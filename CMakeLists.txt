@@ -1,0 +1,153 @@
+cmake_minimum_required(VERSION 3.27)
+
+project(mlx_kquant LANGUAGES CXX C)
+
+# ----------------------------- Setup -----------------------------
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+option(BUILD_SHARED_LIBS "Build extensions as a shared library" ON)
+
+# ----------------------------- Dependencies -----------------------------
+# Pick the right interpreter. mlx.extension.CMakeBuild invokes cmake WITHOUT
+# forwarding the building interpreter, so CMake's FindPython can otherwise latch
+# onto an unrelated system/uv Python that lacks mlx & nanobind (then
+# `python -m mlx --cmake-dir` returns empty and find_package(MLX) fails).
+# Precedence: an explicit -DPython_EXECUTABLE (e.g. via CMAKE_ARGS) wins; else an
+# active virtualenv ($VIRTUAL_ENV); else CMake's normal search.
+if(NOT Python_EXECUTABLE AND DEFINED ENV{VIRTUAL_ENV})
+  set(Python_EXECUTABLE "$ENV{VIRTUAL_ENV}/bin/python")
+endif()
+set(Python_FIND_VIRTUALENV FIRST)
+
+find_package(
+  Python 3.9
+  COMPONENTS Interpreter Development.Module
+  REQUIRED)
+
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  OUTPUT_VARIABLE nanobind_ROOT)
+find_package(nanobind CONFIG REQUIRED)
+
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" -m mlx --cmake-dir
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  OUTPUT_VARIABLE MLX_ROOT)
+find_package(MLX CONFIG REQUIRED)
+
+# NOTE: do NOT splice ${MLX_CXX_FLAGS} into CMAKE_CXX_FLAGS — it is a CMake list
+# (-DACCELERATE_NEW_LAPACK;-D_METAL_), and embedding the ';' into the flags
+# *string* corrupts every compile command (`/bin/sh: -D_METAL_: command not
+# found`). MLXConfig already attaches these as INTERFACE_COMPILE_OPTIONS on the
+# imported `mlx` target, so -D_METAL_ propagates correctly to anything that
+# links `mlx` (below).
+
+# ----------------------------- gguflib (GGUF parser) -----------------------------
+# antirez/gguf-tools single-file GGUF parser, for the C++ kq.load_gguf loader.
+# PIN: the exact ref the MLX kquant fork bumped to (mlx/io/CMakeLists.txt). NOT
+# stock MLX's 8fa6eb65 — that older ref only knows Q4_0/Q4_1/Q8_0, while this one
+# defines GGUF_TYPE_Q5_0/Q5_1/Q2_K..Q6_K + correct K-quant block sizes. Fetched
+# independently of whatever gguflib the stock mlx wheel bundled.
+include(FetchContent)
+FetchContent_Declare(
+  gguflib
+  GIT_REPOSITORY https://github.com/antirez/gguf-tools/
+  GIT_TAG fdfafbed766db0a1e9019b07994cd88f133d1aab
+  # The pinned ref only knows GGML types up to BF16 (30); a tensor of any newer
+  # codec trips gguf_get_tensor's `>= GGUF_TYPE_COUNT` guard and truncates the
+  # tensor list. Teach the parser the post-BF16 type block-geometry (incl. the
+  # MXFP4/NVFP4 float codecs MLX has native kernels for). Idempotent; see script.
+  PATCH_COMMAND ${CMAKE_COMMAND} -DGGUFLIB_DIR=<SOURCE_DIR>
+                -P ${CMAKE_CURRENT_LIST_DIR}/cmake/patch-gguflib.cmake)
+FetchContent_MakeAvailable(gguflib)
+add_library(gguflib STATIC ${gguflib_SOURCE_DIR}/fp16.c
+                           ${gguflib_SOURCE_DIR}/gguflib.c)
+# Hidden visibility so the gguf_* symbols stay LOCAL to whichever image
+# force-loads them (below) and never interpose / collide at runtime with the
+# identically-named gguf_* symbols that libmlx.dylib also exports.
+set_target_properties(gguflib PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                         C_VISIBILITY_PRESET hidden)
+# gguflib uses assert() to reject malformed tensor headers (e.g. ndim > 8).
+# -DNDEBUG (release builds) would compile those out, leaving out-of-bounds
+# reads/writes unguarded when loading untrusted GGUF files. Force NDEBUG off.
+target_compile_options(gguflib PRIVATE -UNDEBUG)
+
+# ----------------------------- C++ library -----------------------------
+add_library(mlx_kquant_ext)
+
+target_sources(
+  mlx_kquant_ext
+  PUBLIC ${CMAKE_CURRENT_LIST_DIR}/src/kquant_codec.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_ops.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_dequantize.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_matmul.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gather.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_encode.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gguf.cpp)
+
+target_include_directories(mlx_kquant_ext PUBLIC ${CMAKE_CURRENT_LIST_DIR}/src)
+# gguflib include/link are PUBLIC: target_sources above lists the .cpp as PUBLIC,
+# so it is also compiled into the `_ext` nanobind module (consumer), which then
+# needs gguflib.h on its include path and the gguf_* symbols at link time.
+target_include_directories(mlx_kquant_ext PUBLIC ${gguflib_SOURCE_DIR})
+target_link_libraries(mlx_kquant_ext PUBLIC mlx)
+# libmlx.dylib bundles its OWN (older) gguflib and exports its gguf_* symbols
+# globally. A plain link binds our gguf_get_tensor()/gguf_open() calls to MLX's
+# copy, whose GGUF_TYPE_COUNT predates the MXFP4/NVFP4 float codecs — so a tensor
+# of type >= 31 trips its `>= GGUF_TYPE_COUNT` guard and the tensor list silently
+# truncates at the first such tensor. force_load pulls OUR patched gguflib
+# objects into this image as (hidden) definitions, so every gguf_* call resolves
+# in-image (two-level namespace) to the patched parser instead of to libmlx.
+target_link_libraries(mlx_kquant_ext PUBLIC gguflib)
+target_link_options(mlx_kquant_ext PRIVATE
+                    "-Wl,-force_load,$<TARGET_FILE:gguflib>")
+
+# ----------------------------- Metal library -----------------------------
+# Vendored kq_* kernels compiled into a single mlx_kquant.metallib.
+# The repo's metal/ dir is searched BEFORE the stock-wheel include tree so the
+# vendored kq_*.h + the quantized_utils.h shim (which adds load_vector) win;
+# steel/gemm/*, utils.h, etc. fall through to the stock wheel headers.
+if(MLX_BUILD_METAL)
+  mlx_build_metallib(
+    TARGET
+    mlx_kquant_metallib
+    TITLE
+    mlx_kquant
+    SOURCES
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_encode.metal
+    INCLUDE_DIRS
+    ${CMAKE_CURRENT_LIST_DIR}/metal
+    ${MLX_INCLUDE_DIRS}
+    OUTPUT_DIRECTORY
+    ${CMAKE_LIBRARY_OUTPUT_DIRECTORY})
+
+  add_dependencies(mlx_kquant_ext mlx_kquant_metallib)
+endif()
+
+# ----------------------------- Python bindings -----------------------------
+nanobind_add_module(
+  _ext
+  NB_STATIC
+  STABLE_ABI
+  LTO
+  NOMINSIZE
+  NB_DOMAIN
+  mlx
+  ${CMAKE_CURRENT_LIST_DIR}/bindings.cpp)
+target_link_libraries(_ext PRIVATE mlx_kquant_ext)
+# kquant_gguf.cpp is a PUBLIC source (above), so it is also compiled into this
+# module and the LTO link keeps its own gguf_* references — force_load the
+# patched gguflib here too so they don't fall back to libmlx's exported copy
+# (see the mlx_kquant_ext force_load note for the full rationale).
+target_link_libraries(_ext PRIVATE gguflib)
+target_link_options(_ext PRIVATE
+                    "-Wl,-force_load,$<TARGET_FILE:gguflib>")
+
+if(BUILD_SHARED_LIBS)
+  target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path)
+endif()

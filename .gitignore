@@ -1,0 +1,9 @@
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.so
+*.dylib
+*.metallib
+*.air
+.DS_Store
