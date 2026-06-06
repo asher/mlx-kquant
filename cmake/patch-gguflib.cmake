@@ -39,3 +39,41 @@ if(NOT _C MATCHES "\"mxfp4\"")
   file(WRITE "${_c}" "${_C}")
   message(STATUS "gguflib: patched gguflib.c (fp-codec + Q1_0/TQ type-features)")
 endif()
+
+# Add a read-only open path. The parser is upstream a read/write GGUF *editor*:
+# gguf_open() uses O_RDWR + mmap(PROT_READ|PROT_WRITE, MAP_SHARED), so a no-copy
+# array viewing a tensor aliases a writable, disk-backed page -- a fused in-place
+# op or a stray buffer-donation then mutates the SOURCE FILE. Consumers that only
+# read existing files must use gguf_open_ro(): O_RDONLY + MAP_PRIVATE, keeping
+# PROT_READ|PROT_WRITE (GPU zero-copy via newBufferWithBytesNoCopy needs writable
+# pages -- PROT_READ alone yields garbage GPU reads), so any write is copy-on-write
+# into a private page and the file on disk is never modified. gguf_open() (and thus
+# the gguf_create() write path, which calls it) is left untouched. gguf_remap()
+# branches on the new ctx->ro.
+file(READ "${_h}" _H)
+if(NOT _H MATCHES "gguf_open_ro")
+  string(REPLACE
+    "    uint64_t alignment;             // File data alignment. Default: 32 bytes.\n} gguf_ctx;"
+    "    uint64_t alignment;             // File data alignment. Default: 32 bytes.\n    int ro;                         // Read-only: MAP_PRIVATE (copy-on-write).\n} gguf_ctx;"
+    _H "${_H}")
+  string(REPLACE
+    "gguf_ctx *gguf_open(const char *filename);\ngguf_ctx *gguf_create(const char *filename, int flags);"
+    "gguf_ctx *gguf_open(const char *filename);\ngguf_ctx *gguf_open_ro(const char *filename);\ngguf_ctx *gguf_create(const char *filename, int flags);"
+    _H "${_H}")
+  file(WRITE "${_h}" "${_H}")
+  message(STATUS "gguflib: patched gguflib.h (read-only open: gguf_open_ro)")
+endif()
+
+file(READ "${_c}" _C)
+if(NOT _C MATCHES "gguf_open_ro")
+  string(REPLACE
+    "    void *mapped = mmap(0,sb.st_size,PROT_READ|PROT_WRITE,MAP_SHARED,ctx->fd,0);"
+    "    /* Keep PROT_READ|PROT_WRITE: GPU zero-copy (newBufferWithBytesNoCopy) needs\n     * writable pages even for read-only use (PROT_READ alone -> garbage GPU\n     * reads). For the read path use MAP_PRIVATE so any write is copy-on-write\n     * into a private page and the source file on disk is never modified. The\n     * writer path keeps MAP_SHARED to build new files. */\n    int _flags = ctx->ro ? MAP_PRIVATE : MAP_SHARED;\n    void *mapped = mmap(0,sb.st_size,PROT_READ|PROT_WRITE,_flags,ctx->fd,0);"
+    _C "${_C}")
+  string(REPLACE
+    "void gguf_rewind(gguf_ctx *ctx) {"
+    "/* Like gguf_open() but opens an existing file read-only (O_RDONLY + MAP_PRIVATE,\n * copy-on-write) so a no-copy tensor view can never be written back to disk. */\ngguf_ctx *gguf_open_ro(const char *filename) {\n    int fd = open(filename,O_RDONLY);\n    if (fd == -1) return NULL;\n    gguf_ctx *ctx = calloc(1, sizeof(*ctx));\n    if (!ctx) { close(fd); return NULL; }\n    ctx->fd = fd;\n    ctx->ro = 1;\n    ctx->alignment = 32;\n    ctx->data_off = 0;\n    if (gguf_remap(ctx) == 0) {\n        gguf_close(ctx);\n        return NULL;\n    }\n    gguf_rewind(ctx);\n    return ctx;\n}\n\nvoid gguf_rewind(gguf_ctx *ctx) {"
+    _C "${_C}")
+  file(WRITE "${_c}" "${_C}")
+  message(STATUS "gguflib: patched gguflib.c (read-only open: gguf_open_ro)")
+endif()
