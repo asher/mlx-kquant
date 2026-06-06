@@ -1,0 +1,69 @@
+MIT License
+
+Copyright © 2026 Asher Feldman
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+THIRD-PARTY ATTRIBUTIONS
+================================================================================
+
+This project derives from and builds upon other open-source software. Their
+license notices are reproduced below as required.
+
+--------------------------------------------------------------------------------
+MLX — https://github.com/ml-explore/mlx
+--------------------------------------------------------------------------------
+
+The Metal compute kernels under metal/ (kq_quantized*.{h,metal}) and the
+include shim metal/mlx/backend/metal/kernels/quantized_utils.h are derived from,
+and built against the headers of, MLX. The C++ op/primitive sources under src/
+port host-side dispatch and CPU reference logic from MLX. MLX is distributed
+under the MIT License:
+
+    MIT License
+
+    Copyright © 2023 Apple Inc.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+--------------------------------------------------------------------------------
+gguf-tools (gguflib) — https://github.com/antirez/gguf-tools
+--------------------------------------------------------------------------------
+
+The C GGUF parser (fp16.c, gguflib.c) used by the kq.load_gguf loader is fetched
+at build time and statically linked. gguf-tools is distributed under the MIT
+License, Copyright (c) 2022 Georgi Gerganov. The full text accompanies the
+upstream source.
