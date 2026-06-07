@@ -157,5 +157,60 @@ def test_gather():
     assert main([]) == 0
 
 
+def test_rhs_gather_large_M_no_short_overflow():
+    """Regression: the sorted single-shot rhs-gather (rhs_nax leaf) must stay
+    correct when the total gathered-row count exceeds 32767.
+
+    The tail-tile row-count computation narrowed (M - tile_origin) to `short`
+    before clamping it to the per-simdgroup tile height, so once the row count
+    crossed SHRT_MAX the leading tiles got a poisoned height and silently
+    produced garbage rows (every tile whose remaining span > 32767). Only the
+    sorted, B>=16, B/E>=4, M==1 path reaches that leaf, and only a single
+    >32k-token forward (no chunking) makes M large enough — so it never showed
+    up in the small-M sweep above. Assert the sorted leaf matches the unsorted
+    per-row leaf (independent kernel) across all rows, and spot-check truth.
+    """
+    if BACKEND != "mlx_kquant":
+        return  # fork path has its own coverage
+    # q8_0: synthesizable in-process (gguf only quantizes flat codecs) and has a
+    # rhs_nax kernel. The overflow lives in the shared tail-tile template, so the
+    # codec is immaterial — q8_0 exercises the same poisoned path as q6_k.
+    codec, gtype = "q8_0", GT.Q8_0
+    Eg, Ng, Kg = 8, 64, 256  # K % 64 == 0
+    rng = np.random.default_rng(7)
+    wires, refs = [], []
+    for _ in range(Eg):
+        we = (rng.standard_normal((Ng, Kg)).astype(np.float32) * 0.1)
+        wq = quants.quantize(we, gtype).astype(np.uint8)
+        wires.append(wq)
+        refs.append(quants.dequantize(np.ascontiguousarray(wq), gtype))
+    w = mx.array(np.stack(wires, 0))
+    deq = mx.array(np.stack(refs, 0).astype(np.float32)).astype(mx.float16)
+    scales = mx.zeros((1,), dtype=mx.uint8)
+
+    # B > 32767 with B % 64 != 0 (forces the partial-M / tail-tile path) and an
+    # uneven sorted routing (long per-expert runs spanning many tiles).
+    B = 33000
+    assert B % 64 != 0 and B > 32767
+    experts = np.sort(rng.integers(0, Eg, size=B).astype(np.uint32))
+    rhs = mx.array(experts)
+    x = mx.array((rng.standard_normal((B, 1, Kg)) * 0.1).astype(np.float32)
+                 ).astype(mx.float16)
+
+    fast = kq.gather_qmm(x, w, scales, codec, rhs_indices=rhs,
+                         transpose=True, sorted_indices=True).reshape(B, Ng)
+    ref = kq.gather_qmm(x, w, scales, codec, rhs_indices=rhs,
+                        transpose=True, sorted_indices=False).reshape(B, Ng)
+    mx.eval(fast, ref)
+    max_abs = float(mx.abs(fast - ref).max().item())
+    assert max_abs < 1e-2, f"sorted rhs-gather diverges from per-row leaf: {max_abs}"
+
+    # spot-check a leading row (the overflow corrupted the FIRST tiles) vs truth
+    b = 0
+    truth = (x[b].astype(mx.float32) @ deq[int(experts[b])].T.astype(mx.float32))[0]
+    mx.eval(truth)
+    assert float(mx.abs(fast[b] - truth).max().item()) < 5e-2
+
+
 if __name__ == "__main__":
     sys.exit(main())
