@@ -81,6 +81,7 @@
 
 #define instantiate_kquant_q8_0_for_type(type)                          \
   instantiate_kquant_batched(verify_qmv, type, 32, 8, 0, q8_0)          \
+  instantiate_kquant_batched(verify_qmv_fine, type, 32, 8, 0, q8_0)     \
   instantiate_kquant_batched(qmv_fast, type, 32, 8, 0, q8_0)            \
   instantiate_kquant_batched(qmv_fast, type, 32, 8, 1, q8_0)            \
   instantiate_kquant_batched(qmv,      type, 32, 8, 0, q8_0)            \

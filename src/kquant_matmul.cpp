@@ -288,14 +288,27 @@ void verify_qmv(
   int bn = kquant_qmv_bn(kquant_type);
   int bk = 32;
   MTL::Size group_dims(bk, 2, 1);
-  MTL::Size grid_dims(1, (N + bn - 1) / bn, 1);
+
+  // q8_0 weight rows are small enough at modest K that the per-row weight stays
+  // L2-resident, so the default verify tiling (8 output rows / threadgroup =>
+  // few threadgroups) starves the GPU of occupancy vs the per-row qmv (M x more
+  // threadgroups) without repaying it in saved DRAM traffic. The finer q8_0
+  // variant emits 2 output rows / threadgroup (4x the threadgroups), restoring
+  // occupancy. Bit-exact vs the default. Other codecs keep the default tiling.
+  std::string verify_kname = "verify_qmv_";
+  int rows_per_tg = bn; // default kernel emits bn (= num_simdgroups*RPS) rows/tg
+  if (kquant_type == "q8_0") {
+    verify_kname = "verify_qmv_fine_";
+    rows_per_tg = 2; // num_simdgroups(2) * results_per_simdgroup(1)
+  }
+  MTL::Size grid_dims(1, (N + rows_per_tg - 1) / rows_per_tg, 1);
 
   std::string type_string = kq_type_string(x.dtype());
   std::string kname;
   kname.reserve(64);
   mx::concatenate(
       kname,
-      kq_kname_prefix(kquant_type) + "verify_qmv_",
+      kq_kname_prefix(kquant_type) + verify_kname,
       type_string,
       "_gs_",
       group_size,

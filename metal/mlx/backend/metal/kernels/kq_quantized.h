@@ -420,7 +420,14 @@ METAL_FUNC void kq_q8_0_qmv_fast_impl(
 
 // Verify-shaped qmv (see kq_q6_k_verify_qmv_impl). Reads each weight block once
 // per output row and dots it against all `vm` activation rows. Non-batched only.
-template <typename T, int group_size, int bits>
+// results_per_simdgroup is templated: the default (4) packs 8 output rows per
+// threadgroup; a finer value (1 -> 2 rows/tg) multiplies the threadgroup count
+// for the same N, restoring GPU occupancy when each row's weight is small enough
+// to stay L2-resident (so amortizing the weight read saves little DRAM traffic
+// and the lost occupancy isn't repaid). Bit-exact across values: each output
+// row's per-lane sequential K-fold + simd_sum is identical regardless of how
+// rows are partitioned across threadgroups.
+template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
 METAL_FUNC void kq_q8_0_verify_qmv_impl(
     const device uint8_t* w,
     const device T* x,
@@ -436,7 +443,6 @@ METAL_FUNC void kq_q8_0_verify_qmv_impl(
   static_assert(bits == 8, "Q8_0 kernel requires bits=8");
 
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
   constexpr int MAX_VM = 8;
@@ -880,7 +886,27 @@ template <typename T, int group_size, int bits, bool batched>
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  kq_q8_0_verify_qmv_impl<T, group_size, bits>(
+  kq_q8_0_verify_qmv_impl<T, group_size, bits, 4>(
+      w, x, y, in_vec_size, out_vec_size, vm, tid, simd_gid, simd_lid);
+}
+
+// Finer-tiled variant: 1 result per simdgroup -> 2 output rows per threadgroup
+// (vs 8 in the default), quadrupling the threadgroup count for the same N. Used
+// when occupancy is the bottleneck (small per-row weight that stays L2-resident).
+// Bit-exact vs the default variant and vs per-row qmv.
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q8_0_verify_qmv_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q8_0_verify_qmv_impl<T, group_size, bits, 1>(
       w, x, y, in_vec_size, out_vec_size, vm, tid, simd_gid, simd_lid);
 }
 
