@@ -80,7 +80,10 @@ inline bool codec_has_matmul(const std::string& kquant_type) {
 // their verify_qmv instantiation lands.
 inline bool codec_has_verify_qmv(const std::string& kquant_type) {
   return kquant_type == "q6_k" || kquant_type == "q8_0" ||
-      kquant_type == "q4_k" || kquant_type == "q5_k";
+      kquant_type == "q4_k" || kquant_type == "q5_k" ||
+      kquant_type == "q5_1" || kquant_type == "q3_k" ||
+      kquant_type == "q2_k" || kquant_type == "q4_0" ||
+      kquant_type == "q4_1" || kquant_type == "q5_0";
 }
 
 // Largest activation-row count (M) the verify_qmv kernels are instantiated for;

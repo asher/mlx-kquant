@@ -105,6 +105,7 @@ instantiate_kquant_q8_0_for_type(bfloat16_t)
 instantiate_kquant_q8_0_for_type(float16_t)
 
 #define instantiate_kquant_q5_1_for_type(type)                          \
+  instantiate_kquant_batched(verify_qmv, type, 32, 5, 0, q5_1)          \
   instantiate_kquant_batched(qmv_fast, type, 32, 5, 0, q5_1)            \
   instantiate_kquant_batched(qmv_fast, type, 32, 5, 1, q5_1)            \
   instantiate_kquant_batched(qmv,      type, 32, 5, 0, q5_1)            \
@@ -129,6 +130,7 @@ instantiate_kquant_q5_1_for_type(bfloat16_t)
 instantiate_kquant_q5_1_for_type(float16_t)
 
 #define instantiate_kquant_q4_0_for_type(type)                          \
+  instantiate_kquant_batched(verify_qmv, type, 32, 4, 0, q4_0)          \
   instantiate_kquant_batched(qmv_fast, type, 32, 4, 0, q4_0)            \
   instantiate_kquant_batched(qmv_fast, type, 32, 4, 1, q4_0)            \
   instantiate_kquant_batched(qmv,      type, 32, 4, 0, q4_0)            \
@@ -153,6 +155,7 @@ instantiate_kquant_q4_0_for_type(bfloat16_t)
 instantiate_kquant_q4_0_for_type(float16_t)
 
 #define instantiate_kquant_q4_1_for_type(type)                          \
+  instantiate_kquant_batched(verify_qmv, type, 32, 4, 0, q4_1)          \
   instantiate_kquant_batched(qmv_fast, type, 32, 4, 0, q4_1)            \
   instantiate_kquant_batched(qmv_fast, type, 32, 4, 1, q4_1)            \
   instantiate_kquant_batched(qmv,      type, 32, 4, 0, q4_1)            \
@@ -177,6 +180,7 @@ instantiate_kquant_q4_1_for_type(bfloat16_t)
 instantiate_kquant_q4_1_for_type(float16_t)
 
 #define instantiate_kquant_q5_0_for_type(type)                          \
+  instantiate_kquant_batched(verify_qmv, type, 32, 5, 0, q5_0)          \
   instantiate_kquant_batched(qmv_fast, type, 32, 5, 0, q5_0)            \
   instantiate_kquant_batched(qmv_fast, type, 32, 5, 1, q5_0)            \
   instantiate_kquant_batched(qmv,      type, 32, 5, 0, q5_0)            \
@@ -276,6 +280,7 @@ instantiate_kquant_q6_k_for_type(bfloat16_t)
 instantiate_kquant_q6_k_for_type(float16_t)
 
 #define instantiate_kquant_q3_k_for_type(type)                          \
+  instantiate_kquant_batched(verify_qmv, type, 256, 3, 0, q3_k)          \
   instantiate_kquant_batched(qmv_fast, type, 256, 3, 0, q3_k)            \
   instantiate_kquant_batched(qmv_fast, type, 256, 3, 1, q3_k)            \
   instantiate_kquant_batched(qmv,      type, 256, 3, 0, q3_k)            \
@@ -300,6 +305,7 @@ instantiate_kquant_q3_k_for_type(bfloat16_t)
 instantiate_kquant_q3_k_for_type(float16_t)
 
 #define instantiate_kquant_q2_k_for_type(type)                          \
+  instantiate_kquant_batched(verify_qmv, type, 256, 2, 0, q2_k)          \
   instantiate_kquant_batched(qmv_fast, type, 256, 2, 0, q2_k)            \
   instantiate_kquant_batched(qmv_fast, type, 256, 2, 1, q2_k)            \
   instantiate_kquant_batched(qmv,      type, 256, 2, 0, q2_k)            \

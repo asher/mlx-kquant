@@ -111,6 +111,114 @@ METAL_FUNC void kq_q4_0_qmv_fast_impl(
   }
 }
 
+// Verify-shaped qmv (see kq_q6_k_verify_qmv_impl in kq_quantized.h). The masked
+// weight nibbles are cached once per output row; the m-loop rebuilds the cheap
+// per-position activation scaling and dots, so the dominant per-row weight read
+// is amortized while the math stays bit-for-bit the qmv_fast path.
+template <typename T, int group_size, int bits>
+METAL_FUNC void kq_q4_0_verify_qmv_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(
+      group_size == KQ_Q4_0_GROUP, "Q4_0 kernel requires group_size=32");
+  static_assert(bits == 4, "Q4_0 kernel requires bits=4");
+
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int block_stride = 16;
+  constexpr int MAX_VM = 8;
+
+  typedef float U;
+  thread U wm[16]; // masked weight value per yl position, cached per output row
+  thread U yl[16];
+  thread U result[MAX_VM][results_per_simdgroup];
+#pragma unroll
+  for (int m = 0; m < MAX_VM; m++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[m][row] = U(0);
+    }
+  }
+
+  const int ix = simd_lid / 2;
+  const int il = (simd_lid % 2) * 8;
+
+  const int row_bytes = in_vec_size * KQ_Q4_0_BLOCK_BYTES / KQ_Q4_0_GROUP;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  const int nb = in_vec_size / KQ_Q4_0_GROUP;
+
+  for (int ib = ix; ib < nb; ib += block_stride) {
+    const int x_base = ib * KQ_Q4_0_GROUP + il;
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const int row_idx = out_row + row;
+      const device uint8_t* block_addr =
+          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_0_BLOCK_BYTES;
+      const U d = U(kq_q4_0_d(block_addr));
+      const device uint16_t* qs =
+          reinterpret_cast<const device uint16_t*>(kq_q4_0_qs_ptr(block_addr)) +
+          il / 2;
+
+      // --- unpack this output row's masked weights once ---
+#pragma unroll
+      for (int i = 0; i < 8; i += 2) {
+        const uint16_t qi = qs[i / 2];
+        wm[i + 0] = U(qi & 0x000F);
+        wm[i + 1] = U(qi & 0x0F00);
+        wm[i + 8] = U(qi & 0x00F0);
+        wm[i + 9] = U(qi & 0xF000);
+      }
+
+      // --- per activation row: rebuild scaled yl + dot ---
+      for (int m = 0; m < vm; m++) {
+        const device T* xm = x + m * in_vec_size + x_base;
+        U sumy = U(0);
+#pragma unroll
+        for (int i = 0; i < 8; i += 2) {
+          const U a0 = U(xm[i + 0]);
+          const U a1 = U(xm[i + 1]);
+          const U b0 = U(xm[i + 16]);
+          const U b1 = U(xm[i + 17]);
+          sumy += a0 + a1 + b0 + b1;
+          yl[i + 0] = a0;
+          yl[i + 1] = a1 * (U(1) / U(256));
+          yl[i + 8] = b0 * (U(1) / U(16));
+          yl[i + 9] = b1 * (U(1) / U(4096));
+        }
+        U acc[4] = {U(0), U(0), U(0), U(0)};
+#pragma unroll
+        for (int i = 0; i < 8; i += 2) {
+          acc[0] += yl[i + 0] * wm[i + 0];
+          acc[1] += yl[i + 1] * wm[i + 1];
+          acc[2] += yl[i + 8] * wm[i + 8];
+          acc[3] += yl[i + 9] * wm[i + 9];
+        }
+        result[m][row] +=
+            d * (acc[0] + acc[1] + acc[2] + acc[3] + sumy * U(-8));
+      }
+    }
+  }
+
+  for (int m = 0; m < vm; m++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      U r = simd_sum(result[m][row]);
+      if (simd_lid == 0) {
+        y[m * out_vec_size + out_row + row] = static_cast<T>(r);
+      }
+    }
+  }
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void kq_q4_0_qmv_impl(
     const device uint8_t* w,
@@ -476,6 +584,22 @@ template <typename T, int group_size, int bits, bool batched>
 }
 
 template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q4_0_verify_qmv(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q4_0_verify_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, vm, tid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool batched>
 [[kernel]] void kq_q4_0_qmv(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -640,6 +764,115 @@ METAL_FUNC void kq_q4_1_qmv_fast_impl(
     result[row] = simd_sum(result[row]);
     if (simd_lid == 0) {
       y[out_row + row] = static_cast<T>(result[row]);
+    }
+  }
+}
+
+// Verify-shaped qmv (see kq_q6_k_verify_qmv_impl in kq_quantized.h). The masked
+// weight nibbles are cached once per output row; the m-loop rebuilds the cheap
+// per-position activation scaling and dots, so the dominant per-row weight read
+// is amortized while the math stays bit-for-bit the qmv_fast path.
+template <typename T, int group_size, int bits>
+METAL_FUNC void kq_q4_1_verify_qmv_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(
+      group_size == KQ_Q4_1_GROUP, "Q4_1 kernel requires group_size=32");
+  static_assert(bits == 4, "Q4_1 kernel requires bits=4");
+
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int block_stride = 16;
+  constexpr int MAX_VM = 8;
+
+  typedef float U;
+  thread U wm[16]; // masked weight value per yl position, cached per output row
+  thread U yl[16];
+  thread U result[MAX_VM][results_per_simdgroup];
+#pragma unroll
+  for (int m = 0; m < MAX_VM; m++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[m][row] = U(0);
+    }
+  }
+
+  const int ix = simd_lid / 2;
+  const int il = (simd_lid % 2) * 8;
+
+  const int row_bytes = in_vec_size * KQ_Q4_1_BLOCK_BYTES / KQ_Q4_1_GROUP;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  const int nb = in_vec_size / KQ_Q4_1_GROUP;
+
+  for (int ib = ix; ib < nb; ib += block_stride) {
+    const int x_base = ib * KQ_Q4_1_GROUP + il;
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const int row_idx = out_row + row;
+      const device uint8_t* block_addr =
+          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_1_BLOCK_BYTES;
+      const U d = U(kq_q4_1_d(block_addr));
+      const U mm = U(kq_q4_1_m(block_addr));
+      const device uint16_t* qs =
+          reinterpret_cast<const device uint16_t*>(kq_q4_1_qs_ptr(block_addr)) +
+          il / 2;
+
+      // --- unpack this output row's masked weights once ---
+#pragma unroll
+      for (int i = 0; i < 8; i += 2) {
+        const uint16_t qi = qs[i / 2];
+        wm[i + 0] = U(qi & 0x000F);
+        wm[i + 1] = U(qi & 0x0F00);
+        wm[i + 8] = U(qi & 0x00F0);
+        wm[i + 9] = U(qi & 0xF000);
+      }
+
+      // --- per activation row: rebuild scaled yl + dot ---
+      for (int m = 0; m < vm; m++) {
+        const device T* xm = x + m * in_vec_size + x_base;
+        U sumy = U(0);
+#pragma unroll
+        for (int i = 0; i < 8; i += 2) {
+          const U a0 = U(xm[i + 0]);
+          const U a1 = U(xm[i + 1]);
+          const U b0 = U(xm[i + 16]);
+          const U b1 = U(xm[i + 17]);
+          sumy += a0 + a1 + b0 + b1;
+          yl[i + 0] = a0;
+          yl[i + 1] = a1 * (U(1) / U(256));
+          yl[i + 8] = b0 * (U(1) / U(16));
+          yl[i + 9] = b1 * (U(1) / U(4096));
+        }
+        U acc[4] = {U(0), U(0), U(0), U(0)};
+#pragma unroll
+        for (int i = 0; i < 8; i += 2) {
+          acc[0] += yl[i + 0] * wm[i + 0];
+          acc[1] += yl[i + 1] * wm[i + 1];
+          acc[2] += yl[i + 8] * wm[i + 8];
+          acc[3] += yl[i + 9] * wm[i + 9];
+        }
+        result[m][row] +=
+            d * (acc[0] + acc[1] + acc[2] + acc[3]) + sumy * mm;
+      }
+    }
+  }
+
+  for (int m = 0; m < vm; m++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      U r = simd_sum(result[m][row]);
+      if (simd_lid == 0) {
+        y[m * out_vec_size + out_row + row] = static_cast<T>(r);
+      }
     }
   }
 }
@@ -1020,6 +1253,22 @@ template <typename T, int group_size, int bits, bool batched>
 }
 
 template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q4_1_verify_qmv(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q4_1_verify_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, vm, tid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool batched>
 [[kernel]] void kq_q4_1_qmv(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -1194,6 +1443,120 @@ METAL_FUNC void kq_q5_0_qmv_fast_impl(
     result[row] = simd_sum(result[row]);
     if (simd_lid == 0) {
       y[out_row + row] = static_cast<T>(result[row]);
+    }
+  }
+}
+
+// Verify-shaped qmv (see kq_q6_k_verify_qmv_impl in kq_quantized.h). The masked
+// weight values (incl. the 5th bit from qh) are cached once per output row; the
+// m-loop rebuilds the cheap per-position activation scaling and dots, so the
+// dominant per-row weight read is amortized while the math stays bit-for-bit the
+// qmv_fast path.
+template <typename T, int group_size, int bits>
+METAL_FUNC void kq_q5_0_verify_qmv_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(
+      group_size == KQ_Q5_0_GROUP, "Q5_0 kernel requires group_size=32");
+  static_assert(bits == 5, "Q5_0 kernel requires bits=5");
+
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int block_stride = 16;
+  constexpr int MAX_VM = 8;
+
+  typedef float U;
+  thread U wm[16]; // masked weight value per yl position, cached per output row
+  thread U yl[16];
+  thread U result[MAX_VM][results_per_simdgroup];
+#pragma unroll
+  for (int m = 0; m < MAX_VM; m++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[m][row] = U(0);
+    }
+  }
+
+  const int ix = simd_lid / 2;
+  const int il = (simd_lid % 2) * 8;
+
+  const int row_bytes = in_vec_size * KQ_Q5_0_BLOCK_BYTES / KQ_Q5_0_GROUP;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  const int nb = in_vec_size / KQ_Q5_0_GROUP;
+
+  for (int ib = ix; ib < nb; ib += block_stride) {
+    const int x_base = ib * KQ_Q5_0_GROUP + il;
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const int row_idx = out_row + row;
+      const device uint8_t* block_addr =
+          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_0_BLOCK_BYTES;
+      const U d = U(kq_q5_0_d(block_addr));
+      const uint32_t qh = kq_q5_0_qh(block_addr);
+      const device uint16_t* qs =
+          reinterpret_cast<const device uint16_t*>(kq_q5_0_qs_ptr(block_addr)) +
+          il / 2;
+
+      // --- unpack this output row's masked weights once ---
+#pragma unroll
+      for (int i = 0; i < 8; i += 2) {
+        const uint16_t qi = qs[i / 2];
+        wm[i + 0] =
+            U((qi & 0x000F) | (((qh >> (i + 0 + il)) << 4) & 0x00010));
+        wm[i + 1] =
+            U((qi & 0x0F00) | (((qh >> (i + 1 + il)) << 12) & 0x01000));
+        wm[i + 8] =
+            U((qi & 0x00F0) | (((qh >> (i + 0 + il + 16)) << 8) & 0x00100));
+        wm[i + 9] =
+            U((qi & 0xF000) | (((qh >> (i + 1 + il + 16)) << 16) & 0x10000));
+      }
+
+      // --- per activation row: rebuild scaled yl + dot ---
+      for (int m = 0; m < vm; m++) {
+        const device T* xm = x + m * in_vec_size + x_base;
+        U sumy = U(0);
+#pragma unroll
+        for (int i = 0; i < 8; i += 2) {
+          const U a0 = U(xm[i + 0]);
+          const U a1 = U(xm[i + 1]);
+          const U b0 = U(xm[i + 16]);
+          const U b1 = U(xm[i + 17]);
+          sumy += a0 + a1 + b0 + b1;
+          yl[i + 0] = a0;
+          yl[i + 1] = a1 * (U(1) / U(256));
+          yl[i + 8] = b0 * (U(1) / U(16));
+          yl[i + 9] = b1 * (U(1) / U(4096));
+        }
+        U acc[4] = {U(0), U(0), U(0), U(0)};
+#pragma unroll
+        for (int i = 0; i < 8; i += 2) {
+          acc[0] += yl[i + 0] * wm[i + 0];
+          acc[1] += yl[i + 1] * wm[i + 1];
+          acc[2] += yl[i + 8] * wm[i + 8];
+          acc[3] += yl[i + 9] * wm[i + 9];
+        }
+        result[m][row] +=
+            d * (acc[0] + acc[1] + acc[2] + acc[3] + sumy * U(-16));
+      }
+    }
+  }
+
+  for (int m = 0; m < vm; m++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      U r = simd_sum(result[m][row]);
+      if (simd_lid == 0) {
+        y[m * out_vec_size + out_row + row] = static_cast<T>(r);
+      }
     }
   }
 }
@@ -1572,6 +1935,22 @@ template <typename T, int group_size, int bits, bool batched>
   }
   kq_q5_0_qmv_fast_impl<T, group_size, bits>(
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q5_0_verify_qmv(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q5_0_verify_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, vm, tid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits, bool batched>
