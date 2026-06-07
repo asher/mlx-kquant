@@ -10,6 +10,7 @@
 //   * the split-k paths (qmm_splitk / qvm_split_k) need the unexported
 //     strided_reduce_general_dispatch -> gated off; plain qmm/qvm run instead.
 //   * kquant never carries biases, so the bias buffer is dropped throughout.
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -265,6 +266,58 @@ void qmv(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// Verify-shaped small-M matmul (no upstream analogue). One threadgroup per
+// N-tile (grid_dims.x = 1) reads each weight tile once and dots it against all
+// M activation rows, amortizing the dominant weight read; the per-row qmv would
+// re-read it M times (M on grid_dims.x). Non-batched only; M (= vm) in [2,
+// verify_qmv_max_rows()], codec in codec_has_verify_qmv. Bit-for-bit identical to
+// running qmv per row.
+void verify_qmv(
+    const array& x,
+    const array& w,
+    const array& scales,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    Device& d,
+    const Stream& s,
+    const std::string& kquant_type) {
+  int bn = kquant_qmv_bn(kquant_type);
+  int bk = 32;
+  MTL::Size group_dims(bk, 2, 1);
+  MTL::Size grid_dims(1, (N + bn - 1) / bn, 1);
+
+  std::string type_string = kq_type_string(x.dtype());
+  std::string kname;
+  kname.reserve(64);
+  mx::concatenate(
+      kname,
+      kq_kname_prefix(kquant_type) + "verify_qmv_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_batch_0");
+
+  auto kernel = kq_get_kernel(d, kname);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  ce.set_input_array(w, c++);
+  ce.set_input_array(scales, c++);
+  ce.set_input_array(x, c++);
+  ce.set_output_array(out, c++);
+  ce.set_bytes(K, c++); // in_vec_size
+  ce.set_bytes(N, c++); // out_vec_size
+  ce.set_bytes(M, c++); // vm (activation-row count)
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 // quantized.cpp:1516-1561. The qmv_quad branch (K==64/128) is unreachable for
 // kquant — eval_gpu throws for that case first — so this always routes to qmv.
 void dispatch_qmv(
@@ -360,6 +413,23 @@ void KQuantMatmul::eval_gpu(
   }
 
   if (transpose_) {
+    // Verify / small-batch regime: amortize the weight read across the M rows
+    // instead of re-reading it per row (qmv puts M on grid_dims.x). Falls back
+    // to qmv outside the supported codec/shape/row-count envelope.
+    // KQ_DISABLE_VERIFY_QMV=1 forces the per-row qmv path (A/B harness lever).
+    static const bool verify_disabled = []() {
+      const char* e = std::getenv("KQ_DISABLE_VERIFY_QMV");
+      return e != nullptr && e[0] == '1';
+    }();
+    int bn = kquant_qmv_bn(kquant_type_);
+    bool verify_ok = !verify_disabled && non_batched && M >= 2 &&
+        M <= verify_qmv_max_rows() && (N % bn == 0) &&
+        (K % qmv_fast_k_align() == 0) && codec_has_verify_qmv(kquant_type_);
+    if (verify_ok) {
+      verify_qmv(x, w, scales, out, group_size_, bits_, M, N, K, d, s,
+                 kquant_type_);
+      return;
+    }
     dispatch_qmv(x, w, scales, out, group_size_, bits_, M, N, K, d, s,
                  kquant_type_);
     return;

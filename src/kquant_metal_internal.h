@@ -74,6 +74,21 @@ inline bool codec_has_matmul(const std::string& kquant_type) {
   return codec != nullptr && codec->has_matmul_kernel;
 }
 
+// Codecs with a verify_qmv kernel (the small-M weight-read-amortizing leaf). Kept
+// as an explicit allow-list so the dispatch only routes to a kernel that was
+// actually instantiated in kq_quantized.metal; new codecs are added here once
+// their verify_qmv instantiation lands.
+inline bool codec_has_verify_qmv(const std::string& kquant_type) {
+  return kquant_type == "q6_k" || kquant_type == "q8_0" ||
+      kquant_type == "q4_k" || kquant_type == "q5_k";
+}
+
+// Largest activation-row count (M) the verify_qmv kernels are instantiated for;
+// must match MAX_VM in kq_*_verify_qmv_impl. M above this falls back to qmv.
+inline int verify_qmv_max_rows() {
+  return 8;
+}
+
 // quantized.cpp:133-175
 inline int get_qmv_batch_limit(int D, int O, Device& d) {
   auto arch_size = d.get_architecture().back();

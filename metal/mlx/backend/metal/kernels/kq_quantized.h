@@ -418,6 +418,87 @@ METAL_FUNC void kq_q8_0_qmv_fast_impl(
   }
 }
 
+// Verify-shaped qmv (see kq_q6_k_verify_qmv_impl). Reads each weight block once
+// per output row and dots it against all `vm` activation rows. Non-batched only.
+template <typename T, int group_size, int bits>
+METAL_FUNC void kq_q8_0_verify_qmv_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(
+      group_size == KQ_Q8_0_GROUP, "Q8_0 kernel requires group_size=32");
+  static_assert(bits == 8, "Q8_0 kernel requires bits=8");
+
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int MAX_VM = 8;
+
+  typedef float U;
+  thread U x_thread[values_per_thread];
+  thread U wq[values_per_thread];
+  thread U result[MAX_VM][results_per_simdgroup];
+#pragma unroll
+  for (int m = 0; m < MAX_VM; m++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[m][row] = U(0);
+    }
+  }
+
+  const int row_bytes = in_vec_size * KQ_Q8_0_BLOCK_BYTES / KQ_Q8_0_GROUP;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+  const int lane_k_offset = simd_lid * values_per_thread;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const int row_idx = out_row + row;
+      const device uint8_t* row_base =
+          w + static_cast<int64_t>(row_idx) * row_bytes;
+      const int k_global = k + lane_k_offset;
+      const int block_id = k_global / KQ_Q8_0_GROUP;
+      const int within = k_global - block_id * KQ_Q8_0_GROUP;
+      const device uint8_t* block_addr =
+          row_base + block_id * KQ_Q8_0_BLOCK_BYTES;
+      const U d = U(kq_q8_0_d(block_addr));
+      const device int8_t* q_ptr = kq_q8_0_q_ptr(block_addr) + within;
+#pragma unroll
+      for (int i = 0; i < values_per_thread; i++) {
+        wq[i] = U(q_ptr[i]); // dequantize weights once per output row
+      }
+
+      for (int m = 0; m < vm; m++) {
+        load_vector<T, U, values_per_thread>(
+            x + m * in_vec_size + k + lane_k_offset, x_thread);
+        U partial = 0;
+#pragma unroll
+        for (int i = 0; i < values_per_thread; i++) {
+          partial += x_thread[i] * wq[i];
+        }
+        result[m][row] += d * partial;
+      }
+    }
+  }
+
+  for (int m = 0; m < vm; m++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      U r = simd_sum(result[m][row]);
+      if (simd_lid == 0) {
+        y[m * out_vec_size + out_row + row] = static_cast<T>(r);
+      }
+    }
+  }
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void kq_q8_0_qmv_impl(
     const device uint8_t* w,
@@ -785,6 +866,22 @@ template <typename T, int group_size, int bits, bool batched>
   }
   kq_q8_0_qmv_fast_impl<T, group_size, bits>(
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q8_0_verify_qmv(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q8_0_verify_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, vm, tid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits, bool batched>
@@ -1592,6 +1689,144 @@ METAL_FUNC void kq_q4_k_qmv_fast_impl(
   }
 }
 
+// Verify-shaped qmv (see kq_q6_k_verify_qmv_impl). Weights are fully dequantized
+// into flat floats (d and the per-sub-block q-scale folded in) ONCE per output
+// row; the per-activation-row m-loop is then a pure dot plus the dmin*sumy offset
+// term (the only activation-derived weight coupling). Doing the nibble unpacking
+// once — not per m — is what keeps the kernel bandwidth-bound rather than
+// compute-bound at M>1. Non-batched only.
+template <typename T, int group_size, int bits>
+METAL_FUNC void kq_q4_k_verify_qmv_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(
+      group_size == KQ_Q4_K_SUPERBLOCK, "Q4_K kernel requires group_size=256");
+  static_assert(bits == 4, "Q4_K kernel requires bits=4");
+
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 2;
+  constexpr int sb_stride = 4;
+  constexpr uint16_t kmask1 = 0x3f3f;
+  constexpr uint16_t kmask2 = 0x0f0f;
+  constexpr uint16_t kmask3 = 0xc0c0;
+  constexpr int MAX_VM = 8;
+
+  typedef float U;
+  // Dequantized weights for the current output row: 4 sub-block groups of 8.
+  U g0[8], g1[8], g2[8], g3[8];
+  thread U result[MAX_VM][results_per_simdgroup];
+#pragma unroll
+  for (int m = 0; m < MAX_VM; m++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[m][row] = U(0);
+    }
+  }
+
+  const int ix = simd_lid / 8;
+  const int it = simd_lid % 8;
+  const int iq = it / 4;
+  const int ir = it % 4;
+
+  const int row_bytes = in_vec_size * KQ_Q4_K_BLOCK_BYTES / KQ_Q4_K_SUPERBLOCK;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  const int nb = in_vec_size / KQ_Q4_K_SUPERBLOCK;
+
+  for (int ib = ix; ib < nb; ib += sb_stride) {
+    const int x_base = ib * KQ_Q4_K_SUPERBLOCK + 64 * iq + 8 * ir;
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const int row_idx = out_row + row;
+      const device uint8_t* sb_addr =
+          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_K_BLOCK_BYTES;
+
+      // --- dequantize this output row's weights once ---
+      const device uint16_t* sc16_src =
+          reinterpret_cast<const device uint16_t*>(
+              kq_q4_k_scales12_ptr(sb_addr)) +
+          iq;
+      uint16_t sc16[4];
+      sc16[0] = sc16_src[0] & kmask1;
+      sc16[1] = sc16_src[2] & kmask1;
+      sc16[2] = ((sc16_src[4] >> 0) & kmask2) | ((sc16_src[0] & kmask3) >> 2);
+      sc16[3] = ((sc16_src[4] >> 4) & kmask2) | ((sc16_src[2] & kmask3) >> 2);
+      thread const uint8_t* sc8 = reinterpret_cast<thread const uint8_t*>(sc16);
+
+      const device uint16_t* q1 =
+          reinterpret_cast<const device uint16_t*>(kq_q4_k_qs_ptr(sb_addr)) +
+          16 * iq + 4 * ir;
+      const device uint16_t* q2 = q1 + 32;
+
+      const U d = U(kq_q4_k_d(sb_addr));
+      const U dmin = U(kq_q4_k_dmin(sb_addr));
+      const U dsc0 = d * U(sc8[0]);
+      const U dsc1 = d * U(sc8[1]);
+      const U dsc4 = d * U(sc8[4]);
+      const U dsc5 = d * U(sc8[5]);
+      const U mc0 = dmin * U(sc8[2]);
+      const U mc1 = dmin * U(sc8[3]);
+      const U mc2 = dmin * U(sc8[6]);
+      const U mc3 = dmin * U(sc8[7]);
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        const uint16_t q1i = q1[i];
+        const uint16_t q2i = q2[i];
+        g0[2 * i + 0] = dsc0 * U(q1i & 0x000F);
+        g0[2 * i + 1] = dsc0 * U((q1i >> 8) & 0x000F);
+        g1[2 * i + 0] = dsc1 * U((q1i >> 4) & 0x000F);
+        g1[2 * i + 1] = dsc1 * U((q1i >> 12) & 0x000F);
+        g2[2 * i + 0] = dsc4 * U(q2i & 0x000F);
+        g2[2 * i + 1] = dsc4 * U((q2i >> 8) & 0x000F);
+        g3[2 * i + 0] = dsc5 * U((q2i >> 4) & 0x000F);
+        g3[2 * i + 1] = dsc5 * U((q2i >> 12) & 0x000F);
+      }
+
+      // --- per activation row: pure dot + dmin*sumy offset ---
+      for (int m = 0; m < vm; m++) {
+        const device T* xm = x + m * in_vec_size + x_base;
+        U t0 = U(0), t1 = U(0), t2 = U(0), t3 = U(0);
+        U sy0 = U(0), sy1 = U(0), sy2 = U(0), sy3 = U(0);
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+          const U a0 = U(xm[k + 0]);
+          const U a1 = U(xm[k + 32]);
+          const U a2 = U(xm[k + 128]);
+          const U a3 = U(xm[k + 160]);
+          t0 += a0 * g0[k];
+          t1 += a1 * g1[k];
+          t2 += a2 * g2[k];
+          t3 += a3 * g3[k];
+          sy0 += a0;
+          sy1 += a1;
+          sy2 += a2;
+          sy3 += a3;
+        }
+        result[m][row] += (t0 + t1 + t2 + t3) -
+            (sy0 * mc0 + sy1 * mc1 + sy2 * mc2 + sy3 * mc3);
+      }
+    }
+  }
+
+  for (int m = 0; m < vm; m++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      U r = simd_sum(result[m][row]);
+      if (simd_lid == 0) {
+        y[m * out_vec_size + out_row + row] = static_cast<T>(r);
+      }
+    }
+  }
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void kq_q4_k_qmv_impl(
     const device uint8_t* w,
@@ -2018,6 +2253,22 @@ template <typename T, int group_size, int bits, bool batched>
 }
 
 template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q4_k_verify_qmv(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q4_k_verify_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, vm, tid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool batched>
 [[kernel]] void kq_q4_k_qmv(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -2259,6 +2510,156 @@ METAL_FUNC void kq_q5_k_qmv_fast_impl(
     result[row] = simd_sum(result[row]);
     if (simd_lid == 0) {
       y[out_row + row] = static_cast<T>(result[row]);
+    }
+  }
+}
+
+// Verify-shaped qmv (see kq_q4_k_verify_qmv_impl). Weights (incl. the 5th bit
+// from qh, folded into a 0..31 value) are fully dequantized into flat floats once
+// per output row; the m-loop is a pure dot + dmin*sumy offset. Non-batched only.
+template <typename T, int group_size, int bits>
+METAL_FUNC void kq_q5_k_verify_qmv_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(
+      group_size == KQ_Q5_K_SUPERBLOCK, "Q5_K kernel requires group_size=256");
+  static_assert(bits == 5, "Q5_K kernel requires bits=5");
+
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 2;
+  constexpr int sb_stride = 4;
+  constexpr uint16_t kmask1 = 0x3f3f;
+  constexpr uint16_t kmask2 = 0x0f0f;
+  constexpr uint16_t kmask3 = 0xc0c0;
+  constexpr int MAX_VM = 8;
+
+  typedef float U;
+  U g0[8], g1[8], g2[8], g3[8];
+  thread U result[MAX_VM][results_per_simdgroup];
+#pragma unroll
+  for (int m = 0; m < MAX_VM; m++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[m][row] = U(0);
+    }
+  }
+
+  const int tid_lane = simd_lid / 4;
+  const int ix = simd_lid % 4;
+  const int iq = tid_lane / 4;
+  const int ir = tid_lane % 4;
+
+  const uint8_t hm1 = uint8_t(1u << (2 * iq));
+  const uint8_t hm2 = uint8_t(hm1 << 1);
+  const uint8_t hm3 = uint8_t(hm1 << 4);
+  const uint8_t hm4 = uint8_t(hm2 << 4);
+
+  const int row_bytes = in_vec_size * KQ_Q5_K_BLOCK_BYTES / KQ_Q5_K_SUPERBLOCK;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  const int nb = in_vec_size / KQ_Q5_K_SUPERBLOCK;
+
+  for (int ib = ix; ib < nb; ib += sb_stride) {
+    const int x_base = ib * KQ_Q5_K_SUPERBLOCK + 64 * iq + 8 * ir;
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const int row_idx = out_row + row;
+      const device uint8_t* sb_addr =
+          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_K_BLOCK_BYTES;
+
+      // --- dequantize this output row's weights once (5-bit value 0..31) ---
+      const device uint16_t* sc16_src =
+          reinterpret_cast<const device uint16_t*>(
+              kq_q5_k_scales12_ptr(sb_addr)) +
+          iq;
+      uint16_t sc16[4];
+      sc16[0] = sc16_src[0] & kmask1;
+      sc16[1] = sc16_src[2] & kmask1;
+      sc16[2] = ((sc16_src[4] >> 0) & kmask2) | ((sc16_src[0] & kmask3) >> 2);
+      sc16[3] = ((sc16_src[4] >> 4) & kmask2) | ((sc16_src[2] & kmask3) >> 2);
+      thread const uint8_t* sc8 = reinterpret_cast<thread const uint8_t*>(sc16);
+
+      const device uint16_t* q1 =
+          reinterpret_cast<const device uint16_t*>(kq_q5_k_qs_ptr(sb_addr)) +
+          16 * iq + 4 * ir;
+      const device uint16_t* q2 = q1 + 32;
+      const device uint8_t* qh = kq_q5_k_qh_ptr(sb_addr) + 8 * ir;
+
+      const U d = U(kq_q5_k_d(sb_addr));
+      const U dmin = U(kq_q5_k_dmin(sb_addr));
+      const U dsc0 = d * U(sc8[0]);
+      const U dsc1 = d * U(sc8[1]);
+      const U dsc4 = d * U(sc8[4]);
+      const U dsc5 = d * U(sc8[5]);
+      const U mc0 = dmin * U(sc8[2]);
+      const U mc1 = dmin * U(sc8[3]);
+      const U mc2 = dmin * U(sc8[6]);
+      const U mc3 = dmin * U(sc8[7]);
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        const uint16_t q1i = q1[i];
+        const uint16_t q2i = q2[i];
+        const uint8_t ha = qh[2 * i + 0];
+        const uint8_t hb = qh[2 * i + 1];
+        g0[2 * i + 0] =
+            dsc0 * (U(q1i & 0x000F) + ((ha & hm1) ? U(16) : U(0)));
+        g0[2 * i + 1] =
+            dsc0 * (U((q1i >> 8) & 0x000F) + ((hb & hm1) ? U(16) : U(0)));
+        g1[2 * i + 0] =
+            dsc1 * (U((q1i >> 4) & 0x000F) + ((ha & hm2) ? U(16) : U(0)));
+        g1[2 * i + 1] =
+            dsc1 * (U((q1i >> 12) & 0x000F) + ((hb & hm2) ? U(16) : U(0)));
+        g2[2 * i + 0] =
+            dsc4 * (U(q2i & 0x000F) + ((ha & hm3) ? U(16) : U(0)));
+        g2[2 * i + 1] =
+            dsc4 * (U((q2i >> 8) & 0x000F) + ((hb & hm3) ? U(16) : U(0)));
+        g3[2 * i + 0] =
+            dsc5 * (U((q2i >> 4) & 0x000F) + ((ha & hm4) ? U(16) : U(0)));
+        g3[2 * i + 1] =
+            dsc5 * (U((q2i >> 12) & 0x000F) + ((hb & hm4) ? U(16) : U(0)));
+      }
+
+      // --- per activation row: pure dot + dmin*sumy offset ---
+      for (int m = 0; m < vm; m++) {
+        const device T* xm = x + m * in_vec_size + x_base;
+        U t0 = U(0), t1 = U(0), t2 = U(0), t3 = U(0);
+        U sy0 = U(0), sy1 = U(0), sy2 = U(0), sy3 = U(0);
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+          const U a0 = U(xm[k + 0]);
+          const U a1 = U(xm[k + 32]);
+          const U a2 = U(xm[k + 128]);
+          const U a3 = U(xm[k + 160]);
+          t0 += a0 * g0[k];
+          t1 += a1 * g1[k];
+          t2 += a2 * g2[k];
+          t3 += a3 * g3[k];
+          sy0 += a0;
+          sy1 += a1;
+          sy2 += a2;
+          sy3 += a3;
+        }
+        result[m][row] += (t0 + t1 + t2 + t3) -
+            (sy0 * mc0 + sy1 * mc1 + sy2 * mc2 + sy3 * mc3);
+      }
+    }
+  }
+
+  for (int m = 0; m < vm; m++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      U r = simd_sum(result[m][row]);
+      if (simd_lid == 0) {
+        y[m * out_vec_size + out_row + row] = static_cast<T>(r);
+      }
     }
   }
 }
@@ -2774,6 +3175,22 @@ template <typename T, int group_size, int bits, bool batched>
 }
 
 template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q5_k_verify_qmv(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q5_k_verify_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, vm, tid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool batched>
 [[kernel]] void kq_q5_k_qmv(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -2968,6 +3385,125 @@ METAL_FUNC void kq_q6_k_qmv_fast_impl(
     result[row] = simd_sum(result[row]);
     if (simd_lid == 0) {
       y[out_row + row] = static_cast<T>(result[row]);
+    }
+  }
+}
+
+// Verify-shaped qmv. The per-row qmv (kq_q6_k_qmv_fast) puts M on grid_dims.x,
+// so each of the M rows runs its own threadgroup that independently re-reads the
+// weight tile — at M=4..8 that is 4-8x the weight traffic for the same answer.
+// This kernel instead runs ONE threadgroup per N-tile (grid_dims.x = 1), reads
+// each weight super-block ONCE, and dots it against ALL `vm` activation rows,
+// so the (dominant) weight read is amortized across the rows. For the small-M
+// verify / batched-decode regime (M = 2..MAX_VM) this recovers the bandwidth the
+// per-row qmv leaves on the table. Non-batched (B == 1) only; x is row-contiguous
+// [vm, in_vec_size], y is [vm, out_vec_size]. Math per (row, m) is identical to
+// kq_q6_k_qmv_fast_impl with x = row m, so results are bit-for-bit the same.
+template <typename T, int group_size, int bits>
+METAL_FUNC void kq_q6_k_verify_qmv_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(
+      group_size == KQ_Q6_K_SUPERBLOCK, "Q6_K kernel requires group_size=256");
+  static_assert(bits == 6, "Q6_K kernel requires bits=6");
+
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int sb_stride = 2;
+  constexpr int MAX_VM = 8;
+
+  typedef float U;
+  // Dequantized weights for the current output row, reused across all vm rows.
+  thread U wq[16];
+  // One accumulator per (row in this output tile, activation row m).
+  thread U result[MAX_VM][results_per_simdgroup];
+#pragma unroll
+  for (int m = 0; m < MAX_VM; m++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[m][row] = U(0);
+    }
+  }
+
+  const int tid_lane = simd_lid / 2;
+  const int ix = simd_lid % 2;
+  const int ip = tid_lane / 8;
+  const int il = tid_lane % 8;
+  const int l0 = 4 * il;
+  const int is = 8 * ip + l0 / 16;
+
+  const int row_bytes = in_vec_size * KQ_Q6_K_BLOCK_BYTES / KQ_Q6_K_SUPERBLOCK;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  const int nb = in_vec_size / KQ_Q6_K_SUPERBLOCK;
+
+  for (int ib = ix; ib < nb; ib += sb_stride) {
+    const int x_base = ib * KQ_Q6_K_SUPERBLOCK + 128 * ip + l0;
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const int row_idx = out_row + row;
+      const device uint8_t* sb_addr =
+          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q6_K_BLOCK_BYTES;
+
+      const device uint8_t* q1 = kq_q6_k_ql_ptr(sb_addr) + 64 * ip + l0;
+      const device uint8_t* q2 = q1 + 32;
+      const device uint8_t* qh = kq_q6_k_qh_ptr(sb_addr) + 32 * ip + l0;
+      const device int8_t* sc = kq_q6_k_scales_ptr(sb_addr) + is;
+      const U d = U(kq_q6_k_d(sb_addr));
+
+      // Dequantize this output row's 16 weights ONCE into registers.
+#pragma unroll
+      for (int l = 0; l < 4; l++) {
+        const uint8_t q1l = q1[l];
+        const uint8_t q2l = q2[l];
+        const uint8_t qhl = qh[l];
+        wq[4 * l + 0] =
+            U(int8_t((q1l & 0x0F) | ((qhl & 0x03) << 4)) - int8_t(32));
+        wq[4 * l + 1] =
+            U(int8_t((q2l & 0x0F) | ((qhl & 0x0C) << 2)) - int8_t(32));
+        wq[4 * l + 2] =
+            U(int8_t((q1l >> 4) | ((qhl & 0x30) << 0)) - int8_t(32));
+        wq[4 * l + 3] =
+            U(int8_t((q2l >> 4) | ((qhl & 0xC0) >> 2)) - int8_t(32));
+      }
+      const U sc0 = U(sc[0]);
+      const U sc1 = U(sc[2]);
+      const U sc2 = U(sc[4]);
+      const U sc3 = U(sc[6]);
+
+      // Dot the dequantized weight against each activation row. The weight read
+      // above happens once; only the (tiny, cache-resident) activations re-read.
+      for (int m = 0; m < vm; m++) {
+        const device T* xm = x + m * in_vec_size + x_base;
+        U sums0 = U(0), sums1 = U(0), sums2 = U(0), sums3 = U(0);
+#pragma unroll
+        for (int l = 0; l < 4; l++) {
+          sums0 += U(xm[l + 0]) * wq[4 * l + 0];
+          sums1 += U(xm[l + 32]) * wq[4 * l + 1];
+          sums2 += U(xm[l + 64]) * wq[4 * l + 2];
+          sums3 += U(xm[l + 96]) * wq[4 * l + 3];
+        }
+        result[m][row] +=
+            d * (sums0 * sc0 + sums1 * sc1 + sums2 * sc2 + sums3 * sc3);
+      }
+    }
+  }
+
+  for (int m = 0; m < vm; m++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      U r = simd_sum(result[m][row]);
+      if (simd_lid == 0) {
+        y[m * out_vec_size + out_row + row] = static_cast<T>(r);
+      }
     }
   }
 }
@@ -3433,6 +3969,25 @@ template <typename T, int group_size, int bits, bool batched>
   }
   kq_q6_k_qmv_fast_impl<T, group_size, bits>(
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+// `batched` is carried only so this reuses the instantiate_kquant_batched macro;
+// the verify path is dispatched non-batched (B == 1) so the offset adjust is a
+// no-op and is omitted.
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q6_k_verify_qmv(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q6_k_verify_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, vm, tid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits, bool batched>
