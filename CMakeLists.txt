@@ -81,6 +81,7 @@ add_library(mlx_kquant_ext)
 target_sources(
   mlx_kquant_ext
   PUBLIC ${CMAKE_CURRENT_LIST_DIR}/src/kquant_codec.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_cpu_decode.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_ops.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_dequantize.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_matmul.cpp

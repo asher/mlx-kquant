@@ -147,10 +147,10 @@ Measured on an M5 Max (128 GB):
   MLX's exported `Device::get_kernel`. No JIT, no steel host structs.
 - **Codec registry** derives `group_size`/`bits` from the codec name, so callers pass only
   `kquant_type`.
-- **GPU (Metal) is the only execution path today.** A scalar CPU **decode** path (`dequantize` /
-  `quantized_matmul` / `gather_qmm`) is on the near-term roadmap — it enables running the op tests in
-  CI without a GPU and CPU-side LoRA train/infer on Linux. CPU **encode** (`quantize`) follows in
-  0.2.0. Until then, all ops require an Apple-Silicon GPU.
+- **CPU and GPU execution.** The decode ops (`dequantize` / `quantized_matmul` / `gather_qmm`) run on
+  either stream — a scalar CPU path (all 10 codecs) backs `stream=mx.cpu` and doubles as the
+  correctness oracle the Metal kernels are A/B'd against, so the op tests can run in CI without a GPU.
+  **Encode (`quantize`) is GPU-only** until the CPU encoder lands in 0.2.0.
 
 ## Scope
 
@@ -185,7 +185,7 @@ exact file plus two appended helpers), rebuild, and re-run the test suite.
 ## Tests
 
 ```sh
-python -m pytest tests/      # dequant / matmul / gather / codecs / encode
+python -m pytest tests/      # dequant / matmul / gather / codecs / cpu_decode / encode
 ```
 
 ## Requirements
@@ -198,15 +198,15 @@ python -m pytest tests/      # dequant / matmul / gather / codecs / encode
 
 ## Limitations
 
-- **GPU-only today.** Every op runs on Metal; there is no CPU fallback yet (decode path is on the
-  roadmap, encode after that). No NVIDIA/AMD/Linux-GPU support.
-- **Encode (`quantize`) is GPU-only** and currently macOS-only.
+- **Decode runs on CPU or Metal; encode is GPU-only.** `dequantize` / `quantized_matmul` /
+  `gather_qmm` have a scalar CPU path (`stream=mx.cpu`); `quantize` requires an Apple-Silicon GPU
+  until the 0.2.0 CPU encoder. No NVIDIA/AMD/Linux-GPU support; a Metal-free Linux build is on the
+  roadmap.
 - The library is the **op layer**, not a model runtime. To load and run full GGUF models, use the
   separate [`gguf-mlx`](#running-full-gguf-models--gguf-mlx) package.
 
 ## Roadmap
 
-- CPU **decode** path (all 10 codecs) → GPU-free CI op tests + CPU LoRA train/infer.
 - Training `vjp` on the matmul/gather ops → LoRA fine-tuning on kquant bases.
 - A Metal-free **Linux** build (CPU train/infer), contingent on the mlx Linux wheel exercising the
   CPU eval paths.

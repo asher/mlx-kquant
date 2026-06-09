@@ -24,8 +24,8 @@ toolchain that runs on a stock `mlx==0.31.2` wheel (no MLX-core fork).
   `run`. Requires the `[tools]` extra.
 - LoRA support for kquant bases (`mlx_kquant.lora_patch` + `docs/lora.md`),
   backed by a gradient-wrt-x `vjp` on the matmul / gather ops.
-- CPU decode path for all 10 codecs (`KQUANT_FORCE_CPU=1`), so the op tests run
-  without a GPU.
+- CPU decode path for all 10 codecs (`stream=mx.cpu`) covering `dequantize` /
+  `quantized_matmul` / `gather_qmm`, so the op tests run without a GPU.
 - PEP 621 packaging, `py.typed`, ruff config, CI (lint + build + honest GPU-gated
   op tests), and a tag-triggered wheel-publish workflow.
 

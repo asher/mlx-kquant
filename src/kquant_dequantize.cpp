@@ -13,9 +13,12 @@
 
 #include "kquant.h"
 #include "kquant_codec.h"
+#include "kquant_cpu_decode.h"
 #include "kquant_internal.h"
 
 #include "mlx/allocator.h"
+#include "mlx/backend/cpu/encoder.h"
+#include "mlx/types/half_types.h"
 
 #ifdef _METAL_
 #include "kquant_metal_internal.h" // kq_get_kernel (cached library handle)
@@ -59,11 +62,37 @@ bool KQuantDequantize::is_equivalent(const mx::Primitive& other) const {
 }
 
 void KQuantDequantize::eval_cpu(
-    const std::vector<mx::array>&,
-    std::vector<mx::array>&) {
-  throw std::runtime_error(
-      "[mlx_kquant] dequantize has no CPU implementation yet; run on the GPU "
-      "stream (the default device).");
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& w = inputs[0]; // uint8 wire bytes, row-contiguous (ensured by the op)
+  // inputs[1] is the vestigial scales placeholder — ignored (scales live in w).
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  auto& encoder = mx::cpu::get_command_encoder(stream());
+  encoder.set_input_array(w);
+  encoder.set_output_array(out);
+  encoder.dispatch([w = mx::array::unsafe_weak_copy(w),
+                    out = mx::array::unsafe_weak_copy(out),
+                    kquant_type = kquant_type_]() mutable {
+    const uint8_t* wp = w.data<uint8_t>();
+    std::size_t num_weights = out.size();
+    auto dt = out.dtype();
+    if (dt == mx::float32) {
+      kquant_dequantize_dispatch(
+          wp, out.data<float>(), num_weights, kquant_type);
+    } else if (dt == mx::float16) {
+      kquant_dequantize_dispatch(
+          wp, out.data<mx::float16_t>(), num_weights, kquant_type);
+    } else if (dt == mx::bfloat16) {
+      kquant_dequantize_dispatch(
+          wp, out.data<mx::bfloat16_t>(), num_weights, kquant_type);
+    } else {
+      throw std::runtime_error(
+          "[mlx_kquant] dequantize: only float32/float16/bfloat16 outputs are "
+          "supported.");
+    }
+  });
 }
 
 #ifdef _METAL_

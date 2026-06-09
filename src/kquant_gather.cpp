@@ -18,14 +18,20 @@
 // while decode (top_k<64 -> no sort -> B<16) falls through to gather_qmv,
 // exactly as the fork does. An earlier revision deferred this on a swapped
 // left/right_sorted premise, which left MoE prefill ~3.3x slower than the fork.
+#include <cstddef>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include "kquant.h"
 #include "kquant_codec.h"
+#include "kquant_cpu_decode.h"
 #include "kquant_internal.h"
 
 #include "mlx/allocator.h"
+#include "mlx/backend/common/utils.h" // elem_to_loc
+#include "mlx/backend/cpu/encoder.h"
+#include "mlx/types/half_types.h"
 
 #ifdef _METAL_
 #include "kquant_metal_internal.h" // shared dispatch helpers
@@ -363,11 +369,72 @@ bool KQuantGatherQMM::is_equivalent(const mx::Primitive& other) const {
 }
 
 void KQuantGatherQMM::eval_cpu(
-    const std::vector<mx::array>&,
-    std::vector<mx::array>&) {
-  throw std::runtime_error(
-      "[mlx_kquant] gather_qmm has no CPU implementation; run on the GPU stream "
-      "(the default device).");
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  // inputs: x, w (uint8), scales placeholder (ignored), lhs_indices,
+  // rhs_indices. x / w matrix-contiguous by the op; indices walked via
+  // elem_to_loc. One output row [M, N] per lhs_indices element.
+  const auto& x = inputs[0];
+  const auto& w = inputs[1];
+  const auto& lhs_indices = inputs[3];
+  const auto& rhs_indices = inputs[4];
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  auto& encoder = mx::cpu::get_command_encoder(stream());
+  encoder.set_input_array(x);
+  encoder.set_input_array(w);
+  encoder.set_input_array(lhs_indices);
+  encoder.set_input_array(rhs_indices);
+  encoder.set_output_array(out);
+  encoder.dispatch([out = mx::array::unsafe_weak_copy(out),
+                    x = mx::array::unsafe_weak_copy(x),
+                    w = mx::array::unsafe_weak_copy(w),
+                    lhs_indices = mx::array::unsafe_weak_copy(lhs_indices),
+                    rhs_indices = mx::array::unsafe_weak_copy(rhs_indices),
+                    transpose_ = transpose_,
+                    kquant_type = kquant_type_]() mutable {
+    int K = x.shape(-1);
+    int M = x.shape(-2);
+    int N = out.shape(-1);
+    std::size_t w_els = static_cast<std::size_t>(w.shape(-1)) * w.shape(-2);
+    const uint32_t* lhs_ptr = lhs_indices.data<uint32_t>();
+    const uint32_t* rhs_ptr = rhs_indices.data<uint32_t>();
+    int n_rows = static_cast<int>(lhs_indices.size());
+
+    auto gather_loop = [&](auto* tag) {
+      using T = std::remove_pointer_t<decltype(tag)>;
+      for (int i = 0; i < n_rows; i++) {
+        int x_idx = static_cast<int>(lhs_ptr[mx::elem_to_loc(
+            i, lhs_indices.shape(), lhs_indices.strides())]);
+        int w_idx = static_cast<int>(rhs_ptr[mx::elem_to_loc(
+            i, rhs_indices.shape(), rhs_indices.strides())]);
+        kquant_qmm_cpu<T>(
+            out.data<T>() + static_cast<std::size_t>(i) * M * N,
+            x.data<T>() +
+                mx::elem_to_loc(x_idx * M * K, x.shape(), x.strides()),
+            w.data<uint8_t>() +
+                mx::elem_to_loc(w_idx * w_els, w.shape(), w.strides()),
+            M,
+            N,
+            K,
+            transpose_,
+            kquant_type);
+      }
+    };
+    auto dt = x.dtype();
+    if (dt == mx::float32) {
+      gather_loop(static_cast<float*>(nullptr));
+    } else if (dt == mx::float16) {
+      gather_loop(static_cast<mx::float16_t*>(nullptr));
+    } else if (dt == mx::bfloat16) {
+      gather_loop(static_cast<mx::bfloat16_t*>(nullptr));
+    } else {
+      throw std::runtime_error(
+          "[mlx_kquant] gather_qmm: only float32/float16/bfloat16 inputs are "
+          "supported.");
+    }
+  });
 }
 
 #ifdef _METAL_

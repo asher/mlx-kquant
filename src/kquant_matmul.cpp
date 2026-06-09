@@ -11,15 +11,21 @@
 //   * the split-k paths (qmm_splitk / qvm_split_k) need the unexported
 //     strided_reduce_general_dispatch -> gated off; plain qmm/qvm run instead.
 //   * kquant never carries biases, so the bias buffer is dropped throughout.
+#include <cstddef>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include "kquant.h"
 #include "kquant_codec.h"
+#include "kquant_cpu_decode.h"
 #include "kquant_internal.h"
 
 #include "mlx/allocator.h"
+#include "mlx/backend/common/utils.h" // elem_to_loc
+#include "mlx/backend/cpu/encoder.h"
+#include "mlx/types/half_types.h"
 #include "mlx/utils.h" // env::enable_tf32
 
 #ifdef _METAL_
@@ -387,11 +393,60 @@ bool KQuantMatmul::is_equivalent(const mx::Primitive& other) const {
 }
 
 void KQuantMatmul::eval_cpu(
-    const std::vector<mx::array>&,
-    std::vector<mx::array>&) {
-  throw std::runtime_error(
-      "[mlx_kquant] quantized_matmul has no CPU implementation; run on the GPU "
-      "stream (the default device).");
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  // inputs: x, w (uint8), scales placeholder (ignored). Matrix-contiguous by
+  // the op, so the M x K / weight rows are dense; leading (batch) dims are
+  // walked via elem_to_loc.
+  const auto& x = inputs[0];
+  const auto& w = inputs[1];
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  auto& encoder = mx::cpu::get_command_encoder(stream());
+  encoder.set_input_array(x);
+  encoder.set_input_array(w);
+  encoder.set_output_array(out);
+  encoder.dispatch([out = mx::array::unsafe_weak_copy(out),
+                    x = mx::array::unsafe_weak_copy(x),
+                    w = mx::array::unsafe_weak_copy(w),
+                    transpose_ = transpose_,
+                    kquant_type = kquant_type_]() mutable {
+    int K = x.shape(-1);
+    int M = x.ndim() > 1 ? x.shape(-2) : 1;
+    int N = out.shape(-1);
+    int batch_size =
+        static_cast<int>(x.size() / (static_cast<std::size_t>(K) * M));
+    std::size_t w_batch_els =
+        w.ndim() > 2 ? static_cast<std::size_t>(w.shape(-1)) * w.shape(-2) : 0;
+    auto run = [&](auto* tag) {
+      using T = std::remove_pointer_t<decltype(tag)>;
+      for (int i = 0; i < batch_size; i++) {
+        kquant_qmm_cpu<T>(
+            out.data<T>() + static_cast<std::size_t>(i) * M * N,
+            x.data<T>() + mx::elem_to_loc(i * M * K, x.shape(), x.strides()),
+            w.data<uint8_t>() +
+                mx::elem_to_loc(i * w_batch_els, w.shape(), w.strides()),
+            M,
+            N,
+            K,
+            transpose_,
+            kquant_type);
+      }
+    };
+    auto dt = x.dtype();
+    if (dt == mx::float32) {
+      run(static_cast<float*>(nullptr));
+    } else if (dt == mx::float16) {
+      run(static_cast<mx::float16_t*>(nullptr));
+    } else if (dt == mx::bfloat16) {
+      run(static_cast<mx::bfloat16_t*>(nullptr));
+    } else {
+      throw std::runtime_error(
+          "[mlx_kquant] quantized_matmul: only float32/float16/bfloat16 inputs "
+          "are supported.");
+    }
+  });
 }
 
 #ifdef _METAL_
