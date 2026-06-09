@@ -110,8 +110,23 @@ jobs:
       - name: No-GPU note
         if: steps.gpu.outputs.available != '1'
         run: |
-          echo "::warning title=GPU op tests skipped::No usable Metal GPU on this runner. The badge covers lint + build + codec doc-lint. Numeric op coverage (all 10 codecs on CPU) lands with the Phase F CPU decode path, after which these run under KQUANT_FORCE_CPU=1 unconditionally."
+          echo "::warning title=GPU-only tests skipped::No usable Metal GPU on this runner. Numeric op coverage still runs on CPU (the KQUANT_FORCE_CPU step below, all 10 codecs); only the GPU-only encode + model round-trips are skipped here."
 
-      # Phase F (CPU decode) will add, here, an unconditional CPU op-test step:
-      #   env: { KQUANT_FORCE_CPU: "1" }
-      #   run: pytest -q tests/test_codecs.py tests/test_gather.py tests/test_nn.py tests/test_recipes.py
+      # CPU decode-path op tests — unconditional, no GPU needed (the scalar CPU
+      # eval paths). This is the enforced numeric gate on hosted runners: all 10
+      # codecs through dequantize / quantized_matmul / gather_qmm, the nn layers,
+      # the GGUF wire-byte reader, and the training vjp (its re-dispatch resolves
+      # on CPU too). KQUANT_FORCE_CPU=1 makes conftest set the default device to
+      # CPU. Encode stays GPU-only (test_encode + the loader/cli round-trips,
+      # which quantize) until the v0.2.0 CPU encoder.
+      - name: CPU op tests (KQUANT_FORCE_CPU)
+        env:
+          KQUANT_FORCE_CPU: "1"
+        run: >-
+          pytest -q
+          tests/test_cpu_decode.py
+          tests/test_codecs.py
+          tests/test_gather.py
+          tests/test_nn.py
+          tests/test_gguf.py
+          tests/test_vjp.py
