@@ -1,11 +1,14 @@
 """kquant encode driver + checkpoint serializer.
 
-:func:`quantize` walks a constructed (unquantized) ``mlx-lm`` model, resolves a
-per-tensor codec from a recipe preset (see :mod:`mlx_kquant.recipes`), encodes
-each quantizable weight with ``kq.quantize`` (GPU), and swaps in the matching
-``KQuant*`` module so the returned model runs immediately. :func:`save` writes
-the result as an ``mlx-lm``-readable checkpoint (sharded safetensors +
+:func:`quantize_model` walks a constructed (unquantized) ``mlx-lm`` model,
+resolves a per-tensor codec from a recipe preset (see :mod:`mlx_kquant.recipes`),
+encodes each quantizable weight with the ``quantize`` op (GPU), and swaps in the
+matching ``KQuant*`` module so the returned model runs immediately. :func:`save`
+writes the result as an ``mlx-lm``-readable checkpoint (sharded safetensors +
 ``config.json``).
+
+This module is named ``convert`` (not ``quantize``) on purpose: a ``quantize``
+submodule would shadow the package-level ``mlx_kquant.quantize`` encode op.
 
 On-disk format (matches the kquant-fork / a future upstream byte-for-byte, so
 checkpoints interoperate):
@@ -17,7 +20,7 @@ checkpoints interoperate):
   (uint8 ``[1]`` placeholder — K-quant scales live inside the wire bytes), and an
   optional ``<path>.bias``; unquantized tensors keep their source dtype.
 
-Encode is GPU-only in v0.1.0 (``kq.quantize`` has no CPU path yet).
+Encode is GPU-only in v0.1.0 (the ``quantize`` op has no CPU path yet).
 """
 
 from __future__ import annotations
@@ -32,8 +35,10 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
-import mlx_kquant as kq
-
+# Bind the encode op by its stable extension location: the package attribute
+# ``mlx_kquant.quantize`` is the op, but importing a ``quantize`` submodule would
+# shadow it — hence this module is named ``convert`` and reaches the op via _ext.
+from ._ext import quantize as _encode_op
 from .codec_geometry import geometry
 from .recipes import classify_tensors, resolve_codec_map
 
@@ -64,12 +69,12 @@ def _encode_weight(w: mx.array, codec: str, imatrix_vec: np.ndarray | None) -> m
         in_dims = w.shape[-1]
         if imatrix_vec.shape == (in_dims,):
             imatrix_arg = mx.array(imatrix_vec, dtype=mx.float32)
-    wq, _ = kq.quantize(w, codec, imatrix=imatrix_arg)
+    wq, _ = _encode_op(w, codec, imatrix=imatrix_arg)
     mx.eval(wq)
     return wq
 
 
-def quantize(
+def quantize_model(
     model: nn.Module,
     config: dict,
     *,
@@ -94,7 +99,7 @@ def quantize(
         swapped in, and a config carrying the ``quantization`` map.
     """
     if preset is None and default_codec is None:
-        raise ValueError("quantize() needs a preset or a default_codec (or both)")
+        raise ValueError("quantize_model() needs a preset or a default_codec (or both)")
 
     from mlx_lm.models.switch_layers import SwitchLinear
 
