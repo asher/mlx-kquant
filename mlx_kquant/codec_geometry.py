@@ -1,0 +1,59 @@
+"""Single source of truth for GGUF K-quant / legacy codec geometry.
+
+Every other Python module (``nn``, ``recipes``, ``quantize``, the loader, and the
+``scripts/check-codecs.py`` doc-lint) imports its codec facts from here so the
+numbers can never drift apart. The authoritative values are the block layouts
+the ``mlx_kquant`` extension's kernels implement (``kq.codecs()`` enumerates the
+same set at runtime).
+"""
+
+from __future__ import annotations
+
+# codec -> (group_size, bits, bytes_per_block, weights_per_block)
+#
+# K-quant superblocks pack 256 weights per block; the legacy block codecs pack
+# 32. ``bytes_per_block`` is the on-disk GGUF block size (scales live inside it).
+CODEC_GEOMETRY: dict[str, tuple[int, int, int, int]] = {
+    "q8_0": (32, 8, 34, 32),
+    "q4_0": (32, 4, 18, 32),
+    "q4_1": (32, 4, 20, 32),
+    "q5_0": (32, 5, 22, 32),
+    "q5_1": (32, 5, 24, 32),
+    "q4_k": (256, 4, 144, 256),
+    "q5_k": (256, 5, 176, 256),
+    "q6_k": (256, 6, 210, 256),
+    "q3_k": (256, 3, 110, 256),
+    "q2_k": (256, 2, 84, 256),
+}
+
+# Every codec the GPU encoder (``kq.quantize``) can produce. The extension
+# encodes all ten; the four legacy block codecs + q8_0 simply ignore an imatrix.
+ENCODER_CODECS: frozenset[str] = frozenset(CODEC_GEOMETRY)
+
+# Only the K-quant superblocks have an importance-weighted rounding path, so an
+# imatrix changes their wire bytes; for everything else it is a no-op.
+IMATRIX_CODECS: frozenset[str] = frozenset(
+    name for name, (_, _, _, wpb) in CODEC_GEOMETRY.items() if wpb == 256
+)
+
+
+def geometry(codec: str) -> tuple[int, int, int, int]:
+    """Return ``(group_size, bits, bytes_per_block, weights_per_block)``."""
+    try:
+        return CODEC_GEOMETRY[codec]
+    except KeyError:
+        raise ValueError(
+            f"unknown codec {codec!r}; known codecs: "
+            f"{', '.join(sorted(CODEC_GEOMETRY))}"
+        ) from None
+
+
+def bytes_per_row(codec: str, in_dims: int) -> int:
+    """uint8 wire-byte width of one quantized row of ``in_dims`` weights."""
+    gs, bits, bpb, wpb = geometry(codec)
+    if in_dims % wpb != 0:
+        raise ValueError(
+            f"codec {codec!r} packs {wpb} weights/block; row width {in_dims} "
+            f"is not a multiple of {wpb}"
+        )
+    return (in_dims // wpb) * bpb

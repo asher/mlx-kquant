@@ -28,8 +28,10 @@ from ._ext import (  # noqa: F401
     quantize,
     quantized_matmul,
 )
+from ._version import __version__
 
 __all__ = [
+    "__version__",
     "codecs",
     "dequantize",
     "gather_qmm",

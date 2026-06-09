@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M2+ quantized-matmul validation: kq.quantized_matmul (or the fork's
+"""Quantized-matmul validation: kq.quantized_matmul (or the fork's
 mx.quantized_matmul) vs an INDEPENDENT dequant-then-matmul reference.
 
 The reference dequant comes from gguf-py's numpy decoder, NOT the extension, so
@@ -58,8 +58,14 @@ except ImportError:
 
     def _qmm(x, w, scales, gs, bits, codec, transpose):
         return mx.quantized_matmul(
-            x, w, scales, transpose=transpose, group_size=gs, bits=bits,
-            mode="kquant", kquant_type=codec,
+            x,
+            w,
+            scales,
+            transpose=transpose,
+            group_size=gs,
+            bits=bits,
+            mode="kquant",
+            kquant_type=codec,
         )
 
 
@@ -103,7 +109,8 @@ def main(argv=None) -> int:
     # stays correct for a wide weight (>2GB, N~262144) where an f16 matmul
     # overflows to inf and even stock mx.matmul overflows int32 row offsets to 0;
     # either would mask or fake a kernel failure. CPU f32 is the trustworthy oracle.
-    deq = quants.dequantize(np.ascontiguousarray(packed), gtype).astype(np.float32)  # [N, K]
+    # [N, K]
+    deq = quants.dequantize(np.ascontiguousarray(packed), gtype).astype(np.float32)
 
     rng = np.random.default_rng(0)
     worst = 0.0
@@ -126,8 +133,10 @@ def main(argv=None) -> int:
         worst = max(worst, max_rel)
         if not ok:
             fail += 1
-        print(f"  {M:>5} {str(tuple(g.shape)):>14} {max_abs:>11.3e} "
-              f"{max_rel:>11.3e} {'ok' if ok else 'FAIL':>8}")
+        print(
+            f"  {M:>5} {str(tuple(g.shape)):>14} {max_abs:>11.3e} "
+            f"{max_rel:>11.3e} {'ok' if ok else 'FAIL':>8}"
+        )
 
     print(f"\nworst max_rel = {worst:.3e}; {'PASS' if not fail else f'{fail} FAIL'}")
     return 1 if fail else 0

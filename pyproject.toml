@@ -1,11 +1,66 @@
 [build-system]
 requires = [
-  "setuptools>=42",
+  "setuptools>=77",
   "cmake>=3.27",
   "mlx==0.31.2",
   "nanobind==2.12.0",
 ]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-kquant"
+dynamic = ["version"]
+description = "GGUF K-quant dequantize / quantized-matmul / gather-qmm / quantize ops for MLX, via custom Metal kernels (no MLX-core fork required)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Asher Feldman" }]
+keywords = [
+  "mlx",
+  "quantization",
+  "gguf",
+  "k-quant",
+  "metal",
+  "apple-silicon",
+  "llm",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: MacOS",
+  "Environment :: GPU",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["mlx==0.31.2"]
+
+# Model-level helpers (the create-weights toolchain, loader, and CLI) need the
+# mlx-lm model zoo and friends; the raw ``kq.*`` ops do not. Keep that weight
+# behind an extra so ``import mlx_kquant`` stays a thin op layer.
+[project.optional-dependencies]
+tools = ["mlx-lm>=0.27", "transformers", "gguf", "numpy"]
+dev = ["pytest", "ruff", "numpy", "gguf"]
+
+[project.scripts]
+mlx-kquant = "mlx_kquant.cli:main"
+mlxkq = "mlx_kquant.cli:main"
+
+# [project.urls] intentionally omitted until the public GitHub repo exists —
+# add Homepage / Repository / Issues there rather than shipping a guessed URL.
+
+[tool.setuptools.dynamic]
+version = { attr = "mlx_kquant._version.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["mlx_kquant*"]
+
+[tool.setuptools.package-data]
+mlx_kquant = ["*.so", "*.dylib", "*.metallib", "py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -13,3 +68,37 @@ markers = [
   "integration: end-to-end test needing a real GGUF (and, for parity, a llama.cpp binary); skipped unless KQUANT_TEST_GGUF_DIR is set",
   "slow: long-running (large prompts / long generation)",
 ]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+extend-exclude = ["build", "tests/fixtures"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["E741"]  # ambiguous var names (l/I) appear in math-y kernel glue
+
+# ---------------------------------------------------------------------------
+# Wheel building (cibuildwheel). macOS arm64 only — the extension is a Metal
+# module. Build isolation pulls [build-system].requires (incl. the ABI-pinned
+# mlx==0.31.2 + nanobind + the Metal toolchain from the runner's Xcode).
+#
+# NOTE: this config is a skeleton — it has NOT yet produced a wheel validated on
+# a second machine. Before the first PyPI publish, build locally, then
+# `pip install` the wheel into a CLEAN venv with only mlx==0.31.2 and confirm
+# `python -c "import mlx_kquant as kq; kq.metallib_loads()"` on a GPU box.
+# ---------------------------------------------------------------------------
+[tool.cibuildwheel]
+build = "cp310-* cp311-* cp312-* cp313-*"
+build-frontend = "build"
+# check-codecs imports the installed wheel (pulling in the mlx dependency) and
+# exercises kq.codecs() — GPU-free, so it validates the libmlx rpath resolves.
+test-command = "python {project}/scripts/check-codecs.py --check"
+
+[tool.cibuildwheel.macos]
+archs = ["arm64"]
+# Do NOT vendor libmlx into the wheel: the extension is ABI-pinned to the user's
+# installed mlx==0.31.2 and resolves it via the @loader_path/../mlx/lib rpath
+# (see CMakeLists.txt). Bundling a second libmlx copy would split MLX global
+# state and resurrect the gguflib<->libmlx symbol collision.
+repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} --exclude libmlx.dylib -w {dest_dir} -v {wheel}"

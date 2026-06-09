@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M4: validate kq.gather_qmm (mixture-of-experts gathered matmul).
+"""Validate kq.gather_qmm (mixture-of-experts gathered matmul).
 
 For each codec, builds E expert weight matrices (flat codecs synthesized in
 process via gguf.quants.quantize; K-quants loaded from tests/fixtures/
@@ -28,7 +28,8 @@ import sys
 
 import mlx.core as mx
 import numpy as np
-from gguf import GGMLQuantizationType as GT, quants
+from gguf import GGMLQuantizationType as GT
+from gguf import quants
 
 # codec -> (gguf type, weights_per_block, bytes_per_block, bits, is_kquant)
 CODECS = {
@@ -53,16 +54,27 @@ try:
     BACKEND = "mlx_kquant"
 
     def _gather(x, w, sc, gs, bits, codec, lhs, rhs):
-        return kq.gather_qmm(x, w, sc, codec, lhs_indices=lhs,
-                             rhs_indices=rhs, transpose=True)
+        return kq.gather_qmm(
+            x, w, sc, codec, lhs_indices=lhs, rhs_indices=rhs, transpose=True
+        )
 
 except ImportError:
     BACKEND = "fork-mx"
 
     def _gather(x, w, sc, gs, bits, codec, lhs, rhs):
-        return mx.gather_qmm(x, w, sc, None, lhs_indices=lhs, rhs_indices=rhs,
-                             transpose=True, group_size=gs, bits=bits,
-                             mode="kquant", kquant_type=codec)
+        return mx.gather_qmm(
+            x,
+            w,
+            sc,
+            None,
+            lhs_indices=lhs,
+            rhs_indices=rhs,
+            transpose=True,
+            group_size=gs,
+            bits=bits,
+            mode="kquant",
+            kquant_type=codec,
+        )
 
 
 def _wire_and_ref(codec, gtype, wpb, bpb, is_kquant):
@@ -73,14 +85,16 @@ def _wire_and_ref(codec, gtype, wpb, bpb, is_kquant):
             return None, None
         z = np.load(path)
         wire = z["wire"].astype(np.uint8)  # [E, N, packed]
-        refs = [quants.dequantize(np.ascontiguousarray(wire[e]), gtype)
-                for e in range(wire.shape[0])]
+        refs = [
+            quants.dequantize(np.ascontiguousarray(wire[e]), gtype)
+            for e in range(wire.shape[0])
+        ]
         return wire, np.stack(refs, axis=0).astype(np.float32)
     # flat codec: synthesize E experts
     rng = np.random.default_rng(11)
     wires, refs = [], []
     for _ in range(E):
-        we = (rng.standard_normal((N, K)).astype(np.float32) * 0.1)
+        we = rng.standard_normal((N, K)).astype(np.float32) * 0.1
         wq = quants.quantize(we, gtype).astype(np.uint8)
         wires.append(wq)
         refs.append(quants.dequantize(np.ascontiguousarray(wq), gtype))
@@ -135,16 +149,19 @@ def main(argv=None) -> int:
                 got = _gather(x, w, scales, wpb, bits, codec, lhs, rhs)
                 # reference: per-output x[lhs[b]] @ deq[experts[b]].T
                 ref_rows = mx.stack(
-                    [x[int(lhs_np[b])] @ deq[int(experts[b])].T
-                     for b in range(B)], axis=0)
+                    [x[int(lhs_np[b])] @ deq[int(experts[b])].T for b in range(B)],
+                    axis=0,
+                )
                 mx.eval(got, ref_rows)
                 g = np.array(got).astype(np.float32)
                 rr = np.array(ref_rows).astype(np.float32)
                 rel = float(np.linalg.norm(g - rr) / (np.linalg.norm(rr) + 1e-6))
                 bad = rel >= 2e-2 or g.shape != rr.shape
                 fails += bad
-                print(f"  {codec:<6} {M:>4} {B:>3} {tag:>5} {rel:>10.3e} "
-                      f"{'FAIL' if bad else 'ok':>8}")
+                print(
+                    f"  {codec:<6} {M:>4} {B:>3} {tag:>5} {rel:>10.3e} "
+                    f"{'FAIL' if bad else 'ok':>8}"
+                )
 
     if missing:
         print(f"\nMISSING fixtures (FAIL): {', '.join(missing)}")
@@ -180,7 +197,7 @@ def test_rhs_gather_large_M_no_short_overflow():
     rng = np.random.default_rng(7)
     wires, refs = [], []
     for _ in range(Eg):
-        we = (rng.standard_normal((Ng, Kg)).astype(np.float32) * 0.1)
+        we = rng.standard_normal((Ng, Kg)).astype(np.float32) * 0.1
         wq = quants.quantize(we, gtype).astype(np.uint8)
         wires.append(wq)
         refs.append(quants.dequantize(np.ascontiguousarray(wq), gtype))
@@ -194,13 +211,16 @@ def test_rhs_gather_large_M_no_short_overflow():
     assert B % 64 != 0 and B > 32767
     experts = np.sort(rng.integers(0, Eg, size=B).astype(np.uint32))
     rhs = mx.array(experts)
-    x = mx.array((rng.standard_normal((B, 1, Kg)) * 0.1).astype(np.float32)
-                 ).astype(mx.float16)
+    x = mx.array((rng.standard_normal((B, 1, Kg)) * 0.1).astype(np.float32)).astype(
+        mx.float16
+    )
 
-    fast = kq.gather_qmm(x, w, scales, codec, rhs_indices=rhs,
-                         transpose=True, sorted_indices=True).reshape(B, Ng)
-    ref = kq.gather_qmm(x, w, scales, codec, rhs_indices=rhs,
-                        transpose=True, sorted_indices=False).reshape(B, Ng)
+    fast = kq.gather_qmm(
+        x, w, scales, codec, rhs_indices=rhs, transpose=True, sorted_indices=True
+    ).reshape(B, Ng)
+    ref = kq.gather_qmm(
+        x, w, scales, codec, rhs_indices=rhs, transpose=True, sorted_indices=False
+    ).reshape(B, Ng)
     mx.eval(fast, ref)
     max_abs = float(mx.abs(fast - ref).max().item())
     assert max_abs < 1e-2, f"sorted rhs-gather diverges from per-row leaf: {max_abs}"

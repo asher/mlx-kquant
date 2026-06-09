@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M3: validate all 10 K-quant codecs (dequant + matmul) end to end.
+"""Validate all 10 K-quant codecs (dequant + matmul) end to end.
 
 Test data per codec:
   * flat codecs (q4_0/q4_1/q5_0/q5_1/q8_0): synthesized in-process via
@@ -27,7 +27,8 @@ import sys
 
 import mlx.core as mx
 import numpy as np
-from gguf import GGMLQuantizationType as GT, quants
+from gguf import GGMLQuantizationType as GT
+from gguf import quants
 
 # codec -> (gguf type, weights_per_block, bytes_per_block, bits, is_kquant)
 CODECS = {
@@ -61,12 +62,21 @@ except ImportError:
     BACKEND = "fork-mx"
 
     def _dequant(w, sc, gs, bits, codec, dt):
-        return mx.dequantize(w, sc, group_size=gs, bits=bits,
-                             mode="kquant", kquant_type=codec, dtype=dt)
+        return mx.dequantize(
+            w, sc, group_size=gs, bits=bits, mode="kquant", kquant_type=codec, dtype=dt
+        )
 
     def _qmm(x, w, sc, gs, bits, codec, transpose=True):
-        return mx.quantized_matmul(x, w, sc, transpose=transpose, group_size=gs,
-                                   bits=bits, mode="kquant", kquant_type=codec)
+        return mx.quantized_matmul(
+            x,
+            w,
+            sc,
+            transpose=transpose,
+            group_size=gs,
+            bits=bits,
+            mode="kquant",
+            kquant_type=codec,
+        )
 
 
 def _wire_and_ref(codec, gtype, wpb, bpb, is_kquant):
@@ -81,7 +91,7 @@ def _wire_and_ref(codec, gtype, wpb, bpb, is_kquant):
         return wire, ref
     # flat codec: synthesize
     rng = np.random.default_rng(7)
-    w = (rng.standard_normal((N, K)).astype(np.float32) * 0.1)
+    w = rng.standard_normal((N, K)).astype(np.float32) * 0.1
     wire = quants.quantize(w, gtype).astype(np.uint8)
     ref = quants.dequantize(np.ascontiguousarray(wire), gtype).astype(np.float32)
     return wire, ref
@@ -94,8 +104,10 @@ def main(argv=None) -> int:
     allow = {c.strip() for c in args.codecs.split(",") if c.strip()}
 
     print(f"=== test_codecs [{BACKEND}] ===")
-    print(f"  {'codec':<6} {'deq_f32':>9} {'deq_f16':>9} {'mm_rel_t':>10} "
-          f"{'mm_rel_n':>10} {'verdict':>8}")
+    print(
+        f"  {'codec':<6} {'deq_f32':>9} {'deq_f16':>9} {'mm_rel_t':>10} "
+        f"{'mm_rel_n':>10} {'verdict':>8}"
+    )
     fails = 0
     missing = []
     for codec, (gtype, wpb, bpb, bits, is_kq) in CODECS.items():
@@ -121,8 +133,11 @@ def main(argv=None) -> int:
         mx.eval(out32, out16)
         a32 = np.array(out32).astype(np.float32).reshape(ref.shape)
         a16 = np.array(out16).astype(np.float32).reshape(ref.shape)
-        deq_f32 = "bit_exact" if np.array_equal(ref, a32) else (
-            "loose" if np.allclose(ref, a32, atol=1e-3, rtol=1e-3) else "FAIL")
+        deq_f32 = (
+            "bit_exact"
+            if np.array_equal(ref, a32)
+            else ("loose" if np.allclose(ref, a32, atol=1e-3, rtol=1e-3) else "FAIL")
+        )
         deq_f16 = "loose" if np.allclose(ref, a16, atol=1e-3, rtol=1e-3) else "FAIL"
 
         # matmul vs dequant-then-matmul. Use relative Frobenius norm
@@ -136,10 +151,14 @@ def main(argv=None) -> int:
         mm_n = 0.0
         mm_fail = False
         for M in (1, 64):
-            xt = mx.array((rng.standard_normal((M, kk)) * 0.1).astype(np.float32)).astype(mx.float16)
+            xt = mx.array(
+                (rng.standard_normal((M, kk)) * 0.1).astype(np.float32)
+            ).astype(mx.float16)
             got_t = _qmm(xt, w, scales, wpb, bits, codec, transpose=True)
             r_t = xt @ deq16.T  # [M, N]
-            xn = mx.array((rng.standard_normal((M, rows)) * 0.1).astype(np.float32)).astype(mx.float16)
+            xn = mx.array(
+                (rng.standard_normal((M, rows)) * 0.1).astype(np.float32)
+            ).astype(mx.float16)
             got_n = _qmm(xn, w, scales, wpb, bits, codec, transpose=False)
             r_n = xn @ deq16  # [M, K]
             mx.eval(got_t, r_t, got_n, r_n)
@@ -157,8 +176,10 @@ def main(argv=None) -> int:
         # f32 dequant must be bit-exact (loose silently masks a real math bug).
         bad = (deq_f32 != "bit_exact") or (deq_f16 == "FAIL") or mm_fail
         fails += bad
-        print(f"  {codec:<6} {deq_f32:>9} {deq_f16:>9} {mm_t:>10.3e} "
-              f"{mm_n:>10.3e} {'FAIL' if bad else 'ok':>8}")
+        print(
+            f"  {codec:<6} {deq_f32:>9} {deq_f16:>9} {mm_t:>10.3e} "
+            f"{mm_n:>10.3e} {'FAIL' if bad else 'ok':>8}"
+        )
 
     if missing:
         print(f"\nMISSING fixtures (FAIL): {', '.join(missing)}")

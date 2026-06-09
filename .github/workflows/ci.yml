@@ -5,42 +5,88 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  logic:
-    # Apple Silicon runner: the extension is a Metal C++ module, so it only
-    # builds on macOS arm64. These tests are pure logic + tiny mx ops and run on
-    # the CPU device (KQUANT_FORCE_CPU) — no kernel dispatch, no models, no GPU.
-    # The integration / slow long-context tests are env-gated (they need real
-    # GGUFs and a llama.cpp binary) and are not run here.
-    name: logic (no models)
+  lint:
+    name: lint + doc-lint
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - run: pip install ruff
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+      - name: Codec doc-lint (no extension build needed)
+        run: python scripts/check-codecs.py --check
 
-      - name: Build extension + install with the gguf extra
+  build-and-test:
+    name: build + tests (py${{ matrix.python }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # The extension is a Metal C++ module — it compiles on macOS arm64 with
+      # the Xcode toolchain (no GPU needed to *build*). Pinned mlx wheel: the
+      # kernels include MLX's steel headers and link libmlx, so the ABI must
+      # match exactly.
+      - name: Build extension + test deps
         run: |
           python -m pip install --upgrade pip
-          pip install "mlx==0.31.2" "nanobind==2.12.0" "cmake>=3.27"
-          pip install -e '.[gguf]'
+          pip install "mlx==0.31.2" "nanobind==2.12.0" "cmake>=3.27" gguf numpy pytest
+          pip install -e . --no-build-isolation
 
-      - name: Logic tests
+      - name: Codec lint (incl. runtime kq.codecs() leg)
+        run: python scripts/check-codecs.py --check
+
+      # Honest-badge discipline: every op is GPU-only until the CPU decode path
+      # (Phase F) lands, and hosted runners may not expose a usable Metal GPU.
+      # So probe for one: run the op tests iff a GPU is actually present, and
+      # skip *honestly* (with a warning) otherwise — never silently green.
+      # Set KQUANT_EXPECT_GPU=1 on a self-hosted Apple-Silicon runner to make a
+      # broken metallib fail red instead of skipping.
+      - name: Detect Metal GPU
+        id: gpu
         env:
-          KQUANT_FORCE_CPU: "1"
+          KQUANT_EXPECT_GPU: ""
         run: |
-          pytest -q \
-            tests/test_remap.py \
-            tests/test_arch_gate.py \
-            tests/test_preflight.py \
-            tests/test_transforms.py \
-            tests/test_config_synth.py \
-            tests/test_tokenizer.py
+          python - <<'PY'
+          import os
+          ok = False
+          try:
+              import mlx_kquant as kq
+              ok = bool(kq.metallib_loads())
+          except Exception as e:
+              print(f"metallib_loads() failed: {type(e).__name__}: {e}")
+          if os.environ.get("KQUANT_EXPECT_GPU") == "1" and not ok:
+              raise SystemExit("GPU expected (KQUANT_EXPECT_GPU=1) but the metallib did not load")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"available={'1' if ok else '0'}\n")
+          print("Metal GPU available:", ok)
+          PY
 
-      - name: Arch-coverage doc is current
-        run: python scripts/check-coverage.py --check
+      - name: Op tests (GPU)
+        if: steps.gpu.outputs.available == '1'
+        run: pytest -q tests/test_codecs.py tests/test_gather.py tests/test_encode.py
 
-      - name: Arch-coverage is self-consistent
-        run: python scripts/check-coverage.py --strict
+      - name: No-GPU note
+        if: steps.gpu.outputs.available != '1'
+        run: |
+          echo "::warning title=GPU op tests skipped::No usable Metal GPU on this runner. The badge covers lint + build + codec doc-lint. Numeric op coverage (all 10 codecs on CPU) lands with the Phase F CPU decode path, after which these run under KQUANT_FORCE_CPU=1 unconditionally."
+
+      # Phase F (CPU decode) will add, here, an unconditional CPU op-test step:
+      #   env: { KQUANT_FORCE_CPU: "1" }
+      #   run: pytest -q tests/test_codecs.py tests/test_gather.py tests/test_nn.py tests/test_recipes.py

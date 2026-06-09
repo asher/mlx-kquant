@@ -149,5 +149,15 @@ target_link_options(_ext PRIVATE
                     "-Wl,-force_load,$<TARGET_FILE:gguflib>")
 
 if(BUILD_SHARED_LIBS)
+  # @loader_path finds the co-located libmlx_kquant_ext.dylib (same package dir).
   target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path)
+  if(APPLE)
+    # Portable-wheel rpath: resolve @rpath/libmlx.dylib against the *user's*
+    # installed mlx wheel at runtime. _ext.so lives in site-packages/mlx_kquant/,
+    # libmlx in site-packages/mlx/lib/, so ../mlx/lib reaches it. (The absolute
+    # build-tree rpath MLXConfig adds works only on the build machine; this is
+    # what makes a redistributed wheel find the ABI-pinned mlx==0.31.2. delocate
+    # must therefore *exclude* libmlx from vendoring — see [tool.cibuildwheel].)
+    target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path/../mlx/lib)
+  endif()
 endif()

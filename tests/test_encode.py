@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M5: validate kq.quantize (encode) for all 10 K-quant codecs.
+"""Validate kq.quantize (encode) for all 10 K-quant codecs.
 
 For a fixed random weight tensor, per codec it checks:
   * scales placeholder shape is [1];
@@ -27,7 +27,8 @@ import sys
 
 import mlx.core as mx
 import numpy as np
-from gguf import GGMLQuantizationType as GT, quants
+from gguf import GGMLQuantizationType as GT
+from gguf import quants
 
 # codec -> (gguf type, weights_per_block, bits, round-trip rel-Frobenius bound)
 CODECS = {
@@ -57,8 +58,14 @@ except ImportError:
     BACKEND = "fork-mx"
 
     def _encode(w, gs, bits, codec, imatrix):
-        return mx.quantize(w, group_size=gs, bits=bits, mode="kquant",
-                           kquant_type=codec, imatrix=imatrix)
+        return mx.quantize(
+            w,
+            group_size=gs,
+            bits=bits,
+            mode="kquant",
+            kquant_type=codec,
+            imatrix=imatrix,
+        )
 
 
 def _sha(a) -> str:
@@ -72,15 +79,17 @@ def main(argv=None) -> int:
     allow = {c.strip() for c in args.codecs.split(",") if c.strip()}
 
     rng = np.random.default_rng(7)
-    w_np = (rng.standard_normal((N, K)).astype(np.float32) * 0.1)
+    w_np = rng.standard_normal((N, K)).astype(np.float32) * 0.1
     w = mx.array(w_np)
     # A non-trivial importance vector (length K) to exercise the imatrix path.
-    imat_np = (np.abs(rng.standard_normal(K)).astype(np.float32) + 0.1)
+    imat_np = np.abs(rng.standard_normal(K)).astype(np.float32) + 0.1
     imat = mx.array(imat_np)
 
     print(f"=== test_encode [{BACKEND}]  w[{N},{K}] ===")
-    print(f"  {'codec':<6} {'scales':>7} {'rt_rel':>9} {'imat':>5} {'wq_sha1':>14} "
-          f"{'wq_imat_sha1':>14} {'verdict':>8}")
+    print(
+        f"  {'codec':<6} {'scales':>7} {'rt_rel':>9} {'imat':>5} {'wq_sha1':>14} "
+        f"{'wq_imat_sha1':>14} {'verdict':>8}"
+    )
     fails = 0
     for codec, (gtype, wpb, bits, bound) in CODECS.items():
         if allow and codec not in allow:
@@ -91,8 +100,7 @@ def main(argv=None) -> int:
 
         scales_ok = tuple(np.array(scales).shape) == (1,)
         wire = np.array(wq).astype(np.uint8)
-        w_rt = quants.dequantize(
-            np.ascontiguousarray(wire), gtype).astype(np.float32)
+        w_rt = quants.dequantize(np.ascontiguousarray(wire), gtype).astype(np.float32)
         rel = float(np.linalg.norm(w_rt - w_np) / (np.linalg.norm(w_np) + 1e-6))
 
         # The imatrix steers importance-weighted rounding in the K-quant
@@ -106,9 +114,11 @@ def main(argv=None) -> int:
 
         bad = (not scales_ok) or (rel >= bound) or (not imat_ok)
         fails += bad
-        print(f"  {codec:<6} {str(scales_ok):>7} {rel:>9.3e} "
-              f"{('chg' if imat_changed else 'same'):>5} {_sha(wq):>14} "
-              f"{_sha(wq_im):>14} {'FAIL' if bad else 'ok':>8}")
+        print(
+            f"  {codec:<6} {str(scales_ok):>7} {rel:>9.3e} "
+            f"{('chg' if imat_changed else 'same'):>5} {_sha(wq):>14} "
+            f"{_sha(wq_im):>14} {'FAIL' if bad else 'ok':>8}"
+        )
 
     print(f"{'FAILURES: ' + str(fails) if fails else 'ALL OK'}")
     return 1 if fails else 0

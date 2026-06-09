@@ -86,27 +86,23 @@ arrays, codecs, metadata, shapes = kq.load_gguf("model.gguf")
 
 ### Use it in your own model
 
-Stock MLX has no `mode="kquant"`, so you don't reuse `nn.QuantizedLinear`. Instead store the wire
-bytes on a module and call the matching `kq.*` op in `forward`:
+Stock MLX has no `mode="kquant"`, so you don't reuse `nn.QuantizedLinear`. Ready-made modules that
+store the wire bytes and dispatch the matching `kq.*` op ship in `mlx_kquant.nn`:
 
 ```python
-import mlx.nn as nn
-import mlx_kquant as kq
+from mlx_kquant.nn import KQuantLinear, KQuantEmbedding, KQuantSwitchLinear
 
-class KQuantLinear(nn.Module):
-    def __init__(self, wq, scales, codec, bias=None):
-        super().__init__()
-        self.weight, self.scales, self.codec = wq, scales, codec
-        if bias is not None:
-            self.bias = bias
-
-    def __call__(self, x):
-        y = kq.quantized_matmul(x, self["weight"], self["scales"], self.codec, transpose=True)
-        return y + self["bias"] if "bias" in self else y
+lin = KQuantLinear(in_dims=512, out_dims=256, bias=False, codec="q4_k")
+lin.weight = wq          # uint8 wire bytes [out_dims, bytes_per_row]
+lin.scales = scales      # [1] placeholder (K-quant scales live in the bytes)
+y = lin(x)               # kq.quantized_matmul under the hood
 ```
 
-This is exactly the pattern the **gguf-mlx** package uses (plus `KQuantEmbedding` and a
-`gather_qmm`-backed `KQuantSwitchLinear` for MoE).
+`KQuantEmbedding` (with a tied-`as_linear`), the `gather_qmm`-backed `KQuantSwitchLinear` for MoE
+experts, and `KQuantMultiLinear` (absorbed-MLA) are exported alongside it. To swap the quantizable
+leaves of a whole constructed mlx-lm model in one call, use
+`mlx_kquant.nn.install_kquant_modules(model, {"<path>.weight": "q4_k", ...})`. The **gguf-mlx**
+package builds its full GGUF runtime on exactly these classes.
 
 ## Running full GGUF models — `gguf-mlx`
 
@@ -151,8 +147,10 @@ Measured on an M5 Max (128 GB):
   MLX's exported `Device::get_kernel`. No JIT, no steel host structs.
 - **Codec registry** derives `group_size`/`bits` from the codec name, so callers pass only
   `kquant_type`.
-- A small CPU reference path (`dequantize` / `quantized_matmul`) is included for CI/robustness; the
-  GPU path is the production one.
+- **GPU (Metal) is the only execution path today.** A scalar CPU **decode** path (`dequantize` /
+  `quantized_matmul` / `gather_qmm`) is on the near-term roadmap — it enables running the op tests in
+  CI without a GPU and CPU-side LoRA train/infer on Linux. CPU **encode** (`quantize`) follows in
+  0.2.0. Until then, all ops require an Apple-Silicon GPU.
 
 ## Scope
 
@@ -189,6 +187,30 @@ exact file plus two appended helpers), rebuild, and re-run the test suite.
 ```sh
 python -m pytest tests/      # dequant / matmul / gather / codecs / encode
 ```
+
+## Requirements
+
+- **macOS on Apple Silicon** (M-series) with a working Metal toolchain (`xcrun metal`) for a
+  build-from-source install. Prebuilt wheels (when published) need only the runtime GPU.
+- **Python ≥ 3.10** (the pinned `mlx==0.31.2` ships no cp39 wheel).
+- **`mlx==0.31.2`** exactly — the kernels include MLX's steel headers and the extension links
+  `libmlx`, so the ABI is version-locked (see [Version pinning](#version-pinning)).
+
+## Limitations
+
+- **GPU-only today.** Every op runs on Metal; there is no CPU fallback yet (decode path is on the
+  roadmap, encode after that). No NVIDIA/AMD/Linux-GPU support.
+- **Encode (`quantize`) is GPU-only** and currently macOS-only.
+- The library is the **op layer**, not a model runtime. To load and run full GGUF models, use the
+  separate [`gguf-mlx`](#running-full-gguf-models--gguf-mlx) package.
+
+## Roadmap
+
+- CPU **decode** path (all 10 codecs) → GPU-free CI op tests + CPU LoRA train/infer.
+- Training `vjp` on the matmul/gather ops → LoRA fine-tuning on kquant bases.
+- A Metal-free **Linux** build (CPU train/infer), contingent on the mlx Linux wheel exercising the
+  CPU eval paths.
+- **0.2.0:** CPU **encode** parity → quantize on Linux.
 
 ## License
 

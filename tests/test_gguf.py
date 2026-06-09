@@ -18,7 +18,8 @@ import pytest
 
 kq = pytest.importorskip("mlx_kquant")
 import mlx.core as mx  # noqa: E402
-from gguf import GGUFWriter, GGMLQuantizationType as GT, quants  # noqa: E402
+from gguf import GGMLQuantizationType as GT  # noqa: E402
+from gguf import GGUFWriter, quants  # noqa: E402
 
 
 def _mint(path) -> tuple:
@@ -27,11 +28,11 @@ def _mint(path) -> tuple:
     w = GGUFWriter(str(path), "smoke")
     w.add_uint32("smoke.answer", 42)
     w.add_string("smoke.name", "hello")
-    f32 = (np.arange(64, dtype=np.float32).reshape(4, 16) * 0.01)
+    f32 = np.arange(64, dtype=np.float32).reshape(4, 16) * 0.01
     w.add_tensor("plain.f32", f32, raw_dtype=GT.F32)
     src = {}
     for name, gt in (("layer.q8", GT.Q8_0), ("layer.q4", GT.Q4_0)):
-        s = (rng.standard_normal((8, 64)).astype(np.float32) * 0.1)
+        s = rng.standard_normal((8, 64)).astype(np.float32) * 0.1
         w.add_tensor(name, quants.quantize(s, gt), raw_dtype=gt)
         src[name] = (gt, s)
     w.write_header_to_file()

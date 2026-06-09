@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M1+ dequant validation: kq.dequantize (or the fork's mx.dequantize) vs the
+"""Dequant validation: kq.dequantize (or the fork's mx.dequantize) vs the
 `gguf.quants` numpy reference.
 
 Backend-agnostic so the SAME script runs in two environments and the outputs can
@@ -60,8 +60,13 @@ except ImportError:
 
     def _dequant(w, scales, gs, bits, codec, dtype):
         return mx.dequantize(
-            w, scales, group_size=gs, bits=bits,
-            mode="kquant", kquant_type=codec, dtype=dtype,
+            w,
+            scales,
+            group_size=gs,
+            bits=bits,
+            mode="kquant",
+            kquant_type=codec,
+            dtype=dtype,
         )
 
 
@@ -97,8 +102,7 @@ def main(argv=None) -> int:
     allow = {c.strip().lower() for c in args.codecs.split(",") if c.strip()}
     reader = GGUFReader(args.gguf, "r")
     # per codec: {f16: {status: n}, f32: {status: n}}
-    counts = defaultdict(lambda: {
-        "f16": defaultdict(int), "f32": defaultdict(int)})
+    counts = defaultdict(lambda: {"f16": defaultdict(int), "f32": defaultdict(int)})
     worst = defaultdict(lambda: {"f16": (0.0, 0.0), "f32": (0.0, 0.0)})
     n = 0
     hard_fail = 0
@@ -128,22 +132,29 @@ def main(argv=None) -> int:
                 worst[codec][tag] = (ma, mr)
             if st == "fail":
                 hard_fail += 1
-                print(f"  FAIL {t.name} {codec} [{tag}] max_abs={ma:.3e}",
-                      file=sys.stderr)
+                print(
+                    f"  FAIL {t.name} {codec} [{tag}] max_abs={ma:.3e}", file=sys.stderr
+                )
             elif args.verbose:
-                print(f"  {t.name:<55} {codec} [{tag}] {st} "
-                      f"max_abs={ma:.3e} max_rel={mr:.3e}")
+                print(
+                    f"  {t.name:<55} {codec} [{tag}] {st} "
+                    f"max_abs={ma:.3e} max_rel={mr:.3e}"
+                )
         n += 1
 
     print(f"\nvalidated {n} tensors")
-    print(f"  {'codec':<6} {'out':>4} {'bit_exact':>10} {'loose':>6} "
-          f"{'fail':>5} {'worst_abs':>11} {'worst_rel':>11}")
+    print(
+        f"  {'codec':<6} {'out':>4} {'bit_exact':>10} {'loose':>6} "
+        f"{'fail':>5} {'worst_abs':>11} {'worst_rel':>11}"
+    )
     for codec in sorted(counts):
         for tag in ("f16", "f32"):
             c = counts[codec][tag]
             wa, wr = worst[codec][tag]
-            print(f"  {codec:<6} {tag:>4} {c['bit_exact']:>10} {c['loose']:>6} "
-                  f"{c['fail']:>5} {wa:>11.3e} {wr:>11.3e}")
+            print(
+                f"  {codec:<6} {tag:>4} {c['bit_exact']:>10} {c['loose']:>6} "
+                f"{c['fail']:>5} {wa:>11.3e} {wr:>11.3e}"
+            )
     if n == 0:
         # No matching tensors validated nothing — a misspelled --codecs or a
         # GGUF without these codecs must not masquerade as a pass.

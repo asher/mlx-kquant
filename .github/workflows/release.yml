@@ -1,0 +1,45 @@
+name: release
+
+# Tag-triggered build + publish. Push a vX.Y.Z tag (matching
+# mlx_kquant/_version.py) to build macOS arm64 wheels and publish to PyPI via
+# trusted publishing (no API token stored).
+#
+# Prerequisites (one-time, before the first real release):
+#   * a PyPI project + a Trusted Publisher entry for this repo/workflow;
+#   * a GitHub Environment named "pypi" (optionally with required reviewers);
+#   * a wheel validated on a clean machine (see [tool.cibuildwheel] note).
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+jobs:
+  build-wheels:
+    name: build wheels (macos arm64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.21
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: ./wheelhouse/*.whl
+
+  publish:
+    name: publish to PyPI
+    needs: build-wheels
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

@@ -39,11 +39,12 @@ E, MOE_N = 4, 128  # experts, out_dims for the MoE fixtures
 def main() -> None:
     os.makedirs(OUT, exist_ok=True)
     rng = np.random.default_rng(1234)
-    w_np = (rng.standard_normal((N, K)).astype(np.float32) * 0.1)
+    w_np = rng.standard_normal((N, K)).astype(np.float32) * 0.1
     w = mx.array(w_np)
     for codec, (gs, bits) in KCODECS.items():
-        wq, _ = mx.quantize(w, group_size=gs, bits=bits,
-                            mode="kquant", kquant_type=codec)
+        wq, _ = mx.quantize(
+            w, group_size=gs, bits=bits, mode="kquant", kquant_type=codec
+        )
         mx.eval(wq)
         wire = np.array(wq).astype(np.uint8)
         path = os.path.join(OUT, f"{codec}.npz")
@@ -57,8 +58,9 @@ def main() -> None:
         wires = []
         for _ in range(E):
             we = mx.array((mrng.standard_normal((MOE_N, K)) * 0.1).astype(np.float32))
-            wqe, _ = mx.quantize(we, group_size=gs, bits=bits,
-                                 mode="kquant", kquant_type=codec)
+            wqe, _ = mx.quantize(
+                we, group_size=gs, bits=bits, mode="kquant", kquant_type=codec
+            )
             mx.eval(wqe)
             wires.append(np.array(wqe).astype(np.uint8))
         wire = np.stack(wires, axis=0)  # [E, MOE_N, packed]

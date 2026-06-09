@@ -1,0 +1,36 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! Please include enough detail to reproduce.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what actually occurred.
+      placeholder: A minimal code snippet or command is ideal.
+    validations:
+      required: true
+  - type: input
+    id: codec
+    attributes:
+      label: Codec(s) involved
+      placeholder: "e.g. q4_k, q6_k, q8_0"
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: |
+        Output of:
+        `python -c "import mlx, mlx_kquant as kq, platform; print(mlx.__version__, kq.__version__, platform.platform())"`
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Traceback / logs
+      render: shell
