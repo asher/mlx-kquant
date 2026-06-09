@@ -32,7 +32,7 @@ bool metallib_loads();
 // placeholder — K-quant scales live inside `w`; the argument exists only for
 // buffer-signature parity with the Metal kernel and is otherwise ignored.
 // group_size/bits are derived from `kquant_type`. Default output dtype is
-// float16 (matches mlx-core's kquant dequantize default).
+// float16.
 mx::array dequantize(
     const mx::array& w,
     const mx::array& scales,
@@ -43,7 +43,7 @@ mx::array dequantize(
 // Quantized matmul: x (float) @ dequant(w). `w` is uint8 K-quant wire bytes,
 // `scales` a vestigial placeholder (see dequantize). transpose=true means
 // `w` is laid out [N, K] (the row-major weight convention). Output dtype is
-// x.dtype(), except float32 x is promoted to bfloat16 (matches mlx-core).
+// x.dtype(), except float32 x is promoted to bfloat16.
 // group_size/bits are derived from `kquant_type`.
 mx::array quantized_matmul(
     mx::array x,
@@ -121,7 +121,9 @@ class KQuantDequantize : public mx::Primitive {
   int bits_;
 };
 
-// Quantized matmul. Inference-only: jvp/vjp/vmap inherit the base-class
+// Quantized matmul. vjp implements only the gradient wrt x (re-dispatch with
+// the transpose flipped) so LoRA can train on a frozen kquant base; jvp/vmap
+// and the gradient wrt the quantized weights/scales inherit the base-class
 // throwing defaults. Split-k perf paths (qmm_splitk / qvm_split_k) are gated
 // off — they depend on the unexported strided_reduce_general_dispatch; plain
 // qmm/qvm produce identical results with less parallelism.
@@ -154,6 +156,14 @@ class KQuantMatmul : public mx::Primitive {
   }
   bool is_equivalent(const mx::Primitive& other) const override;
 
+  // Gradient wrt x only (arg 0): re-dispatch the matmul with the transpose
+  // flipped. The quantized weights/scales are frozen — arg 1/2 throw.
+  std::vector<mx::array> vjp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<mx::array>& outputs) override;
+
  private:
   std::string kquant_type_;
   int group_size_;
@@ -161,12 +171,15 @@ class KQuantMatmul : public mx::Primitive {
   bool transpose_;
 };
 
-// Gather (MoE) quantized matmul. Inference-only: jvp/vjp/vmap inherit the
-// base-class throwing defaults. The gather_qmm_rhs fast path (the only
-// function-constant kernel) is deferred — it requires right_sorted_ == true,
-// i.e. rhs_indices defaulted + sorted_indices, which the lab never does (it
-// always passes rhs_indices explicitly). The dispatch falls through to
-// gather_qmm / gather_qmv, which is correctness-preserving for all inputs.
+// Gather (MoE) quantized matmul. vjp implements only the gradient wrt x (a
+// per-expert gather with the transpose flipped, scatter-added back to the
+// source x rows) so LoRA can train on a frozen kquant base; jvp/vmap and the
+// gradient wrt the weights/scales/indices inherit the base-class throwing
+// defaults. The gather_qmm_rhs fast path (the only function-constant kernel) is
+// deferred — it requires right_sorted_ == true, i.e. rhs_indices defaulted +
+// sorted_indices, which callers never do (they always pass rhs_indices
+// explicitly). The dispatch falls through to gather_qmm / gather_qmv, which is
+// correctness-preserving for all inputs.
 class KQuantGatherQMM : public mx::Primitive {
  public:
   explicit KQuantGatherQMM(
@@ -200,6 +213,15 @@ class KQuantGatherQMM : public mx::Primitive {
   }
   bool is_equivalent(const mx::Primitive& other) const override;
 
+  // Gradient wrt x only (arg 0): gather the cotangent against the experts with
+  // the transpose flipped, then scatter-add the rows back via lhs_indices. The
+  // quantized weights/scales (arg 1/2) and the indices (arg 3/4) throw.
+  std::vector<mx::array> vjp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<mx::array>& outputs) override;
+
  private:
   std::string kquant_type_;
   int group_size_;
@@ -212,7 +234,7 @@ class KQuantGatherQMM : public mx::Primitive {
 // Encode a float weight tensor into K-quant wire bytes. Multi-output primitive:
 // outputs[0] = wq (uint8), outputs[1] = scales placeholder (uint8, shape [1]).
 // Whether an imatrix is used is derived from inputs.size() (1 = w only, 2 = w +
-// imatrix), matching the fork. Inference-only: jvp/vjp/vmap throw. GPU-only.
+// imatrix). Inference-only: jvp/vjp/vmap throw. GPU-only.
 class KQuantQuantize : public mx::Primitive {
  public:
   explicit KQuantQuantize(

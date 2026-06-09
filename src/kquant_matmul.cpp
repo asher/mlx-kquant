@@ -1,16 +1,11 @@
-// KQuantMatmul primitive: x @ dequant(w). GPU dispatch ports the KQuant arm of
-// mlx/backend/metal/quantized.cpp:QuantizedMatmul::eval_gpu (:1566-1713) plus
-// its leaf kernels (qmm / qmm_nax / qvm / qmv) and dispatch helpers, with these
-// extension-specific changes:
-//   * kernels fetched from OUR bundled metallib via d.get_kernel(name, lib);
-//   * row-contiguity guaranteed by the op (contiguous_copy_gpu is unexported);
-//   * kernel-name type tokens via kq_type_string (not type_to_name).
-// Two further deviations, both correctness-preserving:
-//   * is_nax_available() is a hidden symbol -> replicated as
-//   kq_is_nax_available;
-//   * the split-k paths (qmm_splitk / qvm_split_k) need the unexported
-//     strided_reduce_general_dispatch -> gated off; plain qmm/qvm run instead.
-//   * kquant never carries biases, so the bias buffer is dropped throughout.
+// KQuantMatmul primitive: x @ dequant(w). The GPU path dispatches the leaf
+// kernels (qmm / qmm_nax / qvm / qmv) from the bundled metallib via
+// d.get_kernel(name, lib); the op guarantees row-contiguity before dispatch and
+// kernel-name type tokens come from kq_type_string. NAX (tensor-core)
+// availability is probed via kq_is_nax_available. The split-k paths
+// (qmm_splitk / qvm_split_k) are omitted — plain qmm/qvm produce identical
+// results with less parallelism. kquant never carries biases, so no bias buffer
+// is plumbed through.
 #include <cstddef>
 #include <cstdlib>
 #include <stdexcept>
@@ -48,7 +43,7 @@ using mx::Stream;
 // get_qmv_batch_limit, add_strides_and_shapes, kq_get_kernel) come from
 // kquant_metal_internal.h.
 
-// quantized.cpp:545-650 (kquant path, no biases).
+// NAX (tensor-core) GEMM dispatch for the quantized matmul (no biases).
 void qmm_nax(
     const array& x,
     const array& w,
@@ -110,8 +105,8 @@ void qmm_nax(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// quantized.cpp:760-866 (kquant path, no biases). qmm_splitk gated off
-// upstream.
+// Tiled quantized GEMM (no biases). The split-k variant is omitted; plain qmm
+// is correct with less parallelism.
 void qmm(
     const array& x,
     const array& w,
@@ -126,10 +121,9 @@ void qmm(
     Device& d,
     const Stream& s,
     const std::string& kquant_type) {
-  // Upstream gate is `(env::enable_tf32() || x.dtype() != float32)`, but the op
-  // promotes float32 x to bfloat16 before constructing this primitive (just as
-  // mlx-core does), so x.dtype() is never float32 here — the enable_tf32 branch
-  // is always short-circuited. Dropping it avoids the unexported env::get_var.
+  // The op promotes float32 x to bfloat16 before constructing this primitive,
+  // so x.dtype() is never float32 here and the NAX path stays eligible on the
+  // dtype axis with no tf32 gate.
   if (kq_is_nax_available() && transpose && (K % 64 == 0) &&
       (x.dtype() != mx::float32) && codec_has_matmul(kquant_type)) {
     return qmm_nax(
@@ -187,7 +181,7 @@ void qmm(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// quantized.cpp:490-543 (kquant path, no biases).
+// Vector-times-matrix quantized kernel dispatch (no biases).
 void qvm(
     const array& x,
     const array& w,
@@ -236,7 +230,7 @@ void qvm(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// quantized.cpp:294-358 (kquant path, no biases).
+// Matrix-times-vector quantized kernel dispatch (no biases).
 void qmv(
     const array& x,
     const array& w,
@@ -285,7 +279,7 @@ void qmv(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// Verify-shaped small-M matmul (no upstream analogue). One threadgroup per
+// Verify-shaped small-M matmul. One threadgroup per
 // N-tile (grid_dims.x = 1) reads each weight tile once and dots it against all
 // M activation rows, amortizing the dominant weight read; the per-row qmv would
 // re-read it M times (M on grid_dims.x). Non-batched only; M (= vm) in [2,
@@ -351,8 +345,8 @@ void verify_qmv(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// quantized.cpp:1516-1561. The qmv_quad branch (K==64/128) is unreachable for
-// kquant — eval_gpu throws for that case first — so this always routes to qmv.
+// The qmv_quad branch (K==64/128) is unreachable for kquant — eval_gpu throws
+// for that case first — so this always routes to qmv.
 void dispatch_qmv(
     const array& x,
     const array& w,
@@ -449,6 +443,37 @@ void KQuantMatmul::eval_cpu(
   });
 }
 
+std::vector<mx::array> KQuantMatmul::vjp(
+    const std::vector<mx::array>& primals,
+    const std::vector<mx::array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<mx::array>&) {
+  // primals = {x, w (wire bytes), scales placeholder}. Only the gradient wrt x
+  // is defined: dL/dx = cotan @ dequant(w) with the transpose flipped, i.e. the
+  // same quantized matmul run the other way. The quantized base is frozen (the
+  // LoRA use case), so the weight/scale branches throw.
+  std::vector<mx::array> vjps;
+  for (auto arg : argnums) {
+    if (arg == 0) {
+      vjps.push_back(quantized_matmul(
+          cotangents[0],
+          primals[1],
+          primals[2],
+          kquant_type_,
+          !transpose_,
+          stream()));
+    } else if (arg == 1) {
+      throw std::invalid_argument(
+          "[mlx_kquant] quantized_matmul vjp: no gradient wrt the quantized "
+          "weights (the kquant base is frozen).");
+    } else {
+      throw std::invalid_argument(
+          "[mlx_kquant] quantized_matmul vjp: no gradient wrt scales.");
+    }
+  }
+  return vjps;
+}
+
 #ifdef _METAL_
 
 void KQuantMatmul::eval_gpu(
@@ -471,7 +496,7 @@ void KQuantMatmul::eval_gpu(
 
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
 
-  // KQuant special cases (quantized.cpp:1591-1615).
+  // KQuant special cases.
   if (!transpose_ && M < vector_limit) {
     qmm(x,
         w,
@@ -488,19 +513,15 @@ void KQuantMatmul::eval_gpu(
         kquant_type_);
     return;
   }
-  // quantized.cpp:1610 routes K in {64,128} (M<vector_limit, transpose) to a
-  // quad-optimized qmv kernel; no kquant qmv_quad kernel exists (the fork
-  // throws here too). Plain qmv is correct for any K that is a multiple of the
-  // codec group size — K-quants (gs=256) can never reach K=64/128, only the
-  // legacy gs=32 codecs can, and only on weights whose input dim is exactly
-  // 64/128 (none in standard transformers). Fall through to dispatch_qmv below
-  // rather than throw; qmv_quad would be a perf-only kernel for an
-  // essentially-dead path. See docs/progress-extension-refactor.log qmv_quad
-  // survey.
+  // There is no kquant qmv_quad kernel for K in {64,128}. Plain qmv is correct
+  // for any K that is a multiple of the codec group size — K-quants (gs=256)
+  // can never reach K=64/128, and the legacy gs=32 codecs only could on weights
+  // whose input dim is exactly 64/128 (none in standard transformers). Fall
+  // through to dispatch_qmv below rather than throw; a qmv_quad kernel would be
+  // a perf-only path for an essentially-dead case.
 
   if (M >= vector_limit) {
-    // Upstream uses qmm_splitk for (transpose && B==1); gated off here (it
-    // needs strided_reduce_general_dispatch). Plain qmm is correct, just less
+    // The split-k qmm variant is omitted here; plain qmm is correct, just less
     // parallel.
     qmm(x,
         w,
@@ -541,8 +562,7 @@ void KQuantMatmul::eval_gpu(
     return;
   }
 
-  // Upstream routes K>=1024 to qvm_split_k; gated off here. Plain qvm is
-  // correct.
+  // The split-k qvm variant is omitted here; plain qvm is correct.
   qvm(x, w, scales, out, group_size_, bits_, M, N, K, d, s, kquant_type_);
 }
 

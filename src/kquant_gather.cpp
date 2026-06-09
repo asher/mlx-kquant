@@ -1,23 +1,18 @@
-// KQuantGatherQMM primitive: mixture-of-experts quantized matmul. GPU dispatch
-// ports the KQuant arm of mlx/backend/metal/quantized.cpp:GatherQMM::eval_gpu
-// (:1715-1854) plus its gather leaf kernels (gather_qmm / gather_qmm_nax /
-// gather_qmv) at :652-1163, with these extension-specific changes:
-//   * kernels fetched from OUR bundled metallib via kq_get_kernel;
-//   * row-contiguity guaranteed by the op (contiguous_copy_gpu is unexported);
-//   * kernel-name type tokens via kq_type_string (not type_to_name);
-//   * is_nax_available() replicated as kq_is_nax_available (hidden symbol);
-//   * kquant carries no biases, so the bias buffer is dropped throughout.
+// KQuantGatherQMM primitive: mixture-of-experts quantized matmul. The GPU path
+// dispatches the gather leaf kernels (gather_qmm / gather_qmm_nax / gather_qmv)
+// from the bundled metallib via kq_get_kernel; the op guarantees row-contiguity
+// before dispatch, kernel-name type tokens come from kq_type_string, NAX
+// availability is probed via kq_is_nax_available, and kquant carries no biases
+// so no bias buffer is plumbed through.
 //
-// The gather_qmm_rhs fast path (quantized.cpp:1748-1768) IS implemented here as
-// gather_qmm_rhs_nax — it is the only function-constant kernel (align_M/N/K at
-// constant ids 200/201/202). It requires right_sorted_ == true, which holds
-// when lhs_indices is defaulted AND sorted_indices is requested. mlx-lm's
-// SwitchGLU sorts tokens by expert (do_sort when indices.size>=64) and passes
-// rhs_indices only, so right_sorted_ == do_sort: MoE PREFILL takes this sorted
-// per-expert GEMM (≈6-8x faster than B separate gather_qmv vector-matmuls),
-// while decode (top_k<64 -> no sort -> B<16) falls through to gather_qmv,
-// exactly as the fork does. An earlier revision deferred this on a swapped
-// left/right_sorted premise, which left MoE prefill ~3.3x slower than the fork.
+// The gather_qmm_rhs fast path is implemented here as gather_qmm_rhs_nax — the
+// only function-constant kernel (align_M/N/K at constant ids 200/201/202). It
+// requires right_sorted_ == true, which holds when lhs_indices is defaulted AND
+// sorted_indices is requested. mlx-lm's SwitchGLU sorts tokens by expert
+// (do_sort when indices.size>=64) and passes rhs_indices only, so
+// right_sorted_ == do_sort: MoE PREFILL takes this sorted per-expert GEMM
+// (≈6-8x faster than B separate gather_qmv vector-matmuls), while decode
+// (top_k<64 -> no sort -> B<16) falls through to gather_qmv.
 #include <cstddef>
 #include <stdexcept>
 #include <string>
@@ -51,7 +46,7 @@ using mx::Stream;
 // array / Device / CommandEncoder and the shared dispatch helpers come from
 // kquant_metal_internal.h.
 
-// quantized.cpp:652-758 (kquant path, no biases).
+// NAX (tensor-core) GEMM dispatch for the gathered (MoE) matmul (no biases).
 void gather_qmm_nax(
     const array& x,
     const array& w,
@@ -118,7 +113,7 @@ void gather_qmm_nax(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// quantized.cpp:986-1094 (kquant path, no biases).
+// Tiled gathered (MoE) quantized GEMM dispatch (no biases).
 void gather_qmm(
     const array& x,
     const array& w,
@@ -196,7 +191,7 @@ void gather_qmm(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// quantized.cpp:1096-1163 (kquant path, no biases).
+// Gathered (MoE) matrix-times-vector quantized kernel dispatch (no biases).
 void gather_qmv(
     const array& x,
     const array& w,
@@ -252,15 +247,14 @@ void gather_qmv(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// quantized.cpp:1225-1360 (kquant path: NAX-only, no biases). The sorted-rhs
-// fast path: x rows are pre-sorted by expert (lhs_indices defaulted), so a
-// single batched GEMM walks contiguous per-expert row blocks, switching the
-// weight matrix per row-block from the sorted `indices`. M here is the TOTAL
-// row count (x.size()/K), NOT x.shape(-2)==1. Unlike the other gather leaves
-// this passes no index strides — it requires row-contiguous x / indices (the
-// caller guards this) and bakes align_M/N/K into func consts 200/201/202.
-// kquant has no non-NAX gather_qmm_rhs kernel, so this is only ever reached
-// when the NAX gate holds (mirrors gather_qmm_rhs()'s unconditional NAX route).
+// Sorted-rhs fast path (NAX-only, no biases): x rows are pre-sorted by expert
+// (lhs_indices defaulted), so a single batched GEMM walks contiguous per-expert
+// row blocks, switching the weight matrix per row-block from the sorted
+// `indices`. M here is the TOTAL row count (x.size()/K), NOT x.shape(-2)==1.
+// Unlike the other gather leaves this passes no index strides — it requires
+// row-contiguous x / indices (the caller guards this) and bakes align_M/N/K
+// into func consts 200/201/202. kquant has no non-NAX gather_qmm_rhs kernel, so
+// this is only ever reached when the NAX gate holds.
 void gather_qmm_rhs_nax(
     const array& x,
     const array& w,
@@ -437,6 +431,75 @@ void KQuantGatherQMM::eval_cpu(
   });
 }
 
+std::vector<mx::array> KQuantGatherQMM::vjp(
+    const std::vector<mx::array>& primals,
+    const std::vector<mx::array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<mx::array>&) {
+  // primals = {x, w (wire bytes), scales placeholder, lhs_indices,
+  // rhs_indices}. Only the gradient wrt x is defined: gather the cotangent
+  // against the experts with the transpose flipped, then scatter-add each
+  // output row's gradient back onto its source x row via lhs_indices. When the
+  // indices are sorted and there is one x row per output row, the gather alone
+  // already lands the gradient in place. The quantized base is frozen (the LoRA
+  // use case), so the weight/scale branches throw; the gradient wrt the indices
+  // is undefined.
+  std::vector<mx::array> vjps;
+  const auto& x = primals[0];
+  const auto& w = primals[1];
+  const auto& scales = primals[2];
+  const auto& lhs_indices = primals[3];
+  const auto& rhs_indices = primals[4];
+  const auto& cotan = cotangents[0];
+
+  int M = cotan.shape(-2);
+  int K = x.shape(-1);
+  bool sorted = left_sorted_ || right_sorted_;
+  bool no_broadcast =
+      rhs_indices.size() * static_cast<size_t>(M) * static_cast<size_t>(K) ==
+      x.size();
+
+  for (auto arg : argnums) {
+    if (arg == 0) {
+      auto g = gather_qmm(
+          cotan,
+          w,
+          scales,
+          kquant_type_,
+          std::nullopt,
+          rhs_indices,
+          !transpose_,
+          sorted,
+          stream());
+      if (sorted && no_broadcast) {
+        vjps.push_back(g);
+      } else {
+        vjps.push_back(mx::reshape(
+            mx::scatter_add(
+                mx::flatten(mx::zeros_like(x, stream()), 0, -3, stream()),
+                lhs_indices,
+                mx::expand_dims(g, -3, stream()),
+                0,
+                stream()),
+            x.shape(),
+            stream()));
+      }
+    } else if (arg == 1) {
+      throw std::invalid_argument(
+          "[mlx_kquant] gather_qmm vjp: no gradient wrt the quantized weights "
+          "(the kquant base is frozen).");
+    } else if (arg == 2) {
+      throw std::invalid_argument(
+          "[mlx_kquant] gather_qmm vjp: no gradient wrt scales.");
+    } else {
+      throw std::invalid_argument(
+          "[mlx_kquant] gather_qmm vjp: cannot compute the gradient wrt the "
+          "indices.");
+    }
+  }
+  return vjps;
+}
+
 #ifdef _METAL_
 
 void KQuantGatherQMM::eval_gpu(
@@ -462,7 +525,7 @@ void KQuantGatherQMM::eval_gpu(
   int E = w.size() / w.shape(-1) / w.shape(-2);
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
 
-  // Sorted-rhs fast path (mirrors quantized.cpp:1744-1768). When the expert
+  // Sorted-rhs fast path. When the expert
   // (rhs) indices are sorted and lhs was defaulted (right_sorted_), and the
   // batch is large enough to amortize a per-expert GEMM, route to the NAX
   // gather_qmm_rhs kernel instead of B separate gather_qmv vector-matmuls.
