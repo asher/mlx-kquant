@@ -18,11 +18,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      - run: pip install ruff clang-format==19.1.5
       - name: ruff check
         run: ruff check .
       - name: ruff format --check
         run: ruff format --check .
+      # C++ formatting for all first-party sources: the host code (src/,
+      # bindings.cpp) and the Metal kernels (metal/). The kernels' hand-aligned
+      # macro-instantiation tables are exempted by inline `// clang-format off`
+      # regions in the .metal files; everything else is enforced.
+      - name: clang-format --check (C++ / Metal)
+        run: >-
+          clang-format --dry-run --Werror
+          bindings.cpp src/*.cpp src/*.h
+          metal/*.metal metal/mlx/backend/metal/kernels/*.h
       - name: Codec doc-lint (no extension build needed)
         run: python scripts/check-codecs.py --check
 

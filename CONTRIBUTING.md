@@ -19,7 +19,10 @@ front-end. A few notes to get productive quickly.
 ## Running the checks
 
 ```sh
-ruff check . && ruff format --check .      # lint + format
+ruff check . && ruff format --check .      # Python lint + format
+clang-format --dry-run --Werror \
+  bindings.cpp src/*.cpp src/*.h \
+  metal/*.metal metal/mlx/backend/metal/kernels/*.h   # C++/Metal format check
 python scripts/check-codecs.py --check     # codec geometry doc-lint (no GPU)
 pytest -q                                  # op tests
 ```
@@ -50,7 +53,13 @@ README "Codec reference" table, and the kernel, then run
 
 ## Style
 
-- `ruff` is the linter/formatter (config in `pyproject.toml`); a
-  `.pre-commit-config.yaml` runs it on commit (`pre-commit install`).
+- **Python:** `ruff` is the linter/formatter (config in `pyproject.toml`).
+- **C++ / Metal:** `clang-format` (config in `.clang-format`) covers all
+  first-party sources — the host code (`src/*.{cpp,h}`, `bindings.cpp`) and the
+  Metal kernels (`metal/`). The kernels' hand-aligned macro-instantiation
+  tables are exempted with inline `// clang-format off` / `// clang-format on`
+  regions in the `.metal` files; everything else is enforced.
+- `.pre-commit-config.yaml` runs both on commit (`pre-commit install`); the CI
+  `lint` job enforces them.
 - Keep the raw `kq.*` op layer dependency-free; model-level helpers belong behind
   the `[tools]` extra.

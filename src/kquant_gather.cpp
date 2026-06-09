@@ -1,7 +1,7 @@
 // KQuantGatherQMM primitive: mixture-of-experts quantized matmul. GPU dispatch
 // ports the KQuant arm of mlx/backend/metal/quantized.cpp:GatherQMM::eval_gpu
 // (:1715-1854) plus its gather leaf kernels (gather_qmm / gather_qmm_nax /
-// gather_qmv) at :652-1163, with the extension-specific changes from M1/M2:
+// gather_qmv) at :652-1163, with these extension-specific changes:
 //   * kernels fetched from OUR bundled metallib via kq_get_kernel;
 //   * row-contiguity guaranteed by the op (contiguous_copy_gpu is unexported);
 //   * kernel-name type tokens via kq_type_string (not type_to_name);
@@ -10,14 +10,14 @@
 //
 // The gather_qmm_rhs fast path (quantized.cpp:1748-1768) IS implemented here as
 // gather_qmm_rhs_nax — it is the only function-constant kernel (align_M/N/K at
-// constant ids 200/201/202). It requires right_sorted_ == true, which holds when
-// lhs_indices is defaulted AND sorted_indices is requested. mlx-lm's SwitchGLU
-// sorts tokens by expert (do_sort when indices.size>=64) and passes rhs_indices
-// only, so right_sorted_ == do_sort: MoE PREFILL takes this sorted per-expert
-// GEMM (≈6-8x faster than B separate gather_qmv vector-matmuls), while decode
-// (top_k<64 -> no sort -> B<16) falls through to gather_qmv, exactly as the fork
-// does. An earlier revision deferred this on a swapped left/right_sorted premise,
-// which left MoE prefill ~3.3x slower than the fork.
+// constant ids 200/201/202). It requires right_sorted_ == true, which holds
+// when lhs_indices is defaulted AND sorted_indices is requested. mlx-lm's
+// SwitchGLU sorts tokens by expert (do_sort when indices.size>=64) and passes
+// rhs_indices only, so right_sorted_ == do_sort: MoE PREFILL takes this sorted
+// per-expert GEMM (≈6-8x faster than B separate gather_qmv vector-matmuls),
+// while decode (top_k<64 -> no sort -> B<16) falls through to gather_qmv,
+// exactly as the fork does. An earlier revision deferred this on a swapped
+// left/right_sorted premise, which left MoE prefill ~3.3x slower than the fork.
 #include <stdexcept>
 #include <string>
 
@@ -133,8 +133,21 @@ void gather_qmm(
   if (kq_is_nax_available() && transpose && (K % 64 == 0) &&
       (x.dtype() != mx::float32) && codec_has_matmul(kquant_type)) {
     return gather_qmm_nax(
-        x, w, scales, lhs_indices, rhs_indices, out, transpose, group_size,
-        bits, M, N, K, d, s, kquant_type);
+        x,
+        w,
+        scales,
+        lhs_indices,
+        rhs_indices,
+        out,
+        transpose,
+        group_size,
+        bits,
+        M,
+        N,
+        K,
+        d,
+        s,
+        kquant_type);
   }
 
   int B = out.size() / M / N;
@@ -386,41 +399,91 @@ void KQuantGatherQMM::eval_gpu(
   // (rhs) indices are sorted and lhs was defaulted (right_sorted_), and the
   // batch is large enough to amortize a per-expert GEMM, route to the NAX
   // gather_qmm_rhs kernel instead of B separate gather_qmv vector-matmuls.
-  // kquant has no non-NAX rhs kernel, so the NAX gate must hold. We additionally
-  // require x and the rhs indices to already be row-contiguous with one x row
-  // per output row (x.size()/K == B): the op keeps broadcast index strides for
-  // the strided leaves, whereas this kernel takes no strides. The SwitchGLU
-  // sort path satisfies all of this; any case that does not falls through to
-  // the (correct, slower) gather_qmv / gather_qmm leaves below.
+  // kquant has no non-NAX rhs kernel, so the NAX gate must hold. We
+  // additionally require x and the rhs indices to already be row-contiguous
+  // with one x row per output row (x.size()/K == B): the op keeps broadcast
+  // index strides for the strided leaves, whereas this kernel takes no strides.
+  // The SwitchGLU sort path satisfies all of this; any case that does not falls
+  // through to the (correct, slower) gather_qmv / gather_qmm leaves below.
   bool kquant_rhs_ok = kq_is_nax_available() && transpose_ && (K % 64 == 0) &&
       (x.dtype() != mx::float32) && codec_has_matmul(kquant_type_);
   if (M == 1 && B >= 16 && right_sorted_ && (B / E >= 4) && kquant_rhs_ok &&
       x.flags().row_contiguous && rhs_indices.flags().row_contiguous &&
       (x.size() / K == static_cast<size_t>(B))) {
     gather_qmm_rhs_nax(
-        x, w, scales, rhs_indices, out, transpose_, group_size_, bits_,
-        /*M=*/static_cast<int>(x.size() / K), N, K, d, s, kquant_type_);
+        x,
+        w,
+        scales,
+        rhs_indices,
+        out,
+        transpose_,
+        group_size_,
+        bits_,
+        /*M=*/static_cast<int>(x.size() / K),
+        N,
+        K,
+        d,
+        s,
+        kquant_type_);
     return;
   }
 
   if (M >= vector_limit) {
     gather_qmm(
-        x, w, scales, lhs_indices, rhs_indices, out, transpose_, group_size_,
-        bits_, M, N, K, d, s, kquant_type_);
+        x,
+        w,
+        scales,
+        lhs_indices,
+        rhs_indices,
+        out,
+        transpose_,
+        group_size_,
+        bits_,
+        M,
+        N,
+        K,
+        d,
+        s,
+        kquant_type_);
     return;
   }
 
   if (transpose_) {
     gather_qmv(
-        x, w, scales, lhs_indices, rhs_indices, out, group_size_, bits_, M, N,
-        K, d, s, kquant_type_);
+        x,
+        w,
+        scales,
+        lhs_indices,
+        rhs_indices,
+        out,
+        group_size_,
+        bits_,
+        M,
+        N,
+        K,
+        d,
+        s,
+        kquant_type_);
     return;
   }
 
   // KQuant has no dedicated gather_qvm kernel; route through gather_qmm_n.
   gather_qmm(
-      x, w, scales, lhs_indices, rhs_indices, out, transpose_, group_size_,
-      bits_, M, N, K, d, s, kquant_type_);
+      x,
+      w,
+      scales,
+      lhs_indices,
+      rhs_indices,
+      out,
+      transpose_,
+      group_size_,
+      bits_,
+      M,
+      N,
+      K,
+      d,
+      s,
+      kquant_type_);
 }
 
 #else

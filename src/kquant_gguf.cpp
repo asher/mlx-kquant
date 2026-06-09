@@ -2,9 +2,9 @@
 // get_shape, direct-dtype tensors) + gguf_quants.cpp (kquant wire-byte load).
 // gguflib is the antirez/gguf-tools single-file parser (FetchContent-pinned in
 // CMake); it mmaps the file, so tensor.weights_data points into the mmap. By
-// default each tensor is a NO-COPY view over that mmap (see try_zero_copy_array);
-// with zero_copy=false it is memcpy'd out via the array(It, shape, dtype)
-// constructor (one memcpy, ~15 GB/s, the fork's path).
+// default each tensor is a NO-COPY view over that mmap (see
+// try_zero_copy_array); with zero_copy=false it is memcpy'd out via the
+// array(It, shape, dtype) constructor (one memcpy, ~15 GB/s, the fork's path).
 #include <climits>
 #include <cstring>
 #include <fstream>
@@ -45,10 +45,10 @@ constexpr int kGgufArrayHeaderSize = 12; // 4-byte elem type + 8-byte length.
 // does. Returns nullopt when a no-copy wrap isn't possible (unaligned window or
 // >INT32_MAX elements past the page-aligned base); the caller then memcpy's.
 //
-// Alignment reasoning: gguflib mmaps at a page-aligned base and GGUF tensor data
-// sits at a 32-byte-aligned file offset, so `wd` is 32-aligned -> win_off is a
-// multiple of every dtype's itemsize (1/2/4/8) and win_base is page-aligned (the
-// pointer-alignment newBufferWithBytesNoCopy requires).
+// Alignment reasoning: gguflib mmaps at a page-aligned base and GGUF tensor
+// data sits at a 32-byte-aligned file offset, so `wd` is 32-aligned -> win_off
+// is a multiple of every dtype's itemsize (1/2/4/8) and win_base is
+// page-aligned (the pointer-alignment newBufferWithBytesNoCopy requires).
 std::optional<mx::array> try_zero_copy_array(
     const void* wd,
     size_t nbytes,
@@ -79,8 +79,8 @@ std::optional<mx::array> try_zero_copy_array(
     return std::nullopt; // mx::Shape elements are int32.
   }
 
-  mx::allocator::Buffer buf = mx::allocator::make_buffer(
-      reinterpret_cast<void*>(win_base), win_bytes);
+  mx::allocator::Buffer buf =
+      mx::allocator::make_buffer(reinterpret_cast<void*>(win_base), win_bytes);
   if (buf.ptr() == nullptr) {
     return std::nullopt; // no-copy wrap rejected (e.g. alignment).
   }
@@ -260,7 +260,10 @@ void load_block_tensor(
   mx::array packed_arr = [&]() -> mx::array {
     if (zero_copy) {
       if (auto a = try_zero_copy_array(
-              tensor.weights_data, tensor.bsize, mx::uint8, packed,
+              tensor.weights_data,
+              tensor.bsize,
+              mx::uint8,
+              packed,
               ctx_holder)) {
         return *a;
       }
@@ -419,8 +422,8 @@ void read_metadata_value(
       ctx->off += 1;
       break;
     case GGUF_VALUE_TYPE_STRING:
-      out = std::string(
-          val->string.string, static_cast<size_t>(val->string.len));
+      out =
+          std::string(val->string.string, static_cast<size_t>(val->string.len));
       ctx->off += sizeof(gguf_string) + val->string.len;
       break;
     case GGUF_VALUE_TYPE_ARRAY: {
@@ -527,12 +530,25 @@ GgufLoadResult load_gguf(const std::string& path, bool zero_copy /* = true */) {
     res.tensor_shapes.emplace_back(name, std::move(native_shape));
 
     if (const KQuantCodec* codec = gguf_type_to_kquant_codec(tensor.type)) {
-      load_block_tensor(res, tensor, codec->weights_per_block,
-                        codec->bytes_per_block, codec->name, name, zero_copy,
-                        ctx);
+      load_block_tensor(
+          res,
+          tensor,
+          codec->weights_per_block,
+          codec->bytes_per_block,
+          codec->name,
+          name,
+          zero_copy,
+          ctx);
     } else if (const FpCodec* fp = gguf_type_to_fp_codec(tensor.type)) {
-      load_block_tensor(res, tensor, fp->weights_per_block,
-                        fp->bytes_per_block, fp->name, name, zero_copy, ctx);
+      load_block_tensor(
+          res,
+          tensor,
+          fp->weights_per_block,
+          fp->bytes_per_block,
+          fp->name,
+          name,
+          zero_copy,
+          ctx);
     } else if (auto dtype = gguf_type_to_dtype(tensor.type)) {
       res.arrays.emplace(
           name,

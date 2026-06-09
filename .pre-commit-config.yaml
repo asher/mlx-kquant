@@ -6,6 +6,16 @@ repos:
       - id: ruff
         args: [--fix]
       - id: ruff-format
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v19.1.5
+    hooks:
+      - id: clang-format
+        # All first-party C++/Metal sources. `types_or: [file]` overrides the
+        # hook's default c/c++ filter so the .metal kernels (not type-detected
+        # as C++) are covered too; the inline `// clang-format off` regions in
+        # them protect the macro tables.
+        files: '^(bindings\.cpp|src/.*\.(cpp|h)|metal/([^/]*\.metal|mlx/.*\.h))$'
+        types_or: [file]
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:

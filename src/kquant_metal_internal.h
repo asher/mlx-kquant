@@ -3,10 +3,11 @@
 // units share a single definition; compiled only where _METAL_ is defined.
 //
 // Ported from the file-local helpers in mlx/backend/metal/quantized.cpp, with
-// the extension-specific changes established in M1/M2:
+// these extension-specific changes:
 //   * kernels come from OUR bundled metallib (kq_get_kernel, not the fork's
 //     default-metallib d.get_kernel(name));
-//   * is_nax_available() is a hidden symbol -> replicated (kq_is_nax_available);
+//   * is_nax_available() is a hidden symbol -> replicated
+//   (kq_is_nax_available);
 //   * kquant carries no biases -> the bias buffer is dropped everywhere;
 //   * collapse_contiguous_dims is not exported -> replicated (kq_collapse_*).
 #pragma once
@@ -42,7 +43,8 @@ inline bool kq_is_nax_available() {
 #else
   static bool available = []() {
     bool can_use_nax = false;
-    if (__builtin_available(macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *)) {
+    if (__builtin_available(
+            macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *)) {
       can_use_nax = true;
     }
     auto& d = mx::metal::device(mx::Device::gpu);
@@ -74,15 +76,14 @@ inline bool codec_has_matmul(const std::string& kquant_type) {
   return codec != nullptr && codec->has_matmul_kernel;
 }
 
-// Codecs with a verify_qmv kernel (the small-M weight-read-amortizing leaf). Kept
-// as an explicit allow-list so the dispatch only routes to a kernel that was
-// actually instantiated in kq_quantized.metal; new codecs are added here once
-// their verify_qmv instantiation lands.
+// Codecs with a verify_qmv kernel (the small-M weight-read-amortizing leaf).
+// Kept as an explicit allow-list so the dispatch only routes to a kernel that
+// was actually instantiated in kq_quantized.metal; new codecs are added here
+// once their verify_qmv instantiation lands.
 inline bool codec_has_verify_qmv(const std::string& kquant_type) {
   return kquant_type == "q6_k" || kquant_type == "q8_0" ||
-      kquant_type == "q4_k" || kquant_type == "q5_k" ||
-      kquant_type == "q5_1" || kquant_type == "q3_k" ||
-      kquant_type == "q2_k" || kquant_type == "q4_0" ||
+      kquant_type == "q4_k" || kquant_type == "q5_k" || kquant_type == "q5_1" ||
+      kquant_type == "q3_k" || kquant_type == "q2_k" || kquant_type == "q4_0" ||
       kquant_type == "q4_1" || kquant_type == "q5_0";
 }
 
@@ -164,8 +165,8 @@ inline int add_strides_and_shapes(
 // Replica of mlx::core::collapse_contiguous_dims(shape, {strides...})
 // (backend/common/utils.cpp:20; not exported). Collapses adjacent contiguous
 // axes of the index tensors. The kernel's flat-offset math is identical whether
-// or not the dims are collapsed; this just reduces the loop-trip count and keeps
-// our index-stride buffers byte-identical to the fork's.
+// or not the dims are collapsed; this just reduces the loop-trip count and
+// keeps our index-stride buffers byte-identical to the fork's.
 inline std::tuple<mx::Shape, std::vector<mx::Strides>>
 kq_collapse_contiguous_dims(
     const mx::Shape& shape,
@@ -229,8 +230,8 @@ kq_collapse_contiguous_dims(
   return std::make_tuple(out_shape, out_strides);
 }
 
-// quantized.cpp:207-222. Appends the collapsed index ndims/shape/strides for the
-// gather leaf kernels.
+// quantized.cpp:207-222. Appends the collapsed index ndims/shape/strides for
+// the gather leaf kernels.
 inline int add_gather_strides_and_shapes(
     CommandEncoder& ce,
     const array& lhs_indices,
@@ -249,12 +250,12 @@ inline int add_gather_strides_and_shapes(
 // Fetch a kq kernel from OUR bundled metallib (not mlx-core's default one).
 //
 // The library handle is resolved exactly once and cached in a function-local
-// static: get_library() is a locked map lookup keyed by name, and metallib_dir()
-// returns a fresh std::string copy of the .so directory — both per-op costs the
-// fork's plain get_kernel(name) does not pay. The GPU Device is a process
-// singleton and the handle it owns lives for the process, so caching the raw
-// pointer is safe. Only the per-kname get_kernel() lookup remains per call,
-// matching the fork's path exactly.
+// static: get_library() is a locked map lookup keyed by name, and
+// metallib_dir() returns a fresh std::string copy of the .so directory — both
+// per-op costs the fork's plain get_kernel(name) does not pay. The GPU Device
+// is a process singleton and the handle it owns lives for the process, so
+// caching the raw pointer is safe. Only the per-kname get_kernel() lookup
+// remains per call, matching the fork's path exactly.
 inline MTL::ComputePipelineState* kq_get_kernel(
     Device& d,
     const std::string& kname) {

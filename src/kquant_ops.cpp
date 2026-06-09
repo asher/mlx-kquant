@@ -28,7 +28,8 @@ namespace {
 // the leading dim is strided — e.g. the gate/up halves of a fused MoE
 // gate_up_exps tensor are slices [..., :H, :] / [..., H:, :] whose expert
 // (leading) stride is 2*H rows: matrix-contiguous but NOT row_contiguous, so
-// full contiguify copies ~142 MB PER gather call (the decode MoE 5x regression).
+// full contiguify copies ~142 MB PER gather call (the decode MoE 5x
+// regression).
 inline mx::array kq_ensure_row_contiguous_matrix(
     const mx::array& x,
     mx::StreamOrDevice s) {
@@ -72,8 +73,8 @@ mx::array dequantize(
   if (w.shape(-1) % codec->bytes_per_block != 0) {
     std::ostringstream msg;
     msg << "[mlx_kquant.dequantize] Last dim (" << w.shape(-1)
-        << ") must be a multiple of bytes_per_block ("
-        << codec->bytes_per_block << ") for codec '" << kquant_type << "'.";
+        << ") must be a multiple of bytes_per_block (" << codec->bytes_per_block
+        << ") for codec '" << kquant_type << "'.";
     throw std::invalid_argument(msg.str());
   }
 
@@ -159,9 +160,10 @@ mx::array quantized_matmul(
 
   auto s = mx::to_stream(s_);
 
-  // Cast x to the output dtype, then matrix-row-contiguize x / w / scales at the
-  // op level — a public-API replica of the fork's ensure_row_contiguous_matrix
-  // (it contiguizes inside eval_gpu via the unexported contiguous_copy_gpu).
+  // Cast x to the output dtype, then matrix-row-contiguize x / w / scales at
+  // the op level — a public-API replica of the fork's
+  // ensure_row_contiguous_matrix (it contiguizes inside eval_gpu via the
+  // unexported contiguous_copy_gpu).
   auto x_c = kq_ensure_row_contiguous_matrix(mx::astype(x, out_type, s), s);
   auto w_c = kq_ensure_row_contiguous_matrix(w, s);
   auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
@@ -211,7 +213,11 @@ mx::array gather_qmm(
   // No indices at all -> a plain (non-gathered) quantized matmul.
   if (!lhs_indices_ && !rhs_indices_) {
     return quantized_matmul(
-        std::move(x), std::move(w), std::move(scales), kquant_type, transpose,
+        std::move(x),
+        std::move(w),
+        std::move(scales),
+        kquant_type,
+        transpose,
         s_);
   }
 
@@ -291,14 +297,16 @@ mx::array gather_qmm(
   // w needs FULL row-contiguity ONLY when the rhs_nax prefill leaf is reachable
   // (right_sorted && transpose && codec has a fused matmul kernel): that kernel
   // bakes dense expert packing into func consts and takes NO w strides, so the
-  // fork's gather_qmm_rhs_nax calls ensure_row_contiguous(w) (FULL). Every other
-  // leaf (qmv decode / qmm) walks w's strides, so matrix-contiguity (a strided
-  // LEADING/expert dim, no copy) suffices and is what keeps the fused
+  // fork's gather_qmm_rhs_nax calls ensure_row_contiguous(w) (FULL). Every
+  // other leaf (qmv decode / qmm) walks w's strides, so matrix-contiguity (a
+  // strided LEADING/expert dim, no copy) suffices and is what keeps the fused
   // gate_up_exps slice from being copied wholesale on every DECODE gather — the
   // 5x-sensitive hot path. x / scales always take the cheaper matrix check: the
   // eval_gpu rhs_nax gate already requires x.row_contiguous (skips rhs_nax
-  // otherwise, routing to a strided-safe leaf), and scales is a (1,) placeholder.
-  bool rhs_nax_reachable = right_sorted && transpose && codec->has_matmul_kernel;
+  // otherwise, routing to a strided-safe leaf), and scales is a (1,)
+  // placeholder.
+  bool rhs_nax_reachable =
+      right_sorted && transpose && codec->has_matmul_kernel;
   auto x_c = kq_ensure_row_contiguous_matrix(mx::astype(x, out_type, s), s);
   auto w_c = rhs_nax_reachable
       ? (w.flags().row_contiguous ? w : mx::contiguous(w, false, s))
@@ -309,8 +317,13 @@ mx::array gather_qmm(
       std::move(out_shape),
       out_type,
       std::make_shared<KQuantGatherQMM>(
-          s, kquant_type, codec->weights_per_block, codec->bits, transpose,
-          left_sorted, right_sorted),
+          s,
+          kquant_type,
+          codec->weights_per_block,
+          codec->bits,
+          transpose,
+          left_sorted,
+          right_sorted),
       {x_c, w_c, scales_c, std::move(lhs_indices), std::move(rhs_indices)});
 }
 
@@ -384,7 +397,8 @@ std::vector<mx::array> quantize(
       inputs);
 }
 
-// ----------------------------- toolchain self-checks -----------------------------
+// ----------------------------- toolchain self-checks
+// -----------------------------
 
 // Locate the directory of this shared object (where mlx_kquant.metallib lives).
 // Mirrors examples/extensions/axpby/axpby.cpp:current_binary_dir.
@@ -392,7 +406,8 @@ std::string metallib_dir() {
   static std::string dir = []() {
     Dl_info info;
     if (!dladdr(reinterpret_cast<void*>(&metallib_dir), &info)) {
-      throw std::runtime_error("mlx_kquant: unable to resolve binary directory");
+      throw std::runtime_error(
+          "mlx_kquant: unable to resolve binary directory");
     }
     return std::filesystem::path(info.dli_fname).parent_path().string();
   }();

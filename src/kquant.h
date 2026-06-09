@@ -1,6 +1,6 @@
 // Public C++ surface for mlx-kquant: the kq.* ops and their Primitive
-// subclasses. M0 shipped the toolchain self-checks; M1 adds dequantize.
-// quantized_matmul / gather_qmm / quantize land in later milestones.
+// subclasses (toolchain self-checks, dequantize, quantized_matmul, gather_qmm,
+// and quantize).
 #pragma once
 
 #include <optional>
@@ -14,9 +14,11 @@ namespace mx = mlx::core;
 
 namespace mlx_kquant {
 
-// ----------------------------- toolchain self-checks (M0) -----------------------------
+// ----------------------------- toolchain self-checks
+// -----------------------------
 
-// Directory containing the bundled mlx_kquant.metallib (colocated with _ext.so).
+// Directory containing the bundled mlx_kquant.metallib (colocated with
+// _ext.so).
 std::string metallib_dir();
 
 // Load the bundled metallib via MLX's Metal device. Throws on failure.
@@ -55,8 +57,8 @@ mx::array quantized_matmul(
 // expert weight matrix via `rhs_indices` and an x row via `lhs_indices`, then
 // matmul. `w` is uint8 K-quant wire bytes shaped (n_experts, N, bytes_per_row);
 // `scales` a vestigial placeholder (see dequantize). Either index defaults to a
-// plain arange when omitted. `sorted_indices` enables an optimized path when the
-// (defaulted) indices are sorted. Output dtype follows quantized_matmul.
+// plain arange when omitted. `sorted_indices` enables an optimized path when
+// the (defaulted) indices are sorted. Output dtype follows quantized_matmul.
 // group_size/bits are derived from `kquant_type`.
 mx::array gather_qmm(
     mx::array x,

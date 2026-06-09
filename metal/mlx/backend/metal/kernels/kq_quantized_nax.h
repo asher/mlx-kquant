@@ -64,9 +64,9 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
   constexpr bool transpose_a = false;
   constexpr bool transpose_b = true;
 
-  // Clamp to SM/SN in int before narrowing to short — a bare short() cast of the
-  // raw remaining-row/col span overflows once M (or N) exceeds 32767, corrupting
-  // the leading tiles of a single large matmul.
+  // Clamp to SM/SN in int before narrowing to short — a bare short() cast of
+  // the raw remaining-row/col span overflows once M (or N) exceeds 32767,
+  // corrupting the leading tiles of a single large matmul.
   const short sgp_sm = short(min(int(SM), M - (y_row + tm)));
   const bool is_unaligned_sm = (sgp_sm != SM);
 
@@ -2355,9 +2355,9 @@ METAL_FUNC void kq_gather_qmm_rhs_nax_tgp_impl(
 
   // Clamp to SM/SN (small) in int BEFORE narrowing to short. Casting the raw
   // (M - (y_row + tm)) term first overflows short once M > 32767, poisoning the
-  // tail-tile row count for every tile whose remaining-row span exceeds SHRT_MAX
-  // and silently corrupting their output (mirrors the min-then-cast order used
-  // for tgp_bm/tgp_bn above).
+  // tail-tile row count for every tile whose remaining-row span exceeds
+  // SHRT_MAX and silently corrupting their output (mirrors the min-then-cast
+  // order used for tgp_bm/tgp_bn above).
   const short sgp_sm =
       align_M ? SM : short(min(int(SM), max(0, (M - (y_row + tm)))));
   const short sgp_sn =

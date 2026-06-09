@@ -31,9 +31,10 @@ nb::object meta_to_py(const mlx_kquant::GgufMetaValue& v) {
 } // namespace
 
 NB_MODULE(_ext, m) {
-  m.doc() = "mlx-kquant: standalone GGUF K-quant ops for MLX (custom Metal kernels).";
+  m.doc() =
+      "mlx-kquant: standalone GGUF K-quant ops for MLX (custom Metal kernels).";
 
-  // --- toolchain self-checks (M0) ---
+  // --- toolchain self-checks ---
   m.def(
       "codecs",
       &mlx_kquant::codec_names,
@@ -161,8 +162,7 @@ NB_MODULE(_ext, m) {
   m.def(
       "load_gguf",
       [](const std::string& path, bool zero_copy) {
-        mlx_kquant::GgufLoadResult res =
-            mlx_kquant::load_gguf(path, zero_copy);
+        mlx_kquant::GgufLoadResult res = mlx_kquant::load_gguf(path, zero_copy);
 
         nb::dict arrays;
         for (auto& [name, arr] : res.arrays) {

@@ -19,10 +19,10 @@ namespace mx = mlx::core;
 
 namespace mlx_kquant {
 
-// A decoded GGUF metadata value. GGUF KV value types collapse to Python-friendly
-// forms: integer scalars (any width, plus bool) -> int64; float scalars
-// (f32/f64) -> double; strings -> std::string; 1-D arrays -> the matching
-// vector. (GGUF allows only one level of array nesting.)
+// A decoded GGUF metadata value. GGUF KV value types collapse to
+// Python-friendly forms: integer scalars (any width, plus bool) -> int64; float
+// scalars (f32/f64) -> double; strings -> std::string; 1-D arrays -> the
+// matching vector. (GGUF allows only one level of array nesting.)
 using GgufMetaValue = std::variant<
     std::monostate,
     int64_t,

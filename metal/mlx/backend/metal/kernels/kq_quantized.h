@@ -390,7 +390,8 @@ METAL_FUNC void kq_q8_0_qmv_fast_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* row_base = w + static_cast<int64_t>(row_idx) * row_bytes;
+      const device uint8_t* row_base =
+          w + static_cast<int64_t>(row_idx) * row_bytes;
 
       const int k_global = k + lane_k_offset;
       const int block_id = k_global / KQ_Q8_0_GROUP;
@@ -419,14 +420,14 @@ METAL_FUNC void kq_q8_0_qmv_fast_impl(
 }
 
 // Verify-shaped qmv (see kq_q6_k_verify_qmv_impl). Reads each weight block once
-// per output row and dots it against all `vm` activation rows. Non-batched only.
-// results_per_simdgroup is templated: the default (4) packs 8 output rows per
-// threadgroup; a finer value (1 -> 2 rows/tg) multiplies the threadgroup count
-// for the same N, restoring GPU occupancy when each row's weight is small enough
-// to stay L2-resident (so amortizing the weight read saves little DRAM traffic
-// and the lost occupancy isn't repaid). Bit-exact across values: each output
-// row's per-lane sequential K-fold + simd_sum is identical regardless of how
-// rows are partitioned across threadgroups.
+// per output row and dots it against all `vm` activation rows. Non-batched
+// only. results_per_simdgroup is templated: the default (4) packs 8 output rows
+// per threadgroup; a finer value (1 -> 2 rows/tg) multiplies the threadgroup
+// count for the same N, restoring GPU occupancy when each row's weight is small
+// enough to stay L2-resident (so amortizing the weight read saves little DRAM
+// traffic and the lost occupancy isn't repaid). Bit-exact across values: each
+// output row's per-lane sequential K-fold + simd_sum is identical regardless of
+// how rows are partitioned across threadgroups.
 template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
 METAL_FUNC void kq_q8_0_verify_qmv_impl(
     const device uint8_t* w,
@@ -571,7 +572,8 @@ METAL_FUNC void kq_q8_0_qmv_impl(
 
     for (int row = 0; row < active_rows; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* row_base = w + static_cast<int64_t>(row_idx) * row_bytes;
+      const device uint8_t* row_base =
+          w + static_cast<int64_t>(row_idx) * row_bytes;
       const device uint8_t* block_addr =
           row_base + block_id * KQ_Q8_0_BLOCK_BYTES;
 
@@ -892,8 +894,8 @@ template <typename T, int group_size, int bits, bool batched>
 
 // Finer-tiled variant: 1 result per simdgroup -> 2 output rows per threadgroup
 // (vs 8 in the default), quadrupling the threadgroup count for the same N. Used
-// when occupancy is the bottleneck (small per-row weight that stays L2-resident).
-// Bit-exact vs the default variant and vs per-row qmv.
+// when occupancy is the bottleneck (small per-row weight that stays
+// L2-resident). Bit-exact vs the default variant and vs per-row qmv.
 template <typename T, int group_size, int bits, bool batched>
 [[kernel]] void kq_q8_0_verify_qmv_fine(
     const device uint8_t* w,
@@ -1060,8 +1062,8 @@ METAL_FUNC void kq_q5_1_qmv_fast_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* block_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_1_BLOCK_BYTES;
+      const device uint8_t* block_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_1_BLOCK_BYTES;
       const U d = U(kq_q5_1_d(block_addr));
       const U m = U(kq_q5_1_m(block_addr));
       const uint32_t qh = kq_q5_1_qh(block_addr);
@@ -1094,10 +1096,11 @@ METAL_FUNC void kq_q5_1_qmv_fast_impl(
   }
 }
 
-// Verify-shaped qmv (see kq_q6_k_verify_qmv_impl). The masked weight values (incl.
-// the 5th bit from qh) are cached once per output row; the m-loop rebuilds the
-// cheap per-position activation scaling and dots, so the dominant per-row weight
-// read is amortized while the math stays bit-for-bit the qmv_fast path.
+// Verify-shaped qmv (see kq_q6_k_verify_qmv_impl). The masked weight values
+// (incl. the 5th bit from qh) are cached once per output row; the m-loop
+// rebuilds the cheap per-position activation scaling and dots, so the dominant
+// per-row weight read is amortized while the math stays bit-for-bit the
+// qmv_fast path.
 template <typename T, int group_size, int bits>
 METAL_FUNC void kq_q5_1_verify_qmv_impl(
     const device uint8_t* w,
@@ -1144,8 +1147,8 @@ METAL_FUNC void kq_q5_1_verify_qmv_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* block_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_1_BLOCK_BYTES;
+      const device uint8_t* block_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_1_BLOCK_BYTES;
       const U d = U(kq_q5_1_d(block_addr));
       const U mm = U(kq_q5_1_m(block_addr));
       const uint32_t qh = kq_q5_1_qh(block_addr);
@@ -1157,10 +1160,8 @@ METAL_FUNC void kq_q5_1_verify_qmv_impl(
 #pragma unroll
       for (int i = 0; i < 8; i += 2) {
         const uint16_t qi = qs[i / 2];
-        wm[i + 0] =
-            U((qi & 0x000F) | (((qh >> (i + 0 + il)) << 4) & 0x00010));
-        wm[i + 1] =
-            U((qi & 0x0F00) | (((qh >> (i + 1 + il)) << 12) & 0x01000));
+        wm[i + 0] = U((qi & 0x000F) | (((qh >> (i + 0 + il)) << 4) & 0x00010));
+        wm[i + 1] = U((qi & 0x0F00) | (((qh >> (i + 1 + il)) << 12) & 0x01000));
         wm[i + 8] =
             U((qi & 0x00F0) | (((qh >> (i + 0 + il + 16)) << 8) & 0x00100));
         wm[i + 9] =
@@ -1265,8 +1266,8 @@ METAL_FUNC void kq_q5_1_qmv_impl(
 
     for (int row = 0; row < active_rows; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* block_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_1_BLOCK_BYTES;
+      const device uint8_t* block_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_1_BLOCK_BYTES;
       const U d = U(kq_q5_1_d(block_addr));
       const U m = U(kq_q5_1_m(block_addr));
       const uint32_t qh = kq_q5_1_qh(block_addr);
@@ -1786,8 +1787,8 @@ METAL_FUNC void kq_q4_k_qmv_fast_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* sb_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_K_BLOCK_BYTES;
+      const device uint8_t* sb_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_K_BLOCK_BYTES;
 
       const device uint16_t* sc16_src =
           reinterpret_cast<const device uint16_t*>(
@@ -1846,10 +1847,10 @@ METAL_FUNC void kq_q4_k_qmv_fast_impl(
 
 // Verify-shaped qmv (see kq_q6_k_verify_qmv_impl). The masked weight values and
 // scale bytes are unpacked once per output row; the m-loop rebuilds yl/yh + the
-// dot and the dmin*sumy offset, so the dominant per-row weight read is amortized
-// while the math stays bit-for-bit the qmv_fast path (d and the per-sub-block
-// q-scale are applied in the same place, not folded into the cached weights).
-// Non-batched only.
+// dot and the dmin*sumy offset, so the dominant per-row weight read is
+// amortized while the math stays bit-for-bit the qmv_fast path (d and the
+// per-sub-block q-scale are applied in the same place, not folded into the
+// cached weights). Non-batched only.
 template <typename T, int group_size, int bits>
 METAL_FUNC void kq_q4_k_verify_qmv_impl(
     const device uint8_t* w,
@@ -1905,8 +1906,8 @@ METAL_FUNC void kq_q4_k_verify_qmv_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* sb_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_K_BLOCK_BYTES;
+      const device uint8_t* sb_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_K_BLOCK_BYTES;
 
       // --- unpack this output row's masked weights + scales once ---
       const device uint16_t* sc16_src =
@@ -2058,8 +2059,9 @@ METAL_FUNC void kq_q4_k_qmv_impl(
     const int sb_id = k / KQ_Q4_K_SUPERBLOCK;
     for (int row = 0; row < active_rows; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* sb_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + sb_id * KQ_Q4_K_BLOCK_BYTES;
+      const device uint8_t* sb_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes +
+          sb_id * KQ_Q4_K_BLOCK_BYTES;
 
       const U d = U(kq_q4_k_d(sb_addr));
       const U dmin = U(kq_q4_k_dmin(sb_addr));
@@ -2616,8 +2618,8 @@ METAL_FUNC void kq_q5_k_qmv_fast_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* sb_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_K_BLOCK_BYTES;
+      const device uint8_t* sb_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_K_BLOCK_BYTES;
 
       const device uint16_t* sc16_src =
           reinterpret_cast<const device uint16_t*>(
@@ -2691,11 +2693,11 @@ METAL_FUNC void kq_q5_k_qmv_fast_impl(
 }
 
 // Verify-shaped qmv (see kq_q4_k_verify_qmv_impl). The masked low nibbles, the
-// 5th-bit (qh) selectors, and the scale bytes are cached once per output row; the
-// m-loop rebuilds yl/yh + the acc1/acc2/accH dot and the dmin*sumy offset, so the
-// dominant per-row weight read is amortized while the math stays bit-for-bit the
-// qmv_fast path (d and the per-sub-block q-scale are applied in the same place,
-// not folded into the cached weights). Non-batched only.
+// 5th-bit (qh) selectors, and the scale bytes are cached once per output row;
+// the m-loop rebuilds yl/yh + the acc1/acc2/accH dot and the dmin*sumy offset,
+// so the dominant per-row weight read is amortized while the math stays
+// bit-for-bit the qmv_fast path (d and the per-sub-block q-scale are applied in
+// the same place, not folded into the cached weights). Non-batched only.
 template <typename T, int group_size, int bits>
 METAL_FUNC void kq_q5_k_verify_qmv_impl(
     const device uint8_t* w,
@@ -2758,10 +2760,11 @@ METAL_FUNC void kq_q5_k_verify_qmv_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* sb_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_K_BLOCK_BYTES;
+      const device uint8_t* sb_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_K_BLOCK_BYTES;
 
-      // --- unpack this output row's masked weights + qh flags + scales once ---
+      // --- unpack this output row's masked weights + qh flags + scales once
+      // ---
       const device uint16_t* sc16_src =
           reinterpret_cast<const device uint16_t*>(
               kq_q5_k_scales12_ptr(sb_addr)) +
@@ -2949,8 +2952,8 @@ METAL_FUNC void kq_q5_k_qmv_impl(
 
     for (int row = 0; row < active_rows; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* sb_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_K_BLOCK_BYTES;
+      const device uint8_t* sb_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_K_BLOCK_BYTES;
 
       const device uint16_t* sc16_src =
           reinterpret_cast<const device uint16_t*>(
@@ -3565,8 +3568,8 @@ METAL_FUNC void kq_q6_k_qmv_fast_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* sb_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q6_K_BLOCK_BYTES;
+      const device uint8_t* sb_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q6_K_BLOCK_BYTES;
 
       const device uint8_t* q1 = kq_q6_k_ql_ptr(sb_addr) + 64 * ip + l0;
       const device uint8_t* q2 = q1 + 32;
@@ -3607,15 +3610,16 @@ METAL_FUNC void kq_q6_k_qmv_fast_impl(
 }
 
 // Verify-shaped qmv. The per-row qmv (kq_q6_k_qmv_fast) puts M on grid_dims.x,
-// so each of the M rows runs its own threadgroup that independently re-reads the
-// weight tile — at M=4..8 that is 4-8x the weight traffic for the same answer.
-// This kernel instead runs ONE threadgroup per N-tile (grid_dims.x = 1), reads
-// each weight super-block ONCE, and dots it against ALL `vm` activation rows,
-// so the (dominant) weight read is amortized across the rows. For the small-M
-// verify / batched-decode regime (M = 2..MAX_VM) this recovers the bandwidth the
-// per-row qmv leaves on the table. Non-batched (B == 1) only; x is row-contiguous
-// [vm, in_vec_size], y is [vm, out_vec_size]. Math per (row, m) is identical to
-// kq_q6_k_qmv_fast_impl with x = row m, so results are bit-for-bit the same.
+// so each of the M rows runs its own threadgroup that independently re-reads
+// the weight tile — at M=4..8 that is 4-8x the weight traffic for the same
+// answer. This kernel instead runs ONE threadgroup per N-tile (grid_dims.x =
+// 1), reads each weight super-block ONCE, and dots it against ALL `vm`
+// activation rows, so the (dominant) weight read is amortized across the rows.
+// For the small-M verify / batched-decode regime (M = 2..MAX_VM) this recovers
+// the bandwidth the per-row qmv leaves on the table. Non-batched (B == 1) only;
+// x is row-contiguous [vm, in_vec_size], y is [vm, out_vec_size]. Math per
+// (row, m) is identical to kq_q6_k_qmv_fast_impl with x = row m, so results are
+// bit-for-bit the same.
 template <typename T, int group_size, int bits>
 METAL_FUNC void kq_q6_k_verify_qmv_impl(
     const device uint8_t* w,
@@ -3667,8 +3671,8 @@ METAL_FUNC void kq_q6_k_verify_qmv_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* sb_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q6_K_BLOCK_BYTES;
+      const device uint8_t* sb_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q6_K_BLOCK_BYTES;
 
       const device uint8_t* q1 = kq_q6_k_ql_ptr(sb_addr) + 64 * ip + l0;
       const device uint8_t* q2 = q1 + 32;
@@ -3697,7 +3701,8 @@ METAL_FUNC void kq_q6_k_verify_qmv_impl(
       const U sc3 = U(sc[6]);
 
       // Dot the dequantized weight against each activation row. The weight read
-      // above happens once; only the (tiny, cache-resident) activations re-read.
+      // above happens once; only the (tiny, cache-resident) activations
+      // re-read.
       for (int m = 0; m < vm; m++) {
         const device T* xm = x + m * in_vec_size + x_base;
         U sums0 = U(0), sums1 = U(0), sums2 = U(0), sums3 = U(0);
@@ -3781,8 +3786,8 @@ METAL_FUNC void kq_q6_k_qmv_impl(
 
     for (int row = 0; row < active_rows; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* sb_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q6_K_BLOCK_BYTES;
+      const device uint8_t* sb_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q6_K_BLOCK_BYTES;
 
       const device uint8_t* q1 = kq_q6_k_ql_ptr(sb_addr) + 64 * ip + l0;
       const device uint8_t* q2 = q1 + 32;
@@ -4188,9 +4193,9 @@ template <typename T, int group_size, int bits, bool batched>
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
-// `batched` is carried only so this reuses the instantiate_kquant_batched macro;
-// the verify path is dispatched non-batched (B == 1) so the offset adjust is a
-// no-op and is omitted.
+// `batched` is carried only so this reuses the instantiate_kquant_batched
+// macro; the verify path is dispatched non-batched (B == 1) so the offset
+// adjust is a no-op and is omitted.
 template <typename T, int group_size, int bits, bool batched>
 [[kernel]] void kq_q6_k_verify_qmv(
     const device uint8_t* w,
@@ -4398,8 +4403,8 @@ METAL_FUNC void kq_q3_k_qmv_fast_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* sb_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q3_K_BLOCK_BYTES;
+      const device uint8_t* sb_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q3_K_BLOCK_BYTES;
 
       const device uint16_t* q = reinterpret_cast<const device uint16_t*>(
           kq_q3_k_qs_ptr(sb_addr) + q_offset_bytes);
@@ -4548,8 +4553,8 @@ METAL_FUNC void kq_q3_k_verify_qmv_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* sb_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q3_K_BLOCK_BYTES;
+      const device uint8_t* sb_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q3_K_BLOCK_BYTES;
 
       const device uint16_t* q = reinterpret_cast<const device uint16_t*>(
           kq_q3_k_qs_ptr(sb_addr) + q_offset_bytes);
@@ -4727,8 +4732,8 @@ METAL_FUNC void kq_q3_k_qmv_impl(
 
     for (int row = 0; row < active_rows; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* sb_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q3_K_BLOCK_BYTES;
+      const device uint8_t* sb_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q3_K_BLOCK_BYTES;
 
       const device uint16_t* q = reinterpret_cast<const device uint16_t*>(
           kq_q3_k_qs_ptr(sb_addr) + q_offset_bytes);
@@ -5364,8 +5369,8 @@ METAL_FUNC void kq_q2_k_qmv_fast_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* sb_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q2_K_BLOCK_BYTES;
+      const device uint8_t* sb_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q2_K_BLOCK_BYTES;
 
       const device uint8_t* sc = kq_q2_k_scales_ptr(sb_addr) + 8 * iq + is;
       const device uint16_t* qs =
@@ -5464,8 +5469,8 @@ METAL_FUNC void kq_q2_k_verify_qmv_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* sb_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q2_K_BLOCK_BYTES;
+      const device uint8_t* sb_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q2_K_BLOCK_BYTES;
 
       const device uint8_t* sc = kq_q2_k_scales_ptr(sb_addr) + 8 * iq + is;
       const device uint16_t* qs =
@@ -5529,8 +5534,7 @@ METAL_FUNC void kq_q2_k_verify_qmv_impl(
         result[m][row] += d *
                 ((acc1[0] + acc2[0] * (U(1) / U(256))) * scl0 +
                  (acc1[1] + acc2[1] * (U(1) / U(256))) * scl1 * (U(1) / U(4)) +
-                 (acc1[2] + acc2[2] * (U(1) / U(256))) * scl2 *
-                     (U(1) / U(16)) +
+                 (acc1[2] + acc2[2] * (U(1) / U(256))) * scl2 * (U(1) / U(16)) +
                  (acc1[3] + acc2[3] * (U(1) / U(256))) * scl3 *
                      (U(1) / U(64))) -
             dmin * (U(1) / U(16)) *
@@ -5611,8 +5615,8 @@ METAL_FUNC void kq_q2_k_qmv_impl(
 
     for (int row = 0; row < active_rows; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* sb_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q2_K_BLOCK_BYTES;
+      const device uint8_t* sb_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q2_K_BLOCK_BYTES;
 
       const device uint8_t* sc = kq_q2_k_scales_ptr(sb_addr) + 8 * iq + is;
       const device uint16_t* qs =

@@ -1,12 +1,13 @@
 // KQuantMatmul primitive: x @ dequant(w). GPU dispatch ports the KQuant arm of
 // mlx/backend/metal/quantized.cpp:QuantizedMatmul::eval_gpu (:1566-1713) plus
-// its leaf kernels (qmm / qmm_nax / qvm / qmv) and dispatch helpers, with the
-// extension-specific changes established in M1:
+// its leaf kernels (qmm / qmm_nax / qvm / qmv) and dispatch helpers, with these
+// extension-specific changes:
 //   * kernels fetched from OUR bundled metallib via d.get_kernel(name, lib);
 //   * row-contiguity guaranteed by the op (contiguous_copy_gpu is unexported);
 //   * kernel-name type tokens via kq_type_string (not type_to_name).
 // Two further deviations, both correctness-preserving:
-//   * is_nax_available() is a hidden symbol -> replicated as kq_is_nax_available;
+//   * is_nax_available() is a hidden symbol -> replicated as
+//   kq_is_nax_available;
 //   * the split-k paths (qmm_splitk / qvm_split_k) need the unexported
 //     strided_reduce_general_dispatch -> gated off; plain qmm/qvm run instead.
 //   * kquant never carries biases, so the bias buffer is dropped throughout.
@@ -103,7 +104,8 @@ void qmm_nax(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// quantized.cpp:760-866 (kquant path, no biases). qmm_splitk gated off upstream.
+// quantized.cpp:760-866 (kquant path, no biases). qmm_splitk gated off
+// upstream.
 void qmm(
     const array& x,
     const array& w,
@@ -125,7 +127,18 @@ void qmm(
   if (kq_is_nax_available() && transpose && (K % 64 == 0) &&
       (x.dtype() != mx::float32) && codec_has_matmul(kquant_type)) {
     return qmm_nax(
-        x, w, scales, out, transpose, group_size, bits, M, N, K, d, s,
+        x,
+        w,
+        scales,
+        out,
+        transpose,
+        group_size,
+        bits,
+        M,
+        N,
+        K,
+        d,
+        s,
         kquant_type);
   }
 
@@ -270,8 +283,8 @@ void qmv(
 // N-tile (grid_dims.x = 1) reads each weight tile once and dots it against all
 // M activation rows, amortizing the dominant weight read; the per-row qmv would
 // re-read it M times (M on grid_dims.x). Non-batched only; M (= vm) in [2,
-// verify_qmv_max_rows()], codec in codec_has_verify_qmv. Bit-for-bit identical to
-// running qmv per row.
+// verify_qmv_max_rows()], codec in codec_has_verify_qmv. Bit-for-bit identical
+// to running qmv per row.
 void verify_qmv(
     const array& x,
     const array& w,
@@ -296,7 +309,8 @@ void verify_qmv(
   // variant emits 2 output rows / threadgroup (4x the threadgroups), restoring
   // occupancy. Bit-exact vs the default. Other codecs keep the default tiling.
   std::string verify_kname = "verify_qmv_";
-  int rows_per_tg = bn; // default kernel emits bn (= num_simdgroups*RPS) rows/tg
+  int rows_per_tg =
+      bn; // default kernel emits bn (= num_simdgroups*RPS) rows/tg
   if (kquant_type == "q8_0") {
     verify_kname = "verify_qmv_fine_";
     rows_per_tg = 2; // num_simdgroups(2) * results_per_simdgroup(1)
@@ -404,23 +418,47 @@ void KQuantMatmul::eval_gpu(
 
   // KQuant special cases (quantized.cpp:1591-1615).
   if (!transpose_ && M < vector_limit) {
-    qmm(x, w, scales, out, transpose_, group_size_, bits_, M, N, K, d, s,
+    qmm(x,
+        w,
+        scales,
+        out,
+        transpose_,
+        group_size_,
+        bits_,
+        M,
+        N,
+        K,
+        d,
+        s,
         kquant_type_);
     return;
   }
   // quantized.cpp:1610 routes K in {64,128} (M<vector_limit, transpose) to a
-  // quad-optimized qmv kernel; no kquant qmv_quad kernel exists (the fork throws
-  // here too). Plain qmv is correct for any K that is a multiple of the codec
-  // group size — K-quants (gs=256) can never reach K=64/128, only the legacy
-  // gs=32 codecs can, and only on weights whose input dim is exactly 64/128
-  // (none in standard transformers). Fall through to dispatch_qmv below rather
-  // than throw; qmv_quad would be a perf-only kernel for an essentially-dead
-  // path. See docs/progress-extension-refactor.log qmv_quad survey.
+  // quad-optimized qmv kernel; no kquant qmv_quad kernel exists (the fork
+  // throws here too). Plain qmv is correct for any K that is a multiple of the
+  // codec group size — K-quants (gs=256) can never reach K=64/128, only the
+  // legacy gs=32 codecs can, and only on weights whose input dim is exactly
+  // 64/128 (none in standard transformers). Fall through to dispatch_qmv below
+  // rather than throw; qmv_quad would be a perf-only kernel for an
+  // essentially-dead path. See docs/progress-extension-refactor.log qmv_quad
+  // survey.
 
   if (M >= vector_limit) {
-    // Upstream uses qmm_splitk for (transpose && B==1); gated off here (it needs
-    // strided_reduce_general_dispatch). Plain qmm is correct, just less parallel.
-    qmm(x, w, scales, out, transpose_, group_size_, bits_, M, N, K, d, s,
+    // Upstream uses qmm_splitk for (transpose && B==1); gated off here (it
+    // needs strided_reduce_general_dispatch). Plain qmm is correct, just less
+    // parallel.
+    qmm(x,
+        w,
+        scales,
+        out,
+        transpose_,
+        group_size_,
+        bits_,
+        M,
+        N,
+        K,
+        d,
+        s,
         kquant_type_);
     return;
   }
@@ -439,16 +477,17 @@ void KQuantMatmul::eval_gpu(
         M <= verify_qmv_max_rows() && (N % bn == 0) &&
         (K % qmv_fast_k_align() == 0) && codec_has_verify_qmv(kquant_type_);
     if (verify_ok) {
-      verify_qmv(x, w, scales, out, group_size_, bits_, M, N, K, d, s,
-                 kquant_type_);
+      verify_qmv(
+          x, w, scales, out, group_size_, bits_, M, N, K, d, s, kquant_type_);
       return;
     }
-    dispatch_qmv(x, w, scales, out, group_size_, bits_, M, N, K, d, s,
-                 kquant_type_);
+    dispatch_qmv(
+        x, w, scales, out, group_size_, bits_, M, N, K, d, s, kquant_type_);
     return;
   }
 
-  // Upstream routes K>=1024 to qvm_split_k; gated off here. Plain qvm is correct.
+  // Upstream routes K>=1024 to qvm_split_k; gated off here. Plain qvm is
+  // correct.
   qvm(x, w, scales, out, group_size_, bits_, M, N, K, d, s, kquant_type_);
 }
 

@@ -83,8 +83,8 @@ METAL_FUNC void kq_q4_0_qmv_fast_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* block_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_0_BLOCK_BYTES;
+      const device uint8_t* block_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_0_BLOCK_BYTES;
       const U d = U(kq_q4_0_d(block_addr));
       const device uint16_t* qs =
           reinterpret_cast<const device uint16_t*>(kq_q4_0_qs_ptr(block_addr)) +
@@ -161,8 +161,8 @@ METAL_FUNC void kq_q4_0_verify_qmv_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* block_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_0_BLOCK_BYTES;
+      const device uint8_t* block_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_0_BLOCK_BYTES;
       const U d = U(kq_q4_0_d(block_addr));
       const device uint16_t* qs =
           reinterpret_cast<const device uint16_t*>(kq_q4_0_qs_ptr(block_addr)) +
@@ -277,8 +277,8 @@ METAL_FUNC void kq_q4_0_qmv_impl(
 
     for (int row = 0; row < active_rows; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* block_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_0_BLOCK_BYTES;
+      const device uint8_t* block_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_0_BLOCK_BYTES;
       const U d = U(kq_q4_0_d(block_addr));
       const device uint16_t* qs =
           reinterpret_cast<const device uint16_t*>(kq_q4_0_qs_ptr(block_addr)) +
@@ -739,8 +739,8 @@ METAL_FUNC void kq_q4_1_qmv_fast_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* block_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_1_BLOCK_BYTES;
+      const device uint8_t* block_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_1_BLOCK_BYTES;
       const U d = U(kq_q4_1_d(block_addr));
       const U m = U(kq_q4_1_m(block_addr));
       const device uint16_t* qs =
@@ -818,8 +818,8 @@ METAL_FUNC void kq_q4_1_verify_qmv_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* block_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_1_BLOCK_BYTES;
+      const device uint8_t* block_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_1_BLOCK_BYTES;
       const U d = U(kq_q4_1_d(block_addr));
       const U mm = U(kq_q4_1_m(block_addr));
       const device uint16_t* qs =
@@ -860,8 +860,7 @@ METAL_FUNC void kq_q4_1_verify_qmv_impl(
           acc[2] += yl[i + 8] * wm[i + 8];
           acc[3] += yl[i + 9] * wm[i + 9];
         }
-        result[m][row] +=
-            d * (acc[0] + acc[1] + acc[2] + acc[3]) + sumy * mm;
+        result[m][row] += d * (acc[0] + acc[1] + acc[2] + acc[3]) + sumy * mm;
       }
     }
   }
@@ -935,8 +934,8 @@ METAL_FUNC void kq_q4_1_qmv_impl(
 
     for (int row = 0; row < active_rows; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* block_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_1_BLOCK_BYTES;
+      const device uint8_t* block_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_1_BLOCK_BYTES;
       const U d = U(kq_q4_1_d(block_addr));
       const U m = U(kq_q4_1_m(block_addr));
       const device uint16_t* qs =
@@ -1414,8 +1413,8 @@ METAL_FUNC void kq_q5_0_qmv_fast_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* block_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_0_BLOCK_BYTES;
+      const device uint8_t* block_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_0_BLOCK_BYTES;
       const U d = U(kq_q5_0_d(block_addr));
       const uint32_t qh = kq_q5_0_qh(block_addr);
       const device uint16_t* qs =
@@ -1450,8 +1449,8 @@ METAL_FUNC void kq_q5_0_qmv_fast_impl(
 // Verify-shaped qmv (see kq_q6_k_verify_qmv_impl in kq_quantized.h). The masked
 // weight values (incl. the 5th bit from qh) are cached once per output row; the
 // m-loop rebuilds the cheap per-position activation scaling and dots, so the
-// dominant per-row weight read is amortized while the math stays bit-for-bit the
-// qmv_fast path.
+// dominant per-row weight read is amortized while the math stays bit-for-bit
+// the qmv_fast path.
 template <typename T, int group_size, int bits>
 METAL_FUNC void kq_q5_0_verify_qmv_impl(
     const device uint8_t* w,
@@ -1498,8 +1497,8 @@ METAL_FUNC void kq_q5_0_verify_qmv_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* block_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_0_BLOCK_BYTES;
+      const device uint8_t* block_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_0_BLOCK_BYTES;
       const U d = U(kq_q5_0_d(block_addr));
       const uint32_t qh = kq_q5_0_qh(block_addr);
       const device uint16_t* qs =
@@ -1510,10 +1509,8 @@ METAL_FUNC void kq_q5_0_verify_qmv_impl(
 #pragma unroll
       for (int i = 0; i < 8; i += 2) {
         const uint16_t qi = qs[i / 2];
-        wm[i + 0] =
-            U((qi & 0x000F) | (((qh >> (i + 0 + il)) << 4) & 0x00010));
-        wm[i + 1] =
-            U((qi & 0x0F00) | (((qh >> (i + 1 + il)) << 12) & 0x01000));
+        wm[i + 0] = U((qi & 0x000F) | (((qh >> (i + 0 + il)) << 4) & 0x00010));
+        wm[i + 1] = U((qi & 0x0F00) | (((qh >> (i + 1 + il)) << 12) & 0x01000));
         wm[i + 8] =
             U((qi & 0x00F0) | (((qh >> (i + 0 + il + 16)) << 8) & 0x00100));
         wm[i + 9] =
@@ -1619,8 +1616,8 @@ METAL_FUNC void kq_q5_0_qmv_impl(
 
     for (int row = 0; row < active_rows; row++) {
       const int row_idx = out_row + row;
-      const device uint8_t* block_addr =
-          w + static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_0_BLOCK_BYTES;
+      const device uint8_t* block_addr = w +
+          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_0_BLOCK_BYTES;
       const U d = U(kq_q5_0_d(block_addr));
       const uint32_t qh = kq_q5_0_qh(block_addr);
       const device uint16_t* qs =
