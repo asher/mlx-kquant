@@ -34,6 +34,11 @@ jobs:
           metal/*.metal metal/mlx/backend/metal/kernels/*.h
       - name: Codec doc-lint (no extension build needed)
         run: python scripts/check-codecs.py --check
+      # The committed test fixtures are regenerable from this repo via
+      # tests/gen_fixtures.py (GPU encode); verify the on-disk bytes match the
+      # manifest so a tampered/corrupt fixture can't silently pass the op tests.
+      - name: Fixture manifest integrity
+        run: shasum -a 256 -c tests/fixtures/SHA256SUMS
 
   build-and-test:
     name: build + tests (py${{ matrix.python }})
@@ -60,6 +65,12 @@ jobs:
 
       - name: Codec lint (incl. runtime kq.codecs() leg)
         run: python scripts/check-codecs.py --check
+
+      # Pure-logic recipe tests: need the built extension to `import mlx_kquant`
+      # (recipes.py pulls in codec_geometry through the package) but dispatch no
+      # ops, so they run unconditionally — no GPU required.
+      - name: Recipe tests (CPU, no GPU)
+        run: pytest -q tests/test_recipes.py
 
       # Honest-badge discipline: every op is GPU-only until the CPU decode path
       # (Phase F) lands, and hosted runners may not expose a usable Metal GPU.
