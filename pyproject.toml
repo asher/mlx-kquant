@@ -68,6 +68,12 @@ markers = [
   "integration: end-to-end test needing a real GGUF (and, for parity, a llama.cpp binary); skipped unless KQUANT_TEST_GGUF_DIR is set",
   "slow: long-running (large prompts / long generation)",
 ]
+# sentencepiece (a SWIG extension pulled in transitively via mlx-lm/transformers)
+# emits these DeprecationWarnings on import under Python 3.12+. They are upstream
+# and harmless; silence only those exact messages so our own warnings stay loud.
+filterwarnings = [
+  'ignore:builtin type \w+ has no __module__ attribute:DeprecationWarning',
+]
 
 [tool.ruff]
 line-length = 88

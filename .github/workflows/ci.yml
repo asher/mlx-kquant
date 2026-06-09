@@ -57,10 +57,13 @@ jobs:
       # the Xcode toolchain (no GPU needed to *build*). Pinned mlx wheel: the
       # kernels include MLX's steel headers and link libmlx, so the ABI must
       # match exactly.
+      # mlx-lm is the [tools] dep the model-level tests (loader round-trip) need;
+      # without a GPU those tests skip, but installing it lets them run on a
+      # GPU-bearing runner.
       - name: Build extension + test deps
         run: |
           python -m pip install --upgrade pip
-          pip install "mlx==0.31.2" "nanobind==2.12.0" "cmake>=3.27" gguf numpy pytest
+          pip install "mlx==0.31.2" "nanobind==2.12.0" "cmake>=3.27" gguf numpy pytest "mlx-lm>=0.27"
           pip install -e . --no-build-isolation
 
       - name: Codec lint (incl. runtime kq.codecs() leg)
@@ -98,9 +101,11 @@ jobs:
           print("Metal GPU available:", ok)
           PY
 
-      - name: Op tests (GPU)
+      # Full suite when a GPU is present: op tests + the model-level round-trips
+      # (encode/load). Asset-gated KQUANT_TEST_* tests skip without their assets.
+      - name: Op + model tests (GPU)
         if: steps.gpu.outputs.available == '1'
-        run: pytest -q tests/test_codecs.py tests/test_gather.py tests/test_encode.py
+        run: pytest -q tests/
 
       - name: No-GPU note
         if: steps.gpu.outputs.available != '1'
