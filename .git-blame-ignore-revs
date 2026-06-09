@@ -1,0 +1,7 @@
+# Revisions to ignore in `git blame` — bulk, no-behavior-change reformats.
+# Enable locally with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# (GitHub honors this file automatically.)
+
+# adopt clang-format for C++/Metal sources
+fe80b33a3b200de7cd1060fcdd54c9d11bd52644
