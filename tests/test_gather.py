@@ -13,8 +13,6 @@ prefill path (M large -> gather_qmm / gather_qmm_nax), and across two lhs_indice
 patterns (contiguous arange and a reversed/repeated selection) so non-contiguous
 lhs gather is covered, not just the identity case.
 
-Backend-agnostic (kq.gather_qmm or the fork's mx.gather_qmm), so the SAME script
-runs under stock-mlx+mlx_kquant and under the kquant fork; diff to prove parity.
 Exit non-zero on any failure.
 
 Usage: test_gather.py [--codecs q4_k,q8_0,...]
@@ -30,6 +28,8 @@ import mlx.core as mx
 import numpy as np
 from gguf import GGMLQuantizationType as GT
 from gguf import quants
+
+import mlx_kquant as kq
 
 # codec -> (gguf type, weights_per_block, bytes_per_block, bits, is_kquant)
 CODECS = {
@@ -48,33 +48,13 @@ CODECS = {
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 E, N, K = 4, 128, 512  # experts, out_dims, in_features (K % 256 and % 64 == 0)
 
-try:
-    import mlx_kquant as kq
+BACKEND = "mlx_kquant"
 
-    BACKEND = "mlx_kquant"
 
-    def _gather(x, w, sc, gs, bits, codec, lhs, rhs):
-        return kq.gather_qmm(
-            x, w, sc, codec, lhs_indices=lhs, rhs_indices=rhs, transpose=True
-        )
-
-except ImportError:
-    BACKEND = "fork-mx"
-
-    def _gather(x, w, sc, gs, bits, codec, lhs, rhs):
-        return mx.gather_qmm(
-            x,
-            w,
-            sc,
-            None,
-            lhs_indices=lhs,
-            rhs_indices=rhs,
-            transpose=True,
-            group_size=gs,
-            bits=bits,
-            mode="kquant",
-            kquant_type=codec,
-        )
+def _gather(x, w, sc, gs, bits, codec, lhs, rhs):
+    return kq.gather_qmm(
+        x, w, sc, codec, lhs_indices=lhs, rhs_indices=rhs, transpose=True
+    )
 
 
 def _wire_and_ref(codec, gtype, wpb, bpb, is_kquant):
@@ -187,8 +167,6 @@ def test_rhs_gather_large_M_no_short_overflow():
     up in the small-M sweep above. Assert the sorted leaf matches the unsorted
     per-row leaf (independent kernel) across all rows, and spot-check truth.
     """
-    if BACKEND != "mlx_kquant":
-        return  # fork path has its own coverage
     # q8_0: synthesizable in-process (gguf only quantizes flat codecs) and has a
     # rhs_nax kernel. The overflow lives in the shared tail-tile template, so the
     # codec is immaterial — q8_0 exercises the same poisoned path as q6_k.

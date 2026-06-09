@@ -1,9 +1,7 @@
-// C++ GGUF loader for the mlx-kquant extension. Ports the fork's GGUF K-quant
-// load path (mlx/io/gguf.cpp + gguf_quants.cpp) into the extension so the lab
-// no longer pays the pure-Python loader's eager numpy->mx byte-copy (~4 GB/s).
-// This loads tensor wire bytes via a single C++ memcpy from gguflib's mmap
-// (~15 GB/s, matching the fork's mx.load) and decodes all GGUF KV metadata so
-// callers can drop the gguf-py GGUFReader from the load path entirely.
+// C++ GGUF loader for the mlx-kquant extension: a fast K-quant load path that
+// reads tensor wire bytes via a single C++ memcpy from gguflib's mmap
+// (~15 GB/s) and decodes all GGUF KV metadata, so callers need no separate
+// Python GGUF reader on the load path.
 #pragma once
 
 #include <cstdint>

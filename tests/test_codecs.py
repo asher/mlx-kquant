@@ -5,7 +5,7 @@ Test data per codec:
   * flat codecs (q4_0/q4_1/q5_0/q5_1/q8_0): synthesized in-process via
     gguf.quants.quantize(random weights) — gguf-py can encode these.
   * K-quant codecs (q2_k..q6_k): loaded from tests/fixtures/<codec>.npz, minted
-    by gen_fixtures.py using the fork encoder (gguf-py is decode-only for these).
+    by gen_fixtures.py via kq.quantize (gguf-py is decode-only for these).
 
 For each codec it checks, against the gguf.quants numpy reference:
   * dequantize -> float32 : must be BIT-EXACT (enforced, not just "loose")
@@ -14,7 +14,7 @@ For each codec it checks, against the gguf.quants numpy reference:
   * quantized_matmul(x, w, transpose=False) ~= x @ dequant(w)   : within f16 tol
     (so both the qmm_t and qmm_n Metal kernels are exercised)
 
-Backend-agnostic (mlx_kquant or the fork). Exit non-zero on any failure.
+Exit non-zero on any failure.
 
 Usage: test_codecs.py [--codecs q4_k,q8_0,...]
 """
@@ -29,6 +29,8 @@ import mlx.core as mx
 import numpy as np
 from gguf import GGMLQuantizationType as GT
 from gguf import quants
+
+import mlx_kquant as kq
 
 # codec -> (gguf type, weights_per_block, bytes_per_block, bits, is_kquant)
 CODECS = {
@@ -47,36 +49,15 @@ CODECS = {
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 N, K = 256, 512
 
-try:
-    import mlx_kquant as kq
+BACKEND = "mlx_kquant"
 
-    BACKEND = "mlx_kquant"
 
-    def _dequant(w, sc, gs, bits, codec, dt):
-        return kq.dequantize(w, sc, codec, dtype=dt)
+def _dequant(w, sc, gs, bits, codec, dt):
+    return kq.dequantize(w, sc, codec, dtype=dt)
 
-    def _qmm(x, w, sc, gs, bits, codec, transpose=True):
-        return kq.quantized_matmul(x, w, sc, codec, transpose=transpose)
 
-except ImportError:
-    BACKEND = "fork-mx"
-
-    def _dequant(w, sc, gs, bits, codec, dt):
-        return mx.dequantize(
-            w, sc, group_size=gs, bits=bits, mode="kquant", kquant_type=codec, dtype=dt
-        )
-
-    def _qmm(x, w, sc, gs, bits, codec, transpose=True):
-        return mx.quantized_matmul(
-            x,
-            w,
-            sc,
-            transpose=transpose,
-            group_size=gs,
-            bits=bits,
-            mode="kquant",
-            kquant_type=codec,
-        )
+def _qmm(x, w, sc, gs, bits, codec, transpose=True):
+    return kq.quantized_matmul(x, w, sc, codec, transpose=transpose)
 
 
 def _wire_and_ref(codec, gtype, wpb, bpb, is_kquant):

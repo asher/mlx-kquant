@@ -10,8 +10,7 @@ writes the result as an ``mlx-lm``-readable checkpoint (sharded safetensors +
 This module is named ``convert`` (not ``quantize``) on purpose: a ``quantize``
 submodule would shadow the package-level ``mlx_kquant.quantize`` encode op.
 
-On-disk format (matches the kquant-fork / a future upstream byte-for-byte, so
-checkpoints interoperate):
+On-disk format:
 
 * ``config.json`` carries ``quantization`` **and** a mirrored
   ``quantization_config``, each ``{"mode": "kquant", "per_tensor": {path: codec}}``
@@ -45,8 +44,8 @@ from .recipes import classify_tensors, resolve_codec_map
 if TYPE_CHECKING:
     import numpy as np
 
-# Tokenizer / processor / aux files copied verbatim from the source repo on save
-# (everything that isn't weights or the config we rewrite).
+# Tokenizer / processor / aux files copied unchanged from the source model on
+# save (everything that isn't weights or the config we rewrite).
 _AUX_FILES = (
     "tokenizer.json",
     "tokenizer.model",

@@ -1,7 +1,7 @@
-"""mlx-kquant: standalone GGUF K-quant ops for MLX.
+"""mlx-kquant: GGUF K-quant ops for MLX.
 
-Custom Metal kernels packaged as an MLX C++ extension — runs against a stock,
-unmodified ``mlx`` wheel (no MLX-core fork required).
+Custom Metal kernels packaged as an MLX C++ extension, installed on top of a
+stock ``mlx`` wheel.
 
 Current API:
   * ``codecs`` / ``metallib_dir`` / ``metallib_loads`` — toolchain self-checks.

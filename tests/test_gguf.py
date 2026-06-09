@@ -7,8 +7,7 @@ F32 — all we need to exercise the loader's quantized and native-dtype paths),
 load it through the C++ loader, and verify tensors, codecs, shapes and metadata
 round-trip.
 
-Runs under pytest; skipped automatically when the extension is unavailable
-(load_gguf is mlx_kquant-specific; the kquant fork exposes mx.load instead).
+Runs under pytest; skipped automatically when the extension is unavailable.
 """
 
 from __future__ import annotations
@@ -71,7 +70,7 @@ def test_load_gguf(tmp_path):
 
 def test_zero_copy_matches_copy(tmp_path):
     """zero_copy=True (no-copy mmap views) must be byte-identical to zero_copy=
-    False (eager memcpy). Fork-independent: mints its own GGUF, compares kq-vs-kq.
+    False (eager memcpy). Mints its own GGUF, compares kq-vs-kq.
     The small tensors here exercise the real no-copy path (each sits in a single
     page-aligned window), not just the >INT32 / unaligned fallback."""
     _mint(tmp_path / "zc.gguf")

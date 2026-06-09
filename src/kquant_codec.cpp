@@ -2,7 +2,7 @@
 
 namespace mlx_kquant {
 
-// Geometry copied verbatim from mlx/primitives.cpp:3458-3473 (kquant fork):
+// Per-codec block geometry:
 //   {name, weights_per_block, bytes_per_block, bits, has_matmul, has_encode}
 static const std::vector<KQuantCodec>& registry() {
   static const std::vector<KQuantCodec> codecs = {

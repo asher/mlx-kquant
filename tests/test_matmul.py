@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Quantized-matmul validation: kq.quantized_matmul (or the fork's
-mx.quantized_matmul) vs an INDEPENDENT dequant-then-matmul reference.
+"""Quantized-matmul validation: kq.quantized_matmul vs an INDEPENDENT
+dequant-then-matmul reference.
 
 The reference dequant comes from gguf-py's numpy decoder, NOT the extension, so
 a shared bug in the dequant math cannot cancel out of both sides of the
 comparison (a circular check against kq.dequantize would hide exactly that).
-
-Backend-agnostic, so the SAME script runs under stock-mlx+mlx_kquant and under
-the kquant fork; diff the two outputs to prove byte-parity.
 
 For a real K-quant weight tensor pulled from a GGUF it checks, across several M
 (to exercise qmv at small M and qmm / qmm_nax at large M):
@@ -31,6 +28,8 @@ import mlx.core as mx
 import numpy as np
 from gguf import GGMLQuantizationType, GGUFReader, quants
 
+import mlx_kquant as kq
+
 # codec -> (gguf type, weights_per_block, bytes_per_block, bits)
 CODEC_BY_NAME = {
     "q4_0": (GGMLQuantizationType.Q4_0, 32, 18, 4),
@@ -45,28 +44,11 @@ CODEC_BY_NAME = {
     "q6_k": (GGMLQuantizationType.Q6_K, 256, 210, 6),
 }
 
-try:
-    import mlx_kquant as kq
+BACKEND = "mlx_kquant"
 
-    BACKEND = "mlx_kquant"
 
-    def _qmm(x, w, scales, gs, bits, codec, transpose):
-        return kq.quantized_matmul(x, w, scales, codec, transpose=transpose)
-
-except ImportError:
-    BACKEND = "fork-mx"
-
-    def _qmm(x, w, scales, gs, bits, codec, transpose):
-        return mx.quantized_matmul(
-            x,
-            w,
-            scales,
-            transpose=transpose,
-            group_size=gs,
-            bits=bits,
-            mode="kquant",
-            kquant_type=codec,
-        )
+def _qmm(x, w, scales, gs, bits, codec, transpose):
+    return kq.quantized_matmul(x, w, scales, codec, transpose=transpose)
 
 
 def _find_weight(reader, gtype, wpb, bpb, min_k=256):

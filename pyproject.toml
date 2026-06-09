@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mlx-kquant"
 dynamic = ["version"]
-description = "GGUF K-quant dequantize / quantized-matmul / gather-qmm / quantize ops for MLX, via custom Metal kernels (no MLX-core fork required)."
+description = "GGUF K-quant dequantize / quantized-matmul / gather-qmm / quantize ops for MLX, via custom Metal kernels."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -60,7 +60,7 @@ version = { attr = "mlx_kquant._version.__version__" }
 include = ["mlx_kquant*"]
 
 [tool.setuptools.package-data]
-mlx_kquant = ["*.so", "*.dylib", "*.metallib", "py.typed"]
+mlx_kquant = ["*.so", "*.dylib", "*.metallib", "py.typed", "licenses/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -47,10 +47,8 @@ find_package(MLX CONFIG REQUIRED)
 
 # ----------------------------- gguflib (GGUF parser) -----------------------------
 # antirez/gguf-tools single-file GGUF parser, for the C++ kq.load_gguf loader.
-# PIN: the exact ref the MLX kquant fork bumped to (mlx/io/CMakeLists.txt). NOT
-# stock MLX's 8fa6eb65 — that older ref only knows Q4_0/Q4_1/Q8_0, while this one
-# defines GGUF_TYPE_Q5_0/Q5_1/Q2_K..Q6_K + correct K-quant block sizes. Fetched
-# independently of whatever gguflib the stock mlx wheel bundled.
+# PIN: a ref new enough to define GGUF_TYPE_Q5_0/Q5_1/Q2_K..Q6_K + correct
+# K-quant block sizes (older refs only know Q4_0/Q4_1/Q8_0).
 include(FetchContent)
 FetchContent_Declare(
   gguflib
@@ -107,9 +105,9 @@ target_link_options(mlx_kquant_ext PRIVATE
                     "-Wl,-force_load,$<TARGET_FILE:gguflib>")
 
 # ----------------------------- Metal library -----------------------------
-# Vendored kq_* kernels compiled into a single mlx_kquant.metallib.
+# The kq_* kernels compiled into a single mlx_kquant.metallib.
 # The repo's metal/ dir is searched BEFORE the stock-wheel include tree so the
-# vendored kq_*.h + the quantized_utils.h shim (which adds load_vector) win;
+# repo's kq_*.h + quantized_utils.h (which adds load_vector) win;
 # steel/gemm/*, utils.h, etc. fall through to the stock wheel headers.
 if(MLX_BUILD_METAL)
   mlx_build_metallib(

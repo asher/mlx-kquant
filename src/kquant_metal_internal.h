@@ -1,15 +1,10 @@
 // Metal-side dispatch helpers shared between KQuantMatmul (kquant_matmul.cpp)
 // and KQuantGatherQMM (kquant_gather.cpp). Header-inline so both translation
 // units share a single definition; compiled only where _METAL_ is defined.
-//
-// Ported from the file-local helpers in mlx/backend/metal/quantized.cpp, with
-// these extension-specific changes:
-//   * kernels come from OUR bundled metallib (kq_get_kernel, not the fork's
-//     default-metallib d.get_kernel(name));
-//   * is_nax_available() is a hidden symbol -> replicated
-//   (kq_is_nax_available);
-//   * kquant carries no biases -> the bias buffer is dropped everywhere;
-//   * collapse_contiguous_dims is not exported -> replicated (kq_collapse_*).
+// Kernels are fetched from the bundled metallib via kq_get_kernel, NAX
+// availability is probed via kq_is_nax_available, kquant carries no biases (no
+// bias buffer is plumbed through), and kq_collapse_contiguous_dims collapses
+// adjacent contiguous index axes.
 #pragma once
 
 #ifdef _METAL_
@@ -33,10 +28,9 @@ using mx::array;
 using Device = mx::metal::Device;
 using CommandEncoder = mx::metal::CommandEncoder;
 
-// Replica of mlx::core::metal::is_nax_available (device.cpp:828-846). The
-// upstream symbol is hidden (local linkage); its deps are reachable here:
-// metal::device is exported, get_architecture()/get_architecture_gen() are
-// inline header methods. Cached process-wide just like upstream.
+// Probe whether the GPU supports NAX (tensor-core) matmul. metal::device is
+// exported and get_architecture()/get_architecture_gen() are inline header
+// methods, so the check runs here directly. Cached process-wide.
 inline bool kq_is_nax_available() {
 #ifdef MLX_METAL_NO_NAX
   return false;
@@ -162,11 +156,9 @@ inline int add_strides_and_shapes(
   return offset;
 }
 
-// Replica of mlx::core::collapse_contiguous_dims(shape, {strides...})
-// (backend/common/utils.cpp:20; not exported). Collapses adjacent contiguous
-// axes of the index tensors. The kernel's flat-offset math is identical whether
-// or not the dims are collapsed; this just reduces the loop-trip count and
-// keeps our index-stride buffers byte-identical to the fork's.
+// Collapse adjacent contiguous axes of the index tensors. The kernel's
+// flat-offset math is identical whether or not the dims are collapsed; this
+// just reduces the loop-trip count.
 inline std::tuple<mx::Shape, std::vector<mx::Strides>>
 kq_collapse_contiguous_dims(
     const mx::Shape& shape,
@@ -230,8 +222,7 @@ kq_collapse_contiguous_dims(
   return std::make_tuple(out_shape, out_strides);
 }
 
-// quantized.cpp:207-222. Appends the collapsed index ndims/shape/strides for
-// the gather leaf kernels.
+// Append the collapsed index ndims/shape/strides for the gather leaf kernels.
 inline int add_gather_strides_and_shapes(
     CommandEncoder& ce,
     const array& lhs_indices,
@@ -247,15 +238,14 @@ inline int add_gather_strides_and_shapes(
   return offset;
 }
 
-// Fetch a kq kernel from OUR bundled metallib (not mlx-core's default one).
+// Fetch a kq kernel from the bundled metallib.
 //
 // The library handle is resolved exactly once and cached in a function-local
 // static: get_library() is a locked map lookup keyed by name, and
-// metallib_dir() returns a fresh std::string copy of the .so directory — both
-// per-op costs the fork's plain get_kernel(name) does not pay. The GPU Device
-// is a process singleton and the handle it owns lives for the process, so
-// caching the raw pointer is safe. Only the per-kname get_kernel() lookup
-// remains per call, matching the fork's path exactly.
+// metallib_dir() returns a fresh std::string copy of the .so directory. The GPU
+// Device is a process singleton and the handle it owns lives for the process,
+// so caching the raw pointer is safe. Only the per-kname get_kernel() lookup
+// remains per call.
 inline MTL::ComputePipelineState* kq_get_kernel(
     Device& d,
     const std::string& kname) {
@@ -266,8 +256,7 @@ inline MTL::ComputePipelineState* kq_get_kernel(
 // Func-constant variant for kernels specialized via an MTLFCList (the only kq
 // consumer is gather_qmm_rhs_nax: align_M/N/K at constant ids 200/201/202).
 // hash_name must encode the func-const values so each specialization gets a
-// distinct pipeline-state cache entry; mirrors the no-JIT
-// get_gather_qmm_nax_kernel reduction (d.get_kernel(name, lib, hash, consts)).
+// distinct pipeline-state cache entry (d.get_kernel(name, lib, hash, consts)).
 inline MTL::ComputePipelineState* kq_get_kernel(
     Device& d,
     const std::string& kname,

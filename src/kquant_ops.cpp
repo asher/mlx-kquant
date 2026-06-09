@@ -19,8 +19,7 @@ namespace mlx_kquant {
 
 namespace {
 
-// Public-API replica of mlx-core's ensure_row_contiguous_matrix
-// (backend/metal/quantized.cpp:113). A "matrix-contiguous" tensor only needs
+// Matrix-contiguity helper. A "matrix-contiguous" tensor only needs
 // its LAST TWO dims densely packed (stride(-2)==shape(-1) && stride(-1)==1); a
 // strided LEADING/batch dim is fine because the qmv/qmm/gather kernels walk it
 // via the strides passed in add_strides_and_shapes. Using full
@@ -91,8 +90,7 @@ mx::array dequantize(
   out_shape.back() =
       (w.shape(-1) / codec->bytes_per_block) * codec->weights_per_block;
 
-  // Row-contiguize at the op level: the fork contiguizes inside eval_gpu via
-  // contiguous_copy_gpu, which is not exported to extensions.
+  // Row-contiguize at the op level so eval_gpu can assume dense inputs.
   auto w_c = w.flags().row_contiguous ? w : mx::contiguous(w, false, s);
 
   // For every kquant codec, group_size == weights_per_block (32 or 256).
@@ -127,7 +125,7 @@ mx::array quantized_matmul(
         "use gather_qmm for mixture-of-experts.");
   }
 
-  // Expand w's quantized geometry (mirrors extract_quantized_matmul_dims).
+  // Expand w's quantized geometry from the codec block layout.
   int w_bytes_per_row = w.shape(-1);
   if (w_bytes_per_row % codec->bytes_per_block != 0) {
     std::ostringstream msg;
@@ -149,8 +147,8 @@ mx::array quantized_matmul(
     throw std::invalid_argument(msg.str());
   }
 
-  // Output dtype: x.dtype(), with float32 promoted to bfloat16 (matches
-  // mlx-core; the NAX matmul path emits bf16 accumulation).
+  // Output dtype: x.dtype(), with float32 promoted to bfloat16 (the NAX matmul
+  // path emits bf16 accumulation).
   mx::Dtype out_type = (x.dtype() == mx::float32) ? mx::bfloat16 : x.dtype();
   if (!mx::issubdtype(out_type, mx::floating)) {
     throw std::invalid_argument(
@@ -161,9 +159,7 @@ mx::array quantized_matmul(
   auto s = mx::to_stream(s_);
 
   // Cast x to the output dtype, then matrix-row-contiguize x / w / scales at
-  // the op level — a public-API replica of the fork's
-  // ensure_row_contiguous_matrix (it contiguizes inside eval_gpu via the
-  // unexported contiguous_copy_gpu).
+  // the op level so eval_gpu can assume dense inputs.
   auto x_c = kq_ensure_row_contiguous_matrix(mx::astype(x, out_type, s), s);
   auto w_c = kq_ensure_row_contiguous_matrix(w, s);
   auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
@@ -181,8 +177,8 @@ mx::array quantized_matmul(
 
 namespace {
 
-// Replica of mlx::core::indices_or_default (ops.cpp:61). When indices are
-// omitted, default to a flat arange over the leading (batch) dims.
+// When indices are omitted, default to a flat arange over the leading (batch)
+// dims.
 mx::array kq_indices_or_default(
     const std::optional<mx::array>& indices,
     const mx::array& x,
@@ -237,7 +233,7 @@ mx::array gather_qmm(
     throw std::invalid_argument(msg.str());
   }
 
-  // Expand w's quantized geometry (mirrors extract_quantized_matmul_dims). w is
+  // Expand w's quantized geometry from the codec block layout. w is
   // [..., out_dims, bytes_per_row]; the last dim is whole K-quant blocks.
   int w_bytes_per_row = w.shape(-1);
   if (w_bytes_per_row % codec->bytes_per_block != 0) {
@@ -260,7 +256,7 @@ mx::array gather_qmm(
     throw std::invalid_argument(msg.str());
   }
 
-  // Output dtype: x.dtype(), with float32 promoted to bfloat16 (matches core).
+  // Output dtype: x.dtype(), with float32 promoted to bfloat16.
   mx::Dtype out_type = (x.dtype() == mx::float32) ? mx::bfloat16 : x.dtype();
   if (!mx::issubdtype(out_type, mx::floating)) {
     throw std::invalid_argument(
@@ -269,7 +265,7 @@ mx::array gather_qmm(
 
   auto s = mx::to_stream(s_);
 
-  // Default + broadcast the indices, then cast to uint32 (matches core).
+  // Default + broadcast the indices, then cast to uint32.
   mx::array lhs_indices = kq_indices_or_default(lhs_indices_, x, s);
   mx::array rhs_indices = kq_indices_or_default(rhs_indices_, w, s);
   auto bc = mx::broadcast_arrays({lhs_indices, rhs_indices}, s);
@@ -281,9 +277,9 @@ mx::array gather_qmm(
   out_shape.push_back(x.shape(-2));
   out_shape.push_back(w_outer_dims);
 
-  // left_sorted_ / right_sorted_ mirror ops.cpp:5615-5616 EXACTLY: a sort
-  // guarantee holds for the side whose index was *defaulted* (broadcast from
-  // the other), so each "sorted" flag is gated on the OPPOSITE index being
+  // left_sorted_ / right_sorted_: a sort guarantee holds for the side whose
+  // index was *defaulted* (broadcast from the other), so each "sorted" flag is
+  // gated on the OPPOSITE index being
   // absent. left_sorted tracks the lhs (x) ordering -> gated on rhs absent;
   // right_sorted tracks the rhs (w/expert) ordering -> gated on lhs absent.
   // The MoE call passes rhs_indices only, so right_sorted_ == sorted_indices,
@@ -291,13 +287,12 @@ mx::array gather_qmm(
   bool left_sorted = sorted_indices && !rhs_indices_;
   bool right_sorted = sorted_indices && !lhs_indices_;
 
-  // Cast x to the output dtype; row-contiguize x / w / scales at the op level —
-  // a public-API replica of the fork's contiguity handling.
+  // Cast x to the output dtype; row-contiguize x / w / scales at the op level.
   //
   // w needs FULL row-contiguity ONLY when the rhs_nax prefill leaf is reachable
   // (right_sorted && transpose && codec has a fused matmul kernel): that kernel
   // bakes dense expert packing into func consts and takes NO w strides, so the
-  // fork's gather_qmm_rhs_nax calls ensure_row_contiguous(w) (FULL). Every
+  // rhs_nax leaf needs a fully row-contiguous w. Every
   // other leaf (qmv decode / qmm) walks w's strides, so matrix-contiguity (a
   // strided LEADING/expert dim, no copy) suffices and is what keeps the fused
   // gate_up_exps slice from being copied wholesale on every DECODE gather — the
@@ -401,7 +396,6 @@ std::vector<mx::array> quantize(
 // -----------------------------
 
 // Locate the directory of this shared object (where mlx_kquant.metallib lives).
-// Mirrors examples/extensions/axpby/axpby.cpp:current_binary_dir.
 std::string metallib_dir() {
   static std::string dir = []() {
     Dl_info info;

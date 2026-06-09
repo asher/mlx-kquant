@@ -1,11 +1,8 @@
 """kquant-aware ``nn.Module`` subclasses.
 
-Stock mlx has no kquant quantization mode, so these modules don't reuse
-``nn.QuantizedLinear`` (whose ``__call__`` would call an unsupported
-``mx.quantized_matmul(mode="kquant")``). Each module stores the GGUF wire bytes
-directly as a ``uint8`` ``weight`` and dispatches through this extension's
-``kq.dequantize`` / ``kq.quantized_matmul`` / ``kq.gather_qmm`` ops on a stock,
-unmodified ``mlx`` wheel.
+Each module stores GGUF K-quant wire bytes directly as a ``uint8`` ``weight`` and
+dispatches through the ``kq.dequantize`` / ``kq.quantized_matmul`` /
+``kq.gather_qmm`` ops.
 
 Importing this module needs only ``mlx`` + the built extension — no ``mlx-lm``.
 The leaf-swap installer that wires these into a constructed mlx-lm model lives in

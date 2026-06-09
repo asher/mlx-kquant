@@ -9,12 +9,8 @@ For a fixed random weight tensor, per codec it checks:
     when an imatrix is supplied, flat codecs MUST NOT (they have no imatrix path);
   * a stable sha1 of the wire bytes, with and without an imatrix.
 
-Backend-agnostic (kq.quantize or the fork's mx.quantize), so the SAME script
-runs under stock-mlx+mlx_kquant and under the kquant fork. Run it in both venvs
-and diff the sha1 columns: identical sha1 == byte-identical encoder output.
-
-Exit non-zero on any local failure (shape / round-trip). Byte-parity across
-backends is confirmed by comparing the printed sha1s between the two runs.
+Exit non-zero on any local failure (shape / round-trip). The printed sha1s are a
+stable fingerprint of the encoder output.
 
 Usage: test_encode.py [--codecs q4_k,q8_0,...]
 """
@@ -29,6 +25,8 @@ import mlx.core as mx
 import numpy as np
 from gguf import GGMLQuantizationType as GT
 from gguf import quants
+
+import mlx_kquant as kq
 
 # codec -> (gguf type, weights_per_block, bits, round-trip rel-Frobenius bound)
 CODECS = {
@@ -46,26 +44,11 @@ CODECS = {
 
 N, K = 256, 512
 
-try:
-    import mlx_kquant as kq
+BACKEND = "mlx_kquant"
 
-    BACKEND = "mlx_kquant"
 
-    def _encode(w, gs, bits, codec, imatrix):
-        return kq.quantize(w, codec, imatrix=imatrix)
-
-except ImportError:
-    BACKEND = "fork-mx"
-
-    def _encode(w, gs, bits, codec, imatrix):
-        return mx.quantize(
-            w,
-            group_size=gs,
-            bits=bits,
-            mode="kquant",
-            kquant_type=codec,
-            imatrix=imatrix,
-        )
+def _encode(w, gs, bits, codec, imatrix):
+    return kq.quantize(w, codec, imatrix=imatrix)
 
 
 def _sha(a) -> str:

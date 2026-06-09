@@ -1,6 +1,5 @@
-// K-quant codec registry. Mirrors mlx::core::kquant_codec_by_name from the MLX
-// kquant fork (mlx/primitives.cpp) so the extension owns its own copy and needs
-// no MLX-core changes. Source of truth for per-codec block geometry.
+// K-quant codec registry: the source of truth for per-codec block geometry
+// (weights/bytes per block, bit width, kernel availability).
 #pragma once
 
 #include <string>

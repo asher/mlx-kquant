@@ -1,11 +1,8 @@
 // KQuantQuantize primitive: encode a float weight tensor into GGUF K-quant wire
-// bytes. GPU dispatch ports the !dequantize_ KQuant arm of
-// mlx/backend/metal/quantized.cpp:fast::Quantize::eval_gpu (:2016-2084), with
-// these extension-specific changes:
-//   * the encode kernel comes from OUR bundled metallib via kq_get_kernel;
-//   * row-contiguity guaranteed by the op (contiguous_copy_gpu is unexported);
-//   * kernel-name type tokens via kq_type_string (not type_to_name).
-// GPU-only: eval_cpu throws (matches the fork — no CPU encode path).
+// bytes. The GPU path fetches the encode kernel from the bundled metallib via
+// kq_get_kernel; the op guarantees row-contiguity before dispatch, and
+// kernel-name type tokens come from kq_type_string. GPU-only: eval_cpu throws
+// (there is no CPU encode path yet).
 #include <cstdint>
 #include <stdexcept>
 #include <string>

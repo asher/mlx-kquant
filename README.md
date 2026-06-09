@@ -1,21 +1,19 @@
 # mlx-kquant
 
-Standalone GGUF **K-quant** ops for [MLX](https://github.com/ml-explore/mlx) on Apple Silicon,
-packaged as a C++/Metal **extension** — it runs against a **stock, unmodified `mlx` wheel**, with no
-fork of MLX core required.
+GGUF **K-quant** ops for [MLX](https://github.com/ml-explore/mlx) on Apple Silicon, packaged as a
+C++/Metal **extension** that installs on top of a stock `mlx` wheel.
 
 It exposes its own op namespace — `kq.dequantize`, `kq.quantized_matmul`, `kq.gather_qmm`,
-`kq.quantize`, and a fast `kq.load_gguf` — backed by precompiled Metal kernels that build on MLX's
-own steel-GEMM machinery and ship in a `.metallib` inside the wheel. All ten GGUF K-quant / legacy
-codecs are supported: `q2_k, q3_k, q4_k, q5_k, q6_k` and `q4_0, q4_1, q5_0, q5_1, q8_0`.
+`kq.quantize`, and a fast `kq.load_gguf` — backed by precompiled Metal kernels that ship in a
+`.metallib` inside the wheel. All ten GGUF K-quant / legacy codecs are supported:
+`q2_k, q3_k, q4_k, q5_k, q6_k` and `q4_0, q4_1, q5_0, q5_1, q8_0`.
 
 ## Why
 
-K-quant support used to live as a fork of MLX core. Re-homing it as an extension means it installs
-on top of a released `mlx` wheel and can be offered independently — no locally-built core, no
-divergence from upstream. The Metal kernels are byte-identical to the in-core research
-implementation, so numerics and throughput match it (and the dispatch tuning here actually edges it
-out on real models — see [Performance](#performance)).
+Run GGUF K-quant weights on MLX directly — every K-quant and legacy codec gets its own MLX op, with
+no conversion to another quantization format. The dispatch tuning here (matrix-contiguity handling
+for fused MoE expert weights, single-pass NAX matmul) is fast on real models — see
+[Performance](#performance).
 
 ## Install
 
@@ -35,9 +33,9 @@ kq.codecs()          # -> ['q2_k', 'q3_k', ..., 'q8_0']
 kq.metallib_loads()  # -> True  (the bundled metallib opened on the Metal device)
 ```
 
-> The extension links `libmlx` and its kernels `#include` MLX's steel headers, so it is bound to an
-> exact MLX ABI **and** steel-header API. The pin is intentionally `==`, never `>=`; bumping `mlx`
-> requires re-vendoring `quantized_utils.h` and recompiling. See [Version pinning](#version-pinning).
+> The extension links `libmlx` and its kernels `#include` MLX's steel-GEMM headers, so it is bound to
+> an exact MLX ABI **and** header API. The pin is intentionally `==`, never `>=`; moving to a newer
+> `mlx` may require updating the bundled headers and recompiling. See [Version pinning](#version-pinning).
 
 ## Quickstart
 
@@ -86,8 +84,8 @@ arrays, codecs, metadata, shapes = kq.load_gguf("model.gguf")
 
 ### Use it in your own model
 
-Stock MLX has no `mode="kquant"`, so you don't reuse `nn.QuantizedLinear`. Ready-made modules that
-store the wire bytes and dispatch the matching `kq.*` op ship in `mlx_kquant.nn`:
+Ready-made modules that store the wire bytes and dispatch the matching `kq.*` op ship in
+`mlx_kquant.nn`:
 
 ```python
 from mlx_kquant.nn import KQuantLinear, KQuantEmbedding, KQuantSwitchLinear
@@ -126,11 +124,8 @@ print(generate(model, tokenizer, "Explain entropy.", max_tokens=128))
 
 ## Performance
 
-Because the Metal kernels are byte-identical to the in-core research implementation, throughput
-matches it — and the dispatch tuning in this extension (matrix-contiguity handling for fused MoE
-expert weights, single-pass NAX matmul instead of split-K) edges it out on real models.
-
-Measured on an M5 Max (128 GB):
+The Metal kernels use a single-pass NAX matmul and matrix-contiguity handling for fused MoE expert
+weights. Measured on an M5 Max (128 GB):
 
 | Model | Codec | Decode (tok/s) | Prefill pp512 (tok/s) |
 |-------|-------|---------------:|----------------------:|
@@ -139,12 +134,11 @@ Measured on an M5 Max (128 GB):
 
 ## How it works
 
-- **Own ops, not a core override.** Four `Primitive` subclasses (`KQuantDequantize`, `KQuantMatmul`,
-  `KQuantGatherQMM`, `KQuantQuantize`) and their op functions live entirely in the extension. The
-  installed `mlx` is untouched. All primitives are inference-only.
-- **Precompiled metallib on stock headers.** The vendored `kq_*` kernels compile against the stock
-  wheel's steel-GEMM headers and ship as `mlx_kquant.metallib`; host dispatch resolves them through
-  MLX's exported `Device::get_kernel`. No JIT, no steel host structs.
+- **Own ops.** Four `Primitive` subclasses (`KQuantDequantize`, `KQuantMatmul`, `KQuantGatherQMM`,
+  `KQuantQuantize`) and their op functions live entirely in the extension.
+- **Precompiled metallib on stock headers.** The `kq_*` kernels compile against the stock wheel's
+  steel-GEMM headers and ship as `mlx_kquant.metallib`; host dispatch resolves them through MLX's
+  exported `Device::get_kernel`. No JIT, no steel host structs.
 - **Codec registry** derives `group_size`/`bits` from the codec name, so callers pass only
   `kquant_type`.
 - **CPU and GPU execution.** The decode ops (`dequantize` / `quantized_matmul` / `gather_qmm`) run on
@@ -154,11 +148,9 @@ Measured on an M5 Max (128 GB):
 
 ## Scope
 
-This is an **op-level library** with its own `kq.*` namespace — deliberately *not* a drop-in that
-re-enables a `mode="kquant"` argument on `mx.quantize` / `mx.quantized_matmul` / `nn.QuantizedLinear`.
-To use it, point your model's quantized layers at the `kq.*` ops (see
-[Use it in your own model](#use-it-in-your-own-model)); the separate **gguf-mlx** package is a
-full worked example.
+This is an **op-level library** with its own `kq.*` namespace. To use it, point your model's
+quantized layers at the `kq.*` ops (see [Use it in your own model](#use-it-in-your-own-model)); the
+separate **gguf-mlx** package is a full worked example.
 
 ## Codec reference
 
@@ -178,9 +170,8 @@ full worked example.
 ## Version pinning
 
 Pinned to `mlx==0.31.2`. The kernels include MLX's steel headers and the extension links `libmlx`,
-binding it to that release's ABI and header API. To move to a newer MLX: re-vendor that wheel's
-`quantized_utils.h` (the shim at `metal/mlx/backend/metal/kernels/quantized_utils.h` = the wheel's
-exact file plus two appended helpers), rebuild, and re-run the test suite.
+binding it to that release's ABI and header API. To move to a newer MLX: update the bundled headers
+under `metal/mlx/backend/metal/kernels/` for that wheel, rebuild, and re-run the test suite.
 
 ## Tests
 
@@ -214,5 +205,4 @@ python -m pytest tests/      # dequant / matmul / gather / codecs / cpu_decode /
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The Metal kernels under `metal/` are derived from
-[ml-explore/mlx](https://github.com/ml-explore/mlx) (MIT) and the kquant research fork.
+MIT — see [LICENSE](LICENSE).

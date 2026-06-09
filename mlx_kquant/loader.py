@@ -74,7 +74,7 @@ def _get_classes(config: dict):
 
         return _mlxlm_get_classes(config)
     except (ImportError, AttributeError):
-        # Fallback mirroring mlx_lm.utils._get_classes if its internals move.
+        # Fallback that resolves the class here if that private helper moves.
         model_type = config["model_type"]
         try:
             from mlx_lm.utils import MODEL_REMAPPING
@@ -181,8 +181,8 @@ def load(
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
-    # The config stores bare module paths (fork / upstream parity); the install
-    # seam keys on "<path>.weight". Normalize before swapping modules in.
+    # The config stores bare module paths; the install seam keys on
+    # "<path>.weight". Normalize before swapping modules in.
     weight_keyed = {f"{path}.weight": codec for path, codec in per_tensor.items()}
     install_kquant_modules(model, weight_keyed)
 

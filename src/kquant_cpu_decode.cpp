@@ -1,7 +1,5 @@
-// Scalar CPU decoders for the 10 GGUF codecs + dequant-then-matmul. Ports the
-// reference scalar paths from mlx/backend/cpu/quantized.cpp (the KQuant arm of
-// QuantizedMatmul/GatherQMM::eval_cpu and fast::Quantize::eval_cpu's dequantize
-// branch). Bit-exact per-codec against the gguf-py reference; no Metal deps.
+// Scalar CPU decoders for the 10 GGUF codecs + dequant-then-matmul. Bit-exact
+// per-codec against the gguf-py reference; no Metal deps.
 #include "kquant_cpu_decode.h"
 
 #include <cstring>

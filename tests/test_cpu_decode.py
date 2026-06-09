@@ -3,7 +3,7 @@
 
 Every kq call is pinned to ``stream=mx.cpu``, so this exercises the scalar CPU
 decoders (dequantize / quantized_matmul / gather_qmm) and runs with no GPU — the
-CI value of the decode-path port. Checks, per codec, against the gguf.quants
+CI value of the CPU decode path. Checks, per codec, against the gguf.quants
 numpy reference:
 
   * dequantize -> float32 : BIT-EXACT
@@ -187,9 +187,9 @@ def test_cpu_vs_gpu_dequantize_bit_exact():
         cpu = kq.dequantize(w, _scales(), codec, dtype=mx.float32, stream=CPU)
         gpu_out = kq.dequantize(w, _scales(), codec, dtype=mx.float32, stream=mx.gpu)
         mx.eval(cpu, gpu_out)
-        assert np.array_equal(np.array(cpu), np.array(gpu_out)), (
-            f"{codec}: CPU vs GPU f32 dequant differ"
-        )
+        assert np.array_equal(
+            np.array(cpu), np.array(gpu_out)
+        ), f"{codec}: CPU vs GPU f32 dequant differ"
 
 
 def _main() -> int:

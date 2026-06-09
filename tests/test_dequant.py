@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Dequant validation: kq.dequantize (or the fork's mx.dequantize) vs the
-`gguf.quants` numpy reference.
-
-Backend-agnostic so the SAME script runs in two environments and the outputs can
-be diffed to prove byte-parity between the extension and the fork:
-
-  * stock mlx + mlx_kquant  -> uses kq.dequantize           (BACKEND=mlx_kquant)
-  * the kquant fork wheel    -> uses mx.dequantize(mode=...)  (BACKEND=fork-mx)
+"""Dequant validation: kq.dequantize vs the `gguf.quants` numpy reference.
 
 For each quantized tensor of the requested codec(s) it compares:
   * default (float16) output  -> expect LOOSE vs the float32 reference
@@ -29,6 +22,8 @@ import mlx.core as mx
 import numpy as np
 from gguf import GGMLQuantizationType, GGUFReader, quants
 
+import mlx_kquant as kq
+
 # (weights_per_block, bytes_per_block, group_size, bits, codec_name)
 KQUANT_CODECS = {
     GGMLQuantizationType.Q4_0: (32, 18, 32, 4, "q4_0"),
@@ -46,28 +41,11 @@ KQUANT_CODECS = {
 ATOL_LOOSE = 1e-3
 RTOL_LOOSE = 1e-3
 
-# Resolve a backend: prefer the extension, fall back to the fork's core op.
-try:
-    import mlx_kquant as kq
+BACKEND = "mlx_kquant"
 
-    BACKEND = "mlx_kquant"
 
-    def _dequant(w, scales, gs, bits, codec, dtype):
-        return kq.dequantize(w, scales, codec, dtype=dtype)
-
-except ImportError:
-    BACKEND = "fork-mx"
-
-    def _dequant(w, scales, gs, bits, codec, dtype):
-        return mx.dequantize(
-            w,
-            scales,
-            group_size=gs,
-            bits=bits,
-            mode="kquant",
-            kquant_type=codec,
-            dtype=dtype,
-        )
+def _dequant(w, scales, gs, bits, codec, dtype):
+    return kq.dequantize(w, scales, codec, dtype=dtype)
 
 
 def _pack(tensor, wpb, bpb):

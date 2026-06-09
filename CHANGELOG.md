@@ -9,7 +9,7 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [0.1.0] — unreleased
 
 First public release: the standalone `kq.*` op layer plus a create-weights
-toolchain that runs on a stock `mlx==0.31.2` wheel (no MLX-core fork).
+toolchain that runs on a stock `mlx==0.31.2` wheel.
 
 ### Added
 - `kq.*` op namespace: `dequantize`, `quantized_matmul`, `gather_qmm`,

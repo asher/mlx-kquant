@@ -1,10 +1,10 @@
-// GGUF loader implementation. Ports the fork's mlx/io/gguf.cpp (metadata walk,
-// get_shape, direct-dtype tensors) + gguf_quants.cpp (kquant wire-byte load).
-// gguflib is the antirez/gguf-tools single-file parser (FetchContent-pinned in
-// CMake); it mmaps the file, so tensor.weights_data points into the mmap. By
-// default each tensor is a NO-COPY view over that mmap (see
-// try_zero_copy_array); with zero_copy=false it is memcpy'd out via the
-// array(It, shape, dtype) constructor (one memcpy, ~15 GB/s, the fork's path).
+// GGUF loader implementation: metadata walk, get_shape, direct-dtype tensors,
+// and the K-quant wire-byte load path. gguflib is the antirez/gguf-tools
+// single-file parser (FetchContent-pinned in CMake); it mmaps the file, so
+// tensor.weights_data points into the mmap. By default each tensor is a NO-COPY
+// view over that mmap (see try_zero_copy_array); with zero_copy=false it is
+// memcpy'd out via the array(It, shape, dtype) constructor (one memcpy,
+// ~15 GB/s).
 #include <climits>
 #include <cstring>
 #include <fstream>
@@ -125,9 +125,8 @@ const KQuantCodec* gguf_type_to_kquant_codec(uint32_t t) {
   }
 }
 
-// Non-quantized GGUF tensor types we pass through with their native dtype.
-// Unlike the fork (which lacked BF16 and routed it through gguf_tensor_to_f16),
-// we keep BF16 as native bfloat16, matching the lab's pure-Python loader.
+// Non-quantized GGUF tensor types we pass through with their native dtype. BF16
+// is kept as native bfloat16 (not down-converted to float16).
 std::optional<mx::Dtype> gguf_type_to_dtype(uint32_t t) {
   switch (t) {
     case GGUF_TYPE_F32:
@@ -211,9 +210,8 @@ mx::array make_direct_array(
 // bytes (MLX order, byte-packed last dim) + a 1-byte scales placeholder. The
 // block geometry is passed explicitly so the same path serves both the 10
 // K-quant codecs (codec geometry) and the float codecs MXFP4/NVFP4 (which the
-// extension reads as raw wire bytes and the Python loader repacks into MLX's
-// native packed-uint32 + split-scales layout). Mirrors the fork's
-// gguf_load_kquant.
+// extension reads as raw wire bytes and a Python loader repacks into MLX's
+// native packed-uint32 + split-scales layout).
 void load_block_tensor(
     GgufLoadResult& res,
     const gguf_tensor& tensor,
@@ -393,8 +391,8 @@ double read_float_at(const char* p, uint32_t t) {
 }
 
 // Decode one GGUF KV value into a GgufMetaValue, advancing ctx->off past the
-// value bytes exactly as the fork's set_mx_value_from_gguf does (gguflib's
-// gguf_get_key relies on the caller advancing ctx->off past each value).
+// value bytes (gguflib's gguf_get_key relies on the caller advancing ctx->off
+// past each value).
 void read_metadata_value(
     gguf_ctx* ctx,
     uint32_t type,

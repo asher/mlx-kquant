@@ -1,12 +1,7 @@
-// KQuantDequantize primitive: GGUF K-quant wire bytes -> float array.
-// GPU dispatch ports mlx/backend/metal/quantized.cpp:1974-2013 (the kquant
-// dequantize arm of fast::Quantize::eval_gpu), with two extension-specific
-// changes:
-//   * the kernel is fetched from OUR bundled mlx_kquant.metallib (the fork's
-//     kernels live in mlx-core's default metallib), via d.get_kernel(name,
-//     lib);
-//   * row-contiguity is guaranteed by the op (mx::contiguous), since the fork's
-//     contiguous_copy_gpu is not exported.
+// KQuantDequantize primitive: GGUF K-quant wire bytes -> float array. The GPU
+// path fetches the decode kernel from the bundled mlx_kquant.metallib via
+// d.get_kernel(name, lib); the op guarantees row-contiguity (mx::contiguous)
+// before dispatch, so the kernel can assume dense inputs.
 #include <sstream>
 #include <stdexcept>
 #include <string>
