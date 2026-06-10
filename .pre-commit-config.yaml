@@ -23,3 +23,13 @@ repos:
       - id: trailing-whitespace
       - id: check-yaml
       - id: check-merge-conflict
+  - repo: local
+    hooks:
+      - id: check-codecs
+        name: codec doc-lint (check-codecs.py)
+        # Mirrors the CI doc-lint; runs fine without the built extension
+        # (the kq.codecs() leg is skipped with a note).
+        entry: python3 scripts/check-codecs.py --check
+        language: system
+        pass_filenames: false
+        files: '^(mlx_kquant/codec_geometry\.py|README\.md|scripts/check-codecs\.py)$'

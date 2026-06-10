@@ -23,6 +23,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "--model",
         help="load a checkpoint, forward a tiny input, and report finite logits.",
     )
+    p.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="With --model: allow a checkpoint's custom model_file "
+        "(arbitrary code) to load.",
+    )
     p.set_defaults(func=cmd)
 
 
@@ -51,7 +57,7 @@ def cmd(args: argparse.Namespace) -> int:
 
     from ..loader import load
 
-    model, config = load(args.model)
+    model, config = load(args.model, trust_remote_code=args.trust_remote_code)
     out = model(mx.array([[1, 2, 3, 4, 5]]))
     mx.eval(out)
     finite = bool(mx.all(mx.isfinite(out)).item())
