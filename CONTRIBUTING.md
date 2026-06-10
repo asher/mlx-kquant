@@ -6,7 +6,7 @@ front-end. A few notes to get productive quickly.
 ## Prerequisites
 
 - **macOS on Apple Silicon** with the Xcode command-line tools (`xcrun metal`
-  must work — the kernels compile to a `.metallib`).
+  must work - the kernels compile to a `.metallib`).
 - The exact pinned MLX wheel. The kernels include MLX's steel headers and the
   extension links `libmlx`, so the ABI must match:
 
@@ -49,13 +49,13 @@ change codec geometry or the encoder.
 
 Codec facts live in **one** place: `mlx_kquant/codec_geometry.py`. Update it, the
 README "Codec reference" table, and the kernel, then run
-`python scripts/check-codecs.py --check` — it fails on drift between the three.
+`python scripts/check-codecs.py --check` - it fails on drift between the three.
 
 ## Style
 
 - **Python:** `ruff` is the linter/formatter (config in `pyproject.toml`).
 - **C++ / Metal:** `clang-format` (config in `.clang-format`) covers all
-  first-party sources — the host code (`src/*.{cpp,h}`, `bindings.cpp`) and the
+  first-party sources - the host code (`src/*.{cpp,h}`, `bindings.cpp`) and the
   Metal kernels (`metal/`). The kernels' hand-aligned macro-instantiation
   tables are exempted with inline `// clang-format off` / `// clang-format on`
   regions in the `.metal` files; everything else is enforced.

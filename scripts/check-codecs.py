@@ -3,9 +3,9 @@
 
 Compares, for all ten GGUF K-quant / legacy codecs:
 
-  1. ``mlx_kquant/codec_geometry.py`` — the Python single source of truth;
-  2. the README "Codec reference" table — what users read;
-  3. ``kq.codecs()`` — the runtime list the built extension exposes (only when
+  1. ``mlx_kquant/codec_geometry.py`` - the Python single source of truth;
+  2. the README "Codec reference" table - what users read;
+  3. ``kq.codecs()`` - the runtime list the built extension exposes (only when
      the extension is importable; skipped, with a note, otherwise).
 
 This is a *documentation* lint (it catches geometry / naming drift), not a

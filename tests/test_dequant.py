@@ -134,7 +134,7 @@ def main(argv=None) -> int:
                 f"{c['fail']:>5} {wa:>11.3e} {wr:>11.3e}"
             )
     if n == 0:
-        # No matching tensors validated nothing — a misspelled --codecs or a
+        # No matching tensors validated nothing - a misspelled --codecs or a
         # GGUF without these codecs must not masquerade as a pass.
         print("ERROR: no tensors matched the requested codec(s)", file=sys.stderr)
         return 2

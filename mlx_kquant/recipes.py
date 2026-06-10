@@ -1,6 +1,6 @@
 """Attention-protected mixed-precision recipes for kquant encoding.
 
-Pure string / regex / dict logic — no ops, no GPU. Given a model's module
+Pure string / regex / dict logic - no ops, no GPU. Given a model's module
 paths, classify each quantizable tensor by *role* (attention q/k/v/o, MoE
 router, routed vs shared expert, embedding, lm_head, ...) and resolve a
 per-tensor codec from a named *preset* (``q4_k_m``, ``q5_k_moe``, ...). The

@@ -60,7 +60,7 @@ void KQuantDequantize::eval_cpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
   auto& w = inputs[0]; // uint8 wire bytes, row-contiguous (ensured by the op)
-  // inputs[1] is the vestigial scales placeholder — ignored (scales live in w).
+  // inputs[1] is the vestigial scales placeholder - ignored (scales live in w).
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
 

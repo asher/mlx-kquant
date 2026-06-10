@@ -5,13 +5,13 @@
 // availability is probed via kq_is_nax_available, and kquant carries no biases
 // so no bias buffer is plumbed through.
 //
-// The gather_qmm_rhs fast path is implemented here as gather_qmm_rhs_nax — the
+// The gather_qmm_rhs fast path is implemented here as gather_qmm_rhs_nax - the
 // only function-constant kernel (align_M/N/K at constant ids 200/201/202). It
 // requires right_sorted_ == true, which holds when lhs_indices is defaulted AND
 // sorted_indices is requested. mlx-lm's SwitchGLU sorts tokens by expert
 // (do_sort when indices.size>=64) and passes rhs_indices only, so
 // right_sorted_ == do_sort: MoE PREFILL takes this sorted per-expert GEMM
-// (≈6-8x faster than B separate gather_qmv vector-matmuls), while decode
+// (~=6-8x faster than B separate gather_qmv vector-matmuls), while decode
 // (top_k<64 -> no sort -> B<16) falls through to gather_qmv.
 #include <cstddef>
 #include <stdexcept>
@@ -251,7 +251,7 @@ void gather_qmv(
 // (lhs_indices defaulted), so a single batched GEMM walks contiguous per-expert
 // row blocks, switching the weight matrix per row-block from the sorted
 // `indices`. M here is the TOTAL row count (x.size()/K), NOT x.shape(-2)==1.
-// Unlike the other gather leaves this passes no index strides — it requires
+// Unlike the other gather leaves this passes no index strides - it requires
 // row-contiguous x / indices (the caller guards this) and bakes align_M/N/K
 // into func consts 200/201/202. kquant has no non-NAX gather_qmm_rhs kernel, so
 // this is only ever reached when the NAX gate holds.

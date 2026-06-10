@@ -43,8 +43,8 @@ struct GgufLoadResult {
   // Decoded GGUF KV metadata (general.architecture, tokenizer.*, rope.*, ...).
   // Order preserved from the file.
   std::vector<std::pair<std::string, GgufMetaValue>> metadata;
-  // Logical tensor shapes in GGUF native (innermost-first) order — i.e. the
-  // same order gguf-py's ReaderTensor.shape exposes — for config-synth
+  // Logical tensor shapes in GGUF native (innermost-first) order - i.e. the
+  // same order gguf-py's ReaderTensor.shape exposes - for config-synth
   // geometry probes. Logical element dims, NOT byte-packed.
   std::vector<std::pair<std::string, std::vector<int64_t>>> tensor_shapes;
 };

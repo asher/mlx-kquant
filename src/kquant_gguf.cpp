@@ -39,7 +39,7 @@ constexpr int kGgufArrayHeaderSize = 12; // 4-byte elem type + 8-byte length.
 // Build a no-copy mx.array viewing `nbytes` of `dtype`/`shape` starting at `wd`
 // (a pointer into gguflib's mmap). Wraps a page-aligned window enclosing the
 // tensor in a Metal shared-storage buffer via allocator::make_buffer (=
-// newBufferWithBytesNoCopy), then slices/reshapes to the tensor — all no-copy.
+// newBufferWithBytesNoCopy), then slices/reshapes to the tensor - all no-copy.
 // The window array's deleter releases that buffer and drops a ref to the
 // captured gguf_ctx, so the mmap survives exactly as long as some viewing array
 // does. Returns nullopt when a no-copy wrap isn't possible (unaligned window or
@@ -283,7 +283,7 @@ void load_block_tensor(
 // here (like the K-quants); the Python loader de-interleaves ggml's
 // scale+data-interleaved block layout into MLX's native packed form. Returns
 // nullptr for any other type. NOTE: mxfp8 has no GGML wire type, so it can't
-// appear in a GGUF — only MXFP4/NVFP4 are reachable from a file.
+// appear in a GGUF - only MXFP4/NVFP4 are reachable from a file.
 struct FpCodec {
   const char* name;
   int weights_per_block;

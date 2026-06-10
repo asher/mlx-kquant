@@ -4,7 +4,7 @@ into their ``KQuant*`` equivalents.
 ``install_kquant_modules`` walks the model's leaf modules and replaces each
 ``Linear`` / ``Embedding`` / ``SwitchLinear`` / ``MultiLinear`` whose
 ``<path>.weight`` carries a codec with the matching ``KQuant*`` module. It is
-arch-generic — driven entirely by the ``{path: codec}`` map — so widening
+arch-generic - driven entirely by the ``{path: codec}`` map - so widening
 architecture coverage never touches this file.
 
 ``mlx-lm`` is imported lazily (inside the function) so that ``import

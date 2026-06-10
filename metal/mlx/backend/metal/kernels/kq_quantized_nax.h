@@ -64,7 +64,7 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
   constexpr bool transpose_a = false;
   constexpr bool transpose_b = true;
 
-  // Clamp to SM/SN in int before narrowing to short — a bare short() cast of
+  // Clamp to SM/SN in int before narrowing to short - a bare short() cast of
   // the raw remaining-row/col span overflows once M (or N) exceeds 32767,
   // corrupting the leading tiles of a single large matmul.
   const short sgp_sm = short(min(int(SM), M - (y_row + tm)));

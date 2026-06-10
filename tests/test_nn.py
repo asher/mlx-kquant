@@ -5,7 +5,7 @@ KQuantLinear / KQuantEmbedding / KQuantSwitchLinear store GGUF wire bytes and
 dispatch the kq.* ops. Here we feed them the exact same wire bytes used by
 test_codecs / test_gather (committed K-quant fixtures + gguf-py-synthesized flat
 codecs) and compare their forward output to a reference computed with **gguf-py's
-numpy decoder** + numpy matmul — NOT kq.dequantize of the same bytes (that would
+numpy decoder** + numpy matmul - NOT kq.dequantize of the same bytes (that would
 be circular and prove nothing).
 
 Forward only (no kq.quantize), so this runs on the CPU decode path once it
@@ -165,7 +165,7 @@ def main(argv=None) -> int:
         if wire is None:
             missing.append(codec)
             fails += 1
-            print(f"  {codec:<6} {'MISSING fixture — run gen_fixtures.py':>40}")
+            print(f"  {codec:<6} {'MISSING fixture - run gen_fixtures.py':>40}")
             continue
 
         lin_ok = _check_linear(codec, gtype, wire, ref)

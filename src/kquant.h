@@ -29,7 +29,7 @@ bool metallib_loads();
 
 // Dequantize GGUF K-quant wire bytes `w` (uint8, last dim a multiple of the
 // codec's bytes_per_block) into a float array. `scales` is a vestigial
-// placeholder — K-quant scales live inside `w`; the argument exists only for
+// placeholder - K-quant scales live inside `w`; the argument exists only for
 // buffer-signature parity with the Metal kernel and is otherwise ignored.
 // group_size/bits are derived from `kquant_type`. Default output dtype is
 // float16.
@@ -125,7 +125,7 @@ class KQuantDequantize : public mx::Primitive {
 // the transpose flipped) so LoRA can train on a frozen kquant base; jvp/vmap
 // and the gradient wrt the quantized weights/scales inherit the base-class
 // throwing defaults. Split-k perf paths (qmm_splitk / qvm_split_k) are gated
-// off — they depend on the unexported strided_reduce_general_dispatch; plain
+// off - they depend on the unexported strided_reduce_general_dispatch; plain
 // qmm/qvm produce identical results with less parallelism.
 class KQuantMatmul : public mx::Primitive {
  public:
@@ -157,7 +157,7 @@ class KQuantMatmul : public mx::Primitive {
   bool is_equivalent(const mx::Primitive& other) const override;
 
   // Gradient wrt x only (arg 0): re-dispatch the matmul with the transpose
-  // flipped. The quantized weights/scales are frozen — arg 1/2 throw.
+  // flipped. The quantized weights/scales are frozen - arg 1/2 throw.
   std::vector<mx::array> vjp(
       const std::vector<mx::array>& primals,
       const std::vector<mx::array>& cotangents,
@@ -176,7 +176,7 @@ class KQuantMatmul : public mx::Primitive {
 // source x rows) so LoRA can train on a frozen kquant base; jvp/vmap and the
 // gradient wrt the weights/scales/indices inherit the base-class throwing
 // defaults. The gather_qmm_rhs fast path (the only function-constant kernel) is
-// deferred — it requires right_sorted_ == true, i.e. rhs_indices defaulted +
+// deferred - it requires right_sorted_ == true, i.e. rhs_indices defaulted +
 // sorted_indices, which callers never do (they always pass rhs_indices
 // explicitly). The dispatch falls through to gather_qmm / gather_qmv, which is
 // correctness-preserving for all inputs.

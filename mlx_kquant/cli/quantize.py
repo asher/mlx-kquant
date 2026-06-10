@@ -1,4 +1,4 @@
-"""``mlx-kquant quantize`` — encode a model into a kquant checkpoint."""
+"""``mlx-kquant quantize`` - encode a model into a kquant checkpoint."""
 
 from __future__ import annotations
 

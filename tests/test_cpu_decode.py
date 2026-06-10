@@ -2,7 +2,7 @@
 """Validate the CPU decode path (eval_cpu) for all 10 codecs.
 
 Every kq call is pinned to ``stream=mx.cpu``, so this exercises the scalar CPU
-decoders (dequantize / quantized_matmul / gather_qmm) and runs with no GPU — the
+decoders (dequantize / quantized_matmul / gather_qmm) and runs with no GPU - the
 CI value of the CPU decode path. Checks, per codec, against the gguf.quants
 numpy reference:
 
@@ -99,7 +99,7 @@ def _scales():
 def test_cpu_dequantize_matches_reference():
     for codec, (gtype, _wpb, _bpb, _bits, is_kq) in CODECS.items():
         wire, ref = _dense_wire_and_ref(codec, gtype, is_kq)
-        assert wire is not None, f"{codec}: missing fixture — run gen_fixtures.py"
+        assert wire is not None, f"{codec}: missing fixture - run gen_fixtures.py"
         w = mx.array(wire)
         o32 = kq.dequantize(w, _scales(), codec, dtype=mx.float32, stream=CPU)
         o16 = kq.dequantize(w, _scales(), codec, dtype=mx.float16, stream=CPU)
@@ -114,7 +114,7 @@ def test_cpu_quantized_matmul_matches_reference():
     rng = np.random.default_rng(0)
     for codec, (gtype, _wpb, _bpb, _bits, is_kq) in CODECS.items():
         wire, ref = _dense_wire_and_ref(codec, gtype, is_kq)
-        assert wire is not None, f"{codec}: missing fixture — run gen_fixtures.py"
+        assert wire is not None, f"{codec}: missing fixture - run gen_fixtures.py"
         rows, kk = ref.shape  # [N, K]
         w = mx.array(wire)
         for M in (1, 64):
@@ -140,7 +140,7 @@ def test_cpu_gather_qmm_matches_reference():
     rng = np.random.default_rng(0)
     for codec, (gtype, _wpb, _bpb, _bits, is_kq) in CODECS.items():
         wire, ref = _moe_wire_and_ref(codec, gtype, is_kq)
-        assert wire is not None, f"{codec}: missing _moe fixture — gen_fixtures.py"
+        assert wire is not None, f"{codec}: missing _moe fixture - gen_fixtures.py"
         ne, nn, kk = ref.shape
         w = mx.array(wire)
         for M in (1, 64):
@@ -179,10 +179,10 @@ def test_cpu_gather_qmm_matches_reference():
 
 @gpu
 def test_cpu_vs_gpu_dequantize_bit_exact():
-    """f32 dequant is a pure decode — CPU and GPU must produce identical bytes."""
+    """f32 dequant is a pure decode - CPU and GPU must produce identical bytes."""
     for codec, (gtype, _wpb, _bpb, _bits, is_kq) in CODECS.items():
         wire, _ref = _dense_wire_and_ref(codec, gtype, is_kq)
-        assert wire is not None, f"{codec}: missing fixture — run gen_fixtures.py"
+        assert wire is not None, f"{codec}: missing fixture - run gen_fixtures.py"
         w = mx.array(wire)
         cpu = kq.dequantize(w, _scales(), codec, dtype=mx.float32, stream=CPU)
         gpu_out = kq.dequantize(w, _scales(), codec, dtype=mx.float32, stream=mx.gpu)

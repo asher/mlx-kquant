@@ -4,13 +4,13 @@ Each module stores GGUF K-quant wire bytes directly as a ``uint8`` ``weight`` an
 dispatches through the ``kq.dequantize`` / ``kq.quantized_matmul`` /
 ``kq.gather_qmm`` ops.
 
-Importing this module needs only ``mlx`` + the built extension — no ``mlx-lm``.
+Importing this module needs only ``mlx`` + the built extension - no ``mlx-lm``.
 The leaf-swap installer that wires these into a constructed mlx-lm model lives in
 ``mlx_kquant._install`` (which lazily imports ``mlx-lm``).
 
 Each class carries ``mode = "kquant"`` plus ``kquant_type`` / ``group_size`` /
 ``bits`` / ``biases`` attributes so it duck-types with mlx-lm's affine
-``QuantizedLinear`` family — that is what lets the LoRA tuner recognise and adapt
+``QuantizedLinear`` family - that is what lets the LoRA tuner recognise and adapt
 a kquant base (see ``mlx_kquant.mlx_lm_patch``).
 """
 
@@ -27,7 +27,7 @@ from .codec_geometry import CODEC_GEOMETRY, bytes_per_row
 class KQuantEmbedding(nn.Module):
     """Embedding backed by GGUF kquant wire bytes.
 
-    ``__call__`` gathers per-token wire-byte rows then dequantizes — small output
+    ``__call__`` gathers per-token wire-byte rows then dequantizes - small output
     sizes only, so it avoids dequantizing the full embedding table (which can
     exceed INT_MAX elements and overflow the dispatch grid). ``as_linear`` runs a
     full kquant matmul for tied lm_head projection (gemma / qwen3 etc. tie
@@ -44,7 +44,7 @@ class KQuantEmbedding(nn.Module):
         self.biases = None
         self.num_embeddings = num_embeddings
         self.dims = dims
-        # Placeholders — overwritten by load_weights with the GGUF wire bytes.
+        # Placeholders - overwritten by load_weights with the GGUF wire bytes.
         bpr = bytes_per_row(codec, dims)
         self.weight = mx.zeros((num_embeddings, bpr), dtype=mx.uint8)
         self.scales = mx.zeros((1,), dtype=mx.uint8)
@@ -80,7 +80,7 @@ class KQuantLinear(nn.Module):
         self.bits = bits
         self.kquant_type = codec
         self.biases = None
-        # Placeholders — overwritten by load_weights with the GGUF wire bytes.
+        # Placeholders - overwritten by load_weights with the GGUF wire bytes.
         bpr = bytes_per_row(codec, in_dims)
         self.weight = mx.zeros((out_dims, bpr), dtype=mx.uint8)
         self.scales = mx.zeros((1,), dtype=mx.uint8)
@@ -164,14 +164,14 @@ class KQuantMultiLinear(nn.Module):
     ``QuantizedMultiLinear``), used by deepseek_v3-family attention for the
     ``embed_q`` / ``unembed_out`` up-projections. Each of ``num_heads`` heads has
     its own ``(output_dims, input_dims)`` weight; the GGUF stores these stacked,
-    so the wire bytes arrive shaped ``(num_heads, output_dims, bytes_per_row)`` —
+    so the wire bytes arrive shaped ``(num_heads, output_dims, bytes_per_row)`` -
     identical to a SwitchLinear's expert stack, dispatched the same way through
     ``kq.gather_qmm``.
 
     Called in two modes (mlx_lm deepseek_v3 attention):
-      * ``transpose=True``  — ``x[..., h, :, :] @ W[h].T`` (decode q_nope; and
+      * ``transpose=True``  - ``x[..., h, :, :] @ W[h].T`` (decode q_nope; and
         unembed_out always). Contracts over the quantized axis.
-      * ``transpose=False`` — ``x @ W[h]`` (prefill ``embed_q(kv_latent)``),
+      * ``transpose=False`` - ``x @ W[h]`` (prefill ``embed_q(kv_latent)``),
         contracting over the *non-quantized* axis.
     In the ``transpose=False`` case ``x`` carries a singleton head axis
     (``kv_latent`` is shared across heads) which is broadcast to ``num_heads`` via

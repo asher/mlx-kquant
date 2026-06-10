@@ -6,7 +6,7 @@ calibration corpus. :func:`mlx_kquant.quantize.quantize` passes these vectors to
 ``kq.quantize`` (a no-op on the non-K-quant codecs, which have no
 importance-weighted rounding path).
 
-This module is pure numpy (+ optional ``gguf`` for GGUF-format imatrix files) —
+This module is pure numpy (+ optional ``gguf`` for GGUF-format imatrix files) -
 no ops, no GPU. It reads both the legacy llama.cpp ``.dat`` format and the newer
 GGUF imatrix format.
 """
@@ -96,9 +96,9 @@ def map_imatrix_to_hf(
     """Resolve imatrix tensor names against HF module paths.
 
     Tries an identity match first (imatrix keyed by HF-format names with a
-    ``.weight`` suffix — what this package's ``calibrate-imatrix`` produces).
+    ``.weight`` suffix - what this package's ``calibrate-imatrix`` produces).
     Falls back to a GGUF->HF name remap (for llama.cpp imatrix files keyed by
-    GGUF names) *if* the ``gguf-mlx`` remap tables are importable — an optional
+    GGUF names) *if* the ``gguf-mlx`` remap tables are importable - an optional
     integration, not a hard dependency.
 
     Args:

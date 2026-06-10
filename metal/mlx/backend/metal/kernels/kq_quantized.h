@@ -3611,7 +3611,7 @@ METAL_FUNC void kq_q6_k_qmv_fast_impl(
 
 // Verify-shaped qmv. The per-row qmv (kq_q6_k_qmv_fast) puts M on grid_dims.x,
 // so each of the M rows runs its own threadgroup that independently re-reads
-// the weight tile — at M=4..8 that is 4-8x the weight traffic for the same
+// the weight tile - at M=4..8 that is 4-8x the weight traffic for the same
 // answer. This kernel instead runs ONE threadgroup per N-tile (grid_dims.x =
 // 1), reads each weight super-block ONCE, and dots it against ALL `vm`
 // activation rows, so the (dominant) weight read is amortized across the rows.

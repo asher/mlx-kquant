@@ -4,12 +4,12 @@
 patch_mlx_lm_lora() teaches stock mlx-lm to wrap a kquant module in a LoRA layer
 and to fuse the trained adapter back in. These checks cover:
 
-  * apply numerics — lora(x) == base(x) + scale·(x@A)@B (the patched wrapper
+  * apply numerics - lora(x) == base(x) + scale*(x@A)@B (the patched wrapper
     really dispatches through the kquant base plus the low-rank delta);
-  * fuse(dequantize=True) — a float nn.Linear whose forward matches lora(x);
-  * fuse(dequantize=False) — re-encodes the merged weight back to a KQuantLinear
+  * fuse(dequantize=True) - a float nn.Linear whose forward matches lora(x);
+  * fuse(dequantize=False) - re-encodes the merged weight back to a KQuantLinear
     (GPU-only: kq.quantize has no CPU path yet, so this is GPU-gated);
-  * training — a few SGD steps with a trainable projection UPSTREAM of the frozen
+  * training - a few SGD steps with a trainable projection UPSTREAM of the frozen
     kquant base, so the gradient flows through the base's vjp to reach it (the
     realistic multi-layer LoRA gradient path). Asserts the adapter + upstream
     grads are finite and non-zero, the loss strictly falls, and the frozen base
@@ -40,7 +40,7 @@ from mlx_kquant.mlx_lm_patch import patch_mlx_lm_lora
 from mlx_kquant.nn import KQuantLinear, KQuantSwitchLinear
 
 # fuse(dequantize=False) re-encodes via kq.quantize, which is GPU-only and would
-# throw on the CPU device — gate on a real GPU *and* not the forced-CPU CI mode.
+# throw on the CPU device - gate on a real GPU *and* not the forced-CPU CI mode.
 _gpu_encode = pytest.mark.skipif(
     not kq.metallib_loads() or bool(os.environ.get("KQUANT_FORCE_CPU")),
     reason="kquant re-encode (kq.quantize) is GPU-only",

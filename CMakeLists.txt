@@ -38,7 +38,7 @@ execute_process(
   OUTPUT_VARIABLE MLX_ROOT)
 find_package(MLX CONFIG REQUIRED)
 
-# NOTE: do NOT splice ${MLX_CXX_FLAGS} into CMAKE_CXX_FLAGS — it is a CMake list
+# NOTE: do NOT splice ${MLX_CXX_FLAGS} into CMAKE_CXX_FLAGS - it is a CMake list
 # (-DACCELERATE_NEW_LAPACK;-D_METAL_), and embedding the ';' into the flags
 # *string* corrupts every compile command (`/bin/sh: -D_METAL_: command not
 # found`). MLXConfig already attaches these as INTERFACE_COMPILE_OPTIONS on the
@@ -95,7 +95,7 @@ target_include_directories(mlx_kquant_ext PUBLIC ${gguflib_SOURCE_DIR})
 target_link_libraries(mlx_kquant_ext PUBLIC mlx)
 # libmlx.dylib bundles its OWN (older) gguflib and exports its gguf_* symbols
 # globally. A plain link binds our gguf_get_tensor()/gguf_open() calls to MLX's
-# copy, whose GGUF_TYPE_COUNT predates the MXFP4/NVFP4 float codecs — so a tensor
+# copy, whose GGUF_TYPE_COUNT predates the MXFP4/NVFP4 float codecs - so a tensor
 # of type >= 31 trips its `>= GGUF_TYPE_COUNT` guard and the tensor list silently
 # truncates at the first such tensor. force_load pulls OUR patched gguflib
 # objects into this image as (hidden) definitions, so every gguf_* call resolves
@@ -140,7 +140,7 @@ nanobind_add_module(
   ${CMAKE_CURRENT_LIST_DIR}/bindings.cpp)
 target_link_libraries(_ext PRIVATE mlx_kquant_ext)
 # kquant_gguf.cpp is a PUBLIC source (above), so it is also compiled into this
-# module and the LTO link keeps its own gguf_* references — force_load the
+# module and the LTO link keeps its own gguf_* references - force_load the
 # patched gguflib here too so they don't fall back to libmlx's exported copy
 # (see the mlx_kquant_ext force_load note for the full rationale).
 target_link_libraries(_ext PRIVATE gguflib)
@@ -156,7 +156,7 @@ if(BUILD_SHARED_LIBS)
     # libmlx in site-packages/mlx/lib/, so ../mlx/lib reaches it. (The absolute
     # build-tree rpath MLXConfig adds works only on the build machine; this is
     # what makes a redistributed wheel find the ABI-pinned mlx==0.31.2. delocate
-    # must therefore *exclude* libmlx from vendoring — see [tool.cibuildwheel].)
+    # must therefore *exclude* libmlx from vendoring - see [tool.cibuildwheel].)
     target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path/../mlx/lib)
   endif()
 endif()

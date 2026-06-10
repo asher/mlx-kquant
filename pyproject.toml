@@ -50,7 +50,7 @@ dev = ["pytest", "ruff", "numpy", "gguf"]
 mlx-kquant = "mlx_kquant.cli:main"
 mlxkq = "mlx_kquant.cli:main"
 
-# [project.urls] intentionally omitted until the public GitHub repo exists —
+# [project.urls] intentionally omitted until the public GitHub repo exists -
 # add Homepage / Repository / Issues there rather than shipping a guessed URL.
 
 [tool.setuptools.dynamic]
@@ -85,11 +85,11 @@ select = ["E", "F", "I", "W", "UP", "B"]
 ignore = ["E741"]  # ambiguous var names (l/I) appear in math-y kernel glue
 
 # ---------------------------------------------------------------------------
-# Wheel building (cibuildwheel). macOS arm64 only — the extension is a Metal
+# Wheel building (cibuildwheel). macOS arm64 only - the extension is a Metal
 # module. Build isolation pulls [build-system].requires (incl. the ABI-pinned
 # mlx==0.31.2 + nanobind + the Metal toolchain from the runner's Xcode).
 #
-# NOTE: this config is a skeleton — it has NOT yet produced a wheel validated on
+# NOTE: this config is a skeleton - it has NOT yet produced a wheel validated on
 # a second machine. Before the first PyPI publish, build locally, then
 # `pip install` the wheel into a CLEAN venv with only mlx==0.31.2 and confirm
 # `python -c "import mlx_kquant as kq; kq.metallib_loads()"` on a GPU box.
@@ -98,7 +98,7 @@ ignore = ["E741"]  # ambiguous var names (l/I) appear in math-y kernel glue
 build = "cp310-* cp311-* cp312-* cp313-*"
 build-frontend = "build"
 # check-codecs imports the installed wheel (pulling in the mlx dependency) and
-# exercises kq.codecs() — GPU-free, so it validates the libmlx rpath resolves.
+# exercises kq.codecs() - GPU-free, so it validates the libmlx rpath resolves.
 test-command = "python {project}/scripts/check-codecs.py --check"
 
 [tool.cibuildwheel.macos]

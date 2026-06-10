@@ -4,7 +4,7 @@ Stock ``mlx_lm.load_model`` cannot read a kquant checkpoint: it routes the
 ``quantization`` config into ``nn.quantize`` (which ``KeyError``s on the absent
 ``group_size`` and rejects ``mode="kquant"`` regardless). This loader builds the
 ``mlx-lm`` model class, swaps in ``KQuant*`` modules from the ``per_tensor`` map,
-and loads the uint8 wire-byte weights — all against an unmodified ``mlx`` + this
+and loads the uint8 wire-byte weights - all against an unmodified ``mlx`` + this
 extension.
 
 On-disk format is the one :mod:`mlx_kquant.convert` writes: ``config.json``
@@ -177,7 +177,7 @@ def load(
     for wf in weight_files:
         weights.update(mx.load(wf))
 
-    # sanitize first — model.sanitize may rename / drop keys.
+    # sanitize first - model.sanitize may rename / drop keys.
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 

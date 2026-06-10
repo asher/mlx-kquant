@@ -7,21 +7,21 @@ LoRA-trains, and fuses it.
 
 Two layers, one wheel:
 
-- **Ops** — a `kq.*` namespace (`dequantize`, `quantized_matmul`, `gather_qmm`, `quantize`, and a
+- **Ops** - a `kq.*` namespace (`dequantize`, `quantized_matmul`, `gather_qmm`, `quantize`, and a
   zero-copy `load_gguf` reader) backed by precompiled Metal kernels shipped in a `.metallib`. All ten
   codecs: `q2_k, q3_k, q4_k, q5_k, q6_k` and `q4_0, q4_1, q5_0, q5_1, q8_0`.
-- **Tooling** — `mlx-kquant quantize / run / lora / fuse` and a `loader` that create and run K-quant
-  checkpoints in **MLX-native safetensors** — the same format `mlx_lm` reads. No GGUF files in or out.
+- **Tooling** - `mlx-kquant quantize / run / lora / fuse` and a `loader` that create and run K-quant
+  checkpoints in **MLX-native safetensors** - the same format `mlx_lm` reads. No GGUF files in or out.
 
 ## Why
 
 K-quant is the precision recipe behind the strongest small-footprint llama.cpp quants; this makes it
 first-class on MLX. Quantize an HF / `mlx-lm` model to a uniform- or mixed-precision K-quant
-checkpoint, then load, generate, LoRA-train, and fuse it — all on a stock `mlx` wheel, all in MLX
+checkpoint, then load, generate, LoRA-train, and fuse it - all on a stock `mlx` wheel, all in MLX
 safetensors. The kernels are tuned for real models (matrix-contiguity handling for fused MoE experts,
-single-pass NAX matmul) — see [Performance](#performance).
+single-pass NAX matmul) - see [Performance](#performance).
 
-> mlx-kquant is **not** a GGUF runtime — its tooling reads and writes MLX safetensors, not `.gguf`
+> mlx-kquant is **not** a GGUF runtime - its tooling reads and writes MLX safetensors, not `.gguf`
 > files. The `kq.load_gguf` op is a low-level reader that lets downstream packages such as
 > [`gguf-mlx`](#running-gguf-files--gguf-mlx) build a pure-Python GGUF runtime on top; to run a
 > `.gguf` file directly, use gguf-mlx.
@@ -84,7 +84,7 @@ idx = mx.array([[0, 5, 9, 17, 33, 41, 88, 120]], dtype=mx.uint32)
 out = kq.gather_qmm(x, weq, sc, "q4_k", rhs_indices=idx, transpose=True)
 ```
 
-`load_gguf` is a low-level **reader**, not a model loader — a zero-copy building block (tensors as
+`load_gguf` is a low-level **reader**, not a model loader - a zero-copy building block (tensors as
 wire bytes + decoded metadata, ~15 GB/s via a C++ mmap memcpy) for runtimes like
 [`gguf-mlx`](#running-gguf-files--gguf-mlx). mlx-kquant's own checkpoints are MLX safetensors
 ([below](#create-and-run-a-checkpoint)).
@@ -100,7 +100,7 @@ arrays, codecs, metadata, shapes = kq.load_gguf("model.gguf")
 ### Create and run a checkpoint
 
 The CLI (the `[tools]` extra adds `mlx-lm`) quantizes an HF / `mlx-lm` model into a K-quant **MLX
-safetensors** checkpoint and runs it — no GGUF involved:
+safetensors** checkpoint and runs it - no GGUF involved:
 
 ```sh
 pip install "mlx-kquant[tools]"
@@ -119,7 +119,7 @@ model, config = load("qwen3-q4")          # KQuant* layers swapped in, on a stoc
 mx.eval(model(mx.array([[1, 2, 3]])))
 ```
 
-`mlx-kquant lora` (train an adapter) and `mlx-kquant fuse` (merge it back) round out the toolchain —
+`mlx-kquant lora` (train an adapter) and `mlx-kquant fuse` (merge it back) round out the toolchain -
 see [LoRA fine-tuning](#lora-fine-tuning). Run `mlx-kquant --help` for every subcommand.
 
 ### Use it in your own model
@@ -148,7 +148,7 @@ encoder, layer modules, and the mlx-lm monkeypatch are all small and self-contai
 
 ### LoRA fine-tuning
 
-A kquant checkpoint is a frozen base you can adapt with LoRA — attach an adapter for inference, train
+A kquant checkpoint is a frozen base you can adapt with LoRA - attach an adapter for inference, train
 one (the matmul/gather ops define a gradient-through-the-base `vjp`, so the adapter is differentiable
 while the quantized weights stay frozen), and merge it back with `mlx-kquant fuse` (re-encode to
 kquant, or `--dequantize` to float). One call wires it into stock mlx-lm:
@@ -159,13 +159,13 @@ patch_mlx_lm_lora()   # before building LoRA layers / loading adapters; idempote
 ```
 
 See **[docs/lora.md](docs/lora.md)** for attach / train / merge workflows. (DoRA on a kquant base is
-not supported — use LoRA.)
+not supported - use LoRA.)
 
-## Running GGUF files — `gguf-mlx`
+## Running GGUF files - `gguf-mlx`
 
 mlx-kquant produces MLX safetensors checkpoints; it does not run `.gguf` files. To **load and run a
-complete GGUF model** — name remap, config + tokenizer synth from GGUF metadata, K-quant leaf swap,
-dense or MoE, plus a CLI and OpenAI-compatible servers — use the separate **`gguf-mlx`** package. It
+complete GGUF model** - name remap, config + tokenizer synth from GGUF metadata, K-quant leaf swap,
+dense or MoE, plus a CLI and OpenAI-compatible servers - use the separate **`gguf-mlx`** package. It
 depends on this one and builds a pure-Python GGUF runtime on the `kq.*` ops (notably `kq.load_gguf`),
 with no conversion and no safetensors round-trip:
 
@@ -201,7 +201,7 @@ weights. Measured on an M5 Max (128 GB):
 - **Codec registry** derives `group_size`/`bits` from the codec name, so callers pass only
   `kquant_type`.
 - **CPU and GPU execution.** The decode ops (`dequantize` / `quantized_matmul` / `gather_qmm`) run on
-  either stream — a scalar CPU path (all 10 codecs) backs `stream=mx.cpu` and doubles as the
+  either stream - a scalar CPU path (all 10 codecs) backs `stream=mx.cpu` and doubles as the
   correctness oracle the Metal kernels are A/B'd against, so the op tests can run in CI without a GPU.
   **Encode (`quantize`) is GPU-only** until the CPU encoder lands in 0.2.0.
 
@@ -209,9 +209,9 @@ weights. Measured on an M5 Max (128 GB):
 
 mlx-kquant is two things on one wheel:
 
-- **The op layer** — the `kq.*` namespace and its Metal kernels. Point your own model's quantized
+- **The op layer** - the `kq.*` namespace and its Metal kernels. Point your own model's quantized
   layers at these ops (see [Use it in your own model](#use-it-in-your-own-model)).
-- **The checkpoint toolchain** — `quantize` / `loader` / `run` / `lora` / `fuse`, which create and run
+- **The checkpoint toolchain** - `quantize` / `loader` / `run` / `lora` / `fuse`, which create and run
   **MLX safetensors** K-quant checkpoints (the `[tools]` extra).
 
 What it is **not**: a GGUF model runtime. Reading and running `.gguf` files is the job of the separate
@@ -248,8 +248,8 @@ python -m pytest tests/      # dequant / matmul / gather / codecs / cpu_decode /
 
 - **macOS on Apple Silicon** (M-series) with a working Metal toolchain (`xcrun metal`) for a
   build-from-source install. Prebuilt wheels (when published) need only the runtime GPU.
-- **Python ≥ 3.10** (the pinned `mlx==0.31.2` ships no cp39 wheel).
-- **`mlx==0.31.2`** exactly — the kernels include MLX's steel headers and the extension links
+- **Python >= 3.10** (the pinned `mlx==0.31.2` ships no cp39 wheel).
+- **`mlx==0.31.2`** exactly - the kernels include MLX's steel headers and the extension links
   `libmlx`, so the ABI is version-locked (see [Version pinning](#version-pinning)).
 
 ## Limitations
@@ -268,8 +268,8 @@ python -m pytest tests/      # dequant / matmul / gather / codecs / cpu_decode /
 
 - A Metal-free **Linux** build (CPU train/infer), contingent on the mlx Linux wheel exercising the
   CPU eval paths.
-- **0.2.0:** CPU **encode** parity → quantize on Linux.
+- **0.2.0:** CPU **encode** parity -> quantize on Linux.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).

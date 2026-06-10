@@ -1,4 +1,4 @@
-"""``mlx-kquant verify`` — smoke-check the codecs / presets, or a checkpoint."""
+"""``mlx-kquant verify`` - smoke-check the codecs / presets, or a checkpoint."""
 
 from __future__ import annotations
 

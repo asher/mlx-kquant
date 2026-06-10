@@ -16,7 +16,7 @@ On-disk format:
   ``quantization_config``, each ``{"mode": "kquant", "per_tensor": {path: codec}}``
   where ``path`` is the **bare module path** (no ``.weight`` suffix).
 * safetensors hold ``<path>.weight`` (uint8 wire bytes), ``<path>.scales``
-  (uint8 ``[1]`` placeholder — K-quant scales live inside the wire bytes), and an
+  (uint8 ``[1]`` placeholder - K-quant scales live inside the wire bytes), and an
   optional ``<path>.bias``; unquantized tensors keep their source dtype.
 
 Encode is GPU-only in v0.1.0 (the ``quantize`` op has no CPU path yet).
@@ -36,7 +36,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 # Bind the encode op by its stable extension location: the package attribute
 # ``mlx_kquant.quantize`` is the op, but importing a ``quantize`` submodule would
-# shadow it — hence this module is named ``convert`` and reaches the op via _ext.
+# shadow it - hence this module is named ``convert`` and reaches the op via _ext.
 from ._ext import quantize as _encode_op
 from .codec_geometry import geometry
 from .recipes import classify_tensors, resolve_codec_map
@@ -94,7 +94,7 @@ def quantize_model(
         imatrix_path: optional imatrix file to steer the K-quant codecs.
 
     Returns:
-        ``(model, quantized_config)`` — the same model with ``KQuant*`` modules
+        ``(model, quantized_config)`` - the same model with ``KQuant*`` modules
         swapped in, and a config carrying the ``quantization`` map.
     """
     if preset is None and default_codec is None:
@@ -176,7 +176,7 @@ def quantize_model(
             if has_bias:
                 repl.bias = module.bias
         else:
-            # Codec resolved for a module type we don't encode — leave it.
+            # Codec resolved for a module type we don't encode - leave it.
             skipped += 1
             continue
 
@@ -231,5 +231,5 @@ def save(
 
 
 def tree_weight_keys(model: nn.Module) -> list[str]:
-    """Flattened parameter keys for ``model`` — handy for tests/debugging."""
+    """Flattened parameter keys for ``model`` - handy for tests/debugging."""
     return [k for k, _ in tree_flatten(model.parameters())]

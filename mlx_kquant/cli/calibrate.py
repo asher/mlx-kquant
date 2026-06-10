@@ -1,7 +1,7 @@
-"""``mlx-kquant calibrate-imatrix`` — build an importance matrix from a corpus.
+"""``mlx-kquant calibrate-imatrix`` - build an importance matrix from a corpus.
 
 Runs the model forward over a plain-text calibration corpus, capturing per-input-
-feature ``sum(x²) / n_tokens`` on every ``nn.Linear``. Output is the legacy
+feature ``sum(x^2) / n_tokens`` on every ``nn.Linear``. Output is the legacy
 llama-imatrix binary ``.dat`` format, consumable by ``mlx-kquant quantize
 --imatrix`` (and :mod:`mlx_kquant.imatrix`).
 """
@@ -21,7 +21,7 @@ _Sink = dict[str, dict[str, object]]
 
 
 class _AccumLinear(nn.Module):
-    """Wraps an ``nn.Linear`` to accumulate ``sum(x²)`` per input feature."""
+    """Wraps an ``nn.Linear`` to accumulate ``sum(x^2)`` per input feature."""
 
     def __init__(self, base: nn.Module, key: str, sink: _Sink):
         super().__init__()

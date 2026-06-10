@@ -24,7 +24,7 @@ namespace {
 // strided LEADING/batch dim is fine because the qmv/qmm/gather kernels walk it
 // via the strides passed in add_strides_and_shapes. Using full
 // mx::contiguous() here instead would force a copy of the whole tensor whenever
-// the leading dim is strided — e.g. the gate/up halves of a fused MoE
+// the leading dim is strided - e.g. the gate/up halves of a fused MoE
 // gate_up_exps tensor are slices [..., :H, :] / [..., H:, :] whose expert
 // (leading) stride is 2*H rows: matrix-contiguous but NOT row_contiguous, so
 // full contiguify copies ~142 MB PER gather call (the decode MoE 5x
@@ -295,7 +295,7 @@ mx::array gather_qmm(
   // rhs_nax leaf needs a fully row-contiguous w. Every
   // other leaf (qmv decode / qmm) walks w's strides, so matrix-contiguity (a
   // strided LEADING/expert dim, no copy) suffices and is what keeps the fused
-  // gate_up_exps slice from being copied wholesale on every DECODE gather — the
+  // gate_up_exps slice from being copied wholesale on every DECODE gather - the
   // 5x-sensitive hot path. x / scales always take the cheaper matrix check: the
   // eval_gpu rhs_nax gate already requires x.row_contiguous (skips rhs_nax
   // otherwise, routing to a strided-safe leaf), and scales is a (1,)

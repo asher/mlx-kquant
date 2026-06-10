@@ -3,7 +3,7 @@
 // d.get_kernel(name, lib); the op guarantees row-contiguity before dispatch and
 // kernel-name type tokens come from kq_type_string. NAX (tensor-core)
 // availability is probed via kq_is_nax_available. The split-k paths
-// (qmm_splitk / qvm_split_k) are omitted — plain qmm/qvm produce identical
+// (qmm_splitk / qvm_split_k) are omitted - plain qmm/qvm produce identical
 // results with less parallelism. kquant never carries biases, so no bias buffer
 // is plumbed through.
 #include <cstddef>
@@ -345,8 +345,8 @@ void verify_qmv(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// The qmv_quad branch (K==64/128) is unreachable for kquant — eval_gpu throws
-// for that case first — so this always routes to qmv.
+// The qmv_quad branch (K==64/128) is unreachable for kquant - eval_gpu throws
+// for that case first - so this always routes to qmv.
 void dispatch_qmv(
     const array& x,
     const array& w,
@@ -514,7 +514,7 @@ void KQuantMatmul::eval_gpu(
     return;
   }
   // There is no kquant qmv_quad kernel for K in {64,128}. Plain qmv is correct
-  // for any K that is a multiple of the codec group size — K-quants (gs=256)
+  // for any K that is a multiple of the codec group size - K-quants (gs=256)
   // can never reach K=64/128, and the legacy gs=32 codecs only could on weights
   // whose input dim is exactly 64/128 (none in standard transformers). Fall
   // through to dispatch_qmv below rather than throw; a qmv_quad kernel would be

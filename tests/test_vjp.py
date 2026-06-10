@@ -8,14 +8,14 @@ frozen base and their gradient throws. That single branch is what lets a LoRA
 adapter train on a frozen kquant base: a frozen quantized layer must still pass
 gradient back to trainable parameters that sit upstream of it.
 
-These run on the default device — Metal on Apple Silicon — so the vjp resolves
+These run on the default device - Metal on Apple Silicon - so the vjp resolves
 through the GPU kernels; set ``KQUANT_FORCE_CPU=1`` (the shared CI convention in
 conftest.py) to run the same checks through the scalar CPU eval paths instead:
 
   * matmul vjp vs an independent oracle: d/dx (x @ Wq.T) == cotan @ dequant(Wq),
     with the dequant taken from gguf-py (not kq.dequantize) so a shared bug
     cannot cancel out of both sides.
-  * a frozen dense layer trains a parameter placed upstream of it — the loss
+  * a frozen dense layer trains a parameter placed upstream of it - the loss
     strictly decreases, the gradient is finite and non-zero, and the frozen wire
     bytes are byte-unchanged after the steps.
   * the MoE gather counterpart, with a non-identity ``lhs_indices`` selection so

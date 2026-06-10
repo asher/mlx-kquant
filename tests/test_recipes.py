@@ -1,4 +1,4 @@
-"""Recipe resolution tests — pure logic, no GPU, no [tools], no model download.
+"""Recipe resolution tests - pure logic, no GPU, no [tools], no model download.
 
 Drives the classifier + preset resolver from fabricated path/role maps (and a
 tiny fake model for the predicate) and asserts the *specific* per-tensor codec
@@ -190,7 +190,7 @@ def test_layer_position_bump_fires_at_boundaries():
 
 
 class _FakeQuantModule:
-    """Stands in for a quantizable leaf — only needs a ``to_quantized`` attr."""
+    """Stands in for a quantizable leaf - only needs a ``to_quantized`` attr."""
 
     def to_quantized(self):  # pragma: no cover - never called
         raise NotImplementedError

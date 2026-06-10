@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Smoke test for kq.load_gguf — the only coverage of kquant_gguf.cpp (gguflib
+"""Smoke test for kq.load_gguf - the only coverage of kquant_gguf.cpp (gguflib
 mmap + KV-metadata decode + tensor packing + shape reversal).
 
 Mint a tiny GGUF with gguf-py (which can ENCODE the flat codecs q8_0/q4_0 and
-F32 — all we need to exercise the loader's quantized and native-dtype paths),
+F32 - all we need to exercise the loader's quantized and native-dtype paths),
 load it through the C++ loader, and verify tensors, codecs, shapes and metadata
 round-trip.
 
@@ -88,7 +88,7 @@ def test_zero_copy_matches_copy(tmp_path):
         a, b = cp_arr[name], zc_arr[name]
         assert a.shape == b.shape and a.dtype == b.dtype, name
         # raw-byte compare (reinterpret non-uint8 as bytes; no flatten so a >2GB
-        # tensor wouldn't overflow the int32 shape — moot at this size).
+        # tensor wouldn't overflow the int32 shape - moot at this size).
         au = a if a.dtype == mx.uint8 else mx.view(a, mx.uint8)
         bu = b if b.dtype == mx.uint8 else mx.view(b, mx.uint8)
         assert bool(mx.all(au == bu)), f"byte mismatch in {name}"

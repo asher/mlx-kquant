@@ -86,7 +86,7 @@ def main(argv=None) -> int:
     w = mx.array(packed)
     scales = mx.zeros((1,), dtype=mx.uint8)
     # Independent reference: gguf-py's numpy decoder AND a numpy f32 matmul (NOT
-    # kq.dequantize, and NOT mx.matmul) — so neither a shared dequant bug nor a
+    # kq.dequantize, and NOT mx.matmul) - so neither a shared dequant bug nor a
     # shared matmul bug can cancel out of both `got` and `ref`. numpy on CPU also
     # stays correct for a wide weight (>2GB, N~262144) where an f16 matmul
     # overflows to inf and even stock mx.matmul overflows int32 row offsets to 0;
@@ -135,7 +135,7 @@ def _present_codecs(gguf) -> list:
 
 def test_matmul():
     """pytest entry: validate quantized_matmul for EVERY K-quant codec present
-    in KQUANT_TEST_GGUF (not just q4_k — UD/mixed quants vary), else skip.
+    in KQUANT_TEST_GGUF (not just q4_k - UD/mixed quants vary), else skip.
     main() returns 0=pass, 1=numeric mismatch, 2=codec present but no usable 2D
     tensor. A 2 is tolerated (not every codec has a matmul-shaped tensor); only a
     1 fails. Requires at least one codec to actually run so a mis-pointed path

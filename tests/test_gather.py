@@ -100,11 +100,11 @@ def main(argv=None) -> int:
         wire, ref = _wire_and_ref(codec, gtype, wpb, bpb, is_kq)
         if wire is None:
             # A requested K-quant codec with no fixture is a HARD failure, not a
-            # silent skip — otherwise a fresh clone reports ALL OK with zero
+            # silent skip - otherwise a fresh clone reports ALL OK with zero
             # K-quant coverage.
             missing.append(codec)
             fails += 1
-            print(f"  {codec:<6} {'MISSING fixture — run gen_fixtures.py':>49}")
+            print(f"  {codec:<6} {'MISSING fixture - run gen_fixtures.py':>49}")
             continue
         ne, nn, _ = ref.shape
         w = mx.array(wire)
@@ -119,7 +119,7 @@ def main(argv=None) -> int:
             rhs = mx.array(experts)
             # Two lhs_indices patterns: contiguous arange (the fast/identity
             # path), and a reversed selection with a forced repeat (realistic
-            # MoE routing — one x row consumed twice, one unused). The latter
+            # MoE routing - one x row consumed twice, one unused). The latter
             # exercises non-contiguous lhs gather, which arange never does.
             seq = np.arange(B, dtype=np.uint32)
             perm = seq[::-1].copy()
@@ -163,13 +163,13 @@ def test_rhs_gather_large_M_no_short_overflow():
     crossed SHRT_MAX the leading tiles got a poisoned height and silently
     produced garbage rows (every tile whose remaining span > 32767). Only the
     sorted, B>=16, B/E>=4, M==1 path reaches that leaf, and only a single
-    >32k-token forward (no chunking) makes M large enough — so it never showed
+    >32k-token forward (no chunking) makes M large enough - so it never showed
     up in the small-M sweep above. Assert the sorted leaf matches the unsorted
     per-row leaf (independent kernel) across all rows, and spot-check truth.
     """
     # q8_0: synthesizable in-process (gguf only quantizes flat codecs) and has a
     # rhs_nax kernel. The overflow lives in the shared tail-tile template, so the
-    # codec is immaterial — q8_0 exercises the same poisoned path as q6_k.
+    # codec is immaterial - q8_0 exercises the same poisoned path as q6_k.
     codec, gtype = "q8_0", GT.Q8_0
     Eg, Ng, Kg = 8, 64, 256  # K % 64 == 0
     rng = np.random.default_rng(7)

@@ -1,9 +1,9 @@
-"""``mlx-kquant lora`` — train or test a LoRA adapter on a kquant base.
+"""``mlx-kquant lora`` - train or test a LoRA adapter on a kquant base.
 
 A thin pass-through to mlx-lm's own LoRA trainer: it applies the kquant patch
 (so mlx-lm can load, adapt, and save against a kquant checkpoint) and then hands
 every remaining argument straight to ``mlx_lm.lora``. There is no bespoke trainer
-here — all of mlx-lm's lora flags apply unchanged. Run ``mlx-kquant lora --help``
+here - all of mlx-lm's lora flags apply unchanged. Run ``mlx-kquant lora --help``
 to see them.
 
     mlx-kquant lora --model my-q4-ckpt --train --data ./data --iters 200

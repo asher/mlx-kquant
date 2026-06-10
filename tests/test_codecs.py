@@ -3,7 +3,7 @@
 
 Test data per codec:
   * flat codecs (q4_0/q4_1/q5_0/q5_1/q8_0): synthesized in-process via
-    gguf.quants.quantize(random weights) — gguf-py can encode these.
+    gguf.quants.quantize(random weights) - gguf-py can encode these.
   * K-quant codecs (q2_k..q6_k): loaded from tests/fixtures/<codec>.npz, minted
     by gen_fixtures.py via kq.quantize (gguf-py is decode-only for these).
 
@@ -101,7 +101,7 @@ def main(argv=None) -> int:
             # coverage and still prints ALL OK.
             missing.append(codec)
             fails += 1
-            print(f"  {codec:<6} {'MISSING fixture — run gen_fixtures.py':>49}")
+            print(f"  {codec:<6} {'MISSING fixture - run gen_fixtures.py':>49}")
             continue
 
         rows, kk = ref.shape
