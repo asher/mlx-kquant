@@ -1,17 +1,22 @@
 // KQuantQuantize primitive: encode a float weight tensor into GGUF K-quant wire
 // bytes. The GPU path fetches the encode kernel from the bundled metallib via
 // kq_get_kernel; the op guarantees row-contiguity before dispatch, and
-// kernel-name type tokens come from kq_type_string. GPU-only: eval_cpu throws
-// (there is no CPU encode path yet).
+// kernel-name type tokens come from kq_type_string. The CPU path covers the
+// flat codecs (kquant_cpu_encode.h); the K-quant codecs are GPU-only for now
+// and the CPU dispatch throws for them.
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
 
 #include "kquant.h"
 #include "kquant_codec.h"
+#include "kquant_cpu_encode.h"
 #include "kquant_internal.h"
 
 #include "mlx/allocator.h"
+#include "mlx/backend/cpu/encoder.h"
+#include "mlx/types/half_types.h"
 
 #ifdef _METAL_
 #include "kquant_metal_internal.h" // kq_get_kernel
@@ -41,11 +46,55 @@ bool KQuantQuantize::is_equivalent(const mx::Primitive& other) const {
 }
 
 void KQuantQuantize::eval_cpu(
-    const std::vector<mx::array>&,
-    std::vector<mx::array>&) {
-  throw std::runtime_error(
-      "[mlx_kquant] quantize (encode) has no CPU implementation; run on the GPU "
-      "stream (the default device).");
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  // inputs[0] = w (float, row-contiguous via the op); inputs[1] = imatrix (opt,
+  // float32, row-contiguous via the op).
+  auto& w = inputs[0];
+  auto& out = outputs[0]; // wq (uint8)
+  auto& scales_placeholder = outputs[1]; // vestigial [1] uint8
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+  scales_placeholder.set_data(
+      mx::allocator::malloc(scales_placeholder.nbytes()));
+
+  bool has_imatrix = inputs.size() >= 2;
+  std::size_t num_weights = static_cast<std::size_t>(w.size());
+  std::size_t K = static_cast<std::size_t>(w.shape(-1));
+  // Capture a real array for the imatrix slot even when absent (dummy = w,
+  // never read), so the lambda has a valid weak copy to hold.
+  const mx::array& imat_src = has_imatrix ? inputs[1] : w;
+
+  auto& encoder = mx::cpu::get_command_encoder(stream());
+  encoder.set_input_array(w);
+  if (has_imatrix) {
+    encoder.set_input_array(inputs[1]);
+  }
+  encoder.set_output_array(out);
+  encoder.dispatch([w = mx::array::unsafe_weak_copy(w),
+                    imat = mx::array::unsafe_weak_copy(imat_src),
+                    out = mx::array::unsafe_weak_copy(out),
+                    has_imatrix,
+                    num_weights,
+                    K,
+                    kquant_type = kquant_type_]() mutable {
+    const float* imatrix = has_imatrix ? imat.data<float>() : nullptr;
+    uint8_t* outp = out.data<uint8_t>();
+    auto dt = w.dtype();
+    if (dt == mx::float32) {
+      kquant_quantize_dispatch(
+          w.data<float>(), outp, num_weights, kquant_type, imatrix, K);
+    } else if (dt == mx::float16) {
+      kquant_quantize_dispatch(
+          w.data<mx::float16_t>(), outp, num_weights, kquant_type, imatrix, K);
+    } else if (dt == mx::bfloat16) {
+      kquant_quantize_dispatch(
+          w.data<mx::bfloat16_t>(), outp, num_weights, kquant_type, imatrix, K);
+    } else {
+      throw std::runtime_error(
+          "[mlx_kquant] quantize: only float32/float16/bfloat16 inputs are "
+          "supported.");
+    }
+  });
 }
 
 #ifdef _METAL_

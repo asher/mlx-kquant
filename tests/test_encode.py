@@ -118,5 +118,45 @@ def test_encode():
     assert main([]) == 0
 
 
+@pytest.mark.parametrize("codec", [c for c, v in CODECS.items() if v[1] == 32])
+def test_encode_cpu_flat_roundtrip(codec):
+    """CPU encode path (kquant_cpu_encode.cpp) for the flat codecs: encode on the
+    CPU stream, dequantize with the gguf-py reference, and check the round-trip is
+    within the codec's bound. Needs no GPU - this is the CI-runnable gate that the
+    encode (and LoRA quantize/fuse-to-kquant) paths actually execute on hosted
+    runners. The K-quant codecs stay GPU-only until their CPU encoders land."""
+    gtype, _wpb, _bits, bound = CODECS[codec]
+    rng = np.random.default_rng(7)
+    w_np = (rng.standard_normal((N, K)) * 0.1).astype(np.float32)
+    wq, scales = kq.quantize(mx.array(w_np), codec, stream=mx.cpu)
+    mx.eval(wq, scales)
+
+    assert tuple(np.array(scales).shape) == (1,)
+    wire = np.ascontiguousarray(np.array(wq).astype(np.uint8))
+    w_rt = quants.dequantize(wire, gtype).astype(np.float32)
+    rel = float(np.linalg.norm(w_rt - w_np) / (np.linalg.norm(w_np) + 1e-6))
+    assert rel < bound, f"{codec}: round-trip rel {rel:.3e} >= bound {bound}"
+
+
+@pytest.mark.skipif(
+    not kq.metallib_loads() or bool(os.environ.get("KQUANT_FORCE_CPU")),
+    reason="needs the GPU encoder to A/B against (no Metal GPU / forced CPU)",
+)
+@pytest.mark.parametrize("codec", [c for c, v in CODECS.items() if v[1] == 32])
+def test_encode_cpu_matches_gpu_flat(codec):
+    """The CPU encoder is a byte-exact port of the GPU kernel: for the flat codecs
+    the two paths must produce identical wire bytes (same scale derivation, same
+    fp16 store, same round-half-away-from-zero). This is the strong oracle the
+    CPU round-trip can only approximate."""
+    rng = np.random.default_rng(7)
+    w = mx.array((rng.standard_normal((N, K)) * 0.1).astype(np.float32))
+    wq_gpu, _ = kq.quantize(w, codec, stream=mx.gpu)
+    wq_cpu, _ = kq.quantize(w, codec, stream=mx.cpu)
+    mx.eval(wq_gpu, wq_cpu)
+    assert np.array_equal(
+        np.array(wq_gpu).astype(np.uint8), np.array(wq_cpu).astype(np.uint8)
+    )
+
+
 if __name__ == "__main__":
     sys.exit(main())
