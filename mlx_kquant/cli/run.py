@@ -1,4 +1,4 @@
-"""``mlx-kquant run`` — load a kquant checkpoint and generate a few tokens."""
+"""``mlx-kquant run`` - load a kquant checkpoint and generate a few tokens."""
 
 from __future__ import annotations
 
@@ -16,6 +16,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "--model", required=True, help="kquant checkpoint dir or HF repo id."
     )
     p.add_argument("--prompt", default="Hello!", help="Prompt text.")
+    p.add_argument(
+        "--adapter-path",
+        help="Optional LoRA adapter dir to attach at runtime (the base is not "
+        "modified; use `mlx-kquant fuse` to merge it in permanently).",
+    )
     p.add_argument(
         "--max-tokens", type=int, default=64, help="Tokens to generate. Default: 64."
     )
@@ -45,6 +50,14 @@ def cmd(args: argparse.Namespace) -> int:
 
     model, _ = load(args.model, trust_remote_code=args.trust_remote_code)
     tokenizer = load_tokenizer(_resolve_path(args.model, None))
+
+    if args.adapter_path:
+        from mlx_lm.tuner.utils import load_adapters
+
+        from ..mlx_lm_patch import patch_mlx_lm_lora
+
+        patch_mlx_lm_lora()  # install the to_lora seam so the adapter attaches
+        load_adapters(model, args.adapter_path)
 
     prompt = args.prompt
     if getattr(tokenizer, "chat_template", None) is not None:

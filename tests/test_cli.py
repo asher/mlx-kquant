@@ -1,4 +1,4 @@
-"""CLI dispatcher tests — argument parsing + the no-[tools]/no-GPU verify legs.
+"""CLI dispatcher tests - argument parsing + the no-[tools]/no-GPU verify legs.
 
 Importing the CLI must not pull in mlx-lm (heavy imports stay inside ``cmd``), so
 these run on a base install. ``verify --codecs`` / ``--presets`` dispatch no ops.
@@ -6,13 +6,21 @@ these run on a base install. ``verify --codecs`` / ``--presets`` dispatch no ops
 
 from __future__ import annotations
 
+import json
+import os
+
+import mlx.core as mx
 import pytest
 
 import mlx_kquant as kq
 from mlx_kquant.cli import _build_parser, main
+from mlx_kquant.codec_geometry import bytes_per_row
 
+# The e2e test does a GPU-only kquant encode - skip without a real GPU or under
+# forced-CPU (the encoder has no CPU path).
 gpu = pytest.mark.skipif(
-    not kq.metallib_loads(), reason="kquant encode is GPU-only (no Metal GPU)"
+    not kq.metallib_loads() or bool(os.environ.get("KQUANT_FORCE_CPU")),
+    reason="kquant encode is GPU-only (no Metal GPU / forced CPU)",
 )
 
 
@@ -28,7 +36,9 @@ def test_no_command_errors():
     assert e.value.code == 2
 
 
-@pytest.mark.parametrize("cmd", ["quantize", "calibrate-imatrix", "verify", "run"])
+@pytest.mark.parametrize(
+    "cmd", ["quantize", "calibrate-imatrix", "verify", "run", "fuse", "inspect"]
+)
 def test_subcommand_help_exits_zero(cmd):
     with pytest.raises(SystemExit) as e:
         _build_parser().parse_args([cmd, "--help"])
@@ -73,12 +83,69 @@ def test_verify_requires_a_target():
 
 
 def test_verify_codecs_runs():
-    # No [tools], no GPU dispatch — lists codecs + metallib status.
+    # No [tools], no GPU dispatch - lists codecs + metallib status.
     assert main(["verify", "--codecs"]) == 0
 
 
 def test_verify_presets_runs():
     assert main(["verify", "--presets"]) == 0
+
+
+def _fake_kquant_checkpoint(d, codec="q8_0", path="model.layers.0.mlp.down_proj"):
+    """Write a minimal kquant checkpoint inspect can read: a config with a
+    per-tensor map plus a uint8 ``<path>.weight`` of the right packed shape. No
+    GPU, no real encode - inspect only reads the config + safetensors headers."""
+    d.mkdir(parents=True, exist_ok=True)
+    out_dims, in_dims = 4, 32
+    row = bytes_per_row(codec, in_dims)
+    wire = mx.zeros((out_dims, row), dtype=mx.uint8)
+    mx.save_safetensors(str(d / "model.safetensors"), {f"{path}.weight": wire})
+    cfg = {
+        "model_type": "llama",
+        "num_hidden_layers": 1,
+        "quantization": {"mode": "kquant", "per_tensor": {path: codec}},
+    }
+    (d / "config.json").write_text(json.dumps(cfg))
+    return d, out_dims, in_dims
+
+
+def test_inspect_parses_ok():
+    args = _build_parser().parse_args(["inspect", "--model", "m"])
+    assert args.command == "inspect"
+    assert args.as_json is False
+    assert callable(args.func)
+
+
+def test_inspect_reads_kquant_checkpoint(tmp_path, capsys):
+    d, _, in_dims = _fake_kquant_checkpoint(tmp_path / "ckpt")
+    assert main(["inspect", "--model", str(d)]) == 0
+    out = capsys.readouterr().out
+    assert "quantized tensors=1" in out
+    assert "q8_0" in out
+    assert "down_proj" in out
+    # logical shape recovers the in-features from the packed wire width.
+    assert str(in_dims) in out
+
+
+def test_inspect_json(tmp_path, capsys):
+    d, out_dims, in_dims = _fake_kquant_checkpoint(tmp_path / "ckpt")
+    assert main(["inspect", "--model", str(d), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["num_quantized"] == 1
+    assert payload["codec_histogram"] == {"q8_0": 1}
+    (tensor,) = payload["tensors"]
+    assert tensor["codec"] == "q8_0"
+    assert tensor["kind"] == "linear"
+    assert tensor["path"].endswith("down_proj")
+    assert tensor["logical_shape"] == [out_dims, in_dims]
+
+
+def test_inspect_rejects_non_kquant(tmp_path, capsys):
+    d = tmp_path / "plain"
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    assert main(["inspect", "--model", str(d)]) == 1
+    assert "not a kquant checkpoint" in capsys.readouterr().err
 
 
 @gpu

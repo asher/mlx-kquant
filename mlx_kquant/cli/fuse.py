@@ -1,13 +1,15 @@
-"""``mlx-kquant fuse`` — merge a trained LoRA adapter into a kquant checkpoint.
+"""``mlx-kquant fuse`` - merge a trained LoRA adapter into a kquant checkpoint.
 
 Two output modes:
 
-* default (**keep-kquant**) — each adapted weight is decoded, the low-rank delta
+* default (**keep-kquant**) - each adapted weight is decoded, the low-rank delta
   is added, and the merged weight is **re-encoded with that tensor's own codec**
   (read off the base layer, not a recipe), so the result is a kquant checkpoint
   byte-compatible with the original. Re-encoding is GPU-only until the v0.2.0 CPU
-  encoder, and adds a small per-codec re-quant rounding error.
-* ``--dequantize`` — writes a **float** checkpoint: adapted layers fuse to float
+  encoder, and adds a small per-codec re-quant rounding error. Pass ``--imatrix``
+  (the same one used to quantize the base) to steer that re-encode so the merge
+  preserves the base's calibration instead of rounding the adapted tensors blind.
+* ``--dequantize`` - writes a **float** checkpoint: adapted layers fuse to float
   and the remaining (non-adapted) kquant layers are decoded too, so the whole
   model is float. No re-quant error; loads with stock ``mlx_lm.load``; runs
   without a GPU (decode has a CPU path).
@@ -28,7 +30,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="merge a trained LoRA adapter back into a kquant checkpoint",
         description="Fuse LoRA adapter weights into a kquant base. By default the "
         "result stays kquant (merged weights re-encoded with each tensor's "
-        "original codec — GPU-only); --dequantize writes a float checkpoint "
+        "original codec - GPU-only); --dequantize writes a float checkpoint "
         "instead (runs without a GPU, no re-quant error).",
     )
     p.add_argument(
@@ -51,6 +53,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Write a float (dequantized) checkpoint instead of re-encoding to "
         "kquant. Loads with stock mlx_lm.load and needs no GPU.",
+    )
+    p.add_argument(
+        "--imatrix",
+        help="Importance matrix (.dat / .gguf) to steer the keep-kquant re-encode. "
+        "Pass the same imatrix the base was quantized with so the merge preserves "
+        "that calibration. Ignored with --dequantize (no re-encode happens).",
     )
     p.add_argument(
         "--trust-remote-code",
@@ -79,14 +87,18 @@ def cmd(args: argparse.Namespace) -> int:
     model, config = load(args.model, trust_remote_code=args.trust_remote_code)
     load_adapters(model, args.adapter_path)
 
+    imatrix_by_path = _resolve_imatrix(args, model, config)
     fused = [
-        (name, module.fuse(dequantize=args.dequantize))
+        (
+            name,
+            module.fuse(dequantize=args.dequantize, imatrix=imatrix_by_path.get(name)),
+        )
         for name, module in model.named_modules()
         if hasattr(module, "fuse")
     ]
     if not fused:
         raise ValueError(
-            f"{args.adapter_path}: no fusable LoRA layers on the base — is "
+            f"{args.adapter_path}: no fusable LoRA layers on the base - is "
             f"{args.model} a kquant checkpoint with a matching adapter?"
         )
     model.update_modules(tree_unflatten(fused))
@@ -108,6 +120,30 @@ def cmd(args: argparse.Namespace) -> int:
         f"-> {args.save_path} ({mode})"
     )
     return 0
+
+
+def _resolve_imatrix(args, model, config) -> dict:
+    """Map ``--imatrix`` onto the fusable module paths (keep-kquant only).
+
+    Returns ``{module_path: importance_vector}`` for the adapted (fusable) layers.
+    Only those layers are re-encoded, so only they consult the imatrix; the
+    untouched kquant base keeps its original bytes. Empty when no imatrix is given,
+    under ``--dequantize`` (nothing is re-encoded), or when nothing resolves.
+    """
+    if not args.imatrix:
+        return {}
+    if args.dequantize:
+        print("[mlx-kquant] note: --imatrix ignored with --dequantize (no re-encode)")
+        return {}
+
+    from ..imatrix import load_imatrix, map_imatrix_to_hf
+
+    raw = load_imatrix(args.imatrix)
+    fusable = [name for name, m in model.named_modules() if hasattr(m, "fuse")]
+    arch = (config.get("architectures") or [None])[0]
+    mapped = map_imatrix_to_hf(raw, fusable, arch)
+    print(f"[mlx-kquant] imatrix coverage: {len(mapped)}/{len(fusable)} fused tensors")
+    return mapped
 
 
 def _dequantize_remaining(model) -> int:

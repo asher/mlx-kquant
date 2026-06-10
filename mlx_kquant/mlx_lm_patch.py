@@ -1,17 +1,17 @@
-"""Teach stock mlx-lm to understand kquant — across load, adapt, and fuse.
+"""Teach stock mlx-lm to understand kquant - across load, adapt, and fuse.
 
 mlx-lm's loader and LoRA / fuse machinery recognise its own affine
 ``QuantizedLinear`` family but not the kquant modules in :mod:`mlx_kquant.nn`.
 This module closes that gap by monkeypatching mlx-lm at stable entry points,
 behind two idempotent calls:
 
-:func:`patch_mlx_lm_load` — the **load** seam (enough for inference / eval / a
+:func:`patch_mlx_lm_load` - the **load** seam (enough for inference / eval / a
 server). It makes ``mlx_lm.utils.load_model`` kquant-aware, so anything built on
-it — ``mlx_lm.load`` and the ``mlx_lm.lora`` / ``mlx_lm.fuse`` / ``mlx_lm.generate``
-CLIs — can open a kquant checkpoint (stock ``load_model`` routes the config into
+it - ``mlx_lm.load`` and the ``mlx_lm.lora`` / ``mlx_lm.fuse`` / ``mlx_lm.generate``
+CLIs - can open a kquant checkpoint (stock ``load_model`` routes the config into
 ``nn.quantize`` and fails). A non-kquant checkpoint falls through unchanged.
 
-:func:`patch_mlx_lm_lora` — the **adapt + fuse** seam (calls the load seam for
+:func:`patch_mlx_lm_lora` - the **adapt + fuse** seam (calls the load seam for
 you first), in two further ways:
 
 * it gives ``KQuantLinear`` / ``KQuantSwitchLinear`` / ``KQuantEmbedding`` a
@@ -21,8 +21,9 @@ you first), in two further ways:
   wire-byte geometry (the kquant modules store only the packed row width).
 * it replaces the ``LoRA*.fuse`` methods so fusing a trained adapter into a
   kquant base dequantizes through ``kq.dequantize`` and, when the quant format is
-  kept, re-encodes the merged weight through ``kq.quantize``. A non-kquant base
-  falls through to the original implementation unchanged.
+  kept, re-encodes the merged weight through ``kq.quantize`` (optionally steered by
+  an importance matrix, so the merge can preserve the base's calibration). A
+  non-kquant base falls through to the original implementation unchanged.
 
 Call the relevant one once, before loading / building LoRA layers / loading
 adapters; both are idempotent. Training a kquant LoRA also relies on the
@@ -140,9 +141,25 @@ def _embedding_to_lora(self, r, scale, dropout):
 # dequantize=True  -> a float layer (loads anywhere; re-bloats to the float size)
 # dequantize=False -> stays kquant by re-encoding the merged weight (GPU-only
 #                     until the v0.2.0 CPU encoder; adds a small re-quant error).
+#
+# imatrix: an optional per-input-feature importance vector (keep-kquant only). The
+# re-encode otherwise rounds uncalibrated, so pass the same imatrix the base was
+# quantized with to preserve that calibration through the merge.
 
 
-def _linear_fuse(self, dequantize: bool = False):
+def _imatrix_arg(imatrix, in_dims: int):
+    """The importance vector as a float32 ``mx.array``, or ``None`` if unusable.
+
+    A vector whose length does not match the row width is ignored rather than
+    raising, mirroring the encode driver - a partial-coverage imatrix simply
+    leaves the unmatched tensors uncalibrated.
+    """
+    if imatrix is None or getattr(imatrix, "shape", None) != (in_dims,):
+        return None
+    return mx.array(imatrix, dtype=mx.float32)
+
+
+def _linear_fuse(self, dequantize: bool = False, imatrix=None):
     base = self.linear
     if not isinstance(base, KQuantLinear):
         return _orig_fuse["linear"](self, dequantize=dequantize)
@@ -160,7 +177,11 @@ def _linear_fuse(self, dequantize: bool = False):
             fused.bias = base.bias
         return fused
 
-    wire, scales = kq.quantize(merged.astype(mx.float32), base.kquant_type)
+    wire, scales = kq.quantize(
+        merged.astype(mx.float32),
+        base.kquant_type,
+        imatrix=_imatrix_arg(imatrix, in_dims),
+    )
     fused = KQuantLinear(in_dims, out_dims, bias, base.kquant_type)
     fused.weight = wire
     fused.scales = scales
@@ -169,7 +190,7 @@ def _linear_fuse(self, dequantize: bool = False):
     return fused
 
 
-def _switch_fuse(self, dequantize: bool = False):
+def _switch_fuse(self, dequantize: bool = False, imatrix=None):
     base = self.linear
     if not isinstance(base, KQuantSwitchLinear):
         return _orig_fuse["switch"](self, dequantize=dequantize)
@@ -194,9 +215,11 @@ def _switch_fuse(self, dequantize: bool = False):
             fused.bias = base.bias
         return fused
 
+    # The importance vector is per-input-feature, so it applies to every expert.
     wire, scales = kq.quantize(
         merged.reshape(num_experts * out_dims, in_dims).astype(mx.float32),
         base.kquant_type,
+        imatrix=_imatrix_arg(imatrix, in_dims),
     )
     fused = KQuantSwitchLinear(num_experts, out_dims, in_dims, bias, base.kquant_type)
     fused.weight = wire.reshape(num_experts, out_dims, row_bytes)
@@ -206,7 +229,7 @@ def _switch_fuse(self, dequantize: bool = False):
     return fused
 
 
-def _embedding_fuse(self, dequantize: bool = False):
+def _embedding_fuse(self, dequantize: bool = False, imatrix=None):
     base = self.embedding
     if not isinstance(base, KQuantEmbedding):
         return _orig_fuse["embedding"](self, dequantize=dequantize)
@@ -220,7 +243,11 @@ def _embedding_fuse(self, dequantize: bool = False):
         fused.weight = merged
         return fused
 
-    wire, scales = kq.quantize(merged.astype(mx.float32), base.kquant_type)
+    wire, scales = kq.quantize(
+        merged.astype(mx.float32),
+        base.kquant_type,
+        imatrix=_imatrix_arg(imatrix, dims),
+    )
     fused = KQuantEmbedding(num_embeddings, dims, base.kquant_type)
     fused.weight = wire
     fused.scales = scales
@@ -231,7 +258,7 @@ def patch_mlx_lm_load() -> None:
     """Make stock ``mlx_lm.load`` / ``load_model`` open a kquant checkpoint.
 
     Routes a kquant config through :func:`mlx_kquant.loader.load` and leaves every
-    other checkpoint untouched. This is the *inference* seam — enough for a serving
+    other checkpoint untouched. This is the *inference* seam - enough for a serving
     or eval consumer that never trains or fuses. Idempotent; called for you by
     :func:`patch_mlx_lm_lora`.
     """

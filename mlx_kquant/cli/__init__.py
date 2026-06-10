@@ -9,12 +9,13 @@ and as ``python -m mlx_kquant``. Subcommands:
   fuse               merge a trained LoRA adapter into a kquant checkpoint
   verify             smoke-check the codecs / presets, or a built checkpoint
   run                load a checkpoint and generate a few tokens
+  inspect            print a checkpoint's per-tensor codec recipe (no GPU)
 
 The model-level subcommands need the ``[tools]`` extra (mlx-lm); a missing extra
 surfaces as one clear message via :func:`mlx_kquant._deps.require_tools` rather
 than a raw ``ImportError``. The subcommand modules keep their heavy imports
-(``mlx_lm``, ``numpy``) inside ``cmd`` so the dispatcher itself — and
-``verify --codecs`` — work on a base install.
+(``mlx_lm``, ``numpy``) inside ``cmd`` so the dispatcher itself - and
+``verify --codecs`` / ``inspect`` - work on a base install.
 """
 
 from __future__ import annotations
@@ -23,9 +24,9 @@ import argparse
 import sys
 
 from .. import __version__
-from . import calibrate, fuse, lora, quantize, run, verify
+from . import calibrate, fuse, inspect, lora, quantize, run, verify
 
-_SUBCOMMANDS = (quantize, calibrate, lora, fuse, verify, run)
+_SUBCOMMANDS = (quantize, calibrate, lora, fuse, verify, run, inspect)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -44,7 +45,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     raw = sys.argv[1:] if argv is None else list(argv)
-    # `lora` is a pass-through to mlx-lm's trainer — intercept it before argparse
+    # `lora` is a pass-through to mlx-lm's trainer - intercept it before argparse
     # so every mlx-lm flag (including --help) reaches it untouched (REMAINDER
     # can't capture a leading option).
     if raw and raw[0] == "lora":
