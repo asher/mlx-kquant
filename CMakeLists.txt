@@ -3,7 +3,11 @@ cmake_minimum_required(VERSION 3.27)
 project(mlx_kquant LANGUAGES CXX C)
 
 # ----------------------------- Setup -----------------------------
-set(CMAKE_CXX_STANDARD 17)
+# C++20: MLX 0.31.2's public headers (device.h, stream.h) use defaulted
+# comparison operators, a C++20 feature. Apple Clang accepts them as an
+# extension under -std=c++17, but GCC (the Linux toolchain) rejects them, so a
+# C++17 standard breaks the Metal-free Linux build. 20 builds cleanly on both.
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
@@ -63,15 +67,26 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(gguflib)
 add_library(gguflib STATIC ${gguflib_SOURCE_DIR}/fp16.c
                            ${gguflib_SOURCE_DIR}/gguflib.c)
-# Hidden visibility so the gguf_* symbols stay LOCAL to whichever image
-# force-loads them (below) and never interpose / collide at runtime with the
-# identically-named gguf_* symbols that libmlx.dylib also exports.
+# Hidden visibility so the gguf_* symbols stay LOCAL to whichever image links
+# them whole-archive (below) and never interpose / collide at runtime with the
+# identically-named gguf_* symbols that libmlx also exports.
 set_target_properties(gguflib PROPERTIES POSITION_INDEPENDENT_CODE ON
                                          C_VISIBILITY_PRESET hidden)
 # gguflib uses assert() to reject malformed tensor headers (e.g. ndim > 8).
 # -DNDEBUG (release builds) would compile those out, leaving out-of-bounds
 # reads/writes unguarded when loading untrusted GGUF files. Force NDEBUG off.
 target_compile_options(gguflib PRIVATE -UNDEBUG)
+
+# Whole-archive flag for the patched gguflib (used on both linking images below):
+# pull all its (hidden) gguf_* objects into the image so they win over libmlx's
+# exported copy. Apple ld spells this -force_load; GNU ld / lld use the
+# --whole-archive / --no-whole-archive bracket.
+if(APPLE)
+  set(KQ_WHOLE_ARCHIVE_GGUFLIB "-Wl,-force_load,$<TARGET_FILE:gguflib>")
+else()
+  set(KQ_WHOLE_ARCHIVE_GGUFLIB
+      "-Wl,--whole-archive,$<TARGET_FILE:gguflib>,--no-whole-archive")
+endif()
 
 # ----------------------------- C++ library -----------------------------
 add_library(mlx_kquant_ext)
@@ -94,16 +109,15 @@ target_include_directories(mlx_kquant_ext PUBLIC ${CMAKE_CURRENT_LIST_DIR}/src)
 # needs gguflib.h on its include path and the gguf_* symbols at link time.
 target_include_directories(mlx_kquant_ext PUBLIC ${gguflib_SOURCE_DIR})
 target_link_libraries(mlx_kquant_ext PUBLIC mlx)
-# libmlx.dylib bundles its OWN (older) gguflib and exports its gguf_* symbols
-# globally. A plain link binds our gguf_get_tensor()/gguf_open() calls to MLX's
-# copy, whose GGUF_TYPE_COUNT predates the MXFP4/NVFP4 float codecs - so a tensor
-# of type >= 31 trips its `>= GGUF_TYPE_COUNT` guard and the tensor list silently
-# truncates at the first such tensor. force_load pulls OUR patched gguflib
-# objects into this image as (hidden) definitions, so every gguf_* call resolves
-# in-image (two-level namespace) to the patched parser instead of to libmlx.
+# libmlx bundles its OWN (older) gguflib and exports its gguf_* symbols. A plain
+# link can bind our gguf_get_tensor()/gguf_open() calls to MLX's copy, whose
+# GGUF_TYPE_COUNT predates the MXFP4/NVFP4 float codecs - so a tensor of type
+# >= 31 trips its `>= GGUF_TYPE_COUNT` guard and the tensor list silently
+# truncates at the first such tensor. Linking our patched gguflib whole-archive
+# pulls its objects into this image as hidden-visibility definitions, so every
+# gguf_* call resolves in-image to the patched parser instead of to libmlx.
 target_link_libraries(mlx_kquant_ext PUBLIC gguflib)
-target_link_options(mlx_kquant_ext PRIVATE
-                    "-Wl,-force_load,$<TARGET_FILE:gguflib>")
+target_link_options(mlx_kquant_ext PRIVATE ${KQ_WHOLE_ARCHIVE_GGUFLIB})
 
 # ----------------------------- Metal library -----------------------------
 # The kq_* kernels compiled into a single mlx_kquant.metallib.
@@ -145,19 +159,25 @@ target_link_libraries(_ext PRIVATE mlx_kquant_ext)
 # patched gguflib here too so they don't fall back to libmlx's exported copy
 # (see the mlx_kquant_ext force_load note for the full rationale).
 target_link_libraries(_ext PRIVATE gguflib)
-target_link_options(_ext PRIVATE
-                    "-Wl,-force_load,$<TARGET_FILE:gguflib>")
+target_link_options(_ext PRIVATE ${KQ_WHOLE_ARCHIVE_GGUFLIB})
 
 if(BUILD_SHARED_LIBS)
-  # @loader_path finds the co-located libmlx_kquant_ext.dylib (same package dir).
-  target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path)
   if(APPLE)
-    # Portable-wheel rpath: resolve @rpath/libmlx.dylib against the *user's*
+    # @loader_path finds the co-located libmlx_kquant_ext.dylib (same package
+    # dir); the second rpath resolves @rpath/libmlx.dylib against the *user's*
     # installed mlx wheel at runtime. _ext.so lives in site-packages/mlx_kquant/,
     # libmlx in site-packages/mlx/lib/, so ../mlx/lib reaches it. (The absolute
     # build-tree rpath MLXConfig adds works only on the build machine; this is
     # what makes a redistributed wheel find the ABI-pinned mlx==0.31.2. delocate
     # must therefore *exclude* libmlx from vendoring - see [tool.cibuildwheel].)
+    target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path)
     target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path/../mlx/lib)
+  else()
+    # ELF equivalent of @loader_path: $ORIGIN is the dir of _ext.so. The
+    # co-located libmlx_kquant_ext.so sits beside it; ../mlx/lib reaches the
+    # user's installed mlx wheel's libmlx.so (auditwheel must *exclude* libmlx.so
+    # from vendoring, mirroring the macOS delocate exclude).
+    target_link_options(_ext PRIVATE "-Wl,-rpath,\$ORIGIN")
+    target_link_options(_ext PRIVATE "-Wl,-rpath,\$ORIGIN/../mlx/lib")
   endif()
 endif()

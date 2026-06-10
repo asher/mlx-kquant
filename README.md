@@ -28,14 +28,26 @@ single-pass NAX matmul) - see [Performance](#performance).
 
 ## Install
 
-Requires **macOS on Apple Silicon**, the Metal toolchain (`xcrun metal`), and the exact pinned MLX
-wheel:
+**macOS on Apple Silicon** (the GPU path), with the Metal toolchain (`xcrun metal`) and the exact
+pinned MLX wheel:
 
 ```sh
-pip install "mlx==0.31.2"     # pinned, ABI-matched stock wheel
+pip install "mlx==0.31.2"     # pinned, ABI-matched stock wheel (pulls the Metal backend)
 pip install -e .              # builds _ext + mlx_kquant.metallib
 pip install -e ".[tools]"     # + mlx-lm, for the quantize / run / lora / fuse CLI
 ```
+
+**Linux (CPU-only)** also builds, with no Metal toolchain - every op runs through its scalar
+`eval_cpu` path and no metallib is produced. The base `mlx` wheel ships no backend on Linux, so
+install the CPU one explicitly:
+
+```sh
+pip install "mlx[cpu]==0.31.2"   # base frontend + libmlx CPU backend
+pip install -e . --no-build-isolation
+```
+
+CPU is for portability and CI, not throughput. Running a full model forward on Linux also needs
+`MLX_DISABLE_COMPILE=1` - see [Limitations](#limitations).
 
 Smoke-test the toolchain:
 
@@ -246,8 +258,10 @@ python -m pytest tests/      # dequant / matmul / gather / codecs / cpu_decode /
 
 ## Requirements
 
-- **macOS on Apple Silicon** (M-series) with a working Metal toolchain (`xcrun metal`) for a
+- **macOS on Apple Silicon** (M-series) with a working Metal toolchain (`xcrun metal`) for the GPU
   build-from-source install. Prebuilt wheels (when published) need only the runtime GPU.
+- **Linux** (x86_64 or aarch64) is supported CPU-only: build against `mlx[cpu]==0.31.2`, no Metal
+  toolchain required. See [Install](#install) and [Limitations](#limitations).
 - **Python >= 3.10** (the pinned `mlx==0.31.2` ships no cp39 wheel).
 - **`mlx==0.31.2`** exactly - the kernels include MLX's steel headers and the extension links
   `libmlx`, so the ABI is version-locked (see [Version pinning](#version-pinning)).
@@ -255,19 +269,20 @@ python -m pytest tests/      # dequant / matmul / gather / codecs / cpu_decode /
 ## Limitations
 
 - **Decode and encode both run on CPU or Metal.** `dequantize` / `quantized_matmul` / `gather_qmm`
-  and `quantize` all have a scalar CPU path (`stream=mx.cpu`) covering every codec. The build still
-  needs the Metal toolchain (the extension links `libmlx` and bundles a metallib); a Metal-free Linux
-  build - which the CPU paths unblock - is on the roadmap. No NVIDIA/AMD-GPU support.
+  and `quantize` all have a scalar CPU path (`stream=mx.cpu`) covering every codec, so the extension
+  builds and its full op / encode / decode / LoRA suite passes on Linux with no Metal toolchain (see
+  [Install](#install)). CPU is for portability, not throughput; the GPU path is Apple-Silicon Metal.
+  No NVIDIA/AMD-GPU support.
+- **Linux model forwards need `MLX_DISABLE_COMPILE=1`.** Stock MLX's CPU compile JIT generates C++
+  that redeclares GCC's built-in `_Float32`/`_Float64`/`_Float128` types, which `g++` rejects, so any
+  model forward through MLX's compile path fails on Linux+GCC. Disabling the JIT runs those graphs
+  eagerly with identical numerics. This is an upstream MLX-on-Linux limitation independent of
+  mlx-kquant - the `kq.*` ops have their own `eval_cpu` and never touch the JIT.
 - The library is the **op layer**, not a model runtime. To load and run full GGUF models, use the
   separate [`gguf-mlx`](#running-gguf-files--gguf-mlx) package.
 - **LoRA, not DoRA.** LoRA adapters train, attach, and fuse on a kquant base (see
   [docs/lora.md](docs/lora.md)); DoRA is not supported. `fuse` re-encodes to kquant or, with
   `--dequantize`, to float; both modes run on CPU or Metal.
-
-## Roadmap
-
-- A Metal-free **Linux** build (CPU train/infer), contingent on the mlx Linux wheel exercising the
-  CPU eval paths. The scalar CPU encode/decode paths are in place; this is the remaining piece.
 
 ## License
 

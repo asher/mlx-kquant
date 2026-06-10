@@ -39,11 +39,18 @@ toolchain that runs on a stock `mlx==0.31.2` wheel.
 - CPU encode path for all 10 codecs (`stream=mx.cpu`) for `quantize`, a port of
   the Metal encoders (flat codecs + `q6_k` byte-identical across streams), so the
   full quantize pipeline and the encode tests run without a GPU.
-- PEP 621 packaging, `py.typed`, ruff config, CI (lint + build + honest GPU-gated
-  op tests), and a tag-triggered wheel-publish workflow.
+- Metal-free **Linux (CPU-only) build**: the extension compiles against
+  `mlx[cpu]==0.31.2` with no Metal toolchain (every op's `eval_gpu` is behind
+  `#ifdef _METAL_`), and the full op / encode / decode / LoRA / loader / CLI
+  suite passes on x86_64 and aarch64 Linux. Validated in CI and a
+  `Dockerfile.linux-test`.
+- PEP 621 packaging, `py.typed`, ruff config, CI (lint + macOS build with honest
+  GPU-gated op tests + Linux CPU build), and a tag-triggered wheel-publish
+  workflow.
 
 ### Notes
 - `requires-python >= 3.10` (mlx 0.31.2 ships no cp39 wheel).
-- macOS on Apple Silicon. Linux (CPU-only train/infer) is a contingent follow-up
-  (the scalar CPU encode/decode paths are in place; a Metal-free build is the
-  remaining piece).
+- The GPU path is macOS on Apple Silicon (Metal). Linux is supported CPU-only -
+  build against `mlx[cpu]==0.31.2`; model forwards there also need
+  `MLX_DISABLE_COMPILE=1` (an upstream MLX CPU-JIT limitation under GCC, not
+  mlx-kquant).

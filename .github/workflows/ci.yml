@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.12"
       # Pin ruff so CI, pre-commit (.pre-commit-config.yaml), and dev installs
-      # all format/lint identically — an unpinned ruff can change format rules
+      # all format/lint identically - an unpinned ruff can change format rules
       # between releases and turn `ruff format --check` red without a code change.
       - run: pip install ruff==0.15.16 clang-format==19.1.5
       - name: ruff check
@@ -56,7 +56,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # The extension is a Metal C++ module — it compiles on macOS arm64 with
+      # The extension is a Metal C++ module - it compiles on macOS arm64 with
       # the Xcode toolchain (no GPU needed to *build*). Pinned mlx wheel: the
       # kernels include MLX's steel headers and link libmlx, so the ABI must
       # match exactly.
@@ -74,14 +74,14 @@ jobs:
 
       # Pure-logic recipe tests: need the built extension to `import mlx_kquant`
       # (recipes.py pulls in codec_geometry through the package) but dispatch no
-      # ops, so they run unconditionally — no GPU required.
+      # ops, so they run unconditionally - no GPU required.
       - name: Recipe tests (CPU, no GPU)
         run: pytest -q tests/test_recipes.py
 
       # Honest-badge discipline: every op is GPU-only until the CPU decode path
       # (Phase F) lands, and hosted runners may not expose a usable Metal GPU.
       # So probe for one: run the op tests iff a GPU is actually present, and
-      # skip *honestly* (with a warning) otherwise — never silently green.
+      # skip *honestly* (with a warning) otherwise - never silently green.
       # Set KQUANT_EXPECT_GPU=1 on a self-hosted Apple-Silicon runner to make a
       # broken metallib fail red instead of skipping.
       - name: Detect Metal GPU
@@ -115,15 +115,15 @@ jobs:
         run: |
           echo "::warning title=GPU-only tests skipped::No usable Metal GPU on this runner. Numeric op coverage still runs on CPU (the KQUANT_FORCE_CPU step below, all 10 codecs); only the GPU-only encode + model round-trips are skipped here."
 
-      # CPU decode-path op tests — unconditional, no GPU needed (the scalar CPU
-      # eval paths). This is the enforced numeric gate on hosted runners: all 10
-      # codecs through dequantize / quantized_matmul / gather_qmm, the nn layers,
-      # the GGUF wire-byte reader, the training vjp (its re-dispatch resolves on
-      # CPU too), and the LoRA apply/fuse-to-float/train path. KQUANT_FORCE_CPU=1
-      # makes conftest set the default device to CPU; the GPU-only legs (re-encode
-      # to kquant, end-to-end fuse) skip honestly. Encode stays GPU-only
-      # (test_encode + the loader/cli round-trips) until the v0.2.0 CPU encoder.
-      - name: CPU op tests (KQUANT_FORCE_CPU)
+      # CPU op + encode tests - unconditional, no GPU needed: every op, including
+      # the encoder, has a scalar CPU eval path. This is the enforced numeric gate
+      # on hosted runners: all 10 codecs through dequantize / quantized_matmul /
+      # gather_qmm / quantize, the nn layers, the GGUF wire-byte reader, the
+      # training vjp (its re-dispatch resolves on CPU too), the encode
+      # round-trips, the loader + CLI round-trips, and the LoRA apply/fuse/train
+      # path. KQUANT_FORCE_CPU=1 makes conftest set the default device to CPU; the
+      # few CPU-vs-GPU A/B byte-exactness checks skip honestly without a GPU.
+      - name: CPU op + encode tests (KQUANT_FORCE_CPU)
         env:
           KQUANT_FORCE_CPU: "1"
         run: >-
@@ -134,5 +134,64 @@ jobs:
           tests/test_nn.py
           tests/test_gguf.py
           tests/test_vjp.py
+          tests/test_encode.py
+          tests/test_loader.py
+          tests/test_cli.py
           tests/test_lora_patch.py
           tests/test_fuse_cli.py
+
+  build-and-test-linux:
+    name: build + tests (linux, no Metal)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The Metal-free build. Every op's eval_gpu is behind #ifdef _METAL_
+      # (-D_METAL_ is attached only by the macOS mlx build's MLXConfig), so on
+      # Linux they compile to throwing stubs and all numerics run through the
+      # scalar eval_cpu paths. This proves mlx-kquant builds and its CPU suite
+      # passes against the stock Linux mlx==0.31.2 wheel with no Apple toolchain.
+      #
+      # mlx[cpu]: the base `mlx` wheel does not bundle libmlx.so (core.so has it
+      # as NEEDED); the backend ships separately. macOS auto-pulls mlx-metal, but
+      # Linux has no default backend, so install the CPU one (mlx[cpu] ->
+      # mlx-cpu) to get libmlx.so at mlx/lib/. setuptools/wheel are pre-installed
+      # because the editable install runs --no-build-isolation. One Python
+      # version suffices: nanobind builds a STABLE_ABI (abi3) module, and the
+      # macOS job already covers the Python matrix.
+      - name: Build extension (CPU-only) + test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install "setuptools>=77" wheel "mlx[cpu]==0.31.2" "nanobind==2.12.0" "cmake>=3.27" gguf numpy pytest "mlx-lm>=0.27"
+          pip install -e . --no-build-isolation
+
+      # A non-Metal build must report no metallib (and not throw doing so).
+      - name: No metallib on a non-Metal build
+        run: |
+          python - <<'PY'
+          import mlx_kquant as kq
+          assert kq.metallib_loads() is False, "metallib unexpectedly loaded on a non-Metal build"
+          print("metallib_loads() == False (expected on Linux)")
+          PY
+
+      - name: Codec lint (incl. runtime kq.codecs() leg)
+        run: python scripts/check-codecs.py --check
+
+      # Full suite. No Metal GPU here, so the CPU-vs-GPU A/B checks skip via
+      # kq.metallib_loads()==False and the asset-gated KQUANT_TEST_* tests skip
+      # without their assets; everything else runs on the CPU paths.
+      #
+      # MLX_DISABLE_COMPILE: stock MLX's CPU compile JIT emits generated C++ that
+      # redeclares GCC's built-in _Float32/_Float64/_Float128 types, which g++
+      # rejects - so model forwards through MLX's compile path (the loader / CLI /
+      # fuse round-trips) fail on Linux+GCC. Disabling the JIT runs them eagerly
+      # with identical numerics. Upstream MLX-on-Linux limitation, independent of
+      # mlx-kquant (our kq.* ops have their own eval_cpu and never touch the JIT).
+      - name: CPU suite (KQUANT_FORCE_CPU)
+        env:
+          KQUANT_FORCE_CPU: "1"
+          MLX_DISABLE_COMPILE: "1"
+        run: pytest -q tests/

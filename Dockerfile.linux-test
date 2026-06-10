@@ -1,0 +1,56 @@
+# Metal-free Linux build of mlx-kquant, proven before it reaches CI.
+#
+# Builds the extension against the stock Linux mlx==0.31.2 wheel (CPU-only: no
+# Metal, no metallib) and runs the CPU op + encode + decode + loader/fuse/lora
+# suite. The GPU CPU-vs-GPU A/B tests gate on kq.metallib_loads() and skip
+# cleanly here.
+#
+#   docker build -f Dockerfile.linux-test -t mlx-kquant-linux .
+#
+# Host is arm64, and mlx ships a manylinux_2_35_aarch64 wheel, so this builds
+# natively (fast). Add --platform=linux/amd64 to cross-check x86_64.
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+# Build deps mirror [build-system].requires (setuptools/wheel must be present up
+# front because the editable install below runs --no-build-isolation); the rest
+# are runtime/test deps mirroring [dev]. python:*-slim ships no setuptools.
+#
+# mlx[cpu]: the base `mlx` wheel is a thin frontend whose core.so has NEEDED
+# libmlx.so but does NOT bundle it - the backend ships separately. On Darwin the
+# base wheel auto-pulls mlx-metal; on Linux there is no default backend, so we
+# opt into the CPU one (mlx[cpu] -> mlx-cpu==0.31.2), which provides libmlx.so at
+# mlx/lib/ (the same relative location as macOS). Without it `import mlx.core`
+# fails and `python -m mlx --cmake-dir` cannot run.
+RUN pip install --no-cache-dir \
+        "setuptools>=77" wheel \
+        "mlx[cpu]==0.31.2" "nanobind==2.12.0" "cmake>=3.27" \
+        numpy gguf pytest "mlx-lm>=0.27"
+
+# Editable build against the installed Linux mlx wheel (no Metal toolchain).
+RUN pip install -e . --no-build-isolation
+
+# Sanity: import works and the non-Metal build reports no metallib (no throw).
+RUN python -c "import mlx_kquant as kq; print('metallib_loads:', kq.metallib_loads())"
+
+# rpath sanity: confirm the $ORIGIN ELF rpath survived CMake's escaping.
+RUN readelf -d "$(python -c 'import mlx_kquant._ext as e; print(e.__file__)')" \
+        | grep -E 'RUNPATH|RPATH' || true
+
+# The full CPU-runnable suite. GPU A/B tests skip via kq.metallib_loads()==False.
+#
+# MLX_DISABLE_COMPILE: stock MLX's CPU compile JIT emits generated C++ that
+# redeclares GCC's built-in _Float32/_Float64/_Float128 types, which g++ rejects
+# - so any model forward through MLX's compile path (the loader / CLI / fuse
+# round-trips that run a real mlx-lm model) fails on Linux+GCC. Disabling the JIT
+# runs those graphs eagerly with identical numerics. This is an upstream
+# MLX-on-Linux limitation, independent of mlx-kquant (our kq.* ops have their own
+# eval_cpu and never touch the JIT); a Linux CPU user running forwards needs the
+# same flag.
+RUN KQUANT_FORCE_CPU=1 MLX_DISABLE_COMPILE=1 python -m pytest -q tests/

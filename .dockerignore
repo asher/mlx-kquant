@@ -1,0 +1,22 @@
+# Keep the Docker build context lean: ship only sources the Linux build needs.
+# (gguflib is git-cloned by FetchContent at configure time, so the repo's own
+# .git history is unnecessary in the image.)
+.git/
+build/
+dist/
+*.egg-info/
+**/__pycache__/
+*.so
+*.dylib
+*.metallib
+*.air
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.idea/
+.vscode/
