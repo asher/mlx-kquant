@@ -33,7 +33,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def passthrough(rest: list[str]) -> int:
-    """Apply the kquant patch and delegate ``rest`` to ``mlx_lm.lora``."""
+    """Apply the kquant patch and delegate ``rest`` to ``mlx_lm.lora``.
+
+    One flag is intercepted rather than forwarded: ``--trust-remote-code``
+    opts the kquant loader into a checkpoint's custom ``model_file``
+    (arbitrary code); mlx-lm's trainer has no flag of its own for this.
+    """
     import sys
 
     from .._deps import require_tools
@@ -44,7 +49,10 @@ def passthrough(rest: list[str]) -> int:
 
     from ..mlx_lm_patch import patch_mlx_lm_lora
 
-    patch_mlx_lm_lora()
+    trust = "--trust-remote-code" in rest
+    if trust:
+        rest = [a for a in rest if a != "--trust-remote-code"]
+    patch_mlx_lm_lora(trust_remote_code=trust)
 
     saved_argv = sys.argv
     sys.argv = ["mlx_lm.lora", *rest]

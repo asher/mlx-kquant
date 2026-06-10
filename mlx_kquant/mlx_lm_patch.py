@@ -38,6 +38,13 @@ The patched seams (``mlx_lm.utils.load_model`` and the ``LoRA*.fuse`` methods)
 are stable across the supported mlx-lm range (tested through 0.31). Both patch
 functions check the seams exist before patching and raise a clear
 ``RuntimeError`` if a future mlx-lm moves them.
+
+mlx-lm's entry points have no per-call ``trust_remote_code``, so a checkpoint
+with a custom ``model_file`` (arbitrary code) is refused through the patched
+seam by default. The opt-in is made at the patch site -
+``patch_mlx_lm_load(trust_remote_code=True)`` - and is a process-wide,
+one-way grant: once given it applies to every later load and is not revoked
+by a repeat call with the default.
 """
 
 from __future__ import annotations
@@ -57,6 +64,7 @@ _load_patched = False
 _lora_patched = False
 _orig_fuse: dict = {}
 _orig_load_model = None
+_trust_remote_code = False
 
 
 # --- load_model: route a kquant checkpoint through the kquant loader ----------
@@ -81,8 +89,27 @@ def _patched_load_model(
         pass
 
     if config is not None and _kquant_block(config) is not None:
+        model_file = config.get("model_file")
+        if model_file is not None and not _trust_remote_code:
+            # The inner loader's gate would suggest a kwarg this caller cannot
+            # pass (mlx-lm's load_model has no trust slot); say where the
+            # opt-in actually lives instead.
+            raise ValueError(
+                f"{model_path} declares a custom model_file ({model_file!r}), "
+                f"which would import and execute code shipped in the "
+                f"checkpoint. mlx-lm's entry points carry no per-call flag "
+                f"for this; opt in at the patch site with "
+                f"patch_mlx_lm_load(trust_remote_code=True) (CLI: mlx-kquant "
+                f"lora --trust-remote-code) only if you trust its source."
+            )
         # Stock load_model can't read a kquant checkpoint; build it ourselves.
-        return _kq_load(model_path, lazy=lazy, strict=strict, model_config=model_config)
+        return _kq_load(
+            model_path,
+            lazy=lazy,
+            strict=strict,
+            model_config=model_config,
+            trust_remote_code=_trust_remote_code,
+        )
 
     kwargs = {}
     if get_model_classes is not None:
@@ -262,15 +289,23 @@ def _embedding_fuse(self, dequantize: bool = False, imatrix=None):
     return fused
 
 
-def patch_mlx_lm_load() -> None:
+def patch_mlx_lm_load(trust_remote_code: bool = False) -> None:
     """Make stock ``mlx_lm.load`` / ``load_model`` open a kquant checkpoint.
 
     Routes a kquant config through :func:`mlx_kquant.loader.load` and leaves every
     other checkpoint untouched. This is the *inference* seam - enough for a serving
     or eval consumer that never trains or fuses. Idempotent; called for you by
     :func:`patch_mlx_lm_lora`.
+
+    Args:
+        trust_remote_code: allow a checkpoint's custom ``model_file``
+            (arbitrary code) to load through the patched seam. mlx-lm's entry
+            points have no per-call flag, so the grant is made here, at the
+            patch site, and applies process-wide to every later load. It is
+            one-way: a repeat call with the default does not revoke it.
     """
-    global _load_patched, _orig_load_model
+    global _load_patched, _orig_load_model, _trust_remote_code
+    _trust_remote_code = _trust_remote_code or trust_remote_code
     if _load_patched:
         return
     import mlx_lm.utils as _utils
@@ -286,10 +321,15 @@ def patch_mlx_lm_load() -> None:
     _load_patched = True
 
 
-def patch_mlx_lm_lora() -> None:
-    """Make a stock mlx-lm install load, adapt, and fuse kquant bases. Idempotent."""
+def patch_mlx_lm_lora(trust_remote_code: bool = False) -> None:
+    """Make a stock mlx-lm install load, adapt, and fuse kquant bases. Idempotent.
+
+    ``trust_remote_code`` is forwarded to :func:`patch_mlx_lm_load` (same
+    process-wide, one-way semantics).
+    """
     global _lora_patched
     if _lora_patched:
+        patch_mlx_lm_load(trust_remote_code)  # keep the trust grant current
         return
     from mlx_lm.tuner import lora as _lora
 
@@ -302,7 +342,7 @@ def patch_mlx_lm_lora() -> None:
                 "or update mlx-kquant."
             )
 
-    patch_mlx_lm_load()  # the loader seam is a prerequisite for adapt/fuse
+    patch_mlx_lm_load(trust_remote_code)  # the loader seam is a prerequisite
 
     KQuantLinear.to_lora = _linear_to_lora
     KQuantSwitchLinear.to_lora = _switch_to_lora

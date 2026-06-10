@@ -148,6 +148,75 @@ def test_load_model_file_missing(tmp_path):
         load(tmp_path, trust_remote_code=True)
 
 
+_CUSTOM_MODEL_PY = """\
+import mlx.core as mx
+import mlx.nn as nn
+
+
+class ModelArgs:
+    @classmethod
+    def from_dict(cls, d):
+        return cls()
+
+
+class Model(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.fc = nn.Linear(256, 512, bias=False)
+
+    def __call__(self, x):
+        return self.fc(x)
+"""
+
+
+def test_patched_load_model_file_gate(tmp_path):
+    # Through the mlx-lm interop seam there is no per-call kwarg; the error
+    # must point at the patch-site opt-in, not at trust_remote_code=True.
+    import json
+
+    # Look load_model up on the module at call time: a `from ... import` taken
+    # before patching would pin the stale original.
+    import mlx_lm.utils
+
+    from mlx_kquant.mlx_lm_patch import patch_mlx_lm_load
+
+    patch_mlx_lm_load()
+    (tmp_path / "config.json").write_text(json.dumps(_model_file_cfg()))
+    with pytest.raises(ValueError, match="patch_mlx_lm_load"):
+        mlx_lm.utils.load_model(tmp_path)
+
+
+def test_patched_load_model_file_trusted(tmp_path):
+    # The patch-site grant loads a checkpoint whose model class ships in the
+    # checkpoint itself (custom.py), end to end through stock load_model.
+    import json
+
+    import mlx_lm.utils
+
+    import mlx_kquant as kq
+    from mlx_kquant import mlx_lm_patch
+    from mlx_kquant.nn import KQuantLinear
+
+    (tmp_path / "config.json").write_text(json.dumps(_model_file_cfg()))
+    (tmp_path / "custom.py").write_text(_CUSTOM_MODEL_PY)
+    wq, scales = kq.quantize(mx.random.normal((512, 256)), "q4_k")
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), {"fc.weight": wq, "fc.scales": scales}
+    )
+
+    mlx_lm_patch.patch_mlx_lm_load(trust_remote_code=True)
+    try:
+        model, _ = mlx_lm.utils.load_model(tmp_path)
+        assert isinstance(model.fc, KQuantLinear)
+        out = model(mx.random.normal((2, 256)))
+        mx.eval(out)
+        assert bool(mx.all(mx.isfinite(out)).item())
+    finally:
+        # The grant is deliberately one-way via the public API; reset the
+        # module global directly so test order cannot leak trust.
+        mlx_lm_patch._trust_remote_code = False
+
+
 def test_install_kquant_modules_shape_math():
     """No GPU: install swaps a Linear leaf and sizes the uint8 weight correctly."""
     import mlx.nn as nn
