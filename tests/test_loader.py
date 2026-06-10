@@ -26,7 +26,8 @@ import mlx_kquant as kq  # noqa: E402
 from mlx_kquant.loader import _get_classes, load  # noqa: E402
 
 gpu = pytest.mark.skipif(
-    not kq.metallib_loads(), reason="kquant encode is GPU-only (no Metal GPU)"
+    not kq.metallib_loads() or bool(os.environ.get("KQUANT_FORCE_CPU")),
+    reason="kquant encode is GPU-only (no Metal GPU / forced CPU)",
 )
 
 
@@ -91,7 +92,7 @@ def _roundtrip_asserts(tmp_path, cfg: dict, preset: str):
     assert lconfig["quantization"]["per_tensor"] == written_pt
     assert lconfig["quantization"]["mode"] == "kquant"
 
-    # Every quantized leaf came back as a KQuant* module — one per per_tensor key.
+    # Every quantized leaf came back as a KQuant* module - one per per_tensor key.
     n_kq = sum(
         1 for _, m in loaded.named_modules() if type(m).__name__.startswith("KQuant")
     )

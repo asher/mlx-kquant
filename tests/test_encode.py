@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import sys
 
 import mlx.core as mx
 import numpy as np
+import pytest
 from gguf import GGMLQuantizationType as GT
 from gguf import quants
 
@@ -107,6 +109,10 @@ def main(argv=None) -> int:
     return 1 if fails else 0
 
 
+@pytest.mark.skipif(
+    not kq.metallib_loads() or bool(os.environ.get("KQUANT_FORCE_CPU")),
+    reason="kquant encode is GPU-only (no Metal GPU / forced CPU)",
+)
 def test_encode():
     """pytest entry: runs the full encode sweep (no external data needed)."""
     assert main([]) == 0
