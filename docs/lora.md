@@ -3,13 +3,13 @@
 A kquant-quantized model is a **frozen base** you can adapt with LoRA: the packed
 wire bytes never change, and a small low-rank adapter is trained (or attached) on
 top. This works because the `kq.quantized_matmul` / `kq.gather_qmm` ops define a
-gradient-with-respect-to-the-input `vjp` — gradient flows *through* the frozen
+gradient-with-respect-to-the-input `vjp` - gradient flows *through* the frozen
 base to reach the trainable adapter, while the quantized weights themselves carry
 no gradient (they are frozen, exactly as LoRA wants).
 
 `mlx_kquant.mlx_lm_patch.patch_mlx_lm_lora()` teaches a stock
 [mlx-lm](https://github.com/ml-explore/mlx-lm) install to recognise the kquant
-modules in `mlx_kquant.nn` — so mlx-lm's own LoRA tuner, adapter loading, and the
+modules in `mlx_kquant.nn` - so mlx-lm's own LoRA tuner, adapter loading, and the
 `mlx-kquant fuse` merge tool all work on a kquant checkpoint. Call it once, before
 building LoRA layers or loading adapters; it is idempotent.
 
@@ -19,7 +19,7 @@ building LoRA layers or loading adapters; it is idempotent.
 
 ## Worked example: a pirate Qwen3-0.6B
 
-End to end — quantize a small model, LoRA-train it to talk like a pirate, merge
+End to end - quantize a small model, LoRA-train it to talk like a pirate, merge
 the adapter, and chat with it. Needs the `[tools]` extra. Uses the tiny
 [`GPT007/pirate_speak`][pirate] dataset (100 chat turns).
 
@@ -64,17 +64,17 @@ python prep_pirate.py     # -> pirate-data/{train,valid}.jsonl
 **2. Quantize the base** to a K-quant MLX checkpoint:
 
 ```sh
-mlx-kquant quantize --model Qwen/Qwen3-0.6B --preset q4_k_m --mlx-path qwen3-0.6b-q4_k_m
+mlx-kquant quantize --model Qwen/Qwen3-0.6B --preset q5_k_m --mlx-path qwen3-0.6b-q5_k_m
 ```
 
 **3. Train the LoRA adapter** on the kquant base (`mlx-kquant lora` is mlx-lm's
-trainer with the kquant patch applied — all its flags work):
+trainer with the kquant patch applied - all its flags work):
 
 ```sh
 mlx-kquant lora \
-    --model qwen3-0.6b-q4_k_m --train \
+    --model qwen3-0.6b-q5_k_m --train \
     --data ./pirate-data \
-    --iters 300 --batch-size 4 --num-layers 8 \
+    --iters 150 --batch-size 4 --num-layers 8 \
     --adapter-path pirate-adapter
 ```
 
@@ -82,24 +82,40 @@ mlx-kquant lora \
 float checkpoint instead):
 
 ```sh
-mlx-kquant fuse --model qwen3-0.6b-q4_k_m \
+mlx-kquant fuse --model qwen3-0.6b-q5_k_m \
     --adapter-path pirate-adapter \
-    --save-path qwen3-0.6b-pirate
+    --save-path qwen3-0.6b-pirate-q5_k_m
 ```
 
 **5. Chat** with the result:
 
 ```sh
-mlx-kquant run --model qwen3-0.6b-pirate \
+mlx-kquant run --model qwen3-0.6b-pirate-q5_k_m \
     --prompt "What's the weather like today?"
 ```
 
-The base Qwen3-0.6B answers plainly; after fine-tuning it answers in character —
-"Arrr, the skies be fair fer sailin', matey!". (300 iterations on 90 examples is a
-minute or two on an M-series GPU and is enough to pick up the style; turn it up for
-a stronger effect.)
+The base Qwen3-0.6B answers plainly; after fine-tuning it answers in character -
+"Arrrr, I be needin' to give ye the weather for today ...". (150 iterations on 90
+examples is under a minute on an M-series GPU and is enough to pick up the style;
+turn it up for a stronger effect, but watch for overfitting on a set this small.)
+
+The merge re-quantizes the adapted weights, and at `q5_k_m` the persona survives
+that round-trip. At `q4` and below the rounding can wash a small fine-tune out -
+keep the adapter separate (attach it) or use `--dequantize`. The
+[walkthrough](walkthrough.md) measures this end to end.
 
 ## Attach an adapter (inference / no training)
+
+The simplest path is the CLI: `mlx-kquant run --adapter-path` attaches the adapter
+at load time and generates - the base wire bytes are never modified, and the deltas
+stay full-precision (the highest-fidelity way to run a fine-tune):
+
+```sh
+mlx-kquant run --model my-model-q4km --adapter-path adapters/ \
+    --prompt "What's the weather like today?"
+```
+
+In Python, attach it yourself:
 
 ```python
 from mlx_kquant.mlx_lm_patch import patch_mlx_lm_lora
@@ -113,12 +129,12 @@ out = model(tokens)                      # base + low-rank delta
 ```
 
 `load_adapters` reads the standard mlx-lm adapter layout. The wrapped layers
-dispatch the kquant base plus the low-rank delta on every forward — no weights are
+dispatch the kquant base plus the low-rank delta on every forward - no weights are
 modified on disk.
 
 ## Train an adapter
 
-Training uses mlx-lm's own LoRA trainer unchanged — the patch makes the kquant
+Training uses mlx-lm's own LoRA trainer unchanged - the patch makes the kquant
 layers adaptable, and the ops' `vjp` makes them differentiable. The base stays
 frozen; only the adapter (and any unfrozen norm/bias) carries gradient.
 
@@ -131,7 +147,7 @@ mlx-kquant lora --model my-model-q4km --train --data ./data --iters 300
 # writes adapters/adapter_config.json + adapters.safetensors
 ```
 
-(Run `mlx-kquant lora --help` for the full flag list — it is mlx-lm's.) See the
+(Run `mlx-kquant lora --help` for the full flag list - it is mlx-lm's.) See the
 [worked example](#worked-example-a-pirate-qwen3-06b) below for an end-to-end run.
 
 The gradient path is validated end-to-end in `tests/test_lora_patch.py`
@@ -145,7 +161,7 @@ Both the dense and MoE gradient paths resolve on **CPU or GPU** (the `vjp`
 re-dispatches the same ops, which have a CPU decode path), so adapter training
 does not require a GPU.
 
-## Merge an adapter — `mlx-kquant fuse`
+## Merge an adapter - `mlx-kquant fuse`
 
 Once trained, fold the adapter back into the base with the `fuse` subcommand. Two
 output modes:
@@ -171,19 +187,41 @@ mlx-kquant fuse --model my-model-q4km --adapter-path adapters/ \
 | extra error vs the attached adapter | re-quant rounding | none (bf16 arithmetic noise only) |
 | loads with | `mlx_kquant.loader.load` | stock `mlx_lm.load` |
 
-The codec for each re-encoded tensor is **not** re-derived from a recipe — it is
+The codec for each re-encoded tensor is **not** re-derived from a recipe - it is
 read off the base layer, so every tensor keeps the exact codec it was originally
 quantized with, and the fused checkpoint's `per_tensor` map is unchanged.
 
 ### Why keep-kquant is lossy
 
-Merging changes the weight (`W → W + δ`), and the LoRA delta `δ` is arbitrary
-float that does not land on the quant grid, so re-encoding rounds it — the same
+Merging changes the weight (`W -> W + delta`), and the LoRA delta `delta` is arbitrary
+float that does not land on the quant grid, so re-encoding rounds it - the same
 kind of error as the original quantization. There is no exact in-place merge: even
 re-encoding the *unchanged* weight is not bit-identical, because the encoder
 refits each block's scale to the data (and the K-quant encoders run a scale/min
 search and quantize their own sub-scales). `--dequantize` avoids all of this by
 keeping the merged weight in float.
+
+### Lower bit widths: keep the adapter separate
+
+The re-quant rounding is small at q5/q6, but at q4 and below it can wash out a small
+fine-tune *entirely* (re-quantizing a `--dequantize` float merge does the same -
+there is no trick once you land back on a coarse grid). So the highest-fidelity
+option is to **not merge**: keep the adapter as a file and attach it at runtime,
+where the deltas stay full-precision. Merge for a single self-contained checkpoint;
+prefer `--dequantize` (or a higher-bit base) when a low-bit merge would degrade the
+fine-tune.
+
+To carry the base's *general* calibration through a keep-kquant merge, pass the same
+importance matrix you quantized the base with:
+
+```sh
+mlx-kquant fuse --model my-model-q4km --adapter-path adapters/ \
+    --imatrix base.imatrix.dat --save-path my-model-fused
+```
+
+`--imatrix` steers the re-encode of the adapted tensors (it is ignored under
+`--dequantize`); it preserves general quality, not a fine-tune the bit width is too
+coarse to hold. See [imatrix.md](imatrix.md).
 
 ## DoRA is not supported
 
