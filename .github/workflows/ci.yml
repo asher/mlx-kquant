@@ -118,10 +118,11 @@ jobs:
       # CPU decode-path op tests — unconditional, no GPU needed (the scalar CPU
       # eval paths). This is the enforced numeric gate on hosted runners: all 10
       # codecs through dequantize / quantized_matmul / gather_qmm, the nn layers,
-      # the GGUF wire-byte reader, and the training vjp (its re-dispatch resolves
-      # on CPU too). KQUANT_FORCE_CPU=1 makes conftest set the default device to
-      # CPU. Encode stays GPU-only (test_encode + the loader/cli round-trips,
-      # which quantize) until the v0.2.0 CPU encoder.
+      # the GGUF wire-byte reader, the training vjp (its re-dispatch resolves on
+      # CPU too), and the LoRA apply/fuse-to-float/train path. KQUANT_FORCE_CPU=1
+      # makes conftest set the default device to CPU; the GPU-only legs (re-encode
+      # to kquant, end-to-end fuse) skip honestly. Encode stays GPU-only
+      # (test_encode + the loader/cli round-trips) until the v0.2.0 CPU encoder.
       - name: CPU op tests (KQUANT_FORCE_CPU)
         env:
           KQUANT_FORCE_CPU: "1"
@@ -133,3 +134,5 @@ jobs:
           tests/test_nn.py
           tests/test_gguf.py
           tests/test_vjp.py
+          tests/test_lora_patch.py
+          tests/test_fuse_cli.py

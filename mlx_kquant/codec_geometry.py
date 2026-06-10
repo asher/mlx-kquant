@@ -57,3 +57,16 @@ def bytes_per_row(codec: str, in_dims: int) -> int:
             f"is not a multiple of {wpb}"
         )
     return (in_dims // wpb) * bpb
+
+
+def in_features(codec: str, row_bytes: int) -> int:
+    """Inverse of :func:`bytes_per_row`: the logical input width of a quantized
+    row given its uint8 wire-byte length. The kquant modules store only the wire
+    width, so this recovers the in-features the LoRA wrappers need."""
+    gs, bits, bpb, wpb = geometry(codec)
+    if row_bytes % bpb != 0:
+        raise ValueError(
+            f"codec {codec!r} uses {bpb}-byte blocks; row width {row_bytes} "
+            f"is not a multiple of {bpb}"
+        )
+    return (row_bytes // bpb) * wpb

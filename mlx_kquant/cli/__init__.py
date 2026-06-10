@@ -5,6 +5,7 @@ and as ``python -m mlx_kquant``. Subcommands:
 
   quantize           encode an mlx-lm / HF model into a kquant checkpoint
   calibrate-imatrix  build an importance matrix from a calibration corpus
+  fuse               merge a trained LoRA adapter into a kquant checkpoint
   verify             smoke-check the codecs / presets, or a built checkpoint
   run                load a checkpoint and generate a few tokens
 
@@ -21,9 +22,9 @@ import argparse
 import sys
 
 from .. import __version__
-from . import calibrate, quantize, run, verify
+from . import calibrate, fuse, quantize, run, verify
 
-_SUBCOMMANDS = (quantize, calibrate, verify, run)
+_SUBCOMMANDS = (quantize, calibrate, fuse, verify, run)
 
 
 def _build_parser() -> argparse.ArgumentParser:

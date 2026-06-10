@@ -102,6 +102,21 @@ leaves of a whole constructed mlx-lm model in one call, use
 `mlx_kquant.nn.install_kquant_modules(model, {"<path>.weight": "q4_k", ...})`. The **gguf-mlx**
 package builds its full GGUF runtime on exactly these classes.
 
+### LoRA fine-tuning
+
+A kquant checkpoint is a frozen base you can adapt with LoRA — attach an adapter for inference, train
+one (the matmul/gather ops define a gradient-through-the-base `vjp`, so the adapter is differentiable
+while the quantized weights stay frozen), and merge it back with `mlx-kquant fuse` (re-encode to
+kquant, or `--dequantize` to float). One call wires it into stock mlx-lm:
+
+```python
+from mlx_kquant.lora_patch import patch_mlx_lm_lora
+patch_mlx_lm_lora()   # before building LoRA layers / loading adapters; idempotent
+```
+
+See **[docs/lora.md](docs/lora.md)** for attach / train / merge workflows. (DoRA on a kquant base is
+not supported — use LoRA.)
+
 ## Running full GGUF models — `gguf-mlx`
 
 This extension is the low-level op/kernel layer. To **load and run a complete GGUF model** —
@@ -195,10 +210,12 @@ python -m pytest tests/      # dequant / matmul / gather / codecs / cpu_decode /
   roadmap.
 - The library is the **op layer**, not a model runtime. To load and run full GGUF models, use the
   separate [`gguf-mlx`](#running-full-gguf-models--gguf-mlx) package.
+- **LoRA, not DoRA.** LoRA adapters train, attach, and fuse on a kquant base (see
+  [docs/lora.md](docs/lora.md)); DoRA is not supported. `fuse` re-encoding to kquant is GPU-only
+  (`--dequantize` to float runs anywhere).
 
 ## Roadmap
 
-- Training `vjp` on the matmul/gather ops → LoRA fine-tuning on kquant bases.
 - A Metal-free **Linux** build (CPU train/infer), contingent on the mlx Linux wheel exercising the
   CPU eval paths.
 - **0.2.0:** CPU **encode** parity → quantize on Linux.
