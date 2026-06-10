@@ -33,10 +33,16 @@ frozen base passes gradient through to the trainable adapter).
 DoRA is not supported on a kquant base in this release: mlx-lm's DoRA dispatch
 does not consult ``to_lora``, so ``--fine-tune-type dora`` on a kquant model
 raises mlx-lm's own "Can't convert layer" error. Use LoRA.
+
+The patched seams (``mlx_lm.utils.load_model`` and the ``LoRA*.fuse`` methods)
+are stable across the supported mlx-lm range (tested through 0.31). Both patch
+functions check the seams exist before patching and raise a clear
+``RuntimeError`` if a future mlx-lm moves them.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import mlx.core as mx
@@ -69,7 +75,9 @@ def _patched_load_model(
     config = None
     try:
         config = _load_config(Path(model_path))
-    except Exception:
+    except (OSError, json.JSONDecodeError):
+        # Missing / unreadable config.json: defer to stock load_model, which
+        # raises its own (better) error for a broken checkpoint.
         pass
 
     if config is not None and _kquant_block(config) is not None:
@@ -267,6 +275,12 @@ def patch_mlx_lm_load() -> None:
         return
     import mlx_lm.utils as _utils
 
+    if not hasattr(_utils, "load_model"):
+        raise RuntimeError(
+            "mlx_lm.utils.load_model not found - mlx-lm's loader API has moved "
+            "and this mlx-kquant release cannot patch it. Pin an mlx-lm this "
+            "release supports (tested through 0.31), or update mlx-kquant."
+        )
     _orig_load_model = _utils.load_model
     _utils.load_model = _patched_load_model
     _load_patched = True
@@ -278,6 +292,15 @@ def patch_mlx_lm_lora() -> None:
     if _lora_patched:
         return
     from mlx_lm.tuner import lora as _lora
+
+    for cls_name in ("LoRALinear", "LoRASwitchLinear", "LoRAEmbedding"):
+        if not hasattr(getattr(_lora, cls_name, None), "fuse"):
+            raise RuntimeError(
+                f"mlx_lm.tuner.lora.{cls_name}.fuse not found - mlx-lm's LoRA "
+                "API has moved and this mlx-kquant release cannot patch it. "
+                "Pin an mlx-lm this release supports (tested through 0.31), "
+                "or update mlx-kquant."
+            )
 
     patch_mlx_lm_load()  # the loader seam is a prerequisite for adapt/fuse
 

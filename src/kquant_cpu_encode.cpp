@@ -8,6 +8,10 @@
 // GPU-encoded block; the four codecs that reduce sigma2 (q2_k/q4_k/q5_k, and
 // q3_k under an imatrix) can differ by an ULP-tied level but are numerically
 // equivalent.
+//
+// The scale-search algorithms (make_qp_quants / make_qkx3_quants /
+// make_qx_quants) derive from ggml's reference quantizers (llama.cpp, MIT) -
+// see mlx_kquant/licenses/llama.cpp-LICENSE.
 #include "kquant_cpu_encode.h"
 
 #include <algorithm>

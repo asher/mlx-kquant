@@ -1,3 +1,5 @@
+// Encoder scale searches derive from ggml's make_q*_quants reference
+// quantizers (llama.cpp, MIT) - see mlx_kquant/licenses/llama.cpp-LICENSE.
 #include "mlx/backend/metal/kernels/kq_quantized.h"
 
 template <typename T>

@@ -112,7 +112,7 @@ def quantize_model(
 
     try:  # absorbed-MLA module (deepseek_v3 family); absent on older mlx-lm.
         from mlx_lm.models.mla import MultiLinear
-    except Exception:  # pragma: no cover - depends on installed mlx-lm version
+    except ImportError:  # pragma: no cover - depends on installed mlx-lm version
         MultiLinear = None
 
     role_map = classify_tensors(model)

@@ -1,5 +1,7 @@
 // Scalar CPU decoders for the 10 GGUF codecs + dequant-then-matmul. Bit-exact
-// per-codec against the gguf-py reference; no Metal deps.
+// per-codec against the gguf-py reference; no Metal deps. The block decode
+// math derives from ggml (llama.cpp, MIT) - see
+// mlx_kquant/licenses/llama.cpp-LICENSE.
 #include "kquant_cpu_decode.h"
 
 #include <cstring>

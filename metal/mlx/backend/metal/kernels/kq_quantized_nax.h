@@ -1,3 +1,5 @@
+// Single-pass NAX qmm built on MLX's steel-GEMM / NAX kernel framework
+// (MIT) - see mlx_kquant/licenses/mlx-LICENSE.
 #include <metal_simdgroup>
 #include <metal_stdlib>
 

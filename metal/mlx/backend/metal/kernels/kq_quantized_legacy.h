@@ -1,3 +1,6 @@
+// Legacy GGUF block formats and decode math as defined by ggml (llama.cpp,
+// MIT) - see mlx_kquant/licenses/llama.cpp-LICENSE.
+
 // Q4_0: 18 bytes/32 weights. [fp16 d][uint8 qs[16]]. w[i] = d * (q4 - 8).
 
 MLX_MTL_CONST int KQ_Q4_0_GROUP = 32;

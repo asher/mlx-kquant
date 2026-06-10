@@ -47,6 +47,9 @@ toolchain that runs on a stock `mlx==0.31.2` wheel.
 - PEP 621 packaging, `py.typed`, ruff config, CI (lint + macOS build with honest
   GPU-gated op tests + Linux CPU build), and a tag-triggered wheel-publish
   workflow.
+- Third-party license texts bundled under `mlx_kquant/licenses/` (llama.cpp/ggml
+  codec math, gguf-tools parser, MLX kernel headers/helpers), with attribution
+  headers on the derived sources and an Acknowledgements section in the README.
 
 ### Notes
 - `requires-python >= 3.10` (mlx 0.31.2 ships no cp39 wheel).

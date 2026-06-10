@@ -1,4 +1,6 @@
 // clang-format off
+// Kernel instantiations; derived-code attribution lives in the included
+// kq_*.h headers and mlx_kquant/licenses/.
 #include "mlx/backend/metal/kernels/utils.h"
 #include "mlx/backend/metal/kernels/steel/gemm/gemm.h"
 #include "mlx/backend/metal/kernels/quantized_utils.h"

@@ -203,6 +203,10 @@ weights. Measured on an M5 Max (128 GB):
 | gemma-4-26B-A4B-it (MoE) | UD-Q4_K_XL | ~111 | ~2330 |
 | Qwen3.5-9B (dense)       | Q5_K_L     | ~83  | ~2396 |
 
+Transposed matmuls with a small row count (the speculative-decode verify regime) automatically route
+through a weight-read-amortizing `verify_qmv` kernel; set `KQ_DISABLE_VERIFY_QMV=1` to force the
+plain per-row `qmv` path instead (an A/B debugging lever, not a tuning knob).
+
 ## How it works
 
 - **Own ops.** Four `Primitive` subclasses (`KQuantDequantize`, `KQuantMatmul`, `KQuantGatherQMM`,
@@ -287,3 +291,17 @@ python -m pytest tests/      # dequant / matmul / gather / codecs / cpu_decode /
 ## License
 
 MIT - see [LICENSE](LICENSE).
+
+### Acknowledgements
+
+mlx-kquant builds on three MIT-licensed projects; their license texts ship in the wheel under
+[`mlx_kquant/licenses/`](mlx_kquant/licenses/):
+
+- **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** - the K-quant / legacy codec formats
+  and the quantization / dequantization algorithms that encode and decode them are derived from
+  ggml's reference implementation.
+- **[gguf-tools](https://github.com/antirez/gguf-tools)** - the C GGUF parser behind `kq.load_gguf`,
+  statically linked into built wheels.
+- **[MLX](https://github.com/ml-explore/mlx)** - the extension links `libmlx`, the kernels compile
+  against MLX's bundled headers, and parts of the Metal kernels are adapted from MLX's quantized and
+  steel-GEMM kernels.

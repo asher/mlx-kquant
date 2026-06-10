@@ -1,3 +1,6 @@
+// K-quant superblock decode math derives from ggml (llama.cpp, MIT); the
+// qmv / qmm kernel structure (tiling, simdgroup layout) is adapted from MLX's
+// quantized kernels (MIT). See mlx_kquant/licenses/.
 #include <metal_simdgroup>
 #include <metal_stdlib>
 

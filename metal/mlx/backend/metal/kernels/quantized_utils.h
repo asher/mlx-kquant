@@ -1,3 +1,5 @@
+// Vector load / accumulate helpers adapted from MLX's quantized kernels
+// (MIT) - see mlx_kquant/licenses/mlx-LICENSE.
 #include <metal_simdgroup>
 #include <metal_stdlib>
 
