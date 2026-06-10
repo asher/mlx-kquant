@@ -7,9 +7,9 @@ model's logits match the freshly-quantized model's bit-for-bit (same wire bytes
 through disk). A dense (Llama) and an MoE (qwen3_moe -> SwitchLinear) variant
 cover both the ``[out, bpr]`` and ``[E, out, bpr]`` weight layouts.
 
-Encode is GPU-only, so those tests skip without a Metal GPU. The
-``install_kquant_modules`` shape-math test needs no GPU. A real-HF-model
-round-trip runs only when ``KQUANT_TEST_MODEL`` names a (small) source id.
+Encode and the forward ops both have a CPU path, so these round-trips run on CPU
+(and in CI) as well as on a GPU. A real-HF-model round-trip runs only when
+``KQUANT_TEST_MODEL`` names a (small) source id.
 """
 
 from __future__ import annotations
@@ -22,13 +22,7 @@ import pytest
 # The whole module is model-level: needs the [tools] extra (mlx-lm).
 pytest.importorskip("mlx_lm")
 
-import mlx_kquant as kq  # noqa: E402
 from mlx_kquant.loader import _get_classes, load  # noqa: E402
-
-gpu = pytest.mark.skipif(
-    not kq.metallib_loads() or bool(os.environ.get("KQUANT_FORCE_CPU")),
-    reason="kquant encode is GPU-only (no Metal GPU / forced CPU)",
-)
 
 
 def _build(cfg: dict):
@@ -108,17 +102,14 @@ def _roundtrip_asserts(tmp_path, cfg: dict, preset: str):
     assert bool(mx.array_equal(out_loaded, out_q).item())
 
 
-@gpu
 def test_dense_roundtrip(tmp_path):
     _roundtrip_asserts(tmp_path, _tiny_llama_cfg(), "q4_k_m")
 
 
-@gpu
 def test_moe_roundtrip(tmp_path):
     _roundtrip_asserts(tmp_path, _tiny_qwen3_moe_cfg(), "q4_k_moe")
 
 
-@gpu
 def test_load_rejects_non_kquant(tmp_path):
     # A checkpoint with no kquant block is rejected with a clear error.
     import json
@@ -152,7 +143,6 @@ def test_install_kquant_modules_shape_math():
     assert isinstance(m.keep, nn.Linear)
 
 
-@gpu
 @pytest.mark.skipif(
     not os.environ.get("KQUANT_TEST_MODEL"),
     reason="set KQUANT_TEST_MODEL=<small hf id or path> to run",

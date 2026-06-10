@@ -2,7 +2,7 @@
 
 :func:`quantize_model` walks a constructed (unquantized) ``mlx-lm`` model,
 resolves a per-tensor codec from a recipe preset (see :mod:`mlx_kquant.recipes`),
-encodes each quantizable weight with the ``quantize`` op (GPU), and swaps in the
+encodes each quantizable weight with the ``quantize`` op, and swaps in the
 matching ``KQuant*`` module so the returned model runs immediately. :func:`save`
 writes the result as an ``mlx-lm``-readable checkpoint (sharded safetensors +
 ``config.json``).
@@ -19,7 +19,8 @@ On-disk format:
   (uint8 ``[1]`` placeholder - K-quant scales live inside the wire bytes), and an
   optional ``<path>.bias``; unquantized tensors keep their source dtype.
 
-Encode is GPU-only in v0.1.0 (the ``quantize`` op has no CPU path yet).
+Encode runs on CPU or Metal (the ``quantize`` op has a scalar CPU path for all
+ten codecs).
 """
 
 from __future__ import annotations
@@ -62,7 +63,7 @@ _AUX_FILES = (
 
 
 def _encode_weight(w: mx.array, codec: str, imatrix_vec: np.ndarray | None) -> mx.array:
-    """Encode a float weight tensor into uint8 kquant wire bytes (GPU)."""
+    """Encode a float weight tensor into uint8 kquant wire bytes."""
     imatrix_arg = None
     if imatrix_vec is not None:
         in_dims = w.shape[-1]

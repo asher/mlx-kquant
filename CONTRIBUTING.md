@@ -27,15 +27,15 @@ python scripts/check-codecs.py --check     # codec geometry doc-lint (no GPU)
 pytest -q                                  # op tests
 ```
 
-The op tests need a Metal GPU (until the CPU decode path is in place, after which
-they also run under `KQUANT_FORCE_CPU=1`). Tests gated on `KQUANT_TEST_*`
+The op tests run on a Metal GPU or, under `KQUANT_FORCE_CPU=1`, on CPU (the decode
+and encode paths both have a scalar CPU implementation). Tests gated on `KQUANT_TEST_*`
 environment variables need external assets (real GGUFs / HF models) and are
 skipped by default.
 
 ## Regenerating the test fixtures
 
-`tests/fixtures/*.npz` are reproducible from this repo with a built extension and
-a GPU:
+`tests/fixtures/*.npz` are reproducible from this repo with a built extension
+(encode runs on CPU or Metal):
 
 ```sh
 python tests/gen_fixtures.py            # re-encodes via kq.quantize

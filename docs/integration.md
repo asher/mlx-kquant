@@ -51,7 +51,7 @@ Ten codecs, all defined in `mlx_kquant.codec_geometry.CODEC_GEOMETRY` as
 
 `weights_per_block` (`wpb`) is the granularity that matters for layout: K-quants pack 256 weights per
 superblock, the block/legacy codecs 32. The duck-typed `group_size` attribute on a `KQuant*` module
-equals `wpb`. All ten encode on the GPU; the **imatrix** argument to `kq.quantize` steers only the
+equals `wpb`. All ten encode on CPU or Metal; the **imatrix** argument to `kq.quantize` steers only the
 five superblock K-quants (`wpb == 256`) and is a no-op on the `wpb == 32` codecs.
 
 Presets (`mlx_kquant.recipes`) are **purely codec-name-based** - there is no affine "4-bit / 8-bit"
@@ -152,10 +152,12 @@ Reuse `recipes` to drive your own encoder, or call `kq.quantize` directly for a 
 
 ### Encode constraints
 
-- **GPU-only (v0.1.0).** `kq.quantize` has no CPU path yet, so encoding requires a Metal GPU.
-  *Decode* (`kq.dequantize` / `quantized_matmul` / `gather_qmm`) **does** have a CPU path, so loading,
-  inference, LoRA training, and `fuse --dequantize` run without a GPU; only producing or re-encoding
-  wire bytes needs one. (CPU encode is a planned v0.2.0 fast-follow.)
+- **CPU or Metal.** `kq.quantize` has a scalar CPU path for all ten codecs (`stream=mx.cpu`), as do
+  the decode ops (`kq.dequantize` / `quantized_matmul` / `gather_qmm`), so the whole pipeline -
+  quantize, load, inference, LoRA training, and both `fuse` modes - runs without a GPU. The CPU
+  encoder is a port of the Metal kernels: the flat codecs and `q6_k` are byte-identical across
+  streams, while the four codecs that reduce `sigma2` (`q2_k`/`q4_k`/`q5_k`, and `q3_k` with an
+  imatrix) can differ by an ULP-tied level but reconstruct equally well.
 - **Row-width divisibility.** A row's logical width must be a whole number of blocks:
   `in_features % weights_per_block == 0`. `bytes_per_row(codec, in_features)` and the inverse
   `in_features(codec, row_bytes)` raise `ValueError` otherwise, and `convert.quantize_model` skips a
@@ -196,7 +198,7 @@ not.
 - it attaches a `to_lora` method to the `KQuant*` modules, which mlx-lm's tuner consults first when
   discovering and wrapping adaptable layers (recovering in/out dims from the wire-byte geometry);
 - it overrides `LoRA*.fuse` to merge into a kquant base (dequantize, add the delta, optionally
-  re-encode - re-encode is GPU-only per Seam 4), deferring to the original for non-kquant bases.
+  re-encode - re-encode runs on CPU or Metal), deferring to the original for non-kquant bases.
 
 This is the template for adding loader / trainer / fuser support for any custom layer type without
 owning a fork. See [docs/lora.md](lora.md) for the end-to-end workflow.

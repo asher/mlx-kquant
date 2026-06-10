@@ -8,7 +8,7 @@ fixtures from fixed random tensors here and validate ``kq.dequantize`` against
 the gguf-py reference on those bytes (``tests/test_codecs.py`` and
 ``tests/test_gather.py``).
 
-Requires a built extension and a Metal GPU (encode is GPU-only in v0.1.0):
+Requires a built extension (encode runs on CPU or Metal):
 
     python tests/gen_fixtures.py
     shasum -a 256 -c tests/fixtures/SHA256SUMS   # from the repo root

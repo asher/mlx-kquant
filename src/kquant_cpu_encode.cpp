@@ -1,11 +1,13 @@
-// Scalar CPU encoders for the flat GGUF codecs (q8_0 + the four legacy block
-// codecs). Each function is a direct port of the matching Metal kernel impl in
-// kq_quantized_encode.h: same amax/min-max scale derivation, same
-// round-and-pack (Metal `round` is round-half-away-from-zero -> std::round on
-// float), and the scale `d` (and `m`) are written through fp16 exactly as
-// `half(...)` does, so a CPU-encoded block is byte-identical to a GPU-encoded
-// one. The K-quant codecs are GPU-only for now; the dispatch throws for them on
-// CPU.
+// Scalar CPU encoders for all ten GGUF codecs: the flat ones (q8_0 + the four
+// legacy block codecs) here, the five K-quant superblocks in the section below.
+// Each function is a direct port of the matching Metal kernel impl in
+// kq_quantized_encode.h: same scale derivation, same round-and-pack (Metal
+// `round` is round-half-away-from-zero -> std::round; the K-quants use
+// round-half-to-even via std::rint), and the scales are written through fp16
+// exactly as `half(...)` does. The flat codecs and q6_k are byte-identical to a
+// GPU-encoded block; the four codecs that reduce sigma2 (q2_k/q4_k/q5_k, and
+// q3_k under an imatrix) can differ by an ULP-tied level but are numerically
+// equivalent.
 #include "kquant_cpu_encode.h"
 
 #include <algorithm>

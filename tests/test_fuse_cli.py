@@ -10,14 +10,13 @@ Covers the plumbing on top of the numerics in ``test_lora_patch.py``:
     stock ``mlx_lm`` and matches tightly (lossless float merge); keep-kquant
     reloads with our loader and matches within the re-quant tolerance.
 
-The end-to-end tests need a GPU (the base quantize + the keep-kquant re-encode);
-the ``_dequantize_remaining`` unit test does not.
+The end-to-end tests exercise the base quantize + the keep-kquant re-encode; both
+the encode and decode paths run on CPU, so the whole suite runs on CPU (and in CI).
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import struct
 
 import mlx.core as mx
@@ -32,13 +31,6 @@ pytest.importorskip("mlx_lm")
 
 import mlx_kquant as kq  # noqa: E402
 from mlx_kquant.nn import KQuantLinear  # noqa: E402
-
-# The end-to-end tests do a base quantize + a keep-kquant re-encode, both of
-# which call kq.quantize (GPU-only) - skip without a real GPU or under forced-CPU.
-gpu = pytest.mark.skipif(
-    not kq.metallib_loads() or bool(os.environ.get("KQUANT_FORCE_CPU")),
-    reason="kquant encode is GPU-only (no Metal GPU / forced CPU)",
-)
 
 
 def _rel(a, b):
@@ -200,7 +192,6 @@ def _reference_lora_out(base_dir, adapter_dir, x):
     return out
 
 
-@gpu
 def test_loader_patch_lets_mlx_lm_load_kquant(tmp_path):
     """After patching, stock `mlx_lm.utils.load_model` opens a kquant checkpoint
     and forwards finite logits - this is what makes `mlx_lm.load` (and the
@@ -226,7 +217,6 @@ def test_loader_patch_lets_mlx_lm_load_kquant(tmp_path):
     assert bool(mx.all(mx.isfinite(out)).item())
 
 
-@gpu
 def test_fuse_cli_keep_kquant(tmp_path):
     from mlx_kquant.cli import fuse as fuse_cli
     from mlx_kquant.loader import load
@@ -263,7 +253,6 @@ def test_fuse_cli_keep_kquant(tmp_path):
     assert _rel(fout, ref) < 5e-2
 
 
-@gpu
 def test_fuse_cli_keep_kquant_imatrix(tmp_path, capsys):
     """A keep-kquant fuse with --imatrix: mint an imatrix keyed by the fusable
     layers' HF paths, fuse with it, and check it resolves (coverage) and produces
@@ -315,7 +304,6 @@ def test_fuse_cli_keep_kquant_imatrix(tmp_path, capsys):
     assert bool(mx.all(mx.isfinite(fout)).item())
 
 
-@gpu
 def test_fuse_cli_dequantize(tmp_path):
     from mlx_lm.utils import load_model
 

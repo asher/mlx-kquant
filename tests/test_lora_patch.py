@@ -8,7 +8,7 @@ and to fuse the trained adapter back in. These checks cover:
     really dispatches through the kquant base plus the low-rank delta);
   * fuse(dequantize=True) - a float nn.Linear whose forward matches lora(x);
   * fuse(dequantize=False) - re-encodes the merged weight back to a KQuantLinear
-    (GPU-only: kq.quantize has no CPU path yet, so this is GPU-gated);
+    (the re-encode has a CPU path, so this runs on CPU too);
   * training - a few SGD steps with a trainable projection UPSTREAM of the frozen
     kquant base, so the gradient flows through the base's vjp to reach it (the
     realistic multi-layer LoRA gradient path). Asserts the adapter + upstream
@@ -16,35 +16,25 @@ and to fuse the trained adapter back in. These checks cover:
     wire bytes are byte-unchanged. Dense and MoE (KQuantSwitchLinear, which
     routes the gather_qmm vjp) variants.
 
-q8_0 bases are minted with gguf-py (CPU encode) so everything but the kquant
-round-trip runs under KQUANT_FORCE_CPU.
+q8_0 bases are minted with gguf-py (CPU encode); kq.quantize also has a CPU
+path, so the whole module runs under KQUANT_FORCE_CPU.
 
 Run directly for a short report, or under pytest.
 """
 
 from __future__ import annotations
 
-import os
 import sys
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
-import pytest
 from gguf import GGMLQuantizationType as GT
 from gguf import quants
 
-import mlx_kquant as kq
 from mlx_kquant.mlx_lm_patch import patch_mlx_lm_lora
 from mlx_kquant.nn import KQuantLinear, KQuantSwitchLinear
-
-# fuse(dequantize=False) re-encodes via kq.quantize, which is GPU-only and would
-# throw on the CPU device - gate on a real GPU *and* not the forced-CPU CI mode.
-_gpu_encode = pytest.mark.skipif(
-    not kq.metallib_loads() or bool(os.environ.get("KQUANT_FORCE_CPU")),
-    reason="kquant re-encode (kq.quantize) is GPU-only",
-)
 
 
 def _rel(a, b):
@@ -124,7 +114,6 @@ def test_lora_fuse_dequantize_matches_apply():
     assert _rel(fu, lo) < 2e-2
 
 
-@_gpu_encode
 def test_lora_fuse_kquant_roundtrip():
     patch_mlx_lm_lora()
     in_dims, out_dims, M = 256, 16, 8
@@ -216,11 +205,10 @@ def _main() -> int:
     fns = [
         test_lora_apply_numerics,
         test_lora_fuse_dequantize_matches_apply,
+        test_lora_fuse_kquant_roundtrip,
         test_lora_trains_dense,
         test_lora_trains_moe,
     ]
-    if kq.metallib_loads() and not os.environ.get("KQUANT_FORCE_CPU"):
-        fns.insert(2, test_lora_fuse_kquant_roundtrip)
     fails = 0
     for fn in fns:
         try:

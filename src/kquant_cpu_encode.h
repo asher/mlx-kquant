@@ -1,11 +1,12 @@
 // Scalar CPU encode path for kq.quantize: float weights -> GGUF wire bytes for
-// the flat codecs (q8_0 + the four legacy block codecs); the K-quant superblock
-// codecs are encoded on the GPU only for now (the dispatch throws for them on
-// CPU). Ported from the Metal encode kernels (kq_quantized_encode.h) so the CPU
-// output is byte-identical to the GPU encoder, and validated against the
-// gguf-py reference. No Metal dependency, so it builds and runs on any platform
-// with the stock mlx wheel. The entry point is template-declared here and
-// explicitly instantiated for float / float16_t / bfloat16_t in the .cpp.
+// all ten codecs (q8_0 + the four legacy block codecs + the five K-quant
+// superblocks). Ported from the Metal encode kernels (kq_quantized_encode.h):
+// the flat codecs and q6_k are byte-identical to the GPU encoder; the four
+// codecs that reduce sigma2 (q2_k/q4_k/q5_k, and q3_k under an imatrix) can
+// differ by an ULP-tied level but are numerically equivalent. Validated against
+// the gguf-py reference. No Metal dependency, so it builds and runs on any
+// platform with the stock mlx wheel. The entry point is template-declared here
+// and explicitly instantiated for float / float16_t / bfloat16_t in the .cpp.
 #pragma once
 
 #include <cstddef>
@@ -19,8 +20,7 @@ namespace mlx_kquant {
 // must hold the corresponding whole blocks. `imatrix` (length `K`, or nullptr)
 // steers the K-quant superblock codecs; the flat codecs ignore it. `K` is the
 // logical row width in weights, for the imatrix wraparound when a matrix's rows
-// are encoded in one contiguous call. Throws on an unknown codec, and on a
-// K-quant codec until the CPU K-quant encoders land.
+// are encoded in one contiguous call. Throws on an unknown codec.
 template <typename T>
 void kquant_quantize_dispatch(
     const T* w,

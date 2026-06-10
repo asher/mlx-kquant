@@ -252,7 +252,7 @@ mlx-kquant fuse \
 [mlx-kquant] fused 56 adapter layers -> qwen3-0.6b-pirate-q5_k_m (kquant)
 ```
 
-56 = 8 layers x 7 projections (re-encoding is GPU-only).
+56 = 8 layers x 7 projections.
 
 > **Merging re-quantizes - mind the precision.** The merge rounds the updated
 > weights back onto the codec's grid, and a LoRA delta is small. At `q5_k_m` (and

@@ -76,8 +76,8 @@ mx::array gather_qmm(
 // live inline in `wq`, so the second output is a vestigial placeholder kept for
 // signature parity with dequantize/quantized_matmul. Optional `imatrix` (a 1-D
 // float32 importance vector of length K = w.shape(-1)) steers the encoder.
-// group_size/bits are derived from `kquant_type`. GPU-only. The last dim of `w`
-// must be a multiple of the codec's weights_per_block.
+// group_size/bits are derived from `kquant_type`. Runs on CPU or Metal. The
+// last dim of `w` must be a multiple of the codec's weights_per_block.
 std::vector<mx::array> quantize(
     const mx::array& w,
     const std::string& kquant_type,
@@ -234,7 +234,7 @@ class KQuantGatherQMM : public mx::Primitive {
 // Encode a float weight tensor into K-quant wire bytes. Multi-output primitive:
 // outputs[0] = wq (uint8), outputs[1] = scales placeholder (uint8, shape [1]).
 // Whether an imatrix is used is derived from inputs.size() (1 = w only, 2 = w +
-// imatrix). Inference-only: jvp/vjp/vmap throw. GPU-only.
+// imatrix). Inference-only: jvp/vjp/vmap throw. Runs on CPU or Metal.
 class KQuantQuantize : public mx::Primitive {
  public:
   explicit KQuantQuantize(

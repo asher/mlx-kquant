@@ -5,8 +5,8 @@ Two output modes:
 * default (**keep-kquant**) - each adapted weight is decoded, the low-rank delta
   is added, and the merged weight is **re-encoded with that tensor's own codec**
   (read off the base layer, not a recipe), so the result is a kquant checkpoint
-  byte-compatible with the original. Re-encoding is GPU-only until the v0.2.0 CPU
-  encoder, and adds a small per-codec re-quant rounding error. Pass ``--imatrix``
+  byte-compatible with the original. Re-encoding runs on CPU or Metal, and adds a
+  small per-codec re-quant rounding error. Pass ``--imatrix``
   (the same one used to quantize the base) to steer that re-encode so the merge
   preserves the base's calibration instead of rounding the adapted tensors blind.
 * ``--dequantize`` - writes a **float** checkpoint: adapted layers fuse to float
@@ -30,8 +30,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="merge a trained LoRA adapter back into a kquant checkpoint",
         description="Fuse LoRA adapter weights into a kquant base. By default the "
         "result stays kquant (merged weights re-encoded with each tensor's "
-        "original codec - GPU-only); --dequantize writes a float checkpoint "
-        "instead (runs without a GPU, no re-quant error).",
+        "original codec); --dequantize writes a float checkpoint instead "
+        "(no re-quant error). Both modes run on CPU or Metal.",
     )
     p.add_argument(
         "--model",

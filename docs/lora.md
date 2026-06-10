@@ -168,7 +168,7 @@ output modes:
 
 ```sh
 # stays kquant: each merged weight is re-encoded with that tensor's own codec.
-# GPU-only (re-encode uses the GPU); small per-codec re-quant rounding error.
+# runs on CPU or Metal; small per-codec re-quant rounding error.
 mlx-kquant fuse --model my-model-q4km --adapter-path adapters/ \
     --save-path my-model-fused
 
@@ -183,7 +183,7 @@ mlx-kquant fuse --model my-model-q4km --adapter-path adapters/ \
 | | keep-kquant (default) | `--dequantize` |
 |---|---|---|
 | output | kquant (small, same footprint) | float (larger) |
-| needs a GPU | yes (re-encode) | no (decode has a CPU path) |
+| needs a GPU | no (re-encode has a CPU path) | no (decode has a CPU path) |
 | extra error vs the attached adapter | re-quant rounding | none (bf16 arithmetic noise only) |
 | loads with | `mlx_kquant.loader.load` | stock `mlx_lm.load` |
 

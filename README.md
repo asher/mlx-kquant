@@ -62,7 +62,7 @@ import mlx_kquant as kq
 N, K = 256, 512                       # q4_k: K must be a multiple of 256
 w = mx.random.normal((N, K))
 
-# encode float -> K-quant wire bytes (GPU only); optional imatrix steers the encoder
+# encode float -> K-quant wire bytes (CPU or Metal); optional imatrix steers the encoder
 wq, scales = kq.quantize(w, "q4_k")           # wq: uint8 [N, bytes_per_row]
 
 # dequantize back to float
@@ -200,10 +200,10 @@ weights. Measured on an M5 Max (128 GB):
   exported `Device::get_kernel`. No JIT, no steel host structs.
 - **Codec registry** derives `group_size`/`bits` from the codec name, so callers pass only
   `kquant_type`.
-- **CPU and GPU execution.** The decode ops (`dequantize` / `quantized_matmul` / `gather_qmm`) run on
-  either stream - a scalar CPU path (all 10 codecs) backs `stream=mx.cpu` and doubles as the
-  correctness oracle the Metal kernels are A/B'd against, so the op tests can run in CI without a GPU.
-  **Encode (`quantize`) is GPU-only** until the CPU encoder lands in 0.2.0.
+- **CPU and GPU execution.** Every op - the decode ops (`dequantize` / `quantized_matmul` /
+  `gather_qmm`) and `quantize` (encode) - runs on either stream. A scalar CPU path covers all 10
+  codecs and backs `stream=mx.cpu`, doubling as the correctness oracle the Metal kernels are A/B'd
+  against, so the full quantize/decode pipeline (and the op tests) runs in CI without a GPU.
 
 ## Scope
 
@@ -254,21 +254,20 @@ python -m pytest tests/      # dequant / matmul / gather / codecs / cpu_decode /
 
 ## Limitations
 
-- **Decode runs on CPU or Metal; encode is GPU-only.** `dequantize` / `quantized_matmul` /
-  `gather_qmm` have a scalar CPU path (`stream=mx.cpu`); `quantize` requires an Apple-Silicon GPU
-  until the 0.2.0 CPU encoder. No NVIDIA/AMD/Linux-GPU support; a Metal-free Linux build is on the
-  roadmap.
+- **Decode and encode both run on CPU or Metal.** `dequantize` / `quantized_matmul` / `gather_qmm`
+  and `quantize` all have a scalar CPU path (`stream=mx.cpu`) covering every codec. The build still
+  needs the Metal toolchain (the extension links `libmlx` and bundles a metallib); a Metal-free Linux
+  build - which the CPU paths unblock - is on the roadmap. No NVIDIA/AMD-GPU support.
 - The library is the **op layer**, not a model runtime. To load and run full GGUF models, use the
   separate [`gguf-mlx`](#running-gguf-files--gguf-mlx) package.
 - **LoRA, not DoRA.** LoRA adapters train, attach, and fuse on a kquant base (see
-  [docs/lora.md](docs/lora.md)); DoRA is not supported. `fuse` re-encoding to kquant is GPU-only
-  (`--dequantize` to float runs anywhere).
+  [docs/lora.md](docs/lora.md)); DoRA is not supported. `fuse` re-encodes to kquant or, with
+  `--dequantize`, to float; both modes run on CPU or Metal.
 
 ## Roadmap
 
 - A Metal-free **Linux** build (CPU train/infer), contingent on the mlx Linux wheel exercising the
-  CPU eval paths.
-- **0.2.0:** CPU **encode** parity -> quantize on Linux.
+  CPU eval paths. The scalar CPU encode/decode paths are in place; this is the remaining piece.
 
 ## License
 

@@ -8,7 +8,7 @@ Current API:
   * ``dequantize`` - GGUF K-quant wire bytes -> float array.
   * ``quantized_matmul`` - x @ dequant(w) for K-quant weights.
   * ``gather_qmm`` - mixture-of-experts gathered quantized matmul.
-  * ``quantize`` - encode a float tensor into K-quant wire bytes (GPU-only).
+  * ``quantize`` - encode a float tensor into K-quant wire bytes (CPU or Metal).
   * ``load_gguf`` - load a GGUF file's tensors + metadata (C++ mmap memcpy).
 """
 

@@ -13,8 +13,8 @@ and the safetensors hold ``<path>.weight`` / ``<path>.scales`` (+ optional
 ``<path>.bias``). The ``per_tensor`` keys are **bare** module paths; the install
 seam keys on ``<path>.weight``, so the loader normalizes between the two.
 
-``[tools]`` (mlx-lm) is required; decoding the wire bytes at forward time is
-GPU-only until the CPU decode path lands.
+``[tools]`` (mlx-lm) is required; decoding the wire bytes at forward time runs
+on CPU or Metal.
 """
 
 from __future__ import annotations

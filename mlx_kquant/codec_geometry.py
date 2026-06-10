@@ -26,8 +26,8 @@ CODEC_GEOMETRY: dict[str, tuple[int, int, int, int]] = {
     "q2_k": (256, 2, 84, 256),
 }
 
-# Every codec the GPU encoder (``kq.quantize``) can produce. The extension
-# encodes all ten; the four legacy block codecs + q8_0 simply ignore an imatrix.
+# Every codec the ``kq.quantize`` encoder can produce. The extension encodes all
+# ten on CPU or Metal; the four legacy block codecs + q8_0 ignore an imatrix.
 ENCODER_CODECS: frozenset[str] = frozenset(CODEC_GEOMETRY)
 
 # Only the K-quant superblocks have an importance-weighted rounding path, so an

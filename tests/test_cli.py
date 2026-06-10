@@ -7,21 +7,12 @@ these run on a base install. ``verify --codecs`` / ``--presets`` dispatch no ops
 from __future__ import annotations
 
 import json
-import os
 
 import mlx.core as mx
 import pytest
 
-import mlx_kquant as kq
 from mlx_kquant.cli import _build_parser, main
 from mlx_kquant.codec_geometry import bytes_per_row
-
-# The e2e test does a GPU-only kquant encode - skip without a real GPU or under
-# forced-CPU (the encoder has no CPU path).
-gpu = pytest.mark.skipif(
-    not kq.metallib_loads() or bool(os.environ.get("KQUANT_FORCE_CPU")),
-    reason="kquant encode is GPU-only (no Metal GPU / forced CPU)",
-)
 
 
 def test_version_exits_zero():
@@ -148,7 +139,6 @@ def test_inspect_rejects_non_kquant(tmp_path, capsys):
     assert "not a kquant checkpoint" in capsys.readouterr().err
 
 
-@gpu
 def test_quantize_then_verify_e2e(tmp_path):
     """End-to-end through the CLI: a float source -> quantize -> verify --model."""
     pytest.importorskip("mlx_lm")

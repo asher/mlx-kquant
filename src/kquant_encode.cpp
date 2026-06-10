@@ -1,9 +1,9 @@
 // KQuantQuantize primitive: encode a float weight tensor into GGUF K-quant wire
 // bytes. The GPU path fetches the encode kernel from the bundled metallib via
 // kq_get_kernel; the op guarantees row-contiguity before dispatch, and
-// kernel-name type tokens come from kq_type_string. The CPU path covers the
-// flat codecs (kquant_cpu_encode.h); the K-quant codecs are GPU-only for now
-// and the CPU dispatch throws for them.
+// kernel-name type tokens come from kq_type_string. The CPU path
+// (kquant_cpu_encode.h) covers all ten codecs -- flat and K-quant -- so encode
+// runs on either stream.
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>

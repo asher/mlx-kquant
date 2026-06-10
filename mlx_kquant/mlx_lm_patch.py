@@ -139,8 +139,8 @@ def _embedding_to_lora(self, r, scale, dropout):
 # --- fuse: bake the adapter into the base ------------------------------------
 #
 # dequantize=True  -> a float layer (loads anywhere; re-bloats to the float size)
-# dequantize=False -> stays kquant by re-encoding the merged weight (GPU-only
-#                     until the v0.2.0 CPU encoder; adds a small re-quant error).
+# dequantize=False -> stays kquant by re-encoding the merged weight (runs on CPU
+#                     or Metal; adds a small re-quant error).
 #
 # imatrix: an optional per-input-feature importance vector (keep-kquant only). The
 # re-encode otherwise rounds uncalibrated, so pass the same imatrix the base was

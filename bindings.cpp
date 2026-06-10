@@ -143,7 +143,7 @@ NB_MODULE(_ext, m) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
-        Encode a float weight tensor into GGUF K-quant wire bytes (GPU-only).
+        Encode a float weight tensor into GGUF K-quant wire bytes (CPU or Metal).
 
         Args:
             w (array): float weights; last dim a multiple of the codec's

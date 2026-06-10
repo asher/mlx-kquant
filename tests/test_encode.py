@@ -109,12 +109,9 @@ def main(argv=None) -> int:
     return 1 if fails else 0
 
 
-@pytest.mark.skipif(
-    not kq.metallib_loads() or bool(os.environ.get("KQUANT_FORCE_CPU")),
-    reason="kquant encode is GPU-only (no Metal GPU / forced CPU)",
-)
 def test_encode():
-    """pytest entry: runs the full encode sweep (no external data needed)."""
+    """pytest entry: runs the full encode sweep on the default device (CPU under
+    KQUANT_FORCE_CPU); no external data needed."""
     assert main([]) == 0
 
 
@@ -124,7 +121,7 @@ def test_encode_cpu_flat_roundtrip(codec):
     CPU stream, dequantize with the gguf-py reference, and check the round-trip is
     within the codec's bound. Needs no GPU - this is the CI-runnable gate that the
     encode (and LoRA quantize/fuse-to-kquant) paths actually execute on hosted
-    runners. The K-quant codecs stay GPU-only until their CPU encoders land."""
+    runners. The K-quant codecs have their own CPU round-trip tests below."""
     gtype, _wpb, _bits, bound = CODECS[codec]
     rng = np.random.default_rng(7)
     w_np = (rng.standard_normal((N, K)) * 0.1).astype(np.float32)
