@@ -70,7 +70,7 @@ def cmd(args: argparse.Namespace) -> int:
 
     from ..convert import save
     from ..loader import _resolve_path, load
-    from ..lora_patch import patch_mlx_lm_lora
+    from ..mlx_lm_patch import patch_mlx_lm_lora
 
     # Teach mlx-lm's tuner to wrap + fuse kquant bases before applying adapters.
     patch_mlx_lm_lora()

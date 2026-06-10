@@ -117,7 +117,7 @@ def _mint_adapter(base_dir, adapter_dir):
     from mlx_lm.tuner.utils import linear_to_lora_layers
 
     from mlx_kquant.loader import load
-    from mlx_kquant.lora_patch import patch_mlx_lm_lora
+    from mlx_kquant.mlx_lm_patch import patch_mlx_lm_lora
 
     patch_mlx_lm_lora()
     model, _ = load(base_dir)
@@ -147,7 +147,7 @@ def _reference_lora_out(base_dir, adapter_dir, x):
     from mlx_lm.tuner.utils import load_adapters
 
     from mlx_kquant.loader import load
-    from mlx_kquant.lora_patch import patch_mlx_lm_lora
+    from mlx_kquant.mlx_lm_patch import patch_mlx_lm_lora
 
     patch_mlx_lm_lora()
     model, _ = load(base_dir)
@@ -155,6 +155,32 @@ def _reference_lora_out(base_dir, adapter_dir, x):
     out = model(x)
     mx.eval(out)
     return out
+
+
+@gpu
+def test_loader_patch_lets_mlx_lm_load_kquant(tmp_path):
+    """After patching, stock `mlx_lm.utils.load_model` opens a kquant checkpoint
+    and forwards finite logits — this is what makes `mlx_lm.load` (and the
+    `mlx_lm.lora` CLI built on it) work on a kquant base.
+
+    Uses the standalone `patch_mlx_lm_load` (the load-only seam, no LoRA) — a
+    serving / eval consumer wants load without the adapt/fuse machinery."""
+    import mlx_lm.utils as mlx_utils
+
+    from mlx_kquant.mlx_lm_patch import patch_mlx_lm_load
+
+    base = _make_base(tmp_path)
+    patch_mlx_lm_load()
+    # Resolve load_model through the module (as mlx_lm's own `load` does), so the
+    # patched attribute is picked up — `from ... import load_model` would capture
+    # the pre-patch binding.
+    model, config = mlx_utils.load_model(base)
+
+    assert config.get("quantization", {}).get("mode") == "kquant"
+    assert any(type(m).__name__.startswith("KQuant") for _, m in model.named_modules())
+    out = model(mx.array([[1, 2, 3, 4, 5]]))
+    mx.eval(out)
+    assert bool(mx.all(mx.isfinite(out)).item())
 
 
 @gpu

@@ -1,8 +1,18 @@
-"""Teach mlx-lm's LoRA tuner to adapt and fuse a kquant-quantized base.
+"""Teach stock mlx-lm to understand kquant — across load, adapt, and fuse.
 
-mlx-lm's LoRA / fuse machinery recognises its own affine ``QuantizedLinear``
-family but not the kquant modules in :mod:`mlx_kquant.nn`. :func:`patch_mlx_lm_lora`
-closes that gap, in two ways:
+mlx-lm's loader and LoRA / fuse machinery recognise its own affine
+``QuantizedLinear`` family but not the kquant modules in :mod:`mlx_kquant.nn`.
+This module closes that gap by monkeypatching mlx-lm at stable entry points,
+behind two idempotent calls:
+
+:func:`patch_mlx_lm_load` — the **load** seam (enough for inference / eval / a
+server). It makes ``mlx_lm.utils.load_model`` kquant-aware, so anything built on
+it — ``mlx_lm.load`` and the ``mlx_lm.lora`` / ``mlx_lm.fuse`` / ``mlx_lm.generate``
+CLIs — can open a kquant checkpoint (stock ``load_model`` routes the config into
+``nn.quantize`` and fails). A non-kquant checkpoint falls through unchanged.
+
+:func:`patch_mlx_lm_lora` — the **adapt + fuse** seam (calls the load seam for
+you first), in two further ways:
 
 * it gives ``KQuantLinear`` / ``KQuantSwitchLinear`` / ``KQuantEmbedding`` a
   ``to_lora`` method, which mlx-lm's tuner consults first (both when discovering
@@ -14,10 +24,10 @@ closes that gap, in two ways:
   kept, re-encodes the merged weight through ``kq.quantize``. A non-kquant base
   falls through to the original implementation unchanged.
 
-Call it once before building LoRA layers or loading adapters; it is idempotent.
-Training a kquant LoRA also relies on the gradient-wrt-x ``vjp`` the extension
-defines on the matmul / gather ops (the frozen base passes gradient through to
-the trainable adapter).
+Call the relevant one once, before loading / building LoRA layers / loading
+adapters; both are idempotent. Training a kquant LoRA also relies on the
+gradient-wrt-x ``vjp`` the extension defines on the matmul / gather ops (the
+frozen base passes gradient through to the trainable adapter).
 
 DoRA is not supported on a kquant base in this release: mlx-lm's DoRA dispatch
 does not consult ``to_lora``, so ``--fine-tune-type dora`` on a kquant model
@@ -25,6 +35,8 @@ raises mlx-lm's own "Can't convert layer" error. Use LoRA.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -34,8 +46,45 @@ import mlx_kquant as kq
 from .codec_geometry import in_features
 from .nn import KQuantEmbedding, KQuantLinear, KQuantSwitchLinear
 
-_patched = False
+_load_patched = False
+_lora_patched = False
 _orig_fuse: dict = {}
+_orig_load_model = None
+
+
+# --- load_model: route a kquant checkpoint through the kquant loader ----------
+
+
+def _patched_load_model(
+    model_path,
+    lazy: bool = False,
+    strict: bool = True,
+    model_config: dict | None = None,
+    get_model_classes=None,
+):
+    from .loader import _kquant_block, _load_config
+    from .loader import load as _kq_load
+
+    config = None
+    try:
+        config = _load_config(Path(model_path))
+    except Exception:
+        pass
+
+    if config is not None and _kquant_block(config) is not None:
+        # Stock load_model can't read a kquant checkpoint; build it ourselves.
+        return _kq_load(model_path, lazy=lazy, strict=strict, model_config=model_config)
+
+    kwargs = {}
+    if get_model_classes is not None:
+        kwargs["get_model_classes"] = get_model_classes
+    return _orig_load_model(
+        model_path,
+        lazy=lazy,
+        strict=strict,
+        model_config=model_config,
+        **kwargs,
+    )
 
 
 # --- to_lora: wrap a kquant base in the matching LoRA module -----------------
@@ -178,12 +227,32 @@ def _embedding_fuse(self, dequantize: bool = False):
     return fused
 
 
+def patch_mlx_lm_load() -> None:
+    """Make stock ``mlx_lm.load`` / ``load_model`` open a kquant checkpoint.
+
+    Routes a kquant config through :func:`mlx_kquant.loader.load` and leaves every
+    other checkpoint untouched. This is the *inference* seam — enough for a serving
+    or eval consumer that never trains or fuses. Idempotent; called for you by
+    :func:`patch_mlx_lm_lora`.
+    """
+    global _load_patched, _orig_load_model
+    if _load_patched:
+        return
+    import mlx_lm.utils as _utils
+
+    _orig_load_model = _utils.load_model
+    _utils.load_model = _patched_load_model
+    _load_patched = True
+
+
 def patch_mlx_lm_lora() -> None:
-    """Make a stock mlx-lm install adapt and fuse kquant bases. Idempotent."""
-    global _patched
-    if _patched:
+    """Make a stock mlx-lm install load, adapt, and fuse kquant bases. Idempotent."""
+    global _lora_patched
+    if _lora_patched:
         return
     from mlx_lm.tuner import lora as _lora
+
+    patch_mlx_lm_load()  # the loader seam is a prerequisite for adapt/fuse
 
     KQuantLinear.to_lora = _linear_to_lora
     KQuantSwitchLinear.to_lora = _switch_to_lora
@@ -196,4 +265,4 @@ def patch_mlx_lm_lora() -> None:
     _lora.LoRASwitchLinear.fuse = _switch_fuse
     _lora.LoRAEmbedding.fuse = _embedding_fuse
 
-    _patched = True
+    _lora_patched = True

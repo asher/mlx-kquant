@@ -11,7 +11,7 @@ The leaf-swap installer that wires these into a constructed mlx-lm model lives i
 Each class carries ``mode = "kquant"`` plus ``kquant_type`` / ``group_size`` /
 ``bits`` / ``biases`` attributes so it duck-types with mlx-lm's affine
 ``QuantizedLinear`` family — that is what lets the LoRA tuner recognise and adapt
-a kquant base (see ``mlx_kquant.lora_patch``).
+a kquant base (see ``mlx_kquant.mlx_lm_patch``).
 """
 
 from __future__ import annotations

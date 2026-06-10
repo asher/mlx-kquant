@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate mlx_kquant.lora_patch: LoRA on a kquant base (apply / fuse / train).
+"""Validate mlx_kquant.mlx_lm_patch: LoRA on a kquant base (apply / fuse / train).
 
 patch_mlx_lm_lora() teaches stock mlx-lm to wrap a kquant module in a LoRA layer
 and to fuse the trained adapter back in. These checks cover:
@@ -36,7 +36,7 @@ from gguf import GGMLQuantizationType as GT
 from gguf import quants
 
 import mlx_kquant as kq
-from mlx_kquant.lora_patch import patch_mlx_lm_lora
+from mlx_kquant.mlx_lm_patch import patch_mlx_lm_lora
 from mlx_kquant.nn import KQuantLinear, KQuantSwitchLinear
 
 # fuse(dequantize=False) re-encodes via kq.quantize, which is GPU-only and would

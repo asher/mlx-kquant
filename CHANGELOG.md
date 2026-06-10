@@ -20,12 +20,15 @@ toolchain that runs on a stock `mlx==0.31.2` wheel.
 - `mlx_kquant.recipes` / `imatrix` / `quantize` — preset-driven create-weights
   pipeline with optional importance-matrix calibration (GPU encode).
 - `mlx_kquant.loader` — load a kquant checkpoint into a stock mlx-lm model.
-- `mlx-kquant` CLI (alias `mlxkq`): `quantize`, `calibrate-imatrix`, `fuse`,
-  `verify`, `run`. Requires the `[tools]` extra.
-- LoRA support for kquant bases (`mlx_kquant.lora_patch` + `docs/lora.md`),
+- `mlx-kquant` CLI (alias `mlxkq`): `quantize`, `calibrate-imatrix`, `lora`,
+  `fuse`, `verify`, `run`. Requires the `[tools]` extra.
+- LoRA support for kquant bases (`mlx_kquant.mlx_lm_patch` + `docs/lora.md`),
   backed by a gradient-wrt-x `vjp` on the matmul / gather ops: attach / train /
   merge an adapter. `mlx-kquant fuse` re-encodes the merge to kquant or, with
-  `--dequantize`, writes a float checkpoint. DoRA is not supported.
+  `--dequantize`, writes a float checkpoint. DoRA is not supported. A standalone
+  `patch_mlx_lm_load()` enables load-only interop (inference / eval, no LoRA).
+- `docs/integration.md` — reference for building on the `kq.*` ops (wire-byte
+  contract, on-disk format, codec table, the layer/loader/encode/interop seams).
 - CPU decode path for all 10 codecs (`stream=mx.cpu`) covering `dequantize` /
   `quantized_matmul` / `gather_qmm`, so the op tests run without a GPU.
 - PEP 621 packaging, `py.typed`, ruff config, CI (lint + build + honest GPU-gated
