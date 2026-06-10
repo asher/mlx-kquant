@@ -1,19 +1,30 @@
 # mlx-kquant
 
-GGUF **K-quant** ops for [MLX](https://github.com/ml-explore/mlx) on Apple Silicon, packaged as a
-C++/Metal **extension** that installs on top of a stock `mlx` wheel.
+Bring **K-quant precision to [MLX](https://github.com/ml-explore/mlx)** on Apple Silicon: a C++/Metal
+**extension** for a stock `mlx` wheel that adds the llama.cpp K-quant / legacy codecs as native MLX
+ops, plus a toolchain that quantizes a model into a **K-quant MLX safetensors checkpoint** and runs,
+LoRA-trains, and fuses it.
 
-It exposes its own op namespace — `kq.dequantize`, `kq.quantized_matmul`, `kq.gather_qmm`,
-`kq.quantize`, and a fast `kq.load_gguf` — backed by precompiled Metal kernels that ship in a
-`.metallib` inside the wheel. All ten GGUF K-quant / legacy codecs are supported:
-`q2_k, q3_k, q4_k, q5_k, q6_k` and `q4_0, q4_1, q5_0, q5_1, q8_0`.
+Two layers, one wheel:
+
+- **Ops** — a `kq.*` namespace (`dequantize`, `quantized_matmul`, `gather_qmm`, `quantize`, and a
+  zero-copy `load_gguf` reader) backed by precompiled Metal kernels shipped in a `.metallib`. All ten
+  codecs: `q2_k, q3_k, q4_k, q5_k, q6_k` and `q4_0, q4_1, q5_0, q5_1, q8_0`.
+- **Tooling** — `mlx-kquant quantize / run / lora / fuse` and a `loader` that create and run K-quant
+  checkpoints in **MLX-native safetensors** — the same format `mlx_lm` reads. No GGUF files in or out.
 
 ## Why
 
-Run GGUF K-quant weights on MLX directly — every K-quant and legacy codec gets its own MLX op, with
-no conversion to another quantization format. The dispatch tuning here (matrix-contiguity handling
-for fused MoE expert weights, single-pass NAX matmul) is fast on real models — see
-[Performance](#performance).
+K-quant is the precision recipe behind the strongest small-footprint llama.cpp quants; this makes it
+first-class on MLX. Quantize an HF / `mlx-lm` model to a uniform- or mixed-precision K-quant
+checkpoint, then load, generate, LoRA-train, and fuse it — all on a stock `mlx` wheel, all in MLX
+safetensors. The kernels are tuned for real models (matrix-contiguity handling for fused MoE experts,
+single-pass NAX matmul) — see [Performance](#performance).
+
+> mlx-kquant is **not** a GGUF runtime — its tooling reads and writes MLX safetensors, not `.gguf`
+> files. The `kq.load_gguf` op is a low-level reader that lets downstream packages such as
+> [`gguf-mlx`](#running-gguf-files--gguf-mlx) build a pure-Python GGUF runtime on top; to run a
+> `.gguf` file directly, use gguf-mlx.
 
 ## Install
 
@@ -23,6 +34,7 @@ wheel:
 ```sh
 pip install "mlx==0.31.2"     # pinned, ABI-matched stock wheel
 pip install -e .              # builds _ext + mlx_kquant.metallib
+pip install -e ".[tools]"     # + mlx-lm, for the quantize / run / lora / fuse CLI
 ```
 
 Smoke-test the toolchain:
@@ -72,7 +84,10 @@ idx = mx.array([[0, 5, 9, 17, 33, 41, 88, 120]], dtype=mx.uint32)
 out = kq.gather_qmm(x, weq, sc, "q4_k", rhs_indices=idx, transpose=True)
 ```
 
-Load a GGUF file (tensors as wire bytes + decoded metadata, ~15 GB/s via a C++ mmap memcpy):
+`load_gguf` is a low-level **reader**, not a model loader — a zero-copy building block (tensors as
+wire bytes + decoded metadata, ~15 GB/s via a C++ mmap memcpy) for runtimes like
+[`gguf-mlx`](#running-gguf-files--gguf-mlx). mlx-kquant's own checkpoints are MLX safetensors
+([below](#create-and-run-a-checkpoint)).
 
 ```python
 arrays, codecs, metadata, shapes = kq.load_gguf("model.gguf")
@@ -81,6 +96,31 @@ arrays, codecs, metadata, shapes = kq.load_gguf("model.gguf")
 # metadata[key] -> decoded GGUF KV value
 # shapes[name]  -> logical (GGUF-native) shape
 ```
+
+### Create and run a checkpoint
+
+The CLI (the `[tools]` extra adds `mlx-lm`) quantizes an HF / `mlx-lm` model into a K-quant **MLX
+safetensors** checkpoint and runs it — no GGUF involved:
+
+```sh
+pip install "mlx-kquant[tools]"
+mlx-kquant quantize --model Qwen/Qwen3-0.6B --preset q4_k_m --mlx-path qwen3-q4
+mlx-kquant run --model qwen3-q4 --prompt "Explain entropy in one sentence."
+```
+
+The result is a standard MLX checkpoint (`config.json` + sharded safetensors, weights as K-quant wire
+bytes). Load it in code with the bundled loader:
+
+```python
+import mlx.core as mx
+from mlx_kquant.loader import load
+
+model, config = load("qwen3-q4")          # KQuant* layers swapped in, on a stock mlx-lm model
+mx.eval(model(mx.array([[1, 2, 3]])))
+```
+
+`mlx-kquant lora` (train an adapter) and `mlx-kquant fuse` (merge it back) round out the toolchain —
+see [LoRA fine-tuning](#lora-fine-tuning). Run `mlx-kquant --help` for every subcommand.
 
 ### Use it in your own model
 
@@ -102,6 +142,10 @@ leaves of a whole constructed mlx-lm model in one call, use
 `mlx_kquant.nn.install_kquant_modules(model, {"<path>.weight": "q4_k", ...})`. The **gguf-mlx**
 package builds its full GGUF runtime on exactly these classes.
 
+The `[tools]` layer is itself a worked reference for wiring `kq.*` into the MLX ecosystem: the loader,
+encoder, layer modules, and the mlx-lm monkeypatch are all small and self-contained. See
+**[docs/integration.md](docs/integration.md)** if you're building on the ops.
+
 ### LoRA fine-tuning
 
 A kquant checkpoint is a frozen base you can adapt with LoRA — attach an adapter for inference, train
@@ -110,20 +154,20 @@ while the quantized weights stay frozen), and merge it back with `mlx-kquant fus
 kquant, or `--dequantize` to float). One call wires it into stock mlx-lm:
 
 ```python
-from mlx_kquant.lora_patch import patch_mlx_lm_lora
+from mlx_kquant.mlx_lm_patch import patch_mlx_lm_lora
 patch_mlx_lm_lora()   # before building LoRA layers / loading adapters; idempotent
 ```
 
 See **[docs/lora.md](docs/lora.md)** for attach / train / merge workflows. (DoRA on a kquant base is
 not supported — use LoRA.)
 
-## Running full GGUF models — `gguf-mlx`
+## Running GGUF files — `gguf-mlx`
 
-This extension is the low-level op/kernel layer. To **load and run a complete GGUF model** —
-name remap, config + tokenizer synth from GGUF metadata, K-quant leaf swap, dense or MoE, plus
-a CLI and OpenAI-compatible servers — use the separate **`gguf-mlx`** package. It depends on
-this one and wires the `kq.*` ops into a full runtime, with no conversion and no safetensors
-round-trip:
+mlx-kquant produces MLX safetensors checkpoints; it does not run `.gguf` files. To **load and run a
+complete GGUF model** — name remap, config + tokenizer synth from GGUF metadata, K-quant leaf swap,
+dense or MoE, plus a CLI and OpenAI-compatible servers — use the separate **`gguf-mlx`** package. It
+depends on this one and builds a pure-Python GGUF runtime on the `kq.*` ops (notably `kq.load_gguf`),
+with no conversion and no safetensors round-trip:
 
 ```sh
 pip install gguf-mlx          # pulls in mlx-kquant + mlx-lm, transformers, tokenizers, gguf
@@ -163,9 +207,15 @@ weights. Measured on an M5 Max (128 GB):
 
 ## Scope
 
-This is an **op-level library** with its own `kq.*` namespace. To use it, point your model's
-quantized layers at the `kq.*` ops (see [Use it in your own model](#use-it-in-your-own-model)); the
-separate **gguf-mlx** package is a full worked example.
+mlx-kquant is two things on one wheel:
+
+- **The op layer** — the `kq.*` namespace and its Metal kernels. Point your own model's quantized
+  layers at these ops (see [Use it in your own model](#use-it-in-your-own-model)).
+- **The checkpoint toolchain** — `quantize` / `loader` / `run` / `lora` / `fuse`, which create and run
+  **MLX safetensors** K-quant checkpoints (the `[tools]` extra).
+
+What it is **not**: a GGUF model runtime. Reading and running `.gguf` files is the job of the separate
+**[`gguf-mlx`](#running-gguf-files--gguf-mlx)** package, which is built on this one.
 
 ## Codec reference
 
@@ -209,7 +259,7 @@ python -m pytest tests/      # dequant / matmul / gather / codecs / cpu_decode /
   until the 0.2.0 CPU encoder. No NVIDIA/AMD/Linux-GPU support; a Metal-free Linux build is on the
   roadmap.
 - The library is the **op layer**, not a model runtime. To load and run full GGUF models, use the
-  separate [`gguf-mlx`](#running-full-gguf-models--gguf-mlx) package.
+  separate [`gguf-mlx`](#running-gguf-files--gguf-mlx) package.
 - **LoRA, not DoRA.** LoRA adapters train, attach, and fuse on a kquant base (see
   [docs/lora.md](docs/lora.md)); DoRA is not supported. `fuse` re-encoding to kquant is GPU-only
   (`--dequantize` to float runs anywhere).

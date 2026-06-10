@@ -7,7 +7,7 @@ gradient-with-respect-to-the-input `vjp` — gradient flows *through* the frozen
 base to reach the trainable adapter, while the quantized weights themselves carry
 no gradient (they are frozen, exactly as LoRA wants).
 
-`mlx_kquant.lora_patch.patch_mlx_lm_lora()` teaches a stock
+`mlx_kquant.mlx_lm_patch.patch_mlx_lm_lora()` teaches a stock
 [mlx-lm](https://github.com/ml-explore/mlx-lm) install to recognise the kquant
 modules in `mlx_kquant.nn` — so mlx-lm's own LoRA tuner, adapter loading, and the
 `mlx-kquant fuse` merge tool all work on a kquant checkpoint. Call it once, before
@@ -17,10 +17,92 @@ building LoRA layers or loading adapters; it is idempotent.
 > see the separate **`gguf-mlx`** package (`pip install gguf-mlx`), which is built
 > on these ops.
 
+## Worked example: a pirate Qwen3-0.6B
+
+End to end — quantize a small model, LoRA-train it to talk like a pirate, merge
+the adapter, and chat with it. Needs the `[tools]` extra. Uses the tiny
+[`GPT007/pirate_speak`][pirate] dataset (100 chat turns).
+
+[pirate]: https://huggingface.co/datasets/GPT007/pirate_speak
+
+**1. Build the training data.** The dataset ships as Llama-3-formatted text; pull
+out the user/assistant turns and re-emit them as mlx-lm chat records, so the
+trainer applies *Qwen3's* chat template:
+
+```python
+# prep_pirate.py
+import json, re
+from pathlib import Path
+from datasets import load_dataset
+
+ds = load_dataset("GPT007/pirate_speak", split="train")
+turn = re.compile(
+    r"user<\|end_header_id\|>\n\n(.*?)<\|eot_id\|>.*?"
+    r"assistant<\|end_header_id\|>\n\n(.*?)<\|eot_id\|>",
+    re.DOTALL,
+)
+records = []
+for row in ds:
+    m = turn.search(row["text"])
+    if m:
+        records.append({"messages": [
+            {"role": "user", "content": m.group(1).strip()},
+            {"role": "assistant", "content": m.group(2).strip()},
+        ]})
+
+out = Path("pirate-data"); out.mkdir(exist_ok=True)
+split = max(1, len(records) // 10)   # 10% validation
+(out / "valid.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records[:split]))
+(out / "train.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records[split:]))
+print(f"wrote {len(records) - split} train / {split} valid -> {out}/")
+```
+
+```sh
+python prep_pirate.py     # -> pirate-data/{train,valid}.jsonl
+```
+
+**2. Quantize the base** to a K-quant MLX checkpoint:
+
+```sh
+mlx-kquant quantize --model Qwen/Qwen3-0.6B --preset q4_k_m --mlx-path qwen3-0.6b-q4_k_m
+```
+
+**3. Train the LoRA adapter** on the kquant base (`mlx-kquant lora` is mlx-lm's
+trainer with the kquant patch applied — all its flags work):
+
+```sh
+mlx-kquant lora \
+    --model qwen3-0.6b-q4_k_m --train \
+    --data ./pirate-data \
+    --iters 300 --batch-size 4 --num-layers 8 \
+    --adapter-path pirate-adapter
+```
+
+**4. Merge** the adapter back into the base (stays kquant; `--dequantize` for a
+float checkpoint instead):
+
+```sh
+mlx-kquant fuse --model qwen3-0.6b-q4_k_m \
+    --adapter-path pirate-adapter \
+    --save-path qwen3-0.6b-pirate
+```
+
+**5. Chat** with the result:
+
+```sh
+mlx-kquant run --model qwen3-0.6b-pirate \
+    --prompt "What's the weather like today?"
+```
+
+The base Qwen3-0.6B answers plainly; after fine-tuning it answers in character —
+"Arrr, the skies be fair fer sailin', matey!". (300 iterations on 90 examples is a
+minute or two on an M-series GPU and is enough to pick up the style; turn it up for
+a stronger effect.)
+
 ## Attach an adapter (inference / no training)
 
 ```python
-from mlx_kquant.lora_patch import patch_mlx_lm_lora
+from mlx_kquant.mlx_lm_patch import patch_mlx_lm_lora
 from mlx_kquant.loader import load
 from mlx_lm.tuner.utils import load_adapters
 
@@ -40,12 +122,17 @@ Training uses mlx-lm's own LoRA trainer unchanged — the patch makes the kquant
 layers adaptable, and the ops' `vjp` makes them differentiable. The base stays
 frozen; only the adapter (and any unfrozen norm/bias) carries gradient.
 
-```python
-from mlx_kquant.lora_patch import patch_mlx_lm_lora
-patch_mlx_lm_lora()
-# then drive mlx-lm's tuner as usual: linear_to_lora_layers(...) + an optimizer,
-# or `mlx_lm.lora` with --model pointing at the kquant checkpoint.
+The `mlx-kquant lora` subcommand is a thin pass-through to that trainer with the
+patch applied, so `--model` may be a kquant checkpoint and every mlx-lm `lora`
+flag works unchanged:
+
+```sh
+mlx-kquant lora --model my-model-q4km --train --data ./data --iters 300
+# writes adapters/adapter_config.json + adapters.safetensors
 ```
+
+(Run `mlx-kquant lora --help` for the full flag list — it is mlx-lm's.) See the
+[worked example](#worked-example-a-pirate-qwen3-06b) below for an end-to-end run.
 
 The gradient path is validated end-to-end in `tests/test_lora_patch.py`
 (`test_lora_trains_dense` / `test_lora_trains_moe`): a trainable projection
