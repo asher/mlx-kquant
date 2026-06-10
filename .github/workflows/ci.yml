@@ -18,7 +18,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff clang-format==19.1.5
+      # Pin ruff so CI, pre-commit (.pre-commit-config.yaml), and dev installs
+      # all format/lint identically — an unpinned ruff can change format rules
+      # between releases and turn `ruff format --check` red without a code change.
+      - run: pip install ruff==0.15.16 clang-format==19.1.5
       - name: ruff check
         run: ruff check .
       - name: ruff format --check
