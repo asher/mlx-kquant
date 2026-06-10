@@ -120,6 +120,34 @@ def test_load_rejects_non_kquant(tmp_path):
         load(tmp_path)
 
 
+def _model_file_cfg() -> dict:
+    return {
+        "model_type": "llama",
+        "model_file": "custom.py",
+        "quantization": {"mode": "kquant", "per_tensor": {"fc": "q4_k"}},
+    }
+
+
+def test_load_model_file_gate(tmp_path):
+    # A custom model_file is refused without the opt-in, and the error names
+    # both the kwarg and the CLI flag.
+    import json
+
+    (tmp_path / "config.json").write_text(json.dumps(_model_file_cfg()))
+    with pytest.raises(ValueError, match="--trust-remote-code"):
+        load(tmp_path)
+
+
+def test_load_model_file_missing(tmp_path):
+    # Opting in when the declared file is absent (the Hub-download case, where
+    # _HF_ALLOW filters code files) raises a clear error, not FileNotFoundError.
+    import json
+
+    (tmp_path / "config.json").write_text(json.dumps(_model_file_cfg()))
+    with pytest.raises(ValueError, match="not present"):
+        load(tmp_path, trust_remote_code=True)
+
+
 def test_install_kquant_modules_shape_math():
     """No GPU: install swaps a Linear leaf and sizes the uint8 weight correctly."""
     import mlx.nn as nn

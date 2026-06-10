@@ -127,8 +127,10 @@ def load(
         ``(model, config)`` with ``KQuant*`` modules installed and weights loaded.
 
     Raises:
-        ValueError: the checkpoint is not a kquant checkpoint, or declares a
-            custom ``model_file`` without ``trust_remote_code=True``.
+        ValueError: the checkpoint is not a kquant checkpoint, declares a
+            custom ``model_file`` without ``trust_remote_code=True``, or
+            declares a ``model_file`` that is not present on disk (Hub
+            downloads exclude code files).
         FileNotFoundError: no ``model*.safetensors`` in the checkpoint.
     """
     require_tools()
@@ -156,12 +158,21 @@ def load(
         raise ValueError(
             f"{path_or_hf_repo} declares a custom model_file ({model_file!r}), "
             f"which would import and execute code shipped in the checkpoint. "
-            f"Pass trust_remote_code=True only if you trust its source."
+            f"Pass trust_remote_code=True (CLI: --trust-remote-code) only if "
+            f"you trust its source."
         )
     if model_file is not None:
-        spec = importlib.util.spec_from_file_location(
-            "kq_custom_model", model_path / model_file
-        )
+        model_py = model_path / model_file
+        if not model_py.is_file():
+            # Hub downloads exclude code files by design (_HF_ALLOW), so a
+            # remote checkpoint's model_file never arrives through this loader.
+            raise ValueError(
+                f"{path_or_hf_repo} declares model_file ({model_file!r}) but "
+                f"the file is not present at {model_py}. Hub downloads exclude "
+                f"code files by design; clone the repo and load it from a local "
+                f"path if you intend to run its code."
+            )
+        spec = importlib.util.spec_from_file_location("kq_custom_model", model_py)
         arch = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(arch)
         model_class, args_class = arch.Model, arch.ModelArgs
