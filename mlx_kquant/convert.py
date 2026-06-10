@@ -138,6 +138,9 @@ def quantize_model(
     per_tensor: dict[str, str] = {}
     replacements = []
     skipped = 0
+    # The encode op evaluates eagerly per tensor, so this count is honest
+    # progress (big models otherwise look hung for minutes).
+    n_mapped = sum(1 for c in codec_map.values() if c is not None)
     for path, module in model.named_modules():
         codec = codec_map.get(path)
         if codec is None:
@@ -183,6 +186,8 @@ def quantize_model(
 
         per_tensor[path] = codec
         replacements.append((path, repl))
+        if len(per_tensor) % 32 == 0:
+            print(f"[mlx-kquant] encoding {len(per_tensor)}/{n_mapped} tensors")
 
     if replacements:
         model.update_modules(tree_unflatten(replacements))

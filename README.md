@@ -10,8 +10,9 @@ Two layers, one wheel:
 - **Ops** - a `kq.*` namespace (`dequantize`, `quantized_matmul`, `gather_qmm`, `quantize`, and a
   zero-copy `load_gguf` reader) backed by precompiled Metal kernels shipped in a `.metallib`. All ten
   codecs: `q2_k, q3_k, q4_k, q5_k, q6_k` and `q4_0, q4_1, q5_0, q5_1, q8_0`.
-- **Tooling** - `mlx-kquant quantize / run / lora / fuse` and a `loader` that create and run K-quant
-  checkpoints in **MLX-native safetensors** - the same format `mlx_lm` reads. No GGUF files in or out.
+- **Tooling** - `mlx-kquant quantize / run / chat / lora / fuse` (plus `verify`, `inspect`,
+  `calibrate-imatrix`) and a `loader` that create and run K-quant checkpoints in **MLX-native
+  safetensors** - the same format `mlx_lm` reads. No GGUF files in or out.
 
 ## Why
 
@@ -34,7 +35,7 @@ pinned MLX wheel:
 ```sh
 pip install "mlx==0.31.2"     # pinned, ABI-matched stock wheel (pulls the Metal backend)
 pip install -e .              # builds _ext + mlx_kquant.metallib
-pip install -e ".[tools]"     # + mlx-lm, for the quantize / run / lora / fuse CLI
+pip install -e ".[tools]"     # + mlx-lm, for the CLI subcommands (quantize / run / chat / ...)
 ```
 
 **Linux (CPU-only)** also builds, with no Metal toolchain - every op runs through its scalar
@@ -118,7 +119,12 @@ safetensors** checkpoint and runs it - no GGUF involved:
 pip install "mlx-kquant[tools]"
 mlx-kquant quantize --model Qwen/Qwen3-0.6B --preset q4_k_m --mlx-path qwen3-q4
 mlx-kquant run --model qwen3-q4 --prompt "Explain entropy in one sentence."
+mlx-kquant chat --model qwen3-q4 --temp 0.7      # interactive REPL (mlx-lm chat)
 ```
+
+`run` takes the usual sampling knobs (`--temp`, `--top-p`, `--top-k`, `--min-p`, `--seed`) and
+chat-template controls (`--system-prompt`, `--no-chat-template`, `--chat-template-config` for
+template kwargs such as `'{"enable_thinking": false}'`).
 
 The result is a standard MLX checkpoint (`config.json` + sharded safetensors, weights as K-quant wire
 bytes). Load it in code with the bundled loader:
@@ -227,8 +233,9 @@ mlx-kquant is two things on one wheel:
 
 - **The op layer** - the `kq.*` namespace and its Metal kernels. Point your own model's quantized
   layers at these ops (see [Use it in your own model](#use-it-in-your-own-model)).
-- **The checkpoint toolchain** - `quantize` / `loader` / `run` / `lora` / `fuse`, which create and run
-  **MLX safetensors** K-quant checkpoints (the `[tools]` extra).
+- **The checkpoint toolchain** - `quantize` / `loader` / `run` / `chat` / `lora` / `fuse` (plus
+  `verify`, `inspect`, `calibrate-imatrix`), which create and run **MLX safetensors** K-quant
+  checkpoints (the `[tools]` extra).
 
 What it is **not**: a GGUF model runtime. Reading and running `.gguf` files is the job of the separate
 **[`gguf-mlx`](#running-gguf-files--gguf-mlx)** package, which is built on this one.

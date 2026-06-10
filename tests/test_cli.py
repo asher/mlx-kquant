@@ -68,6 +68,62 @@ def test_quantize_parses_ok():
     assert callable(args.func)
 
 
+def test_quantize_rejects_unknown_preset():
+    # choices= catches recipe typos in argparse, before any model load.
+    with pytest.raises(SystemExit) as e:
+        _build_parser().parse_args(
+            ["quantize", "--model", "m", "--mlx-path", "o", "--preset", "q4km"]
+        )
+    assert e.value.code == 2
+
+
+def test_quantize_rejects_unknown_codec():
+    with pytest.raises(SystemExit) as e:
+        _build_parser().parse_args(
+            ["quantize", "--model", "m", "--mlx-path", "o", "--kquant-type", "q4k"]
+        )
+    assert e.value.code == 2
+
+
+def test_run_sampling_and_template_flags_parse():
+    args = _build_parser().parse_args(
+        [
+            "run",
+            "--model",
+            "m",
+            "--top-p",
+            "0.9",
+            "--top-k",
+            "40",
+            "--min-p",
+            "0.05",
+            "--seed",
+            "7",
+            "--system-prompt",
+            "be brief",
+            "--no-chat-template",
+            "--chat-template-config",
+            '{"enable_thinking": false}',
+        ]
+    )
+    assert args.top_p == 0.9
+    assert args.top_k == 40
+    assert args.min_p == 0.05
+    assert args.seed == 7
+    assert args.no_chat_template is True
+
+
+def test_passthrough_commands_registered():
+    # lora / chat are pre-argparse pass-throughs but must still appear in the
+    # registered command list for the top-level --help.
+    import argparse
+
+    parser = _build_parser()
+    sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    assert "lora" in sub.choices
+    assert "chat" in sub.choices
+
+
 def test_verify_requires_a_target():
     with pytest.raises(SystemExit):
         _build_parser().parse_args(["verify"])
@@ -80,6 +136,16 @@ def test_verify_codecs_runs():
 
 def test_verify_presets_runs():
     assert main(["verify", "--presets"]) == 0
+
+
+def test_verify_presets_differentiates_variants(capsys):
+    # The s/m/xl variants share role maps; the output must surface the path /
+    # layer bumps that actually distinguish them.
+    assert main(["verify", "--presets"]) == 0
+    out = capsys.readouterr().out
+    assert "path bumps:" in out
+    assert ".mlp.down_proj=q6_k" in out  # q4_k_xl / q5_k_xl path bump
+    assert "use_more_bits" in out  # the _m layer-position cadence
 
 
 def _fake_kquant_checkpoint(d, codec="q8_0", path="model.layers.0.mlp.down_proj"):
@@ -137,6 +203,32 @@ def test_inspect_rejects_non_kquant(tmp_path, capsys):
     (d / "config.json").write_text(json.dumps({"model_type": "llama"}))
     assert main(["inspect", "--model", str(d)]) == 1
     assert "not a kquant checkpoint" in capsys.readouterr().err
+
+
+def test_quantize_rejects_quantized_source(tmp_path, capsys):
+    # Pointing quantize at an already-quantized checkpoint (e.g. an
+    # mlx-community 4-bit repo) must fail clearly, before the model load.
+    pytest.importorskip("mlx_lm")
+    d = tmp_path / "quantized-src"
+    d.mkdir()
+    (d / "config.json").write_text(
+        json.dumps(
+            {"model_type": "llama", "quantization": {"bits": 4, "group_size": 64}}
+        )
+    )
+    rc = main(
+        [
+            "quantize",
+            "--model",
+            str(d),
+            "--mlx-path",
+            str(tmp_path / "out"),
+            "--kquant-type",
+            "q4_k",
+        ]
+    )
+    assert rc == 1
+    assert "already quantized" in capsys.readouterr().err
 
 
 def test_quantize_then_verify_e2e(tmp_path):

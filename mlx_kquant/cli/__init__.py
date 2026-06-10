@@ -8,7 +8,8 @@ and as ``python -m mlx_kquant``. Subcommands:
   lora               train/test a LoRA adapter on a kquant base (mlx-lm trainer)
   fuse               merge a trained LoRA adapter into a kquant checkpoint
   verify             smoke-check the codecs / presets, or a built checkpoint
-  run                load a checkpoint and generate a few tokens
+  run                load a checkpoint and generate text (one-shot)
+  chat               interactive chat REPL on a kquant checkpoint (mlx-lm chat)
   inspect            print a checkpoint's per-tensor codec recipe (no GPU)
 
 The model-level subcommands need the ``[tools]`` extra (mlx-lm); a missing extra
@@ -24,9 +25,9 @@ import argparse
 import sys
 
 from .. import __version__
-from . import calibrate, fuse, inspect, lora, quantize, run, verify
+from . import calibrate, chat, fuse, inspect, lora, quantize, run, verify
 
-_SUBCOMMANDS = (quantize, calibrate, lora, fuse, verify, run, inspect)
+_SUBCOMMANDS = (quantize, calibrate, lora, fuse, verify, run, chat, inspect)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -45,13 +46,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     raw = sys.argv[1:] if argv is None else list(argv)
-    # `lora` is a pass-through to mlx-lm's trainer - intercept it before argparse
-    # so every mlx-lm flag (including --help) reaches it untouched (REMAINDER
-    # can't capture a leading option).
-    if raw and raw[0] == "lora":
+    # `lora` / `chat` are pass-throughs to mlx-lm CLIs - intercept them before
+    # argparse so every mlx-lm flag (including --help) reaches them untouched
+    # (REMAINDER can't capture a leading option).
+    if raw and raw[0] in ("lora", "chat"):
+        mod = lora if raw[0] == "lora" else chat
         try:
-            return lora.passthrough(raw[1:])
-        except (ImportError, ValueError, FileNotFoundError) as e:
+            return mod.passthrough(raw[1:])
+        except KeyboardInterrupt:
+            print("\ninterrupted", file=sys.stderr)
+            return 130
+        except (ImportError, ValueError, OSError) as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
 
@@ -61,6 +66,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         return 130
-    except (ImportError, ValueError, FileNotFoundError) as e:
+    except (ImportError, ValueError, OSError) as e:
+        # OSError covers FileNotFoundError plus the huggingface_hub / requests
+        # error family (RepositoryNotFoundError, network failures, ...), which
+        # would otherwise surface as raw tracebacks.
         print(f"error: {e}", file=sys.stderr)
         return 1

@@ -19,8 +19,12 @@ toolchain that runs on a stock `mlx==0.31.2` wheel.
   pipeline with optional importance-matrix calibration.
 - `mlx_kquant.loader` - load a kquant checkpoint into a stock mlx-lm model.
 - `mlx-kquant` CLI (alias `mlxkq`): `quantize`, `calibrate-imatrix`, `lora`,
-  `fuse`, `verify`, `run`, `inspect`. Requires the `[tools]` extra (except
-  `inspect` and `verify --codecs`, which run on a base install).
+  `fuse`, `verify`, `run`, `chat`, `inspect`. Requires the `[tools]` extra
+  (except `inspect` and `verify --codecs`, which run on a base install).
+- `mlx-kquant chat` - interactive REPL: a pass-through to mlx-lm's chat with
+  the kquant patch applied. `run` carries sampling (`--top-p` / `--top-k` /
+  `--min-p` / `--seed`) and chat-template (`--system-prompt` /
+  `--no-chat-template` / `--chat-template-config`) controls.
 - `mlx-kquant inspect` - print a checkpoint's per-tensor codec recipe (codec,
   bits, packed/logical shape) from the config + safetensors headers, no GPU.
 - LoRA support for kquant bases (`mlx_kquant.mlx_lm_patch` + `docs/lora.md`),

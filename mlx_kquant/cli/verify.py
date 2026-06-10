@@ -41,11 +41,32 @@ def cmd(args: argparse.Namespace) -> int:
         return 0
 
     if args.presets:
-        from ..recipes import KQUANT_PRESETS
+        from ..recipes import _LAYER_POSITION_BUMPS, _PATH_BUMPS, KQUANT_PRESETS
 
         for name in sorted(KQUANT_PRESETS):
-            default = KQUANT_PRESETS[name].get("default")
-            print(f"  {name:10} default={default}")
+            entries = KQUANT_PRESETS[name]
+            default = entries.get("default")
+            roles = [
+                f"{role}={codec}"
+                for role, codec in sorted(entries.items())
+                if role != "default" and codec != default
+            ]
+            line = f"  {name:10} default={default}"
+            if roles:
+                line += "  " + "  ".join(roles)
+            print(line)
+            bumps = _PATH_BUMPS.get(name)
+            if bumps:
+                btxt = "  ".join(f"{s}={c}" for s, c in sorted(bumps.items()))
+                print(f"  {'':10}   path bumps: {btxt}")
+            for suffix, (codec, rule) in sorted(
+                _LAYER_POSITION_BUMPS.get(name, {}).items()
+            ):
+                print(f"  {'':10}   layer bumps: {suffix}={codec} on {rule} layers")
+        print(
+            "\n  Roles not listed take the default; path/layer bumps match on "
+            "module-path suffix. The _s/_m/_xl variants differ in these bumps."
+        )
         return 0
 
     # --model: full load + forward (needs [tools] + a GPU to decode).

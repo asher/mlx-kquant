@@ -217,6 +217,17 @@ def test_patched_load_model_file_trusted(tmp_path):
         mlx_lm_patch._trust_remote_code = False
 
 
+def test_resolve_path_typo_is_not_a_repo_id():
+    # A nonexistent path-shaped input must say "no such file", not bounce off
+    # the HF Hub validator's repo-id naming-rules message. No network needed.
+    from mlx_kquant.loader import _resolve_path
+
+    with pytest.raises(FileNotFoundError, match="no such file"):
+        _resolve_path("/definitely/nonexistent-zzz", None)
+    with pytest.raises(FileNotFoundError, match="no such file"):
+        _resolve_path("./definitely-nonexistent-zzz", None)
+
+
 def test_install_kquant_modules_shape_math():
     """No GPU: install swaps a Linear leaf and sizes the uint8 weight correctly."""
     import mlx.nn as nn

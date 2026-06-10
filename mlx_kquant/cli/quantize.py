@@ -6,6 +6,11 @@ import argparse
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
+    # Cheap, base-install-safe imports: codec/preset typos fail in argparse
+    # (with the choices listed) instead of after a multi-GB model load.
+    from ..codec_geometry import CODEC_GEOMETRY
+    from ..recipes import KQUANT_PRESETS
+
     p = subparsers.add_parser(
         "quantize",
         help="encode an mlx-lm / HF model into a kquant checkpoint",
@@ -25,14 +30,17 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     recipe = p.add_mutually_exclusive_group(required=True)
     recipe.add_argument(
         "--preset",
-        help="Recipe preset (e.g. q4_k_m, q5_k_moe). See `verify --presets`.",
+        choices=sorted(KQUANT_PRESETS),
+        help="Recipe preset. See `verify --presets` for what each maps.",
     )
     recipe.add_argument(
         "--kquant-type",
-        help="Uniform codec for every quantizable tensor (e.g. q4_k, q8_0).",
+        choices=sorted(CODEC_GEOMETRY),
+        help="Uniform codec for every quantizable tensor.",
     )
     p.add_argument(
         "--default-codec",
+        choices=sorted(CODEC_GEOMETRY),
         help="Codec for tensors a preset does not map (defaults to the preset's "
         "own default).",
     )
@@ -44,6 +52,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def cmd(args: argparse.Namespace) -> int:
+    import json
+    from pathlib import Path
+
     from .._deps import require_tools
 
     require_tools()
@@ -53,7 +64,26 @@ def cmd(args: argparse.Namespace) -> int:
     from ..convert import quantize_model, save
     from ..loader import _resolve_path
 
+    # Fail on bad side inputs before the (slow, large) model load.
+    if args.imatrix and not Path(args.imatrix).is_file():
+        raise FileNotFoundError(f"--imatrix {args.imatrix}: no such file")
+
     src = _resolve_path(args.model, None)
+    try:
+        src_config = json.loads((src / "config.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        src_config = {}
+    quant = src_config.get("quantization") or src_config.get("quantization_config")
+    if quant:
+        mode = "unknown"
+        if isinstance(quant, dict):
+            mode = quant.get("mode") or quant.get("quant_method") or "affine"
+        raise ValueError(
+            f"{args.model} is already quantized (mode={mode!r}); quantize needs "
+            f"a float (bf16/f16) source model."
+        )
+
+    print(f"[mlx-kquant] loading {args.model}")
     model, config = load_model(src, lazy=False)
 
     # --kquant-type names a uniform codec; it maps to the same default_codec the

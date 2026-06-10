@@ -48,9 +48,15 @@ _HF_ALLOW = [
 
 def _resolve_path(path_or_hf_repo: str | Path, revision: str | None) -> Path:
     """Return a local checkpoint dir, downloading from the HF Hub if needed."""
-    p = Path(path_or_hf_repo)
+    p = Path(path_or_hf_repo).expanduser()
     if p.exists():
         return p
+    s = str(path_or_hf_repo)
+    # A path-shaped input that doesn't exist is a local typo, not a Hub repo
+    # id; bouncing it off the Hub validator yields a misleading message about
+    # repo-id naming rules.
+    if s.startswith(("/", "./", "../", "~")) or s.count("/") > 1:
+        raise FileNotFoundError(f"{s}: no such file or directory")
     from huggingface_hub import snapshot_download
 
     return Path(
