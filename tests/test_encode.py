@@ -158,5 +158,98 @@ def test_encode_cpu_matches_gpu_flat(codec):
     )
 
 
+@pytest.mark.parametrize("codec", [c for c, v in CODECS.items() if v[1] == 256])
+def test_encode_cpu_kquant_roundtrip(codec):
+    """CPU encode path (kquant_cpu_encode.cpp) for the five K-quant super-block
+    codecs: encode on the CPU stream, dequantize with the gguf-py reference, and
+    check the round-trip is within the codec's bound. This is the CI-runnable gate
+    that the encode (and LoRA quantize / fuse-to-kquant) paths execute on hosted
+    runners with no GPU."""
+    gtype, _wpb, _bits, bound = CODECS[codec]
+    rng = np.random.default_rng(7)
+    w_np = (rng.standard_normal((N, K)) * 0.1).astype(np.float32)
+    wq, scales = kq.quantize(mx.array(w_np), codec, stream=mx.cpu)
+    mx.eval(wq, scales)
+
+    assert tuple(np.array(scales).shape) == (1,)
+    wire = np.ascontiguousarray(np.array(wq).astype(np.uint8))
+    w_rt = quants.dequantize(wire, gtype).astype(np.float32)
+    rel = float(np.linalg.norm(w_rt - w_np) / (np.linalg.norm(w_np) + 1e-6))
+    assert rel < bound, f"{codec}: round-trip rel {rel:.3e} >= bound {bound}"
+
+
+@pytest.mark.parametrize("codec", [c for c, v in CODECS.items() if v[1] == 256])
+def test_encode_cpu_kquant_imatrix_roundtrip(codec):
+    """CPU encode with an importance matrix: the imatrix steers the per-weight
+    rounding of the K-quant encoders (it is a no-op on the flat codecs), so this
+    exercises the CPU imatrix branch. The reconstruction stays within a modestly
+    relaxed bound - imatrix encode minimizes importance-weighted error, not plain
+    Frobenius, so it can trade a little raw round-trip for weighted accuracy."""
+    gtype, _wpb, _bits, bound = CODECS[codec]
+    rng = np.random.default_rng(7)
+    w_np = (rng.standard_normal((N, K)) * 0.1).astype(np.float32)
+    imat_np = (np.abs(rng.standard_normal(K)) + 0.1).astype(np.float32)
+    wq, _ = kq.quantize(mx.array(w_np), codec, imatrix=mx.array(imat_np), stream=mx.cpu)
+    mx.eval(wq)
+
+    wire = np.ascontiguousarray(np.array(wq).astype(np.uint8))
+    w_rt = quants.dequantize(wire, gtype).astype(np.float32)
+    rel = float(np.linalg.norm(w_rt - w_np) / (np.linalg.norm(w_np) + 1e-6))
+    assert rel < bound * 1.5, f"{codec}: imatrix round-trip rel {rel:.3e}"
+
+
+@pytest.mark.skipif(
+    not kq.metallib_loads() or bool(os.environ.get("KQUANT_FORCE_CPU")),
+    reason="needs the GPU encoder to A/B against (no Metal GPU / forced CPU)",
+)
+@pytest.mark.parametrize("codec", [c for c, v in CODECS.items() if v[1] == 256])
+def test_encode_cpu_matches_gpu_kquant(codec):
+    """The K-quant CPU encoders are serial ports of the 256-thread GPU kernels.
+    The numeric core (per-sub-block fit, fp16 super-scale round-trip, packing) is
+    identical, so the wire bytes match the GPU exactly - with one caveat: the four
+    codecs that consume `sigma2` (q2_k/q4_k/q5_k, and q3_k under an imatrix) reduce
+    sum(x^2) over the super-block, and the GPU's simd_sum tree order can differ
+    from the serial CPU sum by an ULP. That can round a boundary-tied quant level
+    the other way in a rare block, so for those codecs we assert the two encoders
+    are numerically *equivalent* rather than byte-identical: nearly all wire bytes
+    match, and the CPU reconstruction is exactly as faithful as the GPU's (a
+    flipped tie is, by definition, a level the search judged equally good). q6_k
+    has no such reduction and must be byte-exact."""
+    rng = np.random.default_rng(7)
+    w_np = (rng.standard_normal((N, K)) * 0.1).astype(np.float32)
+    w = mx.array(w_np)
+    wq_gpu, _ = kq.quantize(w, codec, stream=mx.gpu)
+    wq_cpu, _ = kq.quantize(w, codec, stream=mx.cpu)
+    mx.eval(wq_gpu, wq_cpu)
+    bg = np.array(wq_gpu).astype(np.uint8)
+    bc = np.array(wq_cpu).astype(np.uint8)
+
+    if codec == "q6_k":
+        assert np.array_equal(bg, bc)
+        return
+
+    # Reduction-sensitive codecs: almost every wire byte matches (the rare
+    # differences are boundary-tied levels), and the round-trip quality is equal.
+    gtype = CODECS[codec][0]
+    mismatch = float(np.mean(bg != bc))
+    assert mismatch < 2e-3, f"{codec}: {mismatch:.2e} of bytes differ"
+    nrm = float(np.linalg.norm(w_np)) + 1e-6
+    rel_gpu = float(
+        np.linalg.norm(
+            quants.dequantize(np.ascontiguousarray(bg), gtype).astype(np.float32) - w_np
+        )
+        / nrm
+    )
+    rel_cpu = float(
+        np.linalg.norm(
+            quants.dequantize(np.ascontiguousarray(bc), gtype).astype(np.float32) - w_np
+        )
+        / nrm
+    )
+    assert abs(rel_cpu - rel_gpu) < 1e-3, (
+        f"{codec}: round-trip quality differs (cpu {rel_cpu:.5f} vs gpu {rel_gpu:.5f})"
+    )
+
+
 if __name__ == "__main__":
     sys.exit(main())
