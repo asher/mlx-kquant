@@ -147,6 +147,77 @@ def test_chat_command_filter_intercepts_slash_lines(capsys):
     assert "shim commands" in capsys.readouterr().out
 
 
+def test_chat_sampling_slash_commands(capsys):
+    from mlx_kquant.cli.chat import _handle_slash
+
+    state = {
+        "readline": None,
+        "enabled": True,
+        "loaded": False,
+        "overridden": False,
+        "sampling": {
+            "temp": 0.0,
+            "top_p": 1.0,
+            "top_k": 0,
+            "min_p": 0.0,
+            "xtc_threshold": 0.0,
+            "xtc_probability": 0.0,
+            "max_tokens": 256,
+        },
+    }
+    _handle_slash("/temp 0.8", state)
+    assert state["sampling"]["temp"] == 0.8
+    assert state["overridden"] is True
+    _handle_slash("/top-k 40", state)
+    assert state["sampling"]["top_k"] == 40
+    _handle_slash("/temp", state)  # no value: prints current, no change
+    _handle_slash("/temp abc", state)  # bad value: error, no change
+    assert state["sampling"]["temp"] == 0.8
+    _handle_slash("/sampling", state)
+    out = capsys.readouterr().out
+    assert "temp = 0.8" in out
+    assert "needs a float" in out
+    assert "max-tokens=256" in out
+
+
+def test_chat_interruptible_applies_sampling_override():
+    pytest.importorskip("mlx_lm")
+    from mlx_kquant.cli.chat import _interruptible
+
+    class FakeTokenizer:
+        eos_token_ids = [2]
+
+        def encode(self, s):
+            return [1]
+
+    captured = {}
+
+    def stream(model, tokenizer, prompt, max_tokens=0, sampler=None, **kw):
+        captured.update(max_tokens=max_tokens, sampler=sampler)
+        yield "tok"
+
+    state = {
+        "overridden": True,
+        "sampling": {
+            "temp": 0.7,
+            "top_p": 0.9,
+            "top_k": 40,
+            "min_p": 0.05,
+            "xtc_threshold": 0.0,
+            "xtc_probability": 0.0,
+            "max_tokens": 99,
+        },
+    }
+    out = list(
+        _interruptible(stream, state)(
+            "model", FakeTokenizer(), "hi", max_tokens=256, sampler="orig"
+        )
+    )
+    assert out == ["tok"]
+    assert captured["max_tokens"] == 99
+    assert callable(captured["sampler"])  # rebuilt, not the original string
+
+
 def test_chat_h_command_also_shows_shim_help(capsys):
     # 'h' is mlx-lm's help command: it must still reach their loop, with the
     # shim's command list printed alongside.

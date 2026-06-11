@@ -125,8 +125,10 @@ mlx-kquant chat --model qwen3-q4 --temp 0.7      # interactive REPL (mlx-lm chat
 `run` takes the usual sampling knobs (`--temp`, `--top-p`, `--top-k`, `--min-p`, `--seed`) and
 chat-template controls (`--system-prompt`, `--no-chat-template`, `--chat-template-config` for
 template kwargs such as `'{"enable_thinking": false}'`). The `chat` REPL has a line-editable
-prompt with persistent history (`--no-history` or in-chat `/history off|on|clear` to control it);
-Ctrl-C cancels the in-flight reply (at an idle prompt it exits, as does Ctrl-D).
+prompt with persistent history (`--no-history` or in-chat `/history off|on|clear` to control it)
+and in-chat sampling control (`/temp`, `/top-p`, `/top-k`, `/min-p`, `/max-tokens`; `/sampling`
+shows current values); Ctrl-C cancels the in-flight reply (at an idle prompt it exits, as does
+Ctrl-D). `--max-kv-size` bounds the KV cache for long sessions (a rotating window, set at start).
 
 The result is a standard MLX checkpoint (`config.json` + sharded safetensors, weights as K-quant wire
 bytes). Load it in code with the bundled loader:
