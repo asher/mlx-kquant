@@ -116,12 +116,19 @@ def _wire_history(readline, enabled: bool) -> dict:
     return state
 
 
+def _print_shim_help(state: dict) -> None:
+    status = "on" if state["enabled"] else "off"
+    print("[mlx-kquant] shim commands (the REPL's own are 'q' / 'r' / 'h'):")
+    print(f"- '/history [on|off|clear]' control prompt-history saving ({status})")
+    print("- '/help' to display these commands")
+
+
 def _handle_slash(line: str, state: dict) -> None:
     """Handle a shim ``/command`` line (never shown to mlx-lm's loop)."""
     readline = state["readline"]
     cmd, _, arg = line.strip().partition(" ")
     if cmd != "/history":
-        print("[mlx-kquant] shim commands: /history [on|off|clear]")
+        _print_shim_help(state)
         return
     if readline is None:
         print("[mlx-kquant] history unavailable (no readline on this build)")
@@ -163,6 +170,11 @@ def _command_filter(real_input, state: dict):
     def filtered(prompt: str = "") -> str:
         while True:
             line = real_input(prompt)
+            if line.strip() == "h":
+                # The REPL's own help follows; surface the shim commands with
+                # it (its print_help is internal, so this prints just above).
+                _print_shim_help(state)
+                return line
             if not line.startswith("/"):
                 return line
             _handle_slash(line, state)
@@ -204,6 +216,7 @@ def passthrough(rest: list[str]) -> int:
     _chat.stream_generate = _interruptible(_chat.stream_generate)
     _chat.input = _command_filter(input, state)
 
+    print("[mlx-kquant] shim: '/history [on|off|clear]' - '/help' for commands")
     saved_argv = sys.argv
     sys.argv = ["mlx_lm.chat", *rest]
     try:

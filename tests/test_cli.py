@@ -147,6 +147,19 @@ def test_chat_command_filter_intercepts_slash_lines(capsys):
     assert "shim commands" in capsys.readouterr().out
 
 
+def test_chat_h_command_also_shows_shim_help(capsys):
+    # 'h' is mlx-lm's help command: it must still reach their loop, with the
+    # shim's command list printed alongside.
+    from mlx_kquant.cli.chat import _command_filter
+
+    state = {"readline": None, "enabled": True, "loaded": False}
+    filtered = _command_filter(lambda prompt="": "h", state)
+    assert filtered(">> ") == "h"
+    out = capsys.readouterr().out
+    assert "/history" in out
+    assert "/help" in out
+
+
 def test_chat_history_toggle_and_clear(tmp_path, monkeypatch, capsys):
     from mlx_kquant.cli import chat as chat_mod
 
