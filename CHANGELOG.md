@@ -20,7 +20,9 @@ toolchain that runs on a stock `mlx==0.31.2` wheel.
   is untouched (still bit-exact). `kq.cpu_neon_available()` reports support.
 - MoE gather decode shapes (every expert group within the fused-GEMV
   ceiling) now run as ONE worker-pool job over all (expert, row) work items
-  instead of one dispatch per expert.
+  instead of one dispatch per expert. `KQ_CPU_SPIN_US` optionally spins the
+  pool workers between jobs (default 0: park immediately — spinning steals
+  cores from the rest of the inference graph).
 - `mlx_kquant.codec_geometry` - single source of truth for codec block geometry.
 - `mlx_kquant.nn` - `kq.*`-backed `KQuantLinear` / `KQuantEmbedding` /
   `KQuantSwitchLinear` / `KQuantMultiLinear` modules, plus `install_kquant_modules`.

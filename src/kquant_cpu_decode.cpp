@@ -485,12 +485,24 @@ class KQThreadPool {
   }
 
   void worker_loop() {
-    // Spin briefly for the next job before sleeping on the condition
-    // variable: decode-shape jobs are ~100us and arrive back-to-back, while
-    // waking a cv-parked thread costs ~50-100us — slow enough that a parked
-    // worker misses most of the job it was woken for. The window is short so
-    // idle phases (no kq.* CPU work) still park every worker.
-    constexpr auto kSpinWindow = std::chrono::microseconds(200);
+    // Optional spin-before-park (KQ_CPU_SPIN_US, default 0 = park on the
+    // condition variable immediately). Spinning for the next job avoids the
+    // ~50-100us cv wake latency and buys ~15% on back-to-back same-op GEMV
+    // microbenches — but in real model graphs the spinning workers steal
+    // cores from everything that runs BETWEEN kq jobs (the single-threaded
+    // MLX CPU ops, and on hybrid CPU/GPU runs the GPU encode threads), which
+    // measured net-negative end-to-end. Off by default; the knob stays for
+    // dedicated-CPU experiments.
+    static const auto kSpinWindow = [] {
+      long us = 0;
+      if (const char* env = std::getenv("KQ_CPU_SPIN_US")) {
+        us = std::atol(env);
+        if (us < 0) {
+          us = 0;
+        }
+      }
+      return std::chrono::microseconds(us);
+    }();
     std::uint64_t seen = 0;
     auto spin_deadline = std::chrono::steady_clock::now() + kSpinWindow;
     while (true) {
