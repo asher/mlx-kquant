@@ -10,7 +10,9 @@
 // mlx_kquant/licenses/llama.cpp-LICENSE.
 #include "kquant_cpu_decode.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -22,6 +24,7 @@
 #include <vector>
 
 #include "kquant_codec.h"
+#include "kquant_cpu_neon.h"
 
 #include "mlx/types/half_types.h" // float16_t, bfloat16_t
 
@@ -406,22 +409,28 @@ class KQThreadPool {
       }
       return;
     }
+    // Each job carries its own shared state, so the caller only has to wait
+    // for its parts to finish — never for slow-to-wake workers to pass
+    // through (a worker that wakes late just finds the part counter
+    // exhausted and goes back to sleep; the shared_ptr keeps the state it
+    // touches alive). Waiting on woken-worker exit instead was costing
+    // ~50-100us of wake-straggler latency per job on asymmetric cores.
+    auto job = std::make_shared<Job>();
+    job->fn = fn; // copy: stragglers may outlive the caller's frame
+    job->parts = n_parts;
     {
       std::lock_guard<std::mutex> lk(m_);
-      job_fn_ = fn; // copy: workers may outlive the caller's frame otherwise
-      job_parts_ = n_parts;
-      job_next_.store(0, std::memory_order_relaxed);
-      job_done_.store(0, std::memory_order_relaxed);
+      job_ = job;
       generation_++;
       cv_.notify_all();
     }
-    run_parts(); // calling thread participates
-    // Wait until every part has run AND every woken worker has left
-    // run_parts — a straggler that exhausted the part counter must not still
-    // be touching job state when the next job's setup rewrites it.
-    std::unique_lock<std::mutex> lk(m_);
-    done_cv_.wait(
-        lk, [&] { return job_done_.load() >= job_parts_ && in_flight_ == 0; });
+    run_parts(*job); // calling thread participates
+    if (job->done.load(std::memory_order_acquire) < job->parts) {
+      std::unique_lock<std::mutex> lk(m_);
+      done_cv_.wait(lk, [&] {
+        return job->done.load(std::memory_order_acquire) >= job->parts;
+      });
+    }
   }
 
  private:
@@ -455,32 +464,65 @@ class KQThreadPool {
     }
   }
 
-  void run_parts() {
+  struct Job {
+    std::function<void(int)> fn;
+    int parts{0};
+    std::atomic<int> next{0};
+    std::atomic<int> done{0};
+  };
+
+  void run_parts(Job& job) {
     int p;
-    while ((p = job_next_.fetch_add(1)) < job_parts_) {
-      job_fn_(p);
-      job_done_.fetch_add(1);
+    while ((p = job.next.fetch_add(1)) < job.parts) {
+      job.fn(p);
+      if (job.done.fetch_add(1) + 1 == job.parts) {
+        // Last part: wake the caller. Notify under the mutex so the caller's
+        // predicate check can't race past the increment and then sleep.
+        std::lock_guard<std::mutex> lk(m_);
+        done_cv_.notify_all();
+      }
     }
   }
 
   void worker_loop() {
+    // Spin briefly for the next job before sleeping on the condition
+    // variable: decode-shape jobs are ~100us and arrive back-to-back, while
+    // waking a cv-parked thread costs ~50-100us — slow enough that a parked
+    // worker misses most of the job it was woken for. The window is short so
+    // idle phases (no kq.* CPU work) still park every worker.
+    constexpr auto kSpinWindow = std::chrono::microseconds(200);
     std::uint64_t seen = 0;
+    auto spin_deadline = std::chrono::steady_clock::now() + kSpinWindow;
     while (true) {
-      {
+      if (stop_.load(std::memory_order_acquire)) {
+        return;
+      }
+      if (generation_.load(std::memory_order_acquire) == seen) {
+        if (std::chrono::steady_clock::now() < spin_deadline) {
+#if defined(__aarch64__)
+          asm volatile("yield");
+#endif
+          continue;
+        }
         std::unique_lock<std::mutex> lk(m_);
-        cv_.wait(lk, [&] { return stop_ || generation_ != seen; });
-        if (stop_) {
+        cv_.wait(lk, [&] {
+          return stop_.load(std::memory_order_relaxed) ||
+              generation_.load(std::memory_order_relaxed) != seen;
+        });
+        if (stop_.load(std::memory_order_relaxed)) {
           return;
         }
-        seen = generation_;
-        in_flight_++; // under m_: ordered against the caller's job setup
       }
-      run_parts();
+      std::shared_ptr<Job> job;
       {
         std::lock_guard<std::mutex> lk(m_);
-        in_flight_--;
-        done_cv_.notify_all();
+        seen = generation_.load(std::memory_order_relaxed);
+        job = job_;
       }
+      if (job) {
+        run_parts(*job);
+      }
+      spin_deadline = std::chrono::steady_clock::now() + kSpinWindow;
     }
   }
 
@@ -488,13 +530,9 @@ class KQThreadPool {
   std::mutex m_;
   std::condition_variable cv_;
   std::condition_variable done_cv_;
-  std::function<void(int)> job_fn_;
-  int job_parts_{0};
-  std::atomic<int> job_next_{0};
-  std::atomic<int> job_done_{0};
-  int in_flight_{0}; // workers currently inside run_parts (guarded by m_)
-  std::uint64_t generation_{0};
-  bool stop_{false};
+  std::shared_ptr<Job> job_; // current job (guarded by m_)
+  std::atomic<std::uint64_t> generation_{0};
+  std::atomic<bool> stop_{false};
 };
 
 } // namespace
@@ -506,15 +544,29 @@ int kq_cpu_threads() {
 void kq_parallel_for(
     std::size_t n_items,
     const std::function<void(std::size_t, std::size_t)>& fn) {
+  kq_parallel_for(n_items, 1, fn);
+}
+
+void kq_parallel_for(
+    std::size_t n_items,
+    std::size_t grain,
+    const std::function<void(std::size_t, std::size_t)>& fn) {
   if (n_items == 0) {
     return;
   }
   auto& pool = KQThreadPool::get();
-  std::size_t parts = static_cast<std::size_t>(pool.n_threads());
+  // Oversubscribe parts (the workers pull them off an atomic counter) so the
+  // schedule load-balances across asymmetric P/E cores and memory-stall
+  // jitter; one static part per thread leaves fast cores idle waiting on the
+  // slowest core's tail.
+  std::size_t parts = static_cast<std::size_t>(pool.n_threads()) * 8;
+  if (grain > 1 && parts > n_items / grain) {
+    parts = n_items / grain;
+  }
   if (parts > n_items) {
     parts = n_items;
   }
-  if (parts <= 1) {
+  if (parts <= 1 || pool.n_threads() <= 1) {
     fn(0, n_items);
     return;
   }
@@ -577,10 +629,6 @@ inline float dot_block(const float* a, const float* b, int n) {
   return ((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7));
 }
 
-// Small-M GEMV ceiling for the fused path; larger M goes through
-// dequantize-once + GEMM, which amortizes the decode across rows instead.
-constexpr int kMaxFusedM = 16;
-
 // Fused decode-then-dot over output rows [n0, n1) for transpose_w=true
 // (w decodes to [N, K] row-major, the weight convention of every model
 // matmul). One 256-weight block is decoded into a stack buffer and
@@ -601,7 +649,7 @@ void qmv_fused_rows(
     std::size_t n0,
     std::size_t n1) {
   float buf[256]; // max weights_per_block across codecs
-  float acc[kMaxFusedM];
+  float acc[kQmvFusedMaxM];
   const int nblocks = K / block_weights;
   for (std::size_t n = n0; n < n1; n++) {
     const uint8_t* wr = w + n * row_bytes;
@@ -622,9 +670,57 @@ void qmv_fused_rows(
   }
 }
 
+// Quantize M f32 activation rows into the NEON kernel's q8 layout (done once
+// per matmul call, before the parallel row loop). Returns the row stride in
+// bytes; rows stay 4-byte aligned (act_block_bytes is a multiple of 4).
+std::size_t quantize_act_rows(
+    const KQNeonKernel* nk,
+    const float* xf,
+    int M,
+    int K,
+    int block_weights,
+    std::unique_ptr<uint8_t[]>& act) {
+  const std::size_t row_stride =
+      (static_cast<std::size_t>(K) / block_weights) * nk->act_block_bytes;
+  act.reset(new uint8_t[static_cast<std::size_t>(M) * row_stride]);
+  for (int m = 0; m < M; m++) {
+    nk->quantize_act_row(
+        xf + static_cast<std::size_t>(m) * K, act.get() + m * row_stride, K);
+  }
+  return row_stride;
+}
+
+// NEON int8 fused GEMV over output rows [n0, n1): one whole-row vec_dot of
+// wire bytes against the pre-quantized q8 activations per (row, m). Wire
+// bytes are read once per row (M passes hit cache).
+void qmv_neon_rows(
+    float* outf, // [M, N]
+    const uint8_t* act, // M q8 activation rows
+    std::size_t act_row_stride,
+    const uint8_t* w,
+    int M,
+    int N,
+    std::size_t row_bytes,
+    int nblocks,
+    const KQNeonKernel* nk,
+    std::size_t n0,
+    std::size_t n1) {
+  for (std::size_t n = n0; n < n1; n++) {
+    const uint8_t* wr = w + n * row_bytes;
+    for (int m = 0; m < M; m++) {
+      outf[static_cast<std::size_t>(m) * N + n] = nk->vec_dot(
+          wr, act + static_cast<std::size_t>(m) * act_row_stride, nblocks);
+    }
+  }
+}
+
+// Per-element casts are ~1 ns of work: keep parts coarse and run decode-shape
+// conversions (M <= 16 rows) inline rather than waking the pool.
+constexpr std::size_t kConvertGrain = std::size_t(1) << 16;
+
 template <typename T>
 void convert_to_f32(const T* src, float* dst, std::size_t n) {
-  kq_parallel_for(n, [&](std::size_t b, std::size_t e) {
+  kq_parallel_for(n, kConvertGrain, [&](std::size_t b, std::size_t e) {
     for (std::size_t i = b; i < e; i++) {
       dst[i] = static_cast<float>(src[i]);
     }
@@ -633,7 +729,7 @@ void convert_to_f32(const T* src, float* dst, std::size_t n) {
 
 template <typename T>
 void convert_from_f32(const float* src, T* dst, std::size_t n) {
-  kq_parallel_for(n, [&](std::size_t b, std::size_t e) {
+  kq_parallel_for(n, kConvertGrain, [&](std::size_t b, std::size_t e) {
     for (std::size_t i = b; i < e; i++) {
       dst[i] = static_cast<T>(src[i]);
     }
@@ -739,25 +835,50 @@ void kquant_qmm_cpu(
     of = of_store.get();
   }
 
-  if (transpose_w && M <= kMaxFusedM && fn != nullptr) {
+  if (transpose_w && M <= kQmvFusedMaxM && fn != nullptr) {
     // Decode/GEMV shape: fused decode-then-dot, parallel over output rows.
-    // No scratch matrix; wire bytes are read exactly once.
-    kq_parallel_for(
-        static_cast<std::size_t>(N), [&](std::size_t n0, std::size_t n1) {
-          qmv_fused_rows(
-              of,
-              xf,
-              w,
-              M,
-              N,
-              K,
-              row_bytes,
-              codec->weights_per_block,
-              codec->bytes_per_block,
-              fn,
-              n0,
-              n1);
-        });
+    // No scratch matrix; wire bytes are read exactly once. When an int8 NEON
+    // kernel exists for the codec, quantize the activations once to q8 and
+    // dot wire nibbles directly (vdotq_s32); else scalar f32 decode-then-dot.
+    const KQNeonKernel* nk = kq_neon_kernel(kquant_type);
+    if (nk != nullptr) {
+      std::unique_ptr<uint8_t[]> act;
+      const std::size_t act_stride =
+          quantize_act_rows(nk, xf, M, K, codec->weights_per_block, act);
+      const int nblocks = K / codec->weights_per_block;
+      kq_parallel_for(
+          static_cast<std::size_t>(N), [&](std::size_t n0, std::size_t n1) {
+            qmv_neon_rows(
+                of,
+                act.get(),
+                act_stride,
+                w,
+                M,
+                N,
+                row_bytes,
+                nblocks,
+                nk,
+                n0,
+                n1);
+          });
+    } else {
+      kq_parallel_for(
+          static_cast<std::size_t>(N), [&](std::size_t n0, std::size_t n1) {
+            qmv_fused_rows(
+                of,
+                xf,
+                w,
+                M,
+                N,
+                K,
+                row_bytes,
+                codec->weights_per_block,
+                codec->bytes_per_block,
+                fn,
+                n0,
+                n1);
+          });
+    }
   } else {
     // Prefill/GEMM shape: dequantize the weight matrix once (parallel over
     // rows, uninitialized scratch — every element is overwritten), then GEMM.
@@ -821,6 +942,174 @@ void kquant_qmm_cpu(
   }
 }
 
+template <typename T>
+void kquant_qmm_cpu_batch(
+    const KQmvTask<T>* tasks,
+    int n_tasks,
+    int N,
+    int K,
+    const std::string& kquant_type) {
+  if (n_tasks <= 0) {
+    return;
+  }
+  const KQuantCodec* codec = codec_by_name(kquant_type);
+  DequantFnF32 fn = codec ? dequant_fn_f32(kquant_type) : nullptr;
+  if (fn == nullptr) {
+    throw std::runtime_error(
+        "[mlx_kquant] quantized_matmul: unsupported codec: " + kquant_type);
+  }
+  const int block_weights = codec->weights_per_block;
+  const int nblocks = K / block_weights;
+  const std::size_t row_bytes =
+      static_cast<std::size_t>(nblocks) * codec->bytes_per_block;
+  const KQNeonKernel* nk = kq_neon_kernel(kquant_type);
+
+  // Deduplicate activation blocks shared across tasks (MoE decode: top-k
+  // experts all read the same token row), so each x row is staged/quantized
+  // once per call. Task counts are tiny at decode; linear scan is fine.
+  std::vector<int> ux_of(n_tasks);
+  std::vector<int> ux_first;
+  for (int t = 0; t < n_tasks; t++) {
+    int u = -1;
+    for (int s = 0; s < static_cast<int>(ux_first.size()); s++) {
+      if (tasks[ux_first[s]].x == tasks[t].x &&
+          tasks[ux_first[s]].m == tasks[t].m) {
+        u = s;
+        break;
+      }
+    }
+    if (u < 0) {
+      u = static_cast<int>(ux_first.size());
+      ux_first.push_back(t);
+    }
+    ux_of[t] = u;
+  }
+  const int n_ux = static_cast<int>(ux_first.size());
+
+  // Stage the unique activation blocks in f32. All loops here are serial:
+  // batch shapes are decode-sized (m <= kQmvFusedMaxM, a handful of tasks),
+  // so staging is negligible next to the N x K row work below.
+  std::vector<const float*> uxf(n_ux);
+  std::unique_ptr<float[]> xf_store;
+  if constexpr (std::is_same_v<T, float>) {
+    for (int u = 0; u < n_ux; u++) {
+      uxf[u] = tasks[ux_first[u]].x;
+    }
+  } else {
+    std::size_t total = 0;
+    for (int u = 0; u < n_ux; u++) {
+      total += static_cast<std::size_t>(tasks[ux_first[u]].m) * K;
+    }
+    xf_store.reset(new float[total]);
+    std::size_t off = 0;
+    for (int u = 0; u < n_ux; u++) {
+      const T* src = tasks[ux_first[u]].x;
+      const std::size_t els =
+          static_cast<std::size_t>(tasks[ux_first[u]].m) * K;
+      float* dst = xf_store.get() + off;
+      for (std::size_t i = 0; i < els; i++) {
+        dst[i] = static_cast<float>(src[i]);
+      }
+      uxf[u] = dst;
+      off += els;
+    }
+  }
+
+  // Quantize the unique activation blocks to q8 once (NEON path only).
+  std::unique_ptr<uint8_t[]> act;
+  std::vector<const uint8_t*> uact(n_ux, nullptr);
+  std::size_t act_stride = 0;
+  if (nk != nullptr) {
+    act_stride = static_cast<std::size_t>(nblocks) * nk->act_block_bytes;
+    std::size_t total_rows = 0;
+    for (int u = 0; u < n_ux; u++) {
+      total_rows += tasks[ux_first[u]].m;
+    }
+    act.reset(new uint8_t[total_rows * act_stride]);
+    std::size_t row = 0;
+    for (int u = 0; u < n_ux; u++) {
+      uact[u] = act.get() + row * act_stride;
+      for (int m = 0; m < tasks[ux_first[u]].m; m++, row++) {
+        nk->quantize_act_row(
+            uxf[u] + static_cast<std::size_t>(m) * K,
+            act.get() + row * act_stride,
+            K);
+      }
+    }
+  }
+
+  // f32 output staging for half-precision tasks.
+  std::vector<float*> ofs(n_tasks);
+  std::unique_ptr<float[]> of_store;
+  if constexpr (std::is_same_v<T, float>) {
+    for (int t = 0; t < n_tasks; t++) {
+      ofs[t] = tasks[t].out;
+    }
+  } else {
+    std::size_t total = 0;
+    for (int t = 0; t < n_tasks; t++) {
+      total += static_cast<std::size_t>(tasks[t].m) * N;
+    }
+    of_store.reset(new float[total]);
+    std::size_t off = 0;
+    for (int t = 0; t < n_tasks; t++) {
+      ofs[t] = of_store.get() + off;
+      off += static_cast<std::size_t>(tasks[t].m) * N;
+    }
+  }
+
+  // ONE parallel job over all (task, output-row) work items. Every row costs
+  // the same (same N x K wire geometry), so flat-index partitioning balances.
+  kq_parallel_for(
+      static_cast<std::size_t>(n_tasks) * N,
+      [&](std::size_t r0, std::size_t r1) {
+        std::size_t r = r0;
+        while (r < r1) {
+          const int t = static_cast<int>(r / N);
+          const std::size_t n0 = r % N;
+          const std::size_t n1 = std::min<std::size_t>(N, n0 + (r1 - r));
+          if (nk != nullptr) {
+            qmv_neon_rows(
+                ofs[t],
+                uact[ux_of[t]],
+                act_stride,
+                tasks[t].w,
+                tasks[t].m,
+                N,
+                row_bytes,
+                nblocks,
+                nk,
+                n0,
+                n1);
+          } else {
+            qmv_fused_rows(
+                ofs[t],
+                uxf[ux_of[t]],
+                tasks[t].w,
+                tasks[t].m,
+                N,
+                K,
+                row_bytes,
+                block_weights,
+                codec->bytes_per_block,
+                fn,
+                n0,
+                n1);
+          }
+          r += n1 - n0;
+        }
+      });
+
+  if constexpr (!std::is_same_v<T, float>) {
+    for (int t = 0; t < n_tasks; t++) {
+      const std::size_t els = static_cast<std::size_t>(tasks[t].m) * N;
+      for (std::size_t i = 0; i < els; i++) {
+        tasks[t].out[i] = static_cast<T>(ofs[t][i]);
+      }
+    }
+  }
+}
+
 // Explicit instantiations for the float types the eval paths dispatch over.
 template void kquant_dequantize_dispatch<float>(
     const uint8_t*,
@@ -880,6 +1169,25 @@ template void kquant_qmm_cpu<mx::bfloat16_t>(
     int,
     int,
     bool,
+    const std::string&);
+
+template void kquant_qmm_cpu_batch<float>(
+    const KQmvTask<float>*,
+    int,
+    int,
+    int,
+    const std::string&);
+template void kquant_qmm_cpu_batch<mx::float16_t>(
+    const KQmvTask<mx::float16_t>*,
+    int,
+    int,
+    int,
+    const std::string&);
+template void kquant_qmm_cpu_batch<mx::bfloat16_t>(
+    const KQmvTask<mx::bfloat16_t>*,
+    int,
+    int,
+    int,
     const std::string&);
 
 } // namespace mlx_kquant

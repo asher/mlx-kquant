@@ -21,6 +21,15 @@ void kq_parallel_for(
     std::size_t n_items,
     const std::function<void(std::size_t, std::size_t)>& fn);
 
+// Same, with a minimum part size: jobs shorter than one `grain` of items run
+// inline (waking the pool costs more than they're worth), and no part is
+// split finer than `grain`. Use when one item is cheap (e.g. per-element
+// dtype casts) so the partitioning reflects actual work.
+void kq_parallel_for(
+    std::size_t n_items,
+    std::size_t grain,
+    const std::function<void(std::size_t, std::size_t)>& fn);
+
 // Worker count the pool was built with (KQ_CPU_THREADS env override, else
 // std::thread::hardware_concurrency()).
 int kq_cpu_threads();
@@ -56,6 +65,34 @@ void kquant_qmm_cpu(
     int N,
     int K,
     bool transpose_w,
+    const std::string& kquant_type);
+
+// Small-M ceiling for the fused decode-then-dot GEMV path inside
+// kquant_qmm_cpu; larger M dequantizes once and runs a GEMM instead.
+constexpr int kQmvFusedMaxM = 16;
+
+// One GEMV in a batched (MoE decode) call: out[m, N] = x[m, K] @ dequant(w).T
+// with per-task row count m <= kQmvFusedMaxM and contiguous [N, K] wire bytes.
+template <typename T>
+struct KQmvTask {
+  T* out; // [m, N]
+  const T* x; // [m, K]
+  const uint8_t* w; // wire bytes for one [N, K] weight matrix
+  int m;
+};
+
+// Run a batch of same-codec, same-[N, K], transpose_w=true fused GEMVs as ONE
+// parallel job over all (task, output-row) work items, instead of one
+// thread-pool job per task. This is the MoE gather decode shape: top-k tiny
+// matvecs per call, where per-task pool wake/teardown dominates. Activation
+// rows referenced by multiple tasks (same x pointer) are staged/quantized
+// once per call.
+template <typename T>
+void kquant_qmm_cpu_batch(
+    const KQmvTask<T>* tasks,
+    int n_tasks,
+    int N,
+    int K,
     const std::string& kquant_type);
 
 } // namespace mlx_kquant

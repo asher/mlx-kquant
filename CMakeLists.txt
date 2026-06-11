@@ -117,6 +117,24 @@ if(APPLE)
   target_compile_definitions(mlx_kquant_ext PUBLIC KQ_USE_ACCELERATE)
   target_link_libraries(mlx_kquant_ext PUBLIC "-framework Accelerate")
 endif()
+# arm64: NEON-dotprod int8 GEMV kernels for the fused small-M CPU matmul.
+# The TU is compiled only on arm64/aarch64 hosts; execution is further gated
+# at runtime (KQ_CPU_NEON=0 kill switch; Linux aarch64 hwcap dotprod check).
+# Every other target keeps the portable scalar path (the header stubs
+# kq_neon_kernel to nullptr when KQ_CPU_NEON_TU is undefined).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+  target_sources(mlx_kquant_ext
+                 PUBLIC ${CMAKE_CURRENT_LIST_DIR}/src/kquant_cpu_neon.cpp)
+  target_compile_definitions(mlx_kquant_ext PUBLIC KQ_CPU_NEON_TU)
+  if(NOT APPLE)
+    # Linux toolchains may default to an armv8.0 baseline without dotprod;
+    # enable it for this one TU - dotprod instructions only execute after the
+    # runtime hwcap check passes.
+    set_source_files_properties(
+      ${CMAKE_CURRENT_LIST_DIR}/src/kquant_cpu_neon.cpp
+      PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+  endif()
+endif()
 # libmlx bundles its OWN (older) gguflib and exports its gguf_* symbols. A plain
 # link can bind our gguf_get_tensor()/gguf_open() calls to MLX's copy, whose
 # GGUF_TYPE_COUNT predates the MXFP4/NVFP4 float codecs - so a tensor of type

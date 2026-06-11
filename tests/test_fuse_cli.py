@@ -304,10 +304,16 @@ def test_fuse_cli_keep_kquant_imatrix(tmp_path, capsys):
     assert bool(mx.all(mx.isfinite(fout)).item())
 
 
-def test_fuse_cli_dequantize(tmp_path):
+def test_fuse_cli_dequantize(tmp_path, monkeypatch):
     from mlx_lm.utils import load_model
 
     from mlx_kquant.cli import fuse as fuse_cli
+
+    # Pin the reference forward to the scalar CPU path: this test gates the
+    # float MERGE (bf16 arithmetic-order noise, < 1e-2), and on the CPU device
+    # the NEON int8 path's activation-q8 error (~7e-3) on the KQuant reference
+    # side would stack on top of that gate.
+    monkeypatch.setenv("KQ_CPU_NEON", "0")
 
     base = _make_base(tmp_path)
     adapter = tmp_path / "adapter"

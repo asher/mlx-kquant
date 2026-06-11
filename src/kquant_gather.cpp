@@ -428,17 +428,101 @@ void KQuantGatherQMM::eval_cpu(
       using T = std::remove_pointer_t<decltype(tag)>;
       const std::size_t row_els = static_cast<std::size_t>(M) * K;
       const std::size_t out_row_els = static_cast<std::size_t>(M) * N;
+
+      // Group boundaries [first, last) over the expert-sorted entries.
+      std::vector<std::pair<std::size_t, std::size_t>> groups;
+      {
+        std::size_t ga = 0;
+        while (ga < entries.size()) {
+          std::size_t gb = ga;
+          while (gb < entries.size() &&
+                 entries[gb].w_idx == entries[ga].w_idx) {
+            gb++;
+          }
+          groups.emplace_back(ga, gb);
+          ga = gb;
+        }
+      }
+      auto group_w = [&](std::size_t first) {
+        return w.data<uint8_t>() +
+            mx::elem_to_loc(
+                   entries[first].w_idx * w_els, w.shape(), w.strides());
+      };
+
+      // Decode-shape consolidation: when every per-expert group is small
+      // enough for the fused GEMV, run the whole call as ONE parallel job
+      // over all (expert, output-row) work items via kquant_qmm_cpu_batch.
+      // The per-group qmm-call-per-expert path below would pay a thread-pool
+      // wake/teardown per (expert, matrix) on ~MBs of work each — at MoE
+      // decode that's the dominant dispatch overhead.
+      bool all_small = transpose_;
+      for (const auto& g : groups) {
+        if ((g.second - g.first) * static_cast<std::size_t>(M) >
+            static_cast<std::size_t>(kQmvFusedMaxM)) {
+          all_small = false;
+          break;
+        }
+      }
+      if (all_small) {
+        std::vector<KQmvTask<T>> tasks(groups.size());
+        std::vector<std::vector<T>> xg_packs; // keep packed copies alive
+        std::vector<std::vector<T>> og_packs;
+        for (std::size_t gi = 0; gi < groups.size(); gi++) {
+          const auto [ga, gb] = groups[gi];
+          const std::size_t rg = gb - ga;
+          KQmvTask<T>& task = tasks[gi];
+          task.w = group_w(ga);
+          task.m = static_cast<int>(rg) * M;
+          if (rg == 1) {
+            task.out =
+                out.data<T>() + static_cast<std::size_t>(entries[ga].i) * M * N;
+            task.x = x.data<T>() +
+                mx::elem_to_loc(
+                         entries[ga].x_idx * M * K, x.shape(), x.strides());
+          } else {
+            xg_packs.emplace_back(rg * row_els);
+            og_packs.emplace_back(rg * out_row_els);
+            for (std::size_t r = 0; r < rg; r++) {
+              std::memcpy(
+                  xg_packs.back().data() + r * row_els,
+                  x.data<T>() +
+                      mx::elem_to_loc(
+                          entries[ga + r].x_idx * M * K,
+                          x.shape(),
+                          x.strides()),
+                  row_els * sizeof(T));
+            }
+            task.x = xg_packs.back().data();
+            task.out = og_packs.back().data();
+          }
+        }
+        kquant_qmm_cpu_batch<T>(
+            tasks.data(), static_cast<int>(tasks.size()), N, K, kquant_type);
+        // Scatter the packed groups' outputs back to their entry rows.
+        std::size_t pi = 0;
+        for (std::size_t gi = 0; gi < groups.size(); gi++) {
+          const auto [ga, gb] = groups[gi];
+          const std::size_t rg = gb - ga;
+          if (rg == 1) {
+            continue;
+          }
+          for (std::size_t r = 0; r < rg; r++) {
+            std::memcpy(
+                out.data<T>() +
+                    static_cast<std::size_t>(entries[ga + r].i) * M * N,
+                og_packs[pi].data() + r * out_row_els,
+                out_row_els * sizeof(T));
+          }
+          pi++;
+        }
+        return;
+      }
+
       std::vector<T> xg;
       std::vector<T> og;
-      std::size_t a = 0;
-      while (a < entries.size()) {
-        std::size_t b = a;
-        while (b < entries.size() && entries[b].w_idx == entries[a].w_idx) {
-          b++;
-        }
+      for (const auto& [a, b] : groups) {
         const std::size_t rg = b - a;
-        const uint8_t* wp = w.data<uint8_t>() +
-            mx::elem_to_loc(entries[a].w_idx * w_els, w.shape(), w.strides());
+        const uint8_t* wp = group_w(a);
         if (rg == 1) {
           // Single entry for this expert (the decode shape): no packing.
           kquant_qmm_cpu<T>(
@@ -480,7 +564,6 @@ void KQuantGatherQMM::eval_cpu(
                 out_row_els * sizeof(T));
           }
         }
-        a = b;
       }
     };
     auto dt = x.dtype();

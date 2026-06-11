@@ -4,7 +4,8 @@ Custom Metal kernels packaged as an MLX C++ extension, installed on top of a
 stock ``mlx`` wheel.
 
 Current API:
-  * ``codecs`` / ``metallib_dir`` / ``metallib_loads`` - toolchain self-checks.
+  * ``codecs`` / ``metallib_dir`` / ``metallib_loads`` /
+    ``cpu_neon_available`` - toolchain self-checks.
   * ``dequantize`` - GGUF K-quant wire bytes -> float array.
   * ``quantized_matmul`` - x @ dequant(w) for K-quant weights.
   * ``gather_qmm`` - mixture-of-experts gathered quantized matmul.
@@ -20,6 +21,7 @@ import mlx.core as _mx  # noqa: F401
 
 from ._ext import (  # noqa: F401
     codecs,
+    cpu_neon_available,
     dequantize,
     gather_qmm,
     load_gguf,
@@ -33,6 +35,7 @@ from ._version import __version__
 __all__ = [
     "__version__",
     "codecs",
+    "cpu_neon_available",
     "dequantize",
     "gather_qmm",
     "load_gguf",

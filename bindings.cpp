@@ -6,6 +6,7 @@
 
 #include "kquant.h"
 #include "kquant_codec.h"
+#include "kquant_cpu_neon.h"
 #include "kquant_gguf.h"
 
 namespace nb = nanobind;
@@ -49,6 +50,12 @@ NB_MODULE(_ext, m) {
       "metallib_loads",
       &mlx_kquant::metallib_loads,
       "Load the bundled metallib via the Metal device (toolchain self-check).");
+
+  m.def(
+      "cpu_neon_available",
+      &mlx_kquant::kq_cpu_neon_available,
+      "True when the arm64 NEON int8 CPU GEMV kernels can run here (arm64 "
+      "build with the dotprod extension, not disabled via KQ_CPU_NEON=0).");
 
   // --- ops ---
   m.def(
