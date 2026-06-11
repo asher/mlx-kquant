@@ -26,8 +26,11 @@ in - no mlx-lm code is copied or re-implemented:
   ``/frequency-penalty`` adjust sampling for subsequent responses
   (``/sampling`` shows the current values; top-k, min-p, and the penalties
   go beyond mlx-lm's own chat flags, via the per-turn sampler and logits
-  processors the wrapped ``stream_generate`` rebuilds). The penalties are
-  also shim startup flags (``--repetition-penalty`` etc.);
+  processors the wrapped ``stream_generate`` rebuilds). All five extras are
+  also shim startup flags (``--top-k``, ``--min-p``,
+  ``--repetition-penalty``, ``--presence-penalty``,
+  ``--frequency-penalty``), so a model card's full sampling recommendation
+  fits on the command line;
 * **Ctrl-C during a response cancels it** and returns to the prompt (the
   ``stream_generate`` mlx-lm iterates is wrapped to absorb the interrupt);
   Ctrl-C at an idle prompt still exits the session;
@@ -282,6 +285,8 @@ def passthrough(rest: list[str]) -> int:
     # rejects unknown arguments). Everything else stays in `rest` untouched.
     shim_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     shim_parser.add_argument("--no-history", action="store_true")
+    shim_parser.add_argument("--top-k", type=int)
+    shim_parser.add_argument("--min-p", type=float)
     shim_parser.add_argument("--repetition-penalty", type=float)
     shim_parser.add_argument("--presence-penalty", type=float)
     shim_parser.add_argument("--frequency-penalty", type=float)
@@ -307,8 +312,8 @@ def passthrough(rest: list[str]) -> int:
     state["sampling"] = {
         "temp": chat_args.temp,
         "top_p": chat_args.top_p,
-        "top_k": 0,
-        "min_p": 0.0,
+        "top_k": shim_args.top_k or 0,
+        "min_p": shim_args.min_p or 0.0,
         "xtc_threshold": chat_args.xtc_threshold,
         "xtc_probability": chat_args.xtc_probability,
         "max_tokens": chat_args.max_tokens,
@@ -316,11 +321,13 @@ def passthrough(rest: list[str]) -> int:
         "presence_penalty": shim_args.presence_penalty or 0.0,
         "frequency_penalty": shim_args.frequency_penalty or 0.0,
     }
-    # A penalty flag engages the override wrapper from the first turn (mlx-lm's
-    # own per-turn sampler carries no penalties).
+    # Any shim sampling flag engages the override wrapper from the first turn
+    # (mlx-lm's own per-turn sampler knows nothing of these knobs).
     state["overridden"] = any(
         v is not None
         for v in (
+            shim_args.top_k,
+            shim_args.min_p,
             shim_args.repetition_penalty,
             shim_args.presence_penalty,
             shim_args.frequency_penalty,
