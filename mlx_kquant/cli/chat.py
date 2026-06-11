@@ -31,6 +31,10 @@ in - no mlx-lm code is copied or re-implemented:
   ``--repetition-penalty``, ``--presence-penalty``,
   ``--frequency-penalty``), so a model card's full sampling recommendation
   fits on the command line;
+* ``/load <file>`` prefills the *next* prompt with a text file's contents
+  (via the readline startup hook), so it can be edited before Enter sends
+  it; Tab completes ``/command`` names, ``/history`` arguments, and file
+  paths after ``/load``;
 * **Ctrl-C during a response cancels it** and returns to the prompt (the
   ``stream_generate`` mlx-lm iterates is wrapped to absorb the interrupt);
   Ctrl-C at an idle prompt still exits the session;
@@ -182,7 +186,8 @@ def _print_shim_help(state: dict) -> None:
         "adjust penalties"
     )
     print("- '/sampling' to show the current sampling settings")
-    print("- '/help' to display these commands")
+    print("- '/load <file>' prefill the next prompt from a text file (edit, Enter)")
+    print("- '/help' to display these commands; Tab completes /commands and paths")
 
 
 def _print_sampling(state: dict) -> None:
@@ -211,6 +216,20 @@ def _handle_slash(line: str, state: dict) -> None:
         return
     if cmd == "/sampling":
         _print_sampling(state)
+        return
+    if cmd == "/load":
+        from pathlib import Path
+
+        if not arg:
+            print("[mlx-kquant] usage: /load <text file> (prefills the next prompt)")
+            return
+        try:
+            text = Path(arg).expanduser().read_text()
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"[mlx-kquant] /load: {e}")
+            return
+        state["pending_insert"] = text.rstrip("\n")
+        print(f"[mlx-kquant] loaded {arg} ({len(text)} chars) - edit, then Enter")
         return
     if cmd != "/history":
         _print_shim_help(state)
@@ -253,8 +272,23 @@ def _command_filter(real_input, state: dict):
     """
 
     def filtered(prompt: str = "") -> str:
+        readline = state["readline"]
         while True:
-            line = real_input(prompt)
+            pending = state.get("pending_insert")
+            if pending is not None:
+                state["pending_insert"] = None
+                if readline is None:
+                    print("[mlx-kquant] (no readline: sending the loaded text as-is)")
+                    return pending
+                # Startup hook fires as input() starts: the text lands in the
+                # line buffer, editable, and is submitted only on Enter.
+                readline.set_startup_hook(lambda t=pending: readline.insert_text(t))
+                try:
+                    line = real_input(prompt)
+                finally:
+                    readline.set_startup_hook(None)
+            else:
+                line = real_input(prompt)
             if line.strip() == "h":
                 # The REPL's own help follows; surface the shim commands with
                 # it (its print_help is internal, so this prints just above).
@@ -265,6 +299,54 @@ def _command_filter(real_input, state: dict):
             _handle_slash(line, state)
 
     return filtered
+
+
+def _make_completer(readline, state: dict):
+    """A readline completer for the shim's /commands.
+
+    Completes command names on a leading ``/``, the on/off/clear arguments of
+    ``/history``, and filesystem paths after ``/load``. Ordinary chat text
+    yields no matches, so Tab stays inert outside the command surface.
+    """
+    import glob
+    import os
+
+    commands = sorted([*_SAMPLING_COMMANDS, "/history", "/sampling", "/load", "/help"])
+
+    def complete(text: str, index: int):
+        buf = readline.get_line_buffer()
+        if buf.startswith("/history "):
+            options = [o for o in ("on", "off", "clear") if o.startswith(text)]
+        elif buf.startswith("/load "):
+            options = [
+                m + ("/" if os.path.isdir(m) else "")
+                for m in sorted(glob.glob(os.path.expanduser(text) + "*"))
+            ]
+        elif text.startswith("/"):
+            options = [c + " " for c in commands if c.startswith(text)]
+        else:
+            return None
+        return options[index] if index < len(options) else None
+
+    return complete
+
+
+def _wire_completion(readline, state: dict) -> None:
+    """Bind Tab to the /command completer (GNU readline or libedit)."""
+    readline.set_completer(_make_completer(readline, state))
+    # The default delims include "/" - drop it so "/te" and "/load src/f"
+    # complete as whole tokens.
+    readline.set_completer_delims(" \t\n")
+    backend = getattr(readline, "backend", None)  # py3.13+; None earlier
+    is_libedit = (
+        backend == "editline"
+        if backend is not None
+        else "libedit" in (readline.__doc__ or "")
+    )
+    if is_libedit:
+        readline.parse_and_bind("bind ^I rl_complete")
+    else:
+        readline.parse_and_bind("tab: complete")
 
 
 def passthrough(rest: list[str]) -> int:
@@ -300,6 +382,8 @@ def passthrough(rest: list[str]) -> int:
     except ImportError:  # pragma: no cover - absent on some builds
         readline = None
     state = _wire_history(readline, enabled=not no_history)
+    if readline is not None:
+        _wire_completion(readline, state)
 
     import mlx_lm.chat as _chat
 

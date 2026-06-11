@@ -226,6 +226,86 @@ def test_chat_interruptible_applies_sampling_override():
     assert len(captured["logits_processors"]) == 1
 
 
+class _FakeReadlineBuffer:
+    """Just enough readline for completer / startup-hook tests."""
+
+    def __init__(self, buffer=""):
+        self.buffer = buffer
+        self.hooks = []
+
+    def get_line_buffer(self):
+        return self.buffer
+
+    def set_startup_hook(self, hook):
+        self.hooks.append(hook)
+
+    def insert_text(self, text):
+        self.inserted = text
+
+
+def test_chat_load_prefills_next_prompt(tmp_path, capsys):
+    from mlx_kquant.cli.chat import _command_filter, _handle_slash
+
+    f = tmp_path / "prompt.txt"
+    f.write_text("review this diff\n")
+    rl = _FakeReadlineBuffer()
+    state = {"readline": rl, "enabled": True, "loaded": False}
+
+    _handle_slash(f"/load {f}", state)
+    assert state["pending_insert"] == "review this diff"
+    assert "loaded" in capsys.readouterr().out
+
+    # The next input() gets the startup hook (set, then cleared), and the
+    # user-edited line is what reaches mlx-lm's loop.
+    filtered = _command_filter(lambda prompt="": "review this diff please", state)
+    assert filtered(">> ") == "review this diff please"
+    assert len(rl.hooks) == 2 and rl.hooks[1] is None
+    rl.hooks[0]()  # the installed hook inserts the loaded text
+    assert rl.inserted == "review this diff"
+    assert state["pending_insert"] is None
+
+
+def test_chat_load_errors(tmp_path, capsys):
+    from mlx_kquant.cli.chat import _handle_slash
+
+    state = {"readline": None, "enabled": True, "loaded": False}
+    _handle_slash("/load", state)
+    _handle_slash(f"/load {tmp_path}/nope.txt", state)
+    out = capsys.readouterr().out
+    assert "usage: /load" in out
+    assert "/load:" in out
+    assert "pending_insert" not in state
+
+
+def test_chat_completer():
+    from mlx_kquant.cli.chat import _make_completer
+
+    state: dict = {}
+    rl = _FakeReadlineBuffer("/te")
+    complete = _make_completer(rl, state)
+    assert complete("/te", 0) == "/temp "
+    assert complete("/te", 1) is None
+
+    rl.buffer = "/history o"
+    assert complete("o", 0) == "on"
+    assert complete("o", 1) == "off"
+    assert complete("o", 2) is None
+
+    rl.buffer = "ordinary chat text"
+    assert complete("text", 0) is None
+
+
+def test_chat_completer_load_paths(tmp_path):
+    from mlx_kquant.cli.chat import _make_completer
+
+    (tmp_path / "prompt.txt").write_text("x")
+    (tmp_path / "prompts").mkdir()
+    rl = _FakeReadlineBuffer(f"/load {tmp_path}/pro")
+    complete = _make_completer(rl, {})
+    got = {complete(f"{tmp_path}/pro", i) for i in range(2)}
+    assert got == {f"{tmp_path}/prompt.txt", f"{tmp_path}/prompts/"}
+
+
 def test_chat_h_command_also_shows_shim_help(capsys):
     # 'h' is mlx-lm's help command: it must still reach their loop, with the
     # shim's command list printed alongside.
