@@ -16,7 +16,11 @@ On top of the unmodified mlx-lm loop, the shim upgrades the terminal it runs
 in - no mlx-lm code is copied or re-implemented:
 
 * importing :mod:`readline` makes the ``input()`` prompt line-editable (arrow
-  keys, Ctrl-A/E) with up-arrow history, persisted across sessions;
+  keys, Ctrl-A/E) with up-arrow history, persisted across sessions
+  (``$XDG_CACHE_HOME/mlx-kquant/chat_history``); ``--no-history`` keeps the
+  session ephemeral (no file read or written; in-session recall still works);
+* lines starting with ``/`` are shim commands, intercepted before mlx-lm's
+  loop sees them: ``/history [on|off|clear]`` controls persistence at runtime;
 * **Ctrl-C during a response cancels it** and returns to the prompt (the
   ``stream_generate`` mlx-lm iterates is wrapped to absorb the interrupt);
   Ctrl-C at an idle prompt still exits the session;
@@ -40,7 +44,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         add_help=False,
         description="Pass-through to mlx-lm's chat REPL with the kquant patch "
         "applied, so --model may be a kquant checkpoint. All mlx-lm chat flags "
-        "apply; run `mlx-kquant chat --help`.",
+        "apply; run `mlx-kquant chat --help`. Extra shim flag: --no-history "
+        "(don't read or write the prompt-history file); in-chat, "
+        "`/history [on|off|clear]` controls the same at runtime.",
     )
 
 
@@ -65,29 +71,103 @@ def _interruptible(stream_fn):
     return wrapped
 
 
-def _wire_history(readline) -> None:
-    """Persist the readline prompt history across chat sessions."""
-    import atexit
+def _history_path():
     import os
     from pathlib import Path
 
     cache = Path(os.environ.get("XDG_CACHE_HOME") or "~/.cache").expanduser()
-    hist = cache / "mlx-kquant" / "chat_history"
-    try:
-        hist.parent.mkdir(parents=True, exist_ok=True)
-        if hist.exists():
-            readline.read_history_file(hist)
-    except OSError:
-        return  # unwritable cache dir: line editing still works, just unsaved
+    return cache / "mlx-kquant" / "chat_history"
+
+
+def _wire_history(readline, enabled: bool) -> dict:
+    """Set up prompt-history persistence; return its mutable control state.
+
+    ``state["enabled"]`` is consulted at exit, so ``/history on|off`` can flip
+    persistence mid-session. The file is only loaded once (``loaded``) - on
+    startup when enabled, or lazily by ``/history on`` - so a later save
+    merges prior history instead of overwriting it with just this session.
+    """
+    state = {"readline": readline, "enabled": enabled, "loaded": False}
+    if readline is None:
+        return state
+
+    import atexit
+
+    hist = _history_path()
+    if enabled:
+        try:
+            if hist.exists():
+                readline.read_history_file(hist)
+            state["loaded"] = True
+        except OSError:
+            pass
 
     def _save() -> None:
+        if not state["enabled"]:
+            return
         try:
+            hist.parent.mkdir(parents=True, exist_ok=True)
             readline.set_history_length(1000)
             readline.write_history_file(hist)
         except OSError:
             pass
 
     atexit.register(_save)
+    return state
+
+
+def _handle_slash(line: str, state: dict) -> None:
+    """Handle a shim ``/command`` line (never shown to mlx-lm's loop)."""
+    readline = state["readline"]
+    cmd, _, arg = line.strip().partition(" ")
+    if cmd != "/history":
+        print("[mlx-kquant] shim commands: /history [on|off|clear]")
+        return
+    if readline is None:
+        print("[mlx-kquant] history unavailable (no readline on this build)")
+        return
+    arg = arg.strip()
+    if arg == "off":
+        state["enabled"] = False
+        print("[mlx-kquant] history off (this session will not be saved)")
+    elif arg == "on":
+        if not state["loaded"]:
+            try:
+                if _history_path().exists():
+                    readline.read_history_file(_history_path())
+                state["loaded"] = True
+            except OSError:
+                pass
+        state["enabled"] = True
+        print("[mlx-kquant] history on")
+    elif arg == "clear":
+        readline.clear_history()
+        try:
+            _history_path().unlink(missing_ok=True)
+        except OSError:
+            pass
+        print("[mlx-kquant] history cleared")
+    else:
+        status = "on" if state["enabled"] else "off"
+        print(f"[mlx-kquant] history is {status} ({_history_path()})")
+
+
+def _command_filter(real_input, state: dict):
+    """An ``input()`` that consumes shim ``/commands`` and re-prompts.
+
+    Installed as a module attribute on ``mlx_lm.chat``, where it shadows the
+    builtin for that module only - mlx-lm's loop receives only the lines that
+    are not shim commands.
+    """
+
+    def filtered(prompt: str = "") -> str:
+        while True:
+            line = real_input(prompt)
+            if not line.startswith("/"):
+                return line
+            _handle_slash(line, state)
+
+    return filtered
 
 
 def passthrough(rest: list[str]) -> int:
@@ -96,6 +176,7 @@ def passthrough(rest: list[str]) -> int:
     Unlike the ``lora`` pass-through, ``--trust-remote-code`` is *not* stripped:
     mlx-lm's chat parser has its own (tokenizer) meaning for it, and the same
     flag also grants the kquant loader's ``model_file`` opt-in here.
+    ``--no-history`` is the shim's own flag and is stripped before delegating.
     """
     import sys
 
@@ -103,14 +184,17 @@ def passthrough(rest: list[str]) -> int:
 
     require_tools()
 
+    no_history = "--no-history" in rest
+    if no_history:
+        rest = [a for a in rest if a != "--no-history"]
+
     # Imported for its side effect: input() becomes line-editable with
     # up-arrow history the moment the module exists.
     try:
         import readline
     except ImportError:  # pragma: no cover - absent on some builds
         readline = None
-    if readline is not None:
-        _wire_history(readline)
+    state = _wire_history(readline, enabled=not no_history)
 
     import mlx_lm.chat as _chat
 
@@ -118,6 +202,7 @@ def passthrough(rest: list[str]) -> int:
 
     patch_mlx_lm_lora(trust_remote_code="--trust-remote-code" in rest)
     _chat.stream_generate = _interruptible(_chat.stream_generate)
+    _chat.input = _command_filter(input, state)
 
     saved_argv = sys.argv
     sys.argv = ["mlx_lm.chat", *rest]

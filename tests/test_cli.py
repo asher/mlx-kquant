@@ -135,6 +135,51 @@ def test_chat_interruptible_is_transparent():
     assert list(_interruptible(stream)(6, step=2)) == [0, 2, 4]
 
 
+def test_chat_command_filter_intercepts_slash_lines(capsys):
+    # /-prefixed lines are consumed by the shim (with a re-prompt); only
+    # ordinary lines reach mlx-lm's loop.
+    from mlx_kquant.cli.chat import _command_filter
+
+    lines = iter(["/bogus", "hello"])
+    state = {"readline": None, "enabled": True, "loaded": False}
+    filtered = _command_filter(lambda prompt="": next(lines), state)
+    assert filtered(">> ") == "hello"
+    assert "shim commands" in capsys.readouterr().out
+
+
+def test_chat_history_toggle_and_clear(tmp_path, monkeypatch, capsys):
+    from mlx_kquant.cli import chat as chat_mod
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+
+    class FakeReadline:
+        cleared = False
+
+        def clear_history(self):
+            self.cleared = True
+
+        def read_history_file(self, path):
+            pass
+
+    rl = FakeReadline()
+    state = {"readline": rl, "enabled": True, "loaded": True}
+
+    chat_mod._handle_slash("/history off", state)
+    assert state["enabled"] is False
+    chat_mod._handle_slash("/history on", state)
+    assert state["enabled"] is True
+
+    hist = chat_mod._history_path()
+    hist.parent.mkdir(parents=True, exist_ok=True)
+    hist.write_text("old\n")
+    chat_mod._handle_slash("/history clear", state)
+    assert rl.cleared
+    assert not hist.exists()
+
+    chat_mod._handle_slash("/history", state)
+    assert "history is on" in capsys.readouterr().out
+
+
 def test_passthrough_commands_registered():
     # lora / chat are pre-argparse pass-throughs but must still appear in the
     # registered command list for the top-level --help.

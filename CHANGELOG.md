@@ -23,8 +23,9 @@ toolchain that runs on a stock `mlx==0.31.2` wheel.
   (except `inspect` and `verify --codecs`, which run on a base install).
 - `mlx-kquant chat` - interactive REPL: a pass-through to mlx-lm's chat with
   the kquant patch applied, plus terminal upgrades in the shim (readline
-  line editing with persistent history; Ctrl-C cancels the in-flight reply;
-  Ctrl-D exits cleanly). `run` carries sampling (`--top-p` / `--top-k` /
+  line editing with persistent history - `--no-history` or in-chat
+  `/history on|off|clear` to control it; Ctrl-C cancels the in-flight
+  reply; Ctrl-D exits cleanly). `run` carries sampling (`--top-p` / `--top-k` /
   `--min-p` / `--seed`) and chat-template (`--system-prompt` /
   `--no-chat-template` / `--chat-template-config`) controls.
 - `mlx-kquant inspect` - print a checkpoint's per-tensor codec recipe (codec,
