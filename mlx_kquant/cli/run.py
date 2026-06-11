@@ -49,6 +49,21 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Min-p cutoff, scaled by the top token's probability (0 = off). "
         "Default: 0.0.",
     )
+    p.add_argument(
+        "--repetition-penalty",
+        type=float,
+        help="Multiplicative penalty for repeating tokens (1.0 = off).",
+    )
+    p.add_argument(
+        "--presence-penalty",
+        type=float,
+        help="Additive penalty for tokens already present (0 = off).",
+    )
+    p.add_argument(
+        "--frequency-penalty",
+        type=float,
+        help="Additive penalty scaled by token frequency (0 = off).",
+    )
     p.add_argument("--seed", type=int, help="PRNG seed for reproducible sampling.")
     p.add_argument("--system-prompt", help="System message for the chat template.")
     p.add_argument(
@@ -120,6 +135,19 @@ def cmd(args: argparse.Namespace) -> int:
 
         kwargs["sampler"] = make_sampler(
             temp=args.temp, top_p=args.top_p, min_p=args.min_p, top_k=args.top_k
+        )
+    penalties = (
+        args.repetition_penalty,
+        args.presence_penalty,
+        args.frequency_penalty,
+    )
+    if any(v is not None for v in penalties):
+        from mlx_lm.sample_utils import make_logits_processors
+
+        kwargs["logits_processors"] = make_logits_processors(
+            repetition_penalty=args.repetition_penalty,
+            presence_penalty=args.presence_penalty,
+            frequency_penalty=args.frequency_penalty,
         )
 
     generate(model, tokenizer, prompt, verbose=True, **kwargs)

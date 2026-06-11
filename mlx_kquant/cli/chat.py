@@ -22,9 +22,12 @@ in - no mlx-lm code is copied or re-implemented:
 * lines starting with ``/`` are shim commands, intercepted before mlx-lm's
   loop sees them: ``/history [on|off|clear]`` controls persistence at
   runtime, and ``/temp`` / ``/top-p`` / ``/top-k`` / ``/min-p`` /
-  ``/max-tokens`` adjust sampling for subsequent responses (``/sampling``
-  shows the current values; top-k and min-p go beyond mlx-lm's own chat
-  flags, via the per-turn sampler the wrapped ``stream_generate`` rebuilds);
+  ``/max-tokens`` / ``/repetition-penalty`` / ``/presence-penalty`` /
+  ``/frequency-penalty`` adjust sampling for subsequent responses
+  (``/sampling`` shows the current values; top-k, min-p, and the penalties
+  go beyond mlx-lm's own chat flags, via the per-turn sampler and logits
+  processors the wrapped ``stream_generate`` rebuilds). The penalties are
+  also shim startup flags (``--repetition-penalty`` etc.);
 * **Ctrl-C during a response cancels it** and returns to the prompt (the
   ``stream_generate`` mlx-lm iterates is wrapped to absorb the interrupt);
   Ctrl-C at an idle prompt still exits the session;
@@ -48,9 +51,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         add_help=False,
         description="Pass-through to mlx-lm's chat REPL with the kquant patch "
         "applied, so --model may be a kquant checkpoint. All mlx-lm chat flags "
-        "apply; run `mlx-kquant chat --help`. Extra shim flag: --no-history "
-        "(don't read or write the prompt-history file); in-chat, "
-        "`/history [on|off|clear]` controls the same at runtime.",
+        "apply; run `mlx-kquant chat --help`. Extra shim flags: --no-history "
+        "(don't read or write the prompt-history file) and "
+        "--repetition-penalty / --presence-penalty / --frequency-penalty; "
+        "in-chat, /history and the /temp-style sampling commands control the "
+        "same at runtime (/help lists them).",
     )
 
 
@@ -75,7 +80,7 @@ def _interruptible(stream_fn, state: dict | None = None):
 
     def wrapped(*args, **kwargs):
         if state is not None and state.get("overridden"):
-            from mlx_lm.sample_utils import make_sampler
+            from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
             s = state["sampling"]
             tokenizer = args[1] if len(args) > 1 else kwargs["tokenizer"]
@@ -91,6 +96,13 @@ def _interruptible(stream_fn, state: dict | None = None):
                 ),
             )
             kwargs["max_tokens"] = s["max_tokens"]
+            # Neutral values map to None so no-op processors aren't run.
+            rep = s["repetition_penalty"]
+            kwargs["logits_processors"] = make_logits_processors(
+                repetition_penalty=None if rep in (None, 1.0) else rep,
+                presence_penalty=s["presence_penalty"] or None,
+                frequency_penalty=s["frequency_penalty"] or None,
+            )
         try:
             yield from stream_fn(*args, **kwargs)
         except KeyboardInterrupt:
@@ -151,6 +163,9 @@ _SAMPLING_COMMANDS = {
     "/top-k": ("top_k", int),
     "/min-p": ("min_p", float),
     "/max-tokens": ("max_tokens", int),
+    "/repetition-penalty": ("repetition_penalty", float),
+    "/presence-penalty": ("presence_penalty", float),
+    "/frequency-penalty": ("frequency_penalty", float),
 }
 
 
@@ -159,6 +174,10 @@ def _print_shim_help(state: dict) -> None:
     print("[mlx-kquant] shim commands (the REPL's own are 'q' / 'r' / 'h'):")
     print(f"- '/history [on|off|clear]' control prompt-history saving ({status})")
     print("- '/temp /top-p /top-k /min-p /max-tokens <value>' adjust sampling")
+    print(
+        "- '/repetition-penalty /presence-penalty /frequency-penalty <value>' "
+        "adjust penalties"
+    )
     print("- '/sampling' to show the current sampling settings")
     print("- '/help' to display these commands")
 
@@ -259,9 +278,15 @@ def passthrough(rest: list[str]) -> int:
 
     require_tools()
 
-    no_history = "--no-history" in rest
-    if no_history:
-        rest = [a for a in rest if a != "--no-history"]
+    # The shim's own flags, removed before delegating (mlx-lm's chat parser
+    # rejects unknown arguments). Everything else stays in `rest` untouched.
+    shim_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    shim_parser.add_argument("--no-history", action="store_true")
+    shim_parser.add_argument("--repetition-penalty", type=float)
+    shim_parser.add_argument("--presence-penalty", type=float)
+    shim_parser.add_argument("--frequency-penalty", type=float)
+    shim_args, rest = shim_parser.parse_known_args(rest)
+    no_history = shim_args.no_history
 
     # Imported for its side effect: input() becomes line-editable with
     # up-arrow history the moment the module exists.
@@ -287,8 +312,20 @@ def passthrough(rest: list[str]) -> int:
         "xtc_threshold": chat_args.xtc_threshold,
         "xtc_probability": chat_args.xtc_probability,
         "max_tokens": chat_args.max_tokens,
+        "repetition_penalty": shim_args.repetition_penalty or 1.0,
+        "presence_penalty": shim_args.presence_penalty or 0.0,
+        "frequency_penalty": shim_args.frequency_penalty or 0.0,
     }
-    state["overridden"] = False
+    # A penalty flag engages the override wrapper from the first turn (mlx-lm's
+    # own per-turn sampler carries no penalties).
+    state["overridden"] = any(
+        v is not None
+        for v in (
+            shim_args.repetition_penalty,
+            shim_args.presence_penalty,
+            shim_args.frequency_penalty,
+        )
+    )
 
     patch_mlx_lm_lora(trust_remote_code="--trust-remote-code" in rest)
     _chat.stream_generate = _interruptible(_chat.stream_generate, state)

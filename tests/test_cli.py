@@ -170,6 +170,8 @@ def test_chat_sampling_slash_commands(capsys):
     assert state["overridden"] is True
     _handle_slash("/top-k 40", state)
     assert state["sampling"]["top_k"] == 40
+    _handle_slash("/presence-penalty 1.5", state)
+    assert state["sampling"]["presence_penalty"] == 1.5
     _handle_slash("/temp", state)  # no value: prints current, no change
     _handle_slash("/temp abc", state)  # bad value: error, no change
     assert state["sampling"]["temp"] == 0.8
@@ -193,7 +195,7 @@ def test_chat_interruptible_applies_sampling_override():
     captured = {}
 
     def stream(model, tokenizer, prompt, max_tokens=0, sampler=None, **kw):
-        captured.update(max_tokens=max_tokens, sampler=sampler)
+        captured.update(max_tokens=max_tokens, sampler=sampler, **kw)
         yield "tok"
 
     state = {
@@ -206,6 +208,9 @@ def test_chat_interruptible_applies_sampling_override():
             "xtc_threshold": 0.0,
             "xtc_probability": 0.0,
             "max_tokens": 99,
+            "repetition_penalty": 1.0,
+            "presence_penalty": 1.5,
+            "frequency_penalty": 0.0,
         },
     }
     out = list(
@@ -216,6 +221,9 @@ def test_chat_interruptible_applies_sampling_override():
     assert out == ["tok"]
     assert captured["max_tokens"] == 99
     assert callable(captured["sampler"])  # rebuilt, not the original string
+    # presence_penalty=1.5 is non-neutral -> exactly one logits processor;
+    # the neutral repetition (1.0) and frequency (0.0) values map to None.
+    assert len(captured["logits_processors"]) == 1
 
 
 def test_chat_h_command_also_shows_shim_help(capsys):
