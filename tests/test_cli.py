@@ -113,6 +113,28 @@ def test_run_sampling_and_template_flags_parse():
     assert args.no_chat_template is True
 
 
+def test_chat_interruptible_absorbs_ctrl_c_mid_stream(capsys):
+    # Ctrl-C during generation lands inside the wrapped generator; absorbing
+    # it ends the turn so the REPL survives instead of the session dying.
+    from mlx_kquant.cli.chat import _interruptible
+
+    def stream():
+        yield "a"
+        raise KeyboardInterrupt
+
+    assert list(_interruptible(stream)()) == ["a"]
+    assert "canceled" in capsys.readouterr().out
+
+
+def test_chat_interruptible_is_transparent():
+    from mlx_kquant.cli.chat import _interruptible
+
+    def stream(n, step=1):
+        yield from range(0, n, step)
+
+    assert list(_interruptible(stream)(6, step=2)) == [0, 2, 4]
+
+
 def test_passthrough_commands_registered():
     # lora / chat are pre-argparse pass-throughs but must still appear in the
     # registered command list for the top-level --help.
