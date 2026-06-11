@@ -13,10 +13,13 @@
 // right_sorted_ == do_sort: MoE PREFILL takes this sorted per-expert GEMM
 // (~=6-8x faster than B separate gather_qmv vector-matmuls), while decode
 // (top_k<64 -> no sort -> B<16) falls through to gather_qmv.
+#include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include "kquant.h"
 #include "kquant_codec.h"
@@ -396,24 +399,88 @@ void KQuantGatherQMM::eval_cpu(
     const uint32_t* rhs_ptr = rhs_indices.data<uint32_t>();
     int n_rows = static_cast<int>(lhs_indices.size());
 
+    // Group the index entries by expert (w_idx) so each expert's wire bytes
+    // are decoded ONCE per call instead of once per entry. In sorted MoE
+    // prefill there is one entry per (token, expert) pair, so the naive
+    // entry-at-a-time loop re-dequantizes every expert per token — the
+    // dominant cost by far. Grouped, all of an expert's rows are packed into
+    // one [Rg*M, K] activation block and run as a single qmm (which threads
+    // internally and picks fused-GEMV or dequant-once+GEMM by row count).
+    struct Entry {
+      int i;
+      int x_idx;
+      int w_idx;
+    };
+    std::vector<Entry> entries(n_rows);
+    for (int i = 0; i < n_rows; i++) {
+      entries[i].i = i;
+      entries[i].x_idx = static_cast<int>(lhs_ptr[mx::elem_to_loc(
+          i, lhs_indices.shape(), lhs_indices.strides())]);
+      entries[i].w_idx = static_cast<int>(rhs_ptr[mx::elem_to_loc(
+          i, rhs_indices.shape(), rhs_indices.strides())]);
+    }
+    std::stable_sort(
+        entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+          return a.w_idx < b.w_idx;
+        });
+
     auto gather_loop = [&](auto* tag) {
       using T = std::remove_pointer_t<decltype(tag)>;
-      for (int i = 0; i < n_rows; i++) {
-        int x_idx = static_cast<int>(lhs_ptr[mx::elem_to_loc(
-            i, lhs_indices.shape(), lhs_indices.strides())]);
-        int w_idx = static_cast<int>(rhs_ptr[mx::elem_to_loc(
-            i, rhs_indices.shape(), rhs_indices.strides())]);
-        kquant_qmm_cpu<T>(
-            out.data<T>() + static_cast<std::size_t>(i) * M * N,
-            x.data<T>() +
-                mx::elem_to_loc(x_idx * M * K, x.shape(), x.strides()),
-            w.data<uint8_t>() +
-                mx::elem_to_loc(w_idx * w_els, w.shape(), w.strides()),
-            M,
-            N,
-            K,
-            transpose_,
-            kquant_type);
+      const std::size_t row_els = static_cast<std::size_t>(M) * K;
+      const std::size_t out_row_els = static_cast<std::size_t>(M) * N;
+      std::vector<T> xg;
+      std::vector<T> og;
+      std::size_t a = 0;
+      while (a < entries.size()) {
+        std::size_t b = a;
+        while (b < entries.size() && entries[b].w_idx == entries[a].w_idx) {
+          b++;
+        }
+        const std::size_t rg = b - a;
+        const uint8_t* wp = w.data<uint8_t>() +
+            mx::elem_to_loc(entries[a].w_idx * w_els, w.shape(), w.strides());
+        if (rg == 1) {
+          // Single entry for this expert (the decode shape): no packing.
+          kquant_qmm_cpu<T>(
+              out.data<T>() + static_cast<std::size_t>(entries[a].i) * M * N,
+              x.data<T>() +
+                  mx::elem_to_loc(
+                      entries[a].x_idx * M * K, x.shape(), x.strides()),
+              wp,
+              M,
+              N,
+              K,
+              transpose_,
+              kquant_type);
+        } else {
+          xg.resize(rg * row_els);
+          og.resize(rg * out_row_els);
+          for (std::size_t r = 0; r < rg; r++) {
+            std::memcpy(
+                xg.data() + r * row_els,
+                x.data<T>() +
+                    mx::elem_to_loc(
+                        entries[a + r].x_idx * M * K, x.shape(), x.strides()),
+                row_els * sizeof(T));
+          }
+          kquant_qmm_cpu<T>(
+              og.data(),
+              xg.data(),
+              wp,
+              static_cast<int>(rg) * M,
+              N,
+              K,
+              transpose_,
+              kquant_type);
+          for (std::size_t r = 0; r < rg; r++) {
+            std::memcpy(
+                out.data<T>() +
+                    static_cast<std::size_t>(entries[a + r].i) * M * N,
+                og.data() + r * out_row_els,
+                out_row_els * sizeof(T));
+          }
+        }
+        a = b;
       }
     };
     auto dt = x.dtype();

@@ -109,6 +109,14 @@ target_include_directories(mlx_kquant_ext PUBLIC ${CMAKE_CURRENT_LIST_DIR}/src)
 # needs gguflib.h on its include path and the gguf_* symbols at link time.
 target_include_directories(mlx_kquant_ext PUBLIC ${gguflib_SOURCE_DIR})
 target_link_libraries(mlx_kquant_ext PUBLIC mlx)
+# Apple: route the CPU matmul's large-M GEMM through Accelerate (engages the
+# AMX/SME matrix units). PUBLIC so the nanobind module, which re-compiles the
+# PUBLIC sources above, sees the same define and link. Other platforms keep
+# the portable threaded-scalar fallback.
+if(APPLE)
+  target_compile_definitions(mlx_kquant_ext PUBLIC KQ_USE_ACCELERATE)
+  target_link_libraries(mlx_kquant_ext PUBLIC "-framework Accelerate")
+endif()
 # libmlx bundles its OWN (older) gguflib and exports its gguf_* symbols. A plain
 # link can bind our gguf_get_tensor()/gguf_open() calls to MLX's copy, whose
 # GGUF_TYPE_COUNT predates the MXFP4/NVFP4 float codecs - so a tensor of type

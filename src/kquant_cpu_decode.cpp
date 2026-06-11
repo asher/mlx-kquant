@@ -1,16 +1,33 @@
-// Scalar CPU decoders for the 10 GGUF codecs + dequant-then-matmul. Bit-exact
-// per-codec against the gguf-py reference; no Metal deps. The block decode
-// math derives from ggml (llama.cpp, MIT) - see
+// CPU decoders for the 10 GGUF codecs + dequant-then-matmul. The per-block
+// decode is scalar and bit-exact per-codec against the gguf-py reference; no
+// Metal deps, so this builds and runs on any platform with the stock mlx
+// wheel. The matmul wrapper is performance-tuned but portable: a shared
+// worker pool parallelizes over output rows / blocks, small-M matmuls run a
+// fused decode-one-block-then-dot loop (no full-matrix scratch), and large-M
+// matmuls dequantize once then run a GEMM — through Accelerate where
+// available (KQ_USE_ACCELERATE), else a threaded scalar loop. The block
+// decode math derives from ggml (llama.cpp, MIT) - see
 // mlx_kquant/licenses/llama.cpp-LICENSE.
 #include "kquant_cpu_decode.h"
 
+#include <atomic>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "kquant_codec.h"
 
 #include "mlx/types/half_types.h" // float16_t, bfloat16_t
+
+#ifdef KQ_USE_ACCELERATE
+#include <Accelerate/Accelerate.h>
+#endif
 
 namespace mx = mlx::core;
 
@@ -354,6 +371,275 @@ void dequantize_q2_k(const uint8_t* w, T* out, std::size_t num_weights) {
   }
 }
 
+// --------------------------------------------------------------------------
+// Shared CPU worker pool
+// --------------------------------------------------------------------------
+//
+// MLX's CPU command encoder runs each primitive's lambda on a single
+// per-stream scheduler thread, so without this pool every kq.* CPU op is
+// single-threaded. The pool is lazily created on first use and lives for the
+// process; the dispatching thread participates in every job, so
+// KQ_CPU_THREADS=1 (or a single-core box) degrades to plain inline execution
+// with no thread traffic. Not reentrant by design — callers below only ever
+// invoke it from the scheduler thread, never from inside a worker.
+
+class KQThreadPool {
+ public:
+  static KQThreadPool& get() {
+    static KQThreadPool pool;
+    return pool;
+  }
+
+  int n_threads() const {
+    return static_cast<int>(workers_.size()) + 1; // + calling thread
+  }
+
+  // Run fn(part) for part in [0, n_parts), distributing parts across the
+  // workers and the calling thread. Blocks until every part has finished.
+  void parallel(int n_parts, const std::function<void(int)>& fn) {
+    if (n_parts <= 0) {
+      return;
+    }
+    if (n_parts == 1 || workers_.empty()) {
+      for (int p = 0; p < n_parts; p++) {
+        fn(p);
+      }
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      job_fn_ = fn; // copy: workers may outlive the caller's frame otherwise
+      job_parts_ = n_parts;
+      job_next_.store(0, std::memory_order_relaxed);
+      job_done_.store(0, std::memory_order_relaxed);
+      generation_++;
+      cv_.notify_all();
+    }
+    run_parts(); // calling thread participates
+    // Wait until every part has run AND every woken worker has left
+    // run_parts — a straggler that exhausted the part counter must not still
+    // be touching job state when the next job's setup rewrites it.
+    std::unique_lock<std::mutex> lk(m_);
+    done_cv_.wait(
+        lk, [&] { return job_done_.load() >= job_parts_ && in_flight_ == 0; });
+  }
+
+ private:
+  KQThreadPool() {
+    int n = static_cast<int>(std::thread::hardware_concurrency());
+    if (const char* env = std::getenv("KQ_CPU_THREADS")) {
+      int v = std::atoi(env);
+      if (v > 0) {
+        n = v;
+      }
+    }
+    if (n < 1) {
+      n = 1;
+    }
+    if (n > 64) {
+      n = 64;
+    }
+    for (int i = 0; i < n - 1; i++) {
+      workers_.emplace_back([this] { worker_loop(); });
+    }
+  }
+
+  ~KQThreadPool() {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      stop_ = true;
+      cv_.notify_all();
+    }
+    for (auto& t : workers_) {
+      t.join();
+    }
+  }
+
+  void run_parts() {
+    int p;
+    while ((p = job_next_.fetch_add(1)) < job_parts_) {
+      job_fn_(p);
+      job_done_.fetch_add(1);
+    }
+  }
+
+  void worker_loop() {
+    std::uint64_t seen = 0;
+    while (true) {
+      {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_.wait(lk, [&] { return stop_ || generation_ != seen; });
+        if (stop_) {
+          return;
+        }
+        seen = generation_;
+        in_flight_++; // under m_: ordered against the caller's job setup
+      }
+      run_parts();
+      {
+        std::lock_guard<std::mutex> lk(m_);
+        in_flight_--;
+        done_cv_.notify_all();
+      }
+    }
+  }
+
+  std::vector<std::thread> workers_;
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::condition_variable done_cv_;
+  std::function<void(int)> job_fn_;
+  int job_parts_{0};
+  std::atomic<int> job_next_{0};
+  std::atomic<int> job_done_{0};
+  int in_flight_{0}; // workers currently inside run_parts (guarded by m_)
+  std::uint64_t generation_{0};
+  bool stop_{false};
+};
+
+} // namespace
+
+int kq_cpu_threads() {
+  return KQThreadPool::get().n_threads();
+}
+
+void kq_parallel_for(
+    std::size_t n_items,
+    const std::function<void(std::size_t, std::size_t)>& fn) {
+  if (n_items == 0) {
+    return;
+  }
+  auto& pool = KQThreadPool::get();
+  std::size_t parts = static_cast<std::size_t>(pool.n_threads());
+  if (parts > n_items) {
+    parts = n_items;
+  }
+  if (parts <= 1) {
+    fn(0, n_items);
+    return;
+  }
+  pool.parallel(static_cast<int>(parts), [&](int p) {
+    std::size_t begin = n_items * p / parts;
+    std::size_t end = n_items * (p + 1) / parts;
+    if (begin < end) {
+      fn(begin, end);
+    }
+  });
+}
+
+namespace {
+
+// Function-pointer resolver for the float32 block decoders, so the hot matmul
+// loops pay the codec-name string compare once per call instead of per block.
+using DequantFnF32 = void (*)(const uint8_t*, float*, std::size_t);
+
+DequantFnF32 dequant_fn_f32(const std::string& t) {
+  if (t == "q8_0") {
+    return &dequantize_q8_0<float>;
+  } else if (t == "q4_0") {
+    return &dequantize_q4_0<float>;
+  } else if (t == "q4_1") {
+    return &dequantize_q4_1<float>;
+  } else if (t == "q5_0") {
+    return &dequantize_q5_0<float>;
+  } else if (t == "q5_1") {
+    return &dequantize_q5_1<float>;
+  } else if (t == "q4_k") {
+    return &dequantize_q4_k<float>;
+  } else if (t == "q5_k") {
+    return &dequantize_q5_k<float>;
+  } else if (t == "q6_k") {
+    return &dequantize_q6_k<float>;
+  } else if (t == "q3_k") {
+    return &dequantize_q3_k<float>;
+  } else if (t == "q2_k") {
+    return &dequantize_q2_k<float>;
+  }
+  return nullptr;
+}
+
+// Multi-accumulator dot so the compiler can vectorize without -ffast-math
+// (a single float accumulator forbids reassociation). n is a whole number of
+// codec blocks, always a multiple of 8.
+inline float dot_block(const float* a, const float* b, int n) {
+  float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+  float s4 = 0.f, s5 = 0.f, s6 = 0.f, s7 = 0.f;
+  for (int i = 0; i < n; i += 8) {
+    s0 += a[i] * b[i];
+    s1 += a[i + 1] * b[i + 1];
+    s2 += a[i + 2] * b[i + 2];
+    s3 += a[i + 3] * b[i + 3];
+    s4 += a[i + 4] * b[i + 4];
+    s5 += a[i + 5] * b[i + 5];
+    s6 += a[i + 6] * b[i + 6];
+    s7 += a[i + 7] * b[i + 7];
+  }
+  return ((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7));
+}
+
+// Small-M GEMV ceiling for the fused path; larger M goes through
+// dequantize-once + GEMM, which amortizes the decode across rows instead.
+constexpr int kMaxFusedM = 16;
+
+// Fused decode-then-dot over output rows [n0, n1) for transpose_w=true
+// (w decodes to [N, K] row-major, the weight convention of every model
+// matmul). One 256-weight block is decoded into a stack buffer and
+// immediately dotted against all M activation rows — wire bytes are read
+// once and no [N, K] scratch is ever materialized, which is what makes
+// memory-bound decode honest.
+void qmv_fused_rows(
+    float* outf, // [M, N]
+    const float* xf, // [M, K]
+    const uint8_t* w,
+    int M,
+    int N,
+    int K,
+    std::size_t row_bytes,
+    int block_weights,
+    std::size_t bytes_per_block,
+    DequantFnF32 fn,
+    std::size_t n0,
+    std::size_t n1) {
+  float buf[256]; // max weights_per_block across codecs
+  float acc[kMaxFusedM];
+  const int nblocks = K / block_weights;
+  for (std::size_t n = n0; n < n1; n++) {
+    const uint8_t* wr = w + n * row_bytes;
+    for (int m = 0; m < M; m++) {
+      acc[m] = 0.0f;
+    }
+    for (int b = 0; b < nblocks; b++) {
+      fn(wr + b * bytes_per_block, buf, block_weights);
+      const float* xb = xf + static_cast<std::size_t>(b) * block_weights;
+      for (int m = 0; m < M; m++) {
+        acc[m] +=
+            dot_block(xb + static_cast<std::size_t>(m) * K, buf, block_weights);
+      }
+    }
+    for (int m = 0; m < M; m++) {
+      outf[static_cast<std::size_t>(m) * N + n] = acc[m];
+    }
+  }
+}
+
+template <typename T>
+void convert_to_f32(const T* src, float* dst, std::size_t n) {
+  kq_parallel_for(n, [&](std::size_t b, std::size_t e) {
+    for (std::size_t i = b; i < e; i++) {
+      dst[i] = static_cast<float>(src[i]);
+    }
+  });
+}
+
+template <typename T>
+void convert_from_f32(const float* src, T* dst, std::size_t n) {
+  kq_parallel_for(n, [&](std::size_t b, std::size_t e) {
+    for (std::size_t i = b; i < e; i++) {
+      dst[i] = static_cast<T>(src[i]);
+    }
+  });
+}
+
 } // namespace
 
 template <typename T>
@@ -389,6 +675,26 @@ void kquant_dequantize_dispatch(
 }
 
 template <typename T>
+void kquant_dequantize_parallel(
+    const uint8_t* w,
+    T* out,
+    std::size_t num_weights,
+    const std::string& kquant_type) {
+  const KQuantCodec* codec = codec_by_name(kquant_type);
+  if (codec == nullptr) {
+    throw std::runtime_error(
+        "[mlx_kquant] dequantize: unsupported codec: " + kquant_type);
+  }
+  const std::size_t bw = codec->weights_per_block;
+  const std::size_t bb = codec->bytes_per_block;
+  const std::size_t n_blocks = num_weights / bw;
+  kq_parallel_for(n_blocks, [&](std::size_t b0, std::size_t b1) {
+    kquant_dequantize_dispatch(
+        w + b0 * bb, out + b0 * bw, (b1 - b0) * bw, kquant_type);
+  });
+}
+
+template <typename T>
 void kquant_qmm_cpu(
     T* result,
     const T* x,
@@ -403,32 +709,115 @@ void kquant_qmm_cpu(
     throw std::runtime_error(
         "[mlx_kquant] quantized_matmul: unsupported codec: " + kquant_type);
   }
-  int w_rows = transpose_w ? N : K;
-  int w_cols = transpose_w ? K : N;
-  std::size_t weights_per_row = static_cast<std::size_t>(w_cols);
-  std::size_t row_bytes =
-      (weights_per_row / codec->weights_per_block) * codec->bytes_per_block;
+  const int w_rows = transpose_w ? N : K;
+  const int w_cols = transpose_w ? K : N;
+  const std::size_t row_bytes =
+      (static_cast<std::size_t>(w_cols) / codec->weights_per_block) *
+      codec->bytes_per_block;
+  DequantFnF32 fn = dequant_fn_f32(kquant_type);
 
-  std::vector<float> w_dec(static_cast<std::size_t>(w_rows) * w_cols);
-  for (int r = 0; r < w_rows; r++) {
-    kquant_dequantize_dispatch(
-        w + r * row_bytes, w_dec.data() + r * w_cols, w_cols, kquant_type);
+  // Stage activations (and, for half outputs, the result) in float32. The
+  // accumulation dtype is float either way; this just hoists the per-element
+  // casts out of the inner loops.
+  const std::size_t x_els = static_cast<std::size_t>(M) * K;
+  const std::size_t out_els = static_cast<std::size_t>(M) * N;
+  std::unique_ptr<float[]> xf_store;
+  const float* xf;
+  if constexpr (std::is_same_v<T, float>) {
+    xf = x;
+  } else {
+    xf_store.reset(new float[x_els]);
+    convert_to_f32(x, xf_store.get(), x_els);
+    xf = xf_store.get();
+  }
+  std::unique_ptr<float[]> of_store;
+  float* of;
+  if constexpr (std::is_same_v<T, float>) {
+    of = result;
+  } else {
+    of_store.reset(new float[out_els]);
+    of = of_store.get();
   }
 
-  for (int m = 0; m < M; m++) {
-    for (int n = 0; n < N; n++) {
-      float acc = 0.0f;
-      if (transpose_w) {
-        for (int k = 0; k < K; k++) {
-          acc += static_cast<float>(x[m * K + k]) * w_dec[n * K + k];
-        }
-      } else {
-        for (int k = 0; k < K; k++) {
-          acc += static_cast<float>(x[m * K + k]) * w_dec[k * N + n];
-        }
-      }
-      result[m * N + n] = static_cast<T>(acc);
-    }
+  if (transpose_w && M <= kMaxFusedM && fn != nullptr) {
+    // Decode/GEMV shape: fused decode-then-dot, parallel over output rows.
+    // No scratch matrix; wire bytes are read exactly once.
+    kq_parallel_for(
+        static_cast<std::size_t>(N), [&](std::size_t n0, std::size_t n1) {
+          qmv_fused_rows(
+              of,
+              xf,
+              w,
+              M,
+              N,
+              K,
+              row_bytes,
+              codec->weights_per_block,
+              codec->bytes_per_block,
+              fn,
+              n0,
+              n1);
+        });
+  } else {
+    // Prefill/GEMM shape: dequantize the weight matrix once (parallel over
+    // rows, uninitialized scratch — every element is overwritten), then GEMM.
+    std::unique_ptr<float[]> w_dec(
+        new float[static_cast<std::size_t>(w_rows) * w_cols]);
+    kq_parallel_for(
+        static_cast<std::size_t>(w_rows), [&](std::size_t r0, std::size_t r1) {
+          for (std::size_t r = r0; r < r1; r++) {
+            kquant_dequantize_dispatch(
+                w + r * row_bytes,
+                w_dec.get() + r * w_cols,
+                w_cols,
+                kquant_type);
+          }
+        });
+
+#ifdef KQ_USE_ACCELERATE
+    // Accelerate's sgemm engages the AMX/SME matrix units — far past what
+    // scalar (or even NEON) per-core loops can reach for M x N x K work.
+    cblas_sgemm(
+        CblasRowMajor,
+        CblasNoTrans,
+        transpose_w ? CblasTrans : CblasNoTrans,
+        M,
+        N,
+        K,
+        1.0f,
+        xf,
+        K,
+        w_dec.get(),
+        w_cols,
+        0.0f,
+        of,
+        N);
+#else
+    kq_parallel_for(
+        static_cast<std::size_t>(N), [&](std::size_t n0, std::size_t n1) {
+          for (int m = 0; m < M; m++) {
+            const float* xm = xf + static_cast<std::size_t>(m) * K;
+            for (std::size_t n = n0; n < n1; n++) {
+              float acc = 0.0f;
+              if (transpose_w) {
+                const float* wn = w_dec.get() + n * K;
+                for (int k = 0; k < K; k++) {
+                  acc += xm[k] * wn[k];
+                }
+              } else {
+                for (int k = 0; k < K; k++) {
+                  acc += xm[k] * w_dec[static_cast<std::size_t>(k) * N + n];
+                }
+              }
+              of[static_cast<std::size_t>(m) * N + n] = acc;
+            }
+          }
+        });
+#endif
+  }
+
+  if constexpr (!std::is_same_v<T, float>) {
+    convert_from_f32(of, result, out_els);
   }
 }
 
@@ -444,6 +833,22 @@ template void kquant_dequantize_dispatch<mx::float16_t>(
     std::size_t,
     const std::string&);
 template void kquant_dequantize_dispatch<mx::bfloat16_t>(
+    const uint8_t*,
+    mx::bfloat16_t*,
+    std::size_t,
+    const std::string&);
+
+template void kquant_dequantize_parallel<float>(
+    const uint8_t*,
+    float*,
+    std::size_t,
+    const std::string&);
+template void kquant_dequantize_parallel<mx::float16_t>(
+    const uint8_t*,
+    mx::float16_t*,
+    std::size_t,
+    const std::string&);
+template void kquant_dequantize_parallel<mx::bfloat16_t>(
     const uint8_t*,
     mx::bfloat16_t*,
     std::size_t,

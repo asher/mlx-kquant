@@ -8,15 +8,37 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace mlx_kquant {
+
+// Run fn(begin, end) over a partition of [0, n_items) on the shared CPU
+// worker pool (the calling thread participates). Falls back to a single
+// inline call when the pool is disabled (KQ_CPU_THREADS=1) or n_items is
+// small. NOT reentrant: fn must not itself call kq_parallel_for.
+void kq_parallel_for(
+    std::size_t n_items,
+    const std::function<void(std::size_t, std::size_t)>& fn);
+
+// Worker count the pool was built with (KQ_CPU_THREADS env override, else
+// std::thread::hardware_concurrency()).
+int kq_cpu_threads();
 
 // Dequantize `num_weights` weights of `kquant_type` wire bytes `w` into `out`.
 // `w` must hold whole blocks and `num_weights` be a multiple of the codec's
 // weights_per_block. Throws on an unknown codec.
 template <typename T>
 void kquant_dequantize_dispatch(
+    const uint8_t* w,
+    T* out,
+    std::size_t num_weights,
+    const std::string& kquant_type);
+
+// kquant_dequantize_dispatch with the block range split across the worker
+// pool. Same contract; bit-identical output (per-block decode is independent).
+template <typename T>
+void kquant_dequantize_parallel(
     const uint8_t* w,
     T* out,
     std::size_t num_weights,

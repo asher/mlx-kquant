@@ -74,13 +74,13 @@ void KQuantDequantize::eval_cpu(
     std::size_t num_weights = out.size();
     auto dt = out.dtype();
     if (dt == mx::float32) {
-      kquant_dequantize_dispatch(
+      kquant_dequantize_parallel(
           wp, out.data<float>(), num_weights, kquant_type);
     } else if (dt == mx::float16) {
-      kquant_dequantize_dispatch(
+      kquant_dequantize_parallel(
           wp, out.data<mx::float16_t>(), num_weights, kquant_type);
     } else if (dt == mx::bfloat16) {
-      kquant_dequantize_dispatch(
+      kquant_dequantize_parallel(
           wp, out.data<mx::bfloat16_t>(), num_weights, kquant_type);
     } else {
       throw std::runtime_error(
