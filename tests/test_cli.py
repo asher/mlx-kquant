@@ -306,6 +306,17 @@ def test_chat_completer_load_paths(tmp_path):
     assert got == {f"{tmp_path}/prompt.txt", f"{tmp_path}/prompts/"}
 
 
+def test_chat_clear_forwards_reset(capsys):
+    # /clear hands mlx-lm its own 'r' (conversation reset) after wiping the
+    # screen - the reset semantics stay theirs.
+    from mlx_kquant.cli.chat import _command_filter
+
+    state = {"readline": None, "enabled": True, "loaded": False}
+    filtered = _command_filter(lambda prompt="": "/clear", state)
+    assert filtered(">> ") == "r"
+    assert "conversation reset" in capsys.readouterr().out
+
+
 def test_chat_h_command_also_shows_shim_help(capsys):
     # 'h' is mlx-lm's help command: it must still reach their loop, with the
     # shim's command list printed alongside.

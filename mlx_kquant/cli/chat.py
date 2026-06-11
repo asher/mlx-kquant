@@ -187,6 +187,7 @@ def _print_shim_help(state: dict) -> None:
     )
     print("- '/sampling' to show the current sampling settings")
     print("- '/load <file>' prefill the next prompt from a text file (edit, Enter)")
+    print("- '/clear' reset the conversation (the REPL's 'r') and the screen")
     print("- '/help' to display these commands; Tab completes /commands and paths")
 
 
@@ -294,6 +295,12 @@ def _command_filter(real_input, state: dict):
                 # it (its print_help is internal, so this prints just above).
                 _print_shim_help(state)
                 return line
+            if line.strip() == "/clear":
+                # Wipe the screen, then hand mlx-lm its own reset command so
+                # the conversation (prompt cache) restarts with its semantics.
+                print("\033[2J\033[H", end="")
+                print("[mlx-kquant] conversation reset")
+                return "r"
             if not line.startswith("/"):
                 return line
             _handle_slash(line, state)
@@ -311,7 +318,9 @@ def _make_completer(readline, state: dict):
     import glob
     import os
 
-    commands = sorted([*_SAMPLING_COMMANDS, "/history", "/sampling", "/load", "/help"])
+    commands = sorted(
+        [*_SAMPLING_COMMANDS, "/history", "/sampling", "/load", "/clear", "/help"]
+    )
 
     def complete(text: str, index: int):
         buf = readline.get_line_buffer()

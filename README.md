@@ -129,7 +129,8 @@ mlx-kquant chat --model qwen3-q4 --temp 0.7      # interactive REPL (mlx-lm chat
 history (`--no-history` or in-chat `/history off|on|clear` to control it) and in-chat sampling
 control (`/temp`, `/top-p`, `/top-k`, `/min-p`, `/max-tokens`, and the three penalties;
 `/sampling` shows current values); `/load <file>` prefills the next prompt from a text file for
-editing; Tab completes `/commands` and paths; Ctrl-C cancels the in-flight reply (at an idle
+editing; `/clear` resets the conversation and wipes the screen; Tab completes `/commands` and
+paths; Ctrl-C cancels the in-flight reply (at an idle
 prompt it exits, as does Ctrl-D). `--max-kv-size` bounds the KV cache for long sessions (a rotating
 window, set at start).
 

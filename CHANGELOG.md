@@ -28,7 +28,8 @@ toolchain that runs on a stock `mlx==0.31.2` wheel.
   `/temp` / `/top-p` / `/top-k` / `/min-p` / `/max-tokens` and
   `/repetition-penalty` / `/presence-penalty` / `/frequency-penalty`
   (also chat startup flags) + `/sampling` status; `/load <file>` prefills
-  the next prompt for editing; Tab completion for /commands and paths;
+  the next prompt for editing; `/clear` resets the conversation and wipes
+  the screen; Tab completion for /commands and paths;
   Ctrl-C cancels the in-flight reply; Ctrl-D exits cleanly). `run`
   carries sampling (`--top-p` / `--top-k` / penalty flags /
   `--min-p` / `--seed`) and chat-template (`--system-prompt` /
