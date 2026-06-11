@@ -1,9 +1,8 @@
 // arm64 NEON-dotprod int8 GEMV kernels for the CPU decode path. The fused
 // small-M matmul quantizes each activation row once to an int8 "q8" layout,
 // then dots weight wire bytes straight against it with vdotq_s32 instead of
-// decoding every block to f32 first. Per-codec kernels exist for the hot
-// decode codecs (q4_k / q5_k / q6_k / q8_0); every other codec - and every
-// non-arm64 or non-dotprod build - falls back to the portable scalar path.
+// decoding every block to f32 first. Per-codec kernels cover all 10 codecs;
+// non-arm64 and non-dotprod builds fall back to the portable scalar path.
 //
 // Numerics: the activation q8 quantization is lossy by design (the same
 // trade ggml makes), so matmul results differ from the f32 decode-then-dot

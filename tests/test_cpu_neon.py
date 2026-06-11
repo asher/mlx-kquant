@@ -2,13 +2,11 @@
 """A/B the arm64 NEON int8 CPU GEMV kernels against the portable scalar path.
 
 ``KQ_CPU_NEON`` is read per matmul call, so the same process can run both
-paths on identical wire bytes. Codecs with int8 kernels (q4_k / q5_k / q6_k /
-q8_0) quantize activations to q8 first, which is lossy by design — the gate
-for them is a rel-norm tolerance (the error is dominated by the activation
-quantization, ~1e-2; the same trade ggml makes). Every other codec must be
-BIT-IDENTICAL with the switch on or off (it has no NEON kernel and always
-takes the scalar path). On non-arm64 builds both runs take the scalar path
-and everything is trivially identical.
+paths on identical wire bytes. All 10 codecs have int8 kernels, which
+quantize activations to q8 first — lossy by design, so the gate is a
+rel-norm tolerance (the error is dominated by the activation quantization,
+~1e-2; the same trade ggml makes). On non-arm64 (or non-dotprod) builds both
+runs take the scalar path and must be BIT-IDENTICAL.
 
 Each codec is also checked against the gguf.quants numpy reference at the
 same 2e-2 rel-norm gate the scalar path uses.
@@ -28,18 +26,18 @@ import mlx_kquant as kq
 
 CPU = mx.cpu
 
-# codec -> (gguf type, has NEON int8 kernel)
+# codec -> gguf type (every codec has a NEON int8 kernel)
 CODECS = {
-    "q4_0": (GT.Q4_0, False),
-    "q4_1": (GT.Q4_1, False),
-    "q5_0": (GT.Q5_0, False),
-    "q5_1": (GT.Q5_1, False),
-    "q8_0": (GT.Q8_0, True),
-    "q2_k": (GT.Q2_K, False),
-    "q3_k": (GT.Q3_K, False),
-    "q4_k": (GT.Q4_K, True),
-    "q5_k": (GT.Q5_K, True),
-    "q6_k": (GT.Q6_K, True),
+    "q4_0": GT.Q4_0,
+    "q4_1": GT.Q4_1,
+    "q5_0": GT.Q5_0,
+    "q5_1": GT.Q5_1,
+    "q8_0": GT.Q8_0,
+    "q2_k": GT.Q2_K,
+    "q3_k": GT.Q3_K,
+    "q4_k": GT.Q4_K,
+    "q5_k": GT.Q5_K,
+    "q6_k": GT.Q6_K,
 }
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -84,7 +82,7 @@ def _rel(a, b):
 
 def test_neon_vs_scalar_quantized_matmul():
     rng = np.random.default_rng(0)
-    for codec, (gtype, has_neon) in CODECS.items():
+    for codec, gtype in CODECS.items():
         wire, ref = _dense_wire_and_ref(codec, gtype)
         w = mx.array(wire)
         for M in (1, 4, 16):
@@ -102,7 +100,7 @@ def test_neon_vs_scalar_quantized_matmul():
             s = np.array(scalar).astype(np.float32)
             n = np.array(neon).astype(np.float32)
             ref_t = x.astype(np.float32) @ ref.T
-            if has_neon and kq.cpu_neon_available():
+            if kq.cpu_neon_available():
                 rel = _rel(n, s)
                 assert rel < NEON_REL, f"{codec} M={M}: neon-vs-scalar rel={rel:.3e}"
                 rel = _rel(n, ref_t)
@@ -115,7 +113,7 @@ def test_neon_vs_scalar_quantized_matmul():
 
 def test_neon_vs_scalar_gather_qmm():
     rng = np.random.default_rng(1)
-    for codec, (gtype, has_neon) in CODECS.items():
+    for codec, gtype in CODECS.items():
         path = os.path.join(FIX, f"{codec}_moe.npz")
         if os.path.exists(path):
             wire = np.load(path)["wire"].astype(np.uint8)
@@ -156,7 +154,7 @@ def test_neon_vs_scalar_gather_qmm():
             [x[int(lhs[b])].astype(np.float32) @ ref[experts[b]].T for b in range(B)],
             axis=0,
         )
-        if has_neon and kq.cpu_neon_available():
+        if kq.cpu_neon_available():
             assert _rel(n, s) < NEON_REL, f"{codec}: gather neon-vs-scalar"
             assert _rel(n, rr) < REF_REL, f"{codec}: gather neon-vs-ref"
         else:

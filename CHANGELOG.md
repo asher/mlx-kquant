@@ -12,12 +12,13 @@ toolchain that runs on a stock `mlx==0.31.2` wheel.
 ### Added
 - `kq.*` op namespace: `dequantize`, `quantized_matmul`, `gather_qmm`,
   `quantize`, `load_gguf`, for all 10 GGUF K-quant / legacy codecs.
-- arm64 NEON-dotprod int8 CPU GEMV kernels for q4_k / q5_k / q6_k / q8_0:
-  the fused small-M `quantized_matmul` / `gather_qmm` CPU path quantizes
-  activations once to int8 and dots wire bytes directly (`vdotq_s32`),
-  ~3-6x the scalar throughput at decode shapes (8-19x per core). Other
-  codecs keep the scalar path; `KQ_CPU_NEON=0` disables; f32 `dequantize`
-  is untouched (still bit-exact). `kq.cpu_neon_available()` reports support.
+- arm64 NEON-dotprod int8 CPU GEMV kernels for ALL 10 codecs: the fused
+  small-M `quantized_matmul` / `gather_qmm` CPU path quantizes activations
+  once to int8 and dots wire bytes directly (`vdotq_s32`), ~3-6x the scalar
+  throughput at decode shapes (8-19x per core). Low-bit k-quants (q2_k/q3_k)
+  make MoE expert offload of very large low-bit GGUFs decode-viable on CPU.
+  `KQ_CPU_NEON=0` disables; f32 `dequantize` is untouched (still bit-exact).
+  `kq.cpu_neon_available()` reports support.
 - MoE gather decode shapes (every expert group within the fused-GEMV
   ceiling) now run as ONE worker-pool job over all (expert, row) work items
   instead of one dispatch per expert. `KQ_CPU_SPIN_US` optionally spins the
