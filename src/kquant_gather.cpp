@@ -455,45 +455,81 @@ void KQuantGatherQMM::eval_cpu(
       // The per-group qmm-call-per-expert path below would pay a thread-pool
       // wake/teardown per (expert, matrix) on ~MBs of work each — at MoE
       // decode that's the dominant dispatch overhead.
+      // Per-group dedupe plan: duplicate (x_idx, w_idx) entries — the same
+      // activation rows against the same expert — compute once and fan out
+      // by memcpy at scatter time, so repeated expert indices save FLOPs as
+      // well as weight traffic. Admission stays gated on the RAW entry
+      // count (not the unique count): widening it would shift groups from
+      // the dequant-once GEMM path onto the fused GEMV — a numerically
+      // valid but different accumulation order that would break the
+      // bit-stability of existing call shapes.
+      struct GroupPlan {
+        std::vector<int> uniq; // unique x_idx, first-seen order
+        std::vector<int> slot; // per group entry -> index into uniq
+      };
+      std::vector<GroupPlan> plans;
       bool all_small = transpose_;
-      for (const auto& g : groups) {
-        if ((g.second - g.first) * static_cast<std::size_t>(M) >
-            static_cast<std::size_t>(kQmvFusedMaxM)) {
-          all_small = false;
-          break;
+      if (all_small) {
+        for (const auto& g : groups) {
+          if ((g.second - g.first) * static_cast<std::size_t>(M) >
+              static_cast<std::size_t>(kQmvFusedMaxM)) {
+            all_small = false;
+            break;
+          }
         }
       }
       if (all_small) {
-        // Merging a group reads/dequantizes the expert's weights once, but
-        // duplicate (x_idx, w_idx) entries are NOT deduplicated: each entry
-        // still contributes M rows of dot compute (task.m = rg * M below).
-        // Callers that repeat an expert index save weight traffic, not FLOPs.
+        plans.resize(groups.size());
+        for (std::size_t gi = 0; gi < groups.size(); gi++) {
+          const auto [ga, gb] = groups[gi];
+          GroupPlan& plan = plans[gi];
+          plan.slot.reserve(gb - ga);
+          for (std::size_t r = ga; r < gb; r++) {
+            const int xi = entries[r].x_idx;
+            std::size_t u = 0;
+            while (u < plan.uniq.size() && plan.uniq[u] != xi) {
+              u++;
+            }
+            if (u == plan.uniq.size()) {
+              plan.uniq.push_back(xi);
+            }
+            plan.slot.push_back(static_cast<int>(u));
+          }
+        }
+      }
+      if (all_small) {
         std::vector<KQmvTask<T>> tasks(groups.size());
         std::vector<std::vector<T>> xg_packs; // keep packed copies alive
         std::vector<std::vector<T>> og_packs;
         for (std::size_t gi = 0; gi < groups.size(); gi++) {
           const auto [ga, gb] = groups[gi];
           const std::size_t rg = gb - ga;
+          const std::size_t ru = plans[gi].uniq.size();
           KQmvTask<T>& task = tasks[gi];
           task.w = group_w(ga);
-          task.m = static_cast<int>(rg) * M;
+          task.m = static_cast<int>(ru) * M;
           if (rg == 1) {
             task.out =
                 out.data<T>() + static_cast<std::size_t>(entries[ga].i) * M * N;
             task.x = x.data<T>() +
                 mx::elem_to_loc(
                          entries[ga].x_idx * M * K, x.shape(), x.strides());
+          } else if (ru == 1) {
+            // One unique row: read x in place, fan the output out below.
+            og_packs.emplace_back(out_row_els);
+            task.x = x.data<T>() +
+                mx::elem_to_loc(
+                         plans[gi].uniq[0] * M * K, x.shape(), x.strides());
+            task.out = og_packs.back().data();
           } else {
-            xg_packs.emplace_back(rg * row_els);
-            og_packs.emplace_back(rg * out_row_els);
-            for (std::size_t r = 0; r < rg; r++) {
+            xg_packs.emplace_back(ru * row_els);
+            og_packs.emplace_back(ru * out_row_els);
+            for (std::size_t u = 0; u < ru; u++) {
               std::memcpy(
-                  xg_packs.back().data() + r * row_els,
+                  xg_packs.back().data() + u * row_els,
                   x.data<T>() +
                       mx::elem_to_loc(
-                          entries[ga + r].x_idx * M * K,
-                          x.shape(),
-                          x.strides()),
+                          plans[gi].uniq[u] * M * K, x.shape(), x.strides()),
                   row_els * sizeof(T));
             }
             task.x = xg_packs.back().data();
@@ -502,7 +538,7 @@ void KQuantGatherQMM::eval_cpu(
         }
         kquant_qmm_cpu_batch<T>(
             tasks.data(), static_cast<int>(tasks.size()), N, K, kquant_type);
-        // Scatter the packed groups' outputs back to their entry rows.
+        // Scatter packed outputs to entry rows (duplicates share a slot).
         std::size_t pi = 0;
         for (std::size_t gi = 0; gi < groups.size(); gi++) {
           const auto [ga, gb] = groups[gi];
@@ -514,7 +550,8 @@ void KQuantGatherQMM::eval_cpu(
             std::memcpy(
                 out.data<T>() +
                     static_cast<std::size_t>(entries[ga + r].i) * M * N,
-                og_packs[pi].data() + r * out_row_els,
+                og_packs[pi].data() +
+                    static_cast<std::size_t>(plans[gi].slot[r]) * out_row_els,
                 out_row_els * sizeof(T));
           }
           pi++;

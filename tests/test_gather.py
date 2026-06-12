@@ -210,5 +210,76 @@ def test_rhs_gather_large_M_no_short_overflow():
     assert float(mx.abs(fast[b] - truth).max().item()) < 5e-2
 
 
+def test_gather_cpu_duplicate_entry_dedupe():
+    """The CPU batch path dedupes duplicate (x_idx, w_idx) entries: each unique
+    activation row computes once and duplicates are filled by memcpy. The
+    deduped output must be BIT-IDENTICAL to per-entry singleton calls (same
+    task shape computed independently), and duplicates of the same expert
+    against DIFFERENT x rows must not collapse.
+    """
+    codec, gtype = "q8_0", GT.Q8_0
+    Eg, Ng, Kg = 4, 64, 256
+    rng = np.random.default_rng(3)
+    wires = [
+        quants.quantize(rng.standard_normal((Ng, Kg)).astype(np.float32) * 0.1, gtype)
+        for _ in range(Eg)
+    ]
+    w = mx.array(np.stack(wires, 0).astype(np.uint8))
+    scales = mx.zeros((1,), dtype=mx.uint8)
+    x = mx.array((rng.standard_normal((4, 1, Kg)) * 0.1).astype(np.float32)).astype(
+        mx.float16
+    )
+
+    def cpu_gather(lhs_np, rhs_np):
+        out = kq.gather_qmm(
+            x,
+            w,
+            scales,
+            codec,
+            lhs_indices=mx.array(lhs_np.astype(np.uint32)),
+            rhs_indices=mx.array(rhs_np.astype(np.uint32)),
+            transpose=True,
+            stream=mx.cpu,
+        )
+        mx.eval(out)
+        return np.array(out)
+
+    prev = os.environ.get("KQ_CPU_NEON")
+    try:
+        for neon in ("0", "1"):
+            os.environ["KQ_CPU_NEON"] = neon
+            # singleton reference per (x_idx, w_idx)
+            single = {
+                (xi, wi): cpu_gather(np.array([xi]), np.array([wi]))[0]
+                for xi in range(4)
+                for wi in range(Eg)
+            }
+            cases = [
+                # all 8 slots -> same (x, expert): a caller redirecting every
+                # slot to one already-routed expert
+                (np.zeros(8, np.int64), np.zeros(8, np.int64)),
+                # mixed duplicates and distinct entries
+                (
+                    np.array([0, 0, 1, 0, 2, 1, 3, 0]),
+                    np.array([1, 1, 1, 2, 2, 1, 3, 1]),
+                ),
+                # same expert, DIFFERENT x rows: must not collapse
+                (np.array([0, 1, 2, 3]), np.array([2, 2, 2, 2])),
+            ]
+            for lhs_np, rhs_np in cases:
+                got = cpu_gather(lhs_np, rhs_np)
+                for b in range(len(lhs_np)):
+                    ref = single[(int(lhs_np[b]), int(rhs_np[b]))]
+                    assert np.array_equal(got[b], ref), (
+                        f"neon={neon} entry {b} (x={lhs_np[b]}, w={rhs_np[b]}) "
+                        f"diverges from singleton call"
+                    )
+    finally:
+        if prev is None:
+            os.environ.pop("KQ_CPU_NEON", None)
+        else:
+            os.environ["KQ_CPU_NEON"] = prev
+
+
 if __name__ == "__main__":
     sys.exit(main())
