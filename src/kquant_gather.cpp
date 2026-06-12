@@ -464,6 +464,10 @@ void KQuantGatherQMM::eval_cpu(
         }
       }
       if (all_small) {
+        // Merging a group reads/dequantizes the expert's weights once, but
+        // duplicate (x_idx, w_idx) entries are NOT deduplicated: each entry
+        // still contributes M rows of dot compute (task.m = rg * M below).
+        // Callers that repeat an expert index save weight traffic, not FLOPs.
         std::vector<KQmvTask<T>> tasks(groups.size());
         std::vector<std::vector<T>> xg_packs; // keep packed copies alive
         std::vector<std::vector<T>> og_packs;
