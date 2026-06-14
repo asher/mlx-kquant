@@ -4,8 +4,17 @@
 # only the imperative bits that PEP 621 can't express: the CMake-driven Metal
 # extension and its build command.
 
+import os
+import sys
+
 from mlx import extension
 from setuptools import setup
+
+# Pin CMake's find_package(Python) to the backend interpreter, which always has
+# the build deps; under build isolation its own search can pick one without them.
+os.environ["CMAKE_ARGS"] = (
+    f"{os.environ.get('CMAKE_ARGS', '')} -DPython_EXECUTABLE={sys.executable}".strip()
+)
 
 if __name__ == "__main__":
     setup(
