@@ -1,5 +1,7 @@
 # mlx-kquant
 
+[![ci](https://github.com/asher/mlx-kquant/actions/workflows/ci.yml/badge.svg)](https://github.com/asher/mlx-kquant/actions/workflows/ci.yml)
+
 Bring **K-quant precision to [MLX](https://github.com/ml-explore/mlx)** on Apple Silicon: a C++/Metal
 **extension** for a stock `mlx` wheel that adds the K-quant superblock and per-block integer codecs
 as native MLX ops, plus a toolchain that quantizes a model into a **K-quant MLX safetensors
