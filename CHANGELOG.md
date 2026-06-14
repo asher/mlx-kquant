@@ -16,7 +16,8 @@ per-tensor recipe inspection. A loader runs those checkpoints on stock mlx-lm.
 
 ### Notes
 - `requires-python >= 3.10` (mlx 0.31.2 ships no cp39 wheel).
-- The GPU path is macOS on Apple Silicon (Metal). Linux is supported CPU-only -
-  build against `mlx[cpu]==0.31.2`; model forwards there also need
-  `MLX_DISABLE_COMPILE=1` (an upstream MLX CPU-JIT limitation under GCC, not
+- The GPU path is macOS 26 (Tahoe) or later on Apple Silicon (Metal); the NAX
+  matmul kernel needs the Metal 4 SDK (`MetalPerformancePrimitives`). Linux is
+  supported CPU-only - build against `mlx[cpu]==0.31.2`; model forwards there also
+  need `MLX_DISABLE_COMPILE=1` (an upstream MLX CPU-JIT limitation under GCC, not
   mlx-kquant).
