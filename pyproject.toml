@@ -112,5 +112,7 @@ environment = { MACOSX_DEPLOYMENT_TARGET = "26.0" }
 # Do NOT vendor libmlx into the wheel: the extension is ABI-pinned to the user's
 # installed mlx==0.31.2 and resolves it via the @loader_path/../mlx/lib rpath
 # (see CMakeLists.txt). Bundling a second libmlx copy would split MLX global
-# state and resurrect the gguflib<->libmlx symbol collision.
-repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} --exclude libmlx.dylib -w {dest_dir} -v {wheel}"
+# state and resurrect the gguflib<->libmlx symbol collision. --exclude keeps it
+# out of the wheel; --ignore-missing-dependencies stops delocate from erroring
+# when it can't resolve libmlx at repair time (it resolves at runtime instead).
+repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} --ignore-missing-dependencies --exclude libmlx.dylib -w {dest_dir} -v {wheel}"
