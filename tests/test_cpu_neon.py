@@ -3,7 +3,7 @@
 
 ``KQ_CPU_NEON`` is read per matmul call, so the same process can run both
 paths on identical wire bytes. All 10 codecs have int8 kernels, which
-quantize activations to q8 first — lossy by design, so the gate is a
+quantize activations to q8 first - lossy by design, so the gate is a
 rel-norm tolerance (the error is dominated by the activation quantization,
 ~1e-2; the same trade ggml makes). On non-arm64 (or non-dotprod) builds both
 runs take the scalar path and must be BIT-IDENTICAL.

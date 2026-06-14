@@ -78,10 +78,10 @@ jobs:
       - name: Recipe tests (CPU, no GPU)
         run: pytest -q tests/test_recipes.py
 
-      # Honest-badge discipline: every op is GPU-only until the CPU decode path
-      # (Phase F) lands, and hosted runners may not expose a usable Metal GPU.
-      # So probe for one: run the op tests iff a GPU is actually present, and
-      # skip *honestly* (with a warning) otherwise - never silently green.
+      # Honest-badge discipline: the Metal op tests need a real GPU, and hosted
+      # runners may not expose a usable one. So probe for one: run the op tests
+      # iff a GPU is actually present, and skip *honestly* (with a warning)
+      # otherwise - never silently green.
       # Set KQUANT_EXPECT_GPU=1 on a self-hosted Apple-Silicon runner to make a
       # broken metallib fail red instead of skipping.
       - name: Detect Metal GPU
@@ -129,6 +129,9 @@ jobs:
         run: >-
           pytest -q
           tests/test_cpu_decode.py
+          tests/test_cpu_neon.py
+          tests/test_dequant.py
+          tests/test_matmul.py
           tests/test_codecs.py
           tests/test_gather.py
           tests/test_nn.py

@@ -5,6 +5,25 @@ from __future__ import annotations
 import argparse
 
 
+class _ListPresetsAction(argparse.Action):
+    """``--list-presets``: print the recipe presets and exit.
+
+    A print-and-exit action (like ``--version``) so it fires before argparse
+    enforces the otherwise-required ``--model`` / ``--mlx-path`` / recipe args.
+    """
+
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(
+            option_strings, dest, nargs=0, default=argparse.SUPPRESS, **kwargs
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        from ..recipes import format_presets
+
+        print(format_presets())
+        parser.exit()
+
+
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
     # Cheap, base-install-safe imports: codec/preset typos fail in argparse
     # (with the choices listed) instead of after a multi-GB model load.
@@ -27,11 +46,16 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         required=True,
         help="Output directory for the kquant checkpoint.",
     )
+    p.add_argument(
+        "--list-presets",
+        action=_ListPresetsAction,
+        help="List the recipe presets (and what each maps) and exit.",
+    )
     recipe = p.add_mutually_exclusive_group(required=True)
     recipe.add_argument(
         "--preset",
         choices=sorted(KQUANT_PRESETS),
-        help="Recipe preset. See `verify --presets` for what each maps.",
+        help="Recipe preset. See `--list-presets` for what each maps.",
     )
     recipe.add_argument(
         "--kquant-type",

@@ -21,3 +21,6 @@ venv/
 .env
 .idea/
 .vscode/
+
+# Local scratch / benchmarks (not part of the package)
+bench/

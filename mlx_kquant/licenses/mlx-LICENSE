@@ -1,4 +1,4 @@
-MLX — https://github.com/ml-explore/mlx
+MLX - https://github.com/ml-explore/mlx
 
 The Metal kernels compile against MLX's bundled kernel headers, the extension
 links libmlx, and parts of the kernels (the vector load / accumulate helpers

@@ -1,0 +1,23 @@
+# Build inputs the sdist needs to compile the extension from source.
+include CMakeLists.txt
+include setup.py
+include bindings.cpp
+recursive-include src *.cpp *.h
+recursive-include metal *.metal *.h
+recursive-include cmake *.cmake
+
+# Project metadata and tooling.
+include LICENSE
+include README.md
+include CHANGELOG.md
+recursive-include scripts *.py
+
+# Tests and fixtures, so an sdist build can run its own checks.
+recursive-include tests *.py *.npz
+include tests/fixtures/SHA256SUMS
+
+# Never ship machine-specific build artifacts in the sdist (the wheel carries
+# these via package-data; the sdist must not, or it would build them in stale).
+global-exclude *.so *.dylib *.metallib *.air *.pyc
+prune tests/fixtures/__pycache__
+global-exclude .DS_Store

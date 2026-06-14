@@ -7,7 +7,7 @@ and as ``python -m mlx_kquant``. Subcommands:
   calibrate-imatrix  build an importance matrix from a calibration corpus
   lora               train/test a LoRA adapter on a kquant base (mlx-lm trainer)
   fuse               merge a trained LoRA adapter into a kquant checkpoint
-  verify             smoke-check the codecs / presets, or a built checkpoint
+  verify             verify compatible codecs, or a built checkpoint
   run                load a checkpoint and generate text (one-shot)
   chat               interactive chat REPL on a kquant checkpoint (mlx-lm chat)
   inspect            print a checkpoint's per-tensor codec recipe (no GPU)

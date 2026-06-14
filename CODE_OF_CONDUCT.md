@@ -27,8 +27,9 @@ setting.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the project maintainers. All complaints will be reviewed and
-investigated promptly and fairly. Maintainers are obligated to respect the
+reported to the project maintainers by opening an issue on the project's GitHub
+issue tracker. All complaints will be reviewed and investigated promptly and
+fairly. Maintainers are obligated to respect the
 privacy and security of the reporter of any incident.
 
 ## Attribution

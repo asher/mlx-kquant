@@ -3,7 +3,7 @@
 A complete, copy-pasteable tour of the `mlx-kquant` toolchain on Apple Silicon:
 take a bf16 model, quantize it to a K-quant MLX checkpoint, run it, teach it to
 talk like a pirate with LoRA, and merge the adapter back in - all on a stock
-`mlx` wheel, no GGUF files involved.
+`mlx` wheel, all in MLX safetensors.
 
 Model: **Qwen3-0.6B** (a small thinking/chat model). Everything below runs in a
 couple of minutes on an M-series GPU and stays well under 1 GB of memory.
@@ -52,7 +52,7 @@ mlx-kquant quantize --model qwen3-0.6b-bf16 --preset q5_k_m --mlx-path qwen3-0.6
 The `q5_k_m` recipe is a mixed-precision K-quant: a `q5_k` base with the
 quality-sensitive tensors bumped to `q6_k` - every layer's `v_proj`, the
 `down_proj` of the first and last few layers plus a periodic subset of the rest
-(the GGUF `_M` cadence), and a standalone output head if the model has one.
+(the `_M` cadence), and a standalone output head if the model has one.
 (Qwen3-0.6B ties its embeddings, so there is no separate head - `embed_tokens`
 stays `q5_k`.) The result is ~415 MB, down from the 1.5 GB bf16:
 
@@ -190,7 +190,7 @@ down or add data to taste.
 ### 4c. Generate with the adapter as a file (no merge)
 
 The adapter is attached at runtime - the base wire bytes are never modified. Point
-`mlx-kquant run` at the base with `--adapter-path` and it installs the LoRA seam,
+`mlx-kquant run` at the base with `--adapter-path` and it installs the LoRA shim,
 loads the adapter, and generates; drop the flag to get the plain base. (Qwen3 is a
 thinking model, so `run` emits a `<think>` block first; the pirate training data
 had no thinking, so the adapted model thinks "empty" and gets straight to the

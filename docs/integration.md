@@ -1,23 +1,23 @@
 # Building on the `kq.*` ops
 
-mlx-kquant is an op layer (`kq.dequantize` / `quantized_matmul` / `gather_qmm` / `quantize` /
-`load_gguf`) plus a `[tools]` layer that turns those ops into a checkpoint toolchain. The `[tools]`
+mlx-kquant is an op layer (`kq.dequantize` / `quantized_matmul` / `gather_qmm` / `quantize`) plus a
+`[tools]` layer that turns those ops into a checkpoint toolchain. The `[tools]`
 modules are deliberately small and are the **reference for integrating the kernels elsewhere in the
-MLX ecosystem** - a model runtime, a different on-disk format, another trainer. This page maps the
-integration seams to the files that implement them. The **`gguf-mlx`** package (`pip install
-gguf-mlx`) is a second, fuller worked example - a whole GGUF runtime on the same ops.
+MLX ecosystem** - a model runtime, a different on-disk format, another trainer. This page maps each
+integration point to the file that implements it.
 
 Everything here runs against a **stock `mlx` wheel** - importing `mlx_kquant` adds the `kq.*`
 namespace; it does **not** register `mode="kquant"` onto `mx.*`, so integrations call `kq.*`
 explicitly.
 
 **Compatibility.** The ops require stock `mlx==0.31.2` (the C++ extension is ABI-pinned to it). The
-`[tools]` seams below (loader, recipes, the mlx-lm patch) additionally need `mlx-lm>=0.27`. The
-on-disk checkpoint format is stable and mirrors what a future in-core kquant mode would read.
+`[tools]` integration points below (loader, recipes, the mlx-lm patch) additionally need
+`mlx-lm>=0.27`. The on-disk checkpoint format is stable and mirrors what a future in-core kquant mode
+would read.
 
 ## The wire-byte contract
 
-A quantized weight is a `uint8` array of GGUF block bytes: a 2-D `[out_features, bytes_per_row]`
+A quantized weight is a `uint8` array of K-quant wire bytes: a 2-D `[out_features, bytes_per_row]`
 (linear / embedding) or 3-D `[num_experts, out_features, bytes_per_row]` (MoE / batched). The codec
 name (`"q4_k"`, `"q8_0"`, ...) carries everything else - `mlx_kquant.codec_geometry` derives
 `group_size` / `bits` / `bytes_per_block` from it, and `bytes_per_row(codec, in_features)` /
@@ -39,10 +39,10 @@ Ten codecs, all defined in `mlx_kquant.codec_geometry.CODEC_GEOMETRY` as
 | codec | bits | weights/block | bytes/block | family |
 |-------|-----:|--------------:|------------:|--------|
 | `q8_0` | 8 | 32 | 34 | block |
-| `q4_0` | 4 | 32 | 18 | block (legacy) |
-| `q4_1` | 4 | 32 | 20 | block (legacy) |
-| `q5_0` | 5 | 32 | 22 | block (legacy) |
-| `q5_1` | 5 | 32 | 24 | block (legacy) |
+| `q4_0` | 4 | 32 | 18 | block |
+| `q4_1` | 4 | 32 | 20 | block (+min) |
+| `q5_0` | 5 | 32 | 22 | block |
+| `q5_1` | 5 | 32 | 24 | block (+min) |
 | `q2_k` | 2 | 256 | 84 | K-quant superblock |
 | `q3_k` | 3 | 256 | 110 | K-quant superblock |
 | `q4_k` | 4 | 256 | 144 | K-quant superblock |
@@ -50,19 +50,20 @@ Ten codecs, all defined in `mlx_kquant.codec_geometry.CODEC_GEOMETRY` as
 | `q6_k` | 6 | 256 | 210 | K-quant superblock |
 
 `weights_per_block` (`wpb`) is the granularity that matters for layout: K-quants pack 256 weights per
-superblock, the block/legacy codecs 32. The duck-typed `group_size` attribute on a `KQuant*` module
+superblock, the block codecs 32. The duck-typed `group_size` attribute on a `KQuant*` module
 equals `wpb`. All ten encode on CPU or Metal; the **imatrix** argument to `kq.quantize` steers only the
 five superblock K-quants (`wpb == 256`) and is a no-op on the `wpb == 32` codecs.
 
 Presets (`mlx_kquant.recipes`) are **purely codec-name-based** - there is no affine "4-bit / 8-bit"
 abstraction that resolves to a codec. A preset (`q4_k_s/m/xl/moe`, `q5_k_s/m/xl/moe`, `q3_k_m`,
 `q6_k`, `q6_k_xl`, `q2_k`, `q8`) maps tensor *roles* (attention, embedding, lm_head, routed/shared
-expert, ...) directly to codec names, with per-role bumps and layer-position heuristics. See Seam 4.
+expert, ...) directly to codec names, with per-role bumps and layer-position heuristics. See
+**Encoding** below.
 
 ## On-disk checkpoint format
 
 `mlx_kquant.convert.save` writes a standard MLX checkpoint - `config.json` plus (sharded)
-safetensors - that the loader (Seam 3) and a patched stock mlx-lm (Seam 5) can read.
+safetensors - that the loader and a patched stock mlx-lm can read.
 
 `config.json` carries the quant block **twice**, under `quantization` and a mirrored
 `quantization_config`, each:
@@ -75,7 +76,7 @@ The `per_tensor` keys are **bare module paths** (no `.weight` suffix). Tensors:
 
 | key | dtype | shape | notes |
 |-----|-------|-------|-------|
-| `<path>.weight` | uint8 | `[out, bytes_per_row]` or `[E, out, bytes_per_row]` (MoE) | the GGUF wire bytes |
+| `<path>.weight` | uint8 | `[out, bytes_per_row]` or `[E, out, bytes_per_row]` (MoE) | the K-quant wire bytes |
 | `<path>.scales` | uint8 | `[1]` | placeholder - real scales live inside the wire bytes |
 | `<path>.bias` | source dtype | `[out]` or `[E, out]` | optional |
 
@@ -83,7 +84,7 @@ Unquantized tensors (norms, router gates, anything the recipe leaves in float) k
 dtype. There is **no** affine-style `.biases` (zero-point) tensor - K-quant zero-points are encoded
 in the bytes.
 
-## Seam 1 - layer modules (`mlx_kquant/nn.py`)
+## Layer modules (`mlx_kquant/nn.py`)
 
 `KQuantLinear` / `KQuantEmbedding` / `KQuantSwitchLinear` / `KQuantMultiLinear` are `nn.Module`s that
 hold the wire bytes and dispatch the matching op in `__call__`. They duck-type mlx-lm's quantized
@@ -112,7 +113,7 @@ def is_kquant(m) -> bool:
 The `mode` / `bits` / `group_size` / `kquant_type` attributes exist precisely so a kquant layer reads
 the same as an affine `nn.QuantizedLinear` to introspection code.
 
-## Seam 2 - the module swap (`install_kquant_modules`)
+## The module swap (`install_kquant_modules`)
 
 `from mlx_kquant.nn import install_kquant_modules` (defined in `mlx_kquant/_install.py`, re-exported
 from `nn`). `install_kquant_modules(model, {"<path>.weight": codec, ...})` walks a constructed model
@@ -121,9 +122,9 @@ returns the count replaced. This is the one call that turns a float model into a
 memory; a loader or converter just has to produce the `{path: codec}` map.
 
 The keys here are `<path>.weight`-suffixed - note this differs from the **bare** paths in the on-disk
-`per_tensor` map (the loader bridges the two; see Seam 3).
+`per_tensor` map (the loader bridges the two; see **Loading a checkpoint**).
 
-## Seam 3 - loading a checkpoint (`mlx_kquant/loader.py`)
+## Loading a checkpoint (`mlx_kquant/loader.py`)
 
 `loader.load` is the pattern for reading a kquant checkpoint on stock mlx: resolve the path, build the
 mlx-lm model class for the config, `install_kquant_modules` from the config's `per_tensor` map, then
@@ -142,7 +143,7 @@ install_kquant_modules(model, weight_keyed)
 So a converter emits bare paths, the installer consumes `.weight`-suffixed ones, and the loader is the
 single place that translates - keep that contract if you write your own loader.
 
-## Seam 4 - encoding (`mlx_kquant/convert.py`, `recipes.py`)
+## Encoding (`mlx_kquant/convert.py`, `recipes.py`)
 
 `convert.quantize_model(model, config, preset=...)` is the create side: `recipes.classify_tensors`
 tags each tensor by role, `recipes.resolve_codec_map` turns a preset into a `{path: codec}` map,
@@ -166,15 +167,15 @@ Reuse `recipes` to drive your own encoder, or call `kq.quantize` directly for a 
 - **No separate bias inside the block.** The codec carries scales/zero-points in its bytes; a layer
   `bias` is stored as its own `<path>.bias` tensor, untouched by the encoder.
 
-## Seam 5 - interop with stock mlx-lm (`mlx_kquant/mlx_lm_patch.py`)
+## Interop with stock mlx-lm (`mlx_kquant/mlx_lm_patch.py`)
 
 The most reusable pattern in the repo: teach an **unmodified** mlx-lm to handle a new quant family by
-monkeypatching its seams instead of forking it. Two idempotent entry points, each a narrow shim over a
-stable mlx-lm function:
+monkeypatching a couple of its load/tuner functions instead of forking it. Two idempotent entry
+points, each a narrow shim over a stable mlx-lm function:
 
 ### Loading on stock mlx-lm (inference)
 
-`patch_mlx_lm_load()` is the **load-only** seam - all an inference / eval / serving consumer needs. It
+`patch_mlx_lm_load()` is the **load-only** shim - all an inference / eval / serving consumer needs. It
 wraps `mlx_lm.utils.load_model` so a kquant config routes through `loader.load`, and every non-kquant
 checkpoint falls through unchanged. Because everything mlx-lm exposes is built on `load_model`,
 `mlx_lm.load`, `mlx_lm.generate`, and the CLIs all then open a kquant checkpoint transparently:
@@ -193,7 +194,7 @@ not.
 
 ### Adapting and fusing (LoRA)
 
-`patch_mlx_lm_lora()` calls `patch_mlx_lm_load()` for you, then adds the train/merge seams:
+`patch_mlx_lm_lora()` calls `patch_mlx_lm_load()` for you, then adds the train/merge shims:
 
 - it attaches a `to_lora` method to the `KQuant*` modules, which mlx-lm's tuner consults first when
   discovering and wrapping adaptable layers (recovering in/out dims from the wire-byte geometry);

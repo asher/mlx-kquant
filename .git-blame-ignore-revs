@@ -1,4 +1,4 @@
-# Revisions to ignore in `git blame` — bulk, no-behavior-change reformats.
+# Revisions to ignore in `git blame` - bulk, no-behavior-change reformats.
 # Enable locally with:
 #   git config blame.ignoreRevsFile .git-blame-ignore-revs
 # (GitHub honors this file automatically.)

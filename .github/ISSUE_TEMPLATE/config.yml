@@ -1,5 +1,1 @@
 blank_issues_enabled: true
-contact_links:
-  - name: Running full GGUF models (gguf-mlx)
-    url: https://pypi.org/project/gguf-mlx/
-    about: To load and run complete GGUF models (remap, tokenizer synth, servers), use the gguf-mlx package, which builds on this op layer.

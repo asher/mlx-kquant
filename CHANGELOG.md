@@ -4,70 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project aims to
 adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - unreleased
+## [0.1.0]
 
-First public release: the standalone `kq.*` op layer plus a create-weights
-toolchain that runs on a stock `mlx==0.31.2` wheel.
-
-### Added
-- `kq.*` op namespace: `dequantize`, `quantized_matmul`, `gather_qmm`,
-  `quantize`, `load_gguf`, for all 10 GGUF K-quant / legacy codecs.
-- arm64 NEON-dotprod int8 CPU GEMV kernels for ALL 10 codecs: the fused
-  small-M `quantized_matmul` / `gather_qmm` CPU path quantizes activations
-  once to int8 and dots wire bytes directly (`vdotq_s32`), ~3-6x the scalar
-  throughput at decode shapes (8-19x per core). Low-bit k-quants (q2_k/q3_k)
-  make MoE expert offload of very large low-bit GGUFs decode-viable on CPU.
-  `KQ_CPU_NEON=0` disables; f32 `dequantize` is untouched (still bit-exact).
-  `kq.cpu_neon_available()` reports support.
-- MoE gather decode shapes (every expert group within the fused-GEMV
-  ceiling) now run as ONE worker-pool job over all (expert, row) work items
-  instead of one dispatch per expert. `KQ_CPU_SPIN_US` optionally spins the
-  pool workers between jobs (default 0: park immediately — spinning steals
-  cores from the rest of the inference graph).
-- `mlx_kquant.codec_geometry` - single source of truth for codec block geometry.
-- `mlx_kquant.nn` - `kq.*`-backed `KQuantLinear` / `KQuantEmbedding` /
-  `KQuantSwitchLinear` / `KQuantMultiLinear` modules, plus `install_kquant_modules`.
-- `mlx_kquant.recipes` / `imatrix` / `quantize` - preset-driven create-weights
-  pipeline with optional importance-matrix calibration.
-- `mlx_kquant.loader` - load a kquant checkpoint into a stock mlx-lm model.
-- `mlx-kquant` CLI (alias `mlxkq`): `quantize`, `calibrate-imatrix`, `lora`,
-  `fuse`, `verify`, `run`, `chat`, `inspect`. Requires the `[tools]` extra
-  (except `inspect` and `verify --codecs`, which run on a base install).
-- `mlx-kquant chat` - interactive REPL: a pass-through to mlx-lm's chat with
-  the kquant patch applied, plus terminal upgrades in the shim (readline
-  line editing with persistent history, in-chat `/commands` for sampling /
-  history / prompt loading / reset with Tab completion, Ctrl-C cancels the
-  in-flight reply). `run` carries sampling and chat-template controls;
-  the README documents both.
-- `mlx-kquant inspect` - print a checkpoint's per-tensor codec recipe (codec,
-  bits, packed/logical shape) from the config + safetensors headers, no GPU.
-- LoRA support for kquant bases (`mlx_kquant.mlx_lm_patch` + `docs/lora.md`),
-  backed by a gradient-wrt-x `vjp` on the matmul / gather ops: attach / train /
-  merge an adapter. `mlx-kquant run --adapter-path` attaches an adapter at runtime;
-  `mlx-kquant fuse` re-encodes the merge to kquant (`--imatrix` carries the base's
-  calibration through the re-encode) or, with `--dequantize`, writes a float
-  checkpoint. DoRA is not supported. A standalone `patch_mlx_lm_load()` enables
-  load-only interop (inference / eval, no LoRA).
-- `docs/integration.md` - reference for building on the `kq.*` ops (wire-byte
-  contract, on-disk format, codec table, the layer/loader/encode/interop seams).
-- `docs/walkthrough.md` (end-to-end quantize -> run -> LoRA -> fuse -> inspect)
-  and `docs/imatrix.md` (imatrix calibration: build, quantize, preserve on merge).
-- CPU decode path for all 10 codecs (`stream=mx.cpu`) covering `dequantize` /
-  `quantized_matmul` / `gather_qmm`, so the op tests run without a GPU.
-- CPU encode path for all 10 codecs (`stream=mx.cpu`) for `quantize`, a port of
-  the Metal encoders (flat codecs + `q6_k` byte-identical across streams), so the
-  full quantize pipeline and the encode tests run without a GPU.
-- Metal-free **Linux (CPU-only) build**: the extension compiles against
-  `mlx[cpu]==0.31.2` with no Metal toolchain (every op's `eval_gpu` is behind
-  `#ifdef _METAL_`), and the full op / encode / decode / LoRA / loader / CLI
-  suite passes on x86_64 and aarch64 Linux. Validated in CI and a
-  `Dockerfile.linux-test`.
-- PEP 621 packaging, `py.typed`, ruff config, CI (lint + macOS build with honest
-  GPU-gated op tests + Linux CPU build), and a tag-triggered wheel-publish
-  workflow.
-- Third-party license texts bundled under `mlx_kquant/licenses/` (llama.cpp/ggml
-  codec math, gguf-tools parser, MLX kernel headers/helpers), with attribution
-  headers on the derived sources and an Acknowledgements section in the README.
+First public release. A C++/Metal extension for a stock `mlx==0.31.2` wheel that
+adds the K-quant superblock and per-block integer codecs as native MLX ops
+(`kq.dequantize` / `quantized_matmul` / `gather_qmm` / `quantize`), with Metal and
+portable CPU paths for all ten codecs. On top of the ops, the `mlx-kquant` CLI
+quantizes an HF / mlx-lm model into a K-quant MLX safetensors checkpoint and runs,
+chats with, LoRA-fine-tunes, and fuses it, with importance-matrix calibration and
+per-tensor recipe inspection. A loader runs those checkpoints on stock mlx-lm.
 
 ### Notes
 - `requires-python >= 3.10` (mlx 0.31.2 ships no cp39 wheel).

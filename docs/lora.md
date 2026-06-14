@@ -13,14 +13,10 @@ modules in `mlx_kquant.nn` - so mlx-lm's own LoRA tuner, adapter loading, and th
 `mlx-kquant fuse` merge tool all work on a kquant checkpoint. Call it once, before
 building LoRA layers or loading adapters; it is idempotent.
 
-> For a complete GGUF model runtime (load any community GGUF, generate, serve),
-> see the separate **`gguf-mlx`** package (`pip install gguf-mlx`), which is built
-> on these ops.
+## Build a pirate Qwen3-0.6B
 
-## Worked example: a pirate Qwen3-0.6B
-
-End to end - quantize a small model, LoRA-train it to talk like a pirate, merge
-the adapter, and chat with it. Needs the `[tools]` extra. Uses the tiny
+End to end - quantize a small model, LoRA-train it to talk like a pirate, and chat
+with it by attaching the adapter. Needs the `[tools]` extra. Uses the tiny
 [`GPT007/pirate_speak`][pirate] dataset (100 chat turns).
 
 [pirate]: https://huggingface.co/datasets/GPT007/pirate_speak
@@ -78,31 +74,25 @@ mlx-kquant lora \
     --adapter-path pirate-adapter
 ```
 
-**4. Merge** the adapter back into the base (stays kquant; `--dequantize` for a
-float checkpoint instead):
+**4. Run it** by attaching the adapter - the base wire bytes stay frozen and the
+trained deltas stay full-precision (the highest-fidelity way to run a fine-tune):
 
 ```sh
-mlx-kquant fuse --model qwen3-0.6b-q5_k_m \
-    --adapter-path pirate-adapter \
-    --save-path qwen3-0.6b-pirate-q5_k_m
-```
-
-**5. Chat** with the result:
-
-```sh
-mlx-kquant run --model qwen3-0.6b-pirate-q5_k_m \
+mlx-kquant run --model qwen3-0.6b-q5_k_m --adapter-path pirate-adapter \
     --prompt "What's the weather like today?"
 ```
 
-The base Qwen3-0.6B answers plainly; after fine-tuning it answers in character -
-"Arrrr, I be needin' to give ye the weather for today ...". (150 iterations on 90
-examples is under a minute on an M-series GPU and is enough to pick up the style;
-turn it up for a stronger effect, but watch for overfitting on a set this small.)
+The base Qwen3-0.6B answers plainly; with the adapter attached it answers in
+character - "Arrrr, I be needin' to give ye the weather for today ...". (150
+iterations on 90 examples is under a minute on an M-series GPU and is enough to
+pick up the style; turn it up for a stronger effect, but watch for overfitting on
+a set this small.)
 
-The merge re-quantizes the adapted weights, and at `q5_k_m` the persona survives
-that round-trip. At `q4` and below the rounding can wash a small fine-tune out -
-keep the adapter separate (attach it) or use `--dequantize`. The
-[walkthrough](walkthrough.md) measures this end to end.
+You can also bake the adapter into a single self-contained checkpoint with
+`mlx-kquant fuse` - but merging re-quantizes the result, which can dilute or even
+cancel a small fine-tune. Attaching keeps the deltas intact, so it stays the
+default here. See the **Merge an adapter** section below, and the
+[walkthrough](walkthrough.md), which measures this end to end.
 
 ## Attach an adapter (inference / no training)
 
@@ -148,7 +138,7 @@ mlx-kquant lora --model my-model-q4km --train --data ./data --iters 300
 ```
 
 (Run `mlx-kquant lora --help` for the full flag list - it is mlx-lm's.) See the
-[worked example](#worked-example-a-pirate-qwen3-06b) below for an end-to-end run.
+[pirate Qwen3-0.6B example](#build-a-pirate-qwen3-06b) below for an end-to-end run.
 
 The gradient path is validated end-to-end in `tests/test_lora_patch.py`
 (`test_lora_trains_dense` / `test_lora_trains_moe`): a trainable projection
@@ -163,8 +153,14 @@ does not require a GPU.
 
 ## Merge an adapter - `mlx-kquant fuse`
 
-Once trained, fold the adapter back into the base with the `fuse` subcommand. Two
-output modes:
+Attaching the adapter (above) is the high-fidelity default - the trained deltas
+stay full-precision. Merging exists for when you want one self-contained
+checkpoint, but it carries a real cost: folding the delta into a kquant base
+**re-quantizes** the result, and that rounding can dilute the fine-tune or, at low
+bit widths, cancel it outright. The smaller the fine-tune is relative to the base
+weights, the more of it the re-quant grid erases. Weigh that before merging.
+
+The `fuse` subcommand has two output modes:
 
 ```sh
 # stays kquant: each merged weight is re-encoded with that tensor's own codec.
@@ -203,13 +199,13 @@ keeping the merged weight in float.
 
 ### Lower bit widths: keep the adapter separate
 
-The re-quant rounding is small at q5/q6, but at q4 and below it can wash out a small
-fine-tune *entirely* (re-quantizing a `--dequantize` float merge does the same -
-there is no trick once you land back on a coarse grid). So the highest-fidelity
-option is to **not merge**: keep the adapter as a file and attach it at runtime,
-where the deltas stay full-precision. Merge for a single self-contained checkpoint;
-prefer `--dequantize` (or a higher-bit base) when a low-bit merge would degrade the
-fine-tune.
+The re-quant rounding is small at q5/q6, but at q4 and below it can dilute or wash
+out a small fine-tune *entirely* (re-quantizing a `--dequantize` float merge does
+the same - there is no trick once you land back on a coarse grid). So the
+highest-fidelity option is to **not merge**: keep the adapter as a file and attach
+it at runtime, where the deltas stay full-precision. Merge for a single
+self-contained checkpoint; prefer `--dequantize` (or a higher-bit base) when a
+low-bit merge would degrade the fine-tune.
 
 To carry the base's *general* calibration through a keep-kquant merge, pass the same
 importance matrix you quantized the base with:

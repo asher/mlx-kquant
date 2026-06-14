@@ -402,7 +402,7 @@ void KQuantGatherQMM::eval_cpu(
     // Group the index entries by expert (w_idx) so each expert's wire bytes
     // are decoded ONCE per call instead of once per entry. In sorted MoE
     // prefill there is one entry per (token, expert) pair, so the naive
-    // entry-at-a-time loop re-dequantizes every expert per token — the
+    // entry-at-a-time loop re-dequantizes every expert per token - the
     // dominant cost by far. Grouped, all of an expert's rows are packed into
     // one [Rg*M, K] activation block and run as a single qmm (which threads
     // internally and picks fused-GEMV or dequant-once+GEMM by row count).
@@ -453,14 +453,14 @@ void KQuantGatherQMM::eval_cpu(
       // enough for the fused GEMV, run the whole call as ONE parallel job
       // over all (expert, output-row) work items via kquant_qmm_cpu_batch.
       // The per-group qmm-call-per-expert path below would pay a thread-pool
-      // wake/teardown per (expert, matrix) on ~MBs of work each — at MoE
+      // wake/teardown per (expert, matrix) on ~MBs of work each - at MoE
       // decode that's the dominant dispatch overhead.
-      // Per-group dedupe plan: duplicate (x_idx, w_idx) entries — the same
-      // activation rows against the same expert — compute once and fan out
+      // Per-group dedupe plan: duplicate (x_idx, w_idx) entries - the same
+      // activation rows against the same expert - compute once and fan out
       // by memcpy at scatter time, so repeated expert indices save FLOPs as
       // well as weight traffic. Admission stays gated on the RAW entry
       // count (not the unique count): widening it would shift groups from
-      // the dequant-once GEMM path onto the fused GEMV — a numerically
+      // the dequant-once GEMM path onto the fused GEMV - a numerically
       // valid but different accumulation order that would break the
       // bit-stability of existing call shapes.
       struct GroupPlan {

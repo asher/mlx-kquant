@@ -1,4 +1,4 @@
-"""``mlx-kquant verify`` - smoke-check the codecs / presets, or a checkpoint."""
+"""``mlx-kquant verify`` - verify compatible codecs, or a built checkpoint."""
 
 from __future__ import annotations
 
@@ -8,9 +8,10 @@ import argparse
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
         "verify",
-        help="smoke-check the codecs / presets, or a built checkpoint",
+        help="verify compatible codecs, or a built checkpoint",
         description="Quick self-checks: the supported codecs and metallib status, "
-        "the recipe presets, or a built checkpoint's forward pass.",
+        "or a built checkpoint's forward pass. (To list the recipe presets, see "
+        "`mlx-kquant quantize --list-presets`.)",
     )
     what = p.add_mutually_exclusive_group(required=True)
     what.add_argument(
@@ -18,7 +19,6 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="print the supported codecs and whether the metallib loads.",
     )
-    what.add_argument("--presets", action="store_true", help="list the recipe presets.")
     what.add_argument(
         "--model",
         help="load a checkpoint, forward a tiny input, and report finite logits.",
@@ -38,35 +38,6 @@ def cmd(args: argparse.Namespace) -> int:
     if args.codecs:
         print("codecs:", ", ".join(kq.codecs()))
         print("metallib loads:", kq.metallib_loads())
-        return 0
-
-    if args.presets:
-        from ..recipes import _LAYER_POSITION_BUMPS, _PATH_BUMPS, KQUANT_PRESETS
-
-        for name in sorted(KQUANT_PRESETS):
-            entries = KQUANT_PRESETS[name]
-            default = entries.get("default")
-            roles = [
-                f"{role}={codec}"
-                for role, codec in sorted(entries.items())
-                if role != "default" and codec != default
-            ]
-            line = f"  {name:10} default={default}"
-            if roles:
-                line += "  " + "  ".join(roles)
-            print(line)
-            bumps = _PATH_BUMPS.get(name)
-            if bumps:
-                btxt = "  ".join(f"{s}={c}" for s, c in sorted(bumps.items()))
-                print(f"  {'':10}   path bumps: {btxt}")
-            for suffix, (codec, rule) in sorted(
-                _LAYER_POSITION_BUMPS.get(name, {}).items()
-            ):
-                print(f"  {'':10}   layer bumps: {suffix}={codec} on {rule} layers")
-        print(
-            "\n  Roles not listed take the default; path/layer bumps match on "
-            "module-path suffix. The _s/_m/_xl variants differ in these bumps."
-        )
         return 0
 
     # --model: full load + forward (needs [tools] + a GPU to decode).

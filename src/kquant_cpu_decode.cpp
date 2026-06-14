@@ -4,7 +4,7 @@
 // wheel. The matmul wrapper is performance-tuned but portable: a shared
 // worker pool parallelizes over output rows / blocks, small-M matmuls run a
 // fused decode-one-block-then-dot loop (no full-matrix scratch), and large-M
-// matmuls dequantize once then run a GEMM — through Accelerate where
+// matmuls dequantize once then run a GEMM - through Accelerate where
 // available (KQ_USE_ACCELERATE), else a threaded scalar loop. The block
 // decode math derives from ggml (llama.cpp, MIT) - see
 // mlx_kquant/licenses/llama.cpp-LICENSE.
@@ -383,7 +383,7 @@ void dequantize_q2_k(const uint8_t* w, T* out, std::size_t num_weights) {
 // single-threaded. The pool is lazily created on first use and lives for the
 // process; the dispatching thread participates in every job, so
 // KQ_CPU_THREADS=1 (or a single-core box) degrades to plain inline execution
-// with no thread traffic. Not reentrant by design — callers below only ever
+// with no thread traffic. Not reentrant by design - callers below only ever
 // invoke it from the scheduler thread, never from inside a worker.
 
 class KQThreadPool {
@@ -410,7 +410,7 @@ class KQThreadPool {
       return;
     }
     // Each job carries its own shared state, so the caller only has to wait
-    // for its parts to finish — never for slow-to-wake workers to pass
+    // for its parts to finish - never for slow-to-wake workers to pass
     // through (a worker that wakes late just finds the part counter
     // exhausted and goes back to sleep; the shared_ptr keeps the state it
     // touches alive). Waiting on woken-worker exit instead was costing
@@ -488,7 +488,7 @@ class KQThreadPool {
     // Optional spin-before-park (KQ_CPU_SPIN_US, default 0 = park on the
     // condition variable immediately). Spinning for the next job avoids the
     // ~50-100us cv wake latency and buys ~15% on back-to-back same-op GEMV
-    // microbenches — but in real model graphs the spinning workers steal
+    // microbenches - but in real model graphs the spinning workers steal
     // cores from everything that runs BETWEEN kq jobs (the single-threaded
     // MLX CPU ops, and on hybrid CPU/GPU runs the GPU encode threads), which
     // measured net-negative end-to-end. Off by default; the knob stays for
@@ -644,7 +644,7 @@ inline float dot_block(const float* a, const float* b, int n) {
 // Fused decode-then-dot over output rows [n0, n1) for transpose_w=true
 // (w decodes to [N, K] row-major, the weight convention of every model
 // matmul). One 256-weight block is decoded into a stack buffer and
-// immediately dotted against all M activation rows — wire bytes are read
+// immediately dotted against all M activation rows - wire bytes are read
 // once and no [N, K] scratch is ever materialized, which is what makes
 // memory-bound decode honest.
 void qmv_fused_rows(
@@ -893,7 +893,7 @@ void kquant_qmm_cpu(
     }
   } else {
     // Prefill/GEMM shape: dequantize the weight matrix once (parallel over
-    // rows, uninitialized scratch — every element is overwritten), then GEMM.
+    // rows, uninitialized scratch - every element is overwritten), then GEMM.
     std::unique_ptr<float[]> w_dec(
         new float[static_cast<std::size_t>(w_rows) * w_cols]);
     kq_parallel_for(
@@ -908,7 +908,7 @@ void kquant_qmm_cpu(
         });
 
 #ifdef KQ_USE_ACCELERATE
-    // Accelerate's sgemm engages the AMX/SME matrix units — far past what
+    // Accelerate's sgemm engages the AMX/SME matrix units - far past what
     // scalar (or even NEON) per-core loops can reach for M x N x K work.
     cblas_sgemm(
         CblasRowMajor,

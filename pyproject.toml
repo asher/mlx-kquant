@@ -51,8 +51,11 @@ dev = ["pytest", "ruff", "numpy", "gguf"]
 mlx-kquant = "mlx_kquant.cli:main"
 mlxkq = "mlx_kquant.cli:main"
 
-# [project.urls] intentionally omitted until the public GitHub repo exists -
-# add Homepage / Repository / Issues there rather than shipping a guessed URL.
+[project.urls]
+Homepage = "https://github.com/asher/mlx-kquant"
+Repository = "https://github.com/asher/mlx-kquant"
+Issues = "https://github.com/asher/mlx-kquant/issues"
+Changelog = "https://github.com/asher/mlx-kquant/blob/main/CHANGELOG.md"
 
 [tool.setuptools.dynamic]
 version = { attr = "mlx_kquant._version.__version__" }

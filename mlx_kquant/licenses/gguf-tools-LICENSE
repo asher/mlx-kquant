@@ -1,4 +1,4 @@
-gguf-tools — https://github.com/antirez/gguf-tools
+gguf-tools - https://github.com/antirez/gguf-tools
 
 The C GGUF parser is statically linked into built mlx-kquant wheels. It is
 distributed under the MIT License:

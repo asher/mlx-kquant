@@ -1,7 +1,8 @@
 """CLI dispatcher tests - argument parsing + the no-[tools]/no-GPU verify legs.
 
 Importing the CLI must not pull in mlx-lm (heavy imports stay inside ``cmd``), so
-these run on a base install. ``verify --codecs`` / ``--presets`` dispatch no ops.
+these run on a base install. ``verify --codecs`` / ``quantize --list-presets``
+dispatch no ops.
 """
 
 from __future__ import annotations
@@ -384,14 +385,18 @@ def test_verify_codecs_runs():
     assert main(["verify", "--codecs"]) == 0
 
 
-def test_verify_presets_runs():
-    assert main(["verify", "--presets"]) == 0
+def test_quantize_list_presets_exits_zero():
+    # A print-and-exit action (like --version); fires before the required args.
+    with pytest.raises(SystemExit) as e:
+        _build_parser().parse_args(["quantize", "--list-presets"])
+    assert e.value.code == 0
 
 
-def test_verify_presets_differentiates_variants(capsys):
+def test_quantize_list_presets_differentiates_variants(capsys):
     # The s/m/xl variants share role maps; the output must surface the path /
     # layer bumps that actually distinguish them.
-    assert main(["verify", "--presets"]) == 0
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(["quantize", "--list-presets"])
     out = capsys.readouterr().out
     assert "path bumps:" in out
     assert ".mlp.down_proj=q6_k" in out  # q4_k_xl / q5_k_xl path bump

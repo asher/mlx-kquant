@@ -2,8 +2,8 @@
 
 An imatrix is a per-tensor importance vector (one weight per input channel) that
 steers the K-quant encoder toward preserving the channels that matter most for a
-calibration corpus. :func:`mlx_kquant.quantize.quantize` passes these vectors to
-``kq.quantize`` (a no-op on the non-K-quant codecs, which have no
+calibration corpus. :func:`mlx_kquant.convert.quantize_model` passes these
+vectors to ``kq.quantize`` (a no-op on the non-K-quant codecs, which have no
 importance-weighted rounding path).
 
 This module is pure numpy (+ optional ``gguf`` for GGUF-format imatrix files) -

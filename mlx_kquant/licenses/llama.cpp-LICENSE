@@ -1,4 +1,4 @@
-llama.cpp / ggml — https://github.com/ggml-org/llama.cpp
+llama.cpp / ggml - https://github.com/ggml-org/llama.cpp
 
 The K-quant and legacy codec formats, and the quantization / dequantization
 algorithms that encode and decode them (the encoder scale searches and the

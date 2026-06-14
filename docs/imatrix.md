@@ -13,8 +13,8 @@ encode time.
   delta shrinks. It still helps across the range - bartowski / Unsloth ship imatrix
   quants at every level.
 - **Superblock K-quants only.** The importance weighting applies to the five
-  superblock codecs (q2_k, q3_k, q4_k, q5_k, q6_k). It is a **no-op** on `q8_0` and
-  the legacy `wpb=32` codecs (q4_0 / q4_1 / q5_0 / q5_1), which have no
+  superblock codecs (q2_k, q3_k, q4_k, q5_k, q6_k). It is a **no-op** on the five
+  `wpb=32` block codecs (q8_0 / q4_0 / q4_1 / q5_0 / q5_1), which have no
   importance-weighted rounding path - passing an imatrix there is silently ignored.
 - It improves the model's **general quality** - measure it with perplexity or KLD
   against the float model. It is *not* a way to protect a specific fine-tune signal:
@@ -59,12 +59,10 @@ merge them** (merging just dilutes whichever set you cared about).
 
 ### Format
 
-The output is the legacy llama.cpp imatrix **`.dat`**: a count plus one float32
+The output is the llama.cpp imatrix **`.dat`** format: a count plus one float32
 importance vector per tensor, keyed by HF module path. `calibrate-imatrix` only
 hooks `nn.Linear`, so embeddings are not covered - that is why a tied-embedding
-model reports 196 of 197 tensors in the next step. The reader also accepts
-llama.cpp's GGUF imatrix format, and remaps GGUF tensor names to HF paths when
-`gguf-mlx` is installed.
+model reports 196 of 197 tensors in the next step.
 
 ## 2. Quantize with the imatrix
 

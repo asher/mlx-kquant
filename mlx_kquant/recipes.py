@@ -4,7 +4,7 @@ Pure string / regex / dict logic - no ops, no GPU. Given a model's module
 paths, classify each quantizable tensor by *role* (attention q/k/v/o, MoE
 router, routed vs shared expert, embedding, lm_head, ...) and resolve a
 per-tensor codec from a named *preset* (``q4_k_m``, ``q5_k_moe``, ...). The
-encoder in :mod:`mlx_kquant.quantize` consumes the resulting ``{path: codec}``
+encoder in :mod:`mlx_kquant.convert` consumes the resulting ``{path: codec}``
 map.
 
 The recipe philosophy: spend bits where they matter (attention output, value
@@ -351,6 +351,42 @@ def resolve_codec_map(
 
         out[path] = base_default
     return out
+
+
+def format_presets() -> str:
+    """Human-readable listing of every preset and what it maps, for the CLI.
+
+    Renders each preset's default codec, its role-specific entries, and the
+    path / layer-position bumps that distinguish the ``_s`` / ``_m`` / ``_xl``
+    variants. The single source of truth is the dicts above, so the listing can
+    never drift from what :func:`resolve_codec_map` actually does.
+    """
+    lines: list[str] = []
+    for name in sorted(_PRESETS):
+        entries = _PRESETS[name]
+        default = entries.get("default")
+        roles = [
+            f"{role}={codec}"
+            for role, codec in sorted(entries.items())
+            if role != "default" and codec != default
+        ]
+        line = f"  {name:10} default={default}"
+        if roles:
+            line += "  " + "  ".join(roles)
+        lines.append(line)
+        bumps = _PATH_BUMPS.get(name)
+        if bumps:
+            btxt = "  ".join(f"{s}={c}" for s, c in sorted(bumps.items()))
+            lines.append(f"  {'':10}   path bumps: {btxt}")
+        for suffix, (codec, rule) in sorted(
+            _LAYER_POSITION_BUMPS.get(name, {}).items()
+        ):
+            lines.append(f"  {'':10}   layer bumps: {suffix}={codec} on {rule} layers")
+    lines.append(
+        "\n  Roles not listed take the default; path/layer bumps match on "
+        "module-path suffix. The _s/_m/_xl variants differ in these bumps."
+    )
+    return "\n".join(lines)
 
 
 def kquant_predicate_builder(
