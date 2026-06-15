@@ -38,17 +38,23 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version", action="version", version=f"mlx-kquant {__version__}"
     )
-    sub = parser.add_subparsers(dest="command", metavar="<command>", required=True)
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
     for mod in _SUBCOMMANDS:
         mod.add_parser(sub)
     return parser
+
+
+def _subparsers(parser: argparse.ArgumentParser) -> argparse._SubParsersAction:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return action
+    raise RuntimeError("no subparsers registered")  # unreachable
 
 
 def main(argv: list[str] | None = None) -> int:
     raw = sys.argv[1:] if argv is None else list(argv)
     # `lora` / `chat` are pass-throughs to mlx-lm CLIs - intercept them before
     # argparse so every mlx-lm flag (including --help) reaches them untouched
-    # (REMAINDER can't capture a leading option).
     if raw and raw[0] in ("lora", "chat"):
         mod = lora if raw[0] == "lora" else chat
         try:
@@ -60,7 +66,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {e}", file=sys.stderr)
             return 1
 
-    args = _build_parser().parse_args(raw)
+    parser = _build_parser()
+    # A bare subcommand (name only, no flags) prints that command's full help
+    # rather than argparse's terse "required arguments" error.
+    if len(raw) == 1:
+        sub = _subparsers(parser)
+        if raw[0] in sub.choices:
+            sub.choices[raw[0]].print_help()
+            return 0
+    args = parser.parse_args(raw)
+    if not getattr(args, "func", None):
+        # No subcommand at all: show the top-level help rather than erroring out.
+        parser.print_help()
+        return 0
     try:
         return args.func(args)
     except KeyboardInterrupt:

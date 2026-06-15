@@ -22,10 +22,12 @@ def test_version_exits_zero():
     assert e.value.code == 0
 
 
-def test_no_command_errors():
-    with pytest.raises(SystemExit) as e:
-        _build_parser().parse_args([])
-    assert e.value.code == 2
+def test_no_command_prints_help(capsys):
+    # Bare invocation prints help and exits 0, rather than erroring out.
+    assert main([]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("usage: mlx-kquant")
+    assert "quantize" in out
 
 
 @pytest.mark.parametrize(
@@ -35,6 +37,47 @@ def test_subcommand_help_exits_zero(cmd):
     with pytest.raises(SystemExit) as e:
         _build_parser().parse_args([cmd, "--help"])
     assert e.value.code == 0
+
+
+@pytest.mark.parametrize(
+    "cmd", ["quantize", "calibrate-imatrix", "verify", "run", "fuse", "inspect"]
+)
+def test_bare_subcommand_prints_help(cmd, capsys):
+    # A bare subcommand prints its full help and exits 0, not a terse
+    # "required arguments" error. (lora/chat are pass-throughs, covered
+    # by their own help handling, and would pull in mlx-lm here.)
+    assert main([cmd]) == 0
+    assert capsys.readouterr().out.startswith(f"usage: mlx-kquant {cmd}")
+
+
+def test_has_opt_recognizes_option_forms():
+    from mlx_kquant.cli._args import has_opt
+
+    assert has_opt(["--model", "x"], "--model")
+    assert has_opt(["--model=x"], "--model")
+    assert has_opt(["-m", "x"], "-m", "--model")
+    assert has_opt(["-mx"], "-m", "--model")
+    assert has_opt(["-c", "f.yaml"], "-c", "--config")
+    assert has_opt(["-cf.yaml"], "-c", "--config")
+    assert has_opt(["--config=f"], "-c", "--config")
+    assert not has_opt(["--train"], "--model")
+    assert not has_opt([], "--model")
+
+
+def test_lora_guard_refuses_default_download(capsys):
+    # `lora --train` with no model/data must error (naming both) rather than
+    # download mlx-lm's Qwen3-0.6b + WikiSQL defaults. The guard fires before
+    # mlx-lm is imported, so this stays a base-install test.
+    assert main(["lora", "--train"]) == 1
+    err = capsys.readouterr().err
+    assert "--model" in err and "--data" in err
+
+
+def test_chat_guard_refuses_default_download(capsys):
+    # `chat` with flags but no --model must error rather than download
+    # mlx-lm's default model.
+    assert main(["chat", "--temp", "0.7"]) == 1
+    assert "--model" in capsys.readouterr().err
 
 
 def test_quantize_requires_a_recipe():
