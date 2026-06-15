@@ -18,11 +18,18 @@ Two layers:
 
 ## Why
 
-K-quant is the precision recipe behind the strongest small-footprint community quants; this makes it
-first-class on MLX. Quantize an HF / `mlx-lm` model to a uniform- or mixed-precision K-quant
-checkpoint, then load, generate, LoRA-train, and fuse it - all on a stock `mlx` wheel, all in MLX
-safetensors. The kernels are tuned for real models (matrix-contiguity handling for fused MoE experts,
-single-pass NAX matmul), see [Performance](#performance).
+K-quants have roughly half the divergence vs. affine quants at the same bitrate (as measured by KLD).
+
+| Model | Budget | MLX affine | K-quant | Divergence cut |
+|-------|--------|------------|---------|---------------:|
+| Qwen3.6-27B | 4-bit | 0.0577 @ 4.69 bpw | Q4_K_M 0.0208 @ 4.88 bpw | 2.8× |
+| Qwen3.6-27B | 5-bit | 0.0214 @ 5.68 bpw | Q5_K_M 0.0096 @ 5.73 bpw | 2.2× |
+| gemma-4-E2B | 4-bit | 1.2254 @ 5.76 bpw | Q4_K_M 0.6657 @ 5.77 bpw | 1.8× |
+| gemma-4-E2B | 5-bit | 0.4979 @ 6.67 bpw | Q5_K_XL 0.2316 @ 6.67 bpw | 2.2× |
+
+mlx-kquant brings them to the MLX ecosystem with tuned Metal kernels. Quantize an MLX safetensors model
+to a uniform- or mixed-precision K-quant checkpoint, then load, generate, LoRA-train, and fuse it
+on a stock `mlx` wheel.
 
 ## Install
 
