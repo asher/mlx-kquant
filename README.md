@@ -26,13 +26,22 @@ single-pass NAX matmul), see [Performance](#performance).
 
 ## Install
 
-**macOS 26.2 (Tahoe) or later on Apple Silicon** (the GPU path), with the Metal toolchain
-(`xcrun metal`) and the exact pinned MLX wheel.
+**macOS 26.2 (Tahoe) or later on Apple Silicon.** Prebuilt wheels (CPython 3.10-3.13):
 
 ```sh
-pip install "mlx==0.31.2"     # pinned, ABI-matched stock wheel (pulls the Metal backend)
-pip install -e .              # builds _ext + mlx_kquant.metallib
-pip install -e ".[tools]"     # + mlx-lm, for the CLI subcommands (quantize / run / chat / ...)
+pip install mlx-kquant            # the K-quant ops + precompiled metallib
+pip install "mlx-kquant[tools]"   # the CLI (quantize / run / chat / lora / fuse)
+```
+
+Either pulls the ABI-matched `mlx==0.31.2` automatically.
+
+**From source** (or to develop) needs the Metal toolchain (`xcrun metal`); the metallib compiles at
+install time, no runtime JIT:
+
+```sh
+git clone https://github.com/asher/mlx-kquant && cd mlx-kquant
+pip install "mlx==0.31.2"         # pinned, ABI-matched stock wheel (pulls the Metal backend)
+pip install -e ".[tools]"         # builds _ext + mlx_kquant.metallib; adds mlx-lm for the CLI
 ```
 
 **Linux (CPU-only)** also builds, with no Metal toolchain. The ops run on their portable `eval_cpu`
@@ -298,9 +307,9 @@ python -m pytest tests/
 
 ## Requirements
 
-- **macOS 26.2 (Tahoe) or later on Apple Silicon** (M-series) with a working Metal toolchain
-  (`xcrun metal`) for the GPU build-from-source install.
-- **Linux** (x86_64 or aarch64) is supported CPU-only: build against `mlx[cpu]==0.31.2`, no Metal
+- **macOS 26.2 (Tahoe) or later on Apple Silicon** (M-series). Building from source needs the Metal
+  toolchain (`xcrun metal`).
+- **Linux** (x86_64 or aarch64) is supported CPU-only. Build against `mlx[cpu]==0.31.2`, no Metal
   toolchain required. See [Install](#install) and [Limitations](#limitations).
 - **Python >= 3.10** (the pinned `mlx==0.31.2` ships no cp39 wheel).
 - **`mlx==0.31.2`** exactly - the kernels include MLX's steel headers and the extension links
@@ -317,7 +326,7 @@ python -m pytest tests/
   eagerly with identical numerics. This is an upstream MLX-on-Linux limitation independent of
   mlx-kquant - the `kq.*` ops have their own `eval_cpu` and never touch the JIT.
 - **LoRA, not DoRA.** LoRA adapters train, attach, and fuse on a kquant base (see
-  [docs/lora.md](https://github.com/asher/mlx-kquant/blob/main/docs/lora.md)); DoRA is not yet supported. `fuse` re-encodes to kquant or, with
+  [docs/lora.md](https://github.com/asher/mlx-kquant/blob/main/docs/lora.md)), DoRA is not yet supported. `fuse` re-encodes to kquant or, with
   `--dequantize`, to float; both modes run on CPU or Metal.
 
 ## License
