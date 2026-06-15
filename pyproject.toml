@@ -107,8 +107,10 @@ test-command = "python {project}/scripts/check-codecs.py --check"
 
 [tool.cibuildwheel.macos]
 archs = ["arm64"]
-# The NAX kernel needs macOS 26 for the Metal 4 SDK (MetalPerformancePrimitives).
-environment = { MACOSX_DEPLOYMENT_TARGET = "26.0" }
+# NAX needs the Metal 4 SDK (MetalPerformancePrimitives); target 26.2, not 26.0:
+# the SDK 26.5+ headers compile NAX against a broken operand shim below 26.2.
+# https://github.com/ml-explore/mlx/issues/3586
+environment = { MACOSX_DEPLOYMENT_TARGET = "26.2" }
 # Do NOT vendor libmlx into the wheel: the extension is ABI-pinned to the user's
 # installed mlx==0.31.2 and resolves it via the @loader_path/../mlx/lib rpath
 # (see CMakeLists.txt). Bundling a second libmlx copy would split MLX global

@@ -26,9 +26,8 @@ single-pass NAX matmul), see [Performance](#performance).
 
 ## Install
 
-**macOS 26 (Tahoe) or later on Apple Silicon** (the GPU path), with the Metal toolchain
-(`xcrun metal`) and the exact pinned MLX wheel. macOS 26 is the floor because the NAX matmul kernel
-needs the Metal 4 SDK (`MetalPerformancePrimitives`):
+**macOS 26.2 (Tahoe) or later on Apple Silicon** (the GPU path), with the Metal toolchain
+(`xcrun metal`) and the exact pinned MLX wheel.
 
 ```sh
 pip install "mlx==0.31.2"     # pinned, ABI-matched stock wheel (pulls the Metal backend)
@@ -299,10 +298,8 @@ python -m pytest tests/
 
 ## Requirements
 
-- **macOS 26 (Tahoe) or later on Apple Silicon** (M-series) with a working Metal toolchain
-  (`xcrun metal`) for the GPU build-from-source install. macOS 26 is required because the NAX matmul
-  kernel needs the Metal 4 SDK (`MetalPerformancePrimitives`); prebuilt wheels are tagged
-  `macosx_26_0` so pip declines to install them on older macOS rather than failing at runtime.
+- **macOS 26.2 (Tahoe) or later on Apple Silicon** (M-series) with a working Metal toolchain
+  (`xcrun metal`) for the GPU build-from-source install.
 - **Linux** (x86_64 or aarch64) is supported CPU-only: build against `mlx[cpu]==0.31.2`, no Metal
   toolchain required. See [Install](#install) and [Limitations](#limitations).
 - **Python >= 3.10** (the pinned `mlx==0.31.2` ships no cp39 wheel).
