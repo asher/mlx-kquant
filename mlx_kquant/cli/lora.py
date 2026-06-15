@@ -42,12 +42,34 @@ def passthrough(rest: list[str]) -> int:
     import sys
 
     from .._deps import require_tools
+    from ._args import has_opt
+
+    wants_help = "-h" in rest or "--help" in rest
+    if rest and not wants_help and not has_opt(rest, "-c", "--config"):
+        missing = [
+            flag
+            for flag, present in (
+                ("--model (a kquant checkpoint)", has_opt(rest, "--model")),
+                ("--data", has_opt(rest, "--data")),
+            )
+            if not present
+        ]
+        if missing:
+            raise ValueError(
+                "lora needs " + " and ".join(missing) + " (or -c <config.yaml>); "
+                "refusing mlx-lm's defaults (Qwen3-0.6b / WikiSQL). "
+                "See `mlx-kquant lora --help`."
+            )
 
     require_tools()
 
     from mlx_lm.lora import main as lora_main
 
     from ..mlx_lm_patch import patch_mlx_lm_lora
+
+    # Bare `mlx-kquant lora` shows mlx-lm's lora help.
+    if not rest:
+        rest = ["--help"]
 
     trust = "--trust-remote-code" in rest
     if trust:

@@ -369,8 +369,22 @@ def passthrough(rest: list[str]) -> int:
     import sys
 
     from .._deps import require_tools
+    from ._args import has_opt
+
+    wants_help = "-h" in rest or "--help" in rest
+    if rest and not wants_help and not has_opt(rest, "-m", "--model"):
+        raise ValueError(
+            "chat needs --model <kquant checkpoint>; refusing mlx-lm's default "
+            "model (Llama-3.2-3B-Instruct-4bit). See `mlx-kquant chat --help`."
+        )
 
     require_tools()
+
+    if not rest:
+        import mlx_lm.chat as _chat
+
+        _chat.setup_arg_parser().parse_args(["--help"])
+        return 0  # parse_args(["--help"]) exits; unreachable
 
     # The shim's own flags, removed before delegating (mlx-lm's chat parser
     # rejects unknown arguments). Everything else stays in `rest` untouched.
