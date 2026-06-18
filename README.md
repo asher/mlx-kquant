@@ -12,7 +12,8 @@ Two layers:
 - **Ops** (C++/Metal) - a `kq.*` namespace (`dequantize`, `quantized_matmul`, `gather_qmm`,
   `quantize`) backed by Metal kernels compiled to a `.metallib` at build time (no runtime JIT). All
   ten K-quant/legacy codecs: `q2_k, q3_k, q4_k, q5_k, q6_k` and `q4_0, q4_1, q5_0, q5_1, q8_0`, plus
-  seven decode-only IQ codecs (`iq4_nl, iq4_xs, iq3_s, iq3_xxs, iq2_xxs, iq2_xs, iq2_s`).
+  nine decode-only IQ codecs
+  (`iq4_nl, iq4_xs, iq3_s, iq3_xxs, iq2_xxs, iq2_xs, iq2_s, iq1_s, iq1_m`).
 - **Tooling** (Python) - `mlx-kquant quantize / run / chat / lora / fuse` (plus `verify`, `inspect`,
   `calibrate-imatrix`) and a `loader` that create and run K-quant checkpoints in **MLX-native
   safetensors** format.
@@ -308,6 +309,8 @@ are informed by our analysis of the mixed-precision quants that [Unsloth][unslot
 | iq2_xxs | 256 | 2 |  66 | grid + scale/sign words (decode-only) |
 | iq2_xs  | 256 | 2 |  74 | grid + scales (decode-only) |
 | iq2_s   | 256 | 2 |  82 | grid + qh + signs (decode-only) |
+| iq1_s   | 256 | 1 |  50 | grid + delta (decode-only) |
+| iq1_m   | 256 | 1 |  56 | grid + delta, scattered scale (decode-only) |
 
 ## Version pinning
 

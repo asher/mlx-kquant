@@ -57,7 +57,8 @@ inline int kquant_qmv_bn(const std::string& kquant_type) {
       kquant_type == "q5_k" || kquant_type == "iq4_xs" ||
       kquant_type == "iq3_s" || kquant_type == "iq3_xxs" ||
       kquant_type == "iq2_xxs" || kquant_type == "iq2_xs" ||
-      kquant_type == "iq2_s") {
+      kquant_type == "iq2_s" || kquant_type == "iq1_s" ||
+      kquant_type == "iq1_m") {
     return 4;
   }
   return 8;

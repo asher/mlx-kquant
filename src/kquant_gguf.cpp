@@ -134,6 +134,10 @@ const KQuantCodec* gguf_type_to_kquant_codec(uint32_t t) {
       return codec_by_name("iq2_xs");
     case GGUF_TYPE_IQ2_S:
       return codec_by_name("iq2_s");
+    case GGUF_TYPE_IQ1_S:
+      return codec_by_name("iq1_s");
+    case GGUF_TYPE_IQ1_M:
+      return codec_by_name("iq1_m");
     default:
       return nullptr;
   }

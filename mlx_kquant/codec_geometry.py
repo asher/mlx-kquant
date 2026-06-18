@@ -33,13 +33,27 @@ CODEC_GEOMETRY: dict[str, tuple[int, int, int, int]] = {
     "iq2_xxs": (256, 2, 66, 256),
     "iq2_xs": (256, 2, 74, 256),
     "iq2_s": (256, 2, 82, 256),
+    # IQ1 (1.56 / 1.75 bpw): grid + a ±0.125 delta on each grid value; iq1_m
+    # has no super-block d (reconstructed from scattered scale nibbles).
+    "iq1_s": (256, 1, 50, 256),
+    "iq1_m": (256, 1, 56, 256),
 }
 
 # IQ codecs load community GGUFs but have no encoder (their rounding needs a
 # search + imatrix the extension doesn't implement); excluded from the encoder
 # and imatrix sets below.
 DECODE_ONLY_CODECS: frozenset[str] = frozenset(
-    {"iq4_nl", "iq4_xs", "iq3_s", "iq3_xxs", "iq2_xxs", "iq2_xs", "iq2_s"}
+    {
+        "iq4_nl",
+        "iq4_xs",
+        "iq3_s",
+        "iq3_xxs",
+        "iq2_xxs",
+        "iq2_xs",
+        "iq2_s",
+        "iq1_s",
+        "iq1_m",
+    }
 )
 
 # Every codec the ``kq.quantize`` encoder can produce: the ten K-quant/legacy

@@ -52,6 +52,8 @@ CODECS = {
     "iq2_xxs": (GT.IQ2_XXS, 256, 66, 2, False),
     "iq2_xs": (GT.IQ2_XS, 256, 74, 2, False),
     "iq2_s": (GT.IQ2_S, 256, 82, 2, False),
+    "iq1_s": (GT.IQ1_S, 256, 50, 1, False),
+    "iq1_m": (GT.IQ1_M, 256, 56, 1, False),
 }
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -64,11 +66,19 @@ gpu = pytest.mark.skipif(
 
 
 def _synth_iq_wire(rng, bpb, n_blocks):
-    """Structurally-valid random IQ wire: random bytes with a sane fp16 d
-    (block offset 0 in every IQ4/IQ3 struct) so dequant can't hit Inf/NaN."""
+    """Structurally-valid random IQ wire: random bytes with a sane fp16 d so
+    dequant can't hit Inf/NaN. Most IQ structs carry d at block offset 0; IQ1_M
+    (bpb 56) has no d -- its fp16 scale is the top nibble of each of the four
+    uint16 scale words at offset 48 -- so seed those nibbles instead."""
     wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
     d = rng.uniform(0.02, 0.08, n_blocks).astype(np.float16)
-    wire[:, 0:2] = d.view(np.uint8).reshape(n_blocks, 2)
+    if bpb == 56:  # IQ1_M: scale reconstructed from scattered top nibbles
+        dbits = d.view(np.uint16)
+        for k, byteidx in enumerate((49, 51, 53, 55)):  # high byte of each word
+            nib = ((dbits >> (4 * k)) & 0xF).astype(np.uint8)
+            wire[:, byteidx] = (wire[:, byteidx] & 0x0F) | (nib << 4)
+    else:
+        wire[:, 0:2] = d.view(np.uint8).reshape(n_blocks, 2)
     return wire
 
 

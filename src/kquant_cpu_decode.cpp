@@ -607,6 +607,91 @@ void dequantize_iq2_s(const uint8_t* w, T* out, std::size_t num_weights) {
   }
 }
 
+// IQ1_S / IQ1_M (1.56 / 1.75 bpw): like IQ2 but the grid stores SIGNED int8
+// values and each is offset by a +/-0.125 delta before scaling (no signs[]
+// table). y = dl * (grid[j] + delta). IQ1_S takes its per-32 scale from d and
+// the qh word; IQ1_M has NO super-block d -- it is reconstructed from the top
+// nibble of each of the four 16-bit scale words -- and a per-16 scale + delta
+// sign. Both share iq1s_grid (uint64, 8 signed bytes/entry, 11-bit index).
+template <typename T>
+void dequantize_iq1_s(const uint8_t* w, T* out, std::size_t num_weights) {
+  constexpr int block_weights = 256;
+  constexpr int block_bytes = 50;
+  std::size_t num_blocks = num_weights / block_weights;
+  for (std::size_t b = 0; b < num_blocks; b++) {
+    const uint8_t* block = w + b * block_bytes;
+    float d = read_f16(block);
+    const uint8_t* qs = block + 2; // uint8_t[32]
+    const uint8_t* qhb = block + 34; // uint16_t[8]
+    T* y = out + b * block_weights;
+    for (int ib = 0; ib < 8; ib++) {
+      uint16_t qh;
+      std::memcpy(&qh, qhb + 2 * ib, sizeof(uint16_t));
+      float dl = d * (2 * ((qh >> 12) & 7) + 1);
+      float delta = (qh & 0x8000) ? -0.125f : 0.125f;
+      for (int l = 0; l < 4; l++) {
+        const int8_t* g = reinterpret_cast<const int8_t*>(
+            iq1s_grid + (qs[l] | (((qh >> (3 * l)) & 7) << 8)));
+        for (int j = 0; j < 8; j++) {
+          y[j] = static_cast<T>(dl * (g[j] + delta));
+        }
+        y += 8;
+      }
+      qs += 4;
+    }
+  }
+}
+
+template <typename T>
+void dequantize_iq1_m(const uint8_t* w, T* out, std::size_t num_weights) {
+  constexpr int block_weights = 256;
+  constexpr int block_bytes = 56;
+  std::size_t num_blocks = num_weights / block_weights;
+  for (std::size_t b = 0; b < num_blocks; b++) {
+    const uint8_t* block = w + b * block_bytes;
+    const uint8_t* qs = block + 0; // uint8_t[32]
+    const uint8_t* qh = block + 32; // uint8_t[16]
+    uint16_t sc[4];
+    std::memcpy(sc, block + 48, sizeof(sc)); // scales: uint8_t[8] = uint16_t[4]
+    uint16_t scale_u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+        ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+    float d = read_f16(reinterpret_cast<const uint8_t*>(&scale_u16));
+    T* y = out + b * block_weights;
+    for (int ib = 0; ib < 8; ib++) {
+      float dl1 = d * (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 0x7) + 1);
+      float dl2 = d * (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1);
+      uint16_t idx[4] = {
+          static_cast<uint16_t>(qs[0] | ((qh[0] << 8) & 0x700)),
+          static_cast<uint16_t>(qs[1] | ((qh[0] << 4) & 0x700)),
+          static_cast<uint16_t>(qs[2] | ((qh[1] << 8) & 0x700)),
+          static_cast<uint16_t>(qs[3] | ((qh[1] << 4) & 0x700)),
+      };
+      float delta[4] = {
+          (qh[0] & 0x08) ? -0.125f : 0.125f,
+          (qh[0] & 0x80) ? -0.125f : 0.125f,
+          (qh[1] & 0x08) ? -0.125f : 0.125f,
+          (qh[1] & 0x80) ? -0.125f : 0.125f,
+      };
+      for (int l = 0; l < 2; l++) {
+        const int8_t* g = reinterpret_cast<const int8_t*>(iq1s_grid + idx[l]);
+        for (int j = 0; j < 8; j++) {
+          y[j] = static_cast<T>(dl1 * (g[j] + delta[l]));
+        }
+        y += 8;
+      }
+      for (int l = 2; l < 4; l++) {
+        const int8_t* g = reinterpret_cast<const int8_t*>(iq1s_grid + idx[l]);
+        for (int j = 0; j < 8; j++) {
+          y[j] = static_cast<T>(dl2 * (g[j] + delta[l]));
+        }
+        y += 8;
+      }
+      qs += 4;
+      qh += 2;
+    }
+  }
+}
+
 // --------------------------------------------------------------------------
 // Shared CPU worker pool
 // --------------------------------------------------------------------------
@@ -865,6 +950,10 @@ DequantFnF32 dequant_fn_f32(const std::string& t) {
     return &dequantize_iq2_xs<float>;
   } else if (t == "iq2_s") {
     return &dequantize_iq2_s<float>;
+  } else if (t == "iq1_s") {
+    return &dequantize_iq1_s<float>;
+  } else if (t == "iq1_m") {
+    return &dequantize_iq1_m<float>;
   }
   return nullptr;
 }
@@ -1037,6 +1126,10 @@ void kquant_dequantize_dispatch(
     dequantize_iq2_xs(w, out, num_weights);
   } else if (kquant_type == "iq2_s") {
     dequantize_iq2_s(w, out, num_weights);
+  } else if (kquant_type == "iq1_s") {
+    dequantize_iq1_s(w, out, num_weights);
+  } else if (kquant_type == "iq1_m") {
+    dequantize_iq1_m(w, out, num_weights);
   } else {
     throw std::runtime_error(
         "[mlx_kquant] dequantize: unsupported codec: " + kquant_type);
