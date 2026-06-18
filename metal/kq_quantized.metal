@@ -332,14 +332,39 @@ instantiate_kquant_q2_k_for_type(float)
 instantiate_kquant_q2_k_for_type(bfloat16_t)
 instantiate_kquant_q2_k_for_type(float16_t)
 
-// IQ codecs (decode-only): Phase D wires dequantize; matmul/gather/qmv follow.
-#define instantiate_kquant_iq_dequant_for_type(type)  \
-  instantiate_kquant_dequantize(type, 32, 4, iq4_nl)  \
-  instantiate_kquant_dequantize(type, 256, 4, iq4_xs) \
-  instantiate_kquant_dequantize(type, 256, 3, iq3_s)  \
+// IQ codecs are decode-only (load community GGUFs); they ship ALU-only (no NAX)
+// and without verify_qmv (the small-batch path falls back to qmv, bit-exact).
+#define instantiate_kquant_iq4_nl_for_type(type)                     \
+  instantiate_kquant_batched(qmv_fast, type, 32, 4, 0, iq4_nl)       \
+  instantiate_kquant_batched(qmv_fast, type, 32, 4, 1, iq4_nl)       \
+  instantiate_kquant_batched(qmv,      type, 32, 4, 0, iq4_nl)       \
+  instantiate_kquant_batched(qmv,      type, 32, 4, 1, iq4_nl)       \
+  instantiate_kquant_qmm_t(type, 32, 4, true, 0, iq4_nl)             \
+  instantiate_kquant_qmm_t(type, 32, 4, true, 1, iq4_nl)             \
+  instantiate_kquant_qmm_t(type, 32, 4, false, 0, iq4_nl)            \
+  instantiate_kquant_qmm_t(type, 32, 4, false, 1, iq4_nl)            \
+  instantiate_kquant_qmm_t_splitk(type, 32, 4, true, iq4_nl)         \
+  instantiate_kquant_qmm_t_splitk(type, 32, 4, false, iq4_nl)        \
+  instantiate_kquant_qmm_n(type, 32, 4, 0, iq4_nl)                   \
+  instantiate_kquant_qmm_n(type, 32, 4, 1, iq4_nl)                   \
+  instantiate_kquant_gather_qmv(gather_qmv_fast, type, 32, 4, iq4_nl) \
+  instantiate_kquant_gather_qmv(gather_qmv,      type, 32, 4, iq4_nl) \
+  instantiate_kquant_gather_qmm_t(type, 32, 4, true, iq4_nl)         \
+  instantiate_kquant_gather_qmm_t(type, 32, 4, false, iq4_nl)        \
+  instantiate_kquant_gather_qmm_n(type, 32, 4, iq4_nl)               \
+  instantiate_kquant_dequantize(type, 32, 4, iq4_nl)
+
+instantiate_kquant_iq4_nl_for_type(float)
+instantiate_kquant_iq4_nl_for_type(bfloat16_t)
+instantiate_kquant_iq4_nl_for_type(float16_t)
+
+// IQ super-blocks: dequantize wired; matmul/gather/qmv land next.
+#define instantiate_kquant_iq_sb_dequant_for_type(type) \
+  instantiate_kquant_dequantize(type, 256, 4, iq4_xs)   \
+  instantiate_kquant_dequantize(type, 256, 3, iq3_s)    \
   instantiate_kquant_dequantize(type, 256, 3, iq3_xxs)
 
-instantiate_kquant_iq_dequant_for_type(float)
-instantiate_kquant_iq_dequant_for_type(bfloat16_t)
-instantiate_kquant_iq_dequant_for_type(float16_t)
+instantiate_kquant_iq_sb_dequant_for_type(float)
+instantiate_kquant_iq_sb_dequant_for_type(bfloat16_t)
+instantiate_kquant_iq_sb_dequant_for_type(float16_t)
     // clang-format on
