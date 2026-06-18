@@ -210,8 +210,6 @@ def test_cpu_gather_qmm_matches_reference():
 def test_cpu_vs_gpu_dequantize_bit_exact():
     """f32 dequant is a pure decode - CPU and GPU must produce identical bytes."""
     for codec, (gtype, _wpb, _bpb, _bits, is_kq) in CODECS.items():
-        if codec.startswith("iq"):
-            continue  # IQ Metal dequant lands in Phase D
         wire, _ref = _dense_wire_and_ref(codec, gtype, is_kq)
         assert wire is not None, f"{codec}: missing fixture - run gen_fixtures.py"
         w = mx.array(wire)

@@ -331,4 +331,15 @@ instantiate_kquant_q3_k_for_type(float16_t)
 instantiate_kquant_q2_k_for_type(float)
 instantiate_kquant_q2_k_for_type(bfloat16_t)
 instantiate_kquant_q2_k_for_type(float16_t)
+
+// IQ codecs (decode-only): Phase D wires dequantize; matmul/gather/qmv follow.
+#define instantiate_kquant_iq_dequant_for_type(type)  \
+  instantiate_kquant_dequantize(type, 32, 4, iq4_nl)  \
+  instantiate_kquant_dequantize(type, 256, 4, iq4_xs) \
+  instantiate_kquant_dequantize(type, 256, 3, iq3_s)  \
+  instantiate_kquant_dequantize(type, 256, 3, iq3_xxs)
+
+instantiate_kquant_iq_dequant_for_type(float)
+instantiate_kquant_iq_dequant_for_type(bfloat16_t)
+instantiate_kquant_iq_dequant_for_type(float16_t)
     // clang-format on

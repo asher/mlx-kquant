@@ -2002,3 +2002,42 @@ template <typename T, int group_size, int bits>
   static_assert(bits == 5, "Q5_0 kernel requires bits=5");
   kq_q5_0_dequantize_impl<T>(w, out, num_weights, gid);
 }
+
+// IQ4_NL: 18 bytes/32 weights. [fp16 d][uint8 qs[16]]. Non-linear LUT decode:
+// w[i] = d * kvalues_iq4nl[nibble] (low nibbles -> 0..15, high -> 16..31).
+
+MLX_MTL_CONST int KQ_IQ4_NL_GROUP = 32;
+MLX_MTL_CONST int KQ_IQ4_NL_BLOCK_BYTES = 18;
+MLX_MTL_CONST int KQ_IQ4_NL_QS_OFFSET = 2;
+
+template <typename T>
+METAL_FUNC void kq_iq4_nl_dequantize_impl(
+    const device uint8_t* w,
+    device T* out,
+    const constant uint& num_weights,
+    uint gid) {
+  if (gid >= num_weights) {
+    return;
+  }
+  const int block_id = gid / KQ_IQ4_NL_GROUP;
+  const int within = gid % KQ_IQ4_NL_GROUP;
+  const device uint8_t* block_addr = w + block_id * KQ_IQ4_NL_BLOCK_BYTES;
+  const float d = float(*(const device half*)(block_addr));
+  const device uint8_t* qs = block_addr + KQ_IQ4_NL_QS_OFFSET;
+  const int nib =
+      (within < 16) ? (int(qs[within]) & 0x0F) : (int(qs[within - 16]) >> 4);
+  out[gid] = T(d * float(kvalues_iq4nl[nib]));
+}
+
+template <typename T, int group_size, int bits>
+[[kernel]] void kq_iq4_nl_dequantize(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    device T* out,
+    const constant uint& num_weights,
+    uint gid [[thread_position_in_grid]]) {
+  static_assert(
+      group_size == KQ_IQ4_NL_GROUP, "IQ4_NL kernel requires group_size=32");
+  static_assert(bits == 4, "IQ4_NL kernel requires bits=4");
+  kq_iq4_nl_dequantize_impl<T>(w, out, num_weights, gid);
+}

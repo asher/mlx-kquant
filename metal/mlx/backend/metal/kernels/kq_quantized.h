@@ -4,6 +4,8 @@
 #include <metal_simdgroup>
 #include <metal_stdlib>
 
+#include "mlx/backend/metal/kernels/kq_quantized_iq_tables.h"
+
 using namespace metal;
 
 #define MLX_MTL_CONST static constant constexpr const
@@ -6121,6 +6123,162 @@ template <typename T, int group_size, int bits>
       group_size == KQ_Q2_K_SUPERBLOCK, "Q2_K kernel requires group_size=256");
   static_assert(bits == 2, "Q2_K kernel requires bits=2");
   kq_q2_k_dequantize_impl<T>(w, out, num_weights, gid);
+}
+
+// IQ4_XS: 136 bytes/256 weights. [fp16 d][u16 scales_h][u8
+// scales_l[4]][qs[128]]. Symmetric (no min), signed 6-bit per-32 scale (ls -
+// 32), kvalues LUT.
+
+MLX_MTL_CONST int KQ_IQ4_XS_SUPERBLOCK = 256;
+MLX_MTL_CONST int KQ_IQ4_XS_BLOCK_BYTES = 136;
+MLX_MTL_CONST int KQ_IQ4_XS_SCALESL_OFFSET = 4;
+MLX_MTL_CONST int KQ_IQ4_XS_QS_OFFSET = 8;
+
+template <typename T>
+METAL_FUNC void kq_iq4_xs_dequantize_impl(
+    const device uint8_t* w,
+    device T* out,
+    const constant uint& num_weights,
+    uint gid) {
+  if (gid >= num_weights) {
+    return;
+  }
+  const int sb_id = gid / KQ_IQ4_XS_SUPERBLOCK;
+  const int within = gid - sb_id * KQ_IQ4_XS_SUPERBLOCK;
+  const int ib = within / 32;
+  const int j = within % 32;
+  const device uint8_t* sb = w + sb_id * KQ_IQ4_XS_BLOCK_BYTES;
+  const float d = float(*(const device half*)sb);
+  const uint16_t scales_h = uint16_t(sb[2]) | (uint16_t(sb[3]) << 8);
+  const device uint8_t* scales_l = sb + KQ_IQ4_XS_SCALESL_OFFSET;
+  const int ls = ((scales_l[ib / 2] >> (4 * (ib & 1))) & 0xf) |
+      (((scales_h >> (2 * ib)) & 3) << 4);
+  const float dl = d * float(ls - 32);
+  const device uint8_t* qs = sb + KQ_IQ4_XS_QS_OFFSET + ib * 16;
+  const int nib = (j < 16) ? (int(qs[j]) & 0xf) : (int(qs[j - 16]) >> 4);
+  out[gid] = T(dl * float(kvalues_iq4nl[nib]));
+}
+
+template <typename T, int group_size, int bits>
+[[kernel]] void kq_iq4_xs_dequantize(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    device T* out,
+    const constant uint& num_weights,
+    uint gid [[thread_position_in_grid]]) {
+  static_assert(
+      group_size == KQ_IQ4_XS_SUPERBLOCK, "IQ4_XS kernel requires gs=256");
+  static_assert(bits == 4, "IQ4_XS kernel requires bits=4");
+  kq_iq4_xs_dequantize_impl<T>(w, out, num_weights, gid);
+}
+
+// IQ3_XXS: 98 bytes/256 weights. [fp16 d][qs[64] grid idx][gas[32]]. Each ib32
+// gas u32 holds the 4 sign indices (low 28 bits, via ksigns LUT) + a top-4-bit
+// scale. The *0.5 is folded into the block scale on this (dequant) path.
+
+MLX_MTL_CONST int KQ_IQ3_XXS_SUPERBLOCK = 256;
+MLX_MTL_CONST int KQ_IQ3_XXS_BLOCK_BYTES = 98;
+MLX_MTL_CONST int KQ_IQ3_XXS_QS_OFFSET = 2;
+MLX_MTL_CONST int KQ_IQ3_XXS_GAS_OFFSET = 66;
+
+template <typename T>
+METAL_FUNC void kq_iq3_xxs_dequantize_impl(
+    const device uint8_t* w,
+    device T* out,
+    const constant uint& num_weights,
+    uint gid) {
+  if (gid >= num_weights) {
+    return;
+  }
+  const int sb_id = gid / KQ_IQ3_XXS_SUPERBLOCK;
+  const int within = gid - sb_id * KQ_IQ3_XXS_SUPERBLOCK;
+  const int ib32 = within / 32;
+  const int p = within % 32;
+  const int l = p / 8;
+  const int sub = p % 8;
+  const device uint8_t* sb = w + sb_id * KQ_IQ3_XXS_BLOCK_BYTES;
+  const float d = float(*(const device half*)sb);
+  const device uint8_t* qs = sb + KQ_IQ3_XXS_QS_OFFSET + ib32 * 8;
+  const device uint8_t* gas = sb + KQ_IQ3_XXS_GAS_OFFSET + ib32 * 4;
+  const uint32_t aux32 = uint32_t(gas[0]) | (uint32_t(gas[1]) << 8) |
+      (uint32_t(gas[2]) << 16) | (uint32_t(gas[3]) << 24);
+  const float db = d * (0.5f + float(aux32 >> 28)) * 0.5f;
+  const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+  const int qi = (sub < 4) ? int(qs[2 * l]) : int(qs[2 * l + 1]);
+  const int bytej = (sub < 4) ? sub : (sub - 4);
+  const uint8_t gb = (iq3xxs_grid[qi] >> (8 * bytej)) & 0xff;
+  const float sgn = (signs & kmask_iq2xs[sub]) ? -1.0f : 1.0f;
+  out[gid] = T(db * float(gb) * sgn);
+}
+
+template <typename T, int group_size, int bits>
+[[kernel]] void kq_iq3_xxs_dequantize(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    device T* out,
+    const constant uint& num_weights,
+    uint gid [[thread_position_in_grid]]) {
+  static_assert(
+      group_size == KQ_IQ3_XXS_SUPERBLOCK, "IQ3_XXS kernel requires gs=256");
+  static_assert(bits == 3, "IQ3_XXS kernel requires bits=3");
+  kq_iq3_xxs_dequantize_impl<T>(w, out, num_weights, gid);
+}
+
+// IQ3_S: 110 bytes/256 weights. [fp16 d][qs[64]][qh[8]][signs[32]][scales[4]].
+// 9-bit grid index (qs low 8 + qh bit 8), signs from block bytes, 4-bit scale
+// -> 2*s+1. No min.
+
+MLX_MTL_CONST int KQ_IQ3_S_SUPERBLOCK = 256;
+MLX_MTL_CONST int KQ_IQ3_S_BLOCK_BYTES = 110;
+MLX_MTL_CONST int KQ_IQ3_S_QS_OFFSET = 2;
+MLX_MTL_CONST int KQ_IQ3_S_QH_OFFSET = 66;
+MLX_MTL_CONST int KQ_IQ3_S_SIGNS_OFFSET = 74;
+MLX_MTL_CONST int KQ_IQ3_S_SCALES_OFFSET = 106;
+
+template <typename T>
+METAL_FUNC void kq_iq3_s_dequantize_impl(
+    const device uint8_t* w,
+    device T* out,
+    const constant uint& num_weights,
+    uint gid) {
+  if (gid >= num_weights) {
+    return;
+  }
+  const int sb_id = gid / KQ_IQ3_S_SUPERBLOCK;
+  const int within = gid - sb_id * KQ_IQ3_S_SUPERBLOCK;
+  const int s = within / 32;
+  const int p = within % 32;
+  const int l = p / 8;
+  const int sub = p % 8;
+  const device uint8_t* sb = w + sb_id * KQ_IQ3_S_BLOCK_BYTES;
+  const float d = float(*(const device half*)sb);
+  const device uint8_t* qs = sb + KQ_IQ3_S_QS_OFFSET + s * 8;
+  const device uint8_t* qh = sb + KQ_IQ3_S_QH_OFFSET;
+  const device uint8_t* signs = sb + KQ_IQ3_S_SIGNS_OFFSET + s * 4;
+  const device uint8_t* scales = sb + KQ_IQ3_S_SCALES_OFFSET;
+  const int sc_nib = (scales[s / 2] >> (4 * (s & 1))) & 0xf;
+  const float db = d * float(1 + 2 * sc_nib);
+  const int qhbit = (sub < 4) ? ((int(qh[s]) << (8 - 2 * l)) & 256)
+                              : ((int(qh[s]) << (7 - 2 * l)) & 256);
+  const int qi =
+      (sub < 4) ? (int(qs[2 * l]) | qhbit) : (int(qs[2 * l + 1]) | qhbit);
+  const int bytej = (sub < 4) ? sub : (sub - 4);
+  const uint8_t gb = (iq3s_grid[qi] >> (8 * bytej)) & 0xff;
+  const float sgn = (signs[l] & kmask_iq2xs[sub]) ? -1.0f : 1.0f;
+  out[gid] = T(db * float(gb) * sgn);
+}
+
+template <typename T, int group_size, int bits>
+[[kernel]] void kq_iq3_s_dequantize(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    device T* out,
+    const constant uint& num_weights,
+    uint gid [[thread_position_in_grid]]) {
+  static_assert(
+      group_size == KQ_IQ3_S_SUPERBLOCK, "IQ3_S kernel requires gs=256");
+  static_assert(bits == 3, "IQ3_S kernel requires bits=3");
+  kq_iq3_s_dequantize_impl<T>(w, out, num_weights, gid);
 }
 
 #define KQUANT_DEFINE_GATHER_KERNELS(CODEC, LOADER)                   \
