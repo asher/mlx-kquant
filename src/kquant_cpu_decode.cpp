@@ -25,6 +25,7 @@
 
 #include "kquant_codec.h"
 #include "kquant_cpu_neon.h"
+#include "kquant_iq_tables.h"
 
 #include "mlx/types/half_types.h" // float16_t, bfloat16_t
 
@@ -374,6 +375,139 @@ void dequantize_q2_k(const uint8_t* w, T* out, std::size_t num_weights) {
   }
 }
 
+// IQ codecs (load-only): grid/LUT decode, signs read from a packed table.
+// Float-op order mirrors ggml dequantize_row_iq* so f32 output is bit-exact.
+
+template <typename T>
+void dequantize_iq4_nl(const uint8_t* w, T* out, std::size_t num_weights) {
+  constexpr int block_weights = 32;
+  constexpr int block_bytes = 18;
+  std::size_t num_blocks = num_weights / block_weights;
+  for (std::size_t b = 0; b < num_blocks; b++) {
+    const uint8_t* block = w + b * block_bytes;
+    float d = read_f16(block);
+    const uint8_t* qs = block + 2;
+    T* dst = out + b * block_weights;
+    for (int j = 0; j < 16; j++) {
+      dst[j] = static_cast<T>(d * kvalues_iq4nl[qs[j] & 0xf]);
+      dst[j + 16] = static_cast<T>(d * kvalues_iq4nl[qs[j] >> 4]);
+    }
+  }
+}
+
+template <typename T>
+void dequantize_iq4_xs(const uint8_t* w, T* out, std::size_t num_weights) {
+  constexpr int block_weights = 256;
+  constexpr int block_bytes = 136;
+  std::size_t num_blocks = num_weights / block_weights;
+  for (std::size_t b = 0; b < num_blocks; b++) {
+    const uint8_t* block = w + b * block_bytes;
+    float d = read_f16(block);
+    uint16_t scales_h;
+    std::memcpy(&scales_h, block + 2, sizeof(uint16_t));
+    const uint8_t* scales_l = block + 4;
+    const uint8_t* qs = block + 8;
+    T* dst = out + b * block_weights;
+    for (int ib = 0; ib < 8; ib++) {
+      int ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) |
+          (((scales_h >> (2 * ib)) & 3) << 4);
+      float dl = d * (ls - 32);
+      const uint8_t* q = qs + ib * 16;
+      T* o = dst + ib * 32;
+      for (int j = 0; j < 16; j++) {
+        o[j] = static_cast<T>(dl * kvalues_iq4nl[q[j] & 0xf]);
+        o[j + 16] = static_cast<T>(dl * kvalues_iq4nl[q[j] >> 4]);
+      }
+    }
+  }
+}
+
+template <typename T>
+void dequantize_iq3_xxs(const uint8_t* w, T* out, std::size_t num_weights) {
+  constexpr int block_weights = 256;
+  constexpr int block_bytes = 98;
+  std::size_t num_blocks = num_weights / block_weights;
+  for (std::size_t b = 0; b < num_blocks; b++) {
+    const uint8_t* block = w + b * block_bytes;
+    float d = read_f16(block);
+    const uint8_t* qs = block + 2;
+    const uint8_t* gas = block + 2 + 64; // scales+signs, interleaved per ib32
+    T* dst = out + b * block_weights;
+    for (int ib32 = 0; ib32 < 8; ib32++) {
+      uint32_t aux32;
+      std::memcpy(&aux32, gas + 4 * ib32, sizeof(uint32_t));
+      float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+      const uint8_t* q = qs + ib32 * 8;
+      T* o = dst + ib32 * 32;
+      for (int l = 0; l < 4; l++) {
+        uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+        const uint8_t* g1 =
+            reinterpret_cast<const uint8_t*>(iq3xxs_grid + q[2 * l + 0]);
+        const uint8_t* g2 =
+            reinterpret_cast<const uint8_t*>(iq3xxs_grid + q[2 * l + 1]);
+        for (int j = 0; j < 4; j++) {
+          o[j + 0] = static_cast<T>(
+              db * g1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f));
+          o[j + 4] = static_cast<T>(
+              db * g2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f));
+        }
+        o += 8;
+      }
+    }
+  }
+}
+
+template <typename T>
+void dequantize_iq3_s(const uint8_t* w, T* out, std::size_t num_weights) {
+  constexpr int block_weights = 256;
+  constexpr int block_bytes = 110;
+  std::size_t num_blocks = num_weights / block_weights;
+  for (std::size_t b = 0; b < num_blocks; b++) {
+    const uint8_t* block = w + b * block_bytes;
+    float d = read_f16(block);
+    const uint8_t* qs = block + 2;
+    const uint8_t* qh = block + 66;
+    const uint8_t* signs = block + 74;
+    const uint8_t* scales = block + 106;
+    T* y = out + b * block_weights;
+    for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+      float db1 = d * (1 + 2 * (scales[ib32 / 2] & 0xf));
+      float db2 = d * (1 + 2 * (scales[ib32 / 2] >> 4));
+      for (int l = 0; l < 4; l++) {
+        const uint8_t* g1 = reinterpret_cast<const uint8_t*>(
+            iq3s_grid + (qs[2 * l + 0] | ((qh[0] << (8 - 2 * l)) & 256)));
+        const uint8_t* g2 = reinterpret_cast<const uint8_t*>(
+            iq3s_grid + (qs[2 * l + 1] | ((qh[0] << (7 - 2 * l)) & 256)));
+        for (int j = 0; j < 4; j++) {
+          y[j + 0] = static_cast<T>(
+              db1 * g1[j] * (signs[l] & kmask_iq2xs[j + 0] ? -1.f : 1.f));
+          y[j + 4] = static_cast<T>(
+              db1 * g2[j] * (signs[l] & kmask_iq2xs[j + 4] ? -1.f : 1.f));
+        }
+        y += 8;
+      }
+      qs += 8;
+      signs += 4;
+      for (int l = 0; l < 4; l++) {
+        const uint8_t* g1 = reinterpret_cast<const uint8_t*>(
+            iq3s_grid + (qs[2 * l + 0] | ((qh[1] << (8 - 2 * l)) & 256)));
+        const uint8_t* g2 = reinterpret_cast<const uint8_t*>(
+            iq3s_grid + (qs[2 * l + 1] | ((qh[1] << (7 - 2 * l)) & 256)));
+        for (int j = 0; j < 4; j++) {
+          y[j + 0] = static_cast<T>(
+              db2 * g1[j] * (signs[l] & kmask_iq2xs[j + 0] ? -1.f : 1.f));
+          y[j + 4] = static_cast<T>(
+              db2 * g2[j] * (signs[l] & kmask_iq2xs[j + 4] ? -1.f : 1.f));
+        }
+        y += 8;
+      }
+      qh += 2;
+      qs += 8;
+      signs += 4;
+    }
+  }
+}
+
 // --------------------------------------------------------------------------
 // Shared CPU worker pool
 // --------------------------------------------------------------------------
@@ -618,6 +752,14 @@ DequantFnF32 dequant_fn_f32(const std::string& t) {
     return &dequantize_q3_k<float>;
   } else if (t == "q2_k") {
     return &dequantize_q2_k<float>;
+  } else if (t == "iq4_nl") {
+    return &dequantize_iq4_nl<float>;
+  } else if (t == "iq4_xs") {
+    return &dequantize_iq4_xs<float>;
+  } else if (t == "iq3_s") {
+    return &dequantize_iq3_s<float>;
+  } else if (t == "iq3_xxs") {
+    return &dequantize_iq3_xxs<float>;
   }
   return nullptr;
 }
@@ -776,6 +918,14 @@ void kquant_dequantize_dispatch(
     dequantize_q3_k(w, out, num_weights);
   } else if (kquant_type == "q2_k") {
     dequantize_q2_k(w, out, num_weights);
+  } else if (kquant_type == "iq4_nl") {
+    dequantize_iq4_nl(w, out, num_weights);
+  } else if (kquant_type == "iq4_xs") {
+    dequantize_iq4_xs(w, out, num_weights);
+  } else if (kquant_type == "iq3_s") {
+    dequantize_iq3_s(w, out, num_weights);
+  } else if (kquant_type == "iq3_xxs") {
+    dequantize_iq3_xxs(w, out, num_weights);
   } else {
     throw std::runtime_error(
         "[mlx_kquant] dequantize: unsupported codec: " + kquant_type);

@@ -40,9 +40,9 @@ def _parse_readme_table() -> dict[str, tuple[int, int, int]]:
     """Return ``codec -> (block, bits, bytes_per_block)`` from the README table."""
     text = (REPO / "README.md").read_text()
     out: dict[str, tuple[int, int, int]] = {}
-    # Rows look like: | q2_k  | 256 | 2 |  84 | K-quant superblock |
+    # Rows look like: | q2_k  | 256 | 2 |  84 | K-quant superblock | (and iq*).
     row = re.compile(
-        r"^\|\s*(q\d[\w]*)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|",
+        r"^\|\s*(i?q\d[\w]*)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|",
         re.MULTILINE,
     )
     for m in row.finditer(text):

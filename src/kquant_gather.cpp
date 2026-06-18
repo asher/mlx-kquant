@@ -135,7 +135,7 @@ void gather_qmm(
     const std::string& kquant_type) {
   // enable_tf32 dropped (always short-circuited; op promotes f32 x -> bf16).
   if (kq_is_nax_available() && transpose && (K % 64 == 0) &&
-      (x.dtype() != mx::float32) && codec_has_matmul(kquant_type)) {
+      (x.dtype() != mx::float32) && codec_has_nax(kquant_type)) {
     return gather_qmm_nax(
         x,
         w,
@@ -727,7 +727,7 @@ void KQuantGatherQMM::eval_gpu(
   // The SwitchGLU sort path satisfies all of this; any case that does not falls
   // through to the (correct, slower) gather_qmv / gather_qmm leaves below.
   bool kquant_rhs_ok = kq_is_nax_available() && transpose_ && (K % 64 == 0) &&
-      (x.dtype() != mx::float32) && codec_has_matmul(kquant_type_);
+      (x.dtype() != mx::float32) && codec_has_nax(kquant_type_);
   if (M == 1 && B >= 16 && right_sorted_ && (B / E >= 4) && kquant_rhs_ok &&
       x.flags().row_contiguous && rhs_indices.flags().row_contiguous &&
       (x.size() / K == static_cast<size_t>(B))) {

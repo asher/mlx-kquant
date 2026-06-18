@@ -96,7 +96,7 @@ std::optional<mx::array> try_zero_copy_array(
   return mx::reshape(view, shape);
 }
 
-// Map a GGUF tensor type to one of the extension's 10 K-quant codecs, or
+// Map a GGUF tensor type to one of the extension's supported codecs, or
 // nullptr for non-quantized / unsupported types.
 const KQuantCodec* gguf_type_to_kquant_codec(uint32_t t) {
   switch (t) {
@@ -120,6 +120,14 @@ const KQuantCodec* gguf_type_to_kquant_codec(uint32_t t) {
       return codec_by_name("q5_k");
     case GGUF_TYPE_Q6_K:
       return codec_by_name("q6_k");
+    case GGUF_TYPE_IQ4_NL:
+      return codec_by_name("iq4_nl");
+    case GGUF_TYPE_IQ4_XS:
+      return codec_by_name("iq4_xs");
+    case GGUF_TYPE_IQ3_S:
+      return codec_by_name("iq3_s");
+    case GGUF_TYPE_IQ3_XXS:
+      return codec_by_name("iq3_xxs");
     default:
       return nullptr;
   }

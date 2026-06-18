@@ -70,6 +70,13 @@ inline bool codec_has_matmul(const std::string& kquant_type) {
   return codec != nullptr && codec->has_matmul_kernel;
 }
 
+// Gates the NAX (tensor-core) dispatch. IQ codecs ship ALU-only, so this is
+// false for them and their qmm/gather route to the ALU kernels.
+inline bool codec_has_nax(const std::string& kquant_type) {
+  const KQuantCodec* codec = codec_by_name(kquant_type);
+  return codec != nullptr && codec->has_nax_kernel;
+}
+
 // Codecs with a verify_qmv kernel (the small-M weight-read-amortizing leaf).
 // Kept as an explicit allow-list so the dispatch only routes to a kernel that
 // was actually instantiated in kq_quantized.metal; new codecs are added here

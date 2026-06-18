@@ -11,7 +11,8 @@ Two layers:
 
 - **Ops** (C++/Metal) - a `kq.*` namespace (`dequantize`, `quantized_matmul`, `gather_qmm`,
   `quantize`) backed by Metal kernels compiled to a `.metallib` at build time (no runtime JIT). All
-  ten codecs: `q2_k, q3_k, q4_k, q5_k, q6_k` and `q4_0, q4_1, q5_0, q5_1, q8_0`.
+  ten K-quant/legacy codecs: `q2_k, q3_k, q4_k, q5_k, q6_k` and `q4_0, q4_1, q5_0, q5_1, q8_0`, plus
+  four decode-only IQ codecs (`iq4_nl, iq4_xs, iq3_s, iq3_xxs`) for loading community GGUFs.
 - **Tooling** (Python) - `mlx-kquant quantize / run / chat / lora / fuse` (plus `verify`, `inspect`,
   `calibrate-imatrix`) and a `loader` that create and run K-quant checkpoints in **MLX-native
   safetensors** format.
@@ -236,7 +237,8 @@ per-row `qmv` path (see [Environment variables](#environment-variables)).
 - **Codec registry** derives `group_size`/`bits` from the codec name, so callers pass only
   `kquant_type`.
 - **CPU and GPU execution.** Every op - the decode ops (`dequantize` / `quantized_matmul` /
-  `gather_qmm`) and `quantize` (encode) - runs on either stream, covering all 10 codecs, so the full
+  `gather_qmm`) and `quantize` (encode) - runs on either stream, covering all ten encodable codecs (plus
+  IQ decode), so the full
   quantize/decode pipeline (and the op tests) runs in CI without a GPU. The per-block `dequantize` is
   a scalar, bit-exact (per-codec, vs the `gguf.quants` reference quantizer) decoder. The CPU **matmul**
   and **gather** are tuned for Apple Silicon: a shared worker pool over output rows, NEON int8
@@ -299,6 +301,10 @@ are informed by our analysis of the mixed-precision quants that [Unsloth][unslot
 | q5_0  |  32 | 5 |  22 | block scale |
 | q5_1  |  32 | 5 |  24 | block scale + min |
 | q8_0  |  32 | 8 |  34 | block scale |
+| iq4_nl  |  32 | 4 |  18 | non-linear LUT (decode-only) |
+| iq4_xs  | 256 | 4 | 136 | LUT superblock (decode-only) |
+| iq3_s   | 256 | 3 | 110 | grid + signs (decode-only) |
+| iq3_xxs | 256 | 3 |  98 | grid + gas words (decode-only) |
 
 ## Version pinning
 
@@ -325,7 +331,8 @@ python -m pytest tests/
 ## Limitations
 
 - **GPU path is Apple-Silicon Metal only.** No ROCm or CUDA support. Every op also has a CPU path
-  (`stream=mx.cpu`) covering all 10 codecs, so the extension still builds and runs without Metal (see
+  (`stream=mx.cpu`) — decode for all fourteen codecs, encode for the ten encodable — so the extension
+  still builds and runs without Metal (see
   [How it works](#how-it-works) and [Install](#install)).
 - **Linux model forwards need `MLX_DISABLE_COMPILE=1`.** Stock MLX's CPU compile JIT generates C++
   that redeclares GCC's built-in `_Float32`/`_Float64`/`_Float128` types, which `g++` rejects, so any

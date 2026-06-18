@@ -24,16 +24,29 @@ CODEC_GEOMETRY: dict[str, tuple[int, int, int, int]] = {
     "q6_k": (256, 6, 210, 256),
     "q3_k": (256, 3, 110, 256),
     "q2_k": (256, 2, 84, 256),
+    # IQ codecs: grid/LUT decode, load-only (see DECODE_ONLY_CODECS). iq4_nl is
+    # flat-32 like the legacy codecs; the rest are 256-weight superblocks.
+    "iq4_nl": (32, 4, 18, 32),
+    "iq4_xs": (256, 4, 136, 256),
+    "iq3_s": (256, 3, 110, 256),
+    "iq3_xxs": (256, 3, 98, 256),
 }
 
-# Every codec the ``kq.quantize`` encoder can produce. The extension encodes all
-# ten on CPU or Metal; the four legacy block codecs + q8_0 ignore an imatrix.
-ENCODER_CODECS: frozenset[str] = frozenset(CODEC_GEOMETRY)
+# IQ codecs load community GGUFs but have no encoder (their rounding needs a
+# search + imatrix the extension doesn't implement); excluded from the encoder
+# and imatrix sets below.
+DECODE_ONLY_CODECS: frozenset[str] = frozenset({"iq4_nl", "iq4_xs", "iq3_s", "iq3_xxs"})
 
-# Only the K-quant superblocks have an importance-weighted rounding path, so an
-# imatrix changes their wire bytes; for everything else it is a no-op.
+# Every codec the ``kq.quantize`` encoder can produce: the ten K-quant/legacy
+# codecs on CPU or Metal (the four legacy block codecs + q8_0 ignore an imatrix).
+ENCODER_CODECS: frozenset[str] = frozenset(CODEC_GEOMETRY) - DECODE_ONLY_CODECS
+
+# Only the encodable K-quant superblocks have an importance-weighted rounding
+# path, so an imatrix changes their wire bytes; for everything else it is a no-op.
 IMATRIX_CODECS: frozenset[str] = frozenset(
-    name for name, (_, _, _, wpb) in CODEC_GEOMETRY.items() if wpb == 256
+    name
+    for name, (_, _, _, wpb) in CODEC_GEOMETRY.items()
+    if wpb == 256 and name not in DECODE_ONLY_CODECS
 )
 
 

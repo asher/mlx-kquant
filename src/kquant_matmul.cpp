@@ -125,7 +125,7 @@ void qmm(
   // so x.dtype() is never float32 here and the NAX path stays eligible on the
   // dtype axis with no tf32 gate.
   if (kq_is_nax_available() && transpose && (K % 64 == 0) &&
-      (x.dtype() != mx::float32) && codec_has_matmul(kquant_type)) {
+      (x.dtype() != mx::float32) && codec_has_nax(kquant_type)) {
     return qmm_nax(
         x,
         w,
