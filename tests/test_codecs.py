@@ -48,6 +48,9 @@ CODECS = {
     "iq4_xs": (GT.IQ4_XS, 256, 136, 4, False),
     "iq3_s": (GT.IQ3_S, 256, 110, 3, False),
     "iq3_xxs": (GT.IQ3_XXS, 256, 98, 3, False),
+    "iq2_xxs": (GT.IQ2_XXS, 256, 66, 2, False),
+    "iq2_xs": (GT.IQ2_XS, 256, 74, 2, False),
+    "iq2_s": (GT.IQ2_S, 256, 82, 2, False),
 }
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
