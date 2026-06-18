@@ -45,6 +45,8 @@ CODECS = {
     "iq2_xxs": GT.IQ2_XXS,
     "iq2_xs": GT.IQ2_XS,
     "iq2_s": GT.IQ2_S,
+    "iq1_s": GT.IQ1_S,
+    "iq1_m": GT.IQ1_M,
 }
 
 # IQ codecs are decode-only (gguf-py can't encode them): (weights_per_block,
@@ -58,13 +60,24 @@ IQ_GEOM = {
     "iq2_xxs": (256, 66),
     "iq2_xs": (256, 74),
     "iq2_s": (256, 82),
+    "iq1_s": (256, 50),
+    "iq1_m": (256, 56),
 }
 
 
 def _synth_iq_wire(rng, bpb, n_blocks):
     wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
     d = rng.uniform(0.02, 0.08, n_blocks).astype(np.float16)
-    wire[:, 0:2] = d.view(np.uint8).reshape(n_blocks, 2)
+    if bpb == 56:
+        # IQ1_M has no super-block d; the fp16 scale is rebuilt from the top
+        # nibbles of the four uint16 scale words (bytes 49/51/53/55). Seed those
+        # nibbles so the reconstructed scale is a sane (non-NaN) fp16.
+        dbits = d.view(np.uint16)
+        for k, byteidx in enumerate((49, 51, 53, 55)):
+            nib = ((dbits >> (4 * k)) & 0xF).astype(np.uint8)
+            wire[:, byteidx] = (wire[:, byteidx] & 0x0F) | (nib << 4)
+    else:
+        wire[:, 0:2] = d.view(np.uint8).reshape(n_blocks, 2)
     return wire
 
 

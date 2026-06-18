@@ -1202,6 +1202,141 @@ float vec_dot_iq2_s(const uint8_t* w, const void* act, int nb) {
   return 0.125f * sumf;
 }
 
+// IQ1_S / IQ1_M: signed grid with a +/-0.125 delta added to every grid value.
+// The grid.act term is the usual int8 vdot; the delta term factors out as
+// delta * scale * sum(act), folded via the q8_K block-sums (IQ1_S) or a +/-1
+// delta-vector dot (IQ1_M). The shared |delta| = 0.125 is applied once at the
+// end. IQ1_M has no super-block d -- it is rebuilt from four scattered nibbles.
+float vec_dot_iq1_s(const uint8_t* w, const void* act, int nb) {
+  const ActQ8K* y = static_cast<const ActQ8K*>(act);
+  const int32x4_t mzero = vdupq_n_s32(0);
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    const uint8_t* xb = w + static_cast<std::size_t>(i) * 50;
+    const float d = read_f16(xb) * y[i].d;
+    const uint8_t* qs = xb + 2;
+    const uint16_t* qh = reinterpret_cast<const uint16_t*>(xb + 34);
+    const int8_t* q8 = y[i].qs;
+    const int16_t* bsums = y[i].bsums;
+    int sumi1 = 0, sumi2 = 0, sumi3 = 0;
+    for (int ib = 0; ib < 8; ib += 2) {
+      const int8x16_t q8b0 = vld1q_s8(q8);
+      const int8x16_t q8b1 = vld1q_s8(q8 + 16);
+      const int8x16_t q8b2 = vld1q_s8(q8 + 32);
+      const int8x16_t q8b3 = vld1q_s8(q8 + 48);
+      q8 += 64;
+      int8x16_t g0 = grid8(
+          iq1s_grid,
+          qs[0] | ((qh[ib + 0] << 8) & 0x700),
+          qs[1] | ((qh[ib + 0] << 5) & 0x700));
+      int8x16_t g1 = grid8(
+          iq1s_grid,
+          qs[2] | ((qh[ib + 0] << 2) & 0x700),
+          qs[3] | ((qh[ib + 0] >> 1) & 0x700));
+      int8x16_t g2 = grid8(
+          iq1s_grid,
+          qs[4] | ((qh[ib + 1] << 8) & 0x700),
+          qs[5] | ((qh[ib + 1] << 5) & 0x700));
+      int8x16_t g3 = grid8(
+          iq1s_grid,
+          qs[6] | ((qh[ib + 1] << 2) & 0x700),
+          qs[7] | ((qh[ib + 1] >> 1) & 0x700));
+      qs += 8;
+      const int32x4_t p1 = vdotq_s32(vdotq_s32(mzero, g0, q8b0), g1, q8b1);
+      const int32x4_t p2 = vdotq_s32(vdotq_s32(mzero, g2, q8b2), g3, q8b3);
+      const int ls1 = 2 * ((qh[ib + 0] >> 12) & 7) + 1;
+      const int ls2 = 2 * ((qh[ib + 1] >> 12) & 7) + 1;
+      sumi1 += vaddvq_s32(p1) * ls1;
+      sumi2 += vaddvq_s32(p2) * ls2;
+      sumi3 += (bsums[2 * ib + 0] + bsums[2 * ib + 1]) * ls1 *
+              ((qh[ib + 0] & 0x8000) ? -1 : 1) +
+          (bsums[2 * ib + 2] + bsums[2 * ib + 3]) * ls2 *
+              ((qh[ib + 1] & 0x8000) ? -1 : 1);
+    }
+    sumf += d * (sumi1 + sumi2 + 0.125f * sumi3);
+  }
+  return sumf;
+}
+
+float vec_dot_iq1_m(const uint8_t* w, const void* act, int nb) {
+  const ActQ8K* y = static_cast<const ActQ8K*>(act);
+  const int32x4_t mask = vdupq_n_s32(0x7);
+  const int32x4_t mone = vdupq_n_s32(1);
+  const int32x4_t mzero = vdupq_n_s32(0);
+  int8x16x4_t deltas;
+  deltas.val[0] = vcombine_s8(vdup_n_s8(+1), vdup_n_s8(+1));
+  deltas.val[1] = vcombine_s8(vdup_n_s8(-1), vdup_n_s8(+1));
+  deltas.val[2] = vcombine_s8(vdup_n_s8(+1), vdup_n_s8(-1));
+  deltas.val[3] = vcombine_s8(vdup_n_s8(-1), vdup_n_s8(-1));
+  uint32_t aux32;
+  const uint8_t* aux8 = reinterpret_cast<const uint8_t*>(&aux32);
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    const uint8_t* xb = w + static_cast<std::size_t>(i) * 56;
+    const uint8_t* qs = xb;
+    const uint8_t* qh = xb + 32;
+    const uint16_t* sc = reinterpret_cast<const uint16_t*>(xb + 48);
+    uint16_t scale_u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+        ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+    const float d =
+        read_f16(reinterpret_cast<const uint8_t*>(&scale_u16)) * y[i].d;
+    const int8_t* q8 = y[i].qs;
+    int32x4_t sumi1 = mzero;
+    int32x4_t sumi2 = mzero;
+    for (int ib = 0; ib < 8; ib += 2) {
+      const int8x16_t q8b0 = vld1q_s8(q8);
+      const int8x16_t q8b1 = vld1q_s8(q8 + 16);
+      const int8x16_t q8b2 = vld1q_s8(q8 + 32);
+      const int8x16_t q8b3 = vld1q_s8(q8 + 48);
+      q8 += 64;
+      int8x16_t g0 = grid8(
+          iq1s_grid,
+          qs[0] | ((qh[0] << 8) & 0x700),
+          qs[1] | ((qh[0] << 4) & 0x700));
+      int8x16_t g1 = grid8(
+          iq1s_grid,
+          qs[2] | ((qh[1] << 8) & 0x700),
+          qs[3] | ((qh[1] << 4) & 0x700));
+      int8x16_t g2 = grid8(
+          iq1s_grid,
+          qs[4] | ((qh[2] << 8) & 0x700),
+          qs[5] | ((qh[2] << 4) & 0x700));
+      int8x16_t g3 = grid8(
+          iq1s_grid,
+          qs[6] | ((qh[3] << 8) & 0x700),
+          qs[7] | ((qh[3] << 4) & 0x700));
+      const int32x4_t p1 =
+          vpaddq_s32(vdotq_s32(mzero, g0, q8b0), vdotq_s32(mzero, g1, q8b1));
+      const int32x4_t p2 =
+          vpaddq_s32(vdotq_s32(mzero, g2, q8b2), vdotq_s32(mzero, g3, q8b3));
+      const int32x4_t p12 = vpaddq_s32(p1, p2);
+      uint32_t qh32;
+      std::memcpy(&qh32, qh, sizeof(uint32_t));
+      aux32 = ((qh32 >> 3) & 0x01010101) | ((qh32 >> 6) & 0x02020202);
+      const int32x4_t p3 = vpaddq_s32(
+          vdotq_s32(mzero, deltas.val[aux8[0]], q8b0),
+          vdotq_s32(mzero, deltas.val[aux8[1]], q8b1));
+      const int32x4_t p4 = vpaddq_s32(
+          vdotq_s32(mzero, deltas.val[aux8[2]], q8b2),
+          vdotq_s32(mzero, deltas.val[aux8[3]], q8b3));
+      const int32x4_t p34 = vpaddq_s32(p3, p4);
+      const int32_t s4[4] = {
+          static_cast<int32_t>(sc[ib / 2] >> 0),
+          static_cast<int32_t>(sc[ib / 2] >> 3),
+          static_cast<int32_t>(sc[ib / 2] >> 6),
+          static_cast<int32_t>(sc[ib / 2] >> 9)};
+      int32x4_t scales_4 = vld1q_s32(s4);
+      scales_4 = vaddq_s32(vshlq_n_s32(vandq_s32(scales_4, mask), 1), mone);
+      sumi1 = vmlaq_s32(sumi1, scales_4, p12);
+      sumi2 = vmlaq_s32(sumi2, scales_4, p34);
+      qs += 8;
+      qh += 4;
+    }
+    sumf += d * (vaddvq_s32(sumi1) + 0.125f * vaddvq_s32(sumi2));
+  }
+  return sumf;
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
@@ -1274,6 +1409,14 @@ constexpr KQNeonKernel kKernelIQ2S = {
     &vec_dot_iq2_s,
     sizeof(ActQ8K),
     &quantize_act_row_q8k};
+constexpr KQNeonKernel kKernelIQ1S = {
+    &vec_dot_iq1_s,
+    sizeof(ActQ8K),
+    &quantize_act_row_q8k};
+constexpr KQNeonKernel kKernelIQ1M = {
+    &vec_dot_iq1_m,
+    sizeof(ActQ8K),
+    &quantize_act_row_q8k};
 
 bool cpu_has_dotprod() {
 #if defined(__APPLE__)
@@ -1332,6 +1475,10 @@ const KQNeonKernel* kq_neon_kernel(const std::string& codec) {
     return &kKernelIQ2XS;
   } else if (codec == "iq2_s") {
     return &kKernelIQ2S;
+  } else if (codec == "iq1_s") {
+    return &kKernelIQ1S;
+  } else if (codec == "iq1_m") {
+    return &kKernelIQ1M;
   }
   return nullptr;
 }
