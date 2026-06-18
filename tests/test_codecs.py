@@ -51,6 +51,8 @@ CODECS = {
     "iq2_xxs": (GT.IQ2_XXS, 256, 66, 2, False),
     "iq2_xs": (GT.IQ2_XS, 256, 74, 2, False),
     "iq2_s": (GT.IQ2_S, 256, 82, 2, False),
+    "iq1_s": (GT.IQ1_S, 256, 50, 1, False),
+    "iq1_m": (GT.IQ1_M, 256, 56, 1, False),
 }
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -72,7 +74,16 @@ def _synth_iq_wire(rng, bpb, n_blocks):
     bytes with a sane fp16 d at block offset 0 so dequant can't hit Inf/NaN."""
     wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
     d = rng.uniform(0.02, 0.08, n_blocks).astype(np.float16)
-    wire[:, 0:2] = d.view(np.uint8).reshape(n_blocks, 2)
+    if bpb == 56:
+        # IQ1_M has no super-block d; its fp16 scale is rebuilt from the top
+        # nibbles of the four uint16 scale words (bytes 49/51/53/55). Seed those
+        # so the reconstructed scale is a sane (non-NaN) fp16.
+        dbits = d.view(np.uint16)
+        for k, byteidx in enumerate((49, 51, 53, 55)):
+            nib = ((dbits >> (4 * k)) & 0xF).astype(np.uint8)
+            wire[:, byteidx] = (wire[:, byteidx] & 0x0F) | (nib << 4)
+    else:
+        wire[:, 0:2] = d.view(np.uint8).reshape(n_blocks, 2)
     return wire
 
 
