@@ -22,6 +22,9 @@ static const std::vector<KQuantCodec>& registry() {
       {"iq4_xs", 256, 136, 4, true, false, false},
       {"iq3_s", 256, 110, 3, true, false, false},
       {"iq3_xxs", 256, 98, 3, true, false, false},
+      {"iq2_xxs", 256, 66, 2, true, false, false},
+      {"iq2_xs", 256, 74, 2, true, false, false},
+      {"iq2_s", 256, 82, 2, true, false, false},
   };
   return codecs;
 }

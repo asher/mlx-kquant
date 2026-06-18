@@ -30,12 +30,17 @@ CODEC_GEOMETRY: dict[str, tuple[int, int, int, int]] = {
     "iq4_xs": (256, 4, 136, 256),
     "iq3_s": (256, 3, 110, 256),
     "iq3_xxs": (256, 3, 98, 256),
+    "iq2_xxs": (256, 2, 66, 256),
+    "iq2_xs": (256, 2, 74, 256),
+    "iq2_s": (256, 2, 82, 256),
 }
 
 # IQ codecs load community GGUFs but have no encoder (their rounding needs a
 # search + imatrix the extension doesn't implement); excluded from the encoder
 # and imatrix sets below.
-DECODE_ONLY_CODECS: frozenset[str] = frozenset({"iq4_nl", "iq4_xs", "iq3_s", "iq3_xxs"})
+DECODE_ONLY_CODECS: frozenset[str] = frozenset(
+    {"iq4_nl", "iq4_xs", "iq3_s", "iq3_xxs", "iq2_xxs", "iq2_xs", "iq2_s"}
+)
 
 # Every codec the ``kq.quantize`` encoder can produce: the ten K-quant/legacy
 # codecs on CPU or Metal (the four legacy block codecs + q8_0 ignore an imatrix).
