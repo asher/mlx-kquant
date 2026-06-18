@@ -42,6 +42,9 @@ CODECS = {
     "iq4_xs": GT.IQ4_XS,
     "iq3_s": GT.IQ3_S,
     "iq3_xxs": GT.IQ3_XXS,
+    "iq2_xxs": GT.IQ2_XXS,
+    "iq2_xs": GT.IQ2_XS,
+    "iq2_s": GT.IQ2_S,
 }
 
 # IQ codecs are decode-only (gguf-py can't encode them): (weights_per_block,
@@ -52,6 +55,9 @@ IQ_GEOM = {
     "iq4_xs": (256, 136),
     "iq3_s": (256, 110),
     "iq3_xxs": (256, 98),
+    "iq2_xxs": (256, 66),
+    "iq2_xs": (256, 74),
+    "iq2_s": (256, 82),
 }
 
 
