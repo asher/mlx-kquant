@@ -54,7 +54,8 @@ inline bool kq_is_nax_available() {
 // quantized.cpp:52-58
 inline int kquant_qmv_bn(const std::string& kquant_type) {
   if (kquant_type == "q2_k" || kquant_type == "q3_k" || kquant_type == "q4_k" ||
-      kquant_type == "q5_k") {
+      kquant_type == "q5_k" || kquant_type == "iq4_xs" ||
+      kquant_type == "iq3_s" || kquant_type == "iq3_xxs") {
     return 4;
   }
   return 8;

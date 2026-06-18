@@ -6281,6 +6281,1194 @@ template <typename T, int group_size, int bits>
   kq_iq3_s_dequantize_impl<T>(w, out, num_weights, gid);
 }
 
+// ===================== IQ4_XS matmul / gather / qmv =====================
+
+// Lane `simd_lid` owns one 8-weight group (sub-block lid/4, half lid%4) of
+// every superblock; simd_sum reduces the 32 lanes. bn=4 -> 2 rows/simdgroup.
+template <typename T, int group_size, int bits>
+METAL_FUNC void kq_iq4_xs_qmv_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(group_size == KQ_IQ4_XS_SUPERBLOCK, "IQ4_XS requires gs=256");
+  static_assert(bits == 4, "IQ4_XS requires bits=4");
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 2; // bn = 4
+  constexpr int vpt = 8;
+  typedef float U;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+  if (out_row >= out_vec_size) {
+    return;
+  }
+  const int active_rows = min(results_per_simdgroup, out_vec_size - out_row);
+  const int row_bytes =
+      in_vec_size * KQ_IQ4_XS_BLOCK_BYTES / KQ_IQ4_XS_SUPERBLOCK;
+  const int nb = in_vec_size / KQ_IQ4_XS_SUPERBLOCK;
+  x += tid.x * in_vec_size;
+  y += tid.x * out_vec_size;
+  const int s = simd_lid / 4; // sub-block
+  const int o = (simd_lid % 4) * 8; // offset within sub-block
+  const bool is_high = o >= 16;
+  const int byte0 = is_high ? (o - 16) : o;
+  U result[results_per_simdgroup] = {0};
+  for (int ib = 0; ib < nb; ib++) {
+    U xt[vpt];
+#pragma unroll
+    for (int i = 0; i < vpt; i++) {
+      xt[i] = U(x[ib * KQ_IQ4_XS_SUPERBLOCK + simd_lid * vpt + i]);
+    }
+    for (int row = 0; row < active_rows; row++) {
+      const device uint8_t* sb = w +
+          static_cast<int64_t>(out_row + row) * row_bytes +
+          ib * KQ_IQ4_XS_BLOCK_BYTES;
+      const U d = U(float(*(const device half*)sb));
+      const uint16_t scales_h = uint16_t(sb[2]) | (uint16_t(sb[3]) << 8);
+      const device uint8_t* scales_l = sb + KQ_IQ4_XS_SCALESL_OFFSET;
+      const int ls = ((scales_l[s / 2] >> (4 * (s & 1))) & 0xf) |
+          (((scales_h >> (2 * s)) & 3) << 4);
+      const U dl = d * U(ls - 32);
+      const device uint8_t* qs = sb + KQ_IQ4_XS_QS_OFFSET + s * 16 + byte0;
+      U partial = 0;
+#pragma unroll
+      for (int i = 0; i < vpt; i++) {
+        const int nib = is_high ? (qs[i] >> 4) : (qs[i] & 0xf);
+        partial += xt[i] * U(kvalues_iq4nl[nib]);
+      }
+      result[row] += dl * partial;
+    }
+  }
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    U r = simd_sum(result[row]);
+    if (simd_lid == 0 && row < active_rows) {
+      y[out_row + row] = static_cast<T>(r);
+    }
+  }
+}
+
+template <typename T, int group_size, int bits>
+METAL_FUNC void kq_iq4_xs_qmv_fast_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  kq_iq4_xs_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+// Decodes n_reads weights at tile column `bj` of sub-block `sb` per call; no
+// odd-sub-block caching (correctness over the q4_k vectorization).
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct KqIq4_xsBlockLoader {
+  MLX_MTL_CONST int weights_per_block = KQ_IQ4_XS_SUPERBLOCK;
+  MLX_MTL_CONST int bytes_per_block = KQ_IQ4_XS_BLOCK_BYTES;
+  MLX_MTL_CONST int sub_block_size = 32;
+  MLX_MTL_CONST int sub_blocks_per_block = weights_per_block / sub_block_size;
+  static_assert(BCOLS == sub_block_size, "IQ4_XS loader requires BCOLS==32.");
+  static_assert(
+      (BCOLS * BROWS) % tgp_size == 0,
+      "tgp_size must evenly divide BCOLS * BROWS.");
+  MLX_MTL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
+
+  const int src_ld;
+  const int row_bytes;
+  const int tile_stride;
+  const short fixed_sub_block_idx;
+  const short thread_idx;
+  const short bi;
+  const short bj;
+  threadgroup T* dst;
+  const device uint8_t* src;
+  short sub_block_idx;
+
+  KqIq4_xsBlockLoader(
+      const device uint8_t* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      int col_in_block = 0)
+      : src_ld(src_ld_),
+        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        tile_stride(
+            reduction_dim
+                ? 0
+                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+        fixed_sub_block_idx(
+            reduction_dim == 0 ? (col_in_block / sub_block_size) : 0),
+        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj((thread_idx % TCOLS) * n_reads),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
+        sub_block_idx(0) {}
+
+  void load_unsafe() const {
+    const short sb = (reduction_dim == 0) ? fixed_sub_block_idx : sub_block_idx;
+    const float d = float(*(const device half*)src);
+    const uint16_t scales_h = uint16_t(src[2]) | (uint16_t(src[3]) << 8);
+    const device uint8_t* scales_l = src + KQ_IQ4_XS_SCALESL_OFFSET;
+    const int ls = ((scales_l[sb / 2] >> (4 * (sb & 1))) & 0xf) |
+        (((scales_h >> (2 * sb)) & 3) << 4);
+    const float dl = d * float(ls - 32);
+    const device uint8_t* qs = src + KQ_IQ4_XS_QS_OFFSET + sb * 16;
+#pragma unroll
+    for (short i = 0; i < n_reads; i++) {
+      const int p = bj + i;
+      const bool is_high = p >= 16;
+      const int b = is_high ? (p - 16) : p;
+      const int nib = is_high ? (qs[b] >> 4) : (qs[b] & 0xf);
+      dst[i] = T(dl * float(kvalues_iq4nl[nib]));
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    if (bi >= src_tile_dim.y) {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() {
+    if (reduction_dim == 1) {
+      sub_block_idx++;
+      if (sub_block_idx == sub_blocks_per_block) {
+        sub_block_idx = 0;
+        src += bytes_per_block;
+      }
+    } else {
+      src += tile_stride;
+    }
+  }
+};
+
+template <typename T, int group_size, int bits, bool aligned_N, bool batched>
+[[kernel]] void kq_iq4_xs_qmm_t(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if constexpr (batched) {
+    kq_adjust_matrix_offsets<T>(
+        x,
+        w,
+        y,
+        M * N,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        tid);
+  }
+  static_assert(group_size == KQ_IQ4_XS_SUPERBLOCK, "IQ4_XS requires gs=256");
+  static_assert(bits == 4, "IQ4_XS requires bits=4");
+  constexpr int BM = 64, BK = 32, BN = 64;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+  using LoaderW =
+      KqIq4_xsBlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool aligned_N>
+[[kernel]] void kq_iq4_xs_qmm_t_splitk(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    const constant int& k_partition_size,
+    const constant int& split_k_partition_stride,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(group_size == KQ_IQ4_XS_SUPERBLOCK, "IQ4_XS requires gs=256");
+  static_assert(bits == 4, "IQ4_XS requires bits=4");
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+  using LoaderW =
+      KqIq4_xsBlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
+  const int k_start = tid.z * k_partition_size;
+  x += k_start;
+  auto wl = w;
+  wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
+  y += tid.z * static_cast<int64_t>(split_k_partition_stride);
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      wl,
+      x,
+      y,
+      Xs,
+      Ws,
+      K,
+      N,
+      M,
+      k_partition_size,
+      tid,
+      lid,
+      simd_gid,
+      simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_iq4_xs_qmm_n(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if constexpr (batched) {
+    kq_adjust_matrix_offsets<T>(
+        x,
+        w,
+        y,
+        M * N,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        tid);
+  }
+  static_assert(group_size == KQ_IQ4_XS_SUPERBLOCK, "IQ4_XS requires gs=256");
+  static_assert(bits == 4, "IQ4_XS requires bits=4");
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int BN_padded = (BN + 16 / sizeof(T));
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BK * BN_padded];
+  using LoaderW =
+      KqIq4_xsBlockLoader<T, BK, BN, BN_padded, 0, 2 * 2 * SIMD_SIZE>;
+  kq_qmm_n_impl<T, LoaderW, BM, BK, BN>(
+      w, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_iq4_xs_qmv_fast(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if constexpr (batched) {
+    int batch_M = x_shape[x_batch_ndims];
+    kq_adjust_matrix_offsets<T>(
+        x,
+        w,
+        y,
+        out_vec_size * batch_M,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        tid);
+  }
+  kq_iq4_xs_qmv_fast_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_iq4_xs_qmv(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if constexpr (batched) {
+    int batch_M = x_shape[x_batch_ndims];
+    kq_adjust_matrix_offsets<T>(
+        x,
+        w,
+        y,
+        out_vec_size * batch_M,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        tid);
+  }
+  kq_iq4_xs_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+// ===================== IQ3_XXS matmul / gather / qmv =====================
+
+// Grid bytes are magnitudes (<128); signs come from the per-block "gas" word
+// (high nibble = scale, low bits index ksigns). 0.5 factor folded into db to
+// match the dequant path (bit-equivalent to the mat-vec post-sum *0.5).
+template <typename T, int group_size, int bits>
+METAL_FUNC void kq_iq3_xxs_qmv_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(group_size == KQ_IQ3_XXS_SUPERBLOCK, "IQ3_XXS requires gs=256");
+  static_assert(bits == 3, "IQ3_XXS requires bits=3");
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 2; // bn = 4
+  constexpr int vpt = 8;
+  typedef float U;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+  if (out_row >= out_vec_size) {
+    return;
+  }
+  const int active_rows = min(results_per_simdgroup, out_vec_size - out_row);
+  const int row_bytes =
+      in_vec_size * KQ_IQ3_XXS_BLOCK_BYTES / KQ_IQ3_XXS_SUPERBLOCK;
+  const int nb = in_vec_size / KQ_IQ3_XXS_SUPERBLOCK;
+  x += tid.x * in_vec_size;
+  y += tid.x * out_vec_size;
+  const int s = simd_lid / 4; // sub-block
+  const int l = simd_lid % 4; // l-group
+  U result[results_per_simdgroup] = {0};
+  for (int ib = 0; ib < nb; ib++) {
+    U xt[vpt];
+#pragma unroll
+    for (int i = 0; i < vpt; i++) {
+      xt[i] = U(x[ib * KQ_IQ3_XXS_SUPERBLOCK + simd_lid * vpt + i]);
+    }
+    for (int row = 0; row < active_rows; row++) {
+      const device uint8_t* sb = w +
+          static_cast<int64_t>(out_row + row) * row_bytes +
+          ib * KQ_IQ3_XXS_BLOCK_BYTES;
+      const U d = U(float(*(const device half*)sb));
+      const device uint8_t* qs = sb + KQ_IQ3_XXS_QS_OFFSET + s * 8;
+      const device uint8_t* gas = sb + KQ_IQ3_XXS_GAS_OFFSET + s * 4;
+      const uint aux32 = uint(gas[0]) | (uint(gas[1]) << 8) |
+          (uint(gas[2]) << 16) | (uint(gas[3]) << 24);
+      const U db = d * (U(0.5f) + U(aux32 >> 28)) * U(0.5f);
+      const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+      const uint g1 = iq3xxs_grid[qs[2 * l]];
+      const uint g2 = iq3xxs_grid[qs[2 * l + 1]];
+      U partial = 0;
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        partial += xt[j] * U((g1 >> (8 * j)) & 0xff) *
+            ((signs & kmask_iq2xs[j]) ? U(-1) : U(1));
+        partial += xt[j + 4] * U((g2 >> (8 * j)) & 0xff) *
+            ((signs & kmask_iq2xs[j + 4]) ? U(-1) : U(1));
+      }
+      result[row] += db * partial;
+    }
+  }
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    U r = simd_sum(result[row]);
+    if (simd_lid == 0 && row < active_rows) {
+      y[out_row + row] = static_cast<T>(r);
+    }
+  }
+}
+
+template <typename T, int group_size, int bits>
+METAL_FUNC void kq_iq3_xxs_qmv_fast_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  kq_iq3_xxs_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct KqIq3_xxsBlockLoader {
+  MLX_MTL_CONST int weights_per_block = KQ_IQ3_XXS_SUPERBLOCK;
+  MLX_MTL_CONST int bytes_per_block = KQ_IQ3_XXS_BLOCK_BYTES;
+  MLX_MTL_CONST int sub_block_size = 32;
+  MLX_MTL_CONST int sub_blocks_per_block = weights_per_block / sub_block_size;
+  static_assert(BCOLS == sub_block_size, "IQ3_XXS loader requires BCOLS==32.");
+  static_assert(
+      (BCOLS * BROWS) % tgp_size == 0,
+      "tgp_size must evenly divide BCOLS * BROWS.");
+  MLX_MTL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
+
+  const int src_ld;
+  const int row_bytes;
+  const int tile_stride;
+  const short fixed_sub_block_idx;
+  const short thread_idx;
+  const short bi;
+  const short bj;
+  threadgroup T* dst;
+  const device uint8_t* src;
+  short sub_block_idx;
+
+  KqIq3_xxsBlockLoader(
+      const device uint8_t* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      int col_in_block = 0)
+      : src_ld(src_ld_),
+        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        tile_stride(
+            reduction_dim
+                ? 0
+                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+        fixed_sub_block_idx(
+            reduction_dim == 0 ? (col_in_block / sub_block_size) : 0),
+        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj((thread_idx % TCOLS) * n_reads),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
+        sub_block_idx(0) {}
+
+  void load_unsafe() const {
+    const short sb = (reduction_dim == 0) ? fixed_sub_block_idx : sub_block_idx;
+    const float d = float(*(const device half*)src);
+    const device uint8_t* qs = src + KQ_IQ3_XXS_QS_OFFSET + sb * 8;
+    const device uint8_t* gas = src + KQ_IQ3_XXS_GAS_OFFSET + sb * 4;
+    const uint aux32 = uint(gas[0]) | (uint(gas[1]) << 8) |
+        (uint(gas[2]) << 16) | (uint(gas[3]) << 24);
+    const float db = d * (0.5f + float(aux32 >> 28)) * 0.5f;
+#pragma unroll
+    for (short i = 0; i < n_reads; i++) {
+      const int p = bj + i;
+      const int l = p / 8;
+      const int jpos = p % 8;
+      const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+      const uint g = iq3xxs_grid[jpos < 4 ? qs[2 * l] : qs[2 * l + 1]];
+      const int jj = jpos < 4 ? jpos : jpos - 4;
+      const float gb = float((g >> (8 * jj)) & 0xff);
+      const float sgn = (signs & kmask_iq2xs[jpos]) ? -1.f : 1.f;
+      dst[i] = T(db * gb * sgn);
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    if (bi >= src_tile_dim.y) {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() {
+    if (reduction_dim == 1) {
+      sub_block_idx++;
+      if (sub_block_idx == sub_blocks_per_block) {
+        sub_block_idx = 0;
+        src += bytes_per_block;
+      }
+    } else {
+      src += tile_stride;
+    }
+  }
+};
+
+template <typename T, int group_size, int bits, bool aligned_N, bool batched>
+[[kernel]] void kq_iq3_xxs_qmm_t(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if constexpr (batched) {
+    kq_adjust_matrix_offsets<T>(
+        x,
+        w,
+        y,
+        M * N,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        tid);
+  }
+  static_assert(group_size == KQ_IQ3_XXS_SUPERBLOCK, "IQ3_XXS requires gs=256");
+  static_assert(bits == 3, "IQ3_XXS requires bits=3");
+  constexpr int BM = 64, BK = 32, BN = 64;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+  using LoaderW =
+      KqIq3_xxsBlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool aligned_N>
+[[kernel]] void kq_iq3_xxs_qmm_t_splitk(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    const constant int& k_partition_size,
+    const constant int& split_k_partition_stride,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(group_size == KQ_IQ3_XXS_SUPERBLOCK, "IQ3_XXS requires gs=256");
+  static_assert(bits == 3, "IQ3_XXS requires bits=3");
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+  using LoaderW =
+      KqIq3_xxsBlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
+  const int k_start = tid.z * k_partition_size;
+  x += k_start;
+  auto wl = w;
+  wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
+  y += tid.z * static_cast<int64_t>(split_k_partition_stride);
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      wl,
+      x,
+      y,
+      Xs,
+      Ws,
+      K,
+      N,
+      M,
+      k_partition_size,
+      tid,
+      lid,
+      simd_gid,
+      simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_iq3_xxs_qmm_n(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if constexpr (batched) {
+    kq_adjust_matrix_offsets<T>(
+        x,
+        w,
+        y,
+        M * N,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        tid);
+  }
+  static_assert(group_size == KQ_IQ3_XXS_SUPERBLOCK, "IQ3_XXS requires gs=256");
+  static_assert(bits == 3, "IQ3_XXS requires bits=3");
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int BN_padded = (BN + 16 / sizeof(T));
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BK * BN_padded];
+  using LoaderW =
+      KqIq3_xxsBlockLoader<T, BK, BN, BN_padded, 0, 2 * 2 * SIMD_SIZE>;
+  kq_qmm_n_impl<T, LoaderW, BM, BK, BN>(
+      w, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_iq3_xxs_qmv_fast(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if constexpr (batched) {
+    int batch_M = x_shape[x_batch_ndims];
+    kq_adjust_matrix_offsets<T>(
+        x,
+        w,
+        y,
+        out_vec_size * batch_M,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        tid);
+  }
+  kq_iq3_xxs_qmv_fast_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_iq3_xxs_qmv(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if constexpr (batched) {
+    int batch_M = x_shape[x_batch_ndims];
+    kq_adjust_matrix_offsets<T>(
+        x,
+        w,
+        y,
+        out_vec_size * batch_M,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        tid);
+  }
+  kq_iq3_xxs_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+// ===================== IQ3_S matmul / gather / qmv =====================
+
+// 9-bit grid index (qs low 8 + qh high bit), per-block sign bytes, scale =
+// d*(1+2*nibble) (no 0.5 factor).
+template <typename T, int group_size, int bits>
+METAL_FUNC void kq_iq3_s_qmv_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(group_size == KQ_IQ3_S_SUPERBLOCK, "IQ3_S requires gs=256");
+  static_assert(bits == 3, "IQ3_S requires bits=3");
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 2; // bn = 4
+  constexpr int vpt = 8;
+  typedef float U;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+  if (out_row >= out_vec_size) {
+    return;
+  }
+  const int active_rows = min(results_per_simdgroup, out_vec_size - out_row);
+  const int row_bytes =
+      in_vec_size * KQ_IQ3_S_BLOCK_BYTES / KQ_IQ3_S_SUPERBLOCK;
+  const int nb = in_vec_size / KQ_IQ3_S_SUPERBLOCK;
+  x += tid.x * in_vec_size;
+  y += tid.x * out_vec_size;
+  const int s = simd_lid / 4; // sub-block
+  const int l = simd_lid % 4; // l-group
+  U result[results_per_simdgroup] = {0};
+  for (int ib = 0; ib < nb; ib++) {
+    U xt[vpt];
+#pragma unroll
+    for (int i = 0; i < vpt; i++) {
+      xt[i] = U(x[ib * KQ_IQ3_S_SUPERBLOCK + simd_lid * vpt + i]);
+    }
+    for (int row = 0; row < active_rows; row++) {
+      const device uint8_t* sb = w +
+          static_cast<int64_t>(out_row + row) * row_bytes +
+          ib * KQ_IQ3_S_BLOCK_BYTES;
+      const U d = U(float(*(const device half*)sb));
+      const device uint8_t* scales = sb + KQ_IQ3_S_SCALES_OFFSET;
+      const U db = d * U(1 + 2 * ((scales[s / 2] >> (4 * (s & 1))) & 0xf));
+      const uint qh = sb[KQ_IQ3_S_QH_OFFSET + s];
+      const device uint8_t* qs = sb + KQ_IQ3_S_QS_OFFSET + s * 8;
+      const uint8_t signs = sb[KQ_IQ3_S_SIGNS_OFFSET + s * 4 + l];
+      const uint i1 = qs[2 * l] | ((qh << (8 - 2 * l)) & 256);
+      const uint i2 = qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256);
+      const uint g1 = iq3s_grid[i1];
+      const uint g2 = iq3s_grid[i2];
+      U partial = 0;
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        partial += xt[j] * U((g1 >> (8 * j)) & 0xff) *
+            ((signs & kmask_iq2xs[j]) ? U(-1) : U(1));
+        partial += xt[j + 4] * U((g2 >> (8 * j)) & 0xff) *
+            ((signs & kmask_iq2xs[j + 4]) ? U(-1) : U(1));
+      }
+      result[row] += db * partial;
+    }
+  }
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    U r = simd_sum(result[row]);
+    if (simd_lid == 0 && row < active_rows) {
+      y[out_row + row] = static_cast<T>(r);
+    }
+  }
+}
+
+template <typename T, int group_size, int bits>
+METAL_FUNC void kq_iq3_s_qmv_fast_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  kq_iq3_s_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct KqIq3_sBlockLoader {
+  MLX_MTL_CONST int weights_per_block = KQ_IQ3_S_SUPERBLOCK;
+  MLX_MTL_CONST int bytes_per_block = KQ_IQ3_S_BLOCK_BYTES;
+  MLX_MTL_CONST int sub_block_size = 32;
+  MLX_MTL_CONST int sub_blocks_per_block = weights_per_block / sub_block_size;
+  static_assert(BCOLS == sub_block_size, "IQ3_S loader requires BCOLS==32.");
+  static_assert(
+      (BCOLS * BROWS) % tgp_size == 0,
+      "tgp_size must evenly divide BCOLS * BROWS.");
+  MLX_MTL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
+
+  const int src_ld;
+  const int row_bytes;
+  const int tile_stride;
+  const short fixed_sub_block_idx;
+  const short thread_idx;
+  const short bi;
+  const short bj;
+  threadgroup T* dst;
+  const device uint8_t* src;
+  short sub_block_idx;
+
+  KqIq3_sBlockLoader(
+      const device uint8_t* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      int col_in_block = 0)
+      : src_ld(src_ld_),
+        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        tile_stride(
+            reduction_dim
+                ? 0
+                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+        fixed_sub_block_idx(
+            reduction_dim == 0 ? (col_in_block / sub_block_size) : 0),
+        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj((thread_idx % TCOLS) * n_reads),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
+        sub_block_idx(0) {}
+
+  void load_unsafe() const {
+    const short sb = (reduction_dim == 0) ? fixed_sub_block_idx : sub_block_idx;
+    const float d = float(*(const device half*)src);
+    const device uint8_t* scales = src + KQ_IQ3_S_SCALES_OFFSET;
+    const float db =
+        d * float(1 + 2 * ((scales[sb / 2] >> (4 * (sb & 1))) & 0xf));
+    const uint qh = src[KQ_IQ3_S_QH_OFFSET + sb];
+    const device uint8_t* qs = src + KQ_IQ3_S_QS_OFFSET + sb * 8;
+    const device uint8_t* sg = src + KQ_IQ3_S_SIGNS_OFFSET + sb * 4;
+#pragma unroll
+    for (short i = 0; i < n_reads; i++) {
+      const int p = bj + i;
+      const int l = p / 8;
+      const int jpos = p % 8;
+      const uint8_t signs = sg[l];
+      const uint idx = (jpos < 4)
+          ? (qs[2 * l] | ((qh << (8 - 2 * l)) & 256))
+          : (qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256));
+      const uint g = iq3s_grid[idx];
+      const int jj = jpos < 4 ? jpos : jpos - 4;
+      const float gb = float((g >> (8 * jj)) & 0xff);
+      const float sgn = (signs & kmask_iq2xs[jpos]) ? -1.f : 1.f;
+      dst[i] = T(db * gb * sgn);
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    if (bi >= src_tile_dim.y) {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() {
+    if (reduction_dim == 1) {
+      sub_block_idx++;
+      if (sub_block_idx == sub_blocks_per_block) {
+        sub_block_idx = 0;
+        src += bytes_per_block;
+      }
+    } else {
+      src += tile_stride;
+    }
+  }
+};
+
+template <typename T, int group_size, int bits, bool aligned_N, bool batched>
+[[kernel]] void kq_iq3_s_qmm_t(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if constexpr (batched) {
+    kq_adjust_matrix_offsets<T>(
+        x,
+        w,
+        y,
+        M * N,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        tid);
+  }
+  static_assert(group_size == KQ_IQ3_S_SUPERBLOCK, "IQ3_S requires gs=256");
+  static_assert(bits == 3, "IQ3_S requires bits=3");
+  constexpr int BM = 64, BK = 32, BN = 64;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+  using LoaderW =
+      KqIq3_sBlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool aligned_N>
+[[kernel]] void kq_iq3_s_qmm_t_splitk(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    const constant int& k_partition_size,
+    const constant int& split_k_partition_stride,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(group_size == KQ_IQ3_S_SUPERBLOCK, "IQ3_S requires gs=256");
+  static_assert(bits == 3, "IQ3_S requires bits=3");
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+  using LoaderW =
+      KqIq3_sBlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
+  const int k_start = tid.z * k_partition_size;
+  x += k_start;
+  auto wl = w;
+  wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
+  y += tid.z * static_cast<int64_t>(split_k_partition_stride);
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      wl,
+      x,
+      y,
+      Xs,
+      Ws,
+      K,
+      N,
+      M,
+      k_partition_size,
+      tid,
+      lid,
+      simd_gid,
+      simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_iq3_s_qmm_n(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if constexpr (batched) {
+    kq_adjust_matrix_offsets<T>(
+        x,
+        w,
+        y,
+        M * N,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        tid);
+  }
+  static_assert(group_size == KQ_IQ3_S_SUPERBLOCK, "IQ3_S requires gs=256");
+  static_assert(bits == 3, "IQ3_S requires bits=3");
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int BN_padded = (BN + 16 / sizeof(T));
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BK * BN_padded];
+  using LoaderW =
+      KqIq3_sBlockLoader<T, BK, BN, BN_padded, 0, 2 * 2 * SIMD_SIZE>;
+  kq_qmm_n_impl<T, LoaderW, BM, BK, BN>(
+      w, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_iq3_s_qmv_fast(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if constexpr (batched) {
+    int batch_M = x_shape[x_batch_ndims];
+    kq_adjust_matrix_offsets<T>(
+        x,
+        w,
+        y,
+        out_vec_size * batch_M,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        tid);
+  }
+  kq_iq3_s_qmv_fast_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_iq3_s_qmv(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if constexpr (batched) {
+    int batch_M = x_shape[x_batch_ndims];
+    kq_adjust_matrix_offsets<T>(
+        x,
+        w,
+        y,
+        out_vec_size * batch_M,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        tid);
+  }
+  kq_iq3_s_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
 #define KQUANT_DEFINE_GATHER_KERNELS(CODEC, LOADER)                   \
   template <typename T, int group_size, int bits>                     \
   [[kernel]] void kq_##CODEC##_gather_qmv_fast(                       \
@@ -6506,5 +7694,8 @@ KQUANT_DEFINE_GATHER_KERNELS(q6_k, KqQ6_KBlockLoader)
 KQUANT_DEFINE_GATHER_KERNELS(q3_k, KqQ3_KBlockLoader)
 KQUANT_DEFINE_GATHER_KERNELS(q2_k, KqQ2_KBlockLoader)
 KQUANT_DEFINE_GATHER_KERNELS(iq4_nl, KqIq4_nlBlockLoader)
+KQUANT_DEFINE_GATHER_KERNELS(iq4_xs, KqIq4_xsBlockLoader)
+KQUANT_DEFINE_GATHER_KERNELS(iq3_xxs, KqIq3_xxsBlockLoader)
+KQUANT_DEFINE_GATHER_KERNELS(iq3_s, KqIq3_sBlockLoader)
 
 #undef KQUANT_DEFINE_GATHER_KERNELS
