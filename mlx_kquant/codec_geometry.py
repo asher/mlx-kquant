@@ -40,15 +40,10 @@ CODEC_GEOMETRY: dict[str, tuple[int, int, int, int]] = {
     "iq1_m": (256, 1, 56, 256),
 }
 
-# IQ codecs that still lack a CPU encoder. Encode lands incrementally: iq4_nl
-# and iq4_xs already encode (so they are no longer here); the rest load community
-# GGUFs but cannot yet be produced by kq.quantize.
-DECODE_ONLY_CODECS: frozenset[str] = frozenset(
-    {
-        "iq1_s",
-        "iq1_m",
-    }
-)
+# Codecs that load but cannot be produced by kq.quantize. Empty: every codec --
+# all five K-quant superblocks, the five legacy block codecs, and all nine IQ
+# codecs -- now has a CPU (IQ) or CPU/Metal (K-quant) encoder.
+DECODE_ONLY_CODECS: frozenset[str] = frozenset()
 
 # Every codec the ``kq.quantize`` encoder can produce: the ten K-quant/legacy
 # codecs on CPU or Metal (the four legacy block codecs + q8_0 ignore an imatrix).

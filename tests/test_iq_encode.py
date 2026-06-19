@@ -38,12 +38,14 @@ IQ_ENCODE_CODECS = {
     "iq2_s": (GT.IQ2_S, 256, 2, 0.45),
     "iq3_xxs": (GT.IQ3_XXS, 256, 3, 0.30),
     "iq3_s": (GT.IQ3_S, 256, 3, 0.30),
+    "iq1_s": (GT.IQ1_S, 256, 1, 0.65),
+    "iq1_m": (GT.IQ1_M, 256, 1, 0.65),
 }
 
 # Codecs ggml marks imatrix-required: kq.quantize rejects them without an
 # imatrix (mirrors ggml_quantize_requires_imatrix). The rest fall back gracefully
 # to an importance-free weighting.
-REQUIRED_IMATRIX = {"iq2_xxs", "iq2_xs"}
+REQUIRED_IMATRIX = {"iq2_xxs", "iq2_xs", "iq1_s"}
 
 N, K = 256, 512
 
