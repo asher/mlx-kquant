@@ -127,3 +127,20 @@ def test_iq_encode_requires_imatrix(codec):
     with pytest.raises((ValueError, RuntimeError)):
         wq, _ = kq.quantize(mx.array(w_np), codec)
         mx.eval(wq)
+
+
+@pytest.mark.parametrize("codec", list(IQ_ENCODE_CODECS))
+def test_iq_encode_convert_wrapper(codec):
+    """The convert._encode_weight wrapper (the CLI ``quantize`` encode path)
+    produces wire bytes for every landed IQ codec -- graceful codecs with no
+    imatrix, required codecs with one."""
+    from mlx_kquant.convert import _encode_weight
+
+    rng = np.random.default_rng(3)
+    w = mx.array((rng.standard_normal((N, K)) * 0.1).astype(np.float32))
+    vec = None
+    if codec in REQUIRED_IMATRIX:
+        vec = (np.abs(rng.standard_normal(K)) + 0.1).astype(np.float32)
+    wq = _encode_weight(w, codec, vec)
+    mx.eval(wq)
+    assert wq.shape[0] == N
