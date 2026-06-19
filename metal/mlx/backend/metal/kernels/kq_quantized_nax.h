@@ -2283,6 +2283,952 @@ struct KqNaxQ2_KBlockLoader {
         w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);              \
   }
 
+// ---- IQ-codec NAX block loaders (load-only; ALU dequant re-tiled to BK=64)
+// ---- iq4_nl (32-weight group): structurally KqNaxQ4_0BlockLoader with the
+// non-linear kvalues_iq4nl codebook replacing the linear (x-8) dequant. Same
+// 18-byte block (fp16 d @0, packed nibbles @2) and interleaved-nibble layout
+// (weight j<16 -> qs[j]&0xF, weight 16+i -> qs[i]>>4).
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct KqNaxIq4_nlBlockLoader {
+  MLX_MTL_CONST int weights_per_block = KQ_IQ4_NL_GROUP;
+  MLX_MTL_CONST int bytes_per_block = KQ_IQ4_NL_BLOCK_BYTES;
+
+  static_assert(
+      BCOLS % weights_per_block == 0,
+      "IQ4_NL NAX loader requires BCOLS to be a multiple of 32.");
+  static_assert(
+      (BCOLS * BROWS) % tgp_size == 0,
+      "tgp_size must evenly divide BCOLS * BROWS.");
+
+  MLX_MTL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
+  static_assert(
+      n_reads <= weights_per_block,
+      "IQ4_NL NAX loader: n_reads must not exceed 32 (one block per thread).");
+
+  const int src_ld;
+  const int row_bytes;
+  const int tile_stride;
+
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+
+  KqNaxIq4_nlBlockLoader(
+      const device uint8_t* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      int /* col_in_block */ = 0)
+      : src_ld(src_ld_),
+        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        tile_stride(
+            reduction_dim
+                ? (BCOLS / weights_per_block) * bytes_per_block
+                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj((thread_idx % TCOLS) * n_reads),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)) {}
+
+  void load_unsafe() const {
+    const short block_idx = bj / weights_per_block;
+    const short within = bj % weights_per_block;
+    const device uint8_t* block_addr = src + block_idx * bytes_per_block;
+    const float d = float(*(const device half*)block_addr);
+    const device uint8_t* qs = block_addr + KQ_IQ4_NL_QS_OFFSET;
+#pragma unroll
+    for (short i = 0; i < n_reads; i++) {
+      const int j = within + i;
+      const int x = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
+      dst[i] = T(d * float(kvalues_iq4nl[x]));
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    if (bi >= src_tile_dim.y) {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() {
+    src += tile_stride;
+  }
+};
+
+// Superblock IQ NAX loaders. All eight model on KqNaxQ6_KBlockLoader: a 64-wide
+// K-tile spans two 32-weight sub-blocks (BCOLS==64, n_reads==32, bj in {0,32}),
+// the thread owns one whole sub-block selected by sb = base + bj/32, and next()
+// strides two sub-blocks. The Q6_K pair-cache is dropped (correctness first;
+// the redundant superblock-header read is an N5 profiling concern). The
+// per-weight dequant body is a verbatim transcription of the validated ALU
+// KqIq*BlockLoader (kq_quantized.h) with the within-sub-block index p == i.
+// Grid/sign tables come in via kq_quantized.h.
+
+// iq4_xs: superblock nibble decode (kvalues_iq4nl), 6-bit per-sub-block scale.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct KqNaxIq4_xsBlockLoader {
+  MLX_MTL_CONST int weights_per_block = KQ_IQ4_XS_SUPERBLOCK;
+  MLX_MTL_CONST int bytes_per_block = KQ_IQ4_XS_BLOCK_BYTES;
+  MLX_MTL_CONST int k_tile_size = 32;
+  MLX_MTL_CONST int k_tiles_per_block = weights_per_block / k_tile_size;
+
+  static_assert(BCOLS == 64, "iq4_xs NAX loader requires BCOLS == 64.");
+  static_assert(
+      (BCOLS * BROWS) % tgp_size == 0,
+      "tgp_size must evenly divide BCOLS * BROWS.");
+
+  MLX_MTL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
+  static_assert(n_reads == k_tile_size, "iq4_xs NAX expects n_reads == 32.");
+
+  const int src_ld;
+  const int row_bytes;
+  const int tile_stride;
+  const short fixed_kt_base;
+
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+  short kt_base;
+
+  KqNaxIq4_xsBlockLoader(
+      const device uint8_t* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      int col_in_block = 0)
+      : src_ld(src_ld_),
+        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        tile_stride(
+            reduction_dim
+                ? 0
+                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+        fixed_kt_base(reduction_dim == 0 ? (col_in_block / k_tile_size) : 0),
+        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj((thread_idx % TCOLS) * n_reads),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
+        kt_base(0) {}
+
+  void load_unsafe() const {
+    const short sb =
+        (reduction_dim == 1 ? kt_base : fixed_kt_base) + bj / k_tile_size;
+    const float d = float(*(const device half*)src);
+    const uint16_t scales_h = uint16_t(src[2]) | (uint16_t(src[3]) << 8);
+    const device uint8_t* scales_l = src + KQ_IQ4_XS_SCALESL_OFFSET;
+    const int ls = ((scales_l[sb / 2] >> (4 * (sb & 1))) & 0xf) |
+        (((scales_h >> (2 * sb)) & 3) << 4);
+    const float dl = d * float(ls - 32);
+    const device uint8_t* qs = src + KQ_IQ4_XS_QS_OFFSET + sb * 16;
+#pragma unroll
+    for (short i = 0; i < n_reads; i++) {
+      const int p = i;
+      const bool is_high = p >= 16;
+      const int b = is_high ? (p - 16) : p;
+      const int nib = is_high ? (qs[b] >> 4) : (qs[b] & 0xf);
+      dst[i] = T(dl * float(kvalues_iq4nl[nib]));
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    if (bi >= src_tile_dim.y) {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() {
+    if (reduction_dim == 1) {
+      kt_base += 2;
+      if (kt_base == k_tiles_per_block) {
+        kt_base = 0;
+        src += bytes_per_block;
+      }
+    } else {
+      src += tile_stride;
+    }
+  }
+};
+
+// iq3_xxs: 3-bit grid (iq3xxs_grid) + ksigns_iq2xs signs, gas-packed scale.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct KqNaxIq3_xxsBlockLoader {
+  MLX_MTL_CONST int weights_per_block = KQ_IQ3_XXS_SUPERBLOCK;
+  MLX_MTL_CONST int bytes_per_block = KQ_IQ3_XXS_BLOCK_BYTES;
+  MLX_MTL_CONST int k_tile_size = 32;
+  MLX_MTL_CONST int k_tiles_per_block = weights_per_block / k_tile_size;
+
+  static_assert(BCOLS == 64, "iq3_xxs NAX loader requires BCOLS == 64.");
+  static_assert(
+      (BCOLS * BROWS) % tgp_size == 0,
+      "tgp_size must evenly divide BCOLS * BROWS.");
+
+  MLX_MTL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
+  static_assert(n_reads == k_tile_size, "iq3_xxs NAX expects n_reads == 32.");
+
+  const int src_ld;
+  const int row_bytes;
+  const int tile_stride;
+  const short fixed_kt_base;
+
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+  short kt_base;
+
+  KqNaxIq3_xxsBlockLoader(
+      const device uint8_t* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      int col_in_block = 0)
+      : src_ld(src_ld_),
+        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        tile_stride(
+            reduction_dim
+                ? 0
+                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+        fixed_kt_base(reduction_dim == 0 ? (col_in_block / k_tile_size) : 0),
+        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj((thread_idx % TCOLS) * n_reads),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
+        kt_base(0) {}
+
+  void load_unsafe() const {
+    const short sb =
+        (reduction_dim == 1 ? kt_base : fixed_kt_base) + bj / k_tile_size;
+    const float d = float(*(const device half*)src);
+    const device uint8_t* qs = src + KQ_IQ3_XXS_QS_OFFSET + sb * 8;
+    const device uint8_t* gas = src + KQ_IQ3_XXS_GAS_OFFSET + sb * 4;
+    const uint aux32 = uint(gas[0]) | (uint(gas[1]) << 8) |
+        (uint(gas[2]) << 16) | (uint(gas[3]) << 24);
+    const float db = d * (0.5f + float(aux32 >> 28)) * 0.5f;
+#pragma unroll
+    for (short i = 0; i < n_reads; i++) {
+      const int p = i;
+      const int l = p / 8;
+      const int jpos = p % 8;
+      const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+      const uint g = iq3xxs_grid[jpos < 4 ? qs[2 * l] : qs[2 * l + 1]];
+      const int jj = jpos < 4 ? jpos : jpos - 4;
+      const float gb = float((g >> (8 * jj)) & 0xff);
+      const float sgn = (signs & kmask_iq2xs[jpos]) ? -1.f : 1.f;
+      dst[i] = T(db * gb * sgn);
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    if (bi >= src_tile_dim.y) {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() {
+    if (reduction_dim == 1) {
+      kt_base += 2;
+      if (kt_base == k_tiles_per_block) {
+        kt_base = 0;
+        src += bytes_per_block;
+      }
+    } else {
+      src += tile_stride;
+    }
+  }
+};
+
+// iq3_s: 3-bit grid (iq3s_grid) with qh high bit + per-byte signs.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct KqNaxIq3_sBlockLoader {
+  MLX_MTL_CONST int weights_per_block = KQ_IQ3_S_SUPERBLOCK;
+  MLX_MTL_CONST int bytes_per_block = KQ_IQ3_S_BLOCK_BYTES;
+  MLX_MTL_CONST int k_tile_size = 32;
+  MLX_MTL_CONST int k_tiles_per_block = weights_per_block / k_tile_size;
+
+  static_assert(BCOLS == 64, "iq3_s NAX loader requires BCOLS == 64.");
+  static_assert(
+      (BCOLS * BROWS) % tgp_size == 0,
+      "tgp_size must evenly divide BCOLS * BROWS.");
+
+  MLX_MTL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
+  static_assert(n_reads == k_tile_size, "iq3_s NAX expects n_reads == 32.");
+
+  const int src_ld;
+  const int row_bytes;
+  const int tile_stride;
+  const short fixed_kt_base;
+
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+  short kt_base;
+
+  KqNaxIq3_sBlockLoader(
+      const device uint8_t* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      int col_in_block = 0)
+      : src_ld(src_ld_),
+        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        tile_stride(
+            reduction_dim
+                ? 0
+                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+        fixed_kt_base(reduction_dim == 0 ? (col_in_block / k_tile_size) : 0),
+        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj((thread_idx % TCOLS) * n_reads),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
+        kt_base(0) {}
+
+  void load_unsafe() const {
+    const short sb =
+        (reduction_dim == 1 ? kt_base : fixed_kt_base) + bj / k_tile_size;
+    const float d = float(*(const device half*)src);
+    const device uint8_t* scales = src + KQ_IQ3_S_SCALES_OFFSET;
+    const float db =
+        d * float(1 + 2 * ((scales[sb / 2] >> (4 * (sb & 1))) & 0xf));
+    const uint qh = src[KQ_IQ3_S_QH_OFFSET + sb];
+    const device uint8_t* qs = src + KQ_IQ3_S_QS_OFFSET + sb * 8;
+    const device uint8_t* sg = src + KQ_IQ3_S_SIGNS_OFFSET + sb * 4;
+#pragma unroll
+    for (short i = 0; i < n_reads; i++) {
+      const int p = i;
+      const int l = p / 8;
+      const int jpos = p % 8;
+      const uint8_t signs = sg[l];
+      const uint idx = (jpos < 4)
+          ? (qs[2 * l] | ((qh << (8 - 2 * l)) & 256))
+          : (qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256));
+      const uint g = iq3s_grid[idx];
+      const int jj = jpos < 4 ? jpos : jpos - 4;
+      const float gb = float((g >> (8 * jj)) & 0xff);
+      const float sgn = (signs & kmask_iq2xs[jpos]) ? -1.f : 1.f;
+      dst[i] = T(db * gb * sgn);
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    if (bi >= src_tile_dim.y) {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() {
+    if (reduction_dim == 1) {
+      kt_base += 2;
+      if (kt_base == k_tiles_per_block) {
+        kt_base = 0;
+        src += bytes_per_block;
+      }
+    } else {
+      src += tile_stride;
+    }
+  }
+};
+
+// iq2_xxs: 2-bit grid (iq2xxs_grid uint64) + ksigns, signbits-packed scale.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct KqNaxIq2_xxsBlockLoader {
+  MLX_MTL_CONST int weights_per_block = KQ_IQ2_XXS_SUPERBLOCK;
+  MLX_MTL_CONST int bytes_per_block = KQ_IQ2_XXS_BLOCK_BYTES;
+  MLX_MTL_CONST int k_tile_size = 32;
+  MLX_MTL_CONST int k_tiles_per_block = weights_per_block / k_tile_size;
+
+  static_assert(BCOLS == 64, "iq2_xxs NAX loader requires BCOLS == 64.");
+  static_assert(
+      (BCOLS * BROWS) % tgp_size == 0,
+      "tgp_size must evenly divide BCOLS * BROWS.");
+
+  MLX_MTL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
+  static_assert(n_reads == k_tile_size, "iq2_xxs NAX expects n_reads == 32.");
+
+  const int src_ld;
+  const int row_bytes;
+  const int tile_stride;
+  const short fixed_kt_base;
+
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+  short kt_base;
+
+  KqNaxIq2_xxsBlockLoader(
+      const device uint8_t* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      int col_in_block = 0)
+      : src_ld(src_ld_),
+        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        tile_stride(
+            reduction_dim
+                ? 0
+                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+        fixed_kt_base(reduction_dim == 0 ? (col_in_block / k_tile_size) : 0),
+        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj((thread_idx % TCOLS) * n_reads),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
+        kt_base(0) {}
+
+  void load_unsafe() const {
+    const short sb =
+        (reduction_dim == 1 ? kt_base : fixed_kt_base) + bj / k_tile_size;
+    const float d = float(*(const device half*)src);
+    const device uint8_t* qs = src + KQ_IQ2_XXS_QS_OFFSET + sb * 8;
+    const uint signbits = uint(qs[4]) | (uint(qs[5]) << 8) |
+        (uint(qs[6]) << 16) | (uint(qs[7]) << 24);
+    const float db = d * (0.5f + float(signbits >> 28)) * 0.25f;
+#pragma unroll
+    for (short i = 0; i < n_reads; i++) {
+      const int p = i;
+      const int l = p / 8;
+      const int j = p % 8;
+      const uint8_t signs = ksigns_iq2xs[(signbits >> (7 * l)) & 127];
+      const uint64_t g = iq2xxs_grid[qs[l]];
+      const float gb = float((g >> (8 * j)) & 0xff);
+      const float sgn = (signs & kmask_iq2xs[j]) ? -1.f : 1.f;
+      dst[i] = T(db * gb * sgn);
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    if (bi >= src_tile_dim.y) {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() {
+    if (reduction_dim == 1) {
+      kt_base += 2;
+      if (kt_base == k_tiles_per_block) {
+        kt_base = 0;
+        src += bytes_per_block;
+      }
+    } else {
+      src += tile_stride;
+    }
+  }
+};
+
+// iq2_xs: 2-bit grid (iq2xs_grid) with 9-bit packed index + ksigns, nibble sc.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct KqNaxIq2_xsBlockLoader {
+  MLX_MTL_CONST int weights_per_block = KQ_IQ2_XS_SUPERBLOCK;
+  MLX_MTL_CONST int bytes_per_block = KQ_IQ2_XS_BLOCK_BYTES;
+  MLX_MTL_CONST int k_tile_size = 32;
+  MLX_MTL_CONST int k_tiles_per_block = weights_per_block / k_tile_size;
+
+  static_assert(BCOLS == 64, "iq2_xs NAX loader requires BCOLS == 64.");
+  static_assert(
+      (BCOLS * BROWS) % tgp_size == 0,
+      "tgp_size must evenly divide BCOLS * BROWS.");
+
+  MLX_MTL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
+  static_assert(n_reads == k_tile_size, "iq2_xs NAX expects n_reads == 32.");
+
+  const int src_ld;
+  const int row_bytes;
+  const int tile_stride;
+  const short fixed_kt_base;
+
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+  short kt_base;
+
+  KqNaxIq2_xsBlockLoader(
+      const device uint8_t* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      int col_in_block = 0)
+      : src_ld(src_ld_),
+        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        tile_stride(
+            reduction_dim
+                ? 0
+                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+        fixed_kt_base(reduction_dim == 0 ? (col_in_block / k_tile_size) : 0),
+        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj((thread_idx % TCOLS) * n_reads),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
+        kt_base(0) {}
+
+  void load_unsafe() const {
+    const short sb =
+        (reduction_dim == 1 ? kt_base : fixed_kt_base) + bj / k_tile_size;
+    const float d = float(*(const device half*)src);
+    const device uint8_t* qs = src + KQ_IQ2_XS_QS_OFFSET + sb * 8;
+    const uint8_t sc = src[KQ_IQ2_XS_SCALES_OFFSET + sb];
+#pragma unroll
+    for (short i = 0; i < n_reads; i++) {
+      const int p = i;
+      const int l = p / 8;
+      const int j = p % 8;
+      const int sc_nib = (l < 2) ? (sc & 0xf) : (sc >> 4);
+      const float db = d * (0.5f + float(sc_nib)) * 0.25f;
+      const device uint8_t* qp = qs + l * 2;
+      const uint q = uint(qp[0]) | (uint(qp[1]) << 8);
+      const uint8_t signs = ksigns_iq2xs[q >> 9];
+      const uint64_t g = iq2xs_grid[q & 511];
+      const float gb = float((g >> (8 * j)) & 0xff);
+      const float sgn = (signs & kmask_iq2xs[j]) ? -1.f : 1.f;
+      dst[i] = T(db * gb * sgn);
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    if (bi >= src_tile_dim.y) {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() {
+    if (reduction_dim == 1) {
+      kt_base += 2;
+      if (kt_base == k_tiles_per_block) {
+        kt_base = 0;
+        src += bytes_per_block;
+      }
+    } else {
+      src += tile_stride;
+    }
+  }
+};
+
+// iq2_s: 2-bit grid (iq2s_grid) with qh high bits + per-byte signs, nibble sc.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct KqNaxIq2_sBlockLoader {
+  MLX_MTL_CONST int weights_per_block = KQ_IQ2_S_SUPERBLOCK;
+  MLX_MTL_CONST int bytes_per_block = KQ_IQ2_S_BLOCK_BYTES;
+  MLX_MTL_CONST int k_tile_size = 32;
+  MLX_MTL_CONST int k_tiles_per_block = weights_per_block / k_tile_size;
+
+  static_assert(BCOLS == 64, "iq2_s NAX loader requires BCOLS == 64.");
+  static_assert(
+      (BCOLS * BROWS) % tgp_size == 0,
+      "tgp_size must evenly divide BCOLS * BROWS.");
+
+  MLX_MTL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
+  static_assert(n_reads == k_tile_size, "iq2_s NAX expects n_reads == 32.");
+
+  const int src_ld;
+  const int row_bytes;
+  const int tile_stride;
+  const short fixed_kt_base;
+
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+  short kt_base;
+
+  KqNaxIq2_sBlockLoader(
+      const device uint8_t* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      int col_in_block = 0)
+      : src_ld(src_ld_),
+        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        tile_stride(
+            reduction_dim
+                ? 0
+                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+        fixed_kt_base(reduction_dim == 0 ? (col_in_block / k_tile_size) : 0),
+        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj((thread_idx % TCOLS) * n_reads),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
+        kt_base(0) {}
+
+  void load_unsafe() const {
+    const short sb =
+        (reduction_dim == 1 ? kt_base : fixed_kt_base) + bj / k_tile_size;
+    const float d = float(*(const device half*)src);
+    const device uint8_t* qs = src + KQ_IQ2_S_QS_OFFSET + sb * 4;
+    const device uint8_t* sg = src + KQ_IQ2_S_SIGNS_OFFSET + sb * 4;
+    const uint qh = src[KQ_IQ2_S_QH_OFFSET + sb];
+    const uint8_t sc = src[KQ_IQ2_S_SCALES_OFFSET + sb];
+#pragma unroll
+    for (short i = 0; i < n_reads; i++) {
+      const int p = i;
+      const int l = p / 8;
+      const int j = p % 8;
+      const int sc_nib = (l < 2) ? (sc & 0xf) : (sc >> 4);
+      const float db = d * (0.5f + float(sc_nib)) * 0.25f;
+      const uint idx = qs[l] | ((qh << (8 - 2 * l)) & 0x300);
+      const uint8_t signs = sg[l];
+      const uint64_t g = iq2s_grid[idx];
+      const float gb = float((g >> (8 * j)) & 0xff);
+      const float sgn = (signs & kmask_iq2xs[j]) ? -1.f : 1.f;
+      dst[i] = T(db * gb * sgn);
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    if (bi >= src_tile_dim.y) {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() {
+    if (reduction_dim == 1) {
+      kt_base += 2;
+      if (kt_base == k_tiles_per_block) {
+        kt_base = 0;
+        src += bytes_per_block;
+      }
+    } else {
+      src += tile_stride;
+    }
+  }
+};
+
+// iq1_s: 1-bit grid (iq1s_grid) with qh-derived scale + per-block delta sign.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct KqNaxIq1_sBlockLoader {
+  MLX_MTL_CONST int weights_per_block = KQ_IQ1_S_SUPERBLOCK;
+  MLX_MTL_CONST int bytes_per_block = KQ_IQ1_S_BLOCK_BYTES;
+  MLX_MTL_CONST int k_tile_size = 32;
+  MLX_MTL_CONST int k_tiles_per_block = weights_per_block / k_tile_size;
+
+  static_assert(BCOLS == 64, "iq1_s NAX loader requires BCOLS == 64.");
+  static_assert(
+      (BCOLS * BROWS) % tgp_size == 0,
+      "tgp_size must evenly divide BCOLS * BROWS.");
+
+  MLX_MTL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
+  static_assert(n_reads == k_tile_size, "iq1_s NAX expects n_reads == 32.");
+
+  const int src_ld;
+  const int row_bytes;
+  const int tile_stride;
+  const short fixed_kt_base;
+
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+  short kt_base;
+
+  KqNaxIq1_sBlockLoader(
+      const device uint8_t* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      int col_in_block = 0)
+      : src_ld(src_ld_),
+        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        tile_stride(
+            reduction_dim
+                ? 0
+                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+        fixed_kt_base(reduction_dim == 0 ? (col_in_block / k_tile_size) : 0),
+        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj((thread_idx % TCOLS) * n_reads),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
+        kt_base(0) {}
+
+  void load_unsafe() const {
+    const short sb =
+        (reduction_dim == 1 ? kt_base : fixed_kt_base) + bj / k_tile_size;
+    const float d = float(*(const device half*)src);
+    const device uint8_t* qhp = src + KQ_IQ1_S_QH_OFFSET + sb * 2;
+    const uint qh = uint(qhp[0]) | (uint(qhp[1]) << 8);
+    const device uint8_t* qs = src + KQ_IQ1_S_QS_OFFSET + sb * 4;
+    const float dl = d * float(2 * int((qh >> 12) & 7) + 1);
+    const float delta = (qh & 0x8000) ? -0.125f : 0.125f;
+#pragma unroll
+    for (short i = 0; i < n_reads; i++) {
+      const int p = i;
+      const int l = p / 8;
+      const int j = p % 8;
+      const uint idx = uint(qs[l]) | (((qh >> (3 * l)) & 7) << 8);
+      const int8_t gv =
+          as_type<int8_t>(uint8_t((iq1s_grid[idx] >> (8 * j)) & 0xff));
+      dst[i] = T(dl * (float(gv) + delta));
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    if (bi >= src_tile_dim.y) {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() {
+    if (reduction_dim == 1) {
+      kt_base += 2;
+      if (kt_base == k_tiles_per_block) {
+        kt_base = 0;
+        src += bytes_per_block;
+      }
+    } else {
+      src += tile_stride;
+    }
+  }
+};
+
+// iq1_m: 1-bit grid (iq1s_grid) with reconstructed d, per-half scale + delta.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct KqNaxIq1_mBlockLoader {
+  MLX_MTL_CONST int weights_per_block = KQ_IQ1_M_SUPERBLOCK;
+  MLX_MTL_CONST int bytes_per_block = KQ_IQ1_M_BLOCK_BYTES;
+  MLX_MTL_CONST int k_tile_size = 32;
+  MLX_MTL_CONST int k_tiles_per_block = weights_per_block / k_tile_size;
+
+  static_assert(BCOLS == 64, "iq1_m NAX loader requires BCOLS == 64.");
+  static_assert(
+      (BCOLS * BROWS) % tgp_size == 0,
+      "tgp_size must evenly divide BCOLS * BROWS.");
+
+  MLX_MTL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
+  static_assert(n_reads == k_tile_size, "iq1_m NAX expects n_reads == 32.");
+
+  const int src_ld;
+  const int row_bytes;
+  const int tile_stride;
+  const short fixed_kt_base;
+
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+  short kt_base;
+
+  KqNaxIq1_mBlockLoader(
+      const device uint8_t* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      int col_in_block = 0)
+      : src_ld(src_ld_),
+        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        tile_stride(
+            reduction_dim
+                ? 0
+                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+        fixed_kt_base(reduction_dim == 0 ? (col_in_block / k_tile_size) : 0),
+        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj((thread_idx % TCOLS) * n_reads),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
+        kt_base(0) {}
+
+  void load_unsafe() const {
+    const short sb =
+        (reduction_dim == 1 ? kt_base : fixed_kt_base) + bj / k_tile_size;
+    const device uint8_t* scp = src + KQ_IQ1_M_SCALES_OFFSET;
+    const ushort sc0 = ushort(scp[0]) | (ushort(scp[1]) << 8);
+    const ushort sc1 = ushort(scp[2]) | (ushort(scp[3]) << 8);
+    const ushort sc2 = ushort(scp[4]) | (ushort(scp[5]) << 8);
+    const ushort sc3 = ushort(scp[6]) | (ushort(scp[7]) << 8);
+    const ushort scale_u16 = (sc0 >> 12) | ((sc1 >> 8) & 0x00f0) |
+        ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000);
+    const float d = float(as_type<half>(scale_u16));
+    const device uint8_t* swp = scp + (sb / 2) * 2;
+    const uint sc_word = uint(swp[0]) | (uint(swp[1]) << 8);
+    const device uint8_t* qhp = src + KQ_IQ1_M_QH_OFFSET + sb * 2;
+    const device uint8_t* qs = src + KQ_IQ1_M_QS_OFFSET + sb * 4;
+#pragma unroll
+    for (short i = 0; i < n_reads; i++) {
+      const int p = i;
+      const int l = p / 8;
+      const int j = p % 8;
+      const int shift = 6 * (sb & 1) + ((l < 2) ? 0 : 3);
+      const float dl = d * float(2 * int((sc_word >> shift) & 7) + 1);
+      const uint8_t qh = qhp[l / 2];
+      const int hshift = (l & 1) ? 4 : 8;
+      const uint idx = uint(qs[l]) | ((uint(qh) << hshift) & 0x700);
+      const float delta = (qh & ((l & 1) ? 0x80 : 0x08)) ? -0.125f : 0.125f;
+      const int8_t gv =
+          as_type<int8_t>(uint8_t((iq1s_grid[idx] >> (8 * j)) & 0xff));
+      dst[i] = T(dl * (float(gv) + delta));
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    if (bi >= src_tile_dim.y) {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() {
+    if (reduction_dim == 1) {
+      kt_base += 2;
+      if (kt_base == k_tiles_per_block) {
+        kt_base = 0;
+        src += bytes_per_block;
+      }
+    } else {
+      src += tile_stride;
+    }
+  }
+};
+
+KQ_NAX_DEFINE_KERNELS(iq4_nl, 32, 4, KqNaxIq4_nlBlockLoader)
+KQ_NAX_DEFINE_KERNELS(iq4_xs, 256, 4, KqNaxIq4_xsBlockLoader)
+KQ_NAX_DEFINE_KERNELS(iq3_xxs, 256, 3, KqNaxIq3_xxsBlockLoader)
+KQ_NAX_DEFINE_KERNELS(iq3_s, 256, 3, KqNaxIq3_sBlockLoader)
+KQ_NAX_DEFINE_KERNELS(iq2_xxs, 256, 2, KqNaxIq2_xxsBlockLoader)
+KQ_NAX_DEFINE_KERNELS(iq2_xs, 256, 2, KqNaxIq2_xsBlockLoader)
+KQ_NAX_DEFINE_KERNELS(iq2_s, 256, 2, KqNaxIq2_sBlockLoader)
+KQ_NAX_DEFINE_KERNELS(iq1_s, 256, 1, KqNaxIq1_sBlockLoader)
+KQ_NAX_DEFINE_KERNELS(iq1_m, 256, 1, KqNaxIq1_mBlockLoader)
 KQ_NAX_DEFINE_KERNELS(q4_0, 32, 4, KqNaxQ4_0BlockLoader)
 KQ_NAX_DEFINE_KERNELS(q4_1, 32, 4, KqNaxQ4_1BlockLoader)
 KQ_NAX_DEFINE_KERNELS(q5_0, 32, 5, KqNaxQ5_0BlockLoader)
@@ -2555,6 +3501,15 @@ METAL_FUNC void kq_gather_qmm_rhs_nax_tgp_impl(
 
 KQ_NAX_DEFINE_GATHER_RHS(q8_0, 32, 8, KqNaxQ8_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(q5_1, 32, 5, KqNaxQ5_1BlockLoader)
+KQ_NAX_DEFINE_GATHER_RHS(iq4_nl, 32, 4, KqNaxIq4_nlBlockLoader)
+KQ_NAX_DEFINE_GATHER_RHS(iq4_xs, 256, 4, KqNaxIq4_xsBlockLoader)
+KQ_NAX_DEFINE_GATHER_RHS(iq3_xxs, 256, 3, KqNaxIq3_xxsBlockLoader)
+KQ_NAX_DEFINE_GATHER_RHS(iq3_s, 256, 3, KqNaxIq3_sBlockLoader)
+KQ_NAX_DEFINE_GATHER_RHS(iq2_xxs, 256, 2, KqNaxIq2_xxsBlockLoader)
+KQ_NAX_DEFINE_GATHER_RHS(iq2_xs, 256, 2, KqNaxIq2_xsBlockLoader)
+KQ_NAX_DEFINE_GATHER_RHS(iq2_s, 256, 2, KqNaxIq2_sBlockLoader)
+KQ_NAX_DEFINE_GATHER_RHS(iq1_s, 256, 1, KqNaxIq1_sBlockLoader)
+KQ_NAX_DEFINE_GATHER_RHS(iq1_m, 256, 1, KqNaxIq1_mBlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(q4_0, 32, 4, KqNaxQ4_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(q4_1, 32, 4, KqNaxQ4_1BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(q5_0, 32, 5, KqNaxQ5_0BlockLoader)

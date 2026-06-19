@@ -9,6 +9,7 @@
 
 #ifdef _METAL_
 
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <tuple>
@@ -77,6 +78,13 @@ inline bool codec_has_matmul(const std::string& kquant_type) {
 // Gates the NAX (tensor-core) dispatch. IQ codecs ship ALU-only, so this is
 // false for them and their qmm/gather route to the ALU kernels.
 inline bool codec_has_nax(const std::string& kquant_type) {
+  // KQ_DISABLE_NAX=1 forces the ALU qmm/gather path (A/B harness lever). Read
+  // live (not cached) so a single process can toggle NAX between calls; only
+  // reached on the NAX-eligible prefill path, so the getenv cost is negligible.
+  const char* e = std::getenv("KQ_DISABLE_NAX");
+  if (e != nullptr && e[0] == '1') {
+    return false;
+  }
   const KQuantCodec* codec = codec_by_name(kquant_type);
   return codec != nullptr && codec->has_nax_kernel;
 }

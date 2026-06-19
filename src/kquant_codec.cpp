@@ -5,7 +5,8 @@ namespace mlx_kquant {
 // Per-codec block geometry:
 //   {name, weights_per_block, bytes_per_block, bits, has_matmul, has_encode,
 //   has_nax}
-// IQ codecs are load-only (no encoder) and ALU-only for now (no NAX kernels).
+// IQ codecs are decode-only for now (no encoder); all carry NAX prefill
+// kernels.
 static const std::vector<KQuantCodec>& registry() {
   static const std::vector<KQuantCodec> codecs = {
       {"q2_k", 256, 84, 2, true, true, true},
@@ -18,15 +19,15 @@ static const std::vector<KQuantCodec>& registry() {
       {"q5_0", 32, 22, 5, true, true, true},
       {"q5_1", 32, 24, 5, true, true, true},
       {"q8_0", 32, 34, 8, true, true, true},
-      {"iq4_nl", 32, 18, 4, true, false, false},
-      {"iq4_xs", 256, 136, 4, true, false, false},
-      {"iq3_s", 256, 110, 3, true, false, false},
-      {"iq3_xxs", 256, 98, 3, true, false, false},
-      {"iq2_xxs", 256, 66, 2, true, false, false},
-      {"iq2_xs", 256, 74, 2, true, false, false},
-      {"iq2_s", 256, 82, 2, true, false, false},
-      {"iq1_s", 256, 50, 1, true, false, false},
-      {"iq1_m", 256, 56, 1, true, false, false},
+      {"iq4_nl", 32, 18, 4, true, false, true},
+      {"iq4_xs", 256, 136, 4, true, false, true},
+      {"iq3_s", 256, 110, 3, true, false, true},
+      {"iq3_xxs", 256, 98, 3, true, false, true},
+      {"iq2_xxs", 256, 66, 2, true, false, true},
+      {"iq2_xs", 256, 74, 2, true, false, true},
+      {"iq2_s", 256, 82, 2, true, false, true},
+      {"iq1_s", 256, 50, 1, true, false, true},
+      {"iq1_m", 256, 56, 1, true, false, true},
   };
   return codecs;
 }
