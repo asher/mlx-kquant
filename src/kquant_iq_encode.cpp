@@ -12,10 +12,16 @@
 #include "kquant_iq_encode.h"
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstring>
+#include <mutex>
+#include <stdexcept>
+#include <utility>
+#include <vector>
 
-#include "kquant_cpu_encode_util.h" // write_f16, kq_nearest_int (anon-ns, per-TU)
+#include "kquant_cpu_encode_util.h" // write_f16, kq_nearest_int, kq_make_qp_quants
+#include "kquant_iq_encode_tables.h" // kgrid_2bit_*, kgrid_1bit_2048, kgrid_256/512
 #include "kquant_iq_tables.h" // kvalues_iq4nl
 
 #include "mlx/types/half_types.h"
@@ -200,6 +206,385 @@ void quantize_iq4_block(
   }
 }
 
+// ---- IQ grid inverse-index machinery (ggml iq2xs_init_impl / iq3xs_init_impl)
+//
+// The grid IQ codecs search a lattice. ggml precomputes per grid: the expanded
+// grid (each entry's NVALS values as 2l+1), an inverse map
+// kmap[packed_index] -> grid index (negative sentinel for off-grid points), and
+// a flat kneighbours list giving the nearest grid points for every off-grid
+// packed index. We build the same three arrays from the compact init grids
+// (kquant_iq_encode_tables.h). NB: this expanded grid is the SEARCH
+// representation (odd 2l+1 values), distinct from the decode tables in
+// kquant_iq_tables.h, which hold the reconstruction values. iq2 family: uint64
+// grid, 8 values, 2 bits each; iq3 family: uint32 grid, 4 values, 3 bits each.
+
+template <typename GridT, int NVALS, int BITS>
+struct IqGridIndex {
+  std::vector<GridT> grid; // expanded grid: NVALS bytes of 2l+1 per entry
+  std::vector<int> kmap; // packed index -> grid index, or -(offset+1)
+  std::vector<uint16_t> kneighbours; // [count, idx...] slice per off-grid slot
+};
+
+template <typename GridT, int NVALS, int BITS>
+void build_iq_grid_index(
+    const uint16_t* kgrid,
+    int grid_size,
+    int kmap_size,
+    int nwant,
+    IqGridIndex<GridT, NVALS, BITS>& out) {
+  constexpr int mask = (1 << BITS) - 1;
+
+  // Expand the compact grid into the 2l+1 search representation.
+  out.grid.resize(grid_size);
+  for (int k = 0; k < grid_size; ++k) {
+    auto* pos = reinterpret_cast<int8_t*>(&out.grid[k]);
+    for (int i = 0; i < NVALS; ++i) {
+      int l = (kgrid[k] >> (BITS * i)) & mask;
+      pos[i] = int8_t(2 * l + 1);
+    }
+  }
+
+  // Invert: kmap[packed index of grid entry] = entry index; -1 otherwise. The
+  // packed index recovered here equals kgrid[k] (the compact entry), which the
+  // table guarantees is < kmap_size.
+  out.kmap.assign(kmap_size, -1);
+  for (int i = 0; i < grid_size; ++i) {
+    const auto* aux8 = reinterpret_cast<const uint8_t*>(&out.grid[i]);
+    int index = 0;
+    for (int k = 0; k < NVALS; ++k) {
+      int q = (aux8[k] - 1) / 2;
+      index |= (q << (BITS * k));
+    }
+    if (index < 0 || index >= kmap_size) {
+      throw std::runtime_error(
+          "[mlx_kquant] quantize: IQ grid index out of range");
+    }
+    out.kmap[index] = i;
+  }
+
+  // For each off-grid packed index, collect its nearest grid points (within
+  // `nwant` distinct squared distances). ggml ties on grid index (a total
+  // order), so the result is deterministic without its OpenMP parallelism.
+  std::vector<std::vector<uint16_t>> nbr(kmap_size);
+  std::vector<std::pair<int, int>> dist2(grid_size);
+  int8_t pos[NVALS];
+  std::size_t total = 0;
+  for (int i = 0; i < kmap_size; ++i) {
+    if (out.kmap[i] >= 0) {
+      continue;
+    }
+    for (int k = 0; k < NVALS; ++k) {
+      int l = (i >> (BITS * k)) & mask;
+      pos[k] = int8_t(2 * l + 1);
+    }
+    for (int j = 0; j < grid_size; ++j) {
+      const auto* pg = reinterpret_cast<const int8_t*>(&out.grid[j]);
+      int d2 = 0;
+      for (int k = 0; k < NVALS; ++k) {
+        int diff = pg[k] - pos[k];
+        d2 += diff * diff;
+      }
+      dist2[j] = {d2, j};
+    }
+    std::sort(dist2.begin(), dist2.end()); // by distance, then grid index
+    int d2 = dist2[0].first, nhave = 1;
+    for (int j = 0; j < grid_size; ++j) {
+      if (dist2[j].first > d2) {
+        if (nhave == nwant) {
+          break;
+        }
+        d2 = dist2[j].first;
+        ++nhave;
+      }
+      nbr[i].push_back(uint16_t(dist2[j].second));
+    }
+    total += 1 + nbr[i].size();
+  }
+
+  // Flatten into [count, idx...] slices; the kmap sentinel for an off-grid slot
+  // is -(offset+1), so the encoder recovers the slice via `kneighbours - kmap -
+  // 1`.
+  out.kneighbours.resize(total);
+  int counter = 0;
+  for (int i = 0; i < kmap_size; ++i) {
+    if (out.kmap[i] >= 0) {
+      continue;
+    }
+    out.kmap[i] = -(counter + 1);
+    out.kneighbours[counter++] = uint16_t(nbr[i].size());
+    for (uint16_t idx : nbr[i]) {
+      out.kneighbours[counter++] = idx;
+    }
+  }
+}
+
+using Iq2Index = IqGridIndex<uint64_t, 8, 2>;
+
+// iq2 family (ggml iq2_data gindex): 0=iq2_xxs(256), 1=iq2_xs(512),
+// 2=iq1_s/iq1_m(2048, shared), 3=iq2_s(1024). All share kmap_size 43692. Built
+// once per gindex on first use; the returned reference is read-only thereafter.
+const Iq2Index& iq2_index(int gindex) {
+  static Iq2Index idx[4];
+  static std::once_flag flag[4];
+  std::call_once(flag[gindex], [gindex] {
+    constexpr int kmap_size = 43692;
+    switch (gindex) {
+      case 0:
+        build_iq_grid_index(kgrid_2bit_256, 256, kmap_size, 2, idx[0]);
+        break;
+      case 1:
+        build_iq_grid_index(kgrid_2bit_512, 512, kmap_size, 2, idx[1]);
+        break;
+      case 2:
+        build_iq_grid_index(kgrid_1bit_2048, 2048, kmap_size, 3, idx[2]);
+        break;
+      case 3:
+        build_iq_grid_index(kgrid_2bit_1024, 1024, kmap_size, 1, idx[3]);
+        break;
+    }
+  });
+  return idx[gindex];
+}
+
+// ggml iq2_find_best_neighbour (ggml-quants.c:3198): of an off-grid point's
+// candidate neighbours, pick the one minimising weighted squared error to the
+// scaled lattice point, and write its (value-1)/2 levels into L.
+int iq2_find_best_neighbour(
+    const uint16_t* neighbours,
+    const uint64_t* grid,
+    const float* xval,
+    const float* weight,
+    float scale,
+    int8_t* L) {
+  int num_neighbors = neighbours[0];
+  float best_d2 = FLT_MAX;
+  int grid_index = -1;
+  for (int j = 1; j <= num_neighbors; ++j) {
+    const auto* pg = reinterpret_cast<const int8_t*>(grid + neighbours[j]);
+    float d2 = 0;
+    for (int i = 0; i < 8; ++i) {
+      float q = pg[i];
+      float diff = scale * q - xval[i];
+      d2 += weight[i] * diff * diff;
+    }
+    if (d2 < best_d2) {
+      best_d2 = d2;
+      grid_index = neighbours[j];
+    }
+  }
+  const auto* pg = reinterpret_cast<const int8_t*>(grid + grid_index);
+  for (int i = 0; i < 8; ++i) {
+    L[i] = (pg[i] - 1) / 2;
+  }
+  return grid_index;
+}
+
+// Port of ggml quantize_row_iq2_xxs_impl (ggml-quants.c:3222) for one QK_K=256
+// super-block -> block_iq2_xxs wire layout ([fp16 d][u16 qs[32]] = 66 bytes).
+// imatrix-required: quant_weights is non-null (enforced at the op level).
+template <typename T>
+void quantize_iq2_xxs_block(
+    const T* x,
+    uint8_t* block,
+    const float* quant_weights) {
+  constexpr int kMaxQ = 3;
+  const Iq2Index& gi = iq2_index(0);
+  const uint64_t* kgrid_q2xs = gi.grid.data();
+  const int* kmap_q2xs = gi.kmap.data();
+  const uint16_t* kneighbors_q2xs = gi.kneighbours.data();
+
+  float scales[8]; // QK_K/32
+  float weight[32];
+  float xval[32];
+  int8_t L[32];
+  int8_t Laux[32];
+  float waux[32];
+  uint8_t block_signs[4];
+  uint32_t q2[16]; // 2*(QK_K/32)
+  std::memset(q2, 0, sizeof(q2));
+
+  float sumx2 = 0;
+  for (int i = 0; i < 256; ++i) {
+    float v = float(x[i]);
+    sumx2 += v * v;
+  }
+  float sigma2 = sumx2 / 256.0f;
+
+  float max_scale = 0;
+  for (int ib = 0; ib < 8; ++ib) {
+    const T* xb = x + 32 * ib;
+    const float* qw = quant_weights + 32 * ib;
+    for (int i = 0; i < 32; ++i) {
+      float v = float(xb[i]);
+      weight[i] = qw[i] * std::sqrt(sigma2 + v * v);
+    }
+    for (int i = 0; i < 32; ++i) {
+      waux[i] = std::sqrt(weight[i]);
+    }
+    for (int k = 0; k < 4; ++k) {
+      int nflip = 0;
+      uint8_t s = 0;
+      for (int i = 0; i < 8; ++i) {
+        float v = float(xb[8 * k + i]);
+        if (v >= 0) {
+          xval[8 * k + i] = v;
+        } else {
+          xval[8 * k + i] = -v;
+          ++nflip;
+          s |= (1 << i);
+        }
+      }
+      if (nflip % 2) {
+        int imin = 0;
+        float v0 = float(xb[8 * k]);
+        float mn = weight[8 * k] * v0 * v0;
+        for (int i = 1; i < 8; ++i) {
+          float vi = float(xb[8 * k + i]);
+          float ax = weight[8 * k + i] * vi * vi;
+          if (ax < mn) {
+            mn = ax;
+            imin = i;
+          }
+        }
+        xval[8 * k + imin] = -xval[8 * k + imin];
+        s ^= (1 << imin);
+      }
+      block_signs[k] = s & 127;
+    }
+    float mx = xval[0];
+    for (int i = 1; i < 32; ++i) {
+      mx = std::max(mx, xval[i]);
+    }
+    if (mx < GROUP_MAX_EPS) {
+      scales[ib] = 0;
+      std::memset(L, 0, 32);
+      continue;
+    }
+    float scale = kq_make_qp_quants<32>(
+        xval, weight, kMaxQ + 1, (uint8_t*)L, GROUP_MAX_EPS);
+    float eff_max = scale * kMaxQ;
+    if (eff_max <= 0) {
+      scales[ib] = 0;
+      std::memset(L, 0, 32);
+      continue;
+    }
+    float best = 0;
+    for (int is = -6; is <= 6; ++is) {
+      float id = (2 * kMaxQ - 1 + is * 0.1f) / eff_max;
+      float this_scale = 1 / id;
+      for (int k = 0; k < 4; ++k) {
+        for (int i = 0; i < 8; ++i) {
+          int l = kq_nearest_int(0.5f * (id * xval[8 * k + i] - 1));
+          Laux[8 * k + i] = int8_t(std::max(0, std::min(kMaxQ - 1, l)));
+        }
+        uint16_t u = 0;
+        for (int i = 0; i < 8; ++i) {
+          u |= (Laux[8 * k + i] << 2 * i);
+        }
+        int grid_index = kmap_q2xs[u];
+        if (grid_index < 0) {
+          const uint16_t* neighbours = kneighbors_q2xs - kmap_q2xs[u] - 1;
+          grid_index = iq2_find_best_neighbour(
+              neighbours,
+              kgrid_q2xs,
+              xval + 8 * k,
+              waux + 8 * k,
+              this_scale,
+              Laux + 8 * k);
+        }
+      }
+      float sumqx = 0, sumq2 = 0;
+      for (int i = 0; i < 32; ++i) {
+        float w = weight[i];
+        float q = 2 * Laux[i] + 1;
+        sumqx += w * xval[i] * q;
+        sumq2 += w * q * q;
+      }
+      if (sumq2 > 0 && sumqx * sumqx > best * sumq2) {
+        scale = sumqx / sumq2;
+        best = scale * sumqx;
+        std::memcpy(L, Laux, 32);
+      }
+    }
+    if (scale > 0) {
+      float id = 1 / scale;
+      for (int k = 0; k < 4; ++k) {
+        uint16_t u = 0;
+        for (int i = 0; i < 8; ++i) {
+          int l = kq_nearest_int(0.5f * (id * xval[8 * k + i] - 1));
+          l = std::max(0, std::min(kMaxQ - 1, l));
+          u |= (l << 2 * i);
+        }
+        int grid_index = kmap_q2xs[u];
+        if (grid_index < 0) {
+          const uint16_t* neighbours = kneighbors_q2xs - kmap_q2xs[u] - 1;
+          grid_index = iq2_find_best_neighbour(
+              neighbours,
+              kgrid_q2xs,
+              xval + 8 * k,
+              waux + 8 * k,
+              scale,
+              L + 8 * k);
+        }
+        const auto* pg =
+            reinterpret_cast<const int8_t*>(kgrid_q2xs + grid_index);
+        for (int i = 0; i < 8; ++i) {
+          L[8 * k + i] = (pg[i] - 1) / 2;
+        }
+      }
+      float sumqx = 0, sumq2 = 0;
+      for (int i = 0; i < 32; ++i) {
+        float w = weight[i];
+        float q = 2 * L[i] + 1;
+        sumqx += w * xval[i] * q;
+        sumq2 += w * q * q;
+      }
+      if (sumq2 > 0) {
+        scale = sumqx / sumq2;
+      }
+    }
+    if (scale < 0) {
+      // Should never happen; flip scale positive (the wire encodes an unsigned
+      // scale) and flip the quant signs to match.
+      scale = -scale;
+      for (int k = 0; k < 4; ++k) {
+        block_signs[k] = (~block_signs[k]) & 127;
+      }
+    }
+    for (int k = 0; k < 4; ++k) {
+      uint16_t u = 0;
+      for (int i = 0; i < 8; ++i) {
+        u |= (L[8 * k + i] << 2 * i);
+      }
+      int grid_index = kmap_q2xs[u];
+      if (grid_index < 0) {
+        throw std::runtime_error(
+            "[mlx_kquant] quantize: iq2_xxs produced a point not on the grid");
+      }
+      q2[2 * ib + 0] |= ((uint32_t)grid_index << 8 * k);
+      q2[2 * ib + 1] |= ((uint32_t)block_signs[k] << 7 * k);
+    }
+    scales[ib] = scale;
+    max_scale = std::max(max_scale, scale);
+  }
+
+  if (!max_scale) {
+    write_f16(block, 0.0f);
+    std::memset(block + 2, 0, 64);
+    return;
+  }
+
+  float d = max_scale / 31;
+  write_f16(block, d);
+  float id = 1 / d;
+  for (int ib = 0; ib < 8; ++ib) {
+    int l = kq_nearest_int(0.5f * (id * scales[ib] - 1));
+    l = std::max(0, std::min(15, l));
+    q2[2 * ib + 1] |= ((uint32_t)l << 28);
+  }
+  std::memcpy(block + 2, q2, 64);
+}
+
 } // namespace
 
 template <typename T>
@@ -224,6 +609,13 @@ void kquant_iq_quantize_dispatch(
     for (std::size_t b = 0; b < nblocks; ++b) {
       const float* qw = imatrix ? imatrix + ((b * wpb) % K) : nullptr;
       quantize_iq4_block<T>(wpb, w + b * wpb, out + b * bpb, qw, 7);
+    }
+  } else if (kquant_type == "iq2_xxs") {
+    constexpr int wpb = 256, bpb = 66;
+    std::size_t nblocks = num_weights / wpb;
+    for (std::size_t b = 0; b < nblocks; ++b) {
+      const float* qw = imatrix ? imatrix + ((b * wpb) % K) : nullptr;
+      quantize_iq2_xxs_block<T>(w + b * wpb, out + b * bpb, qw);
     }
   } else {
     throw std::runtime_error(

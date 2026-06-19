@@ -47,7 +47,6 @@ DECODE_ONLY_CODECS: frozenset[str] = frozenset(
     {
         "iq3_s",
         "iq3_xxs",
-        "iq2_xxs",
         "iq2_xs",
         "iq2_s",
         "iq1_s",
