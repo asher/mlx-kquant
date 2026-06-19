@@ -366,8 +366,21 @@ std::vector<mx::array> quantize(
       throw std::invalid_argument(msg.str());
     }
   }
+  if (codec->requires_imatrix && !imatrix.has_value()) {
+    throw std::invalid_argument(
+        "[mlx_kquant.quantize] codec '" + kquant_type +
+        "' requires an importance matrix (imatrix); ggml rejects encoding it "
+        "without one.");
+  }
 
   auto s = mx::to_stream(s_);
+  // IQ encode is CPU-only (ggml has no GPU IQ quantizer); force the op onto the
+  // CPU stream UNCONDITIONALLY so KQuantQuantize::eval_cpu runs (it needs a CPU
+  // command encoder) even if the caller passed stream=gpu -- there is no GPU IQ
+  // encoder to honor. All nine IQ codecs -- and no K-quant -- start with "iq".
+  if (kquant_type.rfind("iq", 0) == 0) {
+    s = mx::default_stream(mx::Device::cpu);
+  }
 
   auto wq_shape = w.shape();
   wq_shape.back() =

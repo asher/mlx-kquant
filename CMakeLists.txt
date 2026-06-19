@@ -96,12 +96,22 @@ target_sources(
   PUBLIC ${CMAKE_CURRENT_LIST_DIR}/src/kquant_codec.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_cpu_decode.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_cpu_encode.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_iq_encode.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_ops.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_dequantize.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_matmul.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gather.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_encode.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gguf.cpp)
+
+# The IQ CPU encoders must match llama-quantize bit-for-bit on the deterministic
+# codecs, so this TU is compiled with FMA contraction off (the float reductions
+# in the scale search are contraction-sensitive). Directory-scoped, so it applies
+# both to the mlx_kquant_ext library and to the nanobind module that recompiles
+# this PUBLIC source.
+set_source_files_properties(
+  ${CMAKE_CURRENT_LIST_DIR}/src/kquant_iq_encode.cpp
+  PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 
 target_include_directories(mlx_kquant_ext PUBLIC ${CMAKE_CURRENT_LIST_DIR}/src)
 # gguflib include/link are PUBLIC: target_sources above lists the .cpp as PUBLIC,

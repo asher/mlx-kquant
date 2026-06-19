@@ -21,6 +21,7 @@
 
 #include "kquant_codec.h"
 #include "kquant_cpu_encode_util.h" // write_f16, read_f16, kq_nearest_int, kq_make_qp_quants
+#include "kquant_iq_encode.h" // kquant_iq_quantize_dispatch (IQ codecs)
 
 #include "mlx/types/half_types.h"
 
@@ -851,8 +852,9 @@ void kquant_quantize_dispatch(
   } else if (kquant_type == "q6_k") {
     quantize_q6_k(w, out, num_weights, imatrix, K);
   } else {
-    throw std::runtime_error(
-        "[mlx_kquant] quantize: unsupported codec: " + kquant_type);
+    // IQ codecs (CPU-only encode); throws if the codec is genuinely unknown or
+    // its IQ encoder is not yet implemented.
+    kquant_iq_quantize_dispatch(w, out, num_weights, kquant_type, imatrix, K);
   }
 }
 

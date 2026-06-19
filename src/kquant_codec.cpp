@@ -4,30 +4,30 @@ namespace mlx_kquant {
 
 // Per-codec block geometry:
 //   {name, weights_per_block, bytes_per_block, bits, has_matmul, has_encode,
-//   has_nax}
-// IQ codecs are decode-only for now (no encoder); all carry NAX prefill
-// kernels.
+//   has_nax, requires_imatrix}
+// All codecs carry NAX prefill kernels. IQ encode lands incrementally (iq4_nl,
+// iq4_xs so far); requires_imatrix marks the ggml imatrix-required IQ codecs.
 static const std::vector<KQuantCodec>& registry() {
   static const std::vector<KQuantCodec> codecs = {
-      {"q2_k", 256, 84, 2, true, true, true},
-      {"q3_k", 256, 110, 3, true, true, true},
-      {"q4_k", 256, 144, 4, true, true, true},
-      {"q5_k", 256, 176, 5, true, true, true},
-      {"q6_k", 256, 210, 6, true, true, true},
-      {"q4_0", 32, 18, 4, true, true, true},
-      {"q4_1", 32, 20, 4, true, true, true},
-      {"q5_0", 32, 22, 5, true, true, true},
-      {"q5_1", 32, 24, 5, true, true, true},
-      {"q8_0", 32, 34, 8, true, true, true},
-      {"iq4_nl", 32, 18, 4, true, false, true},
-      {"iq4_xs", 256, 136, 4, true, false, true},
-      {"iq3_s", 256, 110, 3, true, false, true},
-      {"iq3_xxs", 256, 98, 3, true, false, true},
-      {"iq2_xxs", 256, 66, 2, true, false, true},
-      {"iq2_xs", 256, 74, 2, true, false, true},
-      {"iq2_s", 256, 82, 2, true, false, true},
-      {"iq1_s", 256, 50, 1, true, false, true},
-      {"iq1_m", 256, 56, 1, true, false, true},
+      {"q2_k", 256, 84, 2, true, true, true, false},
+      {"q3_k", 256, 110, 3, true, true, true, false},
+      {"q4_k", 256, 144, 4, true, true, true, false},
+      {"q5_k", 256, 176, 5, true, true, true, false},
+      {"q6_k", 256, 210, 6, true, true, true, false},
+      {"q4_0", 32, 18, 4, true, true, true, false},
+      {"q4_1", 32, 20, 4, true, true, true, false},
+      {"q5_0", 32, 22, 5, true, true, true, false},
+      {"q5_1", 32, 24, 5, true, true, true, false},
+      {"q8_0", 32, 34, 8, true, true, true, false},
+      {"iq4_nl", 32, 18, 4, true, true, true, false},
+      {"iq4_xs", 256, 136, 4, true, true, true, false},
+      {"iq3_s", 256, 110, 3, true, false, true, false},
+      {"iq3_xxs", 256, 98, 3, true, false, true, false},
+      {"iq2_xxs", 256, 66, 2, true, false, true, true},
+      {"iq2_xs", 256, 74, 2, true, false, true, true},
+      {"iq2_s", 256, 82, 2, true, false, true, false},
+      {"iq1_s", 256, 50, 1, true, false, true, true},
+      {"iq1_m", 256, 56, 1, true, false, true, false},
   };
   return codecs;
 }

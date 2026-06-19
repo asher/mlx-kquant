@@ -15,6 +15,7 @@ struct KQuantCodec {
   bool has_matmul_kernel; // fused qmm/gather kernels exist
   bool has_encode; // encode (quantize) kernel exists
   bool has_nax_kernel; // NAX (tensor-core) qmm/gather kernels exist
+  bool requires_imatrix; // encode rejects a missing imatrix (ggml-required IQ)
 };
 
 // Returns nullptr if `name` is not a known codec.
