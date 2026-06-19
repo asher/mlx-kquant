@@ -26,7 +26,8 @@ METAL_FUNC void kq_q4_0_dequantize_impl(
   }
   const int block_id = gid / KQ_Q4_0_GROUP;
   const int within = gid % KQ_Q4_0_GROUP;
-  const device uint8_t* block_addr = w + block_id * KQ_Q4_0_BLOCK_BYTES;
+  const device uint8_t* block_addr =
+      w + static_cast<int64_t>(block_id) * KQ_Q4_0_BLOCK_BYTES;
   const float d = kq_q4_0_d(block_addr);
   const device uint8_t* qs = kq_q4_0_qs_ptr(block_addr);
   const int q4 =
@@ -681,7 +682,8 @@ METAL_FUNC void kq_q4_1_dequantize_impl(
   }
   const int block_id = gid / KQ_Q4_1_GROUP;
   const int within = gid % KQ_Q4_1_GROUP;
-  const device uint8_t* block_addr = w + block_id * KQ_Q4_1_BLOCK_BYTES;
+  const device uint8_t* block_addr =
+      w + static_cast<int64_t>(block_id) * KQ_Q4_1_BLOCK_BYTES;
   const float d = kq_q4_1_d(block_addr);
   const float m = kq_q4_1_m(block_addr);
   const device uint8_t* qs = kq_q4_1_qs_ptr(block_addr);
@@ -1353,7 +1355,8 @@ METAL_FUNC void kq_q5_0_dequantize_impl(
   }
   const int block_id = gid / KQ_Q5_0_GROUP;
   const int within = gid % KQ_Q5_0_GROUP;
-  const device uint8_t* block_addr = w + block_id * KQ_Q5_0_BLOCK_BYTES;
+  const device uint8_t* block_addr =
+      w + static_cast<int64_t>(block_id) * KQ_Q5_0_BLOCK_BYTES;
   const float d = kq_q5_0_d(block_addr);
   const uint32_t qh = kq_q5_0_qh(block_addr);
   const device uint8_t* qs = kq_q5_0_qs_ptr(block_addr);
@@ -2021,7 +2024,8 @@ METAL_FUNC void kq_iq4_nl_dequantize_impl(
   }
   const int block_id = gid / KQ_IQ4_NL_GROUP;
   const int within = gid % KQ_IQ4_NL_GROUP;
-  const device uint8_t* block_addr = w + block_id * KQ_IQ4_NL_BLOCK_BYTES;
+  const device uint8_t* block_addr =
+      w + static_cast<int64_t>(block_id) * KQ_IQ4_NL_BLOCK_BYTES;
   const float d = float(*(const device half*)(block_addr));
   const device uint8_t* qs = block_addr + KQ_IQ4_NL_QS_OFFSET;
   const int nib =

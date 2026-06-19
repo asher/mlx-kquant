@@ -444,9 +444,14 @@ void KQuantGatherQMM::eval_cpu(
         }
       }
       auto group_w = [&](std::size_t first) {
+        // 64-bit expert offset. A stacked expert tensor can exceed 2^31 bytes
+        // (a 256-expert q5_k down_proj is ~2.2 GB), and mx::elem_to_loc takes
+        // an int first argument, so passing w_idx * w_els truncated the offset
+        // to 32 bits and read out of bounds for expert indices past ~2^31 /
+        // w_els. w is matrix-contiguous (op-enforced), so the byte offset is
+        // w_idx * w_els computed in size_t.
         return w.data<uint8_t>() +
-            mx::elem_to_loc(
-                   entries[first].w_idx * w_els, w.shape(), w.strides());
+            static_cast<std::size_t>(entries[first].w_idx) * w_els;
       };
 
       // Decode-shape consolidation: when every per-expert group is small
@@ -512,14 +517,18 @@ void KQuantGatherQMM::eval_cpu(
             task.out =
                 out.data<T>() + static_cast<std::size_t>(entries[ga].i) * M * N;
             task.x = x.data<T>() +
-                mx::elem_to_loc(
-                         entries[ga].x_idx * M * K, x.shape(), x.strides());
+                elem_to_loc64(
+                         static_cast<int64_t>(entries[ga].x_idx) * M * K,
+                         x.shape(),
+                         x.strides());
           } else if (ru == 1) {
             // One unique row: read x in place, fan the output out below.
             og_packs.emplace_back(out_row_els);
             task.x = x.data<T>() +
-                mx::elem_to_loc(
-                         plans[gi].uniq[0] * M * K, x.shape(), x.strides());
+                elem_to_loc64(
+                         static_cast<int64_t>(plans[gi].uniq[0]) * M * K,
+                         x.shape(),
+                         x.strides());
             task.out = og_packs.back().data();
           } else {
             xg_packs.emplace_back(ru * row_els);
@@ -528,8 +537,10 @@ void KQuantGatherQMM::eval_cpu(
               std::memcpy(
                   xg_packs.back().data() + u * row_els,
                   x.data<T>() +
-                      mx::elem_to_loc(
-                          plans[gi].uniq[u] * M * K, x.shape(), x.strides()),
+                      elem_to_loc64(
+                          static_cast<int64_t>(plans[gi].uniq[u]) * M * K,
+                          x.shape(),
+                          x.strides()),
                   row_els * sizeof(T));
             }
             task.x = xg_packs.back().data();
@@ -569,8 +580,10 @@ void KQuantGatherQMM::eval_cpu(
           kquant_qmm_cpu<T>(
               out.data<T>() + static_cast<std::size_t>(entries[a].i) * M * N,
               x.data<T>() +
-                  mx::elem_to_loc(
-                      entries[a].x_idx * M * K, x.shape(), x.strides()),
+                  elem_to_loc64(
+                      static_cast<int64_t>(entries[a].x_idx) * M * K,
+                      x.shape(),
+                      x.strides()),
               wp,
               M,
               N,
@@ -584,8 +597,10 @@ void KQuantGatherQMM::eval_cpu(
             std::memcpy(
                 xg.data() + r * row_els,
                 x.data<T>() +
-                    mx::elem_to_loc(
-                        entries[a + r].x_idx * M * K, x.shape(), x.strides()),
+                    elem_to_loc64(
+                        static_cast<int64_t>(entries[a + r].x_idx) * M * K,
+                        x.shape(),
+                        x.strides()),
                 row_els * sizeof(T));
           }
           kquant_qmm_cpu<T>(
