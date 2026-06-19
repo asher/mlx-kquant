@@ -45,8 +45,6 @@ CODEC_GEOMETRY: dict[str, tuple[int, int, int, int]] = {
 # GGUFs but cannot yet be produced by kq.quantize.
 DECODE_ONLY_CODECS: frozenset[str] = frozenset(
     {
-        "iq3_s",
-        "iq3_xxs",
         "iq1_s",
         "iq1_m",
     }

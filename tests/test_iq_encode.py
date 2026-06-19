@@ -36,6 +36,8 @@ IQ_ENCODE_CODECS = {
     "iq2_xxs": (GT.IQ2_XXS, 256, 2, 0.45),
     "iq2_xs": (GT.IQ2_XS, 256, 2, 0.45),
     "iq2_s": (GT.IQ2_S, 256, 2, 0.45),
+    "iq3_xxs": (GT.IQ3_XXS, 256, 3, 0.30),
+    "iq3_s": (GT.IQ3_S, 256, 3, 0.30),
 }
 
 # Codecs ggml marks imatrix-required: kq.quantize rejects them without an
