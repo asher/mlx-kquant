@@ -359,9 +359,9 @@ MIT - see [LICENSE](https://github.com/asher/mlx-kquant/blob/main/LICENSE).
 mlx-kquant builds on three MIT-licensed projects; their license texts ship in the wheel under
 [`mlx_kquant/licenses/`](https://github.com/asher/mlx-kquant/tree/main/mlx_kquant/licenses):
 
-- **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** - the K-quant and block codec formats
-  and the quantization / dequantization algorithms that encode and decode them are derived from
-  ggml's reference implementation.
+- **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** - the K-quant, IQ, and legacy block
+  codec formats and the quantization / dequantization algorithms that encode and decode them (including
+  the IQ codebook / grid tables, transcribed verbatim) are derived from ggml's reference implementation.
 - **[gguf-tools](https://github.com/antirez/gguf-tools)** - used to implement a zero-copy GGUF loader
   for downstream projects, statically linked into built wheels.
 - **[MLX](https://github.com/ml-explore/mlx)** - the extension links `libmlx`, the kernels compile
