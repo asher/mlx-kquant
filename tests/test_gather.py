@@ -43,6 +43,15 @@ CODECS = {
     "q4_k": (GT.Q4_K, 256, 144, 4, True),
     "q5_k": (GT.Q5_K, 256, 176, 5, True),
     "q6_k": (GT.Q6_K, 256, 210, 6, True),
+    "iq4_nl": (GT.IQ4_NL, 32, 18, 4, False),
+    "iq4_xs": (GT.IQ4_XS, 256, 136, 4, False),
+    "iq3_s": (GT.IQ3_S, 256, 110, 3, False),
+    "iq3_xxs": (GT.IQ3_XXS, 256, 98, 3, False),
+    "iq2_xxs": (GT.IQ2_XXS, 256, 66, 2, False),
+    "iq2_xs": (GT.IQ2_XS, 256, 74, 2, False),
+    "iq2_s": (GT.IQ2_S, 256, 82, 2, False),
+    "iq1_s": (GT.IQ1_S, 256, 50, 1, False),
+    "iq1_m": (GT.IQ1_M, 256, 56, 1, False),
 }
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -57,8 +66,34 @@ def _gather(x, w, sc, gs, bits, codec, lhs, rhs):
     )
 
 
+def _synth_iq_wire(rng, bpb, n_blocks):
+    """Structurally-valid random IQ wire (gguf-py is decode-only for IQ): random
+    bytes with a sane fp16 d at block offset 0 so dequant can't hit Inf/NaN."""
+    wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
+    d = rng.uniform(0.02, 0.08, n_blocks).astype(np.float16)
+    if bpb == 56:
+        # IQ1_M has no super-block d; its fp16 scale is rebuilt from the top
+        # nibbles of the four uint16 scale words (bytes 49/51/53/55). Seed those
+        # so the reconstructed scale is a sane (non-NaN) fp16.
+        dbits = d.view(np.uint16)
+        for k, byteidx in enumerate((49, 51, 53, 55)):
+            nib = ((dbits >> (4 * k)) & 0xF).astype(np.uint8)
+            wire[:, byteidx] = (wire[:, byteidx] & 0x0F) | (nib << 4)
+    else:
+        wire[:, 0:2] = d.view(np.uint8).reshape(n_blocks, 2)
+    return wire
+
+
 def _wire_and_ref(codec, gtype, wpb, bpb, is_kquant):
     """Return (wire uint8[E, N, packed], ref float32[E, N, K])."""
+    if codec.startswith("iq"):
+        rng = np.random.default_rng(11)
+        wires = [
+            _synth_iq_wire(rng, bpb, N * (K // wpb)).reshape(N, (K // wpb) * bpb)
+            for _ in range(E)
+        ]
+        refs = [quants.dequantize(np.ascontiguousarray(w), gtype) for w in wires]
+        return np.stack(wires, 0), np.stack(refs, 0).astype(np.float32)
     if is_kquant:
         path = os.path.join(FIX, f"{codec}_moe.npz")
         if not os.path.exists(path):

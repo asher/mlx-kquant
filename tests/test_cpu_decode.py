@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the CPU decode path (eval_cpu) for all 10 codecs.
+"""Validate the CPU decode path (eval_cpu) for all 14 codecs.
 
 Every kq call is pinned to ``stream=mx.cpu``, so this exercises the scalar CPU
 decoders (dequantize / quantized_matmul / gather_qmm) and runs with no GPU - the
@@ -14,7 +14,8 @@ numpy reference:
 When a Metal GPU is present, also A/Bs CPU vs GPU dequantize for bit-exactness.
 
 K-quant wire bytes come from the committed fixtures (gguf-py is decode-only for
-those); flat codecs are synthesized in-process. Run directly for a sweep table.
+those); flat codecs are quantized in-process; IQ codecs (decode-only, no gguf-py
+encode) use synthesized structurally-valid wire. Run directly for a sweep table.
 """
 
 from __future__ import annotations
@@ -44,6 +45,15 @@ CODECS = {
     "q4_k": (GT.Q4_K, 256, 144, 4, True),
     "q5_k": (GT.Q5_K, 256, 176, 5, True),
     "q6_k": (GT.Q6_K, 256, 210, 6, True),
+    "iq4_nl": (GT.IQ4_NL, 32, 18, 4, False),
+    "iq4_xs": (GT.IQ4_XS, 256, 136, 4, False),
+    "iq3_s": (GT.IQ3_S, 256, 110, 3, False),
+    "iq3_xxs": (GT.IQ3_XXS, 256, 98, 3, False),
+    "iq2_xxs": (GT.IQ2_XXS, 256, 66, 2, False),
+    "iq2_xs": (GT.IQ2_XS, 256, 74, 2, False),
+    "iq2_s": (GT.IQ2_S, 256, 82, 2, False),
+    "iq1_s": (GT.IQ1_S, 256, 50, 1, False),
+    "iq1_m": (GT.IQ1_M, 256, 56, 1, False),
 }
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -55,8 +65,31 @@ gpu = pytest.mark.skipif(
 )
 
 
+def _synth_iq_wire(rng, bpb, n_blocks):
+    """Structurally-valid random IQ wire: random bytes with a sane fp16 d so
+    dequant can't hit Inf/NaN. Most IQ structs carry d at block offset 0; IQ1_M
+    (bpb 56) has no d -- its fp16 scale is the top nibble of each of the four
+    uint16 scale words at offset 48 -- so seed those nibbles instead."""
+    wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
+    d = rng.uniform(0.02, 0.08, n_blocks).astype(np.float16)
+    if bpb == 56:  # IQ1_M: scale reconstructed from scattered top nibbles
+        dbits = d.view(np.uint16)
+        for k, byteidx in enumerate((49, 51, 53, 55)):  # high byte of each word
+            nib = ((dbits >> (4 * k)) & 0xF).astype(np.uint8)
+            wire[:, byteidx] = (wire[:, byteidx] & 0x0F) | (nib << 4)
+    else:
+        wire[:, 0:2] = d.view(np.uint8).reshape(n_blocks, 2)
+    return wire
+
+
 def _dense_wire_and_ref(codec, gtype, is_kquant):
     """(wire uint8[N, packed], ref float32[N, K]) or (None, None) if missing."""
+    if codec.startswith("iq"):
+        wpb, bpb = CODECS[codec][1], CODECS[codec][2]
+        wire = _synth_iq_wire(np.random.default_rng(7), bpb, N * (K // wpb))
+        wire = wire.reshape(N, (K // wpb) * bpb)
+        ref = quants.dequantize(np.ascontiguousarray(wire), gtype).astype(np.float32)
+        return wire, ref
     if is_kquant:
         path = os.path.join(FIX, f"{codec}.npz")
         if not os.path.exists(path):
@@ -72,6 +105,15 @@ def _dense_wire_and_ref(codec, gtype, is_kquant):
 
 def _moe_wire_and_ref(codec, gtype, is_kquant):
     """(wire uint8[E, N, packed], ref float32[E, N, K]) or (None, None)."""
+    if codec.startswith("iq"):
+        wpb, bpb = CODECS[codec][1], CODECS[codec][2]
+        rng = np.random.default_rng(11)
+        wires = [
+            _synth_iq_wire(rng, bpb, N * (K // wpb)).reshape(N, (K // wpb) * bpb)
+            for _ in range(E_MOE)
+        ]
+        refs = [quants.dequantize(np.ascontiguousarray(w), gtype) for w in wires]
+        return np.stack(wires, 0), np.stack(refs, 0).astype(np.float32)
     if is_kquant:
         path = os.path.join(FIX, f"{codec}_moe.npz")
         if not os.path.exists(path):

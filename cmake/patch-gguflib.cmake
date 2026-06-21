@@ -40,6 +40,19 @@ if(NOT _C MATCHES "\"mxfp4\"")
   message(STATUS "gguflib: patched gguflib.c (fp-codec + Q1_0/TQ type-features)")
 endif()
 
+# Correct two upstream IQ block-geometry errors (antirez's table predates the
+# final ggml IQ layout): IQ1_S is 50 B / 256 (it had 110), and IQ4_NL is the
+# ONLY flat IQ codec at 18 B / 32 (it had 256/50 = IQ1_S's geometry). The IQ4_NL
+# error made gguflib mis-size every IQ4_NL tensor, so kq.load_gguf aborted on a
+# bsize mismatch vs the codec registry's correct (32,18).
+file(READ "${_c}" _C)
+if(NOT _C MATCHES "iq4_nl\", 32, 18")
+  string(REPLACE "{\"iq1_s\", 256, 110}" "{\"iq1_s\", 256, 50}" _C "${_C}")
+  string(REPLACE "{\"iq4_nl\", 256, 50}" "{\"iq4_nl\", 32, 18}" _C "${_C}")
+  file(WRITE "${_c}" "${_C}")
+  message(STATUS "gguflib: corrected IQ1_S/IQ4_NL block geometry")
+endif()
+
 # Add a read-only open path. The parser is upstream a read/write GGUF *editor*:
 # gguf_open() uses O_RDWR + mmap(PROT_READ|PROT_WRITE, MAP_SHARED), so a no-copy
 # array viewing a tensor aliases a writable, disk-backed page -- a fused in-place

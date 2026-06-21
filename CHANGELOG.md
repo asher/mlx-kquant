@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project aims to
 adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0]
+
+### Added
+- IQ codecs are now full-featured alongside the K-quant/legacy codecs. All nine
+  (`iq4_nl, iq4_xs, iq3_s, iq3_xxs, iq2_xxs, iq2_xs, iq2_s, iq1_s, iq1_m`) gained:
+  - **NAX (tensor-core) matmul** for prefill, matching the K-quant kernels
+    (decode `qmv` unchanged).
+  - **`quantize` (encode)** — a scalar CPU port of ggml's `quantize_row_iq*`
+    quantizers (grid search + inverse-index neighbour tables), so `kq.quantize`,
+    the `convert` driver, and the `mlx-kquant quantize` CLI now produce every IQ
+    codec. IQ encode is CPU-only (ggml has no GPU IQ quantizer) and is routed to
+    a CPU stream internally. `iq2_xxs`, `iq2_xs`, and `iq1_s` require an
+    importance matrix (mirroring ggml) and reject a missing one.
+
 ## [0.1.2]
 
 ### Fixed

@@ -24,17 +24,38 @@ CODEC_GEOMETRY: dict[str, tuple[int, int, int, int]] = {
     "q6_k": (256, 6, 210, 256),
     "q3_k": (256, 3, 110, 256),
     "q2_k": (256, 2, 84, 256),
+    # IQ codecs: grid/LUT decode (see DECODE_ONLY_CODECS for which still lack a
+    # CPU encoder). iq4_nl is flat-32 like the legacy codecs; the rest are
+    # 256-weight superblocks.
+    "iq4_nl": (32, 4, 18, 32),
+    "iq4_xs": (256, 4, 136, 256),
+    "iq3_s": (256, 3, 110, 256),
+    "iq3_xxs": (256, 3, 98, 256),
+    "iq2_xxs": (256, 2, 66, 256),
+    "iq2_xs": (256, 2, 74, 256),
+    "iq2_s": (256, 2, 82, 256),
+    # IQ1 (1.56 / 1.75 bpw): grid + a ±0.125 delta on each grid value; iq1_m
+    # has no super-block d (reconstructed from scattered scale nibbles).
+    "iq1_s": (256, 1, 50, 256),
+    "iq1_m": (256, 1, 56, 256),
 }
 
-# Every codec the ``kq.quantize`` encoder can produce. The extension encodes all
-# ten on CPU or Metal; the four legacy block codecs + q8_0 ignore an imatrix.
-ENCODER_CODECS: frozenset[str] = frozenset(CODEC_GEOMETRY)
+# Codecs that load but cannot be produced by kq.quantize. Empty: every codec --
+# all five K-quant superblocks, the five legacy block codecs, and all nine IQ
+# codecs -- now has a CPU (IQ) or CPU/Metal (K-quant) encoder.
+DECODE_ONLY_CODECS: frozenset[str] = frozenset()
 
-# Only the K-quant superblocks have an importance-weighted rounding path, so an
-# imatrix changes their wire bytes; for everything else it is a no-op.
-IMATRIX_CODECS: frozenset[str] = frozenset(
-    name for name, (_, _, _, wpb) in CODEC_GEOMETRY.items() if wpb == 256
-)
+# Every codec the ``kq.quantize`` encoder can produce: the ten K-quant/legacy
+# codecs on CPU or Metal (the four legacy block codecs + q8_0 ignore an imatrix).
+ENCODER_CODECS: frozenset[str] = frozenset(CODEC_GEOMETRY) - DECODE_ONLY_CODECS
+
+# The five K-quant superblocks whose committed fixtures are minted with an
+# imatrix (gen_fixtures.py). Pinned to an explicit literal, NOT derived from
+# wpb == 256: the IQ superblocks are wpb == 256 too and several are imatrix-
+# sensitive, but their encode is CPU-only with no committed GPU fixtures, so they
+# must stay out of this fixture-minting set. IQ imatrix behavior is asserted
+# separately (registry-driven) in test_encode.py.
+IMATRIX_CODECS: frozenset[str] = frozenset({"q2_k", "q3_k", "q4_k", "q5_k", "q6_k"})
 
 
 def geometry(codec: str) -> tuple[int, int, int, int]:

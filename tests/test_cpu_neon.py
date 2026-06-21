@@ -2,7 +2,7 @@
 """A/B the arm64 NEON int8 CPU GEMV kernels against the portable scalar path.
 
 ``KQ_CPU_NEON`` is read per matmul call, so the same process can run both
-paths on identical wire bytes. All 10 codecs have int8 kernels, which
+paths on identical wire bytes. All 14 codecs have int8 kernels, which
 quantize activations to q8 first - lossy by design, so the gate is a
 rel-norm tolerance (the error is dominated by the activation quantization,
 ~1e-2; the same trade ggml makes). On non-arm64 (or non-dotprod) builds both
@@ -38,7 +38,48 @@ CODECS = {
     "q4_k": GT.Q4_K,
     "q5_k": GT.Q5_K,
     "q6_k": GT.Q6_K,
+    "iq4_nl": GT.IQ4_NL,
+    "iq4_xs": GT.IQ4_XS,
+    "iq3_s": GT.IQ3_S,
+    "iq3_xxs": GT.IQ3_XXS,
+    "iq2_xxs": GT.IQ2_XXS,
+    "iq2_xs": GT.IQ2_XS,
+    "iq2_s": GT.IQ2_S,
+    "iq1_s": GT.IQ1_S,
+    "iq1_m": GT.IQ1_M,
 }
+
+# IQ codecs are decode-only (gguf-py can't encode them): (weights_per_block,
+# bytes_per_block) to synthesize structurally-valid wire (sane fp16 d at offset
+# 0) so both the NEON and scalar paths read identical bytes.
+IQ_GEOM = {
+    "iq4_nl": (32, 18),
+    "iq4_xs": (256, 136),
+    "iq3_s": (256, 110),
+    "iq3_xxs": (256, 98),
+    "iq2_xxs": (256, 66),
+    "iq2_xs": (256, 74),
+    "iq2_s": (256, 82),
+    "iq1_s": (256, 50),
+    "iq1_m": (256, 56),
+}
+
+
+def _synth_iq_wire(rng, bpb, n_blocks):
+    wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
+    d = rng.uniform(0.02, 0.08, n_blocks).astype(np.float16)
+    if bpb == 56:
+        # IQ1_M has no super-block d; the fp16 scale is rebuilt from the top
+        # nibbles of the four uint16 scale words (bytes 49/51/53/55). Seed those
+        # nibbles so the reconstructed scale is a sane (non-NaN) fp16.
+        dbits = d.view(np.uint16)
+        for k, byteidx in enumerate((49, 51, 53, 55)):
+            nib = ((dbits >> (4 * k)) & 0xF).astype(np.uint8)
+            wire[:, byteidx] = (wire[:, byteidx] & 0x0F) | (nib << 4)
+    else:
+        wire[:, 0:2] = d.view(np.uint8).reshape(n_blocks, 2)
+    return wire
+
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 N, K = 256, 512
@@ -65,6 +106,12 @@ def _scales():
 
 
 def _dense_wire_and_ref(codec, gtype):
+    if codec in IQ_GEOM:
+        wpb, bpb = IQ_GEOM[codec]
+        wire = _synth_iq_wire(np.random.default_rng(7), bpb, N * (K // wpb))
+        wire = wire.reshape(N, (K // wpb) * bpb)
+        ref = quants.dequantize(np.ascontiguousarray(wire), gtype).astype(np.float32)
+        return wire, ref
     path = os.path.join(FIX, f"{codec}.npz")
     if os.path.exists(path):
         wire = np.load(path)["wire"].astype(np.uint8)
@@ -115,7 +162,18 @@ def test_neon_vs_scalar_gather_qmm():
     rng = np.random.default_rng(1)
     for codec, gtype in CODECS.items():
         path = os.path.join(FIX, f"{codec}_moe.npz")
-        if os.path.exists(path):
+        if codec in IQ_GEOM:
+            wpb, bpb = IQ_GEOM[codec]
+            wire = np.stack(
+                [
+                    _synth_iq_wire(rng, bpb, N * (K // wpb)).reshape(
+                        N, (K // wpb) * bpb
+                    )
+                    for _ in range(E_MOE)
+                ],
+                0,
+            )
+        elif os.path.exists(path):
             wire = np.load(path)["wire"].astype(np.uint8)
         else:
             wires = []

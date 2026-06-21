@@ -13,6 +13,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "kquant_iq_tables.h"
+
 #if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
 #define KQ_NEON_DOTPROD 1
 #include <arm_neon.h>
@@ -770,6 +772,571 @@ float vec_dot_q5_1(const uint8_t* w, const void* act, int nb) {
   return vaddvq_f32(sumv) + summs;
 }
 
+// IQ codecs. Decode-only: grid/LUT weights, signs folded into the int8 weight
+// (vmulq_s8) so the inner loop stays a vdotq_s32. The 256-wide IQ codecs reuse
+// the q8_K activation (no min term, so bsums are ignored). Mirrors ggml's arm64
+// vec_dot_iq* kernels; all grid bytes are < 128, so the int8 reinterpret of the
+// uint32 grid agrees with the scalar uint8 decode.
+
+inline uint32x4_t grid4(const uint32_t* g, int a, int b, int c, int d) {
+  const uint32_t v[4] = {g[a], g[b], g[c], g[d]};
+  return vld1q_u32(v);
+}
+
+// IQ2 grids are uint64 (one entry = 8 int8 weights). Combine two adjacent
+// 8-weight groups into a 16-lane vector - the IQ2 analog of grid4's four uint32
+// lookups. All grid bytes are < 128, so the int8 reinterpret is exact.
+inline int8x16_t grid8(const uint64_t* g, int a, int b) {
+  return vcombine_s8(
+      vld1_s8(reinterpret_cast<const int8_t*>(g + a)),
+      vld1_s8(reinterpret_cast<const int8_t*>(g + b)));
+}
+
+// Sign-expansion tables shared by the block-local-sign codecs (iq3_s, iq2_s):
+// k_mask1 spreads each of the 4 sign bytes across its 8 lanes, k_mask2 selects
+// the per-lane sign bit. (k_shift, the iq3_s 9th-grid-bit table, stays local.)
+constexpr uint8_t k_mask1[32] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1,
+                                 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2,
+                                 2, 2, 3, 3, 3, 3, 3, 3, 3, 3};
+constexpr uint8_t k_mask2[16] =
+    {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+
+// iq4_nl block: d f16 @0, qs u4x2[16] @2 -> kvalues_iq4nl LUT. q8_0 activation.
+float vec_dot_iq4_nl(const uint8_t* w, const void* act, int nb) {
+  const ActQ80* y = static_cast<const ActQ80*>(act);
+  const int8x16_t values = vld1q_s8(kvalues_iq4nl);
+  const uint8x16_t m4b = vdupq_n_u8(0xf);
+  const int32x4_t mzero = vdupq_n_s32(0);
+  float32x4_t sumv0 = vdupq_n_f32(0.0f);
+  float32x4_t sumv1 = vdupq_n_f32(0.0f);
+  int i = 0;
+  for (; i + 1 < nb; i += 2) {
+    const uint8_t* xb0 = w + static_cast<std::size_t>(i) * 18;
+    const uint8_t* xb1 = xb0 + 18;
+    const uint8x16_t q0 = vld1q_u8(xb0 + 2);
+    const uint8x16_t q1 = vld1q_u8(xb1 + 2);
+    const int8x16_t v0l = vqtbl1q_s8(values, vandq_u8(q0, m4b));
+    const int8x16_t v0h = vqtbl1q_s8(values, vshrq_n_u8(q0, 4));
+    const int8x16_t v1l = vqtbl1q_s8(values, vandq_u8(q1, m4b));
+    const int8x16_t v1h = vqtbl1q_s8(values, vshrq_n_u8(q1, 4));
+    const int32x4_t p0 = vdotq_s32(
+        vdotq_s32(mzero, v0l, vld1q_s8(y[i].qs)), v0h, vld1q_s8(y[i].qs + 16));
+    const int32x4_t p1 = vdotq_s32(
+        vdotq_s32(mzero, v1l, vld1q_s8(y[i + 1].qs)),
+        v1h,
+        vld1q_s8(y[i + 1].qs + 16));
+    sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p0), read_f16(xb0) * y[i].d);
+    sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(p1), read_f16(xb1) * y[i + 1].d);
+  }
+  for (; i < nb; ++i) {
+    const uint8_t* xb = w + static_cast<std::size_t>(i) * 18;
+    const uint8x16_t q = vld1q_u8(xb + 2);
+    const int8x16_t vl = vqtbl1q_s8(values, vandq_u8(q, m4b));
+    const int8x16_t vh = vqtbl1q_s8(values, vshrq_n_u8(q, 4));
+    const int32x4_t p = vdotq_s32(
+        vdotq_s32(mzero, vl, vld1q_s8(y[i].qs)), vh, vld1q_s8(y[i].qs + 16));
+    sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p), read_f16(xb) * y[i].d);
+  }
+  return vaddvq_f32(vaddq_f32(sumv0, sumv1));
+}
+
+// iq4_xs block: d f16 @0, scales_h u16 @2, scales_l[4] @4, qs[128] @8. Signed
+// 6-bit per-32 scale (ls - 32), kvalues LUT, no min.
+float vec_dot_iq4_xs(const uint8_t* w, const void* act, int nb) {
+  const ActQ8K* y = static_cast<const ActQ8K*>(act);
+  const int8x16_t values = vld1q_s8(kvalues_iq4nl);
+  const uint8x16_t m4b = vdupq_n_u8(0xf);
+  const int32x4_t mzero = vdupq_n_s32(0);
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    const uint8_t* xb = w + static_cast<std::size_t>(i) * 136;
+    const float d = read_f16(xb) * y[i].d;
+    uint16_t h;
+    std::memcpy(&h, xb + 2, sizeof(uint16_t));
+    const uint8_t* scales_l = xb + 4;
+    const uint8_t* q4 = xb + 8;
+    const int8_t* q8 = y[i].qs;
+    int32_t sumi1 = 0, sumi2 = 0;
+    for (int ib = 0; ib < 4; ++ib) {
+      const uint8x16_t q4b0 = vld1q_u8(q4);
+      const uint8x16_t q4b1 = vld1q_u8(q4 + 16);
+      q4 += 32;
+      const int8x16_t v0 = vqtbl1q_s8(values, vandq_u8(q4b0, m4b));
+      const int8x16_t v1 = vqtbl1q_s8(values, vshrq_n_u8(q4b0, 4));
+      const int8x16_t v2 = vqtbl1q_s8(values, vandq_u8(q4b1, m4b));
+      const int8x16_t v3 = vqtbl1q_s8(values, vshrq_n_u8(q4b1, 4));
+      const int32x4_t p1 =
+          vdotq_s32(vdotq_s32(mzero, v0, vld1q_s8(q8)), v1, vld1q_s8(q8 + 16));
+      const int32x4_t p2 = vdotq_s32(
+          vdotq_s32(mzero, v2, vld1q_s8(q8 + 32)), v3, vld1q_s8(q8 + 48));
+      q8 += 64;
+      const int ls1 = ((scales_l[ib] & 0xf) | ((h << 4) & 0x30)) - 32;
+      const int ls2 = ((scales_l[ib] >> 4) | ((h << 2) & 0x30)) - 32;
+      h >>= 4;
+      sumi1 += vaddvq_s32(p1) * ls1;
+      sumi2 += vaddvq_s32(p2) * ls2;
+    }
+    sumf += d * static_cast<float>(sumi1 + sumi2);
+  }
+  return sumf;
+}
+
+// iq3_xxs block: d f16 @0, qs[64] @2 (grid idx), gas[32] @66 (per-ib32 u32:
+// signs in low 28 bits, scale in top 4). Global *0.5 applied post-sum.
+float vec_dot_iq3_xxs(const uint8_t* w, const void* act, int nb) {
+  const ActQ8K* y = static_cast<const ActQ8K*>(act);
+  const uint64_t* signs64 = reinterpret_cast<const uint64_t*>(keven_signs_q2xs);
+  const int32x4_t mzero = vdupq_n_s32(0);
+  uint32_t aux32[2];
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    const uint8_t* xb = w + static_cast<std::size_t>(i) * 98;
+    const float d = read_f16(xb) * y[i].d;
+    const uint8_t* q3 = xb + 2;
+    const uint8_t* gas = xb + 2 + 64;
+    const int8_t* q8 = y[i].qs;
+    float sumf1 = 0.0f, sumf2 = 0.0f;
+    for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+      const int8x16_t q8b0 = vld1q_s8(q8);
+      const int8x16_t q8b1 = vld1q_s8(q8 + 16);
+      const int8x16_t q8b2 = vld1q_s8(q8 + 32);
+      const int8x16_t q8b3 = vld1q_s8(q8 + 48);
+      q8 += 64;
+      std::memcpy(aux32, gas, 8);
+      gas += 8;
+      const uint32x4_t g0 = grid4(iq3xxs_grid, q3[0], q3[1], q3[2], q3[3]);
+      const uint32x4_t g1 = grid4(iq3xxs_grid, q3[4], q3[5], q3[6], q3[7]);
+      const uint32x4_t g2 = grid4(iq3xxs_grid, q3[8], q3[9], q3[10], q3[11]);
+      const uint32x4_t g3 = grid4(iq3xxs_grid, q3[12], q3[13], q3[14], q3[15]);
+      q3 += 16;
+      int8x16_t s0 = vcombine_s8(
+          vld1_s8(reinterpret_cast<const int8_t*>(signs64 + (aux32[0] & 127))),
+          vld1_s8(reinterpret_cast<const int8_t*>(
+              signs64 + ((aux32[0] >> 7) & 127))));
+      int8x16_t s1 = vcombine_s8(
+          vld1_s8(reinterpret_cast<const int8_t*>(
+              signs64 + ((aux32[0] >> 14) & 127))),
+          vld1_s8(reinterpret_cast<const int8_t*>(
+              signs64 + ((aux32[0] >> 21) & 127))));
+      int8x16_t s2 = vcombine_s8(
+          vld1_s8(reinterpret_cast<const int8_t*>(signs64 + (aux32[1] & 127))),
+          vld1_s8(reinterpret_cast<const int8_t*>(
+              signs64 + ((aux32[1] >> 7) & 127))));
+      int8x16_t s3 = vcombine_s8(
+          vld1_s8(reinterpret_cast<const int8_t*>(
+              signs64 + ((aux32[1] >> 14) & 127))),
+          vld1_s8(reinterpret_cast<const int8_t*>(
+              signs64 + ((aux32[1] >> 21) & 127))));
+      s0 = vmulq_s8(s0, vreinterpretq_s8_u32(g0));
+      s1 = vmulq_s8(s1, vreinterpretq_s8_u32(g1));
+      s2 = vmulq_s8(s2, vreinterpretq_s8_u32(g2));
+      s3 = vmulq_s8(s3, vreinterpretq_s8_u32(g3));
+      const int32x4_t p1 = vdotq_s32(vdotq_s32(mzero, s0, q8b0), s1, q8b1);
+      const int32x4_t p2 = vdotq_s32(vdotq_s32(mzero, s2, q8b2), s3, q8b3);
+      sumf1 += vaddvq_s32(p1) * (0.5f + (aux32[0] >> 28));
+      sumf2 += vaddvq_s32(p2) * (0.5f + (aux32[1] >> 28));
+    }
+    sumf += d * (sumf1 + sumf2);
+  }
+  return 0.5f * sumf;
+}
+
+// iq3_s block: d f16 @0, qs[64] @2 (low 8 grid bits), qh[8] @66 (9th bit),
+// signs[32] @74, scales[4] @106 (4-bit -> 2*s+1). 9-bit grid, no min.
+float vec_dot_iq3_s(const uint8_t* w, const void* act, int nb) {
+  const ActQ8K* y = static_cast<const ActQ8K*>(act);
+  static const int16_t k_shift[8] = {8, 7, 6, 5, 4, 3, 2, 1};
+  const uint8x16_t mask1_0 = vld1q_u8(k_mask1);
+  const uint8x16_t mask1_1 = vld1q_u8(k_mask1 + 16);
+  const uint8x16_t mask2 = vld1q_u8(k_mask2);
+  const int16x8_t hshift = vld1q_s16(k_shift);
+  const uint16x8_t m256 = vdupq_n_u16(256);
+  const uint8x16_t m1 = vdupq_n_u8(1);
+  const int32x4_t mzero = vdupq_n_s32(0);
+  uint32_t scales32[2];
+  const uint8_t* scales8 = reinterpret_cast<const uint8_t*>(scales32);
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    const uint8_t* xb = w + static_cast<std::size_t>(i) * 110;
+    const float d = read_f16(xb) * y[i].d;
+    const uint8_t* qs = xb + 2;
+    const uint8_t* qh = xb + 66;
+    const uint16_t* signs = reinterpret_cast<const uint16_t*>(xb + 74);
+    const int8_t* q8 = y[i].qs;
+    std::memcpy(scales32, xb + 106, 4);
+    scales32[1] = (((scales32[0] >> 4) & 0x0f0f0f0f) << 1) | 0x01010101;
+    scales32[0] = ((scales32[0] & 0x0f0f0f0f) << 1) | 0x01010101;
+    int32_t sumi1 = 0, sumi2 = 0;
+    for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+      const int8x16_t q8b0 = vld1q_s8(q8);
+      const int8x16_t q8b1 = vld1q_s8(q8 + 16);
+      const int8x16_t q8b2 = vld1q_s8(q8 + 32);
+      const int8x16_t q8b3 = vld1q_s8(q8 + 48);
+      q8 += 64;
+      const uint8x16_t idx_l = vld1q_u8(qs);
+      qs += 16;
+      uint16_t idx[8];
+      vst1q_u16(
+          idx,
+          vorrq_u16(
+              vmovl_u8(vget_low_u8(idx_l)),
+              vandq_u16(vshlq_u16(vdupq_n_u16(qh[ib32]), hshift), m256)));
+      const uint32x4_t g0 = grid4(iq3s_grid, idx[0], idx[1], idx[2], idx[3]);
+      const uint32x4_t g1 = grid4(iq3s_grid, idx[4], idx[5], idx[6], idx[7]);
+      vst1q_u16(
+          idx,
+          vorrq_u16(
+              vmovl_u8(vget_high_u8(idx_l)),
+              vandq_u16(vshlq_u16(vdupq_n_u16(qh[ib32 + 1]), hshift), m256)));
+      const uint32x4_t g2 = grid4(iq3s_grid, idx[0], idx[1], idx[2], idx[3]);
+      const uint32x4_t g3 = grid4(iq3s_grid, idx[4], idx[5], idx[6], idx[7]);
+
+      uint8x16_t vs = vreinterpretq_u8_u32(
+          vdupq_n_u32(signs[0] | (static_cast<uint32_t>(signs[1]) << 16)));
+      uint8x16_t vsb = vandq_u8(vqtbl1q_u8(vs, mask1_1), mask2);
+      uint8x16_t vsa = vandq_u8(vqtbl1q_u8(vs, mask1_0), mask2);
+      vsa = vorrq_u8(vceqq_u8(vsa, mask2), m1);
+      vsb = vorrq_u8(vceqq_u8(vsb, mask2), m1);
+      const int8x16_t q3s0 =
+          vmulq_s8(vreinterpretq_s8_u8(vsa), vreinterpretq_s8_u32(g0));
+      const int8x16_t q3s1 =
+          vmulq_s8(vreinterpretq_s8_u8(vsb), vreinterpretq_s8_u32(g1));
+
+      vs = vreinterpretq_u8_u32(
+          vdupq_n_u32(signs[2] | (static_cast<uint32_t>(signs[3]) << 16)));
+      vsb = vandq_u8(vqtbl1q_u8(vs, mask1_1), mask2);
+      vsa = vandq_u8(vqtbl1q_u8(vs, mask1_0), mask2);
+      vsa = vorrq_u8(vceqq_u8(vsa, mask2), m1);
+      vsb = vorrq_u8(vceqq_u8(vsb, mask2), m1);
+      signs += 4;
+      const int8x16_t q3s2 =
+          vmulq_s8(vreinterpretq_s8_u8(vsa), vreinterpretq_s8_u32(g2));
+      const int8x16_t q3s3 =
+          vmulq_s8(vreinterpretq_s8_u8(vsb), vreinterpretq_s8_u32(g3));
+
+      const int32x4_t p1 = vdotq_s32(vdotq_s32(mzero, q3s0, q8b0), q3s1, q8b1);
+      const int32x4_t p2 = vdotq_s32(vdotq_s32(mzero, q3s2, q8b2), q3s3, q8b3);
+      sumi1 += vaddvq_s32(p1) * scales8[ib32 / 2 + 0];
+      sumi2 += vaddvq_s32(p2) * scales8[ib32 / 2 + 4];
+    }
+    sumf += d * static_cast<float>(sumi1 + sumi2);
+  }
+  return sumf;
+}
+
+// iq2_xxs block: d f16 @0, qs[32] u16 @2. Each ib32 (8 bytes): 4 grid-idx
+// bytes + a u32 with 4 7-bit sign indices (low 28 bits) and a 4-bit scale (top
+// 4). Signs via keven_signs (vmulq_s8), per-ib32 (0.5+scale), global *0.25.
+float vec_dot_iq2_xxs(const uint8_t* w, const void* act, int nb) {
+  const ActQ8K* y = static_cast<const ActQ8K*>(act);
+  const uint64_t* signs64 = reinterpret_cast<const uint64_t*>(keven_signs_q2xs);
+  const int32x4_t mzero = vdupq_n_s32(0);
+  uint32_t aux32[4];
+  const uint8_t* aux8 = reinterpret_cast<const uint8_t*>(aux32);
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    const uint8_t* xb = w + static_cast<std::size_t>(i) * 66;
+    const float d = read_f16(xb) * y[i].d;
+    const uint8_t* q2 = xb + 2;
+    const int8_t* q8 = y[i].qs;
+    float sumf1 = 0.0f, sumf2 = 0.0f;
+    for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+      const int8x16_t q8b0 = vld1q_s8(q8);
+      const int8x16_t q8b1 = vld1q_s8(q8 + 16);
+      const int8x16_t q8b2 = vld1q_s8(q8 + 32);
+      const int8x16_t q8b3 = vld1q_s8(q8 + 48);
+      q8 += 64;
+      std::memcpy(aux32, q2, 16);
+      q2 += 16;
+      int8x16_t g0 = grid8(iq2xxs_grid, aux8[0], aux8[1]);
+      int8x16_t g1 = grid8(iq2xxs_grid, aux8[2], aux8[3]);
+      int8x16_t g2 = grid8(iq2xxs_grid, aux8[8], aux8[9]);
+      int8x16_t g3 = grid8(iq2xxs_grid, aux8[10], aux8[11]);
+      int8x16_t s0 = vcombine_s8(
+          vld1_s8(reinterpret_cast<const int8_t*>(signs64 + (aux32[1] & 127))),
+          vld1_s8(reinterpret_cast<const int8_t*>(
+              signs64 + ((aux32[1] >> 7) & 127))));
+      int8x16_t s1 = vcombine_s8(
+          vld1_s8(reinterpret_cast<const int8_t*>(
+              signs64 + ((aux32[1] >> 14) & 127))),
+          vld1_s8(reinterpret_cast<const int8_t*>(
+              signs64 + ((aux32[1] >> 21) & 127))));
+      int8x16_t s2 = vcombine_s8(
+          vld1_s8(reinterpret_cast<const int8_t*>(signs64 + (aux32[3] & 127))),
+          vld1_s8(reinterpret_cast<const int8_t*>(
+              signs64 + ((aux32[3] >> 7) & 127))));
+      int8x16_t s3 = vcombine_s8(
+          vld1_s8(reinterpret_cast<const int8_t*>(
+              signs64 + ((aux32[3] >> 14) & 127))),
+          vld1_s8(reinterpret_cast<const int8_t*>(
+              signs64 + ((aux32[3] >> 21) & 127))));
+      g0 = vmulq_s8(g0, s0);
+      g1 = vmulq_s8(g1, s1);
+      g2 = vmulq_s8(g2, s2);
+      g3 = vmulq_s8(g3, s3);
+      const int32x4_t p1 = vdotq_s32(vdotq_s32(mzero, g0, q8b0), g1, q8b1);
+      const int32x4_t p2 = vdotq_s32(vdotq_s32(mzero, g2, q8b2), g3, q8b3);
+      sumf1 += vaddvq_s32(p1) * (0.5f + (aux32[1] >> 28));
+      sumf2 += vaddvq_s32(p2) * (0.5f + (aux32[3] >> 28));
+    }
+    sumf += d * (sumf1 + sumf2);
+  }
+  return 0.25f * sumf;
+}
+
+// iq2_xs block: d f16 @0, qs[32] u16 @2 (9-bit grid idx, 7-bit sign idx),
+// scales[8] u8 @66 (two 4-bit per byte -> 0.5+s). Signs via keven_signs; the
+// two halves of each ib32 carry distinct scales (low/high nibble); global
+// *0.25.
+float vec_dot_iq2_xs(const uint8_t* w, const void* act, int nb) {
+  const ActQ8K* y = static_cast<const ActQ8K*>(act);
+  const uint64_t* signs64 = reinterpret_cast<const uint64_t*>(keven_signs_q2xs);
+  const int32x4_t mzero = vdupq_n_s32(0);
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    const uint8_t* xb = w + static_cast<std::size_t>(i) * 74;
+    const float d = read_f16(xb) * y[i].d;
+    const uint16_t* q2 = reinterpret_cast<const uint16_t*>(xb + 2);
+    const uint8_t* sc = xb + 66;
+    const int8_t* q8 = y[i].qs;
+    float sumf_acc = 0.0f;
+    for (int ib32 = 0; ib32 < 8; ++ib32) {
+      const int8x16_t q8b0 = vld1q_s8(q8);
+      const int8x16_t q8b1 = vld1q_s8(q8 + 16);
+      q8 += 32;
+      int8x16_t g0 = grid8(iq2xs_grid, q2[0] & 511, q2[1] & 511);
+      int8x16_t g1 = grid8(iq2xs_grid, q2[2] & 511, q2[3] & 511);
+      int8x16_t s0 = vcombine_s8(
+          vld1_s8(reinterpret_cast<const int8_t*>(signs64 + (q2[0] >> 9))),
+          vld1_s8(reinterpret_cast<const int8_t*>(signs64 + (q2[1] >> 9))));
+      int8x16_t s1 = vcombine_s8(
+          vld1_s8(reinterpret_cast<const int8_t*>(signs64 + (q2[2] >> 9))),
+          vld1_s8(reinterpret_cast<const int8_t*>(signs64 + (q2[3] >> 9))));
+      q2 += 4;
+      g0 = vmulq_s8(g0, s0);
+      g1 = vmulq_s8(g1, s1);
+      sumf_acc +=
+          vaddvq_s32(vdotq_s32(mzero, g0, q8b0)) * (0.5f + (sc[ib32] & 0xf));
+      sumf_acc +=
+          vaddvq_s32(vdotq_s32(mzero, g1, q8b1)) * (0.5f + (sc[ib32] >> 4));
+    }
+    sumf += d * sumf_acc;
+  }
+  return 0.25f * sumf;
+}
+
+// iq2_s block: d f16 @0, qs[32] @2 (grid low 8 bits), signs[32] @34, qh[8] @66
+// (2 high grid bits per group), scales[8] @74 (two 4-bit -> 1+2s). Block-local
+// signs (k_mask1/k_mask2), 10-bit grid; global *0.125 == (0.5+s)*0.25.
+float vec_dot_iq2_s(const uint8_t* w, const void* act, int nb) {
+  const ActQ8K* y = static_cast<const ActQ8K*>(act);
+  const uint8x16_t mask1_0 = vld1q_u8(k_mask1);
+  const uint8x16_t mask1_1 = vld1q_u8(k_mask1 + 16);
+  const uint8x16_t mask2 = vld1q_u8(k_mask2);
+  const uint8x16_t m1 = vdupq_n_u8(1);
+  const int32x4_t mzero = vdupq_n_s32(0);
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    const uint8_t* xb = w + static_cast<std::size_t>(i) * 82;
+    const float d = read_f16(xb) * y[i].d;
+    const uint8_t* qs = xb + 2;
+    const uint16_t* signs = reinterpret_cast<const uint16_t*>(xb + 34);
+    const uint8_t* qh = xb + 66;
+    const uint8_t* sc = xb + 74;
+    const int8_t* q8 = y[i].qs;
+    int32_t sumi1 = 0, sumi2 = 0;
+    for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+      const int8x16_t q8b0 = vld1q_s8(q8);
+      const int8x16_t q8b1 = vld1q_s8(q8 + 16);
+      const int8x16_t q8b2 = vld1q_s8(q8 + 32);
+      const int8x16_t q8b3 = vld1q_s8(q8 + 48);
+      q8 += 64;
+      int8x16_t g0 = grid8(
+          iq2s_grid,
+          qs[0] | ((qh[ib32] << 8) & 0x300),
+          qs[1] | ((qh[ib32] << 6) & 0x300));
+      int8x16_t g1 = grid8(
+          iq2s_grid,
+          qs[2] | ((qh[ib32] << 4) & 0x300),
+          qs[3] | ((qh[ib32] << 2) & 0x300));
+      int8x16_t g2 = grid8(
+          iq2s_grid,
+          qs[4] | ((qh[ib32 + 1] << 8) & 0x300),
+          qs[5] | ((qh[ib32 + 1] << 6) & 0x300));
+      int8x16_t g3 = grid8(
+          iq2s_grid,
+          qs[6] | ((qh[ib32 + 1] << 4) & 0x300),
+          qs[7] | ((qh[ib32 + 1] << 2) & 0x300));
+      qs += 8;
+
+      uint8x16_t vs = vreinterpretq_u8_u32(
+          vdupq_n_u32(signs[0] | (static_cast<uint32_t>(signs[1]) << 16)));
+      uint8x16_t vsb = vandq_u8(vqtbl1q_u8(vs, mask1_1), mask2);
+      uint8x16_t vsa = vandq_u8(vqtbl1q_u8(vs, mask1_0), mask2);
+      vsa = vorrq_u8(vceqq_u8(vsa, mask2), m1);
+      vsb = vorrq_u8(vceqq_u8(vsb, mask2), m1);
+      g0 = vmulq_s8(vreinterpretq_s8_u8(vsa), g0);
+      g1 = vmulq_s8(vreinterpretq_s8_u8(vsb), g1);
+
+      vs = vreinterpretq_u8_u32(
+          vdupq_n_u32(signs[2] | (static_cast<uint32_t>(signs[3]) << 16)));
+      vsb = vandq_u8(vqtbl1q_u8(vs, mask1_1), mask2);
+      vsa = vandq_u8(vqtbl1q_u8(vs, mask1_0), mask2);
+      vsa = vorrq_u8(vceqq_u8(vsa, mask2), m1);
+      vsb = vorrq_u8(vceqq_u8(vsb, mask2), m1);
+      signs += 4;
+      g2 = vmulq_s8(vreinterpretq_s8_u8(vsa), g2);
+      g3 = vmulq_s8(vreinterpretq_s8_u8(vsb), g3);
+
+      sumi1 +=
+          vaddvq_s32(vdotq_s32(mzero, g0, q8b0)) * (1 + 2 * (sc[ib32] & 0xf));
+      sumi1 +=
+          vaddvq_s32(vdotq_s32(mzero, g1, q8b1)) * (1 + 2 * (sc[ib32] >> 4));
+      sumi2 += vaddvq_s32(vdotq_s32(mzero, g2, q8b2)) *
+          (1 + 2 * (sc[ib32 + 1] & 0xf));
+      sumi2 += vaddvq_s32(vdotq_s32(mzero, g3, q8b3)) *
+          (1 + 2 * (sc[ib32 + 1] >> 4));
+    }
+    sumf += d * static_cast<float>(sumi1 + sumi2);
+  }
+  return 0.125f * sumf;
+}
+
+// IQ1_S / IQ1_M: signed grid with a +/-0.125 delta added to every grid value.
+// The grid.act term is the usual int8 vdot; the delta term factors out as
+// delta * scale * sum(act), folded via the q8_K block-sums (IQ1_S) or a +/-1
+// delta-vector dot (IQ1_M). The shared |delta| = 0.125 is applied once at the
+// end. IQ1_M has no super-block d -- it is rebuilt from four scattered nibbles.
+float vec_dot_iq1_s(const uint8_t* w, const void* act, int nb) {
+  const ActQ8K* y = static_cast<const ActQ8K*>(act);
+  const int32x4_t mzero = vdupq_n_s32(0);
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    const uint8_t* xb = w + static_cast<std::size_t>(i) * 50;
+    const float d = read_f16(xb) * y[i].d;
+    const uint8_t* qs = xb + 2;
+    const uint16_t* qh = reinterpret_cast<const uint16_t*>(xb + 34);
+    const int8_t* q8 = y[i].qs;
+    const int16_t* bsums = y[i].bsums;
+    int sumi1 = 0, sumi2 = 0, sumi3 = 0;
+    for (int ib = 0; ib < 8; ib += 2) {
+      const int8x16_t q8b0 = vld1q_s8(q8);
+      const int8x16_t q8b1 = vld1q_s8(q8 + 16);
+      const int8x16_t q8b2 = vld1q_s8(q8 + 32);
+      const int8x16_t q8b3 = vld1q_s8(q8 + 48);
+      q8 += 64;
+      int8x16_t g0 = grid8(
+          iq1s_grid,
+          qs[0] | ((qh[ib + 0] << 8) & 0x700),
+          qs[1] | ((qh[ib + 0] << 5) & 0x700));
+      int8x16_t g1 = grid8(
+          iq1s_grid,
+          qs[2] | ((qh[ib + 0] << 2) & 0x700),
+          qs[3] | ((qh[ib + 0] >> 1) & 0x700));
+      int8x16_t g2 = grid8(
+          iq1s_grid,
+          qs[4] | ((qh[ib + 1] << 8) & 0x700),
+          qs[5] | ((qh[ib + 1] << 5) & 0x700));
+      int8x16_t g3 = grid8(
+          iq1s_grid,
+          qs[6] | ((qh[ib + 1] << 2) & 0x700),
+          qs[7] | ((qh[ib + 1] >> 1) & 0x700));
+      qs += 8;
+      const int32x4_t p1 = vdotq_s32(vdotq_s32(mzero, g0, q8b0), g1, q8b1);
+      const int32x4_t p2 = vdotq_s32(vdotq_s32(mzero, g2, q8b2), g3, q8b3);
+      const int ls1 = 2 * ((qh[ib + 0] >> 12) & 7) + 1;
+      const int ls2 = 2 * ((qh[ib + 1] >> 12) & 7) + 1;
+      sumi1 += vaddvq_s32(p1) * ls1;
+      sumi2 += vaddvq_s32(p2) * ls2;
+      sumi3 += (bsums[2 * ib + 0] + bsums[2 * ib + 1]) * ls1 *
+              ((qh[ib + 0] & 0x8000) ? -1 : 1) +
+          (bsums[2 * ib + 2] + bsums[2 * ib + 3]) * ls2 *
+              ((qh[ib + 1] & 0x8000) ? -1 : 1);
+    }
+    sumf += d * (sumi1 + sumi2 + 0.125f * sumi3);
+  }
+  return sumf;
+}
+
+float vec_dot_iq1_m(const uint8_t* w, const void* act, int nb) {
+  const ActQ8K* y = static_cast<const ActQ8K*>(act);
+  const int32x4_t mask = vdupq_n_s32(0x7);
+  const int32x4_t mone = vdupq_n_s32(1);
+  const int32x4_t mzero = vdupq_n_s32(0);
+  int8x16x4_t deltas;
+  deltas.val[0] = vcombine_s8(vdup_n_s8(+1), vdup_n_s8(+1));
+  deltas.val[1] = vcombine_s8(vdup_n_s8(-1), vdup_n_s8(+1));
+  deltas.val[2] = vcombine_s8(vdup_n_s8(+1), vdup_n_s8(-1));
+  deltas.val[3] = vcombine_s8(vdup_n_s8(-1), vdup_n_s8(-1));
+  uint32_t aux32;
+  const uint8_t* aux8 = reinterpret_cast<const uint8_t*>(&aux32);
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    const uint8_t* xb = w + static_cast<std::size_t>(i) * 56;
+    const uint8_t* qs = xb;
+    const uint8_t* qh = xb + 32;
+    const uint16_t* sc = reinterpret_cast<const uint16_t*>(xb + 48);
+    uint16_t scale_u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+        ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+    const float d =
+        read_f16(reinterpret_cast<const uint8_t*>(&scale_u16)) * y[i].d;
+    const int8_t* q8 = y[i].qs;
+    int32x4_t sumi1 = mzero;
+    int32x4_t sumi2 = mzero;
+    for (int ib = 0; ib < 8; ib += 2) {
+      const int8x16_t q8b0 = vld1q_s8(q8);
+      const int8x16_t q8b1 = vld1q_s8(q8 + 16);
+      const int8x16_t q8b2 = vld1q_s8(q8 + 32);
+      const int8x16_t q8b3 = vld1q_s8(q8 + 48);
+      q8 += 64;
+      int8x16_t g0 = grid8(
+          iq1s_grid,
+          qs[0] | ((qh[0] << 8) & 0x700),
+          qs[1] | ((qh[0] << 4) & 0x700));
+      int8x16_t g1 = grid8(
+          iq1s_grid,
+          qs[2] | ((qh[1] << 8) & 0x700),
+          qs[3] | ((qh[1] << 4) & 0x700));
+      int8x16_t g2 = grid8(
+          iq1s_grid,
+          qs[4] | ((qh[2] << 8) & 0x700),
+          qs[5] | ((qh[2] << 4) & 0x700));
+      int8x16_t g3 = grid8(
+          iq1s_grid,
+          qs[6] | ((qh[3] << 8) & 0x700),
+          qs[7] | ((qh[3] << 4) & 0x700));
+      const int32x4_t p1 =
+          vpaddq_s32(vdotq_s32(mzero, g0, q8b0), vdotq_s32(mzero, g1, q8b1));
+      const int32x4_t p2 =
+          vpaddq_s32(vdotq_s32(mzero, g2, q8b2), vdotq_s32(mzero, g3, q8b3));
+      const int32x4_t p12 = vpaddq_s32(p1, p2);
+      uint32_t qh32;
+      std::memcpy(&qh32, qh, sizeof(uint32_t));
+      aux32 = ((qh32 >> 3) & 0x01010101) | ((qh32 >> 6) & 0x02020202);
+      const int32x4_t p3 = vpaddq_s32(
+          vdotq_s32(mzero, deltas.val[aux8[0]], q8b0),
+          vdotq_s32(mzero, deltas.val[aux8[1]], q8b1));
+      const int32x4_t p4 = vpaddq_s32(
+          vdotq_s32(mzero, deltas.val[aux8[2]], q8b2),
+          vdotq_s32(mzero, deltas.val[aux8[3]], q8b3));
+      const int32x4_t p34 = vpaddq_s32(p3, p4);
+      const int32_t s4[4] = {
+          static_cast<int32_t>(sc[ib / 2] >> 0),
+          static_cast<int32_t>(sc[ib / 2] >> 3),
+          static_cast<int32_t>(sc[ib / 2] >> 6),
+          static_cast<int32_t>(sc[ib / 2] >> 9)};
+      int32x4_t scales_4 = vld1q_s32(s4);
+      scales_4 = vaddq_s32(vshlq_n_s32(vandq_s32(scales_4, mask), 1), mone);
+      sumi1 = vmlaq_s32(sumi1, scales_4, p12);
+      sumi2 = vmlaq_s32(sumi2, scales_4, p34);
+      qs += 8;
+      qh += 4;
+    }
+    sumf += d * (vaddvq_s32(sumi1) + 0.125f * vaddvq_s32(sumi2));
+  }
+  return sumf;
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
@@ -814,6 +1381,42 @@ constexpr KQNeonKernel kKernelQ51 = {
     &vec_dot_q5_1,
     sizeof(ActQ81),
     &quantize_act_row_q81};
+constexpr KQNeonKernel kKernelIQ4NL = {
+    &vec_dot_iq4_nl,
+    sizeof(ActQ80),
+    &quantize_act_row_q80};
+constexpr KQNeonKernel kKernelIQ4XS = {
+    &vec_dot_iq4_xs,
+    sizeof(ActQ8K),
+    &quantize_act_row_q8k};
+constexpr KQNeonKernel kKernelIQ3S = {
+    &vec_dot_iq3_s,
+    sizeof(ActQ8K),
+    &quantize_act_row_q8k};
+constexpr KQNeonKernel kKernelIQ3XXS = {
+    &vec_dot_iq3_xxs,
+    sizeof(ActQ8K),
+    &quantize_act_row_q8k};
+constexpr KQNeonKernel kKernelIQ2XXS = {
+    &vec_dot_iq2_xxs,
+    sizeof(ActQ8K),
+    &quantize_act_row_q8k};
+constexpr KQNeonKernel kKernelIQ2XS = {
+    &vec_dot_iq2_xs,
+    sizeof(ActQ8K),
+    &quantize_act_row_q8k};
+constexpr KQNeonKernel kKernelIQ2S = {
+    &vec_dot_iq2_s,
+    sizeof(ActQ8K),
+    &quantize_act_row_q8k};
+constexpr KQNeonKernel kKernelIQ1S = {
+    &vec_dot_iq1_s,
+    sizeof(ActQ8K),
+    &quantize_act_row_q8k};
+constexpr KQNeonKernel kKernelIQ1M = {
+    &vec_dot_iq1_m,
+    sizeof(ActQ8K),
+    &quantize_act_row_q8k};
 
 bool cpu_has_dotprod() {
 #if defined(__APPLE__)
@@ -858,6 +1461,24 @@ const KQNeonKernel* kq_neon_kernel(const std::string& codec) {
     return &kKernelQ50;
   } else if (codec == "q5_1") {
     return &kKernelQ51;
+  } else if (codec == "iq4_nl") {
+    return &kKernelIQ4NL;
+  } else if (codec == "iq4_xs") {
+    return &kKernelIQ4XS;
+  } else if (codec == "iq3_s") {
+    return &kKernelIQ3S;
+  } else if (codec == "iq3_xxs") {
+    return &kKernelIQ3XXS;
+  } else if (codec == "iq2_xxs") {
+    return &kKernelIQ2XXS;
+  } else if (codec == "iq2_xs") {
+    return &kKernelIQ2XS;
+  } else if (codec == "iq2_s") {
+    return &kKernelIQ2S;
+  } else if (codec == "iq1_s") {
+    return &kKernelIQ1S;
+  } else if (codec == "iq1_m") {
+    return &kKernelIQ1M;
   }
   return nullptr;
 }

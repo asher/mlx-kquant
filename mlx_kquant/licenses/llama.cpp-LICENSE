@@ -1,9 +1,12 @@
 llama.cpp / ggml - https://github.com/ggml-org/llama.cpp
 
-The K-quant and legacy codec formats, and the quantization / dequantization
-algorithms that encode and decode them (the encoder scale searches and the
-block decode math in src/kquant_cpu_*.cpp and the Metal kernel headers), are
-derived from ggml's reference implementation. ggml and llama.cpp are
+The K-quant, IQ, and legacy codec formats, and the quantization /
+dequantization algorithms that encode and decode them (the encoder scale
+searches and block decode math in src/kquant_cpu_*.cpp and
+src/kquant_iq_encode.cpp, and the Metal kernel headers), are derived from
+ggml's reference implementation; the IQ codebook / grid tables
+(src/kquant_iq_*tables.h and the Metal *_iq_tables.h header) are transcribed
+from it verbatim. ggml and llama.cpp are
 distributed under the MIT License:
 
 MIT License

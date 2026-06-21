@@ -26,8 +26,10 @@ import sys
 
 import pytest
 
-# All ten codecs. K is a multiple of 256 so every codec's block size divides it;
-# N, K aligned and M >= 32 so the NAX GEMM path (not the per-row qmv) runs.
+# Every codec. K is a multiple of 256 so each codec's block size divides it;
+# N, K aligned and M >= 32 so the NAX GEMM path (not the per-row qmv) runs. The
+# nine IQ codecs cover the IQ NAX cold dispatch; the three ggml imatrix-required
+# ones are minted with an importance matrix (else kq.quantize rejects them).
 CODECS = [
     "q4_0",
     "q4_1",
@@ -39,7 +41,17 @@ CODECS = [
     "q4_k",
     "q5_k",
     "q6_k",
+    "iq4_nl",
+    "iq4_xs",
+    "iq3_xxs",
+    "iq3_s",
+    "iq2_xxs",
+    "iq2_xs",
+    "iq2_s",
+    "iq1_s",
+    "iq1_m",
 ]
+REQUIRED_IMATRIX = {"iq2_xxs", "iq2_xs", "iq1_s"}
 N, K, M = 1024, 1024, 64
 
 
@@ -61,7 +73,11 @@ def _cold_check(codec: str) -> int:
     w_np = rng.standard_normal((N, K)).astype(np.float32)
 
     # Quantize on the CPU stream so no GPU matmul runs before the one under test.
-    wq, scales = kq.quantize(mx.array(w_np), codec, stream=mx.cpu)
+    # The imatrix-required IQ codecs need an importance vector to encode at all.
+    imatrix = None
+    if codec in REQUIRED_IMATRIX:
+        imatrix = mx.array((np.abs(rng.standard_normal(K)) + 0.1).astype(np.float32))
+    wq, scales = kq.quantize(mx.array(w_np), codec, imatrix=imatrix, stream=mx.cpu)
     mx.eval(wq, scales)
     wq_np = np.ascontiguousarray(np.array(wq))
 

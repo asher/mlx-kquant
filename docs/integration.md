@@ -33,7 +33,8 @@ y = kq.quantized_matmul(x, wq, scales, "q4_k", transpose=True)   # x @ dequant(w
 
 ## Codecs
 
-Ten codecs, all defined in `mlx_kquant.codec_geometry.CODEC_GEOMETRY` as
+Fourteen codecs (ten encodable + four decode-only IQ), all defined in
+`mlx_kquant.codec_geometry.CODEC_GEOMETRY` as
 `(group_size, bits, bytes_per_block, weights_per_block)`:
 
 | codec | bits | weights/block | bytes/block | family |
@@ -48,6 +49,15 @@ Ten codecs, all defined in `mlx_kquant.codec_geometry.CODEC_GEOMETRY` as
 | `q4_k` | 4 | 256 | 144 | K-quant superblock |
 | `q5_k` | 5 | 256 | 176 | K-quant superblock |
 | `q6_k` | 6 | 256 | 210 | K-quant superblock |
+| `iq4_nl` | 4 | 32 | 18 | non-linear LUT (decode-only) |
+| `iq4_xs` | 4 | 256 | 136 | LUT superblock (decode-only) |
+| `iq3_s` | 3 | 256 | 110 | grid + signs (decode-only) |
+| `iq3_xxs` | 3 | 256 | 98 | grid + gas words (decode-only) |
+| `iq2_xxs` | 2 | 256 | 66 | grid + scale/sign words (decode-only) |
+| `iq2_xs` | 2 | 256 | 74 | grid + scales (decode-only) |
+| `iq2_s` | 2 | 256 | 82 | grid + qh + signs (decode-only) |
+| `iq1_s` | 1 | 256 | 50 | grid + delta (decode-only) |
+| `iq1_m` | 1 | 256 | 56 | grid + delta, scattered scale (decode-only) |
 
 `weights_per_block` (`wpb`) is the granularity that matters for layout: K-quants pack 256 weights per
 superblock, the block codecs 32. The duck-typed `group_size` attribute on a `KQuant*` module

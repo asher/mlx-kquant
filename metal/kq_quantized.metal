@@ -331,4 +331,220 @@ instantiate_kquant_q3_k_for_type(float16_t)
 instantiate_kquant_q2_k_for_type(float)
 instantiate_kquant_q2_k_for_type(bfloat16_t)
 instantiate_kquant_q2_k_for_type(float16_t)
+
+// IQ codecs are decode-only (load community GGUFs); they ship ALU-only (no NAX)
+// and without verify_qmv (the small-batch path falls back to qmv, bit-exact).
+#define instantiate_kquant_iq4_nl_for_type(type)                     \
+  instantiate_kquant_batched(qmv_fast, type, 32, 4, 0, iq4_nl)       \
+  instantiate_kquant_batched(qmv_fast, type, 32, 4, 1, iq4_nl)       \
+  instantiate_kquant_batched(qmv,      type, 32, 4, 0, iq4_nl)       \
+  instantiate_kquant_batched(qmv,      type, 32, 4, 1, iq4_nl)       \
+  instantiate_kquant_qmm_t(type, 32, 4, true, 0, iq4_nl)             \
+  instantiate_kquant_qmm_t(type, 32, 4, true, 1, iq4_nl)             \
+  instantiate_kquant_qmm_t(type, 32, 4, false, 0, iq4_nl)            \
+  instantiate_kquant_qmm_t(type, 32, 4, false, 1, iq4_nl)            \
+  instantiate_kquant_qmm_t_splitk(type, 32, 4, true, iq4_nl)         \
+  instantiate_kquant_qmm_t_splitk(type, 32, 4, false, iq4_nl)        \
+  instantiate_kquant_qmm_n(type, 32, 4, 0, iq4_nl)                   \
+  instantiate_kquant_qmm_n(type, 32, 4, 1, iq4_nl)                   \
+  instantiate_kquant_gather_qmv(gather_qmv_fast, type, 32, 4, iq4_nl) \
+  instantiate_kquant_gather_qmv(gather_qmv,      type, 32, 4, iq4_nl) \
+  instantiate_kquant_gather_qmm_t(type, 32, 4, true, iq4_nl)         \
+  instantiate_kquant_gather_qmm_t(type, 32, 4, false, iq4_nl)        \
+  instantiate_kquant_gather_qmm_n(type, 32, 4, iq4_nl)               \
+  instantiate_kquant_dequantize(type, 32, 4, iq4_nl)
+
+instantiate_kquant_iq4_nl_for_type(float)
+instantiate_kquant_iq4_nl_for_type(bfloat16_t)
+instantiate_kquant_iq4_nl_for_type(float16_t)
+
+#define instantiate_kquant_iq4_xs_for_type(type)                     \
+  instantiate_kquant_batched(qmv_fast, type, 256, 4, 0, iq4_xs)      \
+  instantiate_kquant_batched(qmv_fast, type, 256, 4, 1, iq4_xs)      \
+  instantiate_kquant_batched(qmv,      type, 256, 4, 0, iq4_xs)      \
+  instantiate_kquant_batched(qmv,      type, 256, 4, 1, iq4_xs)      \
+  instantiate_kquant_qmm_t(type, 256, 4, true, 0, iq4_xs)            \
+  instantiate_kquant_qmm_t(type, 256, 4, true, 1, iq4_xs)           \
+  instantiate_kquant_qmm_t(type, 256, 4, false, 0, iq4_xs)          \
+  instantiate_kquant_qmm_t(type, 256, 4, false, 1, iq4_xs)          \
+  instantiate_kquant_qmm_t_splitk(type, 256, 4, true, iq4_xs)        \
+  instantiate_kquant_qmm_t_splitk(type, 256, 4, false, iq4_xs)       \
+  instantiate_kquant_qmm_n(type, 256, 4, 0, iq4_xs)                  \
+  instantiate_kquant_qmm_n(type, 256, 4, 1, iq4_xs)                  \
+  instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 4, iq4_xs) \
+  instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 4, iq4_xs) \
+  instantiate_kquant_gather_qmm_t(type, 256, 4, true, iq4_xs)        \
+  instantiate_kquant_gather_qmm_t(type, 256, 4, false, iq4_xs)       \
+  instantiate_kquant_gather_qmm_n(type, 256, 4, iq4_xs)              \
+  instantiate_kquant_dequantize(type, 256, 4, iq4_xs)
+
+instantiate_kquant_iq4_xs_for_type(float)
+instantiate_kquant_iq4_xs_for_type(bfloat16_t)
+instantiate_kquant_iq4_xs_for_type(float16_t)
+
+#define instantiate_kquant_iq3_xxs_for_type(type)                    \
+  instantiate_kquant_batched(qmv_fast, type, 256, 3, 0, iq3_xxs)     \
+  instantiate_kquant_batched(qmv_fast, type, 256, 3, 1, iq3_xxs)     \
+  instantiate_kquant_batched(qmv,      type, 256, 3, 0, iq3_xxs)     \
+  instantiate_kquant_batched(qmv,      type, 256, 3, 1, iq3_xxs)     \
+  instantiate_kquant_qmm_t(type, 256, 3, true, 0, iq3_xxs)           \
+  instantiate_kquant_qmm_t(type, 256, 3, true, 1, iq3_xxs)           \
+  instantiate_kquant_qmm_t(type, 256, 3, false, 0, iq3_xxs)          \
+  instantiate_kquant_qmm_t(type, 256, 3, false, 1, iq3_xxs)          \
+  instantiate_kquant_qmm_t_splitk(type, 256, 3, true, iq3_xxs)       \
+  instantiate_kquant_qmm_t_splitk(type, 256, 3, false, iq3_xxs)      \
+  instantiate_kquant_qmm_n(type, 256, 3, 0, iq3_xxs)                 \
+  instantiate_kquant_qmm_n(type, 256, 3, 1, iq3_xxs)                 \
+  instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 3, iq3_xxs) \
+  instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 3, iq3_xxs) \
+  instantiate_kquant_gather_qmm_t(type, 256, 3, true, iq3_xxs)       \
+  instantiate_kquant_gather_qmm_t(type, 256, 3, false, iq3_xxs)      \
+  instantiate_kquant_gather_qmm_n(type, 256, 3, iq3_xxs)             \
+  instantiate_kquant_dequantize(type, 256, 3, iq3_xxs)
+
+instantiate_kquant_iq3_xxs_for_type(float)
+instantiate_kquant_iq3_xxs_for_type(bfloat16_t)
+instantiate_kquant_iq3_xxs_for_type(float16_t)
+
+#define instantiate_kquant_iq3_s_for_type(type)                      \
+  instantiate_kquant_batched(qmv_fast, type, 256, 3, 0, iq3_s)       \
+  instantiate_kquant_batched(qmv_fast, type, 256, 3, 1, iq3_s)       \
+  instantiate_kquant_batched(qmv,      type, 256, 3, 0, iq3_s)       \
+  instantiate_kquant_batched(qmv,      type, 256, 3, 1, iq3_s)       \
+  instantiate_kquant_qmm_t(type, 256, 3, true, 0, iq3_s)             \
+  instantiate_kquant_qmm_t(type, 256, 3, true, 1, iq3_s)             \
+  instantiate_kquant_qmm_t(type, 256, 3, false, 0, iq3_s)            \
+  instantiate_kquant_qmm_t(type, 256, 3, false, 1, iq3_s)            \
+  instantiate_kquant_qmm_t_splitk(type, 256, 3, true, iq3_s)         \
+  instantiate_kquant_qmm_t_splitk(type, 256, 3, false, iq3_s)        \
+  instantiate_kquant_qmm_n(type, 256, 3, 0, iq3_s)                   \
+  instantiate_kquant_qmm_n(type, 256, 3, 1, iq3_s)                   \
+  instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 3, iq3_s) \
+  instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 3, iq3_s) \
+  instantiate_kquant_gather_qmm_t(type, 256, 3, true, iq3_s)         \
+  instantiate_kquant_gather_qmm_t(type, 256, 3, false, iq3_s)        \
+  instantiate_kquant_gather_qmm_n(type, 256, 3, iq3_s)              \
+  instantiate_kquant_dequantize(type, 256, 3, iq3_s)
+
+instantiate_kquant_iq3_s_for_type(float)
+instantiate_kquant_iq3_s_for_type(bfloat16_t)
+instantiate_kquant_iq3_s_for_type(float16_t)
+
+#define instantiate_kquant_iq2_xxs_for_type(type)                    \
+  instantiate_kquant_batched(qmv_fast, type, 256, 2, 0, iq2_xxs)     \
+  instantiate_kquant_batched(qmv_fast, type, 256, 2, 1, iq2_xxs)     \
+  instantiate_kquant_batched(qmv,      type, 256, 2, 0, iq2_xxs)     \
+  instantiate_kquant_batched(qmv,      type, 256, 2, 1, iq2_xxs)     \
+  instantiate_kquant_qmm_t(type, 256, 2, true, 0, iq2_xxs)           \
+  instantiate_kquant_qmm_t(type, 256, 2, true, 1, iq2_xxs)           \
+  instantiate_kquant_qmm_t(type, 256, 2, false, 0, iq2_xxs)          \
+  instantiate_kquant_qmm_t(type, 256, 2, false, 1, iq2_xxs)          \
+  instantiate_kquant_qmm_t_splitk(type, 256, 2, true, iq2_xxs)       \
+  instantiate_kquant_qmm_t_splitk(type, 256, 2, false, iq2_xxs)      \
+  instantiate_kquant_qmm_n(type, 256, 2, 0, iq2_xxs)                 \
+  instantiate_kquant_qmm_n(type, 256, 2, 1, iq2_xxs)                 \
+  instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 2, iq2_xxs) \
+  instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 2, iq2_xxs) \
+  instantiate_kquant_gather_qmm_t(type, 256, 2, true, iq2_xxs)       \
+  instantiate_kquant_gather_qmm_t(type, 256, 2, false, iq2_xxs)      \
+  instantiate_kquant_gather_qmm_n(type, 256, 2, iq2_xxs)             \
+  instantiate_kquant_dequantize(type, 256, 2, iq2_xxs)
+
+instantiate_kquant_iq2_xxs_for_type(float)
+instantiate_kquant_iq2_xxs_for_type(bfloat16_t)
+instantiate_kquant_iq2_xxs_for_type(float16_t)
+
+#define instantiate_kquant_iq2_xs_for_type(type)                     \
+  instantiate_kquant_batched(qmv_fast, type, 256, 2, 0, iq2_xs)      \
+  instantiate_kquant_batched(qmv_fast, type, 256, 2, 1, iq2_xs)      \
+  instantiate_kquant_batched(qmv,      type, 256, 2, 0, iq2_xs)      \
+  instantiate_kquant_batched(qmv,      type, 256, 2, 1, iq2_xs)      \
+  instantiate_kquant_qmm_t(type, 256, 2, true, 0, iq2_xs)            \
+  instantiate_kquant_qmm_t(type, 256, 2, true, 1, iq2_xs)            \
+  instantiate_kquant_qmm_t(type, 256, 2, false, 0, iq2_xs)           \
+  instantiate_kquant_qmm_t(type, 256, 2, false, 1, iq2_xs)           \
+  instantiate_kquant_qmm_t_splitk(type, 256, 2, true, iq2_xs)        \
+  instantiate_kquant_qmm_t_splitk(type, 256, 2, false, iq2_xs)       \
+  instantiate_kquant_qmm_n(type, 256, 2, 0, iq2_xs)                  \
+  instantiate_kquant_qmm_n(type, 256, 2, 1, iq2_xs)                  \
+  instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 2, iq2_xs) \
+  instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 2, iq2_xs) \
+  instantiate_kquant_gather_qmm_t(type, 256, 2, true, iq2_xs)        \
+  instantiate_kquant_gather_qmm_t(type, 256, 2, false, iq2_xs)       \
+  instantiate_kquant_gather_qmm_n(type, 256, 2, iq2_xs)              \
+  instantiate_kquant_dequantize(type, 256, 2, iq2_xs)
+
+instantiate_kquant_iq2_xs_for_type(float)
+instantiate_kquant_iq2_xs_for_type(bfloat16_t)
+instantiate_kquant_iq2_xs_for_type(float16_t)
+
+#define instantiate_kquant_iq2_s_for_type(type)                      \
+  instantiate_kquant_batched(qmv_fast, type, 256, 2, 0, iq2_s)       \
+  instantiate_kquant_batched(qmv_fast, type, 256, 2, 1, iq2_s)       \
+  instantiate_kquant_batched(qmv,      type, 256, 2, 0, iq2_s)       \
+  instantiate_kquant_batched(qmv,      type, 256, 2, 1, iq2_s)       \
+  instantiate_kquant_qmm_t(type, 256, 2, true, 0, iq2_s)             \
+  instantiate_kquant_qmm_t(type, 256, 2, true, 1, iq2_s)             \
+  instantiate_kquant_qmm_t(type, 256, 2, false, 0, iq2_s)            \
+  instantiate_kquant_qmm_t(type, 256, 2, false, 1, iq2_s)            \
+  instantiate_kquant_qmm_t_splitk(type, 256, 2, true, iq2_s)         \
+  instantiate_kquant_qmm_t_splitk(type, 256, 2, false, iq2_s)        \
+  instantiate_kquant_qmm_n(type, 256, 2, 0, iq2_s)                   \
+  instantiate_kquant_qmm_n(type, 256, 2, 1, iq2_s)                   \
+  instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 2, iq2_s) \
+  instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 2, iq2_s) \
+  instantiate_kquant_gather_qmm_t(type, 256, 2, true, iq2_s)         \
+  instantiate_kquant_gather_qmm_t(type, 256, 2, false, iq2_s)        \
+  instantiate_kquant_gather_qmm_n(type, 256, 2, iq2_s)               \
+  instantiate_kquant_dequantize(type, 256, 2, iq2_s)
+
+instantiate_kquant_iq2_s_for_type(float)
+instantiate_kquant_iq2_s_for_type(bfloat16_t)
+instantiate_kquant_iq2_s_for_type(float16_t)
+
+#define instantiate_kquant_iq1_s_for_type(type)                      \
+  instantiate_kquant_batched(qmv_fast, type, 256, 1, 0, iq1_s)       \
+  instantiate_kquant_batched(qmv_fast, type, 256, 1, 1, iq1_s)       \
+  instantiate_kquant_batched(qmv,      type, 256, 1, 0, iq1_s)       \
+  instantiate_kquant_batched(qmv,      type, 256, 1, 1, iq1_s)       \
+  instantiate_kquant_qmm_t(type, 256, 1, true, 0, iq1_s)             \
+  instantiate_kquant_qmm_t(type, 256, 1, true, 1, iq1_s)            \
+  instantiate_kquant_qmm_t(type, 256, 1, false, 0, iq1_s)            \
+  instantiate_kquant_qmm_t(type, 256, 1, false, 1, iq1_s)            \
+  instantiate_kquant_qmm_t_splitk(type, 256, 1, true, iq1_s)         \
+  instantiate_kquant_qmm_t_splitk(type, 256, 1, false, iq1_s)        \
+  instantiate_kquant_qmm_n(type, 256, 1, 0, iq1_s)                   \
+  instantiate_kquant_qmm_n(type, 256, 1, 1, iq1_s)                   \
+  instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 1, iq1_s) \
+  instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 1, iq1_s) \
+  instantiate_kquant_gather_qmm_t(type, 256, 1, true, iq1_s)         \
+  instantiate_kquant_gather_qmm_t(type, 256, 1, false, iq1_s)        \
+  instantiate_kquant_gather_qmm_n(type, 256, 1, iq1_s)               \
+  instantiate_kquant_dequantize(type, 256, 1, iq1_s)
+instantiate_kquant_iq1_s_for_type(float)
+instantiate_kquant_iq1_s_for_type(bfloat16_t)
+instantiate_kquant_iq1_s_for_type(float16_t)
+
+#define instantiate_kquant_iq1_m_for_type(type)                      \
+  instantiate_kquant_batched(qmv_fast, type, 256, 1, 0, iq1_m)       \
+  instantiate_kquant_batched(qmv_fast, type, 256, 1, 1, iq1_m)       \
+  instantiate_kquant_batched(qmv,      type, 256, 1, 0, iq1_m)       \
+  instantiate_kquant_batched(qmv,      type, 256, 1, 1, iq1_m)       \
+  instantiate_kquant_qmm_t(type, 256, 1, true, 0, iq1_m)             \
+  instantiate_kquant_qmm_t(type, 256, 1, true, 1, iq1_m)            \
+  instantiate_kquant_qmm_t(type, 256, 1, false, 0, iq1_m)            \
+  instantiate_kquant_qmm_t(type, 256, 1, false, 1, iq1_m)            \
+  instantiate_kquant_qmm_t_splitk(type, 256, 1, true, iq1_m)         \
+  instantiate_kquant_qmm_t_splitk(type, 256, 1, false, iq1_m)        \
+  instantiate_kquant_qmm_n(type, 256, 1, 0, iq1_m)                   \
+  instantiate_kquant_qmm_n(type, 256, 1, 1, iq1_m)                   \
+  instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 1, iq1_m) \
+  instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 1, iq1_m) \
+  instantiate_kquant_gather_qmm_t(type, 256, 1, true, iq1_m)         \
+  instantiate_kquant_gather_qmm_t(type, 256, 1, false, iq1_m)        \
+  instantiate_kquant_gather_qmm_n(type, 256, 1, iq1_m)               \
+  instantiate_kquant_dequantize(type, 256, 1, iq1_m)
+instantiate_kquant_iq1_m_for_type(float)
+instantiate_kquant_iq1_m_for_type(bfloat16_t)
+instantiate_kquant_iq1_m_for_type(float16_t)
     // clang-format on

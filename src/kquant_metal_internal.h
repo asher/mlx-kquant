@@ -9,6 +9,7 @@
 
 #ifdef _METAL_
 
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <tuple>
@@ -54,7 +55,11 @@ inline bool kq_is_nax_available() {
 // quantized.cpp:52-58
 inline int kquant_qmv_bn(const std::string& kquant_type) {
   if (kquant_type == "q2_k" || kquant_type == "q3_k" || kquant_type == "q4_k" ||
-      kquant_type == "q5_k") {
+      kquant_type == "q5_k" || kquant_type == "iq4_xs" ||
+      kquant_type == "iq3_s" || kquant_type == "iq3_xxs" ||
+      kquant_type == "iq2_xxs" || kquant_type == "iq2_xs" ||
+      kquant_type == "iq2_s" || kquant_type == "iq1_s" ||
+      kquant_type == "iq1_m") {
     return 4;
   }
   return 8;
@@ -68,6 +73,20 @@ inline int qmv_fast_k_align() {
 inline bool codec_has_matmul(const std::string& kquant_type) {
   const KQuantCodec* codec = codec_by_name(kquant_type);
   return codec != nullptr && codec->has_matmul_kernel;
+}
+
+// Gates the NAX (tensor-core) dispatch. IQ codecs ship ALU-only, so this is
+// false for them and their qmm/gather route to the ALU kernels.
+inline bool codec_has_nax(const std::string& kquant_type) {
+  // KQ_DISABLE_NAX=1 forces the ALU qmm/gather path (A/B harness lever). Read
+  // live (not cached) so a single process can toggle NAX between calls; only
+  // reached on the NAX-eligible prefill path, so the getenv cost is negligible.
+  const char* e = std::getenv("KQ_DISABLE_NAX");
+  if (e != nullptr && e[0] == '1') {
+    return false;
+  }
+  const KQuantCodec* codec = codec_by_name(kquant_type);
+  return codec != nullptr && codec->has_nax_kernel;
 }
 
 // Codecs with a verify_qmv kernel (the small-M weight-read-amortizing leaf).

@@ -19,8 +19,9 @@ On-disk format:
   (uint8 ``[1]`` placeholder - K-quant scales live inside the wire bytes), and an
   optional ``<path>.bias``; unquantized tensors keep their source dtype.
 
-Encode runs on CPU or Metal (the ``quantize`` op has a scalar CPU path for all
-ten codecs).
+The ten K-quant/legacy codecs encode on CPU or Metal; the nine IQ codecs encode
+CPU-only (ggml has no GPU IQ quantizer), which the ``quantize`` op routes
+internally, so a recipe mixing both still converts on either stream.
 """
 
 from __future__ import annotations

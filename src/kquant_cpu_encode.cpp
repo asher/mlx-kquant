@@ -20,6 +20,8 @@
 #include <stdexcept>
 
 #include "kquant_codec.h"
+#include "kquant_cpu_encode_util.h" // write_f16, read_f16, kq_nearest_int, kq_make_qp_quants
+#include "kquant_iq_encode.h" // kquant_iq_quantize_dispatch (IQ codecs)
 
 #include "mlx/types/half_types.h"
 
@@ -29,22 +31,9 @@ namespace mlx_kquant {
 
 namespace {
 
-// Write a float as a 2-byte fp16 (round-to-nearest-even), matching the kernel's
-// `half(v)` store; the K-quant re-quantize phase reads this back, so the round
-// trip must be identical between CPU and GPU.
-inline void write_f16(uint8_t* ptr, float v) {
-  _Float16 h = static_cast<_Float16>(v);
-  std::memcpy(ptr, &h, sizeof(_Float16));
-}
-
-// Read a 2-byte fp16 back to float, matching the kernel's `float(*(half*)...)`.
-// The K-quant encoders write the super-scale as fp16 then re-read it before
-// re-quantizing each weight, so this round trip must match the GPU exactly.
-inline float read_f16(const uint8_t* ptr) {
-  _Float16 h;
-  std::memcpy(&h, ptr, sizeof(_Float16));
-  return static_cast<float>(h);
-}
+// write_f16, read_f16, kq_nearest_int, and kq_make_qp_quants now live in
+// kquant_cpu_encode_util.h (shared, in an anonymous namespace, with the IQ
+// encoders in kquant_iq_encode.cpp).
 
 template <typename T>
 void quantize_q8_0(const T* w, uint8_t* out, std::size_t num_weights) {
@@ -241,12 +230,6 @@ constexpr int Q5K_BB = 176, Q5K_D = 0, Q5K_DMIN = 2, Q5K_SC = 4, Q5K_QH = 16,
               Q5K_QS = 48;
 constexpr int Q6K_BB = 210, Q6K_QL = 0, Q6K_QH = 128, Q6K_SC = 192, Q6K_D = 208;
 
-// int(rint(v)): round-half-to-even, matching Metal `int(rint(v))` (the K-quant
-// rounding rule; the flat codecs above use round-half-away-from-zero instead).
-inline int kq_nearest_int(float v) {
-  return static_cast<int>(std::rint(v));
-}
-
 // sum(x^2) over the 256-weight super-block -> sigma2 = factor*sum/256, and
 // av_x = sqrt(sigma2). The GPU computes the sum via a simd_sum tree reduction;
 // the serial sum here can differ by an ULP, which is why the K-quant CPU/GPU
@@ -259,96 +242,6 @@ compute_sigma2_av_x(const float* Xs, float& sigma2, float& av_x, float factor) {
   }
   sigma2 = factor * total / 256.0f;
   av_x = std::sqrt(sigma2);
-}
-
-// Fit a single positive-only scale to N values via the ggml make_qp_quants
-// search (used for the Q4_K/Q5_K/Q2_K super-scale and super-min). Writes the
-// quantized levels into L_out and returns the scale.
-template <int N>
-float kq_make_qp_quants(
-    const float* x,
-    const float* qw,
-    int nmax,
-    uint8_t* L_out) {
-  float max_v = 0.0f;
-  for (int i = 0; i < N; i++) {
-    if (x[i] > max_v) {
-      max_v = x[i];
-    }
-  }
-  if (max_v < 1e-30f) { // GROUP_MAX_EPS
-    for (int i = 0; i < N; i++) {
-      L_out[i] = 0;
-    }
-    return 0.0f;
-  }
-  float iscale = float(nmax) / max_v;
-  uint8_t L[N];
-  for (int i = 0; i < N; i++) {
-    int l = kq_nearest_int(iscale * x[i]);
-    L[i] = uint8_t(std::max(0, std::min(nmax, l)));
-  }
-  float scale = 1.0f / iscale;
-  float best_mse = 0.0f;
-  for (int i = 0; i < N; i++) {
-    float diff = x[i] - scale * float(L[i]);
-    best_mse += qw[i] * diff * diff;
-  }
-  for (int is = -4; is <= 4; is++) {
-    if (is == 0) {
-      continue;
-    }
-    float iscale_is = (0.1f * float(is) + float(nmax)) / max_v;
-    float scale_is = 1.0f / iscale_is;
-    float mse = 0.0f;
-    for (int i = 0; i < N; i++) {
-      int l = kq_nearest_int(iscale_is * x[i]);
-      l = std::min(nmax, l);
-      float diff = x[i] - scale_is * float(l);
-      mse += qw[i] * diff * diff;
-    }
-    if (mse < best_mse) {
-      best_mse = mse;
-      iscale = iscale_is;
-    }
-  }
-  float sumlx = 0.0f, suml2 = 0.0f;
-  for (int i = 0; i < N; i++) {
-    int l = kq_nearest_int(iscale * x[i]);
-    l = std::min(nmax, l);
-    L[i] = uint8_t(l);
-    sumlx += qw[i] * x[i] * float(l);
-    suml2 += qw[i] * float(l) * float(l);
-  }
-  for (int itry = 0; itry < 5; itry++) {
-    int n_changed = 0;
-    for (int i = 0; i < N; i++) {
-      float w = qw[i];
-      float slx = sumlx - w * x[i] * float(L[i]);
-      float sl2 = suml2 - w * float(L[i]) * float(L[i]);
-      if (slx > 0.0f && sl2 > 0.0f) {
-        int new_l = kq_nearest_int(x[i] * sl2 / slx);
-        new_l = std::min(nmax, new_l);
-        if (new_l != int(L[i])) {
-          slx += w * x[i] * float(new_l);
-          sl2 += w * float(new_l) * float(new_l);
-          if (slx * slx * suml2 > sumlx * sumlx * sl2) {
-            L[i] = uint8_t(new_l);
-            sumlx = slx;
-            suml2 = sl2;
-            n_changed++;
-          }
-        }
-      }
-    }
-    if (n_changed == 0) {
-      break;
-    }
-  }
-  for (int i = 0; i < N; i++) {
-    L_out[i] = L[i];
-  }
-  return (suml2 > 0.0f) ? (sumlx / suml2) : 0.0f;
 }
 
 // Fit a scale + min to N values via the ggml make_qkx3_quants search (the
@@ -959,8 +852,9 @@ void kquant_quantize_dispatch(
   } else if (kquant_type == "q6_k") {
     quantize_q6_k(w, out, num_weights, imatrix, K);
   } else {
-    throw std::runtime_error(
-        "[mlx_kquant] quantize: unsupported codec: " + kquant_type);
+    // IQ codecs (CPU-only encode); throws if the codec is genuinely unknown or
+    // its IQ encoder is not yet implemented.
+    kquant_iq_quantize_dispatch(w, out, num_weights, kquant_type, imatrix, K);
   }
 }
 

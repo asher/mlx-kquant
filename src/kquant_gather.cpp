@@ -135,7 +135,7 @@ void gather_qmm(
     const std::string& kquant_type) {
   // enable_tf32 dropped (always short-circuited; op promotes f32 x -> bf16).
   if (kq_is_nax_available() && transpose && (K % 64 == 0) &&
-      (x.dtype() != mx::float32) && codec_has_matmul(kquant_type)) {
+      (x.dtype() != mx::float32) && codec_has_nax(kquant_type)) {
     return gather_qmm_nax(
         x,
         w,
@@ -444,9 +444,14 @@ void KQuantGatherQMM::eval_cpu(
         }
       }
       auto group_w = [&](std::size_t first) {
+        // 64-bit expert offset. A stacked expert tensor can exceed 2^31 bytes
+        // (a 256-expert q5_k down_proj is ~2.2 GB), and mx::elem_to_loc takes
+        // an int first argument, so passing w_idx * w_els truncated the offset
+        // to 32 bits and read out of bounds for expert indices past ~2^31 /
+        // w_els. w is matrix-contiguous (op-enforced), so the byte offset is
+        // w_idx * w_els computed in size_t.
         return w.data<uint8_t>() +
-            mx::elem_to_loc(
-                   entries[first].w_idx * w_els, w.shape(), w.strides());
+            static_cast<std::size_t>(entries[first].w_idx) * w_els;
       };
 
       // Decode-shape consolidation: when every per-expert group is small
@@ -512,14 +517,18 @@ void KQuantGatherQMM::eval_cpu(
             task.out =
                 out.data<T>() + static_cast<std::size_t>(entries[ga].i) * M * N;
             task.x = x.data<T>() +
-                mx::elem_to_loc(
-                         entries[ga].x_idx * M * K, x.shape(), x.strides());
+                elem_to_loc64(
+                         static_cast<int64_t>(entries[ga].x_idx) * M * K,
+                         x.shape(),
+                         x.strides());
           } else if (ru == 1) {
             // One unique row: read x in place, fan the output out below.
             og_packs.emplace_back(out_row_els);
             task.x = x.data<T>() +
-                mx::elem_to_loc(
-                         plans[gi].uniq[0] * M * K, x.shape(), x.strides());
+                elem_to_loc64(
+                         static_cast<int64_t>(plans[gi].uniq[0]) * M * K,
+                         x.shape(),
+                         x.strides());
             task.out = og_packs.back().data();
           } else {
             xg_packs.emplace_back(ru * row_els);
@@ -528,8 +537,10 @@ void KQuantGatherQMM::eval_cpu(
               std::memcpy(
                   xg_packs.back().data() + u * row_els,
                   x.data<T>() +
-                      mx::elem_to_loc(
-                          plans[gi].uniq[u] * M * K, x.shape(), x.strides()),
+                      elem_to_loc64(
+                          static_cast<int64_t>(plans[gi].uniq[u]) * M * K,
+                          x.shape(),
+                          x.strides()),
                   row_els * sizeof(T));
             }
             task.x = xg_packs.back().data();
@@ -569,8 +580,10 @@ void KQuantGatherQMM::eval_cpu(
           kquant_qmm_cpu<T>(
               out.data<T>() + static_cast<std::size_t>(entries[a].i) * M * N,
               x.data<T>() +
-                  mx::elem_to_loc(
-                      entries[a].x_idx * M * K, x.shape(), x.strides()),
+                  elem_to_loc64(
+                      static_cast<int64_t>(entries[a].x_idx) * M * K,
+                      x.shape(),
+                      x.strides()),
               wp,
               M,
               N,
@@ -584,8 +597,10 @@ void KQuantGatherQMM::eval_cpu(
             std::memcpy(
                 xg.data() + r * row_els,
                 x.data<T>() +
-                    mx::elem_to_loc(
-                        entries[a + r].x_idx * M * K, x.shape(), x.strides()),
+                    elem_to_loc64(
+                        static_cast<int64_t>(entries[a + r].x_idx) * M * K,
+                        x.shape(),
+                        x.strides()),
                 row_els * sizeof(T));
           }
           kquant_qmm_cpu<T>(
@@ -727,7 +742,7 @@ void KQuantGatherQMM::eval_gpu(
   // The SwitchGLU sort path satisfies all of this; any case that does not falls
   // through to the (correct, slower) gather_qmv / gather_qmm leaves below.
   bool kquant_rhs_ok = kq_is_nax_available() && transpose_ && (K % 64 == 0) &&
-      (x.dtype() != mx::float32) && codec_has_matmul(kquant_type_);
+      (x.dtype() != mx::float32) && codec_has_nax(kquant_type_);
   if (M == 1 && B >= 16 && right_sorted_ && (B / E >= 4) && kquant_rhs_ok &&
       x.flags().row_contiguous && rhs_indices.flags().row_contiguous &&
       (x.size() / K == static_cast<size_t>(B))) {

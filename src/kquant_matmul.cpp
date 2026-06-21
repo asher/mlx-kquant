@@ -125,7 +125,7 @@ void qmm(
   // so x.dtype() is never float32 here and the NAX path stays eligible on the
   // dtype axis with no tf32 gate.
   if (kq_is_nax_available() && transpose && (K % 64 == 0) &&
-      (x.dtype() != mx::float32) && codec_has_matmul(kquant_type)) {
+      (x.dtype() != mx::float32) && codec_has_nax(kquant_type)) {
     return qmm_nax(
         x,
         w,
@@ -418,9 +418,14 @@ void KQuantMatmul::eval_cpu(
       for (int i = 0; i < batch_size; i++) {
         kquant_qmm_cpu<T>(
             out.data<T>() + static_cast<std::size_t>(i) * M * N,
-            x.data<T>() + mx::elem_to_loc(i * M * K, x.shape(), x.strides()),
+            x.data<T>() +
+                elem_to_loc64(
+                    static_cast<int64_t>(i) * M * K, x.shape(), x.strides()),
             w.data<uint8_t>() +
-                mx::elem_to_loc(i * w_batch_els, w.shape(), w.strides()),
+                elem_to_loc64(
+                    static_cast<int64_t>(i) * static_cast<int64_t>(w_batch_els),
+                    w.shape(),
+                    w.strides()),
             M,
             N,
             K,

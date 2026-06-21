@@ -30,8 +30,10 @@ import numpy as np
 import mlx_kquant as kq
 from mlx_kquant.codec_geometry import IMATRIX_CODECS
 
-# The 5 K-quant superblock codecs (weights_per_block == 256); the geometry comes
-# from codec_geometry, so this never drifts from the kernels.
+# The 5 K-quant superblock codecs whose committed fixtures are minted with an
+# imatrix. IMATRIX_CODECS is an explicit literal in codec_geometry (NOT every
+# wpb==256 codec -- that would wrongly pull in the CPU-only IQ superblocks, which
+# have no GPU encoder and no committed fixtures).
 KCODECS = sorted(IMATRIX_CODECS)
 
 N, K = 256, 512  # K % 256 == 0 (K-quant block) and % 64 == 0 (nax matmul)
