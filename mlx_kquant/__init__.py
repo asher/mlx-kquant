@@ -29,6 +29,7 @@ from ._ext import (  # noqa: F401
     metallib_loads,
     quantize,
     quantized_matmul,
+    sdpa_vector,
 )
 from ._version import __version__
 
@@ -43,4 +44,5 @@ __all__ = [
     "metallib_loads",
     "quantize",
     "quantized_matmul",
+    "sdpa_vector",
 ]

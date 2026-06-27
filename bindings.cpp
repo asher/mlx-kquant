@@ -108,6 +108,32 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_vector",
+      &mlx_kquant::sdpa_vector,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "scale"_a,
+      "causal"_a = true,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Vector scaled-dot-product attention for large head dims (256, 512) that
+        stock MLX's fused vector allowlist excludes.
+
+        Args:
+            q (array): queries [B, n_q_heads, qL, D], float16/bfloat16.
+            k (array): keys [B, n_kv_heads, kL, D]; head/seq strided is fine
+                (read in place), D dim must be contiguous.
+            v (array): values [B, n_kv_heads, kL, D].
+            scale (float): query scale (typically 1/sqrt(D)).
+            causal (bool): apply an offset causal mask. Default True.
+
+        Returns:
+            array: attention output [B, n_q_heads, qL, D].
+      )");
+
+  m.def(
       "gather_qmm",
       &mlx_kquant::gather_qmm,
       "x"_a,
