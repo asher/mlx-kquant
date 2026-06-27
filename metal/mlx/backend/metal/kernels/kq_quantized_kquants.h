@@ -3790,6 +3790,68 @@ template <typename T, int group_size, int bits>
   kq_q3_k_dequantize_impl<T>(w, out, num_weights, gid);
 }
 
+// q3_k flat-with-M verify mat-vec: kq_mv_ext_impl (see kq_quantized.h) + the
+// per-codec chunk dequant below. Direct port of ggml-metal dequantize_q3_K (16
+// contiguous weights of chunk il, natural order [il*16, il*16+16)). ml is taken
+// from the pre-coef dl (4*dl), matching ggml; the hmask bit subtracts it.
+inline void kq_q3_k_deq_chunk16(
+    const device uint8_t* block,
+    short il,
+    thread float4x4& reg) {
+  const float d_all = kq_q3_k_d(block);
+  const device uint8_t* q = kq_q3_k_qs_ptr(block);
+  const device uint8_t* h = kq_q3_k_hmask_ptr(block);
+  const device uint8_t* scales = kq_q3_k_scales12_ptr(block);
+  q = q + 32 * (il / 8) + 16 * (il & 1);
+  h = h + 16 * (il & 1);
+  const uint8_t m = 1 << (il / 2);
+  const uint16_t kmask1 =
+      (il / 4) > 1 ? ((il / 4) > 2 ? 192 : 48) : ((il / 4) > 0 ? 12 : 3);
+  const uint16_t kmask2 = (il / 8) ? 0xF0 : 0x0F;
+  const uint16_t scale_2 = scales[il % 8];
+  const uint16_t scale_1 = scales[8 + il % 4];
+  const int16_t dl_int = ((il / 4) & 1)
+      ? ((scale_2 & kmask2) | ((scale_1 & kmask1) << 2))
+      : ((scale_2 & kmask2) | ((scale_1 & kmask1) << 4));
+  float dl =
+      il < 8 ? d_all * (dl_int - 32.0f) : d_all * (dl_int / 16.0f - 32.0f);
+  const float ml = 4.0f * dl;
+  il = (il / 2) & 3;
+  const float coef = il > 1 ? (il > 2 ? 1.0f / 64.0f : 1.0f / 16.0f)
+                            : (il > 0 ? 1.0f / 4.0f : 1.0f);
+  const uint8_t mask = il > 1 ? (il > 2 ? 192 : 48) : (il > 0 ? 12 : 3);
+  dl *= coef;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    reg[i / 4][i % 4] = dl * float(q[i] & mask) - (h[i] & m ? 0.0f : ml);
+  }
+}
+
+struct KqQ3_KExt {
+  MLX_MTL_CONST int superblock = KQ_Q3_K_SUPERBLOCK;
+  MLX_MTL_CONST int block_bytes = KQ_Q3_K_BLOCK_BYTES;
+  static METAL_FUNC void
+  deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
+    kq_q3_k_deq_chunk16(block, il, reg);
+  }
+};
+
+template <typename T, short r1ptg, short nsg, short nxpsg>
+[[kernel]] void kq_q3_k_mv_ext(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    const constant int& /* vm */, // == r1ptg
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  kq_mv_ext_impl<T, KqQ3_KExt, r1ptg, nsg, nxpsg>(
+      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
+}
+
 // Q2_K: 84 bytes/256 weights. [scales[16]][qs[64]][fp16 d][fp16 dmin].
 // w[i] = d * (sc & 0xF) * q2 - dmin * (sc >> 4). Asymmetric.
 

@@ -623,8 +623,8 @@ void KQuantMatmul::eval_gpu(
       return e != nullptr ? std::atoi(e) : -1; // -1 = per-codec default
     }();
     const bool codec_has_mv_ext = kquant_type_ == "q8_0" ||
-        kquant_type_ == "q4_k" || kquant_type_ == "q5_k" ||
-        kquant_type_ == "q6_k";
+        kquant_type_ == "q3_k" || kquant_type_ == "q4_k" ||
+        kquant_type_ == "q5_k" || kquant_type_ == "q6_k";
     // All wired codecs validated bit-exact, so default-on == has-kernel.
     const bool mv_ext_default_on = codec_has_mv_ext;
     // q8_0 is a 32-weight block; the K-quants are 256.
