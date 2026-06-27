@@ -4712,3 +4712,52 @@ template <typename T, int group_size, int bits>
   static_assert(bits == 2, "Q2_K kernel requires bits=2");
   kq_q2_k_dequantize_impl<T>(w, out, num_weights, gid);
 }
+
+// q2_k flat-with-M verify mat-vec: kq_mv_ext_impl (see kq_quantized.h) + the
+// per-codec chunk dequant below. Direct port of ggml-metal dequantize_q2_K (16
+// contiguous weights of chunk il, natural order [il*16, il*16+16)).
+inline void kq_q2_k_deq_chunk16(
+    const device uint8_t* block,
+    short il,
+    thread float4x4& reg) {
+  const float d = kq_q2_k_d(block);
+  const float dmin = kq_q2_k_dmin(block);
+  const device uint8_t* q = kq_q2_k_qs_ptr(block);
+  const uint8_t sc = kq_q2_k_scales_ptr(block)[il];
+  q = q + 32 * (il / 8) + 16 * (il & 1);
+  il = (il / 2) % 4;
+  const float coef = il > 1 ? (il > 2 ? 1.0f / 64.0f : 1.0f / 16.0f)
+                            : (il > 0 ? 1.0f / 4.0f : 1.0f);
+  const uint8_t mask = il > 1 ? (il > 2 ? 192 : 48) : (il > 0 ? 12 : 3);
+  const float dl = d * float(sc & 0xF) * coef;
+  const float ml = dmin * float(sc >> 4);
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    reg[i / 4][i % 4] = dl * float(q[i] & mask) - ml;
+  }
+}
+
+struct KqQ2_KExt {
+  MLX_MTL_CONST int superblock = KQ_Q2_K_SUPERBLOCK;
+  MLX_MTL_CONST int block_bytes = KQ_Q2_K_BLOCK_BYTES;
+  static METAL_FUNC void
+  deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
+    kq_q2_k_deq_chunk16(block, il, reg);
+  }
+};
+
+template <typename T, short r1ptg, short nsg, short nxpsg>
+[[kernel]] void kq_q2_k_mv_ext(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    const constant int& /* vm */, // == r1ptg
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  kq_mv_ext_impl<T, KqQ2_KExt, r1ptg, nsg, nxpsg>(
+      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
+}

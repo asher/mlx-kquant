@@ -304,6 +304,7 @@ instantiate_kquant_q6_k_for_type(float16_t)
   instantiate_mv_ext_for_type(codec, gs, bits, bfloat16_t)              \
   instantiate_mv_ext_for_type(codec, gs, bits, float16_t)
 instantiate_mv_ext_all(q8_0, 32, 8)
+instantiate_mv_ext_all(q2_k, 256, 2)
 instantiate_mv_ext_all(q3_k, 256, 3)
 instantiate_mv_ext_all(q4_k, 256, 4)
 instantiate_mv_ext_all(q5_k, 256, 5)
