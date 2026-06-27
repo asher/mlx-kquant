@@ -357,11 +357,12 @@ void verify_qmv(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// Flat-with-M verify mat-vec (kq_q6_k_mv_ext): port of ggml mul_mv_ext_q4x4.
+// Flat-with-M verify mat-vec (kq_<codec>_mv_ext): port of ggml mul_mv_ext_q4x4.
 // One output row per thread, M (= vm) register accumulators, nypsg=4 output
 // rows in parallel per simdgroup, nxpsg=8-lane K-reduction; the weight row
 // streams once and is dotted against all M activation columns. M selects the
-// kernel (r1ptg is compile-time). q6_k only; same call args as verify_qmv.
+// kernel (r1ptg is compile-time). All wired codecs (the kname prefix carries
+// the codec); same call args as verify_qmv.
 void verify_mv_ext(
     const array& x,
     const array& w,
@@ -622,14 +623,26 @@ void KQuantMatmul::eval_gpu(
       const char* e = std::getenv("KQ_VERIFY_EXT");
       return e != nullptr ? std::atoi(e) : -1; // -1 = per-codec default
     }();
+    // Every wired codec now has an mv_ext kernel: q8_0, the five K-quants, the
+    // four legacy non-K (q4_0/q4_1/q5_0/q5_1), and all nine IQ. Validated
+    // bit-exact, so default-on == has-kernel.
     const bool codec_has_mv_ext = kquant_type_ == "q8_0" ||
         kquant_type_ == "q2_k" || kquant_type_ == "q3_k" ||
         kquant_type_ == "q4_k" || kquant_type_ == "q5_k" ||
-        kquant_type_ == "q6_k";
-    // All wired codecs validated bit-exact, so default-on == has-kernel.
+        kquant_type_ == "q6_k" || kquant_type_ == "q4_0" ||
+        kquant_type_ == "q4_1" || kquant_type_ == "q5_0" ||
+        kquant_type_ == "q5_1" || kquant_type_ == "iq4_nl" ||
+        kquant_type_ == "iq4_xs" || kquant_type_ == "iq3_s" ||
+        kquant_type_ == "iq3_xxs" || kquant_type_ == "iq2_xxs" ||
+        kquant_type_ == "iq2_xs" || kquant_type_ == "iq2_s" ||
+        kquant_type_ == "iq1_s" || kquant_type_ == "iq1_m";
     const bool mv_ext_default_on = codec_has_mv_ext;
-    // q8_0 is a 32-weight block; the K-quants are 256.
-    const int mv_ext_k_align = (kquant_type_ == "q8_0") ? 32 : 256;
+    // 32-weight blocks (legacy + q8_0 + iq4_nl) align K to 32; the 256-weight
+    // super-block codecs (K-quants + the other IQ) align to 256. Pull the
+    // modulus from the codec geometry rather than hard-coding per codec.
+    const KQuantCodec* mv_ext_codec = codec_by_name(kquant_type_);
+    const int mv_ext_k_align =
+        mv_ext_codec ? mv_ext_codec->weights_per_block : 256;
     if (codec_has_mv_ext && non_batched && M >= 2 && M <= 8 &&
         (K % mv_ext_k_align == 0) &&
         (verify_ext == 1 || (verify_ext != 0 && mv_ext_default_on))) {
