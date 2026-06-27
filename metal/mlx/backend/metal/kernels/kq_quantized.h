@@ -1073,6 +1073,47 @@ template <typename T, int group_size, int bits>
   kq_q8_0_dequantize_impl<T>(w, out, num_weights, gid);
 }
 
+// q8_0 flat-with-M verify mat-vec: kq_mv_ext_impl (see above) + chunk dequant.
+// Direct port of ggml-metal dequantize_q8_0: the 16 contiguous int8 weights of
+// chunk il, natural order [il*16, il*16+16). A q8_0 block is 32 weights, so a
+// 16-weight chunk is half a block (il in [0,1]).
+inline void kq_q8_0_deq_chunk16(
+    const device uint8_t* block,
+    short il,
+    thread float4x4& reg) {
+  const float d = kq_q8_0_d(block);
+  const device int8_t* qs = kq_q8_0_q_ptr(block) + 16 * il;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    reg[i / 4][i % 4] = float(qs[i]) * d;
+  }
+}
+
+struct KqQ8_0Ext {
+  MLX_MTL_CONST int superblock = KQ_Q8_0_GROUP;
+  MLX_MTL_CONST int block_bytes = KQ_Q8_0_BLOCK_BYTES;
+  static METAL_FUNC void
+  deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
+    kq_q8_0_deq_chunk16(block, il, reg);
+  }
+};
+
+template <typename T, short r1ptg, short nsg, short nxpsg>
+[[kernel]] void kq_q8_0_mv_ext(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    const constant int& /* vm */, // == r1ptg
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  kq_mv_ext_impl<T, KqQ8_0Ext, r1ptg, nsg, nxpsg>(
+      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
+}
+
 #include "mlx/backend/metal/kernels/kq_quantized_legacy.h"
 
 // Q5_1: 24 bytes/32 weights. [fp16 d][fp16 m][uint32 qh][uint8 qs[16]].

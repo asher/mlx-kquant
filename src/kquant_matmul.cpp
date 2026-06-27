@@ -610,19 +610,27 @@ void KQuantMatmul::eval_gpu(
   }
 
   if (transpose_) {
-    // The q6_k verify width goes through the flat-with-M mat-vec
-    // (kq_q6_k_mv_ext, a port of ggml mul_mv_ext): one output row per thread
-    // with M register accumulators + nypsg parallel rows per simdgroup, vs
-    // verify_qmv's [MAX_VM][RPS] block that stays occupancy-exposed under
-    // saturation. Measured flat to M=4 (x1.06 saturated, matching llama) and a
-    // strict bit-exact win over verify_qmv at every M. On by default for q6_k;
-    // KQ_VERIFY_EXT=0 forces the verify_qmv path (A/B lever).
+    // The verify width goes through the flat-with-M mat-vec (kq_<codec>_mv_ext,
+    // a port of ggml mul_mv_ext): one output row per thread with M register
+    // accumulators + nypsg parallel rows per simdgroup, vs verify_qmv's
+    // [MAX_VM][RPS] block that stays occupancy-exposed under saturation.
+    // Measured flat with M (matching llama) and bit-exact (fp-noise) vs
+    // verify_qmv and per-row qmv. On by default for the codecs in
+    // mv_ext_default_on; KQ_VERIFY_EXT=0 forces the verify_qmv path, =1 forces
+    // mv_ext for any codec that has the kernel (A/B lever).
     static const int verify_ext = []() {
       const char* e = std::getenv("KQ_VERIFY_EXT");
       return e != nullptr ? std::atoi(e) : -1; // -1 = per-codec default
     }();
-    if (verify_ext != 0 && non_batched && M >= 2 && M <= 8 &&
-        kquant_type_ == "q6_k" && (K % 256 == 0)) {
+    const bool codec_has_mv_ext =
+        kquant_type_ == "q8_0" || kquant_type_ == "q6_k";
+    // All wired codecs validated bit-exact, so default-on == has-kernel.
+    const bool mv_ext_default_on = codec_has_mv_ext;
+    // q8_0 is a 32-weight block; the K-quants are 256.
+    const int mv_ext_k_align = (kquant_type_ == "q8_0") ? 32 : 256;
+    if (codec_has_mv_ext && non_batched && M >= 2 && M <= 8 &&
+        (K % mv_ext_k_align == 0) &&
+        (verify_ext == 1 || (verify_ext != 0 && mv_ext_default_on))) {
       verify_mv_ext(
           x, w, scales, out, group_size_, bits_, M, N, K, d, s, kquant_type_);
       return;

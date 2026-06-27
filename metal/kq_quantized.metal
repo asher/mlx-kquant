@@ -284,22 +284,27 @@ instantiate_kquant_q6_k_for_type(bfloat16_t)
 instantiate_kquant_q6_k_for_type(float16_t)
 
 // Flat-with-M verify mat-vec (port of ggml mul_mv_ext_q4x4). nsg=2, nxpsg=8;
-// r1ptg = M templated for M in [2,8] (one kernel per draft width).
-#define instantiate_q6k_mv_ext(type, m)                                 \
+// r1ptg = M templated for M in [2,8] (one kernel per draft width). Codec-generic
+// (kq_mv_ext_impl); one deq_chunk16 per codec. q8_0 is a 32-weight block, the
+// K-quants are 256.
+#define instantiate_mv_ext(codec, type, gs, bits, m)                    \
   instantiate_kernel(                                                   \
-      "kquant_q6_k_mv_ext_" #type "_gs_256_b_6_m" #m,                   \
-      kq_q6_k_mv_ext, type, m, 2, 8)
-#define instantiate_q6k_mv_ext_for_type(type)                           \
-  instantiate_q6k_mv_ext(type, 2)                                       \
-  instantiate_q6k_mv_ext(type, 3)                                       \
-  instantiate_q6k_mv_ext(type, 4)                                       \
-  instantiate_q6k_mv_ext(type, 5)                                       \
-  instantiate_q6k_mv_ext(type, 6)                                       \
-  instantiate_q6k_mv_ext(type, 7)                                       \
-  instantiate_q6k_mv_ext(type, 8)
-instantiate_q6k_mv_ext_for_type(float)
-instantiate_q6k_mv_ext_for_type(bfloat16_t)
-instantiate_q6k_mv_ext_for_type(float16_t)
+      "kquant_" #codec "_mv_ext_" #type "_gs_" #gs "_b_" #bits "_m" #m, \
+      kq_ ## codec ## _mv_ext, type, m, 2, 8)
+#define instantiate_mv_ext_for_type(codec, gs, bits, type)             \
+  instantiate_mv_ext(codec, type, gs, bits, 2)                          \
+  instantiate_mv_ext(codec, type, gs, bits, 3)                          \
+  instantiate_mv_ext(codec, type, gs, bits, 4)                          \
+  instantiate_mv_ext(codec, type, gs, bits, 5)                          \
+  instantiate_mv_ext(codec, type, gs, bits, 6)                          \
+  instantiate_mv_ext(codec, type, gs, bits, 7)                          \
+  instantiate_mv_ext(codec, type, gs, bits, 8)
+#define instantiate_mv_ext_all(codec, gs, bits)                        \
+  instantiate_mv_ext_for_type(codec, gs, bits, float)                   \
+  instantiate_mv_ext_for_type(codec, gs, bits, bfloat16_t)              \
+  instantiate_mv_ext_for_type(codec, gs, bits, float16_t)
+instantiate_mv_ext_all(q8_0, 32, 8)
+instantiate_mv_ext_all(q6_k, 256, 6)
 
 #define instantiate_kquant_q3_k_for_type(type)                          \
   instantiate_kquant_batched(verify_qmv, type, 256, 3, 0, q3_k)          \
