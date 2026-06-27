@@ -1830,6 +1830,16 @@ inline void kq_get_scale_min_k4(
   m_out = j_high ? m_high : m_low;
 }
 
+// ggml get_scale_min_k4_just2: returns {scale, min} (6-bit each) for sub-block
+// pair (j, k) of a q4_k/q5_k 12-byte scales array. Used by the mv_ext chunk
+// dequant; direct port of ggml-metal.
+inline uchar2 kq_get_scale_min_k4_just2(int j, int k, const device uint8_t* q) {
+  return j < 4 ? uchar2(q[j + 0 + k] & 63, q[j + 4 + k] & 63)
+               : uchar2(
+                     (q[j + 4 + k] & 0xF) | ((q[j - 4 + k] & 0xc0) >> 2),
+                     (q[j + 4 + k] >> 4) | ((q[j - 0 + k] & 0xc0) >> 2));
+}
+
 #include "mlx/backend/metal/kernels/kq_quantized_kquants.h"
 
 #include "mlx/backend/metal/kernels/kq_quantized_iq.h"

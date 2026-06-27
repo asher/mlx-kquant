@@ -1787,6 +1787,61 @@ template <typename T, int group_size, int bits>
   kq_q5_k_dequantize_impl<T>(w, out, num_weights, gid);
 }
 
+// q5_k flat-with-M verify mat-vec: kq_mv_ext_impl (see kq_quantized.h) + the
+// per-codec chunk dequant below. Direct port of ggml-metal dequantize_q5_K (16
+// contiguous weights of chunk il, natural order [il*16, il*16+16)). The 5th bit
+// (qh) is added in as qh_val before the dl scale, matching ggml.
+inline void kq_q5_k_deq_chunk16(
+    const device uint8_t* block,
+    short il,
+    thread float4x4& reg) {
+  const device uint8_t* q = kq_q5_k_qs_ptr(block);
+  const device uint8_t* qh = kq_q5_k_qh_ptr(block);
+  const short is = (il / 4) * 2;
+  q = q + 32 * (il / 4) + 16 * (il & 1);
+  qh = qh + 16 * (il & 1);
+  const uint8_t ul = 1 << (il / 2);
+  il = il & 3;
+  const uchar2 sc =
+      kq_get_scale_min_k4_just2(is, il / 2, kq_q5_k_scales12_ptr(block));
+  const float d = il < 2 ? kq_q5_k_d(block) : kq_q5_k_d(block) / 16.0f;
+  const float dmin = kq_q5_k_dmin(block);
+  const float dl = d * float(sc[0]);
+  const float ml = dmin * float(sc[1]);
+  const uint16_t mask = il < 2 ? 0x0F : 0xF0;
+  const float qh_val = il < 2 ? 16.0f : 256.0f;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    reg[i / 4][i % 4] =
+        dl * (float(q[i] & mask) + (qh[i] & ul ? qh_val : 0.0f)) - ml;
+  }
+}
+
+struct KqQ5_KExt {
+  MLX_MTL_CONST int superblock = KQ_Q5_K_SUPERBLOCK;
+  MLX_MTL_CONST int block_bytes = KQ_Q5_K_BLOCK_BYTES;
+  static METAL_FUNC void
+  deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
+    kq_q5_k_deq_chunk16(block, il, reg);
+  }
+};
+
+template <typename T, short r1ptg, short nsg, short nxpsg>
+[[kernel]] void kq_q5_k_mv_ext(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    const constant int& /* vm */, // == r1ptg
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  kq_mv_ext_impl<T, KqQ5_KExt, r1ptg, nsg, nxpsg>(
+      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
+}
+
 // Q6_K: 210 bytes/256 weights. REVERSED field order: [ql[128]][qh[64]][int8
 // scales[16]][fp16 d]. q6 = (low4 | (high2<<4)) - 32; w[i] = d * sc * q6.
 
