@@ -326,6 +326,111 @@ METAL_FUNC void kq_adjust_matrix_offsets(
   y += tid.z * output_stride;
 }
 
+// ---------------------------------------------------------------------------
+// Flat-with-M verify mat-vec (port of ggml-metal kernel_mul_mv_ext_q4x4),
+// codec-agnostic. The per-row qmv puts M on grid_dims.x, so each of the M rows
+// runs its own threadgroup that re-reads the weight tile - M-x the weight
+// traffic for the same answer, and under GPU saturation (the verify forward's
+// real condition) the M dots stay exposed. This decomposition stays flat with
+// M: the 32 simdgroup lanes are nxpsg along K x nypsg output rows, so nypsg
+// output rows compute in parallel per simdgroup, EACH thread owns ONE row and
+// holds only r1ptg(=M) float accumulators, and the K-reduction is an
+// nxpsg-lane simd_shuffle_down. The weight row streams once and is dotted
+// against all M activation columns - same weight DRAM traffic as M=1. r1ptg is
+// the compile-time draft width (== runtime vm); dispatched for M in [2,8] only.
+// Bit-exact (fp-noise) vs verify_qmv and per-row qmv.
+//
+// Codec is a traits struct giving super-block geometry (superblock,
+// block_bytes) and deq_chunk16(block, il, reg): dequantize the 16 contiguous
+// weights of chunk il into a float4x4 in natural order [il*16, il*16+16). The
+// ggml dequantize_* permutation of il yields exactly that natural order, so the
+// contiguous activation read below pairs each weight with its activation.
+// Non-batched (B == 1) only; x is row-contiguous [vm, K], y is [vm, N].
+// Derived from llama.cpp ggml-metal.metal (MIT); attribution in licenses/.
+template <typename T, typename Codec, short r1ptg, short nsg, short nxpsg>
+METAL_FUNC void kq_mv_ext_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    uint3 tgpig,
+    ushort tiisg,
+    ushort sgitg) {
+  constexpr short nypsg = 32 / nxpsg; // output rows per simdgroup
+  constexpr short chpb = Codec::superblock / 16; // 16-weight chunks per block
+  const short tx = tiisg % nxpsg; // K position within the row group
+  const short ty = tiisg / nxpsg; // which of nypsg rows this thread owns
+
+  const int i01 = tgpig.x * (nypsg * nsg) + nypsg * sgitg + ty; // output row
+  const int i11 = tgpig.y * r1ptg; // first activation column (grid.y==1 -> 0)
+
+  const int nb = in_vec_size / Codec::superblock;
+  const int row_bytes = nb * Codec::block_bytes;
+  // Clamp OOB rows to row 0 for a valid read; the store is masked below.
+  const device uint8_t* w_row =
+      (i01 < out_vec_size) ? w + static_cast<int64_t>(i01) * row_bytes : w;
+
+  const device T* y_col[r1ptg];
+#pragma unroll
+  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+    y_col[ir1] = x + static_cast<int64_t>(i11 + ir1) * in_vec_size + tx * 16;
+  }
+
+  float sumf[r1ptg];
+#pragma unroll
+  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+    sumf[ir1] = 0.0f;
+  }
+
+  for (int ich = tx; 16 * ich < in_vec_size; ich += nxpsg) {
+    const int ib = ich / chpb; // super-block index
+    const short cch = ich % chpb; // chunk within super-block
+    const device uint8_t* block =
+        w_row + static_cast<int64_t>(ib) * Codec::block_bytes;
+    float4x4 lx;
+    Codec::deq_chunk16(block, cch, lx);
+#pragma unroll
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+      const device T* yp = y_col[ir1];
+      const float4 a0 = float4(*(const device vec<T, 4>*)(yp + 0));
+      const float4 a1 = float4(*(const device vec<T, 4>*)(yp + 4));
+      const float4 a2 = float4(*(const device vec<T, 4>*)(yp + 8));
+      const float4 a3 = float4(*(const device vec<T, 4>*)(yp + 12));
+      sumf[ir1] +=
+          dot(lx[0], a0) + dot(lx[1], a1) + dot(lx[2], a2) + dot(lx[3], a3);
+      y_col[ir1] += nxpsg * 16;
+    }
+  }
+
+#pragma unroll
+  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+    if (nxpsg >= 32) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 16);
+    }
+    if (nxpsg >= 16) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 8);
+    }
+    if (nxpsg >= 8) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 4);
+    }
+    if (nxpsg >= 4) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 2);
+    }
+    if (nxpsg >= 2) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 1);
+    }
+  }
+
+  if (tx == 0 && i01 < out_vec_size) {
+#pragma unroll
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+      y[static_cast<int64_t>(i11 + ir1) * out_vec_size + i01] =
+          static_cast<T>(sumf[ir1]);
+    }
+  }
+}
+
 // Q8_0: 34 bytes/32 weights. [fp16 d][int8 q[32]]. w[i] = d * q[i].
 
 MLX_MTL_CONST int KQ_Q8_0_GROUP = 32;

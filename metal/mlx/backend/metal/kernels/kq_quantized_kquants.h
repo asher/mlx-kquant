@@ -2568,21 +2568,8 @@ template <typename T, int group_size, int bits, bool batched>
 }
 
 // ---------------------------------------------------------------------------
-// q6_k flat-with-M verify mat-vec (port of ggml-metal kernel_mul_mv_ext_q4x4).
-//
-// verify_qmv amortizes the weight read across M rows but gives each thread an
-// [MAX_VM][results_per_simdgroup] accumulator block and reduces one output row
-// per simdgroup over all 32 lanes; under GPU saturation (the verify forward's
-// real condition) the M dots stay exposed and the kernel scales ~1.44x@M4. ggml
-// stays FLAT at this width with a different decomposition we mirror here: the
-// 32 simdgroup lanes are nxpsg(=8) along K x nypsg(=4) output rows, so FOUR
-// output rows compute in parallel per simdgroup, EACH thread owns ONE row and
-// holds only r1ptg(=M) float accumulators, and the K-reduction is an nxpsg-lane
-// simd_shuffle_down. The weight row is streamed once and dotted against all M
-// activation columns -- same weight DRAM traffic as M=1. r1ptg is the
-// compile-time draft width (== runtime vm); dispatched for M in [2,8] only.
-// Bit-exact (fp-noise) vs verify_qmv and per-row qmv. Derived from llama.cpp
-// ggml-metal.metal (MIT); attribution in licenses/.
+// q6_k flat-with-M verify mat-vec: kq_mv_ext_impl (see kq_quantized.h) + the
+// per-codec chunk dequant below.
 
 // Dequantize the 16 contiguous weights of chunk `il` (in [0,15]) of a q6_k
 // super-block into a float4x4 (natural element order il*16 .. il*16+15). Direct
@@ -2625,6 +2612,15 @@ inline void kq_q6_k_deq_chunk16(
   }
 }
 
+struct KqQ6_KExt {
+  MLX_MTL_CONST int superblock = KQ_Q6_K_SUPERBLOCK;
+  MLX_MTL_CONST int block_bytes = KQ_Q6_K_BLOCK_BYTES;
+  static METAL_FUNC void
+  deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
+    kq_q6_k_deq_chunk16(block, il, reg);
+  }
+};
+
 template <typename T, short r1ptg, short nsg, short nxpsg>
 [[kernel]] void kq_q6_k_mv_ext(
     const device uint8_t* w,
@@ -2637,78 +2633,8 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
     uint3 tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-  constexpr short nypsg = 32 / nxpsg; // output rows per simdgroup
-  constexpr short chpb = KQ_Q6_K_SUPERBLOCK / 16; // 16 chunks per super-block
-  const short tx = tiisg % nxpsg; // K position within the row group
-  const short ty = tiisg / nxpsg; // which of nypsg rows this thread owns
-
-  const int i01 = tgpig.x * (nypsg * nsg) + nypsg * sgitg + ty; // output row
-  const int i11 = tgpig.y * r1ptg; // first activation column (grid.y==1 -> 0)
-
-  const int nb = in_vec_size / KQ_Q6_K_SUPERBLOCK;
-  const int row_bytes = nb * KQ_Q6_K_BLOCK_BYTES;
-  // Clamp OOB rows to row 0 for a valid read; the store is masked below.
-  const device uint8_t* w_row =
-      (i01 < out_vec_size) ? w + static_cast<int64_t>(i01) * row_bytes : w;
-
-  const device T* y_col[r1ptg];
-#pragma unroll
-  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-    y_col[ir1] = x + static_cast<int64_t>(i11 + ir1) * in_vec_size + tx * 16;
-  }
-
-  float sumf[r1ptg];
-#pragma unroll
-  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-    sumf[ir1] = 0.0f;
-  }
-
-  for (int ich = tx; 16 * ich < in_vec_size; ich += nxpsg) {
-    const int ib = ich / chpb; // super-block index
-    const short cch = ich % chpb; // chunk within super-block
-    const device uint8_t* block =
-        w_row + static_cast<int64_t>(ib) * KQ_Q6_K_BLOCK_BYTES;
-    float4x4 lx;
-    kq_q6_k_deq_chunk16(block, cch, lx);
-#pragma unroll
-    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-      const device T* yp = y_col[ir1];
-      const float4 a0 = float4(*(const device vec<T, 4>*)(yp + 0));
-      const float4 a1 = float4(*(const device vec<T, 4>*)(yp + 4));
-      const float4 a2 = float4(*(const device vec<T, 4>*)(yp + 8));
-      const float4 a3 = float4(*(const device vec<T, 4>*)(yp + 12));
-      sumf[ir1] +=
-          dot(lx[0], a0) + dot(lx[1], a1) + dot(lx[2], a2) + dot(lx[3], a3);
-      y_col[ir1] += nxpsg * 16;
-    }
-  }
-
-#pragma unroll
-  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-    if (nxpsg >= 32) {
-      sumf[ir1] += simd_shuffle_down(sumf[ir1], 16);
-    }
-    if (nxpsg >= 16) {
-      sumf[ir1] += simd_shuffle_down(sumf[ir1], 8);
-    }
-    if (nxpsg >= 8) {
-      sumf[ir1] += simd_shuffle_down(sumf[ir1], 4);
-    }
-    if (nxpsg >= 4) {
-      sumf[ir1] += simd_shuffle_down(sumf[ir1], 2);
-    }
-    if (nxpsg >= 2) {
-      sumf[ir1] += simd_shuffle_down(sumf[ir1], 1);
-    }
-  }
-
-  if (tx == 0 && i01 < out_vec_size) {
-#pragma unroll
-    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-      y[static_cast<int64_t>(i11 + ir1) * out_vec_size + i01] =
-          static_cast<T>(sumf[ir1]);
-    }
-  }
+  kq_mv_ext_impl<T, KqQ6_KExt, r1ptg, nsg, nxpsg>(
+      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
 }
 
 template <typename T, int group_size, int bits, bool batched>
