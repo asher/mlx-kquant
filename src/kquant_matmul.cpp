@@ -637,6 +637,14 @@ void KQuantMatmul::eval_gpu(
         kquant_type_ == "iq2_xs" || kquant_type_ == "iq2_s" ||
         kquant_type_ == "iq1_s" || kquant_type_ == "iq1_m";
     const bool mv_ext_default_on = codec_has_mv_ext;
+    // Width gate for the DEFAULT path (the A/B force-on KQ_VERIFY_EXT=1 ignores
+    // it). Measured DRAM-fresh: for non-IQ codecs verify_qmv (tuned for small
+    // M, MAX_VM accumulators) ties or beats mv_ext at M==2 and mv_ext only pays
+    // at M>=3, so non-IQ falls back to verify_qmv at M==2 (no regression at the
+    // rarely-used draft-width-1 case). IQ has no verify_qmv kernel, so mv_ext
+    // (vs per-row qmv) is a clear win at every M>=2 and stays on.
+    const bool is_iq = kquant_type_.rfind("iq", 0) == 0;
+    const bool mv_ext_width_ok = is_iq || M >= 3;
     // 32-weight blocks (legacy + q8_0 + iq4_nl) align K to 32; the 256-weight
     // super-block codecs (K-quants + the other IQ) align to 256. Pull the
     // modulus from the codec geometry rather than hard-coding per codec.
@@ -645,7 +653,8 @@ void KQuantMatmul::eval_gpu(
         mv_ext_codec ? mv_ext_codec->weights_per_block : 256;
     if (codec_has_mv_ext && non_batched && M >= 2 && M <= 8 &&
         (K % mv_ext_k_align == 0) &&
-        (verify_ext == 1 || (verify_ext != 0 && mv_ext_default_on))) {
+        (verify_ext == 1 ||
+         (verify_ext != 0 && mv_ext_default_on && mv_ext_width_ok))) {
       verify_mv_ext(
           x, w, scales, out, group_size_, bits_, M, N, K, d, s, kquant_type_);
       return;
