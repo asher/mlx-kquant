@@ -1812,6 +1812,56 @@ template <typename T, int group_size, int bits>
   kq_q5_1_dequantize_impl<T>(w, out, num_weights, gid);
 }
 
+// q5_1 flat-with-M verify mat-vec: kq_mv_ext_impl (see above) + chunk dequant.
+// Mirrors kq_q5_1_dequantize_impl (natural order [il*16, il*16+16)); il in
+// [0,1]
+// -> within base 0 then 16. 5th bit from qh bit `within`. w[i] = d * q5 + m,
+// q5 = lo4 | (qh_bit << 4).
+inline void kq_q5_1_deq_chunk16(
+    const device uint8_t* block,
+    short il,
+    thread float4x4& reg) {
+  const float d = kq_q5_1_d(block);
+  const float m = kq_q5_1_m(block);
+  const uint32_t qh = kq_q5_1_qh(block);
+  const device uint8_t* qs = kq_q5_1_qs_ptr(block);
+  const int base = (il & 1) * 16;
+  const int shift = (il & 1) ? 4 : 0;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    const int within = base + i;
+    const uint32_t hi = ((qh >> within) << 4) & 0x10u;
+    const int lo = (int(qs[i]) >> shift) & 0x0F;
+    const float q5 = float(lo | int(hi));
+    reg[i / 4][i % 4] = d * q5 + m;
+  }
+}
+
+struct KqQ5_1Ext {
+  MLX_MTL_CONST int superblock = KQ_Q5_1_GROUP;
+  MLX_MTL_CONST int block_bytes = KQ_Q5_1_BLOCK_BYTES;
+  static METAL_FUNC void
+  deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
+    kq_q5_1_deq_chunk16(block, il, reg);
+  }
+};
+
+template <typename T, short r1ptg, short nsg, short nxpsg>
+[[kernel]] void kq_q5_1_mv_ext(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    const constant int& /* vm */, // == r1ptg
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  kq_mv_ext_impl<T, KqQ5_1Ext, r1ptg, nsg, nxpsg>(
+      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
+}
+
 inline void kq_get_scale_min_k4(
     int j,
     const device uint8_t* q,

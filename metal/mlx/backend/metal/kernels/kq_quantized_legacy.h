@@ -653,6 +653,50 @@ template <typename T, int group_size, int bits>
   kq_q4_0_dequantize_impl<T>(w, out, num_weights, gid);
 }
 
+// q4_0 flat-with-M verify mat-vec: kq_mv_ext_impl (see kq_quantized.h) + chunk
+// dequant. Port of ggml-metal dequantize_q4_0 (16 contiguous weights of chunk
+// il, natural order [il*16, il*16+16)). A q4_0 block is 32 weights, so il in
+// [0,1]: low nibbles (0..15) then high nibbles (16..31) of qs[0..15]. w[i] = d
+// * (q4 - 8).
+inline void kq_q4_0_deq_chunk16(
+    const device uint8_t* block,
+    short il,
+    thread float4x4& reg) {
+  const float d = kq_q4_0_d(block);
+  const device uint8_t* qs = kq_q4_0_qs_ptr(block);
+  const int shift = (il & 1) ? 4 : 0;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    const int q4 = (int(qs[i]) >> shift) & 0x0F;
+    reg[i / 4][i % 4] = d * float(q4 - 8);
+  }
+}
+
+struct KqQ4_0Ext {
+  MLX_MTL_CONST int superblock = KQ_Q4_0_GROUP;
+  MLX_MTL_CONST int block_bytes = KQ_Q4_0_BLOCK_BYTES;
+  static METAL_FUNC void
+  deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
+    kq_q4_0_deq_chunk16(block, il, reg);
+  }
+};
+
+template <typename T, short r1ptg, short nsg, short nxpsg>
+[[kernel]] void kq_q4_0_mv_ext(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    const constant int& /* vm */, // == r1ptg
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  kq_mv_ext_impl<T, KqQ4_0Ext, r1ptg, nsg, nxpsg>(
+      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
+}
+
 // Q4_1: 20 bytes/32 weights. [fp16 d][fp16 m][uint8 qs[16]]. w[i] = d * q4 + m.
 
 MLX_MTL_CONST int KQ_Q4_1_GROUP = 32;
@@ -1320,6 +1364,49 @@ template <typename T, int group_size, int bits>
       group_size == KQ_Q4_1_GROUP, "Q4_1 kernel requires group_size=32");
   static_assert(bits == 4, "Q4_1 kernel requires bits=4");
   kq_q4_1_dequantize_impl<T>(w, out, num_weights, gid);
+}
+
+// q4_1 flat-with-M verify mat-vec: kq_mv_ext_impl + chunk dequant. Port of
+// ggml-metal dequantize_q4_1 (natural order [il*16, il*16+16)); il in [0,1] ->
+// low then high nibbles of qs[0..15]. w[i] = d * q4 + m.
+inline void kq_q4_1_deq_chunk16(
+    const device uint8_t* block,
+    short il,
+    thread float4x4& reg) {
+  const float d = kq_q4_1_d(block);
+  const float m = kq_q4_1_m(block);
+  const device uint8_t* qs = kq_q4_1_qs_ptr(block);
+  const int shift = (il & 1) ? 4 : 0;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    const int q4 = (int(qs[i]) >> shift) & 0x0F;
+    reg[i / 4][i % 4] = d * float(q4) + m;
+  }
+}
+
+struct KqQ4_1Ext {
+  MLX_MTL_CONST int superblock = KQ_Q4_1_GROUP;
+  MLX_MTL_CONST int block_bytes = KQ_Q4_1_BLOCK_BYTES;
+  static METAL_FUNC void
+  deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
+    kq_q4_1_deq_chunk16(block, il, reg);
+  }
+};
+
+template <typename T, short r1ptg, short nsg, short nxpsg>
+[[kernel]] void kq_q4_1_mv_ext(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    const constant int& /* vm */, // == r1ptg
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  kq_mv_ext_impl<T, KqQ4_1Ext, r1ptg, nsg, nxpsg>(
+      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
 }
 
 // Q5_0: 22 bytes/32 weights. [fp16 d][uint8 qh[4]][uint8 qs[16]]. w[i] = d *
@@ -2006,6 +2093,54 @@ template <typename T, int group_size, int bits>
   kq_q5_0_dequantize_impl<T>(w, out, num_weights, gid);
 }
 
+// q5_0 flat-with-M verify mat-vec: kq_mv_ext_impl + chunk dequant. Mirrors
+// kq_q5_0_dequantize_impl (natural order [il*16, il*16+16)); il in [0,1] ->
+// within base 0 then 16. The 5th bit comes from qh bit `within`. w[i] = d *
+// (q5 - 16), q5 = lo4 | (qh_bit << 4).
+inline void kq_q5_0_deq_chunk16(
+    const device uint8_t* block,
+    short il,
+    thread float4x4& reg) {
+  const float d = kq_q5_0_d(block);
+  const uint32_t qh = kq_q5_0_qh(block);
+  const device uint8_t* qs = kq_q5_0_qs_ptr(block);
+  const int base = (il & 1) * 16; // natural within-offset (0 or 16)
+  const int shift = (il & 1) ? 4 : 0; // low or high nibble of qs[i]
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    const int within = base + i;
+    const uint32_t hi = ((qh >> within) << 4) & 0x10u;
+    const int lo = (int(qs[i]) >> shift) & 0x0F;
+    const int q5 = lo | int(hi);
+    reg[i / 4][i % 4] = d * float(q5 - 16);
+  }
+}
+
+struct KqQ5_0Ext {
+  MLX_MTL_CONST int superblock = KQ_Q5_0_GROUP;
+  MLX_MTL_CONST int block_bytes = KQ_Q5_0_BLOCK_BYTES;
+  static METAL_FUNC void
+  deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
+    kq_q5_0_deq_chunk16(block, il, reg);
+  }
+};
+
+template <typename T, short r1ptg, short nsg, short nxpsg>
+[[kernel]] void kq_q5_0_mv_ext(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    const constant int& /* vm */, // == r1ptg
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  kq_mv_ext_impl<T, KqQ5_0Ext, r1ptg, nsg, nxpsg>(
+      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
+}
+
 // IQ4_NL: 18 bytes/32 weights. [fp16 d][uint8 qs[16]]. Non-linear LUT decode:
 // w[i] = d * kvalues_iq4nl[nibble] (low nibbles -> 0..15, high -> 16..31).
 
@@ -2044,6 +2179,48 @@ template <typename T, int group_size, int bits>
       group_size == KQ_IQ4_NL_GROUP, "IQ4_NL kernel requires group_size=32");
   static_assert(bits == 4, "IQ4_NL kernel requires bits=4");
   kq_iq4_nl_dequantize_impl<T>(w, out, num_weights, gid);
+}
+
+// iq4_nl flat-with-M verify mat-vec: kq_mv_ext_impl + chunk dequant. Mirrors
+// kq_iq4_nl_dequantize_impl (natural order [il*16, il*16+16)); il in [0,1] ->
+// low then high nibbles of qs[0..15]. w[i] = d * kvalues_iq4nl[nibble].
+inline void kq_iq4_nl_deq_chunk16(
+    const device uint8_t* block,
+    short il,
+    thread float4x4& reg) {
+  const float d = float(*(const device half*)(block));
+  const device uint8_t* qs = block + KQ_IQ4_NL_QS_OFFSET;
+  const int shift = (il & 1) ? 4 : 0;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    const int nib = (int(qs[i]) >> shift) & 0x0F;
+    reg[i / 4][i % 4] = d * float(kvalues_iq4nl[nib]);
+  }
+}
+
+struct KqIq4_nlExt {
+  MLX_MTL_CONST int superblock = KQ_IQ4_NL_GROUP;
+  MLX_MTL_CONST int block_bytes = KQ_IQ4_NL_BLOCK_BYTES;
+  static METAL_FUNC void
+  deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
+    kq_iq4_nl_deq_chunk16(block, il, reg);
+  }
+};
+
+template <typename T, short r1ptg, short nsg, short nxpsg>
+[[kernel]] void kq_iq4_nl_mv_ext(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    const constant int& /* vm */, // == r1ptg
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  kq_mv_ext_impl<T, KqIq4_nlExt, r1ptg, nsg, nxpsg>(
+      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
 }
 
 // IQ4_NL mat-vec: one impl for both qmv and qmv_fast (the LUT decode is cheap,
