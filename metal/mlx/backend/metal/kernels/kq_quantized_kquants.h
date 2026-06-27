@@ -1948,7 +1948,15 @@ METAL_FUNC void kq_q6_k_qmv_fast_impl(
 // x is row-contiguous [vm, in_vec_size], y is [vm, out_vec_size]. Math per
 // (row, m) is identical to kq_q6_k_qmv_fast_impl with x = row m, so results are
 // bit-for-bit the same.
-template <typename T, int group_size, int bits>
+//
+// results_per_simdgroup is templated (see kq_q8_0_verify_qmv_impl): the default
+// (4) packs 8 output rows per threadgroup; a finer value (1 -> 2 rows/tg)
+// multiplies the threadgroup count for the same N, restoring GPU occupancy when
+// each row's weight is small enough to stay L2-resident (so amortizing the
+// weight read saves little DRAM traffic and the lost occupancy isn't repaid).
+// Bit-exact across values: each output row's per-lane K-fold + simd_sum is
+// identical regardless of how rows are partitioned across threadgroups.
+template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
 METAL_FUNC void kq_q6_k_verify_qmv_impl(
     const device uint8_t* w,
     const device T* x,
@@ -1964,13 +1972,14 @@ METAL_FUNC void kq_q6_k_verify_qmv_impl(
   static_assert(bits == 6, "Q6_K kernel requires bits=6");
 
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
   constexpr int sb_stride = 2;
   constexpr int MAX_VM = 8;
 
   typedef float U;
-  // Dequantized weights for the current output row, reused across all vm rows.
-  thread U wq[16];
+  // Dequantized weights for the current output row, grouped as 4 float4 (wv[c]
+  // holds v_c at l=0..3) so the per-row dot reads them vectorized. Dequantized
+  // ONCE and reused across all vm activation rows.
+  thread float4 wv[4];
   // One accumulator per (row in this output tile, activation row m).
   thread U result[MAX_VM][results_per_simdgroup];
 #pragma unroll
@@ -2008,39 +2017,37 @@ METAL_FUNC void kq_q6_k_verify_qmv_impl(
       const device int8_t* sc = kq_q6_k_scales_ptr(sb_addr) + is;
       const U d = U(kq_q6_k_d(sb_addr));
 
-      // Dequantize this output row's 16 weights ONCE into registers.
+      // Dequantize this output row's 16 weights ONCE into registers, grouped so
+      // wv[c] = (v_c at l=0..3) for a vectorized per-row dot.
 #pragma unroll
       for (int l = 0; l < 4; l++) {
         const uint8_t q1l = q1[l];
         const uint8_t q2l = q2[l];
         const uint8_t qhl = qh[l];
-        wq[4 * l + 0] =
-            U(int8_t((q1l & 0x0F) | ((qhl & 0x03) << 4)) - int8_t(32));
-        wq[4 * l + 1] =
-            U(int8_t((q2l & 0x0F) | ((qhl & 0x0C) << 2)) - int8_t(32));
-        wq[4 * l + 2] =
-            U(int8_t((q1l >> 4) | ((qhl & 0x30) << 0)) - int8_t(32));
-        wq[4 * l + 3] =
-            U(int8_t((q2l >> 4) | ((qhl & 0xC0) >> 2)) - int8_t(32));
+        wv[0][l] = U(int8_t((q1l & 0x0F) | ((qhl & 0x03) << 4)) - int8_t(32));
+        wv[1][l] = U(int8_t((q2l & 0x0F) | ((qhl & 0x0C) << 2)) - int8_t(32));
+        wv[2][l] = U(int8_t((q1l >> 4) | ((qhl & 0x30) << 0)) - int8_t(32));
+        wv[3][l] = U(int8_t((q2l >> 4) | ((qhl & 0xC0) >> 2)) - int8_t(32));
       }
       const U sc0 = U(sc[0]);
       const U sc1 = U(sc[2]);
       const U sc2 = U(sc[4]);
       const U sc3 = U(sc[6]);
 
-      // Dot the dequantized weight against each activation row. The weight read
-      // above happens once; only the (tiny, cache-resident) activations
-      // re-read.
+      // Dot the dequantized weight against each activation row. The four
+      // contiguous activation float4s (xm[32c .. 32c+3]) are loaded vectorized;
+      // the weight dequant above happens once. Accumulation order matches
+      // kq_q6_k_qmv_fast_impl exactly, so results stay bit-for-bit identical.
       for (int m = 0; m < vm; m++) {
         const device T* xm = x + m * in_vec_size + x_base;
-        U sums0 = U(0), sums1 = U(0), sums2 = U(0), sums3 = U(0);
-#pragma unroll
-        for (int l = 0; l < 4; l++) {
-          sums0 += U(xm[l + 0]) * wq[4 * l + 0];
-          sums1 += U(xm[l + 32]) * wq[4 * l + 1];
-          sums2 += U(xm[l + 64]) * wq[4 * l + 2];
-          sums3 += U(xm[l + 96]) * wq[4 * l + 3];
-        }
+        const float4 x0 = float4(*(const device vec<T, 4>*)(xm + 0));
+        const float4 x1 = float4(*(const device vec<T, 4>*)(xm + 32));
+        const float4 x2 = float4(*(const device vec<T, 4>*)(xm + 64));
+        const float4 x3 = float4(*(const device vec<T, 4>*)(xm + 96));
+        const U sums0 = dot(x0, wv[0]);
+        const U sums1 = dot(x1, wv[1]);
+        const U sums2 = dot(x2, wv[2]);
+        const U sums3 = dot(x3, wv[3]);
         result[m][row] +=
             d * (sums0 * sc0 + sums1 * sc1 + sums2 * sc2 + sums3 * sc3);
       }
@@ -2536,8 +2543,172 @@ template <typename T, int group_size, int bits, bool batched>
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  kq_q6_k_verify_qmv_impl<T, group_size, bits>(
+  kq_q6_k_verify_qmv_impl<T, group_size, bits, 4>(
       w, x, y, in_vec_size, out_vec_size, vm, tid, simd_gid, simd_lid);
+}
+
+// Finer-tiled variant: 1 result per simdgroup -> 2 output rows per threadgroup
+// (vs 8 in the default), quadrupling the threadgroup count for the same N. Used
+// when occupancy is the bottleneck (small per-row weight that stays
+// L2-resident). Bit-exact vs the default variant and vs per-row qmv.
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q6_k_verify_qmv_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q6_k_verify_qmv_impl<T, group_size, bits, 1>(
+      w, x, y, in_vec_size, out_vec_size, vm, tid, simd_gid, simd_lid);
+}
+
+// ---------------------------------------------------------------------------
+// q6_k flat-with-M verify mat-vec (port of ggml-metal kernel_mul_mv_ext_q4x4).
+//
+// verify_qmv amortizes the weight read across M rows but gives each thread an
+// [MAX_VM][results_per_simdgroup] accumulator block and reduces one output row
+// per simdgroup over all 32 lanes; under GPU saturation (the verify forward's
+// real condition) the M dots stay exposed and the kernel scales ~1.44x@M4. ggml
+// stays FLAT at this width with a different decomposition we mirror here: the
+// 32 simdgroup lanes are nxpsg(=8) along K x nypsg(=4) output rows, so FOUR
+// output rows compute in parallel per simdgroup, EACH thread owns ONE row and
+// holds only r1ptg(=M) float accumulators, and the K-reduction is an nxpsg-lane
+// simd_shuffle_down. The weight row is streamed once and dotted against all M
+// activation columns -- same weight DRAM traffic as M=1. r1ptg is the
+// compile-time draft width (== runtime vm); dispatched for M in [2,8] only.
+// Bit-exact (fp-noise) vs verify_qmv and per-row qmv. Derived from llama.cpp
+// ggml-metal.metal (MIT); attribution in licenses/.
+
+// Dequantize the 16 contiguous weights of chunk `il` (in [0,15]) of a q6_k
+// super-block into a float4x4 (natural element order il*16 .. il*16+15). Direct
+// port of ggml-metal dequantize_q6_K.
+inline void kq_q6_k_deq_chunk16(
+    const device uint8_t* block,
+    short il,
+    thread float4x4& reg) {
+  const float d_all = kq_q6_k_d(block);
+  const device uint16_t* ql = (const device uint16_t*)kq_q6_k_ql_ptr(block);
+  const device uint16_t* qh = (const device uint16_t*)kq_q6_k_qh_ptr(block);
+  const device int8_t* scales = kq_q6_k_scales_ptr(block);
+
+  ql = ql + 32 * (il / 8) + 16 * ((il / 2) & 1) + 8 * (il & 1);
+  qh = qh + 16 * (il / 8) + 8 * (il & 1);
+  const float sc = float(scales[(il % 2) + 2 * (il / 2)]);
+  il = (il / 2) & 3;
+
+  const uint32_t kmask1 = il > 1 ? (il > 2 ? 0xC0C0C0C0 : 0x30303030)
+                                 : (il > 0 ? 0x0C0C0C0C : 0x03030303);
+  const uint32_t kmask2 = il > 1 ? 0xF0F0F0F0 : 0x0F0F0F0F;
+  const float ml = d_all * sc * 32.0f;
+  const float dl0 = d_all * sc;
+  const float dl1 = dl0 / 256.0f;
+  const float dl2 = dl0 / (256.0f * 256.0f);
+  const float dl3 = dl0 / (256.0f * 256.0f * 256.0f);
+  const uint8_t shr_h = il > 2 ? 2 : 0;
+  const uint8_t shl_h = il > 1 ? 0 : (il > 0 ? 2 : 4);
+  const uint8_t shr_l = il > 1 ? 4 : 0;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t low = (ql[2 * i] | ((uint32_t)ql[2 * i + 1] << 16)) & kmask2;
+    const uint32_t high =
+        (qh[2 * i] | ((uint32_t)qh[2 * i + 1] << 16)) & kmask1;
+    const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+    reg[i][0] = dl0 * float(q & 0xFF) - ml;
+    reg[i][1] = dl1 * float(q & 0xFF00) - ml;
+    reg[i][2] = dl2 * float(q & 0xFF0000) - ml;
+    reg[i][3] = dl3 * float(q & 0xFF000000) - ml;
+  }
+}
+
+template <typename T, short r1ptg, short nsg, short nxpsg>
+[[kernel]] void kq_q6_k_mv_ext(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    const constant int& /* vm */, // == r1ptg
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  constexpr short nypsg = 32 / nxpsg; // output rows per simdgroup
+  constexpr short chpb = KQ_Q6_K_SUPERBLOCK / 16; // 16 chunks per super-block
+  const short tx = tiisg % nxpsg; // K position within the row group
+  const short ty = tiisg / nxpsg; // which of nypsg rows this thread owns
+
+  const int i01 = tgpig.x * (nypsg * nsg) + nypsg * sgitg + ty; // output row
+  const int i11 = tgpig.y * r1ptg; // first activation column (grid.y==1 -> 0)
+
+  const int nb = in_vec_size / KQ_Q6_K_SUPERBLOCK;
+  const int row_bytes = nb * KQ_Q6_K_BLOCK_BYTES;
+  // Clamp OOB rows to row 0 for a valid read; the store is masked below.
+  const device uint8_t* w_row =
+      (i01 < out_vec_size) ? w + static_cast<int64_t>(i01) * row_bytes : w;
+
+  const device T* y_col[r1ptg];
+#pragma unroll
+  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+    y_col[ir1] = x + static_cast<int64_t>(i11 + ir1) * in_vec_size + tx * 16;
+  }
+
+  float sumf[r1ptg];
+#pragma unroll
+  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+    sumf[ir1] = 0.0f;
+  }
+
+  for (int ich = tx; 16 * ich < in_vec_size; ich += nxpsg) {
+    const int ib = ich / chpb; // super-block index
+    const short cch = ich % chpb; // chunk within super-block
+    const device uint8_t* block =
+        w_row + static_cast<int64_t>(ib) * KQ_Q6_K_BLOCK_BYTES;
+    float4x4 lx;
+    kq_q6_k_deq_chunk16(block, cch, lx);
+#pragma unroll
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+      const device T* yp = y_col[ir1];
+      const float4 a0 = float4(*(const device vec<T, 4>*)(yp + 0));
+      const float4 a1 = float4(*(const device vec<T, 4>*)(yp + 4));
+      const float4 a2 = float4(*(const device vec<T, 4>*)(yp + 8));
+      const float4 a3 = float4(*(const device vec<T, 4>*)(yp + 12));
+      sumf[ir1] +=
+          dot(lx[0], a0) + dot(lx[1], a1) + dot(lx[2], a2) + dot(lx[3], a3);
+      y_col[ir1] += nxpsg * 16;
+    }
+  }
+
+#pragma unroll
+  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+    if (nxpsg >= 32) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 16);
+    }
+    if (nxpsg >= 16) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 8);
+    }
+    if (nxpsg >= 8) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 4);
+    }
+    if (nxpsg >= 4) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 2);
+    }
+    if (nxpsg >= 2) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 1);
+    }
+  }
+
+  if (tx == 0 && i01 < out_vec_size) {
+#pragma unroll
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+      y[static_cast<int64_t>(i11 + ir1) * out_vec_size + i01] =
+          static_cast<T>(sumf[ir1]);
+    }
+  }
 }
 
 template <typename T, int group_size, int bits, bool batched>
