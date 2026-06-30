@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project aims to
 adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1]
+
+### Added
+- **Verify mat-vec kernels (`mul_mv_ext` port)** for speculative-decode verify
+  and batched MTP. Flat-with-M kernels ported from ggml's `mul_mv_ext` for all
+  K-quant, legacy, and IQ codecs via a shared `kq_mv_ext_impl` template. Gated
+  at M>=3 for non-IQ codecs (verify_qmv wins at M<=2) and all-M for IQ. Extends
+  to M=12 for batch MTP verify.
+- **Compiled vector SDPA kernel (`kq.sdpa_vector`)** for head_dim 256 and 512
+  with GQA and strided KV support.
+- **Synthetic all-codec matmul test** (`test_matmul_synth.py`) - GGUF-free
+  quantized-matmul validation across all codecs.
+
 ## [0.2.0]
 
 ### Added

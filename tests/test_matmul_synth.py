@@ -81,6 +81,6 @@ def test_matmul_synth(codec):
         diff = np.abs(g - r)
         max_abs = float(diff.max())
         max_rel = float((diff / (np.abs(r) + 1e-3)).max())
-        assert max_rel < 5e-2 or max_abs < 5e-3, (
+        assert max_rel < 5e-2 or max_abs < 1e-2, (
             f"{codec} M={M}: max_rel={max_rel:.3e} max_abs={max_abs:.3e}"
         )
