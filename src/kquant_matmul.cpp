@@ -282,9 +282,9 @@ void qmv(
 // Verify-shaped small-M matmul. One threadgroup per
 // N-tile (grid_dims.x = 1) reads each weight tile once and dots it against all
 // M activation rows, amortizing the dominant weight read; the per-row qmv would
-// re-read it M times (M on grid_dims.x). Non-batched only; M (= vm) in [2,
-// verify_qmv_max_rows()], codec in codec_has_verify_qmv. Bit-for-bit identical
-// to running qmv per row.
+// re-read it M times (M on grid_dims.x). Non-batched only; M (= vm) in
+// [2, verify_qmv_max_rows()], codec in codec_has_verify_qmv. Bit-for-bit
+// identical to running qmv per row.
 void verify_qmv(
     const array& x,
     const array& w,
@@ -360,9 +360,9 @@ void verify_qmv(
 // Flat-with-M verify mat-vec (kq_<codec>_mv_ext): port of ggml mul_mv_ext_q4x4.
 // One output row per thread, M (= vm) register accumulators, nypsg=4 output
 // rows in parallel per simdgroup, nxpsg=8-lane K-reduction; the weight row
-// streams once and is dotted against all M activation columns. M selects the
-// kernel (r1ptg is compile-time). All wired codecs (the kname prefix carries
-// the codec); same call args as verify_qmv.
+// streams once and is dotted against all M activation columns. M in [2, 12]
+// selects the kernel (r1ptg is compile-time). All wired codecs (the kname
+// prefix carries the codec); same call args as verify_qmv.
 void verify_mv_ext(
     const array& x,
     const array& w,
@@ -592,22 +592,26 @@ void KQuantMatmul::eval_gpu(
   // a perf-only path for an essentially-dead case.
 
   if (M >= vector_limit) {
-    // The split-k qmm variant is omitted here; plain qmm is correct, just less
-    // parallel.
-    qmm(x,
-        w,
-        scales,
-        out,
-        transpose_,
-        group_size_,
-        bits_,
-        M,
-        N,
-        K,
-        d,
-        s,
-        kquant_type_);
-    return;
+    // For transpose shapes in the mv_ext M-range, the weight-read-amortizing
+    // kernel beats qmm's under-utilised BM=64 tile at small M. Let those fall
+    // through to the mv_ext check below; vector_limit was calibrated for
+    // qmv-vs-qmm, not mv_ext-vs-qmm.
+    if (!(transpose_ && non_batched && M >= 2 && M <= 12)) {
+      qmm(x,
+          w,
+          scales,
+          out,
+          transpose_,
+          group_size_,
+          bits_,
+          M,
+          N,
+          K,
+          d,
+          s,
+          kquant_type_);
+      return;
+    }
   }
 
   if (transpose_) {
@@ -651,7 +655,7 @@ void KQuantMatmul::eval_gpu(
     const KQuantCodec* mv_ext_codec = codec_by_name(kquant_type_);
     const int mv_ext_k_align =
         mv_ext_codec ? mv_ext_codec->weights_per_block : 256;
-    if (codec_has_mv_ext && non_batched && M >= 2 && M <= 8 &&
+    if (codec_has_mv_ext && non_batched && M >= 2 && M <= 12 &&
         (K % mv_ext_k_align == 0) &&
         (verify_ext == 1 ||
          (verify_ext != 0 && mv_ext_default_on && mv_ext_width_ok))) {

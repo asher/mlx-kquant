@@ -337,7 +337,7 @@ METAL_FUNC void kq_adjust_matrix_offsets(
 // holds only r1ptg(=M) float accumulators, and the K-reduction is an
 // nxpsg-lane simd_shuffle_down. The weight row streams once and is dotted
 // against all M activation columns - same weight DRAM traffic as M=1. r1ptg is
-// the compile-time draft width (== runtime vm); dispatched for M in [2,8] only.
+// the compile-time draft width (== runtime vm); dispatched for M in [2,12].
 // Bit-exact (fp-noise) vs verify_qmv and per-row qmv.
 //
 // Codec is a traits struct giving super-block geometry (superblock,
