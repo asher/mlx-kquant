@@ -115,6 +115,24 @@ mx::array sdpa_vector(
     bool causal = true,
     mx::StreamOrDevice s = {});
 
+// Decode-time (qL == 1) GQA attention tuned for long KV: fixed coarse
+// contiguous key splits plus threadgroup-staged K/V tiles shared across the
+// GQA group, so device memory reads the KV once per kv-head. Optional
+// per-q-head attention sinks (an extra softmax logit with no value row).
+// q [B, n_q_heads, 1, D], k/v [B, n_kv_heads, kL, D] with contiguous D;
+// head/seq strides are read in place. head_dim 64 only; gqa_factor 2..8.
+// `splits` 0 picks the default (32); `tile_c` is the staged tile height
+// (32 or 16). Metal-only.
+mx::array sdpa_decode_gqa(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    const std::optional<mx::array>& sinks = std::nullopt,
+    int splits = 0,
+    int tile_c = 32,
+    mx::StreamOrDevice s = {});
+
 // ----------------------------- primitives -----------------------------
 
 // Dequantize a single uint8 K-quant wire-byte tensor. Inference-only:
@@ -265,6 +283,37 @@ class KQuantSDPA : public mx::Primitive {
  private:
   float scale_;
   bool causal_;
+};
+
+// Decode-time GQA attention (see sdpa_decode_gqa). Sinks presence is encoded
+// in the input count (q, k, v[, sinks]). Inference-only.
+class KQuantSDPAGQA : public mx::Primitive {
+ public:
+  explicit KQuantSDPAGQA(mx::Stream stream, float scale, int splits, int tile_c)
+      : mx::Primitive(stream),
+        scale_(scale),
+        splits_(splits),
+        tile_c_(tile_c) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSDPAGQA";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int splits_;
+  int tile_c_;
 };
 
 // Gather (MoE) quantized matmul. vjp implements only the gradient wrt x (a

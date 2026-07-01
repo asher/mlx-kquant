@@ -166,6 +166,39 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_decode_gqa",
+      &mlx_kquant::sdpa_decode_gqa,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "scale"_a,
+      "sinks"_a = nb::none(),
+      "splits"_a = 0,
+      "tile_c"_a = 32,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Decode-time (qL == 1) GQA attention tuned for long KV caches: the key
+        axis is split into a fixed number of coarse contiguous chunks and each
+        chunk is streamed through threadgroup-staged K/V tiles shared by the
+        whole GQA group, so device memory reads the KV once per kv-head.
+
+        Args:
+            q (array): queries [B, n_q_heads, 1, 64], float16/bfloat16.
+            k (array): keys [B, n_kv_heads, kL, 64]; head/seq strided is fine
+                (read in place), the head_dim must be contiguous.
+            v (array): values [B, n_kv_heads, kL, 64].
+            scale (float): query scale (typically 1/sqrt(64)).
+            sinks (array, optional): per-q-head attention sinks, shape
+                [n_q_heads] -- an extra softmax logit with no value row.
+            splits (int): key-axis split count; 0 picks the default (32).
+            tile_c (int): staged tile height, 32 or 16. Default 32.
+
+        Returns:
+            array: attention output [B, n_q_heads, 1, 64].
+      )");
+
+  m.def(
       "gather_qmm",
       &mlx_kquant::gather_qmm,
       "x"_a,

@@ -164,12 +164,122 @@ void KQuantSDPA::eval_gpu(
   }
 }
 
+void KQuantSDPAGQA::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  const auto& q = inputs[0];
+  const auto& k = inputs[1];
+  const auto& v = inputs[2];
+  const bool sinks = inputs.size() == 4;
+
+  int B = q.shape(0);
+  int n_q_heads = q.shape(1);
+  int D = q.shape(3);
+  int n_kv_heads = k.shape(1);
+  int kL = k.shape(2);
+  int gqa_factor = n_q_heads / n_kv_heads;
+  // Auto splits: coarse buckets (a per-kL value would mint a new pipeline
+  // specialization every decode step). Measured on M5 Max: more splits win as
+  // depth grows; ~512-1024 keys per chunk is the sweet spot.
+  int splits = splits_;
+  if (splits == 0) {
+    splits = kL <= 8192 ? 16 : kL <= 24576 ? 32 : kL <= 49152 ? 64 : 128;
+  }
+
+  size_t k_head_stride =
+      static_cast<size_t>(k.shape(1) == 1 ? k.strides(0) : k.strides(1));
+  size_t k_seq_stride = static_cast<size_t>(k.strides(2));
+  size_t v_head_stride =
+      static_cast<size_t>(v.shape(1) == 1 ? v.strides(0) : v.strides(1));
+  size_t v_seq_stride = static_cast<size_t>(v.strides(2));
+  float scale = scale_;
+
+  // Coarse per-split partials (float32) + running max/sum, merged by pass 2.
+  mx::Shape part_shape = {B, n_q_heads, splits, D};
+  mx::Shape red_shape = {B, n_q_heads, splits};
+  array partials(part_shape, mx::float32, nullptr, {});
+  array sums(red_shape, mx::float32, nullptr, {});
+  array maxs(red_shape, mx::float32, nullptr, {});
+  partials.set_data(mx::allocator::malloc(partials.nbytes()));
+  sums.set_data(mx::allocator::malloc(sums.nbytes()));
+  maxs.set_data(mx::allocator::malloc(maxs.nbytes()));
+
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.add_temporary(partials);
+  ce.add_temporary(sums);
+  ce.add_temporary(maxs);
+
+  std::string ts = kq_type_string(q.dtype());
+  bool has_sinks = sinks;
+  mx::metal::MTLFCList fc = {
+      {&splits, MTL::DataType::DataTypeInt, 2},
+      {&has_sinks, MTL::DataType::DataTypeBool, 3},
+  };
+
+  // Pass 1: one threadgroup per (kv-head, batch, split); the whole GQA group
+  // shares each staged K/V tile.
+  {
+    std::string kname = "kq_sdpa_gqa_2pass_1_" + ts + "_" + std::to_string(D) +
+        "_c" + std::to_string(tile_c_);
+    std::string hash = kname + "_s" + std::to_string(splits);
+    auto kernel = kq_get_kernel(d, kname, hash, fc);
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(q, 0);
+    ce.set_input_array(k, 1);
+    ce.set_input_array(v, 2);
+    ce.set_output_array(partials, 3);
+    ce.set_output_array(sums, 4);
+    ce.set_output_array(maxs, 5);
+    ce.set_bytes(kL, 6);
+    ce.set_bytes(k_head_stride, 7);
+    ce.set_bytes(k_seq_stride, 8);
+    ce.set_bytes(v_head_stride, 9);
+    ce.set_bytes(v_seq_stride, 10);
+    ce.set_bytes(scale, 11);
+    MTL::Size group_dims(32, gqa_factor, 1);
+    MTL::Size grid_dims(n_kv_heads, B, splits);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  // Pass 2: merge the per-split partials; sinks fold into the denominator.
+  {
+    std::string kname = "kq_sdpa_gqa_2pass_2_" + ts + "_" + std::to_string(D);
+    std::string hash =
+        kname + "_s" + std::to_string(splits) + (has_sinks ? "_k1" : "_k0");
+    auto kernel = kq_get_kernel(d, kname, hash, fc);
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(partials, 0);
+    ce.set_input_array(sums, 1);
+    ce.set_input_array(maxs, 2);
+    // Metal wants every buffer bound; without sinks, rebind sums as a dummy
+    // (the read is compiled out via the function constant).
+    ce.set_input_array(sinks ? inputs[3] : sums, 3);
+    ce.set_output_array(out, 4);
+    ce.set_bytes(n_q_heads, 5);
+    MTL::Size group_dims(32, 1, 1);
+    MTL::Size grid_dims(n_q_heads, B, 1);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+  }
+}
+
 #else // !_METAL_
 
 void KQuantSDPA::eval_gpu(
     const std::vector<mx::array>&,
     std::vector<mx::array>&) {
   throw std::runtime_error("[mlx_kquant.sdpa_vector] requires a Metal build.");
+}
+
+void KQuantSDPAGQA::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.sdpa_decode_gqa] requires a Metal build.");
 }
 
 #endif
@@ -253,6 +363,105 @@ mx::array sdpa_vector(
       dt,
       std::make_shared<KQuantSDPA>(s, scale, causal),
       {std::move(q_c), std::move(k_c), std::move(v_c)});
+}
+
+void KQuantSDPAGQA::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.sdpa_decode_gqa] has no CPU implementation.");
+}
+
+std::vector<mx::Shape> KQuantSDPAGQA::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  return {inputs[0].shape()};
+}
+
+bool KQuantSDPAGQA::is_equivalent(const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQuantSDPAGQA&>(other);
+  return scale_ == o.scale_ && splits_ == o.splits_ && tile_c_ == o.tile_c_;
+}
+
+mx::array sdpa_decode_gqa(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    const std::optional<mx::array>& sinks,
+    int splits,
+    int tile_c,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+
+  if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa] q, k, v must be 4-D [B, heads, L, D].");
+  }
+  int D = q.shape(-1);
+  if (D != 64 || v.shape(-1) != D || k.shape(-1) != D) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa] only head_dim 64 is supported.");
+  }
+  if (q.shape(2) != 1) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa] decode only: query length must be 1.");
+  }
+  auto dt = q.dtype();
+  if (dt != mx::float16 && dt != mx::bfloat16) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa] q must be float16 or bfloat16.");
+  }
+  if (k.dtype() != dt || v.dtype() != dt) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa] q, k, v must share a dtype.");
+  }
+  int n_q_heads = q.shape(1);
+  int n_kv_heads = k.shape(1);
+  if (n_kv_heads == 0 || n_q_heads % n_kv_heads != 0) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa] n_q_heads must be a multiple of "
+        "n_kv_heads.");
+  }
+  int gqa_factor = n_q_heads / n_kv_heads;
+  if (gqa_factor > 8) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa] gqa_factor must be <= 8.");
+  }
+  if (splits < 0 || splits > 128) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa] splits must be in [0, 128].");
+  }
+  if (tile_c != 16 && tile_c != 32) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa] tile_c must be 16 or 32.");
+  }
+  if (k.shape(2) < 1) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa] key length must be >= 1.");
+  }
+
+  auto q_c = q.flags().row_contiguous ? q : mx::contiguous(q, false, s);
+  auto k_c = k.strides().back() == 1 ? k : mx::contiguous(k, false, s);
+  auto v_c = v.strides().back() == 1 ? v : mx::contiguous(v, false, s);
+
+  std::vector<mx::array> inputs = {
+      std::move(q_c), std::move(k_c), std::move(v_c)};
+  if (sinks.has_value()) {
+    auto sk = *sinks;
+    if (sk.size() != static_cast<size_t>(n_q_heads)) {
+      throw std::invalid_argument(
+          "[mlx_kquant.sdpa_decode_gqa] sinks must have n_q_heads elements.");
+    }
+    sk = mx::astype(mx::reshape(sk, {n_q_heads}, s), mx::float32, s);
+    inputs.push_back(mx::contiguous(sk, false, s));
+  }
+
+  auto out_shape = q.shape();
+  return mx::array(
+      std::move(out_shape),
+      dt,
+      std::make_shared<KQuantSDPAGQA>(s, scale, splits, tile_c),
+      std::move(inputs));
 }
 
 } // namespace mlx_kquant
