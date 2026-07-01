@@ -133,6 +133,37 @@ mx::array sdpa_decode_gqa(
     int tile_c = 32,
     mx::StreamOrDevice s = {});
 
+// Fused MoE GLU gather on the MLX packed mxfp4 layout: gate and up expert
+// matvecs (sharing each activation load), expert biases, and the clamped
+// SwiGLU epilogue out = (min(g, limit) * sigmoid(alpha * g)) * (clip(u,
+// +-limit) + 1) in one dispatch. Decode-shaped: x [T, K] (one row per token,
+// shared across that token's R expert slots), indices [T, R]; weights uint32
+// [E, N, K/8] + scales uint8 [E, N, K/32] (group 32, 4-bit), biases [E, N].
+// Returns [T, R, N] in x.dtype. Metal-only.
+mx::array moe_glu_gather(
+    mx::array x,
+    mx::array gate_w,
+    mx::array gate_scales,
+    mx::array gate_bias,
+    mx::array up_w,
+    mx::array up_scales,
+    mx::array up_bias,
+    mx::array indices,
+    float alpha = 1.702f,
+    float limit = 7.0f,
+    mx::StreamOrDevice s = {});
+
+// Gathered matvec with the expert bias fused, same packed-mxfp4 layout as
+// moe_glu_gather. x [T, R, K] (one row per expert slot), indices [T, R].
+// Returns [T, R, N] in x.dtype. Metal-only.
+mx::array gather_qmv_bias(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    mx::array bias,
+    mx::array indices,
+    mx::StreamOrDevice s = {});
+
 // ----------------------------- primitives -----------------------------
 
 // Dequantize a single uint8 K-quant wire-byte tensor. Inference-only:
@@ -314,6 +345,54 @@ class KQuantSDPAGQA : public mx::Primitive {
   float scale_;
   int splits_;
   int tile_c_;
+};
+
+// Fused MoE GLU gather (see moe_glu_gather). Inference-only.
+class KQuantMoEGLU : public mx::Primitive {
+ public:
+  explicit KQuantMoEGLU(mx::Stream stream, float alpha, float limit)
+      : mx::Primitive(stream), alpha_(alpha), limit_(limit) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantMoEGLU";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float alpha_;
+  float limit_;
+};
+
+// Gathered matvec with fused expert bias (see gather_qmv_bias).
+// Inference-only.
+class KQuantGatherQMVBias : public mx::Primitive {
+ public:
+  explicit KQuantGatherQMVBias(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantGatherQMVBias";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
 };
 
 // Gather (MoE) quantized matmul. vjp implements only the gradient wrt x (a

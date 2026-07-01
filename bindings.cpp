@@ -199,6 +199,68 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "moe_glu_gather",
+      &mlx_kquant::moe_glu_gather,
+      "x"_a,
+      "gate_w"_a,
+      "gate_scales"_a,
+      "gate_bias"_a,
+      "up_w"_a,
+      "up_scales"_a,
+      "up_bias"_a,
+      "indices"_a,
+      "alpha"_a = 1.702f,
+      "limit"_a = 7.0f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused MoE GLU gather on the MLX packed mxfp4 layout: gate and up
+        expert matvecs (sharing each activation load), expert biases, and the
+        clamped-SwiGLU epilogue
+        ``(min(g, limit) * sigmoid(alpha * g)) * (clip(u, -limit, limit) + 1)``
+        in one dispatch. Decode-shaped: one activation row per token, shared
+        across that token's expert slots.
+
+        Args:
+            x (array): activations [T, K], float16/bfloat16.
+            gate_w (array): packed gate weights uint32 [E, N, K/8].
+            gate_scales (array): E8M0 group scales uint8 [E, N, K/32].
+            gate_bias (array): gate biases [E, N].
+            up_w / up_scales / up_bias: same layout for the up projection.
+            indices (array): expert indices [T, R].
+            alpha (float): sigmoid slope. Default 1.702.
+            limit (float): activation clamp. Default 7.0.
+
+        Returns:
+            array: activated hidden states [T, R, N] in x.dtype.
+      )");
+
+  m.def(
+      "gather_qmv_bias",
+      &mlx_kquant::gather_qmv_bias,
+      "x"_a,
+      "w"_a,
+      "scales"_a,
+      "bias"_a,
+      "indices"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Gathered matvec with the expert bias fused, on the MLX packed mxfp4
+        layout (see moe_glu_gather). One activation row per expert slot.
+
+        Args:
+            x (array): activations [T, R, K], float16/bfloat16.
+            w (array): packed weights uint32 [E, N, K/8].
+            scales (array): E8M0 group scales uint8 [E, N, K/32].
+            bias (array): biases [E, N].
+            indices (array): expert indices [T, R].
+
+        Returns:
+            array: output [T, R, N] in x.dtype.
+      )");
+
+  m.def(
       "gather_qmm",
       &mlx_kquant::gather_qmm,
       "x"_a,
