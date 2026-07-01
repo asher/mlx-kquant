@@ -16,6 +16,8 @@ a kquant base (see ``mlx_kquant.mlx_lm_patch``).
 
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -97,6 +99,22 @@ class KQuantLinear(nn.Module):
         self.freeze()
 
     def __call__(self, x):
+        # Decode (M=1) with a real bias: fuse the add into the qmv/qmv_fast
+        # dispatch instead of a separate elementwise op -- see
+        # quantized_matmul_qmv_bias's docstring for the exact shape contract.
+        # Only q8_0 is wired so far; every other codec/shape (prefill,
+        # verify/MTP) falls through to the plain matmul-then-add below.
+        # KQ_DISABLE_QMV_BIAS=1 forces the unfused path (A/B lever); read live
+        # so a single process can toggle between calls.
+        if (
+            "bias" in self
+            and self.kquant_type == "q8_0"
+            and x.size // x.shape[-1] == 1
+            and os.environ.get("KQ_DISABLE_QMV_BIAS") != "1"
+        ):
+            return kq.quantized_matmul_qmv_bias(
+                x, self["weight"], self["scales"], self["bias"], self.kquant_type
+            )
         y = kq.quantized_matmul(
             x, self["weight"], self["scales"], self.kquant_type, transpose=True
         )

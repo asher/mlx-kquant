@@ -175,6 +175,93 @@ mx::array quantized_matmul(
       {x_c, w_c, scales_c});
 }
 
+mx::array quantized_matmul_qmv_bias(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    mx::array bias,
+    const std::string& kquant_type,
+    mx::StreamOrDevice s_) {
+  if (kquant_type != "q8_0") {
+    throw std::invalid_argument(
+        "[mlx_kquant.quantized_matmul_qmv_bias] only kquant_type 'q8_0' is "
+        "wired so far, got '" +
+        kquant_type + "'.");
+  }
+  if (w.dtype() != mx::uint8) {
+    throw std::invalid_argument(
+        "[mlx_kquant.quantized_matmul_qmv_bias] w must be uint8 (raw GGUF "
+        "wire bytes).");
+  }
+  if (w.ndim() != 2) {
+    throw std::invalid_argument(
+        "[mlx_kquant.quantized_matmul_qmv_bias] w must be 2D (this op is not "
+        "batched); use gather_qmm for mixture-of-experts.");
+  }
+  const KQuantCodec* codec = codec_by_name(kquant_type);
+
+  int w_bytes_per_row = w.shape(-1);
+  if (w_bytes_per_row % codec->bytes_per_block != 0) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.quantized_matmul_qmv_bias] KQuant weight last dim ("
+        << w_bytes_per_row << " bytes) is not a whole number of "
+        << codec->bytes_per_block << "-byte " << codec->name << " blocks.";
+    throw std::invalid_argument(msg.str());
+  }
+  int weights_per_row =
+      (w_bytes_per_row / codec->bytes_per_block) * codec->weights_per_block;
+  int N = w.shape(-2); // transpose=true only: w is [N, K]
+  if (weights_per_row != x.shape(-1)) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.quantized_matmul_qmv_bias] x last dim (" << x.shape(-1)
+        << ") does not match the expanded quantized matrix "
+        << "inner dim (" << weights_per_row << ") for codec '" << codec->name
+        << "'.";
+    throw std::invalid_argument(msg.str());
+  }
+  if (bias.ndim() != 1 || bias.shape(0) != N) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.quantized_matmul_qmv_bias] bias must be 1D with "
+        << "length " << N << " (the output dim), got shape " << bias.shape()
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  int64_t total_rows = x.size() / x.shape(-1);
+  if (total_rows != 1) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.quantized_matmul_qmv_bias] decode-only: x must carry "
+        << "exactly one row (got " << total_rows << "). Use "
+        << "quantized_matmul() + a separate add for prefill/verify shapes.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  mx::Dtype out_type = (x.dtype() == mx::float32) ? mx::bfloat16 : x.dtype();
+  if (!mx::issubdtype(out_type, mx::floating)) {
+    throw std::invalid_argument(
+        "[mlx_kquant.quantized_matmul_qmv_bias] Only real floating x dtypes "
+        "are supported.");
+  }
+
+  auto s = mx::to_stream(s_);
+
+  auto x_c = kq_ensure_row_contiguous_matrix(mx::astype(x, out_type, s), s);
+  auto w_c = kq_ensure_row_contiguous_matrix(w, s);
+  auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
+  auto bias_c = mx::astype(bias, out_type, s);
+  bias_c =
+      bias_c.flags().row_contiguous ? bias_c : mx::contiguous(bias_c, false, s);
+
+  auto out_shape = x_c.shape();
+  out_shape.back() = N;
+
+  return mx::array(
+      std::move(out_shape),
+      out_type,
+      std::make_shared<KQuantQmvBias>(
+          s, kquant_type, codec->weights_per_block, codec->bits),
+      {x_c, w_c, scales_c, bias_c});
+}
+
 namespace {
 
 // When indices are omitted, default to a flat arange over the leading (batch)

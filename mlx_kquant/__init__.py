@@ -8,6 +8,8 @@ Current API:
     ``cpu_neon_available`` - toolchain self-checks.
   * ``dequantize`` - GGUF K-quant wire bytes -> float array.
   * ``quantized_matmul`` - x @ dequant(w) for K-quant weights.
+  * ``quantized_matmul_qmv_bias`` - decode-only (M=1) bias-fused variant of
+    ``quantized_matmul``, q8_0 only.
   * ``gather_qmm`` - mixture-of-experts gathered quantized matmul.
   * ``quantize`` - encode a float tensor into K-quant wire bytes (CPU or Metal).
   * ``load_gguf`` - load a GGUF file's tensors + metadata (C++ mmap memcpy).
@@ -29,6 +31,7 @@ from ._ext import (  # noqa: F401
     metallib_loads,
     quantize,
     quantized_matmul,
+    quantized_matmul_qmv_bias,
     sdpa_vector,
 )
 from ._version import __version__
@@ -44,5 +47,6 @@ __all__ = [
     "metallib_loads",
     "quantize",
     "quantized_matmul",
+    "quantized_matmul_qmv_bias",
     "sdpa_vector",
 ]

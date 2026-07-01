@@ -53,6 +53,23 @@ mx::array quantized_matmul(
     bool transpose = true,
     mx::StreamOrDevice s = {});
 
+// Bias-fused quantized matmul: x (float) @ dequant(w) + bias, fusing the add
+// into the same kernel dispatch instead of a separate elementwise op.
+// Decode-only: x must carry exactly one row (x.shape(-2) == 1 after
+// flattening leading batch dims), matching how KQuantLinear is called during
+// B=1 token-at-a-time decode -- throws outside that shape. Only kquant_type
+// "q8_0" is wired so far. transpose is always true (the only regime
+// KQuantLinear uses); group_size/bits are derived from kquant_type. Callers
+// should fall back to quantized_matmul() + a separate add for every other
+// shape (prefill, verify/MTP) or codec.
+mx::array quantized_matmul_qmv_bias(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    mx::array bias,
+    const std::string& kquant_type,
+    mx::StreamOrDevice s = {});
+
 // Gather (mixture-of-experts) quantized matmul: for each output row, select an
 // expert weight matrix via `rhs_indices` and an x row via `lhs_indices`, then
 // matmul. `w` is uint8 K-quant wire bytes shaped (n_experts, N, bytes_per_row);
@@ -183,6 +200,44 @@ class KQuantMatmul : public mx::Primitive {
   int group_size_;
   int bits_;
   bool transpose_;
+};
+
+// Bias-fused decode-only (M=1) qmv/qmv_fast dispatch -- see
+// quantized_matmul_qmv_bias() above for the shape contract eval_gpu enforces.
+// Inference-only, like the SDPA primitive below: no vjp override, so a grad
+// request throws via the base-class default (KQuantLinear always freezes
+// weight/scales/bias, so this is never exercised in practice).
+class KQuantQmvBias : public mx::Primitive {
+ public:
+  explicit KQuantQmvBias(
+      mx::Stream stream,
+      std::string kquant_type,
+      int group_size,
+      int bits)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        group_size_(group_size),
+        bits_(bits) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantQmvBias";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+  int group_size_;
+  int bits_;
 };
 
 // Vector SDPA for large head dims. Inference-only: jvp/vjp/vmap inherit the

@@ -108,6 +108,38 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "quantized_matmul_qmv_bias",
+      &mlx_kquant::quantized_matmul_qmv_bias,
+      "x"_a,
+      "w"_a,
+      "scales"_a,
+      "bias"_a,
+      "kquant_type"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Bias-fused quantized matmul: ``x @ dequant(w) + bias`` for GGUF
+        K-quant weights, fusing the add into the matmul kernel dispatch.
+
+        Decode-only: ``x`` must carry exactly one row (``x.shape[-2] == 1``
+        after flattening leading batch dims) -- raises otherwise. Only
+        ``kquant_type="q8_0"`` is wired so far. ``transpose`` is always True
+        (the only regime this is used for). For any other shape or codec, use
+        ``quantized_matmul`` followed by a separate ``+ bias``.
+
+        Args:
+            x (array): float activations, exactly one row.
+            w (array): uint8 K-quant wire bytes, laid out [N, K].
+            scales (array): vestigial placeholder; ignored by the kernel.
+            bias (array): 1D, length N (the output dim).
+            kquant_type (str): codec name; only ``"q8_0"`` is wired so far.
+
+        Returns:
+            array: the matmul-plus-bias result (x.dtype, float32 promoted to
+            bfloat16).
+      )");
+
+  m.def(
       "sdpa_vector",
       &mlx_kquant::sdpa_vector,
       "q"_a,
