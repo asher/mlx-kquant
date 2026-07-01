@@ -84,6 +84,20 @@ std::vector<mx::array> quantize(
     const std::optional<mx::array>& imatrix = std::nullopt,
     mx::StreamOrDevice s = {});
 
+// Vector scaled-dot-product attention for large head dims (e.g. 512) that stock
+// MLX's fused vector allowlist {64,96,128,256} excludes. q/k/v are float
+// [B, n_q_heads, qL, D] / [B, n_kv_heads, kL, D] (GQA: n_q_heads % n_kv_heads
+// == 0); q is made row-contiguous, k/v are read in place via their strides.
+// `causal` applies an offset causal mask (query row i attends keys <= kL - qL +
+// i). Returns the attention output [B, n_q_heads, qL, D]. Metal-only.
+mx::array sdpa_vector(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    bool causal = true,
+    mx::StreamOrDevice s = {});
+
 // ----------------------------- primitives -----------------------------
 
 // Dequantize a single uint8 K-quant wire-byte tensor. Inference-only:
@@ -169,6 +183,33 @@ class KQuantMatmul : public mx::Primitive {
   int group_size_;
   int bits_;
   bool transpose_;
+};
+
+// Vector SDPA for large head dims. Inference-only: jvp/vjp/vmap inherit the
+// base-class throwing defaults. eval_cpu throws (Metal-only kernel).
+class KQuantSDPA : public mx::Primitive {
+ public:
+  explicit KQuantSDPA(mx::Stream stream, float scale, bool causal)
+      : mx::Primitive(stream), scale_(scale), causal_(causal) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSDPA";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  bool causal_;
 };
 
 // Gather (MoE) quantized matmul. vjp implements only the gradient wrt x (a

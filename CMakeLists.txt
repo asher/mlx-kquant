@@ -100,6 +100,7 @@ target_sources(
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_ops.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_dequantize.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_matmul.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_sdpa.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gather.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_encode.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gguf.cpp)
@@ -170,6 +171,7 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_encode.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_sdpa.metal
     INCLUDE_DIRS
     ${CMAKE_CURRENT_LIST_DIR}/metal
     ${MLX_INCLUDE_DIRS}

@@ -282,9 +282,9 @@ void qmv(
 // Verify-shaped small-M matmul. One threadgroup per
 // N-tile (grid_dims.x = 1) reads each weight tile once and dots it against all
 // M activation rows, amortizing the dominant weight read; the per-row qmv would
-// re-read it M times (M on grid_dims.x). Non-batched only; M (= vm) in [2,
-// verify_qmv_max_rows()], codec in codec_has_verify_qmv. Bit-for-bit identical
-// to running qmv per row.
+// re-read it M times (M on grid_dims.x). Non-batched only; M (= vm) in
+// [2, verify_qmv_max_rows()], codec in codec_has_verify_qmv. Bit-for-bit
+// identical to running qmv per row.
 void verify_qmv(
     const array& x,
     const array& w,
@@ -302,16 +302,28 @@ void verify_qmv(
   int bk = 32;
   MTL::Size group_dims(bk, 2, 1);
 
-  // q8_0 weight rows are small enough at modest K that the per-row weight stays
-  // L2-resident, so the default verify tiling (8 output rows / threadgroup =>
-  // few threadgroups) starves the GPU of occupancy vs the per-row qmv (M x more
-  // threadgroups) without repaying it in saved DRAM traffic. The finer q8_0
-  // variant emits 2 output rows / threadgroup (4x the threadgroups), restoring
-  // occupancy. Bit-exact vs the default. Other codecs keep the default tiling.
+  // Weight rows small enough at modest K stay L2-resident, so the default
+  // verify tiling (8 output rows / threadgroup => few threadgroups) can starve
+  // the GPU of occupancy vs the per-row qmv (M x more threadgroups) without
+  // repaying it in saved DRAM traffic. The finer variant emits 2 output rows /
+  // threadgroup (4x the threadgroups). Bit-exact vs the default. q8_0 measured
+  // a win at idle so it is fine by default; q6_k measured NEUTRAL under
+  // saturation (the verify forward's real condition), so it stays coarse by
+  // default. Only q8_0 and q6_k have the fine kernel instantiated.
+  // KQ_VERIFY_FINE=1 forces fine for both, KQ_VERIFY_FINE=0 forces coarse for
+  // both (A/B lever).
+  static const int verify_fine = []() {
+    const char* e = std::getenv("KQ_VERIFY_FINE");
+    return e != nullptr ? std::atoi(e) : -1; // -1 = per-codec default
+  }();
+  bool codec_has_fine = (kquant_type == "q8_0" || kquant_type == "q6_k");
+  bool default_fine = (kquant_type == "q8_0"); // q6_k neutral -> coarse default
+  bool use_fine = codec_has_fine &&
+      (verify_fine == 1 || (verify_fine != 0 && default_fine));
   std::string verify_kname = "verify_qmv_";
   int rows_per_tg =
       bn; // default kernel emits bn (= num_simdgroups*RPS) rows/tg
-  if (kquant_type == "q8_0") {
+  if (use_fine) {
     verify_kname = "verify_qmv_fine_";
     rows_per_tg = 2; // num_simdgroups(2) * results_per_simdgroup(1)
   }
@@ -342,6 +354,60 @@ void verify_qmv(
   ce.set_bytes(K, c++); // in_vec_size
   ce.set_bytes(N, c++); // out_vec_size
   ce.set_bytes(M, c++); // vm (activation-row count)
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+// Flat-with-M verify mat-vec (kq_<codec>_mv_ext): port of ggml mul_mv_ext_q4x4.
+// One output row per thread, M (= vm) register accumulators, nypsg=4 output
+// rows in parallel per simdgroup, nxpsg=8-lane K-reduction; the weight row
+// streams once and is dotted against all M activation columns. M in [2, 12]
+// selects the kernel (r1ptg is compile-time). All wired codecs (the kname
+// prefix carries the codec); same call args as verify_qmv.
+void verify_mv_ext(
+    const array& x,
+    const array& w,
+    const array& scales,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    Device& d,
+    const Stream& s,
+    const std::string& kquant_type) {
+  constexpr int nsg = 2;
+  constexpr int nxpsg = 8;
+  constexpr int rows_per_tg = (32 / nxpsg) * nsg; // nypsg * nsg = 8
+  MTL::Size group_dims(32, nsg, 1);
+  MTL::Size grid_dims((N + rows_per_tg - 1) / rows_per_tg, 1, 1);
+
+  std::string type_string = kq_type_string(x.dtype());
+  std::string kname;
+  kname.reserve(64);
+  mx::concatenate(
+      kname,
+      kq_kname_prefix(kquant_type) + "mv_ext_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_m",
+      M);
+
+  auto kernel = kq_get_kernel(d, kname);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  ce.set_input_array(w, c++);
+  ce.set_input_array(scales, c++);
+  ce.set_input_array(x, c++);
+  ce.set_output_array(out, c++);
+  ce.set_bytes(K, c++); // in_vec_size
+  ce.set_bytes(N, c++); // out_vec_size
+  ce.set_bytes(M, c++); // vm (== r1ptg)
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -526,25 +592,77 @@ void KQuantMatmul::eval_gpu(
   // a perf-only path for an essentially-dead case.
 
   if (M >= vector_limit) {
-    // The split-k qmm variant is omitted here; plain qmm is correct, just less
-    // parallel.
-    qmm(x,
-        w,
-        scales,
-        out,
-        transpose_,
-        group_size_,
-        bits_,
-        M,
-        N,
-        K,
-        d,
-        s,
-        kquant_type_);
-    return;
+    // For transpose shapes in the mv_ext M-range, the weight-read-amortizing
+    // kernel beats qmm's under-utilised BM=64 tile at small M. Let those fall
+    // through to the mv_ext check below; vector_limit was calibrated for
+    // qmv-vs-qmm, not mv_ext-vs-qmm.
+    if (!(transpose_ && non_batched && M >= 2 && M <= 12)) {
+      qmm(x,
+          w,
+          scales,
+          out,
+          transpose_,
+          group_size_,
+          bits_,
+          M,
+          N,
+          K,
+          d,
+          s,
+          kquant_type_);
+      return;
+    }
   }
 
   if (transpose_) {
+    // The verify width goes through the flat-with-M mat-vec (kq_<codec>_mv_ext,
+    // a port of ggml mul_mv_ext): one output row per thread with M register
+    // accumulators + nypsg parallel rows per simdgroup, vs verify_qmv's
+    // [MAX_VM][RPS] block that stays occupancy-exposed under saturation.
+    // Measured flat with M (matching llama) and bit-exact (fp-noise) vs
+    // verify_qmv and per-row qmv. On by default for the codecs in
+    // mv_ext_default_on; KQ_VERIFY_EXT=0 forces the verify_qmv path, =1 forces
+    // mv_ext for any codec that has the kernel (A/B lever).
+    static const int verify_ext = []() {
+      const char* e = std::getenv("KQ_VERIFY_EXT");
+      return e != nullptr ? std::atoi(e) : -1; // -1 = per-codec default
+    }();
+    // Every wired codec now has an mv_ext kernel: q8_0, the five K-quants, the
+    // four legacy non-K (q4_0/q4_1/q5_0/q5_1), and all nine IQ. Validated
+    // bit-exact, so default-on == has-kernel.
+    const bool codec_has_mv_ext = kquant_type_ == "q8_0" ||
+        kquant_type_ == "q2_k" || kquant_type_ == "q3_k" ||
+        kquant_type_ == "q4_k" || kquant_type_ == "q5_k" ||
+        kquant_type_ == "q6_k" || kquant_type_ == "q4_0" ||
+        kquant_type_ == "q4_1" || kquant_type_ == "q5_0" ||
+        kquant_type_ == "q5_1" || kquant_type_ == "iq4_nl" ||
+        kquant_type_ == "iq4_xs" || kquant_type_ == "iq3_s" ||
+        kquant_type_ == "iq3_xxs" || kquant_type_ == "iq2_xxs" ||
+        kquant_type_ == "iq2_xs" || kquant_type_ == "iq2_s" ||
+        kquant_type_ == "iq1_s" || kquant_type_ == "iq1_m";
+    const bool mv_ext_default_on = codec_has_mv_ext;
+    // Width gate for the DEFAULT path (the A/B force-on KQ_VERIFY_EXT=1 ignores
+    // it). Measured DRAM-fresh: for non-IQ codecs verify_qmv (tuned for small
+    // M, MAX_VM accumulators) ties or beats mv_ext at M==2 and mv_ext only pays
+    // at M>=3, so non-IQ falls back to verify_qmv at M==2 (no regression at the
+    // rarely-used draft-width-1 case). IQ has no verify_qmv kernel, so mv_ext
+    // (vs per-row qmv) is a clear win at every M>=2 and stays on.
+    const bool is_iq = kquant_type_.rfind("iq", 0) == 0;
+    const bool mv_ext_width_ok = is_iq || M >= 3;
+    // 32-weight blocks (legacy + q8_0 + iq4_nl) align K to 32; the 256-weight
+    // super-block codecs (K-quants + the other IQ) align to 256. Pull the
+    // modulus from the codec geometry rather than hard-coding per codec.
+    const KQuantCodec* mv_ext_codec = codec_by_name(kquant_type_);
+    const int mv_ext_k_align =
+        mv_ext_codec ? mv_ext_codec->weights_per_block : 256;
+    if (codec_has_mv_ext && non_batched && M >= 2 && M <= 12 &&
+        (K % mv_ext_k_align == 0) &&
+        (verify_ext == 1 ||
+         (verify_ext != 0 && mv_ext_default_on && mv_ext_width_ok))) {
+      verify_mv_ext(
+          x, w, scales, out, group_size_, bits_, M, N, K, d, s, kquant_type_);
+      return;
+    }
     // Verify / small-batch regime: amortize the weight read across the M rows
     // instead of re-reading it per row (qmv puts M on grid_dims.x). Falls back
     // to qmv outside the supported codec/shape/row-count envelope.

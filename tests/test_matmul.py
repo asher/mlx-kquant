@@ -6,8 +6,8 @@ The reference dequant comes from gguf-py's numpy decoder, NOT the extension, so
 a shared bug in the dequant math cannot cancel out of both sides of the
 comparison (a circular check against kq.dequantize would hide exactly that).
 
-For a real K-quant weight tensor pulled from a GGUF it checks, across several M
-(to exercise qmv at small M and qmm / qmm_nax at large M):
+For a real quantized weight tensor pulled from a GGUF it checks, across several M
+(qmv at M=1, the verify mv_ext kernel at M in [2,8], qmm / qmm_nax at large M):
 
     quantized_matmul(x, w, transpose=True)  ~=  x @ dequant(w).T
 
@@ -42,6 +42,17 @@ CODEC_BY_NAME = {
     "q4_k": (GGMLQuantizationType.Q4_K, 256, 144, 4),
     "q5_k": (GGMLQuantizationType.Q5_K, 256, 176, 5),
     "q6_k": (GGMLQuantizationType.Q6_K, 256, 210, 6),
+    # IQ codecs (gguf-py decodes all 9; the kq codec name is the lowercase enum).
+    # The M-sweep below routes M=2 through the mv_ext verify kernel.
+    "iq4_nl": (GGMLQuantizationType.IQ4_NL, 32, 18, 4),
+    "iq4_xs": (GGMLQuantizationType.IQ4_XS, 256, 136, 4),
+    "iq3_s": (GGMLQuantizationType.IQ3_S, 256, 110, 3),
+    "iq3_xxs": (GGMLQuantizationType.IQ3_XXS, 256, 98, 3),
+    "iq2_xxs": (GGMLQuantizationType.IQ2_XXS, 256, 66, 2),
+    "iq2_xs": (GGMLQuantizationType.IQ2_XS, 256, 74, 2),
+    "iq2_s": (GGMLQuantizationType.IQ2_S, 256, 82, 2),
+    "iq1_s": (GGMLQuantizationType.IQ1_S, 256, 50, 1),
+    "iq1_m": (GGMLQuantizationType.IQ1_M, 256, 56, 1),
 }
 
 BACKEND = "mlx_kquant"
@@ -125,8 +136,8 @@ def main(argv=None) -> int:
 
 
 def _present_codecs(gguf) -> list:
-    """K-quant codec names from CODEC_BY_NAME that actually appear in the file,
-    in CODEC_BY_NAME order. Lets the pytest entry test whatever a given model
+    """Codec names from CODEC_BY_NAME that actually appear in the file, in
+    CODEC_BY_NAME order. Lets the pytest entry test whatever a given model
     happens to contain instead of assuming a fixed codec."""
     reader = GGUFReader(gguf, "r")
     present = {t.tensor_type for t in reader.tensors}
@@ -134,7 +145,7 @@ def _present_codecs(gguf) -> list:
 
 
 def test_matmul():
-    """pytest entry: validate quantized_matmul for EVERY K-quant codec present
+    """pytest entry: validate quantized_matmul for EVERY codec present
     in KQUANT_TEST_GGUF (not just q4_k - UD/mixed quants vary), else skip.
     main() returns 0=pass, 1=numeric mismatch, 2=codec present but no usable 2D
     tensor. A 2 is tolerated (not every codec has a matmul-shaped tensor); only a

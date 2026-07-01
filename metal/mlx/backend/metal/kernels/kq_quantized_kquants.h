@@ -822,6 +822,55 @@ template <typename T, int group_size, int bits>
   kq_q4_k_dequantize_impl<T>(w, out, num_weights, gid);
 }
 
+// q4_k flat-with-M verify mat-vec: kq_mv_ext_impl (see kq_quantized.h) + the
+// per-codec chunk dequant below. Direct port of ggml-metal dequantize_q4_K (16
+// contiguous weights of chunk il, natural order [il*16, il*16+16)).
+inline void kq_q4_k_deq_chunk16(
+    const device uint8_t* block,
+    short il,
+    thread float4x4& reg) {
+  const device uint8_t* q = kq_q4_k_qs_ptr(block);
+  const short is = (il / 4) * 2;
+  q = q + (il / 4) * 32 + 16 * (il & 1);
+  il = il & 3;
+  const uchar2 sc =
+      kq_get_scale_min_k4_just2(is, il / 2, kq_q4_k_scales12_ptr(block));
+  const float d = il < 2 ? kq_q4_k_d(block) : kq_q4_k_d(block) / 16.0f;
+  const float dmin = kq_q4_k_dmin(block);
+  const float dl = d * float(sc[0]);
+  const float ml = dmin * float(sc[1]);
+  const uint16_t mask = il < 2 ? 0x0F : 0xF0;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    reg[i / 4][i % 4] = dl * float(q[i] & mask) - ml;
+  }
+}
+
+struct KqQ4_KExt {
+  MLX_MTL_CONST int superblock = KQ_Q4_K_SUPERBLOCK;
+  MLX_MTL_CONST int block_bytes = KQ_Q4_K_BLOCK_BYTES;
+  static METAL_FUNC void
+  deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
+    kq_q4_k_deq_chunk16(block, il, reg);
+  }
+};
+
+template <typename T, short r1ptg, short nsg, short nxpsg>
+[[kernel]] void kq_q4_k_mv_ext(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    const constant int& /* vm */, // == r1ptg
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  kq_mv_ext_impl<T, KqQ4_KExt, r1ptg, nsg, nxpsg>(
+      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
+}
+
 // Q5_K: 176 bytes/256 weights. [fp16 d][fp16
 // dmin][scales[12]][qh[32]][qs[128]]. q5 = q4 | (high_bit<<4); w[i] = d *
 // sub_scale * q5 - dmin * sub_min.
@@ -1787,6 +1836,61 @@ template <typename T, int group_size, int bits>
   kq_q5_k_dequantize_impl<T>(w, out, num_weights, gid);
 }
 
+// q5_k flat-with-M verify mat-vec: kq_mv_ext_impl (see kq_quantized.h) + the
+// per-codec chunk dequant below. Direct port of ggml-metal dequantize_q5_K (16
+// contiguous weights of chunk il, natural order [il*16, il*16+16)). The 5th bit
+// (qh) is added in as qh_val before the dl scale, matching ggml.
+inline void kq_q5_k_deq_chunk16(
+    const device uint8_t* block,
+    short il,
+    thread float4x4& reg) {
+  const device uint8_t* q = kq_q5_k_qs_ptr(block);
+  const device uint8_t* qh = kq_q5_k_qh_ptr(block);
+  const short is = (il / 4) * 2;
+  q = q + 32 * (il / 4) + 16 * (il & 1);
+  qh = qh + 16 * (il & 1);
+  const uint8_t ul = 1 << (il / 2);
+  il = il & 3;
+  const uchar2 sc =
+      kq_get_scale_min_k4_just2(is, il / 2, kq_q5_k_scales12_ptr(block));
+  const float d = il < 2 ? kq_q5_k_d(block) : kq_q5_k_d(block) / 16.0f;
+  const float dmin = kq_q5_k_dmin(block);
+  const float dl = d * float(sc[0]);
+  const float ml = dmin * float(sc[1]);
+  const uint16_t mask = il < 2 ? 0x0F : 0xF0;
+  const float qh_val = il < 2 ? 16.0f : 256.0f;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    reg[i / 4][i % 4] =
+        dl * (float(q[i] & mask) + (qh[i] & ul ? qh_val : 0.0f)) - ml;
+  }
+}
+
+struct KqQ5_KExt {
+  MLX_MTL_CONST int superblock = KQ_Q5_K_SUPERBLOCK;
+  MLX_MTL_CONST int block_bytes = KQ_Q5_K_BLOCK_BYTES;
+  static METAL_FUNC void
+  deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
+    kq_q5_k_deq_chunk16(block, il, reg);
+  }
+};
+
+template <typename T, short r1ptg, short nsg, short nxpsg>
+[[kernel]] void kq_q5_k_mv_ext(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    const constant int& /* vm */, // == r1ptg
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  kq_mv_ext_impl<T, KqQ5_KExt, r1ptg, nsg, nxpsg>(
+      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
+}
+
 // Q6_K: 210 bytes/256 weights. REVERSED field order: [ql[128]][qh[64]][int8
 // scales[16]][fp16 d]. q6 = (low4 | (high2<<4)) - 32; w[i] = d * sc * q6.
 
@@ -1948,7 +2052,15 @@ METAL_FUNC void kq_q6_k_qmv_fast_impl(
 // x is row-contiguous [vm, in_vec_size], y is [vm, out_vec_size]. Math per
 // (row, m) is identical to kq_q6_k_qmv_fast_impl with x = row m, so results are
 // bit-for-bit the same.
-template <typename T, int group_size, int bits>
+//
+// results_per_simdgroup is templated (see kq_q8_0_verify_qmv_impl): the default
+// (4) packs 8 output rows per threadgroup; a finer value (1 -> 2 rows/tg)
+// multiplies the threadgroup count for the same N, restoring GPU occupancy when
+// each row's weight is small enough to stay L2-resident (so amortizing the
+// weight read saves little DRAM traffic and the lost occupancy isn't repaid).
+// Bit-exact across values: each output row's per-lane K-fold + simd_sum is
+// identical regardless of how rows are partitioned across threadgroups.
+template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
 METAL_FUNC void kq_q6_k_verify_qmv_impl(
     const device uint8_t* w,
     const device T* x,
@@ -1964,13 +2076,14 @@ METAL_FUNC void kq_q6_k_verify_qmv_impl(
   static_assert(bits == 6, "Q6_K kernel requires bits=6");
 
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
   constexpr int sb_stride = 2;
   constexpr int MAX_VM = 8;
 
   typedef float U;
-  // Dequantized weights for the current output row, reused across all vm rows.
-  thread U wq[16];
+  // Dequantized weights for the current output row, grouped as 4 float4 (wv[c]
+  // holds v_c at l=0..3) so the per-row dot reads them vectorized. Dequantized
+  // ONCE and reused across all vm activation rows.
+  thread float4 wv[4];
   // One accumulator per (row in this output tile, activation row m).
   thread U result[MAX_VM][results_per_simdgroup];
 #pragma unroll
@@ -2008,39 +2121,37 @@ METAL_FUNC void kq_q6_k_verify_qmv_impl(
       const device int8_t* sc = kq_q6_k_scales_ptr(sb_addr) + is;
       const U d = U(kq_q6_k_d(sb_addr));
 
-      // Dequantize this output row's 16 weights ONCE into registers.
+      // Dequantize this output row's 16 weights ONCE into registers, grouped so
+      // wv[c] = (v_c at l=0..3) for a vectorized per-row dot.
 #pragma unroll
       for (int l = 0; l < 4; l++) {
         const uint8_t q1l = q1[l];
         const uint8_t q2l = q2[l];
         const uint8_t qhl = qh[l];
-        wq[4 * l + 0] =
-            U(int8_t((q1l & 0x0F) | ((qhl & 0x03) << 4)) - int8_t(32));
-        wq[4 * l + 1] =
-            U(int8_t((q2l & 0x0F) | ((qhl & 0x0C) << 2)) - int8_t(32));
-        wq[4 * l + 2] =
-            U(int8_t((q1l >> 4) | ((qhl & 0x30) << 0)) - int8_t(32));
-        wq[4 * l + 3] =
-            U(int8_t((q2l >> 4) | ((qhl & 0xC0) >> 2)) - int8_t(32));
+        wv[0][l] = U(int8_t((q1l & 0x0F) | ((qhl & 0x03) << 4)) - int8_t(32));
+        wv[1][l] = U(int8_t((q2l & 0x0F) | ((qhl & 0x0C) << 2)) - int8_t(32));
+        wv[2][l] = U(int8_t((q1l >> 4) | ((qhl & 0x30) << 0)) - int8_t(32));
+        wv[3][l] = U(int8_t((q2l >> 4) | ((qhl & 0xC0) >> 2)) - int8_t(32));
       }
       const U sc0 = U(sc[0]);
       const U sc1 = U(sc[2]);
       const U sc2 = U(sc[4]);
       const U sc3 = U(sc[6]);
 
-      // Dot the dequantized weight against each activation row. The weight read
-      // above happens once; only the (tiny, cache-resident) activations
-      // re-read.
+      // Dot the dequantized weight against each activation row. The four
+      // contiguous activation float4s (xm[32c .. 32c+3]) are loaded vectorized;
+      // the weight dequant above happens once. Accumulation order matches
+      // kq_q6_k_qmv_fast_impl exactly, so results stay bit-for-bit identical.
       for (int m = 0; m < vm; m++) {
         const device T* xm = x + m * in_vec_size + x_base;
-        U sums0 = U(0), sums1 = U(0), sums2 = U(0), sums3 = U(0);
-#pragma unroll
-        for (int l = 0; l < 4; l++) {
-          sums0 += U(xm[l + 0]) * wq[4 * l + 0];
-          sums1 += U(xm[l + 32]) * wq[4 * l + 1];
-          sums2 += U(xm[l + 64]) * wq[4 * l + 2];
-          sums3 += U(xm[l + 96]) * wq[4 * l + 3];
-        }
+        const float4 x0 = float4(*(const device vec<T, 4>*)(xm + 0));
+        const float4 x1 = float4(*(const device vec<T, 4>*)(xm + 32));
+        const float4 x2 = float4(*(const device vec<T, 4>*)(xm + 64));
+        const float4 x3 = float4(*(const device vec<T, 4>*)(xm + 96));
+        const U sums0 = dot(x0, wv[0]);
+        const U sums1 = dot(x1, wv[1]);
+        const U sums2 = dot(x2, wv[2]);
+        const U sums3 = dot(x3, wv[3]);
         result[m][row] +=
             d * (sums0 * sc0 + sums1 * sc1 + sums2 * sc2 + sums3 * sc3);
       }
@@ -2536,8 +2647,98 @@ template <typename T, int group_size, int bits, bool batched>
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  kq_q6_k_verify_qmv_impl<T, group_size, bits>(
+  kq_q6_k_verify_qmv_impl<T, group_size, bits, 4>(
       w, x, y, in_vec_size, out_vec_size, vm, tid, simd_gid, simd_lid);
+}
+
+// Finer-tiled variant: 1 result per simdgroup -> 2 output rows per threadgroup
+// (vs 8 in the default), quadrupling the threadgroup count for the same N. Used
+// when occupancy is the bottleneck (small per-row weight that stays
+// L2-resident). Bit-exact vs the default variant and vs per-row qmv.
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q6_k_verify_qmv_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q6_k_verify_qmv_impl<T, group_size, bits, 1>(
+      w, x, y, in_vec_size, out_vec_size, vm, tid, simd_gid, simd_lid);
+}
+
+// ---------------------------------------------------------------------------
+// q6_k flat-with-M verify mat-vec: kq_mv_ext_impl (see kq_quantized.h) + the
+// per-codec chunk dequant below.
+
+// Dequantize the 16 contiguous weights of chunk `il` (in [0,15]) of a q6_k
+// super-block into a float4x4 (natural element order il*16 .. il*16+15). Direct
+// port of ggml-metal dequantize_q6_K.
+inline void kq_q6_k_deq_chunk16(
+    const device uint8_t* block,
+    short il,
+    thread float4x4& reg) {
+  const float d_all = kq_q6_k_d(block);
+  const device uint16_t* ql = (const device uint16_t*)kq_q6_k_ql_ptr(block);
+  const device uint16_t* qh = (const device uint16_t*)kq_q6_k_qh_ptr(block);
+  const device int8_t* scales = kq_q6_k_scales_ptr(block);
+
+  ql = ql + 32 * (il / 8) + 16 * ((il / 2) & 1) + 8 * (il & 1);
+  qh = qh + 16 * (il / 8) + 8 * (il & 1);
+  const float sc = float(scales[(il % 2) + 2 * (il / 2)]);
+  il = (il / 2) & 3;
+
+  const uint32_t kmask1 = il > 1 ? (il > 2 ? 0xC0C0C0C0 : 0x30303030)
+                                 : (il > 0 ? 0x0C0C0C0C : 0x03030303);
+  const uint32_t kmask2 = il > 1 ? 0xF0F0F0F0 : 0x0F0F0F0F;
+  const float ml = d_all * sc * 32.0f;
+  const float dl0 = d_all * sc;
+  const float dl1 = dl0 / 256.0f;
+  const float dl2 = dl0 / (256.0f * 256.0f);
+  const float dl3 = dl0 / (256.0f * 256.0f * 256.0f);
+  const uint8_t shr_h = il > 2 ? 2 : 0;
+  const uint8_t shl_h = il > 1 ? 0 : (il > 0 ? 2 : 4);
+  const uint8_t shr_l = il > 1 ? 4 : 0;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t low = (ql[2 * i] | ((uint32_t)ql[2 * i + 1] << 16)) & kmask2;
+    const uint32_t high =
+        (qh[2 * i] | ((uint32_t)qh[2 * i + 1] << 16)) & kmask1;
+    const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+    reg[i][0] = dl0 * float(q & 0xFF) - ml;
+    reg[i][1] = dl1 * float(q & 0xFF00) - ml;
+    reg[i][2] = dl2 * float(q & 0xFF0000) - ml;
+    reg[i][3] = dl3 * float(q & 0xFF000000) - ml;
+  }
+}
+
+struct KqQ6_KExt {
+  MLX_MTL_CONST int superblock = KQ_Q6_K_SUPERBLOCK;
+  MLX_MTL_CONST int block_bytes = KQ_Q6_K_BLOCK_BYTES;
+  static METAL_FUNC void
+  deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
+    kq_q6_k_deq_chunk16(block, il, reg);
+  }
+};
+
+template <typename T, short r1ptg, short nsg, short nxpsg>
+[[kernel]] void kq_q6_k_mv_ext(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    const constant int& /* vm */, // == r1ptg
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  kq_mv_ext_impl<T, KqQ6_KExt, r1ptg, nsg, nxpsg>(
+      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
 }
 
 template <typename T, int group_size, int bits, bool batched>
@@ -3589,6 +3790,68 @@ template <typename T, int group_size, int bits>
   kq_q3_k_dequantize_impl<T>(w, out, num_weights, gid);
 }
 
+// q3_k flat-with-M verify mat-vec: kq_mv_ext_impl (see kq_quantized.h) + the
+// per-codec chunk dequant below. Direct port of ggml-metal dequantize_q3_K (16
+// contiguous weights of chunk il, natural order [il*16, il*16+16)). ml is taken
+// from the pre-coef dl (4*dl), matching ggml; the hmask bit subtracts it.
+inline void kq_q3_k_deq_chunk16(
+    const device uint8_t* block,
+    short il,
+    thread float4x4& reg) {
+  const float d_all = kq_q3_k_d(block);
+  const device uint8_t* q = kq_q3_k_qs_ptr(block);
+  const device uint8_t* h = kq_q3_k_hmask_ptr(block);
+  const device uint8_t* scales = kq_q3_k_scales12_ptr(block);
+  q = q + 32 * (il / 8) + 16 * (il & 1);
+  h = h + 16 * (il & 1);
+  const uint8_t m = 1 << (il / 2);
+  const uint16_t kmask1 =
+      (il / 4) > 1 ? ((il / 4) > 2 ? 192 : 48) : ((il / 4) > 0 ? 12 : 3);
+  const uint16_t kmask2 = (il / 8) ? 0xF0 : 0x0F;
+  const uint16_t scale_2 = scales[il % 8];
+  const uint16_t scale_1 = scales[8 + il % 4];
+  const int16_t dl_int = ((il / 4) & 1)
+      ? ((scale_2 & kmask2) | ((scale_1 & kmask1) << 2))
+      : ((scale_2 & kmask2) | ((scale_1 & kmask1) << 4));
+  float dl =
+      il < 8 ? d_all * (dl_int - 32.0f) : d_all * (dl_int / 16.0f - 32.0f);
+  const float ml = 4.0f * dl;
+  il = (il / 2) & 3;
+  const float coef = il > 1 ? (il > 2 ? 1.0f / 64.0f : 1.0f / 16.0f)
+                            : (il > 0 ? 1.0f / 4.0f : 1.0f);
+  const uint8_t mask = il > 1 ? (il > 2 ? 192 : 48) : (il > 0 ? 12 : 3);
+  dl *= coef;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    reg[i / 4][i % 4] = dl * float(q[i] & mask) - (h[i] & m ? 0.0f : ml);
+  }
+}
+
+struct KqQ3_KExt {
+  MLX_MTL_CONST int superblock = KQ_Q3_K_SUPERBLOCK;
+  MLX_MTL_CONST int block_bytes = KQ_Q3_K_BLOCK_BYTES;
+  static METAL_FUNC void
+  deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
+    kq_q3_k_deq_chunk16(block, il, reg);
+  }
+};
+
+template <typename T, short r1ptg, short nsg, short nxpsg>
+[[kernel]] void kq_q3_k_mv_ext(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    const constant int& /* vm */, // == r1ptg
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  kq_mv_ext_impl<T, KqQ3_KExt, r1ptg, nsg, nxpsg>(
+      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
+}
+
 // Q2_K: 84 bytes/256 weights. [scales[16]][qs[64]][fp16 d][fp16 dmin].
 // w[i] = d * (sc & 0xF) * q2 - dmin * (sc >> 4). Asymmetric.
 
@@ -4448,4 +4711,53 @@ template <typename T, int group_size, int bits>
       group_size == KQ_Q2_K_SUPERBLOCK, "Q2_K kernel requires group_size=256");
   static_assert(bits == 2, "Q2_K kernel requires bits=2");
   kq_q2_k_dequantize_impl<T>(w, out, num_weights, gid);
+}
+
+// q2_k flat-with-M verify mat-vec: kq_mv_ext_impl (see kq_quantized.h) + the
+// per-codec chunk dequant below. Direct port of ggml-metal dequantize_q2_K (16
+// contiguous weights of chunk il, natural order [il*16, il*16+16)).
+inline void kq_q2_k_deq_chunk16(
+    const device uint8_t* block,
+    short il,
+    thread float4x4& reg) {
+  const float d = kq_q2_k_d(block);
+  const float dmin = kq_q2_k_dmin(block);
+  const device uint8_t* q = kq_q2_k_qs_ptr(block);
+  const uint8_t sc = kq_q2_k_scales_ptr(block)[il];
+  q = q + 32 * (il / 8) + 16 * (il & 1);
+  il = (il / 2) % 4;
+  const float coef = il > 1 ? (il > 2 ? 1.0f / 64.0f : 1.0f / 16.0f)
+                            : (il > 0 ? 1.0f / 4.0f : 1.0f);
+  const uint8_t mask = il > 1 ? (il > 2 ? 192 : 48) : (il > 0 ? 12 : 3);
+  const float dl = d * float(sc & 0xF) * coef;
+  const float ml = dmin * float(sc >> 4);
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    reg[i / 4][i % 4] = dl * float(q[i] & mask) - ml;
+  }
+}
+
+struct KqQ2_KExt {
+  MLX_MTL_CONST int superblock = KQ_Q2_K_SUPERBLOCK;
+  MLX_MTL_CONST int block_bytes = KQ_Q2_K_BLOCK_BYTES;
+  static METAL_FUNC void
+  deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
+    kq_q2_k_deq_chunk16(block, il, reg);
+  }
+};
+
+template <typename T, short r1ptg, short nsg, short nxpsg>
+[[kernel]] void kq_q2_k_mv_ext(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    const constant int& /* vm */, // == r1ptg
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  kq_mv_ext_impl<T, KqQ2_KExt, r1ptg, nsg, nxpsg>(
+      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
 }
