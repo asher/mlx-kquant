@@ -111,9 +111,9 @@ def _check_embedding(codec, gtype, wire, ref) -> bool:
     idx_np = np.array([[0, 3, 7], [rows - 1, 1, 5]], dtype=np.uint32)
     out = emb(mx.array(idx_np))
     mx.eval(out)
-    # gather/dequant is loose (f16) vs the f32 oracle rows.
+    # gather/dequant emits bf16 (default), loose vs the f32 oracle rows.
     gather_ok = np.allclose(
-        np.array(out).astype(np.float32), ref[idx_np], atol=1e-3, rtol=1e-3
+        np.array(out.astype(mx.float32)), ref[idx_np], atol=8e-3, rtol=8e-3
     )
     # tied as_linear == quantized_matmul against the same weight.
     rng = np.random.default_rng(1)

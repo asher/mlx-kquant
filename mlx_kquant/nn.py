@@ -34,7 +34,13 @@ class KQuantEmbedding(nn.Module):
     ``embed_tokens`` to ``lm_head``).
     """
 
-    def __init__(self, num_embeddings: int, dims: int, codec: str):
+    def __init__(
+        self,
+        num_embeddings: int,
+        dims: int,
+        codec: str,
+        out_dtype: mx.Dtype = mx.bfloat16,
+    ):
         super().__init__()
         gs, bits, _, _ = CODEC_GEOMETRY[codec]
         self.mode = "kquant"
@@ -44,6 +50,7 @@ class KQuantEmbedding(nn.Module):
         self.biases = None
         self.num_embeddings = num_embeddings
         self.dims = dims
+        self.out_dtype = out_dtype
         # Placeholders - overwritten by load_weights with the GGUF wire bytes.
         bpr = bytes_per_row(codec, dims)
         self.weight = mx.zeros((num_embeddings, bpr), dtype=mx.uint8)
@@ -54,7 +61,8 @@ class KQuantEmbedding(nn.Module):
         gathered = self["weight"][x]  # [*, bytes_per_row]
         flat = gathered.reshape(-1, gathered.shape[-1])
         deq = kq.dequantize(flat, self["scales"], self.kquant_type)
-        return deq.reshape(*gathered.shape[:-1], self.dims)
+        # emit compute dtype (bf16) so a bf16 stream isn't promoted to f32
+        return deq.reshape(*gathered.shape[:-1], self.dims).astype(self.out_dtype)
 
     def as_linear(self, x):
         return kq.quantized_matmul(
