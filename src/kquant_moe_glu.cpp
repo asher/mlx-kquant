@@ -3,7 +3,7 @@
 //   mxfp4 packed layout: moe_glu_gather (gate + up + biases + clamped-SwiGLU
 //     in one dispatch) and gather_qmv_bias.
 //   K-quant wire bytes: moe_glu_gather_kq (gate + up + silu/gelu GLU, no
-//     biases) and gather_qmv_kq, per-codec kernels (q6_k, q8_0 wired).
+//     biases) and gather_qmv_kq, per-codec kernels (full codec matrix).
 #include <stdexcept>
 #include <string>
 
@@ -195,8 +195,12 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   int N = gw.shape(1);
   int K = x.shape(-1);
 
-  std::string kname = "kq_" + kquant_type_ + "_moe_glu_gather_shexp_" + act_ +
-      "_" + kq_type_string(x.dtype());
+  // Mixed shexp codecs dispatch the generic "_sx_" instantiations.
+  const std::string stem = shexp_type_ == kquant_type_
+      ? kquant_type_
+      : kquant_type_ + "_sx_" + shexp_type_;
+  std::string kname = "kq_" + stem + "_moe_glu_gather_shexp_" + act_ + "_" +
+      kq_type_string(x.dtype());
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -234,8 +238,11 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   int K = x.shape(-1);
   (void)scores;
 
+  const std::string stem = shexp_type_ == kquant_type_
+      ? kquant_type_
+      : kquant_type_ + "_sx_" + shexp_type_;
   std::string kname =
-      "kq_" + kquant_type_ + "_gather_qmv_mix_" + kq_type_string(x.dtype());
+      "kq_" + stem + "_gather_qmv_mix_" + kq_type_string(x.dtype());
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -399,12 +406,13 @@ void KQuantGatherQMVMixKQ::eval_cpu(
 
 bool KQuantMoEGLUShexpKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMoEGLUShexpKQ&>(other);
-  return kquant_type_ == o.kquant_type_ && act_ == o.act_;
+  return kquant_type_ == o.kquant_type_ && act_ == o.act_ &&
+      shexp_type_ == o.shexp_type_;
 }
 
 bool KQuantGatherQMVMixKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantGatherQMVMixKQ&>(other);
-  return kquant_type_ == o.kquant_type_;
+  return kquant_type_ == o.kquant_type_ && shexp_type_ == o.shexp_type_;
 }
 
 std::vector<mx::Shape> KQuantMoEGLUShexpKQ::output_shapes(
@@ -500,11 +508,26 @@ mx::array prep_indices(const mx::array& idx, mx::StreamOrDevice s) {
   return mx::contiguous(mx::astype(idx, mx::uint32, s), false, s);
 }
 
-// Codecs with the fused kq GLU/gather kernels wired (kq_moe_glu_kq.h). Grows
-// with the codec matrix; unsupported codecs must fall back to the stock path
+// Codecs with the fused kq GLU/gather kernels wired (kq_moe_glu_kq.h):
+// tuned kernels for q6_k/q8_0, generic Ext-trait kernels for the rest of the
+// codec matrix. Unsupported codecs must fall back to the stock path
 // per-tensor (callers gate on this via ops throwing invalid_argument).
-bool codec_has_moe_glu(const std::string& kquant_type) {
-  return kquant_type == "q6_k" || kquant_type == "q8_0";
+bool codec_has_moe_glu(const std::string& t) {
+  return t == "q2_k" || t == "q3_k" || t == "q4_k" || t == "q5_k" ||
+      t == "q6_k" || t == "q8_0" || t == "q4_0" || t == "q4_1" || t == "q5_0" ||
+      t == "q5_1" || t == "iq4_nl" || t == "iq4_xs" || t == "iq3_s" ||
+      t == "iq3_xxs" || t == "iq2_xxs" || t == "iq2_xs" || t == "iq2_s" ||
+      t == "iq1_s" || t == "iq1_m";
+}
+
+// Mixed-codec shared experts instantiate only the UD-style upcast combos:
+// shexp codec == expert codec, or q6_k / q8_0 over anything.
+bool shexp_combo_has_kernel(
+    const std::string& kquant_type,
+    const std::string& shexp_type) {
+  return codec_has_moe_glu(kquant_type) && codec_has_moe_glu(shexp_type) &&
+      (shexp_type == kquant_type || shexp_type == "q6_k" ||
+       shexp_type == "q8_0");
 }
 
 // Shared validation for one K-quant wire-byte expert stack.
@@ -546,7 +569,7 @@ void check_kq_expert_stack(
 }
 
 // Shared validation for one single-expert (2-D) K-quant wire-byte tensor;
-// must match the expert stack's row shape exactly.
+// must match the expert stack's row shape (in its OWN codec's wire bytes).
 void check_kq_shexp_row(
     const char* op,
     const mx::array& w,
@@ -554,6 +577,11 @@ void check_kq_shexp_row(
     int K,
     int N) {
   const KQuantCodec* codec = codec_by_name(kquant_type);
+  if (codec == nullptr) {
+    throw std::invalid_argument(
+        std::string(op) + " unknown shared-expert codec '" + kquant_type +
+        "'.");
+  }
   if (w.ndim() != 2 || w.dtype() != mx::uint8) {
     throw std::invalid_argument(
         std::string(op) +
@@ -757,9 +785,17 @@ mx::array moe_glu_gather_shexp_kq(
     const std::string& kquant_type,
     mx::array indices,
     const std::string& act,
+    const std::string& shexp_kquant_type,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.moe_glu_gather_shexp_kq]";
+  const std::string shexp_type =
+      shexp_kquant_type.empty() ? kquant_type : shexp_kquant_type;
+  if (!shexp_combo_has_kernel(kquant_type, shexp_type)) {
+    throw std::invalid_argument(
+        std::string(op) + " no fused kernel for expert codec '" + kquant_type +
+        "' with shared-expert codec '" + shexp_type + "'.");
+  }
   if (x.ndim() != 2) {
     throw std::invalid_argument(std::string(op) + " x must be 2-D [T, K].");
   }
@@ -783,15 +819,15 @@ mx::array moe_glu_gather_shexp_kq(
         std::string(op) + " gate/up expert shapes must match.");
   }
   int N = gate_w.shape(1);
-  check_kq_shexp_row(op, shexp_gate_w, kquant_type, K, N);
-  check_kq_shexp_row(op, shexp_up_w, kquant_type, K, N);
+  check_kq_shexp_row(op, shexp_gate_w, shexp_type, K, N);
+  check_kq_shexp_row(op, shexp_up_w, shexp_type, K, N);
 
   auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
   mx::Shape out_shape = {x.shape(0), indices.shape(1) + 1, N};
   return mx::array(
       std::move(out_shape),
       dt,
-      std::make_shared<KQuantMoEGLUShexpKQ>(s, kquant_type, act),
+      std::make_shared<KQuantMoEGLUShexpKQ>(s, kquant_type, act, shexp_type),
       {std::move(gate_w),
        std::move(up_w),
        std::move(shexp_gate_w),
@@ -807,9 +843,17 @@ mx::array gather_qmv_mix_kq(
     const std::string& kquant_type,
     mx::array indices,
     mx::array scores,
+    const std::string& shexp_kquant_type,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.gather_qmv_mix_kq]";
+  const std::string shexp_type =
+      shexp_kquant_type.empty() ? kquant_type : shexp_kquant_type;
+  if (!shexp_combo_has_kernel(kquant_type, shexp_type)) {
+    throw std::invalid_argument(
+        std::string(op) + " no fused kernel for expert codec '" + kquant_type +
+        "' with shared-expert codec '" + shexp_type + "'.");
+  }
   if (x.ndim() != 3) {
     throw std::invalid_argument(std::string(op) + " x must be 3-D [T, S, K].");
   }
@@ -830,14 +874,14 @@ mx::array gather_qmv_mix_kq(
   }
   int K = x.shape(2);
   check_kq_expert_stack(op, w, kquant_type, K);
-  check_kq_shexp_row(op, shexp_w, kquant_type, K, w.shape(1));
+  check_kq_shexp_row(op, shexp_w, shexp_type, K, w.shape(1));
 
   auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
   mx::Shape out_shape = {x.shape(0), w.shape(1)};
   return mx::array(
       std::move(out_shape),
       dt,
-      std::make_shared<KQuantGatherQMVMixKQ>(s, kquant_type),
+      std::make_shared<KQuantGatherQMVMixKQ>(s, kquant_type, shexp_type),
       {std::move(w),
        std::move(shexp_w),
        std::move(x_c),

@@ -168,7 +168,7 @@ mx::array gather_qmv_bias(
 // wire bytes (n_experts, out_dims, bytes_per_row) sharing each activation
 // load, with the GLU epilogue act(g) * u fused (act: "silu" or "gelu"). No
 // biases. x [T, K], indices [T, R]. Returns [T, R, N]. Metal-only; requires
-// K % 256 == 0 and a codec with the fused kernel wired (q6_k, q8_0 today).
+// K % 256 == 0 and a codec with the fused kernel wired (full GGUF matrix).
 mx::array moe_glu_gather_kq(
     mx::array x,
     mx::array gate_w,
@@ -189,7 +189,9 @@ mx::array gather_qmv_kq(
 
 // moe_glu_gather_kq with the block's shared expert folded in as one extra
 // slot: shexp_gate_w / shexp_up_w are single-expert 2-D wire-byte tensors
-// [N, bytes_per_row] with the same codec and shape as one expert stack row.
+// [N, bytes_per_row(shexp codec)] shape-matched to one expert stack row.
+// shexp_kquant_type defaults to kquant_type; a different codec (mixed-codec
+// blocks, UD-style upcast shexp) must be q6_k or q8_0.
 // Returns [T, R + 1, N]; the last slot is the shared expert.
 mx::array moe_glu_gather_shexp_kq(
     mx::array x,
@@ -200,6 +202,7 @@ mx::array moe_glu_gather_shexp_kq(
     const std::string& kquant_type,
     mx::array indices,
     const std::string& act = "silu",
+    const std::string& shexp_kquant_type = "",
     mx::StreamOrDevice s = {});
 
 // Down projection with the routing mix folded in: x [T, S, K] (slot S-1 =
@@ -213,6 +216,7 @@ mx::array gather_qmv_mix_kq(
     const std::string& kquant_type,
     mx::array indices,
     mx::array scores,
+    const std::string& shexp_kquant_type = "",
     mx::StreamOrDevice s = {});
 
 // Router top-k in one dispatch: logits [T, E + 1] (column E = shared-expert
@@ -522,10 +526,12 @@ class KQuantMoEGLUShexpKQ : public mx::Primitive {
   explicit KQuantMoEGLUShexpKQ(
       mx::Stream stream,
       std::string kquant_type,
-      std::string act)
+      std::string act,
+      std::string shexp_type)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
-        act_(std::move(act)) {}
+        act_(std::move(act)),
+        shexp_type_(std::move(shexp_type)) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -545,14 +551,20 @@ class KQuantMoEGLUShexpKQ : public mx::Primitive {
  private:
   std::string kquant_type_;
   std::string act_;
+  std::string shexp_type_;
 };
 
 // K-quant gathered matvec with routing mix folded in (see gather_qmv_mix_kq).
 // Inference-only.
 class KQuantGatherQMVMixKQ : public mx::Primitive {
  public:
-  explicit KQuantGatherQMVMixKQ(mx::Stream stream, std::string kquant_type)
-      : mx::Primitive(stream), kquant_type_(std::move(kquant_type)) {}
+  explicit KQuantGatherQMVMixKQ(
+      mx::Stream stream,
+      std::string kquant_type,
+      std::string shexp_type)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        shexp_type_(std::move(shexp_type)) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -571,6 +583,7 @@ class KQuantGatherQMVMixKQ : public mx::Primitive {
 
  private:
   std::string kquant_type_;
+  std::string shexp_type_;
 };
 
 // Router softmax + top-k + score epilogue (see moe_router_topk). Two

@@ -280,7 +280,7 @@ NB_MODULE(_ext, m) {
             x (array): activations [T, K], float16/bfloat16. K % 256 == 0.
             gate_w (array): uint8 wire bytes (n_experts, N, bytes_per_row).
             up_w (array): uint8 wire bytes, same shape as gate_w.
-            kquant_type (str): codec with a fused kernel (q6_k, q8_0).
+            kquant_type (str): codec with a fused kernel (full GGUF matrix).
             indices (array): expert indices [T, R].
             act (str): 'silu' (default) or 'gelu' (tanh approx).
 
@@ -304,7 +304,7 @@ NB_MODULE(_ext, m) {
         Args:
             x (array): activations [T, R, K], float16/bfloat16. K % 256 == 0.
             w (array): uint8 wire bytes (n_experts, N, bytes_per_row).
-            kquant_type (str): codec with a fused kernel (q6_k, q8_0).
+            kquant_type (str): codec with a fused kernel (full GGUF matrix).
             indices (array): expert indices [T, R].
 
         Returns:
@@ -322,12 +322,13 @@ NB_MODULE(_ext, m) {
       "kquant_type"_a,
       "indices"_a,
       "act"_a = "silu",
+      "shexp_kquant_type"_a = "",
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
         moe_glu_gather_kq with the block's shared expert folded in as one
-        extra slot (the last), fed by single-expert 2-D wire-byte tensors of
-        the same codec and row shape as the expert stack.
+        extra slot (the last), fed by single-expert 2-D wire-byte tensors
+        row-shape-matched to the expert stack.
 
         Args:
             x (array): activations [T, K], float16/bfloat16. K % 256 == 0.
@@ -335,9 +336,11 @@ NB_MODULE(_ext, m) {
             up_w (array): uint8 wire bytes, same shape as gate_w.
             shexp_gate_w (array): uint8 wire bytes (N, bytes_per_row).
             shexp_up_w (array): uint8 wire bytes (N, bytes_per_row).
-            kquant_type (str): codec with a fused kernel (q6_k, q8_0).
+            kquant_type (str): expert codec with a fused kernel.
             indices (array): expert indices [T, R].
             act (str): 'silu' (default) or 'gelu' (tanh approx).
+            shexp_kquant_type (str): shared-expert codec; '' (default) =
+                kquant_type. Mixed combos must be q6_k or q8_0.
 
         Returns:
             array: activated hidden states [T, R + 1, N] in x.dtype.
@@ -352,6 +355,7 @@ NB_MODULE(_ext, m) {
       "kquant_type"_a,
       "indices"_a,
       "scores"_a,
+      "shexp_kquant_type"_a = "",
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
@@ -363,9 +367,11 @@ NB_MODULE(_ext, m) {
             x (array): activations [T, S, K], float16/bfloat16. K % 256 == 0.
             w (array): uint8 wire bytes (n_experts, N, bytes_per_row).
             shexp_w (array): uint8 wire bytes (N, bytes_per_row).
-            kquant_type (str): codec with a fused kernel (q6_k, q8_0).
+            kquant_type (str): expert codec with a fused kernel.
             indices (array): expert indices [T, S - 1].
             scores (array): mix weights [T, S]; cast to float32.
+            shexp_kquant_type (str): shared-expert codec; '' (default) =
+                kquant_type. Mixed combos must be q6_k or q8_0.
 
         Returns:
             array: mixed output [T, N] in x.dtype.
