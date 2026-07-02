@@ -174,7 +174,7 @@ NB_MODULE(_ext, m) {
       "scale"_a,
       "sinks"_a = nb::none(),
       "splits"_a = 0,
-      "tile_c"_a = 32,
+      "tile_c"_a = 0,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
@@ -184,18 +184,20 @@ NB_MODULE(_ext, m) {
         whole GQA group, so device memory reads the KV once per kv-head.
 
         Args:
-            q (array): queries [B, n_q_heads, 1, 64], float16/bfloat16.
-            k (array): keys [B, n_kv_heads, kL, 64]; head/seq strided is fine
+            q (array): queries [B, n_q_heads, 1, D], float16/bfloat16;
+                D in {64, 128, 256, 512}.
+            k (array): keys [B, n_kv_heads, kL, D]; head/seq strided is fine
                 (read in place), the head_dim must be contiguous.
-            v (array): values [B, n_kv_heads, kL, 64].
-            scale (float): query scale (typically 1/sqrt(64)).
+            v (array): values [B, n_kv_heads, kL, D].
+            scale (float): query scale (typically 1/sqrt(D)).
             sinks (array, optional): per-q-head attention sinks, shape
                 [n_q_heads] -- an extra softmax logit with no value row.
-            splits (int): key-axis split count; 0 picks the default (32).
-            tile_c (int): staged tile height, 32 or 16. Default 32.
+            splits (int): key-axis split count; 0 picks the default.
+            tile_c (int): staged tile height, 8/16/32; 0 (default) picks by
+                head_dim (32 up to D=128, 16 at D=256, 8 at D=512).
 
         Returns:
-            array: attention output [B, n_q_heads, 1, 64].
+            array: attention output [B, n_q_heads, 1, D].
       )");
 
   m.def(

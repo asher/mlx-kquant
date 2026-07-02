@@ -398,9 +398,11 @@ mx::array sdpa_decode_gqa(
         "[mlx_kquant.sdpa_decode_gqa] q, k, v must be 4-D [B, heads, L, D].");
   }
   int D = q.shape(-1);
-  if (D != 64 || v.shape(-1) != D || k.shape(-1) != D) {
+  if ((D != 64 && D != 128 && D != 256 && D != 512) || v.shape(-1) != D ||
+      k.shape(-1) != D) {
     throw std::invalid_argument(
-        "[mlx_kquant.sdpa_decode_gqa] only head_dim 64 is supported.");
+        "[mlx_kquant.sdpa_decode_gqa] only head_dim 64/128/256/512 is "
+        "supported.");
   }
   if (q.shape(2) != 1) {
     throw std::invalid_argument(
@@ -423,17 +425,25 @@ mx::array sdpa_decode_gqa(
         "n_kv_heads.");
   }
   int gqa_factor = n_q_heads / n_kv_heads;
-  if (gqa_factor > 8) {
+  if (gqa_factor > 16) {
     throw std::invalid_argument(
-        "[mlx_kquant.sdpa_decode_gqa] gqa_factor must be <= 8.");
+        "[mlx_kquant.sdpa_decode_gqa] gqa_factor must be <= 16.");
   }
   if (splits < 0 || splits > 128) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa] splits must be in [0, 128].");
   }
-  if (tile_c != 16 && tile_c != 32) {
+  if (tile_c == 0) {
+    tile_c = D <= 128 ? 32 : D == 256 ? 16 : 8;
+  }
+  // Instantiated (D, C) pairs: threadgroup K+V tiles cap at 16 KB so two
+  // threadgroups co-reside per core (D=64/128: C 32/16; 256: 16/8; 512: 8).
+  const bool tile_ok = (D <= 128 && (tile_c == 32 || tile_c == 16)) ||
+      (D == 256 && (tile_c == 16 || tile_c == 8)) || (D == 512 && tile_c == 8);
+  if (!tile_ok) {
     throw std::invalid_argument(
-        "[mlx_kquant.sdpa_decode_gqa] tile_c must be 16 or 32.");
+        "[mlx_kquant.sdpa_decode_gqa] tile_c not instantiated for this "
+        "head_dim (0 picks the default).");
   }
   if (k.shape(2) < 1) {
     throw std::invalid_argument(

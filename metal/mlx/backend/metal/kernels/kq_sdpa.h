@@ -184,8 +184,8 @@ template <typename T, int D>
 // Partials are float32.
 //
 // Pass-1 threadgroup: (32, gqa_factor, 1); one simdgroup per q-head of the
-// group. Grid: (n_kv_heads, B, gqa_splits). Requires gqa_factor <= 8 and
-// gqa_splits <= 128 (pass-2 scratch).
+// group. Grid: (n_kv_heads, B, gqa_splits). Requires gqa_factor <= 16
+// (512-thread threadgroup) and gqa_splits <= 128 (pass-2 scratch).
 
 template <typename T, int D, int C = 32, int NE = 4>
 [[kernel]] void kq_sdpa_gqa_2pass_1(

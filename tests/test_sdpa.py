@@ -113,6 +113,78 @@ def test_sdpa_vector_gqa(Hq, Hkv):
     _check(512, qL=4, kL=2048, dtype=mx.bfloat16, Hq=Hq, Hkv=Hkv)
 
 
+def _ref_sdpa_sinks(q, k, v, scale, sinks):
+    """f32 reference with per-q-head sink logits: an extra softmax column
+    with no value row (raises the max / adds to the denominator only)."""
+    g = q.shape[1] // k.shape[1]
+    kr = mx.repeat(k, g, axis=1).astype(mx.float32)
+    vr = mx.repeat(v, g, axis=1).astype(mx.float32)
+    s = (q.astype(mx.float32) @ kr.swapaxes(-1, -2)) * scale  # [B,Hq,1,kL]
+    if sinks is not None:
+        col = mx.broadcast_to(
+            sinks.astype(mx.float32).reshape(1, -1, 1, 1),
+            (*s.shape[:3], 1),
+        )
+        s = mx.concatenate([s, col], axis=-1)
+    w = mx.softmax(s, axis=-1)
+    if sinks is not None:
+        w = w[..., :-1]
+    return (w @ vr).astype(q.dtype)
+
+
+def _check_gqa(
+    D, kL, dtype, Hq=24, Hkv=4, tile_c=0, sinks=False, strided=False, splits=0
+):
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(1, Hq, Hkv, 1, kL, D, dtype, seed=kL + D, strided=strided)
+    sk = None
+    if sinks:
+        sk = mx.random.normal((Hq,), key=mx.random.key(D + 1)).astype(mx.float32)
+        mx.eval(sk)
+    got = kq.sdpa_decode_gqa(q, k, v, scale, sinks=sk, splits=splits, tile_c=tile_c)
+    ref = _ref_sdpa_sinks(q, k, v, scale, sk)
+    mx.eval(got, ref)
+    rel = _rel(got, ref)
+    bound = REL_BOUND[dtype]
+    print(
+        f"  [gqa] D={D} kL={kL} Hq/Hkv={Hq}/{Hkv} c={tile_c} "
+        f"sinks={sinks} {str(dtype)[9:]:>9}: rel={rel:.3e}"
+    )
+    assert rel < bound, f"D={D} kL={kL} rel {rel:.3e} >= {bound:.0e}"
+    assert got.shape == q.shape
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize(
+    "D,tile_c",
+    [(64, 32), (64, 16), (128, 32), (128, 16), (256, 16), (256, 8), (512, 8)],
+)
+def test_sdpa_decode_gqa(D, tile_c, dtype):
+    _check_gqa(D, kL=4096, dtype=dtype, tile_c=tile_c)
+
+
+@pytest.mark.parametrize("Hq,Hkv", [(24, 4), (16, 4), (32, 8), (8, 8)])
+def test_sdpa_decode_gqa_factors(Hq, Hkv):
+    _check_gqa(256, kL=2048, dtype=mx.bfloat16, Hq=Hq, Hkv=Hkv)
+
+
+@pytest.mark.parametrize("Hq,Hkv,D", [(16, 1, 512), (32, 4, 512)])
+def test_sdpa_decode_gqa_wide_factor(Hq, Hkv, D):
+    # gemma-4 12b/31b global-layer geometry (gqa 16 / 8 at hd512)
+    _check_gqa(D, kL=2048, dtype=mx.bfloat16, Hq=Hq, Hkv=Hkv)
+
+
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
+def test_sdpa_decode_gqa_sinks(D):
+    _check_gqa(D, kL=2048, dtype=mx.bfloat16, sinks=True)
+
+
+@pytest.mark.parametrize("D", [64, 256, 512])
+def test_sdpa_decode_gqa_strided_unaligned(D):
+    # strided KV-cache prefix + a key length off every tile/split boundary
+    _check_gqa(D, kL=3071, dtype=mx.bfloat16, strided=True, splits=16)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--d", type=int, default=512)
