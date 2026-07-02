@@ -434,6 +434,82 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "add_rmsnorm",
+      &mlx_kquant::add_rmsnorm,
+      "h"_a,
+      "residual"_a,
+      "weight"_a,
+      "eps"_a,
+      "scale"_a = nb::none(),
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused post-norm residual: (residual + rms_norm(h, weight)) * scale
+        in one dispatch, all math in f32.
+
+        Args:
+            h (array): [..., D], float16/bfloat16.
+            residual (array): same shape and dtype as h.
+            weight (array): [D] norm weight, same dtype as h.
+            eps (float): rms_norm epsilon.
+            scale (array, optional): size-1 epilogue scalar, same dtype as
+                h; 1.0 when absent.
+
+        Returns:
+            array: same shape and dtype as h.
+      )");
+
+  m.def(
+      "rmsnorm_multi3",
+      &mlx_kquant::rmsnorm_multi3,
+      "x"_a,
+      "w0"_a,
+      "w1"_a,
+      "w2"_a,
+      "eps"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Three rms_norms of one tensor in one dispatch, sharing the
+        mean-square reduction of x.
+
+        Args:
+            x (array): [..., D], float16/bfloat16.
+            w0 (array): [D] norm weight, same dtype as x.
+            w1 (array): [D] norm weight, same dtype as x.
+            w2 (array): [D] norm weight, same dtype as x.
+            eps (float): rms_norm epsilon.
+
+        Returns:
+            tuple: (rms_norm(x, w0), rms_norm(x, w1), rms_norm(x, w2)).
+      )");
+
+  m.def(
+      "rmsnorm2_add",
+      &mlx_kquant::rmsnorm2_add,
+      "a"_a,
+      "wa"_a,
+      "b"_a,
+      "wb"_a,
+      "eps"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused branch merge: rms_norm(a, wa) + rms_norm(b, wb) in one
+        dispatch, all math in f32.
+
+        Args:
+            a (array): [..., D], float16/bfloat16.
+            wa (array): [D] norm weight, same dtype as a.
+            b (array): same shape and dtype as a.
+            wb (array): [D] norm weight, same dtype as a.
+            eps (float): rms_norm epsilon.
+
+        Returns:
+            array: same shape and dtype as a.
+      )");
+
+  m.def(
       "gather_qmm",
       &mlx_kquant::gather_qmm,
       "x"_a,

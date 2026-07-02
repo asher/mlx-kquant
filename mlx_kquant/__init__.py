@@ -22,6 +22,7 @@ Current API:
 import mlx.core as _mx  # noqa: F401
 
 from ._ext import (  # noqa: F401
+    add_rmsnorm,
     codecs,
     cpu_neon_available,
     dequantize,
@@ -40,6 +41,8 @@ from ._ext import (  # noqa: F401
     quantize,
     quantized_matmul,
     quantized_matmul_qmv_bias,
+    rmsnorm2_add,
+    rmsnorm_multi3,
     sdpa_decode_gqa,
     sdpa_vector,
 )
@@ -47,6 +50,7 @@ from ._version import __version__
 
 __all__ = [
     "__version__",
+    "add_rmsnorm",
     "codecs",
     "cpu_neon_available",
     "dequantize",
@@ -65,6 +69,8 @@ __all__ = [
     "quantize",
     "quantized_matmul",
     "quantized_matmul_qmv_bias",
+    "rmsnorm2_add",
+    "rmsnorm_multi3",
     "sdpa_decode_gqa",
     "sdpa_vector",
 ]

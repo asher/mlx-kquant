@@ -248,6 +248,40 @@ std::vector<mx::array> moe_router_topk(
     const std::optional<mx::array>& per_expert_scale = std::nullopt,
     mx::StreamOrDevice s = {});
 
+// Fused residual + RMSNorm glue (one dispatch each; see kq_norm_fused.h).
+// rms_norm(x, w) = w * x * rsqrt(mean(x^2) + eps) over the last axis, all
+// math in f32, matching mx::fast::rms_norm. float16/bfloat16 only; weights
+// (and the optional scale) must match the activation dtype. Metal-only.
+
+// out = (residual + rms_norm(h, weight)) * scale; scale is an optional
+// size-1 array (gemma-4's layer_scalar), 1.0 when absent.
+mx::array add_rmsnorm(
+    mx::array h,
+    mx::array residual,
+    mx::array weight,
+    float eps,
+    const std::optional<mx::array>& scale = std::nullopt,
+    mx::StreamOrDevice s = {});
+
+// {rms_norm(x, w0), rms_norm(x, w1), rms_norm(x, w2)} sharing one
+// mean-square reduction of x.
+std::vector<mx::array> rmsnorm_multi3(
+    mx::array x,
+    mx::array w0,
+    mx::array w1,
+    mx::array w2,
+    float eps,
+    mx::StreamOrDevice s = {});
+
+// out = rms_norm(a, wa) + rms_norm(b, wb).
+mx::array rmsnorm2_add(
+    mx::array a,
+    mx::array wa,
+    mx::array b,
+    mx::array wb,
+    float eps,
+    mx::StreamOrDevice s = {});
+
 // ----------------------------- primitives -----------------------------
 
 // Dequantize a single uint8 K-quant wire-byte tensor. Inference-only:
@@ -663,6 +697,85 @@ class KQuantMoERouterTopK : public mx::Primitive {
   bool norm_;
   bool shared_;
   bool has_pes_;
+};
+
+// Fused (residual + rms_norm(h, w)) * scale (see add_rmsnorm).
+// Inference-only.
+class KQuantAddRMSNorm : public mx::Primitive {
+ public:
+  explicit KQuantAddRMSNorm(mx::Stream stream, float eps, bool has_scale)
+      : mx::Primitive(stream), eps_(eps), has_scale_(has_scale) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantAddRMSNorm";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float eps_;
+  bool has_scale_;
+};
+
+// Three rms_norms of one tensor sharing the reduction (see rmsnorm_multi3).
+// Inference-only.
+class KQuantRMSNormMulti3 : public mx::Primitive {
+ public:
+  explicit KQuantRMSNormMulti3(mx::Stream stream, float eps)
+      : mx::Primitive(stream), eps_(eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantRMSNormMulti3";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float eps_;
+};
+
+// rms_norm(a, wa) + rms_norm(b, wb) in one dispatch (see rmsnorm2_add).
+// Inference-only.
+class KQuantRMSNorm2Add : public mx::Primitive {
+ public:
+  explicit KQuantRMSNorm2Add(mx::Stream stream, float eps)
+      : mx::Primitive(stream), eps_(eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantRMSNorm2Add";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float eps_;
 };
 
 // Gather (MoE) quantized matmul. vjp implements only the gradient wrt x (a
