@@ -704,3 +704,124 @@ template <typename T>
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Router top-k (codec-independent float kernel): softmax over E logits, pick
+// the top R (min-index tie-break), emit gather-ready indices [T, R] uint32 and
+// mix scores [T, R + 1] float32 in one dispatch. Column E of each logits row
+// is the shared-expert gate logit; its sigmoid lands in scores slot R. NORM
+// selects renormalizing the picked probabilities to sum to 1 (norm_topk_prob).
+// One threadgroup of 256 threads per token; E <= 1024, R <= 16 (host-checked).
+// ---------------------------------------------------------------------------
+#define KQ_ROUTER_MAX_E 1024
+#define KQ_ROUTER_MAX_R 16
+
+template <typename T>
+[[kernel]] void kq_moe_router_topk(
+    const device T* logits [[buffer(0)]],
+    device uint32_t* indices [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    const constant int& E [[buffer(3)]],
+    const constant int& R [[buffer(4)]],
+    const constant int& NORM [[buffer(5)]],
+    uint tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int NT = 256;
+  constexpr int NSG = NT / 32;
+  threadgroup float p[KQ_ROUTER_MAX_E];
+  threadgroup float red_v[NSG];
+  threadgroup uint red_i[NSG];
+  threadgroup float stat[2];
+  threadgroup float win_v[KQ_ROUTER_MAX_R];
+
+  const device T* lrow = logits + (int64_t)tid * (E + 1);
+
+  float m = -INFINITY;
+  for (int e = lid; e < E; e += NT) {
+    m = metal::max(m, float(lrow[e]));
+  }
+  m = simd_max(m);
+  if (simd_lid == 0) {
+    red_v[simd_gid] = m;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (lid == 0) {
+    float g = red_v[0];
+    for (int i = 1; i < NSG; i++) {
+      g = metal::max(g, red_v[i]);
+    }
+    stat[0] = g;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float gmax = stat[0];
+
+  float s = 0;
+  for (int e = lid; e < E; e += NT) {
+    const float v = metal::exp(float(lrow[e]) - gmax);
+    p[e] = v;
+    s += v;
+  }
+  s = simd_sum(s);
+  if (simd_lid == 0) {
+    red_v[simd_gid] = s;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (lid == 0) {
+    float g = 0;
+    for (int i = 0; i < NSG; i++) {
+      g += red_v[i];
+    }
+    stat[1] = g;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float gsum = stat[1];
+
+  for (int r = 0; r < R; r++) {
+    float bv = -1.0f;
+    uint bi = 0xffffffffu;
+    for (int e = lid; e < E; e += NT) {
+      const float v = p[e];
+      if (v > bv || (v == bv && uint(e) < bi)) {
+        bv = v;
+        bi = uint(e);
+      }
+    }
+    const float sv = simd_max(bv);
+    uint cand = bv == sv ? bi : 0xffffffffu;
+    cand = simd_min(cand);
+    if (simd_lid == 0) {
+      red_v[simd_gid] = sv;
+      red_i[simd_gid] = cand;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+      float wv = red_v[0];
+      uint wi = red_i[0];
+      for (int i = 1; i < NSG; i++) {
+        if (red_v[i] > wv || (red_v[i] == wv && red_i[i] < wi)) {
+          wv = red_v[i];
+          wi = red_i[i];
+        }
+      }
+      indices[(int64_t)tid * R + r] = wi;
+      win_v[r] = wv;
+      p[wi] = -1.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  if (lid == 0) {
+    float ps = 0;
+    for (int r = 0; r < R; r++) {
+      ps += win_v[r];
+    }
+    const float denom = NORM ? ps : gsum;
+    device float* srow = scores + (int64_t)tid * (R + 1);
+    for (int r = 0; r < R; r++) {
+      srow[r] = win_v[r] / denom;
+    }
+    srow[R] = 1.0f / (1.0f + metal::exp(-float(lrow[E])));
+  }
+}

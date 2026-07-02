@@ -42,4 +42,8 @@ instantiate_kq_moe_glu_kq(q6_k, bfloat16_t)
 instantiate_kq_moe_glu_kq(q6_k, float16_t)
 instantiate_kq_moe_glu_kq(q8_0, bfloat16_t)
 instantiate_kq_moe_glu_kq(q8_0, float16_t)
+
+instantiate_kernel("kq_moe_router_topk_float", kq_moe_router_topk, float)
+instantiate_kernel("kq_moe_router_topk_bfloat16_t", kq_moe_router_topk, bfloat16_t)
+instantiate_kernel("kq_moe_router_topk_float16_t", kq_moe_router_topk, float16_t)
     // clang-format on

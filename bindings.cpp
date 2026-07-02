@@ -372,6 +372,29 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "moe_router_topk",
+      &mlx_kquant::moe_router_topk,
+      "logits"_a,
+      "top_k"_a,
+      "norm_topk_prob"_a = true,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Router top-k in one dispatch: f32 softmax over the first E columns,
+        top_k selection (min-index tie-break), optional renormalization, and
+        the sigmoid of column E (the shared-expert gate logit) in the last
+        scores slot.
+
+        Args:
+            logits (array): router logits [T, E + 1]; E <= 1024.
+            top_k (int): experts per token, <= 16.
+            norm_topk_prob (bool): renormalize picked probabilities.
+
+        Returns:
+            tuple: (indices [T, top_k] uint32, scores [T, top_k + 1] float32).
+      )");
+
+  m.def(
       "gather_qmm",
       &mlx_kquant::gather_qmm,
       "x"_a,

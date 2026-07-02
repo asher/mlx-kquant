@@ -215,6 +215,19 @@ mx::array gather_qmv_mix_kq(
     mx::array scores,
     mx::StreamOrDevice s = {});
 
+// Router top-k in one dispatch: logits [T, E + 1] (column E = shared-expert
+// gate logit), softmax over the first E columns in f32, pick the top_k
+// largest (min-index tie-break), optionally renormalize the picked
+// probabilities (norm_topk_prob). Returns {indices [T, top_k] uint32,
+// scores [T, top_k + 1] float32} with the sigmoid of the shared-gate logit
+// in the last scores slot -- exactly the inputs moe_glu_gather_shexp_kq and
+// gather_qmv_mix_kq consume. E <= 1024, top_k <= 16. Metal-only.
+std::vector<mx::array> moe_router_topk(
+    mx::array logits,
+    int top_k,
+    bool norm_topk_prob,
+    mx::StreamOrDevice s = {});
+
 // ----------------------------- primitives -----------------------------
 
 // Dequantize a single uint8 K-quant wire-byte tensor. Inference-only:
@@ -558,6 +571,33 @@ class KQuantGatherQMVMixKQ : public mx::Primitive {
 
  private:
   std::string kquant_type_;
+};
+
+// Router softmax + top-k + score epilogue (see moe_router_topk). Two
+// outputs (indices, scores). Inference-only.
+class KQuantMoERouterTopK : public mx::Primitive {
+ public:
+  explicit KQuantMoERouterTopK(mx::Stream stream, int top_k, bool norm)
+      : mx::Primitive(stream), top_k_(top_k), norm_(norm) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantMoERouterTopK";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int top_k_;
+  bool norm_;
 };
 
 // Gather (MoE) quantized matmul. vjp implements only the gradient wrt x (a

@@ -253,6 +253,37 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+void KQuantMoERouterTopK::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto& indices = outputs[0];
+  auto& scores = outputs[1];
+  indices.set_data(mx::allocator::malloc(indices.nbytes()));
+  scores.set_data(mx::allocator::malloc(scores.nbytes()));
+
+  const auto& logits = inputs[0];
+  int T = logits.shape(0);
+  int E = logits.shape(1) - 1;
+  int R = top_k_;
+  int NORM = norm_ ? 1 : 0;
+
+  std::string kname = "kq_moe_router_topk_" + kq_type_string(logits.dtype());
+  auto kernel = kq_get_kernel(d, kname);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(logits, 0);
+  ce.set_output_array(indices, 1);
+  ce.set_output_array(scores, 2);
+  ce.set_bytes(E, 3);
+  ce.set_bytes(R, 4);
+  ce.set_bytes(NORM, 5);
+  MTL::Size group_dims(256, 1, 1);
+  MTL::Size grid_dims(T, 1, 1);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 #else // !_METAL_
 
 void KQuantMoEGLU::eval_gpu(
@@ -290,6 +321,12 @@ void KQuantGatherQMVMixKQ::eval_gpu(
     const std::vector<mx::array>&,
     std::vector<mx::array>&) {
   throw std::runtime_error("[mlx_kquant.gather_qmv_mix_kq] requires Metal.");
+}
+
+void KQuantMoERouterTopK::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error("[mlx_kquant.moe_router_topk] requires Metal.");
 }
 
 #endif
@@ -378,6 +415,24 @@ std::vector<mx::Shape> KQuantMoEGLUShexpKQ::output_shapes(
 std::vector<mx::Shape> KQuantGatherQMVMixKQ::output_shapes(
     const std::vector<mx::array>& inputs) {
   return {{inputs[2].shape(0), inputs[0].shape(1)}};
+}
+
+void KQuantMoERouterTopK::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.moe_router_topk] has no CPU implementation.");
+}
+
+bool KQuantMoERouterTopK::is_equivalent(const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQuantMoERouterTopK&>(other);
+  return top_k_ == o.top_k_ && norm_ == o.norm_;
+}
+
+std::vector<mx::Shape> KQuantMoERouterTopK::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  int T = inputs[0].shape(0);
+  return {{T, top_k_}, {T, top_k_ + 1}};
 }
 
 std::vector<mx::Shape> KQuantGatherQMVKQ::output_shapes(
@@ -788,6 +843,41 @@ mx::array gather_qmv_mix_kq(
        std::move(x_c),
        prep_indices(indices, s),
        prep_scores(scores, s)});
+}
+
+std::vector<mx::array> moe_router_topk(
+    mx::array logits,
+    int top_k,
+    bool norm_topk_prob,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const char* op = "[mlx_kquant.moe_router_topk]";
+  if (logits.ndim() != 2) {
+    throw std::invalid_argument(
+        std::string(op) + " logits must be 2-D [T, E + 1].");
+  }
+  auto dt = logits.dtype();
+  if (dt != mx::float32 && dt != mx::float16 && dt != mx::bfloat16) {
+    throw std::invalid_argument(
+        std::string(op) + " logits must be float32/float16/bfloat16.");
+  }
+  int E = logits.shape(1) - 1;
+  if (top_k < 1 || top_k > 16 || top_k > E) {
+    throw std::invalid_argument(
+        std::string(op) + " top_k must be in [1, min(E, 16)].");
+  }
+  if (E > 1024) {
+    throw std::invalid_argument(std::string(op) + " requires E <= 1024.");
+  }
+
+  auto l_c =
+      logits.flags().row_contiguous ? logits : mx::contiguous(logits, false, s);
+  int T = l_c.shape(0);
+  return mx::array::make_arrays(
+      {{T, top_k}, {T, top_k + 1}},
+      {mx::uint32, mx::float32},
+      std::make_shared<KQuantMoERouterTopK>(s, top_k, norm_topk_prob),
+      {std::move(l_c)});
 }
 
 } // namespace mlx_kquant
