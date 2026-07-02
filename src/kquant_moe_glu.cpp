@@ -4,6 +4,9 @@
 //     in one dispatch) and gather_qmv_bias.
 //   K-quant wire bytes: moe_glu_gather_kq (gate + up + silu/gelu GLU, no
 //     biases) and gather_qmv_kq, per-codec kernels (full codec matrix).
+#include <cstdio>
+#include <cstdlib>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -35,6 +38,60 @@ inline std::string kq_gather_stem(const std::string& t, int K) {
   return t;
 }
 
+// Decode-scale launches underfill the GPU at the default mapping (8 K-lanes
+// x 8 output rows per threadgroup); widening the K-lane split (NX = 16/32
+// lanes per output row) multiplies threadgroups and shortens each K-chain.
+// Measured at t = 1 (gemma-a4b q4_k K=2816, qwen3-next q6_k K=2048): only
+// the two-stream GLU gathers (gate+up / shexp) profit -- sharing each
+// activation chunk across two weight streams keeps per-thread work high
+// enough that the extra threadgroups come free (nx16 +9% / +30% incl. the
+// tuned-q6_k swap; nx32 mixed, so the auto pick caps at 16). Single-stream
+// gathers (qmv / mix / mix_ns) are flat-to-negative under widening at every
+// measured shape and stay NX = 8. KQ_MOE_NX=8|16|32 forces a width for ALL
+// ops (A/B and tests); rows = output rows across the whole dispatch.
+inline int kq_moe_pick_nx(int64_t rows, int K, bool two_stream) {
+  // Re-read per call only when the variable exists at all (interleaved A/B
+  // flips it in-process); unset costs one static check.
+  static const bool has_env = std::getenv("KQ_MOE_NX") != nullptr;
+  if (has_env) {
+    const char* e = std::getenv("KQ_MOE_NX");
+    const int v = e == nullptr ? 0 : std::atoi(e);
+    if (v == 8 || v == 16 || v == 32) {
+      return v;
+    }
+  }
+  if (two_stream && K / 16 >= 32 && (rows * 8) / 64 < 2048) {
+    return 16;
+  }
+  return 8;
+}
+
+inline const char* kq_nx_suffix(int nx) {
+  return nx == 32 ? "_nx32" : (nx == 16 ? "_nx16" : "");
+}
+
+// KQ_MOE_NX_LOG=1: print each fused-MoE kernel name once (dispatch audit).
+inline void kq_moe_log_kname(const std::string& kname) {
+  static const bool log = std::getenv("KQ_MOE_NX_LOG") != nullptr;
+  if (!log) {
+    return;
+  }
+  static std::set<std::string> seen;
+  if (seen.insert(kname).second) {
+    std::fprintf(stderr, "[kq_moe] %s\n", kname.c_str());
+  }
+}
+
+// Wide-NX variants exist only on the generic Ext kernels; tuned q6_k/q8_0
+// uniform dispatches reroute to their "_ext" stems when a wide NX is picked.
+inline std::string kq_gather_stem_nx(const std::string& t, int K, int nx) {
+  std::string stem = kq_gather_stem(t, K);
+  if (nx > 8 && (stem == "q6_k" || stem == "q8_0")) {
+    stem += "_ext";
+  }
+  return stem;
+}
+
 } // namespace
 
 #ifdef _METAL_
@@ -64,6 +121,7 @@ void KQuantMoEGLU::eval_gpu(
   float limit = limit_;
 
   std::string kname = "kq_moe_glu_gather_" + kq_type_string(x.dtype());
+  kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -105,6 +163,7 @@ void KQuantGatherQMVBias::eval_gpu(
   int K = x.shape(-1);
 
   std::string kname = "kq_gather_qmv_bias_" + kq_type_string(x.dtype());
+  kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -139,8 +198,11 @@ void KQuantMoEGLUKQ::eval_gpu(
   int N = gw.shape(1);
   int K = x.shape(-1);
 
-  std::string kname = "kq_" + kq_gather_stem(kquant_type_, K) +
-      "_moe_glu_gather_" + act_ + "_" + kq_type_string(x.dtype());
+  const int nx = kq_moe_pick_nx((int64_t)N * R * T, K, true);
+  std::string kname = "kq_" + kq_gather_stem_nx(kquant_type_, K, nx) +
+      "_moe_glu_gather_" + act_ + kq_nx_suffix(nx) + "_" +
+      kq_type_string(x.dtype());
+  kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -152,7 +214,7 @@ void KQuantMoEGLUKQ::eval_gpu(
   ce.set_bytes(K, 5);
   ce.set_bytes(N, 6);
   MTL::Size group_dims(32, 2, 1);
-  MTL::Size grid_dims(N / 8, R, T);
+  MTL::Size grid_dims(N / (64 / nx), R, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -173,8 +235,10 @@ void KQuantGatherQMVKQ::eval_gpu(
   int N = w.shape(1);
   int K = x.shape(-1);
 
-  std::string kname = "kq_" + kq_gather_stem(kquant_type_, K) + "_gather_qmv_" +
-      kq_type_string(x.dtype());
+  const int nx = kq_moe_pick_nx((int64_t)N * R * T, K, false);
+  std::string kname = "kq_" + kq_gather_stem_nx(kquant_type_, K, nx) +
+      "_gather_qmv" + kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
+  kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -185,7 +249,7 @@ void KQuantGatherQMVKQ::eval_gpu(
   ce.set_bytes(K, 4);
   ce.set_bytes(N, 5);
   MTL::Size group_dims(32, 2, 1);
-  MTL::Size grid_dims(N / 8, R, T);
+  MTL::Size grid_dims(N / (64 / nx), R, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -210,11 +274,13 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   int K = x.shape(-1);
 
   // Mixed shexp codecs dispatch the generic "_sx_" instantiations.
+  const int nx = kq_moe_pick_nx((int64_t)N * (R + 1) * T, K, true);
   const std::string stem = shexp_type_ == kquant_type_
-      ? kq_gather_stem(kquant_type_, K)
+      ? kq_gather_stem_nx(kquant_type_, K, nx)
       : kquant_type_ + "_sx_" + shexp_type_;
-  std::string kname = "kq_" + stem + "_moe_glu_gather_shexp_" + act_ + "_" +
-      kq_type_string(x.dtype());
+  std::string kname = "kq_" + stem + "_moe_glu_gather_shexp_" + act_ +
+      kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
+  kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -228,7 +294,7 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   ce.set_bytes(K, 7);
   ce.set_bytes(N, 8);
   MTL::Size group_dims(32, 2, 1);
-  MTL::Size grid_dims(N / 8, R + 1, T);
+  MTL::Size grid_dims(N / (64 / nx), R + 1, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -252,11 +318,13 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   int K = x.shape(-1);
   (void)scores;
 
+  const int nx = kq_moe_pick_nx((int64_t)N * T, K, false);
   const std::string stem = shexp_type_ == kquant_type_
-      ? kq_gather_stem(kquant_type_, K)
+      ? kq_gather_stem_nx(kquant_type_, K, nx)
       : kquant_type_ + "_sx_" + shexp_type_;
-  std::string kname =
-      "kq_" + stem + "_gather_qmv_mix_" + kq_type_string(x.dtype());
+  std::string kname = "kq_" + stem + "_gather_qmv_mix" + kq_nx_suffix(nx) +
+      "_" + kq_type_string(x.dtype());
+  kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -270,7 +338,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   ce.set_bytes(N, 7);
   ce.set_bytes(S, 8);
   MTL::Size group_dims(32, 2, 1);
-  MTL::Size grid_dims(N / 8, 1, T);
+  MTL::Size grid_dims(N / (64 / nx), 1, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -293,8 +361,10 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   int K = x.shape(-1);
 
   // mix_ns is generic for every codec (no tuned variants) -- plain names.
-  std::string kname =
-      "kq_" + kquant_type_ + "_gather_qmv_mix_ns_" + kq_type_string(x.dtype());
+  const int nx = kq_moe_pick_nx((int64_t)N * T, K, false);
+  std::string kname = "kq_" + kquant_type_ + "_gather_qmv_mix_ns" +
+      kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
+  kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -307,7 +377,7 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   ce.set_bytes(N, 6);
   ce.set_bytes(S, 7);
   MTL::Size group_dims(32, 2, 1);
-  MTL::Size grid_dims(N / 8, 1, T);
+  MTL::Size grid_dims(N / (64 / nx), 1, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -332,6 +402,7 @@ void KQuantMoERouterTopK::eval_gpu(
   const auto& pes = has_pes_ ? inputs[1] : inputs[0];
 
   std::string kname = "kq_moe_router_topk_" + kq_type_string(logits.dtype());
+  kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
