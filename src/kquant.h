@@ -164,6 +164,29 @@ mx::array gather_qmv_bias(
     mx::array indices,
     mx::StreamOrDevice s = {});
 
+// K-quant counterpart of moe_glu_gather: gate and up expert matvecs on GGUF
+// wire bytes (n_experts, out_dims, bytes_per_row) sharing each activation
+// load, with the GLU epilogue act(g) * u fused (act: "silu" or "gelu"). No
+// biases. x [T, K], indices [T, R]. Returns [T, R, N]. Metal-only; requires
+// K % 256 == 0 and a codec with the fused kernel wired (q6_k, q8_0 today).
+mx::array moe_glu_gather_kq(
+    mx::array x,
+    mx::array gate_w,
+    mx::array up_w,
+    const std::string& kquant_type,
+    mx::array indices,
+    const std::string& act = "silu",
+    mx::StreamOrDevice s = {});
+
+// K-quant gathered matvec (down projection), same wire layout. x [T, R, K]
+// (one row per expert slot), indices [T, R]. Returns [T, R, N]. Metal-only.
+mx::array gather_qmv_kq(
+    mx::array x,
+    mx::array w,
+    const std::string& kquant_type,
+    mx::array indices,
+    mx::StreamOrDevice s = {});
+
 // ----------------------------- primitives -----------------------------
 
 // Dequantize a single uint8 K-quant wire-byte tensor. Inference-only:
@@ -393,6 +416,62 @@ class KQuantGatherQMVBias : public mx::Primitive {
     return "KQuantGatherQMVBias";
   }
   bool is_equivalent(const mx::Primitive& other) const override;
+};
+
+// K-quant fused MoE GLU gather (see moe_glu_gather_kq). Inference-only.
+class KQuantMoEGLUKQ : public mx::Primitive {
+ public:
+  explicit KQuantMoEGLUKQ(
+      mx::Stream stream,
+      std::string kquant_type,
+      std::string act)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        act_(std::move(act)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantMoEGLUKQ";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+  std::string act_;
+};
+
+// K-quant gathered matvec (see gather_qmv_kq). Inference-only.
+class KQuantGatherQMVKQ : public mx::Primitive {
+ public:
+  explicit KQuantGatherQMVKQ(mx::Stream stream, std::string kquant_type)
+      : mx::Primitive(stream), kquant_type_(std::move(kquant_type)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantGatherQMVKQ";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
 };
 
 // Gather (MoE) quantized matmul. vjp implements only the gradient wrt x (a

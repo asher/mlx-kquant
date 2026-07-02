@@ -261,6 +261,57 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "moe_glu_gather_kq",
+      &mlx_kquant::moe_glu_gather_kq,
+      "x"_a,
+      "gate_w"_a,
+      "up_w"_a,
+      "kquant_type"_a,
+      "indices"_a,
+      "act"_a = "silu",
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused MoE GLU gather for K-quant expert stacks: gate and up expert
+        matvecs share each activation load and the GLU epilogue act(g) * u is
+        applied in the same dispatch. No biases. Decode-shaped.
+
+        Args:
+            x (array): activations [T, K], float16/bfloat16. K % 256 == 0.
+            gate_w (array): uint8 wire bytes (n_experts, N, bytes_per_row).
+            up_w (array): uint8 wire bytes, same shape as gate_w.
+            kquant_type (str): codec with a fused kernel (q6_k, q8_0).
+            indices (array): expert indices [T, R].
+            act (str): 'silu' (default) or 'gelu' (tanh approx).
+
+        Returns:
+            array: activated hidden states [T, R, N] in x.dtype.
+      )");
+
+  m.def(
+      "gather_qmv_kq",
+      &mlx_kquant::gather_qmv_kq,
+      "x"_a,
+      "w"_a,
+      "kquant_type"_a,
+      "indices"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Gathered matvec for K-quant expert stacks (the MoE down projection).
+        One activation row per expert slot.
+
+        Args:
+            x (array): activations [T, R, K], float16/bfloat16. K % 256 == 0.
+            w (array): uint8 wire bytes (n_experts, N, bytes_per_row).
+            kquant_type (str): codec with a fused kernel (q6_k, q8_0).
+            indices (array): expert indices [T, R].
+
+        Returns:
+            array: output [T, R, N] in x.dtype.
+      )");
+
+  m.def(
       "gather_qmm",
       &mlx_kquant::gather_qmm,
       "x"_a,

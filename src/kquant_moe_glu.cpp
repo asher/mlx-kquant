@@ -1,11 +1,14 @@
-// Fused MoE gather ops for MLX native-fp codecs (mxfp4): moe_glu_gather
-// (gate + up matvecs + biases + clamped-SwiGLU epilogue in one dispatch) and
-// gather_qmv_bias (gathered matvec with the expert bias fused). Decode-shaped:
-// one activation row per gathered expert row. Inference-only (no CPU eval).
+// Fused MoE gather ops. Two families sharing the decode shape (one activation
+// row per gathered expert row), all inference-only (no CPU eval):
+//   mxfp4 packed layout: moe_glu_gather (gate + up + biases + clamped-SwiGLU
+//     in one dispatch) and gather_qmv_bias.
+//   K-quant wire bytes: moe_glu_gather_kq (gate + up + silu/gelu GLU, no
+//     biases) and gather_qmv_kq, per-codec kernels (q6_k, q8_0 wired).
 #include <stdexcept>
 #include <string>
 
 #include "kquant.h"
+#include "kquant_codec.h" // codec_by_name
 #include "kquant_internal.h" // kq_type_string
 
 #include "mlx/ops.h"
@@ -104,6 +107,74 @@ void KQuantGatherQMVBias::eval_gpu(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+void KQuantMoEGLUKQ::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  const auto& gw = inputs[0];
+  const auto& uw = inputs[1];
+  const auto& x = inputs[2];
+  const auto& indices = inputs[3];
+
+  int T = indices.shape(0);
+  int R = indices.shape(1);
+  int N = gw.shape(1);
+  int K = x.shape(-1);
+
+  std::string kname = "kq_" + kquant_type_ + "_moe_glu_gather_" + act_ + "_" +
+      kq_type_string(x.dtype());
+  auto kernel = kq_get_kernel(d, kname);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(gw, 0);
+  ce.set_input_array(uw, 1);
+  ce.set_input_array(x, 2);
+  ce.set_input_array(indices, 3);
+  ce.set_output_array(out, 4);
+  ce.set_bytes(K, 5);
+  ce.set_bytes(N, 6);
+  MTL::Size group_dims(32, 2, 1);
+  MTL::Size grid_dims(N / 8, R, T);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+void KQuantGatherQMVKQ::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  const auto& w = inputs[0];
+  const auto& x = inputs[1];
+  const auto& indices = inputs[2];
+
+  int T = indices.shape(0);
+  int R = indices.shape(1);
+  int N = w.shape(1);
+  int K = x.shape(-1);
+
+  std::string kname =
+      "kq_" + kquant_type_ + "_gather_qmv_" + kq_type_string(x.dtype());
+  auto kernel = kq_get_kernel(d, kname);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(w, 0);
+  ce.set_input_array(x, 1);
+  ce.set_input_array(indices, 2);
+  ce.set_output_array(out, 3);
+  ce.set_bytes(K, 4);
+  ce.set_bytes(N, 5);
+  MTL::Size group_dims(32, 2, 1);
+  MTL::Size grid_dims(N / 8, R, T);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 #else // !_METAL_
 
 void KQuantMoEGLU::eval_gpu(
@@ -116,6 +187,18 @@ void KQuantGatherQMVBias::eval_gpu(
     const std::vector<mx::array>&,
     std::vector<mx::array>&) {
   throw std::runtime_error("[mlx_kquant.gather_qmv_bias] requires Metal.");
+}
+
+void KQuantMoEGLUKQ::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error("[mlx_kquant.moe_glu_gather_kq] requires Metal.");
+}
+
+void KQuantGatherQMVKQ::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error("[mlx_kquant.gather_qmv_kq] requires Metal.");
 }
 
 #endif
@@ -141,6 +224,40 @@ bool KQuantMoEGLU::is_equivalent(const mx::Primitive& other) const {
 
 bool KQuantGatherQMVBias::is_equivalent(const mx::Primitive&) const {
   return true;
+}
+
+void KQuantMoEGLUKQ::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.moe_glu_gather_kq] has no CPU implementation.");
+}
+
+void KQuantGatherQMVKQ::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.gather_qmv_kq] has no CPU implementation.");
+}
+
+bool KQuantMoEGLUKQ::is_equivalent(const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQuantMoEGLUKQ&>(other);
+  return kquant_type_ == o.kquant_type_ && act_ == o.act_;
+}
+
+bool KQuantGatherQMVKQ::is_equivalent(const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQuantGatherQMVKQ&>(other);
+  return kquant_type_ == o.kquant_type_;
+}
+
+std::vector<mx::Shape> KQuantMoEGLUKQ::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  return {{inputs[3].shape(0), inputs[3].shape(1), inputs[0].shape(1)}};
+}
+
+std::vector<mx::Shape> KQuantGatherQMVKQ::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  return {{inputs[2].shape(0), inputs[2].shape(1), inputs[0].shape(1)}};
 }
 
 std::vector<mx::Shape> KQuantMoEGLU::output_shapes(
@@ -201,6 +318,51 @@ mx::array prep_bias(const mx::array& b, mx::StreamOrDevice s) {
 
 mx::array prep_indices(const mx::array& idx, mx::StreamOrDevice s) {
   return mx::contiguous(mx::astype(idx, mx::uint32, s), false, s);
+}
+
+// Codecs with the fused kq GLU/gather kernels wired (kq_moe_glu_kq.h). Grows
+// with the codec matrix; unsupported codecs must fall back to the stock path
+// per-tensor (callers gate on this via ops throwing invalid_argument).
+bool codec_has_moe_glu(const std::string& kquant_type) {
+  return kquant_type == "q6_k" || kquant_type == "q8_0";
+}
+
+// Shared validation for one K-quant wire-byte expert stack.
+void check_kq_expert_stack(
+    const char* op,
+    const mx::array& w,
+    const std::string& kquant_type,
+    int K) {
+  const KQuantCodec* codec = codec_by_name(kquant_type);
+  if (codec == nullptr || !codec_has_moe_glu(kquant_type)) {
+    throw std::invalid_argument(
+        std::string(op) + " codec '" + kquant_type +
+        "' has no fused MoE kernel.");
+  }
+  if (w.ndim() != 3 || w.dtype() != mx::uint8) {
+    throw std::invalid_argument(
+        std::string(op) +
+        " expert weights must be uint8 [E, N, bytes_per_row].");
+  }
+  const int64_t bpr =
+      (int64_t)K / codec->weights_per_block * codec->bytes_per_block;
+  if (K % codec->weights_per_block != 0 || w.shape(2) != bpr) {
+    throw std::invalid_argument(
+        std::string(op) + " weight trailing dim does not match K for '" +
+        kquant_type + "'.");
+  }
+  if (K % 256 != 0) {
+    throw std::invalid_argument(
+        std::string(op) + " requires K % 256 == 0 (fast-path mapping).");
+  }
+  if (w.shape(1) % 8 != 0) {
+    throw std::invalid_argument(
+        std::string(op) + " N must be a multiple of 8.");
+  }
+  if (!w.flags().row_contiguous) {
+    throw std::invalid_argument(
+        std::string(op) + " weights must be row-contiguous.");
+  }
 }
 
 } // namespace
@@ -293,6 +455,86 @@ mx::array gather_qmv_bias(
        prep_bias(bias, s),
        std::move(x_c),
        prep_indices(indices, s)});
+}
+
+mx::array moe_glu_gather_kq(
+    mx::array x,
+    mx::array gate_w,
+    mx::array up_w,
+    const std::string& kquant_type,
+    mx::array indices,
+    const std::string& act,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  if (x.ndim() != 2) {
+    throw std::invalid_argument(
+        "[mlx_kquant.moe_glu_gather_kq] x must be 2-D [T, K].");
+  }
+  if (indices.ndim() != 2 || indices.shape(0) != x.shape(0)) {
+    throw std::invalid_argument(
+        "[mlx_kquant.moe_glu_gather_kq] indices must be [T, R].");
+  }
+  auto dt = x.dtype();
+  if (dt != mx::float16 && dt != mx::bfloat16) {
+    throw std::invalid_argument(
+        "[mlx_kquant.moe_glu_gather_kq] x must be float16 or bfloat16.");
+  }
+  if (act != "silu" && act != "gelu") {
+    throw std::invalid_argument(
+        "[mlx_kquant.moe_glu_gather_kq] act must be 'silu' or 'gelu'.");
+  }
+  int K = x.shape(1);
+  check_kq_expert_stack(
+      "[mlx_kquant.moe_glu_gather_kq]", gate_w, kquant_type, K);
+  check_kq_expert_stack("[mlx_kquant.moe_glu_gather_kq]", up_w, kquant_type, K);
+  if (gate_w.shape(0) != up_w.shape(0) || gate_w.shape(1) != up_w.shape(1)) {
+    throw std::invalid_argument(
+        "[mlx_kquant.moe_glu_gather_kq] gate/up expert shapes must match.");
+  }
+
+  auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  mx::Shape out_shape = {x.shape(0), indices.shape(1), gate_w.shape(1)};
+  return mx::array(
+      std::move(out_shape),
+      dt,
+      std::make_shared<KQuantMoEGLUKQ>(s, kquant_type, act),
+      {std::move(gate_w),
+       std::move(up_w),
+       std::move(x_c),
+       prep_indices(indices, s)});
+}
+
+mx::array gather_qmv_kq(
+    mx::array x,
+    mx::array w,
+    const std::string& kquant_type,
+    mx::array indices,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  if (x.ndim() != 3) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmv_kq] x must be 3-D [T, R, K].");
+  }
+  if (indices.ndim() != 2 || indices.shape(0) != x.shape(0) ||
+      indices.shape(1) != x.shape(1)) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmv_kq] indices must be [T, R] matching x.");
+  }
+  auto dt = x.dtype();
+  if (dt != mx::float16 && dt != mx::bfloat16) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmv_kq] x must be float16 or bfloat16.");
+  }
+  int K = x.shape(2);
+  check_kq_expert_stack("[mlx_kquant.gather_qmv_kq]", w, kquant_type, K);
+
+  auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  mx::Shape out_shape = {x.shape(0), x.shape(1), w.shape(1)};
+  return mx::array(
+      std::move(out_shape),
+      dt,
+      std::make_shared<KQuantGatherQMVKQ>(s, kquant_type),
+      {std::move(w), std::move(x_c), prep_indices(indices, s)});
 }
 
 } // namespace mlx_kquant
