@@ -11,7 +11,12 @@ gguf.quants.dequantize:
     gather_qmv_kq            h_s @ D_e.T
     moe_glu_gather_shexp_kq  routed slots + shared-expert slot (last)
     gather_qmv_mix_kq        sum_s score_s * (h_s @ D_e.T)
+    gather_qmv_mix_ns_kq     same, no shared expert (all S slots routed)
     moe_router_topk          f32 softmax + top-k + norm + shared-gate sigmoid
+                             (+ shared_gate=False / per_expert_scale arms)
+
+The q8_0 row also runs at K=352 (K % 256 != 0) to cover the generic-uniform
+q8_0_ext dispatch stem (gemma-4-a4b down-proj geometry class).
 
 Mixed-codec shared experts (the UD-style upcast) are covered by pairing every
 expert codec with a q8_0 shexp, plus the q8_0-experts/q6_k-shexp reverse.
@@ -89,14 +94,14 @@ def _synth_iq_wire(rng, bpb, n_blocks):
     return wire
 
 
-def _wire_and_ref(codec, seed=11):
-    """Return (wire uint8[E, N, packed], ref float32[E, N, K]) or (None, None)
-    when a K-quant fixture is missing."""
+def _wire_and_ref(codec, seed=11, k=K):
+    """Return (wire uint8[E, N, packed], ref float32[E, N, k]) or (None, None)
+    when a K-quant fixture is missing. k only varies for synthesized codecs."""
     gtype, wpb, bpb, is_kq = CODECS[codec]
     if codec.startswith("iq"):
         rng = np.random.default_rng(seed)
         wires = [
-            _synth_iq_wire(rng, bpb, N * (K // wpb)).reshape(N, (K // wpb) * bpb)
+            _synth_iq_wire(rng, bpb, N * (k // wpb)).reshape(N, (k // wpb) * bpb)
             for _ in range(E)
         ]
         refs = [quants.dequantize(np.ascontiguousarray(w), gtype) for w in wires]
@@ -115,7 +120,7 @@ def _wire_and_ref(codec, seed=11):
     rng = np.random.default_rng(seed)
     wires, refs = [], []
     for _ in range(E):
-        we = rng.standard_normal((N, K)).astype(np.float32) * 0.1
+        we = rng.standard_normal((N, k)).astype(np.float32) * 0.1
         wq = quants.quantize(we, gtype).astype(np.uint8)
         wires.append(wq)
         refs.append(quants.dequantize(np.ascontiguousarray(wq), gtype))
@@ -134,17 +139,17 @@ def _rel(got, ref):
     return float(np.linalg.norm(g - ref) / (np.linalg.norm(ref) + 1e-6))
 
 
-def _check_codec(codec, sx=None, act="silu", dtype=mx.float16):
-    """Run all four gather ops for one (expert codec, shexp codec) pair.
+def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K):
+    """Run all five gather ops for one (expert codec, shexp codec) pair.
     Returns list of (name, rel, ok)."""
     scodec = sx or codec
-    wire, ref = _wire_and_ref(codec)
+    wire, ref = _wire_and_ref(codec, k=k)
     if wire is None:
         return None
     if scodec == codec:
         swire, sref = wire, ref
     else:
-        swire, sref = _wire_and_ref(scodec, seed=13)
+        swire, sref = _wire_and_ref(scodec, seed=13, k=k)
         if swire is None:
             return None
     rng = np.random.default_rng(0)
@@ -153,7 +158,7 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16):
     sgw, suw, sdw = mx.array(swire[2]), mx.array(swire[3]), mx.array(swire[1])
     sg_ref, su_ref, sd_ref = sref[2], sref[3], sref[1]
 
-    x_np = (rng.standard_normal((T, K)) * 0.1).astype(np.float16)
+    x_np = (rng.standard_normal((T, k)) * 0.1).astype(np.float16)
     x = mx.array(x_np).astype(dtype)
     xf = np.array(x.astype(mx.float32))  # exactly what the kernel reads
     inds_np = rng.integers(0, E, size=(T, R)).astype(np.uint32)
@@ -184,7 +189,7 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16):
     out.append(("glu", rel, rel < REL_BOUND))
 
     # gather_qmv_kq
-    h_np = (rng.standard_normal((T, R, K)) * 0.1).astype(np.float16)
+    h_np = (rng.standard_normal((T, R, k)) * 0.1).astype(np.float16)
     h = mx.array(h_np).astype(dtype)
     hf = np.array(h.astype(mx.float32))
     got = kq.gather_qmv_kq(h, dw, codec, inds)
@@ -234,7 +239,7 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16):
 
     # gather_qmv_mix_kq (shexp codec = scodec)
     S = R + 1
-    hs_np = (rng.standard_normal((T, S, K)) * 0.1).astype(np.float16)
+    hs_np = (rng.standard_normal((T, S, k)) * 0.1).astype(np.float16)
     hs = mx.array(hs_np).astype(dtype)
     hsf = np.array(hs.astype(mx.float32))
     sc_np = rng.uniform(0.05, 0.9, size=(T, S)).astype(np.float32)
@@ -259,6 +264,20 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16):
     )
     rel = _rel(got, r)
     out.append(("mix", rel, rel < REL_BOUND))
+
+    # gather_qmv_mix_ns_kq: all S slots routed (gemma-style, no shared expert)
+    inds_ns_np = rng.integers(0, E, size=(T, S)).astype(np.uint32)
+    got = kq.gather_qmv_mix_ns_kq(hs, dw, codec, mx.array(inds_ns_np), sc)
+    mx.eval(got)
+    r = np.stack(
+        [
+            sum(sc_np[t, s] * (hsf[t, s] @ ref[inds_ns_np[t, s]].T) for s in range(S))
+            for t in range(T)
+        ],
+        0,
+    )
+    rel = _rel(got, r)
+    out.append(("mix_ns", rel, rel < REL_BOUND))
     return out
 
 
@@ -284,6 +303,33 @@ def _check_router():
             sig = 1.0 / (1.0 + np.exp(-logits_np[t, e]))
             if abs(float(np.array(sc)[t, r]) - sig) > 1e-5:
                 fails.append(f"E={e} R={r} t={t} shared gate")
+    # shared_gate=False + per_expert_scale (gemma routing epilogue)
+    for e, r in ((128, 8), (16, 4)):
+        logits_np = rng.standard_normal((5, e)).astype(np.float32)
+        pes_np = rng.uniform(0.5, 1.5, e).astype(np.float32)
+        inds, sc = kq.moe_router_topk(
+            mx.array(logits_np),
+            r,
+            True,
+            shared_gate=False,
+            per_expert_scale=mx.array(pes_np),
+        )
+        mx.eval(inds, sc)
+        if sc.shape != (5, r):
+            fails.append(f"E={e} R={r} no-shared scores shape {sc.shape}")
+            continue
+        p = np.exp(logits_np - logits_np.max(-1, keepdims=True))
+        p /= p.sum(-1, keepdims=True)
+        top = np.argsort(-p, axis=-1, kind="stable")[:, :r]
+        got_i = np.array(inds)
+        for t in range(5):
+            if set(got_i[t]) != set(top[t]):
+                fails.append(f"E={e} R={r} t={t} pes indices")
+                continue
+            pk = p[t, got_i[t]]
+            want = pk / pk.sum() * pes_np[got_i[t]]
+            if not np.allclose(np.array(sc)[t], want, rtol=1e-5, atol=1e-6):
+                fails.append(f"E={e} R={r} t={t} pes scores")
     return fails
 
 
@@ -295,24 +341,25 @@ def main(argv=None) -> int:
 
     print(f"=== test_moe_glu  E={E} N={N} K={K} T={T} R={R} ===")
     print(
-        f"  {'codec':<8} {'shexp':<8} {'act':<5} {'glu':>10} {'qmv':>10} "
-        f"{'shexp':>10} {'mix':>10} {'verdict':>8}"
+        f"  {'codec':<10} {'shexp':<8} {'act':<5} {'glu':>10} {'qmv':>10} "
+        f"{'shexp':>10} {'mix':>10} {'mix_ns':>10} {'verdict':>8}"
     )
     fails, missing = 0, []
 
-    def run(codec, sx=None, act="silu", dtype=mx.float16):
+    def run(codec, sx=None, act="silu", dtype=mx.float16, k=K):
         nonlocal fails
-        res = _check_codec(codec, sx=sx, act=act, dtype=dtype)
+        res = _check_codec(codec, sx=sx, act=act, dtype=dtype, k=k)
         if res is None:
             missing.append(codec if sx is None else f"{codec}+{sx}")
             fails += 1
-            print(f"  {codec:<8} {'MISSING fixture - run gen_fixtures.py':>50}")
+            print(f"  {codec:<10} {'MISSING fixture - run gen_fixtures.py':>50}")
             return
         bad = not all(ok for _n, _r, ok in res)
         fails += bad
         cells = " ".join(f"{r:>10.3e}" for _n, r, _ok in res)
+        label = codec if k == K else f"{codec}/{k}"
         print(
-            f"  {codec:<8} {(sx or '-'):<8} {act:<5} {cells} "
+            f"  {label:<10} {(sx or '-'):<8} {act:<5} {cells} "
             f"{'FAIL' if bad else 'ok':>8}"
         )
 
@@ -324,6 +371,7 @@ def main(argv=None) -> int:
             run(codec, sx="q8_0")  # UD-style upcast shexp
     if not allow or "q8_0" in allow:
         run("q8_0", sx="q6_k")  # reverse mixed combo
+        run("q8_0", k=352)  # K % 256 != 0 -> q8_0_ext generic-uniform stem
     if not allow or "q4_k" in allow:
         run("q4_k", act="gelu")  # gelu epilogue (gemma GeGLU)
         run("q4_k", dtype=mx.bfloat16)  # bf16 activations

@@ -78,9 +78,20 @@ instantiate_kq_moe_glu_kq(q8_0, float16_t)
       "kq_" #codec "_sx_" #scodec "_gather_qmv_mix_" #type,                   \
       kq_ext_gather_qmv_mix, type, traits, straits)
 
+// No-shared-expert mix (gemma-style weighted sum; always the generic kernel,
+// q6_k/q8_0 included).
+#define instantiate_kq_ext_mix_ns(codec, traits)                              \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_ns_bfloat16_t",                           \
+      kq_ext_gather_qmv_mix_ns, bfloat16_t, traits)                            \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_ns_float16_t",                            \
+      kq_ext_gather_qmv_mix_ns, float16_t, traits)
+
 #define instantiate_kq_ext_all(codec, traits)                                 \
   instantiate_kq_ext_uniform(codec, traits, bfloat16_t)                        \
   instantiate_kq_ext_uniform(codec, traits, float16_t)                         \
+  instantiate_kq_ext_mix_ns(codec, traits)                                     \
   instantiate_kq_ext_sx(codec, traits, q6_k, KqQ6_KExt, bfloat16_t)            \
   instantiate_kq_ext_sx(codec, traits, q6_k, KqQ6_KExt, float16_t)             \
   instantiate_kq_ext_sx(codec, traits, q8_0, KqQ8_0Ext, bfloat16_t)            \
@@ -110,6 +121,16 @@ instantiate_kq_ext_sx(q6_k, KqQ6_KExt, q8_0, KqQ8_0Ext, bfloat16_t)
 instantiate_kq_ext_sx(q6_k, KqQ6_KExt, q8_0, KqQ8_0Ext, float16_t)
 instantiate_kq_ext_sx(q8_0, KqQ8_0Ext, q6_k, KqQ6_KExt, bfloat16_t)
 instantiate_kq_ext_sx(q8_0, KqQ8_0Ext, q6_k, KqQ6_KExt, float16_t)
+
+// q6_k/q8_0 mix_ns (generic; no tuned ns kernels exist).
+instantiate_kq_ext_mix_ns(q6_k, KqQ6_KExt)
+instantiate_kq_ext_mix_ns(q8_0, KqQ8_0Ext)
+
+// Generic-uniform q8_0 fallback for K % 256 != 0 (the tuned q8_0 kernels
+// stride K in 256-wide steps; 32-weight blocks only need K % 32). Dispatched
+// under the "q8_0_ext" stem.
+instantiate_kq_ext_uniform(q8_0_ext, KqQ8_0Ext, bfloat16_t)
+instantiate_kq_ext_uniform(q8_0_ext, KqQ8_0Ext, float16_t)
 
 instantiate_kernel("kq_moe_router_topk_float", kq_moe_router_topk, float)
 instantiate_kernel("kq_moe_router_topk_bfloat16_t", kq_moe_router_topk, bfloat16_t)

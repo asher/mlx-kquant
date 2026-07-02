@@ -23,6 +23,20 @@ namespace mx = mlx::core;
 
 namespace mlx_kquant {
 
+namespace {
+
+// Tuned q6_k/q8_0 kernels stride K in 256-wide steps; the generic Ext-trait
+// kernels only need whole blocks. q6_k is structurally K % 256 == 0; q8_0 at
+// K % 256 != 0 dispatches the generic "q8_0_ext" instantiations.
+inline std::string kq_gather_stem(const std::string& t, int K) {
+  if (t == "q8_0" && K % 256 != 0) {
+    return "q8_0_ext";
+  }
+  return t;
+}
+
+} // namespace
+
 #ifdef _METAL_
 
 void KQuantMoEGLU::eval_gpu(
@@ -125,8 +139,8 @@ void KQuantMoEGLUKQ::eval_gpu(
   int N = gw.shape(1);
   int K = x.shape(-1);
 
-  std::string kname = "kq_" + kquant_type_ + "_moe_glu_gather_" + act_ + "_" +
-      kq_type_string(x.dtype());
+  std::string kname = "kq_" + kq_gather_stem(kquant_type_, K) +
+      "_moe_glu_gather_" + act_ + "_" + kq_type_string(x.dtype());
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -159,8 +173,8 @@ void KQuantGatherQMVKQ::eval_gpu(
   int N = w.shape(1);
   int K = x.shape(-1);
 
-  std::string kname =
-      "kq_" + kquant_type_ + "_gather_qmv_" + kq_type_string(x.dtype());
+  std::string kname = "kq_" + kq_gather_stem(kquant_type_, K) + "_gather_qmv_" +
+      kq_type_string(x.dtype());
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -197,7 +211,7 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
 
   // Mixed shexp codecs dispatch the generic "_sx_" instantiations.
   const std::string stem = shexp_type_ == kquant_type_
-      ? kquant_type_
+      ? kq_gather_stem(kquant_type_, K)
       : kquant_type_ + "_sx_" + shexp_type_;
   std::string kname = "kq_" + stem + "_moe_glu_gather_shexp_" + act_ + "_" +
       kq_type_string(x.dtype());
@@ -239,7 +253,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   (void)scores;
 
   const std::string stem = shexp_type_ == kquant_type_
-      ? kquant_type_
+      ? kq_gather_stem(kquant_type_, K)
       : kquant_type_ + "_sx_" + shexp_type_;
   std::string kname =
       "kq_" + stem + "_gather_qmv_mix_" + kq_type_string(x.dtype());
@@ -260,6 +274,43 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+void KQuantGatherQMVMixNSKQ::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  const auto& w = inputs[0];
+  const auto& x = inputs[1];
+  const auto& indices = inputs[2];
+  const auto& scores = inputs[3];
+
+  int T = x.shape(0);
+  int S = x.shape(1);
+  int N = w.shape(1);
+  int K = x.shape(-1);
+
+  // mix_ns is generic for every codec (no tuned variants) -- plain names.
+  std::string kname =
+      "kq_" + kquant_type_ + "_gather_qmv_mix_ns_" + kq_type_string(x.dtype());
+  auto kernel = kq_get_kernel(d, kname);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(w, 0);
+  ce.set_input_array(x, 1);
+  ce.set_input_array(indices, 2);
+  ce.set_input_array(scores, 3);
+  ce.set_output_array(out, 4);
+  ce.set_bytes(K, 5);
+  ce.set_bytes(N, 6);
+  ce.set_bytes(S, 7);
+  MTL::Size group_dims(32, 2, 1);
+  MTL::Size grid_dims(N / 8, 1, T);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 void KQuantMoERouterTopK::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
@@ -271,10 +322,14 @@ void KQuantMoERouterTopK::eval_gpu(
   scores.set_data(mx::allocator::malloc(scores.nbytes()));
 
   const auto& logits = inputs[0];
+  int SHARED = shared_ ? 1 : 0;
+  int HAS_PES = has_pes_ ? 1 : 0;
   int T = logits.shape(0);
-  int E = logits.shape(1) - 1;
+  int E = logits.shape(1) - SHARED;
   int R = top_k_;
   int NORM = norm_ ? 1 : 0;
+  // pes must be a bound buffer even when unused; logits stands in.
+  const auto& pes = has_pes_ ? inputs[1] : inputs[0];
 
   std::string kname = "kq_moe_router_topk_" + kq_type_string(logits.dtype());
   auto kernel = kq_get_kernel(d, kname);
@@ -286,6 +341,9 @@ void KQuantMoERouterTopK::eval_gpu(
   ce.set_bytes(E, 3);
   ce.set_bytes(R, 4);
   ce.set_bytes(NORM, 5);
+  ce.set_bytes(SHARED, 6);
+  ce.set_input_array(pes, 7);
+  ce.set_bytes(HAS_PES, 8);
   MTL::Size group_dims(256, 1, 1);
   MTL::Size grid_dims(T, 1, 1);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -328,6 +386,12 @@ void KQuantGatherQMVMixKQ::eval_gpu(
     const std::vector<mx::array>&,
     std::vector<mx::array>&) {
   throw std::runtime_error("[mlx_kquant.gather_qmv_mix_kq] requires Metal.");
+}
+
+void KQuantGatherQMVMixNSKQ::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error("[mlx_kquant.gather_qmv_mix_ns_kq] requires Metal.");
 }
 
 void KQuantMoERouterTopK::eval_gpu(
@@ -425,6 +489,23 @@ std::vector<mx::Shape> KQuantGatherQMVMixKQ::output_shapes(
   return {{inputs[2].shape(0), inputs[0].shape(1)}};
 }
 
+void KQuantGatherQMVMixNSKQ::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.gather_qmv_mix_ns_kq] has no CPU implementation.");
+}
+
+bool KQuantGatherQMVMixNSKQ::is_equivalent(const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQuantGatherQMVMixNSKQ&>(other);
+  return kquant_type_ == o.kquant_type_;
+}
+
+std::vector<mx::Shape> KQuantGatherQMVMixNSKQ::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  return {{inputs[1].shape(0), inputs[0].shape(1)}};
+}
+
 void KQuantMoERouterTopK::eval_cpu(
     const std::vector<mx::array>&,
     std::vector<mx::array>&) {
@@ -434,13 +515,14 @@ void KQuantMoERouterTopK::eval_cpu(
 
 bool KQuantMoERouterTopK::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMoERouterTopK&>(other);
-  return top_k_ == o.top_k_ && norm_ == o.norm_;
+  return top_k_ == o.top_k_ && norm_ == o.norm_ && shared_ == o.shared_ &&
+      has_pes_ == o.has_pes_;
 }
 
 std::vector<mx::Shape> KQuantMoERouterTopK::output_shapes(
     const std::vector<mx::array>& inputs) {
   int T = inputs[0].shape(0);
-  return {{T, top_k_}, {T, top_k_ + 1}};
+  return {{T, top_k_}, {T, top_k_ + (shared_ ? 1 : 0)}};
 }
 
 std::vector<mx::Shape> KQuantGatherQMVKQ::output_shapes(
@@ -554,10 +636,10 @@ void check_kq_expert_stack(
         std::string(op) + " weight trailing dim does not match K for '" +
         kquant_type + "'.");
   }
-  if (K % 256 != 0) {
-    throw std::invalid_argument(
-        std::string(op) + " requires K % 256 == 0 (fast-path mapping).");
-  }
+  // Whole blocks suffice: the generic Ext-trait kernels stride K in
+  // 16-weight chunks; the tuned q6_k/q8_0 kernels additionally need
+  // K % 256 == 0 and kq_gather_stem falls back to the generic q8_0_ext
+  // instantiations otherwise (q6_k's superblock IS 256).
   if (w.shape(1) % 8 != 0) {
     throw std::invalid_argument(
         std::string(op) + " N must be a multiple of 8.");
@@ -889,23 +971,67 @@ mx::array gather_qmv_mix_kq(
        prep_scores(scores, s)});
 }
 
+mx::array gather_qmv_mix_ns_kq(
+    mx::array x,
+    mx::array w,
+    const std::string& kquant_type,
+    mx::array indices,
+    mx::array scores,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const char* op = "[mlx_kquant.gather_qmv_mix_ns_kq]";
+  if (x.ndim() != 3) {
+    throw std::invalid_argument(std::string(op) + " x must be 3-D [T, S, K].");
+  }
+  int S = x.shape(1);
+  if (indices.ndim() != 2 || indices.shape(0) != x.shape(0) ||
+      indices.shape(1) != S) {
+    throw std::invalid_argument(std::string(op) + " indices must be [T, S].");
+  }
+  if (scores.ndim() != 2 || scores.shape(0) != x.shape(0) ||
+      scores.shape(1) != S) {
+    throw std::invalid_argument(std::string(op) + " scores must be [T, S].");
+  }
+  auto dt = x.dtype();
+  if (dt != mx::float16 && dt != mx::bfloat16) {
+    throw std::invalid_argument(
+        std::string(op) + " x must be float16 or bfloat16.");
+  }
+  int K = x.shape(2);
+  check_kq_expert_stack(op, w, kquant_type, K);
+
+  auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  mx::Shape out_shape = {x.shape(0), w.shape(1)};
+  return mx::array(
+      std::move(out_shape),
+      dt,
+      std::make_shared<KQuantGatherQMVMixNSKQ>(s, kquant_type),
+      {std::move(w),
+       std::move(x_c),
+       prep_indices(indices, s),
+       prep_scores(scores, s)});
+}
+
 std::vector<mx::array> moe_router_topk(
     mx::array logits,
     int top_k,
     bool norm_topk_prob,
+    bool shared_gate,
+    const std::optional<mx::array>& per_expert_scale,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.moe_router_topk]";
+  const int shared = shared_gate ? 1 : 0;
   if (logits.ndim() != 2) {
     throw std::invalid_argument(
-        std::string(op) + " logits must be 2-D [T, E + 1].");
+        std::string(op) + " logits must be 2-D [T, E + shared_gate].");
   }
   auto dt = logits.dtype();
   if (dt != mx::float32 && dt != mx::float16 && dt != mx::bfloat16) {
     throw std::invalid_argument(
         std::string(op) + " logits must be float32/float16/bfloat16.");
   }
-  int E = logits.shape(1) - 1;
+  int E = logits.shape(1) - shared;
   if (top_k < 1 || top_k > 16 || top_k > E) {
     throw std::invalid_argument(
         std::string(op) + " top_k must be in [1, min(E, 16)].");
@@ -917,11 +1043,21 @@ std::vector<mx::array> moe_router_topk(
   auto l_c =
       logits.flags().row_contiguous ? logits : mx::contiguous(logits, false, s);
   int T = l_c.shape(0);
+  std::vector<mx::array> inputs = {std::move(l_c)};
+  if (per_expert_scale.has_value()) {
+    const auto& pes = *per_expert_scale;
+    if (pes.ndim() != 1 || pes.shape(0) != E) {
+      throw std::invalid_argument(
+          std::string(op) + " per_expert_scale must be 1-D [E].");
+    }
+    inputs.push_back(prep_scores(pes, s));
+  }
   return mx::array::make_arrays(
-      {{T, top_k}, {T, top_k + 1}},
+      {{T, top_k}, {T, top_k + shared}},
       {mx::uint32, mx::float32},
-      std::make_shared<KQuantMoERouterTopK>(s, top_k, norm_topk_prob),
-      {std::move(l_c)});
+      std::make_shared<KQuantMoERouterTopK>(
+          s, top_k, norm_topk_prob, shared_gate, per_expert_scale.has_value()),
+      std::move(inputs));
 }
 
 } // namespace mlx_kquant

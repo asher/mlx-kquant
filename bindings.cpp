@@ -378,26 +378,59 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "gather_qmv_mix_ns_kq",
+      &mlx_kquant::gather_qmv_mix_ns_kq,
+      "x"_a,
+      "w"_a,
+      "kquant_type"_a,
+      "indices"_a,
+      "scores"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Gathered down projection with the routing mix folded in, no shared
+        expert: each of the S routed slots is accumulated in f32 weighted by
+        its score, replacing gather + (y * scores).sum.
+
+        Args:
+            x (array): activations [T, S, K], float16/bfloat16.
+            w (array): uint8 wire bytes (n_experts, N, bytes_per_row).
+            kquant_type (str): expert codec with a fused kernel.
+            indices (array): expert indices [T, S].
+            scores (array): mix weights [T, S]; cast to float32.
+
+        Returns:
+            array: mixed output [T, N] in x.dtype.
+      )");
+
+  m.def(
       "moe_router_topk",
       &mlx_kquant::moe_router_topk,
       "logits"_a,
       "top_k"_a,
       "norm_topk_prob"_a = true,
+      "shared_gate"_a = true,
+      "per_expert_scale"_a = nb::none(),
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
         Router top-k in one dispatch: f32 softmax over the first E columns,
-        top_k selection (min-index tie-break), optional renormalization, and
-        the sigmoid of column E (the shared-expert gate logit) in the last
-        scores slot.
+        top_k selection (min-index tie-break), optional renormalization, an
+        optional per-expert scale applied to the picked scores, and (when
+        shared_gate) the sigmoid of column E (the shared-expert gate logit)
+        in the last scores slot.
 
         Args:
-            logits (array): router logits [T, E + 1]; E <= 1024.
+            logits (array): router logits [T, E + shared_gate]; E <= 1024.
             top_k (int): experts per token, <= 16.
             norm_topk_prob (bool): renormalize picked probabilities.
+            shared_gate (bool): logits carry a trailing shared-gate column.
+            per_expert_scale (array, optional): [E] multiplier on picked
+                scores, applied after renormalization; cast to float32.
 
         Returns:
-            tuple: (indices [T, top_k] uint32, scores [T, top_k + 1] float32).
+            tuple: (indices [T, top_k] uint32,
+            scores [T, top_k + shared_gate] float32).
       )");
 
   m.def(

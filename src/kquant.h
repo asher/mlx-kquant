@@ -219,17 +219,33 @@ mx::array gather_qmv_mix_kq(
     const std::string& shexp_kquant_type = "",
     mx::StreamOrDevice s = {});
 
-// Router top-k in one dispatch: logits [T, E + 1] (column E = shared-expert
-// gate logit), softmax over the first E columns in f32, pick the top_k
-// largest (min-index tie-break), optionally renormalize the picked
-// probabilities (norm_topk_prob). Returns {indices [T, top_k] uint32,
-// scores [T, top_k + 1] float32} with the sigmoid of the shared-gate logit
-// in the last scores slot -- exactly the inputs moe_glu_gather_shexp_kq and
-// gather_qmv_mix_kq consume. E <= 1024, top_k <= 16. Metal-only.
+// No-shared-expert routing mix (gemma-style MoE): x [T, S, K], indices
+// [T, S], scores [T, S]; every slot gathers from the expert stack and the
+// score-weighted sum accumulates in f32. Returns [T, N]. Metal-only.
+mx::array gather_qmv_mix_ns_kq(
+    mx::array x,
+    mx::array w,
+    const std::string& kquant_type,
+    mx::array indices,
+    mx::array scores,
+    mx::StreamOrDevice s = {});
+
+// Router top-k in one dispatch: softmax over E logit columns in f32, pick
+// the top_k largest (min-index tie-break), optionally renormalize the picked
+// probabilities (norm_topk_prob; equals softmax over the selected raw logits
+// -- the gemma router semantics). With shared_gate (qwen3-next), logits are
+// [T, E + 1], column E is the shared-expert gate logit and its sigmoid lands
+// in the last scores slot; without, logits are [T, E] and scores are
+// [T, top_k]. Optional per_expert_scale ([E] float) multiplies each picked
+// score by its expert's scale (gemma). Returns {indices [T, top_k] uint32,
+// scores float32} -- exactly the inputs moe_glu_gather_shexp_kq /
+// gather_qmv_mix*_kq consume. E <= 1024, top_k <= 16. Metal-only.
 std::vector<mx::array> moe_router_topk(
     mx::array logits,
     int top_k,
     bool norm_topk_prob,
+    bool shared_gate = true,
+    const std::optional<mx::array>& per_expert_scale = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // ----------------------------- primitives -----------------------------
@@ -586,12 +602,46 @@ class KQuantGatherQMVMixKQ : public mx::Primitive {
   std::string shexp_type_;
 };
 
+// No-shared-expert routing mix (see gather_qmv_mix_ns_kq). Inference-only.
+class KQuantGatherQMVMixNSKQ : public mx::Primitive {
+ public:
+  explicit KQuantGatherQMVMixNSKQ(mx::Stream stream, std::string kquant_type)
+      : mx::Primitive(stream), kquant_type_(std::move(kquant_type)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantGatherQMVMixNSKQ";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+};
+
 // Router softmax + top-k + score epilogue (see moe_router_topk). Two
 // outputs (indices, scores). Inference-only.
 class KQuantMoERouterTopK : public mx::Primitive {
  public:
-  explicit KQuantMoERouterTopK(mx::Stream stream, int top_k, bool norm)
-      : mx::Primitive(stream), top_k_(top_k), norm_(norm) {}
+  explicit KQuantMoERouterTopK(
+      mx::Stream stream,
+      int top_k,
+      bool norm,
+      bool shared,
+      bool has_pes)
+      : mx::Primitive(stream),
+        top_k_(top_k),
+        norm_(norm),
+        shared_(shared),
+        has_pes_(has_pes) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -611,6 +661,8 @@ class KQuantMoERouterTopK : public mx::Primitive {
  private:
   int top_k_;
   bool norm_;
+  bool shared_;
+  bool has_pes_;
 };
 
 // Gather (MoE) quantized matmul. vjp implements only the gradient wrt x (a

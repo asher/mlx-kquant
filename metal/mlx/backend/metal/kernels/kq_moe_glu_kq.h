@@ -889,6 +889,40 @@ template <typename T, typename Codec, typename SCodec, int ACT>
   }
 }
 
+// No-shared-expert mix (gemma-style MoE: plain score-weighted sum over the
+// routed slots): indices and scores are both [T, S], every slot gathers from
+// the expert stack.
+template <typename T, typename Codec>
+[[kernel]] void kq_ext_gather_qmv_mix_ns(
+    const device uint8_t* w [[buffer(0)]],
+    const device T* h [[buffer(1)]],
+    const device uint32_t* indices [[buffer(2)]],
+    const device float* scores [[buffer(3)]],
+    device T* out [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& S [[buffer(7)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const short tx = short(simd_lid % KQ_EXT_NXPSG);
+  const short ty = short(simd_lid / KQ_EXT_NXPSG);
+  const int out_row = tid.x * 8 + simd_gid * 4 + ty;
+
+  float result = 0.0f;
+  for (int slot = 0; slot < S; slot++) {
+    const int expert = int(indices[tid.z * S + slot]);
+    const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
+    result += scores[tid.z * S + slot] *
+        kq_ext_row_partial<T, Codec>(
+                  w, xs, (int64_t)expert * N + out_row, K, tx);
+  }
+  result = kq_ext_reduce8(result);
+  if (tx == 0) {
+    out[(int64_t)tid.z * N + out_row] = static_cast<T>(result);
+  }
+}
+
 template <typename T, typename Codec, typename SCodec>
 [[kernel]] void kq_ext_gather_qmv_mix(
     const device uint8_t* w [[buffer(0)]],
@@ -929,10 +963,15 @@ template <typename T, typename Codec, typename SCodec>
 // ---------------------------------------------------------------------------
 // Router top-k (codec-independent float kernel): softmax over E logits, pick
 // the top R (min-index tie-break), emit gather-ready indices [T, R] uint32 and
-// mix scores [T, R + 1] float32 in one dispatch. Column E of each logits row
-// is the shared-expert gate logit; its sigmoid lands in scores slot R. NORM
-// selects renormalizing the picked probabilities to sum to 1 (norm_topk_prob).
-// One threadgroup of 256 threads per token; E <= 1024, R <= 16 (host-checked).
+// mix scores [T, R + SHARED] float32 in one dispatch. When SHARED == 1,
+// column E of each logits row is the shared-expert gate logit and its sigmoid
+// lands in scores slot R (qwen3-next); SHARED == 0 is the plain-MoE form
+// (gemma). NORM selects renormalizing the picked probabilities to sum to 1
+// (norm_topk_prob; also exactly softmax-over-the-selected-logits, the gemma
+// router semantics). HAS_PES scales each picked score by pes[expert]
+// (gemma's learned per_expert_scale); pes may be any bound buffer when
+// HAS_PES == 0. One threadgroup of 256 threads per token; E <= 1024, R <= 16
+// (host-checked).
 // ---------------------------------------------------------------------------
 #define KQ_ROUTER_MAX_E 1024
 #define KQ_ROUTER_MAX_R 16
@@ -945,6 +984,9 @@ template <typename T>
     const constant int& E [[buffer(3)]],
     const constant int& R [[buffer(4)]],
     const constant int& NORM [[buffer(5)]],
+    const constant int& SHARED [[buffer(6)]],
+    const device float* pes [[buffer(7)]],
+    const constant int& HAS_PES [[buffer(8)]],
     uint tid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -956,8 +998,9 @@ template <typename T>
   threadgroup uint red_i[NSG];
   threadgroup float stat[2];
   threadgroup float win_v[KQ_ROUTER_MAX_R];
+  threadgroup uint win_i[KQ_ROUTER_MAX_R];
 
-  const device T* lrow = logits + (int64_t)tid * (E + 1);
+  const device T* lrow = logits + (int64_t)tid * (E + SHARED);
 
   float m = -INFINITY;
   for (int e = lid; e < E; e += NT) {
@@ -1028,6 +1071,7 @@ template <typename T>
       }
       indices[(int64_t)tid * R + r] = wi;
       win_v[r] = wv;
+      win_i[r] = wi;
       p[wi] = -1.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1039,10 +1083,16 @@ template <typename T>
       ps += win_v[r];
     }
     const float denom = NORM ? ps : gsum;
-    device float* srow = scores + (int64_t)tid * (R + 1);
+    device float* srow = scores + (int64_t)tid * (R + SHARED);
     for (int r = 0; r < R; r++) {
-      srow[r] = win_v[r] / denom;
+      float sv = win_v[r] / denom;
+      if (HAS_PES) {
+        sv *= pes[win_i[r]];
+      }
+      srow[r] = sv;
     }
-    srow[R] = 1.0f / (1.0f + metal::exp(-float(lrow[E])));
+    if (SHARED) {
+      srow[R] = 1.0f / (1.0f + metal::exp(-float(lrow[E])));
+    }
   }
 }
