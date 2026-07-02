@@ -187,6 +187,34 @@ mx::array gather_qmv_kq(
     mx::array indices,
     mx::StreamOrDevice s = {});
 
+// moe_glu_gather_kq with the block's shared expert folded in as one extra
+// slot: shexp_gate_w / shexp_up_w are single-expert 2-D wire-byte tensors
+// [N, bytes_per_row] with the same codec and shape as one expert stack row.
+// Returns [T, R + 1, N]; the last slot is the shared expert.
+mx::array moe_glu_gather_shexp_kq(
+    mx::array x,
+    mx::array gate_w,
+    mx::array up_w,
+    mx::array shexp_gate_w,
+    mx::array shexp_up_w,
+    const std::string& kquant_type,
+    mx::array indices,
+    const std::string& act = "silu",
+    mx::StreamOrDevice s = {});
+
+// Down projection with the routing mix folded in: x [T, S, K] (slot S-1 =
+// shared expert), indices [T, S-1], scores [T, S] (routed weights then the
+// sigmoid shared-expert gate). Accumulates all S slots in f32 and returns
+// [T, N] -- replaces gather + (y * scores).sum + shared add. Metal-only.
+mx::array gather_qmv_mix_kq(
+    mx::array x,
+    mx::array w,
+    mx::array shexp_w,
+    const std::string& kquant_type,
+    mx::array indices,
+    mx::array scores,
+    mx::StreamOrDevice s = {});
+
 // ----------------------------- primitives -----------------------------
 
 // Dequantize a single uint8 K-quant wire-byte tensor. Inference-only:
@@ -467,6 +495,64 @@ class KQuantGatherQMVKQ : public mx::Primitive {
 
   const char* name() const override {
     return "KQuantGatherQMVKQ";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+};
+
+// K-quant fused MoE GLU gather with shared-expert slot (see
+// moe_glu_gather_shexp_kq). Inference-only.
+class KQuantMoEGLUShexpKQ : public mx::Primitive {
+ public:
+  explicit KQuantMoEGLUShexpKQ(
+      mx::Stream stream,
+      std::string kquant_type,
+      std::string act)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        act_(std::move(act)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantMoEGLUShexpKQ";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+  std::string act_;
+};
+
+// K-quant gathered matvec with routing mix folded in (see gather_qmv_mix_kq).
+// Inference-only.
+class KQuantGatherQMVMixKQ : public mx::Primitive {
+ public:
+  explicit KQuantGatherQMVMixKQ(mx::Stream stream, std::string kquant_type)
+      : mx::Primitive(stream), kquant_type_(std::move(kquant_type)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantGatherQMVMixKQ";
   }
   bool is_equivalent(const mx::Primitive& other) const override;
 

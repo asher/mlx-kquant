@@ -22,6 +22,20 @@
   instantiate_kernel(                                                 \
       "kq_" #codec "_gather_qmv_" #type,                              \
       kq_ ## codec ## _gather_qmv,                                    \
+      type)                                                           \
+  instantiate_kernel(                                                 \
+      "kq_" #codec "_moe_glu_gather_shexp_silu_" #type,               \
+      kq_ ## codec ## _moe_glu_gather_shexp,                          \
+      type,                                                           \
+      KQ_GLU_ACT_SILU)                                                \
+  instantiate_kernel(                                                 \
+      "kq_" #codec "_moe_glu_gather_shexp_gelu_" #type,               \
+      kq_ ## codec ## _moe_glu_gather_shexp,                          \
+      type,                                                           \
+      KQ_GLU_ACT_GELU)                                                \
+  instantiate_kernel(                                                 \
+      "kq_" #codec "_gather_qmv_mix_" #type,                          \
+      kq_ ## codec ## _gather_qmv_mix,                                \
       type)
 
 instantiate_kq_moe_glu_kq(q6_k, bfloat16_t)

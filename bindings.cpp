@@ -312,6 +312,66 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "moe_glu_gather_shexp_kq",
+      &mlx_kquant::moe_glu_gather_shexp_kq,
+      "x"_a,
+      "gate_w"_a,
+      "up_w"_a,
+      "shexp_gate_w"_a,
+      "shexp_up_w"_a,
+      "kquant_type"_a,
+      "indices"_a,
+      "act"_a = "silu",
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        moe_glu_gather_kq with the block's shared expert folded in as one
+        extra slot (the last), fed by single-expert 2-D wire-byte tensors of
+        the same codec and row shape as the expert stack.
+
+        Args:
+            x (array): activations [T, K], float16/bfloat16. K % 256 == 0.
+            gate_w (array): uint8 wire bytes (n_experts, N, bytes_per_row).
+            up_w (array): uint8 wire bytes, same shape as gate_w.
+            shexp_gate_w (array): uint8 wire bytes (N, bytes_per_row).
+            shexp_up_w (array): uint8 wire bytes (N, bytes_per_row).
+            kquant_type (str): codec with a fused kernel (q6_k, q8_0).
+            indices (array): expert indices [T, R].
+            act (str): 'silu' (default) or 'gelu' (tanh approx).
+
+        Returns:
+            array: activated hidden states [T, R + 1, N] in x.dtype.
+      )");
+
+  m.def(
+      "gather_qmv_mix_kq",
+      &mlx_kquant::gather_qmv_mix_kq,
+      "x"_a,
+      "w"_a,
+      "shexp_w"_a,
+      "kquant_type"_a,
+      "indices"_a,
+      "scores"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Gathered down projection with the routing mix folded in: every slot
+        (the last being the shared expert) is accumulated in f32 weighted by
+        its score, replacing gather + (y * scores).sum + shared add.
+
+        Args:
+            x (array): activations [T, S, K], float16/bfloat16. K % 256 == 0.
+            w (array): uint8 wire bytes (n_experts, N, bytes_per_row).
+            shexp_w (array): uint8 wire bytes (N, bytes_per_row).
+            kquant_type (str): codec with a fused kernel (q6_k, q8_0).
+            indices (array): expert indices [T, S - 1].
+            scores (array): mix weights [T, S]; cast to float32.
+
+        Returns:
+            array: mixed output [T, N] in x.dtype.
+      )");
+
+  m.def(
       "gather_qmm",
       &mlx_kquant::gather_qmm,
       "x"_a,
