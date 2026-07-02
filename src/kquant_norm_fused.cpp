@@ -58,6 +58,21 @@ mx::array prep_norm_weight(
 
 #ifdef _METAL_
 
+namespace {
+
+// One threadgroup per row, sized so each thread covers 4 contiguous elements
+// (KQ_NORM_NREADS); rows wider than 4096 loop strided inside the kernel.
+MTL::Size kq_norm_group_dims(int D) {
+  int threads = (D + 3) / 4;
+  threads = ((threads + 31) / 32) * 32;
+  if (threads > 1024) {
+    threads = 1024;
+  }
+  return MTL::Size(threads, 1, 1);
+}
+
+} // namespace
+
 void KQuantAddRMSNorm::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
@@ -88,7 +103,7 @@ void KQuantAddRMSNorm::eval_gpu(
   ce.set_bytes(D, 5);
   ce.set_bytes(eps_, 6);
   ce.set_bytes(HAS_SCALE, 7);
-  MTL::Size group_dims(256, 1, 1);
+  MTL::Size group_dims = kq_norm_group_dims(D);
   MTL::Size grid_dims(T, 1, 1);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
@@ -119,7 +134,7 @@ void KQuantRMSNormMulti3::eval_gpu(
   ce.set_output_array(outputs[2], 6);
   ce.set_bytes(D, 7);
   ce.set_bytes(eps_, 8);
-  MTL::Size group_dims(256, 1, 1);
+  MTL::Size group_dims = kq_norm_group_dims(D);
   MTL::Size grid_dims(T, 1, 1);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
@@ -147,7 +162,7 @@ void KQuantRMSNorm2Add::eval_gpu(
   ce.set_output_array(out, 4);
   ce.set_bytes(D, 5);
   ce.set_bytes(eps_, 6);
-  MTL::Size group_dims(256, 1, 1);
+  MTL::Size group_dims = kq_norm_group_dims(D);
   MTL::Size grid_dims(T, 1, 1);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }

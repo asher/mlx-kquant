@@ -15,11 +15,14 @@
 //
 // All math in f32 (accumulate, normalize, add), one round to T at the write;
 // rms_norm(x, w) = w * x * rsqrt(mean(x^2) + eps), matching
-// mx::fast::rms_norm semantics. Grid: (T, 1, 1) threadgroups of (256, 1, 1);
-// rows are launch-bound at decode so scalar strided loads are fine.
+// mx::fast::rms_norm semantics. Grid: (T, 1, 1) threadgroups; the host sizes
+// the threadgroup to ceil(D / 4) so each thread reads 4 contiguous elements
+// once into registers (the stock rms_norm single-row pattern -- a scalar
+// strided two-pass loop measures ~3x the exec time and inverts the E2E win).
+// Rows wider than 4 * 1024 fall back to a strided two-pass loop.
 
-#define KQ_NORM_NT 256
-#define KQ_NORM_NSG (KQ_NORM_NT / 32)
+#define KQ_NORM_NREADS 4
+#define KQ_NORM_MAX_NSG 32
 
 template <typename T>
 [[kernel]] void kq_add_rmsnorm(
@@ -33,19 +36,38 @@ template <typename T>
     const constant int& HAS_SCALE [[buffer(7)]],
     uint tid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
+    uint ntg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  threadgroup float red[KQ_NORM_NSG];
+  threadgroup float red[KQ_NORM_MAX_NSG];
   threadgroup float stat[1];
 
   const device T* hrow = h + (int64_t)tid * D;
   const device T* rrow = residual + (int64_t)tid * D;
   device T* orow = out + (int64_t)tid * D;
+  const int nsg = (ntg + 31) / 32;
+  const bool cached = D <= int(ntg) * KQ_NORM_NREADS;
+  const int base = lid * KQ_NORM_NREADS;
 
+  float v[KQ_NORM_NREADS] = {0, 0, 0, 0};
   float ss = 0;
-  for (int i = lid; i < D; i += KQ_NORM_NT) {
-    const float v = float(hrow[i]);
-    ss += v * v;
+  if (cached) {
+    if (base + KQ_NORM_NREADS <= D) {
+      for (int j = 0; j < KQ_NORM_NREADS; j++) {
+        v[j] = float(hrow[base + j]);
+        ss += v[j] * v[j];
+      }
+    } else {
+      for (int j = 0; base + j < D; j++) {
+        v[j] = float(hrow[base + j]);
+        ss += v[j] * v[j];
+      }
+    }
+  } else {
+    for (int i = lid; i < D; i += ntg) {
+      const float x = float(hrow[i]);
+      ss += x * x;
+    }
   }
   ss = simd_sum(ss);
   if (simd_lid == 0) {
@@ -54,7 +76,7 @@ template <typename T>
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (lid == 0) {
     float g = 0;
-    for (int i = 0; i < KQ_NORM_NSG; i++) {
+    for (int i = 0; i < nsg; i++) {
       g += red[i];
     }
     stat[0] = g;
@@ -63,9 +85,16 @@ template <typename T>
   const float inv = metal::rsqrt(stat[0] / float(D) + eps);
   const float sc = HAS_SCALE ? float(lscale[0]) : 1.0f;
 
-  for (int i = lid; i < D; i += KQ_NORM_NT) {
-    const float v = float(rrow[i]) + float(w[i]) * float(hrow[i]) * inv;
-    orow[i] = static_cast<T>(v * sc);
+  if (cached) {
+    for (int j = 0; j < KQ_NORM_NREADS && base + j < D; j++) {
+      const float o = float(rrow[base + j]) + float(w[base + j]) * v[j] * inv;
+      orow[base + j] = static_cast<T>(o * sc);
+    }
+  } else {
+    for (int i = lid; i < D; i += ntg) {
+      const float o = float(rrow[i]) + float(w[i]) * float(hrow[i]) * inv;
+      orow[i] = static_cast<T>(o * sc);
+    }
   }
 }
 
@@ -82,20 +111,32 @@ template <typename T>
     const constant float& eps [[buffer(8)]],
     uint tid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
+    uint ntg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  threadgroup float red[KQ_NORM_NSG];
+  threadgroup float red[KQ_NORM_MAX_NSG];
   threadgroup float stat[1];
 
   const device T* xrow = x + (int64_t)tid * D;
   device T* o0 = out0 + (int64_t)tid * D;
   device T* o1 = out1 + (int64_t)tid * D;
   device T* o2 = out2 + (int64_t)tid * D;
+  const int nsg = (ntg + 31) / 32;
+  const bool cached = D <= int(ntg) * KQ_NORM_NREADS;
+  const int base = lid * KQ_NORM_NREADS;
 
+  float v[KQ_NORM_NREADS] = {0, 0, 0, 0};
   float ss = 0;
-  for (int i = lid; i < D; i += KQ_NORM_NT) {
-    const float v = float(xrow[i]);
-    ss += v * v;
+  if (cached) {
+    for (int j = 0; j < KQ_NORM_NREADS && base + j < D; j++) {
+      v[j] = float(xrow[base + j]);
+      ss += v[j] * v[j];
+    }
+  } else {
+    for (int i = lid; i < D; i += ntg) {
+      const float xv = float(xrow[i]);
+      ss += xv * xv;
+    }
   }
   ss = simd_sum(ss);
   if (simd_lid == 0) {
@@ -104,7 +145,7 @@ template <typename T>
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (lid == 0) {
     float g = 0;
-    for (int i = 0; i < KQ_NORM_NSG; i++) {
+    for (int i = 0; i < nsg; i++) {
       g += red[i];
     }
     stat[0] = g;
@@ -112,11 +153,20 @@ template <typename T>
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const float inv = metal::rsqrt(stat[0] / float(D) + eps);
 
-  for (int i = lid; i < D; i += KQ_NORM_NT) {
-    const float v = float(xrow[i]) * inv;
-    o0[i] = static_cast<T>(float(w0[i]) * v);
-    o1[i] = static_cast<T>(float(w1[i]) * v);
-    o2[i] = static_cast<T>(float(w2[i]) * v);
+  if (cached) {
+    for (int j = 0; j < KQ_NORM_NREADS && base + j < D; j++) {
+      const float n = v[j] * inv;
+      o0[base + j] = static_cast<T>(float(w0[base + j]) * n);
+      o1[base + j] = static_cast<T>(float(w1[base + j]) * n);
+      o2[base + j] = static_cast<T>(float(w2[base + j]) * n);
+    }
+  } else {
+    for (int i = lid; i < D; i += ntg) {
+      const float n = float(xrow[i]) * inv;
+      o0[i] = static_cast<T>(float(w0[i]) * n);
+      o1[i] = static_cast<T>(float(w1[i]) * n);
+      o2[i] = static_cast<T>(float(w2[i]) * n);
+    }
   }
 }
 
@@ -131,36 +181,51 @@ template <typename T>
     const constant float& eps [[buffer(6)]],
     uint tid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
+    uint ntg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  threadgroup float red[2 * KQ_NORM_NSG];
+  threadgroup float red[2 * KQ_NORM_MAX_NSG];
   threadgroup float stat[2];
 
   const device T* arow = a + (int64_t)tid * D;
   const device T* brow = b + (int64_t)tid * D;
   device T* orow = out + (int64_t)tid * D;
+  const int nsg = (ntg + 31) / 32;
+  const bool cached = D <= int(ntg) * KQ_NORM_NREADS;
+  const int base = lid * KQ_NORM_NREADS;
 
+  float va[KQ_NORM_NREADS] = {0, 0, 0, 0};
+  float vb[KQ_NORM_NREADS] = {0, 0, 0, 0};
   float sa = 0;
   float sb = 0;
-  for (int i = lid; i < D; i += KQ_NORM_NT) {
-    const float va = float(arow[i]);
-    const float vb = float(brow[i]);
-    sa += va * va;
-    sb += vb * vb;
+  if (cached) {
+    for (int j = 0; j < KQ_NORM_NREADS && base + j < D; j++) {
+      va[j] = float(arow[base + j]);
+      vb[j] = float(brow[base + j]);
+      sa += va[j] * va[j];
+      sb += vb[j] * vb[j];
+    }
+  } else {
+    for (int i = lid; i < D; i += ntg) {
+      const float xa = float(arow[i]);
+      const float xb = float(brow[i]);
+      sa += xa * xa;
+      sb += xb * xb;
+    }
   }
   sa = simd_sum(sa);
   sb = simd_sum(sb);
   if (simd_lid == 0) {
     red[simd_gid] = sa;
-    red[KQ_NORM_NSG + simd_gid] = sb;
+    red[KQ_NORM_MAX_NSG + simd_gid] = sb;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (lid == 0) {
     float ga = 0;
     float gb = 0;
-    for (int i = 0; i < KQ_NORM_NSG; i++) {
+    for (int i = 0; i < nsg; i++) {
       ga += red[i];
-      gb += red[KQ_NORM_NSG + i];
+      gb += red[KQ_NORM_MAX_NSG + i];
     }
     stat[0] = ga;
     stat[1] = gb;
@@ -169,9 +234,17 @@ template <typename T>
   const float inva = metal::rsqrt(stat[0] / float(D) + eps);
   const float invb = metal::rsqrt(stat[1] / float(D) + eps);
 
-  for (int i = lid; i < D; i += KQ_NORM_NT) {
-    const float v = float(wa[i]) * float(arow[i]) * inva +
-        float(wb[i]) * float(brow[i]) * invb;
-    orow[i] = static_cast<T>(v);
+  if (cached) {
+    for (int j = 0; j < KQ_NORM_NREADS && base + j < D; j++) {
+      const float o = float(wa[base + j]) * va[j] * inva +
+          float(wb[base + j]) * vb[j] * invb;
+      orow[base + j] = static_cast<T>(o);
+    }
+  } else {
+    for (int i = lid; i < D; i += ntg) {
+      const float o = float(wa[i]) * float(arow[i]) * inva +
+          float(wb[i]) * float(brow[i]) * invb;
+      orow[i] = static_cast<T>(o);
+    }
   }
 }
