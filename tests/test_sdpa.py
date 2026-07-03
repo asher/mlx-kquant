@@ -115,11 +115,17 @@ def test_sdpa_vector_gqa(Hq, Hkv):
 
 def _ref_sdpa_sinks(q, k, v, scale, sinks):
     """f32 reference with per-q-head sink logits: an extra softmax column
-    with no value row (raises the max / adds to the denominator only)."""
+    with no value row (raises the max / adds to the denominator only).
+    qL > 1 is offset-causal (query row i attends keys <= kL - qL + i)."""
     g = q.shape[1] // k.shape[1]
     kr = mx.repeat(k, g, axis=1).astype(mx.float32)
     vr = mx.repeat(v, g, axis=1).astype(mx.float32)
-    s = (q.astype(mx.float32) @ kr.swapaxes(-1, -2)) * scale  # [B,Hq,1,kL]
+    s = (q.astype(mx.float32) @ kr.swapaxes(-1, -2)) * scale  # [B,Hq,qL,kL]
+    qL, kL = q.shape[2], k.shape[2]
+    if qL > 1:
+        rows = mx.arange(kL - qL, kL).reshape(qL, 1)
+        cols = mx.arange(kL).reshape(1, kL)
+        s = mx.where(cols <= rows, s, float("-inf"))
     if sinks is not None:
         col = mx.broadcast_to(
             sinks.astype(mx.float32).reshape(1, -1, 1, 1),
@@ -133,10 +139,19 @@ def _ref_sdpa_sinks(q, k, v, scale, sinks):
 
 
 def _check_gqa(
-    D, kL, dtype, Hq=24, Hkv=4, tile_c=0, sinks=False, strided=False, splits=0
+    D,
+    kL,
+    dtype,
+    Hq=24,
+    Hkv=4,
+    tile_c=0,
+    sinks=False,
+    strided=False,
+    splits=0,
+    qL=1,
 ):
     scale = 1.0 / (D**0.5)
-    q, k, v = _make(1, Hq, Hkv, 1, kL, D, dtype, seed=kL + D, strided=strided)
+    q, k, v = _make(1, Hq, Hkv, qL, kL, D, dtype, seed=kL + D, strided=strided)
     sk = None
     if sinks:
         sk = mx.random.normal((Hq,), key=mx.random.key(D + 1)).astype(mx.float32)
@@ -147,7 +162,7 @@ def _check_gqa(
     rel = _rel(got, ref)
     bound = REL_BOUND[dtype]
     print(
-        f"  [gqa] D={D} kL={kL} Hq/Hkv={Hq}/{Hkv} c={tile_c} "
+        f"  [gqa] D={D} qL={qL} kL={kL} Hq/Hkv={Hq}/{Hkv} c={tile_c} "
         f"sinks={sinks} {str(dtype)[9:]:>9}: rel={rel:.3e}"
     )
     assert rel < bound, f"D={D} kL={kL} rel {rel:.3e} >= {bound:.0e}"
@@ -183,6 +198,36 @@ def test_sdpa_decode_gqa_sinks(D):
 def test_sdpa_decode_gqa_strided_unaligned(D):
     # strided KV-cache prefix + a key length off every tile/split boundary
     _check_gqa(D, kL=3071, dtype=mx.bfloat16, strided=True, splits=16)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
+@pytest.mark.parametrize("qL", [2, 3, 4])
+def test_sdpa_gqa_verify(D, qL, dtype):
+    # speculative-verify width: offset-causal queries share the staged tiles
+    _check_gqa(D, kL=4096, dtype=dtype, qL=qL)
+
+
+def test_sdpa_gqa_verify_gemma_geometry():
+    # gemma-4-31b global layers at verify width (gqa 8 at hd512)
+    _check_gqa(512, kL=8192, dtype=mx.bfloat16, Hq=32, Hkv=4, qL=4)
+
+
+def test_sdpa_gqa_verify_sinks():
+    _check_gqa(64, kL=2048, dtype=mx.bfloat16, sinks=True, qL=4)
+
+
+@pytest.mark.parametrize("D", [64, 512])
+def test_sdpa_gqa_verify_strided_unaligned(D):
+    _check_gqa(D, kL=3071, dtype=mx.bfloat16, strided=True, splits=16, qL=4)
+
+
+def test_sdpa_gqa_verify_short_kv():
+    # kL small enough that most splits stage zero keys and whole tiles fall
+    # beyond a query's causal limit: exercises the empty-split partials and
+    # the fully-invalid-tile guard (finite_min max would otherwise poison
+    # the sum with exp(0) terms).
+    _check_gqa(64, kL=17, dtype=mx.bfloat16, splits=16, qL=4)
 
 
 def main():

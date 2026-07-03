@@ -63,6 +63,29 @@ instantiate_kq_sdpa_gqa(float16_t, 256, 16)
 instantiate_kq_sdpa_gqa(float16_t, 256, 8)
 instantiate_kq_sdpa_gqa_ne(bfloat16_t, 512, 8, 2)
 instantiate_kq_sdpa_gqa_ne(float16_t, 512, 8, 2)
+
+// Verify-width (qL 2..4) pair variants: two queries per simdgroup, so each
+// staged element read feeds two dots (threadgroup-memory traffic halves) at
+// two query/output register sets per thread. NE mirrors the qL==1 choice.
+#define instantiate_kq_sdpa_gqa_p2(type, D, C, NE)                    \
+  instantiate_kernel(                                                 \
+      "kq_sdpa_gqa_2pass_1_" #type "_" #D "_c" #C "_p2",              \
+      kq_sdpa_gqa_2pass_1,                                            \
+      type,                                                           \
+      D,                                                              \
+      C,                                                              \
+      NE,                                                             \
+      2)
+
+instantiate_kq_sdpa_gqa_p2(bfloat16_t, 512, 8, 2)
+instantiate_kq_sdpa_gqa_p2(float16_t, 512, 8, 2)
+instantiate_kq_sdpa_gqa_p2(bfloat16_t, 256, 16, 4)
+instantiate_kq_sdpa_gqa_p2(float16_t, 256, 16, 4)
+instantiate_kq_sdpa_gqa_p2(bfloat16_t, 128, 32, 4)
+instantiate_kq_sdpa_gqa_p2(float16_t, 128, 32, 4)
+instantiate_kq_sdpa_gqa_p2(bfloat16_t, 64, 32, 4)
+instantiate_kq_sdpa_gqa_p2(float16_t, 64, 32, 4)
+
 instantiate_kq_sdpa_gqa_merge(bfloat16_t, 64)
 instantiate_kq_sdpa_gqa_merge(float16_t, 64)
 instantiate_kq_sdpa_gqa_merge(bfloat16_t, 128)

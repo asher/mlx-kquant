@@ -179,6 +179,7 @@ void KQuantSDPAGQA::eval_gpu(
 
   int B = q.shape(0);
   int n_q_heads = q.shape(1);
+  int qL = q.shape(2);
   int D = q.shape(3);
   int n_kv_heads = k.shape(1);
   int kL = k.shape(2);
@@ -200,8 +201,8 @@ void KQuantSDPAGQA::eval_gpu(
   float scale = scale_;
 
   // Coarse per-split partials (float32) + running max/sum, merged by pass 2.
-  mx::Shape part_shape = {B, n_q_heads, splits, D};
-  mx::Shape red_shape = {B, n_q_heads, splits};
+  mx::Shape part_shape = {B, n_q_heads, qL, splits, D};
+  mx::Shape red_shape = {B, n_q_heads, qL, splits};
   array partials(part_shape, mx::float32, nullptr, {});
   array sums(red_shape, mx::float32, nullptr, {});
   array maxs(red_shape, mx::float32, nullptr, {});
@@ -222,10 +223,12 @@ void KQuantSDPAGQA::eval_gpu(
   };
 
   // Pass 1: one threadgroup per (kv-head, batch, split); the whole GQA group
-  // shares each staged K/V tile.
+  // (and, at verify width, every query pair -- the threadgroup z axis) shares
+  // each staged K/V tile. qL > 1 dispatches the _p2 (two queries per
+  // simdgroup) instantiation.
   {
     std::string kname = "kq_sdpa_gqa_2pass_1_" + ts + "_" + std::to_string(D) +
-        "_c" + std::to_string(tile_c_);
+        "_c" + std::to_string(tile_c_) + (qL > 1 ? "_p2" : "");
     std::string hash = kname + "_s" + std::to_string(splits);
     auto kernel = kq_get_kernel(d, kname, hash, fc);
     ce.set_compute_pipeline_state(kernel);
@@ -241,12 +244,14 @@ void KQuantSDPAGQA::eval_gpu(
     ce.set_bytes(v_head_stride, 9);
     ce.set_bytes(v_seq_stride, 10);
     ce.set_bytes(scale, 11);
-    MTL::Size group_dims(32, gqa_factor, 1);
+    ce.set_bytes(qL, 12);
+    MTL::Size group_dims(32, gqa_factor, qL > 1 ? (qL + 1) / 2 : 1);
     MTL::Size grid_dims(n_kv_heads, B, splits);
     ce.dispatch_threadgroups(grid_dims, group_dims);
   }
 
   // Pass 2: merge the per-split partials; sinks fold into the denominator.
+  // Grid z is the query axis.
   {
     std::string kname = "kq_sdpa_gqa_2pass_2_" + ts + "_" + std::to_string(D);
     std::string hash =
@@ -262,7 +267,7 @@ void KQuantSDPAGQA::eval_gpu(
     ce.set_output_array(out, 4);
     ce.set_bytes(n_q_heads, 5);
     MTL::Size group_dims(32, 1, 1);
-    MTL::Size grid_dims(n_q_heads, B, 1);
+    MTL::Size grid_dims(n_q_heads, B, qL);
     ce.dispatch_threadgroups(grid_dims, group_dims);
   }
 }
@@ -404,9 +409,11 @@ mx::array sdpa_decode_gqa(
         "[mlx_kquant.sdpa_decode_gqa] only head_dim 64/128/256/512 is "
         "supported.");
   }
-  if (q.shape(2) != 1) {
+  int qL = q.shape(2);
+  if (qL < 1 || qL > 4) {
     throw std::invalid_argument(
-        "[mlx_kquant.sdpa_decode_gqa] decode only: query length must be 1.");
+        "[mlx_kquant.sdpa_decode_gqa] query length must be 1 (decode) "
+        "to 4 (speculative-verify width).");
   }
   auto dt = q.dtype();
   if (dt != mx::float16 && dt != mx::bfloat16) {
@@ -429,6 +436,13 @@ mx::array sdpa_decode_gqa(
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa] gqa_factor must be <= 16.");
   }
+  // Pass-1 threadgroup is 32 * gqa_factor * ceil(qL / 2) threads (Metal max
+  // 1024).
+  if (gqa_factor * ((qL + 1) / 2) > 32) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa] gqa_factor * ceil(query length / 2) "
+        "must be <= 32 (1024-thread threadgroup).");
+  }
   if (splits < 0 || splits > 128) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa] splits must be in [0, 128].");
@@ -445,9 +459,9 @@ mx::array sdpa_decode_gqa(
         "[mlx_kquant.sdpa_decode_gqa] tile_c not instantiated for this "
         "head_dim (0 picks the default).");
   }
-  if (k.shape(2) < 1) {
+  if (k.shape(2) < qL) {
     throw std::invalid_argument(
-        "[mlx_kquant.sdpa_decode_gqa] key length must be >= 1.");
+        "[mlx_kquant.sdpa_decode_gqa] key length must be >= query length.");
   }
 
   auto q_c = q.flags().row_contiguous ? q : mx::contiguous(q, false, s);

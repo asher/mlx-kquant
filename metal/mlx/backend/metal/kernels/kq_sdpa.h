@@ -183,11 +183,20 @@ template <typename T, int D>
 // (an extra softmax logit with no value row) fold into the pass-2 denominator.
 // Partials are float32.
 //
-// Pass-1 threadgroup: (32, gqa_factor, 1); one simdgroup per q-head of the
-// group. Grid: (n_kv_heads, B, gqa_splits). Requires gqa_factor <= 16
-// (512-thread threadgroup) and gqa_splits <= 128 (pass-2 scratch).
+// Pass-1 threadgroup: (32, gqa_factor, ceil(q_len / QPS)); one simdgroup per
+// q-head x QPS-query group. Grid: (n_kv_heads, B, gqa_splits). q_len is 1 at
+// decode and 2..4 at speculative-verify width: every simdgroup of the group
+// shares each staged K/V tile, so device KV traffic stays one sweep per
+// kv-head regardless of query count. QPS is the compile-time query count per
+// simdgroup: each staged element is read from threadgroup memory once and
+// dotted against QPS query slices, dividing the threadgroup-memory traffic
+// (the qL>1 bottleneck) by QPS at a cost of QPS query/output register sets
+// (QPS=2 at D=512 is ~140 floats/thread; QPS=4 spills). Verify queries are
+// the sequence's trailing positions, causally clamped
+// (key <= N - q_len + query index). Requires gqa_factor * ceil(q_len / QPS)
+// <= 32 (1024-thread threadgroup) and gqa_splits <= 128 (pass-2 scratch).
 
-template <typename T, int D, int C = 32, int NE = 4>
+template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
 [[kernel]] void kq_sdpa_gqa_2pass_1(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
@@ -201,6 +210,7 @@ template <typename T, int D, int C = 32, int NE = 4>
     const constant size_t& v_head_stride [[buffer(9)]],
     const constant size_t& v_seq_stride [[buffer(10)]],
     const constant float& scale [[buffer(11)]],
+    const constant int& q_len [[buffer(12)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -217,6 +227,8 @@ template <typename T, int D, int C = 32, int NE = 4>
   const int batch_idx = tid.y;
   const int split_idx = tid.z;
   const int gqa_factor = tptg.y;
+  const int nq = q_len; // runtime query count (tptg.z * QPS >= nq)
+  const int qz0 = tidtg.z * QPS; // first query of this simdgroup
   const int lane = tidtg.x;
   const int tx = lane % NL;
   const int ty = lane / NL;
@@ -235,23 +247,35 @@ template <typename T, int D, int C = 32, int NE = 4>
   const device T* vbase =
       values + (size_t)(batch_idx * num_kv_heads + kv_head_idx) * v_head_stride;
 
-  // Pre-scaled query slice for this lane's key-row columns.
+  // Pre-scaled query slices for this lane's key-row columns
+  // ([B, Hq, q_len, D], row-contiguous). A simdgroup past the runtime query
+  // count (odd q_len at QPS=2) zero-fills; its lanes compute but never write.
   const device T4* q4 =
-      (const device T4*)(queries + (size_t)q_batch_head_idx * D);
-  float4 qf[DP4];
-  for (short ii = 0; ii < DP4; ii++) {
-    qf[ii] = scale * float4(q4[ii * NL + tx]);
+      (const device T4*)(queries + ((size_t)q_batch_head_idx * nq + qz0) * D);
+  float4 qf[QPS][DP4];
+  int lim[QPS]; // highest key each query may attend (its causal position)
+  for (short p = 0; p < QPS; p++) {
+    const bool active = qz0 + p < nq;
+    for (short ii = 0; ii < DP4; ii++) {
+      qf[p][ii] = active ? scale * float4(q4[(size_t)p * D4 + ii * NL + tx])
+                         : float4(0);
+    }
+    lim[p] = active ? N - nq + qz0 + p : -1;
   }
 
-  float max_score = Limits<float>::finite_min;
-  float sum_exp_score = 0;
-  float4 lo[DP4];
-  for (short ii = 0; ii < DP4; ii++) {
-    lo[ii] = 0;
+  float max_score[QPS];
+  float sum_exp_score[QPS];
+  float4 lo[QPS][DP4];
+  for (short p = 0; p < QPS; p++) {
+    max_score[p] = Limits<float>::finite_min;
+    sum_exp_score[p] = 0;
+    for (short ii = 0; ii < DP4; ii++) {
+      lo[p][ii] = 0;
+    }
   }
 
-  const int flat = tidtg.y * 32 + lane;
-  const int n_threads = 32 * gqa_factor;
+  const int flat = (tidtg.z * gqa_factor + tidtg.y) * 32 + lane;
+  const int n_threads = 32 * gqa_factor * tptg.z;
 
   for (int kt = k0; kt < k1; kt += C) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -272,73 +296,109 @@ template <typename T, int D, int C = 32, int NE = 4>
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Scores: NE keys in flight, NL lanes per key, then reduce + broadcast.
-    float mqk[C / NE];
-    float m_tile = Limits<float>::finite_min;
+    // Each staged element is read once and dotted against all QPS queries.
+    float mqk[QPS][C / NE];
+    float m_tile[QPS];
+    for (short p = 0; p < QPS; p++) {
+      m_tile[p] = Limits<float>::finite_min;
+    }
     for (short cc = 0; cc < C / NE; cc++) {
-      float s = 0;
-      for (short ii = 0; ii < DP4; ii++) {
-        s += dot(float4(sK[(cc * NE + ty) * D4 + ii * NL + tx]), qf[ii]);
+      float s[QPS];
+      for (short p = 0; p < QPS; p++) {
+        s[p] = 0;
       }
-      for (short off = NL / 2; off > 0; off >>= 1) {
-        s += simd_shuffle_down(s, off);
+      for (short ii = 0; ii < DP4; ii++) {
+        const float4 kk = float4(sK[(cc * NE + ty) * D4 + ii * NL + tx]);
+        for (short p = 0; p < QPS; p++) {
+          s[p] += dot(kk, qf[p][ii]);
+        }
       }
-      s = simd_shuffle(s, NL * ty);
-      const bool valid = (kt + cc * NE + ty) < k1;
-      mqk[cc] = valid ? s : Limits<float>::finite_min;
-      m_tile = max(m_tile, mqk[cc]);
+      const int kg = kt + cc * NE + ty;
+      for (short p = 0; p < QPS; p++) {
+        for (short off = NL / 2; off > 0; off >>= 1) {
+          s[p] += simd_shuffle_down(s[p], off);
+        }
+        s[p] = simd_shuffle(s[p], NL * ty);
+        const bool valid = kg < k1 && kg <= lim[p];
+        mqk[p][cc] = valid ? s[p] : Limits<float>::finite_min;
+        m_tile[p] = max(m_tile[p], mqk[p][cc]);
+      }
     }
-    m_tile = simd_max(m_tile);
 
-    // Online softmax; each lane sums its ty-group's keys, so the simd_sum
-    // counts every key NL times.
-    const float new_max = max(max_score, m_tile);
-    const float factor = fast::exp(max_score - new_max);
-    float vs[C / NE];
-    float vsum = 0;
-    for (short cc = 0; cc < C / NE; cc++) {
-      vs[cc] = fast::exp(mqk[cc] - new_max);
-      vsum += vs[cc];
+    // Online softmax per query; each lane sums its ty-group's keys, so the
+    // simd_sum counts every key NL times. A tile entirely beyond a query's
+    // causal limit is skipped outright: with the running max still
+    // finite_min, exp(finite_min - finite_min) == 1 would poison the sum
+    // (can only happen at verify width; a decode query attends every key).
+    float vs[QPS][C / NE];
+    for (short p = 0; p < QPS; p++) {
+      m_tile[p] = simd_max(m_tile[p]);
+      if (m_tile[p] > Limits<float>::finite_min) {
+        const float new_max = max(max_score[p], m_tile[p]);
+        const float factor = fast::exp(max_score[p] - new_max);
+        float vsum = 0;
+        for (short cc = 0; cc < C / NE; cc++) {
+          vs[p][cc] = fast::exp(mqk[p][cc] - new_max);
+          vsum += vs[p][cc];
+        }
+        sum_exp_score[p] =
+            sum_exp_score[p] * factor + simd_sum(vsum) * (1.0f / NL);
+        max_score[p] = new_max;
+        for (short ii = 0; ii < DP4; ii++) {
+          lo[p][ii] *= factor;
+        }
+      } else {
+        for (short cc = 0; cc < C / NE; cc++) {
+          vs[p][cc] = 0;
+        }
+      }
     }
-    sum_exp_score = sum_exp_score * factor + simd_sum(vsum) * (1.0f / NL);
-    max_score = new_max;
 
-    for (short ii = 0; ii < DP4; ii++) {
-      lo[ii] *= factor;
-    }
     for (short cc = 0; cc < C / NE; cc++) {
       for (short ii = 0; ii < DP4; ii++) {
-        lo[ii] += float4(sV[(cc * NE + ty) * D4 + ii * NL + tx]) * vs[cc];
+        const float4 vv = float4(sV[(cc * NE + ty) * D4 + ii * NL + tx]);
+        for (short p = 0; p < QPS; p++) {
+          lo[p][ii] += vv * vs[p][cc];
+        }
       }
     }
   }
 
-  // Cross-ty reduction of the deferred output accumulator; the ty == 0 lane
+  // Cross-ty reduction of the deferred output accumulators; the ty == 0 lane
   // group holds the chunk totals.
-  for (short ii = 0; ii < DP4; ii++) {
-    for (short off = (NE / 2) * NL; off >= NL; off >>= 1) {
-      lo[ii][0] += simd_shuffle_down(lo[ii][0], off);
-      lo[ii][1] += simd_shuffle_down(lo[ii][1], off);
-      lo[ii][2] += simd_shuffle_down(lo[ii][2], off);
-      lo[ii][3] += simd_shuffle_down(lo[ii][3], off);
+  for (short p = 0; p < QPS; p++) {
+    if (qz0 + p >= nq) {
+      continue;
     }
-  }
-
-  const size_t po = ((size_t)q_batch_head_idx * gqa_splits + split_idx);
-  if (ty == 0) {
-    device float4* out4 = (device float4*)(out + po * D);
     for (short ii = 0; ii < DP4; ii++) {
-      out4[ii * NL + tx] = lo[ii];
+      for (short off = (NE / 2) * NL; off >= NL; off >>= 1) {
+        lo[p][ii][0] += simd_shuffle_down(lo[p][ii][0], off);
+        lo[p][ii][1] += simd_shuffle_down(lo[p][ii][1], off);
+        lo[p][ii][2] += simd_shuffle_down(lo[p][ii][2], off);
+        lo[p][ii][3] += simd_shuffle_down(lo[p][ii][3], off);
+      }
     }
-  }
-  if (lane == 0) {
-    sums[po] = sum_exp_score;
-    maxs[po] = max_score;
+
+    const size_t po =
+        (((size_t)q_batch_head_idx * nq + qz0 + p) * gqa_splits + split_idx);
+    if (ty == 0) {
+      device float4* out4 = (device float4*)(out + po * D);
+      for (short ii = 0; ii < DP4; ii++) {
+        out4[ii * NL + tx] = lo[p][ii];
+      }
+    }
+    if (lane == 0) {
+      sums[po] = sum_exp_score[p];
+      maxs[po] = max_score[p];
+    }
   }
 }
 
-// Merge the per-split partials; one simdgroup per (q-head, batch). Sinks are
+// Merge the per-split partials; one simdgroup per (q-head, batch, query).
+// Grid z is the query axis (1 at decode; q_len at verify width). Sinks are
 // a per-q-head extra logit with no value row: they raise the global max and
-// add exp(sink - max) to the denominator.
+// add exp(sink - max) to the denominator; a query's own sink applies at
+// every verify position identically.
 template <typename T, int D>
 [[kernel]] void kq_sdpa_gqa_2pass_2(
     const device float* partials [[buffer(0)]],
@@ -348,11 +408,13 @@ template <typename T, int D>
     device T* out [[buffer(4)]],
     const constant int& n_q_heads [[buffer(5)]],
     uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int EPT = D / 32; // output elements per lane
   const int head_idx = tid.x;
   const int batch_idx = tid.y;
-  const size_t base = (size_t)batch_idx * n_q_heads + head_idx;
+  const size_t base =
+      ((size_t)batch_idx * n_q_heads + head_idx) * tpg.z + tid.z;
 
   partials += base * gqa_splits * D;
   sums += base * gqa_splits;

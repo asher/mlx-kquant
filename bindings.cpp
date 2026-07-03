@@ -178,14 +178,16 @@ NB_MODULE(_ext, m) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
-        Decode-time (qL == 1) GQA attention tuned for long KV caches: the key
-        axis is split into a fixed number of coarse contiguous chunks and each
+        Decode/verify GQA attention tuned for long KV caches: the key axis
+        is split into a fixed number of coarse contiguous chunks and each
         chunk is streamed through threadgroup-staged K/V tiles shared by the
-        whole GQA group, so device memory reads the KV once per kv-head.
+        whole GQA group, so device memory reads the KV once per kv-head. At
+        qL 2..4 (speculative-verify width) every query also shares the staged
+        tiles, causally clamped to its own trailing position.
 
         Args:
-            q (array): queries [B, n_q_heads, 1, D], float16/bfloat16;
-                D in {64, 128, 256, 512}.
+            q (array): queries [B, n_q_heads, qL, D], float16/bfloat16;
+                qL in 1..4, D in {64, 128, 256, 512}.
             k (array): keys [B, n_kv_heads, kL, D]; head/seq strided is fine
                 (read in place), the head_dim must be contiguous.
             v (array): values [B, n_kv_heads, kL, D].
@@ -197,7 +199,7 @@ NB_MODULE(_ext, m) {
                 head_dim (32 up to D=128, 16 at D=256, 8 at D=512).
 
         Returns:
-            array: attention output [B, n_q_heads, 1, D].
+            array: attention output [B, n_q_heads, qL, D].
       )");
 
   m.def(
