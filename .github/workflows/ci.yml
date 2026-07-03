@@ -76,7 +76,7 @@ jobs:
       # (recipes.py pulls in codec_geometry through the package) but dispatch no
       # ops, so they run unconditionally - no GPU required.
       - name: Recipe tests (CPU, no GPU)
-        run: pytest -q tests/test_recipes.py
+        run: pytest -q --continue-on-collection-errors tests/test_recipes.py
 
       # Honest-badge discipline: the Metal op tests need a real GPU, and hosted
       # runners may not expose a usable one. So probe for one: run the op tests
@@ -108,7 +108,7 @@ jobs:
       # (encode/load). Asset-gated KQUANT_TEST_* tests skip without their assets.
       - name: Op + model tests (GPU)
         if: steps.gpu.outputs.available == '1'
-        run: pytest -q tests/
+        run: pytest -q --continue-on-collection-errors tests/
 
       - name: No-GPU note
         if: steps.gpu.outputs.available != '1'
@@ -197,4 +197,4 @@ jobs:
         env:
           KQUANT_FORCE_CPU: "1"
           MLX_DISABLE_COMPILE: "1"
-        run: pytest -q tests/
+        run: pytest -q --continue-on-collection-errors tests/

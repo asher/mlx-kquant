@@ -16,8 +16,22 @@ _TOOLS_HINT = (
 
 
 def require_tools() -> None:
-    """Raise ``ImportError`` with an actionable hint if ``[tools]`` is absent."""
+    """Raise ``ImportError`` with an actionable hint if ``[tools]`` is absent
+    or broken.
+
+    A present-but-broken mlx-lm raises whatever its import died on (e.g.
+    transformers 5.13 rejects mlx-lm <= 0.31.3's tokenizer registration with
+    an ``AttributeError``); surface that as a version-conflict hint instead of
+    a raw traceback from a dependency's internals.
+    """
     try:
         import mlx_lm  # noqa: F401
-    except ImportError as e:
+    except ModuleNotFoundError as e:
         raise ImportError(f"mlx-kquant: {_TOOLS_HINT}") from e
+    except Exception as e:
+        raise ImportError(
+            "mlx-kquant: mlx-lm is installed but failed to import, which "
+            "usually means an incompatible dependency version (for example "
+            "transformers 5.13 breaks mlx-lm <= 0.31.3; fix with: pip install "
+            f"'transformers<5.13'). Underlying error: {e!r}"
+        ) from e
