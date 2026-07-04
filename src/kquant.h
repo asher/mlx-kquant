@@ -133,6 +133,25 @@ mx::array sdpa_decode_gqa(
     int tile_c = 32,
     mx::StreamOrDevice s = {});
 
+// Speculative-verify attention on the GPU matrix units for a GQA-folded query
+// tile. The caller folds q [B, Hq, qL, D] -> [B, Hkv, G*qL, D] (kv-major
+// heads) and passes the original qL, so folded row r is causally clamped to
+// key <= kL - qL + (r % qL). One 32-row query tile streams each contiguous KV
+// split once (S = Q @ K^T and O += P @ V on simdgroup_matrix, float32
+// accumulators, online softmax per row); the per-split partials merge through
+// the shared kq_sdpa_gqa 2-pass reduction. Requires B == 1, q heads == kv
+// heads (folded), G*qL <= 32, qL in [2, 8], head_dim 256, kL >= qL. k/v are
+// read in place via their head/seq strides (head_dim contiguous). `splits` 0
+// picks the default. Metal-only.
+mx::array sdpa_fa_verify(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    int q_len,
+    int splits = 0,
+    mx::StreamOrDevice s = {});
+
 // Fused MoE GLU gather on the MLX packed mxfp4 layout: gate and up expert
 // matvecs (sharing each activation load), expert biases, and the clamped
 // SwiGLU epilogue out = (min(g, limit) * sigmoid(alpha * g)) * (clip(u,
@@ -463,6 +482,37 @@ class KQuantSDPAGQA : public mx::Primitive {
   float scale_;
   int splits_;
   int tile_c_;
+};
+
+// Simdgroup-matrix FA verify attention (see sdpa_fa_verify). Inference-only.
+class KQuantSDPAFAVerify : public mx::Primitive {
+ public:
+  explicit KQuantSDPAFAVerify(
+      mx::Stream stream,
+      float scale,
+      int q_len,
+      int splits)
+      : mx::Primitive(stream), scale_(scale), q_len_(q_len), splits_(splits) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSDPAFAVerify";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int q_len_;
+  int splits_;
 };
 
 // Fused MoE GLU gather (see moe_glu_gather). Inference-only.

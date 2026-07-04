@@ -2,6 +2,8 @@
 // Vector SDPA kernel instantiations for large head dims. Derived-code
 // attribution lives in kq_sdpa.h and mlx_kquant/licenses/.
 #include "mlx/backend/metal/kernels/utils.h"
+#include "mlx/backend/metal/kernels/steel/attn/loader.h"
+#include "mlx/backend/metal/kernels/steel/attn/mma.h"
 #include "mlx/backend/metal/kernels/kq_sdpa.h"
 
 #define instantiate_kq_sdpa(type, D)                                  \
@@ -85,6 +87,20 @@ instantiate_kq_sdpa_gqa_p2(bfloat16_t, 128, 32, 4)
 instantiate_kq_sdpa_gqa_p2(float16_t, 128, 32, 4)
 instantiate_kq_sdpa_gqa_p2(bfloat16_t, 64, 32, 4)
 instantiate_kq_sdpa_gqa_p2(float16_t, 64, 32, 4)
+
+// Simdgroup-matrix FA verify pass 1 (folded GQA, one 32-row Q tile); the
+// merge reuses kq_sdpa_gqa_2pass_2. head_dim 256 only for now: at 512 the
+// Q + O fragment sets are ~256 floats/thread, so a 512 instantiation needs a
+// BD-chunked (two-sweep) output accumulator first.
+#define instantiate_kq_sdpa_fa_verify(type, D)                         \
+  instantiate_kernel(                                                  \
+      "kq_sdpa_fa_verify_2pass_1_" #type "_" #D,                       \
+      kq_sdpa_fa_verify_2pass_1,                                       \
+      type,                                                            \
+      D)
+
+instantiate_kq_sdpa_fa_verify(bfloat16_t, 256)
+instantiate_kq_sdpa_fa_verify(float16_t, 256)
 
 instantiate_kq_sdpa_gqa_merge(bfloat16_t, 64)
 instantiate_kq_sdpa_gqa_merge(float16_t, 64)
