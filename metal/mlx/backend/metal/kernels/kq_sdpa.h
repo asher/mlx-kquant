@@ -423,6 +423,27 @@ struct KQExpSubOp {
   }
 };
 
+// Cooperative row-major tile staging for the FA verify kernels
+template <typename T, int BK, int D, int LDS, int NT>
+METAL_FUNC void kq_fa_stage_rows(
+    threadgroup T* dst,
+    const device T* src,
+    size_t seq_stride,
+    int rows_valid,
+    int flat_tid) {
+  using T4 = metal::vec<T, 4>;
+  constexpr int D4 = D / 4;
+  constexpr int LDS4 = LDS / 4;
+  threadgroup T4* dst4 = (threadgroup T4*)dst;
+  for (int i = flat_tid; i < BK * D4; i += NT) {
+    const int r = i / D4;
+    const int c = i - r * D4;
+    dst4[r * LDS4 + c] = r < rows_valid
+        ? ((const device T4*)(src + (size_t)r * seq_stride))[c]
+        : T4(T(0));
+  }
+}
+
 // Simdgroup-matrix (steel MMA) speculative-verify attention, pass 1. The
 // caller folds the GQA group into the query rows -- q [B, Hq, qL, D] becomes
 // [B, Hkv, G*qL, D] with kv-major heads -- so the kernel sees an MHA problem
@@ -472,17 +493,13 @@ template <typename T, int D, int BQ = 32>
   constexpr short TK = BK / kFragSize;
   constexpr short TD = D / kFragSize;
   constexpr short kPad = 16 / sizeof(T);
-  constexpr short LDK = BK + kPad; // Ks staged transposed [D][BK + pad]
-  constexpr short LDV = D + kPad; // Vs staged row-major [BK][D + pad]
-  constexpr int kSmemKV = (LDK * D > BK * LDV) ? LDK * D : BK * LDV;
+  constexpr short LDS = D + kPad; // K and V staged row-major [BK][D + pad]
 
   using MMAFrag_t = mlx::steel::BaseMMAFrag<float, kFragSize, kFragSize>;
-  using KLoader = mlx::steel::BlockLoaderT<T, BK, D, 1, LDK, 0, kNWarps * 32>;
-  using VLoader = mlx::steel::BlockLoaderT<T, BK, D, LDV, 1, 0, kNWarps * 32>;
 
   // K and V share the buffer (steel pattern): the S matmul consumes Ks
   // before the V load overwrites it, halving the threadgroup footprint.
-  threadgroup T KV_smem[kSmemKV];
+  threadgroup T KV_smem[BK * LDS];
 
   const int kv_head_idx = tid.x;
   const int batch_idx = tid.y;
@@ -502,17 +519,13 @@ template <typename T, int D, int BQ = 32>
       (size_t)(batch_idx * num_kv_heads + kv_head_idx) * v_head_stride +
       (size_t)k0 * v_seq_stride;
 
-  KLoader loader_k(
-      kbase, static_cast<int>(k_seq_stride), KV_smem, simd_gid, simd_lid);
-  VLoader loader_v(
-      vbase, static_cast<int>(v_seq_stride), KV_smem, simd_gid, simd_lid);
-
   // Fragment coordinates: this thread owns row (row0 + sm) and the column
   // pair at sn of every 8x8 fragment.
   const short2 sc = MMAFrag_t::get_coord(simd_lid);
   const short sm = sc.y;
   const short sn = sc.x;
   const int row = int(simd_gid) * kFragSize + sm;
+  const int flat_tid = int(simd_gid) * 32 + int(simd_lid);
   // Highest key this row attends. Padding rows (row >= n_rows) compute a
   // harmless in-range limit; their partials are never written.
   const int lim = N - q_len + (row % q_len);
@@ -539,22 +552,24 @@ template <typename T, int D, int BQ = 32>
   float sum_score = 0;
 
   for (int kt = k0; kt < k1; kt += BK) {
-    const int krem = k1 - kt;
+    const int krem = min(k1 - kt, BK);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (krem < BK) {
-      loader_k.load_safe(short2(D, krem));
-    } else {
-      loader_k.load_unsafe();
-    }
+    kq_fa_stage_rows<T, BK, D, LDS, kNWarps * 32>(
+        KV_smem,
+        kbase + (size_t)(kt - k0) * k_seq_stride,
+        k_seq_stride,
+        krem,
+        flat_tid);
     Stile.clear();
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // S = Q @ K^T, one 8-deep head-dim slab at a time.
+    // S = Q @ K^T, one 8-deep head-dim slab at a time. K is staged
+    // row-major, so the K^T fragment load swaps its strides.
     STEEL_PRAGMA_UNROLL
     for (short dd = 0; dd < TD; dd++) {
       simdgroup_barrier(mem_flags::mem_none);
-      Ktile.template load<T, 1, 1, LDK, 1>(
-          &KV_smem[(dd * kFragSize + sm) * LDK + sn]);
+      Ktile.template load<T, 1, 1, 1, LDS>(
+          &KV_smem[sn * LDS + dd * kFragSize + sm]);
       simdgroup_barrier(mem_flags::mem_none);
       STEEL_PRAGMA_UNROLL
       for (short ik = 0; ik < TK; ik++) {
@@ -586,11 +601,12 @@ template <typename T, int D, int BQ = 32>
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (krem < BK) {
-      loader_v.load_safe(short2(D, krem));
-    } else {
-      loader_v.load_unsafe();
-    }
+    kq_fa_stage_rows<T, BK, D, LDS, kNWarps * 32>(
+        KV_smem,
+        vbase + (size_t)(kt - k0) * v_seq_stride,
+        v_seq_stride,
+        krem,
+        flat_tid);
 
     // Online softmax on this thread's row (registers only, overlapping the
     // V load). A row with no valid key yet keeps max at finite_min and
@@ -619,8 +635,8 @@ template <typename T, int D, int BQ = 32>
     for (short id = 0; id < TD; id++) {
       STEEL_PRAGMA_UNROLL
       for (short ik = 0; ik < TK; ik++) {
-        Vtile.template load<T, 1, 1, LDV, 1>(
-            &KV_smem[(ik * kFragSize + sm) * LDV + id * kFragSize + sn]);
+        Vtile.template load<T, 1, 1, LDS, 1>(
+            &KV_smem[(ik * kFragSize + sm) * LDS + id * kFragSize + sn]);
         MMAFrag_t::mma(
             Otile.frag_at(0, id),
             Stile.frag_at(0, ik),
@@ -628,9 +644,6 @@ template <typename T, int D, int BQ = 32>
             Otile.frag_at(0, id));
       }
     }
-
-    loader_k.next();
-    loader_v.next();
   }
 
   // Unnormalized partials in the kq_sdpa_gqa_2pass_1 layout. Each row's four
@@ -649,6 +662,257 @@ template <typename T, int D, int BQ = 32>
       }
     }
     if (sn == 0) {
+      sums[po] = sum_score;
+      maxs[po] = max_score == Limits<float>::finite_min
+          ? Limits<float>::finite_min
+          : max_score * M_LN2_F;
+    }
+  }
+}
+
+// head_dim-512 FA verify pass 1. At D=512 the per-thread Q and O fragment
+// sets of the kernel above are ~256 floats (each thread owns two columns of
+// every 8-wide fragment across the full head dim): certain register spill
+// at 128 threads. The fold therefore also splits by HEAD-DIM HALF: 8
+// simdgroups (256 threads), simdgroup sg owning row strip sg / 2 and d-half
+// sg & 1. Q, O and the P @ V accumulation live entirely in the owning half,
+// so the per-thread register budget matches the hd256 kernel. Only
+// S = Q @ K^T spans the full head dim: each half computes a partial S over
+// its 256 columns and the halves are summed through a small threadgroup
+// scratch each tile (half 0 writes, half 1 adds in place -- sibling
+// simdgroups own identical (row, key) elements, so the add is race-free --
+// then both halves read the combined tile back and compute the row stats
+// redundantly but identically, in registers). BK drops to 16 so a full-D
+// K/V row tile fits the 32 KB threadgroup budget. The folded-causal mask,
+// exp2-space softmax, empty-split/dead-row guards, partials layout and
+// merge pass all match the hd256 kernel.
+template <typename T, int D>
+[[kernel]] void kq_sdpa_fa_verify_dsplit_2pass_1(
+    const device T* queries [[buffer(0)]],
+    const device T* keys [[buffer(1)]],
+    const device T* values [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    device float* sums [[buffer(4)]],
+    device float* maxs [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant size_t& k_head_stride [[buffer(7)]],
+    const constant size_t& k_seq_stride [[buffer(8)]],
+    const constant size_t& v_head_stride [[buffer(9)]],
+    const constant size_t& v_seq_stride [[buffer(10)]],
+    const constant float& scale [[buffer(11)]],
+    const constant int& q_len [[buffer(12)]],
+    const constant int& n_rows [[buffer(13)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]]) {
+  constexpr int BQ = 32; // query rows (the whole fold, zero-padded)
+  constexpr int BK = 16; // keys staged per tile (full-D rows)
+  constexpr int kNWarps = 8; // 4 row strips x 2 head-dim halves
+  constexpr short kFragSize = 8;
+  constexpr short TK = BK / kFragSize;
+  constexpr short DH = D / 2; // columns per head-dim half
+  constexpr short TDH = DH / kFragSize;
+  constexpr short kPad = 16 / sizeof(T);
+  constexpr short LDS = D + kPad; // K and V staged row-major [BK][D + pad]
+
+  using MMAFrag_t = mlx::steel::BaseMMAFrag<float, kFragSize, kFragSize>;
+
+  // K and V share the buffer (the S matmul consumes Ks before the V load
+  // overwrites it); S_smem carries the half-partial score exchange.
+  threadgroup T KV_smem[BK * LDS];
+  threadgroup float S_smem[BQ * BK];
+
+  const int kv_head_idx = tid.x;
+  const int batch_idx = tid.y;
+  const int split_idx = tid.z;
+  const int num_kv_heads = tpg.x;
+  const int q_batch_head_idx = batch_idx * num_kv_heads + kv_head_idx;
+
+  // Contiguous, BK-aligned chunk of the key axis for this threadgroup.
+  const int chunk = ((N + gqa_splits * BK - 1) / (gqa_splits * BK)) * BK;
+  const int k0 = split_idx * chunk;
+  const int k1 = min(k0 + chunk, N);
+
+  const device T* kbase = keys +
+      (size_t)(batch_idx * num_kv_heads + kv_head_idx) * k_head_stride +
+      (size_t)k0 * k_seq_stride;
+  const device T* vbase = values +
+      (size_t)(batch_idx * num_kv_heads + kv_head_idx) * v_head_stride +
+      (size_t)k0 * v_seq_stride;
+
+  const short dh_half = simd_gid & 1;
+  const short strip = simd_gid >> 1;
+  const short2 sc = MMAFrag_t::get_coord(simd_lid);
+  const short sm = sc.y;
+  const short sn = sc.x;
+  const int row = int(strip) * kFragSize + sm;
+  const int lim = N - q_len + (row % q_len);
+  const int lim_min = N - q_len; // every real row attends at least this far
+  const int flat_tid = int(simd_gid) * 32 + int(simd_lid);
+
+  // This half's Q columns in float32 fragments (one device read; rows past
+  // n_rows zero-fill, so padding rows score 0 everywhere).
+  mlx::steel::MMATile<float, 1, TDH, MMAFrag_t> Qtile;
+  {
+    const device T* qrow = queries +
+        ((size_t)q_batch_head_idx * n_rows + row) * D + dh_half * DH + sn;
+    Qtile.template load_safe<T, 1, 1>(qrow, D, short2(DH - sn, n_rows - row));
+  }
+
+  mlx::steel::MMATile<float, 1, TK, MMAFrag_t> Stile;
+  mlx::steel::MMATile<float, 1, TK, MMAFrag_t> Ktile;
+  mlx::steel::MMATile<float, 1, 1, MMAFrag_t> Vtile;
+  mlx::steel::MMATile<float, 1, TDH, MMAFrag_t> Otile;
+  Otile.clear();
+
+  // exp2-space online softmax (steel): scores carry scale * log2(e).
+  const float scale2 = scale * M_LOG2E_F;
+  float max_score = Limits<float>::finite_min;
+  float sum_score = 0;
+
+  for (int kt = k0; kt < k1; kt += BK) {
+    const int krem = min(k1 - kt, BK);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    kq_fa_stage_rows<T, BK, D, LDS, kNWarps * 32>(
+        KV_smem,
+        kbase + (size_t)(kt - k0) * k_seq_stride,
+        k_seq_stride,
+        krem,
+        flat_tid);
+    Stile.clear();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Partial S over this half's 256 columns (row-major staging, swapped
+    // fragment load strides).
+    STEEL_PRAGMA_UNROLL
+    for (short dd = 0; dd < TDH; dd++) {
+      simdgroup_barrier(mem_flags::mem_none);
+      Ktile.template load<T, 1, 1, 1, LDS>(
+          &KV_smem[sn * LDS + dh_half * DH + dd * kFragSize + sm]);
+      simdgroup_barrier(mem_flags::mem_none);
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        MMAFrag_t::mma(
+            Stile.frag_at(0, ik),
+            Qtile.frag_at(0, dd),
+            Ktile.frag_at(0, ik),
+            Stile.frag_at(0, ik));
+      }
+    }
+
+    // Half-partial exchange; the scale folds into the read-back.
+    if (dh_half == 0) {
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        STEEL_PRAGMA_UNROLL
+        for (short jj = 0; jj < MMAFrag_t::kElemCols; jj++) {
+          S_smem[row * BK + ik * kFragSize + sn + jj] =
+              Stile.frag_at(0, ik)[jj];
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (dh_half == 1) {
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        STEEL_PRAGMA_UNROLL
+        for (short jj = 0; jj < MMAFrag_t::kElemCols; jj++) {
+          S_smem[row * BK + ik * kFragSize + sn + jj] +=
+              Stile.frag_at(0, ik)[jj];
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    STEEL_PRAGMA_UNROLL
+    for (short ik = 0; ik < TK; ik++) {
+      STEEL_PRAGMA_UNROLL
+      for (short jj = 0; jj < MMAFrag_t::kElemCols; jj++) {
+        Stile.frag_at(0, ik)[jj] =
+            S_smem[row * BK + ik * kFragSize + sn + jj] * scale2;
+      }
+    }
+
+    // Mask. Only the split tail or a tile reaching past kL - qL can mask
+    // anything; interior tiles skip the branch.
+    if (krem < BK || kt + BK - 1 > lim_min) {
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        const int kg = kt + ik * kFragSize + sn;
+        STEEL_PRAGMA_UNROLL
+        for (short jj = 0; jj < MMAFrag_t::kElemCols; jj++) {
+          if (kg + jj >= k1 || kg + jj > lim) {
+            Stile.frag_at(0, ik)[jj] = Limits<float>::finite_min;
+          }
+        }
+      }
+    }
+
+    // The exchange barriers already ordered every K read before this
+    // overwrite; no extra barrier needed.
+    kq_fa_stage_rows<T, BK, D, LDS, kNWarps * 32>(
+        KV_smem,
+        vbase + (size_t)(kt - k0) * v_seq_stride,
+        v_seq_stride,
+        krem,
+        flat_tid);
+
+    // Online softmax on this thread's row (registers only, overlapping the
+    // V load); both halves compute identical stats from the combined S. A
+    // row with no valid key yet keeps max at finite_min and zeroes its P
+    // row instead of exponentiating.
+    float new_max = max_score;
+    Stile.template row_reduce<KQMaxOp>(&new_max);
+    if (new_max > Limits<float>::finite_min) {
+      Stile.template row_bin_op<KQExpSubOp>(&new_max);
+      float factor = fast::exp2(max_score - new_max);
+      float tile_sum = 0;
+      Stile.template row_reduce<KQSumOp>(&tile_sum);
+      sum_score = sum_score * factor + tile_sum;
+      max_score = new_max;
+      Otile.template row_bin_op<KQMulOp>(&factor);
+    } else {
+      STEEL_PRAGMA_UNROLL
+      for (short ii = 0; ii < decltype(Stile)::kElemsPerTile; ii++) {
+        Stile.elems()[ii] = 0;
+      }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // O_half += P @ V[:, half]
+    STEEL_PRAGMA_UNROLL
+    for (short id = 0; id < TDH; id++) {
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        Vtile.template load<T, 1, 1, LDS, 1>(
+            &KV_smem
+                [(ik * kFragSize + sm) * LDS + dh_half * DH + id * kFragSize +
+                 sn]);
+        MMAFrag_t::mma(
+            Otile.frag_at(0, id),
+            Stile.frag_at(0, ik),
+            Vtile.frag_at(0, 0),
+            Otile.frag_at(0, id));
+      }
+    }
+  }
+
+  // Unnormalized partials, each half writing its own columns; the sn == 0
+  // owner of half 0 writes the row stats (both halves hold identical
+  // values), with the max converted to natural log for the shared merge.
+  if (row < n_rows) {
+    const size_t po =
+        ((size_t)q_batch_head_idx * n_rows + row) * gqa_splits + split_idx;
+    device float* orow = out + po * D + dh_half * DH + sn;
+    STEEL_PRAGMA_UNROLL
+    for (short id = 0; id < TDH; id++) {
+      STEEL_PRAGMA_UNROLL
+      for (short jj = 0; jj < MMAFrag_t::kElemCols; jj++) {
+        orow[id * kFragSize + jj] = Otile.frag_at(0, id)[jj];
+      }
+    }
+    if (dh_half == 0 && sn == 0) {
       sums[po] = sum_score;
       maxs[po] = max_score == Limits<float>::finite_min
           ? Limits<float>::finite_min

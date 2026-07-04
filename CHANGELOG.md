@@ -7,6 +7,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `sdpa_fa_verify` head_dim 512: 256-thread d-split kernel (gemma-4
+  global-attention verify/decode, folds to 32 rows) + vectorized K/V staging.
 - `sdpa_fa_verify` now takes a 64-row query tile (up from 32), so a GQA-16
   fold at `q_len` 4 stays on the matrix units instead of falling to the
   stock materialized path. `q_len` 1 is also accepted now, routing plain

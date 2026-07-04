@@ -374,9 +374,10 @@ void KQuantSDPAFAVerify::eval_gpu(
       {&has_sinks, MTL::DataType::DataTypeBool, 3},
   };
 
-  // Pass 1: one threadgroup (a simdgroup per 8 tile rows) per
-  // (kv-head, batch, split) streams its key chunk through the
-  // simdgroup-matrix tile.
+  // Pass 1: one threadgroup per (kv-head, batch, split) streams its key
+  // chunk through the simdgroup-matrix tile. head_dim 256 runs a simdgroup
+  // per 8 tile rows ((BQ/8)*32 threads); 512 runs the 256-thread d-split
+  // variant (BQ 32 only, capped at the op).
   {
     const int bq = n_rows <= 32 ? 32 : 64;
     std::string kname = "kq_sdpa_fa_verify_2pass_1_" + ts + "_" +
@@ -385,7 +386,7 @@ void KQuantSDPAFAVerify::eval_gpu(
     auto kernel = kq_get_kernel(d, kname, hash, fc);
     // Register-heavy pipeline: some GPUs cap it below the dispatch width, and
     // Metal turns an oversized dispatch into silent garbage, not an error.
-    const size_t tg = (bq / 8) * 32;
+    const size_t tg = D == 512 ? 256 : (bq / 8) * 32;
     if (tg > kernel->maxTotalThreadsPerThreadgroup()) {
       throw std::runtime_error(
           "[mlx_kquant.sdpa_fa_verify] threadgroup of " + std::to_string(tg) +
@@ -407,7 +408,7 @@ void KQuantSDPAFAVerify::eval_gpu(
     ce.set_bytes(scale, 11);
     ce.set_bytes(q_len, 12);
     ce.set_bytes(n_rows, 13);
-    MTL::Size group_dims(32, bq / 8, 1);
+    MTL::Size group_dims(32, tg / 32, 1);
     MTL::Size grid_dims(n_kv_heads, B, splits);
     ce.dispatch_threadgroups(grid_dims, group_dims);
   }
@@ -693,10 +694,9 @@ mx::array sdpa_fa_verify(
         "[mlx_kquant.sdpa_fa_verify] q, k, v must be 4-D [B, heads, L, D].");
   }
   int D = q.shape(-1);
-  // head_dim 512 needs a BD-chunked output accumulator (see kq_sdpa.metal).
-  if (D != 256 || k.shape(-1) != D || v.shape(-1) != D) {
+  if ((D != 256 && D != 512) || k.shape(-1) != D || v.shape(-1) != D) {
     throw std::invalid_argument(
-        "[mlx_kquant.sdpa_fa_verify] only head_dim 256 is supported.");
+        "[mlx_kquant.sdpa_fa_verify] only head_dim 256 or 512 is supported.");
   }
   auto dt = q.dtype();
   if (dt != mx::float16 && dt != mx::bfloat16) {
@@ -725,10 +725,14 @@ mx::array sdpa_fa_verify(
         "[mlx_kquant.sdpa_fa_verify] q_len must be in [1, 8].");
   }
   int n_rows = q.shape(2);
-  if (n_rows < q_len || n_rows > 64 || n_rows % q_len != 0) {
+  // The 64-row tile exists only for head_dim 256; the 512 d-split kernel is
+  // fixed at the 32-row tile.
+  int max_rows = D == 512 ? 32 : 64;
+  if (n_rows < q_len || n_rows > max_rows || n_rows % q_len != 0) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_fa_verify] folded rows must be a multiple of q_len "
-        "and <= 64.");
+        "and <= " +
+        std::to_string(max_rows) + " at head_dim " + std::to_string(D) + ".");
   }
   if (k.shape(2) < q_len) {
     throw std::invalid_argument(

@@ -227,7 +227,8 @@ NB_MODULE(_ext, m) {
 
         Args:
             q (array): folded queries [1, n_kv_heads, G*q_len, D],
-                float16/bfloat16; G*q_len <= 64, D = 256.
+                float16/bfloat16; D = 256 or 512; G*q_len <= 64 at D=256,
+                <= 32 at D=512.
             k (array): keys [1, n_kv_heads, kL, D]; head/seq strided is fine
                 (read in place), the head_dim must be contiguous.
             v (array): values [1, n_kv_heads, kL, D].
