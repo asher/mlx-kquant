@@ -21,8 +21,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pass), with pair variants accepting verify widths (q_len 2..4, subject to
   gqa_factor * q_len <= 32).
 - **Fused residual/rmsnorm glue ops** (`add_rmsnorm`, `rmsnorm_multi3`,
-  `rmsnorm2_add`) with register-cached 4-wide reads and row-sized
-  threadgroups.
+  `rmsnorm2_add`) with register-cached 4-wide reads, row-sized threadgroups,
+  and scalar CPU eval paths.
 
 ### Changed
 - `KQuantEmbedding` output dtype defaults to bf16 (was f16).

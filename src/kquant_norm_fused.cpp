@@ -1,14 +1,18 @@
 // Fused residual + RMSNorm glue ops. Transformer layer glue at decode is a
 // chain of tiny dependent dispatches (norms, residual adds, per-layer
 // scalars); each op here replaces one recurring pattern with a single
-// dispatch (see kq_norm_fused.h for the kernel shapes). All inference-only
-// (no CPU eval); rms_norm semantics match mx::fast::rms_norm.
+// dispatch (see kq_norm_fused.h for the kernel shapes). The scalar CPU evals
+// mirror the kernels' f32-accumulate / one-round-at-write semantics;
+// rms_norm semantics match mx::fast::rms_norm.
+#include <cmath>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include "kquant.h"
 #include "kquant_internal.h" // kq_type_string
 
+#include "mlx/backend/cpu/encoder.h"
 #include "mlx/ops.h"
 #include "mlx/utils.h"
 
@@ -189,25 +193,172 @@ void KQuantRMSNorm2Add::eval_gpu(
 
 #endif
 
+namespace {
+
+// Row mean-square -> 1/sqrt(ms + eps), f32 accumulate (kernel pass 1).
+template <typename T>
+float row_inv_rms(const T* row, int D, float eps) {
+  float ss = 0;
+  for (int i = 0; i < D; i++) {
+    const float x = static_cast<float>(row[i]);
+    ss += x * x;
+  }
+  return 1.0f / std::sqrt(ss / static_cast<float>(D) + eps);
+}
+
+// Dispatch a per-dtype functor over the f16/bf16 activation dtypes the
+// factories admit.
+template <typename F>
+void norm_cpu_dispatch(mx::Dtype dt, const char* op, F&& run) {
+  if (dt == mx::float16) {
+    run(static_cast<mx::float16_t*>(nullptr));
+  } else if (dt == mx::bfloat16) {
+    run(static_cast<mx::bfloat16_t*>(nullptr));
+  } else {
+    throw std::runtime_error(
+        std::string(op) + " only float16/bfloat16 inputs are supported.");
+  }
+}
+
+} // namespace
+
 void KQuantAddRMSNorm::eval_cpu(
-    const std::vector<mx::array>&,
-    std::vector<mx::array>&) {
-  throw std::runtime_error(
-      "[mlx_kquant.add_rmsnorm] has no CPU implementation.");
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  const auto& h = inputs[0];
+  const auto& residual = inputs[1];
+  const auto& w = inputs[2];
+  const auto& lscale = has_scale_ ? inputs[3] : inputs[0];
+
+  auto& encoder = mx::cpu::get_command_encoder(stream());
+  encoder.set_input_array(h);
+  encoder.set_input_array(residual);
+  encoder.set_input_array(w);
+  encoder.set_input_array(lscale);
+  encoder.set_output_array(out);
+  encoder.dispatch([out = mx::array::unsafe_weak_copy(out),
+                    h = mx::array::unsafe_weak_copy(h),
+                    residual = mx::array::unsafe_weak_copy(residual),
+                    w = mx::array::unsafe_weak_copy(w),
+                    lscale = mx::array::unsafe_weak_copy(lscale),
+                    eps = eps_,
+                    has_scale = has_scale_]() mutable {
+    const int D = h.shape(-1);
+    const int64_t T = h.size() / D;
+    norm_cpu_dispatch(h.dtype(), "[mlx_kquant.add_rmsnorm]", [&](auto* tag) {
+      using DT = std::remove_pointer_t<decltype(tag)>;
+      const DT* hp = h.data<DT>();
+      const DT* rp = residual.data<DT>();
+      const DT* wp = w.data<DT>();
+      const float sc =
+          has_scale ? static_cast<float>(lscale.data<DT>()[0]) : 1.0f;
+      DT* op = out.data<DT>();
+      for (int64_t t = 0; t < T; t++) {
+        const DT* hrow = hp + t * D;
+        const DT* rrow = rp + t * D;
+        DT* orow = op + t * D;
+        const float inv = row_inv_rms(hrow, D, eps);
+        for (int i = 0; i < D; i++) {
+          const float o = static_cast<float>(rrow[i]) +
+              static_cast<float>(wp[i]) * static_cast<float>(hrow[i]) * inv;
+          orow[i] = static_cast<DT>(o * sc);
+        }
+      }
+    });
+  });
 }
 
 void KQuantRMSNormMulti3::eval_cpu(
-    const std::vector<mx::array>&,
-    std::vector<mx::array>&) {
-  throw std::runtime_error(
-      "[mlx_kquant.rmsnorm_multi3] has no CPU implementation.");
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  for (auto& out : outputs) {
+    out.set_data(mx::allocator::malloc(out.nbytes()));
+  }
+
+  auto& encoder = mx::cpu::get_command_encoder(stream());
+  for (const auto& in : inputs) {
+    encoder.set_input_array(in);
+  }
+  for (auto& out : outputs) {
+    encoder.set_output_array(out);
+  }
+  encoder.dispatch([x = mx::array::unsafe_weak_copy(inputs[0]),
+                    w0 = mx::array::unsafe_weak_copy(inputs[1]),
+                    w1 = mx::array::unsafe_weak_copy(inputs[2]),
+                    w2 = mx::array::unsafe_weak_copy(inputs[3]),
+                    o0 = mx::array::unsafe_weak_copy(outputs[0]),
+                    o1 = mx::array::unsafe_weak_copy(outputs[1]),
+                    o2 = mx::array::unsafe_weak_copy(outputs[2]),
+                    eps = eps_]() mutable {
+    const int D = x.shape(-1);
+    const int64_t T = x.size() / D;
+    norm_cpu_dispatch(x.dtype(), "[mlx_kquant.rmsnorm_multi3]", [&](auto* tag) {
+      using DT = std::remove_pointer_t<decltype(tag)>;
+      const DT* xp = x.data<DT>();
+      const DT* w0p = w0.data<DT>();
+      const DT* w1p = w1.data<DT>();
+      const DT* w2p = w2.data<DT>();
+      DT* o0p = o0.data<DT>();
+      DT* o1p = o1.data<DT>();
+      DT* o2p = o2.data<DT>();
+      for (int64_t t = 0; t < T; t++) {
+        const DT* xrow = xp + t * D;
+        const float inv = row_inv_rms(xrow, D, eps);
+        for (int i = 0; i < D; i++) {
+          const float n = static_cast<float>(xrow[i]) * inv;
+          o0p[t * D + i] = static_cast<DT>(static_cast<float>(w0p[i]) * n);
+          o1p[t * D + i] = static_cast<DT>(static_cast<float>(w1p[i]) * n);
+          o2p[t * D + i] = static_cast<DT>(static_cast<float>(w2p[i]) * n);
+        }
+      }
+    });
+  });
 }
 
 void KQuantRMSNorm2Add::eval_cpu(
-    const std::vector<mx::array>&,
-    std::vector<mx::array>&) {
-  throw std::runtime_error(
-      "[mlx_kquant.rmsnorm2_add] has no CPU implementation.");
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  auto& encoder = mx::cpu::get_command_encoder(stream());
+  for (const auto& in : inputs) {
+    encoder.set_input_array(in);
+  }
+  encoder.set_output_array(out);
+  encoder.dispatch([a = mx::array::unsafe_weak_copy(inputs[0]),
+                    wa = mx::array::unsafe_weak_copy(inputs[1]),
+                    b = mx::array::unsafe_weak_copy(inputs[2]),
+                    wb = mx::array::unsafe_weak_copy(inputs[3]),
+                    out = mx::array::unsafe_weak_copy(out),
+                    eps = eps_]() mutable {
+    const int D = a.shape(-1);
+    const int64_t T = a.size() / D;
+    norm_cpu_dispatch(a.dtype(), "[mlx_kquant.rmsnorm2_add]", [&](auto* tag) {
+      using DT = std::remove_pointer_t<decltype(tag)>;
+      const DT* ap = a.data<DT>();
+      const DT* wap = wa.data<DT>();
+      const DT* bp = b.data<DT>();
+      const DT* wbp = wb.data<DT>();
+      DT* op = out.data<DT>();
+      for (int64_t t = 0; t < T; t++) {
+        const DT* arow = ap + t * D;
+        const DT* brow = bp + t * D;
+        DT* orow = op + t * D;
+        const float inva = row_inv_rms(arow, D, eps);
+        const float invb = row_inv_rms(brow, D, eps);
+        for (int i = 0; i < D; i++) {
+          const float o =
+              static_cast<float>(wap[i]) * static_cast<float>(arow[i]) * inva +
+              static_cast<float>(wbp[i]) * static_cast<float>(brow[i]) * invb;
+          orow[i] = static_cast<DT>(o);
+        }
+      }
+    });
+  });
 }
 
 bool KQuantAddRMSNorm::is_equivalent(const mx::Primitive& other) const {
