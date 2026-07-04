@@ -112,6 +112,12 @@ def test_verify_zero_copy_views(tmp_path):
     arrays, _, _, _ = kq.load_gguf(path)
     a16, a32 = arrays["t.f16"], arrays["t.f32"]
     mx.eval(a16, a32)
+    if not mx.metal.is_available():
+        # CPU-only builds have no no-copy Metal wrap: every tensor falls back
+        # to the memcpy path, so the checker must be inert by construction.
+        assert kq.zero_copy_view_count() == 0
+        assert kq.verify_zero_copy_views([("a", a16)], no_alias=["a"]) == []
+        pytest.skip("zero-copy mmap views need the Metal allocator")
     assert kq.zero_copy_view_count() >= 2
 
     owned = mx.array(np.ones(8, dtype=np.float32))
