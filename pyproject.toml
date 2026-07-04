@@ -44,7 +44,9 @@ dependencies = ["mlx==0.31.2"]
 # mlx-lm model zoo and friends; the raw ``kq.*`` ops do not. Keep that weight
 # behind an extra so ``import mlx_kquant`` stays a thin op layer.
 [project.optional-dependencies]
-tools = ["mlx-lm>=0.27", "transformers", "gguf", "numpy"]
+# transformers<5.13: 5.13.0 rejects mlx-lm 0.31.3's string-key
+# AutoTokenizer.register at import; lift when a fixed mlx-lm ships.
+tools = ["mlx-lm>=0.27", "transformers<5.13", "gguf", "numpy"]
 dev = ["pytest", "ruff", "numpy", "gguf"]
 
 [project.scripts]

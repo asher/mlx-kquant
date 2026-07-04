@@ -4,8 +4,10 @@
 // kernel-name type tokens come from kq_type_string. NAX (tensor-core)
 // availability is probed via kq_is_nax_available. The split-k paths
 // (qmm_splitk / qvm_split_k) are omitted - plain qmm/qvm produce identical
-// results with less parallelism. kquant never carries biases, so no bias buffer
-// is plumbed through.
+// results with less parallelism. KQuantMatmul itself never carries a bias (a
+// separate elementwise add is fine off the decode-latency-critical path); the
+// decode-only bias-fused fast path lives in the KQuantQmvBias primitive below
+// (qmv_bias), which reuses this file's qmv dispatch helpers.
 #include <cstddef>
 #include <cstdlib>
 #include <stdexcept>
@@ -276,6 +278,61 @@ void qmv(
   ce.set_bytes(K, c++);
   ce.set_bytes(N, c++);
   add_strides_and_shapes(ce, B <= 1, x, w, scales, c);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+// Bias-fused qmv/qmv_fast dispatch: decode-only (M=1, non-batched) fast path
+// for a KQuantLinear whose GGUF weight carries a real linear bias. The caller
+// (KQuantQmvBias::eval_gpu, gated by the M=1 shape contract
+// quantized_matmul_qmv_bias() enforces at the op level) guarantees M=1 --
+// unlike qmv() above, there is no batched-B or M>1 fallback here because the
+// only caller (KQuantLinear) never batches and only takes this path at
+// decode.
+void qmv_bias(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& bias,
+    array& out,
+    int group_size,
+    int bits,
+    int N,
+    int K,
+    Device& d,
+    const Stream& s,
+    const std::string& kquant_type) {
+  int bn = kquant_qmv_bn(kquant_type);
+  int bk = 32;
+  MTL::Size group_dims(bk, 2, 1);
+  MTL::Size grid_dims(1, (N + bn - 1) / bn, 1);
+
+  std::string type_string = kq_type_string(x.dtype());
+  bool fast = (N % bn == 0) && (K % qmv_fast_k_align() == 0);
+  std::string kname;
+  kname.reserve(64);
+  mx::concatenate(
+      kname,
+      kq_kname_prefix(kquant_type) + (fast ? "qmv_fast_bias_" : "qmv_bias_"),
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_batch_0");
+
+  auto kernel = kq_get_kernel(d, kname);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  ce.set_input_array(w, c++);
+  ce.set_input_array(scales, c++);
+  ce.set_input_array(x, c++);
+  ce.set_output_array(out, c++);
+  ce.set_input_array(bias, c++);
+  ce.set_bytes(K, c++);
+  ce.set_bytes(N, c++);
+  add_strides_and_shapes(ce, /*non_batched=*/true, x, w, scales, c);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -696,6 +753,111 @@ void KQuantMatmul::eval_gpu(
     std::vector<mx::array>&) {
   throw std::runtime_error(
       "[mlx_kquant] quantized_matmul has no GPU implementation.");
+}
+
+#endif // _METAL_
+
+std::vector<mx::Shape> KQuantQmvBias::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  const auto& x = inputs[0];
+  const auto& w = inputs[1];
+  auto shape = x.shape();
+  shape.back() = w.shape(-2); // transpose=true only: w is [N, K]
+  return {shape};
+}
+
+bool KQuantQmvBias::is_equivalent(const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQuantQmvBias&>(other);
+  return kquant_type_ == o.kquant_type_ && group_size_ == o.group_size_ &&
+      bits_ == o.bits_;
+}
+
+void KQuantQmvBias::eval_cpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  // inputs: x, w (uint8), scales placeholder (ignored), bias. The op-level
+  // shape contract (quantized_matmul_qmv_bias) guarantees M=1 and
+  // non-batched, so this needs no batch loop, unlike KQuantMatmul::eval_cpu.
+  const auto& x = inputs[0];
+  const auto& w = inputs[1];
+  const auto& bias = inputs[3];
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  auto& encoder = mx::cpu::get_command_encoder(stream());
+  encoder.set_input_array(x);
+  encoder.set_input_array(w);
+  encoder.set_input_array(bias);
+  encoder.set_output_array(out);
+  encoder.dispatch([out = mx::array::unsafe_weak_copy(out),
+                    x = mx::array::unsafe_weak_copy(x),
+                    w = mx::array::unsafe_weak_copy(w),
+                    bias = mx::array::unsafe_weak_copy(bias),
+                    kquant_type = kquant_type_]() mutable {
+    int K = x.shape(-1);
+    int N = out.shape(-1);
+    auto run = [&](auto* tag) {
+      using T = std::remove_pointer_t<decltype(tag)>;
+      kquant_qmm_cpu<T>(
+          out.data<T>(),
+          x.data<T>(),
+          w.data<uint8_t>(),
+          1,
+          N,
+          K,
+          /*transpose=*/true,
+          kquant_type);
+      const T* bias_ptr = bias.data<T>();
+      T* out_ptr = out.data<T>();
+      for (int i = 0; i < N; i++) {
+        out_ptr[i] = static_cast<T>(
+            static_cast<float>(out_ptr[i]) + static_cast<float>(bias_ptr[i]));
+      }
+    };
+    auto dt = x.dtype();
+    if (dt == mx::float32) {
+      run(static_cast<float*>(nullptr));
+    } else if (dt == mx::float16) {
+      run(static_cast<mx::float16_t*>(nullptr));
+    } else if (dt == mx::bfloat16) {
+      run(static_cast<mx::bfloat16_t*>(nullptr));
+    } else {
+      throw std::runtime_error(
+          "[mlx_kquant] quantized_matmul_qmv_bias: only float32/float16/"
+          "bfloat16 inputs are supported.");
+    }
+  });
+}
+
+#ifdef _METAL_
+
+void KQuantQmvBias::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  const auto& x = inputs[0];
+  const auto& w = inputs[1];
+  const auto& scales = inputs[2];
+  const auto& bias = inputs[3];
+
+  int K = x.shape(-1);
+  int N = out.shape(-1);
+
+  qmv_bias(
+      x, w, scales, bias, out, group_size_, bits_, N, K, d, s, kquant_type_);
+}
+
+#else
+
+void KQuantQmvBias::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant] quantized_matmul_qmv_bias has no GPU implementation.");
 }
 
 #endif // _METAL_

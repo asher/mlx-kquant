@@ -16,6 +16,8 @@ a kquant base (see ``mlx_kquant.mlx_lm_patch``).
 
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -34,7 +36,13 @@ class KQuantEmbedding(nn.Module):
     ``embed_tokens`` to ``lm_head``).
     """
 
-    def __init__(self, num_embeddings: int, dims: int, codec: str):
+    def __init__(
+        self,
+        num_embeddings: int,
+        dims: int,
+        codec: str,
+        out_dtype: mx.Dtype = mx.bfloat16,
+    ):
         super().__init__()
         gs, bits, _, _ = CODEC_GEOMETRY[codec]
         self.mode = "kquant"
@@ -44,6 +52,7 @@ class KQuantEmbedding(nn.Module):
         self.biases = None
         self.num_embeddings = num_embeddings
         self.dims = dims
+        self.out_dtype = out_dtype
         # Placeholders - overwritten by load_weights with the GGUF wire bytes.
         bpr = bytes_per_row(codec, dims)
         self.weight = mx.zeros((num_embeddings, bpr), dtype=mx.uint8)
@@ -54,7 +63,8 @@ class KQuantEmbedding(nn.Module):
         gathered = self["weight"][x]  # [*, bytes_per_row]
         flat = gathered.reshape(-1, gathered.shape[-1])
         deq = kq.dequantize(flat, self["scales"], self.kquant_type)
-        return deq.reshape(*gathered.shape[:-1], self.dims)
+        # emit compute dtype (bf16) so a bf16 stream isn't promoted to f32
+        return deq.reshape(*gathered.shape[:-1], self.dims).astype(self.out_dtype)
 
     def as_linear(self, x):
         return kq.quantized_matmul(
@@ -89,6 +99,22 @@ class KQuantLinear(nn.Module):
         self.freeze()
 
     def __call__(self, x):
+        # Decode (M=1) with a real bias: fuse the add into the qmv/qmv_fast
+        # dispatch instead of a separate elementwise op -- see
+        # quantized_matmul_qmv_bias's docstring for the exact shape contract.
+        # Only q8_0 is wired so far; every other codec/shape (prefill,
+        # verify/MTP) falls through to the plain matmul-then-add below.
+        # KQ_DISABLE_QMV_BIAS=1 forces the unfused path (A/B lever); read live
+        # so a single process can toggle between calls.
+        if (
+            "bias" in self
+            and self.kquant_type == "q8_0"
+            and x.size // x.shape[-1] == 1
+            and os.environ.get("KQ_DISABLE_QMV_BIAS") != "1"
+        ):
+            return kq.quantized_matmul_qmv_bias(
+                x, self["weight"], self["scales"], self["bias"], self.kquant_type
+            )
         y = kq.quantized_matmul(
             x, self["weight"], self["scales"], self.kquant_type, transpose=True
         )

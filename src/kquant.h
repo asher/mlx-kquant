@@ -53,6 +53,23 @@ mx::array quantized_matmul(
     bool transpose = true,
     mx::StreamOrDevice s = {});
 
+// Bias-fused quantized matmul: x (float) @ dequant(w) + bias, fusing the add
+// into the same kernel dispatch instead of a separate elementwise op.
+// Decode-only: x must carry exactly one row (x.shape(-2) == 1 after
+// flattening leading batch dims), matching how KQuantLinear is called during
+// B=1 token-at-a-time decode -- throws outside that shape. Only kquant_type
+// "q8_0" is wired so far. transpose is always true (the only regime
+// KQuantLinear uses); group_size/bits are derived from kquant_type. Callers
+// should fall back to quantized_matmul() + a separate add for every other
+// shape (prefill, verify/MTP) or codec.
+mx::array quantized_matmul_qmv_bias(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    mx::array bias,
+    const std::string& kquant_type,
+    mx::StreamOrDevice s = {});
+
 // Gather (mixture-of-experts) quantized matmul: for each output row, select an
 // expert weight matrix via `rhs_indices` and an x row via `lhs_indices`, then
 // matmul. `w` is uint8 K-quant wire bytes shaped (n_experts, N, bytes_per_row);
@@ -96,6 +113,173 @@ mx::array sdpa_vector(
     mx::array v,
     float scale,
     bool causal = true,
+    mx::StreamOrDevice s = {});
+
+// Decode-time (qL == 1) GQA attention tuned for long KV: fixed coarse
+// contiguous key splits plus threadgroup-staged K/V tiles shared across the
+// GQA group, so device memory reads the KV once per kv-head. Optional
+// per-q-head attention sinks (an extra softmax logit with no value row).
+// q [B, n_q_heads, 1, D], k/v [B, n_kv_heads, kL, D] with contiguous D;
+// head/seq strides are read in place. head_dim 64 only; gqa_factor 2..8.
+// `splits` 0 picks the default (32); `tile_c` is the staged tile height
+// (32 or 16). Metal-only.
+mx::array sdpa_decode_gqa(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    const std::optional<mx::array>& sinks = std::nullopt,
+    int splits = 0,
+    int tile_c = 32,
+    mx::StreamOrDevice s = {});
+
+// Fused MoE GLU gather on the MLX packed mxfp4 layout: gate and up expert
+// matvecs (sharing each activation load), expert biases, and the clamped
+// SwiGLU epilogue out = (min(g, limit) * sigmoid(alpha * g)) * (clip(u,
+// +-limit) + 1) in one dispatch. Decode-shaped: x [T, K] (one row per token,
+// shared across that token's R expert slots), indices [T, R]; weights uint32
+// [E, N, K/8] + scales uint8 [E, N, K/32] (group 32, 4-bit), biases [E, N].
+// Returns [T, R, N] in x.dtype. Metal-only.
+mx::array moe_glu_gather(
+    mx::array x,
+    mx::array gate_w,
+    mx::array gate_scales,
+    mx::array gate_bias,
+    mx::array up_w,
+    mx::array up_scales,
+    mx::array up_bias,
+    mx::array indices,
+    float alpha = 1.702f,
+    float limit = 7.0f,
+    mx::StreamOrDevice s = {});
+
+// Gathered matvec with the expert bias fused, same packed-mxfp4 layout as
+// moe_glu_gather. x [T, R, K] (one row per expert slot), indices [T, R].
+// Returns [T, R, N] in x.dtype. Metal-only.
+mx::array gather_qmv_bias(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    mx::array bias,
+    mx::array indices,
+    mx::StreamOrDevice s = {});
+
+// K-quant counterpart of moe_glu_gather: gate and up expert matvecs on GGUF
+// wire bytes (n_experts, out_dims, bytes_per_row) sharing each activation
+// load, with the GLU epilogue act(g) * u fused (act: "silu" or "gelu"). No
+// biases. x [T, K], indices [T, R]. Returns [T, R, N]. Metal-only; requires
+// K % 256 == 0 and a codec with the fused kernel wired (full GGUF matrix).
+mx::array moe_glu_gather_kq(
+    mx::array x,
+    mx::array gate_w,
+    mx::array up_w,
+    const std::string& kquant_type,
+    mx::array indices,
+    const std::string& act = "silu",
+    mx::StreamOrDevice s = {});
+
+// K-quant gathered matvec (down projection), same wire layout. x [T, R, K]
+// (one row per expert slot), indices [T, R]. Returns [T, R, N]. Metal-only.
+mx::array gather_qmv_kq(
+    mx::array x,
+    mx::array w,
+    const std::string& kquant_type,
+    mx::array indices,
+    mx::StreamOrDevice s = {});
+
+// moe_glu_gather_kq with the block's shared expert folded in as one extra
+// slot: shexp_gate_w / shexp_up_w are single-expert 2-D wire-byte tensors
+// [N, bytes_per_row(shexp codec)] shape-matched to one expert stack row.
+// shexp_kquant_type defaults to kquant_type; a different codec (mixed-codec
+// blocks, UD-style upcast shexp) must be q6_k or q8_0.
+// Returns [T, R + 1, N]; the last slot is the shared expert.
+mx::array moe_glu_gather_shexp_kq(
+    mx::array x,
+    mx::array gate_w,
+    mx::array up_w,
+    mx::array shexp_gate_w,
+    mx::array shexp_up_w,
+    const std::string& kquant_type,
+    mx::array indices,
+    const std::string& act = "silu",
+    const std::string& shexp_kquant_type = "",
+    mx::StreamOrDevice s = {});
+
+// Down projection with the routing mix folded in: x [T, S, K] (slot S-1 =
+// shared expert), indices [T, S-1], scores [T, S] (routed weights then the
+// sigmoid shared-expert gate). Accumulates all S slots in f32 and returns
+// [T, N] -- replaces gather + (y * scores).sum + shared add. Metal-only.
+mx::array gather_qmv_mix_kq(
+    mx::array x,
+    mx::array w,
+    mx::array shexp_w,
+    const std::string& kquant_type,
+    mx::array indices,
+    mx::array scores,
+    const std::string& shexp_kquant_type = "",
+    mx::StreamOrDevice s = {});
+
+// No-shared-expert routing mix (gemma-style MoE): x [T, S, K], indices
+// [T, S], scores [T, S]; every slot gathers from the expert stack and the
+// score-weighted sum accumulates in f32. Returns [T, N]. Metal-only.
+mx::array gather_qmv_mix_ns_kq(
+    mx::array x,
+    mx::array w,
+    const std::string& kquant_type,
+    mx::array indices,
+    mx::array scores,
+    mx::StreamOrDevice s = {});
+
+// Router top-k in one dispatch: softmax over E logit columns in f32, pick
+// the top_k largest (min-index tie-break), optionally renormalize the picked
+// probabilities (norm_topk_prob; equals softmax over the selected raw logits
+// -- the gemma router semantics). With shared_gate (qwen3-next), logits are
+// [T, E + 1], column E is the shared-expert gate logit and its sigmoid lands
+// in the last scores slot; without, logits are [T, E] and scores are
+// [T, top_k]. Optional per_expert_scale ([E] float) multiplies each picked
+// score by its expert's scale (gemma). Returns {indices [T, top_k] uint32,
+// scores float32} -- exactly the inputs moe_glu_gather_shexp_kq /
+// gather_qmv_mix*_kq consume. E <= 1024, top_k <= 16. Metal-only.
+std::vector<mx::array> moe_router_topk(
+    mx::array logits,
+    int top_k,
+    bool norm_topk_prob,
+    bool shared_gate = true,
+    const std::optional<mx::array>& per_expert_scale = std::nullopt,
+    mx::StreamOrDevice s = {});
+
+// Fused residual + RMSNorm glue (one dispatch each; see kq_norm_fused.h).
+// rms_norm(x, w) = w * x * rsqrt(mean(x^2) + eps) over the last axis, all
+// math in f32, matching mx::fast::rms_norm. float16/bfloat16 only; weights
+// (and the optional scale) must match the activation dtype. Metal-only.
+
+// out = (residual + rms_norm(h, weight)) * scale; scale is an optional
+// size-1 array (gemma-4's layer_scalar), 1.0 when absent.
+mx::array add_rmsnorm(
+    mx::array h,
+    mx::array residual,
+    mx::array weight,
+    float eps,
+    const std::optional<mx::array>& scale = std::nullopt,
+    mx::StreamOrDevice s = {});
+
+// {rms_norm(x, w0), rms_norm(x, w1), rms_norm(x, w2)} sharing one
+// mean-square reduction of x.
+std::vector<mx::array> rmsnorm_multi3(
+    mx::array x,
+    mx::array w0,
+    mx::array w1,
+    mx::array w2,
+    float eps,
+    mx::StreamOrDevice s = {});
+
+// out = rms_norm(a, wa) + rms_norm(b, wb).
+mx::array rmsnorm2_add(
+    mx::array a,
+    mx::array wa,
+    mx::array b,
+    mx::array wb,
+    float eps,
     mx::StreamOrDevice s = {});
 
 // ----------------------------- primitives -----------------------------
@@ -185,6 +369,44 @@ class KQuantMatmul : public mx::Primitive {
   bool transpose_;
 };
 
+// Bias-fused decode-only (M=1) qmv/qmv_fast dispatch -- see
+// quantized_matmul_qmv_bias() above for the shape contract eval_gpu enforces.
+// Inference-only, like the SDPA primitive below: no vjp override, so a grad
+// request throws via the base-class default (KQuantLinear always freezes
+// weight/scales/bias, so this is never exercised in practice).
+class KQuantQmvBias : public mx::Primitive {
+ public:
+  explicit KQuantQmvBias(
+      mx::Stream stream,
+      std::string kquant_type,
+      int group_size,
+      int bits)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        group_size_(group_size),
+        bits_(bits) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantQmvBias";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+  int group_size_;
+  int bits_;
+};
+
 // Vector SDPA for large head dims. Inference-only: jvp/vjp/vmap inherit the
 // base-class throwing defaults. eval_cpu throws (Metal-only kernel).
 class KQuantSDPA : public mx::Primitive {
@@ -210,6 +432,350 @@ class KQuantSDPA : public mx::Primitive {
  private:
   float scale_;
   bool causal_;
+};
+
+// Decode-time GQA attention (see sdpa_decode_gqa). Sinks presence is encoded
+// in the input count (q, k, v[, sinks]). Inference-only.
+class KQuantSDPAGQA : public mx::Primitive {
+ public:
+  explicit KQuantSDPAGQA(mx::Stream stream, float scale, int splits, int tile_c)
+      : mx::Primitive(stream),
+        scale_(scale),
+        splits_(splits),
+        tile_c_(tile_c) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSDPAGQA";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int splits_;
+  int tile_c_;
+};
+
+// Fused MoE GLU gather (see moe_glu_gather). Inference-only.
+class KQuantMoEGLU : public mx::Primitive {
+ public:
+  explicit KQuantMoEGLU(mx::Stream stream, float alpha, float limit)
+      : mx::Primitive(stream), alpha_(alpha), limit_(limit) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantMoEGLU";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float alpha_;
+  float limit_;
+};
+
+// Gathered matvec with fused expert bias (see gather_qmv_bias).
+// Inference-only.
+class KQuantGatherQMVBias : public mx::Primitive {
+ public:
+  explicit KQuantGatherQMVBias(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantGatherQMVBias";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+};
+
+// K-quant fused MoE GLU gather (see moe_glu_gather_kq). Inference-only.
+class KQuantMoEGLUKQ : public mx::Primitive {
+ public:
+  explicit KQuantMoEGLUKQ(
+      mx::Stream stream,
+      std::string kquant_type,
+      std::string act)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        act_(std::move(act)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantMoEGLUKQ";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+  std::string act_;
+};
+
+// K-quant gathered matvec (see gather_qmv_kq). Inference-only.
+class KQuantGatherQMVKQ : public mx::Primitive {
+ public:
+  explicit KQuantGatherQMVKQ(mx::Stream stream, std::string kquant_type)
+      : mx::Primitive(stream), kquant_type_(std::move(kquant_type)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantGatherQMVKQ";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+};
+
+// K-quant fused MoE GLU gather with shared-expert slot (see
+// moe_glu_gather_shexp_kq). Inference-only.
+class KQuantMoEGLUShexpKQ : public mx::Primitive {
+ public:
+  explicit KQuantMoEGLUShexpKQ(
+      mx::Stream stream,
+      std::string kquant_type,
+      std::string act,
+      std::string shexp_type)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        act_(std::move(act)),
+        shexp_type_(std::move(shexp_type)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantMoEGLUShexpKQ";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+  std::string act_;
+  std::string shexp_type_;
+};
+
+// K-quant gathered matvec with routing mix folded in (see gather_qmv_mix_kq).
+// Inference-only.
+class KQuantGatherQMVMixKQ : public mx::Primitive {
+ public:
+  explicit KQuantGatherQMVMixKQ(
+      mx::Stream stream,
+      std::string kquant_type,
+      std::string shexp_type)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        shexp_type_(std::move(shexp_type)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantGatherQMVMixKQ";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+  std::string shexp_type_;
+};
+
+// No-shared-expert routing mix (see gather_qmv_mix_ns_kq). Inference-only.
+class KQuantGatherQMVMixNSKQ : public mx::Primitive {
+ public:
+  explicit KQuantGatherQMVMixNSKQ(mx::Stream stream, std::string kquant_type)
+      : mx::Primitive(stream), kquant_type_(std::move(kquant_type)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantGatherQMVMixNSKQ";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+};
+
+// Router softmax + top-k + score epilogue (see moe_router_topk). Two
+// outputs (indices, scores). Inference-only.
+class KQuantMoERouterTopK : public mx::Primitive {
+ public:
+  explicit KQuantMoERouterTopK(
+      mx::Stream stream,
+      int top_k,
+      bool norm,
+      bool shared,
+      bool has_pes)
+      : mx::Primitive(stream),
+        top_k_(top_k),
+        norm_(norm),
+        shared_(shared),
+        has_pes_(has_pes) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantMoERouterTopK";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int top_k_;
+  bool norm_;
+  bool shared_;
+  bool has_pes_;
+};
+
+// Fused (residual + rms_norm(h, w)) * scale (see add_rmsnorm).
+// Inference-only.
+class KQuantAddRMSNorm : public mx::Primitive {
+ public:
+  explicit KQuantAddRMSNorm(mx::Stream stream, float eps, bool has_scale)
+      : mx::Primitive(stream), eps_(eps), has_scale_(has_scale) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantAddRMSNorm";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float eps_;
+  bool has_scale_;
+};
+
+// Three rms_norms of one tensor sharing the reduction (see rmsnorm_multi3).
+// Inference-only.
+class KQuantRMSNormMulti3 : public mx::Primitive {
+ public:
+  explicit KQuantRMSNormMulti3(mx::Stream stream, float eps)
+      : mx::Primitive(stream), eps_(eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantRMSNormMulti3";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float eps_;
+};
+
+// rms_norm(a, wa) + rms_norm(b, wb) in one dispatch (see rmsnorm2_add).
+// Inference-only.
+class KQuantRMSNorm2Add : public mx::Primitive {
+ public:
+  explicit KQuantRMSNorm2Add(mx::Stream stream, float eps)
+      : mx::Primitive(stream), eps_(eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantRMSNorm2Add";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float eps_;
 };
 
 // Gather (MoE) quantized matmul. vjp implements only the gradient wrt x (a

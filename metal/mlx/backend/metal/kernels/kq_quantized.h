@@ -473,7 +473,8 @@ METAL_FUNC void kq_q8_0_qmv_fast_impl(
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    const device T* bias = nullptr) {
   static_assert(
       group_size == KQ_Q8_0_GROUP, "Q8_0 kernel requires group_size=32");
   static_assert(bits == 8, "Q8_0 kernel requires bits=8");
@@ -525,7 +526,11 @@ METAL_FUNC void kq_q8_0_qmv_fast_impl(
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
     if (simd_lid == 0) {
-      y[out_row + row] = static_cast<T>(result[row]);
+      U out_val = result[row];
+      if (bias != nullptr) {
+        out_val += U(bias[out_row + row]);
+      }
+      y[out_row + row] = static_cast<T>(out_val);
     }
   }
 }
@@ -626,7 +631,8 @@ METAL_FUNC void kq_q8_0_qmv_impl(
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    const device T* bias = nullptr) {
   static_assert(
       group_size == KQ_Q8_0_GROUP, "Q8_0 kernel requires group_size=32");
   static_assert(bits == 8, "Q8_0 kernel requires bits=8");
@@ -705,7 +711,11 @@ METAL_FUNC void kq_q8_0_qmv_impl(
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
     if (simd_lid == 0 && row < active_rows) {
-      y[out_row + row] = static_cast<T>(result[row]);
+      U out_val = result[row];
+      if (bias != nullptr) {
+        out_val += U(bias[out_row + row]);
+      }
+      y[out_row + row] = static_cast<T>(out_val);
     }
   }
 }
@@ -987,6 +997,50 @@ template <typename T, int group_size, int bits, bool batched>
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
+// Bias-fused variant of kq_q8_0_qmv_fast: decode-only (B=1) fast path for a
+// KQuantLinear whose GGUF weight carries a real linear bias (e.g. gpt-oss
+// attention QKVO). Fuses the post-matmul add into this kernel's own output
+// write instead of a separate elementwise dispatch. Non-batched only -- the
+// batched (MoE-style) axis isn't wired for this variant; KQuantLinear never
+// batches, so it isn't needed here.
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q8_0_qmv_fast_bias(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const device T* bias,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if constexpr (batched) {
+    int batch_M = x_shape[x_batch_ndims];
+    kq_adjust_matrix_offsets<T>(
+        x,
+        w,
+        y,
+        out_vec_size * batch_M,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        tid);
+  }
+  kq_q8_0_qmv_fast_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, bias);
+}
+
 template <typename T, int group_size, int bits, bool batched>
 [[kernel]] void kq_q8_0_verify_qmv(
     const device uint8_t* w,
@@ -1058,6 +1112,45 @@ template <typename T, int group_size, int bits, bool batched>
   }
   kq_q8_0_qmv_impl<T, group_size, bits>(
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+// Bias-fused variant of kq_q8_0_qmv -- see kq_q8_0_qmv_fast_bias above.
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q8_0_qmv_bias(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const device T* bias,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if constexpr (batched) {
+    int batch_M = x_shape[x_batch_ndims];
+    kq_adjust_matrix_offsets<T>(
+        x,
+        w,
+        y,
+        out_vec_size * batch_M,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        tid);
+  }
+  kq_q8_0_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, bias);
 }
 
 template <typename T, int group_size, int bits>

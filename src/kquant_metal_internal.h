@@ -1,10 +1,11 @@
-// Metal-side dispatch helpers shared between KQuantMatmul (kquant_matmul.cpp)
-// and KQuantGatherQMM (kquant_gather.cpp). Header-inline so both translation
-// units share a single definition; compiled only where _METAL_ is defined.
-// Kernels are fetched from the bundled metallib via kq_get_kernel, NAX
-// availability is probed via kq_is_nax_available, kquant carries no biases (no
-// bias buffer is plumbed through), and kq_collapse_contiguous_dims collapses
-// adjacent contiguous index axes.
+// Metal-side dispatch helpers shared between KQuantMatmul (kquant_matmul.cpp),
+// KQuantQmvBias (kquant_matmul.cpp), and KQuantGatherQMM (kquant_gather.cpp).
+// Header-inline so all translation units share a single definition; compiled
+// only where _METAL_ is defined. Kernels are fetched from the bundled
+// metallib via kq_get_kernel, NAX availability is probed via
+// kq_is_nax_available, and kq_collapse_contiguous_dims collapses adjacent
+// contiguous index axes. Most kquant paths carry no bias buffer; the q8_0
+// decode-only qmv/qmv_fast kernels are the exception (see KQuantQmvBias).
 #pragma once
 
 #ifdef _METAL_
