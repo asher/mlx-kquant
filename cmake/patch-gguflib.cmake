@@ -57,17 +57,23 @@ endif()
 # gguf_open() uses O_RDWR + mmap(PROT_READ|PROT_WRITE, MAP_SHARED), so a no-copy
 # array viewing a tensor aliases a writable, disk-backed page -- a fused in-place
 # op or a stray buffer-donation then mutates the SOURCE FILE. Consumers that only
-# read existing files must use gguf_open_ro(): O_RDONLY + MAP_PRIVATE, keeping
-# PROT_READ|PROT_WRITE (GPU zero-copy via newBufferWithBytesNoCopy needs writable
-# pages -- PROT_READ alone yields garbage GPU reads), so any write is copy-on-write
-# into a private page and the file on disk is never modified. gguf_open() (and thus
-# the gguf_create() write path, which calls it) is left untouched. gguf_remap()
-# branches on the new ctx->ro.
+# read existing files must use gguf_open_ro(): O_RDONLY + PROT_READ + MAP_SHARED,
+# so tensor pages stay clean, evictable file-cache pages and a stray write
+# faults loudly instead of reaching the file. Metal wraps read-only shared pages
+# fine via newBufferWithBytesNoCopy (llama.cpp maps weights the same way). The
+# historical mode, PROT_READ|PROT_WRITE + MAP_PRIVATE, made the GPU write-fault
+# every touched page: the first forward lazily copied the whole file into
+# anonymous memory (compress-only, never droppable), doubling the model's
+# standing cost; under memory pressure that turns a graceful slowdown into a
+# compress/refault storm. KQ_GGUF_MMAP=private_rw restores that mode as a kill
+# switch; KQ_GGUF_MMAP=private_ro is a diagnostic quadrant. gguf_open() (and
+# thus the gguf_create() write path, which calls it) is left untouched.
+# gguf_remap() branches on the new ctx->ro.
 file(READ "${_h}" _H)
 if(NOT _H MATCHES "gguf_open_ro")
   string(REPLACE
     "    uint64_t alignment;             // File data alignment. Default: 32 bytes.\n} gguf_ctx;"
-    "    uint64_t alignment;             // File data alignment. Default: 32 bytes.\n    int ro;                         // Read-only: MAP_PRIVATE (copy-on-write).\n} gguf_ctx;"
+    "    uint64_t alignment;             // File data alignment. Default: 32 bytes.\n    int ro;                         // Read-only mapping (see KQ_GGUF_MMAP).\n} gguf_ctx;"
     _H "${_H}")
   string(REPLACE
     "gguf_ctx *gguf_open(const char *filename);\ngguf_ctx *gguf_create(const char *filename, int flags);"
@@ -81,11 +87,11 @@ file(READ "${_c}" _C)
 if(NOT _C MATCHES "gguf_open_ro")
   string(REPLACE
     "    void *mapped = mmap(0,sb.st_size,PROT_READ|PROT_WRITE,MAP_SHARED,ctx->fd,0);"
-    "    /* Keep PROT_READ|PROT_WRITE: GPU zero-copy (newBufferWithBytesNoCopy) needs\n     * writable pages even for read-only use (PROT_READ alone -> garbage GPU\n     * reads). For the read path use MAP_PRIVATE so any write is copy-on-write\n     * into a private page and the source file on disk is never modified. The\n     * writer path keeps MAP_SHARED to build new files. */\n    int _flags = ctx->ro ? MAP_PRIVATE : MAP_SHARED;\n    void *mapped = mmap(0,sb.st_size,PROT_READ|PROT_WRITE,_flags,ctx->fd,0);"
+    "    /* Read-only contexts default to PROT_READ + MAP_SHARED: weights stay\n     * clean, evictable file-cache pages, and Metal wraps read-only shared\n     * pages fine (llama.cpp maps weights the same way). The historical mode,\n     * PROT_READ|PROT_WRITE + MAP_PRIVATE, made the GPU write-fault every\n     * touched page, lazily copying the whole file into anonymous memory that\n     * can only be compressed, never dropped. KQ_GGUF_MMAP=private_rw restores\n     * it; KQ_GGUF_MMAP=private_ro is a diagnostic. The writer path keeps\n     * PROT_READ|PROT_WRITE + MAP_SHARED to build new files. */\n    int _prot = PROT_READ|PROT_WRITE;\n    int _flags = MAP_SHARED;\n    if (ctx->ro) {\n        const char *_m = getenv(\"KQ_GGUF_MMAP\");\n        if (_m && !strcmp(_m,\"private_rw\")) { _flags = MAP_PRIVATE; }\n        else if (_m && !strcmp(_m,\"private_ro\")) { _prot = PROT_READ; _flags = MAP_PRIVATE; }\n        else { _prot = PROT_READ; }\n    }\n    void *mapped = mmap(0,sb.st_size,_prot,_flags,ctx->fd,0);"
     _C "${_C}")
   string(REPLACE
     "void gguf_rewind(gguf_ctx *ctx) {"
-    "/* Like gguf_open() but opens an existing file read-only (O_RDONLY + MAP_PRIVATE,\n * copy-on-write) so a no-copy tensor view can never be written back to disk. */\ngguf_ctx *gguf_open_ro(const char *filename) {\n    int fd = open(filename,O_RDONLY);\n    if (fd == -1) return NULL;\n    gguf_ctx *ctx = calloc(1, sizeof(*ctx));\n    if (!ctx) { close(fd); return NULL; }\n    ctx->fd = fd;\n    ctx->ro = 1;\n    ctx->alignment = 32;\n    ctx->data_off = 0;\n    if (gguf_remap(ctx) == 0) {\n        gguf_close(ctx);\n        return NULL;\n    }\n    gguf_rewind(ctx);\n    return ctx;\n}\n\nvoid gguf_rewind(gguf_ctx *ctx) {"
+    "/* Like gguf_open() but opens an existing file read-only (O_RDONLY; mapping\n * mode per KQ_GGUF_MMAP, default PROT_READ + MAP_SHARED) so a no-copy tensor\n * view can never be written back to disk. */\ngguf_ctx *gguf_open_ro(const char *filename) {\n    int fd = open(filename,O_RDONLY);\n    if (fd == -1) return NULL;\n    gguf_ctx *ctx = calloc(1, sizeof(*ctx));\n    if (!ctx) { close(fd); return NULL; }\n    ctx->fd = fd;\n    ctx->ro = 1;\n    ctx->alignment = 32;\n    ctx->data_off = 0;\n    if (gguf_remap(ctx) == 0) {\n        gguf_close(ctx);\n        return NULL;\n    }\n    gguf_rewind(ctx);\n    return ctx;\n}\n\nvoid gguf_rewind(gguf_ctx *ctx) {"
     _C "${_C}")
   file(WRITE "${_c}" "${_C}")
   message(STATUS "gguflib: patched gguflib.c (read-only open: gguf_open_ro)")

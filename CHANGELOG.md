@@ -7,30 +7,46 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [0.3.1]
 
 ### Added
-- **`sdpa_fa_verify`**: simdgroup-matrix speculative-verify attention for a
+- `sdpa_fa_verify`: simdgroup-matrix speculative-verify attention for a
   GQA-folded query tile (G*q_len <= 32 rows, q_len 2..8, head_dim 256).
   Streams each contiguous KV split once through threadgroup-staged K/V tiles
   with S = Q@K^T and O += P@V on the matrix units, float32 accumulators, and a
   per-row offset-causal online softmax; reuses the `sdpa_decode_gqa`
   split-merge pass.
+- `verify_zero_copy_views(items, no_alias=[])` and `zero_copy_view_count()`:
+  post-load integrity check that arrays backed by a GGUF mapping still carry
+  their wire dtype (integer reinterprets allowed) and that `no_alias` names
+  own their buffers. Catches buffer donation into the file mapping: a donated
+  dtype-changing copy leaves an array typed X over wire bytes typed Y, and
+  the write is dropped on read-only maps. Metadata-only, O(#tensors).
+
+### Changed
+- `load_gguf` zero-copy mappings are now read-only shared (`PROT_READ` +
+  `MAP_SHARED`) instead of writable private. Private mappings made the GPU
+  write-fault every wired page, lazily copying the whole file into anonymous
+  memory that can only be compressed, never dropped (a hidden full-model RAM
+  copy on top of the page cache carrying the same bytes); read-only shared
+  pages are wired in place and stay clean, evictable file cache.
+  `KQ_GGUF_MMAP=private_rw` restores the old mode; `private_ro` is a
+  diagnostic quadrant.
 
 ## [0.3.0]
 
 ### Added
-- **Fused MoE gather kernels** for quantized experts: `moe_glu_gather_kq` /
+- Fused MoE gather kernels: for quantized experts: `moe_glu_gather_kq` /
   `gather_qmv_kq` cover all 19 GGUF codecs (K-quant, legacy, IQ) plus
   mixed-codec shared experts; `moe_glu_gather` / `gather_qmv_bias` cover mxfp4.
   Each fuses the expert gather, dequant mat-vec, and GLU activation into one
   dispatch. Wide K-lane (NX=16/32) variants engage automatically for
   decode-scale two-stream GLU gathers.
-- **Fused MoE router** (`moe_router_topk`): softmax + top-k + weight norm +
+- Fused MoE router: (`moe_router_topk`): softmax + top-k + weight norm +
   shared-gate sigmoid in one dispatch; no-shexp routing-mix gather and
   per-expert-scale support; q8_0 odd-K fallback.
-- **`sdpa_decode_gqa`**: tile-staged GQA decode SDPA kernel (head_dim
+- `sdpa_decode_gqa`: tile-staged GQA decode SDPA kernel (head_dim
   64/128/256/512, GQA factor 2..16, attention sinks folded into the merge
   pass), with pair variants accepting verify widths (q_len 2..4, subject to
   gqa_factor * q_len <= 32).
-- **Fused residual/rmsnorm glue ops** (`add_rmsnorm`, `rmsnorm_multi3`,
+- Fused residual/rmsnorm glue ops (`add_rmsnorm`, `rmsnorm_multi3`,
   `rmsnorm2_add`) with register-cached 4-wide reads, row-sized threadgroups,
   and scalar CPU eval paths.
 

@@ -5,16 +5,19 @@
 // view over that mmap (see try_zero_copy_array); with zero_copy=false it is
 // memcpy'd out via the array(It, shape, dtype) constructor (one memcpy,
 // ~15 GB/s).
+#include <algorithm>
 #include <climits>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_set>
 
 #include <unistd.h> // getpagesize
 
@@ -35,6 +38,67 @@ namespace mlx_kquant {
 namespace {
 
 constexpr int kGgufArrayHeaderSize = 12; // 4-byte elem type + 8-byte length.
+
+// Live zero-copy tensor ranges: the tensor's exact wire bytes and dtype (NOT
+// the enclosing page window -- adjacent tensors can share a page, and exact
+// ranges keep the dtype unambiguous). Registered when a no-copy view is
+// built, erased by the view's buffer deleter. Backs verify_zero_copy_views().
+struct ZcRange {
+  uintptr_t base;
+  size_t bytes;
+  mx::Dtype dtype;
+};
+std::mutex g_zc_mutex;
+std::vector<ZcRange> g_zc_ranges;
+
+void zc_register(uintptr_t base, size_t bytes, mx::Dtype dtype) {
+  std::lock_guard<std::mutex> lock(g_zc_mutex);
+  g_zc_ranges.push_back({base, bytes, dtype});
+}
+
+void zc_unregister(uintptr_t base) {
+  std::lock_guard<std::mutex> lock(g_zc_mutex);
+  for (auto it = g_zc_ranges.begin(); it != g_zc_ranges.end(); ++it) {
+    if (it->base == base) {
+      g_zc_ranges.erase(it);
+      return;
+    }
+  }
+}
+
+// Local dtype name map (mlx::core::dtype_to_string is not exported from the
+// wheel dylib).
+const char* zc_dtype_name(mx::Dtype d) {
+  if (d == mx::float32)
+    return "float32";
+  if (d == mx::float16)
+    return "float16";
+  if (d == mx::bfloat16)
+    return "bfloat16";
+  if (d == mx::float64)
+    return "float64";
+  if (d == mx::uint8)
+    return "uint8";
+  if (d == mx::uint16)
+    return "uint16";
+  if (d == mx::uint32)
+    return "uint32";
+  if (d == mx::uint64)
+    return "uint64";
+  if (d == mx::int8)
+    return "int8";
+  if (d == mx::int16)
+    return "int16";
+  if (d == mx::int32)
+    return "int32";
+  if (d == mx::int64)
+    return "int64";
+  if (d == mx::bool_)
+    return "bool";
+  if (d == mx::complex64)
+    return "complex64";
+  return "unknown";
+}
 
 // Build a no-copy mx.array viewing `nbytes` of `dtype`/`shape` starting at `wd`
 // (a pointer into gguflib's mmap). Wraps a page-aligned window enclosing the
@@ -85,7 +149,9 @@ std::optional<mx::array> try_zero_copy_array(
     return std::nullopt; // no-copy wrap rejected (e.g. alignment).
   }
 
-  mx::Deleter del = [ctx_holder](mx::allocator::Buffer b) {
+  zc_register(addr, nbytes, dtype);
+  mx::Deleter del = [ctx_holder, addr](mx::allocator::Buffer b) {
+    zc_unregister(addr);
     mx::allocator::release(b);
   };
   mx::array window(buf, mx::Shape{static_cast<int>(win_elems)}, dtype, del);
@@ -513,8 +579,9 @@ GgufLoadResult load_gguf(const std::string& path, bool zero_copy /* = true */) {
   // deleters so the mmap outlives this function and is gguf_close'd (munmap'd)
   // only when the last viewing array is freed. With zero_copy=false no array
   // captures it, so it is closed when this local ref drops on return.
-  // Read-only mapping (PROT_READ/MAP_PRIVATE): a zero-copy array views the
-  // mmapped tensor bytes, so the source file must never be writable through it.
+  // Read-only mapping (default PROT_READ/MAP_SHARED; see KQ_GGUF_MMAP in
+  // cmake/patch-gguflib.cmake): tensor pages stay clean, evictable file-cache
+  // pages and the source file can never be written through a zero-copy view.
   std::shared_ptr<gguf_ctx> ctx(gguf_open_ro(path.c_str()), gguf_close);
   if (!ctx) {
     throw std::runtime_error("[load_gguf] gguf_open_ro failed for " + path);
@@ -580,6 +647,70 @@ GgufLoadResult load_gguf(const std::string& path, bool zero_copy /* = true */) {
   }
 
   return res;
+}
+
+size_t zero_copy_view_count() {
+  std::lock_guard<std::mutex> lock(g_zc_mutex);
+  return g_zc_ranges.size();
+}
+
+std::vector<std::string> verify_zero_copy_views(
+    const std::vector<std::pair<std::string, mx::array>>& items,
+    const std::vector<std::string>& no_alias) {
+  std::vector<ZcRange> ranges;
+  {
+    std::lock_guard<std::mutex> lock(g_zc_mutex);
+    ranges = g_zc_ranges;
+  }
+  std::sort(
+      ranges.begin(), ranges.end(), [](const ZcRange& a, const ZcRange& b) {
+        return a.base < b.base;
+      });
+  std::unordered_set<std::string> must_own(no_alias.begin(), no_alias.end());
+
+  // Tensor ranges never overlap, so the candidate is the last range starting
+  // at or before p.
+  auto find_range = [&](uintptr_t p) -> const ZcRange* {
+    auto it = std::upper_bound(
+        ranges.begin(), ranges.end(), p, [](uintptr_t v, const ZcRange& r) {
+          return v < r.base;
+        });
+    if (it == ranges.begin()) {
+      return nullptr;
+    }
+    --it;
+    return p < it->base + it->bytes ? &*it : nullptr;
+  };
+
+  std::vector<std::string> problems;
+  for (const auto& [name, arr] : items) {
+    if (!arr.is_available()) {
+      problems.push_back(name + ": unevaluated (mx.eval the arrays first)");
+      continue;
+    }
+    const auto p = reinterpret_cast<uintptr_t>(arr.data<char>());
+    const ZcRange* r = find_range(p);
+    if (r == nullptr) {
+      continue; // owned buffer
+    }
+    if (must_own.count(name)) {
+      problems.push_back(
+          name + ": transformed param still aliases the mapping");
+      continue;
+    }
+    // Integer<->integer reinterprets (uint8 wire viewed as uint32 for packed
+    // layouts) are legitimate; any float-involved dtype change on mapped
+    // bytes is the donation-corruption signature.
+    const bool both_int = mx::issubdtype(arr.dtype(), mx::integer) &&
+        mx::issubdtype(r->dtype, mx::integer);
+    if (arr.dtype() != r->dtype && !both_int) {
+      problems.push_back(
+          name + ": mapped view dtype " + zc_dtype_name(arr.dtype()) +
+          " != wire dtype " + zc_dtype_name(r->dtype) +
+          " (buffer donation through the mapping?)");
+    }
+  }
+  return problems;
 }
 
 } // namespace mlx_kquant

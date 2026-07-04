@@ -46,6 +46,8 @@ from ._ext import (  # noqa: F401
     sdpa_decode_gqa,
     sdpa_fa_verify,
     sdpa_vector,
+    verify_zero_copy_views,
+    zero_copy_view_count,
 )
 from ._version import __version__
 
@@ -75,4 +77,6 @@ __all__ = [
     "sdpa_decode_gqa",
     "sdpa_fa_verify",
     "sdpa_vector",
+    "verify_zero_copy_views",
+    "zero_copy_view_count",
 ]

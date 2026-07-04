@@ -62,4 +62,20 @@ struct GgufLoadResult {
 // (the original ~15 GB/s path) and the mmap is closed before returning.
 GgufLoadResult load_gguf(const std::string& path, bool zero_copy = true);
 
+// Number of live zero-copy tensor views (registered mmap tensor ranges).
+size_t zero_copy_view_count();
+
+// Post-load integrity check for zero-copy views. For each (name, array) whose
+// data pointer lies inside a live GGUF tensor mapping, report a problem string
+// when its dtype differs from the wire dtype recorded at load (integer-to-
+// integer reinterprets allowed), or when its name is listed in `no_alias`
+// (loader-transformed params that must own their buffers). Catches MLX buffer
+// donation into a file mapping: a donated dtype-changing copy leaves an array
+// typed X over wire bytes typed Y, and the write is dropped on read-only
+// shared mappings. Arrays must be evaluated. Metadata-only: O(items x log
+// ranges), no tensor data is read.
+std::vector<std::string> verify_zero_copy_views(
+    const std::vector<std::pair<std::string, mx::array>>& items,
+    const std::vector<std::string>& no_alias = {});
+
 } // namespace mlx_kquant
