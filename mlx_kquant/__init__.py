@@ -44,6 +44,7 @@ from ._ext import (  # noqa: F401
     rmsnorm2_add,
     rmsnorm_multi3,
     sdpa_decode_gqa,
+    sdpa_fa_verify,
     sdpa_vector,
 )
 from ._version import __version__
@@ -72,5 +73,6 @@ __all__ = [
     "rmsnorm2_add",
     "rmsnorm_multi3",
     "sdpa_decode_gqa",
+    "sdpa_fa_verify",
     "sdpa_vector",
 ]

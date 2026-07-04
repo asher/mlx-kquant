@@ -242,6 +242,85 @@ def test_sdpa_gqa_verify_short_kv():
     _check_gqa(64, kL=17, dtype=mx.bfloat16, splits=16, qL=4)
 
 
+def _ref_sdpa_fold(q, k, v, scale, q_len):
+    """f32 reference for the GQA-folded verify layout: q [B, Hkv, G*qL, D]
+    attends its own kv head directly; folded row r is causally clamped to
+    key <= kL - qL + (r % qL)."""
+    s = (q.astype(mx.float32) @ k.astype(mx.float32).swapaxes(-1, -2)) * scale
+    n_rows, kL = q.shape[2], k.shape[2]
+    lims = (kL - q_len + mx.arange(n_rows) % q_len).reshape(n_rows, 1)
+    cols = mx.arange(kL).reshape(1, kL)
+    s = mx.where(cols <= lims, s, float("-inf"))
+    w = mx.softmax(s, axis=-1)
+    return (w @ v.astype(mx.float32)).astype(q.dtype)
+
+
+def _check_fa(D, qL, kL, dtype, Hkv=4, G=6, strided=False, splits=0):
+    n_rows = G * qL
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(
+        1, Hkv, Hkv, n_rows, kL, D, dtype, seed=qL * 13 + kL + D, strided=strided
+    )
+    got = kq.sdpa_fa_verify(q, k, v, scale, q_len=qL, splits=splits)
+    ref = _ref_sdpa_fold(q, k, v, scale, qL)
+    _eval_or_skip(got, ref)
+    rel = _rel(got, ref)
+    bound = REL_BOUND[dtype]
+    tag = "strided" if strided else "contig"
+    print(
+        f"  [fa] D={D} qL={qL} G={G} kL={kL} Hkv={Hkv} {str(dtype)[9:]:>9} "
+        f"{tag}: rel={rel:.3e}"
+    )
+    assert rel < bound, f"D={D} qL={qL} G={G} kL={kL} rel {rel:.3e} >= {bound:.0e}"
+    assert got.shape == q.shape
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("qL", [2, 3, 4, 5, 6])
+def test_sdpa_fa_verify(qL, dtype):
+    _check_fa(256, qL, kL=4096, dtype=dtype, G=4)
+
+
+def test_sdpa_fa_verify_qwen_geometry():
+    # qwen3.5/3.6 full-attn fold: 24 rows = G6 x qL4 at hd256
+    _check_fa(256, 4, kL=8192, dtype=mx.bfloat16, Hkv=4, G=6)
+
+
+def test_sdpa_fa_verify_full_tile():
+    # n_rows == 32 fills the tile exactly (no padding rows), qL at the cap
+    _check_fa(256, 8, kL=4096, dtype=mx.bfloat16, Hkv=2, G=4)
+
+
+def test_sdpa_fa_verify_partial_warp():
+    # n_rows == 18: the third simdgroup covers rows 16..17 plus padding
+    _check_fa(256, 6, kL=2048, dtype=mx.bfloat16, G=3)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_sdpa_fa_verify_strided_unaligned(dtype):
+    # strided KV-cache prefix + a key length off every tile/split boundary
+    _check_fa(256, 4, kL=3071, dtype=dtype, strided=True, splits=16)
+
+
+def test_sdpa_fa_verify_short_kv():
+    # kL small enough that most splits stage zero keys: their empty partials
+    # (max = finite_min, sum = 0) must merge as weight zero
+    _check_fa(256, 4, kL=17, dtype=mx.bfloat16, splits=16, G=6)
+
+
+def test_sdpa_fa_verify_min_kv():
+    # kL == qL floor: row 0 attends exactly one key, every row masked hard
+    _check_fa(256, 4, kL=4, dtype=mx.bfloat16, G=6)
+
+
+def test_sdpa_fa_verify_causal_split_straddle():
+    # the last qL keys straddle a split boundary (splits=128, kL=4098 puts
+    # keys 4096..4097 alone in the final split): that split is entirely past
+    # the low rows' causal limits, exercising the dead-row guard in a
+    # non-empty split
+    _check_fa(256, 4, kL=4098, dtype=mx.bfloat16, splits=128, G=6)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--d", type=int, default=512)
