@@ -129,6 +129,15 @@ void KQuantSDPA::eval_gpu(
     std::string hash =
         kname + (causal ? "_c1" : "_c0") + "_b" + std::to_string(blocks);
     auto kernel = kq_get_kernel(d, kname, hash, fc);
+    // Register-heavy pipeline: some GPUs cap it below the dispatch width, and
+    // Metal turns an oversized dispatch into silent garbage, not an error.
+    const size_t tg = size_t(32) * gqa_factor * qL;
+    if (tg > kernel->maxTotalThreadsPerThreadgroup()) {
+      throw std::runtime_error(
+          "[mlx_kquant.sdpa_vector] threadgroup of " + std::to_string(tg) +
+          " threads exceeds this GPU's pipeline limit (" +
+          std::to_string(kernel->maxTotalThreadsPerThreadgroup()) + ").");
+    }
     ce.set_compute_pipeline_state(kernel);
     ce.set_input_array(q, 0);
     ce.set_input_array(k, 1);
@@ -231,6 +240,16 @@ void KQuantSDPAGQA::eval_gpu(
         "_c" + std::to_string(tile_c_) + (qL > 1 ? "_p2" : "");
     std::string hash = kname + "_s" + std::to_string(splits);
     auto kernel = kq_get_kernel(d, kname, hash, fc);
+    // Register-heavy pipeline: some GPUs cap it below the dispatch width, and
+    // Metal turns an oversized dispatch into silent garbage, not an error.
+    const size_t tg =
+        size_t(32) * gqa_factor * (qL > 1 ? size_t((qL + 1) / 2) : 1);
+    if (tg > kernel->maxTotalThreadsPerThreadgroup()) {
+      throw std::runtime_error(
+          "[mlx_kquant.sdpa_decode_gqa] threadgroup of " + std::to_string(tg) +
+          " threads exceeds this GPU's pipeline limit (" +
+          std::to_string(kernel->maxTotalThreadsPerThreadgroup()) + ").");
+    }
     ce.set_compute_pipeline_state(kernel);
     ce.set_input_array(q, 0);
     ce.set_input_array(k, 1);

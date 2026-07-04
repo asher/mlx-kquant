@@ -77,13 +77,25 @@ def _make(B, Hq, Hkv, qL, kL, D, dtype, seed, strided):
     return q, k, v
 
 
+def _eval_or_skip(*arrays):
+    # Materialize op + reference; a device whose pipeline caps the dispatch
+    # width raises the informative eval_gpu guard error -> capability skip,
+    # never a silent-garbage numerics failure.
+    try:
+        mx.eval(*arrays)
+    except RuntimeError as e:
+        if "pipeline limit" in str(e):
+            pytest.skip(str(e))
+        raise
+
+
 def _check(D, qL, kL, dtype, Hq=32, Hkv=16, strided=False):
     causal = qL > 1  # qL==1 attends all keys; offset-causal is the verify regime
     scale = 1.0 / (D**0.5)
     q, k, v = _make(1, Hq, Hkv, qL, kL, D, dtype, seed=qL * 7 + kL + D, strided=strided)
     got = kq.sdpa_vector(q, k, v, scale, causal=causal)
     ref = _ref_sdpa(q, k, v, scale, causal)
-    mx.eval(got, ref)
+    _eval_or_skip(got, ref)
     rel = _rel(got, ref)
     bound = REL_BOUND[dtype]
     tag = "strided" if strided else "contig"
@@ -158,7 +170,7 @@ def _check_gqa(
         mx.eval(sk)
     got = kq.sdpa_decode_gqa(q, k, v, scale, sinks=sk, splits=splits, tile_c=tile_c)
     ref = _ref_sdpa_sinks(q, k, v, scale, sk)
-    mx.eval(got, ref)
+    _eval_or_skip(got, ref)
     rel = _rel(got, ref)
     bound = REL_BOUND[dtype]
     print(
