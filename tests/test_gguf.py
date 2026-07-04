@@ -92,3 +92,46 @@ def test_zero_copy_matches_copy(tmp_path):
         au = a if a.dtype == mx.uint8 else mx.view(a, mx.uint8)
         bu = b if b.dtype == mx.uint8 else mx.view(b, mx.uint8)
         assert bool(mx.all(au == bu)), f"byte mismatch in {name}"
+
+
+def test_verify_zero_copy_views(tmp_path):
+    """Donation-tripwire red/green: mapped views must keep their wire dtype,
+    no_alias names must not alias the mapping at all, owned arrays are exempt.
+    """
+    path = str(tmp_path / "views.gguf")
+    w = GGUFWriter(path, "smoke")
+    f16 = np.arange(64, dtype=np.float16).reshape(4, 16) * np.float16(0.25)
+    f32 = np.arange(32, dtype=np.float32).reshape(2, 16)
+    w.add_tensor("t.f16", f16, raw_dtype=GT.F16)
+    w.add_tensor("t.f32", f32, raw_dtype=GT.F32)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+    arrays, _, _, _ = kq.load_gguf(path)
+    a16, a32 = arrays["t.f16"], arrays["t.f32"]
+    mx.eval(a16, a32)
+    assert kq.zero_copy_view_count() >= 2
+
+    owned = mx.array(np.ones(8, dtype=np.float32))
+    mx.eval(owned)
+
+    # Green: untouched views carry their wire dtype; owned buffers are skipped.
+    assert kq.verify_zero_copy_views([("a", a16), ("b", a32), ("c", owned)]) == []
+
+    # Red: a same-itemsize reinterpret aliasing the mapping is exactly the
+    # footprint a donated dtype-changing cast leaves behind.
+    fake = mx.view(a16, mx.bfloat16)
+    mx.eval(fake)
+    (prob,) = kq.verify_zero_copy_views([("bad", fake)])
+    assert "bad" in prob and "float16" in prob and "bfloat16" in prob
+
+    # Red: names in no_alias must own their buffers even at matching dtype.
+    (prob,) = kq.verify_zero_copy_views([("t", a32)], no_alias=["t"])
+    assert "aliases" in prob
+    assert kq.verify_zero_copy_views([("t", owned)], no_alias=["t"]) == []
+
+    # Unevaluated arrays are reported, not silently skipped.
+    (prob,) = kq.verify_zero_copy_views([("z", a32 + 0.0)])
+    assert "unevaluated" in prob

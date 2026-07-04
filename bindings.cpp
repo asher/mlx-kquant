@@ -659,4 +659,45 @@ NB_MODULE(_ext, m) {
               - shapes: tensor name -> logical shape (GGUF native, innermost-first
                 order; matches gguf-py ReaderTensor.shape).
       )");
+
+  m.def(
+      "zero_copy_view_count",
+      &mlx_kquant::zero_copy_view_count,
+      "Number of live zero-copy GGUF tensor views (registered mmap ranges).");
+
+  m.def(
+      "verify_zero_copy_views",
+      [](nb::list items, std::vector<std::string> no_alias) {
+        std::vector<std::pair<std::string, mx::array>> pairs;
+        pairs.reserve(nb::len(items));
+        for (nb::handle h : items) {
+          auto t = nb::cast<nb::sequence>(h);
+          pairs.emplace_back(
+              nb::cast<std::string>(t[0]), nb::cast<mx::array>(t[1]));
+        }
+        return mlx_kquant::verify_zero_copy_views(pairs, no_alias);
+      },
+      "items"_a,
+      "no_alias"_a = std::vector<std::string>{},
+      R"(
+        Check (name, array) pairs against the live zero-copy GGUF mappings.
+
+        Returns a list of problem strings, one per violation: an array whose
+        buffer sits inside a mapped GGUF tensor range but whose dtype differs
+        from the wire dtype recorded at load (integer-to-integer reinterprets
+        allowed), or an array named in ``no_alias`` that aliases any mapping
+        (loader transforms must produce owned buffers). An empty list means
+        clean. This detects buffer donation into the file mapping: a donated
+        dtype-changing copy leaves an array typed X over wire bytes typed Y,
+        and the write is dropped on read-only shared mappings. Arrays must be
+        evaluated first. Metadata-only; no tensor data is read.
+
+        Args:
+            items (list[tuple[str, array]]): named arrays to check, e.g.
+                ``mlx.utils.tree_flatten(model.parameters())``.
+            no_alias (list[str]): names that must not alias any mapping.
+
+        Returns:
+            list[str]: problem descriptions; empty when clean.
+      )");
 }
