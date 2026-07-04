@@ -513,8 +513,9 @@ GgufLoadResult load_gguf(const std::string& path, bool zero_copy /* = true */) {
   // deleters so the mmap outlives this function and is gguf_close'd (munmap'd)
   // only when the last viewing array is freed. With zero_copy=false no array
   // captures it, so it is closed when this local ref drops on return.
-  // Read-only mapping (PROT_READ/MAP_PRIVATE): a zero-copy array views the
-  // mmapped tensor bytes, so the source file must never be writable through it.
+  // Read-only mapping (default PROT_READ/MAP_SHARED; see KQ_GGUF_MMAP in
+  // cmake/patch-gguflib.cmake): tensor pages stay clean, evictable file-cache
+  // pages and the source file can never be written through a zero-copy view.
   std::shared_ptr<gguf_ctx> ctx(gguf_open_ro(path.c_str()), gguf_close);
   if (!ctx) {
     throw std::runtime_error("[load_gguf] gguf_open_ro failed for " + path);
