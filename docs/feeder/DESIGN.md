@@ -265,6 +265,16 @@ old+new overlap is bounded to one layer's stacks. `arena_alloc`'s deleter
 frees to the OS directly (no allocator cache), which is what makes the
 reallocation an actual release.
 
+Validated live against the 162 GB MiniMax on the M3 Max: an inducer
+holding incompressible memory flipped the kernel to warning, the arena
+stepped down (one step per still-growing pressure source poll, to the
+floor under sustained growth), swap never moved, decode never stalled,
+and the generation stayed byte-identical. The regrow headroom check must
+count only free + speculative + purgeable pages - counting inactive
+(which includes other processes' anon memory, reclaimable only through
+swap) let a 17 GB regrow push ~11 GB of anon to swap before the check
+was tightened.
+
 ## Remaining work
 
 1. **NAX comparison**: measure the NAX rhs leaf vs the new ALU kernel on an
