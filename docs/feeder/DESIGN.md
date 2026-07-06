@@ -190,21 +190,79 @@ prefill on a non-NAX GPU, in-RAM models included, so it is not a feeder
 component - the feeder just no longer has a kernel-bound regime below the
 SSD sweep floor.
 
+## Landed: the decode feeder, stage A
+
+The wired arena and the popularity residency manager are landed in gguf-mlx
+(`gguf_mlx/decode_feeder.py`, `KQ_FEEDER_DECODE=1`), without the encoded
+event pair: per-layer wired arenas (`arena_alloc` + `mlock`) hold the
+popular subset of each layer's expert stacks, decode-sized calls remap the
+router's expert ids to arena slots on the host, and the stock gather
+kernels run on the GPU stream from the arena. Misses are pread
+(`F_NOCACHE`) straight into evicted slots. Two pieces of the original plan
+turned out unnecessary at decode granularity:
+
+- **No staging ring.** The offload wrapper already evaluates the router
+  per layer, and layer L's router depends on everything before it - so
+  when layer L stages for token t, the last gather that referenced layer
+  L's arena (token t-1's) has completed, and any slot may be overwritten.
+  Eviction, adoption and staging are one operation.
+- **No event pair.** Host-side synchronization suffices for the same
+  reason. The encoded pair remains stage B (below).
+
+Eviction picks the least-popular resident (decayed LFU counts) never one
+the current call routes to; the arena starts empty and self-organizes.
+Small prefill chunks (<= `KQ_ARENA_STAGE_MAX_TOKENS`, default 64) take the
+same path when their routed set fits, which is what makes repeat
+short-prompt TTFT cheap in a live session; on overflow they fall back to
+**router-aware partial staging** in the prefill feeder
+(`prefill_partial_call`: pread only the routed experts' slices into the
+ring slot, original indices, no remap - remaining-work item 2, now done).
+
+Measured (162 GB MiniMax Q5_K_M, 128 GB M3 Max, 70.6 GB arena ~ f=0.44,
+greedy output identical to the CPU path throughout):
+
+| metric | page-cache decode | arena decode |
+|--------|-------------------|--------------|
+| 512-token generation | 2.4 tok/s | 4.0 tok/s avg, ~4.7 steady (89.8% hit) |
+| 53-token prompt TTFT | 19.4 s (whole-layer feeder) | 11.4 s (partial staging) |
+
+Hard-won sizing and wiring lessons:
+
+- **The arena must be mlocked.** Unlocked, the kernel pages the LFU-cold
+  tail to swap under exactly the pressure an over-RAM model creates, and a
+  hit that faults from swap is slower than the GGUF read it saved
+  (observed: 0.066 tok/s death spiral at 92 GB unlocked).
+- **Miss reads must be F_NOCACHE.** Cached, they recruit the page cache as
+  a competitor for the same RAM the arena is wired into.
+- **Size against three ceilings**: the GPU working-set budget, a physical-
+  RAM fraction (`KQ_DECODE_ARENA_RAM_FRAC`), and reclaimable-right-now
+  memory (vm_stat) so a machine already busy with other workloads offers
+  the arena less - minus spine and KV reserve, capped at the expert bytes.
+- **Do not background-seed the arena.** A demand miss is a perfectly
+  targeted read; a seed is a popularity guess, and the SSD is saturated by
+  demand misses during exactly the window seeding would help. Measured
+  net-negative; organic fill converges in a few dozen tokens.
+
 ## Remaining work
 
 1. **NAX comparison**: measure the NAX rhs leaf vs the new ALU kernel on an
    M5-class GPU (`KQ_DISABLE_NAX=1` now falls back to the tuned ALU kernel
    instead of the per-row path, so the A/B is clean).
-2. **Router-aware partial staging** for small chunks: eval the router before
-   staging and pread only the routed experts' slices - closes the short-
-   prompt gap where whole-layer staging over-reads.
-3. **The decode feeder** (the original architecture): pre-encoded per-token
-   command buffers with the event pair, wired arena + popularity residency
-   manager, staging ring for misses, watchdog poison recovery. One empirical
-   caution: measured token-to-token routing reuse on MiniMax-M2.7 (256
-   experts, top-8) is only ~30%, so speculative next-layer prefetch of the
-   previous token's experts wastes most of its reads; popularity pinning
-   across a window is the mechanism that pays, not per-token speculation.
+2. **Decode feeder stage B** (the encoded event pair): pre-encoded
+   per-token command buffers with `kq.event_signal`/`kq.event_wait` and
+   watchdog poison, removing stage A's per-layer eval tax (~1-10 ms/token
+   against a 200+ ms IO-bound token; only worth building if profiling shows
+   the sync tax matters at higher residency). Caution: one command buffer
+   referencing the whole arena re-enters the large-single-buffer wiring
+   regime the Metal watchdog kills; stage B needs the arena referenced
+   per-layer or a residency set.
+3. **Pressure-adaptive arena shrink**: react to memory pressure arriving
+   after load (another workload starts) by munlocking and MADV_FREE-ing
+   the coldest slots instead of letting the kernel swap other tenants.
+   The original empirical caution stands: token-to-token routing reuse on
+   MiniMax-M2.7 (256 experts, top-8) is only ~30%, so per-token speculative
+   prefetch wastes most of its reads; popularity pinning across a window
+   (stage A's LFU) is the mechanism that pays.
 
 ## Files
 
