@@ -946,6 +946,13 @@ void shared_event_set(uint64_t handle, uint64_t value);
 uint64_t shared_event_read(uint64_t handle);
 bool shared_event_wait(uint64_t handle, uint64_t value, int64_t timeout_ms);
 
+// Writable zero-copy host buffer: page-aligned host memory wrapped no-copy
+// in a Metal shared-storage buffer, as a uint8 array of `shape` plus the raw
+// base address (for the Python binding's writable memoryview over the same
+// bytes; valid exactly as long as the array lives). The CPU-write -> GPU-read
+// ordering contract is the caller's, via the event ops below.
+std::pair<mx::array, uintptr_t> arena_alloc(const mx::Shape& shape);
+
 // Stream side: identity ops on `x` that encode an MTLSharedEvent signal/wait
 // at their position in the graph's evaluation order. The returned array
 // aliases x and MUST be threaded into downstream compute (or evaluated

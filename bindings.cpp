@@ -701,6 +701,36 @@ NB_MODULE(_ext, m) {
             list[str]: problem descriptions; empty when clean.
       )");
 
+  // --- feeder-loop support: writable zero-copy buffers + shared events ---
+
+  m.def(
+      "arena_alloc",
+      [](const std::vector<int>& shape) {
+        auto [arr, addr] = mlx_kquant::arena_alloc(
+            mlx::core::Shape(shape.begin(), shape.end()));
+        PyObject* mv = PyMemoryView_FromMemory(
+            reinterpret_cast<char*>(addr),
+            static_cast<Py_ssize_t>(arr.nbytes()),
+            PyBUF_WRITE);
+        if (mv == nullptr) {
+          throw nb::python_error();
+        }
+        return nb::make_tuple(arr, nb::steal(mv));
+      },
+      "shape"_a,
+      R"(
+        Allocate a page-aligned host buffer wrapped zero-copy as a Metal
+        shared-storage uint8 array.
+
+        Returns (array, memoryview): the same bytes seen from both sides.
+        The writable memoryview is the CPU feeder's window (os.preadv into
+        slices of it reads disk straight into GPU-visible memory); the array
+        is what kernels consume. The memoryview is valid only while the array
+        is alive - hold them together. Writes become safely visible to GPU
+        work encoded after an event_wait whose value the writer signals
+        (shared_event_set) after writing; nothing else orders them.
+      )");
+
   // --- shared-event stream primitives (feeder loop) ---
 
   m.def(

@@ -23,6 +23,7 @@ import mlx.core as _mx  # noqa: F401
 
 from ._ext import (  # noqa: F401
     add_rmsnorm,
+    arena_alloc,
     codecs,
     cpu_neon_available,
     dequantize,
@@ -61,6 +62,7 @@ from ._version import __version__
 __all__ = [
     "__version__",
     "add_rmsnorm",
+    "arena_alloc",
     "codecs",
     "cpu_neon_available",
     "dequantize",
