@@ -164,30 +164,47 @@ layers, q5_k on others) make shapes non-uniform.
 Measured on the 162 GB MiniMax Q5_K_M (128 GB M3 Max, greedy output
 verified identical with the feeder on and off):
 
-| prompt tokens | page-cache prefill | feeder prefill |
-|---------------|--------------------|----------------|
-| 46            | 1.78 tok/s         | 1.78 tok/s     |
-| 829           | 18.7 tok/s         | 33.1 tok/s     |
-| 7101          | 55.5 tok/s         | 61.2 tok/s     |
+| prompt tokens | page-cache prefill | feeder prefill | + gather_qmm_rhs |
+|---------------|--------------------|----------------|------------------|
+| 46            | 1.78 tok/s         | 1.78 tok/s     |                  |
+| 829           | 18.7 tok/s         | 33.1 tok/s     |                  |
+| 7101          | 55.5 tok/s         | 61.2 tok/s     | 211.0 tok/s      |
 
 Interpretation: at 829 tokens the feeder sits on the SSD full-sweep floor
 (829 tok / 33.1 = 25.0 s vs a 22.8 s sweep) - the page-cache double pass is
 gone. At 46 tokens it's a wash: whole-layer staging reads all experts while
 the page-cache path only faults the ~77% a small chunk routes to; the extra
 bytes cancel the reclaim penalty (router-aware partial staging would win
-here). At 7k+ the ALU `gather_qmm` rate (~16 ms/token at that batch, no NAX
-on M3) binds both paths; that ceiling is the kernel/NAX item below. Two
-side effects worth knowing: decode right after a feeder prefill starts
-~10-15% slower (the page cache is cold - the feeder never populates it),
-and the ring wires ~2 x 2.7 GB while prefilling.
+here). At 7k+ the compute rate binds both paths; the last column is the
+non-NAX sorted-rhs kernel below lifting that ceiling 3.3x. Two side effects
+worth knowing: decode right after a feeder prefill starts ~10-15% slower
+(the page cache is cold - the feeder never populates it), and the ring wires
+~2 x 2.7 GB while prefilling.
+
+## Landed: non-NAX gather_qmm_rhs (the long-prefill compute ceiling)
+
+The 7k+ ceiling above was the missing non-NAX sorted-rhs kernel: SwitchGLU's
+sorted prefill arrives as B rows of M=1, and without a segment-walking GEMM
+the batch decomposed into per-row gather tiles at a fraction of the machine.
+`kq_gather_qmm_rhs_impl` (steel simdgroup-mma, per-expert row segments,
+all 19 codecs) now serves that shape on GPUs without NAX, with the same
+routing conditions as the NAX leaf and a `KQ_DISABLE_GATHER_RHS_ALU=1` A/B
+lever. Measured on the M3 Max: kernel-level 7.7-9.5 TFLOPS at T=4096
+(vs 1.3-2.0 for the per-row path); end-to-end 7k prefill 491 -> 1294 tok/s
+on in-RAM Qwen3.6-35B-A3B pure-GPU and 64.8 -> 211.0 tok/s on the MiniMax
+feeder run above. Short prompts see less (B/E is small, expert tiles are
+re-read per 64-row tile): 1.45x at T=512. Landing this also surfaced an
+op-level contiguity bug affecting the NAX leaf: flags of an unevaluated
+sliced w are meaningless at op-build time, so the compaction was skipped on
+the slice's first eval and the stride-less rhs kernels mis-walked experts;
+the op now always inserts the Contiguous node (zero-copy when already
+packed).
 
 ## Remaining work
 
-1. **Long-prefill compute ceiling**: on NAX-less GPUs the ALU gather_qmm is
-   the bound. Options: a tuned prefill qmm (threadgroup dequant + simdgroup
-   matmul), or staged dequant-to-fp16 + dense matmul per ring slot. On an
-   M5-class GPU the existing NAX path may erase this without new work -
-   measure there first.
+1. **NAX comparison**: measure the NAX rhs leaf vs the new ALU kernel on an
+   M5-class GPU (`KQ_DISABLE_NAX=1` now falls back to the tuned ALU kernel
+   instead of the per-row path, so the A/B is clean).
 2. **Router-aware partial staging** for small chunks: eval the router before
    staging and pread only the routed experts' slices - closes the short-
    prompt gap where whole-layer staging over-reads.
