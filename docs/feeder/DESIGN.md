@@ -1,8 +1,11 @@
 # Feeder loop: GPU-resident MoE decode for larger-than-RAM models
 
-Status: validated prototype (`feeder.swift`), not yet integrated. This document
-records the architecture, the measurements that justify it, and the integration
-plan as a kq primitive pair.
+Status: the handoff primitives are implemented and tested on this branch
+(`kq.event_signal` / `kq.event_wait` + the `shared_event_*` host API,
+`src/kquant_event.cpp`, `tests/test_events.py`); the architecture was
+validated first by a standalone prototype (`feeder.swift`). This document
+records the architecture, the measurements that justify it, and the remaining
+integration plan.
 
 ## Problem
 
@@ -106,28 +109,58 @@ decode on the same model/box runs ~1–3 tok/s. The architecture is worth
 roughly 4–10× on decode depending on quant and residency, before any prefill
 work.
 
-## Integration plan (kq primitive pair)
+## The primitive pair (implemented on this branch)
 
-1. `kq.event_signal(x, event_id, value)` / `kq.event_wait(x, event_id, value)`
-   — thin eval-time ops that encode `encodeSignalEvent` / `encodeWaitForEvent`
-   on the Metal stream's active command encoder, threading `x` through as a
-   data dependency so lazy evaluation orders them correctly. CPU
-   implementations are no-ops (identity), so placement fallbacks stay legal.
-2. `kq.moe_gather_staged(x, ids, arena, ring, resident_table, slot_table)` —
-   the fused gather/gemv variant that resolves each expert id to arena or ring
-   at runtime. This is the existing fused MoE kernel plus one indirection.
-3. A feeder thread owned by the loader (gguf-mlx side): shares the event ids,
-   the GGUF fds, and the residency manager. The decode path becomes: encode
-   token graph (signal/wait pairs baked in), `mx.async_eval`, feeder services
-   layers as the GPU reaches them.
-4. Watchdog + poison recovery in the feeder; on poison, discard the token's
+`kq.event_signal(x, handle, value)` / `kq.event_wait(x, handle, value)` are
+identity ops that end the active compute encoder and encode
+`encodeSignalEvent` / `encodeWait` on the stream's command buffer at their
+position in evaluation order, threading `x` through as a data dependency so
+lazy evaluation orders them. CPU evals are plain identities, so placement
+fallbacks stay legal. `kq.shared_event_create/destroy/set/read/wait` is the
+host side (the feeder's half of each edge); `shared_event_wait` releases the
+GIL. Functional coverage in `tests/test_events.py` includes a live
+feeder-thread handoff, a wedged wait drained by the `UINT64_MAX` poison with
+the device healthy afterwards, and a signal/wait pair separated by enough ops
+to force command-buffer splits — splitting can serialize the pair but not
+deadlock it, because a wait's satisfying signal always comes from the host.
+
+Two findings from benchmarking the pair inside real MLX graphs:
+
+- A per-layer handoff pair costs ~160 µs when the feeder answers just-in-time
+  (the encoded wait actually blocks: GPU-idle wake dominates, matching the
+  harness numbers) and ~20 µs when the feeder has already signaled. At 62
+  layers that brackets the sync tax per token between ~1 and ~10 ms — small
+  against the IO term either way, and the blocked case only occurs when IO is
+  the bottleneck anyway.
+- The existing fused kq gather kernels already run the full MiniMax-geometry
+  expert token (62 layers × top-8, q5_k gate/up + q6_k down) from a resident
+  arena at ~16 ms/token (~320 GB/s effective) when chained into one graph per
+  token. **No new Metal kernel is required**: the feeder owns the router ids
+  at the handoff edge, so it can resolve expert id → arena/ring slot on the
+  host and hand the stock gather kernels a slot-index array. The
+  `moe_gather_staged` kernel this plan originally called for is unnecessary.
+
+## Remaining integration (gguf-mlx side)
+
+1. A CPU-writable, GPU-visible allocation for the staging ring and the
+   per-layer slot-index arrays (the one plumbing gap: MLX arrays are
+   immutable from Python, so the feeder needs either a small kq helper that
+   wraps feeder-owned host memory as a zero-copy array, or the writable
+   variant of the GGUF zero-copy loader machinery).
+2. The feeder thread owned by the loader: shares the event handles, the GGUF
+   fds, and a popularity-based residency manager over a wired expert arena
+   (residency fraction f is the whole game — see the prototype table).
+   Decode becomes: build the token graph with signal/wait pairs and
+   slot-indexed gathers baked in, `mx.async_eval`, feeder services layers as
+   the GPU reaches them.
+3. Watchdog + poison recovery in the feeder; on poison, discard the token's
    arrays and rebuild the stream.
 
-The risk to retire first in integration is MLX's command-buffer splitting:
-`MLX_MAX_OPS_PER_BUFFER` must be large enough (or the ops must force
-buffer boundaries deliberately) that a wait and its satisfying feeder write
-never end up ordered wrong across a split. The prototype sidesteps this by
-hand-encoding one buffer per token; the primitive version must assert it.
+One empirical caution for the residency manager: measured token-to-token
+routing reuse on MiniMax-M2.7 (256 experts, top-8) is only ~30%, so
+speculative next-layer prefetch of the previous token's experts wastes most
+of its reads; popularity pinning across a window is the mechanism that pays,
+not per-token speculation.
 
 ## Files
 

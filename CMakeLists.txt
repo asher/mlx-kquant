@@ -105,6 +105,7 @@ target_sources(
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_norm_fused.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gather.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_encode.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_event.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gguf.cpp)
 
 # The IQ CPU encoders must match llama-quantize bit-for-bit on the deterministic
