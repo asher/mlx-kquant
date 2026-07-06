@@ -192,8 +192,21 @@ routing conditions as the NAX leaf and a `KQ_DISABLE_GATHER_RHS_ALU=1` A/B
 lever. Measured on the M3 Max: kernel-level 7.7-9.5 TFLOPS at T=4096
 (vs 1.3-2.0 for the per-row path); end-to-end 7k prefill 491 -> 1294 tok/s
 on in-RAM Qwen3.6-35B-A3B pure-GPU and 64.8 -> 211.0 tok/s on the MiniMax
-feeder run above. Short prompts see less (B/E is small, expert tiles are
-re-read per 64-row tile): 1.45x at T=512. Landing this also surfaced an
+feeder run above.
+
+The row tile height BM adapts to the batch's rows-per-expert (M/E): every
+expert segment in a tile pays a full-tile mma K-loop, so utilization is
+roughly 1/segments-per-tile and a fixed BM=64 runs mid-size batches at a
+fraction of the machine. Dispatch picks 16 / 32 / 64 at M/E thresholds
+40 / 384 (M3 Max sweep; `KQ_GATHER_RHS_BM` forces a height for retuning -
+worth re-sweeping on other GPU generations). q5_k sweep, TFLOPS by M/E:
+BM=16 wins <=32 (4.08 vs 2.27 at 16), BM=32 wins 48-256 (8.76 vs 7.95 at
+128), BM=64 wins >=512. End-to-end A3B: 802-token prompt 943 -> 1199 tok/s
+(+25%) vs fixed BM=64, 7k +10.5% (chunks of 4096 land in the BM=32 band).
+Beware first-run numbers when measuring this: the first prefill after a
+load pays the page-cache faults for the whole mmap and reads ~35% slow.
+
+Landing the base kernel also surfaced an
 op-level contiguity bug affecting the NAX leaf: flags of an unevaluated
 sliced w are meaningless at op-build time, so the compaction was skipped on
 the slice's first eval and the stride-less rhs kernels mis-walked experts;
