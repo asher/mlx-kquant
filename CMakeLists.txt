@@ -30,6 +30,27 @@ find_package(
   COMPONENTS Interpreter Development.Module
   REQUIRED)
 
+# nanobind must be the exact version the mlx wheel was built with (pinned in
+# [build-system].requires; keep the two in sync). A different version builds
+# and links CLEANLY but shares no nanobind ABI domain with mlx.core at
+# runtime, so every mlx array crossing the C++/Python boundary fails with
+# "incompatible function arguments". Build isolation installs the pin;
+# non-isolated dev builds (build_ext --inplace, -e --no-build-isolation) use
+# whatever the venv has - guard that path here.
+set(KQ_NANOBIND_PIN "2.12.0")
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" -c "import nanobind; print(nanobind.__version__)"
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  OUTPUT_VARIABLE KQ_NANOBIND_FOUND)
+if(NOT KQ_NANOBIND_FOUND VERSION_EQUAL KQ_NANOBIND_PIN)
+  message(
+    FATAL_ERROR
+      "nanobind ${KQ_NANOBIND_FOUND} found, but mlx's nanobind ABI requires "
+      "exactly ${KQ_NANOBIND_PIN} (a mismatch builds fine and fails at "
+      "runtime on every array argument). Fix: pip install nanobind==${KQ_NANOBIND_PIN}"
+  )
+endif()
+
 execute_process(
   COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
   OUTPUT_STRIP_TRAILING_WHITESPACE

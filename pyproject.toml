@@ -3,6 +3,8 @@ requires = [
   "setuptools>=77",
   "cmake>=3.27",
   "mlx==0.31.2",
+  # Must match mlx's nanobind ABI exactly; CMakeLists.txt (KQ_NANOBIND_PIN)
+  # enforces it at configure time for non-isolated builds - keep in sync.
   "nanobind==2.12.0",
 ]
 build-backend = "setuptools.build_meta"
