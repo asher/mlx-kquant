@@ -596,19 +596,24 @@ instantiate_kquant_iq1_m_for_type(float16_t)
     // clang-format on
 
 // clang-format off
-#define instantiate_kquant_gather_qmm_rhs(type, gs, bits, aligned_N, codec) \
-  instantiate_kernel(                                                       \
-      "kquant_" #codec "_gather_qmm_rhs_nt_" #type "_gs_" #gs "_b_" #bits   \
-          "_bm_64_bn_64_bk_32_wm_2_wn_2_alN_" #aligned_N,                   \
-      kq_ ## codec ## _gather_qmm_rhs,                                      \
-      type,                                                                 \
-      gs,                                                                   \
-      bits,                                                                 \
-      aligned_N)
+#define instantiate_kquant_gather_qmm_rhs(type, gs, bits, aligned_N, bm, codec) \
+  instantiate_kernel(                                                           \
+      "kquant_" #codec "_gather_qmm_rhs_nt_" #type "_gs_" #gs "_b_" #bits       \
+          "_bm_" #bm "_bn_64_bk_32_wm_2_wn_2_alN_" #aligned_N,                  \
+      kq_ ## codec ## _gather_qmm_rhs,                                          \
+      type,                                                                     \
+      gs,                                                                       \
+      bits,                                                                     \
+      aligned_N,                                                                \
+      bm)
 
 #define instantiate_kquant_gather_qmm_rhs_for_type(type, gs, bits, codec) \
-  instantiate_kquant_gather_qmm_rhs(type, gs, bits, true, codec)          \
-  instantiate_kquant_gather_qmm_rhs(type, gs, bits, false, codec)
+  instantiate_kquant_gather_qmm_rhs(type, gs, bits, true, 64, codec)      \
+  instantiate_kquant_gather_qmm_rhs(type, gs, bits, false, 64, codec)     \
+  instantiate_kquant_gather_qmm_rhs(type, gs, bits, true, 32, codec)      \
+  instantiate_kquant_gather_qmm_rhs(type, gs, bits, false, 32, codec)     \
+  instantiate_kquant_gather_qmm_rhs(type, gs, bits, true, 16, codec)      \
+  instantiate_kquant_gather_qmm_rhs(type, gs, bits, false, 16, codec)
 
 #define instantiate_kquant_gather_qmm_rhs_codec(gs, bits, codec)             \
   instantiate_kquant_gather_qmm_rhs_for_type(float, gs, bits, codec)         \

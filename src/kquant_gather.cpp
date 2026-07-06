@@ -345,6 +345,10 @@ void gather_qmm_rhs_nax(
 // and indices, M = total row count), but M/K alignment is handled dynamically
 // in-kernel and only N alignment is baked into the kernel name; K must be a
 // multiple of the 32-wide K tile, which every kquant block size guarantees.
+// The row tile BM adapts to the batch's rows-per-expert (M/E): each expert
+// segment in a tile pays a full-tile mma K-loop, so a BM much larger than a
+// segment wastes most of every matmul, and a BM=64 tile at 16 rows/expert
+// runs at ~25% utilization.
 void gather_qmm_rhs(
     const array& x,
     const array& w,
@@ -356,10 +360,21 @@ void gather_qmm_rhs(
     int M,
     int N,
     int K,
+    int E,
     Device& d,
     const Stream& s,
     const std::string& kquant_type) {
-  int bm = 64, bn = 64, bk = 32, wm = 2, wn = 2;
+  int bn = 64, bk = 32, wm = 2, wn = 2;
+  const int rows_per_expert = M / std::max(E, 1);
+  int bm = rows_per_expert >= 384 ? 64 : (rows_per_expert >= 40 ? 32 : 16);
+  // Tuning lever: force a tile height (16/32/64). Read live - only reached
+  // on the sorted prefill path, so the getenv cost is negligible.
+  if (const char* e = std::getenv("KQ_GATHER_RHS_BM")) {
+    int v = std::atoi(e);
+    if (v == 16 || v == 32 || v == 64) {
+      bm = v;
+    }
+  }
   bool aligned = (N % bn) == 0;
 
   std::string type_string = kq_type_string(x.dtype());
@@ -846,6 +861,7 @@ void KQuantGatherQMM::eval_gpu(
           /*M=*/static_cast<int>(x.size() / K),
           N,
           K,
+          E,
           d,
           s,
           kquant_type_);

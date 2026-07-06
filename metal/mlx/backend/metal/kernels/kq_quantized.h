@@ -2362,8 +2362,13 @@ METAL_FUNC void kq_gather_qmm_rhs_impl(
   }
 }
 
+// BM is a template parameter (64/32/16): sorted prefill batches with few
+// rows per expert fragment each row tile into per-expert segments that each
+// pay a full-tile mma K-loop, so utilization is ~1/segments-per-tile. The
+// dispatch picks the largest BM not much above the batch's rows-per-expert.
 #define KQ_DEFINE_GATHER_QMM_RHS(CODEC, LOADER)                       \
-  template <typename T, int group_size, int bits, bool aligned_N>     \
+  template <typename T, int group_size, int bits, bool aligned_N,     \
+            int BM>                                                   \
   [[kernel]] void kq_##CODEC##_gather_qmm_rhs(                        \
       const device T* x [[buffer(0)]],                                \
       const device uint8_t* w [[buffer(1)]],                          \
@@ -2376,7 +2381,7 @@ METAL_FUNC void kq_gather_qmm_rhs_impl(
       uint3 tid [[threadgroup_position_in_grid]],                     \
       uint simd_gid [[simdgroup_index_in_threadgroup]],               \
       uint simd_lid [[thread_index_in_simdgroup]]) {                  \
-    constexpr int BM = 64, BK = 32, BN = 64;                          \
+    constexpr int BK = 32, BN = 64;                                   \
     constexpr int BK_padded = (BK + 16 / sizeof(T));                  \
     using LoaderW = LOADER<                                           \
         T,                                                            \
