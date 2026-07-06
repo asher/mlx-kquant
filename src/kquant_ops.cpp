@@ -376,23 +376,26 @@ mx::array gather_qmm(
 
   // Cast x to the output dtype; row-contiguize x / w / scales at the op level.
   //
-  // w needs FULL row-contiguity ONLY when the rhs_nax prefill leaf is reachable
-  // (right_sorted && transpose && codec has a fused matmul kernel): that kernel
-  // bakes dense expert packing into func consts and takes NO w strides, so the
-  // rhs_nax leaf needs a fully row-contiguous w. Every
+  // w needs FULL row-contiguity ONLY when a gather_qmm_rhs prefill leaf is
+  // reachable (right_sorted && transpose && codec has a fused matmul kernel):
+  // those kernels assume dense expert packing and take NO w strides. Every
   // other leaf (qmv decode / qmm) walks w's strides, so matrix-contiguity (a
   // strided LEADING/expert dim, no copy) suffices and is what keeps the fused
   // gate_up_exps slice from being copied wholesale on every DECODE gather - the
   // 5x-sensitive hot path. x / scales always take the cheaper matrix check: the
-  // eval_gpu rhs_nax gate already requires x.row_contiguous (skips rhs_nax
+  // eval_gpu rhs gate already requires x.row_contiguous (skips the rhs leaf
   // otherwise, routing to a strided-safe leaf), and scales is a (1,)
   // placeholder.
-  bool rhs_nax_reachable =
-      right_sorted && transpose && codec->has_matmul_kernel;
+  bool rhs_reachable = right_sorted && transpose && codec->has_matmul_kernel;
   auto x_c = kq_ensure_row_contiguous_matrix(mx::astype(x, out_type, s), s);
-  auto w_c = rhs_nax_reachable
-      ? (w.flags().row_contiguous ? w : mx::contiguous(w, false, s))
-      : kq_ensure_row_contiguous_matrix(w, s);
+  // Always insert the Contiguous node when the rhs leaf is reachable: flags
+  // of an UNEVALUATED array (e.g. a fresh gate/up slice view) are not
+  // meaningful at op-build time, so a `w.flags().row_contiguous ? w : ...`
+  // short-circuit here skipped the compaction on the slice's first eval and
+  // handed the stride-less rhs kernels an expert stride they mis-walk.
+  // Contiguous::eval aliases zero-copy when w turns out packed anyway.
+  auto w_c = rhs_reachable ? mx::contiguous(w, false, s)
+                           : kq_ensure_row_contiguous_matrix(w, s);
   auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
 
   return mx::array(
