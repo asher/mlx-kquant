@@ -3,8 +3,9 @@
 Status: the handoff primitives are implemented and tested on this branch
 (`kq.event_signal` / `kq.event_wait` + the `shared_event_*` host API,
 `src/kquant_event.cpp`, `tests/test_events.py`); the architecture was
-validated first by a standalone prototype (`feeder.swift`). This document
-records the architecture, the measurements that justify it, and the remaining
+validated first by a standalone prototype
+(`benchmarks/feeder/prototype/feeder.swift`). This document records the
+architecture, the measurements that justify it, and the remaining
 integration plan.
 
 ## Problem
@@ -32,7 +33,8 @@ won't-fix (mlx#3142). This design gets the same unbroken-stream property from
 
 ## Key facts the design rests on
 
-Established on an M3 Max (128 GB), macOS 15, with `harness.swift`:
+Established on an M3 Max (128 GB), macOS 15, with
+`benchmarks/feeder/prototype/harness.swift`:
 
 - MLX's default fence path already encodes mid-buffer `MTLSharedEvent`
   signal/wait pairs. A pre-satisfied encoded wait costs ~20 µs marginal; a
@@ -85,9 +87,10 @@ Components for a real integration:
 
 ## Prototype results
 
-`feeder.swift` simulates MiniMax-M2.7-class decode (62 layers, 256 experts,
-top-8, ~9.28 MiB/expert at Q5_K_M) with bandwidth-faithful kernels reading the
-real 162 GB GGUF (`F_NOCACHE`, qd8). Median steady-state token, M3 Max:
+`benchmarks/feeder/prototype/feeder.swift` simulates MiniMax-M2.7-class
+decode (62 layers, 256 experts, top-8, ~9.28 MiB/expert at Q5_K_M) with
+bandwidth-faithful kernels reading the real 162 GB GGUF (`F_NOCACHE`, qd8).
+Median steady-state token, M3 Max:
 
 | resident fraction f | mode      | tok/s |
 |---------------------|-----------|-------|
@@ -198,7 +201,17 @@ and the ring wires ~2 x 2.7 GB while prefilling.
 
 ## Files
 
-- `feeder.swift` — the prototype (standalone, `swiftc -O feeder.swift`).
-  Usage: `feeder <residentPct> <demand|prefetch> <tokens> [--kill-feeder]`.
-- `harness.swift` — sync/coherence/IO measurement harness that produced the
-  primitive-cost numbers above.
+The runnable artifacts behind the numbers in this document live in
+[`benchmarks/feeder/`](../../benchmarks/feeder/):
+
+- [`bench_feeder_mlx.py`](../../benchmarks/feeder/bench_feeder_mlx.py) —
+  handoff-pair cost and expert-gather rate through the kq primitives in real
+  MLX graphs. Re-run this on new hardware (e.g. an M5 with NAX) to revisit
+  the compute-ceiling numbers.
+- [`prototype/feeder.swift`](../../benchmarks/feeder/prototype/feeder.swift)
+  — the standalone Swift/Metal prototype (`swiftc -O feeder.swift`; usage:
+  `feeder <residentPct> <demand|prefetch> <tokens> [--kill-feeder]`). Frozen
+  reference for the prototype results table.
+- [`prototype/harness.swift`](../../benchmarks/feeder/prototype/harness.swift)
+  — sync/coherence/IO measurement harness that produced the primitive-cost
+  numbers above. Frozen reference.
