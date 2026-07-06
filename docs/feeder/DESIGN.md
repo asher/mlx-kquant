@@ -243,6 +243,28 @@ Hard-won sizing and wiring lessons:
   demand misses during exactly the window seeding would help. Measured
   net-negative; organic fill converges in a few dozen tokens.
 
+### Pressure-adaptive shrink (landed)
+
+The load-time ceilings answer a machine that is busy *at load*; pressure
+arriving afterward (another model, a build) meets a wired arena the kernel
+cannot reclaim. The feeder now polls
+`kern.memorystatus_vm_pressure_level` between stage calls and steps the
+arena target down under warning/critical (two steps at critical), floored
+at a quarter of the sized capacity, regrowing a step at a time after
+sustained normal pressure *and* measured reclaimable-RAM headroom.
+`KQ_DECODE_PRESSURE=0` opts out.
+
+The original sketch here - munlock + `MADV_FREE` the coldest slots in
+place - does not work on the GPU path: gathers reference the layer's whole
+Metal buffer every token, so its pages stay GPU-resident whatever madvise
+says. The landed mechanism instead *reallocates* each layer's arena
+smaller at that layer's own stage call (the stage-A eval fence makes the
+swap safe), copying the layer's most popular residents across - so a
+shrink costs the LFU-cold tail, never the hot set, and the transient
+old+new overlap is bounded to one layer's stacks. `arena_alloc`'s deleter
+frees to the OS directly (no allocator cache), which is what makes the
+reallocation an actual release.
+
 ## Remaining work
 
 1. **NAX comparison**: measure the NAX rhs leaf vs the new ALU kernel on an
@@ -255,14 +277,9 @@ Hard-won sizing and wiring lessons:
    the sync tax matters at higher residency). Caution: one command buffer
    referencing the whole arena re-enters the large-single-buffer wiring
    regime the Metal watchdog kills; stage B needs the arena referenced
-   per-layer or a residency set.
-3. **Pressure-adaptive arena shrink**: react to memory pressure arriving
-   after load (another workload starts) by munlocking and MADV_FREE-ing
-   the coldest slots instead of letting the kernel swap other tenants.
-   The original empirical caution stands: token-to-token routing reuse on
-   MiniMax-M2.7 (256 experts, top-8) is only ~30%, so per-token speculative
-   prefetch wastes most of its reads; popularity pinning across a window
-   (stage A's LFU) is the mechanism that pays.
+   per-layer or a residency set (`MTLResidencySet`, macOS 15+), and a
+   poisoned token is recomputed, not skipped (its input id was fixed
+   before encoding; the retry overwrites the same KV offsets).
 
 ## Files
 
