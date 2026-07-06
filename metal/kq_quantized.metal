@@ -594,3 +594,44 @@ instantiate_kquant_iq1_m_for_type(float)
 instantiate_kquant_iq1_m_for_type(bfloat16_t)
 instantiate_kquant_iq1_m_for_type(float16_t)
     // clang-format on
+
+// clang-format off
+#define instantiate_kquant_gather_qmm_rhs(type, gs, bits, aligned_N, codec) \
+  instantiate_kernel(                                                       \
+      "kquant_" #codec "_gather_qmm_rhs_nt_" #type "_gs_" #gs "_b_" #bits   \
+          "_bm_64_bn_64_bk_32_wm_2_wn_2_alN_" #aligned_N,                   \
+      kq_ ## codec ## _gather_qmm_rhs,                                      \
+      type,                                                                 \
+      gs,                                                                   \
+      bits,                                                                 \
+      aligned_N)
+
+#define instantiate_kquant_gather_qmm_rhs_for_type(type, gs, bits, codec) \
+  instantiate_kquant_gather_qmm_rhs(type, gs, bits, true, codec)          \
+  instantiate_kquant_gather_qmm_rhs(type, gs, bits, false, codec)
+
+#define instantiate_kquant_gather_qmm_rhs_codec(gs, bits, codec)             \
+  instantiate_kquant_gather_qmm_rhs_for_type(float, gs, bits, codec)         \
+  instantiate_kquant_gather_qmm_rhs_for_type(float16_t, gs, bits, codec)     \
+  instantiate_kquant_gather_qmm_rhs_for_type(bfloat16_t, gs, bits, codec)
+
+instantiate_kquant_gather_qmm_rhs_codec(32, 8, q8_0)
+instantiate_kquant_gather_qmm_rhs_codec(32, 4, q4_0)
+instantiate_kquant_gather_qmm_rhs_codec(32, 4, q4_1)
+instantiate_kquant_gather_qmm_rhs_codec(32, 5, q5_0)
+instantiate_kquant_gather_qmm_rhs_codec(32, 5, q5_1)
+instantiate_kquant_gather_qmm_rhs_codec(256, 4, q4_k)
+instantiate_kquant_gather_qmm_rhs_codec(256, 5, q5_k)
+instantiate_kquant_gather_qmm_rhs_codec(256, 6, q6_k)
+instantiate_kquant_gather_qmm_rhs_codec(256, 3, q3_k)
+instantiate_kquant_gather_qmm_rhs_codec(256, 2, q2_k)
+instantiate_kquant_gather_qmm_rhs_codec(32, 4, iq4_nl)
+instantiate_kquant_gather_qmm_rhs_codec(256, 4, iq4_xs)
+instantiate_kquant_gather_qmm_rhs_codec(256, 3, iq3_xxs)
+instantiate_kquant_gather_qmm_rhs_codec(256, 3, iq3_s)
+instantiate_kquant_gather_qmm_rhs_codec(256, 2, iq2_xxs)
+instantiate_kquant_gather_qmm_rhs_codec(256, 2, iq2_xs)
+instantiate_kquant_gather_qmm_rhs_codec(256, 2, iq2_s)
+instantiate_kquant_gather_qmm_rhs_codec(256, 1, iq1_s)
+instantiate_kquant_gather_qmm_rhs_codec(256, 1, iq1_m)
+    // clang-format on

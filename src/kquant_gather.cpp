@@ -5,9 +5,10 @@
 // availability is probed via kq_is_nax_available, and kquant carries no biases
 // so no bias buffer is plumbed through.
 //
-// The gather_qmm_rhs fast path is implemented here as gather_qmm_rhs_nax - the
-// only function-constant kernel (align_M/N/K at constant ids 200/201/202). It
-// requires right_sorted_ == true, which holds when lhs_indices is defaulted AND
+// The gather_qmm_rhs fast path has two backends: gather_qmm_rhs_nax - the
+// only function-constant kernel (align_M/N/K at constant ids 200/201/202) -
+// and the steel-mma gather_qmm_rhs for GPUs without NAX. Both
+// require right_sorted_ == true, which holds when lhs_indices is defaulted AND
 // sorted_indices is requested. mlx-lm's SwitchGLU sorts tokens by expert
 // (do_sort when indices.size>=64) and passes rhs_indices only, so
 // right_sorted_ == do_sort: MoE PREFILL takes this sorted per-expert GEMM
@@ -15,6 +16,7 @@
 // (top_k<64 -> no sort -> B<16) falls through to gather_qmv.
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -250,14 +252,13 @@ void gather_qmv(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// Sorted-rhs fast path (NAX-only, no biases): x rows are pre-sorted by expert
-// (lhs_indices defaulted), so a single batched GEMM walks contiguous per-expert
-// row blocks, switching the weight matrix per row-block from the sorted
-// `indices`. M here is the TOTAL row count (x.size()/K), NOT x.shape(-2)==1.
-// Unlike the other gather leaves this passes no index strides - it requires
-// row-contiguous x / indices (the caller guards this) and bakes align_M/N/K
-// into func consts 200/201/202. kquant has no non-NAX gather_qmm_rhs kernel, so
-// this is only ever reached when the NAX gate holds.
+// Sorted-rhs fast path (NAX variant, no biases): x rows are pre-sorted by
+// expert (lhs_indices defaulted), so a single batched GEMM walks contiguous
+// per-expert row blocks, switching the weight matrix per row-block from the
+// sorted `indices`. M here is the TOTAL row count (x.size()/K), NOT
+// x.shape(-2)==1. Unlike the other gather leaves this passes no index strides
+// - it requires row-contiguous x / indices (the caller guards this) and bakes
+// align_M/N/K into func consts 200/201/202.
 void gather_qmm_rhs_nax(
     const array& x,
     const array& w,
@@ -320,6 +321,71 @@ void gather_qmm_rhs_nax(
       align_K ? 't' : 'n');
 
   auto kernel = kq_get_kernel(d, kname, hash_name, func_consts);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+
+  MTL::Size group_dims(32, wn, wm);
+  MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, 1);
+
+  int c = 0;
+  ce.set_input_array(x, c++);
+  ce.set_input_array(w, c++);
+  ce.set_input_array(scales, c++);
+  ce.set_input_array(indices, c++);
+  ce.set_output_array(out, c++);
+  ce.set_bytes(M, c++);
+  ce.set_bytes(N, c++);
+  ce.set_bytes(K, c++);
+
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+// Sorted-rhs fast path, ALU (steel simdgroup-mma) variant for GPUs without
+// NAX. Same contract as gather_qmm_rhs_nax (transpose-only, row-contiguous x
+// and indices, M = total row count), but M/K alignment is handled dynamically
+// in-kernel and only N alignment is baked into the kernel name; K must be a
+// multiple of the 32-wide K tile, which every kquant block size guarantees.
+void gather_qmm_rhs(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& indices,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    Device& d,
+    const Stream& s,
+    const std::string& kquant_type) {
+  int bm = 64, bn = 64, bk = 32, wm = 2, wn = 2;
+  bool aligned = (N % bn) == 0;
+
+  std::string type_string = kq_type_string(x.dtype());
+  std::string kname;
+  kname.reserve(96);
+  mx::concatenate(
+      kname,
+      kq_kname_prefix(kquant_type) + "gather_qmm_rhs_nt_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_bm_",
+      bm,
+      "_bn_",
+      bn,
+      "_bk_",
+      bk,
+      "_wm_",
+      wm,
+      "_wn_",
+      wn,
+      aligned ? "_alN_true" : "_alN_false");
+
+  auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
 
@@ -733,34 +799,57 @@ void KQuantGatherQMM::eval_gpu(
 
   // Sorted-rhs fast path. When the expert
   // (rhs) indices are sorted and lhs was defaulted (right_sorted_), and the
-  // batch is large enough to amortize a per-expert GEMM, route to the NAX
-  // gather_qmm_rhs kernel instead of B separate gather_qmv vector-matmuls.
-  // kquant has no non-NAX rhs kernel, so the NAX gate must hold. We
+  // batch is large enough to amortize a per-expert GEMM, route to a
+  // gather_qmm_rhs kernel (NAX where available, steel-mma ALU otherwise)
+  // instead of B separate gather_qmv vector-matmuls. We
   // additionally require x and the rhs indices to already be row-contiguous
   // with one x row per output row (x.size()/K == B): the op keeps broadcast
-  // index strides for the strided leaves, whereas this kernel takes no strides.
-  // The SwitchGLU sort path satisfies all of this; any case that does not falls
-  // through to the (correct, slower) gather_qmv / gather_qmm leaves below.
-  bool kquant_rhs_ok = kq_is_nax_available() && transpose_ && (K % 64 == 0) &&
-      (x.dtype() != mx::float32) && codec_has_nax(kquant_type_);
-  if (M == 1 && B >= 16 && right_sorted_ && (B / E >= 4) && kquant_rhs_ok &&
-      x.flags().row_contiguous && rhs_indices.flags().row_contiguous &&
+  // index strides for the strided leaves, whereas these kernels take no
+  // strides. The SwitchGLU sort path satisfies all of this; any case that does
+  // not falls through to the (correct, slower) gather_qmv / gather_qmm leaves
+  // below. KQ_DISABLE_GATHER_RHS_ALU=1 kills only the ALU variant (A/B tool).
+  bool kquant_rhs_nax_ok = kq_is_nax_available() && transpose_ &&
+      (K % 64 == 0) && (x.dtype() != mx::float32) &&
+      codec_has_nax(kquant_type_);
+  static const bool rhs_alu_disabled =
+      std::getenv("KQ_DISABLE_GATHER_RHS_ALU") != nullptr;
+  bool kquant_rhs_alu_ok = !rhs_alu_disabled && transpose_ && (K % 32 == 0);
+  if (M == 1 && B >= 16 && right_sorted_ && (B / E >= 4) &&
+      (kquant_rhs_nax_ok || kquant_rhs_alu_ok) && x.flags().row_contiguous &&
+      w.flags().row_contiguous && rhs_indices.flags().row_contiguous &&
       (x.size() / K == static_cast<size_t>(B))) {
-    gather_qmm_rhs_nax(
-        x,
-        w,
-        scales,
-        rhs_indices,
-        out,
-        transpose_,
-        group_size_,
-        bits_,
-        /*M=*/static_cast<int>(x.size() / K),
-        N,
-        K,
-        d,
-        s,
-        kquant_type_);
+    if (kquant_rhs_nax_ok) {
+      gather_qmm_rhs_nax(
+          x,
+          w,
+          scales,
+          rhs_indices,
+          out,
+          transpose_,
+          group_size_,
+          bits_,
+          /*M=*/static_cast<int>(x.size() / K),
+          N,
+          K,
+          d,
+          s,
+          kquant_type_);
+    } else {
+      gather_qmm_rhs(
+          x,
+          w,
+          scales,
+          rhs_indices,
+          out,
+          group_size_,
+          bits_,
+          /*M=*/static_cast<int>(x.size() / K),
+          N,
+          K,
+          d,
+          s,
+          kquant_type_);
+    }
     return;
   }
 
