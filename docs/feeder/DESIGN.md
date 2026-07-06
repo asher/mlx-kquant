@@ -176,42 +176,19 @@ gone. At 46 tokens it's a wash: whole-layer staging reads all experts while
 the page-cache path only faults the ~77% a small chunk routes to; the extra
 bytes cancel the reclaim penalty (router-aware partial staging would win
 here). At 7k+ the compute rate binds both paths; the last column is the
-non-NAX sorted-rhs kernel below lifting that ceiling 3.3x. Two side effects
+non-NAX sorted-rhs kernel (next section) lifting that ceiling 3.3x. Two
+side effects
 worth knowing: decode right after a feeder prefill starts ~10-15% slower
 (the page cache is cold - the feeder never populates it), and the ring wires
 ~2 x 2.7 GB while prefilling.
 
-## Landed: non-NAX gather_qmm_rhs (the long-prefill compute ceiling)
-
-The 7k+ ceiling above was the missing non-NAX sorted-rhs kernel: SwitchGLU's
-sorted prefill arrives as B rows of M=1, and without a segment-walking GEMM
-the batch decomposed into per-row gather tiles at a fraction of the machine.
-`kq_gather_qmm_rhs_impl` (steel simdgroup-mma, per-expert row segments,
-all 19 codecs) now serves that shape on GPUs without NAX, with the same
-routing conditions as the NAX leaf and a `KQ_DISABLE_GATHER_RHS_ALU=1` A/B
-lever. Measured on the M3 Max: kernel-level 7.7-9.5 TFLOPS at T=4096
-(vs 1.3-2.0 for the per-row path); end-to-end 7k prefill 491 -> 1294 tok/s
-on in-RAM Qwen3.6-35B-A3B pure-GPU and 64.8 -> 211.0 tok/s on the MiniMax
-feeder run above.
-
-The row tile height BM adapts to the batch's rows-per-expert (M/E): every
-expert segment in a tile pays a full-tile mma K-loop, so utilization is
-roughly 1/segments-per-tile and a fixed BM=64 runs mid-size batches at a
-fraction of the machine. Dispatch picks 16 / 32 / 64 at M/E thresholds
-40 / 384 (M3 Max sweep; `KQ_GATHER_RHS_BM` forces a height for retuning -
-worth re-sweeping on other GPU generations). q5_k sweep, TFLOPS by M/E:
-BM=16 wins <=32 (4.08 vs 2.27 at 16), BM=32 wins 48-256 (8.76 vs 7.95 at
-128), BM=64 wins >=512. End-to-end A3B: 802-token prompt 943 -> 1199 tok/s
-(+25%) vs fixed BM=64, 7k +10.5% (chunks of 4096 land in the BM=32 band).
-Beware first-run numbers when measuring this: the first prefill after a
-load pays the page-cache faults for the whole mmap and reads ~35% slow.
-
-Landing the base kernel also surfaced an
-op-level contiguity bug affecting the NAX leaf: flags of an unevaluated
-sliced w are meaningless at op-build time, so the compaction was skipped on
-the slice's first eval and the stride-less rhs kernels mis-walked experts;
-the op now always inserts the Contiguous node (zero-copy when already
-packed).
+The 7k+ ceiling was the missing non-NAX sorted-rhs GEMM, a generic kernel
+landed and documented in the changelog (`gather_qmm_rhs`, steel
+simdgroup-mma, rows-per-expert-adaptive row tile): the feeder's 7k prefill
+went 61.2 -> 211.0 tok/s with no feeder changes. It benefits any sorted MoE
+prefill on a non-NAX GPU, in-RAM models included, so it is not a feeder
+component - the feeder just no longer has a kernel-bound regime below the
+SSD sweep floor.
 
 ## Remaining work
 

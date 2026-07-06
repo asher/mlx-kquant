@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project aims to
 adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Non-NAX `gather_qmm_rhs`: steel simdgroup-mma GEMM for the sorted-rhs
+  (SwitchGLU prefill) gather leaf on GPUs without tensor units, all 19
+  codecs. Walks each row tile's per-expert segments and runs one full-K
+  matmul per segment, so the sorted batch no longer decomposes into
+  per-row `gather_qmv` calls. The row tile height adapts to the batch's
+  rows-per-expert (BM 16/32/64 at M/E thresholds 40/384, tuned on M3 Max):
+  every segment pays a full-tile mma pass, so a tile much taller than a
+  segment wastes most of every matmul. MoE prefill-shape rates on an M3 Max
+  improve ~5-6x at large batches (q4_k 9.5 / q5_k 8.0 / q6_k 7.7 TFLOPS at
+  128 rows/expert) and more at mid sizes where the adaptive tile kicks in.
+  `KQ_DISABLE_GATHER_RHS_ALU=1` forces the old per-row path;
+  `KQ_GATHER_RHS_BM` pins the tile height (retuning lever). On NAX machines
+  the NAX leaf still takes precedence; the new kernel serves the cases NAX
+  refuses (older macOS, `K % 64 != 0`, `KQ_DISABLE_NAX=1`).
+
+### Fixed
+- The sorted-rhs gather leaf mis-walked expert strides on the FIRST
+  evaluation of a lazily-sliced weight stack (e.g. a fresh `w[:, :n]` view):
+  the op trusted `w.flags().row_contiguous` at graph-build time, but flags of
+  an unevaluated array are meaningless, so the compaction copy was skipped
+  and the stride-less kernel read experts at the packed stride. Affected the
+  NAX leaf too. The op now always inserts the `Contiguous` node when the rhs
+  leaf is reachable (zero-copy at eval when already packed) and eval_gpu
+  additionally gates on `w.flags().row_contiguous`.
+
 ## [0.3.2]
 
 ### Added

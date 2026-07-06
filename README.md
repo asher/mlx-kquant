@@ -227,7 +227,10 @@ weights. Measured on an M5 Max (128 GB):
 
 Transposed matmuls with a small row count (the speculative-decode verify regime) automatically route
 through a weight-read-amortizing `verify_qmv` kernel; `KQ_DISABLE_VERIFY_QMV=1` forces the plain
-per-row `qmv` path (see [Environment variables](#environment-variables)).
+per-row `qmv` path (see [Environment variables](#environment-variables)). Sorted MoE prefill batches
+(`sorted_indices=True`) route to a per-expert-segment GEMM on all GPUs - a NAX kernel where tensor
+units are available, a steel simdgroup-mma kernel with a rows-per-expert-adaptive row tile elsewhere
+- instead of decomposing into per-row gathers.
 
 ## How it works
 
@@ -258,6 +261,10 @@ All optional; the defaults are right for normal use.
   matmul, which is bit-exact (the NEON path is tolerance-level; see [How it works](#how-it-works)).
 - `KQ_DISABLE_VERIFY_QMV=1` - on Metal, force the plain per-row `qmv` path instead of the
   weight-read-amortizing `verify_qmv` kernel. An A/B debugging lever, not a tuning knob.
+- `KQ_DISABLE_GATHER_RHS_ALU=1` - on Metal without NAX, force sorted MoE prefill back to the
+  per-row gather path instead of the segment-walking `gather_qmm_rhs` GEMM. A/B lever.
+- `KQ_GATHER_RHS_BM` - pin the `gather_qmm_rhs` row tile height (`16`/`32`/`64`) instead of the
+  rows-per-expert-adaptive choice. Retuning lever for other GPU generations.
 
 ## Quant recipes
 
