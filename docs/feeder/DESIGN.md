@@ -140,27 +140,61 @@ Two findings from benchmarking the pair inside real MLX graphs:
   host and hand the stock gather kernels a slot-index array. The
   `moe_gather_staged` kernel this plan originally called for is unnecessary.
 
-## Remaining integration (gguf-mlx side)
+## Landed: writable staging + prefill feeder
 
-1. A CPU-writable, GPU-visible allocation for the staging ring and the
-   per-layer slot-index arrays (the one plumbing gap: MLX arrays are
-   immutable from Python, so the feeder needs either a small kq helper that
-   wraps feeder-owned host memory as a zero-copy array, or the writable
-   variant of the GGUF zero-copy loader machinery).
-2. The feeder thread owned by the loader: shares the event handles, the GGUF
-   fds, and a popularity-based residency manager over a wired expert arena
-   (residency fraction f is the whole game — see the prototype table).
-   Decode becomes: build the token graph with signal/wait pairs and
-   slot-indexed gathers baked in, `mx.async_eval`, feeder services layers as
-   the GPU reaches them.
-3. Watchdog + poison recovery in the feeder; on poison, discard the token's
-   arrays and rebuild the stream.
+`arena_alloc` (this branch) is the CPU-writable, GPU-visible allocation:
+page-aligned host memory wrapped no-copy in a Metal shared buffer, returned
+as a uint8 array plus a writable memoryview over the same bytes, so
+`os.preadv` reads disk straight into kernel-visible memory.
 
-One empirical caution for the residency manager: measured token-to-token
-routing reuse on MiniMax-M2.7 (256 experts, top-8) is only ~30%, so
-speculative next-layer prefetch of the previous token's experts wastes most
-of its reads; popularity pinning across a window is the mechanism that pays,
-not per-token speculation.
+The prefill feeder itself lives in gguf-mlx (`gguf_mlx/feeder.py`,
+`KQ_FEEDER_PREFILL=1`): a two-slot ring of arena buffers, one slot per layer
+parity, staged by a feeder thread while the GPU computes the previous layer
+from the other slot, with the module's expert weights swapped to zero-copy
+slot views for the duration of each call. Because streaming prefill already
+evals per layer, host-side synchronization suffices there - the encoded
+event pair in this extension is needed only by a decode feeder, which has no
+per-layer eval. Slots are sized per kind at the largest layer and viewed
+per-layer, since mixed-codec quants (Q5_K_M puts q6_k down stacks on some
+layers, q5_k on others) make shapes non-uniform.
+
+Measured on the 162 GB MiniMax Q5_K_M (128 GB M3 Max, greedy output
+verified identical with the feeder on and off):
+
+| prompt tokens | page-cache prefill | feeder prefill |
+|---------------|--------------------|----------------|
+| 46            | 1.78 tok/s         | 1.78 tok/s     |
+| 829           | 18.7 tok/s         | 33.1 tok/s     |
+| 7101          | 55.5 tok/s         | 61.2 tok/s     |
+
+Interpretation: at 829 tokens the feeder sits on the SSD full-sweep floor
+(829 tok / 33.1 = 25.0 s vs a 22.8 s sweep) - the page-cache double pass is
+gone. At 46 tokens it's a wash: whole-layer staging reads all experts while
+the page-cache path only faults the ~77% a small chunk routes to; the extra
+bytes cancel the reclaim penalty (router-aware partial staging would win
+here). At 7k+ the ALU `gather_qmm` rate (~16 ms/token at that batch, no NAX
+on M3) binds both paths; that ceiling is the kernel/NAX item below. Two
+side effects worth knowing: decode right after a feeder prefill starts
+~10-15% slower (the page cache is cold - the feeder never populates it),
+and the ring wires ~2 x 2.7 GB while prefilling.
+
+## Remaining work
+
+1. **Long-prefill compute ceiling**: on NAX-less GPUs the ALU gather_qmm is
+   the bound. Options: a tuned prefill qmm (threadgroup dequant + simdgroup
+   matmul), or staged dequant-to-fp16 + dense matmul per ring slot. On an
+   M5-class GPU the existing NAX path may erase this without new work -
+   measure there first.
+2. **Router-aware partial staging** for small chunks: eval the router before
+   staging and pread only the routed experts' slices - closes the short-
+   prompt gap where whole-layer staging over-reads.
+3. **The decode feeder** (the original architecture): pre-encoded per-token
+   command buffers with the event pair, wired arena + popularity residency
+   manager, staging ring for misses, watchdog poison recovery. One empirical
+   caution: measured token-to-token routing reuse on MiniMax-M2.7 (256
+   experts, top-8) is only ~30%, so speculative next-layer prefetch of the
+   previous token's experts wastes most of its reads; popularity pinning
+   across a window is the mechanism that pays, not per-token speculation.
 
 ## Files
 
