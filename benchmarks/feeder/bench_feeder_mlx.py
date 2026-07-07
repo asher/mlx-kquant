@@ -5,10 +5,13 @@ A: per-token cost of 62 encoded signal/wait handoff pairs (feeder thread
 B: fused kq gather rate from a resident synthetic q5_k arena at MiniMax
    decode geometry (62 layers x top-8, d_model 3072, d_ff 1536).
 """
+
 import threading
 import time
 
 import mlx.core as mx
+import numpy as np
+
 from mlx_kquant import _ext as kq
 
 NLAYERS = 62
@@ -62,18 +65,18 @@ stop = True
 kq.shared_event_set(r_done, 2**64 - 2)  # let the feeder loop exit
 t.join()
 
-print(f"A: ungated {base_s * 1e3:.2f} ms/token, gated {gated_s * 1e3:.2f} "
-      f"ms/token -> {(gated_s - base_s) * 1e3 / NLAYERS * 1000:.0f} us per "
-      f"handoff pair ({NLAYERS} pairs/token)")
+print(
+    f"A: ungated {base_s * 1e3:.2f} ms/token, gated {gated_s * 1e3:.2f} "
+    f"ms/token -> {(gated_s - base_s) * 1e3 / NLAYERS * 1000:.0f} us per "
+    f"handoff pair ({NLAYERS} pairs/token)"
+)
 
 # ---------- B: resident-arena fused gather rate ----------
-import numpy as np
-
-N_EXP = 64          # arena slots per layer (memory-bound sample; rate/expert is what matters)
+N_EXP = 64  # arena slots per layer (memory-bound sample; rate/expert matters)
 D_FF = 1536
-Q5K_BPB = 176       # q5_k bytes per 256-weight block
+Q5K_BPB = 176  # q5_k bytes per 256-weight block
 Q6K_BPB = 210
-gate_up_bytes = D * Q5K_BPB // 256   # per row
+gate_up_bytes = D * Q5K_BPB // 256  # per row
 rng = np.random.default_rng(0)
 gate_w = mx.array(rng.integers(0, 255, (N_EXP, D_FF, gate_up_bytes), dtype=np.uint8))
 up_w = mx.array(rng.integers(0, 255, (N_EXP, D_FF, gate_up_bytes), dtype=np.uint8))
@@ -93,6 +96,8 @@ with mx.stream(mx.gpu):
         mx.eval(outs)
 dt = (time.perf_counter() - t0) / REPS
 bytes_per_call = 8 * 2 * D_FF * gate_up_bytes
-print(f"B: fused q5_k gather (top-8 gate+up) {dt * 1e6:.0f} us/call, "
-      f"{bytes_per_call / dt / 1e9:.1f} GB/s effective; "
-      f"x{NLAYERS} layers = {dt * NLAYERS * 1e3:.1f} ms/token gate+up share")
+print(
+    f"B: fused q5_k gather (top-8 gate+up) {dt * 1e6:.0f} us/call, "
+    f"{bytes_per_call / dt / 1e9:.1f} GB/s effective; "
+    f"x{NLAYERS} layers = {dt * NLAYERS * 1e3:.1f} ms/token gate+up share"
+)

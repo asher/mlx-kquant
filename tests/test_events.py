@@ -154,5 +154,5 @@ def test_bad_handle_throws():
     x = mx.ones(4)
     with mx.stream(mx.gpu):
         y = kq.event_signal(x, 10**9, 1)  # unknown handle: throws at eval
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError, match="Unknown shared event handle"):
         mx.eval(y)

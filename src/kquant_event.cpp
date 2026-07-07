@@ -38,7 +38,8 @@ namespace mlx_kquant {
 namespace {
 
 std::mutex g_event_mutex;
-std::unordered_map<uint64_t, NS::SharedPtr<MTL::SharedEvent>>& event_registry() {
+std::unordered_map<uint64_t, NS::SharedPtr<MTL::SharedEvent>>&
+event_registry() {
   static auto* reg =
       new std::unordered_map<uint64_t, NS::SharedPtr<MTL::SharedEvent>>();
   return *reg;

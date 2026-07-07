@@ -593,7 +593,7 @@ instantiate_kquant_iq1_s_for_type(float16_t)
 instantiate_kquant_iq1_m_for_type(float)
 instantiate_kquant_iq1_m_for_type(bfloat16_t)
 instantiate_kquant_iq1_m_for_type(float16_t)
-    // clang-format on
+// clang-format on
 
 // clang-format off
 #define instantiate_kquant_gather_qmm_rhs(type, gs, bits, aligned_N, bm, codec) \

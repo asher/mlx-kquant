@@ -2366,37 +2366,36 @@ METAL_FUNC void kq_gather_qmm_rhs_impl(
 // rows per expert fragment each row tile into per-expert segments that each
 // pay a full-tile mma K-loop, so utilization is ~1/segments-per-tile. The
 // dispatch picks the largest BM not much above the batch's rows-per-expert.
-#define KQ_DEFINE_GATHER_QMM_RHS(CODEC, LOADER)                       \
-  template <typename T, int group_size, int bits, bool aligned_N,     \
-            int BM>                                                   \
-  [[kernel]] void kq_##CODEC##_gather_qmm_rhs(                        \
-      const device T* x [[buffer(0)]],                                \
-      const device uint8_t* w [[buffer(1)]],                          \
-      const device uint8_t* scales [[buffer(2)]],                     \
-      const device uint32_t* indices [[buffer(3)]],                   \
-      device T* y [[buffer(4)]],                                      \
-      const constant int& M [[buffer(5)]],                            \
-      const constant int& N [[buffer(6)]],                            \
-      const constant int& K [[buffer(7)]],                            \
-      uint3 tid [[threadgroup_position_in_grid]],                     \
-      uint simd_gid [[simdgroup_index_in_threadgroup]],               \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                  \
-    constexpr int BK = 32, BN = 64;                                   \
-    constexpr int BK_padded = (BK + 16 / sizeof(T));                  \
-    using LoaderW = LOADER<                                           \
-        T,                                                            \
-        BN,                                                           \
-        BK,                                                           \
-        BK_padded,                                                    \
-        /*reduction_dim=*/1,                                          \
-        /*tgp_size=*/2 * 2 * SIMD_SIZE>;                              \
-    static_assert(                                                    \
-        group_size == LoaderW::weights_per_block,                     \
-        #CODEC " gather_qmm_rhs requires group_size == block size");  \
-    threadgroup T Xs[BM * BK_padded];                                 \
-    threadgroup T Ws[BN * BK_padded];                                 \
-    kq_gather_qmm_rhs_impl<T, LoaderW, aligned_N, BM, BK, BN>(        \
-        x, w, indices, y, Xs, Ws, M, N, K, tid, simd_gid, simd_lid);  \
+#define KQ_DEFINE_GATHER_QMM_RHS(CODEC, LOADER)                           \
+  template <typename T, int group_size, int bits, bool aligned_N, int BM> \
+  [[kernel]] void kq_##CODEC##_gather_qmm_rhs(                            \
+      const device T* x [[buffer(0)]],                                    \
+      const device uint8_t* w [[buffer(1)]],                              \
+      const device uint8_t* scales [[buffer(2)]],                         \
+      const device uint32_t* indices [[buffer(3)]],                       \
+      device T* y [[buffer(4)]],                                          \
+      const constant int& M [[buffer(5)]],                                \
+      const constant int& N [[buffer(6)]],                                \
+      const constant int& K [[buffer(7)]],                                \
+      uint3 tid [[threadgroup_position_in_grid]],                         \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                   \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                      \
+    constexpr int BK = 32, BN = 64;                                       \
+    constexpr int BK_padded = (BK + 16 / sizeof(T));                      \
+    using LoaderW = LOADER<                                               \
+        T,                                                                \
+        BN,                                                               \
+        BK,                                                               \
+        BK_padded,                                                        \
+        /*reduction_dim=*/1,                                              \
+        /*tgp_size=*/2 * 2 * SIMD_SIZE>;                                  \
+    static_assert(                                                        \
+        group_size == LoaderW::weights_per_block,                         \
+        #CODEC " gather_qmm_rhs requires group_size == block size");      \
+    threadgroup T Xs[BM * BK_padded];                                     \
+    threadgroup T Ws[BN * BK_padded];                                     \
+    kq_gather_qmm_rhs_impl<T, LoaderW, aligned_N, BM, BK, BN>(            \
+        x, w, indices, y, Xs, Ws, M, N, K, tid, simd_gid, simd_lid);      \
   }
 
 KQ_DEFINE_GATHER_QMM_RHS(q8_0, KqQ8_0BlockLoader)
