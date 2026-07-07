@@ -57,6 +57,20 @@ NB_MODULE(_ext, m) {
       "True when the arm64 NEON int8 CPU GEMV kernels can run here (arm64 "
       "build with the dotprod extension, not disabled via KQ_CPU_NEON=0).");
 
+  m.def(
+      "nax_available",
+      &mlx_kquant::nax_available,
+      "True when the GPU supports the NAX (tensor-core) matmul kernels.");
+
+  m.def(
+      "nax_gather_enabled",
+      &mlx_kquant::nax_gather_enabled,
+      "kquant_type"_a,
+      "True when gather_qmm's sorted-rhs NAX GEMM leaf can serve this codec "
+      "here: NAX hardware present, the codec ships NAX kernels, and "
+      "KQ_DISABLE_NAX is unset (read live). Sorted-prefill callers defer to "
+      "gather_qmm when this holds.");
+
   // --- ops ---
   m.def(
       "dequantize",
@@ -706,19 +720,19 @@ NB_MODULE(_ext, m) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
-        Build gather_qmm_seg tile maps from expert-sorted routing indices,
+        Build the gather_qmm_seg tile map from expert-sorted routing indices,
         entirely on GPU (no host sync).
 
         Args:
             indices (array): 1-D uint32 expert ids, sorted ascending.
-            n_experts (int): total expert count (sizes the map32 bound).
+            n_experts (int): total expert count (sizes the map bound).
 
         Returns:
-            tuple: (map64, map32, counts) -- uint32 [cap, 3] tile tables of
-            (expert, row_start, num_rows) for full 64-row tiles and <= 32-row
-            remainder tiles, plus uint32 [2] valid-tile counts. Slots past
-            the counts are uninitialized; tile order is unspecified.
-            Metal-only.
+            tuple: (map, counts) -- uint32 [cap, 3] tile table of
+            (expert, row_start, num_rows) tiling each segment into 64-row
+            tiles where only the last tile of a segment can be partial, plus
+            uint32 [1] valid-tile count. Slots past the count are
+            uninitialized; tile order is unspecified. Metal-only.
       )");
 
   m.def(
@@ -728,8 +742,7 @@ NB_MODULE(_ext, m) {
       "w"_a,
       "scales"_a,
       "kquant_type"_a,
-      "map64"_a,
-      "map32"_a,
+      "map"_a,
       "counts"_a,
       nb::kw_only(),
       "stream"_a = nb::none(),
@@ -742,13 +755,14 @@ NB_MODULE(_ext, m) {
                 (n_experts, out_dims, bytes_per_row).
             scales (array): vestigial placeholder; ignored by the kernel.
             kquant_type (str): codec name, e.g. ``"iq2_xxs"``.
-            map64 (array): uint32 [n_tiles, 3] rows of
-                (expert, row_start, num_rows), num_rows <= 64.
-            map32 (array): same layout, num_rows <= 32.
-            counts (array): uint32 [2] valid-tile counts for map64 / map32.
-                Valid tiles never span experts and must jointly cover every
-                x row exactly once (uncovered output rows are left
-                unwritten). Use expert_tile_map to build all three.
+            map (array): uint32 [n_tiles, 3] rows of
+                (expert, row_start, num_rows), num_rows <= 64. Only the last
+                tile of a segment may be partial; its dead row fragments are
+                skipped in the MMA.
+            counts (array): uint32 [1] valid-tile count. Valid tiles never
+                span experts and must cover every x row exactly once
+                (uncovered output rows are left unwritten). Use
+                expert_tile_map to build both.
 
         Returns:
             array: [rows, out_dims] (x.dtype, float32 -> bfloat16). Metal-only.

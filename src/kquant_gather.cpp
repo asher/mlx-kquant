@@ -947,10 +947,10 @@ void KQuantGatherQMM::eval_gpu(
 std::vector<mx::Shape> KQuantExpertTileMap::output_shapes(
     const std::vector<mx::array>& inputs) {
   int rows = inputs[0].shape(0);
-  int cap64 = std::max(rows / 64, 1);
-  int cap32 = std::max(
-      std::min((rows + 31) / 32, 2 * std::min(n_experts_, rows)), 1);
-  return {{cap64, 3}, {cap32, 3}, {2}};
+  // Per expert: ceil(len / 64) tiles = at most rows / 64 full tiles overall
+  // plus one partial tile per present expert.
+  int cap = std::max(rows / 64 + std::min(n_experts_, rows), 1);
+  return {{cap, 3}, {1}};
 }
 
 bool KQuantExpertTileMap::is_equivalent(const mx::Primitive& other) const {
@@ -991,11 +991,9 @@ void KQuantExpertTileMap::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   const auto& indices = inputs[0];
-  auto& map64 = outputs[0];
-  auto& map32 = outputs[1];
-  auto& counts = outputs[2];
-  map64.set_data(mx::allocator::malloc(map64.nbytes()));
-  map32.set_data(mx::allocator::malloc(map32.nbytes()));
+  auto& map = outputs[0];
+  auto& counts = outputs[1];
+  map.set_data(mx::allocator::malloc(map.nbytes()));
   counts.set_data(mx::allocator::malloc(counts.nbytes()));
 
   int rows = indices.shape(0);
@@ -1005,15 +1003,14 @@ void KQuantExpertTileMap::eval_gpu(
     auto kernel = kq_get_kernel(d, "kq_seg_zero_counts");
     ce.set_compute_pipeline_state(kernel);
     ce.set_output_array(counts, 0);
-    ce.dispatch_threads(MTL::Size(2, 1, 1), MTL::Size(2, 1, 1));
+    ce.dispatch_threads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
   }
   {
     auto kernel = kq_get_kernel(d, "kq_expert_tile_map");
     ce.set_compute_pipeline_state(kernel);
     int c = 0;
     ce.set_input_array(indices, c++);
-    ce.set_output_array(map64, c++);
-    ce.set_output_array(map32, c++);
+    ce.set_output_array(map, c++);
     ce.set_output_array(counts, c++);
     ce.set_bytes(rows, c++);
     int tg = 256;
@@ -1031,13 +1028,12 @@ void KQuantGatherQMMSeg::eval_gpu(
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   // inputs are row-contiguous (ensured by the op): x [R, K] (float),
-  // w [E, N, bpr] (uint8), scales, map64 / map32 [T, 3] (uint32), counts [2].
+  // w [E, N, bpr] (uint8), scales, map [T, 3] (uint32), counts [1].
   const auto& x = inputs[0];
   const auto& w = inputs[1];
   const auto& scales = inputs[2];
-  const auto& map64 = inputs[3];
-  const auto& map32 = inputs[4];
-  const auto& counts = inputs[5];
+  const auto& map = inputs[3];
+  const auto& counts = inputs[4];
 
   int K = x.shape(-1);
   int N = w.shape(1);
@@ -1046,38 +1042,31 @@ void KQuantGatherQMMSeg::eval_gpu(
   bool aligned = N % bn == 0;
   auto& ce = mx::metal::get_command_encoder(s);
 
-  auto dispatch = [&](const mx::array& map, int bm, int count_idx) {
-    std::string kname;
-    kname.reserve(96);
-    mx::concatenate(
-        kname,
-        kq_kname_prefix(kquant_type_) + "gather_qmm_seg_t_",
-        kq_type_string(x.dtype()),
-        "_gs_",
-        group_size_,
-        "_b_",
-        bits_,
-        aligned ? "_alN_true" : "_alN_false",
-        "_bm_",
-        bm);
-    auto kernel = kq_get_kernel(d, kname);
-    ce.set_compute_pipeline_state(kernel);
-    int c = 0;
-    ce.set_input_array(w, c++);
-    ce.set_input_array(scales, c++);
-    ce.set_input_array(x, c++);
-    ce.set_input_array(map, c++);
-    ce.set_input_array(counts, c++);
-    ce.set_output_array(out, c++);
-    ce.set_bytes(K, c++);
-    ce.set_bytes(N, c++);
-    ce.set_bytes(count_idx, c++);
-    MTL::Size group_dims(32, 2, 2);
-    MTL::Size grid_dims((N + bn - 1) / bn, map.shape(0), 1);
-    ce.dispatch_threadgroups(grid_dims, group_dims);
-  };
-  dispatch(map64, 64, 0);
-  dispatch(map32, 32, 1);
+  std::string kname;
+  kname.reserve(96);
+  mx::concatenate(
+      kname,
+      kq_kname_prefix(kquant_type_) + "gather_qmm_seg_t_",
+      kq_type_string(x.dtype()),
+      "_gs_",
+      group_size_,
+      "_b_",
+      bits_,
+      aligned ? "_alN_true" : "_alN_false");
+  auto kernel = kq_get_kernel(d, kname);
+  ce.set_compute_pipeline_state(kernel);
+  int c = 0;
+  ce.set_input_array(w, c++);
+  ce.set_input_array(scales, c++);
+  ce.set_input_array(x, c++);
+  ce.set_input_array(map, c++);
+  ce.set_input_array(counts, c++);
+  ce.set_output_array(out, c++);
+  ce.set_bytes(K, c++);
+  ce.set_bytes(N, c++);
+  MTL::Size group_dims(32, 2, 2);
+  MTL::Size grid_dims((N + bn - 1) / bn, map.shape(0), 1);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
 #else

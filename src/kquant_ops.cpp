@@ -11,6 +11,7 @@
 #include "mlx/utils.h" // to_stream
 
 #ifdef _METAL_
+#include "kquant_metal_internal.h" // kq_is_nax_available / codec_has_nax
 #include "mlx/backend/metal/device.h"
 #endif
 
@@ -433,11 +434,9 @@ std::vector<mx::array> expert_tile_map(
   auto s = mx::to_stream(s_);
   auto idx_c = mx::contiguous(indices, false, s);
 
-  int cap64 = std::max(rows / 64, 1);
-  int cap32 = std::max(
-      std::min((rows + 31) / 32, 2 * std::min(n_experts, rows)), 1);
-  std::vector<mx::Shape> shapes = {{cap64, 3}, {cap32, 3}, {2}};
-  std::vector<mx::Dtype> dtypes = {mx::uint32, mx::uint32, mx::uint32};
+  int cap = std::max(rows / 64 + std::min(n_experts, rows), 1);
+  std::vector<mx::Shape> shapes = {{cap, 3}, {1}};
+  std::vector<mx::Dtype> dtypes = {mx::uint32, mx::uint32};
   return mx::array::make_arrays(
       std::move(shapes),
       dtypes,
@@ -466,8 +465,7 @@ mx::array gather_qmm_seg(
     mx::array w,
     mx::array scales,
     const std::string& kquant_type,
-    mx::array map64,
-    mx::array map32,
+    mx::array map,
     mx::array counts,
     mx::StreamOrDevice s_) {
   if (w.dtype() != mx::uint8) {
@@ -492,12 +490,11 @@ mx::array gather_qmm_seg(
         << "(n_experts, N, bytes_per_row) but got shape " << w.shape() << ".";
     throw std::invalid_argument(msg.str());
   }
-  check_seg_map(map64, "map64", "gather_qmm_seg");
-  check_seg_map(map32, "map32", "gather_qmm_seg");
-  if (counts.ndim() != 1 || counts.shape(0) != 2 ||
+  check_seg_map(map, "map", "gather_qmm_seg");
+  if (counts.ndim() != 1 || counts.shape(0) != 1 ||
       counts.dtype() != mx::uint32) {
     std::ostringstream msg;
-    msg << "[mlx_kquant.gather_qmm_seg] counts must be uint32 [2] but got "
+    msg << "[mlx_kquant.gather_qmm_seg] counts must be uint32 [1] but got "
         << "shape " << counts.shape() << " dtype " << counts.dtype() << ".";
     throw std::invalid_argument(msg.str());
   }
@@ -533,8 +530,7 @@ mx::array gather_qmm_seg(
   // must be fully row-contiguous (no strided expert dim).
   auto w_c = mx::contiguous(w, false, s);
   auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
-  auto m64_c = mx::contiguous(map64, false, s);
-  auto m32_c = mx::contiguous(map32, false, s);
+  auto map_c = mx::contiguous(map, false, s);
   auto cnt_c = mx::contiguous(counts, false, s);
 
   mx::Shape out_shape{x.shape(0), w.shape(1)};
@@ -543,8 +539,7 @@ mx::array gather_qmm_seg(
       out_type,
       std::make_shared<KQuantGatherQMMSeg>(
           s, kquant_type, codec->weights_per_block, codec->bits),
-      {x_c, w_c, scales_c, std::move(m64_c), std::move(m32_c),
-       std::move(cnt_c)});
+      {x_c, w_c, scales_c, std::move(map_c), std::move(cnt_c)});
 }
 
 std::vector<mx::array> quantize(
@@ -653,6 +648,23 @@ bool metallib_loads() {
   d.get_library("mlx_kquant", metallib_dir());
   return true;
 #else
+  return false;
+#endif
+}
+
+bool nax_available() {
+#ifdef _METAL_
+  return kq_is_nax_available();
+#else
+  return false;
+#endif
+}
+
+bool nax_gather_enabled(const std::string& kquant_type) {
+#ifdef _METAL_
+  return kq_is_nax_available() && codec_has_nax(kquant_type);
+#else
+  (void)kquant_type;
   return false;
 #endif
 }

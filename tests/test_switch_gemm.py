@@ -142,9 +142,10 @@ def test_gather_qmm_seg_matches_loop(codec, dtype):
     w, s = sw["weight"], sw["scales"]
 
     rng = np.random.default_rng(23)
-    # Ragged segments: absent experts, tiny (1-row), sub-tile, and multi-tile.
+    # Ragged segments: absent experts and partial tiles at every fragment
+    # boundary class (1, 17, 63, 96, 129, 200, 48 rows).
     counts = np.zeros(E, dtype=np.int64)
-    counts[[0, 2, 3, 5, 7]] = [1, 63, 64, 129, 200]
+    counts[[0, 1, 2, 3, 4, 5, 7]] = [1, 17, 63, 96, 129, 200, 48]
     rows = int(counts.sum())
     x = mx.array(
         (rng.standard_normal((rows, K)) * 0.1).astype(np.float32)
@@ -222,25 +223,25 @@ def test_gather_qmm_seg_unaligned_n():
         [0, 0, 0, 5],
         [64] * 8,
         [65] * 8,
+        [1, 7, 8, 9, 16, 17, 48, 96],
     ],
-    ids=["ragged", "single", "tiny", "uniform64", "uniform65"],
+    ids=["ragged", "single", "tiny", "uniform64", "uniform65", "sub_frag"],
 )
 def test_expert_tile_map_matches_host(counts):
     import mlx_kquant as kq
     from mlx_kquant.nn import _host_tile_maps
 
     counts = np.asarray(counts, dtype=np.int64)
-    m64h, m32h, cnth = _host_tile_maps(counts)
-    m64, m32, cnt = kq.expert_tile_map(_counts_to_indices(counts), len(counts))
-    mx.eval(m64, m32, cnt, m64h, m32h, cnth)
+    mh, cnth = _host_tile_maps(counts)
+    m, cnt = kq.expert_tile_map(_counts_to_indices(counts), len(counts))
+    mx.eval(m, cnt, mh, cnth)
     cnt, cnth = np.array(cnt), np.array(cnth)
     np.testing.assert_array_equal(cnt, cnth)
     # tile order is unspecified: compare as sorted sets of valid rows
-    for got, ref, n in ((m64, m64h, cnt[0]), (m32, m32h, cnt[1])):
-        g = np.array(got)[:n]
-        r = np.array(ref)[:n]
-        order = lambda a: a[np.lexsort(a.T[::-1])]
-        np.testing.assert_array_equal(order(g), order(r))
+    g = np.array(m)[: cnt[0]]
+    r = np.array(mh)[: cnt[0]]
+    order = lambda a: a[np.lexsort(a.T[::-1])]
+    np.testing.assert_array_equal(order(g), order(r))
 
 
 @pytest.mark.skipif(
@@ -254,25 +255,56 @@ def test_gather_qmm_seg_rejects_bad_inputs():
     w = mx.zeros((2, N, 1056), dtype=mx.uint8)  # iq2_xxs bpr for K=4096
     s = mx.zeros((1,), dtype=mx.uint8)
     good = mx.zeros((1, 3), dtype=mx.uint32)
-    cnt = mx.zeros((2,), dtype=mx.uint32)
+    cnt = mx.zeros((1,), dtype=mx.uint32)
     with pytest.raises(ValueError):  # K mismatch (bpr expands to 4096)
-        kq.gather_qmm_seg(x, w, s, "iq2_xxs", good, good, cnt)
+        kq.gather_qmm_seg(x, w, s, "iq2_xxs", good, cnt)
     x_ok = mx.zeros((64, 4096), dtype=mx.float16)
     with pytest.raises(ValueError):  # bad map shape
         kq.gather_qmm_seg(
-            x_ok, w, s, "iq2_xxs", mx.zeros((3,), dtype=mx.uint32), good, cnt
+            x_ok, w, s, "iq2_xxs", mx.zeros((3,), dtype=mx.uint32), cnt
         )
-    with pytest.raises(ValueError):  # bad counts shape
+    with pytest.raises(ValueError):  # bad counts shape (old multi-map layout)
         kq.gather_qmm_seg(
-            x_ok, w, s, "iq2_xxs", good, good, mx.zeros((1,), dtype=mx.uint32)
+            x_ok, w, s, "iq2_xxs", good, mx.zeros((2,), dtype=mx.uint32)
         )
     with pytest.raises(ValueError):  # 3-D x
         kq.gather_qmm_seg(
             mx.zeros((64, 1, 4096), dtype=mx.float16), w, s, "iq2_xxs",
-            good, good, cnt,
+            good, cnt,
         )
     with pytest.raises(ValueError):  # expert_tile_map: non-uint32 indices
         kq.expert_tile_map(mx.zeros((8,), dtype=mx.int32), 4)
+
+
+def test_seg_arm_defers_to_nax_gather(monkeypatch):
+    import mlx_kquant.nn as kqnn
+
+    sw = _make_switch("iq2_xxs")
+    rng = np.random.default_rng(11)
+    x, idx = _sorted_inputs(rng, 512, list(range(E)))
+    monkeypatch.setenv("KQ_SWITCH_GEMM_MIN_ROWS", "512")
+    calls = []
+    orig = sw._sorted_expert_gemm
+    monkeypatch.setattr(
+        sw, "_sorted_expert_gemm", lambda *a: calls.append(1) or orig(*a)
+    )
+    # NAX leaf reachable -> the sorted arm must defer to gather_qmm
+    monkeypatch.setattr(
+        kqnn.kq, "nax_gather_enabled", lambda codec: True, raising=False
+    )
+    nax_out = sw(x, idx, sorted_indices=True)
+    mx.eval(nax_out)
+    assert not calls
+    monkeypatch.setattr(
+        kqnn.kq, "nax_gather_enabled", lambda codec: False, raising=False
+    )
+    seg_out = sw(x, idx, sorted_indices=True)
+    mx.eval(seg_out)
+    assert len(calls) == 1
+    g = np.array(seg_out.astype(mx.float32))
+    r = np.array(nax_out.astype(mx.float32))
+    rel = np.linalg.norm(g - r) / (np.linalg.norm(r) + 1e-6)
+    assert rel < 5e-3, f"rel {rel:.3e}"
 
 
 def main() -> int:

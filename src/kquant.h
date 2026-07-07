@@ -25,6 +25,16 @@ std::string metallib_dir();
 // Returns false only on a non-Metal build.
 bool metallib_loads();
 
+// True when the GPU supports the NAX (tensor-core) matmul kernels (false on
+// non-Metal builds and pre-NAX GPUs).
+bool nax_available();
+
+// True when gather_qmm's sorted-rhs NAX GEMM leaf can serve `kquant_type`
+// here: NAX hardware present, the codec ships NAX kernels, and KQ_DISABLE_NAX
+// is unset (read live). Callers with their own sorted-prefill arms (e.g. the
+// gather_qmm_seg switch arm) defer to gather_qmm when this holds.
+bool nax_gather_enabled(const std::string& kquant_type);
+
 // ----------------------------- ops -----------------------------
 
 // Dequantize GGUF K-quant wire bytes `w` (uint8, last dim a multiple of the
@@ -88,13 +98,12 @@ mx::array gather_qmm(
     bool sorted_indices = false,
     mx::StreamOrDevice s = {});
 
-// Build the gather_qmm_seg tile maps from expert-sorted routing indices, on
-// GPU (no host sync). Returns {map64, map32, counts}: map64 uint32
-// [cap64, 3] rows of (expert, row_start, 64) covering each segment's full
-// 64-row tiles, map32 uint32 [cap32, 3] covering the <= 63-row remainders as
-// <= 32-row tiles, counts uint32 [2] = the number of valid tiles in each map.
-// The caps are shape-only upper bounds; slots past counts are uninitialized
-// and tile order is unspecified. Metal-only.
+// Build the gather_qmm_seg tile map from expert-sorted routing indices, on
+// GPU (no host sync). Returns {map, counts}: map uint32 [cap, 3] rows of
+// (expert, row_start, num_rows) tiling each segment into 64-row tiles where
+// only the last tile of a segment can be partial; counts uint32 [1] = the
+// number of valid tiles. The cap is a shape-only upper bound; slots past
+// counts are uninitialized and tile order is unspecified. Metal-only.
 std::vector<mx::array> expert_tile_map(
     mx::array indices,
     int n_experts,
@@ -102,21 +111,20 @@ std::vector<mx::array> expert_tile_map(
 
 // Segment-walking gather GEMM for expert-sorted MoE prefill. x is [R, K] rows
 // pre-sorted by expert; w is uint8 wire bytes (n_experts, N, bytes_per_row);
-// map64 / map32 / counts are the expert_tile_map outputs (or host-built
-// equivalents): uint32 [*, 3] tile rows of (expert, row_start, num_rows)
-// with num_rows <= 64 (map64) / <= 32 (map32), tiles never spanning experts.
-// Two dispatches compute y[row_start : row_start + num_rows] =
-// x_seg @ dequant(w[expert]).T per tile at tiled-GEMM throughput. Rows not
-// covered by the valid tiles are left unwritten (the caller's maps must
-// jointly cover every row exactly once). Output dtype follows
-// quantized_matmul. Metal-only.
+// map / counts are the expert_tile_map outputs (or host-built equivalents):
+// uint32 [*, 3] tile rows of (expert, row_start, num_rows <= 64), tiles
+// never spanning experts. One dispatch computes
+// y[row_start : row_start + num_rows] = x_seg @ dequant(w[expert]).T per tile
+// at tiled-GEMM throughput; partial tiles skip dead row fragments in the MMA
+// so ragged segments cost ~ceil(num_rows / 8) row fragments. Rows not
+// covered by the valid tiles are left unwritten (the caller's map must cover
+// every row exactly once). Output dtype follows quantized_matmul. Metal-only.
 mx::array gather_qmm_seg(
     mx::array x,
     mx::array w,
     mx::array scales,
     const std::string& kquant_type,
-    mx::array map64,
-    mx::array map32,
+    mx::array map,
     mx::array counts,
     mx::StreamOrDevice s = {});
 
@@ -1097,8 +1105,8 @@ class KQuantGatherQMM : public mx::Primitive {
   bool right_sorted_;
 };
 
-// Tile-map builder (see expert_tile_map). Multi-output: {map64, map32,
-// counts}. Inference-only, Metal-only.
+// Tile-map builder (see expert_tile_map). Multi-output: {map, counts}.
+// Inference-only, Metal-only.
 class KQuantExpertTileMap : public mx::Primitive {
  public:
   explicit KQuantExpertTileMap(mx::Stream stream, int n_experts)
