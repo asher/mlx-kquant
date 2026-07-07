@@ -29,7 +29,7 @@ METAL_FUNC void kq_qmm_t_impl(
     threadgroup T* Ws,
     const constant int& K,
     const constant int& N,
-    const constant int& M,
+    const int M,
     const int K_eff,
     uint3 tid,
     uint lid,
@@ -2139,6 +2139,66 @@ inline uchar2 kq_get_scale_min_k4_just2(int j, int k, const device uint8_t* q) {
         /*tgp_size=*/2 * 2 * SIMD_SIZE>;                              \
     kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(                 \
         w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);   \
+  }                                                                   \
+                                                                      \
+  /* Segment-walking gather GEMM: x holds rows pre-sorted by expert;  \
+     seg_map is [n_tiles, 3] uint32 rows of (expert, row_start,       \
+     num_rows) with num_rows <= BM. One threadgroup per (N-tile,      \
+     M-tile); grid.y indexes seg_map, clamped by tile_count[          \
+     count_idx] so a shape-only upper bound can be dispatched. Rows   \
+     not covered by the map are left unwritten. */                    \
+  template <typename T, int group_size, int bits, bool aligned_N,     \
+            int BM>                                                   \
+  [[kernel]] void kq_##CODEC##_gather_qmm_seg_t(                      \
+      const device uint8_t* w,                                        \
+      const device uint8_t* /* scales */,                             \
+      const device T* x,                                              \
+      const device uint32_t* seg_map,                                 \
+      const device uint32_t* tile_count,                              \
+      device T* y,                                                    \
+      const constant int& K,                                          \
+      const constant int& N,                                          \
+      const constant int& count_idx,                                  \
+      uint3 tid [[threadgroup_position_in_grid]],                     \
+      uint lid [[thread_index_in_threadgroup]],                       \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],               \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                  \
+    if (tid.y >= tile_count[count_idx]) {                             \
+      return;                                                         \
+    }                                                                 \
+    constexpr int BK = 32, BN = 64;                                   \
+    constexpr int BK_padded = (BK + 16 / sizeof(T));                  \
+    threadgroup T Xs[BM * BK_padded];                                 \
+    threadgroup T Ws[BN * BK_padded];                                 \
+    using LoaderW = LOADER<                                           \
+        T,                                                            \
+        BN,                                                           \
+        BK,                                                           \
+        BK_padded,                                                    \
+        /*reduction_dim=*/1,                                          \
+        /*tgp_size=*/2 * 2 * SIMD_SIZE>;                              \
+    const device uint32_t* seg = seg_map + 3 * tid.y;                 \
+    const int K_w =                                                   \
+        (K / LoaderW::weights_per_block) * LoaderW::bytes_per_block;  \
+    w += static_cast<int64_t>(seg[0]) * N * K_w;                      \
+    x += static_cast<int64_t>(seg[1]) * K;                            \
+    y += static_cast<int64_t>(seg[1]) * N;                            \
+    const int num_rows = static_cast<int>(seg[2]);                    \
+    uint3 tid_seg = uint3(tid.x, 0, tid.z);                           \
+    kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(                 \
+        w,                                                            \
+        x,                                                            \
+        y,                                                            \
+        Xs,                                                           \
+        Ws,                                                           \
+        K,                                                            \
+        N,                                                            \
+        num_rows,                                                     \
+        K,                                                            \
+        tid_seg,                                                      \
+        lid,                                                          \
+        simd_gid,                                                     \
+        simd_lid);                                                    \
   }                                                                   \
                                                                       \
   template <typename T, int group_size, int bits>                     \

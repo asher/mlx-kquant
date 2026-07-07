@@ -26,6 +26,30 @@ import mlx_kquant as kq
 
 from .codec_geometry import CODEC_GEOMETRY, bytes_per_row
 
+# gather_qmm_seg tile heights (the kernels' BM values).
+_SEG_TILE_ROWS = 64
+_SEG_REM_ROWS = 32
+
+
+def _host_tile_maps(counts):
+    """Host-built equivalent of kq.expert_tile_map from per-expert counts:
+    (map64, map32, counts) uint32 arrays."""
+    t64, t32 = [], []
+    row = 0
+    for e in np.flatnonzero(counts):
+        c = int(counts[e])
+        full = (c // _SEG_TILE_ROWS) * _SEG_TILE_ROWS
+        for off in range(0, full, _SEG_TILE_ROWS):
+            t64.append((e, row + off, _SEG_TILE_ROWS))
+        for off in range(full, c, _SEG_REM_ROWS):
+            t32.append((e, row + off, min(_SEG_REM_ROWS, c - off)))
+        row += c
+    pad = [(0, 0, 0)]
+    m64 = np.asarray(t64 or pad, dtype=np.uint32)
+    m32 = np.asarray(t32 or pad, dtype=np.uint32)
+    cnt = np.asarray([len(t64), len(t32)], dtype=np.uint32)
+    return mx.array(m64), mx.array(m32), mx.array(cnt)
+
 
 class KQuantEmbedding(nn.Module):
     """Embedding backed by GGUF kquant wire bytes.
@@ -194,11 +218,19 @@ class KQuantSwitchLinear(nn.Module):
         return x
 
     def _sorted_expert_gemm(self, x, indices):
+        xf = x.reshape(indices.size, -1)
+        w, s, codec = self["weight"], self["scales"], self.kquant_type
+        if hasattr(kq, "gather_qmm_seg") and mx.metal.is_available():
+            # tile maps built on GPU: no host sync, layers stay pipelined
+            if indices.dtype != mx.uint32:
+                indices = indices.astype(mx.uint32)
+            m64, m32, cnt = kq.expert_tile_map(indices, w.shape[0])
+            return kq.gather_qmm_seg(xf, w, s, codec, m64, m32, cnt)[
+                :, None, :
+            ]
         counts = np.bincount(
             np.array(indices), minlength=self.weight.shape[0]
         )
-        xf = x.reshape(indices.size, -1)
-        w, s, codec = self["weight"], self["scales"], self.kquant_type
         outs = []
         start = 0
         for e in np.flatnonzero(counts):

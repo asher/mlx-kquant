@@ -699,6 +699,62 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "expert_tile_map",
+      &mlx_kquant::expert_tile_map,
+      "indices"_a,
+      "n_experts"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Build gather_qmm_seg tile maps from expert-sorted routing indices,
+        entirely on GPU (no host sync).
+
+        Args:
+            indices (array): 1-D uint32 expert ids, sorted ascending.
+            n_experts (int): total expert count (sizes the map32 bound).
+
+        Returns:
+            tuple: (map64, map32, counts) -- uint32 [cap, 3] tile tables of
+            (expert, row_start, num_rows) for full 64-row tiles and <= 32-row
+            remainder tiles, plus uint32 [2] valid-tile counts. Slots past
+            the counts are uninitialized; tile order is unspecified.
+            Metal-only.
+      )");
+
+  m.def(
+      "gather_qmm_seg",
+      &mlx_kquant::gather_qmm_seg,
+      "x"_a,
+      "w"_a,
+      "scales"_a,
+      "kquant_type"_a,
+      "map64"_a,
+      "map32"_a,
+      "counts"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Segment-walking gather GEMM for expert-sorted MoE prefill.
+
+        Args:
+            x (array): float activations [rows, K], rows pre-sorted by expert.
+            w (array): uint8 K-quant wire bytes shaped
+                (n_experts, out_dims, bytes_per_row).
+            scales (array): vestigial placeholder; ignored by the kernel.
+            kquant_type (str): codec name, e.g. ``"iq2_xxs"``.
+            map64 (array): uint32 [n_tiles, 3] rows of
+                (expert, row_start, num_rows), num_rows <= 64.
+            map32 (array): same layout, num_rows <= 32.
+            counts (array): uint32 [2] valid-tile counts for map64 / map32.
+                Valid tiles never span experts and must jointly cover every
+                x row exactly once (uncovered output rows are left
+                unwritten). Use expert_tile_map to build all three.
+
+        Returns:
+            array: [rows, out_dims] (x.dtype, float32 -> bfloat16). Metal-only.
+      )");
+
+  m.def(
       "quantize",
       &mlx_kquant::quantize,
       "w"_a,

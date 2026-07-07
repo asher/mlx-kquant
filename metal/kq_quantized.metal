@@ -65,6 +65,17 @@
       bits,                                                               \
       aligned_N)
 
+#define instantiate_kquant_gather_qmm_seg_t(type, gs, bits, aligned_N, bm, codec) \
+  instantiate_kernel(                                                             \
+      "kquant_" #codec "_gather_qmm_seg_t_" #type "_gs_" #gs "_b_" #bits          \
+          "_alN_" #aligned_N "_bm_" #bm,                                          \
+      kq_ ## codec ## _gather_qmm_seg_t,                                          \
+      type,                                                                       \
+      gs,                                                                         \
+      bits,                                                                       \
+      aligned_N,                                                                  \
+      bm)
+
 #define instantiate_kquant_gather_qmm_n(type, gs, bits, codec)            \
   instantiate_kernel(                                                     \
       "kquant_" #codec "_gather_qmm_n_" #type "_gs_" #gs "_b_" #bits,     \
@@ -102,6 +113,10 @@
   instantiate_kquant_gather_qmv(gather_qmv,      type, 32, 8, q8_0)     \
   instantiate_kquant_gather_qmm_t(type, 32, 8, true, q8_0)              \
   instantiate_kquant_gather_qmm_t(type, 32, 8, false, q8_0)             \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 8, true, 64, q8_0) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 8, true, 32, q8_0) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 8, false, 64, q8_0) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 8, false, 32, q8_0) \
   instantiate_kquant_gather_qmm_n(type, 32, 8, q8_0)                    \
   instantiate_kquant_dequantize(type, 32, 8, q8_0)
 
@@ -127,6 +142,10 @@ instantiate_kquant_q8_0_for_type(float16_t)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 32, 5, q5_1)     \
   instantiate_kquant_gather_qmm_t(type, 32, 5, true, q5_1)              \
   instantiate_kquant_gather_qmm_t(type, 32, 5, false, q5_1)             \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 5, true, 64, q5_1) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 5, true, 32, q5_1) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 5, false, 64, q5_1) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 5, false, 32, q5_1) \
   instantiate_kquant_gather_qmm_n(type, 32, 5, q5_1)                    \
   instantiate_kquant_dequantize(type, 32, 5, q5_1)
 
@@ -152,6 +171,10 @@ instantiate_kquant_q5_1_for_type(float16_t)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 32, 4, q4_0)     \
   instantiate_kquant_gather_qmm_t(type, 32, 4, true, q4_0)              \
   instantiate_kquant_gather_qmm_t(type, 32, 4, false, q4_0)             \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 4, true, 64, q4_0) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 4, true, 32, q4_0) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 4, false, 64, q4_0) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 4, false, 32, q4_0) \
   instantiate_kquant_gather_qmm_n(type, 32, 4, q4_0)                    \
   instantiate_kquant_dequantize(type, 32, 4, q4_0)
 
@@ -177,6 +200,10 @@ instantiate_kquant_q4_0_for_type(float16_t)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 32, 4, q4_1)     \
   instantiate_kquant_gather_qmm_t(type, 32, 4, true, q4_1)              \
   instantiate_kquant_gather_qmm_t(type, 32, 4, false, q4_1)             \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 4, true, 64, q4_1) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 4, true, 32, q4_1) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 4, false, 64, q4_1) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 4, false, 32, q4_1) \
   instantiate_kquant_gather_qmm_n(type, 32, 4, q4_1)                    \
   instantiate_kquant_dequantize(type, 32, 4, q4_1)
 
@@ -202,6 +229,10 @@ instantiate_kquant_q4_1_for_type(float16_t)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 32, 5, q5_0)     \
   instantiate_kquant_gather_qmm_t(type, 32, 5, true, q5_0)              \
   instantiate_kquant_gather_qmm_t(type, 32, 5, false, q5_0)             \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 5, true, 64, q5_0) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 5, true, 32, q5_0) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 5, false, 64, q5_0) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 5, false, 32, q5_0) \
   instantiate_kquant_gather_qmm_n(type, 32, 5, q5_0)                    \
   instantiate_kquant_dequantize(type, 32, 5, q5_0)
 
@@ -227,6 +258,10 @@ instantiate_kquant_q5_0_for_type(float16_t)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 4, q4_k)     \
   instantiate_kquant_gather_qmm_t(type, 256, 4, true, q4_k)              \
   instantiate_kquant_gather_qmm_t(type, 256, 4, false, q4_k)             \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 4, true, 64, q4_k) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 4, true, 32, q4_k) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 4, false, 64, q4_k) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 4, false, 32, q4_k) \
   instantiate_kquant_gather_qmm_n(type, 256, 4, q4_k)                    \
   instantiate_kquant_dequantize(type, 256, 4, q4_k)
 
@@ -252,6 +287,10 @@ instantiate_kquant_q4_k_for_type(float16_t)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 5, q5_k)     \
   instantiate_kquant_gather_qmm_t(type, 256, 5, true, q5_k)              \
   instantiate_kquant_gather_qmm_t(type, 256, 5, false, q5_k)             \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 5, true, 64, q5_k) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 5, true, 32, q5_k) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 5, false, 64, q5_k) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 5, false, 32, q5_k) \
   instantiate_kquant_gather_qmm_n(type, 256, 5, q5_k)                    \
   instantiate_kquant_dequantize(type, 256, 5, q5_k)
 
@@ -278,6 +317,10 @@ instantiate_kquant_q5_k_for_type(float16_t)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 6, q6_k)     \
   instantiate_kquant_gather_qmm_t(type, 256, 6, true, q6_k)              \
   instantiate_kquant_gather_qmm_t(type, 256, 6, false, q6_k)             \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 6, true, 64, q6_k) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 6, true, 32, q6_k) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 6, false, 64, q6_k) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 6, false, 32, q6_k) \
   instantiate_kquant_gather_qmm_n(type, 256, 6, q6_k)                    \
   instantiate_kquant_dequantize(type, 256, 6, q6_k)
 
@@ -346,6 +389,10 @@ instantiate_mv_ext_all(iq1_m, 256, 1)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 3, q3_k)     \
   instantiate_kquant_gather_qmm_t(type, 256, 3, true, q3_k)              \
   instantiate_kquant_gather_qmm_t(type, 256, 3, false, q3_k)             \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 3, true, 64, q3_k) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 3, true, 32, q3_k) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 3, false, 64, q3_k) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 3, false, 32, q3_k) \
   instantiate_kquant_gather_qmm_n(type, 256, 3, q3_k)                    \
   instantiate_kquant_dequantize(type, 256, 3, q3_k)
 
@@ -371,6 +418,10 @@ instantiate_kquant_q3_k_for_type(float16_t)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 2, q2_k)     \
   instantiate_kquant_gather_qmm_t(type, 256, 2, true, q2_k)              \
   instantiate_kquant_gather_qmm_t(type, 256, 2, false, q2_k)             \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 2, true, 64, q2_k) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 2, true, 32, q2_k) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 2, false, 64, q2_k) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 2, false, 32, q2_k) \
   instantiate_kquant_gather_qmm_n(type, 256, 2, q2_k)                    \
   instantiate_kquant_dequantize(type, 256, 2, q2_k)
 
@@ -397,6 +448,10 @@ instantiate_kquant_q2_k_for_type(float16_t)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 32, 4, iq4_nl) \
   instantiate_kquant_gather_qmm_t(type, 32, 4, true, iq4_nl)         \
   instantiate_kquant_gather_qmm_t(type, 32, 4, false, iq4_nl)        \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 4, true, 64, iq4_nl) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 4, true, 32, iq4_nl) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 4, false, 64, iq4_nl) \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 4, false, 32, iq4_nl) \
   instantiate_kquant_gather_qmm_n(type, 32, 4, iq4_nl)               \
   instantiate_kquant_dequantize(type, 32, 4, iq4_nl)
 
@@ -421,6 +476,10 @@ instantiate_kquant_iq4_nl_for_type(float16_t)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 4, iq4_xs) \
   instantiate_kquant_gather_qmm_t(type, 256, 4, true, iq4_xs)        \
   instantiate_kquant_gather_qmm_t(type, 256, 4, false, iq4_xs)       \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 4, true, 64, iq4_xs) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 4, true, 32, iq4_xs) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 4, false, 64, iq4_xs) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 4, false, 32, iq4_xs) \
   instantiate_kquant_gather_qmm_n(type, 256, 4, iq4_xs)              \
   instantiate_kquant_dequantize(type, 256, 4, iq4_xs)
 
@@ -445,6 +504,10 @@ instantiate_kquant_iq4_xs_for_type(float16_t)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 3, iq3_xxs) \
   instantiate_kquant_gather_qmm_t(type, 256, 3, true, iq3_xxs)       \
   instantiate_kquant_gather_qmm_t(type, 256, 3, false, iq3_xxs)      \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 3, true, 64, iq3_xxs) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 3, true, 32, iq3_xxs) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 3, false, 64, iq3_xxs) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 3, false, 32, iq3_xxs) \
   instantiate_kquant_gather_qmm_n(type, 256, 3, iq3_xxs)             \
   instantiate_kquant_dequantize(type, 256, 3, iq3_xxs)
 
@@ -469,6 +532,10 @@ instantiate_kquant_iq3_xxs_for_type(float16_t)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 3, iq3_s) \
   instantiate_kquant_gather_qmm_t(type, 256, 3, true, iq3_s)         \
   instantiate_kquant_gather_qmm_t(type, 256, 3, false, iq3_s)        \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 3, true, 64, iq3_s) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 3, true, 32, iq3_s) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 3, false, 64, iq3_s) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 3, false, 32, iq3_s) \
   instantiate_kquant_gather_qmm_n(type, 256, 3, iq3_s)              \
   instantiate_kquant_dequantize(type, 256, 3, iq3_s)
 
@@ -493,6 +560,10 @@ instantiate_kquant_iq3_s_for_type(float16_t)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 2, iq2_xxs) \
   instantiate_kquant_gather_qmm_t(type, 256, 2, true, iq2_xxs)       \
   instantiate_kquant_gather_qmm_t(type, 256, 2, false, iq2_xxs)      \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 2, true, 64, iq2_xxs) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 2, true, 32, iq2_xxs) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 2, false, 64, iq2_xxs) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 2, false, 32, iq2_xxs) \
   instantiate_kquant_gather_qmm_n(type, 256, 2, iq2_xxs)             \
   instantiate_kquant_dequantize(type, 256, 2, iq2_xxs)
 
@@ -517,6 +588,10 @@ instantiate_kquant_iq2_xxs_for_type(float16_t)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 2, iq2_xs) \
   instantiate_kquant_gather_qmm_t(type, 256, 2, true, iq2_xs)        \
   instantiate_kquant_gather_qmm_t(type, 256, 2, false, iq2_xs)       \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 2, true, 64, iq2_xs) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 2, true, 32, iq2_xs) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 2, false, 64, iq2_xs) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 2, false, 32, iq2_xs) \
   instantiate_kquant_gather_qmm_n(type, 256, 2, iq2_xs)              \
   instantiate_kquant_dequantize(type, 256, 2, iq2_xs)
 
@@ -541,6 +616,10 @@ instantiate_kquant_iq2_xs_for_type(float16_t)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 2, iq2_s) \
   instantiate_kquant_gather_qmm_t(type, 256, 2, true, iq2_s)         \
   instantiate_kquant_gather_qmm_t(type, 256, 2, false, iq2_s)        \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 2, true, 64, iq2_s) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 2, true, 32, iq2_s) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 2, false, 64, iq2_s) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 2, false, 32, iq2_s) \
   instantiate_kquant_gather_qmm_n(type, 256, 2, iq2_s)               \
   instantiate_kquant_dequantize(type, 256, 2, iq2_s)
 
@@ -565,6 +644,10 @@ instantiate_kquant_iq2_s_for_type(float16_t)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 1, iq1_s) \
   instantiate_kquant_gather_qmm_t(type, 256, 1, true, iq1_s)         \
   instantiate_kquant_gather_qmm_t(type, 256, 1, false, iq1_s)        \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 1, true, 64, iq1_s) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 1, true, 32, iq1_s) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 1, false, 64, iq1_s) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 1, false, 32, iq1_s) \
   instantiate_kquant_gather_qmm_n(type, 256, 1, iq1_s)               \
   instantiate_kquant_dequantize(type, 256, 1, iq1_s)
 instantiate_kquant_iq1_s_for_type(float)
@@ -588,6 +671,10 @@ instantiate_kquant_iq1_s_for_type(float16_t)
   instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 1, iq1_m) \
   instantiate_kquant_gather_qmm_t(type, 256, 1, true, iq1_m)         \
   instantiate_kquant_gather_qmm_t(type, 256, 1, false, iq1_m)        \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 1, true, 64, iq1_m) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 1, true, 32, iq1_m) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 1, false, 64, iq1_m) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 1, false, 32, iq1_m) \
   instantiate_kquant_gather_qmm_n(type, 256, 1, iq1_m)               \
   instantiate_kquant_dequantize(type, 256, 1, iq1_m)
 instantiate_kquant_iq1_m_for_type(float)
@@ -639,4 +726,66 @@ instantiate_kquant_gather_qmm_rhs_codec(256, 2, iq2_xs)
 instantiate_kquant_gather_qmm_rhs_codec(256, 2, iq2_s)
 instantiate_kquant_gather_qmm_rhs_codec(256, 1, iq1_s)
 instantiate_kquant_gather_qmm_rhs_codec(256, 1, iq1_m)
+
+// Tile-map builder for gather_qmm_seg. One thread per expert-sorted row; the
+// thread whose row starts a tile appends (expert, row_start, num_rows) to
+// map64 (full 64-row tiles) or map32 (remainder tiles, <= 32 rows).
+// counts[0] / counts[1] receive the appended tile counts and must be zeroed
+// first (kq_seg_zero_counts). Tile order within each map is unspecified.
+[[kernel]] void kq_seg_zero_counts(
+    device uint32_t* counts [[buffer(0)]],
+    uint i [[thread_position_in_grid]]) {
+  counts[i] = 0;
+}
+
+[[kernel]] void kq_expert_tile_map(
+    const device uint32_t* indices [[buffer(0)]],
+    device uint32_t* map64 [[buffer(1)]],
+    device uint32_t* map32 [[buffer(2)]],
+    device atomic_uint* counts [[buffer(3)]],
+    const constant int& n_rows [[buffer(4)]],
+    uint r [[thread_position_in_grid]]) {
+  if (r >= static_cast<uint>(n_rows)) {
+    return;
+  }
+  const uint e = indices[r];
+  // first row of this expert's segment (indices are sorted ascending)
+  uint lo = 0, hi = r;
+  while (lo < hi) {
+    uint mid = (lo + hi) / 2;
+    if (indices[mid] < e) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  // first row past the segment
+  uint lo2 = r + 1, hi2 = static_cast<uint>(n_rows);
+  while (lo2 < hi2) {
+    uint mid = (lo2 + hi2) / 2;
+    if (indices[mid] <= e) {
+      lo2 = mid + 1;
+    } else {
+      hi2 = mid;
+    }
+  }
+  const uint rank = r - lo;
+  const uint seg_len = lo2 - lo;
+  const uint full64 = (seg_len / 64u) * 64u;
+  if (rank < full64) {
+    if (rank % 64u == 0u) {
+      uint slot =
+          atomic_fetch_add_explicit(&counts[0], 1u, memory_order_relaxed);
+      map64[3u * slot] = e;
+      map64[3u * slot + 1u] = r;
+      map64[3u * slot + 2u] = 64u;
+    }
+  } else if ((rank - full64) % 32u == 0u) {
+    uint slot =
+        atomic_fetch_add_explicit(&counts[1], 1u, memory_order_relaxed);
+    map32[3u * slot] = e;
+    map32[3u * slot + 1u] = r;
+    map32[3u * slot + 2u] = min(32u, seg_len - rank);
+  }
+}
     // clang-format on

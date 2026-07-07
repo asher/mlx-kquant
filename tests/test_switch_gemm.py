@@ -100,6 +100,181 @@ def test_threshold_and_shape_gating(monkeypatch):
     assert len(calls) == 1
 
 
+# ------------------------------------------------------- gather_qmm_seg op
+
+
+def _tile_maps(counts):
+    from mlx_kquant.nn import _host_tile_maps
+
+    return _host_tile_maps(counts)
+
+
+def _counts_to_indices(counts):
+    return mx.array(
+        np.repeat(np.arange(len(counts), dtype=np.uint32), counts)
+    )
+
+
+@pytest.mark.skipif(
+    bool(os.environ.get("KQUANT_FORCE_CPU")),
+    reason="gather_qmm_seg is Metal-only.",
+)
+@pytest.mark.parametrize("codec", ["iq2_xxs", "q2_k", "q8_0"])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_gather_qmm_seg_matches_loop(codec, dtype):
+    import mlx_kquant as kq
+
+    if codec == "q8_0":
+        rng = np.random.default_rng(7)
+        wf = rng.standard_normal((E, N, K)).astype(np.float32) * 0.1
+        from gguf import GGMLQuantizationType as GT
+        from gguf import quants
+
+        wire = np.stack(
+            [quants.quantize(wf[e], GT.Q8_0).astype(np.uint8) for e in range(E)]
+        )
+        sw = KQuantSwitchLinear(
+            num_experts=E, output_dims=N, input_dims=K, bias=False, codec=codec
+        )
+        sw.weight = mx.array(wire)
+    else:
+        sw = _make_switch(codec)
+    w, s = sw["weight"], sw["scales"]
+
+    rng = np.random.default_rng(23)
+    # Ragged segments: absent experts, tiny (1-row), sub-tile, and multi-tile.
+    counts = np.zeros(E, dtype=np.int64)
+    counts[[0, 2, 3, 5, 7]] = [1, 63, 64, 129, 200]
+    rows = int(counts.sum())
+    x = mx.array(
+        (rng.standard_normal((rows, K)) * 0.1).astype(np.float32)
+    ).astype(dtype)
+
+    refs, start = [], 0
+    for e in np.flatnonzero(counts):
+        c = int(counts[e])
+        refs.append(
+            kq.quantized_matmul(
+                x[start : start + c], w[e], s, sw.kquant_type, transpose=True
+            )
+        )
+        start += c
+    ref = mx.concatenate(refs)
+
+    # host-built maps and GPU-built maps must both match the loop
+    for label, maps in (
+        ("host", _tile_maps(counts)),
+        ("gpu", kq.expert_tile_map(_counts_to_indices(counts), E)),
+    ):
+        got = kq.gather_qmm_seg(x, w, s, sw.kquant_type, *maps)
+        mx.eval(got, ref)
+        assert got.shape == (rows, N) and got.dtype == ref.dtype
+        g = np.array(got.astype(mx.float32))
+        r = np.array(ref.astype(mx.float32))
+        rel = np.linalg.norm(g - r) / (np.linalg.norm(r) + 1e-6)
+        assert rel < 2e-3, f"{codec} {dtype} {label}: rel {rel:.3e}"
+
+
+@pytest.mark.skipif(
+    bool(os.environ.get("KQUANT_FORCE_CPU")),
+    reason="gather_qmm_seg is Metal-only.",
+)
+def test_gather_qmm_seg_unaligned_n():
+    import mlx_kquant as kq
+
+    rng = np.random.default_rng(31)
+    n_odd = 72  # not a multiple of the kernel's BN=64
+    wire = np.stack([_synth_iq2xxs_wire(rng, n_odd) for _ in range(4)], 0)
+    w = mx.array(wire)
+    s = mx.zeros((1,), dtype=mx.uint8)
+    counts = np.array([65, 0, 3, 64], dtype=np.int64)
+    rows = int(counts.sum())
+    x = mx.array(
+        (rng.standard_normal((rows, K)) * 0.1).astype(np.float32)
+    ).astype(mx.float16)
+    got = kq.gather_qmm_seg(x, w, s, "iq2_xxs", *_tile_maps(counts))
+    refs, start = [], 0
+    for e in np.flatnonzero(counts):
+        c = int(counts[e])
+        refs.append(
+            kq.quantized_matmul(
+                x[start : start + c], w[e], s, "iq2_xxs", transpose=True
+            )
+        )
+        start += c
+    ref = mx.concatenate(refs)
+    mx.eval(got, ref)
+    g = np.array(got.astype(mx.float32))
+    r = np.array(ref.astype(mx.float32))
+    rel = np.linalg.norm(g - r) / (np.linalg.norm(r) + 1e-6)
+    assert got.shape == (rows, n_odd) and rel < 2e-3, f"rel {rel:.3e}"
+
+
+@pytest.mark.skipif(
+    bool(os.environ.get("KQUANT_FORCE_CPU")),
+    reason="expert_tile_map is Metal-only.",
+)
+@pytest.mark.parametrize(
+    "counts",
+    [
+        [1, 63, 64, 129, 200, 0, 0, 32],
+        [512],
+        [0, 0, 0, 5],
+        [64] * 8,
+        [65] * 8,
+    ],
+    ids=["ragged", "single", "tiny", "uniform64", "uniform65"],
+)
+def test_expert_tile_map_matches_host(counts):
+    import mlx_kquant as kq
+    from mlx_kquant.nn import _host_tile_maps
+
+    counts = np.asarray(counts, dtype=np.int64)
+    m64h, m32h, cnth = _host_tile_maps(counts)
+    m64, m32, cnt = kq.expert_tile_map(_counts_to_indices(counts), len(counts))
+    mx.eval(m64, m32, cnt, m64h, m32h, cnth)
+    cnt, cnth = np.array(cnt), np.array(cnth)
+    np.testing.assert_array_equal(cnt, cnth)
+    # tile order is unspecified: compare as sorted sets of valid rows
+    for got, ref, n in ((m64, m64h, cnt[0]), (m32, m32h, cnt[1])):
+        g = np.array(got)[:n]
+        r = np.array(ref)[:n]
+        order = lambda a: a[np.lexsort(a.T[::-1])]
+        np.testing.assert_array_equal(order(g), order(r))
+
+
+@pytest.mark.skipif(
+    bool(os.environ.get("KQUANT_FORCE_CPU")),
+    reason="gather_qmm_seg is Metal-only.",
+)
+def test_gather_qmm_seg_rejects_bad_inputs():
+    import mlx_kquant as kq
+
+    x = mx.zeros((64, K), dtype=mx.float16)
+    w = mx.zeros((2, N, 1056), dtype=mx.uint8)  # iq2_xxs bpr for K=4096
+    s = mx.zeros((1,), dtype=mx.uint8)
+    good = mx.zeros((1, 3), dtype=mx.uint32)
+    cnt = mx.zeros((2,), dtype=mx.uint32)
+    with pytest.raises(ValueError):  # K mismatch (bpr expands to 4096)
+        kq.gather_qmm_seg(x, w, s, "iq2_xxs", good, good, cnt)
+    x_ok = mx.zeros((64, 4096), dtype=mx.float16)
+    with pytest.raises(ValueError):  # bad map shape
+        kq.gather_qmm_seg(
+            x_ok, w, s, "iq2_xxs", mx.zeros((3,), dtype=mx.uint32), good, cnt
+        )
+    with pytest.raises(ValueError):  # bad counts shape
+        kq.gather_qmm_seg(
+            x_ok, w, s, "iq2_xxs", good, good, mx.zeros((1,), dtype=mx.uint32)
+        )
+    with pytest.raises(ValueError):  # 3-D x
+        kq.gather_qmm_seg(
+            mx.zeros((64, 1, 4096), dtype=mx.float16), w, s, "iq2_xxs",
+            good, good, cnt,
+        )
+    with pytest.raises(ValueError):  # expert_tile_map: non-uint32 indices
+        kq.expert_tile_map(mx.zeros((8,), dtype=mx.int32), 4)
+
+
 def main() -> int:
     return int(pytest.main([__file__, "-q"]))
 
