@@ -1,7 +1,8 @@
 // DeepSeek-V4-Flash lightning-indexer kernels, ported from omlx glm_moe_dsa
 // steel_dsa_indexer_score.h (also (c) 2026 Apple Inc.) with the kernels
 // renamed into the kq_ namespace and the top-k params struct self-hosted
-// (kq_dsa_params.h). Two kernels:
+// (kq_dsa_params.h). omlx is Apache-2.0: see mlx_kquant/licenses/
+// omlx-LICENSE. Two kernels:
 //
 //  * kq_dsa_indexer_score -- steel GEMM computing, per query row m and key
 //    column n, sum_h relu(q[h,m] . k[n]) * w[h,m]: the indexer relevance

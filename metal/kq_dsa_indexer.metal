@@ -1,5 +1,6 @@
 // clang-format off
 // DeepSeek-V4-Flash lightning-indexer instantiations; see kq_dsa_indexer.h.
+// omlx is Apache-2.0: see mlx_kquant/licenses/omlx-LICENSE.
 #include "mlx/backend/metal/kernels/utils.h"
 #include "mlx/backend/metal/kernels/steel/gemm/gemm.h"
 #include "mlx/backend/metal/kernels/kq_dsa_indexer.h"

@@ -1,5 +1,6 @@
 // clang-format off
 // DeepSeek-V4-Flash sparse attention instantiations; see kq_dsa_sparse_attn.h.
+// omlx is Apache-2.0: see mlx_kquant/licenses/omlx-LICENSE.
 #include "mlx/backend/metal/kernels/utils.h"
 #include "mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h"
 #include "mlx/backend/metal/kernels/kq_dsa_sparse_attn.h"

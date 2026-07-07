@@ -363,7 +363,7 @@ MIT - see [LICENSE](https://github.com/asher/mlx-kquant/blob/main/LICENSE).
 
 ### Acknowledgements
 
-mlx-kquant builds on three MIT-licensed projects; their license texts ship in the wheel under
+mlx-kquant builds on the following projects; their license texts ship in the wheel under
 [`mlx_kquant/licenses/`](https://github.com/asher/mlx-kquant/tree/main/mlx_kquant/licenses):
 
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** - the K-quant, IQ, and legacy block
@@ -374,3 +374,6 @@ mlx-kquant builds on three MIT-licensed projects; their license texts ship in th
 - **[MLX](https://github.com/ml-explore/mlx)** - the extension links `libmlx`, the kernels compile
   against MLX's bundled headers, and parts of the Metal kernels are adapted from MLX's quantized and
   steel-GEMM kernels.
+- **[omlx](https://github.com/jundot/omlx)** (Apache-2.0) - the DeepSeek-V4-Flash DSA kernels
+  (`dsa_sparse_attention`, `dsa_indexer_scores`, `dsa_topk_indices`) are ported, with modifications,
+  from omlx's `glm_moe_dsa` custom kernels (Copyright OpenAI / Apple Inc., per file).

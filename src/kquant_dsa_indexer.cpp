@@ -6,6 +6,7 @@
 // Ported from omlx glm_moe_dsa dsa_indexer.cpp; the kq build fetches both
 // kernels from the AOT metallib with function constants (300 causal,
 // 301 weights-lh, 302 bucketed emission). Inference-only (no CPU eval).
+// omlx is Apache-2.0: see mlx_kquant/licenses/omlx-LICENSE.
 #include <cstdint>
 #include <sstream>
 #include <stdexcept>

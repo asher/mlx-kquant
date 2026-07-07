@@ -1,5 +1,6 @@
 // Host/device-shared parameter blocks for the kq DSA kernels
 // (kq_dsa_sparse_attn.h / kq_dsa_indexer.h; ported from omlx glm_moe_dsa).
+// omlx is Apache-2.0: see mlx_kquant/licenses/omlx-LICENSE.
 // Included by the Metal TUs (after utils.h, which supplies int64_t) and via
 // relative paths by src/kquant_dsa_*.cpp -- keep it include-free so both
 // compilers accept it, and keep field order/layout in sync with all consumers.

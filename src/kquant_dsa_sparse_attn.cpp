@@ -5,6 +5,7 @@
 // additionally accepts qL == 1 (decode) and qL == 2 (MTP verify) -- omlx
 // gated those out only because it lacked a decode-time indexer. K == V (the
 // V4 shared latent). Inference-only (no CPU eval).
+// omlx is Apache-2.0: see mlx_kquant/licenses/omlx-LICENSE.
 #include <cstdint>
 #include <sstream>
 #include <stdexcept>

@@ -9,6 +9,8 @@
 // all H heads via 8x8 MMA fragments, D chunked into DC-wide slabs. K == V
 // (the V4 shared latent), so a single KV buffer serves both passes.
 //
+// omlx is Apache-2.0: see mlx_kquant/licenses/omlx-LICENSE.
+//
 // Unlike the omlx host wrapper, the kq dispatch accepts qL >= 1: decode
 // (qL = 1) and MTP verify (qL = 2) run this same kernel -- omlx gated them
 // out only because it lacked a decode-time indexer, not for kernel reasons.
