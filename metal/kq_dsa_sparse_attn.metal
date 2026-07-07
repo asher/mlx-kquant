@@ -1,0 +1,23 @@
+// clang-format off
+// DeepSeek-V4-Flash sparse attention instantiations; see kq_dsa_sparse_attn.h.
+#include "mlx/backend/metal/kernels/utils.h"
+#include "mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h"
+#include "mlx/backend/metal/kernels/kq_dsa_sparse_attn.h"
+
+#define instantiate_kq_dsa_sparse_attention(tname, dtype, bk, dc, h, d, wm) \
+  instantiate_kernel(                                                       \
+      "kq_dsa_sparse_attention_" #tname "_bk" #bk "_dc" #dc "_h" #h        \
+      "_d" #d "_wm" #wm,                                                    \
+      kq_dsa_sparse_attention,                                              \
+      dtype,                                                                \
+      bk,                                                                   \
+      dc,                                                                   \
+      h,                                                                    \
+      d,                                                                    \
+      wm,                                                                   \
+      uint,                                                                 \
+      float)
+
+instantiate_kq_dsa_sparse_attention(float16_t, half, 256, 32, 64, 512, 8);
+instantiate_kq_dsa_sparse_attention(bfloat16_t, bfloat16_t, 256, 32, 64, 512, 8);
+    // clang-format on

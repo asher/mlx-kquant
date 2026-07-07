@@ -305,6 +305,113 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "dsa_sparse_attention",
+      &mlx_kquant::dsa_sparse_attention,
+      "q"_a,
+      "local_kv"_a,
+      "pooled"_a,
+      "topk_indices"_a,
+      "sinks"_a,
+      "scale"_a,
+      "q_offset"_a,
+      "compress_ratio"_a,
+      "local_window"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        DeepSeek-V4-Flash sparse attention: sliding local window + gathered
+        indexer-selected pooled rows + per-head attention sinks in one
+        dispatch (flash online softmax, f32 accumulation). Ported from omlx
+        glm_moe_dsa; qL >= 1, so decode, MTP verify (qL = 2) and prefill all
+        run this kernel.
+
+        Args:
+            q (array): queries [B, 64, qL, 512], float16/bfloat16.
+            local_kv (array): sliding-window KV [B, 1, localL, 512]
+                (K == V shared latent), temporal order, localL >= qL.
+            pooled (array): compressed pooled rows [B, P, 512].
+            topk_indices (array): uint32 [B, 1, qL, N] pooled-row indices;
+                slots >= the causal horizon (q_offset + pos + 1) /
+                compress_ratio are masked out kernel-side.
+            sinks (array): per-head sink logits [64].
+            scale (float): attention scale (1/sqrt(512)).
+            q_offset (int): absolute position of the chunk start.
+            compress_ratio (int): pooled compression ratio.
+            local_window (int): sliding-window size (128).
+
+        Returns:
+            array: attention output [B, 64, qL, 512] in the input dtype.
+      )");
+
+  m.def(
+      "dsa_indexer_scores",
+      &mlx_kquant::dsa_indexer_scores,
+      "queries"_a,
+      "keys"_a,
+      "weights"_a,
+      "causal"_a = true,
+      "unused_causal_prefix_topk"_a = 0,
+      "skip_causal_future_store"_a = false,
+      "causal_q_offset"_a = -1,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        DeepSeek-V4-Flash lightning-indexer relevance scores (steel GEMM):
+        out[b, 0, m, n] = sum_h relu(q[b, h, m] . k[b, 0, n]) * w[h, m].
+        Ported from omlx glm_moe_dsa. Feed the result to dsa_topk_indices to
+        pick the pooled rows dsa_sparse_attention gathers.
+
+        Args:
+            queries (array): [B, H, M, 128], H 32 or 64, M % 64 == 0,
+                float16/bfloat16. Decode pads the single query row to 64
+                and keeps output row 0.
+            keys (array): pooled indexer keys [B, 1, N, 128], N % 64 == 0.
+            weights (array): per-head query weights, [B, M, H] (lh layout)
+                or [B, H, M, 1].
+            causal (bool): mask n > causal_q_offset + m with -inf.
+            unused_causal_prefix_topk (int): skip writing tiles whose rows
+                all fall inside a causal prefix of this many keys (they are
+                identity-selected by a causal_valid_prefix top-k).
+            skip_causal_future_store (bool): leave fully-masked future tiles
+                unwritten instead of storing -inf (pair with a
+                causal_valid_prefix top-k that never reads them).
+            causal_q_offset (int): absolute position of query row 0; -1
+                means N - M.
+
+        Returns:
+            array: scores [B, 1, M, N] in the input dtype.
+      )");
+
+  m.def(
+      "dsa_topk_indices",
+      &mlx_kquant::dsa_topk_indices,
+      "scores"_a,
+      "topk"_a,
+      "bucketed"_a = false,
+      "causal_valid_prefix"_a = false,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Per-row top-k arg-select over 16-bit float scores (2-pass radix
+        select, one threadgroup per row). Ported from omlx glm_moe_dsa.
+        The selected index set matches a full sort; the order within a row
+        does not (ties at the threshold are admitted in scan order) --
+        dsa_sparse_attention is order-insensitive.
+
+        Args:
+            scores (array): [B, 1, L, K], float16/bfloat16, K >= topk.
+            topk (int): 512 or 2048.
+            bucketed (bool): deterministic bucketed emission (>threshold
+                entries before ==threshold entries).
+            causal_valid_prefix (bool): clamp each row's scan to its causal
+                prefix K - L + (row % L) + 1 and emit the identity prefix
+                when it fits inside topk.
+
+        Returns:
+            array: uint32 indices [B, 1, L, topk].
+      )");
+
+  m.def(
       "moe_glu_gather_kq",
       &mlx_kquant::moe_glu_gather_kq,
       "x"_a,

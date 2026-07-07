@@ -201,6 +201,62 @@ mx::array moe_glu_gather_kq(
     float limit = 0.0f,
     mx::StreamOrDevice s = {});
 
+// DeepSeek-V4-Flash sparse attention: sliding local window + gathered
+// indexer-selected pooled rows + per-head sinks in one dispatch (flash
+// online softmax, f32 accumulation). q [B, 64, qL, 512] (qL >= 1: decode,
+// MTP verify and prefill all use this kernel), local_kv [B, 1, localL, 512]
+// (K == V shared latent), pooled [B, P, 512], topk_indices [B, 1, qL, N]
+// uint32 (invalid/masked slots < 0 or >= the causal pooled horizon
+// (q_offset + pos + 1) / compress_ratio contribute nothing), sinks [64].
+// Returns [B, 64, qL, 512]. Metal-only.
+mx::array dsa_sparse_attention(
+    mx::array q,
+    mx::array local_kv,
+    mx::array pooled,
+    mx::array topk_indices,
+    mx::array sinks,
+    float scale,
+    int q_offset,
+    int compress_ratio,
+    int local_window,
+    mx::StreamOrDevice s = {});
+
+// DeepSeek-V4-Flash lightning-indexer relevance scores (steel GEMM):
+// out[b, 0, m, n] = sum_h relu(q[b, h, m, :] . k[b, 0, n, :]) * w_h_m.
+// q [B, H, M, 128] (H 32 or 64), k [B, 1, N, 128]; weights either
+// [B, M, H] ("lh" layout) or [B, H, M, 1]. Requires M % 64 == 0 and
+// N % 64 == 0 (pad or fall back Python-side; decode pads the single query
+// row to 64 and keeps row 0). causal masks n > causal_q_offset + m with
+// -inf (causal_q_offset -1 means N - M); with skip_causal_future_store the
+// fully-masked tiles are left unwritten instead (only valid when the
+// consumer never reads them, e.g. a causal_valid_prefix top-k).
+// Returns [B, 1, M, N]. Metal-only.
+mx::array dsa_indexer_scores(
+    mx::array queries,
+    mx::array keys,
+    mx::array weights,
+    bool causal = true,
+    int unused_causal_prefix_topk = 0,
+    bool skip_causal_future_store = false,
+    int causal_q_offset = -1,
+    mx::StreamOrDevice s = {});
+
+// Per-row top-k arg-select over 16-bit float scores (2-pass radix over the
+// orderable bit transform; one threadgroup per row). scores [B, 1, L, K]
+// fp16/bf16, topk in {512, 2048}, K >= topk. The selected set matches a
+// full sort; intra-row order does not (threshold ties admitted in scan
+// order). bucketed emits >threshold before ==threshold deterministically.
+// causal_valid_prefix clamps each row's scan to K - L + row%L + 1 entries
+// (scores laid out with queries as trailing rows) and emits the identity
+// prefix when the valid range fits inside topk. Returns [B, 1, L, topk]
+// uint32. Metal-only.
+mx::array dsa_topk_indices(
+    mx::array scores,
+    int topk,
+    bool bucketed = false,
+    bool causal_valid_prefix = false,
+    mx::StreamOrDevice s = {});
+
 // K-quant gathered matvec (down projection), same wire layout. x [T, R, K]
 // (one row per expert slot), indices [T, R]. Returns [T, R, N]. Metal-only.
 mx::array gather_qmv_kq(
@@ -565,6 +621,120 @@ class KQuantGatherQMVBias : public mx::Primitive {
     return "KQuantGatherQMVBias";
   }
   bool is_equivalent(const mx::Primitive& other) const override;
+};
+
+// DeepSeek-V4-Flash sparse attention (see dsa_sparse_attention).
+// Inference-only, Metal-only.
+class KQDsaSparseAttention : public mx::Primitive {
+ public:
+  explicit KQDsaSparseAttention(
+      mx::Stream stream,
+      float scale,
+      int q_offset,
+      int compress_ratio,
+      int local_window)
+      : mx::Primitive(stream),
+        scale_(scale),
+        q_offset_(q_offset),
+        compress_ratio_(compress_ratio),
+        local_window_(local_window) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQDsaSparseAttention";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int q_offset_;
+  int compress_ratio_;
+  int local_window_;
+};
+
+// DeepSeek-V4-Flash indexer relevance scores (see dsa_indexer_scores).
+// Inference-only, Metal-only.
+class KQDsaIndexerScores : public mx::Primitive {
+ public:
+  explicit KQDsaIndexerScores(
+      mx::Stream stream,
+      bool causal,
+      bool weights_lh,
+      int unused_causal_prefix_topk,
+      bool skip_causal_future_store,
+      int causal_q_offset)
+      : mx::Primitive(stream),
+        causal_(causal),
+        weights_lh_(weights_lh),
+        unused_causal_prefix_topk_(unused_causal_prefix_topk),
+        skip_causal_future_store_(skip_causal_future_store),
+        causal_q_offset_(causal_q_offset) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQDsaIndexerScores";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  bool causal_;
+  bool weights_lh_;
+  int unused_causal_prefix_topk_;
+  bool skip_causal_future_store_;
+  int causal_q_offset_;
+};
+
+// DeepSeek-V4-Flash indexer top-k select (see dsa_topk_indices).
+// Inference-only, Metal-only.
+class KQDsaTopKIndices : public mx::Primitive {
+ public:
+  explicit KQDsaTopKIndices(
+      mx::Stream stream,
+      int topk,
+      bool bucketed,
+      bool causal_valid_prefix)
+      : mx::Primitive(stream),
+        topk_(topk),
+        bucketed_(bucketed),
+        causal_valid_prefix_(causal_valid_prefix) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQDsaTopKIndices";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int topk_;
+  bool bucketed_;
+  bool causal_valid_prefix_;
 };
 
 // K-quant fused MoE GLU gather (see moe_glu_gather_kq). Inference-only.
