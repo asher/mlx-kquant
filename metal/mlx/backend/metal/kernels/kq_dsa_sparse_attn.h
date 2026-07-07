@@ -14,6 +14,14 @@
 // Unlike the omlx host wrapper, the kq dispatch accepts qL >= 1: decode
 // (qL = 1) and MTP verify (qL = 2) run this same kernel -- omlx gated them
 // out only because it lacked a decode-time indexer, not for kernel reasons.
+//
+// Beyond the port, key tiles track their last live slot: all-dead tiles
+// (visibility-clamped pooled tiles, the dummy pooled tile of window-only
+// layers) skip both MMA phases entirely, and partially-live tiles bound the
+// gathers and fragment sweeps to a bucketed live prefix (arms of TK/4
+// fragments). Window and compressed layers pass identity top-k, so their
+// live slots always form a prefix; scattered real top-k simply lands in the
+// widest arm.
 
 #pragma once
 
@@ -56,6 +64,61 @@ struct KQDsaDivOp {
     return x / y;
   }
 };
+
+// Live-bounded QK / PV fragment sweeps. Identity top-k (window and
+// compressed layers) and the visibility clamp leave whole key-tile suffixes
+// dead; the arms bound the fragment loops to the bucketed live prefix. KF
+// must be a compile-time constant: a runtime bound would index the MMA
+// fragment registers dynamically and spill them to thread memory.
+// Dead columns stay exact: Stile is cleared, the selected[]<0 mask fill
+// drives them to -inf before the row reduce, and the PV arm only skips
+// fragments whose softmax weights are exactly zero.
+#define KQ_DSA_QK_SWEEP(KF)                                                  \
+  STEEL_PRAGMA_UNROLL                                                        \
+  for (short dd = 0; dd < TDC; ++dd) {                                       \
+    simdgroup_barrier(mem_flags::mem_none);                                  \
+    Qtile.template load<T, 1, 1, LDQ, 1>(&Qs[Qs_offset + dd * kFragSize]);   \
+    STEEL_PRAGMA_UNROLL                                                      \
+    for (short ik = 0; ik < (KF); ++ik) {                                    \
+      MMAFragAcc::load(                                                      \
+          Ktile.frag_at(0, ik),                                              \
+          &KVs[Ks_offset + dd * kFragSize * LDK + ik * kFragSize],           \
+          Int<LDK>{},                                                        \
+          Int<1>{});                                                         \
+    }                                                                        \
+    simdgroup_barrier(mem_flags::mem_none);                                  \
+    STEEL_PRAGMA_UNROLL                                                      \
+    for (short iq = 0; iq < TQ; ++iq) {                                      \
+      STEEL_PRAGMA_UNROLL                                                    \
+      for (short ik = 0; ik < (KF); ++ik) {                                  \
+        MMAFragAcc::mma(                                                     \
+            Stile.frag_at(iq, ik),                                           \
+            Qtile.frag_at(iq, 0),                                            \
+            Ktile.frag_at(0, ik),                                            \
+            Stile.frag_at(iq, ik));                                          \
+      }                                                                      \
+    }                                                                        \
+  }
+
+#define KQ_DSA_PV_SWEEP(KF)                                                  \
+  STEEL_PRAGMA_UNROLL                                                        \
+  for (short iq = 0; iq < TQ; ++iq) {                                        \
+    STEEL_PRAGMA_UNROLL                                                      \
+    for (short id = 0; id < TDC; ++id) {                                     \
+      STEEL_PRAGMA_UNROLL                                                    \
+      for (short ik = 0; ik < (KF); ++ik) {                                  \
+        const short kk = ik * kFragSize;                                     \
+        const short dd = id * kFragSize;                                     \
+        Vtile.template load<T, 1, 1, LDV, 1>(                                \
+            &KVs[Vs_offset + kk * LDV + dd]);                                \
+        MMAFragAcc::mma(                                                     \
+            Otile.frag_at(iq, vchunk * TDC + id),                            \
+            Stile.frag_at(iq, ik),                                           \
+            Vtile.frag_at(0, 0),                                             \
+            Otile.frag_at(iq, vchunk * TDC + id));                           \
+      }                                                                      \
+    }                                                                        \
+  }
 
 // clang-format off
 template <
@@ -101,6 +164,7 @@ template <
   static_assert(BK % kFragSize == 0, "BK must be a multiple of 8.");
   static_assert(DC % kFragSize == 0, "DC must be a multiple of 8.");
   static_assert(D % DC == 0, "Head dimension must divide DC.");
+  static_assert(TK % 4 == 0, "Live-fragment arms slice the key tile in 4.");
 
   constexpr int tgp_size = WM * 32;
   const int lane = int(simd_group_id * 32 + simd_lane_id);
@@ -111,6 +175,10 @@ template <
   threadgroup T Qs[H * LDQ];
   threadgroup T KVs[(BK * LDV > DC * LDK) ? BK * LDV : DC * LDK];
   threadgroup int selected[BK];
+  // Double-buffered per-simdgroup last-live slot: tile t's readers and tile
+  // t+2's writers of the same buffer are separated by tile t+1's post-build
+  // barrier (executed on the skip path too), so no extra barrier is needed.
+  threadgroup int sg_last_live[2][WM];
 
   using MMAFragAcc = BaseMMAFrag<AccumType, kFragSize, kFragSize>;
   MMATile<AccumType, TQ, 1, MMAFragAcc> Qtile;
@@ -175,6 +243,7 @@ template <
     const int tile_slot = is_pooled_tile ? (ktile - local_tiles) : ktile;
     const int slot_base = tile_slot * BK;
 
+    int my_last_live = -1;
     for (int k = lane; k < BK; k += tgp_size) {
       const int slot = slot_base + k;
       int k_pos = -1;
@@ -191,9 +260,31 @@ template <
         }
       }
       selected[k] = k_pos;
+      if (k_pos >= 0) {
+        my_last_live = k;
+      }
+    }
+    {
+      const int sg_max = simd_max(my_last_live);
+      if (simd_lane_id == 0) {
+        sg_last_live[ktile & 1][simd_group_id] = sg_max;
+      }
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int tile_last_live = sg_last_live[ktile & 1][0];
+    STEEL_PRAGMA_UNROLL
+    for (short w = 1; w < WM; ++w) {
+      tile_last_live = metal::max(tile_last_live, sg_last_live[ktile & 1][w]);
+    }
+    if (tile_last_live < 0) {
+      continue;
+    }
+    // 1..4, each arm covering another TK/4 fragments of live prefix.
+    const short live_arm =
+        short((tile_last_live / kFragSize) / (TK / 4)) + 1;
+    const int live_slots = int(live_arm) * (BK / 4);
 
     Stile.clear();
 
@@ -208,7 +299,7 @@ template <
             q_base[size_t(h) * params->Q_strides[1] + dbase + d];
       }
 
-      for (int elem = lane; elem < BK * DC; elem += tgp_size) {
+      for (int elem = lane; elem < live_slots * DC; elem += tgp_size) {
         const int k = elem / DC;
         const int d = elem - k * DC;
         const int k_pos = selected[k];
@@ -225,14 +316,19 @@ template <
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
-      STEEL_PRAGMA_UNROLL
-      for (short dd = 0; dd < TDC; ++dd) {
-        simdgroup_barrier(mem_flags::mem_none);
-        Qtile.template load<T, 1, 1, LDQ, 1>(&Qs[Qs_offset + dd * kFragSize]);
-        Ktile.template load<T, 1, 1, LDK, 1>(
-            &KVs[Ks_offset + dd * kFragSize * LDK]);
-        simdgroup_barrier(mem_flags::mem_none);
-        tile_matmad(Stile, Qtile, Ktile, Stile);
+      switch (live_arm) {
+        case 1:
+          KQ_DSA_QK_SWEEP(TK / 4);
+          break;
+        case 2:
+          KQ_DSA_QK_SWEEP(TK / 2);
+          break;
+        case 3:
+          KQ_DSA_QK_SWEEP(3 * TK / 4);
+          break;
+        default:
+          KQ_DSA_QK_SWEEP(TK);
+          break;
       }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -293,7 +389,7 @@ template <
     for (short vchunk = 0; vchunk < D_CHUNKS; ++vchunk) {
       const int dbase = int(vchunk) * DC;
 
-      for (int elem = lane; elem < BK * DC; elem += tgp_size) {
+      for (int elem = lane; elem < live_slots * DC; elem += tgp_size) {
         const int k = elem / DC;
         const int d = elem - k * DC;
         const int k_pos = selected[k];
@@ -310,23 +406,19 @@ template <
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
-      STEEL_PRAGMA_UNROLL
-      for (short iq = 0; iq < TQ; ++iq) {
-        STEEL_PRAGMA_UNROLL
-        for (short id = 0; id < TDC; ++id) {
-          STEEL_PRAGMA_UNROLL
-          for (short ik = 0; ik < TK; ++ik) {
-            const short kk = ik * kFragSize;
-            const short dd = id * kFragSize;
-            Vtile.template load<T, 1, 1, LDV, 1>(
-                &KVs[Vs_offset + kk * LDV + dd]);
-            MMAFragAcc::mma(
-                Otile.frag_at(iq, vchunk * TDC + id),
-                Stile.frag_at(iq, ik),
-                Vtile.frag_at(0, 0),
-                Otile.frag_at(iq, vchunk * TDC + id));
-          }
-        }
+      switch (live_arm) {
+        case 1:
+          KQ_DSA_PV_SWEEP(TK / 4);
+          break;
+        case 2:
+          KQ_DSA_PV_SWEEP(TK / 2);
+          break;
+        case 3:
+          KQ_DSA_PV_SWEEP(3 * TK / 4);
+          break;
+        default:
+          KQ_DSA_PV_SWEEP(TK);
+          break;
       }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -340,3 +432,6 @@ template <
       size_t(tm + sm) * params->O_strides[1] + sn;
   Otile.template store<T, 1, 1>(out, params->O_strides[1]);
 }
+
+#undef KQ_DSA_QK_SWEEP
+#undef KQ_DSA_PV_SWEEP

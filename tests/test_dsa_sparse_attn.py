@@ -73,7 +73,8 @@ def _rel(got, ref):
     return float(np.linalg.norm(g - ref) / (np.linalg.norm(ref) + 1e-6))
 
 
-def _case(qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed):
+def _case(qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed,
+          mode="random"):
     rng = np.random.default_rng(seed)
     B = 1
     q = mx.array(rng.standard_normal((B, H, qL, D)) * 0.3).astype(dtype)
@@ -82,20 +83,32 @@ def _case(qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed):
     )
     pooled = mx.array(rng.standard_normal((B, P, D)) * 0.3).astype(dtype)
     sinks = mx.array(rng.standard_normal((H,)) * 0.5).astype(dtype)
-    # Unique indices into [0, P): the horizon clamp, not the test data, is
-    # what masks slots. Some rows deliberately land beyond the horizon.
-    tk = np.stack(
-        [
-            np.stack(
-                [
-                    rng.choice(P, size=topk_n, replace=False).astype(np.uint32)
-                    for _ in range(qL)
-                ],
-                0,
-            )
-        ],
-        0,
-    )[:, None]
+    if mode == "identity":
+        # The window/compressed dispatch arms: live slots form a prefix, so
+        # the kernel's live-fragment bounding engages.
+        row = np.arange(topk_n, dtype=np.uint32)
+        tk = np.broadcast_to(row, (B, 1, qL, topk_n)).copy()
+    elif mode == "dummy":
+        # Window-only layers: one pooled row, horizon-clamped fully dead.
+        tk = np.zeros((B, 1, qL, topk_n), dtype=np.uint32)
+    else:
+        # Unique indices into [0, P): the horizon clamp, not the test data,
+        # is what masks slots. Some rows deliberately land beyond the
+        # horizon.
+        tk = np.stack(
+            [
+                np.stack(
+                    [
+                        rng.choice(P, size=topk_n, replace=False).astype(
+                            np.uint32
+                        )
+                        for _ in range(qL)
+                    ],
+                    0,
+                )
+            ],
+            0,
+        )[:, None]
     topk = mx.array(tk)
     scale = D**-0.5
 
@@ -108,22 +121,35 @@ def _case(qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed):
 
 
 CASES = [
-    # (name, qL, localL, P, topk_n, q_offset, ratio, window)
-    ("decode", 1, 128, 640, 512, 2560, 4, 128),
-    ("decode_clamped", 1, 128, 640, 512, 1024, 4, 128),  # horizon < many idx
-    ("verify_qL2", 2, 128, 640, 512, 2559, 4, 128),
-    ("prefill_qL8", 8, 136, 700, 512, 2792, 4, 128),
-    ("prefill_qL64", 64, 192, 700, 512, 2736, 4, 128),
-    ("short_local", 1, 40, 300, 100, 1199, 4, 128),  # local_count < window
-    ("ratio128", 1, 128, 96, 64, 12288, 128, 128),  # compressed-pool layer
+    # (name, qL, localL, P, topk_n, q_offset, ratio, window, mode)
+    ("decode", 1, 128, 640, 512, 2560, 4, 128, "random"),
+    ("decode_clamped", 1, 128, 640, 512, 1024, 4, 128, "random"),  # horizon < many idx
+    ("verify_qL2", 2, 128, 640, 512, 2559, 4, 128, "random"),
+    ("prefill_qL8", 8, 136, 700, 512, 2792, 4, 128, "random"),
+    ("prefill_qL64", 64, 192, 700, 512, 2736, 4, 128, "random"),
+    ("short_local", 1, 40, 300, 100, 1199, 4, 128, "random"),  # local_count < window
+    ("ratio128", 1, 128, 96, 64, 12288, 128, 128, "random"),  # compressed-pool layer
+    # Live-fragment arm / dead-tile skip paths:
+    # dummy pooled row + huge ratio -> pooled tile fully dead (skip), local
+    # tile at most half live (window 128 of BK 256).
+    ("window_dummy", 64, 191, 1, 1, 2048, 1 << 30, 128, "dummy"),
+    # 17-row identity prefix, some rows horizon-clamped -> narrowest arm.
+    ("identity_p17", 64, 191, 17, 17, 2050, 128, 128, "identity"),
+    # Two pooled tiles, clamp at ~275-291 -> tile 1 full, tile 2 short prefix.
+    ("identity_2tiles", 64, 191, 512, 512, 1100, 4, 128, "identity"),
+    # Clamp at ~225-241 -> tile 2 entirely dead (skip), tile 1 partial.
+    ("identity_tile2_dead", 8, 135, 512, 512, 900, 4, 128, "identity"),
 ]
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("case", CASES, ids=[c[0] for c in CASES])
 def test_dsa_sparse_attention(case, dtype):
-    name, qL, localL, P, topk_n, q_offset, ratio, window = case
-    rel = _case(qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed=7)
+    name, qL, localL, P, topk_n, q_offset, ratio, window, mode = case
+    rel = _case(
+        qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed=7,
+        mode=mode,
+    )
     assert rel < REL_BOUND[dtype], f"{name} {dtype}: rel {rel:.3e}"
 
 
@@ -146,15 +172,16 @@ def test_dsa_sparse_attention_rejects_bad_shapes():
 def main() -> int:
     fails = 0
     for case in CASES:
-        name, qL, localL, P, topk_n, q_offset, ratio, window = case
+        name, qL, localL, P, topk_n, q_offset, ratio, window, mode = case
         for dtype in (mx.float16, mx.bfloat16):
             rel = _case(
-                qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed=7
+                qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed=7,
+                mode=mode,
             )
             ok = rel < REL_BOUND[dtype]
             fails += not ok
             print(
-                f"  {name:<16} {str(dtype):<18} rel={rel:.3e} "
+                f"  {name:<20} {str(dtype):<18} rel={rel:.3e} "
                 f"{'ok' if ok else 'FAIL'}"
             )
     print("ALL OK" if not fails else f"FAILURES: {fails}")
