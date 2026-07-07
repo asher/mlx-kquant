@@ -232,8 +232,9 @@ NB_MODULE(_ext, m) {
                 (read in place), the head_dim must be contiguous.
             v (array): values [1, n_kv_heads, kL, D].
             scale (float): query scale (typically 1/sqrt(D)).
-            q_len (int): pre-fold query length (2..8); sets each folded
-                row's causal clamp.
+            q_len (int): pre-fold query length (1..8); sets each folded
+                row's causal clamp. q_len 1 is plain GQA decode on the
+                matrix units (every folded row attends the full KV).
             splits (int): key-axis split count; 0 picks the default.
 
         Returns:

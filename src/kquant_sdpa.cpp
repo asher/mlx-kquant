@@ -720,9 +720,9 @@ mx::array sdpa_fa_verify(
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_fa_verify] k and v must share a key length.");
   }
-  if (q_len < 2 || q_len > 8) {
+  if (q_len < 1 || q_len > 8) {
     throw std::invalid_argument(
-        "[mlx_kquant.sdpa_fa_verify] q_len must be in [2, 8].");
+        "[mlx_kquant.sdpa_fa_verify] q_len must be in [1, 8].");
   }
   int n_rows = q.shape(2);
   if (n_rows < q_len || n_rows > 64 || n_rows % q_len != 0) {

@@ -286,6 +286,13 @@ def test_sdpa_fa_verify_qwen_geometry():
     _check_fa(256, 4, kL=8192, dtype=mx.bfloat16, Hkv=4, G=6)
 
 
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_sdpa_fa_verify_decode(dtype):
+    # q_len == 1: plain GQA decode on the matrix units (every folded row
+    # attends the full KV). 122b shape: G16 x qL1 at hd256, 2 kv heads.
+    _check_fa(256, 1, kL=8192, dtype=dtype, Hkv=2, G=16)
+
+
 def test_sdpa_fa_verify_full_tile():
     # n_rows == 32 fills the tile exactly (no padding rows), qL at the cap
     _check_fa(256, 8, kL=4096, dtype=mx.bfloat16, Hkv=2, G=4)
