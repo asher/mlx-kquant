@@ -286,6 +286,13 @@ def test_sdpa_fa_verify_qwen_geometry():
     _check_fa(256, 4, kL=8192, dtype=mx.bfloat16, Hkv=4, G=6)
 
 
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_sdpa_fa_verify_decode(dtype):
+    # q_len == 1: plain GQA decode on the matrix units (every folded row
+    # attends the full KV). 122b shape: G16 x qL1 at hd256, 2 kv heads.
+    _check_fa(256, 1, kL=8192, dtype=dtype, Hkv=2, G=16)
+
+
 def test_sdpa_fa_verify_full_tile():
     # n_rows == 32 fills the tile exactly (no padding rows), qL at the cap
     _check_fa(256, 8, kL=4096, dtype=mx.bfloat16, Hkv=2, G=4)
@@ -319,6 +326,43 @@ def test_sdpa_fa_verify_causal_split_straddle():
     # the low rows' causal limits, exercising the dead-row guard in a
     # non-empty split
     _check_fa(256, 4, kL=4098, dtype=mx.bfloat16, splits=128, G=6)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_sdpa_fa_verify_bq64_full_tile(dtype):
+    # gqa16 x qL4 = 64 rows (qwen3.5-122b-a10b verify fold): fills the BQ=64
+    # tile exactly
+    _check_fa(256, 4, kL=4096, dtype=dtype, Hkv=2, G=16)
+
+
+@pytest.mark.parametrize("G,qL", [(8, 5), (12, 4), (10, 6)])
+def test_sdpa_fa_verify_bq64_padded(G, qL):
+    # 33..63 rows: BQ=64 with padding rows in the upper simdgroups
+    _check_fa(256, qL, kL=2048, dtype=mx.bfloat16, Hkv=2, G=G)
+
+
+def test_sdpa_fa_verify_bq64_strided_kv():
+    _check_fa(256, 4, kL=3071, dtype=mx.bfloat16, Hkv=2, G=16, strided=True, splits=16)
+
+
+def test_sdpa_fa_verify_lazy_strided_q():
+    # Regression: an UNEVALUATED strided q view (here a chunk of a folded
+    # tile) must not be trusted as row-contiguous at op-build time; the op
+    # wraps q in mx.contiguous unconditionally, which resolves at eval.
+    D, qL, kL = 256, 4, 4096
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(1, 2, 2, 32, kL, D, mx.bfloat16, seed=7, strided=False)
+    whole = kq.sdpa_fa_verify(q, k, v, scale, q_len=qL)
+    qc = q.reshape(1, 2, 2, 16, D)
+    lazy_chunks = [qc[:, :, i] for i in range(2)]  # NOT evaluated
+    got = mx.concatenate(
+        [kq.sdpa_fa_verify(c, k, v, scale, q_len=qL) for c in lazy_chunks],
+        axis=2,
+    )
+    _eval_or_skip(whole, got)
+    rel = _rel(got, whole)
+    print(f"  [fa] lazy strided q chunks: rel={rel:.3e}")
+    assert rel < 1e-6, f"lazy strided q gave rel {rel:.3e}"
 
 
 def main():

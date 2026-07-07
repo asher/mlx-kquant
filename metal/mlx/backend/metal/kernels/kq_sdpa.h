@@ -426,13 +426,14 @@ struct KQExpSubOp {
 // Simdgroup-matrix (steel MMA) speculative-verify attention, pass 1. The
 // caller folds the GQA group into the query rows -- q [B, Hq, qL, D] becomes
 // [B, Hkv, G*qL, D] with kv-major heads -- so the kernel sees an MHA problem
-// whose n_rows = G*qL <= 32 queries fill exactly one BQ=32 tile, held in
-// per-thread fragments (each thread owns one row of every 8x8 fragment, so
-// the online-softmax row max/sum live in registers with no threadgroup
-// round-trips). Grid (n_kv_heads, B, gqa_splits): each threadgroup streams
-// its contiguous key chunk once through threadgroup-staged K/V tiles (one
-// shared buffer, steel style), computing S = Q @ K^T and O += P @ V on
-// simdgroup_matrix with float32 accumulators.
+// whose n_rows = G*qL <= BQ queries fill one BQ-row tile (BQ 32 or 64; one
+// 8-row fragment strip per simdgroup, so per-thread register pressure is
+// BQ-independent), held in per-thread fragments (each thread owns one row of
+// every 8x8 fragment, so the online-softmax row max/sum live in registers
+// with no threadgroup round-trips). Grid (n_kv_heads, B, gqa_splits): each
+// threadgroup streams its contiguous key chunk once through
+// threadgroup-staged K/V tiles (one shared buffer, steel style), computing
+// S = Q @ K^T and O += P @ V on simdgroup_matrix with float32 accumulators.
 //
 // Each folded row is causally clamped to key <= kL - qL + (row % qL), with qL
 // a runtime buffer param. Only tiles reaching past kL - qL or the split tail
@@ -445,7 +446,7 @@ struct KQExpSubOp {
 // at finite_min and zeroes its P row (exp2(0) == 1 would otherwise poison the
 // sum); an empty split writes (O = 0, sum = 0, max = finite_min) partials
 // that merge with weight zero.
-template <typename T, int D>
+template <typename T, int D, int BQ = 32>
 [[kernel]] void kq_sdpa_fa_verify_2pass_1(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
@@ -465,7 +466,6 @@ template <typename T, int D>
     uint simd_lid [[thread_index_in_simdgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]]) {
-  constexpr int BQ = 32; // query rows (the whole fold, zero-padded)
   constexpr int BK = 32; // keys staged per tile
   constexpr int kNWarps = BQ / 8; // one 8-row fragment strip per simdgroup
   constexpr short kFragSize = 8;

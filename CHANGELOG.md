@@ -7,6 +7,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `sdpa_fa_verify` now takes a 64-row query tile (up from 32), so a GQA-16
+  fold at `q_len` 4 stays on the matrix units instead of falling to the
+  stock materialized path. `q_len` 1 is also accepted now, routing plain
+  GQA decode through the same kernel.
 - Non-NAX `gather_qmm_rhs`: steel simdgroup-mma GEMM for the sorted-rhs
   (SwitchGLU prefill) gather leaf on GPUs without tensor units, all 19
   codecs. Walks each row tile's per-expert segments and runs one full-K
@@ -23,6 +27,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refuses (older macOS, `K % 64 != 0`, `KQ_DISABLE_NAX=1`).
 
 ### Fixed
+- `sdpa_fa_verify` read a lazily-strided query as packed: it trusted the
+  query layout at graph-build time, so a non-contiguous q tile was streamed
+  at the wrong stride. Layout is now checked at eval time.
 - The sorted-rhs gather leaf mis-walked expert strides on the FIRST
   evaluation of a lazily-sliced weight stack (e.g. a fresh `w[:, :n]` view):
   the op trusted `w.flags().row_contiguous` at graph-build time, but flags of
