@@ -2222,3 +2222,200 @@ KQUANT_DEFINE_GATHER_KERNELS(iq1_s, KqIq1_sBlockLoader)
 KQUANT_DEFINE_GATHER_KERNELS(iq1_m, KqIq1_mBlockLoader)
 
 #undef KQUANT_DEFINE_GATHER_KERNELS
+
+// Sorted-rhs gather GEMM (ALU/steel path), the non-NAX counterpart of
+// kq_gather_qmm_rhs_nax_tgp_impl. x rows arrive sorted by expert (the
+// SwitchGLU prefill layout): each BM output tile walks its row segments of
+// equal expert index and runs one steel-mma GEMM per segment against that
+// expert's transposed weight matrix, storing only the segment's row slice.
+// Without this kernel the sorted-prefill batch decomposes into per-row
+// gather tiles that fill 1/BM of every simdgroup matmul. Transpose (nt)
+// form only; K must be a multiple of BK (every kquant block size is).
+template <
+    typename T,
+    typename LoaderW,
+    const bool aligned_N,
+    const int BM = 64,
+    const int BK = 32,
+    const int BN = 64>
+METAL_FUNC void kq_gather_qmm_rhs_impl(
+    const device T* x,
+    const device uint8_t* w,
+    const device uint32_t* indices,
+    device T* y,
+    threadgroup T* Xs,
+    threadgroup T* Ws,
+    const constant int& M,
+    const constant int& N,
+    const constant int& K,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(BK >= SIMD_SIZE, "BK should be >= SIMD_SIZE");
+  static_assert(BK % SIMD_SIZE == 0, "BK should be a multiple of SIMD_SIZE");
+
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  using mma_t = mlx::steel::BlockMMA<
+      T,
+      T,
+      BM,
+      BN,
+      BK,
+      WM,
+      WN,
+      /*transpose_a=*/false,
+      /*transpose_b=*/true,
+      BK_padded,
+      BK_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+
+  const int K_w = (K / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
+  const size_t stride_w = size_t(N) * K_w;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+
+  x += size_t(y_row) * K;
+  y += size_t(y_row) * N + y_col;
+  auto wl = w + size_t(y_col) * K_w;
+
+  const short num_els = short(min(BM, M - y_row));
+  const short num_outs = aligned_N ? short(BN) : short(min(BN, N - y_col));
+
+  uint32_t index_next = indices[y_row];
+  short offset_next = 0;
+  short n = 0;
+  while (n < num_els) {
+    n++;
+    const short offset = offset_next;
+    const uint32_t index = index_next;
+    offset_next = num_els;
+    for (; n < num_els; n++) {
+      if (indices[y_row + n] != index) {
+        offset_next = n;
+        index_next = indices[y_row + n];
+        break;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_none);
+
+    mma_t mma_op(simd_gid, simd_lid);
+    loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
+    LoaderW loader_w(wl + index * stride_w, K, Ws, simd_gid, simd_lid);
+
+    if (num_els == BM) {
+      if (aligned_N || num_outs == BN) {
+        for (int k = 0; k < K; k += BK) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          loader_x.load_unsafe();
+          loader_w.load_unsafe();
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          mma_op.mma(Xs, Ws);
+          loader_x.next();
+          loader_w.next();
+        }
+      } else {
+        for (int k = 0; k < K; k += BK) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          loader_x.load_unsafe();
+          loader_w.load_safe(short2(BK, num_outs));
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          mma_op.mma(Xs, Ws);
+          loader_x.next();
+          loader_w.next();
+        }
+      }
+    } else {
+      if (aligned_N || num_outs == BN) {
+        for (int k = 0; k < K; k += BK) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          loader_x.load_safe(short2(BK, num_els));
+          loader_w.load_unsafe();
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          mma_op.mma(Xs, Ws);
+          loader_x.next();
+          loader_w.next();
+        }
+      } else {
+        for (int k = 0; k < K; k += BK) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          loader_x.load_safe(short2(BK, num_els));
+          loader_w.load_safe(short2(BK, num_outs));
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          mma_op.mma(Xs, Ws);
+          loader_x.next();
+          loader_w.next();
+        }
+      }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (offset == 0 && offset_next == BM && (aligned_N || num_outs == BN)) {
+      mma_op.store_result(y, N);
+    } else {
+      mma_op.store_result_slice(
+          y, N, short2(0, offset), short2(num_outs, offset_next));
+    }
+  }
+}
+
+// BM is a template parameter (64/32/16): sorted prefill batches with few
+// rows per expert fragment each row tile into per-expert segments that each
+// pay a full-tile mma K-loop, so utilization is ~1/segments-per-tile. The
+// dispatch picks the largest BM not much above the batch's rows-per-expert.
+#define KQ_DEFINE_GATHER_QMM_RHS(CODEC, LOADER)                           \
+  template <typename T, int group_size, int bits, bool aligned_N, int BM> \
+  [[kernel]] void kq_##CODEC##_gather_qmm_rhs(                            \
+      const device T* x [[buffer(0)]],                                    \
+      const device uint8_t* w [[buffer(1)]],                              \
+      const device uint8_t* scales [[buffer(2)]],                         \
+      const device uint32_t* indices [[buffer(3)]],                       \
+      device T* y [[buffer(4)]],                                          \
+      const constant int& M [[buffer(5)]],                                \
+      const constant int& N [[buffer(6)]],                                \
+      const constant int& K [[buffer(7)]],                                \
+      uint3 tid [[threadgroup_position_in_grid]],                         \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                   \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                      \
+    constexpr int BK = 32, BN = 64;                                       \
+    constexpr int BK_padded = (BK + 16 / sizeof(T));                      \
+    using LoaderW = LOADER<                                               \
+        T,                                                                \
+        BN,                                                               \
+        BK,                                                               \
+        BK_padded,                                                        \
+        /*reduction_dim=*/1,                                              \
+        /*tgp_size=*/2 * 2 * SIMD_SIZE>;                                  \
+    static_assert(                                                        \
+        group_size == LoaderW::weights_per_block,                         \
+        #CODEC " gather_qmm_rhs requires group_size == block size");      \
+    threadgroup T Xs[BM * BK_padded];                                     \
+    threadgroup T Ws[BN * BK_padded];                                     \
+    kq_gather_qmm_rhs_impl<T, LoaderW, aligned_N, BM, BK, BN>(            \
+        x, w, indices, y, Xs, Ws, M, N, K, tid, simd_gid, simd_lid);      \
+  }
+
+KQ_DEFINE_GATHER_QMM_RHS(q8_0, KqQ8_0BlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(q4_0, KqQ4_0BlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(q4_1, KqQ4_1BlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(q5_0, KqQ5_0BlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(q5_1, KqQ5_1BlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(q4_k, KqQ4_KBlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(q5_k, KqQ5_KBlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(q6_k, KqQ6_KBlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(q3_k, KqQ3_KBlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(q2_k, KqQ2_KBlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(iq4_nl, KqIq4_nlBlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(iq4_xs, KqIq4_xsBlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(iq3_xxs, KqIq3_xxsBlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(iq3_s, KqIq3_sBlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(iq2_xxs, KqIq2_xxsBlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(iq2_xs, KqIq2_xsBlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(iq2_s, KqIq2_sBlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(iq1_s, KqIq1_sBlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(iq1_m, KqIq1_mBlockLoader)
+
+#undef KQ_DEFINE_GATHER_QMM_RHS

@@ -700,4 +700,109 @@ NB_MODULE(_ext, m) {
         Returns:
             list[str]: problem descriptions; empty when clean.
       )");
+
+  // --- feeder-loop support: writable zero-copy buffers + shared events ---
+
+  m.def(
+      "arena_alloc",
+      [](const std::vector<int>& shape) {
+        auto [arr, addr] = mlx_kquant::arena_alloc(
+            mlx::core::Shape(shape.begin(), shape.end()));
+        PyObject* mv = PyMemoryView_FromMemory(
+            reinterpret_cast<char*>(addr),
+            static_cast<Py_ssize_t>(arr.nbytes()),
+            PyBUF_WRITE);
+        if (mv == nullptr) {
+          throw nb::python_error();
+        }
+        return nb::make_tuple(arr, nb::steal(mv));
+      },
+      "shape"_a,
+      R"(
+        Allocate a page-aligned host buffer wrapped zero-copy as a Metal
+        shared-storage uint8 array.
+
+        Returns (array, memoryview): the same bytes seen from both sides.
+        The writable memoryview is the CPU feeder's window (os.preadv into
+        slices of it reads disk straight into GPU-visible memory); the array
+        is what kernels consume. The memoryview is valid only while the array
+        is alive - hold them together. Writes become safely visible to GPU
+        work encoded after an event_wait whose value the writer signals
+        (shared_event_set) after writing; nothing else orders them.
+      )");
+
+  // --- shared-event stream primitives (feeder loop) ---
+
+  m.def(
+      "shared_event_create",
+      &mlx_kquant::shared_event_create,
+      "Create a process-wide MTLSharedEvent (signaled value 0); returns an "
+      "opaque handle for the other shared_event_*/event_* calls. Metal-only.");
+
+  m.def(
+      "shared_event_destroy",
+      &mlx_kquant::shared_event_destroy,
+      "handle"_a,
+      "Release a shared event. Live command buffers keep their own "
+      "reference; encoding against a destroyed handle throws.");
+
+  m.def(
+      "shared_event_set",
+      &mlx_kquant::shared_event_set,
+      "handle"_a,
+      "value"_a,
+      "Host-side signal: set the event's value. Releases any encoded "
+      "event_wait on a value <= the one set; setting 2**64 - 1 is the "
+      "poison that un-wedges every wait on the event (watchdog recovery).");
+
+  m.def(
+      "shared_event_read",
+      &mlx_kquant::shared_event_read,
+      "handle"_a,
+      "Current signaled value of the event (non-blocking).");
+
+  m.def(
+      "shared_event_wait",
+      &mlx_kquant::shared_event_wait,
+      "handle"_a,
+      "value"_a,
+      "timeout_ms"_a = -1,
+      nb::call_guard<nb::gil_scoped_release>(),
+      "Block the calling thread until the event reaches ``value``; releases "
+      "the GIL. ``timeout_ms < 0`` waits forever. Returns False on timeout.");
+
+  m.def(
+      "event_signal",
+      &mlx_kquant::event_signal,
+      "x"_a,
+      "handle"_a,
+      "value"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Identity op on ``x`` that encodes an MTLSharedEvent signal at its
+        position in evaluation order: the event reaches ``value`` only after
+        all GPU work encoded before it (e.g. the router whose output the
+        feeder is about to read) has completed. The result aliases ``x`` and
+        must feed downstream compute or be evaluated - an unused output
+        encodes nothing. On the CPU stream it is a plain identity.
+      )");
+
+  m.def(
+      "event_wait",
+      &mlx_kquant::event_wait,
+      "x"_a,
+      "handle"_a,
+      "value"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Identity op on ``x`` that encodes an MTLSharedEvent wait at its
+        position in evaluation order: GPU work encoded after it (e.g. an
+        expert kernel reading staged weights) stalls until the event reaches
+        ``value`` - normally from shared_event_set on the feeder thread, or
+        the 2**64 - 1 poison to drain a wedged buffer. The result aliases
+        ``x`` and must feed downstream compute or be evaluated. On the CPU
+        stream it is a plain identity.
+      )");
 }

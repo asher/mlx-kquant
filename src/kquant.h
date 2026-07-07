@@ -925,4 +925,98 @@ class KQuantQuantize : public mx::Primitive {
   int bits_;
 };
 
+// ---------------- shared-event stream primitives ----------------
+// Building blocks for the feeder decode loop (docs/feeder/DESIGN.md): a
+// process-wide MTLSharedEvent registry with a host-side API, and two ops that
+// encode a signal/wait against a registered event directly on the Metal
+// command stream, so a single command buffer can hand control to a CPU feeder
+// mid-stream and resume when it answers. Registry handles are opaque
+// non-zero integers; every call throws on an unknown handle, and all of it
+// throws on CPU-only builds (there is no event to encode).
+
+// Create/destroy a shared event. Events start at signaled value 0.
+uint64_t shared_event_create();
+void shared_event_destroy(uint64_t handle);
+
+// Host side: set the event's value (the GPU-visible signal, including the
+// UINT64_MAX poison that releases any encoded wait), read it, or block until
+// it reaches `value` (timeout_ms < 0 waits forever; returns false on
+// timeout).
+void shared_event_set(uint64_t handle, uint64_t value);
+uint64_t shared_event_read(uint64_t handle);
+bool shared_event_wait(uint64_t handle, uint64_t value, int64_t timeout_ms);
+
+// Writable zero-copy host buffer: page-aligned host memory wrapped no-copy
+// in a Metal shared-storage buffer, as a uint8 array of `shape` plus the raw
+// base address (for the Python binding's writable memoryview over the same
+// bytes; valid exactly as long as the array lives). The CPU-write -> GPU-read
+// ordering contract is the caller's, via the event ops below.
+std::pair<mx::array, uintptr_t> arena_alloc(const mx::Shape& shape);
+
+// Stream side: identity ops on `x` that encode an MTLSharedEvent signal/wait
+// at their position in the graph's evaluation order. The returned array
+// aliases x and MUST be threaded into downstream compute (or evaluated
+// explicitly) - an unused output is dead code and encodes nothing. eval_cpu
+// is a plain identity so CPU placements remain legal no-ops.
+mx::array event_signal(
+    const mx::array& x,
+    uint64_t handle,
+    uint64_t value,
+    mx::StreamOrDevice s = {});
+mx::array event_wait(
+    const mx::array& x,
+    uint64_t handle,
+    uint64_t value,
+    mx::StreamOrDevice s = {});
+
+class KQuantEventSignal : public mx::Primitive {
+ public:
+  explicit KQuantEventSignal(mx::Stream stream, uint64_t handle, uint64_t value)
+      : mx::Primitive(stream), handle_(handle), value_(value) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantEventSignal";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  uint64_t handle_;
+  uint64_t value_;
+};
+
+class KQuantEventWait : public mx::Primitive {
+ public:
+  explicit KQuantEventWait(mx::Stream stream, uint64_t handle, uint64_t value)
+      : mx::Primitive(stream), handle_(handle), value_(value) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantEventWait";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  uint64_t handle_;
+  uint64_t value_;
+};
+
 } // namespace mlx_kquant

@@ -318,3 +318,64 @@ def test_gather_cpu_duplicate_entry_dedupe():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_rhs_gather_sweep():
+    """Parity sweep for the sorted-rhs gather leaf (gather_qmm_rhs: steel-mma
+    on non-NAX GPUs, rhs_nax where NAX exists) against the unsorted per-row
+    leaf. Covers every codec, both 16-bit x dtypes (the op promotes fp32 x
+    to bfloat16 before the primitive), a B that is not a multiple of the row
+    tile, an N that is not a
+    multiple of the column tile (partial-N stores), and uneven sorted expert
+    segments that straddle tile boundaries."""
+    rng = np.random.default_rng(3)
+    fails = []
+    for codec, (gtype, wpb, bpb, _bits, is_kq) in CODECS.items():
+        wire, ref = _wire_and_ref(codec, gtype, wpb, bpb, is_kq)
+        assert wire is not None, f"missing fixture for {codec}"
+        w = mx.array(wire)
+        scales = mx.zeros((1,), dtype=mx.uint8)
+        ne = wire.shape[0]
+
+        # N=128 fixtures exercise full column tiles; slice the wire rows to
+        # N=96 for the partial-N variant (row-major wire: rows are whole
+        # superblock rows, so a leading slice stays a valid wire).
+        for n_rows in (None, 96):
+            wv = w if n_rows is None else w[:, :n_rows]
+            for dtype in (mx.float16, mx.bfloat16):
+                for B in (100, 256):
+                    experts = np.sort(rng.integers(0, ne, size=B)).astype(np.uint32)
+                    rhs = mx.array(experts)
+                    x = mx.array(
+                        (rng.standard_normal((B, 1, K)) * 0.1).astype(np.float32)
+                    ).astype(dtype)
+                    got = kq.gather_qmm(
+                        x,
+                        wv,
+                        scales,
+                        codec,
+                        rhs_indices=rhs,
+                        transpose=True,
+                        sorted_indices=True,
+                    ).reshape(B, -1)
+                    ctl = kq.gather_qmm(
+                        x,
+                        wv,
+                        scales,
+                        codec,
+                        rhs_indices=rhs,
+                        transpose=True,
+                        sorted_indices=False,
+                    ).reshape(B, -1)
+                    mx.eval(got, ctl)
+                    g = np.array(got.astype(mx.float32))
+                    c = np.array(ctl.astype(mx.float32))
+                    rel = float(np.linalg.norm(g - c) / (np.linalg.norm(c) + 1e-6))
+                    # bf16 tiles round dequantized weights to 8 mantissa
+                    # bits before the mma; the per-row control leaf keeps
+                    # them in float. ~2.5e-3 rel is that quantization, not
+                    # a defect (the dense qmm_t tests carry the same slack).
+                    tol = 1e-3 if dtype == mx.float16 else 1e-2
+                    if rel >= tol or g.shape != c.shape:
+                        fails.append((codec, n_rows, str(dtype), B, rel))
+    assert not fails, f"sorted-rhs leaf diverges: {fails}"
