@@ -185,9 +185,12 @@ mx::array gather_qmv_bias(
 
 // K-quant counterpart of moe_glu_gather: gate and up expert matvecs on GGUF
 // wire bytes (n_experts, out_dims, bytes_per_row) sharing each activation
-// load, with the GLU epilogue act(g) * u fused (act: "silu" or "gelu"). No
-// biases. x [T, K], indices [T, R]. Returns [T, R, N]. Metal-only; requires
-// K % 256 == 0 and a codec with the fused kernel wired (full GGUF matrix).
+// load, with the GLU epilogue act(g) * u fused (act: "silu", "gelu" or
+// "silu_limit" -- the latter clamps g from above and u to +-limit before
+// silu(g) * u, deepseek-v4 LimitedSwiGLU semantics, and requires limit > 0).
+// No biases. x [T, K], indices [T, R]. Returns [T, R, N]. Metal-only;
+// requires K % 256 == 0 and a codec with the fused kernel wired (full GGUF
+// matrix).
 mx::array moe_glu_gather_kq(
     mx::array x,
     mx::array gate_w,
@@ -195,6 +198,7 @@ mx::array moe_glu_gather_kq(
     const std::string& kquant_type,
     mx::array indices,
     const std::string& act = "silu",
+    float limit = 0.0f,
     mx::StreamOrDevice s = {});
 
 // K-quant gathered matvec (down projection), same wire layout. x [T, R, K]
@@ -569,10 +573,12 @@ class KQuantMoEGLUKQ : public mx::Primitive {
   explicit KQuantMoEGLUKQ(
       mx::Stream stream,
       std::string kquant_type,
-      std::string act)
+      std::string act,
+      float limit = 0.0f)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
-        act_(std::move(act)) {}
+        act_(std::move(act)),
+        limit_(limit) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -592,6 +598,7 @@ class KQuantMoEGLUKQ : public mx::Primitive {
  private:
   std::string kquant_type_;
   std::string act_;
+  float limit_;
 };
 
 // K-quant gathered matvec (see gather_qmv_kq). Inference-only.

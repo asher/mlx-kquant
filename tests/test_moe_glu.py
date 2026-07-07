@@ -134,12 +134,22 @@ def _act_np(g, act):
         return g / (1.0 + np.exp(-g))
 
 
+def _glu_np(g, u, act, limit=0.0):
+    """GLU epilogue reference: act(g) * u. silu_limit = deepseek-v4
+    LimitedSwiGLU (gate clamped from above only, up clamped both sides)."""
+    if act == "silu_limit":
+        g = np.minimum(g, limit)
+        u = np.clip(u, -limit, limit)
+        act = "silu"
+    return _act_np(g, act) * u
+
+
 def _rel(got, ref):
     g = np.array(got.astype(mx.float32))
     return float(np.linalg.norm(g - ref) / (np.linalg.norm(ref) + 1e-6))
 
 
-def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K):
+def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0):
     """Run all five gather ops for one (expert codec, shexp codec) pair.
     Returns list of (name, rel, ok)."""
     scodec = sx or codec
@@ -170,13 +180,13 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K):
     up_stack_np = wire[::-1].copy()
     up_stack = mx.array(up_stack_np)
     up_ref = ref[::-1].copy()
-    got = kq.moe_glu_gather_kq(x, dw, up_stack, codec, inds, act=act)
+    got = kq.moe_glu_gather_kq(x, dw, up_stack, codec, inds, act=act, limit=limit)
     mx.eval(got)
     r = np.stack(
         [
             np.stack(
                 [
-                    _act_np(xf[t] @ ref[e].T, act) * (xf[t] @ up_ref[e].T)
+                    _glu_np(xf[t] @ ref[e].T, xf[t] @ up_ref[e].T, act, limit)
                     for e in inds_np[t]
                 ],
                 0,
@@ -204,7 +214,10 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K):
     rel = _rel(got, r)
     out.append(("qmv", rel, rel < REL_BOUND))
 
-    # moe_glu_gather_shexp_kq (shexp codec = scodec)
+    # moe_glu_gather_shexp_kq (shexp codec = scodec). No silu_limit shexp
+    # instantiations exist (deepseek-v4's shared expert stays in Python), so
+    # silu_limit runs exercise the shexp op with plain silu.
+    act = "silu" if act == "silu_limit" else act
     got = kq.moe_glu_gather_shexp_kq(
         x,
         dw,
@@ -346,9 +359,9 @@ def main(argv=None) -> int:
     )
     fails, missing = 0, []
 
-    def run(codec, sx=None, act="silu", dtype=mx.float16, k=K):
+    def run(codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0):
         nonlocal fails
-        res = _check_codec(codec, sx=sx, act=act, dtype=dtype, k=k)
+        res = _check_codec(codec, sx=sx, act=act, dtype=dtype, k=k, limit=limit)
         if res is None:
             missing.append(codec if sx is None else f"{codec}+{sx}")
             fails += 1
@@ -375,6 +388,19 @@ def main(argv=None) -> int:
     if not allow or "q4_k" in allow:
         run("q4_k", act="gelu")  # gelu epilogue (gemma GeGLU)
         run("q4_k", dtype=mx.bfloat16)  # bf16 activations
+    # silu_limit epilogue (deepseek-v4 LimitedSwiGLU). limit=0.05 so the
+    # clamps actually engage at the test's ~0.1-scale activations. iq2_xxs +
+    # q2_k are V4's expert codecs (generic Ext kernels); q6_k/q8_0 cover the
+    # tuned kernels.
+    if not allow or "iq2_xxs" in allow:
+        run("iq2_xxs", act="silu_limit", limit=0.05)
+        run("iq2_xxs", act="silu_limit", dtype=mx.bfloat16, limit=0.05)
+    if not allow or "q2_k" in allow:
+        run("q2_k", act="silu_limit", limit=0.05)
+    if not allow or "q6_k" in allow:
+        run("q6_k", act="silu_limit", limit=0.05)
+    if not allow or "q8_0" in allow:
+        run("q8_0", act="silu_limit", limit=0.05)
 
     router_fails = _check_router()
     for f in router_fails:
@@ -386,6 +412,16 @@ def main(argv=None) -> int:
         print(f"\nMISSING fixtures (FAIL): {', '.join(missing)}")
     print(f"{'FAILURES: ' + str(fails) if fails else 'ALL OK'}")
     return 1 if fails else 0
+
+
+def test_silu_limit_requires_positive_limit():
+    """act='silu_limit' with limit<=0 must be rejected host-side (a zero
+    limit would silently zero every expert row)."""
+    x = mx.zeros((2, 256), dtype=mx.float16)
+    inds = mx.zeros((2, 2), dtype=mx.uint32)
+    w = mx.zeros((4, 8, 16), dtype=mx.uint8)
+    with pytest.raises(ValueError, match="limit"):
+        kq.moe_glu_gather_kq(x, w, w, "q8_0", inds, act="silu_limit")
 
 
 def test_moe_glu():

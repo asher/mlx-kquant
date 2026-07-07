@@ -28,14 +28,21 @@
 // Activation selector (epilogue): out = act(g) * u.
 #define KQ_GLU_ACT_SILU 0
 #define KQ_GLU_ACT_GELU 1
+#define KQ_GLU_ACT_SILU_LIMIT 2
 
 template <int ACT>
-inline float kq_glu_epilogue(float g, float u) {
+inline float kq_glu_epilogue(float g, float u, float limit) {
   if (ACT == KQ_GLU_ACT_GELU) {
     // tanh-approx gelu (matches mlx nn.gelu_approx / gemma usage)
     const float g3 = 0.044715f * g * g * g;
     const float t = metal::precise::tanh(0.7978845608028654f * (g + g3));
     return (0.5f * g * (1.0f + t)) * u;
+  }
+  if (ACT == KQ_GLU_ACT_SILU_LIMIT) {
+    // deepseek-v4 LimitedSwiGLU: gate clamped from above only, up clamped
+    // both sides, then plain silu(g) * u (alpha 1, no +1 -- NOT gpt-oss).
+    g = metal::min(g, limit);
+    u = metal::clamp(u, -limit, limit);
   }
   const float sig = 1.0f / (1.0f + metal::exp(-g));
   return (g * sig) * u;
@@ -53,6 +60,7 @@ template <typename T, int ACT>
     device T* out [[buffer(4)]],
     const constant int& K [[buffer(5)]],
     const constant int& N [[buffer(6)]],
+    const constant float& limit [[buffer(7)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -135,7 +143,7 @@ template <typename T, int ACT>
     U g = simd_sum(rg[row]);
     U u = simd_sum(ru[row]);
     if (simd_lid == 0) {
-      out[row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u));
+      out[row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
     }
   }
 }
@@ -237,6 +245,7 @@ template <typename T, int ACT>
     device T* out [[buffer(6)]],
     const constant int& K [[buffer(7)]],
     const constant int& N [[buffer(8)]],
+    const constant float& limit [[buffer(9)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -322,7 +331,7 @@ template <typename T, int ACT>
     U g = simd_sum(rg[row]);
     U u = simd_sum(ru[row]);
     if (simd_lid == 0) {
-      out[row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u));
+      out[row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
     }
   }
 }
@@ -435,6 +444,7 @@ template <typename T, int ACT>
     device T* out [[buffer(4)]],
     const constant int& K [[buffer(5)]],
     const constant int& N [[buffer(6)]],
+    const constant float& limit [[buffer(7)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -491,7 +501,7 @@ template <typename T, int ACT>
     U g = simd_sum(rg[row]);
     U u = simd_sum(ru[row]);
     if (simd_lid == 0) {
-      out[row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u));
+      out[row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
     }
   }
 }
@@ -570,6 +580,7 @@ template <typename T, int ACT>
     device T* out [[buffer(6)]],
     const constant int& K [[buffer(7)]],
     const constant int& N [[buffer(8)]],
+    const constant float& limit [[buffer(9)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -629,7 +640,7 @@ template <typename T, int ACT>
     U g = simd_sum(rg[row]);
     U u = simd_sum(ru[row]);
     if (simd_lid == 0) {
-      out[row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u));
+      out[row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
     }
   }
 }
@@ -806,6 +817,7 @@ template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
     device T* out [[buffer(4)]],
     const constant int& K [[buffer(5)]],
     const constant int& N [[buffer(6)]],
+    const constant float& limit [[buffer(7)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -825,7 +837,7 @@ template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
   const float g = kq_ext_reduce<NX>(gu.x);
   const float u = kq_ext_reduce<NX>(gu.y);
   if (tx == 0) {
-    out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u));
+    out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
   }
 }
 
@@ -875,6 +887,7 @@ template <
     device T* out [[buffer(6)]],
     const constant int& K [[buffer(7)]],
     const constant int& N [[buffer(8)]],
+    const constant float& limit [[buffer(9)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -901,7 +914,7 @@ template <
   const float g = kq_ext_reduce<NX>(gu.x);
   const float u = kq_ext_reduce<NX>(gu.y);
   if (tx == 0) {
-    out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u));
+    out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
   }
 }
 

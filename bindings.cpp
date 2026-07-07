@@ -313,6 +313,7 @@ NB_MODULE(_ext, m) {
       "kquant_type"_a,
       "indices"_a,
       "act"_a = "silu",
+      "limit"_a = 0.0f,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
@@ -326,7 +327,10 @@ NB_MODULE(_ext, m) {
             up_w (array): uint8 wire bytes, same shape as gate_w.
             kquant_type (str): codec with a fused kernel (full GGUF matrix).
             indices (array): expert indices [T, R].
-            act (str): 'silu' (default) or 'gelu' (tanh approx).
+            act (str): 'silu' (default), 'gelu' (tanh approx) or 'silu_limit'
+                (silu(min(g, limit)) * clip(u, -limit, limit) -- deepseek-v4
+                LimitedSwiGLU; requires limit > 0).
+            limit (float): clamp bound for 'silu_limit'; ignored otherwise.
 
         Returns:
             array: activated hidden states [T, R, N] in x.dtype.

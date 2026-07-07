@@ -20,6 +20,11 @@
       type,                                                           \
       KQ_GLU_ACT_GELU)                                                \
   instantiate_kernel(                                                 \
+      "kq_" #codec "_moe_glu_gather_silu_limit_" #type,               \
+      kq_ ## codec ## _moe_glu_gather,                                \
+      type,                                                           \
+      KQ_GLU_ACT_SILU_LIMIT)                                          \
+  instantiate_kernel(                                                 \
       "kq_" #codec "_gather_qmv_" #type,                              \
       kq_ ## codec ## _gather_qmv,                                    \
       type)                                                           \
@@ -55,6 +60,9 @@ instantiate_kq_moe_glu_kq(q8_0, float16_t)
   instantiate_kernel(                                                         \
       "kq_" #codec "_moe_glu_gather_gelu" sfx "_" #type,                      \
       kq_ext_moe_glu_gather, type, traits, KQ_GLU_ACT_GELU, nx)                \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_silu_limit" sfx "_" #type,                \
+      kq_ext_moe_glu_gather, type, traits, KQ_GLU_ACT_SILU_LIMIT, nx)          \
   instantiate_kernel(                                                         \
       "kq_" #codec "_gather_qmv" sfx "_" #type,                               \
       kq_ext_gather_qmv, type, traits, nx)                                     \

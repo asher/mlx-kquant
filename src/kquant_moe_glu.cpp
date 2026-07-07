@@ -213,6 +213,7 @@ void KQuantMoEGLUKQ::eval_gpu(
   ce.set_output_array(out, 4);
   ce.set_bytes(K, 5);
   ce.set_bytes(N, 6);
+  ce.set_bytes(limit_, 7);
   MTL::Size group_dims(32, 2, 1);
   MTL::Size grid_dims(N / (64 / nx), R, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -293,6 +294,10 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   ce.set_output_array(out, 6);
   ce.set_bytes(K, 7);
   ce.set_bytes(N, 8);
+  // Signature parity with the plain kernels: the shexp epilogue takes the
+  // limit arg too (dead for silu/gelu; no shexp silu_limit instantiations).
+  const float limit = 0.0f;
+  ce.set_bytes(limit, 9);
   MTL::Size group_dims(32, 2, 1);
   MTL::Size grid_dims(N / (64 / nx), R + 1, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -512,7 +517,8 @@ void KQuantGatherQMVKQ::eval_cpu(
 
 bool KQuantMoEGLUKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMoEGLUKQ&>(other);
-  return kquant_type_ == o.kquant_type_ && act_ == o.act_;
+  return kquant_type_ == o.kquant_type_ && act_ == o.act_ &&
+      limit_ == o.limit_;
 }
 
 bool KQuantGatherQMVKQ::is_equivalent(const mx::Primitive& other) const {
@@ -856,6 +862,7 @@ mx::array moe_glu_gather_kq(
     const std::string& kquant_type,
     mx::array indices,
     const std::string& act,
+    float limit,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   if (x.ndim() != 2) {
@@ -871,9 +878,14 @@ mx::array moe_glu_gather_kq(
     throw std::invalid_argument(
         "[mlx_kquant.moe_glu_gather_kq] x must be float16 or bfloat16.");
   }
-  if (act != "silu" && act != "gelu") {
+  if (act != "silu" && act != "gelu" && act != "silu_limit") {
     throw std::invalid_argument(
-        "[mlx_kquant.moe_glu_gather_kq] act must be 'silu' or 'gelu'.");
+        "[mlx_kquant.moe_glu_gather_kq] act must be 'silu', 'gelu' or "
+        "'silu_limit'.");
+  }
+  if (act == "silu_limit" && !(limit > 0.0f)) {
+    throw std::invalid_argument(
+        "[mlx_kquant.moe_glu_gather_kq] act 'silu_limit' requires limit > 0.");
   }
   int K = x.shape(1);
   check_kq_expert_stack(
@@ -889,7 +901,7 @@ mx::array moe_glu_gather_kq(
   return mx::array(
       std::move(out_shape),
       dt,
-      std::make_shared<KQuantMoEGLUKQ>(s, kquant_type, act),
+      std::make_shared<KQuantMoEGLUKQ>(s, kquant_type, act, limit),
       {std::move(gate_w),
        std::move(up_w),
        std::move(x_c),
