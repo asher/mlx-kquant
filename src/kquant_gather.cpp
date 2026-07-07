@@ -529,10 +529,16 @@ void KQuantGatherQMM::eval_cpu(
         // (a 256-expert q5_k down_proj is ~2.2 GB), and mx::elem_to_loc takes
         // an int first argument, so passing w_idx * w_els truncated the offset
         // to 32 bits and read out of bounds for expert indices past ~2^31 /
-        // w_els. w is matrix-contiguous (op-enforced), so the byte offset is
-        // w_idx * w_els computed in size_t.
+        // w_els. The op enforces only MATRIX-contiguity (rows packed within
+        // each expert; the leading expert dim may be strided, e.g. a row
+        // slice of a stacked wire), so the offset must decompose through w's
+        // strides rather than assume dense w_idx * w_els packing.
         return w.data<uint8_t>() +
-            static_cast<std::size_t>(entries[first].w_idx) * w_els;
+            elem_to_loc64(
+                   static_cast<int64_t>(entries[first].w_idx) *
+                       static_cast<int64_t>(w_els),
+                   w.shape(),
+                   w.strides());
       };
 
       // Decode-shape consolidation: when every per-expert group is small
