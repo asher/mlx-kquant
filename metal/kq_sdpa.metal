@@ -88,19 +88,23 @@ instantiate_kq_sdpa_gqa_p2(float16_t, 128, 32, 4)
 instantiate_kq_sdpa_gqa_p2(bfloat16_t, 64, 32, 4)
 instantiate_kq_sdpa_gqa_p2(float16_t, 64, 32, 4)
 
-// Simdgroup-matrix FA verify pass 1 (folded GQA, one 32-row Q tile); the
+// Simdgroup-matrix FA verify pass 1 (folded GQA, one BQ-row Q tile: BQ 32
+// covers folds to gqa8 x qL4, BQ 64 to gqa16 x qL4 / gqa8 x qL8); the
 // merge reuses kq_sdpa_gqa_2pass_2. head_dim 256 only for now: at 512 the
 // Q + O fragment sets are ~256 floats/thread, so a 512 instantiation needs a
 // BD-chunked (two-sweep) output accumulator first.
-#define instantiate_kq_sdpa_fa_verify(type, D)                         \
+#define instantiate_kq_sdpa_fa_verify(type, D, BQ)                     \
   instantiate_kernel(                                                  \
-      "kq_sdpa_fa_verify_2pass_1_" #type "_" #D,                       \
+      "kq_sdpa_fa_verify_2pass_1_" #type "_" #D "_bq" #BQ,             \
       kq_sdpa_fa_verify_2pass_1,                                       \
       type,                                                            \
-      D)
+      D,                                                               \
+      BQ)
 
-instantiate_kq_sdpa_fa_verify(bfloat16_t, 256)
-instantiate_kq_sdpa_fa_verify(float16_t, 256)
+instantiate_kq_sdpa_fa_verify(bfloat16_t, 256, 32)
+instantiate_kq_sdpa_fa_verify(float16_t, 256, 32)
+instantiate_kq_sdpa_fa_verify(bfloat16_t, 256, 64)
+instantiate_kq_sdpa_fa_verify(float16_t, 256, 64)
 
 instantiate_kq_sdpa_gqa_merge(bfloat16_t, 64)
 instantiate_kq_sdpa_gqa_merge(float16_t, 64)

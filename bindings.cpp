@@ -218,15 +218,16 @@ NB_MODULE(_ext, m) {
         query tile. Fold the GQA group into the query rows first --
         q [1, Hq, q_len, D] reshaped to [1, Hkv, G*q_len, D] with kv-major
         heads -- and pass the original q_len: folded row r is causally
-        clamped to key <= kL - q_len + (r % q_len). The 32-row query tile
-        streams each contiguous KV split once, computing S = Q @ K^T and
-        O += P @ V on simdgroup_matrix with float32 accumulators and a
-        per-row online softmax; per-split partials are merged by the same
-        reduction pass as ``sdpa_decode_gqa``.
+        clamped to key <= kL - q_len + (r % q_len). The query tile (32 rows,
+        or 64 for oversized folds such as gqa16 x q_len 4) streams each
+        contiguous KV split once, computing S = Q @ K^T and O += P @ V on
+        simdgroup_matrix with float32 accumulators and a per-row online
+        softmax; per-split partials are merged by the same reduction pass as
+        ``sdpa_decode_gqa``.
 
         Args:
             q (array): folded queries [1, n_kv_heads, G*q_len, D],
-                float16/bfloat16; G*q_len <= 32, D = 256.
+                float16/bfloat16; G*q_len <= 64, D = 256.
             k (array): keys [1, n_kv_heads, kL, D]; head/seq strided is fine
                 (read in place), the head_dim must be contiguous.
             v (array): values [1, n_kv_heads, kL, D].

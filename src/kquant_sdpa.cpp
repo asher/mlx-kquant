@@ -30,6 +30,27 @@ using mx::array;
 using mx::Stream;
 using mx::metal::Device;
 
+// Eval-time layout guard. The op builders wrap q in mx::contiguous (layout
+// flags are undefined on unevaluated inputs, so build-time checks can miss),
+// and k/v are read in place via strides but need a contiguous head_dim; by
+// the time eval_gpu runs the flags are real, so anything non-conforming here
+// is a bug upstream -- fail loudly instead of reading garbage.
+void kq_sdpa_check_layout(
+    const char* op,
+    const array& q,
+    const array& k,
+    const array& v) {
+  if (!q.flags().row_contiguous) {
+    throw std::runtime_error(
+        std::string("[mlx_kquant.") + op + "] q must be row-contiguous.");
+  }
+  if (k.strides().back() != 1 || v.strides().back() != 1) {
+    throw std::runtime_error(
+        std::string("[mlx_kquant.") + op +
+        "] k/v head_dim must be contiguous.");
+  }
+}
+
 // Number of key-blocks to split the reduction across. Mirrors MLX's own
 // sdpa_vector_2pass heuristic: more blocks only when there are enough
 // simdgroups per kv-head (n_simds = gqa_factor * qL) to justify the extra
@@ -81,6 +102,7 @@ void KQuantSDPA::eval_gpu(
   const auto& q = inputs[0];
   const auto& k = inputs[1];
   const auto& v = inputs[2];
+  kq_sdpa_check_layout("sdpa_vector", q, k, v);
 
   int B = q.shape(0);
   int n_q_heads = q.shape(1);
@@ -185,6 +207,7 @@ void KQuantSDPAGQA::eval_gpu(
   const auto& k = inputs[1];
   const auto& v = inputs[2];
   const bool sinks = inputs.size() == 4;
+  kq_sdpa_check_layout("sdpa_decode_gqa", q, k, v);
 
   int B = q.shape(0);
   int n_q_heads = q.shape(1);
@@ -304,6 +327,7 @@ void KQuantSDPAFAVerify::eval_gpu(
   const auto& q = inputs[0];
   const auto& k = inputs[1];
   const auto& v = inputs[2];
+  kq_sdpa_check_layout("sdpa_fa_verify", q, k, v);
 
   int B = q.shape(0);
   int n_kv_heads = k.shape(1);
@@ -350,16 +374,18 @@ void KQuantSDPAFAVerify::eval_gpu(
       {&has_sinks, MTL::DataType::DataTypeBool, 3},
   };
 
-  // Pass 1: one 128-thread threadgroup per (kv-head, batch, split) streams
-  // its key chunk through the simdgroup-matrix tile.
+  // Pass 1: one threadgroup (a simdgroup per 8 tile rows) per
+  // (kv-head, batch, split) streams its key chunk through the
+  // simdgroup-matrix tile.
   {
-    std::string kname =
-        "kq_sdpa_fa_verify_2pass_1_" + ts + "_" + std::to_string(D);
+    const int bq = n_rows <= 32 ? 32 : 64;
+    std::string kname = "kq_sdpa_fa_verify_2pass_1_" + ts + "_" +
+        std::to_string(D) + "_bq" + std::to_string(bq);
     std::string hash = kname + "_s" + std::to_string(splits);
     auto kernel = kq_get_kernel(d, kname, hash, fc);
     // Register-heavy pipeline: some GPUs cap it below the dispatch width, and
     // Metal turns an oversized dispatch into silent garbage, not an error.
-    const size_t tg = 128;
+    const size_t tg = (bq / 8) * 32;
     if (tg > kernel->maxTotalThreadsPerThreadgroup()) {
       throw std::runtime_error(
           "[mlx_kquant.sdpa_fa_verify] threadgroup of " + std::to_string(tg) +
@@ -381,7 +407,7 @@ void KQuantSDPAFAVerify::eval_gpu(
     ce.set_bytes(scale, 11);
     ce.set_bytes(q_len, 12);
     ce.set_bytes(n_rows, 13);
-    MTL::Size group_dims(32, 4, 1);
+    MTL::Size group_dims(32, bq / 8, 1);
     MTL::Size grid_dims(n_kv_heads, B, splits);
     ce.dispatch_threadgroups(grid_dims, group_dims);
   }
@@ -499,7 +525,10 @@ mx::array sdpa_vector(
   // q small -> contiguize if needed (cheap). k/v: only the last (head) dim must
   // be contiguous; head/seq strides are read in place, so a strided KV-cache
   // prefix is passed through without a copy.
-  auto q_c = q.flags().row_contiguous ? q : mx::contiguous(q, false, s);
+  // Unconditional: layout flags are undefined on unevaluated inputs (a
+  // lazy strided view can read as row-contiguous here), and Contiguous
+  // decides at eval time, sharing the buffer when q is already packed.
+  auto q_c = mx::contiguous(q, false, s);
   auto k_c = k.strides().back() == 1 ? k : mx::contiguous(k, false, s);
   auto v_c = v.strides().back() == 1 ? v : mx::contiguous(v, false, s);
 
@@ -605,7 +634,10 @@ mx::array sdpa_decode_gqa(
         "[mlx_kquant.sdpa_decode_gqa] key length must be >= query length.");
   }
 
-  auto q_c = q.flags().row_contiguous ? q : mx::contiguous(q, false, s);
+  // Unconditional: layout flags are undefined on unevaluated inputs (a
+  // lazy strided view can read as row-contiguous here), and Contiguous
+  // decides at eval time, sharing the buffer when q is already packed.
+  auto q_c = mx::contiguous(q, false, s);
   auto k_c = k.strides().back() == 1 ? k : mx::contiguous(k, false, s);
   auto v_c = v.strides().back() == 1 ? v : mx::contiguous(v, false, s);
 
@@ -693,10 +725,10 @@ mx::array sdpa_fa_verify(
         "[mlx_kquant.sdpa_fa_verify] q_len must be in [2, 8].");
   }
   int n_rows = q.shape(2);
-  if (n_rows < q_len || n_rows > 32 || n_rows % q_len != 0) {
+  if (n_rows < q_len || n_rows > 64 || n_rows % q_len != 0) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_fa_verify] folded rows must be a multiple of q_len "
-        "and <= 32.");
+        "and <= 64.");
   }
   if (k.shape(2) < q_len) {
     throw std::invalid_argument(
@@ -707,7 +739,10 @@ mx::array sdpa_fa_verify(
         "[mlx_kquant.sdpa_fa_verify] splits must be in [0, 128].");
   }
 
-  auto q_c = q.flags().row_contiguous ? q : mx::contiguous(q, false, s);
+  // Unconditional: layout flags are undefined on unevaluated inputs (a
+  // lazy strided view can read as row-contiguous here), and Contiguous
+  // decides at eval time, sharing the buffer when q is already packed.
+  auto q_c = mx::contiguous(q, false, s);
   auto k_c = k.strides().back() == 1 ? k : mx::contiguous(k, false, s);
   auto v_c = v.strides().back() == 1 ? v : mx::contiguous(v, false, s);
 
