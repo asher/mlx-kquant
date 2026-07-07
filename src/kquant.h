@@ -297,6 +297,15 @@ mx::array dsa_topk_indices(
     bool causal_valid_prefix = false,
     mx::StreamOrDevice s = {});
 
+// DeepSeek-V4-Flash indexer activation QAT round-trip, fused: 128-wide
+// Hadamard (mlx hadamard_n butterfly order and 1/sqrt(128) scale, exactly)
+// then the per-32-block FP4-E2M1 round-trip (scale 2^ceil(log2(amax/6)),
+// amax floor FLT_MIN*6, clamp +-6, tie-to-even threshold ladder). x is any
+// shape with a trailing dim of 128; returns the same shape and dtype.
+// Bit-compatible with the mx.hadamard_transform + compiled fp4-core chain.
+// Metal-only.
+mx::array dsa_indexer_qat(mx::array x, mx::StreamOrDevice s = {});
+
 // K-quant gathered matvec (down projection), same wire layout. x [T, R, K]
 // (one row per expert slot), indices [T, R]. Returns [T, R, N]. Metal-only.
 mx::array gather_qmv_kq(
@@ -775,6 +784,28 @@ class KQDsaTopKIndices : public mx::Primitive {
   int topk_;
   bool bucketed_;
   bool causal_valid_prefix_;
+};
+
+// DeepSeek-V4-Flash fused indexer QAT round-trip (see dsa_indexer_qat).
+// Inference-only, Metal-only.
+class KQDsaIndexerQat : public mx::Primitive {
+ public:
+  explicit KQDsaIndexerQat(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQDsaIndexerQat";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
 };
 
 // K-quant fused MoE GLU gather (see moe_glu_gather_kq). Inference-only.

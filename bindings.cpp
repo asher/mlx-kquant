@@ -426,6 +426,28 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "dsa_indexer_qat",
+      &mlx_kquant::dsa_indexer_qat,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        DeepSeek-V4-Flash indexer activation QAT round-trip, fused: the
+        128-wide Hadamard transform (mlx hadamard_transform's butterfly
+        order and 1/sqrt(128) scale, bit-exactly) followed by the
+        per-32-block FP4-E2M1 round-trip (scale 2^ceil(log2(amax/6)) with
+        an FLT_MIN*6 amax floor, clamp to +-6, tie-to-even rounding).
+        One kernel in place of the multi-pass hadamard + quantize chain.
+
+        Args:
+            x (array): any shape with a trailing dim of 128,
+                float16/bfloat16/float32.
+
+        Returns:
+            array: same shape and dtype as ``x``.
+      )");
+
+  m.def(
       "moe_glu_gather_kq",
       &mlx_kquant::moe_glu_gather_kq,
       "x"_a,

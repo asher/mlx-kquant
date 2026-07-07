@@ -124,6 +124,7 @@ target_sources(
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_sdpa.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_dsa_sparse_attn.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_dsa_indexer.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_dsa_qat.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_moe_glu.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_norm_fused.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gather.cpp
@@ -201,6 +202,7 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_sdpa.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_dsa_sparse_attn.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_dsa_indexer.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_dsa_qat.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_glu.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_glu_kq.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_norm_fused.metal
