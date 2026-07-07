@@ -20,6 +20,7 @@ import os
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 import mlx_kquant as kq
 
@@ -162,6 +163,23 @@ class KQuantSwitchLinear(nn.Module):
         self.freeze()
 
     def __call__(self, x, indices, sorted_indices=False):
+        # Prefill-shaped sorted calls (mlx-lm SwitchGLU's _gather_sort layout:
+        # x [B,1,K], indices [B] ascending) run one GEMM per expert segment
+        # instead of gather_qmm's per-row matvec fallback -- ~6x on M3-class
+        # GPUs where the sorted rhs GEMM kernel is unavailable. Costs one host
+        # sync on the routing indices per MoE layer. KQ_SWITCH_GEMM_MIN_ROWS=0
+        # disables; read live for A/B.
+        if (
+            sorted_indices
+            and "bias" not in self
+            and indices.ndim == 1
+            and x.ndim == 3
+            and x.shape[0] == indices.size
+            and x.shape[1] == 1
+        ):
+            min_rows = int(os.environ.get("KQ_SWITCH_GEMM_MIN_ROWS", "512"))
+            if min_rows > 0 and indices.size >= min_rows:
+                return self._sorted_expert_gemm(x, indices)
         x = kq.gather_qmm(
             x,
             self["weight"],
@@ -174,6 +192,25 @@ class KQuantSwitchLinear(nn.Module):
         if "bias" in self:
             x = x + mx.expand_dims(self["bias"][indices], -2)
         return x
+
+    def _sorted_expert_gemm(self, x, indices):
+        counts = np.bincount(
+            np.array(indices), minlength=self.weight.shape[0]
+        )
+        xf = x.reshape(indices.size, -1)
+        w, s, codec = self["weight"], self["scales"], self.kquant_type
+        outs = []
+        start = 0
+        for e in np.flatnonzero(counts):
+            c = int(counts[e])
+            outs.append(
+                kq.quantized_matmul(
+                    xf[start : start + c], w[e], s, codec, transpose=True
+                )
+            )
+            start += c
+        y = mx.concatenate(outs) if len(outs) > 1 else outs[0]
+        return y[:, None, :]
 
     def _extra_repr(self):
         n, m, b = self.weight.shape
