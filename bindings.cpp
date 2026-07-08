@@ -635,22 +635,33 @@ NB_MODULE(_ext, m) {
       "norm_topk_prob"_a = true,
       "shared_gate"_a = true,
       "per_expert_scale"_a = nb::none(),
+      "bias"_a = nb::none(),
+      "scoring"_a = "softmax",
+      "scale"_a = 1.0f,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
-        Router top-k in one dispatch: f32 softmax over the first E columns,
-        top_k selection (min-index tie-break), optional renormalization, an
-        optional per-expert scale applied to the picked scores, and (when
-        shared_gate) the sigmoid of column E (the shared-expert gate logit)
-        in the last scores slot.
+        Router top-k in one dispatch: f32 scoring over the first E columns
+        (softmax, or sqrtsoftplus = sqrt(softplus(x)) for deepseek-v4),
+        top_k selection (min-index tie-break) optionally ranked by
+        score + bias, optional renormalization, an optional per-expert
+        scale applied to the picked scores, a uniform scale on emitted
+        routed scores, and (when shared_gate) the sigmoid of column E (the
+        shared-expert gate logit) in the last scores slot.
 
         Args:
             logits (array): router logits [T, E + shared_gate]; E <= 1024.
             top_k (int): experts per token, <= 16.
-            norm_topk_prob (bool): renormalize picked probabilities.
+            norm_topk_prob (bool): renormalize picked scores. Required for
+                sqrtsoftplus (renorm carries the model's 1e-20 guard).
             shared_gate (bool): logits carry a trailing shared-gate column.
             per_expert_scale (array, optional): [E] multiplier on picked
                 scores, applied after renormalization; cast to float32.
+            bias (array, optional): [E] selection bias
+                (e_score_correction_bias); emitted scores stay unbiased.
+            scoring (str): "softmax" or "sqrtsoftplus".
+            scale (float): uniform multiplier on emitted routed scores
+                (routed_scaling_factor).
 
         Returns:
             tuple: (indices [T, top_k] uint32,

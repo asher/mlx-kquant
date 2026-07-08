@@ -1016,17 +1016,23 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
 }
 
 // ---------------------------------------------------------------------------
-// Router top-k (codec-independent float kernel): softmax over E logits, pick
-// the top R (min-index tie-break), emit gather-ready indices [T, R] uint32 and
-// mix scores [T, R + SHARED] float32 in one dispatch. When SHARED == 1,
-// column E of each logits row is the shared-expert gate logit and its sigmoid
-// lands in scores slot R (qwen3-next); SHARED == 0 is the plain-MoE form
-// (gemma). NORM selects renormalizing the picked probabilities to sum to 1
-// (norm_topk_prob; also exactly softmax-over-the-selected-logits, the gemma
-// router semantics). HAS_PES scales each picked score by pes[expert]
-// (gemma's learned per_expert_scale); pes may be any bound buffer when
-// HAS_PES == 0. One threadgroup of 256 threads per token; E <= 1024, R <= 16
-// (host-checked).
+// Router top-k (codec-independent float kernel): score E logits, pick the
+// top R (min-index tie-break), emit gather-ready indices [T, R] uint32 and
+// mix scores [T, R + SHARED] float32 in one dispatch. SCORING == 0 is f32
+// softmax; SCORING == 1 is sqrt(softplus(x)) (deepseek-v4), which has no
+// global normalizer and requires NORM (renorm adds the model's 1e-20 guard
+// since scores may be exactly 0). HAS_BIAS ranks selection by
+// score + bias[expert] (e_score_correction_bias) while emitted scores stay
+// unbiased. When SHARED == 1, column E of each logits row is the
+// shared-expert gate logit and its sigmoid lands in scores slot R
+// (qwen3-next); SHARED == 0 is the plain-MoE form (gemma). NORM selects
+// renormalizing the picked scores to sum to 1 (norm_topk_prob; for softmax
+// also exactly softmax-over-the-selected-logits, the gemma router
+// semantics). HAS_PES scales each picked score by pes[expert] (gemma's
+// learned per_expert_scale); SCALE is a uniform multiplier on emitted
+// routed scores (deepseek-v4 routed_scaling_factor). pes/bias may be any
+// bound buffer when HAS_PES/HAS_BIAS == 0. One threadgroup of 256 threads
+// per token; E <= 1024, R <= 16 (host-checked).
 // ---------------------------------------------------------------------------
 #define KQ_ROUTER_MAX_E 1024
 #define KQ_ROUTER_MAX_R 16
@@ -1042,6 +1048,10 @@ template <typename T>
     const constant int& SHARED [[buffer(6)]],
     const device float* pes [[buffer(7)]],
     const constant int& HAS_PES [[buffer(8)]],
+    const device float* bias [[buffer(9)]],
+    const constant int& HAS_BIAS [[buffer(10)]],
+    const constant int& SCORING [[buffer(11)]],
+    const constant float& SCALE [[buffer(12)]],
     uint tid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -1057,51 +1067,70 @@ template <typename T>
 
   const device T* lrow = logits + (int64_t)tid * (E + SHARED);
 
-  float m = -INFINITY;
-  for (int e = lid; e < E; e += NT) {
-    m = metal::max(m, float(lrow[e]));
-  }
-  m = simd_max(m);
-  if (simd_lid == 0) {
-    red_v[simd_gid] = m;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (lid == 0) {
-    float g = red_v[0];
-    for (int i = 1; i < NSG; i++) {
-      g = metal::max(g, red_v[i]);
+  // SCORING is threadgroup-uniform, so barriers inside each arm are safe.
+  float gsum = 1.0f;
+  if (SCORING == 1) {
+    for (int e = lid; e < E; e += NT) {
+      const float x = float(lrow[e]);
+      // Stable softplus: max(x, 0) + log1p(exp(-|x|)); series for tiny z
+      // where log(1 + z) loses bits.
+      const float z = metal::exp(-metal::abs(x));
+      const float l1p =
+          (z < 1e-4f) ? metal::fma(-0.5f * z, z, z) : metal::log(1.0f + z);
+      p[e] = metal::sqrt(metal::max(x, 0.0f) + l1p);
     }
-    stat[0] = g;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  const float gmax = stat[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  } else {
+    float m = -INFINITY;
+    for (int e = lid; e < E; e += NT) {
+      m = metal::max(m, float(lrow[e]));
+    }
+    m = simd_max(m);
+    if (simd_lid == 0) {
+      red_v[simd_gid] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+      float g = red_v[0];
+      for (int i = 1; i < NSG; i++) {
+        g = metal::max(g, red_v[i]);
+      }
+      stat[0] = g;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float gmax = stat[0];
 
-  float s = 0;
-  for (int e = lid; e < E; e += NT) {
-    const float v = metal::exp(float(lrow[e]) - gmax);
-    p[e] = v;
-    s += v;
-  }
-  s = simd_sum(s);
-  if (simd_lid == 0) {
-    red_v[simd_gid] = s;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (lid == 0) {
-    float g = 0;
-    for (int i = 0; i < NSG; i++) {
-      g += red_v[i];
+    float s = 0;
+    for (int e = lid; e < E; e += NT) {
+      const float v = metal::exp(float(lrow[e]) - gmax);
+      p[e] = v;
+      s += v;
     }
-    stat[1] = g;
+    s = simd_sum(s);
+    if (simd_lid == 0) {
+      red_v[simd_gid] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+      float g = 0;
+      for (int i = 0; i < NSG; i++) {
+        g += red_v[i];
+      }
+      stat[1] = g;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    gsum = stat[1];
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  const float gsum = stat[1];
 
   for (int r = 0; r < R; r++) {
-    float bv = -1.0f;
+    // -inf init/sentinel: biased ranking values can be negative.
+    float bv = -INFINITY;
     uint bi = 0xffffffffu;
     for (int e = lid; e < E; e += NT) {
-      const float v = p[e];
+      float v = p[e];
+      if (HAS_BIAS) {
+        v += bias[e];
+      }
       if (v > bv || (v == bv && uint(e) < bi)) {
         bv = v;
         bi = uint(e);
@@ -1125,9 +1154,10 @@ template <typename T>
         }
       }
       indices[(int64_t)tid * R + r] = wi;
-      win_v[r] = wv;
+      // Emitted score is the unbiased p[wi] (== wv when HAS_BIAS == 0).
+      win_v[r] = p[wi];
       win_i[r] = wi;
-      p[wi] = -1.0f;
+      p[wi] = -INFINITY;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
@@ -1137,14 +1167,14 @@ template <typename T>
     for (int r = 0; r < R; r++) {
       ps += win_v[r];
     }
-    const float denom = NORM ? ps : gsum;
+    const float denom = NORM ? (SCORING == 1 ? ps + 1e-20f : ps) : gsum;
     device float* srow = scores + (int64_t)tid * (R + SHARED);
     for (int r = 0; r < R; r++) {
       float sv = win_v[r] / denom;
       if (HAS_PES) {
         sv *= pes[win_i[r]];
       }
-      srow[r] = sv;
+      srow[r] = sv * SCALE;
     }
     if (SHARED) {
       srow[R] = 1.0f / (1.0f + metal::exp(-float(lrow[E])));

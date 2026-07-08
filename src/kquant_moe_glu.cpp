@@ -399,12 +399,16 @@ void KQuantMoERouterTopK::eval_gpu(
   const auto& logits = inputs[0];
   int SHARED = shared_ ? 1 : 0;
   int HAS_PES = has_pes_ ? 1 : 0;
+  int HAS_BIAS = has_bias_ ? 1 : 0;
+  int SCORING = scoring_;
+  float SCALE = scale_;
   int T = logits.shape(0);
   int E = logits.shape(1) - SHARED;
   int R = top_k_;
   int NORM = norm_ ? 1 : 0;
-  // pes must be a bound buffer even when unused; logits stands in.
+  // pes/bias must be bound buffers even when unused; logits stands in.
   const auto& pes = has_pes_ ? inputs[1] : inputs[0];
+  const auto& bias = has_bias_ ? inputs[1 + (has_pes_ ? 1 : 0)] : inputs[0];
 
   std::string kname = "kq_moe_router_topk_" + kq_type_string(logits.dtype());
   kq_moe_log_kname(kname);
@@ -420,6 +424,10 @@ void KQuantMoERouterTopK::eval_gpu(
   ce.set_bytes(SHARED, 6);
   ce.set_input_array(pes, 7);
   ce.set_bytes(HAS_PES, 8);
+  ce.set_input_array(bias, 9);
+  ce.set_bytes(HAS_BIAS, 10);
+  ce.set_bytes(SCORING, 11);
+  ce.set_bytes(SCALE, 12);
   MTL::Size group_dims(256, 1, 1);
   MTL::Size grid_dims(T, 1, 1);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -592,7 +600,8 @@ void KQuantMoERouterTopK::eval_cpu(
 bool KQuantMoERouterTopK::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMoERouterTopK&>(other);
   return top_k_ == o.top_k_ && norm_ == o.norm_ && shared_ == o.shared_ &&
-      has_pes_ == o.has_pes_;
+      has_pes_ == o.has_pes_ && has_bias_ == o.has_bias_ &&
+      scoring_ == o.scoring_ && scale_ == o.scale_;
 }
 
 std::vector<mx::Shape> KQuantMoERouterTopK::output_shapes(
@@ -1100,10 +1109,26 @@ std::vector<mx::array> moe_router_topk(
     bool norm_topk_prob,
     bool shared_gate,
     const std::optional<mx::array>& per_expert_scale,
+    const std::optional<mx::array>& bias,
+    const std::string& scoring,
+    float scale,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.moe_router_topk]";
   const int shared = shared_gate ? 1 : 0;
+  int scoring_i;
+  if (scoring == "softmax") {
+    scoring_i = 0;
+  } else if (scoring == "sqrtsoftplus") {
+    scoring_i = 1;
+  } else {
+    throw std::invalid_argument(
+        std::string(op) + " scoring must be softmax or sqrtsoftplus.");
+  }
+  if (scoring_i == 1 && !norm_topk_prob) {
+    throw std::invalid_argument(
+        std::string(op) + " sqrtsoftplus requires norm_topk_prob.");
+  }
   if (logits.ndim() != 2) {
     throw std::invalid_argument(
         std::string(op) + " logits must be 2-D [T, E + shared_gate].");
@@ -1134,11 +1159,25 @@ std::vector<mx::array> moe_router_topk(
     }
     inputs.push_back(prep_scores(pes, s));
   }
+  if (bias.has_value()) {
+    const auto& b = *bias;
+    if (b.ndim() != 1 || b.shape(0) != E) {
+      throw std::invalid_argument(std::string(op) + " bias must be 1-D [E].");
+    }
+    inputs.push_back(prep_scores(b, s));
+  }
   return mx::array::make_arrays(
       {{T, top_k}, {T, top_k + shared}},
       {mx::uint32, mx::float32},
       std::make_shared<KQuantMoERouterTopK>(
-          s, top_k, norm_topk_prob, shared_gate, per_expert_scale.has_value()),
+          s,
+          top_k,
+          norm_topk_prob,
+          shared_gate,
+          per_expert_scale.has_value(),
+          bias.has_value(),
+          scoring_i,
+          scale),
       std::move(inputs));
 }
 

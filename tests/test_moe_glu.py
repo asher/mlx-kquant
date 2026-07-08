@@ -343,6 +343,54 @@ def _check_router():
             want = pk / pk.sum() * pes_np[got_i[t]]
             if not np.allclose(np.array(sc)[t], want, rtol=1e-5, atol=1e-6):
                 fails.append(f"E={e} R={r} t={t} pes scores")
+    # sqrtsoftplus + selection bias + routed scale (deepseek-v4 routing)
+    for e, r, spread in ((256, 6, 1.0), (256, 6, 30.0), (64, 4, 1.0)):
+        logits_np = (rng.standard_normal((7, e)) * spread).astype(np.float32)
+        # exact ties at the top-k boundary exercise the min-index tie-break
+        logits_np[5, 10:20] = logits_np[5, 10]
+        bias_np = rng.standard_normal(e).astype(np.float32)
+        for dt in (mx.float32, mx.bfloat16):
+            inds, sc = kq.moe_router_topk(
+                mx.array(logits_np).astype(dt),
+                r,
+                True,
+                shared_gate=False,
+                bias=mx.array(bias_np),
+                scoring="sqrtsoftplus",
+                scale=1.5,
+            )
+            mx.eval(inds, sc)
+            lf = np.array(mx.array(logits_np).astype(dt).astype(mx.float32))
+            p = np.sqrt(np.logaddexp(lf, 0.0))
+            top = np.argsort(-(p + bias_np), axis=-1, kind="stable")[:, :r]
+            got_i = np.array(inds)
+            for t in range(7):
+                if set(got_i[t]) != set(top[t]):
+                    # accept flips from fp32 softplus ulp noise at the
+                    # boundary: biased scores must match within 3e-6
+                    bk = np.sort((p + bias_np)[t, got_i[t]])
+                    bw = np.sort((p + bias_np)[t, top[t]])
+                    if not np.allclose(bk, bw, rtol=0, atol=3e-6):
+                        fails.append(f"E={e} R={r} t={t} {dt} ssp indices")
+                        continue
+                pk = p[t, got_i[t]]
+                want = pk / (pk.sum() + 1e-20) * 1.5
+                if not np.allclose(np.array(sc)[t], want, rtol=1e-5, atol=1e-6):
+                    fails.append(f"E={e} R={r} t={t} {dt} ssp scores")
+        # all-negative logits: scores near 0, renorm guard must not blow up
+        neg = mx.array((-np.abs(logits_np) - 50.0).astype(np.float32))
+        inds, sc = kq.moe_router_topk(
+            neg,
+            r,
+            True,
+            shared_gate=False,
+            bias=mx.array(bias_np),
+            scoring="sqrtsoftplus",
+            scale=1.5,
+        )
+        mx.eval(inds, sc)
+        if not np.all(np.isfinite(np.array(sc))):
+            fails.append(f"E={e} R={r} ssp negative-logits nonfinite scores")
     return fails
 
 

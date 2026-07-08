@@ -373,15 +373,21 @@ mx::array gather_qmv_mix_ns_kq(
     mx::array scores,
     mx::StreamOrDevice s = {});
 
-// Router top-k in one dispatch: softmax over E logit columns in f32, pick
-// the top_k largest (min-index tie-break), optionally renormalize the picked
-// probabilities (norm_topk_prob; equals softmax over the selected raw logits
-// -- the gemma router semantics). With shared_gate (qwen3-next), logits are
-// [T, E + 1], column E is the shared-expert gate logit and its sigmoid lands
-// in the last scores slot; without, logits are [T, E] and scores are
-// [T, top_k]. Optional per_expert_scale ([E] float) multiplies each picked
-// score by its expert's scale (gemma). Returns {indices [T, top_k] uint32,
-// scores float32} -- exactly the inputs moe_glu_gather_shexp_kq /
+// Router top-k in one dispatch: score E logit columns in f32 ("softmax" or
+// "sqrtsoftplus" = sqrt(softplus(x)), deepseek-v4), pick the top_k largest
+// (min-index tie-break), optionally renormalize the picked scores
+// (norm_topk_prob; for softmax equals softmax over the selected raw logits
+// -- the gemma router semantics; required for sqrtsoftplus, which has no
+// global normalizer and renorms with the model's 1e-20 guard). Optional
+// bias ([E] float, e_score_correction_bias) ranks selection by
+// score + bias while emitted scores stay unbiased. With shared_gate
+// (qwen3-next), logits are [T, E + 1], column E is the shared-expert gate
+// logit and its sigmoid lands in the last scores slot; without, logits are
+// [T, E] and scores are [T, top_k]. Optional per_expert_scale ([E] float)
+// multiplies each picked score by its expert's scale (gemma); scale is a
+// uniform multiplier on emitted routed scores (deepseek-v4
+// routed_scaling_factor). Returns {indices [T, top_k] uint32, scores
+// float32} -- exactly the inputs moe_glu_gather_shexp_kq /
 // gather_qmv_mix*_kq consume. E <= 1024, top_k <= 16. Metal-only.
 std::vector<mx::array> moe_router_topk(
     mx::array logits,
@@ -389,6 +395,9 @@ std::vector<mx::array> moe_router_topk(
     bool norm_topk_prob,
     bool shared_gate = true,
     const std::optional<mx::array>& per_expert_scale = std::nullopt,
+    const std::optional<mx::array>& bias = std::nullopt,
+    const std::string& scoring = "softmax",
+    float scale = 1.0f,
     mx::StreamOrDevice s = {});
 
 // Fused residual + RMSNorm glue (one dispatch each; see kq_norm_fused.h).
@@ -1001,7 +1010,7 @@ class KQuantGatherQMVMixNSKQ : public mx::Primitive {
   std::string kquant_type_;
 };
 
-// Router softmax + top-k + score epilogue (see moe_router_topk). Two
+// Router scoring + top-k + score epilogue (see moe_router_topk). Two
 // outputs (indices, scores). Inference-only.
 class KQuantMoERouterTopK : public mx::Primitive {
  public:
@@ -1010,12 +1019,18 @@ class KQuantMoERouterTopK : public mx::Primitive {
       int top_k,
       bool norm,
       bool shared,
-      bool has_pes)
+      bool has_pes,
+      bool has_bias,
+      int scoring,
+      float scale)
       : mx::Primitive(stream),
         top_k_(top_k),
         norm_(norm),
         shared_(shared),
-        has_pes_(has_pes) {}
+        has_pes_(has_pes),
+        has_bias_(has_bias),
+        scoring_(scoring),
+        scale_(scale) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -1037,6 +1052,9 @@ class KQuantMoERouterTopK : public mx::Primitive {
   bool norm_;
   bool shared_;
   bool has_pes_;
+  bool has_bias_;
+  int scoring_;
+  float scale_;
 };
 
 // Fused (residual + rms_norm(h, w)) * scale (see add_rmsnorm).
