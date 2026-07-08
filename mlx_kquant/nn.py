@@ -297,18 +297,32 @@ class KQuantMultiLinear(nn.Module):
     def __call__(self, x, transpose: bool = True):
         # x: (B, Hx, L, D) where Hx is num_heads (per-head activation) or 1
         # (a head-shared activation broadcast across heads, transpose=False).
+        # The gather index arrays depend only on (B, Hx); memoize them so a
+        # decode loop reuses one constant pair instead of rebuilding
+        # arange/broadcast graph nodes every layer every token (underscored
+        # attr: excluded from Module parameters).
         nh = self.num_heads
         B, Hx = x.shape[0], x.shape[1]
-        rhs = mx.broadcast_to(mx.arange(nh, dtype=mx.uint32).reshape(1, nh), (B, nh))
-        if Hx == nh:
-            lhs = mx.arange(B * nh, dtype=mx.uint32).reshape(B, nh)
-        elif Hx == 1:
-            lhs = mx.broadcast_to(mx.arange(B, dtype=mx.uint32).reshape(B, 1), (B, nh))
+        cached = getattr(self, "_gather_idx", None)
+        if cached is not None and cached[0] == (B, Hx):
+            lhs, rhs = cached[1], cached[2]
         else:
-            raise ValueError(
-                f"KQuantMultiLinear: head axis {Hx} is neither 1 nor "
-                f"num_heads={nh} (x.shape={x.shape})"
+            rhs = mx.broadcast_to(
+                mx.arange(nh, dtype=mx.uint32).reshape(1, nh), (B, nh)
             )
+            if Hx == nh:
+                lhs = mx.arange(B * nh, dtype=mx.uint32).reshape(B, nh)
+            elif Hx == 1:
+                lhs = mx.broadcast_to(
+                    mx.arange(B, dtype=mx.uint32).reshape(B, 1), (B, nh)
+                )
+            else:
+                raise ValueError(
+                    f"KQuantMultiLinear: head axis {Hx} is neither 1 nor "
+                    f"num_heads={nh} (x.shape={x.shape})"
+                )
+            mx.eval(lhs, rhs)
+            self._gather_idx = ((B, Hx), lhs, rhs)
         return kq.gather_qmm(
             x,
             self["weight"],
