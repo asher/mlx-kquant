@@ -95,8 +95,19 @@ void KQDsaSparseAttention::eval_gpu(
       /* int64_t O_strides[3] = */
       {o.strides(0), o.strides(1), o.strides(2)}};
 
+  // Key-tile width by top-k density: narrow lists (window layers' dummy row,
+  // compressed layers before their pool passes 128 rows) never light more
+  // than 128 slots per tile, and the 128-wide tile's halved threadgroup
+  // memory (two threadgroups per core) plus finer live-arm buckets measured
+  // up to 20% faster there; dense 512-entry lists keep the 256-wide tile
+  // (fewer per-tile softmax rescales / selected[] builds). KQ_DSA_BK=128/256
+  // overrides for tuning.
+  static const char* bk_env = std::getenv("KQ_DSA_BK");
+  const std::string bk_tag = bk_env
+      ? ((std::string(bk_env) == "128") ? "bk128" : "bk256")
+      : ((topkN <= 128) ? "bk128" : "bk256");
   const std::string kname = "kq_dsa_sparse_attention_" +
-      kq_type_string(q.dtype()) + "_bk256_dc32_h64_d512_wm8";
+      kq_type_string(q.dtype()) + "_" + bk_tag + "_dc32_h64_d512_wm8";
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);

@@ -164,6 +164,16 @@ template <
   static_assert(DC % kFragSize == 0, "DC must be a multiple of 8.");
   static_assert(D % DC == 0, "Head dimension must divide DC.");
   static_assert(TK % 4 == 0, "Live-fragment arms slice the key tile in 4.");
+  static_assert(
+      sizeof(T) == 2,
+      "Staging moves rows as uint4 (8 half/bfloat elements per load).");
+
+  // uint4 staging geometry: 8 elements per 16-byte vector, DC/8 vectors per
+  // row slice. Row strides (LDQ/LDV elements = 80 bytes) and dbase (64-byte
+  // multiples) keep every vector access 16-byte aligned; the host contract
+  // (mx::contiguous, D = 512) keeps the device side aligned too.
+  constexpr short kElemsPerVec = 16 / short(sizeof(T));
+  constexpr short kVecsPerSlice = DC / kElemsPerVec;
 
   constexpr int tgp_size = WM * 32;
   const int lane = int(simd_group_id * 32 + simd_lane_id);
@@ -171,8 +181,12 @@ template <
   const int q_pos = int(tid.x);
   const int b = int(tid.y);
 
-  threadgroup T Qs[H * LDQ];
-  threadgroup T KVs[(BK * LDV > DC * LDK) ? BK * LDV : DC * LDK];
+  threadgroup uint4 Qs_v[(H * LDQ * short(sizeof(T)) + 15) / 16];
+  threadgroup uint4 KVs_v
+      [(((BK * LDV > DC * LDK) ? BK * LDV : DC * LDK) * short(sizeof(T)) + 15) /
+       16];
+  threadgroup T* Qs = reinterpret_cast<threadgroup T*>(Qs_v);
+  threadgroup T* KVs = reinterpret_cast<threadgroup T*>(KVs_v);
   threadgroup int selected[BK];
   // Double-buffered per-simdgroup last-live slot: tile t's readers and tile
   // t+2's writers of the same buffer are separated by tile t+1's post-build
@@ -285,25 +299,40 @@ template <
     for (short dchunk = 0; dchunk < D_CHUNKS; ++dchunk) {
       const int dbase = int(dchunk) * DC;
 
-      for (int elem = lane; elem < H * DC; elem += tgp_size) {
-        const int h = elem / DC;
-        const int d = elem - h * DC;
-        Qs[h * LDQ + d] = q_base[size_t(h) * params->Q_strides[1] + dbase + d];
+      for (int u = lane; u < H * kVecsPerSlice; u += tgp_size) {
+        const int h = u / kVecsPerSlice;
+        const int v = u - h * kVecsPerSlice;
+        reinterpret_cast<threadgroup uint4*>(&Qs[h * LDQ])[v] =
+            reinterpret_cast<const device uint4*>(
+                q_base + size_t(h) * params->Q_strides[1] + dbase)[v];
       }
 
-      for (int elem = lane; elem < live_slots * DC; elem += tgp_size) {
-        const int k = elem / DC;
-        const int d = elem - k * DC;
+      // One gathered row slice per thread: one address computation, DC/8
+      // vector loads, transposed scalar stores (consecutive k per d stays
+      // conflict-free).
+      for (int k = lane; k < live_slots; k += tgp_size) {
         const int k_pos = selected[k];
-        T value = T(0);
         if (k_pos >= 0) {
-          value = is_pooled_tile
-              ? pooled_base
-                    [size_t(k_pos) * params->Pooled_strides[1] + dbase + d]
-              : local_base
-                    [size_t(k_pos) * params->Local_strides[2] + dbase + d];
+          const device uint4* srcv = reinterpret_cast<const device uint4*>(
+              (is_pooled_tile
+                   ? pooled_base + size_t(k_pos) * params->Pooled_strides[1]
+                   : local_base + size_t(k_pos) * params->Local_strides[2]) +
+              dbase);
+          STEEL_PRAGMA_UNROLL
+          for (short v = 0; v < kVecsPerSlice; ++v) {
+            const uint4 packed = srcv[v];
+            const thread T* pe = reinterpret_cast<const thread T*>(&packed);
+            STEEL_PRAGMA_UNROLL
+            for (short j = 0; j < kElemsPerVec; ++j) {
+              KVs[k + (v * kElemsPerVec + j) * LDK] = pe[j];
+            }
+          }
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short d = 0; d < DC; ++d) {
+            KVs[k + d * LDK] = T(0);
+          }
         }
-        KVs[k + d * LDK] = value;
       }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -381,19 +410,26 @@ template <
     for (short vchunk = 0; vchunk < D_CHUNKS; ++vchunk) {
       const int dbase = int(vchunk) * DC;
 
-      for (int elem = lane; elem < live_slots * DC; elem += tgp_size) {
-        const int k = elem / DC;
-        const int d = elem - k * DC;
+      for (int k = lane; k < live_slots; k += tgp_size) {
         const int k_pos = selected[k];
-        T value = T(0);
+        threadgroup uint4* dstv =
+            reinterpret_cast<threadgroup uint4*>(&KVs[k * LDV]);
         if (k_pos >= 0) {
-          value = is_pooled_tile
-              ? pooled_base
-                    [size_t(k_pos) * params->Pooled_strides[1] + dbase + d]
-              : local_base
-                    [size_t(k_pos) * params->Local_strides[2] + dbase + d];
+          const device uint4* srcv = reinterpret_cast<const device uint4*>(
+              (is_pooled_tile
+                   ? pooled_base + size_t(k_pos) * params->Pooled_strides[1]
+                   : local_base + size_t(k_pos) * params->Local_strides[2]) +
+              dbase);
+          STEEL_PRAGMA_UNROLL
+          for (short v = 0; v < kVecsPerSlice; ++v) {
+            dstv[v] = srcv[v];
+          }
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short v = 0; v < kVecsPerSlice; ++v) {
+            dstv[v] = uint4(0);
+          }
         }
-        KVs[k * LDV + d] = value;
       }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
