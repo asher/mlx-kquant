@@ -19,10 +19,10 @@
 #include "mlx/utils.h" // to_stream
 
 #ifdef _METAL_
+#include "../metal/mlx/backend/metal/kernels/kq_dsa_params.h"
 #include "kquant_metal_internal.h" // kq_get_kernel
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels/steel/gemm/params.h"
-#include "../metal/mlx/backend/metal/kernels/kq_dsa_params.h"
 #endif
 
 namespace mx = mlx::core;
@@ -81,10 +81,10 @@ void KQDsaIndexerScores::eval_gpu(
       {&use_weights_lh, MTL::DataType::DataTypeBool, 301},
   };
 
-  const std::string kname = "kq_dsa_indexer_score_" + kq_type_string(q.dtype()) +
-      "_bm64_bn64_bk16_wm2_wn2";
-  const std::string hash_name = kname + "_causal_" +
-      (do_causal ? 't' : 'n') + "_wlh_" + (use_weights_lh ? 't' : 'n');
+  const std::string kname = "kq_dsa_indexer_score_" +
+      kq_type_string(q.dtype()) + "_bm64_bn64_bk16_wm2_wn2";
+  const std::string hash_name = kname + "_causal_" + (do_causal ? 't' : 'n') +
+      "_wlh_" + (use_weights_lh ? 't' : 'n');
 
   auto kernel = kq_get_kernel(d, kname, hash_name, func_consts);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -123,15 +123,14 @@ void KQDsaTopKIndices::eval_gpu(
   const int rows = B * L;
 
   const std::string kname = "kq_dsa_topk_indices_" +
-      kq_type_string(scores.dtype()) + "_topk" + std::to_string(topk_) +
-      "_t" + std::to_string(threads);
+      kq_type_string(scores.dtype()) + "_topk" + std::to_string(topk_) + "_t" +
+      std::to_string(threads);
 
   bool bucketed = bucketed_;
   mx::metal::MTLFCList func_consts = {
       {&bucketed, MTL::DataType::DataTypeBool, 302},
   };
-  const std::string hash_name =
-      kname + "_bucketed_" + (bucketed ? 't' : 'n');
+  const std::string hash_name = kname + "_bucketed_" + (bucketed ? 't' : 'n');
 
   auto kernel = kq_get_kernel(d, kname, hash_name, func_consts);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -292,8 +291,7 @@ mx::array dsa_indexer_scores(
   auto w = mx::contiguous(mx::astype(weights, final_type, s), false, s);
 
   mx::Shape out_shape{q.shape(0), 1, q.shape(2), k.shape(2)};
-  std::vector<mx::array> inputs = {
-      std::move(q), std::move(k), std::move(w)};
+  std::vector<mx::array> inputs = {std::move(q), std::move(k), std::move(w)};
   return mx::array(
       std::move(out_shape),
       final_type,
@@ -329,8 +327,8 @@ mx::array dsa_topk_indices(
   }
   if (scores.shape(3) < topk) {
     std::ostringstream msg;
-    msg << "[mlx_kquant.dsa_topk_indices] scores row length "
-        << scores.shape(3) << " is smaller than topk " << topk << ".";
+    msg << "[mlx_kquant.dsa_topk_indices] scores row length " << scores.shape(3)
+        << " is smaller than topk " << topk << ".";
     throw std::invalid_argument(msg.str());
   }
   if (scores.dtype() != mx::float16 && scores.dtype() != mx::bfloat16) {

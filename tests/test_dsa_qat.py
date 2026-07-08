@@ -40,13 +40,26 @@ def _e2m1_round(v):
     s = mx.sign(v)
     a = mx.abs(v)
     q = mx.where(
-        a <= 0.25, 0.0,
-        mx.where(a < 0.75, 0.5,
-        mx.where(a <= 1.25, 1.0,
-        mx.where(a < 1.75, 1.5,
-        mx.where(a <= 2.5, 2.0,
-        mx.where(a < 3.5, 3.0,
-        mx.where(a <= 5.0, 4.0, 6.0)))))))
+        a <= 0.25,
+        0.0,
+        mx.where(
+            a < 0.75,
+            0.5,
+            mx.where(
+                a <= 1.25,
+                1.0,
+                mx.where(
+                    a < 1.75,
+                    1.5,
+                    mx.where(
+                        a <= 2.5,
+                        2.0,
+                        mx.where(a < 3.5, 3.0, mx.where(a <= 5.0, 4.0, 6.0)),
+                    ),
+                ),
+            ),
+        ),
+    )
     return s * q
 
 
@@ -54,9 +67,7 @@ def _ref(x):
     orig = x.dtype
     v = mx.hadamard_transform(x.astype(mx.float32))
     v = mx.unflatten(v, -1, (-1, 32))
-    amax = mx.maximum(
-        mx.max(mx.abs(v), axis=-1, keepdims=True), 7.052966104933725e-38
-    )
+    amax = mx.maximum(mx.max(mx.abs(v), axis=-1, keepdims=True), 7.052966104933725e-38)
     scale = _exp2i(mx.ceil(mx.log2(amax / 6.0)))
     v = _e2m1_round(mx.clip(v / scale, -6.0, 6.0)) * scale
     return mx.flatten(v, -2).astype(orig)
@@ -79,8 +90,12 @@ CASES = [
     ("small", lambda r, s, d: r.standard_normal(s) * 1e-20),
     ("large", lambda r, s, d: r.standard_normal(s) * _BIG[d]),
     ("subnormal_floor", lambda r, s, d: r.standard_normal(s) * 1e-38),
-    ("mixed_rows", lambda r, s, d: r.standard_normal(s)
-        * (10.0 ** r.integers(-12, _MIX_HI[d], size=(s[0], 1)))),
+    (
+        "mixed_rows",
+        lambda r, s, d: (
+            r.standard_normal(s) * (10.0 ** r.integers(-12, _MIX_HI[d], size=(s[0], 1)))
+        ),
+    ),
     ("zeros", lambda r, s, d: np.zeros(s)),
     # Dyadic lattice inputs: post-hadamard values land on exact multiples of
     # small powers of two, hammering the e2m1 tie thresholds after the
@@ -134,8 +149,10 @@ def main() -> int:
             mx.eval(got, ref)
             n = int((_bits(got) != _bits(ref)).sum())
             fails += n > 0
-            print(f"  {name:<16} {str(dtype):<18} "
-                  f"{'bit-identical' if n == 0 else f'{n} words differ'}")
+            print(
+                f"  {name:<16} {str(dtype):<18} "
+                f"{'bit-identical' if n == 0 else f'{n} words differ'}"
+            )
     print("ALL OK" if not fails else f"FAILURES: {fails}")
     return 1 if fails else 0
 

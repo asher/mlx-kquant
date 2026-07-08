@@ -18,9 +18,9 @@
 #include "mlx/utils.h" // to_stream
 
 #ifdef _METAL_
+#include "../metal/mlx/backend/metal/kernels/kq_dsa_params.h"
 #include "kquant_metal_internal.h" // kq_get_kernel
 #include "mlx/backend/metal/device.h"
-#include "../metal/mlx/backend/metal/kernels/kq_dsa_params.h"
 #endif
 
 namespace mx = mlx::core;
@@ -139,8 +139,7 @@ std::vector<mx::Shape> KQDsaSparseAttention::output_shapes(
 bool KQDsaSparseAttention::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQDsaSparseAttention&>(other);
   return scale_ == o.scale_ && q_offset_ == o.q_offset_ &&
-      compress_ratio_ == o.compress_ratio_ &&
-      local_window_ == o.local_window_;
+      compress_ratio_ == o.compress_ratio_ && local_window_ == o.local_window_;
 }
 
 mx::array dsa_sparse_attention(
@@ -159,17 +158,16 @@ mx::array dsa_sparse_attention(
   if (q.ndim() != 4 || local_kv.ndim() != 4 || pooled.ndim() != 3 ||
       topk_indices.ndim() != 4 || sinks.ndim() != 1) {
     std::ostringstream msg;
-    msg << "[mlx_kquant.dsa_sparse_attention] incompatible ranks: "
-        << q.shape() << ", " << local_kv.shape() << ", " << pooled.shape()
-        << ", " << topk_indices.shape() << ", " << sinks.shape() << ".";
+    msg << "[mlx_kquant.dsa_sparse_attention] incompatible ranks: " << q.shape()
+        << ", " << local_kv.shape() << ", " << pooled.shape() << ", "
+        << topk_indices.shape() << ", " << sinks.shape() << ".";
     throw std::invalid_argument(msg.str());
   }
   if (q.shape(0) != local_kv.shape(0) || q.shape(0) != pooled.shape(0) ||
       q.shape(0) != topk_indices.shape(0) || q.shape(1) != 64 ||
-      q.shape(3) != 512 || local_kv.shape(1) != 1 ||
-      local_kv.shape(3) != 512 || pooled.shape(2) != 512 ||
-      topk_indices.shape(1) != 1 || topk_indices.shape(2) != q.shape(2) ||
-      sinks.shape(0) != q.shape(1)) {
+      q.shape(3) != 512 || local_kv.shape(1) != 1 || local_kv.shape(3) != 512 ||
+      pooled.shape(2) != 512 || topk_indices.shape(1) != 1 ||
+      topk_indices.shape(2) != q.shape(2) || sinks.shape(0) != q.shape(1)) {
     std::ostringstream msg;
     msg << "[mlx_kquant.dsa_sparse_attention] incompatible shapes: "
         << q.shape() << ", " << local_kv.shape() << ", " << pooled.shape()
@@ -211,8 +209,7 @@ mx::array dsa_sparse_attention(
       mx::contiguous(mx::astype(local_kv, final_type, s), false, s);
   auto pooled_cast =
       mx::contiguous(mx::astype(pooled, final_type, s), false, s);
-  auto sinks_cast =
-      mx::contiguous(mx::astype(sinks, final_type, s), false, s);
+  auto sinks_cast = mx::contiguous(mx::astype(sinks, final_type, s), false, s);
   topk_indices = mx::contiguous(topk_indices, false, s);
 
   mx::Shape out_shape{

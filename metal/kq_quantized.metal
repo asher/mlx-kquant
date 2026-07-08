@@ -740,4 +740,4 @@ instantiate_kquant_gather_qmm_rhs_codec(256, 1, iq1_m)
   map[3u * slot + 1u] = r;
   map[3u * slot + 2u] = min(64u, seg_len - rank);
 }
-    // clang-format on
+// clang-format on

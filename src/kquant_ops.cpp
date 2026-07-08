@@ -414,10 +414,8 @@ mx::array gather_qmm(
       {x_c, w_c, scales_c, std::move(lhs_indices), std::move(rhs_indices)});
 }
 
-std::vector<mx::array> expert_tile_map(
-    mx::array indices,
-    int n_experts,
-    mx::StreamOrDevice s_) {
+std::vector<mx::array>
+expert_tile_map(mx::array indices, int n_experts, mx::StreamOrDevice s_) {
   if (indices.ndim() != 1 || indices.dtype() != mx::uint32) {
     std::ostringstream msg;
     msg << "[mlx_kquant.expert_tile_map] indices must be 1-D uint32 but got "
@@ -447,7 +445,9 @@ std::vector<mx::array> expert_tile_map(
 namespace {
 
 void check_seg_map(
-    const mx::array& m, const char* which, const std::string& op) {
+    const mx::array& m,
+    const char* which,
+    const std::string& op) {
   if (m.ndim() != 2 || m.shape(1) != 3 || m.dtype() != mx::uint32 ||
       m.shape(0) < 1) {
     std::ostringstream msg;

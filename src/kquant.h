@@ -104,10 +104,8 @@ mx::array gather_qmm(
 // only the last tile of a segment can be partial; counts uint32 [1] = the
 // number of valid tiles. The cap is a shape-only upper bound; slots past
 // counts are uninitialized and tile order is unspecified. Metal-only.
-std::vector<mx::array> expert_tile_map(
-    mx::array indices,
-    int n_experts,
-    mx::StreamOrDevice s = {});
+std::vector<mx::array>
+expert_tile_map(mx::array indices, int n_experts, mx::StreamOrDevice s = {});
 
 // Segment-walking gather GEMM for expert-sorted MoE prefill. x is [R, K] rows
 // pre-sorted by expert; w is uint8 wire bytes (n_experts, N, bytes_per_row);

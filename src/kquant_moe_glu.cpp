@@ -517,8 +517,7 @@ void KQuantGatherQMVKQ::eval_cpu(
 
 bool KQuantMoEGLUKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMoEGLUKQ&>(other);
-  return kquant_type_ == o.kquant_type_ && act_ == o.act_ &&
-      limit_ == o.limit_;
+  return kquant_type_ == o.kquant_type_ && act_ == o.act_ && limit_ == o.limit_;
 }
 
 bool KQuantGatherQMVKQ::is_equivalent(const mx::Primitive& other) const {

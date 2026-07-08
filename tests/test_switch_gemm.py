@@ -110,9 +110,7 @@ def _tile_maps(counts):
 
 
 def _counts_to_indices(counts):
-    return mx.array(
-        np.repeat(np.arange(len(counts), dtype=np.uint32), counts)
-    )
+    return mx.array(np.repeat(np.arange(len(counts), dtype=np.uint32), counts))
 
 
 @pytest.mark.skipif(
@@ -147,9 +145,9 @@ def test_gather_qmm_seg_matches_loop(codec, dtype):
     counts = np.zeros(E, dtype=np.int64)
     counts[[0, 1, 2, 3, 4, 5, 7]] = [1, 17, 63, 96, 129, 200, 48]
     rows = int(counts.sum())
-    x = mx.array(
-        (rng.standard_normal((rows, K)) * 0.1).astype(np.float32)
-    ).astype(dtype)
+    x = mx.array((rng.standard_normal((rows, K)) * 0.1).astype(np.float32)).astype(
+        dtype
+    )
 
     refs, start = [], 0
     for e in np.flatnonzero(counts):
@@ -190,9 +188,9 @@ def test_gather_qmm_seg_unaligned_n():
     s = mx.zeros((1,), dtype=mx.uint8)
     counts = np.array([65, 0, 3, 64], dtype=np.int64)
     rows = int(counts.sum())
-    x = mx.array(
-        (rng.standard_normal((rows, K)) * 0.1).astype(np.float32)
-    ).astype(mx.float16)
+    x = mx.array((rng.standard_normal((rows, K)) * 0.1).astype(np.float32)).astype(
+        mx.float16
+    )
     got = kq.gather_qmm_seg(x, w, s, "iq2_xxs", *_tile_maps(counts))
     refs, start = [], 0
     for e in np.flatnonzero(counts):
@@ -240,7 +238,10 @@ def test_expert_tile_map_matches_host(counts):
     # tile order is unspecified: compare as sorted sets of valid rows
     g = np.array(m)[: cnt[0]]
     r = np.array(mh)[: cnt[0]]
-    order = lambda a: a[np.lexsort(a.T[::-1])]
+
+    def order(a):
+        return a[np.lexsort(a.T[::-1])]
+
     np.testing.assert_array_equal(order(g), order(r))
 
 
@@ -260,17 +261,17 @@ def test_gather_qmm_seg_rejects_bad_inputs():
         kq.gather_qmm_seg(x, w, s, "iq2_xxs", good, cnt)
     x_ok = mx.zeros((64, 4096), dtype=mx.float16)
     with pytest.raises(ValueError):  # bad map shape
-        kq.gather_qmm_seg(
-            x_ok, w, s, "iq2_xxs", mx.zeros((3,), dtype=mx.uint32), cnt
-        )
+        kq.gather_qmm_seg(x_ok, w, s, "iq2_xxs", mx.zeros((3,), dtype=mx.uint32), cnt)
     with pytest.raises(ValueError):  # bad counts shape (old multi-map layout)
-        kq.gather_qmm_seg(
-            x_ok, w, s, "iq2_xxs", good, mx.zeros((2,), dtype=mx.uint32)
-        )
+        kq.gather_qmm_seg(x_ok, w, s, "iq2_xxs", good, mx.zeros((2,), dtype=mx.uint32))
     with pytest.raises(ValueError):  # 3-D x
         kq.gather_qmm_seg(
-            mx.zeros((64, 1, 4096), dtype=mx.float16), w, s, "iq2_xxs",
-            good, cnt,
+            mx.zeros((64, 1, 4096), dtype=mx.float16),
+            w,
+            s,
+            "iq2_xxs",
+            good,
+            cnt,
         )
     with pytest.raises(ValueError):  # expert_tile_map: non-uint32 indices
         kq.expert_tile_map(mx.zeros((8,), dtype=mx.int32), 4)

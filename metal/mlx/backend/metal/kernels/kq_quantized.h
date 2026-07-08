@@ -185,9 +185,8 @@ struct KqSegBlockMMA {
 
   METAL_FUNC short active_tm_rows(const short valid_rows) const {
     short avail = valid_rows - tm;
-    return avail <= 0
-        ? short(0)
-        : min(TM, short((avail + TM_stride - 1) / TM_stride));
+    return avail <= 0 ? short(0)
+                      : min(TM, short((avail + TM_stride - 1) / TM_stride));
   }
 
   // AT-specialized k-sweep: all fragment indices and loop bounds are
@@ -228,10 +227,8 @@ struct KqSegBlockMMA {
     }
   }
 
-  METAL_FUNC void mma(
-      const threadgroup T* As,
-      const threadgroup T* Bs,
-      const short active_tm) {
+  METAL_FUNC void
+  mma(const threadgroup T* As, const threadgroup T* Bs, const short active_tm) {
     // active_tm is uniform per simdgroup and constant across k-steps; only
     // simdgroup_barriers live inside the arms, so per-simdgroup divergence
     // here is safe. A fully dead simdgroup skips its loads and matmads.
@@ -2425,17 +2422,7 @@ inline uchar2 kq_get_scale_min_k4_just2(int j, int k, const device uint8_t* q) {
     y += static_cast<int64_t>(seg[1]) * N;                            \
     const int num_rows = static_cast<int>(seg[2]);                    \
     kq_qmm_t_seg_impl<T, LoaderW, aligned_N, BM, BK, BN>(             \
-        w,                                                            \
-        x,                                                            \
-        y,                                                            \
-        Xs,                                                           \
-        Ws,                                                           \
-        K,                                                            \
-        N,                                                            \
-        num_rows,                                                     \
-        tid,                                                          \
-        simd_gid,                                                     \
-        simd_lid);                                                    \
+        w, x, y, Xs, Ws, K, N, num_rows, tid, simd_gid, simd_lid);    \
   }                                                                   \
                                                                       \
   template <typename T, int group_size, int bits>                     \

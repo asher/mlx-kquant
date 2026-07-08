@@ -41,8 +41,7 @@ void KQDsaIndexerQat::eval_gpu(
   // mlx's hadamard_transform default scale for n=128.
   const float scale = 1.0f / std::sqrt(128.0f);
 
-  const std::string kname =
-      "kq_dsa_indexer_qat_" + kq_type_string(x.dtype());
+  const std::string kname = "kq_dsa_indexer_qat_" + kq_type_string(x.dtype());
   auto kernel = kq_get_kernel(d, kname, kname, {});
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);

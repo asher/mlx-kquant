@@ -21,8 +21,8 @@
 
 #pragma once
 
-#include "mlx/backend/metal/kernels/steel/gemm/gemm.h"
 #include "mlx/backend/metal/kernels/kq_dsa_params.h"
+#include "mlx/backend/metal/kernels/steel/gemm/gemm.h"
 
 using namespace mlx::steel;
 
@@ -37,7 +37,8 @@ METAL_FUNC uint kq_dsa_ordered_key_16(T x) {
 }
 
 template <typename T, typename O, int TOPK, int THREADS>
-[[kernel, max_total_threads_per_threadgroup(THREADS)]] void kq_dsa_topk_indices_16bit(
+[[kernel, max_total_threads_per_threadgroup(THREADS)]] void
+kq_dsa_topk_indices_16bit(
     const device T* scores [[buffer(0)]],
     device O* out [[buffer(1)]],
     const constant KQDsaTopKParams* params [[buffer(2)]],
@@ -191,19 +192,8 @@ kq_dsa_indexer_score(
     uint3 lid [[thread_position_in_threadgroup]]) {
   (void)lid;
 
-  using gemm_kernel = GEMMKernel<
-      T,
-      T,
-      BM,
-      BN,
-      BK,
-      WM,
-      WN,
-      false,
-      true,
-      true,
-      true,
-      float>;
+  using gemm_kernel =
+      GEMMKernel<T, T, BM, BN, BK, WM, WN, false, true, true, true, float>;
 
   using loader_a_t = typename gemm_kernel::loader_a_t;
   using loader_b_t = typename gemm_kernel::loader_b_t;
@@ -233,8 +223,8 @@ kq_dsa_indexer_score(
       if (skip_causal_future_store) {
         return;
       }
-      device T* Dst = O + size_t(tid.z) * M * N + size_t(c_row) * params->ldd +
-          c_col;
+      device T* Dst =
+          O + size_t(tid.z) * M * N + size_t(c_row) * params->ldd + c_col;
       for (int e = thread_idx; e < BM * BN; e += THREADS) {
         const int row = e / BN;
         const int col = e - row * BN;
@@ -325,8 +315,8 @@ kq_dsa_indexer_score(
       for (short e = 0; e < decltype(mma_op.Ctile)::kElemsPerFrag; ++e) {
         const int col = col_base + e;
         const bool future = kq_dsa_do_causal && col > q_offset + row;
-        const T value = future ? static_cast<T>(-INFINITY)
-                               : static_cast<T>(accum[ai]);
+        const T value =
+            future ? static_cast<T>(-INFINITY) : static_cast<T>(accum[ai]);
         Dst[out_base + e] = value;
         ai++;
       }

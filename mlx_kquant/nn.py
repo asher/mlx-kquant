@@ -237,9 +237,7 @@ class KQuantSwitchLinear(nn.Module):
                 indices = indices.astype(mx.uint32)
             maps = kq.expert_tile_map(indices, w.shape[0])
             return kq.gather_qmm_seg(xf, w, s, codec, *maps)[:, None, :]
-        counts = np.bincount(
-            np.array(indices), minlength=self.weight.shape[0]
-        )
+        counts = np.bincount(np.array(indices), minlength=self.weight.shape[0])
         outs = []
         start = 0
         for e in np.flatnonzero(counts):

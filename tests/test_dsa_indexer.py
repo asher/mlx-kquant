@@ -98,9 +98,7 @@ def test_dsa_indexer_scores(case, dtype):
         # The decode-v1 shape: one real query row broadcast to fill M=64.
         q = mx.broadcast_to(q[:, :, :1], q.shape)
         w = mx.broadcast_to(w[:, :1], w.shape)
-    got = kq.dsa_indexer_scores(
-        q, k, w, causal=causal, causal_q_offset=q_offset
-    )
+    got = kq.dsa_indexer_scores(q, k, w, causal=causal, causal_q_offset=q_offset)
     mx.eval(got)
     g = np.array(got.astype(mx.float32))
     ref = _ref_scores(q, k, w, causal, q_offset)
@@ -146,9 +144,7 @@ def test_dsa_topk_indices_decode(dtype, bucketed):
     rng = np.random.default_rng(11)
     K, topk = 1500, 512
     # Heavy ties: quantized normal values so the threshold bucket is fat.
-    scores = mx.array(
-        np.round(rng.standard_normal((1, 1, 1, K)) * 8) / 8
-    ).astype(dtype)
+    scores = mx.array(np.round(rng.standard_normal((1, 1, 1, K)) * 8) / 8).astype(dtype)
     got = kq.dsa_topk_indices(scores, topk, bucketed=bucketed)
     mx.eval(got)
     assert got.shape == (1, 1, 1, topk) and got.dtype == mx.uint32
@@ -162,9 +158,7 @@ def test_dsa_topk_indices_causal_prefix(dtype):
     B, L, K, topk = 1, 640, 640, 512
     raw = rng.standard_normal((B, 1, L, K))
     scores = mx.array(raw).astype(dtype)
-    got = kq.dsa_topk_indices(
-        scores, topk, bucketed=True, causal_valid_prefix=True
-    )
+    got = kq.dsa_topk_indices(scores, topk, bucketed=True, causal_valid_prefix=True)
     mx.eval(got)
     vals = np.array(scores.astype(mx.float32))
     sel = np.array(got)
@@ -188,9 +182,7 @@ def test_dsa_indexer_e2e_prefill(dtype):
         unused_causal_prefix_topk=topk,
         skip_causal_future_store=True,
     )
-    got = kq.dsa_topk_indices(
-        scores, topk, bucketed=True, causal_valid_prefix=True
-    )
+    got = kq.dsa_topk_indices(scores, topk, bucketed=True, causal_valid_prefix=True)
     mx.eval(got)
     # Judge against the kernel's own 16-bit scores; each row's causal scan
     # range [0, m] is always written (only never-read tiles skip-store).

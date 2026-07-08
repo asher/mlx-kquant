@@ -27,4 +27,4 @@ instantiate_kq_dsa_topk_indices(float16_t, half, 2048, 1024);
 instantiate_kq_dsa_topk_indices(bfloat16_t, bfloat16_t, 2048, 1024);
 instantiate_kq_dsa_topk_indices(float16_t, half, 512, 1024);
 instantiate_kq_dsa_topk_indices(bfloat16_t, bfloat16_t, 512, 1024);
-    // clang-format on
+// clang-format on

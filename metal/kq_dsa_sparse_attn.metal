@@ -21,4 +21,4 @@
 
 instantiate_kq_dsa_sparse_attention(float16_t, half, 256, 32, 64, 512, 8);
 instantiate_kq_dsa_sparse_attention(bfloat16_t, bfloat16_t, 256, 32, 64, 512, 8);
-    // clang-format on
+// clang-format on

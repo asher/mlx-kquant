@@ -73,14 +73,11 @@ def _rel(got, ref):
     return float(np.linalg.norm(g - ref) / (np.linalg.norm(ref) + 1e-6))
 
 
-def _case(qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed,
-          mode="random"):
+def _case(qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed, mode="random"):
     rng = np.random.default_rng(seed)
     B = 1
     q = mx.array(rng.standard_normal((B, H, qL, D)) * 0.3).astype(dtype)
-    local_kv = mx.array(rng.standard_normal((B, 1, localL, D)) * 0.3).astype(
-        dtype
-    )
+    local_kv = mx.array(rng.standard_normal((B, 1, localL, D)) * 0.3).astype(dtype)
     pooled = mx.array(rng.standard_normal((B, P, D)) * 0.3).astype(dtype)
     sinks = mx.array(rng.standard_normal((H,)) * 0.5).astype(dtype)
     if mode == "identity":
@@ -99,9 +96,7 @@ def _case(qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed,
             [
                 np.stack(
                     [
-                        rng.choice(P, size=topk_n, replace=False).astype(
-                            np.uint32
-                        )
+                        rng.choice(P, size=topk_n, replace=False).astype(np.uint32)
                         for _ in range(qL)
                     ],
                     0,
@@ -147,7 +142,15 @@ CASES = [
 def test_dsa_sparse_attention(case, dtype):
     name, qL, localL, P, topk_n, q_offset, ratio, window, mode = case
     rel = _case(
-        qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed=7,
+        qL,
+        localL,
+        P,
+        topk_n,
+        q_offset,
+        ratio,
+        window,
+        dtype,
+        seed=7,
         mode=mode,
     )
     assert rel < REL_BOUND[dtype], f"{name} {dtype}: rel {rel:.3e}"
@@ -175,14 +178,21 @@ def main() -> int:
         name, qL, localL, P, topk_n, q_offset, ratio, window, mode = case
         for dtype in (mx.float16, mx.bfloat16):
             rel = _case(
-                qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed=7,
+                qL,
+                localL,
+                P,
+                topk_n,
+                q_offset,
+                ratio,
+                window,
+                dtype,
+                seed=7,
                 mode=mode,
             )
             ok = rel < REL_BOUND[dtype]
             fails += not ok
             print(
-                f"  {name:<20} {str(dtype):<18} rel={rel:.3e} "
-                f"{'ok' if ok else 'FAIL'}"
+                f"  {name:<20} {str(dtype):<18} rel={rel:.3e} {'ok' if ok else 'FAIL'}"
             )
     print("ALL OK" if not fails else f"FAILURES: {fails}")
     return 1 if fails else 0

@@ -25,8 +25,8 @@
 
 #pragma once
 
-#include "mlx/backend/metal/kernels/steel/attn/attn.h"
 #include "mlx/backend/metal/kernels/kq_dsa_params.h"
+#include "mlx/backend/metal/kernels/steel/attn/attn.h"
 
 using namespace mlx::steel;
 
@@ -73,51 +73,50 @@ struct KQDsaDivOp {
 // Dead columns stay exact: Stile is cleared, the selected[]<0 mask fill
 // drives them to -inf before the row reduce, and the PV arm only skips
 // fragments whose softmax weights are exactly zero.
-#define KQ_DSA_QK_SWEEP(KF)                                                  \
-  STEEL_PRAGMA_UNROLL                                                        \
-  for (short dd = 0; dd < TDC; ++dd) {                                       \
-    simdgroup_barrier(mem_flags::mem_none);                                  \
-    Qtile.template load<T, 1, 1, LDQ, 1>(&Qs[Qs_offset + dd * kFragSize]);   \
-    STEEL_PRAGMA_UNROLL                                                      \
-    for (short ik = 0; ik < (KF); ++ik) {                                    \
-      MMAFragAcc::load(                                                      \
-          Ktile.frag_at(0, ik),                                              \
-          &KVs[Ks_offset + dd * kFragSize * LDK + ik * kFragSize],           \
-          Int<LDK>{},                                                        \
-          Int<1>{});                                                         \
-    }                                                                        \
-    simdgroup_barrier(mem_flags::mem_none);                                  \
-    STEEL_PRAGMA_UNROLL                                                      \
-    for (short iq = 0; iq < TQ; ++iq) {                                      \
-      STEEL_PRAGMA_UNROLL                                                    \
-      for (short ik = 0; ik < (KF); ++ik) {                                  \
-        MMAFragAcc::mma(                                                     \
-            Stile.frag_at(iq, ik),                                           \
-            Qtile.frag_at(iq, 0),                                            \
-            Ktile.frag_at(0, ik),                                            \
-            Stile.frag_at(iq, ik));                                          \
-      }                                                                      \
-    }                                                                        \
+#define KQ_DSA_QK_SWEEP(KF)                                                \
+  STEEL_PRAGMA_UNROLL                                                      \
+  for (short dd = 0; dd < TDC; ++dd) {                                     \
+    simdgroup_barrier(mem_flags::mem_none);                                \
+    Qtile.template load<T, 1, 1, LDQ, 1>(&Qs[Qs_offset + dd * kFragSize]); \
+    STEEL_PRAGMA_UNROLL                                                    \
+    for (short ik = 0; ik < (KF); ++ik) {                                  \
+      MMAFragAcc::load(                                                    \
+          Ktile.frag_at(0, ik),                                            \
+          &KVs[Ks_offset + dd * kFragSize * LDK + ik * kFragSize],         \
+          Int<LDK>{},                                                      \
+          Int<1>{});                                                       \
+    }                                                                      \
+    simdgroup_barrier(mem_flags::mem_none);                                \
+    STEEL_PRAGMA_UNROLL                                                    \
+    for (short iq = 0; iq < TQ; ++iq) {                                    \
+      STEEL_PRAGMA_UNROLL                                                  \
+      for (short ik = 0; ik < (KF); ++ik) {                                \
+        MMAFragAcc::mma(                                                   \
+            Stile.frag_at(iq, ik),                                         \
+            Qtile.frag_at(iq, 0),                                          \
+            Ktile.frag_at(0, ik),                                          \
+            Stile.frag_at(iq, ik));                                        \
+      }                                                                    \
+    }                                                                      \
   }
 
-#define KQ_DSA_PV_SWEEP(KF)                                                  \
-  STEEL_PRAGMA_UNROLL                                                        \
-  for (short iq = 0; iq < TQ; ++iq) {                                        \
-    STEEL_PRAGMA_UNROLL                                                      \
-    for (short id = 0; id < TDC; ++id) {                                     \
-      STEEL_PRAGMA_UNROLL                                                    \
-      for (short ik = 0; ik < (KF); ++ik) {                                  \
-        const short kk = ik * kFragSize;                                     \
-        const short dd = id * kFragSize;                                     \
-        Vtile.template load<T, 1, 1, LDV, 1>(                                \
-            &KVs[Vs_offset + kk * LDV + dd]);                                \
-        MMAFragAcc::mma(                                                     \
-            Otile.frag_at(iq, vchunk * TDC + id),                            \
-            Stile.frag_at(iq, ik),                                           \
-            Vtile.frag_at(0, 0),                                             \
-            Otile.frag_at(iq, vchunk * TDC + id));                           \
-      }                                                                      \
-    }                                                                        \
+#define KQ_DSA_PV_SWEEP(KF)                                                    \
+  STEEL_PRAGMA_UNROLL                                                          \
+  for (short iq = 0; iq < TQ; ++iq) {                                          \
+    STEEL_PRAGMA_UNROLL                                                        \
+    for (short id = 0; id < TDC; ++id) {                                       \
+      STEEL_PRAGMA_UNROLL                                                      \
+      for (short ik = 0; ik < (KF); ++ik) {                                    \
+        const short kk = ik * kFragSize;                                       \
+        const short dd = id * kFragSize;                                       \
+        Vtile.template load<T, 1, 1, LDV, 1>(&KVs[Vs_offset + kk * LDV + dd]); \
+        MMAFragAcc::mma(                                                       \
+            Otile.frag_at(iq, vchunk* TDC + id),                               \
+            Stile.frag_at(iq, ik),                                             \
+            Vtile.frag_at(0, 0),                                               \
+            Otile.frag_at(iq, vchunk* TDC + id));                              \
+      }                                                                        \
+    }                                                                          \
   }
 
 // clang-format off
@@ -217,25 +216,20 @@ template <
 
   const device T* q_base = Q + size_t(b) * params->Q_strides[0] +
       size_t(q_pos) * params->Q_strides[2];
-  const device T* local_base =
-      LocalKV + size_t(b) * params->Local_strides[0];
+  const device T* local_base = LocalKV + size_t(b) * params->Local_strides[0];
   const device T* pooled_base =
       PooledKV + size_t(b) * params->Pooled_strides[0];
-  const device IndexT* topk_base =
-      Topk + size_t(b) * params->Topk_strides[0] +
+  const device IndexT* topk_base = Topk + size_t(b) * params->Topk_strides[0] +
       size_t(q_pos) * params->Topk_strides[2];
 
   const int local_offset = params->localL - params->qL;
-  const int local_end =
-      metal::min(params->localL, local_offset + q_pos + 1);
-  const int local_start =
-      metal::max(0, local_end - params->local_window);
+  const int local_end = metal::min(params->localL, local_offset + q_pos + 1);
+  const int local_start = metal::max(0, local_end - params->local_window);
   const int local_count = metal::max(0, local_end - local_start);
   const int local_tiles = (local_count + BK - 1) / BK;
   const int pooled_tiles = (params->topk + BK - 1) / BK;
   const int pooled_valid = metal::min(
-      params->pooledL,
-      (params->q_offset + q_pos + 1) / params->compress_ratio);
+      params->pooledL, (params->q_offset + q_pos + 1) / params->compress_ratio);
   const int total_tiles = local_tiles + pooled_tiles;
 
   for (int ktile = 0; ktile < total_tiles; ++ktile) {
@@ -282,8 +276,7 @@ template <
       continue;
     }
     // 1..4, each arm covering another TK/4 fragments of live prefix.
-    const short live_arm =
-        short((tile_last_live / kFragSize) / (TK / 4)) + 1;
+    const short live_arm = short((tile_last_live / kFragSize) / (TK / 4)) + 1;
     const int live_slots = int(live_arm) * (BK / 4);
 
     Stile.clear();
@@ -295,8 +288,7 @@ template <
       for (int elem = lane; elem < H * DC; elem += tgp_size) {
         const int h = elem / DC;
         const int d = elem - h * DC;
-        Qs[h * LDQ + d] =
-            q_base[size_t(h) * params->Q_strides[1] + dbase + d];
+        Qs[h * LDQ + d] = q_base[size_t(h) * params->Q_strides[1] + dbase + d];
       }
 
       for (int elem = lane; elem < live_slots * DC; elem += tgp_size) {
@@ -306,10 +298,10 @@ template <
         T value = T(0);
         if (k_pos >= 0) {
           value = is_pooled_tile
-              ? pooled_base[size_t(k_pos) * params->Pooled_strides[1] +
-                            dbase + d]
-              : local_base[size_t(k_pos) * params->Local_strides[2] +
-                           dbase + d];
+              ? pooled_base
+                    [size_t(k_pos) * params->Pooled_strides[1] + dbase + d]
+              : local_base
+                    [size_t(k_pos) * params->Local_strides[2] + dbase + d];
         }
         KVs[k + d * LDK] = value;
       }
@@ -396,10 +388,10 @@ template <
         T value = T(0);
         if (k_pos >= 0) {
           value = is_pooled_tile
-              ? pooled_base[size_t(k_pos) * params->Pooled_strides[1] +
-                            dbase + d]
-              : local_base[size_t(k_pos) * params->Local_strides[2] +
-                           dbase + d];
+              ? pooled_base
+                    [size_t(k_pos) * params->Pooled_strides[1] + dbase + d]
+              : local_base
+                    [size_t(k_pos) * params->Local_strides[2] + dbase + d];
         }
         KVs[k * LDV + d] = value;
       }
