@@ -323,3 +323,85 @@ kq_dsa_indexer_score(
     }
   }
 }
+
+// Decode-width direct score: sum_h relu(q[h, j] . k[r]) * w[j, h] for
+// QL <= 4 query rows against every pooled row, one simdgroup per R-row
+// group, never materializing the [H, P] per-head scores. Each lane holds
+// one half4 of each key row; q rows stream from device (L2-resident) and
+// are shared across the group's R rows. Pooled visibility follows
+// PoolingCache.make_mask: row r is visible to query j iff
+// r < (q_offset + j + 1) / ratio, and every row is visible when QL == 1;
+// invisible rows score the dtype's finite min so the radix top-k orders
+// them last (matching the inline path's masked argpartition).
+template <typename T, int QL, int H = 64, int D = 128, int SGS = 4, int R = 8>
+[[kernel, max_total_threads_per_threadgroup(SGS * 32)]] void
+kq_dsa_indexer_score_decode(
+    const device T* Q [[buffer(0)]], // [B, H, QL, D]
+    const device T* K [[buffer(1)]], // [B, P, D]
+    const device T* W [[buffer(2)]], // [B, QL, H]
+    device T* out [[buffer(3)]], // [B, 1, QL, P]
+    const constant int& P [[buffer(4)]],
+    const constant int& q_offset [[buffer(5)]],
+    const constant int& ratio [[buffer(6)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    ushort simd_gid [[simdgroup_index_in_threadgroup]],
+    ushort simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(D == 4 * 32, "one half4 of the key row per lane");
+
+  const int b = int(tid.z);
+  const int row0 = (int(tid.x) * SGS + int(simd_gid)) * R;
+  if (row0 >= P) {
+    return;
+  }
+  const int nrows = metal::min(R, P - row0);
+
+  const device T* kb = K + (size_t(b) * P + size_t(row0)) * D + simd_lid * 4;
+  vec<T, 4> kf[R];
+  STEEL_PRAGMA_UNROLL
+  for (int i = 0; i < R; ++i) {
+    kf[i] = i < nrows
+        ? *reinterpret_cast<const device vec<T, 4>*>(kb + size_t(i) * D)
+        : vec<T, 4>(0);
+  }
+
+  float acc[R][QL];
+  STEEL_PRAGMA_UNROLL
+  for (int i = 0; i < R; ++i) {
+    STEEL_PRAGMA_UNROLL
+    for (int j = 0; j < QL; ++j) {
+      acc[i][j] = 0.0f;
+    }
+  }
+
+  const device T* qb = Q + size_t(b) * H * QL * D + simd_lid * 4;
+  const device T* wb = W + size_t(b) * QL * H;
+  for (int h = 0; h < H; ++h) {
+    STEEL_PRAGMA_UNROLL
+    for (int j = 0; j < QL; ++j) {
+      const float4 qf = float4(*reinterpret_cast<const device vec<T, 4>*>(
+          qb + (size_t(h) * QL + j) * D));
+      const float w = float(wb[size_t(j) * H + h]);
+      STEEL_PRAGMA_UNROLL
+      for (int i = 0; i < R; ++i) {
+        const float dotv = simd_sum(metal::dot(qf, float4(kf[i])));
+        acc[i][j] += metal::max(dotv, 0.0f) * w;
+      }
+    }
+  }
+
+  if (simd_lid != 0) {
+    return;
+  }
+  device T* ob = out + size_t(b) * QL * size_t(P) + row0;
+  STEEL_PRAGMA_UNROLL
+  for (int j = 0; j < QL; ++j) {
+    const int vlim = QL == 1 ? P : metal::min(P, (q_offset + j + 1) / ratio);
+    STEEL_PRAGMA_UNROLL
+    for (int i = 0; i < R; ++i) {
+      if (i < nrows) {
+        ob[size_t(j) * P + i] =
+            row0 + i < vlim ? static_cast<T>(acc[i][j]) : Limits<T>::finite_min;
+      }
+    }
+  }
+}

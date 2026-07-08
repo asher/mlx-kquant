@@ -208,6 +208,102 @@ def test_dsa_indexer_rejects_bad_shapes():
         kq.dsa_topk_indices(scores[..., :256], 512)
 
 
+# --------------------------------------------------------- decode scores
+
+
+def _ref_scores_decode(q, k, w, q_offset, ratio):
+    """f32 reference of the fused decode score with make_mask visibility.
+
+    Masked entries carry the dtype's finite min, matching the kernel."""
+    qf = np.array(q.astype(mx.float32))
+    kf = np.array(k.astype(mx.float32))
+    wf = np.array(w.astype(mx.float32))
+    B, _, QL, _ = qf.shape
+    P = kf.shape[1]
+    dots = np.einsum("bhjd,bpd->bhjp", qf, kf)
+    out = np.einsum("bjh,bhjp->bjp", wf, np.maximum(dots, 0.0))[:, None]
+    mask = np.zeros(out.shape, dtype=bool)
+    if QL > 1:
+        for j in range(QL):
+            vlim = min(P, (q_offset + j + 1) // ratio)
+            mask[:, :, j, vlim:] = True
+    return out, mask
+
+
+def _make_decode_qkw(B, QL, P, dtype, seed):
+    rng = np.random.default_rng(seed)
+    q = mx.array(rng.standard_normal((B, 64, QL, D)) * 0.4).astype(dtype)
+    k = mx.array(rng.standard_normal((B, P, D)) * 0.4).astype(dtype)
+    # Signed weights: relu is on the dot, not the weighted sum.
+    w = mx.array(rng.standard_normal((B, QL, 64)) * 0.2).astype(dtype)
+    return q, k, w
+
+
+DECODE_SCORE_CASES = [
+    # (name, QL, P, q_offset, ratio)
+    ("decode_ql1", 1, 1024, 4095, 4),
+    ("verify_ql2_min_p", 2, 512, 2047, 4),
+    ("verify_ql3_ragged", 3, 1027, 4106, 4),
+    ("verify_ql4_clipped", 4, 517, 2066, 4),
+    ("tiny_pool", 1, 33, 131, 4),
+    ("deep_pool", 2, 16384, 65535, 4),
+]
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "case", DECODE_SCORE_CASES, ids=[c[0] for c in DECODE_SCORE_CASES]
+)
+def test_dsa_indexer_score_decode(case, dtype):
+    name, QL, P, q_offset, ratio = case
+    q, k, w = _make_decode_qkw(1, QL, P, dtype, seed=23)
+    got = kq.dsa_indexer_score_decode(q, k, w, q_offset, ratio)
+    mx.eval(got)
+    assert got.shape == (1, 1, QL, P)
+    g = np.array(got.astype(mx.float32))
+    ref, mask = _ref_scores_decode(q, k, w, q_offset, ratio)
+    if mask.any():
+        assert np.all(g[mask] <= -60000), name
+    rel = np.linalg.norm(g[~mask] - ref[~mask]) / (np.linalg.norm(ref[~mask]) + 1e-6)
+    assert rel < REL_BOUND[dtype], f"{name} {dtype}: rel {rel:.3e}"
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_dsa_indexer_e2e_decode(dtype):
+    """Production decode wiring: fused scores -> bucketed top-k."""
+    QL, P, topk = 3, 4096, 512
+    q, k, w = _make_decode_qkw(1, QL, P, dtype, seed=29)
+    q_offset, ratio = P * 4 - QL, 4
+    scores = kq.dsa_indexer_score_decode(q, k, w, q_offset, ratio)
+    got = kq.dsa_topk_indices(scores, topk, bucketed=True)
+    mx.eval(got)
+    assert got.shape == (1, 1, QL, topk)
+    vals = np.array(scores.astype(mx.float32))
+    sel = np.array(got)
+    for j in range(QL):
+        _check_topk_row(vals[0, 0, j], sel[0, 0, j], topk, P)
+
+
+def test_dsa_indexer_score_decode_rejects_bad_shapes():
+    q = mx.zeros((1, 64, 1, 128), dtype=mx.float16)
+    k = mx.zeros((1, 256, 128), dtype=mx.float16)
+    w = mx.zeros((1, 1, 64), dtype=mx.float16)
+    with pytest.raises(ValueError):  # qL > 4
+        kq.dsa_indexer_score_decode(
+            mx.zeros((1, 64, 5, 128), dtype=mx.float16),
+            k,
+            mx.zeros((1, 5, 64), dtype=mx.float16),
+            100,
+            4,
+        )
+    with pytest.raises(ValueError):  # bad head count
+        kq.dsa_indexer_score_decode(q[:, :32], k, w[:, :, :32], 100, 4)
+    with pytest.raises(ValueError):  # keys rank
+        kq.dsa_indexer_score_decode(q, k[:, None], w, 100, 4)
+    with pytest.raises(ValueError):  # negative q_offset
+        kq.dsa_indexer_score_decode(q, k, w, -1, 4)
+
+
 def main() -> int:
     rc = pytest.main([__file__, "-q"])
     return int(rc)

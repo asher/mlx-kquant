@@ -426,6 +426,39 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "dsa_indexer_score_decode",
+      &mlx_kquant::dsa_indexer_score_decode,
+      "queries"_a,
+      "keys"_a,
+      "weights"_a,
+      "q_offset"_a,
+      "ratio"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Decode-width lightning-indexer scores, fused:
+        out[b, 0, j, p] = sum_h relu(q[b, h, j] . k[b, p]) * w[b, j, h]
+        for qL <= 4 query rows without materializing the [H, P] per-head
+        scores. Selection-equivalent to the inline path when any positive
+        global scale is folded out. Pooled visibility follows
+        PoolingCache.make_mask(qL, q_offset): row p is visible to query j
+        iff p < (q_offset + j + 1) // ratio, and every row is visible when
+        qL == 1; invisible rows score the dtype's finite min.
+
+        Args:
+            queries (array): [B, 64, qL, 128], qL in [1, 4],
+                float16/bfloat16.
+            keys (array): the pooled indexer key cache [B, P, 128].
+            weights (array): per-head query weights [B, qL, 64].
+            q_offset (int): absolute position of query row 0's step
+                (make_mask's ``offset``).
+            ratio (int): pooled compression ratio.
+
+        Returns:
+            array: scores [B, 1, qL, P] shaped for dsa_topk_indices.
+      )");
+
+  m.def(
       "dsa_indexer_qat",
       &mlx_kquant::dsa_indexer_qat,
       "x"_a,

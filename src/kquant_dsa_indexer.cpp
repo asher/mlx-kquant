@@ -105,6 +105,46 @@ void KQDsaIndexerScores::eval_gpu(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+void KQDsaIndexerScoreDecode::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+
+  const auto& q = inputs[0];
+  const auto& k = inputs[1];
+  const auto& weights = inputs[2];
+  auto& out = outputs[0];
+
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  // Mirrors the kernel's SGS = 4 simdgroups x R = 8 rows per threadgroup.
+  constexpr int rows_per_tg = 32;
+
+  const int B = q.shape(0);
+  const int QL = q.shape(2);
+  const int P = k.shape(1);
+
+  const std::string kname = "kq_dsa_indexer_score_decode_" +
+      kq_type_string(q.dtype()) + "_ql" + std::to_string(QL);
+
+  auto kernel = kq_get_kernel(d, kname, kname, {});
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+
+  ce.set_input_array(q, 0);
+  ce.set_input_array(k, 1);
+  ce.set_input_array(weights, 2);
+  ce.set_output_array(out, 3);
+  ce.set_bytes(P, 4);
+  ce.set_bytes(q_offset_, 5);
+  ce.set_bytes(ratio_, 6);
+
+  MTL::Size group_dims(32, 4, 1);
+  MTL::Size grid_dims((P + rows_per_tg - 1) / rows_per_tg, 1, B);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 void KQDsaTopKIndices::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
@@ -161,6 +201,13 @@ void KQDsaIndexerScores::eval_gpu(
       "[mlx_kquant.dsa_indexer_scores] requires a Metal build.");
 }
 
+void KQDsaIndexerScoreDecode::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.dsa_indexer_score_decode] requires a Metal build.");
+}
+
 void KQDsaTopKIndices::eval_gpu(
     const std::vector<mx::array>&,
     std::vector<mx::array>&) {
@@ -182,6 +229,13 @@ void KQDsaTopKIndices::eval_cpu(
     std::vector<mx::array>&) {
   throw std::runtime_error(
       "[mlx_kquant.dsa_topk_indices] has no CPU implementation.");
+}
+
+void KQDsaIndexerScoreDecode::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.dsa_indexer_score_decode] has no CPU implementation.");
 }
 
 std::vector<mx::Shape> KQDsaIndexerScores::output_shapes(
@@ -209,6 +263,88 @@ bool KQDsaTopKIndices::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQDsaTopKIndices&>(other);
   return topk_ == o.topk_ && bucketed_ == o.bucketed_ &&
       causal_valid_prefix_ == o.causal_valid_prefix_;
+}
+
+std::vector<mx::Shape> KQDsaIndexerScoreDecode::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  const auto& q = inputs[0];
+  const auto& k = inputs[1];
+  return {mx::Shape{q.shape(0), 1, q.shape(2), k.shape(1)}};
+}
+
+bool KQDsaIndexerScoreDecode::is_equivalent(const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQDsaIndexerScoreDecode&>(other);
+  return q_offset_ == o.q_offset_ && ratio_ == o.ratio_;
+}
+
+mx::array dsa_indexer_score_decode(
+    mx::array queries,
+    mx::array keys,
+    mx::array weights,
+    int q_offset,
+    int ratio,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+
+  if (queries.ndim() != 4 || keys.ndim() != 3 || weights.ndim() != 3) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_indexer_score_decode] expected q rank 4, keys "
+        << "rank 3 and weights rank 3, got " << queries.shape() << ", "
+        << keys.shape() << ", " << weights.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  const int B = queries.shape(0);
+  const int H = queries.shape(1);
+  const int QL = queries.shape(2);
+  if (H != 64 || queries.shape(3) != 128) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_indexer_score_decode] expected 64 indexer heads "
+        << "of dim 128, got " << queries.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (QL < 1 || QL > 4) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_indexer_score_decode] qL must be in [1, 4], got "
+        << QL << " (use dsa_indexer_scores for prefill widths).";
+    throw std::invalid_argument(msg.str());
+  }
+  if (keys.shape(0) != B || keys.shape(1) < 1 || keys.shape(2) != 128 ||
+      weights.shape(0) != B || weights.shape(1) != QL ||
+      weights.shape(2) != H) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_indexer_score_decode] incompatible q, keys, "
+        << "weights shapes: " << queries.shape() << ", " << keys.shape() << ", "
+        << weights.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (q_offset < 0 || ratio < 1) {
+    throw std::invalid_argument(
+        "[mlx_kquant.dsa_indexer_score_decode] q_offset must be >= 0 and "
+        "ratio >= 1.");
+  }
+
+  auto final_type =
+      mx::result_type(std::vector<mx::array>{queries, keys, weights});
+  if (final_type != mx::float16 && final_type != mx::bfloat16) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_indexer_score_decode] expected fp16 or bf16 "
+        << "inputs, got " << final_type << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // See dsa_indexer_scores: pre-eval flags are unreliable, contiguous is
+  // a no-op at eval when the input already is.
+  auto q = mx::contiguous(mx::astype(queries, final_type, s), false, s);
+  auto k = mx::contiguous(mx::astype(keys, final_type, s), false, s);
+  auto w = mx::contiguous(mx::astype(weights, final_type, s), false, s);
+
+  mx::Shape out_shape{B, 1, QL, keys.shape(1)};
+  std::vector<mx::array> inputs = {std::move(q), std::move(k), std::move(w)};
+  return mx::array(
+      std::move(out_shape),
+      final_type,
+      std::make_shared<KQDsaIndexerScoreDecode>(s, q_offset, ratio),
+      std::move(inputs));
 }
 
 mx::array dsa_indexer_scores(

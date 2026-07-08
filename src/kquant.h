@@ -295,6 +295,23 @@ mx::array dsa_topk_indices(
     bool causal_valid_prefix = false,
     mx::StreamOrDevice s = {});
 
+// Decode-width lightning-indexer scores, fused: sum_h relu(q_h . k_p) * w_h
+// for qL <= 4 query rows over every pooled row without materializing the
+// [H, P] per-head scores. queries [B, 64, qL, 128], keys [B, P, 128] (the
+// pooled cache, rank 3), weights [B, qL, 64] with any positive global scale
+// folded out (top-k invariant). Pooled visibility follows
+// PoolingCache.make_mask(qL, q_offset): row i is visible to query j iff
+// i < (q_offset + j + 1) / ratio, and every row is visible when qL == 1;
+// invisible rows score the dtype's finite min. Returns [B, 1, qL, P] scores
+// shaped for dsa_topk_indices. Metal-only.
+mx::array dsa_indexer_score_decode(
+    mx::array queries,
+    mx::array keys,
+    mx::array weights,
+    int q_offset,
+    int ratio,
+    mx::StreamOrDevice s = {});
+
 // DeepSeek-V4-Flash indexer activation QAT round-trip, fused: 128-wide
 // Hadamard (mlx hadamard_n butterfly order and 1/sqrt(128) scale, exactly)
 // then the per-32-block FP4-E2M1 round-trip (scale 2^ceil(log2(amax/6)),
@@ -782,6 +799,33 @@ class KQDsaTopKIndices : public mx::Primitive {
   int topk_;
   bool bucketed_;
   bool causal_valid_prefix_;
+};
+
+// DeepSeek-V4-Flash decode-width indexer scores (see
+// dsa_indexer_score_decode). Inference-only, Metal-only.
+class KQDsaIndexerScoreDecode : public mx::Primitive {
+ public:
+  explicit KQDsaIndexerScoreDecode(mx::Stream stream, int q_offset, int ratio)
+      : mx::Primitive(stream), q_offset_(q_offset), ratio_(ratio) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQDsaIndexerScoreDecode";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int q_offset_;
+  int ratio_;
 };
 
 // DeepSeek-V4-Flash fused indexer QAT round-trip (see dsa_indexer_qat).
