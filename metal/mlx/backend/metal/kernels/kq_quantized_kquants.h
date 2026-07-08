@@ -2301,6 +2301,9 @@ struct KqQ6_KBlockLoader {
   threadgroup T* dst;
   const device uint8_t* src;
   short kt;
+  // Unlike q2_k/q3_k, q6_k keeps its decoded-quadrant register cache: it is
+  // only 3-deep (vs their 7) and the two-stream ql/qh nibble decode is heavy
+  // enough that stateless re-decode measured slower (11.86 -> 11.58 TFLOPS).
   struct Caches {
     T q1[n_reads];
     T q2[n_reads];
@@ -3369,16 +3372,6 @@ struct KqQ3_KBlockLoader {
   threadgroup T* dst;
   const device uint8_t* src;
   short kt;
-  struct Caches {
-    T c1[n_reads];
-    T c2[n_reads];
-    T c3[n_reads];
-    T c4[n_reads];
-    T c5[n_reads];
-    T c6[n_reads];
-    T c7[n_reads];
-  };
-  metal::conditional_t<reduction_dim == 1, Caches, kq_empty> cached;
 
   KqQ3_KBlockLoader(
       const device uint8_t* src_,
@@ -3402,88 +3395,9 @@ struct KqQ3_KBlockLoader {
         kt(0) {}
 
   void load_unsafe() {
-    if constexpr (reduction_dim == 1) {
-      if (kt != 0) {
-        if (kt == 1) {
-#pragma unroll
-          for (short i = 0; i < n_reads; i++)
-            dst[i] = cached.c1[i];
-        } else if (kt == 2) {
-#pragma unroll
-          for (short i = 0; i < n_reads; i++)
-            dst[i] = cached.c2[i];
-        } else if (kt == 3) {
-#pragma unroll
-          for (short i = 0; i < n_reads; i++)
-            dst[i] = cached.c3[i];
-        } else if (kt == 4) {
-#pragma unroll
-          for (short i = 0; i < n_reads; i++)
-            dst[i] = cached.c4[i];
-        } else if (kt == 5) {
-#pragma unroll
-          for (short i = 0; i < n_reads; i++)
-            dst[i] = cached.c5[i];
-        } else if (kt == 6) {
-#pragma unroll
-          for (short i = 0; i < n_reads; i++)
-            dst[i] = cached.c6[i];
-        } else {
-#pragma unroll
-          for (short i = 0; i < n_reads; i++)
-            dst[i] = cached.c7[i];
-        }
-        return;
-      }
-
-      const float d = float(*(const device half*)(src + KQ_Q3_K_D_OFFSET));
-      const short scale_off = (bj >= 16) ? 1 : 0;
-      float es[8];
-#pragma unroll
-      for (short k = 0; k < 8; k++) {
-        const uint8_t sc = kq_q3_k_unpack_scale(
-            k * 2 + scale_off, src + KQ_Q3_K_SCALES_OFFSET);
-        es[k] = d * float((int)sc - 32);
-      }
-
-      const device uint8_t* qs_a = src + KQ_Q3_K_QS_OFFSET + bj;
-      const device uint8_t* qs_b = src + KQ_Q3_K_QS_OFFSET + 32 + bj;
-      const device uint8_t* hm = src + KQ_Q3_K_HMASK_OFFSET + bj;
-
-#pragma unroll
-      for (short i = 0; i < n_reads; i++) {
-        const uint8_t qa = qs_a[i];
-        const uint8_t qb = qs_b[i];
-        const uint8_t h = hm[i];
-        const uint8_t q2_0 = qa & 0x03;
-        const uint8_t q2_1 = (qa >> 2) & 0x03;
-        const uint8_t q2_2 = (qa >> 4) & 0x03;
-        const uint8_t q2_3 = (qa >> 6) & 0x03;
-        const uint8_t q2_4 = qb & 0x03;
-        const uint8_t q2_5 = (qb >> 2) & 0x03;
-        const uint8_t q2_6 = (qb >> 4) & 0x03;
-        const uint8_t q2_7 = (qb >> 6) & 0x03;
-        const int q3_0 = (int)q2_0 - (((h >> 0) & 1) ? 0 : 4);
-        const int q3_1 = (int)q2_1 - (((h >> 1) & 1) ? 0 : 4);
-        const int q3_2 = (int)q2_2 - (((h >> 2) & 1) ? 0 : 4);
-        const int q3_3 = (int)q2_3 - (((h >> 3) & 1) ? 0 : 4);
-        const int q3_4 = (int)q2_4 - (((h >> 4) & 1) ? 0 : 4);
-        const int q3_5 = (int)q2_5 - (((h >> 5) & 1) ? 0 : 4);
-        const int q3_6 = (int)q2_6 - (((h >> 6) & 1) ? 0 : 4);
-        const int q3_7 = (int)q2_7 - (((h >> 7) & 1) ? 0 : 4);
-        dst[i] = T(es[0] * float(q3_0));
-        cached.c1[i] = T(es[1] * float(q3_1));
-        cached.c2[i] = T(es[2] * float(q3_2));
-        cached.c3[i] = T(es[3] * float(q3_3));
-        cached.c4[i] = T(es[4] * float(q3_4));
-        cached.c5[i] = T(es[5] * float(q3_5));
-        cached.c6[i] = T(es[6] * float(q3_6));
-        cached.c7[i] = T(es[7] * float(q3_7));
-      }
-      return;
-    }
-
-    const short kt_use = fixed_kt;
+    // Stateless per-k-tile decode: see KqQ2_KBlockLoader. (110-byte blocks
+    // are only 2-aligned, so reads stay byte-wide.)
+    const short kt_use = (reduction_dim == 1) ? kt : fixed_kt;
     const short outer_half = kt_use / 4;
     const short qs_shift = (kt_use & 3) * 2;
     const short hmask_bit = kt_use;
@@ -4290,16 +4204,6 @@ struct KqQ2_KBlockLoader {
   threadgroup T* dst;
   const device uint8_t* src;
   short kt;
-  struct Caches {
-    T c1[n_reads];
-    T c2[n_reads];
-    T c3[n_reads];
-    T c4[n_reads];
-    T c5[n_reads];
-    T c6[n_reads];
-    T c7[n_reads];
-  };
-  metal::conditional_t<reduction_dim == 1, Caches, kq_empty> cached;
 
   KqQ2_KBlockLoader(
       const device uint8_t* src_,
@@ -4323,93 +4227,11 @@ struct KqQ2_KBlockLoader {
         kt(0) {}
 
   void load_unsafe() {
-    if constexpr (reduction_dim == 1) {
-      if (kt != 0) {
-        if (kt == 1) {
-#pragma unroll
-          for (short i = 0; i < n_reads; i++)
-            dst[i] = cached.c1[i];
-        } else if (kt == 2) {
-#pragma unroll
-          for (short i = 0; i < n_reads; i++)
-            dst[i] = cached.c2[i];
-        } else if (kt == 3) {
-#pragma unroll
-          for (short i = 0; i < n_reads; i++)
-            dst[i] = cached.c3[i];
-        } else if (kt == 4) {
-#pragma unroll
-          for (short i = 0; i < n_reads; i++)
-            dst[i] = cached.c4[i];
-        } else if (kt == 5) {
-#pragma unroll
-          for (short i = 0; i < n_reads; i++)
-            dst[i] = cached.c5[i];
-        } else if (kt == 6) {
-#pragma unroll
-          for (short i = 0; i < n_reads; i++)
-            dst[i] = cached.c6[i];
-        } else {
-#pragma unroll
-          for (short i = 0; i < n_reads; i++)
-            dst[i] = cached.c7[i];
-        }
-        return;
-      }
-
-      const float d = float(*(const device half*)(src + KQ_Q2_K_D_OFFSET));
-      const float dmin =
-          float(*(const device half*)(src + KQ_Q2_K_DMIN_OFFSET));
-      const short scale_off = (bj >= 16) ? 1 : 0;
-      float es[8];
-      float em[8];
-#pragma unroll
-      for (short k = 0; k < 8; k++) {
-        const uint8_t sc_byte = src[KQ_Q2_K_SCALES_OFFSET + k * 2 + scale_off];
-        es[k] = d * float(sc_byte & 0x0F);
-        em[k] = dmin * float(sc_byte >> 4);
-      }
-
-      static_assert(
-          n_reads == 8 || n_reads == 16,
-          "Q2_K ALU vector load supports n_reads=8 or 16 (uint).");
-      const device uint8_t* qs_a = src + KQ_Q2_K_QS_OFFSET + bj;
-      const device uint8_t* qs_b = src + KQ_Q2_K_QS_OFFSET + 32 + bj;
-      uint8_t qa_b[n_reads];
-      uint8_t qb_b[n_reads];
-#pragma unroll
-      for (short v = 0; v < n_reads / 4; v++) {
-        const uint qs_a_v = *reinterpret_cast<const device uint*>(qs_a + v * 4);
-        const uint qs_b_v = *reinterpret_cast<const device uint*>(qs_b + v * 4);
-        *reinterpret_cast<thread uint*>(&qa_b[v * 4]) = qs_a_v;
-        *reinterpret_cast<thread uint*>(&qb_b[v * 4]) = qs_b_v;
-      }
-
-#pragma unroll
-      for (short i = 0; i < n_reads; i++) {
-        const uint8_t qa = qa_b[i];
-        const uint8_t qb = qb_b[i];
-        const uint8_t q2_0 = qa & 0x03;
-        const uint8_t q2_1 = (qa >> 2) & 0x03;
-        const uint8_t q2_2 = (qa >> 4) & 0x03;
-        const uint8_t q2_3 = (qa >> 6) & 0x03;
-        const uint8_t q2_4 = qb & 0x03;
-        const uint8_t q2_5 = (qb >> 2) & 0x03;
-        const uint8_t q2_6 = (qb >> 4) & 0x03;
-        const uint8_t q2_7 = (qb >> 6) & 0x03;
-        dst[i] = T(es[0] * float(q2_0) - em[0]);
-        cached.c1[i] = T(es[1] * float(q2_1) - em[1]);
-        cached.c2[i] = T(es[2] * float(q2_2) - em[2]);
-        cached.c3[i] = T(es[3] * float(q2_3) - em[3]);
-        cached.c4[i] = T(es[4] * float(q2_4) - em[4]);
-        cached.c5[i] = T(es[5] * float(q2_5) - em[5]);
-        cached.c6[i] = T(es[6] * float(q2_6) - em[6]);
-        cached.c7[i] = T(es[7] * float(q2_7) - em[7]);
-      }
-      return;
-    }
-
-    const short kt_use = fixed_kt;
+    // Stateless per-k-tile decode (mirrors the iq2_xxs loader): the 84-byte
+    // superblock stays L1-hot across its 8 k-tiles, and skipping a decoded
+    // register cache keeps per-thread register pressure low enough for full
+    // occupancy alongside the MMA accumulators.
+    const short kt_use = (reduction_dim == 1) ? kt : fixed_kt;
     const short outer_half = kt_use / 4;
     const short qs_shift = (kt_use & 3) * 2;
     const short scale_idx = kt_use * 2 + (bj >= 16 ? 1 : 0);
@@ -4422,10 +4244,22 @@ struct KqQ2_KBlockLoader {
 
     const device uint8_t* qs = src + KQ_Q2_K_QS_OFFSET + outer_half * 32 + bj;
 
+    if constexpr (n_reads % 4 == 0) {
+      uint8_t qb[n_reads];
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const uint8_t q2 = (qs[i] >> qs_shift) & 0x03;
-      dst[i] = T(eff_scale * float(q2) - eff_min);
+      for (short v = 0; v < n_reads / 4; v++) {
+        *reinterpret_cast<thread uint*>(&qb[v * 4]) =
+            *reinterpret_cast<const device uint*>(qs + v * 4);
+      }
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(eff_scale * float((qb[i] >> qs_shift) & 0x03) - eff_min);
+      }
+    } else {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(eff_scale * float((qs[i] >> qs_shift) & 0x03) - eff_min);
+      }
     }
   }
 
