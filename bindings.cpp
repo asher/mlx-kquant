@@ -481,6 +481,31 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "dsa_kv_qat",
+      &mlx_kquant::dsa_kv_qat,
+      "x"_a,
+      "n_rot"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        DeepSeek-V4-Flash main-attention KV QAT round-trip, fused: the
+        per-64-block FP8-E4M3FN round-trip (scale 2^ceil(log2(amax/448))
+        with a 1e-4 amax floor, clamp to +-448, ties-to-even) on the
+        leading D - n_rot dims, the trailing n_rot RoPE dims fp8-exempt,
+        then the whole row rounded through fp16 (the f16 KV-cache step).
+        One kernel in place of the split + fp8-core + concat + astype
+        chain, bit-identically.
+
+        Args:
+            x (array): any shape with trailing dim D,
+                (D - n_rot) % 64 == 0; float16/bfloat16/float32.
+            n_rot (int): trailing RoPE dims excluded from the fp8 step.
+
+        Returns:
+            array: same shape and dtype as ``x``.
+      )");
+
+  m.def(
       "moe_glu_gather_kq",
       &mlx_kquant::moe_glu_gather_kq,
       "x"_a,

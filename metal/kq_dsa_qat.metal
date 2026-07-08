@@ -10,3 +10,12 @@ instantiate_kq_dsa_indexer_qat(float16_t, half);
 instantiate_kq_dsa_indexer_qat(bfloat16_t, bfloat16_t);
 instantiate_kq_dsa_indexer_qat(float, float);
 // clang-format on
+
+// clang-format off
+#define instantiate_kq_dsa_kv_qat(tname, dtype)                         \
+  instantiate_kernel("kq_dsa_kv_qat_" #tname, kq_dsa_kv_qat, dtype)
+
+instantiate_kq_dsa_kv_qat(float16_t, half);
+instantiate_kq_dsa_kv_qat(bfloat16_t, bfloat16_t);
+instantiate_kq_dsa_kv_qat(float, float);
+// clang-format on

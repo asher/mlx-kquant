@@ -143,3 +143,63 @@ template <typename T>
     }
   }
 }
+
+// Main-attention KV row QAT round-trip fused into one kernel (ds4.c
+// dsv4_fp8_kv_quantize_row + f16_round): per-64-block FP8-E4M3FN
+// round-trip on the leading D - NROT dims (scale = 2^ceil(log2(amax/448))
+// with a 1e-4 amax floor, clamp to +-448, nearest-even mantissa rounding
+// with the 2^-9 subnormal step floor, rescale), the trailing NROT RoPE
+// dims untouched by fp8, then every output re-rounded through fp16 (the
+// f16 KV-cache step). Bit-compatible with the split + _fp8_block_core +
+// concat + astype graph it replaces: the fp8 result rounds through T
+// before the fp16 round (the graph's per-slice astype), log2 is
+// metal::precise::log2 (mlx's Log2 op), and ldexp(1, e) equals the exact
+// power-of-two table for every reachable e. One threadgroup of 256
+// threads per row: one simdgroup per 64-block (lane owns elements
+// 64b + lane and 64b + 32 + lane), lanes re-derive the block scale from
+// the simd_max broadcast.
+template <typename T>
+[[kernel, max_total_threads_per_threadgroup(256)]] void kq_dsa_kv_qat(
+    const device T* X [[buffer(0)]],
+    device T* O [[buffer(1)]],
+    const constant int& D [[buffer(2)]],
+    const constant int& NROT [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int NSG = 8; // 256 / 32
+  const device T* x_row = X + size_t(tgid) * D;
+  device T* o_row = O + size_t(tgid) * D;
+
+  const int nblk = (D - NROT) / 64;
+  for (int b = int(simd_gid); b < nblk; b += NSG) {
+    float v[2];
+    float local = 0.0f;
+    STEEL_PRAGMA_UNROLL
+    for (int j = 0; j < 2; j++) {
+      v[j] = float(x_row[64 * b + 32 * j + int(simd_lid)]);
+      local = metal::max(local, metal::fabs(v[j]));
+    }
+    const float amax = metal::max(simd_max(local), 1e-4f);
+    const float scale = metal::ldexp(
+        1.0f, int(metal::ceil(metal::precise::log2(amax / 448.0f))));
+    STEEL_PRAGMA_UNROLL
+    for (int j = 0; j < 2; j++) {
+      const float c = metal::clamp(v[j] / scale, -448.0f, 448.0f);
+      const float a = metal::fabs(c);
+      const float sgn = c > 0.0f ? 1.0f : (c < 0.0f ? -1.0f : 0.0f);
+      // _e4m3_round: e = clip(floor(log2(max(a, 2^-9))), -6, 8), step
+      // q = 2^(e-3), rint ties to even mantissa.
+      float e = metal::floor(metal::precise::log2(metal::max(a, 0.001953125f)));
+      e = metal::clamp(e, -6.0f, 8.0f);
+      const float q = metal::ldexp(1.0f, int(e) - 3);
+      const float r = sgn * metal::rint(a / q) * q * scale;
+      o_row[64 * b + 32 * j + int(simd_lid)] = T(half(float(T(r))));
+    }
+  }
+  for (int i = int(lid); i < NROT; i += 256) {
+    const int e = (D - NROT) + i;
+    o_row[e] = T(half(float(x_row[e])));
+  }
+}

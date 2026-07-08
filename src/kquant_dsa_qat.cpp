@@ -56,6 +56,35 @@ void KQDsaIndexerQat::eval_gpu(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+void KQDsaKvQat::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+
+  const auto& x = inputs[0];
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  const int D = x.shape(-1);
+  const int rows = int(x.size() / D);
+  const int n_rot = n_rot_;
+
+  const std::string kname = "kq_dsa_kv_qat_" + kq_type_string(x.dtype());
+  auto kernel = kq_get_kernel(d, kname, kname, {});
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+
+  ce.set_input_array(x, 0);
+  ce.set_output_array(out, 1);
+  ce.set_bytes(D, 2);
+  ce.set_bytes(n_rot, 3);
+
+  MTL::Size group_dims(256, 1, 1);
+  MTL::Size grid_dims(rows, 1, 1);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 #else // !_METAL_
 
 void KQDsaIndexerQat::eval_gpu(
@@ -63,6 +92,12 @@ void KQDsaIndexerQat::eval_gpu(
     std::vector<mx::array>&) {
   throw std::runtime_error(
       "[mlx_kquant.dsa_indexer_qat] requires a Metal build.");
+}
+
+void KQDsaKvQat::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error("[mlx_kquant.dsa_kv_qat] requires a Metal build.");
 }
 
 #endif
@@ -81,6 +116,55 @@ std::vector<mx::Shape> KQDsaIndexerQat::output_shapes(
 
 bool KQDsaIndexerQat::is_equivalent(const mx::Primitive&) const {
   return true;
+}
+
+void KQDsaKvQat::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.dsa_kv_qat] has no CPU implementation.");
+}
+
+std::vector<mx::Shape> KQDsaKvQat::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  return {inputs[0].shape()};
+}
+
+bool KQDsaKvQat::is_equivalent(const mx::Primitive& other) const {
+  return n_rot_ == static_cast<const KQDsaKvQat&>(other).n_rot_;
+}
+
+mx::array dsa_kv_qat(mx::array x, int n_rot, mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+
+  if (x.ndim() < 1) {
+    throw std::invalid_argument(
+        "[mlx_kquant.dsa_kv_qat] x must have rank >= 1.");
+  }
+  const int D = x.shape(-1);
+  if (n_rot < 0 || n_rot > D || (D - n_rot) % 64 != 0 || D == n_rot) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_kv_qat] needs 0 <= n_rot < D and "
+        << "(D - n_rot) % 64 == 0 (64-wide fp8 blocks), got D = " << D
+        << ", n_rot = " << n_rot << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (x.dtype() != mx::float16 && x.dtype() != mx::bfloat16 &&
+      x.dtype() != mx::float32) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_kv_qat] expected fp16/bf16/fp32 input, got "
+        << x.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto xc = mx::contiguous(x, false, s);
+  auto out_shape = xc.shape();
+  std::vector<mx::array> inputs = {std::move(xc)};
+  return mx::array(
+      std::move(out_shape),
+      x.dtype(),
+      std::make_shared<KQDsaKvQat>(s, n_rot),
+      std::move(inputs));
 }
 
 mx::array dsa_indexer_qat(mx::array x, mx::StreamOrDevice s_) {

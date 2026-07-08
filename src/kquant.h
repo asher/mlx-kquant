@@ -321,6 +321,15 @@ mx::array dsa_indexer_score_decode(
 // Metal-only.
 mx::array dsa_indexer_qat(mx::array x, mx::StreamOrDevice s = {});
 
+// DeepSeek-V4-Flash main-attention KV QAT round-trip in one dispatch:
+// per-64-block FP8-E4M3FN round-trip (scale 2^ceil(log2(amax/448)), amax
+// floor 1e-4, clamp +-448, ties-to-even) on the leading dims, the trailing
+// n_rot RoPE dims fp8-exempt, then the whole row rounded through fp16 (the
+// f16 KV-cache step). x is any shape with trailing dim D where
+// (D - n_rot) % 64 == 0; returns the same shape and dtype. Bit-compatible
+// with the split + fp8-core + concat + astype chain. Metal-only.
+mx::array dsa_kv_qat(mx::array x, int n_rot, mx::StreamOrDevice s = {});
+
 // K-quant gathered matvec (down projection), same wire layout. x [T, R, K]
 // (one row per expert slot), indices [T, R]. Returns [T, R, N]. Metal-only.
 mx::array gather_qmv_kq(
@@ -857,6 +866,32 @@ class KQDsaIndexerQat : public mx::Primitive {
     return "KQDsaIndexerQat";
   }
   bool is_equivalent(const mx::Primitive& other) const override;
+};
+
+// DeepSeek-V4-Flash fused main-attention KV QAT round-trip (see
+// dsa_kv_qat). Inference-only, Metal-only.
+class KQDsaKvQat : public mx::Primitive {
+ public:
+  explicit KQDsaKvQat(mx::Stream stream, int n_rot)
+      : mx::Primitive(stream), n_rot_(n_rot) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQDsaKvQat";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int n_rot_;
 };
 
 // K-quant fused MoE GLU gather (see moe_glu_gather_kq). Inference-only.
