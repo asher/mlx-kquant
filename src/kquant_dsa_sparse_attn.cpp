@@ -6,6 +6,7 @@
 // gated those out only because it lacked a decode-time indexer. K == V (the
 // V4 shared latent). Inference-only (no CPU eval).
 // omlx is Apache-2.0: see mlx_kquant/licenses/omlx-LICENSE.
+#include <algorithm>
 #include <cstdint>
 #include <sstream>
 #include <stdexcept>
@@ -106,10 +107,74 @@ void KQDsaSparseAttention::eval_gpu(
   const std::string bk_tag = bk_env
       ? ((std::string(bk_env) == "128") ? "bk128" : "bk256")
       : ((topkN <= 128) ? "bk128" : "bk256");
-  const std::string kname = "kq_dsa_sparse_attention_" +
-      kq_type_string(q.dtype()) + "_" + bk_tag + "_dc32_h64_d512_wm8";
-  auto kernel = kq_get_kernel(d, kname);
+  const std::string ts = kq_type_string(q.dtype());
   auto& ce = mx::metal::get_command_encoder(s);
+
+  // Small grids leave most of the GPU idle (decode is one threadgroup per
+  // (query, batch)), so route them to the split-KV variant: key tiles fan
+  // out over n_splits threadgroups writing unnormalized fp32 partials, and
+  // a merge kernel renormalizes across splits with the sinks seeding the
+  // denominator once. The split route always takes the 128-wide tile: each
+  // threadgroup handles about one tile, so the wide tile's fewer-rescales
+  // advantage does not apply and the finer tile fans out further.
+  // KQ_DSA_SPLIT=0/1 forces the route for testing; the qL cap also bounds
+  // the transient partials allocation.
+  const std::string split_bk_tag = bk_env ? bk_tag : "bk128";
+  const int BK = (split_bk_tag == "bk128") ? 128 : 256;
+  const int local_tiles = (std::min(local_window_, localL) + BK - 1) / BK;
+  const int pooled_tiles = (topkN + BK - 1) / BK;
+  const int total_tiles = local_tiles + pooled_tiles;
+  const char* split_env = std::getenv("KQ_DSA_SPLIT");
+  const bool split_forced_on = split_env && std::string(split_env) == "1";
+  const bool split_forced_off = split_env && std::string(split_env) == "0";
+  const bool use_split = qL <= 4 &&
+      (split_forced_on ||
+       (!split_forced_off && B * qL <= 8 && total_tiles >= 2));
+
+  if (use_split) {
+    const int n_splits = std::max(1, std::min(total_tiles, 32));
+    mx::array oacc({B, qL, n_splits, H, 512}, mx::float32, nullptr, {});
+    mx::array ms({B, qL, n_splits, H}, mx::float32, nullptr, {});
+    mx::array ls({B, qL, n_splits, H}, mx::float32, nullptr, {});
+    oacc.set_data(mx::allocator::malloc(oacc.nbytes()));
+    ms.set_data(mx::allocator::malloc(ms.nbytes()));
+    ls.set_data(mx::allocator::malloc(ls.nbytes()));
+    ce.add_temporary(oacc);
+    ce.add_temporary(ms);
+    ce.add_temporary(ls);
+
+    const std::string split_kname = "kq_dsa_sparse_attention_split_" + ts +
+        "_" + split_bk_tag + "_dc32_h64_d512_wm8";
+    auto split_kernel = kq_get_kernel(d, split_kname);
+    ce.set_compute_pipeline_state(split_kernel);
+    ce.set_input_array(q, 0);
+    ce.set_input_array(local_kv, 1);
+    ce.set_input_array(pooled, 2);
+    ce.set_input_array(topk, 3);
+    ce.set_output_array(oacc, 4);
+    ce.set_output_array(ms, 5);
+    ce.set_output_array(ls, 6);
+    ce.set_bytes(params, 7);
+    ce.dispatch_threadgroups(MTL::Size(n_splits, qL, B), MTL::Size(32, 8, 1));
+
+    const std::string merge_kname =
+        "kq_dsa_sparse_attention_merge_" + ts + "_d512";
+    auto merge_kernel = kq_get_kernel(d, merge_kname);
+    ce.set_compute_pipeline_state(merge_kernel);
+    ce.set_input_array(oacc, 0);
+    ce.set_input_array(ms, 1);
+    ce.set_input_array(ls, 2);
+    ce.set_input_array(sinks, 3);
+    ce.set_output_array(o, 4);
+    ce.set_bytes(params, 5);
+    ce.set_bytes(n_splits, 6);
+    ce.dispatch_threadgroups(MTL::Size(H, qL, B), MTL::Size(32, 1, 1));
+    return;
+  }
+
+  const std::string kname =
+      "kq_dsa_sparse_attention_" + ts + "_" + bk_tag + "_dc32_h64_d512_wm8";
+  auto kernel = kq_get_kernel(d, kname);
   ce.set_compute_pipeline_state(kernel);
   ce.set_input_array(q, 0);
   ce.set_input_array(local_kv, 1);

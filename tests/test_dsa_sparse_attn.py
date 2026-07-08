@@ -73,7 +73,7 @@ def _rel(got, ref):
     return float(np.linalg.norm(g - ref) / (np.linalg.norm(ref) + 1e-6))
 
 
-def _case(qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed, mode="random"):
+def _build(qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed, mode):
     rng = np.random.default_rng(seed)
     B = 1
     q = mx.array(rng.standard_normal((B, H, qL, D)) * 0.3).astype(dtype)
@@ -106,7 +106,13 @@ def _case(qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed, mode="ran
         )[:, None]
     topk = mx.array(tk)
     scale = D**-0.5
+    return q, local_kv, pooled, topk, sinks, scale
 
+
+def _case(qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed, mode="random"):
+    q, local_kv, pooled, topk, sinks, scale = _build(
+        qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed, mode
+    )
     got = kq.dsa_sparse_attention(
         q, local_kv, pooled, topk, sinks, scale, q_offset, ratio, window
     )
@@ -154,6 +160,49 @@ def test_dsa_sparse_attention(case, dtype):
         mode=mode,
     )
     assert rel < REL_BOUND[dtype], f"{name} {dtype}: rel {rel:.3e}"
+
+
+SPLIT_CASES = [
+    # (name, qL, localL, P, topk_n, q_offset, ratio, window, mode)
+    ("decode_3tiles", 1, 128, 640, 512, 2560, 4, 128, "random"),
+    ("verify_qL3", 3, 128, 640, 512, 2558, 4, 128, "random"),
+    ("clamped", 1, 128, 640, 512, 1024, 4, 128, "random"),
+    ("min_tiles", 1, 40, 300, 100, 1199, 4, 128, "random"),
+    # Dead pooled tile: one split writes an empty (m = finite_min, l = 0)
+    # partial that must merge at zero weight.
+    ("dead_pooled_split", 1, 128, 1, 1, 2048, 1 << 30, 128, "dummy"),
+]
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("case", SPLIT_CASES, ids=[c[0] for c in SPLIT_CASES])
+def test_dsa_sparse_attention_split_matches_base(case, dtype, monkeypatch):
+    """Forced split-KV route vs forced single-dispatch route on one input set.
+
+    Both accumulate in fp32; the split path only reorders the online-softmax
+    combination across key tiles, so the cross-route difference must sit well
+    under the reference tolerance.
+    """
+    name, qL, localL, P, topk_n, q_offset, ratio, window, mode = case
+    q, local_kv, pooled, topk, sinks, scale = _build(
+        qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed=11, mode=mode
+    )
+    outs = {}
+    for force in ("0", "1"):
+        monkeypatch.setenv("KQ_DSA_SPLIT", force)
+        got = kq.dsa_sparse_attention(
+            q, local_kv, pooled, topk, sinks, scale, q_offset, ratio, window
+        )
+        mx.eval(got)
+        outs[force] = np.array(got.astype(mx.float32))
+    ref = _ref(q, local_kv, pooled, topk, sinks, scale, q_offset, ratio, window)
+    for force in ("0", "1"):
+        rel = float(np.linalg.norm(outs[force] - ref) / (np.linalg.norm(ref) + 1e-6))
+        assert rel < REL_BOUND[dtype], f"{name} force={force}: rel {rel:.3e}"
+    cross = float(
+        np.linalg.norm(outs["1"] - outs["0"]) / (np.linalg.norm(outs["0"]) + 1e-6)
+    )
+    assert cross < 1e-3, f"{name}: split-vs-base rel {cross:.3e}"
 
 
 def test_dsa_sparse_attention_rejects_bad_shapes():
