@@ -12,6 +12,9 @@ Arms:
   gpu-packed        mx.gather_qmm(mode=<codec>) on the MLX packed layout
   gpu-packed-fused  kq.moe_glu_gather / kq.gather_qmv_bias (decode, mxfp4)
   gpu-wire          kq.gather_qmm(<codec>) on GGUF wire bytes
+  gpu-wire-fused    kq.moe_glu_gather_kq / kq.gather_qmv_kq on wire bytes
+                    (-bias rows: swiglu_clamp + expert biases, the gpt-oss
+                    decode unit; needs a kq build with codec_has_moe_glu)
   cpu-wire          kq.gather_qmm(<codec>) under mx.stream(mx.cpu)
   gpu-wire-q4_k     same-geometry k-quant wire reference
 
@@ -193,6 +196,7 @@ def bench_shape(tag, codec, e, n_gateup, k, topk, ref_codec):
     wire_cpu = codec_supported(codec, "cpu")
     if not (wire_gpu and wire_cpu):
         print(f"  [skip] wire arms: {codec!r} gpu={wire_gpu} cpu={wire_cpu}")
+    wire_fused = wire_gpu and getattr(kq, "codec_has_moe_glu", lambda c: False)(codec)
 
     gu_bytes_wire = 2 * n_gateup * wire_bytes_per_row(codec, k)
     gu_bytes_packed = 2 * n_gateup * (k // 8 * 4 + k // gs)
@@ -249,6 +253,38 @@ def bench_shape(tag, codec, e, n_gateup, k, topk, ref_codec):
                 "gpu-packed-fused gate+up",
                 timed(fused_gateup, DECODE_REPS),
                 rows * gu_bytes_packed,
+            )
+        if wire_fused:
+
+            def wf_gateup(x2d=x2d, ids=ids):
+                return kq.moe_glu_gather_kq(
+                    x2d, arms["gate"]["wire"], arms["up"]["wire"], codec, ids
+                )
+
+            report(
+                "gpu-wire-fused gate+up",
+                timed(wf_gateup, DECODE_REPS),
+                rows * gu_bytes_wire,
+            )
+
+            def wf_gateup_bias(x2d=x2d, ids=ids):
+                return kq.moe_glu_gather_kq(
+                    x2d,
+                    arms["gate"]["wire"],
+                    arms["up"]["wire"],
+                    codec,
+                    ids,
+                    act="swiglu_clamp",
+                    limit=7.0,
+                    gate_bias=arms["gate"]["bias"],
+                    up_bias=arms["up"]["bias"],
+                    alpha=1.702,
+                )
+
+            report(
+                "gpu-wire-fused-bias gate+up",
+                timed(wf_gateup_bias, DECODE_REPS),
+                rows * gu_bytes_wire,
             )
         if wire_gpu or wire_cpu:
 
@@ -339,6 +375,31 @@ def bench_shape(tag, codec, e, n_gateup, k, topk, ref_codec):
                 "gpu-packed-fused down",
                 timed(fused_down, DECODE_REPS),
                 rows * down_bytes_packed,
+            )
+        if wire_fused:
+
+            def wf_down(xqv=xqv, ids=ids):
+                return kq.gather_qmv_kq(xqv, arms["down"]["wire"], codec, ids)
+
+            report(
+                "gpu-wire-fused down",
+                timed(wf_down, DECODE_REPS),
+                rows * down_bytes_wire,
+            )
+
+            def wf_down_bias(xqv=xqv, ids=ids):
+                return kq.gather_qmv_kq(
+                    xqv,
+                    arms["down"]["wire"],
+                    codec,
+                    ids,
+                    bias=arms["down"]["bias"],
+                )
+
+            report(
+                "gpu-wire-fused-bias down",
+                timed(wf_down_bias, DECODE_REPS),
+                rows * down_bytes_wire,
             )
         if wire_gpu or wire_cpu:
 

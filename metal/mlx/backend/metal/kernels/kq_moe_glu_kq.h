@@ -901,13 +901,21 @@ template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
 
   KQ_EXT_STAGE_LUTS(Codec, kq_luts)
   const int64_t row = (int64_t)expert * N + out_row;
+  // Bias loads issued before the dot-product loop so their DRAM latency
+  // hides behind it instead of stalling the epilogue store.
+  float gbv = 0.0f;
+  float ubv = 0.0f;
+  if (tx == 0) {
+    gbv = gb[row];
+    ubv = ub[row];
+  }
   const float2 gu =
       kq_ext_glu_row_partial<T, Codec, NX>(gw, uw, x, row, K, tx, kq_luts);
   const float g = kq_ext_reduce<NX>(gu.x);
   const float u = kq_ext_reduce<NX>(gu.y);
   if (tx == 0) {
-    out[out_row] = static_cast<T>(
-        kq_glu_epilogue<ACT>(g + gb[row], u + ub[row], limit, alpha));
+    out[out_row] =
+        static_cast<T>(kq_glu_epilogue<ACT>(g + gbv, u + ubv, limit, alpha));
   }
 }
 
@@ -937,10 +945,14 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
 
   KQ_EXT_STAGE_LUTS(Codec, kq_luts)
   const int64_t row = (int64_t)expert * N + out_row;
+  float bv = 0.0f;
+  if (tx == 0) {
+    bv = b[row];
+  }
   const float r = kq_ext_reduce<NX>(
       kq_ext_row_partial<T, Codec, NX>(w, x, row, K, tx, kq_luts));
   if (tx == 0) {
-    out[out_row] = static_cast<T>(r + b[row]);
+    out[out_row] = static_cast<T>(r + bv);
   }
 }
 
