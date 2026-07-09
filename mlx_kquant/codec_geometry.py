@@ -38,12 +38,17 @@ CODEC_GEOMETRY: dict[str, tuple[int, int, int, int]] = {
     # has no super-block d (reconstructed from scattered scale nibbles).
     "iq1_s": (256, 1, 50, 256),
     "iq1_m": (256, 1, 56, 256),
+    # Native-fp codecs (OCP micro-scaling floats): mxfp4 is one e8m0 scale per
+    # 32 E2M1 values; nvfp4 packs four 16-value ue4m3-scaled groups per
+    # 64-weight block, so group_size (16) != weights_per_block (64).
+    "mxfp4": (32, 4, 17, 32),
+    "nvfp4": (16, 4, 36, 64),
 }
 
-# Codecs that load but cannot be produced by kq.quantize. Empty: every codec --
-# all five K-quant superblocks, the five legacy block codecs, and all nine IQ
-# codecs -- now has a CPU (IQ) or CPU/Metal (K-quant) encoder.
-DECODE_ONLY_CODECS: frozenset[str] = frozenset()
+# Codecs that load but cannot be produced by kq.quantize: the native-fp
+# codecs are decode-only wire codecs (every K-quant/legacy/IQ codec has a
+# CPU or CPU/Metal encoder).
+DECODE_ONLY_CODECS: frozenset[str] = frozenset({"mxfp4", "nvfp4"})
 
 # Every codec the ``kq.quantize`` encoder can produce: the ten K-quant/legacy
 # codecs on CPU or Metal (the four legacy block codecs + q8_0 ignore an imatrix).

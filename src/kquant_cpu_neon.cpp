@@ -10,9 +10,11 @@
 
 #ifdef KQ_CPU_NEON_TU
 
+#include <array>
 #include <cstdlib>
 #include <cstring>
 
+#include "kquant_fp_tables.h"
 #include "kquant_iq_tables.h"
 
 #if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
@@ -840,6 +842,100 @@ float vec_dot_iq4_nl(const uint8_t* w, const void* act, int nb) {
   return vaddvq_f32(vaddq_f32(sumv0, sumv1));
 }
 
+// mxfp4 block: e8m0 scale @0, qs u4x2[16] @1 -> doubled-E2M1 LUT (the
+// compensating half is folded into kq_e8m0_half). q8_0 activation.
+float vec_dot_mxfp4(const uint8_t* w, const void* act, int nb) {
+  const ActQ80* y = static_cast<const ActQ80*>(act);
+  const int8x16_t values = vld1q_s8(kvalues_mxfp4);
+  const uint8x16_t m4b = vdupq_n_u8(0xf);
+  const int32x4_t mzero = vdupq_n_s32(0);
+  float32x4_t sumv0 = vdupq_n_f32(0.0f);
+  float32x4_t sumv1 = vdupq_n_f32(0.0f);
+  int i = 0;
+  for (; i + 1 < nb; i += 2) {
+    const uint8_t* xb0 = w + static_cast<std::size_t>(i) * 17;
+    const uint8_t* xb1 = xb0 + 17;
+    const uint8x16_t q0 = vld1q_u8(xb0 + 1);
+    const uint8x16_t q1 = vld1q_u8(xb1 + 1);
+    const int8x16_t v0l = vqtbl1q_s8(values, vandq_u8(q0, m4b));
+    const int8x16_t v0h = vqtbl1q_s8(values, vshrq_n_u8(q0, 4));
+    const int8x16_t v1l = vqtbl1q_s8(values, vandq_u8(q1, m4b));
+    const int8x16_t v1h = vqtbl1q_s8(values, vshrq_n_u8(q1, 4));
+    const int32x4_t p0 = vdotq_s32(
+        vdotq_s32(mzero, v0l, vld1q_s8(y[i].qs)), v0h, vld1q_s8(y[i].qs + 16));
+    const int32x4_t p1 = vdotq_s32(
+        vdotq_s32(mzero, v1l, vld1q_s8(y[i + 1].qs)),
+        v1h,
+        vld1q_s8(y[i + 1].qs + 16));
+    sumv0 =
+        vmlaq_n_f32(sumv0, vcvtq_f32_s32(p0), kq_e8m0_half(xb0[0]) * y[i].d);
+    sumv1 = vmlaq_n_f32(
+        sumv1, vcvtq_f32_s32(p1), kq_e8m0_half(xb1[0]) * y[i + 1].d);
+  }
+  for (; i < nb; ++i) {
+    const uint8_t* xb = w + static_cast<std::size_t>(i) * 17;
+    const uint8x16_t q = vld1q_u8(xb + 1);
+    const int8x16_t vl = vqtbl1q_s8(values, vandq_u8(q, m4b));
+    const int8x16_t vh = vqtbl1q_s8(values, vshrq_n_u8(q, 4));
+    const int32x4_t p = vdotq_s32(
+        vdotq_s32(mzero, vl, vld1q_s8(y[i].qs)), vh, vld1q_s8(y[i].qs + 16));
+    sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p), kq_e8m0_half(xb[0]) * y[i].d);
+  }
+  return vaddvq_f32(vaddq_f32(sumv0, sumv1));
+}
+
+// 256-entry kq_ue4m3_half table so the nvfp4 hot loop avoids the branchy
+// decode (4 scale lookups per 64 weights).
+const float* ue4m3_half_lut() {
+  static const std::array<float, 256> t = [] {
+    std::array<float, 256> a{};
+    for (int i = 0; i < 256; ++i) {
+      a[i] = kq_ue4m3_half(static_cast<uint8_t>(i));
+    }
+    return a;
+  }();
+  return t.data();
+}
+
+// nvfp4 block: 4 ue4m3 group scales @0, qs u4x2[32] @4 = four 16-value
+// groups, two-halves nibble split within each group. One 36-byte codec block
+// spans two ActQ80 blocks (act_block_bytes = 2 * sizeof(ActQ80)); per-group
+// scales keep each group's integer dot separate.
+float vec_dot_nvfp4(const uint8_t* w, const void* act, int nb) {
+  const ActQ80* y = static_cast<const ActQ80*>(act);
+  const float* lut = ue4m3_half_lut();
+  const int8x16_t values = vld1q_s8(kvalues_mxfp4);
+  const uint8x16_t m4b = vdupq_n_u8(0xf);
+  const int32x4_t mzero = vdupq_n_s32(0);
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    const uint8_t* xb = w + static_cast<std::size_t>(i) * 36;
+    for (int h = 0; h < 2; ++h) { // groups 2h, 2h+1 pair with act block 2i+h
+      const ActQ80& yb = y[2 * i + h];
+      const uint8x16_t q = vld1q_u8(xb + 4 + 16 * h);
+      const int8x16_t vl = vqtbl1q_s8(values, vandq_u8(q, m4b));
+      const int8x16_t vh = vqtbl1q_s8(values, vshrq_n_u8(q, 4));
+      const int8x16_t a0 = vld1q_s8(yb.qs);
+      const int8x16_t a1 = vld1q_s8(yb.qs + 16);
+      // vl lanes: group 2h values 0-7, group 2h+1 values 0-7; vh likewise
+      // values 8-15. Regroup act lanes to match, so vdot lanes 0-1 sum group
+      // 2h and lanes 2-3 group 2h+1.
+      const int8x16_t alo = vcombine_s8(vget_low_s8(a0), vget_low_s8(a1));
+      const int8x16_t ahi = vcombine_s8(vget_high_s8(a0), vget_high_s8(a1));
+      const int32x4_t p =
+          vaddq_s32(vdotq_s32(mzero, vl, alo), vdotq_s32(mzero, vh, ahi));
+      const float s0 = lut[xb[2 * h]];
+      const float s1 = lut[xb[2 * h + 1]];
+      sumf += yb.d *
+          (s0 *
+               static_cast<float>(vgetq_lane_s32(p, 0) + vgetq_lane_s32(p, 1)) +
+           s1 *
+               static_cast<float>(vgetq_lane_s32(p, 2) + vgetq_lane_s32(p, 3)));
+    }
+  }
+  return sumf;
+}
+
 // iq4_xs block: d f16 @0, scales_h u16 @2, scales_l[4] @4, qs[128] @8. Signed
 // 6-bit per-32 scale (ls - 32), kvalues LUT, no min.
 float vec_dot_iq4_xs(const uint8_t* w, const void* act, int nb) {
@@ -1417,6 +1513,14 @@ constexpr KQNeonKernel kKernelIQ1M = {
     &vec_dot_iq1_m,
     sizeof(ActQ8K),
     &quantize_act_row_q8k};
+constexpr KQNeonKernel kKernelMXFP4 = {
+    &vec_dot_mxfp4,
+    sizeof(ActQ80),
+    &quantize_act_row_q80};
+constexpr KQNeonKernel kKernelNVFP4 = {
+    &vec_dot_nvfp4,
+    2 * sizeof(ActQ80), // one 64-weight codec block = two ActQ80 blocks
+    &quantize_act_row_q80};
 
 bool cpu_has_dotprod() {
 #if defined(__APPLE__)
@@ -1479,6 +1583,10 @@ const KQNeonKernel* kq_neon_kernel(const std::string& codec) {
     return &kKernelIQ1S;
   } else if (codec == "iq1_m") {
     return &kKernelIQ1M;
+  } else if (codec == "mxfp4") {
+    return &kKernelMXFP4;
+  } else if (codec == "nvfp4") {
+    return &kKernelNVFP4;
   }
   return nullptr;
 }

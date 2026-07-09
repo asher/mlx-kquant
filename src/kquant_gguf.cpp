@@ -204,6 +204,13 @@ const KQuantCodec* gguf_type_to_kquant_codec(uint32_t t) {
       return codec_by_name("iq1_s");
     case GGUF_TYPE_IQ1_M:
       return codec_by_name("iq1_m");
+    // GGML type numbers (ggml.h): MXFP4=39, NVFP4=40. Literals so this
+    // compiles against a gguflib whose enum predates them (an unpatched
+    // parser would have already stopped at the tensor anyway).
+    case 39:
+      return codec_by_name("mxfp4");
+    case 40:
+      return codec_by_name("nvfp4");
     default:
       return nullptr;
   }
@@ -290,12 +297,11 @@ mx::array make_direct_array(
   throw std::runtime_error("[load_gguf] unhandled direct dtype");
 }
 
-// Load one block-quantized tensor (K-quant or a native-fp codec) as uint8 wire
-// bytes (MLX order, byte-packed last dim) + a 1-byte scales placeholder. The
-// block geometry is passed explicitly so the same path serves both the 10
-// K-quant codecs (codec geometry) and the float codecs MXFP4/NVFP4 (which the
-// extension reads as raw wire bytes and a Python loader repacks into MLX's
-// native packed-uint32 + split-scales layout).
+// Load one block-quantized tensor as uint8 wire bytes (MLX order, byte-packed
+// last dim) + a 1-byte scales placeholder. All block codecs - K-quants and the
+// native-fp codecs mxfp4/nvfp4 - route here via the registry geometry; a
+// Python loader may still de-interleave the native-fp wire bytes into MLX's
+// packed layout downstream (gguf-mlx packed mode).
 void load_block_tensor(
     GgufLoadResult& res,
     const gguf_tensor& tensor,
@@ -361,33 +367,6 @@ void load_block_tensor(
       mx::array(&zero, mx::Shape{1}, mx::uint8));
 
   res.codecs.emplace_back(name, codec_name);
-}
-
-// Native-fp GGUF codecs MLX has dedicated kernels for. Read as raw wire bytes
-// here (like the K-quants); the Python loader de-interleaves ggml's
-// scale+data-interleaved block layout into MLX's native packed form. Returns
-// nullptr for any other type. NOTE: mxfp8 has no GGML wire type, so it can't
-// appear in a GGUF - only MXFP4/NVFP4 are reachable from a file.
-struct FpCodec {
-  const char* name;
-  int weights_per_block;
-  int bytes_per_block;
-};
-const FpCodec* gguf_type_to_fp_codec(uint32_t t) {
-  // GGML type numbers (ggml.h): MXFP4=39 (32 vals / 17 B), NVFP4=40 (64 vals /
-  // 36 B). Use the literals so this compiles even against a gguflib whose enum
-  // predates them (an unpatched parser would have already stopped at the tensor
-  // anyway, so this branch is only reached once the parser knows the type).
-  static const FpCodec kMxfp4{"mxfp4", 32, 17};
-  static const FpCodec kNvfp4{"nvfp4", 64, 36};
-  switch (t) {
-    case 39:
-      return &kMxfp4;
-    case 40:
-      return &kNvfp4;
-    default:
-      return nullptr;
-  }
 }
 
 // Byte size of a fixed-width GGUF scalar value type (0 for STRING/ARRAY).
@@ -619,16 +598,6 @@ GgufLoadResult load_gguf(const std::string& path, bool zero_copy /* = true */) {
           codec->weights_per_block,
           codec->bytes_per_block,
           codec->name,
-          name,
-          zero_copy,
-          ctx);
-    } else if (const FpCodec* fp = gguf_type_to_fp_codec(tensor.type)) {
-      load_block_tensor(
-          res,
-          tensor,
-          fp->weights_per_block,
-          fp->bytes_per_block,
-          fp->name,
           name,
           zero_copy,
           ctx);

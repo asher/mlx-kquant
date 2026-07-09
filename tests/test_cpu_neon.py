@@ -47,6 +47,8 @@ CODECS = {
     "iq2_s": GT.IQ2_S,
     "iq1_s": GT.IQ1_S,
     "iq1_m": GT.IQ1_M,
+    "mxfp4": GT.MXFP4,
+    "nvfp4": GT.NVFP4,
 }
 
 # IQ codecs are decode-only (gguf-py can't encode them): (weights_per_block,
@@ -62,11 +64,17 @@ IQ_GEOM = {
     "iq2_s": (256, 82),
     "iq1_s": (256, 50),
     "iq1_m": (256, 56),
+    # nvfp4 rides the same synth path (gguf-py has no nvfp4 encoder); mxfp4
+    # is encodable so it goes through quants.quantize like the flat codecs.
+    "nvfp4": (64, 36),
 }
 
 
 def _synth_iq_wire(rng, bpb, n_blocks):
     wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
+    if bpb == 36:  # nvfp4: four ue4m3 group scales at offsets 0-3
+        wire[:, 0:4] = rng.integers(0x30, 0x41, (n_blocks, 4), dtype=np.uint8)
+        return wire
     d = rng.uniform(0.02, 0.08, n_blocks).astype(np.float16)
     if bpb == 56:
         # IQ1_M has no super-block d; the fp16 scale is rebuilt from the top

@@ -52,6 +52,8 @@ CODECS = {
     "iq2_s": (GT.IQ2_S, 256, 82, 2, False),
     "iq1_s": (GT.IQ1_S, 256, 50, 1, False),
     "iq1_m": (GT.IQ1_M, 256, 56, 1, False),
+    "mxfp4": (GT.MXFP4, 32, 17, 4, False),
+    "nvfp4": (GT.NVFP4, 64, 36, 4, False),
 }
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -60,9 +62,15 @@ E, N, K = 4, 128, 512  # experts, out_dims, in_features (K % 256 and % 64 == 0)
 BACKEND = "mlx_kquant"
 
 
+# Native-fp codecs have no Metal gather leaves yet; their arms run on the CPU
+# stream (the streaming decode path) until those kernels land.
+NATIVE_FP_CPU_ONLY = {"mxfp4", "nvfp4"}
+
+
 def _gather(x, w, sc, gs, bits, codec, lhs, rhs):
+    stream = mx.cpu if codec in NATIVE_FP_CPU_ONLY else None
     return kq.gather_qmm(
-        x, w, sc, codec, lhs_indices=lhs, rhs_indices=rhs, transpose=True
+        x, w, sc, codec, lhs_indices=lhs, rhs_indices=rhs, transpose=True, stream=stream
     )
 
 
@@ -70,6 +78,9 @@ def _synth_iq_wire(rng, bpb, n_blocks):
     """Structurally-valid random IQ wire (gguf-py is decode-only for IQ): random
     bytes with a sane fp16 d at block offset 0 so dequant can't hit Inf/NaN."""
     wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
+    if bpb == 36:  # nvfp4: four ue4m3 group scales at offsets 0-3
+        wire[:, 0:4] = rng.integers(0x30, 0x41, (n_blocks, 4), dtype=np.uint8)
+        return wire
     d = rng.uniform(0.02, 0.08, n_blocks).astype(np.float16)
     if bpb == 56:
         # IQ1_M has no super-block d; its fp16 scale is rebuilt from the top
@@ -86,7 +97,7 @@ def _synth_iq_wire(rng, bpb, n_blocks):
 
 def _wire_and_ref(codec, gtype, wpb, bpb, is_kquant):
     """Return (wire uint8[E, N, packed], ref float32[E, N, K])."""
-    if codec.startswith("iq"):
+    if codec.startswith("iq") or codec == "nvfp4":
         rng = np.random.default_rng(11)
         wires = [
             _synth_iq_wire(rng, bpb, N * (K // wpb)).reshape(N, (K // wpb) * bpb)
@@ -331,6 +342,8 @@ def test_rhs_gather_sweep():
     rng = np.random.default_rng(3)
     fails = []
     for codec, (gtype, wpb, bpb, _bits, is_kq) in CODECS.items():
+        if codec in NATIVE_FP_CPU_ONLY:  # Metal sorted-tile path lands later
+            continue
         wire, ref = _wire_and_ref(codec, gtype, wpb, bpb, is_kq)
         assert wire is not None, f"missing fixture for {codec}"
         w = mx.array(wire)

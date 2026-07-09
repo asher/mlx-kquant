@@ -53,6 +53,8 @@ CODECS = {
     "iq2_s": (GT.IQ2_S, 256, 82, 2, False),
     "iq1_s": (GT.IQ1_S, 256, 50, 1, False),
     "iq1_m": (GT.IQ1_M, 256, 56, 1, False),
+    "mxfp4": (GT.MXFP4, 32, 17, 4, False),
+    "nvfp4": (GT.NVFP4, 64, 36, 4, False),
 }
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -65,14 +67,23 @@ def _dequant(w, sc, gs, bits, codec, dt):
     return kq.dequantize(w, sc, codec, dtype=dt)
 
 
+# Native-fp codecs have no Metal matmul leaves yet; their matmul arms run on
+# the CPU stream (the streaming decode path) until those kernels land.
+NATIVE_FP_CPU_ONLY = {"mxfp4", "nvfp4"}
+
+
 def _qmm(x, w, sc, gs, bits, codec, transpose=True):
-    return kq.quantized_matmul(x, w, sc, codec, transpose=transpose)
+    stream = mx.cpu if codec in NATIVE_FP_CPU_ONLY else None
+    return kq.quantized_matmul(x, w, sc, codec, transpose=transpose, stream=stream)
 
 
 def _synth_iq_wire(rng, bpb, n_blocks):
     """Structurally-valid random IQ wire (gguf-py is decode-only for IQ): random
     bytes with a sane fp16 d at block offset 0 so dequant can't hit Inf/NaN."""
     wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
+    if bpb == 36:  # nvfp4: four ue4m3 group scales at offsets 0-3
+        wire[:, 0:4] = rng.integers(0x30, 0x41, (n_blocks, 4), dtype=np.uint8)
+        return wire
     d = rng.uniform(0.02, 0.08, n_blocks).astype(np.float16)
     if bpb == 56:
         # IQ1_M has no super-block d; its fp16 scale is rebuilt from the top
@@ -89,7 +100,7 @@ def _synth_iq_wire(rng, bpb, n_blocks):
 
 def _wire_and_ref(codec, gtype, wpb, bpb, is_kquant):
     """Return (wire uint8[N, packed], ref float32[N, K])."""
-    if codec.startswith("iq"):
+    if codec.startswith("iq") or codec == "nvfp4":
         wire = _synth_iq_wire(np.random.default_rng(7), bpb, N * (K // wpb))
         wire = wire.reshape(N, (K // wpb) * bpb)
         ref = quants.dequantize(np.ascontiguousarray(wire), gtype).astype(np.float32)

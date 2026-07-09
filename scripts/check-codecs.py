@@ -40,9 +40,10 @@ def _parse_readme_table() -> dict[str, tuple[int, int, int]]:
     """Return ``codec -> (block, bits, bytes_per_block)`` from the README table."""
     text = (REPO / "README.md").read_text()
     out: dict[str, tuple[int, int, int]] = {}
-    # Rows look like: | q2_k  | 256 | 2 |  84 | K-quant superblock | (and iq*).
+    # Rows look like: | q2_k  | 256 | 2 |  84 | K-quant superblock |
+    # (iq* and the native-fp codecs mxfp4/nvfp4 included).
     row = re.compile(
-        r"^\|\s*(i?q\d[\w]*)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|",
+        r"^\|\s*(i?q\d[\w]*|mxfp4|nvfp4)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|",
         re.MULTILINE,
     )
     for m in row.finditer(text):
@@ -80,7 +81,9 @@ def main(argv: list[str] | None = None) -> int:
     for codec in sorted(geom_codecs & readme_codecs):
         gs, bits, bpb, wpb = geom[codec]
         r_block, r_bits, r_bpb = readme[codec]
-        agree = (gs == r_block == wpb) and (bits == r_bits) and (bpb == r_bpb)
+        # README "Block" documents the on-disk block (pairs with bytes/block);
+        # group_size may be smaller (nvfp4: 4 scale groups per 64-weight block).
+        agree = (r_block == wpb) and (bits == r_bits) and (bpb == r_bpb)
         if not agree:
             problems.append(
                 f"{codec}: geometry (block={gs}/wpb={wpb}, bits={bits}, "

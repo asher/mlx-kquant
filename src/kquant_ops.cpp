@@ -87,6 +87,11 @@ mx::array dequantize(
   }
 
   auto s = mx::to_stream(s_);
+  // Codecs without Metal kernels (native-fp until their leaves land) force
+  // the op onto the CPU stream so eval_cpu runs even under a GPU default.
+  if (!codec->has_matmul_kernel) {
+    s = mx::default_stream(mx::Device::cpu);
+  }
 
   auto out_shape = w.shape();
   out_shape.back() =

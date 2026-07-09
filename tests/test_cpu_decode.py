@@ -54,6 +54,8 @@ CODECS = {
     "iq2_s": (GT.IQ2_S, 256, 82, 2, False),
     "iq1_s": (GT.IQ1_S, 256, 50, 1, False),
     "iq1_m": (GT.IQ1_M, 256, 56, 1, False),
+    "mxfp4": (GT.MXFP4, 32, 17, 4, False),
+    "nvfp4": (GT.NVFP4, 64, 36, 4, False),
 }
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -71,6 +73,9 @@ def _synth_iq_wire(rng, bpb, n_blocks):
     (bpb 56) has no d -- its fp16 scale is the top nibble of each of the four
     uint16 scale words at offset 48 -- so seed those nibbles instead."""
     wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
+    if bpb == 36:  # nvfp4: four ue4m3 group scales at offsets 0-3
+        wire[:, 0:4] = rng.integers(0x30, 0x41, (n_blocks, 4), dtype=np.uint8)
+        return wire
     d = rng.uniform(0.02, 0.08, n_blocks).astype(np.float16)
     if bpb == 56:  # IQ1_M: scale reconstructed from scattered top nibbles
         dbits = d.view(np.uint16)
@@ -84,7 +89,7 @@ def _synth_iq_wire(rng, bpb, n_blocks):
 
 def _dense_wire_and_ref(codec, gtype, is_kquant):
     """(wire uint8[N, packed], ref float32[N, K]) or (None, None) if missing."""
-    if codec.startswith("iq"):
+    if codec.startswith("iq") or codec == "nvfp4":
         wpb, bpb = CODECS[codec][1], CODECS[codec][2]
         wire = _synth_iq_wire(np.random.default_rng(7), bpb, N * (K // wpb))
         wire = wire.reshape(N, (K // wpb) * bpb)
@@ -105,7 +110,7 @@ def _dense_wire_and_ref(codec, gtype, is_kquant):
 
 def _moe_wire_and_ref(codec, gtype, is_kquant):
     """(wire uint8[E, N, packed], ref float32[E, N, K]) or (None, None)."""
-    if codec.startswith("iq"):
+    if codec.startswith("iq") or codec == "nvfp4":
         wpb, bpb = CODECS[codec][1], CODECS[codec][2]
         rng = np.random.default_rng(11)
         wires = [
