@@ -71,6 +71,17 @@ NB_MODULE(_ext, m) {
       "KQ_DISABLE_NAX is unset (read live). Sorted-prefill callers defer to "
       "gather_qmm when this holds.");
 
+  m.def(
+      "codec_has_matmul",
+      [](const std::string& kquant_type) {
+        const auto* codec = mlx_kquant::codec_by_name(kquant_type);
+        return codec != nullptr && codec->has_matmul_kernel;
+      },
+      "kquant_type"_a,
+      "True when this codec ships Metal matmul kernels (qmv/qmm/gather). "
+      "CPU-only wire codecs return False; their matmuls must stay on the "
+      "CPU stream.");
+
   // --- ops ---
   m.def(
       "dequantize",
