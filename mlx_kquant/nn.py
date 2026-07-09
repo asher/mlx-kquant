@@ -20,10 +20,31 @@ import os
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 import mlx_kquant as kq
 
 from .codec_geometry import CODEC_GEOMETRY, bytes_per_row
+
+# gather_qmm_seg tile height (the kernel's BM).
+_SEG_TILE_ROWS = 64
+
+
+def _host_tile_maps(counts):
+    """Host-built equivalent of kq.expert_tile_map from per-expert counts:
+    (map, counts) uint32 arrays. Segments tile into 64-row tiles; only the
+    last tile of a segment can be partial (the kernel skips its dead row
+    fragments)."""
+    tiles = []
+    row = 0
+    for e in np.flatnonzero(counts):
+        c = int(counts[e])
+        for off in range(0, c, _SEG_TILE_ROWS):
+            tiles.append((e, row + off, min(_SEG_TILE_ROWS, c - off)))
+        row += c
+    m = np.asarray(tiles or [(0, 0, 0)], dtype=np.uint32)
+    cnt = np.asarray([len(tiles)], dtype=np.uint32)
+    return mx.array(m), mx.array(cnt)
 
 
 class KQuantEmbedding(nn.Module):
@@ -162,6 +183,27 @@ class KQuantSwitchLinear(nn.Module):
         self.freeze()
 
     def __call__(self, x, indices, sorted_indices=False):
+        # Prefill-shaped sorted calls (mlx-lm SwitchGLU's _gather_sort layout:
+        # x [B,1,K], indices [B] ascending) run one GEMM per expert segment
+        # instead of gather_qmm's per-row matvec fallback, which is much faster
+        # where the sorted rhs GEMM kernel is unavailable. Costs one host sync
+        # on the routing indices per MoE layer. KQ_SWITCH_GEMM_MIN_ROWS=0
+        # disables; read live for A/B.
+        if (
+            sorted_indices
+            and "bias" not in self
+            and indices.ndim == 1
+            and x.ndim == 3
+            and x.shape[0] == indices.size
+            and x.shape[1] == 1
+        ):
+            min_rows = int(os.environ.get("KQ_SWITCH_GEMM_MIN_ROWS", "512"))
+            if (
+                min_rows > 0
+                and indices.size >= min_rows
+                and not self._nax_gather_preferred(indices.size, x.shape[-1])
+            ):
+                return self._sorted_expert_gemm(x, indices)
         x = kq.gather_qmm(
             x,
             self["weight"],
@@ -174,6 +216,40 @@ class KQuantSwitchLinear(nn.Module):
         if "bias" in self:
             x = x + mx.expand_dims(self["bias"][indices], -2)
         return x
+
+    def _nax_gather_preferred(self, rows, k):
+        """Mirror gather_qmm's sorted-rhs NAX GEMM gate: on NAX GPUs that
+        tensor-core leaf beats the simdgroup-MMA seg kernel, so the sorted
+        arm defers to gather_qmm whenever the leaf is reachable."""
+        if not (
+            hasattr(kq, "nax_gather_enabled")
+            and kq.nax_gather_enabled(self.kquant_type)
+        ):
+            return False
+        return k % 64 == 0 and rows >= 16 and rows >= 4 * self.weight.shape[0]
+
+    def _sorted_expert_gemm(self, x, indices):
+        xf = x.reshape(indices.size, -1)
+        w, s, codec = self["weight"], self["scales"], self.kquant_type
+        if hasattr(kq, "gather_qmm_seg") and mx.metal.is_available():
+            # tile map built on GPU: no host sync, layers stay pipelined
+            if indices.dtype != mx.uint32:
+                indices = indices.astype(mx.uint32)
+            maps = kq.expert_tile_map(indices, w.shape[0])
+            return kq.gather_qmm_seg(xf, w, s, codec, *maps)[:, None, :]
+        counts = np.bincount(np.array(indices), minlength=self.weight.shape[0])
+        outs = []
+        start = 0
+        for e in np.flatnonzero(counts):
+            c = int(counts[e])
+            outs.append(
+                kq.quantized_matmul(
+                    xf[start : start + c], w[e], s, codec, transpose=True
+                )
+            )
+            start += c
+        y = mx.concatenate(outs) if len(outs) > 1 else outs[0]
+        return y[:, None, :]
 
     def _extra_repr(self):
         n, m, b = self.weight.shape
@@ -221,18 +297,32 @@ class KQuantMultiLinear(nn.Module):
     def __call__(self, x, transpose: bool = True):
         # x: (B, Hx, L, D) where Hx is num_heads (per-head activation) or 1
         # (a head-shared activation broadcast across heads, transpose=False).
+        # The gather index arrays depend only on (B, Hx); memoize them so a
+        # decode loop reuses one constant pair instead of rebuilding
+        # arange/broadcast graph nodes every layer every token (underscored
+        # attr: excluded from Module parameters).
         nh = self.num_heads
         B, Hx = x.shape[0], x.shape[1]
-        rhs = mx.broadcast_to(mx.arange(nh, dtype=mx.uint32).reshape(1, nh), (B, nh))
-        if Hx == nh:
-            lhs = mx.arange(B * nh, dtype=mx.uint32).reshape(B, nh)
-        elif Hx == 1:
-            lhs = mx.broadcast_to(mx.arange(B, dtype=mx.uint32).reshape(B, 1), (B, nh))
+        cached = getattr(self, "_gather_idx", None)
+        if cached is not None and cached[0] == (B, Hx):
+            lhs, rhs = cached[1], cached[2]
         else:
-            raise ValueError(
-                f"KQuantMultiLinear: head axis {Hx} is neither 1 nor "
-                f"num_heads={nh} (x.shape={x.shape})"
+            rhs = mx.broadcast_to(
+                mx.arange(nh, dtype=mx.uint32).reshape(1, nh), (B, nh)
             )
+            if Hx == nh:
+                lhs = mx.arange(B * nh, dtype=mx.uint32).reshape(B, nh)
+            elif Hx == 1:
+                lhs = mx.broadcast_to(
+                    mx.arange(B, dtype=mx.uint32).reshape(B, 1), (B, nh)
+                )
+            else:
+                raise ValueError(
+                    f"KQuantMultiLinear: head axis {Hx} is neither 1 nor "
+                    f"num_heads={nh} (x.shape={x.shape})"
+                )
+            mx.eval(lhs, rhs)
+            self._gather_idx = ((B, Hx), lhs, rhs)
         return kq.gather_qmm(
             x,
             self["weight"],

@@ -28,14 +28,21 @@
 // Activation selector (epilogue): out = act(g) * u.
 #define KQ_GLU_ACT_SILU 0
 #define KQ_GLU_ACT_GELU 1
+#define KQ_GLU_ACT_SILU_LIMIT 2
 
 template <int ACT>
-inline float kq_glu_epilogue(float g, float u) {
+inline float kq_glu_epilogue(float g, float u, float limit) {
   if (ACT == KQ_GLU_ACT_GELU) {
     // tanh-approx gelu (matches mlx nn.gelu_approx / gemma usage)
     const float g3 = 0.044715f * g * g * g;
     const float t = metal::precise::tanh(0.7978845608028654f * (g + g3));
     return (0.5f * g * (1.0f + t)) * u;
+  }
+  if (ACT == KQ_GLU_ACT_SILU_LIMIT) {
+    // deepseek-v4 LimitedSwiGLU: gate clamped from above only, up clamped
+    // both sides, then plain silu(g) * u (alpha 1, no +1 -- NOT gpt-oss).
+    g = metal::min(g, limit);
+    u = metal::clamp(u, -limit, limit);
   }
   const float sig = 1.0f / (1.0f + metal::exp(-g));
   return (g * sig) * u;
@@ -53,6 +60,7 @@ template <typename T, int ACT>
     device T* out [[buffer(4)]],
     const constant int& K [[buffer(5)]],
     const constant int& N [[buffer(6)]],
+    const constant float& limit [[buffer(7)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -135,7 +143,7 @@ template <typename T, int ACT>
     U g = simd_sum(rg[row]);
     U u = simd_sum(ru[row]);
     if (simd_lid == 0) {
-      out[row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u));
+      out[row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
     }
   }
 }
@@ -237,6 +245,7 @@ template <typename T, int ACT>
     device T* out [[buffer(6)]],
     const constant int& K [[buffer(7)]],
     const constant int& N [[buffer(8)]],
+    const constant float& limit [[buffer(9)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -322,7 +331,7 @@ template <typename T, int ACT>
     U g = simd_sum(rg[row]);
     U u = simd_sum(ru[row]);
     if (simd_lid == 0) {
-      out[row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u));
+      out[row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
     }
   }
 }
@@ -435,6 +444,7 @@ template <typename T, int ACT>
     device T* out [[buffer(4)]],
     const constant int& K [[buffer(5)]],
     const constant int& N [[buffer(6)]],
+    const constant float& limit [[buffer(7)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -491,7 +501,7 @@ template <typename T, int ACT>
     U g = simd_sum(rg[row]);
     U u = simd_sum(ru[row]);
     if (simd_lid == 0) {
-      out[row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u));
+      out[row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
     }
   }
 }
@@ -570,6 +580,7 @@ template <typename T, int ACT>
     device T* out [[buffer(6)]],
     const constant int& K [[buffer(7)]],
     const constant int& N [[buffer(8)]],
+    const constant float& limit [[buffer(9)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -629,7 +640,7 @@ template <typename T, int ACT>
     U g = simd_sum(rg[row]);
     U u = simd_sum(ru[row]);
     if (simd_lid == 0) {
-      out[row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u));
+      out[row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
     }
   }
 }
@@ -728,14 +739,17 @@ template <typename T>
 #define KQ_EXT_NXPSG 8
 
 // Partial dot of x (one activation row) against wire-byte weight row `row`,
-// this thread's K-stripe only (chunks tx, tx + NX, ...).
+// this thread's K-stripe only (chunks tx, tx + NX, ...). `luts` is the
+// codec's threadgroup-staged table block (KqTgLuts; unused for table-free
+// codecs).
 template <typename T, typename Codec, int NX>
 METAL_FUNC float kq_ext_row_partial(
     const device uint8_t* w,
     const device T* x,
     int64_t row,
     int K,
-    short tx) {
+    short tx,
+    const threadgroup uint8_t* luts) {
   constexpr short chpb = Codec::superblock / 16;
   const int nb = K / Codec::superblock;
   const device uint8_t* w_row = w + row * (int64_t)nb * Codec::block_bytes;
@@ -744,7 +758,7 @@ METAL_FUNC float kq_ext_row_partial(
     const device uint8_t* block =
         w_row + (int64_t)(ich / chpb) * Codec::block_bytes;
     float4x4 lw;
-    Codec::deq_chunk16(block, short(ich % chpb), lw);
+    KqTgLuts<Codec>::deq_chunk16(block, short(ich % chpb), lw, luts);
     const device T* xp = x + ich * 16;
     acc += dot(lw[0], float4(*(const device vec<T, 4>*)(xp + 0))) +
         dot(lw[1], float4(*(const device vec<T, 4>*)(xp + 4))) +
@@ -762,7 +776,8 @@ METAL_FUNC float2 kq_ext_glu_row_partial(
     const device T* x,
     int64_t row,
     int K,
-    short tx) {
+    short tx,
+    const threadgroup uint8_t* luts) {
   constexpr short chpb = Codec::superblock / 16;
   const int nb = K / Codec::superblock;
   const int64_t row_off = row * (int64_t)nb * Codec::block_bytes;
@@ -778,13 +793,25 @@ METAL_FUNC float2 kq_ext_glu_row_partial(
     const float4 a2 = float4(*(const device vec<T, 4>*)(xp + 8));
     const float4 a3 = float4(*(const device vec<T, 4>*)(xp + 12));
     float4x4 lw;
-    Codec::deq_chunk16(g_row + boff, cch, lw);
+    KqTgLuts<Codec>::deq_chunk16(g_row + boff, cch, lw, luts);
     acc.x += dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3);
-    Codec::deq_chunk16(u_row + boff, cch, lw);
+    KqTgLuts<Codec>::deq_chunk16(u_row + boff, cch, lw, luts);
     acc.y += dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3);
   }
   return acc;
 }
+
+// Declares `name` and stages CodecT's decode LUTs into it (no-op, 16-byte
+// stub array for table-free codecs). Gather threadgroups are (32, 2, 1).
+#define KQ_EXT_STAGE_LUTS(CodecT, name)                                \
+  threadgroup uint4 name##_v[(KqTgLuts<CodecT>::bytes + 15) / 16 + 1]; \
+  threadgroup uint8_t* name =                                          \
+      reinterpret_cast<threadgroup uint8_t*>(name##_v);                \
+  if (KqTgLuts<CodecT>::bytes > 0) {                                   \
+    KqTgLuts<CodecT>::stage(                                           \
+        name, ushort(simd_gid * 32 + simd_lid), ushort(64));           \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                   \
+  }
 
 // NX-lane K-stripe reduction (row groups are consecutive lanes; only lane
 // tx == 0 of each group holds the full sum afterwards). NX = 8 keeps the
@@ -806,6 +833,7 @@ template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
     device T* out [[buffer(4)]],
     const constant int& K [[buffer(5)]],
     const constant int& N [[buffer(6)]],
+    const constant float& limit [[buffer(7)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -820,12 +848,13 @@ template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
   x += (int64_t)tid.z * K;
   out += ((int64_t)tid.z * R + tid.y) * N;
 
+  KQ_EXT_STAGE_LUTS(Codec, kq_luts)
   const float2 gu = kq_ext_glu_row_partial<T, Codec, NX>(
-      gw, uw, x, (int64_t)expert * N + out_row, K, tx);
+      gw, uw, x, (int64_t)expert * N + out_row, K, tx, kq_luts);
   const float g = kq_ext_reduce<NX>(gu.x);
   const float u = kq_ext_reduce<NX>(gu.y);
   if (tx == 0) {
-    out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u));
+    out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
   }
 }
 
@@ -852,8 +881,9 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
   x += row_idx * K;
   out += row_idx * N;
 
+  KQ_EXT_STAGE_LUTS(Codec, kq_luts)
   const float r = kq_ext_reduce<NX>(kq_ext_row_partial<T, Codec, NX>(
-      w, x, (int64_t)expert * N + out_row, K, tx));
+      w, x, (int64_t)expert * N + out_row, K, tx, kq_luts));
   if (tx == 0) {
     out[out_row] = static_cast<T>(r);
   }
@@ -875,6 +905,7 @@ template <
     device T* out [[buffer(6)]],
     const constant int& K [[buffer(7)]],
     const constant int& N [[buffer(8)]],
+    const constant float& limit [[buffer(9)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -889,19 +920,21 @@ template <
   x += (int64_t)tid.z * K;
   out += ((int64_t)tid.z * tpg.y + tid.y) * N;
 
+  KQ_EXT_STAGE_LUTS(Codec, kq_luts)
+  KQ_EXT_STAGE_LUTS(SCodec, kq_sluts)
   float2 gu;
   if (shared_slot) {
     gu = kq_ext_glu_row_partial<T, SCodec, NX>(
-        sgw, suw, x, (int64_t)out_row, K, tx);
+        sgw, suw, x, (int64_t)out_row, K, tx, kq_sluts);
   } else {
     const int expert = int(indices[tid.z * n_route + tid.y]);
     gu = kq_ext_glu_row_partial<T, Codec, NX>(
-        gw, uw, x, (int64_t)expert * N + out_row, K, tx);
+        gw, uw, x, (int64_t)expert * N + out_row, K, tx, kq_luts);
   }
   const float g = kq_ext_reduce<NX>(gu.x);
   const float u = kq_ext_reduce<NX>(gu.y);
   if (tx == 0) {
-    out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u));
+    out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
   }
 }
 
@@ -926,13 +959,14 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
   const short ty = short(simd_lid / NX);
   const int out_row = tid.x * (2 * RPS) + int(simd_gid) * RPS + ty;
 
+  KQ_EXT_STAGE_LUTS(Codec, kq_luts)
   float result = 0.0f;
   for (int slot = 0; slot < S; slot++) {
     const int expert = int(indices[tid.z * S + slot]);
     const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
     result += scores[tid.z * S + slot] *
         kq_ext_row_partial<T, Codec, NX>(
-                  w, xs, (int64_t)expert * N + out_row, K, tx);
+                  w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
   }
   result = kq_ext_reduce<NX>(result);
   if (tx == 0) {
@@ -959,18 +993,21 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
   const short ty = short(simd_lid / NX);
   const int out_row = tid.x * (2 * RPS) + int(simd_gid) * RPS + ty;
 
+  KQ_EXT_STAGE_LUTS(Codec, kq_luts)
+  KQ_EXT_STAGE_LUTS(SCodec, kq_sluts)
   float result = 0.0f;
   for (int slot = 0; slot < S - 1; slot++) {
     const int expert = int(indices[tid.z * (S - 1) + slot]);
     const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
     result += scores[tid.z * S + slot] *
         kq_ext_row_partial<T, Codec, NX>(
-                  w, xs, (int64_t)expert * N + out_row, K, tx);
+                  w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
   }
   {
     const device T* xs = h + ((int64_t)tid.z * S + (S - 1)) * K;
     result += scores[tid.z * S + (S - 1)] *
-        kq_ext_row_partial<T, SCodec, NX>(sw, xs, (int64_t)out_row, K, tx);
+        kq_ext_row_partial<T, SCodec, NX>(
+                  sw, xs, (int64_t)out_row, K, tx, kq_sluts);
   }
   result = kq_ext_reduce<NX>(result);
   if (tx == 0) {
@@ -979,17 +1016,23 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
 }
 
 // ---------------------------------------------------------------------------
-// Router top-k (codec-independent float kernel): softmax over E logits, pick
-// the top R (min-index tie-break), emit gather-ready indices [T, R] uint32 and
-// mix scores [T, R + SHARED] float32 in one dispatch. When SHARED == 1,
-// column E of each logits row is the shared-expert gate logit and its sigmoid
-// lands in scores slot R (qwen3-next); SHARED == 0 is the plain-MoE form
-// (gemma). NORM selects renormalizing the picked probabilities to sum to 1
-// (norm_topk_prob; also exactly softmax-over-the-selected-logits, the gemma
-// router semantics). HAS_PES scales each picked score by pes[expert]
-// (gemma's learned per_expert_scale); pes may be any bound buffer when
-// HAS_PES == 0. One threadgroup of 256 threads per token; E <= 1024, R <= 16
-// (host-checked).
+// Router top-k (codec-independent float kernel): score E logits, pick the
+// top R (min-index tie-break), emit gather-ready indices [T, R] uint32 and
+// mix scores [T, R + SHARED] float32 in one dispatch. SCORING == 0 is f32
+// softmax; SCORING == 1 is sqrt(softplus(x)) (deepseek-v4), which has no
+// global normalizer and requires NORM (renorm adds the model's 1e-20 guard
+// since scores may be exactly 0). HAS_BIAS ranks selection by
+// score + bias[expert] (e_score_correction_bias) while emitted scores stay
+// unbiased. When SHARED == 1, column E of each logits row is the
+// shared-expert gate logit and its sigmoid lands in scores slot R
+// (qwen3-next); SHARED == 0 is the plain-MoE form (gemma). NORM selects
+// renormalizing the picked scores to sum to 1 (norm_topk_prob; for softmax
+// also exactly softmax-over-the-selected-logits, the gemma router
+// semantics). HAS_PES scales each picked score by pes[expert] (gemma's
+// learned per_expert_scale); SCALE is a uniform multiplier on emitted
+// routed scores (deepseek-v4 routed_scaling_factor). pes/bias may be any
+// bound buffer when HAS_PES/HAS_BIAS == 0. One threadgroup of 256 threads
+// per token; E <= 1024, R <= 16 (host-checked).
 // ---------------------------------------------------------------------------
 #define KQ_ROUTER_MAX_E 1024
 #define KQ_ROUTER_MAX_R 16
@@ -1005,6 +1048,10 @@ template <typename T>
     const constant int& SHARED [[buffer(6)]],
     const device float* pes [[buffer(7)]],
     const constant int& HAS_PES [[buffer(8)]],
+    const device float* bias [[buffer(9)]],
+    const constant int& HAS_BIAS [[buffer(10)]],
+    const constant int& SCORING [[buffer(11)]],
+    const constant float& SCALE [[buffer(12)]],
     uint tid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -1020,51 +1067,70 @@ template <typename T>
 
   const device T* lrow = logits + (int64_t)tid * (E + SHARED);
 
-  float m = -INFINITY;
-  for (int e = lid; e < E; e += NT) {
-    m = metal::max(m, float(lrow[e]));
-  }
-  m = simd_max(m);
-  if (simd_lid == 0) {
-    red_v[simd_gid] = m;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (lid == 0) {
-    float g = red_v[0];
-    for (int i = 1; i < NSG; i++) {
-      g = metal::max(g, red_v[i]);
+  // SCORING is threadgroup-uniform, so barriers inside each arm are safe.
+  float gsum = 1.0f;
+  if (SCORING == 1) {
+    for (int e = lid; e < E; e += NT) {
+      const float x = float(lrow[e]);
+      // Stable softplus: max(x, 0) + log1p(exp(-|x|)); series for tiny z
+      // where log(1 + z) loses bits.
+      const float z = metal::exp(-metal::abs(x));
+      const float l1p =
+          (z < 1e-4f) ? metal::fma(-0.5f * z, z, z) : metal::log(1.0f + z);
+      p[e] = metal::sqrt(metal::max(x, 0.0f) + l1p);
     }
-    stat[0] = g;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  const float gmax = stat[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  } else {
+    float m = -INFINITY;
+    for (int e = lid; e < E; e += NT) {
+      m = metal::max(m, float(lrow[e]));
+    }
+    m = simd_max(m);
+    if (simd_lid == 0) {
+      red_v[simd_gid] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+      float g = red_v[0];
+      for (int i = 1; i < NSG; i++) {
+        g = metal::max(g, red_v[i]);
+      }
+      stat[0] = g;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float gmax = stat[0];
 
-  float s = 0;
-  for (int e = lid; e < E; e += NT) {
-    const float v = metal::exp(float(lrow[e]) - gmax);
-    p[e] = v;
-    s += v;
-  }
-  s = simd_sum(s);
-  if (simd_lid == 0) {
-    red_v[simd_gid] = s;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (lid == 0) {
-    float g = 0;
-    for (int i = 0; i < NSG; i++) {
-      g += red_v[i];
+    float s = 0;
+    for (int e = lid; e < E; e += NT) {
+      const float v = metal::exp(float(lrow[e]) - gmax);
+      p[e] = v;
+      s += v;
     }
-    stat[1] = g;
+    s = simd_sum(s);
+    if (simd_lid == 0) {
+      red_v[simd_gid] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+      float g = 0;
+      for (int i = 0; i < NSG; i++) {
+        g += red_v[i];
+      }
+      stat[1] = g;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    gsum = stat[1];
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  const float gsum = stat[1];
 
   for (int r = 0; r < R; r++) {
-    float bv = -1.0f;
+    // -inf init/sentinel: biased ranking values can be negative.
+    float bv = -INFINITY;
     uint bi = 0xffffffffu;
     for (int e = lid; e < E; e += NT) {
-      const float v = p[e];
+      float v = p[e];
+      if (HAS_BIAS) {
+        v += bias[e];
+      }
       if (v > bv || (v == bv && uint(e) < bi)) {
         bv = v;
         bi = uint(e);
@@ -1088,9 +1154,10 @@ template <typename T>
         }
       }
       indices[(int64_t)tid * R + r] = wi;
-      win_v[r] = wv;
+      // Emitted score is the unbiased p[wi] (== wv when HAS_BIAS == 0).
+      win_v[r] = p[wi];
       win_i[r] = wi;
-      p[wi] = -1.0f;
+      p[wi] = -INFINITY;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
@@ -1100,14 +1167,14 @@ template <typename T>
     for (int r = 0; r < R; r++) {
       ps += win_v[r];
     }
-    const float denom = NORM ? ps : gsum;
+    const float denom = NORM ? (SCORING == 1 ? ps + 1e-20f : ps) : gsum;
     device float* srow = scores + (int64_t)tid * (R + SHARED);
     for (int r = 0; r < R; r++) {
       float sv = win_v[r] / denom;
       if (HAS_PES) {
         sv *= pes[win_i[r]];
       }
-      srow[r] = sv;
+      srow[r] = sv * SCALE;
     }
     if (SHARED) {
       srow[R] = 1.0f / (1.0f + metal::exp(-float(lrow[E])));

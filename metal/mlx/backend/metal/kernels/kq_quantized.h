@@ -29,7 +29,7 @@ METAL_FUNC void kq_qmm_t_impl(
     threadgroup T* Ws,
     const constant int& K,
     const constant int& N,
-    const constant int& M,
+    const int M,
     const int K_eff,
     uint3 tid,
     uint lid,
@@ -115,6 +115,244 @@ METAL_FUNC void kq_qmm_t_impl(
         loader_w.load_unsafe();
         threadgroup_barrier(mem_flags::mem_threadgroup);
         mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    }
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (num_els < BM || num_outs < BN) {
+    mma_op.store_result_safe(y, N, short2(num_outs, num_els));
+  } else {
+    mma_op.store_result(y, N);
+  }
+}
+
+// Row-fragment-clamped BlockMMA for the segment-walking gather GEMM. Same
+// fragment layout and numerics as mlx::steel::BlockMMA in the qmm_t
+// configuration (transpose_a=false, transpose_b=true, float accumulation),
+// but mma() takes a per-simdgroup active row-fragment count so a partially
+// filled tile only pays MMA for ~ceil(valid_rows / 8) row fragments instead
+// of all BM rows. Fragment i of the simdgroup with base row tm covers tile
+// rows [tm + i * TM_stride, tm + i * TM_stride + 8).
+template <
+    typename T,
+    const int BM,
+    const int BN,
+    const int BK,
+    const int WM,
+    const int WN,
+    const short lda_tgp,
+    const short ldb_tgp>
+struct KqSegBlockMMA {
+  STEEL_CONST short kFragSize = 8;
+  using MMAFrag_acc_t = mlx::steel::BaseMMAFrag<float, kFragSize, kFragSize>;
+
+  STEEL_CONST short TM_stride = kFragSize * WM;
+  STEEL_CONST short TN_stride = kFragSize * WN;
+  STEEL_CONST short TM = BM / (kFragSize * WM);
+  STEEL_CONST short TN = BN / (kFragSize * WN);
+
+  STEEL_CONST short A_str_m = lda_tgp;
+  STEEL_CONST short A_str_k = 1;
+  STEEL_CONST short B_str_k = 1;
+  STEEL_CONST short B_str_n = ldb_tgp;
+  STEEL_CONST short tile_stride_a = kFragSize * A_str_k;
+  STEEL_CONST short tile_stride_b = kFragSize * B_str_k;
+
+  mlx::steel::MMATile<float, TM, 1, MMAFrag_acc_t> Atile;
+  mlx::steel::MMATile<float, 1, TN, MMAFrag_acc_t> Btile;
+  mlx::steel::MMATile<float, TM, TN, MMAFrag_acc_t> Ctile;
+
+  short sm;
+  short sn;
+  short tm;
+  short As_offset;
+  short Bs_offset;
+
+  METAL_FUNC KqSegBlockMMA(ushort simd_group_id, ushort simd_lane_id) {
+    tm = kFragSize * (simd_group_id / WN);
+    short tn = kFragSize * (simd_group_id % WN);
+    short2 simd_coord = MMAFrag_acc_t::get_coord(simd_lane_id);
+    sm = simd_coord.y;
+    sn = simd_coord.x;
+    As_offset = (tm + sm) * A_str_m + sn * A_str_k;
+    Bs_offset = sm * B_str_k + (tn + sn) * B_str_n;
+    sm += tm;
+    sn += tn;
+  }
+
+  METAL_FUNC short active_tm_rows(const short valid_rows) const {
+    short avail = valid_rows - tm;
+    return avail <= 0 ? short(0)
+                      : min(TM, short((avail + TM_stride - 1) / TM_stride));
+  }
+
+  // AT-specialized k-sweep: all fragment indices and loop bounds are
+  // compile-time so the tiles stay in registers (runtime bounds force the
+  // frag arrays into thread memory and roughly halve throughput).
+  template <short AT>
+  METAL_FUNC void mma_arm(const threadgroup T* As, const threadgroup T* Bs) {
+    As += As_offset;
+    Bs += Bs_offset;
+    STEEL_PRAGMA_UNROLL
+    for (short kk = 0; kk < BK; kk += kFragSize) {
+      simdgroup_barrier(mem_flags::mem_none);
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < AT; ++i) {
+        MMAFrag_acc_t::load(
+            Atile.frag_at(i, 0),
+            &As[(i * kFragSize) * WM * A_str_m],
+            mlx::steel::Int<A_str_m>{},
+            mlx::steel::Int<A_str_k>{});
+      }
+      simdgroup_barrier(mem_flags::mem_none);
+      Btile.template load<T, 1, WN, B_str_k, B_str_n>(Bs);
+      simdgroup_barrier(mem_flags::mem_none);
+      STEEL_PRAGMA_UNROLL
+      for (short m = 0; m < AT; ++m) {
+        STEEL_PRAGMA_UNROLL
+        for (short n = 0; n < TN; ++n) {
+          short n_serp = (m % 2) ? (TN - 1 - n) : n;
+          MMAFrag_acc_t::mma(
+              Ctile.frag_at(m, n_serp),
+              Atile.frag_at(m, 0),
+              Btile.frag_at(0, n_serp),
+              Ctile.frag_at(m, n_serp));
+        }
+      }
+      As += tile_stride_a;
+      Bs += tile_stride_b;
+    }
+  }
+
+  METAL_FUNC void
+  mma(const threadgroup T* As, const threadgroup T* Bs, const short active_tm) {
+    // active_tm is uniform per simdgroup and constant across k-steps; only
+    // simdgroup_barriers live inside the arms, so per-simdgroup divergence
+    // here is safe. A fully dead simdgroup skips its loads and matmads.
+    static_assert(TM == 4, "seg MMA arms assume BM = 64, WM = 2");
+    switch (active_tm) {
+      case 4:
+        mma_arm<4>(As, Bs);
+        break;
+      case 3:
+        mma_arm<3>(As, Bs);
+        break;
+      case 2:
+        mma_arm<2>(As, Bs);
+        break;
+      case 1:
+        mma_arm<1>(As, Bs);
+        break;
+      default:
+        break;
+    }
+  }
+
+  METAL_FUNC void store_result(device T* D, const int ldd) {
+    D += sm * ldd + sn;
+    Ctile.template store<T, WM, WN>(D, ldd);
+  }
+
+  METAL_FUNC void
+  store_result_safe(device T* D, const int ldd, short2 dst_tile_dims) {
+    D += sm * ldd + sn;
+    dst_tile_dims -= short2(sn, sm);
+    if (dst_tile_dims.x <= 0 || dst_tile_dims.y <= 0) {
+      return;
+    }
+    Ctile.template store_safe<T, WM, WN>(D, ldd, dst_tile_dims);
+  }
+};
+
+// kq_qmm_t_impl specialization for one gather_qmm_seg tile: single M-tile at
+// x (grid.y indexes the tile map instead of rows), valid rows M <= BM, dead
+// row fragments skipped in the MMA.
+template <
+    typename T,
+    typename LoaderW,
+    const bool aligned_N,
+    const int BM,
+    const int BK,
+    const int BN>
+METAL_FUNC void kq_qmm_t_seg_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    threadgroup T* Xs,
+    threadgroup T* Ws,
+    const constant int& K,
+    const constant int& N,
+    const int M,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(BK >= SIMD_SIZE, "BK should be >= SIMD_SIZE");
+  static_assert(BK % SIMD_SIZE == 0, "BK should be a multiple of SIMD_SIZE");
+
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  using mma_t = KqSegBlockMMA<T, BM, BN, BK, WM, WN, BK_padded, BK_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+
+  const int K_w = (K / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
+  const int y_col = tid.x * BN;
+
+  auto wl = w + static_cast<int64_t>(y_col) * K_w;
+  y += y_col;
+
+  const short num_els = min(BM, M);
+  const short num_outs = min(BN, N - y_col);
+  loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
+  LoaderW loader_w(wl, K, Ws, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+  const short active_tm = mma_op.active_tm_rows(num_els);
+
+  if (num_els < BM) {
+    if (!aligned_N && num_outs < BN) {
+      for (int k = 0; k < K; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_safe(short2(BK, num_els));
+        loader_w.load_safe(short2(BK, num_outs));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws, active_tm);
+        loader_x.next();
+        loader_w.next();
+      }
+    } else {
+      for (int k = 0; k < K; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_safe(short2(BK, num_els));
+        loader_w.load_unsafe();
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws, active_tm);
+        loader_x.next();
+        loader_w.next();
+      }
+    }
+  } else {
+    if (!aligned_N && num_outs < BN) {
+      for (int k = 0; k < K; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_unsafe();
+        loader_w.load_safe(short2(BK, num_outs));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws, active_tm);
+        loader_x.next();
+        loader_w.next();
+      }
+    } else {
+      for (int k = 0; k < K; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_unsafe();
+        loader_w.load_unsafe();
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws, active_tm);
         loader_x.next();
         loader_w.next();
       }
@@ -2139,6 +2377,52 @@ inline uchar2 kq_get_scale_min_k4_just2(int j, int k, const device uint8_t* q) {
         /*tgp_size=*/2 * 2 * SIMD_SIZE>;                              \
     kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(                 \
         w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);   \
+  }                                                                   \
+                                                                      \
+  /* Segment-walking gather GEMM: x holds rows pre-sorted by expert;  \
+     seg_map is [n_tiles, 3] uint32 rows of (expert, row_start,       \
+     num_rows) with num_rows <= 64; only the last tile of a segment   \
+     may be partial and its dead row fragments are skipped in the     \
+     MMA. One threadgroup per (N-tile, map tile); grid.y indexes      \
+     seg_map, clamped by tile_count[0] so a shape-only upper bound    \
+     can be dispatched. Rows not covered by the map are left          \
+     unwritten. */                                                    \
+  template <typename T, int group_size, int bits, bool aligned_N>     \
+  [[kernel]] void kq_##CODEC##_gather_qmm_seg_t(                      \
+      const device uint8_t* w,                                        \
+      const device uint8_t* /* scales */,                             \
+      const device T* x,                                              \
+      const device uint32_t* seg_map,                                 \
+      const device uint32_t* tile_count,                              \
+      device T* y,                                                    \
+      const constant int& K,                                          \
+      const constant int& N,                                          \
+      uint3 tid [[threadgroup_position_in_grid]],                     \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],               \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                  \
+    if (tid.y >= tile_count[0]) {                                     \
+      return;                                                         \
+    }                                                                 \
+    constexpr int BM = 64, BK = 32, BN = 64;                          \
+    constexpr int BK_padded = (BK + 16 / sizeof(T));                  \
+    threadgroup T Xs[BM * BK_padded];                                 \
+    threadgroup T Ws[BN * BK_padded];                                 \
+    using LoaderW = LOADER<                                           \
+        T,                                                            \
+        BN,                                                           \
+        BK,                                                           \
+        BK_padded,                                                    \
+        /*reduction_dim=*/1,                                          \
+        /*tgp_size=*/2 * 2 * SIMD_SIZE>;                              \
+    const device uint32_t* seg = seg_map + 3 * tid.y;                 \
+    const int K_w =                                                   \
+        (K / LoaderW::weights_per_block) * LoaderW::bytes_per_block;  \
+    w += static_cast<int64_t>(seg[0]) * N * K_w;                      \
+    x += static_cast<int64_t>(seg[1]) * K;                            \
+    y += static_cast<int64_t>(seg[1]) * N;                            \
+    const int num_rows = static_cast<int>(seg[2]);                    \
+    kq_qmm_t_seg_impl<T, LoaderW, aligned_N, BM, BK, BN>(             \
+        w, x, y, Xs, Ws, K, N, num_rows, tid, simd_gid, simd_lid);    \
   }                                                                   \
                                                                       \
   template <typename T, int group_size, int bits>                     \

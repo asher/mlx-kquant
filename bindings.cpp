@@ -57,6 +57,20 @@ NB_MODULE(_ext, m) {
       "True when the arm64 NEON int8 CPU GEMV kernels can run here (arm64 "
       "build with the dotprod extension, not disabled via KQ_CPU_NEON=0).");
 
+  m.def(
+      "nax_available",
+      &mlx_kquant::nax_available,
+      "True when the GPU supports the NAX (tensor-core) matmul kernels.");
+
+  m.def(
+      "nax_gather_enabled",
+      &mlx_kquant::nax_gather_enabled,
+      "kquant_type"_a,
+      "True when gather_qmm's sorted-rhs NAX GEMM leaf can serve this codec "
+      "here: NAX hardware present, the codec ships NAX kernels, and "
+      "KQ_DISABLE_NAX is unset (read live). Sorted-prefill callers defer to "
+      "gather_qmm when this holds.");
+
   // --- ops ---
   m.def(
       "dequantize",
@@ -305,6 +319,193 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "dsa_sparse_attention",
+      &mlx_kquant::dsa_sparse_attention,
+      "q"_a,
+      "local_kv"_a,
+      "pooled"_a,
+      "topk_indices"_a,
+      "sinks"_a,
+      "scale"_a,
+      "q_offset"_a,
+      "compress_ratio"_a,
+      "local_window"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        DeepSeek-V4-Flash sparse attention: sliding local window + gathered
+        indexer-selected pooled rows + per-head attention sinks in one
+        dispatch (flash online softmax, f32 accumulation). Ported from omlx
+        glm_moe_dsa; qL >= 1, so decode, MTP verify (qL = 2) and prefill all
+        run this kernel.
+
+        Args:
+            q (array): queries [B, 64, qL, 512], float16/bfloat16.
+            local_kv (array): sliding-window KV [B, 1, localL, 512]
+                (K == V shared latent), temporal order, localL >= qL.
+            pooled (array): compressed pooled rows [B, P, 512].
+            topk_indices (array): uint32 [B, 1, qL, N] pooled-row indices;
+                slots >= the causal horizon (q_offset + pos + 1) /
+                compress_ratio are masked out kernel-side.
+            sinks (array): per-head sink logits [64].
+            scale (float): attention scale (1/sqrt(512)).
+            q_offset (int): absolute position of the chunk start.
+            compress_ratio (int): pooled compression ratio.
+            local_window (int): sliding-window size (128).
+
+        Returns:
+            array: attention output [B, 64, qL, 512] in the input dtype.
+      )");
+
+  m.def(
+      "dsa_indexer_scores",
+      &mlx_kquant::dsa_indexer_scores,
+      "queries"_a,
+      "keys"_a,
+      "weights"_a,
+      "causal"_a = true,
+      "unused_causal_prefix_topk"_a = 0,
+      "skip_causal_future_store"_a = false,
+      "causal_q_offset"_a = -1,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        DeepSeek-V4-Flash lightning-indexer relevance scores (steel GEMM):
+        out[b, 0, m, n] = sum_h relu(q[b, h, m] . k[b, 0, n]) * w[h, m].
+        Ported from omlx glm_moe_dsa. Feed the result to dsa_topk_indices to
+        pick the pooled rows dsa_sparse_attention gathers.
+
+        Args:
+            queries (array): [B, H, M, 128], H 32 or 64, M % 64 == 0,
+                float16/bfloat16. Decode pads the single query row to 64
+                and keeps output row 0.
+            keys (array): pooled indexer keys [B, 1, N, 128], N % 64 == 0.
+            weights (array): per-head query weights, [B, M, H] (lh layout)
+                or [B, H, M, 1].
+            causal (bool): mask n > causal_q_offset + m with -inf.
+            unused_causal_prefix_topk (int): skip writing tiles whose rows
+                all fall inside a causal prefix of this many keys (they are
+                identity-selected by a causal_valid_prefix top-k).
+            skip_causal_future_store (bool): leave fully-masked future tiles
+                unwritten instead of storing -inf (pair with a
+                causal_valid_prefix top-k that never reads them).
+            causal_q_offset (int): absolute position of query row 0; -1
+                means N - M.
+
+        Returns:
+            array: scores [B, 1, M, N] in the input dtype.
+      )");
+
+  m.def(
+      "dsa_topk_indices",
+      &mlx_kquant::dsa_topk_indices,
+      "scores"_a,
+      "topk"_a,
+      "bucketed"_a = false,
+      "causal_valid_prefix"_a = false,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Per-row top-k arg-select over 16-bit float scores (2-pass radix
+        select, one threadgroup per row). Ported from omlx glm_moe_dsa.
+        The selected index set matches a full sort; the order within a row
+        does not (ties at the threshold are admitted in scan order) --
+        dsa_sparse_attention is order-insensitive.
+
+        Args:
+            scores (array): [B, 1, L, K], float16/bfloat16, K >= topk.
+            topk (int): 512 or 2048.
+            bucketed (bool): deterministic bucketed emission (>threshold
+                entries before ==threshold entries).
+            causal_valid_prefix (bool): clamp each row's scan to its causal
+                prefix K - L + (row % L) + 1 and emit the identity prefix
+                when it fits inside topk.
+
+        Returns:
+            array: uint32 indices [B, 1, L, topk].
+      )");
+
+  m.def(
+      "dsa_indexer_score_decode",
+      &mlx_kquant::dsa_indexer_score_decode,
+      "queries"_a,
+      "keys"_a,
+      "weights"_a,
+      "q_offset"_a,
+      "ratio"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Decode-width lightning-indexer scores, fused:
+        out[b, 0, j, p] = sum_h relu(q[b, h, j] . k[b, p]) * w[b, j, h]
+        for qL <= 4 query rows without materializing the [H, P] per-head
+        scores. Selection-equivalent to the inline path when any positive
+        global scale is folded out. Pooled visibility follows
+        PoolingCache.make_mask(qL, q_offset): row p is visible to query j
+        iff p < (q_offset + j + 1) // ratio, and every row is visible when
+        qL == 1; invisible rows score the dtype's finite min.
+
+        Args:
+            queries (array): [B, 64, qL, 128], qL in [1, 4],
+                float16/bfloat16.
+            keys (array): the pooled indexer key cache [B, P, 128].
+            weights (array): per-head query weights [B, qL, 64].
+            q_offset (int): absolute position of query row 0's step
+                (make_mask's ``offset``).
+            ratio (int): pooled compression ratio.
+
+        Returns:
+            array: scores [B, 1, qL, P] shaped for dsa_topk_indices.
+      )");
+
+  m.def(
+      "dsa_indexer_qat",
+      &mlx_kquant::dsa_indexer_qat,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        DeepSeek-V4-Flash indexer activation QAT round-trip, fused: the
+        128-wide Hadamard transform (mlx hadamard_transform's butterfly
+        order and 1/sqrt(128) scale, bit-exactly) followed by the
+        per-32-block FP4-E2M1 round-trip (scale 2^ceil(log2(amax/6)) with
+        an FLT_MIN*6 amax floor, clamp to +-6, tie-to-even rounding).
+        One kernel in place of the multi-pass hadamard + quantize chain.
+
+        Args:
+            x (array): any shape with a trailing dim of 128,
+                float16/bfloat16/float32.
+
+        Returns:
+            array: same shape and dtype as ``x``.
+      )");
+
+  m.def(
+      "dsa_kv_qat",
+      &mlx_kquant::dsa_kv_qat,
+      "x"_a,
+      "n_rot"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        DeepSeek-V4-Flash main-attention KV QAT round-trip, fused: the
+        per-64-block FP8-E4M3FN round-trip (scale 2^ceil(log2(amax/448))
+        with a 1e-4 amax floor, clamp to +-448, ties-to-even) on the
+        leading D - n_rot dims, the trailing n_rot RoPE dims fp8-exempt,
+        then the whole row rounded through fp16 (the f16 KV-cache step).
+        One kernel in place of the split + fp8-core + concat + astype
+        chain, bit-identically.
+
+        Args:
+            x (array): any shape with trailing dim D,
+                (D - n_rot) % 64 == 0; float16/bfloat16/float32.
+            n_rot (int): trailing RoPE dims excluded from the fp8 step.
+
+        Returns:
+            array: same shape and dtype as ``x``.
+      )");
+
+  m.def(
       "moe_glu_gather_kq",
       &mlx_kquant::moe_glu_gather_kq,
       "x"_a,
@@ -313,6 +514,7 @@ NB_MODULE(_ext, m) {
       "kquant_type"_a,
       "indices"_a,
       "act"_a = "silu",
+      "limit"_a = 0.0f,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
@@ -326,7 +528,10 @@ NB_MODULE(_ext, m) {
             up_w (array): uint8 wire bytes, same shape as gate_w.
             kquant_type (str): codec with a fused kernel (full GGUF matrix).
             indices (array): expert indices [T, R].
-            act (str): 'silu' (default) or 'gelu' (tanh approx).
+            act (str): 'silu' (default), 'gelu' (tanh approx) or 'silu_limit'
+                (silu(min(g, limit)) * clip(u, -limit, limit) -- deepseek-v4
+                LimitedSwiGLU; requires limit > 0).
+            limit (float): clamp bound for 'silu_limit'; ignored otherwise.
 
         Returns:
             array: activated hidden states [T, R, N] in x.dtype.
@@ -455,22 +660,33 @@ NB_MODULE(_ext, m) {
       "norm_topk_prob"_a = true,
       "shared_gate"_a = true,
       "per_expert_scale"_a = nb::none(),
+      "bias"_a = nb::none(),
+      "scoring"_a = "softmax",
+      "scale"_a = 1.0f,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
-        Router top-k in one dispatch: f32 softmax over the first E columns,
-        top_k selection (min-index tie-break), optional renormalization, an
-        optional per-expert scale applied to the picked scores, and (when
-        shared_gate) the sigmoid of column E (the shared-expert gate logit)
-        in the last scores slot.
+        Router top-k in one dispatch: f32 scoring over the first E columns
+        (softmax, or sqrtsoftplus = sqrt(softplus(x)) for deepseek-v4),
+        top_k selection (min-index tie-break) optionally ranked by
+        score + bias, optional renormalization, an optional per-expert
+        scale applied to the picked scores, a uniform scale on emitted
+        routed scores, and (when shared_gate) the sigmoid of column E (the
+        shared-expert gate logit) in the last scores slot.
 
         Args:
             logits (array): router logits [T, E + shared_gate]; E <= 1024.
             top_k (int): experts per token, <= 16.
-            norm_topk_prob (bool): renormalize picked probabilities.
+            norm_topk_prob (bool): renormalize picked scores. Required for
+                sqrtsoftplus (renorm carries the model's 1e-20 guard).
             shared_gate (bool): logits carry a trailing shared-gate column.
             per_expert_scale (array, optional): [E] multiplier on picked
                 scores, applied after renormalization; cast to float32.
+            bias (array, optional): [E] selection bias
+                (e_score_correction_bias); emitted scores stay unbiased.
+            scoring (str): "softmax" or "sqrtsoftplus".
+            scale (float): uniform multiplier on emitted routed scores
+                (routed_scaling_factor).
 
         Returns:
             tuple: (indices [T, top_k] uint32,
@@ -585,6 +801,62 @@ NB_MODULE(_ext, m) {
 
         Returns:
             array: the gathered matmul result (x.dtype, float32 -> bfloat16).
+      )");
+
+  m.def(
+      "expert_tile_map",
+      &mlx_kquant::expert_tile_map,
+      "indices"_a,
+      "n_experts"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Build the gather_qmm_seg tile map from expert-sorted routing indices,
+        entirely on GPU (no host sync).
+
+        Args:
+            indices (array): 1-D uint32 expert ids, sorted ascending.
+            n_experts (int): total expert count (sizes the map bound).
+
+        Returns:
+            tuple: (map, counts) -- uint32 [cap, 3] tile table of
+            (expert, row_start, num_rows) tiling each segment into 64-row
+            tiles where only the last tile of a segment can be partial, plus
+            uint32 [1] valid-tile count. Slots past the count are
+            uninitialized; tile order is unspecified. Metal-only.
+      )");
+
+  m.def(
+      "gather_qmm_seg",
+      &mlx_kquant::gather_qmm_seg,
+      "x"_a,
+      "w"_a,
+      "scales"_a,
+      "kquant_type"_a,
+      "map"_a,
+      "counts"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Segment-walking gather GEMM for expert-sorted MoE prefill.
+
+        Args:
+            x (array): float activations [rows, K], rows pre-sorted by expert.
+            w (array): uint8 K-quant wire bytes shaped
+                (n_experts, out_dims, bytes_per_row).
+            scales (array): vestigial placeholder; ignored by the kernel.
+            kquant_type (str): codec name, e.g. ``"iq2_xxs"``.
+            map (array): uint32 [n_tiles, 3] rows of
+                (expert, row_start, num_rows), num_rows <= 64. Only the last
+                tile of a segment may be partial; its dead row fragments are
+                skipped in the MMA.
+            counts (array): uint32 [1] valid-tile count. Valid tiles never
+                span experts and must cover every x row exactly once
+                (uncovered output rows are left unwritten). Use
+                expert_tile_map to build both.
+
+        Returns:
+            array: [rows, out_dims] (x.dtype, float32 -> bfloat16). Metal-only.
       )");
 
   m.def(

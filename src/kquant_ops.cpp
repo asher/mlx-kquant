@@ -1,5 +1,6 @@
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <sstream>
 #include <stdexcept>
@@ -10,6 +11,7 @@
 #include "mlx/utils.h" // to_stream
 
 #ifdef _METAL_
+#include "kquant_metal_internal.h" // kq_is_nax_available / codec_has_nax
 #include "mlx/backend/metal/device.h"
 #endif
 
@@ -412,6 +414,134 @@ mx::array gather_qmm(
       {x_c, w_c, scales_c, std::move(lhs_indices), std::move(rhs_indices)});
 }
 
+std::vector<mx::array>
+expert_tile_map(mx::array indices, int n_experts, mx::StreamOrDevice s_) {
+  if (indices.ndim() != 1 || indices.dtype() != mx::uint32) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.expert_tile_map] indices must be 1-D uint32 but got "
+        << "shape " << indices.shape() << " dtype " << indices.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  int rows = indices.shape(0);
+  if (rows < 1 || n_experts < 1) {
+    throw std::invalid_argument(
+        "[mlx_kquant.expert_tile_map] indices must be non-empty and "
+        "n_experts positive.");
+  }
+
+  auto s = mx::to_stream(s_);
+  auto idx_c = mx::contiguous(indices, false, s);
+
+  int cap = std::max(rows / 64 + std::min(n_experts, rows), 1);
+  std::vector<mx::Shape> shapes = {{cap, 3}, {1}};
+  std::vector<mx::Dtype> dtypes = {mx::uint32, mx::uint32};
+  return mx::array::make_arrays(
+      std::move(shapes),
+      dtypes,
+      std::make_shared<KQuantExpertTileMap>(s, n_experts),
+      {idx_c});
+}
+
+namespace {
+
+void check_seg_map(
+    const mx::array& m,
+    const char* which,
+    const std::string& op) {
+  if (m.ndim() != 2 || m.shape(1) != 3 || m.dtype() != mx::uint32 ||
+      m.shape(0) < 1) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant." << op << "] " << which
+        << " must be uint32 [n_tiles >= 1, 3] (expert, row_start, num_rows) "
+        << "but got shape " << m.shape() << " dtype " << m.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
+} // namespace
+
+mx::array gather_qmm_seg(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    const std::string& kquant_type,
+    mx::array map,
+    mx::array counts,
+    mx::StreamOrDevice s_) {
+  if (w.dtype() != mx::uint8) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_seg] w must be uint8 (raw GGUF wire bytes).");
+  }
+  const KQuantCodec* codec = codec_by_name(kquant_type);
+  if (codec == nullptr) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_seg] Unknown kquant_type: '" + kquant_type +
+        "'.");
+  }
+  if (x.ndim() != 2) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_seg] x must be [rows, K] but got shape "
+        << x.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (w.ndim() != 3) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_seg] w must be "
+        << "(n_experts, N, bytes_per_row) but got shape " << w.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  check_seg_map(map, "map", "gather_qmm_seg");
+  if (counts.ndim() != 1 || counts.shape(0) != 1 ||
+      counts.dtype() != mx::uint32) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_seg] counts must be uint32 [1] but got "
+        << "shape " << counts.shape() << " dtype " << counts.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  int w_bytes_per_row = w.shape(-1);
+  if (w_bytes_per_row % codec->bytes_per_block != 0) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_seg] KQuant weight last dim ("
+        << w_bytes_per_row << " bytes) is not a whole number of "
+        << codec->bytes_per_block << "-byte " << codec->name << " blocks.";
+    throw std::invalid_argument(msg.str());
+  }
+  int weights_per_row =
+      (w_bytes_per_row / codec->bytes_per_block) * codec->weights_per_block;
+  if (weights_per_row != x.shape(-1)) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_seg] x last dim (" << x.shape(-1)
+        << ") does not match the expanded quantized row width ("
+        << weights_per_row << ") for codec '" << codec->name << "'.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  mx::Dtype out_type = (x.dtype() == mx::float32) ? mx::bfloat16 : x.dtype();
+  if (!mx::issubdtype(out_type, mx::floating)) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_seg] Only real floating x dtypes are "
+        "supported.");
+  }
+
+  auto s = mx::to_stream(s_);
+  auto x_c = kq_ensure_row_contiguous_matrix(mx::astype(x, out_type, s), s);
+  // The kernel computes each expert's base pointer as expert * N * K_w, so w
+  // must be fully row-contiguous (no strided expert dim).
+  auto w_c = mx::contiguous(w, false, s);
+  auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
+  auto map_c = mx::contiguous(map, false, s);
+  auto cnt_c = mx::contiguous(counts, false, s);
+
+  mx::Shape out_shape{x.shape(0), w.shape(1)};
+  return mx::array(
+      std::move(out_shape),
+      out_type,
+      std::make_shared<KQuantGatherQMMSeg>(
+          s, kquant_type, codec->weights_per_block, codec->bits),
+      {x_c, w_c, scales_c, std::move(map_c), std::move(cnt_c)});
+}
+
 std::vector<mx::array> quantize(
     const mx::array& w,
     const std::string& kquant_type,
@@ -518,6 +648,23 @@ bool metallib_loads() {
   d.get_library("mlx_kquant", metallib_dir());
   return true;
 #else
+  return false;
+#endif
+}
+
+bool nax_available() {
+#ifdef _METAL_
+  return kq_is_nax_available();
+#else
+  return false;
+#endif
+}
+
+bool nax_gather_enabled(const std::string& kquant_type) {
+#ifdef _METAL_
+  return kq_is_nax_available() && codec_has_nax(kquant_type);
+#else
+  (void)kquant_type;
   return false;
 #endif
 }

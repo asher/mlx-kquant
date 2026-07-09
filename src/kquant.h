@@ -25,6 +25,16 @@ std::string metallib_dir();
 // Returns false only on a non-Metal build.
 bool metallib_loads();
 
+// True when the GPU supports the NAX (tensor-core) matmul kernels (false on
+// non-Metal builds and pre-NAX GPUs).
+bool nax_available();
+
+// True when gather_qmm's sorted-rhs NAX GEMM leaf can serve `kquant_type`
+// here: NAX hardware present, the codec ships NAX kernels, and KQ_DISABLE_NAX
+// is unset (read live). Callers with their own sorted-prefill arms (e.g. the
+// gather_qmm_seg switch arm) defer to gather_qmm when this holds.
+bool nax_gather_enabled(const std::string& kquant_type);
+
 // ----------------------------- ops -----------------------------
 
 // Dequantize GGUF K-quant wire bytes `w` (uint8, last dim a multiple of the
@@ -86,6 +96,34 @@ mx::array gather_qmm(
     std::optional<mx::array> rhs_indices = std::nullopt,
     bool transpose = true,
     bool sorted_indices = false,
+    mx::StreamOrDevice s = {});
+
+// Build the gather_qmm_seg tile map from expert-sorted routing indices, on
+// GPU (no host sync). Returns {map, counts}: map uint32 [cap, 3] rows of
+// (expert, row_start, num_rows) tiling each segment into 64-row tiles where
+// only the last tile of a segment can be partial; counts uint32 [1] = the
+// number of valid tiles. The cap is a shape-only upper bound; slots past
+// counts are uninitialized and tile order is unspecified. Metal-only.
+std::vector<mx::array>
+expert_tile_map(mx::array indices, int n_experts, mx::StreamOrDevice s = {});
+
+// Segment-walking gather GEMM for expert-sorted MoE prefill. x is [R, K] rows
+// pre-sorted by expert; w is uint8 wire bytes (n_experts, N, bytes_per_row);
+// map / counts are the expert_tile_map outputs (or host-built equivalents):
+// uint32 [*, 3] tile rows of (expert, row_start, num_rows <= 64), tiles
+// never spanning experts. One dispatch computes
+// y[row_start : row_start + num_rows] = x_seg @ dequant(w[expert]).T per tile
+// at tiled-GEMM throughput; partial tiles skip dead row fragments in the MMA
+// so ragged segments cost ~ceil(num_rows / 8) row fragments. Rows not
+// covered by the valid tiles are left unwritten (the caller's map must cover
+// every row exactly once). Output dtype follows quantized_matmul. Metal-only.
+mx::array gather_qmm_seg(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    const std::string& kquant_type,
+    mx::array map,
+    mx::array counts,
     mx::StreamOrDevice s = {});
 
 // Quantize (encode) a float weight tensor `w` into GGUF K-quant wire bytes.
@@ -185,9 +223,12 @@ mx::array gather_qmv_bias(
 
 // K-quant counterpart of moe_glu_gather: gate and up expert matvecs on GGUF
 // wire bytes (n_experts, out_dims, bytes_per_row) sharing each activation
-// load, with the GLU epilogue act(g) * u fused (act: "silu" or "gelu"). No
-// biases. x [T, K], indices [T, R]. Returns [T, R, N]. Metal-only; requires
-// K % 256 == 0 and a codec with the fused kernel wired (full GGUF matrix).
+// load, with the GLU epilogue act(g) * u fused (act: "silu", "gelu" or
+// "silu_limit" -- the latter clamps g from above and u to +-limit before
+// silu(g) * u, deepseek-v4 LimitedSwiGLU semantics, and requires limit > 0).
+// No biases. x [T, K], indices [T, R]. Returns [T, R, N]. Metal-only;
+// requires K % 256 == 0 and a codec with the fused kernel wired (full GGUF
+// matrix).
 mx::array moe_glu_gather_kq(
     mx::array x,
     mx::array gate_w,
@@ -195,7 +236,99 @@ mx::array moe_glu_gather_kq(
     const std::string& kquant_type,
     mx::array indices,
     const std::string& act = "silu",
+    float limit = 0.0f,
     mx::StreamOrDevice s = {});
+
+// DeepSeek-V4-Flash sparse attention: sliding local window + gathered
+// indexer-selected pooled rows + per-head sinks in one dispatch (flash
+// online softmax, f32 accumulation). q [B, 64, qL, 512] (qL >= 1: decode,
+// MTP verify and prefill all use this kernel), local_kv [B, 1, localL, 512]
+// (K == V shared latent), pooled [B, P, 512], topk_indices [B, 1, qL, N]
+// uint32 (invalid/masked slots < 0 or >= the causal pooled horizon
+// (q_offset + pos + 1) / compress_ratio contribute nothing), sinks [64].
+// Returns [B, 64, qL, 512]. Metal-only.
+mx::array dsa_sparse_attention(
+    mx::array q,
+    mx::array local_kv,
+    mx::array pooled,
+    mx::array topk_indices,
+    mx::array sinks,
+    float scale,
+    int q_offset,
+    int compress_ratio,
+    int local_window,
+    mx::StreamOrDevice s = {});
+
+// DeepSeek-V4-Flash lightning-indexer relevance scores (steel GEMM):
+// out[b, 0, m, n] = sum_h relu(q[b, h, m, :] . k[b, 0, n, :]) * w_h_m.
+// q [B, H, M, 128] (H 32 or 64), k [B, 1, N, 128]; weights either
+// [B, M, H] ("lh" layout) or [B, H, M, 1]. Requires M % 64 == 0 and
+// N % 64 == 0 (pad or fall back Python-side; decode pads the single query
+// row to 64 and keeps row 0). causal masks n > causal_q_offset + m with
+// -inf (causal_q_offset -1 means N - M); with skip_causal_future_store the
+// fully-masked tiles are left unwritten instead (only valid when the
+// consumer never reads them, e.g. a causal_valid_prefix top-k).
+// Returns [B, 1, M, N]. Metal-only.
+mx::array dsa_indexer_scores(
+    mx::array queries,
+    mx::array keys,
+    mx::array weights,
+    bool causal = true,
+    int unused_causal_prefix_topk = 0,
+    bool skip_causal_future_store = false,
+    int causal_q_offset = -1,
+    mx::StreamOrDevice s = {});
+
+// Per-row top-k arg-select over 16-bit float scores (2-pass radix over the
+// orderable bit transform; one threadgroup per row). scores [B, 1, L, K]
+// fp16/bf16, topk in {512, 2048}, K >= topk. The selected set matches a
+// full sort; intra-row order does not (threshold ties admitted in scan
+// order). bucketed emits >threshold before ==threshold deterministically.
+// causal_valid_prefix clamps each row's scan to K - L + row%L + 1 entries
+// (scores laid out with queries as trailing rows) and emits the identity
+// prefix when the valid range fits inside topk. Returns [B, 1, L, topk]
+// uint32. Metal-only.
+mx::array dsa_topk_indices(
+    mx::array scores,
+    int topk,
+    bool bucketed = false,
+    bool causal_valid_prefix = false,
+    mx::StreamOrDevice s = {});
+
+// Decode-width lightning-indexer scores, fused: sum_h relu(q_h . k_p) * w_h
+// for qL <= 4 query rows over every pooled row without materializing the
+// [H, P] per-head scores. queries [B, 64, qL, 128], keys [B, P, 128] (the
+// pooled cache, rank 3), weights [B, qL, 64] with any positive global scale
+// folded out (top-k invariant). Pooled visibility follows
+// PoolingCache.make_mask(qL, q_offset): row i is visible to query j iff
+// i < (q_offset + j + 1) / ratio, and every row is visible when qL == 1;
+// invisible rows score the dtype's finite min. Returns [B, 1, qL, P] scores
+// shaped for dsa_topk_indices. Metal-only.
+mx::array dsa_indexer_score_decode(
+    mx::array queries,
+    mx::array keys,
+    mx::array weights,
+    int q_offset,
+    int ratio,
+    mx::StreamOrDevice s = {});
+
+// DeepSeek-V4-Flash indexer activation QAT round-trip, fused: 128-wide
+// Hadamard (mlx hadamard_n butterfly order and 1/sqrt(128) scale, exactly)
+// then the per-32-block FP4-E2M1 round-trip (scale 2^ceil(log2(amax/6)),
+// amax floor FLT_MIN*6, clamp +-6, tie-to-even threshold ladder). x is any
+// shape with a trailing dim of 128; returns the same shape and dtype.
+// Bit-compatible with the mx.hadamard_transform + compiled fp4-core chain.
+// Metal-only.
+mx::array dsa_indexer_qat(mx::array x, mx::StreamOrDevice s = {});
+
+// DeepSeek-V4-Flash main-attention KV QAT round-trip in one dispatch:
+// per-64-block FP8-E4M3FN round-trip (scale 2^ceil(log2(amax/448)), amax
+// floor 1e-4, clamp +-448, ties-to-even) on the leading dims, the trailing
+// n_rot RoPE dims fp8-exempt, then the whole row rounded through fp16 (the
+// f16 KV-cache step). x is any shape with trailing dim D where
+// (D - n_rot) % 64 == 0; returns the same shape and dtype. Bit-compatible
+// with the split + fp8-core + concat + astype chain. Metal-only.
+mx::array dsa_kv_qat(mx::array x, int n_rot, mx::StreamOrDevice s = {});
 
 // K-quant gathered matvec (down projection), same wire layout. x [T, R, K]
 // (one row per expert slot), indices [T, R]. Returns [T, R, N]. Metal-only.
@@ -249,15 +382,21 @@ mx::array gather_qmv_mix_ns_kq(
     mx::array scores,
     mx::StreamOrDevice s = {});
 
-// Router top-k in one dispatch: softmax over E logit columns in f32, pick
-// the top_k largest (min-index tie-break), optionally renormalize the picked
-// probabilities (norm_topk_prob; equals softmax over the selected raw logits
-// -- the gemma router semantics). With shared_gate (qwen3-next), logits are
-// [T, E + 1], column E is the shared-expert gate logit and its sigmoid lands
-// in the last scores slot; without, logits are [T, E] and scores are
-// [T, top_k]. Optional per_expert_scale ([E] float) multiplies each picked
-// score by its expert's scale (gemma). Returns {indices [T, top_k] uint32,
-// scores float32} -- exactly the inputs moe_glu_gather_shexp_kq /
+// Router top-k in one dispatch: score E logit columns in f32 ("softmax" or
+// "sqrtsoftplus" = sqrt(softplus(x)), deepseek-v4), pick the top_k largest
+// (min-index tie-break), optionally renormalize the picked scores
+// (norm_topk_prob; for softmax equals softmax over the selected raw logits
+// -- the gemma router semantics; required for sqrtsoftplus, which has no
+// global normalizer and renorms with the model's 1e-20 guard). Optional
+// bias ([E] float, e_score_correction_bias) ranks selection by
+// score + bias while emitted scores stay unbiased. With shared_gate
+// (qwen3-next), logits are [T, E + 1], column E is the shared-expert gate
+// logit and its sigmoid lands in the last scores slot; without, logits are
+// [T, E] and scores are [T, top_k]. Optional per_expert_scale ([E] float)
+// multiplies each picked score by its expert's scale (gemma); scale is a
+// uniform multiplier on emitted routed scores (deepseek-v4
+// routed_scaling_factor). Returns {indices [T, top_k] uint32, scores
+// float32} -- exactly the inputs moe_glu_gather_shexp_kq /
 // gather_qmv_mix*_kq consume. E <= 1024, top_k <= 16. Metal-only.
 std::vector<mx::array> moe_router_topk(
     mx::array logits,
@@ -265,6 +404,9 @@ std::vector<mx::array> moe_router_topk(
     bool norm_topk_prob,
     bool shared_gate = true,
     const std::optional<mx::array>& per_expert_scale = std::nullopt,
+    const std::optional<mx::array>& bias = std::nullopt,
+    const std::string& scoring = "softmax",
+    float scale = 1.0f,
     mx::StreamOrDevice s = {});
 
 // Fused residual + RMSNorm glue (one dispatch each; see kq_norm_fused.h).
@@ -563,16 +705,207 @@ class KQuantGatherQMVBias : public mx::Primitive {
   bool is_equivalent(const mx::Primitive& other) const override;
 };
 
+// DeepSeek-V4-Flash sparse attention (see dsa_sparse_attention).
+// Inference-only, Metal-only.
+class KQDsaSparseAttention : public mx::Primitive {
+ public:
+  explicit KQDsaSparseAttention(
+      mx::Stream stream,
+      float scale,
+      int q_offset,
+      int compress_ratio,
+      int local_window)
+      : mx::Primitive(stream),
+        scale_(scale),
+        q_offset_(q_offset),
+        compress_ratio_(compress_ratio),
+        local_window_(local_window) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQDsaSparseAttention";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int q_offset_;
+  int compress_ratio_;
+  int local_window_;
+};
+
+// DeepSeek-V4-Flash indexer relevance scores (see dsa_indexer_scores).
+// Inference-only, Metal-only.
+class KQDsaIndexerScores : public mx::Primitive {
+ public:
+  explicit KQDsaIndexerScores(
+      mx::Stream stream,
+      bool causal,
+      bool weights_lh,
+      int unused_causal_prefix_topk,
+      bool skip_causal_future_store,
+      int causal_q_offset)
+      : mx::Primitive(stream),
+        causal_(causal),
+        weights_lh_(weights_lh),
+        unused_causal_prefix_topk_(unused_causal_prefix_topk),
+        skip_causal_future_store_(skip_causal_future_store),
+        causal_q_offset_(causal_q_offset) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQDsaIndexerScores";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  bool causal_;
+  bool weights_lh_;
+  int unused_causal_prefix_topk_;
+  bool skip_causal_future_store_;
+  int causal_q_offset_;
+};
+
+// DeepSeek-V4-Flash indexer top-k select (see dsa_topk_indices).
+// Inference-only, Metal-only.
+class KQDsaTopKIndices : public mx::Primitive {
+ public:
+  explicit KQDsaTopKIndices(
+      mx::Stream stream,
+      int topk,
+      bool bucketed,
+      bool causal_valid_prefix)
+      : mx::Primitive(stream),
+        topk_(topk),
+        bucketed_(bucketed),
+        causal_valid_prefix_(causal_valid_prefix) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQDsaTopKIndices";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int topk_;
+  bool bucketed_;
+  bool causal_valid_prefix_;
+};
+
+// DeepSeek-V4-Flash decode-width indexer scores (see
+// dsa_indexer_score_decode). Inference-only, Metal-only.
+class KQDsaIndexerScoreDecode : public mx::Primitive {
+ public:
+  explicit KQDsaIndexerScoreDecode(mx::Stream stream, int q_offset, int ratio)
+      : mx::Primitive(stream), q_offset_(q_offset), ratio_(ratio) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQDsaIndexerScoreDecode";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int q_offset_;
+  int ratio_;
+};
+
+// DeepSeek-V4-Flash fused indexer QAT round-trip (see dsa_indexer_qat).
+// Inference-only, Metal-only.
+class KQDsaIndexerQat : public mx::Primitive {
+ public:
+  explicit KQDsaIndexerQat(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQDsaIndexerQat";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+};
+
+// DeepSeek-V4-Flash fused main-attention KV QAT round-trip (see
+// dsa_kv_qat). Inference-only, Metal-only.
+class KQDsaKvQat : public mx::Primitive {
+ public:
+  explicit KQDsaKvQat(mx::Stream stream, int n_rot)
+      : mx::Primitive(stream), n_rot_(n_rot) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQDsaKvQat";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int n_rot_;
+};
+
 // K-quant fused MoE GLU gather (see moe_glu_gather_kq). Inference-only.
 class KQuantMoEGLUKQ : public mx::Primitive {
  public:
   explicit KQuantMoEGLUKQ(
       mx::Stream stream,
       std::string kquant_type,
-      std::string act)
+      std::string act,
+      float limit = 0.0f)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
-        act_(std::move(act)) {}
+        act_(std::move(act)),
+        limit_(limit) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -592,6 +925,7 @@ class KQuantMoEGLUKQ : public mx::Primitive {
  private:
   std::string kquant_type_;
   std::string act_;
+  float limit_;
 };
 
 // K-quant gathered matvec (see gather_qmv_kq). Inference-only.
@@ -711,7 +1045,7 @@ class KQuantGatherQMVMixNSKQ : public mx::Primitive {
   std::string kquant_type_;
 };
 
-// Router softmax + top-k + score epilogue (see moe_router_topk). Two
+// Router scoring + top-k + score epilogue (see moe_router_topk). Two
 // outputs (indices, scores). Inference-only.
 class KQuantMoERouterTopK : public mx::Primitive {
  public:
@@ -720,12 +1054,18 @@ class KQuantMoERouterTopK : public mx::Primitive {
       int top_k,
       bool norm,
       bool shared,
-      bool has_pes)
+      bool has_pes,
+      bool has_bias,
+      int scoring,
+      float scale)
       : mx::Primitive(stream),
         top_k_(top_k),
         norm_(norm),
         shared_(shared),
-        has_pes_(has_pes) {}
+        has_pes_(has_pes),
+        has_bias_(has_bias),
+        scoring_(scoring),
+        scale_(scale) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -747,6 +1087,9 @@ class KQuantMoERouterTopK : public mx::Primitive {
   bool norm_;
   bool shared_;
   bool has_pes_;
+  bool has_bias_;
+  int scoring_;
+  float scale_;
 };
 
 // Fused (residual + rms_norm(h, w)) * scale (see add_rmsnorm).
@@ -886,6 +1229,67 @@ class KQuantGatherQMM : public mx::Primitive {
   bool transpose_;
   bool left_sorted_;
   bool right_sorted_;
+};
+
+// Tile-map builder (see expert_tile_map). Multi-output: {map, counts}.
+// Inference-only, Metal-only.
+class KQuantExpertTileMap : public mx::Primitive {
+ public:
+  explicit KQuantExpertTileMap(mx::Stream stream, int n_experts)
+      : mx::Primitive(stream), n_experts_(n_experts) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantExpertTileMap";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int n_experts_;
+};
+
+// Segment-walking gather GEMM (see gather_qmm_seg). Inference-only, Metal-only:
+// eval_cpu and the default vjp/jvp throw.
+class KQuantGatherQMMSeg : public mx::Primitive {
+ public:
+  explicit KQuantGatherQMMSeg(
+      mx::Stream stream,
+      std::string kquant_type,
+      int group_size,
+      int bits)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        group_size_(group_size),
+        bits_(bits) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantGatherQMMSeg";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+  int group_size_;
+  int bits_;
 };
 
 // Encode a float weight tensor into K-quant wire bytes. Multi-output primitive:

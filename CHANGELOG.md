@@ -6,7 +6,36 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.3]
+
 ### Added
+- DeepSeek-V4-Flash / GLM sparse attention, ported with modifications from
+  omlx's `glm_moe_dsa` custom kernels (Apache-2.0; per-file OpenAI/Apple
+  notices preserved). `dsa_sparse_attention` runs the sliding local window plus
+  the indexer-selected pooled KV rows plus per-head attention sinks in one
+  flash-softmax dispatch (f32 accumulation); the lightning indexer is
+  `dsa_indexer_scores` (prefill GEMM), `dsa_indexer_score_decode` (fused
+  decode-width scores), and `dsa_topk_indices` (2-pass radix arg-select). All
+  accept `qL >= 1`, so decode, MTP verify (`qL = 2`), and prefill share them.
+- `dsa_kv_qat` and `dsa_indexer_qat`: fused DeepSeek-V4 quantization-aware
+  round-trips - per-64-block FP8-E4M3FN on the main-attention KV, and a 128-wide
+  Hadamard transform then per-32-block FP4-E2M1 on the indexer activations -
+  each bit-identical to the equivalent MLX graph.
+- `silu_limit` activation for the fused K-quant MoE GLU gather: the clamped
+  SwiGLU `silu(min(g, limit)) * clip(u, -limit, limit)` that DeepSeek-V4's
+  `LimitedSwiGLU` needs, passed as a constant-buffer limit (dead-arg-stripped
+  for the existing silu/gelu paths, so their kernels are unchanged).
+- `moe_router_topk` gains `sqrtsoftplus` scoring (`sqrt(softplus(x))`),
+  score-plus-bias ranked selection, and an optional per-expert routed scale -
+  DeepSeek-V4 routing in one dispatch.
+- `gather_qmm_seg` + `expert_tile_map`: expert-sorted MoE prefill as one GEMM
+  per expert segment instead of per-row gathers, with the 64-row tile map built
+  on the GPU from the sorted routing indices (no host sync). `KQuantSwitchLinear`
+  takes this arm on large prefill batches, gated by `KQ_SWITCH_GEMM_MIN_ROWS`
+  (default `512`). `nax_gather_enabled` reports whether the sorted-gather NAX
+  leaf is reachable, so the arm defers to it on tensor-unit GPUs.
+- `docs/kernels.md`: a capability-grouped reference for the fused and
+  architecture-specific kernels beyond the four core codec ops.
 - `sdpa_fa_verify` head_dim 512: 256-thread d-split kernel (gemma-4
   global-attention verify/decode, folds to 32 rows) + vectorized K/V staging.
 - `sdpa_fa_verify` now takes a 64-row query tile (up from 32), so a GQA-16
@@ -18,15 +47,25 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   codecs. Walks each row tile's per-expert segments and runs one full-K
   matmul per segment, so the sorted batch no longer decomposes into
   per-row `gather_qmv` calls. The row tile height adapts to the batch's
-  rows-per-expert (BM 16/32/64 at M/E thresholds 40/384, tuned on M3 Max):
-  every segment pays a full-tile mma pass, so a tile much taller than a
-  segment wastes most of every matmul. MoE prefill-shape rates on an M3 Max
-  improve ~5-6x at large batches (q4_k 9.5 / q5_k 8.0 / q6_k 7.7 TFLOPS at
-  128 rows/expert) and more at mid sizes where the adaptive tile kicks in.
+  rows-per-expert (BM 16/32/64 at M/E thresholds 40/384): every segment pays a
+  full-tile mma pass, so a tile much taller than a segment wastes most of every
+  matmul. This is a large speedup on MoE prefill shapes at big batches, and more
+  at mid sizes where the adaptive tile kicks in.
   `KQ_DISABLE_GATHER_RHS_ALU=1` forces the old per-row path;
   `KQ_GATHER_RHS_BM` pins the tile height (retuning lever). On NAX machines
   the NAX leaf still takes precedence; the new kernel serves the cases NAX
   refuses (older macOS, `K % 64 != 0`, `KQ_DISABLE_NAX=1`).
+
+### Changed
+- iq2_xxs / iq3_xxs Ext MoE gathers stage their dequant LUTs in threadgroup
+  memory, shared across the gather's lanes.
+- q2_k / q3_k decode `qmm_t` weight loaders re-read each K-tile statelessly
+  instead of carrying a deep decoded-register cache; q6_k keeps its shallow
+  cache (its two-stream nibble decode is heavy enough that re-reading is
+  slower).
+- `KQuantMultiLinear` memoizes its gather index arrays across calls, so a decode
+  loop reuses one constant pair instead of rebuilding the arange/broadcast graph
+  every layer.
 
 ### Fixed
 - `sdpa_fa_verify` read a lazily-strided query as packed: it trusted the

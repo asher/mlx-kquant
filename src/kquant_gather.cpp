@@ -944,4 +944,147 @@ void KQuantGatherQMM::eval_gpu(
 
 #endif // _METAL_
 
+std::vector<mx::Shape> KQuantExpertTileMap::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  int rows = inputs[0].shape(0);
+  // Per expert: ceil(len / 64) tiles = at most rows / 64 full tiles overall
+  // plus one partial tile per present expert.
+  int cap = std::max(rows / 64 + std::min(n_experts_, rows), 1);
+  return {{cap, 3}, {1}};
+}
+
+bool KQuantExpertTileMap::is_equivalent(const mx::Primitive& other) const {
+  return n_experts_ ==
+      static_cast<const KQuantExpertTileMap&>(other).n_experts_;
+}
+
+void KQuantExpertTileMap::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant] expert_tile_map has no CPU implementation.");
+}
+
+std::vector<mx::Shape> KQuantGatherQMMSeg::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  return {{inputs[0].shape(0), inputs[1].shape(1)}};
+}
+
+bool KQuantGatherQMMSeg::is_equivalent(const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQuantGatherQMMSeg&>(other);
+  return kquant_type_ == o.kquant_type_ && group_size_ == o.group_size_ &&
+      bits_ == o.bits_;
+}
+
+void KQuantGatherQMMSeg::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant] gather_qmm_seg has no CPU implementation.");
+}
+
+#ifdef _METAL_
+
+void KQuantExpertTileMap::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  const auto& indices = inputs[0];
+  auto& map = outputs[0];
+  auto& counts = outputs[1];
+  map.set_data(mx::allocator::malloc(map.nbytes()));
+  counts.set_data(mx::allocator::malloc(counts.nbytes()));
+
+  int rows = indices.shape(0);
+  auto& ce = mx::metal::get_command_encoder(s);
+
+  {
+    auto kernel = kq_get_kernel(d, "kq_seg_zero_counts");
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_output_array(counts, 0);
+    ce.dispatch_threads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
+  }
+  {
+    auto kernel = kq_get_kernel(d, "kq_expert_tile_map");
+    ce.set_compute_pipeline_state(kernel);
+    int c = 0;
+    ce.set_input_array(indices, c++);
+    ce.set_output_array(map, c++);
+    ce.set_output_array(counts, c++);
+    ce.set_bytes(rows, c++);
+    int tg = 256;
+    MTL::Size grid((rows + tg - 1) / tg, 1, 1);
+    ce.dispatch_threadgroups(grid, MTL::Size(tg, 1, 1));
+  }
+}
+
+void KQuantGatherQMMSeg::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  // inputs are row-contiguous (ensured by the op): x [R, K] (float),
+  // w [E, N, bpr] (uint8), scales, map [T, 3] (uint32), counts [1].
+  const auto& x = inputs[0];
+  const auto& w = inputs[1];
+  const auto& scales = inputs[2];
+  const auto& map = inputs[3];
+  const auto& counts = inputs[4];
+
+  int K = x.shape(-1);
+  int N = w.shape(1);
+
+  constexpr int bn = 64;
+  bool aligned = N % bn == 0;
+  auto& ce = mx::metal::get_command_encoder(s);
+
+  std::string kname;
+  kname.reserve(96);
+  mx::concatenate(
+      kname,
+      kq_kname_prefix(kquant_type_) + "gather_qmm_seg_t_",
+      kq_type_string(x.dtype()),
+      "_gs_",
+      group_size_,
+      "_b_",
+      bits_,
+      aligned ? "_alN_true" : "_alN_false");
+  auto kernel = kq_get_kernel(d, kname);
+  ce.set_compute_pipeline_state(kernel);
+  int c = 0;
+  ce.set_input_array(w, c++);
+  ce.set_input_array(scales, c++);
+  ce.set_input_array(x, c++);
+  ce.set_input_array(map, c++);
+  ce.set_input_array(counts, c++);
+  ce.set_output_array(out, c++);
+  ce.set_bytes(K, c++);
+  ce.set_bytes(N, c++);
+  MTL::Size group_dims(32, 2, 2);
+  MTL::Size grid_dims((N + bn - 1) / bn, map.shape(0), 1);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+#else
+
+void KQuantExpertTileMap::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant] expert_tile_map has no GPU implementation.");
+}
+
+void KQuantGatherQMMSeg::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant] gather_qmm_seg has no GPU implementation.");
+}
+
+#endif // _METAL_
+
 } // namespace mlx_kquant
