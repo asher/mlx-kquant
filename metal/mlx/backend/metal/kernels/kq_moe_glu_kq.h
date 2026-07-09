@@ -29,14 +29,25 @@
 #define KQ_GLU_ACT_SILU 0
 #define KQ_GLU_ACT_GELU 1
 #define KQ_GLU_ACT_SILU_LIMIT 2
+#define KQ_GLU_ACT_SWIGLU_CLAMP 3
 
 template <int ACT>
-inline float kq_glu_epilogue(float g, float u, float limit) {
+inline float
+kq_glu_epilogue(float g, float u, float limit, float alpha = 1.0f) {
   if (ACT == KQ_GLU_ACT_GELU) {
     // tanh-approx gelu (matches mlx nn.gelu_approx / gemma usage)
     const float g3 = 0.044715f * g * g * g;
     const float t = metal::precise::tanh(0.7978845608028654f * (g + g3));
     return (0.5f * g * (1.0f + t)) * u;
+  }
+  if (ACT == KQ_GLU_ACT_SWIGLU_CLAMP) {
+    // gpt-oss clamped SwiGLU: gate clamped from above only, up clamped both
+    // sides, sigmoid slope alpha, and a (u + 1) linear term -- matches the
+    // packed kq_moe_glu_gather epilogue (kq_moe_glu.h).
+    g = metal::min(g, limit);
+    u = metal::clamp(u, -limit, limit);
+    const float sig = 1.0f / (1.0f + metal::exp(-alpha * g));
+    return (g * sig) * (u + 1.0f);
   }
   if (ACT == KQ_GLU_ACT_SILU_LIMIT) {
     // deepseek-v4 LimitedSwiGLU: gate clamped from above only, up clamped
@@ -855,6 +866,81 @@ template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
   const float u = kq_ext_reduce<NX>(gu.y);
   if (tx == 0) {
     out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
+  }
+}
+
+// Biased variants (gpt-oss experts): per-(expert, out_dim) f32 biases added
+// to the accumulated dots before the epilogue / store. Only the uniform
+// family carries biases; shexp/mix stay bias-free (no such checkpoints).
+template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
+[[kernel]] void kq_ext_moe_glu_gather_bias(
+    const device uint8_t* gw [[buffer(0)]],
+    const device uint8_t* uw [[buffer(1)]],
+    const device float* gb [[buffer(2)]],
+    const device float* ub [[buffer(3)]],
+    const device T* x [[buffer(4)]],
+    const device uint32_t* indices [[buffer(5)]],
+    device T* out [[buffer(6)]],
+    const constant int& K [[buffer(7)]],
+    const constant int& N [[buffer(8)]],
+    const constant float& limit [[buffer(9)]],
+    const constant float& alpha [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int RPS = 32 / NX;
+  const short tx = short(simd_lid % NX);
+  const short ty = short(simd_lid / NX);
+  const int R = tpg.y;
+  const int expert = indices[tid.z * R + tid.y];
+  const int out_row = tid.x * (2 * RPS) + int(simd_gid) * RPS + ty;
+
+  x += (int64_t)tid.z * K;
+  out += ((int64_t)tid.z * R + tid.y) * N;
+
+  KQ_EXT_STAGE_LUTS(Codec, kq_luts)
+  const int64_t row = (int64_t)expert * N + out_row;
+  const float2 gu =
+      kq_ext_glu_row_partial<T, Codec, NX>(gw, uw, x, row, K, tx, kq_luts);
+  const float g = kq_ext_reduce<NX>(gu.x);
+  const float u = kq_ext_reduce<NX>(gu.y);
+  if (tx == 0) {
+    out[out_row] = static_cast<T>(
+        kq_glu_epilogue<ACT>(g + gb[row], u + ub[row], limit, alpha));
+  }
+}
+
+template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
+[[kernel]] void kq_ext_gather_qmv_bias(
+    const device uint8_t* w [[buffer(0)]],
+    const device float* b [[buffer(1)]],
+    const device T* x [[buffer(2)]],
+    const device uint32_t* indices [[buffer(3)]],
+    device T* out [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int RPS = 32 / NX;
+  const short tx = short(simd_lid % NX);
+  const short ty = short(simd_lid / NX);
+  const int R = tpg.y;
+  const int64_t row_idx = (int64_t)tid.z * R + tid.y;
+  const int expert = indices[row_idx];
+  const int out_row = tid.x * (2 * RPS) + int(simd_gid) * RPS + ty;
+
+  x += row_idx * K;
+  out += row_idx * N;
+
+  KQ_EXT_STAGE_LUTS(Codec, kq_luts)
+  const int64_t row = (int64_t)expert * N + out_row;
+  const float r = kq_ext_reduce<NX>(
+      kq_ext_row_partial<T, Codec, NX>(w, x, row, K, tx, kq_luts));
+  if (tx == 0) {
+    out[out_row] = static_cast<T>(r + b[row]);
   }
 }
 

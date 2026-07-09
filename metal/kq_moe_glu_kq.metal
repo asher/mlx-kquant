@@ -114,6 +114,22 @@ instantiate_kq_moe_glu_kq(q8_0, float16_t)
   instantiate_kq_ext_mix_ns_nx(codec, traits, 16, "_nx16")                     \
   instantiate_kq_ext_mix_ns_nx(codec, traits, 32, "_nx32")
 
+// Biased experts (gpt-oss): per-(expert, out_dim) f32 biases fused into the
+// GLU epilogue / qmv store. Only the clamped-SwiGLU epilogue is emitted --
+// biased expert checkpoints all use it.
+#define instantiate_kq_ext_bias_nx(codec, traits, type, nx, sfx)               \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_bias_swiglu_clamp" sfx "_" #type,         \
+      kq_ext_moe_glu_gather_bias, type, traits, KQ_GLU_ACT_SWIGLU_CLAMP, nx)   \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_bias" sfx "_" #type,                          \
+      kq_ext_gather_qmv_bias, type, traits, nx)
+
+#define instantiate_kq_ext_bias(codec, traits, type)                           \
+  instantiate_kq_ext_bias_nx(codec, traits, type, 8, "")                       \
+  instantiate_kq_ext_bias_nx(codec, traits, type, 16, "_nx16")                 \
+  instantiate_kq_ext_bias_nx(codec, traits, type, 32, "_nx32")
+
 #define instantiate_kq_ext_all(codec, traits)                                 \
   instantiate_kq_ext_uniform(codec, traits, bfloat16_t)                        \
   instantiate_kq_ext_uniform(codec, traits, float16_t)                         \
@@ -140,6 +156,12 @@ instantiate_kq_ext_all(iq2_xs, KqIq2_xsExt)
 instantiate_kq_ext_all(iq2_s, KqIq2_sExt)
 instantiate_kq_ext_all(iq1_s, KqIq1_sExt)
 instantiate_kq_ext_all(iq1_m, KqIq1_mExt)
+instantiate_kq_ext_all(mxfp4, KqMxfp4Ext)
+instantiate_kq_ext_all(nvfp4, KqNvfp4Ext)
+instantiate_kq_ext_bias(mxfp4, KqMxfp4Ext, bfloat16_t)
+instantiate_kq_ext_bias(mxfp4, KqMxfp4Ext, float16_t)
+instantiate_kq_ext_bias(nvfp4, KqNvfp4Ext, bfloat16_t)
+instantiate_kq_ext_bias(nvfp4, KqNvfp4Ext, float16_t)
 
 // q6_k/q8_0 experts with the OTHER upcast shexp codec (diagonals covered by
 // the tuned kernels).
