@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.4]
+
 ### Added
 - Native-fp wire codecs `mxfp4` (GGML type 39: 17-byte blocks, e8m0 scale +
   16 two-halves nibble bytes) and `nvfp4` (type 40: 36-byte blocks, four
