@@ -2303,7 +2303,7 @@ struct KqQ6_KBlockLoader {
   short kt;
   // Unlike q2_k/q3_k, q6_k keeps its decoded-quadrant register cache: it is
   // only 3-deep (vs their 7) and the two-stream ql/qh nibble decode is heavy
-  // enough that stateless re-decode measured slower (11.86 -> 11.58 TFLOPS).
+  // enough that stateless re-decode is slower.
   struct Caches {
     T q1[n_reads];
     T q2[n_reads];

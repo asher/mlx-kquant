@@ -185,9 +185,9 @@ class KQuantSwitchLinear(nn.Module):
     def __call__(self, x, indices, sorted_indices=False):
         # Prefill-shaped sorted calls (mlx-lm SwitchGLU's _gather_sort layout:
         # x [B,1,K], indices [B] ascending) run one GEMM per expert segment
-        # instead of gather_qmm's per-row matvec fallback -- ~6x on M3-class
-        # GPUs where the sorted rhs GEMM kernel is unavailable. Costs one host
-        # sync on the routing indices per MoE layer. KQ_SWITCH_GEMM_MIN_ROWS=0
+        # instead of gather_qmm's per-row matvec fallback, which is much faster
+        # where the sorted rhs GEMM kernel is unavailable. Costs one host sync
+        # on the routing indices per MoE layer. KQ_SWITCH_GEMM_MIN_ROWS=0
         # disables; read live for A/B.
         if (
             sorted_indices
