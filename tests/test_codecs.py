@@ -67,14 +67,8 @@ def _dequant(w, sc, gs, bits, codec, dt):
     return kq.dequantize(w, sc, codec, dtype=dt)
 
 
-# Native-fp codecs have no Metal matmul leaves yet; their matmul arms run on
-# the CPU stream (the streaming decode path) until those kernels land.
-NATIVE_FP_CPU_ONLY = {"mxfp4", "nvfp4"}
-
-
 def _qmm(x, w, sc, gs, bits, codec, transpose=True):
-    stream = mx.cpu if codec in NATIVE_FP_CPU_ONLY else None
-    return kq.quantized_matmul(x, w, sc, codec, transpose=transpose, stream=stream)
+    return kq.quantized_matmul(x, w, sc, codec, transpose=transpose)
 
 
 def _synth_iq_wire(rng, bpb, n_blocks):

@@ -33,10 +33,24 @@ def _synth_iq2xxs_wire(rng, n_rows):
     return wire.reshape(n_rows, (K // 256) * bpb)
 
 
+def _synth_native_fp_wire(rng, codec, n_rows):
+    bpb, wpb = (17, 32) if codec == "mxfp4" else (36, 64)
+    n_blocks = n_rows * (K // wpb)
+    wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
+    if codec == "mxfp4":
+        wire[:, 0] = rng.integers(121, 132, n_blocks, dtype=np.uint8)
+    else:
+        wire[:, 0:4] = rng.integers(0x30, 0x41, (n_blocks, 4), dtype=np.uint8)
+    return wire.reshape(n_rows, (K // wpb) * bpb)
+
+
 def _make_switch(codec):
     if codec == "iq2_xxs":
         rng = np.random.default_rng(5)
         wire = np.stack([_synth_iq2xxs_wire(rng, N) for _ in range(E)], 0)
+    elif codec in ("mxfp4", "nvfp4"):
+        rng = np.random.default_rng(5)
+        wire = np.stack([_synth_native_fp_wire(rng, codec, N) for _ in range(E)], 0)
     else:
         path = os.path.join(FIX, f"{codec}_moe.npz")
         if not os.path.exists(path):
@@ -58,7 +72,7 @@ def _sorted_inputs(rng, rows, experts):
     return x.astype(mx.float16), mx.array(idx)
 
 
-@pytest.mark.parametrize("codec", ["iq2_xxs", "q2_k"])
+@pytest.mark.parametrize("codec", ["iq2_xxs", "q2_k", "mxfp4", "nvfp4"])
 @pytest.mark.parametrize(
     "rows,experts",
     [(1024, list(range(E))), (600, [3]), (777, [0, 2, 7])],

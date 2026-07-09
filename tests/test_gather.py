@@ -62,15 +62,9 @@ E, N, K = 4, 128, 512  # experts, out_dims, in_features (K % 256 and % 64 == 0)
 BACKEND = "mlx_kquant"
 
 
-# Native-fp codecs have no Metal gather leaves yet; their arms run on the CPU
-# stream (the streaming decode path) until those kernels land.
-NATIVE_FP_CPU_ONLY = {"mxfp4", "nvfp4"}
-
-
 def _gather(x, w, sc, gs, bits, codec, lhs, rhs):
-    stream = mx.cpu if codec in NATIVE_FP_CPU_ONLY else None
     return kq.gather_qmm(
-        x, w, sc, codec, lhs_indices=lhs, rhs_indices=rhs, transpose=True, stream=stream
+        x, w, sc, codec, lhs_indices=lhs, rhs_indices=rhs, transpose=True
     )
 
 
@@ -342,8 +336,6 @@ def test_rhs_gather_sweep():
     rng = np.random.default_rng(3)
     fails = []
     for codec, (gtype, wpb, bpb, _bits, is_kq) in CODECS.items():
-        if codec in NATIVE_FP_CPU_ONLY:  # Metal sorted-tile path lands later
-            continue
         wire, ref = _wire_and_ref(codec, gtype, wpb, bpb, is_kq)
         assert wire is not None, f"missing fixture for {codec}"
         w = mx.array(wire)
