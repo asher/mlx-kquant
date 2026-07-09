@@ -14,7 +14,10 @@ Two layers:
   ten K-quant/legacy codecs: `q2_k, q3_k, q4_k, q5_k, q6_k` and `q4_0, q4_1, q5_0, q5_1, q8_0`, plus
   nine IQ codecs
   (`iq4_nl, iq4_xs, iq3_s, iq3_xxs, iq2_xxs, iq2_xs, iq2_s, iq1_s, iq1_m`) - all nineteen decode,
-  matmul (incl. tensor-core prefill), and encode (IQ encode is CPU-only).
+  matmul (incl. tensor-core prefill), and encode (IQ encode is CPU-only). On top of these four core
+  ops the namespace also carries fused decode/prefill kernels (MoE GLU and router, attention, norm
+  fusions) and a set of DeepSeek/GLM sparse-attention kernels - see
+  [docs/kernels.md](docs/kernels.md).
 - **Tooling** (Python) - `mlx-kquant quantize / run / chat / lora / fuse` (plus `verify`, `inspect`,
   `calibrate-imatrix`) and a `loader` that create and run K-quant checkpoints in **MLX-native
   safetensors** format.
@@ -265,6 +268,11 @@ All optional; the defaults are right for normal use.
   per-row gather path instead of the segment-walking `gather_qmm_rhs` GEMM. A/B lever.
 - `KQ_GATHER_RHS_BM` - pin the `gather_qmm_rhs` row tile height (`16`/`32`/`64`) instead of the
   rows-per-expert-adaptive choice. Retuning lever for other GPU generations.
+- `KQ_SWITCH_GEMM_MIN_ROWS` - minimum routed rows before `KQuantSwitchLinear` takes the sorted
+  per-expert GEMM arm on a prefill batch (default `512`; `0` disables it and keeps the plain gather).
+
+The model-specific kernels carry their own tuning levers, documented alongside each kernel in
+[docs/kernels.md](https://github.com/asher/mlx-kquant/blob/main/docs/kernels.md).
 
 ## Quant recipes
 
