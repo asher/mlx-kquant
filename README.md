@@ -15,7 +15,8 @@ Two layers:
   nine IQ codecs
   (`iq4_nl, iq4_xs, iq3_s, iq3_xxs, iq2_xxs, iq2_xs, iq2_s, iq1_s, iq1_m`) - all nineteen decode,
   matmul (incl. tensor-core prefill), and encode (IQ encode is CPU-only) - plus the native-fp wire
-  codecs `mxfp4, nvfp4` (decode + CPU matmul so far; decode-only, no encoder). On top of these four core
+  codecs `mxfp4, nvfp4` (decode, CPU NEON + Metal matmul, and the fused MoE family incl. biased
+  gpt-oss experts; no encoder - GGUFs ship these tensors pre-quantized). On top of these four core
   ops the namespace also carries fused decode/prefill kernels (MoE GLU and router, attention, norm
   fusions) and a set of DeepSeek/GLM sparse-attention kernels - see
   [docs/kernels.md](docs/kernels.md).

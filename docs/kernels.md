@@ -25,7 +25,8 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
 - **`quantized_matmul_qmv_bias`** - `x @ dequant(w) + bias` with the bias add fused into the matvec.
   Decode-only (single row); `q8_0` for now, other codecs fall through to matmul-then-add.
 - **`gather_qmv_kq`** - gathered matvec for an expert stack, one activation row per expert slot: the
-  MoE down projection at decode.
+  MoE down projection at decode. Takes an optional per-expert bias for the fp4 wire codecs
+  (`mxfp4`/`nvfp4`, gpt-oss experts).
 - **`gather_qmv_mix_kq`** / **`gather_qmv_mix_ns_kq`** - the down projection with the routing mix
   folded in - every slot accumulated in f32 weighted by its score, and (in the `mix` variant) a shared
   expert as the last slot - replacing a gather plus a weighted sum plus the shared-expert add. Shaped
@@ -43,15 +44,18 @@ Fused gate/up expert matvecs with the GLU epilogue applied in the same dispatch,
 load feeds both projections.
 
 - **`moe_glu_gather_kq`** - fused MoE GLU gather for K-quant expert stacks: `act(gate) * up` in one
-  decode-shaped dispatch, no biases.
+  decode-shaped dispatch. Bias-free for most codecs; the fp4 wire codecs (`mxfp4`/`nvfp4`) also take
+  per-expert gate/up biases with the `swiglu_clamp` activation (gpt-oss experts).
 - **`moe_glu_gather_shexp_kq`** - the same with the block's shared expert folded in as an extra slot.
 - **`moe_glu_gather`** - the MLX packed-mxfp4 counterpart.
 - **`moe_router_topk`** - the router in one dispatch: f32 scoring (`softmax`, or `sqrtsoftplus` for
   DeepSeek-V4), top-k with a min-index tie-break, optional bias-ranked selection, optional
   renormalization, and an optional per-expert scale.
 
-The GLU activation is selected per model: plain SwiGLU/GELU, or the clamped `silu_limit`
-(`silu(min(g, limit)) * clip(u, -limit, limit)`) that DeepSeek-V4's `LimitedSwiGLU` needs.
+The GLU activation is selected per model: plain SwiGLU/GELU, the clamped `silu_limit`
+(`silu(min(g, limit)) * clip(u, -limit, limit)`) that DeepSeek-V4's `LimitedSwiGLU` needs, or
+`swiglu_clamp` (gpt-oss clamped SwiGLU: biases added, sigmoid slope `alpha`, and a `(u + 1)` linear
+term; requires the expert biases and is instantiated for `mxfp4`/`nvfp4` only).
 
 ## Attention
 
