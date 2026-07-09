@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project aims to
 adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
 ## [0.3.3]
 
 ### Added
@@ -45,11 +47,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   codecs. Walks each row tile's per-expert segments and runs one full-K
   matmul per segment, so the sorted batch no longer decomposes into
   per-row `gather_qmv` calls. The row tile height adapts to the batch's
-  rows-per-expert (BM 16/32/64 at M/E thresholds 40/384, tuned on M3 Max):
-  every segment pays a full-tile mma pass, so a tile much taller than a
-  segment wastes most of every matmul. MoE prefill-shape rates on an M3 Max
-  improve ~5-6x at large batches (q4_k 9.5 / q5_k 8.0 / q6_k 7.7 TFLOPS at
-  128 rows/expert) and more at mid sizes where the adaptive tile kicks in.
+  rows-per-expert (BM 16/32/64 at M/E thresholds 40/384): every segment pays a
+  full-tile mma pass, so a tile much taller than a segment wastes most of every
+  matmul. This is a large speedup on MoE prefill shapes at big batches, and more
+  at mid sizes where the adaptive tile kicks in.
   `KQ_DISABLE_GATHER_RHS_ALU=1` forces the old per-row path;
   `KQ_GATHER_RHS_BM` pins the tile height (retuning lever). On NAX machines
   the NAX leaf still takes precedence; the new kernel serves the cases NAX
