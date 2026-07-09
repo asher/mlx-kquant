@@ -17,8 +17,13 @@ emission):
   src/kquant_dsa_indexer.cpp from csrc/params.h,
   csrc/deepseek_v4_sparse_attention.cpp, and csrc/dsa_indexer.h
 
-omlx is Copyright (c) the omlx contributors and licensed under the Apache
-License, Version 2.0, reproduced below.
+omlx's glm_moe_dsa tree is itself partly vendored: the steel kernel headers
+carry the upstream copyrights noted per file above (OpenAI, Apple Inc.), and
+omlx's Python-side glm_moe_dsa patch module (not used here) vendors Apple's
+mlx-lm model code. Where a source file carries an upstream copyright notice,
+that notice is the operative one; the unmarked host/dispatch code is omlx's
+own. omlx is Copyright (c) the omlx contributors and distributed under the
+Apache License, Version 2.0, reproduced below.
 
 ---------------------------------------------------------------------------
 
