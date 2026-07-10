@@ -24,6 +24,7 @@ streaming). Protocol: idle machine, median of REPS after WARMUP.
 """
 
 import argparse
+import os
 import platform
 import statistics
 import subprocess
@@ -35,8 +36,11 @@ import numpy as np
 
 from mlx_kquant import _ext as kq
 
-GPTOSS_GGUF = (
-    "/Users/asher/llm/gguf/lmstudio-community__gpt-oss-20b-GGUF/gpt-oss-20b-MXFP4.gguf"
+GPTOSS_GGUF = os.environ.get(
+    "KQUANT_BENCH_GPTOSS_GGUF",
+    os.path.expanduser(
+        "~/llm/gguf/lmstudio-community__gpt-oss-20b-GGUF/gpt-oss-20b-MXFP4.gguf"
+    ),
 )
 
 DECODE_M = (1, 2, 4)
