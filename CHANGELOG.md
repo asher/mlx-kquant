@@ -31,6 +31,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sorted-prefill units; gpt-oss/DeepSeek-V4 shapes; packed, packed-fused,
   wire, wire-fused(+bias) and CPU arms).
 
+### Fixed
+- E8M0/UE4M3 scale decode on Metal builds the float bits directly instead of
+  fast-math `exp2`, which lands ulps off on some Metal compiler versions -
+  keeps GPU dequant bit-exact with the CPU decoders and gguf-py on every
+  toolchain, and matches MLX's own `fp8_e8m0` conversion.
+
 ## [0.3.3]
 
 ### Added

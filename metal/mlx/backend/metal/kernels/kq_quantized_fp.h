@@ -36,19 +36,23 @@ constant float kq_fp_e2m1_lut[16] = {
     -4.0f,
     -6.0f};
 
+// 2^(e-127) built from bits: metal::exp2 is fast-math and lands ulps off on
+// some compiler versions. e == 0 is the f32 subnormal 2^-127.
 inline float kq_fp_e8m0_scale(uint8_t e) {
-  return metal::exp2(float(int(e) - 127));
+  return as_type<float>(e == 0 ? 0x00400000u : uint(e) << 23);
 }
 
 // Unsigned E4M3 (bias 7); 0x00 and 0x7F (the NaN encoding) decode to 0.
+// Normals assembled from bits (biased f32 exponent e + 120, mantissa m << 20)
+// for the same fast-math reason; the subnormal product is exact as written.
 inline float kq_fp_ue4m3_scale(uint8_t v) {
   if (v == 0 || v == 0x7F) {
     return 0.0f;
   }
-  const int e = (v >> 3) & 0xF;
-  const float m = float(v & 0x7);
-  return e == 0 ? m * 0.001953125f /* 2^-9 */
-                : metal::exp2(float(e - 7)) * (1.0f + m * 0.125f);
+  const uint e = (v >> 3) & 0xF;
+  const uint m = v & 0x7;
+  return e == 0 ? float(m) * 0.001953125f /* 2^-9 */
+                : as_type<float>((e + 120u) << 23 | m << 20);
 }
 
 // ---------------------------------------------------------------------------
