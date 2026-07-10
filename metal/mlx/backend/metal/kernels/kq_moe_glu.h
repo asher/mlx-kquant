@@ -39,8 +39,11 @@ constant float kq_fp4_e2m1_lut[16] = {
     -4.0f,
     -6.0f};
 
+// 2^(e-127) built from bits, matching MLX's fp8_e8m0 float conversion:
+// metal::exp2 is fast-math and lands ulps off on some compiler versions.
+// e == 0 is the f32 subnormal 2^-127.
 inline float kq_e8m0_scale(uint8_t e) {
-  return metal::exp2(float(int(e) - 127));
+  return as_type<float>(e == 0 ? 0x00400000u : uint(e) << 23);
 }
 
 template <typename T, typename U, int VPT>

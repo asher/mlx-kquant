@@ -18,6 +18,10 @@ gguf.quants.dequantize:
 The q8_0 row also runs at K=352 (K % 256 != 0) to cover the generic-uniform
 q8_0_ext dispatch stem (gemma-4-a4b down-proj geometry class).
 
+The fp4 wire codecs (mxfp4/nvfp4) additionally run the biased swiglu_clamp
+arms (gpt-oss expert shape); mxfp4 cross-checks them against the packed-layout
+kernels on deinterleaved weights.
+
 Mixed-codec shared experts (the UD-style upcast) are covered by pairing every
 expert codec with a q8_0 shexp, plus the q8_0-experts/q6_k-shexp reverse.
 
@@ -67,6 +71,8 @@ CODECS = {
     "iq2_s": (GT.IQ2_S, 256, 82, False),
     "iq1_s": (GT.IQ1_S, 256, 50, False),
     "iq1_m": (GT.IQ1_M, 256, 56, False),
+    "mxfp4": (GT.MXFP4, 32, 17, False),
+    "nvfp4": (GT.NVFP4, 64, 36, False),
 }
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -80,6 +86,9 @@ def _synth_iq_wire(rng, bpb, n_blocks):
     random bytes with a sane fp16 d at block offset 0 (IQ1_M: scale nibbles)
     so dequant can't hit Inf/NaN."""
     wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
+    if bpb == 36:  # nvfp4: four ue4m3 group scales, kept small for f16 GLU
+        wire[:, 0:4] = rng.integers(0x08, 0x19, (n_blocks, 4), dtype=np.uint8)
+        return wire
     # Keep d small: random scale/grid bits already reach the codec's max
     # magnitude, and the GLU product act(g) * u must stay inside f16 range
     # (iq4_xs random wire hits |w| ~ 80 at d = 0.02).
@@ -98,7 +107,7 @@ def _wire_and_ref(codec, seed=11, k=K):
     """Return (wire uint8[E, N, packed], ref float32[E, N, k]) or (None, None)
     when a K-quant fixture is missing. k only varies for synthesized codecs."""
     gtype, wpb, bpb, is_kq = CODECS[codec]
-    if codec.startswith("iq"):
+    if codec.startswith("iq") or codec == "nvfp4":
         rng = np.random.default_rng(seed)
         wires = [
             _synth_iq_wire(rng, bpb, N * (k // wpb)).reshape(N, (k // wpb) * bpb)
@@ -134,9 +143,17 @@ def _act_np(g, act):
         return g / (1.0 + np.exp(-g))
 
 
-def _glu_np(g, u, act, limit=0.0):
+def _glu_np(g, u, act, limit=0.0, alpha=1.0):
     """GLU epilogue reference: act(g) * u. silu_limit = deepseek-v4
-    LimitedSwiGLU (gate clamped from above only, up clamped both sides)."""
+    LimitedSwiGLU (gate clamped from above only, up clamped both sides);
+    swiglu_clamp = gpt-oss clamped SwiGLU (same clamps, sigmoid slope alpha
+    and a (u + 1) linear term)."""
+    if act == "swiglu_clamp":
+        g = np.minimum(g, limit)
+        u = np.clip(u, -limit, limit)
+        with np.errstate(over="ignore"):
+            sig = 1.0 / (1.0 + np.exp(-alpha * g))
+        return (g * sig) * (u + 1.0)
     if act == "silu_limit":
         g = np.minimum(g, limit)
         u = np.clip(u, -limit, limit)
@@ -291,6 +308,126 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0):
     )
     rel = _rel(got, r)
     out.append(("mix_ns", rel, rel < REL_BOUND))
+    return out
+
+
+def _mxfp4_deinterleave_np(wire):
+    """ggml mxfp4 wire [E, N, nblk*17] -> MLX packed layout (packed uint32
+    [E, N, K/8], scales uint8 [E, N, K/32]): two-halves nibbles resequenced,
+    scale bytes split out. Mirrors gguf-mlx's mxfp4_deinterleave."""
+    e, n, last = wire.shape
+    blocks = wire.reshape(e, n, last // 17, 17)
+    scales = np.ascontiguousarray(blocks[..., 0])
+    data = blocks[..., 1:]
+    lo = data & 0x0F
+    hi = data >> 4
+    v = np.concatenate([lo, hi], axis=-1)  # (..., nblk, 32) sequential codes
+    out = (v[..., 0::2] | (v[..., 1::2] << 4)).astype(np.uint8)
+    packed = np.ascontiguousarray(out).reshape(e, n, -1).view(np.uint32)
+    return packed, scales
+
+
+def _check_bias(codec, dtype=mx.float16, limit=0.05, alpha=1.702):
+    """Biased fused ops (gpt-oss swiglu_clamp shape): moe_glu_gather_kq with
+    gate/up biases and gather_qmv_kq with bias vs the numpy reference. mxfp4
+    additionally cross-checks both against the packed-layout kernels
+    (moe_glu_gather / gather_qmv_bias) on deinterleaved weights. limit is
+    small so the clamps engage at the test's ~0.1-scale activations."""
+    wire, ref = _wire_and_ref(codec)
+    rng = np.random.default_rng(7)
+    gw = mx.array(wire)
+    up_np = wire[::-1].copy()
+    uw = mx.array(up_np)
+    up_ref = ref[::-1].copy()
+    gb_np = rng.uniform(-0.2, 0.2, (E, N)).astype(np.float32)
+    ub_np = rng.uniform(-0.2, 0.2, (E, N)).astype(np.float32)
+    db_np = rng.uniform(-0.2, 0.2, (E, N)).astype(np.float32)
+    gb, ub, db = mx.array(gb_np), mx.array(ub_np), mx.array(db_np)
+
+    x_np = (rng.standard_normal((T, K)) * 0.1).astype(np.float16)
+    x = mx.array(x_np).astype(dtype)
+    xf = np.array(x.astype(mx.float32))
+    inds_np = rng.integers(0, E, size=(T, R)).astype(np.uint32)
+    inds = mx.array(inds_np)
+    out = []
+
+    got_glu = kq.moe_glu_gather_kq(
+        x,
+        gw,
+        uw,
+        codec,
+        inds,
+        act="swiglu_clamp",
+        limit=limit,
+        gate_bias=gb,
+        up_bias=ub,
+        alpha=alpha,
+    )
+    mx.eval(got_glu)
+    r = np.stack(
+        [
+            np.stack(
+                [
+                    _glu_np(
+                        xf[t] @ ref[e].T + gb_np[e],
+                        xf[t] @ up_ref[e].T + ub_np[e],
+                        "swiglu_clamp",
+                        limit,
+                        alpha,
+                    )
+                    for e in inds_np[t]
+                ],
+                0,
+            )
+            for t in range(T)
+        ],
+        0,
+    )
+    rel = _rel(got_glu, r)
+    out.append(("glu", rel, rel < REL_BOUND))
+
+    h_np = (rng.standard_normal((T, R, K)) * 0.1).astype(np.float16)
+    h = mx.array(h_np).astype(dtype)
+    hf = np.array(h.astype(mx.float32))
+    got_qmv = kq.gather_qmv_kq(h, gw, codec, inds, bias=db)
+    mx.eval(got_qmv)
+    r = np.stack(
+        [
+            np.stack(
+                [
+                    hf[t, s] @ ref[inds_np[t, s]].T + db_np[inds_np[t, s]]
+                    for s in range(R)
+                ],
+                0,
+            )
+            for t in range(T)
+        ],
+        0,
+    )
+    rel = _rel(got_qmv, r)
+    out.append(("qmv", rel, rel < REL_BOUND))
+
+    if codec == "mxfp4":
+        pgw, pgs = _mxfp4_deinterleave_np(wire)
+        puw, pus = _mxfp4_deinterleave_np(up_np)
+        pg = kq.moe_glu_gather(
+            x,
+            mx.array(pgw),
+            mx.array(pgs),
+            gb,
+            mx.array(puw),
+            mx.array(pus),
+            ub,
+            inds,
+            alpha,
+            limit,
+        )
+        pd = kq.gather_qmv_bias(h, mx.array(pgw), mx.array(pgs), db, inds)
+        mx.eval(pg, pd)
+        rel = _rel(got_glu, np.array(pg.astype(mx.float32)))
+        out.append(("xpk_glu", rel, rel < REL_BOUND))
+        rel = _rel(got_qmv, np.array(pd.astype(mx.float32)))
+        out.append(("xpk_qmv", rel, rel < REL_BOUND))
     return out
 
 
@@ -450,6 +587,26 @@ def main(argv=None) -> int:
     if not allow or "q8_0" in allow:
         run("q8_0", act="silu_limit", limit=0.05)
 
+    # swiglu_clamp + biases (gpt-oss shape; fp4 wire codecs only). mxfp4 rows
+    # include the packed-kernel cross-check columns.
+    def run_bias(codec, dtype=mx.float16):
+        nonlocal fails
+        res = _check_bias(codec, dtype=dtype)
+        bad = not all(ok for _n, _r, ok in res)
+        fails += bad
+        cells = " ".join(f"{n}={r:.3e}" for n, r, _ok in res)
+        dt = "bf16" if dtype == mx.bfloat16 else "f16"
+        print(
+            f"  {codec:<10} {'bias':<8} clamp/{dt:<4} {cells} "
+            f"{'FAIL' if bad else 'ok':>8}"
+        )
+
+    for codec in ("mxfp4", "nvfp4"):
+        if allow and codec not in allow:
+            continue
+        run_bias(codec)
+        run_bias(codec, dtype=mx.bfloat16)
+
     router_fails = _check_router()
     for f in router_fails:
         print(f"  router FAIL: {f}")
@@ -470,6 +627,39 @@ def test_silu_limit_requires_positive_limit():
     w = mx.zeros((4, 8, 16), dtype=mx.uint8)
     with pytest.raises(ValueError, match="limit"):
         kq.moe_glu_gather_kq(x, w, w, "q8_0", inds, act="silu_limit")
+
+
+def test_swiglu_clamp_validation():
+    """Host-side contract for the biased arms: swiglu_clamp needs both
+    biases + limit + alpha; biases need swiglu_clamp; biased kernels are
+    instantiated for the fp4 codecs only."""
+    x = mx.zeros((2, 512), dtype=mx.float16)
+    inds = mx.zeros((2, 2), dtype=mx.uint32)
+    w = mx.zeros((4, 8, 512 // 32 * 17), dtype=mx.uint8)  # mxfp4 geometry
+    b = mx.zeros((4, 8), dtype=mx.float32)
+    with pytest.raises(ValueError, match="swiglu_clamp"):
+        kq.moe_glu_gather_kq(
+            x, w, w, "mxfp4", inds, act="swiglu_clamp", limit=7.0, alpha=1.702
+        )
+    with pytest.raises(ValueError, match="swiglu_clamp"):
+        kq.moe_glu_gather_kq(x, w, w, "mxfp4", inds, act="silu", gate_bias=b, up_bias=b)
+    wq8 = mx.zeros((4, 8, 512 // 32 * 34), dtype=mx.uint8)
+    with pytest.raises(ValueError, match="mxfp4/nvfp4"):
+        kq.moe_glu_gather_kq(
+            x,
+            wq8,
+            wq8,
+            "q8_0",
+            inds,
+            act="swiglu_clamp",
+            limit=7.0,
+            gate_bias=b,
+            up_bias=b,
+            alpha=1.702,
+        )
+    h = mx.zeros((2, 2, 512), dtype=mx.float16)
+    with pytest.raises(ValueError, match="mxfp4/nvfp4"):
+        kq.gather_qmv_kq(h, wq8, "q8_0", inds, bias=b)
 
 
 def test_moe_glu():

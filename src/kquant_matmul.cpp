@@ -685,8 +685,9 @@ void KQuantMatmul::eval_gpu(
       return e != nullptr ? std::atoi(e) : -1; // -1 = per-codec default
     }();
     // Every wired codec now has an mv_ext kernel: q8_0, the five K-quants, the
-    // four legacy non-K (q4_0/q4_1/q5_0/q5_1), and all nine IQ. Validated
-    // bit-exact, so default-on == has-kernel.
+    // four legacy non-K (q4_0/q4_1/q5_0/q5_1), all nine IQ, and the native-fp
+    // wire codecs (mxfp4/nvfp4). Validated bit-exact, so default-on ==
+    // has-kernel.
     const bool codec_has_mv_ext = kquant_type_ == "q8_0" ||
         kquant_type_ == "q2_k" || kquant_type_ == "q3_k" ||
         kquant_type_ == "q4_k" || kquant_type_ == "q5_k" ||
@@ -696,7 +697,8 @@ void KQuantMatmul::eval_gpu(
         kquant_type_ == "iq4_xs" || kquant_type_ == "iq3_s" ||
         kquant_type_ == "iq3_xxs" || kquant_type_ == "iq2_xxs" ||
         kquant_type_ == "iq2_xs" || kquant_type_ == "iq2_s" ||
-        kquant_type_ == "iq1_s" || kquant_type_ == "iq1_m";
+        kquant_type_ == "iq1_s" || kquant_type_ == "iq1_m" ||
+        kquant_type_ == "mxfp4" || kquant_type_ == "nvfp4";
     const bool mv_ext_default_on = codec_has_mv_ext;
     // Width gate for the DEFAULT path (the A/B force-on KQ_VERIFY_EXT=1 ignores
     // it). Measured DRAM-fresh: for non-IQ codecs verify_qmv (tuned for small

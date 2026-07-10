@@ -50,8 +50,13 @@ CODECS = [
     "iq2_s",
     "iq1_s",
     "iq1_m",
+    "mxfp4",
+    "nvfp4",
 ]
 REQUIRED_IMATRIX = {"iq2_xxs", "iq2_xs", "iq1_s"}
+# Decode-only wire codecs: no kq.quantize, the cold check synthesizes wire
+# bytes and oracles them through gguf-py's numpy dequant.
+DECODE_ONLY = {"mxfp4", "nvfp4"}
 N, K, M = 1024, 1024, 64
 
 
@@ -70,16 +75,31 @@ def _cold_check(codec: str) -> int:
 
     gtype = getattr(GT, codec.upper())
     rng = np.random.default_rng(0)
-    w_np = rng.standard_normal((N, K)).astype(np.float32)
 
-    # Quantize on the CPU stream so no GPU matmul runs before the one under test.
-    # The imatrix-required IQ codecs need an importance vector to encode at all.
-    imatrix = None
-    if codec in REQUIRED_IMATRIX:
-        imatrix = mx.array((np.abs(rng.standard_normal(K)) + 0.1).astype(np.float32))
-    wq, scales = kq.quantize(mx.array(w_np), codec, imatrix=imatrix, stream=mx.cpu)
-    mx.eval(wq, scales)
-    wq_np = np.ascontiguousarray(np.array(wq))
+    if codec in DECODE_ONLY:
+        # Synthesized wire (moderate scale bytes so dequant can't hit Inf/NaN).
+        bpb, wpb = (17, 32) if codec == "mxfp4" else (36, 64)
+        n_blocks = N * (K // wpb)
+        wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
+        if codec == "mxfp4":
+            wire[:, 0] = rng.integers(121, 132, n_blocks, dtype=np.uint8)
+        else:
+            wire[:, 0:4] = rng.integers(0x30, 0x41, (n_blocks, 4), dtype=np.uint8)
+        wq_np = np.ascontiguousarray(wire.reshape(N, (K // wpb) * bpb))
+        scales = mx.zeros((1,), dtype=mx.uint8)
+    else:
+        w_np = rng.standard_normal((N, K)).astype(np.float32)
+        # Quantize on the CPU stream so no GPU matmul runs before the one under
+        # test. The imatrix-required IQ codecs need an importance vector to
+        # encode at all.
+        imatrix = None
+        if codec in REQUIRED_IMATRIX:
+            imatrix = mx.array(
+                (np.abs(rng.standard_normal(K)) + 0.1).astype(np.float32)
+            )
+        wq, scales = kq.quantize(mx.array(w_np), codec, imatrix=imatrix, stream=mx.cpu)
+        mx.eval(wq, scales)
+        wq_np = np.ascontiguousarray(np.array(wq))
 
     # Independent oracle: gguf-py numpy dequant of the SAME bytes, then numpy f32
     # matmul. Never kq.dequantize and never the GPU matmul, so neither a shared

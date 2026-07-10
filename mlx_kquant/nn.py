@@ -191,7 +191,6 @@ class KQuantSwitchLinear(nn.Module):
         # disables; read live for A/B.
         if (
             sorted_indices
-            and "bias" not in self
             and indices.ndim == 1
             and x.ndim == 3
             and x.shape[0] == indices.size
@@ -203,7 +202,10 @@ class KQuantSwitchLinear(nn.Module):
                 and indices.size >= min_rows
                 and not self._nax_gather_preferred(indices.size, x.shape[-1])
             ):
-                return self._sorted_expert_gemm(x, indices)
+                y = self._sorted_expert_gemm(x, indices)
+                if "bias" in self:
+                    y = y + mx.expand_dims(self["bias"][indices], -2)
+                return y
         x = kq.gather_qmm(
             x,
             self["weight"],

@@ -24,6 +24,8 @@ import mlx.core as _mx  # noqa: F401
 from ._ext import (  # noqa: F401
     add_rmsnorm,
     arena_alloc,
+    codec_has_matmul,
+    codec_has_moe_glu,
     codecs,
     cpu_neon_available,
     dequantize,
@@ -73,6 +75,8 @@ __all__ = [
     "__version__",
     "add_rmsnorm",
     "arena_alloc",
+    "codec_has_matmul",
+    "codec_has_moe_glu",
     "codecs",
     "cpu_neon_available",
     "dequantize",

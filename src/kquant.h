@@ -223,12 +223,15 @@ mx::array gather_qmv_bias(
 
 // K-quant counterpart of moe_glu_gather: gate and up expert matvecs on GGUF
 // wire bytes (n_experts, out_dims, bytes_per_row) sharing each activation
-// load, with the GLU epilogue act(g) * u fused (act: "silu", "gelu" or
-// "silu_limit" -- the latter clamps g from above and u to +-limit before
-// silu(g) * u, deepseek-v4 LimitedSwiGLU semantics, and requires limit > 0).
-// No biases. x [T, K], indices [T, R]. Returns [T, R, N]. Metal-only;
-// requires K % 256 == 0 and a codec with the fused kernel wired (full GGUF
-// matrix).
+// load, with the GLU epilogue act(g) * u fused (act: "silu", "gelu",
+// "silu_limit" -- clamps g from above and u to +-limit before silu(g) * u,
+// deepseek-v4 LimitedSwiGLU semantics, requires limit > 0 -- or
+// "swiglu_clamp" -- gpt-oss clamped SwiGLU with per-(expert, out_dim) f32
+// gate/up biases, sigmoid slope alpha and a (u + 1) linear term; requires
+// both biases [E, N], limit > 0 and alpha > 0; mxfp4/nvfp4 only). Biases are
+// accepted only with act "swiglu_clamp". x [T, K], indices [T, R]. Returns
+// [T, R, N]. Metal-only; requires K % 256 == 0 and a codec with the fused
+// kernel wired (full GGUF matrix).
 mx::array moe_glu_gather_kq(
     mx::array x,
     mx::array gate_w,
@@ -237,7 +240,13 @@ mx::array moe_glu_gather_kq(
     mx::array indices,
     const std::string& act = "silu",
     float limit = 0.0f,
+    const std::optional<mx::array>& gate_bias = std::nullopt,
+    const std::optional<mx::array>& up_bias = std::nullopt,
+    float alpha = 0.0f,
     mx::StreamOrDevice s = {});
+
+// True when the codec has the fused MoE GLU/gather kernel family above.
+bool codec_has_moe_glu(const std::string& kquant_type);
 
 // DeepSeek-V4-Flash sparse attention: sliding local window + gathered
 // indexer-selected pooled rows + per-head sinks in one dispatch (flash
@@ -331,12 +340,15 @@ mx::array dsa_indexer_qat(mx::array x, mx::StreamOrDevice s = {});
 mx::array dsa_kv_qat(mx::array x, int n_rot, mx::StreamOrDevice s = {});
 
 // K-quant gathered matvec (down projection), same wire layout. x [T, R, K]
-// (one row per expert slot), indices [T, R]. Returns [T, R, N]. Metal-only.
+// (one row per expert slot), indices [T, R]. Optional per-(expert, out_dim)
+// f32 bias [E, N] added to each gathered row (mxfp4/nvfp4 only). Returns
+// [T, R, N]. Metal-only.
 mx::array gather_qmv_kq(
     mx::array x,
     mx::array w,
     const std::string& kquant_type,
     mx::array indices,
+    const std::optional<mx::array>& bias = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // moe_glu_gather_kq with the block's shared expert folded in as one extra
@@ -901,11 +913,13 @@ class KQuantMoEGLUKQ : public mx::Primitive {
       mx::Stream stream,
       std::string kquant_type,
       std::string act,
-      float limit = 0.0f)
+      float limit = 0.0f,
+      float alpha = 0.0f)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         act_(std::move(act)),
-        limit_(limit) {}
+        limit_(limit),
+        alpha_(alpha) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -926,6 +940,7 @@ class KQuantMoEGLUKQ : public mx::Primitive {
   std::string kquant_type_;
   std::string act_;
   float limit_;
+  float alpha_;
 };
 
 // K-quant gathered matvec (see gather_qmv_kq). Inference-only.

@@ -14,7 +14,9 @@ Two layers:
   ten K-quant/legacy codecs: `q2_k, q3_k, q4_k, q5_k, q6_k` and `q4_0, q4_1, q5_0, q5_1, q8_0`, plus
   nine IQ codecs
   (`iq4_nl, iq4_xs, iq3_s, iq3_xxs, iq2_xxs, iq2_xs, iq2_s, iq1_s, iq1_m`) - all nineteen decode,
-  matmul (incl. tensor-core prefill), and encode (IQ encode is CPU-only). On top of these four core
+  matmul (incl. tensor-core prefill), and encode (IQ encode is CPU-only) - plus the native-fp wire
+  codecs `mxfp4, nvfp4` (decode, CPU NEON + Metal matmul, and the fused MoE family incl. biased
+  gpt-oss experts; no encoder - GGUFs ship these tensors pre-quantized). On top of these four core
   ops the namespace also carries fused decode/prefill kernels (MoE GLU and router, attention, norm
   fusions) and a set of DeepSeek/GLM sparse-attention kernels - see
   [docs/kernels.md](docs/kernels.md).
@@ -327,6 +329,8 @@ are informed by our analysis of the mixed-precision quants that [Unsloth][unslot
 | iq2_s   | 256 | 2 |  82 | grid + qh + signs |
 | iq1_s   | 256 | 1 |  50 | grid + delta |
 | iq1_m   | 256 | 1 |  56 | grid + delta, scattered scale |
+| mxfp4   |  32 | 4 |  17 | e8m0 scale, E2M1 values (decode-only) |
+| nvfp4   |  64 | 4 |  36 | 4x ue4m3-scaled 16-value groups (decode-only) |
 
 ## Version pinning
 

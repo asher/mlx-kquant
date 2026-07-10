@@ -71,6 +71,24 @@ NB_MODULE(_ext, m) {
       "KQ_DISABLE_NAX is unset (read live). Sorted-prefill callers defer to "
       "gather_qmm when this holds.");
 
+  m.def(
+      "codec_has_moe_glu",
+      &mlx_kquant::codec_has_moe_glu,
+      "kquant_type"_a,
+      "True when this codec has the fused MoE GLU/gather kernel family "
+      "(kq.moe_glu_gather_kq and friends).");
+
+  m.def(
+      "codec_has_matmul",
+      [](const std::string& kquant_type) {
+        const auto* codec = mlx_kquant::codec_by_name(kquant_type);
+        return codec != nullptr && codec->has_matmul_kernel;
+      },
+      "kquant_type"_a,
+      "True when this codec ships Metal matmul kernels (qmv/qmm/gather). "
+      "CPU-only wire codecs return False; their matmuls must stay on the "
+      "CPU stream.");
+
   // --- ops ---
   m.def(
       "dequantize",
@@ -515,12 +533,15 @@ NB_MODULE(_ext, m) {
       "indices"_a,
       "act"_a = "silu",
       "limit"_a = 0.0f,
+      "gate_bias"_a = nb::none(),
+      "up_bias"_a = nb::none(),
+      "alpha"_a = 0.0f,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
         Fused MoE GLU gather for K-quant expert stacks: gate and up expert
         matvecs share each activation load and the GLU epilogue act(g) * u is
-        applied in the same dispatch. No biases. Decode-shaped.
+        applied in the same dispatch. Decode-shaped.
 
         Args:
             x (array): activations [T, K], float16/bfloat16. K % 256 == 0.
@@ -528,10 +549,18 @@ NB_MODULE(_ext, m) {
             up_w (array): uint8 wire bytes, same shape as gate_w.
             kquant_type (str): codec with a fused kernel (full GGUF matrix).
             indices (array): expert indices [T, R].
-            act (str): 'silu' (default), 'gelu' (tanh approx) or 'silu_limit'
+            act (str): 'silu' (default), 'gelu' (tanh approx), 'silu_limit'
                 (silu(min(g, limit)) * clip(u, -limit, limit) -- deepseek-v4
-                LimitedSwiGLU; requires limit > 0).
-            limit (float): clamp bound for 'silu_limit'; ignored otherwise.
+                LimitedSwiGLU; requires limit > 0) or 'swiglu_clamp'
+                (gpt-oss clamped SwiGLU: biases added, g clamped from above,
+                u clamped both sides, sigmoid slope alpha and a (u + 1)
+                linear term; requires gate_bias/up_bias, limit > 0 and
+                alpha > 0; mxfp4/nvfp4 only).
+            limit (float): clamp bound for 'silu_limit'/'swiglu_clamp'.
+            gate_bias (array, optional): per-(expert, out_dim) bias [E, N],
+                'swiglu_clamp' only.
+            up_bias (array, optional): same shape, 'swiglu_clamp' only.
+            alpha (float): sigmoid slope for 'swiglu_clamp'.
 
         Returns:
             array: activated hidden states [T, R, N] in x.dtype.
@@ -544,6 +573,7 @@ NB_MODULE(_ext, m) {
       "w"_a,
       "kquant_type"_a,
       "indices"_a,
+      "bias"_a = nb::none(),
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
@@ -555,6 +585,8 @@ NB_MODULE(_ext, m) {
             w (array): uint8 wire bytes (n_experts, N, bytes_per_row).
             kquant_type (str): codec with a fused kernel (full GGUF matrix).
             indices (array): expert indices [T, R].
+            bias (array, optional): per-(expert, out_dim) bias [E, N] added
+                to each gathered row (mxfp4/nvfp4 only).
 
         Returns:
             array: output [T, R, N] in x.dtype.

@@ -2,8 +2,9 @@
 // row per gathered expert row), all inference-only (no CPU eval):
 //   mxfp4 packed layout: moe_glu_gather (gate + up + biases + clamped-SwiGLU
 //     in one dispatch) and gather_qmv_bias.
-//   K-quant wire bytes: moe_glu_gather_kq (gate + up + silu/gelu GLU, no
-//     biases) and gather_qmv_kq, per-codec kernels (full codec matrix).
+//   K-quant wire bytes: moe_glu_gather_kq (gate + up + GLU epilogue;
+//     optional biases with act "swiglu_clamp", mxfp4/nvfp4 only) and
+//     gather_qmv_kq, per-codec kernels (full codec matrix).
 #include <cstdio>
 #include <cstdlib>
 #include <set>
@@ -188,10 +189,12 @@ void KQuantMoEGLUKQ::eval_gpu(
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
+  // Biased (swiglu_clamp) layout: gw, uw, gb, ub, x, indices.
+  const bool biased = inputs.size() == 6;
   const auto& gw = inputs[0];
   const auto& uw = inputs[1];
-  const auto& x = inputs[2];
-  const auto& indices = inputs[3];
+  const auto& x = inputs[biased ? 4 : 2];
+  const auto& indices = inputs.back();
 
   int T = indices.shape(0);
   int R = indices.shape(1);
@@ -200,20 +203,32 @@ void KQuantMoEGLUKQ::eval_gpu(
 
   const int nx = kq_moe_pick_nx((int64_t)N * R * T, K, true);
   std::string kname = "kq_" + kq_gather_stem_nx(kquant_type_, K, nx) +
-      "_moe_glu_gather_" + act_ + kq_nx_suffix(nx) + "_" +
-      kq_type_string(x.dtype());
+      "_moe_glu_gather_" + (biased ? "bias_" : "") + act_ + kq_nx_suffix(nx) +
+      "_" + kq_type_string(x.dtype());
   kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   ce.set_input_array(gw, 0);
   ce.set_input_array(uw, 1);
-  ce.set_input_array(x, 2);
-  ce.set_input_array(indices, 3);
-  ce.set_output_array(out, 4);
-  ce.set_bytes(K, 5);
-  ce.set_bytes(N, 6);
-  ce.set_bytes(limit_, 7);
+  if (biased) {
+    ce.set_input_array(inputs[2], 2);
+    ce.set_input_array(inputs[3], 3);
+    ce.set_input_array(x, 4);
+    ce.set_input_array(indices, 5);
+    ce.set_output_array(out, 6);
+    ce.set_bytes(K, 7);
+    ce.set_bytes(N, 8);
+    ce.set_bytes(limit_, 9);
+    ce.set_bytes(alpha_, 10);
+  } else {
+    ce.set_input_array(x, 2);
+    ce.set_input_array(indices, 3);
+    ce.set_output_array(out, 4);
+    ce.set_bytes(K, 5);
+    ce.set_bytes(N, 6);
+    ce.set_bytes(limit_, 7);
+  }
   MTL::Size group_dims(32, 2, 1);
   MTL::Size grid_dims(N / (64 / nx), R, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -227,9 +242,11 @@ void KQuantGatherQMVKQ::eval_gpu(
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
+  // Biased layout: w, b, x, indices.
+  const bool biased = inputs.size() == 4;
   const auto& w = inputs[0];
-  const auto& x = inputs[1];
-  const auto& indices = inputs[2];
+  const auto& x = inputs[biased ? 2 : 1];
+  const auto& indices = inputs.back();
 
   int T = indices.shape(0);
   int R = indices.shape(1);
@@ -238,17 +255,27 @@ void KQuantGatherQMVKQ::eval_gpu(
 
   const int nx = kq_moe_pick_nx((int64_t)N * R * T, K, false);
   std::string kname = "kq_" + kq_gather_stem_nx(kquant_type_, K, nx) +
-      "_gather_qmv" + kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
+      "_gather_qmv" + (biased ? "_bias" : "") + kq_nx_suffix(nx) + "_" +
+      kq_type_string(x.dtype());
   kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   ce.set_input_array(w, 0);
-  ce.set_input_array(x, 1);
-  ce.set_input_array(indices, 2);
-  ce.set_output_array(out, 3);
-  ce.set_bytes(K, 4);
-  ce.set_bytes(N, 5);
+  if (biased) {
+    ce.set_input_array(inputs[1], 1);
+    ce.set_input_array(x, 2);
+    ce.set_input_array(indices, 3);
+    ce.set_output_array(out, 4);
+    ce.set_bytes(K, 5);
+    ce.set_bytes(N, 6);
+  } else {
+    ce.set_input_array(x, 1);
+    ce.set_input_array(indices, 2);
+    ce.set_output_array(out, 3);
+    ce.set_bytes(K, 4);
+    ce.set_bytes(N, 5);
+  }
   MTL::Size group_dims(32, 2, 1);
   MTL::Size grid_dims(N / (64 / nx), R, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -525,7 +552,8 @@ void KQuantGatherQMVKQ::eval_cpu(
 
 bool KQuantMoEGLUKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMoEGLUKQ&>(other);
-  return kquant_type_ == o.kquant_type_ && act_ == o.act_ && limit_ == o.limit_;
+  return kquant_type_ == o.kquant_type_ && act_ == o.act_ &&
+      limit_ == o.limit_ && alpha_ == o.alpha_;
 }
 
 bool KQuantGatherQMVKQ::is_equivalent(const mx::Primitive& other) const {
@@ -535,7 +563,9 @@ bool KQuantGatherQMVKQ::is_equivalent(const mx::Primitive& other) const {
 
 std::vector<mx::Shape> KQuantMoEGLUKQ::output_shapes(
     const std::vector<mx::array>& inputs) {
-  return {{inputs[3].shape(0), inputs[3].shape(1), inputs[0].shape(1)}};
+  // Indices are the last input in both the unbiased and biased layouts.
+  const auto& idx = inputs.back();
+  return {{idx.shape(0), idx.shape(1), inputs[0].shape(1)}};
 }
 
 void KQuantMoEGLUShexpKQ::eval_cpu(
@@ -612,7 +642,9 @@ std::vector<mx::Shape> KQuantMoERouterTopK::output_shapes(
 
 std::vector<mx::Shape> KQuantGatherQMVKQ::output_shapes(
     const std::vector<mx::array>& inputs) {
-  return {{inputs[2].shape(0), inputs[2].shape(1), inputs[0].shape(1)}};
+  // Indices are the last input in both the unbiased and biased layouts.
+  const auto& idx = inputs.back();
+  return {{idx.shape(0), idx.shape(1), inputs[0].shape(1)}};
 }
 
 std::vector<mx::Shape> KQuantMoEGLU::output_shapes(
@@ -623,6 +655,18 @@ std::vector<mx::Shape> KQuantMoEGLU::output_shapes(
 std::vector<mx::Shape> KQuantGatherQMVBias::output_shapes(
     const std::vector<mx::array>& inputs) {
   return {{inputs[4].shape(0), inputs[4].shape(1), inputs[0].shape(1)}};
+}
+
+// Codecs with the fused kq GLU/gather kernels wired (kq_moe_glu_kq.h):
+// tuned kernels for q6_k/q8_0, generic Ext-trait kernels for the rest of the
+// codec matrix. Unsupported codecs must fall back to the stock path
+// per-tensor (callers gate on this via ops throwing invalid_argument).
+bool codec_has_moe_glu(const std::string& t) {
+  return t == "q2_k" || t == "q3_k" || t == "q4_k" || t == "q5_k" ||
+      t == "q6_k" || t == "q8_0" || t == "q4_0" || t == "q4_1" || t == "q5_0" ||
+      t == "q5_1" || t == "iq4_nl" || t == "iq4_xs" || t == "iq3_s" ||
+      t == "iq3_xxs" || t == "iq2_xxs" || t == "iq2_xs" || t == "iq2_s" ||
+      t == "iq1_s" || t == "iq1_m" || t == "mxfp4" || t == "nvfp4";
 }
 
 namespace {
@@ -673,18 +717,6 @@ mx::array prep_bias(const mx::array& b, mx::StreamOrDevice s) {
 
 mx::array prep_indices(const mx::array& idx, mx::StreamOrDevice s) {
   return mx::contiguous(mx::astype(idx, mx::uint32, s), false, s);
-}
-
-// Codecs with the fused kq GLU/gather kernels wired (kq_moe_glu_kq.h):
-// tuned kernels for q6_k/q8_0, generic Ext-trait kernels for the rest of the
-// codec matrix. Unsupported codecs must fall back to the stock path
-// per-tensor (callers gate on this via ops throwing invalid_argument).
-bool codec_has_moe_glu(const std::string& t) {
-  return t == "q2_k" || t == "q3_k" || t == "q4_k" || t == "q5_k" ||
-      t == "q6_k" || t == "q8_0" || t == "q4_0" || t == "q4_1" || t == "q5_0" ||
-      t == "q5_1" || t == "iq4_nl" || t == "iq4_xs" || t == "iq3_s" ||
-      t == "iq3_xxs" || t == "iq2_xxs" || t == "iq2_xs" || t == "iq2_s" ||
-      t == "iq1_s" || t == "iq1_m";
 }
 
 // Mixed-codec shared experts instantiate only the UD-style upcast combos:
@@ -871,6 +903,9 @@ mx::array moe_glu_gather_kq(
     mx::array indices,
     const std::string& act,
     float limit,
+    const std::optional<mx::array>& gate_bias,
+    const std::optional<mx::array>& up_bias,
+    float alpha,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   if (x.ndim() != 2) {
@@ -886,14 +921,33 @@ mx::array moe_glu_gather_kq(
     throw std::invalid_argument(
         "[mlx_kquant.moe_glu_gather_kq] x must be float16 or bfloat16.");
   }
-  if (act != "silu" && act != "gelu" && act != "silu_limit") {
+  if (act != "silu" && act != "gelu" && act != "silu_limit" &&
+      act != "swiglu_clamp") {
     throw std::invalid_argument(
-        "[mlx_kquant.moe_glu_gather_kq] act must be 'silu', 'gelu' or "
-        "'silu_limit'.");
+        "[mlx_kquant.moe_glu_gather_kq] act must be 'silu', 'gelu', "
+        "'silu_limit' or 'swiglu_clamp'.");
   }
   if (act == "silu_limit" && !(limit > 0.0f)) {
     throw std::invalid_argument(
         "[mlx_kquant.moe_glu_gather_kq] act 'silu_limit' requires limit > 0.");
+  }
+  const bool biased = gate_bias.has_value() || up_bias.has_value();
+  if (act == "swiglu_clamp") {
+    if (!gate_bias.has_value() || !up_bias.has_value() || !(limit > 0.0f) ||
+        !(alpha > 0.0f)) {
+      throw std::invalid_argument(
+          "[mlx_kquant.moe_glu_gather_kq] act 'swiglu_clamp' requires "
+          "gate_bias, up_bias, limit > 0 and alpha > 0.");
+    }
+    if (kquant_type != "mxfp4" && kquant_type != "nvfp4") {
+      throw std::invalid_argument(
+          "[mlx_kquant.moe_glu_gather_kq] biased kernels are instantiated "
+          "for mxfp4/nvfp4 only.");
+    }
+  } else if (biased) {
+    throw std::invalid_argument(
+        "[mlx_kquant.moe_glu_gather_kq] gate_bias/up_bias require act "
+        "'swiglu_clamp'.");
   }
   int K = x.shape(1);
   check_kq_expert_stack(
@@ -903,17 +957,31 @@ mx::array moe_glu_gather_kq(
     throw std::invalid_argument(
         "[mlx_kquant.moe_glu_gather_kq] gate/up expert shapes must match.");
   }
+  if (biased) {
+    for (const auto* b : {&*gate_bias, &*up_bias}) {
+      if (b->ndim() != 2 || b->shape(0) != gate_w.shape(0) ||
+          b->shape(1) != gate_w.shape(1)) {
+        throw std::invalid_argument(
+            "[mlx_kquant.moe_glu_gather_kq] biases must be [E, N] matching "
+            "the expert stacks.");
+      }
+    }
+  }
 
   auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
   mx::Shape out_shape = {x.shape(0), indices.shape(1), gate_w.shape(1)};
+  std::vector<mx::array> op_inputs = {std::move(gate_w), std::move(up_w)};
+  if (biased) {
+    op_inputs.push_back(prep_bias(*gate_bias, s));
+    op_inputs.push_back(prep_bias(*up_bias, s));
+  }
+  op_inputs.push_back(std::move(x_c));
+  op_inputs.push_back(prep_indices(indices, s));
   return mx::array(
       std::move(out_shape),
       dt,
-      std::make_shared<KQuantMoEGLUKQ>(s, kquant_type, act, limit),
-      {std::move(gate_w),
-       std::move(up_w),
-       std::move(x_c),
-       prep_indices(indices, s)});
+      std::make_shared<KQuantMoEGLUKQ>(s, kquant_type, act, limit, alpha),
+      std::move(op_inputs));
 }
 
 mx::array gather_qmv_kq(
@@ -921,6 +989,7 @@ mx::array gather_qmv_kq(
     mx::array w,
     const std::string& kquant_type,
     mx::array indices,
+    const std::optional<mx::array>& bias,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   if (x.ndim() != 3) {
@@ -939,14 +1008,33 @@ mx::array gather_qmv_kq(
   }
   int K = x.shape(2);
   check_kq_expert_stack("[mlx_kquant.gather_qmv_kq]", w, kquant_type, K);
+  if (bias.has_value()) {
+    if (kquant_type != "mxfp4" && kquant_type != "nvfp4") {
+      throw std::invalid_argument(
+          "[mlx_kquant.gather_qmv_kq] biased kernels are instantiated for "
+          "mxfp4/nvfp4 only.");
+    }
+    if (bias->ndim() != 2 || bias->shape(0) != w.shape(0) ||
+        bias->shape(1) != w.shape(1)) {
+      throw std::invalid_argument(
+          "[mlx_kquant.gather_qmv_kq] bias must be [E, N] matching the "
+          "expert stack.");
+    }
+  }
 
   auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
   mx::Shape out_shape = {x.shape(0), x.shape(1), w.shape(1)};
+  std::vector<mx::array> op_inputs = {std::move(w)};
+  if (bias.has_value()) {
+    op_inputs.push_back(prep_bias(*bias, s));
+  }
+  op_inputs.push_back(std::move(x_c));
+  op_inputs.push_back(prep_indices(indices, s));
   return mx::array(
       std::move(out_shape),
       dt,
       std::make_shared<KQuantGatherQMVKQ>(s, kquant_type),
-      {std::move(w), std::move(x_c), prep_indices(indices, s)});
+      std::move(op_inputs));
 }
 
 mx::array moe_glu_gather_shexp_kq(

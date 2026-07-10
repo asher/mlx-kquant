@@ -2225,6 +2225,8 @@ inline uchar2 kq_get_scale_min_k4_just2(int j, int k, const device uint8_t* q) {
 
 #include "mlx/backend/metal/kernels/kq_quantized_iq.h"
 
+#include "mlx/backend/metal/kernels/kq_quantized_fp.h"
+
 #define KQUANT_DEFINE_GATHER_KERNELS(CODEC, LOADER)                   \
   template <typename T, int group_size, int bits>                     \
   [[kernel]] void kq_##CODEC##_gather_qmv_fast(                       \
@@ -2504,6 +2506,8 @@ KQUANT_DEFINE_GATHER_KERNELS(iq2_xs, KqIq2_xsBlockLoader)
 KQUANT_DEFINE_GATHER_KERNELS(iq2_s, KqIq2_sBlockLoader)
 KQUANT_DEFINE_GATHER_KERNELS(iq1_s, KqIq1_sBlockLoader)
 KQUANT_DEFINE_GATHER_KERNELS(iq1_m, KqIq1_mBlockLoader)
+KQUANT_DEFINE_GATHER_KERNELS(mxfp4, KqMxfp4BlockLoader)
+KQUANT_DEFINE_GATHER_KERNELS(nvfp4, KqNvfp4BlockLoader)
 
 #undef KQUANT_DEFINE_GATHER_KERNELS
 
@@ -2701,5 +2705,7 @@ KQ_DEFINE_GATHER_QMM_RHS(iq2_xs, KqIq2_xsBlockLoader)
 KQ_DEFINE_GATHER_QMM_RHS(iq2_s, KqIq2_sBlockLoader)
 KQ_DEFINE_GATHER_QMM_RHS(iq1_s, KqIq1_sBlockLoader)
 KQ_DEFINE_GATHER_QMM_RHS(iq1_m, KqIq1_mBlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(mxfp4, KqMxfp4BlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS(nvfp4, KqNvfp4BlockLoader)
 
 #undef KQ_DEFINE_GATHER_QMM_RHS

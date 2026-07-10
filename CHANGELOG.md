@@ -6,6 +6,37 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.4]
+
+### Added
+- Native-fp wire codecs `mxfp4` (GGML type 39: 17-byte blocks, e8m0 scale +
+  16 two-halves nibble bytes) and `nvfp4` (type 40: 36-byte blocks, four
+  ue4m3-scaled 16-value groups) as first-class kquant codecs: zero-copy GGUF
+  wire bytes with scalar + NEON CPU decode/matvec, the full Metal ALU matmul
+  and gather families, and the fused MoE GLU family (`moe_glu_gather_kq`,
+  `gather_qmv_kq`, shexp/mix variants). Decode-only - GGUFs ship these
+  tensors pre-quantized, so there is no encoder; `nvfp4` is verified at the
+  kernel level against synthetic wire (no real-model artifact yet).
+- `swiglu_clamp` activation + per-expert gate/up/down biases on the fused
+  MoE ops (fp4 codecs only): the gpt-oss clamped SwiGLU runs as one dispatch
+  per GLU and the biased down gather as another - bit-identical to the
+  packed-mxfp4 `moe_glu_gather`/`gather_qmv_bias` pair on the same weights.
+- `codec_has_matmul` / `codec_has_moe_glu` capability queries, so consumers
+  gate GPU routing and fused installs off the registry instead of
+  hard-coding codec lists.
+- `KQuantSwitchLinear` sorted-GEMM prefill arm now serves biased expert
+  stacks (bias applied after the segmented GEMM) - gpt-oss prefill takes
+  the one-GEMM-per-expert-segment path instead of per-row gathers.
+- `benchmarks/bench_native_fp_ab.py`: packed-vs-wire MoE A/B bench (decode +
+  sorted-prefill units; gpt-oss/DeepSeek-V4 shapes; packed, packed-fused,
+  wire, wire-fused(+bias) and CPU arms).
+
+### Fixed
+- E8M0/UE4M3 scale decode on Metal builds the float bits directly instead of
+  fast-math `exp2`, which lands ulps off on some Metal compiler versions -
+  keeps GPU dequant bit-exact with the CPU decoders and gguf-py on every
+  toolchain, and matches MLX's own `fp8_e8m0` conversion.
+
 ## [0.3.3]
 
 ### Added

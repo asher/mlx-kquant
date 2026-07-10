@@ -345,6 +345,8 @@ instantiate_mv_ext_all(q4_1, 32, 4)
 instantiate_mv_ext_all(q5_0, 32, 5)
 instantiate_mv_ext_all(q5_1, 32, 5)
 instantiate_mv_ext_all(iq4_nl, 32, 4)
+instantiate_mv_ext_all(mxfp4, 32, 4)
+instantiate_mv_ext_all(nvfp4, 64, 4)
 instantiate_mv_ext_all(iq4_xs, 256, 4)
 instantiate_mv_ext_all(iq3_s, 256, 3)
 instantiate_mv_ext_all(iq3_xxs, 256, 3)
@@ -435,6 +437,58 @@ instantiate_kquant_q2_k_for_type(float16_t)
 instantiate_kquant_iq4_nl_for_type(float)
 instantiate_kquant_iq4_nl_for_type(bfloat16_t)
 instantiate_kquant_iq4_nl_for_type(float16_t)
+
+#define instantiate_kquant_mxfp4_for_type(type)                      \
+  instantiate_kquant_batched(qmv_fast, type, 32, 4, 0, mxfp4)        \
+  instantiate_kquant_batched(qmv_fast, type, 32, 4, 1, mxfp4)        \
+  instantiate_kquant_batched(qmv,      type, 32, 4, 0, mxfp4)        \
+  instantiate_kquant_batched(qmv,      type, 32, 4, 1, mxfp4)        \
+  instantiate_kquant_qmm_t(type, 32, 4, true, 0, mxfp4)              \
+  instantiate_kquant_qmm_t(type, 32, 4, true, 1, mxfp4)              \
+  instantiate_kquant_qmm_t(type, 32, 4, false, 0, mxfp4)             \
+  instantiate_kquant_qmm_t(type, 32, 4, false, 1, mxfp4)             \
+  instantiate_kquant_qmm_t_splitk(type, 32, 4, true, mxfp4)          \
+  instantiate_kquant_qmm_t_splitk(type, 32, 4, false, mxfp4)         \
+  instantiate_kquant_qmm_n(type, 32, 4, 0, mxfp4)                    \
+  instantiate_kquant_qmm_n(type, 32, 4, 1, mxfp4)                    \
+  instantiate_kquant_gather_qmv(gather_qmv_fast, type, 32, 4, mxfp4) \
+  instantiate_kquant_gather_qmv(gather_qmv,      type, 32, 4, mxfp4) \
+  instantiate_kquant_gather_qmm_t(type, 32, 4, true, mxfp4)          \
+  instantiate_kquant_gather_qmm_t(type, 32, 4, false, mxfp4)         \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 4, true, mxfp4)      \
+  instantiate_kquant_gather_qmm_seg_t(type, 32, 4, false, mxfp4)     \
+  instantiate_kquant_gather_qmm_n(type, 32, 4, mxfp4)                \
+  instantiate_kquant_dequantize(type, 32, 4, mxfp4)
+
+instantiate_kquant_mxfp4_for_type(float)
+instantiate_kquant_mxfp4_for_type(bfloat16_t)
+instantiate_kquant_mxfp4_for_type(float16_t)
+
+#define instantiate_kquant_nvfp4_for_type(type)                      \
+  instantiate_kquant_batched(qmv_fast, type, 64, 4, 0, nvfp4)        \
+  instantiate_kquant_batched(qmv_fast, type, 64, 4, 1, nvfp4)        \
+  instantiate_kquant_batched(qmv,      type, 64, 4, 0, nvfp4)        \
+  instantiate_kquant_batched(qmv,      type, 64, 4, 1, nvfp4)        \
+  instantiate_kquant_qmm_t(type, 64, 4, true, 0, nvfp4)              \
+  instantiate_kquant_qmm_t(type, 64, 4, true, 1, nvfp4)              \
+  instantiate_kquant_qmm_t(type, 64, 4, false, 0, nvfp4)             \
+  instantiate_kquant_qmm_t(type, 64, 4, false, 1, nvfp4)             \
+  instantiate_kquant_qmm_t_splitk(type, 64, 4, true, nvfp4)          \
+  instantiate_kquant_qmm_t_splitk(type, 64, 4, false, nvfp4)         \
+  instantiate_kquant_qmm_n(type, 64, 4, 0, nvfp4)                    \
+  instantiate_kquant_qmm_n(type, 64, 4, 1, nvfp4)                    \
+  instantiate_kquant_gather_qmv(gather_qmv_fast, type, 64, 4, nvfp4) \
+  instantiate_kquant_gather_qmv(gather_qmv,      type, 64, 4, nvfp4) \
+  instantiate_kquant_gather_qmm_t(type, 64, 4, true, nvfp4)          \
+  instantiate_kquant_gather_qmm_t(type, 64, 4, false, nvfp4)         \
+  instantiate_kquant_gather_qmm_seg_t(type, 64, 4, true, nvfp4)      \
+  instantiate_kquant_gather_qmm_seg_t(type, 64, 4, false, nvfp4)     \
+  instantiate_kquant_gather_qmm_n(type, 64, 4, nvfp4)                \
+  instantiate_kquant_dequantize(type, 64, 4, nvfp4)
+
+instantiate_kquant_nvfp4_for_type(float)
+instantiate_kquant_nvfp4_for_type(bfloat16_t)
+instantiate_kquant_nvfp4_for_type(float16_t)
 
 #define instantiate_kquant_iq4_xs_for_type(type)                     \
   instantiate_kquant_batched(qmv_fast, type, 256, 4, 0, iq4_xs)      \
@@ -679,6 +733,8 @@ instantiate_kquant_gather_qmm_rhs_codec(256, 6, q6_k)
 instantiate_kquant_gather_qmm_rhs_codec(256, 3, q3_k)
 instantiate_kquant_gather_qmm_rhs_codec(256, 2, q2_k)
 instantiate_kquant_gather_qmm_rhs_codec(32, 4, iq4_nl)
+instantiate_kquant_gather_qmm_rhs_codec(32, 4, mxfp4)
+instantiate_kquant_gather_qmm_rhs_codec(64, 4, nvfp4)
 instantiate_kquant_gather_qmm_rhs_codec(256, 4, iq4_xs)
 instantiate_kquant_gather_qmm_rhs_codec(256, 3, iq3_xxs)
 instantiate_kquant_gather_qmm_rhs_codec(256, 3, iq3_s)

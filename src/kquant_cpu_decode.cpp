@@ -25,6 +25,7 @@
 
 #include "kquant_codec.h"
 #include "kquant_cpu_neon.h"
+#include "kquant_fp_tables.h"
 #include "kquant_iq_tables.h"
 
 #include "mlx/types/half_types.h" // float16_t, bfloat16_t
@@ -391,6 +392,47 @@ void dequantize_iq4_nl(const uint8_t* w, T* out, std::size_t num_weights) {
     for (int j = 0; j < 16; j++) {
       dst[j] = static_cast<T>(d * kvalues_iq4nl[qs[j] & 0xf]);
       dst[j + 16] = static_cast<T>(d * kvalues_iq4nl[qs[j] >> 4]);
+    }
+  }
+}
+
+// Native-fp codecs (decode-only): doubled-E2M1 LUT with the half folded into
+// the block scale (kquant_fp_tables.h). Float-op order mirrors gguf-py
+// MXFP4/NVFP4.dequantize_blocks so f32 output is bit-exact.
+
+template <typename T>
+void dequantize_mxfp4(const uint8_t* w, T* out, std::size_t num_weights) {
+  constexpr int block_weights = 32;
+  constexpr int block_bytes = 17;
+  std::size_t num_blocks = num_weights / block_weights;
+  for (std::size_t b = 0; b < num_blocks; b++) {
+    const uint8_t* block = w + b * block_bytes;
+    float d = kq_e8m0_half(block[0]);
+    const uint8_t* qs = block + 1;
+    T* dst = out + b * block_weights;
+    for (int j = 0; j < 16; j++) {
+      dst[j] = static_cast<T>(d * kvalues_mxfp4[qs[j] & 0xf]);
+      dst[j + 16] = static_cast<T>(d * kvalues_mxfp4[qs[j] >> 4]);
+    }
+  }
+}
+
+template <typename T>
+void dequantize_nvfp4(const uint8_t* w, T* out, std::size_t num_weights) {
+  constexpr int block_weights = 64; // four 16-value groups, one scale each
+  constexpr int block_bytes = 36;
+  std::size_t num_blocks = num_weights / block_weights;
+  for (std::size_t b = 0; b < num_blocks; b++) {
+    const uint8_t* block = w + b * block_bytes;
+    T* dst = out + b * block_weights;
+    for (int g = 0; g < 4; g++) {
+      float d = kq_ue4m3_half(block[g]);
+      const uint8_t* qs = block + 4 + g * 8;
+      T* gd = dst + g * 16;
+      for (int j = 0; j < 8; j++) {
+        gd[j] = static_cast<T>(d * kvalues_mxfp4[qs[j] & 0xf]);
+        gd[j + 8] = static_cast<T>(d * kvalues_mxfp4[qs[j] >> 4]);
+      }
     }
   }
 }
@@ -954,6 +996,10 @@ DequantFnF32 dequant_fn_f32(const std::string& t) {
     return &dequantize_iq1_s<float>;
   } else if (t == "iq1_m") {
     return &dequantize_iq1_m<float>;
+  } else if (t == "mxfp4") {
+    return &dequantize_mxfp4<float>;
+  } else if (t == "nvfp4") {
+    return &dequantize_nvfp4<float>;
   }
   return nullptr;
 }
@@ -1130,6 +1176,10 @@ void kquant_dequantize_dispatch(
     dequantize_iq1_s(w, out, num_weights);
   } else if (kquant_type == "iq1_m") {
     dequantize_iq1_m(w, out, num_weights);
+  } else if (kquant_type == "mxfp4") {
+    dequantize_mxfp4(w, out, num_weights);
+  } else if (kquant_type == "nvfp4") {
+    dequantize_nvfp4(w, out, num_weights);
   } else {
     throw std::runtime_error(
         "[mlx_kquant] dequantize: unsupported codec: " + kquant_type);
