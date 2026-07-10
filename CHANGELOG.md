@@ -6,6 +6,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- `KQuantSwitchLinear` sorted-expert GEMM arm now also requires the default
+  device to be the GPU, not just a present Metal backend: `expert_tile_map`/
+  `gather_qmm_seg` are Metal-only, so a CPU default device (e.g.
+  `KQUANT_FORCE_CPU`) correctly falls through to the per-expert loop instead
+  of dispatching Metal-only ops.
+
 ## [0.3.4]
 
 ### Added

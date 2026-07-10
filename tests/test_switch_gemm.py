@@ -98,10 +98,17 @@ def test_sorted_expert_gemm_matches_gather(codec, rows, experts, monkeypatch):
 
 
 def test_threshold_and_shape_gating(monkeypatch):
+    import mlx_kquant.nn as kqnn
+
     sw = _make_switch("iq2_xxs")
     rng = np.random.default_rng(0)
     x, idx = _sorted_inputs(rng, 64, list(range(E)))
     monkeypatch.setenv("KQ_SWITCH_GEMM_MIN_ROWS", "512")
+    # On NAX GPUs big sorted batches defer to gather_qmm's tensor-core leaf;
+    # pin that off so the row threshold itself is what routes.
+    monkeypatch.setattr(
+        kqnn.kq, "nax_gather_enabled", lambda codec: False, raising=False
+    )
     calls = []
     orig = sw._sorted_expert_gemm
     monkeypatch.setattr(
