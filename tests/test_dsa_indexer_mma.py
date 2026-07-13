@@ -126,6 +126,117 @@ def test_dsa_indexer_qat_quant_rejects_bad_shapes():
         kq.dsa_indexer_qat_quant(mx.zeros((8, 64), dtype=mx.float16))
 
 
+# ------------------------------------------------- qat pack (no Hadamard)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_dsa_indexer_qat_pack_fixed_point(dtype):
+    """pack of already-roundtripped rows dequantizes back bit-exactly."""
+    rng = np.random.default_rng(29)
+    x = mx.array(rng.standard_normal((3000, D)) * 0.6).astype(dtype)
+    rows = kq.dsa_indexer_qat(x)
+    codes, scales = kq.dsa_indexer_qat_pack(rows)
+    mx.eval(rows, codes, scales)
+    assert codes.dtype == mx.int8 and scales.dtype == mx.float32
+
+    redeq_mx = _dequantize(codes, scales).astype(dtype)
+    if dtype == mx.bfloat16:
+        redeq = np.array(redeq_mx.astype(mx.float32))
+        r = np.array(rows.astype(mx.float32))
+        width = np.uint32
+    else:
+        redeq = np.array(redeq_mx)
+        r = np.array(rows)
+        width = np.uint16
+    bit_eq = redeq.view(width) == r.view(width)
+    # Bit-exact except -0.0 -> +0.0 (as in qat_quant).
+    assert np.all(bit_eq | ((redeq == 0) & (r == 0)))
+    assert np.array_equal(redeq, r)
+
+
+def test_dsa_indexer_qat_pack_consistency_with_quant():
+    """pack(roundtrip(x)) vs qat_quant(x): per 32-block, either codes AND
+    scales are identical, or the block hit the 3*2^k scale ambiguity (the
+    original scale is not a function of the on-grid values) and pack
+    emits exactly the halved scale with doubled codes. Both forms
+    dequantize and score bit-identically (asserted below and in the
+    scores test)."""
+    rng = np.random.default_rng(31)
+    x = mx.array(rng.standard_normal((4000, D)) * 0.6).astype(mx.float16)
+    rows = kq.dsa_indexer_qat(x)
+    qc, qs = kq.dsa_indexer_qat_quant(x)
+    pc, ps = kq.dsa_indexer_qat_pack(rows)
+    mx.eval(rows, qc, qs, pc, ps)
+
+    cq = np.array(qc).reshape(-1, 4, 32)
+    cp = np.array(pc).reshape(-1, 4, 32)
+    sq = np.array(qs)
+    sp = np.array(ps)
+
+    exact = (cq == cp).all(axis=-1) & (sq == sp)
+    halved = (
+        ~exact
+        & (sp == sq / 2)
+        & (cp == 2 * cq).all(axis=-1)
+        # ambiguity trigger: the block max is exactly the grid point 3
+        & (np.abs(cq).max(axis=-1) == 6)
+    )
+    assert np.all(exact | halved)
+    assert exact.any() and halved.any()  # both cases exercised
+
+    # Identical dequant either way.
+    dq = np.array(_dequantize(qc, qs))
+    dp = np.array(_dequantize(pc, ps))
+    assert np.array_equal(dq, dp)
+
+
+@pytest.mark.parametrize("H", [64, 32])
+def test_dsa_indexer_scores_q_with_packed_keys(H):
+    """scores_q on pack()-ed key rows == scores on the cached fp16 rows,
+    bit-identical (the halved-scale form rescales by the same pow2)."""
+    M, N = 128, 320
+    q, k, w = _make_qkw(1, H, M, N, mx.float16, True, seed=37)
+    qd = kq.dsa_indexer_qat(q.reshape(-1, D)).reshape(q.shape)
+    kd = kq.dsa_indexer_qat(k.reshape(-1, D)).reshape(k.shape)
+
+    qc, qs = _quantize(q)
+    kc, ks = kq.dsa_indexer_qat_pack(kd.reshape(-1, D))
+    kc = kc.reshape(k.shape)
+    ks = ks.reshape(1, 1, N, 4)
+
+    ref = kq.dsa_indexer_scores(qd, kd, w, causal=True)
+    got = kq.dsa_indexer_scores_q(qc, qs, kc, ks, w, causal=True)
+    mx.eval(ref, got)
+    a = np.array(ref.astype(mx.float32))
+    b = np.array(got.astype(mx.float32))
+    masked = np.isneginf(a)
+    assert np.array_equal(masked, np.isneginf(b))
+    assert np.array_equal(a[~masked], b[~masked])
+
+
+def test_dsa_indexer_qat_pack_zero_row_padding():
+    """gmlx pads pooled keys with zero rows before packing: packed zero
+    rows must produce codes that score exactly 0."""
+    H, M, N, real = 64, 64, 256, 200
+    q, k, w = _make_qkw(1, H, M, N, mx.float16, True, seed=41)
+    kd = kq.dsa_indexer_qat(k.reshape(-1, D)).reshape(k.shape)
+    kd_np = np.array(kd)
+    kd_np[0, 0, real:] = 0.0  # zero padding rows
+    kd = mx.array(kd_np)
+
+    kc, ks = kq.dsa_indexer_qat_pack(kd.reshape(-1, D))
+    mx.eval(kc, ks)
+    assert np.all(np.array(kc.reshape(k.shape))[0, 0, real:] == 0)
+
+    qc, qs = _quantize(q)
+    got = kq.dsa_indexer_scores_q(
+        qc, qs, kc.reshape(k.shape), ks.reshape(1, 1, N, 4), w, causal=False
+    )
+    mx.eval(got)
+    g = np.array(got.astype(mx.float32))
+    assert np.all(g[0, 0, :, real:] == 0.0)
+
+
 # --------------------------------------------------------- scores_q arm
 
 SCORE_CASES = [

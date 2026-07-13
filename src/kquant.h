@@ -343,6 +343,18 @@ std::vector<mx::array> dsa_indexer_qat_quant(
     mx::array x,
     mx::StreamOrDevice s = {});
 
+// Pack variant of dsa_indexer_qat_quant WITHOUT the Hadamard: x rows are
+// already rotated and on the E2M1 grid (e.g. pooled keys cached as the
+// fp16 output of dsa_indexer_qat). Same wire form; fixed point on
+// on-grid rows (dequant == x bit-exactly, +0.0 for -0.0). Scale caveat:
+// a block whose max is exactly 3*2^k re-derives scale 2^(k-1) where the
+// in-graph quant may have chosen 2^k (the original scale is not a
+// function of the on-grid values); codes double and every downstream
+// dequant/scores_q result is bit-identical either way. Metal-only.
+std::vector<mx::array> dsa_indexer_qat_pack(
+    mx::array x,
+    mx::StreamOrDevice s = {});
+
 // dsa_indexer_scores on pre-quantized operands (no fp16 operand path, no
 // internal quantize): codes_q int8 [B, H, M, 128] + scales_q f32
 // [B, H, M, 4] and codes_k int8 [B, 1, N, 128] + scales_k f32 [B, 1, N, 4]
@@ -932,6 +944,28 @@ class KQDsaIndexerQatQuant : public mx::Primitive {
 
   const char* name() const override {
     return "KQDsaIndexerQatQuant";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+};
+
+// Hadamard-free pack of already-rotated on-grid rows into codes+scales
+// (see dsa_indexer_qat_pack). Inference-only, Metal-only.
+class KQDsaIndexerQatPack : public mx::Primitive {
+ public:
+  explicit KQDsaIndexerQatPack(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQDsaIndexerQatPack";
   }
   bool is_equivalent(const mx::Primitive& other) const override;
 };

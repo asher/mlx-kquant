@@ -525,6 +525,33 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "dsa_indexer_qat_pack",
+      &mlx_kquant::dsa_indexer_qat_pack,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Pack variant of dsa_indexer_qat_quant WITHOUT the Hadamard: for
+        rows that are already rotated and on the E2M1 grid (e.g. pooled
+        indexer keys cached as the fp16 output of dsa_indexer_qat). Same
+        wire form as dsa_indexer_qat_quant; on on-grid rows the pack is a
+        fixed point (codes * scales == x bit-exactly, with the same
+        +0.0-for--0.0 caveat). A block whose max is exactly 3*2^k
+        re-derives scale 2^(k-1) where the in-graph quant may have chosen
+        2^k (the original scale is not recoverable from on-grid values);
+        codes double and every downstream dequant / dsa_indexer_scores_q
+        result is bit-identical either way.
+
+        Args:
+            x (array): any shape with a trailing dim of 128, already
+                Hadamard-rotated on-grid rows; float16/bfloat16/float32.
+
+        Returns:
+            tuple(array, array): codes int8 and scales float32, as
+            dsa_indexer_qat_quant.
+      )");
+
+  m.def(
       "dsa_indexer_scores_q",
       &mlx_kquant::dsa_indexer_scores_q,
       "codes_q"_a,

@@ -90,6 +90,37 @@ void KQDsaIndexerQatQuant::eval_gpu(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+void KQDsaIndexerQatPack::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+
+  const auto& x = inputs[0];
+  auto& codes = outputs[0];
+  auto& scales = outputs[1];
+  codes.set_data(mx::allocator::malloc(codes.nbytes()));
+  scales.set_data(mx::allocator::malloc(scales.nbytes()));
+
+  constexpr int rows_per_tg = 32;
+  const int rows = int(x.size() / 128);
+
+  const std::string kname =
+      "kq_dsa_indexer_qat_pack_" + kq_type_string(x.dtype());
+  auto kernel = kq_get_kernel(d, kname, kname, {});
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+
+  ce.set_input_array(x, 0);
+  ce.set_output_array(codes, 1);
+  ce.set_output_array(scales, 2);
+  ce.set_bytes(rows, 3);
+
+  MTL::Size group_dims(256, 1, 1);
+  MTL::Size grid_dims((rows + rows_per_tg - 1) / rows_per_tg, 1, 1);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 void KQDsaKvQat::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
@@ -135,6 +166,13 @@ void KQDsaIndexerQatQuant::eval_gpu(
       "[mlx_kquant.dsa_indexer_qat_quant] requires a Metal build.");
 }
 
+void KQDsaIndexerQatPack::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.dsa_indexer_qat_pack] requires a Metal build.");
+}
+
 void KQDsaKvQat::eval_gpu(
     const std::vector<mx::array>&,
     std::vector<mx::array>&) {
@@ -174,6 +212,24 @@ std::vector<mx::Shape> KQDsaIndexerQatQuant::output_shapes(
 }
 
 bool KQDsaIndexerQatQuant::is_equivalent(const mx::Primitive&) const {
+  return true;
+}
+
+void KQDsaIndexerQatPack::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.dsa_indexer_qat_pack] has no CPU implementation.");
+}
+
+std::vector<mx::Shape> KQDsaIndexerQatPack::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  auto scales_shape = inputs[0].shape();
+  scales_shape.back() = 4;
+  return {inputs[0].shape(), std::move(scales_shape)};
+}
+
+bool KQDsaIndexerQatPack::is_equivalent(const mx::Primitive&) const {
   return true;
 }
 
@@ -287,6 +343,40 @@ std::vector<mx::array> dsa_indexer_qat_quant(
       std::move(shapes),
       dtypes,
       std::make_shared<KQDsaIndexerQatQuant>(s),
+      {std::move(xc)});
+}
+
+std::vector<mx::array> dsa_indexer_qat_pack(
+    mx::array x,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+
+  if (x.ndim() < 1 || x.shape(-1) != 128) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_indexer_qat_pack] expected a trailing dim of "
+        << "128 (the V4 indexer head dim), got shape " << x.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (x.dtype() != mx::float16 && x.dtype() != mx::bfloat16 &&
+      x.dtype() != mx::float32) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_indexer_qat_pack] expected fp16/bf16/fp32 "
+        << "input, got " << x.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // Pre-eval flags are unreliable; contiguous is a no-op at eval when the
+  // input already is.
+  auto xc = mx::contiguous(x, false, s);
+
+  auto scales_shape = xc.shape();
+  scales_shape.back() = 4;
+  std::vector<mx::Shape> shapes = {xc.shape(), std::move(scales_shape)};
+  std::vector<mx::Dtype> dtypes = {mx::int8, mx::float32};
+  return mx::array::make_arrays(
+      std::move(shapes),
+      dtypes,
+      std::make_shared<KQDsaIndexerQatPack>(s),
       {std::move(xc)});
 }
 

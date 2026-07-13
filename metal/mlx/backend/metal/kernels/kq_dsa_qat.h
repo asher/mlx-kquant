@@ -215,6 +215,75 @@ kq_dsa_indexer_qat_quant(
   }
 }
 
+// Pack variant without the Hadamard: input rows are ALREADY rotated and
+// on the E2M1 grid (e.g. pooled indexer keys cached as the fp16 output of
+// kq_dsa_indexer_qat). Re-derives the per-32-block scale from the row
+// values with the same formula (2^ceil(log2(amax/6)), FLT_MIN*6 floor)
+// and packs codes+scales in the kq_dsa_indexer_qat_quant wire form.
+// Fixed point on on-grid rows: codes * scale_half == input bit-exactly
+// (+0.0 for the round-trip's -0.0, as in the quant emit). Scale caveat:
+// a block whose max snapped to 3*2^k re-derives scale 2^(k-1) where the
+// in-graph quant chose 2^k (the original scale is not a function of the
+// on-grid values); codes double, dequant and downstream scores_q results
+// are bit-identical either way (power-of-two rescale).
+template <typename T>
+[[kernel, max_total_threads_per_threadgroup(256)]] void kq_dsa_indexer_qat_pack(
+    const device T* X [[buffer(0)]],
+    device int8_t* CODES [[buffer(1)]],
+    device float* SCALES [[buffer(2)]],
+    const constant int& n_rows [[buffer(3)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+  constexpr short N = 128;
+  constexpr short ROWS = 32;
+  constexpr short RAD = 16;
+
+  threadgroup float part[ROWS][N / RAD];
+  threadgroup float qs[ROWS][N / 32];
+
+  const short lr = short(lane >> 3);
+  const short i = short(lane & 7);
+  const int row = int(tgid.x) * ROWS + lr;
+  const bool active = row < n_rows;
+
+  const device T* x_row = X + size_t(row) * N;
+  float x[RAD];
+  float local_max = 0.0f;
+  STEEL_PRAGMA_UNROLL
+  for (short r = 0; r < RAD; r++) {
+    x[r] = active ? float(x_row[i * RAD + r]) : 0.0f;
+    local_max = metal::max(local_max, metal::fabs(x[r]));
+  }
+  part[lr][i] = local_max;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Per-32-block scale: block b spans workers 2b and 2b+1 (same formula
+  // as the round-trip core).
+  if (i < N / 32) {
+    float amax = metal::max(part[lr][2 * i], part[lr][2 * i + 1]);
+    amax = metal::max(amax, 7.052966104933725e-38f); // FLT_MIN * 6
+    const float e = metal::ceil(metal::precise::log2(amax / 6.0f));
+    qs[lr][i] = metal::ldexp(1.0f, int(e));
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (active) {
+    device int8_t* c_row = CODES + size_t(row) * N;
+    STEEL_PRAGMA_UNROLL
+    for (short r = 0; r < RAD; r++) {
+      const short e = i * RAD + r;
+      const float q = qs[lr][e >> 5];
+      const float c = metal::clamp(x[r] / q, -6.0f, 6.0f);
+      const float sgn = c > 0.0f ? 1.0f : (c < 0.0f ? -1.0f : 0.0f);
+      const float qv = kq_dsa_e2m1_snap(metal::fabs(c));
+      c_row[e] = int8_t(sgn * qv * 2.0f);
+    }
+    if (i < N / 32) {
+      SCALES[size_t(row) * (N / 32) + i] = qs[lr][i] * 0.5f;
+    }
+  }
+}
+
 // Main-attention KV row QAT round-trip fused into one kernel (ds4.c
 // dsv4_fp8_kv_quantize_row + f16_round): per-64-block FP8-E4M3FN
 // round-trip on the leading D - NROT dims (scale = 2^ceil(log2(amax/448))
