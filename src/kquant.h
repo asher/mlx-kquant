@@ -330,6 +330,40 @@ mx::array dsa_indexer_score_decode(
 // Metal-only.
 mx::array dsa_indexer_qat(mx::array x, mx::StreamOrDevice s = {});
 
+// Emit variant of dsa_indexer_qat: same Hadamard + E2M1 quantization, but
+// returns the quantized wire form instead of the dequantized round-trip:
+// {codes int8 (x's shape; E2M1 values doubled, in [-12, 12]),
+//  scales float32 (x's shape with trailing 128 -> 4; per-32-block
+//  power-of-two scale pre-folded as scale * 0.5)}.
+// dequant = codes * scales (repeated over each 32 block) reproduces
+// dsa_indexer_qat(x) bit-exactly, except negatives snapped to zero
+// re-dequantize as +0.0 where the round-trip stores -0.0 (value-equal;
+// scores unaffected). Feed to dsa_indexer_scores_q. Metal-only.
+std::vector<mx::array> dsa_indexer_qat_quant(
+    mx::array x,
+    mx::StreamOrDevice s = {});
+
+// dsa_indexer_scores on pre-quantized operands (no fp16 operand path, no
+// internal quantize): codes_q int8 [B, H, M, 128] + scales_q f32
+// [B, H, M, 4] and codes_k int8 [B, 1, N, 128] + scales_k f32 [B, 1, N, 4]
+// in the dsa_indexer_qat_quant wire form. weights as in dsa_indexer_scores
+// (fp16/bf16/fp32; fp32 is cast-free since the kernel reads weights as
+// f32). Same causal semantics and padding contract. Output dtype follows
+// fp16/bf16 weights, else float16. Scores are bit-identical to
+// dsa_indexer_scores on the dequantized codes (int32-exact segment MMA,
+// fp32 rescale/accumulation of dyadic products). Tensor-op hardware only.
+mx::array dsa_indexer_scores_q(
+    mx::array codes_q,
+    mx::array scales_q,
+    mx::array codes_k,
+    mx::array scales_k,
+    mx::array weights,
+    bool causal = true,
+    int unused_causal_prefix_topk = 0,
+    bool skip_causal_future_store = false,
+    int causal_q_offset = -1,
+    mx::StreamOrDevice s = {});
+
 // DeepSeek-V4-Flash main-attention KV QAT round-trip in one dispatch:
 // per-64-block FP8-E4M3FN round-trip (scale 2^ceil(log2(amax/448)), amax
 // floor 1e-4, clamp +-448, ties-to-even) on the leading dims, the trailing
@@ -878,6 +912,69 @@ class KQDsaIndexerQat : public mx::Primitive {
     return "KQDsaIndexerQat";
   }
   bool is_equivalent(const mx::Primitive& other) const override;
+};
+
+// Emit variant of KQDsaIndexerQat producing int8 codes + per-32-block
+// scales (see dsa_indexer_qat_quant). Inference-only, Metal-only.
+class KQDsaIndexerQatQuant : public mx::Primitive {
+ public:
+  explicit KQDsaIndexerQatQuant(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQDsaIndexerQatQuant";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+};
+
+// Lightning-indexer scores on pre-quantized int8/E2M1 operands via
+// tensor-op MMA (see dsa_indexer_scores_q). Inference-only, Metal-only.
+class KQDsaIndexerScoresQ : public mx::Primitive {
+ public:
+  explicit KQDsaIndexerScoresQ(
+      mx::Stream stream,
+      bool causal,
+      bool weights_lh,
+      int unused_causal_prefix_topk,
+      bool skip_causal_future_store,
+      int causal_q_offset)
+      : mx::Primitive(stream),
+        causal_(causal),
+        weights_lh_(weights_lh),
+        unused_causal_prefix_topk_(unused_causal_prefix_topk),
+        skip_causal_future_store_(skip_causal_future_store),
+        causal_q_offset_(causal_q_offset) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQDsaIndexerScoresQ";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  bool causal_;
+  bool weights_lh_;
+  int unused_causal_prefix_topk_;
+  bool skip_causal_future_store_;
+  int causal_q_offset_;
 };
 
 // DeepSeek-V4-Flash fused main-attention KV QAT round-trip (see
