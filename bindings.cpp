@@ -499,6 +499,98 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "dsa_indexer_qat_quant",
+      &mlx_kquant::dsa_indexer_qat_quant,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Emit variant of dsa_indexer_qat: same fused Hadamard + FP4-E2M1
+        quantization, returning the quantized wire form instead of the
+        dequantized round-trip. codes * scales (each scale covering its
+        32-block) reproduces dsa_indexer_qat(x) bit-exactly, except
+        negatives snapped to zero re-dequantize as +0.0 where the
+        round-trip stores -0.0 (value-equal; scores unaffected). Feed to
+        dsa_indexer_scores_q.
+
+        Args:
+            x (array): any shape with a trailing dim of 128,
+                float16/bfloat16/float32.
+
+        Returns:
+            tuple(array, array): codes int8 (x's shape; E2M1 values
+            doubled, in [-12, 12]) and scales float32 (x's shape with the
+            trailing 128 replaced by 4; per-32-block power-of-two scale
+            pre-folded as scale * 0.5).
+      )");
+
+  m.def(
+      "dsa_indexer_qat_pack",
+      &mlx_kquant::dsa_indexer_qat_pack,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Pack variant of dsa_indexer_qat_quant WITHOUT the Hadamard: for
+        rows that are already rotated and on the E2M1 grid (e.g. pooled
+        indexer keys cached as the fp16 output of dsa_indexer_qat). Same
+        wire form as dsa_indexer_qat_quant; on on-grid rows the pack is a
+        fixed point (codes * scales == x bit-exactly, with the same
+        +0.0-for--0.0 caveat). A block whose max is exactly 3*2^k
+        re-derives scale 2^(k-1) where the in-graph quant may have chosen
+        2^k (the original scale is not recoverable from on-grid values);
+        codes double and every downstream dequant / dsa_indexer_scores_q
+        result is bit-identical either way.
+
+        Args:
+            x (array): any shape with a trailing dim of 128, already
+                Hadamard-rotated on-grid rows; float16/bfloat16/float32.
+
+        Returns:
+            tuple(array, array): codes int8 and scales float32, as
+            dsa_indexer_qat_quant.
+      )");
+
+  m.def(
+      "dsa_indexer_scores_q",
+      &mlx_kquant::dsa_indexer_scores_q,
+      "codes_q"_a,
+      "scales_q"_a,
+      "codes_k"_a,
+      "scales_k"_a,
+      "weights"_a,
+      "causal"_a = true,
+      "unused_causal_prefix_topk"_a = 0,
+      "skip_causal_future_store"_a = false,
+      "causal_q_offset"_a = -1,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        dsa_indexer_scores on pre-quantized operands (dsa_indexer_qat_quant
+        wire form) via int8 tensor-op MMA: each 128-dim dot runs as four
+        K=32 int8 x int8 segments accumulated in int32 (exact), rescaled by
+        the segment's scale pair. Scores are bit-identical to
+        dsa_indexer_scores on the dequantized codes. Tensor-op hardware
+        only (no fallback; dequantize and use dsa_indexer_scores instead).
+
+        Args:
+            codes_q (array): [B, H, M, 128] int8, H 32 or 64, M % 64 == 0.
+            scales_q (array): [B, H, M, 4] float32.
+            codes_k (array): [B, 1, N, 128] int8, N % 64 == 0.
+            scales_k (array): [B, 1, N, 4] float32.
+            weights (array): [B, M, H] (lh layout) or [B, H, M, 1],
+                float16/bfloat16/float32.
+            causal (bool): as in dsa_indexer_scores.
+            unused_causal_prefix_topk (int): as in dsa_indexer_scores.
+            skip_causal_future_store (bool): as in dsa_indexer_scores.
+            causal_q_offset (int): as in dsa_indexer_scores.
+
+        Returns:
+            array: scores [B, 1, M, N]; bfloat16 for bfloat16 weights,
+            else float16.
+      )");
+
+  m.def(
       "dsa_kv_qat",
       &mlx_kquant::dsa_kv_qat,
       "x"_a,

@@ -8,6 +8,7 @@
 // 301 weights-lh, 302 bucketed emission). Inference-only (no CPU eval).
 // omlx is Apache-2.0: see mlx_kquant/licenses/omlx-LICENSE.
 #include <cstdint>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -31,6 +32,23 @@ namespace mlx_kquant {
 
 #ifdef _METAL_
 
+namespace {
+
+// Tensor-op MMA arm of the indexer score GEMM (kq_dsa_indexer_mma.h).
+// Default on tensor-op hardware; KQ_DISABLE_INDEXER_MMA=1 falls back to
+// the simdgroup steel kernel without a rebuild (read per dispatch: the
+// getenv cost is negligible on the prefill path).
+bool kq_indexer_mma_enabled() {
+  return kq_is_nax_available() &&
+      std::getenv("KQ_DISABLE_INDEXER_MMA") == nullptr;
+}
+
+constexpr int kq_indexer_mma_bm = 64;
+constexpr int kq_indexer_mma_bn = 32;
+constexpr int kq_indexer_mma_threads = 128;
+
+} // namespace
+
 void KQDsaIndexerScores::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
@@ -43,6 +61,45 @@ void KQDsaIndexerScores::eval_gpu(
   auto& out = outputs[0];
 
   out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  if (kq_indexer_mma_enabled()) {
+    const int B = q.shape(0);
+    const int H = q.shape(1);
+    const int M = q.shape(2);
+    const int N = k.shape(2);
+
+    bool do_causal = causal_;
+    bool use_weights_lh = weights_lh_;
+    mx::metal::MTLFCList func_consts = {
+        {&do_causal, MTL::DataType::DataTypeBool, 310},
+        {&use_weights_lh, MTL::DataType::DataTypeBool, 311},
+    };
+
+    const std::string kname =
+        "kq_dsa_indexer_score_mma_" + kq_type_string(q.dtype());
+    const std::string hash_name = kname + "_causal_" + (do_causal ? 't' : 'n') +
+        "_wlh_" + (use_weights_lh ? 't' : 'n');
+
+    auto kernel = kq_get_kernel(d, kname, hash_name, func_consts);
+    auto& ce = mx::metal::get_command_encoder(s);
+    ce.set_compute_pipeline_state(kernel);
+
+    ce.set_input_array(q, 0);
+    ce.set_input_array(k, 1);
+    ce.set_input_array(weights, 2);
+    ce.set_output_array(out, 3);
+    ce.set_bytes(M, 4);
+    ce.set_bytes(N, 5);
+    ce.set_bytes(H, 6);
+    ce.set_bytes(unused_causal_prefix_topk_, 7);
+    ce.set_bytes(skip_causal_future_store_, 8);
+    ce.set_bytes(causal_q_offset_, 9);
+
+    MTL::Size group_dims(kq_indexer_mma_threads, 1, 1);
+    MTL::Size grid_dims(N / kq_indexer_mma_bn, M / kq_indexer_mma_bm, B);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+    return;
+  }
 
   constexpr int bm = 64;
   constexpr int bn = 64;
@@ -102,6 +159,66 @@ void KQDsaIndexerScores::eval_gpu(
 
   MTL::Size group_dims(wm * wn * 32, 1, 1);
   MTL::Size grid_dims(tiles_n, tiles_m, B);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+void KQDsaIndexerScoresQ::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+
+  const auto& qc = inputs[0];
+  const auto& sq = inputs[1];
+  const auto& kc = inputs[2];
+  const auto& sk = inputs[3];
+  const auto& weights = inputs[4];
+  auto& out = outputs[0];
+
+  if (!kq_is_nax_available()) {
+    throw std::runtime_error(
+        "[mlx_kquant.dsa_indexer_scores_q] requires tensor-op (NAX) "
+        "hardware; use dsa_indexer_scores on the dequantized codes.");
+  }
+
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  const int B = qc.shape(0);
+  const int H = qc.shape(1);
+  const int M = qc.shape(2);
+  const int N = kc.shape(2);
+
+  bool do_causal = causal_;
+  bool use_weights_lh = weights_lh_;
+  mx::metal::MTLFCList func_consts = {
+      {&do_causal, MTL::DataType::DataTypeBool, 310},
+      {&use_weights_lh, MTL::DataType::DataTypeBool, 311},
+  };
+
+  const std::string kname =
+      "kq_dsa_indexer_score_i8mx_" + kq_type_string(out.dtype());
+  const std::string hash_name = kname + "_causal_" + (do_causal ? 't' : 'n') +
+      "_wlh_" + (use_weights_lh ? 't' : 'n');
+
+  auto kernel = kq_get_kernel(d, kname, hash_name, func_consts);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+
+  ce.set_input_array(qc, 0);
+  ce.set_input_array(sq, 1);
+  ce.set_input_array(kc, 2);
+  ce.set_input_array(sk, 3);
+  ce.set_input_array(weights, 4);
+  ce.set_output_array(out, 5);
+  ce.set_bytes(M, 6);
+  ce.set_bytes(N, 7);
+  ce.set_bytes(H, 8);
+  ce.set_bytes(unused_causal_prefix_topk_, 9);
+  ce.set_bytes(skip_causal_future_store_, 10);
+  ce.set_bytes(causal_q_offset_, 11);
+
+  MTL::Size group_dims(kq_indexer_mma_threads, 1, 1);
+  MTL::Size grid_dims(N / kq_indexer_mma_bn, M / kq_indexer_mma_bm, B);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -208,6 +325,13 @@ void KQDsaIndexerScoreDecode::eval_gpu(
       "[mlx_kquant.dsa_indexer_score_decode] requires a Metal build.");
 }
 
+void KQDsaIndexerScoresQ::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.dsa_indexer_scores_q] requires a Metal build.");
+}
+
 void KQDsaTopKIndices::eval_gpu(
     const std::vector<mx::array>&,
     std::vector<mx::array>&) {
@@ -238,6 +362,13 @@ void KQDsaIndexerScoreDecode::eval_cpu(
       "[mlx_kquant.dsa_indexer_score_decode] has no CPU implementation.");
 }
 
+void KQDsaIndexerScoresQ::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.dsa_indexer_scores_q] has no CPU implementation.");
+}
+
 std::vector<mx::Shape> KQDsaIndexerScores::output_shapes(
     const std::vector<mx::array>& inputs) {
   const auto& q = inputs[0];
@@ -263,6 +394,21 @@ bool KQDsaTopKIndices::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQDsaTopKIndices&>(other);
   return topk_ == o.topk_ && bucketed_ == o.bucketed_ &&
       causal_valid_prefix_ == o.causal_valid_prefix_;
+}
+
+std::vector<mx::Shape> KQDsaIndexerScoresQ::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  const auto& qc = inputs[0];
+  const auto& kc = inputs[2];
+  return {mx::Shape{qc.shape(0), 1, qc.shape(2), kc.shape(2)}};
+}
+
+bool KQDsaIndexerScoresQ::is_equivalent(const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQDsaIndexerScoresQ&>(other);
+  return causal_ == o.causal_ && weights_lh_ == o.weights_lh_ &&
+      unused_causal_prefix_topk_ == o.unused_causal_prefix_topk_ &&
+      skip_causal_future_store_ == o.skip_causal_future_store_ &&
+      causal_q_offset_ == o.causal_q_offset_;
 }
 
 std::vector<mx::Shape> KQDsaIndexerScoreDecode::output_shapes(
@@ -432,6 +578,117 @@ mx::array dsa_indexer_scores(
       std::move(out_shape),
       final_type,
       std::make_shared<KQDsaIndexerScores>(
+          s,
+          causal,
+          weights_lh,
+          unused_causal_prefix_topk,
+          skip_causal_future_store,
+          causal_q_offset),
+      std::move(inputs));
+}
+
+mx::array dsa_indexer_scores_q(
+    mx::array codes_q,
+    mx::array scales_q,
+    mx::array codes_k,
+    mx::array scales_k,
+    mx::array weights,
+    bool causal,
+    int unused_causal_prefix_topk,
+    bool skip_causal_future_store,
+    int causal_q_offset,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+
+  if (codes_q.ndim() != 4 || codes_k.ndim() != 4 || scales_q.ndim() != 4 ||
+      scales_k.ndim() != 4 || (weights.ndim() != 3 && weights.ndim() != 4)) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_indexer_scores_q] expected codes/scales rank 4 "
+        << "and weights rank 3 or 4, got " << codes_q.shape() << ", "
+        << scales_q.shape() << ", " << codes_k.shape() << ", "
+        << scales_k.shape() << ", " << weights.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (codes_q.dtype() != mx::int8 || codes_k.dtype() != mx::int8 ||
+      scales_q.dtype() != mx::float32 || scales_k.dtype() != mx::float32) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_indexer_scores_q] expected int8 codes and "
+        << "float32 scales (dsa_indexer_qat_quant wire form), got "
+        << codes_q.dtype() << "/" << scales_q.dtype() << " and "
+        << codes_k.dtype() << "/" << scales_k.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  const bool weights_lh = weights.ndim() == 3;
+  bool weights_match = false;
+  if (weights_lh) {
+    weights_match = weights.shape(1) == codes_q.shape(2) &&
+        weights.shape(2) == codes_q.shape(1);
+  } else {
+    weights_match = weights.shape(1) == codes_q.shape(1) &&
+        weights.shape(2) == codes_q.shape(2) && weights.shape(3) == 1;
+  }
+  const int B = codes_q.shape(0);
+  const int H = codes_q.shape(1);
+  const int M = codes_q.shape(2);
+  const int N = codes_k.shape(2);
+  if (codes_k.shape(0) != B || weights.shape(0) != B || !weights_match ||
+      codes_k.shape(1) != 1 || codes_q.shape(3) != 128 ||
+      codes_k.shape(3) != 128 || scales_q.shape() != mx::Shape{B, H, M, 4} ||
+      scales_k.shape() != mx::Shape{B, 1, N, 4}) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_indexer_scores_q] incompatible codes, scales, "
+        << "weights shapes: " << codes_q.shape() << ", " << scales_q.shape()
+        << ", " << codes_k.shape() << ", " << scales_k.shape() << ", "
+        << weights.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (H != 32 && H != 64) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_indexer_scores_q] expected 32 or 64 indexer "
+        << "heads, got " << H << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (M % 64 != 0 || N % 64 != 0 || N < 64) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_indexer_scores_q] M and N must be positive "
+        << "multiples of 64, got M " << M << ", N " << N << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (unused_causal_prefix_topk < 0) {
+    throw std::invalid_argument(
+        "[mlx_kquant.dsa_indexer_scores_q] unused_causal_prefix_topk must "
+        "be non-negative.");
+  }
+  if (causal_q_offset < -1) {
+    throw std::invalid_argument(
+        "[mlx_kquant.dsa_indexer_scores_q] causal_q_offset must be -1 or "
+        "non-negative.");
+  }
+  if (weights.dtype() != mx::float16 && weights.dtype() != mx::bfloat16 &&
+      weights.dtype() != mx::float32) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_indexer_scores_q] expected fp16/bf16/fp32 "
+        << "weights, got " << weights.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  auto out_type = weights.dtype() == mx::bfloat16 ? mx::bfloat16 : mx::float16;
+
+  // See dsa_indexer_scores: pre-eval flags are unreliable, contiguous is
+  // a no-op at eval when the input already is. The kernel reads weights
+  // as f32 regardless of layout.
+  auto qc = mx::contiguous(codes_q, false, s);
+  auto sq = mx::contiguous(scales_q, false, s);
+  auto kc = mx::contiguous(codes_k, false, s);
+  auto sk = mx::contiguous(scales_k, false, s);
+  auto w = mx::contiguous(mx::astype(weights, mx::float32, s), false, s);
+
+  mx::Shape out_shape{B, 1, M, N};
+  std::vector<mx::array> inputs = {
+      std::move(qc), std::move(sq), std::move(kc), std::move(sk), std::move(w)};
+  return mx::array(
+      std::move(out_shape),
+      out_type,
+      std::make_shared<KQDsaIndexerScoresQ>(
           s,
           causal,
           weights_lh,

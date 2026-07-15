@@ -6,6 +6,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Tensor-op DSA indexer score GEMM: a Metal MMA (f16) path plus an i8mx
+  quantized arm for the DeepSeek sparse-attention indexer, with a QAT emit
+  helper (`dsa_indexer_qat_pack`) that packs pre-rotated, on-grid key rows,
+  and an A/B benchmark (`benchmarks/bench_dsa_indexer_ab.py`).
+
 ### Fixed
 - `KQuantSwitchLinear` sorted-expert GEMM arm now also requires the default
   device to be the GPU, not just a present Metal backend: `expert_tile_map`/

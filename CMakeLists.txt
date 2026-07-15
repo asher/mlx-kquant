@@ -202,6 +202,7 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_sdpa.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_dsa_sparse_attn.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_dsa_indexer.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_dsa_indexer_mma.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_dsa_qat.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_glu.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_glu_kq.metal
