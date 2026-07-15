@@ -19,8 +19,11 @@ Contracts:
 Covers both weight layouts, both head counts (64 and 32), causal on/off,
 explicit and derived q_offset, and the skip-store prefill wiring.
 
-Tensor-op kernels are Metal-only and NAX-gated: skipped under
-KQUANT_FORCE_CPU.
+Tensor-op kernels are Metal-only and NAX-gated: the module skips under
+KQUANT_FORCE_CPU, and the scores_q tests additionally skip on non-NAX
+GPUs (scores_q has no fallback kernel and raises at dispatch; the f16
+MMA dispatch falls back to the simdgroup kernel, so those tests run
+everywhere Metal does).
 
 Usage: test_dsa_indexer_mma.py
 """
@@ -39,6 +42,13 @@ import mlx_kquant as kq
 pytestmark = pytest.mark.skipif(
     bool(os.environ.get("KQUANT_FORCE_CPU")),
     reason="kq DSA indexer kernels are Metal-only; no CPU path.",
+)
+
+# scores_q has no non-NAX kernel (eval_gpu raises); hosted CI GPUs are
+# pre-NAX, so gate every test that dispatches it.
+requires_nax = pytest.mark.skipif(
+    not kq.nax_available(),
+    reason="dsa_indexer_scores_q requires tensor-op (NAX) hardware.",
 )
 
 REL_BOUND = {mx.bfloat16: 5e-3, mx.float16: 2e-3}
@@ -190,6 +200,7 @@ def test_dsa_indexer_qat_pack_consistency_with_quant():
     assert np.array_equal(dq, dp)
 
 
+@requires_nax
 @pytest.mark.parametrize("H", [64, 32])
 def test_dsa_indexer_scores_q_with_packed_keys(H):
     """scores_q on pack()-ed key rows == scores on the cached fp16 rows,
@@ -214,6 +225,7 @@ def test_dsa_indexer_scores_q_with_packed_keys(H):
     assert np.array_equal(a[~masked], b[~masked])
 
 
+@requires_nax
 def test_dsa_indexer_qat_pack_zero_row_padding():
     """gmlx pads pooled keys with zero rows before packing: packed zero
     rows must produce codes that score exactly 0."""
@@ -250,6 +262,7 @@ SCORE_CASES = [
 ]
 
 
+@requires_nax
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("case", SCORE_CASES, ids=[c[0] for c in SCORE_CASES])
 def test_dsa_indexer_scores_q_matches_dequant_scores(case, dtype):
@@ -275,6 +288,7 @@ def test_dsa_indexer_scores_q_matches_dequant_scores(case, dtype):
     assert np.array_equal(a[~masked], b[~masked]), f"{name}: not bit-identical"
 
 
+@requires_nax
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_dsa_indexer_scores_q_vs_fp32_reference(dtype):
     """Independent check against the numpy reference on dequantized values."""
@@ -295,6 +309,7 @@ def test_dsa_indexer_scores_q_vs_fp32_reference(dtype):
     assert rel < REL_BOUND[dtype], f"rel {rel:.3e}"
 
 
+@requires_nax
 def test_dsa_indexer_scores_q_fp32_weights():
     """fp32 weights accepted; output falls back to fp16."""
     q, k, w = _make_qkw(1, 64, 64, 256, mx.float16, True, seed=13)
@@ -308,6 +323,7 @@ def test_dsa_indexer_scores_q_fp32_weights():
     assert np.array_equal(np.array(got32), np.array(got16))
 
 
+@requires_nax
 def test_dsa_indexer_scores_q_skip_store_e2e():
     """Production prefill wiring on the quant arm: skip-store + prefix topk."""
     M = N = 640
