@@ -98,10 +98,17 @@ def test_sorted_expert_gemm_matches_gather(codec, rows, experts, monkeypatch):
 
 
 def test_threshold_and_shape_gating(monkeypatch):
+    import mlx_kquant.nn as kqnn
+
     sw = _make_switch("iq2_xxs")
     rng = np.random.default_rng(0)
     x, idx = _sorted_inputs(rng, 64, list(range(E)))
     monkeypatch.setenv("KQ_SWITCH_GEMM_MIN_ROWS", "512")
+    # On NAX GPUs big sorted batches defer to gather_qmm's tensor-core leaf;
+    # pin that off so the row threshold itself is what routes.
+    monkeypatch.setattr(
+        kqnn.kq, "nax_gather_enabled", lambda codec: False, raising=False
+    )
     calls = []
     orig = sw._sorted_expert_gemm
     monkeypatch.setattr(
@@ -111,6 +118,27 @@ def test_threshold_and_shape_gating(monkeypatch):
     assert not calls
     x2, idx2 = _sorted_inputs(rng, 512, list(range(E)))
     mx.eval(sw(x2, idx2, sorted_indices=True))
+    assert len(calls) == 1
+
+
+def test_nax_deferral(monkeypatch):
+    import mlx_kquant as kq
+
+    if not kq.nax_gather_enabled("iq2_xxs"):
+        pytest.skip("no NAX gather leaf on this device/build")
+    sw = _make_switch("iq2_xxs")
+    rng = np.random.default_rng(0)
+    monkeypatch.setenv("KQ_SWITCH_GEMM_MIN_ROWS", "512")
+    calls = []
+    orig = sw._sorted_expert_gemm
+    monkeypatch.setattr(
+        sw, "_sorted_expert_gemm", lambda *a: calls.append(1) or orig(*a)
+    )
+    x, idx = _sorted_inputs(rng, 512, list(range(E)))
+    mx.eval(sw(x, idx, sorted_indices=True))  # NAX leaf reachable: defer
+    assert not calls
+    monkeypatch.setenv("KQ_DISABLE_NAX", "1")  # leaf gone: sorted arm fires
+    mx.eval(sw(x, idx, sorted_indices=True))
     assert len(calls) == 1
 
 

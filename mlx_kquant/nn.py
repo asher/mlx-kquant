@@ -233,8 +233,15 @@ class KQuantSwitchLinear(nn.Module):
     def _sorted_expert_gemm(self, x, indices):
         xf = x.reshape(indices.size, -1)
         w, s, codec = self["weight"], self["scales"], self.kquant_type
-        if hasattr(kq, "gather_qmm_seg") and mx.metal.is_available():
-            # tile map built on GPU: no host sync, layers stay pipelined
+        if (
+            hasattr(kq, "gather_qmm_seg")
+            and mx.metal.is_available()
+            and mx.default_device() == mx.Device(mx.gpu)
+        ):
+            # tile map built on GPU: no host sync, layers stay pipelined.
+            # expert_tile_map/gather_qmm_seg are Metal-only; a CPU default
+            # device (KQUANT_FORCE_CPU) must take the loop below even when
+            # the Metal backend exists.
             if indices.dtype != mx.uint32:
                 indices = indices.astype(mx.uint32)
             maps = kq.expert_tile_map(indices, w.shape[0])
