@@ -12,6 +12,10 @@
   instantiate_kernel(                                                 \
       "kq_gather_qmv_bias_" #type,                                    \
       kq_gather_qmv_bias,                                             \
+      type)                                                           \
+  instantiate_kernel(                                                 \
+      "kq_gather_qmv_mix_bias_" #type,                                \
+      kq_gather_qmv_mix_bias,                                         \
       type)
 
 instantiate_kq_moe_glu(bfloat16_t)

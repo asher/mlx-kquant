@@ -181,6 +181,46 @@ void KQuantGatherQMVBias::eval_gpu(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+void KQuantGatherQMVMixBias::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  const auto& w = inputs[0];
+  const auto& sc = inputs[1];
+  const auto& b = inputs[2];
+  const auto& x = inputs[3];
+  const auto& indices = inputs[4];
+  const auto& scores = inputs[5];
+
+  int T = indices.shape(0);
+  int S = indices.shape(1);
+  int N = w.shape(1);
+  int K = x.shape(-1);
+
+  std::string kname = "kq_gather_qmv_mix_bias_" + kq_type_string(x.dtype());
+  kq_moe_log_kname(kname);
+  auto kernel = kq_get_kernel(d, kname);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(w, 0);
+  ce.set_input_array(sc, 1);
+  ce.set_input_array(b, 2);
+  ce.set_input_array(x, 3);
+  ce.set_input_array(indices, 4);
+  ce.set_input_array(scores, 5);
+  ce.set_output_array(out, 6);
+  ce.set_bytes(K, 7);
+  ce.set_bytes(N, 8);
+  ce.set_bytes(S, 9);
+  MTL::Size group_dims(32, 2, 1);
+  MTL::Size grid_dims(N / 8, 1, T);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 void KQuantMoEGLUKQ::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
@@ -474,6 +514,12 @@ void KQuantGatherQMVBias::eval_gpu(
   throw std::runtime_error("[mlx_kquant.gather_qmv_bias] requires Metal.");
 }
 
+void KQuantGatherQMVMixBias::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error("[mlx_kquant.gather_qmv_mix_bias] requires Metal.");
+}
+
 void KQuantMoEGLUKQ::eval_gpu(
     const std::vector<mx::array>&,
     std::vector<mx::array>&) {
@@ -527,12 +573,23 @@ void KQuantGatherQMVBias::eval_cpu(
       "[mlx_kquant.gather_qmv_bias] has no CPU implementation.");
 }
 
+void KQuantGatherQMVMixBias::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.gather_qmv_mix_bias] has no CPU implementation.");
+}
+
 bool KQuantMoEGLU::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMoEGLU&>(other);
   return alpha_ == o.alpha_ && limit_ == o.limit_;
 }
 
 bool KQuantGatherQMVBias::is_equivalent(const mx::Primitive&) const {
+  return true;
+}
+
+bool KQuantGatherQMVMixBias::is_equivalent(const mx::Primitive&) const {
   return true;
 }
 
@@ -655,6 +712,11 @@ std::vector<mx::Shape> KQuantMoEGLU::output_shapes(
 std::vector<mx::Shape> KQuantGatherQMVBias::output_shapes(
     const std::vector<mx::array>& inputs) {
   return {{inputs[4].shape(0), inputs[4].shape(1), inputs[0].shape(1)}};
+}
+
+std::vector<mx::Shape> KQuantGatherQMVMixBias::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  return {{inputs[4].shape(0), inputs[0].shape(1)}};
 }
 
 // Codecs with the fused kq GLU/gather kernels wired (kq_moe_glu_kq.h):
@@ -893,6 +955,50 @@ mx::array gather_qmv_bias(
        prep_bias(bias, s),
        std::move(x_c),
        prep_indices(indices, s)});
+}
+
+mx::array gather_qmv_mix_bias(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    mx::array bias,
+    mx::array indices,
+    mx::array scores,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const char* op = "[mlx_kquant.gather_qmv_mix_bias]";
+  if (x.ndim() != 3) {
+    throw std::invalid_argument(std::string(op) + " x must be 3-D [T, S, K].");
+  }
+  int S = x.shape(1);
+  if (indices.ndim() != 2 || indices.shape(0) != x.shape(0) ||
+      indices.shape(1) != S) {
+    throw std::invalid_argument(std::string(op) + " indices must be [T, S].");
+  }
+  if (scores.ndim() != 2 || scores.shape(0) != x.shape(0) ||
+      scores.shape(1) != S) {
+    throw std::invalid_argument(std::string(op) + " scores must be [T, S].");
+  }
+  auto dt = x.dtype();
+  if (dt != mx::float16 && dt != mx::bfloat16) {
+    throw std::invalid_argument(
+        std::string(op) + " x must be float16 or bfloat16.");
+  }
+  int K = x.shape(2);
+  check_expert_stack(op, w, scales, bias, K);
+
+  auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  mx::Shape out_shape = {x.shape(0), w.shape(1)};
+  return mx::array(
+      std::move(out_shape),
+      dt,
+      std::make_shared<KQuantGatherQMVMixBias>(s),
+      {std::move(w),
+       std::move(scales),
+       prep_bias(bias, s),
+       std::move(x_c),
+       prep_indices(indices, s),
+       prep_scores(scores, s)});
 }
 
 mx::array moe_glu_gather_kq(

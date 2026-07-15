@@ -428,6 +428,25 @@ def _check_bias(codec, dtype=mx.float16, limit=0.05, alpha=1.702):
         out.append(("xpk_glu", rel, rel < REL_BOUND))
         rel = _rel(got_qmv, np.array(pd.astype(mx.float32)))
         out.append(("xpk_qmv", rel, rel < REL_BOUND))
+
+        sc_np = rng.uniform(0.05, 1.0, (T, R)).astype(np.float32)
+        pm = kq.gather_qmv_mix_bias(
+            h, mx.array(pgw), mx.array(pgs), db, inds, mx.array(sc_np)
+        )
+        mx.eval(pm)
+        r = np.stack(
+            [
+                sum(
+                    sc_np[t, s]
+                    * (hf[t, s] @ ref[inds_np[t, s]].T + db_np[inds_np[t, s]])
+                    for s in range(R)
+                )
+                for t in range(T)
+            ],
+            0,
+        )
+        rel = _rel(pm, r)
+        out.append(("xpk_mix", rel, rel < REL_BOUND))
     return out
 
 
