@@ -76,8 +76,8 @@ inline bool codec_has_matmul(const std::string& kquant_type) {
   return codec != nullptr && codec->has_matmul_kernel;
 }
 
-// Gates the NAX (tensor-core) dispatch. IQ codecs ship ALU-only, so this is
-// false for them and their qmm/gather route to the ALU kernels.
+// Gates the NAX (tensor-core) dispatch per codec (has_nax_kernel in the
+// codec table); codecs without a NAX kernel route to the ALU kernels.
 inline bool codec_has_nax(const std::string& kquant_type) {
   // KQ_DISABLE_NAX=1 forces the ALU qmm/gather path (A/B harness lever). Read
   // live (not cached) so a single process can toggle NAX between calls; only

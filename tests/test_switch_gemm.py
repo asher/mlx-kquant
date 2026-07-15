@@ -121,6 +121,27 @@ def test_threshold_and_shape_gating(monkeypatch):
     assert len(calls) == 1
 
 
+def test_nax_deferral(monkeypatch):
+    import mlx_kquant as kq
+
+    if not kq.nax_gather_enabled("iq2_xxs"):
+        pytest.skip("no NAX gather leaf on this device/build")
+    sw = _make_switch("iq2_xxs")
+    rng = np.random.default_rng(0)
+    monkeypatch.setenv("KQ_SWITCH_GEMM_MIN_ROWS", "512")
+    calls = []
+    orig = sw._sorted_expert_gemm
+    monkeypatch.setattr(
+        sw, "_sorted_expert_gemm", lambda *a: calls.append(1) or orig(*a)
+    )
+    x, idx = _sorted_inputs(rng, 512, list(range(E)))
+    mx.eval(sw(x, idx, sorted_indices=True))  # NAX leaf reachable: defer
+    assert not calls
+    monkeypatch.setenv("KQ_DISABLE_NAX", "1")  # leaf gone: sorted arm fires
+    mx.eval(sw(x, idx, sorted_indices=True))
+    assert len(calls) == 1
+
+
 # ------------------------------------------------------- gather_qmm_seg op
 
 
