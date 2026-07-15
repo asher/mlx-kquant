@@ -11,6 +11,7 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   quantized arm for the DeepSeek sparse-attention indexer, with a QAT emit
   helper (`dsa_indexer_qat_pack`) that packs pre-rotated, on-grid key rows,
   and an A/B benchmark (`benchmarks/bench_dsa_indexer_ab.py`).
+- `gather_qmv_mix_bias`: packed-mxfp4 gathered down projection with the routing mix + expert bias folded in (f32 slot accumulation), replacing `gather_qmv_bias` + `(y * scores).sum(-2)` for gpt-oss 
 
 ### Fixed
 - `KQuantSwitchLinear` sorted-expert GEMM arm now also requires the default

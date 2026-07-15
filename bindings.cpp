@@ -337,6 +337,34 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "gather_qmv_mix_bias",
+      &mlx_kquant::gather_qmv_mix_bias,
+      "x"_a,
+      "w"_a,
+      "scales"_a,
+      "bias"_a,
+      "indices"_a,
+      "scores"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        gather_qmv_bias with the routing mix folded in: each routed slot's
+        matvec + expert bias is accumulated in f32 weighted by its score,
+        replacing gather_qmv_bias + (y * scores).sum(-2).
+
+        Args:
+            x (array): activations [T, S, K], float16/bfloat16.
+            w (array): packed weights uint32 [E, N, K/8].
+            scales (array): E8M0 group scales uint8 [E, N, K/32].
+            bias (array): biases [E, N].
+            indices (array): expert indices [T, S].
+            scores (array): mix weights [T, S]; cast to float32.
+
+        Returns:
+            array: mixed output [T, N] in x.dtype.
+      )");
+
+  m.def(
       "dsa_sparse_attention",
       &mlx_kquant::dsa_sparse_attention,
       "q"_a,

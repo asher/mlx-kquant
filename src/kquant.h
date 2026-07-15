@@ -221,6 +221,19 @@ mx::array gather_qmv_bias(
     mx::array indices,
     mx::StreamOrDevice s = {});
 
+// gather_qmv_bias with the routing mix folded in: x [T, S, K] (one row per
+// routed slot), indices [T, S], scores [T, S] (cast to f32). Each slot's
+// matvec + expert bias accumulates in f32 weighted by its score -- replaces
+// gather_qmv_bias + (y * scores).sum(-2). Returns [T, N]. Metal-only.
+mx::array gather_qmv_mix_bias(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    mx::array bias,
+    mx::array indices,
+    mx::array scores,
+    mx::StreamOrDevice s = {});
+
 // K-quant counterpart of moe_glu_gather: gate and up expert matvecs on GGUF
 // wire bytes (n_experts, out_dims, bytes_per_row) sharing each activation
 // load, with the GLU epilogue act(g) * u fused (act: "silu", "gelu",
@@ -759,6 +772,28 @@ class KQuantGatherQMVBias : public mx::Primitive {
 
   const char* name() const override {
     return "KQuantGatherQMVBias";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+};
+
+// Gathered matvec with fused expert bias and routing mix (see
+// gather_qmv_mix_bias). Inference-only.
+class KQuantGatherQMVMixBias : public mx::Primitive {
+ public:
+  explicit KQuantGatherQMVMixBias(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantGatherQMVMixBias";
   }
   bool is_equivalent(const mx::Primitive& other) const override;
 };
