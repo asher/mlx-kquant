@@ -90,6 +90,57 @@ inline bool codec_has_nax(const std::string& kquant_type) {
   return codec != nullptr && codec->has_nax_kernel;
 }
 
+// Codecs with qmv_fast_fine/qmv_fine instantiations (2 output rows per
+// threadgroup vs kquant_qmv_bn rows, multiplying the threadgroup count for
+// the same N). Explicit allow-list like codec_has_verify_qmv below: the
+// dispatch may only route to kernels actually instantiated in
+// kq_quantized.metal.
+inline bool codec_has_qmv_fine(const std::string& kquant_type) {
+  return kquant_type == "q8_0" || kquant_type == "q4_0" ||
+      kquant_type == "q4_1" || kquant_type == "q5_0" || kquant_type == "q5_1" ||
+      kquant_type == "q2_k" || kquant_type == "q3_k" || kquant_type == "q4_k" ||
+      kquant_type == "q5_k" || kquant_type == "q6_k" ||
+      kquant_type == "iq4_nl" || kquant_type == "mxfp4" ||
+      kquant_type == "nvfp4" || kquant_type == "iq4_xs" ||
+      kquant_type == "iq3_xxs" || kquant_type == "iq3_s" ||
+      kquant_type == "iq2_xxs" || kquant_type == "iq2_xs" ||
+      kquant_type == "iq2_s" || kquant_type == "iq1_s" ||
+      kquant_type == "iq1_m";
+}
+
+// Default fine-tiling ceiling per codec: the qmv dispatch uses the fine
+// (2 rows per threadgroup) variant when M == 1, B == 1, and N <= this value.
+// Calibrated on M5 Max via thermally-paired A/B (mlx-quant-lab
+// tools/gemv-fine-ab.py): fine wins on occupancy-starved layer-size
+// dispatches and loses at embedding-size N, where the grid already
+// saturates and finer tiling only repeats per-threadgroup x reads. 0 =
+// stay coarse by default (measured negative or not yet calibrated).
+// KQ_QMV_FINE=1/0 overrides in either direction.
+inline int kquant_qmv_fine_default_max_n(const std::string& kquant_type) {
+  // Uniform wins across layer shapes; lm_head-size N excluded.
+  if (kquant_type == "q6_k" || kquant_type == "q4_k" || kquant_type == "q5_k" ||
+      kquant_type == "q5_0" || kquant_type == "iq4_xs" ||
+      kquant_type == "iq3_s" || kquant_type == "iq3_xxs" ||
+      kquant_type == "iq2_s" || kquant_type == "iq1_m") {
+    return 16384;
+  }
+  // Wins through mid-N; measured negative at the largest layer shape.
+  if (kquant_type == "q3_k" || kquant_type == "iq4_nl") {
+    return 8192;
+  }
+  if (kquant_type == "q5_1") {
+    return 4096;
+  }
+  // Only kv-size dispatches reproducibly win.
+  if (kquant_type == "q8_0" || kquant_type == "q2_k" || kquant_type == "q4_0" ||
+      kquant_type == "q4_1") {
+    return 2048;
+  }
+  // mxfp4/nvfp4/iq2_xxs/iq2_xs/iq1_s: no synthetic encoder, so no paired
+  // A/B yet -- coarse by default until calibrated on real wire data.
+  return 0;
+}
+
 // Codecs with a verify_qmv kernel (the small-M weight-read-amortizing leaf).
 // Kept as an explicit allow-list so the dispatch only routes to a kernel that
 // was actually instantiated in kq_quantized.metal; new codecs are added here

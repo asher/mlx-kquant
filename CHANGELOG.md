@@ -7,11 +7,15 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Fine-tiled qmv decode variant (`qmv_fast_fine`/`qmv_fine`, 2 output rows per
+  threadgroup) for all matmul codecs, bit-exact, with per-codec dispatch-size
+  defaults and a `KQ_QMV_FINE` override; recovers occupancy on mid-size decode
+  matvecs (dense-llama 8B Q6_K decode ~+3% end-to-end).
 - Tensor-op DSA indexer score GEMM: a Metal MMA (f16) path plus an i8mx
   quantized arm for the DeepSeek sparse-attention indexer, with a QAT emit
   helper (`dsa_indexer_qat_pack`) that packs pre-rotated, on-grid key rows,
   and an A/B benchmark (`benchmarks/bench_dsa_indexer_ab.py`).
-- `gather_qmv_mix_bias`: packed-mxfp4 gathered down projection with the routing mix + expert bias folded in (f32 slot accumulation), replacing `gather_qmv_bias` + `(y * scores).sum(-2)` for gpt-oss 
+- `gather_qmv_mix_bias`: packed-mxfp4 gathered down projection with the routing mix + expert bias folded in (f32 slot accumulation), replacing `gather_qmv_bias` + `(y * scores).sum(-2)` for gpt-oss
 
 ### Fixed
 - `KQuantSwitchLinear` sorted-expert GEMM arm now also requires the default
