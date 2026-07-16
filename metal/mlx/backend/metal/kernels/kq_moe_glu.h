@@ -18,7 +18,11 @@
 //
 // Grid: (N / 8, R, T) threadgroups of (32, 2, 1); R = expert slots per token,
 // T = tokens (mix_bias: (N / 8, 1, T), the slot loop runs inside). Each
-// threadgroup computes 8 output rows (2 simdgroups x 4).
+// threadgroup computes 8 output rows (2 simdgroups x 4). The qmv kernels
+// take results_per_simdgroup: the "_fine" variants run 1 (2 rows per
+// threadgroup, grid N / 2 -> 4x threadgroups) to fill the device on starved
+// decode grids; per-lane work and simd_sum order are unchanged, so fine
+// output is bit-identical.
 //
 // The load / E8M0-scale / fp4-dot primitives are self-contained (kq_ prefix):
 // the stock fp_quantized.h copies collide with this repo's quantized_utils.h
@@ -162,7 +166,7 @@ template <typename T>
   }
 }
 
-template <typename T>
+template <typename T, int results_per_simdgroup = 4>
 [[kernel]] void kq_gather_qmv_bias(
     const device uint32_t* w [[buffer(0)]],
     const device uint8_t* s [[buffer(1)]],
@@ -176,7 +180,6 @@ template <typename T>
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 16;
   constexpr int block_size = values_per_thread * 32;
   typedef float U;
@@ -184,7 +187,8 @@ template <typename T>
   const int R = tpg.y;
   const size_t row_idx = (size_t)tid.z * R + tid.y;
   const int expert = indices[row_idx];
-  const int out_row = tid.x * 8 + simd_gid * results_per_simdgroup;
+  const int out_row =
+      tid.x * (2 * results_per_simdgroup) + simd_gid * results_per_simdgroup;
 
   const int w_row_bytes = K / 2;
   const int g_row = K / 32;
@@ -230,7 +234,7 @@ template <typename T>
   }
 }
 
-template <typename T>
+template <typename T, int results_per_simdgroup = 4>
 [[kernel]] void kq_gather_qmv_mix_bias(
     const device uint32_t* w [[buffer(0)]],
     const device uint8_t* s [[buffer(1)]],
@@ -245,12 +249,12 @@ template <typename T>
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 16;
   constexpr int block_size = values_per_thread * 32;
   typedef float U;
 
-  const int out_row = tid.x * 8 + simd_gid * results_per_simdgroup;
+  const int out_row =
+      tid.x * (2 * results_per_simdgroup) + simd_gid * results_per_simdgroup;
   const int w_row_bytes = K / 2;
   const int g_row = K / 32;
   const int n_full = K / block_size;

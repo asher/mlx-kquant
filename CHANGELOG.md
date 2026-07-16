@@ -11,6 +11,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   threadgroup) for all matmul codecs, bit-exact, with per-codec dispatch-size
   defaults and a `KQ_QMV_FINE` override; recovers occupancy on mid-size decode
   matvecs (dense-llama 8B Q6_K decode ~+3% end-to-end).
+- Fine-tiled MoE gather variants (2 output rows per threadgroup, 4x the
+  threadgroups) for the tuned q6_k/q8_0 `gather_qmv`/`gather_qmv_mix` and the
+  packed-mxfp4 `gather_qmv_bias`/`gather_qmv_mix_bias` kernels, plus the
+  bias-fused q8_0 `qmv_bias` fine siblings; bit-exact, on by default for
+  starved decode grids with a `KQ_GATHER_FINE` override (uniform-q6_k
+  qwen3.6-35B decode ~+2.7%, gpt-oss-20b ~+1.25% end-to-end; the generic Ext
+  codec-matrix equivalents measured E2E-neutral and are not instantiated).
 - Tensor-op DSA indexer score GEMM: a Metal MMA (f16) path plus an i8mx
   quantized arm for the DeepSeek sparse-attention indexer, with a QAT emit
   helper (`dsa_indexer_qat_pack`) that packs pre-rotated, on-grid key rows,

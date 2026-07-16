@@ -322,8 +322,17 @@ void qmv_bias(
     const std::string& kquant_type) {
   int bn = kquant_qmv_bn(kquant_type);
   int bk = 32;
+
+  // Same fine-tiling policy as qmv() above; M == 1 is the shape contract
+  // here, so only the codec ceiling gates the default.
+  const char* qmv_fine_e = std::getenv("KQ_QMV_FINE");
+  const int qmv_fine_env = qmv_fine_e != nullptr ? std::atoi(qmv_fine_e) : -1;
+  const bool use_fine = codec_has_qmv_fine(kquant_type) &&
+      (qmv_fine_env == 1 ||
+       (qmv_fine_env != 0 && N <= kquant_qmv_fine_default_max_n(kquant_type)));
+  const int rows_per_tg = use_fine ? 2 : bn;
   MTL::Size group_dims(bk, 2, 1);
-  MTL::Size grid_dims(1, (N + bn - 1) / bn, 1);
+  MTL::Size grid_dims(1, (N + rows_per_tg - 1) / rows_per_tg, 1);
 
   std::string type_string = kq_type_string(x.dtype());
   bool fast = (N % bn == 0) && (K % qmv_fast_k_align() == 0);
@@ -331,7 +340,9 @@ void qmv_bias(
   kname.reserve(64);
   mx::concatenate(
       kname,
-      kq_kname_prefix(kquant_type) + (fast ? "qmv_fast_bias_" : "qmv_bias_"),
+      kq_kname_prefix(kquant_type) +
+          (fast ? (use_fine ? "qmv_fast_bias_fine_" : "qmv_fast_bias_")
+                : (use_fine ? "qmv_bias_fine_" : "qmv_bias_")),
       type_string,
       "_gs_",
       group_size,

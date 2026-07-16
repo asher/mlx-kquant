@@ -1304,6 +1304,31 @@ template <typename T, int group_size, int bits, bool batched>
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, bias);
 }
 
+// Finer-tiled bias variant (see kq_q8_0_qmv_fast_fine): 2 output rows per
+// threadgroup. Non-batched only, like the coarse bias kernel.
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q8_0_qmv_fast_bias_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const device T* bias,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q8_0_qmv_fast_impl<T, group_size, bits, 1>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, bias);
+}
+
 template <typename T, int group_size, int bits, bool batched>
 [[kernel]] void kq_q8_0_verify_qmv(
     const device uint8_t* w,
@@ -1436,6 +1461,30 @@ template <typename T, int group_size, int bits, bool batched>
         tid);
   }
   kq_q8_0_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, bias);
+}
+
+// Finer-tiled bias variant of kq_q8_0_qmv (see kq_q8_0_qmv_fast_bias_fine).
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q8_0_qmv_bias_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const device T* bias,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q8_0_qmv_impl<T, group_size, bits, 1>(
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, bias);
 }
 

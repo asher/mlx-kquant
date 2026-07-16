@@ -159,7 +159,7 @@ template <typename T, int ACT>
   }
 }
 
-template <typename T>
+template <typename T, int results_per_simdgroup = 4>
 [[kernel]] void kq_q6_k_gather_qmv(
     const device uint8_t* w [[buffer(0)]],
     const device T* x [[buffer(1)]],
@@ -171,7 +171,6 @@ template <typename T>
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int results_per_simdgroup = 4;
   typedef float U;
 
   thread U yl[16];
@@ -187,7 +186,8 @@ template <typename T>
   const int R = tpg.y;
   const int64_t row_idx = (int64_t)tid.z * R + tid.y;
   const int expert = indices[row_idx];
-  const int out_row = tid.x * 8 + simd_gid * results_per_simdgroup;
+  const int out_row =
+      tid.x * (2 * results_per_simdgroup) + simd_gid * results_per_simdgroup;
 
   const int row_bytes = K * KQ_Q6_K_BLOCK_BYTES / KQ_Q6_K_SUPERBLOCK;
   const int nb = K / KQ_Q6_K_SUPERBLOCK;
@@ -347,7 +347,7 @@ template <typename T, int ACT>
   }
 }
 
-template <typename T>
+template <typename T, int results_per_simdgroup = 4>
 [[kernel]] void kq_q6_k_gather_qmv_mix(
     const device uint8_t* w [[buffer(0)]],
     const device uint8_t* sw [[buffer(1)]],
@@ -361,7 +361,6 @@ template <typename T>
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int results_per_simdgroup = 4;
   typedef float U;
 
   thread U yl[16];
@@ -374,7 +373,8 @@ template <typename T>
   const int l0 = 4 * il;
   const int is = 8 * ip + l0 / 16;
 
-  const int out_row = tid.x * 8 + simd_gid * results_per_simdgroup;
+  const int out_row =
+      tid.x * (2 * results_per_simdgroup) + simd_gid * results_per_simdgroup;
   const int row_bytes = K * KQ_Q6_K_BLOCK_BYTES / KQ_Q6_K_SUPERBLOCK;
   const int nb = K / KQ_Q6_K_SUPERBLOCK;
 
@@ -517,7 +517,7 @@ template <typename T, int ACT>
   }
 }
 
-template <typename T>
+template <typename T, int results_per_simdgroup = 4>
 [[kernel]] void kq_q8_0_gather_qmv(
     const device uint8_t* w [[buffer(0)]],
     const device T* x [[buffer(1)]],
@@ -529,7 +529,6 @@ template <typename T>
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * 32;
   typedef float U;
@@ -540,7 +539,8 @@ template <typename T>
   const int R = tpg.y;
   const int64_t row_idx = (int64_t)tid.z * R + tid.y;
   const int expert = indices[row_idx];
-  const int out_row = tid.x * 8 + simd_gid * results_per_simdgroup;
+  const int out_row =
+      tid.x * (2 * results_per_simdgroup) + simd_gid * results_per_simdgroup;
 
   const int row_bytes = K * KQ_Q8_0_BLOCK_BYTES / KQ_Q8_0_GROUP;
   const int64_t row0 = (int64_t)expert * N + out_row;
@@ -656,7 +656,7 @@ template <typename T, int ACT>
   }
 }
 
-template <typename T>
+template <typename T, int results_per_simdgroup = 4>
 [[kernel]] void kq_q8_0_gather_qmv_mix(
     const device uint8_t* w [[buffer(0)]],
     const device uint8_t* sw [[buffer(1)]],
@@ -670,7 +670,6 @@ template <typename T>
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * 32;
   typedef float U;
@@ -678,7 +677,8 @@ template <typename T>
   thread U x_thread[values_per_thread];
   thread U result[results_per_simdgroup] = {0};
 
-  const int out_row = tid.x * 8 + simd_gid * results_per_simdgroup;
+  const int out_row =
+      tid.x * (2 * results_per_simdgroup) + simd_gid * results_per_simdgroup;
   const int row_bytes = K * KQ_Q8_0_BLOCK_BYTES / KQ_Q8_0_GROUP;
   const int lane_k_offset = simd_lid * values_per_thread;
 
@@ -740,7 +740,11 @@ template <typename T>
 // mapping (8 rows per threadgroup); NX = 16 / 32 halve/quarter the rows per
 // threadgroup so decode-scale launches (one token, few expert slots) fill
 // the device: the default grid underfills it and the kernels sit at 57-77%
-// of DRAM peak until the threadgroup count is 2-4x higher. The tuned
+// of DRAM peak until the threadgroup count is 2-4x higher. (Fine tiling --
+// fewer rows per threadgroup at constant NX, the lever that pays on the
+// tuned q6_k/q8_0 and packed-mxfp4 gathers -- was measured E2E-neutral on
+// these Ext kernels at both 2x and 4x threadgroups and is not instantiated
+// for them.) The tuned
 // q6_k/q8_0 kernels stay the uniform-codec dispatch targets at NX = 8;
 // these cover the remaining codecs, wide-NX dispatches (q6_k_ext/q8_0_ext
 // stems), and mixed-codec shared experts (SCodec != Codec, the UD-style

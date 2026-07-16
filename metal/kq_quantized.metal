@@ -102,6 +102,8 @@
   instantiate_kquant_batched(qmv,      type, 32, 8, 1, q8_0)            \
   instantiate_kquant_batched(qmv_fast_bias, type, 32, 8, 0, q8_0)       \
   instantiate_kquant_batched(qmv_bias,      type, 32, 8, 0, q8_0)       \
+  instantiate_kquant_batched(qmv_fast_bias_fine, type, 32, 8, 0, q8_0)  \
+  instantiate_kquant_batched(qmv_bias_fine, type, 32, 8, 0, q8_0)       \
   instantiate_kquant_qmm_t(type, 32, 8, true, 0, q8_0)                  \
   instantiate_kquant_qmm_t(type, 32, 8, true, 1, q8_0)                  \
   instantiate_kquant_qmm_t(type, 32, 8, false, 0, q8_0)                 \
