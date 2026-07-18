@@ -702,7 +702,7 @@ METAL_FUNC void kq_q8_0_dequantize_impl(
   out[gid] = T(d * float(q));
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
 METAL_FUNC void kq_q8_0_qmv_fast_impl(
     const device uint8_t* w,
     const device T* x,
@@ -718,7 +718,6 @@ METAL_FUNC void kq_q8_0_qmv_fast_impl(
   static_assert(bits == 8, "Q8_0 kernel requires bits=8");
 
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
 
@@ -860,7 +859,7 @@ METAL_FUNC void kq_q8_0_verify_qmv_impl(
   }
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
 METAL_FUNC void kq_q8_0_qmv_impl(
     const device uint8_t* w,
     const device T* x,
@@ -876,7 +875,6 @@ METAL_FUNC void kq_q8_0_qmv_impl(
   static_assert(bits == 8, "Q8_0 kernel requires bits=8");
 
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
 
@@ -1235,6 +1233,33 @@ template <typename T, int group_size, int bits, bool batched>
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
+// Finer-tiled qmv_fast: 1 result per simdgroup -> 2 output rows per
+// threadgroup (vs 8 in the default), quadrupling the threadgroup count for
+// the same N. Dispatched (non-batched, N even) when the default tiling
+// leaves the GPU short of threadgroups at decode-size N. Bit-exact vs the
+// default variant (same per-row lane fold + simd_sum).
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q8_0_qmv_fast_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q8_0_qmv_fast_impl<T, group_size, bits, 1>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
 // Bias-fused variant of kq_q8_0_qmv_fast: decode-only (B=1) fast path for a
 // KQuantLinear whose GGUF weight carries a real linear bias (e.g. gpt-oss
 // attention QKVO). Fuses the post-matmul add into this kernel's own output
@@ -1276,6 +1301,31 @@ template <typename T, int group_size, int bits, bool batched>
         tid);
   }
   kq_q8_0_qmv_fast_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, bias);
+}
+
+// Finer-tiled bias variant (see kq_q8_0_qmv_fast_fine): 2 output rows per
+// threadgroup. Non-batched only, like the coarse bias kernel.
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q8_0_qmv_fast_bias_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const device T* bias,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q8_0_qmv_fast_impl<T, group_size, bits, 1>(
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, bias);
 }
 
@@ -1352,6 +1402,29 @@ template <typename T, int group_size, int bits, bool batched>
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
+// Finer-tiled qmv (see kq_q8_0_qmv_fast_fine): 2 output rows per threadgroup.
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q8_0_qmv_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q8_0_qmv_impl<T, group_size, bits, 1>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
 // Bias-fused variant of kq_q8_0_qmv -- see kq_q8_0_qmv_fast_bias above.
 template <typename T, int group_size, int bits, bool batched>
 [[kernel]] void kq_q8_0_qmv_bias(
@@ -1388,6 +1461,30 @@ template <typename T, int group_size, int bits, bool batched>
         tid);
   }
   kq_q8_0_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, bias);
+}
+
+// Finer-tiled bias variant of kq_q8_0_qmv (see kq_q8_0_qmv_fast_bias_fine).
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q8_0_qmv_bias_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const device T* bias,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q8_0_qmv_impl<T, group_size, bits, 1>(
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, bias);
 }
 
@@ -1494,7 +1591,7 @@ METAL_FUNC void kq_q5_1_dequantize_impl(
   out[gid] = T(d * q5 + m);
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
 METAL_FUNC void kq_q5_1_qmv_fast_impl(
     const device uint8_t* w,
     const device T* x,
@@ -1509,7 +1606,6 @@ METAL_FUNC void kq_q5_1_qmv_fast_impl(
   static_assert(bits == 5, "Q5_1 kernel requires bits=5");
 
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
   constexpr int block_stride = 16;
 
   typedef float U;
@@ -1692,7 +1788,7 @@ METAL_FUNC void kq_q5_1_verify_qmv_impl(
   }
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
 METAL_FUNC void kq_q5_1_qmv_impl(
     const device uint8_t* w,
     const device T* x,
@@ -1707,7 +1803,6 @@ METAL_FUNC void kq_q5_1_qmv_impl(
   static_assert(bits == 5, "Q5_1 kernel requires bits=5");
 
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
   constexpr int block_stride = 16;
 
   typedef float U;
@@ -2077,6 +2172,33 @@ template <typename T, int group_size, int bits, bool batched>
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
+// Finer-tiled qmv_fast: 1 result per simdgroup -> 2 output rows per
+// threadgroup (vs 8 in the default), quadrupling the threadgroup count for
+// the same N. Dispatched (non-batched, N even) when the default tiling
+// leaves the GPU short of threadgroups at decode-size N. Bit-exact vs the
+// default variant (same per-row lane fold + simd_sum).
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q5_1_qmv_fast_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q5_1_qmv_fast_impl<T, group_size, bits, 1>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
 template <typename T, int group_size, int bits, bool batched>
 [[kernel]] void kq_q5_1_verify_qmv(
     const device uint8_t* w,
@@ -2127,6 +2249,29 @@ template <typename T, int group_size, int bits, bool batched>
         tid);
   }
   kq_q5_1_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+// Finer-tiled qmv (see kq_q5_1_qmv_fast_fine): 2 output rows per threadgroup.
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q5_1_qmv_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q5_1_qmv_impl<T, group_size, bits, 1>(
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 

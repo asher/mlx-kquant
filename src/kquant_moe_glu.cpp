@@ -93,6 +93,33 @@ inline std::string kq_gather_stem_nx(const std::string& t, int K, int nx) {
   return stem;
 }
 
+// Fine tiling for the single-stream gathers: fewer output rows per
+// threadgroup at the unchanged 8-lane K split. Instantiated where it
+// measured an E2E win -- the tuned q6_k/q8_0 kernels and the packed-mxfp4
+// bias kernels, results_per_simdgroup 4 -> 1 (2 rows per threadgroup, 4x
+// threadgroups) -- and dropped for the Ext codec matrix, where both the 2x
+// (one-simdgroup) and 4x (NX 16 one-simdgroup) variants were E2E-neutral.
+// Unlike wide NX this multiplies work-in-flight without shortening per-lane
+// K-chains, and output stays bit-exact. Default: on when the coarse grid
+// underfills the device (decode-scale launches); callers only consult this
+// at NX = 8, so a forced KQ_MOE_NX=16/32 wins. KQ_GATHER_FINE=1/0 forces
+// fine/coarse; read live once set (KQ_MOE_NX pattern above) so interleaved
+// in-process A/Bs can flip arms.
+inline bool kq_gather_fine(int64_t coarse_tgs) {
+  static const bool has_env = std::getenv("KQ_GATHER_FINE") != nullptr;
+  if (has_env) {
+    const char* e = std::getenv("KQ_GATHER_FINE");
+    const int v = e == nullptr ? -1 : std::atoi(e);
+    if (v == 0) {
+      return false;
+    }
+    if (v == 1) {
+      return true;
+    }
+  }
+  return coarse_tgs < 2048;
+}
+
 } // namespace
 
 #ifdef _METAL_
@@ -163,7 +190,9 @@ void KQuantGatherQMVBias::eval_gpu(
   int N = w.shape(1);
   int K = x.shape(-1);
 
-  std::string kname = "kq_gather_qmv_bias_" + kq_type_string(x.dtype());
+  const bool fine = kq_gather_fine((int64_t)(N / 8) * R * T);
+  std::string kname = std::string("kq_gather_qmv_bias") +
+      (fine ? "_fine_" : "_") + kq_type_string(x.dtype());
   kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -177,7 +206,7 @@ void KQuantGatherQMVBias::eval_gpu(
   ce.set_bytes(K, 6);
   ce.set_bytes(N, 7);
   MTL::Size group_dims(32, 2, 1);
-  MTL::Size grid_dims(N / 8, R, T);
+  MTL::Size grid_dims(N / (fine ? 2 : 8), R, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -201,7 +230,9 @@ void KQuantGatherQMVMixBias::eval_gpu(
   int N = w.shape(1);
   int K = x.shape(-1);
 
-  std::string kname = "kq_gather_qmv_mix_bias_" + kq_type_string(x.dtype());
+  const bool fine = kq_gather_fine((int64_t)(N / 8) * T);
+  std::string kname = std::string("kq_gather_qmv_mix_bias") +
+      (fine ? "_fine_" : "_") + kq_type_string(x.dtype());
   kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -217,7 +248,7 @@ void KQuantGatherQMVMixBias::eval_gpu(
   ce.set_bytes(N, 8);
   ce.set_bytes(S, 9);
   MTL::Size group_dims(32, 2, 1);
-  MTL::Size grid_dims(N / 8, 1, T);
+  MTL::Size grid_dims(N / (fine ? 2 : 8), 1, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -294,9 +325,15 @@ void KQuantGatherQMVKQ::eval_gpu(
   int K = x.shape(-1);
 
   const int nx = kq_moe_pick_nx((int64_t)N * R * T, K, false);
-  std::string kname = "kq_" + kq_gather_stem_nx(kquant_type_, K, nx) +
-      "_gather_qmv" + (biased ? "_bias" : "") + kq_nx_suffix(nx) + "_" +
-      kq_type_string(x.dtype());
+  const std::string stem = kq_gather_stem_nx(kquant_type_, K, nx);
+  // Fine tiling is instantiated only on the tuned q6_k/q8_0 kernels; the Ext
+  // equivalents (2x and 4x threadgroup variants) measured E2E-neutral and
+  // were dropped. Biased stacks are mxfp4/nvfp4 wire, i.e. never tuned.
+  const bool tuned = stem == "q6_k" || stem == "q8_0";
+  const bool fine =
+      tuned && !biased && nx == 8 && kq_gather_fine((int64_t)(N / 8) * R * T);
+  std::string kname = "kq_" + stem + "_gather_qmv" + (biased ? "_bias" : "") +
+      (fine ? "_fine" : kq_nx_suffix(nx)) + "_" + kq_type_string(x.dtype());
   kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -317,7 +354,7 @@ void KQuantGatherQMVKQ::eval_gpu(
     ce.set_bytes(N, 5);
   }
   MTL::Size group_dims(32, 2, 1);
-  MTL::Size grid_dims(N / (64 / nx), R, T);
+  MTL::Size grid_dims(N / (fine ? 2 : (64 / nx)), R, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -394,8 +431,11 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   const std::string stem = shexp_type_ == kquant_type_
       ? kq_gather_stem_nx(kquant_type_, K, nx)
       : kquant_type_ + "_sx_" + shexp_type_;
-  std::string kname = "kq_" + stem + "_gather_qmv_mix" + kq_nx_suffix(nx) +
-      "_" + kq_type_string(x.dtype());
+  // Fine tiling on the tuned uniform-codec kernels only (see gather_qmv).
+  const bool tuned = stem == "q6_k" || stem == "q8_0";
+  const bool fine = tuned && nx == 8 && kq_gather_fine((int64_t)(N / 8) * T);
+  std::string kname = "kq_" + stem + "_gather_qmv_mix" +
+      (fine ? "_fine" : kq_nx_suffix(nx)) + "_" + kq_type_string(x.dtype());
   kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -410,7 +450,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   ce.set_bytes(N, 7);
   ce.set_bytes(S, 8);
   MTL::Size group_dims(32, 2, 1);
-  MTL::Size grid_dims(N / (64 / nx), 1, T);
+  MTL::Size grid_dims(N / (fine ? 2 : (64 / nx)), 1, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -433,6 +473,8 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   int K = x.shape(-1);
 
   // mix_ns is generic for every codec (no tuned variants) -- plain names.
+  // No fine tier: the Ext fine variants measured E2E-neutral and were
+  // dropped.
   const int nx = kq_moe_pick_nx((int64_t)N * T, K, false);
   std::string kname = "kq_" + kquant_type_ + "_gather_qmv_mix_ns" +
       kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());

@@ -48,6 +48,26 @@ instantiate_kq_moe_glu_kq(q6_k, float16_t)
 instantiate_kq_moe_glu_kq(q8_0, bfloat16_t)
 instantiate_kq_moe_glu_kq(q8_0, float16_t)
 
+// Fine-tiled single-stream tuned kernels: results_per_simdgroup = 1 -> 2
+// output rows per (32, 2, 1) threadgroup, 4x the threadgroups. Bit-exact vs
+// the default (per-lane K-chain and simd_sum order unchanged).
+#define instantiate_kq_moe_glu_kq_fine(codec, type)                    \
+  instantiate_kernel(                                                 \
+      "kq_" #codec "_gather_qmv_fine_" #type,                         \
+      kq_ ## codec ## _gather_qmv,                                    \
+      type,                                                           \
+      1)                                                              \
+  instantiate_kernel(                                                 \
+      "kq_" #codec "_gather_qmv_mix_fine_" #type,                     \
+      kq_ ## codec ## _gather_qmv_mix,                                \
+      type,                                                           \
+      1)
+
+instantiate_kq_moe_glu_kq_fine(q6_k, bfloat16_t)
+instantiate_kq_moe_glu_kq_fine(q6_k, float16_t)
+instantiate_kq_moe_glu_kq_fine(q8_0, bfloat16_t)
+instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
+
 // Codec matrix (generic Ext-trait kernels; q6_k/q8_0 uniform stay on the
 // tuned kernels above). Names match the tuned scheme so dispatch is uniform.
 // Every op is emitted at NX = 8 (plain name, tuned-equivalent grid), 16

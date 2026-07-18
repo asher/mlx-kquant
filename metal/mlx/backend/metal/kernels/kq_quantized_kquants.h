@@ -55,7 +55,9 @@ METAL_FUNC void kq_q4_k_dequantize_impl(
   out[gid] = T(d * float(sc6) * float(q4) - dmin * float(mn6));
 }
 
-template <typename T, int group_size, int bits>
+// results_per_simdgroup default 2 (vs 4 for flat codecs): super-block scale
+// unpacking needs more registers.
+template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
 METAL_FUNC void kq_q4_k_qmv_fast_impl(
     const device uint8_t* w,
     const device T* x,
@@ -70,8 +72,6 @@ METAL_FUNC void kq_q4_k_qmv_fast_impl(
   static_assert(bits == 4, "Q4_K kernel requires bits=4");
 
   constexpr int num_simdgroups = 2;
-  // 2 (vs 4 for flat codecs), super-block scale unpacking needs more registers.
-  constexpr int results_per_simdgroup = 2;
   constexpr int sb_stride = 4;
   constexpr uint16_t kmask1 = 0x3f3f;
   constexpr uint16_t kmask2 = 0x0f0f;
@@ -330,7 +330,7 @@ METAL_FUNC void kq_q4_k_verify_qmv_impl(
   }
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
 METAL_FUNC void kq_q4_k_qmv_impl(
     const device uint8_t* w,
     const device T* x,
@@ -345,7 +345,6 @@ METAL_FUNC void kq_q4_k_qmv_impl(
   static_assert(bits == 4, "Q4_K kernel requires bits=4");
 
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 2;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
 
@@ -756,6 +755,33 @@ template <typename T, int group_size, int bits, bool batched>
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
+// Finer-tiled qmv_fast: 1 result per simdgroup -> 2 output rows per
+// threadgroup (vs 4 in the default), doubling the threadgroup count for the
+// same N. Dispatched (non-batched, N even) when the default tiling leaves
+// the GPU short of threadgroups at decode-size N. Bit-exact vs the default
+// variant (same per-row lane fold + simd_sum).
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q4_k_qmv_fast_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q4_k_qmv_fast_impl<T, group_size, bits, 1>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
 template <typename T, int group_size, int bits, bool batched>
 [[kernel]] void kq_q4_k_verify_qmv(
     const device uint8_t* w,
@@ -806,6 +832,29 @@ template <typename T, int group_size, int bits, bool batched>
         tid);
   }
   kq_q4_k_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+// Finer-tiled qmv (see kq_q4_k_qmv_fast_fine): 2 output rows per threadgroup.
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q4_k_qmv_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q4_k_qmv_impl<T, group_size, bits, 1>(
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
@@ -932,7 +981,7 @@ METAL_FUNC void kq_q5_k_dequantize_impl(
   out[gid] = T(d * float(sc6) * float(q5) - dmin * float(mn6));
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
 METAL_FUNC void kq_q5_k_qmv_fast_impl(
     const device uint8_t* w,
     const device T* x,
@@ -947,7 +996,6 @@ METAL_FUNC void kq_q5_k_qmv_fast_impl(
   static_assert(bits == 5, "Q5_K kernel requires bits=5");
 
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 2;
   constexpr int sb_stride = 4;
   constexpr uint16_t kmask1 = 0x3f3f;
   constexpr uint16_t kmask2 = 0x0f0f;
@@ -1260,7 +1308,7 @@ METAL_FUNC void kq_q5_k_verify_qmv_impl(
   }
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
 METAL_FUNC void kq_q5_k_qmv_impl(
     const device uint8_t* w,
     const device T* x,
@@ -1275,7 +1323,6 @@ METAL_FUNC void kq_q5_k_qmv_impl(
   static_assert(bits == 5, "Q5_K kernel requires bits=5");
 
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 2;
   constexpr int sb_stride = 4;
   constexpr uint16_t kmask1 = 0x3f3f;
   constexpr uint16_t kmask2 = 0x0f0f;
@@ -1770,6 +1817,33 @@ template <typename T, int group_size, int bits, bool batched>
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
+// Finer-tiled qmv_fast: 1 result per simdgroup -> 2 output rows per
+// threadgroup (vs 4 in the default), doubling the threadgroup count for the
+// same N. Dispatched (non-batched, N even) when the default tiling leaves
+// the GPU short of threadgroups at decode-size N. Bit-exact vs the default
+// variant (same per-row lane fold + simd_sum).
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q5_k_qmv_fast_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q5_k_qmv_fast_impl<T, group_size, bits, 1>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
 template <typename T, int group_size, int bits, bool batched>
 [[kernel]] void kq_q5_k_verify_qmv(
     const device uint8_t* w,
@@ -1820,6 +1894,29 @@ template <typename T, int group_size, int bits, bool batched>
         tid);
   }
   kq_q5_k_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+// Finer-tiled qmv (see kq_q5_k_qmv_fast_fine): 2 output rows per threadgroup.
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q5_k_qmv_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q5_k_qmv_impl<T, group_size, bits, 1>(
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
@@ -1950,7 +2047,7 @@ METAL_FUNC void kq_q6_k_dequantize_impl(
   out[gid] = T(d * float(scale_i8) * float(q6));
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
 METAL_FUNC void kq_q6_k_qmv_fast_impl(
     const device uint8_t* w,
     const device T* x,
@@ -1965,7 +2062,6 @@ METAL_FUNC void kq_q6_k_qmv_fast_impl(
   static_assert(bits == 6, "Q6_K kernel requires bits=6");
 
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
   constexpr int sb_stride = 2;
 
   typedef float U;
@@ -2169,7 +2265,7 @@ METAL_FUNC void kq_q6_k_verify_qmv_impl(
   }
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
 METAL_FUNC void kq_q6_k_qmv_impl(
     const device uint8_t* w,
     const device T* x,
@@ -2184,7 +2280,6 @@ METAL_FUNC void kq_q6_k_qmv_impl(
   static_assert(bits == 6, "Q6_K kernel requires bits=6");
 
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
   constexpr int sb_stride = 2;
 
   typedef float U;
@@ -2635,6 +2730,33 @@ template <typename T, int group_size, int bits, bool batched>
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
+// Finer-tiled qmv_fast: 1 result per simdgroup -> 2 output rows per
+// threadgroup (vs 8 in the default), quadrupling the threadgroup count for
+// the same N. Dispatched (non-batched, N even) when the default tiling
+// leaves the GPU short of threadgroups at decode-size N. Bit-exact vs the
+// default variant (same per-row lane fold + simd_sum).
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q6_k_qmv_fast_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q6_k_qmv_fast_impl<T, group_size, bits, 1>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
 // `batched` is carried only so this reuses the instantiate_kquant_batched
 // macro; the verify path is dispatched non-batched (B == 1) so the offset
 // adjust is a no-op and is omitted.
@@ -2781,6 +2903,29 @@ template <typename T, int group_size, int bits, bool batched>
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
+// Finer-tiled qmv (see kq_q6_k_qmv_fast_fine): 2 output rows per threadgroup.
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q6_k_qmv_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q6_k_qmv_impl<T, group_size, bits, 1>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
 template <typename T, int group_size, int bits>
 [[kernel]] void kq_q6_k_dequantize(
     const device uint8_t* w,
@@ -2863,7 +3008,7 @@ METAL_FUNC void kq_q3_k_dequantize_impl(
   out[gid] = T(eff_scale * float(q3));
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
 METAL_FUNC void kq_q3_k_qmv_fast_impl(
     const device uint8_t* w,
     const device T* x,
@@ -2878,7 +3023,6 @@ METAL_FUNC void kq_q3_k_qmv_fast_impl(
   static_assert(bits == 3, "Q3_K kernel requires bits=3");
 
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 2;
   constexpr int sb_stride = 4;
 
   const ushort4 mm_table[4] = {
@@ -3186,7 +3330,7 @@ METAL_FUNC void kq_q3_k_verify_qmv_impl(
   }
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
 METAL_FUNC void kq_q3_k_qmv_impl(
     const device uint8_t* w,
     const device T* x,
@@ -3201,7 +3345,6 @@ METAL_FUNC void kq_q3_k_qmv_impl(
   static_assert(bits == 3, "Q3_K kernel requires bits=3");
 
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 2;
   constexpr int sb_stride = 4;
 
   const ushort4 mm_table[4] = {
@@ -3638,6 +3781,33 @@ template <typename T, int group_size, int bits, bool batched>
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
+// Finer-tiled qmv_fast: 1 result per simdgroup -> 2 output rows per
+// threadgroup (vs 4 in the default), doubling the threadgroup count for the
+// same N. Dispatched (non-batched, N even) when the default tiling leaves
+// the GPU short of threadgroups at decode-size N. Bit-exact vs the default
+// variant (same per-row lane fold + simd_sum).
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q3_k_qmv_fast_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q3_k_qmv_fast_impl<T, group_size, bits, 1>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
 template <typename T, int group_size, int bits, bool batched>
 [[kernel]] void kq_q3_k_verify_qmv(
     const device uint8_t* w,
@@ -3688,6 +3858,29 @@ template <typename T, int group_size, int bits, bool batched>
         tid);
   }
   kq_q3_k_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+// Finer-tiled qmv (see kq_q3_k_qmv_fast_fine): 2 output rows per threadgroup.
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q3_k_qmv_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q3_k_qmv_impl<T, group_size, bits, 1>(
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
@@ -3822,7 +4015,7 @@ METAL_FUNC void kq_q2_k_dequantize_impl(
   out[gid] = T(eff_scale * float(q2) - eff_min);
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
 METAL_FUNC void kq_q2_k_qmv_fast_impl(
     const device uint8_t* w,
     const device T* x,
@@ -3837,7 +4030,6 @@ METAL_FUNC void kq_q2_k_qmv_fast_impl(
   static_assert(bits == 2, "Q2_K kernel requires bits=2");
 
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 2;
   constexpr int sb_stride = 4;
 
   typedef float U;
@@ -4062,7 +4254,7 @@ METAL_FUNC void kq_q2_k_verify_qmv_impl(
   }
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
 METAL_FUNC void kq_q2_k_qmv_impl(
     const device uint8_t* w,
     const device T* x,
@@ -4077,7 +4269,6 @@ METAL_FUNC void kq_q2_k_qmv_impl(
   static_assert(bits == 2, "Q2_K kernel requires bits=2");
 
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 2;
   constexpr int sb_stride = 4;
 
   typedef float U;
@@ -4481,6 +4672,33 @@ template <typename T, int group_size, int bits, bool batched>
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
+// Finer-tiled qmv_fast: 1 result per simdgroup -> 2 output rows per
+// threadgroup (vs 4 in the default), doubling the threadgroup count for the
+// same N. Dispatched (non-batched, N even) when the default tiling leaves
+// the GPU short of threadgroups at decode-size N. Bit-exact vs the default
+// variant (same per-row lane fold + simd_sum).
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q2_k_qmv_fast_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q2_k_qmv_fast_impl<T, group_size, bits, 1>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
 template <typename T, int group_size, int bits, bool batched>
 [[kernel]] void kq_q2_k_verify_qmv(
     const device uint8_t* w,
@@ -4531,6 +4749,29 @@ template <typename T, int group_size, int bits, bool batched>
         tid);
   }
   kq_q2_k_qmv_impl<T, group_size, bits>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+// Finer-tiled qmv (see kq_q2_k_qmv_fast_fine): 2 output rows per threadgroup.
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void kq_q2_k_qmv_fine(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  kq_q2_k_qmv_impl<T, group_size, bits, 1>(
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 

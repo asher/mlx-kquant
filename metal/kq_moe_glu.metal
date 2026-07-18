@@ -16,7 +16,17 @@
   instantiate_kernel(                                                 \
       "kq_gather_qmv_mix_bias_" #type,                                \
       kq_gather_qmv_mix_bias,                                         \
-      type)
+      type)                                                           \
+  instantiate_kernel(                                                 \
+      "kq_gather_qmv_bias_fine_" #type,                               \
+      kq_gather_qmv_bias,                                             \
+      type,                                                           \
+      1)                                                              \
+  instantiate_kernel(                                                 \
+      "kq_gather_qmv_mix_bias_fine_" #type,                           \
+      kq_gather_qmv_mix_bias,                                         \
+      type,                                                           \
+      1)
 
 instantiate_kq_moe_glu(bfloat16_t)
 instantiate_kq_moe_glu(float16_t)

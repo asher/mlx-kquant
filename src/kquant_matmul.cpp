@@ -249,8 +249,25 @@ void qmv(
   int B = out.size() / M / N;
   int bn = kquant_qmv_bn(kquant_type);
   int bk = 32;
+
+  // Finer tiling: 2 output rows per threadgroup (vs bn), multiplying the
+  // threadgroup count for the same N. Recovers occupancy for mid-size decode
+  // dispatches where N/bn threadgroups underfill the GPU; loses at
+  // embedding-size N (already saturated). Bit-exact vs the default tiling.
+  // Default per codec via kquant_qmv_fine_default_max_n; KQ_QMV_FINE=1
+  // forces fine, =0 forces coarse (A/B lever). Read live (KQ_DISABLE_NAX
+  // precedent) so one process can interleave coarse/fine for
+  // thermally-paired A/Bs; getenv cost is noise per dispatch.
+  const char* qmv_fine_e = std::getenv("KQ_QMV_FINE");
+  const int qmv_fine_env = qmv_fine_e != nullptr ? std::atoi(qmv_fine_e) : -1;
+  const bool fine_ok = B == 1 && codec_has_qmv_fine(kquant_type);
+  const bool use_fine = fine_ok &&
+      (qmv_fine_env == 1 ||
+       (qmv_fine_env != 0 && M == 1 &&
+        N <= kquant_qmv_fine_default_max_n(kquant_type)));
+  const int rows_per_tg = use_fine ? 2 : bn;
   MTL::Size group_dims(bk, 2, 1);
-  MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
+  MTL::Size grid_dims(M, (N + rows_per_tg - 1) / rows_per_tg, B);
 
   std::string type_string = kq_type_string(x.dtype());
   bool fast = (N % bn == 0) && (K % qmv_fast_k_align() == 0);
@@ -258,7 +275,9 @@ void qmv(
   kname.reserve(64);
   mx::concatenate(
       kname,
-      kq_kname_prefix(kquant_type) + (fast ? "qmv_fast_" : "qmv_"),
+      kq_kname_prefix(kquant_type) +
+          (fast ? (use_fine ? "qmv_fast_fine_" : "qmv_fast_")
+                : (use_fine ? "qmv_fine_" : "qmv_")),
       type_string,
       "_gs_",
       group_size,
@@ -303,8 +322,17 @@ void qmv_bias(
     const std::string& kquant_type) {
   int bn = kquant_qmv_bn(kquant_type);
   int bk = 32;
+
+  // Same fine-tiling policy as qmv() above; M == 1 is the shape contract
+  // here, so only the codec ceiling gates the default.
+  const char* qmv_fine_e = std::getenv("KQ_QMV_FINE");
+  const int qmv_fine_env = qmv_fine_e != nullptr ? std::atoi(qmv_fine_e) : -1;
+  const bool use_fine = codec_has_qmv_fine(kquant_type) &&
+      (qmv_fine_env == 1 ||
+       (qmv_fine_env != 0 && N <= kquant_qmv_fine_default_max_n(kquant_type)));
+  const int rows_per_tg = use_fine ? 2 : bn;
   MTL::Size group_dims(bk, 2, 1);
-  MTL::Size grid_dims(1, (N + bn - 1) / bn, 1);
+  MTL::Size grid_dims(1, (N + rows_per_tg - 1) / rows_per_tg, 1);
 
   std::string type_string = kq_type_string(x.dtype());
   bool fast = (N % bn == 0) && (K % qmv_fast_k_align() == 0);
@@ -312,7 +340,9 @@ void qmv_bias(
   kname.reserve(64);
   mx::concatenate(
       kname,
-      kq_kname_prefix(kquant_type) + (fast ? "qmv_fast_bias_" : "qmv_bias_"),
+      kq_kname_prefix(kquant_type) +
+          (fast ? (use_fine ? "qmv_fast_bias_fine_" : "qmv_fast_bias_")
+                : (use_fine ? "qmv_bias_fine_" : "qmv_bias_")),
       type_string,
       "_gs_",
       group_size,
