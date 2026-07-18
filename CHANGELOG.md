@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.5]
+
 ### Added
 - Fine-tiled qmv decode variant (`qmv_fast_fine`/`qmv_fine`, 2 output rows per
   threadgroup) for all matmul codecs, bit-exact, with per-codec dispatch-size
