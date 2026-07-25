@@ -407,6 +407,29 @@ struct KqNaxQ8_0BlockLoader {
   }
 };
 
+// Row-tile traversal swizzle for M > 64: launch order is x-fastest, so
+// with grid (n_tiles, y_tiles) every row-tile streams the whole weight
+// matrix from DRAM (weight-normalized bandwidth divides by y_tiles;
+// measured near-constant ~270-282 GB/s real traffic M65-256). The host
+// folds 2^log row-tiles into grid.x (grid.x = n_tiles << log); this remap
+// makes consecutive launches cover the folded row-tiles of the SAME
+// BN-column weight band (~268KB at BN=64), so tiles 2..2^log hit SLC.
+// No-op when grid.x == n_tiles. Folded padding rows (r.y beyond the real
+// row-tile count) must early-return in the wrapper -- threadgroup-uniform,
+// so in-impl barriers stay safe.
+METAL_FUNC uint3 kq_swizzle_tid(uint3 tid, uint3 tgp_grid, int N, int BN) {
+  const uint n_tiles = uint((N + BN - 1) / BN);
+  if (tgp_grid.x <= n_tiles) {
+    return tid;
+  }
+  const uint log = uint(31 - clz(tgp_grid.x / n_tiles));
+  const uint mask = (1u << log) - 1;
+  uint3 r = tid;
+  r.y = (tid.y << log) + (tid.x & mask);
+  r.x = tid.x >> log;
+  return r;
+}
+
 template <
     typename T,
     int group_size,
@@ -434,12 +457,18 @@ template <
     const constant int64_t* w_strides,
     const constant int64_t* /* s_strides */,
     uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tgp_grid [[threadgroups_per_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   static_assert(
       group_size == KQ_Q8_0_GROUP, "Q8_0 NAX kernel requires group_size=32");
   static_assert(bits == 8, "Q8_0 NAX kernel requires bits=8");
+
+  tid = kq_swizzle_tid(tid, tgp_grid, N, BN);
+  if (int(tid.y) * BM >= M) {
+    return;
+  }
 
   constexpr int BK = 64;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
@@ -806,12 +835,18 @@ template <
     const constant int64_t* w_strides,
     const constant int64_t* /* s_strides */,
     uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tgp_grid [[threadgroups_per_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   static_assert(
       group_size == KQ_Q5_1_GROUP, "Q5_1 NAX kernel requires group_size=32");
   static_assert(bits == 5, "Q5_1 NAX kernel requires bits=5");
+
+  tid = kq_swizzle_tid(tid, tgp_grid, N, BN);
+  if (int(tid.y) * BM >= M) {
+    return;
+  }
 
   constexpr int BK = 64;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
@@ -1973,6 +2008,7 @@ struct KqNaxQ2_KBlockLoader {
       const constant int64_t* w_strides,                                   \
       const constant int64_t* /* s_strides */,                             \
       uint3 tid [[threadgroup_position_in_grid]],                          \
+      uint3 tgp_grid [[threadgroups_per_grid]],                            \
       uint lid [[thread_index_in_threadgroup]],                            \
       uint simd_gid [[simdgroup_index_in_threadgroup]],                    \
       uint simd_lid [[thread_index_in_simdgroup]]) {                       \
@@ -1981,6 +2017,10 @@ struct KqNaxQ2_KBlockLoader {
         #codec " NAX kernel requires group_size=" #GROUP_CONST);           \
     static_assert(                                                         \
         bits == bits_val, #codec " NAX kernel requires bits=" #bits_val);  \
+    tid = kq_swizzle_tid(tid, tgp_grid, N, BN);                            \
+    if (int(tid.y) * BM >= M) {                                            \
+      return;                                                              \
+    }                                                                      \
     constexpr int BK = 64;                                                 \
     constexpr int BK_padded = (BK + 16 / sizeof(T));                       \
     using LoaderW = LOADER<                                                \

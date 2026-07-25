@@ -192,6 +192,27 @@ void qmm_nax(
        (db64_mode == -1 && db64_min_n > 0 && N >= db64_min_n));
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
+  // Row-tile traversal swizzle (M > 64): fold row-tiles into grid.x so
+  // consecutive launches cover the same BN-column weight band, letting
+  // row-tiles 2..2^log read it from SLC instead of re-streaming DRAM
+  // (weight-normalized bandwidth otherwise divides by the row-tile
+  // count). kq_swizzle_tid in the kernel derives the fold factor from
+  // threadgroups_per_grid; padded row-tiles early-return.
+  // KQ_NAX_SWIZZLE: 1 = on (experiment lever; default off).
+  static const bool swizzle_on = []() {
+    const char* e = std::getenv("KQ_NAX_SWIZZLE");
+    return e != nullptr && std::atoi(e) != 0;
+  }();
+  if (swizzle_on && transpose && bm == 64) {
+    int y_tiles = (M + bm - 1) / bm;
+    if (y_tiles >= 2) {
+      int log = y_tiles >= 4 ? 2 : 1;
+      grid_dims = MTL::Size(
+          static_cast<size_t>((N + bn - 1) / bn) << log,
+          (y_tiles + (1 << log) - 1) >> log,
+          B);
+    }
+  }
 
   bool aligned = N % bn == 0;
   bool batched = B > 1;
