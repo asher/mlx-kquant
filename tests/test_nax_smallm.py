@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small-M NAX qmm routing validation (q6_k, q8_0, q4_k).
+"""Small-M NAX qmm routing validation (q6_k, q8_0, q4_k, q5_k).
 
 The batch-decode M range routes these codecs through three regimes: the mv
 paths (up to a per-codec crossover at M 6-8), the double-buffered BM=32 NAX
@@ -34,7 +34,7 @@ MS = [2, 6, 7, 8, 9, 12, 13, 16, 24, 31, 32, 33, 64]
 
 
 @pytest.mark.parametrize("n_out", [1024, 1000])
-@pytest.mark.parametrize("codec", ["q6_k", "q8_0", "q4_k"])
+@pytest.mark.parametrize("codec", ["q6_k", "q8_0", "q4_k", "q5_k"])
 def test_smallm_routing(codec, n_out):
     mx.random.seed(11)
     wf = mx.random.normal((n_out, K)) * 0.1

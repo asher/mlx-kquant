@@ -76,7 +76,7 @@ void qmm_nax(
   // DRAM-bound (measured: q6_k M48 146 GB/s on bm32 vs 184 on bm64).
   if (small_bm_on &&
       (kquant_type == "q6_k" || kquant_type == "q8_0" ||
-       kquant_type == "q4_k") &&
+       kquant_type == "q4_k" || kquant_type == "q5_k") &&
       M <= 32) {
     bm = 32;
   }
@@ -741,9 +741,11 @@ void KQuantMatmul::eval_gpu(
     const char* e = std::getenv("KQ_NAX_SMALL_BM");
     return e == nullptr || std::atoi(e) != 0;
   }();
-  const int smallm_min = kquant_type_ == "q4_k"            ? 7
-      : (kquant_type_ == "q6_k" || kquant_type_ == "q8_0") ? 9
-                                                           : 0;
+  const int smallm_min = kquant_type_ == "q4_k" ? 7
+      : (kquant_type_ == "q6_k" || kquant_type_ == "q8_0" ||
+         kquant_type_ == "q5_k")
+      ? 9
+      : 0;
   if (nax_smallm_route && transpose_ && non_batched && smallm_min > 0 &&
       M >= smallm_min && M <= 12 && kq_is_nax_available() && (K % 64 == 0) &&
       x.dtype() != mx::float32) {

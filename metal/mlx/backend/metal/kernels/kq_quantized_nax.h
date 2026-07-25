@@ -1421,7 +1421,11 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ5_KBlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  // Double-buffer safe: qh is read fresh per call (the former qh cache was
+  // filled only at sb_base == 0, which replays garbage on the odd-tile DB
+  // loader instance; per the q6_k precedent the re-read is free under
+  // weight streaming, the cache only added state).
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q5_K_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_Q5_K_BLOCK_BYTES;
   MLX_MTL_CONST int sub_block_size = 32;
@@ -1449,11 +1453,6 @@ struct KqNaxQ5_KBlockLoader {
   threadgroup T* dst;
   const device uint8_t* src;
   short sb_base;
-  // qh cached on sb_base==0; reduction_dim==0 reads per-call instead.
-  struct Caches {
-    uint8_t qh_cache[bytes_per_thread];
-  };
-  metal::conditional_t<reduction_dim == 1, Caches, kq_empty> cached;
 
   KqNaxQ5_KBlockLoader(
       const device uint8_t* src_,
@@ -1476,62 +1475,12 @@ struct KqNaxQ5_KBlockLoader {
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         sb_base(0) {}
 
-  void load_unsafe() {
+  void load_unsafe() const {
     static_assert(
         bytes_per_thread == 16,
         "Q5_K NAX vector load assumes bytes_per_thread == 16 (uint4).");
 
-    if constexpr (reduction_dim == 1) {
-      const short pair_base = sb_base;
-
-      const float d = float(*(const device half*)(src + KQ_Q5_K_D_OFFSET));
-      const float dmin =
-          float(*(const device half*)(src + KQ_Q5_K_DMIN_OFFSET));
-      const device uint8_t* scales12 = src + KQ_Q5_K_SCALES_OFFSET;
-
-      uint8_t sc6_lo, mn6_lo, sc6_hi, mn6_hi;
-      kq_get_scale_min_k4(pair_base + 0, scales12, sc6_lo, mn6_lo);
-      kq_get_scale_min_k4(pair_base + 1, scales12, sc6_hi, mn6_hi);
-      const float eff_scale_lo = d * float(sc6_lo);
-      const float eff_min_lo = dmin * float(mn6_lo);
-      const float eff_scale_hi = d * float(sc6_hi);
-      const float eff_min_hi = dmin * float(mn6_hi);
-
-      const short pair = pair_base / 2;
-      const device uint8_t* qs = src + KQ_Q5_K_QS_OFFSET + pair * 32 + bj_byte;
-      const device uint8_t* qh = src + KQ_Q5_K_QH_OFFSET + bj_byte;
-
-      const uint4 qs_v = *reinterpret_cast<const device uint4*>(qs);
-      const thread uint8_t* qs_b =
-          reinterpret_cast<const thread uint8_t*>(&qs_v);
-
-      if (sb_base == 0) {
-        const uint4 qh_v = *reinterpret_cast<const device uint4*>(qh);
-        const thread uint8_t* qh_b =
-            reinterpret_cast<const thread uint8_t*>(&qh_v);
-#pragma unroll
-        for (short i = 0; i < bytes_per_thread; i++) {
-          cached.qh_cache[i] = qh_b[i];
-        }
-      }
-
-#pragma unroll
-      for (short i = 0; i < bytes_per_thread; i++) {
-        const uint8_t b = qs_b[i];
-        const uint8_t h = cached.qh_cache[i];
-        const uint8_t q4_lo = b & 0x0F;
-        const uint8_t q4_hi = b >> 4;
-        const uint8_t hi_lo = (h >> pair_base) & 1u;
-        const uint8_t hi_hi = (h >> (pair_base + 1)) & 1u;
-        const uint8_t q5_lo = q4_lo | (hi_lo << 4);
-        const uint8_t q5_hi = q4_hi | (hi_hi << 4);
-        dst[i] = T(eff_scale_lo * float(q5_lo) - eff_min_lo);
-        dst[sub_block_size + i] = T(eff_scale_hi * float(q5_hi) - eff_min_hi);
-      }
-      return;
-    }
-
-    const short pair_base = fixed_sb_base;
+    const short pair_base = (reduction_dim == 1) ? sb_base : fixed_sb_base;
 
     const float d = float(*(const device half*)(src + KQ_Q5_K_D_OFFSET));
     const float dmin = float(*(const device half*)(src + KQ_Q5_K_DMIN_OFFSET));
@@ -1570,7 +1519,7 @@ struct KqNaxQ5_KBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) {
+  void load_safe(short2 src_tile_dim) const {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < bytes_per_thread; i++) {
