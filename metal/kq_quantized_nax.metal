@@ -157,6 +157,44 @@ instantiate_kquant_nax_db64(iq2_xs, 256, 2)
 instantiate_kquant_nax_db64(iq2_s, 256, 2)
 instantiate_kquant_nax_db64(iq1_s, 256, 1)
 instantiate_kquant_nax_db64(iq1_m, 256, 1)
+// BM=128 qmm_t tile (wm2 wn2 -> TM=4, TN=2, paired-N matmad; generic in
+// TM so no pairing-branch trap). The M>64 regime is bound by
+// per-threadgroup work (loader dequant + MMA issue, real DRAM ~half
+// peak); BM=128 halves the row-tile count and with it total loader
+// dequant per unique weight. A loads straight from device, so the cost
+// is Dtile registers: 8 accumulator fragments vs 4. Dispatched only when
+// ceil(M/64) is even and M >= 193 (padding parity with BM=64; q6_k ABBA
+// at three shapes: +9-25% M224-512, prefill M512-2048 +8-10% hot,
+// +31-40% cold). KQ_NAX_BM128=0 kills.
+#define instantiate_kquant_nax_qmm_t_bm128(codec, type, gs, bits)             \
+  instantiate_kquant_nax_qmm_t(type, gs, bits, true,  1, 128, 64, 2, 2, codec) \
+  instantiate_kquant_nax_qmm_t(type, gs, bits, true,  0, 128, 64, 2, 2, codec) \
+  instantiate_kquant_nax_qmm_t(type, gs, bits, false, 1, 128, 64, 2, 2, codec) \
+  instantiate_kquant_nax_qmm_t(type, gs, bits, false, 0, 128, 64, 2, 2, codec)
+#define instantiate_kquant_nax_bm128(codec, gs, bits)                        \
+  instantiate_kquant_nax_qmm_t_bm128(codec, float,      gs, bits)            \
+  instantiate_kquant_nax_qmm_t_bm128(codec, float16_t,  gs, bits)            \
+  instantiate_kquant_nax_qmm_t_bm128(codec, bfloat16_t, gs, bits)
+instantiate_kquant_nax_bm128(q6_k, 256, 6)
+instantiate_kquant_nax_bm128(q8_0, 32, 8)
+instantiate_kquant_nax_bm128(q4_k, 256, 4)
+instantiate_kquant_nax_bm128(q5_k, 256, 5)
+instantiate_kquant_nax_bm128(q3_k, 256, 3)
+instantiate_kquant_nax_bm128(q2_k, 256, 2)
+instantiate_kquant_nax_bm128(q5_1, 32, 5)
+instantiate_kquant_nax_bm128(q4_0, 32, 4)
+instantiate_kquant_nax_bm128(q4_1, 32, 4)
+instantiate_kquant_nax_bm128(q5_0, 32, 5)
+instantiate_kquant_nax_bm128(iq4_nl, 32, 4)
+instantiate_kquant_nax_bm128(iq4_xs, 256, 4)
+instantiate_kquant_nax_bm128(iq3_xxs, 256, 3)
+instantiate_kquant_nax_bm128(iq3_s, 256, 3)
+instantiate_kquant_nax_bm128(iq2_xxs, 256, 2)
+instantiate_kquant_nax_bm128(iq2_xs, 256, 2)
+instantiate_kquant_nax_bm128(iq2_s, 256, 2)
+instantiate_kquant_nax_bm128(iq1_s, 256, 1)
+instantiate_kquant_nax_bm128(iq1_m, 256, 1)
+
 instantiate_kquant_nax_smallbm(q6_k, 256, 6)
 instantiate_kquant_nax_smallbm(q8_0, 32, 8)
 instantiate_kquant_nax_smallbm(q4_k, 256, 4)

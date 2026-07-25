@@ -201,6 +201,23 @@ void qmm_nax(
       (small_bm_mode == 2 || kq_smallbm_policy(kquant_type).bm32)) {
     bm = 32;
   }
+  // BM=128 tile for M>=193: halves the row-tile count and with it weight
+  // re-streams per unique weight (q6_k ABBA at three shapes: +9-25%
+  // M224-512; prefill M512-2048 +8-10% hot, +31-40% cold). Padding
+  // decides the rest of the band: with M = 128q + r the tile carries 64
+  // extra padding rows exactly when r is in (1,64], and every measured
+  // loss cell (M144/160/192 -12-19%, M320 -6%) is in that zone while
+  // r == 0 or r > 64 is neutral-or-win -> dispatch only when ceil(M/64)
+  // is even. Floor 193: M65-128 measured pure wash (grid.y 2 -> 1 adds
+  // nothing; the band is issue-bound with parallelism to spare), first
+  // winning band is ceil(M/64) == 4. KQ_NAX_BM128=0 kills.
+  static const bool bm128_on = []() {
+    const char* e = std::getenv("KQ_NAX_BM128");
+    return e == nullptr || std::atoi(e) != 0;
+  }();
+  if (bm128_on && transpose && M >= 193 && ((M + 63) / 64) % 2 == 0) {
+    bm = 128;
+  }
   // M33-64 band: the name-suffixed _db BM=64 variant double-buffers Ws
   // (bm32 here would stream weights twice via grid.y=2; blanket DB@64
   // regressed M96+ -3-15% and prefill -3-7%, so it is band-gated).
