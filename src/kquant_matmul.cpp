@@ -71,6 +71,9 @@ void qmm_nax(
     const char* e = std::getenv("KQ_NAX_SMALL_BM");
     return e == nullptr || std::atoi(e) != 0;
   }();
+  // Window ends at 32: above it grid.y goes to 2 and every weight column
+  // tile streams once per M-tile, which halves per-weight bandwidth at
+  // DRAM-bound (measured: q6_k M48 146 GB/s on bm32 vs 184 on bm64).
   if (small_bm_on && (kquant_type == "q6_k" || kquant_type == "q8_0") &&
       M <= 32) {
     bm = 32;
