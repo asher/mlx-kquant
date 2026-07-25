@@ -70,7 +70,13 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
   // the raw remaining-row/col span overflows once M (or N) exceeds 32767,
   // corrupting the leading tiles of a single large matmul.
   const short sgp_sm = short(min(int(SM), M - (y_row + tm)));
-  const bool is_unaligned_sm = (sgp_sm != SM);
+  // TG-UNIFORM alignment branch: with multiple SG-rows (WM>1) a per-SG
+  // predicate (sgp_sm != SM) sends simdgroups of the same threadgroup down
+  // different dispatch_bool bodies whenever the M-tile is partial but one
+  // SG-row is full (e.g. M=24 in a BM=32 tile), which measures ~35% slower
+  // than either uniform path. The safe path costs ~3%, so branch on the
+  // tile, clamp per SG.
+  const bool is_unaligned_sm = (M - y_row) < BM;
 
   const short sgp_sn = aligned_N ? SN : short(min(int(SN), N - (y_col + tn)));
 
@@ -86,43 +92,120 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+      if constexpr (LoaderW::db_safe && BM == 32) {
+        // Double-buffered Ws: the loader for step s+1 issues before the MMA
+        // of step s reads buffer s, one barrier per step instead of two.
+        // Measured +7-14% on the small-M tile (the kernel is latency-bound,
+        // not issue-bound). Two loader instances, one per buffer; next()
+        // advances one BK tile, so each loader double-next()s to stride its
+        // own (even or odd) tiles. Requires a kt-position-generic loader
+        // (db_safe): a pair-cache replay would read a never-filled cache on
+        // the odd-tile instance. Gated to BM == 32 until the BM=64 shape
+        // (shared with prefill) gets its own certification.
+        constexpr int WS_STRIDE = BN * BK_padded;
+        LoaderW loader_w1(wl, K, Ws + WS_STRIDE, simd_gid, simd_lid);
+        loader_w1.next();
+        const int n_steps = K / BK;
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
           loader_w.load_safe(short2(BK, tgp_bn));
         }
-
+        loader_w.next();
+        loader_w.next();
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        STEEL_PRAGMA_NO_UNROLL
-        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-          NAXTile<T, TM, TK> Atile;
-          NAXTile<T, TN, TK> Btile;
-
-          volatile int compiler_barrier;
-
-          if constexpr (kAlignedM.value) {
-            Atile.load(x + kk1, K);
-          } else {
-            Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+        for (int step = 0; step < n_steps; step++) {
+          if (step + 1 < n_steps) {
+            if (step & 1) {
+              if constexpr (kAlignedN.value) {
+                loader_w.load_unsafe();
+              } else {
+                loader_w.load_safe(short2(BK, tgp_bn));
+              }
+              loader_w.next();
+              loader_w.next();
+            } else {
+              if constexpr (kAlignedN.value) {
+                loader_w1.load_unsafe();
+              } else {
+                loader_w1.load_safe(short2(BK, tgp_bn));
+              }
+              loader_w1.next();
+              loader_w1.next();
+            }
           }
 
-          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+          const threadgroup T* Wcur = Ws + (step & 1) * WS_STRIDE;
 
-          tile_matmad_nax(
-              Dtile,
-              Atile,
-              metal::bool_constant<transpose_a>{},
-              Btile,
-              metal::bool_constant<transpose_b>{});
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, TN, TK> Btile;
 
-          (void)compiler_barrier;
+            volatile int compiler_barrier;
+
+            if constexpr (kAlignedM.value) {
+              Atile.load(x + kk1, K);
+            } else {
+              Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            }
+
+            Btile.template load<T, BK_padded, 1>(
+                const_cast<threadgroup T*>(Wcur) + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<transpose_a>{},
+                Btile,
+                metal::bool_constant<transpose_b>{});
+
+            (void)compiler_barrier;
+          }
+
+          x += BK;
+          threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+      } else {
+        for (int k = 0; k < K; k += BK) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if constexpr (kAlignedN.value) {
+            loader_w.load_unsafe();
+          } else {
+            loader_w.load_safe(short2(BK, tgp_bn));
+          }
 
-        x += BK;
-        loader_w.next();
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, TN, TK> Btile;
+
+            volatile int compiler_barrier;
+
+            if constexpr (kAlignedM.value) {
+              Atile.load(x + kk1, K);
+            } else {
+              Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            }
+
+            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<transpose_a>{},
+                Btile,
+                metal::bool_constant<transpose_b>{});
+
+            (void)compiler_barrier;
+          }
+
+          x += BK;
+          loader_w.next();
+        }
       }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -244,6 +327,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ8_0BlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_Q8_0_GROUP; // 32
   MLX_MTL_CONST int bytes_per_block = KQ_Q8_0_BLOCK_BYTES; // 34
 
@@ -582,6 +666,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ5_1BlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_Q5_1_GROUP; // 32
   MLX_MTL_CONST int bytes_per_block = KQ_Q5_1_BLOCK_BYTES; // 24
 
@@ -924,6 +1009,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ4_0BlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_Q4_0_GROUP;
   MLX_MTL_CONST int bytes_per_block = KQ_Q4_0_BLOCK_BYTES;
 
@@ -1008,6 +1094,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ4_1BlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_Q4_1_GROUP;
   MLX_MTL_CONST int bytes_per_block = KQ_Q4_1_BLOCK_BYTES;
 
@@ -1093,6 +1180,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ5_0BlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_Q5_0_GROUP;
   MLX_MTL_CONST int bytes_per_block = KQ_Q5_0_BLOCK_BYTES;
 
@@ -1182,6 +1270,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ4_KBlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_Q4_K_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_Q4_K_BLOCK_BYTES;
   MLX_MTL_CONST int sub_block_size = 32;
@@ -1302,6 +1391,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ5_KBlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_Q5_K_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_Q5_K_BLOCK_BYTES;
   MLX_MTL_CONST int sub_block_size = 32;
@@ -1500,6 +1590,12 @@ struct KqNaxQ6_KBlockLoader {
   MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
   static_assert(n_reads == k_tile_size, "Q6_K NAX expects n_reads == 32.");
 
+  // Double-buffer safe: load_unsafe is kt-position-generic (no pair-cache;
+  // it was removed when the double-buffered loop landed -- the two-instance
+  // even/odd tile walk never revisits kt_base+2, and dequant ALU measured
+  // free, so the cache only added state).
+  MLX_MTL_CONST bool db_safe = true;
+
   const int src_ld;
   const int row_bytes;
   const int tile_stride;
@@ -1512,12 +1608,6 @@ struct KqNaxQ6_KBlockLoader {
   threadgroup T* dst;
   const device uint8_t* src;
   short kt_base;
-  // Pair-cache: kt_base & 2 == 0 computes both pairs; reduction_dim==0 has no
-  // cache.
-  struct Caches {
-    T cached[n_reads];
-  };
-  metal::conditional_t<reduction_dim == 1, Caches, kq_empty> cached;
 
   KqNaxQ6_KBlockLoader(
       const device uint8_t* src_,
@@ -1541,54 +1631,7 @@ struct KqNaxQ6_KBlockLoader {
         kt_base(0) {}
 
   void load_unsafe() {
-    if constexpr (reduction_dim == 1) {
-      if (kt_base & 2) {
-#pragma unroll
-        for (short i = 0; i < n_reads; i++) {
-          dst[i] = cached.cached[i];
-        }
-        return;
-      }
-
-      const short base = kt_base;
-      const short kt = base + (bj / k_tile_size);
-      const short half_idx = kt / 4;
-      const short quadrant = kt - half_idx * 4;
-
-      const float d = float(*(const device half*)(src + KQ_Q6_K_D_OFFSET));
-      const device int8_t* scales =
-          (const device int8_t*)(src + KQ_Q6_K_SCALES_OFFSET);
-
-      const device uint8_t* ql_base =
-          src + KQ_Q6_K_QL_OFFSET + half_idx * 64 + (quadrant & 1) * 32;
-      const device uint8_t* qh_base = src + KQ_Q6_K_QH_OFFSET + half_idx * 32;
-
-      const float es_lo_a = d * float(scales[kt * 2 + 0]);
-      const float es_hi_a = d * float(scales[kt * 2 + 1]);
-      const float es_lo_b = d * float(scales[(kt + 2) * 2 + 0]);
-      const float es_hi_b = d * float(scales[(kt + 2) * 2 + 1]);
-      const short qh_shift_a = quadrant * 2;
-      const short qh_shift_b = qh_shift_a + 4;
-
-#pragma unroll
-      for (short i = 0; i < n_reads; i++) {
-        const uint8_t ql_byte = ql_base[i];
-        const uint8_t h = qh_base[i];
-        const float es_a = (i >= 16) ? es_hi_a : es_lo_a;
-        const float es_b = (i >= 16) ? es_hi_b : es_lo_b;
-        const uint8_t low4_a = ql_byte & 0x0F;
-        const uint8_t low4_b = ql_byte >> 4;
-        const uint8_t high2_a = (uint8_t)((h >> qh_shift_a) & 0x03);
-        const uint8_t high2_b = (uint8_t)((h >> qh_shift_b) & 0x03);
-        const int8_t q6_a = (int8_t)(low4_a | (high2_a << 4)) - (int8_t)32;
-        const int8_t q6_b = (int8_t)(low4_b | (high2_b << 4)) - (int8_t)32;
-        dst[i] = T(es_a * float(q6_a));
-        cached.cached[i] = T(es_b * float(q6_b));
-      }
-      return;
-    }
-
-    const short base = fixed_kt_base;
+    const short base = reduction_dim == 1 ? kt_base : fixed_kt_base;
     const short kt = base + (bj / k_tile_size);
     const short half_idx = kt / 4;
     const short quadrant = kt - half_idx * 4;
@@ -1652,6 +1695,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ3_KBlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_Q3_K_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_Q3_K_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -1849,6 +1893,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ2_KBlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_Q2_K_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_Q2_K_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -2070,7 +2115,15 @@ struct KqNaxQ2_KBlockLoader {
         bits == bits_val, #codec " NAX kernel requires bits=" #bits_val); \
     constexpr int BK = 64;                                                \
     constexpr int BK_padded = (BK + 16 / sizeof(T));                      \
-    threadgroup T Ws[BN * BK_padded];                                     \
+    using LoaderW = LOADER<                                               \
+        T,                                                                \
+        BN,                                                               \
+        BK,                                                               \
+        BK_padded,                                                        \
+        /*reduction_dim=*/1,                                              \
+        /*tgp_size=*/WM * WN * SIMD_SIZE>;                                \
+    constexpr int kWsBufs = (LoaderW::db_safe && BM == 32) ? 2 : 1;       \
+    threadgroup T Ws[kWsBufs * BN * BK_padded];                           \
     if constexpr (batched) {                                              \
       kq_adjust_matrix_offsets<T>(                                        \
           x,                                                              \
@@ -2085,13 +2138,6 @@ struct KqNaxQ2_KBlockLoader {
           w_strides,                                                      \
           tid);                                                           \
     }                                                                     \
-    using LoaderW = LOADER<                                               \
-        T,                                                                \
-        BN,                                                               \
-        BK,                                                               \
-        BK_padded,                                                        \
-        /*reduction_dim=*/1,                                              \
-        /*tgp_size=*/WM * WN * SIMD_SIZE>;                                \
     kq_qmm_t_nax_tgp_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(     \
         w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);              \
   }                                                                       \
@@ -2190,7 +2236,15 @@ struct KqNaxQ2_KBlockLoader {
         bits == bits_val, #codec " NAX kernel requires bits=" #bits_val); \
     constexpr int BK = 64;                                                \
     constexpr int BK_padded = (BK + 16 / sizeof(T));                      \
-    threadgroup T Ws[BN * BK_padded];                                     \
+    using LoaderW = LOADER<                                               \
+        T,                                                                \
+        BN,                                                               \
+        BK,                                                               \
+        BK_padded,                                                        \
+        /*reduction_dim=*/1,                                              \
+        /*tgp_size=*/WM * WN * SIMD_SIZE>;                                \
+    constexpr int kWsBufs = (LoaderW::db_safe && BM == 32) ? 2 : 1;       \
+    threadgroup T Ws[kWsBufs * BN * BK_padded];                           \
     kq_adjust_matrix_offsets<T>(                                          \
         x,                                                                \
         w,                                                                \
@@ -2209,13 +2263,6 @@ struct KqNaxQ2_KBlockLoader {
         w_shape,                                                          \
         w_strides,                                                        \
         tid);                                                             \
-    using LoaderW = LOADER<                                               \
-        T,                                                                \
-        BN,                                                               \
-        BK,                                                               \
-        BK_padded,                                                        \
-        /*reduction_dim=*/1,                                              \
-        /*tgp_size=*/WM * WN * SIMD_SIZE>;                                \
     kq_qmm_t_nax_tgp_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(     \
         w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);              \
   }                                                                       \
@@ -2296,6 +2343,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq4_nlBlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_IQ4_NL_GROUP;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ4_NL_BLOCK_BYTES;
 
@@ -2390,6 +2438,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq4_xsBlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_IQ4_XS_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ4_XS_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -2491,6 +2540,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq3_xxsBlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_IQ3_XXS_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ3_XXS_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -2595,6 +2645,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq3_sBlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_IQ3_S_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ3_S_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -2703,6 +2754,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq2_xxsBlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_IQ2_XXS_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ2_XXS_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -2805,6 +2857,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq2_xsBlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_IQ2_XS_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ2_XS_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -2909,6 +2962,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq2_sBlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_IQ2_S_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ2_S_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -3014,6 +3068,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq1_sBlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_IQ1_S_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ1_S_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -3116,6 +3171,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq1_mBlockLoader {
+  MLX_MTL_CONST bool db_safe = false;
   MLX_MTL_CONST int weights_per_block = KQ_IQ1_M_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ1_M_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;

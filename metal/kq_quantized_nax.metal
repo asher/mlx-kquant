@@ -93,6 +93,30 @@
   instantiate_kquant_nax_codec_for_type(codec, float16_t,   gs, bits)                      \
   instantiate_kquant_nax_codec_for_type(codec, bfloat16_t,  gs, bits)
 
+// Small-BM qmm_t tile for the batch-decode M range: BM=64 wastes up to 75%
+// of MMA issues on row padding at M<=32 (MMA measured ~48% of kernel time).
+// BM=32 (wm2 wn2 -> TM=1, TN=2) is the smallest tile the fragment pairing
+// in tile_matmad_nax and the loaders' n_reads==32 contract allow: BM=16
+// forces TM=TN=1, where NEITHER matmad branch exists and the kernel is
+// silently empty. q6_k first.
+// BM=32 wm2/wn2 (TM=1, TN=2, paired-N matmad). NOTE two rejected shapes:
+// BM=16 forces TM=TN=1 where NEITHER tile_matmad_nax pairing branch exists
+// (silently empty kernel); BM=32 wm1/wn4 (TM=2, TN=1) takes the paired-M
+// branch, which produces wrong numerics with (ta=false, tb=true) -- only
+// visible at M>16 where the second row fragment is non-zero. The
+// mixed-alignment penalty this shape would have fixed is handled by the
+// TG-uniform alignment branch in kq_qmm_t_nax_tgp_impl instead.
+#define instantiate_kquant_nax_qmm_t_smallbm(codec, type, gs, bits)          \
+  instantiate_kquant_nax_qmm_t(type, gs, bits, true,  1, 32, 64, 2, 2, codec) \
+  instantiate_kquant_nax_qmm_t(type, gs, bits, true,  0, 32, 64, 2, 2, codec) \
+  instantiate_kquant_nax_qmm_t(type, gs, bits, false, 1, 32, 64, 2, 2, codec) \
+  instantiate_kquant_nax_qmm_t(type, gs, bits, false, 0, 32, 64, 2, 2, codec)
+#define instantiate_kquant_nax_smallbm(codec, gs, bits)                      \
+  instantiate_kquant_nax_qmm_t_smallbm(codec, float,      gs, bits)          \
+  instantiate_kquant_nax_qmm_t_smallbm(codec, float16_t,  gs, bits)          \
+  instantiate_kquant_nax_qmm_t_smallbm(codec, bfloat16_t, gs, bits)
+instantiate_kquant_nax_smallbm(q6_k, 256, 6)
+
 instantiate_kquant_nax_codec(q8_0, 32, 8)
 instantiate_kquant_nax_codec(q5_1, 32, 5)
 instantiate_kquant_nax_codec(q4_0, 32, 4)

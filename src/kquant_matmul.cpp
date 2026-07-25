@@ -62,6 +62,17 @@ void qmm_nax(
     const std::string& kquant_type) {
   int B = out.size() / M / N;
   int wm = 2, wn = 2, bm = 64, bn = 64, bk = 64;
+  // Small-BM tile for small M: BM=64 wastes up to 75% of MMA issues on row
+  // padding at M<=32 (MMA is ~48% of kernel time). BM=32 is the smallest
+  // tile the NAX fragment pairing allows (TM=1, TN=2). q6_k-only
+  // instantiations for now; KQ_NAX_SMALL_BM=0 kills.
+  static const bool small_bm_on = []() {
+    const char* e = std::getenv("KQ_NAX_SMALL_BM");
+    return e == nullptr || std::atoi(e) != 0;
+  }();
+  if (small_bm_on && kquant_type == "q6_k" && M <= 32) {
+    bm = 32;
+  }
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
 
@@ -687,6 +698,57 @@ void KQuantMatmul::eval_gpu(
   // whose input dim is exactly 64/128 (none in standard transformers). Fall
   // through to dispatch_qmv below rather than throw; a qmv_quad kernel would be
   // a perf-only path for an essentially-dead case.
+
+  // Probe lever: KQ_FORCE_QMM_MIN_M=<m> routes transpose shapes with M >= m
+  // straight to qmm (-> NAX), bypassing the mv_ext/verify_qmv claims, for
+  // qmm-vs-mv_ext crossover measurement below M=13.
+  static const int force_qmm_min_m = []() {
+    const char* e = std::getenv("KQ_FORCE_QMM_MIN_M");
+    return e != nullptr ? std::atoi(e) : 0;
+  }();
+  if (force_qmm_min_m > 0 && transpose_ && M >= force_qmm_min_m) {
+    qmm(x,
+        w,
+        scales,
+        out,
+        transpose_,
+        group_size_,
+        bits_,
+        M,
+        N,
+        K,
+        d,
+        s,
+        kquant_type_);
+    return;
+  }
+
+  // q6_k M 9-12: the double-buffered BM=32 NAX tile (274-305 GB/s
+  // cold-stream) beats mv_ext's wide-M decay (254 at M10, 221 at M12);
+  // mv_ext keeps M <= 8 where it holds 315-536. KQ_NAX_SMALL_BM=0 restores
+  // the old routing (same switch that picks the BM=32 tile in qmm_nax).
+  static const bool nax_smallm_route = []() {
+    const char* e = std::getenv("KQ_NAX_SMALL_BM");
+    return e == nullptr || std::atoi(e) != 0;
+  }();
+  if (nax_smallm_route && transpose_ && non_batched && M >= 9 && M <= 12 &&
+      kquant_type_ == "q6_k" && kq_is_nax_available() && (K % 64 == 0) &&
+      x.dtype() != mx::float32) {
+    qmm(x,
+        w,
+        scales,
+        out,
+        transpose_,
+        group_size_,
+        bits_,
+        M,
+        N,
+        K,
+        d,
+        s,
+        kquant_type_);
+    return;
+  }
 
   if (M >= vector_limit) {
     // For transpose shapes in the mv_ext M-range, the weight-read-amortizing
