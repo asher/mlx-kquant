@@ -731,13 +731,20 @@ void KQuantMatmul::eval_gpu(
         kquant_type_ == "mxfp4" || kquant_type_ == "nvfp4";
     const bool mv_ext_default_on = codec_has_mv_ext;
     // Width gate for the DEFAULT path (the A/B force-on KQ_VERIFY_EXT=1 ignores
-    // it). Measured DRAM-fresh: for non-IQ codecs verify_qmv (tuned for small
-    // M, MAX_VM accumulators) ties or beats mv_ext at M==2 and mv_ext only pays
-    // at M>=3, so non-IQ falls back to verify_qmv at M==2 (no regression at the
-    // rarely-used draft-width-1 case). IQ has no verify_qmv kernel, so mv_ext
-    // (vs per-row qmv) is a clear win at every M>=2 and stays on.
+    // it). Measured DRAM-cold across every wired codec (M5 Max, [17408x5120],
+    // working set streamed far past the SLC): at M==2 verify_qmv holds its
+    // M==1 rate only for q4_k (495 vs mv_ext 422 GB/s) and q8_0 (540 vs 541);
+    // every other codec craters there (q6_k 328, q3_k 179, legacy 213-298,
+    // all vs mv_ext 353-536), and the wire codecs with no verify kernel
+    // (mxfp4/nvfp4) fall to per-row qmv at half their M==1 rate (69/61 vs
+    // mv_ext 392/432). M==2 is every B=2 decode step, not just the
+    // draft-width-1 verify, so M==2 routes to mv_ext for all codecs except
+    // the two where verify_qmv measures faster. IQ has no verify_qmv kernel,
+    // so mv_ext stays on at every M>=2.
     const bool is_iq = kquant_type_.rfind("iq", 0) == 0;
-    const bool mv_ext_width_ok = is_iq || M >= 3;
+    const bool verify_qmv_wins_m2 =
+        kquant_type_ == "q4_k" || kquant_type_ == "q8_0";
+    const bool mv_ext_width_ok = is_iq || M >= 3 || !verify_qmv_wins_m2;
     // 32-weight blocks (legacy + q8_0 + iq4_nl) align K to 32; the 256-weight
     // super-block codecs (K-quants + the other IQ) align to 256. Pull the
     // modulus from the codec geometry rather than hard-coding per codec.

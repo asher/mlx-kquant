@@ -6,6 +6,16 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- Decode matmul width gate: M==2 now routes to the flat mat-vec
+  (`kq_<codec>_mv_ext`) for every codec except q4_k and q8_0, where
+  `verify_qmv` measures faster DRAM-cold. The K-quants and legacy codecs
+  crater on the old M==2 route (q6_k 328 vs 536 GB/s cold), and mxfp4/nvfp4
+  (no verify kernel) fell through to per-row qmv at half their M==1 rate
+  (mv_ext is 5.6-7.1x there). M==2 is every B=2 batched decode step, not just
+  draft-width-1 verify; qwen3.6-27B Q6_K B=2 decode gains ~6-12% aggregate
+  tok/s end-to-end.
+
 ## [0.3.5]
 
 ### Added
