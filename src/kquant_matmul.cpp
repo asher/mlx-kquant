@@ -45,6 +45,40 @@ using mx::Stream;
 // get_qmv_batch_limit, add_strides_and_shapes, kq_get_kernel) come from
 // kquant_metal_internal.h.
 
+// Measured small-BM policy per codec (cold-stream [17408x5120], M5 Max).
+// bm32: the BM=32 double-buffered tile wins M13-32 over BM=64 (wins range
+// +3% to +45%; excluded codecs measured neutral or worse -- iq2_s -24%,
+// the DB loader duplication hurts register-heavy grid dequant).
+// route_min: lowest M routed from the mv paths to qmm (0 = mv keeps all
+// M <= 12; the flat codecs' and iq1_s's qmm is dequant-ALU-bound at
+// 105-150 GB/s, below their mv paths through M12).
+struct KqSmallBmPolicy {
+  bool bm32;
+  int route_min;
+};
+static KqSmallBmPolicy kq_smallbm_policy(const std::string& t) {
+  if (t == "q4_k" || t == "q3_k") {
+    return {true, 7};
+  }
+  if (t == "q2_k" || t == "iq3_xxs") {
+    return {true, 8};
+  }
+  if (t == "q6_k" || t == "q8_0" || t == "q5_k" || t == "iq3_s") {
+    return {true, 9};
+  }
+  if (t == "iq2_xxs") {
+    return {true, 10};
+  }
+  if (t == "iq4_xs") {
+    return {true, 11};
+  }
+  if (t == "q4_0" || t == "q4_1" || t == "q5_0" || t == "q5_1" ||
+      t == "iq1_s") {
+    return {true, 0};
+  }
+  return {false, 0}; // iq4_nl, iq2_xs, iq2_s, iq1_m
+}
+
 // NAX (tensor-core) GEMM dispatch for the quantized matmul (no biases).
 void qmm_nax(
     const array& x,
@@ -74,11 +108,7 @@ void qmm_nax(
   // Window ends at 32: above it grid.y goes to 2 and every weight column
   // tile streams once per M-tile, which halves per-weight bandwidth at
   // DRAM-bound (measured: q6_k M48 146 GB/s on bm32 vs 184 on bm64).
-  if (small_bm_on &&
-      (kquant_type == "q6_k" || kquant_type == "q8_0" ||
-       kquant_type == "q4_k" || kquant_type == "q5_k" ||
-       kquant_type == "q3_k" || kquant_type == "q2_k") &&
-      M <= 32) {
+  if (small_bm_on && M <= 32 && kq_smallbm_policy(kquant_type).bm32) {
     bm = 32;
   }
   MTL::Size group_dims(32, wn, wm);
@@ -732,24 +762,16 @@ void KQuantMatmul::eval_gpu(
   }
 
   // Small-M qmm route: the double-buffered BM=32 NAX tile beats the mv
-  // paths' wide-M decay above a per-codec crossover (cold-stream GB/s):
-  //   q6_k M>=9: 274-305 vs 221-254; mv keeps M<=8 at 315-536
-  //   q8_0 M>=9: 379-383 vs 277-354; mv keeps M<=8 at 403-480
-  //   q4_k M>=7: 249-287 vs 149-256; mv keeps M<=6 at 293-387
-  //   q3_k M>=7: 182-193 vs 108-215; mv keeps M<=6 at 215-347
-  //   q2_k M>=8: 133-194 vs 88-135; mv keeps M<=7 at 145-372
-  // KQ_NAX_SMALL_BM=0 restores the old routing (same switch that picks
-  // the BM=32 tile in qmm_nax).
+  // paths' wide-M decay above a per-codec crossover (kq_smallbm_policy;
+  // measured cold-stream, e.g. q6_k M>=9 274-305 vs 221-254, q4_k M>=7
+  // 249-287 vs 149-256, q2_k M>=8 133-194 vs 88-135, iq3_xxs M>=8
+  // 163-175 vs 102-158). KQ_NAX_SMALL_BM=0 restores the old routing
+  // (same switch that picks the BM=32 tile in qmm_nax).
   static const bool nax_smallm_route = []() {
     const char* e = std::getenv("KQ_NAX_SMALL_BM");
     return e == nullptr || std::atoi(e) != 0;
   }();
-  const int smallm_min = (kquant_type_ == "q4_k" || kquant_type_ == "q3_k") ? 7
-      : kquant_type_ == "q2_k"                                              ? 8
-      : (kquant_type_ == "q6_k" || kquant_type_ == "q8_0" ||
-         kquant_type_ == "q5_k")
-      ? 9
-      : 0;
+  const int smallm_min = kq_smallbm_policy(kquant_type_).route_min;
   if (nax_smallm_route && transpose_ && non_batched && smallm_min > 0 &&
       M >= smallm_min && M <= 12 && kq_is_nax_available() && (K % 64 == 0) &&
       x.dtype() != mx::float32) {

@@ -693,7 +693,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ5_1BlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q5_1_GROUP; // 32
   MLX_MTL_CONST int bytes_per_block = KQ_Q5_1_BLOCK_BYTES; // 24
 
@@ -810,7 +810,15 @@ template <
 
   constexpr int BK = 64;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
-  threadgroup T Ws[BN * BK_padded];
+  using LoaderW = KqNaxQ5_1BlockLoader<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      /*reduction_dim=*/1,
+      /*tgp_size=*/WM * WN * SIMD_SIZE>;
+  constexpr int kWsBufs = (LoaderW::db_safe && BM == 32) ? 2 : 1;
+  threadgroup T Ws[kWsBufs * BN * BK_padded];
 
   if constexpr (batched) {
     kq_adjust_matrix_offsets<T>(
@@ -827,15 +835,16 @@ template <
         tid);
   }
 
-  using LoaderW = KqNaxQ5_1BlockLoader<
+  kq_qmm_t_nax_tgp_impl<
       T,
-      BN,
+      LoaderW,
+      aligned_N,
+      BM,
       BK,
-      BK_padded,
-      /*reduction_dim=*/1,
-      /*tgp_size=*/WM * WN * SIMD_SIZE>;
-  kq_qmm_t_nax_tgp_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
-      w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+      BN,
+      WM,
+      WN,
+      kWsBufs == 2>(w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits, bool batched>
@@ -932,7 +941,16 @@ template <
 
   constexpr int BK = 64;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
-  threadgroup T Ws[BN * BK_padded];
+  using LoaderW = KqNaxQ5_1BlockLoader<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      /*reduction_dim=*/1,
+      /*tgp_size=*/WM * WN * SIMD_SIZE>;
+  // Gather stays single-buffered at BM=64 (see the q8_0 gather note).
+  constexpr int kWsBufs = (LoaderW::db_safe && BM == 32) ? 2 : 1;
+  threadgroup T Ws[kWsBufs * BN * BK_padded];
 
   kq_adjust_matrix_offsets<T>(
       x,
@@ -953,15 +971,16 @@ template <
       w_strides,
       tid);
 
-  using LoaderW = KqNaxQ5_1BlockLoader<
+  kq_qmm_t_nax_tgp_impl<
       T,
-      BN,
+      LoaderW,
+      aligned_N,
+      BM,
       BK,
-      BK_padded,
-      /*reduction_dim=*/1,
-      /*tgp_size=*/WM * WN * SIMD_SIZE>;
-  kq_qmm_t_nax_tgp_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
-      w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+      BN,
+      WM,
+      WN,
+      kWsBufs == 2>(w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits>
@@ -1036,7 +1055,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ4_0BlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q4_0_GROUP;
   MLX_MTL_CONST int bytes_per_block = KQ_Q4_0_BLOCK_BYTES;
 
@@ -1121,7 +1140,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ4_1BlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q4_1_GROUP;
   MLX_MTL_CONST int bytes_per_block = KQ_Q4_1_BLOCK_BYTES;
 
@@ -1207,7 +1226,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ5_0BlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q5_0_GROUP;
   MLX_MTL_CONST int bytes_per_block = KQ_Q5_0_BLOCK_BYTES;
 
@@ -2200,7 +2219,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq4_nlBlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ4_NL_GROUP;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ4_NL_BLOCK_BYTES;
 
@@ -2295,7 +2314,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq4_xsBlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ4_XS_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ4_XS_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -2397,7 +2416,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq3_xxsBlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ3_XXS_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ3_XXS_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -2502,7 +2521,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq3_sBlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ3_S_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ3_S_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -2611,7 +2630,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq2_xxsBlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ2_XXS_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ2_XXS_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -2714,7 +2733,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq2_xsBlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ2_XS_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ2_XS_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -2819,7 +2838,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq2_sBlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ2_S_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ2_S_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -2925,7 +2944,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq1_sBlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ1_S_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ1_S_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -3028,7 +3047,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq1_mBlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ1_M_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ1_M_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
