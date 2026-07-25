@@ -1674,7 +1674,11 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ3_KBlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  // Double-buffer safe: kt-position-generic load_unsafe (the former
+  // pair-cache + hmask cache replayed on odd kt_base, which reads a
+  // never-filled cache on the odd-tile DB loader instance; per the
+  // q6_k/q5_k precedent the re-dequant is free under weight streaming).
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q3_K_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_Q3_K_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -1702,12 +1706,6 @@ struct KqNaxQ3_KBlockLoader {
   threadgroup T* dst;
   const device uint8_t* src;
   short kt_base;
-  // Pair-cache + hmask cache; reduction_dim==0 has no register storage.
-  struct Caches {
-    T cached[n_reads];
-    uint8_t hmask_cache[bytes_per_thread];
-  };
-  metal::conditional_t<reduction_dim == 1, Caches, kq_empty> cached;
 
   KqNaxQ3_KBlockLoader(
       const device uint8_t* src_,
@@ -1730,76 +1728,8 @@ struct KqNaxQ3_KBlockLoader {
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         kt_base(0) {}
 
-  void load_unsafe() {
-    if constexpr (reduction_dim == 1) {
-      if (kt_base & 2) {
-#pragma unroll
-        for (short i = 0; i < bytes_per_thread; i++) {
-          dst[i] = cached.cached[i];
-          dst[k_tile_size + i] = cached.cached[bytes_per_thread + i];
-        }
-        return;
-      }
-
-      const short base = kt_base;
-      const short outer_half = base / 4;
-      const short scale_off = (bj_byte >= 16) ? 1 : 0;
-
-      const float d = float(*(const device half*)(src + KQ_Q3_K_D_OFFSET));
-      const device uint8_t* qs =
-          src + KQ_Q3_K_QS_OFFSET + outer_half * 32 + bj_byte;
-      const device uint8_t* hm = src + KQ_Q3_K_HMASK_OFFSET + bj_byte;
-
-      const float es_a = d *
-          float((int)kq_q3_k_unpack_scale(
-                    base * 2 + scale_off, src + KQ_Q3_K_SCALES_OFFSET) -
-                32);
-      const float es_b = d *
-          float((int)kq_q3_k_unpack_scale(
-                    (base + 1) * 2 + scale_off, src + KQ_Q3_K_SCALES_OFFSET) -
-                32);
-      const float es_c = d *
-          float((int)kq_q3_k_unpack_scale(
-                    (base + 2) * 2 + scale_off, src + KQ_Q3_K_SCALES_OFFSET) -
-                32);
-      const float es_d = d *
-          float((int)kq_q3_k_unpack_scale(
-                    (base + 3) * 2 + scale_off, src + KQ_Q3_K_SCALES_OFFSET) -
-                32);
-
-      const short shift_a = (base & 3) * 2;
-      const short shift_b = ((base + 1) & 3) * 2;
-      const short shift_c = ((base + 2) & 3) * 2;
-      const short shift_d = ((base + 3) & 3) * 2;
-
-      if (kt_base == 0) {
-#pragma unroll
-        for (short i = 0; i < bytes_per_thread; i++) {
-          cached.hmask_cache[i] = hm[i];
-        }
-      }
-
-#pragma unroll
-      for (short i = 0; i < bytes_per_thread; i++) {
-        const uint8_t q = qs[i];
-        const uint8_t h = cached.hmask_cache[i];
-        const uint8_t q2_a = (q >> shift_a) & 0x03;
-        const uint8_t q2_b = (q >> shift_b) & 0x03;
-        const uint8_t q2_c = (q >> shift_c) & 0x03;
-        const uint8_t q2_d = (q >> shift_d) & 0x03;
-        const int q3_a = (int)q2_a - (((h >> base) & 1) ? 0 : 4);
-        const int q3_b = (int)q2_b - (((h >> (base + 1)) & 1) ? 0 : 4);
-        const int q3_c = (int)q2_c - (((h >> (base + 2)) & 1) ? 0 : 4);
-        const int q3_d = (int)q2_d - (((h >> (base + 3)) & 1) ? 0 : 4);
-        dst[i] = T(es_a * float(q3_a));
-        dst[k_tile_size + i] = T(es_b * float(q3_b));
-        cached.cached[i] = T(es_c * float(q3_c));
-        cached.cached[bytes_per_thread + i] = T(es_d * float(q3_d));
-      }
-      return;
-    }
-
-    const short base = fixed_kt_base;
+  void load_unsafe() const {
+    const short base = reduction_dim == 1 ? kt_base : fixed_kt_base;
     const short outer_half = base / 4;
     const short scale_off = (bj_byte >= 16) ? 1 : 0;
 
@@ -1836,7 +1766,7 @@ struct KqNaxQ3_KBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) {
+  void load_safe(short2 src_tile_dim) const {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < bytes_per_thread; i++) {
@@ -1872,7 +1802,9 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ2_KBlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  // Double-buffer safe: kt-position-generic load_unsafe (former pair-cache
+  // deleted, same treatment as q3_k).
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q2_K_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_Q2_K_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -1900,10 +1832,6 @@ struct KqNaxQ2_KBlockLoader {
   threadgroup T* dst;
   const device uint8_t* src;
   short kt_base;
-  struct Caches {
-    T cached[n_reads];
-  };
-  metal::conditional_t<reduction_dim == 1, Caches, kq_empty> cached;
 
   KqNaxQ2_KBlockLoader(
       const device uint8_t* src_,
@@ -1926,74 +1854,8 @@ struct KqNaxQ2_KBlockLoader {
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         kt_base(0) {}
 
-  void load_unsafe() {
-    if constexpr (reduction_dim == 1) {
-      if (kt_base & 2) {
-#pragma unroll
-        for (short i = 0; i < bytes_per_thread; i++) {
-          dst[i] = cached.cached[i];
-          dst[k_tile_size + i] = cached.cached[bytes_per_thread + i];
-        }
-        return;
-      }
-
-      const short base = kt_base;
-      const short outer_half = base / 4;
-      const short scale_off = (bj_byte >= 16) ? 1 : 0;
-
-      const float d = float(*(const device half*)(src + KQ_Q2_K_D_OFFSET));
-      const float dmin =
-          float(*(const device half*)(src + KQ_Q2_K_DMIN_OFFSET));
-      const device uint8_t* qs =
-          src + KQ_Q2_K_QS_OFFSET + outer_half * 32 + bj_byte;
-
-      static_assert(
-          bytes_per_thread == 16,
-          "Q2_K NAX vector load assumes bytes_per_thread == 16.");
-      uint8_t qs_b[bytes_per_thread];
-#pragma unroll
-      for (short v = 0; v < bytes_per_thread / 4; v++) {
-        const uint qs_v = *reinterpret_cast<const device uint*>(qs + v * 4);
-        *reinterpret_cast<thread uint*>(&qs_b[v * 4]) = qs_v;
-      }
-
-      const uint8_t sc_a = src[KQ_Q2_K_SCALES_OFFSET + base * 2 + scale_off];
-      const uint8_t sc_b =
-          src[KQ_Q2_K_SCALES_OFFSET + (base + 1) * 2 + scale_off];
-      const uint8_t sc_c =
-          src[KQ_Q2_K_SCALES_OFFSET + (base + 2) * 2 + scale_off];
-      const uint8_t sc_d =
-          src[KQ_Q2_K_SCALES_OFFSET + (base + 3) * 2 + scale_off];
-      const float es_a = d * float(sc_a & 0x0F);
-      const float em_a = dmin * float(sc_a >> 4);
-      const float es_b = d * float(sc_b & 0x0F);
-      const float em_b = dmin * float(sc_b >> 4);
-      const float es_c = d * float(sc_c & 0x0F);
-      const float em_c = dmin * float(sc_c >> 4);
-      const float es_d = d * float(sc_d & 0x0F);
-      const float em_d = dmin * float(sc_d >> 4);
-
-      const short shift_a = (base & 3) * 2;
-      const short shift_b = ((base + 1) & 3) * 2;
-      const short shift_c = ((base + 2) & 3) * 2;
-      const short shift_d = ((base + 3) & 3) * 2;
-
-#pragma unroll
-      for (short i = 0; i < bytes_per_thread; i++) {
-        const uint8_t q = qs_b[i];
-        const uint8_t q2_a = (q >> shift_a) & 0x03;
-        const uint8_t q2_b = (q >> shift_b) & 0x03;
-        const uint8_t q2_c = (q >> shift_c) & 0x03;
-        const uint8_t q2_d = (q >> shift_d) & 0x03;
-        dst[i] = T(es_a * float(q2_a) - em_a);
-        dst[k_tile_size + i] = T(es_b * float(q2_b) - em_b);
-        cached.cached[i] = T(es_c * float(q2_c) - em_c);
-        cached.cached[bytes_per_thread + i] = T(es_d * float(q2_d) - em_d);
-      }
-      return;
-    }
-
-    const short base = fixed_kt_base;
+  void load_unsafe() const {
+    const short base = reduction_dim == 1 ? kt_base : fixed_kt_base;
     const short outer_half = base / 4;
     const short scale_off = (bj_byte >= 16) ? 1 : 0;
 
@@ -2032,7 +1894,7 @@ struct KqNaxQ2_KBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) {
+  void load_safe(short2 src_tile_dim) const {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < bytes_per_thread; i++) {

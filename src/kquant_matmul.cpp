@@ -76,7 +76,8 @@ void qmm_nax(
   // DRAM-bound (measured: q6_k M48 146 GB/s on bm32 vs 184 on bm64).
   if (small_bm_on &&
       (kquant_type == "q6_k" || kquant_type == "q8_0" ||
-       kquant_type == "q4_k" || kquant_type == "q5_k") &&
+       kquant_type == "q4_k" || kquant_type == "q5_k" ||
+       kquant_type == "q3_k" || kquant_type == "q2_k") &&
       M <= 32) {
     bm = 32;
   }
@@ -735,13 +736,16 @@ void KQuantMatmul::eval_gpu(
   //   q6_k M>=9: 274-305 vs 221-254; mv keeps M<=8 at 315-536
   //   q8_0 M>=9: 379-383 vs 277-354; mv keeps M<=8 at 403-480
   //   q4_k M>=7: 249-287 vs 149-256; mv keeps M<=6 at 293-387
+  //   q3_k M>=7: 182-193 vs 108-215; mv keeps M<=6 at 215-347
+  //   q2_k M>=8: 133-194 vs 88-135; mv keeps M<=7 at 145-372
   // KQ_NAX_SMALL_BM=0 restores the old routing (same switch that picks
   // the BM=32 tile in qmm_nax).
   static const bool nax_smallm_route = []() {
     const char* e = std::getenv("KQ_NAX_SMALL_BM");
     return e == nullptr || std::atoi(e) != 0;
   }();
-  const int smallm_min = kquant_type_ == "q4_k" ? 7
+  const int smallm_min = (kquant_type_ == "q4_k" || kquant_type_ == "q3_k") ? 7
+      : kquant_type_ == "q2_k"                                              ? 8
       : (kquant_type_ == "q6_k" || kquant_type_ == "q8_0" ||
          kquant_type_ == "q5_k")
       ? 9
