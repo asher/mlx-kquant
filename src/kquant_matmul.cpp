@@ -75,8 +75,9 @@ static KqSmallBmPolicy kq_smallbm_policy(const std::string& t) {
     return {true, 9, 16384};
   }
   if (t == "q8_0") {
-    // +2-9% at 17408, +2-4% at 14336, ~0 at 4096, -3/-8% at 1024.
-    return {true, 9, 8192};
+    // db64: +2-9% at 17408, +2-4% at 14336, ~0 at 4096, -3/-8% at 1024.
+    // route_min 8 post-ushort-loader (forced M8 391 vs mv 378 at 17408).
+    return {true, 8, 8192};
   }
   if (t == "q5_k" || t == "iq3_s") {
     return {true, 9, 0};
@@ -87,14 +88,26 @@ static KqSmallBmPolicy kq_smallbm_policy(const std::string& t) {
   if (t == "iq4_xs") {
     return {true, 11, 0};
   }
-  if (t == "q4_0" || t == "q4_1" || t == "q5_0" || t == "q5_1" ||
-      t == "iq1_s") {
-    // Band A/B: all 17 non-winners neutral-to-worse (iq2_s -45%, iq1_s
-    // -37% at M64: DB loader duplication vs register-heavy grid dequant,
-    // same shape as the bm32 exclusions).
+  // Flat-family entries are post-ushort-loader (the 32-single-byte-load
+  // dequant chain was the 105-150 GB/s wall; with it gone these codecs
+  // earn sub-13 routes, iq4_nl rejoins bm32 at +27-52% over bm64, and
+  // db64 splits: q4_1/q5_0/q5_1 win +9-20% at N=17408 and +2-7% at 8192
+  // but lose -5-13% at 1024, while q4_0/iq4_nl stay neutral-to-negative
+  // (their loaders are cheap enough that the duplicated Ws buffers cost
+  // more occupancy than the latency hiding returns).
+  if (t == "q4_0" || t == "iq4_nl") {
+    return {true, 6, 0};
+  }
+  if (t == "q4_1" || t == "q5_1") {
+    return {true, 6, 8192};
+  }
+  if (t == "q5_0") {
+    return {true, 7, 8192};
+  }
+  if (t == "iq1_s") {
     return {true, 0, 0};
   }
-  return {false, 0, 0}; // iq4_nl, iq2_xs, iq2_s, iq1_m
+  return {false, 0, 0}; // iq2_xs, iq2_s, iq1_m
 }
 
 // Shape-adjusted sub-13 route threshold. The table crossovers were tuned
@@ -124,11 +137,20 @@ static int kq_smallm_route_min(const std::string& t, int N, int K) {
     return (K >= 8192 || N <= 2048) ? 12 : 11;
   }
   if (t == "q8_0") {
-    // At K >= 8192 the M12 qmm (261-265 GB/s) sits inside the mv path's
-    // run-to-run band (253-290): no reliable win anywhere in the sub-13
-    // window, so drop the route. The M13+ BM=32 tile is separate and
-    // keeps its +25% at M16.
-    return K >= 8192 ? 0 : 11;
+    // q8_0's mv is the strongest in the fleet (500 GB/s at M5); even with
+    // the ushort loader the qmm never beats it below M13 at decode
+    // projection shapes (down M8 246 vs 374 mv, kv M12 324 vs 332). The
+    // M13+ BM=32 tile is separate and keeps its win.
+    return 0;
+  }
+  if (t == "q4_0" || t == "q4_1" || t == "iq4_nl") {
+    // Down-projection K walk pushes the crossover to 8 (q4_0 M8 251 vs
+    // 227 mv at [4096x14336], iq4_nl 232 vs 221); kv shapes cross at 7.
+    // iq4_nl crossovers are measured on its bm32 tile.
+    return K >= 8192 ? 8 : 7;
+  }
+  if (t == "q5_0" || t == "q5_1") {
+    return 8;
   }
   if (t == "q3_k") {
     return N <= 2048 ? 8 : m;
@@ -165,16 +187,18 @@ void qmm_nax(
   // Small-BM tile for small M: BM=64 wastes up to 75% of MMA issues on row
   // padding at M<=32 (MMA is ~48% of kernel time). BM=32 is the smallest
   // tile the NAX fragment pairing allows (TM=1, TN=2). Codecs whose loaders
-  // are db_safe and have smallbm instantiations only; KQ_NAX_SMALL_BM=0
-  // kills.
-  static const bool small_bm_on = []() {
+  // are db_safe and have smallbm instantiations only. KQ_NAX_SMALL_BM:
+  // 0 = off, 2 = force bm32 for policy-excluded codecs (crossover
+  // finding), unset or 1 = per-codec policy.
+  static const int small_bm_mode = []() {
     const char* e = std::getenv("KQ_NAX_SMALL_BM");
-    return e == nullptr || std::atoi(e) != 0;
+    return e == nullptr ? 1 : std::atoi(e);
   }();
   // Window ends at 32: above it grid.y goes to 2 and every weight column
   // tile streams once per M-tile, which halves per-weight bandwidth at
   // DRAM-bound (measured: q6_k M48 146 GB/s on bm32 vs 184 on bm64).
-  if (small_bm_on && M <= 32 && kq_smallbm_policy(kquant_type).bm32) {
+  if (small_bm_mode != 0 && M <= 32 &&
+      (small_bm_mode == 2 || kq_smallbm_policy(kquant_type).bm32)) {
     bm = 32;
   }
   // M33-64 band: the name-suffixed _db BM=64 variant double-buffers Ws

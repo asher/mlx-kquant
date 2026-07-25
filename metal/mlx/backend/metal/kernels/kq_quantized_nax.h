@@ -385,9 +385,21 @@ struct KqNaxQ8_0BlockLoader {
     const float d = float(*(const device half*)(block_addr + KQ_Q8_0_D_OFFSET));
     const device int8_t* q =
         (const device int8_t*)(block_addr + KQ_Q8_0_Q_OFFSET + within);
+    if constexpr (n_reads == weights_per_block) {
+      // One whole block per thread (within == 0): 16 aligned ushorts (q
+      // sits at +2 of a 34-byte block) replace 32 single-byte loads.
+      const device ushort* q16 = (const device ushort*)q;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      dst[i] = T(d * float(q[i]));
+      for (short s = 0; s < 16; s++) {
+        const ushort v = q16[s];
+        dst[2 * s + 0] = T(d * float(char(v & 0xFFu)));
+        dst[2 * s + 1] = T(d * float(char(v >> 8)));
+      }
+    } else {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(d * float(q[i]));
+      }
     }
   }
 
@@ -782,13 +794,34 @@ struct KqNaxQ5_1BlockLoader {
     const uint32_t qh =
         *(const device uint32_t*)(block_addr + KQ_Q5_1_QH_OFFSET);
     const device uint8_t* qs = block_addr + KQ_Q5_1_QS_OFFSET;
+    if constexpr (n_reads == weights_per_block) {
+      // One whole block per thread (within == 0): 8 aligned ushorts (qs
+      // sits at +8 of a 24-byte block) replace 32 single-byte loads.
+      const device ushort* qs16 = (const device ushort*)qs;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int j = within + i;
-      const uint32_t hi = ((qh >> j) << 4) & 0x10u;
-      const uint8_t lo = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
-      const float q5 = float(uint32_t(lo) | hi);
-      dst[i] = T(d * q5 + m);
+      for (short s = 0; s < 8; s++) {
+        const ushort v = qs16[s];
+        const uint32_t x0 = (v & 0x000Fu) | (((qh >> (2 * s)) << 4) & 0x10u);
+        const uint32_t x1 =
+            ((v >> 8) & 0x000Fu) | (((qh >> (2 * s + 1)) << 4) & 0x10u);
+        const uint32_t x16 =
+            ((v >> 4) & 0x000Fu) | (((qh >> (2 * s + 16)) << 4) & 0x10u);
+        const uint32_t x17 =
+            uint32_t(v >> 12) | (((qh >> (2 * s + 17)) << 4) & 0x10u);
+        dst[2 * s + 0] = T(d * float(x0) + m);
+        dst[2 * s + 1] = T(d * float(x1) + m);
+        dst[2 * s + 16] = T(d * float(x16) + m);
+        dst[2 * s + 17] = T(d * float(x17) + m);
+      }
+    } else {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        const int j = within + i;
+        const uint32_t hi = ((qh >> j) << 4) & 0x10u;
+        const uint8_t lo = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
+        const float q5 = float(uint32_t(lo) | hi);
+        dst[i] = T(d * q5 + m);
+      }
     }
   }
 
@@ -1150,11 +1183,28 @@ struct KqNaxQ4_0BlockLoader {
     const device uint8_t* block_addr = src + block_idx * bytes_per_block;
     const float d = float(*(const device half*)(block_addr + KQ_Q4_0_D_OFFSET));
     const device uint8_t* qs = block_addr + KQ_Q4_0_QS_OFFSET;
+    if constexpr (n_reads == weights_per_block) {
+      // One whole block per thread (the qmm_t tile shape; within == 0).
+      // Pull the 16 data bytes as 8 aligned ushorts (qs sits at +2 of an
+      // 18-byte block, so 2-byte alignment always holds) and extract the
+      // nibbles in registers: the general path issues 32 single-byte
+      // device loads per block and reads every byte twice.
+      const device ushort* qs16 = (const device ushort*)qs;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int j = within + i;
-      const int x = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
-      dst[i] = T(d * float(int(x) - 8));
+      for (short s = 0; s < 8; s++) {
+        const ushort v = qs16[s];
+        dst[2 * s + 0] = T(d * float(int(v & 0x000Fu) - 8));
+        dst[2 * s + 1] = T(d * float(int((v >> 8) & 0x000Fu) - 8));
+        dst[2 * s + 16] = T(d * float(int((v >> 4) & 0x000Fu) - 8));
+        dst[2 * s + 17] = T(d * float(int(v >> 12) - 8));
+      }
+    } else {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        const int j = within + i;
+        const int x = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
+        dst[i] = T(d * float(int(x) - 8));
+      }
     }
   }
 
@@ -1236,11 +1286,25 @@ struct KqNaxQ4_1BlockLoader {
     const float d = float(*(const device half*)(block_addr + KQ_Q4_1_D_OFFSET));
     const float m = float(*(const device half*)(block_addr + KQ_Q4_1_M_OFFSET));
     const device uint8_t* qs = block_addr + KQ_Q4_1_QS_OFFSET;
+    if constexpr (n_reads == weights_per_block) {
+      // One whole block per thread (within == 0): 8 aligned ushorts (qs
+      // sits at +4 of a 20-byte block) replace 32 single-byte loads.
+      const device ushort* qs16 = (const device ushort*)qs;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int j = within + i;
-      const int x = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
-      dst[i] = T(d * float(x) + m);
+      for (short s = 0; s < 8; s++) {
+        const ushort v = qs16[s];
+        dst[2 * s + 0] = T(d * float(v & 0x000Fu) + m);
+        dst[2 * s + 1] = T(d * float((v >> 8) & 0x000Fu) + m);
+        dst[2 * s + 16] = T(d * float((v >> 4) & 0x000Fu) + m);
+        dst[2 * s + 17] = T(d * float(v >> 12) + m);
+      }
+    } else {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        const int j = within + i;
+        const int x = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
+        dst[i] = T(d * float(x) + m);
+      }
     }
   }
 
@@ -1321,16 +1385,37 @@ struct KqNaxQ5_0BlockLoader {
     const device uint8_t* block_addr = src + block_idx * bytes_per_block;
     const float d = float(*(const device half*)(block_addr + KQ_Q5_0_D_OFFSET));
     const device uint8_t* qh_p = block_addr + KQ_Q5_0_QH_OFFSET;
-    const uint32_t qh = uint32_t(qh_p[0]) | (uint32_t(qh_p[1]) << 8) |
-        (uint32_t(qh_p[2]) << 16) | (uint32_t(qh_p[3]) << 24);
+    const device ushort* qh16 = (const device ushort*)qh_p;
+    const uint32_t qh = uint32_t(qh16[0]) | (uint32_t(qh16[1]) << 16);
     const device uint8_t* qs = block_addr + KQ_Q5_0_QS_OFFSET;
+    if constexpr (n_reads == weights_per_block) {
+      // One whole block per thread (within == 0): 8 aligned ushorts (qs
+      // sits at +6 of a 22-byte block) replace 32 single-byte loads.
+      const device ushort* qs16 = (const device ushort*)qs;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int j = within + i;
-      const uint32_t hi = ((qh >> j) << 4) & 0x10u;
-      const uint8_t lo = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
-      const float q5 = float(uint32_t(lo) | hi);
-      dst[i] = T(d * (q5 - 16.0f));
+      for (short s = 0; s < 8; s++) {
+        const ushort v = qs16[s];
+        const uint32_t x0 = (v & 0x000Fu) | (((qh >> (2 * s)) << 4) & 0x10u);
+        const uint32_t x1 =
+            ((v >> 8) & 0x000Fu) | (((qh >> (2 * s + 1)) << 4) & 0x10u);
+        const uint32_t x16 =
+            ((v >> 4) & 0x000Fu) | (((qh >> (2 * s + 16)) << 4) & 0x10u);
+        const uint32_t x17 =
+            uint32_t(v >> 12) | (((qh >> (2 * s + 17)) << 4) & 0x10u);
+        dst[2 * s + 0] = T(d * (float(x0) - 16.0f));
+        dst[2 * s + 1] = T(d * (float(x1) - 16.0f));
+        dst[2 * s + 16] = T(d * (float(x16) - 16.0f));
+        dst[2 * s + 17] = T(d * (float(x17) - 16.0f));
+      }
+    } else {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        const int j = within + i;
+        const uint32_t hi = ((qh >> j) << 4) & 0x10u;
+        const uint8_t lo = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
+        const float q5 = float(uint32_t(lo) | hi);
+        dst[i] = T(d * (q5 - 16.0f));
+      }
     }
   }
 
@@ -2323,11 +2408,25 @@ struct KqNaxIq4_nlBlockLoader {
     const device uint8_t* block_addr = src + block_idx * bytes_per_block;
     const float d = float(*(const device half*)block_addr);
     const device uint8_t* qs = block_addr + KQ_IQ4_NL_QS_OFFSET;
+    if constexpr (n_reads == weights_per_block) {
+      // One whole block per thread (within == 0): 8 aligned ushorts (qs
+      // sits at +2 of an 18-byte block) replace 32 single-byte loads.
+      const device ushort* qs16 = (const device ushort*)qs;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int j = within + i;
-      const int x = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
-      dst[i] = T(d * float(kvalues_iq4nl[x]));
+      for (short s = 0; s < 8; s++) {
+        const ushort v = qs16[s];
+        dst[2 * s + 0] = T(d * float(kvalues_iq4nl[v & 0x000Fu]));
+        dst[2 * s + 1] = T(d * float(kvalues_iq4nl[(v >> 8) & 0x000Fu]));
+        dst[2 * s + 16] = T(d * float(kvalues_iq4nl[(v >> 4) & 0x000Fu]));
+        dst[2 * s + 17] = T(d * float(kvalues_iq4nl[v >> 12]));
+      }
+    } else {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        const int j = within + i;
+        const int x = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
+        dst[i] = T(d * float(kvalues_iq4nl[x]));
+      }
     }
   }
 
