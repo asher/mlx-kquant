@@ -412,7 +412,7 @@ struct KqNaxQ8_0BlockLoader {
 // matrix from DRAM (weight-normalized bandwidth divides by y_tiles;
 // measured near-constant ~270-282 GB/s real traffic M65-256). The host
 // folds 2^log row-tiles into grid.x (grid.x = n_tiles << log); this remap
-// makes consecutive launches cover the folded row-tiles of the SAME
+// makes consecutive launches cover the folded row-tiles of one shared
 // BN-column weight band (~268KB at BN=64), so tiles 2..2^log hit SLC.
 // No-op when grid.x == n_tiles. Folded padding rows (r.y beyond the real
 // row-tile count) must early-return in the wrapper -- threadgroup-uniform,

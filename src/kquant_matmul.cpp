@@ -54,7 +54,7 @@ using mx::Stream;
 // 105-150 GB/s, below their mv paths through M12).
 // db64_min_n: minimum N for which the M33-64 band dispatches the
 // name-suffixed _db (double-buffered Ws) BM=64 qmm_t variant (0 = never).
-// Measured per codec AND per shape: only q6_k and q8_0 win the band at
+// Measured per codec and per shape: only q6_k and q8_0 win the band at
 // all, and both wins are N-gated (K is not the driver: q6_k at
 // [17408x4096] wins +8-12% while [14336x5120] is a wash; the decode
 // projection shapes N<=4096 lose -3 to -11%).

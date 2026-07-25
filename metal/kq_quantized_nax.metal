@@ -117,7 +117,7 @@
   instantiate_kquant_nax_qmm_t_smallbm(codec, bfloat16_t, gs, bits)
 
 // Double-buffered BM=64 qmm_t, name-suffixed _db: dispatched by the host
-// ONLY for the M33-64 decode band (kq_smallbm_policy db64 + KQ_NAX_DB64).
+// solely for the M33-64 decode band (kq_smallbm_policy db64 + KQ_NAX_DB64).
 // As a blanket BM=64 default the doubled Ws cut occupancy (M96+ -3-15%,
 // prefill -3-7%); band-gating keeps the +7-17% M33-64 decode win without
 // the tax. Same tile shape as the stock bm64 kernel; only kWsBufs differs.
