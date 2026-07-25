@@ -79,6 +79,54 @@ static KqSmallBmPolicy kq_smallbm_policy(const std::string& t) {
   return {false, 0}; // iq4_nl, iq2_xs, iq2_s, iq1_m
 }
 
+// Shape-adjusted sub-13 route threshold. The table crossovers were tuned
+// at [17408x5120]; they hold for N >= 8192 but sit too low for strong-mv
+// codecs at decode projection shapes, where the qmm grid is only
+// ceil(N/64) threadgroups and the in-tile K walk serializes (measured at
+// [4096x14336] down, [4096x4096] q/o, [1024x4096] GQA k/v). Weak-mv
+// codecs (q4_k, q2_k, q5_k, iq2_xxs) measured clean at all three shapes
+// and keep the table value; iq4_xs loses its whole M11-12 window at
+// small N and drops the route there.
+static int kq_smallm_route_min(const std::string& t, int N, int K) {
+  int m = kq_smallbm_policy(t).route_min;
+  if (m == 0) {
+    return 0;
+  }
+  if (t == "q6_k" && N >= 100000) {
+    // Vocab-head N shifts the q6_k crossover down one: the mv paths decay
+    // faster with N (M8 at N=248320 reads 237 GB/s vs 307 at N=17408)
+    // while qmm holds 289-299. 100k separates vocab heads (128k-262k)
+    // from the largest dense FFN rows (~53k).
+    return 8;
+  }
+  if (N >= 8192) {
+    return m;
+  }
+  if (t == "q6_k") {
+    return (K >= 8192 || N <= 2048) ? 12 : 11;
+  }
+  if (t == "q8_0") {
+    // At K >= 8192 the M12 qmm (261-265 GB/s) sits inside the mv path's
+    // run-to-run band (253-290): no reliable win anywhere in the sub-13
+    // window, so drop the route. The M13+ BM=32 tile is separate and
+    // keeps its +25% at M16.
+    return K >= 8192 ? 0 : 11;
+  }
+  if (t == "q3_k") {
+    return N <= 2048 ? 8 : m;
+  }
+  if (t == "iq3_xxs") {
+    return N <= 2048 ? 10 : m;
+  }
+  if (t == "iq3_s") {
+    return 12;
+  }
+  if (t == "iq4_xs") {
+    return 0;
+  }
+  return m;
+}
+
 // NAX (tensor-core) GEMM dispatch for the quantized matmul (no biases).
 void qmm_nax(
     const array& x,
@@ -771,14 +819,7 @@ void KQuantMatmul::eval_gpu(
     const char* e = std::getenv("KQ_NAX_SMALL_BM");
     return e == nullptr || std::atoi(e) != 0;
   }();
-  int smallm_min = kq_smallbm_policy(kquant_type_).route_min;
-  // Vocab-head N shifts the q6_k crossover down one: the mv paths decay
-  // faster with N (M8 at N=248320 reads 237 GB/s vs 307 at N=17408) while
-  // qmm holds 289-299. 100k separates vocab heads (128k-262k) from the
-  // largest dense FFN rows (~53k).
-  if (smallm_min == 9 && kquant_type_ == "q6_k" && N >= 100000) {
-    smallm_min = 8;
-  }
+  int smallm_min = kq_smallm_route_min(kquant_type_, N, K);
   if (nax_smallm_route && transpose_ && non_batched && smallm_min > 0 &&
       M >= smallm_min && M <= 12 && kq_is_nax_available() && (K % 64 == 0) &&
       x.dtype() != mx::float32) {
