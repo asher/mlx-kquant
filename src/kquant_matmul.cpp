@@ -771,7 +771,14 @@ void KQuantMatmul::eval_gpu(
     const char* e = std::getenv("KQ_NAX_SMALL_BM");
     return e == nullptr || std::atoi(e) != 0;
   }();
-  const int smallm_min = kq_smallbm_policy(kquant_type_).route_min;
+  int smallm_min = kq_smallbm_policy(kquant_type_).route_min;
+  // Vocab-head N shifts the q6_k crossover down one: the mv paths decay
+  // faster with N (M8 at N=248320 reads 237 GB/s vs 307 at N=17408) while
+  // qmm holds 289-299. 100k separates vocab heads (128k-262k) from the
+  // largest dense FFN rows (~53k).
+  if (smallm_min == 9 && kquant_type_ == "q6_k" && N >= 100000) {
+    smallm_min = 8;
+  }
   if (nax_smallm_route && transpose_ && non_batched && smallm_min > 0 &&
       M >= smallm_min && M <= 12 && kq_is_nax_available() && (K % 64 == 0) &&
       x.dtype() != mx::float32) {
