@@ -52,41 +52,49 @@ using mx::Stream;
 // route_min: lowest M routed from the mv paths to qmm (0 = mv keeps all
 // M <= 12; the flat codecs' and iq1_s's qmm is dequant-ALU-bound at
 // 105-150 GB/s, below their mv paths through M12).
-// db64: the M33-64 band dispatches the name-suffixed _db (double-buffered
-// Ws) BM=64 qmm_t variant. Measured per codec; false until certified.
+// db64_min_n: minimum N for which the M33-64 band dispatches the
+// name-suffixed _db (double-buffered Ws) BM=64 qmm_t variant (0 = never).
+// Measured per codec AND per shape: only q6_k and q8_0 win the band at
+// all, and both wins are N-gated (K is not the driver: q6_k at
+// [17408x4096] wins +8-12% while [14336x5120] is a wash; the decode
+// projection shapes N<=4096 lose -3 to -11%).
 struct KqSmallBmPolicy {
   bool bm32;
   int route_min;
-  bool db64;
+  int db64_min_n;
 };
 static KqSmallBmPolicy kq_smallbm_policy(const std::string& t) {
   if (t == "q4_k" || t == "q3_k") {
-    return {true, 7, false};
+    return {true, 7, 0};
   }
   if (t == "q2_k" || t == "iq3_xxs") {
-    return {true, 8, false};
+    return {true, 8, 0};
   }
-  if (t == "q6_k" || t == "q8_0") {
-    // Only band winners: q6_k +9-17%, q8_0 +2-9% M33-64. All 17 others
-    // measured neutral-to-worse (iq2_s -45%, iq1_s -37% at M64: the DB
-    // loader duplication hurts register-heavy grid dequant, same shape
-    // as the bm32 exclusions).
-    return {true, 9, true};
+  if (t == "q6_k") {
+    // +8-17% at N=17408 (any K), wash at 14336, -3/-11% at 4096/1024.
+    return {true, 9, 16384};
+  }
+  if (t == "q8_0") {
+    // +2-9% at 17408, +2-4% at 14336, ~0 at 4096, -3/-8% at 1024.
+    return {true, 9, 8192};
   }
   if (t == "q5_k" || t == "iq3_s") {
-    return {true, 9, false};
+    return {true, 9, 0};
   }
   if (t == "iq2_xxs") {
-    return {true, 10, false};
+    return {true, 10, 0};
   }
   if (t == "iq4_xs") {
-    return {true, 11, false};
+    return {true, 11, 0};
   }
   if (t == "q4_0" || t == "q4_1" || t == "q5_0" || t == "q5_1" ||
       t == "iq1_s") {
-    return {true, 0, false};
+    // Band A/B: all 17 non-winners neutral-to-worse (iq2_s -45%, iq1_s
+    // -37% at M64: DB loader duplication vs register-heavy grid dequant,
+    // same shape as the bm32 exclusions).
+    return {true, 0, 0};
   }
-  return {false, 0, false}; // iq4_nl, iq2_xs, iq2_s, iq1_m
+  return {false, 0, 0}; // iq4_nl, iq2_xs, iq2_s, iq1_m
 }
 
 // Shape-adjusted sub-13 route threshold. The table crossovers were tuned
@@ -178,9 +186,10 @@ void qmm_nax(
     const char* e = std::getenv("KQ_NAX_DB64");
     return e == nullptr ? -1 : std::atoi(e);
   }();
+  int db64_min_n = kq_smallbm_policy(kquant_type).db64_min_n;
   bool use_db64 = transpose && bm == 64 && M >= 33 && M <= 64 &&
       (db64_mode == 1 ||
-       (db64_mode == -1 && kq_smallbm_policy(kquant_type).db64));
+       (db64_mode == -1 && db64_min_n > 0 && N >= db64_min_n));
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
 
