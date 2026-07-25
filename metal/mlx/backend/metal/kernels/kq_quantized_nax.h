@@ -327,7 +327,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ8_0BlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q8_0_GROUP; // 32
   MLX_MTL_CONST int bytes_per_block = KQ_Q8_0_BLOCK_BYTES; // 34
 
@@ -438,7 +438,15 @@ template <
 
   constexpr int BK = 64;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
-  threadgroup T Ws[BN * BK_padded];
+  using LoaderW = KqNaxQ8_0BlockLoader<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      /*reduction_dim=*/1,
+      /*tgp_size=*/WM * WN * SIMD_SIZE>;
+  constexpr int kWsBufs = (LoaderW::db_safe && BM == 32) ? 2 : 1;
+  threadgroup T Ws[kWsBufs * BN * BK_padded];
 
   if constexpr (batched) {
     kq_adjust_matrix_offsets<T>(
@@ -455,13 +463,6 @@ template <
         tid);
   }
 
-  using LoaderW = KqNaxQ8_0BlockLoader<
-      T,
-      BN,
-      BK,
-      BK_padded,
-      /*reduction_dim=*/1,
-      /*tgp_size=*/WM * WN * SIMD_SIZE>;
   kq_qmm_t_nax_tgp_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
@@ -560,7 +561,15 @@ template <
 
   constexpr int BK = 64;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
-  threadgroup T Ws[BN * BK_padded];
+  using LoaderW = KqNaxQ8_0BlockLoader<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      /*reduction_dim=*/1,
+      /*tgp_size=*/WM * WN * SIMD_SIZE>;
+  constexpr int kWsBufs = (LoaderW::db_safe && BM == 32) ? 2 : 1;
+  threadgroup T Ws[kWsBufs * BN * BK_padded];
 
   kq_adjust_matrix_offsets<T>(
       x,
@@ -581,13 +590,6 @@ template <
       w_strides,
       tid);
 
-  using LoaderW = KqNaxQ8_0BlockLoader<
-      T,
-      BN,
-      BK,
-      BK_padded,
-      /*reduction_dim=*/1,
-      /*tgp_size=*/WM * WN * SIMD_SIZE>;
   kq_qmm_t_nax_tgp_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
