@@ -416,7 +416,8 @@ template <
     int BM,
     int BN,
     int WM,
-    int WN>
+    int WN,
+    bool use_db = false>
 [[kernel]] void kq_q8_0_qmm_t_nax(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -449,10 +450,13 @@ template <
       BK_padded,
       /*reduction_dim=*/1,
       /*tgp_size=*/WM * WN * SIMD_SIZE>;
-  // DB stays gated to BM == 32: at BM == 64 the doubled Ws footprint cut
-  // occupancy and regressed M96+ and prefill 3-7% (measured), while the
-  // M33-64 band is better served by the bm32 tile.
-  constexpr int kWsBufs = (LoaderW::db_safe && BM == 32) ? 2 : 1;
+  // DB is implicit at BM == 32 and opt-in (use_db, the name-suffixed _db
+  // instantiations) at BM == 64 for the M33-64 dispatch band only: as a
+  // blanket BM == 64 default the doubled Ws footprint cut occupancy and
+  // regressed M96+ and prefill 3-7% (measured).
+  static_assert(
+      !use_db || LoaderW::db_safe, "use_db requires a db_safe loader");
+  constexpr int kWsBufs = (LoaderW::db_safe && (BM == 32 || use_db)) ? 2 : 1;
   threadgroup T Ws[kWsBufs * BN * BK_padded];
 
   if constexpr (batched) {
@@ -784,7 +788,8 @@ template <
     int BM,
     int BN,
     int WM,
-    int WN>
+    int WN,
+    bool use_db = false>
 [[kernel]] void kq_q5_1_qmm_t_nax(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -817,7 +822,9 @@ template <
       BK_padded,
       /*reduction_dim=*/1,
       /*tgp_size=*/WM * WN * SIMD_SIZE>;
-  constexpr int kWsBufs = (LoaderW::db_safe && BM == 32) ? 2 : 1;
+  static_assert(
+      !use_db || LoaderW::db_safe, "use_db requires a db_safe loader");
+  constexpr int kWsBufs = (LoaderW::db_safe && (BM == 32 || use_db)) ? 2 : 1;
   threadgroup T Ws[kWsBufs * BN * BK_padded];
 
   if constexpr (batched) {
@@ -1948,7 +1955,8 @@ struct KqNaxQ2_KBlockLoader {
       int BM,                                                              \
       int BN,                                                              \
       int WM,                                                              \
-      int WN>                                                              \
+      int WN,                                                              \
+      bool use_db = false>                                                 \
   [[kernel]] void kq_##codec##_qmm_t_nax(                                  \
       const device uint8_t* w,                                             \
       const device uint8_t* /* scales */,                                  \
@@ -1982,7 +1990,10 @@ struct KqNaxQ2_KBlockLoader {
         BK_padded,                                                         \
         /*reduction_dim=*/1,                                               \
         /*tgp_size=*/WM * WN * SIMD_SIZE>;                                 \
-    constexpr int kWsBufs = (LoaderW::db_safe && BM == 32) ? 2 : 1;        \
+    static_assert(                                                         \
+        !use_db || LoaderW::db_safe, "use_db requires a db_safe loader");  \
+    constexpr int kWsBufs =                                                \
+        (LoaderW::db_safe && (BM == 32 || use_db)) ? 2 : 1;                \
     threadgroup T Ws[kWsBufs * BN * BK_padded];                            \
     if constexpr (batched) {                                               \
       kq_adjust_matrix_offsets<T>(                                         \

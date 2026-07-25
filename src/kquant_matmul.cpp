@@ -52,31 +52,41 @@ using mx::Stream;
 // route_min: lowest M routed from the mv paths to qmm (0 = mv keeps all
 // M <= 12; the flat codecs' and iq1_s's qmm is dequant-ALU-bound at
 // 105-150 GB/s, below their mv paths through M12).
+// db64: the M33-64 band dispatches the name-suffixed _db (double-buffered
+// Ws) BM=64 qmm_t variant. Measured per codec; false until certified.
 struct KqSmallBmPolicy {
   bool bm32;
   int route_min;
+  bool db64;
 };
 static KqSmallBmPolicy kq_smallbm_policy(const std::string& t) {
   if (t == "q4_k" || t == "q3_k") {
-    return {true, 7};
+    return {true, 7, false};
   }
   if (t == "q2_k" || t == "iq3_xxs") {
-    return {true, 8};
+    return {true, 8, false};
   }
-  if (t == "q6_k" || t == "q8_0" || t == "q5_k" || t == "iq3_s") {
-    return {true, 9};
+  if (t == "q6_k" || t == "q8_0") {
+    // Only band winners: q6_k +9-17%, q8_0 +2-9% M33-64. All 17 others
+    // measured neutral-to-worse (iq2_s -45%, iq1_s -37% at M64: the DB
+    // loader duplication hurts register-heavy grid dequant, same shape
+    // as the bm32 exclusions).
+    return {true, 9, true};
+  }
+  if (t == "q5_k" || t == "iq3_s") {
+    return {true, 9, false};
   }
   if (t == "iq2_xxs") {
-    return {true, 10};
+    return {true, 10, false};
   }
   if (t == "iq4_xs") {
-    return {true, 11};
+    return {true, 11, false};
   }
   if (t == "q4_0" || t == "q4_1" || t == "q5_0" || t == "q5_1" ||
       t == "iq1_s") {
-    return {true, 0};
+    return {true, 0, false};
   }
-  return {false, 0}; // iq4_nl, iq2_xs, iq2_s, iq1_m
+  return {false, 0, false}; // iq4_nl, iq2_xs, iq2_s, iq1_m
 }
 
 // Shape-adjusted sub-13 route threshold. The table crossovers were tuned
@@ -159,6 +169,18 @@ void qmm_nax(
   if (small_bm_on && M <= 32 && kq_smallbm_policy(kquant_type).bm32) {
     bm = 32;
   }
+  // M33-64 band: the name-suffixed _db BM=64 variant double-buffers Ws
+  // (bm32 here would stream weights twice via grid.y=2; blanket DB@64
+  // regressed M96+ -3-15% and prefill -3-7%, so it is band-gated).
+  // KQ_NAX_DB64: 0 = off, 1 = force all codecs (crossover finding),
+  // unset = per-codec policy.
+  static const int db64_mode = []() {
+    const char* e = std::getenv("KQ_NAX_DB64");
+    return e == nullptr ? -1 : std::atoi(e);
+  }();
+  bool use_db64 = transpose && bm == 64 && M >= 33 && M <= 64 &&
+      (db64_mode == 1 ||
+       (db64_mode == -1 && kq_smallbm_policy(kquant_type).db64));
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
 
@@ -186,7 +208,8 @@ void qmm_nax(
       "_wn",
       wn,
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
-      batched ? "_batch_1" : "_batch_0");
+      batched ? "_batch_1" : "_batch_0",
+      use_db64 ? "_db" : "");
 
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);

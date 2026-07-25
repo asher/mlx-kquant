@@ -39,7 +39,9 @@ pytestmark = pytest.mark.skipif(
 K = 1024
 # Every routing seam: mv tail (2, 6), per-codec qmm crossover (7-10),
 # NAX BM=32 body/edges (12, 13, 16, 24, 31, 32), BM=64 handoff (33, 64).
-MS = [2, 6, 7, 8, 9, 10, 12, 13, 16, 24, 31, 32, 33, 64]
+# 33/48/64 also cover the _db double-buffered BM=64 band variant where
+# the policy enables it (q6_k, q8_0).
+MS = [2, 6, 7, 8, 9, 10, 12, 13, 16, 24, 31, 32, 33, 48, 64]
 
 ENCODABLE = [
     "q6_k",

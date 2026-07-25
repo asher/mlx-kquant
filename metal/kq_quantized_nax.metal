@@ -115,6 +115,48 @@
   instantiate_kquant_nax_qmm_t_smallbm(codec, float,      gs, bits)          \
   instantiate_kquant_nax_qmm_t_smallbm(codec, float16_t,  gs, bits)          \
   instantiate_kquant_nax_qmm_t_smallbm(codec, bfloat16_t, gs, bits)
+
+// Double-buffered BM=64 qmm_t, name-suffixed _db: dispatched by the host
+// ONLY for the M33-64 decode band (kq_smallbm_policy db64 + KQ_NAX_DB64).
+// As a blanket BM=64 default the doubled Ws cut occupancy (M96+ -3-15%,
+// prefill -3-7%); band-gating keeps the +7-17% M33-64 decode win without
+// the tax. Same tile shape as the stock bm64 kernel; only kWsBufs differs.
+#define instantiate_kquant_nax_qmm_t_db(                                     \
+    type, gs, bits, aligned_N, batched, codec)                               \
+  instantiate_kernel(                                                        \
+      "kquant_" #codec "_qmm_t_nax_" #type "_gs_" #gs "_b_" #bits            \
+          "_bm64_bn64_bk64_wm2_wn2"                                          \
+          "_alN_" #aligned_N "_batch_" #batched "_db",                       \
+      kq_ ## codec ## _qmm_t_nax,                                            \
+      type, gs, bits, aligned_N, batched, 64, 64, 2, 2, true)
+#define instantiate_kquant_nax_qmm_t_db64_for_type(codec, type, gs, bits)    \
+  instantiate_kquant_nax_qmm_t_db(type, gs, bits, true,  1, codec)           \
+  instantiate_kquant_nax_qmm_t_db(type, gs, bits, true,  0, codec)           \
+  instantiate_kquant_nax_qmm_t_db(type, gs, bits, false, 1, codec)           \
+  instantiate_kquant_nax_qmm_t_db(type, gs, bits, false, 0, codec)
+#define instantiate_kquant_nax_db64(codec, gs, bits)                         \
+  instantiate_kquant_nax_qmm_t_db64_for_type(codec, float,      gs, bits)    \
+  instantiate_kquant_nax_qmm_t_db64_for_type(codec, float16_t,  gs, bits)    \
+  instantiate_kquant_nax_qmm_t_db64_for_type(codec, bfloat16_t, gs, bits)
+instantiate_kquant_nax_db64(q6_k, 256, 6)
+instantiate_kquant_nax_db64(q8_0, 32, 8)
+instantiate_kquant_nax_db64(q4_k, 256, 4)
+instantiate_kquant_nax_db64(q5_k, 256, 5)
+instantiate_kquant_nax_db64(q3_k, 256, 3)
+instantiate_kquant_nax_db64(q2_k, 256, 2)
+instantiate_kquant_nax_db64(q5_1, 32, 5)
+instantiate_kquant_nax_db64(q4_0, 32, 4)
+instantiate_kquant_nax_db64(q4_1, 32, 4)
+instantiate_kquant_nax_db64(q5_0, 32, 5)
+instantiate_kquant_nax_db64(iq4_nl, 32, 4)
+instantiate_kquant_nax_db64(iq4_xs, 256, 4)
+instantiate_kquant_nax_db64(iq3_xxs, 256, 3)
+instantiate_kquant_nax_db64(iq3_s, 256, 3)
+instantiate_kquant_nax_db64(iq2_xxs, 256, 2)
+instantiate_kquant_nax_db64(iq2_xs, 256, 2)
+instantiate_kquant_nax_db64(iq2_s, 256, 2)
+instantiate_kquant_nax_db64(iq1_s, 256, 1)
+instantiate_kquant_nax_db64(iq1_m, 256, 1)
 instantiate_kquant_nax_smallbm(q6_k, 256, 6)
 instantiate_kquant_nax_smallbm(q8_0, 32, 8)
 instantiate_kquant_nax_smallbm(q4_k, 256, 4)
