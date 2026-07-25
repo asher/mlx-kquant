@@ -117,6 +117,7 @@
   instantiate_kquant_nax_qmm_t_smallbm(codec, bfloat16_t, gs, bits)
 instantiate_kquant_nax_smallbm(q6_k, 256, 6)
 instantiate_kquant_nax_smallbm(q8_0, 32, 8)
+instantiate_kquant_nax_smallbm(q4_k, 256, 4)
 
 instantiate_kquant_nax_codec(q8_0, 32, 8)
 instantiate_kquant_nax_codec(q5_1, 32, 5)

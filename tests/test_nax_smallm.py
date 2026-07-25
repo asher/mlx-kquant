@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Small-M NAX qmm routing validation (q6_k, q8_0).
+"""Small-M NAX qmm routing validation (q6_k, q8_0, q4_k).
 
 The batch-decode M range routes these codecs through three regimes: the mv
-paths (M 2-8), the double-buffered BM=32 NAX tile (M 9-32), and the classic
-BM=64 NAX tile (M >= 33). This sweeps M across every seam and bounds each
-result against a dequantize-based float32 reference, on both an aligned and
-a ragged N. On non-NAX GPUs the M 9-12 route falls back to the mv paths and
-BM stays 64; the numeric contract is identical, so the assertions hold on
-any Metal device.
+paths (up to a per-codec crossover at M 6-8), the double-buffered BM=32 NAX
+tile (crossover+1 through 32), and the classic BM=64 NAX tile (M >= 33).
+This sweeps M across every seam and bounds each result against a
+dequantize-based float32 reference, on both an aligned and a ragged N. On
+non-NAX GPUs the small-M route falls back to the mv paths and BM stays 64;
+the numeric contract is identical, so the assertions hold on any Metal
+device.
 
 Run locally on GPU (per-phase NAX gate, not hosted CI).
 """
@@ -27,13 +28,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 K = 1024
-# Every routing seam: mv_ext tail (2, 8), NAX BM=32 entry/body/edges
-# (9, 12, 13, 16, 24, 31, 32), BM=64 handoff (33, 64).
-MS = [2, 8, 9, 12, 13, 16, 24, 31, 32, 33, 64]
+# Every routing seam: mv tail (2, 6, 8), per-codec qmm crossover (7-9),
+# NAX BM=32 body/edges (12, 13, 16, 24, 31, 32), BM=64 handoff (33, 64).
+MS = [2, 6, 7, 8, 9, 12, 13, 16, 24, 31, 32, 33, 64]
 
 
 @pytest.mark.parametrize("n_out", [1024, 1000])
-@pytest.mark.parametrize("codec", ["q6_k", "q8_0"])
+@pytest.mark.parametrize("codec", ["q6_k", "q8_0", "q4_k"])
 def test_smallm_routing(codec, n_out):
     mx.random.seed(11)
     wf = mx.random.normal((n_out, K)) * 0.1

@@ -1297,7 +1297,10 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ4_KBlockLoader {
-  MLX_MTL_CONST bool db_safe = false;
+  // Double-buffer safe: no replay cache; (sb_base, src) is a pure position
+  // counter that stays consistent under any next() sequence, including the
+  // construct + single next() + double-next() walk of the DB loop.
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q4_K_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_Q4_K_BLOCK_BYTES;
   MLX_MTL_CONST int sub_block_size = 32;

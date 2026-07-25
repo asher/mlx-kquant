@@ -74,7 +74,9 @@ void qmm_nax(
   // Window ends at 32: above it grid.y goes to 2 and every weight column
   // tile streams once per M-tile, which halves per-weight bandwidth at
   // DRAM-bound (measured: q6_k M48 146 GB/s on bm32 vs 184 on bm64).
-  if (small_bm_on && (kquant_type == "q6_k" || kquant_type == "q8_0") &&
+  if (small_bm_on &&
+      (kquant_type == "q6_k" || kquant_type == "q8_0" ||
+       kquant_type == "q4_k") &&
       M <= 32) {
     bm = 32;
   }
@@ -728,18 +730,23 @@ void KQuantMatmul::eval_gpu(
     return;
   }
 
-  // q6_k / q8_0 M 9-12: the double-buffered BM=32 NAX tile beats the mv
-  // paths' wide-M decay (q6_k 274-305 vs 221-254 GB/s cold-stream; q8_0
-  // 379-383 vs 277-354); the mv paths keep M <= 8 where they hold 315-536
-  // (q6_k) / 403-480 (q8_0). KQ_NAX_SMALL_BM=0 restores the old routing
-  // (same switch that picks the BM=32 tile in qmm_nax).
+  // Small-M qmm route: the double-buffered BM=32 NAX tile beats the mv
+  // paths' wide-M decay above a per-codec crossover (cold-stream GB/s):
+  //   q6_k M>=9: 274-305 vs 221-254; mv keeps M<=8 at 315-536
+  //   q8_0 M>=9: 379-383 vs 277-354; mv keeps M<=8 at 403-480
+  //   q4_k M>=7: 249-287 vs 149-256; mv keeps M<=6 at 293-387
+  // KQ_NAX_SMALL_BM=0 restores the old routing (same switch that picks
+  // the BM=32 tile in qmm_nax).
   static const bool nax_smallm_route = []() {
     const char* e = std::getenv("KQ_NAX_SMALL_BM");
     return e == nullptr || std::atoi(e) != 0;
   }();
-  if (nax_smallm_route && transpose_ && non_batched && M >= 9 && M <= 12 &&
-      (kquant_type_ == "q6_k" || kquant_type_ == "q8_0") &&
-      kq_is_nax_available() && (K % 64 == 0) && x.dtype() != mx::float32) {
+  const int smallm_min = kquant_type_ == "q4_k"            ? 7
+      : (kquant_type_ == "q6_k" || kquant_type_ == "q8_0") ? 9
+                                                           : 0;
+  if (nax_smallm_route && transpose_ && non_batched && smallm_min > 0 &&
+      M >= smallm_min && M <= 12 && kq_is_nax_available() && (K % 64 == 0) &&
+      x.dtype() != mx::float32) {
     qmm(x,
         w,
         scales,
