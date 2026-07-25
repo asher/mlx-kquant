@@ -374,6 +374,29 @@ instantiate_mv_ext_all(iq2_s, 256, 2)
 instantiate_mv_ext_all(iq1_s, 256, 1)
 instantiate_mv_ext_all(iq1_m, 256, 1)
 
+// Wide-M rows-per-thread experiment (KQ_MV_EXT_NR=2): each thread owns nr0=2
+// output rows and shares one activation load across them, halving activation
+// cache traffic. q6_k only, M 5-12 where the nr0=1 decay bites. Suffix _nr2.
+#define instantiate_mv_ext_nr2(codec, type, gs, bits, m)                \
+  instantiate_kernel(                                                   \
+      "kquant_" #codec "_mv_ext_" #type "_gs_" #gs "_b_" #bits "_m" #m  \
+      "_nr2",                                                           \
+      kq_ ## codec ## _mv_ext_nr, type, m, 2, 8, 2)
+#define instantiate_mv_ext_nr2_for_type(codec, gs, bits, type)          \
+  instantiate_mv_ext_nr2(codec, type, gs, bits, 5)                      \
+  instantiate_mv_ext_nr2(codec, type, gs, bits, 6)                      \
+  instantiate_mv_ext_nr2(codec, type, gs, bits, 7)                      \
+  instantiate_mv_ext_nr2(codec, type, gs, bits, 8)                      \
+  instantiate_mv_ext_nr2(codec, type, gs, bits, 9)                      \
+  instantiate_mv_ext_nr2(codec, type, gs, bits, 10)                     \
+  instantiate_mv_ext_nr2(codec, type, gs, bits, 11)                     \
+  instantiate_mv_ext_nr2(codec, type, gs, bits, 12)
+#define instantiate_mv_ext_nr2_all(codec, gs, bits)                     \
+  instantiate_mv_ext_nr2_for_type(codec, gs, bits, float)               \
+  instantiate_mv_ext_nr2_for_type(codec, gs, bits, bfloat16_t)          \
+  instantiate_mv_ext_nr2_for_type(codec, gs, bits, float16_t)
+instantiate_mv_ext_nr2_all(q6_k, 256, 6)
+
 #define instantiate_kquant_q3_k_for_type(type)                          \
   instantiate_kquant_batched(verify_qmv, type, 256, 3, 0, q3_k)          \
   instantiate_kquant_batched(qmv_fast, type, 256, 3, 0, q3_k)            \

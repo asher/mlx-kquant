@@ -465,7 +465,16 @@ void verify_mv_ext(
     const std::string& kquant_type) {
   constexpr int nsg = 2;
   constexpr int nxpsg = 8;
-  constexpr int rows_per_tg = (32 / nxpsg) * nsg; // nypsg * nsg = 8
+  // Wide-M rows-per-thread experiment (KQ_MV_EXT_NR=2): each thread owns two
+  // consecutive output rows and shares one activation load across them,
+  // halving the M*N*K activation cache traffic that dominates past M~5.
+  // q6_k-only instantiations for now; default 1 = shipped behavior.
+  static const int mv_ext_nr = []() {
+    const char* e = std::getenv("KQ_MV_EXT_NR");
+    return e != nullptr ? std::atoi(e) : 1;
+  }();
+  const bool use_nr2 = mv_ext_nr == 2 && M >= 5 && kquant_type == "q6_k";
+  const int rows_per_tg = (32 / nxpsg) * nsg * (use_nr2 ? 2 : 1);
   MTL::Size group_dims(32, nsg, 1);
   MTL::Size grid_dims((N + rows_per_tg - 1) / rows_per_tg, 1, 1);
 
@@ -481,7 +490,8 @@ void verify_mv_ext(
       "_b_",
       bits,
       "_m",
-      M);
+      M,
+      use_nr2 ? "_nr2" : "");
 
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
