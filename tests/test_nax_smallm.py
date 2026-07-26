@@ -39,9 +39,15 @@ pytestmark = pytest.mark.skipif(
 K = 1024
 # Every routing seam: mv tail (2, 6), per-codec qmm crossover (7-10),
 # NAX BM=32 body/edges (12, 13, 16, 24, 31, 32), BM=64 handoff (33, 64).
-# 33/48/64 also cover the _db double-buffered BM=64 band variant where
-# the policy enables it (q6_k, q8_0).
+# The _db double-buffered variant of the 33-64 band is N-gated far above
+# these widths; test_db64_band_dispatch covers it at the policy floors.
 MS = [2, 6, 7, 8, 9, 10, 12, 13, 16, 24, 31, 32, 33, 48, 64]
+
+# Per-codec db64_min_n floors (kq_smallbm_policy). At these N the M33-64
+# band dispatches the name-suffixed _db kernels on the default route; the
+# small-N matrix below never reaches them, and env forcing cannot stand
+# in because the mode reads are process-static.
+DB64_N = {"q6_k": 16384, "q8_0": 8192, "q4_1": 8192, "q5_1": 8192, "q5_0": 8192}
 
 ENCODABLE = [
     "q6_k",
@@ -78,6 +84,46 @@ def test_smallm_routing(codec, n_out):
     ref_w = kq.dequantize(w, s, codec).astype(mx.float32).T
     mx.eval(w, s, ref_w)
     _sweep(codec, w, s, ref_w, n_out)
+
+
+@pytest.mark.parametrize("n_out", [1024, 1000])
+@pytest.mark.parametrize("codec", ENCODABLE)
+def test_bm128_band(codec, n_out):
+    # M inside the even-ceil(M/64) window: per the bm128_min_m tier the
+    # codec either takes the BM=128 tile or stays on BM=64 -- the numeric
+    # contract is identical, so this pins both routings (and the padded
+    # M224 entry exercises the 32-dead-row tile edge).
+    mx.random.seed(11)
+    wf = mx.random.normal((n_out, K)) * 0.1
+    w, s = kq.quantize(wf, codec)
+    ref_w = kq.dequantize(w, s, codec).astype(mx.float32).T
+    mx.eval(w, s, ref_w)
+    for m in (224, 256):
+        x = (mx.random.normal((m, K)) * 0.5).astype(mx.bfloat16)
+        y = kq.quantized_matmul(x, w, s, codec, transpose=True)
+        y = y.astype(mx.float32)
+        ref = x.astype(mx.float32) @ ref_w
+        mx.eval(y, ref)
+        err = float((mx.abs(y - ref)).max() / (mx.abs(ref).max() + 1e-6))
+        assert err < 2e-2, f"{codec} bm128 N{n_out} M{m}: rel err {err:.3e}"
+
+
+@pytest.mark.parametrize("codec", sorted(DB64_N))
+def test_db64_band_dispatch(codec):
+    n_out = DB64_N[codec]
+    mx.random.seed(11)
+    wf = mx.random.normal((n_out, K)) * 0.1
+    w, s = kq.quantize(wf, codec)
+    ref_w = kq.dequantize(w, s, codec).astype(mx.float32).T
+    mx.eval(w, s, ref_w)
+    for m in (33, 48, 64):
+        x = (mx.random.normal((m, K)) * 0.5).astype(mx.bfloat16)
+        y = kq.quantized_matmul(x, w, s, codec, transpose=True)
+        y = y.astype(mx.float32)
+        ref = x.astype(mx.float32) @ ref_w
+        mx.eval(y, ref)
+        err = float((mx.abs(y - ref)).max() / (mx.abs(ref).max() + 1e-6))
+        assert err < 2e-2, f"{codec} db64 N{n_out} M{m}: rel err {err:.3e}"
 
 
 @pytest.mark.parametrize("n_out", [1024, 1000])
