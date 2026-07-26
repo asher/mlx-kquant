@@ -392,8 +392,8 @@ struct KqNaxQ8_0BlockLoader {
 #pragma unroll
       for (short s = 0; s < 16; s++) {
         const ushort v = q16[s];
-        dst[2 * s + 0] = T(d * float(char(v & 0xFFu)));
-        dst[2 * s + 1] = T(d * float(char(v >> 8)));
+        dst[2 * s + 0] = T(d * float(int8_t(v & 0xFFu)));
+        dst[2 * s + 1] = T(d * float(int8_t(v >> 8)));
       }
     } else {
 #pragma unroll

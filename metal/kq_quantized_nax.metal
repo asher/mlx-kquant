@@ -111,8 +111,8 @@
   instantiate_kquant_nax_qmm_t(type, gs, bits, true,  0, 32, 64, 2, 2, codec) \
   instantiate_kquant_nax_qmm_t(type, gs, bits, false, 1, 32, 64, 2, 2, codec) \
   instantiate_kquant_nax_qmm_t(type, gs, bits, false, 0, 32, 64, 2, 2, codec)
+// No float x variant, same reachability argument as the db64 macro.
 #define instantiate_kquant_nax_smallbm(codec, gs, bits)                      \
-  instantiate_kquant_nax_qmm_t_smallbm(codec, float,      gs, bits)          \
   instantiate_kquant_nax_qmm_t_smallbm(codec, float16_t,  gs, bits)          \
   instantiate_kquant_nax_qmm_t_smallbm(codec, bfloat16_t, gs, bits)
 
@@ -129,34 +129,26 @@
           "_alN_" #aligned_N "_batch_" #batched "_db",                       \
       kq_ ## codec ## _qmm_t_nax,                                            \
       type, gs, bits, aligned_N, batched, 64, 64, 2, 2, true)
+// No float x variant: kquant_ops promotes float32 activations to bf16
+// before the primitive and the qmm_nax route is gated on
+// x.dtype() != float32, so a float lookup can never happen. Codecs are
+// the five whose policy can enable the band (db64_min_n > 0); probing a
+// crossover on another codec now needs its instantiation restored and a
+// rebuild, not just KQ_NAX_DB64=1 (the host availability-gates on the
+// policy so the force lever cannot look up a missing kernel).
 #define instantiate_kquant_nax_qmm_t_db64_for_type(codec, type, gs, bits)    \
   instantiate_kquant_nax_qmm_t_db(type, gs, bits, true,  1, codec)           \
   instantiate_kquant_nax_qmm_t_db(type, gs, bits, true,  0, codec)           \
   instantiate_kquant_nax_qmm_t_db(type, gs, bits, false, 1, codec)           \
   instantiate_kquant_nax_qmm_t_db(type, gs, bits, false, 0, codec)
 #define instantiate_kquant_nax_db64(codec, gs, bits)                         \
-  instantiate_kquant_nax_qmm_t_db64_for_type(codec, float,      gs, bits)    \
   instantiate_kquant_nax_qmm_t_db64_for_type(codec, float16_t,  gs, bits)    \
   instantiate_kquant_nax_qmm_t_db64_for_type(codec, bfloat16_t, gs, bits)
 instantiate_kquant_nax_db64(q6_k, 256, 6)
 instantiate_kquant_nax_db64(q8_0, 32, 8)
-instantiate_kquant_nax_db64(q4_k, 256, 4)
-instantiate_kquant_nax_db64(q5_k, 256, 5)
-instantiate_kquant_nax_db64(q3_k, 256, 3)
-instantiate_kquant_nax_db64(q2_k, 256, 2)
 instantiate_kquant_nax_db64(q5_1, 32, 5)
-instantiate_kquant_nax_db64(q4_0, 32, 4)
 instantiate_kquant_nax_db64(q4_1, 32, 4)
 instantiate_kquant_nax_db64(q5_0, 32, 5)
-instantiate_kquant_nax_db64(iq4_nl, 32, 4)
-instantiate_kquant_nax_db64(iq4_xs, 256, 4)
-instantiate_kquant_nax_db64(iq3_xxs, 256, 3)
-instantiate_kquant_nax_db64(iq3_s, 256, 3)
-instantiate_kquant_nax_db64(iq2_xxs, 256, 2)
-instantiate_kquant_nax_db64(iq2_xs, 256, 2)
-instantiate_kquant_nax_db64(iq2_s, 256, 2)
-instantiate_kquant_nax_db64(iq1_s, 256, 1)
-instantiate_kquant_nax_db64(iq1_m, 256, 1)
 // BM=128 qmm_t tile (wm2 wn2 -> TM=4, TN=2, paired-N matmad; generic in
 // TM so no pairing-branch trap). The M>64 regime is bound by
 // per-threadgroup work (loader dequant + MMA issue, real DRAM ~half
@@ -171,8 +163,8 @@ instantiate_kquant_nax_db64(iq1_m, 256, 1)
   instantiate_kquant_nax_qmm_t(type, gs, bits, true,  0, 128, 64, 2, 2, codec) \
   instantiate_kquant_nax_qmm_t(type, gs, bits, false, 1, 128, 64, 2, 2, codec) \
   instantiate_kquant_nax_qmm_t(type, gs, bits, false, 0, 128, 64, 2, 2, codec)
+// No float x variant, same reachability argument as the db64 macro.
 #define instantiate_kquant_nax_bm128(codec, gs, bits)                        \
-  instantiate_kquant_nax_qmm_t_bm128(codec, float,      gs, bits)            \
   instantiate_kquant_nax_qmm_t_bm128(codec, float16_t,  gs, bits)            \
   instantiate_kquant_nax_qmm_t_bm128(codec, bfloat16_t, gs, bits)
 instantiate_kquant_nax_bm128(q6_k, 256, 6)
