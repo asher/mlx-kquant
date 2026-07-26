@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.6]
+
 ### Added
 - BM=32 double-buffered NAX qmm tile for the M<=32 batch-decode band, where
   the BM=64 tile wastes up to 75% of MMA issues on row padding. Rolled out
