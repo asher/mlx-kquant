@@ -41,7 +41,7 @@ on a stock `mlx` wheel.
 
 ## Install
 
-**macOS 26.2 (Tahoe) or later on Apple Silicon.** Prebuilt wheels (CPython 3.10-3.13):
+**macOS 26.2 (Tahoe) or later on Apple Silicon.** Prebuilt wheels (CPython 3.10-3.14):
 
 ```sh
 pip install mlx-kquant            # the K-quant ops + precompiled metallib
