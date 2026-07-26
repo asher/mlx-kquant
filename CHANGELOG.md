@@ -6,7 +6,45 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- BM=32 double-buffered NAX qmm tile for the M<=32 batch-decode band, where
+  the BM=64 tile wastes up to 75% of MMA issues on row padding. Rolled out
+  codec by codec (q6_k, q8_0, q4_k, q5_k, q2_k/q3_k, then all 19 codecs)
+  behind a measured per-codec policy; q3_k M12 +65% and q2_k M12 +110% at
+  the wide decode shape.
+- Name-suffixed `_db` double-buffered BM=64 qmm_t variant for the M33-64
+  band, N-gated per codec (q6_k >= 16384; q8_0/q4_1/q5_1/q5_0 >= 8192):
+  blanket double-buffering at BM=64 regressed M96+ and prefill, so only the
+  band and the codecs that measured wins carry it.
+- BM=128 qmm_t tile for M >= 193 when ceil(M/64) is even (odd ceilings add
+  64 padding rows), with per-codec entry floors from a 19-codec paired ABBA:
+  193 for q6_k and the IQ grid codecs (+4-27%, the taller tile amortizes
+  grid-dequant ALU over 2x rows), 449 for the K-quants and byte-loaders that
+  lose the padded M224 cell, 961 for the flat quartet. `KQ_NAX_BM128` is
+  tri-state like `KQ_NAX_DB64`.
+- Flat-codec ushort loader fast paths: the q4_0/q4_1/q5_0/q5_1/q8_0/iq4_nl
+  block loaders read each 32-weight block as aligned ushorts instead of 32
+  single-byte device loads (q4_0 113 -> 306 GB/s at the M16 wide decode
+  shape; q8_0 +15-25% at M48-128).
+- Batch-decode routing levers documented in docs/kernels.md: `KQ_NAX_SMALL_BM`,
+  `KQ_NAX_BM128`, `KQ_NAX_DB64`, `KQ_FORCE_QMM_MIN_M`, plus the two
+  falsified-but-kept probe levers `KQ_NAX_SWIZZLE` (row-tile traversal
+  swizzle; the M>64 band is per-threadgroup-bound, not DRAM-bound) and
+  `KQ_MV_EXT_NR` (two-rows-per-thread mv_ext; no faster than shipped).
+
 ### Changed
+- Transpose decode shapes above a per-codec crossover (M 6-9, with per-codec
+  small-N/big-K floors, vocab-head N shifting q6_k to M >= 8) now route to
+  the NAX qmm instead of riding the mat-vec paths to M 13; the mat-vec
+  kernels decay past M~5 (q6_k M >= 9: 274-305 GB/s on qmm vs 221-254 cold).
+- The q6_k/q5_k/q3_k/q2_k loaders drop their replay caches (scale/qh/pair/
+  hmask), unifying each to one position-generic body; the caches only added
+  register state, so the default BM=64 prefill path also speeds up (q5_k
+  M2048 +13%).
+- Metallib instantiation trim: `_db` variants exist only for the five
+  policy-enabled codecs and the new tile macros (smallbm, db64, bm128) drop
+  their float-x variants (float32 x is promoted to bf16 before the
+  primitive); 105.7 -> 93.2 MB.
 - Decode matmul width gate: M==2 now routes to the flat mat-vec
   (`kq_<codec>_mv_ext`) for every codec except q4_k and q8_0, where
   `verify_qmv` measures faster DRAM-cold. The K-quants and legacy codecs
