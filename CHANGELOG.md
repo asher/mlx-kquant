@@ -17,11 +17,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   blanket double-buffering at BM=64 regressed M96+ and prefill, so only the
   band and the codecs that measured wins carry it.
 - BM=128 qmm_t tile for M >= 193 when ceil(M/64) is even (odd ceilings add
-  64 padding rows), with per-codec entry floors from a 19-codec paired ABBA:
-  193 for q6_k and the IQ grid codecs (+4-27%, the taller tile amortizes
-  grid-dequant ALU over 2x rows), 449 for the K-quants and byte-loaders that
-  lose the padded M224 cell, 961 for the flat quartet. `KQ_NAX_BM128` is
-  tri-state like `KQ_NAX_DB64`.
+  64 padding rows), with per-codec entry floors from a 19-codec paired ABBA
+  (`benchmarks/bench_qmm_bm128_ab.py`): 193 for q6_k and the IQ grid codecs
+  (+4-27%, the taller tile amortizes grid-dequant ALU over 2x rows), 449
+  for the K-quants and byte-loaders that lose the padded M224 cell, 961 for
+  the flat quartet. `KQ_NAX_BM128` is tri-state like `KQ_NAX_DB64`, plus a
+  floor-dropping probe mode `2`.
 - Flat-codec ushort loader fast paths: the q4_0/q4_1/q5_0/q5_1/q8_0/iq4_nl
   block loaders read each 32-weight block as aligned ushorts instead of 32
   single-byte device loads (q4_0 113 -> 306 GB/s at the M16 wide decode
@@ -44,7 +45,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Metallib instantiation trim: `_db` variants exist only for the five
   policy-enabled codecs and the new tile macros (smallbm, db64, bm128) drop
   their float-x variants (float32 x is promoted to bf16 before the
-  primitive); 105.7 -> 93.2 MB.
+  primitive). Release-over-release the metallib goes 80.6 MB (0.3.5) ->
+  93.2 MB; the trim recovers 12.5 MB of what the new tiles would otherwise
+  have added.
 - Decode matmul width gate: M==2 now routes to the flat mat-vec
   (`kq_<codec>_mv_ext`) for every codec except q4_k and q8_0, where
   `verify_qmv` measures faster DRAM-cold. The K-quants and legacy codecs

@@ -61,7 +61,8 @@ using mx::Stream;
 // bm128_min_m: lowest M at which the M>=193 band takes the BM=128 tile
 // (still inside the even-ceil(M/64) window; never 0, every codec wins
 // somewhere). Measured per codec at [17408x5120] and [4096x14336],
-// M 224/256/512/1024, paired-process ABBA (tools/qmm-bm128-ab.py):
+// M 224/256/512/1024, paired-process ABBA on M5 Max
+// (benchmarks/bench_qmm_bm128_ab.py; re-measure on new silicon):
 // - 193: wins from the band start. The dequant-ALU-heavy grid codecs
 //   are the strongest (iq2_s/iq2_xs/iq4_xs +4 to +27% everywhere
 //   measured; the taller tile amortizes dequant over twice the rows);
@@ -231,14 +232,18 @@ void qmm_nax(
   // even. The entry floor is per-codec (bm128_min_m: the 19-codec ABBA
   // showed the shallow band flipping sign by loader weight, see the
   // policy table). KQ_NAX_BM128: 0 = off, 1 = force floor 193 for all
-  // codecs (crossover finding), unset = per-codec policy.
+  // codecs (crossover finding), 2 = drop the floor entirely (probes the
+  // M65-128 wash band, symmetric with KQ_NAX_SMALL_BM=2), unset =
+  // per-codec policy.
   static const int bm128_mode = []() {
     const char* e = std::getenv("KQ_NAX_BM128");
     return e == nullptr ? -1 : std::atoi(e);
   }();
   int bm128_min_m = kq_smallbm_policy(kquant_type).bm128_min_m;
   if (bm128_mode != 0 && transpose && ((M + 63) / 64) % 2 == 0 &&
-      (bm128_mode == 1 ? M >= 193 : M >= bm128_min_m)) {
+      (bm128_mode == 1       ? M >= 193
+           : bm128_mode == 2 ? true
+                             : M >= bm128_min_m)) {
     bm = 128;
   }
   // M33-64 band: the name-suffixed _db BM=64 variant double-buffers Ws

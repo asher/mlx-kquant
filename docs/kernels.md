@@ -49,8 +49,10 @@ Tuning levers (defaults are right for normal use):
 - `KQ_NAX_SMALL_BM` - small-M routing. `0` restores the old routing (mat-vec paths below M 13 and
   no BM=32 tile), `2` forces BM=32 for policy-excluded codecs, unset or `1` follows the per-codec
   policy.
-- `KQ_NAX_BM128` - BM=128 band. `0` off, `1` forces the floor to M 193 for every codec, unset
-  follows the per-codec entry floors (193/449/961 tiers from the 19-codec ABBA).
+- `KQ_NAX_BM128` - BM=128 band. `0` off, `1` forces the floor to M 193 for every codec, `2` drops
+  the floor entirely (any even ceil(M/64), probing the M65-128 wash band), unset follows the
+  per-codec entry floors (193/449/961 tiers, measured on M5 Max by
+  `benchmarks/bench_qmm_bm128_ab.py`; re-run it before trusting them on new silicon).
 - `KQ_NAX_DB64` - double-buffered M 33-64 band. `0` off, `1` drops the N floor, unset follows the
   per-codec N floors. Only the five policy-enabled codecs (q6_k, q8_0, q4_1, q5_1, q5_0) carry
   `_db` instantiations, so `1` is bounded by availability; probing another codec needs its
