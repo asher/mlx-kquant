@@ -6,6 +6,18 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.7]
+
+Build and publish cp314 wheel
+
+### Added
+- CPython 3.14 in the CI build/test matrix.
+
+### Changed
+- `pypa/cibuildwheel` v2.21 -> v4.1.1 in the release workflow. cp314 is only
+  built by default from v3.1.0 on, so the old pin would have silently dropped
+  the new `cp314-*` entry from `[tool.cibuildwheel] build`.
+
 ## [0.3.6]
 
 ### Added

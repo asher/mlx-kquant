@@ -52,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12", "3.13"]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -155,19 +155,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      # The Metal-free build. Every op's eval_gpu is behind #ifdef _METAL_
-      # (-D_METAL_ is attached only by the macOS mlx build's MLXConfig), so on
-      # Linux they compile to throwing stubs and all numerics run through the
-      # scalar eval_cpu paths. This proves mlx-kquant builds and its CPU suite
-      # passes against the stock Linux mlx==0.31.2 wheel with no Apple toolchain.
-      #
-      # mlx[cpu]: the base `mlx` wheel does not bundle libmlx.so (core.so has it
-      # as NEEDED); the backend ships separately. macOS auto-pulls mlx-metal, but
-      # Linux has no default backend, so install the CPU one (mlx[cpu] ->
-      # mlx-cpu) to get libmlx.so at mlx/lib/. setuptools/wheel are pre-installed
-      # because the editable install runs --no-build-isolation. One Python
-      # version suffices: nanobind builds a STABLE_ABI (abi3) module, and the
-      # macOS job already covers the Python matrix.
+      # Metal-free build: eval_gpu sits behind #ifdef _METAL_, set only by the
+      # macOS MLXConfig, so every op here runs its scalar eval_cpu path.
+      # mlx[cpu] because the base Linux wheel ships no libmlx.so.
+      # One Python version: the macOS job sweeps the matrix.
       - name: Build extension (CPU-only) + test deps
         run: |
           python -m pip install --upgrade pip

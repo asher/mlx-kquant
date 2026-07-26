@@ -34,8 +34,9 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match mlx_kquant/_version.py ($pkg_version)"
             exit 1
           fi
+      # v3.1.0+ is required for cp314; older versions drop it silently.
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.21
+        uses: pypa/cibuildwheel@v4.1.1
       - uses: actions/upload-artifact@v7
         with:
           name: wheels
