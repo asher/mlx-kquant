@@ -5,10 +5,11 @@ The batch-decode M range routes every NAX codec through three regimes: the
 mv paths (up to a per-codec crossover at M 6-9), the double-buffered BM=32
 NAX tile (crossover through 32), and the classic BM=64 NAX tile (M >= 33).
 This sweeps M across every seam and bounds each result against a
-dequantize-based float32 reference, on both an aligned and a ragged N. On
-non-NAX GPUs the small-M route falls back to the mv paths and BM stays 64;
-the numeric contract is identical, so the assertions hold on any Metal
-device.
+dequantize-based float32 reference, on both an aligned and a ragged N. The
+BM=128 band tests extend the sweep so every codec dispatches the BM=128
+tile on at least one tier cell. On non-NAX GPUs the small-M route falls
+back to the mv paths and BM stays 64; the numeric contract is identical,
+so the assertions hold on any Metal device.
 
 Encodable codecs quantize a fresh tensor; IQ codecs use the synthetic-wire
 helpers from test_codecs (gguf-py dequantize as reference), since the
@@ -43,6 +44,14 @@ K = 1024
 # these widths; test_db64_band_dispatch covers it at the policy floors.
 MS = [2, 6, 7, 8, 9, 10, 12, 13, 16, 24, 31, 32, 33, 48, 64]
 
+# BM=128 band: every entry has even ceil(M/64). M224/256 dispatch the
+# tile for the 193 tier only (q6_k plus the IQ grid codecs); M512 adds
+# the 449 tier and M1024 the 961 tier, so every codec takes BM=128 in at
+# least one cell and stays on BM=64 in at least one other. The numeric
+# contract is identical on both routings, and the padded M224 entry
+# exercises the 32-dead-row tile edge.
+BM128_MS = [224, 256, 512, 1024]
+
 # Per-codec db64_min_n floors (kq_smallbm_policy). At these N the M33-64
 # band dispatches the name-suffixed _db kernels on the default route; the
 # small-N matrix below never reaches them, and env forcing cannot stand
@@ -64,8 +73,8 @@ ENCODABLE = [
 IQ = [c for c in CODECS if c.startswith("iq")]
 
 
-def _sweep(codec, w, s, ref_w, n_out):
-    for m in MS:
+def _sweep(codec, w, s, ref_w, n_out, ms=MS):
+    for m in ms:
         x = (mx.random.normal((m, K)) * 0.5).astype(mx.bfloat16)
         y = kq.quantized_matmul(x, w, s, codec, transpose=True)
         y = y.astype(mx.float32)
@@ -75,60 +84,16 @@ def _sweep(codec, w, s, ref_w, n_out):
         assert err < 2e-2, f"{codec} N{n_out} M{m}: rel err {err:.3e}"
 
 
-@pytest.mark.parametrize("n_out", [1024, 1000])
-@pytest.mark.parametrize("codec", ENCODABLE)
-def test_smallm_routing(codec, n_out):
+def _encodable_setup(codec, n_out):
     mx.random.seed(11)
     wf = mx.random.normal((n_out, K)) * 0.1
     w, s = kq.quantize(wf, codec)
     ref_w = kq.dequantize(w, s, codec).astype(mx.float32).T
     mx.eval(w, s, ref_w)
-    _sweep(codec, w, s, ref_w, n_out)
+    return w, s, ref_w
 
 
-@pytest.mark.parametrize("n_out", [1024, 1000])
-@pytest.mark.parametrize("codec", ENCODABLE)
-def test_bm128_band(codec, n_out):
-    # M inside the even-ceil(M/64) window: per the bm128_min_m tier the
-    # codec either takes the BM=128 tile or stays on BM=64 -- the numeric
-    # contract is identical, so this pins both routings (and the padded
-    # M224 entry exercises the 32-dead-row tile edge).
-    mx.random.seed(11)
-    wf = mx.random.normal((n_out, K)) * 0.1
-    w, s = kq.quantize(wf, codec)
-    ref_w = kq.dequantize(w, s, codec).astype(mx.float32).T
-    mx.eval(w, s, ref_w)
-    for m in (224, 256):
-        x = (mx.random.normal((m, K)) * 0.5).astype(mx.bfloat16)
-        y = kq.quantized_matmul(x, w, s, codec, transpose=True)
-        y = y.astype(mx.float32)
-        ref = x.astype(mx.float32) @ ref_w
-        mx.eval(y, ref)
-        err = float((mx.abs(y - ref)).max() / (mx.abs(ref).max() + 1e-6))
-        assert err < 2e-2, f"{codec} bm128 N{n_out} M{m}: rel err {err:.3e}"
-
-
-@pytest.mark.parametrize("codec", sorted(DB64_N))
-def test_db64_band_dispatch(codec):
-    n_out = DB64_N[codec]
-    mx.random.seed(11)
-    wf = mx.random.normal((n_out, K)) * 0.1
-    w, s = kq.quantize(wf, codec)
-    ref_w = kq.dequantize(w, s, codec).astype(mx.float32).T
-    mx.eval(w, s, ref_w)
-    for m in (33, 48, 64):
-        x = (mx.random.normal((m, K)) * 0.5).astype(mx.bfloat16)
-        y = kq.quantized_matmul(x, w, s, codec, transpose=True)
-        y = y.astype(mx.float32)
-        ref = x.astype(mx.float32) @ ref_w
-        mx.eval(y, ref)
-        err = float((mx.abs(y - ref)).max() / (mx.abs(ref).max() + 1e-6))
-        assert err < 2e-2, f"{codec} db64 N{n_out} M{m}: rel err {err:.3e}"
-
-
-@pytest.mark.parametrize("n_out", [1024, 1000])
-@pytest.mark.parametrize("codec", IQ)
-def test_smallm_routing_iq(codec, n_out):
+def _iq_setup(codec, n_out):
     from gguf import quants
 
     gtype, wpb, bpb, _, _ = CODECS[codec]
@@ -141,4 +106,39 @@ def test_smallm_routing_iq(codec, n_out):
     s = mx.zeros((1,), dtype=mx.uint8)
     mx.eval(w, s, ref_w)
     mx.random.seed(11)
+    return w, s, ref_w
+
+
+@pytest.mark.parametrize("n_out", [1024, 1000])
+@pytest.mark.parametrize("codec", ENCODABLE)
+def test_smallm_routing(codec, n_out):
+    w, s, ref_w = _encodable_setup(codec, n_out)
+    _sweep(codec, w, s, ref_w, n_out)
+
+
+@pytest.mark.parametrize("n_out", [1024, 1000])
+@pytest.mark.parametrize("codec", ENCODABLE)
+def test_bm128_band(codec, n_out):
+    w, s, ref_w = _encodable_setup(codec, n_out)
+    _sweep(codec, w, s, ref_w, n_out, ms=BM128_MS)
+
+
+@pytest.mark.parametrize("n_out", [1024, 1000])
+@pytest.mark.parametrize("codec", IQ)
+def test_bm128_band_iq(codec, n_out):
+    w, s, ref_w = _iq_setup(codec, n_out)
+    _sweep(codec, w, s, ref_w, n_out, ms=BM128_MS)
+
+
+@pytest.mark.parametrize("codec", sorted(DB64_N))
+def test_db64_band_dispatch(codec):
+    n_out = DB64_N[codec]
+    w, s, ref_w = _encodable_setup(codec, n_out)
+    _sweep(codec, w, s, ref_w, n_out, ms=[33, 48, 64])
+
+
+@pytest.mark.parametrize("n_out", [1024, 1000])
+@pytest.mark.parametrize("codec", IQ)
+def test_smallm_routing_iq(codec, n_out):
+    w, s, ref_w = _iq_setup(codec, n_out)
     _sweep(codec, w, s, ref_w, n_out)
