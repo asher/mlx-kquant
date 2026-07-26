@@ -45,6 +45,149 @@ using mx::Stream;
 // get_qmv_batch_limit, add_strides_and_shapes, kq_get_kernel) come from
 // kquant_metal_internal.h.
 
+// Measured small-BM policy per codec (cold-stream [17408x5120], M5 Max).
+// bm32: the BM=32 double-buffered tile wins M13-32 over BM=64 (wins range
+// +3% to +45%; excluded codecs measured neutral or worse -- iq2_s -24%,
+// the DB loader duplication hurts register-heavy grid dequant).
+// route_min: lowest M routed from the mv paths to qmm (0 = mv keeps all
+// M <= 12; the flat codecs' and iq1_s's qmm is dequant-ALU-bound at
+// 105-150 GB/s, below their mv paths through M12).
+// db64_min_n: minimum N for which the M33-64 band dispatches the
+// name-suffixed _db (double-buffered Ws) BM=64 qmm_t variant (0 = never).
+// Measured per codec and per shape: only q6_k and q8_0 win the band at
+// all, and both wins are N-gated (K is not the driver: q6_k at
+// [17408x4096] wins +8-12% while [14336x5120] is a wash; the decode
+// projection shapes N<=4096 lose -3 to -11%).
+// bm128_min_m: lowest M at which the M>=193 band takes the BM=128 tile
+// (still inside the even-ceil(M/64) window; never 0, every codec wins
+// somewhere). Measured per codec at [17408x5120] and [4096x14336],
+// M 224/256/512/1024, paired-process ABBA on M5 Max
+// (benchmarks/bench_qmm_bm128_ab.py; re-measure on new silicon):
+// - 193: wins from the band start. The dequant-ALU-heavy grid codecs
+//   are the strongest (iq2_s/iq2_xs/iq4_xs +4 to +27% everywhere
+//   measured; the taller tile amortizes dequant over twice the rows);
+//   q6_k is the originally booked +9-25%.
+// - 449: M224 (the pad-heaviest measured cell, 32 dead rows) loses
+//   -3 to -13% and M256 is small-or-wash, while M512/M1024 win up to
+//   +13% (q5_k, q3_k) -- the k-quants, q8_0, and the cheap-loader IQs.
+// - 961: the flat quartet only wins the deepest bands (+1-7% at M1024)
+//   and loses or washes below.
+struct KqSmallBmPolicy {
+  bool bm32;
+  int route_min;
+  int db64_min_n;
+  int bm128_min_m;
+};
+static KqSmallBmPolicy kq_smallbm_policy(const std::string& t) {
+  if (t == "q4_k" || t == "q3_k") {
+    return {true, 7, 0, 449};
+  }
+  if (t == "q2_k" || t == "iq3_xxs") {
+    return {true, 8, 0, 449};
+  }
+  if (t == "q6_k") {
+    // +8-17% at N=17408 (any K), wash at 14336, -3/-11% at 4096/1024.
+    return {true, 9, 16384, 193};
+  }
+  if (t == "q8_0") {
+    // db64: +2-9% at 17408, +2-4% at 14336, ~0 at 4096, -3/-8% at 1024.
+    // route_min 8 post-ushort-loader (forced M8 391 vs mv 378 at 17408).
+    return {true, 8, 8192, 449};
+  }
+  if (t == "q5_k") {
+    return {true, 9, 0, 449};
+  }
+  if (t == "iq3_s") {
+    return {true, 9, 0, 193};
+  }
+  if (t == "iq2_xxs") {
+    return {true, 10, 0, 193};
+  }
+  if (t == "iq4_xs") {
+    return {true, 11, 0, 193};
+  }
+  // Flat-family entries are post-ushort-loader (the 32-single-byte-load
+  // dequant chain was the 105-150 GB/s wall; with it gone these codecs
+  // earn sub-13 routes, iq4_nl rejoins bm32 at +27-52% over bm64, and
+  // db64 splits: q4_1/q5_0/q5_1 win +9-20% at N=17408 and +2-7% at 8192
+  // but lose -5-13% at 1024, while q4_0/iq4_nl stay neutral-to-negative
+  // (their loaders are cheap enough that the duplicated Ws buffers cost
+  // more occupancy than the latency hiding returns).
+  if (t == "q4_0") {
+    return {true, 6, 0, 961};
+  }
+  if (t == "iq4_nl") {
+    return {true, 6, 0, 449};
+  }
+  if (t == "q4_1" || t == "q5_1") {
+    return {true, 6, 8192, 961};
+  }
+  if (t == "q5_0") {
+    return {true, 7, 8192, 961};
+  }
+  if (t == "iq1_s") {
+    return {true, 0, 0, 449};
+  }
+  return {false, 0, 0, 193}; // iq2_xs, iq2_s, iq1_m
+}
+
+// Shape-adjusted sub-13 route threshold. The table crossovers were tuned
+// at [17408x5120]; they hold for N >= 8192 but sit too low for strong-mv
+// codecs at decode projection shapes, where the qmm grid is only
+// ceil(N/64) threadgroups and the in-tile K walk serializes (measured at
+// [4096x14336] down, [4096x4096] q/o, [1024x4096] GQA k/v). Weak-mv
+// codecs (q4_k, q2_k, q5_k, iq2_xxs) measured clean at all three shapes
+// and keep the table value; iq4_xs loses its whole M11-12 window at
+// small N and drops the route there.
+static int kq_smallm_route_min(const std::string& t, int N, int K) {
+  int m = kq_smallbm_policy(t).route_min;
+  if (m == 0) {
+    return 0;
+  }
+  if (t == "q6_k" && N >= 100000) {
+    // Vocab-head N shifts the q6_k crossover down one: the mv paths decay
+    // faster with N (M8 at N=248320 reads 237 GB/s vs 307 at N=17408)
+    // while qmm holds 289-299. 100k separates vocab heads (128k-262k)
+    // from the largest dense FFN rows (~53k).
+    return 8;
+  }
+  if (N >= 8192) {
+    return m;
+  }
+  if (t == "q6_k") {
+    return (K >= 8192 || N <= 2048) ? 12 : 11;
+  }
+  if (t == "q8_0") {
+    // q8_0's mv is the strongest in the fleet (500 GB/s at M5); even with
+    // the ushort loader the qmm never beats it below M13 at decode
+    // projection shapes (down M8 246 vs 374 mv, kv M12 324 vs 332). The
+    // M13+ BM=32 tile is separate and keeps its win.
+    return 0;
+  }
+  if (t == "q4_0" || t == "q4_1" || t == "iq4_nl") {
+    // Down-projection K walk pushes the crossover to 8 (q4_0 M8 251 vs
+    // 227 mv at [4096x14336], iq4_nl 232 vs 221); kv shapes cross at 7.
+    // iq4_nl crossovers are measured on its bm32 tile.
+    return K >= 8192 ? 8 : 7;
+  }
+  if (t == "q5_0" || t == "q5_1") {
+    return 8;
+  }
+  if (t == "q3_k") {
+    return N <= 2048 ? 8 : m;
+  }
+  if (t == "iq3_xxs") {
+    return N <= 2048 ? 10 : m;
+  }
+  if (t == "iq3_s") {
+    return 12;
+  }
+  if (t == "iq4_xs") {
+    return 0;
+  }
+  return m;
+}
+
 // NAX (tensor-core) GEMM dispatch for the quantized matmul (no biases).
 void qmm_nax(
     const array& x,
@@ -62,8 +205,86 @@ void qmm_nax(
     const std::string& kquant_type) {
   int B = out.size() / M / N;
   int wm = 2, wn = 2, bm = 64, bn = 64, bk = 64;
+  // Small-BM tile for small M: BM=64 wastes up to 75% of MMA issues on row
+  // padding at M<=32 (MMA is ~48% of kernel time). BM=32 is the smallest
+  // tile the NAX fragment pairing allows (TM=1, TN=2). Codecs whose loaders
+  // are db_safe and have smallbm instantiations only. KQ_NAX_SMALL_BM:
+  // 0 = off, 2 = force bm32 for policy-excluded codecs (crossover
+  // finding), unset or 1 = per-codec policy.
+  static const int small_bm_mode = []() {
+    const char* e = std::getenv("KQ_NAX_SMALL_BM");
+    return e == nullptr ? 1 : std::atoi(e);
+  }();
+  // Window ends at 32: above it grid.y goes to 2 and every weight column
+  // tile streams once per M-tile, which halves per-weight bandwidth at
+  // DRAM-bound (measured: q6_k M48 146 GB/s on bm32 vs 184 on bm64).
+  if (small_bm_mode != 0 && transpose && M <= 32 &&
+      (small_bm_mode == 2 || kq_smallbm_policy(kquant_type).bm32)) {
+    bm = 32;
+  }
+  // BM=128 tile for the M>=193 band: halves the row-tile count and with
+  // it weight re-streams per unique weight (q6_k booked +9-25% M224-512;
+  // prefill M512-2048 +8-10% hot, +31-40% cold). Padding decides the
+  // rest of the band: with M = 128q + r the tile carries 64 extra
+  // padding rows exactly when r is in (1,64], and every measured loss
+  // cell (M144/160/192 -12-19%, M320 -6%) is in that zone while r == 0
+  // or r > 64 is neutral-or-win -> dispatch only when ceil(M/64) is
+  // even. The entry floor is per-codec (bm128_min_m: the 19-codec ABBA
+  // showed the shallow band flipping sign by loader weight, see the
+  // policy table). KQ_NAX_BM128: 0 = off, 1 = force floor 193 for all
+  // codecs (crossover finding), 2 = drop the floor entirely (probes the
+  // M65-128 wash band, symmetric with KQ_NAX_SMALL_BM=2), unset =
+  // per-codec policy.
+  static const int bm128_mode = []() {
+    const char* e = std::getenv("KQ_NAX_BM128");
+    return e == nullptr ? -1 : std::atoi(e);
+  }();
+  int bm128_min_m = kq_smallbm_policy(kquant_type).bm128_min_m;
+  if (bm128_mode != 0 && transpose && ((M + 63) / 64) % 2 == 0 &&
+      (bm128_mode == 1       ? M >= 193
+           : bm128_mode == 2 ? true
+                             : M >= bm128_min_m)) {
+    bm = 128;
+  }
+  // M33-64 band: the name-suffixed _db BM=64 variant double-buffers Ws
+  // (bm32 here would stream weights twice via grid.y=2; blanket DB@64
+  // regressed M96+ -3-15% and prefill -3-7%, so it is band-gated).
+  // KQ_NAX_DB64: 0 = off, 1 = drop the N floor (crossover finding),
+  // unset = per-codec policy. Only policy-enabled codecs
+  // (db64_min_n > 0) carry _db instantiations, so 1 is bounded by
+  // availability; probing another codec needs its instantiation
+  // restored and a metallib rebuild.
+  static const int db64_mode = []() {
+    const char* e = std::getenv("KQ_NAX_DB64");
+    return e == nullptr ? -1 : std::atoi(e);
+  }();
+  int db64_min_n = kq_smallbm_policy(kquant_type).db64_min_n;
+  bool use_db64 = transpose && bm == 64 && M >= 33 && M <= 64 &&
+      db64_min_n > 0 &&
+      (db64_mode == 1 || (db64_mode == -1 && N >= db64_min_n));
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
+  // Row-tile traversal swizzle (M > 64): fold row-tiles into grid.x so
+  // consecutive launches cover the same BN-column weight band, letting
+  // row-tiles 2..2^log read it from SLC instead of re-streaming DRAM
+  // (weight-normalized bandwidth otherwise divides by the row-tile
+  // count). kq_swizzle_tid in the kernel derives the fold factor from
+  // threadgroups_per_grid; padded row-tiles early-return.
+  // KQ_NAX_SWIZZLE: 1 = on (experiment lever; default off).
+  static const bool swizzle_on = []() {
+    const char* e = std::getenv("KQ_NAX_SWIZZLE");
+    return e != nullptr && std::atoi(e) != 0;
+  }();
+  if (swizzle_on && transpose && bm == 64) {
+    int y_tiles = (M + bm - 1) / bm;
+    if (y_tiles >= 2) {
+      int log = y_tiles >= 4 ? 2 : 1;
+      grid_dims = MTL::Size(
+          static_cast<size_t>((N + bn - 1) / bn) << log,
+          (y_tiles + (1 << log) - 1) >> log,
+          B);
+    }
+  }
 
   bool aligned = N % bn == 0;
   bool batched = B > 1;
@@ -89,7 +310,8 @@ void qmm_nax(
       "_wn",
       wn,
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
-      batched ? "_batch_1" : "_batch_0");
+      batched ? "_batch_1" : "_batch_0",
+      use_db64 ? "_db" : "");
 
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -465,7 +687,16 @@ void verify_mv_ext(
     const std::string& kquant_type) {
   constexpr int nsg = 2;
   constexpr int nxpsg = 8;
-  constexpr int rows_per_tg = (32 / nxpsg) * nsg; // nypsg * nsg = 8
+  // Wide-M rows-per-thread experiment (KQ_MV_EXT_NR=2): each thread owns two
+  // consecutive output rows and shares one activation load across them,
+  // halving the M*N*K activation cache traffic that dominates past M~5.
+  // q6_k-only instantiations for now; default 1 = shipped behavior.
+  static const int mv_ext_nr = []() {
+    const char* e = std::getenv("KQ_MV_EXT_NR");
+    return e != nullptr ? std::atoi(e) : 1;
+  }();
+  const bool use_nr2 = mv_ext_nr == 2 && M >= 5 && kquant_type == "q6_k";
+  const int rows_per_tg = (32 / nxpsg) * nsg * (use_nr2 ? 2 : 1);
   MTL::Size group_dims(32, nsg, 1);
   MTL::Size grid_dims((N + rows_per_tg - 1) / rows_per_tg, 1, 1);
 
@@ -481,7 +712,8 @@ void verify_mv_ext(
       "_b_",
       bits,
       "_m",
-      M);
+      M,
+      use_nr2 ? "_nr2" : "");
 
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -678,6 +910,60 @@ void KQuantMatmul::eval_gpu(
   // through to dispatch_qmv below rather than throw; a qmv_quad kernel would be
   // a perf-only path for an essentially-dead case.
 
+  // Probe lever: KQ_FORCE_QMM_MIN_M=<m> routes transpose shapes with M >= m
+  // straight to qmm (-> NAX), bypassing the mv_ext/verify_qmv claims, for
+  // qmm-vs-mv_ext crossover measurement below M=13.
+  static const int force_qmm_min_m = []() {
+    const char* e = std::getenv("KQ_FORCE_QMM_MIN_M");
+    return e != nullptr ? std::atoi(e) : 0;
+  }();
+  if (force_qmm_min_m > 0 && transpose_ && M >= force_qmm_min_m) {
+    qmm(x,
+        w,
+        scales,
+        out,
+        transpose_,
+        group_size_,
+        bits_,
+        M,
+        N,
+        K,
+        d,
+        s,
+        kquant_type_);
+    return;
+  }
+
+  // Small-M qmm route: the double-buffered BM=32 NAX tile beats the mv
+  // paths' wide-M decay above a per-codec crossover (kq_smallbm_policy;
+  // measured cold-stream, e.g. q6_k M>=9 274-305 vs 221-254, q4_k M>=7
+  // 249-287 vs 149-256, q2_k M>=8 133-194 vs 88-135, iq3_xxs M>=8
+  // 163-175 vs 102-158). KQ_NAX_SMALL_BM=0 restores the old routing
+  // (same switch that picks the BM=32 tile in qmm_nax).
+  static const bool nax_smallm_route = []() {
+    const char* e = std::getenv("KQ_NAX_SMALL_BM");
+    return e == nullptr || std::atoi(e) != 0;
+  }();
+  int smallm_min = kq_smallm_route_min(kquant_type_, N, K);
+  if (nax_smallm_route && transpose_ && non_batched && smallm_min > 0 &&
+      M >= smallm_min && M <= 12 && kq_is_nax_available() && (K % 64 == 0) &&
+      x.dtype() != mx::float32) {
+    qmm(x,
+        w,
+        scales,
+        out,
+        transpose_,
+        group_size_,
+        bits_,
+        M,
+        N,
+        K,
+        d,
+        s,
+        kquant_type_);
+    return;
+  }
+
   if (M >= vector_limit) {
     // For transpose shapes in the mv_ext M-range, the weight-read-amortizing
     // kernel beats qmm's under-utilised BM=64 tile at small M. Let those fall
@@ -731,13 +1017,20 @@ void KQuantMatmul::eval_gpu(
         kquant_type_ == "mxfp4" || kquant_type_ == "nvfp4";
     const bool mv_ext_default_on = codec_has_mv_ext;
     // Width gate for the DEFAULT path (the A/B force-on KQ_VERIFY_EXT=1 ignores
-    // it). Measured DRAM-fresh: for non-IQ codecs verify_qmv (tuned for small
-    // M, MAX_VM accumulators) ties or beats mv_ext at M==2 and mv_ext only pays
-    // at M>=3, so non-IQ falls back to verify_qmv at M==2 (no regression at the
-    // rarely-used draft-width-1 case). IQ has no verify_qmv kernel, so mv_ext
-    // (vs per-row qmv) is a clear win at every M>=2 and stays on.
+    // it). Measured DRAM-cold across every wired codec (M5 Max, [17408x5120],
+    // working set streamed far past the SLC): at M==2 verify_qmv holds its
+    // M==1 rate only for q4_k (495 vs mv_ext 422 GB/s) and q8_0 (540 vs 541);
+    // every other codec craters there (q6_k 328, q3_k 179, legacy 213-298,
+    // all vs mv_ext 353-536), and the wire codecs with no verify kernel
+    // (mxfp4/nvfp4) fall to per-row qmv at half their M==1 rate (69/61 vs
+    // mv_ext 392/432). M==2 is every B=2 decode step, not just the
+    // draft-width-1 verify, so M==2 routes to mv_ext for all codecs except
+    // the two where verify_qmv measures faster. IQ has no verify_qmv kernel,
+    // so mv_ext stays on at every M>=2.
     const bool is_iq = kquant_type_.rfind("iq", 0) == 0;
-    const bool mv_ext_width_ok = is_iq || M >= 3;
+    const bool verify_qmv_wins_m2 =
+        kquant_type_ == "q4_k" || kquant_type_ == "q8_0";
+    const bool mv_ext_width_ok = is_iq || M >= 3 || !verify_qmv_wins_m2;
     // 32-weight blocks (legacy + q8_0 + iq4_nl) align K to 32; the 256-weight
     // super-block codecs (K-quants + the other IQ) align to 256. Pull the
     // modulus from the codec geometry rather than hard-coding per codec.

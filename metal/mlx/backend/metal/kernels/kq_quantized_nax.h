@@ -20,7 +20,8 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    const bool use_db = false>
 METAL_FUNC void kq_qmm_t_nax_tgp_impl(
     const device uint8_t* w,
     const device T* x,
@@ -70,7 +71,13 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
   // the raw remaining-row/col span overflows once M (or N) exceeds 32767,
   // corrupting the leading tiles of a single large matmul.
   const short sgp_sm = short(min(int(SM), M - (y_row + tm)));
-  const bool is_unaligned_sm = (sgp_sm != SM);
+  // TG-UNIFORM alignment branch: with multiple SG-rows (WM>1) a per-SG
+  // predicate (sgp_sm != SM) sends simdgroups of the same threadgroup down
+  // different dispatch_bool bodies whenever the M-tile is partial but one
+  // SG-row is full (e.g. M=24 in a BM=32 tile), which measures ~35% slower
+  // than either uniform path. The safe path costs ~3%, so branch on the
+  // tile, clamp per SG.
+  const bool is_unaligned_sm = (M - y_row) < BM;
 
   const short sgp_sn = aligned_N ? SN : short(min(int(SN), N - (y_col + tn)));
 
@@ -86,43 +93,123 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+      if constexpr (use_db) {
+        static_assert(
+            !use_db || LoaderW::db_safe,
+            "double-buffered Ws requires a kt-position-generic loader");
+        // Double-buffered Ws: the loader for step s+1 issues before the MMA
+        // of step s reads buffer s, one barrier per step instead of two.
+        // Measured +7-14% on the small-M tile (the kernel is latency-bound,
+        // not issue-bound). Two loader instances, one per buffer; next()
+        // advances one BK tile, so each loader double-next()s to stride its
+        // own (even or odd) tiles. Requires a kt-position-generic loader
+        // (db_safe): a pair-cache replay would read a never-filled cache on
+        // the odd-tile instance. use_db is passed by the kernel wrapper and
+        // must match its Ws allocation (kWsBufs).
+        constexpr int WS_STRIDE = BN * BK_padded;
+        LoaderW loader_w1(wl, K, Ws + WS_STRIDE, simd_gid, simd_lid);
+        loader_w1.next();
+        const int n_steps = K / BK;
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
           loader_w.load_safe(short2(BK, tgp_bn));
         }
-
+        loader_w.next();
+        loader_w.next();
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        STEEL_PRAGMA_NO_UNROLL
-        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-          NAXTile<T, TM, TK> Atile;
-          NAXTile<T, TN, TK> Btile;
-
-          volatile int compiler_barrier;
-
-          if constexpr (kAlignedM.value) {
-            Atile.load(x + kk1, K);
-          } else {
-            Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+        for (int step = 0; step < n_steps; step++) {
+          if (step + 1 < n_steps) {
+            if (step & 1) {
+              if constexpr (kAlignedN.value) {
+                loader_w.load_unsafe();
+              } else {
+                loader_w.load_safe(short2(BK, tgp_bn));
+              }
+              loader_w.next();
+              loader_w.next();
+            } else {
+              if constexpr (kAlignedN.value) {
+                loader_w1.load_unsafe();
+              } else {
+                loader_w1.load_safe(short2(BK, tgp_bn));
+              }
+              loader_w1.next();
+              loader_w1.next();
+            }
           }
 
-          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+          const threadgroup T* Wcur = Ws + (step & 1) * WS_STRIDE;
 
-          tile_matmad_nax(
-              Dtile,
-              Atile,
-              metal::bool_constant<transpose_a>{},
-              Btile,
-              metal::bool_constant<transpose_b>{});
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, TN, TK> Btile;
 
-          (void)compiler_barrier;
+            volatile int compiler_barrier;
+
+            if constexpr (kAlignedM.value) {
+              Atile.load(x + kk1, K);
+            } else {
+              Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            }
+
+            Btile.template load<T, BK_padded, 1>(
+                const_cast<threadgroup T*>(Wcur) + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<transpose_a>{},
+                Btile,
+                metal::bool_constant<transpose_b>{});
+
+            (void)compiler_barrier;
+          }
+
+          x += BK;
+          threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+      } else {
+        for (int k = 0; k < K; k += BK) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if constexpr (kAlignedN.value) {
+            loader_w.load_unsafe();
+          } else {
+            loader_w.load_safe(short2(BK, tgp_bn));
+          }
 
-        x += BK;
-        loader_w.next();
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, TN, TK> Btile;
+
+            volatile int compiler_barrier;
+
+            if constexpr (kAlignedM.value) {
+              Atile.load(x + kk1, K);
+            } else {
+              Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            }
+
+            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<transpose_a>{},
+                Btile,
+                metal::bool_constant<transpose_b>{});
+
+            (void)compiler_barrier;
+          }
+
+          x += BK;
+          loader_w.next();
+        }
       }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -244,6 +331,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ8_0BlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q8_0_GROUP; // 32
   MLX_MTL_CONST int bytes_per_block = KQ_Q8_0_BLOCK_BYTES; // 34
 
@@ -297,9 +385,21 @@ struct KqNaxQ8_0BlockLoader {
     const float d = float(*(const device half*)(block_addr + KQ_Q8_0_D_OFFSET));
     const device int8_t* q =
         (const device int8_t*)(block_addr + KQ_Q8_0_Q_OFFSET + within);
+    if constexpr (n_reads == weights_per_block) {
+      // One whole block per thread (within == 0): 16 aligned ushorts (q
+      // sits at +2 of a 34-byte block) replace 32 single-byte loads.
+      const device ushort* q16 = (const device ushort*)q;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      dst[i] = T(d * float(q[i]));
+      for (short s = 0; s < 16; s++) {
+        const ushort v = q16[s];
+        dst[2 * s + 0] = T(d * float(int8_t(v & 0xFFu)));
+        dst[2 * s + 1] = T(d * float(int8_t(v >> 8)));
+      }
+    } else {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(d * float(q[i]));
+      }
     }
   }
 
@@ -319,6 +419,29 @@ struct KqNaxQ8_0BlockLoader {
   }
 };
 
+// Row-tile traversal swizzle for M > 64: launch order is x-fastest, so
+// with grid (n_tiles, y_tiles) every row-tile streams the whole weight
+// matrix from DRAM (weight-normalized bandwidth divides by y_tiles;
+// measured near-constant ~270-282 GB/s real traffic M65-256). The host
+// folds 2^log row-tiles into grid.x (grid.x = n_tiles << log); this remap
+// makes consecutive launches cover the folded row-tiles of one shared
+// BN-column weight band (~268KB at BN=64), so tiles 2..2^log hit SLC.
+// No-op when grid.x == n_tiles. Folded padding rows (r.y beyond the real
+// row-tile count) must early-return in the wrapper -- threadgroup-uniform,
+// so in-impl barriers stay safe.
+METAL_FUNC uint3 kq_swizzle_tid(uint3 tid, uint3 tgp_grid, int N, int BN) {
+  const uint n_tiles = uint((N + BN - 1) / BN);
+  if (tgp_grid.x <= n_tiles) {
+    return tid;
+  }
+  const uint log = uint(31 - clz(tgp_grid.x / n_tiles));
+  const uint mask = (1u << log) - 1;
+  uint3 r = tid;
+  r.y = (tid.y << log) + (tid.x & mask);
+  r.x = tid.x >> log;
+  return r;
+}
+
 template <
     typename T,
     int group_size,
@@ -328,7 +451,8 @@ template <
     int BM,
     int BN,
     int WM,
-    int WN>
+    int WN,
+    bool use_db = false>
 [[kernel]] void kq_q8_0_qmm_t_nax(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -345,6 +469,7 @@ template <
     const constant int64_t* w_strides,
     const constant int64_t* /* s_strides */,
     uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tgp_grid [[threadgroups_per_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -352,9 +477,28 @@ template <
       group_size == KQ_Q8_0_GROUP, "Q8_0 NAX kernel requires group_size=32");
   static_assert(bits == 8, "Q8_0 NAX kernel requires bits=8");
 
+  tid = kq_swizzle_tid(tid, tgp_grid, N, BN);
+  if (int(tid.y) * BM >= M) {
+    return;
+  }
+
   constexpr int BK = 64;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
-  threadgroup T Ws[BN * BK_padded];
+  using LoaderW = KqNaxQ8_0BlockLoader<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      /*reduction_dim=*/1,
+      /*tgp_size=*/WM * WN * SIMD_SIZE>;
+  // DB is implicit at BM == 32 and opt-in (use_db, the name-suffixed _db
+  // instantiations) at BM == 64 for the M33-64 dispatch band only: as a
+  // blanket BM == 64 default the doubled Ws footprint cut occupancy and
+  // regressed M96+ and prefill 3-7% (measured).
+  static_assert(
+      !use_db || LoaderW::db_safe, "use_db requires a db_safe loader");
+  constexpr int kWsBufs = (LoaderW::db_safe && (BM == 32 || use_db)) ? 2 : 1;
+  threadgroup T Ws[kWsBufs * BN * BK_padded];
 
   if constexpr (batched) {
     kq_adjust_matrix_offsets<T>(
@@ -371,15 +515,16 @@ template <
         tid);
   }
 
-  using LoaderW = KqNaxQ8_0BlockLoader<
+  kq_qmm_t_nax_tgp_impl<
       T,
-      BN,
+      LoaderW,
+      aligned_N,
+      BM,
       BK,
-      BK_padded,
-      /*reduction_dim=*/1,
-      /*tgp_size=*/WM * WN * SIMD_SIZE>;
-  kq_qmm_t_nax_tgp_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
-      w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+      BN,
+      WM,
+      WN,
+      kWsBufs == 2>(w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits, bool batched>
@@ -476,7 +621,17 @@ template <
 
   constexpr int BK = 64;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
-  threadgroup T Ws[BN * BK_padded];
+  using LoaderW = KqNaxQ8_0BlockLoader<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      /*reduction_dim=*/1,
+      /*tgp_size=*/WM * WN * SIMD_SIZE>;
+  // Gather stays single-buffered at BM=64: the MoE gather surface has its
+  // own certified tuning and has not been re-measured with DB.
+  constexpr int kWsBufs = (LoaderW::db_safe && BM == 32) ? 2 : 1;
+  threadgroup T Ws[kWsBufs * BN * BK_padded];
 
   kq_adjust_matrix_offsets<T>(
       x,
@@ -497,15 +652,16 @@ template <
       w_strides,
       tid);
 
-  using LoaderW = KqNaxQ8_0BlockLoader<
+  kq_qmm_t_nax_tgp_impl<
       T,
-      BN,
+      LoaderW,
+      aligned_N,
+      BM,
       BK,
-      BK_padded,
-      /*reduction_dim=*/1,
-      /*tgp_size=*/WM * WN * SIMD_SIZE>;
-  kq_qmm_t_nax_tgp_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
-      w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+      BN,
+      WM,
+      WN,
+      kWsBufs == 2>(w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits>
@@ -582,6 +738,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ5_1BlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q5_1_GROUP; // 32
   MLX_MTL_CONST int bytes_per_block = KQ_Q5_1_BLOCK_BYTES; // 24
 
@@ -637,13 +794,34 @@ struct KqNaxQ5_1BlockLoader {
     const uint32_t qh =
         *(const device uint32_t*)(block_addr + KQ_Q5_1_QH_OFFSET);
     const device uint8_t* qs = block_addr + KQ_Q5_1_QS_OFFSET;
+    if constexpr (n_reads == weights_per_block) {
+      // One whole block per thread (within == 0): 8 aligned ushorts (qs
+      // sits at +8 of a 24-byte block) replace 32 single-byte loads.
+      const device ushort* qs16 = (const device ushort*)qs;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int j = within + i;
-      const uint32_t hi = ((qh >> j) << 4) & 0x10u;
-      const uint8_t lo = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
-      const float q5 = float(uint32_t(lo) | hi);
-      dst[i] = T(d * q5 + m);
+      for (short s = 0; s < 8; s++) {
+        const ushort v = qs16[s];
+        const uint32_t x0 = (v & 0x000Fu) | (((qh >> (2 * s)) << 4) & 0x10u);
+        const uint32_t x1 =
+            ((v >> 8) & 0x000Fu) | (((qh >> (2 * s + 1)) << 4) & 0x10u);
+        const uint32_t x16 =
+            ((v >> 4) & 0x000Fu) | (((qh >> (2 * s + 16)) << 4) & 0x10u);
+        const uint32_t x17 =
+            uint32_t(v >> 12) | (((qh >> (2 * s + 17)) << 4) & 0x10u);
+        dst[2 * s + 0] = T(d * float(x0) + m);
+        dst[2 * s + 1] = T(d * float(x1) + m);
+        dst[2 * s + 16] = T(d * float(x16) + m);
+        dst[2 * s + 17] = T(d * float(x17) + m);
+      }
+    } else {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        const int j = within + i;
+        const uint32_t hi = ((qh >> j) << 4) & 0x10u;
+        const uint8_t lo = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
+        const float q5 = float(uint32_t(lo) | hi);
+        dst[i] = T(d * q5 + m);
+      }
     }
   }
 
@@ -672,7 +850,8 @@ template <
     int BM,
     int BN,
     int WM,
-    int WN>
+    int WN,
+    bool use_db = false>
 [[kernel]] void kq_q5_1_qmm_t_nax(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -689,6 +868,7 @@ template <
     const constant int64_t* w_strides,
     const constant int64_t* /* s_strides */,
     uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tgp_grid [[threadgroups_per_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -696,9 +876,24 @@ template <
       group_size == KQ_Q5_1_GROUP, "Q5_1 NAX kernel requires group_size=32");
   static_assert(bits == 5, "Q5_1 NAX kernel requires bits=5");
 
+  tid = kq_swizzle_tid(tid, tgp_grid, N, BN);
+  if (int(tid.y) * BM >= M) {
+    return;
+  }
+
   constexpr int BK = 64;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
-  threadgroup T Ws[BN * BK_padded];
+  using LoaderW = KqNaxQ5_1BlockLoader<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      /*reduction_dim=*/1,
+      /*tgp_size=*/WM * WN * SIMD_SIZE>;
+  static_assert(
+      !use_db || LoaderW::db_safe, "use_db requires a db_safe loader");
+  constexpr int kWsBufs = (LoaderW::db_safe && (BM == 32 || use_db)) ? 2 : 1;
+  threadgroup T Ws[kWsBufs * BN * BK_padded];
 
   if constexpr (batched) {
     kq_adjust_matrix_offsets<T>(
@@ -715,15 +910,16 @@ template <
         tid);
   }
 
-  using LoaderW = KqNaxQ5_1BlockLoader<
+  kq_qmm_t_nax_tgp_impl<
       T,
-      BN,
+      LoaderW,
+      aligned_N,
+      BM,
       BK,
-      BK_padded,
-      /*reduction_dim=*/1,
-      /*tgp_size=*/WM * WN * SIMD_SIZE>;
-  kq_qmm_t_nax_tgp_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
-      w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+      BN,
+      WM,
+      WN,
+      kWsBufs == 2>(w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits, bool batched>
@@ -820,7 +1016,16 @@ template <
 
   constexpr int BK = 64;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
-  threadgroup T Ws[BN * BK_padded];
+  using LoaderW = KqNaxQ5_1BlockLoader<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      /*reduction_dim=*/1,
+      /*tgp_size=*/WM * WN * SIMD_SIZE>;
+  // Gather stays single-buffered at BM=64 (see the q8_0 gather note).
+  constexpr int kWsBufs = (LoaderW::db_safe && BM == 32) ? 2 : 1;
+  threadgroup T Ws[kWsBufs * BN * BK_padded];
 
   kq_adjust_matrix_offsets<T>(
       x,
@@ -841,15 +1046,16 @@ template <
       w_strides,
       tid);
 
-  using LoaderW = KqNaxQ5_1BlockLoader<
+  kq_qmm_t_nax_tgp_impl<
       T,
-      BN,
+      LoaderW,
+      aligned_N,
+      BM,
       BK,
-      BK_padded,
-      /*reduction_dim=*/1,
-      /*tgp_size=*/WM * WN * SIMD_SIZE>;
-  kq_qmm_t_nax_tgp_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
-      w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+      BN,
+      WM,
+      WN,
+      kWsBufs == 2>(w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits>
@@ -924,6 +1130,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ4_0BlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q4_0_GROUP;
   MLX_MTL_CONST int bytes_per_block = KQ_Q4_0_BLOCK_BYTES;
 
@@ -976,11 +1183,28 @@ struct KqNaxQ4_0BlockLoader {
     const device uint8_t* block_addr = src + block_idx * bytes_per_block;
     const float d = float(*(const device half*)(block_addr + KQ_Q4_0_D_OFFSET));
     const device uint8_t* qs = block_addr + KQ_Q4_0_QS_OFFSET;
+    if constexpr (n_reads == weights_per_block) {
+      // One whole block per thread (the qmm_t tile shape; within == 0).
+      // Pull the 16 data bytes as 8 aligned ushorts (qs sits at +2 of an
+      // 18-byte block, so 2-byte alignment always holds) and extract the
+      // nibbles in registers: the general path issues 32 single-byte
+      // device loads per block and reads every byte twice.
+      const device ushort* qs16 = (const device ushort*)qs;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int j = within + i;
-      const int x = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
-      dst[i] = T(d * float(int(x) - 8));
+      for (short s = 0; s < 8; s++) {
+        const ushort v = qs16[s];
+        dst[2 * s + 0] = T(d * float(int(v & 0x000Fu) - 8));
+        dst[2 * s + 1] = T(d * float(int((v >> 8) & 0x000Fu) - 8));
+        dst[2 * s + 16] = T(d * float(int((v >> 4) & 0x000Fu) - 8));
+        dst[2 * s + 17] = T(d * float(int(v >> 12) - 8));
+      }
+    } else {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        const int j = within + i;
+        const int x = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
+        dst[i] = T(d * float(int(x) - 8));
+      }
     }
   }
 
@@ -1008,6 +1232,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ4_1BlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q4_1_GROUP;
   MLX_MTL_CONST int bytes_per_block = KQ_Q4_1_BLOCK_BYTES;
 
@@ -1061,11 +1286,25 @@ struct KqNaxQ4_1BlockLoader {
     const float d = float(*(const device half*)(block_addr + KQ_Q4_1_D_OFFSET));
     const float m = float(*(const device half*)(block_addr + KQ_Q4_1_M_OFFSET));
     const device uint8_t* qs = block_addr + KQ_Q4_1_QS_OFFSET;
+    if constexpr (n_reads == weights_per_block) {
+      // One whole block per thread (within == 0): 8 aligned ushorts (qs
+      // sits at +4 of a 20-byte block) replace 32 single-byte loads.
+      const device ushort* qs16 = (const device ushort*)qs;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int j = within + i;
-      const int x = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
-      dst[i] = T(d * float(x) + m);
+      for (short s = 0; s < 8; s++) {
+        const ushort v = qs16[s];
+        dst[2 * s + 0] = T(d * float(v & 0x000Fu) + m);
+        dst[2 * s + 1] = T(d * float((v >> 8) & 0x000Fu) + m);
+        dst[2 * s + 16] = T(d * float((v >> 4) & 0x000Fu) + m);
+        dst[2 * s + 17] = T(d * float(v >> 12) + m);
+      }
+    } else {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        const int j = within + i;
+        const int x = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
+        dst[i] = T(d * float(x) + m);
+      }
     }
   }
 
@@ -1093,6 +1332,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ5_0BlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q5_0_GROUP;
   MLX_MTL_CONST int bytes_per_block = KQ_Q5_0_BLOCK_BYTES;
 
@@ -1145,16 +1385,37 @@ struct KqNaxQ5_0BlockLoader {
     const device uint8_t* block_addr = src + block_idx * bytes_per_block;
     const float d = float(*(const device half*)(block_addr + KQ_Q5_0_D_OFFSET));
     const device uint8_t* qh_p = block_addr + KQ_Q5_0_QH_OFFSET;
-    const uint32_t qh = uint32_t(qh_p[0]) | (uint32_t(qh_p[1]) << 8) |
-        (uint32_t(qh_p[2]) << 16) | (uint32_t(qh_p[3]) << 24);
+    const device ushort* qh16 = (const device ushort*)qh_p;
+    const uint32_t qh = uint32_t(qh16[0]) | (uint32_t(qh16[1]) << 16);
     const device uint8_t* qs = block_addr + KQ_Q5_0_QS_OFFSET;
+    if constexpr (n_reads == weights_per_block) {
+      // One whole block per thread (within == 0): 8 aligned ushorts (qs
+      // sits at +6 of a 22-byte block) replace 32 single-byte loads.
+      const device ushort* qs16 = (const device ushort*)qs;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int j = within + i;
-      const uint32_t hi = ((qh >> j) << 4) & 0x10u;
-      const uint8_t lo = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
-      const float q5 = float(uint32_t(lo) | hi);
-      dst[i] = T(d * (q5 - 16.0f));
+      for (short s = 0; s < 8; s++) {
+        const ushort v = qs16[s];
+        const uint32_t x0 = (v & 0x000Fu) | (((qh >> (2 * s)) << 4) & 0x10u);
+        const uint32_t x1 =
+            ((v >> 8) & 0x000Fu) | (((qh >> (2 * s + 1)) << 4) & 0x10u);
+        const uint32_t x16 =
+            ((v >> 4) & 0x000Fu) | (((qh >> (2 * s + 16)) << 4) & 0x10u);
+        const uint32_t x17 =
+            uint32_t(v >> 12) | (((qh >> (2 * s + 17)) << 4) & 0x10u);
+        dst[2 * s + 0] = T(d * (float(x0) - 16.0f));
+        dst[2 * s + 1] = T(d * (float(x1) - 16.0f));
+        dst[2 * s + 16] = T(d * (float(x16) - 16.0f));
+        dst[2 * s + 17] = T(d * (float(x17) - 16.0f));
+      }
+    } else {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        const int j = within + i;
+        const uint32_t hi = ((qh >> j) << 4) & 0x10u;
+        const uint8_t lo = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
+        const float q5 = float(uint32_t(lo) | hi);
+        dst[i] = T(d * (q5 - 16.0f));
+      }
     }
   }
 
@@ -1182,6 +1443,10 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ4_KBlockLoader {
+  // Double-buffer safe: no replay cache; (sb_base, src) is a pure position
+  // counter that stays consistent under any next() sequence, including the
+  // construct + single next() + double-next() walk of the DB loop.
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q4_K_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_Q4_K_BLOCK_BYTES;
   MLX_MTL_CONST int sub_block_size = 32;
@@ -1302,6 +1567,11 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ5_KBlockLoader {
+  // Double-buffer safe: qh is read fresh per call (the former qh cache was
+  // filled only at sb_base == 0, which replays garbage on the odd-tile DB
+  // loader instance; per the q6_k precedent the re-read is free under
+  // weight streaming, the cache only added state).
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q5_K_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_Q5_K_BLOCK_BYTES;
   MLX_MTL_CONST int sub_block_size = 32;
@@ -1329,11 +1599,6 @@ struct KqNaxQ5_KBlockLoader {
   threadgroup T* dst;
   const device uint8_t* src;
   short sb_base;
-  // qh cached on sb_base==0; reduction_dim==0 reads per-call instead.
-  struct Caches {
-    uint8_t qh_cache[bytes_per_thread];
-  };
-  metal::conditional_t<reduction_dim == 1, Caches, kq_empty> cached;
 
   KqNaxQ5_KBlockLoader(
       const device uint8_t* src_,
@@ -1356,62 +1621,12 @@ struct KqNaxQ5_KBlockLoader {
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         sb_base(0) {}
 
-  void load_unsafe() {
+  void load_unsafe() const {
     static_assert(
         bytes_per_thread == 16,
         "Q5_K NAX vector load assumes bytes_per_thread == 16 (uint4).");
 
-    if constexpr (reduction_dim == 1) {
-      const short pair_base = sb_base;
-
-      const float d = float(*(const device half*)(src + KQ_Q5_K_D_OFFSET));
-      const float dmin =
-          float(*(const device half*)(src + KQ_Q5_K_DMIN_OFFSET));
-      const device uint8_t* scales12 = src + KQ_Q5_K_SCALES_OFFSET;
-
-      uint8_t sc6_lo, mn6_lo, sc6_hi, mn6_hi;
-      kq_get_scale_min_k4(pair_base + 0, scales12, sc6_lo, mn6_lo);
-      kq_get_scale_min_k4(pair_base + 1, scales12, sc6_hi, mn6_hi);
-      const float eff_scale_lo = d * float(sc6_lo);
-      const float eff_min_lo = dmin * float(mn6_lo);
-      const float eff_scale_hi = d * float(sc6_hi);
-      const float eff_min_hi = dmin * float(mn6_hi);
-
-      const short pair = pair_base / 2;
-      const device uint8_t* qs = src + KQ_Q5_K_QS_OFFSET + pair * 32 + bj_byte;
-      const device uint8_t* qh = src + KQ_Q5_K_QH_OFFSET + bj_byte;
-
-      const uint4 qs_v = *reinterpret_cast<const device uint4*>(qs);
-      const thread uint8_t* qs_b =
-          reinterpret_cast<const thread uint8_t*>(&qs_v);
-
-      if (sb_base == 0) {
-        const uint4 qh_v = *reinterpret_cast<const device uint4*>(qh);
-        const thread uint8_t* qh_b =
-            reinterpret_cast<const thread uint8_t*>(&qh_v);
-#pragma unroll
-        for (short i = 0; i < bytes_per_thread; i++) {
-          cached.qh_cache[i] = qh_b[i];
-        }
-      }
-
-#pragma unroll
-      for (short i = 0; i < bytes_per_thread; i++) {
-        const uint8_t b = qs_b[i];
-        const uint8_t h = cached.qh_cache[i];
-        const uint8_t q4_lo = b & 0x0F;
-        const uint8_t q4_hi = b >> 4;
-        const uint8_t hi_lo = (h >> pair_base) & 1u;
-        const uint8_t hi_hi = (h >> (pair_base + 1)) & 1u;
-        const uint8_t q5_lo = q4_lo | (hi_lo << 4);
-        const uint8_t q5_hi = q4_hi | (hi_hi << 4);
-        dst[i] = T(eff_scale_lo * float(q5_lo) - eff_min_lo);
-        dst[sub_block_size + i] = T(eff_scale_hi * float(q5_hi) - eff_min_hi);
-      }
-      return;
-    }
-
-    const short pair_base = fixed_sb_base;
+    const short pair_base = (reduction_dim == 1) ? sb_base : fixed_sb_base;
 
     const float d = float(*(const device half*)(src + KQ_Q5_K_D_OFFSET));
     const float dmin = float(*(const device half*)(src + KQ_Q5_K_DMIN_OFFSET));
@@ -1450,7 +1665,7 @@ struct KqNaxQ5_KBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) {
+  void load_safe(short2 src_tile_dim) const {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < bytes_per_thread; i++) {
@@ -1500,6 +1715,12 @@ struct KqNaxQ6_KBlockLoader {
   MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
   static_assert(n_reads == k_tile_size, "Q6_K NAX expects n_reads == 32.");
 
+  // Double-buffer safe: load_unsafe is kt-position-generic (no pair-cache;
+  // it was removed when the double-buffered loop landed -- the two-instance
+  // even/odd tile walk never revisits kt_base+2, and dequant ALU measured
+  // free, so the cache only added state).
+  MLX_MTL_CONST bool db_safe = true;
+
   const int src_ld;
   const int row_bytes;
   const int tile_stride;
@@ -1512,12 +1733,6 @@ struct KqNaxQ6_KBlockLoader {
   threadgroup T* dst;
   const device uint8_t* src;
   short kt_base;
-  // Pair-cache: kt_base & 2 == 0 computes both pairs; reduction_dim==0 has no
-  // cache.
-  struct Caches {
-    T cached[n_reads];
-  };
-  metal::conditional_t<reduction_dim == 1, Caches, kq_empty> cached;
 
   KqNaxQ6_KBlockLoader(
       const device uint8_t* src_,
@@ -1541,54 +1756,7 @@ struct KqNaxQ6_KBlockLoader {
         kt_base(0) {}
 
   void load_unsafe() {
-    if constexpr (reduction_dim == 1) {
-      if (kt_base & 2) {
-#pragma unroll
-        for (short i = 0; i < n_reads; i++) {
-          dst[i] = cached.cached[i];
-        }
-        return;
-      }
-
-      const short base = kt_base;
-      const short kt = base + (bj / k_tile_size);
-      const short half_idx = kt / 4;
-      const short quadrant = kt - half_idx * 4;
-
-      const float d = float(*(const device half*)(src + KQ_Q6_K_D_OFFSET));
-      const device int8_t* scales =
-          (const device int8_t*)(src + KQ_Q6_K_SCALES_OFFSET);
-
-      const device uint8_t* ql_base =
-          src + KQ_Q6_K_QL_OFFSET + half_idx * 64 + (quadrant & 1) * 32;
-      const device uint8_t* qh_base = src + KQ_Q6_K_QH_OFFSET + half_idx * 32;
-
-      const float es_lo_a = d * float(scales[kt * 2 + 0]);
-      const float es_hi_a = d * float(scales[kt * 2 + 1]);
-      const float es_lo_b = d * float(scales[(kt + 2) * 2 + 0]);
-      const float es_hi_b = d * float(scales[(kt + 2) * 2 + 1]);
-      const short qh_shift_a = quadrant * 2;
-      const short qh_shift_b = qh_shift_a + 4;
-
-#pragma unroll
-      for (short i = 0; i < n_reads; i++) {
-        const uint8_t ql_byte = ql_base[i];
-        const uint8_t h = qh_base[i];
-        const float es_a = (i >= 16) ? es_hi_a : es_lo_a;
-        const float es_b = (i >= 16) ? es_hi_b : es_lo_b;
-        const uint8_t low4_a = ql_byte & 0x0F;
-        const uint8_t low4_b = ql_byte >> 4;
-        const uint8_t high2_a = (uint8_t)((h >> qh_shift_a) & 0x03);
-        const uint8_t high2_b = (uint8_t)((h >> qh_shift_b) & 0x03);
-        const int8_t q6_a = (int8_t)(low4_a | (high2_a << 4)) - (int8_t)32;
-        const int8_t q6_b = (int8_t)(low4_b | (high2_b << 4)) - (int8_t)32;
-        dst[i] = T(es_a * float(q6_a));
-        cached.cached[i] = T(es_b * float(q6_b));
-      }
-      return;
-    }
-
-    const short base = fixed_kt_base;
+    const short base = reduction_dim == 1 ? kt_base : fixed_kt_base;
     const short kt = base + (bj / k_tile_size);
     const short half_idx = kt / 4;
     const short quadrant = kt - half_idx * 4;
@@ -1652,6 +1820,11 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ3_KBlockLoader {
+  // Double-buffer safe: kt-position-generic load_unsafe (the former
+  // pair-cache + hmask cache replayed on odd kt_base, which reads a
+  // never-filled cache on the odd-tile DB loader instance; per the
+  // q6_k/q5_k precedent the re-dequant is free under weight streaming).
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q3_K_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_Q3_K_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -1679,12 +1852,6 @@ struct KqNaxQ3_KBlockLoader {
   threadgroup T* dst;
   const device uint8_t* src;
   short kt_base;
-  // Pair-cache + hmask cache; reduction_dim==0 has no register storage.
-  struct Caches {
-    T cached[n_reads];
-    uint8_t hmask_cache[bytes_per_thread];
-  };
-  metal::conditional_t<reduction_dim == 1, Caches, kq_empty> cached;
 
   KqNaxQ3_KBlockLoader(
       const device uint8_t* src_,
@@ -1707,76 +1874,8 @@ struct KqNaxQ3_KBlockLoader {
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         kt_base(0) {}
 
-  void load_unsafe() {
-    if constexpr (reduction_dim == 1) {
-      if (kt_base & 2) {
-#pragma unroll
-        for (short i = 0; i < bytes_per_thread; i++) {
-          dst[i] = cached.cached[i];
-          dst[k_tile_size + i] = cached.cached[bytes_per_thread + i];
-        }
-        return;
-      }
-
-      const short base = kt_base;
-      const short outer_half = base / 4;
-      const short scale_off = (bj_byte >= 16) ? 1 : 0;
-
-      const float d = float(*(const device half*)(src + KQ_Q3_K_D_OFFSET));
-      const device uint8_t* qs =
-          src + KQ_Q3_K_QS_OFFSET + outer_half * 32 + bj_byte;
-      const device uint8_t* hm = src + KQ_Q3_K_HMASK_OFFSET + bj_byte;
-
-      const float es_a = d *
-          float((int)kq_q3_k_unpack_scale(
-                    base * 2 + scale_off, src + KQ_Q3_K_SCALES_OFFSET) -
-                32);
-      const float es_b = d *
-          float((int)kq_q3_k_unpack_scale(
-                    (base + 1) * 2 + scale_off, src + KQ_Q3_K_SCALES_OFFSET) -
-                32);
-      const float es_c = d *
-          float((int)kq_q3_k_unpack_scale(
-                    (base + 2) * 2 + scale_off, src + KQ_Q3_K_SCALES_OFFSET) -
-                32);
-      const float es_d = d *
-          float((int)kq_q3_k_unpack_scale(
-                    (base + 3) * 2 + scale_off, src + KQ_Q3_K_SCALES_OFFSET) -
-                32);
-
-      const short shift_a = (base & 3) * 2;
-      const short shift_b = ((base + 1) & 3) * 2;
-      const short shift_c = ((base + 2) & 3) * 2;
-      const short shift_d = ((base + 3) & 3) * 2;
-
-      if (kt_base == 0) {
-#pragma unroll
-        for (short i = 0; i < bytes_per_thread; i++) {
-          cached.hmask_cache[i] = hm[i];
-        }
-      }
-
-#pragma unroll
-      for (short i = 0; i < bytes_per_thread; i++) {
-        const uint8_t q = qs[i];
-        const uint8_t h = cached.hmask_cache[i];
-        const uint8_t q2_a = (q >> shift_a) & 0x03;
-        const uint8_t q2_b = (q >> shift_b) & 0x03;
-        const uint8_t q2_c = (q >> shift_c) & 0x03;
-        const uint8_t q2_d = (q >> shift_d) & 0x03;
-        const int q3_a = (int)q2_a - (((h >> base) & 1) ? 0 : 4);
-        const int q3_b = (int)q2_b - (((h >> (base + 1)) & 1) ? 0 : 4);
-        const int q3_c = (int)q2_c - (((h >> (base + 2)) & 1) ? 0 : 4);
-        const int q3_d = (int)q2_d - (((h >> (base + 3)) & 1) ? 0 : 4);
-        dst[i] = T(es_a * float(q3_a));
-        dst[k_tile_size + i] = T(es_b * float(q3_b));
-        cached.cached[i] = T(es_c * float(q3_c));
-        cached.cached[bytes_per_thread + i] = T(es_d * float(q3_d));
-      }
-      return;
-    }
-
-    const short base = fixed_kt_base;
+  void load_unsafe() const {
+    const short base = reduction_dim == 1 ? kt_base : fixed_kt_base;
     const short outer_half = base / 4;
     const short scale_off = (bj_byte >= 16) ? 1 : 0;
 
@@ -1813,7 +1912,7 @@ struct KqNaxQ3_KBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) {
+  void load_safe(short2 src_tile_dim) const {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < bytes_per_thread; i++) {
@@ -1849,6 +1948,9 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxQ2_KBlockLoader {
+  // Double-buffer safe: kt-position-generic load_unsafe (former pair-cache
+  // deleted, same treatment as q3_k).
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_Q2_K_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_Q2_K_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -1876,10 +1978,6 @@ struct KqNaxQ2_KBlockLoader {
   threadgroup T* dst;
   const device uint8_t* src;
   short kt_base;
-  struct Caches {
-    T cached[n_reads];
-  };
-  metal::conditional_t<reduction_dim == 1, Caches, kq_empty> cached;
 
   KqNaxQ2_KBlockLoader(
       const device uint8_t* src_,
@@ -1902,74 +2000,8 @@ struct KqNaxQ2_KBlockLoader {
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         kt_base(0) {}
 
-  void load_unsafe() {
-    if constexpr (reduction_dim == 1) {
-      if (kt_base & 2) {
-#pragma unroll
-        for (short i = 0; i < bytes_per_thread; i++) {
-          dst[i] = cached.cached[i];
-          dst[k_tile_size + i] = cached.cached[bytes_per_thread + i];
-        }
-        return;
-      }
-
-      const short base = kt_base;
-      const short outer_half = base / 4;
-      const short scale_off = (bj_byte >= 16) ? 1 : 0;
-
-      const float d = float(*(const device half*)(src + KQ_Q2_K_D_OFFSET));
-      const float dmin =
-          float(*(const device half*)(src + KQ_Q2_K_DMIN_OFFSET));
-      const device uint8_t* qs =
-          src + KQ_Q2_K_QS_OFFSET + outer_half * 32 + bj_byte;
-
-      static_assert(
-          bytes_per_thread == 16,
-          "Q2_K NAX vector load assumes bytes_per_thread == 16.");
-      uint8_t qs_b[bytes_per_thread];
-#pragma unroll
-      for (short v = 0; v < bytes_per_thread / 4; v++) {
-        const uint qs_v = *reinterpret_cast<const device uint*>(qs + v * 4);
-        *reinterpret_cast<thread uint*>(&qs_b[v * 4]) = qs_v;
-      }
-
-      const uint8_t sc_a = src[KQ_Q2_K_SCALES_OFFSET + base * 2 + scale_off];
-      const uint8_t sc_b =
-          src[KQ_Q2_K_SCALES_OFFSET + (base + 1) * 2 + scale_off];
-      const uint8_t sc_c =
-          src[KQ_Q2_K_SCALES_OFFSET + (base + 2) * 2 + scale_off];
-      const uint8_t sc_d =
-          src[KQ_Q2_K_SCALES_OFFSET + (base + 3) * 2 + scale_off];
-      const float es_a = d * float(sc_a & 0x0F);
-      const float em_a = dmin * float(sc_a >> 4);
-      const float es_b = d * float(sc_b & 0x0F);
-      const float em_b = dmin * float(sc_b >> 4);
-      const float es_c = d * float(sc_c & 0x0F);
-      const float em_c = dmin * float(sc_c >> 4);
-      const float es_d = d * float(sc_d & 0x0F);
-      const float em_d = dmin * float(sc_d >> 4);
-
-      const short shift_a = (base & 3) * 2;
-      const short shift_b = ((base + 1) & 3) * 2;
-      const short shift_c = ((base + 2) & 3) * 2;
-      const short shift_d = ((base + 3) & 3) * 2;
-
-#pragma unroll
-      for (short i = 0; i < bytes_per_thread; i++) {
-        const uint8_t q = qs_b[i];
-        const uint8_t q2_a = (q >> shift_a) & 0x03;
-        const uint8_t q2_b = (q >> shift_b) & 0x03;
-        const uint8_t q2_c = (q >> shift_c) & 0x03;
-        const uint8_t q2_d = (q >> shift_d) & 0x03;
-        dst[i] = T(es_a * float(q2_a) - em_a);
-        dst[k_tile_size + i] = T(es_b * float(q2_b) - em_b);
-        cached.cached[i] = T(es_c * float(q2_c) - em_c);
-        cached.cached[bytes_per_thread + i] = T(es_d * float(q2_d) - em_d);
-      }
-      return;
-    }
-
-    const short base = fixed_kt_base;
+  void load_unsafe() const {
+    const short base = reduction_dim == 1 ? kt_base : fixed_kt_base;
     const short outer_half = base / 4;
     const short scale_off = (bj_byte >= 16) ? 1 : 0;
 
@@ -2008,7 +2040,7 @@ struct KqNaxQ2_KBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) {
+  void load_safe(short2 src_tile_dim) const {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < bytes_per_thread; i++) {
@@ -2033,254 +2065,281 @@ struct KqNaxQ2_KBlockLoader {
   }
 };
 
-#define KQ_NAX_DEFINE_KERNELS(codec, GROUP_CONST, bits_val, LOADER)       \
-  template <                                                              \
-      typename T,                                                         \
-      int group_size,                                                     \
-      int bits,                                                           \
-      bool aligned_N,                                                     \
-      bool batched,                                                       \
-      int BM,                                                             \
-      int BN,                                                             \
-      int WM,                                                             \
-      int WN>                                                             \
-  [[kernel]] void kq_##codec##_qmm_t_nax(                                 \
-      const device uint8_t* w,                                            \
-      const device uint8_t* /* scales */,                                 \
-      const device T* x,                                                  \
-      device T* y,                                                        \
-      const constant int& K,                                              \
-      const constant int& N,                                              \
-      const constant int& M,                                              \
-      const constant int& x_batch_ndims,                                  \
-      const constant int* x_shape,                                        \
-      const constant int64_t* x_strides,                                  \
-      const constant int& w_batch_ndims,                                  \
-      const constant int* w_shape,                                        \
-      const constant int64_t* w_strides,                                  \
-      const constant int64_t* /* s_strides */,                            \
-      uint3 tid [[threadgroup_position_in_grid]],                         \
-      uint lid [[thread_index_in_threadgroup]],                           \
-      uint simd_gid [[simdgroup_index_in_threadgroup]],                   \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                      \
-    static_assert(                                                        \
-        group_size == GROUP_CONST,                                        \
-        #codec " NAX kernel requires group_size=" #GROUP_CONST);          \
-    static_assert(                                                        \
-        bits == bits_val, #codec " NAX kernel requires bits=" #bits_val); \
-    constexpr int BK = 64;                                                \
-    constexpr int BK_padded = (BK + 16 / sizeof(T));                      \
-    threadgroup T Ws[BN * BK_padded];                                     \
-    if constexpr (batched) {                                              \
-      kq_adjust_matrix_offsets<T>(                                        \
-          x,                                                              \
-          w,                                                              \
-          y,                                                              \
-          M * N,                                                          \
-          x_batch_ndims,                                                  \
-          x_shape,                                                        \
-          x_strides,                                                      \
-          w_batch_ndims,                                                  \
-          w_shape,                                                        \
-          w_strides,                                                      \
-          tid);                                                           \
-    }                                                                     \
-    using LoaderW = LOADER<                                               \
-        T,                                                                \
-        BN,                                                               \
-        BK,                                                               \
-        BK_padded,                                                        \
-        /*reduction_dim=*/1,                                              \
-        /*tgp_size=*/WM * WN * SIMD_SIZE>;                                \
-    kq_qmm_t_nax_tgp_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(     \
-        w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);              \
-  }                                                                       \
-                                                                          \
-  template <typename T, int group_size, int bits, bool batched>           \
-  [[kernel]] void kq_##codec##_qmm_n_nax(                                 \
-      const device uint8_t* w,                                            \
-      const device uint8_t* /* scales */,                                 \
-      const device T* x,                                                  \
-      device T* y,                                                        \
-      const constant int& K,                                              \
-      const constant int& N,                                              \
-      const constant int& M,                                              \
-      const constant int& x_batch_ndims,                                  \
-      const constant int* x_shape,                                        \
-      const constant int64_t* x_strides,                                  \
-      const constant int& w_batch_ndims,                                  \
-      const constant int* w_shape,                                        \
-      const constant int64_t* w_strides,                                  \
-      const constant int64_t* /* s_strides */,                            \
-      uint3 tid [[threadgroup_position_in_grid]],                         \
-      uint lid [[thread_index_in_threadgroup]],                           \
-      uint simd_gid [[simdgroup_index_in_threadgroup]],                   \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                      \
-    static_assert(                                                        \
-        group_size == GROUP_CONST,                                        \
-        #codec " NAX kernel requires group_size=" #GROUP_CONST);          \
-    static_assert(                                                        \
-        bits == bits_val, #codec " NAX kernel requires bits=" #bits_val); \
-    constexpr int BM = 64, BK = 64, BN = 64, WM = 2, WN = 2;              \
-    constexpr int BN_padded = (BN + 16 / sizeof(T));                      \
-    threadgroup T Ws[BK * BN_padded];                                     \
-    if constexpr (batched) {                                              \
-      kq_adjust_matrix_offsets<T>(                                        \
-          x,                                                              \
-          w,                                                              \
-          y,                                                              \
-          M * N,                                                          \
-          x_batch_ndims,                                                  \
-          x_shape,                                                        \
-          x_strides,                                                      \
-          w_batch_ndims,                                                  \
-          w_shape,                                                        \
-          w_strides,                                                      \
-          tid);                                                           \
-    }                                                                     \
-    using LoaderW = LOADER<                                               \
-        T,                                                                \
-        BK,                                                               \
-        BN,                                                               \
-        BN_padded,                                                        \
-        /*reduction_dim=*/0,                                              \
-        /*tgp_size=*/WM * WN * SIMD_SIZE>;                                \
-    kq_qmm_n_nax_tgp_impl<T, LoaderW, BM, BK, BN, WM, WN>(                \
-        w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);              \
-  }                                                                       \
-                                                                          \
-  template <                                                              \
-      typename T,                                                         \
-      int group_size,                                                     \
-      int bits,                                                           \
-      bool aligned_N,                                                     \
-      int BM,                                                             \
-      int BN,                                                             \
-      int WM,                                                             \
-      int WN>                                                             \
-  [[kernel]] void kq_##codec##_gather_qmm_t_nax(                          \
-      const device uint8_t* w,                                            \
-      const device uint8_t* /* scales */,                                 \
-      const device T* x,                                                  \
-      const device uint32_t* lhs_indices,                                 \
-      const device uint32_t* rhs_indices,                                 \
-      device T* y,                                                        \
-      const constant int& K,                                              \
-      const constant int& N,                                              \
-      const constant int& M,                                              \
-      const constant int& x_batch_ndims,                                  \
-      const constant int* x_shape,                                        \
-      const constant int64_t* x_strides,                                  \
-      const constant int& w_batch_ndims,                                  \
-      const constant int* w_shape,                                        \
-      const constant int64_t* w_strides,                                  \
-      const constant int64_t* /* s_strides */,                            \
-      const constant int& batch_ndims,                                    \
-      const constant int* batch_shape,                                    \
-      const constant int64_t* lhs_strides,                                \
-      const constant int64_t* rhs_strides,                                \
-      uint3 tid [[threadgroup_position_in_grid]],                         \
-      uint lid [[thread_index_in_threadgroup]],                           \
-      uint simd_gid [[simdgroup_index_in_threadgroup]],                   \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                      \
-    static_assert(                                                        \
-        group_size == GROUP_CONST,                                        \
-        #codec " NAX kernel requires group_size=" #GROUP_CONST);          \
-    static_assert(                                                        \
-        bits == bits_val, #codec " NAX kernel requires bits=" #bits_val); \
-    constexpr int BK = 64;                                                \
-    constexpr int BK_padded = (BK + 16 / sizeof(T));                      \
-    threadgroup T Ws[BN * BK_padded];                                     \
-    kq_adjust_matrix_offsets<T>(                                          \
-        x,                                                                \
-        w,                                                                \
-        lhs_indices,                                                      \
-        rhs_indices,                                                      \
-        y,                                                                \
-        M * N,                                                            \
-        batch_ndims,                                                      \
-        batch_shape,                                                      \
-        lhs_strides,                                                      \
-        rhs_strides,                                                      \
-        x_batch_ndims,                                                    \
-        x_shape,                                                          \
-        x_strides,                                                        \
-        w_batch_ndims,                                                    \
-        w_shape,                                                          \
-        w_strides,                                                        \
-        tid);                                                             \
-    using LoaderW = LOADER<                                               \
-        T,                                                                \
-        BN,                                                               \
-        BK,                                                               \
-        BK_padded,                                                        \
-        /*reduction_dim=*/1,                                              \
-        /*tgp_size=*/WM * WN * SIMD_SIZE>;                                \
-    kq_qmm_t_nax_tgp_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(     \
-        w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);              \
-  }                                                                       \
-                                                                          \
-  template <typename T, int group_size, int bits>                         \
-  [[kernel]] void kq_##codec##_gather_qmm_n_nax(                          \
-      const device uint8_t* w,                                            \
-      const device uint8_t* /* scales */,                                 \
-      const device T* x,                                                  \
-      const device uint32_t* lhs_indices,                                 \
-      const device uint32_t* rhs_indices,                                 \
-      device T* y,                                                        \
-      const constant int& K,                                              \
-      const constant int& N,                                              \
-      const constant int& M,                                              \
-      const constant int& x_batch_ndims,                                  \
-      const constant int* x_shape,                                        \
-      const constant int64_t* x_strides,                                  \
-      const constant int& w_batch_ndims,                                  \
-      const constant int* w_shape,                                        \
-      const constant int64_t* w_strides,                                  \
-      const constant int64_t* /* s_strides */,                            \
-      const constant int& batch_ndims,                                    \
-      const constant int* batch_shape,                                    \
-      const constant int64_t* lhs_strides,                                \
-      const constant int64_t* rhs_strides,                                \
-      uint3 tid [[threadgroup_position_in_grid]],                         \
-      uint lid [[thread_index_in_threadgroup]],                           \
-      uint simd_gid [[simdgroup_index_in_threadgroup]],                   \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                      \
-    static_assert(                                                        \
-        group_size == GROUP_CONST,                                        \
-        #codec " NAX kernel requires group_size=" #GROUP_CONST);          \
-    static_assert(                                                        \
-        bits == bits_val, #codec " NAX kernel requires bits=" #bits_val); \
-    constexpr int BM = 64, BK = 64, BN = 64, WM = 2, WN = 2;              \
-    constexpr int BN_padded = (BN + 16 / sizeof(T));                      \
-    threadgroup T Ws[BK * BN_padded];                                     \
-    kq_adjust_matrix_offsets<T>(                                          \
-        x,                                                                \
-        w,                                                                \
-        lhs_indices,                                                      \
-        rhs_indices,                                                      \
-        y,                                                                \
-        M * N,                                                            \
-        batch_ndims,                                                      \
-        batch_shape,                                                      \
-        lhs_strides,                                                      \
-        rhs_strides,                                                      \
-        x_batch_ndims,                                                    \
-        x_shape,                                                          \
-        x_strides,                                                        \
-        w_batch_ndims,                                                    \
-        w_shape,                                                          \
-        w_strides,                                                        \
-        tid);                                                             \
-    using LoaderW = LOADER<                                               \
-        T,                                                                \
-        BK,                                                               \
-        BN,                                                               \
-        BN_padded,                                                        \
-        /*reduction_dim=*/0,                                              \
-        /*tgp_size=*/WM * WN * SIMD_SIZE>;                                \
-    kq_qmm_n_nax_tgp_impl<T, LoaderW, BM, BK, BN, WM, WN>(                \
-        w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);              \
+#define KQ_NAX_DEFINE_KERNELS(codec, GROUP_CONST, bits_val, LOADER)        \
+  template <                                                               \
+      typename T,                                                          \
+      int group_size,                                                      \
+      int bits,                                                            \
+      bool aligned_N,                                                      \
+      bool batched,                                                        \
+      int BM,                                                              \
+      int BN,                                                              \
+      int WM,                                                              \
+      int WN,                                                              \
+      bool use_db = false>                                                 \
+  [[kernel]] void kq_##codec##_qmm_t_nax(                                  \
+      const device uint8_t* w,                                             \
+      const device uint8_t* /* scales */,                                  \
+      const device T* x,                                                   \
+      device T* y,                                                         \
+      const constant int& K,                                               \
+      const constant int& N,                                               \
+      const constant int& M,                                               \
+      const constant int& x_batch_ndims,                                   \
+      const constant int* x_shape,                                         \
+      const constant int64_t* x_strides,                                   \
+      const constant int& w_batch_ndims,                                   \
+      const constant int* w_shape,                                         \
+      const constant int64_t* w_strides,                                   \
+      const constant int64_t* /* s_strides */,                             \
+      uint3 tid [[threadgroup_position_in_grid]],                          \
+      uint3 tgp_grid [[threadgroups_per_grid]],                            \
+      uint lid [[thread_index_in_threadgroup]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                    \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                       \
+    static_assert(                                                         \
+        group_size == GROUP_CONST,                                         \
+        #codec " NAX kernel requires group_size=" #GROUP_CONST);           \
+    static_assert(                                                         \
+        bits == bits_val, #codec " NAX kernel requires bits=" #bits_val);  \
+    tid = kq_swizzle_tid(tid, tgp_grid, N, BN);                            \
+    if (int(tid.y) * BM >= M) {                                            \
+      return;                                                              \
+    }                                                                      \
+    constexpr int BK = 64;                                                 \
+    constexpr int BK_padded = (BK + 16 / sizeof(T));                       \
+    using LoaderW = LOADER<                                                \
+        T,                                                                 \
+        BN,                                                                \
+        BK,                                                                \
+        BK_padded,                                                         \
+        /*reduction_dim=*/1,                                               \
+        /*tgp_size=*/WM * WN * SIMD_SIZE>;                                 \
+    static_assert(                                                         \
+        !use_db || LoaderW::db_safe, "use_db requires a db_safe loader");  \
+    constexpr int kWsBufs =                                                \
+        (LoaderW::db_safe && (BM == 32 || use_db)) ? 2 : 1;                \
+    threadgroup T Ws[kWsBufs * BN * BK_padded];                            \
+    if constexpr (batched) {                                               \
+      kq_adjust_matrix_offsets<T>(                                         \
+          x,                                                               \
+          w,                                                               \
+          y,                                                               \
+          M * N,                                                           \
+          x_batch_ndims,                                                   \
+          x_shape,                                                         \
+          x_strides,                                                       \
+          w_batch_ndims,                                                   \
+          w_shape,                                                         \
+          w_strides,                                                       \
+          tid);                                                            \
+    }                                                                      \
+    kq_qmm_t_nax_tgp_impl<                                                 \
+        T,                                                                 \
+        LoaderW,                                                           \
+        aligned_N,                                                         \
+        BM,                                                                \
+        BK,                                                                \
+        BN,                                                                \
+        WM,                                                                \
+        WN,                                                                \
+        kWsBufs == 2>(w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid); \
+  }                                                                        \
+                                                                           \
+  template <typename T, int group_size, int bits, bool batched>            \
+  [[kernel]] void kq_##codec##_qmm_n_nax(                                  \
+      const device uint8_t* w,                                             \
+      const device uint8_t* /* scales */,                                  \
+      const device T* x,                                                   \
+      device T* y,                                                         \
+      const constant int& K,                                               \
+      const constant int& N,                                               \
+      const constant int& M,                                               \
+      const constant int& x_batch_ndims,                                   \
+      const constant int* x_shape,                                         \
+      const constant int64_t* x_strides,                                   \
+      const constant int& w_batch_ndims,                                   \
+      const constant int* w_shape,                                         \
+      const constant int64_t* w_strides,                                   \
+      const constant int64_t* /* s_strides */,                             \
+      uint3 tid [[threadgroup_position_in_grid]],                          \
+      uint lid [[thread_index_in_threadgroup]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                    \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                       \
+    static_assert(                                                         \
+        group_size == GROUP_CONST,                                         \
+        #codec " NAX kernel requires group_size=" #GROUP_CONST);           \
+    static_assert(                                                         \
+        bits == bits_val, #codec " NAX kernel requires bits=" #bits_val);  \
+    constexpr int BM = 64, BK = 64, BN = 64, WM = 2, WN = 2;               \
+    constexpr int BN_padded = (BN + 16 / sizeof(T));                       \
+    threadgroup T Ws[BK * BN_padded];                                      \
+    if constexpr (batched) {                                               \
+      kq_adjust_matrix_offsets<T>(                                         \
+          x,                                                               \
+          w,                                                               \
+          y,                                                               \
+          M * N,                                                           \
+          x_batch_ndims,                                                   \
+          x_shape,                                                         \
+          x_strides,                                                       \
+          w_batch_ndims,                                                   \
+          w_shape,                                                         \
+          w_strides,                                                       \
+          tid);                                                            \
+    }                                                                      \
+    using LoaderW = LOADER<                                                \
+        T,                                                                 \
+        BK,                                                                \
+        BN,                                                                \
+        BN_padded,                                                         \
+        /*reduction_dim=*/0,                                               \
+        /*tgp_size=*/WM * WN * SIMD_SIZE>;                                 \
+    kq_qmm_n_nax_tgp_impl<T, LoaderW, BM, BK, BN, WM, WN>(                 \
+        w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);               \
+  }                                                                        \
+                                                                           \
+  template <                                                               \
+      typename T,                                                          \
+      int group_size,                                                      \
+      int bits,                                                            \
+      bool aligned_N,                                                      \
+      int BM,                                                              \
+      int BN,                                                              \
+      int WM,                                                              \
+      int WN>                                                              \
+  [[kernel]] void kq_##codec##_gather_qmm_t_nax(                           \
+      const device uint8_t* w,                                             \
+      const device uint8_t* /* scales */,                                  \
+      const device T* x,                                                   \
+      const device uint32_t* lhs_indices,                                  \
+      const device uint32_t* rhs_indices,                                  \
+      device T* y,                                                         \
+      const constant int& K,                                               \
+      const constant int& N,                                               \
+      const constant int& M,                                               \
+      const constant int& x_batch_ndims,                                   \
+      const constant int* x_shape,                                         \
+      const constant int64_t* x_strides,                                   \
+      const constant int& w_batch_ndims,                                   \
+      const constant int* w_shape,                                         \
+      const constant int64_t* w_strides,                                   \
+      const constant int64_t* /* s_strides */,                             \
+      const constant int& batch_ndims,                                     \
+      const constant int* batch_shape,                                     \
+      const constant int64_t* lhs_strides,                                 \
+      const constant int64_t* rhs_strides,                                 \
+      uint3 tid [[threadgroup_position_in_grid]],                          \
+      uint lid [[thread_index_in_threadgroup]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                    \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                       \
+    static_assert(                                                         \
+        group_size == GROUP_CONST,                                         \
+        #codec " NAX kernel requires group_size=" #GROUP_CONST);           \
+    static_assert(                                                         \
+        bits == bits_val, #codec " NAX kernel requires bits=" #bits_val);  \
+    constexpr int BK = 64;                                                 \
+    constexpr int BK_padded = (BK + 16 / sizeof(T));                       \
+    using LoaderW = LOADER<                                                \
+        T,                                                                 \
+        BN,                                                                \
+        BK,                                                                \
+        BK_padded,                                                         \
+        /*reduction_dim=*/1,                                               \
+        /*tgp_size=*/WM * WN * SIMD_SIZE>;                                 \
+    constexpr int kWsBufs = (LoaderW::db_safe && BM == 32) ? 2 : 1;        \
+    threadgroup T Ws[kWsBufs * BN * BK_padded];                            \
+    kq_adjust_matrix_offsets<T>(                                           \
+        x,                                                                 \
+        w,                                                                 \
+        lhs_indices,                                                       \
+        rhs_indices,                                                       \
+        y,                                                                 \
+        M * N,                                                             \
+        batch_ndims,                                                       \
+        batch_shape,                                                       \
+        lhs_strides,                                                       \
+        rhs_strides,                                                       \
+        x_batch_ndims,                                                     \
+        x_shape,                                                           \
+        x_strides,                                                         \
+        w_batch_ndims,                                                     \
+        w_shape,                                                           \
+        w_strides,                                                         \
+        tid);                                                              \
+    kq_qmm_t_nax_tgp_impl<                                                 \
+        T,                                                                 \
+        LoaderW,                                                           \
+        aligned_N,                                                         \
+        BM,                                                                \
+        BK,                                                                \
+        BN,                                                                \
+        WM,                                                                \
+        WN,                                                                \
+        kWsBufs == 2>(w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid); \
+  }                                                                        \
+                                                                           \
+  template <typename T, int group_size, int bits>                          \
+  [[kernel]] void kq_##codec##_gather_qmm_n_nax(                           \
+      const device uint8_t* w,                                             \
+      const device uint8_t* /* scales */,                                  \
+      const device T* x,                                                   \
+      const device uint32_t* lhs_indices,                                  \
+      const device uint32_t* rhs_indices,                                  \
+      device T* y,                                                         \
+      const constant int& K,                                               \
+      const constant int& N,                                               \
+      const constant int& M,                                               \
+      const constant int& x_batch_ndims,                                   \
+      const constant int* x_shape,                                         \
+      const constant int64_t* x_strides,                                   \
+      const constant int& w_batch_ndims,                                   \
+      const constant int* w_shape,                                         \
+      const constant int64_t* w_strides,                                   \
+      const constant int64_t* /* s_strides */,                             \
+      const constant int& batch_ndims,                                     \
+      const constant int* batch_shape,                                     \
+      const constant int64_t* lhs_strides,                                 \
+      const constant int64_t* rhs_strides,                                 \
+      uint3 tid [[threadgroup_position_in_grid]],                          \
+      uint lid [[thread_index_in_threadgroup]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                    \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                       \
+    static_assert(                                                         \
+        group_size == GROUP_CONST,                                         \
+        #codec " NAX kernel requires group_size=" #GROUP_CONST);           \
+    static_assert(                                                         \
+        bits == bits_val, #codec " NAX kernel requires bits=" #bits_val);  \
+    constexpr int BM = 64, BK = 64, BN = 64, WM = 2, WN = 2;               \
+    constexpr int BN_padded = (BN + 16 / sizeof(T));                       \
+    threadgroup T Ws[BK * BN_padded];                                      \
+    kq_adjust_matrix_offsets<T>(                                           \
+        x,                                                                 \
+        w,                                                                 \
+        lhs_indices,                                                       \
+        rhs_indices,                                                       \
+        y,                                                                 \
+        M * N,                                                             \
+        batch_ndims,                                                       \
+        batch_shape,                                                       \
+        lhs_strides,                                                       \
+        rhs_strides,                                                       \
+        x_batch_ndims,                                                     \
+        x_shape,                                                           \
+        x_strides,                                                         \
+        w_batch_ndims,                                                     \
+        w_shape,                                                           \
+        w_strides,                                                         \
+        tid);                                                              \
+    using LoaderW = LOADER<                                                \
+        T,                                                                 \
+        BK,                                                                \
+        BN,                                                                \
+        BN_padded,                                                         \
+        /*reduction_dim=*/0,                                               \
+        /*tgp_size=*/WM * WN * SIMD_SIZE>;                                 \
+    kq_qmm_n_nax_tgp_impl<T, LoaderW, BM, BK, BN, WM, WN>(                 \
+        w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);               \
   }
 
 // ---- IQ-codec NAX block loaders (load-only; ALU dequant re-tiled to BK=64)
@@ -2296,6 +2355,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq4_nlBlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ4_NL_GROUP;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ4_NL_BLOCK_BYTES;
 
@@ -2348,11 +2408,25 @@ struct KqNaxIq4_nlBlockLoader {
     const device uint8_t* block_addr = src + block_idx * bytes_per_block;
     const float d = float(*(const device half*)block_addr);
     const device uint8_t* qs = block_addr + KQ_IQ4_NL_QS_OFFSET;
+    if constexpr (n_reads == weights_per_block) {
+      // One whole block per thread (within == 0): 8 aligned ushorts (qs
+      // sits at +2 of an 18-byte block) replace 32 single-byte loads.
+      const device ushort* qs16 = (const device ushort*)qs;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int j = within + i;
-      const int x = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
-      dst[i] = T(d * float(kvalues_iq4nl[x]));
+      for (short s = 0; s < 8; s++) {
+        const ushort v = qs16[s];
+        dst[2 * s + 0] = T(d * float(kvalues_iq4nl[v & 0x000Fu]));
+        dst[2 * s + 1] = T(d * float(kvalues_iq4nl[(v >> 8) & 0x000Fu]));
+        dst[2 * s + 16] = T(d * float(kvalues_iq4nl[(v >> 4) & 0x000Fu]));
+        dst[2 * s + 17] = T(d * float(kvalues_iq4nl[v >> 12]));
+      }
+    } else {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        const int j = within + i;
+        const int x = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
+        dst[i] = T(d * float(kvalues_iq4nl[x]));
+      }
     }
   }
 
@@ -2390,6 +2464,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq4_xsBlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ4_XS_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ4_XS_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -2491,6 +2566,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq3_xxsBlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ3_XXS_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ3_XXS_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -2595,6 +2671,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq3_sBlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ3_S_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ3_S_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -2703,6 +2780,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq2_xxsBlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ2_XXS_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ2_XXS_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -2805,6 +2883,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq2_xsBlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ2_XS_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ2_XS_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -2909,6 +2988,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq2_sBlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ2_S_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ2_S_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -3014,6 +3094,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq1_sBlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ1_S_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ1_S_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;
@@ -3116,6 +3197,7 @@ template <
     short reduction_dim,
     short tgp_size>
 struct KqNaxIq1_mBlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
   MLX_MTL_CONST int weights_per_block = KQ_IQ1_M_SUPERBLOCK;
   MLX_MTL_CONST int bytes_per_block = KQ_IQ1_M_BLOCK_BYTES;
   MLX_MTL_CONST int k_tile_size = 32;

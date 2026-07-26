@@ -669,6 +669,128 @@ METAL_FUNC void kq_mv_ext_impl(
   }
 }
 
+// Wide-M variant of kq_mv_ext_impl: each thread owns nr0 CONSECUTIVE output
+// rows instead of one. The nr0=1 kernel re-loads all r1ptg activation columns
+// per 16-weight chunk per row, so activation cache traffic scales as
+// M * N * K and dominates past M~5 (q6_k [17408x5120]: 542 GB/s at M=2,
+// 313 at M=8 against a flat ~540 weight-bound). Sharing one activation load
+// across nr0 dequantized rows divides that traffic by nr0 at the cost of
+// nr0 * r1ptg accumulators + nr0 float4x4 dequant registers per thread.
+// Same weight DRAM traffic; grid.x shrinks by nr0.
+template <
+    typename T,
+    typename Codec,
+    short r1ptg,
+    short nsg,
+    short nxpsg,
+    short nr0>
+METAL_FUNC void kq_mv_ext_nr_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    uint3 tgpig,
+    ushort tiisg,
+    ushort sgitg) {
+  constexpr short nypsg = 32 / nxpsg; // row-groups per simdgroup
+  constexpr short chpb = Codec::superblock / 16; // 16-weight chunks per block
+  const short tx = tiisg % nxpsg; // K position within the row group
+  const short ty = tiisg / nxpsg; // which of nypsg row-groups
+
+  const int i01 =
+      (tgpig.x * (nypsg * nsg) + nypsg * sgitg + ty) * nr0; // first row
+  const int i11 = tgpig.y * r1ptg; // first activation column
+
+  const int nb = in_vec_size / Codec::superblock;
+  const int row_bytes = nb * Codec::block_bytes;
+  // Clamp OOB rows to row 0 for a valid read; stores are masked below.
+  const device uint8_t* w_rows[nr0];
+#pragma unroll
+  for (short ir0 = 0; ir0 < nr0; ++ir0) {
+    const int row = i01 + ir0;
+    w_rows[ir0] =
+        (row < out_vec_size) ? w + static_cast<int64_t>(row) * row_bytes : w;
+  }
+
+  const device T* y_col[r1ptg];
+#pragma unroll
+  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+    y_col[ir1] = x + static_cast<int64_t>(i11 + ir1) * in_vec_size + tx * 16;
+  }
+
+  float sumf[nr0][r1ptg];
+#pragma unroll
+  for (short ir0 = 0; ir0 < nr0; ++ir0) {
+#pragma unroll
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+      sumf[ir0][ir1] = 0.0f;
+    }
+  }
+
+  for (int ich = tx; 16 * ich < in_vec_size; ich += nxpsg) {
+    const int ib = ich / chpb; // super-block index
+    const short cch = ich % chpb; // chunk within super-block
+    float4x4 lx[nr0];
+#pragma unroll
+    for (short ir0 = 0; ir0 < nr0; ++ir0) {
+      Codec::deq_chunk16(
+          w_rows[ir0] + static_cast<int64_t>(ib) * Codec::block_bytes,
+          cch,
+          lx[ir0]);
+    }
+#pragma unroll
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+      const device T* yp = y_col[ir1];
+      const float4 a0 = float4(*(const device vec<T, 4>*)(yp + 0));
+      const float4 a1 = float4(*(const device vec<T, 4>*)(yp + 4));
+      const float4 a2 = float4(*(const device vec<T, 4>*)(yp + 8));
+      const float4 a3 = float4(*(const device vec<T, 4>*)(yp + 12));
+#pragma unroll
+      for (short ir0 = 0; ir0 < nr0; ++ir0) {
+        sumf[ir0][ir1] += dot(lx[ir0][0], a0) + dot(lx[ir0][1], a1) +
+            dot(lx[ir0][2], a2) + dot(lx[ir0][3], a3);
+      }
+      y_col[ir1] += nxpsg * 16;
+    }
+  }
+
+#pragma unroll
+  for (short ir0 = 0; ir0 < nr0; ++ir0) {
+#pragma unroll
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+      if (nxpsg >= 32) {
+        sumf[ir0][ir1] += simd_shuffle_down(sumf[ir0][ir1], 16);
+      }
+      if (nxpsg >= 16) {
+        sumf[ir0][ir1] += simd_shuffle_down(sumf[ir0][ir1], 8);
+      }
+      if (nxpsg >= 8) {
+        sumf[ir0][ir1] += simd_shuffle_down(sumf[ir0][ir1], 4);
+      }
+      if (nxpsg >= 4) {
+        sumf[ir0][ir1] += simd_shuffle_down(sumf[ir0][ir1], 2);
+      }
+      if (nxpsg >= 2) {
+        sumf[ir0][ir1] += simd_shuffle_down(sumf[ir0][ir1], 1);
+      }
+    }
+  }
+
+  if (tx == 0) {
+#pragma unroll
+    for (short ir0 = 0; ir0 < nr0; ++ir0) {
+      if (i01 + ir0 < out_vec_size) {
+#pragma unroll
+        for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+          y[static_cast<int64_t>(i11 + ir1) * out_vec_size + i01 + ir0] =
+              static_cast<T>(sumf[ir0][ir1]);
+        }
+      }
+    }
+  }
+}
+
 // Q8_0: 34 bytes/32 weights. [fp16 d][int8 q[32]]. w[i] = d * q[i].
 
 MLX_MTL_CONST int KQ_Q8_0_GROUP = 32;
