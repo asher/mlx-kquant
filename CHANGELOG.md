@@ -6,10 +6,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.7]
+
+Build and publish cp314 wheel
+
 ### Added
-- CPython 3.14 support: `cp314-*` wheels and 3.14 in the CI build/test matrix.
-  No source changes were needed - the pinned `mlx==0.31.2` already ships cp314
-  wheels and nanobind 2.12.0 compiles against 3.14 - so this is packaging only.
+- CPython 3.14 in the CI build/test matrix.
 
 ### Changed
 - `pypa/cibuildwheel` v2.21 -> v4.1.1 in the release workflow. cp314 is only
