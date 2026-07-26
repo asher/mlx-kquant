@@ -58,35 +58,52 @@ using mx::Stream;
 // all, and both wins are N-gated (K is not the driver: q6_k at
 // [17408x4096] wins +8-12% while [14336x5120] is a wash; the decode
 // projection shapes N<=4096 lose -3 to -11%).
+// bm128_min_m: lowest M at which the M>=193 band takes the BM=128 tile
+// (still inside the even-ceil(M/64) window; never 0, every codec wins
+// somewhere). Measured per codec at [17408x5120] and [4096x14336],
+// M 224/256/512/1024, paired-process ABBA (tools/qmm-bm128-ab.py):
+// - 193: wins from the band start. The dequant-ALU-heavy grid codecs
+//   are the strongest (iq2_s/iq2_xs/iq4_xs +4 to +27% everywhere
+//   measured; the taller tile amortizes dequant over twice the rows);
+//   q6_k is the originally booked +9-25%.
+// - 449: M224 (the pad-heaviest measured cell, 32 dead rows) loses
+//   -3 to -13% and M256 is small-or-wash, while M512/M1024 win up to
+//   +13% (q5_k, q3_k) -- the k-quants, q8_0, and the cheap-loader IQs.
+// - 961: the flat quartet only wins the deepest bands (+1-7% at M1024)
+//   and loses or washes below.
 struct KqSmallBmPolicy {
   bool bm32;
   int route_min;
   int db64_min_n;
+  int bm128_min_m;
 };
 static KqSmallBmPolicy kq_smallbm_policy(const std::string& t) {
   if (t == "q4_k" || t == "q3_k") {
-    return {true, 7, 0};
+    return {true, 7, 0, 449};
   }
   if (t == "q2_k" || t == "iq3_xxs") {
-    return {true, 8, 0};
+    return {true, 8, 0, 449};
   }
   if (t == "q6_k") {
     // +8-17% at N=17408 (any K), wash at 14336, -3/-11% at 4096/1024.
-    return {true, 9, 16384};
+    return {true, 9, 16384, 193};
   }
   if (t == "q8_0") {
     // db64: +2-9% at 17408, +2-4% at 14336, ~0 at 4096, -3/-8% at 1024.
     // route_min 8 post-ushort-loader (forced M8 391 vs mv 378 at 17408).
-    return {true, 8, 8192};
+    return {true, 8, 8192, 449};
   }
-  if (t == "q5_k" || t == "iq3_s") {
-    return {true, 9, 0};
+  if (t == "q5_k") {
+    return {true, 9, 0, 449};
+  }
+  if (t == "iq3_s") {
+    return {true, 9, 0, 193};
   }
   if (t == "iq2_xxs") {
-    return {true, 10, 0};
+    return {true, 10, 0, 193};
   }
   if (t == "iq4_xs") {
-    return {true, 11, 0};
+    return {true, 11, 0, 193};
   }
   // Flat-family entries are post-ushort-loader (the 32-single-byte-load
   // dequant chain was the 105-150 GB/s wall; with it gone these codecs
@@ -95,19 +112,22 @@ static KqSmallBmPolicy kq_smallbm_policy(const std::string& t) {
   // but lose -5-13% at 1024, while q4_0/iq4_nl stay neutral-to-negative
   // (their loaders are cheap enough that the duplicated Ws buffers cost
   // more occupancy than the latency hiding returns).
-  if (t == "q4_0" || t == "iq4_nl") {
-    return {true, 6, 0};
+  if (t == "q4_0") {
+    return {true, 6, 0, 961};
+  }
+  if (t == "iq4_nl") {
+    return {true, 6, 0, 449};
   }
   if (t == "q4_1" || t == "q5_1") {
-    return {true, 6, 8192};
+    return {true, 6, 8192, 961};
   }
   if (t == "q5_0") {
-    return {true, 7, 8192};
+    return {true, 7, 8192, 961};
   }
   if (t == "iq1_s") {
-    return {true, 0, 0};
+    return {true, 0, 0, 449};
   }
-  return {false, 0, 0}; // iq2_xs, iq2_s, iq1_m
+  return {false, 0, 0, 193}; // iq2_xs, iq2_s, iq1_m
 }
 
 // Shape-adjusted sub-13 route threshold. The table crossovers were tuned
@@ -197,40 +217,46 @@ void qmm_nax(
   // Window ends at 32: above it grid.y goes to 2 and every weight column
   // tile streams once per M-tile, which halves per-weight bandwidth at
   // DRAM-bound (measured: q6_k M48 146 GB/s on bm32 vs 184 on bm64).
-  if (small_bm_mode != 0 && M <= 32 &&
+  if (small_bm_mode != 0 && transpose && M <= 32 &&
       (small_bm_mode == 2 || kq_smallbm_policy(kquant_type).bm32)) {
     bm = 32;
   }
-  // BM=128 tile for M>=193: halves the row-tile count and with it weight
-  // re-streams per unique weight (q6_k ABBA at three shapes: +9-25%
-  // M224-512; prefill M512-2048 +8-10% hot, +31-40% cold). Padding
-  // decides the rest of the band: with M = 128q + r the tile carries 64
-  // extra padding rows exactly when r is in (1,64], and every measured
-  // loss cell (M144/160/192 -12-19%, M320 -6%) is in that zone while
-  // r == 0 or r > 64 is neutral-or-win -> dispatch only when ceil(M/64)
-  // is even. Floor 193: M65-128 measured pure wash (grid.y 2 -> 1 adds
-  // nothing; the band is issue-bound with parallelism to spare), first
-  // winning band is ceil(M/64) == 4. KQ_NAX_BM128=0 kills.
-  static const bool bm128_on = []() {
+  // BM=128 tile for the M>=193 band: halves the row-tile count and with
+  // it weight re-streams per unique weight (q6_k booked +9-25% M224-512;
+  // prefill M512-2048 +8-10% hot, +31-40% cold). Padding decides the
+  // rest of the band: with M = 128q + r the tile carries 64 extra
+  // padding rows exactly when r is in (1,64], and every measured loss
+  // cell (M144/160/192 -12-19%, M320 -6%) is in that zone while r == 0
+  // or r > 64 is neutral-or-win -> dispatch only when ceil(M/64) is
+  // even. The entry floor is per-codec (bm128_min_m: the 19-codec ABBA
+  // showed the shallow band flipping sign by loader weight, see the
+  // policy table). KQ_NAX_BM128: 0 = off, 1 = force floor 193 for all
+  // codecs (crossover finding), unset = per-codec policy.
+  static const int bm128_mode = []() {
     const char* e = std::getenv("KQ_NAX_BM128");
-    return e == nullptr || std::atoi(e) != 0;
+    return e == nullptr ? -1 : std::atoi(e);
   }();
-  if (bm128_on && transpose && M >= 193 && ((M + 63) / 64) % 2 == 0) {
+  int bm128_min_m = kq_smallbm_policy(kquant_type).bm128_min_m;
+  if (bm128_mode != 0 && transpose && ((M + 63) / 64) % 2 == 0 &&
+      (bm128_mode == 1 ? M >= 193 : M >= bm128_min_m)) {
     bm = 128;
   }
   // M33-64 band: the name-suffixed _db BM=64 variant double-buffers Ws
   // (bm32 here would stream weights twice via grid.y=2; blanket DB@64
   // regressed M96+ -3-15% and prefill -3-7%, so it is band-gated).
-  // KQ_NAX_DB64: 0 = off, 1 = force all codecs (crossover finding),
-  // unset = per-codec policy.
+  // KQ_NAX_DB64: 0 = off, 1 = drop the N floor (crossover finding),
+  // unset = per-codec policy. Only policy-enabled codecs
+  // (db64_min_n > 0) carry _db instantiations, so 1 is bounded by
+  // availability; probing another codec needs its instantiation
+  // restored and a metallib rebuild.
   static const int db64_mode = []() {
     const char* e = std::getenv("KQ_NAX_DB64");
     return e == nullptr ? -1 : std::atoi(e);
   }();
   int db64_min_n = kq_smallbm_policy(kquant_type).db64_min_n;
   bool use_db64 = transpose && bm == 64 && M >= 33 && M <= 64 &&
-      (db64_mode == 1 ||
-       (db64_mode == -1 && db64_min_n > 0 && N >= db64_min_n));
+      db64_min_n > 0 &&
+      (db64_mode == 1 || (db64_mode == -1 && N >= db64_min_n));
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
   // Row-tile traversal swizzle (M > 64): fold row-tiles into grid.x so
