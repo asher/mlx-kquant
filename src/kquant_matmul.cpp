@@ -875,6 +875,15 @@ void verify_mv_ext(
   }();
   const bool use_nx =
       !use_nr2 && !use_sb && mv_ext_nx != 0 && M >= 4 && kquant_type == "q6_k";
+  // T-precision-dot experiment (KQ_MV_EXT_HD=1): chunk dots in half/bfloat
+  // at 2x issue rate + no per-row activation converts, f32 fold per chunk.
+  // q6_k M 4-12, half/bfloat x only.
+  static const bool mv_ext_hd = []() {
+    const char* e = std::getenv("KQ_MV_EXT_HD");
+    return e != nullptr && std::atoi(e) == 1;
+  }();
+  const bool use_hd = !use_nr2 && !use_sb && !use_nx && mv_ext_hd && M >= 4 &&
+      kquant_type == "q6_k" && x.dtype() != mx::float32;
   const int nxpsg_eff = use_nx ? mv_ext_nx : nxpsg;
   const int rows_per_tg = (32 / nxpsg_eff) * nsg * (use_nr2 ? 2 : 1);
   MTL::Size group_dims(32, nsg, 1);
@@ -895,7 +904,8 @@ void verify_mv_ext(
       M,
       use_nr2 ? "_nr2"
               : (use_sb ? "_sb"
-                        : (use_nx ? (mv_ext_nx == 16 ? "_x16" : "_x32") : "")));
+                        : (use_nx ? (mv_ext_nx == 16 ? "_x16" : "_x32")
+                                  : (use_hd ? "_hd" : ""))));
 
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);

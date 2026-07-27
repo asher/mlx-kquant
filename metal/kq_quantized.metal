@@ -450,6 +450,31 @@ instantiate_mv_ext_sb_all(q6_k, 256, 6)
 instantiate_mv_ext_nx_all(q6_k, 256, 6, 16)
 instantiate_mv_ext_nx_all(q6_k, 256, 6, 32)
 
+// T-precision-dot experiment (KQ_MV_EXT_HD=1): the FMA-issue-bound band's
+// ALU lever. Dequanted chunk converts float->T once (amortized over M rows),
+// activations load at native T width with no per-row convert, and the
+// 16-term chunk dot runs at half/bfloat issue rate before an f32 fold.
+// q6_k only, M 4-12; no float x variant (no rate advantage). Suffix _hd.
+#define instantiate_mv_ext_hd(codec, type, gs, bits, m)                 \
+  instantiate_kernel(                                                   \
+      "kquant_" #codec "_mv_ext_" #type "_gs_" #gs "_b_" #bits "_m" #m  \
+      "_hd",                                                            \
+      kq_ ## codec ## _mv_ext_hd, type, m, 2, 8)
+#define instantiate_mv_ext_hd_for_type(codec, gs, bits, type)           \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 4)                       \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 5)                       \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 6)                       \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 7)                       \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 8)                       \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 9)                       \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 10)                      \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 11)                      \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 12)
+#define instantiate_mv_ext_hd_all(codec, gs, bits)                      \
+  instantiate_mv_ext_hd_for_type(codec, gs, bits, bfloat16_t)           \
+  instantiate_mv_ext_hd_for_type(codec, gs, bits, float16_t)
+instantiate_mv_ext_hd_all(q6_k, 256, 6)
+
 #define instantiate_kquant_q3_k_for_type(type)                          \
   instantiate_kquant_batched(verify_qmv, type, 256, 3, 0, q3_k)          \
   instantiate_kquant_batched(qmv_fast, type, 256, 3, 0, q3_k)            \

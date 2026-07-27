@@ -669,6 +669,107 @@ METAL_FUNC void kq_mv_ext_impl(
   }
 }
 
+// T-precision-dot variant of kq_mv_ext_impl (suffix _hd). Past M~4 the base
+// kernel is FMA-issue-bound, and its inner loop runs entirely at float rate:
+// 16 activation T->float converts plus 4 float4 dots per chunk per row. Here
+// the dequanted chunk converts float->T ONCE (amortized over r1ptg rows),
+// activations load at native T width with no convert, and the 16-term chunk
+// dot runs in vec<T,4> arithmetic (2x issue rate for half/bfloat on M5)
+// before folding into the f32 accumulator. Numerics: products and the
+// 3-deep in-chunk adds round at T precision; cross-chunk accumulation stays
+// f32, so error does not grow with K beyond the base kernel's.
+template <typename T, typename Codec, short r1ptg, short nsg, short nxpsg>
+METAL_FUNC void kq_mv_ext_hd_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    uint3 tgpig,
+    ushort tiisg,
+    ushort sgitg) {
+  constexpr short nypsg = 32 / nxpsg; // output rows per simdgroup
+  constexpr short chpb = Codec::superblock / 16; // 16-weight chunks per block
+  const short tx = tiisg % nxpsg; // K position within the row group
+  const short ty = tiisg / nxpsg; // which of nypsg rows this thread owns
+
+  const int i01 = tgpig.x * (nypsg * nsg) + nypsg * sgitg + ty; // output row
+  const int i11 = tgpig.y * r1ptg; // first activation column (grid.y==1 -> 0)
+
+  const int nb = in_vec_size / Codec::superblock;
+  const int row_bytes = nb * Codec::block_bytes;
+  // Clamp OOB rows to row 0 for a valid read; the store is masked below.
+  const device uint8_t* w_row =
+      (i01 < out_vec_size) ? w + static_cast<int64_t>(i01) * row_bytes : w;
+
+  const device T* y_col[r1ptg];
+#pragma unroll
+  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+    y_col[ir1] = x + static_cast<int64_t>(i11 + ir1) * in_vec_size + tx * 16;
+  }
+
+  float sumf[r1ptg];
+#pragma unroll
+  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+    sumf[ir1] = 0.0f;
+  }
+
+  for (int ich = tx; 16 * ich < in_vec_size; ich += nxpsg) {
+    const int ib = ich / chpb; // super-block index
+    const short cch = ich % chpb; // chunk within super-block
+    const device uint8_t* block =
+        w_row + static_cast<int64_t>(ib) * Codec::block_bytes;
+    float4x4 lx;
+    Codec::deq_chunk16(block, cch, lx);
+    const vec<T, 4> lt0 = vec<T, 4>(lx[0]);
+    const vec<T, 4> lt1 = vec<T, 4>(lx[1]);
+    const vec<T, 4> lt2 = vec<T, 4>(lx[2]);
+    const vec<T, 4> lt3 = vec<T, 4>(lx[3]);
+#pragma unroll
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+      const device T* yp = y_col[ir1];
+      const vec<T, 4> a0 = *(const device vec<T, 4>*)(yp + 0);
+      const vec<T, 4> a1 = *(const device vec<T, 4>*)(yp + 4);
+      const vec<T, 4> a2 = *(const device vec<T, 4>*)(yp + 8);
+      const vec<T, 4> a3 = *(const device vec<T, 4>*)(yp + 12);
+      vec<T, 4> pa = lt0 * a0;
+      pa += lt1 * a1;
+      pa += lt2 * a2;
+      pa += lt3 * a3;
+      const vec<T, 2> p2 = pa.xy + pa.zw;
+      sumf[ir1] += float(p2.x) + float(p2.y);
+      y_col[ir1] += nxpsg * 16;
+    }
+  }
+
+#pragma unroll
+  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+    if (nxpsg >= 32) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 16);
+    }
+    if (nxpsg >= 16) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 8);
+    }
+    if (nxpsg >= 8) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 4);
+    }
+    if (nxpsg >= 4) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 2);
+    }
+    if (nxpsg >= 2) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 1);
+    }
+  }
+
+  if (tx == 0 && i01 < out_vec_size) {
+#pragma unroll
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+      y[static_cast<int64_t>(i11 + ir1) * out_vec_size + i01] =
+          static_cast<T>(sumf[ir1]);
+    }
+  }
+}
+
 // Wide-M variant of kq_mv_ext_impl: each thread owns nr0 CONSECUTIVE output
 // rows instead of one. The nr0=1 kernel re-loads all r1ptg activation columns
 // per 16-weight chunk per row, so activation cache traffic scales as
