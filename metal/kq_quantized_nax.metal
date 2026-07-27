@@ -116,6 +116,26 @@
   instantiate_kquant_nax_qmm_t_smallbm(codec, float16_t,  gs, bits)          \
   instantiate_kquant_nax_qmm_t_smallbm(codec, bfloat16_t, gs, bits)
 
+// Split-K qmm_t on the NAX BM=32 tile (KQ_QMM_SPLITK_NAX experiment):
+// grid.z K-slices into T partials + shared accum fold. The plain small-M
+// grid is TG-count starved (ceil(N/64) x 1 threadgroups at decode shapes);
+// splitting K multiplies occupancy without touching the fragment shape.
+// q6_k + q8_0 only; no batched or float x variants (route gates match
+// qmm_nax and non_batched).
+#define instantiate_kquant_nax_qmm_t_splitk(type, gs, bits, aligned_N, codec) \
+  instantiate_kernel(                                                        \
+      "kquant_" #codec "_qmm_t_nax_splitk_" #type "_gs_" #gs "_b_" #bits     \
+          "_bm32_bn64_bk64_wm2_wn2_alN_" #aligned_N,                         \
+      kq_ ## codec ## _qmm_t_nax_splitk,                                     \
+      type, gs, bits, aligned_N, 32, 64, 2, 2)
+#define instantiate_kquant_nax_splitk(codec, gs, bits)                       \
+  instantiate_kquant_nax_qmm_t_splitk(float16_t,  gs, bits, true,  codec)    \
+  instantiate_kquant_nax_qmm_t_splitk(float16_t,  gs, bits, false, codec)    \
+  instantiate_kquant_nax_qmm_t_splitk(bfloat16_t, gs, bits, true,  codec)    \
+  instantiate_kquant_nax_qmm_t_splitk(bfloat16_t, gs, bits, false, codec)
+instantiate_kquant_nax_splitk(q6_k, 256, 6)
+instantiate_kquant_nax_splitk(q8_0, 32, 8)
+
 // Double-buffered BM=64 qmm_t, name-suffixed _db: dispatched by the host
 // solely for the M33-64 decode band (kq_smallbm_policy db64 + KQ_NAX_DB64).
 // As a blanket BM=64 default the doubled Ws cut occupancy (M96+ -3-15%,

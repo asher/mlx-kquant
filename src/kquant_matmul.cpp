@@ -2,8 +2,9 @@
 // kernels (qmm / qmm_nax / qvm / qmv) from the bundled metallib via
 // d.get_kernel(name, lib); the op guarantees row-contiguity before dispatch and
 // kernel-name type tokens come from kq_type_string. NAX (tensor-core)
-// availability is probed via kq_is_nax_available. qmm_splitk (env-gated,
-// KQ_QMM_SPLITK) partitions K for the small-M band; qvm_split_k stays
+// availability is probed via kq_is_nax_available. qmm_splitk / qmm_nax_splitk
+// (env-gated, KQ_QMM_SPLITK / KQ_QMM_SPLITK_NAX) partition K for the
+// small-M band on the steel and NAX tiles respectively; qvm_split_k stays
 // omitted - plain qvm is identical with less parallelism. KQuantMatmul itself
 // never carries a bias (a separate elementwise add is fine off the
 // decode-latency-critical path); the decode-only bias-fused fast path lives in
@@ -452,6 +453,85 @@ void qmm_splitk(
       group_size,
       "_b_",
       bits,
+      aligned ? "_alN_true" : "_alN_false");
+
+  auto kernel = kq_get_kernel(d, kname);
+  ce.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  ce.set_input_array(w, c++);
+  ce.set_input_array(scales, c++);
+  ce.set_input_array(x, c++);
+  ce.set_output_array(partials, c++);
+  ce.set_bytes(K, c++);
+  ce.set_bytes(N, c++);
+  ce.set_bytes(M, c++);
+  ce.set_bytes(k_partition, c++);
+  ce.set_bytes(part_stride, c++);
+  MTL::Size group_dims(32, wn, wm);
+  MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, splits);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+
+  std::string aname = "kquant_qmm_splitk_accum_" + type_string;
+  auto accum = kq_get_kernel(d, aname);
+  ce.set_compute_pipeline_state(accum);
+  const int n_elems = M * N;
+  c = 0;
+  ce.set_input_array(partials, c++);
+  ce.set_output_array(out, c++);
+  ce.set_bytes(n_elems, c++);
+  ce.set_bytes(splits, c++);
+  ce.set_bytes(part_stride, c++);
+  MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
+  MTL::Size agroup(256, 1, 1);
+  ce.dispatch_threads(agrid, agroup);
+}
+
+// Split-K qmm_t on the NAX BM=32 tile (KQ_QMM_SPLITK_NAX experiment). Same
+// partial/fold shape as qmm_splitk, but slices run the tensor-core tile:
+// the steel splitk probe measured per-TG pipeline bound (~140-160 GB/s flat
+// in splits), while the NAX small-M cap is TG-count starvation -- the lever
+// splitk actually multiplies. Slice starts must be superblock-aligned so
+// every loader instance begins at kt_base 0; the caller guarantees splits
+// divides K / max(superblock, BK). Non-batched transpose shapes only.
+void qmm_nax_splitk(
+    const array& x,
+    const array& w,
+    const array& scales,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    int splits,
+    Device& d,
+    const Stream& s,
+    const std::string& kquant_type) {
+  constexpr int bm = 32, bn = 64;
+  constexpr int wm = 2, wn = 2;
+  const int k_partition = K / splits;
+  const int part_stride = M * N;
+
+  array partials({splits, M, N}, x.dtype(), nullptr, {});
+  partials.set_data(mx::allocator::malloc(partials.nbytes()));
+
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.add_temporary(partials);
+
+  std::string type_string = kq_type_string(x.dtype());
+  bool aligned = N % bn == 0;
+  std::string kname;
+  kname.reserve(80);
+  mx::concatenate(
+      kname,
+      kq_kname_prefix(kquant_type) + "qmm_t_nax_splitk_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_bm32_bn64_bk64_wm2_wn2",
       aligned ? "_alN_true" : "_alN_false");
 
   auto kernel = kq_get_kernel(d, kname);
@@ -1034,6 +1114,42 @@ void KQuantMatmul::eval_gpu(
         s,
         kquant_type_);
     return;
+  }
+
+  // NAX split-K qmm experiment (KQ_QMM_SPLITK_NAX=<target splits>, 0 = off,
+  // read once): K-slices on the tensor-core BM=32 tile; see qmm_nax_splitk.
+  // Slice quantum is max(superblock, BK) so every slice starts a loader at
+  // kt_base 0. q6_k + q8_0 instantiations only.
+  static const int qmm_splitk_nax_env = []() {
+    const char* e = std::getenv("KQ_QMM_SPLITK_NAX");
+    return e != nullptr ? std::atoi(e) : 0;
+  }();
+  if (qmm_splitk_nax_env > 1 && transpose_ && non_batched && M <= 32 &&
+      (kquant_type_ == "q6_k" || kquant_type_ == "q8_0") &&
+      kq_is_nax_available() && (K % 64 == 0) && x.dtype() != mx::float32) {
+    const int sliceq = std::max(group_size_, 64);
+    const int nblk = K / sliceq;
+    int sp = std::min(qmm_splitk_nax_env, nblk);
+    while (sp > 1 && nblk % sp != 0) {
+      --sp;
+    }
+    if (sp > 1) {
+      qmm_nax_splitk(
+          x,
+          w,
+          scales,
+          out,
+          group_size_,
+          bits_,
+          M,
+          N,
+          K,
+          sp,
+          d,
+          s,
+          kquant_type_);
+      return;
+    }
   }
 
   // Split-K qmm experiment (KQ_QMM_SPLITK=<target splits>, 0 = off, read
