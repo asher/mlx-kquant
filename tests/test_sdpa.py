@@ -242,6 +242,120 @@ def test_sdpa_gqa_verify_short_kv():
     _check_gqa(64, kL=17, dtype=mx.bfloat16, splits=16, qL=4)
 
 
+def _ref_sdpa_starts(q, k, v, scale, pads, qL):
+    # per-row f32 reference on the visible tail [pads[b], kL)
+    outs = []
+    for b in range(q.shape[0]):
+        p = int(pads[b])
+        outs.append(
+            _ref_sdpa(
+                q[b : b + 1],
+                k[b : b + 1, :, p:, :],
+                v[b : b + 1, :, p:, :],
+                scale,
+                causal=qL > 1,
+            )
+        )
+    return mx.concatenate(outs, axis=0)
+
+
+def _check_gqa_starts(
+    D,
+    kL,
+    dtype,
+    B=4,
+    Hq=24,
+    Hkv=4,
+    qL=1,
+    pads=None,
+    strided=False,
+    splits=0,
+):
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(B, Hq, Hkv, qL, kL, D, dtype, seed=kL + D + B, strided=strided)
+    if pads is None:
+        pads = [(b * (kL - qL)) // B for b in range(B)]
+    starts = mx.array(pads, dtype=mx.int32)
+    mx.eval(starts)
+    got = kq.sdpa_decode_gqa(q, k, v, scale, splits=splits, starts=starts)
+    ref = _ref_sdpa_starts(q, k, v, scale, pads, qL)
+    _eval_or_skip(got, ref)
+    rel = _rel(got, ref)
+    bound = REL_BOUND[dtype]
+    print(
+        f"  [gqa-starts] D={D} qL={qL} kL={kL} B={B} Hq/Hkv={Hq}/{Hkv} "
+        f"pads={pads} {str(dtype)[9:]:>9}: rel={rel:.3e}"
+    )
+    assert rel < bound, f"D={D} kL={kL} pads={pads} rel {rel:.3e} >= {bound:.0e}"
+    assert got.shape == q.shape
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
+def test_sdpa_decode_gqa_starts(D, dtype):
+    # left-padded batched rows: row b attends keys [pads[b], kL)
+    _check_gqa_starts(D, kL=4096, dtype=dtype)
+
+
+@pytest.mark.parametrize("D", [64, 512])
+def test_sdpa_decode_gqa_batched_nostarts(D):
+    # B > 1 without starts: the plain batched grid the ragged route
+    # degenerates to at pad-0 (and a pin for batched use on its own)
+    _check_gqa(D, kL=4096, dtype=mx.bfloat16)
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(8, 24, 4, 1, 4096, D, mx.bfloat16, seed=D, strided=False)
+    got = kq.sdpa_decode_gqa(q, k, v, scale)
+    ref = _ref_sdpa_sinks(q, k, v, scale, None)
+    _eval_or_skip(got, ref)
+    assert _rel(got, ref) < REL_BOUND[mx.bfloat16]
+
+
+def test_sdpa_decode_gqa_starts_zero_matches_plain():
+    # all-zero starts must match the no-starts call on the same inputs
+    scale = 1.0 / (512**0.5)
+    q, k, v = _make(4, 24, 4, 1, 2048, 512, mx.bfloat16, seed=3, strided=False)
+    starts = mx.zeros((4,), dtype=mx.int32)
+    a = kq.sdpa_decode_gqa(q, k, v, scale, starts=starts)
+    b = kq.sdpa_decode_gqa(q, k, v, scale)
+    _eval_or_skip(a, b)
+    assert _rel(a, b) < 1e-6
+
+
+@pytest.mark.parametrize("qL", [2, 4])
+def test_sdpa_decode_gqa_starts_verify(qL):
+    # verify width on left-padded rows: the block occupies the last qL
+    # positions of every row regardless of its pad (end-aligned causal)
+    _check_gqa_starts(512, kL=4096, dtype=mx.bfloat16, qL=qL)
+
+
+def test_sdpa_decode_gqa_starts_edges():
+    # pad 0, a pad on a tile boundary, a pad mid-tile, and the maximum
+    # in-contract pad (one visible key at qL=1: output equals that value row)
+    _check_gqa_starts(
+        512,
+        kL=3071,
+        dtype=mx.bfloat16,
+        B=4,
+        pads=[0, 1024, 1543, 3070],
+        strided=True,
+        splits=16,
+    )
+
+
+@pytest.mark.parametrize("Hq,Hkv", [(32, 4), (16, 1)])
+def test_sdpa_decode_gqa_starts_gemma_geometry(Hq, Hkv):
+    # gemma-4 31b (gqa 8) and 12b (gqa 16, single kv head) global layers
+    _check_gqa_starts(512, kL=8192, dtype=mx.bfloat16, B=8, Hq=Hq, Hkv=Hkv)
+
+
+def test_sdpa_decode_gqa_starts_validation():
+    q, k, v = _make(4, 24, 4, 1, 512, 64, mx.bfloat16, seed=5, strided=False)
+    with pytest.raises(ValueError, match="one element per batch row"):
+        kq.sdpa_decode_gqa(q, k, v, 0.125, starts=mx.zeros((3,), mx.int32))
+    with pytest.raises(ValueError, match="int32"):
+        kq.sdpa_decode_gqa(q, k, v, 0.125, starts=mx.zeros((4,), mx.int64))
+
+
 def _ref_sdpa_fold(q, k, v, scale, q_len):
     """f32 reference for the GQA-folded verify layout: q [B, Hkv, G*qL, D]
     attends its own kv head directly; folded row r is causally clamped to

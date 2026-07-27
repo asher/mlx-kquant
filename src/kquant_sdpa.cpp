@@ -206,7 +206,9 @@ void KQuantSDPAGQA::eval_gpu(
   const auto& q = inputs[0];
   const auto& k = inputs[1];
   const auto& v = inputs[2];
-  const bool sinks = inputs.size() == 4;
+  const bool sinks = has_sinks_;
+  const bool starts = has_starts_;
+  const size_t starts_idx = 3 + (sinks ? 1 : 0);
   kq_sdpa_check_layout("sdpa_decode_gqa", q, k, v);
 
   int B = q.shape(0);
@@ -249,9 +251,11 @@ void KQuantSDPAGQA::eval_gpu(
 
   std::string ts = kq_type_string(q.dtype());
   bool has_sinks = sinks;
+  bool has_starts = starts;
   mx::metal::MTLFCList fc = {
       {&splits, MTL::DataType::DataTypeInt, 2},
       {&has_sinks, MTL::DataType::DataTypeBool, 3},
+      {&has_starts, MTL::DataType::DataTypeBool, 4},
   };
 
   // Pass 1: one threadgroup per (kv-head, batch, split); the whole GQA group
@@ -261,7 +265,8 @@ void KQuantSDPAGQA::eval_gpu(
   {
     std::string kname = "kq_sdpa_gqa_2pass_1_" + ts + "_" + std::to_string(D) +
         "_c" + std::to_string(tile_c_) + (qL > 1 ? "_p2" : "");
-    std::string hash = kname + "_s" + std::to_string(splits);
+    std::string hash =
+        kname + "_s" + std::to_string(splits) + (has_starts ? "_st1" : "_st0");
     auto kernel = kq_get_kernel(d, kname, hash, fc);
     // Register-heavy pipeline: some GPUs cap it below the dispatch width, and
     // Metal turns an oversized dispatch into silent garbage, not an error.
@@ -287,6 +292,9 @@ void KQuantSDPAGQA::eval_gpu(
     ce.set_bytes(v_seq_stride, 10);
     ce.set_bytes(scale, 11);
     ce.set_bytes(qL, 12);
+    // Metal wants every buffer bound; without starts, rebind sums as a dummy
+    // (the read is compiled out via the function constant).
+    ce.set_input_array(starts ? inputs[starts_idx] : sums, 13);
     MTL::Size group_dims(32, gqa_factor, qL > 1 ? (qL + 1) / 2 : 1);
     MTL::Size grid_dims(n_kv_heads, B, splits);
     ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -555,7 +563,8 @@ std::vector<mx::Shape> KQuantSDPAGQA::output_shapes(
 
 bool KQuantSDPAGQA::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantSDPAGQA&>(other);
-  return scale_ == o.scale_ && splits_ == o.splits_ && tile_c_ == o.tile_c_;
+  return scale_ == o.scale_ && splits_ == o.splits_ && tile_c_ == o.tile_c_ &&
+      has_sinks_ == o.has_sinks_ && has_starts_ == o.has_starts_;
 }
 
 mx::array sdpa_decode_gqa(
@@ -566,6 +575,7 @@ mx::array sdpa_decode_gqa(
     const std::optional<mx::array>& sinks,
     int splits,
     int tile_c,
+    const std::optional<mx::array>& starts,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
 
@@ -653,12 +663,27 @@ mx::array sdpa_decode_gqa(
     sk = mx::astype(mx::reshape(sk, {n_q_heads}, s), mx::float32, s);
     inputs.push_back(mx::contiguous(sk, false, s));
   }
+  if (starts.has_value()) {
+    auto st = *starts;
+    if (st.size() != static_cast<size_t>(q.shape(0))) {
+      throw std::invalid_argument(
+          "[mlx_kquant.sdpa_decode_gqa] starts must have one element per "
+          "batch row.");
+    }
+    if (st.dtype() != mx::int32) {
+      throw std::invalid_argument(
+          "[mlx_kquant.sdpa_decode_gqa] starts must be int32.");
+    }
+    st = mx::reshape(st, {q.shape(0)}, s);
+    inputs.push_back(mx::contiguous(st, false, s));
+  }
 
   auto out_shape = q.shape();
   return mx::array(
       std::move(out_shape),
       dt,
-      std::make_shared<KQuantSDPAGQA>(s, scale, splits, tile_c),
+      std::make_shared<KQuantSDPAGQA>(
+          s, scale, splits, tile_c, sinks.has_value(), starts.has_value()),
       std::move(inputs));
 }
 

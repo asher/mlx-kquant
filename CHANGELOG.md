@@ -10,6 +10,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `route_shed(indices, scores, slot_table)`: GPU-side routed-expert slot
   remap plus residency shed for streamed MoE decode; non-resident experts
   are shed and reported (miss ids and scores) without a host sync.
+- `sdpa_decode_gqa` optional `starts` (int32 [B]): per-batch-row key start
+  offsets for left-padded batched KV caches; padded-out key chunks are
+  skipped, not staged.
 
 ## [0.3.7]
 

@@ -207,6 +207,7 @@ NB_MODULE(_ext, m) {
       "sinks"_a = nb::none(),
       "splits"_a = 0,
       "tile_c"_a = 0,
+      "starts"_a = nb::none(),
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
@@ -215,7 +216,9 @@ NB_MODULE(_ext, m) {
         chunk is streamed through threadgroup-staged K/V tiles shared by the
         whole GQA group, so device memory reads the KV once per kv-head. At
         qL 2..4 (speculative-verify width) every query also shares the staged
-        tiles, causally clamped to its own trailing position.
+        tiles, causally clamped to its own trailing position. With `starts`,
+        batch row b attends keys [starts[b], kL) -- a left-padded batched KV
+        cache -- and fully padded-out key chunks are skipped, not staged.
 
         Args:
             q (array): queries [B, n_q_heads, qL, D], float16/bfloat16;
@@ -229,6 +232,9 @@ NB_MODULE(_ext, m) {
             splits (int): key-axis split count; 0 picks the default.
             tile_c (int): staged tile height, 8/16/32; 0 (default) picks by
                 head_dim (32 up to D=128, 16 at D=256, 8 at D=512).
+            starts (array, optional): per-batch-row key start offsets,
+                int32 [B], each in [0, kL - qL]; row b attends [starts[b],
+                kL). Out-of-range values read as an empty row (zero output).
 
         Returns:
             array: attention output [B, n_q_heads, qL, D].

@@ -15,6 +15,7 @@ constant bool do_causal [[function_constant(0)]];
 constant int blocks [[function_constant(1)]];
 constant int gqa_splits [[function_constant(2)]];
 constant bool gqa_has_sinks [[function_constant(3)]];
+constant bool gqa_has_starts [[function_constant(4)]];
 
 template <typename T, int D, int V = D>
 [[kernel]] void kq_sdpa_vector_2pass_1(
@@ -211,6 +212,7 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
     const constant size_t& v_seq_stride [[buffer(10)]],
     const constant float& scale [[buffer(11)]],
     const constant int& q_len [[buffer(12)]],
+    const device int* starts [[buffer(13)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -241,6 +243,18 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
   const int chunk = ((N + gqa_splits * C - 1) / (gqa_splits * C)) * C;
   const int k0 = split_idx * chunk;
   const int k1 = min(k0 + chunk, N);
+
+  // Per-row key start (left-padded batched KV cache): row batch_idx attends
+  // keys [row_start, N). Whole tiles below the start are skipped outright --
+  // the pad region's bytes are never staged -- and a partially padded tile
+  // masks per key below. A chunk entirely below the start writes an empty
+  // partial (max finite_min, sum 0), which pass 2 merges at zero weight.
+  int row_start = 0;
+  int kt0 = k0;
+  if (gqa_has_starts) {
+    row_start = max(0, starts[batch_idx]);
+    kt0 = max(k0, (row_start / C) * C);
+  }
 
   const device T* kbase =
       keys + (size_t)(batch_idx * num_kv_heads + kv_head_idx) * k_head_stride;
@@ -277,7 +291,7 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
   const int flat = (tidtg.z * gqa_factor + tidtg.y) * 32 + lane;
   const int n_threads = 32 * gqa_factor * tptg.z;
 
-  for (int kt = k0; kt < k1; kt += C) {
+  for (int kt = kt0; kt < k1; kt += C) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Cooperative tile load; zero-fill the tail so stale threadgroup data
     // can never reach the accumulators.
@@ -319,17 +333,19 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
           s[p] += simd_shuffle_down(s[p], off);
         }
         s[p] = simd_shuffle(s[p], NL * ty);
-        const bool valid = kg < k1 && kg <= lim[p];
+        const bool valid =
+            kg < k1 && kg <= lim[p] && (!gqa_has_starts || kg >= row_start);
         mqk[p][cc] = valid ? s[p] : Limits<float>::finite_min;
         m_tile[p] = max(m_tile[p], mqk[p][cc]);
       }
     }
 
     // Online softmax per query; each lane sums its ty-group's keys, so the
-    // simd_sum counts every key NL times. A tile entirely beyond a query's
-    // causal limit is skipped outright: with the running max still
-    // finite_min, exp(finite_min - finite_min) == 1 would poison the sum
-    // (can only happen at verify width; a decode query attends every key).
+    // simd_sum counts every key NL times. A tile with no valid key is
+    // skipped outright: with the running max still finite_min,
+    // exp(finite_min - finite_min) == 1 would poison the sum (happens past
+    // a query's causal limit at verify width, or below row_start on a
+    // left-padded row).
     float vs[QPS][C / NE];
     for (short p = 0; p < QPS; p++) {
       m_tile[p] = simd_max(m_tile[p]);
