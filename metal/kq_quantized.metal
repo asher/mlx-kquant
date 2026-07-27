@@ -397,6 +397,59 @@ instantiate_mv_ext_all(iq1_m, 256, 1)
   instantiate_mv_ext_nr2_for_type(codec, gs, bits, float16_t)
 instantiate_mv_ext_nr2_all(q6_k, 256, 6)
 
+// Shuffle-broadcast experiment (KQ_MV_EXT_SB=1): the four ty-lanes sharing
+// a tx column exchange float4 quarters of the activation window over
+// simd_shuffle instead of each loading all 16 elements -- activation cache
+// traffic / 4, no barriers, no extra accumulators. q6_k only, M 4-12 where
+// the nr0=1 activation decay bites. Suffix _sb.
+#define instantiate_mv_ext_sb(codec, type, gs, bits, m)                 \
+  instantiate_kernel(                                                   \
+      "kquant_" #codec "_mv_ext_" #type "_gs_" #gs "_b_" #bits "_m" #m  \
+      "_sb",                                                            \
+      kq_ ## codec ## _mv_ext_sb, type, m, 2, 8)
+#define instantiate_mv_ext_sb_for_type(codec, gs, bits, type)           \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 4)                       \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 5)                       \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 6)                       \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 7)                       \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 8)                       \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 9)                       \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 10)                      \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 11)                      \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 12)
+#define instantiate_mv_ext_sb_all(codec, gs, bits)                      \
+  instantiate_mv_ext_sb_for_type(codec, gs, bits, float)                \
+  instantiate_mv_ext_sb_for_type(codec, gs, bits, bfloat16_t)           \
+  instantiate_mv_ext_sb_for_type(codec, gs, bits, float16_t)
+instantiate_mv_ext_sb_all(q6_k, 256, 6)
+
+// Wide-nxpsg experiment (KQ_MV_EXT_NX=16|32): more K lanes per simdgroup
+// means fewer output rows per simdgroup, so each activation element has
+// nypsg*nsg = 4 (x16) or 2 (x32) redundant readers instead of 8 -- the
+// L1-capacity pressure behind the M4->8 decay -- and the grid gains
+// threadgroups. Same impl, different template params. q6_k M 4-12.
+#define instantiate_mv_ext_nx(codec, type, gs, bits, m, nx)             \
+  instantiate_kernel(                                                   \
+      "kquant_" #codec "_mv_ext_" #type "_gs_" #gs "_b_" #bits "_m" #m  \
+      "_x" #nx,                                                         \
+      kq_ ## codec ## _mv_ext, type, m, 2, nx)
+#define instantiate_mv_ext_nx_for_type(codec, gs, bits, type, nx)       \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 4, nx)                   \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 5, nx)                   \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 6, nx)                   \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 7, nx)                   \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 8, nx)                   \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 9, nx)                   \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 10, nx)                  \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 11, nx)                  \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 12, nx)
+#define instantiate_mv_ext_nx_all(codec, gs, bits, nx)                  \
+  instantiate_mv_ext_nx_for_type(codec, gs, bits, float, nx)            \
+  instantiate_mv_ext_nx_for_type(codec, gs, bits, bfloat16_t, nx)       \
+  instantiate_mv_ext_nx_for_type(codec, gs, bits, float16_t, nx)
+instantiate_mv_ext_nx_all(q6_k, 256, 6, 16)
+instantiate_mv_ext_nx_all(q6_k, 256, 6, 32)
+
 #define instantiate_kquant_q3_k_for_type(type)                          \
   instantiate_kquant_batched(verify_qmv, type, 256, 3, 0, q3_k)          \
   instantiate_kquant_batched(qmv_fast, type, 256, 3, 0, q3_k)            \

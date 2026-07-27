@@ -777,7 +777,26 @@ void verify_mv_ext(
     return e != nullptr ? std::atoi(e) : 1;
   }();
   const bool use_nr2 = mv_ext_nr == 2 && M >= 5 && kquant_type == "q6_k";
-  const int rows_per_tg = (32 / nxpsg) * nsg * (use_nr2 ? 2 : 1);
+  // Shuffle-broadcast experiment (KQ_MV_EXT_SB=1): ty-lanes exchange
+  // activation quarters over simd_shuffle instead of each loading the full
+  // window -- activation cache traffic / 4, same grid. q6_k M 4-12 only.
+  static const bool mv_ext_sb = []() {
+    const char* e = std::getenv("KQ_MV_EXT_SB");
+    return e != nullptr && std::atoi(e) == 1;
+  }();
+  const bool use_sb = !use_nr2 && mv_ext_sb && M >= 4 && kquant_type == "q6_k";
+  // Wide-nxpsg experiment (KQ_MV_EXT_NX=16|32): fewer redundant activation
+  // readers per element (nypsg*nsg drops 8 -> 4 -> 2) + more threadgroups.
+  // q6_k M 4-12 only; wins here would generalize per codec.
+  static const int mv_ext_nx = []() {
+    const char* e = std::getenv("KQ_MV_EXT_NX");
+    const int v = e != nullptr ? std::atoi(e) : 0;
+    return (v == 16 || v == 32) ? v : 0;
+  }();
+  const bool use_nx =
+      !use_nr2 && !use_sb && mv_ext_nx != 0 && M >= 4 && kquant_type == "q6_k";
+  const int nxpsg_eff = use_nx ? mv_ext_nx : nxpsg;
+  const int rows_per_tg = (32 / nxpsg_eff) * nsg * (use_nr2 ? 2 : 1);
   MTL::Size group_dims(32, nsg, 1);
   MTL::Size grid_dims((N + rows_per_tg - 1) / rows_per_tg, 1, 1);
 
@@ -794,7 +813,9 @@ void verify_mv_ext(
       bits,
       "_m",
       M,
-      use_nr2 ? "_nr2" : "");
+      use_nr2 ? "_nr2"
+              : (use_sb ? "_sb"
+                        : (use_nx ? (mv_ext_nx == 16 ? "_x16" : "_x32") : "")));
 
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);

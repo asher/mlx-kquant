@@ -791,6 +791,99 @@ METAL_FUNC void kq_mv_ext_nr_impl(
   }
 }
 
+// Shuffle-broadcast variant of kq_mv_ext_impl. The chunk index depends only
+// on tx, so the nypsg ty-lanes sharing a tx column process identical
+// activation windows and the nr0=1 kernel reads every activation element
+// nypsg times per simdgroup (the M * N * K traffic that dominates past
+// M~5). Here each ty-lane loads ONE float4 quarter of the 16-element window
+// and the four lanes exchange quarters over simd_shuffle: activation cache
+// traffic / 4 with no barriers, no threadgroup memory, and no extra
+// accumulators (the register cost that sank the nr0=2 variant). Divergence
+// safety: the K loop exits on a tx-uniform condition, so the four shuffle
+// partners (same tx, ty 0-3) are always uniformly active, including OOB
+// output rows, which run the loop on a clamped w row and mask the store.
+// Requires nxpsg == 8 so ty spans exactly the four quarters.
+template <typename T, typename Codec, short r1ptg, short nsg, short nxpsg>
+METAL_FUNC void kq_mv_ext_sb_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    uint3 tgpig,
+    ushort tiisg,
+    ushort sgitg) {
+  static_assert(nxpsg == 8, "shuffle-broadcast needs ty to span 4 quarters");
+  constexpr short nypsg = 32 / nxpsg; // output rows per simdgroup
+  constexpr short chpb = Codec::superblock / 16; // 16-weight chunks per block
+  const short tx = tiisg % nxpsg; // K position within the row group
+  const short ty = tiisg / nxpsg; // which of nypsg rows this thread owns
+
+  const int i01 = tgpig.x * (nypsg * nsg) + nypsg * sgitg + ty; // output row
+  const int i11 = tgpig.y * r1ptg; // first activation column
+
+  const int nb = in_vec_size / Codec::superblock;
+  const int row_bytes = nb * Codec::block_bytes;
+  // Clamp OOB rows to row 0 for a valid read; the store is masked below.
+  const device uint8_t* w_row =
+      (i01 < out_vec_size) ? w + static_cast<int64_t>(i01) * row_bytes : w;
+
+  const device T* y_col[r1ptg];
+#pragma unroll
+  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+    y_col[ir1] = x + static_cast<int64_t>(i11 + ir1) * in_vec_size + tx * 16;
+  }
+
+  float sumf[r1ptg];
+#pragma unroll
+  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+    sumf[ir1] = 0.0f;
+  }
+
+  const ushort lane0 = tx;
+  for (int ich = tx; 16 * ich < in_vec_size; ich += nxpsg) {
+    const int ib = ich / chpb; // super-block index
+    const short cch = ich % chpb; // chunk within super-block
+    const device uint8_t* block =
+        w_row + static_cast<int64_t>(ib) * Codec::block_bytes;
+    float4x4 lx;
+    Codec::deq_chunk16(block, cch, lx);
+#pragma unroll
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+      const device T* yp = y_col[ir1];
+      const float4 mine = float4(*(const device vec<T, 4>*)(yp + 4 * ty));
+      const float4 a0 = simd_shuffle(mine, lane0);
+      const float4 a1 = simd_shuffle(mine, static_cast<ushort>(lane0 + 8));
+      const float4 a2 = simd_shuffle(mine, static_cast<ushort>(lane0 + 16));
+      const float4 a3 = simd_shuffle(mine, static_cast<ushort>(lane0 + 24));
+      sumf[ir1] +=
+          dot(lx[0], a0) + dot(lx[1], a1) + dot(lx[2], a2) + dot(lx[3], a3);
+      y_col[ir1] += nxpsg * 16;
+    }
+  }
+
+#pragma unroll
+  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+    if (nxpsg >= 8) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 4);
+    }
+    if (nxpsg >= 4) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 2);
+    }
+    if (nxpsg >= 2) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 1);
+    }
+  }
+
+  if (tx == 0 && i01 < out_vec_size) {
+#pragma unroll
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+      y[static_cast<int64_t>(i11 + ir1) * out_vec_size + i01] =
+          static_cast<T>(sumf[ir1]);
+    }
+  }
+}
+
 // Q8_0: 34 bytes/32 weights. [fp16 d][int8 q[32]]. w[i] = d * q[i].
 
 MLX_MTL_CONST int KQ_Q8_0_GROUP = 32;
