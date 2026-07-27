@@ -863,4 +863,37 @@ instantiate_kquant_gather_qmm_rhs_codec(256, 1, iq1_m)
   map[3u * slot + 1u] = r;
   map[3u * slot + 2u] = min(64u, seg_len - rank);
 }
-// clang-format on
+
+// Split-K partial fold for qmm_t_splitk: y[i] = (T)(f32 sum over the
+// splits axis of partials[z * stride + i]). Partials carry one T rounding
+// per slice; the fold accumulates in f32 and rounds once more. One thread
+// per output element; cost is noise next to the GEMM pass.
+template <typename T>
+[[kernel]] void kq_qmm_splitk_accum(
+    const device T* partials [[buffer(0)]],
+    device T* y [[buffer(1)]],
+    const constant int& n_elems [[buffer(2)]],
+    const constant int& splits [[buffer(3)]],
+    const constant int& stride [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid >= static_cast<uint>(n_elems)) {
+    return;
+  }
+  float acc = 0.0f;
+  for (int z = 0; z < splits; ++z) {
+    acc += static_cast<float>(
+        partials[static_cast<int64_t>(z) * stride + gid]);
+  }
+  y[gid] = static_cast<T>(acc);
+}
+
+#define instantiate_kq_qmm_splitk_accum(type)   \
+  instantiate_kernel(                           \
+      "kquant_qmm_splitk_accum_" #type,         \
+      kq_qmm_splitk_accum,                      \
+      type)
+
+instantiate_kq_qmm_splitk_accum(float)
+instantiate_kq_qmm_splitk_accum(bfloat16_t)
+instantiate_kq_qmm_splitk_accum(float16_t)
+    // clang-format on

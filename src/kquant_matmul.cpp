@@ -2,12 +2,13 @@
 // kernels (qmm / qmm_nax / qvm / qmv) from the bundled metallib via
 // d.get_kernel(name, lib); the op guarantees row-contiguity before dispatch and
 // kernel-name type tokens come from kq_type_string. NAX (tensor-core)
-// availability is probed via kq_is_nax_available. The split-k paths
-// (qmm_splitk / qvm_split_k) are omitted - plain qmm/qvm produce identical
-// results with less parallelism. KQuantMatmul itself never carries a bias (a
-// separate elementwise add is fine off the decode-latency-critical path); the
-// decode-only bias-fused fast path lives in the KQuantQmvBias primitive below
-// (qmv_bias), which reuses this file's qmv dispatch helpers.
+// availability is probed via kq_is_nax_available. qmm_splitk (env-gated,
+// KQ_QMM_SPLITK) partitions K for the small-M band; qvm_split_k stays
+// omitted - plain qvm is identical with less parallelism. KQuantMatmul itself
+// never carries a bias (a separate elementwise add is fine off the
+// decode-latency-critical path); the decode-only bias-fused fast path lives in
+// the KQuantQmvBias primitive below (qmv_bias), which reuses this file's qmv
+// dispatch helpers.
 #include <cstddef>
 #include <cstdlib>
 #include <stdexcept>
@@ -329,8 +330,8 @@ void qmm_nax(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// Tiled quantized GEMM (no biases). The split-k variant is omitted; plain qmm
-// is correct with less parallelism.
+// Tiled quantized GEMM (no biases). The split-k variant (qmm_splitk below)
+// covers the small-M occupancy hole; plain qmm is the general path.
 void qmm(
     const array& x,
     const array& w,
@@ -403,6 +404,86 @@ void qmm(
   ce.set_bytes(M, c++);
   add_strides_and_shapes(ce, B <= 1, x, w, scales, c);
   ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+// Split-K qmm_t for the small-M decode band. The plain tile grid is only
+// ceil(N/64) x 1 threadgroups at decode shapes with M <= 32 (84 at
+// [5376 x 21504]) and the in-tile K walk serializes, capping qmm/NAX at
+// 160-257 GB/s while mv_ext decays past M~4 on L2 activation re-reads.
+// Partitioning K across grid.z multiplies threadgroup count by `splits`;
+// each slice writes a T partial tile and a second tiny pass folds them in
+// f32. Slice starts must land on wire-block boundaries, so the partition
+// is a multiple of group_size (the caller guarantees splits divides
+// K / group_size). Non-batched transpose shapes only.
+void qmm_splitk(
+    const array& x,
+    const array& w,
+    const array& scales,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    int splits,
+    Device& d,
+    const Stream& s,
+    const std::string& kquant_type) {
+  constexpr int bm = 32, bn = 32;
+  constexpr int wm = 2, wn = 2;
+  const int k_partition = (K / group_size / splits) * group_size;
+  const int part_stride = M * N;
+
+  array partials({splits, M, N}, x.dtype(), nullptr, {});
+  partials.set_data(mx::allocator::malloc(partials.nbytes()));
+
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.add_temporary(partials);
+
+  std::string type_string = kq_type_string(x.dtype());
+  bool aligned = N % bn == 0;
+  std::string kname;
+  kname.reserve(64);
+  mx::concatenate(
+      kname,
+      kq_kname_prefix(kquant_type) + "qmm_t_splitk_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      aligned ? "_alN_true" : "_alN_false");
+
+  auto kernel = kq_get_kernel(d, kname);
+  ce.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  ce.set_input_array(w, c++);
+  ce.set_input_array(scales, c++);
+  ce.set_input_array(x, c++);
+  ce.set_output_array(partials, c++);
+  ce.set_bytes(K, c++);
+  ce.set_bytes(N, c++);
+  ce.set_bytes(M, c++);
+  ce.set_bytes(k_partition, c++);
+  ce.set_bytes(part_stride, c++);
+  MTL::Size group_dims(32, wn, wm);
+  MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, splits);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+
+  std::string aname = "kquant_qmm_splitk_accum_" + type_string;
+  auto accum = kq_get_kernel(d, aname);
+  ce.set_compute_pipeline_state(accum);
+  const int n_elems = M * N;
+  c = 0;
+  ce.set_input_array(partials, c++);
+  ce.set_output_array(out, c++);
+  ce.set_bytes(n_elems, c++);
+  ce.set_bytes(splits, c++);
+  ce.set_bytes(part_stride, c++);
+  MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
+  MTL::Size agroup(256, 1, 1);
+  ce.dispatch_threads(agrid, agroup);
 }
 
 // Vector-times-matrix quantized kernel dispatch (no biases).
@@ -932,6 +1013,42 @@ void KQuantMatmul::eval_gpu(
         s,
         kquant_type_);
     return;
+  }
+
+  // Split-K qmm experiment (KQ_QMM_SPLITK=<target splits>, 0 = off, read
+  // once): the small-M band's occupancy lever; see qmm_splitk. Routes when
+  // a >1 divisor of the wire-block count exists at or under the target.
+  // K-quants + q8_0 only for now (instantiation coverage).
+  static const int qmm_splitk_env = []() {
+    const char* e = std::getenv("KQ_QMM_SPLITK");
+    return e != nullptr ? std::atoi(e) : 0;
+  }();
+  if (qmm_splitk_env > 1 && transpose_ && non_batched && M <= 32 &&
+      (kquant_type_ == "q6_k" || kquant_type_ == "q5_k" ||
+       kquant_type_ == "q4_k" || kquant_type_ == "q3_k" ||
+       kquant_type_ == "q2_k" || kquant_type_ == "q8_0")) {
+    const int nblk = K / group_size_;
+    int sp = std::min(qmm_splitk_env, nblk);
+    while (sp > 1 && nblk % sp != 0) {
+      --sp;
+    }
+    if (sp > 1) {
+      qmm_splitk(
+          x,
+          w,
+          scales,
+          out,
+          group_size_,
+          bits_,
+          M,
+          N,
+          K,
+          sp,
+          d,
+          s,
+          kquant_type_);
+      return;
+    }
   }
 
   // Small-M qmm route: the double-buffered BM=32 NAX tile beats the mv
