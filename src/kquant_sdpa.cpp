@@ -202,6 +202,10 @@ void KQuantSDPAGQA::eval_gpu(
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
+  const bool write_lse = return_lse_;
+  if (write_lse) {
+    outputs[1].set_data(mx::allocator::malloc(outputs[1].nbytes()));
+  }
 
   const auto& q = inputs[0];
   const auto& k = inputs[1];
@@ -255,11 +259,13 @@ void KQuantSDPAGQA::eval_gpu(
   bool has_sinks = sinks;
   bool has_starts = starts;
   bool has_kv_q8 = kv_q8;
+  bool has_lse = write_lse;
   mx::metal::MTLFCList fc = {
       {&splits, MTL::DataType::DataTypeInt, 2},
       {&has_sinks, MTL::DataType::DataTypeBool, 3},
       {&has_starts, MTL::DataType::DataTypeBool, 4},
       {&has_kv_q8, MTL::DataType::DataTypeBool, 5},
+      {&has_lse, MTL::DataType::DataTypeBool, 6},
   };
 
   // Pass 1: one threadgroup per (kv-head, batch, split); the whole GQA group
@@ -329,8 +335,8 @@ void KQuantSDPAGQA::eval_gpu(
   // Grid z is the query axis.
   {
     std::string kname = "kq_sdpa_gqa_2pass_2_" + ts + "_" + std::to_string(D);
-    std::string hash =
-        kname + "_s" + std::to_string(splits) + (has_sinks ? "_k1" : "_k0");
+    std::string hash = kname + "_s" + std::to_string(splits) +
+        (has_sinks ? "_k1" : "_k0") + (write_lse ? "_lse" : "");
     auto kernel = kq_get_kernel(d, kname, hash, fc);
     ce.set_compute_pipeline_state(kernel);
     ce.set_input_array(partials, 0);
@@ -341,6 +347,11 @@ void KQuantSDPAGQA::eval_gpu(
     ce.set_input_array(sinks ? inputs[3] : sums, 3);
     ce.set_output_array(out, 4);
     ce.set_bytes(n_q_heads, 5);
+    if (write_lse) {
+      ce.set_output_array(outputs[1], 6);
+    } else {
+      ce.set_input_array(sums, 6);
+    }
     MTL::Size group_dims(32, 1, 1);
     MTL::Size grid_dims(n_q_heads, B, qL);
     ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -354,6 +365,10 @@ void KQuantSDPAFAVerify::eval_gpu(
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
+  const bool write_lse = return_lse_;
+  if (write_lse) {
+    outputs[1].set_data(mx::allocator::malloc(outputs[1].nbytes()));
+  }
 
   // q is the GQA-folded query tile [B, Hkv, n_rows, D], row-contiguous;
   // k/v [B, Hkv, kL, D] are read in place via their head/seq strides.
@@ -402,9 +417,11 @@ void KQuantSDPAFAVerify::eval_gpu(
 
   std::string ts = kq_type_string(q.dtype());
   bool has_sinks = false;
+  bool has_lse = write_lse;
   mx::metal::MTLFCList fc = {
       {&splits, MTL::DataType::DataTypeInt, 2},
       {&has_sinks, MTL::DataType::DataTypeBool, 3},
+      {&has_lse, MTL::DataType::DataTypeBool, 6},
   };
 
   // Pass 1: one threadgroup per (kv-head, batch, split) streams its key
@@ -449,7 +466,8 @@ void KQuantSDPAFAVerify::eval_gpu(
   // Pass 2: the shared kq_sdpa_gqa merge; grid z is the folded row axis.
   {
     std::string kname = "kq_sdpa_gqa_2pass_2_" + ts + "_" + std::to_string(D);
-    std::string hash = kname + "_s" + std::to_string(splits) + "_k0";
+    std::string hash = kname + "_s" + std::to_string(splits) + "_k0" +
+        (write_lse ? "_lse" : "");
     auto kernel = kq_get_kernel(d, kname, hash, fc);
     ce.set_compute_pipeline_state(kernel);
     ce.set_input_array(partials, 0);
@@ -460,6 +478,11 @@ void KQuantSDPAFAVerify::eval_gpu(
     ce.set_input_array(sums, 3);
     ce.set_output_array(out, 4);
     ce.set_bytes(n_kv_heads, 5);
+    if (write_lse) {
+      ce.set_output_array(outputs[1], 6);
+    } else {
+      ce.set_input_array(sums, 6);
+    }
     MTL::Size group_dims(32, 1, 1);
     MTL::Size grid_dims(n_kv_heads, B, n_rows);
     ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -583,17 +606,22 @@ void KQuantSDPAGQA::eval_cpu(
 
 std::vector<mx::Shape> KQuantSDPAGQA::output_shapes(
     const std::vector<mx::array>& inputs) {
-  return {inputs[0].shape()};
+  const auto& qs = inputs[0].shape();
+  if (return_lse_) {
+    return {qs, {qs[0], qs[1], qs[2]}};
+  }
+  return {qs};
 }
 
 bool KQuantSDPAGQA::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantSDPAGQA&>(other);
   return scale_ == o.scale_ && splits_ == o.splits_ && tile_c_ == o.tile_c_ &&
       has_sinks_ == o.has_sinks_ && has_starts_ == o.has_starts_ &&
-      has_kv_q8_ == o.has_kv_q8_;
+      has_kv_q8_ == o.has_kv_q8_ && return_lse_ == o.return_lse_;
 }
 
-mx::array sdpa_decode_gqa(
+static std::vector<mx::array> sdpa_decode_gqa_impl(
+    bool return_lse,
     mx::array q,
     mx::array k,
     mx::array v,
@@ -741,19 +769,88 @@ mx::array sdpa_decode_gqa(
     }
   }
 
+  auto prim = std::make_shared<KQuantSDPAGQA>(
+      s,
+      scale,
+      splits,
+      tile_c,
+      sinks.has_value(),
+      starts.has_value(),
+      kv_q8,
+      return_lse);
   auto out_shape = q.shape();
-  return mx::array(
-      std::move(out_shape),
-      dt,
-      std::make_shared<KQuantSDPAGQA>(
-          s,
-          scale,
-          splits,
-          tile_c,
-          sinks.has_value(),
-          starts.has_value(),
-          kv_q8),
-      std::move(inputs));
+  if (return_lse) {
+    mx::Shape lse_shape = {q.shape(0), q.shape(1), q.shape(2)};
+    return mx::array::make_arrays(
+        {std::move(out_shape), std::move(lse_shape)},
+        {dt, mx::float32},
+        std::move(prim),
+        std::move(inputs));
+  }
+  return {
+      mx::array(std::move(out_shape), dt, std::move(prim), std::move(inputs))};
+}
+
+mx::array sdpa_decode_gqa(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    const std::optional<mx::array>& sinks,
+    int splits,
+    int tile_c,
+    const std::optional<mx::array>& starts,
+    const std::optional<mx::array>& k_scales,
+    const std::optional<mx::array>& k_biases,
+    const std::optional<mx::array>& v_scales,
+    const std::optional<mx::array>& v_biases,
+    mx::StreamOrDevice s_) {
+  return sdpa_decode_gqa_impl(
+      false,
+      std::move(q),
+      std::move(k),
+      std::move(v),
+      scale,
+      sinks,
+      splits,
+      tile_c,
+      starts,
+      k_scales,
+      k_biases,
+      v_scales,
+      v_biases,
+      s_)[0];
+}
+
+std::vector<mx::array> sdpa_decode_gqa_lse(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    const std::optional<mx::array>& sinks,
+    int splits,
+    int tile_c,
+    const std::optional<mx::array>& starts,
+    const std::optional<mx::array>& k_scales,
+    const std::optional<mx::array>& k_biases,
+    const std::optional<mx::array>& v_scales,
+    const std::optional<mx::array>& v_biases,
+    mx::StreamOrDevice s_) {
+  return sdpa_decode_gqa_impl(
+      true,
+      std::move(q),
+      std::move(k),
+      std::move(v),
+      scale,
+      sinks,
+      splits,
+      tile_c,
+      starts,
+      k_scales,
+      k_biases,
+      v_scales,
+      v_biases,
+      s_);
 }
 
 void KQuantSDPAFAVerify::eval_cpu(
@@ -765,15 +862,21 @@ void KQuantSDPAFAVerify::eval_cpu(
 
 std::vector<mx::Shape> KQuantSDPAFAVerify::output_shapes(
     const std::vector<mx::array>& inputs) {
-  return {inputs[0].shape()};
+  const auto& qs = inputs[0].shape();
+  if (return_lse_) {
+    return {qs, {qs[0], qs[1], qs[2]}};
+  }
+  return {qs};
 }
 
 bool KQuantSDPAFAVerify::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantSDPAFAVerify&>(other);
-  return scale_ == o.scale_ && q_len_ == o.q_len_ && splits_ == o.splits_;
+  return scale_ == o.scale_ && q_len_ == o.q_len_ && splits_ == o.splits_ &&
+      return_lse_ == o.return_lse_;
 }
 
-mx::array sdpa_fa_verify(
+static std::vector<mx::array> sdpa_fa_verify_impl(
+    bool return_lse,
     mx::array q,
     mx::array k,
     mx::array v,
@@ -846,12 +949,52 @@ mx::array sdpa_fa_verify(
   auto k_c = k.strides().back() == 1 ? k : mx::contiguous(k, false, s);
   auto v_c = v.strides().back() == 1 ? v : mx::contiguous(v, false, s);
 
+  auto prim =
+      std::make_shared<KQuantSDPAFAVerify>(s, scale, q_len, splits, return_lse);
   auto out_shape = q_c.shape();
-  return mx::array(
-      std::move(out_shape),
-      dt,
-      std::make_shared<KQuantSDPAFAVerify>(s, scale, q_len, splits),
-      {std::move(q_c), std::move(k_c), std::move(v_c)});
+  std::vector<mx::array> inputs = {
+      std::move(q_c), std::move(k_c), std::move(v_c)};
+  if (return_lse) {
+    mx::Shape lse_shape = {out_shape[0], out_shape[1], out_shape[2]};
+    return mx::array::make_arrays(
+        {std::move(out_shape), std::move(lse_shape)},
+        {dt, mx::float32},
+        std::move(prim),
+        std::move(inputs));
+  }
+  return {
+      mx::array(std::move(out_shape), dt, std::move(prim), std::move(inputs))};
+}
+
+mx::array sdpa_fa_verify(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    int q_len,
+    int splits,
+    mx::StreamOrDevice s_) {
+  return sdpa_fa_verify_impl(
+      false,
+      std::move(q),
+      std::move(k),
+      std::move(v),
+      scale,
+      q_len,
+      splits,
+      s_)[0];
+}
+
+std::vector<mx::array> sdpa_fa_verify_lse(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    int q_len,
+    int splits,
+    mx::StreamOrDevice s_) {
+  return sdpa_fa_verify_impl(
+      true, std::move(q), std::move(k), std::move(v), scale, q_len, splits, s_);
 }
 
 } // namespace mlx_kquant

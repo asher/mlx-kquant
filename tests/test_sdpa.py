@@ -518,3 +518,66 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_sdpa_return_lse_matches_reference():
+    B, Hq, Hkv, D, S = 2, 32, 8, 128, 3001
+    q, k, v = _make(B, Hq, Hkv, 1, S, D, mx.bfloat16, seed=11, strided=False)
+    scale = 1.0 / (D**0.5)
+    o, lse = kq.sdpa_decode_gqa(q, k, v, scale, return_lse=True)
+    o0 = kq.sdpa_decode_gqa(q, k, v, scale)
+    kr = mx.repeat(k, Hq // Hkv, axis=1).astype(mx.float32)
+    s_ref = (q.astype(mx.float32) * scale) @ kr.swapaxes(-1, -2)
+    lse_ref = mx.logsumexp(s_ref[:, :, 0, :], axis=-1)[..., None]
+    _eval_or_skip(o, lse, o0, lse_ref)
+    assert lse.shape == (B, Hq, 1) and lse.dtype == mx.float32
+    assert float(mx.abs(o - o0).max()) == 0.0
+    assert float(mx.abs(lse - lse_ref).max()) < 2e-2
+
+
+def test_sdpa_fa_verify_return_lse():
+    q, k, v = _make(1, 8, 8, 32, 2048, 128, mx.bfloat16, seed=12, strided=False)
+    scale = 1.0 / (128**0.5)
+    o, lse = kq.sdpa_fa_verify(q, k, v, scale, 1, return_lse=True)
+    o0 = kq.sdpa_fa_verify(q, k, v, scale, 1)
+    s_ref = (q.astype(mx.float32) * scale) @ k.astype(mx.float32).swapaxes(-1, -2)
+    lse_ref = mx.logsumexp(s_ref, axis=-1)
+    _eval_or_skip(o, lse, o0, lse_ref)
+    assert lse.shape == (1, 8, 32) and lse.dtype == mx.float32
+    assert float(mx.abs(o - o0).max()) == 0.0
+    assert float(mx.abs(lse - lse_ref).max()) < 2e-2
+
+
+def test_sdpa_cascade_lse_merge():
+    # shared-prefix cascade: fa fold over the shared block plus a per-row
+    # private call, LSE-merged, must match one call over the concatenated KV
+    B, Hq, Hkv, D = 4, 32, 8, 128
+    gqa = Hq // Hkv
+    P, Sp = 4096, 384
+    scale = 1.0 / (D**0.5)
+    q, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, mx.bfloat16, seed=13, strided=False)
+    q = mx.random.normal((B, Hq, 1, D)).astype(mx.bfloat16) * 0.5
+    _, k_pr, v_pr = _make(B, Hq, Hkv, 1, Sp, D, mx.bfloat16, seed=14, strided=False)
+    k_full = mx.concatenate([mx.broadcast_to(k_sh, (B, Hkv, P, D)), k_pr], axis=2)
+    v_full = mx.concatenate([mx.broadcast_to(v_sh, (B, Hkv, P, D)), v_pr], axis=2)
+    ref = kq.sdpa_decode_gqa(q, mx.contiguous(k_full), mx.contiguous(v_full), scale)
+    qf = mx.contiguous(
+        q[:, :, 0, :]
+        .reshape(B, Hkv, gqa, D)
+        .transpose(1, 0, 2, 3)
+        .reshape(1, Hkv, B * gqa, D)
+    )
+    o_f, l_f = kq.sdpa_fa_verify(qf, k_sh, v_sh, scale, 1, return_lse=True)
+    o_sh = o_f.reshape(1, Hkv, B, gqa, D)[0].transpose(1, 0, 2, 3).reshape(B, Hq, 1, D)
+    l_sh = l_f.reshape(1, Hkv, B, gqa)[0].transpose(1, 0, 2).reshape(B, Hq, 1)
+    o_pr, l_pr = kq.sdpa_decode_gqa(q, k_pr, v_pr, scale, return_lse=True)
+    m = mx.maximum(l_sh, l_pr)
+    w_sh = mx.exp(l_sh - m)[..., None]
+    w_pr = mx.exp(l_pr - m)[..., None]
+    merged = (
+        (o_sh.astype(mx.float32) * w_sh + o_pr.astype(mx.float32) * w_pr)
+        / (w_sh + w_pr)
+    ).astype(q.dtype)
+    _eval_or_skip(merged, ref)
+    rel = _rel(merged, ref)
+    assert rel < REL_BOUND[mx.bfloat16], f"cascade merge rel {rel:.3e}"

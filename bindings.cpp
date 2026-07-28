@@ -199,7 +199,52 @@ NB_MODULE(_ext, m) {
 
   m.def(
       "sdpa_decode_gqa",
-      &mlx_kquant::sdpa_decode_gqa,
+      [](mx::array q,
+         mx::array k,
+         mx::array v,
+         float scale,
+         const std::optional<mx::array>& sinks,
+         int splits,
+         int tile_c,
+         const std::optional<mx::array>& starts,
+         const std::optional<mx::array>& k_scales,
+         const std::optional<mx::array>& k_biases,
+         const std::optional<mx::array>& v_scales,
+         const std::optional<mx::array>& v_biases,
+         bool return_lse,
+         mx::StreamOrDevice s) -> nb::object {
+        if (return_lse) {
+          auto outs = mlx_kquant::sdpa_decode_gqa_lse(
+              std::move(q),
+              std::move(k),
+              std::move(v),
+              scale,
+              sinks,
+              splits,
+              tile_c,
+              starts,
+              k_scales,
+              k_biases,
+              v_scales,
+              v_biases,
+              s);
+          return nb::make_tuple(outs[0], outs[1]);
+        }
+        return nb::cast(mlx_kquant::sdpa_decode_gqa(
+            std::move(q),
+            std::move(k),
+            std::move(v),
+            scale,
+            sinks,
+            splits,
+            tile_c,
+            starts,
+            k_scales,
+            k_biases,
+            v_scales,
+            v_biases,
+            s));
+      },
       "q"_a,
       "k"_a,
       "v"_a,
@@ -213,6 +258,7 @@ NB_MODULE(_ext, m) {
       "v_scales"_a = nb::none(),
       "v_biases"_a = nb::none(),
       nb::kw_only(),
+      "return_lse"_a = false,
       "stream"_a = nb::none(),
       R"(
         Decode/verify GQA attention tuned for long KV caches: the key axis
@@ -244,12 +290,37 @@ NB_MODULE(_ext, m) {
                 kL). Out-of-range values read as an empty row (zero output).
 
         Returns:
-            array: attention output [B, n_q_heads, qL, D].
+            array: attention output [B, n_q_heads, qL, D]. With
+            ``return_lse=True``, a tuple ``(out, lse)`` where lse
+            [B, n_q_heads, qL] float32 is the natural-log softmax
+            normalizer per query row (the merge weight for combining
+            attention over disjoint key regions).
       )");
 
   m.def(
       "sdpa_fa_verify",
-      &mlx_kquant::sdpa_fa_verify,
+      [](mx::array q,
+         mx::array k,
+         mx::array v,
+         float scale,
+         int q_len,
+         int splits,
+         bool return_lse,
+         mx::StreamOrDevice s) -> nb::object {
+        if (return_lse) {
+          auto outs = mlx_kquant::sdpa_fa_verify_lse(
+              std::move(q),
+              std::move(k),
+              std::move(v),
+              scale,
+              q_len,
+              splits,
+              s);
+          return nb::make_tuple(outs[0], outs[1]);
+        }
+        return nb::cast(mlx_kquant::sdpa_fa_verify(
+            std::move(q), std::move(k), std::move(v), scale, q_len, splits, s));
+      },
       "q"_a,
       "k"_a,
       "v"_a,
@@ -257,6 +328,7 @@ NB_MODULE(_ext, m) {
       "q_len"_a,
       "splits"_a = 0,
       nb::kw_only(),
+      "return_lse"_a = false,
       "stream"_a = nb::none(),
       R"(
         Speculative-verify attention on the GPU matrix units for a GQA-folded
@@ -284,7 +356,10 @@ NB_MODULE(_ext, m) {
             splits (int): key-axis split count; 0 picks the default.
 
         Returns:
-            array: attention output [1, n_kv_heads, G*q_len, D].
+            array: attention output [1, n_kv_heads, G*q_len, D]. With
+            ``return_lse=True``, a tuple ``(out, lse)`` where lse
+            [1, n_kv_heads, G*q_len] float32 is the natural-log softmax
+            normalizer per folded row (cascade merge weight).
       )");
 
   m.def(

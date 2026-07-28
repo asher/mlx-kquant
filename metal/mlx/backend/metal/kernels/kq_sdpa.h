@@ -21,6 +21,7 @@ constant bool gqa_has_starts [[function_constant(4)]];
 // cooperative tile stage dequants into sK/sV -- everything downstream of
 // the stage is unchanged. Compiled out when false.
 constant bool gqa_kv_q8 [[function_constant(5)]];
+constant bool gqa_write_lse [[function_constant(6)]];
 
 template <typename T, int D, int V = D>
 [[kernel]] void kq_sdpa_vector_2pass_1(
@@ -1029,6 +1030,7 @@ template <typename T, int D>
     const device float* sinks [[buffer(3)]],
     device T* out [[buffer(4)]],
     const constant int& n_q_heads [[buffer(5)]],
+    device float* out_lse [[buffer(6)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -1075,5 +1077,10 @@ template <typename T, int D>
   out += base * D;
   for (short e = 0; e < EPT; e++) {
     out[e * 32 + simd_lid] = static_cast<T>(denom == 0 ? 0.0f : acc[e] / denom);
+  }
+  // Natural-log softmax normalizer (sinks included when present): the
+  // cascade merge weight for combining disjoint key regions.
+  if (gqa_write_lse && simd_lid == 0) {
+    out_lse[base] = denom == 0 ? -INFINITY : (fast::log(denom) + m);
   }
 }
