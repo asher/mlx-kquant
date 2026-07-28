@@ -319,41 +319,71 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
   for (int kt = kt0; kt < k1; kt += C) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Cooperative tile load; zero-fill the tail so stale threadgroup data
-    // can never reach the accumulators. On the q8 path each uint32 word
-    // holds 4 codes; dequant (scale * q + bias, per 64-element group) lands
-    // in sK/sV at the same T4 precision as the fp path.
-    for (int i = flat; i < C * D4; i += n_threads) {
-      const int row = i / D4;
-      const int col = i % D4;
-      const int kg = kt + row;
-      if (kg < k1) {
-        if (gqa_kv_q8) {
-          const uint32_t kw = kwbase[(size_t)kg * k_seq_stride + col];
-          const uint32_t vw = vwbase[(size_t)kg * v_seq_stride + col];
-          const size_t gs = col / GP4;
+    // can never reach the accumulators. The q8 path works in uint4 units
+    // (16 codes): one vectorized wire load and ONE scale/bias pair per
+    // unit -- 16 consecutive elements never straddle a 64-element group --
+    // instead of per-word scalar traffic, which measured ~40% below the
+    // fp16 kernel's bandwidth.
+    if (gqa_kv_q8) {
+      constexpr int DU = D / 16; // uint4 units per row
+      for (int u = flat; u < C * DU; u += n_threads) {
+        const int row = u / DU;
+        const int c16 = u % DU;
+        const int kg = kt + row;
+        const int i = row * D4 + c16 * 4;
+        if (kg < k1) {
+          const uint4 kw =
+              ((const device uint4*)(kwbase + (size_t)kg * k_seq_stride))[c16];
+          const uint4 vw =
+              ((const device uint4*)(vwbase + (size_t)kg * v_seq_stride))[c16];
+          const size_t gs = (c16 * 16) / 64;
           const float ksc = float(ksb[(size_t)kg * ks_seq_stride + gs]);
           const float kbi = float(kbb[(size_t)kg * ks_seq_stride + gs]);
           const float vsc = float(vsb[(size_t)kg * vs_seq_stride + gs]);
           const float vbi = float(vbb[(size_t)kg * vs_seq_stride + gs]);
-          const float4 kq4 = float4(
-              float(kw & 0xff),
-              float((kw >> 8) & 0xff),
-              float((kw >> 16) & 0xff),
-              float(kw >> 24));
-          const float4 vq4 = float4(
-              float(vw & 0xff),
-              float((vw >> 8) & 0xff),
-              float((vw >> 16) & 0xff),
-              float(vw >> 24));
-          sK[i] = T4(kq4 * ksc + kbi);
-          sV[i] = T4(vq4 * vsc + vbi);
+#pragma unroll
+          for (short w = 0; w < 4; w++) {
+            const uint32_t kx = w == 0 ? kw.x
+                : w == 1               ? kw.y
+                : w == 2               ? kw.z
+                                       : kw.w;
+            const uint32_t vx = w == 0 ? vw.x
+                : w == 1               ? vw.y
+                : w == 2               ? vw.z
+                                       : vw.w;
+            const float4 kq4 = float4(
+                float(kx & 0xff),
+                float((kx >> 8) & 0xff),
+                float((kx >> 16) & 0xff),
+                float(kx >> 24));
+            const float4 vq4 = float4(
+                float(vx & 0xff),
+                float((vx >> 8) & 0xff),
+                float((vx >> 16) & 0xff),
+                float(vx >> 24));
+            sK[i + w] = T4(kq4 * ksc + kbi);
+            sV[i + w] = T4(vq4 * vsc + vbi);
+          }
         } else {
+#pragma unroll
+          for (short w = 0; w < 4; w++) {
+            sK[i + w] = T4(T(0));
+            sV[i + w] = T4(T(0));
+          }
+        }
+      }
+    } else {
+      for (int i = flat; i < C * D4; i += n_threads) {
+        const int row = i / D4;
+        const int col = i % D4;
+        const int kg = kt + row;
+        if (kg < k1) {
           sK[i] = ((const device T4*)(kbase + (size_t)kg * k_seq_stride))[col];
           sV[i] = ((const device T4*)(vbase + (size_t)kg * v_seq_stride))[col];
+        } else {
+          sK[i] = T4(T(0));
+          sV[i] = T4(T(0));
         }
-      } else {
-        sK[i] = T4(T(0));
-        sV[i] = T4(T(0));
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
