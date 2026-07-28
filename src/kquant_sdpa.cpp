@@ -208,7 +208,9 @@ void KQuantSDPAGQA::eval_gpu(
   const auto& v = inputs[2];
   const bool sinks = has_sinks_;
   const bool starts = has_starts_;
+  const bool kv_q8 = has_kv_q8_;
   const size_t starts_idx = 3 + (sinks ? 1 : 0);
+  const size_t qkv_idx = starts_idx + (starts ? 1 : 0);
   kq_sdpa_check_layout("sdpa_decode_gqa", q, k, v);
 
   int B = q.shape(0);
@@ -252,10 +254,12 @@ void KQuantSDPAGQA::eval_gpu(
   std::string ts = kq_type_string(q.dtype());
   bool has_sinks = sinks;
   bool has_starts = starts;
+  bool has_kv_q8 = kv_q8;
   mx::metal::MTLFCList fc = {
       {&splits, MTL::DataType::DataTypeInt, 2},
       {&has_sinks, MTL::DataType::DataTypeBool, 3},
       {&has_starts, MTL::DataType::DataTypeBool, 4},
+      {&has_kv_q8, MTL::DataType::DataTypeBool, 5},
   };
 
   // Pass 1: one threadgroup per (kv-head, batch, split); the whole GQA group
@@ -265,8 +269,8 @@ void KQuantSDPAGQA::eval_gpu(
   {
     std::string kname = "kq_sdpa_gqa_2pass_1_" + ts + "_" + std::to_string(D) +
         "_c" + std::to_string(tile_c_) + (qL > 1 ? "_p2" : "");
-    std::string hash =
-        kname + "_s" + std::to_string(splits) + (has_starts ? "_st1" : "_st0");
+    std::string hash = kname + "_s" + std::to_string(splits) +
+        (has_starts ? "_st1" : "_st0") + (has_kv_q8 ? "_q8" : "");
     auto kernel = kq_get_kernel(d, kname, hash, fc);
     // Register-heavy pipeline: some GPUs cap it below the dispatch width, and
     // Metal turns an oversized dispatch into silent garbage, not an error.
@@ -295,6 +299,27 @@ void KQuantSDPAGQA::eval_gpu(
     // Metal wants every buffer bound; without starts, rebind sums as a dummy
     // (the read is compiled out via the function constant).
     ce.set_input_array(starts ? inputs[starts_idx] : sums, 13);
+    // Quantized-KV scale/bias operands (dummies when compiled out). Scale
+    // strides are shared per K/V side (scales and biases are congruent).
+    size_t ks_head_stride = 0, ks_seq_stride = 0;
+    size_t vs_head_stride = 0, vs_seq_stride = 0;
+    if (kv_q8) {
+      const auto& ksc = inputs[qkv_idx];
+      const auto& vsc = inputs[qkv_idx + 2];
+      ks_head_stride = static_cast<size_t>(
+          ksc.shape(1) == 1 ? ksc.strides(0) : ksc.strides(1));
+      ks_seq_stride = static_cast<size_t>(ksc.strides(2));
+      vs_head_stride = static_cast<size_t>(
+          vsc.shape(1) == 1 ? vsc.strides(0) : vsc.strides(1));
+      vs_seq_stride = static_cast<size_t>(vsc.strides(2));
+    }
+    for (int i = 0; i < 4; i++) {
+      ce.set_input_array(kv_q8 ? inputs[qkv_idx + i] : sums, 14 + i);
+    }
+    ce.set_bytes(ks_head_stride, 18);
+    ce.set_bytes(ks_seq_stride, 19);
+    ce.set_bytes(vs_head_stride, 20);
+    ce.set_bytes(vs_seq_stride, 21);
     MTL::Size group_dims(32, gqa_factor, qL > 1 ? (qL + 1) / 2 : 1);
     MTL::Size grid_dims(n_kv_heads, B, splits);
     ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -564,7 +589,8 @@ std::vector<mx::Shape> KQuantSDPAGQA::output_shapes(
 bool KQuantSDPAGQA::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantSDPAGQA&>(other);
   return scale_ == o.scale_ && splits_ == o.splits_ && tile_c_ == o.tile_c_ &&
-      has_sinks_ == o.has_sinks_ && has_starts_ == o.has_starts_;
+      has_sinks_ == o.has_sinks_ && has_starts_ == o.has_starts_ &&
+      has_kv_q8_ == o.has_kv_q8_;
 }
 
 mx::array sdpa_decode_gqa(
@@ -576,19 +602,50 @@ mx::array sdpa_decode_gqa(
     int splits,
     int tile_c,
     const std::optional<mx::array>& starts,
+    const std::optional<mx::array>& k_scales,
+    const std::optional<mx::array>& k_biases,
+    const std::optional<mx::array>& v_scales,
+    const std::optional<mx::array>& v_biases,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
+
+  const int n_qkv = int(k_scales.has_value()) + int(k_biases.has_value()) +
+      int(v_scales.has_value()) + int(v_biases.has_value());
+  const bool kv_q8 = n_qkv == 4;
+  if (n_qkv != 0 && n_qkv != 4) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa] quantized KV needs all four of "
+        "k_scales/k_biases/v_scales/v_biases.");
+  }
 
   if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa] q, k, v must be 4-D [B, heads, L, D].");
   }
   int D = q.shape(-1);
-  if ((D != 64 && D != 128 && D != 256 && D != 512) || v.shape(-1) != D ||
-      k.shape(-1) != D) {
+  if ((D != 64 && D != 128 && D != 256 && D != 512) ||
+      (!kv_q8 && (v.shape(-1) != D || k.shape(-1) != D))) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa] only head_dim 64/128/256/512 is "
         "supported.");
+  }
+  if (kv_q8) {
+    // mlx affine wire, bits 8 / group 64: packed uint32 words, one
+    // scale/bias per 64-element group ([B, Hkv, S, D/64], q's dtype).
+    if (k.dtype() != mx::uint32 || v.dtype() != mx::uint32 ||
+        k.shape(-1) != D / 4 || v.shape(-1) != D / 4) {
+      throw std::invalid_argument(
+          "[mlx_kquant.sdpa_decode_gqa] quantized k/v must be uint32 wire "
+          "with last dim head_dim / 4 (bits 8).");
+    }
+    for (const auto& a : {*k_scales, *k_biases, *v_scales, *v_biases}) {
+      if (a.dtype() != q.dtype() || a.ndim() != 4 || a.shape(-1) != D / 64 ||
+          a.shape(2) != k.shape(2)) {
+        throw std::invalid_argument(
+            "[mlx_kquant.sdpa_decode_gqa] quantized KV scales/biases must "
+            "be [B, n_kv_heads, S, head_dim / 64] in q's dtype (group 64).");
+      }
+    }
   }
   int qL = q.shape(2);
   if (qL < 1 || qL > 4) {
@@ -601,7 +658,7 @@ mx::array sdpa_decode_gqa(
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa] q must be float16 or bfloat16.");
   }
-  if (k.dtype() != dt || v.dtype() != dt) {
+  if (!kv_q8 && (k.dtype() != dt || v.dtype() != dt)) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa] q, k, v must share a dtype.");
   }
@@ -677,13 +734,25 @@ mx::array sdpa_decode_gqa(
     st = mx::reshape(st, {q.shape(0)}, s);
     inputs.push_back(mx::contiguous(st, false, s));
   }
+  if (kv_q8) {
+    for (const auto& a : {*k_scales, *k_biases, *v_scales, *v_biases}) {
+      inputs.push_back(
+          a.strides().back() == 1 ? a : mx::contiguous(a, false, s));
+    }
+  }
 
   auto out_shape = q.shape();
   return mx::array(
       std::move(out_shape),
       dt,
       std::make_shared<KQuantSDPAGQA>(
-          s, scale, splits, tile_c, sinks.has_value(), starts.has_value()),
+          s,
+          scale,
+          splits,
+          tile_c,
+          sinks.has_value(),
+          starts.has_value(),
+          kv_q8),
       std::move(inputs));
 }
 

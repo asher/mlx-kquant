@@ -475,6 +475,31 @@ instantiate_mv_ext_nx_all(q6_k, 256, 6, 32)
   instantiate_mv_ext_hd_for_type(codec, gs, bits, float16_t)
 instantiate_mv_ext_hd_all(q6_k, 256, 6)
 
+// Staged-activation experiment (KQ_MV_EXT_TS=1): the M x 128 activation
+// window stages into threadgroup memory once per K-step and 8 simdgroups
+// (32 output rows) share it -- the activation-path lever the sb/nr2/nx
+// falsifications never isolated. Dot math identical to base. q6_k M 4-12.
+#define instantiate_mv_ext_ts(codec, type, gs, bits, m)                 \
+  instantiate_kernel(                                                   \
+      "kquant_" #codec "_mv_ext_" #type "_gs_" #gs "_b_" #bits "_m" #m  \
+      "_ts",                                                            \
+      kq_ ## codec ## _mv_ext_ts, type, m, 8, 8)
+#define instantiate_mv_ext_ts_for_type(codec, gs, bits, type)           \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 4)                       \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 5)                       \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 6)                       \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 7)                       \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 8)                       \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 9)                       \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 10)                      \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 11)                      \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 12)
+#define instantiate_mv_ext_ts_all(codec, gs, bits)                      \
+  instantiate_mv_ext_ts_for_type(codec, gs, bits, float)                \
+  instantiate_mv_ext_ts_for_type(codec, gs, bits, bfloat16_t)           \
+  instantiate_mv_ext_ts_for_type(codec, gs, bits, float16_t)
+instantiate_mv_ext_ts_all(q6_k, 256, 6)
+
 #define instantiate_kquant_q3_k_for_type(type)                          \
   instantiate_kquant_batched(verify_qmv, type, 256, 3, 0, q3_k)          \
   instantiate_kquant_batched(qmv_fast, type, 256, 3, 0, q3_k)            \

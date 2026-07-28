@@ -16,6 +16,11 @@ constant int blocks [[function_constant(1)]];
 constant int gqa_splits [[function_constant(2)]];
 constant bool gqa_has_sinks [[function_constant(3)]];
 constant bool gqa_has_starts [[function_constant(4)]];
+// Quantized KV operands (mlx affine wire, bits 8 / group 64): keys/values
+// bind as packed uint32 words plus per-group scale/bias arrays, and the
+// cooperative tile stage dequants into sK/sV -- everything downstream of
+// the stage is unchanged. Compiled out when false.
+constant bool gqa_kv_q8 [[function_constant(5)]];
 
 template <typename T, int D, int V = D>
 [[kernel]] void kq_sdpa_vector_2pass_1(
@@ -213,6 +218,14 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
     const constant float& scale [[buffer(11)]],
     const constant int& q_len [[buffer(12)]],
     const device int* starts [[buffer(13)]],
+    const device T* k_scales [[buffer(14)]],
+    const device T* k_biases [[buffer(15)]],
+    const device T* v_scales [[buffer(16)]],
+    const device T* v_biases [[buffer(17)]],
+    const constant size_t& ks_head_stride [[buffer(18)]],
+    const constant size_t& ks_seq_stride [[buffer(19)]],
+    const constant size_t& vs_head_stride [[buffer(20)]],
+    const constant size_t& vs_seq_stride [[buffer(21)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -220,6 +233,7 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
   constexpr int D4 = D / 4;
   constexpr int NL = 32 / NE; // lanes per in-flight key
   constexpr int DP4 = D4 / NL; // float4s per lane per key row
+  constexpr int GP4 = 64 / 4; // packed words per quant group (group_size 64)
   using T4 = metal::vec<T, 4>;
 
   threadgroup T4 sK[C * D4];
@@ -256,10 +270,21 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
     kt0 = max(k0, (row_start / C) * C);
   }
 
+  // With gqa_kv_q8 the k/v buffers hold packed uint32 wire and the strides
+  // arrive in WORDS (D/4 per row); otherwise they hold T elements.
   const device T* kbase =
       keys + (size_t)(batch_idx * num_kv_heads + kv_head_idx) * k_head_stride;
   const device T* vbase =
       values + (size_t)(batch_idx * num_kv_heads + kv_head_idx) * v_head_stride;
+  const size_t kv_hb = (size_t)(batch_idx * num_kv_heads + kv_head_idx);
+  const device uint32_t* kwbase =
+      (const device uint32_t*)keys + kv_hb * k_head_stride;
+  const device uint32_t* vwbase =
+      (const device uint32_t*)values + kv_hb * v_head_stride;
+  const device T* ksb = k_scales + kv_hb * ks_head_stride;
+  const device T* kbb = k_biases + kv_hb * ks_head_stride;
+  const device T* vsb = v_scales + kv_hb * vs_head_stride;
+  const device T* vbb = v_biases + kv_hb * vs_head_stride;
 
   // Pre-scaled query slices for this lane's key-row columns
   // ([B, Hq, q_len, D], row-contiguous). A simdgroup past the runtime query
@@ -294,14 +319,38 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
   for (int kt = kt0; kt < k1; kt += C) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Cooperative tile load; zero-fill the tail so stale threadgroup data
-    // can never reach the accumulators.
+    // can never reach the accumulators. On the q8 path each uint32 word
+    // holds 4 codes; dequant (scale * q + bias, per 64-element group) lands
+    // in sK/sV at the same T4 precision as the fp path.
     for (int i = flat; i < C * D4; i += n_threads) {
       const int row = i / D4;
       const int col = i % D4;
       const int kg = kt + row;
       if (kg < k1) {
-        sK[i] = ((const device T4*)(kbase + (size_t)kg * k_seq_stride))[col];
-        sV[i] = ((const device T4*)(vbase + (size_t)kg * v_seq_stride))[col];
+        if (gqa_kv_q8) {
+          const uint32_t kw = kwbase[(size_t)kg * k_seq_stride + col];
+          const uint32_t vw = vwbase[(size_t)kg * v_seq_stride + col];
+          const size_t gs = col / GP4;
+          const float ksc = float(ksb[(size_t)kg * ks_seq_stride + gs]);
+          const float kbi = float(kbb[(size_t)kg * ks_seq_stride + gs]);
+          const float vsc = float(vsb[(size_t)kg * vs_seq_stride + gs]);
+          const float vbi = float(vbb[(size_t)kg * vs_seq_stride + gs]);
+          const float4 kq4 = float4(
+              float(kw & 0xff),
+              float((kw >> 8) & 0xff),
+              float((kw >> 16) & 0xff),
+              float(kw >> 24));
+          const float4 vq4 = float4(
+              float(vw & 0xff),
+              float((vw >> 8) & 0xff),
+              float((vw >> 16) & 0xff),
+              float(vw >> 24));
+          sK[i] = T4(kq4 * ksc + kbi);
+          sV[i] = T4(vq4 * vsc + vbi);
+        } else {
+          sK[i] = ((const device T4*)(kbase + (size_t)kg * k_seq_stride))[col];
+          sV[i] = ((const device T4*)(vbase + (size_t)kg * v_seq_stride))[col];
+        }
       } else {
         sK[i] = T4(T(0));
         sV[i] = T4(T(0));

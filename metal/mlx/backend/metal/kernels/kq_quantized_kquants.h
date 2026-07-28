@@ -2899,6 +2899,23 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
 }
 
 template <typename T, short r1ptg, short nsg, short nxpsg>
+[[kernel]] void kq_q6_k_mv_ext_ts(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size, // K
+    const constant int& out_vec_size, // N
+    const constant int& /* vm */, // == r1ptg
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup T staged[r1ptg * nxpsg * 16];
+  kq_mv_ext_ts_impl<T, KqQ6_KExt, r1ptg, nsg, nxpsg>(
+      w, x, y, staged, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
+}
+
+template <typename T, short r1ptg, short nsg, short nxpsg>
 [[kernel]] void kq_q6_k_mv_ext_hd(
     const device uint8_t* w,
     const device uint8_t* /* scales */,

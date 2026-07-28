@@ -884,9 +884,19 @@ void verify_mv_ext(
   }();
   const bool use_hd = !use_nr2 && !use_sb && !use_nx && mv_ext_hd && M >= 4 &&
       kquant_type == "q6_k" && x.dtype() != mx::float32;
+  // Staged-activation experiment (KQ_MV_EXT_TS=1): cooperative TG-memory
+  // stage of the activation window, 8 simdgroups / 32 rows per TG. q6_k
+  // M 4-12; K must cover a full 128-element window (q6_k geometry does).
+  static const bool mv_ext_ts = []() {
+    const char* e = std::getenv("KQ_MV_EXT_TS");
+    return e != nullptr && std::atoi(e) == 1;
+  }();
+  const bool use_ts = !use_nr2 && !use_sb && !use_nx && !use_hd && mv_ext_ts &&
+      M >= 4 && kquant_type == "q6_k" && K % 128 == 0;
+  const int nsg_eff = use_ts ? 8 : nsg;
   const int nxpsg_eff = use_nx ? mv_ext_nx : nxpsg;
-  const int rows_per_tg = (32 / nxpsg_eff) * nsg * (use_nr2 ? 2 : 1);
-  MTL::Size group_dims(32, nsg, 1);
+  const int rows_per_tg = (32 / nxpsg_eff) * nsg_eff * (use_nr2 ? 2 : 1);
+  MTL::Size group_dims(32, nsg_eff, 1);
   MTL::Size grid_dims((N + rows_per_tg - 1) / rows_per_tg, 1, 1);
 
   std::string type_string = kq_type_string(x.dtype());
@@ -905,7 +915,7 @@ void verify_mv_ext(
       use_nr2 ? "_nr2"
               : (use_sb ? "_sb"
                         : (use_nx ? (mv_ext_nx == 16 ? "_x16" : "_x32")
-                                  : (use_hd ? "_hd" : ""))));
+                                  : (use_hd ? "_hd" : (use_ts ? "_ts" : "")))));
 
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -1127,13 +1137,15 @@ void KQuantMatmul::eval_gpu(
   }
 
   // NAX split-K qmm experiment (KQ_QMM_SPLITK_NAX=<target splits>, 0 = off,
-  // read once): K-slices on the tensor-core BM=32 tile; see qmm_nax_splitk.
+  // 1 = auto target 32; read LIVE per call so --ab-env can flip it on one
+  // generator): K-slices on the tensor-core BM=32 tile; see qmm_nax_splitk.
   // Slice quantum is max(superblock, BK) so every slice starts a loader at
   // kt_base 0. q6_k + q8_0 instantiations only.
-  static const int qmm_splitk_nax_env = []() {
-    const char* e = std::getenv("KQ_QMM_SPLITK_NAX");
-    return e != nullptr ? std::atoi(e) : 0;
-  }();
+  const char* sk_nax_e = std::getenv("KQ_QMM_SPLITK_NAX");
+  int qmm_splitk_nax_env = sk_nax_e != nullptr ? std::atoi(sk_nax_e) : 0;
+  if (qmm_splitk_nax_env == 1) {
+    qmm_splitk_nax_env = 32;
+  }
   if (qmm_splitk_nax_env > 1 && transpose_ && non_batched && M <= 32 &&
       (kquant_type_ == "q6_k" || kquant_type_ == "q8_0") &&
       kq_is_nax_available() && (K % 64 == 0) && x.dtype() != mx::float32) {

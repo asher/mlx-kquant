@@ -174,6 +174,10 @@ mx::array sdpa_decode_gqa(
     int splits = 0,
     int tile_c = 32,
     const std::optional<mx::array>& starts = std::nullopt,
+    const std::optional<mx::array>& k_scales = std::nullopt,
+    const std::optional<mx::array>& k_biases = std::nullopt,
+    const std::optional<mx::array>& v_scales = std::nullopt,
+    const std::optional<mx::array>& v_biases = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // Speculative-verify attention on the GPU matrix units for a GQA-folded query
@@ -700,13 +704,15 @@ class KQuantSDPAGQA : public mx::Primitive {
       int splits,
       int tile_c,
       bool has_sinks,
-      bool has_starts)
+      bool has_starts,
+      bool has_kv_q8 = false)
       : mx::Primitive(stream),
         scale_(scale),
         splits_(splits),
         tile_c_(tile_c),
         has_sinks_(has_sinks),
-        has_starts_(has_starts) {}
+        has_starts_(has_starts),
+        has_kv_q8_(has_kv_q8) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -729,6 +735,7 @@ class KQuantSDPAGQA : public mx::Primitive {
   int tile_c_;
   bool has_sinks_;
   bool has_starts_;
+  bool has_kv_q8_;
 };
 
 // Simdgroup-matrix FA verify attention (see sdpa_fa_verify). Inference-only.

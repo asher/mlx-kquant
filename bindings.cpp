@@ -208,6 +208,10 @@ NB_MODULE(_ext, m) {
       "splits"_a = 0,
       "tile_c"_a = 0,
       "starts"_a = nb::none(),
+      "k_scales"_a = nb::none(),
+      "k_biases"_a = nb::none(),
+      "v_scales"_a = nb::none(),
+      "v_biases"_a = nb::none(),
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
@@ -219,6 +223,9 @@ NB_MODULE(_ext, m) {
         tiles, causally clamped to its own trailing position. With `starts`,
         batch row b attends keys [starts[b], kL) -- a left-padded batched KV
         cache -- and fully padded-out key chunks are skipped, not staged.
+        With k_scales/k_biases/v_scales/v_biases (all four), k and v are
+        mlx affine-quantized wire (uint32, bits 8, group 64) and dequant is
+        fused into the tile stage.
 
         Args:
             q (array): queries [B, n_q_heads, qL, D], float16/bfloat16;
