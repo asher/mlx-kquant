@@ -1075,12 +1075,14 @@ template <typename T, int D>
   sums += base * gqa_splits;
   maxs += base * gqa_splits;
 
-  // Second set: fa folded layout, row = kv*(B*gqa) + b*gqa + g.
+  // Second set: fa folded layout with the query axis innermost,
+  // row = ((kv*B + b)*gqa + g)*qL + t (tpg.z = qL; decode width -> t = 0).
   int splits2 = 0;
   if (gqa_cascade) {
     const int kv = head_idx / cascade_gqa;
     const int g = head_idx % cascade_gqa;
-    const size_t row = ((size_t)kv * tpg.y + batch_idx) * cascade_gqa + g;
+    const size_t row =
+        (((size_t)kv * tpg.y + batch_idx) * cascade_gqa + g) * tpg.z + tid.z;
     splits2 = cascade_splits;
     partials2 += row * splits2 * D;
     sums2 += row * splits2;

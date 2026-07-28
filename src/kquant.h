@@ -225,9 +225,11 @@ mx::array sdpa_fa_verify(
 // query rows, the decode pass covers the private region per row, and both
 // partial sets fold through one merge pass (the splits machinery is the LSE
 // merge). Equivalent to sdpa_decode_gqa over the concatenated KV, reading
-// the prefix once instead of B times. q [B, Hq, 1, D]; B*gqa <= 64 (32 at
-// head_dim 512); gqa <= 16; Sp >= 1. Returns {out} or {out, lse} with
-// return_lse. Metal-only.
+// the prefix once instead of B times. q [B, Hq, qL, D], qL in [1, 8]
+// (verify width: per-row end-aligned causal on the private suffix, full
+// visibility of the shared prefix); B*gqa*qL <= 64 (32 at head_dim 512);
+// gqa <= 16; gqa*ceil(qL/2) <= 32 at qL > 1; Sp >= qL. Returns {out} or
+// {out, lse} (lse [B, Hq, qL]) with return_lse. Metal-only.
 std::vector<mx::array> sdpa_decode_gqa_cascade(
     mx::array q,
     mx::array k_shared,

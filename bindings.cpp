@@ -452,9 +452,11 @@ NB_MODULE(_ext, m) {
         concatenated KV, reading the prefix once instead of B times.
 
         Args:
-            q (array): queries [B, n_q_heads, 1, D], float16/bfloat16;
-                D in {64, 128, 256, 512}; gqa <= 16; B*gqa <= 64 (<= 32 at
-                D=512).
+            q (array): queries [B, n_q_heads, qL, D], float16/bfloat16;
+                qL in [1, 8] (verify width: end-aligned causal on the
+                private suffix, full shared visibility); D in
+                {64, 128, 256, 512}; gqa <= 16; B*gqa*qL <= 64 (<= 32 at
+                D=512); gqa*ceil(qL/2) <= 32 at qL > 1.
             k_shared (array): shared prefix keys [1, n_kv_heads, P, D].
             v_shared (array): shared prefix values [1, n_kv_heads, P, D].
             k_priv (array): private suffix keys [B, n_kv_heads, Sp, D],

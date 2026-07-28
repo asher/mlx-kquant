@@ -663,6 +663,82 @@ def test_sdpa_cascade_fused_validation():
         kq.sdpa_decode_gqa_cascade(
             q, k_sh, v_sh, k_pr[:, :, :0, :], v_pr[:, :, :0, :], scale
         )  # empty private region
+    q9 = mx.concatenate([q] * 9, axis=2)
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_cascade(q9, k_sh, v_sh, k_pr, v_pr, scale)  # qL > 8
+    # over the folded-row cap: B2 * gqa8 * qL5 = 80 > 64
+    qw, k_w, v_w = _make(B, 64, Hkv, 5, 64, D, mx.bfloat16, seed=29, strided=False)
+    _, ksw, vsw = _make(1, 64, Hkv, 1, 512, D, mx.bfloat16, seed=30, strided=False)
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_cascade(qw, ksw, vsw, k_w, v_w, scale)
+
+
+def _cascade_verify_ref(q, k, v, pads, scale, qL):
+    # f32 masked reference: per-row left pad + end-aligned causal block
+    B, Hq, _, D = q.shape
+    Hkv, L = k.shape[1], k.shape[2]
+    kr = mx.repeat(k, Hq // Hkv, axis=1).astype(mx.float32)
+    vr = mx.repeat(v, Hq // Hkv, axis=1).astype(mx.float32)
+    s = (q.astype(mx.float32) * scale) @ kr.swapaxes(-1, -2)
+    pos = mx.arange(L)[None, None, None, :]
+    end = (L - qL) + mx.arange(qL)[None, None, :, None]
+    pad = mx.array(pads)[:, None, None, None]
+    keep = (pos >= pad) & (pos <= end)
+    s = mx.where(keep, s, mx.array(-mx.inf))
+    return mx.softmax(s, axis=-1) @ vr
+
+
+@pytest.mark.parametrize(
+    "B,Hq,Hkv,D,qL,pads",
+    [
+        (2, 4, 2, 256, 8, [0, 64]),  # gemma-31b assistant geometry
+        (2, 12, 2, 256, 5, [0, 64]),  # qwen nextn geometry at cap-2
+        (2, 8, 4, 512, 3, [0, 16]),  # hd512 d-split walk
+        (4, 16, 8, 128, 8, [0, 3, 511, 64]),  # 64 folded rows exactly
+        (1, 8, 8, 64, 5, [0]),
+    ],
+)
+def test_sdpa_cascade_fused_verify_width(B, Hq, Hkv, D, qL, pads):
+    # qL > 1: end-aligned causal on the private suffix, full shared
+    # visibility, per-row starts honored
+    P, sp = 2048, 96
+    scale = 1.0 / (D**0.5)
+    mx.random.seed(41)
+    L = max(pads) + P + sp
+    kb = mx.random.normal((B, Hkv, L, D)).astype(mx.float16)
+    vb = mx.random.normal((B, Hkv, L, D)).astype(mx.float16)
+    pk = kb[0:1, :, pads[0] : pads[0] + P]
+    pv = vb[0:1, :, pads[0] : pads[0] + P]
+    rk, rv = [], []
+    for b in range(B):
+        rk.append(
+            mx.concatenate(
+                [kb[b : b + 1, :, : pads[b]], pk, kb[b : b + 1, :, pads[b] + P :]],
+                axis=2,
+            )
+        )
+        rv.append(
+            mx.concatenate(
+                [vb[b : b + 1, :, : pads[b]], pv, vb[b : b + 1, :, pads[b] + P :]],
+                axis=2,
+            )
+        )
+    k = mx.concatenate(rk, axis=0)
+    v = mx.concatenate(rv, axis=0)
+    q = mx.random.normal((B, Hq, qL, D)).astype(mx.float16)
+    c0 = min(pads) + P
+    starts = None
+    if any(pads):
+        starts = mx.array([p + P - c0 for p in pads], dtype=mx.int32)
+    got, lse = kq.sdpa_decode_gqa_cascade(
+        q, pk, pv, k[:, :, c0:], v[:, :, c0:], scale, starts=starts, return_lse=True
+    )
+    ref = _cascade_verify_ref(q, k, v, pads, scale, qL)
+    _eval_or_skip(got, ref)
+    assert lse.shape == (B, Hq, qL)
+    rel = _rel(got, ref)
+    print(f"  [cascade] verify D={D} qL={qL} B={B}: rel={rel:.3e}")
+    assert rel < REL_BOUND[mx.float16], f"cascade verify rel {rel:.3e}"
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])

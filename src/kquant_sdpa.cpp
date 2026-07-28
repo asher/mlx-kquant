@@ -548,10 +548,10 @@ void KQuantSDPACascade::eval_gpu(
   int D = q.shape(3);
   int n_kv_heads = k_sh.shape(1);
   int gqa_factor = n_q_heads / n_kv_heads;
-  int n_rows = B * gqa_factor;
   int P = k_sh.shape(2);
   int Sp = k_pr.shape(2);
-  int qL = 1;
+  int qL = q.shape(2);
+  int n_rows = B * gqa_factor * qL;
   float scale = scale_;
 
   int s_sh = splits_shared_;
@@ -596,11 +596,12 @@ void KQuantSDPACascade::eval_gpu(
         {&f, MTL::DataType::DataTypeBool, 8},
     };
     std::string kname = "kq_sdpa_gqa_2pass_1_" + ts + "_" + std::to_string(D) +
-        "_c" + std::to_string(tile_c_);
+        "_c" + std::to_string(tile_c_) + (qL > 1 ? "_p2" : "");
     std::string hash = kname + "_s" + std::to_string(s_pr) +
         (has_starts ? "_st1" : "_st0") + "_casc";
     auto kernel = kq_get_kernel(d, kname, hash, fc);
-    const size_t tg = size_t(32) * gqa_factor;
+    const size_t tg =
+        size_t(32) * gqa_factor * (qL > 1 ? size_t((qL + 1) / 2) : 1);
     if (tg > kernel->maxTotalThreadsPerThreadgroup()) {
       throw std::runtime_error(
           "[mlx_kquant.sdpa_decode_gqa_cascade] threadgroup of " +
@@ -638,7 +639,7 @@ void KQuantSDPACascade::eval_gpu(
     const int pzero = 0;
     ce.set_input_array(sums1, 22);
     ce.set_bytes(pzero, 23);
-    MTL::Size group_dims(32, gqa_factor, 1);
+    MTL::Size group_dims(32, gqa_factor, qL > 1 ? (qL + 1) / 2 : 1);
     MTL::Size grid_dims(n_kv_heads, B, s_pr);
     ce.dispatch_threadgroups(grid_dims, group_dims);
   }
@@ -681,7 +682,8 @@ void KQuantSDPACascade::eval_gpu(
     ce.set_bytes(v_head_stride, 9);
     ce.set_bytes(v_seq_stride, 10);
     ce.set_bytes(scale, 11);
-    ce.set_bytes(qL, 12);
+    const int q_len_shared = 1; // unclamped: verify rows see the whole prefix
+    ce.set_bytes(q_len_shared, 12);
     ce.set_bytes(n_rows, 13);
     MTL::Size group_dims(32, tg / 32, 1);
     MTL::Size grid_dims(n_kv_heads, 1, s_sh);
@@ -1262,8 +1264,9 @@ std::vector<mx::array> sdpa_decode_gqa_cascade(
     throw std::invalid_argument(
         std::string(op) + "head_dim must be 64, 128, 256 or 512.");
   }
-  if (q.shape(2) != 1) {
-    throw std::invalid_argument(std::string(op) + "q_len must be 1.");
+  int qL = q.shape(2);
+  if (qL < 1 || qL > 8) {
+    throw std::invalid_argument(std::string(op) + "q_len must be in [1, 8].");
   }
   if (k_shared.shape(0) != 1 || v_shared.shape(0) != 1 ||
       v_shared.shape(1) != n_kv_heads ||
@@ -1291,21 +1294,31 @@ std::vector<mx::array> sdpa_decode_gqa_cascade(
   if (gqa_factor > 16) {
     throw std::invalid_argument(std::string(op) + "gqa factor must be <= 16.");
   }
-  int n_rows = B * gqa_factor;
+  int n_rows = B * gqa_factor * qL;
   int max_rows = D == 512 ? 32 : 64;
   if (n_rows > max_rows) {
     throw std::invalid_argument(
-        std::string(op) + "B * gqa must be <= " + std::to_string(max_rows) +
-        " at head_dim " + std::to_string(D) + ".");
+        std::string(op) + "B * gqa * q_len must be <= " +
+        std::to_string(max_rows) + " at head_dim " + std::to_string(D) + ".");
   }
+  if (qL > 1 && gqa_factor * ((qL + 1) / 2) > 32) {
+    throw std::invalid_argument(
+        std::string(op) + "gqa * ceil(q_len/2) must be <= 32.");
+  }
+  const int tile_default = D <= 128 ? 32 : D == 256 ? 16 : 8;
   if (tile_c == 0) {
-    tile_c = D <= 128 ? 32 : D == 256 ? 16 : 8;
+    tile_c = tile_default;
   }
   const bool tile_ok = (D <= 128 && (tile_c == 32 || tile_c == 16)) ||
       (D == 256 && (tile_c == 16 || tile_c == 8)) || (D == 512 && tile_c == 8);
   if (!tile_ok) {
     throw std::invalid_argument(
         std::string(op) + "tile_c not instantiated for this head_dim.");
+  }
+  if (qL > 1 && tile_c != tile_default) {
+    // the verify-width (_p2) private kernel exists at the default tile only
+    throw std::invalid_argument(
+        std::string(op) + "q_len > 1 requires the default tile_c.");
   }
   if (splits_shared < 0 || splits_shared > 128 || splits_priv < 0 ||
       splits_priv > 128) {
@@ -1314,12 +1327,13 @@ std::vector<mx::array> sdpa_decode_gqa_cascade(
   }
 
   auto q_c = mx::contiguous(q, false, s);
-  // kv-head-major fold for the shared row-tile pass.
+  // kv-head-major fold for the shared row-tile pass, query axis innermost:
+  // row = (b*gqa + g)*qL + t.
   auto q_folded = mx::contiguous(
       mx::reshape(
           mx::transpose(
-              mx::reshape(q_c, {B, n_kv_heads, gqa_factor, D}, s),
-              {1, 0, 2, 3},
+              mx::reshape(q_c, {B, n_kv_heads, gqa_factor, qL, D}, s),
+              {1, 0, 2, 3, 4},
               s),
           {1, n_kv_heads, n_rows, D},
           s),
@@ -1359,7 +1373,7 @@ std::vector<mx::array> sdpa_decode_gqa_cascade(
       return_lse);
   auto out_shape = q.shape();
   if (return_lse) {
-    mx::Shape lse_shape = {B, n_q_heads, 1};
+    mx::Shape lse_shape = {B, n_q_heads, qL};
     return mx::array::make_arrays(
         {std::move(out_shape), std::move(lse_shape)},
         {dt, mx::float32},
