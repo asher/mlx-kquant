@@ -363,6 +363,82 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_decode_gqa_cascade",
+      [](mx::array q,
+         mx::array k_shared,
+         mx::array v_shared,
+         mx::array k_priv,
+         mx::array v_priv,
+         float scale,
+         const std::optional<mx::array>& starts,
+         int splits_shared,
+         int splits_priv,
+         int tile_c,
+         bool return_lse,
+         mx::StreamOrDevice s) -> nb::object {
+        auto outs = mlx_kquant::sdpa_decode_gqa_cascade(
+            std::move(q),
+            std::move(k_shared),
+            std::move(v_shared),
+            std::move(k_priv),
+            std::move(v_priv),
+            scale,
+            starts,
+            splits_shared,
+            splits_priv,
+            tile_c,
+            return_lse,
+            s);
+        if (return_lse) {
+          return nb::make_tuple(outs[0], outs[1]);
+        }
+        return nb::cast(outs[0]);
+      },
+      "q"_a,
+      "k_shared"_a,
+      "v_shared"_a,
+      "k_priv"_a,
+      "v_priv"_a,
+      "scale"_a,
+      "starts"_a = nb::none(),
+      "splits_shared"_a = 0,
+      "splits_priv"_a = 0,
+      "tile_c"_a = 0,
+      nb::kw_only(),
+      "return_lse"_a = false,
+      "stream"_a = nb::none(),
+      R"(
+        Fused shared-prefix (cascade) decode attention: every batch row
+        attends one COMMON prefix, stored once, plus its own private
+        suffix. The shared region is walked ONCE for all B*gqa query rows
+        on the matrix-unit row tile; the private region runs per row (with
+        optional left-pad ``starts``); both partial sets fold through a
+        single merge pass. Equivalent to ``sdpa_decode_gqa`` over the
+        concatenated KV, reading the prefix once instead of B times.
+
+        Args:
+            q (array): queries [B, n_q_heads, 1, D], float16/bfloat16;
+                D in {64, 128, 256, 512}; gqa <= 16; B*gqa <= 64 (<= 32 at
+                D=512).
+            k_shared (array): shared prefix keys [1, n_kv_heads, P, D].
+            v_shared (array): shared prefix values [1, n_kv_heads, P, D].
+            k_priv (array): private suffix keys [B, n_kv_heads, Sp, D],
+                Sp >= 1.
+            v_priv (array): private suffix values [B, n_kv_heads, Sp, D].
+            scale (float): query scale (typically 1/sqrt(D)).
+            starts (array, optional): int32 [B] per-row private-region key
+                start offsets (left-padded private suffixes).
+            splits_shared (int): shared-region split count; 0 = default.
+            splits_priv (int): private-region split count; 0 = default.
+            tile_c (int): private-pass staged tile height; 0 picks by
+                head_dim.
+
+        Returns:
+            array: attention output [B, n_q_heads, 1, D]. With
+            ``return_lse=True``, a tuple ``(out, lse)``.
+      )");
+
+  m.def(
       "moe_glu_gather",
       &mlx_kquant::moe_glu_gather,
       "x"_a,

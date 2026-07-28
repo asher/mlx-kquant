@@ -581,3 +581,85 @@ def test_sdpa_cascade_lse_merge():
     _eval_or_skip(merged, ref)
     rel = _rel(merged, ref)
     assert rel < REL_BOUND[mx.bfloat16], f"cascade merge rel {rel:.3e}"
+
+
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_sdpa_cascade_fused_matches_concat(D, dtype):
+    # fused cascade op == one sdpa_decode_gqa call over the concatenated KV
+    B, Hq, Hkv = 4, 32, 8
+    P, Sp = 3071, 257
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, dtype, seed=21, strided=False)
+    q, k_pr, v_pr = _make(B, Hq, Hkv, 1, Sp, D, dtype, seed=22, strided=False)
+    k_full = mx.contiguous(
+        mx.concatenate([mx.broadcast_to(k_sh, (B, Hkv, P, D)), k_pr], axis=2)
+    )
+    v_full = mx.contiguous(
+        mx.concatenate([mx.broadcast_to(v_sh, (B, Hkv, P, D)), v_pr], axis=2)
+    )
+    ref = kq.sdpa_decode_gqa(q, k_full, v_full, scale)
+    got = kq.sdpa_decode_gqa_cascade(q, k_sh, v_sh, k_pr, v_pr, scale)
+    _eval_or_skip(got, ref)
+    rel = _rel(got, ref)
+    print(f"  [cascade] fused D={D} {dtype}: rel={rel:.3e}")
+    assert rel < REL_BOUND[dtype], f"fused cascade rel {rel:.3e}"
+
+
+def test_sdpa_cascade_fused_starts():
+    # per-row private left-pad: keys below starts[b] in the PRIVATE region
+    # are excluded; the shared prefix is always fully attended
+    B, Hq, Hkv, D = 4, 32, 8, 128
+    P, Sp = 2048, 384
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, mx.bfloat16, seed=23, strided=False)
+    q, k_pr, v_pr = _make(B, Hq, Hkv, 1, Sp, D, mx.bfloat16, seed=24, strided=False)
+    starts = mx.array([0, 7, 133, Sp - 1], dtype=mx.int32)
+    got = kq.sdpa_decode_gqa_cascade(q, k_sh, v_sh, k_pr, v_pr, scale, starts=starts)
+    k_full = mx.concatenate([mx.broadcast_to(k_sh, (B, Hkv, P, D)), k_pr], axis=2)
+    v_full = mx.concatenate([mx.broadcast_to(v_sh, (B, Hkv, P, D)), v_pr], axis=2)
+    pos = mx.arange(P + Sp)[None, :]
+    keep = pos >= (starts[:, None] + P)
+    keep = mx.logical_or(pos < P, keep)
+    bias = mx.where(keep, mx.zeros(keep.shape), mx.full(keep.shape, -mx.inf))
+    kr = mx.repeat(k_full, Hq // Hkv, axis=1).astype(mx.float32)
+    vr = mx.repeat(v_full, Hq // Hkv, axis=1).astype(mx.float32)
+    s_ref = (q.astype(mx.float32) * scale) @ kr.swapaxes(-1, -2)
+    s_ref = s_ref + bias[:, None, None, :]
+    ref = mx.softmax(s_ref, axis=-1) @ vr
+    _eval_or_skip(got, ref)
+    rel = _rel(got.astype(mx.float32), ref)
+    assert rel < REL_BOUND[mx.bfloat16], f"cascade starts rel {rel:.3e}"
+
+
+def test_sdpa_cascade_fused_return_lse():
+    B, Hq, Hkv, D = 2, 16, 8, 128
+    P, Sp = 1023, 65
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, mx.bfloat16, seed=25, strided=False)
+    q, k_pr, v_pr = _make(B, Hq, Hkv, 1, Sp, D, mx.bfloat16, seed=26, strided=False)
+    o, lse = kq.sdpa_decode_gqa_cascade(
+        q, k_sh, v_sh, k_pr, v_pr, scale, return_lse=True
+    )
+    o0 = kq.sdpa_decode_gqa_cascade(q, k_sh, v_sh, k_pr, v_pr, scale)
+    k_full = mx.concatenate([mx.broadcast_to(k_sh, (B, Hkv, P, D)), k_pr], axis=2)
+    kr = mx.repeat(k_full, Hq // Hkv, axis=1).astype(mx.float32)
+    s_ref = (q.astype(mx.float32) * scale) @ kr.swapaxes(-1, -2)
+    lse_ref = mx.logsumexp(s_ref[:, :, 0, :], axis=-1)[..., None]
+    _eval_or_skip(o, lse, o0, lse_ref)
+    assert lse.shape == (B, Hq, 1) and lse.dtype == mx.float32
+    assert float(mx.abs(o - o0).max()) == 0.0
+    assert float(mx.abs(lse - lse_ref).max()) < 2e-2
+
+
+def test_sdpa_cascade_fused_validation():
+    B, Hq, Hkv, D = 2, 16, 8, 128
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, 512, D, mx.bfloat16, seed=27, strided=False)
+    q, k_pr, v_pr = _make(B, Hq, Hkv, 1, 64, D, mx.bfloat16, seed=28, strided=False)
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_cascade(q, k_pr, v_pr, k_pr, v_pr, scale)  # shared B != 1
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_cascade(
+            q, k_sh, v_sh, k_pr[:, :, :0, :], v_pr[:, :, :0, :], scale
+        )  # empty private region

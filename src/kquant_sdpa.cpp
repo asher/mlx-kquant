@@ -260,12 +260,14 @@ void KQuantSDPAGQA::eval_gpu(
   bool has_starts = starts;
   bool has_kv_q8 = kv_q8;
   bool has_lse = write_lse;
+  bool has_cascade = false;
   mx::metal::MTLFCList fc = {
       {&splits, MTL::DataType::DataTypeInt, 2},
       {&has_sinks, MTL::DataType::DataTypeBool, 3},
       {&has_starts, MTL::DataType::DataTypeBool, 4},
       {&has_kv_q8, MTL::DataType::DataTypeBool, 5},
       {&has_lse, MTL::DataType::DataTypeBool, 6},
+      {&has_cascade, MTL::DataType::DataTypeBool, 7},
   };
 
   // Pass 1: one threadgroup per (kv-head, batch, split); the whole GQA group
@@ -352,6 +354,13 @@ void KQuantSDPAGQA::eval_gpu(
     } else {
       ce.set_input_array(sums, 6);
     }
+    // Cascade compiled out: dummy second-set bindings.
+    const int czero = 0;
+    for (int i = 7; i <= 9; i++) {
+      ce.set_input_array(sums, i);
+    }
+    ce.set_bytes(czero, 10);
+    ce.set_bytes(czero, 11);
     MTL::Size group_dims(32, 1, 1);
     MTL::Size grid_dims(n_q_heads, B, qL);
     ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -418,10 +427,12 @@ void KQuantSDPAFAVerify::eval_gpu(
   std::string ts = kq_type_string(q.dtype());
   bool has_sinks = false;
   bool has_lse = write_lse;
+  bool has_cascade = false;
   mx::metal::MTLFCList fc = {
       {&splits, MTL::DataType::DataTypeInt, 2},
       {&has_sinks, MTL::DataType::DataTypeBool, 3},
       {&has_lse, MTL::DataType::DataTypeBool, 6},
+      {&has_cascade, MTL::DataType::DataTypeBool, 7},
   };
 
   // Pass 1: one threadgroup per (kv-head, batch, split) streams its key
@@ -483,8 +494,216 @@ void KQuantSDPAFAVerify::eval_gpu(
     } else {
       ce.set_input_array(sums, 6);
     }
+    // Cascade compiled out: dummy second-set bindings.
+    const int czero = 0;
+    for (int i = 7; i <= 9; i++) {
+      ce.set_input_array(sums, i);
+    }
+    ce.set_bytes(czero, 10);
+    ce.set_bytes(czero, 11);
     MTL::Size group_dims(32, 1, 1);
     MTL::Size grid_dims(n_kv_heads, B, n_rows);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+  }
+}
+
+void KQuantSDPACascade::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+  const bool write_lse = return_lse_;
+  if (write_lse) {
+    outputs[1].set_data(mx::allocator::malloc(outputs[1].nbytes()));
+  }
+
+  const auto& q = inputs[0];
+  const auto& qf = inputs[1];
+  const auto& k_sh = inputs[2];
+  const auto& v_sh = inputs[3];
+  const auto& k_pr = inputs[4];
+  const auto& v_pr = inputs[5];
+  const bool starts = has_starts_;
+  kq_sdpa_check_layout("sdpa_decode_gqa_cascade", q, k_pr, v_pr);
+  kq_sdpa_check_layout("sdpa_decode_gqa_cascade", qf, k_sh, v_sh);
+
+  int B = q.shape(0);
+  int n_q_heads = q.shape(1);
+  int D = q.shape(3);
+  int n_kv_heads = k_sh.shape(1);
+  int gqa_factor = n_q_heads / n_kv_heads;
+  int n_rows = B * gqa_factor;
+  int P = k_sh.shape(2);
+  int Sp = k_pr.shape(2);
+  int qL = 1;
+  float scale = scale_;
+
+  int s_sh = splits_shared_;
+  if (s_sh == 0) {
+    s_sh = P <= 8192 ? 16 : P <= 24576 ? 32 : P <= 49152 ? 64 : 128;
+  }
+  int s_pr = splits_priv_;
+  if (s_pr == 0) {
+    s_pr = Sp <= 8192 ? 16 : Sp <= 24576 ? 32 : Sp <= 49152 ? 64 : 128;
+  }
+
+  std::string ts = kq_type_string(q.dtype());
+  auto& ce = mx::metal::get_command_encoder(s);
+
+  // Private-region partials (decode layout) + shared-region partials (fa
+  // folded layout); one merge pass folds both.
+  mx::Shape p1_shape = {B, n_q_heads, qL, s_pr, D};
+  mx::Shape r1_shape = {B, n_q_heads, qL, s_pr};
+  array partials1(p1_shape, mx::float32, nullptr, {});
+  array sums1(r1_shape, mx::float32, nullptr, {});
+  array maxs1(r1_shape, mx::float32, nullptr, {});
+  mx::Shape p2_shape = {1, n_kv_heads, n_rows, s_sh, D};
+  mx::Shape r2_shape = {1, n_kv_heads, n_rows, s_sh};
+  array partials2(p2_shape, mx::float32, nullptr, {});
+  array sums2(r2_shape, mx::float32, nullptr, {});
+  array maxs2(r2_shape, mx::float32, nullptr, {});
+  for (array* a : {&partials1, &sums1, &maxs1, &partials2, &sums2, &maxs2}) {
+    a->set_data(mx::allocator::malloc(a->nbytes()));
+    ce.add_temporary(*a);
+  }
+
+  // Pass 1a: private suffixes through the decode-gqa kernel (per-row grid,
+  // starts honored).
+  {
+    bool f = false;
+    bool has_starts = starts;
+    mx::metal::MTLFCList fc = {
+        {&s_pr, MTL::DataType::DataTypeInt, 2},
+        {&f, MTL::DataType::DataTypeBool, 3},
+        {&has_starts, MTL::DataType::DataTypeBool, 4},
+        {&f, MTL::DataType::DataTypeBool, 5},
+    };
+    std::string kname = "kq_sdpa_gqa_2pass_1_" + ts + "_" + std::to_string(D) +
+        "_c" + std::to_string(tile_c_);
+    std::string hash = kname + "_s" + std::to_string(s_pr) +
+        (has_starts ? "_st1" : "_st0") + "_casc";
+    auto kernel = kq_get_kernel(d, kname, hash, fc);
+    const size_t tg = size_t(32) * gqa_factor;
+    if (tg > kernel->maxTotalThreadsPerThreadgroup()) {
+      throw std::runtime_error(
+          "[mlx_kquant.sdpa_decode_gqa_cascade] threadgroup of " +
+          std::to_string(tg) + " threads exceeds this GPU's pipeline limit.");
+    }
+    size_t k_head_stride = static_cast<size_t>(
+        k_pr.shape(1) == 1 ? k_pr.strides(0) : k_pr.strides(1));
+    size_t k_seq_stride = static_cast<size_t>(k_pr.strides(2));
+    size_t v_head_stride = static_cast<size_t>(
+        v_pr.shape(1) == 1 ? v_pr.strides(0) : v_pr.strides(1));
+    size_t v_seq_stride = static_cast<size_t>(v_pr.strides(2));
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(q, 0);
+    ce.set_input_array(k_pr, 1);
+    ce.set_input_array(v_pr, 2);
+    ce.set_output_array(partials1, 3);
+    ce.set_output_array(sums1, 4);
+    ce.set_output_array(maxs1, 5);
+    ce.set_bytes(Sp, 6);
+    ce.set_bytes(k_head_stride, 7);
+    ce.set_bytes(k_seq_stride, 8);
+    ce.set_bytes(v_head_stride, 9);
+    ce.set_bytes(v_seq_stride, 10);
+    ce.set_bytes(scale, 11);
+    ce.set_bytes(qL, 12);
+    ce.set_input_array(starts ? inputs[6] : sums1, 13);
+    size_t zero = 0;
+    for (int i = 0; i < 4; i++) {
+      ce.set_input_array(sums1, 14 + i);
+    }
+    ce.set_bytes(zero, 18);
+    ce.set_bytes(zero, 19);
+    ce.set_bytes(zero, 20);
+    ce.set_bytes(zero, 21);
+    MTL::Size group_dims(32, gqa_factor, 1);
+    MTL::Size grid_dims(n_kv_heads, B, s_pr);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  // Pass 1b: the shared prefix through the fa row-tile kernel -- one KV walk
+  // serves all B*gqa folded rows.
+  {
+    bool f = false;
+    mx::metal::MTLFCList fc = {
+        {&s_sh, MTL::DataType::DataTypeInt, 2},
+        {&f, MTL::DataType::DataTypeBool, 3},
+    };
+    const int bq = n_rows <= 32 ? 32 : 64;
+    std::string kname = "kq_sdpa_fa_verify_2pass_1_" + ts + "_" +
+        std::to_string(D) + "_bq" + std::to_string(bq);
+    std::string hash = kname + "_s" + std::to_string(s_sh) + "_casc";
+    auto kernel = kq_get_kernel(d, kname, hash, fc);
+    const size_t tg = D == 512 ? 256 : (bq / 8) * 32;
+    if (tg > kernel->maxTotalThreadsPerThreadgroup()) {
+      throw std::runtime_error(
+          "[mlx_kquant.sdpa_decode_gqa_cascade] threadgroup of " +
+          std::to_string(tg) + " threads exceeds this GPU's pipeline limit.");
+    }
+    size_t k_head_stride = static_cast<size_t>(
+        k_sh.shape(1) == 1 ? k_sh.strides(0) : k_sh.strides(1));
+    size_t k_seq_stride = static_cast<size_t>(k_sh.strides(2));
+    size_t v_head_stride = static_cast<size_t>(
+        v_sh.shape(1) == 1 ? v_sh.strides(0) : v_sh.strides(1));
+    size_t v_seq_stride = static_cast<size_t>(v_sh.strides(2));
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(qf, 0);
+    ce.set_input_array(k_sh, 1);
+    ce.set_input_array(v_sh, 2);
+    ce.set_output_array(partials2, 3);
+    ce.set_output_array(sums2, 4);
+    ce.set_output_array(maxs2, 5);
+    ce.set_bytes(P, 6);
+    ce.set_bytes(k_head_stride, 7);
+    ce.set_bytes(k_seq_stride, 8);
+    ce.set_bytes(v_head_stride, 9);
+    ce.set_bytes(v_seq_stride, 10);
+    ce.set_bytes(scale, 11);
+    ce.set_bytes(qL, 12);
+    ce.set_bytes(n_rows, 13);
+    MTL::Size group_dims(32, tg / 32, 1);
+    MTL::Size grid_dims(n_kv_heads, 1, s_sh);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  // Pass 2: one merge over both partial sets (the LSE merge).
+  {
+    bool f = false;
+    bool t = true;
+    bool has_lse = write_lse;
+    mx::metal::MTLFCList fc = {
+        {&s_pr, MTL::DataType::DataTypeInt, 2},
+        {&f, MTL::DataType::DataTypeBool, 3},
+        {&has_lse, MTL::DataType::DataTypeBool, 6},
+        {&t, MTL::DataType::DataTypeBool, 7},
+    };
+    std::string kname = "kq_sdpa_gqa_2pass_2_" + ts + "_" + std::to_string(D);
+    std::string hash = kname + "_s" + std::to_string(s_pr) + "_k0_casc" +
+        std::to_string(s_sh) + (write_lse ? "_lse" : "");
+    auto kernel = kq_get_kernel(d, kname, hash, fc);
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(partials1, 0);
+    ce.set_input_array(sums1, 1);
+    ce.set_input_array(maxs1, 2);
+    ce.set_input_array(sums1, 3);
+    ce.set_output_array(out, 4);
+    ce.set_bytes(n_q_heads, 5);
+    if (write_lse) {
+      ce.set_output_array(outputs[1], 6);
+    } else {
+      ce.set_input_array(sums1, 6);
+    }
+    ce.set_input_array(partials2, 7);
+    ce.set_input_array(sums2, 8);
+    ce.set_input_array(maxs2, 9);
+    ce.set_bytes(s_sh, 10);
+    ce.set_bytes(gqa_factor, 11);
+    MTL::Size group_dims(32, 1, 1);
+    MTL::Size grid_dims(n_q_heads, B, qL);
     ce.dispatch_threadgroups(grid_dims, group_dims);
   }
 }
@@ -509,6 +728,13 @@ void KQuantSDPAFAVerify::eval_gpu(
     std::vector<mx::array>&) {
   throw std::runtime_error(
       "[mlx_kquant.sdpa_fa_verify] requires a Metal build.");
+}
+
+void KQuantSDPACascade::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.sdpa_decode_gqa_cascade] requires a Metal build.");
 }
 
 #endif
@@ -858,6 +1084,177 @@ void KQuantSDPAFAVerify::eval_cpu(
     std::vector<mx::array>&) {
   throw std::runtime_error(
       "[mlx_kquant.sdpa_fa_verify] has no CPU implementation.");
+}
+
+void KQuantSDPACascade::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.sdpa_decode_gqa_cascade] has no CPU implementation.");
+}
+
+std::vector<mx::Shape> KQuantSDPACascade::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  const auto& qs = inputs[0].shape();
+  if (return_lse_) {
+    return {qs, {qs[0], qs[1], qs[2]}};
+  }
+  return {qs};
+}
+
+bool KQuantSDPACascade::is_equivalent(const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQuantSDPACascade&>(other);
+  return scale_ == o.scale_ && splits_shared_ == o.splits_shared_ &&
+      splits_priv_ == o.splits_priv_ && tile_c_ == o.tile_c_ &&
+      has_starts_ == o.has_starts_ && return_lse_ == o.return_lse_;
+}
+
+std::vector<mx::array> sdpa_decode_gqa_cascade(
+    mx::array q,
+    mx::array k_shared,
+    mx::array v_shared,
+    mx::array k_priv,
+    mx::array v_priv,
+    float scale,
+    const std::optional<mx::array>& starts,
+    int splits_shared,
+    int splits_priv,
+    int tile_c,
+    bool return_lse,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const char* op = "[mlx_kquant.sdpa_decode_gqa_cascade] ";
+
+  if (q.ndim() != 4 || k_shared.ndim() != 4 || v_shared.ndim() != 4 ||
+      k_priv.ndim() != 4 || v_priv.ndim() != 4) {
+    throw std::invalid_argument(
+        std::string(op) + "q, k, v must be 4-D [B, heads, L, D].");
+  }
+  int B = q.shape(0);
+  int n_q_heads = q.shape(1);
+  int D = q.shape(3);
+  int n_kv_heads = k_shared.shape(1);
+  auto dt = q.dtype();
+  if (dt != mx::float16 && dt != mx::bfloat16) {
+    throw std::invalid_argument(
+        std::string(op) + "q must be float16 or bfloat16.");
+  }
+  for (const auto& a : {k_shared, v_shared, k_priv, v_priv}) {
+    if (a.dtype() != dt || a.shape(3) != D) {
+      throw std::invalid_argument(
+          std::string(op) + "k/v must share q's dtype and head_dim.");
+    }
+  }
+  if (D != 64 && D != 128 && D != 256 && D != 512) {
+    throw std::invalid_argument(
+        std::string(op) + "head_dim must be 64, 128, 256 or 512.");
+  }
+  if (q.shape(2) != 1) {
+    throw std::invalid_argument(std::string(op) + "q_len must be 1.");
+  }
+  if (k_shared.shape(0) != 1 || v_shared.shape(0) != 1 ||
+      v_shared.shape(1) != n_kv_heads ||
+      v_shared.shape(2) != k_shared.shape(2)) {
+    throw std::invalid_argument(
+        std::string(op) +
+        "shared k/v must be [1, n_kv_heads, P, D] with matching P.");
+  }
+  if (k_priv.shape(0) != B || v_priv.shape(0) != B ||
+      k_priv.shape(1) != n_kv_heads || v_priv.shape(1) != n_kv_heads ||
+      v_priv.shape(2) != k_priv.shape(2)) {
+    throw std::invalid_argument(
+        std::string(op) +
+        "private k/v must be [B, n_kv_heads, Sp, D] with matching Sp.");
+  }
+  if (k_priv.shape(2) < 1 || k_shared.shape(2) < 1) {
+    throw std::invalid_argument(
+        std::string(op) + "both key regions must be non-empty.");
+  }
+  if (n_q_heads % n_kv_heads != 0) {
+    throw std::invalid_argument(
+        std::string(op) + "q heads must be a multiple of kv heads.");
+  }
+  int gqa_factor = n_q_heads / n_kv_heads;
+  if (gqa_factor > 16) {
+    throw std::invalid_argument(std::string(op) + "gqa factor must be <= 16.");
+  }
+  int n_rows = B * gqa_factor;
+  int max_rows = D == 512 ? 32 : 64;
+  if (n_rows > max_rows) {
+    throw std::invalid_argument(
+        std::string(op) + "B * gqa must be <= " + std::to_string(max_rows) +
+        " at head_dim " + std::to_string(D) + ".");
+  }
+  if (tile_c == 0) {
+    tile_c = D <= 128 ? 32 : D == 256 ? 16 : 8;
+  }
+  const bool tile_ok = (D <= 128 && (tile_c == 32 || tile_c == 16)) ||
+      (D == 256 && (tile_c == 16 || tile_c == 8)) || (D == 512 && tile_c == 8);
+  if (!tile_ok) {
+    throw std::invalid_argument(
+        std::string(op) + "tile_c not instantiated for this head_dim.");
+  }
+  if (splits_shared < 0 || splits_shared > 128 || splits_priv < 0 ||
+      splits_priv > 128) {
+    throw std::invalid_argument(
+        std::string(op) + "splits must be in [0, 128].");
+  }
+
+  auto q_c = mx::contiguous(q, false, s);
+  // kv-head-major fold for the shared row-tile pass.
+  auto q_folded = mx::contiguous(
+      mx::reshape(
+          mx::transpose(
+              mx::reshape(q_c, {B, n_kv_heads, gqa_factor, D}, s),
+              {1, 0, 2, 3},
+              s),
+          {1, n_kv_heads, n_rows, D},
+          s),
+      false,
+      s);
+  auto contig_kv = [&](const mx::array& a) {
+    return a.strides().back() == 1 ? a : mx::contiguous(a, false, s);
+  };
+
+  std::vector<mx::array> inputs = {
+      std::move(q_c),
+      std::move(q_folded),
+      contig_kv(k_shared),
+      contig_kv(v_shared),
+      contig_kv(k_priv),
+      contig_kv(v_priv)};
+  if (starts.has_value()) {
+    auto st = *starts;
+    if (st.size() != static_cast<size_t>(B)) {
+      throw std::invalid_argument(
+          std::string(op) + "starts must have one element per batch row.");
+    }
+    if (st.dtype() != mx::int32) {
+      throw std::invalid_argument(std::string(op) + "starts must be int32.");
+    }
+    st = mx::reshape(st, {B}, s);
+    inputs.push_back(mx::contiguous(st, false, s));
+  }
+
+  auto prim = std::make_shared<KQuantSDPACascade>(
+      s,
+      scale,
+      splits_shared,
+      splits_priv,
+      tile_c,
+      starts.has_value(),
+      return_lse);
+  auto out_shape = q.shape();
+  if (return_lse) {
+    mx::Shape lse_shape = {B, n_q_heads, 1};
+    return mx::array::make_arrays(
+        {std::move(out_shape), std::move(lse_shape)},
+        {dt, mx::float32},
+        std::move(prim),
+        std::move(inputs));
+  }
+  return {
+      mx::array(std::move(out_shape), dt, std::move(prim), std::move(inputs))};
 }
 
 std::vector<mx::Shape> KQuantSDPAFAVerify::output_shapes(
