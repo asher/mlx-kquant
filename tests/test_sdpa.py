@@ -722,6 +722,48 @@ def test_sdpa_paged_all_pages_is_dense():
     assert rel < REL_BOUND[mx.bfloat16], f"all-pages vs dense rel {rel:.3e}"
 
 
+def test_sdpa_paged_starts():
+    # left-padded rows: pad positions inside selected pages score -inf
+    import numpy as np
+
+    np.random.seed(41)
+    B, Hq, Hkv, D, S, npages = 3, 16, 8, 128, 4096, 20
+    page, scale = 32, 1.0 / (D**0.5)
+    pads = [0, 37, 511]
+    q, k, v = _make(B, Hq, Hkv, 1, S, D, mx.float16, seed=42, strided=False)
+    pg = np.stack(
+        [
+            np.stack(
+                [
+                    np.sort(np.random.choice(S // page, size=npages, replace=False))
+                    for _ in range(Hkv)
+                ]
+            )
+            for _ in range(B)
+        ]
+    ).astype(np.int32)
+    # force the pad-boundary page resident so masking inside it is exercised
+    for b in range(B):
+        pg[b, :, 0] = pads[b] // page
+    starts = mx.array(pads, dtype=mx.int32)
+    got = kq.sdpa_decode_gqa_paged(q, k, v, scale, mx.array(pg), starts=starts)
+    kr = mx.repeat(k, Hq // Hkv, axis=1).astype(mx.float32)
+    vr = mx.repeat(v, Hq // Hkv, axis=1).astype(mx.float32)
+    sc = (q.astype(mx.float32) * scale) @ kr.swapaxes(-1, -2)
+    mask = np.zeros((B, Hkv, S), dtype=bool)
+    for b in range(B):
+        for h in range(Hkv):
+            for pp in pg[b, h]:
+                mask[b, h, pp * page : (pp + 1) * page] = True
+        mask[b, :, : pads[b]] = False
+    mask = np.repeat(mask, Hq // Hkv, axis=1)[:, :, None, :]
+    bias = mx.array(np.where(mask, 0.0, -np.inf).astype(np.float32))
+    ref = mx.softmax(sc + bias, axis=-1) @ vr
+    _eval_or_skip(got, ref)
+    err = float(mx.abs(got.astype(mx.float32) - ref).max())
+    assert err < 2e-2, f"paged+starts vs masked ref err={err}"
+
+
 def test_sdpa_paged_validation():
     B, Hq, Hkv, D, S = 2, 16, 8, 128, 1024
     scale = 1.0 / (D**0.5)
@@ -736,3 +778,11 @@ def test_sdpa_paged_validation():
     q2 = mx.concatenate([q, q], axis=2)
     with pytest.raises(ValueError):
         kq.sdpa_decode_gqa_paged(q2, k, v, scale, good)
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_paged(
+            q, k, v, scale, good, starts=mx.zeros((B + 1,), dtype=mx.int32)
+        )
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_paged(
+            q, k, v, scale, good, starts=mx.zeros((B,), dtype=mx.float32)
+        )

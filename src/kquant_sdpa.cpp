@@ -1074,6 +1074,7 @@ mx::array sdpa_decode_gqa_paged(
     float scale,
     mx::array pages,
     int splits,
+    const std::optional<mx::array>& starts,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.sdpa_decode_gqa_paged] ";
@@ -1136,13 +1137,26 @@ mx::array sdpa_decode_gqa_paged(
       splits,
       tile_c,
       /*has_sinks=*/false,
-      /*has_starts=*/false,
+      /*has_starts=*/starts.has_value(),
       /*has_kv_q8=*/false,
       /*return_lse=*/false,
       /*paged=*/true);
   auto out_shape = q.shape();
   std::vector<mx::array> inputs = {
-      std::move(q_c), std::move(k_c), std::move(v_c), std::move(p_c)};
+      std::move(q_c), std::move(k_c), std::move(v_c)};
+  if (starts.has_value()) {
+    auto st = *starts;
+    if (st.size() != static_cast<size_t>(B)) {
+      throw std::invalid_argument(
+          std::string(op) + "starts must have one element per batch row.");
+    }
+    if (st.dtype() != mx::int32) {
+      throw std::invalid_argument(std::string(op) + "starts must be int32.");
+    }
+    st = mx::reshape(st, {B}, s);
+    inputs.push_back(mx::contiguous(st, false, s));
+  }
+  inputs.push_back(std::move(p_c));
   return mx::array(
       std::move(out_shape), dt, std::move(prim), std::move(inputs));
 }

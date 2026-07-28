@@ -371,6 +371,7 @@ NB_MODULE(_ext, m) {
       "scale"_a,
       "pages"_a,
       "splits"_a = 0,
+      "starts"_a = nb::none(),
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
@@ -378,7 +379,8 @@ NB_MODULE(_ext, m) {
         pages listed per (batch, kv-head), walking the selected pages
         through the decode kernel instead of the full cache. The page
         unit is the head dim's staged tile height: 32 rows at head_dim
-        64/128, 16 at 256, 8 at 512.
+        64/128, 16 at 256, 8 at 512. Optional starts (int32 [B])
+        restricts row b to keys [starts[b], N) for left-padded batches.
 
         Args:
             q (array): queries [B, n_q_heads, 1, D], float16/bfloat16.
