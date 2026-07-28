@@ -788,9 +788,11 @@ mx::array sdpa_fa_verify(
         "[mlx_kquant.sdpa_fa_verify] q, k, v must be 4-D [B, heads, L, D].");
   }
   int D = q.shape(-1);
-  if ((D != 256 && D != 512) || k.shape(-1) != D || v.shape(-1) != D) {
+  if ((D != 64 && D != 128 && D != 256 && D != 512) || k.shape(-1) != D ||
+      v.shape(-1) != D) {
     throw std::invalid_argument(
-        "[mlx_kquant.sdpa_fa_verify] only head_dim 256 or 512 is supported.");
+        "[mlx_kquant.sdpa_fa_verify] only head_dim 64, 128, 256 or 512 is "
+        "supported.");
   }
   auto dt = q.dtype();
   if (dt != mx::float16 && dt != mx::bfloat16) {
@@ -819,8 +821,8 @@ mx::array sdpa_fa_verify(
         "[mlx_kquant.sdpa_fa_verify] q_len must be in [1, 8].");
   }
   int n_rows = q.shape(2);
-  // The 64-row tile exists only for head_dim 256; the 512 d-split kernel is
-  // fixed at the 32-row tile.
+  // The 64-row tile exists for the register-resident head dims (64-256);
+  // the 512 d-split kernel is fixed at the 32-row tile.
   int max_rows = D == 512 ? 32 : 64;
   if (n_rows < q_len || n_rows > max_rows || n_rows % q_len != 0) {
     throw std::invalid_argument(

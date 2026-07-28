@@ -390,7 +390,7 @@ def _check_fa(D, qL, kL, dtype, Hkv=4, G=6, strided=False, splits=0):
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("D", [256, 512])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 @pytest.mark.parametrize("qL", [2, 3, 4, 5, 6])
 def test_sdpa_fa_verify(D, qL, dtype):
     _check_fa(D, qL, kL=4096, dtype=dtype, G=4)
@@ -402,7 +402,7 @@ def test_sdpa_fa_verify_qwen_geometry():
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("D", [256, 512])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_sdpa_fa_verify_decode(D, dtype):
     # q_len == 1: plain GQA decode on the matrix units (every folded row
     # attends the full KV). 122b shape: G16 x qL1 at hd256, 2 kv heads;
@@ -415,39 +415,39 @@ def test_sdpa_fa_verify_gemma_geometry():
     _check_fa(512, 4, kL=8192, dtype=mx.bfloat16, Hkv=4, G=8)
 
 
-@pytest.mark.parametrize("D", [256, 512])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_sdpa_fa_verify_full_tile(D):
     # n_rows == 32 fills the tile exactly (no padding rows), qL at the cap
     _check_fa(D, 8, kL=4096, dtype=mx.bfloat16, Hkv=2, G=4)
 
 
-@pytest.mark.parametrize("D", [256, 512])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_sdpa_fa_verify_partial_warp(D):
     # n_rows == 18: the third row strip covers rows 16..17 plus padding
     _check_fa(D, 6, kL=2048, dtype=mx.bfloat16, G=3)
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("D", [256, 512])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_sdpa_fa_verify_strided_unaligned(D, dtype):
     # strided KV-cache prefix + a key length off every tile/split boundary
     _check_fa(D, 4, kL=3071, dtype=dtype, strided=True, splits=16)
 
 
-@pytest.mark.parametrize("D", [256, 512])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_sdpa_fa_verify_short_kv(D):
     # kL small enough that most splits stage zero keys: their empty partials
     # (max = finite_min, sum = 0) must merge as weight zero
     _check_fa(D, 4, kL=17, dtype=mx.bfloat16, splits=16, G=6)
 
 
-@pytest.mark.parametrize("D", [256, 512])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_sdpa_fa_verify_min_kv(D):
     # kL == qL floor: row 0 attends exactly one key, every row masked hard
     _check_fa(D, 4, kL=4, dtype=mx.bfloat16, G=6)
 
 
-@pytest.mark.parametrize("D", [256, 512])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_sdpa_fa_verify_causal_split_straddle(D):
     # the last qL keys straddle a split boundary (splits=128, kL=4098 puts
     # keys 4096..4097 alone in the final split): that split is entirely past
@@ -471,6 +471,15 @@ def test_sdpa_fa_verify_bq64_padded(G, qL):
 
 def test_sdpa_fa_verify_bq64_strided_kv():
     _check_fa(256, 4, kL=3071, dtype=mx.bfloat16, Hkv=2, G=16, strided=True, splits=16)
+
+
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("G", [32, 64])
+def test_sdpa_fa_verify_cascade_fold(D, G):
+    # shared-prefix cascade: B batch rows folded kv-head-major into the row
+    # axis at q_len 1 (every row attends the full prefix); G=64 fills the
+    # BQ=64 tile at the register-resident head dims
+    _check_fa(D, 1, kL=6144, dtype=mx.bfloat16, Hkv=2, G=G)
 
 
 def test_sdpa_fa_verify_lazy_strided_q():
