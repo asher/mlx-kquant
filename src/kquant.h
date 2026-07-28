@@ -229,7 +229,14 @@ mx::array sdpa_fa_verify(
 // (verify width: per-row end-aligned causal on the private suffix, full
 // visibility of the shared prefix); B*gqa*qL <= 64 (32 at head_dim 512);
 // gqa <= 16; gqa*ceil(qL/2) <= 32 at qL > 1; Sp >= qL. Returns {out} or
-// {out, lse} (lse [B, Hq, qL]) with return_lse. Metal-only.
+// {out, lse} (lse [B, Hq, qL]) with return_lse.
+//
+// Quantized KV (mlx affine wire, bits 8 / group 64): pass all eight of
+// k/v x scales/biases x shared/priv and both slabs bind as packed uint32
+// words ([.., S, D/4]) with per-group scale/bias arrays ([.., S, D/64],
+// q's dtype); dequant happens at tile stage, downstream math unchanged.
+// All-eight-or-none; head_dim 512 not supported with quantized KV.
+// Metal-only.
 std::vector<mx::array> sdpa_decode_gqa_cascade(
     mx::array q,
     mx::array k_shared,
@@ -242,6 +249,14 @@ std::vector<mx::array> sdpa_decode_gqa_cascade(
     int splits_priv = 0,
     int tile_c = 0,
     bool return_lse = false,
+    const std::optional<mx::array>& k_shared_scales = std::nullopt,
+    const std::optional<mx::array>& k_shared_biases = std::nullopt,
+    const std::optional<mx::array>& v_shared_scales = std::nullopt,
+    const std::optional<mx::array>& v_shared_biases = std::nullopt,
+    const std::optional<mx::array>& k_priv_scales = std::nullopt,
+    const std::optional<mx::array>& k_priv_biases = std::nullopt,
+    const std::optional<mx::array>& v_priv_scales = std::nullopt,
+    const std::optional<mx::array>& v_priv_biases = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // Sparse page-gather decode: attend only the C-row pages listed per
@@ -865,14 +880,16 @@ class KQuantSDPACascade : public mx::Primitive {
       int splits_priv,
       int tile_c,
       bool has_starts,
-      bool return_lse)
+      bool return_lse,
+      bool has_kv_q8 = false)
       : mx::Primitive(stream),
         scale_(scale),
         splits_shared_(splits_shared),
         splits_priv_(splits_priv),
         tile_c_(tile_c),
         has_starts_(has_starts),
-        return_lse_(return_lse) {}
+        return_lse_(return_lse),
+        has_kv_q8_(has_kv_q8) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -896,6 +913,7 @@ class KQuantSDPACascade : public mx::Primitive {
   int tile_c_;
   bool has_starts_;
   bool return_lse_;
+  bool has_kv_q8_;
 };
 
 // Fused MoE GLU gather (see moe_glu_gather). Inference-only.

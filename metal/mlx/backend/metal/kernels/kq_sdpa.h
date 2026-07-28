@@ -566,6 +566,54 @@ METAL_FUNC void kq_fa_stage_rows(
   }
 }
 
+// q8 variant: rows arrive as packed uint32 affine wire (bits 8, group 64)
+// with per-group scale/bias; dequant lands in the staged tile so the MMA
+// consumers are unchanged. Works in uint4 units (16 codes) -- one
+// vectorized wire load and one scale/bias pair per unit, never straddling
+// a 64-element group (same staging shape as the decode kernel's q8 path).
+template <typename T, int BK, int D, int LDS, int NT>
+METAL_FUNC void kq_fa_stage_rows_q8(
+    threadgroup T* dst,
+    const device uint32_t* src,
+    const device T* scales,
+    const device T* biases,
+    size_t seq_stride_w,
+    size_t sb_seq_stride,
+    int rows_valid,
+    int flat_tid) {
+  using T4 = metal::vec<T, 4>;
+  constexpr int DU = D / 16; // uint4 units per row
+  constexpr int LDS4 = LDS / 4;
+  threadgroup T4* dst4 = (threadgroup T4*)dst;
+  for (int u = flat_tid; u < BK * DU; u += NT) {
+    const int r = u / DU;
+    const int c16 = u - r * DU;
+    const int i = r * LDS4 + c16 * 4;
+    if (r < rows_valid) {
+      const uint4 w =
+          ((const device uint4*)(src + (size_t)r * seq_stride_w))[c16];
+      const size_t g = (c16 * 16) / 64;
+      const float sc = float(scales[(size_t)r * sb_seq_stride + g]);
+      const float bi = float(biases[(size_t)r * sb_seq_stride + g]);
+#pragma unroll
+      for (short j = 0; j < 4; j++) {
+        const uint32_t x = j == 0 ? w.x : j == 1 ? w.y : j == 2 ? w.z : w.w;
+        const float4 q4 = float4(
+            float(x & 0xff),
+            float((x >> 8) & 0xff),
+            float((x >> 16) & 0xff),
+            float(x >> 24));
+        dst4[i + j] = T4(q4 * sc + bi);
+      }
+    } else {
+#pragma unroll
+      for (short j = 0; j < 4; j++) {
+        dst4[i + j] = T4(T(0));
+      }
+    }
+  }
+}
+
 // Simdgroup-matrix (steel MMA) speculative-verify attention, pass 1. The
 // caller folds the GQA group into the query rows -- q [B, Hq, qL, D] becomes
 // [B, Hkv, G*qL, D] with kv-major heads -- so the kernel sees an MHA problem
@@ -605,6 +653,14 @@ template <typename T, int D, int BQ = 32>
     const constant float& scale [[buffer(11)]],
     const constant int& q_len [[buffer(12)]],
     const constant int& n_rows [[buffer(13)]],
+    const device T* k_scales [[buffer(14)]],
+    const device T* k_biases [[buffer(15)]],
+    const device T* v_scales [[buffer(16)]],
+    const device T* v_biases [[buffer(17)]],
+    const constant size_t& ks_head_stride [[buffer(18)]],
+    const constant size_t& ks_seq_stride [[buffer(19)]],
+    const constant size_t& vs_head_stride [[buffer(20)]],
+    const constant size_t& vs_seq_stride [[buffer(21)]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -634,12 +690,25 @@ template <typename T, int D, int BQ = 32>
   const int k0 = split_idx * chunk;
   const int k1 = min(k0 + chunk, N);
 
-  const device T* kbase = keys +
-      (size_t)(batch_idx * num_kv_heads + kv_head_idx) * k_head_stride +
-      (size_t)k0 * k_seq_stride;
-  const device T* vbase = values +
-      (size_t)(batch_idx * num_kv_heads + kv_head_idx) * v_head_stride +
-      (size_t)k0 * v_seq_stride;
+  // With gqa_kv_q8 the k/v buffers hold packed uint32 wire and the strides
+  // arrive in WORDS (D/4 per row); otherwise they hold T elements.
+  const size_t kv_hb = (size_t)(batch_idx * num_kv_heads + kv_head_idx);
+  const device T* kbase =
+      keys + kv_hb * k_head_stride + (size_t)k0 * k_seq_stride;
+  const device T* vbase =
+      values + kv_hb * v_head_stride + (size_t)k0 * v_seq_stride;
+  const device uint32_t* kwbase = (const device uint32_t*)keys +
+      kv_hb * k_head_stride + (size_t)k0 * k_seq_stride;
+  const device uint32_t* vwbase = (const device uint32_t*)values +
+      kv_hb * v_head_stride + (size_t)k0 * v_seq_stride;
+  const device T* ksb =
+      k_scales + kv_hb * ks_head_stride + (size_t)k0 * ks_seq_stride;
+  const device T* kbb =
+      k_biases + kv_hb * ks_head_stride + (size_t)k0 * ks_seq_stride;
+  const device T* vsb =
+      v_scales + kv_hb * vs_head_stride + (size_t)k0 * vs_seq_stride;
+  const device T* vbb =
+      v_biases + kv_hb * vs_head_stride + (size_t)k0 * vs_seq_stride;
 
   // Fragment coordinates: this thread owns row (row0 + sm) and the column
   // pair at sn of every 8x8 fragment.
@@ -676,12 +745,24 @@ template <typename T, int D, int BQ = 32>
   for (int kt = k0; kt < k1; kt += BK) {
     const int krem = min(k1 - kt, BK);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    kq_fa_stage_rows<T, BK, D, LDS, kNWarps * 32>(
-        KV_smem,
-        kbase + (size_t)(kt - k0) * k_seq_stride,
-        k_seq_stride,
-        krem,
-        flat_tid);
+    if (gqa_kv_q8) {
+      kq_fa_stage_rows_q8<T, BK, D, LDS, kNWarps * 32>(
+          KV_smem,
+          kwbase + (size_t)(kt - k0) * k_seq_stride,
+          ksb + (size_t)(kt - k0) * ks_seq_stride,
+          kbb + (size_t)(kt - k0) * ks_seq_stride,
+          k_seq_stride,
+          ks_seq_stride,
+          krem,
+          flat_tid);
+    } else {
+      kq_fa_stage_rows<T, BK, D, LDS, kNWarps * 32>(
+          KV_smem,
+          kbase + (size_t)(kt - k0) * k_seq_stride,
+          k_seq_stride,
+          krem,
+          flat_tid);
+    }
     Stile.clear();
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -723,12 +804,24 @@ template <typename T, int D, int BQ = 32>
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    kq_fa_stage_rows<T, BK, D, LDS, kNWarps * 32>(
-        KV_smem,
-        vbase + (size_t)(kt - k0) * v_seq_stride,
-        v_seq_stride,
-        krem,
-        flat_tid);
+    if (gqa_kv_q8) {
+      kq_fa_stage_rows_q8<T, BK, D, LDS, kNWarps * 32>(
+          KV_smem,
+          vwbase + (size_t)(kt - k0) * v_seq_stride,
+          vsb + (size_t)(kt - k0) * vs_seq_stride,
+          vbb + (size_t)(kt - k0) * vs_seq_stride,
+          v_seq_stride,
+          vs_seq_stride,
+          krem,
+          flat_tid);
+    } else {
+      kq_fa_stage_rows<T, BK, D, LDS, kNWarps * 32>(
+          KV_smem,
+          vbase + (size_t)(kt - k0) * v_seq_stride,
+          v_seq_stride,
+          krem,
+          flat_tid);
+    }
 
     // Online softmax on this thread's row (registers only, overlapping the
     // V load). A row with no valid key yet keeps max at finite_min and

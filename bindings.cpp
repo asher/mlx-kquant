@@ -410,6 +410,14 @@ NB_MODULE(_ext, m) {
          int splits_priv,
          int tile_c,
          bool return_lse,
+         const std::optional<mx::array>& k_shared_scales,
+         const std::optional<mx::array>& k_shared_biases,
+         const std::optional<mx::array>& v_shared_scales,
+         const std::optional<mx::array>& v_shared_biases,
+         const std::optional<mx::array>& k_priv_scales,
+         const std::optional<mx::array>& k_priv_biases,
+         const std::optional<mx::array>& v_priv_scales,
+         const std::optional<mx::array>& v_priv_biases,
          mx::StreamOrDevice s) -> nb::object {
         auto outs = mlx_kquant::sdpa_decode_gqa_cascade(
             std::move(q),
@@ -423,6 +431,14 @@ NB_MODULE(_ext, m) {
             splits_priv,
             tile_c,
             return_lse,
+            k_shared_scales,
+            k_shared_biases,
+            v_shared_scales,
+            v_shared_biases,
+            k_priv_scales,
+            k_priv_biases,
+            v_priv_scales,
+            v_priv_biases,
             s);
         if (return_lse) {
           return nb::make_tuple(outs[0], outs[1]);
@@ -441,6 +457,14 @@ NB_MODULE(_ext, m) {
       "tile_c"_a = 0,
       nb::kw_only(),
       "return_lse"_a = false,
+      "k_shared_scales"_a = nb::none(),
+      "k_shared_biases"_a = nb::none(),
+      "v_shared_scales"_a = nb::none(),
+      "v_shared_biases"_a = nb::none(),
+      "k_priv_scales"_a = nb::none(),
+      "k_priv_biases"_a = nb::none(),
+      "v_priv_scales"_a = nb::none(),
+      "v_priv_biases"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Fused shared-prefix (cascade) decode attention: every batch row
@@ -469,6 +493,11 @@ NB_MODULE(_ext, m) {
             splits_priv (int): private-region split count; 0 = default.
             tile_c (int): private-pass staged tile height; 0 picks by
                 head_dim.
+            k_shared_scales ... v_priv_biases (array, optional): quantized
+                KV (mlx affine wire, bits 8 / group 64). Pass all eight and
+                both k/v slabs bind as packed uint32 words ([.., S, D/4])
+                with scales/biases [.., S, D/64] in q's dtype; dequant
+                happens at tile stage. Not supported at D=512.
 
         Returns:
             array: attention output [B, n_q_heads, 1, D]. With

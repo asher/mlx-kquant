@@ -741,6 +741,115 @@ def test_sdpa_cascade_fused_verify_width(B, Hq, Hkv, D, qL, pads):
     assert rel < REL_BOUND[mx.float16], f"cascade verify rel {rel:.3e}"
 
 
+def _q8(a):
+    # mlx affine wire the batch quantized caches produce (group 64, bits 8)
+    return mx.quantize(a, group_size=64, bits=8)
+
+
+@pytest.mark.parametrize(
+    "B,Hq,Hkv,D,qL",
+    [
+        (4, 32, 8, 128, 1),  # plain batch decode
+        (4, 16, 8, 256, 1),  # hd256 decode
+        (2, 12, 2, 256, 5),  # qwen verify geometry (60 rows)
+        (2, 8, 2, 128, 8),  # 64 folded rows exactly
+    ],
+)
+def test_sdpa_cascade_fused_kv_q8(B, Hq, Hkv, D, qL):
+    # q8 operands == the fp16 cascade run on the dequantized arrays,
+    # bit-exact: both stage the same T values, the math after the stage
+    # is identical
+    P, Sp = 2047, 193 + qL
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, mx.float16, seed=51, strided=False)
+    q, k_pr, v_pr = _make(B, Hq, Hkv, qL, Sp, D, mx.float16, seed=52, strided=False)
+    starts = mx.array([(7 * b) % 64 for b in range(B)], dtype=mx.int32)
+
+    ksh_w, ksh_s, ksh_b = _q8(k_sh)
+    vsh_w, vsh_s, vsh_b = _q8(v_sh)
+    kpr_w, kpr_s, kpr_b = _q8(k_pr)
+    vpr_w, vpr_s, vpr_b = _q8(v_pr)
+
+    got = kq.sdpa_decode_gqa_cascade(
+        q,
+        ksh_w,
+        vsh_w,
+        kpr_w,
+        vpr_w,
+        scale,
+        starts=starts,
+        k_shared_scales=ksh_s,
+        k_shared_biases=ksh_b,
+        v_shared_scales=vsh_s,
+        v_shared_biases=vsh_b,
+        k_priv_scales=kpr_s,
+        k_priv_biases=kpr_b,
+        v_priv_scales=vpr_s,
+        v_priv_biases=vpr_b,
+    )
+
+    def dq(w, s, b):
+        return mx.dequantize(w, s, b, group_size=64, bits=8)
+
+    ref = kq.sdpa_decode_gqa_cascade(
+        q,
+        dq(ksh_w, ksh_s, ksh_b).astype(mx.float16),
+        dq(vsh_w, vsh_s, vsh_b).astype(mx.float16),
+        dq(kpr_w, kpr_s, kpr_b).astype(mx.float16),
+        dq(vpr_w, vpr_s, vpr_b).astype(mx.float16),
+        scale,
+        starts=starts,
+    )
+    _eval_or_skip(got, ref)
+    diff = float(mx.abs(got - ref).max())
+    print(f"  [cascade] kv_q8 D={D} qL={qL}: max|d|={diff:.3e}")
+    assert diff == 0.0, f"cascade kv_q8 not bit-exact: {diff:.3e}"
+
+
+def test_sdpa_cascade_fused_kv_q8_validation():
+    B, Hq, Hkv, D = 2, 16, 8, 128
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, 512, D, mx.float16, seed=53, strided=False)
+    q, k_pr, v_pr = _make(B, Hq, Hkv, 1, 64, D, mx.float16, seed=54, strided=False)
+    ksh_w, ksh_s, ksh_b = _q8(k_sh)
+    with pytest.raises(ValueError):
+        # partial q8 set (scales without biases)
+        kq.sdpa_decode_gqa_cascade(
+            q, ksh_w, v_sh, k_pr, v_pr, scale, k_shared_scales=ksh_s
+        )
+    # D=512 rejects q8
+    _, k5, v5 = _make(1, 8, 4, 1, 512, 512, mx.float16, seed=55, strided=False)
+    q5, kp5, vp5 = _make(2, 8, 4, 1, 64, 512, mx.float16, seed=56, strided=False)
+    args = {}
+    for name, arr in (
+        ("k_shared", k5),
+        ("v_shared", v5),
+        ("k_priv", kp5),
+        ("v_priv", vp5),
+    ):
+        w, s, b = _q8(arr)
+        args[name] = w
+        args[name + "_scales"] = s
+        args[name + "_biases"] = b
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_cascade(
+            q5,
+            args["k_shared"],
+            args["v_shared"],
+            args["k_priv"],
+            args["v_priv"],
+            1.0 / (512**0.5),
+            k_shared_scales=args["k_shared_scales"],
+            k_shared_biases=args["k_shared_biases"],
+            v_shared_scales=args["v_shared_scales"],
+            v_shared_biases=args["v_shared_biases"],
+            k_priv_scales=args["k_priv_scales"],
+            k_priv_biases=args["k_priv_biases"],
+            v_priv_scales=args["v_priv_scales"],
+            v_priv_biases=args["v_priv_biases"],
+        )
+
+
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("D", [64, 128, 256])
 def test_sdpa_paged_matches_selected_reference(D, dtype):
