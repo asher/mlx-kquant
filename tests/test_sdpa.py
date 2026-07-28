@@ -663,3 +663,76 @@ def test_sdpa_cascade_fused_validation():
         kq.sdpa_decode_gqa_cascade(
             q, k_sh, v_sh, k_pr[:, :, :0, :], v_pr[:, :, :0, :], scale
         )  # empty private region
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_sdpa_paged_matches_selected_reference(D, dtype):
+    # page-gather decode == f32 attention over exactly the selected pages
+    import numpy as np
+
+    np.random.seed(31)
+    B, Hq, Hkv, S, npages = 2, 16, 8, 4093, 24
+    page = 32 if D <= 128 else 16
+    tot = (S + page - 1) // page
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(B, Hq, Hkv, 1, S, D, dtype, seed=32, strided=False)
+    pg = np.stack(
+        [
+            np.stack(
+                [
+                    np.sort(np.random.choice(tot, size=npages, replace=False))
+                    for _ in range(Hkv)
+                ]
+            )
+            for _ in range(B)
+        ]
+    ).astype(np.int32)
+    pages = mx.array(pg)
+    got = kq.sdpa_decode_gqa_paged(q, k, v, scale, pages)
+    kr = mx.repeat(k, Hq // Hkv, axis=1).astype(mx.float32)
+    vr = mx.repeat(v, Hq // Hkv, axis=1).astype(mx.float32)
+    sc = (q.astype(mx.float32) * scale) @ kr.swapaxes(-1, -2)
+    mask = np.zeros((B, Hkv, S), dtype=bool)
+    for b in range(B):
+        for h in range(Hkv):
+            for pp in pg[b, h]:
+                mask[b, h, pp * page : min((pp + 1) * page, S)] = True
+    mask = np.repeat(mask, Hq // Hkv, axis=1)[:, :, None, :]
+    bias = mx.array(np.where(mask, 0.0, -np.inf).astype(np.float32))
+    ref = mx.softmax(sc + bias, axis=-1) @ vr
+    _eval_or_skip(got, ref)
+    err = float(mx.abs(got.astype(mx.float32) - ref).max())
+    assert err < 2e-2, f"paged vs selected ref err={err}"
+
+
+def test_sdpa_paged_all_pages_is_dense():
+    # selecting every page must reproduce the dense decode call
+    import numpy as np
+
+    B, Hq, Hkv, D, S = 2, 32, 8, 128, 2048
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(B, Hq, Hkv, 1, S, D, mx.bfloat16, seed=33, strided=False)
+    tot = S // 32
+    pg = np.broadcast_to(np.arange(tot, dtype=np.int32), (B, Hkv, tot)).copy()
+    got = kq.sdpa_decode_gqa_paged(q, k, v, scale, mx.array(pg))
+    ref = kq.sdpa_decode_gqa(q, k, v, scale)
+    _eval_or_skip(got, ref)
+    rel = _rel(got, ref)
+    assert rel < REL_BOUND[mx.bfloat16], f"all-pages vs dense rel {rel:.3e}"
+
+
+def test_sdpa_paged_validation():
+    B, Hq, Hkv, D, S = 2, 16, 8, 128, 1024
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(B, Hq, Hkv, 1, S, D, mx.bfloat16, seed=34, strided=False)
+    good = mx.zeros((B, Hkv, 4), dtype=mx.int32)
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_paged(q, k, v, scale, good.astype(mx.float32))
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_paged(
+            q, k, v, scale, mx.zeros((B, Hkv + 1, 4), dtype=mx.int32)
+        )
+    q2 = mx.concatenate([q, q], axis=2)
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_paged(q2, k, v, scale, good)

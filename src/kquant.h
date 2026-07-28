@@ -242,6 +242,19 @@ std::vector<mx::array> sdpa_decode_gqa_cascade(
     bool return_lse = false,
     mx::StreamOrDevice s = {});
 
+// Sparse page-gather decode: attend only the C-row pages listed per
+// (batch, kv-head). pages is int32 [B, n_kv_heads, n_pages] with page
+// indices into the key axis (page size = the head dim's staged tile:
+// 32 at D<=128, 16 at D=256, 8 at D=512). qL == 1 only; fp16/bf16 KV.
+mx::array sdpa_decode_gqa_paged(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    mx::array pages,
+    int splits = 0,
+    mx::StreamOrDevice s = {});
+
 // sdpa_fa_verify returning {out, lse}: lse [B, Hkv, n_rows] float32 is the
 // natural-log softmax normalizer per folded row (cascade merge weight).
 std::vector<mx::array> sdpa_fa_verify_lse(
@@ -760,7 +773,8 @@ class KQuantSDPAGQA : public mx::Primitive {
       bool has_sinks,
       bool has_starts,
       bool has_kv_q8 = false,
-      bool return_lse = false)
+      bool return_lse = false,
+      bool paged = false)
       : mx::Primitive(stream),
         scale_(scale),
         splits_(splits),
@@ -768,7 +782,8 @@ class KQuantSDPAGQA : public mx::Primitive {
         has_sinks_(has_sinks),
         has_starts_(has_starts),
         has_kv_q8_(has_kv_q8),
-        return_lse_(return_lse) {}
+        return_lse_(return_lse),
+        paged_(paged) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -791,6 +806,7 @@ class KQuantSDPAGQA : public mx::Primitive {
   int tile_c_;
   bool has_sinks_;
   bool has_starts_;
+  bool paged_ = false;
   bool has_kv_q8_;
   bool return_lse_;
 };

@@ -363,6 +363,39 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_decode_gqa_paged",
+      &mlx_kquant::sdpa_decode_gqa_paged,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "scale"_a,
+      "pages"_a,
+      "splits"_a = 0,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Sparse page-gather decode attention: attend ONLY the key/value
+        pages listed per (batch, kv-head), walking the selected pages
+        through the decode kernel instead of the full cache. The page
+        unit is the head dim's staged tile height: 32 rows at head_dim
+        64/128, 16 at 256, 8 at 512.
+
+        Args:
+            q (array): queries [B, n_q_heads, 1, D], float16/bfloat16.
+            k (array): keys [B, n_kv_heads, S, D] (full cache view).
+            v (array): values [B, n_kv_heads, S, D].
+            scale (float): query scale (typically 1/sqrt(D)).
+            pages (array): int32 [B, n_kv_heads, n_pages] page indices in
+                [0, ceil(S / page_size)); no duplicates. The final partial
+                page is tail-clamped to S automatically.
+            splits (int): key-axis split count; 0 buckets by the SELECTED
+                key count.
+
+        Returns:
+            array: attention output [B, n_q_heads, 1, D].
+      )");
+
+  m.def(
       "sdpa_decode_gqa_cascade",
       [](mx::array q,
          mx::array k_shared,

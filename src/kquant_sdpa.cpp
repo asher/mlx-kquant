@@ -213,6 +213,7 @@ void KQuantSDPAGQA::eval_gpu(
   const bool sinks = has_sinks_;
   const bool starts = has_starts_;
   const bool kv_q8 = has_kv_q8_;
+  const bool paged = paged_;
   const size_t starts_idx = 3 + (sinks ? 1 : 0);
   const size_t qkv_idx = starts_idx + (starts ? 1 : 0);
   kq_sdpa_check_layout("sdpa_decode_gqa", q, k, v);
@@ -226,10 +227,17 @@ void KQuantSDPAGQA::eval_gpu(
   int gqa_factor = n_q_heads / n_kv_heads;
   // Auto splits: coarse buckets (a per-kL value would mint a new pipeline
   // specialization every decode step). Measured on M5 Max: more splits win as
-  // depth grows; ~512-1024 keys per chunk is the sweet spot.
+  // depth grows; ~512-1024 keys per chunk is the sweet spot. The paged walk
+  // rides the pages operand at the end of the input list and buckets on the
+  // SELECTED key count, not the cache depth.
+  int n_pages = 0;
+  if (paged) {
+    n_pages = static_cast<int>(inputs.back().shape(2));
+  }
   int splits = splits_;
   if (splits == 0) {
-    splits = kL <= 8192 ? 16 : kL <= 24576 ? 32 : kL <= 49152 ? 64 : 128;
+    const int span = paged ? n_pages * tile_c_ : kL;
+    splits = span <= 8192 ? 16 : span <= 24576 ? 32 : span <= 49152 ? 64 : 128;
   }
 
   size_t k_head_stride =
@@ -261,6 +269,7 @@ void KQuantSDPAGQA::eval_gpu(
   bool has_kv_q8 = kv_q8;
   bool has_lse = write_lse;
   bool has_cascade = false;
+  bool has_paged = paged;
   mx::metal::MTLFCList fc = {
       {&splits, MTL::DataType::DataTypeInt, 2},
       {&has_sinks, MTL::DataType::DataTypeBool, 3},
@@ -268,6 +277,7 @@ void KQuantSDPAGQA::eval_gpu(
       {&has_kv_q8, MTL::DataType::DataTypeBool, 5},
       {&has_lse, MTL::DataType::DataTypeBool, 6},
       {&has_cascade, MTL::DataType::DataTypeBool, 7},
+      {&has_paged, MTL::DataType::DataTypeBool, 8},
   };
 
   // Pass 1: one threadgroup per (kv-head, batch, split); the whole GQA group
@@ -278,7 +288,8 @@ void KQuantSDPAGQA::eval_gpu(
     std::string kname = "kq_sdpa_gqa_2pass_1_" + ts + "_" + std::to_string(D) +
         "_c" + std::to_string(tile_c_) + (qL > 1 ? "_p2" : "");
     std::string hash = kname + "_s" + std::to_string(splits) +
-        (has_starts ? "_st1" : "_st0") + (has_kv_q8 ? "_q8" : "");
+        (has_starts ? "_st1" : "_st0") + (has_kv_q8 ? "_q8" : "") +
+        (paged ? "_pg" : "");
     auto kernel = kq_get_kernel(d, kname, hash, fc);
     // Register-heavy pipeline: some GPUs cap it below the dispatch width, and
     // Metal turns an oversized dispatch into silent garbage, not an error.
@@ -328,6 +339,9 @@ void KQuantSDPAGQA::eval_gpu(
     ce.set_bytes(ks_seq_stride, 19);
     ce.set_bytes(vs_head_stride, 20);
     ce.set_bytes(vs_seq_stride, 21);
+    // Page list (dummy when the paged walk is compiled out).
+    ce.set_input_array(paged ? inputs.back() : sums, 22);
+    ce.set_bytes(n_pages, 23);
     MTL::Size group_dims(32, gqa_factor, qL > 1 ? (qL + 1) / 2 : 1);
     MTL::Size grid_dims(n_kv_heads, B, splits);
     ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -579,6 +593,7 @@ void KQuantSDPACascade::eval_gpu(
         {&f, MTL::DataType::DataTypeBool, 3},
         {&has_starts, MTL::DataType::DataTypeBool, 4},
         {&f, MTL::DataType::DataTypeBool, 5},
+        {&f, MTL::DataType::DataTypeBool, 8},
     };
     std::string kname = "kq_sdpa_gqa_2pass_1_" + ts + "_" + std::to_string(D) +
         "_c" + std::to_string(tile_c_);
@@ -620,6 +635,9 @@ void KQuantSDPACascade::eval_gpu(
     ce.set_bytes(zero, 19);
     ce.set_bytes(zero, 20);
     ce.set_bytes(zero, 21);
+    const int pzero = 0;
+    ce.set_input_array(sums1, 22);
+    ce.set_bytes(pzero, 23);
     MTL::Size group_dims(32, gqa_factor, 1);
     MTL::Size grid_dims(n_kv_heads, B, s_pr);
     ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -843,7 +861,8 @@ bool KQuantSDPAGQA::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantSDPAGQA&>(other);
   return scale_ == o.scale_ && splits_ == o.splits_ && tile_c_ == o.tile_c_ &&
       has_sinks_ == o.has_sinks_ && has_starts_ == o.has_starts_ &&
-      has_kv_q8_ == o.has_kv_q8_ && return_lse_ == o.return_lse_;
+      has_kv_q8_ == o.has_kv_q8_ && return_lse_ == o.return_lse_ &&
+      paged_ == o.paged_;
 }
 
 static std::vector<mx::array> sdpa_decode_gqa_impl(
@@ -1046,6 +1065,86 @@ mx::array sdpa_decode_gqa(
       v_scales,
       v_biases,
       s_)[0];
+}
+
+mx::array sdpa_decode_gqa_paged(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    mx::array pages,
+    int splits,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const char* op = "[mlx_kquant.sdpa_decode_gqa_paged] ";
+  if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4) {
+    throw std::invalid_argument(std::string(op) + "q/k/v must be 4-D.");
+  }
+  int B = q.shape(0);
+  int n_q_heads = q.shape(1);
+  int qL = q.shape(2);
+  int D = q.shape(3);
+  int n_kv_heads = k.shape(1);
+  if (qL != 1) {
+    throw std::invalid_argument(
+        std::string(op) + "query length must be 1 (decode).");
+  }
+  if (D != 64 && D != 128 && D != 256 && D != 512) {
+    throw std::invalid_argument(
+        std::string(op) + "only head_dim 64/128/256/512 is supported.");
+  }
+  auto dt = q.dtype();
+  if (dt != mx::float16 && dt != mx::bfloat16) {
+    throw std::invalid_argument(
+        std::string(op) + "q must be float16 or bfloat16.");
+  }
+  if (k.dtype() != dt || v.dtype() != dt) {
+    throw std::invalid_argument(
+        std::string(op) + "q, k, v must share a dtype (no quantized KV).");
+  }
+  if (n_kv_heads == 0 || n_q_heads % n_kv_heads != 0) {
+    throw std::invalid_argument(
+        std::string(op) + "n_q_heads must be a multiple of n_kv_heads.");
+  }
+  int gqa_factor = n_q_heads / n_kv_heads;
+  if (gqa_factor > 16) {
+    throw std::invalid_argument(std::string(op) + "gqa_factor must be <= 16.");
+  }
+  if (splits < 0 || splits > 128) {
+    throw std::invalid_argument(
+        std::string(op) + "splits must be in [0, 128].");
+  }
+  // Page unit is the head dim's staged tile height.
+  const int tile_c = D <= 128 ? 32 : D == 256 ? 16 : 8;
+  if (pages.dtype() != mx::int32 || pages.ndim() != 3 || pages.shape(0) != B ||
+      pages.shape(1) != n_kv_heads || pages.shape(2) < 1) {
+    throw std::invalid_argument(
+        std::string(op) +
+        "pages must be int32 [B, n_kv_heads, n_pages] with n_pages >= 1 "
+        "(page indices into the key axis; page size = " +
+        std::to_string(tile_c) + " rows at this head_dim).");
+  }
+
+  auto q_c = mx::contiguous(q, false, s);
+  auto k_c = k.strides().back() == 1 ? k : mx::contiguous(k, false, s);
+  auto v_c = v.strides().back() == 1 ? v : mx::contiguous(v, false, s);
+  auto p_c = mx::contiguous(pages, false, s);
+
+  auto prim = std::make_shared<KQuantSDPAGQA>(
+      s,
+      scale,
+      splits,
+      tile_c,
+      /*has_sinks=*/false,
+      /*has_starts=*/false,
+      /*has_kv_q8=*/false,
+      /*return_lse=*/false,
+      /*paged=*/true);
+  auto out_shape = q.shape();
+  std::vector<mx::array> inputs = {
+      std::move(q_c), std::move(k_c), std::move(v_c), std::move(p_c)};
+  return mx::array(
+      std::move(out_shape), dt, std::move(prim), std::move(inputs));
 }
 
 std::vector<mx::array> sdpa_decode_gqa_lse(
