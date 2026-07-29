@@ -25,6 +25,14 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   per row. 1.6-4.2x vs per-row calls at P 14k-32k, hd128/hd256.
 - `sdpa_fa_verify` head_dim 64/128 tiles; `return_lse` on
   `sdpa_decode_gqa` and `sdpa_fa_verify`.
+- `sdpa_decode_gqa_paged`: page-gather decode over per-kv-head page lists
+  for top-k sparse attention, with `starts` for left-padded batch rows.
+- Verify width (qL 1-8) on the cascade op: end-aligned causal over each
+  row's private slab with full shared-prefix visibility; `lse` gains the
+  qL axis.
+- q8 KV operands (bits 8, group 64) on the cascade op, dequantized on the
+  staged tiles in both passes; bit-exact vs the fp16 cascade on
+  dequantized arrays (head_dim 512 declines).
 
 ## [0.3.7]
 
