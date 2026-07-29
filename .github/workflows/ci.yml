@@ -59,13 +59,6 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # The extension is a Metal C++ module - it compiles on macOS arm64 with
-      # the Xcode toolchain (no GPU needed to *build*). Pinned mlx wheel: the
-      # kernels include MLX's steel headers and link libmlx, so the ABI must
-      # match exactly.
-      # mlx-lm is the [tools] dep the model-level tests (loader round-trip) need;
-      # without a GPU those tests skip, but installing it lets them run on a
-      # GPU-bearing runner.
       - name: Build extension + test deps
         run: |
           python -m pip install --upgrade pip
