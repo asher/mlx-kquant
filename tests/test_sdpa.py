@@ -663,3 +663,311 @@ def test_sdpa_cascade_fused_validation():
         kq.sdpa_decode_gqa_cascade(
             q, k_sh, v_sh, k_pr[:, :, :0, :], v_pr[:, :, :0, :], scale
         )  # empty private region
+    q9 = mx.concatenate([q] * 9, axis=2)
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_cascade(q9, k_sh, v_sh, k_pr, v_pr, scale)  # qL > 8
+    # over the folded-row cap: B2 * gqa8 * qL5 = 80 > 64
+    qw, k_w, v_w = _make(B, 64, Hkv, 5, 64, D, mx.bfloat16, seed=29, strided=False)
+    _, ksw, vsw = _make(1, 64, Hkv, 1, 512, D, mx.bfloat16, seed=30, strided=False)
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_cascade(qw, ksw, vsw, k_w, v_w, scale)
+
+
+def _cascade_verify_ref(q, k, v, pads, scale, qL):
+    # f32 masked reference: per-row left pad + end-aligned causal block
+    B, Hq, _, D = q.shape
+    Hkv, L = k.shape[1], k.shape[2]
+    kr = mx.repeat(k, Hq // Hkv, axis=1).astype(mx.float32)
+    vr = mx.repeat(v, Hq // Hkv, axis=1).astype(mx.float32)
+    s = (q.astype(mx.float32) * scale) @ kr.swapaxes(-1, -2)
+    pos = mx.arange(L)[None, None, None, :]
+    end = (L - qL) + mx.arange(qL)[None, None, :, None]
+    pad = mx.array(pads)[:, None, None, None]
+    keep = (pos >= pad) & (pos <= end)
+    s = mx.where(keep, s, mx.array(-mx.inf))
+    return mx.softmax(s, axis=-1) @ vr
+
+
+@pytest.mark.parametrize(
+    "B,Hq,Hkv,D,qL,pads",
+    [
+        (2, 4, 2, 256, 8, [0, 64]),  # gemma-31b assistant geometry
+        (2, 12, 2, 256, 5, [0, 64]),  # qwen nextn geometry at cap-2
+        (2, 8, 4, 512, 3, [0, 16]),  # hd512 d-split walk
+        (4, 16, 8, 128, 8, [0, 3, 511, 64]),  # 64 folded rows exactly
+        (1, 8, 8, 64, 5, [0]),
+    ],
+)
+def test_sdpa_cascade_fused_verify_width(B, Hq, Hkv, D, qL, pads):
+    # qL > 1: end-aligned causal on the private suffix, full shared
+    # visibility, per-row starts honored
+    P, sp = 2048, 96
+    scale = 1.0 / (D**0.5)
+    mx.random.seed(41)
+    L = max(pads) + P + sp
+    kb = mx.random.normal((B, Hkv, L, D)).astype(mx.float16)
+    vb = mx.random.normal((B, Hkv, L, D)).astype(mx.float16)
+    pk = kb[0:1, :, pads[0] : pads[0] + P]
+    pv = vb[0:1, :, pads[0] : pads[0] + P]
+    rk, rv = [], []
+    for b in range(B):
+        rk.append(
+            mx.concatenate(
+                [kb[b : b + 1, :, : pads[b]], pk, kb[b : b + 1, :, pads[b] + P :]],
+                axis=2,
+            )
+        )
+        rv.append(
+            mx.concatenate(
+                [vb[b : b + 1, :, : pads[b]], pv, vb[b : b + 1, :, pads[b] + P :]],
+                axis=2,
+            )
+        )
+    k = mx.concatenate(rk, axis=0)
+    v = mx.concatenate(rv, axis=0)
+    q = mx.random.normal((B, Hq, qL, D)).astype(mx.float16)
+    c0 = min(pads) + P
+    starts = None
+    if any(pads):
+        starts = mx.array([p + P - c0 for p in pads], dtype=mx.int32)
+    got, lse = kq.sdpa_decode_gqa_cascade(
+        q, pk, pv, k[:, :, c0:], v[:, :, c0:], scale, starts=starts, return_lse=True
+    )
+    ref = _cascade_verify_ref(q, k, v, pads, scale, qL)
+    _eval_or_skip(got, ref)
+    assert lse.shape == (B, Hq, qL)
+    rel = _rel(got, ref)
+    print(f"  [cascade] verify D={D} qL={qL} B={B}: rel={rel:.3e}")
+    assert rel < REL_BOUND[mx.float16], f"cascade verify rel {rel:.3e}"
+
+
+def _q8(a):
+    # mlx affine wire the batch quantized caches produce (group 64, bits 8)
+    return mx.quantize(a, group_size=64, bits=8)
+
+
+@pytest.mark.parametrize(
+    "B,Hq,Hkv,D,qL",
+    [
+        (4, 32, 8, 128, 1),  # plain batch decode
+        (4, 16, 8, 256, 1),  # hd256 decode
+        (2, 12, 2, 256, 5),  # qwen verify geometry (60 rows)
+        (2, 8, 2, 128, 8),  # 64 folded rows exactly
+    ],
+)
+def test_sdpa_cascade_fused_kv_q8(B, Hq, Hkv, D, qL):
+    # q8 operands == the fp16 cascade run on the dequantized arrays,
+    # bit-exact: both stage the same T values, the math after the stage
+    # is identical
+    P, Sp = 2047, 193 + qL
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, mx.float16, seed=51, strided=False)
+    q, k_pr, v_pr = _make(B, Hq, Hkv, qL, Sp, D, mx.float16, seed=52, strided=False)
+    starts = mx.array([(7 * b) % 64 for b in range(B)], dtype=mx.int32)
+
+    ksh_w, ksh_s, ksh_b = _q8(k_sh)
+    vsh_w, vsh_s, vsh_b = _q8(v_sh)
+    kpr_w, kpr_s, kpr_b = _q8(k_pr)
+    vpr_w, vpr_s, vpr_b = _q8(v_pr)
+
+    got = kq.sdpa_decode_gqa_cascade(
+        q,
+        ksh_w,
+        vsh_w,
+        kpr_w,
+        vpr_w,
+        scale,
+        starts=starts,
+        k_shared_scales=ksh_s,
+        k_shared_biases=ksh_b,
+        v_shared_scales=vsh_s,
+        v_shared_biases=vsh_b,
+        k_priv_scales=kpr_s,
+        k_priv_biases=kpr_b,
+        v_priv_scales=vpr_s,
+        v_priv_biases=vpr_b,
+    )
+
+    def dq(w, s, b):
+        return mx.dequantize(w, s, b, group_size=64, bits=8)
+
+    ref = kq.sdpa_decode_gqa_cascade(
+        q,
+        dq(ksh_w, ksh_s, ksh_b).astype(mx.float16),
+        dq(vsh_w, vsh_s, vsh_b).astype(mx.float16),
+        dq(kpr_w, kpr_s, kpr_b).astype(mx.float16),
+        dq(vpr_w, vpr_s, vpr_b).astype(mx.float16),
+        scale,
+        starts=starts,
+    )
+    _eval_or_skip(got, ref)
+    diff = float(mx.abs(got - ref).max())
+    print(f"  [cascade] kv_q8 D={D} qL={qL}: max|d|={diff:.3e}")
+    assert diff == 0.0, f"cascade kv_q8 not bit-exact: {diff:.3e}"
+
+
+def test_sdpa_cascade_fused_kv_q8_validation():
+    B, Hq, Hkv, D = 2, 16, 8, 128
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, 512, D, mx.float16, seed=53, strided=False)
+    q, k_pr, v_pr = _make(B, Hq, Hkv, 1, 64, D, mx.float16, seed=54, strided=False)
+    ksh_w, ksh_s, ksh_b = _q8(k_sh)
+    with pytest.raises(ValueError):
+        # partial q8 set (scales without biases)
+        kq.sdpa_decode_gqa_cascade(
+            q, ksh_w, v_sh, k_pr, v_pr, scale, k_shared_scales=ksh_s
+        )
+    # D=512 rejects q8
+    _, k5, v5 = _make(1, 8, 4, 1, 512, 512, mx.float16, seed=55, strided=False)
+    q5, kp5, vp5 = _make(2, 8, 4, 1, 64, 512, mx.float16, seed=56, strided=False)
+    args = {}
+    for name, arr in (
+        ("k_shared", k5),
+        ("v_shared", v5),
+        ("k_priv", kp5),
+        ("v_priv", vp5),
+    ):
+        w, s, b = _q8(arr)
+        args[name] = w
+        args[name + "_scales"] = s
+        args[name + "_biases"] = b
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_cascade(
+            q5,
+            args["k_shared"],
+            args["v_shared"],
+            args["k_priv"],
+            args["v_priv"],
+            1.0 / (512**0.5),
+            k_shared_scales=args["k_shared_scales"],
+            k_shared_biases=args["k_shared_biases"],
+            v_shared_scales=args["v_shared_scales"],
+            v_shared_biases=args["v_shared_biases"],
+            k_priv_scales=args["k_priv_scales"],
+            k_priv_biases=args["k_priv_biases"],
+            v_priv_scales=args["v_priv_scales"],
+            v_priv_biases=args["v_priv_biases"],
+        )
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_sdpa_paged_matches_selected_reference(D, dtype):
+    # page-gather decode == f32 attention over exactly the selected pages
+    import numpy as np
+
+    np.random.seed(31)
+    B, Hq, Hkv, S, npages = 2, 16, 8, 4093, 24
+    page = 32 if D <= 128 else 16
+    tot = (S + page - 1) // page
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(B, Hq, Hkv, 1, S, D, dtype, seed=32, strided=False)
+    pg = np.stack(
+        [
+            np.stack(
+                [
+                    np.sort(np.random.choice(tot, size=npages, replace=False))
+                    for _ in range(Hkv)
+                ]
+            )
+            for _ in range(B)
+        ]
+    ).astype(np.int32)
+    pages = mx.array(pg)
+    got = kq.sdpa_decode_gqa_paged(q, k, v, scale, pages)
+    kr = mx.repeat(k, Hq // Hkv, axis=1).astype(mx.float32)
+    vr = mx.repeat(v, Hq // Hkv, axis=1).astype(mx.float32)
+    sc = (q.astype(mx.float32) * scale) @ kr.swapaxes(-1, -2)
+    mask = np.zeros((B, Hkv, S), dtype=bool)
+    for b in range(B):
+        for h in range(Hkv):
+            for pp in pg[b, h]:
+                mask[b, h, pp * page : min((pp + 1) * page, S)] = True
+    mask = np.repeat(mask, Hq // Hkv, axis=1)[:, :, None, :]
+    bias = mx.array(np.where(mask, 0.0, -np.inf).astype(np.float32))
+    ref = mx.softmax(sc + bias, axis=-1) @ vr
+    _eval_or_skip(got, ref)
+    err = float(mx.abs(got.astype(mx.float32) - ref).max())
+    assert err < 2e-2, f"paged vs selected ref err={err}"
+
+
+def test_sdpa_paged_all_pages_is_dense():
+    # selecting every page must reproduce the dense decode call
+    import numpy as np
+
+    B, Hq, Hkv, D, S = 2, 32, 8, 128, 2048
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(B, Hq, Hkv, 1, S, D, mx.bfloat16, seed=33, strided=False)
+    tot = S // 32
+    pg = np.broadcast_to(np.arange(tot, dtype=np.int32), (B, Hkv, tot)).copy()
+    got = kq.sdpa_decode_gqa_paged(q, k, v, scale, mx.array(pg))
+    ref = kq.sdpa_decode_gqa(q, k, v, scale)
+    _eval_or_skip(got, ref)
+    rel = _rel(got, ref)
+    assert rel < REL_BOUND[mx.bfloat16], f"all-pages vs dense rel {rel:.3e}"
+
+
+def test_sdpa_paged_starts():
+    # left-padded rows: pad positions inside selected pages score -inf
+    import numpy as np
+
+    np.random.seed(41)
+    B, Hq, Hkv, D, S, npages = 3, 16, 8, 128, 4096, 20
+    page, scale = 32, 1.0 / (D**0.5)
+    pads = [0, 37, 511]
+    q, k, v = _make(B, Hq, Hkv, 1, S, D, mx.float16, seed=42, strided=False)
+    pg = np.stack(
+        [
+            np.stack(
+                [
+                    np.sort(np.random.choice(S // page, size=npages, replace=False))
+                    for _ in range(Hkv)
+                ]
+            )
+            for _ in range(B)
+        ]
+    ).astype(np.int32)
+    # force the pad-boundary page resident so masking inside it is exercised
+    for b in range(B):
+        pg[b, :, 0] = pads[b] // page
+    starts = mx.array(pads, dtype=mx.int32)
+    got = kq.sdpa_decode_gqa_paged(q, k, v, scale, mx.array(pg), starts=starts)
+    kr = mx.repeat(k, Hq // Hkv, axis=1).astype(mx.float32)
+    vr = mx.repeat(v, Hq // Hkv, axis=1).astype(mx.float32)
+    sc = (q.astype(mx.float32) * scale) @ kr.swapaxes(-1, -2)
+    mask = np.zeros((B, Hkv, S), dtype=bool)
+    for b in range(B):
+        for h in range(Hkv):
+            for pp in pg[b, h]:
+                mask[b, h, pp * page : (pp + 1) * page] = True
+        mask[b, :, : pads[b]] = False
+    mask = np.repeat(mask, Hq // Hkv, axis=1)[:, :, None, :]
+    bias = mx.array(np.where(mask, 0.0, -np.inf).astype(np.float32))
+    ref = mx.softmax(sc + bias, axis=-1) @ vr
+    _eval_or_skip(got, ref)
+    err = float(mx.abs(got.astype(mx.float32) - ref).max())
+    assert err < 2e-2, f"paged+starts vs masked ref err={err}"
+
+
+def test_sdpa_paged_validation():
+    B, Hq, Hkv, D, S = 2, 16, 8, 128, 1024
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(B, Hq, Hkv, 1, S, D, mx.bfloat16, seed=34, strided=False)
+    good = mx.zeros((B, Hkv, 4), dtype=mx.int32)
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_paged(q, k, v, scale, good.astype(mx.float32))
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_paged(
+            q, k, v, scale, mx.zeros((B, Hkv + 1, 4), dtype=mx.int32)
+        )
+    q2 = mx.concatenate([q, q], axis=2)
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_paged(q2, k, v, scale, good)
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_paged(
+            q, k, v, scale, good, starts=mx.zeros((B + 1,), dtype=mx.int32)
+        )
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_paged(
+            q, k, v, scale, good, starts=mx.zeros((B,), dtype=mx.float32)
+        )

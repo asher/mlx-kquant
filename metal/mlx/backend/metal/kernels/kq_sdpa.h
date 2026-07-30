@@ -27,6 +27,10 @@ constant bool gqa_write_lse [[function_constant(6)]];
 // folds into the same online-softmax reduction as the primary set. Compiled
 // out when false.
 constant bool gqa_cascade [[function_constant(7)]];
+// Page-gather decode: the key walk follows a per-(batch, kv-head) list of
+// selected C-row pages (sparse top-k attention) instead of the contiguous
+// [0, N) axis. Compiled out when false.
+constant bool gqa_paged [[function_constant(8)]];
 
 template <typename T, int D, int V = D>
 [[kernel]] void kq_sdpa_vector_2pass_1(
@@ -232,6 +236,8 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
     const constant size_t& ks_seq_stride [[buffer(19)]],
     const constant size_t& vs_head_stride [[buffer(20)]],
     const constant size_t& vs_seq_stride [[buffer(21)]],
+    const device int* pages [[buffer(22)]],
+    const constant int& n_pages [[buffer(23)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -322,7 +328,22 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
   const int flat = (tidtg.z * gqa_factor + tidtg.y) * 32 + lane;
   const int n_threads = 32 * gqa_factor * tptg.z;
 
-  for (int kt = kt0; kt < k1; kt += C) {
+  // Tile walk: contiguous chunks of the key axis, or (paged) this
+  // threadgroup's slice of the selected-page list. A page tile's tail
+  // guard is N itself (pages are C-aligned windows of the full cache).
+  int t0 = kt0 / C;
+  int t1 = (k1 + C - 1) / C;
+  const device int* prow = pages;
+  if (gqa_paged) {
+    const int pchunk = (n_pages + gqa_splits - 1) / gqa_splits;
+    t0 = split_idx * pchunk;
+    t1 = min(t0 + pchunk, n_pages);
+    prow = pages + (size_t)(batch_idx * num_kv_heads + kv_head_idx) * n_pages;
+  }
+  const int kend = gqa_paged ? N : k1;
+
+  for (int t = t0; t < t1; t++) {
+    const int kt = gqa_paged ? prow[t] * C : t * C;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Cooperative tile load; zero-fill the tail so stale threadgroup data
     // can never reach the accumulators. The q8 path works in uint4 units
@@ -337,7 +358,7 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
         const int c16 = u % DU;
         const int kg = kt + row;
         const int i = row * D4 + c16 * 4;
-        if (kg < k1) {
+        if (kg < kend) {
           const uint4 kw =
               ((const device uint4*)(kwbase + (size_t)kg * k_seq_stride))[c16];
           const uint4 vw =
@@ -383,7 +404,7 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
         const int row = i / D4;
         const int col = i % D4;
         const int kg = kt + row;
-        if (kg < k1) {
+        if (kg < kend) {
           sK[i] = ((const device T4*)(kbase + (size_t)kg * k_seq_stride))[col];
           sV[i] = ((const device T4*)(vbase + (size_t)kg * v_seq_stride))[col];
         } else {
@@ -419,7 +440,7 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
         }
         s[p] = simd_shuffle(s[p], NL * ty);
         const bool valid =
-            kg < k1 && kg <= lim[p] && (!gqa_has_starts || kg >= row_start);
+            kg < kend && kg <= lim[p] && (!gqa_has_starts || kg >= row_start);
         mqk[p][cc] = valid ? s[p] : Limits<float>::finite_min;
         m_tile[p] = max(m_tile[p], mqk[p][cc]);
       }
@@ -545,6 +566,54 @@ METAL_FUNC void kq_fa_stage_rows(
   }
 }
 
+// q8 variant: rows arrive as packed uint32 affine wire (bits 8, group 64)
+// with per-group scale/bias; dequant lands in the staged tile so the MMA
+// consumers are unchanged. Works in uint4 units (16 codes) -- one
+// vectorized wire load and one scale/bias pair per unit, never straddling
+// a 64-element group (same staging shape as the decode kernel's q8 path).
+template <typename T, int BK, int D, int LDS, int NT>
+METAL_FUNC void kq_fa_stage_rows_q8(
+    threadgroup T* dst,
+    const device uint32_t* src,
+    const device T* scales,
+    const device T* biases,
+    size_t seq_stride_w,
+    size_t sb_seq_stride,
+    int rows_valid,
+    int flat_tid) {
+  using T4 = metal::vec<T, 4>;
+  constexpr int DU = D / 16; // uint4 units per row
+  constexpr int LDS4 = LDS / 4;
+  threadgroup T4* dst4 = (threadgroup T4*)dst;
+  for (int u = flat_tid; u < BK * DU; u += NT) {
+    const int r = u / DU;
+    const int c16 = u - r * DU;
+    const int i = r * LDS4 + c16 * 4;
+    if (r < rows_valid) {
+      const uint4 w =
+          ((const device uint4*)(src + (size_t)r * seq_stride_w))[c16];
+      const size_t g = (c16 * 16) / 64;
+      const float sc = float(scales[(size_t)r * sb_seq_stride + g]);
+      const float bi = float(biases[(size_t)r * sb_seq_stride + g]);
+#pragma unroll
+      for (short j = 0; j < 4; j++) {
+        const uint32_t x = j == 0 ? w.x : j == 1 ? w.y : j == 2 ? w.z : w.w;
+        const float4 q4 = float4(
+            float(x & 0xff),
+            float((x >> 8) & 0xff),
+            float((x >> 16) & 0xff),
+            float(x >> 24));
+        dst4[i + j] = T4(q4 * sc + bi);
+      }
+    } else {
+#pragma unroll
+      for (short j = 0; j < 4; j++) {
+        dst4[i + j] = T4(T(0));
+      }
+    }
+  }
+}
+
 // Simdgroup-matrix (steel MMA) speculative-verify attention, pass 1. The
 // caller folds the GQA group into the query rows -- q [B, Hq, qL, D] becomes
 // [B, Hkv, G*qL, D] with kv-major heads -- so the kernel sees an MHA problem
@@ -584,6 +653,14 @@ template <typename T, int D, int BQ = 32>
     const constant float& scale [[buffer(11)]],
     const constant int& q_len [[buffer(12)]],
     const constant int& n_rows [[buffer(13)]],
+    const device T* k_scales [[buffer(14)]],
+    const device T* k_biases [[buffer(15)]],
+    const device T* v_scales [[buffer(16)]],
+    const device T* v_biases [[buffer(17)]],
+    const constant size_t& ks_head_stride [[buffer(18)]],
+    const constant size_t& ks_seq_stride [[buffer(19)]],
+    const constant size_t& vs_head_stride [[buffer(20)]],
+    const constant size_t& vs_seq_stride [[buffer(21)]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -613,12 +690,25 @@ template <typename T, int D, int BQ = 32>
   const int k0 = split_idx * chunk;
   const int k1 = min(k0 + chunk, N);
 
-  const device T* kbase = keys +
-      (size_t)(batch_idx * num_kv_heads + kv_head_idx) * k_head_stride +
-      (size_t)k0 * k_seq_stride;
-  const device T* vbase = values +
-      (size_t)(batch_idx * num_kv_heads + kv_head_idx) * v_head_stride +
-      (size_t)k0 * v_seq_stride;
+  // With gqa_kv_q8 the k/v buffers hold packed uint32 wire and the strides
+  // arrive in WORDS (D/4 per row); otherwise they hold T elements.
+  const size_t kv_hb = (size_t)(batch_idx * num_kv_heads + kv_head_idx);
+  const device T* kbase =
+      keys + kv_hb * k_head_stride + (size_t)k0 * k_seq_stride;
+  const device T* vbase =
+      values + kv_hb * v_head_stride + (size_t)k0 * v_seq_stride;
+  const device uint32_t* kwbase = (const device uint32_t*)keys +
+      kv_hb * k_head_stride + (size_t)k0 * k_seq_stride;
+  const device uint32_t* vwbase = (const device uint32_t*)values +
+      kv_hb * v_head_stride + (size_t)k0 * v_seq_stride;
+  const device T* ksb =
+      k_scales + kv_hb * ks_head_stride + (size_t)k0 * ks_seq_stride;
+  const device T* kbb =
+      k_biases + kv_hb * ks_head_stride + (size_t)k0 * ks_seq_stride;
+  const device T* vsb =
+      v_scales + kv_hb * vs_head_stride + (size_t)k0 * vs_seq_stride;
+  const device T* vbb =
+      v_biases + kv_hb * vs_head_stride + (size_t)k0 * vs_seq_stride;
 
   // Fragment coordinates: this thread owns row (row0 + sm) and the column
   // pair at sn of every 8x8 fragment.
@@ -655,12 +745,24 @@ template <typename T, int D, int BQ = 32>
   for (int kt = k0; kt < k1; kt += BK) {
     const int krem = min(k1 - kt, BK);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    kq_fa_stage_rows<T, BK, D, LDS, kNWarps * 32>(
-        KV_smem,
-        kbase + (size_t)(kt - k0) * k_seq_stride,
-        k_seq_stride,
-        krem,
-        flat_tid);
+    if (gqa_kv_q8) {
+      kq_fa_stage_rows_q8<T, BK, D, LDS, kNWarps * 32>(
+          KV_smem,
+          kwbase + (size_t)(kt - k0) * k_seq_stride,
+          ksb + (size_t)(kt - k0) * ks_seq_stride,
+          kbb + (size_t)(kt - k0) * ks_seq_stride,
+          k_seq_stride,
+          ks_seq_stride,
+          krem,
+          flat_tid);
+    } else {
+      kq_fa_stage_rows<T, BK, D, LDS, kNWarps * 32>(
+          KV_smem,
+          kbase + (size_t)(kt - k0) * k_seq_stride,
+          k_seq_stride,
+          krem,
+          flat_tid);
+    }
     Stile.clear();
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -702,12 +804,24 @@ template <typename T, int D, int BQ = 32>
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    kq_fa_stage_rows<T, BK, D, LDS, kNWarps * 32>(
-        KV_smem,
-        vbase + (size_t)(kt - k0) * v_seq_stride,
-        v_seq_stride,
-        krem,
-        flat_tid);
+    if (gqa_kv_q8) {
+      kq_fa_stage_rows_q8<T, BK, D, LDS, kNWarps * 32>(
+          KV_smem,
+          vwbase + (size_t)(kt - k0) * v_seq_stride,
+          vsb + (size_t)(kt - k0) * vs_seq_stride,
+          vbb + (size_t)(kt - k0) * vs_seq_stride,
+          v_seq_stride,
+          vs_seq_stride,
+          krem,
+          flat_tid);
+    } else {
+      kq_fa_stage_rows<T, BK, D, LDS, kNWarps * 32>(
+          KV_smem,
+          vbase + (size_t)(kt - k0) * v_seq_stride,
+          v_seq_stride,
+          krem,
+          flat_tid);
+    }
 
     // Online softmax on this thread's row (registers only, overlapping the
     // V load). A row with no valid key yet keeps max at finite_min and
@@ -1054,12 +1168,14 @@ template <typename T, int D>
   sums += base * gqa_splits;
   maxs += base * gqa_splits;
 
-  // Second set: fa folded layout, row = kv*(B*gqa) + b*gqa + g.
+  // Second set: fa folded layout with the query axis innermost,
+  // row = ((kv*B + b)*gqa + g)*qL + t (tpg.z = qL; decode width -> t = 0).
   int splits2 = 0;
   if (gqa_cascade) {
     const int kv = head_idx / cascade_gqa;
     const int g = head_idx % cascade_gqa;
-    const size_t row = ((size_t)kv * tpg.y + batch_idx) * cascade_gqa + g;
+    const size_t row =
+        (((size_t)kv * tpg.y + batch_idx) * cascade_gqa + g) * tpg.z + tid.z;
     splits2 = cascade_splits;
     partials2 += row * splits2 * D;
     sums2 += row * splits2;

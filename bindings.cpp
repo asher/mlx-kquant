@@ -363,6 +363,41 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_decode_gqa_paged",
+      &mlx_kquant::sdpa_decode_gqa_paged,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "scale"_a,
+      "pages"_a,
+      "splits"_a = 0,
+      "starts"_a = nb::none(),
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Sparse page-gather decode attention: attend ONLY the key/value
+        pages listed per (batch, kv-head), walking the selected pages
+        through the decode kernel instead of the full cache. The page
+        unit is the head dim's staged tile height: 32 rows at head_dim
+        64/128, 16 at 256, 8 at 512. Optional starts (int32 [B])
+        restricts row b to keys [starts[b], N) for left-padded batches.
+
+        Args:
+            q (array): queries [B, n_q_heads, 1, D], float16/bfloat16.
+            k (array): keys [B, n_kv_heads, S, D] (full cache view).
+            v (array): values [B, n_kv_heads, S, D].
+            scale (float): query scale (typically 1/sqrt(D)).
+            pages (array): int32 [B, n_kv_heads, n_pages] page indices in
+                [0, ceil(S / page_size)); no duplicates. The final partial
+                page is tail-clamped to S automatically.
+            splits (int): key-axis split count; 0 buckets by the SELECTED
+                key count.
+
+        Returns:
+            array: attention output [B, n_q_heads, 1, D].
+      )");
+
+  m.def(
       "sdpa_decode_gqa_cascade",
       [](mx::array q,
          mx::array k_shared,
@@ -375,6 +410,14 @@ NB_MODULE(_ext, m) {
          int splits_priv,
          int tile_c,
          bool return_lse,
+         const std::optional<mx::array>& k_shared_scales,
+         const std::optional<mx::array>& k_shared_biases,
+         const std::optional<mx::array>& v_shared_scales,
+         const std::optional<mx::array>& v_shared_biases,
+         const std::optional<mx::array>& k_priv_scales,
+         const std::optional<mx::array>& k_priv_biases,
+         const std::optional<mx::array>& v_priv_scales,
+         const std::optional<mx::array>& v_priv_biases,
          mx::StreamOrDevice s) -> nb::object {
         auto outs = mlx_kquant::sdpa_decode_gqa_cascade(
             std::move(q),
@@ -388,6 +431,14 @@ NB_MODULE(_ext, m) {
             splits_priv,
             tile_c,
             return_lse,
+            k_shared_scales,
+            k_shared_biases,
+            v_shared_scales,
+            v_shared_biases,
+            k_priv_scales,
+            k_priv_biases,
+            v_priv_scales,
+            v_priv_biases,
             s);
         if (return_lse) {
           return nb::make_tuple(outs[0], outs[1]);
@@ -406,6 +457,14 @@ NB_MODULE(_ext, m) {
       "tile_c"_a = 0,
       nb::kw_only(),
       "return_lse"_a = false,
+      "k_shared_scales"_a = nb::none(),
+      "k_shared_biases"_a = nb::none(),
+      "v_shared_scales"_a = nb::none(),
+      "v_shared_biases"_a = nb::none(),
+      "k_priv_scales"_a = nb::none(),
+      "k_priv_biases"_a = nb::none(),
+      "v_priv_scales"_a = nb::none(),
+      "v_priv_biases"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Fused shared-prefix (cascade) decode attention: every batch row
@@ -417,9 +476,11 @@ NB_MODULE(_ext, m) {
         concatenated KV, reading the prefix once instead of B times.
 
         Args:
-            q (array): queries [B, n_q_heads, 1, D], float16/bfloat16;
-                D in {64, 128, 256, 512}; gqa <= 16; B*gqa <= 64 (<= 32 at
-                D=512).
+            q (array): queries [B, n_q_heads, qL, D], float16/bfloat16;
+                qL in [1, 8] (verify width: end-aligned causal on the
+                private suffix, full shared visibility); D in
+                {64, 128, 256, 512}; gqa <= 16; B*gqa*qL <= 64 (<= 32 at
+                D=512); gqa*ceil(qL/2) <= 32 at qL > 1.
             k_shared (array): shared prefix keys [1, n_kv_heads, P, D].
             v_shared (array): shared prefix values [1, n_kv_heads, P, D].
             k_priv (array): private suffix keys [B, n_kv_heads, Sp, D],
@@ -432,6 +493,11 @@ NB_MODULE(_ext, m) {
             splits_priv (int): private-region split count; 0 = default.
             tile_c (int): private-pass staged tile height; 0 picks by
                 head_dim.
+            k_shared_scales ... v_priv_biases (array, optional): quantized
+                KV (mlx affine wire, bits 8 / group 64). Pass all eight and
+                both k/v slabs bind as packed uint32 words ([.., S, D/4])
+                with scales/biases [.., S, D/64] in q's dtype; dequant
+                happens at tile stage. Not supported at D=512.
 
         Returns:
             array: attention output [B, n_q_heads, 1, D]. With
