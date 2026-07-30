@@ -514,6 +514,24 @@ mx::array rmsnorm2_add(
     float eps,
     mx::StreamOrDevice s = {});
 
+// GPU-side routed-expert slot remap + residency shed for streamed MoE decode
+// (the gpu-dispatch autonomous-token front end; see kq_route_shed.h).
+// slot_table maps expert id -> arena slot, negative = non-resident. Every
+// non-resident routed expert is shed (a lazy graph cannot demand-read disk);
+// kept gate weights are renormalized mass-preserving (score * S_all/S_kept).
+// Shed entries keep a valid slot (the row's first kept slot, else 0) with a
+// zero mix weight so downstream gather kernels stay exact. Misses come back
+// packed to the front of miss_ids/miss_scores in descending score order
+// (prestage priority), -1 / 0 padded; the host consumes them between tokens.
+// Over-budget accounting vs a keep-mass P is host-side arithmetic on
+// miss_scores. Returns {slots u32 [T,R], mix f32 [T,R], miss_ids i32 [T,R],
+// miss_scores f32 [T,R]}.
+std::vector<mx::array> route_shed(
+    mx::array indices,
+    mx::array scores,
+    mx::array slot_table,
+    mx::StreamOrDevice s = {});
+
 // ----------------------------- primitives -----------------------------
 
 // Dequantize a single uint8 K-quant wire-byte tensor. Inference-only:
@@ -1350,6 +1368,30 @@ class KQuantRMSNorm2Add : public mx::Primitive {
 
  private:
   float eps_;
+};
+
+// Routed-expert slot remap + residency shed (see route_shed).
+// Inference-only.
+class KQuantRouteShed : public mx::Primitive {
+ public:
+  explicit KQuantRouteShed(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantRouteShed";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return true;
+  }
 };
 
 // Gather (MoE) quantized matmul. vjp implements only the gradient wrt x (a

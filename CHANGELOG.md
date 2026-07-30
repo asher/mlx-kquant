@@ -6,6 +6,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `route_shed(indices, scores, slot_table)`: GPU-side routed-expert slot
+  remap plus residency shed for streamed MoE decode; non-resident experts
+  are shed and reported (miss ids and scores) without a host sync.
+
 ## [0.3.7]
 
 Build and publish cp314 wheel

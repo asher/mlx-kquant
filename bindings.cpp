@@ -922,6 +922,36 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "route_shed",
+      &mlx_kquant::route_shed,
+      "indices"_a,
+      "scores"_a,
+      "slot_table"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        GPU-side routed-expert slot remap + residency shed for streamed MoE
+        decode. Remaps routed expert ids to arena slots via slot_table
+        (expert id -> slot, negative = non-resident), sheds every
+        non-resident expert (a lazy graph cannot demand-read disk),
+        renormalizes kept gate weights mass-preserving
+        (score * S_all / S_kept), and reports misses for between-token
+        prestaging. Shed entries keep a valid slot (the row's first kept
+        slot, else 0) with a zero mix weight, so downstream gather kernels
+        need no changes. All-miss rows return an all-zero mix.
+
+        Args:
+            indices (array): expert indices [T, R], uint32. R <= 64.
+            scores (array): gate scores [T, R], float32.
+            slot_table (array): [n_experts], int32; slot index or negative.
+
+        Returns:
+            tuple: (slots u32 [T, R], mix f32 [T, R],
+            miss_ids i32 [T, R] front-packed descending-score with -1 pad,
+            miss_scores f32 [T, R] aligned with 0 pad).
+      )");
+
+  m.def(
       "gather_qmm",
       &mlx_kquant::gather_qmm,
       "x"_a,
