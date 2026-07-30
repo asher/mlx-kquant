@@ -397,6 +397,109 @@ instantiate_mv_ext_all(iq1_m, 256, 1)
   instantiate_mv_ext_nr2_for_type(codec, gs, bits, float16_t)
 instantiate_mv_ext_nr2_all(q6_k, 256, 6)
 
+// Shuffle-broadcast experiment (KQ_MV_EXT_SB=1): the four ty-lanes sharing
+// a tx column exchange float4 quarters of the activation window over
+// simd_shuffle instead of each loading all 16 elements -- activation cache
+// traffic / 4, no barriers, no extra accumulators. q6_k only, M 4-12 where
+// the nr0=1 activation decay bites. Suffix _sb.
+#define instantiate_mv_ext_sb(codec, type, gs, bits, m)                 \
+  instantiate_kernel(                                                   \
+      "kquant_" #codec "_mv_ext_" #type "_gs_" #gs "_b_" #bits "_m" #m  \
+      "_sb",                                                            \
+      kq_ ## codec ## _mv_ext_sb, type, m, 2, 8)
+#define instantiate_mv_ext_sb_for_type(codec, gs, bits, type)           \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 4)                       \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 5)                       \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 6)                       \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 7)                       \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 8)                       \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 9)                       \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 10)                      \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 11)                      \
+  instantiate_mv_ext_sb(codec, type, gs, bits, 12)
+#define instantiate_mv_ext_sb_all(codec, gs, bits)                      \
+  instantiate_mv_ext_sb_for_type(codec, gs, bits, float)                \
+  instantiate_mv_ext_sb_for_type(codec, gs, bits, bfloat16_t)           \
+  instantiate_mv_ext_sb_for_type(codec, gs, bits, float16_t)
+instantiate_mv_ext_sb_all(q6_k, 256, 6)
+
+// Wide-nxpsg experiment (KQ_MV_EXT_NX=16|32): more K lanes per simdgroup
+// means fewer output rows per simdgroup, so each activation element has
+// nypsg*nsg = 4 (x16) or 2 (x32) redundant readers instead of 8 -- the
+// L1-capacity pressure behind the M4->8 decay -- and the grid gains
+// threadgroups. Same impl, different template params. q6_k M 4-12.
+#define instantiate_mv_ext_nx(codec, type, gs, bits, m, nx)             \
+  instantiate_kernel(                                                   \
+      "kquant_" #codec "_mv_ext_" #type "_gs_" #gs "_b_" #bits "_m" #m  \
+      "_x" #nx,                                                         \
+      kq_ ## codec ## _mv_ext, type, m, 2, nx)
+#define instantiate_mv_ext_nx_for_type(codec, gs, bits, type, nx)       \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 4, nx)                   \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 5, nx)                   \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 6, nx)                   \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 7, nx)                   \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 8, nx)                   \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 9, nx)                   \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 10, nx)                  \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 11, nx)                  \
+  instantiate_mv_ext_nx(codec, type, gs, bits, 12, nx)
+#define instantiate_mv_ext_nx_all(codec, gs, bits, nx)                  \
+  instantiate_mv_ext_nx_for_type(codec, gs, bits, float, nx)            \
+  instantiate_mv_ext_nx_for_type(codec, gs, bits, bfloat16_t, nx)       \
+  instantiate_mv_ext_nx_for_type(codec, gs, bits, float16_t, nx)
+instantiate_mv_ext_nx_all(q6_k, 256, 6, 16)
+instantiate_mv_ext_nx_all(q6_k, 256, 6, 32)
+
+// T-precision-dot experiment (KQ_MV_EXT_HD=1): the FMA-issue-bound band's
+// ALU lever. Dequanted chunk converts float->T once (amortized over M rows),
+// activations load at native T width with no per-row convert, and the
+// 16-term chunk dot runs at half/bfloat issue rate before an f32 fold.
+// q6_k only, M 4-12; no float x variant (no rate advantage). Suffix _hd.
+#define instantiate_mv_ext_hd(codec, type, gs, bits, m)                 \
+  instantiate_kernel(                                                   \
+      "kquant_" #codec "_mv_ext_" #type "_gs_" #gs "_b_" #bits "_m" #m  \
+      "_hd",                                                            \
+      kq_ ## codec ## _mv_ext_hd, type, m, 2, 8)
+#define instantiate_mv_ext_hd_for_type(codec, gs, bits, type)           \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 4)                       \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 5)                       \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 6)                       \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 7)                       \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 8)                       \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 9)                       \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 10)                      \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 11)                      \
+  instantiate_mv_ext_hd(codec, type, gs, bits, 12)
+#define instantiate_mv_ext_hd_all(codec, gs, bits)                      \
+  instantiate_mv_ext_hd_for_type(codec, gs, bits, bfloat16_t)           \
+  instantiate_mv_ext_hd_for_type(codec, gs, bits, float16_t)
+instantiate_mv_ext_hd_all(q6_k, 256, 6)
+
+// Staged-activation experiment (KQ_MV_EXT_TS=1): the M x 128 activation
+// window stages into threadgroup memory once per K-step and 8 simdgroups
+// (32 output rows) share it -- the activation-path lever the sb/nr2/nx
+// falsifications never isolated. Dot math identical to base. q6_k M 4-12.
+#define instantiate_mv_ext_ts(codec, type, gs, bits, m)                 \
+  instantiate_kernel(                                                   \
+      "kquant_" #codec "_mv_ext_" #type "_gs_" #gs "_b_" #bits "_m" #m  \
+      "_ts",                                                            \
+      kq_ ## codec ## _mv_ext_ts, type, m, 8, 8)
+#define instantiate_mv_ext_ts_for_type(codec, gs, bits, type)           \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 4)                       \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 5)                       \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 6)                       \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 7)                       \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 8)                       \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 9)                       \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 10)                      \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 11)                      \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 12)
+#define instantiate_mv_ext_ts_all(codec, gs, bits)                      \
+  instantiate_mv_ext_ts_for_type(codec, gs, bits, float)                \
+  instantiate_mv_ext_ts_for_type(codec, gs, bits, bfloat16_t)           \
+  instantiate_mv_ext_ts_for_type(codec, gs, bits, float16_t)
+instantiate_mv_ext_ts_all(q6_k, 256, 6)
+
 #define instantiate_kquant_q3_k_for_type(type)                          \
   instantiate_kquant_batched(verify_qmv, type, 256, 3, 0, q3_k)          \
   instantiate_kquant_batched(qmv_fast, type, 256, 3, 0, q3_k)            \
@@ -863,4 +966,37 @@ instantiate_kquant_gather_qmm_rhs_codec(256, 1, iq1_m)
   map[3u * slot + 1u] = r;
   map[3u * slot + 2u] = min(64u, seg_len - rank);
 }
-// clang-format on
+
+// Split-K partial fold for qmm_t_splitk: y[i] = (T)(f32 sum over the
+// splits axis of partials[z * stride + i]). Partials carry one T rounding
+// per slice; the fold accumulates in f32 and rounds once more. One thread
+// per output element; cost is noise next to the GEMM pass.
+template <typename T>
+[[kernel]] void kq_qmm_splitk_accum(
+    const device T* partials [[buffer(0)]],
+    device T* y [[buffer(1)]],
+    const constant int& n_elems [[buffer(2)]],
+    const constant int& splits [[buffer(3)]],
+    const constant int& stride [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid >= static_cast<uint>(n_elems)) {
+    return;
+  }
+  float acc = 0.0f;
+  for (int z = 0; z < splits; ++z) {
+    acc += static_cast<float>(
+        partials[static_cast<int64_t>(z) * stride + gid]);
+  }
+  y[gid] = static_cast<T>(acc);
+}
+
+#define instantiate_kq_qmm_splitk_accum(type)   \
+  instantiate_kernel(                           \
+      "kquant_qmm_splitk_accum_" #type,         \
+      kq_qmm_splitk_accum,                      \
+      type)
+
+instantiate_kq_qmm_splitk_accum(float)
+instantiate_kq_qmm_splitk_accum(bfloat16_t)
+instantiate_kq_qmm_splitk_accum(float16_t)
+    // clang-format on

@@ -33,13 +33,18 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    const int k_len = -1) {
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
 
   (void)lid;
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  // k_len < 0 walks the full reduction; the split-k wrapper passes a slice
+  // length while K keeps supplying the (full) row strides.
+  const int k_bound = k_len < 0 ? K : k_len;
 
   const int K_w = (K / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   const int y_row = tid.y * BM;
@@ -109,7 +114,7 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
         constexpr int WS_STRIDE = BN * BK_padded;
         LoaderW loader_w1(wl, K, Ws + WS_STRIDE, simd_gid, simd_lid);
         loader_w1.next();
-        const int n_steps = K / BK;
+        const int n_steps = k_bound / BK;
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
@@ -172,7 +177,7 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
       } else {
-        for (int k = 0; k < K; k += BK) {
+        for (int k = 0; k < k_bound; k += BK) {
           threadgroup_barrier(mem_flags::mem_threadgroup);
           if constexpr (kAlignedN.value) {
             loader_w.load_unsafe();
@@ -3319,6 +3324,89 @@ KQ_NAX_DEFINE_KERNELS(q5_k, 256, 5, KqNaxQ5_KBlockLoader)
 KQ_NAX_DEFINE_KERNELS(q6_k, 256, 6, KqNaxQ6_KBlockLoader)
 KQ_NAX_DEFINE_KERNELS(q3_k, 256, 3, KqNaxQ3_KBlockLoader)
 KQ_NAX_DEFINE_KERNELS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
+
+// Split-K qmm_t on the NAX tile (KQ_QMM_SPLITK_NAX, small-M experiment):
+// grid.z indexes K-slices; each slice walks k_partition_size weights from a
+// superblock-aligned start and stores a T partial tile at
+// tid.z * split_k_partition_stride. The shared kquant_qmm_splitk_accum pass
+// folds slices in f32. The host guarantees k_partition_size is a multiple
+// of both the codec superblock and BK, so every slice starts the loader at
+// kt_base 0. Non-batched transpose shapes only; no swizzle (grid.y is a
+// single row tile in the target band).
+#define KQ_NAX_DEFINE_SPLITK_KERNEL(codec, GROUP_CONST, bits_val, LOADER)    \
+  template <                                                                 \
+      typename T,                                                            \
+      int group_size,                                                        \
+      int bits,                                                              \
+      bool aligned_N,                                                        \
+      int BM,                                                                \
+      int BN,                                                                \
+      int WM,                                                                \
+      int WN>                                                                \
+  [[kernel]] void kq_##codec##_qmm_t_nax_splitk(                             \
+      const device uint8_t* w,                                               \
+      const device uint8_t* /* scales */,                                    \
+      const device T* x,                                                     \
+      device T* y,                                                           \
+      const constant int& K,                                                 \
+      const constant int& N,                                                 \
+      const constant int& M,                                                 \
+      const constant int& k_partition_size,                                  \
+      const constant int& split_k_partition_stride,                          \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint lid [[thread_index_in_threadgroup]],                              \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    static_assert(                                                           \
+        group_size == GROUP_CONST,                                           \
+        #codec " NAX kernel requires group_size=" #GROUP_CONST);             \
+    static_assert(                                                           \
+        bits == bits_val, #codec " NAX kernel requires bits=" #bits_val);    \
+    if (int(tid.y) * BM >= M) {                                              \
+      return;                                                                \
+    }                                                                        \
+    constexpr int BK = 64;                                                   \
+    constexpr int BK_padded = (BK + 16 / sizeof(T));                         \
+    using LoaderW = LOADER<                                                  \
+        T,                                                                   \
+        BN,                                                                  \
+        BK,                                                                  \
+        BK_padded,                                                           \
+        /*reduction_dim=*/1,                                                 \
+        /*tgp_size=*/WM * WN * SIMD_SIZE>;                                   \
+    constexpr int kWsBufs = (LoaderW::db_safe && BM == 32) ? 2 : 1;          \
+    threadgroup T Ws[kWsBufs * BN * BK_padded];                              \
+    const int k_start = int(tid.z) * k_partition_size;                       \
+    x += k_start;                                                            \
+    auto wl = w;                                                             \
+    wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block; \
+    y += int(tid.z) * static_cast<int64_t>(split_k_partition_stride);        \
+    kq_qmm_t_nax_tgp_impl<                                                   \
+        T,                                                                   \
+        LoaderW,                                                             \
+        aligned_N,                                                           \
+        BM,                                                                  \
+        BK,                                                                  \
+        BN,                                                                  \
+        WM,                                                                  \
+        WN,                                                                  \
+        kWsBufs == 2>(                                                       \
+        wl,                                                                  \
+        x,                                                                   \
+        y,                                                                   \
+        Ws,                                                                  \
+        K,                                                                   \
+        N,                                                                   \
+        M,                                                                   \
+        tid,                                                                 \
+        lid,                                                                 \
+        simd_gid,                                                            \
+        simd_lid,                                                            \
+        k_partition_size);                                                   \
+  }
+
+KQ_NAX_DEFINE_SPLITK_KERNEL(q6_k, 256, 6, KqNaxQ6_KBlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(q8_0, 32, 8, KqNaxQ8_0BlockLoader)
 
 template <
     typename T,

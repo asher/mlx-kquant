@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 import mlx.core as mx
 import numpy as np
@@ -35,6 +36,49 @@ pytestmark = pytest.mark.skipif(
     bool(os.environ.get("KQUANT_FORCE_CPU")),
     reason="kq.dsa_sparse_attention is a Metal-only kernel; no CPU path.",
 )
+
+# Hosted-CI macOS runners expose a paravirtualized Metal device whose backend
+# compiler transiently fails the heaviest pipeline build in this suite (the
+# non-split bk256 instantiation) at first touch: "Unable to load kernel ...
+# Compilation failed", while the same pipeline compiles fine moments later.
+# On such runners, settle that pipeline once with retries before any test
+# relies on it; tests skip only if it never compiles. Real hardware never
+# reports a paravirtual device name, so this is a no-op there.
+try:
+    _DEVICE_NAME = str(mx.device_info().get("device_name", ""))
+except Exception:
+    _DEVICE_NAME = ""
+_VIRTUAL_GPU = "paravirtual" in _DEVICE_NAME.lower()
+
+_PRIMED: dict[str, bool] = {}
+
+
+def _heavy_pipeline_ready(dtype):
+    """Prime the non-split bk256 pipeline for dtype (qL 8 forces the
+    non-split route regardless of KQ_DSA_SPLIT). True on real hardware
+    without compiling anything."""
+    if not _VIRTUAL_GPU:
+        return True
+    key = str(dtype)
+    if key not in _PRIMED:
+        q, local_kv, pooled, topk, sinks, scale = _build(
+            8, 136, 700, 512, 2792, 4, 128, dtype, seed=7, mode="random"
+        )
+        ok = False
+        for _ in range(4):
+            try:
+                mx.eval(
+                    kq.dsa_sparse_attention(
+                        q, local_kv, pooled, topk, sinks, scale, 2792, 4, 128
+                    )
+                )
+                ok = True
+                break
+            except RuntimeError:
+                time.sleep(2)
+        _PRIMED[key] = ok
+    return _PRIMED[key]
+
 
 REL_BOUND = {mx.bfloat16: 5e-3, mx.float16: 2e-3}
 
@@ -147,6 +191,10 @@ CASES = [
 @pytest.mark.parametrize("case", CASES, ids=[c[0] for c in CASES])
 def test_dsa_sparse_attention(case, dtype):
     name, qL, localL, P, topk_n, q_offset, ratio, window, mode = case
+    # qL > 4 forces the non-split route; topk_n > 128 selects the bk256
+    # tile: the pipeline the paravirtual backend flakes on.
+    if topk_n > 128 and qL > 4 and not _heavy_pipeline_ready(dtype):
+        pytest.skip("paravirtual Metal never compiled the bk256 pipeline")
     rel = _case(
         qL,
         localL,
@@ -184,6 +232,10 @@ def test_dsa_sparse_attention_split_matches_base(case, dtype, monkeypatch):
     under the reference tolerance.
     """
     name, qL, localL, P, topk_n, q_offset, ratio, window, mode = case
+    # The forced non-split arm (KQ_DSA_SPLIT=0) dispatches the bk256
+    # pipeline whenever topk_n > 128, at any qL.
+    if topk_n > 128 and not _heavy_pipeline_ready(dtype):
+        pytest.skip("paravirtual Metal never compiled the bk256 pipeline")
     q, local_kv, pooled, topk, sinks, scale = _build(
         qL, localL, P, topk_n, q_offset, ratio, window, dtype, seed=11, mode=mode
     )

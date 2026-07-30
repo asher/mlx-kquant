@@ -153,14 +153,18 @@ mx::array sdpa_vector(
     bool causal = true,
     mx::StreamOrDevice s = {});
 
-// Decode-time (qL == 1) GQA attention tuned for long KV: fixed coarse
+// Decode/verify (qL 1..4) GQA attention tuned for long KV: fixed coarse
 // contiguous key splits plus threadgroup-staged K/V tiles shared across the
 // GQA group, so device memory reads the KV once per kv-head. Optional
 // per-q-head attention sinks (an extra softmax logit with no value row).
-// q [B, n_q_heads, 1, D], k/v [B, n_kv_heads, kL, D] with contiguous D;
-// head/seq strides are read in place. head_dim 64 only; gqa_factor 2..8.
-// `splits` 0 picks the default (32); `tile_c` is the staged tile height
-// (32 or 16). Metal-only.
+// Optional per-batch-row key start offsets `starts` (int32 [B]) restrict row
+// b's attention to keys [starts[b], kL) -- a left-padded batched KV cache --
+// with fully padded-out key chunks skipped, not just masked. Values must be
+// in [0, kL - qL]; out-of-range starts read as empty rows (zero output).
+// q [B, n_q_heads, qL, D], k/v [B, n_kv_heads, kL, D] with contiguous D;
+// head/seq strides are read in place. head_dim 64/128/256/512; gqa_factor
+// <= 16. `splits` 0 picks the default; `tile_c` is the staged tile height
+// (0 picks by head_dim). Metal-only.
 mx::array sdpa_decode_gqa(
     mx::array q,
     mx::array k,
@@ -169,6 +173,11 @@ mx::array sdpa_decode_gqa(
     const std::optional<mx::array>& sinks = std::nullopt,
     int splits = 0,
     int tile_c = 32,
+    const std::optional<mx::array>& starts = std::nullopt,
+    const std::optional<mx::array>& k_scales = std::nullopt,
+    const std::optional<mx::array>& k_biases = std::nullopt,
+    const std::optional<mx::array>& v_scales = std::nullopt,
+    const std::optional<mx::array>& v_biases = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // Speculative-verify attention on the GPU matrix units for a GQA-folded query
@@ -684,15 +693,26 @@ class KQuantSDPA : public mx::Primitive {
   bool causal_;
 };
 
-// Decode-time GQA attention (see sdpa_decode_gqa). Sinks presence is encoded
-// in the input count (q, k, v[, sinks]). Inference-only.
+// Decode-time GQA attention (see sdpa_decode_gqa). Optional inputs follow
+// q, k, v in a fixed order (sinks, then starts); presence flags are carried
+// here, not inferred from the input count. Inference-only.
 class KQuantSDPAGQA : public mx::Primitive {
  public:
-  explicit KQuantSDPAGQA(mx::Stream stream, float scale, int splits, int tile_c)
+  explicit KQuantSDPAGQA(
+      mx::Stream stream,
+      float scale,
+      int splits,
+      int tile_c,
+      bool has_sinks,
+      bool has_starts,
+      bool has_kv_q8 = false)
       : mx::Primitive(stream),
         scale_(scale),
         splits_(splits),
-        tile_c_(tile_c) {}
+        tile_c_(tile_c),
+        has_sinks_(has_sinks),
+        has_starts_(has_starts),
+        has_kv_q8_(has_kv_q8) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -713,6 +733,9 @@ class KQuantSDPAGQA : public mx::Primitive {
   float scale_;
   int splits_;
   int tile_c_;
+  bool has_sinks_;
+  bool has_starts_;
+  bool has_kv_q8_;
 };
 
 // Simdgroup-matrix FA verify attention (see sdpa_fa_verify). Inference-only.

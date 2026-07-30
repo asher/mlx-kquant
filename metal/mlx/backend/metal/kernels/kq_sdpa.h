@@ -15,6 +15,12 @@ constant bool do_causal [[function_constant(0)]];
 constant int blocks [[function_constant(1)]];
 constant int gqa_splits [[function_constant(2)]];
 constant bool gqa_has_sinks [[function_constant(3)]];
+constant bool gqa_has_starts [[function_constant(4)]];
+// Quantized KV operands (mlx affine wire, bits 8 / group 64): keys/values
+// bind as packed uint32 words plus per-group scale/bias arrays, and the
+// cooperative tile stage dequants into sK/sV -- everything downstream of
+// the stage is unchanged. Compiled out when false.
+constant bool gqa_kv_q8 [[function_constant(5)]];
 
 template <typename T, int D, int V = D>
 [[kernel]] void kq_sdpa_vector_2pass_1(
@@ -211,6 +217,15 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
     const constant size_t& v_seq_stride [[buffer(10)]],
     const constant float& scale [[buffer(11)]],
     const constant int& q_len [[buffer(12)]],
+    const device int* starts [[buffer(13)]],
+    const device T* k_scales [[buffer(14)]],
+    const device T* k_biases [[buffer(15)]],
+    const device T* v_scales [[buffer(16)]],
+    const device T* v_biases [[buffer(17)]],
+    const constant size_t& ks_head_stride [[buffer(18)]],
+    const constant size_t& ks_seq_stride [[buffer(19)]],
+    const constant size_t& vs_head_stride [[buffer(20)]],
+    const constant size_t& vs_seq_stride [[buffer(21)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -218,6 +233,7 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
   constexpr int D4 = D / 4;
   constexpr int NL = 32 / NE; // lanes per in-flight key
   constexpr int DP4 = D4 / NL; // float4s per lane per key row
+  constexpr int GP4 = 64 / 4; // packed words per quant group (group_size 64)
   using T4 = metal::vec<T, 4>;
 
   threadgroup T4 sK[C * D4];
@@ -242,10 +258,33 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
   const int k0 = split_idx * chunk;
   const int k1 = min(k0 + chunk, N);
 
+  // Per-row key start (left-padded batched KV cache): row batch_idx attends
+  // keys [row_start, N). Whole tiles below the start are skipped outright --
+  // the pad region's bytes are never staged -- and a partially padded tile
+  // masks per key below. A chunk entirely below the start writes an empty
+  // partial (max finite_min, sum 0), which pass 2 merges at zero weight.
+  int row_start = 0;
+  int kt0 = k0;
+  if (gqa_has_starts) {
+    row_start = max(0, starts[batch_idx]);
+    kt0 = max(k0, (row_start / C) * C);
+  }
+
+  // With gqa_kv_q8 the k/v buffers hold packed uint32 wire and the strides
+  // arrive in WORDS (D/4 per row); otherwise they hold T elements.
   const device T* kbase =
       keys + (size_t)(batch_idx * num_kv_heads + kv_head_idx) * k_head_stride;
   const device T* vbase =
       values + (size_t)(batch_idx * num_kv_heads + kv_head_idx) * v_head_stride;
+  const size_t kv_hb = (size_t)(batch_idx * num_kv_heads + kv_head_idx);
+  const device uint32_t* kwbase =
+      (const device uint32_t*)keys + kv_hb * k_head_stride;
+  const device uint32_t* vwbase =
+      (const device uint32_t*)values + kv_hb * v_head_stride;
+  const device T* ksb = k_scales + kv_hb * ks_head_stride;
+  const device T* kbb = k_biases + kv_hb * ks_head_stride;
+  const device T* vsb = v_scales + kv_hb * vs_head_stride;
+  const device T* vbb = v_biases + kv_hb * vs_head_stride;
 
   // Pre-scaled query slices for this lane's key-row columns
   // ([B, Hq, q_len, D], row-contiguous). A simdgroup past the runtime query
@@ -277,20 +316,74 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
   const int flat = (tidtg.z * gqa_factor + tidtg.y) * 32 + lane;
   const int n_threads = 32 * gqa_factor * tptg.z;
 
-  for (int kt = k0; kt < k1; kt += C) {
+  for (int kt = kt0; kt < k1; kt += C) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Cooperative tile load; zero-fill the tail so stale threadgroup data
-    // can never reach the accumulators.
-    for (int i = flat; i < C * D4; i += n_threads) {
-      const int row = i / D4;
-      const int col = i % D4;
-      const int kg = kt + row;
-      if (kg < k1) {
-        sK[i] = ((const device T4*)(kbase + (size_t)kg * k_seq_stride))[col];
-        sV[i] = ((const device T4*)(vbase + (size_t)kg * v_seq_stride))[col];
-      } else {
-        sK[i] = T4(T(0));
-        sV[i] = T4(T(0));
+    // can never reach the accumulators. The q8 path works in uint4 units
+    // (16 codes): one vectorized wire load and ONE scale/bias pair per
+    // unit -- 16 consecutive elements never straddle a 64-element group --
+    // instead of per-word scalar traffic, which measured ~40% below the
+    // fp16 kernel's bandwidth.
+    if (gqa_kv_q8) {
+      constexpr int DU = D / 16; // uint4 units per row
+      for (int u = flat; u < C * DU; u += n_threads) {
+        const int row = u / DU;
+        const int c16 = u % DU;
+        const int kg = kt + row;
+        const int i = row * D4 + c16 * 4;
+        if (kg < k1) {
+          const uint4 kw =
+              ((const device uint4*)(kwbase + (size_t)kg * k_seq_stride))[c16];
+          const uint4 vw =
+              ((const device uint4*)(vwbase + (size_t)kg * v_seq_stride))[c16];
+          const size_t gs = (c16 * 16) / 64;
+          const float ksc = float(ksb[(size_t)kg * ks_seq_stride + gs]);
+          const float kbi = float(kbb[(size_t)kg * ks_seq_stride + gs]);
+          const float vsc = float(vsb[(size_t)kg * vs_seq_stride + gs]);
+          const float vbi = float(vbb[(size_t)kg * vs_seq_stride + gs]);
+#pragma unroll
+          for (short w = 0; w < 4; w++) {
+            const uint32_t kx = w == 0 ? kw.x
+                : w == 1               ? kw.y
+                : w == 2               ? kw.z
+                                       : kw.w;
+            const uint32_t vx = w == 0 ? vw.x
+                : w == 1               ? vw.y
+                : w == 2               ? vw.z
+                                       : vw.w;
+            const float4 kq4 = float4(
+                float(kx & 0xff),
+                float((kx >> 8) & 0xff),
+                float((kx >> 16) & 0xff),
+                float(kx >> 24));
+            const float4 vq4 = float4(
+                float(vx & 0xff),
+                float((vx >> 8) & 0xff),
+                float((vx >> 16) & 0xff),
+                float(vx >> 24));
+            sK[i + w] = T4(kq4 * ksc + kbi);
+            sV[i + w] = T4(vq4 * vsc + vbi);
+          }
+        } else {
+#pragma unroll
+          for (short w = 0; w < 4; w++) {
+            sK[i + w] = T4(T(0));
+            sV[i + w] = T4(T(0));
+          }
+        }
+      }
+    } else {
+      for (int i = flat; i < C * D4; i += n_threads) {
+        const int row = i / D4;
+        const int col = i % D4;
+        const int kg = kt + row;
+        if (kg < k1) {
+          sK[i] = ((const device T4*)(kbase + (size_t)kg * k_seq_stride))[col];
+          sV[i] = ((const device T4*)(vbase + (size_t)kg * v_seq_stride))[col];
+        } else {
+          sK[i] = T4(T(0));
+          sV[i] = T4(T(0));
+        }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -319,17 +412,19 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
           s[p] += simd_shuffle_down(s[p], off);
         }
         s[p] = simd_shuffle(s[p], NL * ty);
-        const bool valid = kg < k1 && kg <= lim[p];
+        const bool valid =
+            kg < k1 && kg <= lim[p] && (!gqa_has_starts || kg >= row_start);
         mqk[p][cc] = valid ? s[p] : Limits<float>::finite_min;
         m_tile[p] = max(m_tile[p], mqk[p][cc]);
       }
     }
 
     // Online softmax per query; each lane sums its ty-group's keys, so the
-    // simd_sum counts every key NL times. A tile entirely beyond a query's
-    // causal limit is skipped outright: with the running max still
-    // finite_min, exp(finite_min - finite_min) == 1 would poison the sum
-    // (can only happen at verify width; a decode query attends every key).
+    // simd_sum counts every key NL times. A tile with no valid key is
+    // skipped outright: with the running max still finite_min,
+    // exp(finite_min - finite_min) == 1 would poison the sum (happens past
+    // a query's causal limit at verify width, or below row_start on a
+    // left-padded row).
     float vs[QPS][C / NE];
     for (short p = 0; p < QPS; p++) {
       m_tile[p] = simd_max(m_tile[p]);

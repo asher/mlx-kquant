@@ -10,6 +10,16 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `route_shed(indices, scores, slot_table)`: GPU-side routed-expert slot
   remap plus residency shed for streamed MoE decode; non-resident experts
   are shed and reported (miss ids and scores) without a host sync.
+- `sdpa_decode_gqa` optional `starts` (int32 [B]): per-batch-row key start
+  offsets for left-padded batched KV caches; padded-out key chunks are
+  skipped, not staged.
+- `sdpa_decode_gqa` q8 KV operands (affine wire, bits 8, group 64): batched
+  decode attends over quantized KV directly, dequantizing on the staged
+  tile; up to 1.9x/call at depth vs dequantize-then-attend.
+- Env-gated small-M qmm experiment kernels (`KQ_QMM_SPLITK`,
+  `KQ_QMM_SPLITK_NAX`, `KQ_MV_EXT_SB`, `KQ_MV_EXT_NX`, `KQ_MV_EXT_HD`):
+  the NAX split-K path lifts the collapsed M9-16 band 65-76%; the rest
+  measured flat to negative on M5 and stay off by default.
 
 ## [0.3.7]
 
