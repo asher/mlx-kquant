@@ -36,6 +36,18 @@ pytestmark = pytest.mark.skipif(
     reason="kq.dsa_sparse_attention is a Metal-only kernel; no CPU path.",
 )
 
+# Hosted-CI macOS runners expose a paravirtualized Metal device whose backend
+# compiler transiently fails the heaviest pipeline build in this suite (the
+# non-split bf16 bk256 instantiation) at first touch: "Unable to load kernel
+# ... Compilation failed", while the same pipeline compiles fine moments
+# later. Real hardware never reports a paravirtual device name, so this
+# gates only virtualized runners; every case keeps real-GPU coverage.
+try:
+    _DEVICE_NAME = str(mx.device_info().get("device_name", ""))
+except Exception:
+    _DEVICE_NAME = ""
+_VIRTUAL_GPU = "paravirtual" in _DEVICE_NAME.lower()
+
 REL_BOUND = {mx.bfloat16: 5e-3, mx.float16: 2e-3}
 
 H, D = 64, 512  # kernel geometry (fixed by the instantiations)
@@ -147,6 +159,14 @@ CASES = [
 @pytest.mark.parametrize("case", CASES, ids=[c[0] for c in CASES])
 def test_dsa_sparse_attention(case, dtype):
     name, qL, localL, P, topk_n, q_offset, ratio, window, mode = case
+    # qL > 4 forces the non-split route; topk_n > 128 selects the bk256
+    # tile: together the exact set of cases that first-touch the pipeline
+    # the paravirtual backend flakes on.
+    if _VIRTUAL_GPU and dtype == mx.bfloat16 and topk_n > 128 and qL > 4:
+        pytest.skip(
+            "paravirtual Metal: transient backend-compile failure "
+            "on the bf16 bk256 pipeline; covered on real GPUs"
+        )
     rel = _case(
         qL,
         localL,
