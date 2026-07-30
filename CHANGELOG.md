@@ -6,6 +6,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- Zero-copy GGUF load of tensors whose wire bytes exceed 2 GiB (e.g. the
+  expert stacks of a many-hundred-expert MoE): these silently fell back to
+  an eager per-tensor memcpy, exhausting memory at load on over-RAM models.
+
 ## [0.3.8]
 
 Batched and shared-prefix decode attention: cascade, paged sparse, q8 KV

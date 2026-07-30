@@ -106,8 +106,13 @@ const char* zc_dtype_name(mx::Dtype d) {
 // newBufferWithBytesNoCopy), then slices/reshapes to the tensor - all no-copy.
 // The window array's deleter releases that buffer and drops a ref to the
 // captured gguf_ctx, so the mmap survives exactly as long as some viewing array
-// does. Returns nullopt when a no-copy wrap isn't possible (unaligned window or
-// >INT32_MAX elements past the page-aligned base); the caller then memcpy's.
+// does. A tensor with more elements than INT32_MAX at its own dtype (mx::Shape
+// is int32 - e.g. a >2 GB uint8 expert wire stack of a many-hundred-expert
+// MoE) is window-sliced at a wider integer dtype and view()ed back at the end;
+// slice and view both stay buffer-sharing on the contiguous window, so that
+// path is still no-copy. Returns nullopt when no wrap is possible (unaligned
+// window, or the last dim / offsets don't divide at any wide dtype either);
+// the caller then memcpy's.
 //
 // Alignment reasoning: gguflib mmaps at a page-aligned base and GGUF tensor
 // data sits at a 32-byte-aligned file offset, so `wd` is 32-aligned -> win_off
@@ -136,12 +141,40 @@ std::optional<mx::array> try_zero_copy_array(
   }
 
   const size_t win_bytes = win_off + nbytes;
-  const size_t win_elems = win_bytes / isz;
-  const size_t off_elems = win_off / isz;
-  const size_t num_elems = nbytes / isz;
-  if (win_elems > static_cast<size_t>(std::numeric_limits<int>::max())) {
-    return std::nullopt; // mx::Shape elements are int32.
+  const size_t int_max = static_cast<size_t>(std::numeric_limits<int>::max());
+
+  // Dtype the 1-D window is built and sliced at: normally the tensor's own,
+  // widened when the element count would overflow int32 shape dims.
+  mx::Dtype win_dtype = dtype;
+  size_t win_isz = isz;
+  if (win_bytes / isz > int_max) {
+    const size_t last_bytes =
+        shape.empty() ? 0 : static_cast<size_t>(shape.back()) * isz;
+    const std::pair<size_t, mx::Dtype> wide[] = {
+        {8, mx::uint64}, {4, mx::uint32}, {2, mx::uint16}};
+    bool widened = false;
+    for (const auto& [w, dt] : wide) {
+      if (w <= isz || last_bytes == 0) {
+        break;
+      }
+      if (win_off % w != 0 || nbytes % w != 0 || last_bytes % w != 0) {
+        continue;
+      }
+      if (win_bytes / w > int_max) {
+        continue;
+      }
+      win_dtype = dt;
+      win_isz = w;
+      widened = true;
+      break;
+    }
+    if (!widened) {
+      return std::nullopt;
+    }
   }
+  const size_t win_elems = win_bytes / win_isz;
+  const size_t off_elems = win_off / win_isz;
+  const size_t num_elems = nbytes / win_isz;
 
   mx::allocator::Buffer buf =
       mx::allocator::make_buffer(reinterpret_cast<void*>(win_base), win_bytes);
@@ -154,12 +187,18 @@ std::optional<mx::array> try_zero_copy_array(
     zc_unregister(addr);
     mx::allocator::release(b);
   };
-  mx::array window(buf, mx::Shape{static_cast<int>(win_elems)}, dtype, del);
+  mx::array window(buf, mx::Shape{static_cast<int>(win_elems)}, win_dtype, del);
   mx::array view = mx::slice(
       window,
       mx::Shape{static_cast<int>(off_elems)},
       mx::Shape{static_cast<int>(off_elems + num_elems)});
-  return mx::reshape(view, shape);
+  if (win_isz == isz) {
+    return mx::reshape(view, shape);
+  }
+  mx::Shape wide_shape = shape;
+  wide_shape.back() = static_cast<mx::ShapeElem>(
+      static_cast<size_t>(shape.back()) * isz / win_isz);
+  return mx::view(mx::reshape(view, wide_shape), dtype);
 }
 
 // Map a GGUF tensor type to one of the extension's supported codecs, or
