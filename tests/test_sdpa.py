@@ -390,7 +390,7 @@ def _check_fa(D, qL, kL, dtype, Hkv=4, G=6, strided=False, splits=0):
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("D", [256, 512])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 @pytest.mark.parametrize("qL", [2, 3, 4, 5, 6])
 def test_sdpa_fa_verify(D, qL, dtype):
     _check_fa(D, qL, kL=4096, dtype=dtype, G=4)
@@ -402,7 +402,7 @@ def test_sdpa_fa_verify_qwen_geometry():
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("D", [256, 512])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_sdpa_fa_verify_decode(D, dtype):
     # q_len == 1: plain GQA decode on the matrix units (every folded row
     # attends the full KV). 122b shape: G16 x qL1 at hd256, 2 kv heads;
@@ -415,39 +415,39 @@ def test_sdpa_fa_verify_gemma_geometry():
     _check_fa(512, 4, kL=8192, dtype=mx.bfloat16, Hkv=4, G=8)
 
 
-@pytest.mark.parametrize("D", [256, 512])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_sdpa_fa_verify_full_tile(D):
     # n_rows == 32 fills the tile exactly (no padding rows), qL at the cap
     _check_fa(D, 8, kL=4096, dtype=mx.bfloat16, Hkv=2, G=4)
 
 
-@pytest.mark.parametrize("D", [256, 512])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_sdpa_fa_verify_partial_warp(D):
     # n_rows == 18: the third row strip covers rows 16..17 plus padding
     _check_fa(D, 6, kL=2048, dtype=mx.bfloat16, G=3)
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("D", [256, 512])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_sdpa_fa_verify_strided_unaligned(D, dtype):
     # strided KV-cache prefix + a key length off every tile/split boundary
     _check_fa(D, 4, kL=3071, dtype=dtype, strided=True, splits=16)
 
 
-@pytest.mark.parametrize("D", [256, 512])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_sdpa_fa_verify_short_kv(D):
     # kL small enough that most splits stage zero keys: their empty partials
     # (max = finite_min, sum = 0) must merge as weight zero
     _check_fa(D, 4, kL=17, dtype=mx.bfloat16, splits=16, G=6)
 
 
-@pytest.mark.parametrize("D", [256, 512])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_sdpa_fa_verify_min_kv(D):
     # kL == qL floor: row 0 attends exactly one key, every row masked hard
     _check_fa(D, 4, kL=4, dtype=mx.bfloat16, G=6)
 
 
-@pytest.mark.parametrize("D", [256, 512])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_sdpa_fa_verify_causal_split_straddle(D):
     # the last qL keys straddle a split boundary (splits=128, kL=4098 puts
     # keys 4096..4097 alone in the final split): that split is entirely past
@@ -471,6 +471,15 @@ def test_sdpa_fa_verify_bq64_padded(G, qL):
 
 def test_sdpa_fa_verify_bq64_strided_kv():
     _check_fa(256, 4, kL=3071, dtype=mx.bfloat16, Hkv=2, G=16, strided=True, splits=16)
+
+
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("G", [32, 64])
+def test_sdpa_fa_verify_cascade_fold(D, G):
+    # shared-prefix cascade: B batch rows folded kv-head-major into the row
+    # axis at q_len 1 (every row attends the full prefix); G=64 fills the
+    # BQ=64 tile at the register-resident head dims
+    _check_fa(D, 1, kL=6144, dtype=mx.bfloat16, Hkv=2, G=G)
 
 
 def test_sdpa_fa_verify_lazy_strided_q():
@@ -509,3 +518,148 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_sdpa_return_lse_matches_reference():
+    B, Hq, Hkv, D, S = 2, 32, 8, 128, 3001
+    q, k, v = _make(B, Hq, Hkv, 1, S, D, mx.bfloat16, seed=11, strided=False)
+    scale = 1.0 / (D**0.5)
+    o, lse = kq.sdpa_decode_gqa(q, k, v, scale, return_lse=True)
+    o0 = kq.sdpa_decode_gqa(q, k, v, scale)
+    kr = mx.repeat(k, Hq // Hkv, axis=1).astype(mx.float32)
+    s_ref = (q.astype(mx.float32) * scale) @ kr.swapaxes(-1, -2)
+    lse_ref = mx.logsumexp(s_ref[:, :, 0, :], axis=-1)[..., None]
+    _eval_or_skip(o, lse, o0, lse_ref)
+    assert lse.shape == (B, Hq, 1) and lse.dtype == mx.float32
+    assert float(mx.abs(o - o0).max()) == 0.0
+    assert float(mx.abs(lse - lse_ref).max()) < 2e-2
+
+
+def test_sdpa_fa_verify_return_lse():
+    q, k, v = _make(1, 8, 8, 32, 2048, 128, mx.bfloat16, seed=12, strided=False)
+    scale = 1.0 / (128**0.5)
+    o, lse = kq.sdpa_fa_verify(q, k, v, scale, 1, return_lse=True)
+    o0 = kq.sdpa_fa_verify(q, k, v, scale, 1)
+    s_ref = (q.astype(mx.float32) * scale) @ k.astype(mx.float32).swapaxes(-1, -2)
+    lse_ref = mx.logsumexp(s_ref, axis=-1)
+    _eval_or_skip(o, lse, o0, lse_ref)
+    assert lse.shape == (1, 8, 32) and lse.dtype == mx.float32
+    assert float(mx.abs(o - o0).max()) == 0.0
+    assert float(mx.abs(lse - lse_ref).max()) < 2e-2
+
+
+def test_sdpa_cascade_lse_merge():
+    # shared-prefix cascade: fa fold over the shared block plus a per-row
+    # private call, LSE-merged, must match one call over the concatenated KV
+    B, Hq, Hkv, D = 4, 32, 8, 128
+    gqa = Hq // Hkv
+    P, Sp = 4096, 384
+    scale = 1.0 / (D**0.5)
+    q, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, mx.bfloat16, seed=13, strided=False)
+    q = mx.random.normal((B, Hq, 1, D)).astype(mx.bfloat16) * 0.5
+    _, k_pr, v_pr = _make(B, Hq, Hkv, 1, Sp, D, mx.bfloat16, seed=14, strided=False)
+    k_full = mx.concatenate([mx.broadcast_to(k_sh, (B, Hkv, P, D)), k_pr], axis=2)
+    v_full = mx.concatenate([mx.broadcast_to(v_sh, (B, Hkv, P, D)), v_pr], axis=2)
+    ref = kq.sdpa_decode_gqa(q, mx.contiguous(k_full), mx.contiguous(v_full), scale)
+    qf = mx.contiguous(
+        q[:, :, 0, :]
+        .reshape(B, Hkv, gqa, D)
+        .transpose(1, 0, 2, 3)
+        .reshape(1, Hkv, B * gqa, D)
+    )
+    o_f, l_f = kq.sdpa_fa_verify(qf, k_sh, v_sh, scale, 1, return_lse=True)
+    o_sh = o_f.reshape(1, Hkv, B, gqa, D)[0].transpose(1, 0, 2, 3).reshape(B, Hq, 1, D)
+    l_sh = l_f.reshape(1, Hkv, B, gqa)[0].transpose(1, 0, 2).reshape(B, Hq, 1)
+    o_pr, l_pr = kq.sdpa_decode_gqa(q, k_pr, v_pr, scale, return_lse=True)
+    m = mx.maximum(l_sh, l_pr)
+    w_sh = mx.exp(l_sh - m)[..., None]
+    w_pr = mx.exp(l_pr - m)[..., None]
+    merged = (
+        (o_sh.astype(mx.float32) * w_sh + o_pr.astype(mx.float32) * w_pr)
+        / (w_sh + w_pr)
+    ).astype(q.dtype)
+    _eval_or_skip(merged, ref)
+    rel = _rel(merged, ref)
+    assert rel < REL_BOUND[mx.bfloat16], f"cascade merge rel {rel:.3e}"
+
+
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_sdpa_cascade_fused_matches_concat(D, dtype):
+    # fused cascade op == one sdpa_decode_gqa call over the concatenated KV
+    B, Hq, Hkv = 4, 32, 8
+    P, Sp = 3071, 257
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, dtype, seed=21, strided=False)
+    q, k_pr, v_pr = _make(B, Hq, Hkv, 1, Sp, D, dtype, seed=22, strided=False)
+    k_full = mx.contiguous(
+        mx.concatenate([mx.broadcast_to(k_sh, (B, Hkv, P, D)), k_pr], axis=2)
+    )
+    v_full = mx.contiguous(
+        mx.concatenate([mx.broadcast_to(v_sh, (B, Hkv, P, D)), v_pr], axis=2)
+    )
+    ref = kq.sdpa_decode_gqa(q, k_full, v_full, scale)
+    got = kq.sdpa_decode_gqa_cascade(q, k_sh, v_sh, k_pr, v_pr, scale)
+    _eval_or_skip(got, ref)
+    rel = _rel(got, ref)
+    print(f"  [cascade] fused D={D} {dtype}: rel={rel:.3e}")
+    assert rel < REL_BOUND[dtype], f"fused cascade rel {rel:.3e}"
+
+
+def test_sdpa_cascade_fused_starts():
+    # per-row private left-pad: keys below starts[b] in the PRIVATE region
+    # are excluded; the shared prefix is always fully attended
+    B, Hq, Hkv, D = 4, 32, 8, 128
+    P, Sp = 2048, 384
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, mx.bfloat16, seed=23, strided=False)
+    q, k_pr, v_pr = _make(B, Hq, Hkv, 1, Sp, D, mx.bfloat16, seed=24, strided=False)
+    starts = mx.array([0, 7, 133, Sp - 1], dtype=mx.int32)
+    got = kq.sdpa_decode_gqa_cascade(q, k_sh, v_sh, k_pr, v_pr, scale, starts=starts)
+    k_full = mx.concatenate([mx.broadcast_to(k_sh, (B, Hkv, P, D)), k_pr], axis=2)
+    v_full = mx.concatenate([mx.broadcast_to(v_sh, (B, Hkv, P, D)), v_pr], axis=2)
+    pos = mx.arange(P + Sp)[None, :]
+    keep = pos >= (starts[:, None] + P)
+    keep = mx.logical_or(pos < P, keep)
+    bias = mx.where(keep, mx.zeros(keep.shape), mx.full(keep.shape, -mx.inf))
+    kr = mx.repeat(k_full, Hq // Hkv, axis=1).astype(mx.float32)
+    vr = mx.repeat(v_full, Hq // Hkv, axis=1).astype(mx.float32)
+    s_ref = (q.astype(mx.float32) * scale) @ kr.swapaxes(-1, -2)
+    s_ref = s_ref + bias[:, None, None, :]
+    ref = mx.softmax(s_ref, axis=-1) @ vr
+    _eval_or_skip(got, ref)
+    rel = _rel(got.astype(mx.float32), ref)
+    assert rel < REL_BOUND[mx.bfloat16], f"cascade starts rel {rel:.3e}"
+
+
+def test_sdpa_cascade_fused_return_lse():
+    B, Hq, Hkv, D = 2, 16, 8, 128
+    P, Sp = 1023, 65
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, mx.bfloat16, seed=25, strided=False)
+    q, k_pr, v_pr = _make(B, Hq, Hkv, 1, Sp, D, mx.bfloat16, seed=26, strided=False)
+    o, lse = kq.sdpa_decode_gqa_cascade(
+        q, k_sh, v_sh, k_pr, v_pr, scale, return_lse=True
+    )
+    o0 = kq.sdpa_decode_gqa_cascade(q, k_sh, v_sh, k_pr, v_pr, scale)
+    k_full = mx.concatenate([mx.broadcast_to(k_sh, (B, Hkv, P, D)), k_pr], axis=2)
+    kr = mx.repeat(k_full, Hq // Hkv, axis=1).astype(mx.float32)
+    s_ref = (q.astype(mx.float32) * scale) @ kr.swapaxes(-1, -2)
+    lse_ref = mx.logsumexp(s_ref[:, :, 0, :], axis=-1)[..., None]
+    _eval_or_skip(o, lse, o0, lse_ref)
+    assert lse.shape == (B, Hq, 1) and lse.dtype == mx.float32
+    assert float(mx.abs(o - o0).max()) == 0.0
+    assert float(mx.abs(lse - lse_ref).max()) < 2e-2
+
+
+def test_sdpa_cascade_fused_validation():
+    B, Hq, Hkv, D = 2, 16, 8, 128
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, 512, D, mx.bfloat16, seed=27, strided=False)
+    q, k_pr, v_pr = _make(B, Hq, Hkv, 1, 64, D, mx.bfloat16, seed=28, strided=False)
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_cascade(q, k_pr, v_pr, k_pr, v_pr, scale)  # shared B != 1
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_cascade(
+            q, k_sh, v_sh, k_pr[:, :, :0, :], v_pr[:, :, :0, :], scale
+        )  # empty private region

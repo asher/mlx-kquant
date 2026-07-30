@@ -20,6 +20,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `KQ_QMM_SPLITK_NAX`, `KQ_MV_EXT_SB`, `KQ_MV_EXT_NX`, `KQ_MV_EXT_HD`):
   the NAX split-K path lifts the collapsed M9-16 band 65-76%; the rest
   measured flat to negative on M5 and stay off by default.
+- `sdpa_decode_gqa_cascade`: fused shared-prefix batched decode; one KV
+  walk serves the shared prefix for every batch row, private suffixes read
+  per row. 1.6-4.2x vs per-row calls at P 14k-32k, hd128/hd256.
+- `sdpa_fa_verify` head_dim 64/128 tiles; `return_lse` on
+  `sdpa_decode_gqa` and `sdpa_fa_verify`.
 
 ## [0.3.7]
 

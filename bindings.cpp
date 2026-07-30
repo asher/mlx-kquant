@@ -199,7 +199,52 @@ NB_MODULE(_ext, m) {
 
   m.def(
       "sdpa_decode_gqa",
-      &mlx_kquant::sdpa_decode_gqa,
+      [](mx::array q,
+         mx::array k,
+         mx::array v,
+         float scale,
+         const std::optional<mx::array>& sinks,
+         int splits,
+         int tile_c,
+         const std::optional<mx::array>& starts,
+         const std::optional<mx::array>& k_scales,
+         const std::optional<mx::array>& k_biases,
+         const std::optional<mx::array>& v_scales,
+         const std::optional<mx::array>& v_biases,
+         bool return_lse,
+         mx::StreamOrDevice s) -> nb::object {
+        if (return_lse) {
+          auto outs = mlx_kquant::sdpa_decode_gqa_lse(
+              std::move(q),
+              std::move(k),
+              std::move(v),
+              scale,
+              sinks,
+              splits,
+              tile_c,
+              starts,
+              k_scales,
+              k_biases,
+              v_scales,
+              v_biases,
+              s);
+          return nb::make_tuple(outs[0], outs[1]);
+        }
+        return nb::cast(mlx_kquant::sdpa_decode_gqa(
+            std::move(q),
+            std::move(k),
+            std::move(v),
+            scale,
+            sinks,
+            splits,
+            tile_c,
+            starts,
+            k_scales,
+            k_biases,
+            v_scales,
+            v_biases,
+            s));
+      },
       "q"_a,
       "k"_a,
       "v"_a,
@@ -213,6 +258,7 @@ NB_MODULE(_ext, m) {
       "v_scales"_a = nb::none(),
       "v_biases"_a = nb::none(),
       nb::kw_only(),
+      "return_lse"_a = false,
       "stream"_a = nb::none(),
       R"(
         Decode/verify GQA attention tuned for long KV caches: the key axis
@@ -244,12 +290,37 @@ NB_MODULE(_ext, m) {
                 kL). Out-of-range values read as an empty row (zero output).
 
         Returns:
-            array: attention output [B, n_q_heads, qL, D].
+            array: attention output [B, n_q_heads, qL, D]. With
+            ``return_lse=True``, a tuple ``(out, lse)`` where lse
+            [B, n_q_heads, qL] float32 is the natural-log softmax
+            normalizer per query row (the merge weight for combining
+            attention over disjoint key regions).
       )");
 
   m.def(
       "sdpa_fa_verify",
-      &mlx_kquant::sdpa_fa_verify,
+      [](mx::array q,
+         mx::array k,
+         mx::array v,
+         float scale,
+         int q_len,
+         int splits,
+         bool return_lse,
+         mx::StreamOrDevice s) -> nb::object {
+        if (return_lse) {
+          auto outs = mlx_kquant::sdpa_fa_verify_lse(
+              std::move(q),
+              std::move(k),
+              std::move(v),
+              scale,
+              q_len,
+              splits,
+              s);
+          return nb::make_tuple(outs[0], outs[1]);
+        }
+        return nb::cast(mlx_kquant::sdpa_fa_verify(
+            std::move(q), std::move(k), std::move(v), scale, q_len, splits, s));
+      },
       "q"_a,
       "k"_a,
       "v"_a,
@@ -257,6 +328,7 @@ NB_MODULE(_ext, m) {
       "q_len"_a,
       "splits"_a = 0,
       nb::kw_only(),
+      "return_lse"_a = false,
       "stream"_a = nb::none(),
       R"(
         Speculative-verify attention on the GPU matrix units for a GQA-folded
@@ -272,8 +344,8 @@ NB_MODULE(_ext, m) {
 
         Args:
             q (array): folded queries [1, n_kv_heads, G*q_len, D],
-                float16/bfloat16; D = 256 or 512; G*q_len <= 64 at D=256,
-                <= 32 at D=512.
+                float16/bfloat16; D = 64, 128, 256 or 512; G*q_len <= 64
+                except <= 32 at D=512.
             k (array): keys [1, n_kv_heads, kL, D]; head/seq strided is fine
                 (read in place), the head_dim must be contiguous.
             v (array): values [1, n_kv_heads, kL, D].
@@ -284,7 +356,86 @@ NB_MODULE(_ext, m) {
             splits (int): key-axis split count; 0 picks the default.
 
         Returns:
-            array: attention output [1, n_kv_heads, G*q_len, D].
+            array: attention output [1, n_kv_heads, G*q_len, D]. With
+            ``return_lse=True``, a tuple ``(out, lse)`` where lse
+            [1, n_kv_heads, G*q_len] float32 is the natural-log softmax
+            normalizer per folded row (cascade merge weight).
+      )");
+
+  m.def(
+      "sdpa_decode_gqa_cascade",
+      [](mx::array q,
+         mx::array k_shared,
+         mx::array v_shared,
+         mx::array k_priv,
+         mx::array v_priv,
+         float scale,
+         const std::optional<mx::array>& starts,
+         int splits_shared,
+         int splits_priv,
+         int tile_c,
+         bool return_lse,
+         mx::StreamOrDevice s) -> nb::object {
+        auto outs = mlx_kquant::sdpa_decode_gqa_cascade(
+            std::move(q),
+            std::move(k_shared),
+            std::move(v_shared),
+            std::move(k_priv),
+            std::move(v_priv),
+            scale,
+            starts,
+            splits_shared,
+            splits_priv,
+            tile_c,
+            return_lse,
+            s);
+        if (return_lse) {
+          return nb::make_tuple(outs[0], outs[1]);
+        }
+        return nb::cast(outs[0]);
+      },
+      "q"_a,
+      "k_shared"_a,
+      "v_shared"_a,
+      "k_priv"_a,
+      "v_priv"_a,
+      "scale"_a,
+      "starts"_a = nb::none(),
+      "splits_shared"_a = 0,
+      "splits_priv"_a = 0,
+      "tile_c"_a = 0,
+      nb::kw_only(),
+      "return_lse"_a = false,
+      "stream"_a = nb::none(),
+      R"(
+        Fused shared-prefix (cascade) decode attention: every batch row
+        attends one COMMON prefix, stored once, plus its own private
+        suffix. The shared region is walked ONCE for all B*gqa query rows
+        on the matrix-unit row tile; the private region runs per row (with
+        optional left-pad ``starts``); both partial sets fold through a
+        single merge pass. Equivalent to ``sdpa_decode_gqa`` over the
+        concatenated KV, reading the prefix once instead of B times.
+
+        Args:
+            q (array): queries [B, n_q_heads, 1, D], float16/bfloat16;
+                D in {64, 128, 256, 512}; gqa <= 16; B*gqa <= 64 (<= 32 at
+                D=512).
+            k_shared (array): shared prefix keys [1, n_kv_heads, P, D].
+            v_shared (array): shared prefix values [1, n_kv_heads, P, D].
+            k_priv (array): private suffix keys [B, n_kv_heads, Sp, D],
+                Sp >= 1.
+            v_priv (array): private suffix values [B, n_kv_heads, Sp, D].
+            scale (float): query scale (typically 1/sqrt(D)).
+            starts (array, optional): int32 [B] per-row private-region key
+                start offsets (left-padded private suffixes).
+            splits_shared (int): shared-region split count; 0 = default.
+            splits_priv (int): private-region split count; 0 = default.
+            tile_c (int): private-pass staged tile height; 0 picks by
+                head_dim.
+
+        Returns:
+            array: attention output [B, n_q_heads, 1, D]. With
+            ``return_lse=True``, a tuple ``(out, lse)``.
       )");
 
   m.def(

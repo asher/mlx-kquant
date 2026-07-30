@@ -180,6 +180,25 @@ mx::array sdpa_decode_gqa(
     const std::optional<mx::array>& v_biases = std::nullopt,
     mx::StreamOrDevice s = {});
 
+// sdpa_decode_gqa returning {out, lse}: lse [B, n_q_heads, qL] float32 is
+// the natural-log softmax normalizer per query row (sinks included when
+// present) -- the merge weight for combining attention over disjoint key
+// regions (shared-prefix cascade).
+std::vector<mx::array> sdpa_decode_gqa_lse(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    const std::optional<mx::array>& sinks = std::nullopt,
+    int splits = 0,
+    int tile_c = 32,
+    const std::optional<mx::array>& starts = std::nullopt,
+    const std::optional<mx::array>& k_scales = std::nullopt,
+    const std::optional<mx::array>& k_biases = std::nullopt,
+    const std::optional<mx::array>& v_scales = std::nullopt,
+    const std::optional<mx::array>& v_biases = std::nullopt,
+    mx::StreamOrDevice s = {});
+
 // Speculative-verify attention on the GPU matrix units for a GQA-folded query
 // tile. The caller folds q [B, Hq, qL, D] -> [B, Hkv, G*qL, D] (kv-major
 // heads) and passes the original qL, so folded row r is causally clamped to
@@ -191,6 +210,41 @@ mx::array sdpa_decode_gqa(
 // read in place via their head/seq strides (head_dim contiguous). `splits` 0
 // picks the default. Metal-only.
 mx::array sdpa_fa_verify(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    int q_len,
+    int splits = 0,
+    mx::StreamOrDevice s = {});
+
+// Fused shared-prefix cascade decode attention. Every batch row attends one
+// COMMON prefix (stored once, [1, Hkv, P, D]) plus its own private suffix
+// ([B, Hkv, Sp, D], optional per-row `starts` for left padding). Internally:
+// the fa row-tile pass walks the shared prefix ONCE for all B*gqa folded
+// query rows, the decode pass covers the private region per row, and both
+// partial sets fold through one merge pass (the splits machinery is the LSE
+// merge). Equivalent to sdpa_decode_gqa over the concatenated KV, reading
+// the prefix once instead of B times. q [B, Hq, 1, D]; B*gqa <= 64 (32 at
+// head_dim 512); gqa <= 16; Sp >= 1. Returns {out} or {out, lse} with
+// return_lse. Metal-only.
+std::vector<mx::array> sdpa_decode_gqa_cascade(
+    mx::array q,
+    mx::array k_shared,
+    mx::array v_shared,
+    mx::array k_priv,
+    mx::array v_priv,
+    float scale,
+    const std::optional<mx::array>& starts = std::nullopt,
+    int splits_shared = 0,
+    int splits_priv = 0,
+    int tile_c = 0,
+    bool return_lse = false,
+    mx::StreamOrDevice s = {});
+
+// sdpa_fa_verify returning {out, lse}: lse [B, Hkv, n_rows] float32 is the
+// natural-log softmax normalizer per folded row (cascade merge weight).
+std::vector<mx::array> sdpa_fa_verify_lse(
     mx::array q,
     mx::array k,
     mx::array v,
@@ -705,14 +759,16 @@ class KQuantSDPAGQA : public mx::Primitive {
       int tile_c,
       bool has_sinks,
       bool has_starts,
-      bool has_kv_q8 = false)
+      bool has_kv_q8 = false,
+      bool return_lse = false)
       : mx::Primitive(stream),
         scale_(scale),
         splits_(splits),
         tile_c_(tile_c),
         has_sinks_(has_sinks),
         has_starts_(has_starts),
-        has_kv_q8_(has_kv_q8) {}
+        has_kv_q8_(has_kv_q8),
+        return_lse_(return_lse) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -736,6 +792,7 @@ class KQuantSDPAGQA : public mx::Primitive {
   bool has_sinks_;
   bool has_starts_;
   bool has_kv_q8_;
+  bool return_lse_;
 };
 
 // Simdgroup-matrix FA verify attention (see sdpa_fa_verify). Inference-only.
@@ -745,8 +802,13 @@ class KQuantSDPAFAVerify : public mx::Primitive {
       mx::Stream stream,
       float scale,
       int q_len,
-      int splits)
-      : mx::Primitive(stream), scale_(scale), q_len_(q_len), splits_(splits) {}
+      int splits,
+      bool return_lse = false)
+      : mx::Primitive(stream),
+        scale_(scale),
+        q_len_(q_len),
+        splits_(splits),
+        return_lse_(return_lse) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -767,6 +829,51 @@ class KQuantSDPAFAVerify : public mx::Primitive {
   float scale_;
   int q_len_;
   int splits_;
+  bool return_lse_;
+};
+
+// Fused shared-prefix cascade attention (see sdpa_decode_gqa_cascade).
+// Inference-only.
+class KQuantSDPACascade : public mx::Primitive {
+ public:
+  explicit KQuantSDPACascade(
+      mx::Stream stream,
+      float scale,
+      int splits_shared,
+      int splits_priv,
+      int tile_c,
+      bool has_starts,
+      bool return_lse)
+      : mx::Primitive(stream),
+        scale_(scale),
+        splits_shared_(splits_shared),
+        splits_priv_(splits_priv),
+        tile_c_(tile_c),
+        has_starts_(has_starts),
+        return_lse_(return_lse) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSDPACascade";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int splits_shared_;
+  int splits_priv_;
+  int tile_c_;
+  bool has_starts_;
+  bool return_lse_;
 };
 
 // Fused MoE GLU gather (see moe_glu_gather). Inference-only.

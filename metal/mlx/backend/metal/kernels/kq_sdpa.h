@@ -21,6 +21,12 @@ constant bool gqa_has_starts [[function_constant(4)]];
 // cooperative tile stage dequants into sK/sV -- everything downstream of
 // the stage is unchanged. Compiled out when false.
 constant bool gqa_kv_q8 [[function_constant(5)]];
+constant bool gqa_write_lse [[function_constant(6)]];
+// Cascade merge: a second partials set (the shared-prefix region, written by
+// the fa row-tile pass in its folded [1, Hkv, B*gqa, splits2, D] layout)
+// folds into the same online-softmax reduction as the primary set. Compiled
+// out when false.
+constant bool gqa_cascade [[function_constant(7)]];
 
 template <typename T, int D, int V = D>
 [[kernel]] void kq_sdpa_vector_2pass_1(
@@ -1029,6 +1035,12 @@ template <typename T, int D>
     const device float* sinks [[buffer(3)]],
     device T* out [[buffer(4)]],
     const constant int& n_q_heads [[buffer(5)]],
+    device float* out_lse [[buffer(6)]],
+    const device float* partials2 [[buffer(7)]],
+    const device float* sums2 [[buffer(8)]],
+    const device float* maxs2 [[buffer(9)]],
+    const constant int& cascade_splits [[buffer(10)]],
+    const constant int& cascade_gqa [[buffer(11)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -1042,11 +1054,27 @@ template <typename T, int D>
   sums += base * gqa_splits;
   maxs += base * gqa_splits;
 
+  // Second set: fa folded layout, row = kv*(B*gqa) + b*gqa + g.
+  int splits2 = 0;
+  if (gqa_cascade) {
+    const int kv = head_idx / cascade_gqa;
+    const int g = head_idx % cascade_gqa;
+    const size_t row = ((size_t)kv * tpg.y + batch_idx) * cascade_gqa + g;
+    splits2 = cascade_splits;
+    partials2 += row * splits2 * D;
+    sums2 += row * splits2;
+    maxs2 += row * splits2;
+  }
+
   threadgroup float ws[128];
+  threadgroup float ws2[128];
 
   float m = Limits<float>::finite_min;
   for (int s = simd_lid; s < gqa_splits; s += 32) {
     m = max(m, maxs[s]);
+  }
+  for (int s = simd_lid; s < splits2; s += 32) {
+    m = max(m, maxs2[s]);
   }
   m = simd_max(m);
   if (gqa_has_sinks) {
@@ -1058,6 +1086,11 @@ template <typename T, int D>
     const float w = fast::exp(maxs[s] - m);
     ws[s] = w;
     denom += w * sums[s];
+  }
+  for (int s = simd_lid; s < splits2; s += 32) {
+    const float w = fast::exp(maxs2[s] - m);
+    ws2[s] = w;
+    denom += w * sums2[s];
   }
   denom = simd_sum(denom);
   if (gqa_has_sinks) {
@@ -1072,8 +1105,19 @@ template <typename T, int D>
       acc[e] += w * partials[s * D + e * 32 + simd_lid];
     }
   }
+  for (int s = 0; s < splits2; s++) {
+    const float w = ws2[s];
+    for (short e = 0; e < EPT; e++) {
+      acc[e] += w * partials2[s * D + e * 32 + simd_lid];
+    }
+  }
   out += base * D;
   for (short e = 0; e < EPT; e++) {
     out[e * 32 + simd_lid] = static_cast<T>(denom == 0 ? 0.0f : acc[e] / denom);
+  }
+  // Natural-log softmax normalizer (sinks included when present): the
+  // cascade merge weight for combining disjoint key regions.
+  if (gqa_write_lse && simd_lid == 0) {
+    out_lse[base] = denom == 0 ? -INFINITY : (fast::log(denom) + m);
   }
 }
