@@ -6,33 +6,38 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.8]
+
+Batched and shared-prefix decode attention: cascade, paged sparse, q8 KV
+operands, routed-expert shed.
+
 ### Added
-- `route_shed(indices, scores, slot_table)`: GPU-side routed-expert slot
-  remap plus residency shed for streamed MoE decode; non-resident experts
-  are shed and reported (miss ids and scores) without a host sync.
-- `sdpa_decode_gqa` optional `starts` (int32 [B]): per-batch-row key start
-  offsets for left-padded batched KV caches; padded-out key chunks are
-  skipped, not staged.
-- `sdpa_decode_gqa` q8 KV operands (affine wire, bits 8, group 64): batched
-  decode attends over quantized KV directly, dequantizing on the staged
-  tile; up to 1.9x/call at depth vs dequantize-then-attend.
-- Env-gated small-M qmm experiment kernels (`KQ_QMM_SPLITK`,
-  `KQ_QMM_SPLITK_NAX`, `KQ_MV_EXT_SB`, `KQ_MV_EXT_NX`, `KQ_MV_EXT_HD`):
-  the NAX split-K path lifts the collapsed M9-16 band 65-76%; the rest
-  measured flat to negative on M5 and stay off by default.
 - `sdpa_decode_gqa_cascade`: fused shared-prefix batched decode; one KV
   walk serves the shared prefix for every batch row, private suffixes read
   per row. 1.6-4.2x vs per-row calls at P 14k-32k, hd128/hd256.
-- `sdpa_fa_verify` head_dim 64/128 tiles; `return_lse` on
-  `sdpa_decode_gqa` and `sdpa_fa_verify`.
-- `sdpa_decode_gqa_paged`: page-gather decode over per-kv-head page lists
-  for top-k sparse attention, with `starts` for left-padded batch rows.
 - Verify width (qL 1-8) on the cascade op: end-aligned causal over each
   row's private slab with full shared-prefix visibility; `lse` gains the
   qL axis.
 - q8 KV operands (bits 8, group 64) on the cascade op, dequantized on the
   staged tiles in both passes; bit-exact vs the fp16 cascade on
   dequantized arrays (head_dim 512 declines).
+- `sdpa_decode_gqa` optional `starts` (int32 [B]): per-batch-row key start
+  offsets for left-padded batched KV caches; padded-out key chunks are
+  skipped, not staged.
+- `sdpa_decode_gqa` q8 KV operands (affine wire, bits 8, group 64): batched
+  decode attends over quantized KV directly, dequantizing on the staged
+  tile; up to 1.9x/call at depth vs dequantize-then-attend.
+- `sdpa_decode_gqa_paged`: page-gather decode over per-kv-head page lists
+  for top-k sparse attention, with `starts` for left-padded batch rows.
+- `sdpa_fa_verify` head_dim 64/128 tiles; `return_lse` on
+  `sdpa_decode_gqa` and `sdpa_fa_verify`.
+- `route_shed(indices, scores, slot_table)`: GPU-side routed-expert slot
+  remap plus residency shed for streamed MoE decode; non-resident experts
+  are shed and reported (miss ids and scores) without a host sync.
+- Env-gated small-M qmm experiment kernels (`KQ_QMM_SPLITK`,
+  `KQ_QMM_SPLITK_NAX`, `KQ_MV_EXT_SB`, `KQ_MV_EXT_NX`, `KQ_MV_EXT_HD`,
+  `KQ_MV_EXT_TS`): the NAX split-K path lifts the collapsed M9-16 band
+  65-76%; the rest measured flat to negative on M5 and stay off by default.
 
 ## [0.3.7]
 
