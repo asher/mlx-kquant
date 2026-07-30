@@ -66,6 +66,15 @@ Tuning levers (defaults are right for normal use):
 - `KQ_MV_EXT_NR` - `2` selects the two-rows-per-thread `mv_ext` variant (q6_k, M 5-12), which
   halves activation cache traffic but measured no faster than the shipped kernels. Kept as a probe
   for future silicon. Default `1` (shipped behavior).
+- `KQ_QMM_SPLITK_NAX` - split-K on the NAX BM=32 tile; the value is the target slice count (`1` =
+  auto 32, `0` off). Lifts the collapsed M 9-16 band 65-76% on M5 Max. q6_k/q8_0, M <= 32; read
+  live per call. Default off.
+- `KQ_QMM_SPLITK` - split-K for the plain small-M qmm (target slice count, `0` off). Measured flat
+  to negative on M5 Max; kept as a probe. K-quants plus q8_0, M <= 32. Default off.
+- `KQ_MV_EXT_SB` / `KQ_MV_EXT_NX` / `KQ_MV_EXT_HD` / `KQ_MV_EXT_TS` - `mv_ext` activation-traffic
+  experiments: shuffle-broadcast (`1`), wide nxpsg (`16`/`32`), half-precision chunk dots (`1`),
+  threadgroup-staged activations (`1`). q6_k M 4-12 only. `HD` measured +4-5% at M 8; the rest flat
+  to negative on M5 Max. Kept as probes. Default off.
 
 ## MoE GLU
 
@@ -95,8 +104,18 @@ mechanism below.
   fused vector path does not cover.
 - **`sdpa_decode_gqa`** - decode/verify GQA tuned for long KV caches: the key axis splits into coarse
   chunks streamed through threadgroup-staged K/V tiles shared by the GQA group, so device memory reads
-  the KV once per chunk.
+  the KV once per chunk. Optional `starts` (int32 `[B]`) restricts row b to keys `[starts[b], kL)` for
+  left-padded batches, skipping fully padded-out chunks. Optional affine q8 K/V operands (scales and
+  biases, bits 8, group 64) dequantize on the tile stage. `return_lse=True` adds per-row log-sum-exp.
+- **`sdpa_decode_gqa_cascade`** - shared-prefix batched decode: every row attends one common prefix
+  plus its own private suffix. The prefix is walked once for all rows on the matrix-unit tile, private
+  suffixes run per row, one merge pass folds both; 1.6-4.2x over per-row calls at 14k-32k prefixes.
+  qL 1-8 (verify width, end-aligned causal); takes `starts` and the q8 operands on either region.
+- **`sdpa_decode_gqa_paged`** - sparse page-gather decode: attends only the K/V pages listed per
+  (batch, kv-head), so cost tracks the selected keys rather than the cache length. The page unit is
+  the staged tile height (32 rows at head dim 64/128, 16 at 256, 8 at 512); takes `starts`.
 - **`sdpa_fa_verify`** - speculative-verify attention on the matrix units for a GQA-folded query tile.
+  Head dims 64 through 512; `return_lse` as above.
 
 ## DeepSeek/GLM sparse attention (DSA)
 
@@ -148,3 +167,8 @@ The zero-copy arena buffers and shared-event stream primitives (`arena_alloc`, `
 `event_wait`, `shared_event_*`, `zero_copy_view_count`, `verify_zero_copy_views`, `load_gguf`) support
 a producer/consumer decode loop and are a separate subsystem; see
 [docs/feeder/DESIGN.md](feeder/DESIGN.md).
+
+- **`route_shed`** - routed-expert slot remap plus residency shed for streamed MoE decode: expert ids
+  map to arena slots through a resident-slot table, non-resident experts are shed with their gate
+  mass renormalized onto the kept ones, and the misses come back (ids and scores) for between-token
+  prestaging. No host sync.
