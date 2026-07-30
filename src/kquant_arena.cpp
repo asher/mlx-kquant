@@ -22,8 +22,15 @@ namespace mx = mlx::core;
 
 namespace mlx_kquant {
 
-std::pair<mx::array, uintptr_t> arena_alloc(const mx::Shape& shape) {
-  size_t nbytes = 1;
+std::pair<mx::array, uintptr_t> arena_alloc(
+    const mx::Shape& shape,
+    mx::Dtype dtype) {
+  if (dtype != mx::uint8 && dtype != mx::uint16 && dtype != mx::uint32 &&
+      dtype != mx::uint64) {
+    throw std::invalid_argument(
+        "[mlx_kquant.arena_alloc] dtype must be an unsigned integer type.");
+  }
+  size_t nbytes = mx::size_of(dtype);
   for (auto d : shape) {
     if (d <= 0) {
       throw std::invalid_argument(
@@ -50,7 +57,7 @@ std::pair<mx::array, uintptr_t> arena_alloc(const mx::Shape& shape) {
     mx::allocator::release(b);
     std::free(ptr);
   };
-  mx::array arr(buf, shape, mx::uint8, del);
+  mx::array arr(buf, shape, dtype, del);
   return {std::move(arr), reinterpret_cast<uintptr_t>(ptr)};
 }
 

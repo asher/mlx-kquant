@@ -1748,7 +1748,9 @@ bool shared_event_wait(uint64_t handle, uint64_t value, int64_t timeout_ms);
 // base address (for the Python binding's writable memoryview over the same
 // bytes; valid exactly as long as the array lives). The CPU-write -> GPU-read
 // ordering contract is the caller's, via the event ops below.
-std::pair<mx::array, uintptr_t> arena_alloc(const mx::Shape& shape);
+std::pair<mx::array, uintptr_t> arena_alloc(
+    const mx::Shape& shape,
+    mlx::core::Dtype dtype = mlx::core::uint8);
 
 // Stream side: identity ops on `x` that encode an MTLSharedEvent signal/wait
 // at their position in the graph's evaluation order. The returned array

@@ -1392,9 +1392,26 @@ NB_MODULE(_ext, m) {
 
   m.def(
       "arena_alloc",
-      [](const std::vector<int>& shape) {
+      [](const std::vector<int>& shape, int itemsize) {
+        mlx::core::Dtype dt = mlx::core::uint8;
+        switch (itemsize) {
+          case 1:
+            break;
+          case 2:
+            dt = mlx::core::uint16;
+            break;
+          case 4:
+            dt = mlx::core::uint32;
+            break;
+          case 8:
+            dt = mlx::core::uint64;
+            break;
+          default:
+            throw std::invalid_argument(
+                "[mlx_kquant.arena_alloc] itemsize must be 1, 2, 4 or 8.");
+        }
         auto [arr, addr] = mlx_kquant::arena_alloc(
-            mlx::core::Shape(shape.begin(), shape.end()));
+            mlx::core::Shape(shape.begin(), shape.end()), dt);
         PyObject* mv = PyMemoryView_FromMemory(
             reinterpret_cast<char*>(addr),
             static_cast<Py_ssize_t>(arr.nbytes()),
@@ -1405,11 +1422,14 @@ NB_MODULE(_ext, m) {
         return nb::make_tuple(arr, nb::steal(mv));
       },
       "shape"_a,
+      "itemsize"_a = 1,
       R"(
         Allocate a page-aligned host buffer wrapped zero-copy as a Metal
-        shared-storage uint8 array.
+        shared-storage unsigned-integer array (dtype uint8/16/32/64 per
+        ``itemsize``; wider itemsizes let a >2 GiB slot fit int32 shape dims).
 
-        Returns (array, memoryview): the same bytes seen from both sides.
+        Returns (array, memoryview): the same bytes seen from both sides,
+        the memoryview always byte-addressed over the full allocation.
         The writable memoryview is the CPU feeder's window (os.preadv into
         slices of it reads disk straight into GPU-visible memory); the array
         is what kernels consume. The memoryview is valid only while the array
