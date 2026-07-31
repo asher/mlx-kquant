@@ -6,6 +6,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `arena_alloc` accepts `itemsize` 2/4/8 so >2 GiB staging slots fit int32
+  shape dims.
+- `residency_insert` / `residency_commit` / `residency_erase`: wire chosen
+  buffers into the Metal residency set, ending per-command-buffer re-wiring
+  of large host-pinned weights.
+
 ### Fixed
 - Zero-copy GGUF load of tensors whose wire bytes exceed 2 GiB (e.g. the
   expert stacks of a many-hundred-expert MoE): these silently fell back to
