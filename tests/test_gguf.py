@@ -141,3 +141,46 @@ def test_verify_zero_copy_views(tmp_path):
     # Unevaluated arrays are reported, not silently skipped.
     (prob,) = kq.verify_zero_copy_views([("z", a32 + 0.0)])
     assert "unevaluated" in prob
+
+
+@pytest.mark.skipif(
+    not __import__("os").environ.get("KQUANT_BIG_TESTS"),
+    reason="writes a >2 GiB GGUF; set KQUANT_BIG_TESTS=1 to run",
+)
+def test_load_gguf_wire_over_int32(tmp_path):
+    """A quantized tensor whose wire bytes exceed INT32_MAX must still load
+    zero-copy (wide-dtype window slice + view back), not fall back to the
+    eager per-tensor memcpy - which OOMs a many-hundred-expert MoE at load."""
+    import resource
+    import sys
+
+    rows, k = 247_000, 8192  # 34-byte q8_0 blocks -> 8704 B/row, ~2.15 GB
+    row_bytes = k // 32 * 34
+    nbytes = rows * row_bytes
+    assert nbytes > 2**31
+
+    rng = np.random.default_rng(0)
+    wire = rng.integers(0, 256, size=nbytes, dtype=np.uint8)
+    path = str(tmp_path / "big.gguf")
+    w = GGUFWriter(path, "smoke")
+    # add_tensor takes the byte shape; the writer derives the logical shape.
+    w.add_tensor("big.q8", wire.reshape(rows, row_bytes), raw_dtype=GT.Q8_0)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+    scale = 1 if sys.platform == "darwin" else 1024  # ru_maxrss units
+    rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale
+    arrays, codecs, _meta, _shapes = kq.load_gguf(path, True)
+    rss1 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale
+
+    a = arrays["big.q8"]
+    assert a.dtype == mx.uint8 and a.shape == (rows, row_bytes)
+    assert dict(codecs)["big.q8"] == "q8_0"
+    # The regression signature: the pre-fix path memcpy'd the wire eagerly.
+    assert rss1 - rss0 < 512 * 1024 * 1024, "load copied the wire bytes"
+
+    for i in (0, 1, rows // 2, rows - 1):
+        got = np.array(a[i])
+        assert np.array_equal(got, wire[i * row_bytes : (i + 1) * row_bytes]), i

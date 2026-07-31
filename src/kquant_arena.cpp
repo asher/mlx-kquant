@@ -18,12 +18,23 @@
 
 #include "kquant.h"
 
+#ifdef _METAL_
+#include "mlx/backend/metal/device.h"
+#endif
+
 namespace mx = mlx::core;
 
 namespace mlx_kquant {
 
-std::pair<mx::array, uintptr_t> arena_alloc(const mx::Shape& shape) {
-  size_t nbytes = 1;
+std::pair<mx::array, uintptr_t> arena_alloc(
+    const mx::Shape& shape,
+    mx::Dtype dtype) {
+  if (dtype != mx::uint8 && dtype != mx::uint16 && dtype != mx::uint32 &&
+      dtype != mx::uint64) {
+    throw std::invalid_argument(
+        "[mlx_kquant.arena_alloc] dtype must be an unsigned integer type.");
+  }
+  size_t nbytes = mx::size_of(dtype);
   for (auto d : shape) {
     if (d <= 0) {
       throw std::invalid_argument(
@@ -50,8 +61,71 @@ std::pair<mx::array, uintptr_t> arena_alloc(const mx::Shape& shape) {
     mx::allocator::release(b);
     std::free(ptr);
   };
-  mx::array arr(buf, shape, mx::uint8, del);
+  mx::array arr(buf, shape, dtype, del);
   return {std::move(arr), reinterpret_cast<uintptr_t>(ptr)};
 }
+
+#ifdef _METAL_
+
+// MLX's ResidencySet wrapper methods are not exported from libmlx; its
+// inline accessor hands back the raw MTL::ResidencySet (created at device
+// init and attached to MLX's command queue), and metal-cpp is header-only,
+// so the additions run entirely in this TU.
+static MTL::ResidencySet* kq_residency_set() {
+  auto& d = mx::metal::device(mx::Device(mx::Device::gpu));
+  return const_cast<MTL::ResidencySet*>(d.residency_set().mtl_residency_set());
+}
+
+bool residency_insert(const mx::array& a) {
+  const void* ptr = a.buffer().ptr();
+  if (ptr == nullptr) {
+    return false;
+  }
+  auto* rs = kq_residency_set();
+  if (rs == nullptr) {
+    return false;
+  }
+  rs->addAllocation(static_cast<MTL::Buffer*>(const_cast<void*>(ptr)));
+  return true;
+}
+
+bool residency_commit() {
+  auto* rs = kq_residency_set();
+  if (rs == nullptr) {
+    return false;
+  }
+  rs->commit();
+  rs->requestResidency();
+  return true;
+}
+
+bool residency_erase(const mx::array& a) {
+  const void* ptr = a.buffer().ptr();
+  if (ptr == nullptr) {
+    return false;
+  }
+  auto* rs = kq_residency_set();
+  if (rs == nullptr) {
+    return false;
+  }
+  rs->removeAllocation(static_cast<MTL::Buffer*>(const_cast<void*>(ptr)));
+  return true;
+}
+
+#else
+
+bool residency_insert(const mx::array&) {
+  return false;
+}
+
+bool residency_commit() {
+  return false;
+}
+
+bool residency_erase(const mx::array&) {
+  return false;
+}
+
+#endif
 
 } // namespace mlx_kquant

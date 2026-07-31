@@ -6,6 +6,23 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- Grid-codec mat-vec decode is faster per call via vectorized scale and
+  grid unpack (bit-exact): iq1_m 1.2-1.6x, iq2_xxs 1.2x, iq2_xs 1.4x;
+  iq1_s, iq3_xxs, iq3_s small gains; iq2_s neutral.
+
+### Added
+- `arena_alloc` accepts `itemsize` 2/4/8 so >2 GiB staging slots fit int32
+  shape dims.
+- `residency_insert` / `residency_commit` / `residency_erase`: wire chosen
+  buffers into the Metal residency set, ending per-command-buffer re-wiring
+  of large host-pinned weights.
+
+### Fixed
+- Zero-copy GGUF load of tensors whose wire bytes exceed 2 GiB (e.g. the
+  expert stacks of a many-hundred-expert MoE): these silently fell back to
+  an eager per-tensor memcpy, exhausting memory at load on over-RAM models.
+
 ## [0.3.8]
 
 Batched and shared-prefix decode attention: cascade, paged sparse, q8 KV

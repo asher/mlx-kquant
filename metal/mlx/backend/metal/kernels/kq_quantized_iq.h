@@ -1361,20 +1361,25 @@ METAL_FUNC void kq_iq3_xxs_qmv_impl(
           ib * KQ_IQ3_XXS_BLOCK_BYTES;
       const U d = U(float(*(const device half*)sb));
       const device uint8_t* qs = sb + KQ_IQ3_XXS_QS_OFFSET + s * 8;
-      const device uint8_t* gas = sb + KQ_IQ3_XXS_GAS_OFFSET + s * 4;
-      const uint aux32 = uint(gas[0]) | (uint(gas[1]) << 8) |
-          (uint(gas[2]) << 16) | (uint(gas[3]) << 24);
+      // Blocks are 98 bytes (2-aligned), so the aux word is two ushort
+      // loads, not four byte loads.
+      const device ushort* gw = reinterpret_cast<const device ushort*>(
+          sb + KQ_IQ3_XXS_GAS_OFFSET + s * 4);
+      const uint aux32 = uint(gw[0]) | (uint(gw[1]) << 16);
       const U db = d * (U(0.5f) + U(aux32 >> 28)) * U(0.5f);
       const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
-      const uint g1 = iq3xxs_grid[qs[2 * l]];
-      const uint g2 = iq3xxs_grid[qs[2 * l + 1]];
+      // Reinterpret each grid word as a uchar4; folding the sign into the
+      // integer-valued magnitude is exact, so the single rounding per fma
+      // is unchanged.
+      const uchar4 g1 = as_type<uchar4>(iq3xxs_grid[qs[2 * l]]);
+      const uchar4 g2 = as_type<uchar4>(iq3xxs_grid[qs[2 * l + 1]]);
       U partial = 0;
 #pragma unroll
       for (int j = 0; j < 4; j++) {
-        partial += xt[j] * U((g1 >> (8 * j)) & 0xff) *
-            ((signs & kmask_iq2xs[j]) ? U(-1) : U(1));
-        partial += xt[j + 4] * U((g2 >> (8 * j)) & 0xff) *
-            ((signs & kmask_iq2xs[j + 4]) ? U(-1) : U(1));
+        const U gv1 = (signs & kmask_iq2xs[j]) ? -U(g1[j]) : U(g1[j]);
+        partial += xt[j] * gv1;
+        const U gv2 = (signs & kmask_iq2xs[4 + j]) ? -U(g2[j]) : U(g2[j]);
+        partial += xt[j + 4] * gv2;
       }
       result[row] += db * partial;
     }
@@ -1808,19 +1813,25 @@ METAL_FUNC void kq_iq3_s_qmv_impl(
       const device uint8_t* scales = sb + KQ_IQ3_S_SCALES_OFFSET;
       const U db = d * U(1 + 2 * ((scales[s / 2] >> (4 * (s & 1))) & 0xf));
       const uint qh = sb[KQ_IQ3_S_QH_OFFSET + s];
-      const device uint8_t* qs = sb + KQ_IQ3_S_QS_OFFSET + s * 8;
+      // The qs pair is 2-aligned: one ushort load instead of two byte
+      // loads.
+      const uint qpair = uint(*reinterpret_cast<const device ushort*>(
+          sb + KQ_IQ3_S_QS_OFFSET + s * 8 + 2 * l));
       const uint8_t signs = sb[KQ_IQ3_S_SIGNS_OFFSET + s * 4 + l];
-      const uint i1 = qs[2 * l] | ((qh << (8 - 2 * l)) & 256);
-      const uint i2 = qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256);
-      const uint g1 = iq3s_grid[i1];
-      const uint g2 = iq3s_grid[i2];
+      const uint i1 = (qpair & 0xff) | ((qh << (8 - 2 * l)) & 256);
+      const uint i2 = (qpair >> 8) | ((qh << (7 - 2 * l)) & 256);
+      // Reinterpret each grid word as a uchar4; folding the sign into the
+      // integer-valued magnitude is exact, so the single rounding per fma
+      // is unchanged.
+      const uchar4 g1 = as_type<uchar4>(iq3s_grid[i1]);
+      const uchar4 g2 = as_type<uchar4>(iq3s_grid[i2]);
       U partial = 0;
 #pragma unroll
       for (int j = 0; j < 4; j++) {
-        partial += xt[j] * U((g1 >> (8 * j)) & 0xff) *
-            ((signs & kmask_iq2xs[j]) ? U(-1) : U(1));
-        partial += xt[j + 4] * U((g2 >> (8 * j)) & 0xff) *
-            ((signs & kmask_iq2xs[j + 4]) ? U(-1) : U(1));
+        const U gv1 = (signs & kmask_iq2xs[j]) ? -U(g1[j]) : U(g1[j]);
+        partial += xt[j] * gv1;
+        const U gv2 = (signs & kmask_iq2xs[4 + j]) ? -U(g2[j]) : U(g2[j]);
+        partial += xt[j + 4] * gv2;
       }
       result[row] += db * partial;
     }
@@ -2257,16 +2268,28 @@ METAL_FUNC void kq_iq2_xxs_qmv_impl(
           ib * KQ_IQ2_XXS_BLOCK_BYTES;
       const U d = U(float(*(const device half*)sb));
       const device uint8_t* qs = sb + KQ_IQ2_XXS_QS_OFFSET + s * 8;
-      const uint signbits = uint(qs[4]) | (uint(qs[5]) << 8) |
-          (uint(qs[6]) << 16) | (uint(qs[7]) << 24);
+      // Blocks are 66 bytes (2-aligned), so the sign word is two ushort
+      // loads, not four byte loads.
+      const device ushort* qw = reinterpret_cast<const device ushort*>(qs);
+      const uint signbits = uint(qw[2]) | (uint(qw[3]) << 16);
       const U db = d * (U(0.5f) + U(signbits >> 28)) * U(0.25f);
       const uint8_t signs = ksigns_iq2xs[(signbits >> (7 * l)) & 127];
+      // Reinterpret the grid word as two uchar4s; folding the sign into
+      // the integer-valued magnitude is exact, so the single rounding per
+      // fma is unchanged and results stay bit-exact.
       const uint64_t g = iq2xxs_grid[qs[l]];
+      const uchar4 g_lo = as_type<uchar4>(uint(g & 0xffffffffu));
+      const uchar4 g_hi = as_type<uchar4>(uint(g >> 32));
       U partial = 0;
 #pragma unroll
-      for (int j = 0; j < 8; j++) {
-        partial += xt[j] * U((g >> (8 * j)) & 0xff) *
-            ((signs & kmask_iq2xs[j]) ? U(-1) : U(1));
+      for (int j = 0; j < 4; j++) {
+        const U gv = (signs & kmask_iq2xs[j]) ? -U(g_lo[j]) : U(g_lo[j]);
+        partial += xt[j] * gv;
+      }
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const U gv = (signs & kmask_iq2xs[4 + j]) ? -U(g_hi[j]) : U(g_hi[j]);
+        partial += xt[4 + j] * gv;
       }
       result[row] += db * partial;
     }
@@ -2696,18 +2719,30 @@ METAL_FUNC void kq_iq2_xs_qmv_impl(
           static_cast<int64_t>(out_row + row) * row_bytes +
           ib * KQ_IQ2_XS_BLOCK_BYTES;
       const U d = U(float(*(const device half*)sb));
-      const device uint8_t* qp = sb + KQ_IQ2_XS_QS_OFFSET + s * 8 + l * 2;
-      const uint q = uint(qp[0]) | (uint(qp[1]) << 8);
+      // The qs entry is a 2-aligned uint16: one ushort load instead of
+      // two byte loads.
+      const uint q = uint(*reinterpret_cast<const device ushort*>(
+          sb + KQ_IQ2_XS_QS_OFFSET + s * 8 + l * 2));
       const uint8_t sc = sb[KQ_IQ2_XS_SCALES_OFFSET + s];
       const int sc_nib = (l < 2) ? (sc & 0xf) : (sc >> 4);
       const U db = d * (U(0.5f) + U(sc_nib)) * U(0.25f);
       const uint8_t signs = ksigns_iq2xs[q >> 9];
+      // Reinterpret the grid word as two uchar4s; folding the sign into
+      // the integer-valued magnitude is exact, so the single rounding per
+      // fma is unchanged.
       const uint64_t g = iq2xs_grid[q & 511];
+      const uchar4 g_lo = as_type<uchar4>(uint(g & 0xffffffffu));
+      const uchar4 g_hi = as_type<uchar4>(uint(g >> 32));
       U partial = 0;
 #pragma unroll
-      for (int j = 0; j < 8; j++) {
-        partial += xt[j] * U((g >> (8 * j)) & 0xff) *
-            ((signs & kmask_iq2xs[j]) ? U(-1) : U(1));
+      for (int j = 0; j < 4; j++) {
+        const U gv = (signs & kmask_iq2xs[j]) ? -U(g_lo[j]) : U(g_lo[j]);
+        partial += xt[j] * gv;
+      }
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const U gv = (signs & kmask_iq2xs[4 + j]) ? -U(g_hi[j]) : U(g_hi[j]);
+        partial += xt[4 + j] * gv;
       }
       result[row] += db * partial;
     }
@@ -3147,12 +3182,23 @@ METAL_FUNC void kq_iq2_s_qmv_impl(
       const U db = d * (U(0.5f) + U(sc_nib)) * U(0.25f);
       const uint idx = qs[l] | ((qh << (8 - 2 * l)) & 0x300);
       const uint8_t signs_byte = sg[l];
+      // Reinterpret the grid word as two uchar4s; folding the sign into
+      // the integer-valued magnitude is exact, so the single rounding per
+      // fma is unchanged.
       const uint64_t g = iq2s_grid[idx];
+      const uchar4 g_lo = as_type<uchar4>(uint(g & 0xffffffffu));
+      const uchar4 g_hi = as_type<uchar4>(uint(g >> 32));
       U partial = 0;
 #pragma unroll
-      for (int j = 0; j < 8; j++) {
-        partial += xt[j] * U((g >> (8 * j)) & 0xff) *
-            ((signs_byte & kmask_iq2xs[j]) ? U(-1) : U(1));
+      for (int j = 0; j < 4; j++) {
+        const U gv = (signs_byte & kmask_iq2xs[j]) ? -U(g_lo[j]) : U(g_lo[j]);
+        partial += xt[j] * gv;
+      }
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const U gv =
+            (signs_byte & kmask_iq2xs[4 + j]) ? -U(g_hi[j]) : U(g_hi[j]);
+        partial += xt[4 + j] * gv;
       }
       result[row] += db * partial;
     }
@@ -3586,18 +3632,27 @@ METAL_FUNC void kq_iq1_s_qmv_impl(
           static_cast<int64_t>(out_row + row) * row_bytes +
           ib * KQ_IQ1_S_BLOCK_BYTES;
       const U d = U(float(*(const device half*)sb));
-      const device uint8_t* qhp = sb + KQ_IQ1_S_QH_OFFSET + s * 2;
-      const uint qh = uint(qhp[0]) | (uint(qhp[1]) << 8);
+      // The qh entry is a 2-aligned uint16: one ushort load instead of
+      // two byte loads.
+      const uint qh = uint(*reinterpret_cast<const device ushort*>(
+          sb + KQ_IQ1_S_QH_OFFSET + s * 2));
       const uint8_t qs = sb[KQ_IQ1_S_QS_OFFSET + s * 4 + l];
       const U dl = d * U(2 * int((qh >> 12) & 7) + 1);
       const U delta = (qh & 0x8000) ? U(-0.125f) : U(0.125f);
       const uint idx = uint(qs) | (((qh >> (3 * l)) & 7) << 8);
+      // Reinterpret the signed grid word as two char4s: value-identical to
+      // the byte extract chain, same fma order, so results stay bit-exact.
       const uint64_t g = iq1s_grid[idx];
+      const char4 g_lo = as_type<char4>(uint(g & 0xffffffffu));
+      const char4 g_hi = as_type<char4>(uint(g >> 32));
       U partial = 0;
 #pragma unroll
-      for (int j = 0; j < 8; j++) {
-        const int8_t gv = as_type<int8_t>(uint8_t((g >> (8 * j)) & 0xff));
-        partial += xt[j] * (U(gv) + delta);
+      for (int j = 0; j < 4; j++) {
+        partial += xt[j] * (U(g_lo[j]) + delta);
+      }
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        partial += xt[4 + j] * (U(g_hi[j]) + delta);
       }
       result[row] += dl * partial;
     }
@@ -4016,6 +4071,11 @@ METAL_FUNC void kq_iq1_m_qmv_impl(
   y += tid.x * out_vec_size;
   const int s = simd_lid / 4; // sub-block
   const int l = simd_lid % 4; // l-group (one 8-weight group)
+  // Per-lane constants: field shift within the scale word, qh nibble shift,
+  // sign-bit mask (invariant across superblocks).
+  const int shift0 = (l < 2) ? 0 : 3;
+  const int hshift = (l & 1) ? 4 : 8;
+  const uint8_t sign_mask = (l & 1) ? 0x80 : 0x08;
   U result[results_per_simdgroup] = {0};
   for (int ib = 0; ib < nb; ib++) {
     U xt[vpt];
@@ -4027,29 +4087,34 @@ METAL_FUNC void kq_iq1_m_qmv_impl(
       const device uint8_t* sb = w +
           static_cast<int64_t>(out_row + row) * row_bytes +
           ib * KQ_IQ1_M_BLOCK_BYTES;
-      const device uint8_t* scp = sb + KQ_IQ1_M_SCALES_OFFSET;
-      const ushort sc0 = ushort(scp[0]) | (ushort(scp[1]) << 8);
-      const ushort sc1 = ushort(scp[2]) | (ushort(scp[3]) << 8);
-      const ushort sc2 = ushort(scp[4]) | (ushort(scp[5]) << 8);
-      const ushort sc3 = ushort(scp[6]) | (ushort(scp[7]) << 8);
-      const ushort scale_u16 = (sc0 >> 12) | ((sc1 >> 8) & 0x00f0) |
-          ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000);
+      // Blocks are 56 bytes and scales sit at +48, so the 8-byte scale
+      // block is always 8-aligned: one vector load replaces eight byte
+      // loads, and the per-half word is a select from the same vector.
+      const ushort4 scv =
+          *reinterpret_cast<const device ushort4*>(sb + KQ_IQ1_M_SCALES_OFFSET);
+      const ushort scale_u16 = (scv.x >> 12) | ((scv.y >> 8) & 0x00f0) |
+          ((scv.z >> 4) & 0x0f00) | (scv.w & 0xf000);
       const U d = U(float(as_type<half>(scale_u16)));
-      const device uint8_t* swp = scp + (s / 2) * 2;
-      const uint sc_word = uint(swp[0]) | (uint(swp[1]) << 8);
-      const int shift = 6 * (s & 1) + ((l < 2) ? 0 : 3);
+      const uint sc_word = scv[s / 2];
+      const int shift = 6 * (s & 1) + shift0;
       const U dl = d * U(2 * int((sc_word >> shift) & 7) + 1);
       const uint8_t qh = sb[KQ_IQ1_M_QH_OFFSET + s * 2 + l / 2];
-      const int hshift = (l & 1) ? 4 : 8;
       const uint idx = uint(sb[KQ_IQ1_M_QS_OFFSET + s * 4 + l]) |
           ((uint(qh) << hshift) & 0x700);
-      const U delta = (qh & ((l & 1) ? 0x80 : 0x08)) ? U(-0.125f) : U(0.125f);
+      const U delta = (qh & sign_mask) ? U(-0.125f) : U(0.125f);
+      // Reinterpret the signed grid word as two char4s: value-identical to
+      // the byte extract chain, same fma order, so results stay bit-exact.
       const uint64_t g = iq1s_grid[idx];
+      const char4 g_lo = as_type<char4>(uint(g & 0xffffffffu));
+      const char4 g_hi = as_type<char4>(uint(g >> 32));
       U partial = 0;
 #pragma unroll
-      for (int j = 0; j < 8; j++) {
-        const int8_t gv = as_type<int8_t>(uint8_t((g >> (8 * j)) & 0xff));
-        partial += xt[j] * (U(gv) + delta);
+      for (int j = 0; j < 4; j++) {
+        partial += xt[j] * (U(g_lo[j]) + delta);
+      }
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        partial += xt[4 + j] * (U(g_hi[j]) + delta);
       }
       result[row] += dl * partial;
     }

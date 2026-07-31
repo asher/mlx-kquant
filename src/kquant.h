@@ -1748,7 +1748,21 @@ bool shared_event_wait(uint64_t handle, uint64_t value, int64_t timeout_ms);
 // base address (for the Python binding's writable memoryview over the same
 // bytes; valid exactly as long as the array lives). The CPU-write -> GPU-read
 // ordering contract is the caller's, via the event ops below.
-std::pair<mx::array, uintptr_t> arena_alloc(const mx::Shape& shape);
+std::pair<mx::array, uintptr_t> arena_alloc(
+    const mx::Shape& shape,
+    mlx::core::Dtype dtype = mlx::core::uint8);
+
+// GPU residency: stage arrays' buffers into the Metal device residency
+// set (insert per array, then one commit), so command buffers stop
+// re-wiring those pages on every use (the cost that dominates streamed
+// decode once weights are host-pinned). Membership lasts for the buffer's
+// lifetime. Both return false on non-Metal builds; insert also returns
+// false for an array with no materialized data.
+bool residency_insert(const mx::array& a);
+bool residency_commit();
+// Remove before freeing a set member (a freed buffer must not stay in the
+// set); takes effect at the next commit.
+bool residency_erase(const mx::array& a);
 
 // Stream side: identity ops on `x` that encode an MTLSharedEvent signal/wait
 // at their position in the graph's evaluation order. The returned array
