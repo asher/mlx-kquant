@@ -1438,6 +1438,30 @@ NB_MODULE(_ext, m) {
         (shared_event_set) after writing; nothing else orders them.
       )");
 
+  m.def(
+      "residency_insert",
+      &mlx_kquant::residency_insert,
+      "a"_a,
+      "Stage ``a``'s underlying Metal buffer for the device residency set "
+      "(wired for the buffer's lifetime once residency_commit runs), so "
+      "command buffers stop re-wiring its pages on every use. The array "
+      "must have materialized data (evaluate first). False on non-Metal "
+      "builds or missing data.");
+
+  m.def(
+      "residency_commit",
+      &mlx_kquant::residency_commit,
+      "Commit staged residency_insert additions and request residency. "
+      "False on non-Metal builds.");
+
+  m.def(
+      "residency_erase",
+      &mlx_kquant::residency_erase,
+      "a"_a,
+      "Stage removal of ``a``'s buffer from the residency set (call before "
+      "dropping a member buffer; takes effect at the next commit). False "
+      "on non-Metal builds or missing data.");
+
   // --- shared-event stream primitives (feeder loop) ---
 
   m.def(
