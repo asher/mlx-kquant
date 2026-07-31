@@ -2257,16 +2257,28 @@ METAL_FUNC void kq_iq2_xxs_qmv_impl(
           ib * KQ_IQ2_XXS_BLOCK_BYTES;
       const U d = U(float(*(const device half*)sb));
       const device uint8_t* qs = sb + KQ_IQ2_XXS_QS_OFFSET + s * 8;
-      const uint signbits = uint(qs[4]) | (uint(qs[5]) << 8) |
-          (uint(qs[6]) << 16) | (uint(qs[7]) << 24);
+      // Blocks are 66 bytes (2-aligned), so the sign word is two ushort
+      // loads, not four byte loads.
+      const device ushort* qw = reinterpret_cast<const device ushort*>(qs);
+      const uint signbits = uint(qw[2]) | (uint(qw[3]) << 16);
       const U db = d * (U(0.5f) + U(signbits >> 28)) * U(0.25f);
       const uint8_t signs = ksigns_iq2xs[(signbits >> (7 * l)) & 127];
+      // Reinterpret the grid word as two uchar4s; folding the sign into
+      // the integer-valued magnitude is exact, so the single rounding per
+      // fma is unchanged and results stay bit-exact.
       const uint64_t g = iq2xxs_grid[qs[l]];
+      const uchar4 g_lo = as_type<uchar4>(uint(g & 0xffffffffu));
+      const uchar4 g_hi = as_type<uchar4>(uint(g >> 32));
       U partial = 0;
 #pragma unroll
-      for (int j = 0; j < 8; j++) {
-        partial += xt[j] * U((g >> (8 * j)) & 0xff) *
-            ((signs & kmask_iq2xs[j]) ? U(-1) : U(1));
+      for (int j = 0; j < 4; j++) {
+        const U gv = (signs & kmask_iq2xs[j]) ? -U(g_lo[j]) : U(g_lo[j]);
+        partial += xt[j] * gv;
+      }
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const U gv = (signs & kmask_iq2xs[4 + j]) ? -U(g_hi[j]) : U(g_hi[j]);
+        partial += xt[4 + j] * gv;
       }
       result[row] += db * partial;
     }
@@ -4016,6 +4028,11 @@ METAL_FUNC void kq_iq1_m_qmv_impl(
   y += tid.x * out_vec_size;
   const int s = simd_lid / 4; // sub-block
   const int l = simd_lid % 4; // l-group (one 8-weight group)
+  // Per-lane constants: field shift within the scale word, qh nibble shift,
+  // sign-bit mask (invariant across superblocks).
+  const int shift0 = (l < 2) ? 0 : 3;
+  const int hshift = (l & 1) ? 4 : 8;
+  const uint8_t sign_mask = (l & 1) ? 0x80 : 0x08;
   U result[results_per_simdgroup] = {0};
   for (int ib = 0; ib < nb; ib++) {
     U xt[vpt];
@@ -4027,29 +4044,34 @@ METAL_FUNC void kq_iq1_m_qmv_impl(
       const device uint8_t* sb = w +
           static_cast<int64_t>(out_row + row) * row_bytes +
           ib * KQ_IQ1_M_BLOCK_BYTES;
-      const device uint8_t* scp = sb + KQ_IQ1_M_SCALES_OFFSET;
-      const ushort sc0 = ushort(scp[0]) | (ushort(scp[1]) << 8);
-      const ushort sc1 = ushort(scp[2]) | (ushort(scp[3]) << 8);
-      const ushort sc2 = ushort(scp[4]) | (ushort(scp[5]) << 8);
-      const ushort sc3 = ushort(scp[6]) | (ushort(scp[7]) << 8);
-      const ushort scale_u16 = (sc0 >> 12) | ((sc1 >> 8) & 0x00f0) |
-          ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000);
+      // Blocks are 56 bytes and scales sit at +48, so the 8-byte scale
+      // block is always 8-aligned: one vector load replaces eight byte
+      // loads, and the per-half word is a select from the same vector.
+      const ushort4 scv =
+          *reinterpret_cast<const device ushort4*>(sb + KQ_IQ1_M_SCALES_OFFSET);
+      const ushort scale_u16 = (scv.x >> 12) | ((scv.y >> 8) & 0x00f0) |
+          ((scv.z >> 4) & 0x0f00) | (scv.w & 0xf000);
       const U d = U(float(as_type<half>(scale_u16)));
-      const device uint8_t* swp = scp + (s / 2) * 2;
-      const uint sc_word = uint(swp[0]) | (uint(swp[1]) << 8);
-      const int shift = 6 * (s & 1) + ((l < 2) ? 0 : 3);
+      const uint sc_word = scv[s / 2];
+      const int shift = 6 * (s & 1) + shift0;
       const U dl = d * U(2 * int((sc_word >> shift) & 7) + 1);
       const uint8_t qh = sb[KQ_IQ1_M_QH_OFFSET + s * 2 + l / 2];
-      const int hshift = (l & 1) ? 4 : 8;
       const uint idx = uint(sb[KQ_IQ1_M_QS_OFFSET + s * 4 + l]) |
           ((uint(qh) << hshift) & 0x700);
-      const U delta = (qh & ((l & 1) ? 0x80 : 0x08)) ? U(-0.125f) : U(0.125f);
+      const U delta = (qh & sign_mask) ? U(-0.125f) : U(0.125f);
+      // Reinterpret the signed grid word as two char4s: value-identical to
+      // the byte extract chain, same fma order, so results stay bit-exact.
       const uint64_t g = iq1s_grid[idx];
+      const char4 g_lo = as_type<char4>(uint(g & 0xffffffffu));
+      const char4 g_hi = as_type<char4>(uint(g >> 32));
       U partial = 0;
 #pragma unroll
-      for (int j = 0; j < 8; j++) {
-        const int8_t gv = as_type<int8_t>(uint8_t((g >> (8 * j)) & 0xff));
-        partial += xt[j] * (U(gv) + delta);
+      for (int j = 0; j < 4; j++) {
+        partial += xt[j] * (U(g_lo[j]) + delta);
+      }
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        partial += xt[4 + j] * (U(g_hi[j]) + delta);
       }
       result[row] += dl * partial;
     }
