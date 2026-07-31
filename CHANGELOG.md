@@ -7,8 +7,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Changed
-- iq1_m and iq2_xxs mat-vec decode is 1.2-1.6x faster per call (vectorized
-  scale and grid unpack, bit-exact).
+- Grid-codec mat-vec decode is faster per call via vectorized scale and
+  grid unpack (bit-exact): iq1_m 1.2-1.6x, iq2_xxs 1.2x, iq2_xs 1.4x;
+  iq1_s, iq3_xxs, iq3_s small gains; iq2_s neutral.
 
 ### Added
 - `arena_alloc` accepts `itemsize` 2/4/8 so >2 GiB staging slots fit int32
