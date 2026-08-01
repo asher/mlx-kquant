@@ -3650,6 +3650,7 @@ METAL_FUNC void kq_gather_qmm_rhs_nax_tgp_impl(
       uint3 tid [[threadgroup_position_in_grid]],                              \
       uint simd_group_id [[simdgroup_index_in_threadgroup]],                   \
       uint simd_lane_id [[thread_index_in_simdgroup]]) {                       \
+    (void)scales; /* wire-format blocks are self-scaled; no separate scales */ \
     static_assert(                                                             \
         group_size == GROUP_CONST,                                             \
         #codec " NAX kernel requires group_size=" #GROUP_CONST);               \

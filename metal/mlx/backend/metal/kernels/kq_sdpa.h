@@ -245,7 +245,6 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
   constexpr int D4 = D / 4;
   constexpr int NL = 32 / NE; // lanes per in-flight key
   constexpr int DP4 = D4 / NL; // float4s per lane per key row
-  constexpr int GP4 = 64 / 4; // packed words per quant group (group_size 64)
   using T4 = metal::vec<T, 4>;
 
   threadgroup T4 sK[C * D4];
