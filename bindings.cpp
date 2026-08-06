@@ -968,6 +968,120 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_decode_gqa_kvarn",
+      [](mx::array q,
+         mx::array codes_k,
+         mx::array axes_k,
+         mx::array codes_v,
+         mx::array axes_v,
+         mx::array stage_k,
+         mx::array stage_v,
+         int n,
+         float scale,
+         int k_bits,
+         int v_bits,
+         const std::optional<mx::array>& sinks,
+         int splits,
+         int tile_c,
+         const std::optional<mx::array>& starts,
+         bool return_lse,
+         mx::StreamOrDevice s) -> nb::object {
+        if (return_lse) {
+          auto outs = mlx_kquant::sdpa_decode_gqa_kvarn_lse(
+              std::move(q),
+              std::move(codes_k),
+              std::move(axes_k),
+              std::move(codes_v),
+              std::move(axes_v),
+              std::move(stage_k),
+              std::move(stage_v),
+              n,
+              scale,
+              k_bits,
+              v_bits,
+              sinks,
+              splits,
+              tile_c,
+              starts,
+              s);
+          return nb::make_tuple(outs[0], outs[1]);
+        }
+        return nb::cast(mlx_kquant::sdpa_decode_gqa_kvarn(
+            std::move(q),
+            std::move(codes_k),
+            std::move(axes_k),
+            std::move(codes_v),
+            std::move(axes_v),
+            std::move(stage_k),
+            std::move(stage_v),
+            n,
+            scale,
+            k_bits,
+            v_bits,
+            sinks,
+            splits,
+            tile_c,
+            starts,
+            s));
+      },
+      "q"_a,
+      "codes_k"_a,
+      "axes_k"_a,
+      "codes_v"_a,
+      "axes_v"_a,
+      "stage_k"_a,
+      "stage_v"_a,
+      "n"_a,
+      "scale"_a,
+      "k_bits"_a = 6,
+      "v_bits"_a = 6,
+      "sinks"_a = nb::none(),
+      "splits"_a = 0,
+      "tile_c"_a = 0,
+      "starts"_a = nb::none(),
+      nb::kw_only(),
+      "return_lse"_a = false,
+      "stream"_a = nb::none(),
+      R"(
+        sdpa_decode_gqa over a KVarN-backed KV cache, fused: sealed groups
+        dequantize (kvarn_quantize wire) at tile stage, sink and live tokens
+        read the fp16 rotated stage, and everything downstream of the stage
+        is the sdpa_decode_gqa machinery unchanged. Rotated-domain contract:
+        q must arrive WHT-rotated (kvarn_rotate) and the output is the
+        rotated attention result, which the caller un-rotates.
+
+        Key layout for n total keys: keys [0, min(n, S_rows - 128)) read
+        stage rows directly (fp16 sink groups); the next full 128-groups
+        read sealed records in order; the remainder reads the live stage
+        rows at [S_rows - 128, S_rows). head_dim 128 only.
+
+        Args:
+            q (array): rotated queries [B, n_q_heads, qL, 128],
+                float16/bfloat16; qL 1 (decode) to 4 (verify width).
+            codes_k (array): uint32 [B, n_kv_heads, Gcap, 512 * k_bits].
+            axes_k (array): float16 [B, n_kv_heads, Gcap, 3, 128].
+            codes_v (array): uint32 [B, n_kv_heads, Gcap, 512 * v_bits].
+            axes_v (array): float16 [B, n_kv_heads, Gcap, 3, 128].
+            stage_k (array): float16 [B, n_kv_heads, S_rows, 128], rotated;
+                S_rows a multiple of 128 >= 256 (sink groups + live group).
+            stage_v (array): float16, same shape as stage_k.
+            n (int): total key count (Gcap and S_rows are capacities).
+            scale (float): query scale (typically 1/sqrt(128)).
+            k_bits (int): K record width, one of 2/3/4/5/6/8. Default 6.
+            v_bits (int): V record width. Default 6.
+            sinks (array, optional): per-q-head softmax sink logits.
+            splits (int): key-axis split count; 0 picks the default.
+            tile_c (int): staged tile height, 32 or 16; 0 picks 32.
+            starts (array, optional): int32 [B] per-row key starts.
+            return_lse (bool): also return the natural-log softmax
+                normalizer [B, n_q_heads, qL] float32.
+
+        Returns:
+            array or tuple(array, array): rotated attention output
+            [B, n_q_heads, qL, 128] (plus lse with return_lse).
+      )");
+
+  m.def(
       "moe_glu_gather_kq",
       &mlx_kquant::moe_glu_gather_kq,
       "x"_a,

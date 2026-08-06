@@ -1,0 +1,239 @@
+"""Fused KVarN decode attention vs the materialize reference.
+
+sdpa_decode_gqa_kvarn stages the same fp16 values the kvarn_dequant kernel
+produces (identical fp32 expression and rounding), and everything downstream
+of the tile stage is the sdpa_decode_gqa machinery unchanged. The reference
+therefore materializes the cache (sink + dequantized records + live) into a
+plain fp16 KV and runs sdpa_decode_gqa with identical splits/tile_c: outputs
+must match bit for bit, including lse.
+"""
+
+from __future__ import annotations
+
+import os
+
+import mlx.core as mx
+import numpy as np
+import pytest
+
+import mlx_kquant as kq
+
+pytestmark = pytest.mark.skipif(
+    bool(os.environ.get("KQUANT_FORCE_CPU")),
+    reason="sdpa_decode_gqa_kvarn is a Metal-only kernel; no CPU path.",
+)
+
+D = 128
+SCALE = D**-0.5
+
+
+def build_state(B, H, N, k_bits, v_bits, sink_cap=128, seed=0):
+    """Synthesize a rotated-domain KVarN cache state plus its materialized
+    fp16 twin. Keys [0, min(N, sink_cap)) live in stage sink rows, full
+    128-groups after that are sealed records, the remainder is the live
+    stage slot."""
+    rng = np.random.default_rng(seed)
+    kx = rng.standard_normal((B, H, N, D)).astype(np.float16)
+    vx = rng.standard_normal((B, H, N, D)).astype(np.float16)
+
+    sink = min(N, sink_cap)
+    n_recs = max(0, (N - sink_cap) // 128)
+    live0 = sink + n_recs * 128
+    s_rows = sink_cap + 128
+
+    stage_k = np.zeros((B, H, s_rows, D), np.float16)
+    stage_v = np.zeros((B, H, s_rows, D), np.float16)
+    stage_k[:, :, :sink] = kx[:, :, :sink]
+    stage_v[:, :, :sink] = vx[:, :, :sink]
+    live_len = N - live0
+    stage_k[:, :, sink_cap : sink_cap + live_len] = kx[:, :, live0:N]
+    stage_v[:, :, sink_cap : sink_cap + live_len] = vx[:, :, live0:N]
+
+    g_cap = max(n_recs, 1)
+    codes_k = np.zeros((B, H, g_cap, 512 * k_bits), np.uint32)
+    codes_v = np.zeros((B, H, g_cap, 512 * v_bits), np.uint32)
+    axes_k = np.zeros((B, H, g_cap, 3, D), np.float16)
+    axes_v = np.zeros((B, H, g_cap, 3, D), np.float16)
+
+    if n_recs:
+        ck, ak = kq.kvarn_quantize(mx.array(kx[:, :, sink:live0]), k_bits, "k")
+        cv, av = kq.kvarn_quantize(mx.array(vx[:, :, sink:live0]), v_bits, "v")
+        mx.eval(ck, ak, cv, av)
+        codes_k[:, :, :n_recs] = np.array(ck)
+        axes_k[:, :, :n_recs] = np.array(ak)
+        codes_v[:, :, :n_recs] = np.array(cv)
+        axes_v[:, :, :n_recs] = np.array(av)
+
+    return {
+        "codes_k": mx.array(codes_k),
+        "axes_k": mx.array(axes_k),
+        "codes_v": mx.array(codes_v),
+        "axes_v": mx.array(axes_v),
+        "stage_k": mx.array(stage_k),
+        "stage_v": mx.array(stage_v),
+        "kx": mx.array(kx),
+        "vx": mx.array(vx),
+        "sink": sink,
+        "live0": live0,
+        "n_recs": n_recs,
+        "k_bits": k_bits,
+        "v_bits": v_bits,
+    }
+
+
+def materialize(st, dtype):
+    """Reference fp16/bf16 KV: raw sink and live rows plus records
+    dequantized at the target dtype (matching the fused kernel's single
+    fp32 -> T rounding)."""
+    refs = []
+    for side, raw in (("k", st["kx"]), ("v", st["vx"])):
+        parts = [raw[:, :, : st["sink"]].astype(dtype)]
+        if st["n_recs"]:
+            n = st["n_recs"]
+            parts.append(
+                kq.kvarn_dequant(
+                    st[f"codes_{side}"][:, :, :n],
+                    st[f"axes_{side}"][:, :, :n],
+                    st[f"{side}_bits"],
+                    side,
+                    dtype=dtype,
+                )
+            )
+        parts.append(raw[:, :, st["live0"] :].astype(dtype))
+        refs.append(mx.concatenate(parts, axis=2))
+    return refs
+
+
+def run_pair(st, q, N, k_bits, v_bits, dtype=mx.float16, **kw):
+    qm = mx.array(q).astype(dtype)
+    out = kq.sdpa_decode_gqa_kvarn(
+        qm,
+        st["codes_k"],
+        st["axes_k"],
+        st["codes_v"],
+        st["axes_v"],
+        st["stage_k"],
+        st["stage_v"],
+        N,
+        SCALE,
+        k_bits,
+        v_bits,
+        **kw,
+    )
+    k_ref, v_ref = materialize(st, dtype)
+    ref = kq.sdpa_decode_gqa(qm, k_ref, v_ref, SCALE, **kw)
+    return out, ref
+
+
+def assert_bit_equal(a, b):
+    if isinstance(a, tuple):
+        for x, y in zip(a, b, strict=True):
+            assert_bit_equal(x, y)
+        return
+    mx.eval(a, b)
+    if a.dtype == mx.bfloat16:
+        # numpy has no bfloat16; the fp32 embedding is exact.
+        a, b = a.astype(mx.float32), b.astype(mx.float32)
+    an, bn = np.array(a), np.array(b)
+    assert an.dtype == bn.dtype and an.shape == bn.shape
+    maxd = np.abs(an.astype(np.float64) - bn.astype(np.float64)).max()
+    assert np.array_equal(an, bn), f"max|d|={maxd}"
+
+
+def make_q(B, n_q_heads, qL, seed=1):
+    rng = np.random.default_rng(seed)
+    return rng.standard_normal((B, n_q_heads, qL, D)).astype(np.float16)
+
+
+@pytest.mark.parametrize("n", [100, 129, 256, 300, 1000, 4097])
+def test_decode_matches_materialize_at_boundaries(n):
+    st = build_state(1, 2, n, 6, 6, seed=n)
+    q = make_q(1, 8, 1)
+    out, ref = run_pair(st, q, n, 6, 6)
+    assert_bit_equal(out, ref)
+
+
+@pytest.mark.parametrize("kv_bits", [(2, 2), (3, 3), (4, 4), (5, 5), (8, 8), (6, 5)])
+def test_decode_matches_materialize_across_widths(kv_bits):
+    kb, vb = kv_bits
+    st = build_state(1, 2, 300, kb, vb, seed=kb * 10 + vb)
+    q = make_q(1, 8, 1)
+    out, ref = run_pair(st, q, 300, kb, vb)
+    assert_bit_equal(out, ref)
+
+
+@pytest.mark.parametrize("ql", [2, 3, 4])
+def test_verify_width_matches_materialize(ql):
+    st = build_state(1, 2, 700, 6, 6, seed=ql)
+    q = make_q(1, 8, ql)
+    out, ref = run_pair(st, q, 700, 6, 6)
+    assert_bit_equal(out, ref)
+
+
+def test_starts_and_batch():
+    st = build_state(3, 2, 300, 6, 6, seed=3)
+    q = make_q(3, 8, 1)
+    starts = mx.array([0, 150, 296], dtype=mx.int32)
+    out, ref = run_pair(st, q, 300, 6, 6, starts=starts)
+    assert_bit_equal(out, ref)
+
+
+def test_sinks_ride_through():
+    st = build_state(1, 2, 300, 6, 6, seed=4)
+    q = make_q(1, 8, 1)
+    sinks = mx.array(np.linspace(-1.0, 2.0, 8), dtype=mx.float32)
+    out, ref = run_pair(st, q, 300, 6, 6, sinks=sinks)
+    assert_bit_equal(out, ref)
+
+
+def test_lse_matches():
+    st = build_state(1, 2, 500, 6, 6, seed=5)
+    q = make_q(1, 8, 1)
+    out, ref = run_pair(st, q, 500, 6, 6, return_lse=True)
+    assert_bit_equal(out, ref)
+
+
+def test_bfloat16_query():
+    st = build_state(1, 2, 300, 6, 6, seed=6)
+    q = make_q(1, 8, 1)
+    out, ref = run_pair(st, q, 300, 6, 6, dtype=mx.bfloat16)
+    assert_bit_equal(out, ref)
+
+
+def test_tile_c_16_and_explicit_splits():
+    st = build_state(1, 2, 1000, 6, 6, seed=7)
+    q = make_q(1, 8, 1)
+    out, ref = run_pair(st, q, 1000, 6, 6, tile_c=16, splits=7)
+    assert_bit_equal(out, ref)
+
+
+def test_multi_group_sink():
+    # quantized_kv_start extension: sink capacity of two groups.
+    st = build_state(1, 2, 700, 6, 6, sink_cap=256, seed=8)
+    q = make_q(1, 8, 1)
+    out, ref = run_pair(st, q, 700, 6, 6)
+    assert_bit_equal(out, ref)
+
+
+def test_rejects_malformed():
+    st = build_state(1, 2, 300, 6, 6, seed=9)
+    q = mx.array(make_q(1, 8, 1))
+    args = (
+        st["codes_k"],
+        st["axes_k"],
+        st["codes_v"],
+        st["axes_v"],
+        st["stage_k"],
+        st["stage_v"],
+    )
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_gqa_kvarn(q, *args, 300, SCALE, 7, 6)
+    with pytest.raises(ValueError):
+        # n beyond sink + record + live capacity
+        kq.sdpa_decode_gqa_kvarn(q, *args, 500, SCALE, 6, 6)
+    with pytest.raises(ValueError):
+        # codes width inconsistent with bits
+        kq.sdpa_decode_gqa_kvarn(q, *args, 300, SCALE, 8, 6)
+    with pytest.raises(ValueError):
+        # D != 128
+        kq.sdpa_decode_gqa_kvarn(q[..., :64], *args, 300, SCALE, 6, 6)

@@ -199,6 +199,60 @@ std::vector<mx::array> sdpa_decode_gqa_lse(
     const std::optional<mx::array>& v_biases = std::nullopt,
     mx::StreamOrDevice s = {});
 
+// Decode/verify GQA attention over a KVarN-backed KV cache (kq_kvarn.h wire
+// plus fp16 rotated stage), fused: sealed groups dequantize at tile stage,
+// downstream attention is unchanged. Everything is rotated-domain: q must
+// arrive WHT-rotated (kvarn_rotate) and the output is the rotated attention
+// result (V rows are stored rotated), so the caller un-rotates it.
+//
+// Key layout (n = total keys): keys [0, min(n, sink_cap)) read stage rows
+// [0, ..) directly (fp16 sink groups, sink_cap = stage rows - 128); the next
+// floor((n - sink_cap) / 128) * 128 keys read sealed records in order; the
+// remainder reads the live stage rows at [sink_cap, sink_cap + 128). Both
+// stages are [B, Hkv, S_rows, 128] fp16 with S_rows a multiple of 128 and
+// >= 256. codes uint32 [B, Hkv, Gcap, 512 * bits], axes fp16
+// [B, Hkv, Gcap, 3, 128] per side; Gcap only needs to cover the sealed
+// groups. q [B, n_q_heads, qL, 128] float16/bfloat16, qL 1 (decode) to 4
+// (speculative-verify width). k_bits/v_bits in {2, 3, 4, 5, 6, 8} may
+// differ. sinks/starts/splits/tile_c as sdpa_decode_gqa. head_dim 128 only.
+// Metal-only.
+mx::array sdpa_decode_gqa_kvarn(
+    mx::array q,
+    mx::array codes_k,
+    mx::array axes_k,
+    mx::array codes_v,
+    mx::array axes_v,
+    mx::array stage_k,
+    mx::array stage_v,
+    int n,
+    float scale,
+    int k_bits,
+    int v_bits,
+    const std::optional<mx::array>& sinks = std::nullopt,
+    int splits = 0,
+    int tile_c = 32,
+    const std::optional<mx::array>& starts = std::nullopt,
+    mx::StreamOrDevice s = {});
+
+// sdpa_decode_gqa_kvarn returning {out, lse}; lse as sdpa_decode_gqa_lse.
+std::vector<mx::array> sdpa_decode_gqa_kvarn_lse(
+    mx::array q,
+    mx::array codes_k,
+    mx::array axes_k,
+    mx::array codes_v,
+    mx::array axes_v,
+    mx::array stage_k,
+    mx::array stage_v,
+    int n,
+    float scale,
+    int k_bits,
+    int v_bits,
+    const std::optional<mx::array>& sinks = std::nullopt,
+    int splits = 0,
+    int tile_c = 32,
+    const std::optional<mx::array>& starts = std::nullopt,
+    mx::StreamOrDevice s = {});
+
 // Speculative-verify attention on the GPU matrix units for a GQA-folded query
 // tile. The caller folds q [B, Hq, qL, D] -> [B, Hkv, G*qL, D] (kv-major
 // heads) and passes the original qL, so folded row r is causally clamped to
@@ -824,7 +878,11 @@ class KQuantSDPAGQA : public mx::Primitive {
       bool has_starts,
       bool has_kv_q8 = false,
       bool return_lse = false,
-      bool paged = false)
+      bool paged = false,
+      bool has_kvarn = false,
+      int kvarn_k_bits = 0,
+      int kvarn_v_bits = 0,
+      int kvarn_n = 0)
       : mx::Primitive(stream),
         scale_(scale),
         splits_(splits),
@@ -833,7 +891,11 @@ class KQuantSDPAGQA : public mx::Primitive {
         has_starts_(has_starts),
         has_kv_q8_(has_kv_q8),
         return_lse_(return_lse),
-        paged_(paged) {}
+        paged_(paged),
+        has_kvarn_(has_kvarn),
+        kvarn_k_bits_(kvarn_k_bits),
+        kvarn_v_bits_(kvarn_v_bits),
+        kvarn_n_(kvarn_n) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -859,6 +921,10 @@ class KQuantSDPAGQA : public mx::Primitive {
   bool paged_ = false;
   bool has_kv_q8_;
   bool return_lse_;
+  bool has_kvarn_ = false;
+  int kvarn_k_bits_ = 0;
+  int kvarn_v_bits_ = 0;
+  int kvarn_n_ = 0;
 };
 
 // Simdgroup-matrix FA verify attention (see sdpa_fa_verify). Inference-only.

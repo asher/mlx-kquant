@@ -31,6 +31,35 @@ constant bool gqa_cascade [[function_constant(7)]];
 // selected C-row pages (sparse top-k attention) instead of the contiguous
 // [0, N) axis. Compiled out when false.
 constant bool gqa_paged [[function_constant(8)]];
+// KVarN-backed KV (kq_kvarn.h records + fp16 rotated stage): keys/values
+// bind as record words with per-record strides, axes and stage bind at
+// buffers 24-27, and tile staging dequantizes in place. The bit widths are
+// function constants so the extraction loops specialize per (k, v) pair;
+// pipeline hashes must carry a "_kv<k><v>" token. Callers that never set
+// these constants get the compiled-out default (defined-check below), so
+// only the kvarn dispatch site binds the extra buffers. D=128 only.
+constant bool gqa_kv_kvarn_fc [[function_constant(9)]];
+constant int kvarn_k_bits_fc [[function_constant(10)]];
+constant int kvarn_v_bits_fc [[function_constant(11)]];
+constant bool gqa_kv_kvarn =
+    is_function_constant_defined(gqa_kv_kvarn_fc) ? gqa_kv_kvarn_fc : false;
+constant int kvarn_k_bits =
+    is_function_constant_defined(kvarn_k_bits_fc) ? kvarn_k_bits_fc : 6;
+constant int kvarn_v_bits =
+    is_function_constant_defined(kvarn_v_bits_fc) ? kvarn_v_bits_fc : 6;
+
+// KVarN region map for the decode kernel: keys [0, sink_rows) read stage
+// rows [0, sink_rows); keys [sink_rows, sink_rows + n_rec_keys) read sealed
+// records; later keys read stage rows from live_row0. Mirrored in
+// kquant_sdpa.cpp; layouts must match field for field.
+struct KQKvarnMeta {
+  int sink_rows;
+  int n_rec_keys;
+  int live_row0;
+  int pad;
+  ulong stage_k_head;
+  ulong stage_v_head;
+};
 
 template <typename T, int D, int V = D>
 [[kernel]] void kq_sdpa_vector_2pass_1(
@@ -238,6 +267,11 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
     const constant size_t& vs_seq_stride [[buffer(21)]],
     const device int* pages [[buffer(22)]],
     const constant int& n_pages [[buffer(23)]],
+    const device half* kvarn_axes_k [[buffer(24)]],
+    const device half* kvarn_axes_v [[buffer(25)]],
+    const device half* kvarn_stage_k [[buffer(26)]],
+    const device half* kvarn_stage_v [[buffer(27)]],
+    const constant KQKvarnMeta& kvm [[buffer(28)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -350,7 +384,152 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
     // unit -- 16 consecutive elements never straddle a 64-element group --
     // instead of per-word scalar traffic, which measured ~40% below the
     // fp16 kernel's bandwidth.
-    if (gqa_kv_q8) {
+    if (gqa_kv_kvarn) {
+      // KVarN tile staging. C divides 128 and every region bound is either
+      // group-aligned or N itself, so a tile reads exactly one region:
+      // stage rows (sink or live, fp16 [token][dim]) or one sealed record
+      // (kq_kvarn.h: K rows are dims x token columns, V rows are tokens x
+      // dim columns; LSB-first row bitstreams).
+      threadgroup T* sKh = (threadgroup T*)sK;
+      threadgroup T* sVh = (threadgroup T*)sV;
+      const int rec_end = kvm.sink_rows + kvm.n_rec_keys;
+      if (kt < kvm.sink_rows || kt >= rec_end) {
+        const int srow0 =
+            kt < kvm.sink_rows ? kt : kvm.live_row0 + (kt - rec_end);
+        const device half* stk = kvarn_stage_k + kv_hb * kvm.stage_k_head;
+        const device half* stv = kvarn_stage_v + kv_hb * kvm.stage_v_head;
+        for (int i = flat; i < C * D4; i += n_threads) {
+          const int row = i / D4;
+          const int col = i % D4;
+          const int kg = kt + row;
+          if (kg < kend) {
+            const device half4* kr =
+                (const device half4*)(stk + (size_t)(srow0 + row) * D);
+            const device half4* vr =
+                (const device half4*)(stv + (size_t)(srow0 + row) * D);
+            sK[i] = T4(float4(kr[col]));
+            sV[i] = T4(float4(vr[col]));
+          } else {
+            sK[i] = T4(T(0));
+            sV[i] = T4(T(0));
+          }
+        }
+      } else {
+        const int rk = kt - kvm.sink_rows;
+        const int rec = rk >> 7; // sealed group index
+        const int c0 = rk & 127; // first token column within the group
+        const device uint32_t* krec = kwbase + (size_t)rec * k_seq_stride;
+        const device uint32_t* vrec = vwbase + (size_t)rec * v_seq_stride;
+        const device half* kax =
+            kvarn_axes_k + kv_hb * ks_head_stride + (size_t)rec * ks_seq_stride;
+        const device half* vax =
+            kvarn_axes_v + kv_hb * vs_head_stride + (size_t)rec * vs_seq_stride;
+        const uint kmask = (1u << kvarn_k_bits) - 1u;
+        const uint vmask = (1u << kvarn_v_bits) - 1u;
+        // Both loaders stage a unit's record words in registers and extract
+        // with fully unrolled loops: the bit widths are function constants,
+        // so every word index and shift folds at pipeline build (no dynamic
+        // register indexing, no 64-bit arithmetic). Axis values broadcast
+        // through simd_shuffle from one per-lane preload instead of
+        // per-element device loads. Record rows are always in-bounds
+        // memory, so validity applies at the store, keeping the simdgroup
+        // convergent for the shuffles.
+        //
+        // V units: (32-dim segment, token row); with C == 32 a simdgroup
+        // covers one segment with row == lane, so the segment's other_axis
+        // slice lives in one register per lane. A segment's start bit is
+        // word-aligned for every width and spans exactly kvarn_v_bits
+        // words.
+        for (int u = flat; u < C * (D / 32); u += n_threads) {
+          const int seg = u / C;
+          const int row = u % C;
+          threadgroup T4* dst = (threadgroup T4*)(sVh + row * D + seg * 32);
+          const int vr = c0 + row;
+          const device uint32_t* w =
+              vrec + (size_t)vr * 4 * kvarn_v_bits + (size_t)seg * kvarn_v_bits;
+          uint wreg[8];
+#pragma unroll
+          for (short t = 0; t < 8; t++) {
+            wreg[t] = t < kvarn_v_bits ? w[t] : 0u;
+          }
+          const float other_l = float(vax[256 + seg * 32 + lane]);
+          const float vsc = float(vax[vr]);
+          const float vzp = float(vax[128 + vr]);
+          const bool valid = kt + row < kend;
+#pragma unroll
+          for (short j4 = 0; j4 < 8; j4++) {
+            float4 f;
+#pragma unroll
+            for (short jj = 0; jj < 4; jj++) {
+              const int j = j4 * 4 + jj;
+              const int bit = j * kvarn_v_bits;
+              const int wi = bit >> 5;
+              const int sh = bit & 31;
+              uint qv = wreg[wi] >> sh;
+              if (sh + kvarn_v_bits > 32) {
+                qv |= wreg[wi + 1] << (32 - sh);
+              }
+              const float other = C == 32 ? simd_shuffle(other_l, ushort(j))
+                                          : float(vax[256 + seg * 32 + j]);
+              f[jj] = (float(qv & vmask) * vsc + vzp) * other;
+            }
+            dst[j4] = valid ? T4(f) : T4(T(0));
+          }
+        }
+        // K units: one record dim-row each, extracting this tile's C token
+        // columns and scattering transposed into sK. The tile's C-wide
+        // other_axis slice broadcasts from one per-lane preload. At C == 32
+        // (and even widths at C == 16) the segment start is word-aligned,
+        // so the extraction unrolls with compile-time shifts; the unaligned
+        // C == 16 odd-width case falls back to device-indexed extraction.
+        const int kb0 = c0 * kvarn_k_bits;
+        // Lanes past C are never shuffled from; clamp keeps their preload
+        // in bounds at C == 16.
+        const float otherk_l = float(kax[256 + min(c0 + lane, 127)]);
+        for (int u = flat; u < D; u += n_threads) {
+          const device uint32_t* w =
+              krec + (size_t)u * 4 * kvarn_k_bits + (kb0 >> 5);
+          const float ksc = float(kax[u]);
+          const float kzp = float(kax[128 + u]);
+          if ((kb0 & 31) == 0) {
+            uint wreg[8];
+#pragma unroll
+            for (short t = 0; t < 8; t++) {
+              wreg[t] = t * 32 < C * kvarn_k_bits ? w[t] : 0u;
+            }
+#pragma unroll
+            for (short j = 0; j < C; j++) {
+              const int bit = j * kvarn_k_bits;
+              const int wi = bit >> 5;
+              const int sh = bit & 31;
+              uint qk = wreg[wi] >> sh;
+              if (sh + kvarn_k_bits > 32) {
+                qk |= wreg[wi + 1] << (32 - sh);
+              }
+              const float other = simd_shuffle(otherk_l, ushort(j));
+              sKh[j * D + u] = kt + j < kend
+                  ? T((float(qk & kmask) * ksc + kzp) * other)
+                  : T(0);
+            }
+          } else {
+            int bit = kb0 & 31;
+            for (int j = 0; j < C; j++) {
+              const int wi = bit >> 5;
+              const int sh = bit & 31;
+              uint qk = w[wi] >> sh;
+              if (sh + kvarn_k_bits > 32) {
+                qk |= w[wi + 1] << (32 - sh);
+              }
+              bit += kvarn_k_bits;
+              const float other = simd_shuffle(otherk_l, ushort(j));
+              sKh[j * D + u] = kt + j < kend
+                  ? T((float(qk & kmask) * ksc + kzp) * other)
+                  : T(0);
+            }
+          }
+        }
+      }
+    } else if (gqa_kv_q8) {
       constexpr int DU = D / 16; // uint4 units per row
       for (int u = flat; u < C * DU; u += n_threads) {
         const int row = u / DU;
