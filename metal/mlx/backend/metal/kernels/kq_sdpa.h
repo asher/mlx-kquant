@@ -50,13 +50,15 @@ constant int kvarn_v_bits =
 
 // KVarN region map for the decode kernel: keys [0, sink_rows) read stage
 // rows [0, sink_rows); keys [sink_rows, sink_rows + n_rec_keys) read sealed
-// records; later keys read stage rows from live_row0. Mirrored in
-// kquant_sdpa.cpp; layouts must match field for field.
+// records; later keys read stage rows from live_row0. full_vis lifts the
+// per-query causal clamp (a precision-tail body segment ends before every
+// query's position, so all of its keys are visible at any query width).
+// Mirrored in kquant_sdpa.cpp; layouts must match field for field.
 struct KQKvarnMeta {
   int sink_rows;
   int n_rec_keys;
   int live_row0;
-  int pad;
+  int full_vis;
   ulong stage_k_head;
   ulong stage_v_head;
 };
@@ -338,13 +340,14 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
       (const device T4*)(queries + ((size_t)q_batch_head_idx * nq + qz0) * D);
   float4 qf[QPS][DP4];
   int lim[QPS]; // highest key each query may attend (its causal position)
+  const bool full_vis = gqa_kv_kvarn && kvm.full_vis != 0;
   for (short p = 0; p < QPS; p++) {
     const bool active = qz0 + p < nq;
     for (short ii = 0; ii < DP4; ii++) {
       qf[p][ii] = active ? scale * float4(q4[(size_t)p * D4 + ii * NL + tx])
                          : float4(0);
     }
-    lim[p] = active ? N - nq + qz0 + p : -1;
+    lim[p] = active ? (full_vis ? N - 1 : N - nq + qz0 + p) : -1;
   }
 
   float max_score[QPS];

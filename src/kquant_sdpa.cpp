@@ -59,7 +59,7 @@ struct KQKvarnMeta {
   int32_t sink_rows;
   int32_t n_rec_keys;
   int32_t live_row0;
-  int32_t pad;
+  int32_t full_vis;
   uint64_t stage_k_head;
   uint64_t stage_v_head;
 };
@@ -238,8 +238,9 @@ void KQuantSDPAGQA::eval_gpu(
   int D = q.shape(3);
   int n_kv_heads = k.shape(1);
   // With kvarn the key count comes from the op (codes/stage are
-  // capacity-sized), not the codes shape.
-  int kL = kvarn ? kvarn_n_ : k.shape(2);
+  // capacity-sized), not the codes shape. A tail-merge body walks only the
+  // first n_attend keys while the region map stays on the full layout.
+  int kL = kvarn ? (kvarn_n_attend_ ? kvarn_n_attend_ : kvarn_n_) : k.shape(2);
   int gqa_factor = n_q_heads / n_kv_heads;
   // Auto splits: coarse buckets (a per-kL value would mint a new pipeline
   // specialization every decode step). Measured on M5 Max: more splits win as
@@ -383,9 +384,10 @@ void KQuantSDPAGQA::eval_gpu(
       const auto& stk = inputs[qkv_idx + 2];
       const auto& stv = inputs[qkv_idx + 3];
       const int sink_cap = stk.shape(2) - 128;
-      kvm.sink_rows = std::min(kL, sink_cap);
-      kvm.n_rec_keys = std::max(0, (kL - sink_cap) / 128) * 128;
+      kvm.sink_rows = std::min(kvarn_n_, sink_cap);
+      kvm.n_rec_keys = std::max(0, (kvarn_n_ - sink_cap) / 128) * 128;
       kvm.live_row0 = sink_cap;
+      kvm.full_vis = kvarn_full_vis_ ? 1 : 0;
       kvm.stage_k_head = static_cast<uint64_t>(
           stk.shape(1) == 1 ? stk.strides(0) : stk.strides(1));
       kvm.stage_v_head = static_cast<uint64_t>(
@@ -999,7 +1001,8 @@ bool KQuantSDPAGQA::is_equivalent(const mx::Primitive& other) const {
       has_kv_q8_ == o.has_kv_q8_ && return_lse_ == o.return_lse_ &&
       paged_ == o.paged_ && has_kvarn_ == o.has_kvarn_ &&
       kvarn_k_bits_ == o.kvarn_k_bits_ && kvarn_v_bits_ == o.kvarn_v_bits_ &&
-      kvarn_n_ == o.kvarn_n_;
+      kvarn_n_ == o.kvarn_n_ && kvarn_n_attend_ == o.kvarn_n_attend_ &&
+      kvarn_full_vis_ == o.kvarn_full_vis_;
 }
 
 static std::vector<mx::array> sdpa_decode_gqa_impl(
@@ -1346,6 +1349,8 @@ static std::vector<mx::array> sdpa_decode_gqa_kvarn_impl(
     int splits,
     int tile_c,
     const std::optional<mx::array>& starts,
+    int n_attend,
+    bool full_visibility,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
 
@@ -1431,6 +1436,20 @@ static std::vector<mx::array> sdpa_decode_gqa_kvarn_impl(
         "[mlx_kquant.sdpa_decode_gqa_kvarn] n exceeds the sink + record + "
         "live capacity of the operands.");
   }
+  if (n_attend != 0 && (n_attend < qL || n_attend > n)) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa_kvarn] n_attend must be in "
+        "[query length, n].");
+  }
+  if (full_visibility) {
+    const int span = n_attend ? n_attend : n;
+    if (span > n - qL + 1) {
+      throw std::invalid_argument(
+          "[mlx_kquant.sdpa_decode_gqa_kvarn] full_visibility requires the "
+          "attended span to end at or before every query's causal position "
+          "(n_attend <= n - query length + 1).");
+    }
+  }
   if (n_kv_heads == 0 || n_q_heads % n_kv_heads != 0) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa_kvarn] n_q_heads must be a multiple of "
@@ -1513,7 +1532,9 @@ static std::vector<mx::array> sdpa_decode_gqa_kvarn_impl(
       true,
       k_bits,
       v_bits,
-      n);
+      n,
+      n_attend,
+      full_visibility);
   auto out_shape = q.shape();
   if (return_lse) {
     mx::Shape lse_shape = {B, n_q_heads, qL};
@@ -1543,6 +1564,8 @@ mx::array sdpa_decode_gqa_kvarn(
     int splits,
     int tile_c,
     const std::optional<mx::array>& starts,
+    int n_attend,
+    bool full_visibility,
     mx::StreamOrDevice s_) {
   return sdpa_decode_gqa_kvarn_impl(
       false,
@@ -1561,6 +1584,8 @@ mx::array sdpa_decode_gqa_kvarn(
       splits,
       tile_c,
       starts,
+      n_attend,
+      full_visibility,
       s_)[0];
 }
 
@@ -1580,6 +1605,8 @@ std::vector<mx::array> sdpa_decode_gqa_kvarn_lse(
     int splits,
     int tile_c,
     const std::optional<mx::array>& starts,
+    int n_attend,
+    bool full_visibility,
     mx::StreamOrDevice s_) {
   return sdpa_decode_gqa_kvarn_impl(
       true,
@@ -1598,6 +1625,8 @@ std::vector<mx::array> sdpa_decode_gqa_kvarn_lse(
       splits,
       tile_c,
       starts,
+      n_attend,
+      full_visibility,
       s_);
 }
 

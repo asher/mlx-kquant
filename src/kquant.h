@@ -214,8 +214,13 @@ std::vector<mx::array> sdpa_decode_gqa_lse(
 // [B, Hkv, Gcap, 3, 128] per side; Gcap only needs to cover the sealed
 // groups. q [B, n_q_heads, qL, 128] float16/bfloat16, qL 1 (decode) to 4
 // (speculative-verify width). k_bits/v_bits in {2, 3, 4, 5, 6, 8} may
-// differ. sinks/starts/splits/tile_c as sdpa_decode_gqa. head_dim 128 only.
-// Metal-only.
+// differ. sinks/starts/splits/tile_c as sdpa_decode_gqa.
+//
+// Precision-tail body segments: n_attend > 0 walks only the first n_attend
+// keys while the region map stays on the full n-key layout (the tail overlay
+// covers the rest). full_visibility lifts the per-query causal clamp; it
+// requires n_attend <= n - qL + 1 so every walked key precedes every query.
+// head_dim 128 only. Metal-only.
 mx::array sdpa_decode_gqa_kvarn(
     mx::array q,
     mx::array codes_k,
@@ -232,6 +237,8 @@ mx::array sdpa_decode_gqa_kvarn(
     int splits = 0,
     int tile_c = 32,
     const std::optional<mx::array>& starts = std::nullopt,
+    int n_attend = 0,
+    bool full_visibility = false,
     mx::StreamOrDevice s = {});
 
 // sdpa_decode_gqa_kvarn returning {out, lse}; lse as sdpa_decode_gqa_lse.
@@ -251,6 +258,8 @@ std::vector<mx::array> sdpa_decode_gqa_kvarn_lse(
     int splits = 0,
     int tile_c = 32,
     const std::optional<mx::array>& starts = std::nullopt,
+    int n_attend = 0,
+    bool full_visibility = false,
     mx::StreamOrDevice s = {});
 
 // Speculative-verify attention on the GPU matrix units for a GQA-folded query
@@ -882,7 +891,9 @@ class KQuantSDPAGQA : public mx::Primitive {
       bool has_kvarn = false,
       int kvarn_k_bits = 0,
       int kvarn_v_bits = 0,
-      int kvarn_n = 0)
+      int kvarn_n = 0,
+      int kvarn_n_attend = 0,
+      bool kvarn_full_vis = false)
       : mx::Primitive(stream),
         scale_(scale),
         splits_(splits),
@@ -895,7 +906,9 @@ class KQuantSDPAGQA : public mx::Primitive {
         has_kvarn_(has_kvarn),
         kvarn_k_bits_(kvarn_k_bits),
         kvarn_v_bits_(kvarn_v_bits),
-        kvarn_n_(kvarn_n) {}
+        kvarn_n_(kvarn_n),
+        kvarn_n_attend_(kvarn_n_attend),
+        kvarn_full_vis_(kvarn_full_vis) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -925,6 +938,8 @@ class KQuantSDPAGQA : public mx::Primitive {
   int kvarn_k_bits_ = 0;
   int kvarn_v_bits_ = 0;
   int kvarn_n_ = 0;
+  int kvarn_n_attend_ = 0;
+  bool kvarn_full_vis_ = false;
 };
 
 // Simdgroup-matrix FA verify attention (see sdpa_fa_verify). Inference-only.

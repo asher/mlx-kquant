@@ -984,6 +984,8 @@ NB_MODULE(_ext, m) {
          int splits,
          int tile_c,
          const std::optional<mx::array>& starts,
+         int n_attend,
+         bool full_visibility,
          bool return_lse,
          mx::StreamOrDevice s) -> nb::object {
         if (return_lse) {
@@ -1003,6 +1005,8 @@ NB_MODULE(_ext, m) {
               splits,
               tile_c,
               starts,
+              n_attend,
+              full_visibility,
               s);
           return nb::make_tuple(outs[0], outs[1]);
         }
@@ -1022,6 +1026,8 @@ NB_MODULE(_ext, m) {
             splits,
             tile_c,
             starts,
+            n_attend,
+            full_visibility,
             s));
       },
       "q"_a,
@@ -1040,6 +1046,8 @@ NB_MODULE(_ext, m) {
       "tile_c"_a = 0,
       "starts"_a = nb::none(),
       nb::kw_only(),
+      "n_attend"_a = 0,
+      "full_visibility"_a = false,
       "return_lse"_a = false,
       "stream"_a = nb::none(),
       R"(
@@ -1073,6 +1081,14 @@ NB_MODULE(_ext, m) {
             splits (int): key-axis split count; 0 picks the default.
             tile_c (int): staged tile height, 32 or 16; 0 picks 32.
             starts (array, optional): int32 [B] per-row key starts.
+            n_attend (int): walk only the first n_attend keys while the
+                region map stays on the full n-key layout; 0 walks all n.
+                Precision-tail body segments set this to n minus the tail
+                overlay length.
+            full_visibility (bool): lift the per-query causal clamp;
+                requires n_attend <= n - qL + 1 so every walked key
+                precedes every query. Used with return_lse for tail
+                merges.
             return_lse (bool): also return the natural-log softmax
                 normalizer [B, n_q_heads, qL] float32.
 

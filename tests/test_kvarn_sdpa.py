@@ -215,6 +215,88 @@ def test_multi_group_sink():
     assert_bit_equal(out, ref)
 
 
+def test_n_attend_matches_truncated_reference():
+    # Body walk of a tail merge: first 800 of 1000 keys, region map still on
+    # the full layout. The 800-key cut lands mid-record. At qL 1 the causal
+    # clamp is inert, so full_visibility must not change the result.
+    st = build_state(1, 2, 1000, 6, 6, seed=10)
+    q = mx.array(make_q(1, 8, 1))
+    args = (
+        st["codes_k"],
+        st["axes_k"],
+        st["codes_v"],
+        st["axes_v"],
+        st["stage_k"],
+        st["stage_v"],
+    )
+    out = kq.sdpa_decode_gqa_kvarn(q, *args, 1000, SCALE, 6, 6, n_attend=800)
+    out_fv = kq.sdpa_decode_gqa_kvarn(
+        q, *args, 1000, SCALE, 6, 6, n_attend=800, full_visibility=True
+    )
+    k_ref, v_ref = materialize(st, mx.float16)
+    ref = kq.sdpa_decode_gqa(q, k_ref[:, :, :800], v_ref[:, :, :800], SCALE)
+    assert_bit_equal(out, ref)
+    assert_bit_equal(out_fv, ref)
+
+
+def lse_merge(ob, lb, ot, lt):
+    """Numerically stable two-segment softmax merge in fp32."""
+    ob, ot = ob.astype(mx.float32), ot.astype(mx.float32)
+    m = mx.maximum(lb, lt)
+    wb, wt = mx.exp(lb - m), mx.exp(lt - m)
+    out = (ob * wb[..., None] + ot * wt[..., None]) / (wb + wt)[..., None]
+    return out, m + mx.log(wb + wt)
+
+
+@pytest.mark.parametrize("ql", [1, 2, 3, 4])
+def test_tail_lse_merge_composition(ql):
+    # Precision-tail shape: body = fused kvarn over keys [0, 200) with the
+    # causal clamp lifted, tail = plain sdpa over raw rows [200, 260) where
+    # offset causality is exact for trailing queries. The LSE merge must
+    # reproduce a single attention over the concatenated key values. The
+    # body cut keeps 72 of record 0's 128 keys, so a clamp that is not
+    # lifted would hide body keys from early queries and fail loudly.
+    N, A = 260, 200
+    st = build_state(1, 2, N, 6, 6, seed=20 + ql)
+    q = mx.array(make_q(1, 8, ql))
+    args = (
+        st["codes_k"],
+        st["axes_k"],
+        st["codes_v"],
+        st["axes_v"],
+        st["stage_k"],
+        st["stage_v"],
+    )
+    body, lse_b = kq.sdpa_decode_gqa_kvarn(
+        q,
+        *args,
+        N,
+        SCALE,
+        6,
+        6,
+        n_attend=A,
+        full_visibility=True,
+        return_lse=True,
+    )
+    tail, lse_t = kq.sdpa_decode_gqa(
+        q, st["kx"][:, :, A:], st["vx"][:, :, A:], SCALE, return_lse=True
+    )
+    merged, lse_m = lse_merge(body, lse_b, tail, lse_t)
+
+    k_m, v_m = materialize(st, mx.float16)
+    k_ref = mx.concatenate([k_m[:, :, :A], st["kx"][:, :, A:]], axis=2)
+    v_ref = mx.concatenate([v_m[:, :, :A], st["vx"][:, :, A:]], axis=2)
+    ref, lse_ref = kq.sdpa_decode_gqa(q, k_ref, v_ref, SCALE, return_lse=True)
+    mx.eval(merged, lse_m, ref, lse_ref)
+
+    # Not bit-exact: the merge re-rounds fp16 partial outputs and the split
+    # structure differs from the single call.
+    np.testing.assert_allclose(
+        np.array(merged), np.array(ref.astype(mx.float32)), rtol=2e-3, atol=2e-3
+    )
+    np.testing.assert_allclose(np.array(lse_m), np.array(lse_ref), rtol=1e-5, atol=1e-4)
+
+
 def test_rejects_malformed():
     st = build_state(1, 2, 300, 6, 6, seed=9)
     q = mx.array(make_q(1, 8, 1))
@@ -237,3 +319,10 @@ def test_rejects_malformed():
     with pytest.raises(ValueError):
         # D != 128
         kq.sdpa_decode_gqa_kvarn(q[..., :64], *args, 300, SCALE, 6, 6)
+    with pytest.raises(ValueError):
+        # n_attend beyond n
+        kq.sdpa_decode_gqa_kvarn(q, *args, 300, SCALE, 6, 6, n_attend=400)
+    with pytest.raises(ValueError):
+        # full visibility over keys at or past a query's causal position
+        q4 = mx.array(make_q(1, 8, 4))
+        kq.sdpa_decode_gqa_kvarn(q4, *args, 300, SCALE, 6, 6, full_visibility=True)
