@@ -29,6 +29,19 @@ nb::object meta_to_py(const mlx_kquant::GgufMetaValue& v) {
       v);
 }
 
+// Map a KVarN tile-orientation string to the vside flag.
+bool kvarn_kind_is_v(const std::string& kind, const char* op) {
+  if (kind == "v") {
+    return true;
+  }
+  if (kind == "k") {
+    return false;
+  }
+  throw std::invalid_argument(
+      std::string("[mlx_kquant.") + op +
+      "] kind must be \"k\" or \"v\", got \"" + kind + "\".");
+}
+
 } // namespace
 
 NB_MODULE(_ext, m) {
@@ -871,6 +884,87 @@ NB_MODULE(_ext, m) {
 
         Returns:
             array: same shape and dtype as ``x``.
+      )");
+
+  m.def(
+      "kvarn_quantize",
+      [](mx::array x,
+         int bits,
+         const std::string& kind,
+         int iterations,
+         mx::StreamOrDevice s) {
+        return mlx_kquant::kvarn_quantize(
+            std::move(x),
+            bits,
+            kvarn_kind_is_v(kind, "kvarn_quantize"),
+            iterations,
+            s);
+      },
+      "x"_a,
+      "bits"_a,
+      "kind"_a,
+      "iterations"_a = 16,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        KVarN KV-cache group quantizer (BeeLlama variant). Per 128-token
+        group of one kv-head slice: 16-iteration log-domain Sinkhorn
+        variance normalization with best-imbalance selection, then per-row
+        asymmetric RTN, packed as an LSB-first row bitstream with the row
+        scale/zero-point absorbed into fp16 axis vectors. K tiles are
+        [row=dim][col=token], V tiles [row=token][col=dim]. Oracle:
+        tests/kvarn_ref.py.
+
+        Args:
+            x (array): rotated fp16 stage [..., T, 128], T % 128 == 0.
+            bits (int): code width, one of 2/3/4/5/6/8.
+            kind (str): "k" or "v" tile orientation.
+            iterations (int): Sinkhorn iterations. Default 16.
+
+        Returns:
+            tuple(array, array): codes uint32 [..., T/128, 512*bits]
+            (row r at words [r*4*bits, (r+1)*4*bits)) and axes float16
+            [..., T/128, 3, 128] (scale_axis, zp_axis, other_axis).
+      )");
+
+  m.def(
+      "kvarn_dequant",
+      [](mx::array codes,
+         mx::array axes,
+         int bits,
+         const std::string& kind,
+         std::optional<mx::Dtype> dtype,
+         mx::StreamOrDevice s) {
+        return mlx_kquant::kvarn_dequant(
+            std::move(codes),
+            std::move(axes),
+            bits,
+            kvarn_kind_is_v(kind, "kvarn_dequant"),
+            dtype.value_or(mx::float16),
+            s);
+      },
+      "codes"_a,
+      "axes"_a,
+      "bits"_a,
+      "kind"_a,
+      "dtype"_a = nb::none(),
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Dequantize kvarn_quantize records back to the rotated group
+        [..., T/128 * 128, 128]: x = (q * scale_axis[row] + zp_axis[row])
+        * other_axis[col] with row = token for kind "v" and row = dim for
+        kind "k".
+
+        Args:
+            codes (array): uint32 [..., G, 512*bits] from kvarn_quantize.
+            axes (array): float16 [..., G, 3, 128] from kvarn_quantize.
+            bits (int): code width, one of 2/3/4/5/6/8.
+            kind (str): "k" or "v", matching the quantize call.
+            dtype (Dtype, optional): float16 or bfloat16. Default float16.
+
+        Returns:
+            array: the rotated-domain reconstruction.
       )");
 
   m.def(

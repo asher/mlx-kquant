@@ -495,6 +495,35 @@ mx::array dsa_indexer_scores_q(
 // with the split + fp8-core + concat + astype chain. Metal-only.
 mx::array dsa_kv_qat(mx::array x, int n_rot, mx::StreamOrDevice s = {});
 
+// KVarN KV-cache group quantizer (BeeLlama variant): per 128-token group
+// of one kv-head slice, 16-iteration log-domain Sinkhorn variance
+// normalization with best-imbalance selection, then per-row asymmetric
+// RTN with the row scale/zero-point absorbed into fp16 axis vectors.
+// x is the rotated fp16 stage [..., T, 128] with T % 128 == 0; vside
+// selects tile orientation (false: K, rows = dims; true: V, rows =
+// tokens). Returns {codes uint32 [..., T/128, 512*bits] (LSB-first row
+// bitstream, row r at words [r*4*bits, (r+1)*4*bits)), axes float16
+// [..., T/128, 3, 128] (scale_axis, zp_axis, other_axis)}.
+// bits in {2, 3, 4, 5, 6, 8}. Oracle: tests/kvarn_ref.py. Metal-only.
+std::vector<mx::array> kvarn_quantize(
+    mx::array x,
+    int bits,
+    bool vside,
+    int iterations = 16,
+    mx::StreamOrDevice s = {});
+
+// Dequantize kvarn_quantize records back to the rotated group
+// [..., T/128 * 128, 128]: x = (q * scale_axis[row] + zp_axis[row]) *
+// other_axis[col] with row = vside ? token : dim. out_dtype float16 or
+// bfloat16. Metal-only.
+mx::array kvarn_dequant(
+    mx::array codes,
+    mx::array axes,
+    int bits,
+    bool vside,
+    mx::Dtype out_dtype = mx::float16,
+    mx::StreamOrDevice s = {});
+
 // K-quant gathered matvec (down projection), same wire layout. x [T, R, K]
 // (one row per expert slot), indices [T, R]. Optional per-(expert, out_dim)
 // f32 bias [E, N] added to each gathered row (mxfp4/nvfp4 only). Returns
@@ -1258,6 +1287,66 @@ class KQDsaKvQat : public mx::Primitive {
 
  private:
   int n_rot_;
+};
+
+// KVarN group quantizer (see kvarn_quantize). Inference-only, Metal-only.
+class KQKvarnQuantize : public mx::Primitive {
+ public:
+  explicit KQKvarnQuantize(
+      mx::Stream stream,
+      int bits,
+      bool vside,
+      int iterations)
+      : mx::Primitive(stream),
+        bits_(bits),
+        vside_(vside),
+        iterations_(iterations) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQKvarnQuantize";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int bits_;
+  bool vside_;
+  int iterations_;
+};
+
+// KVarN record dequantizer (see kvarn_dequant). Inference-only, Metal-only.
+class KQKvarnDequant : public mx::Primitive {
+ public:
+  explicit KQKvarnDequant(mx::Stream stream, int bits, bool vside)
+      : mx::Primitive(stream), bits_(bits), vside_(vside) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQKvarnDequant";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int bits_;
+  bool vside_;
 };
 
 // K-quant fused MoE GLU gather (see moe_glu_gather_kq). Inference-only.
