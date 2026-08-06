@@ -82,6 +82,7 @@ from ._ext import (  # noqa: F401
     zero_copy_view_count,
 )
 from ._version import __version__
+from .kvarn import kvarn_rotate  # noqa: F401
 
 __all__ = [
     "__version__",
@@ -113,6 +114,7 @@ __all__ = [
     "gather_qmv_mix_ns_kq",
     "kvarn_dequant",
     "kvarn_quantize",
+    "kvarn_rotate",
     "load_gguf",
     "metallib_dir",
     "metallib_loads",

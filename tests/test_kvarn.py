@@ -196,6 +196,92 @@ def test_quantize_rejects_malformed(call):
         call(x)
 
 
+def _ulp16(a, b):
+    def key(x):
+        u = np.asarray(x, np.float16).view(np.uint16).astype(np.int64)
+        return np.where(u & 0x8000, 0xFFFF - u, u + 0x8000)
+
+    return np.abs(key(a) - key(b))
+
+
+@pytest.mark.parametrize("head_dim", (128, 256, 512))
+def test_rotate_matches_oracle_wht_fp32(head_dim):
+    # ref.wht_head is pinned bit-exact against the BeeLlama fixtures, so
+    # matching it here chains kvarn_rotate to the normative composite WHT.
+    x = (_rng(head_dim).standard_normal((512, head_dim)) * 3).astype(np.float32)
+    want = ref.wht_head(x)
+    got = np.array(kq.kvarn_rotate(mx.array(x)))
+    if head_dim == 128:
+        assert np.array_equal(got, want)
+    else:
+        # mlx's butterfly stage order differs in last fp32 ulps at 256/512.
+        np.testing.assert_allclose(got, want, rtol=1e-6, atol=5e-6)
+
+
+@pytest.mark.parametrize("head_dim", (128, 256, 512))
+def test_rotate_fp16_staging_path(head_dim):
+    # The fp16 stage must hold the fp32 rotation rounded once, not an fp16
+    # butterfly. At 128 this is bit-exact vs the oracle.
+    x = (_rng(head_dim + 50).standard_normal((2048, head_dim)) * 3).astype(np.float16)
+    want = ref.wht_head(x.astype(np.float32)).astype(np.float16)
+    got = np.array(kq.kvarn_rotate(mx.array(x)))
+    assert got.dtype == np.float16
+    if head_dim == 128:
+        assert np.array_equal(got, want)
+    else:
+        u = _ulp16(got, want)
+        absd = np.abs(got.astype(np.float32) - want.astype(np.float32))
+        assert np.all((u <= 1) | (absd <= 1e-6))
+        assert float((u > 0).mean()) <= 0.002
+
+
+@pytest.mark.parametrize("head_dim", (128, 256, 512))
+def test_rotate_self_inverse(head_dim):
+    x = _rng(head_dim + 70).standard_normal((256, head_dim)).astype(np.float16)
+    y = np.array(kq.kvarn_rotate(kq.kvarn_rotate(mx.array(x))))
+    np.testing.assert_allclose(
+        y.astype(np.float32), x.astype(np.float32), rtol=2e-3, atol=2e-3
+    )
+
+
+def test_rotate_dtype_override():
+    x = _rng(8).standard_normal((64, 128)).astype(np.float16)
+    out = kq.kvarn_rotate(mx.array(x), dtype=mx.float32)
+    assert out.dtype == mx.float32
+    assert np.array_equal(np.array(out), ref.wht_head(x.astype(np.float32)))
+
+
+def test_rotate_rejects_bad_head_dim():
+    with pytest.raises(ValueError):
+        kq.kvarn_rotate(mx.zeros((4, 64), dtype=mx.float16))
+
+
+@pytest.mark.parametrize("kind", SIDES)
+@pytest.mark.parametrize("bits", (2, 6))
+def test_full_pipeline_reconstruction(kind, bits):
+    # rotate -> quantize -> dequant -> unrotate must reconstruct as well as
+    # the oracle chain on the same data.
+    x = _rng(bits + 400).standard_normal((1, 2, 256, 128)).astype(np.float16)
+    stage = kq.kvarn_rotate(mx.array(x))
+    codes, axes = kq.kvarn_quantize(stage, bits, kind)
+    recon = kq.kvarn_rotate(kq.kvarn_dequant(codes, axes, bits, kind))
+    mx.eval(recon)
+    got = np.array(recon).astype(np.float32)
+
+    stage_np = np.array(stage)
+    oracle = np.stack(
+        [ref.dequant_tile(rec, kind) for _, rec in _oracle_tiles(stage_np, bits, kind)]
+    ).reshape(x.shape)
+    oracle = ref.wht_head(oracle.reshape(-1, 128)).reshape(x.shape)
+
+    xf = x.astype(np.float32)
+    rmse_kernel = float(np.sqrt(np.mean((got - xf) ** 2)))
+    rmse_oracle = float(np.sqrt(np.mean((oracle - xf) ** 2)))
+    assert rmse_kernel <= rmse_oracle * 1.05
+    if bits == 6:
+        assert rmse_kernel < 0.05 * float(xf.std())
+
+
 def test_dequant_rejects_malformed():
     x = mx.zeros((1, 1, 256, 128), dtype=mx.float16)
     codes, axes = kq.kvarn_quantize(x, 6, "k")
