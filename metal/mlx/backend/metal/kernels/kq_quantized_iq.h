@@ -210,17 +210,12 @@ struct KqExtDeq<KqIq3_xxsExt> {
     for (int t = 0; t < 2; ++t) {
       const int l = lbase + t;
       const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
-      const constant uint8_t* g0 =
-          reinterpret_cast<const constant uint8_t*>(iq3xxs_grid + qs[2 * l]);
-      const constant uint8_t* g1 = reinterpret_cast<const constant uint8_t*>(
-          iq3xxs_grid + qs[2 * l + 1]);
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const float v0 = float(g0[j]);
-        const float v1 = float(g1[j]);
-        reg[2 * t][j] = (signs & (1 << j)) ? -v0 : v0;
-        reg[2 * t + 1][j] = (signs & (1 << (j + 4))) ? -v1 : v1;
-      }
+      const float4 v0 = float4(as_type<uchar4>(iq3xxs_grid[qs[2 * l]]));
+      const float4 v1 = float4(as_type<uchar4>(iq3xxs_grid[qs[2 * l + 1]]));
+      reg[2 * t] =
+          select(v0, -v0, bool4(signs & 1, signs & 2, signs & 4, signs & 8));
+      reg[2 * t + 1] = select(
+          v1, -v1, bool4(signs & 16, signs & 32, signs & 64, signs & 128));
     }
   }
 };
@@ -361,18 +356,14 @@ struct KqExtDeq<KqIq3_sExt> {
       const int l = lbase + t;
       const int hi0 = (qhb << (8 - 2 * l)) & 256;
       const int hi1 = (qhb << (7 - 2 * l)) & 256;
-      const constant uint8_t* g0 = reinterpret_cast<const constant uint8_t*>(
-          iq3s_grid + (int(qs[2 * l]) | hi0));
-      const constant uint8_t* g1 = reinterpret_cast<const constant uint8_t*>(
-          iq3s_grid + (int(qs[2 * l + 1]) | hi1));
+      const float4 v0 =
+          float4(as_type<uchar4>(iq3s_grid[int(qs[2 * l]) | hi0]));
+      const float4 v1 =
+          float4(as_type<uchar4>(iq3s_grid[int(qs[2 * l + 1]) | hi1]));
       const uint8_t sb = signs[l];
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const float v0 = float(g0[j]);
-        const float v1 = float(g1[j]);
-        reg[2 * t][j] = (sb & (1 << j)) ? -v0 : v0;
-        reg[2 * t + 1][j] = (sb & (1 << (j + 4))) ? -v1 : v1;
-      }
+      reg[2 * t] = select(v0, -v0, bool4(sb & 1, sb & 2, sb & 4, sb & 8));
+      reg[2 * t + 1] =
+          select(v1, -v1, bool4(sb & 16, sb & 32, sb & 64, sb & 128));
     }
   }
 };
@@ -492,17 +483,20 @@ struct KqExtDeq<KqIq2_xxsExt> {
     const uint32_t signbits = uint32_t(qs[4]) | (uint32_t(qs[5]) << 8) |
         (uint32_t(qs[6]) << 16) | (uint32_t(qs[7]) << 24);
     scale = d * (0.5f + float(signbits >> 28)) * 0.25f;
+    // One u64 grid load + vector uchar4 -> float4 conversions + selects
+    // replace the per-byte load/convert/select chain. Integer-exact:
+    // outputs bit-identical to the scalar form.
 #pragma unroll
     for (int t = 0; t < 2; ++t) {
       const int l = lbase + t;
-      const constant uint8_t* gb =
-          reinterpret_cast<const constant uint8_t*>(iq2xxs_grid + qs[l]);
+      const uint64_t ge = iq2xxs_grid[qs[l]];
       const uint8_t signs = ksigns_iq2xs[(signbits >> (7 * l)) & 127];
-#pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        const float v = float(gb[j]);
-        reg[2 * t + j / 4][j % 4] = (signs & (1 << j)) ? -v : v;
-      }
+      const float4 v0 = float4(as_type<uchar4>(uint32_t(ge)));
+      const float4 v1 = float4(as_type<uchar4>(uint32_t(ge >> 32)));
+      reg[2 * t] =
+          select(v0, -v0, bool4(signs & 1, signs & 2, signs & 4, signs & 8));
+      reg[2 * t + 1] = select(
+          v1, -v1, bool4(signs & 16, signs & 32, signs & 64, signs & 128));
     }
   }
 };
@@ -630,14 +624,14 @@ struct KqExtDeq<KqIq2_xsExt> {
     for (int t = 0; t < 2; ++t) {
       const int l = lbase + t;
       const uint q = uint(qp[2 * l]) | (uint(qp[2 * l + 1]) << 8);
-      const constant uint8_t* gb =
-          reinterpret_cast<const constant uint8_t*>(iq2xs_grid + (q & 511));
+      const uint64_t ge = iq2xs_grid[q & 511];
       const uint8_t signs = ksigns_iq2xs[q >> 9];
-#pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        const float v = float(gb[j]);
-        reg[2 * t + j / 4][j % 4] = (signs & (1 << j)) ? -v : v;
-      }
+      const float4 v0 = float4(as_type<uchar4>(uint32_t(ge)));
+      const float4 v1 = float4(as_type<uchar4>(uint32_t(ge >> 32)));
+      reg[2 * t] =
+          select(v0, -v0, bool4(signs & 1, signs & 2, signs & 4, signs & 8));
+      reg[2 * t + 1] = select(
+          v1, -v1, bool4(signs & 16, signs & 32, signs & 64, signs & 128));
     }
   }
 };
@@ -773,14 +767,13 @@ struct KqExtDeq<KqIq2_sExt> {
     for (int t = 0; t < 2; ++t) {
       const int l = lbase + t;
       const int qi = int(qs[ib32 * 4 + l]) | ((qhb << (8 - 2 * l)) & 0x300);
-      const constant uint8_t* gb =
-          reinterpret_cast<const constant uint8_t*>(iq2s_grid + qi);
+      const uint64_t ge = iq2s_grid[qi];
       const uint8_t sb = signs[ib32 * 4 + l];
-#pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        const float v = float(gb[j]);
-        reg[2 * t + j / 4][j % 4] = (sb & (1 << j)) ? -v : v;
-      }
+      const float4 v0 = float4(as_type<uchar4>(uint32_t(ge)));
+      const float4 v1 = float4(as_type<uchar4>(uint32_t(ge >> 32)));
+      reg[2 * t] = select(v0, -v0, bool4(sb & 1, sb & 2, sb & 4, sb & 8));
+      reg[2 * t + 1] =
+          select(v1, -v1, bool4(sb & 16, sb & 32, sb & 64, sb & 128));
     }
   }
 };
