@@ -450,9 +450,8 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   ce.set_bytes(K, 7);
   ce.set_bytes(N, 8);
   // Signature parity with the plain kernels: the shexp epilogue takes the
-  // limit arg too (dead for silu/gelu; no shexp silu_limit instantiations).
-  const float limit = 0.0f;
-  ce.set_bytes(limit, 9);
+  // limit arg (live for silu_limit, dead for silu/gelu).
+  ce.set_bytes(limit_, 9);
   MTL::Size group_dims(32, 2, 1);
   MTL::Size grid_dims(N / (64 / nx), R + 1, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -736,7 +735,7 @@ void KQuantGatherQMVMixKQ::eval_cpu(
 bool KQuantMoEGLUShexpKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMoEGLUShexpKQ&>(other);
   return kquant_type_ == o.kquant_type_ && act_ == o.act_ &&
-      shexp_type_ == o.shexp_type_;
+      shexp_type_ == o.shexp_type_ && limit_ == o.limit_;
 }
 
 bool KQuantGatherQMVMixKQ::is_equivalent(const mx::Primitive& other) const {
@@ -1246,6 +1245,7 @@ mx::array moe_glu_gather_shexp_kq(
     const std::string& kquant_type,
     mx::array indices,
     const std::string& act,
+    float limit,
     const std::string& shexp_kquant_type,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
@@ -1268,9 +1268,13 @@ mx::array moe_glu_gather_shexp_kq(
     throw std::invalid_argument(
         std::string(op) + " x must be float16 or bfloat16.");
   }
-  if (act != "silu" && act != "gelu") {
+  if (act != "silu" && act != "gelu" && act != "silu_limit") {
     throw std::invalid_argument(
-        std::string(op) + " act must be 'silu' or 'gelu'.");
+        std::string(op) + " act must be 'silu', 'gelu' or 'silu_limit'.");
+  }
+  if (act == "silu_limit" && !(limit > 0.0f)) {
+    throw std::invalid_argument(
+        std::string(op) + " act 'silu_limit' requires limit > 0.");
   }
   int K = x.shape(1);
   check_kq_expert_stack(op, gate_w, kquant_type, K);
@@ -1288,7 +1292,8 @@ mx::array moe_glu_gather_shexp_kq(
   return mx::array(
       std::move(out_shape),
       dt,
-      std::make_shared<KQuantMoEGLUShexpKQ>(s, kquant_type, act, shexp_type),
+      std::make_shared<KQuantMoEGLUShexpKQ>(
+          s, kquant_type, act, shexp_type, limit),
       {std::move(gate_w),
        std::move(up_w),
        std::move(shexp_gate_w),

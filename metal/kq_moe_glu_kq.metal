@@ -39,6 +39,11 @@
       type,                                                           \
       KQ_GLU_ACT_GELU)                                                \
   instantiate_kernel(                                                 \
+      "kq_" #codec "_moe_glu_gather_shexp_silu_limit_" #type,         \
+      kq_ ## codec ## _moe_glu_gather_shexp,                          \
+      type,                                                           \
+      KQ_GLU_ACT_SILU_LIMIT)                                          \
+  instantiate_kernel(                                                 \
       "kq_" #codec "_gather_qmv_mix_" #type,                          \
       kq_ ## codec ## _gather_qmv_mix,                                \
       type)
@@ -93,6 +98,10 @@ instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
       "kq_" #codec "_moe_glu_gather_shexp_gelu" sfx "_" #type,                \
       kq_ext_moe_glu_gather_shexp, type, traits, traits, KQ_GLU_ACT_GELU, nx)  \
   instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_shexp_silu_limit" sfx "_" #type,          \
+      kq_ext_moe_glu_gather_shexp, type, traits, traits,                       \
+      KQ_GLU_ACT_SILU_LIMIT, nx)                                               \
+  instantiate_kernel(                                                         \
       "kq_" #codec "_gather_qmv_mix" sfx "_" #type,                           \
       kq_ext_gather_qmv_mix, type, traits, traits, nx)
 
@@ -110,6 +119,11 @@ instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
   instantiate_kernel(                                                         \
       "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_gelu" sfx "_" #type, \
       kq_ext_moe_glu_gather_shexp, type, traits, straits, KQ_GLU_ACT_GELU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_silu_limit" sfx      \
+      "_" #type,                                                              \
+      kq_ext_moe_glu_gather_shexp, type, traits, straits,                      \
+      KQ_GLU_ACT_SILU_LIMIT, nx)                                               \
   instantiate_kernel(                                                         \
       "kq_" #codec "_sx_" #scodec "_gather_qmv_mix" sfx "_" #type,            \
       kq_ext_gather_qmv_mix, type, traits, straits, nx)

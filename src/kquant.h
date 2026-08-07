@@ -523,6 +523,7 @@ mx::array moe_glu_gather_shexp_kq(
     const std::string& kquant_type,
     mx::array indices,
     const std::string& act = "silu",
+    float limit = 0.0f,
     const std::string& shexp_kquant_type = "",
     mx::StreamOrDevice s = {});
 
@@ -1385,11 +1386,13 @@ class KQuantMoEGLUShexpKQ : public mx::Primitive {
       mx::Stream stream,
       std::string kquant_type,
       std::string act,
-      std::string shexp_type)
+      std::string shexp_type,
+      float limit = 0.0f)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         act_(std::move(act)),
-        shexp_type_(std::move(shexp_type)) {}
+        shexp_type_(std::move(shexp_type)),
+        limit_(limit) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -1410,6 +1413,7 @@ class KQuantMoEGLUShexpKQ : public mx::Primitive {
   std::string kquant_type_;
   std::string act_;
   std::string shexp_type_;
+  float limit_;
 };
 
 // K-quant gathered matvec with routing mix folded in (see gather_qmv_mix_kq).
