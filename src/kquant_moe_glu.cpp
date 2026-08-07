@@ -307,16 +307,16 @@ void KQuantMoEGLUKQ::eval_gpu(
       xs_e[0] == '1' && xs_e[1] == '\0';
   // Row-paired variant (_r2) at the decode-scale NX = 16 width: two output
   // rows per thread halve x load issues (each activation chunk feeds four
-  // dots instead of two). Bit-identical outputs. Wins are codec-dependent
-  // (measured, chained decode-shape gather): iq2_xs +14%, iq1_s +7%,
-  // iq2_xxs +2.5%, q2_k +1.5%, q4_k/iq3_xxs +0.7%; near-wire codecs
-  // (q6_k/q8_0 at 550-575 GB/s) and the heavy-staged ones (iq2_s, iq3_s,
-  // q3_k, q5_k) lose 1-3% to register pressure, so the default is a
-  // measured allowlist. KQ_GLU_R2=1/0 forces on/off for every codec
-  // (live-read once set, KQ_MOE_NX pattern).
-  bool r2 = !biased && !xs && nx == 16 &&
-      (stem == "iq2_xxs" || stem == "iq2_xs" || stem == "iq1_s" ||
-       stem == "q2_k" || stem == "q4_k" || stem == "iq3_xxs");
+  // dots instead of two). Bit-identical outputs. Chained-isolation benches
+  // showed codec-dependent wins (iq2_xs +14%, iq1_s +7%, iq2_xxs +2.5%),
+  // but the one end-to-end test (DeepSeek-V4-Flash decode, iq2_xxs GLU)
+  // measured a consistent ~1% step-time regression in both ABA orders:
+  // halving grid.x moves the launch from the filled threadgroup regime
+  // into the underfilled one, and the chained bench's ramp-fill inflates
+  // exactly that regime. Default OFF everywhere until a codec earns an
+  // end-to-end win; KQ_GLU_R2=1 forces on for any codec (live-read once
+  // set, KQ_MOE_NX pattern).
+  bool r2 = false;
   {
     static const bool r2_env = std::getenv("KQ_GLU_R2") != nullptr;
     if (r2_env && !biased && !xs && nx == 16) {
