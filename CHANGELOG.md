@@ -21,6 +21,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - iq2_xxs / iq2_xs / iq2_s / iq3_s MoE gather decode is 9-12% faster per
   call (hoisted block scale, byte-indexed grids); the ext mat-vec at
   verify widths 2..8 gains 7-10% on the same codecs.
+- MoE GLU gather decode gains a row-paired kernel on codecs where it
+  measured faster (iq2_xs +14%, iq1_s +7%, iq2_xxs +2.5%, q2_k, q4_k,
+  iq3_xxs); the score-mixed down gather gains a slot-parallel kernel at
+  decode scale. Both are bit-identical to the prior kernels;
+  KQ_GLU_R2 / KQ_MOE_SP force either form.
 
 ## [0.3.9]
 
