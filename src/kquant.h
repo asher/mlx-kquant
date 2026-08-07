@@ -5,6 +5,7 @@
 
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "mlx/ops.h"
@@ -1995,5 +1996,11 @@ class KQuantEventWait : public mx::Primitive {
   uint64_t handle_;
   uint64_t value_;
 };
+
+// Runtime read/write of MLX's command-buffer split caps (ops, MB per
+// buffer). set returns the previous pair. GPU-only; see
+// kquant_cb_caps.cpp for the phase-flip rationale.
+std::pair<int, int> get_cb_caps();
+std::pair<int, int> set_cb_caps(int max_ops, int max_mb);
 
 } // namespace mlx_kquant

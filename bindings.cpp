@@ -1,5 +1,6 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
@@ -1255,6 +1256,34 @@ NB_MODULE(_ext, m) {
 
         Returns:
             array: [..., 4, D], dtype of resid.
+      )");
+
+  m.def(
+      "get_cb_caps",
+      &mlx_kquant::get_cb_caps,
+      R"(
+        Read MLX's live command-buffer split caps.
+
+        Returns:
+            tuple: (max_ops_per_buffer, max_mb_per_buffer).
+      )");
+
+  m.def(
+      "set_cb_caps",
+      &mlx_kquant::set_cb_caps,
+      "max_ops"_a,
+      "max_mb"_a,
+      R"(
+        Set MLX's command-buffer split caps at runtime. The env knobs
+        latch at device init; decode wants coarse buffers, deep prefill
+        fine ones, so servers flip these per phase.
+
+        Args:
+            max_ops (int): ops per command buffer, in [1, 2^30].
+            max_mb (int): MB per command buffer, in [1, 2^30].
+
+        Returns:
+            tuple: the previous (max_ops, max_mb).
       )");
 
   m.def(

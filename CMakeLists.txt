@@ -128,6 +128,7 @@ target_sources(
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_moe_glu.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_norm_fused.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_hc_glue.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_cb_caps.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_route_shed.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_skinny_mv.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gather.cpp
