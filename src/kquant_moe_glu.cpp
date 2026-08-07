@@ -71,6 +71,28 @@ inline const char* kq_nx_suffix(int nx) {
   return nx == 32 ? "_nx32" : (nx == 16 ? "_nx16" : "");
 }
 
+// Slot-parallel mix_ns (_sp): the S slot dots spread across S simdgroup
+// pairs, multiplying resident threads by S without shortening per-thread
+// K-chains (the widening lever that measured flat-to-negative on the
+// single-stream gathers). Outputs are bit-identical to the loop kernel.
+// Solo dispatch -5% at the V4-Flash down shape (the loop kernel's launch
+// ramp is occupancy-shy); E2E -0.1% pipelined / -0.5% naive, direction
+// consistent across 8 runs x 2 loop regimes x both ABA orders. Default: on
+// when the coarse grid underfills the device (decode-scale launches);
+// prefill-scale grids keep the loop kernel. KQ_MOE_SP=1/0 forces on/off;
+// read live once set so in-process A/Bs can flip arms.
+inline bool kq_moe_sp(int64_t coarse_tgs, int S) {
+  if (S < 2 || S > 16) {
+    return false; // threadgroup is 64 * S threads; 1024 cap => S <= 16
+  }
+  static const bool has_env = std::getenv("KQ_MOE_SP") != nullptr;
+  if (has_env) {
+    const char* e = std::getenv("KQ_MOE_SP");
+    return e != nullptr && std::atoi(e) != 0;
+  }
+  return coarse_tgs < 2048;
+}
+
 // KQ_MOE_NX_LOG=1: print each fused-MoE kernel name once (dispatch audit).
 inline void kq_moe_log_kname(const std::string& kname) {
   static const bool log = std::getenv("KQ_MOE_NX_LOG") != nullptr;
@@ -283,9 +305,28 @@ void KQuantMoEGLUKQ::eval_gpu(
   const bool xs = !biased && K <= 4096 &&
       (stem == "iq2_xxs" || stem == "q2_k") && xs_e != nullptr &&
       xs_e[0] == '1' && xs_e[1] == '\0';
+  // Row-paired variant (_r2) at the decode-scale NX = 16 width: two output
+  // rows per thread halve x load issues (each activation chunk feeds four
+  // dots instead of two). Bit-identical outputs. Wins are codec-dependent
+  // (measured, chained decode-shape gather): iq2_xs +14%, iq1_s +7%,
+  // iq2_xxs +2.5%, q2_k +1.5%, q4_k/iq3_xxs +0.7%; near-wire codecs
+  // (q6_k/q8_0 at 550-575 GB/s) and the heavy-staged ones (iq2_s, iq3_s,
+  // q3_k, q5_k) lose 1-3% to register pressure, so the default is a
+  // measured allowlist. KQ_GLU_R2=1/0 forces on/off for every codec
+  // (live-read once set, KQ_MOE_NX pattern).
+  bool r2 = !biased && !xs && nx == 16 &&
+      (stem == "iq2_xxs" || stem == "iq2_xs" || stem == "iq1_s" ||
+       stem == "q2_k" || stem == "q4_k" || stem == "iq3_xxs");
+  {
+    static const bool r2_env = std::getenv("KQ_GLU_R2") != nullptr;
+    if (r2_env && !biased && !xs && nx == 16) {
+      const char* e = std::getenv("KQ_GLU_R2");
+      r2 = e != nullptr && std::atoi(e) != 0;
+    }
+  }
   std::string kname = "kq_" + stem + "_moe_glu_gather_" +
-      (biased ? "bias_" : "") + act_ + (xs ? "_xs" : "") + kq_nx_suffix(nx) +
-      "_" + kq_type_string(x.dtype());
+      (biased ? "bias_" : "") + act_ + (xs ? "_xs" : "") +
+      (r2 ? "_r2" : kq_nx_suffix(nx)) + "_" + kq_type_string(x.dtype());
   kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -311,7 +352,7 @@ void KQuantMoEGLUKQ::eval_gpu(
     ce.set_bytes(limit_, 7);
   }
   MTL::Size group_dims(32, 2, 1);
-  MTL::Size grid_dims(N / (64 / nx), R, T);
+  MTL::Size grid_dims(N / (r2 ? 8 : (64 / nx)), R, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -484,10 +525,11 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
 
   // mix_ns is generic for every codec (no tuned variants) -- plain names.
   // No fine tier: the Ext fine variants measured E2E-neutral and were
-  // dropped.
+  // dropped. Decode-scale launches route to the slot-parallel variant.
   const int nx = kq_moe_pick_nx((int64_t)N * T, K, false);
+  const bool sp = nx == 8 && kq_moe_sp((int64_t)T * (N / 8), S);
   std::string kname = "kq_" + kquant_type_ + "_gather_qmv_mix_ns" +
-      kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
+      (sp ? "_sp" : kq_nx_suffix(nx)) + "_" + kq_type_string(x.dtype());
   kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -500,8 +542,8 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   ce.set_bytes(K, 5);
   ce.set_bytes(N, 6);
   ce.set_bytes(S, 7);
-  MTL::Size group_dims(32, 2, 1);
-  MTL::Size grid_dims(N / (64 / nx), 1, T);
+  MTL::Size group_dims(32, sp ? 2 * S : 2, 1);
+  MTL::Size grid_dims(N / (sp ? 8 : (64 / nx)), 1, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
