@@ -6,6 +6,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `skinny_matmul`: x @ w.T at token widths 1..16 against small-N large-K
+  nn.Linear-layout weights, 4-8x faster than the stock GEMM at widths
+  2..16 (router gates, indexer projections at speculative verify widths).
+
 ## [0.3.9]
 
 ### Changed

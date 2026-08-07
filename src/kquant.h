@@ -611,6 +611,15 @@ mx::array rmsnorm2_add(
     float eps,
     mx::StreamOrDevice s = {});
 
+// y = x @ w.T for token widths 1..16 against a small-N, large-K weight in
+// nn.Linear layout ([N, K]). x is [..., M, K] with 1 <= M <= 16 and
+// K % 4 == 0; x float16/bfloat16/float32, w matching x or float32; output
+// float32 when either operand is, else x dtype. f32 accumulate. Fills the
+// GEMV-to-GEMM cliff MLX's steel path hits at M >= 2 on these shapes
+// (router gates, indexer weight projections, hyper-connection mixes at
+// speculative verify widths).
+mx::array skinny_matmul(mx::array x, mx::array w, mx::StreamOrDevice s = {});
+
 // GPU-side routed-expert slot remap + residency shed for streamed MoE decode
 // (the gpu-dispatch autonomous-token front end; see kq_route_shed.h).
 // slot_table maps expert id -> arena slot, negative = non-resident. Every
@@ -1538,6 +1547,28 @@ class KQuantRMSNorm2Add : public mx::Primitive {
 
  private:
   float eps_;
+};
+
+// Skinny matmul y = x @ w.T at token widths 1..16 (see skinny_matmul).
+// Inference-only.
+class KQuantSkinnyMV : public mx::Primitive {
+ public:
+  explicit KQuantSkinnyMV(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSkinnyMV";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
 };
 
 // Routed-expert slot remap + residency shed (see route_shed).
