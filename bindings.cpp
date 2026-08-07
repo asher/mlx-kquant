@@ -1152,6 +1152,28 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "skinny_matmul",
+      &mlx_kquant::skinny_matmul,
+      "x"_a,
+      "w"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        y = x @ w.T at token widths 1..16 against a small-N, large-K
+        weight in nn.Linear layout, f32 accumulate. Fills the GEMV-to-GEMM
+        cliff MLX hits at M >= 2 on these shapes.
+
+        Args:
+            x (array): [..., M, K], 1 <= M <= 16, K a multiple of 4;
+                float16/bfloat16/float32.
+            w (array): [N, K] weight, dtype matching x or float32.
+
+        Returns:
+            array: [..., M, N]; float32 when either operand is, else the
+            x dtype.
+      )");
+
+  m.def(
       "route_shed",
       &mlx_kquant::route_shed,
       "indices"_a,

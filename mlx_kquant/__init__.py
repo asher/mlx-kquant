@@ -76,6 +76,7 @@ from ._ext import (  # noqa: F401
     shared_event_read,
     shared_event_set,
     shared_event_wait,
+    skinny_matmul,
     verify_zero_copy_views,
     zero_copy_view_count,
 )
@@ -129,6 +130,7 @@ __all__ = [
     "sdpa_decode_gqa_paged",
     "sdpa_fa_verify",
     "sdpa_vector",
+    "skinny_matmul",
     "residency_commit",
     "residency_erase",
     "residency_insert",
