@@ -1152,6 +1152,112 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "hc_front_reduce",
+      &mlx_kquant::hc_front_reduce,
+      "x"_a,
+      "fn"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Hyper-connection front reduction for the fused M=1 decode route:
+        the 24 mix dots of x against fn plus the row sum of squares
+        (deferred rms factor). hc_mult 4 only.
+
+        Args:
+            x (array): [..., 4, D] streams, float16/bfloat16, D % 8 == 0,
+                D <= 8192.
+            fn (array): [24, 4 * D] float32 mix matrix.
+
+        Returns:
+            tuple: (mixes_raw f32 [..., 24], sumsq f32 [..., 1]).
+      )");
+
+  m.def(
+      "hc_front_expand_reduce",
+      &mlx_kquant::hc_front_expand_reduce,
+      "x_sub"_a,
+      "resid"_a,
+      "post"_a,
+      "comb"_a,
+      "fn"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        The previous cycle's hc_expand fused ahead of the front reduction:
+        one dispatch expands (x_sub, resid, post, comb) to h, writes it,
+        and reduces the mix dots and sum of squares of h.
+
+        Args:
+            x_sub (array): [..., D] sublayer output.
+            resid (array): [..., 4, D] residual streams.
+            post (array): [..., 4] float32.
+            comb (array): [..., 4, 4] float32.
+            fn (array): [24, 4 * D] float32 mix matrix.
+
+        Returns:
+            tuple: (h [..., 4, D], mixes_raw f32 [..., 24],
+            sumsq f32 [..., 1]); h is bit-identical to the unfused expand.
+      )");
+
+  m.def(
+      "hc_sinkhorn_collapse",
+      &mlx_kquant::hc_sinkhorn_collapse,
+      "x"_a,
+      "mixes_raw"_a,
+      "sumsq"_a,
+      "scale"_a,
+      "base"_a,
+      "w"_a,
+      "iters"_a,
+      "hc_eps"_a,
+      "norm_eps"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Sinkhorn mix normalization plus stream collapse with the sublayer
+        RMSNorm folded into the single output rounding. The deferred front
+        rms factor enters through sumsq and multiplies the three scales.
+
+        Args:
+            x (array): [..., 4, D] streams, float16/bfloat16.
+            mixes_raw (array): [..., 24] float32 from the front reduction.
+            sumsq (array): [..., 1] float32 row sum of squares.
+            scale (array): [3] float32 pre/post/comb scales.
+            base (array): [24] float32 mix biases.
+            w (array): [D] sublayer norm weight, same dtype as x.
+            iters (int): sinkhorn iterations.
+            hc_eps (float): sinkhorn epsilon.
+            norm_eps (float): rms_norm epsilon.
+
+        Returns:
+            tuple: (collapsed [..., D], post f32 [..., 4],
+            comb f32 [..., 4, 4]).
+      )");
+
+  m.def(
+      "hc_expand",
+      &mlx_kquant::hc_expand,
+      "x"_a,
+      "resid"_a,
+      "post"_a,
+      "comb"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Expand the sublayer output back to four streams:
+        out[i] = post[i] * x + sum_j comb[j][i] * resid[j].
+
+        Args:
+            x (array): [..., D] sublayer output.
+            resid (array): [..., 4, D] residual streams.
+            post (array): [..., 4] float32.
+            comb (array): [..., 4, 4] float32.
+
+        Returns:
+            array: [..., 4, D], dtype of resid.
+      )");
+
+  m.def(
       "skinny_matmul",
       &mlx_kquant::skinny_matmul,
       "x"_a,

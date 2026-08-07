@@ -611,6 +611,51 @@ mx::array rmsnorm2_add(
     float eps,
     mx::StreamOrDevice s = {});
 
+// Fused deepseek4 hyper-connection glue for the single-token decode route
+// (hc_mult 4 only; see kq_hc_glue.h). x is [..., 4, D] with D % 8 == 0 and
+// D <= 8192; fn is float32 [24, 4 * D]. Returns {mixes_raw f32 [..., 24],
+// sumsq f32 [..., 1]}.
+std::vector<mx::array>
+hc_front_reduce(mx::array x, mx::array fn, mx::StreamOrDevice s = {});
+
+// The previous cycle's expand fused ahead of the same front reduction.
+// x_sub is [..., D], resid [..., 4, D], post f32 [..., 4], comb f32
+// [..., 4, 4]. Returns {h [..., 4, D], mixes_raw f32 [..., 24],
+// sumsq f32 [..., 1]}; h is bit-identical to hc_expand of the same carry.
+std::vector<mx::array> hc_front_expand_reduce(
+    mx::array x_sub,
+    mx::array resid,
+    mx::array post,
+    mx::array comb,
+    mx::array fn,
+    mx::StreamOrDevice s = {});
+
+// Sinkhorn mix normalization + collapse to one stream with the sublayer
+// RMSNorm (weight w, eps norm_eps) folded into the single output rounding.
+// The deferred front rms factor enters through sumsq. scale is f32 [3],
+// base f32 [24]. Returns {collapsed [..., D], post f32 [..., 4],
+// comb f32 [..., 4, 4]}.
+std::vector<mx::array> hc_sinkhorn_collapse(
+    mx::array x,
+    mx::array mixes_raw,
+    mx::array sumsq,
+    mx::array scale,
+    mx::array base,
+    mx::array w,
+    int iters,
+    float hc_eps,
+    float norm_eps,
+    mx::StreamOrDevice s = {});
+
+// Expand the sublayer output x [..., D] back over resid [..., 4, D] with
+// the pre/comb coefficients. Returns [..., 4, D].
+mx::array hc_expand(
+    mx::array x,
+    mx::array resid,
+    mx::array post,
+    mx::array comb,
+    mx::StreamOrDevice s = {});
+
 // y = x @ w.T for token widths 1..16 against a small-N, large-K weight in
 // nn.Linear layout ([N, K]). x is [..., M, K] with 1 <= M <= 16 and
 // K % 4 == 0; x float16/bfloat16/float32, w matching x or float32; output
@@ -1547,6 +1592,96 @@ class KQuantRMSNorm2Add : public mx::Primitive {
 
  private:
   float eps_;
+};
+
+// Fused hyper-connection glue primitives (see hc_front_reduce and friends).
+// Inference-only, GPU-only.
+class KQuantHcFrontReduce : public mx::Primitive {
+ public:
+  explicit KQuantHcFrontReduce(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcFrontReduce";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return true;
+  }
+};
+
+class KQuantHcFrontExpandReduce : public mx::Primitive {
+ public:
+  explicit KQuantHcFrontExpandReduce(mx::Stream stream)
+      : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcFrontExpandReduce";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return true;
+  }
+};
+
+class KQuantHcSinkhornCollapse : public mx::Primitive {
+ public:
+  explicit KQuantHcSinkhornCollapse(
+      mx::Stream stream,
+      int iters,
+      float hc_eps,
+      float norm_eps)
+      : mx::Primitive(stream),
+        iters_(iters),
+        hc_eps_(hc_eps),
+        norm_eps_(norm_eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcSinkhornCollapse";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int iters_;
+  float hc_eps_;
+  float norm_eps_;
+};
+
+class KQuantHcExpand : public mx::Primitive {
+ public:
+  explicit KQuantHcExpand(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcExpand";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return true;
+  }
 };
 
 // Skinny matmul y = x @ w.T at token widths 1..16 (see skinny_matmul).
