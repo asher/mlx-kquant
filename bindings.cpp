@@ -1061,9 +1061,9 @@ NB_MODULE(_ext, m) {
         Key layout for n total keys: keys [0, min(n, S_rows - 128)) read
         stage rows directly (fp16 sink groups); the next full 128-groups
         read sealed records in order; the remainder reads the live stage
-        rows at [S_rows - 128, S_rows). head_dim 128 or 256; wider heads
-        store D/128 slice records per group, slice-minor in the codes with
-        one axes triplet per slice.
+        rows at [S_rows - 128, S_rows). head_dim 128, 256 or 512; wider
+        heads store D/128 slice records per group, slice-minor in the codes
+        with one axes triplet per slice.
 
         Args:
             q (array): rotated queries [B, n_q_heads, qL, D],
@@ -1083,8 +1083,9 @@ NB_MODULE(_ext, m) {
             v_bits (int): V record width. Default 6.
             sinks (array, optional): per-q-head softmax sink logits.
             splits (int): key-axis split count; 0 picks the default.
-            tile_c (int): staged tile height, 32 or 16 at head_dim 128 and
-                16 or 8 at 256; 0 picks the default (32 / 16).
+            tile_c (int): staged tile height, 32 or 16 at head_dim 128,
+                16 or 8 at 256, and 8 at 512; 0 picks the default
+                (32 / 16 / 8).
             starts (array, optional): int32 [B] per-row key starts.
             n_attend (int): walk only the first n_attend keys while the
                 region map stays on the full n-key layout; 0 walks all n.

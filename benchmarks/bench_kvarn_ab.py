@@ -18,6 +18,9 @@ Timing: one op per mx.eval, mx.synchronize() fences around every rep,
 median of REPS after WARMUP, arms interleaved ABBA per depth.
 
 Protocol: idle machine; GPU microbench only (no model load).
+
+--head-dim 256 runs the two-slice record path (qwen3.5/3.6 geometry); the
+tile stages C=16 there, so compare against q8/fp16 at the same head dim.
 """
 
 import argparse
@@ -30,8 +33,19 @@ import numpy as np
 
 import mlx_kquant as kq
 
-D = 128
-SCALE = D**-0.5
+
+def quantize_head(x, bits, kind):
+    """Flat slice-minor records for any supported head dim (kq wire)."""
+    b, h, t, d = x.shape
+    sl = d // 128
+    if sl == 1:
+        return kq.kvarn_quantize(x, bits, kind)
+    xs = x.reshape(b, h, t, sl, 128).transpose(0, 1, 3, 2, 4)
+    c, a = kq.kvarn_quantize(xs, bits, kind)
+    g = c.shape[3]
+    c = c.transpose(0, 1, 3, 2, 4).reshape(b, h, g, sl * 512 * bits)
+    a = a.transpose(0, 1, 3, 2, 4, 5).reshape(b, h, g, 3 * sl, 128)
+    return c, a
 
 
 def fence():
@@ -61,10 +75,10 @@ def affine_q8(x):
     return w.view(mx.uint32), scales, biases
 
 
-def build(n, h, seed):
+def build(n, h, seed, d):
     rng = np.random.default_rng(seed)
-    kx = mx.array(rng.standard_normal((1, h, n, D)).astype(np.float16))
-    vx = mx.array(rng.standard_normal((1, h, n, D)).astype(np.float16))
+    kx = mx.array(rng.standard_normal((1, h, n, d)).astype(np.float16))
+    vx = mx.array(rng.standard_normal((1, h, n, d)).astype(np.float16))
     mx.eval(kx, vx)
     return kx, vx
 
@@ -74,6 +88,7 @@ def main():
     ap.add_argument("--depths", default="4096,16384,32768")
     ap.add_argument("--kv-heads", type=int, default=8)
     ap.add_argument("--gqa", type=int, default=4)
+    ap.add_argument("--head-dim", type=int, default=128, choices=(128, 256, 512))
     ap.add_argument("--k-bits", type=int, default=6)
     ap.add_argument("--v-bits", type=int, default=6)
     ap.add_argument("--warmup", type=int, default=20)
@@ -83,25 +98,27 @@ def main():
 
     h = args.kv_heads
     hq = h * args.gqa
+    d = args.head_dim
+    scale = d**-0.5
     rng = np.random.default_rng(1)
-    q = mx.array(rng.standard_normal((1, hq, 1, D)).astype(np.float16))
+    q = mx.array(rng.standard_normal((1, hq, 1, d)).astype(np.float16))
     mx.eval(q)
 
     results = {}
     for n in [int(x) for x in args.depths.split(",")]:
-        kx, vx = build(n, h, n)
+        kx, vx = build(n, h, n, d)
 
         # kvarn cache state: sink group + sealed records + live remainder.
         sink = 128
         n_recs = max(0, (n - sink) // 128)
         live0 = sink + n_recs * 128
-        ck, ak = kq.kvarn_quantize(kx[:, :, sink:live0], args.k_bits, "k")
-        cv, av = kq.kvarn_quantize(vx[:, :, sink:live0], args.v_bits, "v")
+        ck, ak = quantize_head(kx[:, :, sink:live0], args.k_bits, "k")
+        cv, av = quantize_head(vx[:, :, sink:live0], args.v_bits, "v")
         stage_k = mx.concatenate(
-            [kx[:, :, :sink], mx.zeros((1, h, 128, D), dtype=mx.float16)], axis=2
+            [kx[:, :, :sink], mx.zeros((1, h, 128, d), dtype=mx.float16)], axis=2
         )
         stage_v = mx.concatenate(
-            [vx[:, :, :sink], mx.zeros((1, h, 128, D), dtype=mx.float16)], axis=2
+            [vx[:, :, :sink], mx.zeros((1, h, 128, d), dtype=mx.float16)], axis=2
         )
         live_len = n - live0
         if live_len:
@@ -112,12 +129,12 @@ def main():
         mx.eval(ck, ak, cv, av, stage_k, stage_v, kw, ks, kb, vw, vs, vb)
 
         arms = {
-            "fp16": lambda kx=kx, vx=vx: kq.sdpa_decode_gqa(q, kx, vx, SCALE),
+            "fp16": lambda kx=kx, vx=vx: kq.sdpa_decode_gqa(q, kx, vx, scale),
             "q8": lambda kw=kw, vw=vw, ks=ks, kb=kb, vs=vs, vb=vb: kq.sdpa_decode_gqa(
                 q,
                 kw,
                 vw,
-                SCALE,
+                scale,
                 k_scales=ks,
                 k_biases=kb,
                 v_scales=vs,
@@ -133,7 +150,7 @@ def main():
                     sk,
                     sv,
                     n,
-                    SCALE,
+                    scale,
                     args.k_bits,
                     args.v_bits,
                 )

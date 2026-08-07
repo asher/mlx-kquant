@@ -1363,10 +1363,11 @@ static std::vector<mx::array> sdpa_decode_gqa_kvarn_impl(
           std::to_string(bits) + ".");
     }
   }
-  if (q.ndim() != 4 || (q.shape(-1) != 128 && q.shape(-1) != 256)) {
+  if (q.ndim() != 4 ||
+      (q.shape(-1) != 128 && q.shape(-1) != 256 && q.shape(-1) != 512)) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa_kvarn] q must be [B, n_q_heads, qL, "
-        "D] with head_dim 128 or 256.");
+        "D] with head_dim 128, 256 or 512.");
   }
   const int D = q.shape(3);
   const int slices = D / 128;
@@ -1471,14 +1472,14 @@ static std::vector<mx::array> sdpa_decode_gqa_kvarn_impl(
         "[mlx_kquant.sdpa_decode_gqa_kvarn] splits must be in [0, 128].");
   }
   if (tile_c == 0) {
-    tile_c = D == 128 ? 32 : 16;
+    tile_c = D == 128 ? 32 : D == 256 ? 16 : 8;
   }
-  const bool tile_ok =
-      D == 128 ? (tile_c == 32 || tile_c == 16) : (tile_c == 16 || tile_c == 8);
+  const bool tile_ok = (D == 128 && (tile_c == 32 || tile_c == 16)) ||
+      (D == 256 && (tile_c == 16 || tile_c == 8)) || (D == 512 && tile_c == 8);
   if (!tile_ok) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa_kvarn] tile_c must be 32 or 16 at "
-        "head_dim 128 and 16 or 8 at 256 (0 picks the default).");
+        "head_dim 128, 16 or 8 at 256, and 8 at 512 (0 picks the default).");
   }
 
   // Unconditional on q (layout flags are undefined on unevaluated inputs);
