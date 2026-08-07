@@ -22,9 +22,7 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   call (hoisted block scale, byte-indexed grids); the ext mat-vec at
   verify widths 2..8 gains 7-10% on the same codecs.
 - Score-mixed MoE down gather gains a slot-parallel kernel at decode
-  scale (bit-identical; KQ_MOE_SP forces either form). A row-paired GLU
-  gather kernel is also available behind KQ_GLU_R2=1 (bit-identical,
-  off by default: isolation wins did not survive end-to-end serving).
+  scale (bit-identical; KQ_MOE_SP forces either form).
 
 ## [0.3.9]
 

@@ -39,11 +39,6 @@
       type,                                                           \
       KQ_GLU_ACT_GELU)                                                \
   instantiate_kernel(                                                 \
-      "kq_" #codec "_moe_glu_gather_shexp_silu_limit_" #type,         \
-      kq_ ## codec ## _moe_glu_gather_shexp,                          \
-      type,                                                           \
-      KQ_GLU_ACT_SILU_LIMIT)                                          \
-  instantiate_kernel(                                                 \
       "kq_" #codec "_gather_qmv_mix_" #type,                          \
       kq_ ## codec ## _gather_qmv_mix,                                \
       type)
@@ -98,10 +93,6 @@ instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
       "kq_" #codec "_moe_glu_gather_shexp_gelu" sfx "_" #type,                \
       kq_ext_moe_glu_gather_shexp, type, traits, traits, KQ_GLU_ACT_GELU, nx)  \
   instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_shexp_silu_limit" sfx "_" #type,          \
-      kq_ext_moe_glu_gather_shexp, type, traits, traits,                       \
-      KQ_GLU_ACT_SILU_LIMIT, nx)                                               \
-  instantiate_kernel(                                                         \
       "kq_" #codec "_gather_qmv_mix" sfx "_" #type,                           \
       kq_ext_gather_qmv_mix, type, traits, traits, nx)
 
@@ -120,11 +111,6 @@ instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
       "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_gelu" sfx "_" #type, \
       kq_ext_moe_glu_gather_shexp, type, traits, straits, KQ_GLU_ACT_GELU, nx) \
   instantiate_kernel(                                                         \
-      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_silu_limit" sfx      \
-      "_" #type,                                                              \
-      kq_ext_moe_glu_gather_shexp, type, traits, straits,                      \
-      KQ_GLU_ACT_SILU_LIMIT, nx)                                               \
-  instantiate_kernel(                                                         \
       "kq_" #codec "_sx_" #scodec "_gather_qmv_mix" sfx "_" #type,            \
       kq_ext_gather_qmv_mix, type, traits, straits, nx)
 
@@ -132,24 +118,6 @@ instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
   instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 8, "")        \
   instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 16, "_nx16")  \
   instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 32, "_nx32")
-
-// Row-paired GLU gather (_r2): NX = 16 only (RPS = 2 keeps the N % 8 grid
-// constraint); each thread owns two output rows so x chunk loads amortize
-// over four dots.
-#define instantiate_kq_ext_r2_type(codec, traits, type)                       \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_silu_r2_" #type,                          \
-      kq_ext_moe_glu_gather_r2, type, traits, KQ_GLU_ACT_SILU, 16)             \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_gelu_r2_" #type,                          \
-      kq_ext_moe_glu_gather_r2, type, traits, KQ_GLU_ACT_GELU, 16)             \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_silu_limit_r2_" #type,                    \
-      kq_ext_moe_glu_gather_r2, type, traits, KQ_GLU_ACT_SILU_LIMIT, 16)
-
-#define instantiate_kq_ext_r2(codec, traits)                                  \
-  instantiate_kq_ext_r2_type(codec, traits, bfloat16_t)                        \
-  instantiate_kq_ext_r2_type(codec, traits, float16_t)
 
 // No-shared-expert mix (gemma-style weighted sum; always the generic kernel,
 // q6_k/q8_0 included).
@@ -193,7 +161,6 @@ instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
 #define instantiate_kq_ext_all(codec, traits)                                 \
   instantiate_kq_ext_uniform(codec, traits, bfloat16_t)                        \
   instantiate_kq_ext_uniform(codec, traits, float16_t)                         \
-  instantiate_kq_ext_r2(codec, traits)                                         \
   instantiate_kq_ext_mix_ns(codec, traits)                                     \
   instantiate_kq_ext_sx(codec, traits, q6_k, KqQ6_KExt, bfloat16_t)            \
   instantiate_kq_ext_sx(codec, traits, q6_k, KqQ6_KExt, float16_t)             \
@@ -267,8 +234,6 @@ instantiate_kq_ext_uniform(q6_k_ext, KqQ6_KExt, bfloat16_t)
 instantiate_kq_ext_uniform(q6_k_ext, KqQ6_KExt, float16_t)
 instantiate_kq_ext_uniform(q8_0_ext, KqQ8_0Ext, bfloat16_t)
 instantiate_kq_ext_uniform(q8_0_ext, KqQ8_0Ext, float16_t)
-instantiate_kq_ext_r2(q6_k_ext, KqQ6_KExt)
-instantiate_kq_ext_r2(q8_0_ext, KqQ8_0Ext)
 
 instantiate_kernel("kq_moe_router_topk_float", kq_moe_router_topk, float)
 instantiate_kernel("kq_moe_router_topk_bfloat16_t", kq_moe_router_topk, bfloat16_t)

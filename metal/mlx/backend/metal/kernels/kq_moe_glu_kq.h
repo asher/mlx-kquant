@@ -823,55 +823,6 @@ METAL_FUNC float2 kq_ext_glu_row_partial(
   return acc;
 }
 
-// Two-row GLU pair variant: one thread owns two output rows, so each
-// activation chunk load feeds four dots (gate/up x both rows). The decode
-// GLU gather is bound on redundant x re-reads (every output row re-streams
-// the full K activation row from SLC, ~4x the weight bytes at R = 6);
-// threadgroup staging cut that traffic but collapsed residency (falsified);
-// row pairing halves it with zero threadgroup memory and unchanged weight
-// traffic. Per row the chunk walk and dot order match
-// kq_ext_glu_row_partial exactly, so outputs are bit-identical.
-template <typename T, typename Codec, int NX>
-METAL_FUNC float4 kq_ext_glu_row_partial_r2(
-    const device uint8_t* gw,
-    const device uint8_t* uw,
-    const device T* x,
-    int64_t row0,
-    int64_t row1,
-    int K,
-    short tx,
-    const threadgroup uint8_t* luts) {
-  constexpr short chpb = Codec::superblock / 16;
-  const int nb = K / Codec::superblock;
-  const int64_t r0off = row0 * (int64_t)nb * Codec::block_bytes;
-  const int64_t r1off = row1 * (int64_t)nb * Codec::block_bytes;
-  float4 acc = float4(0.0f);
-  for (int ich = tx; 16 * ich < K; ich += NX) {
-    const int64_t boff = (int64_t)(ich / chpb) * Codec::block_bytes;
-    const short cch = short(ich % chpb);
-    const device T* xp = x + ich * 16;
-    const float4 a0 = float4(*(const device vec<T, 4>*)(xp + 0));
-    const float4 a1 = float4(*(const device vec<T, 4>*)(xp + 4));
-    const float4 a2 = float4(*(const device vec<T, 4>*)(xp + 8));
-    const float4 a3 = float4(*(const device vec<T, 4>*)(xp + 12));
-    float4x4 lw;
-    float sc;
-    KqTgLuts<Codec>::deq_chunk16s(gw + r0off + boff, cch, lw, luts, sc);
-    acc.x += sc *
-        (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
-    KqTgLuts<Codec>::deq_chunk16s(uw + r0off + boff, cch, lw, luts, sc);
-    acc.y += sc *
-        (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
-    KqTgLuts<Codec>::deq_chunk16s(gw + r1off + boff, cch, lw, luts, sc);
-    acc.z += sc *
-        (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
-    KqTgLuts<Codec>::deq_chunk16s(uw + r1off + boff, cch, lw, luts, sc);
-    acc.w += sc *
-        (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
-  }
-  return acc;
-}
-
 // GLU pair variant reading a threadgroup-staged activation row. Numerically
 // identical to kq_ext_glu_row_partial: same chunk order, same float4
 // conversions -- only the x address space differs. Decode-scale gathers are
@@ -972,55 +923,6 @@ template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
   const float u = kq_ext_reduce<NX>(gu.y);
   if (tx == 0) {
     out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
-  }
-}
-
-// Row-paired uniform GLU gather (_r2): each thread computes two output rows
-// so x chunk loads amortize over four dots. Dispatched at NX = 16 (RPS = 2:
-// the 4 * RPS = 8 rows per threadgroup keep the host's N % 8 grid
-// constraint) with grid (N / 8, R, T), half the threadgroups of the plain
-// NX = 16 kernel. Outputs bit-identical to kq_ext_moe_glu_gather.
-template <typename T, typename Codec, int ACT, int NX>
-[[kernel]] void kq_ext_moe_glu_gather_r2(
-    const device uint8_t* gw [[buffer(0)]],
-    const device uint8_t* uw [[buffer(1)]],
-    const device T* x [[buffer(2)]],
-    const device uint32_t* indices [[buffer(3)]],
-    device T* out [[buffer(4)]],
-    const constant int& K [[buffer(5)]],
-    const constant int& N [[buffer(6)]],
-    const constant float& limit [[buffer(7)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint3 tpg [[threadgroups_per_grid]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int RPS = 32 / NX;
-  const short tx = short(simd_lid % NX);
-  const short ty = short(simd_lid / NX);
-  const int R = tpg.y;
-  const int expert = indices[tid.z * R + tid.y];
-  const int base = tid.x * (4 * RPS) + int(simd_gid) * (2 * RPS) + ty;
-
-  x += (int64_t)tid.z * K;
-  out += ((int64_t)tid.z * R + tid.y) * N;
-
-  KQ_EXT_STAGE_LUTS(Codec, kq_luts)
-  const float4 gu = kq_ext_glu_row_partial_r2<T, Codec, NX>(
-      gw,
-      uw,
-      x,
-      (int64_t)expert * N + base,
-      (int64_t)expert * N + base + RPS,
-      K,
-      tx,
-      kq_luts);
-  const float g0 = kq_ext_reduce<NX>(gu.x);
-  const float u0 = kq_ext_reduce<NX>(gu.y);
-  const float g1 = kq_ext_reduce<NX>(gu.z);
-  const float u1 = kq_ext_reduce<NX>(gu.w);
-  if (tx == 0) {
-    out[base] = static_cast<T>(kq_glu_epilogue<ACT>(g0, u0, limit));
-    out[base + RPS] = static_cast<T>(kq_glu_epilogue<ACT>(g1, u1, limit));
   }
 }
 

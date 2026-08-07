@@ -954,7 +954,6 @@ NB_MODULE(_ext, m) {
       "kquant_type"_a,
       "indices"_a,
       "act"_a = "silu",
-      "limit"_a = 0.0f,
       "shexp_kquant_type"_a = "",
       nb::kw_only(),
       "stream"_a = nb::none(),
@@ -971,10 +970,7 @@ NB_MODULE(_ext, m) {
             shexp_up_w (array): uint8 wire bytes (N, bytes_per_row).
             kquant_type (str): expert codec with a fused kernel.
             indices (array): expert indices [T, R].
-            act (str): 'silu' (default), 'gelu' (tanh approx) or
-                'silu_limit' (deepseek-v4 LimitedSwiGLU; requires
-                limit > 0). The shared-expert slot applies the same act.
-            limit (float): clamp bound for 'silu_limit'.
+            act (str): 'silu' (default) or 'gelu' (tanh approx).
             shexp_kquant_type (str): shared-expert codec; '' (default) =
                 kquant_type. Mixed combos must be q6_k or q8_0.
 

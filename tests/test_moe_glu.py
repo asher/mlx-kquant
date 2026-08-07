@@ -231,8 +231,10 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0):
     rel = _rel(got, r)
     out.append(("qmv", rel, rel < REL_BOUND))
 
-    # moe_glu_gather_shexp_kq (shexp codec = scodec); silu_limit applies the
-    # same limited epilogue to routed and shared slots (deepseek-v4 fold).
+    # moe_glu_gather_shexp_kq (shexp codec = scodec). No silu_limit shexp
+    # instantiations exist (deepseek-v4's shared expert stays in Python), so
+    # silu_limit runs exercise the shexp op with plain silu.
+    act = "silu" if act == "silu_limit" else act
     got = kq.moe_glu_gather_shexp_kq(
         x,
         dw,
@@ -242,7 +244,6 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0):
         codec,
         inds,
         act=act,
-        limit=limit,
         shexp_kquant_type=("" if scodec == codec else scodec),
     )
     mx.eval(got)
@@ -250,7 +251,7 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0):
         [
             np.stack(
                 [
-                    _glu_np(xf[t] @ ref[e].T, xf[t] @ up_ref[e].T, act, limit)
+                    _act_np(xf[t] @ ref[e].T, act) * (xf[t] @ up_ref[e].T)
                     for e in inds_np[t]
                 ],
                 0,
@@ -260,8 +261,7 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0):
         0,
     )
     shared = np.stack(
-        [_glu_np(xf[t] @ sg_ref.T, xf[t] @ su_ref.T, act, limit) for t in range(T)],
-        0,
+        [_act_np(xf[t] @ sg_ref.T, act) * (xf[t] @ su_ref.T) for t in range(T)], 0
     )
     r = np.concatenate([routed, shared[:, None, :]], axis=1)
     rel = _rel(got, r)
@@ -599,11 +599,8 @@ def main(argv=None) -> int:
     if not allow or "iq2_xxs" in allow:
         run("iq2_xxs", act="silu_limit", limit=0.05)
         run("iq2_xxs", act="silu_limit", dtype=mx.bfloat16, limit=0.05)
-        # V4-Flash shexp fold shape: iq2_xxs experts, q8_0 shared expert
-        run("iq2_xxs", sx="q8_0", act="silu_limit", limit=0.05)
     if not allow or "q2_k" in allow:
         run("q2_k", act="silu_limit", limit=0.05)
-        run("q2_k", sx="q8_0", act="silu_limit", limit=0.05)
     if not allow or "q6_k" in allow:
         run("q6_k", act="silu_limit", limit=0.05)
     if not allow or "q8_0" in allow:

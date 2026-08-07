@@ -1,9 +1,9 @@
-"""Slot-parallel mix_ns (_sp) and row-paired GLU gather (_r2) A/B.
+"""Slot-parallel mix_ns (_sp) A/B.
 
-Both variants restructure parallelism only (sp: slot loop onto simdgroup
-pairs; r2: two output rows per thread) and must be bit-identical to the
-loop/plain kernels. Each arm runs in a subprocess so the live-read env
-latches (KQ_MOE_SP / KQ_GLU_R2) see the variable from the first dispatch.
+The variant restructures parallelism only (the slot loop spreads onto
+simdgroup pairs) and must be bit-identical to the loop kernel. Each arm
+runs in a subprocess so the live-read env latch (KQ_MOE_SP) sees the
+variable from the first dispatch.
 """
 
 import os
@@ -52,11 +52,11 @@ np.savez(out_path, mix=np.array(mix.astype(mx.float32)),
 
 
 @pytest.mark.parametrize("codec", ["q2_k", "q4_k", "q8_0", "iq2_xxs"])
-def test_sp_r2_bit_identical(codec, tmp_path):
+def test_sp_bit_identical(codec, tmp_path):
     outs = {}
     for arm, env in (
-        ("base", {"KQ_MOE_SP": "0", "KQ_GLU_R2": "0"}),
-        ("variant", {"KQ_MOE_SP": "1", "KQ_GLU_R2": "1"}),
+        ("base", {"KQ_MOE_SP": "0"}),
+        ("variant", {"KQ_MOE_SP": "1"}),
     ):
         f = tmp_path / f"{arm}.npz"
         subprocess.run(
