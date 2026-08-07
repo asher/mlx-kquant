@@ -564,6 +564,21 @@ METAL_FUNC void kq_adjust_matrix_offsets(
   y += tid.z * output_stride;
 }
 
+// Scaled chunk dequant for the ext mat-vec loops, reading constant-space
+// tables. Same contract as KqTgLuts::deq_chunk16s without staging. Codecs
+// with no hoistable scale pass scale = 1 and unchanged weights.
+template <typename Codec>
+struct KqExtDeq {
+  static METAL_FUNC void deq_chunk16s(
+      const device uint8_t* block,
+      short il,
+      thread float4x4& reg,
+      thread float& scale) {
+    Codec::deq_chunk16(block, il, reg);
+    scale = 1.0f;
+  }
+};
+
 // ---------------------------------------------------------------------------
 // Flat-with-M verify mat-vec (port of ggml-metal kernel_mul_mv_ext_q4x4),
 // codec-agnostic. The per-row qmv puts M on grid_dims.x, so each of the M rows
@@ -627,7 +642,8 @@ METAL_FUNC void kq_mv_ext_impl(
     const device uint8_t* block =
         w_row + static_cast<int64_t>(ib) * Codec::block_bytes;
     float4x4 lx;
-    Codec::deq_chunk16(block, cch, lx);
+    float sc;
+    KqExtDeq<Codec>::deq_chunk16s(block, cch, lx, sc);
 #pragma unroll
     for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
       const device T* yp = y_col[ir1];
@@ -635,8 +651,8 @@ METAL_FUNC void kq_mv_ext_impl(
       const float4 a1 = float4(*(const device vec<T, 4>*)(yp + 4));
       const float4 a2 = float4(*(const device vec<T, 4>*)(yp + 8));
       const float4 a3 = float4(*(const device vec<T, 4>*)(yp + 12));
-      sumf[ir1] +=
-          dot(lx[0], a0) + dot(lx[1], a1) + dot(lx[2], a2) + dot(lx[3], a3);
+      sumf[ir1] += sc *
+          (dot(lx[0], a0) + dot(lx[1], a1) + dot(lx[2], a2) + dot(lx[3], a3));
       y_col[ir1] += nxpsg * 16;
     }
   }

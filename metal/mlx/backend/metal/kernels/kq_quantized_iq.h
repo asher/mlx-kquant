@@ -191,6 +191,40 @@ struct KqIq3_xxsExt {
   }
 };
 
+template <>
+struct KqExtDeq<KqIq3_xxsExt> {
+  static METAL_FUNC void deq_chunk16s(
+      const device uint8_t* block,
+      short il,
+      thread float4x4& reg,
+      thread float& scale) {
+    const int ib32 = il / 2;
+    const int lbase = (il & 1) * 2;
+    const float d = float(*(const device half*)block);
+    const device uint8_t* qs = block + KQ_IQ3_XXS_QS_OFFSET + ib32 * 8;
+    const device uint8_t* gas = block + KQ_IQ3_XXS_GAS_OFFSET + ib32 * 4;
+    const uint32_t aux32 = uint32_t(gas[0]) | (uint32_t(gas[1]) << 8) |
+        (uint32_t(gas[2]) << 16) | (uint32_t(gas[3]) << 24);
+    scale = d * (0.5f + float(aux32 >> 28)) * 0.5f;
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+      const int l = lbase + t;
+      const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+      const constant uint8_t* g0 =
+          reinterpret_cast<const constant uint8_t*>(iq3xxs_grid + qs[2 * l]);
+      const constant uint8_t* g1 = reinterpret_cast<const constant uint8_t*>(
+          iq3xxs_grid + qs[2 * l + 1]);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float v0 = float(g0[j]);
+        const float v1 = float(g1[j]);
+        reg[2 * t][j] = (signs & (1 << j)) ? -v0 : v0;
+        reg[2 * t + 1][j] = (signs & (1 << (j + 4))) ? -v1 : v1;
+      }
+    }
+  }
+};
+
 template <typename T, short r1ptg, short nsg, short nxpsg>
 [[kernel]] void kq_iq3_xxs_mv_ext(
     const device uint8_t* w,
@@ -306,6 +340,43 @@ struct KqIq3_sExt {
   }
 };
 
+template <>
+struct KqExtDeq<KqIq3_sExt> {
+  static METAL_FUNC void deq_chunk16s(
+      const device uint8_t* block,
+      short il,
+      thread float4x4& reg,
+      thread float& scale) {
+    const int s = il / 2;
+    const int lbase = (il & 1) * 2;
+    const float d = float(*(const device half*)block);
+    const device uint8_t* qs = block + KQ_IQ3_S_QS_OFFSET + s * 8;
+    const device uint8_t* signs = block + KQ_IQ3_S_SIGNS_OFFSET + s * 4;
+    const device uint8_t* scales = block + KQ_IQ3_S_SCALES_OFFSET;
+    const int sc_nib = (scales[s / 2] >> (4 * (s & 1))) & 0xf;
+    scale = d * float(1 + 2 * sc_nib);
+    const int qhb = int(block[KQ_IQ3_S_QH_OFFSET + s]);
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+      const int l = lbase + t;
+      const int hi0 = (qhb << (8 - 2 * l)) & 256;
+      const int hi1 = (qhb << (7 - 2 * l)) & 256;
+      const constant uint8_t* g0 = reinterpret_cast<const constant uint8_t*>(
+          iq3s_grid + (int(qs[2 * l]) | hi0));
+      const constant uint8_t* g1 = reinterpret_cast<const constant uint8_t*>(
+          iq3s_grid + (int(qs[2 * l + 1]) | hi1));
+      const uint8_t sb = signs[l];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float v0 = float(g0[j]);
+        const float v1 = float(g1[j]);
+        reg[2 * t][j] = (sb & (1 << j)) ? -v0 : v0;
+        reg[2 * t + 1][j] = (sb & (1 << (j + 4))) ? -v1 : v1;
+      }
+    }
+  }
+};
+
 template <typename T, short r1ptg, short nsg, short nxpsg>
 [[kernel]] void kq_iq3_s_mv_ext(
     const device uint8_t* w,
@@ -404,6 +475,35 @@ struct KqIq2_xxsExt {
   static METAL_FUNC void
   deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
     kq_iq2_xxs_deq_chunk16(block, il, reg);
+  }
+};
+
+template <>
+struct KqExtDeq<KqIq2_xxsExt> {
+  static METAL_FUNC void deq_chunk16s(
+      const device uint8_t* block,
+      short il,
+      thread float4x4& reg,
+      thread float& scale) {
+    const int ib32 = il / 2;
+    const int lbase = (il & 1) * 2;
+    const float d = float(*(const device half*)block);
+    const device uint8_t* qs = block + KQ_IQ2_XXS_QS_OFFSET + ib32 * 8;
+    const uint32_t signbits = uint32_t(qs[4]) | (uint32_t(qs[5]) << 8) |
+        (uint32_t(qs[6]) << 16) | (uint32_t(qs[7]) << 24);
+    scale = d * (0.5f + float(signbits >> 28)) * 0.25f;
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+      const int l = lbase + t;
+      const constant uint8_t* gb =
+          reinterpret_cast<const constant uint8_t*>(iq2xxs_grid + qs[l]);
+      const uint8_t signs = ksigns_iq2xs[(signbits >> (7 * l)) & 127];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const float v = float(gb[j]);
+        reg[2 * t + j / 4][j % 4] = (signs & (1 << j)) ? -v : v;
+      }
+    }
   }
 };
 
@@ -509,6 +609,36 @@ struct KqIq2_xsExt {
   static METAL_FUNC void
   deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
     kq_iq2_xs_deq_chunk16(block, il, reg);
+  }
+};
+
+template <>
+struct KqExtDeq<KqIq2_xsExt> {
+  static METAL_FUNC void deq_chunk16s(
+      const device uint8_t* block,
+      short il,
+      thread float4x4& reg,
+      thread float& scale) {
+    const int ib32 = il / 2;
+    const int lbase = (il & 1) * 2;
+    const float d = float(*(const device half*)block);
+    const uint8_t sc = block[KQ_IQ2_XS_SCALES_OFFSET + ib32];
+    const int sc_nib = (lbase < 2) ? (sc & 0xf) : (sc >> 4);
+    scale = d * (0.5f + float(sc_nib)) * 0.25f;
+    const device uint8_t* qp = block + KQ_IQ2_XS_QS_OFFSET + ib32 * 8;
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+      const int l = lbase + t;
+      const uint q = uint(qp[2 * l]) | (uint(qp[2 * l + 1]) << 8);
+      const constant uint8_t* gb =
+          reinterpret_cast<const constant uint8_t*>(iq2xs_grid + (q & 511));
+      const uint8_t signs = ksigns_iq2xs[q >> 9];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const float v = float(gb[j]);
+        reg[2 * t + j / 4][j % 4] = (signs & (1 << j)) ? -v : v;
+      }
+    }
   }
 };
 
@@ -620,6 +750,38 @@ struct KqIq2_sExt {
   static METAL_FUNC void
   deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
     kq_iq2_s_deq_chunk16(block, il, reg);
+  }
+};
+
+template <>
+struct KqExtDeq<KqIq2_sExt> {
+  static METAL_FUNC void deq_chunk16s(
+      const device uint8_t* block,
+      short il,
+      thread float4x4& reg,
+      thread float& scale) {
+    const int ib32 = il / 2;
+    const int lbase = (il & 1) * 2;
+    const float d = float(*(const device half*)block);
+    const device uint8_t* qs = block + KQ_IQ2_S_QS_OFFSET;
+    const device uint8_t* signs = block + KQ_IQ2_S_SIGNS_OFFSET;
+    const uint8_t sc = block[KQ_IQ2_S_SCALES_OFFSET + ib32];
+    const int sc_nib = (lbase < 2) ? (sc & 0xf) : (sc >> 4);
+    scale = d * (0.5f + float(sc_nib)) * 0.25f;
+    const int qhb = int(block[KQ_IQ2_S_QH_OFFSET + ib32]);
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+      const int l = lbase + t;
+      const int qi = int(qs[ib32 * 4 + l]) | ((qhb << (8 - 2 * l)) & 0x300);
+      const constant uint8_t* gb =
+          reinterpret_cast<const constant uint8_t*>(iq2s_grid + qi);
+      const uint8_t sb = signs[ib32 * 4 + l];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const float v = float(gb[j]);
+        reg[2 * t + j / 4][j % 4] = (sb & (1 << j)) ? -v : v;
+      }
+    }
   }
 };
 
