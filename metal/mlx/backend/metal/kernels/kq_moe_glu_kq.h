@@ -730,7 +730,9 @@ template <typename T, int results_per_simdgroup = 4>
 // ---------------------------------------------------------------------------
 // Codec-matrix kernels: one generic implementation per family, templated on
 // the Ext codec traits from kq_quantized*.h (superblock, block_bytes,
-// deq_chunk16(block, il, reg) -> 16 weights in natural order). Thread
+// deq_chunk16(block, il, reg) -> 16 weights in natural order). Row loops
+// use the deq_chunk16s form and fold the returned scale once per chunk
+// dot. Thread
 // mapping follows kq_mv_ext_impl, templated on the K-lane width NX: the 32
 // simdgroup lanes split into NX K-lanes x (32 / NX) output rows (each thread
 // owns one row); the K-reduction is a log2(NX)-step simd_shuffle_down within
@@ -773,12 +775,14 @@ METAL_FUNC float kq_ext_row_partial(
     const device uint8_t* block =
         w_row + (int64_t)(ich / chpb) * Codec::block_bytes;
     float4x4 lw;
-    KqTgLuts<Codec>::deq_chunk16(block, short(ich % chpb), lw, luts);
+    float sc;
+    KqTgLuts<Codec>::deq_chunk16s(block, short(ich % chpb), lw, luts, sc);
     const device T* xp = x + ich * 16;
-    acc += dot(lw[0], float4(*(const device vec<T, 4>*)(xp + 0))) +
-        dot(lw[1], float4(*(const device vec<T, 4>*)(xp + 4))) +
-        dot(lw[2], float4(*(const device vec<T, 4>*)(xp + 8))) +
-        dot(lw[3], float4(*(const device vec<T, 4>*)(xp + 12)));
+    acc += sc *
+        (dot(lw[0], float4(*(const device vec<T, 4>*)(xp + 0))) +
+         dot(lw[1], float4(*(const device vec<T, 4>*)(xp + 4))) +
+         dot(lw[2], float4(*(const device vec<T, 4>*)(xp + 8))) +
+         dot(lw[3], float4(*(const device vec<T, 4>*)(xp + 12))));
   }
   return acc;
 }
@@ -808,10 +812,13 @@ METAL_FUNC float2 kq_ext_glu_row_partial(
     const float4 a2 = float4(*(const device vec<T, 4>*)(xp + 8));
     const float4 a3 = float4(*(const device vec<T, 4>*)(xp + 12));
     float4x4 lw;
-    KqTgLuts<Codec>::deq_chunk16(g_row + boff, cch, lw, luts);
-    acc.x += dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3);
-    KqTgLuts<Codec>::deq_chunk16(u_row + boff, cch, lw, luts);
-    acc.y += dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3);
+    float sc;
+    KqTgLuts<Codec>::deq_chunk16s(g_row + boff, cch, lw, luts, sc);
+    acc.x += sc *
+        (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
+    KqTgLuts<Codec>::deq_chunk16s(u_row + boff, cch, lw, luts, sc);
+    acc.y += sc *
+        (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
   }
   return acc;
 }
@@ -846,10 +853,13 @@ METAL_FUNC float2 kq_ext_glu_row_partial_xs(
     const float4 a2 = float4(*(const threadgroup vec<T, 4>*)(xp + 8));
     const float4 a3 = float4(*(const threadgroup vec<T, 4>*)(xp + 12));
     float4x4 lw;
-    KqTgLuts<Codec>::deq_chunk16(g_row + boff, cch, lw, luts);
-    acc.x += dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3);
-    KqTgLuts<Codec>::deq_chunk16(u_row + boff, cch, lw, luts);
-    acc.y += dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3);
+    float sc;
+    KqTgLuts<Codec>::deq_chunk16s(g_row + boff, cch, lw, luts, sc);
+    acc.x += sc *
+        (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
+    KqTgLuts<Codec>::deq_chunk16s(u_row + boff, cch, lw, luts, sc);
+    acc.y += sc *
+        (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
   }
   return acc;
 }

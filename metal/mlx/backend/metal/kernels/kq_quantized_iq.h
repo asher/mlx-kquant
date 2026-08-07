@@ -4517,6 +4517,10 @@ template <typename T, int group_size, int bits, bool batched>
 // memory once per threadgroup removes that latency; kmask_iq2xs is 1 << j
 // and folds away. Codecs without LUTs keep bytes = 0 and the passthrough
 // three-argument deq.
+//
+// deq_chunk16s writes the weights sign-applied without the block scale
+// and returns the scale for the caller to fold once per chunk dot.
+// Codecs with no hoistable scale pass scale = 1 and unchanged weights.
 template <typename Codec>
 struct KqTgLuts {
   MLX_MTL_CONST int bytes = 0;
@@ -4527,6 +4531,15 @@ struct KqTgLuts {
       thread float4x4& reg,
       const threadgroup uint8_t*) {
     Codec::deq_chunk16(block, il, reg);
+  }
+  static METAL_FUNC void deq_chunk16s(
+      const device uint8_t* block,
+      short il,
+      thread float4x4& reg,
+      const threadgroup uint8_t*,
+      thread float& scale) {
+    Codec::deq_chunk16(block, il, reg);
+    scale = 1.0f;
   }
 };
 
@@ -4547,11 +4560,12 @@ struct KqTgLuts<KqIq2_xxsExt> {
       d32[512 + i] = signs32[i];
     }
   }
-  static METAL_FUNC void deq_chunk16(
+  static METAL_FUNC void deq_chunk16s(
       const device uint8_t* block,
       short il,
       thread float4x4& reg,
-      const threadgroup uint8_t* luts) {
+      const threadgroup uint8_t* luts,
+      thread float& scale) {
     const threadgroup uint64_t* grid =
         reinterpret_cast<const threadgroup uint64_t*>(luts);
     const threadgroup uint8_t* ksigns = luts + 2048;
@@ -4561,15 +4575,30 @@ struct KqTgLuts<KqIq2_xxsExt> {
     const device uint8_t* qs = block + KQ_IQ2_XXS_QS_OFFSET + ib32 * 8;
     const uint32_t signbits = uint32_t(qs[4]) | (uint32_t(qs[5]) << 8) |
         (uint32_t(qs[6]) << 16) | (uint32_t(qs[7]) << 24);
-    const float db = d * (0.5f + float(signbits >> 28)) * 0.25f;
+    scale = d * (0.5f + float(signbits >> 28)) * 0.25f;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-      const int l = lbase + i / 8;
-      const int j = i % 8;
+    for (int t = 0; t < 2; ++t) {
+      const int l = lbase + t;
+      const threadgroup uint8_t* gb =
+          reinterpret_cast<const threadgroup uint8_t*>(grid + qs[l]);
       const uint8_t signs = ksigns[(signbits >> (7 * l)) & 127];
-      const uint8_t gb = (grid[qs[l]] >> (8 * j)) & 0xff;
-      const float sgn = (signs & (1 << j)) ? -1.0f : 1.0f;
-      reg[i / 4][i % 4] = db * float(gb) * sgn;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const float v = float(gb[j]);
+        reg[2 * t + j / 4][j % 4] = (signs & (1 << j)) ? -v : v;
+      }
+    }
+  }
+  static METAL_FUNC void deq_chunk16(
+      const device uint8_t* block,
+      short il,
+      thread float4x4& reg,
+      const threadgroup uint8_t* luts) {
+    float scale;
+    deq_chunk16s(block, il, reg, luts, scale);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      reg[i] *= scale;
     }
   }
 };
@@ -4589,11 +4618,12 @@ struct KqTgLuts<KqIq3_xxsExt> {
       d32[256 + i] = signs32[i];
     }
   }
-  static METAL_FUNC void deq_chunk16(
+  static METAL_FUNC void deq_chunk16s(
       const device uint8_t* block,
       short il,
       thread float4x4& reg,
-      const threadgroup uint8_t* luts) {
+      const threadgroup uint8_t* luts,
+      thread float& scale) {
     const threadgroup uint32_t* grid =
         reinterpret_cast<const threadgroup uint32_t*>(luts);
     const threadgroup uint8_t* ksigns = luts + 1024;
@@ -4604,17 +4634,34 @@ struct KqTgLuts<KqIq3_xxsExt> {
     const device uint8_t* gas = block + KQ_IQ3_XXS_GAS_OFFSET + ib32 * 4;
     const uint32_t aux32 = uint32_t(gas[0]) | (uint32_t(gas[1]) << 8) |
         (uint32_t(gas[2]) << 16) | (uint32_t(gas[3]) << 24);
-    const float db = d * (0.5f + float(aux32 >> 28)) * 0.5f;
+    scale = d * (0.5f + float(aux32 >> 28)) * 0.5f;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-      const int l = lbase + i / 8;
-      const int sub = i % 8;
+    for (int t = 0; t < 2; ++t) {
+      const int l = lbase + t;
       const uint8_t signs = ksigns[(aux32 >> (7 * l)) & 127];
-      const int qi = (sub < 4) ? int(qs[2 * l]) : int(qs[2 * l + 1]);
-      const int bytej = (sub < 4) ? sub : (sub - 4);
-      const uint8_t gb = (grid[qi] >> (8 * bytej)) & 0xff;
-      const float sgn = (signs & (1 << sub)) ? -1.0f : 1.0f;
-      reg[i / 4][i % 4] = db * float(gb) * sgn;
+      const threadgroup uint8_t* g0 =
+          reinterpret_cast<const threadgroup uint8_t*>(grid + qs[2 * l]);
+      const threadgroup uint8_t* g1 =
+          reinterpret_cast<const threadgroup uint8_t*>(grid + qs[2 * l + 1]);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float v0 = float(g0[j]);
+        const float v1 = float(g1[j]);
+        reg[2 * t][j] = (signs & (1 << j)) ? -v0 : v0;
+        reg[2 * t + 1][j] = (signs & (1 << (j + 4))) ? -v1 : v1;
+      }
+    }
+  }
+  static METAL_FUNC void deq_chunk16(
+      const device uint8_t* block,
+      short il,
+      thread float4x4& reg,
+      const threadgroup uint8_t* luts) {
+    float scale;
+    deq_chunk16s(block, il, reg, luts, scale);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      reg[i] *= scale;
     }
   }
 };
