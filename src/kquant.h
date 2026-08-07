@@ -209,10 +209,11 @@ std::vector<mx::array> sdpa_decode_gqa_lse(
 // [0, ..) directly (fp16 sink groups, sink_cap = stage rows - 128); the next
 // floor((n - sink_cap) / 128) * 128 keys read sealed records in order; the
 // remainder reads the live stage rows at [sink_cap, sink_cap + 128). Both
-// stages are [B, Hkv, S_rows, 128] fp16 with S_rows a multiple of 128 and
-// >= 256. codes uint32 [B, Hkv, Gcap, 512 * bits], axes fp16
-// [B, Hkv, Gcap, 3, 128] per side; Gcap only needs to cover the sealed
-// groups. q [B, n_q_heads, qL, 128] float16/bfloat16, qL 1 (decode) to 4
+// stages are [B, Hkv, S_rows, D] fp16 with S_rows a multiple of 128 and
+// >= 256. codes uint32 [B, Hkv, Gcap, (D / 128) * 512 * bits] (slice-minor
+// records), axes fp16 [B, Hkv, Gcap, 3 * (D / 128), 128] per side (one
+// scale/zp/other triplet per slice); Gcap only needs to cover the sealed
+// groups. q [B, n_q_heads, qL, D] float16/bfloat16, qL 1 (decode) to 4
 // (speculative-verify width). k_bits/v_bits in {2, 3, 4, 5, 6, 8} may
 // differ. sinks/starts/splits/tile_c as sdpa_decode_gqa.
 //
@@ -220,7 +221,7 @@ std::vector<mx::array> sdpa_decode_gqa_lse(
 // keys while the region map stays on the full n-key layout (the tail overlay
 // covers the rest). full_visibility lifts the per-query causal clamp; it
 // requires n_attend <= n - qL + 1 so every walked key precedes every query.
-// head_dim 128 only. Metal-only.
+// head_dim 128 or 256. Metal-only.
 mx::array sdpa_decode_gqa_kvarn(
     mx::array q,
     mx::array codes_k,

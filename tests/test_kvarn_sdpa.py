@@ -27,22 +27,51 @@ D = 128
 SCALE = D**-0.5
 
 
-def build_state(B, H, N, k_bits, v_bits, sink_cap=128, seed=0):
+def quantize_head(x, bits, kind):
+    """Quantize [B, H, T, d] into the flat slice-minor wire the fused
+    kernel reads: codes [B, H, G, (d/128) * 512 * bits], axes
+    [B, H, G, 3 * (d/128), 128] (one triplet per slice)."""
+    b, h, t, d = x.shape
+    sl = d // 128
+    if sl == 1:
+        return kq.kvarn_quantize(x, bits, kind)
+    xs = x.reshape(b, h, t, sl, 128).transpose(0, 1, 3, 2, 4)
+    c, a = kq.kvarn_quantize(xs, bits, kind)
+    g = c.shape[3]
+    c = c.transpose(0, 1, 3, 2, 4).reshape(b, h, g, sl * 512 * bits)
+    a = a.transpose(0, 1, 3, 2, 4, 5).reshape(b, h, g, 3 * sl, 128)
+    return c, a
+
+
+def dequant_head(codes, axes, bits, kind, d, dtype):
+    """Invert quantize_head's layout back to [B, H, G * 128, d]."""
+    b, h, g = codes.shape[:3]
+    sl = d // 128
+    if sl == 1:
+        return kq.kvarn_dequant(codes, axes, bits, kind, dtype=dtype)
+    c = codes.reshape(b, h, g, sl, 512 * bits).transpose(0, 1, 3, 2, 4)
+    a = axes.reshape(b, h, g, sl, 3, 128).transpose(0, 1, 3, 2, 4, 5)
+    out = kq.kvarn_dequant(c, a, bits, kind, dtype=dtype)
+    return out.transpose(0, 1, 3, 2, 4).reshape(b, h, g * 128, d)
+
+
+def build_state(B, H, N, k_bits, v_bits, sink_cap=128, seed=0, d=D):
     """Synthesize a rotated-domain KVarN cache state plus its materialized
     fp16 twin. Keys [0, min(N, sink_cap)) live in stage sink rows, full
     128-groups after that are sealed records, the remainder is the live
     stage slot."""
     rng = np.random.default_rng(seed)
-    kx = rng.standard_normal((B, H, N, D)).astype(np.float16)
-    vx = rng.standard_normal((B, H, N, D)).astype(np.float16)
+    sl = d // 128
+    kx = rng.standard_normal((B, H, N, d)).astype(np.float16)
+    vx = rng.standard_normal((B, H, N, d)).astype(np.float16)
 
     sink = min(N, sink_cap)
     n_recs = max(0, (N - sink_cap) // 128)
     live0 = sink + n_recs * 128
     s_rows = sink_cap + 128
 
-    stage_k = np.zeros((B, H, s_rows, D), np.float16)
-    stage_v = np.zeros((B, H, s_rows, D), np.float16)
+    stage_k = np.zeros((B, H, s_rows, d), np.float16)
+    stage_v = np.zeros((B, H, s_rows, d), np.float16)
     stage_k[:, :, :sink] = kx[:, :, :sink]
     stage_v[:, :, :sink] = vx[:, :, :sink]
     live_len = N - live0
@@ -50,14 +79,14 @@ def build_state(B, H, N, k_bits, v_bits, sink_cap=128, seed=0):
     stage_v[:, :, sink_cap : sink_cap + live_len] = vx[:, :, live0:N]
 
     g_cap = max(n_recs, 1)
-    codes_k = np.zeros((B, H, g_cap, 512 * k_bits), np.uint32)
-    codes_v = np.zeros((B, H, g_cap, 512 * v_bits), np.uint32)
-    axes_k = np.zeros((B, H, g_cap, 3, D), np.float16)
-    axes_v = np.zeros((B, H, g_cap, 3, D), np.float16)
+    codes_k = np.zeros((B, H, g_cap, sl * 512 * k_bits), np.uint32)
+    codes_v = np.zeros((B, H, g_cap, sl * 512 * v_bits), np.uint32)
+    axes_k = np.zeros((B, H, g_cap, 3 * sl, 128), np.float16)
+    axes_v = np.zeros((B, H, g_cap, 3 * sl, 128), np.float16)
 
     if n_recs:
-        ck, ak = kq.kvarn_quantize(mx.array(kx[:, :, sink:live0]), k_bits, "k")
-        cv, av = kq.kvarn_quantize(mx.array(vx[:, :, sink:live0]), v_bits, "v")
+        ck, ak = quantize_head(mx.array(kx[:, :, sink:live0]), k_bits, "k")
+        cv, av = quantize_head(mx.array(vx[:, :, sink:live0]), v_bits, "v")
         mx.eval(ck, ak, cv, av)
         codes_k[:, :, :n_recs] = np.array(ck)
         axes_k[:, :, :n_recs] = np.array(ak)
@@ -78,6 +107,7 @@ def build_state(B, H, N, k_bits, v_bits, sink_cap=128, seed=0):
         "n_recs": n_recs,
         "k_bits": k_bits,
         "v_bits": v_bits,
+        "d": d,
     }
 
 
@@ -91,12 +121,13 @@ def materialize(st, dtype):
         if st["n_recs"]:
             n = st["n_recs"]
             parts.append(
-                kq.kvarn_dequant(
+                dequant_head(
                     st[f"codes_{side}"][:, :, :n],
                     st[f"axes_{side}"][:, :, :n],
                     st[f"{side}_bits"],
                     side,
-                    dtype=dtype,
+                    st["d"],
+                    dtype,
                 )
             )
         parts.append(raw[:, :, st["live0"] :].astype(dtype))
@@ -106,6 +137,7 @@ def materialize(st, dtype):
 
 def run_pair(st, q, N, k_bits, v_bits, dtype=mx.float16, **kw):
     qm = mx.array(q).astype(dtype)
+    scale = st["d"] ** -0.5
     out = kq.sdpa_decode_gqa_kvarn(
         qm,
         st["codes_k"],
@@ -115,13 +147,13 @@ def run_pair(st, q, N, k_bits, v_bits, dtype=mx.float16, **kw):
         st["stage_k"],
         st["stage_v"],
         N,
-        SCALE,
+        scale,
         k_bits,
         v_bits,
         **kw,
     )
     k_ref, v_ref = materialize(st, dtype)
-    ref = kq.sdpa_decode_gqa(qm, k_ref, v_ref, SCALE, **kw)
+    ref = kq.sdpa_decode_gqa(qm, k_ref, v_ref, scale, **kw)
     return out, ref
 
 
@@ -140,9 +172,9 @@ def assert_bit_equal(a, b):
     assert np.array_equal(an, bn), f"max|d|={maxd}"
 
 
-def make_q(B, n_q_heads, qL, seed=1):
+def make_q(B, n_q_heads, qL, seed=1, d=D):
     rng = np.random.default_rng(seed)
-    return rng.standard_normal((B, n_q_heads, qL, D)).astype(np.float16)
+    return rng.standard_normal((B, n_q_heads, qL, d)).astype(np.float16)
 
 
 @pytest.mark.parametrize("n", [100, 129, 256, 300, 1000, 4097])
@@ -317,7 +349,7 @@ def test_rejects_malformed():
         # codes width inconsistent with bits
         kq.sdpa_decode_gqa_kvarn(q, *args, 300, SCALE, 8, 6)
     with pytest.raises(ValueError):
-        # D != 128
+        # unsupported head dim
         kq.sdpa_decode_gqa_kvarn(q[..., :64], *args, 300, SCALE, 6, 6)
     with pytest.raises(ValueError):
         # n_attend beyond n
@@ -326,3 +358,169 @@ def test_rejects_malformed():
         # full visibility over keys at or past a query's causal position
         q4 = mx.array(make_q(1, 8, 4))
         kq.sdpa_decode_gqa_kvarn(q4, *args, 300, SCALE, 6, 6, full_visibility=True)
+
+
+# -- head_dim 256 (two-slice records) ----------------------------------------
+
+
+def test_d256_slice_layout_contract():
+    # The flat wire must be slice-minor: slice s of a group's codes at word
+    # offset s * 512 * bits, axes triplet s at rows [3s, 3s + 3). Pinned
+    # against independent per-slice quantization of the same tokens.
+    rng = np.random.default_rng(30)
+    x = mx.array(rng.standard_normal((1, 2, 256, 256)).astype(np.float16))
+    c, a = quantize_head(x, 6, "k")
+    mx.eval(c, a)
+    for s in range(2):
+        cs, as_ = kq.kvarn_quantize(x[..., s * 128 : (s + 1) * 128], 6, "k")
+        mx.eval(cs, as_)
+        assert np.array_equal(
+            np.array(c[..., s * 512 * 6 : (s + 1) * 512 * 6]), np.array(cs)
+        )
+        assert np.array_equal(np.array(a[:, :, :, 3 * s : 3 * s + 3]), np.array(as_))
+
+
+@pytest.mark.parametrize("n", [100, 129, 300, 1000, 4097])
+def test_d256_decode_matches_materialize_at_boundaries(n):
+    st = build_state(1, 2, n, 6, 6, seed=40 + n, d=256)
+    q = make_q(1, 8, 1, d=256)
+    out, ref = run_pair(st, q, n, 6, 6)
+    assert_bit_equal(out, ref)
+
+
+@pytest.mark.parametrize("kv_bits", [(2, 2), (3, 3), (5, 4), (8, 8), (6, 5)])
+def test_d256_decode_matches_materialize_across_widths(kv_bits):
+    kb, vb = kv_bits
+    st = build_state(1, 2, 300, kb, vb, seed=50 + kb * 10 + vb, d=256)
+    q = make_q(1, 8, 1, d=256)
+    out, ref = run_pair(st, q, 300, kb, vb)
+    assert_bit_equal(out, ref)
+
+
+@pytest.mark.parametrize("ql", [2, 3, 4])
+def test_d256_verify_width_matches_materialize(ql):
+    st = build_state(1, 2, 700, 6, 6, seed=60 + ql, d=256)
+    q = make_q(1, 8, ql, d=256)
+    out, ref = run_pair(st, q, 700, 6, 6)
+    assert_bit_equal(out, ref)
+
+
+def test_d256_starts_and_batch():
+    st = build_state(3, 2, 300, 6, 6, seed=61, d=256)
+    q = make_q(3, 8, 1, d=256)
+    starts = mx.array([0, 150, 296], dtype=mx.int32)
+    out, ref = run_pair(st, q, 300, 6, 6, starts=starts)
+    assert_bit_equal(out, ref)
+
+
+def test_d256_sinks_and_lse():
+    st = build_state(1, 2, 500, 6, 6, seed=62, d=256)
+    q = make_q(1, 8, 1, d=256)
+    sinks = mx.array(np.linspace(-1.0, 2.0, 8), dtype=mx.float32)
+    out, ref = run_pair(st, q, 500, 6, 6, sinks=sinks, return_lse=True)
+    assert_bit_equal(out, ref)
+
+
+def test_d256_tile_c8_and_explicit_splits():
+    st = build_state(1, 2, 1000, 6, 6, seed=63, d=256)
+    q = make_q(1, 8, 1, d=256)
+    out, ref = run_pair(st, q, 1000, 6, 6, tile_c=8, splits=7)
+    assert_bit_equal(out, ref)
+
+
+def test_d256_multi_group_sink():
+    st = build_state(1, 2, 700, 6, 6, sink_cap=256, seed=64, d=256)
+    q = make_q(1, 8, 1, d=256)
+    out, ref = run_pair(st, q, 700, 6, 6)
+    assert_bit_equal(out, ref)
+
+
+def test_d256_bfloat16_query():
+    st = build_state(1, 2, 300, 6, 6, seed=65, d=256)
+    q = make_q(1, 8, 1, d=256)
+    out, ref = run_pair(st, q, 300, 6, 6, dtype=mx.bfloat16)
+    assert_bit_equal(out, ref)
+
+
+def test_d256_n_attend_matches_truncated_reference():
+    st = build_state(1, 2, 1000, 6, 6, seed=66, d=256)
+    q = mx.array(make_q(1, 8, 1, d=256))
+    args = (
+        st["codes_k"],
+        st["axes_k"],
+        st["codes_v"],
+        st["axes_v"],
+        st["stage_k"],
+        st["stage_v"],
+    )
+    scale = 256**-0.5
+    out = kq.sdpa_decode_gqa_kvarn(q, *args, 1000, scale, 6, 6, n_attend=800)
+    k_ref, v_ref = materialize(st, mx.float16)
+    ref = kq.sdpa_decode_gqa(q, k_ref[:, :, :800], v_ref[:, :, :800], scale)
+    assert_bit_equal(out, ref)
+
+
+@pytest.mark.parametrize("ql", [1, 4])
+def test_d256_tail_lse_merge_composition(ql):
+    N, A = 260, 200
+    st = build_state(1, 2, N, 6, 6, seed=70 + ql, d=256)
+    q = mx.array(make_q(1, 8, ql, d=256))
+    args = (
+        st["codes_k"],
+        st["axes_k"],
+        st["codes_v"],
+        st["axes_v"],
+        st["stage_k"],
+        st["stage_v"],
+    )
+    scale = 256**-0.5
+    body, lse_b = kq.sdpa_decode_gqa_kvarn(
+        q, *args, N, scale, 6, 6, n_attend=A, full_visibility=True, return_lse=True
+    )
+    tail, lse_t = kq.sdpa_decode_gqa(
+        q, st["kx"][:, :, A:], st["vx"][:, :, A:], scale, return_lse=True
+    )
+    merged, lse_m = lse_merge(body, lse_b, tail, lse_t)
+
+    k_m, v_m = materialize(st, mx.float16)
+    k_ref = mx.concatenate([k_m[:, :, :A], st["kx"][:, :, A:]], axis=2)
+    v_ref = mx.concatenate([v_m[:, :, :A], st["vx"][:, :, A:]], axis=2)
+    ref, lse_ref = kq.sdpa_decode_gqa(q, k_ref, v_ref, scale, return_lse=True)
+    mx.eval(merged, lse_m, ref, lse_ref)
+    np.testing.assert_allclose(
+        np.array(merged), np.array(ref.astype(mx.float32)), rtol=2e-3, atol=2e-3
+    )
+    np.testing.assert_allclose(np.array(lse_m), np.array(lse_ref), rtol=1e-5, atol=1e-4)
+
+
+def test_d256_rejects_wrong_tile_c_and_stale_shapes():
+    st = build_state(1, 2, 300, 6, 6, seed=67, d=256)
+    q = mx.array(make_q(1, 8, 1, d=256))
+    args = (
+        st["codes_k"],
+        st["axes_k"],
+        st["codes_v"],
+        st["axes_v"],
+        st["stage_k"],
+        st["stage_v"],
+    )
+    scale = 256**-0.5
+    with pytest.raises(ValueError):
+        # tile_c 32 has no D=256 instantiation
+        kq.sdpa_decode_gqa_kvarn(q, *args, 300, scale, 6, 6, tile_c=32)
+    with pytest.raises(ValueError):
+        # single-slice codes with a 256-dim query
+        st1 = build_state(1, 2, 300, 6, 6, seed=68)
+        kq.sdpa_decode_gqa_kvarn(
+            q,
+            st1["codes_k"],
+            st1["axes_k"],
+            st1["codes_v"],
+            st1["axes_v"],
+            st["stage_k"],
+            st["stage_v"],
+            300,
+            scale,
+            6,
+            6,
+        )

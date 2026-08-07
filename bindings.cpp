@@ -1061,25 +1061,30 @@ NB_MODULE(_ext, m) {
         Key layout for n total keys: keys [0, min(n, S_rows - 128)) read
         stage rows directly (fp16 sink groups); the next full 128-groups
         read sealed records in order; the remainder reads the live stage
-        rows at [S_rows - 128, S_rows). head_dim 128 only.
+        rows at [S_rows - 128, S_rows). head_dim 128 or 256; wider heads
+        store D/128 slice records per group, slice-minor in the codes with
+        one axes triplet per slice.
 
         Args:
-            q (array): rotated queries [B, n_q_heads, qL, 128],
+            q (array): rotated queries [B, n_q_heads, qL, D],
                 float16/bfloat16; qL 1 (decode) to 4 (verify width).
-            codes_k (array): uint32 [B, n_kv_heads, Gcap, 512 * k_bits].
-            axes_k (array): float16 [B, n_kv_heads, Gcap, 3, 128].
-            codes_v (array): uint32 [B, n_kv_heads, Gcap, 512 * v_bits].
-            axes_v (array): float16 [B, n_kv_heads, Gcap, 3, 128].
-            stage_k (array): float16 [B, n_kv_heads, S_rows, 128], rotated;
+            codes_k (array): uint32
+                [B, n_kv_heads, Gcap, (D / 128) * 512 * k_bits].
+            axes_k (array): float16
+                [B, n_kv_heads, Gcap, 3 * (D / 128), 128].
+            codes_v (array): uint32, K layout with v_bits.
+            axes_v (array): float16, K layout.
+            stage_k (array): float16 [B, n_kv_heads, S_rows, D], rotated;
                 S_rows a multiple of 128 >= 256 (sink groups + live group).
             stage_v (array): float16, same shape as stage_k.
             n (int): total key count (Gcap and S_rows are capacities).
-            scale (float): query scale (typically 1/sqrt(128)).
+            scale (float): query scale (typically 1/sqrt(D)).
             k_bits (int): K record width, one of 2/3/4/5/6/8. Default 6.
             v_bits (int): V record width. Default 6.
             sinks (array, optional): per-q-head softmax sink logits.
             splits (int): key-axis split count; 0 picks the default.
-            tile_c (int): staged tile height, 32 or 16; 0 picks 32.
+            tile_c (int): staged tile height, 32 or 16 at head_dim 128 and
+                16 or 8 at 256; 0 picks the default (32 / 16).
             starts (array, optional): int32 [B] per-row key starts.
             n_attend (int): walk only the first n_attend keys while the
                 region map stays on the full n-key layout; 0 walks all n.
