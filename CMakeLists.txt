@@ -127,6 +127,8 @@ target_sources(
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_dsa_qat.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_moe_glu.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_norm_fused.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_hc_glue.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_cb_caps.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_route_shed.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_skinny_mv.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gather.cpp
@@ -209,6 +211,7 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_glu.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_glu_kq.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_norm_fused.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_hc_glue.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_route_shed.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_skinny_mv.metal
     INCLUDE_DIRS

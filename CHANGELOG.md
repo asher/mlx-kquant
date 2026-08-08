@@ -10,6 +10,19 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `skinny_matmul`: x @ w.T at token widths 1..16 against small-N large-K
   nn.Linear-layout weights, 4-8x faster than the stock GEMM at widths
   2..16 (router gates, indexer projections at speculative verify widths).
+- `hc_front_reduce` / `hc_front_expand_reduce` / `hc_sinkhorn_collapse` /
+  `hc_expand`: fused deepseek4 hyper-connection glue for single-token
+  decode; replaces ~176 python kernel launches per step with 4 native ops.
+- `get_cb_caps` / `set_cb_caps`: runtime read/write of MLX's command
+  buffer split caps, so a server can run coarse buffers during decode and
+  fine buffers during deep prefill.
+
+### Changed
+- iq2_xxs / iq2_xs / iq2_s / iq3_s MoE gather decode is 9-12% faster per
+  call (hoisted block scale, byte-indexed grids); the ext mat-vec at
+  verify widths 2..8 gains 7-10% on the same codecs.
+- Score-mixed MoE down gather gains a slot-parallel kernel at decode
+  scale (bit-identical; KQ_MOE_SP forces either form).
 
 ## [0.3.9]
 
