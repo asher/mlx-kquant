@@ -295,19 +295,10 @@ void KQuantMoEGLUKQ::eval_gpu(
   int K = x.shape(-1);
 
   const int nx = kq_moe_pick_nx((int64_t)N * R * T, K, true);
-  // x-staged experiment (KQ_MOE_XSTAGE=1, iq2_xxs/q2_k, K <= 4096):
-  // MEASURED SLOWER on M5 Max (162 vs 105 us at decode geometry) -- the 8KB
-  // threadgroup stage collapses TG residency and the gather is dequant-ALU
-  // bound, not x-read bound. Kept opt-in as the experiment record; never
-  // auto-routed.
   const std::string stem = kq_gather_stem_nx(kquant_type_, K, nx);
-  const char* xs_e = std::getenv("KQ_MOE_XSTAGE");
-  const bool xs = !biased && K <= 4096 &&
-      (stem == "iq2_xxs" || stem == "q2_k") && xs_e != nullptr &&
-      xs_e[0] == '1' && xs_e[1] == '\0';
   std::string kname = "kq_" + stem + "_moe_glu_gather_" +
-      (biased ? "bias_" : "") + act_ + (xs ? "_xs" : "") + kq_nx_suffix(nx) +
-      "_" + kq_type_string(x.dtype());
+      (biased ? "bias_" : "") + act_ + kq_nx_suffix(nx) + "_" +
+      kq_type_string(x.dtype());
   kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);

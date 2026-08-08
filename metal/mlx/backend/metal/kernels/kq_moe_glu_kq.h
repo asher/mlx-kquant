@@ -823,52 +823,6 @@ METAL_FUNC float2 kq_ext_glu_row_partial(
   return acc;
 }
 
-// GLU pair variant reading a threadgroup-staged activation row. Numerically
-// identical to kq_ext_glu_row_partial: same chunk order, same float4
-// conversions -- only the x address space differs. Decode-scale gathers are
-// bound on redundant x re-reads (every output row streams the full K row
-// from SLC); staging once per threadgroup cuts that traffic by the
-// rows-per-threadgroup factor.
-template <typename T, typename Codec, int NX>
-METAL_FUNC float2 kq_ext_glu_row_partial_xs(
-    const device uint8_t* gw,
-    const device uint8_t* uw,
-    const threadgroup T* x,
-    int64_t row,
-    int K,
-    short tx,
-    const threadgroup uint8_t* luts) {
-  constexpr short chpb = Codec::superblock / 16;
-  const int nb = K / Codec::superblock;
-  const int64_t row_off = row * (int64_t)nb * Codec::block_bytes;
-  const device uint8_t* g_row = gw + row_off;
-  const device uint8_t* u_row = uw + row_off;
-  float2 acc = float2(0.0f);
-  for (int ich = tx; 16 * ich < K; ich += NX) {
-    const int64_t boff = (int64_t)(ich / chpb) * Codec::block_bytes;
-    const short cch = short(ich % chpb);
-    const threadgroup T* xp = x + ich * 16;
-    const float4 a0 = float4(*(const threadgroup vec<T, 4>*)(xp + 0));
-    const float4 a1 = float4(*(const threadgroup vec<T, 4>*)(xp + 4));
-    const float4 a2 = float4(*(const threadgroup vec<T, 4>*)(xp + 8));
-    const float4 a3 = float4(*(const threadgroup vec<T, 4>*)(xp + 12));
-    float4x4 lw;
-    float sc;
-    KqTgLuts<Codec>::deq_chunk16s(g_row + boff, cch, lw, luts, sc);
-    acc.x += sc *
-        (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
-    KqTgLuts<Codec>::deq_chunk16s(u_row + boff, cch, lw, luts, sc);
-    acc.y += sc *
-        (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
-  }
-  return acc;
-}
-
-// Max staged activation length (elements) for _xs gather variants; the host
-// dispatches _xs only when K fits. 4096 bf16 = 8KB threadgroup memory,
-// small enough to keep several threadgroups resident per core.
-#define KQ_EXT_XS_MAX 4096
-
 // Declares `name` and stages CodecT's decode LUTs into it (no-op, 16-byte
 // stub array for table-free codecs). Gather threadgroups are (32, 2, 1).
 #define KQ_EXT_STAGE_LUTS(CodecT, name)                                \
@@ -919,52 +873,6 @@ template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
   KQ_EXT_STAGE_LUTS(Codec, kq_luts)
   const float2 gu = kq_ext_glu_row_partial<T, Codec, NX>(
       gw, uw, x, (int64_t)expert * N + out_row, K, tx, kq_luts);
-  const float g = kq_ext_reduce<NX>(gu.x);
-  const float u = kq_ext_reduce<NX>(gu.y);
-  if (tx == 0) {
-    out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
-  }
-}
-
-// x-staged uniform GLU gather: identical math to kq_ext_moe_glu_gather with
-// the token's activation row staged once into threadgroup memory (all 2*RPS
-// rows of the threadgroup share it). Host gates dispatch on
-// K <= KQ_EXT_XS_MAX.
-template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
-[[kernel]] void kq_ext_moe_glu_gather_xs(
-    const device uint8_t* gw [[buffer(0)]],
-    const device uint8_t* uw [[buffer(1)]],
-    const device T* x [[buffer(2)]],
-    const device uint32_t* indices [[buffer(3)]],
-    device T* out [[buffer(4)]],
-    const constant int& K [[buffer(5)]],
-    const constant int& N [[buffer(6)]],
-    const constant float& limit [[buffer(7)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint3 tpg [[threadgroups_per_grid]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int RPS = 32 / NX; // rows per simdgroup (2 simdgroups per tg)
-  const short tx = short(simd_lid % NX);
-  const short ty = short(simd_lid / NX);
-  const int R = tpg.y;
-  const int expert = indices[tid.z * R + tid.y];
-  const int out_row = tid.x * (2 * RPS) + int(simd_gid) * RPS + ty;
-
-  x += (int64_t)tid.z * K;
-  out += ((int64_t)tid.z * R + tid.y) * N;
-
-  KQ_EXT_STAGE_LUTS(Codec, kq_luts)
-  threadgroup T kq_xs[KQ_EXT_XS_MAX];
-  {
-    const short lane = short(simd_gid * 32 + simd_lid);
-    for (int i = lane; i < K; i += 64) {
-      kq_xs[i] = x[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
-  const float2 gu = kq_ext_glu_row_partial_xs<T, Codec, NX>(
-      gw, uw, kq_xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
   const float g = kq_ext_reduce<NX>(gu.x);
   const float u = kq_ext_reduce<NX>(gu.y);
   if (tx == 0) {

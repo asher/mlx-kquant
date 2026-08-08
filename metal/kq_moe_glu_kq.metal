@@ -167,31 +167,6 @@ instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
   instantiate_kq_ext_sx(codec, traits, q8_0, KqQ8_0Ext, bfloat16_t)            \
   instantiate_kq_ext_sx(codec, traits, q8_0, KqQ8_0Ext, float16_t)
 
-// x-staged uniform GLU gather (_xs): the token activation row is staged in
-// threadgroup memory; host dispatches only when K <= KQ_EXT_XS_MAX. Scoped
-// to the decode-gather experiment codecs for now (V4-Flash experts).
-#define instantiate_kq_ext_xs_nx(codec, traits, type, nx, sfx)                \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_silu_xs" sfx "_" #type,                   \
-      kq_ext_moe_glu_gather_xs, type, traits, KQ_GLU_ACT_SILU, nx)             \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_gelu_xs" sfx "_" #type,                   \
-      kq_ext_moe_glu_gather_xs, type, traits, KQ_GLU_ACT_GELU, nx)             \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_silu_limit_xs" sfx "_" #type,             \
-      kq_ext_moe_glu_gather_xs, type, traits, KQ_GLU_ACT_SILU_LIMIT, nx)
-
-#define instantiate_kq_ext_xs(codec, traits)                                  \
-  instantiate_kq_ext_xs_nx(codec, traits, bfloat16_t, 8, "")                   \
-  instantiate_kq_ext_xs_nx(codec, traits, bfloat16_t, 16, "_nx16")             \
-  instantiate_kq_ext_xs_nx(codec, traits, bfloat16_t, 32, "_nx32")             \
-  instantiate_kq_ext_xs_nx(codec, traits, float16_t, 8, "")                    \
-  instantiate_kq_ext_xs_nx(codec, traits, float16_t, 16, "_nx16")              \
-  instantiate_kq_ext_xs_nx(codec, traits, float16_t, 32, "_nx32")
-
-instantiate_kq_ext_xs(iq2_xxs, KqIq2_xxsExt)
-instantiate_kq_ext_xs(q2_k, KqQ2_KExt)
-
 instantiate_kq_ext_all(q2_k, KqQ2_KExt)
 instantiate_kq_ext_all(q3_k, KqQ3_KExt)
 instantiate_kq_ext_all(q4_k, KqQ4_KExt)
