@@ -3505,6 +3505,16 @@ METAL_FUNC void kq_gather_qmm_rhs_nax_tgp_impl(
     }
     threadgroup_barrier(mem_flags::mem_none);
 
+    // Rows this simdgroup owns within the current expert segment. When the
+    // segment misses the simdgroup's row band the store below is an empty
+    // slice, so its A loads and matmads are dead work: skip them. The
+    // threadgroup barriers and the cooperative Ws dequant stay TG-uniform
+    // (every segment intersects at least one band, and loop trip counts are
+    // identical across the TG).
+    const short m_lo_lim = min(int(sgp_sm), max(0, offset - tm));
+    const short m_hi_lim = min(int(sgp_sm), max(0, offset_next - tm));
+    const bool sg_active = m_lo_lim < m_hi_lim;
+
     NAXTile<AccumType, TM, TN> Dtile;
     Dtile.clear();
 
@@ -3531,35 +3541,37 @@ METAL_FUNC void kq_gather_qmm_rhs_nax_tgp_impl(
 
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            NAXTile<T, TM, TK> Atile;
-            NAXTile<T, BR, BC> Btile;
+          if (sg_active) {
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<T, BR, BC> Btile;
 
-            // Prevents the Metal compiler from reordering loads across
-            // iterations.
-            volatile int compiler_barrier;
+              // Prevents the Metal compiler from reordering loads across
+              // iterations.
+              volatile int compiler_barrier;
 
-            if constexpr (kAlignedM.value) {
-              Atile.load(xn + kk1, K);
-            } else {
-              Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+              if constexpr (kAlignedM.value) {
+                Atile.load(xn + kk1, K);
+              } else {
+                Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+              }
+
+              if constexpr (transpose) {
+                Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+              } else {
+                Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * BN_padded);
+              }
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<transpose>{});
+
+              (void)compiler_barrier;
             }
-
-            if constexpr (transpose) {
-              Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
-            } else {
-              Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * BN_padded);
-            }
-
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile,
-                metal::bool_constant<transpose>{});
-
-            (void)compiler_barrier;
           }
 
           xn += BK;
@@ -3571,53 +3583,57 @@ METAL_FUNC void kq_gather_qmm_rhs_nax_tgp_impl(
           loader_w.load_safe(tile_w);
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            NAXTile<T, TM, TK> Atile;
-            NAXTile<T, BR, BC> Btile;
+          if (sg_active) {
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<T, BR, BC> Btile;
 
-            // Prevents the Metal compiler from reordering loads across
-            // iterations.
-            volatile int compiler_barrier;
+              // Prevents the Metal compiler from reordering loads across
+              // iterations.
+              volatile int compiler_barrier;
 
-            const short psk = min(int(SK), max(0, (BK - kk1)));
-            Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
+              const short psk = min(int(SK), max(0, (BK - kk1)));
+              Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
 
-            if constexpr (transpose) {
-              Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
-            } else {
-              Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * BN_padded);
+              if constexpr (transpose) {
+                Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+              } else {
+                Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * BN_padded);
+              }
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<transpose>{});
+
+              (void)compiler_barrier;
             }
-
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile,
-                metal::bool_constant<transpose>{});
-
-            (void)compiler_barrier;
           }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const short m_lo_lim = min(int(sgp_sm), max(0, offset - tm));
-        const short m_hi_lim = min(int(sgp_sm), max(0, offset_next - tm));
-
-        if constexpr (kAlignedN.value) {
-          if (m_lo_lim == 0 && m_hi_lim == SM) {
-            Dtile.store(y + tm * N + tn, N);
+        if (sg_active) {
+          if constexpr (kAlignedN.value) {
+            if (m_lo_lim == 0 && m_hi_lim == SM) {
+              Dtile.store(y + tm * N + tn, N);
+            } else {
+              Dtile.store_slice(
+                  y + tm * N + tn,
+                  N,
+                  short2(0, m_lo_lim),
+                  short2(SN, m_hi_lim));
+            }
           } else {
             Dtile.store_slice(
-                y + tm * N + tn, N, short2(0, m_lo_lim), short2(SN, m_hi_lim));
+                y + tm * N + tn,
+                N,
+                short2(0, m_lo_lim),
+                short2(sgp_sn, m_hi_lim));
           }
-        } else {
-          Dtile.store_slice(
-              y + tm * N + tn,
-              N,
-              short2(0, m_lo_lim),
-              short2(sgp_sn, m_hi_lim));
         }
       });
     });
