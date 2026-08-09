@@ -2837,21 +2837,18 @@ struct KqNaxIq2_xxsBlockLoader {
   void load_unsafe() const {
     const short sb =
         (reduction_dim == 1 ? kt_base : fixed_kt_base) + bj / k_tile_size;
-    const float d = float(*(const device half*)src);
-    const device uint8_t* qs = src + KQ_IQ2_XXS_QS_OFFSET + sb * 8;
-    const uint signbits = uint(qs[4]) | (uint(qs[5]) << 8) |
-        (uint(qs[6]) << 16) | (uint(qs[7]) << 24);
-    const float db = d * (0.5f + float(signbits >> 28)) * 0.25f;
+    // The 32-weight k-tile is one ib32 group = chunk16s chunks 2*sb and
+    // 2*sb+1 (shared scale word). Sign-select on the exact grid bytes then
+    // one scale multiply is bit-identical to the scalar per-weight form:
+    // (db*gb)*(+-1) == db*(+-gb) in IEEE.
+    float4x4 r0, r1;
+    float s0, s1;
+    KqExtDeq<KqIq2_xxsExt>::deq_chunk16s(src, short(2 * sb), r0, s0);
+    KqExtDeq<KqIq2_xxsExt>::deq_chunk16s(src, short(2 * sb + 1), r1, s1);
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int p = i;
-      const int l = p / 8;
-      const int j = p % 8;
-      const uint8_t signs = ksigns_iq2xs[(signbits >> (7 * l)) & 127];
-      const uint64_t g = iq2xxs_grid[qs[l]];
-      const float gb = float((g >> (8 * j)) & 0xff);
-      const float sgn = (signs & kmask_iq2xs[j]) ? -1.f : 1.f;
-      dst[i] = T(db * gb * sgn);
+    for (short i = 0; i < 16; i++) {
+      dst[i] = T(s0 * r0[i / 4][i % 4]);
+      dst[16 + i] = T(s1 * r1[i / 4][i % 4]);
     }
   }
 
