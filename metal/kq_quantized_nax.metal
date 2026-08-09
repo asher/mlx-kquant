@@ -207,6 +207,41 @@ instantiate_kquant_nax_bm128(iq2_s, 256, 2)
 instantiate_kquant_nax_bm128(iq1_s, 256, 1)
 instantiate_kquant_nax_bm128(iq1_m, 256, 1)
 
+// Small-BM gather_qmm_rhs tile for the few-rows-per-expert prefill regime
+// (MoE top-k at chat chunk sizes: rows/E ~ 4-32). Every expert segment in
+// a tile re-runs the full-tile MMA K-loop, so segments/tile ~ BM/(rows/E)+1
+// sets the MMA redundancy and BM=32 roughly halves it, for a modest extra
+// Ws dequant (expert tiles straddle more row tiles). Same wm2 wn2 -> SM=16,
+// TM=1, TN=2 paired-N fragment shape as the proven qmm_t smallbm tile
+// (BM=16 is the silently-empty-kernel trap, see above). nt only: the
+// sorted-rhs route is transpose-only and the nn TM=1 pairing with tb=false
+// is unproven. No float x variant, same reachability argument as the db64
+// macro.
+#define instantiate_kquant_nax_gather_rhs_bm32(codec, gs, bits)              \
+  instantiate_kquant_nax_gather_qmm_rhs(                                     \
+      float16_t,  gs, bits, true, nt, 32, 64, 2, 2, codec)                   \
+  instantiate_kquant_nax_gather_qmm_rhs(                                     \
+      bfloat16_t, gs, bits, true, nt, 32, 64, 2, 2, codec)
+instantiate_kquant_nax_gather_rhs_bm32(q6_k, 256, 6)
+instantiate_kquant_nax_gather_rhs_bm32(q8_0, 32, 8)
+instantiate_kquant_nax_gather_rhs_bm32(q4_k, 256, 4)
+instantiate_kquant_nax_gather_rhs_bm32(q5_k, 256, 5)
+instantiate_kquant_nax_gather_rhs_bm32(q3_k, 256, 3)
+instantiate_kquant_nax_gather_rhs_bm32(q2_k, 256, 2)
+instantiate_kquant_nax_gather_rhs_bm32(q5_1, 32, 5)
+instantiate_kquant_nax_gather_rhs_bm32(q4_0, 32, 4)
+instantiate_kquant_nax_gather_rhs_bm32(q4_1, 32, 4)
+instantiate_kquant_nax_gather_rhs_bm32(q5_0, 32, 5)
+instantiate_kquant_nax_gather_rhs_bm32(iq4_nl, 32, 4)
+instantiate_kquant_nax_gather_rhs_bm32(iq4_xs, 256, 4)
+instantiate_kquant_nax_gather_rhs_bm32(iq3_xxs, 256, 3)
+instantiate_kquant_nax_gather_rhs_bm32(iq3_s, 256, 3)
+instantiate_kquant_nax_gather_rhs_bm32(iq2_xxs, 256, 2)
+instantiate_kquant_nax_gather_rhs_bm32(iq2_xs, 256, 2)
+instantiate_kquant_nax_gather_rhs_bm32(iq2_s, 256, 2)
+instantiate_kquant_nax_gather_rhs_bm32(iq1_s, 256, 1)
+instantiate_kquant_nax_gather_rhs_bm32(iq1_m, 256, 1)
+
 instantiate_kquant_nax_smallbm(q6_k, 256, 6)
 instantiate_kquant_nax_smallbm(q8_0, 32, 8)
 instantiate_kquant_nax_smallbm(q4_k, 256, 4)

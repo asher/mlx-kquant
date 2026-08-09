@@ -20,6 +20,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fine buffers during deep prefill.
 
 ### Changed
+- MoE prefill gather (sorted-rhs NAX path) is 12-28% faster per call
+  below ~64 rows per expert, biggest at 128-529-token chunks on top-8
+  256-expert shapes (bit-identical; KQ_GATHER_RHS_NAX_BM forces the
+  tile height).
 - iq2_xxs / iq2_xs / iq2_s / iq3_s MoE gather decode is 9-12% faster per
   call (hoisted block scale, byte-indexed grids); the ext mat-vec at
   verify widths 2..8 gains 7-10% on the same codecs.

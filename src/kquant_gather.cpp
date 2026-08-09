@@ -271,10 +271,25 @@ void gather_qmm_rhs_nax(
     int M,
     int N,
     int K,
+    int E,
     Device& d,
     const Stream& s,
     const std::string& kquant_type) {
-  int bm = 64, bn = 64, bk = 64, wm = 2, wn = 2;
+  int bn = 64, bk = 64, wm = 2, wn = 2;
+  // Each expert segment in a row tile pays a full-tile MMA K-loop (the
+  // in-kernel simdgroup skip trims bands the segment misses), so at few
+  // rows per expert the smaller tile roughly halves the redundant MMA for
+  // a modest extra Ws dequant. Crossover measured on DSV4-Flash shapes.
+  const int rows_per_expert = M / std::max(E, 1);
+  int bm = rows_per_expert < 64 ? 32 : 64;
+  // Tuning lever: force the NAX rhs tile height (32/64). Read live - only
+  // reached on the sorted prefill path, so the getenv cost is negligible.
+  if (const char* e = std::getenv("KQ_GATHER_RHS_NAX_BM")) {
+    int v = std::atoi(e);
+    if (v == 32 || v == 64) {
+      bm = v;
+    }
+  }
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
@@ -852,6 +867,7 @@ void KQuantGatherQMM::eval_gpu(
           /*M=*/static_cast<int>(x.size() / K),
           N,
           K,
+          E,
           d,
           s,
           kquant_type_);
