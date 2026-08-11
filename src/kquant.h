@@ -861,6 +861,27 @@ std::vector<mx::array> hc_sinkhorn_collapse(
     float norm_eps,
     mx::StreamOrDevice s = {});
 
+// hc_front_expand_reduce and hc_sinkhorn_collapse as one dispatch: the
+// sumsq threadgroup continues into the collapse behind a device arrival
+// counter instead of the host launching a second kernel. Single row only
+// (the leading dims must multiply to 1), which fixes the grid at 25
+// threadgroups so the whole grid stays co-resident and the wait cannot
+// deadlock. Returns {h [..., 4, D], collapsed [..., D], post f32
+// [..., 4], comb f32 [..., 4, 4]}, bit-identical to the split pair.
+std::vector<mx::array> hc_front_expand_collapse(
+    mx::array x_sub,
+    mx::array resid,
+    mx::array post,
+    mx::array comb,
+    mx::array fn,
+    mx::array scale,
+    mx::array base,
+    mx::array w,
+    int iters,
+    float hc_eps,
+    float norm_eps,
+    mx::StreamOrDevice s = {});
+
 // Expand the sublayer output x [..., D] back over resid [..., 4, D] with
 // the pre/comb coefficients. Returns [..., 4, D].
 mx::array hc_expand(
@@ -2072,6 +2093,36 @@ class KQuantHcSinkhornCollapse : public mx::Primitive {
 
   const char* name() const override {
     return "KQuantHcSinkhornCollapse";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int iters_;
+  float hc_eps_;
+  float norm_eps_;
+};
+
+class KQuantHcFrontExpandCollapse : public mx::Primitive {
+ public:
+  explicit KQuantHcFrontExpandCollapse(
+      mx::Stream stream,
+      int iters,
+      float hc_eps,
+      float norm_eps)
+      : mx::Primitive(stream),
+        iters_(iters),
+        hc_eps_(hc_eps),
+        norm_eps_(norm_eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcFrontExpandCollapse";
   }
   bool is_equivalent(const mx::Primitive& other) const override;
 

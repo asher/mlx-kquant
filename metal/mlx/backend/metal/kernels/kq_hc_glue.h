@@ -16,6 +16,15 @@
 //                             into the output. One threadgroup per row.
 //   kq_hc_expand:             pre/comb expand of the sublayer output back
 //                             to four streams. Two threadgroups per row.
+//   kq_hc_front_expand_collapse: the two above as one dispatch, the
+//                             sumsq threadgroup continuing into the
+//                             collapse once an arrival counter says every
+//                             mix threadgroup has published its dot.
+//                             Single row, fixed 25-threadgroup grid.
+//
+// The expand_reduce and sinkhorn_collapse bodies live in shared inline
+// functions so the split and continuation routes run the same arithmetic
+// in the same order by construction and cannot drift apart.
 
 #define KQ_HC 4
 #define KQ_HC_MIX ((2 + KQ_HC) * KQ_HC)
@@ -81,26 +90,27 @@ template <typename T>
   }
 }
 
+// Shared body of kq_hc_front_expand_reduce, also run by every threadgroup
+// of the fused continuation kernel. partial is threadgroup scratch [8].
 template <typename T>
-[[kernel]] void kq_hc_front_expand_reduce(
-    const device T* x_sub [[buffer(0)]],
-    const device T* resid [[buffer(1)]],
-    const device float* post [[buffer(2)]],
-    const device float* comb [[buffer(3)]],
-    const device float* fn [[buffer(4)]],
-    device T* h_out [[buffer(5)]],
-    device float* mixes_raw [[buffer(6)]],
-    device float* sumsq [[buffer(7)]],
-    const constant int& D [[buffer(8)]],
-    uint tg [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]]) {
+inline void kq_hc_front_expand_reduce_body(
+    const device T* x_sub,
+    const device T* resid,
+    const device float* post,
+    const device float* comb,
+    const device float* fn,
+    device T* h_out,
+    device float* mixes_raw,
+    device float* sumsq,
+    const int D,
+    uint row,
+    uint m,
+    uint tid,
+    threadgroup float* partial) {
   const uint lane = tid % 32;
   const uint sg = tid / 32;
   const int KTOT = KQ_HC * D;
   const uint D4q = (uint)D / 4;
-
-  const uint row = tg / (KQ_HC_MIX + 1);
-  const uint m = tg % (KQ_HC_MIX + 1);
 
   const device T* xs = x_sub + (int64_t)row * D;
   const device T* rr = resid + (int64_t)row * KTOT;
@@ -152,7 +162,6 @@ template <typename T>
     }
   }
 
-  threadgroup float partial[8];
   acc = simd_sum(acc);
   if (lane == 0) {
     partial[sg] = acc;
@@ -172,22 +181,58 @@ template <typename T>
 }
 
 template <typename T>
-[[kernel]] void kq_hc_sinkhorn_collapse(
-    const device T* x [[buffer(0)]],
-    const device float* mixes_raw [[buffer(1)]],
-    const device float* sumsq [[buffer(2)]],
-    const device float* scale [[buffer(3)]],
-    const device float* base [[buffer(4)]],
-    const device T* w [[buffer(5)]],
-    device T* collapsed [[buffer(6)]],
-    device float* post [[buffer(7)]],
-    device float* comb [[buffer(8)]],
-    const constant int& D [[buffer(9)]],
-    const constant int& iters [[buffer(10)]],
-    const constant float& hc_eps [[buffer(11)]],
-    const constant float& norm_eps [[buffer(12)]],
-    uint row [[threadgroup_position_in_grid]],
+[[kernel]] void kq_hc_front_expand_reduce(
+    const device T* x_sub [[buffer(0)]],
+    const device T* resid [[buffer(1)]],
+    const device float* post [[buffer(2)]],
+    const device float* comb [[buffer(3)]],
+    const device float* fn [[buffer(4)]],
+    device T* h_out [[buffer(5)]],
+    device float* mixes_raw [[buffer(6)]],
+    device float* sumsq [[buffer(7)]],
+    const constant int& D [[buffer(8)]],
+    uint tg [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]) {
+  threadgroup float partial[8];
+  kq_hc_front_expand_reduce_body<T>(
+      x_sub,
+      resid,
+      post,
+      comb,
+      fn,
+      h_out,
+      mixes_raw,
+      sumsq,
+      D,
+      tg / (KQ_HC_MIX + 1),
+      tg % (KQ_HC_MIX + 1),
+      tid,
+      partial);
+}
+
+// Shared body of kq_hc_sinkhorn_collapse, also run by the continuation
+// threadgroup of the fused kernel. pre_shared is [KQ_HC], ssq_shared [8]
+// and inv_shared [1] of threadgroup scratch.
+template <typename T>
+inline void kq_hc_sinkhorn_collapse_body(
+    const device T* x,
+    const device float* mixes_raw,
+    const device float* sumsq,
+    const device float* scale,
+    const device float* base,
+    const device T* w,
+    device T* collapsed,
+    device float* post,
+    device float* comb,
+    const int D,
+    const int iters,
+    const float hc_eps,
+    const float norm_eps,
+    uint row,
+    uint tid,
+    threadgroup float* pre_shared,
+    threadgroup float* ssq_shared,
+    threadgroup float* inv_shared) {
   const uint lane = tid % 32;
   const uint sg = tid / 32;
   const int BASE_OFF = 2 * KQ_HC;
@@ -199,10 +244,6 @@ template <typename T>
   device float* comb_out = comb + row * KQ_HC * KQ_HC;
 
   const float factor = metal::rsqrt(sumsq[row] / (float)(KQ_HC * D) + NEPS);
-
-  threadgroup float pre_shared[KQ_HC];
-  threadgroup float ssq_shared[8];
-  threadgroup float inv_shared[1];
 
   if (sg == 0) {
     const float pre_scale = scale[0] * factor;
@@ -313,6 +354,143 @@ template <typename T>
       out4[d4] = T4(vals[c] * inv * wv);
     }
   }
+}
+
+template <typename T>
+[[kernel]] void kq_hc_sinkhorn_collapse(
+    const device T* x [[buffer(0)]],
+    const device float* mixes_raw [[buffer(1)]],
+    const device float* sumsq [[buffer(2)]],
+    const device float* scale [[buffer(3)]],
+    const device float* base [[buffer(4)]],
+    const device T* w [[buffer(5)]],
+    device T* collapsed [[buffer(6)]],
+    device float* post [[buffer(7)]],
+    device float* comb [[buffer(8)]],
+    const constant int& D [[buffer(9)]],
+    const constant int& iters [[buffer(10)]],
+    const constant float& hc_eps [[buffer(11)]],
+    const constant float& norm_eps [[buffer(12)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+  threadgroup float pre_shared[KQ_HC];
+  threadgroup float ssq_shared[8];
+  threadgroup float inv_shared[1];
+  kq_hc_sinkhorn_collapse_body<T>(
+      x,
+      mixes_raw,
+      sumsq,
+      scale,
+      base,
+      w,
+      collapsed,
+      post,
+      comb,
+      D,
+      iters,
+      hc_eps,
+      norm_eps,
+      row,
+      tid,
+      pre_shared,
+      ssq_shared,
+      inv_shared);
+}
+
+// The two-dispatch front cycle as one dispatch. Every threadgroup runs the
+// expand_reduce body, publishes its device writes and arrives at the
+// counter; the sumsq threadgroup then continues into the collapse body
+// once all KQ_HC_MIX + 1 have arrived.
+//
+// The wait is unbounded on purpose. Metal gives no forward-progress
+// guarantee across threadgroups, so the protocol is safe only while the
+// whole grid is co-resident: the grid is a fixed KQ_HC_MIX + 1 = 25
+// threadgroups for a single row, which the host side enforces by
+// rejecting any other row count. A bounded spin would trade an
+// unschedulable grid, which is a visible hang, for a silently wrong
+// result, which is worse.
+template <typename T>
+[[kernel]] void kq_hc_front_expand_collapse(
+    const device T* x_sub [[buffer(0)]],
+    const device T* resid [[buffer(1)]],
+    const device float* post_in [[buffer(2)]],
+    const device float* comb_in [[buffer(3)]],
+    const device float* fn [[buffer(4)]],
+    const device float* scale [[buffer(5)]],
+    const device float* base [[buffer(6)]],
+    const device T* w [[buffer(7)]],
+    device T* h_out [[buffer(8)]],
+    device float* mixes_raw [[buffer(9)]],
+    device float* sumsq [[buffer(10)]],
+    device atomic_uint* arrive [[buffer(11)]],
+    device T* collapsed [[buffer(12)]],
+    device float* post_out [[buffer(13)]],
+    device float* comb_out [[buffer(14)]],
+    const constant int& D [[buffer(15)]],
+    const constant int& iters [[buffer(16)]],
+    const constant float& hc_eps [[buffer(17)]],
+    const constant float& norm_eps [[buffer(18)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+  threadgroup float partial[8];
+  threadgroup float pre_shared[KQ_HC];
+  threadgroup float ssq_shared[8];
+  threadgroup float inv_shared[1];
+
+  kq_hc_front_expand_reduce_body<T>(
+      x_sub,
+      resid,
+      post_in,
+      comb_in,
+      fn,
+      h_out,
+      mixes_raw,
+      sumsq,
+      D,
+      0u,
+      tg,
+      tid,
+      partial);
+
+  // publish this threadgroup's mix dot (or h and sumsq) before arriving
+  threadgroup_barrier(mem_flags::mem_device);
+  if (tid == 0) {
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst);
+    atomic_fetch_add_explicit(arrive, 1u, memory_order_relaxed);
+  }
+
+  if (tg != (uint)KQ_HC_MIX) {
+    return;
+  }
+
+  if (tid == 0) {
+    uint v = atomic_load_explicit(arrive, memory_order_relaxed);
+    while (v < (uint)(KQ_HC_MIX + 1)) {
+      v = atomic_load_explicit(arrive, memory_order_relaxed);
+    }
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst);
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+
+  kq_hc_sinkhorn_collapse_body<T>(
+      h_out,
+      mixes_raw,
+      sumsq,
+      scale,
+      base,
+      w,
+      collapsed,
+      post_out,
+      comb_out,
+      D,
+      iters,
+      hc_eps,
+      norm_eps,
+      0u,
+      tid,
+      pre_shared,
+      ssq_shared,
+      inv_shared);
 }
 
 template <typename T>

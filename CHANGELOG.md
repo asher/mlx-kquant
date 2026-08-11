@@ -227,6 +227,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `dsa_kv_qat` takes `f16_round=False`, which stops at the fp8 result and
   copies the RoPE tail through unchanged. Fuses the DeepSeek-V4 compressor
   emit-path quantization, which has no f16 cache step, into one dispatch.
+- `hc_front_expand_collapse`: `hc_front_expand_reduce` and
+  `hc_sinkhorn_collapse` as one dispatch, the sumsq threadgroup continuing
+  into the collapse behind a device arrival counter. Single row only, which
+  fixes the grid at the 25 threadgroups the wait needs co-resident.
+  Bit-identical to the two ops it replaces, which both remain.
 
 ### Changed
 - IQ4_NL decode is faster, because each mat-vec lane now reads eight weights

@@ -1690,6 +1690,50 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "hc_front_expand_collapse",
+      &mlx_kquant::hc_front_expand_collapse,
+      "x_sub"_a,
+      "resid"_a,
+      "post"_a,
+      "comb"_a,
+      "fn"_a,
+      "scale"_a,
+      "base"_a,
+      "w"_a,
+      "iters"_a,
+      "hc_eps"_a,
+      "norm_eps"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        hc_front_expand_reduce and hc_sinkhorn_collapse as one dispatch.
+        Every threadgroup runs the front reduction and arrives at a device
+        counter; the sumsq threadgroup then continues into the collapse
+        instead of the host launching a second kernel.
+
+        Single row only: the leading dims must multiply to 1. That fixes
+        the grid at 25 threadgroups, which is what keeps the whole grid
+        co-resident, and the continuation is only safe while it is.
+
+        Args:
+            x_sub (array): [..., D] sublayer output.
+            resid (array): [..., 4, D] residual streams.
+            post (array): [..., 4] float32.
+            comb (array): [..., 4, 4] float32.
+            fn (array): [24, 4 * D] float32 mix matrix.
+            scale (array): [3] float32 pre/post/comb scales.
+            base (array): [24] float32 mix biases.
+            w (array): [D] sublayer norm weight, same dtype as resid.
+            iters (int): sinkhorn iterations.
+            hc_eps (float): sinkhorn epsilon.
+            norm_eps (float): rms_norm epsilon.
+
+        Returns:
+            tuple: (h [..., 4, D], collapsed [..., D], post f32 [..., 4],
+            comb f32 [..., 4, 4]); bit-identical to the split pair.
+      )");
+
+  m.def(
       "hc_expand",
       &mlx_kquant::hc_expand,
       "x"_a,

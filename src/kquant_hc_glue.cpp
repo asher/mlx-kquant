@@ -162,6 +162,65 @@ void KQuantHcSinkhornCollapse::eval_gpu(
   ce.dispatch_threadgroups(MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1));
 }
 
+void KQuantHcFrontExpandCollapse::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  for (auto& out : outputs) {
+    out.set_data(mx::allocator::malloc(out.nbytes()));
+  }
+  const auto& resid = inputs[1];
+  int D = resid.shape(-1);
+
+  // Scratch the split route passes between its two dispatches, plus the
+  // arrival counter the continuation waits on. A fresh counter per
+  // dispatch is what makes the lifecycle safe: the buffer comes from an
+  // allocator that never hands back memory an in-flight batch still
+  // references, add_temporary retains it until this batch completes, and
+  // a command buffer that fails leaves a buffer that is simply dropped
+  // rather than one that has to be reset from the CPU under a partial
+  // value.
+  mx::array mixes_raw({1, MIX}, mx::float32, nullptr, {});
+  mx::array sumsq({1, 1}, mx::float32, nullptr, {});
+  mx::array arrive({1}, mx::uint32, nullptr, {});
+  mixes_raw.set_data(mx::allocator::malloc(mixes_raw.nbytes()));
+  sumsq.set_data(mx::allocator::malloc(sumsq.nbytes()));
+  arrive.set_data(mx::allocator::malloc(arrive.nbytes()));
+  *arrive.data<uint32_t>() = 0;
+
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.add_temporary(mixes_raw);
+  ce.add_temporary(sumsq);
+  ce.add_temporary(arrive);
+
+  std::string kname =
+      "kq_hc_front_expand_collapse_" + kq_type_string(resid.dtype());
+  auto kernel = kq_get_kernel(d, kname);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(inputs[0], 0);
+  ce.set_input_array(resid, 1);
+  ce.set_input_array(inputs[2], 2);
+  ce.set_input_array(inputs[3], 3);
+  ce.set_input_array(inputs[4], 4);
+  ce.set_input_array(inputs[5], 5);
+  ce.set_input_array(inputs[6], 6);
+  ce.set_input_array(inputs[7], 7);
+  ce.set_output_array(outputs[0], 8);
+  ce.set_output_array(mixes_raw, 9);
+  ce.set_output_array(sumsq, 10);
+  ce.set_output_array(arrive, 11);
+  ce.set_output_array(outputs[1], 12);
+  ce.set_output_array(outputs[2], 13);
+  ce.set_output_array(outputs[3], 14);
+  ce.set_bytes(D, 15);
+  ce.set_bytes(iters_, 16);
+  ce.set_bytes(hc_eps_, 17);
+  ce.set_bytes(norm_eps_, 18);
+  // fixed grid: one row, MIX + 1 threadgroups, all co-resident
+  ce.dispatch_threadgroups(MTL::Size(MIX + 1, 1, 1), MTL::Size(256, 1, 1));
+}
+
 void KQuantHcExpand::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
@@ -207,6 +266,13 @@ void KQuantHcSinkhornCollapse::eval_gpu(
   throw std::runtime_error("[mlx_kquant.hc_sinkhorn_collapse] requires Metal.");
 }
 
+void KQuantHcFrontExpandCollapse::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.hc_front_expand_collapse] requires Metal.");
+}
+
 void KQuantHcExpand::eval_gpu(
     const std::vector<mx::array>&,
     std::vector<mx::array>&) {
@@ -236,6 +302,13 @@ void KQuantHcSinkhornCollapse::eval_cpu(
       "[mlx_kquant.hc_sinkhorn_collapse] has no CPU implementation.");
 }
 
+void KQuantHcFrontExpandCollapse::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.hc_front_expand_collapse] has no CPU implementation.");
+}
+
 void KQuantHcExpand::eval_cpu(
     const std::vector<mx::array>&,
     std::vector<mx::array>&) {
@@ -244,6 +317,12 @@ void KQuantHcExpand::eval_cpu(
 
 bool KQuantHcSinkhornCollapse::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantHcSinkhornCollapse&>(other);
+  return iters_ == o.iters_ && hc_eps_ == o.hc_eps_ && norm_eps_ == o.norm_eps_;
+}
+
+bool KQuantHcFrontExpandCollapse::is_equivalent(
+    const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQuantHcFrontExpandCollapse&>(other);
   return iters_ == o.iters_ && hc_eps_ == o.hc_eps_ && norm_eps_ == o.norm_eps_;
 }
 
@@ -374,6 +453,91 @@ std::vector<mx::array> hc_sinkhorn_collapse(
       {std::move(x_c),
        std::move(m_c),
        std::move(q_c),
+       std::move(sc_c),
+       std::move(b_c),
+       std::move(w_c)});
+}
+
+std::vector<mx::array> hc_front_expand_collapse(
+    mx::array x_sub,
+    mx::array resid,
+    mx::array post,
+    mx::array comb,
+    mx::array fn,
+    mx::array scale,
+    mx::array base,
+    mx::array w,
+    int iters,
+    float hc_eps,
+    float norm_eps,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const char* op = "[mlx_kquant.hc_front_expand_collapse]";
+  int D = check_streams(resid, op, "resid");
+  check_fn(fn, D, op);
+  int64_t rows = resid.size() / (int64_t(HC) * D);
+  // The continuation waits on threadgroups of its own grid, which is only
+  // safe while that grid is co-resident. One row keeps it at a fixed 25.
+  if (rows != 1) {
+    throw std::invalid_argument(
+        std::string(op) +
+        " is single row only: the leading dims of resid must multiply to 1.");
+  }
+  if (x_sub.shape(-1) != D || x_sub.size() != resid.size() / HC) {
+    throw std::invalid_argument(
+        std::string(op) + " x_sub must be [..., D] matching resid.");
+  }
+  if (x_sub.dtype() != resid.dtype()) {
+    throw std::invalid_argument(
+        std::string(op) + " x_sub and resid dtypes must match.");
+  }
+  if (int64_t(post.size()) != rows * HC ||
+      int64_t(comb.size()) != rows * HC * HC) {
+    throw std::invalid_argument(
+        std::string(op) + " post/comb must be [..., 4] / [..., 4, 4].");
+  }
+  if (scale.size() != 3 || int(base.size()) != MIX) {
+    throw std::invalid_argument(
+        std::string(op) + " scale must be [3] and base [24].");
+  }
+  if (w.ndim() != 1 || w.shape(0) != D || w.dtype() != resid.dtype()) {
+    throw std::invalid_argument(
+        std::string(op) + " w must be [D] in the activation dtype.");
+  }
+  if (iters < 1) {
+    throw std::invalid_argument(std::string(op) + " iters must be >= 1.");
+  }
+  auto xs_c = prep_hc_act(x_sub, op, "x_sub", s);
+  auto r_c = prep_hc_act(resid, op, "resid", s);
+  auto p_c = prep_hc_f32(post, op, "post", s);
+  auto c_c = prep_hc_f32(comb, op, "comb", s);
+  auto fn_c = prep_hc_f32(fn, op, "fn", s);
+  auto sc_c = prep_hc_f32(scale, op, "scale", s);
+  auto b_c = prep_hc_f32(base, op, "base", s);
+  auto w_c = mx::contiguous(w, false, s);
+
+  auto lead = resid.shape();
+  lead.pop_back();
+  lead.pop_back();
+  auto col_shape = lead;
+  col_shape.push_back(D);
+  auto post_shape = lead;
+  post_shape.push_back(HC);
+  auto comb_shape = lead;
+  comb_shape.push_back(HC);
+  comb_shape.push_back(HC);
+  return mx::array::make_arrays(
+      {resid.shape(),
+       std::move(col_shape),
+       std::move(post_shape),
+       std::move(comb_shape)},
+      {resid.dtype(), resid.dtype(), mx::float32, mx::float32},
+      std::make_shared<KQuantHcFrontExpandCollapse>(s, iters, hc_eps, norm_eps),
+      {std::move(xs_c),
+       std::move(r_c),
+       std::move(p_c),
+       std::move(c_c),
+       std::move(fn_c),
        std::move(sc_c),
        std::move(b_c),
        std::move(w_c)});

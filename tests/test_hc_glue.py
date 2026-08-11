@@ -137,6 +137,78 @@ def test_front_expand_reduce_matches_composition(D):
     assert np.array_equal(np.array(ssq2), np.array(ssq_ref))
 
 
+@pytest.mark.parametrize("D", [1024, 2048, 4096, 8192, 1032])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("iters", [1, 2, ITERS])
+@pytest.mark.parametrize("rep", range(3))
+def test_front_expand_collapse_matches_split_pair(D, dtype, iters, rep):
+    # The continuation runs the same two inline bodies the split pair
+    # runs, so every output is bit identical, not merely close. Repeated
+    # because the arrival protocol is a race between threadgroups and one
+    # passing run is not evidence that it always converges.
+    x, fn, scale, base, w = _mk(23 + rep, D, dtype)
+    col = (mx.random.normal((1, 1, D)) * 0.05).astype(dtype)
+    post = mx.random.uniform(0.5, 1.5, (1, 1, HC)).astype(mx.float32)
+    comb = mx.random.uniform(0.1, 0.9, (1, 1, HC, HC)).astype(mx.float32)
+    comb = comb / comb.sum(axis=-1, keepdims=True)
+    mx.eval(col, post, comb)
+
+    h_ref, mr, ssq = kq.hc_front_expand_reduce(col, x, post, comb, fn)
+    c_ref, p_ref, cb_ref = kq.hc_sinkhorn_collapse(
+        h_ref,
+        mr,
+        ssq,
+        scale,
+        base,
+        w,
+        iters=iters,
+        hc_eps=HC_EPS,
+        norm_eps=NORM_EPS,
+    )
+    h, c, p, cb = kq.hc_front_expand_collapse(
+        col,
+        x,
+        post,
+        comb,
+        fn,
+        scale,
+        base,
+        w,
+        iters=iters,
+        hc_eps=HC_EPS,
+        norm_eps=NORM_EPS,
+    )
+    mx.eval(h_ref, c_ref, p_ref, cb_ref, h, c, p, cb)
+
+    assert np.array_equal(_np64(h), _np64(h_ref))
+    assert np.array_equal(_np64(c), _np64(c_ref))
+    assert np.array_equal(np.array(p), np.array(p_ref))
+    assert np.array_equal(np.array(cb), np.array(cb_ref))
+
+
+def test_front_expand_collapse_rejects_multi_row():
+    # The continuation waits on its own grid, which is only safe while
+    # that grid is co-resident; more than one row would grow it.
+    D = 1024
+    x, fn, scale, base, w = _mk(29, D)
+    x2 = mx.concatenate([x, x], axis=1)
+    col = mx.zeros((1, 2, D), dtype=x.dtype)
+    with pytest.raises(ValueError, match="single row"):
+        kq.hc_front_expand_collapse(
+            col,
+            x2,
+            mx.zeros((1, 2, HC)),
+            mx.zeros((1, 2, HC, HC)),
+            fn,
+            scale,
+            base,
+            w,
+            iters=ITERS,
+            hc_eps=HC_EPS,
+            norm_eps=NORM_EPS,
+        )
+
+
 def test_input_validation():
     x, fn, scale, base, w = _mk(17, 2048)
     with pytest.raises(ValueError):
