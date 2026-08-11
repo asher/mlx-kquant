@@ -493,8 +493,14 @@ mx::array dsa_indexer_scores_q(
 // n_rot RoPE dims fp8-exempt, then the whole row rounded through fp16 (the
 // f16 KV-cache step). x is any shape with trailing dim D where
 // (D - n_rot) % 64 == 0; returns the same shape and dtype. Bit-compatible
-// with the split + fp8-core + concat + astype chain. Metal-only.
-mx::array dsa_kv_qat(mx::array x, int n_rot, mx::StreamOrDevice s = {});
+// with the split + fp8-core + concat + astype chain. Set f16_round false
+// for the compressor emit-path form, which stops at the fp8 result and
+// passes the RoPE tail through unchanged. Metal-only.
+mx::array dsa_kv_qat(
+    mx::array x,
+    int n_rot,
+    bool f16_round = true,
+    mx::StreamOrDevice s = {});
 
 // K-quant gathered matvec (down projection), same wire layout. x [T, R, K]
 // (one row per expert slot), indices [T, R]. Optional per-(expert, out_dim)
@@ -1293,8 +1299,8 @@ class KQDsaIndexerScoresQ : public mx::Primitive {
 // dsa_kv_qat). Inference-only, Metal-only.
 class KQDsaKvQat : public mx::Primitive {
  public:
-  explicit KQDsaKvQat(mx::Stream stream, int n_rot)
-      : mx::Primitive(stream), n_rot_(n_rot) {}
+  explicit KQDsaKvQat(mx::Stream stream, int n_rot, bool f16_round)
+      : mx::Primitive(stream), n_rot_(n_rot), f16_round_(f16_round) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -1313,6 +1319,7 @@ class KQDsaKvQat : public mx::Primitive {
 
  private:
   int n_rot_;
+  bool f16_round_;
 };
 
 // K-quant fused MoE GLU gather (see moe_glu_gather_kq). Inference-only.
