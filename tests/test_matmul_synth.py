@@ -53,7 +53,10 @@ CODECS = {
 # ggml marks these imatrix-required; kq.quantize rejects them without one.
 REQ_IMAT = {"iq2_xxs", "iq2_xs", "iq1_s"}
 N, K = 256, 512
-MS = (1, 2, 3, 4, 8)
+# 1 takes qmv, 2 through 8 take the verify mv_ext kernel, and 64 takes
+# qmm. Without a large M the block loaders never run, so the prefill
+# path of every codec goes untested.
+MS = (1, 2, 3, 4, 8, 64)
 
 
 @pytest.mark.parametrize("codec", list(CODECS))
