@@ -84,3 +84,39 @@ def test_matmul_synth(codec):
         assert max_rel < 5e-2 or max_abs < 1e-2, (
             f"{codec} M={M}: max_rel={max_rel:.3e} max_abs={max_abs:.3e}"
         )
+
+
+# Codecs with a 32-weight block. They accept any K that 32 divides, so they
+# reach the plain qmv path. The superblock codecs need K that 256 divides,
+# which always takes the fast path.
+BLOCK32 = ("q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl")
+# 288 is 9 blocks of 32. It is not a multiple of qmv_fast_k_align(), so the
+# kernel must guard the tail. K=512 above only covers the fast path.
+K_TAIL = 288
+
+
+@pytest.mark.parametrize("codec", BLOCK32)
+def test_matmul_synth_tail(codec):
+    """Validate the plain qmv path, where the block count leaves a tail."""
+    gtype = CODECS[codec]
+    rng = np.random.default_rng(0)
+    w_np = (rng.standard_normal((N, K_TAIL)) * 0.1).astype(np.float32)
+    wq, _ = kq.quantize(mx.array(w_np), codec)
+    mx.eval(wq)
+    packed = np.ascontiguousarray(np.array(wq).astype(np.uint8))
+    w = mx.array(packed)
+    scales = mx.zeros((1,), dtype=mx.uint8)
+    deq = quants.dequantize(packed, gtype).astype(np.float32)
+    for M in MS:
+        x_np = (rng.standard_normal((M, K_TAIL)) * 0.1).astype(np.float32)
+        x = mx.array(x_np).astype(mx.float16)
+        got = kq.quantized_matmul(x, w, scales, codec, transpose=True)
+        mx.eval(got)
+        g = np.array(got).astype(np.float32)
+        r = np.array(x).astype(np.float32) @ deq.T
+        diff = np.abs(g - r)
+        max_abs = float(diff.max())
+        max_rel = float((diff / (np.abs(r) + 1e-3)).max())
+        assert max_rel < 5e-2 or max_abs < 1e-2, (
+            f"{codec} M={M}: max_rel={max_rel:.3e} max_abs={max_abs:.3e}"
+        )
