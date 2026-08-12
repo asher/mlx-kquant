@@ -6,6 +6,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `dsa_kv_qat` takes `f16_round=False`, which stops at the fp8 result and
+  copies the RoPE tail through unchanged. Fuses the DeepSeek-V4 compressor
+  emit-path quantization, which has no f16 cache step, into one dispatch.
+
 ## [0.3.11]
 
 ### Changed

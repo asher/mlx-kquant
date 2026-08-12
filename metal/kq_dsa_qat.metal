@@ -28,8 +28,10 @@ instantiate_kq_dsa_indexer_qat_pack(float, float);
 // clang-format on
 
 // clang-format off
-#define instantiate_kq_dsa_kv_qat(tname, dtype)                         \
-  instantiate_kernel("kq_dsa_kv_qat_" #tname, kq_dsa_kv_qat, dtype)
+#define instantiate_kq_dsa_kv_qat(tname, dtype)                            \
+  instantiate_kernel("kq_dsa_kv_qat_" #tname, kq_dsa_kv_qat, dtype, true)  \
+  instantiate_kernel(                                                      \
+      "kq_dsa_kv_qat_nof16_" #tname, kq_dsa_kv_qat, dtype, false)
 
 instantiate_kq_dsa_kv_qat(float16_t, half);
 instantiate_kq_dsa_kv_qat(bfloat16_t, bfloat16_t);

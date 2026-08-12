@@ -136,7 +136,9 @@ modifications, from omlx's `glm_moe_dsa` custom kernels (see the
   per-head attention sinks, in one flash-softmax dispatch (f32 accumulation).
 - **`dsa_kv_qat`** / **`dsa_indexer_qat`** - the fused quantization-aware round-trips DeepSeek-V4 does
   on its main-attention KV (per-64-block FP8-E4M3FN) and indexer activations (128-wide Hadamard then
-  per-32-block FP4-E2M1), each bit-identical to the equivalent MLX graph.
+  per-32-block FP4-E2M1), each bit-identical to the equivalent MLX graph. `dsa_kv_qat(...,
+  f16_round=False)` drops the trailing fp16 round for the compressor emit path, whose pooled rows are
+  quantized but never stored in the f16 KV cache.
 
 Tuning levers (defaults are right for normal use):
 

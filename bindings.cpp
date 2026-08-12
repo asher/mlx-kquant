@@ -855,6 +855,7 @@ NB_MODULE(_ext, m) {
       "x"_a,
       "n_rot"_a,
       nb::kw_only(),
+      "f16_round"_a = true,
       "stream"_a = nb::none(),
       R"(
         DeepSeek-V4-Flash main-attention KV QAT round-trip, fused: the
@@ -865,10 +866,17 @@ NB_MODULE(_ext, m) {
         One kernel in place of the split + fp8-core + concat + astype
         chain, bit-identically.
 
+        With ``f16_round`` false the fp16 step is dropped: the fp8 result
+        stays in the storage dtype and the RoPE tail is copied through
+        unchanged. That is the compressor emit-path form, where the pooled
+        row is quantized but never passes through the f16 KV cache; it
+        replaces the split + fp8-core + concat chain on its own.
+
         Args:
             x (array): any shape with trailing dim D,
                 (D - n_rot) % 64 == 0; float16/bfloat16/float32.
             n_rot (int): trailing RoPE dims excluded from the fp8 step.
+            f16_round (bool): apply the trailing fp16 round. Default True.
 
         Returns:
             array: same shape and dtype as ``x``.
