@@ -11,6 +11,15 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   copies the RoPE tail through unchanged. Fuses the DeepSeek-V4 compressor
   emit-path quantization, which has no f16 cache step, into one dispatch.
 
+### Changed
+- IQ4_NL decode is faster, because each mat-vec lane now reads eight weights
+  instead of one. IQ4_NL no longer trails the other 4-bit codecs.
+- IQ4_XS decode is faster, because each mat-vec lane now reads a quant byte
+  once and uses both nibbles instead of dropping one.
+- IQ4_XS prefill is faster, because the tensor-core loader now reads the
+  quant bytes with vector loads and uses both nibbles of each byte. IQ4_XS
+  prefill no longer trails the other 4-bit codecs.
+
 ## [0.3.11]
 
 ### Changed

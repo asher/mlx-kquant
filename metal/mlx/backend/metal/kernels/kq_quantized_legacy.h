@@ -2367,9 +2367,24 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
       w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
 }
 
-// IQ4_NL mat-vec: one impl for both qmv and qmv_fast (the LUT decode is cheap,
-// so there's no separate aligned fast path). Lane `simd_lid` owns weight `lane`
-// of every 32-block; simd_sum reduces the 32 lanes.
+// IQ4_NL mat-vec: one impl for both qmv and qmv_fast. The LUT decode is cheap,
+// so there is no separate aligned fast path.
+//
+// Four lanes cover one 32-weight block, and a simdgroup covers eight blocks per
+// step. Each lane owns four qs bytes and reads both nibbles of each byte, which
+// gives the lane eight weights. simd_sum then reduces the 32 lanes.
+//
+// The earlier version gave each lane one weight. That version read one byte and
+// one scale per lane per row-block, which is 64 load instructions for each
+// 32-weight block. This version reads two ushorts and one scale for each group
+// of four lanes, which is 12 load instructions for the same block. The kernel
+// is instruction-bound, not bandwidth-bound, so the load count sets the speed.
+// The iq4_xs kernel in kq_quantized_iq.h uses the same shape.
+//
+// Blocks are 18 bytes and qs starts at byte 2, so every qs address is a
+// multiple of 2. Therefore the lane can use ushort loads. It cannot use uint
+// loads, because an 18-byte block makes every second block address odd for a
+// 4-byte type.
 template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
 METAL_FUNC void kq_iq4_nl_qmv_impl(
     const device uint8_t* w,
@@ -2383,6 +2398,9 @@ METAL_FUNC void kq_iq4_nl_qmv_impl(
   static_assert(group_size == KQ_IQ4_NL_GROUP, "IQ4_NL requires gs=32");
   static_assert(bits == 4, "IQ4_NL requires bits=4");
   constexpr int num_simdgroups = 2;
+  constexpr int lanes_per_block = 4; // four lanes cover one 32-weight block
+  constexpr int blocks_per_step = 32 / lanes_per_block; // eight blocks a step
+  constexpr int bytes_per_lane = KQ_IQ4_NL_GROUP / 2 / lanes_per_block; // four
   typedef float U;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
@@ -2394,19 +2412,46 @@ METAL_FUNC void kq_iq4_nl_qmv_impl(
   const int nb = in_vec_size / KQ_IQ4_NL_GROUP;
   x += tid.x * in_vec_size;
   y += tid.x * out_vec_size;
-  const bool is_high = simd_lid >= 16;
-  const int byteidx = is_high ? int(simd_lid) - 16 : int(simd_lid);
+  // The lane picks its block within the step, then its byte group in that
+  // block. Byte `byte0 + k` holds weight `byte0 + k` in the low nibble and
+  // weight `byte0 + k + 16` in the high nibble.
+  const int lane_blk = int(simd_lid) / lanes_per_block; // 0..7
+  const int byte0 = (int(simd_lid) % lanes_per_block) * bytes_per_lane;
   U result[results_per_simdgroup] = {0};
-  for (int ib = 0; ib < nb; ib++) {
-    const U xv = U(x[ib * KQ_IQ4_NL_GROUP + simd_lid]);
+  for (int base = 0; base < nb; base += blocks_per_step) {
+    const int ib = base + lane_blk;
+    // The last step can run past the end. Those lanes add nothing. Every lane
+    // still reaches the simd_sum below, because `base` is the same in all
+    // lanes.
+    if (ib >= nb) {
+      continue;
+    }
+    // Hold the lane's eight x values in registers. All rows below reuse them.
+    U xt[2 * bytes_per_lane];
+    const device T* xb = x + ib * KQ_IQ4_NL_GROUP + byte0;
+#pragma unroll
+    for (int k = 0; k < bytes_per_lane; k++) {
+      xt[k] = U(xb[k]);
+      xt[bytes_per_lane + k] = U(xb[KQ_IQ4_NL_GROUP / 2 + k]);
+    }
     for (int row = 0; row < active_rows; row++) {
       const device uint8_t* blk = w +
           static_cast<int64_t>(out_row + row) * row_bytes +
           ib * KQ_IQ4_NL_BLOCK_BYTES;
       const U d = U(float(*(const device half*)blk));
-      const uint8_t b = blk[KQ_IQ4_NL_QS_OFFSET + byteidx];
-      const int nib = is_high ? (b >> 4) : (b & 0x0F);
-      result[row] += d * U(kvalues_iq4nl[nib]) * xv;
+      const device ushort* qw = reinterpret_cast<const device ushort*>(
+          blk + KQ_IQ4_NL_QS_OFFSET + byte0);
+      const uint qbytes = uint(qw[0]) | (uint(qw[1]) << 16);
+      // One scale multiply for the whole group. The earlier version scaled
+      // every weight, so this version also rounds less.
+      U partial = 0;
+#pragma unroll
+      for (int k = 0; k < bytes_per_lane; k++) {
+        const uint b = (qbytes >> (8 * k)) & 0xFF;
+        partial += U(kvalues_iq4nl[b & 0x0F]) * xt[k];
+        partial += U(kvalues_iq4nl[b >> 4]) * xt[bytes_per_lane + k];
+      }
+      result[row] += d * partial;
     }
   }
   for (int row = 0; row < results_per_simdgroup; row++) {
