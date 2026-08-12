@@ -2527,14 +2527,27 @@ struct KqNaxIq4_xsBlockLoader {
     const int ls = ((scales_l[sb / 2] >> (4 * (sb & 1))) & 0xf) |
         (((scales_h >> (2 * sb)) & 3) << 4);
     const float dl = d * float(ls - 32);
-    const device uint8_t* qs = src + KQ_IQ4_XS_QS_OFFSET + sb * 16;
+    // A byte holds two weights of the sub-block. The low nibble gives
+    // weight b and the high nibble gives weight b + 16. Read the 16 quant
+    // bytes with two uint2 loads and use both nibbles, instead of one byte
+    // load per weight that drops a nibble. The quants of sub-block sb start
+    // at byte 8 + 16 * sb of a 136-byte block. Both terms divide by 8, so
+    // the uint2 loads are aligned.
+    const device uint2* qw = reinterpret_cast<const device uint2*>(
+        src + KQ_IQ4_XS_QS_OFFSET + sb * 16);
+    const uint2 q01 = qw[0];
+    const uint2 q23 = qw[1];
+    const uint qword[4] = {q01.x, q01.y, q23.x, q23.y};
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int p = i;
-      const bool is_high = p >= 16;
-      const int b = is_high ? (p - 16) : p;
-      const int nib = is_high ? (qs[b] >> 4) : (qs[b] & 0xf);
-      dst[i] = T(dl * float(kvalues_iq4nl[nib]));
+    for (short v = 0; v < 4; v++) {
+      const uint q = qword[v];
+#pragma unroll
+      for (short k = 0; k < 4; k++) {
+        const short i = 4 * v + k;
+        const uint b = (q >> (8 * k)) & 0xFFu;
+        dst[i] = T(dl * float(kvalues_iq4nl[b & 0x0Fu]));
+        dst[16 + i] = T(dl * float(kvalues_iq4nl[b >> 4]));
+      }
     }
   }
 
