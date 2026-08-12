@@ -14,6 +14,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - IQ4_NL decode is faster, because each mat-vec lane now reads eight weights
   instead of one. IQ4_NL no longer trails the other 4-bit codecs.
+- IQ4_XS decode is faster, because each mat-vec lane now reads a quant byte
+  once and uses both nibbles instead of dropping one.
 
 ## [0.3.11]
 

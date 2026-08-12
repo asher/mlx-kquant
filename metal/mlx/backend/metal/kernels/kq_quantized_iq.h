@@ -1058,33 +1058,45 @@ METAL_FUNC void kq_iq4_xs_qmv_impl(
   const int nb = in_vec_size / KQ_IQ4_XS_SUPERBLOCK;
   x += tid.x * in_vec_size;
   y += tid.x * out_vec_size;
+  // A byte holds two weights of the sub-block. The low nibble gives weight b
+  // and the high nibble gives weight b + 16. Each lane takes four bytes and
+  // uses both nibbles, so it still covers eight weights but reads each byte
+  // once. The old shape read a byte for each weight and dropped one nibble,
+  // which doubled the load count.
+  //
+  // A block is 136 bytes and the quants start at byte 8. Both divide by four,
+  // so one uint load is safe for every block.
+  constexpr int bytes_per_lane = vpt / 2;
   const int s = simd_lid / 4; // sub-block
-  const int o = (simd_lid % 4) * 8; // offset within sub-block
-  const bool is_high = o >= 16;
-  const int byte0 = is_high ? (o - 16) : o;
+  const int q0 = int(simd_lid % 4) * bytes_per_lane; // first byte of the lane
   U result[results_per_simdgroup] = {0};
   for (int ib = 0; ib < nb; ib++) {
-    U xt[vpt];
+    U xlo[bytes_per_lane];
+    U xhi[bytes_per_lane];
+    const device T* xb = x + ib * KQ_IQ4_XS_SUPERBLOCK + s * 32 + q0;
 #pragma unroll
-    for (int i = 0; i < vpt; i++) {
-      xt[i] = U(x[ib * KQ_IQ4_XS_SUPERBLOCK + simd_lid * vpt + i]);
+    for (int i = 0; i < bytes_per_lane; i++) {
+      xlo[i] = U(xb[i]);
+      xhi[i] = U(xb[16 + i]);
     }
     for (int row = 0; row < active_rows; row++) {
       const device uint8_t* sb = w +
           static_cast<int64_t>(out_row + row) * row_bytes +
           ib * KQ_IQ4_XS_BLOCK_BYTES;
       const U d = U(float(*(const device half*)sb));
-      const uint16_t scales_h = uint16_t(sb[2]) | (uint16_t(sb[3]) << 8);
+      const uint scales_h = uint(*(const device ushort*)(sb + 2));
       const device uint8_t* scales_l = sb + KQ_IQ4_XS_SCALESL_OFFSET;
       const int ls = ((scales_l[s / 2] >> (4 * (s & 1))) & 0xf) |
           (((scales_h >> (2 * s)) & 3) << 4);
       const U dl = d * U(ls - 32);
-      const device uint8_t* qs = sb + KQ_IQ4_XS_QS_OFFSET + s * 16 + byte0;
+      const uint qb = *reinterpret_cast<const device uint*>(
+          sb + KQ_IQ4_XS_QS_OFFSET + s * 16 + q0);
       U partial = 0;
 #pragma unroll
-      for (int i = 0; i < vpt; i++) {
-        const int nib = is_high ? (qs[i] >> 4) : (qs[i] & 0xf);
-        partial += xt[i] * U(kvalues_iq4nl[nib]);
+      for (int i = 0; i < bytes_per_lane; i++) {
+        const uint b = (qb >> (8 * i)) & 0xFF;
+        partial += xlo[i] * U(kvalues_iq4nl[b & 0x0F]);
+        partial += xhi[i] * U(kvalues_iq4nl[b >> 4]);
       }
       result[row] += dl * partial;
     }
