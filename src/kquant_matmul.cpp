@@ -192,26 +192,57 @@ static int kq_smallm_route_min(const std::string& t, int N, int K) {
 
 // Non-NAX default split-K entry M per codec (0 = env lever only).
 // Below the entry, the mv paths win. From the entry through M32,
-// qmm_splitk is flat at the measured shapes. The default route decays
-// past M~4 and falls into the plain qmm_t hole at M13.
-// Measured 2026-08 on M3 Max:
-// - q4_k, muse-glimmer full forward: M8 146 vs 172 ms, M9 wash,
-//   M10 189 vs 175. Entry 10.
-// - q3_k, Qwen3-4B MLP: M8 wash, M10 win. Entry 10.
-// - q6_k, vocab head [6656x150k]: M8 8.6 vs 10.3 ms. Entry 8.
-// q5_k, q2_k, and q8_0 are not measured. They enter at the M13 cliff.
+// qmm_splitk is flat at the measured shapes (the bm16 tile carries
+// M <= 16; BM=32 carries M 17-32). The default route decays past M~4
+// and falls into the plain qmm_t hole at M13.
+// Measured 2026-08 on M3 Max, bm16 tile:
+// - q4_k, muse-glimmer MLP: bm16 flat 1.83-1.91 ms M2-16; mv_ext wins
+//   through M4 (1.05-1.42), loses from M6 (~2.3). Entry 6.
+// - q5_k, muse-glimmer vocab head [6656x202k]: bm16 flat 5.9-6.1;
+//   default wins through M4 (4.4), loses from M6 (6.5). Entry 6.
+// - q3_k, Qwen3-4B MLP: bm16 flat ~0.7 from M6. Entry 6.
+// - q6_k, Qwen3-4B vocab head: bm16 flat 1.83-1.94; default 2.25 at
+//   M6, 3.93 at M8. Entry 6.
+// q2_k and q8_0 are not measured. They enter at the M13 cliff (q8_0's
+// mv paths are the strongest in the fleet; measure before lowering).
 // NAX machines keep their existing routing.
 static int kq_splitk_min_m(const std::string& t) {
-  if (t == "q4_k" || t == "q3_k") {
-    return 10;
+  if (t == "q4_k" || t == "q3_k" || t == "q5_k" || t == "q6_k") {
+    return 6;
   }
-  if (t == "q6_k") {
-    return 8;
-  }
-  if (t == "q5_k" || t == "q2_k" || t == "q8_0") {
+  if (t == "q2_k" || t == "q8_0") {
     return 13;
   }
   return 0;
+}
+
+// Default entry M for the staged mv_ext (_ts) route (0 = env lever
+// only). Entries pend measurement on this silicon.
+static int kq_mv_ext_ts_min_m(const std::string& t) {
+  (void)t;
+  return 0;
+}
+
+// True when the staged mv_ext (_ts) route takes this shape. Shared by
+// eval_gpu (window gate) and verify_mv_ext (kernel pick) so the M 13-17
+// window only opens when the _ts kernel is the one that runs.
+static bool kq_mv_ext_ts_takes(const std::string& t, int M, int K) {
+  static const int env = []() {
+    const char* e = std::getenv("KQ_MV_EXT_TS");
+    return e != nullptr ? std::atoi(e) : -1; // -1 = per-codec default
+  }();
+  if (env == 0) {
+    return false;
+  }
+  const bool ts_codec = t == "q6_k" || t == "q4_k" || t == "q3_k";
+  if (!ts_codec || K % 128 != 0 || M < 4 || M > 17) {
+    return false;
+  }
+  if (env == 1) {
+    return true;
+  }
+  const int min_m = kq_mv_ext_ts_min_m(t);
+  return min_m > 0 && M >= min_m;
 }
 
 // NAX (tensor-core) GEMM dispatch for the quantized matmul (no biases).
@@ -454,8 +485,14 @@ void qmm_splitk(
     Device& d,
     const Stream& s,
     const std::string& kquant_type) {
-  constexpr int bm = 32, bn = 32;
+  constexpr int bn = 32;
   constexpr int wm = 2, wn = 2;
+  // The bm16 tile halves the MMA row-padding waste at M <= 16.
+  const bool bm16 = M <= 16 &&
+      (kquant_type == "q4_k" || kquant_type == "q3_k" ||
+       kquant_type == "q6_k" || kquant_type == "q5_k" ||
+       kquant_type == "q2_k" || kquant_type == "q8_0");
+  const int bm = bm16 ? 16 : 32;
   const int k_partition = (K / group_size / splits) * group_size;
   const int part_stride = M * N;
 
@@ -471,7 +508,8 @@ void qmm_splitk(
   kname.reserve(64);
   mx::concatenate(
       kname,
-      kq_kname_prefix(kquant_type) + "qmm_t_splitk_",
+      kq_kname_prefix(kquant_type) +
+          (bm16 ? "qmm_t_splitk_bm16_" : "qmm_t_splitk_"),
       type_string,
       "_gs_",
       group_size,
@@ -880,7 +918,8 @@ void verify_mv_ext(
     const char* e = std::getenv("KQ_MV_EXT_NR");
     return e != nullptr ? std::atoi(e) : 1;
   }();
-  const bool use_nr2 = mv_ext_nr == 2 && M >= 5 && kquant_type == "q6_k";
+  const bool use_nr2 =
+      mv_ext_nr == 2 && M >= 5 && M <= 12 && kquant_type == "q6_k";
   // Shuffle-broadcast experiment (KQ_MV_EXT_SB=1): ty-lanes exchange
   // activation quarters over simd_shuffle instead of each loading the full
   // window -- activation cache traffic / 4, same grid. q6_k M 4-12 only.
@@ -888,7 +927,8 @@ void verify_mv_ext(
     const char* e = std::getenv("KQ_MV_EXT_SB");
     return e != nullptr && std::atoi(e) == 1;
   }();
-  const bool use_sb = !use_nr2 && mv_ext_sb && M >= 4 && kquant_type == "q6_k";
+  const bool use_sb =
+      !use_nr2 && mv_ext_sb && M >= 4 && M <= 12 && kquant_type == "q6_k";
   // Wide-nxpsg experiment (KQ_MV_EXT_NX=16|32): fewer redundant activation
   // readers per element (nypsg*nsg drops 8 -> 4 -> 2) + more threadgroups.
   // q6_k M 4-12 only; wins here would generalize per codec.
@@ -897,8 +937,8 @@ void verify_mv_ext(
     const int v = e != nullptr ? std::atoi(e) : 0;
     return (v == 16 || v == 32) ? v : 0;
   }();
-  const bool use_nx =
-      !use_nr2 && !use_sb && mv_ext_nx != 0 && M >= 4 && kquant_type == "q6_k";
+  const bool use_nx = !use_nr2 && !use_sb && mv_ext_nx != 0 && M >= 4 &&
+      M <= 12 && kquant_type == "q6_k";
   // T-precision-dot experiment (KQ_MV_EXT_HD=1): chunk dots in half/bfloat
   // at 2x issue rate + no per-row activation converts, f32 fold per chunk.
   // q6_k M 4-12, half/bfloat x only.
@@ -907,16 +947,13 @@ void verify_mv_ext(
     return e != nullptr && std::atoi(e) == 1;
   }();
   const bool use_hd = !use_nr2 && !use_sb && !use_nx && mv_ext_hd && M >= 4 &&
-      kquant_type == "q6_k" && x.dtype() != mx::float32;
-  // Staged-activation experiment (KQ_MV_EXT_TS=1): cooperative TG-memory
-  // stage of the activation window, 8 simdgroups / 32 rows per TG. q6_k
-  // M 4-12; K must cover a full 128-element window (q6_k geometry does).
-  static const bool mv_ext_ts = []() {
-    const char* e = std::getenv("KQ_MV_EXT_TS");
-    return e != nullptr && std::atoi(e) == 1;
-  }();
-  const bool use_ts = !use_nr2 && !use_sb && !use_nx && !use_hd && mv_ext_ts &&
-      M >= 4 && kquant_type == "q6_k" && K % 128 == 0;
+      M <= 12 && kquant_type == "q6_k" && x.dtype() != mx::float32;
+  // Staged-activation mv_ext (KQ_MV_EXT_TS): cooperative TG-memory stage
+  // of the activation window, 8 simdgroups / 32 rows per TG. Instantiated
+  // for q6_k/q4_k/q3_k at M 4-17; K must cover a full 128-element window.
+  // Unset = per-codec default (kq_mv_ext_ts_min_m), 1 forces, 0 disables.
+  const bool use_ts = !use_nr2 && !use_sb && !use_nx && !use_hd &&
+      kq_mv_ext_ts_takes(kquant_type, M, K);
   const int nsg_eff = use_ts ? 8 : nsg;
   const int nxpsg_eff = use_nx ? mv_ext_nx : nxpsg;
   const int rows_per_tg = (32 / nxpsg_eff) * nsg_eff * (use_nr2 ? 2 : 1);
@@ -1212,7 +1249,7 @@ void KQuantMatmul::eval_gpu(
   const int splitk_min_m = kq_splitk_min_m(kquant_type_);
   const bool splitk_route = qmm_splitk_env > 1 ||
       (qmm_splitk_env == -1 && splitk_min_m > 0 && M >= splitk_min_m &&
-       !kq_is_nax_available());
+       !kq_is_nax_available() && !kq_mv_ext_ts_takes(kquant_type_, M, K));
   if (splitk_route && transpose_ && non_batched && M <= 32 &&
       (kquant_type_ == "q6_k" || kquant_type_ == "q5_k" ||
        kquant_type_ == "q4_k" || kquant_type_ == "q3_k" ||
@@ -1276,8 +1313,9 @@ void KQuantMatmul::eval_gpu(
     // For transpose shapes in the mv_ext M-range, the weight-read-amortizing
     // kernel beats qmm's under-utilised BM=64 tile at small M. Let those fall
     // through to the mv_ext check below; vector_limit was calibrated for
-    // qmv-vs-qmm, not mv_ext-vs-qmm.
-    if (!(transpose_ && non_batched && M >= 2 && M <= 12)) {
+    // qmv-vs-qmm, not mv_ext-vs-qmm. The _ts route extends the range.
+    if (!(transpose_ && non_batched &&
+          ((M >= 2 && M <= 12) || kq_mv_ext_ts_takes(kquant_type_, M, K)))) {
       qmm(x,
           w,
           scales,
@@ -1345,7 +1383,8 @@ void KQuantMatmul::eval_gpu(
     const KQuantCodec* mv_ext_codec = codec_by_name(kquant_type_);
     const int mv_ext_k_align =
         mv_ext_codec ? mv_ext_codec->weights_per_block : 256;
-    if (codec_has_mv_ext && non_batched && M >= 2 && M <= 12 &&
+    if (codec_has_mv_ext && non_batched &&
+        ((M >= 2 && M <= 12) || kq_mv_ext_ts_takes(kquant_type_, M, K)) &&
         (K % mv_ext_k_align == 0) &&
         (verify_ext == 1 ||
          (verify_ext != 0 && mv_ext_default_on && mv_ext_width_ok))) {

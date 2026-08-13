@@ -37,6 +37,18 @@
       bits,                                                               \
       aligned_N)
 
+// BM=16 split-K tile for M <= 16 (codecs with the bm16 template arm).
+#define instantiate_kquant_qmm_t_splitk_bm16(type, gs, bits, aligned_N, codec) \
+  instantiate_kernel(                                                          \
+      "kquant_" #codec "_qmm_t_splitk_bm16_" #type "_gs_" #gs "_b_" #bits      \
+          "_alN_" #aligned_N,                                                  \
+      kq_ ## codec ## _qmm_t_splitk,                                           \
+      type,                                                                    \
+      gs,                                                                      \
+      bits,                                                                    \
+      aligned_N,                                                               \
+      true)
+
 #define instantiate_kquant_qmm_n(type, gs, bits, batched, codec)        \
   instantiate_kernel(                                                   \
       "kquant_" #codec "_qmm_n_" #type "_gs_" #gs "_b_" #bits           \
@@ -110,6 +122,8 @@
   instantiate_kquant_qmm_t(type, 32, 8, false, 1, q8_0)                 \
   instantiate_kquant_qmm_t_splitk(type, 32, 8, true, q8_0)              \
   instantiate_kquant_qmm_t_splitk(type, 32, 8, false, q8_0)             \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 32, 8, true, q8_0)           \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 32, 8, false, q8_0)         \
   instantiate_kquant_qmm_n(type, 32, 8, 0, q8_0)                        \
   instantiate_kquant_qmm_n(type, 32, 8, 1, q8_0)                        \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 32, 8, q8_0)     \
@@ -255,6 +269,8 @@ instantiate_kquant_q5_0_for_type(float16_t)
   instantiate_kquant_qmm_t(type, 256, 4, false, 1, q4_k)                 \
   instantiate_kquant_qmm_t_splitk(type, 256, 4, true, q4_k)              \
   instantiate_kquant_qmm_t_splitk(type, 256, 4, false, q4_k)             \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 256, 4, true, q4_k)         \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 256, 4, false, q4_k)        \
   instantiate_kquant_qmm_n(type, 256, 4, 0, q4_k)                        \
   instantiate_kquant_qmm_n(type, 256, 4, 1, q4_k)                        \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 4, q4_k)     \
@@ -284,6 +300,8 @@ instantiate_kquant_q4_k_for_type(float16_t)
   instantiate_kquant_qmm_t(type, 256, 5, false, 1, q5_k)                 \
   instantiate_kquant_qmm_t_splitk(type, 256, 5, true, q5_k)              \
   instantiate_kquant_qmm_t_splitk(type, 256, 5, false, q5_k)             \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 256, 5, true, q5_k)          \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 256, 5, false, q5_k)        \
   instantiate_kquant_qmm_n(type, 256, 5, 0, q5_k)                        \
   instantiate_kquant_qmm_n(type, 256, 5, 1, q5_k)                        \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 5, q5_k)     \
@@ -314,6 +332,8 @@ instantiate_kquant_q5_k_for_type(float16_t)
   instantiate_kquant_qmm_t(type, 256, 6, false, 1, q6_k)                 \
   instantiate_kquant_qmm_t_splitk(type, 256, 6, true, q6_k)              \
   instantiate_kquant_qmm_t_splitk(type, 256, 6, false, q6_k)             \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 256, 6, true, q6_k)         \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 256, 6, false, q6_k)        \
   instantiate_kquant_qmm_n(type, 256, 6, 0, q6_k)                        \
   instantiate_kquant_qmm_n(type, 256, 6, 1, q6_k)                        \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 6, q6_k)     \
@@ -475,10 +495,12 @@ instantiate_mv_ext_nx_all(q6_k, 256, 6, 32)
   instantiate_mv_ext_hd_for_type(codec, gs, bits, float16_t)
 instantiate_mv_ext_hd_all(q6_k, 256, 6)
 
-// Staged-activation experiment (KQ_MV_EXT_TS=1): the M x 128 activation
-// window stages into threadgroup memory once per K-step and 8 simdgroups
+// Staged-activation mv_ext (suffix _ts): the M x 128 activation window
+// stages into threadgroup memory once per K-step and 8 simdgroups
 // (32 output rows) share it -- the activation-path lever the sb/nr2/nx
-// falsifications never isolated. Dot math identical to base. q6_k M 4-12.
+// falsifications never isolated. Dot math identical to base.
+// q6_k/q4_k/q3_k, M 4-17. M 13-17 is ts-only: the base kernel has no
+// instantiations there.
 #define instantiate_mv_ext_ts(codec, type, gs, bits, m)                 \
   instantiate_kernel(                                                   \
       "kquant_" #codec "_mv_ext_" #type "_gs_" #gs "_b_" #bits "_m" #m  \
@@ -493,12 +515,19 @@ instantiate_mv_ext_hd_all(q6_k, 256, 6)
   instantiate_mv_ext_ts(codec, type, gs, bits, 9)                       \
   instantiate_mv_ext_ts(codec, type, gs, bits, 10)                      \
   instantiate_mv_ext_ts(codec, type, gs, bits, 11)                      \
-  instantiate_mv_ext_ts(codec, type, gs, bits, 12)
+  instantiate_mv_ext_ts(codec, type, gs, bits, 12)                      \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 13)                      \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 14)                      \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 15)                      \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 16)                      \
+  instantiate_mv_ext_ts(codec, type, gs, bits, 17)
 #define instantiate_mv_ext_ts_all(codec, gs, bits)                      \
   instantiate_mv_ext_ts_for_type(codec, gs, bits, float)                \
   instantiate_mv_ext_ts_for_type(codec, gs, bits, bfloat16_t)           \
   instantiate_mv_ext_ts_for_type(codec, gs, bits, float16_t)
 instantiate_mv_ext_ts_all(q6_k, 256, 6)
+instantiate_mv_ext_ts_all(q4_k, 256, 4)
+instantiate_mv_ext_ts_all(q3_k, 256, 3)
 
 #define instantiate_kquant_q3_k_for_type(type)                          \
   instantiate_kquant_batched(verify_qmv, type, 256, 3, 0, q3_k)          \
@@ -514,6 +543,8 @@ instantiate_mv_ext_ts_all(q6_k, 256, 6)
   instantiate_kquant_qmm_t(type, 256, 3, false, 1, q3_k)                 \
   instantiate_kquant_qmm_t_splitk(type, 256, 3, true, q3_k)              \
   instantiate_kquant_qmm_t_splitk(type, 256, 3, false, q3_k)             \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 256, 3, true, q3_k)         \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 256, 3, false, q3_k)        \
   instantiate_kquant_qmm_n(type, 256, 3, 0, q3_k)                        \
   instantiate_kquant_qmm_n(type, 256, 3, 1, q3_k)                        \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 3, q3_k)     \
@@ -543,6 +574,8 @@ instantiate_kquant_q3_k_for_type(float16_t)
   instantiate_kquant_qmm_t(type, 256, 2, false, 1, q2_k)                 \
   instantiate_kquant_qmm_t_splitk(type, 256, 2, true, q2_k)              \
   instantiate_kquant_qmm_t_splitk(type, 256, 2, false, q2_k)             \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 256, 2, true, q2_k)          \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 256, 2, false, q2_k)        \
   instantiate_kquant_qmm_n(type, 256, 2, 0, q2_k)                        \
   instantiate_kquant_qmm_n(type, 256, 2, 1, q2_k)                        \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 2, q2_k)     \
