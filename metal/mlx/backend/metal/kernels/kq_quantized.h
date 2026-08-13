@@ -786,111 +786,6 @@ METAL_FUNC void kq_mv_ext_hd_impl(
   }
 }
 
-// Staged-activation variant of kq_mv_ext_impl (suffix _ts). Weights stay in
-// registers exactly as in the base kernel; the change is the activation
-// path, the one lever the falsified variants never isolated: sb swapped
-// loads for shuffles (worse throughput), nr2 amortized via registers
-// (spilled), x16/x32 only changed which thread issues the loads. Here the
-// M x (nxpsg*16) activation window stages into threadgroup memory once per
-// K-step via a cooperative load, every row-thread dots from on-core SRAM,
-// and the threadgroup carries nsg_ts simdgroups (32 rows at nsg_ts=8) so
-// cross-TG device activation traffic drops rows_per_tg/8-fold vs the base
-// kernel. Dot arithmetic is bit-identical to base (staging is a copy).
-// K must be a multiple of nxpsg*16 (q6_k superblock 256 guarantees it).
-template <typename T, typename Codec, short r1ptg, short nsg, short nxpsg>
-METAL_FUNC void kq_mv_ext_ts_impl(
-    const device uint8_t* w,
-    const device T* x,
-    device T* y,
-    threadgroup T* staged, // r1ptg * nxpsg * 16 elements
-    const constant int& in_vec_size, // K
-    const constant int& out_vec_size, // N
-    uint3 tgpig,
-    ushort tiisg,
-    ushort sgitg) {
-  constexpr short nypsg = 32 / nxpsg; // output rows per simdgroup
-  constexpr short chpb = Codec::superblock / 16; // 16-weight chunks per block
-  constexpr short stage_w = nxpsg * 16; // staged K-window elements per row
-  const short tx = tiisg % nxpsg; // K position within the row group
-  const short ty = tiisg / nxpsg; // which of nypsg rows this thread owns
-
-  const int i01 = tgpig.x * (nypsg * nsg) + nypsg * sgitg + ty; // output row
-  const int i11 = tgpig.y * r1ptg; // first activation column (grid.y==1 -> 0)
-
-  const int nb = in_vec_size / Codec::superblock;
-  const int row_bytes = nb * Codec::block_bytes;
-  // Clamp OOB rows to row 0 for a valid read; the store is masked below.
-  const device uint8_t* w_row =
-      (i01 < out_vec_size) ? w + static_cast<int64_t>(i01) * row_bytes : w;
-
-  const short lin = sgitg * 32 + tiisg; // linear thread id in the TG
-  constexpr short tg_threads = nsg * 32;
-
-  float sumf[r1ptg];
-#pragma unroll
-  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-    sumf[ir1] = 0.0f;
-  }
-
-  for (int base = 0; 16 * base < in_vec_size; base += nxpsg) {
-    // Cooperative stage of the M x stage_w activation window.
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const int kw = 16 * base;
-    for (short f = lin; f < r1ptg * stage_w; f += tg_threads) {
-      const short ir1 = f / stage_w;
-      const short j = f % stage_w;
-      staged[f] = x[static_cast<int64_t>(i11 + ir1) * in_vec_size + kw + j];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const int ich = base + tx;
-    const int ib = ich / chpb; // super-block index
-    const short cch = ich % chpb; // chunk within super-block
-    const device uint8_t* block =
-        w_row + static_cast<int64_t>(ib) * Codec::block_bytes;
-    float4x4 lx;
-    Codec::deq_chunk16(block, cch, lx);
-    const threadgroup T* sp = staged + tx * 16;
-#pragma unroll
-    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-      const threadgroup T* yp = sp + ir1 * stage_w;
-      const float4 a0 = float4(*(const threadgroup vec<T, 4>*)(yp + 0));
-      const float4 a1 = float4(*(const threadgroup vec<T, 4>*)(yp + 4));
-      const float4 a2 = float4(*(const threadgroup vec<T, 4>*)(yp + 8));
-      const float4 a3 = float4(*(const threadgroup vec<T, 4>*)(yp + 12));
-      sumf[ir1] +=
-          dot(lx[0], a0) + dot(lx[1], a1) + dot(lx[2], a2) + dot(lx[3], a3);
-    }
-  }
-
-#pragma unroll
-  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-    if (nxpsg >= 32) {
-      sumf[ir1] += simd_shuffle_down(sumf[ir1], 16);
-    }
-    if (nxpsg >= 16) {
-      sumf[ir1] += simd_shuffle_down(sumf[ir1], 8);
-    }
-    if (nxpsg >= 8) {
-      sumf[ir1] += simd_shuffle_down(sumf[ir1], 4);
-    }
-    if (nxpsg >= 4) {
-      sumf[ir1] += simd_shuffle_down(sumf[ir1], 2);
-    }
-    if (nxpsg >= 2) {
-      sumf[ir1] += simd_shuffle_down(sumf[ir1], 1);
-    }
-  }
-
-  if (tx == 0 && i01 < out_vec_size) {
-#pragma unroll
-    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-      y[static_cast<int64_t>(i11 + ir1) * out_vec_size + i01] =
-          static_cast<T>(sumf[ir1]);
-    }
-  }
-}
-
 // Wide-M variant of kq_mv_ext_impl: each thread owns nr0 CONSECUTIVE output
 // rows instead of one. The nr0=1 kernel re-loads all r1ptg activation columns
 // per 16-weight chunk per row, so activation cache traffic scales as
@@ -1528,7 +1423,12 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits, bool aligned_N>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool bm16 = false>
 [[kernel]] void kq_q8_0_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -1546,7 +1446,8 @@ template <typename T, int group_size, int bits, bool aligned_N>
   static_assert(
       group_size == KQ_Q8_0_GROUP, "Q8_0 kernel requires group_size=32");
   static_assert(bits == 8, "Q8_0 kernel requires bits=8");
-  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BM = bm16 ? 16 : 32;
+  constexpr int BK = 32, BN = bm16 ? 64 : 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
