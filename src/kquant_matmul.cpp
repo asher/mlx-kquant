@@ -190,6 +190,30 @@ static int kq_smallm_route_min(const std::string& t, int N, int K) {
   return m;
 }
 
+// Non-NAX default split-K entry M per codec (0 = env lever only).
+// Below the entry, the mv paths win. From the entry through M32,
+// qmm_splitk is flat at the measured shapes. The default route decays
+// past M~4 and falls into the plain qmm_t hole at M13.
+// Measured 2026-08 on M3 Max:
+// - q4_k, muse-glimmer full forward: M8 146 vs 172 ms, M9 wash,
+//   M10 189 vs 175. Entry 10.
+// - q3_k, Qwen3-4B MLP: M8 wash, M10 win. Entry 10.
+// - q6_k, vocab head [6656x150k]: M8 8.6 vs 10.3 ms. Entry 8.
+// q5_k, q2_k, and q8_0 are not measured. They enter at the M13 cliff.
+// NAX machines keep their existing routing.
+static int kq_splitk_min_m(const std::string& t) {
+  if (t == "q4_k" || t == "q3_k") {
+    return 10;
+  }
+  if (t == "q6_k") {
+    return 8;
+  }
+  if (t == "q5_k" || t == "q2_k" || t == "q8_0") {
+    return 13;
+  }
+  return 0;
+}
+
 // NAX (tensor-core) GEMM dispatch for the quantized matmul (no biases).
 void qmm_nax(
     const array& x,
@@ -1174,20 +1198,28 @@ void KQuantMatmul::eval_gpu(
     }
   }
 
-  // Split-K qmm experiment (KQ_QMM_SPLITK=<target splits>, 0 = off, read
-  // once): the small-M band's occupancy lever; see qmm_splitk. Routes when
-  // a >1 divisor of the wire-block count exists at or under the target.
-  // K-quants + q8_0 only for now (instantiation coverage).
+  // Split-K qmm: the occupancy lever for the small-M band; see
+  // qmm_splitk. The route needs a >1 divisor of the wire-block count
+  // at or under the target. K-quants + q8_0 only for now
+  // (instantiation coverage). Default routing is non-NAX only and
+  // enters at kq_splitk_min_m. KQ_QMM_SPLITK=<target splits> forces
+  // the route for all M <= 32 (A/B lever). KQ_QMM_SPLITK=0 disables
+  // both.
   static const int qmm_splitk_env = []() {
     const char* e = std::getenv("KQ_QMM_SPLITK");
-    return e != nullptr ? std::atoi(e) : 0;
+    return e != nullptr ? std::atoi(e) : -1; // -1 = per-codec default
   }();
-  if (qmm_splitk_env > 1 && transpose_ && non_batched && M <= 32 &&
+  const int splitk_min_m = kq_splitk_min_m(kquant_type_);
+  const bool splitk_route = qmm_splitk_env > 1 ||
+      (qmm_splitk_env == -1 && splitk_min_m > 0 && M >= splitk_min_m &&
+       !kq_is_nax_available());
+  if (splitk_route && transpose_ && non_batched && M <= 32 &&
       (kquant_type_ == "q6_k" || kquant_type_ == "q5_k" ||
        kquant_type_ == "q4_k" || kquant_type_ == "q3_k" ||
        kquant_type_ == "q2_k" || kquant_type_ == "q8_0")) {
+    const int splitk_target = qmm_splitk_env > 1 ? qmm_splitk_env : 16;
     const int nblk = K / group_size_;
-    int sp = std::min(qmm_splitk_env, nblk);
+    int sp = std::min(splitk_target, nblk);
     while (sp > 1 && nblk % sp != 0) {
       --sp;
     }

@@ -1,13 +1,12 @@
-"""Verify-band row-scaling bench: matmul groups + full forward vs M.
+"""Verify-band row-scaling bench: matmul groups and full forward vs M.
 
-Times one decoder layer's MLP (the dominant verify-band cost), the
-lm_head, and optionally the full forward against a warm cache, at row
-counts M = 1..32. A near-flat curve means verify rows ride the weight
-read (llama.cpp behavior); a linear curve reproduces the speculative
-verify defect this bench exists to measure.
+Times one decoder layer's MLP, the lm_head, and (with --full) the full
+forward against a warm cache, at row counts M = 1..32. A near-flat
+curve means verify rows ride the weight read. A linear curve shows the
+speculative verify defect.
 
-Run one process per kernel-env config (most KQ_* levers latch at first
-dispatch); label with CFG:
+Use one process per kernel-env config. Most KQ_* levers latch at first
+dispatch. Label each run with CFG:
 
     CFG=default python benchmarks/bench_verify_band.py --model m.gguf
     CFG=splitk16 KQ_QMM_SPLITK=16 python benchmarks/bench_verify_band.py ...
