@@ -69,12 +69,12 @@ Tuning levers (defaults are right for normal use):
 - `KQ_QMM_SPLITK_NAX` - split-K on the NAX BM=32 tile; the value is the target slice count (`1` =
   auto 32, `0` off). Lifts the collapsed M 9-16 band 65-76% on M5 Max. q6_k/q8_0, M <= 32; read
   live per call. Default off.
-- `KQ_QMM_SPLITK` - split-K for the plain small-M qmm (target slice count, `0` off). Measured flat
-  to negative on M5 Max; kept as a probe. K-quants plus q8_0, M <= 32. Default off.
-- `KQ_MV_EXT_SB` / `KQ_MV_EXT_NX` / `KQ_MV_EXT_HD` / `KQ_MV_EXT_TS` - `mv_ext` activation-traffic
-  experiments: shuffle-broadcast (`1`), wide nxpsg (`16`/`32`), half-precision chunk dots (`1`),
-  threadgroup-staged activations (`1`). q6_k M 4-12 only. `HD` measured +4-5% at M 8; the rest flat
-  to negative on M5 Max. Kept as probes. Default off.
+- `KQ_QMM_SPLITK` - the same lever for the plain small-M qmm, used when NAX is absent or disabled.
+  Entry points come from a per-device table. K-quants, legacy quants and the IQ codecs, M <= 32.
+- `KQ_MV_EXT_SB` / `KQ_MV_EXT_NX` / `KQ_MV_EXT_HD` - `mv_ext` activation-traffic experiments:
+  shuffle-broadcast (`1`), wide nxpsg (`16`/`32`), half-precision chunk dots (`1`). q6_k M 4-12
+  only. `HD` measured +4-5% at M 8; the rest flat to negative on M5 Max. Kept as probes. Default
+  off.
 
 ## MoE GLU
 

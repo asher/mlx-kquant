@@ -1266,7 +1266,12 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits, bool aligned_N>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool bm16 = false>
 [[kernel]] void kq_iq4_xs_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -1283,7 +1288,8 @@ template <typename T, int group_size, int bits, bool aligned_N>
     uint simd_lid [[thread_index_in_simdgroup]]) {
   static_assert(group_size == KQ_IQ4_XS_SUPERBLOCK, "IQ4_XS requires gs=256");
   static_assert(bits == 4, "IQ4_XS requires bits=4");
-  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BM = bm16 ? 16 : 32;
+  constexpr int BK = 32, BN = bm16 ? 64 : 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -1717,7 +1723,12 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits, bool aligned_N>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool bm16 = false>
 [[kernel]] void kq_iq3_xxs_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -1734,7 +1745,8 @@ template <typename T, int group_size, int bits, bool aligned_N>
     uint simd_lid [[thread_index_in_simdgroup]]) {
   static_assert(group_size == KQ_IQ3_XXS_SUPERBLOCK, "IQ3_XXS requires gs=256");
   static_assert(bits == 3, "IQ3_XXS requires bits=3");
-  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BM = bm16 ? 16 : 32;
+  constexpr int BK = 32, BN = bm16 ? 64 : 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -2173,7 +2185,12 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits, bool aligned_N>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool bm16 = false>
 [[kernel]] void kq_iq3_s_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -2190,7 +2207,8 @@ template <typename T, int group_size, int bits, bool aligned_N>
     uint simd_lid [[thread_index_in_simdgroup]]) {
   static_assert(group_size == KQ_IQ3_S_SUPERBLOCK, "IQ3_S requires gs=256");
   static_assert(bits == 3, "IQ3_S requires bits=3");
-  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BM = bm16 ? 16 : 32;
+  constexpr int BK = 32, BN = bm16 ? 64 : 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -2625,7 +2643,12 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits, bool aligned_N>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool bm16 = false>
 [[kernel]] void kq_iq2_xxs_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -2642,7 +2665,8 @@ template <typename T, int group_size, int bits, bool aligned_N>
     uint simd_lid [[thread_index_in_simdgroup]]) {
   static_assert(group_size == KQ_IQ2_XXS_SUPERBLOCK, "IQ2_XXS requires gs=256");
   static_assert(bits == 2, "IQ2_XXS requires bits=2");
-  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BM = bm16 ? 16 : 32;
+  constexpr int BK = 32, BN = bm16 ? 64 : 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -3080,7 +3104,12 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits, bool aligned_N>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool bm16 = false>
 [[kernel]] void kq_iq2_xs_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -3097,7 +3126,8 @@ template <typename T, int group_size, int bits, bool aligned_N>
     uint simd_lid [[thread_index_in_simdgroup]]) {
   static_assert(group_size == KQ_IQ2_XS_SUPERBLOCK, "IQ2_XS requires gs=256");
   static_assert(bits == 2, "IQ2_XS requires bits=2");
-  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BM = bm16 ? 16 : 32;
+  constexpr int BK = 32, BN = bm16 ? 64 : 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -3537,7 +3567,12 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits, bool aligned_N>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool bm16 = false>
 [[kernel]] void kq_iq2_s_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -3554,7 +3589,8 @@ template <typename T, int group_size, int bits, bool aligned_N>
     uint simd_lid [[thread_index_in_simdgroup]]) {
   static_assert(group_size == KQ_IQ2_S_SUPERBLOCK, "IQ2_S requires gs=256");
   static_assert(bits == 2, "IQ2_S requires bits=2");
-  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BM = bm16 ? 16 : 32;
+  constexpr int BK = 32, BN = bm16 ? 64 : 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -3988,7 +4024,12 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits, bool aligned_N>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool bm16 = false>
 [[kernel]] void kq_iq1_s_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -4005,7 +4046,8 @@ template <typename T, int group_size, int bits, bool aligned_N>
     uint simd_lid [[thread_index_in_simdgroup]]) {
   static_assert(group_size == KQ_IQ1_S_SUPERBLOCK, "IQ1_S requires gs=256");
   static_assert(bits == 1, "IQ1_S requires bits=1");
-  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BM = bm16 ? 16 : 32;
+  constexpr int BK = 32, BN = bm16 ? 64 : 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -4461,7 +4503,12 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits, bool aligned_N>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool bm16 = false>
 [[kernel]] void kq_iq1_m_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -4478,7 +4525,8 @@ template <typename T, int group_size, int bits, bool aligned_N>
     uint simd_lid [[thread_index_in_simdgroup]]) {
   static_assert(group_size == KQ_IQ1_M_SUPERBLOCK, "IQ1_M requires gs=256");
   static_assert(bits == 1, "IQ1_M requires bits=1");
-  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BM = bm16 ? 16 : 32;
+  constexpr int BK = 32, BN = bm16 ? 64 : 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
