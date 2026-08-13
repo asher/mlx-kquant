@@ -17,6 +17,17 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   iq2_xxs, iq2_xs, iq1_s and iq1_m have no measured entry point, because ggml
   refuses to encode them without an importance matrix, so they stay on the
   environment lever.
+- Speculative verify is faster on NAX hardware: a target forward of 8-32
+  rows now costs about 1.4x a single-row forward instead of about 2x, so
+  drafted tokens ride the weight read instead of paying per row. Measured
+  1.40x per full forward at verify widths on a 30B q4_k model.
+- The NAX split-K tile covers every codec that has NAX kernels, not just
+  q6_k and q8_0. Per-call wins from the routing entry are 1.05-1.25x
+  worst-shape and up to 2.5x on small-N projections, biggest for the
+  grid-dequant IQ codecs.
+- `KQ_QMM_SPLITK_NAX` unset now takes a measured per-codec entry M rather
+  than disabling the route. Set it to 0 to disable, or to a split count to
+  force the route at every width up to 32.
 - The non-NAX split-K entry points are picked per device instead of from one
   table, so NAX machines running with the tile forced off get their own
   measured entries.

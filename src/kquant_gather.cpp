@@ -14,6 +14,12 @@
 // right_sorted_ == do_sort: MoE PREFILL takes this sorted per-expert GEMM
 // (~=6-8x faster than B separate gather_qmv vector-matmuls), while decode
 // (top_k<64 -> no sort -> B<16) falls through to gather_qmv.
+//
+// No split-K here, unlike the dense path: this grid already spans the
+// active experts, and verify cost grows with M because more experts get
+// touched, not from starvation. At [E=256, N=2048, K=7168, top_k=8] it
+// holds 78-83% of roofline across M8-M32, so a split has nothing to
+// recover.
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>

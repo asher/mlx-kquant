@@ -207,8 +207,8 @@ static bool kq_splitk_codec(const std::string& t) {
 //
 // Two device tables, picked at dispatch. On NAX silicon this route only
 // runs with NAX off (KQ_DISABLE_NAX, or a codec with no NAX kernels);
-// the band is otherwise served by the NAX tile. That ALU path crosses
-// later than pre-NAX silicon does. Measured 2026-08-13 on M5
+// the band is otherwise served by kq_splitk_nax_min_m. That ALU path
+// crosses later than pre-NAX silicon does. Measured 2026-08-13 on M5
 // Max under KQ_DISABLE_NAX=1, three shapes; wins from the entry are
 // 2.0-2.3x.
 static int kq_splitk_min_m_nax_alu(const std::string& t) {
@@ -269,6 +269,40 @@ static int kq_splitk_min_m(const std::string& t) {
   }
   return 0;
 }
+
+// Default NAX split-K entry M per codec (0 = env lever only). The
+// un-split BM=32 grid is ceil(N/64) x 1 threadgroups with a serial
+// in-tile K walk, so the verify band pays per row; splitting K
+// multiplies threadgroup count. The win scales with how starved the
+// grid is: 1.6-2.5x at [256x6656], 1.0-1.2x at vocab-head N.
+//
+// Entry is the lowest M with no regression on any measured shape.
+// Measured 2026-08-13 on M5 Max at target 16 over seven shapes
+// (benchmarks/bench_verify_band_ab.py). No N gate needed: vocab-head
+// shapes stay >= 1.0 at every entry.
+static int kq_splitk_nax_min_m(const std::string& t) {
+  if (t == "iq2_xs" || t == "iq2_s") {
+    return 16;
+  }
+  if (t == "q6_k" || t == "iq1_m") {
+    return 12;
+  }
+  if (t == "iq3_s" || t == "iq2_xxs" || t == "iq1_s") {
+    return 10;
+  }
+  if (t == "q2_k" || t == "q3_k" || t == "q4_k" || t == "q5_k" || t == "q8_0" ||
+      t == "q4_0" || t == "q4_1" || t == "q5_0" || t == "q5_1" ||
+      t == "iq4_nl" || t == "iq4_xs" || t == "iq3_xxs") {
+    return 8;
+  }
+  return 0;
+}
+
+// Default split target; resolves down to a divisor of K / max(gs, BK),
+// so the realised count is coarser (K=6656 and K=19968 both give 13).
+// One target for all codecs: over routed cells only, 16 is best for 15
+// of 19 and within 1% for the rest.
+static constexpr int kq_splitk_nax_target = 16;
 
 // NAX (tensor-core) GEMM dispatch for the quantized matmul (no biases).
 void qmm_nax(
@@ -1214,19 +1248,22 @@ void KQuantMatmul::eval_gpu(
     return;
   }
 
-  // NAX split-K qmm experiment (KQ_QMM_SPLITK_NAX=<target splits>, 0 = off,
-  // 1 = auto target 32; read LIVE per call so --ab-env can flip it on one
-  // generator): K-slices on the tensor-core BM=32 tile; see qmm_nax_splitk.
-  // Slice quantum is max(superblock, BK) so every slice starts a loader at
-  // kt_base 0. q6_k + q8_0 instantiations only.
+  // NAX split-K, entering at kq_splitk_nax_min_m through M32; see
+  // qmm_nax_splitk. Slice quantum max(superblock, BK) keeps every slice
+  // starting a loader at kt_base 0 for both gs families.
+  // KQ_QMM_SPLITK_NAX=<splits> forces the route for all M <= 32, 1 uses
+  // the default target, 0 disables. Read live so an A/B can flip arms
+  // on one generator.
   const char* sk_nax_e = std::getenv("KQ_QMM_SPLITK_NAX");
-  int qmm_splitk_nax_env = sk_nax_e != nullptr ? std::atoi(sk_nax_e) : 0;
-  if (qmm_splitk_nax_env == 1) {
-    qmm_splitk_nax_env = 32;
-  }
-  if (qmm_splitk_nax_env > 1 && transpose_ && non_batched && M <= 32 &&
-      (kquant_type_ == "q6_k" || kquant_type_ == "q8_0") &&
-      kq_is_nax_available() && (K % 64 == 0) && x.dtype() != mx::float32) {
+  const int sk_nax_env = sk_nax_e != nullptr ? std::atoi(sk_nax_e) : -1;
+  const int sk_nax_min_m = kq_splitk_nax_min_m(kquant_type_);
+  const bool sk_nax_route = sk_nax_env >= 1 ||
+      (sk_nax_env == -1 && sk_nax_min_m > 0 && M >= sk_nax_min_m);
+  if (sk_nax_route && transpose_ && non_batched && M <= 32 &&
+      codec_has_nax(kquant_type_) && kq_is_nax_available() && (K % 64 == 0) &&
+      x.dtype() != mx::float32) {
+    const int qmm_splitk_nax_env =
+        sk_nax_env > 1 ? sk_nax_env : kq_splitk_nax_target;
     const int sliceq = std::max(group_size_, 64);
     const int nblk = K / sliceq;
     int sp = std::min(qmm_splitk_nax_env, nblk);
