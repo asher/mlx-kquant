@@ -639,7 +639,7 @@ template <
       group_size == KQ_Q4_K_SUPERBLOCK, "Q4_K kernel requires group_size=256");
   static_assert(bits == 4, "Q4_K kernel requires bits=4");
   constexpr int BM = bm16 ? 16 : 32;
-  constexpr int BK = 32, BN = 32;
+  constexpr int BK = 32, BN = bm16 ? 64 : 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -1724,7 +1724,7 @@ template <
       group_size == KQ_Q5_K_SUPERBLOCK, "Q5_K kernel requires group_size=256");
   static_assert(bits == 5, "Q5_K kernel requires bits=5");
   constexpr int BM = bm16 ? 16 : 32;
-  constexpr int BK = 32, BN = 32;
+  constexpr int BK = 32, BN = bm16 ? 64 : 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -2643,7 +2643,7 @@ template <
       group_size == KQ_Q6_K_SUPERBLOCK, "Q6_K kernel requires group_size=256");
   static_assert(bits == 6, "Q6_K kernel requires bits=6");
   constexpr int BM = bm16 ? 16 : 32;
-  constexpr int BK = 32, BN = 32;
+  constexpr int BK = 32, BN = bm16 ? 64 : 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -3765,7 +3765,7 @@ template <
       group_size == KQ_Q3_K_SUPERBLOCK, "Q3_K kernel requires group_size=256");
   static_assert(bits == 3, "Q3_K kernel requires bits=3");
   constexpr int BM = bm16 ? 16 : 32;
-  constexpr int BK = 32, BN = 32;
+  constexpr int BK = 32, BN = bm16 ? 64 : 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -4679,7 +4679,7 @@ template <
       group_size == KQ_Q2_K_SUPERBLOCK, "Q2_K kernel requires group_size=256");
   static_assert(bits == 2, "Q2_K kernel requires bits=2");
   constexpr int BM = bm16 ? 16 : 32;
-  constexpr int BK = 32, BN = 32;
+  constexpr int BK = 32, BN = bm16 ? 64 : 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];

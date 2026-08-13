@@ -485,14 +485,15 @@ void qmm_splitk(
     Device& d,
     const Stream& s,
     const std::string& kquant_type) {
-  constexpr int bn = 32;
   constexpr int wm = 2, wn = 2;
-  // The bm16 tile halves the MMA row-padding waste at M <= 16.
+  // The bm16 tile halves the MMA row-padding waste at small M and
+  // widens BN to 64 so each K-step does more MMA work per barrier.
   const bool bm16 = M <= 16 &&
       (kquant_type == "q4_k" || kquant_type == "q3_k" ||
        kquant_type == "q6_k" || kquant_type == "q5_k" ||
        kquant_type == "q2_k" || kquant_type == "q8_0");
   const int bm = bm16 ? 16 : 32;
+  const int bn = bm16 ? 64 : 32;
   const int k_partition = (K / group_size / splits) * group_size;
   const int part_stride = M * N;
 
