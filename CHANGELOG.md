@@ -6,6 +6,18 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- Quantized matmul is faster from 2 to 32 rows on machines with no NAX tile,
+  which is the band a speculative-decoding verify step runs in. A 16-row
+  split-K tile carries M <= 16, and each codec enters the route at its own
+  measured row count. Measured on M3 Max at [17920x6656], 16 rows: q4_k
+  5.6 -> 1.9 ms, iq4_nl 4.1 -> 1.5, iq3_xxs 4.2 -> 1.7, iq3_s 4.3 -> 1.8,
+  iq4_xs 4.7 -> 2.6. Single-row decode keeps its own route and is unchanged.
+- `KQ_QMM_SPLITK` forces or disables that route for every codec it supports.
+  iq2_xxs, iq2_xs, iq1_s and iq1_m have no measured entry point, because ggml
+  refuses to encode them without an importance matrix, so they stay on the
+  environment lever.
+
 ## [0.3.11]
 
 ### Added
