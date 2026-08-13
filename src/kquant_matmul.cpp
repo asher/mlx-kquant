@@ -190,6 +190,15 @@ static int kq_smallm_route_min(const std::string& t, int N, int K) {
   return m;
 }
 
+// Codecs with a split-K kernel and its bm16 tile arm. Gates both the
+// route and the tile pick, so the two cannot drift apart.
+static bool kq_splitk_codec(const std::string& t) {
+  return t == "q4_k" || t == "q5_k" || t == "q6_k" || t == "q3_k" ||
+      t == "q2_k" || t == "q8_0" || t == "iq4_xs" || t == "iq4_nl" ||
+      t == "iq3_xxs" || t == "iq3_s" || t == "iq2_xxs" || t == "iq2_xs" ||
+      t == "iq2_s" || t == "iq1_s" || t == "iq1_m";
+}
+
 // Non-NAX default split-K entry M per codec (0 = env lever only).
 // Below the entry, the mv paths win. From the entry through M32,
 // qmm_splitk is flat at the measured shapes (the bm16 tile carries
@@ -203,12 +212,32 @@ static int kq_smallm_route_min(const std::string& t, int N, int K) {
 // - q3_k, Qwen3-4B MLP: bm16 flat ~0.7 from M6. Entry 6.
 // - q6_k, Qwen3-4B vocab head: bm16 flat 1.83-1.94; default 2.25 at
 //   M6, 3.93 at M8. Entry 6.
+// - iq3_s, iq3_xxs and iq4_nl, same shape as q4_k: bm16 flat 1.5-1.9;
+//   the default wins through M4 (0.69-0.75x), ties at M6 (1.04-1.20x)
+//   and loses 2.2-2.7x at M16. Entry 6. iq3_s holds at a second shape
+//   [12288x4096] from real weights (M6 0.98x, M8 1.32x).
+// - iq4_xs, same shape: its bm16 tile is slower (2.6 flat), so the
+//   default holds through M8 (0.90x) and the tile takes over at M10
+//   (1.02x), 1.82x at M16. Entry 10.
+// - iq2_s at [4096x12288] from real weights: bm16 flat ~1.5, the
+//   default crosses at M8 (1.07x) and loses 1.61x at M16. Entry 8.
 // q2_k and q8_0 are not measured. They enter at the M13 cliff (q8_0's
 // mv paths are the strongest in the fleet; measure before lowering).
+// iq2_xxs, iq2_xs, iq1_s and iq1_m stay on the env lever: ggml refuses
+// to encode them without an importance matrix, so no synthetic weights
+// exist, and the local imatrix models hold iq2_xxs only as 3D expert
+// tensors, which this route never takes.
 // NAX machines keep their existing routing.
 static int kq_splitk_min_m(const std::string& t) {
-  if (t == "q4_k" || t == "q3_k" || t == "q5_k" || t == "q6_k") {
+  if (t == "q4_k" || t == "q3_k" || t == "q5_k" || t == "q6_k" ||
+      t == "iq3_s" || t == "iq3_xxs" || t == "iq4_nl") {
     return 6;
+  }
+  if (t == "iq2_s") {
+    return 8;
+  }
+  if (t == "iq4_xs") {
+    return 10;
   }
   if (t == "q2_k" || t == "q8_0") {
     return 13;
@@ -488,10 +517,7 @@ void qmm_splitk(
   constexpr int wm = 2, wn = 2;
   // The bm16 tile halves the MMA row-padding waste at small M and
   // widens BN to 64 so each K-step does more MMA work per barrier.
-  const bool bm16 = M <= 16 &&
-      (kquant_type == "q4_k" || kquant_type == "q3_k" ||
-       kquant_type == "q6_k" || kquant_type == "q5_k" ||
-       kquant_type == "q2_k" || kquant_type == "q8_0");
+  const bool bm16 = M <= 16 && kq_splitk_codec(kquant_type);
   const int bm = bm16 ? 16 : 32;
   const int bn = bm16 ? 64 : 32;
   const int k_partition = (K / group_size / splits) * group_size;
@@ -1252,9 +1278,7 @@ void KQuantMatmul::eval_gpu(
       (qmm_splitk_env == -1 && splitk_min_m > 0 && M >= splitk_min_m &&
        !kq_is_nax_available() && !kq_mv_ext_ts_takes(kquant_type_, M, K));
   if (splitk_route && transpose_ && non_batched && M <= 32 &&
-      (kquant_type_ == "q6_k" || kquant_type_ == "q5_k" ||
-       kquant_type_ == "q4_k" || kquant_type_ == "q3_k" ||
-       kquant_type_ == "q2_k" || kquant_type_ == "q8_0")) {
+      kq_splitk_codec(kquant_type_)) {
     const int splitk_target = qmm_splitk_env > 1 ? qmm_splitk_env : 16;
     const int nblk = K / group_size_;
     int sp = std::min(splitk_target, nblk);
