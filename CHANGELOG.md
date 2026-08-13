@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.13]
+
 ### Changed
 - Quantized matmul is faster from 2 to 32 rows on machines with no NAX tile,
   which is the band a speculative-decoding verify step runs in. A 16-row
@@ -39,7 +41,7 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `KQ_MV_EXT_TS` and its staged-activation kernels. Against the current
   BM=32 tile the route is 0.27-0.72x, so it loses at every width it covered.
 
-## [0.3.11]
+## [0.3.12]
 
 ### Added
 - `dsa_kv_qat` takes `f16_round=False`, which stops at the fp8 result and
