@@ -6,6 +6,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- sdpa_vector stored its pass-1 partials in the activation dtype; float16
+  activations could overflow them to inf on long flat attention with large
+  V outliers. Partials are float32 now, matching the GQA decode kernels.
+
 ## [0.3.13]
 
 ### Changed

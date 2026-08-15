@@ -125,7 +125,10 @@ void KQuantSDPA::eval_gpu(
   // Per-block partials + running max/sum, reduced by pass 2.
   mx::Shape part_shape = {B, n_q_heads, qL, blocks, D};
   mx::Shape red_shape = {B, n_q_heads, qL, blocks};
-  array partials(part_shape, q.dtype(), nullptr, {});
+  // f32 partials: un-normalized online-softmax accumulator state is
+  // unbounded by the model, so a 16-bit store can overflow (fp16) or lose
+  // mantissa (bf16). The gqa/cascade/paged siblings already use f32.
+  array partials(part_shape, mx::float32, nullptr, {});
   array sums(red_shape, mx::float32, nullptr, {});
   array maxs(red_shape, mx::float32, nullptr, {});
   partials.set_data(mx::allocator::malloc(partials.nbytes()));

@@ -37,7 +37,7 @@ template <typename T, int D, int V = D>
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
     const device T* values [[buffer(2)]],
-    device T* out [[buffer(3)]],
+    device float* out [[buffer(3)]],
     device float* sums [[buffer(4)]],
     device float* maxs [[buffer(5)]],
     const constant int& N [[buffer(6)]],
@@ -119,13 +119,13 @@ template <typename T, int D, int V = D>
     maxs[0] = max_score;
   }
   for (int i = 0; i < v_per_thread; i++) {
-    out[i] = static_cast<T>(o[i]);
+    out[i] = o[i];
   }
 }
 
 template <typename T, int D>
 [[kernel]] void kq_sdpa_vector_2pass_2(
-    const device T* partials [[buffer(0)]],
+    const device float* partials [[buffer(0)]],
     const device float* sums [[buffer(1)]],
     const device float* maxs [[buffer(2)]],
     device T* out [[buffer(3)]],

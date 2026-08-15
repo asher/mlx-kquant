@@ -125,6 +125,24 @@ def test_sdpa_vector_gqa(Hq, Hkv):
     _check(512, qL=4, kL=2048, dtype=mx.bfloat16, Hq=Hq, Hkv=Hkv)
 
 
+@pytest.mark.parametrize("D", [256, 512])
+def test_sdpa_vector_f32_partials_outlier_v(D):
+    # Un-normalized pass-1 partials scale with keys-per-block times |v|.
+    # A float16 partial store overflows 65504 under flat attention with
+    # outlier V channels; f32 partials must stay finite and rounding-level.
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(1, 8, 2, 1, 16384, D, mx.float16, seed=3, strided=False)
+    k = (0.05 * k.astype(mx.float32)).astype(mx.float16)  # flatten attention
+    v[:, :, :, ::64] = 2048.0
+    mx.eval(k, v)
+    got = kq.sdpa_vector(q, k, v, scale, causal=False)
+    ref = _ref_sdpa(q, k, v, scale, causal=False)
+    _eval_or_skip(got, ref)
+    assert bool(mx.all(mx.isfinite(got.astype(mx.float32))).item())
+    rel = _rel(got, ref)
+    assert rel < REL_BOUND[mx.float16], f"D={D} rel {rel:.3e}"
+
+
 def _ref_sdpa_sinks(q, k, v, scale, sinks):
     """f32 reference with per-q-head sink logits: an extra softmax column
     with no value row (raises the max / adds to the denominator only).
