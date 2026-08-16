@@ -5,22 +5,25 @@
 #include "mlx/backend/metal/kernels/steel/attn/mma.h"
 #include "mlx/backend/metal/kernels/kq_sdpa.h"
 
-#define instantiate_kq_sdpa(type, D)                                  \
+#define instantiate_kq_sdpa(type, ptype, D)                           \
   instantiate_kernel(                                                 \
       "kq_sdpa_vector_2pass_1_" #type "_" #D,                         \
       kq_sdpa_vector_2pass_1,                                         \
       type,                                                           \
+      ptype,                                                          \
       D)                                                              \
   instantiate_kernel(                                                 \
       "kq_sdpa_vector_2pass_2_" #type "_" #D,                         \
       kq_sdpa_vector_2pass_2,                                         \
       type,                                                           \
+      ptype,                                                          \
       D)
 
-instantiate_kq_sdpa(bfloat16_t, 256)
-instantiate_kq_sdpa(bfloat16_t, 512)
-instantiate_kq_sdpa(float16_t, 256)
-instantiate_kq_sdpa(float16_t, 512)
+// Partial store type per input dtype (see the PT note in kq_sdpa.h).
+instantiate_kq_sdpa(bfloat16_t, bfloat16_t, 256)
+instantiate_kq_sdpa(bfloat16_t, bfloat16_t, 512)
+instantiate_kq_sdpa(float16_t, float, 256)
+instantiate_kq_sdpa(float16_t, float, 512)
 
 #define instantiate_kq_sdpa_gqa(type, D, C)                           \
   instantiate_kernel(                                                 \

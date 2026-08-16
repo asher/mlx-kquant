@@ -143,6 +143,24 @@ def test_sdpa_vector_f32_partials_outlier_v(D):
     assert rel < REL_BOUND[mx.float16], f"D={D} rel {rel:.3e}"
 
 
+@pytest.mark.parametrize("D", [256, 512])
+def test_sdpa_vector_bf16_partials_outlier_v(D):
+    # bfloat16 keeps 16-bit pass-1 partials (range covers the outlier
+    # magnitudes that overflow fp16); same stress must stay finite and
+    # within the bf16 rounding bound.
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(1, 8, 2, 1, 16384, D, mx.bfloat16, seed=3, strided=False)
+    k = (0.05 * k.astype(mx.float32)).astype(mx.bfloat16)
+    v[:, :, :, ::64] = 2048.0
+    mx.eval(k, v)
+    got = kq.sdpa_vector(q, k, v, scale, causal=False)
+    ref = _ref_sdpa(q, k, v, scale, causal=False)
+    _eval_or_skip(got, ref)
+    assert bool(mx.all(mx.isfinite(got.astype(mx.float32))).item())
+    rel = _rel(got, ref)
+    assert rel < REL_BOUND[mx.bfloat16], f"D={D} rel {rel:.3e}"
+
+
 def _ref_sdpa_sinks(q, k, v, scale, sinks):
     """f32 reference with per-q-head sink logits: an extra softmax column
     with no value row (raises the max / adds to the denominator only).
