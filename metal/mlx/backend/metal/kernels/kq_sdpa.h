@@ -32,12 +32,15 @@ constant bool gqa_cascade [[function_constant(7)]];
 // [0, N) axis. Compiled out when false.
 constant bool gqa_paged [[function_constant(8)]];
 
-template <typename T, int D, int V = D>
+// PT = pass-1 partial store type. float16 inputs use float: the
+// un-normalized accumulator state can exceed the fp16 ceiling. bfloat16
+// keeps 16-bit stores (range-safe) and the pre-fix bandwidth.
+template <typename T, typename PT, int D, int V = D>
 [[kernel]] void kq_sdpa_vector_2pass_1(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
     const device T* values [[buffer(2)]],
-    device T* out [[buffer(3)]],
+    device PT* out [[buffer(3)]],
     device float* sums [[buffer(4)]],
     device float* maxs [[buffer(5)]],
     const constant int& N [[buffer(6)]],
@@ -119,13 +122,13 @@ template <typename T, int D, int V = D>
     maxs[0] = max_score;
   }
   for (int i = 0; i < v_per_thread; i++) {
-    out[i] = static_cast<T>(o[i]);
+    out[i] = static_cast<PT>(o[i]);
   }
 }
 
-template <typename T, int D>
+template <typename T, typename PT, int D>
 [[kernel]] void kq_sdpa_vector_2pass_2(
-    const device T* partials [[buffer(0)]],
+    const device PT* partials [[buffer(0)]],
     const device float* sums [[buffer(1)]],
     const device float* maxs [[buffer(2)]],
     device T* out [[buffer(3)]],

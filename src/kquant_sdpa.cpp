@@ -125,7 +125,12 @@ void KQuantSDPA::eval_gpu(
   // Per-block partials + running max/sum, reduced by pass 2.
   mx::Shape part_shape = {B, n_q_heads, qL, blocks, D};
   mx::Shape red_shape = {B, n_q_heads, qL, blocks};
-  array partials(part_shape, q.dtype(), nullptr, {});
+  // Un-normalized online-softmax accumulator state is unbounded by the
+  // model, so a float16 store can overflow: float16 inputs get f32
+  // partials. bfloat16 has the range and keeps 16-bit stores (pre-fix
+  // bandwidth). Must match the PT instantiation map in kq_sdpa.metal.
+  auto part_dtype = q.dtype() == mx::float16 ? mx::float32 : q.dtype();
+  array partials(part_shape, part_dtype, nullptr, {});
   array sums(red_shape, mx::float32, nullptr, {});
   array maxs(red_shape, mx::float32, nullptr, {});
   partials.set_data(mx::allocator::malloc(partials.nbytes()));

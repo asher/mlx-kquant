@@ -6,6 +6,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- sdpa_vector's float16 pass-1 partials could overflow to inf under long
+  flat attention with large V outliers; they now store as float32
+  (bfloat16 partials are unchanged).
+
 ## [0.3.13]
 
 ### Changed
