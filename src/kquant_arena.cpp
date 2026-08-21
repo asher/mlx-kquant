@@ -67,13 +67,32 @@ std::pair<mx::array, uintptr_t> arena_alloc(
 
 #ifdef _METAL_
 
-// MLX's ResidencySet wrapper methods are not exported from libmlx; its
-// inline accessor hands back the raw MTL::ResidencySet (created at device
-// init and attached to MLX's command queue), and metal-cpp is header-only,
-// so the additions run entirely in this TU.
+// mlx 0.31 exposed its queue-attached MTL::ResidencySet and these helpers
+// piggybacked on it; 0.32 split residency into size-capped sets budgeted
+// by set_wired_limit, with no raw handle out and the command queues
+// private. The arena keeps its own standalone set instead: created once
+// against MLX's MTL device with a standing requestResidency, mutations
+// applied at residency_commit(). The arena's host pages stay pinned by
+// mlock either way; this set keeps their GPU mappings resident without
+// consuming MLX's wired-limit budget, which the arena must not depend on
+// (streaming-mode servers run with that budget at zero). metal-cpp is
+// header-only, so the additions run entirely in this TU.
 static MTL::ResidencySet* kq_residency_set() {
-  auto& d = mx::metal::device(mx::Device(mx::Device::gpu));
-  return const_cast<MTL::ResidencySet*>(d.residency_set().mtl_residency_set());
+  static MTL::ResidencySet* rs = []() -> MTL::ResidencySet* {
+    if (__builtin_available(macOS 15, *)) {
+      auto& d = mx::metal::device(mx::Device(mx::Device::gpu));
+      auto* desc = MTL::ResidencySetDescriptor::alloc()->init();
+      NS::Error* error = nullptr;
+      auto* set = d.mtl_device()->newResidencySet(desc, &error);
+      desc->release();
+      if (set != nullptr) {
+        set->requestResidency();
+      }
+      return set;
+    }
+    return nullptr;
+  }();
+  return rs;
 }
 
 bool residency_insert(const mx::array& a) {
