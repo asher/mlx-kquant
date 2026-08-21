@@ -2,10 +2,10 @@
 requires = [
   "setuptools>=77",
   "cmake>=3.27",
-  "mlx==0.31.2",
+  "mlx==0.32.1",
   # Must match mlx's nanobind ABI exactly; CMakeLists.txt (KQ_NANOBIND_PIN)
   # enforces it at configure time for non-isolated builds - keep in sync.
-  "nanobind==2.12.0",
+  "nanobind==2.13.0",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -41,7 +41,7 @@ classifiers = [
   "Environment :: GPU",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = ["mlx==0.31.2"]
+dependencies = ["mlx==0.32.1"]
 
 # Model-level helpers (the create-weights toolchain, loader, and CLI) need the
 # mlx-lm model zoo and friends; the raw ``kq.*`` ops do not. Keep that weight

@@ -37,7 +37,7 @@ find_package(
 # "incompatible function arguments". Build isolation installs the pin;
 # non-isolated dev builds (build_ext --inplace, -e --no-build-isolation) use
 # whatever the venv has - guard that path here.
-set(KQ_NANOBIND_PIN "2.12.0")
+set(KQ_NANOBIND_PIN "2.13.0")
 execute_process(
   COMMAND "${Python_EXECUTABLE}" -c "import nanobind; print(nanobind.__version__)"
   OUTPUT_STRIP_TRAILING_WHITESPACE
