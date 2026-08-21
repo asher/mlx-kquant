@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.27)
 project(mlx_kquant LANGUAGES CXX C)
 
 # ----------------------------- Setup -----------------------------
-# C++20: MLX 0.31.2's public headers (device.h, stream.h) use defaulted
+# C++20: MLX 0.32.1's public headers (device.h, stream.h) use defaulted
 # comparison operators, a C++20 feature. Apple Clang accepts them as an
 # extension under -std=c++17, but GCC (the Linux toolchain) rejects them, so a
 # C++17 standard breaks the Metal-free Linux build. 20 builds cleanly on both.
@@ -248,7 +248,7 @@ if(BUILD_SHARED_LIBS)
     # installed mlx wheel at runtime. _ext.so lives in site-packages/mlx_kquant/,
     # libmlx in site-packages/mlx/lib/, so ../mlx/lib reaches it. (The absolute
     # build-tree rpath MLXConfig adds works only on the build machine; this is
-    # what makes a redistributed wheel find the ABI-pinned mlx==0.31.2. delocate
+    # what makes a redistributed wheel find the ABI-pinned mlx==0.32.1. delocate
     # must therefore *exclude* libmlx from vendoring - see [tool.cibuildwheel].)
     target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path)
     target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path/../mlx/lib)

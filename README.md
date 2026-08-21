@@ -48,14 +48,14 @@ pip install mlx-kquant            # the K-quant ops + precompiled metallib
 pip install "mlx-kquant[tools]"   # the CLI (quantize / run / chat / lora / fuse)
 ```
 
-Either pulls the ABI-matched `mlx==0.31.2` automatically.
+Either pulls the ABI-matched `mlx==0.32.1` automatically.
 
 **From source** (or to develop) needs the Metal toolchain (`xcrun metal`); the metallib compiles at
 install time, no runtime JIT:
 
 ```sh
 git clone https://github.com/asher/mlx-kquant && cd mlx-kquant
-pip install "mlx==0.31.2"         # pinned, ABI-matched stock wheel (pulls the Metal backend)
+pip install "mlx==0.32.1"         # pinned, ABI-matched stock wheel (pulls the Metal backend)
 pip install -e ".[tools]"         # builds _ext + mlx_kquant.metallib; adds mlx-lm for the CLI
 ```
 
@@ -66,7 +66,7 @@ x86_64 stays on the scalar/threaded path.) The base `mlx` wheel ships no backend
 install the CPU one explicitly:
 
 ```sh
-pip install "mlx[cpu]==0.31.2"   # base frontend + libmlx CPU backend
+pip install "mlx[cpu]==0.32.1"   # base frontend + libmlx CPU backend
 pip install -e . --no-build-isolation
 ```
 
@@ -334,7 +334,7 @@ are informed by our analysis of the mixed-precision quants that [Unsloth][unslot
 
 ## Version pinning
 
-Pinned to `mlx==0.31.2`. The kernels include MLX's steel headers and the extension links `libmlx`,
+Pinned to `mlx==0.32.1`. The kernels include MLX's steel headers and the extension links `libmlx`,
 binding it to that release's ABI and header API. To move to a newer MLX: update the bundled headers
 under `metal/mlx/backend/metal/kernels/` for that wheel, rebuild, and re-run the test suite.
 
@@ -348,10 +348,10 @@ python -m pytest tests/
 
 - **macOS 26.2 (Tahoe) or later on Apple Silicon** (M-series). Building from source needs the Metal
   toolchain (`xcrun metal`).
-- **Linux** (x86_64 or aarch64) is supported CPU-only. Build against `mlx[cpu]==0.31.2`, no Metal
+- **Linux** (x86_64 or aarch64) is supported CPU-only. Build against `mlx[cpu]==0.32.1`, no Metal
   toolchain required. See [Install](#install) and [Limitations](#limitations).
-- **Python >= 3.10** (the pinned `mlx==0.31.2` ships no cp39 wheel).
-- **`mlx==0.31.2`** exactly - the kernels include MLX's steel headers and the extension links
+- **Python >= 3.10** (the pinned `mlx==0.32.1` ships no cp39 wheel).
+- **`mlx==0.32.1`** exactly - the kernels include MLX's steel headers and the extension links
   `libmlx`, so the ABI is version-locked (see [Version pinning](#version-pinning)).
 
 ## Limitations

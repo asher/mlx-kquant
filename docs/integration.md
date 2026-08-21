@@ -10,7 +10,7 @@ Everything here runs against a **stock `mlx` wheel** - importing `mlx_kquant` ad
 namespace; it does **not** register `mode="kquant"` onto `mx.*`, so integrations call `kq.*`
 explicitly.
 
-**Compatibility.** The ops require stock `mlx==0.31.2` (the C++ extension is ABI-pinned to it). The
+**Compatibility.** The ops require stock `mlx==0.32.1` (the C++ extension is ABI-pinned to it). The
 `[tools]` integration points below (loader, recipes, the mlx-lm patch) additionally need
 `mlx-lm>=0.27`. The on-disk checkpoint format is stable and mirrors what a future in-core kquant mode
 would read.

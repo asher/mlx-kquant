@@ -96,11 +96,11 @@ ignore = ["E741"]  # ambiguous var names (l/I) appear in math-y kernel glue
 # ---------------------------------------------------------------------------
 # Wheel building (cibuildwheel). macOS arm64 only - the extension is a Metal
 # module. Build isolation pulls [build-system].requires (incl. the ABI-pinned
-# mlx==0.31.2 + nanobind + the Metal toolchain from the runner's Xcode).
+# mlx==0.32.1 + nanobind + the Metal toolchain from the runner's Xcode).
 #
 # NOTE: this config is a skeleton - it has NOT yet produced a wheel validated on
 # a second machine. Before the first PyPI publish, build locally, then
-# `pip install` the wheel into a CLEAN venv with only mlx==0.31.2 and confirm
+# `pip install` the wheel into a CLEAN venv with only mlx==0.32.1 and confirm
 # `python -c "import mlx_kquant as kq; kq.metallib_loads()"` on a GPU box.
 # ---------------------------------------------------------------------------
 [tool.cibuildwheel]
@@ -120,7 +120,7 @@ archs = ["arm64"]
 # https://github.com/ml-explore/mlx/issues/3586
 environment = { MACOSX_DEPLOYMENT_TARGET = "26.2" }
 # Do NOT vendor libmlx into the wheel: the extension is ABI-pinned to the user's
-# installed mlx==0.31.2 and resolves it via the @loader_path/../mlx/lib rpath
+# installed mlx==0.32.1 and resolves it via the @loader_path/../mlx/lib rpath
 # (see CMakeLists.txt). Bundling a second libmlx copy would split MLX global
 # state and resurrect the gguflib<->libmlx symbol collision. --exclude keeps it
 # out of the wheel; --ignore-missing-dependencies stops delocate from erroring
