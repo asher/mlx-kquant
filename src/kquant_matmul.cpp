@@ -190,7 +190,7 @@ static int kq_smallm_route_min(const std::string& t, int N, int K) {
   return m;
 }
 
-// Codecs with a split-K kernel and its bm16 tile arm. Gates both the
+// Codecs with a split-K kernel and its bm8/bm16 tile arms. Gates both the
 // route and the tile pick, so the two cannot drift apart.
 static bool kq_splitk_codec(const std::string& t) {
   return t == "q4_k" || t == "q5_k" || t == "q6_k" || t == "q3_k" ||
@@ -201,9 +201,9 @@ static bool kq_splitk_codec(const std::string& t) {
 
 // Non-NAX default split-K entry M per codec (0 = env lever only).
 // Below the entry, the mv paths win. From the entry through M32,
-// qmm_splitk is flat at the measured shapes (the bm16 tile carries
-// M <= 16; BM=32 carries M 17-32). The default route decays past M~4
-// and falls into the plain qmm_t hole at M13.
+// qmm_splitk is flat at the measured shapes (the bm8 tile carries
+// M <= 8, bm16 M 9-16, BM=32 M 17-32). The default route decays past
+// M~4 and falls into the plain qmm_t hole at M13.
 //
 // Two device tables, picked at dispatch. On NAX silicon this route only
 // runs with NAX off (KQ_DISABLE_NAX, or a codec with no NAX kernels);
@@ -227,50 +227,49 @@ static int kq_splitk_min_m_nax_alu(const std::string& t) {
   return 0;
 }
 
-// Pre-NAX silicon. Measured 2026-08 on M3 Max, bm16 tile:
-// - q4_k, muse-glimmer MLP: bm16 flat 1.83-1.91 ms M2-16; mv_ext wins
-//   through M4 (1.05-1.42), loses from M6 (~2.3). Entry 6.
-// - q5_k, muse-glimmer vocab head [6656x202k]: bm16 flat 5.9-6.1;
-//   default wins through M4 (4.4), loses from M6 (6.5). Entry 6.
-// - q3_k, Qwen3-4B MLP: bm16 flat ~0.7 from M6. Entry 6.
-// - q6_k, Qwen3-4B vocab head: bm16 flat 1.83-1.94; default 2.25 at
-//   M6, 3.93 at M8. Entry 6.
-// - iq3_s, iq3_xxs and iq4_nl, same shape as q4_k: bm16 flat 1.5-1.9;
-//   the default wins through M4 (0.69-0.75x), ties at M6 (1.04-1.20x)
-//   and loses 2.2-2.7x at M16. Entry 6. iq3_s holds at a second shape
-//   [12288x4096] from real weights (M6 0.98x, M8 1.32x).
-// - iq4_xs, same shape: its bm16 tile is slower (2.6 flat), so the
-//   default holds through M8 (0.90x) and the tile takes over at M10
-//   (1.02x), 1.82x at M16. Entry 10.
-// - iq2_s at [4096x12288] from real weights: bm16 flat ~1.5, the
-//   default crosses at M8 (1.07x) and loses 1.61x at M16. Entry 8.
-// - q8_0, Qwen3.8-27B UD-Q6_K_XL (310 q8_0 tensors incl. the vocab head)
-//   with its DFlash2 q8_0 drafter, paired full-round A/B: split-K at M8
-//   verify 141->128 ms (-9%), draft 16.1->14.9; mv_ext still wins at M6
-//   (117 vs 125) and M4 (92 vs 123). Entry 8. M7 not measured.
-// q2_k is not measured. It enters at the M13 cliff.
-// iq2_xxs, iq2_xs, iq1_s and iq1_m stay on the env lever: ggml refuses
-// to encode them without an importance matrix, so no synthetic weights
-// exist, and the local imatrix models hold iq2_xxs only as 3D expert
-// tensors, which this route never takes.
+// Pre-NAX silicon, bm8 tile. Measured 2026-08-21 on M3 Max at
+// [17408x5120], [5120x17408] and [10240x5120] (the Qwen3.8-27B
+// projections), synthetic wire, KQ_QMM_SPLITK=16 against the default
+// route, two process-paired runs per arm. Entry is the lowest M with
+// no regression on any shape; the tile below the entry:
+// - q4_k, q6_k, q2_k, iq2_xxs: 0.81-0.95x at M4, 0.69-0.81x at M5.
+//   Entry 4. q2_k entered at the M13 hole before the bm8 tile.
+// - q5_k, q8_0, iq4_nl, iq3_xxs, iq3_s: 0.93-1.00x at M4, 0.72-0.97x
+//   at M5 (q8_0 is a tie at M5, 0.97-1.00, and wins 0.74-0.81x at
+//   M6). Entry 5.
+// - q3_k: 1.03-1.08x at M5, ties at M6. Entry 6.
+// - iq4_xs: 1.29-1.32x at M6, 0.90-0.96x at M8. Entry 8 (was 10 on
+//   the bm16 tile).
+// - iq2_s: 1.37-1.43x at M6, 1.01-1.03x at M8; the bm16 tile wins
+//   from M10. Entry 8, unchanged.
+// - iq2_xs: 1.02-1.06x at M8, 0.79-1.05x at M12, 0.72-0.74x at M16.
+//   Entry 12.
+// - iq1_s and iq1_m: their tiles cost 3-4x iq2_xxs's per weight, so
+//   the mv paths win through M12 (0.68-1.87x); the default falls to
+//   plain qmm_t at M13 and the tile wins 0.72-0.84x at M16. Entry 13.
+// The bm16 tile that preceded bm8 entered q4_k/q3_k/q5_k/q6_k/iq3_s/
+// iq3_xxs/iq4_nl at 6, iq2_s and q8_0 at 8, iq4_xs at 10.
 static int kq_splitk_min_m(const std::string& t) {
   if (kq_is_nax_available()) {
     return kq_splitk_min_m_nax_alu(t);
   }
-  if (t == "q4_k" || t == "q3_k" || t == "q5_k" || t == "q6_k" ||
-      t == "iq3_s" || t == "iq3_xxs" || t == "iq4_nl") {
+  if (t == "q4_k" || t == "q6_k" || t == "q2_k" || t == "iq2_xxs") {
+    return 4;
+  }
+  if (t == "q5_k" || t == "q8_0" || t == "iq4_nl" || t == "iq3_xxs" ||
+      t == "iq3_s") {
+    return 5;
+  }
+  if (t == "q3_k") {
     return 6;
   }
-  if (t == "iq2_s") {
+  if (t == "iq4_xs" || t == "iq2_s") {
     return 8;
   }
-  if (t == "iq4_xs") {
-    return 10;
+  if (t == "iq2_xs") {
+    return 12;
   }
-  if (t == "q8_0") {
-    return 8;
-  }
-  if (t == "q2_k") {
+  if (t == "iq1_s" || t == "iq1_m") {
     return 13;
   }
   return 0;
@@ -552,10 +551,20 @@ void qmm_splitk(
     const std::string& kquant_type) {
   constexpr int wm = 2, wn = 2;
   // The bm16 tile halves the MMA row-padding waste at small M and
-  // widens BN to 64 so each K-step does more MMA work per barrier.
-  const bool bm16 = M <= 16 && kq_splitk_codec(kquant_type);
-  const int bm = bm16 ? 16 : 32;
-  const int bn = bm16 ? 64 : 32;
+  // widens BN to 64 so each K-step does more MMA work per barrier; the
+  // bm8 tile halves it again for M <= 8 (one simdgroup along M, four
+  // along N). On M3 Max the bm16 tile is bound per weight, not per
+  // byte (q8_0 ~240 GB/s and q6_k ~180 GB/s both ~220 G weights/s), and
+  // the BM32 tile costs 1.45x per weight for 2x the MMA, so MMA issue is
+  // ~45% of the tile. KQ_QMM_SPLITK_BM8=0 keeps M <= 8 on the bm16 tile.
+  static const bool bm8_enabled = []() {
+    const char* e = std::getenv("KQ_QMM_SPLITK_BM8");
+    return e == nullptr || std::atoi(e) != 0;
+  }();
+  const bool small = M <= 16 && kq_splitk_codec(kquant_type);
+  const bool bm8 = small && bm8_enabled && M <= 8;
+  const int bm = bm8 ? 8 : (small ? 16 : 32);
+  const int bn = small ? 64 : 32;
   const int k_partition = (K / group_size / splits) * group_size;
   const int part_stride = M * N;
 
@@ -572,7 +581,8 @@ void qmm_splitk(
   mx::concatenate(
       kname,
       kq_kname_prefix(kquant_type) +
-          (bm16 ? "qmm_t_splitk_bm16_" : "qmm_t_splitk_"),
+          (bm8 ? "qmm_t_splitk_bm8_"
+               : (small ? "qmm_t_splitk_bm16_" : "qmm_t_splitk_")),
       type_string,
       "_gs_",
       group_size,

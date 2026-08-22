@@ -20,7 +20,9 @@ template <
     const bool aligned_N,
     const int BM = 32,
     const int BK = 32,
-    const int BN = 32>
+    const int BN = 32,
+    const int WM = 2,
+    const int WN = 2>
 METAL_FUNC void kq_qmm_t_impl(
     const device uint8_t* w,
     const device T* x,
@@ -40,8 +42,7 @@ METAL_FUNC void kq_qmm_t_impl(
 
   (void)lid;
 
-  constexpr int WM = 2;
-  constexpr int WN = 2;
+  static_assert(WM * WN == 4, "the tile runs on four simdgroups");
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
   using mma_t = mlx::steel::BlockMMA<
@@ -1428,7 +1429,7 @@ template <
     int group_size,
     int bits,
     bool aligned_N,
-    bool bm16 = false>
+    int small_bm = 0>
 [[kernel]] void kq_q8_0_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -1446,8 +1447,9 @@ template <
   static_assert(
       group_size == KQ_Q8_0_GROUP, "Q8_0 kernel requires group_size=32");
   static_assert(bits == 8, "Q8_0 kernel requires bits=8");
-  constexpr int BM = bm16 ? 16 : 32;
-  constexpr int BK = 32, BN = bm16 ? 64 : 32;
+  constexpr int BM = small_bm ? small_bm : 32;
+  constexpr int BK = 32, BN = small_bm ? 64 : 32;
+  constexpr int WM = BM == 8 ? 1 : 2, WN = 4 / WM;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -1465,7 +1467,7 @@ template <
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       wl,
       x,
       y,

@@ -37,7 +37,8 @@
       bits,                                                               \
       aligned_N)
 
-// BM=16 split-K tile for M <= 16 (codecs with the bm16 template arm).
+// BM=16 and BM=8 split-K tiles for M <= 16 and M <= 8 (codecs with the
+// small_bm template arm).
 #define instantiate_kquant_qmm_t_splitk_bm16(type, gs, bits, aligned_N, codec) \
   instantiate_kernel(                                                          \
       "kquant_" #codec "_qmm_t_splitk_bm16_" #type "_gs_" #gs "_b_" #bits      \
@@ -47,7 +48,17 @@
       gs,                                                                      \
       bits,                                                                    \
       aligned_N,                                                               \
-      true)
+      16)
+#define instantiate_kquant_qmm_t_splitk_bm8(type, gs, bits, aligned_N, codec) \
+  instantiate_kernel(                                                         \
+      "kquant_" #codec "_qmm_t_splitk_bm8_" #type "_gs_" #gs "_b_" #bits      \
+          "_alN_" #aligned_N,                                                 \
+      kq_ ## codec ## _qmm_t_splitk,                                          \
+      type,                                                                   \
+      gs,                                                                     \
+      bits,                                                                   \
+      aligned_N,                                                              \
+      8)
 
 #define instantiate_kquant_qmm_n(type, gs, bits, batched, codec)        \
   instantiate_kernel(                                                   \
@@ -123,7 +134,9 @@
   instantiate_kquant_qmm_t_splitk(type, 32, 8, true, q8_0)              \
   instantiate_kquant_qmm_t_splitk(type, 32, 8, false, q8_0)             \
   instantiate_kquant_qmm_t_splitk_bm16(type, 32, 8, true, q8_0)           \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 32, 8, true, q8_0)            \
   instantiate_kquant_qmm_t_splitk_bm16(type, 32, 8, false, q8_0)         \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 32, 8, false, q8_0)          \
   instantiate_kquant_qmm_n(type, 32, 8, 0, q8_0)                        \
   instantiate_kquant_qmm_n(type, 32, 8, 1, q8_0)                        \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 32, 8, q8_0)     \
@@ -270,7 +283,9 @@ instantiate_kquant_q5_0_for_type(float16_t)
   instantiate_kquant_qmm_t_splitk(type, 256, 4, true, q4_k)              \
   instantiate_kquant_qmm_t_splitk(type, 256, 4, false, q4_k)             \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 4, true, q4_k)         \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 4, true, q4_k)          \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 4, false, q4_k)        \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 4, false, q4_k)         \
   instantiate_kquant_qmm_n(type, 256, 4, 0, q4_k)                        \
   instantiate_kquant_qmm_n(type, 256, 4, 1, q4_k)                        \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 4, q4_k)     \
@@ -301,7 +316,9 @@ instantiate_kquant_q4_k_for_type(float16_t)
   instantiate_kquant_qmm_t_splitk(type, 256, 5, true, q5_k)              \
   instantiate_kquant_qmm_t_splitk(type, 256, 5, false, q5_k)             \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 5, true, q5_k)          \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 5, true, q5_k)           \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 5, false, q5_k)        \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 5, false, q5_k)         \
   instantiate_kquant_qmm_n(type, 256, 5, 0, q5_k)                        \
   instantiate_kquant_qmm_n(type, 256, 5, 1, q5_k)                        \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 5, q5_k)     \
@@ -333,7 +350,9 @@ instantiate_kquant_q5_k_for_type(float16_t)
   instantiate_kquant_qmm_t_splitk(type, 256, 6, true, q6_k)              \
   instantiate_kquant_qmm_t_splitk(type, 256, 6, false, q6_k)             \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 6, true, q6_k)         \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 6, true, q6_k)          \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 6, false, q6_k)        \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 6, false, q6_k)         \
   instantiate_kquant_qmm_n(type, 256, 6, 0, q6_k)                        \
   instantiate_kquant_qmm_n(type, 256, 6, 1, q6_k)                        \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 6, q6_k)     \
@@ -511,7 +530,9 @@ instantiate_mv_ext_hd_all(q6_k, 256, 6)
   instantiate_kquant_qmm_t_splitk(type, 256, 3, true, q3_k)              \
   instantiate_kquant_qmm_t_splitk(type, 256, 3, false, q3_k)             \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 3, true, q3_k)         \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 3, true, q3_k)          \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 3, false, q3_k)        \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 3, false, q3_k)         \
   instantiate_kquant_qmm_n(type, 256, 3, 0, q3_k)                        \
   instantiate_kquant_qmm_n(type, 256, 3, 1, q3_k)                        \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 3, q3_k)     \
@@ -542,7 +563,9 @@ instantiate_kquant_q3_k_for_type(float16_t)
   instantiate_kquant_qmm_t_splitk(type, 256, 2, true, q2_k)              \
   instantiate_kquant_qmm_t_splitk(type, 256, 2, false, q2_k)             \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 2, true, q2_k)          \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 2, true, q2_k)           \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 2, false, q2_k)        \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 2, false, q2_k)         \
   instantiate_kquant_qmm_n(type, 256, 2, 0, q2_k)                        \
   instantiate_kquant_qmm_n(type, 256, 2, 1, q2_k)                        \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 2, q2_k)     \
@@ -574,7 +597,9 @@ instantiate_kquant_q2_k_for_type(float16_t)
   instantiate_kquant_qmm_t_splitk(type, 32, 4, true, iq4_nl)         \
   instantiate_kquant_qmm_t_splitk(type, 32, 4, false, iq4_nl)        \
   instantiate_kquant_qmm_t_splitk_bm16(type, 32, 4, true, iq4_nl)  \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 32, 4, true, iq4_nl)   \
   instantiate_kquant_qmm_t_splitk_bm16(type, 32, 4, false, iq4_nl) \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 32, 4, false, iq4_nl)  \
   instantiate_kquant_qmm_n(type, 32, 4, 0, iq4_nl)                   \
   instantiate_kquant_qmm_n(type, 32, 4, 1, iq4_nl)                   \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 32, 4, iq4_nl) \
@@ -660,7 +685,9 @@ instantiate_kquant_nvfp4_for_type(float16_t)
   instantiate_kquant_qmm_t_splitk(type, 256, 4, true, iq4_xs)        \
   instantiate_kquant_qmm_t_splitk(type, 256, 4, false, iq4_xs)       \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 4, true, iq4_xs)  \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 4, true, iq4_xs)   \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 4, false, iq4_xs) \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 4, false, iq4_xs)  \
   instantiate_kquant_qmm_n(type, 256, 4, 0, iq4_xs)                  \
   instantiate_kquant_qmm_n(type, 256, 4, 1, iq4_xs)                  \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 4, iq4_xs) \
@@ -690,7 +717,9 @@ instantiate_kquant_iq4_xs_for_type(float16_t)
   instantiate_kquant_qmm_t_splitk(type, 256, 3, true, iq3_xxs)       \
   instantiate_kquant_qmm_t_splitk(type, 256, 3, false, iq3_xxs)      \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 3, true, iq3_xxs)  \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 3, true, iq3_xxs)   \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 3, false, iq3_xxs) \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 3, false, iq3_xxs)  \
   instantiate_kquant_qmm_n(type, 256, 3, 0, iq3_xxs)                 \
   instantiate_kquant_qmm_n(type, 256, 3, 1, iq3_xxs)                 \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 3, iq3_xxs) \
@@ -720,7 +749,9 @@ instantiate_kquant_iq3_xxs_for_type(float16_t)
   instantiate_kquant_qmm_t_splitk(type, 256, 3, true, iq3_s)         \
   instantiate_kquant_qmm_t_splitk(type, 256, 3, false, iq3_s)        \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 3, true, iq3_s)  \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 3, true, iq3_s)   \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 3, false, iq3_s) \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 3, false, iq3_s)  \
   instantiate_kquant_qmm_n(type, 256, 3, 0, iq3_s)                   \
   instantiate_kquant_qmm_n(type, 256, 3, 1, iq3_s)                   \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 3, iq3_s) \
@@ -750,7 +781,9 @@ instantiate_kquant_iq3_s_for_type(float16_t)
   instantiate_kquant_qmm_t_splitk(type, 256, 2, true, iq2_xxs)       \
   instantiate_kquant_qmm_t_splitk(type, 256, 2, false, iq2_xxs)      \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 2, true, iq2_xxs)  \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 2, true, iq2_xxs)   \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 2, false, iq2_xxs) \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 2, false, iq2_xxs)  \
   instantiate_kquant_qmm_n(type, 256, 2, 0, iq2_xxs)                 \
   instantiate_kquant_qmm_n(type, 256, 2, 1, iq2_xxs)                 \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 2, iq2_xxs) \
@@ -780,7 +813,9 @@ instantiate_kquant_iq2_xxs_for_type(float16_t)
   instantiate_kquant_qmm_t_splitk(type, 256, 2, true, iq2_xs)        \
   instantiate_kquant_qmm_t_splitk(type, 256, 2, false, iq2_xs)       \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 2, true, iq2_xs)  \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 2, true, iq2_xs)   \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 2, false, iq2_xs) \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 2, false, iq2_xs)  \
   instantiate_kquant_qmm_n(type, 256, 2, 0, iq2_xs)                  \
   instantiate_kquant_qmm_n(type, 256, 2, 1, iq2_xs)                  \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 2, iq2_xs) \
@@ -810,7 +845,9 @@ instantiate_kquant_iq2_xs_for_type(float16_t)
   instantiate_kquant_qmm_t_splitk(type, 256, 2, true, iq2_s)         \
   instantiate_kquant_qmm_t_splitk(type, 256, 2, false, iq2_s)        \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 2, true, iq2_s)  \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 2, true, iq2_s)   \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 2, false, iq2_s) \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 2, false, iq2_s)  \
   instantiate_kquant_qmm_n(type, 256, 2, 0, iq2_s)                   \
   instantiate_kquant_qmm_n(type, 256, 2, 1, iq2_s)                   \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 2, iq2_s) \
@@ -840,7 +877,9 @@ instantiate_kquant_iq2_s_for_type(float16_t)
   instantiate_kquant_qmm_t_splitk(type, 256, 1, true, iq1_s)         \
   instantiate_kquant_qmm_t_splitk(type, 256, 1, false, iq1_s)        \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 1, true, iq1_s)  \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 1, true, iq1_s)   \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 1, false, iq1_s) \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 1, false, iq1_s)  \
   instantiate_kquant_qmm_n(type, 256, 1, 0, iq1_s)                   \
   instantiate_kquant_qmm_n(type, 256, 1, 1, iq1_s)                   \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 1, iq1_s) \
@@ -869,7 +908,9 @@ instantiate_kquant_iq1_s_for_type(float16_t)
   instantiate_kquant_qmm_t_splitk(type, 256, 1, true, iq1_m)         \
   instantiate_kquant_qmm_t_splitk(type, 256, 1, false, iq1_m)        \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 1, true, iq1_m)  \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 1, true, iq1_m)   \
   instantiate_kquant_qmm_t_splitk_bm16(type, 256, 1, false, iq1_m) \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 1, false, iq1_m)  \
   instantiate_kquant_qmm_n(type, 256, 1, 0, iq1_m)                   \
   instantiate_kquant_qmm_n(type, 256, 1, 1, iq1_m)                   \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 1, iq1_m) \

@@ -145,10 +145,11 @@ def test_smallm_routing_iq(codec, n_out):
 
 
 # Non-NAX split-K band, which the rest of this file cannot reach on NAX
-# silicon: M 2 sits below every codec entry, 8-32 spans the routed band up
-# to its M <= 32 ceiling, and 33 is the handoff back to plain qmm.
-# KQ_DISABLE_NAX is read live, so toggling it re-routes in-process.
-ALU_SPLITK_MS = [2, 8, 10, 12, 16, 17, 24, 32, 33]
+# silicon: M 2 sits below every codec entry, 6-8 cover the bm8 tile for
+# the codecs whose entry is at or under them, 10-16 the bm16 tile, 17-32
+# the BM32 tile up to its ceiling, and 33 is the handoff back to plain
+# qmm. KQ_DISABLE_NAX is read live, so toggling it re-routes in-process.
+ALU_SPLITK_MS = [2, 6, 7, 8, 10, 12, 16, 17, 24, 32, 33]
 
 
 @pytest.fixture
