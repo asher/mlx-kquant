@@ -7,11 +7,17 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Changed
-- q8_0 enters the non-NAX split-K route at 8 rows (was 13). Measured on
-  M3 Max with Qwen3.8-27B UD-Q6_K_XL (310 q8_0 tensors) and its q8_0 DFlash2
-  drafter, paired full-round A/B: an 8-row verify 141 -> 128 ms and the
-  8-row draft 16.1 -> 14.9 ms; 6 and 4 rows stay on the mv paths, which
-  still win there. 1-row decode is unchanged.
+- Quantized matmul at 4 to 8 rows is faster on machines with no NAX tile:
+  an 8-row split-K tile (one simdgroup along M, four along N) replaces the
+  16-row tile there, so a speculative verify of 8 rows pays for 8 rows of
+  MMA instead of 16. Measured on M3 Max at the Qwen3.8-27B projection
+  shapes, 8 rows: q4_k 0.73x, q6_k 0.75-0.80x, q8_0 0.82-0.85x of the
+  16-row tile. `KQ_QMM_SPLITK_BM8=0` keeps the 16-row tile.
+- Every split-K codec enters the non-NAX route at a re-measured row count
+  (q4_k, q6_k, q2_k, iq2_xxs at 4; q5_k, q8_0, iq4_nl, iq3_xxs, iq3_s at 5;
+  q3_k 6; iq4_xs, iq2_s 8; iq2_xs 12; iq1_s, iq1_m 13). iq2_xxs, iq2_xs,
+  iq1_s and iq1_m were on the environment lever only. 1-row decode is
+  unchanged.
 
 ### Fixed
 - sdpa_vector's float16 pass-1 partials could overflow to inf under long
