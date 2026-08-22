@@ -6,6 +6,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- q8_0 enters the non-NAX split-K route at 8 rows (was 13). Measured on
+  M3 Max with Qwen3.8-27B UD-Q6_K_XL (310 q8_0 tensors) and its q8_0 DFlash2
+  drafter, paired full-round A/B: an 8-row verify 141 -> 128 ms and the
+  8-row draft 16.1 -> 14.9 ms; 6 and 4 rows stay on the mv paths, which
+  still win there. 1-row decode is unchanged.
+
 ### Fixed
 - sdpa_vector's float16 pass-1 partials could overflow to inf under long
   flat attention with large V outliers; they now store as float32
