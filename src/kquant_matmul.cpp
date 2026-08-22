@@ -244,8 +244,11 @@ static int kq_splitk_min_m_nax_alu(const std::string& t) {
 //   (1.02x), 1.82x at M16. Entry 10.
 // - iq2_s at [4096x12288] from real weights: bm16 flat ~1.5, the
 //   default crosses at M8 (1.07x) and loses 1.61x at M16. Entry 8.
-// q2_k and q8_0 are not measured. They enter at the M13 cliff (q8_0's
-// mv paths are the strongest in the fleet; measure before lowering).
+// - q8_0, Qwen3.8-27B UD-Q6_K_XL (310 q8_0 tensors incl. the vocab head)
+//   with its DFlash2 q8_0 drafter, paired full-round A/B: split-K at M8
+//   verify 141->128 ms (-9%), draft 16.1->14.9; mv_ext still wins at M6
+//   (117 vs 125) and M4 (92 vs 123). Entry 8. M7 not measured.
+// q2_k is not measured. It enters at the M13 cliff.
 // iq2_xxs, iq2_xs, iq1_s and iq1_m stay on the env lever: ggml refuses
 // to encode them without an importance matrix, so no synthetic weights
 // exist, and the local imatrix models hold iq2_xxs only as 3D expert
@@ -264,7 +267,10 @@ static int kq_splitk_min_m(const std::string& t) {
   if (t == "iq4_xs") {
     return 10;
   }
-  if (t == "q2_k" || t == "q8_0") {
+  if (t == "q8_0") {
+    return 8;
+  }
+  if (t == "q2_k") {
     return 13;
   }
   return 0;
