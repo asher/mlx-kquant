@@ -6,7 +6,17 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0]
+
 ### Changed
+- Requires mlx 0.32.1 (was 0.31.2). This is the breaking change behind
+  the major-minor bump: environments pinned to mlx 0.31.x must stay on
+  mlx-kquant 0.3.x.
+- The arena keeps a standalone Metal residency set. mlx 0.32 made its
+  queue-attached residency set private and budgeted by set_wired_limit;
+  the arena's GPU mappings now stay resident without consuming that
+  budget, so streaming-mode servers can run with the wired limit at zero.
+- Builds against nanobind 2.13.0 (was 2.12.0).
 - Quantized matmul at 4 to 8 rows is faster on machines with no NAX tile:
   an 8-row split-K tile (one simdgroup along M, four along N) replaces the
   16-row tile there, so a speculative verify of 8 rows pays for 8 rows of
