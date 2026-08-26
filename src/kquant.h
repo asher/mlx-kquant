@@ -663,6 +663,35 @@ mx::array hc_expand(
     mx::array comb,
     mx::StreamOrDevice s = {});
 
+// Grouped rms norm for the qwen4exp low-rank hyper-connection: one
+// statistic per stream of h [..., 4, D], gamma [4 * D] float16/bfloat16
+// gain, output in the h dtype (float32 residual, or the gamma dtype at
+// half). D % 64 == 0.
+mx::array hc_lowrank_norm(
+    mx::array h,
+    mx::array gamma,
+    float eps,
+    mx::StreamOrDevice s = {});
+
+// Fused low-rank hyper-connection front: the q8_0 down qmv over xn (the
+// hc_lowrank_norm output) with silu(x / 4), plus the float32 inject dots
+// 2 * sigmoid(x / 4). lowrank (w_down rows) % 32 == 0, at most 512.
+// Returns {lo [..., LR] lo_dtype, inj f32 [..., 4]}.
+std::vector<mx::array> hc_lowrank_front(
+    mx::array xn,
+    mx::array w_down,
+    mx::array w_inject,
+    mx::Dtype lo_dtype,
+    mx::StreamOrDevice s = {});
+
+// Epilogue: the q8_0 up qmv of lo, sigmoid gate against xn and the mean
+// over the 4 streams. Returns mixed [..., D] in the xn dtype.
+mx::array hc_lowrank_epilogue(
+    mx::array lo,
+    mx::array w_up,
+    mx::array xn,
+    mx::StreamOrDevice s = {});
+
 // y = x @ w.T for token widths 1..16 against a small-N, large-K weight in
 // nn.Linear layout ([N, K]). x is [..., M, K] with 1 <= M <= 16 and
 // K % 4 == 0; x float16/bfloat16/float32, w matching x or float32; output
@@ -1686,6 +1715,67 @@ class KQuantHcExpand : public mx::Primitive {
 
   const char* name() const override {
     return "KQuantHcExpand";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return true;
+  }
+};
+
+// Fused low-rank hyper-connection primitives (see hc_lowrank_front).
+// Inference-only, GPU-only.
+class KQuantHcLowrankNorm : public mx::Primitive {
+ public:
+  explicit KQuantHcLowrankNorm(mx::Stream stream, float eps)
+      : mx::Primitive(stream), eps_(eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcLowrankNorm";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float eps_;
+};
+
+class KQuantHcLowrankFront : public mx::Primitive {
+ public:
+  explicit KQuantHcLowrankFront(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcLowrankFront";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return true;
+  }
+};
+
+class KQuantHcLowrankEpilogue : public mx::Primitive {
+ public:
+  explicit KQuantHcLowrankEpilogue(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcLowrankEpilogue";
   }
   bool is_equivalent(const mx::Primitive& other) const override {
     return true;

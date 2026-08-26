@@ -1267,6 +1267,80 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "hc_lowrank_norm",
+      &mlx_kquant::hc_lowrank_norm,
+      "h"_a,
+      "gamma"_a,
+      "eps"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Grouped rms norm for the low-rank hyper-connection (qwen4exp):
+        one statistic per stream, gamma gain over all streams. One
+        dispatch, materializing xn once for the front and epilogue.
+
+        Args:
+            h (array): [..., 4, D] residual streams, float32 or the gamma
+                dtype. D % 64 == 0, D <= 8192.
+            gamma (array): [4 * D] norm gain, float16/bfloat16.
+            eps (float): rms epsilon.
+
+        Returns:
+            array: xn [..., 4, D] in the h dtype.
+      )");
+
+  m.def(
+      "hc_lowrank_front",
+      &mlx_kquant::hc_lowrank_front,
+      "xn"_a,
+      "w_down"_a,
+      "w_inject"_a,
+      "lo_dtype"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused low-rank hyper-connection front (qwen4exp): the q8_0 down
+        qmv over xn with silu(x / 4), plus the float32 inject dots
+        2 * sigmoid(x / 4). One dispatch.
+
+        Args:
+            xn (array): [..., 4, D] normed streams (hc_lowrank_norm
+                output), float32 or lo_dtype. D % 64 == 0, D <= 8192.
+            w_down (array): [LR, 4 * D / 32 * 34] uint8 q8_0 wire.
+                LR % 32 == 0, LR <= 512.
+            w_inject (array): [4, 4 * D] float32.
+            lo_dtype (Dtype): float16 or bfloat16; the down qmv output
+                rounds here before silu (the kq qmv promotion).
+
+        Returns:
+            tuple: (lo [..., LR] lo_dtype, inj f32 [..., 4]).
+      )");
+
+  m.def(
+      "hc_lowrank_epilogue",
+      &mlx_kquant::hc_lowrank_epilogue,
+      "lo"_a,
+      "w_up"_a,
+      "xn"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused low-rank hyper-connection epilogue (qwen4exp): the q8_0 up
+        qmv of lo, sigmoid gate against xn, mean over the 4 streams. One
+        dispatch.
+
+        Args:
+            lo (array): [..., LR] float16/bfloat16 (hc_lowrank_front
+                output).
+            w_up (array): [4 * D, LR / 32 * 34] uint8 q8_0 wire.
+            xn (array): [..., 4, D] normed streams (hc_lowrank_norm
+                output).
+
+        Returns:
+            array: mixed [..., D] in the xn dtype.
+      )");
+
+  m.def(
       "get_cb_caps",
       &mlx_kquant::get_cb_caps,
       R"(

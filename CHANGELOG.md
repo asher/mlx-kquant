@@ -6,6 +6,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- hc_lowrank_norm / hc_lowrank_front / hc_lowrank_epilogue: fused
+  low-rank hyper-connection ops for qwen4exp decode. Grouped rms norm in
+  one dispatch; q8_0 down qmv, silu and the float32 inject dots in a
+  second; up qmv, sigmoid gate and the stream mean in a third.
+
 ## [0.4.0]
 
 ### Changed
