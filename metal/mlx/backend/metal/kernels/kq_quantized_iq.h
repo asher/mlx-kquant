@@ -1633,6 +1633,11 @@ struct KqIq3_xxsBlockLoader {
         sub_block_idx(0) {}
 
   void load_unsafe() const {
+    // Two u32 grid loads + vector uchar4 -> float4 conversions + selects per
+    // 8-weight group replace the per-byte load/convert/select chain. The
+    // products are exact sign flips, so outputs stay bit-identical to the
+    // scalar form.
+    static_assert(n_reads % 8 == 0, "vector loader needs whole 8-groups");
     const short sb = (reduction_dim == 0) ? fixed_sub_block_idx : sub_block_idx;
     const float d = float(*(const device half*)src);
     const device uint8_t* qs = src + KQ_IQ3_XXS_QS_OFFSET + sb * 8;
@@ -1640,17 +1645,22 @@ struct KqIq3_xxsBlockLoader {
     const uint aux32 = uint(gas[0]) | (uint(gas[1]) << 8) |
         (uint(gas[2]) << 16) | (uint(gas[3]) << 24);
     const float db = d * (0.5f + float(aux32 >> 28)) * 0.5f;
+    const short lbase = bj / 8;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int p = bj + i;
-      const int l = p / 8;
-      const int jpos = p % 8;
-      const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
-      const uint g = iq3xxs_grid[jpos < 4 ? qs[2 * l] : qs[2 * l + 1]];
-      const int jj = jpos < 4 ? jpos : jpos - 4;
-      const float gb = float((g >> (8 * jj)) & 0xff);
-      const float sgn = (signs & kmask_iq2xs[jpos]) ? -1.f : 1.f;
-      dst[i] = T(db * gb * sgn);
+    for (short t = 0; t < n_reads / 8; ++t) {
+      const short l = lbase + t;
+      const uint8_t sbyte = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+      const float4 v0 = float4(as_type<uchar4>(iq3xxs_grid[qs[2 * l]]));
+      const float4 v1 = float4(as_type<uchar4>(iq3xxs_grid[qs[2 * l + 1]]));
+      const float4 r0 =
+          select(v0, -v0, bool4(sbyte & 1, sbyte & 2, sbyte & 4, sbyte & 8)) *
+          db;
+      const float4 r1 =
+          select(
+              v1, -v1, bool4(sbyte & 16, sbyte & 32, sbyte & 64, sbyte & 128)) *
+          db;
+      *(threadgroup vec<T, 4>*)(dst + 8 * t) = vec<T, 4>(r0);
+      *(threadgroup vec<T, 4>*)(dst + 8 * t + 4) = vec<T, 4>(r1);
     }
   }
 
@@ -2092,6 +2102,11 @@ struct KqIq3_sBlockLoader {
         sub_block_idx(0) {}
 
   void load_unsafe() const {
+    // Two u32 grid loads + vector uchar4 -> float4 conversions + selects per
+    // 8-weight group replace the per-byte load/convert/select chain. The
+    // products are exact sign flips, so outputs stay bit-identical to the
+    // scalar form.
+    static_assert(n_reads % 8 == 0, "vector loader needs whole 8-groups");
     const short sb = (reduction_dim == 0) ? fixed_sub_block_idx : sub_block_idx;
     const float d = float(*(const device half*)src);
     const device uint8_t* scales = src + KQ_IQ3_S_SCALES_OFFSET;
@@ -2100,20 +2115,24 @@ struct KqIq3_sBlockLoader {
     const uint qh = src[KQ_IQ3_S_QH_OFFSET + sb];
     const device uint8_t* qs = src + KQ_IQ3_S_QS_OFFSET + sb * 8;
     const device uint8_t* sg = src + KQ_IQ3_S_SIGNS_OFFSET + sb * 4;
+    const short lbase = bj / 8;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int p = bj + i;
-      const int l = p / 8;
-      const int jpos = p % 8;
-      const uint8_t signs = sg[l];
-      const uint idx = (jpos < 4)
-          ? (qs[2 * l] | ((qh << (8 - 2 * l)) & 256))
-          : (qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256));
-      const uint g = iq3s_grid[idx];
-      const int jj = jpos < 4 ? jpos : jpos - 4;
-      const float gb = float((g >> (8 * jj)) & 0xff);
-      const float sgn = (signs & kmask_iq2xs[jpos]) ? -1.f : 1.f;
-      dst[i] = T(db * gb * sgn);
+    for (short t = 0; t < n_reads / 8; ++t) {
+      const short l = lbase + t;
+      const uint8_t sbyte = sg[l];
+      const uint idx0 = qs[2 * l] | ((qh << (8 - 2 * l)) & 256);
+      const uint idx1 = qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256);
+      const float4 v0 = float4(as_type<uchar4>(iq3s_grid[idx0]));
+      const float4 v1 = float4(as_type<uchar4>(iq3s_grid[idx1]));
+      const float4 r0 =
+          select(v0, -v0, bool4(sbyte & 1, sbyte & 2, sbyte & 4, sbyte & 8)) *
+          db;
+      const float4 r1 =
+          select(
+              v1, -v1, bool4(sbyte & 16, sbyte & 32, sbyte & 64, sbyte & 128)) *
+          db;
+      *(threadgroup vec<T, 4>*)(dst + 8 * t) = vec<T, 4>(r0);
+      *(threadgroup vec<T, 4>*)(dst + 8 * t + 4) = vec<T, 4>(r1);
     }
   }
 
@@ -2557,22 +2576,34 @@ struct KqIq2_xxsBlockLoader {
         sub_block_idx(0) {}
 
   void load_unsafe() const {
+    // One u64 grid load + vector uchar4 -> float4 conversions + selects per
+    // 8-weight group replace the per-byte load/convert/select chain. The
+    // products are exact sign flips, so outputs stay bit-identical to the
+    // scalar form.
+    static_assert(n_reads % 8 == 0, "vector loader needs whole 8-groups");
     const short sb = (reduction_dim == 0) ? fixed_sub_block_idx : sub_block_idx;
     const float d = float(*(const device half*)src);
     const device uint8_t* qs = src + KQ_IQ2_XXS_QS_OFFSET + sb * 8;
     const uint signbits = uint(qs[4]) | (uint(qs[5]) << 8) |
         (uint(qs[6]) << 16) | (uint(qs[7]) << 24);
     const float db = d * (0.5f + float(signbits >> 28)) * 0.25f;
+    const short lbase = bj / 8;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int p = bj + i;
-      const int l = p / 8;
-      const int j = p % 8;
-      const uint8_t signs = ksigns_iq2xs[(signbits >> (7 * l)) & 127];
+    for (short t = 0; t < n_reads / 8; ++t) {
+      const short l = lbase + t;
+      const uint8_t sbyte = ksigns_iq2xs[(signbits >> (7 * l)) & 127];
       const uint64_t g = iq2xxs_grid[qs[l]];
-      const float gb = float((g >> (8 * j)) & 0xff);
-      const float sgn = (signs & kmask_iq2xs[j]) ? -1.f : 1.f;
-      dst[i] = T(db * gb * sgn);
+      const float4 v0 = float4(as_type<uchar4>(uint32_t(g)));
+      const float4 v1 = float4(as_type<uchar4>(uint32_t(g >> 32)));
+      const float4 r0 =
+          select(v0, -v0, bool4(sbyte & 1, sbyte & 2, sbyte & 4, sbyte & 8)) *
+          db;
+      const float4 r1 =
+          select(
+              v1, -v1, bool4(sbyte & 16, sbyte & 32, sbyte & 64, sbyte & 128)) *
+          db;
+      *(threadgroup vec<T, 4>*)(dst + 8 * t) = vec<T, 4>(r0);
+      *(threadgroup vec<T, 4>*)(dst + 8 * t + 4) = vec<T, 4>(r1);
     }
   }
 
@@ -3017,24 +3048,36 @@ struct KqIq2_xsBlockLoader {
         sub_block_idx(0) {}
 
   void load_unsafe() const {
+    // One u64 grid load + vector uchar4 -> float4 conversions + selects per
+    // 8-weight group replace the per-byte load/convert/select chain. The
+    // products are exact sign flips, so outputs stay bit-identical to the
+    // scalar form.
+    static_assert(n_reads % 8 == 0, "vector loader needs whole 8-groups");
     const short sb = (reduction_dim == 0) ? fixed_sub_block_idx : sub_block_idx;
     const float d = float(*(const device half*)src);
     const device uint8_t* qs = src + KQ_IQ2_XS_QS_OFFSET + sb * 8;
     const uint8_t sc = src[KQ_IQ2_XS_SCALES_OFFSET + sb];
+    const short lbase = bj / 8;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int p = bj + i;
-      const int l = p / 8;
-      const int j = p % 8;
+    for (short t = 0; t < n_reads / 8; ++t) {
+      const short l = lbase + t;
       const int sc_nib = (l < 2) ? (sc & 0xf) : (sc >> 4);
       const float db = d * (0.5f + float(sc_nib)) * 0.25f;
       const device uint8_t* qp = qs + l * 2;
       const uint q = uint(qp[0]) | (uint(qp[1]) << 8);
-      const uint8_t signs = ksigns_iq2xs[q >> 9];
+      const uint8_t sbyte = ksigns_iq2xs[q >> 9];
       const uint64_t g = iq2xs_grid[q & 511];
-      const float gb = float((g >> (8 * j)) & 0xff);
-      const float sgn = (signs & kmask_iq2xs[j]) ? -1.f : 1.f;
-      dst[i] = T(db * gb * sgn);
+      const float4 v0 = float4(as_type<uchar4>(uint32_t(g)));
+      const float4 v1 = float4(as_type<uchar4>(uint32_t(g >> 32)));
+      const float4 r0 =
+          select(v0, -v0, bool4(sbyte & 1, sbyte & 2, sbyte & 4, sbyte & 8)) *
+          db;
+      const float4 r1 =
+          select(
+              v1, -v1, bool4(sbyte & 16, sbyte & 32, sbyte & 64, sbyte & 128)) *
+          db;
+      *(threadgroup vec<T, 4>*)(dst + 8 * t) = vec<T, 4>(r0);
+      *(threadgroup vec<T, 4>*)(dst + 8 * t + 4) = vec<T, 4>(r1);
     }
   }
 
@@ -3480,25 +3523,37 @@ struct KqIq2_sBlockLoader {
         sub_block_idx(0) {}
 
   void load_unsafe() const {
+    // One u64 grid load + vector uchar4 -> float4 conversions + selects per
+    // 8-weight group replace the per-byte load/convert/select chain. The
+    // products are exact sign flips, so outputs stay bit-identical to the
+    // scalar form.
+    static_assert(n_reads % 8 == 0, "vector loader needs whole 8-groups");
     const short sb = (reduction_dim == 0) ? fixed_sub_block_idx : sub_block_idx;
     const float d = float(*(const device half*)src);
     const device uint8_t* qs = src + KQ_IQ2_S_QS_OFFSET + sb * 4;
     const device uint8_t* sg = src + KQ_IQ2_S_SIGNS_OFFSET + sb * 4;
     const uint qh = src[KQ_IQ2_S_QH_OFFSET + sb];
     const uint8_t sc = src[KQ_IQ2_S_SCALES_OFFSET + sb];
+    const short lbase = bj / 8;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int p = bj + i;
-      const int l = p / 8;
-      const int j = p % 8;
+    for (short t = 0; t < n_reads / 8; ++t) {
+      const short l = lbase + t;
       const int sc_nib = (l < 2) ? (sc & 0xf) : (sc >> 4);
       const float db = d * (0.5f + float(sc_nib)) * 0.25f;
       const uint idx = qs[l] | ((qh << (8 - 2 * l)) & 0x300);
-      const uint8_t signs = sg[l];
       const uint64_t g = iq2s_grid[idx];
-      const float gb = float((g >> (8 * j)) & 0xff);
-      const float sgn = (signs & kmask_iq2xs[j]) ? -1.f : 1.f;
-      dst[i] = T(db * gb * sgn);
+      const uint8_t sbyte = sg[l];
+      const float4 v0 = float4(as_type<uchar4>(uint32_t(g)));
+      const float4 v1 = float4(as_type<uchar4>(uint32_t(g >> 32)));
+      const float4 r0 =
+          select(v0, -v0, bool4(sbyte & 1, sbyte & 2, sbyte & 4, sbyte & 8)) *
+          db;
+      const float4 r1 =
+          select(
+              v1, -v1, bool4(sbyte & 16, sbyte & 32, sbyte & 64, sbyte & 128)) *
+          db;
+      *(threadgroup vec<T, 4>*)(dst + 8 * t) = vec<T, 4>(r0);
+      *(threadgroup vec<T, 4>*)(dst + 8 * t + 4) = vec<T, 4>(r1);
     }
   }
 
@@ -3941,6 +3996,11 @@ struct KqIq1_sBlockLoader {
         sub_block_idx(0) {}
 
   void load_unsafe() const {
+    // One u64 grid load + vector char4 -> float4 conversions per 8-weight
+    // group replace the per-byte load/convert chain. The grid is SIGNED and
+    // the sums/products match the scalar order exactly, so outputs stay
+    // bit-identical to the scalar form.
+    static_assert(n_reads % 8 == 0, "vector loader needs whole 8-groups");
     const short sb = (reduction_dim == 0) ? fixed_sub_block_idx : sub_block_idx;
     const float d = float(*(const device half*)src);
     const device uint8_t* qhp = src + KQ_IQ1_S_QH_OFFSET + sb * 2;
@@ -3948,15 +4008,16 @@ struct KqIq1_sBlockLoader {
     const device uint8_t* qs = src + KQ_IQ1_S_QS_OFFSET + sb * 4;
     const float dl = d * float(2 * int((qh >> 12) & 7) + 1);
     const float delta = (qh & 0x8000) ? -0.125f : 0.125f;
+    const short lbase = bj / 8;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int p = bj + i;
-      const int l = p / 8;
-      const int j = p % 8;
+    for (short t = 0; t < n_reads / 8; ++t) {
+      const short l = lbase + t;
       const uint idx = uint(qs[l]) | (((qh >> (3 * l)) & 7) << 8);
-      const int8_t gv =
-          as_type<int8_t>(uint8_t((iq1s_grid[idx] >> (8 * j)) & 0xff));
-      dst[i] = T(dl * (float(gv) + delta));
+      const uint64_t g = iq1s_grid[idx];
+      const float4 v0 = float4(as_type<char4>(uint32_t(g))) + delta;
+      const float4 v1 = float4(as_type<char4>(uint32_t(g >> 32))) + delta;
+      *(threadgroup vec<T, 4>*)(dst + 8 * t) = vec<T, 4>(v0 * dl);
+      *(threadgroup vec<T, 4>*)(dst + 8 * t + 4) = vec<T, 4>(v1 * dl);
     }
   }
 
@@ -4423,20 +4484,26 @@ struct KqIq1_mBlockLoader {
     const uint sc_word = uint(swp[0]) | (uint(swp[1]) << 8);
     const device uint8_t* qhp = src + KQ_IQ1_M_QH_OFFSET + sb * 2;
     const device uint8_t* qs = src + KQ_IQ1_M_QS_OFFSET + sb * 4;
+    // One u64 grid load + vector char4 -> float4 conversions per 8-weight
+    // group replace the per-byte load/convert chain. The grid is SIGNED and
+    // the sums/products match the scalar order exactly, so outputs stay
+    // bit-identical to the scalar form.
+    static_assert(n_reads % 8 == 0, "vector loader needs whole 8-groups");
+    const short lbase = bj / 8;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int p = bj + i;
-      const int l = p / 8;
-      const int j = p % 8;
+    for (short t = 0; t < n_reads / 8; ++t) {
+      const short l = lbase + t;
       const int shift = 6 * (sb & 1) + ((l < 2) ? 0 : 3);
       const float dl = d * float(2 * int((sc_word >> shift) & 7) + 1);
       const uint8_t qh = qhp[l / 2];
       const int hshift = (l & 1) ? 4 : 8;
       const uint idx = uint(qs[l]) | ((uint(qh) << hshift) & 0x700);
       const float delta = (qh & ((l & 1) ? 0x80 : 0x08)) ? -0.125f : 0.125f;
-      const int8_t gv =
-          as_type<int8_t>(uint8_t((iq1s_grid[idx] >> (8 * j)) & 0xff));
-      dst[i] = T(dl * (float(gv) + delta));
+      const uint64_t g = iq1s_grid[idx];
+      const float4 v0 = float4(as_type<char4>(uint32_t(g))) + delta;
+      const float4 v1 = float4(as_type<char4>(uint32_t(g >> 32))) + delta;
+      *(threadgroup vec<T, 4>*)(dst + 8 * t) = vec<T, 4>(v0 * dl);
+      *(threadgroup vec<T, 4>*)(dst + 8 * t + 4) = vec<T, 4>(v1 * dl);
     }
   }
 
