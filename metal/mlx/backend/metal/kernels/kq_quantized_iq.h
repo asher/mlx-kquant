@@ -67,11 +67,20 @@ inline void kq_iq4_xs_deq_chunk16(
   const int ls = ((scales_l[ib / 2] >> (4 * (ib & 1))) & 0xf) |
       (((scales_h >> (2 * ib)) & 3) << 4);
   const float dl = d * float(ls - 32);
-  const device uint8_t* qs = block + KQ_IQ4_XS_QS_OFFSET + ib * 16;
+  // qs is 8-aligned (block 136 bytes, quants at +8, ib*16): two uint2 loads
+  // + kq_iq4nl_pairs replace sixteen byte loads and kvalues gathers,
+  // bit-identically.
+  const device uint2* qw =
+      reinterpret_cast<const device uint2*>(block + KQ_IQ4_XS_QS_OFFSET) +
+      ib * 2;
 #pragma unroll
-  for (int i = 0; i < 16; ++i) {
-    const int nib = (int(qs[i]) >> shift) & 0xf;
-    reg[i / 4][i % 4] = dl * float(kvalues_iq4nl[nib]);
+  for (int u = 0; u < 4; ++u) {
+    const uint n32 = (qw[u / 2][u & 1] >> shift) & 0x0f0f0f0fu;
+    const float2 kv01 =
+        as_type<float2>(kq_iq4nl_pairs[(n32 & 0xf) | ((n32 >> 4) & 0xf0)]);
+    const float2 kv23 = as_type<float2>(
+        kq_iq4nl_pairs[((n32 >> 16) & 0xf) | ((n32 >> 20) & 0xf0)]);
+    reg[u] = float4(kv01.x, kv01.y, kv23.x, kv23.y) * dl;
   }
 }
 
@@ -1094,9 +1103,10 @@ METAL_FUNC void kq_iq4_xs_qmv_impl(
       U partial = 0;
 #pragma unroll
       for (int i = 0; i < bytes_per_lane; i++) {
-        const uint b = (qb >> (8 * i)) & 0xFF;
-        partial += xlo[i] * U(kvalues_iq4nl[b & 0x0F]);
-        partial += xhi[i] * U(kvalues_iq4nl[b >> 4]);
+        const float2 kv =
+            as_type<float2>(kq_iq4nl_pairs[(qb >> (8 * i)) & 0xFF]);
+        partial += xlo[i] * U(kv.x);
+        partial += xhi[i] * U(kv.y);
       }
       result[row] += dl * partial;
     }
@@ -1178,6 +1188,11 @@ struct KqIq4_xsBlockLoader {
         sub_block_idx(0) {}
 
   void load_unsafe() const {
+    // Each 8-group covers one nibble half of eight consecutive quant bytes:
+    // one uint2 load + adjacent-nibble bytes into kq_iq4nl_pairs replace
+    // eight byte loads and eight kvalues gathers. The pair entries are the
+    // exact float codebook values, so outputs stay bit-identical.
+    static_assert(n_reads % 8 == 0, "vector loader needs whole 8-groups");
     const short sb = (reduction_dim == 0) ? fixed_sub_block_idx : sub_block_idx;
     const float d = float(*(const device half*)src);
     const uint16_t scales_h = uint16_t(src[2]) | (uint16_t(src[3]) << 8);
@@ -1187,12 +1202,24 @@ struct KqIq4_xsBlockLoader {
     const float dl = d * float(ls - 32);
     const device uint8_t* qs = src + KQ_IQ4_XS_QS_OFFSET + sb * 16;
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int p = bj + i;
-      const bool is_high = p >= 16;
-      const int b = is_high ? (p - 16) : p;
-      const int nib = is_high ? (qs[b] >> 4) : (qs[b] & 0xf);
-      dst[i] = T(dl * float(kvalues_iq4nl[nib]));
+    for (short t = 0; t < n_reads / 8; ++t) {
+      const short p0 = bj + 8 * t;
+      const bool is_high = p0 >= 16;
+      // qs is 8-aligned (block 136 bytes, quants at +8) and p0 is a
+      // multiple of 8, so the uint2 load is safe.
+      const uint2 qw =
+          *reinterpret_cast<const device uint2*>(qs + (is_high ? p0 - 16 : p0));
+#pragma unroll
+      for (short u = 0; u < 2; ++u) {
+        const uint n32 =
+            is_high ? ((qw[u] >> 4) & 0x0f0f0f0fu) : (qw[u] & 0x0f0f0f0fu);
+        const float2 kv01 =
+            as_type<float2>(kq_iq4nl_pairs[(n32 & 0xf) | ((n32 >> 4) & 0xf0)]);
+        const float2 kv23 = as_type<float2>(
+            kq_iq4nl_pairs[((n32 >> 16) & 0xf) | ((n32 >> 20) & 0xf0)]);
+        const float4 r = float4(kv01.x, kv01.y, kv23.x, kv23.y) * dl;
+        *(threadgroup vec<T, 4>*)(dst + 8 * t + 4 * u) = vec<T, 4>(r);
+      }
     }
   }
 
@@ -2009,8 +2036,11 @@ METAL_FUNC void kq_iq3_s_qmv_impl(
       const uint qpair = uint(*reinterpret_cast<const device ushort*>(
           sb + KQ_IQ3_S_QS_OFFSET + s * 8 + 2 * l));
       const uint8_t signs = sb[KQ_IQ3_S_SIGNS_OFFSET + s * 4 + l];
-      const uint i1 = (qpair & 0xff) | ((qh << (8 - 2 * l)) & 256);
-      const uint i2 = (qpair >> 8) | ((qh << (7 - 2 * l)) & 256);
+      // One shifted qh covers both grid indices: bit 8 of qt is qh bit 2l
+      // (first index), bit 9 is qh bit 2l+1 (second index).
+      const uint qt = qh << (8 - 2 * l);
+      const uint i1 = (qpair & 0xff) | (qt & 256);
+      const uint i2 = (qpair >> 8) | ((qt >> 1) & 256);
       // Reinterpret each grid word as a uchar4; folding the sign into the
       // integer-valued magnitude is exact, so the single rounding per fma
       // is unchanged.
@@ -4353,6 +4383,8 @@ METAL_FUNC void kq_iq1_m_qmv_impl(
   const int shift0 = (l < 2) ? 0 : 3;
   const int hshift = (l & 1) ? 4 : 8;
   const uint8_t sign_mask = (l & 1) ? 0x80 : 0x08;
+  const int sc_half = s / 2;
+  const int sc_shift = 6 * (s & 1) + shift0;
   U result[results_per_simdgroup] = {0};
   for (int ib = 0; ib < nb; ib++) {
     U xt[vpt];
@@ -4372,9 +4404,8 @@ METAL_FUNC void kq_iq1_m_qmv_impl(
       const ushort scale_u16 = (scv.x >> 12) | ((scv.y >> 8) & 0x00f0) |
           ((scv.z >> 4) & 0x0f00) | (scv.w & 0xf000);
       const U d = U(float(as_type<half>(scale_u16)));
-      const uint sc_word = scv[s / 2];
-      const int shift = 6 * (s & 1) + shift0;
-      const U dl = d * U(2 * int((sc_word >> shift) & 7) + 1);
+      const uint sc_word = scv[sc_half];
+      const U dl = d * U(2 * int((sc_word >> sc_shift) & 7) + 1);
       const uint8_t qh = sb[KQ_IQ1_M_QH_OFFSET + s * 2 + l / 2];
       const uint idx = uint(sb[KQ_IQ1_M_QS_OFFSET + s * 4 + l]) |
           ((uint(qh) << hshift) & 0x700);
