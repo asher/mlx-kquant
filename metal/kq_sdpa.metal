@@ -84,6 +84,16 @@ instantiate_kq_sdpa_gqa_ne(float16_t, 512, 8, 2)
       2)
 
 instantiate_kq_sdpa_gqa_p2(bfloat16_t, 512, 8, 2)
+
+#define instantiate_kq_sdpa_bs(type, D)                               \
+  instantiate_kernel(                                                 \
+      "kq_sdpa_bs_prefill_" #type "_" #D,                             \
+      kq_sdpa_bs_prefill,                                             \
+      type,                                                           \
+      D)
+
+instantiate_kq_sdpa_bs(bfloat16_t, 256)
+instantiate_kq_sdpa_bs(float16_t, 256)
 instantiate_kq_sdpa_gqa_p2(float16_t, 512, 8, 2)
 instantiate_kq_sdpa_gqa_p2(bfloat16_t, 256, 16, 4)
 instantiate_kq_sdpa_gqa_p2(float16_t, 256, 16, 4)

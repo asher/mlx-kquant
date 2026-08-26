@@ -279,6 +279,26 @@ mx::array sdpa_decode_gqa_paged(
     const std::optional<mx::array>& starts = std::nullopt,
     mx::StreamOrDevice s = {});
 
+// Block-sparse FA prefill for QSA-style block selection: q [1, Hq, L, D]
+// with Hq == 12 * Hkv and D == 256 (qwen4exp shape), k/v [1, Hkv, S, D].
+// Queries fold into windows of 4; window w attends ONLY the 4-row key
+// pages in pages[w, :counts[w]] (int32, -1 padded to max_pages), with
+// pmask (uint16, same shape) bit qi selecting membership for query qi of
+// the window, plus each query's own incomplete tail block (causal). The
+// builder must include the window's tail-span blocks in the list and set
+// membership bits only for blocks complete at that query. offset is query
+// row 0's global position (S - L for a standard prefill chunk).
+mx::array sdpa_prefill_block_sparse(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    mx::array pages,
+    mx::array pmask,
+    mx::array counts,
+    int offset,
+    mx::StreamOrDevice s = {});
+
 // sdpa_fa_verify returning {out, lse}: lse [B, Hkv, n_rows] float32 is the
 // natural-log softmax normalizer per folded row (cascade merge weight).
 std::vector<mx::array> sdpa_fa_verify_lse(
@@ -959,6 +979,33 @@ class KQuantSDPAFAVerify : public mx::Primitive {
   int q_len_;
   int splits_;
   bool return_lse_;
+};
+
+// Block-sparse FA prefill over QSA-selected 4-row pages (see
+// sdpa_prefill_block_sparse). Inference-only.
+class KQuantSDPABSPrefill : public mx::Primitive {
+ public:
+  explicit KQuantSDPABSPrefill(mx::Stream stream, float scale, int offset)
+      : mx::Primitive(stream), scale_(scale), offset_(offset) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSDPABSPrefill";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int offset_;
 };
 
 // Fused shared-prefix cascade attention (see sdpa_decode_gqa_cascade).

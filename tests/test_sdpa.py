@@ -1050,6 +1050,98 @@ def test_sdpa_paged_c4_bad_head_dim():
         kq.sdpa_decode_gqa_paged(q, k, v, 1.0 / (D**0.5), good, tile_c=4)
 
 
+def _bs_prefill_lists(sel, offset, S, r=4):
+    # builder mirror: per 4-query window union + tail span, membership bits
+    import numpy as np
+
+    L, _ = sel.shape
+    n_qt = L // 4
+    nbt = (S + r - 1) // r
+    plists, masks = [], []
+    for w in range(n_qt):
+        w4 = offset + w * 4
+        span = {w4 // r, min((w4 + 4) // r, nbt - 1)}
+        u = sorted(set(sel[w * 4 : (w + 1) * 4].ravel().tolist()) | span)
+        pm = []
+        for pg in u:
+            b = 0
+            for qi in range(4):
+                if pg in sel[w * 4 + qi]:
+                    b |= 1 << qi
+            pm.append(b)
+        plists.append(u)
+        masks.append(pm)
+    maxp = max(len(u) for u in plists)
+    pages = np.full((n_qt, maxp), -1, dtype=np.int32)
+    pmask = np.zeros((n_qt, maxp), dtype=np.uint16)
+    counts = np.zeros(n_qt, dtype=np.int32)
+    for w, (u, pm) in enumerate(zip(plists, masks, strict=True)):
+        pages[w, : len(u)] = u
+        pmask[w, : len(u)] = pm
+        counts[w] = len(u)
+    return pages, pmask, counts
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("shape", [(4099, 64, 16), (4096, 64, 16), (12290, 128, 512)])
+def test_sdpa_bs_prefill_matches_masked_reference(shape, dtype):
+    # block-sparse prefill == f32 attention under the QSA token mask
+    # (selected block members plus the causal incomplete tail)
+    import numpy as np
+
+    S, L, topk = shape
+    B, Hq, Hkv, D, r = 1, 24, 2, 256, 4
+    offset = S - L
+    scale = 1.0 / (D**0.5)
+    np.random.seed(S % 97)
+    q, k, v = _make(B, Hq, Hkv, L, S, D, dtype, seed=S % 89, strided=False)
+    sel = np.zeros((L, topk), dtype=np.int64)
+    for t in range(L):
+        comp = (offset + t + 1) // r
+        sel[t] = np.random.choice(comp, size=topk, replace=False)
+    pages, pmask, counts = _bs_prefill_lists(sel, offset, S)
+    got = kq.sdpa_prefill_block_sparse(
+        q, k, v, scale, mx.array(pages), mx.array(pmask), mx.array(counts), offset
+    )
+    m = np.zeros((L, S), dtype=bool)
+    for t in range(L):
+        for pg in sel[t]:
+            m[t, pg * r : (pg + 1) * r] = True
+        pos = offset + t
+        m[t, ((pos + 1) // r) * r : pos + 1] = True
+    ref = mx.fast.scaled_dot_product_attention(
+        q.astype(mx.float32),
+        k.astype(mx.float32),
+        v.astype(mx.float32),
+        scale=scale,
+        mask=mx.array(m)[None, None],
+    )
+    _eval_or_skip(got, ref)
+    err = float(mx.abs(got.astype(mx.float32) - ref).max())
+    assert err < 2e-2, f"bs prefill vs masked ref err={err}"
+
+
+def test_sdpa_bs_prefill_validation():
+    q, k, v = _make(1, 24, 2, 64, 4096, 256, mx.bfloat16, seed=9, strided=False)
+    n_qt = 64 // 4
+    pages = mx.zeros((n_qt, 8), dtype=mx.int32)
+    pmask = mx.zeros((n_qt, 8), dtype=mx.uint16)
+    counts = mx.ones((n_qt,), dtype=mx.int32)
+    sc = 0.0625
+    with pytest.raises(ValueError):  # bad gqa factor
+        q2, k2, v2 = _make(1, 16, 2, 64, 4096, 256, mx.bfloat16, seed=9, strided=False)
+        kq.sdpa_prefill_block_sparse(q2, k2, v2, sc, pages, pmask, counts, 4096 - 64)
+    with pytest.raises(ValueError):  # pages dtype
+        kq.sdpa_prefill_block_sparse(
+            q, k, v, sc, pages.astype(mx.float32), pmask, counts, 4096 - 64
+        )
+    with pytest.raises(ValueError):  # ragged L
+        q3 = q[:, :, :63]
+        kq.sdpa_prefill_block_sparse(q3, k, v, sc, pages, pmask, counts, 4096 - 63)
+    with pytest.raises(ValueError):  # offset out of range
+        kq.sdpa_prefill_block_sparse(q, k, v, sc, pages, pmask, counts, 4090)
+
+
 def test_sdpa_paged_validation():
     B, Hq, Hkv, D, S = 2, 16, 8, 128, 1024
     scale = 1.0 / (D**0.5)

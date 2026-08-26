@@ -299,6 +299,46 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_prefill_block_sparse",
+      &mlx_kquant::sdpa_prefill_block_sparse,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "scale"_a,
+      "pages"_a,
+      "pmask"_a,
+      "counts"_a,
+      "offset"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Block-sparse FA prefill over QSA-selected 4-row key pages. Queries
+        fold into windows of 4 (with the GQA group); window w walks ONLY
+        pages[w, :counts[w]] through a simdgroup-matrix FA tile. A key
+        counts for a query when its page's pmask bit for that query is set
+        (the builder sets bits only for blocks complete at the query), or
+        when it lies in the query's own incomplete tail block (causal).
+        The page list must include each window's tail-span blocks.
+
+        Args:
+            q (array): queries [1, n_q_heads, L, D]; n_q_heads must be
+                12 * n_kv_heads, D must be 256, L a multiple of 4.
+            k (array): keys [1, n_kv_heads, S, D] (full cache view).
+            v (array): values [1, n_kv_heads, S, D].
+            scale (float): query scale (typically 1/sqrt(D)).
+            pages (array): int32 [L / 4, max_pages] page indices per
+                window, padded with -1 past counts[w].
+            pmask (array): uint16 [L / 4, max_pages] membership bits
+                (bit i = query i of the window selected the page).
+            counts (array): int32 [L / 4] live page count per window.
+            offset (int): global position of query row 0 (S - L for a
+                standard prefill chunk).
+
+        Returns:
+            array: attention output [1, n_q_heads, L, D].
+      )");
+
+  m.def(
       "sdpa_fa_verify",
       [](mx::array q,
          mx::array k,
