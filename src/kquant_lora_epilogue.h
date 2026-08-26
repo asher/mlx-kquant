@@ -13,6 +13,7 @@
 
 #include "mlx/mlx.h"
 
+#include "mlx/backend/cpu/encoder.h"
 #ifdef _METAL_
 #include "mlx/backend/metal/device.h"
 #endif
@@ -66,19 +67,49 @@ inline int kq_lora_input_count(int flags) {
 }
 
 struct KqLoraView {
-  const mx::array* a = nullptr;
-  const mx::array* b = nullptr;
-  const mx::array* ids = nullptr;
-  const mx::array* table = nullptr;
-  const mx::array* fac = nullptr;
+  std::optional<mx::array> a;
+  std::optional<mx::array> b;
+  std::optional<mx::array> ids;
+  std::optional<mx::array> table;
+  std::optional<mx::array> fac;
   int flags = 0;
   int rank = 0;
 };
 
 // The operands appended by kq_lora_prep, read back from a primitive's inputs
-// starting at `base` (the count of the op's own inputs).
+// starting at `base` (the count of the op's own inputs). Layout is not
+// checked here: the epilogues walk every operand as dense row-major memory,
+// and an operand's strides are only known once it is evaluated (a lazy
+// broadcast such as mx.repeat of a single value evaluates to a stride-0
+// view), so the eval-time constructors below densify what needs it.
 KqLoraView
 kq_lora_view(const std::vector<mx::array>& inputs, size_t base, int flags);
+
+// Eval-time views: every operand that is not row-contiguous is copied into
+// a dense temporary on the primitive's stream (released with the command
+// buffer / encoder), so the epilogue kernels never read a strided view.
+KqLoraView kq_lora_view_cpu(
+    const std::vector<mx::array>& inputs,
+    size_t base,
+    int flags,
+    mx::cpu::CommandEncoder& encoder,
+    const mx::Stream& s);
+// CPU capture helper: densifies via kq_lora_view_cpu, registers every operand
+// as an encoder input and returns weak copies in kq_lora_view order, so the
+// dispatch lambda reads them back with kq_lora_view(lora, 0, flags).
+std::vector<mx::array> kq_lora_capture_cpu(
+    const std::vector<mx::array>& inputs,
+    size_t base,
+    int flags,
+    mx::cpu::CommandEncoder& encoder,
+    const mx::Stream& s);
+#ifdef _METAL_
+KqLoraView kq_lora_view_gpu(
+    const std::vector<mx::array>& inputs,
+    size_t base,
+    int flags,
+    const mx::Stream& s);
+#endif
 
 // CPU epilogue (the per-row kernel's semantics) for the dense ops' eval_cpu.
 template <typename T>

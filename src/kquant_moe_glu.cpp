@@ -389,7 +389,14 @@ void KQuantGatherQMVKQ::eval_gpu(
   ce.dispatch_threadgroups(grid_dims, group_dims);
   if (lora_flags_ & KQ_LORA_PRESENT) {
     kq_lora_epilogue_rows_gpu(
-        d, s, x, kq_lora_view(inputs, n_base, lora_flags_), out, T * R, K, N);
+        d,
+        s,
+        x,
+        kq_lora_view_gpu(inputs, n_base, lora_flags_, s),
+        out,
+        T * R,
+        K,
+        N);
   }
 }
 
@@ -511,7 +518,7 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   std::optional<mx::array> lora_z;
   KqLoraView lv;
   if (lora_flags_ & KQ_LORA_PRESENT) {
-    lv = kq_lora_view(inputs, 4, lora_flags_);
+    lv = kq_lora_view_gpu(inputs, 4, lora_flags_, s);
     lora_z = kq_lora_mix_z_gpu(d, s, x, lv, T, S, K);
   }
 

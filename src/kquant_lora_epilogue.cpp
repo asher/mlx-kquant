@@ -7,6 +7,8 @@
 #include "kquant_internal.h" // kq_type_string
 #include "kquant_lora_epilogue.h"
 
+#include <cstring>
+
 #ifdef _METAL_
 #include "kquant_metal_internal.h"
 #endif
@@ -16,7 +18,13 @@ namespace mlx_kquant {
 namespace {
 
 mx::array kq_lora_contig(const mx::array& a, mx::StreamOrDevice s) {
-  return a.flags().row_contiguous ? a : mx::contiguous(a, false, s);
+  // Flags are meaningful only on an evaluated array (an unscheduled one
+  // reports the default contiguous layout); lazy operands are densified at
+  // eval by kq_lora_view_gpu / kq_lora_view_cpu instead.
+  if (!a.is_available() || a.flags().row_contiguous) {
+    return a;
+  }
+  return mx::contiguous(a, false, s);
 }
 
 std::string kq_shape_str(const mx::Shape& sh) {
@@ -142,19 +150,84 @@ kq_lora_view(const std::vector<mx::array>& inputs, size_t base, int flags) {
     return v;
   }
   size_t i = base;
-  v.a = &inputs[i++];
-  v.b = &inputs[i++];
+  v.a = inputs[i++];
+  v.b = inputs[i++];
   if (flags & KQ_LORA_HAS_IDS) {
-    v.ids = &inputs[i++];
+    v.ids = inputs[i++];
   }
   if (flags & KQ_LORA_HAS_TABLE) {
-    v.table = &inputs[i++];
+    v.table = inputs[i++];
   }
   if (flags & KQ_LORA_HAS_FAC) {
-    v.fac = &inputs[i++];
+    v.fac = inputs[i++];
   }
   v.rank = v.a->shape(-1);
   return v;
+}
+
+KqLoraView kq_lora_view_cpu(
+    const std::vector<mx::array>& inputs,
+    size_t base,
+    int flags,
+    mx::cpu::CommandEncoder& encoder,
+    const mx::Stream& s) {
+  KqLoraView v = kq_lora_view(inputs, base, flags);
+  auto dense = [&](std::optional<mx::array>& o) {
+    if (!o || o->flags().row_contiguous) {
+      return;
+    }
+    mx::array t(o->shape(), o->dtype(), nullptr, {});
+    t.set_data(mx::allocator::malloc(t.nbytes()));
+    encoder.set_input_array(*o);
+    encoder.set_output_array(t);
+    encoder.dispatch([src = mx::array::unsafe_weak_copy(*o),
+                      dst = mx::array::unsafe_weak_copy(t)]() mutable {
+      const size_t isz = src.itemsize();
+      const char* in = src.data<char>();
+      char* out = dst.data<char>();
+      const auto& shape = src.shape();
+      const auto& strides = src.strides();
+      const int nd = src.ndim();
+      for (size_t i = 0; i < src.size(); i++) {
+        size_t rem = i;
+        int64_t loc = 0;
+        for (int d = nd - 1; d >= 0; --d) {
+          size_t q = rem / shape[d];
+          loc += static_cast<int64_t>(rem - q * shape[d]) * strides[d];
+          rem = q;
+        }
+        std::memcpy(out + i * isz, in + loc * isz, isz);
+      }
+    });
+    encoder.add_temporary(t);
+    o = t;
+  };
+  dense(v.a);
+  dense(v.b);
+  dense(v.ids);
+  dense(v.table);
+  dense(v.fac);
+  return v;
+}
+
+std::vector<mx::array> kq_lora_capture_cpu(
+    const std::vector<mx::array>& inputs,
+    size_t base,
+    int flags,
+    mx::cpu::CommandEncoder& encoder,
+    const mx::Stream& s) {
+  std::vector<mx::array> lora;
+  if (!(flags & KQ_LORA_PRESENT)) {
+    return lora;
+  }
+  KqLoraView v = kq_lora_view_cpu(inputs, base, flags, encoder, s);
+  for (auto* o : {&v.a, &v.b, &v.ids, &v.table, &v.fac}) {
+    if (*o) {
+      encoder.set_input_array(**o);
+      lora.push_back(mx::array::unsafe_weak_copy(**o));
+    }
+  }
+  return lora;
 }
 
 #ifdef _METAL_
@@ -163,6 +236,55 @@ namespace {
 constexpr int kq_lora_tg = 1024; // KQ_LORA_TG
 constexpr int kq_lora_tile = kq_lora_tg * 1; // KQ_LORA_TG * KQ_LORA_NPT
 } // namespace
+
+KqLoraView kq_lora_view_gpu(
+    const std::vector<mx::array>& inputs,
+    size_t base,
+    int flags,
+    const mx::Stream& s) {
+  KqLoraView v = kq_lora_view(inputs, base, flags);
+  auto& d = mx::metal::device(s.device);
+  auto& ce = mx::metal::get_command_encoder(s);
+  auto dense = [&](std::optional<mx::array>& o) {
+    if (!o || o->flags().row_contiguous) {
+      return;
+    }
+    if (o->ndim() > 8) {
+      throw std::runtime_error("kq LoRA operand has more than 8 dims.");
+    }
+    mx::array t(o->shape(), o->dtype(), nullptr, {});
+    t.set_data(mx::allocator::malloc(t.nbytes()));
+    struct {
+      int shape[8];
+      int64_t strides[8];
+      int ndim;
+      int64_t size;
+    } args{};
+    for (int i = 0; i < o->ndim(); i++) {
+      args.shape[i] = o->shape(i);
+      args.strides[i] = o->strides()[i];
+    }
+    args.ndim = o->ndim();
+    args.size = static_cast<int64_t>(o->size());
+    const std::string kname =
+        std::string("kq_lora_densify_") + (o->itemsize() == 2 ? "2" : "4");
+    auto kernel = kq_get_kernel(d, kname);
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(*o, 0);
+    ce.set_output_array(t, 1);
+    ce.set_bytes(args, 2);
+    const size_t tg = std::min<size_t>(1024, o->size());
+    ce.dispatch_threads(MTL::Size(o->size(), 1, 1), MTL::Size(tg, 1, 1));
+    ce.add_temporary(t);
+    o = t;
+  };
+  dense(v.a);
+  dense(v.b);
+  dense(v.ids);
+  dense(v.table);
+  dense(v.fac);
+  return v;
+}
 
 void kq_lora_epilogue_rows_gpu(
     mx::metal::Device& d,

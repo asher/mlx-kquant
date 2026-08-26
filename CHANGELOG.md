@@ -12,7 +12,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `lora_rows`; the gathers also `lora_ids` and `lora_table`) and add the
   low-rank delta inside the op on every codec and route, so a live adapter
   adds no graph ops at decode. `KQuantLinear(x, lora=...)` forwards them;
-  `mlx_kquant.HAS_LORA_EPILOGUE` marks the build.
+  `mlx_kquant.HAS_LORA_EPILOGUE` marks the build. Strided or lazily built
+  LoRA operands (a broadcast row vector, a sliced id matrix) are densified
+  at eval, so they read correctly on every route.
 
 ## [0.4.1]
 

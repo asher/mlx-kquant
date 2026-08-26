@@ -43,6 +43,10 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
   decode on any codec; `lora_table` remaps gathered ids (arena slot to expert, negative skips) and
   `lora_rows` scales rows (0 skips). f16/bf16 activations, rank x slots <= 512, inference only.
   `mlx_kquant.HAS_LORA_EPILOGUE` marks the build; `KQuantLinear(x, lora=(a_t, b_t, rows))` forwards.
+  The epilogue kernels walk every LoRA operand as dense row-major memory; operands that evaluate
+  to a strided view (an unevaluated array reports the default dense layout at op build, and
+  `mx.repeat` of one value evaluates to a stride-0 broadcast) are copied into a dense temporary
+  by a small `kq_lora_densify` dispatch at eval, on the primitive's own stream.
 - **`gather_qmm_seg`** + **`expert_tile_map`** - expert-sorted MoE prefill as one GEMM per expert
   segment instead of per-row gathers. `expert_tile_map` builds the 64-row tile map on the GPU from the
   sorted routing indices (no host sync); `gather_qmm_seg` walks it. Gated by `KQ_SWITCH_GEMM_MIN_ROWS`

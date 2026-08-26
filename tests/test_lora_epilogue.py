@@ -345,3 +345,88 @@ def test_gather_operand_validation():
             lora_b=b,
             lora_table=mx.zeros((2, 2), dtype=mx.int32),
         )
+
+
+# Strided / lazy operands: an unevaluated array reports the default (dense)
+# layout, so build-time contiguity checks cannot see that mx.repeat of one
+# value evaluates to a stride-0 broadcast view. The epilogue densifies such
+# operands at eval; every route must match the dense-operand result exactly.
+def _lazy_variants(dense_rows):
+    m = dense_rows.shape[0] if dense_rows.ndim == 1 else dense_rows.shape
+    n = int(np.prod(m)) if isinstance(m, tuple) else m
+    v = float(np.asarray(dense_rows).reshape(-1)[0])
+    out = {
+        "repeat": mx.repeat(mx.array([v], dtype=mx.float32), n).reshape(
+            dense_rows.shape
+        ),
+        "broadcast": mx.broadcast_to(mx.array(v, dtype=mx.float32), dense_rows.shape),
+    }
+    wide = np.zeros(dense_rows.shape[:-1] + (dense_rows.shape[-1] * 2,), np.float32)
+    wide[..., ::2] = np.asarray(dense_rows)
+    out["slice"] = mx.array(wide)[..., ::2]
+    return out
+
+
+@pytest.mark.parametrize("m", [1, 8])
+@pytest.mark.parametrize("bias", [False, True])
+def test_dense_lazy_rows_match_dense(m, bias):
+    codec, dtype = "q8_0", mx.float16
+    wire, ref = _lin_wire_ref(codec, GT.Q8_0, False)
+    rows_n, kk = ref.shape
+    lin = KQuantLinear(in_dims=kk, out_dims=rows_n, bias=bias, codec=codec)
+    lin.weight = mx.array(wire)
+    rng = np.random.default_rng(11)
+    if bias:
+        lin.bias = mx.array((rng.standard_normal(rows_n) * 0.1).astype(np.float32))
+    x = mx.array((rng.standard_normal((m, kk)) * 0.1).astype(np.float32)).astype(dtype)
+    a, b, _, _ = _lora(rng, (kk, RANK), (RANK, rows_n), dtype)
+    rows = np.full(m, 0.75, dtype=np.float32)
+    want = lin(x, lora=(a, b, mx.array(rows)))
+    mx.eval(want)
+    for name, lazy in _lazy_variants(rows).items():
+        got = lin(x, lora=(a, b, lazy))
+        mx.eval(got)
+        assert np.array_equal(_f32(got), _f32(want)), name
+    # A strided a/b (column slice of a wider matrix) densifies too.
+    a_wide = mx.concatenate([a, a * 0 + 1], axis=1)[:, :RANK]
+    b_wide = mx.concatenate([b, b * 0 + 1], axis=0)[:RANK]
+    got = lin(x, lora=(a_wide, b_wide, mx.array(rows)))
+    mx.eval(got)
+    assert np.array_equal(_f32(got), _f32(want))
+
+
+@gathered
+@pytest.mark.parametrize("op", ["rows", "mix"])
+def test_gather_lazy_rows_and_ids_match_dense(op):
+    codec, dtype = "q8_0", mx.float16
+    wire, ref, h, idx, a, b, a32, b32 = _moe_setup(codec, dtype, t=4, s=2)
+    w = mx.array(wire)
+    rng = np.random.default_rng(23)
+    sc = mx.array(rng.random((4, 2)).astype(np.float32))
+    fac = np.full((4, 2), 0.6, dtype=np.float32)
+    ids = mx.array(idx)
+
+    def run(rows, lora_ids):
+        kw = dict(lora_a=a, lora_b=b, lora_ids=lora_ids, lora_rows=rows)
+        if op == "rows":
+            y = kq.gather_qmv_kq(h, w, codec, ids, **kw)
+        else:
+            y = kq.gather_qmv_mix_ns_kq(h, w, codec, ids, sc, **kw)
+        mx.eval(y)
+        return _f32(y)
+
+    want = run(mx.array(fac), ids)
+    for name, lazy in _lazy_variants(fac).items():
+        assert np.array_equal(run(lazy, ids), want), name
+    # lazy ids: a strided view over a wider index matrix, and a stride-0
+    # broadcast when every slot routes to one expert.
+    wide = np.zeros((4, 4), np.uint32)
+    wide[:, ::2] = idx
+    assert np.array_equal(run(mx.array(fac), mx.array(wide)[:, ::2]), want)
+    one = np.full((4, 2), int(idx[0, 0]), np.uint32)
+    want_one = run(mx.array(fac), mx.array(one))
+    got_one = run(
+        mx.array(fac),
+        mx.broadcast_to(mx.array(int(idx[0, 0]), dtype=mx.uint32), (4, 2)),
+    )
+    assert np.array_equal(got_one, want_one)

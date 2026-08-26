@@ -314,3 +314,32 @@ kq_lora_mix_apply(
     orow[n] = static_cast<T>(float(orow[n]) + acc);
   }
 }
+
+// Densify a strided LoRA operand into a row-major temporary (host side
+// kq_lora_view_gpu). Element-size templated: 2-byte (half/bfloat) and 4-byte
+// (float/uint32/int32) operands share one kernel each.
+struct KqLoraDensifyArgs {
+  int shape[8];
+  int64_t strides[8];
+  int ndim;
+  int64_t size;
+};
+
+template <typename T>
+[[kernel]] void kq_lora_densify(
+    const device T* in [[buffer(0)]],
+    device T* out [[buffer(1)]],
+    const constant KqLoraDensifyArgs& args [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid >= args.size) {
+    return;
+  }
+  int64_t rem = gid;
+  int64_t loc = 0;
+  for (int d = args.ndim - 1; d >= 0; --d) {
+    int64_t q = rem / args.shape[d];
+    loc += (rem - q * args.shape[d]) * args.strides[d];
+    rem = q;
+  }
+  out[gid] = in[loc];
+}

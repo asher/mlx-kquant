@@ -1124,11 +1124,8 @@ void KQuantMatmul::eval_cpu(
   encoder.set_input_array(x);
   encoder.set_input_array(w);
   encoder.set_output_array(out);
-  std::vector<mx::array> lora;
-  for (size_t i = 3; i < inputs.size(); i++) {
-    encoder.set_input_array(inputs[i]);
-    lora.push_back(mx::array::unsafe_weak_copy(inputs[i]));
-  }
+  std::vector<mx::array> lora =
+      kq_lora_capture_cpu(inputs, 3, lora_flags_, encoder, stream());
   encoder.dispatch([out = mx::array::unsafe_weak_copy(out),
                     x = mx::array::unsafe_weak_copy(x),
                     w = mx::array::unsafe_weak_copy(w),
@@ -1241,7 +1238,7 @@ void KQuantMatmul::eval_gpu(
     const int N = out.shape(-1);
     const int rows = static_cast<int>(x.size() / K);
     kq_lora_epilogue_rows_gpu(
-        d, s, x, kq_lora_view(inputs, 3, lora_flags_), out, rows, K, N);
+        d, s, x, kq_lora_view_gpu(inputs, 3, lora_flags_, s), out, rows, K, N);
   }
 }
 
@@ -1579,11 +1576,8 @@ void KQuantQmvBias::eval_cpu(
   encoder.set_input_array(w);
   encoder.set_input_array(bias);
   encoder.set_output_array(out);
-  std::vector<mx::array> lora;
-  for (size_t i = 4; i < inputs.size(); i++) {
-    encoder.set_input_array(inputs[i]);
-    lora.push_back(mx::array::unsafe_weak_copy(inputs[i]));
-  }
+  std::vector<mx::array> lora =
+      kq_lora_capture_cpu(inputs, 4, lora_flags_, encoder, stream());
   encoder.dispatch([out = mx::array::unsafe_weak_copy(out),
                     x = mx::array::unsafe_weak_copy(x),
                     w = mx::array::unsafe_weak_copy(w),
@@ -1652,7 +1646,7 @@ void KQuantQmvBias::eval_gpu(
       x, w, scales, bias, out, group_size_, bits_, N, K, d, s, kquant_type_);
   if (lora_flags_ & KQ_LORA_PRESENT) {
     kq_lora_epilogue_rows_gpu(
-        d, s, x, kq_lora_view(inputs, 4, lora_flags_), out, 1, K, N);
+        d, s, x, kq_lora_view_gpu(inputs, 4, lora_flags_, s), out, 1, K, N);
   }
 }
 
