@@ -239,11 +239,13 @@ void KQDsaIndexerScoreDecode::eval_gpu(
   constexpr int rows_per_tg = 32;
 
   const int B = q.shape(0);
+  const int H = q.shape(1);
   const int QL = q.shape(2);
   const int P = k.shape(1);
 
   const std::string kname = "kq_dsa_indexer_score_decode_" +
-      kq_type_string(q.dtype()) + "_ql" + std::to_string(QL);
+      std::string(H == 4 ? "h4_" : "") + kq_type_string(q.dtype()) + "_ql" +
+      std::to_string(QL);
 
   auto kernel = kq_get_kernel(d, kname, kname, {});
   auto& ce = mx::metal::get_command_encoder(s);
@@ -442,10 +444,10 @@ mx::array dsa_indexer_score_decode(
   const int B = queries.shape(0);
   const int H = queries.shape(1);
   const int QL = queries.shape(2);
-  if (H != 64 || queries.shape(3) != 128) {
+  if ((H != 64 && H != 4) || queries.shape(3) != 128) {
     std::ostringstream msg;
-    msg << "[mlx_kquant.dsa_indexer_score_decode] expected 64 indexer heads "
-        << "of dim 128, got " << queries.shape() << ".";
+    msg << "[mlx_kquant.dsa_indexer_score_decode] expected 4 or 64 indexer "
+        << "heads of dim 128, got " << queries.shape() << ".";
     throw std::invalid_argument(msg.str());
   }
   if (QL < 1 || QL > 4) {

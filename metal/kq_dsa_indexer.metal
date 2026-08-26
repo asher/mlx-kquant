@@ -41,4 +41,19 @@ instantiate_kq_dsa_indexer_score_decode(bfloat16_t, bfloat16_t, 1);
 instantiate_kq_dsa_indexer_score_decode(bfloat16_t, bfloat16_t, 2);
 instantiate_kq_dsa_indexer_score_decode(bfloat16_t, bfloat16_t, 3);
 instantiate_kq_dsa_indexer_score_decode(bfloat16_t, bfloat16_t, 4);
+
+// 4-head band (qwen4exp QSA indexer: 4 heads of dim 128, uniform weights)
+#define instantiate_kq_dsa_indexer_score_decode_h4(tname, dtype, ql) \
+  instantiate_kernel(                                                \
+      "kq_dsa_indexer_score_decode_h4_" #tname "_ql" #ql,           \
+      kq_dsa_indexer_score_decode, dtype, ql, 4)
+
+instantiate_kq_dsa_indexer_score_decode_h4(float16_t, half, 1);
+instantiate_kq_dsa_indexer_score_decode_h4(float16_t, half, 2);
+instantiate_kq_dsa_indexer_score_decode_h4(float16_t, half, 3);
+instantiate_kq_dsa_indexer_score_decode_h4(float16_t, half, 4);
+instantiate_kq_dsa_indexer_score_decode_h4(bfloat16_t, bfloat16_t, 1);
+instantiate_kq_dsa_indexer_score_decode_h4(bfloat16_t, bfloat16_t, 2);
+instantiate_kq_dsa_indexer_score_decode_h4(bfloat16_t, bfloat16_t, 3);
+instantiate_kq_dsa_indexer_score_decode_h4(bfloat16_t, bfloat16_t, 4);
 // clang-format on

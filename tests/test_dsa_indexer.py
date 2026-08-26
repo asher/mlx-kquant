@@ -230,12 +230,12 @@ def _ref_scores_decode(q, k, w, q_offset, ratio):
     return out, mask
 
 
-def _make_decode_qkw(B, QL, P, dtype, seed):
+def _make_decode_qkw(B, QL, P, dtype, seed, H=64):
     rng = np.random.default_rng(seed)
-    q = mx.array(rng.standard_normal((B, 64, QL, D)) * 0.4).astype(dtype)
+    q = mx.array(rng.standard_normal((B, H, QL, D)) * 0.4).astype(dtype)
     k = mx.array(rng.standard_normal((B, P, D)) * 0.4).astype(dtype)
     # Signed weights: relu is on the dot, not the weighted sum.
-    w = mx.array(rng.standard_normal((B, QL, 64)) * 0.2).astype(dtype)
+    w = mx.array(rng.standard_normal((B, QL, H)) * 0.2).astype(dtype)
     return q, k, w
 
 
@@ -284,6 +284,25 @@ def test_dsa_indexer_e2e_decode(dtype):
         _check_topk_row(vals[0, 0, j], sel[0, 0, j], topk, P)
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "case", DECODE_SCORE_CASES, ids=[c[0] for c in DECODE_SCORE_CASES]
+)
+def test_dsa_indexer_score_decode_h4(case, dtype):
+    """4-head band (qwen4exp QSA indexer)."""
+    name, QL, P, q_offset, ratio = case
+    q, k, w = _make_decode_qkw(1, QL, P, dtype, seed=31, H=4)
+    got = kq.dsa_indexer_score_decode(q, k, w, q_offset, ratio)
+    mx.eval(got)
+    assert got.shape == (1, 1, QL, P)
+    g = np.array(got.astype(mx.float32))
+    ref, mask = _ref_scores_decode(q, k, w, q_offset, ratio)
+    if mask.any():
+        assert np.all(g[mask] <= -60000), name
+    rel = np.linalg.norm(g[~mask] - ref[~mask]) / (np.linalg.norm(ref[~mask]) + 1e-6)
+    assert rel < REL_BOUND[dtype], f"{name} {dtype}: rel {rel:.3e}"
+
+
 def test_dsa_indexer_score_decode_rejects_bad_shapes():
     q = mx.zeros((1, 64, 1, 128), dtype=mx.float16)
     k = mx.zeros((1, 256, 128), dtype=mx.float16)
@@ -296,7 +315,7 @@ def test_dsa_indexer_score_decode_rejects_bad_shapes():
             100,
             4,
         )
-    with pytest.raises(ValueError):  # bad head count
+    with pytest.raises(ValueError):  # bad head count (4 and 64 only)
         kq.dsa_indexer_score_decode(q[:, :32], k, w[:, :, :32], 100, 4)
     with pytest.raises(ValueError):  # keys rank
         kq.dsa_indexer_score_decode(q, k[:, None], w, 100, 4)
