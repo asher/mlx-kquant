@@ -124,6 +124,9 @@ NB_MODULE(_ext, m) {
       "kquant_type"_a,
       "transpose"_a = true,
       nb::kw_only(),
+      "lora_a"_a = nb::none(),
+      "lora_b"_a = nb::none(),
+      "lora_rows"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Quantized matmul: ``x @ dequant(w)`` for GGUF K-quant weights.
@@ -135,6 +138,14 @@ NB_MODULE(_ext, m) {
             scales (array): vestigial placeholder; ignored by the kernel.
             kquant_type (str): codec name, e.g. ``"q4_k"``.
             transpose (bool): whether ``w`` is transposed ([N, K]). Default True.
+            lora_a (array, optional): LoRA A^T [K, r] in the activation
+                dtype. With ``lora_b``, adds ``lora_rows * (x @ lora_a) @
+                lora_b`` to the output inside the same op (any codec, any
+                shape), instead of separate matmul and add ops.
+            lora_b (array, optional): LoRA B^T [r, N] (fold the adapter
+                scale in here).
+            lora_rows (array, optional): float32 per-row scale [rows] over
+                the flattened leading dims of ``x``; 0 skips a row.
 
         Returns:
             array: the matmul result (x.dtype, float32 promoted to bfloat16).
@@ -149,6 +160,9 @@ NB_MODULE(_ext, m) {
       "bias"_a,
       "kquant_type"_a,
       nb::kw_only(),
+      "lora_a"_a = nb::none(),
+      "lora_b"_a = nb::none(),
+      "lora_rows"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Bias-fused quantized matmul: ``x @ dequant(w) + bias`` for GGUF
@@ -166,6 +180,14 @@ NB_MODULE(_ext, m) {
             scales (array): vestigial placeholder; ignored by the kernel.
             bias (array): 1D, length N (the output dim).
             kquant_type (str): codec name; only ``"q8_0"`` is wired so far.
+            lora_a (array, optional): LoRA A^T [K, r] in the activation
+                dtype. With ``lora_b``, adds ``lora_rows * (x @ lora_a) @
+                lora_b`` to the output inside the same op (any codec, any
+                shape), instead of separate matmul and add ops.
+            lora_b (array, optional): LoRA B^T [r, N] (fold the adapter
+                scale in here).
+            lora_rows (array, optional): float32 per-row scale [rows] over
+                the flattened leading dims of ``x``; 0 skips a row.
 
         Returns:
             array: the matmul-plus-bias result (x.dtype, float32 promoted to
@@ -979,6 +1001,11 @@ NB_MODULE(_ext, m) {
       "indices"_a,
       "bias"_a = nb::none(),
       nb::kw_only(),
+      "lora_a"_a = nb::none(),
+      "lora_b"_a = nb::none(),
+      "lora_ids"_a = nb::none(),
+      "lora_table"_a = nb::none(),
+      "lora_rows"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Gathered matvec for K-quant expert stacks (the MoE down projection).
@@ -991,6 +1018,16 @@ NB_MODULE(_ext, m) {
             indices (array): expert indices [T, R].
             bias (array, optional): per-(expert, out_dim) bias [E, N] added
                 to each gathered row (mxfp4/nvfp4 only).
+            lora_a (array, optional): per-expert LoRA A^T [E, K, r] in the
+                activation dtype; with ``lora_b`` the gathered LoRA delta is
+                added on the output inside the same op.
+            lora_b (array, optional): per-expert LoRA B^T [E, r, N].
+            lora_ids (array, optional): the adapter's expert per row, same
+                shape as ``indices`` (default: ``indices``).
+            lora_table (array, optional): 1-D int remap applied to the ids
+                (arena slot -> expert); entries < 0 skip the row.
+            lora_rows (array, optional): float32 per-row scale shaped like
+                ``indices``; 0 skips a row.
 
         Returns:
             array: output [T, R, N] in x.dtype.
@@ -1071,6 +1108,11 @@ NB_MODULE(_ext, m) {
       "indices"_a,
       "scores"_a,
       nb::kw_only(),
+      "lora_a"_a = nb::none(),
+      "lora_b"_a = nb::none(),
+      "lora_ids"_a = nb::none(),
+      "lora_table"_a = nb::none(),
+      "lora_rows"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Gathered down projection with the routing mix folded in, no shared
@@ -1083,6 +1125,16 @@ NB_MODULE(_ext, m) {
             kquant_type (str): expert codec with a fused kernel.
             indices (array): expert indices [T, S].
             scores (array): mix weights [T, S]; cast to float32.
+            lora_a (array, optional): per-expert LoRA A^T [E, K, r] in the
+                activation dtype; with ``lora_b`` the gathered LoRA delta is
+                added on the output inside the same op.
+            lora_b (array, optional): per-expert LoRA B^T [E, r, N].
+            lora_ids (array, optional): the adapter's expert per row, same
+                shape as ``indices`` (default: ``indices``).
+            lora_table (array, optional): 1-D int remap applied to the ids
+                (arena slot -> expert); entries < 0 skip the row.
+            lora_rows (array, optional): float32 per-row scale shaped like
+                ``indices``; 0 skips a row.
 
         Returns:
             array: mixed output [T, N] in x.dtype.

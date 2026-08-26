@@ -6,6 +6,14 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `quantized_matmul`, `quantized_matmul_qmv_bias`, `gather_qmv_kq` and
+  `gather_qmv_mix_ns_kq` take optional LoRA operands (`lora_a`, `lora_b`,
+  `lora_rows`; the gathers also `lora_ids` and `lora_table`) and add the
+  low-rank delta inside the op on every codec and route, so a live adapter
+  adds no graph ops at decode. `KQuantLinear(x, lora=...)` forwards them;
+  `mlx_kquant.HAS_LORA_EPILOGUE` marks the build.
+
 ## [0.4.1]
 
 ### Added
@@ -25,7 +33,6 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   second; up qmv, sigmoid gate and the stream mean in a third.
 - KQ_QMM_LOG=1 logs the dispatched qmm kernel name and shape to stderr
   (routing-diagnosis lever for the ALU/NAX qmm paths).
-
 ### Changed
 - The seven grid-codebook GEMM block loaders (iq1_s, iq1_m, iq2_xxs,
   iq2_xs, iq2_s, iq3_xxs, iq3_s) decode a whole 8-weight group per step:

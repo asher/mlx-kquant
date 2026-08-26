@@ -119,7 +119,16 @@ class KQuantLinear(nn.Module):
             self.bias = mx.zeros((out_dims,))
         self.freeze()
 
-    def __call__(self, x):
+    def __call__(self, x, lora=None):
+        # ``lora``: ``(a_t, b_t)`` or ``(a_t, b_t, rows)`` for the in-op LoRA
+        # epilogue (quantized_matmul's lora_a / lora_b / lora_rows): the
+        # adapter delta rides the base matmul's own primitive, so a live GGUF
+        # LoRA adds no graph ops at decode. Tables in the activation dtype.
+        lkw = {}
+        if lora is not None:
+            lkw = {"lora_a": lora[0], "lora_b": lora[1]}
+            if len(lora) > 2 and lora[2] is not None:
+                lkw["lora_rows"] = lora[2]
         # Decode (M=1) with a real bias: fuse the add into the qmv/qmv_fast
         # dispatch instead of a separate elementwise op -- see
         # quantized_matmul_qmv_bias's docstring for the exact shape contract.
@@ -134,10 +143,10 @@ class KQuantLinear(nn.Module):
             and os.environ.get("KQ_DISABLE_QMV_BIAS") != "1"
         ):
             return kq.quantized_matmul_qmv_bias(
-                x, self["weight"], self["scales"], self["bias"], self.kquant_type
+                x, self["weight"], self["scales"], self["bias"], self.kquant_type, **lkw
             )
         y = kq.quantized_matmul(
-            x, self["weight"], self["scales"], self.kquant_type, transpose=True
+            x, self["weight"], self["scales"], self.kquant_type, transpose=True, **lkw
         )
         if "bias" in self:
             y = y + self["bias"]
