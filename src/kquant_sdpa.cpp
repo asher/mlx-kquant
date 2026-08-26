@@ -1040,7 +1040,8 @@ static std::vector<mx::array> sdpa_decode_gqa_impl(
   // Instantiated (D, C) pairs: threadgroup K+V tiles cap at 16 KB so two
   // threadgroups co-reside per core (D=64/128: C 32/16; 256: 16/8; 512: 8).
   const bool tile_ok = (D <= 128 && (tile_c == 32 || tile_c == 16)) ||
-      (D == 256 && (tile_c == 16 || tile_c == 8)) || (D == 512 && tile_c == 8);
+      (D == 256 && (tile_c == 16 || tile_c == 8 || tile_c == 4)) ||
+      (D == 512 && tile_c == 8);
   if (!tile_ok) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa] tile_c not instantiated for this "
@@ -1150,6 +1151,7 @@ mx::array sdpa_decode_gqa_paged(
     float scale,
     mx::array pages,
     int splits,
+    int tile_c,
     const std::optional<mx::array>& starts,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
@@ -1191,8 +1193,23 @@ mx::array sdpa_decode_gqa_paged(
     throw std::invalid_argument(
         std::string(op) + "splits must be in [0, 128].");
   }
-  // Page unit is the head dim's staged tile height.
-  const int tile_c = D <= 128 ? 32 : D == 256 ? 16 : 8;
+  // Page unit is the staged tile height: the head dim's default, or an
+  // explicit smaller instantiated tile (4 at D=256 -- block-sparse
+  // attention whose selection unit is 4 tokens, e.g. qwen4exp QSA).
+  if (tile_c == 0) {
+    tile_c = D <= 128 ? 32 : D == 256 ? 16 : 8;
+  }
+  const bool ptile_ok = tile_c ==
+          (D <= 128       ? 32
+               : D == 256 ? 16
+                          : 8) ||
+      (D == 256 && tile_c == 4);
+  if (!ptile_ok) {
+    throw std::invalid_argument(
+        std::string(op) +
+        "tile_c not instantiated for this head_dim (0 picks the default; "
+        "4 is available at head_dim 256).");
+  }
   if (pages.dtype() != mx::int32 || pages.ndim() != 3 || pages.shape(0) != B ||
       pages.shape(1) != n_kv_heads || pages.shape(2) < 1) {
     throw std::invalid_argument(
@@ -1444,7 +1461,8 @@ std::vector<mx::array> sdpa_decode_gqa_cascade(
     tile_c = tile_default;
   }
   const bool tile_ok = (D <= 128 && (tile_c == 32 || tile_c == 16)) ||
-      (D == 256 && (tile_c == 16 || tile_c == 8)) || (D == 512 && tile_c == 8);
+      (D == 256 && (tile_c == 16 || tile_c == 8 || tile_c == 4)) ||
+      (D == 512 && tile_c == 8);
   if (!tile_ok) {
     throw std::invalid_argument(
         std::string(op) + "tile_c not instantiated for this head_dim.");

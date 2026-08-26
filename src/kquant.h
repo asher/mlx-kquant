@@ -263,7 +263,8 @@ std::vector<mx::array> sdpa_decode_gqa_cascade(
 // Sparse page-gather decode: attend only the C-row pages listed per
 // (batch, kv-head). pages is int32 [B, n_kv_heads, n_pages] with page
 // indices into the key axis (page size = the head dim's staged tile:
-// 32 at D<=128, 16 at D=256, 8 at D=512). qL == 1 only; fp16/bf16 KV.
+// 32 at D<=128, 16 at D=256, 8 at D=512; tile_c=4 picks a 4-row page
+// at D=256). qL == 1 only; fp16/bf16 KV.
 // Optional `starts` (int32 [B]) restricts row b to keys [starts[b], N)
 // -- left-padded batches; pad positions inside selected pages score
 // -inf, so selecting a partially padded page stays exact.
@@ -274,6 +275,7 @@ mx::array sdpa_decode_gqa_paged(
     float scale,
     mx::array pages,
     int splits = 0,
+    int tile_c = 0,
     const std::optional<mx::array>& starts = std::nullopt,
     mx::StreamOrDevice s = {});
 
