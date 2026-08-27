@@ -299,6 +299,46 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_prefill_block_sparse",
+      &mlx_kquant::sdpa_prefill_block_sparse,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "scale"_a,
+      "pages"_a,
+      "pmask"_a,
+      "counts"_a,
+      "offset"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Block-sparse FA prefill over QSA-selected 4-row key pages. Queries
+        fold into windows of 4 (with the GQA group); window w walks ONLY
+        pages[w, :counts[w]] through a simdgroup-matrix FA tile. A key
+        counts for a query when its page's pmask bit for that query is set
+        (the builder sets bits only for blocks complete at the query), or
+        when it lies in the query's own incomplete tail block (causal).
+        The page list must include each window's tail-span blocks.
+
+        Args:
+            q (array): queries [1, n_q_heads, L, D]; n_q_heads must be
+                12 * n_kv_heads, D must be 256, L a multiple of 4.
+            k (array): keys [1, n_kv_heads, S, D] (full cache view).
+            v (array): values [1, n_kv_heads, S, D].
+            scale (float): query scale (typically 1/sqrt(D)).
+            pages (array): int32 [L / 4, max_pages] page indices per
+                window, padded with -1 past counts[w].
+            pmask (array): uint16 [L / 4, max_pages] membership bits
+                (bit i = query i of the window selected the page).
+            counts (array): int32 [L / 4] live page count per window.
+            offset (int): global position of query row 0 (S - L for a
+                standard prefill chunk).
+
+        Returns:
+            array: attention output [1, n_q_heads, L, D].
+      )");
+
+  m.def(
       "sdpa_fa_verify",
       [](mx::array q,
          mx::array k,
@@ -372,6 +412,7 @@ NB_MODULE(_ext, m) {
       "scale"_a,
       "pages"_a,
       "splits"_a = 0,
+      "tile_c"_a = 0,
       "starts"_a = nb::none(),
       nb::kw_only(),
       "stream"_a = nb::none(),
@@ -380,7 +421,9 @@ NB_MODULE(_ext, m) {
         pages listed per (batch, kv-head), walking the selected pages
         through the decode kernel instead of the full cache. The page
         unit is the head dim's staged tile height: 32 rows at head_dim
-        64/128, 16 at 256, 8 at 512. Optional starts (int32 [B])
+        64/128, 16 at 256, 8 at 512; tile_c=4 selects a 4-row page at
+        head_dim 256 (block-sparse attention with a 4-token selection
+        unit). Optional starts (int32 [B])
         restricts row b to keys [starts[b], N) for left-padded batches.
 
         Args:
@@ -393,6 +436,8 @@ NB_MODULE(_ext, m) {
                 page is tail-clamped to S automatically.
             splits (int): key-axis split count; 0 buckets by the SELECTED
                 key count.
+            tile_c (int): page size in rows; 0 picks the head dim's
+                default. 4 is instantiated at head_dim 256 only.
 
         Returns:
             array: attention output [B, n_q_heads, 1, D].
@@ -1264,6 +1309,80 @@ NB_MODULE(_ext, m) {
 
         Returns:
             array: [..., 4, D], dtype of resid.
+      )");
+
+  m.def(
+      "hc_lowrank_norm",
+      &mlx_kquant::hc_lowrank_norm,
+      "h"_a,
+      "gamma"_a,
+      "eps"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Grouped rms norm for the low-rank hyper-connection (qwen4exp):
+        one statistic per stream, gamma gain over all streams. One
+        dispatch, materializing xn once for the front and epilogue.
+
+        Args:
+            h (array): [..., 4, D] residual streams, float32 or the gamma
+                dtype. D % 64 == 0, D <= 8192.
+            gamma (array): [4 * D] norm gain, float16/bfloat16.
+            eps (float): rms epsilon.
+
+        Returns:
+            array: xn [..., 4, D] in the h dtype.
+      )");
+
+  m.def(
+      "hc_lowrank_front",
+      &mlx_kquant::hc_lowrank_front,
+      "xn"_a,
+      "w_down"_a,
+      "w_inject"_a,
+      "lo_dtype"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused low-rank hyper-connection front (qwen4exp): the q8_0 down
+        qmv over xn with silu(x / 4), plus the float32 inject dots
+        2 * sigmoid(x / 4). One dispatch.
+
+        Args:
+            xn (array): [..., 4, D] normed streams (hc_lowrank_norm
+                output), float32 or lo_dtype. D % 64 == 0, D <= 8192.
+            w_down (array): [LR, 4 * D / 32 * 34] uint8 q8_0 wire.
+                LR % 32 == 0, LR <= 512.
+            w_inject (array): [4, 4 * D] float32.
+            lo_dtype (Dtype): float16 or bfloat16; the down qmv output
+                rounds here before silu (the kq qmv promotion).
+
+        Returns:
+            tuple: (lo [..., LR] lo_dtype, inj f32 [..., 4]).
+      )");
+
+  m.def(
+      "hc_lowrank_epilogue",
+      &mlx_kquant::hc_lowrank_epilogue,
+      "lo"_a,
+      "w_up"_a,
+      "xn"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused low-rank hyper-connection epilogue (qwen4exp): the q8_0 up
+        qmv of lo, sigmoid gate against xn, mean over the 4 streams. One
+        dispatch.
+
+        Args:
+            lo (array): [..., LR] float16/bfloat16 (hc_lowrank_front
+                output).
+            w_up (array): [4 * D, LR / 32 * 34] uint8 q8_0 wire.
+            xn (array): [..., 4, D] normed streams (hc_lowrank_norm
+                output).
+
+        Returns:
+            array: mixed [..., D] in the xn dtype.
       )");
 
   m.def(

@@ -6,6 +6,22 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- sdpa_prefill_block_sparse: block-sparse FA prefill for QSA-style block
+  selection at head_dim 256. Queries fold into 4-wide windows (with the
+  GQA-12 group, 48 MMA rows); each window walks only its own 4-row page
+  list with per-page membership bitmasks, so a prefill chunk pays for the
+  selected blocks instead of the full key axis, with no [L, S] mask
+  materialized.
+- sdpa_decode_gqa_paged takes tile_c: 4-row pages are instantiated at
+  head_dim 256 so block-sparse attention with a 4-token selection unit
+  (qwen4exp QSA) can walk its selected blocks directly, with no
+  gathered K/V copy per token.
+- hc_lowrank_norm / hc_lowrank_front / hc_lowrank_epilogue: fused
+  low-rank hyper-connection ops for qwen4exp decode. Grouped rms norm in
+  one dispatch; q8_0 down qmv, silu and the float32 inject dots in a
+  second; up qmv, sigmoid gate and the stream mean in a third.
+
 ## [0.4.0]
 
 ### Changed

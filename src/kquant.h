@@ -263,7 +263,8 @@ std::vector<mx::array> sdpa_decode_gqa_cascade(
 // Sparse page-gather decode: attend only the C-row pages listed per
 // (batch, kv-head). pages is int32 [B, n_kv_heads, n_pages] with page
 // indices into the key axis (page size = the head dim's staged tile:
-// 32 at D<=128, 16 at D=256, 8 at D=512). qL == 1 only; fp16/bf16 KV.
+// 32 at D<=128, 16 at D=256, 8 at D=512; tile_c=4 picks a 4-row page
+// at D=256). qL == 1 only; fp16/bf16 KV.
 // Optional `starts` (int32 [B]) restricts row b to keys [starts[b], N)
 // -- left-padded batches; pad positions inside selected pages score
 // -inf, so selecting a partially padded page stays exact.
@@ -274,7 +275,28 @@ mx::array sdpa_decode_gqa_paged(
     float scale,
     mx::array pages,
     int splits = 0,
+    int tile_c = 0,
     const std::optional<mx::array>& starts = std::nullopt,
+    mx::StreamOrDevice s = {});
+
+// Block-sparse FA prefill for QSA-style block selection: q [1, Hq, L, D]
+// with Hq == 12 * Hkv and D == 256 (qwen4exp shape), k/v [1, Hkv, S, D].
+// Queries fold into windows of 4; window w attends ONLY the 4-row key
+// pages in pages[w, :counts[w]] (int32, -1 padded to max_pages), with
+// pmask (uint16, same shape) bit qi selecting membership for query qi of
+// the window, plus each query's own incomplete tail block (causal). The
+// builder must include the window's tail-span blocks in the list and set
+// membership bits only for blocks complete at that query. offset is query
+// row 0's global position (S - L for a standard prefill chunk).
+mx::array sdpa_prefill_block_sparse(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    mx::array pages,
+    mx::array pmask,
+    mx::array counts,
+    int offset,
     mx::StreamOrDevice s = {});
 
 // sdpa_fa_verify returning {out, lse}: lse [B, Hkv, n_rows] float32 is the
@@ -663,6 +685,35 @@ mx::array hc_expand(
     mx::array comb,
     mx::StreamOrDevice s = {});
 
+// Grouped rms norm for the qwen4exp low-rank hyper-connection: one
+// statistic per stream of h [..., 4, D], gamma [4 * D] float16/bfloat16
+// gain, output in the h dtype (float32 residual, or the gamma dtype at
+// half). D % 64 == 0.
+mx::array hc_lowrank_norm(
+    mx::array h,
+    mx::array gamma,
+    float eps,
+    mx::StreamOrDevice s = {});
+
+// Fused low-rank hyper-connection front: the q8_0 down qmv over xn (the
+// hc_lowrank_norm output) with silu(x / 4), plus the float32 inject dots
+// 2 * sigmoid(x / 4). lowrank (w_down rows) % 32 == 0, at most 512.
+// Returns {lo [..., LR] lo_dtype, inj f32 [..., 4]}.
+std::vector<mx::array> hc_lowrank_front(
+    mx::array xn,
+    mx::array w_down,
+    mx::array w_inject,
+    mx::Dtype lo_dtype,
+    mx::StreamOrDevice s = {});
+
+// Epilogue: the q8_0 up qmv of lo, sigmoid gate against xn and the mean
+// over the 4 streams. Returns mixed [..., D] in the xn dtype.
+mx::array hc_lowrank_epilogue(
+    mx::array lo,
+    mx::array w_up,
+    mx::array xn,
+    mx::StreamOrDevice s = {});
+
 // y = x @ w.T for token widths 1..16 against a small-N, large-K weight in
 // nn.Linear layout ([N, K]). x is [..., M, K] with 1 <= M <= 16 and
 // K % 4 == 0; x float16/bfloat16/float32, w matching x or float32; output
@@ -928,6 +979,33 @@ class KQuantSDPAFAVerify : public mx::Primitive {
   int q_len_;
   int splits_;
   bool return_lse_;
+};
+
+// Block-sparse FA prefill over QSA-selected 4-row pages (see
+// sdpa_prefill_block_sparse). Inference-only.
+class KQuantSDPABSPrefill : public mx::Primitive {
+ public:
+  explicit KQuantSDPABSPrefill(mx::Stream stream, float scale, int offset)
+      : mx::Primitive(stream), scale_(scale), offset_(offset) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSDPABSPrefill";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int offset_;
 };
 
 // Fused shared-prefix cascade attention (see sdpa_decode_gqa_cascade).
@@ -1686,6 +1764,67 @@ class KQuantHcExpand : public mx::Primitive {
 
   const char* name() const override {
     return "KQuantHcExpand";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return true;
+  }
+};
+
+// Fused low-rank hyper-connection primitives (see hc_lowrank_front).
+// Inference-only, GPU-only.
+class KQuantHcLowrankNorm : public mx::Primitive {
+ public:
+  explicit KQuantHcLowrankNorm(mx::Stream stream, float eps)
+      : mx::Primitive(stream), eps_(eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcLowrankNorm";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float eps_;
+};
+
+class KQuantHcLowrankFront : public mx::Primitive {
+ public:
+  explicit KQuantHcLowrankFront(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcLowrankFront";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return true;
+  }
+};
+
+class KQuantHcLowrankEpilogue : public mx::Primitive {
+ public:
+  explicit KQuantHcLowrankEpilogue(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcLowrankEpilogue";
   }
   bool is_equivalent(const mx::Primitive& other) const override {
     return true;

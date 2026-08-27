@@ -114,7 +114,14 @@ mechanism below.
   qL 1-8 (verify width, end-aligned causal); takes `starts` and the q8 operands on either region.
 - **`sdpa_decode_gqa_paged`** - sparse page-gather decode: attends only the K/V pages listed per
   (batch, kv-head), so cost tracks the selected keys rather than the cache length. The page unit is
-  the staged tile height (32 rows at head dim 64/128, 16 at 256, 8 at 512); takes `starts`.
+  the staged tile height (32 rows at head dim 64/128, 16 at 256, 8 at 512); `tile_c` overrides it
+  where instantiated (4-row pages at head dim 256, matching a 4-token block-sparse selection unit);
+  takes `starts`.
+- **`sdpa_prefill_block_sparse`** - block-sparse FA prefill over 4-row K/V pages at head dim 256:
+  queries fold into 4-wide windows (with the GQA group, one MMA tile), and each window walks only
+  its own page list with per-page membership bitmasks, so a prefill chunk pays for the selected
+  blocks instead of the full key axis and no `[L, S]` mask is materialized. Causality inside the
+  diagonal page is enforced in-kernel.
 - **`sdpa_fa_verify`** - speculative-verify attention on the matrix units for a GQA-folded query tile.
   Head dims 64 through 512; `return_lse` as above.
 
