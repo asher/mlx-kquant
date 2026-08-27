@@ -173,12 +173,16 @@ template <typename T, typename H>
   }
 }
 
-// Epilogue: grid (D / 2, R); 2 simdgroups x 1 output per threadgroup
-// (the same threadgroup count as the up qmv would use, for qmv-class
-// serialized latency). Each output d dots its 4 up rows (s * D + d)
-// against lo, gates xn and means over the streams. lo is
-// register-resident per lane (LR / 32 values); LR % 32 == 0
-// (host-enforced).
+// Epilogue: one lane per output (row, d), 256-thread threadgroups over
+// R * D outputs. The up dot has K = LR (tiny); a simdgroup-per-output
+// mapping spends most of the machine on index math and the 5-shuffle
+// simd_sum after ~LR / 32 fmas per lane, which made the kernel scale
+// with R even though the wire is cache-resident. A serial per-lane dot
+// amortizes that overhead: each lane walks its 4 up rows (s * D + d)
+// block by block with packed_char4 loads, keeping the 4 stream
+// accumulators as independent chains, then gates xn and means over the
+// streams. No cross-lane reduction, so batching rows cannot move a bit
+// relative to single-row calls.
 template <typename T, typename H>
 [[kernel]] void kq_hc_lowrank_epilogue(
     const device H* lo [[buffer(0)]],
@@ -187,41 +191,48 @@ template <typename T, typename H>
     device T* mixed [[buffer(3)]],
     const constant int& D [[buffer(4)]],
     const constant int& LR [[buffer(5)]],
-    uint3 tg [[threadgroup_position_in_grid]],
-    uint3 tid3 [[thread_position_in_threadgroup]]) {
-  const uint tid = tid3.x;
-  const uint lane = tid % 32;
-  const uint sg = tid / 32;
-  const uint row = tg.y;
+    const constant int& R [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid >= uint(R) * uint(D)) {
+    return;
+  }
+  const int d = int(gid % uint(D));
+  const int r = int(gid / uint(D));
   const int K = KQ_HCLR * D;
   const int nblk = LR / 32;
   const int row_bytes = LR / KQ_Q8_0_GROUP * KQ_Q8_0_BLOCK_BYTES;
 
-  const device T* xr = xn + int64_t(row) * K;
-  const device H* lor = lo + int64_t(row) * LR;
-
-  float lo_lane[KQ_HCLR_MAX_LRBLK];
+  const device H* lor = lo + int64_t(r) * LR;
+  float acc[KQ_HCLR] = {0.0f, 0.0f, 0.0f, 0.0f};
   for (int it = 0; it < nblk; it++) {
-    lo_lane[it] = float(lor[it * 32 + int(lane)]);
+    const device H* lo_blk = lor + it * 32;
+    float dsc[KQ_HCLR];
+    const device uint8_t* ba[KQ_HCLR];
+    for (int s = 0; s < KQ_HCLR; s++) {
+      ba[s] = w_up + int64_t(s * D + d) * row_bytes + it * KQ_Q8_0_BLOCK_BYTES;
+      dsc[s] = kq_q8_0_d(ba[s]);
+    }
+    for (int j = 0; j < 8; j++) {
+      float l0 = float(lo_blk[j * 4 + 0]);
+      float l1 = float(lo_blk[j * 4 + 1]);
+      float l2 = float(lo_blk[j * 4 + 2]);
+      float l3 = float(lo_blk[j * 4 + 3]);
+      for (int s = 0; s < KQ_HCLR; s++) {
+        const packed_char4 q =
+            *((const device packed_char4*)(kq_q8_0_q_ptr(ba[s]) + j * 4));
+        acc[s] = metal::fma(
+            dsc[s],
+            l0 * float(q.x) + l1 * float(q.y) + l2 * float(q.z) +
+                l3 * float(q.w),
+            acc[s]);
+      }
+    }
   }
-
-  const int d = int(tg.x) * 2 + int(sg);
   float m = 0.0f;
   for (int s = 0; s < KQ_HCLR; s++) {
-    const device uint8_t* row_base = w_up + int64_t(s * D + d) * row_bytes;
-    float acc = 0.0f;
-    for (int it = 0; it < nblk; it++) {
-      const device uint8_t* block_addr = row_base + it * KQ_Q8_0_BLOCK_BYTES;
-      const float dsc = kq_q8_0_d(block_addr);
-      const float q = float(kq_q8_0_q_ptr(block_addr)[lane]);
-      acc = metal::fma(dsc, lo_lane[it] * q, acc);
-    }
-    acc = simd_sum(acc);
     // Eager: up out rounds to H, sigmoid rounds to H, then f32 gate * xn.
-    const float g = float(H(kq_hclr_sigmoid(float(H(acc)))));
-    m = metal::fma(g, float(xr[s * D + d]), m);
+    const float g = float(H(kq_hclr_sigmoid(float(H(acc[s])))));
+    m = metal::fma(g, float(xn[int64_t(r) * K + s * D + d]), m);
   }
-  if (lane == 0) {
-    mixed[int64_t(row) * D + d] = T(m * 0.25f);
-  }
+  mixed[int64_t(r) * D + d] = T(m * 0.25f);
 }
