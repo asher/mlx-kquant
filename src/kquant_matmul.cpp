@@ -510,6 +510,12 @@ void qmm(
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
       batched ? "_batch_1" : "_batch_0");
 
+  static const bool qmm_log = std::getenv("KQ_QMM_LOG") != nullptr;
+  if (qmm_log) {
+    std::fprintf(
+        stderr, "[kq qmm] %s M=%d N=%d K=%d\n", kname.c_str(), M, N, K);
+  }
+
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);

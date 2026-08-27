@@ -21,6 +21,27 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   low-rank hyper-connection ops for qwen4exp decode. Grouped rms norm in
   one dispatch; q8_0 down qmv, silu and the float32 inject dots in a
   second; up qmv, sigmoid gate and the stream mean in a third.
+- KQ_QMM_LOG=1 logs the dispatched qmm kernel name and shape to stderr
+  (routing-diagnosis lever for the ALU/NAX qmm paths).
+
+### Changed
+- The seven grid-codebook GEMM block loaders (iq1_s, iq1_m, iq2_xxs,
+  iq2_xs, iq2_s, iq3_xxs, iq3_s) decode a whole 8-weight group per step:
+  one grid-word load, uchar4/char4 reinterpret, vector sign fold and
+  vec4 threadgroup stores replace the per-weight byte/gather/store
+  chain. Bit-identical outputs. On machines with no NAX tile the GEMM
+  spread across IQ codecs drops from 1.63x to about 1.07x (M3 Max,
+  [12288x4096] M=512: iq2_xs -26%, iq1_m -35%, iq1_s -22%, iq2_s -18%),
+  which moves iq2_s/iq2_xs prefill from behind llama.cpp to ahead of it
+  at the same shape.
+- iq4_xs and iq4_nl decode through a shared 256-entry byte-to-float-pair
+  table (kq_iq4nl_pairs) instead of two kvalues_iq4nl gathers plus two
+  int-to-float converts per quant byte; bit-identical by construction.
+  Applied to the iq4_xs qmv, GEMM loader and mv_ext chunk dequant and
+  the iq4_nl GEMM loader (M3 Max: iq4_xs GEMM -8.6%, now at the
+  grid-codec floor; mv_ext at M=8 -34%; qmv -2%).
+- iq3_s qmv derives both grid indices from one shifted qh word (-3%
+  decode on M3 Max); iq1_m qmv hoists its lane-invariant scale offsets.
 
 ## [0.4.0]
 

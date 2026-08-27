@@ -2527,13 +2527,23 @@ struct KqIq4_nlBlockLoader {
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)) {}
 
   void load_unsafe() const {
+    // One kq_iq4nl_pairs gather per byte (no per-nibble gathers or
+    // converts), vector stores per 4 weights; bit-identical values.
+    static_assert(
+        bytes_per_thread % 4 == 0, "vector loader needs whole 4-byte groups");
     const float d = float(*(const device half*)src);
     const device uint8_t* qs = src + KQ_IQ4_NL_QS_OFFSET + bj_byte;
 #pragma unroll
-    for (short i = 0; i < bytes_per_thread; i++) {
-      const uint8_t b = qs[i];
-      dst[i] = T(d * float(kvalues_iq4nl[b & 0x0F]));
-      dst[half_block + i] = T(d * float(kvalues_iq4nl[b >> 4]));
+    for (short t = 0; t < bytes_per_thread / 4; ++t) {
+      float4 lo, hi;
+#pragma unroll
+      for (short j = 0; j < 4; ++j) {
+        const float2 kv = as_type<float2>(kq_iq4nl_pairs[qs[4 * t + j]]);
+        lo[j] = kv.x;
+        hi[j] = kv.y;
+      }
+      *(threadgroup vec<T, 4>*)(dst + 4 * t) = vec<T, 4>(d * lo);
+      *(threadgroup vec<T, 4>*)(dst + half_block + 4 * t) = vec<T, 4>(d * hi);
     }
   }
 
