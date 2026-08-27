@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1]
+
 ### Added
 - sdpa_prefill_block_sparse: block-sparse FA prefill for QSA-style block
   selection at head_dim 256. Queries fold into 4-wide windows (with the
