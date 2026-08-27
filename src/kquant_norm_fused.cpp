@@ -27,7 +27,10 @@ namespace mlx_kquant {
 
 namespace {
 
-// Row-contiguous activation with a supported dtype, or throw.
+// Row-contiguous activation with a supported dtype, or throw. The
+// Contiguous node is unconditional: flags of an unevaluated array are not
+// meaningful at op-build time (see gather_qmm), and Contiguous::eval
+// aliases zero-copy when the input turns out packed.
 mx::array
 prep_act(const mx::array& x, const char* op, const char* what, mx::Stream s) {
   auto dt = x.dtype();
@@ -35,7 +38,7 @@ prep_act(const mx::array& x, const char* op, const char* what, mx::Stream s) {
     throw std::invalid_argument(
         std::string(op) + " " + what + " must be float16 or bfloat16.");
   }
-  return x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  return mx::contiguous(x, false, s);
 }
 
 // 1-D [D] weight matching the activation dtype, or throw.
@@ -55,7 +58,7 @@ mx::array prep_norm_weight(
     throw std::invalid_argument(
         std::string(op) + " " + what + " dtype must match the activations.");
   }
-  return w.flags().row_contiguous ? w : mx::contiguous(w, false, s);
+  return mx::contiguous(w, false, s);
 }
 
 } // namespace
@@ -423,8 +426,7 @@ mx::array add_rmsnorm(
       throw std::invalid_argument(
           std::string(op) + " scale dtype must match the activations.");
     }
-    inputs.push_back(
-        sc.flags().row_contiguous ? sc : mx::contiguous(sc, false, s));
+    inputs.push_back(mx::contiguous(sc, false, s));
   }
   return mx::array(
       h.shape(),

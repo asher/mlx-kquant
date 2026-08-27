@@ -66,15 +66,16 @@ Tuning levers (defaults are right for normal use):
 - `KQ_MV_EXT_NR` - `2` selects the two-rows-per-thread `mv_ext` variant (q6_k, M 5-12), which
   halves activation cache traffic but measured no faster than the shipped kernels. Kept as a probe
   for future silicon. Default `1` (shipped behavior).
-- `KQ_QMM_SPLITK_NAX` - split-K on the NAX BM=32 tile; the value is the target slice count (`1` =
-  auto 32, `0` off). Lifts the collapsed M 9-16 band 65-76% on M5 Max. q6_k/q8_0, M <= 32; read
-  live per call. Default off.
-- `KQ_QMM_SPLITK` - split-K for the plain small-M qmm (target slice count, `0` off). Measured flat
-  to negative on M5 Max; kept as a probe. K-quants plus q8_0, M <= 32. Default off.
-- `KQ_MV_EXT_SB` / `KQ_MV_EXT_NX` / `KQ_MV_EXT_HD` / `KQ_MV_EXT_TS` - `mv_ext` activation-traffic
-  experiments: shuffle-broadcast (`1`), wide nxpsg (`16`/`32`), half-precision chunk dots (`1`),
-  threadgroup-staged activations (`1`). q6_k M 4-12 only. `HD` measured +4-5% at M 8; the rest flat
-  to negative on M5 Max. Kept as probes. Default off.
+- `KQ_QMM_SPLITK_NAX` - split-K on the NAX BM=32 tile; `0` disables the route, a value at or above
+  `1` forces it and sets the target slice count. Unset takes the per-codec entry M in
+  `kq_splitk_nax_min_m`, measured on M5 Max. Every codec with NAX kernels, M <= 32; read live per
+  call, so both arms can share one process.
+- `KQ_QMM_SPLITK` - the same lever for the plain small-M qmm, used when NAX is absent or disabled.
+  Entry points come from a per-device table. K-quants, legacy quants and the IQ codecs, M <= 32.
+- `KQ_MV_EXT_SB` / `KQ_MV_EXT_NX` / `KQ_MV_EXT_HD` - `mv_ext` activation-traffic experiments:
+  shuffle-broadcast (`1`), wide nxpsg (`16`/`32`), half-precision chunk dots (`1`). q6_k M 4-12
+  only. `HD` measured +4-5% at M 8; the rest flat to negative on M5 Max. Kept as probes. Default
+  off.
 
 ## MoE GLU
 
@@ -113,7 +114,14 @@ mechanism below.
   qL 1-8 (verify width, end-aligned causal); takes `starts` and the q8 operands on either region.
 - **`sdpa_decode_gqa_paged`** - sparse page-gather decode: attends only the K/V pages listed per
   (batch, kv-head), so cost tracks the selected keys rather than the cache length. The page unit is
-  the staged tile height (32 rows at head dim 64/128, 16 at 256, 8 at 512); takes `starts`.
+  the staged tile height (32 rows at head dim 64/128, 16 at 256, 8 at 512); `tile_c` overrides it
+  where instantiated (4-row pages at head dim 256, matching a 4-token block-sparse selection unit);
+  takes `starts`.
+- **`sdpa_prefill_block_sparse`** - block-sparse FA prefill over 4-row K/V pages at head dim 256:
+  queries fold into 4-wide windows (with the GQA group, one MMA tile), and each window walks only
+  its own page list with per-page membership bitmasks, so a prefill chunk pays for the selected
+  blocks instead of the full key axis and no `[L, S]` mask is materialized. Causality inside the
+  diagonal page is enforced in-kernel.
 - **`sdpa_fa_verify`** - speculative-verify attention on the matrix units for a GQA-folded query tile.
   Head dims 64 through 512; `return_lse` as above.
 
@@ -136,7 +144,9 @@ modifications, from omlx's `glm_moe_dsa` custom kernels (see the
   per-head attention sinks, in one flash-softmax dispatch (f32 accumulation).
 - **`dsa_kv_qat`** / **`dsa_indexer_qat`** - the fused quantization-aware round-trips DeepSeek-V4 does
   on its main-attention KV (per-64-block FP8-E4M3FN) and indexer activations (128-wide Hadamard then
-  per-32-block FP4-E2M1), each bit-identical to the equivalent MLX graph.
+  per-32-block FP4-E2M1), each bit-identical to the equivalent MLX graph. `dsa_kv_qat(...,
+  f16_round=False)` drops the trailing fp16 round for the compressor emit path, whose pooled rows are
+  quantized but never stored in the f16 KV cache.
 
 Tuning levers (defaults are right for normal use):
 

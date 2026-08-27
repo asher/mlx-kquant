@@ -142,3 +142,28 @@ def test_db64_band_dispatch(codec):
 def test_smallm_routing_iq(codec, n_out):
     w, s, ref_w = _iq_setup(codec, n_out)
     _sweep(codec, w, s, ref_w, n_out)
+
+
+# Non-NAX split-K band, which the rest of this file cannot reach on NAX
+# silicon: M 2 sits below every codec entry, 6-8 cover the bm8 tile for
+# the codecs whose entry is at or under them, 10-16 the bm16 tile, 17-32
+# the BM32 tile up to its ceiling, and 33 is the handoff back to plain
+# qmm. KQ_DISABLE_NAX is read live, so toggling it re-routes in-process.
+ALU_SPLITK_MS = [2, 6, 7, 8, 10, 12, 16, 17, 24, 32, 33]
+
+
+@pytest.fixture
+def nax_off(monkeypatch):
+    monkeypatch.setenv("KQ_DISABLE_NAX", "1")
+
+
+@pytest.mark.parametrize("codec", ENCODABLE)
+def test_alu_splitk_band(codec, nax_off):
+    w, s, ref_w = _encodable_setup(codec, 1000)
+    _sweep(codec, w, s, ref_w, 1000, ms=ALU_SPLITK_MS)
+
+
+@pytest.mark.parametrize("codec", IQ)
+def test_alu_splitk_band_iq(codec, nax_off):
+    w, s, ref_w = _iq_setup(codec, 1000)
+    _sweep(codec, w, s, ref_w, 1000, ms=ALU_SPLITK_MS)

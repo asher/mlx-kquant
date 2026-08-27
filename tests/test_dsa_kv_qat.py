@@ -11,6 +11,13 @@ the storage dtype before the fp16 step (the graph's per-slice astype), so
 outputs are asserted BIT-identical, not just close: any drift would move
 KV-cache contents.
 
+`f16_round=False` is the compressor emit-path form: same fp8 arithmetic,
+no trailing fp16 round, RoPE tail copied through. Its reference is the
+gguf-mlx compressor site (`Compressor.__call__`, `_qat == "fp8"`), which
+is the same chain minus the astype pair, and it is asserted bit-identical
+against that: pooled rows land in the indexer pool and in attention keys,
+so drift there moves the top-k selection.
+
 Metal-only kernel (eval_cpu throws): skipped under KQUANT_FORCE_CPU.
 
 Usage: test_dsa_kv_qat.py
@@ -64,6 +71,12 @@ def _ref(kv, n_rot):
     return kv.astype(mx.float16).astype(orig)
 
 
+def _ref_nof16(kv, n_rot):
+    """gguf-mlx Compressor.__call__ emit path (_qat == "fp8")."""
+    nope, rot = kv[..., : kv.shape[-1] - n_rot], kv[..., kv.shape[-1] - n_rot :]
+    return mx.concatenate([_fp8_roundtrip(nope), rot], axis=-1)
+
+
 def _bits(a):
     bits_dtype = {2: mx.uint16, 4: mx.uint32}[a.itemsize]
     return np.array(a.view(bits_dtype))
@@ -95,22 +108,51 @@ CASES = [
 ]
 
 
+@pytest.mark.parametrize("f16_round", [True, False], ids=["f16", "nof16"])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
 @pytest.mark.parametrize("case", CASES, ids=[c[0] for c in CASES])
-def test_dsa_kv_qat_bit_identity(case, dtype):
+def test_dsa_kv_qat_bit_identity(case, dtype, f16_round):
     name, gen = case
     rng = np.random.default_rng(7)
     x = mx.array(gen(rng, (2048, 576), dtype)).astype(dtype)
     mx.eval(x)
-    got = kq.dsa_kv_qat(x, 64)
-    ref = _ref(x, 64)
+    got = kq.dsa_kv_qat(x, 64, f16_round=f16_round)
+    ref = (_ref if f16_round else _ref_nof16)(x, 64)
     mx.eval(got, ref)
     gb, rb = _bits(got), _bits(ref)
     mismatch = int((gb != rb).sum())
     assert mismatch == 0, (
-        f"{name} {dtype}: {mismatch}/{gb.size} words differ "
-        f"(first at {np.argwhere(gb != rb)[:4].tolist()})"
+        f"{name} {dtype} f16_round={f16_round}: {mismatch}/{gb.size} words "
+        f"differ (first at {np.argwhere(gb != rb)[:4].tolist()})"
     )
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+def test_dsa_kv_qat_nof16_emit_geometry(dtype):
+    """The V4-Flash compressor emit shape: head_dim 512, rope tail 64, one
+    or two pooled rows per call (ratio-4 overlap emits two, then trims)."""
+    rng = np.random.default_rng(11)
+    for rows in (1, 2):
+        x = mx.array(rng.standard_normal((1, rows, 512))).astype(dtype)
+        mx.eval(x)
+        got = kq.dsa_kv_qat(x, 64, f16_round=False)
+        ref = _ref_nof16(x, 64)
+        mx.eval(got, ref)
+        assert got.shape == x.shape
+        assert not int((_bits(got) != _bits(ref)).sum()), f"{dtype} rows={rows}"
+
+
+def test_dsa_kv_qat_nof16_differs_from_f16():
+    """Guard against the flag being ignored: bf16 values that survive the
+    fp8 step unchanged still move when they are re-rounded through fp16."""
+    xt = mx.full((4, 576), 1e20, dtype=mx.bfloat16)
+    mx.eval(xt)
+    a = kq.dsa_kv_qat(xt, 64, f16_round=True)
+    b = kq.dsa_kv_qat(xt, 64, f16_round=False)
+    mx.eval(a, b)
+    assert int((_bits(a) != _bits(b)).sum()) > 0
+    # rope tail: f16 saturates 1e20 to inf, the emit form leaves it alone
+    assert float(b[0, -1]) == float(xt[0, -1])
 
 
 def test_dsa_kv_qat_shapes_and_rejects():
@@ -148,20 +190,22 @@ def test_dsa_kv_qat_shapes_and_rejects():
 
 def main() -> int:
     fails = 0
-    for name, gen in CASES:
-        for dtype in (mx.float16, mx.bfloat16, mx.float32):
-            rng = np.random.default_rng(7)
-            x = mx.array(gen(rng, (2048, 576), dtype)).astype(dtype)
-            mx.eval(x)
-            got = kq.dsa_kv_qat(x, 64)
-            ref = _ref(x, 64)
-            mx.eval(got, ref)
-            n = int((_bits(got) != _bits(ref)).sum())
-            fails += n > 0
-            print(
-                f"  {name:<16} {str(dtype):<18} "
-                f"{'bit-identical' if n == 0 else f'{n} words differ'}"
-            )
+    for f16_round in (True, False):
+        print(f"f16_round={f16_round}")
+        for name, gen in CASES:
+            for dtype in (mx.float16, mx.bfloat16, mx.float32):
+                rng = np.random.default_rng(7)
+                x = mx.array(gen(rng, (2048, 576), dtype)).astype(dtype)
+                mx.eval(x)
+                got = kq.dsa_kv_qat(x, 64, f16_round=f16_round)
+                ref = (_ref if f16_round else _ref_nof16)(x, 64)
+                mx.eval(got, ref)
+                n = int((_bits(got) != _bits(ref)).sum())
+                fails += n > 0
+                print(
+                    f"  {name:<16} {str(dtype):<18} "
+                    f"{'bit-identical' if n == 0 else f'{n} words differ'}"
+                )
     print("ALL OK" if not fails else f"FAILURES: {fails}")
     return 1 if fails else 0
 

@@ -298,7 +298,12 @@ template <typename T>
 // threads per row: one simdgroup per 64-block (lane owns elements
 // 64b + lane and 64b + 32 + lane), lanes re-derive the block scale from
 // the simd_max broadcast.
-template <typename T>
+//
+// F16R selects the trailing fp16 round. With F16R off the kernel stops at
+// the storage-dtype fp8 result and copies the RoPE tail through unchanged,
+// which is the compressor emit-path form (ds4.c compressor site: the
+// pooled row is quantized but never passes through the f16 KV cache).
+template <typename T, bool F16R>
 [[kernel, max_total_threads_per_threadgroup(256)]] void kq_dsa_kv_qat(
     const device T* X [[buffer(0)]],
     device T* O [[buffer(1)]],
@@ -335,11 +340,12 @@ template <typename T>
       e = metal::clamp(e, -6.0f, 8.0f);
       const float q = metal::ldexp(1.0f, int(e) - 3);
       const float r = sgn * metal::rint(a / q) * q * scale;
-      o_row[64 * b + 32 * j + int(simd_lid)] = T(half(float(T(r))));
+      o_row[64 * b + 32 * j + int(simd_lid)] =
+          F16R ? T(half(float(T(r)))) : T(r);
     }
   }
   for (int i = int(lid); i < NROT; i += 256) {
     const int e = (D - NROT) + i;
-    o_row[e] = T(half(float(x_row[e])));
+    o_row[e] = F16R ? T(half(float(x_row[e]))) : x_row[e];
   }
 }

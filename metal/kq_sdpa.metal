@@ -5,22 +5,25 @@
 #include "mlx/backend/metal/kernels/steel/attn/mma.h"
 #include "mlx/backend/metal/kernels/kq_sdpa.h"
 
-#define instantiate_kq_sdpa(type, D)                                  \
+#define instantiate_kq_sdpa(type, ptype, D)                           \
   instantiate_kernel(                                                 \
       "kq_sdpa_vector_2pass_1_" #type "_" #D,                         \
       kq_sdpa_vector_2pass_1,                                         \
       type,                                                           \
+      ptype,                                                          \
       D)                                                              \
   instantiate_kernel(                                                 \
       "kq_sdpa_vector_2pass_2_" #type "_" #D,                         \
       kq_sdpa_vector_2pass_2,                                         \
       type,                                                           \
+      ptype,                                                          \
       D)
 
-instantiate_kq_sdpa(bfloat16_t, 256)
-instantiate_kq_sdpa(bfloat16_t, 512)
-instantiate_kq_sdpa(float16_t, 256)
-instantiate_kq_sdpa(float16_t, 512)
+// Partial store type per input dtype (see the PT note in kq_sdpa.h).
+instantiate_kq_sdpa(bfloat16_t, bfloat16_t, 256)
+instantiate_kq_sdpa(bfloat16_t, bfloat16_t, 512)
+instantiate_kq_sdpa(float16_t, float, 256)
+instantiate_kq_sdpa(float16_t, float, 512)
 
 #define instantiate_kq_sdpa_gqa(type, D, C)                           \
   instantiate_kernel(                                                 \
@@ -60,8 +63,10 @@ instantiate_kq_sdpa_gqa(float16_t, 128, 32)
 instantiate_kq_sdpa_gqa(float16_t, 128, 16)
 instantiate_kq_sdpa_gqa(bfloat16_t, 256, 16)
 instantiate_kq_sdpa_gqa(bfloat16_t, 256, 8)
+instantiate_kq_sdpa_gqa(bfloat16_t, 256, 4)
 instantiate_kq_sdpa_gqa(float16_t, 256, 16)
 instantiate_kq_sdpa_gqa(float16_t, 256, 8)
+instantiate_kq_sdpa_gqa(float16_t, 256, 4)
 instantiate_kq_sdpa_gqa_ne(bfloat16_t, 512, 8, 2)
 instantiate_kq_sdpa_gqa_ne(float16_t, 512, 8, 2)
 
@@ -79,6 +84,16 @@ instantiate_kq_sdpa_gqa_ne(float16_t, 512, 8, 2)
       2)
 
 instantiate_kq_sdpa_gqa_p2(bfloat16_t, 512, 8, 2)
+
+#define instantiate_kq_sdpa_bs(type, D)                               \
+  instantiate_kernel(                                                 \
+      "kq_sdpa_bs_prefill_" #type "_" #D,                             \
+      kq_sdpa_bs_prefill,                                             \
+      type,                                                           \
+      D)
+
+instantiate_kq_sdpa_bs(bfloat16_t, 256)
+instantiate_kq_sdpa_bs(float16_t, 256)
 instantiate_kq_sdpa_gqa_p2(float16_t, 512, 8, 2)
 instantiate_kq_sdpa_gqa_p2(bfloat16_t, 256, 16, 4)
 instantiate_kq_sdpa_gqa_p2(float16_t, 256, 16, 4)

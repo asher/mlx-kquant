@@ -50,6 +50,10 @@ inline std::string kq_gather_stem(const std::string& t, int K) {
 // gathers (qmv / mix / mix_ns) are flat-to-negative under widening at every
 // measured shape and stay NX = 8. KQ_MOE_NX=8|16|32 forces a width for ALL
 // ops (A/B and tests); rows = output rows across the whole dispatch.
+// The threadgroup cap covers MTP-verify widths (t = 2..8): at qwen4exp
+// geometry (E=512 top-10, K=2560 N=640, iq3_xxs/iq4_xs + q8_0 shexp) nx16
+// beats nx8 by 3.6-9.8% at every t in 2..8, still positive at the 7040-tg
+// t=8 point, so the cap sits at 8192 tgs; true prefill grids stay NX = 8.
 inline int kq_moe_pick_nx(int64_t rows, int K, bool two_stream) {
   // Re-read per call only when the variable exists at all (interleaved A/B
   // flips it in-process); unset costs one static check.
@@ -61,7 +65,7 @@ inline int kq_moe_pick_nx(int64_t rows, int K, bool two_stream) {
       return v;
     }
   }
-  if (two_stream && K / 16 >= 32 && (rows * 8) / 64 < 2048) {
+  if (two_stream && K / 16 >= 32 && (rows * 8) / 64 < 8192) {
     return 16;
   }
   return 8;
@@ -69,6 +73,28 @@ inline int kq_moe_pick_nx(int64_t rows, int K, bool two_stream) {
 
 inline const char* kq_nx_suffix(int nx) {
   return nx == 32 ? "_nx32" : (nx == 16 ? "_nx16" : "");
+}
+
+// Slot-parallel mix_ns (_sp): the S slot dots spread across S simdgroup
+// pairs, multiplying resident threads by S without shortening per-thread
+// K-chains (the widening lever that measured flat-to-negative on the
+// single-stream gathers). Outputs are bit-identical to the loop kernel.
+// Solo dispatch -5% at the V4-Flash down shape (the loop kernel's launch
+// ramp is occupancy-shy); E2E -0.1% pipelined / -0.5% naive, direction
+// consistent across 8 runs x 2 loop regimes x both ABA orders. Default: on
+// when the coarse grid underfills the device (decode-scale launches);
+// prefill-scale grids keep the loop kernel. KQ_MOE_SP=1/0 forces on/off;
+// read live once set so in-process A/Bs can flip arms.
+inline bool kq_moe_sp(int64_t coarse_tgs, int S) {
+  if (S < 2 || S > 16) {
+    return false; // threadgroup is 64 * S threads; 1024 cap => S <= 16
+  }
+  static const bool has_env = std::getenv("KQ_MOE_SP") != nullptr;
+  if (has_env) {
+    const char* e = std::getenv("KQ_MOE_SP");
+    return e != nullptr && std::atoi(e) != 0;
+  }
+  return coarse_tgs < 2048;
 }
 
 // KQ_MOE_NX_LOG=1: print each fused-MoE kernel name once (dispatch audit).
@@ -273,9 +299,10 @@ void KQuantMoEGLUKQ::eval_gpu(
   int K = x.shape(-1);
 
   const int nx = kq_moe_pick_nx((int64_t)N * R * T, K, true);
-  std::string kname = "kq_" + kq_gather_stem_nx(kquant_type_, K, nx) +
-      "_moe_glu_gather_" + (biased ? "bias_" : "") + act_ + kq_nx_suffix(nx) +
-      "_" + kq_type_string(x.dtype());
+  const std::string stem = kq_gather_stem_nx(kquant_type_, K, nx);
+  std::string kname = "kq_" + stem + "_moe_glu_gather_" +
+      (biased ? "bias_" : "") + act_ + kq_nx_suffix(nx) + "_" +
+      kq_type_string(x.dtype());
   kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -474,10 +501,11 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
 
   // mix_ns is generic for every codec (no tuned variants) -- plain names.
   // No fine tier: the Ext fine variants measured E2E-neutral and were
-  // dropped.
+  // dropped. Decode-scale launches route to the slot-parallel variant.
   const int nx = kq_moe_pick_nx((int64_t)N * T, K, false);
+  const bool sp = nx == 8 && kq_moe_sp((int64_t)T * (N / 8), S);
   std::string kname = "kq_" + kquant_type_ + "_gather_qmv_mix_ns" +
-      kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
+      (sp ? "_sp" : kq_nx_suffix(nx)) + "_" + kq_type_string(x.dtype());
   kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -490,8 +518,8 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   ce.set_bytes(K, 5);
   ce.set_bytes(N, 6);
   ce.set_bytes(S, 7);
-  MTL::Size group_dims(32, 2, 1);
-  MTL::Size grid_dims(N / (64 / nx), 1, T);
+  MTL::Size group_dims(32, sp ? 2 * S : 2, 1);
+  MTL::Size grid_dims(N / (sp ? 8 : (64 / nx)), 1, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 

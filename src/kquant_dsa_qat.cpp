@@ -135,7 +135,8 @@ void KQDsaKvQat::eval_gpu(
   const int rows = int(x.size() / D);
   const int n_rot = n_rot_;
 
-  const std::string kname = "kq_dsa_kv_qat_" + kq_type_string(x.dtype());
+  const std::string kname = "kq_dsa_kv_qat_" +
+      std::string(f16_round_ ? "" : "nof16_") + kq_type_string(x.dtype());
   auto kernel = kq_get_kernel(d, kname, kname, {});
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -246,10 +247,12 @@ std::vector<mx::Shape> KQDsaKvQat::output_shapes(
 }
 
 bool KQDsaKvQat::is_equivalent(const mx::Primitive& other) const {
-  return n_rot_ == static_cast<const KQDsaKvQat&>(other).n_rot_;
+  const auto& o = static_cast<const KQDsaKvQat&>(other);
+  return n_rot_ == o.n_rot_ && f16_round_ == o.f16_round_;
 }
 
-mx::array dsa_kv_qat(mx::array x, int n_rot, mx::StreamOrDevice s_) {
+mx::array
+dsa_kv_qat(mx::array x, int n_rot, bool f16_round, mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
 
   if (x.ndim() < 1) {
@@ -278,7 +281,7 @@ mx::array dsa_kv_qat(mx::array x, int n_rot, mx::StreamOrDevice s_) {
   return mx::array(
       std::move(out_shape),
       x.dtype(),
-      std::make_shared<KQDsaKvQat>(s, n_rot),
+      std::make_shared<KQDsaKvQat>(s, n_rot, f16_round),
       std::move(inputs));
 }
 

@@ -138,7 +138,12 @@ void KQuantSDPA::eval_gpu(
   // Per-block partials + running max/sum, reduced by pass 2.
   mx::Shape part_shape = {B, n_q_heads, qL, blocks, D};
   mx::Shape red_shape = {B, n_q_heads, qL, blocks};
-  array partials(part_shape, q.dtype(), nullptr, {});
+  // Un-normalized online-softmax accumulator state is unbounded by the
+  // model, so a float16 store can overflow: float16 inputs get f32
+  // partials. bfloat16 has the range and keeps 16-bit stores (pre-fix
+  // bandwidth). Must match the PT instantiation map in kq_sdpa.metal.
+  auto part_dtype = q.dtype() == mx::float16 ? mx::float32 : q.dtype();
+  array partials(part_shape, part_dtype, nullptr, {});
   array sums(red_shape, mx::float32, nullptr, {});
   array maxs(red_shape, mx::float32, nullptr, {});
   partials.set_data(mx::allocator::malloc(partials.nbytes()));
@@ -863,6 +868,67 @@ void KQuantSDPACascade::eval_gpu(
   }
 }
 
+void KQuantSDPABSPrefill::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  const auto& q = inputs[0]; // folded [1, Hkv, n_qt, 48, D]
+  const auto& k = inputs[1];
+  const auto& v = inputs[2];
+  const auto& pages = inputs[3];
+  const auto& pmask = inputs[4];
+  const auto& counts = inputs[5];
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  int n_kv_heads = q.shape(1);
+  int n_qt = q.shape(2);
+  int D = q.shape(4);
+  int S = k.shape(2);
+  int max_pages = pages.shape(1);
+
+  size_t k_head_stride =
+      static_cast<size_t>(k.shape(1) == 1 ? k.strides(0) : k.strides(1));
+  size_t k_seq_stride = static_cast<size_t>(k.strides(2));
+  size_t v_head_stride =
+      static_cast<size_t>(v.shape(1) == 1 ? v.strides(0) : v.strides(1));
+  size_t v_seq_stride = static_cast<size_t>(v.strides(2));
+  float scale = scale_;
+  int offset = offset_;
+
+  std::string ts = kq_type_string(q.dtype());
+  std::string kname = "kq_sdpa_bs_prefill_" + ts + "_" + std::to_string(D);
+  auto kernel = kq_get_kernel(d, kname, kname, {});
+  const size_t tg = (48 / 8) * 32;
+  if (tg > kernel->maxTotalThreadsPerThreadgroup()) {
+    throw std::runtime_error(
+        "[mlx_kquant.sdpa_prefill_block_sparse] threadgroup of " +
+        std::to_string(tg) + " threads exceeds this GPU's pipeline limit (" +
+        std::to_string(kernel->maxTotalThreadsPerThreadgroup()) + ").");
+  }
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(q, 0);
+  ce.set_input_array(k, 1);
+  ce.set_input_array(v, 2);
+  ce.set_output_array(out, 3);
+  ce.set_bytes(S, 4);
+  ce.set_bytes(k_head_stride, 5);
+  ce.set_bytes(k_seq_stride, 6);
+  ce.set_bytes(v_head_stride, 7);
+  ce.set_bytes(v_seq_stride, 8);
+  ce.set_bytes(scale, 9);
+  ce.set_bytes(offset, 10);
+  ce.set_bytes(max_pages, 11);
+  ce.set_input_array(pages, 12);
+  ce.set_input_array(pmask, 13);
+  ce.set_input_array(counts, 14);
+  MTL::Size group_dims(32, tg / 32, 1);
+  MTL::Size grid_dims(n_kv_heads, n_qt, 1);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 #else // !_METAL_
 
 void KQuantSDPA::eval_gpu(
@@ -883,6 +949,13 @@ void KQuantSDPAFAVerify::eval_gpu(
     std::vector<mx::array>&) {
   throw std::runtime_error(
       "[mlx_kquant.sdpa_fa_verify] requires a Metal build.");
+}
+
+void KQuantSDPABSPrefill::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.sdpa_prefill_block_sparse] requires a Metal build.");
 }
 
 void KQuantSDPACascade::eval_gpu(
@@ -1104,7 +1177,8 @@ static std::vector<mx::array> sdpa_decode_gqa_impl(
   // Instantiated (D, C) pairs: threadgroup K+V tiles cap at 16 KB so two
   // threadgroups co-reside per core (D=64/128: C 32/16; 256: 16/8; 512: 8).
   const bool tile_ok = (D <= 128 && (tile_c == 32 || tile_c == 16)) ||
-      (D == 256 && (tile_c == 16 || tile_c == 8)) || (D == 512 && tile_c == 8);
+      (D == 256 && (tile_c == 16 || tile_c == 8 || tile_c == 4)) ||
+      (D == 512 && tile_c == 8);
   if (!tile_ok) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa] tile_c not instantiated for this "
@@ -1214,6 +1288,7 @@ mx::array sdpa_decode_gqa_paged(
     float scale,
     mx::array pages,
     int splits,
+    int tile_c,
     const std::optional<mx::array>& starts,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
@@ -1255,8 +1330,23 @@ mx::array sdpa_decode_gqa_paged(
     throw std::invalid_argument(
         std::string(op) + "splits must be in [0, 128].");
   }
-  // Page unit is the head dim's staged tile height.
-  const int tile_c = D <= 128 ? 32 : D == 256 ? 16 : 8;
+  // Page unit is the staged tile height: the head dim's default, or an
+  // explicit smaller instantiated tile (4 at D=256 -- block-sparse
+  // attention whose selection unit is 4 tokens, e.g. qwen4exp QSA).
+  if (tile_c == 0) {
+    tile_c = D <= 128 ? 32 : D == 256 ? 16 : 8;
+  }
+  const bool ptile_ok = tile_c ==
+          (D <= 128       ? 32
+               : D == 256 ? 16
+                          : 8) ||
+      (D == 256 && tile_c == 4);
+  if (!ptile_ok) {
+    throw std::invalid_argument(
+        std::string(op) +
+        "tile_c not instantiated for this head_dim (0 picks the default; "
+        "4 is available at head_dim 256).");
+  }
   if (pages.dtype() != mx::int32 || pages.ndim() != 3 || pages.shape(0) != B ||
       pages.shape(1) != n_kv_heads || pages.shape(2) < 1) {
     throw std::invalid_argument(
@@ -1645,6 +1735,13 @@ void KQuantSDPAFAVerify::eval_cpu(
       "[mlx_kquant.sdpa_fa_verify] has no CPU implementation.");
 }
 
+void KQuantSDPABSPrefill::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.sdpa_prefill_block_sparse] has no CPU implementation.");
+}
+
 void KQuantSDPACascade::eval_cpu(
     const std::vector<mx::array>&,
     std::vector<mx::array>&) {
@@ -1814,7 +1911,8 @@ std::vector<mx::array> sdpa_decode_gqa_cascade(
     tile_c = tile_default;
   }
   const bool tile_ok = (D <= 128 && (tile_c == 32 || tile_c == 16)) ||
-      (D == 256 && (tile_c == 16 || tile_c == 8)) || (D == 512 && tile_c == 8);
+      (D == 256 && (tile_c == 16 || tile_c == 8 || tile_c == 4)) ||
+      (D == 512 && tile_c == 8);
   if (!tile_ok) {
     throw std::invalid_argument(
         std::string(op) + "tile_c not instantiated for this head_dim.");
@@ -1915,6 +2013,106 @@ bool KQuantSDPAFAVerify::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantSDPAFAVerify&>(other);
   return scale_ == o.scale_ && q_len_ == o.q_len_ && splits_ == o.splits_ &&
       return_lse_ == o.return_lse_;
+}
+
+std::vector<mx::Shape> KQuantSDPABSPrefill::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  return {inputs[0].shape()};
+}
+
+bool KQuantSDPABSPrefill::is_equivalent(const mx::Primitive& other) const {
+  auto& o = static_cast<const KQuantSDPABSPrefill&>(other);
+  return scale_ == o.scale_ && offset_ == o.offset_;
+}
+
+mx::array sdpa_prefill_block_sparse(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    mx::array pages,
+    mx::array pmask,
+    mx::array counts,
+    int offset,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const char* op = "[mlx_kquant.sdpa_prefill_block_sparse] ";
+  if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4) {
+    throw std::invalid_argument(std::string(op) + "q/k/v must be 4-D.");
+  }
+  int B = q.shape(0);
+  int n_q_heads = q.shape(1);
+  int L = q.shape(2);
+  int D = q.shape(3);
+  int n_kv_heads = k.shape(1);
+  int S = k.shape(2);
+  if (B != 1 || k.shape(0) != 1 || v.shape(0) != 1) {
+    throw std::invalid_argument(std::string(op) + "batch size must be 1.");
+  }
+  if (D != 256 || k.shape(3) != D || v.shape(3) != D) {
+    throw std::invalid_argument(
+        std::string(op) + "only head_dim 256 is instantiated.");
+  }
+  auto dt = q.dtype();
+  if (dt != mx::float16 && dt != mx::bfloat16) {
+    throw std::invalid_argument(
+        std::string(op) + "q must be float16 or bfloat16.");
+  }
+  if (k.dtype() != dt || v.dtype() != dt) {
+    throw std::invalid_argument(
+        std::string(op) + "q, k, v must share a dtype.");
+  }
+  if (n_kv_heads == 0 || n_q_heads != 12 * n_kv_heads) {
+    throw std::invalid_argument(
+        std::string(op) + "gqa factor must be 12 (48-row fold).");
+  }
+  if (L < 4 || L % 4 != 0) {
+    throw std::invalid_argument(
+        std::string(op) + "query length must be a positive multiple of 4.");
+  }
+  if (offset < 0 || offset + L > S) {
+    throw std::invalid_argument(
+        std::string(op) + "offset + query length must be <= key length.");
+  }
+  int n_qt = L / 4;
+  if (pages.dtype() != mx::int32 || pages.ndim() != 2 ||
+      pages.shape(0) != n_qt || pages.shape(1) < 1) {
+    throw std::invalid_argument(
+        std::string(op) +
+        "pages must be int32 [L / 4, max_pages] (-1 padded).");
+  }
+  if (pmask.dtype() != mx::uint16 || pmask.shape() != pages.shape()) {
+    throw std::invalid_argument(
+        std::string(op) + "pmask must be uint16 with pages' shape.");
+  }
+  if (counts.dtype() != mx::int32 || counts.size() != (size_t)n_qt) {
+    throw std::invalid_argument(
+        std::string(op) + "counts must be int32 with one entry per window.");
+  }
+
+  // Fold [1, Hq, L, D] -> [1, Hkv, n_qt, 12 * 4, D] with kv-major heads.
+  auto qf = mx::reshape(q, {1, n_kv_heads, 12, n_qt, 4, D}, s);
+  qf = mx::transpose(qf, {0, 1, 3, 2, 4, 5}, s);
+  qf = mx::reshape(qf, {1, n_kv_heads, n_qt, 48, D}, s);
+  auto q_c = mx::contiguous(qf, false, s);
+  auto k_c = k.strides().back() == 1 ? k : mx::contiguous(k, false, s);
+  auto v_c = v.strides().back() == 1 ? v : mx::contiguous(v, false, s);
+
+  auto prim = std::make_shared<KQuantSDPABSPrefill>(s, scale, offset);
+  std::vector<mx::array> inputs = {
+      std::move(q_c),
+      std::move(k_c),
+      std::move(v_c),
+      mx::contiguous(pages, false, s),
+      mx::contiguous(pmask, false, s),
+      mx::contiguous(mx::reshape(counts, {n_qt}, s), false, s)};
+  mx::array folded(
+      {1, n_kv_heads, n_qt, 48, D}, dt, std::move(prim), std::move(inputs));
+
+  // Unfold back to [1, Hq, L, D].
+  auto o = mx::reshape(folded, {1, n_kv_heads, n_qt, 12, 4, D}, s);
+  o = mx::transpose(o, {0, 1, 3, 2, 4, 5}, s);
+  return mx::reshape(o, {1, n_q_heads, L, D}, s);
 }
 
 static std::vector<mx::array> sdpa_fa_verify_impl(

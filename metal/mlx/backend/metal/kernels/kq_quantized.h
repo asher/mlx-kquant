@@ -6,6 +6,99 @@
 
 #include "mlx/backend/metal/kernels/kq_quantized_iq_tables.h"
 
+// Byte -> packed float bit patterns of (low-nibble value, high-nibble
+// value) from kvalues_iq4nl; read with as_type<float2>. One gather
+// replaces two kvalues gathers plus two int->float converts; the floats
+// are the exact codebook values, so results are bit-identical to the
+// per-nibble form. Packed into scalar uint64 like the iq2/iq1 grids.
+static const constant uint64_t kq_iq4nl_pairs[256] = {
+    0xc2fe0000c2fe0000ull, 0xc2fe0000c2d00000ull, 0xc2fe0000c2a60000ull,
+    0xc2fe0000c2820000ull, 0xc2fe0000c2440000ull, 0xc2fe0000c20c0000ull,
+    0xc2fe0000c1b00000ull, 0xc2fe0000c1200000ull, 0xc2fe00003f800000ull,
+    0xc2fe000041500000ull, 0xc2fe000041c80000ull, 0xc2fe000042180000ull,
+    0xc2fe000042540000ull, 0xc2fe0000428a0000ull, 0xc2fe000042b20000ull,
+    0xc2fe000042e20000ull, 0xc2d00000c2fe0000ull, 0xc2d00000c2d00000ull,
+    0xc2d00000c2a60000ull, 0xc2d00000c2820000ull, 0xc2d00000c2440000ull,
+    0xc2d00000c20c0000ull, 0xc2d00000c1b00000ull, 0xc2d00000c1200000ull,
+    0xc2d000003f800000ull, 0xc2d0000041500000ull, 0xc2d0000041c80000ull,
+    0xc2d0000042180000ull, 0xc2d0000042540000ull, 0xc2d00000428a0000ull,
+    0xc2d0000042b20000ull, 0xc2d0000042e20000ull, 0xc2a60000c2fe0000ull,
+    0xc2a60000c2d00000ull, 0xc2a60000c2a60000ull, 0xc2a60000c2820000ull,
+    0xc2a60000c2440000ull, 0xc2a60000c20c0000ull, 0xc2a60000c1b00000ull,
+    0xc2a60000c1200000ull, 0xc2a600003f800000ull, 0xc2a6000041500000ull,
+    0xc2a6000041c80000ull, 0xc2a6000042180000ull, 0xc2a6000042540000ull,
+    0xc2a60000428a0000ull, 0xc2a6000042b20000ull, 0xc2a6000042e20000ull,
+    0xc2820000c2fe0000ull, 0xc2820000c2d00000ull, 0xc2820000c2a60000ull,
+    0xc2820000c2820000ull, 0xc2820000c2440000ull, 0xc2820000c20c0000ull,
+    0xc2820000c1b00000ull, 0xc2820000c1200000ull, 0xc28200003f800000ull,
+    0xc282000041500000ull, 0xc282000041c80000ull, 0xc282000042180000ull,
+    0xc282000042540000ull, 0xc2820000428a0000ull, 0xc282000042b20000ull,
+    0xc282000042e20000ull, 0xc2440000c2fe0000ull, 0xc2440000c2d00000ull,
+    0xc2440000c2a60000ull, 0xc2440000c2820000ull, 0xc2440000c2440000ull,
+    0xc2440000c20c0000ull, 0xc2440000c1b00000ull, 0xc2440000c1200000ull,
+    0xc24400003f800000ull, 0xc244000041500000ull, 0xc244000041c80000ull,
+    0xc244000042180000ull, 0xc244000042540000ull, 0xc2440000428a0000ull,
+    0xc244000042b20000ull, 0xc244000042e20000ull, 0xc20c0000c2fe0000ull,
+    0xc20c0000c2d00000ull, 0xc20c0000c2a60000ull, 0xc20c0000c2820000ull,
+    0xc20c0000c2440000ull, 0xc20c0000c20c0000ull, 0xc20c0000c1b00000ull,
+    0xc20c0000c1200000ull, 0xc20c00003f800000ull, 0xc20c000041500000ull,
+    0xc20c000041c80000ull, 0xc20c000042180000ull, 0xc20c000042540000ull,
+    0xc20c0000428a0000ull, 0xc20c000042b20000ull, 0xc20c000042e20000ull,
+    0xc1b00000c2fe0000ull, 0xc1b00000c2d00000ull, 0xc1b00000c2a60000ull,
+    0xc1b00000c2820000ull, 0xc1b00000c2440000ull, 0xc1b00000c20c0000ull,
+    0xc1b00000c1b00000ull, 0xc1b00000c1200000ull, 0xc1b000003f800000ull,
+    0xc1b0000041500000ull, 0xc1b0000041c80000ull, 0xc1b0000042180000ull,
+    0xc1b0000042540000ull, 0xc1b00000428a0000ull, 0xc1b0000042b20000ull,
+    0xc1b0000042e20000ull, 0xc1200000c2fe0000ull, 0xc1200000c2d00000ull,
+    0xc1200000c2a60000ull, 0xc1200000c2820000ull, 0xc1200000c2440000ull,
+    0xc1200000c20c0000ull, 0xc1200000c1b00000ull, 0xc1200000c1200000ull,
+    0xc12000003f800000ull, 0xc120000041500000ull, 0xc120000041c80000ull,
+    0xc120000042180000ull, 0xc120000042540000ull, 0xc1200000428a0000ull,
+    0xc120000042b20000ull, 0xc120000042e20000ull, 0x3f800000c2fe0000ull,
+    0x3f800000c2d00000ull, 0x3f800000c2a60000ull, 0x3f800000c2820000ull,
+    0x3f800000c2440000ull, 0x3f800000c20c0000ull, 0x3f800000c1b00000ull,
+    0x3f800000c1200000ull, 0x3f8000003f800000ull, 0x3f80000041500000ull,
+    0x3f80000041c80000ull, 0x3f80000042180000ull, 0x3f80000042540000ull,
+    0x3f800000428a0000ull, 0x3f80000042b20000ull, 0x3f80000042e20000ull,
+    0x41500000c2fe0000ull, 0x41500000c2d00000ull, 0x41500000c2a60000ull,
+    0x41500000c2820000ull, 0x41500000c2440000ull, 0x41500000c20c0000ull,
+    0x41500000c1b00000ull, 0x41500000c1200000ull, 0x415000003f800000ull,
+    0x4150000041500000ull, 0x4150000041c80000ull, 0x4150000042180000ull,
+    0x4150000042540000ull, 0x41500000428a0000ull, 0x4150000042b20000ull,
+    0x4150000042e20000ull, 0x41c80000c2fe0000ull, 0x41c80000c2d00000ull,
+    0x41c80000c2a60000ull, 0x41c80000c2820000ull, 0x41c80000c2440000ull,
+    0x41c80000c20c0000ull, 0x41c80000c1b00000ull, 0x41c80000c1200000ull,
+    0x41c800003f800000ull, 0x41c8000041500000ull, 0x41c8000041c80000ull,
+    0x41c8000042180000ull, 0x41c8000042540000ull, 0x41c80000428a0000ull,
+    0x41c8000042b20000ull, 0x41c8000042e20000ull, 0x42180000c2fe0000ull,
+    0x42180000c2d00000ull, 0x42180000c2a60000ull, 0x42180000c2820000ull,
+    0x42180000c2440000ull, 0x42180000c20c0000ull, 0x42180000c1b00000ull,
+    0x42180000c1200000ull, 0x421800003f800000ull, 0x4218000041500000ull,
+    0x4218000041c80000ull, 0x4218000042180000ull, 0x4218000042540000ull,
+    0x42180000428a0000ull, 0x4218000042b20000ull, 0x4218000042e20000ull,
+    0x42540000c2fe0000ull, 0x42540000c2d00000ull, 0x42540000c2a60000ull,
+    0x42540000c2820000ull, 0x42540000c2440000ull, 0x42540000c20c0000ull,
+    0x42540000c1b00000ull, 0x42540000c1200000ull, 0x425400003f800000ull,
+    0x4254000041500000ull, 0x4254000041c80000ull, 0x4254000042180000ull,
+    0x4254000042540000ull, 0x42540000428a0000ull, 0x4254000042b20000ull,
+    0x4254000042e20000ull, 0x428a0000c2fe0000ull, 0x428a0000c2d00000ull,
+    0x428a0000c2a60000ull, 0x428a0000c2820000ull, 0x428a0000c2440000ull,
+    0x428a0000c20c0000ull, 0x428a0000c1b00000ull, 0x428a0000c1200000ull,
+    0x428a00003f800000ull, 0x428a000041500000ull, 0x428a000041c80000ull,
+    0x428a000042180000ull, 0x428a000042540000ull, 0x428a0000428a0000ull,
+    0x428a000042b20000ull, 0x428a000042e20000ull, 0x42b20000c2fe0000ull,
+    0x42b20000c2d00000ull, 0x42b20000c2a60000ull, 0x42b20000c2820000ull,
+    0x42b20000c2440000ull, 0x42b20000c20c0000ull, 0x42b20000c1b00000ull,
+    0x42b20000c1200000ull, 0x42b200003f800000ull, 0x42b2000041500000ull,
+    0x42b2000041c80000ull, 0x42b2000042180000ull, 0x42b2000042540000ull,
+    0x42b20000428a0000ull, 0x42b2000042b20000ull, 0x42b2000042e20000ull,
+    0x42e20000c2fe0000ull, 0x42e20000c2d00000ull, 0x42e20000c2a60000ull,
+    0x42e20000c2820000ull, 0x42e20000c2440000ull, 0x42e20000c20c0000ull,
+    0x42e20000c1b00000ull, 0x42e20000c1200000ull, 0x42e200003f800000ull,
+    0x42e2000041500000ull, 0x42e2000041c80000ull, 0x42e2000042180000ull,
+    0x42e2000042540000ull, 0x42e20000428a0000ull, 0x42e2000042b20000ull,
+    0x42e2000042e20000ull};
+
 using namespace metal;
 
 #define MLX_MTL_CONST static constant constexpr const
@@ -20,7 +113,9 @@ template <
     const bool aligned_N,
     const int BM = 32,
     const int BK = 32,
-    const int BN = 32>
+    const int BN = 32,
+    const int WM = 2,
+    const int WN = 2>
 METAL_FUNC void kq_qmm_t_impl(
     const device uint8_t* w,
     const device T* x,
@@ -40,8 +135,7 @@ METAL_FUNC void kq_qmm_t_impl(
 
   (void)lid;
 
-  constexpr int WM = 2;
-  constexpr int WN = 2;
+  static_assert(WM * WN == 4, "the tile runs on four simdgroups");
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
   using mma_t = mlx::steel::BlockMMA<
@@ -564,6 +658,21 @@ METAL_FUNC void kq_adjust_matrix_offsets(
   y += tid.z * output_stride;
 }
 
+// Scaled chunk dequant for the ext mat-vec loops, reading constant-space
+// tables. Same contract as KqTgLuts::deq_chunk16s without staging. Codecs
+// with no hoistable scale pass scale = 1 and unchanged weights.
+template <typename Codec>
+struct KqExtDeq {
+  static METAL_FUNC void deq_chunk16s(
+      const device uint8_t* block,
+      short il,
+      thread float4x4& reg,
+      thread float& scale) {
+    Codec::deq_chunk16(block, il, reg);
+    scale = 1.0f;
+  }
+};
+
 // ---------------------------------------------------------------------------
 // Flat-with-M verify mat-vec (port of ggml-metal kernel_mul_mv_ext_q4x4),
 // codec-agnostic. The per-row qmv puts M on grid_dims.x, so each of the M rows
@@ -627,7 +736,8 @@ METAL_FUNC void kq_mv_ext_impl(
     const device uint8_t* block =
         w_row + static_cast<int64_t>(ib) * Codec::block_bytes;
     float4x4 lx;
-    Codec::deq_chunk16(block, cch, lx);
+    float sc;
+    KqExtDeq<Codec>::deq_chunk16s(block, cch, lx, sc);
 #pragma unroll
     for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
       const device T* yp = y_col[ir1];
@@ -635,8 +745,8 @@ METAL_FUNC void kq_mv_ext_impl(
       const float4 a1 = float4(*(const device vec<T, 4>*)(yp + 4));
       const float4 a2 = float4(*(const device vec<T, 4>*)(yp + 8));
       const float4 a3 = float4(*(const device vec<T, 4>*)(yp + 12));
-      sumf[ir1] +=
-          dot(lx[0], a0) + dot(lx[1], a1) + dot(lx[2], a2) + dot(lx[3], a3);
+      sumf[ir1] += sc *
+          (dot(lx[0], a0) + dot(lx[1], a1) + dot(lx[2], a2) + dot(lx[3], a3));
       y_col[ir1] += nxpsg * 16;
     }
   }
@@ -739,111 +849,6 @@ METAL_FUNC void kq_mv_ext_hd_impl(
       const vec<T, 2> p2 = pa.xy + pa.zw;
       sumf[ir1] += float(p2.x) + float(p2.y);
       y_col[ir1] += nxpsg * 16;
-    }
-  }
-
-#pragma unroll
-  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-    if (nxpsg >= 32) {
-      sumf[ir1] += simd_shuffle_down(sumf[ir1], 16);
-    }
-    if (nxpsg >= 16) {
-      sumf[ir1] += simd_shuffle_down(sumf[ir1], 8);
-    }
-    if (nxpsg >= 8) {
-      sumf[ir1] += simd_shuffle_down(sumf[ir1], 4);
-    }
-    if (nxpsg >= 4) {
-      sumf[ir1] += simd_shuffle_down(sumf[ir1], 2);
-    }
-    if (nxpsg >= 2) {
-      sumf[ir1] += simd_shuffle_down(sumf[ir1], 1);
-    }
-  }
-
-  if (tx == 0 && i01 < out_vec_size) {
-#pragma unroll
-    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-      y[static_cast<int64_t>(i11 + ir1) * out_vec_size + i01] =
-          static_cast<T>(sumf[ir1]);
-    }
-  }
-}
-
-// Staged-activation variant of kq_mv_ext_impl (suffix _ts). Weights stay in
-// registers exactly as in the base kernel; the change is the activation
-// path, the one lever the falsified variants never isolated: sb swapped
-// loads for shuffles (worse throughput), nr2 amortized via registers
-// (spilled), x16/x32 only changed which thread issues the loads. Here the
-// M x (nxpsg*16) activation window stages into threadgroup memory once per
-// K-step via a cooperative load, every row-thread dots from on-core SRAM,
-// and the threadgroup carries nsg_ts simdgroups (32 rows at nsg_ts=8) so
-// cross-TG device activation traffic drops rows_per_tg/8-fold vs the base
-// kernel. Dot arithmetic is bit-identical to base (staging is a copy).
-// K must be a multiple of nxpsg*16 (q6_k superblock 256 guarantees it).
-template <typename T, typename Codec, short r1ptg, short nsg, short nxpsg>
-METAL_FUNC void kq_mv_ext_ts_impl(
-    const device uint8_t* w,
-    const device T* x,
-    device T* y,
-    threadgroup T* staged, // r1ptg * nxpsg * 16 elements
-    const constant int& in_vec_size, // K
-    const constant int& out_vec_size, // N
-    uint3 tgpig,
-    ushort tiisg,
-    ushort sgitg) {
-  constexpr short nypsg = 32 / nxpsg; // output rows per simdgroup
-  constexpr short chpb = Codec::superblock / 16; // 16-weight chunks per block
-  constexpr short stage_w = nxpsg * 16; // staged K-window elements per row
-  const short tx = tiisg % nxpsg; // K position within the row group
-  const short ty = tiisg / nxpsg; // which of nypsg rows this thread owns
-
-  const int i01 = tgpig.x * (nypsg * nsg) + nypsg * sgitg + ty; // output row
-  const int i11 = tgpig.y * r1ptg; // first activation column (grid.y==1 -> 0)
-
-  const int nb = in_vec_size / Codec::superblock;
-  const int row_bytes = nb * Codec::block_bytes;
-  // Clamp OOB rows to row 0 for a valid read; the store is masked below.
-  const device uint8_t* w_row =
-      (i01 < out_vec_size) ? w + static_cast<int64_t>(i01) * row_bytes : w;
-
-  const short lin = sgitg * 32 + tiisg; // linear thread id in the TG
-  constexpr short tg_threads = nsg * 32;
-
-  float sumf[r1ptg];
-#pragma unroll
-  for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-    sumf[ir1] = 0.0f;
-  }
-
-  for (int base = 0; 16 * base < in_vec_size; base += nxpsg) {
-    // Cooperative stage of the M x stage_w activation window.
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const int kw = 16 * base;
-    for (short f = lin; f < r1ptg * stage_w; f += tg_threads) {
-      const short ir1 = f / stage_w;
-      const short j = f % stage_w;
-      staged[f] = x[static_cast<int64_t>(i11 + ir1) * in_vec_size + kw + j];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const int ich = base + tx;
-    const int ib = ich / chpb; // super-block index
-    const short cch = ich % chpb; // chunk within super-block
-    const device uint8_t* block =
-        w_row + static_cast<int64_t>(ib) * Codec::block_bytes;
-    float4x4 lx;
-    Codec::deq_chunk16(block, cch, lx);
-    const threadgroup T* sp = staged + tx * 16;
-#pragma unroll
-    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-      const threadgroup T* yp = sp + ir1 * stage_w;
-      const float4 a0 = float4(*(const threadgroup vec<T, 4>*)(yp + 0));
-      const float4 a1 = float4(*(const threadgroup vec<T, 4>*)(yp + 4));
-      const float4 a2 = float4(*(const threadgroup vec<T, 4>*)(yp + 8));
-      const float4 a3 = float4(*(const threadgroup vec<T, 4>*)(yp + 12));
-      sumf[ir1] +=
-          dot(lx[0], a0) + dot(lx[1], a1) + dot(lx[2], a2) + dot(lx[3], a3);
     }
   }
 
@@ -1512,7 +1517,12 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits, bool aligned_N>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    int small_bm = 0>
 [[kernel]] void kq_q8_0_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -1530,7 +1540,9 @@ template <typename T, int group_size, int bits, bool aligned_N>
   static_assert(
       group_size == KQ_Q8_0_GROUP, "Q8_0 kernel requires group_size=32");
   static_assert(bits == 8, "Q8_0 kernel requires bits=8");
-  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BM = small_bm ? small_bm : 32;
+  constexpr int BK = 32, BN = small_bm ? 64 : 32;
+  constexpr int WM = BM == 8 ? 1 : 2, WN = 4 / WM;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -1548,7 +1560,7 @@ template <typename T, int group_size, int bits, bool aligned_N>
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       wl,
       x,
       y,

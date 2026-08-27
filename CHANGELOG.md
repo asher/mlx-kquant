@@ -6,6 +6,152 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1]
+
+### Added
+- sdpa_prefill_block_sparse: block-sparse FA prefill for QSA-style block
+  selection at head_dim 256. Queries fold into 4-wide windows (with the
+  GQA-12 group, 48 MMA rows); each window walks only its own 4-row page
+  list with per-page membership bitmasks, so a prefill chunk pays for the
+  selected blocks instead of the full key axis, with no [L, S] mask
+  materialized.
+- sdpa_decode_gqa_paged takes tile_c: 4-row pages are instantiated at
+  head_dim 256 so block-sparse attention with a 4-token selection unit
+  (qwen4exp QSA) can walk its selected blocks directly, with no
+  gathered K/V copy per token.
+- hc_lowrank_norm / hc_lowrank_front / hc_lowrank_epilogue: fused
+  low-rank hyper-connection ops for qwen4exp decode. Grouped rms norm in
+  one dispatch; q8_0 down qmv, silu and the float32 inject dots in a
+  second; up qmv, sigmoid gate and the stream mean in a third.
+- KQ_QMM_LOG=1 logs the dispatched qmm kernel name and shape to stderr
+  (routing-diagnosis lever for the ALU/NAX qmm paths).
+
+### Changed
+- The seven grid-codebook GEMM block loaders (iq1_s, iq1_m, iq2_xxs,
+  iq2_xs, iq2_s, iq3_xxs, iq3_s) decode a whole 8-weight group per step:
+  one grid-word load, uchar4/char4 reinterpret, vector sign fold and
+  vec4 threadgroup stores replace the per-weight byte/gather/store
+  chain. Bit-identical outputs. On machines with no NAX tile the GEMM
+  spread across IQ codecs drops from 1.63x to about 1.07x (M3 Max,
+  [12288x4096] M=512: iq2_xs -26%, iq1_m -35%, iq1_s -22%, iq2_s -18%),
+  which moves iq2_s/iq2_xs prefill from behind llama.cpp to ahead of it
+  at the same shape.
+- iq4_xs and iq4_nl decode through a shared 256-entry byte-to-float-pair
+  table (kq_iq4nl_pairs) instead of two kvalues_iq4nl gathers plus two
+  int-to-float converts per quant byte; bit-identical by construction.
+  Applied to the iq4_xs qmv, GEMM loader and mv_ext chunk dequant and
+  the iq4_nl GEMM loader (M3 Max: iq4_xs GEMM -8.6%, now at the
+  grid-codec floor; mv_ext at M=8 -34%; qmv -2%).
+- iq3_s qmv derives both grid indices from one shifted qh word (-3%
+  decode on M3 Max); iq1_m qmv hoists its lane-invariant scale offsets.
+
+## [0.4.0]
+
+### Changed
+- Requires mlx 0.32.1 (was 0.31.2). This is the breaking change behind
+  the major-minor bump: environments pinned to mlx 0.31.x must stay on
+  mlx-kquant 0.3.x.
+- The arena keeps a standalone Metal residency set. mlx 0.32 made its
+  queue-attached residency set private and budgeted by set_wired_limit;
+  the arena's GPU mappings now stay resident without consuming that
+  budget, so streaming-mode servers can run with the wired limit at zero.
+- Builds against nanobind 2.13.0 (was 2.12.0).
+- Quantized matmul at 4 to 8 rows is faster on machines with no NAX tile:
+  an 8-row split-K tile (one simdgroup along M, four along N) replaces the
+  16-row tile there, so a speculative verify of 8 rows pays for 8 rows of
+  MMA instead of 16. Measured on M3 Max at the Qwen3.8-27B projection
+  shapes, 8 rows: q4_k 0.73x, q6_k 0.75-0.80x, q8_0 0.82-0.85x of the
+  16-row tile. `KQ_QMM_SPLITK_BM8=0` keeps the 16-row tile.
+- Every split-K codec enters the non-NAX route at a re-measured row count
+  (q4_k, q6_k, q2_k, iq2_xxs at 4; q5_k, q8_0, iq4_nl, iq3_xxs, iq3_s at 5;
+  q3_k 6; iq4_xs, iq2_s 8; iq2_xs 12; iq1_s, iq1_m 13). iq2_xxs, iq2_xs,
+  iq1_s and iq1_m were on the environment lever only. 1-row decode is
+  unchanged.
+
+### Fixed
+- sdpa_vector's float16 pass-1 partials could overflow to inf under long
+  flat attention with large V outliers; they now store as float32
+  (bfloat16 partials are unchanged).
+
+## [0.3.13]
+
+### Changed
+- Quantized matmul is faster from 2 to 32 rows on machines with no NAX tile,
+  which is the band a speculative-decoding verify step runs in. A 16-row
+  split-K tile carries M <= 16, and each codec enters the route at its own
+  measured row count. Measured on M3 Max at [17920x6656], 16 rows: q4_k
+  5.6 -> 1.9 ms, iq4_nl 4.1 -> 1.5, iq3_xxs 4.2 -> 1.7, iq3_s 4.3 -> 1.8,
+  iq4_xs 4.7 -> 2.6. Single-row decode keeps its own route and is unchanged.
+- `KQ_QMM_SPLITK` forces or disables that route for every codec it supports.
+  iq2_xxs, iq2_xs, iq1_s and iq1_m have no measured entry point, because ggml
+  refuses to encode them without an importance matrix, so they stay on the
+  environment lever.
+- Speculative verify is faster on NAX hardware: a target forward of 8-32
+  rows now costs about 1.4x a single-row forward instead of about 2x, so
+  drafted tokens ride the weight read instead of paying per row. Measured
+  1.40x per full forward at verify widths on a 30B q4_k model.
+- The NAX split-K tile covers every codec that has NAX kernels, not just
+  q6_k and q8_0. Per-call wins from the routing entry are 1.05-1.25x
+  worst-shape and up to 2.5x on small-N projections, biggest for the
+  grid-dequant IQ codecs.
+- `KQ_QMM_SPLITK_NAX` unset now takes a measured per-codec entry M rather
+  than disabling the route. Set it to 0 to disable, or to a split count to
+  force the route at every width up to 32.
+- The non-NAX split-K entry points are picked per device instead of from one
+  table, so NAX machines running with the tile forced off get their own
+  measured entries.
+- `KQ_QMM_SPLITK` now takes effect when NAX is disabled by environment on
+  NAX hardware. It keyed off the hardware rather than the active route, so
+  that combination silently fell back to the plain tile.
+
+### Removed
+- `KQ_MV_EXT_TS` and its staged-activation kernels. Against the current
+  BM=32 tile the route is 0.27-0.72x, so it loses at every width it covered.
+
+## [0.3.12]
+
+### Added
+- `dsa_kv_qat` takes `f16_round=False`, which stops at the fp8 result and
+  copies the RoPE tail through unchanged. Fuses the DeepSeek-V4 compressor
+  emit-path quantization, which has no f16 cache step, into one dispatch.
+
+### Changed
+- IQ4_NL decode is faster, because each mat-vec lane now reads eight weights
+  instead of one. IQ4_NL no longer trails the other 4-bit codecs.
+- IQ4_XS decode is faster, because each mat-vec lane now reads a quant byte
+  once and uses both nibbles instead of dropping one.
+- IQ4_XS prefill is faster, because the tensor-core loader now reads the
+  quant bytes with vector loads and uses both nibbles of each byte. IQ4_XS
+  prefill no longer trails the other 4-bit codecs.
+
+## [0.3.11]
+
+### Changed
+- MoE prefill gather (sorted-rhs NAX path) is 12-28% faster per call
+  below ~64 rows per expert, biggest at 128-529-token chunks on top-8
+  256-expert shapes (bit-identical; KQ_GATHER_RHS_NAX_BM forces the
+  tile height).
+
+## [0.3.10]
+
+### Added
+- `skinny_matmul`: x @ w.T at token widths 1..16 against small-N large-K
+  nn.Linear-layout weights, 4-8x faster than the stock GEMM at widths
+  2..16 (router gates, indexer projections at speculative verify widths).
+- `hc_front_reduce` / `hc_front_expand_reduce` / `hc_sinkhorn_collapse` /
+  `hc_expand`: fused deepseek4 hyper-connection glue for single-token
+  decode; replaces ~176 python kernel launches per step with 4 native ops.
+- `get_cb_caps` / `set_cb_caps`: runtime read/write of MLX's command
+  buffer split caps, so a server can run coarse buffers during decode and
+  fine buffers during deep prefill.
+
+### Changed
+- iq2_xxs / iq2_xs / iq2_s / iq3_s MoE gather decode is 9-12% faster per
+  call (hoisted block scale, byte-indexed grids); the ext mat-vec at
+  verify widths 2..8 gains 7-10% on the same codecs.
+- Score-mixed MoE down gather gains a slot-parallel kernel at decode
+  scale (bit-identical; KQ_MOE_SP forces either form).
+
 ## [0.3.9]
 
 ### Changed

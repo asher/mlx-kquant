@@ -2527,14 +2527,27 @@ struct KqNaxIq4_xsBlockLoader {
     const int ls = ((scales_l[sb / 2] >> (4 * (sb & 1))) & 0xf) |
         (((scales_h >> (2 * sb)) & 3) << 4);
     const float dl = d * float(ls - 32);
-    const device uint8_t* qs = src + KQ_IQ4_XS_QS_OFFSET + sb * 16;
+    // A byte holds two weights of the sub-block. The low nibble gives
+    // weight b and the high nibble gives weight b + 16. Read the 16 quant
+    // bytes with two uint2 loads and use both nibbles, instead of one byte
+    // load per weight that drops a nibble. The quants of sub-block sb start
+    // at byte 8 + 16 * sb of a 136-byte block. Both terms divide by 8, so
+    // the uint2 loads are aligned.
+    const device uint2* qw = reinterpret_cast<const device uint2*>(
+        src + KQ_IQ4_XS_QS_OFFSET + sb * 16);
+    const uint2 q01 = qw[0];
+    const uint2 q23 = qw[1];
+    const uint qword[4] = {q01.x, q01.y, q23.x, q23.y};
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int p = i;
-      const bool is_high = p >= 16;
-      const int b = is_high ? (p - 16) : p;
-      const int nib = is_high ? (qs[b] >> 4) : (qs[b] & 0xf);
-      dst[i] = T(dl * float(kvalues_iq4nl[nib]));
+    for (short v = 0; v < 4; v++) {
+      const uint q = qword[v];
+#pragma unroll
+      for (short k = 0; k < 4; k++) {
+        const short i = 4 * v + k;
+        const uint b = (q >> (8 * k)) & 0xFFu;
+        dst[i] = T(dl * float(kvalues_iq4nl[b & 0x0Fu]));
+        dst[16 + i] = T(dl * float(kvalues_iq4nl[b >> 4]));
+      }
     }
   }
 
@@ -2837,21 +2850,18 @@ struct KqNaxIq2_xxsBlockLoader {
   void load_unsafe() const {
     const short sb =
         (reduction_dim == 1 ? kt_base : fixed_kt_base) + bj / k_tile_size;
-    const float d = float(*(const device half*)src);
-    const device uint8_t* qs = src + KQ_IQ2_XXS_QS_OFFSET + sb * 8;
-    const uint signbits = uint(qs[4]) | (uint(qs[5]) << 8) |
-        (uint(qs[6]) << 16) | (uint(qs[7]) << 24);
-    const float db = d * (0.5f + float(signbits >> 28)) * 0.25f;
+    // The 32-weight k-tile is one ib32 group = chunk16s chunks 2*sb and
+    // 2*sb+1 (shared scale word). Sign-select on the exact grid bytes then
+    // one scale multiply is bit-identical to the scalar per-weight form:
+    // (db*gb)*(+-1) == db*(+-gb) in IEEE.
+    float4x4 r0, r1;
+    float s0, s1;
+    KqExtDeq<KqIq2_xxsExt>::deq_chunk16s(src, short(2 * sb), r0, s0);
+    KqExtDeq<KqIq2_xxsExt>::deq_chunk16s(src, short(2 * sb + 1), r1, s1);
 #pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const int p = i;
-      const int l = p / 8;
-      const int j = p % 8;
-      const uint8_t signs = ksigns_iq2xs[(signbits >> (7 * l)) & 127];
-      const uint64_t g = iq2xxs_grid[qs[l]];
-      const float gb = float((g >> (8 * j)) & 0xff);
-      const float sgn = (signs & kmask_iq2xs[j]) ? -1.f : 1.f;
-      dst[i] = T(db * gb * sgn);
+    for (short i = 0; i < 16; i++) {
+      dst[i] = T(s0 * r0[i / 4][i % 4]);
+      dst[16 + i] = T(s1 * r1[i / 4][i % 4]);
     }
   }
 
@@ -3407,6 +3417,23 @@ KQ_NAX_DEFINE_KERNELS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
 
 KQ_NAX_DEFINE_SPLITK_KERNEL(q6_k, 256, 6, KqNaxQ6_KBlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(q8_0, 32, 8, KqNaxQ8_0BlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(q4_k, 256, 4, KqNaxQ4_KBlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(q5_k, 256, 5, KqNaxQ5_KBlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(q3_k, 256, 3, KqNaxQ3_KBlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(q4_0, 32, 4, KqNaxQ4_0BlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(q4_1, 32, 4, KqNaxQ4_1BlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(q5_0, 32, 5, KqNaxQ5_0BlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(q5_1, 32, 5, KqNaxQ5_1BlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(iq4_nl, 32, 4, KqNaxIq4_nlBlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(iq4_xs, 256, 4, KqNaxIq4_xsBlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(iq3_xxs, 256, 3, KqNaxIq3_xxsBlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(iq3_s, 256, 3, KqNaxIq3_sBlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(iq2_xxs, 256, 2, KqNaxIq2_xxsBlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(iq2_xs, 256, 2, KqNaxIq2_xsBlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(iq2_s, 256, 2, KqNaxIq2_sBlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(iq1_s, 256, 1, KqNaxIq1_sBlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(iq1_m, 256, 1, KqNaxIq1_mBlockLoader)
 
 template <
     typename T,
@@ -3508,6 +3535,16 @@ METAL_FUNC void kq_gather_qmm_rhs_nax_tgp_impl(
     }
     threadgroup_barrier(mem_flags::mem_none);
 
+    // Rows this simdgroup owns within the current expert segment. When the
+    // segment misses the simdgroup's row band the store below is an empty
+    // slice, so its A loads and matmads are dead work: skip them. The
+    // threadgroup barriers and the cooperative Ws dequant stay TG-uniform
+    // (every segment intersects at least one band, and loop trip counts are
+    // identical across the TG).
+    const short m_lo_lim = min(int(sgp_sm), max(0, offset - tm));
+    const short m_hi_lim = min(int(sgp_sm), max(0, offset_next - tm));
+    const bool sg_active = m_lo_lim < m_hi_lim;
+
     NAXTile<AccumType, TM, TN> Dtile;
     Dtile.clear();
 
@@ -3534,35 +3571,37 @@ METAL_FUNC void kq_gather_qmm_rhs_nax_tgp_impl(
 
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            NAXTile<T, TM, TK> Atile;
-            NAXTile<T, BR, BC> Btile;
+          if (sg_active) {
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<T, BR, BC> Btile;
 
-            // Prevents the Metal compiler from reordering loads across
-            // iterations.
-            volatile int compiler_barrier;
+              // Prevents the Metal compiler from reordering loads across
+              // iterations.
+              volatile int compiler_barrier;
 
-            if constexpr (kAlignedM.value) {
-              Atile.load(xn + kk1, K);
-            } else {
-              Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+              if constexpr (kAlignedM.value) {
+                Atile.load(xn + kk1, K);
+              } else {
+                Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+              }
+
+              if constexpr (transpose) {
+                Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+              } else {
+                Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * BN_padded);
+              }
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<transpose>{});
+
+              (void)compiler_barrier;
             }
-
-            if constexpr (transpose) {
-              Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
-            } else {
-              Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * BN_padded);
-            }
-
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile,
-                metal::bool_constant<transpose>{});
-
-            (void)compiler_barrier;
           }
 
           xn += BK;
@@ -3574,53 +3613,57 @@ METAL_FUNC void kq_gather_qmm_rhs_nax_tgp_impl(
           loader_w.load_safe(tile_w);
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            NAXTile<T, TM, TK> Atile;
-            NAXTile<T, BR, BC> Btile;
+          if (sg_active) {
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<T, BR, BC> Btile;
 
-            // Prevents the Metal compiler from reordering loads across
-            // iterations.
-            volatile int compiler_barrier;
+              // Prevents the Metal compiler from reordering loads across
+              // iterations.
+              volatile int compiler_barrier;
 
-            const short psk = min(int(SK), max(0, (BK - kk1)));
-            Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
+              const short psk = min(int(SK), max(0, (BK - kk1)));
+              Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
 
-            if constexpr (transpose) {
-              Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
-            } else {
-              Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * BN_padded);
+              if constexpr (transpose) {
+                Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+              } else {
+                Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * BN_padded);
+              }
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<transpose>{});
+
+              (void)compiler_barrier;
             }
-
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile,
-                metal::bool_constant<transpose>{});
-
-            (void)compiler_barrier;
           }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const short m_lo_lim = min(int(sgp_sm), max(0, offset - tm));
-        const short m_hi_lim = min(int(sgp_sm), max(0, offset_next - tm));
-
-        if constexpr (kAlignedN.value) {
-          if (m_lo_lim == 0 && m_hi_lim == SM) {
-            Dtile.store(y + tm * N + tn, N);
+        if (sg_active) {
+          if constexpr (kAlignedN.value) {
+            if (m_lo_lim == 0 && m_hi_lim == SM) {
+              Dtile.store(y + tm * N + tn, N);
+            } else {
+              Dtile.store_slice(
+                  y + tm * N + tn,
+                  N,
+                  short2(0, m_lo_lim),
+                  short2(SN, m_hi_lim));
+            }
           } else {
             Dtile.store_slice(
-                y + tm * N + tn, N, short2(0, m_lo_lim), short2(SN, m_hi_lim));
+                y + tm * N + tn,
+                N,
+                short2(0, m_lo_lim),
+                short2(sgp_sn, m_hi_lim));
           }
-        } else {
-          Dtile.store_slice(
-              y + tm * N + tn,
-              N,
-              short2(0, m_lo_lim),
-              short2(sgp_sn, m_hi_lim));
         }
       });
     });

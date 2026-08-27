@@ -129,10 +129,18 @@ instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
       "kq_" #codec "_gather_qmv_mix_ns" sfx "_float16_t",                     \
       kq_ext_gather_qmv_mix_ns, float16_t, traits, nx)
 
+// The slot-parallel variant is NX = 8 only (wide K-lanes measured
+// flat-to-negative; sp multiplies threads without shortening K-chains).
 #define instantiate_kq_ext_mix_ns(codec, traits)                              \
   instantiate_kq_ext_mix_ns_nx(codec, traits, 8, "")                           \
   instantiate_kq_ext_mix_ns_nx(codec, traits, 16, "_nx16")                     \
-  instantiate_kq_ext_mix_ns_nx(codec, traits, 32, "_nx32")
+  instantiate_kq_ext_mix_ns_nx(codec, traits, 32, "_nx32")                     \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_ns_sp_bfloat16_t",                        \
+      kq_ext_gather_qmv_mix_ns_sp, bfloat16_t, traits, 8)                      \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_ns_sp_float16_t",                         \
+      kq_ext_gather_qmv_mix_ns_sp, float16_t, traits, 8)
 
 // Biased experts (gpt-oss): per-(expert, out_dim) f32 biases fused into the
 // GLU epilogue / qmv store. Only the clamped-SwiGLU epilogue is emitted --

@@ -5,6 +5,7 @@
 
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "mlx/ops.h"
@@ -326,7 +327,8 @@ std::vector<mx::array> sdpa_decode_gqa_cascade(
 // Sparse page-gather decode: attend only the C-row pages listed per
 // (batch, kv-head). pages is int32 [B, n_kv_heads, n_pages] with page
 // indices into the key axis (page size = the head dim's staged tile:
-// 32 at D<=128, 16 at D=256, 8 at D=512). qL == 1 only; fp16/bf16 KV.
+// 32 at D<=128, 16 at D=256, 8 at D=512; tile_c=4 picks a 4-row page
+// at D=256). qL == 1 only; fp16/bf16 KV.
 // Optional `starts` (int32 [B]) restricts row b to keys [starts[b], N)
 // -- left-padded batches; pad positions inside selected pages score
 // -inf, so selecting a partially padded page stays exact.
@@ -337,7 +339,28 @@ mx::array sdpa_decode_gqa_paged(
     float scale,
     mx::array pages,
     int splits = 0,
+    int tile_c = 0,
     const std::optional<mx::array>& starts = std::nullopt,
+    mx::StreamOrDevice s = {});
+
+// Block-sparse FA prefill for QSA-style block selection: q [1, Hq, L, D]
+// with Hq == 12 * Hkv and D == 256 (qwen4exp shape), k/v [1, Hkv, S, D].
+// Queries fold into windows of 4; window w attends ONLY the 4-row key
+// pages in pages[w, :counts[w]] (int32, -1 padded to max_pages), with
+// pmask (uint16, same shape) bit qi selecting membership for query qi of
+// the window, plus each query's own incomplete tail block (causal). The
+// builder must include the window's tail-span blocks in the list and set
+// membership bits only for blocks complete at that query. offset is query
+// row 0's global position (S - L for a standard prefill chunk).
+mx::array sdpa_prefill_block_sparse(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    mx::array pages,
+    mx::array pmask,
+    mx::array counts,
+    int offset,
     mx::StreamOrDevice s = {});
 
 // sdpa_fa_verify returning {out, lse}: lse [B, Hkv, n_rows] float32 is the
@@ -556,8 +579,14 @@ mx::array dsa_indexer_scores_q(
 // n_rot RoPE dims fp8-exempt, then the whole row rounded through fp16 (the
 // f16 KV-cache step). x is any shape with trailing dim D where
 // (D - n_rot) % 64 == 0; returns the same shape and dtype. Bit-compatible
-// with the split + fp8-core + concat + astype chain. Metal-only.
-mx::array dsa_kv_qat(mx::array x, int n_rot, mx::StreamOrDevice s = {});
+// with the split + fp8-core + concat + astype chain. Set f16_round false
+// for the compressor emit-path form, which stops at the fp8 result and
+// passes the RoPE tail through unchanged. Metal-only.
+mx::array dsa_kv_qat(
+    mx::array x,
+    int n_rot,
+    bool f16_round = true,
+    mx::StreamOrDevice s = {});
 
 // KVarN KV-cache group quantizer (BeeLlama variant): per 128-token group
 // of one kv-head slice, 16-iteration log-domain Sinkhorn variance
@@ -703,6 +732,89 @@ mx::array rmsnorm2_add(
     mx::array wb,
     float eps,
     mx::StreamOrDevice s = {});
+
+// Fused deepseek4 hyper-connection glue for the single-token decode route
+// (hc_mult 4 only; see kq_hc_glue.h). x is [..., 4, D] with D % 8 == 0 and
+// D <= 8192; fn is float32 [24, 4 * D]. Returns {mixes_raw f32 [..., 24],
+// sumsq f32 [..., 1]}.
+std::vector<mx::array>
+hc_front_reduce(mx::array x, mx::array fn, mx::StreamOrDevice s = {});
+
+// The previous cycle's expand fused ahead of the same front reduction.
+// x_sub is [..., D], resid [..., 4, D], post f32 [..., 4], comb f32
+// [..., 4, 4]. Returns {h [..., 4, D], mixes_raw f32 [..., 24],
+// sumsq f32 [..., 1]}; h is bit-identical to hc_expand of the same carry.
+std::vector<mx::array> hc_front_expand_reduce(
+    mx::array x_sub,
+    mx::array resid,
+    mx::array post,
+    mx::array comb,
+    mx::array fn,
+    mx::StreamOrDevice s = {});
+
+// Sinkhorn mix normalization + collapse to one stream with the sublayer
+// RMSNorm (weight w, eps norm_eps) folded into the single output rounding.
+// The deferred front rms factor enters through sumsq. scale is f32 [3],
+// base f32 [24]. Returns {collapsed [..., D], post f32 [..., 4],
+// comb f32 [..., 4, 4]}.
+std::vector<mx::array> hc_sinkhorn_collapse(
+    mx::array x,
+    mx::array mixes_raw,
+    mx::array sumsq,
+    mx::array scale,
+    mx::array base,
+    mx::array w,
+    int iters,
+    float hc_eps,
+    float norm_eps,
+    mx::StreamOrDevice s = {});
+
+// Expand the sublayer output x [..., D] back over resid [..., 4, D] with
+// the pre/comb coefficients. Returns [..., 4, D].
+mx::array hc_expand(
+    mx::array x,
+    mx::array resid,
+    mx::array post,
+    mx::array comb,
+    mx::StreamOrDevice s = {});
+
+// Grouped rms norm for the qwen4exp low-rank hyper-connection: one
+// statistic per stream of h [..., 4, D], gamma [4 * D] float16/bfloat16
+// gain, output in the h dtype (float32 residual, or the gamma dtype at
+// half). D % 64 == 0.
+mx::array hc_lowrank_norm(
+    mx::array h,
+    mx::array gamma,
+    float eps,
+    mx::StreamOrDevice s = {});
+
+// Fused low-rank hyper-connection front: the q8_0 down qmv over xn (the
+// hc_lowrank_norm output) with silu(x / 4), plus the float32 inject dots
+// 2 * sigmoid(x / 4). lowrank (w_down rows) % 32 == 0, at most 512.
+// Returns {lo [..., LR] lo_dtype, inj f32 [..., 4]}.
+std::vector<mx::array> hc_lowrank_front(
+    mx::array xn,
+    mx::array w_down,
+    mx::array w_inject,
+    mx::Dtype lo_dtype,
+    mx::StreamOrDevice s = {});
+
+// Epilogue: the q8_0 up qmv of lo, sigmoid gate against xn and the mean
+// over the 4 streams. Returns mixed [..., D] in the xn dtype.
+mx::array hc_lowrank_epilogue(
+    mx::array lo,
+    mx::array w_up,
+    mx::array xn,
+    mx::StreamOrDevice s = {});
+
+// y = x @ w.T for token widths 1..16 against a small-N, large-K weight in
+// nn.Linear layout ([N, K]). x is [..., M, K] with 1 <= M <= 16 and
+// K % 4 == 0; x float16/bfloat16/float32, w matching x or float32; output
+// float32 when either operand is, else x dtype. f32 accumulate. Fills the
+// GEMV-to-GEMM cliff MLX's steel path hits at M >= 2 on these shapes
+// (router gates, indexer weight projections, hyper-connection mixes at
+// speculative verify widths).
+mx::array skinny_matmul(mx::array x, mx::array w, mx::StreamOrDevice s = {});
 
 // GPU-side routed-expert slot remap + residency shed for streamed MoE decode
 // (the gpu-dispatch autonomous-token front end; see kq_route_shed.h).
@@ -978,6 +1090,33 @@ class KQuantSDPAFAVerify : public mx::Primitive {
   int q_len_;
   int splits_;
   bool return_lse_;
+};
+
+// Block-sparse FA prefill over QSA-selected 4-row pages (see
+// sdpa_prefill_block_sparse). Inference-only.
+class KQuantSDPABSPrefill : public mx::Primitive {
+ public:
+  explicit KQuantSDPABSPrefill(mx::Stream stream, float scale, int offset)
+      : mx::Primitive(stream), scale_(scale), offset_(offset) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSDPABSPrefill";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int offset_;
 };
 
 // Fused shared-prefix cascade attention (see sdpa_decode_gqa_cascade).
@@ -1349,8 +1488,8 @@ class KQDsaIndexerScoresQ : public mx::Primitive {
 // dsa_kv_qat). Inference-only, Metal-only.
 class KQDsaKvQat : public mx::Primitive {
  public:
-  explicit KQDsaKvQat(mx::Stream stream, int n_rot)
-      : mx::Primitive(stream), n_rot_(n_rot) {}
+  explicit KQDsaKvQat(mx::Stream stream, int n_rot, bool f16_round)
+      : mx::Primitive(stream), n_rot_(n_rot), f16_round_(f16_round) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -1369,6 +1508,7 @@ class KQDsaKvQat : public mx::Primitive {
 
  private:
   int n_rot_;
+  bool f16_round_;
 };
 
 // KVarN group quantizer (see kvarn_quantize). Inference-only, Metal-only.
@@ -1711,6 +1851,179 @@ class KQuantRMSNorm2Add : public mx::Primitive {
   float eps_;
 };
 
+// Fused hyper-connection glue primitives (see hc_front_reduce and friends).
+// Inference-only, GPU-only.
+class KQuantHcFrontReduce : public mx::Primitive {
+ public:
+  explicit KQuantHcFrontReduce(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcFrontReduce";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return true;
+  }
+};
+
+class KQuantHcFrontExpandReduce : public mx::Primitive {
+ public:
+  explicit KQuantHcFrontExpandReduce(mx::Stream stream)
+      : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcFrontExpandReduce";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return true;
+  }
+};
+
+class KQuantHcSinkhornCollapse : public mx::Primitive {
+ public:
+  explicit KQuantHcSinkhornCollapse(
+      mx::Stream stream,
+      int iters,
+      float hc_eps,
+      float norm_eps)
+      : mx::Primitive(stream),
+        iters_(iters),
+        hc_eps_(hc_eps),
+        norm_eps_(norm_eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcSinkhornCollapse";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int iters_;
+  float hc_eps_;
+  float norm_eps_;
+};
+
+class KQuantHcExpand : public mx::Primitive {
+ public:
+  explicit KQuantHcExpand(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcExpand";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return true;
+  }
+};
+
+// Fused low-rank hyper-connection primitives (see hc_lowrank_front).
+// Inference-only, GPU-only.
+class KQuantHcLowrankNorm : public mx::Primitive {
+ public:
+  explicit KQuantHcLowrankNorm(mx::Stream stream, float eps)
+      : mx::Primitive(stream), eps_(eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcLowrankNorm";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float eps_;
+};
+
+class KQuantHcLowrankFront : public mx::Primitive {
+ public:
+  explicit KQuantHcLowrankFront(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcLowrankFront";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return true;
+  }
+};
+
+class KQuantHcLowrankEpilogue : public mx::Primitive {
+ public:
+  explicit KQuantHcLowrankEpilogue(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcLowrankEpilogue";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return true;
+  }
+};
+
+// Skinny matmul y = x @ w.T at token widths 1..16 (see skinny_matmul).
+// Inference-only.
+class KQuantSkinnyMV : public mx::Primitive {
+ public:
+  explicit KQuantSkinnyMV(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSkinnyMV";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+};
+
 // Routed-expert slot remap + residency shed (see route_shed).
 // Inference-only.
 class KQuantRouteShed : public mx::Primitive {
@@ -2000,5 +2313,11 @@ class KQuantEventWait : public mx::Primitive {
   uint64_t handle_;
   uint64_t value_;
 };
+
+// Runtime read/write of MLX's command-buffer split caps (ops, MB per
+// buffer). set returns the previous pair. GPU-only; see
+// kquant_cb_caps.cpp for the phase-flip rationale.
+std::pair<int, int> get_cb_caps();
+std::pair<int, int> set_cb_caps(int max_ops, int max_mb);
 
 } // namespace mlx_kquant

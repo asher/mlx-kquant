@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.27)
 project(mlx_kquant LANGUAGES CXX C)
 
 # ----------------------------- Setup -----------------------------
-# C++20: MLX 0.31.2's public headers (device.h, stream.h) use defaulted
+# C++20: MLX 0.32.1's public headers (device.h, stream.h) use defaulted
 # comparison operators, a C++20 feature. Apple Clang accepts them as an
 # extension under -std=c++17, but GCC (the Linux toolchain) rejects them, so a
 # C++17 standard breaks the Metal-free Linux build. 20 builds cleanly on both.
@@ -37,7 +37,7 @@ find_package(
 # "incompatible function arguments". Build isolation installs the pin;
 # non-isolated dev builds (build_ext --inplace, -e --no-build-isolation) use
 # whatever the venv has - guard that path here.
-set(KQ_NANOBIND_PIN "2.12.0")
+set(KQ_NANOBIND_PIN "2.13.0")
 execute_process(
   COMMAND "${Python_EXECUTABLE}" -c "import nanobind; print(nanobind.__version__)"
   OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -128,7 +128,11 @@ target_sources(
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_kvarn.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_moe_glu.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_norm_fused.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_hc_glue.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_hc_lowrank.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_cb_caps.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_route_shed.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_skinny_mv.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gather.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_encode.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_arena.cpp
@@ -210,7 +214,10 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_glu.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_glu_kq.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_norm_fused.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_hc_glue.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_hc_lowrank.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_route_shed.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_skinny_mv.metal
     INCLUDE_DIRS
     ${CMAKE_CURRENT_LIST_DIR}/metal
     ${MLX_INCLUDE_DIRS}
@@ -245,7 +252,7 @@ if(BUILD_SHARED_LIBS)
     # installed mlx wheel at runtime. _ext.so lives in site-packages/mlx_kquant/,
     # libmlx in site-packages/mlx/lib/, so ../mlx/lib reaches it. (The absolute
     # build-tree rpath MLXConfig adds works only on the build machine; this is
-    # what makes a redistributed wheel find the ABI-pinned mlx==0.31.2. delocate
+    # what makes a redistributed wheel find the ABI-pinned mlx==0.32.1. delocate
     # must therefore *exclude* libmlx from vendoring - see [tool.cibuildwheel].)
     target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path)
     target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path/../mlx/lib)

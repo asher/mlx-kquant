@@ -190,6 +190,125 @@ static int kq_smallm_route_min(const std::string& t, int N, int K) {
   return m;
 }
 
+// Codecs with a split-K kernel and its bm8/bm16 tile arms. Gates both the
+// route and the tile pick, so the two cannot drift apart.
+static bool kq_splitk_codec(const std::string& t) {
+  return t == "q4_k" || t == "q5_k" || t == "q6_k" || t == "q3_k" ||
+      t == "q2_k" || t == "q8_0" || t == "iq4_xs" || t == "iq4_nl" ||
+      t == "iq3_xxs" || t == "iq3_s" || t == "iq2_xxs" || t == "iq2_xs" ||
+      t == "iq2_s" || t == "iq1_s" || t == "iq1_m";
+}
+
+// Non-NAX default split-K entry M per codec (0 = env lever only).
+// Below the entry, the mv paths win. From the entry through M32,
+// qmm_splitk is flat at the measured shapes (the bm8 tile carries
+// M <= 8, bm16 M 9-16, BM=32 M 17-32). The default route decays past
+// M~4 and falls into the plain qmm_t hole at M13.
+//
+// Two device tables, picked at dispatch. On NAX silicon this route only
+// runs with NAX off (KQ_DISABLE_NAX, or a codec with no NAX kernels);
+// the band is otherwise served by kq_splitk_nax_min_m. That ALU path
+// crosses later than pre-NAX silicon does. Measured 2026-08-13 on M5
+// Max under KQ_DISABLE_NAX=1, three shapes; wins from the entry are
+// 2.0-2.3x.
+static int kq_splitk_min_m_nax_alu(const std::string& t) {
+  if (t == "q4_k" || t == "q3_k" || t == "iq3_xxs" || t == "iq4_nl") {
+    return 8;
+  }
+  if (t == "q5_k") {
+    return 10;
+  }
+  if (t == "q6_k" || t == "iq3_s") {
+    return 12;
+  }
+  if (t == "q2_k" || t == "q8_0" || t == "iq4_xs" || t == "iq2_s") {
+    return 16;
+  }
+  return 0;
+}
+
+// Pre-NAX silicon, bm8 tile. Measured 2026-08-21 on M3 Max at
+// [17408x5120], [5120x17408] and [10240x5120] (the Qwen3.8-27B
+// projections), synthetic wire, KQ_QMM_SPLITK=16 against the default
+// route, two process-paired runs per arm. Entry is the lowest M with
+// no regression on any shape; the tile below the entry:
+// - q4_k, q6_k, q2_k, iq2_xxs: 0.81-0.95x at M4, 0.69-0.81x at M5.
+//   Entry 4. q2_k entered at the M13 hole before the bm8 tile.
+// - q5_k, q8_0, iq4_nl, iq3_xxs, iq3_s: 0.93-1.00x at M4, 0.72-0.97x
+//   at M5 (q8_0 is a tie at M5, 0.97-1.00, and wins 0.74-0.81x at
+//   M6). Entry 5.
+// - q3_k: 1.03-1.08x at M5, ties at M6. Entry 6.
+// - iq4_xs: 1.29-1.32x at M6, 0.90-0.96x at M8. Entry 8 (was 10 on
+//   the bm16 tile).
+// - iq2_s: 1.37-1.43x at M6, 1.01-1.03x at M8; the bm16 tile wins
+//   from M10. Entry 8, unchanged.
+// - iq2_xs: 1.02-1.06x at M8, 0.79-1.05x at M12, 0.72-0.74x at M16.
+//   Entry 12.
+// - iq1_s and iq1_m: their tiles cost 3-4x iq2_xxs's per weight, so
+//   the mv paths win through M12 (0.68-1.87x); the default falls to
+//   plain qmm_t at M13 and the tile wins 0.72-0.84x at M16. Entry 13.
+// The bm16 tile that preceded bm8 entered q4_k/q3_k/q5_k/q6_k/iq3_s/
+// iq3_xxs/iq4_nl at 6, iq2_s and q8_0 at 8, iq4_xs at 10.
+static int kq_splitk_min_m(const std::string& t) {
+  if (kq_is_nax_available()) {
+    return kq_splitk_min_m_nax_alu(t);
+  }
+  if (t == "q4_k" || t == "q6_k" || t == "q2_k" || t == "iq2_xxs") {
+    return 4;
+  }
+  if (t == "q5_k" || t == "q8_0" || t == "iq4_nl" || t == "iq3_xxs" ||
+      t == "iq3_s") {
+    return 5;
+  }
+  if (t == "q3_k") {
+    return 6;
+  }
+  if (t == "iq4_xs" || t == "iq2_s") {
+    return 8;
+  }
+  if (t == "iq2_xs") {
+    return 12;
+  }
+  if (t == "iq1_s" || t == "iq1_m") {
+    return 13;
+  }
+  return 0;
+}
+
+// Default NAX split-K entry M per codec (0 = env lever only). The
+// un-split BM=32 grid is ceil(N/64) x 1 threadgroups with a serial
+// in-tile K walk, so the verify band pays per row; splitting K
+// multiplies threadgroup count. The win scales with how starved the
+// grid is: 1.6-2.5x at [256x6656], 1.0-1.2x at vocab-head N.
+//
+// Entry is the lowest M with no regression on any measured shape.
+// Measured 2026-08-13 on M5 Max at target 16 over seven shapes
+// (benchmarks/bench_verify_band_ab.py). No N gate needed: vocab-head
+// shapes stay >= 1.0 at every entry.
+static int kq_splitk_nax_min_m(const std::string& t) {
+  if (t == "iq2_xs" || t == "iq2_s") {
+    return 16;
+  }
+  if (t == "q6_k" || t == "iq1_m") {
+    return 12;
+  }
+  if (t == "iq3_s" || t == "iq2_xxs" || t == "iq1_s") {
+    return 10;
+  }
+  if (t == "q2_k" || t == "q3_k" || t == "q4_k" || t == "q5_k" || t == "q8_0" ||
+      t == "q4_0" || t == "q4_1" || t == "q5_0" || t == "q5_1" ||
+      t == "iq4_nl" || t == "iq4_xs" || t == "iq3_xxs") {
+    return 8;
+  }
+  return 0;
+}
+
+// Default split target; resolves down to a divisor of K / max(gs, BK),
+// so the realised count is coarser (K=6656 and K=19968 both give 13).
+// One target for all codecs: over routed cells only, 16 is best for 15
+// of 19 and within 1% for the rest.
+static constexpr int kq_splitk_nax_target = 16;
+
 // NAX (tensor-core) GEMM dispatch for the quantized matmul (no biases).
 void qmm_nax(
     const array& x,
@@ -391,6 +510,12 @@ void qmm(
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
       batched ? "_batch_1" : "_batch_0");
 
+  static const bool qmm_log = std::getenv("KQ_QMM_LOG") != nullptr;
+  if (qmm_log) {
+    std::fprintf(
+        stderr, "[kq qmm] %s M=%d N=%d K=%d\n", kname.c_str(), M, N, K);
+  }
+
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -430,8 +555,22 @@ void qmm_splitk(
     Device& d,
     const Stream& s,
     const std::string& kquant_type) {
-  constexpr int bm = 32, bn = 32;
   constexpr int wm = 2, wn = 2;
+  // The bm16 tile halves the MMA row-padding waste at small M and
+  // widens BN to 64 so each K-step does more MMA work per barrier; the
+  // bm8 tile halves it again for M <= 8 (one simdgroup along M, four
+  // along N). On M3 Max the bm16 tile is bound per weight, not per
+  // byte (q8_0 ~240 GB/s and q6_k ~180 GB/s both ~220 G weights/s), and
+  // the BM32 tile costs 1.45x per weight for 2x the MMA, so MMA issue is
+  // ~45% of the tile. KQ_QMM_SPLITK_BM8=0 keeps M <= 8 on the bm16 tile.
+  static const bool bm8_enabled = []() {
+    const char* e = std::getenv("KQ_QMM_SPLITK_BM8");
+    return e == nullptr || std::atoi(e) != 0;
+  }();
+  const bool small = M <= 16 && kq_splitk_codec(kquant_type);
+  const bool bm8 = small && bm8_enabled && M <= 8;
+  const int bm = bm8 ? 8 : (small ? 16 : 32);
+  const int bn = small ? 64 : 32;
   const int k_partition = (K / group_size / splits) * group_size;
   const int part_stride = M * N;
 
@@ -447,7 +586,9 @@ void qmm_splitk(
   kname.reserve(64);
   mx::concatenate(
       kname,
-      kq_kname_prefix(kquant_type) + "qmm_t_splitk_",
+      kq_kname_prefix(kquant_type) +
+          (bm8 ? "qmm_t_splitk_bm8_"
+               : (small ? "qmm_t_splitk_bm16_" : "qmm_t_splitk_")),
       type_string,
       "_gs_",
       group_size,
@@ -856,7 +997,8 @@ void verify_mv_ext(
     const char* e = std::getenv("KQ_MV_EXT_NR");
     return e != nullptr ? std::atoi(e) : 1;
   }();
-  const bool use_nr2 = mv_ext_nr == 2 && M >= 5 && kquant_type == "q6_k";
+  const bool use_nr2 =
+      mv_ext_nr == 2 && M >= 5 && M <= 12 && kquant_type == "q6_k";
   // Shuffle-broadcast experiment (KQ_MV_EXT_SB=1): ty-lanes exchange
   // activation quarters over simd_shuffle instead of each loading the full
   // window -- activation cache traffic / 4, same grid. q6_k M 4-12 only.
@@ -864,7 +1006,8 @@ void verify_mv_ext(
     const char* e = std::getenv("KQ_MV_EXT_SB");
     return e != nullptr && std::atoi(e) == 1;
   }();
-  const bool use_sb = !use_nr2 && mv_ext_sb && M >= 4 && kquant_type == "q6_k";
+  const bool use_sb =
+      !use_nr2 && mv_ext_sb && M >= 4 && M <= 12 && kquant_type == "q6_k";
   // Wide-nxpsg experiment (KQ_MV_EXT_NX=16|32): fewer redundant activation
   // readers per element (nypsg*nsg drops 8 -> 4 -> 2) + more threadgroups.
   // q6_k M 4-12 only; wins here would generalize per codec.
@@ -873,8 +1016,8 @@ void verify_mv_ext(
     const int v = e != nullptr ? std::atoi(e) : 0;
     return (v == 16 || v == 32) ? v : 0;
   }();
-  const bool use_nx =
-      !use_nr2 && !use_sb && mv_ext_nx != 0 && M >= 4 && kquant_type == "q6_k";
+  const bool use_nx = !use_nr2 && !use_sb && mv_ext_nx != 0 && M >= 4 &&
+      M <= 12 && kquant_type == "q6_k";
   // T-precision-dot experiment (KQ_MV_EXT_HD=1): chunk dots in half/bfloat
   // at 2x issue rate + no per-row activation converts, f32 fold per chunk.
   // q6_k M 4-12, half/bfloat x only.
@@ -883,17 +1026,8 @@ void verify_mv_ext(
     return e != nullptr && std::atoi(e) == 1;
   }();
   const bool use_hd = !use_nr2 && !use_sb && !use_nx && mv_ext_hd && M >= 4 &&
-      kquant_type == "q6_k" && x.dtype() != mx::float32;
-  // Staged-activation experiment (KQ_MV_EXT_TS=1): cooperative TG-memory
-  // stage of the activation window, 8 simdgroups / 32 rows per TG. q6_k
-  // M 4-12; K must cover a full 128-element window (q6_k geometry does).
-  static const bool mv_ext_ts = []() {
-    const char* e = std::getenv("KQ_MV_EXT_TS");
-    return e != nullptr && std::atoi(e) == 1;
-  }();
-  const bool use_ts = !use_nr2 && !use_sb && !use_nx && !use_hd && mv_ext_ts &&
-      M >= 4 && kquant_type == "q6_k" && K % 128 == 0;
-  const int nsg_eff = use_ts ? 8 : nsg;
+      M <= 12 && kquant_type == "q6_k" && x.dtype() != mx::float32;
+  const int nsg_eff = nsg;
   const int nxpsg_eff = use_nx ? mv_ext_nx : nxpsg;
   const int rows_per_tg = (32 / nxpsg_eff) * nsg_eff * (use_nr2 ? 2 : 1);
   MTL::Size group_dims(32, nsg_eff, 1);
@@ -915,7 +1049,7 @@ void verify_mv_ext(
       use_nr2 ? "_nr2"
               : (use_sb ? "_sb"
                         : (use_nx ? (mv_ext_nx == 16 ? "_x16" : "_x32")
-                                  : (use_hd ? "_hd" : (use_ts ? "_ts" : "")))));
+                                  : (use_hd ? "_hd" : ""))));
 
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -1136,19 +1270,22 @@ void KQuantMatmul::eval_gpu(
     return;
   }
 
-  // NAX split-K qmm experiment (KQ_QMM_SPLITK_NAX=<target splits>, 0 = off,
-  // 1 = auto target 32; read LIVE per call so --ab-env can flip it on one
-  // generator): K-slices on the tensor-core BM=32 tile; see qmm_nax_splitk.
-  // Slice quantum is max(superblock, BK) so every slice starts a loader at
-  // kt_base 0. q6_k + q8_0 instantiations only.
+  // NAX split-K, entering at kq_splitk_nax_min_m through M32; see
+  // qmm_nax_splitk. Slice quantum max(superblock, BK) keeps every slice
+  // starting a loader at kt_base 0 for both gs families.
+  // KQ_QMM_SPLITK_NAX=<splits> forces the route for all M <= 32, 1 uses
+  // the default target, 0 disables. Read live so an A/B can flip arms
+  // on one generator.
   const char* sk_nax_e = std::getenv("KQ_QMM_SPLITK_NAX");
-  int qmm_splitk_nax_env = sk_nax_e != nullptr ? std::atoi(sk_nax_e) : 0;
-  if (qmm_splitk_nax_env == 1) {
-    qmm_splitk_nax_env = 32;
-  }
-  if (qmm_splitk_nax_env > 1 && transpose_ && non_batched && M <= 32 &&
-      (kquant_type_ == "q6_k" || kquant_type_ == "q8_0") &&
-      kq_is_nax_available() && (K % 64 == 0) && x.dtype() != mx::float32) {
+  const int sk_nax_env = sk_nax_e != nullptr ? std::atoi(sk_nax_e) : -1;
+  const int sk_nax_min_m = kq_splitk_nax_min_m(kquant_type_);
+  const bool sk_nax_route = sk_nax_env >= 1 ||
+      (sk_nax_env == -1 && sk_nax_min_m > 0 && M >= sk_nax_min_m);
+  if (sk_nax_route && transpose_ && non_batched && M <= 32 &&
+      codec_has_nax(kquant_type_) && kq_is_nax_available() && (K % 64 == 0) &&
+      x.dtype() != mx::float32) {
+    const int qmm_splitk_nax_env =
+        sk_nax_env > 1 ? sk_nax_env : kq_splitk_nax_target;
     const int sliceq = std::max(group_size_, 64);
     const int nblk = K / sliceq;
     int sp = std::min(qmm_splitk_nax_env, nblk);
@@ -1174,20 +1311,29 @@ void KQuantMatmul::eval_gpu(
     }
   }
 
-  // Split-K qmm experiment (KQ_QMM_SPLITK=<target splits>, 0 = off, read
-  // once): the small-M band's occupancy lever; see qmm_splitk. Routes when
-  // a >1 divisor of the wire-block count exists at or under the target.
-  // K-quants + q8_0 only for now (instantiation coverage).
+  // Split-K qmm: the occupancy lever for the small-M band; see
+  // qmm_splitk. The route needs a >1 divisor of the wire-block count
+  // at or under the target. K-quants + q8_0 only for now
+  // (instantiation coverage). Default routing is non-NAX only and
+  // enters at kq_splitk_min_m. KQ_QMM_SPLITK=<target splits> forces
+  // the route for all M <= 32 (A/B lever). KQ_QMM_SPLITK=0 disables
+  // both.
   static const int qmm_splitk_env = []() {
     const char* e = std::getenv("KQ_QMM_SPLITK");
-    return e != nullptr ? std::atoi(e) : 0;
+    return e != nullptr ? std::atoi(e) : -1; // -1 = per-codec default
   }();
-  if (qmm_splitk_env > 1 && transpose_ && non_batched && M <= 32 &&
-      (kquant_type_ == "q6_k" || kquant_type_ == "q5_k" ||
-       kquant_type_ == "q4_k" || kquant_type_ == "q3_k" ||
-       kquant_type_ == "q2_k" || kquant_type_ == "q8_0")) {
+  const int splitk_min_m = kq_splitk_min_m(kquant_type_);
+  // Hardware AND codec: KQ_DISABLE_NAX lands in codec_has_nax, so
+  // keying off availability alone left this unreachable on NAX silicon.
+  const bool nax_path = kq_is_nax_available() && codec_has_nax(kquant_type_);
+  const bool splitk_route = qmm_splitk_env > 1 ||
+      (qmm_splitk_env == -1 && splitk_min_m > 0 && M >= splitk_min_m &&
+       !nax_path);
+  if (splitk_route && transpose_ && non_batched && M <= 32 &&
+      kq_splitk_codec(kquant_type_)) {
+    const int splitk_target = qmm_splitk_env > 1 ? qmm_splitk_env : 16;
     const int nblk = K / group_size_;
-    int sp = std::min(qmm_splitk_env, nblk);
+    int sp = std::min(splitk_target, nblk);
     while (sp > 1 && nblk % sp != 0) {
       --sp;
     }
