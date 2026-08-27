@@ -157,7 +157,11 @@ void KQuantHcLowrankEpilogue::eval_gpu(
   ce.set_output_array(out, 3);
   ce.set_bytes(D, 4);
   ce.set_bytes(LR, 5);
-  ce.dispatch_threadgroups(MTL::Size(D / 2, rows, 1), MTL::Size(64, 1, 1));
+  ce.set_bytes(rows, 6);
+  // One lane per (row, d) output; see the kernel comment for the mapping.
+  int64_t outs = int64_t(rows) * D;
+  ce.dispatch_threadgroups(
+      MTL::Size((outs + 255) / 256, 1, 1), MTL::Size(256, 1, 1));
 }
 
 #else // !_METAL_

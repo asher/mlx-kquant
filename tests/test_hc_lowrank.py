@@ -75,6 +75,8 @@ CASES = [
     (1, 256, 64, mx.float32, mx.float16),
     (1, 256, 64, mx.float16, mx.float16),
     (2, 2560, 320, mx.float32, mx.bfloat16),  # production geometry
+    (8, 2560, 320, mx.float32, mx.bfloat16),  # max verify width
+    (9, 256, 512, mx.float32, mx.bfloat16),  # max LR
 ]
 
 
@@ -122,6 +124,23 @@ def test_hc_lowrank_epilogue(R, D, LR, h_dtype, half_dtype):
     assert float(d.max()) < 1e-2 * max(scale, 1.0)
     assert float(np.quantile(d, 0.99)) < 5e-3 * max(scale, 1.0)
     assert float(d.mean()) < 1.5e-3 * max(scale, 1.0)
+
+
+@pytest.mark.parametrize("R", [2, 4, 8])
+def test_hc_lowrank_epilogue_batch_bit_exact(R):
+    """A batched epilogue call matches per-row calls exactly.
+
+    Each output (row, d) is one lane's serial dot with no cross-lane
+    reduction, so batching rows must not move a single bit.
+    """
+    h, gamma, wd, _, wu, _, wi = _mk(17, R, 2560, 320, mx.float32, mx.bfloat16)
+    xn = kq.hc_lowrank_norm(h, gamma, EPS)
+    lo, _ = kq.hc_lowrank_front(xn, wd, wi, mx.bfloat16)
+    mixed = kq.hc_lowrank_epilogue(lo, wu, xn)
+    per_row = mx.concatenate(
+        [kq.hc_lowrank_epilogue(lo[r : r + 1], wu, xn[r : r + 1]) for r in range(R)]
+    )
+    assert mx.array_equal(mixed, per_row)
 
 
 def test_hc_lowrank_leading_dims():
