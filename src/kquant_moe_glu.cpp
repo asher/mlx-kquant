@@ -50,6 +50,10 @@ inline std::string kq_gather_stem(const std::string& t, int K) {
 // gathers (qmv / mix / mix_ns) are flat-to-negative under widening at every
 // measured shape and stay NX = 8. KQ_MOE_NX=8|16|32 forces a width for ALL
 // ops (A/B and tests); rows = output rows across the whole dispatch.
+// The threadgroup cap covers MTP-verify widths (t = 2..8): at qwen4exp
+// geometry (E=512 top-10, K=2560 N=640, iq3_xxs/iq4_xs + q8_0 shexp) nx16
+// beats nx8 by 3.6-9.8% at every t in 2..8, still positive at the 7040-tg
+// t=8 point, so the cap sits at 8192 tgs; true prefill grids stay NX = 8.
 inline int kq_moe_pick_nx(int64_t rows, int K, bool two_stream) {
   // Re-read per call only when the variable exists at all (interleaved A/B
   // flips it in-process); unset costs one static check.
@@ -61,7 +65,7 @@ inline int kq_moe_pick_nx(int64_t rows, int K, bool two_stream) {
       return v;
     }
   }
-  if (two_stream && K / 16 >= 32 && (rows * 8) / 64 < 2048) {
+  if (two_stream && K / 16 >= 32 && (rows * 8) / 64 < 8192) {
     return 16;
   }
   return 8;
