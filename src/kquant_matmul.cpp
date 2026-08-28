@@ -20,6 +20,7 @@
 #include "kquant_codec.h"
 #include "kquant_cpu_decode.h"
 #include "kquant_internal.h"
+#include "kquant_lora_epilogue.h"
 
 #include "mlx/allocator.h"
 #include "mlx/backend/common/utils.h" // elem_to_loc
@@ -1104,7 +1105,8 @@ std::vector<mx::Shape> KQuantMatmul::output_shapes(
 bool KQuantMatmul::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMatmul&>(other);
   return kquant_type_ == o.kquant_type_ && group_size_ == o.group_size_ &&
-      bits_ == o.bits_ && transpose_ == o.transpose_;
+      bits_ == o.bits_ && transpose_ == o.transpose_ &&
+      lora_flags_ == o.lora_flags_;
 }
 
 void KQuantMatmul::eval_cpu(
@@ -1122,9 +1124,13 @@ void KQuantMatmul::eval_cpu(
   encoder.set_input_array(x);
   encoder.set_input_array(w);
   encoder.set_output_array(out);
+  std::vector<mx::array> lora =
+      kq_lora_capture_cpu(inputs, 3, lora_flags_, encoder, stream());
   encoder.dispatch([out = mx::array::unsafe_weak_copy(out),
                     x = mx::array::unsafe_weak_copy(x),
                     w = mx::array::unsafe_weak_copy(w),
+                    lora = std::move(lora),
+                    lora_flags = lora_flags_,
                     transpose_ = transpose_,
                     kquant_type = kquant_type_]() mutable {
     int K = x.shape(-1);
@@ -1153,6 +1159,15 @@ void KQuantMatmul::eval_cpu(
             transpose_,
             kquant_type);
       }
+      if (lora_flags & KQ_LORA_PRESENT) {
+        kq_lora_epilogue_rows_cpu<T>(
+            out.data<T>(),
+            x.data<T>(),
+            kq_lora_view(lora, 0, lora_flags),
+            batch_size * M,
+            K,
+            N);
+      }
     };
     auto dt = x.dtype();
     if (dt == mx::float32) {
@@ -1178,6 +1193,11 @@ std::vector<mx::array> KQuantMatmul::vjp(
   // is defined: dL/dx = cotan @ dequant(w) with the transpose flipped, i.e. the
   // same quantized matmul run the other way. The quantized base is frozen (the
   // LoRA use case), so the weight/scale branches throw.
+  if (lora_flags_ & KQ_LORA_PRESENT) {
+    throw std::invalid_argument(
+        "[mlx_kquant] quantized_matmul vjp: the LoRA epilogue is "
+        "inference-only.");
+  }
   std::vector<mx::array> vjps;
   for (auto arg : argnums) {
     if (arg == 0) {
@@ -1187,6 +1207,9 @@ std::vector<mx::array> KQuantMatmul::vjp(
           primals[2],
           kquant_type_,
           !transpose_,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
           stream()));
     } else if (arg == 1) {
       throw std::invalid_argument(
@@ -1203,6 +1226,23 @@ std::vector<mx::array> KQuantMatmul::vjp(
 #ifdef _METAL_
 
 void KQuantMatmul::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  eval_gpu_base(inputs, outputs);
+  if (lora_flags_ & KQ_LORA_PRESENT) {
+    auto& s = stream();
+    auto& d = mx::metal::device(s.device);
+    const auto& x = inputs[0];
+    auto& out = outputs[0];
+    const int K = x.shape(-1);
+    const int N = out.shape(-1);
+    const int rows = static_cast<int>(x.size() / K);
+    kq_lora_epilogue_rows_gpu(
+        d, s, x, kq_lora_view_gpu(inputs, 3, lora_flags_, s), out, rows, K, N);
+  }
+}
+
+void KQuantMatmul::eval_gpu_base(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
   auto& s = stream();
@@ -1516,7 +1556,7 @@ std::vector<mx::Shape> KQuantQmvBias::output_shapes(
 bool KQuantQmvBias::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantQmvBias&>(other);
   return kquant_type_ == o.kquant_type_ && group_size_ == o.group_size_ &&
-      bits_ == o.bits_;
+      bits_ == o.bits_ && lora_flags_ == o.lora_flags_;
 }
 
 void KQuantQmvBias::eval_cpu(
@@ -1536,10 +1576,14 @@ void KQuantQmvBias::eval_cpu(
   encoder.set_input_array(w);
   encoder.set_input_array(bias);
   encoder.set_output_array(out);
+  std::vector<mx::array> lora =
+      kq_lora_capture_cpu(inputs, 4, lora_flags_, encoder, stream());
   encoder.dispatch([out = mx::array::unsafe_weak_copy(out),
                     x = mx::array::unsafe_weak_copy(x),
                     w = mx::array::unsafe_weak_copy(w),
                     bias = mx::array::unsafe_weak_copy(bias),
+                    lora = std::move(lora),
+                    lora_flags = lora_flags_,
                     kquant_type = kquant_type_]() mutable {
     int K = x.shape(-1);
     int N = out.shape(-1);
@@ -1559,6 +1603,10 @@ void KQuantQmvBias::eval_cpu(
       for (int i = 0; i < N; i++) {
         out_ptr[i] = static_cast<T>(
             static_cast<float>(out_ptr[i]) + static_cast<float>(bias_ptr[i]));
+      }
+      if (lora_flags & KQ_LORA_PRESENT) {
+        kq_lora_epilogue_rows_cpu<T>(
+            out_ptr, x.data<T>(), kq_lora_view(lora, 0, lora_flags), 1, K, N);
       }
     };
     auto dt = x.dtype();
@@ -1596,6 +1644,10 @@ void KQuantQmvBias::eval_gpu(
 
   qmv_bias(
       x, w, scales, bias, out, group_size_, bits_, N, K, d, s, kquant_type_);
+  if (lora_flags_ & KQ_LORA_PRESENT) {
+    kq_lora_epilogue_rows_gpu(
+        d, s, x, kq_lora_view_gpu(inputs, 4, lora_flags_, s), out, 1, K, N);
+  }
 }
 
 #else

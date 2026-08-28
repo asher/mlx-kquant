@@ -122,6 +122,12 @@ out = model(tokens)                      # base + low-rank delta
 dispatch the kquant base plus the low-rank delta on every forward - no weights are
 modified on disk.
 
+A runtime that owns its own adapter wrapping can hand the delta to the op instead
+of computing it with separate matmuls: `KQuantLinear(x, lora=(a_t, b_t, rows))`
+(and the `lora_*` keywords on the gathered ops) add it inside the base matmul's
+own dispatch, so a live adapter costs no extra graph ops at decode. See the LoRA
+epilogue entry in [kernels.md](kernels.md).
+
 ## Train an adapter
 
 Training uses mlx-lm's own LoRA trainer unchanged - the patch makes the kquant
