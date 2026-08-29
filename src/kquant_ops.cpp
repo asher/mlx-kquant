@@ -65,6 +65,15 @@ inline mx::array kq_ensure_row_contiguous_matrix(
   return mx::contiguous(x, false, s);
 }
 
+// x always gets an unconditional Contiguous node: build-time strides of an
+// unevaluated array are meaningless, so a stride check here can hand the
+// kernels a lazy transpose whose rows they mis-walk as dense (rows past the
+// first read wrong memory). Contiguous::eval aliases zero-copy whenever the
+// input lands row-contiguous.
+inline mx::array kq_dense_x(const mx::array& x, mx::StreamOrDevice s) {
+  return mx::contiguous(x, false, s);
+}
+
 } // namespace
 
 // ----------------------------- ops -----------------------------
@@ -187,7 +196,7 @@ mx::array quantized_matmul(
 
   // Cast x to the output dtype, then matrix-row-contiguize x / w / scales at
   // the op level so eval_gpu can assume dense inputs.
-  auto x_c = kq_ensure_row_contiguous_matrix(mx::astype(x, out_type, s), s);
+  auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
   auto w_c = kq_ensure_row_contiguous_matrix(w, s);
   auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
 
@@ -308,7 +317,7 @@ mx::array quantized_matmul_qmv_bias(
 
   auto s = mx::to_stream(s_);
 
-  auto x_c = kq_ensure_row_contiguous_matrix(mx::astype(x, out_type, s), s);
+  auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
   auto w_c = kq_ensure_row_contiguous_matrix(w, s);
   auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
   auto bias_c = mx::astype(bias, out_type, s);
@@ -470,7 +479,7 @@ mx::array gather_qmm(
   // otherwise, routing to a strided-safe leaf), and scales is a (1,)
   // placeholder.
   bool rhs_reachable = right_sorted && transpose && codec->has_matmul_kernel;
-  auto x_c = kq_ensure_row_contiguous_matrix(mx::astype(x, out_type, s), s);
+  auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
   // Always insert the Contiguous node when the rhs leaf is reachable: flags
   // of an UNEVALUATED array (e.g. a fresh gate/up slice view) are not
   // meaningful at op-build time, so a `w.flags().row_contiguous ? w : ...`
@@ -606,7 +615,7 @@ mx::array gather_qmm_seg(
   }
 
   auto s = mx::to_stream(s_);
-  auto x_c = kq_ensure_row_contiguous_matrix(mx::astype(x, out_type, s), s);
+  auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
   // The kernel computes each expert's base pointer as expert * N * K_w, so w
   // must be fully row-contiguous (no strided expert dim).
   auto w_c = mx::contiguous(w, false, s);
