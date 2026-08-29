@@ -298,6 +298,8 @@ static int kq_splitk_nax_min_m(const std::string& t) {
     return 12;
   }
   if (t == "iq3_s" || t == "iq2_xxs" || t == "iq1_s" || t == "stq1_0") {
+    // stq1_0: inherited from iq1_s, NOT measured (M5 calibration pending,
+    // docs/kernels.md).
     return 10;
   }
   if (t == "q2_k" || t == "q3_k" || t == "q4_k" || t == "q5_k" || t == "q8_0" ||
