@@ -125,6 +125,33 @@ def test_iq_encode_imatrix_steers(codec):
     assert not np.array_equal(steered, other), f"{codec}: imatrix did not steer"
 
 
+def test_stq1_0_encode_matches_numpy_reference():
+    """The C++ encoder must match kqref's NumPy port byte-for-byte -- two
+    independent ports of quantize_row_stq1_0_ref cross-validate each other
+    (the rel-Frobenius tripwire above cannot catch a wrong zero lane or a
+    swapped nibble order; both still land near the ~2.2 QAT baseline)."""
+    rng = np.random.default_rng(5)
+    w_np = (rng.standard_normal((N, K)) * 0.1).astype(np.float32)
+    assert np.array_equal(
+        _encode_wire("stq1_0", w_np), quants.quantize(w_np, GT.STQ1_0)
+    )
+    z = np.zeros((4, 512), dtype=np.float32)  # amax == 0 blocks
+    assert np.array_equal(_encode_wire("stq1_0", z), quants.quantize(z, GT.STQ1_0))
+
+
+def test_stq1_0_encode_decode_idempotent():
+    """encode(decode(wire)) == wire for every wire with finite d > 0: the
+    codebook is total (any qs/sign bytes are valid) and decode's unique zero
+    per group re-selects the same lane under the strict-< scan."""
+    rng = np.random.default_rng(6)
+    wire = rng.integers(0, 256, size=(16, 2 * 42), dtype=np.uint8)
+    d = (np.abs(rng.standard_normal(32)) + 0.25).astype(np.float16)
+    wire.reshape(-1, 42)[:, 40:42] = d.view(np.uint8).reshape(-1, 2)
+    w_np = quants.dequantize(wire, GT.STQ1_0).astype(np.float32)
+    assert np.array_equal(_encode_wire("stq1_0", w_np), wire)
+    assert np.array_equal(quants.quantize(w_np, GT.STQ1_0), wire)
+
+
 @pytest.mark.parametrize("codec", sorted(REQUIRED_IMATRIX))
 def test_iq_encode_requires_imatrix(codec):
     """The ggml imatrix-required codecs reject a missing imatrix through the
