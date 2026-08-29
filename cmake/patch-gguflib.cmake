@@ -118,3 +118,27 @@ if(NOT _C MATCHES "gguf_open_ro")
   file(WRITE "${_c}" "${_C}")
   message(STATUS "gguflib: patched gguflib.c (read-only open: gguf_open_ro)")
 endif()
+
+# Postconditions: the guards above detect whether a patch was ATTEMPTED, not
+# whether it LANDED -- if a gguflib bump moves an anchor, string(REPLACE)
+# no-ops, the file is rewritten unchanged, and the configure log still prints
+# success. Every marker must be present in the final text; fail the configure
+# otherwise (message(FATAL_ERROR) exits this -P script nonzero, which the
+# callers escalate: PATCH_COMMAND natively, execute_process via
+# COMMAND_ERROR_IS_FATAL).
+file(READ "${_h}" _H)
+file(READ "${_c}" _C)
+foreach(_m "GGUF_TYPE_MXFP4" "GGUF_TYPE_STQ1_0" "gguf_open_ro")
+  if(NOT _H MATCHES "${_m}")
+    message(FATAL_ERROR
+      "gguflib patch did not land: '${_m}' missing from gguflib.h "
+      "(upstream anchor moved after a gguflib bump?)")
+  endif()
+endforeach()
+foreach(_m "\"mxfp4\"" "\"stq1_0\"" "iq4_nl\", 32, 18" "gguf_open_ro")
+  if(NOT _C MATCHES "${_m}")
+    message(FATAL_ERROR
+      "gguflib patch did not land: '${_m}' missing from gguflib.c "
+      "(upstream anchor moved after a gguflib bump?)")
+  endif()
+endforeach()

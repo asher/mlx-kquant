@@ -91,7 +91,8 @@ FetchContent_MakeAvailable(gguflib)
 # _deps sources keep the old patch and silently truncate at the first tensor
 # of any type added since). The script is idempotent; re-apply every configure.
 execute_process(COMMAND ${CMAKE_COMMAND} -DGGUFLIB_DIR=${gguflib_SOURCE_DIR}
-                        -P ${CMAKE_CURRENT_LIST_DIR}/cmake/patch-gguflib.cmake)
+                        -P ${CMAKE_CURRENT_LIST_DIR}/cmake/patch-gguflib.cmake
+                COMMAND_ERROR_IS_FATAL ANY)
 add_library(gguflib STATIC ${gguflib_SOURCE_DIR}/fp16.c
                            ${gguflib_SOURCE_DIR}/gguflib.c)
 # Hidden visibility so the gguf_* symbols stay LOCAL to whichever image links
