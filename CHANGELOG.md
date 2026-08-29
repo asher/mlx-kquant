@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.2]
+
 ### Added
 - `quantized_matmul`, `quantized_matmul_qmv_bias`, `gather_qmv_kq` and
   `gather_qmv_mix_ns_kq` take optional LoRA operands (`lora_a`, `lora_b`,
