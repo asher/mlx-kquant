@@ -135,11 +135,14 @@ foreach(_m "GGUF_TYPE_MXFP4" "GGUF_TYPE_STQ1_0" "gguf_open_ro")
       "(upstream anchor moved after a gguflib bump?)")
   endif()
 endforeach()
-# KQ_GGUF_MMAP witnesses the read-only mmap REPLACE specifically -- the
-# gguf_open_ro marker only covers the function insertion, and losing the mmap
-# edit alone would silently revert read-only opens to PROT_READ|PROT_WRITE.
+# _prot,_flags witnesses the read-only mmap REPLACE specifically: it occurs
+# only in the mutated mmap() argument list. The gguf_open_ro marker covers just
+# the function insertion, and that function's doc comment mentions KQ_GGUF_MMAP
+# too -- so neither of those can tell a landed mmap edit from a missed one, and
+# losing the mmap edit alone silently reverts read-only opens to
+# PROT_READ|PROT_WRITE.
 foreach(_m "\"mxfp4\"" "\"stq1_0\"" "iq4_nl\", 32, 18" "gguf_open_ro"
-        "KQ_GGUF_MMAP")
+        "_prot,_flags")
   if(NOT _C MATCHES "${_m}")
     message(FATAL_ERROR
       "gguflib patch did not land: '${_m}' missing from gguflib.c "
