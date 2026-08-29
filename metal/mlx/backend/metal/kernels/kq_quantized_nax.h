@@ -3317,6 +3317,119 @@ struct KqNaxIq1_mBlockLoader {
   }
 };
 
+// stq1_0: a 32-weight k-tile is exactly 2 lane planes of one 64-weight chunk,
+// so the 16 codebook gathers happen once per tile and each plane is peeled
+// into aligned vec4 stores (0.5 gathers/weight).
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct KqNaxStq1_0BlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
+  MLX_MTL_CONST int weights_per_block = KQ_STQ1_0_SUPERBLOCK;
+  MLX_MTL_CONST int bytes_per_block = KQ_STQ1_0_BLOCK_BYTES;
+  MLX_MTL_CONST int k_tile_size = 32;
+  MLX_MTL_CONST int k_tiles_per_block = weights_per_block / k_tile_size;
+
+  static_assert(BCOLS == 64, "stq1_0 NAX loader requires BCOLS == 64.");
+  static_assert(
+      (BCOLS * BROWS) % tgp_size == 0,
+      "tgp_size must evenly divide BCOLS * BROWS.");
+
+  MLX_MTL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
+  static_assert(n_reads == k_tile_size, "stq1_0 NAX expects n_reads == 32.");
+
+  const int src_ld;
+  const int row_bytes;
+  const int tile_stride;
+  const short fixed_kt_base;
+
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+  short kt_base;
+
+  KqNaxStq1_0BlockLoader(
+      const device uint8_t* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      int col_in_block = 0)
+      : src_ld(src_ld_),
+        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        tile_stride(
+            reduction_dim
+                ? 0
+                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+        fixed_kt_base(reduction_dim == 0 ? (col_in_block / k_tile_size) : 0),
+        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj((thread_idx % TCOLS) * n_reads),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
+        kt_base(0) {}
+
+  void load_unsafe() const {
+    static_assert(
+        dst_ld % 4 == 0, "vec4 threadgroup stores need dst_ld % 4 == 0");
+    const short sb =
+        (reduction_dim == 1 ? kt_base : fixed_kt_base) + bj / k_tile_size;
+    const short chunk = sb >> 1;
+    const short pb = (sb & 1) << 1; // plane base 0 or 2
+    const float d = float(*(const device half*)(src + KQ_STQ1_0_D_OFFSET));
+    const device ushort* qsw =
+        reinterpret_cast<const device ushort*>(src) + 4 * chunk;
+    const ushort sg =
+        *(reinterpret_cast<const device ushort*>(src + KQ_STQ1_0_SIGN_OFFSET) +
+          chunk);
+    uint cbw[4];
+#pragma unroll
+    for (short k = 0; k < 4; ++k) {
+      cbw[k] = kq_stq1_0_cbw(qsw[k], (sg >> (4 * k)) & 0xF);
+    }
+#pragma unroll
+    for (short pp = 0; pp < 2; ++pp) {
+      const short p = pb + pp;
+#pragma unroll
+      for (short k = 0; k < 4; ++k) {
+        *(threadgroup vec<T, 4>*)(dst + 16 * pp + 4 * k) =
+            vec<T, 4>(kq_stq1_0_peel(cbw[k], p) * d);
+      }
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    if (bi >= src_tile_dim.y) {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() {
+    if (reduction_dim == 1) {
+      kt_base += 2;
+      if (kt_base == k_tiles_per_block) {
+        kt_base = 0;
+        src += bytes_per_block;
+      }
+    } else {
+      src += tile_stride;
+    }
+  }
+};
+
 KQ_NAX_DEFINE_KERNELS(iq4_nl, 32, 4, KqNaxIq4_nlBlockLoader)
 KQ_NAX_DEFINE_KERNELS(iq4_xs, 256, 4, KqNaxIq4_xsBlockLoader)
 KQ_NAX_DEFINE_KERNELS(iq3_xxs, 256, 3, KqNaxIq3_xxsBlockLoader)
@@ -3326,6 +3439,7 @@ KQ_NAX_DEFINE_KERNELS(iq2_xs, 256, 2, KqNaxIq2_xsBlockLoader)
 KQ_NAX_DEFINE_KERNELS(iq2_s, 256, 2, KqNaxIq2_sBlockLoader)
 KQ_NAX_DEFINE_KERNELS(iq1_s, 256, 1, KqNaxIq1_sBlockLoader)
 KQ_NAX_DEFINE_KERNELS(iq1_m, 256, 1, KqNaxIq1_mBlockLoader)
+KQ_NAX_DEFINE_KERNELS(stq1_0, 256, 1, KqNaxStq1_0BlockLoader)
 KQ_NAX_DEFINE_KERNELS(q4_0, 32, 4, KqNaxQ4_0BlockLoader)
 KQ_NAX_DEFINE_KERNELS(q4_1, 32, 4, KqNaxQ4_1BlockLoader)
 KQ_NAX_DEFINE_KERNELS(q5_0, 32, 5, KqNaxQ5_0BlockLoader)
@@ -3434,6 +3548,7 @@ KQ_NAX_DEFINE_SPLITK_KERNEL(iq2_xs, 256, 2, KqNaxIq2_xsBlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(iq2_s, 256, 2, KqNaxIq2_sBlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(iq1_s, 256, 1, KqNaxIq1_sBlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(iq1_m, 256, 1, KqNaxIq1_mBlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(stq1_0, 256, 1, KqNaxStq1_0BlockLoader)
 
 template <
     typename T,
@@ -3724,6 +3839,7 @@ KQ_NAX_DEFINE_GATHER_RHS(iq2_xs, 256, 2, KqNaxIq2_xsBlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(iq2_s, 256, 2, KqNaxIq2_sBlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(iq1_s, 256, 1, KqNaxIq1_sBlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(iq1_m, 256, 1, KqNaxIq1_mBlockLoader)
+KQ_NAX_DEFINE_GATHER_RHS(stq1_0, 256, 1, KqNaxStq1_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(q4_0, 32, 4, KqNaxQ4_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(q4_1, 32, 4, KqNaxQ4_1BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(q5_0, 32, 5, KqNaxQ5_0BlockLoader)
