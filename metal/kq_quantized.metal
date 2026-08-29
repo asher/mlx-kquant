@@ -412,6 +412,7 @@ instantiate_mv_ext_all(iq2_xs, 256, 2)
 instantiate_mv_ext_all(iq2_s, 256, 2)
 instantiate_mv_ext_all(iq1_s, 256, 1)
 instantiate_mv_ext_all(iq1_m, 256, 1)
+instantiate_mv_ext_all(stq1_0, 256, 1)
 
 // Wide-M rows-per-thread experiment (KQ_MV_EXT_NR=2): each thread owns nr0=2
 // output rows and shares one activation load across them, halving activation
@@ -924,6 +925,37 @@ instantiate_kquant_iq1_s_for_type(float16_t)
 instantiate_kquant_iq1_m_for_type(float)
 instantiate_kquant_iq1_m_for_type(bfloat16_t)
 instantiate_kquant_iq1_m_for_type(float16_t)
+
+#define instantiate_kquant_stq1_0_for_type(type)                      \
+  instantiate_kquant_batched(qmv_fast, type, 256, 1, 0, stq1_0)       \
+  instantiate_kquant_batched(qmv_fast, type, 256, 1, 1, stq1_0)       \
+  instantiate_kquant_batched(qmv_fast_fine, type, 256, 1, 0, stq1_0)  \
+  instantiate_kquant_batched(qmv_fine, type, 256, 1, 0, stq1_0)       \
+  instantiate_kquant_batched(qmv,      type, 256, 1, 0, stq1_0)       \
+  instantiate_kquant_batched(qmv,      type, 256, 1, 1, stq1_0)       \
+  instantiate_kquant_qmm_t(type, 256, 1, true, 0, stq1_0)             \
+  instantiate_kquant_qmm_t(type, 256, 1, true, 1, stq1_0)            \
+  instantiate_kquant_qmm_t(type, 256, 1, false, 0, stq1_0)            \
+  instantiate_kquant_qmm_t(type, 256, 1, false, 1, stq1_0)            \
+  instantiate_kquant_qmm_t_splitk(type, 256, 1, true, stq1_0)         \
+  instantiate_kquant_qmm_t_splitk(type, 256, 1, false, stq1_0)        \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 256, 1, true, stq1_0)  \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 1, true, stq1_0)   \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 256, 1, false, stq1_0) \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 256, 1, false, stq1_0)  \
+  instantiate_kquant_qmm_n(type, 256, 1, 0, stq1_0)                   \
+  instantiate_kquant_qmm_n(type, 256, 1, 1, stq1_0)                   \
+  instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 1, stq1_0) \
+  instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 1, stq1_0) \
+  instantiate_kquant_gather_qmm_t(type, 256, 1, true, stq1_0)         \
+  instantiate_kquant_gather_qmm_t(type, 256, 1, false, stq1_0)        \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 1, true, stq1_0) \
+  instantiate_kquant_gather_qmm_seg_t(type, 256, 1, false, stq1_0) \
+  instantiate_kquant_gather_qmm_n(type, 256, 1, stq1_0)               \
+  instantiate_kquant_dequantize(type, 256, 1, stq1_0)
+instantiate_kquant_stq1_0_for_type(float)
+instantiate_kquant_stq1_0_for_type(bfloat16_t)
+instantiate_kquant_stq1_0_for_type(float16_t)
 // clang-format on
 
 // clang-format off
@@ -972,6 +1004,7 @@ instantiate_kquant_gather_qmm_rhs_codec(256, 2, iq2_xs)
 instantiate_kquant_gather_qmm_rhs_codec(256, 2, iq2_s)
 instantiate_kquant_gather_qmm_rhs_codec(256, 1, iq1_s)
 instantiate_kquant_gather_qmm_rhs_codec(256, 1, iq1_m)
+instantiate_kquant_gather_qmm_rhs_codec(256, 1, stq1_0)
 
 // Tile-map builder for gather_qmm_seg. One thread per expert-sorted row; the
 // thread whose row starts a 64-row tile appends (expert, row_start, num_rows)
