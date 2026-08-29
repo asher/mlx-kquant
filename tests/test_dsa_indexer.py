@@ -153,6 +153,41 @@ def test_dsa_topk_indices_decode(dtype, bucketed):
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("bucketed", [False, True], ids=["scan", "bucketed"])
+def test_dsa_topk_indices_deterministic_ties(dtype, bucketed):
+    """Threshold ties must be admitted lowest-index-first, every run.
+
+    The atomic tie admission raced the top-k boundary: with 16-bit score
+    quantization the selected set differed run to run, making every
+    QSA/DSA forward nondeterministic (greedy decode included).
+    """
+    rng = np.random.default_rng(17)
+    K, topk = 4096, 512
+    # Coarse quantization: hundreds of exact ties at the threshold value.
+    scores = mx.array(np.round(rng.standard_normal((2, 1, 3, K)) * 2) / 2).astype(dtype)
+    runs = []
+    for _ in range(3):
+        got = kq.dsa_topk_indices(scores, topk, bucketed=bucketed)
+        mx.eval(got)
+        runs.append(np.array(got))
+    np.testing.assert_array_equal(runs[0], runs[1])
+    np.testing.assert_array_equal(runs[0], runs[2])
+    vals = np.array(scores.astype(mx.float32))
+    for b in range(2):
+        for l in range(3):
+            v = vals[b, 0, l]
+            sel = runs[0][b, 0, l]
+            _check_topk_row(v, sel, topk, K)
+            thr = np.partition(v, -topk)[-topk]
+            tie_sel = np.sort(sel[v[sel] == thr])
+            tie_all = np.flatnonzero(v == thr)
+            n_tie = len(tie_sel)
+            np.testing.assert_array_equal(
+                tie_sel, tie_all[:n_tie], "ties not admitted lowest-index-first"
+            )
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_dsa_topk_indices_causal_prefix(dtype):
     rng = np.random.default_rng(13)
     B, L, K, topk = 1, 640, 640, 512
