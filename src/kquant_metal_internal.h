@@ -60,7 +60,7 @@ inline int kquant_qmv_bn(const std::string& kquant_type) {
       kquant_type == "iq3_s" || kquant_type == "iq3_xxs" ||
       kquant_type == "iq2_xxs" || kquant_type == "iq2_xs" ||
       kquant_type == "iq2_s" || kquant_type == "iq1_s" ||
-      kquant_type == "iq1_m") {
+      kquant_type == "iq1_m" || kquant_type == "stq1_0") {
     return 4;
   }
   return 8;
@@ -105,7 +105,7 @@ inline bool codec_has_qmv_fine(const std::string& kquant_type) {
       kquant_type == "iq3_xxs" || kquant_type == "iq3_s" ||
       kquant_type == "iq2_xxs" || kquant_type == "iq2_xs" ||
       kquant_type == "iq2_s" || kquant_type == "iq1_s" ||
-      kquant_type == "iq1_m";
+      kquant_type == "iq1_m" || kquant_type == "stq1_0";
 }
 
 // Default fine-tiling ceiling per codec: the qmv dispatch uses the fine
@@ -138,6 +138,8 @@ inline int kquant_qmv_fine_default_max_n(const std::string& kquant_type) {
   }
   // mxfp4/nvfp4/iq2_xxs/iq2_xs/iq1_s: no synthetic encoder, so no paired
   // A/B yet -- coarse by default until calibrated on real wire data.
+  // stq1_0 IS encodable (imatrix-free) -- coarse only because it is not yet
+  // measured (harness: mlx-quant-lab tools/gemv-fine-ab.py).
   return 0;
 }
 
