@@ -196,11 +196,16 @@ target_link_options(mlx_kquant_ext PRIVATE ${KQ_WHOLE_ARCHIVE_GGUFLIB})
 # repo's kq_*.h + quantized_utils.h (which adds load_vector) win;
 # steel/gemm/*, utils.h, etc. fall through to the stock wheel headers.
 if(MLX_BUILD_METAL)
+  # Header-only kernel edits must retrigger the metallib (it has no depfile).
+  file(GLOB KQ_METAL_KERNEL_HEADERS
+       ${CMAKE_CURRENT_LIST_DIR}/metal/mlx/backend/metal/kernels/*.h)
   mlx_build_metallib(
     TARGET
     mlx_kquant_metallib
     TITLE
     mlx_kquant
+    DEPS
+    ${KQ_METAL_KERNEL_HEADERS}
     SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax.metal
