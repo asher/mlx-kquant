@@ -88,6 +88,10 @@ STQ1_0 = _Stq1_0Type()
 # Plain dict keyed by enum members; a non-enum key is fine. Needed by
 # GGUFWriter.add_tensor_info -> quant_shape_from_byte_shape.
 GGML_QUANT_SIZES[STQ1_0] = (256, 42)
+# Pseudo-member injection: Enum lookup-by-value goes through this map, so
+# GGMLQuantizationType(43) (GGUFReader's tensor-info parse) resolves to the
+# sentinel instead of raising -- real STQ1_0 GGUFs open through gguf-py.
+GGMLQuantizationType._value2member_map_.setdefault(STQ1_0_TYPE_ID, STQ1_0)
 
 
 class _GTProxy:

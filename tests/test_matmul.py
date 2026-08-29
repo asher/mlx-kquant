@@ -26,7 +26,9 @@ import sys
 
 import mlx.core as mx
 import numpy as np
-from gguf import GGMLQuantizationType, GGUFReader, quants
+from gguf import GGUFReader
+from kqref import GT as GGMLQuantizationType
+from kqref import quants
 
 import mlx_kquant as kq
 
@@ -53,6 +55,7 @@ CODEC_BY_NAME = {
     "iq2_s": (GGMLQuantizationType.IQ2_S, 256, 82, 2),
     "iq1_s": (GGMLQuantizationType.IQ1_S, 256, 50, 1),
     "iq1_m": (GGMLQuantizationType.IQ1_M, 256, 56, 1),
+    "stq1_0": (GGMLQuantizationType.STQ1_0, 256, 42, 1),
 }
 
 BACKEND = "mlx_kquant"
