@@ -58,6 +58,7 @@ Fourteen codecs (ten encodable + four decode-only IQ), all defined in
 | `iq2_s` | 2 | 256 | 82 | grid + qh + signs (decode-only) |
 | `iq1_s` | 1 | 256 | 50 | grid + delta (decode-only) |
 | `iq1_m` | 1 | 256 | 56 | grid + delta, scattered scale (decode-only) |
+| `stq1_0` | 1 | 256 | 42 | structured ternary codebook, QAT (CPU encode) |
 
 `weights_per_block` (`wpb`) is the granularity that matters for layout: K-quants pack 256 weights per
 superblock, the block codecs 32. The duck-typed `group_size` attribute on a `KQuant*` module

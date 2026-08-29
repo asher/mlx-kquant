@@ -6,6 +6,20 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- stq1_0 codec (llama.cpp PR #22836, GGML type 43, unmerged upstream --
+  the type id may shift): 1.3125 bpw structured-sparse ternary QAT quant
+  ("Sherry", Tencent Hy-MT1.5). 256-weight / 42-byte blocks, 64
+  stride-16 groups of 4 with one forced zero, 32-entry codebook, fp16
+  d = amax. Full codec: CPU oracle decode + bit-exact encoder port
+  (imatrix-free, CPU-only), Metal ALU kernels (dequant, qmv/qmv_fine,
+  mv_ext, qmm_t/qmm_n, split-K, gather), fused MoE-GLU with a
+  threadgroup codebook and block-uniform scale hoist, and NAX kernels
+  (compile-verified; floors inherited from iq1_s pending M5
+  calibration -- see docs/kernels.md). On M3 Max the decode/verify band
+  (M 1-8) runs 1.7-1.9x faster than iq1_s at [10240x5120]; plain
+  split-K enters at M 5 (measured).
+
 ## [0.4.3]
 
 ### Fixed
