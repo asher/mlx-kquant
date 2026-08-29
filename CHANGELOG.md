@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.3]
+
 ### Fixed
 - dsa_topk: tied scores at the admission threshold were compacted in a
   racy order, so repeated identical forwards could select different
