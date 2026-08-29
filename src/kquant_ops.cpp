@@ -684,11 +684,12 @@ std::vector<mx::array> quantize(
   }
 
   auto s = mx::to_stream(s_);
-  // IQ encode is CPU-only (ggml has no GPU IQ quantizer); force the op onto the
-  // CPU stream UNCONDITIONALLY so KQuantQuantize::eval_cpu runs (it needs a CPU
-  // command encoder) even if the caller passed stream=gpu -- there is no GPU IQ
-  // encoder to honor. All nine IQ codecs -- and no K-quant -- start with "iq".
-  if (kquant_type.rfind("iq", 0) == 0) {
+  // IQ and stq1_0 encode are CPU-only (ggml has no GPU quantizer for them);
+  // force the op onto the CPU stream UNCONDITIONALLY so
+  // KQuantQuantize::eval_cpu runs (it needs a CPU command encoder) even if the
+  // caller passed stream=gpu -- there is no GPU encoder to honor. All nine IQ
+  // codecs -- and no K-quant -- start with "iq"; stq1_0 does not.
+  if (kquant_type.rfind("iq", 0) == 0 || kquant_type == "stq1_0") {
     s = mx::default_stream(mx::Device::cpu);
   }
 
