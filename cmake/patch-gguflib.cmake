@@ -40,6 +40,28 @@ if(NOT _C MATCHES "\"mxfp4\"")
   message(STATUS "gguflib: patched gguflib.c (fp-codec + Q1_0/TQ type-features)")
 endif()
 
+# STQ1_0 (llama.cpp PR #22836, type 43 -- unmerged, may shift): 256 vals / 42 B.
+# Type 42 is an unclaimed slot; the placeholder keeps the table positional.
+file(READ "${_h}" _H)
+if(NOT _H MATCHES "GGUF_TYPE_STQ1_0")
+  string(REPLACE
+    "    GGUF_TYPE_Q1_0 = 41,\n    GGUF_TYPE_COUNT,"
+    "    GGUF_TYPE_Q1_0 = 41,\n    GGUF_TYPE_STQ1_0 = 43,\n    GGUF_TYPE_COUNT,"
+    _H "${_H}")
+  file(WRITE "${_h}" "${_H}")
+  message(STATUS "gguflib: patched gguflib.h (STQ1_0; COUNT=44)")
+endif()
+
+file(READ "${_c}" _C)
+if(NOT _C MATCHES "\"stq1_0\"")
+  string(REPLACE
+    "    {\"q1_0\", 128, 18},\n}"
+    "    {\"q1_0\", 128, 18},\n    {\"unused_42\", 0, 0},\n    {\"stq1_0\", 256, 42},\n}"
+    _C "${_C}")
+  file(WRITE "${_c}" "${_C}")
+  message(STATUS "gguflib: patched gguflib.c (STQ1_0 type-features)")
+endif()
+
 # Correct two upstream IQ block-geometry errors (antirez's table predates the
 # final ggml IQ layout): IQ1_S is 50 B / 256 (it had 110), and IQ4_NL is the
 # ONLY flat IQ codec at 18 B / 32 (it had 256/50 = IQ1_S's geometry). The IQ4_NL
