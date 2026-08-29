@@ -826,7 +826,8 @@ bool codec_has_moe_glu(const std::string& t) {
       t == "q6_k" || t == "q8_0" || t == "q4_0" || t == "q4_1" || t == "q5_0" ||
       t == "q5_1" || t == "iq4_nl" || t == "iq4_xs" || t == "iq3_s" ||
       t == "iq3_xxs" || t == "iq2_xxs" || t == "iq2_xs" || t == "iq2_s" ||
-      t == "iq1_s" || t == "iq1_m" || t == "mxfp4" || t == "nvfp4";
+      t == "iq1_s" || t == "iq1_m" || t == "stq1_0" || t == "mxfp4" ||
+      t == "nvfp4";
 }
 
 namespace {
