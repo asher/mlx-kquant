@@ -6,6 +6,14 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.3]
+
+### Fixed
+- dsa_topk: tied scores at the admission threshold were compacted in a
+  racy order, so repeated identical forwards could select different
+  indexer columns. Compaction is now stable in block order and the same
+  input always yields the same selection.
+
 ## [0.4.2]
 
 ### Added
