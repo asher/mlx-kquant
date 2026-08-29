@@ -16,9 +16,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   mv_ext, qmm_t/qmm_n, split-K, gather), fused MoE-GLU with a
   threadgroup codebook and block-uniform scale hoist, and NAX kernels
   (compile-verified; floors inherited from iq1_s pending M5
-  calibration -- see docs/kernels.md). On M3 Max the decode/verify band
-  (M 1-8) runs 1.7-1.9x faster than iq1_s at [10240x5120]; plain
-  split-K enters at M 5 (measured).
+  calibration -- see docs/kernels.md). On M3 Max (ABBA-paired vs iq1_s
+  at [10240x5120]): parity at M 1-4 (0.88-0.94x), 1.24-1.34x faster
+  through the M 8-12 verify band, parity again from M 16; plain split-K
+  enters at M 5 (measured). At M 1 the whole codec field sits at a
+  ~200 Gweight/s ALU floor, so the pair-LUT gather halving stays the
+  headline phase-2 lever.
 
 ## [0.4.3]
 
