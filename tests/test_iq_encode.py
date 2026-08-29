@@ -5,10 +5,10 @@ gguf-py decodes every IQ codec but cannot encode them, so the oracle here is a
 round-trip: our CPU encoder -> gguf-py reference decoder -> compare to the
 original within a per-codec bound. (Byte-exactness vs llama-quantize is a
 separate lab-side check, not run here.) Also asserts encode determinism, that
-the imatrix steers the encoder, and that the ggml imatrix-required codecs reject
-a missing imatrix -- every IQ codec is importance-weighted, including the flat-32
-iq4_nl, so the wpb==256 heuristic the K-quants use is wrong here and the
-expectation is registry-driven instead.
+the imatrix steers the encoder (IMATRIX_STEERS -- every IQ codec, including the
+flat-32 iq4_nl, but not the QAT stq1_0, which ignores it), and that the ggml
+imatrix-required codecs reject a missing imatrix -- the wpb==256 heuristic the
+K-quants use is wrong here and the expectation is set-driven instead.
 
 Only codecs whose CPU encoder has landed are listed; the map grows per phase.
 kq.quantize forces IQ onto a CPU stream internally, so these run on CI with no
@@ -20,8 +20,7 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 import pytest
-from gguf import GGMLQuantizationType as GT
-from gguf import quants
+from kqref import GT, quants
 
 import mlx_kquant as kq
 
@@ -29,7 +28,9 @@ import mlx_kquant as kq
 # 4-bit (iq4_*) round-trips to ~0.076 on random gaussian data (q4_k-class); the
 # 2-bit iq2_xxs to ~0.36 (random weights are worst-case for an importance-
 # weighted codec; real model weights round-trip far tighter). Bounds carry
-# ~1.3x headroom over the measured value.
+# ~1.3x headroom over the measured value. Exception: stq1_0 is a QAT codec --
+# post-hoc encoding of random gaussians measures ~2.2 rel (worse than zeros,
+# by design), so its 2.5 bound is a regression tripwire, not a quality gate.
 IQ_ENCODE_CODECS = {
     "iq4_nl": (GT.IQ4_NL, 32, 4, 0.12),
     "iq4_xs": (GT.IQ4_XS, 256, 4, 0.12),
@@ -40,7 +41,12 @@ IQ_ENCODE_CODECS = {
     "iq3_s": (GT.IQ3_S, 256, 3, 0.30),
     "iq1_s": (GT.IQ1_S, 256, 1, 0.65),
     "iq1_m": (GT.IQ1_M, 256, 1, 0.65),
+    "stq1_0": (GT.STQ1_0, 256, 1, 2.5),
 }
+
+# Codecs whose encoder the imatrix steers. stq1_0 ignores it (QAT: fixed
+# zero-lane rule, d = amax).
+IMATRIX_STEERS = set(IQ_ENCODE_CODECS) - {"stq1_0"}
 
 # Codecs ggml marks imatrix-required: kq.quantize rejects them without an
 # imatrix (mirrors ggml_quantize_requires_imatrix). The rest fall back gracefully
@@ -83,7 +89,8 @@ def test_iq_encode_roundtrip(codec):
 @pytest.mark.parametrize("codec", list(IQ_ENCODE_CODECS))
 def test_iq_encode_imatrix_roundtrip(codec):
     """Encode with an importance matrix; reconstruction stays within a relaxed
-    bound (imatrix minimizes importance-weighted, not plain Frobenius, error)."""
+    bound (imatrix minimizes importance-weighted, not plain Frobenius, error).
+    Vacuous for stq1_0 (imatrix discarded; same rel as the plain bound)."""
     gtype, _wpb, _bits, bound = IQ_ENCODE_CODECS[codec]
     rng = np.random.default_rng(7)
     w_np = (rng.standard_normal((N, K)) * 0.1).astype(np.float32)
@@ -103,11 +110,11 @@ def test_iq_encode_deterministic(codec):
     assert np.array_equal(a, b)
 
 
-@pytest.mark.parametrize("codec", list(IQ_ENCODE_CODECS))
+@pytest.mark.parametrize("codec", sorted(IMATRIX_STEERS))
 def test_iq_encode_imatrix_steers(codec):
-    """Every IQ codec is importance-weighted (including flat-32 iq4_nl), so the
-    imatrix MUST change the wire bytes. Graceful codecs compare no-imatrix vs
-    imatrix; required codecs (which reject no-imatrix) compare two imatrices."""
+    """Every codec in IMATRIX_STEERS is importance-weighted (including flat-32
+    iq4_nl), so the imatrix MUST change the wire bytes. Graceful codecs compare
+    no-imatrix vs imatrix; required codecs (which reject it) two imatrices."""
     rng = np.random.default_rng(7)
     w_np = (rng.standard_normal((N, K)) * 0.1).astype(np.float32)
     steered = _encode_wire(codec, w_np, imatrix=_imatrix(rng, scale=1.0))

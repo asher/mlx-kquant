@@ -40,8 +40,7 @@ import sys
 import mlx.core as mx
 import numpy as np
 import pytest
-from gguf import GGMLQuantizationType as GT
-from gguf import quants
+from kqref import GT, quants
 
 import mlx_kquant as kq
 
@@ -71,6 +70,7 @@ CODECS = {
     "iq2_s": (GT.IQ2_S, 256, 82, False),
     "iq1_s": (GT.IQ1_S, 256, 50, False),
     "iq1_m": (GT.IQ1_M, 256, 56, False),
+    "stq1_0": (GT.STQ1_0, 256, 42, False),
     "mxfp4": (GT.MXFP4, 32, 17, False),
     "nvfp4": (GT.NVFP4, 64, 36, False),
 }
@@ -98,6 +98,9 @@ def _synth_iq_wire(rng, bpb, n_blocks):
         for k, byteidx in enumerate((49, 51, 53, 55)):
             nib = ((dbits >> (4 * k)) & 0xF).astype(np.uint8)
             wire[:, byteidx] = (wire[:, byteidx] & 0x0F) | (nib << 4)
+    elif bpb == 42:
+        # stq1_0: fp16 d at bytes 40:42; everything else is valid wire.
+        wire[:, 40:42] = d.view(np.uint8).reshape(n_blocks, 2)
     else:
         wire[:, 0:2] = d.view(np.uint8).reshape(n_blocks, 2)
     return wire
@@ -107,7 +110,7 @@ def _wire_and_ref(codec, seed=11, k=K):
     """Return (wire uint8[E, N, packed], ref float32[E, N, k]) or (None, None)
     when a K-quant fixture is missing. k only varies for synthesized codecs."""
     gtype, wpb, bpb, is_kq = CODECS[codec]
-    if codec.startswith("iq") or codec == "nvfp4":
+    if codec.startswith("iq") or codec in ("nvfp4", "stq1_0"):
         rng = np.random.default_rng(seed)
         wires = [
             _synth_iq_wire(rng, bpb, N * (k // wpb)).reshape(N, (k // wpb) * bpb)
