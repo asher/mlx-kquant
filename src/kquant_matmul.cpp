@@ -249,9 +249,8 @@ static int kq_splitk_min_m_nax_alu(const std::string& t) {
 // - iq1_s and iq1_m: their tiles cost 3-4x iq2_xxs's per weight, so
 //   the mv paths win through M12 (0.68-1.87x); the default falls to
 //   plain qmm_t at M13 and the tile wins 0.72-0.84x at M16. Entry 13.
-// - stq1_0 (measured 2026-08-29, same shapes/protocol): 1.02-1.05x at
-//   M5, 0.94-0.97x at M4, 1.15-1.49x through M12 (no grid, cheap
-//   tile). Entry 5.
+// - stq1_0: 1.02-1.05x at M5, 0.94-0.97x at M4, 1.15-1.49x through
+//   M12. Entry 5.
 // The bm16 tile that preceded bm8 entered q4_k/q3_k/q5_k/q6_k/iq3_s/
 // iq3_xxs/iq4_nl at 6, iq2_s and q8_0 at 8, iq4_xs at 10.
 static int kq_splitk_min_m(const std::string& t) {
@@ -298,8 +297,7 @@ static int kq_splitk_nax_min_m(const std::string& t) {
     return 12;
   }
   if (t == "iq3_s" || t == "iq2_xxs" || t == "iq1_s" || t == "stq1_0") {
-    // stq1_0: inherited from iq1_s, NOT measured (M5 calibration pending,
-    // docs/kernels.md).
+    // stq1_0 is inherited from iq1_s, not measured (M5 calibration pending).
     return 10;
   }
   if (t == "q2_k" || t == "q3_k" || t == "q4_k" || t == "q5_k" || t == "q8_0" ||

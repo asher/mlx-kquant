@@ -40,8 +40,7 @@ if(NOT _C MATCHES "\"mxfp4\"")
   message(STATUS "gguflib: patched gguflib.c (fp-codec + Q1_0/TQ type-features)")
 endif()
 
-# STQ1_0 (llama.cpp PR #22836, type 43 -- unmerged, may shift): 256 vals / 42 B.
-# Type 42 is an unclaimed slot; the placeholder keeps the table positional.
+# STQ1_0 (llama.cpp PR #22836, type 43; unmerged, may shift): 256 vals / 42 B.
 file(READ "${_h}" _H)
 if(NOT _H MATCHES "GGUF_TYPE_STQ1_0")
   string(REPLACE
@@ -119,13 +118,8 @@ if(NOT _C MATCHES "gguf_open_ro")
   message(STATUS "gguflib: patched gguflib.c (read-only open: gguf_open_ro)")
 endif()
 
-# Postconditions: the guards above detect whether a patch was ATTEMPTED, not
-# whether it LANDED -- if a gguflib bump moves an anchor, string(REPLACE)
-# no-ops, the file is rewritten unchanged, and the configure log still prints
-# success. Every marker must be present in the final text; fail the configure
-# otherwise (message(FATAL_ERROR) exits this -P script nonzero, which the
-# callers escalate: PATCH_COMMAND natively, execute_process via
-# COMMAND_ERROR_IS_FATAL).
+# The guards above detect whether a patch was attempted, not whether it
+# landed. Every marker must appear in the final text or the configure fails.
 file(READ "${_h}" _H)
 file(READ "${_c}" _C)
 foreach(_m "GGUF_TYPE_MXFP4" "GGUF_TYPE_STQ1_0" "gguf_open_ro")
@@ -135,12 +129,8 @@ foreach(_m "GGUF_TYPE_MXFP4" "GGUF_TYPE_STQ1_0" "gguf_open_ro")
       "(upstream anchor moved after a gguflib bump?)")
   endif()
 endforeach()
-# _prot,_flags witnesses the read-only mmap REPLACE specifically: it occurs
-# only in the mutated mmap() argument list. The gguf_open_ro marker covers just
-# the function insertion, and that function's doc comment mentions KQ_GGUF_MMAP
-# too -- so neither of those can tell a landed mmap edit from a missed one, and
-# losing the mmap edit alone silently reverts read-only opens to
-# PROT_READ|PROT_WRITE.
+# _prot,_flags appears only in the mutated mmap() argument list, so it is the
+# one marker that witnesses that REPLACE specifically.
 foreach(_m "\"mxfp4\"" "\"stq1_0\"" "iq4_nl\", 32, 18" "gguf_open_ro"
         "_prot,_flags")
   if(NOT _C MATCHES "${_m}")

@@ -38,8 +38,7 @@ CODEC_GEOMETRY: dict[str, tuple[int, int, int, int]] = {
     # has no super-block d (reconstructed from scattered scale nibbles).
     "iq1_s": (256, 1, 50, 256),
     "iq1_m": (256, 1, 56, 256),
-    # STQ1_0 (1.3125 bpw): QAT structured-sparse ternary (llama.cpp PR #22836);
-    # 32-entry codebook of 4-lane patterns, one forced zero per group of 4.
+    # stq1_0: QAT structured-sparse ternary (llama.cpp PR #22836).
     "stq1_0": (256, 1, 42, 256),
     # Native-fp codecs (OCP micro-scaling floats): mxfp4 is one e8m0 scale per
     # 32 E2M1 values; nvfp4 packs four 16-value ue4m3-scaled groups per

@@ -2094,10 +2094,8 @@ void quantize_iq1_m_block(
   std::memcpy(block + 48, sc, 8);
 }
 
-// STQ1_0: faithful port of quantize_row_stq1_0_ref (llama.cpp PR #22836).
-// d = amax; per stride-16 group of 4, zero the min-|x| lane (strict <, lowest
-// plane wins ties), others -> sign; reverse LUTs map the packed 2-bit lanes to
-// (slot, sign). imatrix is ignored (QAT codec).
+// Port of quantize_row_stq1_0_ref: d = amax; zero the min-|x| lane per group
+// (strict <), others take sign(x). The imatrix is ignored (QAT codec).
 struct Stq1ReverseLut {
   uint8_t slot[256];
   uint8_t sign[256];

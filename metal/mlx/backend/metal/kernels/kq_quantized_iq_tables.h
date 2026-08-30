@@ -1474,10 +1474,8 @@ static const constant uint8_t kmask_iq2xs[8] = {
     128,
 };
 
-// STQ1_0 (llama.cpp PR #22836, unmerged; hand-added). Index (sign<<4)|slot ->
-// 2-bit lanes (0,1,2)->(-1,0,+1). cb[0x10|slot] == 0xAA - cb[slot], borrow-free
-// per byte (max entry 0xA9), so a whole-word 0xAAAAAAAA - cbw sign fold is
-// exact.
+// STQ1_0 (llama.cpp PR #22836): (sign<<4)|slot -> four 2-bit lanes.
+// cb[0x10|slot] == 0xAA - cb[slot] with no byte borrow (max entry 0xA9).
 static const constant uint8_t stq1_0_codebook[32] = {
     0xA9, 0x89, 0x29, 0x09, 0xA6, 0x86, 0x26, 0x06, 0x9A, 0x92, 0x1A,
     0x12, 0x6A, 0x62, 0x4A, 0x42, 0x01, 0x21, 0x81, 0xA1, 0x04, 0x24,

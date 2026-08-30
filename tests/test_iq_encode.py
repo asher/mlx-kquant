@@ -28,9 +28,8 @@ import mlx_kquant as kq
 # 4-bit (iq4_*) round-trips to ~0.076 on random gaussian data (q4_k-class); the
 # 2-bit iq2_xxs to ~0.36 (random weights are worst-case for an importance-
 # weighted codec; real model weights round-trip far tighter). Bounds carry
-# ~1.3x headroom over the measured value. Exception: stq1_0 is a QAT codec --
-# post-hoc encoding of random gaussians measures ~2.2 rel (worse than zeros,
-# by design), so its 2.5 bound is a regression tripwire, not a quality gate.
+# ~1.3x headroom over the measured value. Exception: stq1_0 is QAT; post-hoc
+# random gaussians measure ~2.2 rel, so 2.5 is a tripwire, not a quality gate.
 IQ_ENCODE_CODECS = {
     "iq4_nl": (GT.IQ4_NL, 32, 4, 0.12),
     "iq4_xs": (GT.IQ4_XS, 256, 4, 0.12),
@@ -44,8 +43,7 @@ IQ_ENCODE_CODECS = {
     "stq1_0": (GT.STQ1_0, 256, 1, 2.5),
 }
 
-# Codecs whose encoder the imatrix steers. stq1_0 ignores it (QAT: fixed
-# zero-lane rule, d = amax).
+# stq1_0 ignores the imatrix (QAT).
 IMATRIX_STEERS = set(IQ_ENCODE_CODECS) - {"stq1_0"}
 
 # Codecs ggml marks imatrix-required: kq.quantize rejects them without an

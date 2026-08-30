@@ -86,10 +86,8 @@ FetchContent_Declare(
   PATCH_COMMAND ${CMAKE_COMMAND} -DGGUFLIB_DIR=<SOURCE_DIR>
                 -P ${CMAKE_CURRENT_LIST_DIR}/cmake/patch-gguflib.cmake)
 FetchContent_MakeAvailable(gguflib)
-# The PATCH_COMMAND stamp is keyed on its command string, not the script's
-# content, so a warm build tree never re-runs an edited patch script (its
-# _deps sources keep the old patch and silently truncate at the first tensor
-# of any type added since). The script is idempotent; re-apply every configure.
+# The PATCH_COMMAND stamp ignores script edits; re-apply on every configure so
+# warm build trees pick them up.
 execute_process(COMMAND ${CMAKE_COMMAND} -DGGUFLIB_DIR=${gguflib_SOURCE_DIR}
                         -P ${CMAKE_CURRENT_LIST_DIR}/cmake/patch-gguflib.cmake
                 COMMAND_ERROR_IS_FATAL ANY)
@@ -203,9 +201,7 @@ target_link_options(mlx_kquant_ext PRIVATE ${KQ_WHOLE_ARCHIVE_GGUFLIB})
 # repo's kq_*.h + quantized_utils.h (which adds load_vector) win;
 # steel/gemm/*, utils.h, etc. fall through to the stock wheel headers.
 if(MLX_BUILD_METAL)
-  # Header-only kernel edits must retrigger the metallib (it has no depfile).
-  # CONFIGURE_DEPENDS: a newly added kernel header joins DEPS without a manual
-  # reconfigure.
+  # The metallib has no depfile; header edits retrigger it only through DEPS.
   file(GLOB KQ_METAL_KERNEL_HEADERS CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_LIST_DIR}/metal/mlx/backend/metal/kernels/*.h)
   mlx_build_metallib(

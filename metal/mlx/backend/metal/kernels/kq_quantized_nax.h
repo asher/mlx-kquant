@@ -3317,9 +3317,8 @@ struct KqNaxIq1_mBlockLoader {
   }
 };
 
-// stq1_0: a 32-weight k-tile is exactly 2 lane planes of one 64-weight chunk,
-// so the 16 codebook gathers happen once per tile and each plane is peeled
-// into aligned vec4 stores (0.5 gathers/weight).
+// stq1_0: a 32-weight k-tile is 2 planes of one chunk, so the 16 codebook
+// gathers happen once per tile (0.5 gathers/weight).
 template <
     typename T,
     short BROWS,
@@ -3383,7 +3382,7 @@ struct KqNaxStq1_0BlockLoader {
     const short sb =
         (reduction_dim == 1 ? kt_base : fixed_kt_base) + bj / k_tile_size;
     const short chunk = sb >> 1;
-    const short pb = (sb & 1) << 1; // plane base 0 or 2
+    const short pb = (sb & 1) << 1;
     const float d = float(*(const device half*)(src + KQ_STQ1_0_D_OFFSET));
     const device ushort* qsw =
         reinterpret_cast<const device ushort*>(src) + 4 * chunk;

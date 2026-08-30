@@ -734,11 +734,8 @@ void dequantize_iq1_m(const uint8_t* w, T* out, std::size_t num_weights) {
   }
 }
 
-// STQ1_0 (1.3125 bpw): QAT structured-sparse ternary. 64 groups of 4 per
-// block; group g = (chunk g/16, gloc g%16) covers weights
-// {chunk*64 + gloc + p*16 : p in 0..3} (stride-16 planes). 4-bit slot + 1-bit
-// sign index the 32-entry codebook; lane p of the codebook byte decodes as
-// (q - 1) * d with q in {0,1,2}.
+// STQ1_0: group g = (chunk g/16, gloc g%16) covers weights
+// chunk*64 + gloc + p*16; lane p of the codebook byte decodes as (q - 1) * d.
 template <typename T>
 void dequantize_stq1_0(const uint8_t* w, T* out, std::size_t num_weights) {
   constexpr int block_weights = 256;

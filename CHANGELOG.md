@@ -7,21 +7,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- stq1_0 codec (llama.cpp PR #22836, GGML type 43, unmerged upstream --
-  the type id may shift): 1.3125 bpw structured-sparse ternary QAT quant
-  ("Sherry", Tencent Hy-MT1.5). 256-weight / 42-byte blocks, 64
-  stride-16 groups of 4 with one forced zero, 32-entry codebook, fp16
-  d = amax. Full codec: CPU oracle decode + bit-exact encoder port
-  (imatrix-free, CPU-only), Metal ALU kernels (dequant, qmv/qmv_fine,
-  mv_ext, qmm_t/qmm_n, split-K, gather), fused MoE-GLU with a
-  threadgroup codebook and block-uniform scale hoist, and NAX kernels
-  (compile-verified; floors inherited from iq1_s pending M5
-  calibration -- see docs/kernels.md). On M3 Max (ABBA-paired vs iq1_s
-  at [10240x5120]): parity at M 1-4 (0.88-0.94x), 1.24-1.34x faster
-  through the M 8-12 verify band, parity again from M 16; plain split-K
-  enters at M 5 (measured). At M 1 the whole codec field sits at a
-  ~200 Gweight/s ALU floor, so the pair-LUT gather halving stays the
-  headline phase-2 lever.
+- The stq1_0 codec, a 1.3125 bpw structured-sparse ternary QAT quant
+  from llama.cpp PR #22836 (GGML type 43; unmerged, the id may shift).
+  It ships CPU decode, a bit-exact encoder, Metal ALU kernels on every
+  route, fused MoE-GLU, and NAX kernels (compile-verified; M5
+  calibration pending, see docs/kernels.md). On M3 Max it matches
+  iq1_s at M 1-4 and from M 16, and runs 1.24-1.34x faster through the
+  M 8-12 verify band.
 
 ## [0.4.3]
 

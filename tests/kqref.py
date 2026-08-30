@@ -1,19 +1,10 @@
-"""gguf.quants-compatible oracle shim adding STQ1_0.
+"""gguf.quants-compatible oracle shim adding STQ1_0, which gguf-py lacks.
 
-gguf-py (0.19.0) has no STQ1_0: ``GT.STQ1_0`` raises and ``quants.dequantize``
-rejects the raw id. This shim is the single Python-side source of the STQ1_0
-type id and reference codec for the test suite:
-
-- ``STQ1_0``: sentinel that drops into the ``GT.<X>`` slot of the per-file
-  codec tables (``.name``/``.value``/``int()``); registered in gguf-py's
-  ``GGML_QUANT_SIZES`` at import so ``GGUFWriter`` can synthesize STQ1_0 files.
-- ``GT``: attribute proxy over ``GGMLQuantizationType`` plus ``GT.STQ1_0``.
-- ``quants``: ``quantize``/``dequantize`` that handle the sentinel with the
-  NumPy reference below and delegate every real enum member to ``gguf.quants``.
-
-The NumPy codec is a port of llama.cpp PR #22836's reference: any random
-qs/sign wire is valid (the 32-entry codebook is total), and
-``quantize(dequantize(wire)) == wire`` whenever d > 0.
+Exports the STQ1_0 sentinel (the single Python-side type-id constant), a GT
+proxy over GGMLQuantizationType, and a quants proxy whose quantize/dequantize
+handle the sentinel with the NumPy reference codec below and delegate real enum
+members to gguf.quants. Any random qs/sign wire is valid, and
+quantize(dequantize(wire)) == wire whenever d > 0.
 """
 
 from __future__ import annotations
@@ -85,12 +76,10 @@ class _Stq1_0Type:
 
 
 STQ1_0 = _Stq1_0Type()
-# Plain dict keyed by enum members; a non-enum key is fine. Needed by
-# GGUFWriter.add_tensor_info -> quant_shape_from_byte_shape.
+# Lets GGUFWriter synthesize STQ1_0 files (a non-enum key is fine).
 GGML_QUANT_SIZES[STQ1_0] = (256, 42)
-# Pseudo-member injection: Enum lookup-by-value goes through this map, so
-# GGMLQuantizationType(43) (GGUFReader's tensor-info parse) resolves to the
-# sentinel instead of raising -- real STQ1_0 GGUFs open through gguf-py.
+# GGMLQuantizationType(43) resolves to the sentinel instead of raising, so
+# GGUFReader opens real STQ1_0 files.
 GGMLQuantizationType._value2member_map_.setdefault(STQ1_0_TYPE_ID, STQ1_0)
 
 
@@ -115,11 +104,11 @@ def _dequantize_stq1_0(data: np.ndarray) -> np.ndarray:
     nb = blocks.shape[0]
     qs = blocks[:, :32]
     sg = blocks[:, 32:40]
-    d = blocks[:, 40:42].copy().view(np.float16).astype(np.float32)  # [nb, 1]
+    d = blocks[:, 40:42].copy().view(np.float16).astype(np.float32)
     g = np.arange(64)
     slots = (qs[:, g >> 1] >> (4 * (g & 1))) & 0xF
     signs = (sg[:, g >> 3] >> (g & 7)) & 1
-    cb = _CODEBOOK[(signs.astype(np.int32) << 4) | slots]  # [nb, 64]
+    cb = _CODEBOOK[(signs.astype(np.int32) << 4) | slots]
     p = np.arange(4)
     lanes = ((cb[:, :, None] >> (2 * p)) & 3).astype(np.float32) - 1.0
     # group axis (chunk, gloc) with lane p -> weight chunk*64 + p*16 + gloc

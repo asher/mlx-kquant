@@ -1,10 +1,7 @@
-// STQ1_0: 42 bytes/256 weights. [qs[32]][sign[8]][fp16 d]. QAT structured-
-// sparse ternary (llama.cpp PR #22836): 64 groups of 4 with exactly one zero
-// and three +/-1 per group, all scaled by the block d. Stride-16 grouping:
-// group g = (chunk g/16, gloc g%16) covers weights {chunk*64 + gloc + p*16},
-// so 16 contiguous weights are lane plane p = il%4 of chunk il/4 -- decode
-// gathers the chunk's codebook bytes once and peels planes by shift/mask.
-// Block stride 42 is 2 mod 4: only half/ushort loads are alignment-safe.
+// STQ1_0 (llama.cpp PR #22836): 42-byte block [qs[32]][sign[8]][fp16 d].
+// Group g = (chunk g/16, gloc g%16) covers weights chunk*64 + gloc + p*16, so
+// 16 contiguous weights are plane p = il%4 of chunk il/4. The 42-byte block
+// stride is 2 mod 4, so only half/ushort loads are alignment-safe.
 
 MLX_MTL_CONST int KQ_STQ1_0_SUPERBLOCK = 256;
 MLX_MTL_CONST int KQ_STQ1_0_BLOCK_BYTES = 42;
@@ -12,9 +9,8 @@ MLX_MTL_CONST int KQ_STQ1_0_QS_OFFSET = 0;
 MLX_MTL_CONST int KQ_STQ1_0_SIGN_OFFSET = 32;
 MLX_MTL_CONST int KQ_STQ1_0_D_OFFSET = 40;
 
-// Word producer: pack the codebook bytes of four consecutive groups. q4 holds
-// their slot nibbles (low first), sbits their sign bits at 0..3. A future
-// TQ2_0 shares the peel below with a raw-load word producer instead.
+// Packs the codebook bytes of four consecutive groups: q4 holds their slot
+// nibbles (low first), sbits their sign bits at 0..3.
 METAL_FUNC uint kq_stq1_0_cbw(ushort q4, ushort sbits) {
   uint cbw = 0;
 #pragma unroll
@@ -26,7 +22,6 @@ METAL_FUNC uint kq_stq1_0_cbw(ushort q4, ushort sbits) {
   return cbw;
 }
 
-// Peel lane plane p from a packed qpack word: four {-1, 0, +1} weights.
 METAL_FUNC float4 kq_stq1_0_peel(uint cbw, short p) {
   const uint v = (cbw >> (2 * p)) & 0x03030303u;
   return float4(as_type<uchar4>(v)) - 1.0f;
@@ -69,8 +64,6 @@ template <typename T, int group_size, int bits>
   kq_stq1_0_dequantize_impl<T>(w, out, num_weights, gid);
 }
 
-// Chunk dequant for mv_ext / MoE: 16 contiguous weights [il*16, il*16+16) =
-// lane plane il%4 of chunk il/4, gathered as four cbw words of 4 groups each.
 inline void kq_stq1_0_deq_chunk16(
     const device uint8_t* block,
     short il,
@@ -115,13 +108,11 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
       w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
 }
 
-// MoE-GLU threadgroup staging: 32-byte codebook (the cheapest stage in the
-// fleet), and the block-uniform d hoists out of deq_chunk16s entirely -- the
-// fused path folds it once per chunk dot, so it is tolerance-equal (not
-// bit-equal) to the scaled decode.
+// deq_chunk16s returns scale = d with raw {-1,0,+1} lanes; the hoisted scale
+// makes the fused path tolerance-equal to the scaled decode, not bit-equal.
 template <>
 struct KqTgLuts<KqStq1_0Ext> {
-  MLX_MTL_CONST int bytes = 32; // codebook
+  MLX_MTL_CONST int bytes = 32;
   static METAL_FUNC void
   stage(threadgroup uint8_t* dst, ushort lin, ushort n_threads) {
     threadgroup uint32_t* d32 = reinterpret_cast<threadgroup uint32_t*>(dst);
@@ -175,10 +166,8 @@ struct KqTgLuts<KqStq1_0Ext> {
 
 // ===================== STQ1_0 matmul / gather / qmv =====================
 
-// Lane simd_lid owns contiguous weights [simd_lid*8, +8): chunk = lid/8,
-// plane p = (lid/2)%4, gloc half h = lid%2 -> two cbw words of the chunk's
-// groups 8h..8h+7, both peeled at plane p. Weights are exactly {-1, 0, +1}*d
-// so every product is exact.
+// Lane simd_lid owns weights [simd_lid*8, +8): chunk lid/8, plane (lid/2)%4,
+// half lid%2.
 template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
 METAL_FUNC void kq_stq1_0_qmv_impl(
     const device uint8_t* w,
@@ -317,9 +306,8 @@ struct KqStq1_0BlockLoader {
         sub_block_idx(0) {}
 
   void load_unsafe() const {
-    // A 32-weight sub-block is planes {0,1} (sb even) or {2,3} (sb odd) of
-    // chunk sb/2 -- never straddles a chunk. Each 8-run peels one half-plane
-    // from a cbw pair into two aligned vec4 stores.
+    // A 32-weight sub-block is planes {0,1} or {2,3} of chunk sb/2; it never
+    // straddles a chunk.
     static_assert(n_reads % 8 == 0, "vector loader needs whole 8-runs");
     const short sb = (reduction_dim == 0) ? fixed_sub_block_idx : sub_block_idx;
     const short chunk = sb >> 1;
@@ -331,7 +319,7 @@ struct KqStq1_0BlockLoader {
           chunk);
 #pragma unroll
     for (short t = 0; t < n_reads / 8; ++t) {
-      const short o = (sb & 1) * 32 + bj + 8 * t; // offset within the chunk
+      const short o = (sb & 1) * 32 + bj + 8 * t;
       const short p = o >> 4;
       const short h = (o >> 3) & 1;
       const uint cbw0 = kq_stq1_0_cbw(qsw[2 * h], (sg >> (8 * h)) & 0xF);
@@ -549,8 +537,7 @@ template <typename T, int group_size, int bits, bool batched>
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
-// Finer-tiled qmv_fast: 1 result per simdgroup -> 2 output rows per
-// threadgroup (vs 4 in the default). Bit-exact vs the default variant.
+// Finer tiling: 1 result per simdgroup, 2 output rows per threadgroup.
 template <typename T, int group_size, int bits, bool batched>
 [[kernel]] void kq_stq1_0_qmv_fast_fine(
     const device uint8_t* w,
@@ -610,8 +597,6 @@ template <typename T, int group_size, int bits, bool batched>
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
-// Finer-tiled qmv (see kq_stq1_0_qmv_fast_fine): 2 output rows per
-// threadgroup.
 template <typename T, int group_size, int bits, bool batched>
 [[kernel]] void kq_stq1_0_qmv_fine(
     const device uint8_t* w,

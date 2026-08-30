@@ -138,8 +138,7 @@ inline int kquant_qmv_fine_default_max_n(const std::string& kquant_type) {
   }
   // mxfp4/nvfp4/iq2_xxs/iq2_xs/iq1_s: no synthetic encoder, so no paired
   // A/B yet -- coarse by default until calibrated on real wire data.
-  // stq1_0 IS encodable (imatrix-free) -- coarse only because it is not yet
-  // measured (harness: mlx-quant-lab tools/gemv-fine-ab.py).
+  // stq1_0 is encodable but unmeasured; coarse for now.
   return 0;
 }
 
