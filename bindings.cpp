@@ -1635,7 +1635,12 @@ NB_MODULE(_ext, m) {
   m.def(
       "load_gguf",
       [](const std::string& path, bool zero_copy) {
-        mlx_kquant::GgufLoadResult res = mlx_kquant::load_gguf(path, zero_copy);
+        // Parse + mmap wrap can take seconds per shard; without the GIL
+        // released a background load freezes the interpreter's UI threads.
+        mlx_kquant::GgufLoadResult res = [&] {
+          nb::gil_scoped_release nogil;
+          return mlx_kquant::load_gguf(path, zero_copy);
+        }();
 
         nb::dict arrays;
         for (auto& [name, arr] : res.arrays) {
