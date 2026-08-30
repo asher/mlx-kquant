@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.4]
+
 ### Added
 - The stq1_0 codec, a 1.3125 bpw structured-sparse ternary QAT quant
   from llama.cpp PR #22836 (GGML type 43; unmerged, the id may shift).
@@ -14,6 +16,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   calibration pending, see docs/kernels.md). On M3 Max it matches
   iq1_s at M 1-4 and from M 16, and runs 1.24-1.34x faster through the
   M 8-12 verify band.
+
+### Changed
+- load_gguf parse releases the python GIL
 
 ## [0.4.3]
 
