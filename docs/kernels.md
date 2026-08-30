@@ -91,6 +91,13 @@ Tuning levers (defaults are right for normal use):
   only. `HD` measured +4-5% at M 8; the rest flat to negative on M5 Max. Kept as probes. Default
   off.
 
+`stq1_0` (structured-sparse ternary, llama.cpp PR #22836) ships the full ALU and NAX kernel set,
+but only the pre-NAX floors are measured (M3 Max: plain split-K entry M 5). Its NAX policy is
+inherited from `iq1_s` and needs M5-silicon calibration: `bm128_min_m`
+(`benchmarks/bench_qmm_bm128_ab.py`), the NAX split-K entry in `kq_splitk_nax_min_m`
+(`benchmarks/bench_verify_band_ab.py`), `kq_splitk_min_m_nax_alu`, and db64 candidacy (no `_db`
+instantiation yet).
+
 ## MoE GLU
 
 Fused gate/up expert matvecs with the GLU epilogue applied in the same dispatch, so each activation

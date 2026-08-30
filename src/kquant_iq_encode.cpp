@@ -2094,6 +2094,70 @@ void quantize_iq1_m_block(
   std::memcpy(block + 48, sc, 8);
 }
 
+// Port of quantize_row_stq1_0_ref: d = amax; zero the min-|x| lane per group
+// (strict <), others take sign(x). The imatrix is ignored (QAT codec).
+struct Stq1ReverseLut {
+  uint8_t slot[256];
+  uint8_t sign[256];
+};
+
+const Stq1ReverseLut& stq1_reverse_lut() {
+  static const Stq1ReverseLut lut = [] {
+    Stq1ReverseLut l;
+    std::memset(l.slot, 0xFF, sizeof(l.slot));
+    std::memset(l.sign, 0, sizeof(l.sign));
+    for (int i = 0; i < 32; ++i) {
+      l.slot[stq1_0_codebook[i]] = static_cast<uint8_t>(i & 0xF);
+      l.sign[stq1_0_codebook[i]] = static_cast<uint8_t>(i >> 4);
+    }
+    return l;
+  }();
+  return lut;
+}
+
+template <typename T>
+void quantize_stq1_0_block(const T* xb, uint8_t* block) {
+  uint8_t* qs = block;
+  uint8_t* sg = block + 32;
+  std::memset(qs, 0, 32);
+  std::memset(sg, 0, 8);
+  float amax = 0.0f;
+  for (int j = 0; j < 256; ++j) {
+    const float a = std::fabs(static_cast<float>(xb[j]));
+    if (a > amax) {
+      amax = a;
+    }
+  }
+  write_f16(block + 40, amax);
+  const Stq1ReverseLut& lut = stq1_reverse_lut();
+  for (int g = 0; g < 64; ++g) {
+    const int chunk = g >> 4;
+    const int gloc = g & 15;
+    const T* base = xb + chunk * 64 + gloc;
+    int zero_pos = 0;
+    float min_abs = std::fabs(static_cast<float>(base[0]));
+    for (int p = 1; p < 4; ++p) {
+      const float a = std::fabs(static_cast<float>(base[p * 16]));
+      if (a < min_abs) {
+        min_abs = a;
+        zero_pos = p;
+      }
+    }
+    uint8_t qpack = 0;
+    for (int p = 0; p < 4; ++p) {
+      uint8_t lane;
+      if (p == zero_pos) {
+        lane = 0x1;
+      } else {
+        lane = (static_cast<float>(base[p * 16]) < 0.0f) ? 0x0 : 0x2;
+      }
+      qpack |= static_cast<uint8_t>(lane << (2 * p));
+    }
+    qs[g >> 1] |= static_cast<uint8_t>(lut.slot[qpack] << (4 * (g & 1)));
+    sg[g >> 3] |= static_cast<uint8_t>(lut.sign[qpack] << (g & 7));
+  }
+}
+
 } // namespace
 
 template <typename T>
@@ -2167,6 +2231,12 @@ void kquant_iq_quantize_dispatch(
     for (std::size_t b = 0; b < nblocks; ++b) {
       const float* qw = imatrix ? imatrix + ((b * wpb) % K) : nullptr;
       quantize_iq1_m_block<T>(w + b * wpb, out + b * bpb, qw);
+    }
+  } else if (kquant_type == "stq1_0") {
+    constexpr int wpb = 256, bpb = 42;
+    std::size_t nblocks = num_weights / wpb;
+    for (std::size_t b = 0; b < nblocks; ++b) {
+      quantize_stq1_0_block<T>(w + b * wpb, out + b * bpb);
     }
   } else {
     throw std::runtime_error(

@@ -23,8 +23,7 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 import pytest
-from gguf import GGMLQuantizationType as GT
-from gguf import quants
+from kqref import GT, quants
 
 import mlx_kquant as kq
 
@@ -49,6 +48,7 @@ CODECS = {
     "iq2_s": GT.IQ2_S,
     "iq1_s": GT.IQ1_S,
     "iq1_m": GT.IQ1_M,
+    "stq1_0": GT.STQ1_0,
 }
 # ggml marks these imatrix-required; kq.quantize rejects them without one.
 REQ_IMAT = {"iq2_xxs", "iq2_xs", "iq1_s"}

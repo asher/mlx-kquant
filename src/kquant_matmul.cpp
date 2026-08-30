@@ -128,7 +128,8 @@ static KqSmallBmPolicy kq_smallbm_policy(const std::string& t) {
   if (t == "q5_0") {
     return {true, 7, 8192, 961};
   }
-  if (t == "iq1_s") {
+  if (t == "iq1_s" || t == "stq1_0") {
+    // stq1_0 starts on the iq1_s policy; re-tune with bench_qmm_bm128_ab.
     return {true, 0, 0, 449};
   }
   return {false, 0, 0, 193}; // iq2_xs, iq2_s, iq1_m
@@ -197,7 +198,7 @@ static bool kq_splitk_codec(const std::string& t) {
   return t == "q4_k" || t == "q5_k" || t == "q6_k" || t == "q3_k" ||
       t == "q2_k" || t == "q8_0" || t == "iq4_xs" || t == "iq4_nl" ||
       t == "iq3_xxs" || t == "iq3_s" || t == "iq2_xxs" || t == "iq2_xs" ||
-      t == "iq2_s" || t == "iq1_s" || t == "iq1_m";
+      t == "iq2_s" || t == "iq1_s" || t == "iq1_m" || t == "stq1_0";
 }
 
 // Non-NAX default split-K entry M per codec (0 = env lever only).
@@ -248,6 +249,8 @@ static int kq_splitk_min_m_nax_alu(const std::string& t) {
 // - iq1_s and iq1_m: their tiles cost 3-4x iq2_xxs's per weight, so
 //   the mv paths win through M12 (0.68-1.87x); the default falls to
 //   plain qmm_t at M13 and the tile wins 0.72-0.84x at M16. Entry 13.
+// - stq1_0: 1.02-1.05x at M5, 0.94-0.97x at M4, 1.15-1.49x through
+//   M12. Entry 5.
 // The bm16 tile that preceded bm8 entered q4_k/q3_k/q5_k/q6_k/iq3_s/
 // iq3_xxs/iq4_nl at 6, iq2_s and q8_0 at 8, iq4_xs at 10.
 static int kq_splitk_min_m(const std::string& t) {
@@ -258,7 +261,7 @@ static int kq_splitk_min_m(const std::string& t) {
     return 4;
   }
   if (t == "q5_k" || t == "q8_0" || t == "iq4_nl" || t == "iq3_xxs" ||
-      t == "iq3_s") {
+      t == "iq3_s" || t == "stq1_0") {
     return 5;
   }
   if (t == "q3_k") {
@@ -293,7 +296,8 @@ static int kq_splitk_nax_min_m(const std::string& t) {
   if (t == "q6_k" || t == "iq1_m") {
     return 12;
   }
-  if (t == "iq3_s" || t == "iq2_xxs" || t == "iq1_s") {
+  if (t == "iq3_s" || t == "iq2_xxs" || t == "iq1_s" || t == "stq1_0") {
+    // stq1_0 is inherited from iq1_s, not measured (M5 calibration pending).
     return 10;
   }
   if (t == "q2_k" || t == "q3_k" || t == "q4_k" || t == "q5_k" || t == "q8_0" ||
@@ -1463,9 +1467,9 @@ void KQuantMatmul::eval_gpu_base(
       return e != nullptr ? std::atoi(e) : -1; // -1 = per-codec default
     }();
     // Every wired codec now has an mv_ext kernel: q8_0, the five K-quants, the
-    // four legacy non-K (q4_0/q4_1/q5_0/q5_1), all nine IQ, and the native-fp
-    // wire codecs (mxfp4/nvfp4). Validated bit-exact, so default-on ==
-    // has-kernel.
+    // four legacy non-K (q4_0/q4_1/q5_0/q5_1), all nine IQ, stq1_0, and the
+    // native-fp wire codecs (mxfp4/nvfp4). Validated bit-exact, so default-on
+    // == has-kernel.
     const bool codec_has_mv_ext = kquant_type_ == "q8_0" ||
         kquant_type_ == "q2_k" || kquant_type_ == "q3_k" ||
         kquant_type_ == "q4_k" || kquant_type_ == "q5_k" ||
@@ -1476,7 +1480,8 @@ void KQuantMatmul::eval_gpu_base(
         kquant_type_ == "iq3_xxs" || kquant_type_ == "iq2_xxs" ||
         kquant_type_ == "iq2_xs" || kquant_type_ == "iq2_s" ||
         kquant_type_ == "iq1_s" || kquant_type_ == "iq1_m" ||
-        kquant_type_ == "mxfp4" || kquant_type_ == "nvfp4";
+        kquant_type_ == "stq1_0" || kquant_type_ == "mxfp4" ||
+        kquant_type_ == "nvfp4";
     const bool mv_ext_default_on = codec_has_mv_ext;
     // Width gate for the DEFAULT path (the A/B force-on KQ_VERIFY_EXT=1 ignores
     // it). Measured DRAM-cold across every wired codec (M5 Max, [17408x5120],
@@ -1488,7 +1493,8 @@ void KQuantMatmul::eval_gpu_base(
     // mv_ext 392/432). M==2 is every B=2 decode step, not just the
     // draft-width-1 verify, so M==2 routes to mv_ext for all codecs except
     // the two where verify_qmv measures faster. IQ has no verify_qmv kernel,
-    // so mv_ext stays on at every M>=2.
+    // so mv_ext stays on at every M>=2. stq1_0 (also verify_qmv-less) is not
+    // caught by the "iq" prefix but passes via !verify_qmv_wins_m2.
     const bool is_iq = kquant_type_.rfind("iq", 0) == 0;
     const bool verify_qmv_wins_m2 =
         kquant_type_ == "q4_k" || kquant_type_ == "q8_0";

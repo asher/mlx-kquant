@@ -734,6 +734,33 @@ void dequantize_iq1_m(const uint8_t* w, T* out, std::size_t num_weights) {
   }
 }
 
+// STQ1_0: group g = (chunk g/16, gloc g%16) covers weights
+// chunk*64 + gloc + p*16; lane p of the codebook byte decodes as (q - 1) * d.
+template <typename T>
+void dequantize_stq1_0(const uint8_t* w, T* out, std::size_t num_weights) {
+  constexpr int block_weights = 256;
+  constexpr int block_bytes = 42;
+  std::size_t num_blocks = num_weights / block_weights;
+  for (std::size_t b = 0; b < num_blocks; b++) {
+    const uint8_t* block = w + b * block_bytes;
+    const uint8_t* qs = block; // uint8_t[32]
+    const uint8_t* sg = block + 32; // uint8_t[8]
+    float d = read_f16(block + 40);
+    T* y = out + b * block_weights;
+    for (int g = 0; g < 64; g++) {
+      const int slot = (qs[g >> 1] >> (4 * (g & 1))) & 0xF;
+      const int sbit = (sg[g >> 3] >> (g & 7)) & 1;
+      const uint8_t cb = stq1_0_codebook[(sbit << 4) | slot];
+      const int chunk = g >> 4;
+      const int gloc = g & 15;
+      for (int p = 0; p < 4; p++) {
+        y[chunk * 64 + p * 16 + gloc] =
+            static_cast<T>(d * static_cast<float>(((cb >> (2 * p)) & 3) - 1));
+      }
+    }
+  }
+}
+
 // --------------------------------------------------------------------------
 // Shared CPU worker pool
 // --------------------------------------------------------------------------
@@ -996,6 +1023,8 @@ DequantFnF32 dequant_fn_f32(const std::string& t) {
     return &dequantize_iq1_s<float>;
   } else if (t == "iq1_m") {
     return &dequantize_iq1_m<float>;
+  } else if (t == "stq1_0") {
+    return &dequantize_stq1_0<float>;
   } else if (t == "mxfp4") {
     return &dequantize_mxfp4<float>;
   } else if (t == "nvfp4") {
@@ -1176,6 +1205,8 @@ void kquant_dequantize_dispatch(
     dequantize_iq1_s(w, out, num_weights);
   } else if (kquant_type == "iq1_m") {
     dequantize_iq1_m(w, out, num_weights);
+  } else if (kquant_type == "stq1_0") {
+    dequantize_stq1_0(w, out, num_weights);
   } else if (kquant_type == "mxfp4") {
     dequantize_mxfp4(w, out, num_weights);
   } else if (kquant_type == "nvfp4") {

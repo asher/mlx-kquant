@@ -152,6 +152,7 @@ instantiate_kquant_nax_splitk(iq2_xs, 256, 2)
 instantiate_kquant_nax_splitk(iq2_s, 256, 2)
 instantiate_kquant_nax_splitk(iq1_s, 256, 1)
 instantiate_kquant_nax_splitk(iq1_m, 256, 1)
+instantiate_kquant_nax_splitk(stq1_0, 256, 1)
 
 // Double-buffered BM=64 qmm_t, name-suffixed _db: dispatched by the host
 // solely for the M33-64 decode band (kq_smallbm_policy db64 + KQ_NAX_DB64).
@@ -223,6 +224,7 @@ instantiate_kquant_nax_bm128(iq2_xs, 256, 2)
 instantiate_kquant_nax_bm128(iq2_s, 256, 2)
 instantiate_kquant_nax_bm128(iq1_s, 256, 1)
 instantiate_kquant_nax_bm128(iq1_m, 256, 1)
+instantiate_kquant_nax_bm128(stq1_0, 256, 1)
 
 // Small-BM gather_qmm_rhs tile for the few-rows-per-expert prefill regime
 // (MoE top-k at chat chunk sizes: rows/E ~ 4-32). Every expert segment in
@@ -258,6 +260,7 @@ instantiate_kquant_nax_gather_rhs_bm32(iq2_xs, 256, 2)
 instantiate_kquant_nax_gather_rhs_bm32(iq2_s, 256, 2)
 instantiate_kquant_nax_gather_rhs_bm32(iq1_s, 256, 1)
 instantiate_kquant_nax_gather_rhs_bm32(iq1_m, 256, 1)
+instantiate_kquant_nax_gather_rhs_bm32(stq1_0, 256, 1)
 
 instantiate_kquant_nax_smallbm(q6_k, 256, 6)
 instantiate_kquant_nax_smallbm(q8_0, 32, 8)
@@ -278,6 +281,7 @@ instantiate_kquant_nax_smallbm(iq2_xs, 256, 2)
 instantiate_kquant_nax_smallbm(iq2_s, 256, 2)
 instantiate_kquant_nax_smallbm(iq1_s, 256, 1)
 instantiate_kquant_nax_smallbm(iq1_m, 256, 1)
+instantiate_kquant_nax_smallbm(stq1_0, 256, 1)
 
 instantiate_kquant_nax_codec(q8_0, 32, 8)
 instantiate_kquant_nax_codec(q5_1, 32, 5)
@@ -298,4 +302,5 @@ instantiate_kquant_nax_codec(iq2_xs, 256, 2)
 instantiate_kquant_nax_codec(iq2_s, 256, 2)
 instantiate_kquant_nax_codec(iq1_s, 256, 1)
 instantiate_kquant_nax_codec(iq1_m, 256, 1)
+instantiate_kquant_nax_codec(stq1_0, 256, 1)
     // clang-format on

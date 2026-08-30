@@ -50,6 +50,7 @@ CODECS = [
     "iq2_s",
     "iq1_s",
     "iq1_m",
+    "stq1_0",
     "mxfp4",
     "nvfp4",
 ]
@@ -68,8 +69,7 @@ def _cold_check(codec: str) -> int:
     """
     import mlx.core as mx
     import numpy as np
-    from gguf import GGMLQuantizationType as GT
-    from gguf import quants
+    from kqref import GT, quants
 
     import mlx_kquant as kq
 

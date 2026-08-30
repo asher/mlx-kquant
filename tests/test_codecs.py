@@ -27,8 +27,7 @@ import sys
 
 import mlx.core as mx
 import numpy as np
-from gguf import GGMLQuantizationType as GT
-from gguf import quants
+from kqref import GT, quants
 
 import mlx_kquant as kq
 
@@ -53,6 +52,7 @@ CODECS = {
     "iq2_s": (GT.IQ2_S, 256, 82, 2, False),
     "iq1_s": (GT.IQ1_S, 256, 50, 1, False),
     "iq1_m": (GT.IQ1_M, 256, 56, 1, False),
+    "stq1_0": (GT.STQ1_0, 256, 42, 1, False),
     "mxfp4": (GT.MXFP4, 32, 17, 4, False),
     "nvfp4": (GT.NVFP4, 64, 36, 4, False),
 }
@@ -87,6 +87,9 @@ def _synth_iq_wire(rng, bpb, n_blocks):
         for k, byteidx in enumerate((49, 51, 53, 55)):
             nib = ((dbits >> (4 * k)) & 0xF).astype(np.uint8)
             wire[:, byteidx] = (wire[:, byteidx] & 0x0F) | (nib << 4)
+    elif bpb == 42:
+        # stq1_0: fp16 d at bytes 40:42; everything else is valid wire.
+        wire[:, 40:42] = d.view(np.uint8).reshape(n_blocks, 2)
     else:
         wire[:, 0:2] = d.view(np.uint8).reshape(n_blocks, 2)
     return wire
@@ -94,7 +97,7 @@ def _synth_iq_wire(rng, bpb, n_blocks):
 
 def _wire_and_ref(codec, gtype, wpb, bpb, is_kquant):
     """Return (wire uint8[N, packed], ref float32[N, K])."""
-    if codec.startswith("iq") or codec == "nvfp4":
+    if codec.startswith("iq") or codec in ("nvfp4", "stq1_0"):
         wire = _synth_iq_wire(np.random.default_rng(7), bpb, N * (K // wpb))
         wire = wire.reshape(N, (K // wpb) * bpb)
         ref = quants.dequantize(np.ascontiguousarray(wire), gtype).astype(np.float32)
