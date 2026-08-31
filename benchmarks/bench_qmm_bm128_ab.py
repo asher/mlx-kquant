@@ -42,6 +42,7 @@ DEFAULT_CODECS = [
     "q6_k",
     "iq1_s",
     "iq1_m",
+    "stq1_0",
     "iq2_xxs",
     "iq2_xs",
     "iq2_s",
@@ -107,7 +108,7 @@ def probe_layout(codec, N, K):
     quantize."""
     import numpy as np
 
-    if codec.startswith("iq"):
+    if codec.startswith("iq") or codec == "stq1_0":
         tests_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "tests",

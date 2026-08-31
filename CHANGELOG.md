@@ -6,6 +6,40 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.4]
+
+### Added
+- The stq1_0 codec, a 1.3125 bpw structured-sparse ternary QAT quant
+  from llama.cpp PR #22836 (GGML type 43; unmerged, the id may shift).
+  It ships CPU decode, a bit-exact encoder, Metal ALU kernels on every
+  route, fused MoE-GLU, and NAX kernels (compile-verified; M5
+  calibration pending, see docs/kernels.md). On M3 Max it matches
+  iq1_s at M 1-4 and from M 16, and runs 1.24-1.34x faster through the
+  M 8-12 verify band.
+
+### Changed
+- load_gguf parse releases the python GIL
+
+## [0.4.3]
+
+### Fixed
+- dsa_topk: tied scores at the admission threshold were compacted in a
+  racy order, so repeated identical forwards could select different
+  indexer columns. Compaction is now stable in block order and the same
+  input always yields the same selection.
+
+## [0.4.2]
+
+### Added
+- `quantized_matmul`, `quantized_matmul_qmv_bias`, `gather_qmv_kq` and
+  `gather_qmv_mix_ns_kq` take optional LoRA operands (`lora_a`, `lora_b`,
+  `lora_rows`; the gathers also `lora_ids` and `lora_table`) and add the
+  low-rank delta inside the op on every codec and route, so a live adapter
+  adds no graph ops at decode. `KQuantLinear(x, lora=...)` forwards them;
+  `mlx_kquant.HAS_LORA_EPILOGUE` marks the build. Strided or lazily built
+  LoRA operands (a broadcast row vector, a sliced id matrix) are densified
+  at eval, so they read correctly on every route.
+
 ## [0.4.1]
 
 ### Added
@@ -25,7 +59,6 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   second; up qmv, sigmoid gate and the stream mean in a third.
 - KQ_QMM_LOG=1 logs the dispatched qmm kernel name and shape to stderr
   (routing-diagnosis lever for the ALU/NAX qmm paths).
-
 ### Changed
 - The seven grid-codebook GEMM block loaders (iq1_s, iq1_m, iq2_xxs,
   iq2_xs, iq2_s, iq3_xxs, iq3_s) decode a whole 8-weight group per step:

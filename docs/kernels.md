@@ -33,6 +33,20 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
   for DeepSeek-V3/V4-style shared-expert MoE.
 - **`gather_qmv_bias`** - gathered matvec with a fused expert bias on MLX's packed mxfp4 layout (the
   counterpart to the K-quant gathers above for that codec).
+- **LoRA epilogue** - `quantized_matmul`, `quantized_matmul_qmv_bias`, `gather_qmv_kq` and
+  `gather_qmv_mix_ns_kq` accept `lora_a` / `lora_b` (plus `lora_rows`, and `lora_ids` / `lora_table`
+  on the gathers) and add `rows * (x @ A) @ B` on their own output inside the primitive. Rows
+  routes run one epilogue dispatch after the base route; the score-mixed gather forms `z = x @ A`
+  in a kernel dispatched before the base gather (it reads only x and A, so the encoder overlaps the
+  two) and applies `z @ B` in a barrier-free kernel after it, so the serialized cost behind the
+  gather is one tiny dependent kernel. Codec independent, so a live adapter adds no graph ops at
+  decode on any codec; `lora_table` remaps gathered ids (arena slot to expert, negative skips) and
+  `lora_rows` scales rows (0 skips). f16/bf16 activations, rank x slots <= 512, inference only.
+  `mlx_kquant.HAS_LORA_EPILOGUE` marks the build; `KQuantLinear(x, lora=(a_t, b_t, rows))` forwards.
+  The epilogue kernels walk every LoRA operand as dense row-major memory; operands that evaluate
+  to a strided view (an unevaluated array reports the default dense layout at op build, and
+  `mx.repeat` of one value evaluates to a stride-0 broadcast) are copied into a dense temporary
+  by a small `kq_lora_densify` dispatch at eval, on the primitive's own stream.
 - **`gather_qmm_seg`** + **`expert_tile_map`** - expert-sorted MoE prefill as one GEMM per expert
   segment instead of per-row gathers. `expert_tile_map` builds the 64-row tile map on the GPU from the
   sorted routing indices (no host sync); `gather_qmm_seg` walks it. Gated by `KQ_SWITCH_GEMM_MIN_ROWS`
@@ -76,6 +90,13 @@ Tuning levers (defaults are right for normal use):
   shuffle-broadcast (`1`), wide nxpsg (`16`/`32`), half-precision chunk dots (`1`). q6_k M 4-12
   only. `HD` measured +4-5% at M 8; the rest flat to negative on M5 Max. Kept as probes. Default
   off.
+
+`stq1_0` (structured-sparse ternary, llama.cpp PR #22836) ships the full ALU and NAX kernel set,
+but only the pre-NAX floors are measured (M3 Max: plain split-K entry M 5). Its NAX policy is
+inherited from `iq1_s` and needs M5-silicon calibration: `bm128_min_m`
+(`benchmarks/bench_qmm_bm128_ab.py`), the NAX split-K entry in `kq_splitk_nax_min_m`
+(`benchmarks/bench_verify_band_ab.py`), `kq_splitk_min_m_nax_alu`, and db64 candidacy (no `_db`
+instantiation yet).
 
 ## MoE GLU
 

@@ -7,6 +7,7 @@
 
 #include "kquant.h"
 #include "kquant_codec.h"
+#include "kquant_lora_epilogue.h"
 
 #include "mlx/utils.h" // to_stream
 
@@ -31,6 +32,22 @@ namespace {
 // (leading) stride is 2*H rows: matrix-contiguous but NOT row_contiguous, so
 // full contiguify copies ~142 MB PER gather call (the decode MoE 5x
 // regression).
+// True when the elements of x are laid out row-major in memory (size-1
+// dims ignored), so a kernel can walk them as dense rows without a copy.
+inline bool kq_rows_dense(const mx::array& x) {
+  int64_t expect = 1;
+  for (int i = x.ndim() - 1; i >= 0; --i) {
+    if (x.shape(i) == 1) {
+      continue;
+    }
+    if (x.strides()[i] != expect) {
+      return false;
+    }
+    expect *= x.shape(i);
+  }
+  return true;
+}
+
 inline mx::array kq_ensure_row_contiguous_matrix(
     const mx::array& x,
     mx::StreamOrDevice s) {
@@ -45,6 +62,15 @@ inline mx::array kq_ensure_row_contiguous_matrix(
       return x;
     }
   }
+  return mx::contiguous(x, false, s);
+}
+
+// x always gets an unconditional Contiguous node: build-time strides of an
+// unevaluated array are meaningless, so a stride check here can hand the
+// kernels a lazy transpose whose rows they mis-walk as dense (rows past the
+// first read wrong memory). Contiguous::eval aliases zero-copy whenever the
+// input lands row-contiguous.
+inline mx::array kq_dense_x(const mx::array& x, mx::StreamOrDevice s) {
   return mx::contiguous(x, false, s);
 }
 
@@ -115,6 +141,9 @@ mx::array quantized_matmul(
     mx::array scales,
     const std::string& kquant_type,
     bool transpose,
+    const std::optional<mx::array>& lora_a,
+    const std::optional<mx::array>& lora_b,
+    const std::optional<mx::array>& lora_rows,
     mx::StreamOrDevice s_) {
   if (w.dtype() != mx::uint8) {
     throw std::invalid_argument(
@@ -167,19 +196,53 @@ mx::array quantized_matmul(
 
   // Cast x to the output dtype, then matrix-row-contiguize x / w / scales at
   // the op level so eval_gpu can assume dense inputs.
-  auto x_c = kq_ensure_row_contiguous_matrix(mx::astype(x, out_type, s), s);
+  auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
   auto w_c = kq_ensure_row_contiguous_matrix(w, s);
   auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
 
   auto out_shape = x_c.shape();
   out_shape.back() = w_outer_dims;
 
+  std::vector<mx::array> op_inputs = {x_c, w_c, scales_c};
+  int lora_flags = 0;
+  if (lora_a.has_value() || lora_b.has_value() || lora_rows.has_value()) {
+    if (w.ndim() != 2) {
+      throw std::invalid_argument(
+          "[mlx_kquant.quantized_matmul] the LoRA epilogue needs a 2-D w.");
+    }
+    // The epilogue walks x as dense [rows, K] rows; views that are only
+    // matrix-contiguous with a leading stride gap get copied.
+    if (!kq_rows_dense(op_inputs[0])) {
+      op_inputs[0] = mx::contiguous(op_inputs[0], false, s);
+    }
+    const int rows = static_cast<int>(x_c.size() / w_inner_dims);
+    lora_flags = kq_lora_prep(
+        "[mlx_kquant.quantized_matmul]",
+        lora_a,
+        lora_b,
+        std::nullopt,
+        std::nullopt,
+        lora_rows,
+        out_type,
+        w_inner_dims,
+        w_outer_dims,
+        0,
+        {rows},
+        1,
+        s,
+        op_inputs);
+  }
   return mx::array(
       std::move(out_shape),
       out_type,
       std::make_shared<KQuantMatmul>(
-          s, kquant_type, codec->weights_per_block, codec->bits, transpose),
-      {x_c, w_c, scales_c});
+          s,
+          kquant_type,
+          codec->weights_per_block,
+          codec->bits,
+          transpose,
+          lora_flags),
+      std::move(op_inputs));
 }
 
 mx::array quantized_matmul_qmv_bias(
@@ -188,6 +251,9 @@ mx::array quantized_matmul_qmv_bias(
     mx::array scales,
     mx::array bias,
     const std::string& kquant_type,
+    const std::optional<mx::array>& lora_a,
+    const std::optional<mx::array>& lora_b,
+    const std::optional<mx::array>& lora_rows,
     mx::StreamOrDevice s_) {
   if (kquant_type != "q8_0") {
     throw std::invalid_argument(
@@ -251,7 +317,7 @@ mx::array quantized_matmul_qmv_bias(
 
   auto s = mx::to_stream(s_);
 
-  auto x_c = kq_ensure_row_contiguous_matrix(mx::astype(x, out_type, s), s);
+  auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
   auto w_c = kq_ensure_row_contiguous_matrix(w, s);
   auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
   auto bias_c = mx::astype(bias, out_type, s);
@@ -261,12 +327,28 @@ mx::array quantized_matmul_qmv_bias(
   auto out_shape = x_c.shape();
   out_shape.back() = N;
 
+  std::vector<mx::array> op_inputs = {x_c, w_c, scales_c, bias_c};
+  const int lora_flags = kq_lora_prep(
+      "[mlx_kquant.quantized_matmul_qmv_bias]",
+      lora_a,
+      lora_b,
+      std::nullopt,
+      std::nullopt,
+      lora_rows,
+      out_type,
+      weights_per_row,
+      N,
+      0,
+      {1},
+      1,
+      s,
+      op_inputs);
   return mx::array(
       std::move(out_shape),
       out_type,
       std::make_shared<KQuantQmvBias>(
-          s, kquant_type, codec->weights_per_block, codec->bits),
-      {x_c, w_c, scales_c, bias_c});
+          s, kquant_type, codec->weights_per_block, codec->bits, lora_flags),
+      std::move(op_inputs));
 }
 
 namespace {
@@ -308,6 +390,9 @@ mx::array gather_qmm(
         std::move(scales),
         kquant_type,
         transpose,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
         s_);
   }
 
@@ -394,7 +479,7 @@ mx::array gather_qmm(
   // otherwise, routing to a strided-safe leaf), and scales is a (1,)
   // placeholder.
   bool rhs_reachable = right_sorted && transpose && codec->has_matmul_kernel;
-  auto x_c = kq_ensure_row_contiguous_matrix(mx::astype(x, out_type, s), s);
+  auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
   // Always insert the Contiguous node when the rhs leaf is reachable: flags
   // of an UNEVALUATED array (e.g. a fresh gate/up slice view) are not
   // meaningful at op-build time, so a `w.flags().row_contiguous ? w : ...`
@@ -530,7 +615,7 @@ mx::array gather_qmm_seg(
   }
 
   auto s = mx::to_stream(s_);
-  auto x_c = kq_ensure_row_contiguous_matrix(mx::astype(x, out_type, s), s);
+  auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
   // The kernel computes each expert's base pointer as expert * N * K_w, so w
   // must be fully row-contiguous (no strided expert dim).
   auto w_c = mx::contiguous(w, false, s);
@@ -599,11 +684,9 @@ std::vector<mx::array> quantize(
   }
 
   auto s = mx::to_stream(s_);
-  // IQ encode is CPU-only (ggml has no GPU IQ quantizer); force the op onto the
-  // CPU stream UNCONDITIONALLY so KQuantQuantize::eval_cpu runs (it needs a CPU
-  // command encoder) even if the caller passed stream=gpu -- there is no GPU IQ
-  // encoder to honor. All nine IQ codecs -- and no K-quant -- start with "iq".
-  if (kquant_type.rfind("iq", 0) == 0) {
+  // IQ and stq1_0 encoders are CPU-only; force the CPU stream so eval_cpu
+  // runs even when the caller passed stream=gpu.
+  if (kquant_type.rfind("iq", 0) == 0 || kquant_type == "stq1_0") {
     s = mx::default_stream(mx::Device::cpu);
   }
 

@@ -11,9 +11,12 @@
 #include <stdexcept>
 #include <string>
 
+#include <optional>
 #include "kquant.h"
 #include "kquant_codec.h" // codec_by_name
 #include "kquant_internal.h" // kq_type_string
+
+#include "kquant_lora_epilogue.h"
 
 #include "mlx/ops.h"
 #include "mlx/utils.h"
@@ -340,11 +343,12 @@ void KQuantGatherQMVKQ::eval_gpu(
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
-  // Biased layout: w, b, x, indices.
-  const bool biased = inputs.size() == 4;
+  // Biased layout: w, b, x, indices (then the LoRA operands, if any).
+  const size_t n_base = inputs.size() - kq_lora_input_count(lora_flags_);
+  const bool biased = n_base == 4;
   const auto& w = inputs[0];
   const auto& x = inputs[biased ? 2 : 1];
-  const auto& indices = inputs.back();
+  const auto& indices = inputs[n_base - 1];
 
   int T = indices.shape(0);
   int R = indices.shape(1);
@@ -383,6 +387,17 @@ void KQuantGatherQMVKQ::eval_gpu(
   MTL::Size group_dims(32, 2, 1);
   MTL::Size grid_dims(N / (fine ? 2 : (64 / nx)), R, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
+  if (lora_flags_ & KQ_LORA_PRESENT) {
+    kq_lora_epilogue_rows_gpu(
+        d,
+        s,
+        x,
+        kq_lora_view_gpu(inputs, n_base, lora_flags_, s),
+        out,
+        T * R,
+        K,
+        N);
+  }
 }
 
 void KQuantMoEGLUShexpKQ::eval_gpu(
@@ -499,6 +514,14 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   int N = w.shape(1);
   int K = x.shape(-1);
 
+  // LoRA: z = x @ A[e] is dispatched first so it overlaps the gather.
+  std::optional<mx::array> lora_z;
+  KqLoraView lv;
+  if (lora_flags_ & KQ_LORA_PRESENT) {
+    lv = kq_lora_view_gpu(inputs, 4, lora_flags_, s);
+    lora_z = kq_lora_mix_z_gpu(d, s, x, lv, T, S, K);
+  }
+
   // mix_ns is generic for every codec (no tuned variants) -- plain names.
   // No fine tier: the Ext fine variants measured E2E-neutral and were
   // dropped. Decode-scale launches route to the slot-parallel variant.
@@ -521,6 +544,9 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   MTL::Size group_dims(32, sp ? 2 * S : 2, 1);
   MTL::Size grid_dims(N / (sp ? 8 : (64 / nx)), 1, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
+  if (lora_z) {
+    kq_lora_mix_apply_gpu(d, s, *lora_z, scores, lv, out, T, S, N);
+  }
 }
 
 void KQuantMoERouterTopK::eval_gpu(
@@ -685,7 +711,7 @@ bool KQuantMoEGLUKQ::is_equivalent(const mx::Primitive& other) const {
 
 bool KQuantGatherQMVKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantGatherQMVKQ&>(other);
-  return kquant_type_ == o.kquant_type_;
+  return kquant_type_ == o.kquant_type_ && lora_flags_ == o.lora_flags_;
 }
 
 std::vector<mx::Shape> KQuantMoEGLUKQ::output_shapes(
@@ -739,7 +765,7 @@ void KQuantGatherQMVMixNSKQ::eval_cpu(
 
 bool KQuantGatherQMVMixNSKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantGatherQMVMixNSKQ&>(other);
-  return kquant_type_ == o.kquant_type_;
+  return kquant_type_ == o.kquant_type_ && lora_flags_ == o.lora_flags_;
 }
 
 std::vector<mx::Shape> KQuantGatherQMVMixNSKQ::output_shapes(
@@ -769,8 +795,10 @@ std::vector<mx::Shape> KQuantMoERouterTopK::output_shapes(
 
 std::vector<mx::Shape> KQuantGatherQMVKQ::output_shapes(
     const std::vector<mx::array>& inputs) {
-  // Indices are the last input in both the unbiased and biased layouts.
-  const auto& idx = inputs.back();
+  // Indices are the last op input in both the unbiased and biased layouts
+  // (the LoRA operands, when present, trail them).
+  const auto& idx =
+      inputs[inputs.size() - 1 - kq_lora_input_count(lora_flags_)];
   return {{idx.shape(0), idx.shape(1), inputs[0].shape(1)}};
 }
 
@@ -798,7 +826,8 @@ bool codec_has_moe_glu(const std::string& t) {
       t == "q6_k" || t == "q8_0" || t == "q4_0" || t == "q4_1" || t == "q5_0" ||
       t == "q5_1" || t == "iq4_nl" || t == "iq4_xs" || t == "iq3_s" ||
       t == "iq3_xxs" || t == "iq2_xxs" || t == "iq2_xs" || t == "iq2_s" ||
-      t == "iq1_s" || t == "iq1_m" || t == "mxfp4" || t == "nvfp4";
+      t == "iq1_s" || t == "iq1_m" || t == "stq1_0" || t == "mxfp4" ||
+      t == "nvfp4";
 }
 
 namespace {
@@ -1166,6 +1195,11 @@ mx::array gather_qmv_kq(
     const std::string& kquant_type,
     mx::array indices,
     const std::optional<mx::array>& bias,
+    const std::optional<mx::array>& lora_a,
+    const std::optional<mx::array>& lora_b,
+    const std::optional<mx::array>& lora_ids,
+    const std::optional<mx::array>& lora_table,
+    const std::optional<mx::array>& lora_rows,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   if (x.ndim() != 3) {
@@ -1199,17 +1233,39 @@ mx::array gather_qmv_kq(
   }
 
   auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
-  mx::Shape out_shape = {x.shape(0), x.shape(1), w.shape(1)};
+  const int E = w.shape(0);
+  const int N = w.shape(1);
+  mx::Shape out_shape = {x.shape(0), x.shape(1), N};
   std::vector<mx::array> op_inputs = {std::move(w)};
   if (bias.has_value()) {
     op_inputs.push_back(prep_bias(*bias, s));
   }
   op_inputs.push_back(std::move(x_c));
   op_inputs.push_back(prep_indices(indices, s));
+  // The adapter's expert per row defaults to the routing indices.
+  const std::optional<mx::array> ids_or =
+      (lora_a.has_value() && !lora_ids.has_value())
+      ? std::optional<mx::array>(indices)
+      : lora_ids;
+  const int lora_flags = kq_lora_prep(
+      "[mlx_kquant.gather_qmv_kq]",
+      lora_a,
+      lora_b,
+      ids_or,
+      lora_table,
+      lora_rows,
+      dt,
+      K,
+      N,
+      E,
+      indices.shape(),
+      1,
+      s,
+      op_inputs);
   return mx::array(
       std::move(out_shape),
       dt,
-      std::make_shared<KQuantGatherQMVKQ>(s, kquant_type),
+      std::make_shared<KQuantGatherQMVKQ>(s, kquant_type, lora_flags),
       std::move(op_inputs));
 }
 
@@ -1332,6 +1388,11 @@ mx::array gather_qmv_mix_ns_kq(
     const std::string& kquant_type,
     mx::array indices,
     mx::array scores,
+    const std::optional<mx::array>& lora_a,
+    const std::optional<mx::array>& lora_b,
+    const std::optional<mx::array>& lora_ids,
+    const std::optional<mx::array>& lora_table,
+    const std::optional<mx::array>& lora_rows,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.gather_qmv_mix_ns_kq]";
@@ -1356,15 +1417,38 @@ mx::array gather_qmv_mix_ns_kq(
   check_kq_expert_stack(op, w, kquant_type, K);
 
   auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
-  mx::Shape out_shape = {x.shape(0), w.shape(1)};
+  const int E = w.shape(0);
+  const int N = w.shape(1);
+  mx::Shape out_shape = {x.shape(0), N};
+  std::vector<mx::array> op_inputs = {
+      std::move(w),
+      std::move(x_c),
+      prep_indices(indices, s),
+      prep_scores(scores, s)};
+  const std::optional<mx::array> ids_or =
+      (lora_a.has_value() && !lora_ids.has_value())
+      ? std::optional<mx::array>(indices)
+      : lora_ids;
+  const int lora_flags = kq_lora_prep(
+      op,
+      lora_a,
+      lora_b,
+      ids_or,
+      lora_table,
+      lora_rows,
+      dt,
+      K,
+      N,
+      E,
+      indices.shape(),
+      S,
+      s,
+      op_inputs);
   return mx::array(
       std::move(out_shape),
       dt,
-      std::make_shared<KQuantGatherQMVMixNSKQ>(s, kquant_type),
-      {std::move(w),
-       std::move(x_c),
-       prep_indices(indices, s),
-       prep_scores(scores, s)});
+      std::make_shared<KQuantGatherQMVMixNSKQ>(s, kquant_type, lora_flags),
+      std::move(op_inputs));
 }
 
 std::vector<mx::array> moe_router_topk(

@@ -86,6 +86,11 @@ FetchContent_Declare(
   PATCH_COMMAND ${CMAKE_COMMAND} -DGGUFLIB_DIR=<SOURCE_DIR>
                 -P ${CMAKE_CURRENT_LIST_DIR}/cmake/patch-gguflib.cmake)
 FetchContent_MakeAvailable(gguflib)
+# The PATCH_COMMAND stamp ignores script edits; re-apply on every configure so
+# warm build trees pick them up.
+execute_process(COMMAND ${CMAKE_COMMAND} -DGGUFLIB_DIR=${gguflib_SOURCE_DIR}
+                        -P ${CMAKE_CURRENT_LIST_DIR}/cmake/patch-gguflib.cmake
+                COMMAND_ERROR_IS_FATAL ANY)
 add_library(gguflib STATIC ${gguflib_SOURCE_DIR}/fp16.c
                            ${gguflib_SOURCE_DIR}/gguflib.c)
 # Hidden visibility so the gguf_* symbols stay LOCAL to whichever image links
@@ -128,6 +133,7 @@ target_sources(
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_kvarn.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_moe_glu.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_norm_fused.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_lora_epilogue.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_hc_glue.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_hc_lowrank.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_cb_caps.cpp
@@ -196,11 +202,16 @@ target_link_options(mlx_kquant_ext PRIVATE ${KQ_WHOLE_ARCHIVE_GGUFLIB})
 # repo's kq_*.h + quantized_utils.h (which adds load_vector) win;
 # steel/gemm/*, utils.h, etc. fall through to the stock wheel headers.
 if(MLX_BUILD_METAL)
+  # The metallib has no depfile; header edits retrigger it only through DEPS.
+  file(GLOB KQ_METAL_KERNEL_HEADERS CONFIGURE_DEPENDS
+       ${CMAKE_CURRENT_LIST_DIR}/metal/mlx/backend/metal/kernels/*.h)
   mlx_build_metallib(
     TARGET
     mlx_kquant_metallib
     TITLE
     mlx_kquant
+    DEPS
+    ${KQ_METAL_KERNEL_HEADERS}
     SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax.metal
@@ -214,6 +225,7 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_glu.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_glu_kq.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_norm_fused.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_lora_epilogue.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_hc_glue.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_hc_lowrank.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_route_shed.metal

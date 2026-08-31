@@ -20,6 +20,7 @@
 #include "kquant_codec.h"
 #include "kquant_cpu_decode.h"
 #include "kquant_internal.h"
+#include "kquant_lora_epilogue.h"
 
 #include "mlx/allocator.h"
 #include "mlx/backend/common/utils.h" // elem_to_loc
@@ -127,7 +128,8 @@ static KqSmallBmPolicy kq_smallbm_policy(const std::string& t) {
   if (t == "q5_0") {
     return {true, 7, 8192, 961};
   }
-  if (t == "iq1_s") {
+  if (t == "iq1_s" || t == "stq1_0") {
+    // stq1_0 starts on the iq1_s policy; re-tune with bench_qmm_bm128_ab.
     return {true, 0, 0, 449};
   }
   return {false, 0, 0, 193}; // iq2_xs, iq2_s, iq1_m
@@ -196,7 +198,7 @@ static bool kq_splitk_codec(const std::string& t) {
   return t == "q4_k" || t == "q5_k" || t == "q6_k" || t == "q3_k" ||
       t == "q2_k" || t == "q8_0" || t == "iq4_xs" || t == "iq4_nl" ||
       t == "iq3_xxs" || t == "iq3_s" || t == "iq2_xxs" || t == "iq2_xs" ||
-      t == "iq2_s" || t == "iq1_s" || t == "iq1_m";
+      t == "iq2_s" || t == "iq1_s" || t == "iq1_m" || t == "stq1_0";
 }
 
 // Non-NAX default split-K entry M per codec (0 = env lever only).
@@ -247,6 +249,8 @@ static int kq_splitk_min_m_nax_alu(const std::string& t) {
 // - iq1_s and iq1_m: their tiles cost 3-4x iq2_xxs's per weight, so
 //   the mv paths win through M12 (0.68-1.87x); the default falls to
 //   plain qmm_t at M13 and the tile wins 0.72-0.84x at M16. Entry 13.
+// - stq1_0: 1.02-1.05x at M5, 0.94-0.97x at M4, 1.15-1.49x through
+//   M12. Entry 5.
 // The bm16 tile that preceded bm8 entered q4_k/q3_k/q5_k/q6_k/iq3_s/
 // iq3_xxs/iq4_nl at 6, iq2_s and q8_0 at 8, iq4_xs at 10.
 static int kq_splitk_min_m(const std::string& t) {
@@ -257,7 +261,7 @@ static int kq_splitk_min_m(const std::string& t) {
     return 4;
   }
   if (t == "q5_k" || t == "q8_0" || t == "iq4_nl" || t == "iq3_xxs" ||
-      t == "iq3_s") {
+      t == "iq3_s" || t == "stq1_0") {
     return 5;
   }
   if (t == "q3_k") {
@@ -292,7 +296,8 @@ static int kq_splitk_nax_min_m(const std::string& t) {
   if (t == "q6_k" || t == "iq1_m") {
     return 12;
   }
-  if (t == "iq3_s" || t == "iq2_xxs" || t == "iq1_s") {
+  if (t == "iq3_s" || t == "iq2_xxs" || t == "iq1_s" || t == "stq1_0") {
+    // stq1_0 is inherited from iq1_s, not measured (M5 calibration pending).
     return 10;
   }
   if (t == "q2_k" || t == "q3_k" || t == "q4_k" || t == "q5_k" || t == "q8_0" ||
@@ -1104,7 +1109,8 @@ std::vector<mx::Shape> KQuantMatmul::output_shapes(
 bool KQuantMatmul::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMatmul&>(other);
   return kquant_type_ == o.kquant_type_ && group_size_ == o.group_size_ &&
-      bits_ == o.bits_ && transpose_ == o.transpose_;
+      bits_ == o.bits_ && transpose_ == o.transpose_ &&
+      lora_flags_ == o.lora_flags_;
 }
 
 void KQuantMatmul::eval_cpu(
@@ -1122,9 +1128,13 @@ void KQuantMatmul::eval_cpu(
   encoder.set_input_array(x);
   encoder.set_input_array(w);
   encoder.set_output_array(out);
+  std::vector<mx::array> lora =
+      kq_lora_capture_cpu(inputs, 3, lora_flags_, encoder, stream());
   encoder.dispatch([out = mx::array::unsafe_weak_copy(out),
                     x = mx::array::unsafe_weak_copy(x),
                     w = mx::array::unsafe_weak_copy(w),
+                    lora = std::move(lora),
+                    lora_flags = lora_flags_,
                     transpose_ = transpose_,
                     kquant_type = kquant_type_]() mutable {
     int K = x.shape(-1);
@@ -1153,6 +1163,15 @@ void KQuantMatmul::eval_cpu(
             transpose_,
             kquant_type);
       }
+      if (lora_flags & KQ_LORA_PRESENT) {
+        kq_lora_epilogue_rows_cpu<T>(
+            out.data<T>(),
+            x.data<T>(),
+            kq_lora_view(lora, 0, lora_flags),
+            batch_size * M,
+            K,
+            N);
+      }
     };
     auto dt = x.dtype();
     if (dt == mx::float32) {
@@ -1178,6 +1197,11 @@ std::vector<mx::array> KQuantMatmul::vjp(
   // is defined: dL/dx = cotan @ dequant(w) with the transpose flipped, i.e. the
   // same quantized matmul run the other way. The quantized base is frozen (the
   // LoRA use case), so the weight/scale branches throw.
+  if (lora_flags_ & KQ_LORA_PRESENT) {
+    throw std::invalid_argument(
+        "[mlx_kquant] quantized_matmul vjp: the LoRA epilogue is "
+        "inference-only.");
+  }
   std::vector<mx::array> vjps;
   for (auto arg : argnums) {
     if (arg == 0) {
@@ -1187,6 +1211,9 @@ std::vector<mx::array> KQuantMatmul::vjp(
           primals[2],
           kquant_type_,
           !transpose_,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
           stream()));
     } else if (arg == 1) {
       throw std::invalid_argument(
@@ -1203,6 +1230,23 @@ std::vector<mx::array> KQuantMatmul::vjp(
 #ifdef _METAL_
 
 void KQuantMatmul::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  eval_gpu_base(inputs, outputs);
+  if (lora_flags_ & KQ_LORA_PRESENT) {
+    auto& s = stream();
+    auto& d = mx::metal::device(s.device);
+    const auto& x = inputs[0];
+    auto& out = outputs[0];
+    const int K = x.shape(-1);
+    const int N = out.shape(-1);
+    const int rows = static_cast<int>(x.size() / K);
+    kq_lora_epilogue_rows_gpu(
+        d, s, x, kq_lora_view_gpu(inputs, 3, lora_flags_, s), out, rows, K, N);
+  }
+}
+
+void KQuantMatmul::eval_gpu_base(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
   auto& s = stream();
@@ -1423,9 +1467,9 @@ void KQuantMatmul::eval_gpu(
       return e != nullptr ? std::atoi(e) : -1; // -1 = per-codec default
     }();
     // Every wired codec now has an mv_ext kernel: q8_0, the five K-quants, the
-    // four legacy non-K (q4_0/q4_1/q5_0/q5_1), all nine IQ, and the native-fp
-    // wire codecs (mxfp4/nvfp4). Validated bit-exact, so default-on ==
-    // has-kernel.
+    // four legacy non-K (q4_0/q4_1/q5_0/q5_1), all nine IQ, stq1_0, and the
+    // native-fp wire codecs (mxfp4/nvfp4). Validated bit-exact, so default-on
+    // == has-kernel.
     const bool codec_has_mv_ext = kquant_type_ == "q8_0" ||
         kquant_type_ == "q2_k" || kquant_type_ == "q3_k" ||
         kquant_type_ == "q4_k" || kquant_type_ == "q5_k" ||
@@ -1436,7 +1480,8 @@ void KQuantMatmul::eval_gpu(
         kquant_type_ == "iq3_xxs" || kquant_type_ == "iq2_xxs" ||
         kquant_type_ == "iq2_xs" || kquant_type_ == "iq2_s" ||
         kquant_type_ == "iq1_s" || kquant_type_ == "iq1_m" ||
-        kquant_type_ == "mxfp4" || kquant_type_ == "nvfp4";
+        kquant_type_ == "stq1_0" || kquant_type_ == "mxfp4" ||
+        kquant_type_ == "nvfp4";
     const bool mv_ext_default_on = codec_has_mv_ext;
     // Width gate for the DEFAULT path (the A/B force-on KQ_VERIFY_EXT=1 ignores
     // it). Measured DRAM-cold across every wired codec (M5 Max, [17408x5120],
@@ -1448,7 +1493,8 @@ void KQuantMatmul::eval_gpu(
     // mv_ext 392/432). M==2 is every B=2 decode step, not just the
     // draft-width-1 verify, so M==2 routes to mv_ext for all codecs except
     // the two where verify_qmv measures faster. IQ has no verify_qmv kernel,
-    // so mv_ext stays on at every M>=2.
+    // so mv_ext stays on at every M>=2. stq1_0 (also verify_qmv-less) is not
+    // caught by the "iq" prefix but passes via !verify_qmv_wins_m2.
     const bool is_iq = kquant_type_.rfind("iq", 0) == 0;
     const bool verify_qmv_wins_m2 =
         kquant_type_ == "q4_k" || kquant_type_ == "q8_0";
@@ -1516,7 +1562,7 @@ std::vector<mx::Shape> KQuantQmvBias::output_shapes(
 bool KQuantQmvBias::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantQmvBias&>(other);
   return kquant_type_ == o.kquant_type_ && group_size_ == o.group_size_ &&
-      bits_ == o.bits_;
+      bits_ == o.bits_ && lora_flags_ == o.lora_flags_;
 }
 
 void KQuantQmvBias::eval_cpu(
@@ -1536,10 +1582,14 @@ void KQuantQmvBias::eval_cpu(
   encoder.set_input_array(w);
   encoder.set_input_array(bias);
   encoder.set_output_array(out);
+  std::vector<mx::array> lora =
+      kq_lora_capture_cpu(inputs, 4, lora_flags_, encoder, stream());
   encoder.dispatch([out = mx::array::unsafe_weak_copy(out),
                     x = mx::array::unsafe_weak_copy(x),
                     w = mx::array::unsafe_weak_copy(w),
                     bias = mx::array::unsafe_weak_copy(bias),
+                    lora = std::move(lora),
+                    lora_flags = lora_flags_,
                     kquant_type = kquant_type_]() mutable {
     int K = x.shape(-1);
     int N = out.shape(-1);
@@ -1559,6 +1609,10 @@ void KQuantQmvBias::eval_cpu(
       for (int i = 0; i < N; i++) {
         out_ptr[i] = static_cast<T>(
             static_cast<float>(out_ptr[i]) + static_cast<float>(bias_ptr[i]));
+      }
+      if (lora_flags & KQ_LORA_PRESENT) {
+        kq_lora_epilogue_rows_cpu<T>(
+            out_ptr, x.data<T>(), kq_lora_view(lora, 0, lora_flags), 1, K, N);
       }
     };
     auto dt = x.dtype();
@@ -1596,6 +1650,10 @@ void KQuantQmvBias::eval_gpu(
 
   qmv_bias(
       x, w, scales, bias, out, group_size_, bits_, N, K, d, s, kquant_type_);
+  if (lora_flags_ & KQ_LORA_PRESENT) {
+    kq_lora_epilogue_rows_gpu(
+        d, s, x, kq_lora_view_gpu(inputs, 4, lora_flags_, s), out, 1, K, N);
+  }
 }
 
 #else

@@ -38,6 +38,8 @@ CODEC_GEOMETRY: dict[str, tuple[int, int, int, int]] = {
     # has no super-block d (reconstructed from scattered scale nibbles).
     "iq1_s": (256, 1, 50, 256),
     "iq1_m": (256, 1, 56, 256),
+    # stq1_0: QAT structured-sparse ternary (llama.cpp PR #22836).
+    "stq1_0": (256, 1, 42, 256),
     # Native-fp codecs (OCP micro-scaling floats): mxfp4 is one e8m0 scale per
     # 32 E2M1 values; nvfp4 packs four 16-value ue4m3-scaled groups per
     # 64-weight block, so group_size (16) != weights_per_block (64).

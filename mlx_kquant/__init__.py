@@ -96,8 +96,15 @@ from ._ext import (  # noqa: F401
 from ._version import __version__
 from .kvarn import kvarn_rotate  # noqa: F401
 
+# Capability flag for callers that pass the optional LoRA operands
+# (lora_a / lora_b / ...) to quantized_matmul, quantized_matmul_qmv_bias,
+# gather_qmv_kq and gather_qmv_mix_ns_kq: the delta is applied by an
+# epilogue dispatch inside those ops, on every codec and route.
+HAS_LORA_EPILOGUE = True
+
 __all__ = [
     "__version__",
+    "HAS_LORA_EPILOGUE",
     "add_rmsnorm",
     "arena_alloc",
     "codec_has_matmul",

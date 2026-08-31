@@ -13,11 +13,14 @@
 //  * kq_dsa_topk_indices_16bit -- one-threadgroup-per-row 2-pass radix
 //    select over the 16-bit orderable transform of fp16/bf16 scores,
 //    emitting TOPK uint32 indices per row. Ties at the threshold key are
-//    admitted in scan order, so the selected set matches a full sort while
-//    the order inside the row does not. Function constant 302 switches to a
-//    bucketed (deterministic-order) emission.
+//    admitted lowest-index-first, matching argpartition's index-order
+//    tie-break; the order inside the row is not sorted. Function constant
+//    302 is accepted for ABI parity and has no effect.
 //
-// Bodies are byte-identical to omlx apart from the renames.
+// Score kernel body byte-identical to omlx apart from the renames. The
+// top-k emission is intentionally not: omlx compacts through atomic
+// counters, which is nondeterministic under 16-bit tie pileup; do not
+// re-take it on an omlx sync.
 
 #pragma once
 
@@ -43,7 +46,9 @@ kq_dsa_topk_indices_16bit(
     device O* out [[buffer(1)]],
     const constant KQDsaTopKParams* params [[buffer(2)]],
     uint tid [[thread_position_in_threadgroup]],
-    uint row [[threadgroup_position_in_grid]]) {
+    uint row [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
   if (row >= uint(params->rows)) {
     return;
   }
@@ -132,46 +137,58 @@ kq_dsa_topk_indices_16bit(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
+  // Stable block-ordered compaction; every step is index-ordered so the
+  // emitted array is bitwise reproducible. Greater keys fill [0, greater),
+  // threshold ties fill [greater, TOPK) lowest-index-first.
   const uint threshold_key = state[2];
-  if (kq_dsa_bucketed_topk) {
-    for (int base = 0; base < scan_limit; base += THREADS) {
-      const int i = base + int(tid);
-      if (i < scan_limit) {
-        const uint key = kq_dsa_ordered_key_16(row_scores[i]);
-        if (key > threshold_key) {
-          const uint pos =
-              atomic_fetch_add_explicit(&counters[0], 1, memory_order_relaxed);
-          if (pos < uint(TOPK)) {
-            row_out[pos] = O(i);
-          }
-        } else if (key == threshold_key) {
-          const uint pos =
-              atomic_fetch_add_explicit(&counters[1], 1, memory_order_relaxed);
-          if (pos < uint(TOPK)) {
-            row_out[pos] = O(i);
-          }
-        }
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-  } else {
-    for (int i = int(tid); i < scan_limit; i += THREADS) {
-      const uint key = kq_dsa_ordered_key_16(row_scores[i]);
-      if (key > threshold_key) {
-        const uint pos =
-            atomic_fetch_add_explicit(&counters[0], 1, memory_order_relaxed);
-        if (pos < uint(TOPK)) {
-          row_out[pos] = O(i);
-        }
-      } else if (key == threshold_key) {
-        const uint pos =
-            atomic_fetch_add_explicit(&counters[1], 1, memory_order_relaxed);
-        if (pos < uint(TOPK)) {
-          row_out[pos] = O(i);
-        }
-      }
-    }
+  threadgroup uint sg_gt[THREADS / 32];
+  threadgroup uint sg_tie[THREADS / 32];
+  threadgroup uint bases[2];
+  if (tid == 0) {
+    bases[0] = 0; // next slot for strictly-greater keys
+    bases[1] = state[3]; // count of strictly-greater keys
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int base = 0; base < scan_limit; base += THREADS) {
+    const int i = base + int(tid);
+    bool is_gt = false;
+    bool is_tie = false;
+    if (i < scan_limit) {
+      const uint key = kq_dsa_ordered_key_16(row_scores[i]);
+      is_gt = (key > threshold_key);
+      is_tie = (key == threshold_key);
+    }
+    const uint gt_lane = simd_prefix_exclusive_sum(uint(is_gt));
+    const uint tie_lane = simd_prefix_exclusive_sum(uint(is_tie));
+    if (simd_lane == 31) {
+      sg_gt[simd_group] = gt_lane + uint(is_gt);
+      sg_tie[simd_group] = tie_lane + uint(is_tie);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (is_gt || is_tie) {
+      uint pos = is_gt ? (bases[0] + gt_lane) : (bases[1] + tie_lane);
+      for (uint g = 0; g < simd_group; ++g) {
+        pos += is_gt ? sg_gt[g] : sg_tie[g];
+      }
+      if (pos < uint(TOPK)) {
+        row_out[pos] = O(i);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+      uint gt_tot = 0;
+      uint tie_tot = 0;
+      for (uint g = 0; g < THREADS / 32; ++g) {
+        gt_tot += sg_gt[g];
+        tie_tot += sg_tie[g];
+      }
+      bases[0] += gt_tot;
+      bases[1] += tie_tot;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  (void)kq_dsa_bucketed_topk; // unused: emission is identical in both modes
+  (void)counters;
 }
 
 template <typename T, int BM, int BN, int BK, int WM, int WN>

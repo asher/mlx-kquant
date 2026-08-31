@@ -41,6 +41,7 @@ DEFAULT_CODECS = [
     "iq2_s",
     "iq1_s",
     "iq1_m",
+    "stq1_0",
 ]
 
 # Muse-Glimmer-30B MLP shapes: gate/up [19968x6656], down [6656x19968].
@@ -74,7 +75,7 @@ def probe_layout(codec, N, K):
 
     import mlx_kquant as kq
 
-    if codec.startswith("iq"):
+    if codec.startswith("iq") or codec == "stq1_0":
         tests_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests"
         )

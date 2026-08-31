@@ -26,8 +26,7 @@ import sys
 
 import mlx.core as mx
 import numpy as np
-from gguf import GGMLQuantizationType as GT
-from gguf import quants
+from kqref import GT, quants
 
 import mlx_kquant as kq
 
@@ -52,6 +51,7 @@ CODECS = {
     "iq2_s": (GT.IQ2_S, 256, 82, 2, False),
     "iq1_s": (GT.IQ1_S, 256, 50, 1, False),
     "iq1_m": (GT.IQ1_M, 256, 56, 1, False),
+    "stq1_0": (GT.STQ1_0, 256, 42, 1, False),
     "mxfp4": (GT.MXFP4, 32, 17, 4, False),
     "nvfp4": (GT.NVFP4, 64, 36, 4, False),
 }
@@ -84,6 +84,9 @@ def _synth_iq_wire(rng, bpb, n_blocks):
         for k, byteidx in enumerate((49, 51, 53, 55)):
             nib = ((dbits >> (4 * k)) & 0xF).astype(np.uint8)
             wire[:, byteidx] = (wire[:, byteidx] & 0x0F) | (nib << 4)
+    elif bpb == 42:
+        # stq1_0: fp16 d at bytes 40:42; everything else is valid wire.
+        wire[:, 40:42] = d.view(np.uint8).reshape(n_blocks, 2)
     else:
         wire[:, 0:2] = d.view(np.uint8).reshape(n_blocks, 2)
     return wire
@@ -91,7 +94,7 @@ def _synth_iq_wire(rng, bpb, n_blocks):
 
 def _wire_and_ref(codec, gtype, wpb, bpb, is_kquant):
     """Return (wire uint8[E, N, packed], ref float32[E, N, K])."""
-    if codec.startswith("iq") or codec == "nvfp4":
+    if codec.startswith("iq") or codec in ("nvfp4", "stq1_0"):
         rng = np.random.default_rng(11)
         wires = [
             _synth_iq_wire(rng, bpb, N * (K // wpb)).reshape(N, (K // wpb) * bpb)
@@ -384,3 +387,66 @@ def test_rhs_gather_sweep():
                     if rel >= tol or g.shape != c.shape:
                         fails.append((codec, n_rows, str(dtype), B, rel))
     assert not fails, f"sorted-rhs leaf diverges: {fails}"
+
+
+def test_lazy_strided_x_matches_contiguous():
+    """Regression: a LAZY non-dense x (e.g. an unevaluated transpose) must
+    produce the same result as its contiguous copy.
+
+    The op-level contiguity guard used to inspect build-time strides, which
+    are meaningless for an unevaluated array, so a lazy transpose was handed
+    to the kernels unguarded and every matrix row past the first read wrong
+    memory (glm5_next MTP verify: embed_q on the [B, H, L, D] transposed
+    query view corrupted row-1 logits at every L=2 verify -> repetition
+    collapse). x now always gets a Contiguous node.
+    """
+    codec, gtype = "q8_0", GT.Q8_0
+    NH, OUT, IN = 4, 32, 64
+    rng = np.random.default_rng(11)
+    wires = []
+    for _ in range(NH):
+        we = rng.standard_normal((OUT, IN)).astype(np.float32) * 0.3
+        wires.append(quants.quantize(we, gtype).astype(np.uint8))
+    w = mx.array(np.stack(wires, 0))
+    scales = mx.zeros((1,), dtype=mx.uint8)
+    lhs = mx.arange(NH, dtype=mx.uint32).reshape(1, NH)
+    rhs = mx.arange(NH, dtype=mx.uint32).reshape(1, NH)
+
+    for L in (1, 2, 3, 5):
+        base = mx.array(rng.standard_normal((1, L, NH, IN)).astype(np.float32)).astype(
+            mx.bfloat16
+        )
+        lazy_t = base.transpose(0, 2, 1, 3)  # never evaluated before the op
+        ref = kq.gather_qmm(
+            mx.contiguous(base.transpose(0, 2, 1, 3)),
+            w,
+            scales,
+            codec,
+            lhs_indices=lhs,
+            rhs_indices=rhs,
+            transpose=True,
+        )
+        got = kq.gather_qmm(
+            lazy_t,
+            w,
+            scales,
+            codec,
+            lhs_indices=lhs,
+            rhs_indices=rhs,
+            transpose=True,
+        )
+        mx.eval(ref, got)
+        d = float(mx.abs(got - ref).max().item())
+        assert d == 0.0, f"gather_qmm lazy strided x diverges at L={L}: {d}"
+
+    # quantized_matmul takes the same guard: lazy transposed 2-D-per-matrix x.
+    wq = mx.array(wires[0])
+    base = mx.array(rng.standard_normal((IN, 8)).astype(np.float32)).astype(mx.bfloat16)
+    lazy_t = base.transpose(1, 0)
+    ref = kq.quantized_matmul(
+        mx.contiguous(base.transpose(1, 0)), wq, scales, codec, True
+    )
+    got = kq.quantized_matmul(lazy_t, wq, scales, codec, True)
+    mx.eval(ref, got)
+    d = float(mx.abs(got - ref).max().item())
+    assert d == 0.0, f"quantized_matmul lazy strided x diverges: {d}"

@@ -70,7 +70,7 @@ ENCODABLE = [
     "q5_0",
     "q5_1",
 ]
-IQ = [c for c in CODECS if c.startswith("iq")]
+IQ = [c for c in CODECS if c.startswith("iq") or c == "stq1_0"]
 
 
 def _sweep(codec, w, s, ref_w, n_out, ms=MS):
@@ -94,7 +94,7 @@ def _encodable_setup(codec, n_out):
 
 
 def _iq_setup(codec, n_out):
-    from gguf import quants
+    from kqref import quants
 
     gtype, wpb, bpb, _, _ = CODECS[codec]
     rng = np.random.default_rng(7)

@@ -243,13 +243,14 @@ const KQuantCodec* gguf_type_to_kquant_codec(uint32_t t) {
       return codec_by_name("iq1_s");
     case GGUF_TYPE_IQ1_M:
       return codec_by_name("iq1_m");
-    // GGML type numbers (ggml.h): MXFP4=39, NVFP4=40. Literals so this
-    // compiles against a gguflib whose enum predates them (an unpatched
-    // parser would have already stopped at the tensor anyway).
+    // Bare literals (MXFP4=39, NVFP4=40, STQ1_0=43): gguflib's enum may
+    // predate these types.
     case 39:
       return codec_by_name("mxfp4");
     case 40:
       return codec_by_name("nvfp4");
+    case 43:
+      return codec_by_name("stq1_0");
     default:
       return nullptr;
   }

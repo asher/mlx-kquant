@@ -33,7 +33,8 @@ y = kq.quantized_matmul(x, wq, scales, "q4_k", transpose=True)   # x @ dequant(w
 
 ## Codecs
 
-Fourteen codecs (ten encodable + four decode-only IQ), all defined in
+Twenty-two codecs (the ten K-quant/legacy encodable on either stream, the nine IQ plus
+`stq1_0` CPU-encodable, and the two fp wire codecs decode-only), all defined in
 `mlx_kquant.codec_geometry.CODEC_GEOMETRY` as
 `(group_size, bits, bytes_per_block, weights_per_block)`:
 
@@ -49,20 +50,26 @@ Fourteen codecs (ten encodable + four decode-only IQ), all defined in
 | `q4_k` | 4 | 256 | 144 | K-quant superblock |
 | `q5_k` | 5 | 256 | 176 | K-quant superblock |
 | `q6_k` | 6 | 256 | 210 | K-quant superblock |
-| `iq4_nl` | 4 | 32 | 18 | non-linear LUT (decode-only) |
-| `iq4_xs` | 4 | 256 | 136 | LUT superblock (decode-only) |
-| `iq3_s` | 3 | 256 | 110 | grid + signs (decode-only) |
-| `iq3_xxs` | 3 | 256 | 98 | grid + gas words (decode-only) |
-| `iq2_xxs` | 2 | 256 | 66 | grid + scale/sign words (decode-only) |
-| `iq2_xs` | 2 | 256 | 74 | grid + scales (decode-only) |
-| `iq2_s` | 2 | 256 | 82 | grid + qh + signs (decode-only) |
-| `iq1_s` | 1 | 256 | 50 | grid + delta (decode-only) |
-| `iq1_m` | 1 | 256 | 56 | grid + delta, scattered scale (decode-only) |
+| `iq4_nl` | 4 | 32 | 18 | non-linear LUT |
+| `iq4_xs` | 4 | 256 | 136 | LUT superblock |
+| `iq3_s` | 3 | 256 | 110 | grid + signs |
+| `iq3_xxs` | 3 | 256 | 98 | grid + gas words |
+| `iq2_xxs` | 2 | 256 | 66 | grid + scale/sign words |
+| `iq2_xs` | 2 | 256 | 74 | grid + scales |
+| `iq2_s` | 2 | 256 | 82 | grid + qh + signs |
+| `iq1_s` | 1 | 256 | 50 | grid + delta |
+| `iq1_m` | 1 | 256 | 56 | grid + delta, scattered scale |
+| `stq1_0` | 1 | 256 | 42 | structured ternary codebook, QAT (CPU encode) |
+| `mxfp4` | 4 | 32 | 17 | micro-scaling fp4, E8M0 block scale (decode-only) |
+| `nvfp4` | 4 | 64 | 36 | micro-scaling fp4, UE4M3 sub-scales (decode-only) |
 
 `weights_per_block` (`wpb`) is the granularity that matters for layout: K-quants pack 256 weights per
 superblock, the block codecs 32. The duck-typed `group_size` attribute on a `KQuant*` module
-equals `wpb`. All ten encode on CPU or Metal; the **imatrix** argument to `kq.quantize` steers only the
-five superblock K-quants (`wpb == 256`) and is a no-op on the `wpb == 32` codecs.
+equals `wpb`. The ten K-quant/legacy codecs encode on CPU or Metal; the nine IQ codecs and
+`stq1_0` encode CPU-only (the IQ encoders are importance-weighted and ggml's imatrix-required trio
+rejects a missing **imatrix**; `stq1_0` ignores it -- QAT fixes its rounding); `mxfp4`/`nvfp4` have
+no encoder (GGUFs ship those tensors pre-quantized). The K-quant **imatrix** steers only the five
+superblock K-quants (`wpb == 256`) and is a no-op on the `wpb == 32` legacy codecs.
 
 Presets (`mlx_kquant.recipes`) are **purely codec-name-based** - there is no affine "4-bit / 8-bit"
 abstraction that resolves to a codec. A preset (`q4_k_s/m/xl/moe`, `q5_k_s/m/xl/moe`, `q3_k_m`,
