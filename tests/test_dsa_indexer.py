@@ -265,12 +265,12 @@ def _ref_scores_decode(q, k, w, q_offset, ratio):
     return out, mask
 
 
-def _make_decode_qkw(B, QL, P, dtype, seed, H=64):
+def _make_decode_qkw(B, QL, P, dtype, seed, H=64, wdtype=None):
     rng = np.random.default_rng(seed)
     q = mx.array(rng.standard_normal((B, H, QL, D)) * 0.4).astype(dtype)
     k = mx.array(rng.standard_normal((B, P, D)) * 0.4).astype(dtype)
     # Signed weights: relu is on the dot, not the weighted sum.
-    w = mx.array(rng.standard_normal((B, QL, H)) * 0.2).astype(dtype)
+    w = mx.array(rng.standard_normal((B, QL, H)) * 0.2).astype(wdtype or dtype)
     return q, k, w
 
 
@@ -319,17 +319,23 @@ def test_dsa_indexer_e2e_decode(dtype):
         _check_topk_row(vals[0, 0, j], sel[0, 0, j], topk, P)
 
 
+@pytest.mark.parametrize("wf32", [False, True], ids=["w16", "wf32"])
+@pytest.mark.parametrize("H", [4, 32, 64])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize(
     "case", DECODE_SCORE_CASES, ids=[c[0] for c in DECODE_SCORE_CASES]
 )
-def test_dsa_indexer_score_decode_h4(case, dtype):
-    """4-head band (qwen4exp QSA indexer)."""
+def test_dsa_indexer_score_decode_bands(case, dtype, H, wf32):
+    """4-head (qwen4exp QSA), 32-head (glm5 pooled) and 64-head bands,
+    16-bit or fp32 head weights."""
     name, QL, P, q_offset, ratio = case
-    q, k, w = _make_decode_qkw(1, QL, P, dtype, seed=31, H=4)
+    q, k, w = _make_decode_qkw(
+        1, QL, P, dtype, seed=31, H=H, wdtype=mx.float32 if wf32 else None
+    )
     got = kq.dsa_indexer_score_decode(q, k, w, q_offset, ratio)
     mx.eval(got)
     assert got.shape == (1, 1, QL, P)
+    assert got.dtype == dtype
     g = np.array(got.astype(mx.float32))
     ref, mask = _ref_scores_decode(q, k, w, q_offset, ratio)
     if mask.any():
@@ -350,8 +356,8 @@ def test_dsa_indexer_score_decode_rejects_bad_shapes():
             100,
             4,
         )
-    with pytest.raises(ValueError):  # bad head count (4 and 64 only)
-        kq.dsa_indexer_score_decode(q[:, :32], k, w[:, :, :32], 100, 4)
+    with pytest.raises(ValueError):  # bad head count (4, 32 and 64 only)
+        kq.dsa_indexer_score_decode(q[:, :16], k, w[:, :, :16], 100, 4)
     with pytest.raises(ValueError):  # keys rank
         kq.dsa_indexer_score_decode(q, k[:, None], w, 100, 4)
     with pytest.raises(ValueError):  # negative q_offset

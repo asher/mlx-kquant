@@ -243,8 +243,10 @@ void KQDsaIndexerScoreDecode::eval_gpu(
   const int QL = q.shape(2);
   const int P = k.shape(1);
 
+  const bool wf = weights.dtype() == mx::float32;
   const std::string kname = "kq_dsa_indexer_score_decode_" +
-      std::string(H == 4 ? "h4_" : "") + kq_type_string(q.dtype()) + "_ql" +
+      (H == 64 && !wf ? std::string() : "h" + std::to_string(H) + "_") +
+      std::string(wf ? "wf_" : "") + kq_type_string(q.dtype()) + "_ql" +
       std::to_string(QL);
 
   auto kernel = kq_get_kernel(d, kname, kname, {});
@@ -444,10 +446,10 @@ mx::array dsa_indexer_score_decode(
   const int B = queries.shape(0);
   const int H = queries.shape(1);
   const int QL = queries.shape(2);
-  if ((H != 64 && H != 4) || queries.shape(3) != 128) {
+  if ((H != 64 && H != 32 && H != 4) || queries.shape(3) != 128) {
     std::ostringstream msg;
-    msg << "[mlx_kquant.dsa_indexer_score_decode] expected 4 or 64 indexer "
-        << "heads of dim 128, got " << queries.shape() << ".";
+    msg << "[mlx_kquant.dsa_indexer_score_decode] expected 4, 32 or 64 "
+        << "indexer heads of dim 128, got " << queries.shape() << ".";
     throw std::invalid_argument(msg.str());
   }
   if (QL < 1 || QL > 4) {
@@ -471,12 +473,14 @@ mx::array dsa_indexer_score_decode(
         "ratio >= 1.");
   }
 
-  auto final_type =
-      mx::result_type(std::vector<mx::array>{queries, keys, weights});
+  // fp32 head weights are read as fp32 (the wf kernel arm); anything else
+  // follows the q/k dtype. Scores always emit in the q/k dtype.
+  const bool weights_f32 = weights.dtype() == mx::float32;
+  auto final_type = mx::result_type(std::vector<mx::array>{queries, keys});
   if (final_type != mx::float16 && final_type != mx::bfloat16) {
     std::ostringstream msg;
     msg << "[mlx_kquant.dsa_indexer_score_decode] expected fp16 or bf16 "
-        << "inputs, got " << final_type << ".";
+        << "queries and keys, got " << final_type << ".";
     throw std::invalid_argument(msg.str());
   }
 
@@ -484,7 +488,8 @@ mx::array dsa_indexer_score_decode(
   // a no-op at eval when the input already is.
   auto q = mx::contiguous(mx::astype(queries, final_type, s), false, s);
   auto k = mx::contiguous(mx::astype(keys, final_type, s), false, s);
-  auto w = mx::contiguous(mx::astype(weights, final_type, s), false, s);
+  auto w = mx::contiguous(
+      mx::astype(weights, weights_f32 ? mx::float32 : final_type, s), false, s);
 
   mx::Shape out_shape{B, 1, QL, keys.shape(1)};
   std::vector<mx::array> inputs = {std::move(q), std::move(k), std::move(w)};

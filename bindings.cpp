@@ -790,10 +790,12 @@ NB_MODULE(_ext, m) {
         qL == 1; invisible rows score the dtype's finite min.
 
         Args:
-            queries (array): [B, 64, qL, 128], qL in [1, 4],
-                float16/bfloat16.
+            queries (array): [B, H, qL, 128], H in {4, 32, 64}, qL in
+                [1, 4], float16/bfloat16.
             keys (array): the pooled indexer key cache [B, P, 128].
-            weights (array): per-head query weights [B, qL, 64].
+            weights (array): per-head query weights [B, qL, H]. float32
+                weights are read as-is (sign-free head gates stay exact);
+                other dtypes follow the q/k dtype.
             q_offset (int): absolute position of query row 0's step
                 (make_mask's ``offset``).
             ratio (int): pooled compression ratio.

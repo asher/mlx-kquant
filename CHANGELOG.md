@@ -7,6 +7,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `dsa_indexer_score_decode` accepts 32 indexer heads and fp32 head weights
+  (read as-is instead of rounded to the q/k dtype).
 - moe_router_topk scoring="sigmoid": the deepseek-v3 / glm5 noaux-tc
   router (sigmoid scores, bias-steered selection, renormalized routed
   weights) in one dispatch.
