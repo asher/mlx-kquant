@@ -1506,9 +1506,11 @@ std::vector<mx::array> moe_router_topk(
     scoring_i = 0;
   } else if (scoring == "sqrtsoftplus") {
     scoring_i = 1;
+  } else if (scoring == "sigmoid") {
+    scoring_i = 2;
   } else {
     throw std::invalid_argument(
-        std::string(op) + " scoring must be softmax or sqrtsoftplus.");
+        std::string(op) + " scoring must be softmax, sqrtsoftplus or sigmoid.");
   }
   if (scoring_i == 1 && !norm_topk_prob) {
     throw std::invalid_argument(

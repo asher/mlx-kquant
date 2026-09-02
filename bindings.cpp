@@ -1155,7 +1155,8 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         Router top-k in one dispatch: f32 scoring over the first E columns
-        (softmax, or sqrtsoftplus = sqrt(softplus(x)) for deepseek-v4),
+        (softmax, sqrtsoftplus = sqrt(softplus(x)) for deepseek-v4, or
+        sigmoid for deepseek-v3 / glm5 noaux-tc routing),
         top_k selection (min-index tie-break) optionally ranked by
         score + bias, optional renormalization, an optional per-expert
         scale applied to the picked scores, a uniform scale on emitted
@@ -1172,7 +1173,7 @@ NB_MODULE(_ext, m) {
                 scores, applied after renormalization; cast to float32.
             bias (array, optional): [E] selection bias
                 (e_score_correction_bias); emitted scores stay unbiased.
-            scoring (str): "softmax" or "sqrtsoftplus".
+            scoring (str): "softmax", "sqrtsoftplus" or "sigmoid".
             scale (float): uniform multiplier on emitted routed scores
                 (routed_scaling_factor).
 

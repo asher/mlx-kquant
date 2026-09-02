@@ -550,6 +550,50 @@ def _check_router():
         mx.eval(inds, sc)
         if not np.all(np.isfinite(np.array(sc))):
             fails.append(f"E={e} R={r} ssp negative-logits nonfinite scores")
+    # sigmoid + selection bias + routed scale (deepseek-v3 / glm5 noaux-tc)
+    for e, r, norm in ((288, 8, True), (256, 8, False), (64, 4, True)):
+        logits_np = (rng.standard_normal((7, e)) * 3.0).astype(np.float32)
+        logits_np[5, 10:20] = logits_np[5, 10]
+        bias_np = rng.standard_normal(e).astype(np.float32)
+        for dt in (mx.float32, mx.bfloat16):
+            inds, sc = kq.moe_router_topk(
+                mx.array(logits_np).astype(dt),
+                r,
+                norm,
+                shared_gate=False,
+                bias=mx.array(bias_np),
+                scoring="sigmoid",
+                scale=2.5,
+            )
+            mx.eval(inds, sc)
+            lf = np.array(mx.array(logits_np).astype(dt).astype(mx.float32))
+            p = 1.0 / (1.0 + np.exp(-lf))
+            top = np.argsort(-(p + bias_np), axis=-1, kind="stable")[:, :r]
+            got_i = np.array(inds)
+            for t in range(7):
+                if set(got_i[t]) != set(top[t]):
+                    bk = np.sort((p + bias_np)[t, got_i[t]])
+                    bw = np.sort((p + bias_np)[t, top[t]])
+                    if not np.allclose(bk, bw, rtol=0, atol=3e-6):
+                        fails.append(f"E={e} R={r} t={t} {dt} sigmoid indices")
+                        continue
+                pk = p[t, got_i[t]]
+                want = pk / (pk.sum() + 1e-20) * 2.5 if norm else pk * 2.5
+                if not np.allclose(np.array(sc)[t], want, rtol=1e-5, atol=1e-6):
+                    fails.append(f"E={e} R={r} t={t} {dt} sigmoid scores")
+        neg = mx.array((-np.abs(logits_np) - 50.0).astype(np.float32))
+        inds, sc = kq.moe_router_topk(
+            neg,
+            r,
+            norm,
+            shared_gate=False,
+            bias=mx.array(bias_np),
+            scoring="sigmoid",
+            scale=2.5,
+        )
+        mx.eval(inds, sc)
+        if not np.all(np.isfinite(np.array(sc))):
+            fails.append(f"E={e} R={r} sigmoid negative-logits nonfinite scores")
     return fails
 
 

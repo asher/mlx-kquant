@@ -1208,7 +1208,9 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
 // mix scores [T, R + SHARED] float32 in one dispatch. SCORING == 0 is f32
 // softmax; SCORING == 1 is sqrt(softplus(x)) (deepseek-v4), which has no
 // global normalizer and requires NORM (renorm adds the model's 1e-20 guard
-// since scores may be exactly 0). HAS_BIAS ranks selection by
+// since scores may be exactly 0); SCORING == 2 is sigmoid (deepseek-v3 /
+// glm5 noaux-tc routing), also per-expert, renorm with the same guard when
+// NORM. HAS_BIAS ranks selection by
 // score + bias[expert] (e_score_correction_bias) while emitted scores stay
 // unbiased. When SHARED == 1, column E of each logits row is the
 // shared-expert gate logit and its sigmoid lands in scores slot R
@@ -1265,6 +1267,11 @@ template <typename T>
       const float l1p =
           (z < 1e-4f) ? metal::fma(-0.5f * z, z, z) : metal::log(1.0f + z);
       p[e] = metal::sqrt(metal::max(x, 0.0f) + l1p);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  } else if (SCORING == 2) {
+    for (int e = lid; e < E; e += NT) {
+      p[e] = 1.0f / (1.0f + metal::exp(-float(lrow[e])));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   } else {
@@ -1354,7 +1361,7 @@ template <typename T>
     for (int r = 0; r < R; r++) {
       ps += win_v[r];
     }
-    const float denom = NORM ? (SCORING == 1 ? ps + 1e-20f : ps) : gsum;
+    const float denom = NORM ? (SCORING != 0 ? ps + 1e-20f : ps) : gsum;
     device float* srow = scores + (int64_t)tid * (R + SHARED);
     for (int r = 0; r < R; r++) {
       float sv = win_v[r] / denom;

@@ -6,6 +6,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- moe_router_topk scoring="sigmoid": the deepseek-v3 / glm5 noaux-tc
+  router (sigmoid scores, bias-steered selection, renormalized routed
+  weights) in one dispatch.
+
 ### Changed
 - Grid-coded IQ decode (iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq1_s,
   iq1_m) reads each grid entry as one table word and applies signs with
