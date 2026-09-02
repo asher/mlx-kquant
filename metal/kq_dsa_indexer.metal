@@ -56,4 +56,37 @@ instantiate_kq_dsa_indexer_score_decode_h4(bfloat16_t, bfloat16_t, 1);
 instantiate_kq_dsa_indexer_score_decode_h4(bfloat16_t, bfloat16_t, 2);
 instantiate_kq_dsa_indexer_score_decode_h4(bfloat16_t, bfloat16_t, 3);
 instantiate_kq_dsa_indexer_score_decode_h4(bfloat16_t, bfloat16_t, 4);
+
+// 32-head band (glm5 pooled indexer) and the fp32-head-weight arms.
+#define instantiate_kq_dsa_indexer_score_decode_h32(tname, dtype, ql) \
+  instantiate_kernel(                                                 \
+      "kq_dsa_indexer_score_decode_h32_" #tname "_ql" #ql,           \
+      kq_dsa_indexer_score_decode, dtype, ql, 32)
+
+instantiate_kq_dsa_indexer_score_decode_h32(float16_t, half, 1);
+instantiate_kq_dsa_indexer_score_decode_h32(float16_t, half, 2);
+instantiate_kq_dsa_indexer_score_decode_h32(float16_t, half, 3);
+instantiate_kq_dsa_indexer_score_decode_h32(float16_t, half, 4);
+instantiate_kq_dsa_indexer_score_decode_h32(bfloat16_t, bfloat16_t, 1);
+instantiate_kq_dsa_indexer_score_decode_h32(bfloat16_t, bfloat16_t, 2);
+instantiate_kq_dsa_indexer_score_decode_h32(bfloat16_t, bfloat16_t, 3);
+instantiate_kq_dsa_indexer_score_decode_h32(bfloat16_t, bfloat16_t, 4);
+
+#define instantiate_kq_dsa_indexer_score_decode_wf(tname, dtype, ql, h) \
+  instantiate_kernel(                                                   \
+      "kq_dsa_indexer_score_decode_h" #h "_wf_" #tname "_ql" #ql,      \
+      kq_dsa_indexer_score_decode, dtype, ql, h, 128, 4, 8, float)
+
+#define instantiate_kq_dsa_indexer_score_decode_wf_all(tname, dtype, h) \
+  instantiate_kq_dsa_indexer_score_decode_wf(tname, dtype, 1, h);       \
+  instantiate_kq_dsa_indexer_score_decode_wf(tname, dtype, 2, h);       \
+  instantiate_kq_dsa_indexer_score_decode_wf(tname, dtype, 3, h);       \
+  instantiate_kq_dsa_indexer_score_decode_wf(tname, dtype, 4, h)
+
+instantiate_kq_dsa_indexer_score_decode_wf_all(float16_t, half, 4);
+instantiate_kq_dsa_indexer_score_decode_wf_all(float16_t, half, 32);
+instantiate_kq_dsa_indexer_score_decode_wf_all(float16_t, half, 64);
+instantiate_kq_dsa_indexer_score_decode_wf_all(bfloat16_t, bfloat16_t, 4);
+instantiate_kq_dsa_indexer_score_decode_wf_all(bfloat16_t, bfloat16_t, 32);
+instantiate_kq_dsa_indexer_score_decode_wf_all(bfloat16_t, bfloat16_t, 64);
 // clang-format on

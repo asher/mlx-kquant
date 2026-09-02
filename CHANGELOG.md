@@ -6,6 +6,34 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- q5_k joins q6_k / q8_0 as a shared-expert codec for the fused MoE
+  gathers over any expert codec (UD builds put the shared expert one tier
+  below q6_k). gather_qmv_mix_kq also takes [T, S - 1] scores with the
+  shared slot at an implicit weight of 1, so callers stop appending a ones
+  column per layer, and its decode dispatch takes the same codec-keyed
+  16-lane widening as the no-shared-expert mix.
+- `dsa_indexer_score_decode` accepts 32 indexer heads and fp32 head weights
+  (read as-is instead of rounded to the q/k dtype).
+- moe_router_topk scoring="sigmoid": the deepseek-v3 / glm5 noaux-tc
+  router (sigmoid scores, bias-steered selection, renormalized routed
+  weights) in one dispatch.
+
+### Changed
+- Score-mixed MoE down gather (mix_ns) at decode widths (t <= 2, K >=
+  2048) dispatches the 16-lane launch instead of the slot-parallel kernel
+  for q4_k, q4_0, q5_0 and iq3_xxs: 9-25% faster per call on M5 Max
+  (2-9% in a dependent chain); results differ from the previous launch by
+  summation order only. Other codecs keep the slot-parallel form.
+- Grid-coded IQ decode (iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq1_s,
+  iq1_m) reads each grid entry as one table word and applies signs with
+  vector selects instead of 8 byte loads and scalar selects; results are
+  bit-identical. Ext gather threadgroups now take their simdgroup count
+  from the launch, and iq2_xs dispatches 8 simdgroups (its 4 KB table
+  staging amortized over 4x the rows): gate/up gathers +10% at one token
+  and +47% at four tokens on M5 Max (E=288 N=2048 K=4096). KQ_MOE_SG
+  forces the count.
+
 ## [0.4.4]
 
 ### Added
