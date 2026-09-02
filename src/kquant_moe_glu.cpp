@@ -493,8 +493,8 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   ce.set_output_array(out, 6);
   ce.set_bytes(K, 7);
   ce.set_bytes(N, 8);
-  // Signature parity with the plain kernels: the shexp epilogue takes the
-  // limit arg too (dead for silu/gelu; no shexp silu_limit instantiations).
+  // The shexp epilogue takes the limit arg like the plain kernels (dead
+  // for silu/gelu; no shexp silu_limit instantiations).
   const float limit = 0.0f;
   ce.set_bytes(limit, 9);
   const bool tuned = stem == "q6_k" || stem == "q8_0";
@@ -522,9 +522,11 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   int S = x.shape(1);
   int N = w.shape(1);
   int K = x.shape(-1);
-  (void)scores;
 
-  const int nx = kq_moe_pick_nx((int64_t)N * T, K, false);
+  // Same codec-keyed widening as mix_ns (the shexp-slot mix has no
+  // slot-parallel form; its nx8 launch is the mix_ns non-sp baseline).
+  const int nx =
+      kq_moe_pick_nx((int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, T, K));
   const std::string stem = shexp_type_ == kquant_type_
       ? kq_gather_stem_nx(kquant_type_, K, nx)
       : kquant_type_ + "_sx_" + shexp_type_;
@@ -546,6 +548,8 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   ce.set_bytes(K, 6);
   ce.set_bytes(N, 7);
   ce.set_bytes(S, 8);
+  const int SC = scores.shape(1);
+  ce.set_bytes(SC, 9);
   const int sg = tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx);
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / (fine ? 2 : (sg * 32 / nx)), 1, T);
@@ -945,8 +949,8 @@ bool shexp_combo_has_kernel(
     const std::string& kquant_type,
     const std::string& shexp_type) {
   return codec_has_moe_glu(kquant_type) && codec_has_moe_glu(shexp_type) &&
-      (shexp_type == kquant_type || shexp_type == "q6_k" ||
-       shexp_type == "q8_0");
+      (shexp_type == kquant_type || shexp_type == "q5_k" ||
+       shexp_type == "q6_k" || shexp_type == "q8_0");
 }
 
 // Shared validation for one K-quant wire-byte expert stack.
@@ -1416,8 +1420,9 @@ mx::array gather_qmv_mix_kq(
         std::string(op) + " indices must be [T, S - 1].");
   }
   if (scores.ndim() != 2 || scores.shape(0) != x.shape(0) ||
-      scores.shape(1) != S) {
-    throw std::invalid_argument(std::string(op) + " scores must be [T, S].");
+      (scores.shape(1) != S && scores.shape(1) != S - 1)) {
+    throw std::invalid_argument(
+        std::string(op) + " scores must be [T, S] or [T, S - 1].");
   }
   auto dt = x.dtype();
   if (dt != mx::float16 && dt != mx::bfloat16) {

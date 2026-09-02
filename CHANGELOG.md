@@ -7,6 +7,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- q5_k joins q6_k / q8_0 as a shared-expert codec for the fused MoE
+  gathers over any expert codec (UD builds put the shared expert one tier
+  below q6_k). gather_qmv_mix_kq also takes [T, S - 1] scores with the
+  shared slot at an implicit weight of 1, so callers stop appending a ones
+  column per layer, and its decode dispatch takes the same codec-keyed
+  16-lane widening as the no-shared-expert mix.
 - `dsa_indexer_score_decode` accepts 32 indexer heads and fp32 head weights
   (read as-is instead of rounded to the q/k dtype).
 - moe_router_topk scoring="sigmoid": the deepseek-v3 / glm5 noaux-tc

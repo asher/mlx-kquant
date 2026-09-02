@@ -1064,7 +1064,7 @@ NB_MODULE(_ext, m) {
             indices (array): expert indices [T, R].
             act (str): 'silu' (default) or 'gelu' (tanh approx).
             shexp_kquant_type (str): shared-expert codec; '' (default) =
-                kquant_type. Mixed combos must be q6_k or q8_0.
+                kquant_type. Mixed combos must be q5_k, q6_k or q8_0.
 
         Returns:
             array: activated hidden states [T, R + 1, N] in x.dtype.
@@ -1093,9 +1093,10 @@ NB_MODULE(_ext, m) {
             shexp_w (array): uint8 wire bytes (N, bytes_per_row).
             kquant_type (str): expert codec with a fused kernel.
             indices (array): expert indices [T, S - 1].
-            scores (array): mix weights [T, S]; cast to float32.
+            scores (array): mix weights [T, S], or [T, S - 1] with the
+                shared slot at an implicit weight of 1; cast to float32.
             shexp_kquant_type (str): shared-expert codec; '' (default) =
-                kquant_type. Mixed combos must be q6_k or q8_0.
+                kquant_type. Mixed combos must be q5_k, q6_k or q8_0.
 
         Returns:
             array: mixed output [T, N] in x.dtype.

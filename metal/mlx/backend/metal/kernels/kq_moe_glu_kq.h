@@ -358,6 +358,7 @@ template <typename T, int results_per_simdgroup = 4>
     const constant int& K [[buffer(6)]],
     const constant int& N [[buffer(7)]],
     const constant int& S [[buffer(8)]],
+    const constant int& SC [[buffer(9)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -382,7 +383,8 @@ template <typename T, int results_per_simdgroup = 4>
     const bool shared_slot = slot == S - 1;
     const device uint8_t* src = shared_slot ? sw : w;
     const int expert = shared_slot ? 0 : int(indices[tid.z * (S - 1) + slot]);
-    const U score = U(scores[tid.z * S + slot]);
+    // SC == S - 1: the shared slot's weight is an implicit 1
+    const U score = slot < SC ? U(scores[tid.z * SC + slot]) : U(1);
     const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
     const int64_t row0 = (int64_t)expert * N + out_row;
 
@@ -667,6 +669,7 @@ template <typename T, int results_per_simdgroup = 4>
     const constant int& K [[buffer(6)]],
     const constant int& N [[buffer(7)]],
     const constant int& S [[buffer(8)]],
+    const constant int& SC [[buffer(9)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -686,7 +689,8 @@ template <typename T, int results_per_simdgroup = 4>
     const bool shared_slot = slot == S - 1;
     const device uint8_t* src = shared_slot ? sw : w;
     const int expert = shared_slot ? 0 : int(indices[tid.z * (S - 1) + slot]);
-    const U score = U(scores[tid.z * S + slot]);
+    // SC == S - 1: the shared slot's weight is an implicit 1
+    const U score = slot < SC ? U(scores[tid.z * SC + slot]) : U(1);
     const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
     const int64_t row0 = (int64_t)expert * N + out_row;
 
@@ -1171,6 +1175,7 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
     const constant int& K [[buffer(6)]],
     const constant int& N [[buffer(7)]],
     const constant int& S [[buffer(8)]],
+    const constant int& SC [[buffer(9)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -1186,13 +1191,14 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
   for (int slot = 0; slot < S - 1; slot++) {
     const int expert = int(indices[tid.z * (S - 1) + slot]);
     const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
-    result += scores[tid.z * S + slot] *
+    result += scores[tid.z * SC + slot] *
         kq_ext_row_partial<T, Codec, NX>(
                   w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
   }
   {
+    // SC == S - 1: the shared slot's weight is an implicit 1
     const device T* xs = h + ((int64_t)tid.z * S + (S - 1)) * K;
-    result += scores[tid.z * S + (S - 1)] *
+    result += (SC == S ? scores[tid.z * SC + (S - 1)] : 1.0f) *
         kq_ext_row_partial<T, SCodec, NX>(
                   sw, xs, (int64_t)out_row, K, tx, kq_sluts);
   }
