@@ -1,9 +1,10 @@
-"""Slot-parallel mix_ns (_sp) A/B.
+"""Fused-MoE launch-shape A/Bs: slot-parallel mix_ns (_sp) and the Ext
+gather simdgroups-per-threadgroup pick (KQ_MOE_SG).
 
-The variant restructures parallelism only (the slot loop spreads onto
-simdgroup pairs) and must be bit-identical to the loop kernel. Each arm
-runs in a subprocess so the live-read env latch (KQ_MOE_SP) sees the
-variable from the first dispatch.
+Both variants restructure parallelism only (the slot loop spreads onto
+simdgroup pairs; more rows share one staged LUT) and must be bit-identical
+to the base launch. Each arm runs in a subprocess so the live-read env
+latches (KQ_MOE_SP, KQ_MOE_SG) see the variable from the first dispatch.
 """
 
 import os
@@ -27,7 +28,7 @@ import mlx_kquant as kq
 codec, out_path = sys.argv[1], sys.argv[2]
 rng = np.random.default_rng(11)
 E, N, K, T, S = 32, 64, 512, 2, 6
-bpb = {"q2_k": 84, "q4_k": 144, "q8_0": 34, "iq2_xxs": 66}[codec]
+bpb = {"q2_k": 84, "q4_k": 144, "q8_0": 34, "iq2_xxs": 66, "iq2_xs": 74}[codec]
 wpb = 32 if codec == "q8_0" else 256
 nb = E * N * (K // wpb)
 wire = rng.integers(0, 256, size=(nb, bpb), dtype=np.uint8)
@@ -68,3 +69,23 @@ def test_sp_bit_identical(codec, tmp_path):
     for key in ("mix", "glu"):
         a, b = outs["base"][key], outs["variant"][key]
         assert np.array_equal(a, b), f"{codec} {key} not bit-identical"
+
+
+@pytest.mark.parametrize("codec", ["q2_k", "iq2_xxs", "iq2_xs"])
+@pytest.mark.parametrize("sg", ["4", "8"])
+def test_sg_bit_identical(codec, sg, tmp_path):
+    outs = {}
+    for arm, env in (
+        ("base", {"KQ_MOE_SG": "2"}),
+        ("variant", {"KQ_MOE_SG": sg}),
+    ):
+        f = tmp_path / f"{arm}.npz"
+        subprocess.run(
+            [sys.executable, "-c", _SNIPPET, codec, str(f)],
+            check=True,
+            env={**os.environ, **env},
+        )
+        outs[arm] = np.load(f)
+    for key in ("mix", "glu"):
+        a, b = outs["base"][key], outs["variant"][key]
+        assert np.array_equal(a, b), f"{codec} {key} sg={sg} not bit-identical"

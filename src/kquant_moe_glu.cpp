@@ -78,6 +78,35 @@ inline const char* kq_nx_suffix(int nx) {
   return nx == 32 ? "_nx32" : (nx == 16 ? "_nx16" : "");
 }
 
+// Simdgroups per threadgroup for the generic Ext gathers (the kernels read
+// the launch shape; the tuned q6_k/q8_0 kernels are fixed at 2). Every
+// threadgroup stages its codec's decode tables into threadgroup memory and
+// barriers before the dot loop; with 2 simdgroups that cost lands every 8
+// rows. Codecs with a large staged table (iq2_xs: 4 KB grid + signs) win
+// from amortizing it over 8 simdgroups: measured interleaved at E=288
+// N=2048 K=4096 gate/up, +10% at t=1 and +47% at t=4 (both metrics min of 4
+// rounds). Codecs with <= 2 KB tables or none (iq2_xxs, iq3_s, iq3_xxs,
+// q2_k, q4_k, iq1_m) measure flat to -5% at 8, so they stay at 2. Falls
+// back to the largest power of two that divides N's row tiling.
+// KQ_MOE_SG=2|4|8 forces a value for every Ext dispatch (A/B and tests);
+// read live once set.
+inline int kq_moe_pick_sg(const std::string& codec, int N, int nx) {
+  const int rps = 32 / nx;
+  int sg = codec == "iq2_xs" ? 8 : 2;
+  static const bool has_env = std::getenv("KQ_MOE_SG") != nullptr;
+  if (has_env) {
+    const char* e = std::getenv("KQ_MOE_SG");
+    const int v = e == nullptr ? 0 : std::atoi(e);
+    if (v == 2 || v == 4 || v == 8) {
+      sg = v;
+    }
+  }
+  while (sg > 2 && N % (sg * rps) != 0) {
+    sg /= 2;
+  }
+  return sg;
+}
+
 // Slot-parallel mix_ns (_sp): the S slot dots spread across S simdgroup
 // pairs, multiplying resident threads by S without shortening per-thread
 // K-chains (the widening lever that measured flat-to-negative on the
@@ -330,8 +359,11 @@ void KQuantMoEGLUKQ::eval_gpu(
     ce.set_bytes(N, 6);
     ce.set_bytes(limit_, 7);
   }
-  MTL::Size group_dims(32, 2, 1);
-  MTL::Size grid_dims(N / (64 / nx), R, T);
+  // Tuned q6_k/q8_0 kernels (nx 8) are fixed at 2 simdgroups.
+  const bool tuned = stem == "q6_k" || stem == "q8_0";
+  const int sg = tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx);
+  MTL::Size group_dims(32, sg, 1);
+  MTL::Size grid_dims(N / (sg * 32 / nx), R, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -384,8 +416,9 @@ void KQuantGatherQMVKQ::eval_gpu(
     ce.set_bytes(K, 4);
     ce.set_bytes(N, 5);
   }
-  MTL::Size group_dims(32, 2, 1);
-  MTL::Size grid_dims(N / (fine ? 2 : (64 / nx)), R, T);
+  const int sg = tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx);
+  MTL::Size group_dims(32, sg, 1);
+  MTL::Size grid_dims(N / (fine ? 2 : (sg * 32 / nx)), R, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
   if (lora_flags_ & KQ_LORA_PRESENT) {
     kq_lora_epilogue_rows_gpu(
@@ -444,8 +477,10 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   // limit arg too (dead for silu/gelu; no shexp silu_limit instantiations).
   const float limit = 0.0f;
   ce.set_bytes(limit, 9);
-  MTL::Size group_dims(32, 2, 1);
-  MTL::Size grid_dims(N / (64 / nx), R + 1, T);
+  const bool tuned = stem == "q6_k" || stem == "q8_0";
+  const int sg = tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx);
+  MTL::Size group_dims(32, sg, 1);
+  MTL::Size grid_dims(N / (sg * 32 / nx), R + 1, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -491,8 +526,9 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   ce.set_bytes(K, 6);
   ce.set_bytes(N, 7);
   ce.set_bytes(S, 8);
-  MTL::Size group_dims(32, 2, 1);
-  MTL::Size grid_dims(N / (fine ? 2 : (64 / nx)), 1, T);
+  const int sg = tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx);
+  MTL::Size group_dims(32, sg, 1);
+  MTL::Size grid_dims(N / (fine ? 2 : (sg * 32 / nx)), 1, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -541,8 +577,9 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   ce.set_bytes(K, 5);
   ce.set_bytes(N, 6);
   ce.set_bytes(S, 7);
-  MTL::Size group_dims(32, sp ? 2 * S : 2, 1);
-  MTL::Size grid_dims(N / (sp ? 8 : (64 / nx)), 1, T);
+  const int sg = sp ? 2 * S : kq_moe_pick_sg(kquant_type_, N, nx);
+  MTL::Size group_dims(32, sg, 1);
+  MTL::Size grid_dims(N / (sp ? 8 : (sg * 32 / nx)), 1, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
   if (lora_z) {
     kq_lora_mix_apply_gpu(d, s, *lora_z, scores, lv, out, T, S, N);

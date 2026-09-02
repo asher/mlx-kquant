@@ -6,6 +6,16 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- Grid-coded IQ decode (iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq1_s,
+  iq1_m) reads each grid entry as one table word and applies signs with
+  vector selects instead of 8 byte loads and scalar selects; results are
+  bit-identical. Ext gather threadgroups now take their simdgroup count
+  from the launch, and iq2_xs dispatches 8 simdgroups (its 4 KB table
+  staging amortized over 4x the rows): gate/up gathers +10% at one token
+  and +47% at four tokens on M5 Max (E=288 N=2048 K=4096). KQ_MOE_SG
+  forces the count.
+
 ## [0.4.4]
 
 ### Added
