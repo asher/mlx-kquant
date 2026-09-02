@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.5]
+
 ### Added
 - q5_k joins q6_k / q8_0 as a shared-expert codec for the fused MoE
   gathers over any expert codec (UD builds put the shared expert one tier
