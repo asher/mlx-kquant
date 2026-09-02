@@ -50,14 +50,15 @@ inline std::string kq_gather_stem(const std::string& t, int K) {
 // activation chunk across two weight streams keeps per-thread work high
 // enough that the extra threadgroups come free (nx16 +9% / +30% incl. the
 // tuned-q6_k swap; nx32 mixed, so the auto pick caps at 16). Single-stream
-// gathers (qmv / mix / mix_ns) are flat-to-negative under widening at every
-// measured shape and stay NX = 8. KQ_MOE_NX=8|16|32 forces a width for ALL
-// ops (A/B and tests); rows = output rows across the whole dispatch.
+// gathers (qmv / mix) are flat-to-negative under widening at every
+// measured shape and stay NX = 8; mix_ns widens for the codecs listed in
+// kq_moe_mix_ns_wide. KQ_MOE_NX=8|16|32 forces a width for ALL ops (A/B
+// and tests); rows = output rows across the whole dispatch.
 // The threadgroup cap covers MTP-verify widths (t = 2..8): at qwen4exp
 // geometry (E=512 top-10, K=2560 N=640, iq3_xxs/iq4_xs + q8_0 shexp) nx16
 // beats nx8 by 3.6-9.8% at every t in 2..8, still positive at the 7040-tg
 // t=8 point, so the cap sits at 8192 tgs; true prefill grids stay NX = 8.
-inline int kq_moe_pick_nx(int64_t rows, int K, bool two_stream) {
+inline int kq_moe_pick_nx(int64_t rows, int K, bool wide_ok) {
   // Re-read per call only when the variable exists at all (interleaved A/B
   // flips it in-process); unset costs one static check.
   static const bool has_env = std::getenv("KQ_MOE_NX") != nullptr;
@@ -68,10 +69,29 @@ inline int kq_moe_pick_nx(int64_t rows, int K, bool two_stream) {
       return v;
     }
   }
-  if (two_stream && K / 16 >= 32 && (rows * 8) / 64 < 8192) {
+  if (wide_ok && K / 16 >= 32 && (rows * 8) / 64 < 8192) {
     return 16;
   }
   return 8;
+}
+
+// Score-mixed down gather (mix_ns) at decode widths: the slot-parallel
+// launch spreads S slots over simdgroup pairs, so every threadgroup covers
+// only 8 output rows and per-row setup dominates the short K chains. The
+// nx16 launch (16 K-lanes per row, 2 simdgroups) beats it for the cheap-
+// decode 4-5 bpw codecs and iq3_xxs (M5 Max, E=128..288 top-8, K=2048 and
+// 4096, N=4096, chained-dispatch timing: q4_k +2-5%, q4_0 +2-9%, q5_0
+// +2-9%, iq3_xxs +1.5-3%; same-order independent-dispatch timing +9-25%).
+// q2_k / q3_k (scale unpack heavy) lose 8-14%, q6_k / q8_0 are flat, the
+// iq2 grid codecs and q5_k lose in the chained regime, and every codec is
+// flat-to-negative at t >= 4 or K < 2048, so those keep the slot-parallel
+// form. KQ_MOE_NX still forces a width.
+inline bool kq_moe_mix_ns_wide(const std::string& codec, int T, int K) {
+  if (T > 2 || K < 2048) {
+    return false;
+  }
+  return codec == "q4_k" || codec == "q4_0" || codec == "q5_0" ||
+      codec == "iq3_xxs";
 }
 
 inline const char* kq_nx_suffix(int nx) {
@@ -560,8 +580,10 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
 
   // mix_ns is generic for every codec (no tuned variants) -- plain names.
   // No fine tier: the Ext fine variants measured E2E-neutral and were
-  // dropped. Decode-scale launches route to the slot-parallel variant.
-  const int nx = kq_moe_pick_nx((int64_t)N * T, K, false);
+  // dropped. Decode-scale launches route to the slot-parallel variant
+  // unless the codec widens (kq_moe_mix_ns_wide).
+  const int nx =
+      kq_moe_pick_nx((int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, T, K));
   const bool sp = nx == 8 && kq_moe_sp((int64_t)T * (N / 8), S);
   std::string kname = "kq_" + kquant_type_ + "_gather_qmv_mix_ns" +
       (sp ? "_sp" : kq_nx_suffix(nx)) + "_" + kq_type_string(x.dtype());

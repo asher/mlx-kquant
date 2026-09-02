@@ -14,6 +14,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   weights) in one dispatch.
 
 ### Changed
+- Score-mixed MoE down gather (mix_ns) at decode widths (t <= 2, K >=
+  2048) dispatches the 16-lane launch instead of the slot-parallel kernel
+  for q4_k, q4_0, q5_0 and iq3_xxs: 9-25% faster per call on M5 Max
+  (2-9% in a dependent chain); results differ from the previous launch by
+  summation order only. Other codecs keep the slot-parallel form.
 - Grid-coded IQ decode (iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq1_s,
   iq1_m) reads each grid entry as one table word and applies signs with
   vector selects instead of 8 byte loads and scalar selects; results are

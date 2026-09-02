@@ -56,8 +56,8 @@ np.savez(out_path, mix=np.array(mix.astype(mx.float32)),
 def test_sp_bit_identical(codec, tmp_path):
     outs = {}
     for arm, env in (
-        ("base", {"KQ_MOE_SP": "0"}),
-        ("variant", {"KQ_MOE_SP": "1"}),
+        ("base", {"KQ_MOE_SP": "0", "KQ_MOE_NX": "8"}),
+        ("variant", {"KQ_MOE_SP": "1", "KQ_MOE_NX": "8"}),
     ):
         f = tmp_path / f"{arm}.npz"
         subprocess.run(
@@ -69,6 +69,62 @@ def test_sp_bit_identical(codec, tmp_path):
     for key in ("mix", "glu"):
         a, b = outs["base"][key], outs["variant"][key]
         assert np.array_equal(a, b), f"{codec} {key} not bit-identical"
+
+
+_WIDE_SNIPPET = r"""
+import sys
+import numpy as np
+import mlx.core as mx
+import mlx_kquant as kq
+from mlx_kquant.nn import bytes_per_row
+
+codec, out_path, T = sys.argv[1], sys.argv[2], int(sys.argv[3])
+rng = np.random.default_rng(5)
+E, N, K, S = 8, 64, 2048, 4
+wpb = 32 if codec in ("q4_0", "q5_0") else 256
+bpb = bytes_per_row(codec, K) // (K // wpb)
+nb = E * N * (K // wpb)
+wire = rng.integers(0, 256, size=(nb, bpb), dtype=np.uint8)
+d = rng.uniform(0.004, 0.01, nb).astype(np.float16)
+d_off = {"q6_k": 208}.get(codec, 0)
+wire[:, d_off:d_off + 2] = d.view(np.uint8).reshape(nb, 2)
+if codec == "q4_k":
+    dm = rng.uniform(0.001, 0.004, nb).astype(np.float16)
+    wire[:, 2:4] = dm.view(np.uint8).reshape(nb, 2)
+w = mx.array(wire.reshape(E, N, (K // wpb) * bpb))
+h = mx.array((rng.standard_normal((T, S, K)) * 0.05).astype(np.float16))
+inds = mx.array(rng.integers(0, E, size=(T, S)).astype(np.uint32))
+sc = mx.array(rng.uniform(0.05, 0.9, size=(T, S)).astype(np.float32))
+mix = kq.gather_qmv_mix_ns_kq(h, w, codec, inds, sc)
+mx.eval(mix)
+np.save(out_path, np.array(mix.astype(mx.float32)))
+"""
+
+
+@pytest.mark.parametrize("codec", ["q4_k", "q4_0", "q5_0", "iq3_xxs", "q6_k"])
+@pytest.mark.parametrize("T", [1, 2, 3])
+def test_mix_ns_wide_pick(codec, T, tmp_path):
+    """The codec-keyed nx16 mix_ns pick (T <= 2, K >= 2048) dispatches the
+    _nx16 kernel for the listed codecs, the slot-parallel kernel otherwise,
+    and matches the forced-nx8 launch to summation-order noise."""
+    wide = codec != "q6_k" and T <= 2
+    outs, names = {}, {}
+    for arm, env in (("auto", {}), ("nx8", {"KQ_MOE_NX": "8"})):
+        f = tmp_path / f"{arm}.npy"
+        r = subprocess.run(
+            [sys.executable, "-c", _WIDE_SNIPPET, codec, str(f), str(T)],
+            check=True,
+            capture_output=True,
+            text=True,
+            env={**os.environ, **env, "KQ_MOE_NX_LOG": "1"},
+        )
+        outs[arm] = np.load(f)
+        names[arm] = r.stdout + r.stderr
+    assert ("_nx16_" in names["auto"]) == wide, names["auto"]
+    assert "_sp_" in names["nx8"], names["nx8"]
+    a, b = outs["auto"], outs["nx8"]
+    scale = np.abs(b).max() + 1e-6
+    assert np.abs(a - b).max() / scale < 2e-3, f"{codec} T={T}"
 
 
 @pytest.mark.parametrize("codec", ["q2_k", "iq2_xxs", "iq2_xs"])
