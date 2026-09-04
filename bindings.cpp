@@ -1178,7 +1178,7 @@ NB_MODULE(_ext, m) {
 
         Returns:
             array or tuple(array, array): rotated attention output
-            [B, n_q_heads, qL, 128] (plus lse with return_lse).
+            [B, n_q_heads, qL, D] (plus lse with return_lse).
       )");
 
   m.def(

@@ -232,7 +232,7 @@ std::vector<mx::array> sdpa_decode_gqa_lse(
 // keys while the region map stays on the full n-key layout (the tail overlay
 // covers the rest). full_visibility lifts the per-query causal clamp; it
 // requires n_attend <= n - qL + 1 so every walked key precedes every query.
-// head_dim 128 or 256. Metal-only.
+// head_dim 128, 256 or 512. Metal-only.
 mx::array sdpa_decode_gqa_kvarn(
     mx::array q,
     mx::array codes_k,
@@ -247,7 +247,7 @@ mx::array sdpa_decode_gqa_kvarn(
     int v_bits,
     const std::optional<mx::array>& sinks = std::nullopt,
     int splits = 0,
-    int tile_c = 32,
+    int tile_c = 0,
     const std::optional<mx::array>& starts = std::nullopt,
     int n_attend = 0,
     bool full_visibility = false,
@@ -268,7 +268,7 @@ std::vector<mx::array> sdpa_decode_gqa_kvarn_lse(
     int v_bits,
     const std::optional<mx::array>& sinks = std::nullopt,
     int splits = 0,
-    int tile_c = 32,
+    int tile_c = 0,
     const std::optional<mx::array>& starts = std::nullopt,
     int n_attend = 0,
     bool full_visibility = false,
