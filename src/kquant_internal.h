@@ -16,6 +16,12 @@ namespace mlx_kquant {
 // Throws on other dtypes.
 std::string kq_type_string(mx::Dtype d);
 
+// KVarN key/value widths the record codec supports.
+inline bool kq_kvarn_bits_ok(int bits) {
+  return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
+      bits == 8;
+}
+
 // Kernel-name prefix for a codec: "kquant_<codec>_".
 inline std::string kq_kname_prefix(const std::string& kquant_type) {
   return "kquant_" + kquant_type + "_";

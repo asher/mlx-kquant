@@ -7,7 +7,9 @@
 #include <string>
 
 #include "kquant.h"
-#include "kquant_internal.h" // kq_type_string
+#include "kquant_internal.h" // kq_type_string, kq_kvarn_bits_ok
+
+#include "../metal/mlx/backend/metal/kernels/kq_kvarn_params.h"
 
 #include "mlx/ops.h" // contiguous
 #include "mlx/utils.h" // to_stream
@@ -23,16 +25,8 @@ namespace mlx_kquant {
 
 namespace {
 
-constexpr int kKvarnGroup = 128;
-
-bool kvarn_bits_ok(int bits) {
-  return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
-      bits == 8;
-}
-
 int kvarn_record_words(int bits) {
-  // 4*bits words per 128-value row, 128 rows.
-  return 4 * bits * kKvarnGroup;
+  return KQ_KVARN_SLICE_WORDS_PER_BIT * bits;
 }
 
 } // namespace
@@ -51,7 +45,7 @@ void KQKvarnQuantize::eval_gpu(
   codes.set_data(mx::allocator::malloc(codes.nbytes()));
   axes.set_data(mx::allocator::malloc(axes.nbytes()));
 
-  const int n_tiles = int(x.size() / (kKvarnGroup * kKvarnGroup));
+  const int n_tiles = int(x.size() / (KQ_KVARN_GROUP * KQ_KVARN_GROUP));
   const int vside = vside_ ? 1 : 0;
 
   const std::string kname = "kq_kvarn_quantize_" + kq_type_string(x.dtype());
@@ -66,7 +60,7 @@ void KQKvarnQuantize::eval_gpu(
   ce.set_bytes(vside, 4);
   ce.set_bytes(iterations_, 5);
 
-  MTL::Size group_dims(kKvarnGroup, 1, 1);
+  MTL::Size group_dims(KQ_KVARN_GROUP, 1, 1);
   MTL::Size grid_dims(n_tiles, 1, 1);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
@@ -96,7 +90,7 @@ void KQKvarnDequant::eval_gpu(
   ce.set_bytes(bits_, 3);
   ce.set_bytes(vside, 4);
 
-  MTL::Size group_dims(kKvarnGroup, 1, 1);
+  MTL::Size group_dims(KQ_KVARN_GROUP, 1, 1);
   MTL::Size grid_dims(n_tiles, 1, 1);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
@@ -130,14 +124,14 @@ std::vector<mx::Shape> KQKvarnQuantize::output_shapes(
     const std::vector<mx::array>& inputs) {
   const auto& shape = inputs[0].shape();
   mx::Shape lead(shape.begin(), shape.end() - 2);
-  const int groups = shape[shape.size() - 2] / kKvarnGroup;
+  const int groups = shape[shape.size() - 2] / KQ_KVARN_GROUP;
   mx::Shape codes_shape = lead;
   codes_shape.push_back(groups);
-  codes_shape.push_back(4 * bits_ * kKvarnGroup);
+  codes_shape.push_back(KQ_KVARN_SLICE_WORDS_PER_BIT * bits_);
   mx::Shape axes_shape = std::move(lead);
   axes_shape.push_back(groups);
   axes_shape.push_back(3);
-  axes_shape.push_back(kKvarnGroup);
+  axes_shape.push_back(KQ_KVARN_GROUP);
   return {std::move(codes_shape), std::move(axes_shape)};
 }
 
@@ -158,8 +152,8 @@ std::vector<mx::Shape> KQKvarnDequant::output_shapes(
   const auto& shape = inputs[0].shape();
   mx::Shape out(shape.begin(), shape.end() - 1);
   const int groups = out.back();
-  out.back() = groups * kKvarnGroup;
-  out.push_back(kKvarnGroup);
+  out.back() = groups * KQ_KVARN_GROUP;
+  out.push_back(KQ_KVARN_GROUP);
   return {std::move(out)};
 }
 
@@ -176,7 +170,7 @@ std::vector<mx::array> kvarn_quantize(
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
 
-  if (!kvarn_bits_ok(bits)) {
+  if (!kq_kvarn_bits_ok(bits)) {
     std::ostringstream msg;
     msg << "[mlx_kquant.kvarn_quantize] bits must be one of 2/3/4/5/6/8, "
         << "got " << bits << ".";
@@ -188,8 +182,8 @@ std::vector<mx::array> kvarn_quantize(
         << iterations << ".";
     throw std::invalid_argument(msg.str());
   }
-  if (x.ndim() < 2 || x.shape(-1) != kKvarnGroup ||
-      x.shape(-2) % kKvarnGroup != 0 || x.shape(-2) == 0) {
+  if (x.ndim() < 2 || x.shape(-1) != KQ_KVARN_GROUP ||
+      x.shape(-2) % KQ_KVARN_GROUP != 0 || x.shape(-2) == 0) {
     std::ostringstream msg;
     msg << "[mlx_kquant.kvarn_quantize] x must be [..., T, 128] with "
         << "T a positive multiple of 128, got shape " << x.shape() << ".";
@@ -219,25 +213,25 @@ mx::array kvarn_dequant(
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
 
-  if (!kvarn_bits_ok(bits)) {
+  if (!kq_kvarn_bits_ok(bits)) {
     std::ostringstream msg;
     msg << "[mlx_kquant.kvarn_dequant] bits must be one of 2/3/4/5/6/8, got "
         << bits << ".";
     throw std::invalid_argument(msg.str());
   }
   if (codes.dtype() != mx::uint32 || codes.ndim() < 2 ||
-      codes.shape(-1) != 4 * bits * kKvarnGroup) {
+      codes.shape(-1) != KQ_KVARN_SLICE_WORDS_PER_BIT * bits) {
     std::ostringstream msg;
     msg << "[mlx_kquant.kvarn_dequant] codes must be uint32 [..., G, "
-        << 4 * bits * kKvarnGroup << "] for bits = " << bits << ", got "
-        << codes.dtype() << " " << codes.shape() << ".";
+        << KQ_KVARN_SLICE_WORDS_PER_BIT * bits << "] for bits = " << bits
+        << ", got " << codes.dtype() << " " << codes.shape() << ".";
     throw std::invalid_argument(msg.str());
   }
   if (axes.dtype() != mx::float16 || axes.ndim() != codes.ndim() + 1 ||
-      axes.shape(-1) != kKvarnGroup || axes.shape(-2) != 3) {
+      axes.shape(-1) != KQ_KVARN_GROUP || axes.shape(-2) != 3) {
     std::ostringstream msg;
     msg << "[mlx_kquant.kvarn_dequant] axes must be float16 [..., G, 3, "
-        << kKvarnGroup << "], got " << axes.dtype() << " " << axes.shape()
+        << KQ_KVARN_GROUP << "], got " << axes.dtype() << " " << axes.shape()
         << ".";
     throw std::invalid_argument(msg.str());
   }

@@ -30,6 +30,8 @@ constant bool gqa_cascade [[function_constant(7)]];
 // Page-gather decode: the key walk follows a per-(batch, kv-head) list of
 // selected C-row pages (sparse top-k attention) instead of the contiguous
 // [0, N) axis. Compiled out when false.
+#include "mlx/backend/metal/kernels/kq_kvarn_params.h"
+
 constant bool gqa_paged [[function_constant(8)]];
 // KVarN-backed KV (kq_kvarn.h records + fp16 rotated stage): keys/values
 // bind as record words with per-record strides, axes and stage bind at
@@ -426,8 +428,8 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
         }
       } else {
         const int rk = kt - kvm.sink_rows;
-        const int rec = rk >> 7; // sealed group index
-        const int c0 = rk & 127; // first token column within the group
+        const int rec = rk >> KQ_KVARN_GROUP_SHIFT; // sealed group index
+        const int c0 = rk & (KQ_KVARN_GROUP - 1); // first token column
         const device uint32_t* krec = kwbase + (size_t)rec * k_seq_stride;
         const device uint32_t* vrec = vwbase + (size_t)rec * v_seq_stride;
         const device half* kax =
@@ -440,7 +442,7 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
         // is a template constant, so the D == 128 case folds back to
         // single-record addressing. The max keeps D < 128 instantiations
         // compiling; the host never dispatches kvarn on them.
-        constexpr int SL = D < 128 ? 1 : D / 128;
+        constexpr int SL = D < KQ_KVARN_GROUP ? 1 : D / KQ_KVARN_GROUP;
         // Both loaders stage a unit's record words in registers and extract
         // with fully unrolled loops: the bit widths are function constants,
         // so every word index and shift folds at pipeline build (no dynamic
@@ -462,9 +464,11 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
           const int sseg = SL == 1 ? seg : (seg & 3);
           threadgroup T4* dst = (threadgroup T4*)(sVh + row * D + seg * 32);
           const int vr = c0 + row;
-          const device half* vaxs = vax + sl * 384;
-          const device uint32_t* w = vrec + (size_t)sl * 512 * kvarn_v_bits +
-              (size_t)vr * 4 * kvarn_v_bits + (size_t)sseg * kvarn_v_bits;
+          const device half* vaxs = vax + sl * KQ_KVARN_AXES_PER_SLICE;
+          const device uint32_t* w = vrec +
+              (size_t)sl * KQ_KVARN_SLICE_WORDS_PER_BIT * kvarn_v_bits +
+              (size_t)vr * KQ_KVARN_ROW_WORDS_PER_BIT * kvarn_v_bits +
+              (size_t)sseg * kvarn_v_bits;
           uint wreg[8];
 #pragma unroll
           for (short t = 0; t < 8; t++) {
@@ -473,9 +477,10 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
           // At C == 32 the shuffle stays correct with slices: a simdgroup's
           // units share one seg (flat is 32-aligned per simdgroup), so
           // every lane preloads from the same slice triplet.
-          const float other_l = float(vaxs[256 + sseg * 32 + lane]);
+          const float other_l =
+              float(vaxs[2 * KQ_KVARN_GROUP + sseg * 32 + lane]);
           const float vsc = float(vaxs[vr]);
-          const float vzp = float(vaxs[128 + vr]);
+          const float vzp = float(vaxs[KQ_KVARN_GROUP + vr]);
           const bool valid = kt + row < kend;
 #pragma unroll
           for (short j4 = 0; j4 < 8; j4++) {
@@ -490,8 +495,9 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
               if (sh + kvarn_v_bits > 32) {
                 qv |= wreg[wi + 1] << (32 - sh);
               }
-              const float other = C == 32 ? simd_shuffle(other_l, ushort(j))
-                                          : float(vaxs[256 + sseg * 32 + j]);
+              const float other = C == 32
+                  ? simd_shuffle(other_l, ushort(j))
+                  : float(vaxs[2 * KQ_KVARN_GROUP + sseg * 32 + j]);
               f[jj] = (float(qv & vmask) * vsc + vzp) * other;
             }
             dst[j4] = valid ? T4(f) : T4(T(0));
@@ -509,15 +515,20 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
         float otherk_sl[SL];
 #pragma unroll
         for (short s2 = 0; s2 < SL; s2++) {
-          otherk_sl[s2] = float(kax[s2 * 384 + 256 + min(c0 + lane, 127)]);
+          otherk_sl[s2] = float(
+              kax[s2 * KQ_KVARN_AXES_PER_SLICE + 2 * KQ_KVARN_GROUP +
+                  min(c0 + lane, KQ_KVARN_GROUP - 1)]);
         }
         for (int u = flat; u < D; u += n_threads) {
-          const int sl = SL == 1 ? 0 : u >> 7;
-          const int ur = SL == 1 ? u : (u & 127);
-          const device uint32_t* w = krec + (size_t)sl * 512 * kvarn_k_bits +
-              (size_t)ur * 4 * kvarn_k_bits + (kb0 >> 5);
-          const float ksc = float(kax[sl * 384 + ur]);
-          const float kzp = float(kax[sl * 384 + 128 + ur]);
+          const int sl = SL == 1 ? 0 : u >> KQ_KVARN_GROUP_SHIFT;
+          const int ur = SL == 1 ? u : (u & (KQ_KVARN_GROUP - 1));
+          const device uint32_t* w = krec +
+              (size_t)sl * KQ_KVARN_SLICE_WORDS_PER_BIT * kvarn_k_bits +
+              (size_t)ur * KQ_KVARN_ROW_WORDS_PER_BIT * kvarn_k_bits +
+              (kb0 >> 5);
+          const float ksc = float(kax[sl * KQ_KVARN_AXES_PER_SLICE + ur]);
+          const float kzp =
+              float(kax[sl * KQ_KVARN_AXES_PER_SLICE + KQ_KVARN_GROUP + ur]);
           // The slice index is simdgroup-uniform (32 consecutive dim rows
           // never straddle a slice), so shuffling from the selected
           // preload is exact; the unrolled ladder avoids dynamic register

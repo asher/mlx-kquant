@@ -18,9 +18,9 @@
 
 #pragma once
 
-using namespace metal;
+#include "mlx/backend/metal/kernels/kq_kvarn_params.h"
 
-constant constexpr int KQ_KVARN_GROUP = 128;
+using namespace metal;
 
 template <typename T>
 inline float kq_kvarn_tile_at(const device T* xt, int r, int c, int vside) {

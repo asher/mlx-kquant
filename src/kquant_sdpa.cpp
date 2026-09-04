@@ -10,7 +10,9 @@
 #include <string>
 
 #include "kquant.h"
-#include "kquant_internal.h" // kq_type_string
+#include "kquant_internal.h" // kq_type_string, kq_kvarn_bits_ok
+
+#include "../metal/mlx/backend/metal/kernels/kq_kvarn_params.h"
 
 #include "mlx/ops.h" // contiguous
 #include "mlx/utils.h" // to_stream
@@ -388,9 +390,10 @@ void KQuantSDPAGQA::eval_gpu(
     if (kvarn) {
       const auto& stk = inputs[qkv_idx + 2];
       const auto& stv = inputs[qkv_idx + 3];
-      const int sink_cap = stk.shape(2) - 128;
+      const int sink_cap = stk.shape(2) - KQ_KVARN_GROUP;
       kvm.sink_rows = std::min(kvarn_n_, sink_cap);
-      kvm.n_rec_keys = std::max(0, (kvarn_n_ - sink_cap) / 128) * 128;
+      kvm.n_rec_keys =
+          std::max(0, (kvarn_n_ - sink_cap) / KQ_KVARN_GROUP) * KQ_KVARN_GROUP;
       kvm.live_row0 = sink_cap;
       kvm.full_vis = kvarn_full_vis_ ? 1 : 0;
       kvm.stage_k_head = static_cast<uint64_t>(
@@ -1445,8 +1448,7 @@ static std::vector<mx::array> sdpa_decode_gqa_kvarn_impl(
   auto s = mx::to_stream(s_);
 
   for (int bits : {k_bits, v_bits}) {
-    if (bits != 2 && bits != 3 && bits != 4 && bits != 5 && bits != 6 &&
-        bits != 8) {
+    if (!kq_kvarn_bits_ok(bits)) {
       throw std::invalid_argument(
           "[mlx_kquant.sdpa_decode_gqa_kvarn] k_bits/v_bits must be one of "
           "2/3/4/5/6/8, got " +
@@ -1460,7 +1462,7 @@ static std::vector<mx::array> sdpa_decode_gqa_kvarn_impl(
         "D] with head_dim 128, 256 or 512.");
   }
   const int D = q.shape(3);
-  const int slices = D / 128;
+  const int slices = D / KQ_KVARN_GROUP;
   auto dt = q.dtype();
   if (dt != mx::float16 && dt != mx::bfloat16) {
     throw std::invalid_argument(
@@ -1476,8 +1478,8 @@ static std::vector<mx::array> sdpa_decode_gqa_kvarn_impl(
   }
   if (codes_k.ndim() != 4 || codes_v.ndim() != 4 ||
       codes_k.dtype() != mx::uint32 || codes_v.dtype() != mx::uint32 ||
-      codes_k.shape(-1) != slices * 512 * k_bits ||
-      codes_v.shape(-1) != slices * 512 * v_bits) {
+      codes_k.shape(-1) != slices * KQ_KVARN_SLICE_WORDS_PER_BIT * k_bits ||
+      codes_v.shape(-1) != slices * KQ_KVARN_SLICE_WORDS_PER_BIT * v_bits) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa_kvarn] codes must be uint32 "
         "[B, n_kv_heads, Gcap, (D / 128) * 512 * bits] (slice-minor "
@@ -1494,7 +1496,7 @@ static std::vector<mx::array> sdpa_decode_gqa_kvarn_impl(
   }
   for (const auto* a : {&axes_k, &axes_v}) {
     if (a->ndim() != 5 || a->dtype() != mx::float16 ||
-        a->shape(-2) != 3 * slices || a->shape(-1) != 128) {
+        a->shape(-2) != 3 * slices || a->shape(-1) != KQ_KVARN_GROUP) {
       throw std::invalid_argument(
           "[mlx_kquant.sdpa_decode_gqa_kvarn] axes must be float16 "
           "[B, n_kv_heads, Gcap, 3 * (D / 128), 128] (one triplet per "
@@ -1516,18 +1518,18 @@ static std::vector<mx::array> sdpa_decode_gqa_kvarn_impl(
     }
   }
   int stage_rows = stage_k.shape(2);
-  if (stage_v.shape(2) != stage_rows || stage_rows < 256 ||
-      stage_rows % 128 != 0) {
+  if (stage_v.shape(2) != stage_rows || stage_rows < 2 * KQ_KVARN_GROUP ||
+      stage_rows % KQ_KVARN_GROUP != 0) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa_kvarn] stage rows must match across "
         "sides and be a multiple of 128 >= 256 (sink groups + live group).");
   }
-  const int sink_cap = stage_rows - 128;
+  const int sink_cap = stage_rows - KQ_KVARN_GROUP;
   if (n < qL) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa_kvarn] n must be >= query length.");
   }
-  if (n > sink_cap + g_cap * 128 + 128) {
+  if (n > sink_cap + (g_cap + 1) * KQ_KVARN_GROUP) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa_kvarn] n exceeds the sink + record + "
         "live capacity of the operands.");
