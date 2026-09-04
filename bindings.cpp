@@ -803,10 +803,12 @@ NB_MODULE(_ext, m) {
         qL == 1; invisible rows score the dtype's finite min.
 
         Args:
-            queries (array): [B, 64, qL, 128], qL in [1, 4],
-                float16/bfloat16.
+            queries (array): [B, H, qL, 128], H in {4, 32, 64}, qL in
+                [1, 4], float16/bfloat16.
             keys (array): the pooled indexer key cache [B, P, 128].
-            weights (array): per-head query weights [B, qL, 64].
+            weights (array): per-head query weights [B, qL, H]. float32
+                weights are read as-is (sign-free head gates stay exact);
+                other dtypes follow the q/k dtype.
             q_offset (int): absolute position of query row 0's step
                 (make_mask's ``offset``).
             ratio (int): pooled compression ratio.
@@ -1292,7 +1294,7 @@ NB_MODULE(_ext, m) {
             indices (array): expert indices [T, R].
             act (str): 'silu' (default) or 'gelu' (tanh approx).
             shexp_kquant_type (str): shared-expert codec; '' (default) =
-                kquant_type. Mixed combos must be q6_k or q8_0.
+                kquant_type. Mixed combos must be q5_k, q6_k or q8_0.
 
         Returns:
             array: activated hidden states [T, R + 1, N] in x.dtype.
@@ -1321,9 +1323,10 @@ NB_MODULE(_ext, m) {
             shexp_w (array): uint8 wire bytes (N, bytes_per_row).
             kquant_type (str): expert codec with a fused kernel.
             indices (array): expert indices [T, S - 1].
-            scores (array): mix weights [T, S]; cast to float32.
+            scores (array): mix weights [T, S], or [T, S - 1] with the
+                shared slot at an implicit weight of 1; cast to float32.
             shexp_kquant_type (str): shared-expert codec; '' (default) =
-                kquant_type. Mixed combos must be q6_k or q8_0.
+                kquant_type. Mixed combos must be q5_k, q6_k or q8_0.
 
         Returns:
             array: mixed output [T, N] in x.dtype.
@@ -1385,7 +1388,8 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         Router top-k in one dispatch: f32 scoring over the first E columns
-        (softmax, or sqrtsoftplus = sqrt(softplus(x)) for deepseek-v4),
+        (softmax, sqrtsoftplus = sqrt(softplus(x)) for deepseek-v4, or
+        sigmoid for deepseek-v3 / glm5 noaux-tc routing),
         top_k selection (min-index tie-break) optionally ranked by
         score + bias, optional renormalization, an optional per-expert
         scale applied to the picked scores, a uniform scale on emitted
@@ -1402,7 +1406,7 @@ NB_MODULE(_ext, m) {
                 scores, applied after renormalization; cast to float32.
             bias (array, optional): [E] selection bias
                 (e_score_correction_bias); emitted scores stay unbiased.
-            scoring (str): "softmax" or "sqrtsoftplus".
+            scoring (str): "softmax", "sqrtsoftplus" or "sigmoid".
             scale (float): uniform multiplier on emitted routed scores
                 (routed_scaling_factor).
 

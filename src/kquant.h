@@ -652,7 +652,7 @@ mx::array gather_qmv_kq(
 // slot: shexp_gate_w / shexp_up_w are single-expert 2-D wire-byte tensors
 // [N, bytes_per_row(shexp codec)] shape-matched to one expert stack row.
 // shexp_kquant_type defaults to kquant_type; a different codec (mixed-codec
-// blocks, UD-style upcast shexp) must be q6_k or q8_0.
+// blocks, UD-style upcast shexp) must be q5_k, q6_k or q8_0.
 // Returns [T, R + 1, N]; the last slot is the shared expert.
 mx::array moe_glu_gather_shexp_kq(
     mx::array x,

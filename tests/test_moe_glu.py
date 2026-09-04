@@ -235,9 +235,10 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0):
     out.append(("qmv", rel, rel < REL_BOUND))
 
     # moe_glu_gather_shexp_kq (shexp codec = scodec). No silu_limit shexp
-    # instantiations exist (deepseek-v4's shared expert stays in Python), so
+    # instantiations exist (the clamped shared experts stay in Python), so
     # silu_limit runs exercise the shexp op with plain silu.
     act = "silu" if act == "silu_limit" else act
+    limit = 0.0 if act != "silu_limit" else limit
     got = kq.moe_glu_gather_shexp_kq(
         x,
         dw,
@@ -254,7 +255,7 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0):
         [
             np.stack(
                 [
-                    _act_np(xf[t] @ ref[e].T, act) * (xf[t] @ up_ref[e].T)
+                    _glu_np(xf[t] @ ref[e].T, xf[t] @ up_ref[e].T, act, limit)
                     for e in inds_np[t]
                 ],
                 0,
@@ -264,7 +265,8 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0):
         0,
     )
     shared = np.stack(
-        [_act_np(xf[t] @ sg_ref.T, act) * (xf[t] @ su_ref.T) for t in range(T)], 0
+        [_glu_np(xf[t] @ sg_ref.T, xf[t] @ su_ref.T, act, limit) for t in range(T)],
+        0,
     )
     r = np.concatenate([routed, shared[:, None, :]], axis=1)
     rel = _rel(got, r)
@@ -297,6 +299,29 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0):
     )
     rel = _rel(got, r)
     out.append(("mix", rel, rel < REL_BOUND))
+    # [T, S - 1] scores: the shared slot rides at an implicit weight of 1,
+    # bit-identical to passing the ones column explicitly
+    sc1 = np.concatenate([sc_np[:, :R], np.ones((T, 1), np.float32)], 1)
+    got_full = kq.gather_qmv_mix_kq(
+        hs,
+        dw,
+        sdw,
+        codec,
+        inds,
+        mx.array(sc1),
+        shexp_kquant_type=("" if scodec == codec else scodec),
+    )
+    got_impl = kq.gather_qmv_mix_kq(
+        hs,
+        dw,
+        sdw,
+        codec,
+        inds,
+        mx.array(sc1[:, :R]),
+        shexp_kquant_type=("" if scodec == codec else scodec),
+    )
+    mx.eval(got_full, got_impl)
+    out.append(("mix_implicit", 0.0, mx.array_equal(got_full, got_impl).item()))
 
     # gather_qmv_mix_ns_kq: all S slots routed (gemma-style, no shared expert)
     inds_ns_np = rng.integers(0, E, size=(T, S)).astype(np.uint32)
@@ -550,6 +575,50 @@ def _check_router():
         mx.eval(inds, sc)
         if not np.all(np.isfinite(np.array(sc))):
             fails.append(f"E={e} R={r} ssp negative-logits nonfinite scores")
+    # sigmoid + selection bias + routed scale (deepseek-v3 / glm5 noaux-tc)
+    for e, r, norm in ((288, 8, True), (256, 8, False), (64, 4, True)):
+        logits_np = (rng.standard_normal((7, e)) * 3.0).astype(np.float32)
+        logits_np[5, 10:20] = logits_np[5, 10]
+        bias_np = rng.standard_normal(e).astype(np.float32)
+        for dt in (mx.float32, mx.bfloat16):
+            inds, sc = kq.moe_router_topk(
+                mx.array(logits_np).astype(dt),
+                r,
+                norm,
+                shared_gate=False,
+                bias=mx.array(bias_np),
+                scoring="sigmoid",
+                scale=2.5,
+            )
+            mx.eval(inds, sc)
+            lf = np.array(mx.array(logits_np).astype(dt).astype(mx.float32))
+            p = 1.0 / (1.0 + np.exp(-lf))
+            top = np.argsort(-(p + bias_np), axis=-1, kind="stable")[:, :r]
+            got_i = np.array(inds)
+            for t in range(7):
+                if set(got_i[t]) != set(top[t]):
+                    bk = np.sort((p + bias_np)[t, got_i[t]])
+                    bw = np.sort((p + bias_np)[t, top[t]])
+                    if not np.allclose(bk, bw, rtol=0, atol=3e-6):
+                        fails.append(f"E={e} R={r} t={t} {dt} sigmoid indices")
+                        continue
+                pk = p[t, got_i[t]]
+                want = pk / (pk.sum() + 1e-20) * 2.5 if norm else pk * 2.5
+                if not np.allclose(np.array(sc)[t], want, rtol=1e-5, atol=1e-6):
+                    fails.append(f"E={e} R={r} t={t} {dt} sigmoid scores")
+        neg = mx.array((-np.abs(logits_np) - 50.0).astype(np.float32))
+        inds, sc = kq.moe_router_topk(
+            neg,
+            r,
+            norm,
+            shared_gate=False,
+            bias=mx.array(bias_np),
+            scoring="sigmoid",
+            scale=2.5,
+        )
+        mx.eval(inds, sc)
+        if not np.all(np.isfinite(np.array(sc))):
+            fails.append(f"E={e} R={r} sigmoid negative-logits nonfinite scores")
     return fails
 
 
@@ -589,6 +658,14 @@ def main(argv=None) -> int:
         run(codec)  # uniform, silu, f16
         if codec != "q8_0":
             run(codec, sx="q8_0")  # UD-style upcast shexp
+    # q5_k upcast shexp (UD builds: iq2_xs/iq3_xxs experts, q5_k shexp)
+    if not allow or "iq2_xs" in allow:
+        run("iq2_xs", sx="q5_k")
+        run("iq2_xs", sx="q5_k", dtype=mx.bfloat16)
+    if not allow or "iq3_xxs" in allow:
+        run("iq3_xxs", sx="q5_k")
+    if not allow or "q6_k" in allow:
+        run("q6_k", sx="q5_k")
     if not allow or "q8_0" in allow:
         run("q8_0", sx="q6_k")  # reverse mixed combo
         run("q8_0", k=352)  # K % 256 != 0 -> q8_0_ext generic-uniform stem

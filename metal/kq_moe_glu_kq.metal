@@ -158,6 +158,12 @@ instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
   instantiate_kq_ext_bias_nx(codec, traits, type, 16, "_nx16")                 \
   instantiate_kq_ext_bias_nx(codec, traits, type, 32, "_nx32")
 
+// q5_k shexp over any expert codec (UD-style upcast where the shexp lands
+// one tier below q6_k): nx 8 and 16 only, the auto pick caps at 16.
+#define instantiate_kq_ext_sx_q5k(codec, traits, type)                        \
+  instantiate_kq_ext_sx_nx(codec, traits, q5_k, KqQ5_KExt, type, 8, "")        \
+  instantiate_kq_ext_sx_nx(codec, traits, q5_k, KqQ5_KExt, type, 16, "_nx16")
+
 #define instantiate_kq_ext_all(codec, traits)                                 \
   instantiate_kq_ext_uniform(codec, traits, bfloat16_t)                        \
   instantiate_kq_ext_uniform(codec, traits, float16_t)                         \
@@ -165,12 +171,20 @@ instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
   instantiate_kq_ext_sx(codec, traits, q6_k, KqQ6_KExt, bfloat16_t)            \
   instantiate_kq_ext_sx(codec, traits, q6_k, KqQ6_KExt, float16_t)             \
   instantiate_kq_ext_sx(codec, traits, q8_0, KqQ8_0Ext, bfloat16_t)            \
-  instantiate_kq_ext_sx(codec, traits, q8_0, KqQ8_0Ext, float16_t)
+  instantiate_kq_ext_sx(codec, traits, q8_0, KqQ8_0Ext, float16_t)             \
+  instantiate_kq_ext_sx_q5k(codec, traits, bfloat16_t)                         \
+  instantiate_kq_ext_sx_q5k(codec, traits, float16_t)
 
 instantiate_kq_ext_all(q2_k, KqQ2_KExt)
 instantiate_kq_ext_all(q3_k, KqQ3_KExt)
 instantiate_kq_ext_all(q4_k, KqQ4_KExt)
-instantiate_kq_ext_all(q5_k, KqQ5_KExt)
+instantiate_kq_ext_uniform(q5_k, KqQ5_KExt, bfloat16_t)
+instantiate_kq_ext_uniform(q5_k, KqQ5_KExt, float16_t)
+instantiate_kq_ext_mix_ns(q5_k, KqQ5_KExt)
+instantiate_kq_ext_sx(q5_k, KqQ5_KExt, q6_k, KqQ6_KExt, bfloat16_t)
+instantiate_kq_ext_sx(q5_k, KqQ5_KExt, q6_k, KqQ6_KExt, float16_t)
+instantiate_kq_ext_sx(q5_k, KqQ5_KExt, q8_0, KqQ8_0Ext, bfloat16_t)
+instantiate_kq_ext_sx(q5_k, KqQ5_KExt, q8_0, KqQ8_0Ext, float16_t)
 instantiate_kq_ext_all(q4_0, KqQ4_0Ext)
 instantiate_kq_ext_all(q4_1, KqQ4_1Ext)
 instantiate_kq_ext_all(q5_0, KqQ5_0Ext)
@@ -198,6 +212,10 @@ instantiate_kq_ext_sx(q6_k, KqQ6_KExt, q8_0, KqQ8_0Ext, bfloat16_t)
 instantiate_kq_ext_sx(q6_k, KqQ6_KExt, q8_0, KqQ8_0Ext, float16_t)
 instantiate_kq_ext_sx(q8_0, KqQ8_0Ext, q6_k, KqQ6_KExt, bfloat16_t)
 instantiate_kq_ext_sx(q8_0, KqQ8_0Ext, q6_k, KqQ6_KExt, float16_t)
+instantiate_kq_ext_sx_q5k(q6_k, KqQ6_KExt, bfloat16_t)
+instantiate_kq_ext_sx_q5k(q6_k, KqQ6_KExt, float16_t)
+instantiate_kq_ext_sx_q5k(q8_0, KqQ8_0Ext, bfloat16_t)
+instantiate_kq_ext_sx_q5k(q8_0, KqQ8_0Ext, float16_t)
 
 // q6_k/q8_0 mix_ns (generic; no tuned ns kernels exist).
 instantiate_kq_ext_mix_ns(q6_k, KqQ6_KExt)

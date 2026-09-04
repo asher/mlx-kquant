@@ -349,13 +349,23 @@ kq_dsa_indexer_score(
 // PoolingCache.make_mask: row r is visible to query j iff
 // r < (q_offset + j + 1) / ratio, and every row is visible when QL == 1;
 // invisible rows score the dtype's finite min so the radix top-k orders
-// them last (matching the inline path's masked argpartition).
-template <typename T, int QL, int H = 64, int D = 128, int SGS = 4, int R = 8>
+// them last (matching the inline path's masked argpartition). WT is the
+// head-weight storage type: fp32 keeps sign-free head gates exact for the
+// runtimes that pin them (glm5), the dot and accumulation are fp32 either
+// way.
+template <
+    typename T,
+    int QL,
+    int H = 64,
+    int D = 128,
+    int SGS = 4,
+    int R = 8,
+    typename WT = T>
 [[kernel, max_total_threads_per_threadgroup(SGS * 32)]] void
 kq_dsa_indexer_score_decode(
     const device T* Q [[buffer(0)]], // [B, H, QL, D]
     const device T* K [[buffer(1)]], // [B, P, D]
-    const device T* W [[buffer(2)]], // [B, QL, H]
+    const device WT* W [[buffer(2)]], // [B, QL, H]
     device T* out [[buffer(3)]], // [B, 1, QL, P]
     const constant int& P [[buffer(4)]],
     const constant int& q_offset [[buffer(5)]],
@@ -391,7 +401,7 @@ kq_dsa_indexer_score_decode(
   }
 
   const device T* qb = Q + size_t(b) * H * QL * D + simd_lid * 4;
-  const device T* wb = W + size_t(b) * QL * H;
+  const device WT* wb = W + size_t(b) * QL * H;
   for (int h = 0; h < H; ++h) {
     STEEL_PRAGMA_UNROLL
     for (int j = 0; j < QL; ++j) {
