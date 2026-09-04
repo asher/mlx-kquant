@@ -468,11 +468,15 @@ void KQuantSDPAFAVerify::eval_gpu(
   const auto& v = inputs[2];
   kq_sdpa_check_layout("sdpa_fa_verify", q, k, v);
 
+  // With kvarn, k/v are the code slabs and the key count comes from the
+  // op; a tail-merge body walks only the first n_attend keys while the
+  // region map stays on the full layout (as sdpa_decode_gqa).
+  const bool kvarn = has_kvarn_;
   int B = q.shape(0);
   int n_kv_heads = k.shape(1);
   int n_rows = q.shape(2);
   int D = q.shape(3);
-  int kL = k.shape(2);
+  int kL = kvarn ? (kvarn_n_attend_ ? kvarn_n_attend_ : kvarn_n_) : k.shape(2);
   int q_len = q_len_;
   // Same coarse split buckets as sdpa_decode_gqa (a per-kL value would mint
   // a new pipeline specialization every decode step).
@@ -511,12 +515,18 @@ void KQuantSDPAFAVerify::eval_gpu(
   bool has_lse = write_lse;
   bool has_cascade = false;
   bool no_q8 = false;
+  bool has_kvarn = kvarn;
+  int kvarn_k_bits = kvarn_k_bits_;
+  int kvarn_v_bits = kvarn_v_bits_;
   mx::metal::MTLFCList fc = {
       {&splits, MTL::DataType::DataTypeInt, 2},
       {&has_sinks, MTL::DataType::DataTypeBool, 3},
       {&no_q8, MTL::DataType::DataTypeBool, 5},
       {&has_lse, MTL::DataType::DataTypeBool, 6},
       {&has_cascade, MTL::DataType::DataTypeBool, 7},
+      {&has_kvarn, MTL::DataType::DataTypeBool, 9},
+      {&kvarn_k_bits, MTL::DataType::DataTypeInt, 10},
+      {&kvarn_v_bits, MTL::DataType::DataTypeInt, 11},
   };
 
   // Pass 1: one threadgroup per (kv-head, batch, split) streams its key
@@ -527,7 +537,10 @@ void KQuantSDPAFAVerify::eval_gpu(
     const int bq = n_rows <= 32 ? 32 : 64;
     std::string kname = "kq_sdpa_fa_verify_2pass_1_" + ts + "_" +
         std::to_string(D) + "_bq" + std::to_string(bq);
-    std::string hash = kname + "_s" + std::to_string(splits);
+    std::string hash = kname + "_s" + std::to_string(splits) +
+        (kvarn ? "_kv" + std::to_string(kvarn_k_bits_) +
+                 std::to_string(kvarn_v_bits_)
+               : "");
     auto kernel = kq_get_kernel(d, kname, hash, fc);
     // Register-heavy pipeline: some GPUs cap it below the dispatch width, and
     // Metal turns an oversized dispatch into silent garbage, not an error.
@@ -553,15 +566,52 @@ void KQuantSDPAFAVerify::eval_gpu(
     ce.set_bytes(scale, 11);
     ce.set_bytes(q_len, 12);
     ce.set_bytes(n_rows, 13);
-    // q8 operand slots: compiled out (fc 5 false); bind dummies.
-    size_t zero = 0;
+    // q8 operand slots: compiled out (fc 5 false); bind dummies. With
+    // kvarn, buffers 18-21 carry the axes head/group strides.
+    size_t ks_head_stride = 0, ks_seq_stride = 0;
+    size_t vs_head_stride = 0, vs_seq_stride = 0;
+    if (kvarn) {
+      const auto& axk = inputs[3];
+      const auto& axv = inputs[4];
+      ks_head_stride = static_cast<size_t>(
+          axk.shape(1) == 1 ? axk.strides(0) : axk.strides(1));
+      ks_seq_stride = static_cast<size_t>(axk.strides(2));
+      vs_head_stride = static_cast<size_t>(
+          axv.shape(1) == 1 ? axv.strides(0) : axv.strides(1));
+      vs_seq_stride = static_cast<size_t>(axv.strides(2));
+    }
     for (int i = 0; i < 4; i++) {
       ce.set_input_array(sums, 14 + i);
     }
-    ce.set_bytes(zero, 18);
-    ce.set_bytes(zero, 19);
-    ce.set_bytes(zero, 20);
-    ce.set_bytes(zero, 21);
+    ce.set_bytes(ks_head_stride, 18);
+    ce.set_bytes(ks_seq_stride, 19);
+    ce.set_bytes(vs_head_stride, 20);
+    ce.set_bytes(vs_seq_stride, 21);
+    // KVarN axes/stage operands and region map (dummies when compiled out).
+    KQKvarnMeta kvm = {};
+    if (kvarn) {
+      const auto& stk = inputs[5];
+      const auto& stv = inputs[6];
+      const int sink_cap = stk.shape(2) - KQ_KVARN_GROUP;
+      kvm.sink_rows = std::min(kvarn_n_, sink_cap);
+      kvm.n_rec_keys =
+          std::max(0, (kvarn_n_ - sink_cap) / KQ_KVARN_GROUP) * KQ_KVARN_GROUP;
+      kvm.live_row0 = sink_cap;
+      kvm.full_vis = kvarn_full_vis_ ? 1 : 0;
+      kvm.stage_k_head = static_cast<uint64_t>(
+          stk.shape(1) == 1 ? stk.strides(0) : stk.strides(1));
+      kvm.stage_v_head = static_cast<uint64_t>(
+          stv.shape(1) == 1 ? stv.strides(0) : stv.strides(1));
+      ce.set_input_array(inputs[3], 24);
+      ce.set_input_array(inputs[4], 25);
+      ce.set_input_array(stk, 26);
+      ce.set_input_array(stv, 27);
+    } else {
+      for (int i = 24; i <= 27; i++) {
+        ce.set_input_array(sums, i);
+      }
+    }
+    ce.set_bytes(kvm, 28);
     MTL::Size group_dims(32, tg / 32, 1);
     MTL::Size grid_dims(n_kv_heads, B, splits);
     ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -2017,7 +2067,10 @@ std::vector<mx::Shape> KQuantSDPAFAVerify::output_shapes(
 bool KQuantSDPAFAVerify::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantSDPAFAVerify&>(other);
   return scale_ == o.scale_ && q_len_ == o.q_len_ && splits_ == o.splits_ &&
-      return_lse_ == o.return_lse_;
+      return_lse_ == o.return_lse_ && has_kvarn_ == o.has_kvarn_ &&
+      kvarn_k_bits_ == o.kvarn_k_bits_ && kvarn_v_bits_ == o.kvarn_v_bits_ &&
+      kvarn_n_ == o.kvarn_n_ && kvarn_n_attend_ == o.kvarn_n_attend_ &&
+      kvarn_full_vis_ == o.kvarn_full_vis_;
 }
 
 std::vector<mx::Shape> KQuantSDPABSPrefill::output_shapes(
@@ -2240,6 +2293,247 @@ std::vector<mx::array> sdpa_fa_verify_lse(
     mx::StreamOrDevice s_) {
   return sdpa_fa_verify_impl(
       true, std::move(q), std::move(k), std::move(v), scale, q_len, splits, s_);
+}
+
+static std::vector<mx::array> sdpa_fa_verify_kvarn_impl(
+    bool return_lse,
+    mx::array q,
+    mx::array codes_k,
+    mx::array axes_k,
+    mx::array codes_v,
+    mx::array axes_v,
+    mx::array stage_k,
+    mx::array stage_v,
+    int n,
+    float scale,
+    int k_bits,
+    int v_bits,
+    int q_len,
+    int splits,
+    int n_attend,
+    bool full_visibility,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const std::string op = "[mlx_kquant.sdpa_fa_verify_kvarn] ";
+
+  for (int bits : {k_bits, v_bits}) {
+    if (!kq_kvarn_bits_ok(bits)) {
+      throw std::invalid_argument(
+          op + "k_bits/v_bits must be one of 2/3/4/5/6/8, got " +
+          std::to_string(bits) + ".");
+    }
+  }
+  if (q.ndim() != 4 ||
+      (q.shape(-1) != 128 && q.shape(-1) != 256 && q.shape(-1) != 512)) {
+    throw std::invalid_argument(
+        op +
+        "q must be [1, n_kv_heads, G * q_len, D] with head_dim 128, "
+        "256 or 512.");
+  }
+  const int D = q.shape(3);
+  const int slices = D / KQ_KVARN_GROUP;
+  auto dt = q.dtype();
+  if (dt != mx::float16 && dt != mx::bfloat16) {
+    throw std::invalid_argument(op + "q must be float16 or bfloat16.");
+  }
+  if (q.shape(0) != 1) {
+    throw std::invalid_argument(op + "batch size must be 1.");
+  }
+  if (codes_k.ndim() != 4 || codes_v.ndim() != 4 ||
+      codes_k.dtype() != mx::uint32 || codes_v.dtype() != mx::uint32 ||
+      codes_k.shape(-1) != slices * KQ_KVARN_SLICE_WORDS_PER_BIT * k_bits ||
+      codes_v.shape(-1) != slices * KQ_KVARN_SLICE_WORDS_PER_BIT * v_bits) {
+    throw std::invalid_argument(
+        op +
+        "codes must be uint32 [1, n_kv_heads, Gcap, (D / 128) * 512 * "
+        "bits] (slice-minor records).");
+  }
+  const int n_kv_heads = codes_k.shape(1);
+  const int g_cap = codes_k.shape(2);
+  if (q.shape(1) != n_kv_heads) {
+    throw std::invalid_argument(
+        op + "q must be GQA-folded: q heads must equal kv heads.");
+  }
+  for (const auto* a :
+       {&codes_k, &codes_v, &axes_k, &axes_v, &stage_k, &stage_v}) {
+    if (a->shape(0) != 1 || a->shape(1) != n_kv_heads) {
+      throw std::invalid_argument(
+          op + "codes/axes/stage leading dims must agree on [1, n_kv_heads].");
+    }
+  }
+  for (const auto* a : {&axes_k, &axes_v}) {
+    if (a->ndim() != 5 || a->dtype() != mx::float16 ||
+        a->shape(-2) != 3 * slices || a->shape(-1) != KQ_KVARN_GROUP) {
+      throw std::invalid_argument(
+          op +
+          "axes must be float16 [1, n_kv_heads, Gcap, 3 * (D / 128), "
+          "128] (one triplet per slice).");
+    }
+  }
+  if (axes_k.shape(2) != g_cap || axes_v.shape(2) != g_cap ||
+      codes_v.shape(2) != g_cap) {
+    throw std::invalid_argument(op + "codes/axes group capacities must match.");
+  }
+  for (const auto* a : {&stage_k, &stage_v}) {
+    if (a->ndim() != 4 || a->dtype() != mx::float16 || a->shape(-1) != D) {
+      throw std::invalid_argument(
+          op + "stage must be float16 [1, n_kv_heads, S_rows, D].");
+    }
+  }
+  const int stage_rows = stage_k.shape(2);
+  if (stage_v.shape(2) != stage_rows || stage_rows < 2 * KQ_KVARN_GROUP ||
+      stage_rows % KQ_KVARN_GROUP != 0) {
+    throw std::invalid_argument(
+        op +
+        "stage rows must match across sides and be a multiple of 128 "
+        ">= 256 (sink groups + live group).");
+  }
+  const int sink_cap = stage_rows - KQ_KVARN_GROUP;
+  if (q_len < 1 || q_len > 8) {
+    throw std::invalid_argument(op + "q_len must be in [1, 8].");
+  }
+  const int n_rows = q.shape(2);
+  const int max_rows = D == 512 ? 32 : 64;
+  if (n_rows < q_len || n_rows > max_rows || n_rows % q_len != 0) {
+    throw std::invalid_argument(
+        op + "folded rows must be a multiple of q_len and <= " +
+        std::to_string(max_rows) + " at head_dim " + std::to_string(D) + ".");
+  }
+  if (n < q_len) {
+    throw std::invalid_argument(op + "n must be >= q_len.");
+  }
+  if (n > sink_cap + (g_cap + 1) * KQ_KVARN_GROUP) {
+    throw std::invalid_argument(
+        op + "n exceeds the sink + record + live capacity of the operands.");
+  }
+  if (n_attend != 0 && (n_attend < q_len || n_attend > n)) {
+    throw std::invalid_argument(op + "n_attend must be in [q_len, n].");
+  }
+  if (n_attend != 0 && q_len > 1 && !full_visibility) {
+    throw std::invalid_argument(
+        op + "n_attend with q_len > 1 requires full_visibility.");
+  }
+  if (full_visibility) {
+    const int span = n_attend ? n_attend : n;
+    if (span > n - q_len + 1) {
+      throw std::invalid_argument(
+          op +
+          "full_visibility requires the attended span to end at or "
+          "before every query's causal position (n_attend <= n - q_len + "
+          "1).");
+    }
+  }
+  if (splits < 0 || splits > 128) {
+    throw std::invalid_argument(op + "splits must be in [0, 128].");
+  }
+
+  // Unconditional: layout flags are undefined on unevaluated inputs, and
+  // contiguous() shares an already-packed buffer.
+  std::vector<mx::array> inputs = {
+      mx::contiguous(q, false, s),
+      mx::contiguous(codes_k, false, s),
+      mx::contiguous(codes_v, false, s),
+      mx::contiguous(axes_k, false, s),
+      mx::contiguous(axes_v, false, s),
+      mx::contiguous(stage_k, false, s),
+      mx::contiguous(stage_v, false, s)};
+  auto prim = std::make_shared<KQuantSDPAFAVerify>(
+      s,
+      scale,
+      q_len,
+      splits,
+      return_lse,
+      true,
+      k_bits,
+      v_bits,
+      n,
+      n_attend,
+      full_visibility);
+  auto out_shape = inputs[0].shape();
+  if (return_lse) {
+    mx::Shape lse_shape = {out_shape[0], out_shape[1], out_shape[2]};
+    return mx::array::make_arrays(
+        {std::move(out_shape), std::move(lse_shape)},
+        {dt, mx::float32},
+        std::move(prim),
+        std::move(inputs));
+  }
+  return {
+      mx::array(std::move(out_shape), dt, std::move(prim), std::move(inputs))};
+}
+
+mx::array sdpa_fa_verify_kvarn(
+    mx::array q,
+    mx::array codes_k,
+    mx::array axes_k,
+    mx::array codes_v,
+    mx::array axes_v,
+    mx::array stage_k,
+    mx::array stage_v,
+    int n,
+    float scale,
+    int k_bits,
+    int v_bits,
+    int q_len,
+    int splits,
+    int n_attend,
+    bool full_visibility,
+    mx::StreamOrDevice s_) {
+  return sdpa_fa_verify_kvarn_impl(
+      false,
+      std::move(q),
+      std::move(codes_k),
+      std::move(axes_k),
+      std::move(codes_v),
+      std::move(axes_v),
+      std::move(stage_k),
+      std::move(stage_v),
+      n,
+      scale,
+      k_bits,
+      v_bits,
+      q_len,
+      splits,
+      n_attend,
+      full_visibility,
+      s_)[0];
+}
+
+std::vector<mx::array> sdpa_fa_verify_kvarn_lse(
+    mx::array q,
+    mx::array codes_k,
+    mx::array axes_k,
+    mx::array codes_v,
+    mx::array axes_v,
+    mx::array stage_k,
+    mx::array stage_v,
+    int n,
+    float scale,
+    int k_bits,
+    int v_bits,
+    int q_len,
+    int splits,
+    int n_attend,
+    bool full_visibility,
+    mx::StreamOrDevice s_) {
+  return sdpa_fa_verify_kvarn_impl(
+      true,
+      std::move(q),
+      std::move(codes_k),
+      std::move(axes_k),
+      std::move(codes_v),
+      std::move(axes_v),
+      std::move(stage_k),
+      std::move(stage_v),
+      n,
+      scale,
+      k_bits,
+      v_bits,
+      q_len,
+      splits,
+      n_attend,
+      full_visibility,
+      s_);
 }
 
 } // namespace mlx_kquant

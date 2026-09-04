@@ -1046,6 +1046,95 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_fa_verify_kvarn",
+      [](mx::array q,
+         mx::array codes_k,
+         mx::array axes_k,
+         mx::array codes_v,
+         mx::array axes_v,
+         mx::array stage_k,
+         mx::array stage_v,
+         int n,
+         float scale,
+         int k_bits,
+         int v_bits,
+         int q_len,
+         int splits,
+         int n_attend,
+         bool full_visibility,
+         bool return_lse,
+         mx::StreamOrDevice s) -> nb::object {
+        if (return_lse) {
+          auto outs = mlx_kquant::sdpa_fa_verify_kvarn_lse(
+              std::move(q),
+              std::move(codes_k),
+              std::move(axes_k),
+              std::move(codes_v),
+              std::move(axes_v),
+              std::move(stage_k),
+              std::move(stage_v),
+              n,
+              scale,
+              k_bits,
+              v_bits,
+              q_len,
+              splits,
+              n_attend,
+              full_visibility,
+              s);
+          return nb::make_tuple(outs[0], outs[1]);
+        }
+        return nb::cast(mlx_kquant::sdpa_fa_verify_kvarn(
+            std::move(q),
+            std::move(codes_k),
+            std::move(axes_k),
+            std::move(codes_v),
+            std::move(axes_v),
+            std::move(stage_k),
+            std::move(stage_v),
+            n,
+            scale,
+            k_bits,
+            v_bits,
+            q_len,
+            splits,
+            n_attend,
+            full_visibility,
+            s));
+      },
+      "q"_a,
+      "codes_k"_a,
+      "axes_k"_a,
+      "codes_v"_a,
+      "axes_v"_a,
+      "stage_k"_a,
+      "stage_v"_a,
+      "n"_a,
+      "scale"_a,
+      "k_bits"_a = 6,
+      "v_bits"_a = 6,
+      "q_len"_a = 1,
+      "splits"_a = 0,
+      nb::kw_only(),
+      "n_attend"_a = 0,
+      "full_visibility"_a = false,
+      "return_lse"_a = false,
+      "stream"_a = nb::none(),
+      R"(
+        sdpa_fa_verify over a KVarN-backed KV cache. The query is the same
+        GQA fold as sdpa_fa_verify (q [1, Hkv, G*q_len, D], kv-major heads,
+        original q_len; G*q_len <= 64, or 32 at head_dim 512) in the
+        rotated domain, and the sealed records dequantize at tile stage
+        exactly as in sdpa_decode_gqa_kvarn, so the output matches
+        sdpa_fa_verify over the materialized cache bit for bit. Operands,
+        n, n_attend and full_visibility follow sdpa_decode_gqa_kvarn; the
+        result is rotated-domain like the query (un-rotate it). This is the
+        verify-width route: the vector kernel's cost climbs steeply past
+        two queries, while the matrix tile prices extra rows at nearly
+        zero. head_dim 128, 256 or 512; batch size 1. Metal-only.
+      )");
+
+  m.def(
       "sdpa_decode_gqa_kvarn",
       [](mx::array q,
          mx::array codes_k,

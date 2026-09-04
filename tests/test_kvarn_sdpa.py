@@ -553,3 +553,295 @@ def test_dwide_rejects_wrong_tile_c_and_stale_shapes(d):
             6,
             6,
         )
+
+
+# -- FA verify (matrix-unit) route over kvarn records -------------------------
+#
+# sdpa_fa_verify_kvarn stages the same values as the decode kernel through
+# the shared kvarn loaders, and everything downstream is sdpa_fa_verify
+# unchanged, so it must match sdpa_fa_verify over the materialized twin bit
+# for bit, lse included.
+
+
+def fold(q, hkv, ql):
+    """[1, Hq, qL, d] -> the kv-major GQA fold [1, Hkv, G * qL, d]."""
+    q = mx.array(q)
+    _, hq, _, d = q.shape
+    return q.reshape(1, hkv, (hq // hkv) * ql, d)
+
+
+def run_fa_pair(st, q, N, k_bits, v_bits, ql, dtype=mx.float16, **kw):
+    hkv = st["codes_k"].shape[1]
+    qf = fold(q, hkv, ql).astype(dtype)
+    scale = st["d"] ** -0.5
+    out = kq.sdpa_fa_verify_kvarn(
+        qf,
+        st["codes_k"],
+        st["axes_k"],
+        st["codes_v"],
+        st["axes_v"],
+        st["stage_k"],
+        st["stage_v"],
+        N,
+        scale,
+        k_bits,
+        v_bits,
+        ql,
+        **kw,
+    )
+    k_ref, v_ref = materialize(st, dtype)
+    ref_kw = {k: v for k, v in kw.items() if k in ("splits", "return_lse")}
+    ref = kq.sdpa_fa_verify(qf, k_ref, v_ref, scale, ql, **ref_kw)
+    return out, ref
+
+
+@pytest.mark.parametrize("ql", [1, 2, 3, 4, 5, 6, 8])
+def test_fa_verify_matches_materialize(ql):
+    st = build_state(1, 2, 700, 6, 6, seed=100 + ql)
+    q = make_q(1, 8, ql)
+    out, ref = run_fa_pair(st, q, 700, 6, 6, ql)
+    assert_bit_equal(out, ref)
+
+
+@pytest.mark.parametrize("n", [100, 129, 256, 300, 1000, 4097])
+def test_fa_verify_matches_materialize_at_boundaries(n):
+    st = build_state(1, 2, n, 6, 6, seed=n + 1)
+    q = make_q(1, 8, 4)
+    out, ref = run_fa_pair(st, q, n, 6, 6, 4, return_lse=True)
+    assert_bit_equal(out, ref)
+
+
+@pytest.mark.parametrize("kv_bits", [(2, 2), (3, 3), (4, 4), (5, 5), (8, 8), (6, 5)])
+def test_fa_verify_matches_materialize_across_widths(kv_bits):
+    kb, vb = kv_bits
+    st = build_state(1, 2, 300, kb, vb, seed=kb * 10 + vb + 1)
+    q = make_q(1, 8, 4)
+    out, ref = run_fa_pair(st, q, 300, kb, vb, 4)
+    assert_bit_equal(out, ref)
+
+
+@pytest.mark.parametrize("g,ql", [(16, 4), (8, 8), (12, 5)])
+def test_fa_verify_wide_folds(g, ql):
+    # 64-row tile: gqa16 x qL4 (qwen3.8-27b), gqa8 x qL8, and a 60-row
+    # padded fold.
+    st = build_state(1, 2, 900, 6, 6, seed=110 + g)
+    q = make_q(1, 2 * g, ql)
+    out, ref = run_fa_pair(st, q, 900, 6, 6, ql)
+    assert_bit_equal(out, ref)
+
+
+def test_fa_verify_bfloat16_query():
+    st = build_state(1, 2, 300, 6, 6, seed=120)
+    q = make_q(1, 8, 4)
+    out, ref = run_fa_pair(st, q, 300, 6, 6, 4, dtype=mx.bfloat16)
+    assert_bit_equal(out, ref)
+
+
+def test_fa_verify_explicit_splits():
+    st = build_state(1, 2, 1000, 6, 6, seed=121)
+    q = make_q(1, 8, 4)
+    out, ref = run_fa_pair(st, q, 1000, 6, 6, 4, splits=7, return_lse=True)
+    assert_bit_equal(out, ref)
+
+
+def test_fa_verify_n_attend_full_visibility():
+    # Body walk of a tail merge at verify width: the first 800 of 1000 keys
+    # with the clamp lifted equals a q_len-1 fold (every row sees every
+    # key) over the truncated twin.
+    st = build_state(1, 2, 1000, 6, 6, seed=122)
+    q = mx.array(make_q(1, 8, 4))
+    qf = fold(q, 2, 4)
+    args = (
+        st["codes_k"],
+        st["axes_k"],
+        st["codes_v"],
+        st["axes_v"],
+        st["stage_k"],
+        st["stage_v"],
+    )
+    out, lse = kq.sdpa_fa_verify_kvarn(
+        qf,
+        *args,
+        1000,
+        SCALE,
+        6,
+        6,
+        4,
+        n_attend=800,
+        full_visibility=True,
+        return_lse=True,
+    )
+    k_ref, v_ref = materialize(st, mx.float16)
+    ref, lse_ref = kq.sdpa_fa_verify(
+        qf, k_ref[:, :, :800], v_ref[:, :, :800], SCALE, 1, return_lse=True
+    )
+    assert_bit_equal((out, lse), (ref, lse_ref))
+
+
+@pytest.mark.parametrize("ql", [2, 4, 8])
+def test_fa_verify_tail_lse_merge_composition(ql):
+    # The gmlx verify-width shape: body = FA kvarn over keys [0, 200) with
+    # the clamp lifted, tail = sdpa_fa_verify over raw rows [200, 260) with
+    # exact offset causality; the LSE merge reproduces one attention over
+    # the concatenated keys.
+    N, A = 260, 200
+    st = build_state(1, 2, N, 6, 6, seed=130 + ql)
+    q = mx.array(make_q(1, 8, ql))
+    qf = fold(q, 2, ql)
+    args = (
+        st["codes_k"],
+        st["axes_k"],
+        st["codes_v"],
+        st["axes_v"],
+        st["stage_k"],
+        st["stage_v"],
+    )
+    body, lse_b = kq.sdpa_fa_verify_kvarn(
+        q=qf,
+        codes_k=args[0],
+        axes_k=args[1],
+        codes_v=args[2],
+        axes_v=args[3],
+        stage_k=args[4],
+        stage_v=args[5],
+        n=N,
+        scale=SCALE,
+        k_bits=6,
+        v_bits=6,
+        q_len=ql,
+        n_attend=A,
+        full_visibility=True,
+        return_lse=True,
+    )
+    tail, lse_t = kq.sdpa_fa_verify(
+        qf, st["kx"][:, :, A:], st["vx"][:, :, A:], SCALE, ql, return_lse=True
+    )
+    merged, lse_m = lse_merge(body, lse_b, tail, lse_t)
+
+    k_m, v_m = materialize(st, mx.float16)
+    k_ref = mx.concatenate([k_m[:, :, :A], st["kx"][:, :, A:]], axis=2)
+    v_ref = mx.concatenate([v_m[:, :, :A], st["vx"][:, :, A:]], axis=2)
+    ref, lse_ref = kq.sdpa_fa_verify(qf, k_ref, v_ref, SCALE, ql, return_lse=True)
+    mx.eval(merged, lse_m, ref, lse_ref)
+    np.testing.assert_allclose(
+        np.array(merged), np.array(ref.astype(mx.float32)), rtol=2e-3, atol=2e-3
+    )
+    np.testing.assert_allclose(np.array(lse_m), np.array(lse_ref), rtol=1e-5, atol=1e-4)
+
+
+def test_fa_verify_rejects_malformed():
+    st = build_state(1, 2, 300, 6, 6, seed=140)
+    args = (
+        st["codes_k"],
+        st["axes_k"],
+        st["codes_v"],
+        st["axes_v"],
+        st["stage_k"],
+        st["stage_v"],
+    )
+    ok = fold(make_q(1, 8, 4), 2, 4)
+    with pytest.raises(ValueError, match="GQA-folded"):
+        kq.sdpa_fa_verify_kvarn(mx.array(make_q(1, 8, 4)), *args, 300, SCALE, 6, 6, 4)
+    with pytest.raises(ValueError, match="folded rows"):
+        kq.sdpa_fa_verify_kvarn(
+            fold(make_q(1, 10, 1), 2, 1), *args, 300, SCALE, 6, 6, 4
+        )
+    with pytest.raises(ValueError, match="folded rows"):
+        kq.sdpa_fa_verify_kvarn(
+            fold(make_q(1, 34, 4), 2, 4), *args, 300, SCALE, 6, 6, 4
+        )
+    with pytest.raises(ValueError, match="q_len must be"):
+        kq.sdpa_fa_verify_kvarn(ok, *args, 300, SCALE, 6, 6, 9)
+    with pytest.raises(ValueError, match="requires full_visibility"):
+        kq.sdpa_fa_verify_kvarn(ok, *args, 300, SCALE, 6, 6, 4, n_attend=200)
+    with pytest.raises(ValueError, match="causal position"):
+        kq.sdpa_fa_verify_kvarn(
+            ok, *args, 300, SCALE, 6, 6, 4, n_attend=298, full_visibility=True
+        )
+    with pytest.raises(ValueError, match="batch size"):
+        st2 = build_state(2, 2, 300, 6, 6, seed=141)
+        kq.sdpa_fa_verify_kvarn(
+            mx.array(make_q(2, 2, 32)),
+            st2["codes_k"],
+            st2["axes_k"],
+            st2["codes_v"],
+            st2["axes_v"],
+            st2["stage_k"],
+            st2["stage_v"],
+            300,
+            SCALE,
+            6,
+            6,
+            4,
+        )
+
+
+@WIDE
+@pytest.mark.parametrize("ql", [1, 4, 8])
+def test_dwide_fa_verify_matches_materialize(d, ql):
+    st = build_state(1, 2, 700, 6, 6, seed=150 + ql, d=d)
+    q = make_q(1, 8, ql, d=d)
+    out, ref = run_fa_pair(st, q, 700, 6, 6, ql, return_lse=True)
+    assert_bit_equal(out, ref)
+
+
+@WIDE
+@pytest.mark.parametrize("kv_bits", [(3, 3), (5, 4), (6, 5), (8, 8)])
+def test_dwide_fa_verify_across_widths(d, kv_bits):
+    kb, vb = kv_bits
+    st = build_state(1, 2, 300, kb, vb, seed=160 + kb, d=d)
+    q = make_q(1, 8, 4, d=d)
+    out, ref = run_fa_pair(st, q, 300, kb, vb, 4)
+    assert_bit_equal(out, ref)
+
+
+@WIDE
+def test_dwide_fa_verify_n_attend_and_boundaries(d):
+    for n in (129, 1000, 4097):
+        st = build_state(1, 2, n, 6, 6, seed=170 + n, d=d)
+        q = mx.array(make_q(1, 8, 4, d=d))
+        qf = fold(q, 2, 4)
+        scale = d**-0.5
+        a = n - 3
+        out = kq.sdpa_fa_verify_kvarn(
+            qf,
+            st["codes_k"],
+            st["axes_k"],
+            st["codes_v"],
+            st["axes_v"],
+            st["stage_k"],
+            st["stage_v"],
+            n,
+            scale,
+            6,
+            6,
+            4,
+            n_attend=a,
+            full_visibility=True,
+        )
+        k_ref, v_ref = materialize(st, mx.float16)
+        ref = kq.sdpa_fa_verify(qf, k_ref[:, :, :a], v_ref[:, :, :a], scale, 1)
+        assert_bit_equal(out, ref)
+
+
+def test_d512_fa_verify_row_cap_and_gemma_fold():
+    # gemma-4 global layers fold 16 q heads on 1 kv head: 64 rows at qL 4
+    # exceeds the d-split kernel's 32-row tile, so the caller chunks the
+    # group; a G8 x qL4 chunk runs whole.
+    st = build_state(1, 1, 700, 6, 6, seed=180, d=512)
+    args = (
+        st["codes_k"],
+        st["axes_k"],
+        st["codes_v"],
+        st["axes_v"],
+        st["stage_k"],
+        st["stage_v"],
+    )
+    scale = 512**-0.5
+    with pytest.raises(ValueError, match="folded rows"):
+        kq.sdpa_fa_verify_kvarn(
+            fold(make_q(1, 16, 4, d=512), 1, 4), *args, 700, scale, 6, 6, 4
+        )
+    q = make_q(1, 8, 4, d=512)
+    out, ref = run_fa_pair(st, q, 700, 6, 6, 4)
+    assert_bit_equal(out, ref)

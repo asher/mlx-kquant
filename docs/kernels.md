@@ -145,6 +145,12 @@ mechanism below.
   diagonal page is enforced in-kernel.
 - **`sdpa_fa_verify`** - speculative-verify attention on the matrix units for a GQA-folded query tile.
   Head dims 64 through 512; `return_lse` as above.
+- **`sdpa_fa_verify_kvarn`** - the same matrix-unit verify pass over a KVarN cache: sealed records
+  dequantize at tile stage through the loaders `sdpa_decode_gqa_kvarn` uses, so the result matches
+  `sdpa_fa_verify` over the materialized cache bit for bit. The verify-width route (q_len 2 to 8):
+  the vector kernel's cost climbs steeply past two queries, the matrix tile prices extra rows at
+  nearly zero. Head dims 128, 256 and 512; `n_attend` / `full_visibility` / `return_lse` as the
+  decode op.
 
 ## DeepSeek/GLM sparse attention (DSA)
 

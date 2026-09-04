@@ -384,6 +384,52 @@ std::vector<mx::array> sdpa_fa_verify_lse(
     int splits = 0,
     mx::StreamOrDevice s = {});
 
+// sdpa_fa_verify over a KVarN-backed KV cache: the same GQA-folded query
+// tile (q [1, Hkv, G*q_len, D] in the rotated domain, q_len in [1, 8],
+// G*q_len <= 64, or 32 at head_dim 512) on the matrix units, with sealed
+// records dequantized at tile stage exactly as sdpa_decode_gqa_kvarn does.
+// Operands, n, n_attend and full_visibility follow sdpa_decode_gqa_kvarn;
+// the output is rotated-domain like the query. This is the verify-width
+// route: the vector kernel's per-query cost climbs steeply past two
+// queries, while the matrix tile prices extra rows at nearly zero.
+// head_dim 128, 256 or 512. Metal-only.
+mx::array sdpa_fa_verify_kvarn(
+    mx::array q,
+    mx::array codes_k,
+    mx::array axes_k,
+    mx::array codes_v,
+    mx::array axes_v,
+    mx::array stage_k,
+    mx::array stage_v,
+    int n,
+    float scale,
+    int k_bits,
+    int v_bits,
+    int q_len,
+    int splits = 0,
+    int n_attend = 0,
+    bool full_visibility = false,
+    mx::StreamOrDevice s = {});
+
+// sdpa_fa_verify_kvarn returning {out, lse}; lse as sdpa_fa_verify_lse.
+std::vector<mx::array> sdpa_fa_verify_kvarn_lse(
+    mx::array q,
+    mx::array codes_k,
+    mx::array axes_k,
+    mx::array codes_v,
+    mx::array axes_v,
+    mx::array stage_k,
+    mx::array stage_v,
+    int n,
+    float scale,
+    int k_bits,
+    int v_bits,
+    int q_len,
+    int splits = 0,
+    int n_attend = 0,
+    bool full_visibility = false,
+    mx::StreamOrDevice s = {});
+
 // Fused MoE GLU gather on the MLX packed mxfp4 layout: gate and up expert
 // matvecs (sharing each activation load), expert biases, and the clamped
 // SwiGLU epilogue out = (min(g, limit) * sigmoid(alpha * g)) * (clip(u,
@@ -1100,12 +1146,24 @@ class KQuantSDPAFAVerify : public mx::Primitive {
       float scale,
       int q_len,
       int splits,
-      bool return_lse = false)
+      bool return_lse = false,
+      bool has_kvarn = false,
+      int kvarn_k_bits = 0,
+      int kvarn_v_bits = 0,
+      int kvarn_n = 0,
+      int kvarn_n_attend = 0,
+      bool kvarn_full_vis = false)
       : mx::Primitive(stream),
         scale_(scale),
         q_len_(q_len),
         splits_(splits),
-        return_lse_(return_lse) {}
+        return_lse_(return_lse),
+        has_kvarn_(has_kvarn),
+        kvarn_k_bits_(kvarn_k_bits),
+        kvarn_v_bits_(kvarn_v_bits),
+        kvarn_n_(kvarn_n),
+        kvarn_n_attend_(kvarn_n_attend),
+        kvarn_full_vis_(kvarn_full_vis) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -1127,6 +1185,12 @@ class KQuantSDPAFAVerify : public mx::Primitive {
   int q_len_;
   int splits_;
   bool return_lse_;
+  bool has_kvarn_ = false;
+  int kvarn_k_bits_ = 0;
+  int kvarn_v_bits_ = 0;
+  int kvarn_n_ = 0;
+  int kvarn_n_attend_ = 0;
+  bool kvarn_full_vis_ = false;
 };
 
 // Block-sparse FA prefill over QSA-selected 4-row pages (see
