@@ -1572,15 +1572,11 @@ static std::vector<mx::array> sdpa_decode_gqa_kvarn_impl(
         "head_dim 128, 16 or 8 at 256, and 8 at 512 (0 picks the default).");
   }
 
-  // Unconditional on q (layout flags are undefined on unevaluated inputs);
-  // codes/axes/stage are read via head/group strides but need contiguous
-  // trailing dims, which contiguous() provides while sharing already-packed
-  // buffers.
+  // Unconditional: layout flags are undefined on unevaluated inputs, and
+  // contiguous() shares an already-packed buffer.
   auto q_c = mx::contiguous(q, false, s);
-  auto ck = codes_k.strides().back() == 1 ? codes_k
-                                          : mx::contiguous(codes_k, false, s);
-  auto cv = codes_v.strides().back() == 1 ? codes_v
-                                          : mx::contiguous(codes_v, false, s);
+  auto ck = mx::contiguous(codes_k, false, s);
+  auto cv = mx::contiguous(codes_v, false, s);
   auto ak = mx::contiguous(axes_k, false, s);
   auto av = mx::contiguous(axes_v, false, s);
   auto sk = mx::contiguous(stage_k, false, s);
