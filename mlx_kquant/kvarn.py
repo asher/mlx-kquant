@@ -21,6 +21,11 @@ import mlx.core as mx
 
 _HEAD_DIMS = (128, 256, 512)
 
+# Record layout the kvarn kernels read: 128-token groups, codes at key and
+# value width, three fp16 axes per slice, fp16 precision tail merged via
+# n_attend. Consumers compare it to their cache layout version.
+KVARN_RECORD_VERSION = 1
+
 
 def kvarn_rotate(
     x: mx.array, *, dtype: mx.Dtype | None = None, stream=None

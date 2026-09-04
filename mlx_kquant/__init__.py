@@ -94,7 +94,7 @@ from ._ext import (  # noqa: F401
     zero_copy_view_count,
 )
 from ._version import __version__
-from .kvarn import kvarn_rotate  # noqa: F401
+from .kvarn import KVARN_RECORD_VERSION, kvarn_rotate  # noqa: F401
 
 # Capability flag for callers that pass the optional LoRA operands
 # (lora_a / lora_b / ...) to quantized_matmul, quantized_matmul_qmv_bias,
@@ -105,6 +105,7 @@ HAS_LORA_EPILOGUE = True
 __all__ = [
     "__version__",
     "HAS_LORA_EPILOGUE",
+    "KVARN_RECORD_VERSION",
     "add_rmsnorm",
     "arena_alloc",
     "codec_has_matmul",
