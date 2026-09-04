@@ -358,6 +358,10 @@ def test_rejects_malformed():
         # full visibility over keys at or past a query's causal position
         q4 = mx.array(make_q(1, 8, 4))
         kq.sdpa_decode_gqa_kvarn(q4, *args, 300, SCALE, 6, 6, full_visibility=True)
+    with pytest.raises(ValueError):
+        # a truncated walk at verify width needs the clamp lifted
+        q4 = mx.array(make_q(1, 8, 4))
+        kq.sdpa_decode_gqa_kvarn(q4, *args, 300, SCALE, 6, 6, n_attend=200)
 
 
 # -- head_dim 256/512 (multi-slice records) ----------------------------------

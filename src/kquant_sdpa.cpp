@@ -1537,6 +1537,13 @@ static std::vector<mx::array> sdpa_decode_gqa_kvarn_impl(
         "[mlx_kquant.sdpa_decode_gqa_kvarn] n_attend must be in "
         "[query length, n].");
   }
+  if (n_attend != 0 && qL > 1 && !full_visibility) {
+    // The causal clamp is measured from the walked length, so a
+    // truncated walk at verify width would hide keys the queries own.
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa_kvarn] n_attend with query length > 1 "
+        "requires full_visibility.");
+  }
   if (full_visibility) {
     const int span = n_attend ? n_attend : n;
     if (span > n - qL + 1) {
