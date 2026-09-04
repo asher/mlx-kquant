@@ -392,3 +392,10 @@ mlx-kquant builds on the following projects; their license texts ship in the whe
 - **[omlx](https://github.com/jundot/omlx)** (Apache-2.0) - the DeepSeek-V4-Flash DSA kernels
   (`dsa_sparse_attention`, `dsa_indexer_scores`, `dsa_topk_indices`) are ported, with modifications,
   from omlx's `glm_moe_dsa` custom kernels (Copyright OpenAI / Apple Inc., per file).
+- **[beellama.cpp](https://github.com/Anbeeld/beellama.cpp)** (MIT) - the KVarN KV-cache quantizer
+  (`kvarn_quantize` / `kvarn_dequant`, `kvarn_rotate`) and the record layout the `*_kvarn` attention
+  kernels read are ported to Metal from its `kvarn` implementation, and the parity fixtures are
+  generated from its CPU reference. The method is Huawei's KVarN (Muller et al.,
+  [arXiv:2606.03458](https://arxiv.org/abs/2606.03458); reference vLLM implementation at
+  [huawei-csl/KVarN](https://github.com/huawei-csl/KVarN), Apache-2.0), taken by way of beellama's
+  port; no code from the vLLM reference is used.

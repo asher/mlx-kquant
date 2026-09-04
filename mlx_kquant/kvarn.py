@@ -1,5 +1,8 @@
 """KVarN rotation glue.
 
+Method: KVarN (Muller et al., Huawei, arXiv:2606.03458). Record format and
+numerics: beellama.cpp (Anbeeld, MIT; licenses/beellama.cpp-LICENSE).
+
 The KVarN pipeline (kvarn_quantize / kvarn_dequant) operates on WHT-rotated
 head vectors. The rotation is mlx's own hadamard butterfly, so no custom
 kernel is needed; this wrapper pins the numerics that make it byte-compatible

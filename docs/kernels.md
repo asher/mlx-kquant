@@ -145,6 +145,25 @@ mechanism below.
   diagonal page is enforced in-kernel.
 - **`sdpa_fa_verify`** - speculative-verify attention on the matrix units for a GQA-folded query tile.
   Head dims 64 through 512; `return_lse` as above.
+## KVarN KV cache
+
+Variance-normalized KV-cache quantization: the method of Huawei's KVarN (Muller et al.,
+[arXiv:2606.03458](https://arxiv.org/abs/2606.03458)) in the record format of
+[beellama.cpp](https://github.com/Anbeeld/beellama.cpp) (MIT; see the README acknowledgements). A
+record is one 128-token group of one 128-dim head slice: codes at 2/3/4/5/6/8 bits plus three fp16
+axis vectors from a 16-step two-axis normalization of the Hadamard-rotated tile. K tiles quantize
+per channel, V tiles per token. `KVARN_RECORD_VERSION` names the layout; consumers pin it against
+their cache layout.
+
+- **`kvarn_rotate`** - the composite Walsh-Hadamard rotation (per-slice WHT-128 plus a cross-slice
+  butterfly at head dims 256 and 512), run in fp32 with one rounding on output so it matches the
+  reference bit for bit at 128. Self-inverse: the same call un-rotates.
+- **`kvarn_quantize` / `kvarn_dequant`** - seal a rotated 128-token tile into a record and read it
+  back; separate K and V kinds.
+- **`sdpa_decode_gqa_kvarn`** - decode attention over sealed records plus fp16 stage rows (the
+  attention sink and the live tail), record groups dequantized at tile stage; `n_attend` walks the
+  record body only, so the caller merges an fp16 precision tail by log-sum-exp. Head dims 128, 256
+  and 512, q_len 1 to 4.
 - **`sdpa_fa_verify_kvarn`** - the same matrix-unit verify pass over a KVarN cache: sealed records
   dequantize at tile stage through the loaders `sdpa_decode_gqa_kvarn` uses, so the result matches
   `sdpa_fa_verify` over the materialized cache bit for bit. The verify-width route (q_len 2 to 8):
