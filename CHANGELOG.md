@@ -6,6 +6,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- KVarN KV-cache quantization: `kvarn_quantize` / `kvarn_dequant`
+  (widths 2/3/4/5/6/8), `kvarn_rotate`, and `sdpa_decode_gqa_kvarn`, a
+  fused decode kernel that attends the records in place. Head dims 128,
+  256 and 512.
+
 ## [0.4.4]
 
 ### Added
