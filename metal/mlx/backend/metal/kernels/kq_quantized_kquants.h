@@ -460,23 +460,23 @@ struct KqQ4_KBlockLoader {
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]],
-      int col_in_block = 0)
+      int col_in_block = 0) thread
       : src_ld(src_ld_),
-        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
         tile_stride(
             reduction_dim
                 ? 0
-                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
         fixed_sub_block_idx(
             reduction_dim == 0 ? (col_in_block / sub_block_size) : 0),
-        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
         bi(thread_idx / TCOLS),
         bj((thread_idx % TCOLS) * n_reads),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         sub_block_idx(0) {}
 
-  void load_unsafe() {
+  void load_unsafe() thread {
     if constexpr (reduction_dim == 1) {
       if (sub_block_idx & 1) {
 #pragma unroll
@@ -537,7 +537,7 @@ struct KqQ4_KBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) {
+  void load_safe(short2 src_tile_dim) thread {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < n_reads; i++) {
@@ -548,7 +548,7 @@ struct KqQ4_KBlockLoader {
     load_unsafe();
   }
 
-  void next() {
+  void next() thread {
     if (reduction_dim == 1) {
       sub_block_idx++;
       if (sub_block_idx == sub_blocks_per_block) {
@@ -1506,23 +1506,23 @@ struct KqQ5_KBlockLoader {
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]],
-      int col_in_block = 0)
+      int col_in_block = 0) thread
       : src_ld(src_ld_),
-        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
         tile_stride(
             reduction_dim
                 ? 0
-                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
         fixed_sub_block_idx(
             reduction_dim == 0 ? (col_in_block / sub_block_size) : 0),
-        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
         bi(thread_idx / TCOLS),
         bj((thread_idx % TCOLS) * n_reads),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         sub_block_idx(0) {}
 
-  void load_unsafe() {
+  void load_unsafe() thread {
     if constexpr (reduction_dim == 1) {
       if (sub_block_idx & 1) {
 #pragma unroll
@@ -1609,7 +1609,7 @@ struct KqQ5_KBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) {
+  void load_safe(short2 src_tile_dim) thread {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < n_reads; i++) {
@@ -1620,7 +1620,7 @@ struct KqQ5_KBlockLoader {
     load_unsafe();
   }
 
-  void next() {
+  void next() thread {
     if (reduction_dim == 1) {
       sub_block_idx++;
       if (sub_block_idx == sub_blocks_per_block) {
@@ -2429,22 +2429,22 @@ struct KqQ6_KBlockLoader {
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]],
-      int col_in_block = 0)
+      int col_in_block = 0) thread
       : src_ld(src_ld_),
-        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
         tile_stride(
             reduction_dim
                 ? 0
-                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
         fixed_kt(reduction_dim == 0 ? (col_in_block / k_tile_size) : 0),
-        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
         bi(thread_idx / TCOLS),
         bj((thread_idx % TCOLS) * n_reads),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         kt(0) {}
 
-  void load_unsafe() {
+  void load_unsafe() thread {
     if constexpr (reduction_dim == 1) {
       const short q = kt & 3;
       if (q == 1) {
@@ -2529,7 +2529,7 @@ struct KqQ6_KBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) {
+  void load_safe(short2 src_tile_dim) thread {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < n_reads; i++) {
@@ -2540,7 +2540,7 @@ struct KqQ6_KBlockLoader {
     load_unsafe();
   }
 
-  void next() {
+  void next() thread {
     if (reduction_dim == 1) {
       kt++;
       if (kt == k_tiles_per_block) {
@@ -3594,22 +3594,22 @@ struct KqQ3_KBlockLoader {
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]],
-      int col_in_block = 0)
+      int col_in_block = 0) thread
       : src_ld(src_ld_),
-        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
         tile_stride(
             reduction_dim
                 ? 0
-                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
         fixed_kt(reduction_dim == 0 ? (col_in_block / k_tile_size) : 0),
-        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
         bi(thread_idx / TCOLS),
         bj((thread_idx % TCOLS) * n_reads),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         kt(0) {}
 
-  void load_unsafe() {
+  void load_unsafe() thread {
     // Stateless per-k-tile decode: see KqQ2_KBlockLoader. (110-byte blocks
     // are only 2-aligned, so reads stay byte-wide.)
     const short kt_use = (reduction_dim == 1) ? kt : fixed_kt;
@@ -3635,7 +3635,7 @@ struct KqQ3_KBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) {
+  void load_safe(short2 src_tile_dim) thread {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < n_reads; i++) {
@@ -3646,7 +3646,7 @@ struct KqQ3_KBlockLoader {
     load_unsafe();
   }
 
-  void next() {
+  void next() thread {
     if (reduction_dim == 1) {
       kt++;
       if (kt == k_tiles_per_block) {
@@ -4481,22 +4481,22 @@ struct KqQ2_KBlockLoader {
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]],
-      int col_in_block = 0)
+      int col_in_block = 0) thread
       : src_ld(src_ld_),
-        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
         tile_stride(
             reduction_dim
                 ? 0
-                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
         fixed_kt(reduction_dim == 0 ? (col_in_block / k_tile_size) : 0),
-        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
         bi(thread_idx / TCOLS),
         bj((thread_idx % TCOLS) * n_reads),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         kt(0) {}
 
-  void load_unsafe() {
+  void load_unsafe() thread {
     // Stateless per-k-tile decode (mirrors the iq2_xxs loader): the 84-byte
     // superblock stays L1-hot across its 8 k-tiles, and skipping a decoded
     // register cache keeps per-thread register pressure low enough for full
@@ -4533,7 +4533,7 @@ struct KqQ2_KBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) {
+  void load_safe(short2 src_tile_dim) thread {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < n_reads; i++) {
@@ -4544,7 +4544,7 @@ struct KqQ2_KBlockLoader {
     load_unsafe();
   }
 
-  void next() {
+  void next() thread {
     if (reduction_dim == 1) {
       kt++;
       if (kt == k_tiles_per_block) {

@@ -289,23 +289,23 @@ struct KqStq1_0BlockLoader {
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]],
-      int col_in_block = 0)
+      int col_in_block = 0) thread
       : src_ld(src_ld_),
-        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
         tile_stride(
             reduction_dim
                 ? 0
-                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
         fixed_sub_block_idx(
             reduction_dim == 0 ? (col_in_block / sub_block_size) : 0),
-        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
         bi(thread_idx / TCOLS),
         bj((thread_idx % TCOLS) * n_reads),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         sub_block_idx(0) {}
 
-  void load_unsafe() const {
+  void load_unsafe() const thread {
     // A 32-weight sub-block is planes {0,1} or {2,3} of chunk sb/2; it never
     // straddles a chunk.
     static_assert(n_reads % 8 == 0, "vector loader needs whole 8-runs");
@@ -332,7 +332,7 @@ struct KqStq1_0BlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) const {
+  void load_safe(short2 src_tile_dim) const thread {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < n_reads; i++) {
@@ -343,7 +343,7 @@ struct KqStq1_0BlockLoader {
     load_unsafe();
   }
 
-  void next() {
+  void next() thread {
     if (reduction_dim == 1) {
       sub_block_idx++;
       if (sub_block_idx == sub_blocks_per_block) {

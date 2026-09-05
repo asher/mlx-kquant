@@ -58,22 +58,18 @@ template <typename T, typename H>
     acc = metal::fma(v, v, acc);
   }
   threadgroup float part[8];
-  threadgroup float inv_sh;
   acc = simd_sum(acc);
   if (lane == 0) {
     part[sg] = acc;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (tid == 0) {
-    float ssq = 0.0f;
-    for (int i = 0; i < 8; ++i) {
-      ssq += part[i];
-    }
-    inv_sh = metal::precise::rsqrt(ssq / float(D) + eps);
+  // Every thread reduces the 8 partials in the same order: one barrier,
+  // no threadgroup scalar to publish.
+  float ssq = 0.0f;
+  for (int i = 0; i < 8; ++i) {
+    ssq += part[i];
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  const float inv = inv_sh;
+  const float inv = metal::precise::rsqrt(ssq / float(D) + eps);
   for (int k = int(tid); k < D; k += 256) {
     if (sizeof(T) == 4) { // float32 residual
       xs[k] = T(float(hs[k]) * inv * float(gs[k]));

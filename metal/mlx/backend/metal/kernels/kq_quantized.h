@@ -265,7 +265,7 @@ struct KqSegBlockMMA {
   short As_offset;
   short Bs_offset;
 
-  METAL_FUNC KqSegBlockMMA(ushort simd_group_id, ushort simd_lane_id) {
+  METAL_FUNC KqSegBlockMMA(ushort simd_group_id, ushort simd_lane_id) thread {
     tm = kFragSize * (simd_group_id / WN);
     short tn = kFragSize * (simd_group_id % WN);
     short2 simd_coord = MMAFrag_acc_t::get_coord(simd_lane_id);
@@ -277,7 +277,7 @@ struct KqSegBlockMMA {
     sn += tn;
   }
 
-  METAL_FUNC short active_tm_rows(const short valid_rows) const {
+  METAL_FUNC short active_tm_rows(const short valid_rows) const thread {
     short avail = valid_rows - tm;
     return avail <= 0 ? short(0)
                       : min(TM, short((avail + TM_stride - 1) / TM_stride));
@@ -287,7 +287,8 @@ struct KqSegBlockMMA {
   // compile-time so the tiles stay in registers (runtime bounds force the
   // frag arrays into thread memory and roughly halve throughput).
   template <short AT>
-  METAL_FUNC void mma_arm(const threadgroup T* As, const threadgroup T* Bs) {
+  METAL_FUNC void mma_arm(const threadgroup T* As, const threadgroup T* Bs)
+      thread {
     As += As_offset;
     Bs += Bs_offset;
     STEEL_PRAGMA_UNROLL
@@ -321,8 +322,10 @@ struct KqSegBlockMMA {
     }
   }
 
-  METAL_FUNC void
-  mma(const threadgroup T* As, const threadgroup T* Bs, const short active_tm) {
+  METAL_FUNC void mma(
+      const threadgroup T* As,
+      const threadgroup T* Bs,
+      const short active_tm) thread {
     // active_tm is uniform per simdgroup and constant across k-steps; only
     // simdgroup_barriers live inside the arms, so per-simdgroup divergence
     // here is safe. A fully dead simdgroup skips its loads and matmads.
@@ -345,13 +348,13 @@ struct KqSegBlockMMA {
     }
   }
 
-  METAL_FUNC void store_result(device T* D, const int ldd) {
+  METAL_FUNC void store_result(device T* D, const int ldd) thread {
     D += sm * ldd + sn;
     Ctile.template store<T, WM, WN>(D, ldd);
   }
 
   METAL_FUNC void
-  store_result_safe(device T* D, const int ldd, short2 dst_tile_dims) {
+  store_result_safe(device T* D, const int ldd, short2 dst_tile_dims) thread {
     D += sm * ldd + sn;
     dst_tile_dims -= short2(sn, sm);
     if (dst_tile_dims.x <= 0 || dst_tile_dims.y <= 0) {
@@ -1420,20 +1423,20 @@ struct KqQ8_0BlockLoader {
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]],
-      int /* col_in_block */ = 0)
+      int /* col_in_block */ = 0) thread
       : src_ld(src_ld_),
-        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
         tile_stride(
             reduction_dim
                 ? bytes_per_block
-                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
-        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
         bi(thread_idx / TCOLS),
         bj((thread_idx % TCOLS) * n_reads),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)) {}
 
-  void load_unsafe() const {
+  void load_unsafe() const thread {
     const float d = float(*(const device half*)src);
     const device int8_t* q =
         (const device int8_t*)(src + KQ_Q8_0_Q_OFFSET + bj);
@@ -1443,7 +1446,7 @@ struct KqQ8_0BlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) const {
+  void load_safe(short2 src_tile_dim) const thread {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < n_reads; i++) {
@@ -1460,7 +1463,7 @@ struct KqQ8_0BlockLoader {
     }
   }
 
-  void next() {
+  void next() thread {
     src += tile_stride;
   }
 };
@@ -2353,20 +2356,20 @@ struct KqQ5_1BlockLoader {
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]],
-      int /* col_in_block */ = 0)
+      int /* col_in_block */ = 0) thread
       : src_ld(src_ld_),
-        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
         tile_stride(
             reduction_dim
                 ? bytes_per_block
-                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
-        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
         bi(thread_idx / TCOLS),
         bj_byte((thread_idx % TCOLS) * bytes_per_thread),
         dst(dst_ + bi * dst_ld + bj_byte),
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)) {}
 
-  void load_unsafe() const {
+  void load_unsafe() const thread {
     const float d = float(*(const device half*)(src + KQ_Q5_1_D_OFFSET));
     const float m = float(*(const device half*)(src + KQ_Q5_1_M_OFFSET));
     const uint32_t qh = *(const device uint32_t*)(src + KQ_Q5_1_QH_OFFSET);
@@ -2394,7 +2397,7 @@ struct KqQ5_1BlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) const {
+  void load_safe(short2 src_tile_dim) const thread {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < bytes_per_thread; i++) {
@@ -2406,7 +2409,7 @@ struct KqQ5_1BlockLoader {
     load_unsafe();
   }
 
-  void next() {
+  void next() thread {
     src += tile_stride;
   }
 };
