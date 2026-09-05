@@ -154,7 +154,19 @@ def run_pair(st, q, N, k_bits, v_bits, dtype=mx.float16, **kw):
     )
     k_ref, v_ref = materialize(st, dtype)
     ref = kq.sdpa_decode_gqa(qm, k_ref, v_ref, scale, **kw)
+    _eval_or_skip(out, ref)
     return out, ref
+
+
+def _eval_or_skip(*arrays):
+    # A GPU whose pipeline caps the dispatch width raises the eval_gpu guard
+    # (as tests/test_sdpa.py): a capability skip, not a numerics failure.
+    try:
+        mx.eval(*arrays)
+    except RuntimeError as e:
+        if "pipeline limit" in str(e):
+            pytest.skip(str(e))
+        raise
 
 
 def assert_bit_equal(a, b):
