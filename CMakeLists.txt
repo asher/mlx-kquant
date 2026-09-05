@@ -63,6 +63,22 @@ execute_process(
   OUTPUT_VARIABLE MLX_ROOT)
 find_package(MLX CONFIG REQUIRED)
 
+# The mlx wheel exports its Apple frameworks as absolute paths under the
+# Xcode that built it; on any other box ld warns that the search path does
+# not exist. Rewrite the missing ones to plain -framework links.
+get_target_property(_mlx_link mlx INTERFACE_LINK_LIBRARIES)
+if(_mlx_link)
+  set(_mlx_link_fixed "")
+  foreach(_item IN LISTS _mlx_link)
+    if(_item MATCHES "^/.*/([A-Za-z0-9_]+)\\.framework$" AND NOT EXISTS "${_item}")
+      list(APPEND _mlx_link_fixed "-framework ${CMAKE_MATCH_1}")
+    else()
+      list(APPEND _mlx_link_fixed "${_item}")
+    endif()
+  endforeach()
+  set_target_properties(mlx PROPERTIES INTERFACE_LINK_LIBRARIES "${_mlx_link_fixed}")
+endif()
+
 # NOTE: do NOT splice ${MLX_CXX_FLAGS} into CMAKE_CXX_FLAGS - it is a CMake list
 # (-DACCELERATE_NEW_LAPACK;-D_METAL_), and embedding the ';' into the flags
 # *string* corrupts every compile command (`/bin/sh: -D_METAL_: command not

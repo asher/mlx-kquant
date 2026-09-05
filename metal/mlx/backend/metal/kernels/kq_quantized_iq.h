@@ -1195,23 +1195,23 @@ struct KqIq4_xsBlockLoader {
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]],
-      int col_in_block = 0)
+      int col_in_block = 0) thread
       : src_ld(src_ld_),
-        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
         tile_stride(
             reduction_dim
                 ? 0
-                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
         fixed_sub_block_idx(
             reduction_dim == 0 ? (col_in_block / sub_block_size) : 0),
-        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
         bi(thread_idx / TCOLS),
         bj((thread_idx % TCOLS) * n_reads),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         sub_block_idx(0) {}
 
-  void load_unsafe() const {
+  void load_unsafe() const thread {
     // Each 8-group covers one nibble half of eight consecutive quant bytes:
     // one uint2 load + adjacent-nibble bytes into kq_iq4nl_pairs replace
     // eight byte loads and eight kvalues gathers. The pair entries are the
@@ -1247,7 +1247,7 @@ struct KqIq4_xsBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) const {
+  void load_safe(short2 src_tile_dim) const thread {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < n_reads; i++) {
@@ -1258,7 +1258,7 @@ struct KqIq4_xsBlockLoader {
     load_unsafe();
   }
 
-  void next() {
+  void next() thread {
     if (reduction_dim == 1) {
       sub_block_idx++;
       if (sub_block_idx == sub_blocks_per_block) {
@@ -1667,23 +1667,23 @@ struct KqIq3_xxsBlockLoader {
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]],
-      int col_in_block = 0)
+      int col_in_block = 0) thread
       : src_ld(src_ld_),
-        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
         tile_stride(
             reduction_dim
                 ? 0
-                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
         fixed_sub_block_idx(
             reduction_dim == 0 ? (col_in_block / sub_block_size) : 0),
-        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
         bi(thread_idx / TCOLS),
         bj((thread_idx % TCOLS) * n_reads),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         sub_block_idx(0) {}
 
-  void load_unsafe() const {
+  void load_unsafe() const thread {
     // Two u32 grid loads + vector uchar4 -> float4 conversions + selects per
     // 8-weight group replace the per-byte load/convert/select chain. The
     // products are exact sign flips, so outputs stay bit-identical to the
@@ -1715,7 +1715,7 @@ struct KqIq3_xxsBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) const {
+  void load_safe(short2 src_tile_dim) const thread {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < n_reads; i++) {
@@ -1726,7 +1726,7 @@ struct KqIq3_xxsBlockLoader {
     load_unsafe();
   }
 
-  void next() {
+  void next() thread {
     if (reduction_dim == 1) {
       sub_block_idx++;
       if (sub_block_idx == sub_blocks_per_block) {
@@ -2139,23 +2139,23 @@ struct KqIq3_sBlockLoader {
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]],
-      int col_in_block = 0)
+      int col_in_block = 0) thread
       : src_ld(src_ld_),
-        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
         tile_stride(
             reduction_dim
                 ? 0
-                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
         fixed_sub_block_idx(
             reduction_dim == 0 ? (col_in_block / sub_block_size) : 0),
-        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
         bi(thread_idx / TCOLS),
         bj((thread_idx % TCOLS) * n_reads),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         sub_block_idx(0) {}
 
-  void load_unsafe() const {
+  void load_unsafe() const thread {
     // Two u32 grid loads + vector uchar4 -> float4 conversions + selects per
     // 8-weight group replace the per-byte load/convert/select chain. The
     // products are exact sign flips, so outputs stay bit-identical to the
@@ -2190,7 +2190,7 @@ struct KqIq3_sBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) const {
+  void load_safe(short2 src_tile_dim) const thread {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < n_reads; i++) {
@@ -2201,7 +2201,7 @@ struct KqIq3_sBlockLoader {
     load_unsafe();
   }
 
-  void next() {
+  void next() thread {
     if (reduction_dim == 1) {
       sub_block_idx++;
       if (sub_block_idx == sub_blocks_per_block) {
@@ -2613,23 +2613,23 @@ struct KqIq2_xxsBlockLoader {
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]],
-      int col_in_block = 0)
+      int col_in_block = 0) thread
       : src_ld(src_ld_),
-        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
         tile_stride(
             reduction_dim
                 ? 0
-                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
         fixed_sub_block_idx(
             reduction_dim == 0 ? (col_in_block / sub_block_size) : 0),
-        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
         bi(thread_idx / TCOLS),
         bj((thread_idx % TCOLS) * n_reads),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         sub_block_idx(0) {}
 
-  void load_unsafe() const {
+  void load_unsafe() const thread {
     // One u64 grid load + vector uchar4 -> float4 conversions + selects per
     // 8-weight group replace the per-byte load/convert/select chain. The
     // products are exact sign flips, so outputs stay bit-identical to the
@@ -2661,7 +2661,7 @@ struct KqIq2_xxsBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) const {
+  void load_safe(short2 src_tile_dim) const thread {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < n_reads; i++) {
@@ -2672,7 +2672,7 @@ struct KqIq2_xxsBlockLoader {
     load_unsafe();
   }
 
-  void next() {
+  void next() thread {
     if (reduction_dim == 1) {
       sub_block_idx++;
       if (sub_block_idx == sub_blocks_per_block) {
@@ -3085,23 +3085,23 @@ struct KqIq2_xsBlockLoader {
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]],
-      int col_in_block = 0)
+      int col_in_block = 0) thread
       : src_ld(src_ld_),
-        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
         tile_stride(
             reduction_dim
                 ? 0
-                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
         fixed_sub_block_idx(
             reduction_dim == 0 ? (col_in_block / sub_block_size) : 0),
-        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
         bi(thread_idx / TCOLS),
         bj((thread_idx % TCOLS) * n_reads),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         sub_block_idx(0) {}
 
-  void load_unsafe() const {
+  void load_unsafe() const thread {
     // One u64 grid load + vector uchar4 -> float4 conversions + selects per
     // 8-weight group replace the per-byte load/convert/select chain. The
     // products are exact sign flips, so outputs stay bit-identical to the
@@ -3135,7 +3135,7 @@ struct KqIq2_xsBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) const {
+  void load_safe(short2 src_tile_dim) const thread {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < n_reads; i++) {
@@ -3146,7 +3146,7 @@ struct KqIq2_xsBlockLoader {
     load_unsafe();
   }
 
-  void next() {
+  void next() thread {
     if (reduction_dim == 1) {
       sub_block_idx++;
       if (sub_block_idx == sub_blocks_per_block) {
@@ -3560,23 +3560,23 @@ struct KqIq2_sBlockLoader {
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]],
-      int col_in_block = 0)
+      int col_in_block = 0) thread
       : src_ld(src_ld_),
-        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
         tile_stride(
             reduction_dim
                 ? 0
-                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
         fixed_sub_block_idx(
             reduction_dim == 0 ? (col_in_block / sub_block_size) : 0),
-        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
         bi(thread_idx / TCOLS),
         bj((thread_idx % TCOLS) * n_reads),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         sub_block_idx(0) {}
 
-  void load_unsafe() const {
+  void load_unsafe() const thread {
     // One u64 grid load + vector uchar4 -> float4 conversions + selects per
     // 8-weight group replace the per-byte load/convert/select chain. The
     // products are exact sign flips, so outputs stay bit-identical to the
@@ -3611,7 +3611,7 @@ struct KqIq2_sBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) const {
+  void load_safe(short2 src_tile_dim) const thread {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < n_reads; i++) {
@@ -3622,7 +3622,7 @@ struct KqIq2_sBlockLoader {
     load_unsafe();
   }
 
-  void next() {
+  void next() thread {
     if (reduction_dim == 1) {
       sub_block_idx++;
       if (sub_block_idx == sub_blocks_per_block) {
@@ -4033,23 +4033,23 @@ struct KqIq1_sBlockLoader {
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]],
-      int col_in_block = 0)
+      int col_in_block = 0) thread
       : src_ld(src_ld_),
-        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
         tile_stride(
             reduction_dim
                 ? 0
-                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
         fixed_sub_block_idx(
             reduction_dim == 0 ? (col_in_block / sub_block_size) : 0),
-        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
         bi(thread_idx / TCOLS),
         bj((thread_idx % TCOLS) * n_reads),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         sub_block_idx(0) {}
 
-  void load_unsafe() const {
+  void load_unsafe() const thread {
     // One u64 grid load + vector char4 -> float4 conversions per 8-weight
     // group replace the per-byte load/convert chain. The grid is SIGNED and
     // the sums/products match the scalar order exactly, so outputs stay
@@ -4075,7 +4075,7 @@ struct KqIq1_sBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) const {
+  void load_safe(short2 src_tile_dim) const thread {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < n_reads; i++) {
@@ -4086,7 +4086,7 @@ struct KqIq1_sBlockLoader {
     load_unsafe();
   }
 
-  void next() {
+  void next() thread {
     if (reduction_dim == 1) {
       sub_block_idx++;
       if (sub_block_idx == sub_blocks_per_block) {
@@ -4509,23 +4509,23 @@ struct KqIq1_mBlockLoader {
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]],
-      int col_in_block = 0)
+      int col_in_block = 0) thread
       : src_ld(src_ld_),
-        row_bytes(src_ld_ * bytes_per_block / weights_per_block),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
         tile_stride(
             reduction_dim
                 ? 0
-                : BROWS * (src_ld_ * bytes_per_block / weights_per_block)),
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
         fixed_sub_block_idx(
             reduction_dim == 0 ? (col_in_block / sub_block_size) : 0),
-        thread_idx(simd_group_id * SIMD_SIZE + simd_lane_id),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
         bi(thread_idx / TCOLS),
         bj((thread_idx % TCOLS) * n_reads),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         sub_block_idx(0) {}
 
-  void load_unsafe() const {
+  void load_unsafe() const thread {
     const short sb = (reduction_dim == 0) ? fixed_sub_block_idx : sub_block_idx;
     const device uint8_t* scp = src + KQ_IQ1_M_SCALES_OFFSET;
     const ushort sc0 = ushort(scp[0]) | (ushort(scp[1]) << 8);
@@ -4562,7 +4562,7 @@ struct KqIq1_mBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) const {
+  void load_safe(short2 src_tile_dim) const thread {
     if (bi >= src_tile_dim.y) {
 #pragma unroll
       for (short i = 0; i < n_reads; i++) {
@@ -4573,7 +4573,7 @@ struct KqIq1_mBlockLoader {
     load_unsafe();
   }
 
-  void next() {
+  void next() thread {
     if (reduction_dim == 1) {
       sub_block_idx++;
       if (sub_block_idx == sub_blocks_per_block) {
