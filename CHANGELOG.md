@@ -6,6 +6,16 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- KVarN KV-cache quantization: `kvarn_quantize` / `kvarn_dequant`
+  (widths 2/3/4/5/6/8), `kvarn_rotate`, and `sdpa_decode_gqa_kvarn`, a
+  fused decode kernel that attends the records in place, plus
+  `sdpa_fa_verify_kvarn`, the matrix-unit verify pass (q_len 2 to 8)
+  over the same records. Head dims 128, 256 and 512.
+  `KVARN_RECORD_VERSION` names the record layout the kernels read.
+  Method: Huawei's KVarN (arXiv:2606.03458); format and numerics follow
+  beellama.cpp (MIT, see the README acknowledgements).
+
 ## [0.4.5]
 
 ### Added

@@ -56,6 +56,8 @@ from ._ext import (  # noqa: F401
     hc_lowrank_front,
     hc_lowrank_norm,
     hc_sinkhorn_collapse,
+    kvarn_dequant,
+    kvarn_quantize,
     load_gguf,
     metallib_dir,
     metallib_loads,
@@ -76,8 +78,10 @@ from ._ext import (  # noqa: F401
     route_shed,
     sdpa_decode_gqa,
     sdpa_decode_gqa_cascade,
+    sdpa_decode_gqa_kvarn,
     sdpa_decode_gqa_paged,
     sdpa_fa_verify,
+    sdpa_fa_verify_kvarn,
     sdpa_prefill_block_sparse,
     sdpa_vector,
     set_cb_caps,
@@ -91,6 +95,7 @@ from ._ext import (  # noqa: F401
     zero_copy_view_count,
 )
 from ._version import __version__
+from .kvarn import KVARN_RECORD_VERSION, kvarn_rotate  # noqa: F401
 
 # Capability flag for callers that pass the optional LoRA operands
 # (lora_a / lora_b / ...) to quantized_matmul, quantized_matmul_qmv_bias,
@@ -101,6 +106,7 @@ HAS_LORA_EPILOGUE = True
 __all__ = [
     "__version__",
     "HAS_LORA_EPILOGUE",
+    "KVARN_RECORD_VERSION",
     "add_rmsnorm",
     "arena_alloc",
     "codec_has_matmul",
@@ -135,6 +141,9 @@ __all__ = [
     "hc_lowrank_front",
     "hc_lowrank_norm",
     "hc_sinkhorn_collapse",
+    "kvarn_dequant",
+    "kvarn_quantize",
+    "kvarn_rotate",
     "load_gguf",
     "metallib_dir",
     "metallib_loads",
@@ -152,8 +161,10 @@ __all__ = [
     "route_shed",
     "sdpa_decode_gqa",
     "sdpa_decode_gqa_cascade",
+    "sdpa_decode_gqa_kvarn",
     "sdpa_decode_gqa_paged",
     "sdpa_fa_verify",
+    "sdpa_fa_verify_kvarn",
     "sdpa_prefill_block_sparse",
     "sdpa_vector",
     "set_cb_caps",

@@ -210,6 +210,70 @@ std::vector<mx::array> sdpa_decode_gqa_lse(
     const std::optional<mx::array>& v_biases = std::nullopt,
     mx::StreamOrDevice s = {});
 
+// Decode/verify GQA attention over a KVarN-backed KV cache (kq_kvarn.h wire
+// plus fp16 rotated stage), fused: sealed groups dequantize at tile stage,
+// downstream attention is unchanged. Everything is rotated-domain: q must
+// arrive WHT-rotated (kvarn_rotate) and the output is the rotated attention
+// result (V rows are stored rotated), so the caller un-rotates it.
+//
+// Key layout (n = total keys): keys [0, min(n, sink_cap)) read stage rows
+// [0, ..) directly (fp16 sink groups, sink_cap = stage rows - 128); the next
+// floor((n - sink_cap) / 128) * 128 keys read sealed records in order; the
+// remainder reads the live stage rows at [sink_cap, sink_cap + 128). Both
+// stages are [B, Hkv, S_rows, D] fp16 with S_rows a multiple of 128 and
+// >= 256. codes uint32 [B, Hkv, Gcap, (D / 128) * 512 * bits] (slice-minor
+// records), axes fp16 [B, Hkv, Gcap, 3 * (D / 128), 128] per side (one
+// scale/zp/other triplet per slice); Gcap only needs to cover the sealed
+// groups. q [B, n_q_heads, qL, D] float16/bfloat16, qL 1 (decode) to 4
+// (speculative-verify width). k_bits/v_bits in {2, 3, 4, 5, 6, 8} may
+// differ. sinks/starts/splits/tile_c as sdpa_decode_gqa.
+//
+// Precision-tail body segments: n_attend > 0 walks only the first n_attend
+// keys while the region map stays on the full n-key layout (the tail overlay
+// covers the rest). full_visibility lifts the per-query causal clamp; it
+// requires n_attend <= n - qL + 1 so every walked key precedes every query.
+// head_dim 128, 256 or 512. Metal-only.
+mx::array sdpa_decode_gqa_kvarn(
+    mx::array q,
+    mx::array codes_k,
+    mx::array axes_k,
+    mx::array codes_v,
+    mx::array axes_v,
+    mx::array stage_k,
+    mx::array stage_v,
+    int n,
+    float scale,
+    int k_bits,
+    int v_bits,
+    const std::optional<mx::array>& sinks = std::nullopt,
+    int splits = 0,
+    int tile_c = 0,
+    const std::optional<mx::array>& starts = std::nullopt,
+    int n_attend = 0,
+    bool full_visibility = false,
+    mx::StreamOrDevice s = {});
+
+// sdpa_decode_gqa_kvarn returning {out, lse}; lse as sdpa_decode_gqa_lse.
+std::vector<mx::array> sdpa_decode_gqa_kvarn_lse(
+    mx::array q,
+    mx::array codes_k,
+    mx::array axes_k,
+    mx::array codes_v,
+    mx::array axes_v,
+    mx::array stage_k,
+    mx::array stage_v,
+    int n,
+    float scale,
+    int k_bits,
+    int v_bits,
+    const std::optional<mx::array>& sinks = std::nullopt,
+    int splits = 0,
+    int tile_c = 0,
+    const std::optional<mx::array>& starts = std::nullopt,
+    int n_attend = 0,
+    bool full_visibility = false,
+    mx::StreamOrDevice s = {});
+
 // Speculative-verify attention on the GPU matrix units for a GQA-folded query
 // tile. The caller folds q [B, Hq, qL, D] -> [B, Hkv, G*qL, D] (kv-major
 // heads) and passes the original qL, so folded row r is causally clamped to
@@ -318,6 +382,52 @@ std::vector<mx::array> sdpa_fa_verify_lse(
     float scale,
     int q_len,
     int splits = 0,
+    mx::StreamOrDevice s = {});
+
+// sdpa_fa_verify over a KVarN-backed KV cache: the same GQA-folded query
+// tile (q [1, Hkv, G*q_len, D] in the rotated domain, q_len in [1, 8],
+// G*q_len <= 64, or 32 at head_dim 512) on the matrix units, with sealed
+// records dequantized at tile stage exactly as sdpa_decode_gqa_kvarn does.
+// Operands, n, n_attend and full_visibility follow sdpa_decode_gqa_kvarn;
+// the output is rotated-domain like the query. This is the verify-width
+// route: the vector kernel's per-query cost climbs steeply past two
+// queries, while the matrix tile prices extra rows at nearly zero.
+// head_dim 128, 256 or 512. Metal-only.
+mx::array sdpa_fa_verify_kvarn(
+    mx::array q,
+    mx::array codes_k,
+    mx::array axes_k,
+    mx::array codes_v,
+    mx::array axes_v,
+    mx::array stage_k,
+    mx::array stage_v,
+    int n,
+    float scale,
+    int k_bits,
+    int v_bits,
+    int q_len,
+    int splits = 0,
+    int n_attend = 0,
+    bool full_visibility = false,
+    mx::StreamOrDevice s = {});
+
+// sdpa_fa_verify_kvarn returning {out, lse}; lse as sdpa_fa_verify_lse.
+std::vector<mx::array> sdpa_fa_verify_kvarn_lse(
+    mx::array q,
+    mx::array codes_k,
+    mx::array axes_k,
+    mx::array codes_v,
+    mx::array axes_v,
+    mx::array stage_k,
+    mx::array stage_v,
+    int n,
+    float scale,
+    int k_bits,
+    int v_bits,
+    int q_len,
+    int splits = 0,
+    int n_attend = 0,
+    bool full_visibility = false,
     mx::StreamOrDevice s = {});
 
 // Fused MoE GLU gather on the MLX packed mxfp4 layout: gate and up expert
@@ -532,6 +642,35 @@ mx::array dsa_kv_qat(
     mx::array x,
     int n_rot,
     bool f16_round = true,
+    mx::StreamOrDevice s = {});
+
+// KVarN KV-cache group quantizer (BeeLlama variant): per 128-token group
+// of one kv-head slice, 16-iteration log-domain Sinkhorn variance
+// normalization with best-imbalance selection, then per-row asymmetric
+// RTN with the row scale/zero-point absorbed into fp16 axis vectors.
+// x is the rotated fp16 stage [..., T, 128] with T % 128 == 0; vside
+// selects tile orientation (false: K, rows = dims; true: V, rows =
+// tokens). Returns {codes uint32 [..., T/128, 512*bits] (LSB-first row
+// bitstream, row r at words [r*4*bits, (r+1)*4*bits)), axes float16
+// [..., T/128, 3, 128] (scale_axis, zp_axis, other_axis)}.
+// bits in {2, 3, 4, 5, 6, 8}. Oracle: tests/kvarn_ref.py. Metal-only.
+std::vector<mx::array> kvarn_quantize(
+    mx::array x,
+    int bits,
+    bool vside,
+    int iterations = 16,
+    mx::StreamOrDevice s = {});
+
+// Dequantize kvarn_quantize records back to the rotated group
+// [..., T/128 * 128, 128]: x = (q * scale_axis[row] + zp_axis[row]) *
+// other_axis[col] with row = vside ? token : dim. out_dtype float16 or
+// bfloat16. Metal-only.
+mx::array kvarn_dequant(
+    mx::array codes,
+    mx::array axes,
+    int bits,
+    bool vside,
+    mx::Dtype out_dtype = mx::float16,
     mx::StreamOrDevice s = {});
 
 // K-quant gathered matvec (down projection), same wire layout. x [T, R, K]
@@ -944,7 +1083,13 @@ class KQuantSDPAGQA : public mx::Primitive {
       bool has_starts,
       bool has_kv_q8 = false,
       bool return_lse = false,
-      bool paged = false)
+      bool paged = false,
+      bool has_kvarn = false,
+      int kvarn_k_bits = 0,
+      int kvarn_v_bits = 0,
+      int kvarn_n = 0,
+      int kvarn_n_attend = 0,
+      bool kvarn_full_vis = false)
       : mx::Primitive(stream),
         scale_(scale),
         splits_(splits),
@@ -953,7 +1098,13 @@ class KQuantSDPAGQA : public mx::Primitive {
         has_starts_(has_starts),
         has_kv_q8_(has_kv_q8),
         return_lse_(return_lse),
-        paged_(paged) {}
+        paged_(paged),
+        has_kvarn_(has_kvarn),
+        kvarn_k_bits_(kvarn_k_bits),
+        kvarn_v_bits_(kvarn_v_bits),
+        kvarn_n_(kvarn_n),
+        kvarn_n_attend_(kvarn_n_attend),
+        kvarn_full_vis_(kvarn_full_vis) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -979,6 +1130,12 @@ class KQuantSDPAGQA : public mx::Primitive {
   bool paged_ = false;
   bool has_kv_q8_;
   bool return_lse_;
+  bool has_kvarn_ = false;
+  int kvarn_k_bits_ = 0;
+  int kvarn_v_bits_ = 0;
+  int kvarn_n_ = 0;
+  int kvarn_n_attend_ = 0;
+  bool kvarn_full_vis_ = false;
 };
 
 // Simdgroup-matrix FA verify attention (see sdpa_fa_verify). Inference-only.
@@ -989,12 +1146,24 @@ class KQuantSDPAFAVerify : public mx::Primitive {
       float scale,
       int q_len,
       int splits,
-      bool return_lse = false)
+      bool return_lse = false,
+      bool has_kvarn = false,
+      int kvarn_k_bits = 0,
+      int kvarn_v_bits = 0,
+      int kvarn_n = 0,
+      int kvarn_n_attend = 0,
+      bool kvarn_full_vis = false)
       : mx::Primitive(stream),
         scale_(scale),
         q_len_(q_len),
         splits_(splits),
-        return_lse_(return_lse) {}
+        return_lse_(return_lse),
+        has_kvarn_(has_kvarn),
+        kvarn_k_bits_(kvarn_k_bits),
+        kvarn_v_bits_(kvarn_v_bits),
+        kvarn_n_(kvarn_n),
+        kvarn_n_attend_(kvarn_n_attend),
+        kvarn_full_vis_(kvarn_full_vis) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -1016,6 +1185,12 @@ class KQuantSDPAFAVerify : public mx::Primitive {
   int q_len_;
   int splits_;
   bool return_lse_;
+  bool has_kvarn_ = false;
+  int kvarn_k_bits_ = 0;
+  int kvarn_v_bits_ = 0;
+  int kvarn_n_ = 0;
+  int kvarn_n_attend_ = 0;
+  bool kvarn_full_vis_ = false;
 };
 
 // Block-sparse FA prefill over QSA-selected 4-row pages (see
@@ -1435,6 +1610,66 @@ class KQDsaKvQat : public mx::Primitive {
  private:
   int n_rot_;
   bool f16_round_;
+};
+
+// KVarN group quantizer (see kvarn_quantize). Inference-only, Metal-only.
+class KQKvarnQuantize : public mx::Primitive {
+ public:
+  explicit KQKvarnQuantize(
+      mx::Stream stream,
+      int bits,
+      bool vside,
+      int iterations)
+      : mx::Primitive(stream),
+        bits_(bits),
+        vside_(vside),
+        iterations_(iterations) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQKvarnQuantize";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int bits_;
+  bool vside_;
+  int iterations_;
+};
+
+// KVarN record dequantizer (see kvarn_dequant). Inference-only, Metal-only.
+class KQKvarnDequant : public mx::Primitive {
+ public:
+  explicit KQKvarnDequant(mx::Stream stream, int bits, bool vside)
+      : mx::Primitive(stream), bits_(bits), vside_(vside) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQKvarnDequant";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int bits_;
+  bool vside_;
 };
 
 // K-quant fused MoE GLU gather (see moe_glu_gather_kq). Inference-only.

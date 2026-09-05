@@ -30,6 +30,19 @@ nb::object meta_to_py(const mlx_kquant::GgufMetaValue& v) {
       v);
 }
 
+// Map a KVarN tile-orientation string to the vside flag.
+bool kvarn_kind_is_v(const std::string& kind, const char* op) {
+  if (kind == "v") {
+    return true;
+  }
+  if (kind == "k") {
+    return false;
+  }
+  throw std::invalid_argument(
+      std::string("[mlx_kquant.") + op +
+      "] kind must be \"k\" or \"v\", got \"" + kind + "\".");
+}
+
 } // namespace
 
 NB_MODULE(_ext, m) {
@@ -949,6 +962,312 @@ NB_MODULE(_ext, m) {
 
         Returns:
             array: same shape and dtype as ``x``.
+      )");
+
+  m.def(
+      "kvarn_quantize",
+      [](mx::array x,
+         int bits,
+         const std::string& kind,
+         int iterations,
+         mx::StreamOrDevice s) {
+        return mlx_kquant::kvarn_quantize(
+            std::move(x),
+            bits,
+            kvarn_kind_is_v(kind, "kvarn_quantize"),
+            iterations,
+            s);
+      },
+      "x"_a,
+      "bits"_a,
+      "kind"_a,
+      "iterations"_a = 16,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        KVarN KV-cache group quantizer (BeeLlama variant). Per 128-token
+        group of one kv-head slice: 16-iteration log-domain Sinkhorn
+        variance normalization with best-imbalance selection, then per-row
+        asymmetric RTN, packed as an LSB-first row bitstream with the row
+        scale/zero-point absorbed into fp16 axis vectors. K tiles are
+        [row=dim][col=token], V tiles [row=token][col=dim]. Oracle:
+        tests/kvarn_ref.py.
+
+        Args:
+            x (array): rotated fp16 stage [..., T, 128], T % 128 == 0.
+            bits (int): code width, one of 2/3/4/5/6/8.
+            kind (str): "k" or "v" tile orientation.
+            iterations (int): Sinkhorn iterations. Default 16.
+
+        Returns:
+            tuple(array, array): codes uint32 [..., T/128, 512*bits]
+            (row r at words [r*4*bits, (r+1)*4*bits)) and axes float16
+            [..., T/128, 3, 128] (scale_axis, zp_axis, other_axis).
+      )");
+
+  m.def(
+      "kvarn_dequant",
+      [](mx::array codes,
+         mx::array axes,
+         int bits,
+         const std::string& kind,
+         std::optional<mx::Dtype> dtype,
+         mx::StreamOrDevice s) {
+        return mlx_kquant::kvarn_dequant(
+            std::move(codes),
+            std::move(axes),
+            bits,
+            kvarn_kind_is_v(kind, "kvarn_dequant"),
+            dtype.value_or(mx::float16),
+            s);
+      },
+      "codes"_a,
+      "axes"_a,
+      "bits"_a,
+      "kind"_a,
+      "dtype"_a = nb::none(),
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Dequantize kvarn_quantize records back to the rotated group
+        [..., T/128 * 128, 128]: x = (q * scale_axis[row] + zp_axis[row])
+        * other_axis[col] with row = token for kind "v" and row = dim for
+        kind "k".
+
+        Args:
+            codes (array): uint32 [..., G, 512*bits] from kvarn_quantize.
+            axes (array): float16 [..., G, 3, 128] from kvarn_quantize.
+            bits (int): code width, one of 2/3/4/5/6/8.
+            kind (str): "k" or "v", matching the quantize call.
+            dtype (Dtype, optional): float16 or bfloat16. Default float16.
+
+        Returns:
+            array: the rotated-domain reconstruction.
+      )");
+
+  m.def(
+      "sdpa_fa_verify_kvarn",
+      [](mx::array q,
+         mx::array codes_k,
+         mx::array axes_k,
+         mx::array codes_v,
+         mx::array axes_v,
+         mx::array stage_k,
+         mx::array stage_v,
+         int n,
+         float scale,
+         int k_bits,
+         int v_bits,
+         int q_len,
+         int splits,
+         int n_attend,
+         bool full_visibility,
+         bool return_lse,
+         mx::StreamOrDevice s) -> nb::object {
+        if (return_lse) {
+          auto outs = mlx_kquant::sdpa_fa_verify_kvarn_lse(
+              std::move(q),
+              std::move(codes_k),
+              std::move(axes_k),
+              std::move(codes_v),
+              std::move(axes_v),
+              std::move(stage_k),
+              std::move(stage_v),
+              n,
+              scale,
+              k_bits,
+              v_bits,
+              q_len,
+              splits,
+              n_attend,
+              full_visibility,
+              s);
+          return nb::make_tuple(outs[0], outs[1]);
+        }
+        return nb::cast(mlx_kquant::sdpa_fa_verify_kvarn(
+            std::move(q),
+            std::move(codes_k),
+            std::move(axes_k),
+            std::move(codes_v),
+            std::move(axes_v),
+            std::move(stage_k),
+            std::move(stage_v),
+            n,
+            scale,
+            k_bits,
+            v_bits,
+            q_len,
+            splits,
+            n_attend,
+            full_visibility,
+            s));
+      },
+      "q"_a,
+      "codes_k"_a,
+      "axes_k"_a,
+      "codes_v"_a,
+      "axes_v"_a,
+      "stage_k"_a,
+      "stage_v"_a,
+      "n"_a,
+      "scale"_a,
+      "k_bits"_a = 6,
+      "v_bits"_a = 6,
+      "q_len"_a = 1,
+      "splits"_a = 0,
+      nb::kw_only(),
+      "n_attend"_a = 0,
+      "full_visibility"_a = false,
+      "return_lse"_a = false,
+      "stream"_a = nb::none(),
+      R"(
+        sdpa_fa_verify over a KVarN-backed KV cache. The query is the same
+        GQA fold as sdpa_fa_verify (q [1, Hkv, G*q_len, D], kv-major heads,
+        original q_len; G*q_len <= 64, or 32 at head_dim 512) in the
+        rotated domain, and the sealed records dequantize at tile stage
+        exactly as in sdpa_decode_gqa_kvarn, so the output matches
+        sdpa_fa_verify over the materialized cache bit for bit. Operands,
+        n, n_attend and full_visibility follow sdpa_decode_gqa_kvarn; the
+        result is rotated-domain like the query (un-rotate it). This is the
+        verify-width route: the vector kernel's cost climbs steeply past
+        two queries, while the matrix tile prices extra rows at nearly
+        zero. head_dim 128, 256 or 512; batch size 1. Metal-only.
+      )");
+
+  m.def(
+      "sdpa_decode_gqa_kvarn",
+      [](mx::array q,
+         mx::array codes_k,
+         mx::array axes_k,
+         mx::array codes_v,
+         mx::array axes_v,
+         mx::array stage_k,
+         mx::array stage_v,
+         int n,
+         float scale,
+         int k_bits,
+         int v_bits,
+         const std::optional<mx::array>& sinks,
+         int splits,
+         int tile_c,
+         const std::optional<mx::array>& starts,
+         int n_attend,
+         bool full_visibility,
+         bool return_lse,
+         mx::StreamOrDevice s) -> nb::object {
+        if (return_lse) {
+          auto outs = mlx_kquant::sdpa_decode_gqa_kvarn_lse(
+              std::move(q),
+              std::move(codes_k),
+              std::move(axes_k),
+              std::move(codes_v),
+              std::move(axes_v),
+              std::move(stage_k),
+              std::move(stage_v),
+              n,
+              scale,
+              k_bits,
+              v_bits,
+              sinks,
+              splits,
+              tile_c,
+              starts,
+              n_attend,
+              full_visibility,
+              s);
+          return nb::make_tuple(outs[0], outs[1]);
+        }
+        return nb::cast(mlx_kquant::sdpa_decode_gqa_kvarn(
+            std::move(q),
+            std::move(codes_k),
+            std::move(axes_k),
+            std::move(codes_v),
+            std::move(axes_v),
+            std::move(stage_k),
+            std::move(stage_v),
+            n,
+            scale,
+            k_bits,
+            v_bits,
+            sinks,
+            splits,
+            tile_c,
+            starts,
+            n_attend,
+            full_visibility,
+            s));
+      },
+      "q"_a,
+      "codes_k"_a,
+      "axes_k"_a,
+      "codes_v"_a,
+      "axes_v"_a,
+      "stage_k"_a,
+      "stage_v"_a,
+      "n"_a,
+      "scale"_a,
+      "k_bits"_a = 6,
+      "v_bits"_a = 6,
+      "sinks"_a = nb::none(),
+      "splits"_a = 0,
+      "tile_c"_a = 0,
+      "starts"_a = nb::none(),
+      nb::kw_only(),
+      "n_attend"_a = 0,
+      "full_visibility"_a = false,
+      "return_lse"_a = false,
+      "stream"_a = nb::none(),
+      R"(
+        sdpa_decode_gqa over a KVarN-backed KV cache, fused: sealed groups
+        dequantize (kvarn_quantize wire) at tile stage, sink and live tokens
+        read the fp16 rotated stage, and everything downstream of the stage
+        is the sdpa_decode_gqa machinery unchanged. Rotated-domain contract:
+        q must arrive WHT-rotated (kvarn_rotate) and the output is the
+        rotated attention result, which the caller un-rotates.
+
+        Key layout for n total keys: keys [0, min(n, S_rows - 128)) read
+        stage rows directly (fp16 sink groups); the next full 128-groups
+        read sealed records in order; the remainder reads the live stage
+        rows at [S_rows - 128, S_rows). head_dim 128, 256 or 512; wider
+        heads store D/128 slice records per group, slice-minor in the codes
+        with one axes triplet per slice.
+
+        Args:
+            q (array): rotated queries [B, n_q_heads, qL, D],
+                float16/bfloat16; qL 1 (decode) to 4 (verify width).
+            codes_k (array): uint32
+                [B, n_kv_heads, Gcap, (D / 128) * 512 * k_bits].
+            axes_k (array): float16
+                [B, n_kv_heads, Gcap, 3 * (D / 128), 128].
+            codes_v (array): uint32, K layout with v_bits.
+            axes_v (array): float16, K layout.
+            stage_k (array): float16 [B, n_kv_heads, S_rows, D], rotated;
+                S_rows a multiple of 128 >= 256 (sink groups + live group).
+            stage_v (array): float16, same shape as stage_k.
+            n (int): total key count (Gcap and S_rows are capacities).
+            scale (float): query scale (typically 1/sqrt(D)).
+            k_bits (int): K record width, one of 2/3/4/5/6/8. Default 6.
+            v_bits (int): V record width. Default 6.
+            sinks (array, optional): per-q-head softmax sink logits.
+            splits (int): key-axis split count; 0 picks the default.
+            tile_c (int): staged tile height, 32 or 16 at head_dim 128,
+                16 or 8 at 256, and 8 at 512; 0 picks the default
+                (32 / 16 / 8).
+            starts (array, optional): int32 [B] per-row key starts.
+            n_attend (int): walk only the first n_attend keys while the
+                region map stays on the full n-key layout; 0 walks all n.
+                Precision-tail body segments set this to n minus the tail
+                overlay length.
+            full_visibility (bool): lift the per-query causal clamp;
+                requires n_attend <= n - qL + 1 so every walked key
+                precedes every query. Used with return_lse for tail
+                merges.
+            return_lse (bool): also return the natural-log softmax
+                normalizer [B, n_q_heads, qL] float32.
+
+        Returns:
+            array or tuple(array, array): rotated attention output
+            [B, n_q_heads, qL, D] (plus lse with return_lse).
       )");
 
   m.def(

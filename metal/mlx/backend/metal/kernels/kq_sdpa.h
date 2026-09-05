@@ -30,7 +30,232 @@ constant bool gqa_cascade [[function_constant(7)]];
 // Page-gather decode: the key walk follows a per-(batch, kv-head) list of
 // selected C-row pages (sparse top-k attention) instead of the contiguous
 // [0, N) axis. Compiled out when false.
+#include "mlx/backend/metal/kernels/kq_kvarn_params.h"
+
 constant bool gqa_paged [[function_constant(8)]];
+// KVarN-backed KV (kq_kvarn.h records + fp16 rotated stage): keys/values
+// bind as record words with per-record strides, axes and stage bind at
+// buffers 24-27, and tile staging dequantizes in place. The bit widths are
+// function constants so the extraction loops specialize per (k, v) pair;
+// pipeline hashes must carry a "_kv<k><v>" token. Callers that never set
+// these constants get the compiled-out default (defined-check below), so
+// only the kvarn dispatch site binds the extra buffers. Heads wider than
+// 128 store D/128 independent slice records per group: slice-minor within
+// the group's codes (word offset s * 512 * bits) with one (scale, zp,
+// other) axes triplet per slice (384 halves each), so slice offsets fold
+// at pipeline build.
+constant bool gqa_kv_kvarn_fc [[function_constant(9)]];
+constant int kvarn_k_bits_fc [[function_constant(10)]];
+constant int kvarn_v_bits_fc [[function_constant(11)]];
+constant bool gqa_kv_kvarn =
+    is_function_constant_defined(gqa_kv_kvarn_fc) ? gqa_kv_kvarn_fc : false;
+constant int kvarn_k_bits =
+    is_function_constant_defined(kvarn_k_bits_fc) ? kvarn_k_bits_fc : 6;
+constant int kvarn_v_bits =
+    is_function_constant_defined(kvarn_v_bits_fc) ? kvarn_v_bits_fc : 6;
+
+// KVarN region map for the decode kernel: keys [0, sink_rows) read stage
+// rows [0, sink_rows); keys [sink_rows, sink_rows + n_rec_keys) read sealed
+// records; later keys read stage rows from live_row0. full_vis lifts the
+// per-query causal clamp (a precision-tail body segment ends before every
+// query's position, so all of its keys are visible at any query width).
+// Mirrored in kquant_sdpa.cpp; layouts must match field for field.
+struct KQKvarnMeta {
+  int sink_rows;
+  int n_rec_keys;
+  int live_row0;
+  int full_vis;
+  ulong stage_k_head;
+  ulong stage_v_head;
+};
+
+// KVarN tile staging shared by the decode and FA verify kernels. C divides
+// 128 and every region bound is group-aligned or N itself, so a C-key tile
+// reads exactly one region: stage rows (sink or live, fp16 [token][dim]) or
+// one sealed record (kq_kvarn.h: K rows are dims x token columns, V rows
+// are tokens x dim columns; LSB-first row bitstreams). Tiles land row-major
+// [C][LDS] (LDS = D packed for the vector kernel, D + pad for the MMA
+// kernels); rows at or past n_valid zero-fill so stale threadgroup data can
+// never reach the accumulators. Heads wider than 128 address slice records
+// (SL folds to single-record addressing at D == 128; the max keeps D < 128
+// instantiations compiling, the host never dispatches kvarn on them).
+//
+// Both record loaders stage a unit's record words in registers and extract
+// with fully unrolled loops: the bit widths are function constants, so
+// every word index and shift folds at pipeline build (no dynamic register
+// indexing, no 64-bit arithmetic). Axis values broadcast through
+// simd_shuffle from one per-lane preload instead of per-element device
+// loads. Record rows are always in-bounds memory, so validity applies at
+// the store, keeping the simdgroup convergent for the shuffles. The unit
+// loops advance by whole simdgroups (nt and the unit counts are multiples
+// of 32), so every lane of a simdgroup runs the same trip count.
+template <typename T, int C, int D, int LDS>
+METAL_FUNC void kq_kvarn_stage_rows(
+    threadgroup T* dst,
+    const device half* rows, // the tile's first stage row, [token][D]
+    int n_valid,
+    int flat,
+    int nt) {
+  using T4 = metal::vec<T, 4>;
+  constexpr int D4 = D / 4;
+  for (int i = flat; i < C * D4; i += nt) {
+    const int row = i / D4;
+    const int col = i % D4;
+    threadgroup T4* d4 = (threadgroup T4*)(dst + row * LDS);
+    if (row < n_valid) {
+      const device half4* r = (const device half4*)(rows + (size_t)row * D);
+      d4[col] = T4(float4(r[col]));
+    } else {
+      d4[col] = T4(T(0));
+    }
+  }
+}
+
+// V units: (32-dim segment, token row); with C == 32 a simdgroup covers one
+// segment with row == lane, so the segment's other_axis slice lives in one
+// register per lane (a simdgroup's units share one seg, flat being
+// 32-aligned per simdgroup, so every lane preloads from the same slice
+// triplet). A segment's start bit is word-aligned for every width and
+// spans exactly kvarn_v_bits words.
+template <typename T, int C, int D, int LDS>
+METAL_FUNC void kq_kvarn_stage_v(
+    threadgroup T* dst,
+    const device uint32_t* vrec, // the tile's record words
+    const device half* vax, // the record's axes (per-slice triplets)
+    int c0, // the tile's first token column within the record
+    int n_valid,
+    int flat,
+    int lane,
+    int nt) {
+  using T4 = metal::vec<T, 4>;
+  constexpr int SL = D < KQ_KVARN_GROUP ? 1 : D / KQ_KVARN_GROUP;
+  const uint vmask = (1u << kvarn_v_bits) - 1u;
+  for (int u = flat; u < C * (D / 32); u += nt) {
+    const int seg = u / C;
+    const int row = u % C;
+    const int sl = SL == 1 ? 0 : seg >> 2;
+    const int sseg = SL == 1 ? seg : (seg & 3);
+    threadgroup T4* d4 = (threadgroup T4*)(dst + row * LDS + seg * 32);
+    const int vr = c0 + row;
+    const device half* vaxs = vax + sl * KQ_KVARN_AXES_PER_SLICE;
+    const device uint32_t* w = vrec +
+        (size_t)sl * KQ_KVARN_SLICE_WORDS_PER_BIT * kvarn_v_bits +
+        (size_t)vr * KQ_KVARN_ROW_WORDS_PER_BIT * kvarn_v_bits +
+        (size_t)sseg * kvarn_v_bits;
+    uint wreg[8];
+#pragma unroll
+    for (short t = 0; t < 8; t++) {
+      wreg[t] = t < kvarn_v_bits ? w[t] : 0u;
+    }
+    const float other_l = float(vaxs[2 * KQ_KVARN_GROUP + sseg * 32 + lane]);
+    const float vsc = float(vaxs[vr]);
+    const float vzp = float(vaxs[KQ_KVARN_GROUP + vr]);
+    const bool valid = row < n_valid;
+#pragma unroll
+    for (short j4 = 0; j4 < 8; j4++) {
+      float4 f;
+#pragma unroll
+      for (short jj = 0; jj < 4; jj++) {
+        const int j = j4 * 4 + jj;
+        const int bit = j * kvarn_v_bits;
+        const int wi = bit >> 5;
+        const int sh = bit & 31;
+        uint qv = wreg[wi] >> sh;
+        if (sh + kvarn_v_bits > 32) {
+          qv |= wreg[wi + 1] << (32 - sh);
+        }
+        const float other = C == 32
+            ? simd_shuffle(other_l, ushort(j))
+            : float(vaxs[2 * KQ_KVARN_GROUP + sseg * 32 + j]);
+        f[jj] = (float(qv & vmask) * vsc + vzp) * other;
+      }
+      d4[j4] = valid ? T4(f) : T4(T(0));
+    }
+  }
+}
+
+// K units: one record dim-row each, extracting the tile's C token columns
+// and scattering transposed into dst. The tile's C-wide other_axis slice
+// broadcasts from one per-lane preload (lanes past C are never shuffled
+// from; the clamp keeps their preload in bounds at C == 16). At C == 32
+// (and even widths at C == 16) the segment start is word-aligned, so the
+// extraction unrolls with compile-time shifts; the unaligned C == 16
+// odd-width case falls back to device-indexed extraction.
+template <typename T, int C, int D, int LDS>
+METAL_FUNC void kq_kvarn_stage_k(
+    threadgroup T* dst,
+    const device uint32_t* krec,
+    const device half* kax,
+    int c0,
+    int n_valid,
+    int flat,
+    int lane,
+    int nt) {
+  constexpr int SL = D < KQ_KVARN_GROUP ? 1 : D / KQ_KVARN_GROUP;
+  const uint kmask = (1u << kvarn_k_bits) - 1u;
+  const int kb0 = c0 * kvarn_k_bits;
+  float otherk_sl[SL];
+#pragma unroll
+  for (short s2 = 0; s2 < SL; s2++) {
+    otherk_sl[s2] = float(
+        kax[s2 * KQ_KVARN_AXES_PER_SLICE + 2 * KQ_KVARN_GROUP +
+            min(c0 + lane, KQ_KVARN_GROUP - 1)]);
+  }
+  for (int u = flat; u < D; u += nt) {
+    const int sl = SL == 1 ? 0 : u >> KQ_KVARN_GROUP_SHIFT;
+    const int ur = SL == 1 ? u : (u & (KQ_KVARN_GROUP - 1));
+    const device uint32_t* w = krec +
+        (size_t)sl * KQ_KVARN_SLICE_WORDS_PER_BIT * kvarn_k_bits +
+        (size_t)ur * KQ_KVARN_ROW_WORDS_PER_BIT * kvarn_k_bits + (kb0 >> 5);
+    const float ksc = float(kax[sl * KQ_KVARN_AXES_PER_SLICE + ur]);
+    const float kzp =
+        float(kax[sl * KQ_KVARN_AXES_PER_SLICE + KQ_KVARN_GROUP + ur]);
+    // The slice index is simdgroup-uniform (32 consecutive dim rows never
+    // straddle a slice), so shuffling from the selected preload is exact;
+    // the unrolled ladder avoids dynamic register indexing.
+    float otherk_l = otherk_sl[0];
+#pragma unroll
+    for (short s2 = 1; s2 < SL; s2++) {
+      if (sl == s2) {
+        otherk_l = otherk_sl[s2];
+      }
+    }
+    if ((kb0 & 31) == 0) {
+      uint wreg[8];
+#pragma unroll
+      for (short t = 0; t < 8; t++) {
+        wreg[t] = t * 32 < C * kvarn_k_bits ? w[t] : 0u;
+      }
+#pragma unroll
+      for (short j = 0; j < C; j++) {
+        const int bit = j * kvarn_k_bits;
+        const int wi = bit >> 5;
+        const int sh = bit & 31;
+        uint qk = wreg[wi] >> sh;
+        if (sh + kvarn_k_bits > 32) {
+          qk |= wreg[wi + 1] << (32 - sh);
+        }
+        const float other = simd_shuffle(otherk_l, ushort(j));
+        dst[j * LDS + u] =
+            j < n_valid ? T((float(qk & kmask) * ksc + kzp) * other) : T(0);
+      }
+    } else {
+      int bit = kb0 & 31;
+      for (int j = 0; j < C; j++) {
+        const int wi = bit >> 5;
+        const int sh = bit & 31;
+        uint qk = w[wi] >> sh;
+        if (sh + kvarn_k_bits > 32) {
+          qk |= w[wi + 1] << (32 - sh);
+        }
+        bit += kvarn_k_bits;
+        const float other = simd_shuffle(otherk_l, ushort(j));
+        dst[j * LDS + u] =
+            j < n_valid ? T((float(qk & kmask) * ksc + kzp) * other) : T(0);
+      }
+    }
+  }
+}
 
 // PT = pass-1 partial store type. float16 inputs use float: the
 // un-normalized accumulator state can exceed the fp16 ceiling. bfloat16
@@ -241,6 +466,11 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
     const constant size_t& vs_seq_stride [[buffer(21)]],
     const device int* pages [[buffer(22)]],
     const constant int& n_pages [[buffer(23)]],
+    const device half* kvarn_axes_k [[buffer(24)]],
+    const device half* kvarn_axes_v [[buffer(25)]],
+    const device half* kvarn_stage_k [[buffer(26)]],
+    const device half* kvarn_stage_v [[buffer(27)]],
+    const constant KQKvarnMeta& kvm [[buffer(28)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -307,13 +537,14 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
       (const device T4*)(queries + ((size_t)q_batch_head_idx * nq + qz0) * D);
   float4 qf[QPS][DP4];
   int lim[QPS]; // highest key each query may attend (its causal position)
+  const bool full_vis = gqa_kv_kvarn && kvm.full_vis != 0;
   for (short p = 0; p < QPS; p++) {
     const bool active = qz0 + p < nq;
     for (short ii = 0; ii < DP4; ii++) {
       qf[p][ii] = active ? scale * float4(q4[(size_t)p * D4 + ii * NL + tx])
                          : float4(0);
     }
-    lim[p] = active ? N - nq + qz0 + p : -1;
+    lim[p] = active ? (full_vis ? N - 1 : N - nq + qz0 + p) : -1;
   }
 
   float max_score[QPS];
@@ -353,7 +584,50 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
     // unit -- 16 consecutive elements never straddle a 64-element group --
     // instead of per-word scalar traffic, which measured ~40% below the
     // fp16 kernel's bandwidth.
-    if (gqa_kv_q8) {
+    if (gqa_kv_kvarn) {
+      threadgroup T* sKh = (threadgroup T*)sK;
+      threadgroup T* sVh = (threadgroup T*)sV;
+      const int rec_end = kvm.sink_rows + kvm.n_rec_keys;
+      const int n_valid = kend - kt;
+      if (kt < kvm.sink_rows || kt >= rec_end) {
+        const int srow0 =
+            kt < kvm.sink_rows ? kt : kvm.live_row0 + (kt - rec_end);
+        kq_kvarn_stage_rows<T, C, D, D>(
+            sKh,
+            kvarn_stage_k + kv_hb * kvm.stage_k_head + (size_t)srow0 * D,
+            n_valid,
+            flat,
+            n_threads);
+        kq_kvarn_stage_rows<T, C, D, D>(
+            sVh,
+            kvarn_stage_v + kv_hb * kvm.stage_v_head + (size_t)srow0 * D,
+            n_valid,
+            flat,
+            n_threads);
+      } else {
+        const int rk = kt - kvm.sink_rows;
+        const int rec = rk >> KQ_KVARN_GROUP_SHIFT; // sealed group index
+        const int c0 = rk & (KQ_KVARN_GROUP - 1); // first token column
+        kq_kvarn_stage_v<T, C, D, D>(
+            sVh,
+            vwbase + (size_t)rec * v_seq_stride,
+            kvarn_axes_v + kv_hb * vs_head_stride + (size_t)rec * vs_seq_stride,
+            c0,
+            n_valid,
+            flat,
+            lane,
+            n_threads);
+        kq_kvarn_stage_k<T, C, D, D>(
+            sKh,
+            kwbase + (size_t)rec * k_seq_stride,
+            kvarn_axes_k + kv_hb * ks_head_stride + (size_t)rec * ks_seq_stride,
+            c0,
+            n_valid,
+            flat,
+            lane,
+            n_threads);
+      }
+    } else if (gqa_kv_q8) {
       constexpr int DU = D / 16; // uint4 units per row
       for (int u = flat; u < C * DU; u += n_threads) {
         const int row = u / DU;
@@ -663,6 +937,11 @@ template <typename T, int D, int BQ = 32>
     const constant size_t& ks_seq_stride [[buffer(19)]],
     const constant size_t& vs_head_stride [[buffer(20)]],
     const constant size_t& vs_seq_stride [[buffer(21)]],
+    const device half* kvarn_axes_k [[buffer(24)]],
+    const device half* kvarn_axes_v [[buffer(25)]],
+    const device half* kvarn_stage_k [[buffer(26)]],
+    const device half* kvarn_stage_v [[buffer(27)]],
+    const constant KQKvarnMeta& kvm [[buffer(28)]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -711,6 +990,17 @@ template <typename T, int D, int BQ = 32>
       v_scales + kv_hb * vs_head_stride + (size_t)k0 * vs_seq_stride;
   const device T* vbb =
       v_biases + kv_hb * vs_head_stride + (size_t)k0 * vs_seq_stride;
+  // KVarN operands (compiled out unless gqa_kv_kvarn): records address per
+  // tile by sealed group, so the bases carry no k0 offset.
+  const device uint32_t* kwrec =
+      (const device uint32_t*)keys + kv_hb * k_head_stride;
+  const device uint32_t* vwrec =
+      (const device uint32_t*)values + kv_hb * v_head_stride;
+  const device half* kaxb = kvarn_axes_k + kv_hb * ks_head_stride;
+  const device half* vaxb = kvarn_axes_v + kv_hb * vs_head_stride;
+  const device half* stk = kvarn_stage_k + kv_hb * kvm.stage_k_head;
+  const device half* stv = kvarn_stage_v + kv_hb * kvm.stage_v_head;
+  const int rec_end = kvm.sink_rows + kvm.n_rec_keys;
 
   // Fragment coordinates: this thread owns row (row0 + sm) and the column
   // pair at sn of every 8x8 fragment.
@@ -721,8 +1011,11 @@ template <typename T, int D, int BQ = 32>
   const int flat_tid = int(simd_gid) * 32 + int(simd_lid);
   // Highest key this row attends. Padding rows (row >= n_rows) compute a
   // harmless in-range limit; their partials are never written.
-  const int lim = N - q_len + (row % q_len);
-  const int lim_min = N - q_len; // every real row attends at least this far
+  // full_vis (kvarn precision-tail body) lifts the clamp: every walked key
+  // precedes every query.
+  const bool full_vis = gqa_kv_kvarn && kvm.full_vis != 0;
+  const int lim = full_vis ? N - 1 : N - q_len + (row % q_len);
+  const int lim_min = full_vis ? N - 1 : N - q_len; // every row reaches it
 
   // Q tile in float32 fragments (one device read; rows past n_rows
   // zero-fill, so padding rows score 0 everywhere).
@@ -747,7 +1040,27 @@ template <typename T, int D, int BQ = 32>
   for (int kt = k0; kt < k1; kt += BK) {
     const int krem = min(k1 - kt, BK);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (gqa_kv_q8) {
+    if (gqa_kv_kvarn) {
+      if (kt < kvm.sink_rows || kt >= rec_end) {
+        const int srow0 =
+            kt < kvm.sink_rows ? kt : kvm.live_row0 + (kt - rec_end);
+        kq_kvarn_stage_rows<T, BK, D, LDS>(
+            KV_smem, stk + (size_t)srow0 * D, krem, flat_tid, kNWarps * 32);
+      } else {
+        const int rk = kt - kvm.sink_rows;
+        const int rec = rk >> KQ_KVARN_GROUP_SHIFT;
+        const int c0 = rk & (KQ_KVARN_GROUP - 1);
+        kq_kvarn_stage_k<T, BK, D, LDS>(
+            KV_smem,
+            kwrec + (size_t)rec * k_seq_stride,
+            kaxb + (size_t)rec * ks_seq_stride,
+            c0,
+            krem,
+            flat_tid,
+            int(simd_lid),
+            kNWarps * 32);
+      }
+    } else if (gqa_kv_q8) {
       kq_fa_stage_rows_q8<T, BK, D, LDS, kNWarps * 32>(
           KV_smem,
           kwbase + (size_t)(kt - k0) * k_seq_stride,
@@ -806,7 +1119,27 @@ template <typename T, int D, int BQ = 32>
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (gqa_kv_q8) {
+    if (gqa_kv_kvarn) {
+      if (kt < kvm.sink_rows || kt >= rec_end) {
+        const int srow0 =
+            kt < kvm.sink_rows ? kt : kvm.live_row0 + (kt - rec_end);
+        kq_kvarn_stage_rows<T, BK, D, LDS>(
+            KV_smem, stv + (size_t)srow0 * D, krem, flat_tid, kNWarps * 32);
+      } else {
+        const int rk = kt - kvm.sink_rows;
+        const int rec = rk >> KQ_KVARN_GROUP_SHIFT;
+        const int c0 = rk & (KQ_KVARN_GROUP - 1);
+        kq_kvarn_stage_v<T, BK, D, LDS>(
+            KV_smem,
+            vwrec + (size_t)rec * v_seq_stride,
+            vaxb + (size_t)rec * vs_seq_stride,
+            c0,
+            krem,
+            flat_tid,
+            int(simd_lid),
+            kNWarps * 32);
+      }
+    } else if (gqa_kv_q8) {
       kq_fa_stage_rows_q8<T, BK, D, LDS, kNWarps * 32>(
           KV_smem,
           vwbase + (size_t)(kt - k0) * v_seq_stride,
@@ -919,6 +1252,15 @@ template <typename T, int D>
     const constant float& scale [[buffer(11)]],
     const constant int& q_len [[buffer(12)]],
     const constant int& n_rows [[buffer(13)]],
+    const constant size_t& ks_head_stride [[buffer(18)]],
+    const constant size_t& ks_seq_stride [[buffer(19)]],
+    const constant size_t& vs_head_stride [[buffer(20)]],
+    const constant size_t& vs_seq_stride [[buffer(21)]],
+    const device half* kvarn_axes_k [[buffer(24)]],
+    const device half* kvarn_axes_v [[buffer(25)]],
+    const device half* kvarn_stage_k [[buffer(26)]],
+    const device half* kvarn_stage_v [[buffer(27)]],
+    const constant KQKvarnMeta& kvm [[buffer(28)]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -957,6 +1299,17 @@ template <typename T, int D>
   const device T* vbase = values +
       (size_t)(batch_idx * num_kv_heads + kv_head_idx) * v_head_stride +
       (size_t)k0 * v_seq_stride;
+  // KVarN operands (compiled out unless gqa_kv_kvarn); see the hd256 kernel.
+  const size_t kv_hb = (size_t)(batch_idx * num_kv_heads + kv_head_idx);
+  const device uint32_t* kwrec =
+      (const device uint32_t*)keys + kv_hb * k_head_stride;
+  const device uint32_t* vwrec =
+      (const device uint32_t*)values + kv_hb * v_head_stride;
+  const device half* kaxb = kvarn_axes_k + kv_hb * ks_head_stride;
+  const device half* vaxb = kvarn_axes_v + kv_hb * vs_head_stride;
+  const device half* stk = kvarn_stage_k + kv_hb * kvm.stage_k_head;
+  const device half* stv = kvarn_stage_v + kv_hb * kvm.stage_v_head;
+  const int rec_end = kvm.sink_rows + kvm.n_rec_keys;
 
   const short dh_half = simd_gid & 1;
   const short strip = simd_gid >> 1;
@@ -964,8 +1317,11 @@ template <typename T, int D>
   const short sm = sc.y;
   const short sn = sc.x;
   const int row = int(strip) * kFragSize + sm;
-  const int lim = N - q_len + (row % q_len);
-  const int lim_min = N - q_len; // every real row attends at least this far
+  // full_vis (kvarn precision-tail body) lifts the clamp: every walked key
+  // precedes every query.
+  const bool full_vis = gqa_kv_kvarn && kvm.full_vis != 0;
+  const int lim = full_vis ? N - 1 : N - q_len + (row % q_len);
+  const int lim_min = full_vis ? N - 1 : N - q_len; // every row reaches it
   const int flat_tid = int(simd_gid) * 32 + int(simd_lid);
 
   // This half's Q columns in float32 fragments (one device read; rows past
@@ -991,12 +1347,34 @@ template <typename T, int D>
   for (int kt = k0; kt < k1; kt += BK) {
     const int krem = min(k1 - kt, BK);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    kq_fa_stage_rows<T, BK, D, LDS, kNWarps * 32>(
-        KV_smem,
-        kbase + (size_t)(kt - k0) * k_seq_stride,
-        k_seq_stride,
-        krem,
-        flat_tid);
+    if (gqa_kv_kvarn) {
+      if (kt < kvm.sink_rows || kt >= rec_end) {
+        const int srow0 =
+            kt < kvm.sink_rows ? kt : kvm.live_row0 + (kt - rec_end);
+        kq_kvarn_stage_rows<T, BK, D, LDS>(
+            KV_smem, stk + (size_t)srow0 * D, krem, flat_tid, kNWarps * 32);
+      } else {
+        const int rk = kt - kvm.sink_rows;
+        const int rec = rk >> KQ_KVARN_GROUP_SHIFT;
+        const int c0 = rk & (KQ_KVARN_GROUP - 1);
+        kq_kvarn_stage_k<T, BK, D, LDS>(
+            KV_smem,
+            kwrec + (size_t)rec * k_seq_stride,
+            kaxb + (size_t)rec * ks_seq_stride,
+            c0,
+            krem,
+            flat_tid,
+            int(simd_lid),
+            kNWarps * 32);
+      }
+    } else {
+      kq_fa_stage_rows<T, BK, D, LDS, kNWarps * 32>(
+          KV_smem,
+          kbase + (size_t)(kt - k0) * k_seq_stride,
+          k_seq_stride,
+          krem,
+          flat_tid);
+    }
     Stile.clear();
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1067,12 +1445,34 @@ template <typename T, int D>
 
     // The exchange barriers already ordered every K read before this
     // overwrite; no extra barrier needed.
-    kq_fa_stage_rows<T, BK, D, LDS, kNWarps * 32>(
-        KV_smem,
-        vbase + (size_t)(kt - k0) * v_seq_stride,
-        v_seq_stride,
-        krem,
-        flat_tid);
+    if (gqa_kv_kvarn) {
+      if (kt < kvm.sink_rows || kt >= rec_end) {
+        const int srow0 =
+            kt < kvm.sink_rows ? kt : kvm.live_row0 + (kt - rec_end);
+        kq_kvarn_stage_rows<T, BK, D, LDS>(
+            KV_smem, stv + (size_t)srow0 * D, krem, flat_tid, kNWarps * 32);
+      } else {
+        const int rk = kt - kvm.sink_rows;
+        const int rec = rk >> KQ_KVARN_GROUP_SHIFT;
+        const int c0 = rk & (KQ_KVARN_GROUP - 1);
+        kq_kvarn_stage_v<T, BK, D, LDS>(
+            KV_smem,
+            vwrec + (size_t)rec * v_seq_stride,
+            vaxb + (size_t)rec * vs_seq_stride,
+            c0,
+            krem,
+            flat_tid,
+            int(simd_lid),
+            kNWarps * 32);
+      }
+    } else {
+      kq_fa_stage_rows<T, BK, D, LDS, kNWarps * 32>(
+          KV_smem,
+          vbase + (size_t)(kt - k0) * v_seq_stride,
+          v_seq_stride,
+          krem,
+          flat_tid);
+    }
 
     // Online softmax on this thread's row (registers only, overlapping the
     // V load); both halves compute identical stats from the combined S. A
