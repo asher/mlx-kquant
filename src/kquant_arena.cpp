@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include "kquant.h"
@@ -44,22 +45,31 @@ std::pair<mx::array, uintptr_t> arena_alloc(
   }
   const size_t page = static_cast<size_t>(getpagesize());
   const size_t alloc_bytes = (nbytes + page - 1) & ~(page - 1);
-  void* ptr = nullptr;
-  if (posix_memalign(&ptr, page, alloc_bytes) != 0 || ptr == nullptr) {
+  // mmap, not malloc: libmalloc keeps a freed block of this size mapped
+  // and dirty, so a shrink or an unload would hand the pages to its
+  // cache instead of the kernel. munmap returns them at once.
+  void* ptr = mmap(
+      nullptr,
+      alloc_bytes,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
+  if (ptr == MAP_FAILED) {
     throw std::runtime_error(
         "[mlx_kquant.arena_alloc] failed to allocate " +
         std::to_string(alloc_bytes) + " bytes.");
   }
   mx::allocator::Buffer buf = mx::allocator::make_buffer(ptr, alloc_bytes);
   if (buf.ptr() == nullptr) {
-    std::free(ptr);
+    munmap(ptr, alloc_bytes);
     throw std::runtime_error(
         "[mlx_kquant.arena_alloc] no-copy buffer wrap rejected (needs the "
         "Metal allocator).");
   }
-  mx::Deleter del = [ptr](mx::allocator::Buffer b) {
+  mx::Deleter del = [ptr, alloc_bytes](mx::allocator::Buffer b) {
     mx::allocator::release(b);
-    std::free(ptr);
+    munmap(ptr, alloc_bytes);
   };
   mx::array arr(buf, shape, dtype, del);
   return {std::move(arr), reinterpret_cast<uintptr_t>(ptr)};

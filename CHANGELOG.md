@@ -6,6 +6,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- `arena_alloc` maps its buffer with mmap and unmaps it on release.
+  libmalloc kept a freed block of arena size mapped and dirty, so a
+  decode-arena shrink or a model unload left tens of GB resident in the
+  process and the kernel saw none of it as free.
+
 ## [0.4.6]
 
 ### Added
