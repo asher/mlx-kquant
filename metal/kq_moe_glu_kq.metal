@@ -229,6 +229,61 @@ instantiate_kq_ext_uniform(q6_k_ext, KqQ6_KExt, float16_t)
 instantiate_kq_ext_uniform(q8_0_ext, KqQ8_0Ext, bfloat16_t)
 instantiate_kq_ext_uniform(q8_0_ext, KqQ8_0Ext, float16_t)
 
+// Half-dot variants (KQ_MOE_HALF=1) for the grid codecs whose float decode
+// is ALU-bound at decode widths: iq2_xs, iq2_xxs, iq3_xxs. Names insert
+// "_h" after the op stem. nx 8 and 16 only (the host caps the pick).
+#define instantiate_kq_ext_half_nx(codec, traits, type, nx, sfx)              \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_h_silu" sfx "_" #type,                    \
+      kq_ext_moe_glu_gather_h, type, traits, KQ_GLU_ACT_SILU, nx)              \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_h_gelu" sfx "_" #type,                    \
+      kq_ext_moe_glu_gather_h, type, traits, KQ_GLU_ACT_GELU, nx)              \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_h_silu_limit" sfx "_" #type,              \
+      kq_ext_moe_glu_gather_h, type, traits, KQ_GLU_ACT_SILU_LIMIT, nx)        \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_h" sfx "_" #type,                             \
+      kq_ext_gather_qmv_h, type, traits, nx)                                   \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_shexp_h_silu" sfx "_" #type,              \
+      kq_ext_moe_glu_gather_shexp_h, type, traits, traits, KQ_GLU_ACT_SILU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_shexp_h_gelu" sfx "_" #type,              \
+      kq_ext_moe_glu_gather_shexp_h, type, traits, traits, KQ_GLU_ACT_GELU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_h" sfx "_" #type,                         \
+      kq_ext_gather_qmv_mix_h, type, traits, traits, nx)
+
+#define instantiate_kq_ext_half_sx_nx(codec, traits, scodec, straits, type, nx, sfx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_h_silu" sfx "_" #type, \
+      kq_ext_moe_glu_gather_shexp_h, type, traits, straits, KQ_GLU_ACT_SILU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_h_gelu" sfx "_" #type, \
+      kq_ext_moe_glu_gather_shexp_h, type, traits, straits, KQ_GLU_ACT_GELU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_sx_" #scodec "_gather_qmv_mix_h" sfx "_" #type,          \
+      kq_ext_gather_qmv_mix_h, type, traits, straits, nx)
+
+#define instantiate_kq_ext_half_type(codec, traits, type)                     \
+  instantiate_kq_ext_half_nx(codec, traits, type, 8, "")                       \
+  instantiate_kq_ext_half_nx(codec, traits, type, 16, "_nx16")                 \
+  instantiate_kq_ext_half_sx_nx(codec, traits, q5_k, KqQ5_KExt, type, 8, "")   \
+  instantiate_kq_ext_half_sx_nx(codec, traits, q5_k, KqQ5_KExt, type, 16, "_nx16") \
+  instantiate_kq_ext_half_sx_nx(codec, traits, q6_k, KqQ6_KExt, type, 8, "")   \
+  instantiate_kq_ext_half_sx_nx(codec, traits, q6_k, KqQ6_KExt, type, 16, "_nx16") \
+  instantiate_kq_ext_half_sx_nx(codec, traits, q8_0, KqQ8_0Ext, type, 8, "")   \
+  instantiate_kq_ext_half_sx_nx(codec, traits, q8_0, KqQ8_0Ext, type, 16, "_nx16")
+
+#define instantiate_kq_ext_half_all(codec, traits)                            \
+  instantiate_kq_ext_half_type(codec, traits, bfloat16_t)                      \
+  instantiate_kq_ext_half_type(codec, traits, float16_t)
+
+instantiate_kq_ext_half_all(iq2_xs, KqIq2_xsExt)
+instantiate_kq_ext_half_all(iq2_xxs, KqIq2_xxsExt)
+instantiate_kq_ext_half_all(iq3_xxs, KqIq3_xxsExt)
+
 instantiate_kernel("kq_moe_router_topk_float", kq_moe_router_topk, float)
 instantiate_kernel("kq_moe_router_topk_bfloat16_t", kq_moe_router_topk, bfloat16_t)
 instantiate_kernel("kq_moe_router_topk_float16_t", kq_moe_router_topk, float16_t)

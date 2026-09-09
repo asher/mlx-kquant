@@ -1381,3 +1381,288 @@ template <typename T>
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Half-dot Ext gathers (KQ_MOE_HALF=1, grid codecs only; see KqTgLutsH).
+// Same thread mapping and launch shape as the Ext kernels above. Three
+// changes per chunk: the grid entry comes back as half4 pairs (no u64 byte
+// unpack), the activation row is read from a half copy staged once per
+// threadgroup in dynamic threadgroup memory (buffer threadgroup(0), K halves,
+// host-sized), and the four 4-wide dots run in half with a float sum per
+// chunk before the chunk scale. Expert rows only: the shared-expert slot in
+// the shexp / mix kernels keeps the float path over the device activation
+// row, so the shexp numerics are unchanged. Outputs differ from the float
+// kernels at the half rounding level (about 1e-3 relative on the fused GLU
+// output at K=4096, against a bf16 floor near 9e-4).
+// ---------------------------------------------------------------------------
+
+#define KQ_EXT_STAGE_LUTS_H(CodecT, name)                               \
+  threadgroup uint4 name##_v[(KqTgLutsH<CodecT>::bytes + 15) / 16 + 1]; \
+  threadgroup uint8_t* name =                                           \
+      reinterpret_cast<threadgroup uint8_t*>(name##_v);                 \
+  if (KqTgLutsH<CodecT>::bytes > 0) {                                   \
+    KqTgLutsH<CodecT>::stage(                                           \
+        name, ushort(simd_gid * 32 + simd_lid), ushort(32 * tptg.y));   \
+  }
+
+// Stages one K-wide activation row as half4 (caller barriers).
+template <typename T>
+METAL_FUNC void kq_ext_stage_xh(
+    threadgroup half4* xs,
+    const device T* x,
+    int K,
+    ushort lin,
+    ushort n_threads) {
+  const device vec<T, 4>* x4 = reinterpret_cast<const device vec<T, 4>*>(x);
+  for (int i = lin; i < K / 4; i += n_threads) {
+    xs[i] = half4(x4[i]);
+  }
+}
+
+template <typename Codec, int NX>
+METAL_FUNC float kq_ext_row_partial_h(
+    const device uint8_t* w,
+    const threadgroup half4* xs,
+    int64_t row,
+    int K,
+    short tx,
+    const threadgroup uint8_t* luts) {
+  constexpr short chpb = Codec::superblock / 16;
+  const int nb = K / Codec::superblock;
+  const device uint8_t* w_row = w + row * (int64_t)nb * Codec::block_bytes;
+  float acc = 0.0f;
+  for (int ich = tx; 16 * ich < K; ich += NX) {
+    const device uint8_t* block =
+        w_row + (int64_t)(ich / chpb) * Codec::block_bytes;
+    half4x4 lw;
+    float sc;
+    KqTgLutsH<Codec>::deq_chunk16h(block, short(ich % chpb), lw, luts, sc);
+    const threadgroup half4* xp = xs + ich * 4;
+    acc += sc *
+        (float(dot(lw[0], xp[0])) + float(dot(lw[1], xp[1])) +
+         float(dot(lw[2], xp[2])) + float(dot(lw[3], xp[3])));
+  }
+  return acc;
+}
+
+template <typename Codec, int NX>
+METAL_FUNC float2 kq_ext_glu_row_partial_h(
+    const device uint8_t* gw,
+    const device uint8_t* uw,
+    const threadgroup half4* xs,
+    int64_t row,
+    int K,
+    short tx,
+    const threadgroup uint8_t* luts) {
+  constexpr short chpb = Codec::superblock / 16;
+  const int nb = K / Codec::superblock;
+  const int64_t row_off = row * (int64_t)nb * Codec::block_bytes;
+  const device uint8_t* g_row = gw + row_off;
+  const device uint8_t* u_row = uw + row_off;
+  float2 acc = float2(0.0f);
+  for (int ich = tx; 16 * ich < K; ich += NX) {
+    const int64_t boff = (int64_t)(ich / chpb) * Codec::block_bytes;
+    const short cch = short(ich % chpb);
+    const threadgroup half4* xp = xs + ich * 4;
+    const half4 a0 = xp[0];
+    const half4 a1 = xp[1];
+    const half4 a2 = xp[2];
+    const half4 a3 = xp[3];
+    half4x4 lw;
+    float sc;
+    KqTgLutsH<Codec>::deq_chunk16h(g_row + boff, cch, lw, luts, sc);
+    acc.x += sc *
+        (float(dot(lw[0], a0)) + float(dot(lw[1], a1)) + float(dot(lw[2], a2)) +
+         float(dot(lw[3], a3)));
+    KqTgLutsH<Codec>::deq_chunk16h(u_row + boff, cch, lw, luts, sc);
+    acc.y += sc *
+        (float(dot(lw[0], a0)) + float(dot(lw[1], a1)) + float(dot(lw[2], a2)) +
+         float(dot(lw[3], a3)));
+  }
+  return acc;
+}
+
+template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
+[[kernel]] void kq_ext_moe_glu_gather_h(
+    const device uint8_t* gw [[buffer(0)]],
+    const device uint8_t* uw [[buffer(1)]],
+    const device T* x [[buffer(2)]],
+    const device uint32_t* indices [[buffer(3)]],
+    device T* out [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant float& limit [[buffer(7)]],
+    threadgroup half4* xs [[threadgroup(0)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int RPS = 32 / NX;
+  const short tx = short(simd_lid % NX);
+  const short ty = short(simd_lid / NX);
+  const int R = tpg.y;
+  const int expert = indices[tid.z * R + tid.y];
+  const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
+  const ushort lin = ushort(simd_gid * 32 + simd_lid);
+  const ushort nth = ushort(32 * tptg.y);
+
+  x += (int64_t)tid.z * K;
+  out += ((int64_t)tid.z * R + tid.y) * N;
+
+  KQ_EXT_STAGE_LUTS_H(Codec, kq_luts)
+  kq_ext_stage_xh<T>(xs, x, K, lin, nth);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float2 gu = kq_ext_glu_row_partial_h<Codec, NX>(
+      gw, uw, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
+  const float g = kq_ext_reduce<NX>(gu.x);
+  const float u = kq_ext_reduce<NX>(gu.y);
+  if (tx == 0) {
+    out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
+  }
+}
+
+template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
+[[kernel]] void kq_ext_gather_qmv_h(
+    const device uint8_t* w [[buffer(0)]],
+    const device T* x [[buffer(1)]],
+    const device uint32_t* indices [[buffer(2)]],
+    device T* out [[buffer(3)]],
+    const constant int& K [[buffer(4)]],
+    const constant int& N [[buffer(5)]],
+    threadgroup half4* xs [[threadgroup(0)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int RPS = 32 / NX;
+  const short tx = short(simd_lid % NX);
+  const short ty = short(simd_lid / NX);
+  const int R = tpg.y;
+  const int64_t row_idx = (int64_t)tid.z * R + tid.y;
+  const int expert = indices[row_idx];
+  const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
+  const ushort lin = ushort(simd_gid * 32 + simd_lid);
+  const ushort nth = ushort(32 * tptg.y);
+
+  x += row_idx * K;
+  out += row_idx * N;
+
+  KQ_EXT_STAGE_LUTS_H(Codec, kq_luts)
+  kq_ext_stage_xh<T>(xs, x, K, lin, nth);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float r = kq_ext_reduce<NX>(kq_ext_row_partial_h<Codec, NX>(
+      w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts));
+  if (tx == 0) {
+    out[out_row] = static_cast<T>(r);
+  }
+}
+
+template <
+    typename T,
+    typename Codec,
+    typename SCodec,
+    int ACT,
+    int NX = KQ_EXT_NXPSG>
+[[kernel]] void kq_ext_moe_glu_gather_shexp_h(
+    const device uint8_t* gw [[buffer(0)]],
+    const device uint8_t* uw [[buffer(1)]],
+    const device uint8_t* sgw [[buffer(2)]],
+    const device uint8_t* suw [[buffer(3)]],
+    const device T* x [[buffer(4)]],
+    const device uint32_t* indices [[buffer(5)]],
+    device T* out [[buffer(6)]],
+    const constant int& K [[buffer(7)]],
+    const constant int& N [[buffer(8)]],
+    const constant float& limit [[buffer(9)]],
+    threadgroup half4* xs [[threadgroup(0)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int RPS = 32 / NX;
+  const short tx = short(simd_lid % NX);
+  const short ty = short(simd_lid / NX);
+  const int n_route = tpg.y - 1;
+  const bool shared_slot = int(tid.y) == n_route;
+  const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
+  const ushort lin = ushort(simd_gid * 32 + simd_lid);
+  const ushort nth = ushort(32 * tptg.y);
+
+  x += (int64_t)tid.z * K;
+  out += ((int64_t)tid.z * tpg.y + tid.y) * N;
+
+  KQ_EXT_STAGE_LUTS_H(Codec, kq_luts)
+  KQ_EXT_STAGE_LUTS(SCodec, kq_sluts)
+  float2 gu;
+  if (shared_slot) {
+    // Shared expert: float path, device activations (numerics unchanged).
+    gu = kq_ext_glu_row_partial<T, SCodec, NX>(
+        sgw, suw, x, (int64_t)out_row, K, tx, kq_sluts);
+  } else {
+    kq_ext_stage_xh<T>(xs, x, K, lin, nth);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int expert = int(indices[tid.z * n_route + tid.y]);
+    gu = kq_ext_glu_row_partial_h<Codec, NX>(
+        gw, uw, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
+  }
+  const float g = kq_ext_reduce<NX>(gu.x);
+  const float u = kq_ext_reduce<NX>(gu.y);
+  if (tx == 0) {
+    out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
+  }
+}
+
+// Score-mixed down gather with the shared-expert slot folded in: the routed
+// slots restage their h row per slot (two barriers each) and dot in half;
+// the shared slot stays on the float path.
+template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
+[[kernel]] void kq_ext_gather_qmv_mix_h(
+    const device uint8_t* w [[buffer(0)]],
+    const device uint8_t* sw [[buffer(1)]],
+    const device T* h [[buffer(2)]],
+    const device uint32_t* indices [[buffer(3)]],
+    const device float* scores [[buffer(4)]],
+    device T* out [[buffer(5)]],
+    const constant int& K [[buffer(6)]],
+    const constant int& N [[buffer(7)]],
+    const constant int& S [[buffer(8)]],
+    const constant int& SC [[buffer(9)]],
+    threadgroup half4* xs [[threadgroup(0)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int RPS = 32 / NX;
+  const short tx = short(simd_lid % NX);
+  const short ty = short(simd_lid / NX);
+  const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
+  const ushort lin = ushort(simd_gid * 32 + simd_lid);
+  const ushort nth = ushort(32 * tptg.y);
+
+  KQ_EXT_STAGE_LUTS_H(Codec, kq_luts)
+  KQ_EXT_STAGE_LUTS(SCodec, kq_sluts)
+  float result = 0.0f;
+  for (int slot = 0; slot < S - 1; slot++) {
+    const int expert = int(indices[tid.z * (S - 1) + slot]);
+    const device T* hs = h + ((int64_t)tid.z * S + slot) * K;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    kq_ext_stage_xh<T>(xs, hs, K, lin, nth);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    result += scores[tid.z * SC + slot] *
+        kq_ext_row_partial_h<Codec, NX>(
+                  w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
+  }
+  {
+    const device T* hs = h + ((int64_t)tid.z * S + (S - 1)) * K;
+    result += (SC == S ? scores[tid.z * SC + (S - 1)] : 1.0f) *
+        kq_ext_row_partial<T, SCodec, NX>(
+                  sw, hs, (int64_t)out_row, K, tx, kq_sluts);
+  }
+  result = kq_ext_reduce<NX>(result);
+  if (tx == 0) {
+    out[(int64_t)tid.z * N + out_row] = static_cast<T>(result);
+  }
+}

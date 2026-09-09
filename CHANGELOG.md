@@ -6,6 +6,15 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `KQ_MOE_HALF=1` (default off) switches the iq2_xs, iq2_xxs and iq3_xxs
+  fused MoE decode gathers (gate/up, shexp, qmv, score mix) to half-dot
+  kernels: the grid stages as half4 pairs, the activation row is staged as
+  half per threadgroup, and the chunk dots run in half with a float sum per
+  chunk. Shared-expert slots keep the float path. Outputs differ from the
+  float kernels at half rounding level (about 1e-3 relative on the fused
+  GLU output).
+
 ### Changed
 - Sorted MoE prefill on NAX GPUs runs `gather_qmm_seg` on a NAX tile kernel
   over the expert tile map (one weight dequant and one MMA pass per 64-row

@@ -183,6 +183,50 @@ inline std::string kq_gather_stem_nx(const std::string& t, int K, int nx) {
 // at NX = 8, so a forced KQ_MOE_NX=16/32 wins. KQ_GATHER_FINE=1/0 forces
 // fine/coarse; read live once set (KQ_MOE_NX pattern above) so interleaved
 // in-process A/Bs can flip arms.
+// Half-dot Ext gathers (KQ_MOE_HALF=1, default off): the grid codecs whose
+// float decode is ALU-bound at decode widths (iq2_xs, iq2_xxs, iq3_xxs) run
+// the "_h" kernels, which stage the grid as half4 pairs, stage the
+// activation row as half in dynamic threadgroup memory (K halves), and dot
+// in half with a float sum per 16-weight chunk. Expert slots only; shared
+// experts keep the float path. Read live once set (KQ_MOE_NX pattern) so
+// interleaved in-process A/Bs can flip arms. K is capped so the staged row
+// plus the largest half table (iq2_xs, 8.3 KB) stays inside the 32 KB
+// threadgroup budget.
+inline bool kq_moe_half(const std::string& codec, int K) {
+  static const bool has_env = std::getenv("KQ_MOE_HALF") != nullptr;
+  if (!has_env) {
+    return false;
+  }
+  const char* e = std::getenv("KQ_MOE_HALF");
+  if (e == nullptr || std::atoi(e) != 1) {
+    return false;
+  }
+  if (K > 8192 || K % 16 != 0) {
+    return false;
+  }
+  return codec == "iq2_xs" || codec == "iq2_xxs" || codec == "iq3_xxs";
+}
+
+// Simdgroups per threadgroup for the half-dot kernels: the staged
+// activation row (K halves) and the half grid are amortized over the
+// threadgroup's rows, so every codec runs at 8 (KQ_MOE_SG still overrides).
+inline int kq_moe_pick_sg_h(int N, int nx) {
+  const int rps = 32 / nx;
+  int sg = 8;
+  static const bool has_env = std::getenv("KQ_MOE_SG") != nullptr;
+  if (has_env) {
+    const char* e = std::getenv("KQ_MOE_SG");
+    const int v = e == nullptr ? 0 : std::atoi(e);
+    if (v == 2 || v == 4 || v == 8) {
+      sg = v;
+    }
+  }
+  while (sg > 2 && N % (sg * rps) != 0) {
+    sg /= 2;
+  }
+  return sg;
+}
+
 inline bool kq_gather_fine(int64_t coarse_tgs) {
   static const bool has_env = std::getenv("KQ_GATHER_FINE") != nullptr;
   if (has_env) {
@@ -350,15 +394,22 @@ void KQuantMoEGLUKQ::eval_gpu(
   int N = gw.shape(1);
   int K = x.shape(-1);
 
-  const int nx = kq_moe_pick_nx((int64_t)N * R * T, K, true);
+  const bool use_half = !biased && kq_moe_half(kquant_type_, K);
+  int nx = kq_moe_pick_nx((int64_t)N * R * T, K, true);
+  if (use_half && nx > 16) {
+    nx = 16;
+  }
   const std::string stem = kq_gather_stem_nx(kquant_type_, K, nx);
   std::string kname = "kq_" + stem + "_moe_glu_gather_" +
-      (biased ? "bias_" : "") + act_ + kq_nx_suffix(nx) + "_" +
-      kq_type_string(x.dtype());
+      (biased ? "bias_" : "") + (use_half ? "h_" : "") + act_ +
+      kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
   kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
+  if (use_half) {
+    ce.set_threadgroup_memory_length((size_t)K * sizeof(uint16_t), 0);
+  }
   ce.set_input_array(gw, 0);
   ce.set_input_array(uw, 1);
   if (biased) {
@@ -381,7 +432,8 @@ void KQuantMoEGLUKQ::eval_gpu(
   }
   // Tuned q6_k/q8_0 kernels (nx 8) are fixed at 2 simdgroups.
   const bool tuned = stem == "q6_k" || stem == "q8_0";
-  const int sg = tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx);
+  const int sg = use_half ? kq_moe_pick_sg_h(N, nx)
+                          : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx));
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / (sg * 32 / nx), R, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -407,7 +459,11 @@ void KQuantGatherQMVKQ::eval_gpu(
   int N = w.shape(1);
   int K = x.shape(-1);
 
-  const int nx = kq_moe_pick_nx((int64_t)N * R * T, K, false);
+  const bool use_half = !biased && kq_moe_half(kquant_type_, K);
+  int nx = kq_moe_pick_nx((int64_t)N * R * T, K, false);
+  if (use_half && nx > 16) {
+    nx = 16;
+  }
   const std::string stem = kq_gather_stem_nx(kquant_type_, K, nx);
   // Fine tiling is instantiated only on the tuned q6_k/q8_0 kernels; the Ext
   // equivalents (2x and 4x threadgroup variants) measured E2E-neutral and
@@ -416,11 +472,15 @@ void KQuantGatherQMVKQ::eval_gpu(
   const bool fine =
       tuned && !biased && nx == 8 && kq_gather_fine((int64_t)(N / 8) * R * T);
   std::string kname = "kq_" + stem + "_gather_qmv" + (biased ? "_bias" : "") +
-      (fine ? "_fine" : kq_nx_suffix(nx)) + "_" + kq_type_string(x.dtype());
+      (use_half ? "_h" : "") + (fine ? "_fine" : kq_nx_suffix(nx)) + "_" +
+      kq_type_string(x.dtype());
   kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
+  if (use_half) {
+    ce.set_threadgroup_memory_length((size_t)K * sizeof(uint16_t), 0);
+  }
   ce.set_input_array(w, 0);
   if (biased) {
     ce.set_input_array(inputs[1], 1);
@@ -436,7 +496,8 @@ void KQuantGatherQMVKQ::eval_gpu(
     ce.set_bytes(K, 4);
     ce.set_bytes(N, 5);
   }
-  const int sg = tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx);
+  const int sg = use_half ? kq_moe_pick_sg_h(N, nx)
+                          : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx));
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / (fine ? 2 : (sg * 32 / nx)), R, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -473,17 +534,28 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   int N = gw.shape(1);
   int K = x.shape(-1);
 
-  // Mixed shexp codecs dispatch the generic "_sx_" instantiations.
-  const int nx = kq_moe_pick_nx((int64_t)N * (R + 1) * T, K, true);
+  // Mixed shexp codecs dispatch the generic "_sx_" instantiations. The
+  // half-dot pick keys on the expert codec; the shared slot stays float.
+  const bool use_half = kq_moe_half(kquant_type_, K) &&
+      (shexp_type_ == kquant_type_ || shexp_type_ == "q5_k" ||
+       shexp_type_ == "q6_k" || shexp_type_ == "q8_0");
+  int nx = kq_moe_pick_nx((int64_t)N * (R + 1) * T, K, true);
+  if (use_half && nx > 16) {
+    nx = 16;
+  }
   const std::string stem = shexp_type_ == kquant_type_
       ? kq_gather_stem_nx(kquant_type_, K, nx)
       : kquant_type_ + "_sx_" + shexp_type_;
-  std::string kname = "kq_" + stem + "_moe_glu_gather_shexp_" + act_ +
-      kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
+  std::string kname = "kq_" + stem + "_moe_glu_gather_shexp_" +
+      (use_half ? "h_" : "") + act_ + kq_nx_suffix(nx) + "_" +
+      kq_type_string(x.dtype());
   kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
+  if (use_half) {
+    ce.set_threadgroup_memory_length((size_t)K * sizeof(uint16_t), 0);
+  }
   ce.set_input_array(gw, 0);
   ce.set_input_array(uw, 1);
   ce.set_input_array(sgw, 2);
@@ -498,7 +570,8 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   const float limit = 0.0f;
   ce.set_bytes(limit, 9);
   const bool tuned = stem == "q6_k" || stem == "q8_0";
-  const int sg = tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx);
+  const int sg = use_half ? kq_moe_pick_sg_h(N, nx)
+                          : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx));
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / (sg * 32 / nx), R + 1, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -525,8 +598,14 @@ void KQuantGatherQMVMixKQ::eval_gpu(
 
   // Same codec-keyed widening as mix_ns (the shexp-slot mix has no
   // slot-parallel form; its nx8 launch is the mix_ns non-sp baseline).
-  const int nx =
+  const bool use_half = kq_moe_half(kquant_type_, K) &&
+      (shexp_type_ == kquant_type_ || shexp_type_ == "q5_k" ||
+       shexp_type_ == "q6_k" || shexp_type_ == "q8_0");
+  int nx =
       kq_moe_pick_nx((int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, T, K));
+  if (use_half && nx > 16) {
+    nx = 16;
+  }
   const std::string stem = shexp_type_ == kquant_type_
       ? kq_gather_stem_nx(kquant_type_, K, nx)
       : kquant_type_ + "_sx_" + shexp_type_;
@@ -534,11 +613,15 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   const bool tuned = stem == "q6_k" || stem == "q8_0";
   const bool fine = tuned && nx == 8 && kq_gather_fine((int64_t)(N / 8) * T);
   std::string kname = "kq_" + stem + "_gather_qmv_mix" +
-      (fine ? "_fine" : kq_nx_suffix(nx)) + "_" + kq_type_string(x.dtype());
+      (use_half ? "_h" : "") + (fine ? "_fine" : kq_nx_suffix(nx)) + "_" +
+      kq_type_string(x.dtype());
   kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
+  if (use_half) {
+    ce.set_threadgroup_memory_length((size_t)K * sizeof(uint16_t), 0);
+  }
   ce.set_input_array(w, 0);
   ce.set_input_array(sw, 1);
   ce.set_input_array(x, 2);
@@ -550,7 +633,8 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   ce.set_bytes(S, 8);
   const int SC = scores.shape(1);
   ce.set_bytes(SC, 9);
-  const int sg = tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx);
+  const int sg = use_half ? kq_moe_pick_sg_h(N, nx)
+                          : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx));
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / (fine ? 2 : (sg * 32 / nx)), 1, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);

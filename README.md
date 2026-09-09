@@ -280,6 +280,10 @@ All optional; the defaults are right for normal use.
   call. A/B lever.
 - `KQ_DISABLE_GATHER_SEG_NAX=1` - run `gather_qmm_seg` on its steel simdgroup-mma kernel even where
   the NAX tile kernel is available. Read once per process. A/B lever.
+- `KQ_MOE_HALF=1` - on Metal, run the iq2_xs, iq2_xxs and iq3_xxs fused MoE decode gathers on the
+  half-dot kernels (half grid tables, half-staged activations, half chunk dots with a float sum per
+  chunk; shared-expert slots stay on the float path). Read per call. Default off: the outputs differ
+  from the float kernels at half rounding level. A/B lever.
 
 The model-specific kernels carry their own tuning levers, documented alongside each kernel in
 [docs/kernels.md](https://github.com/asher/mlx-kquant/blob/main/docs/kernels.md).

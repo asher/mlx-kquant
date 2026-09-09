@@ -5152,3 +5152,175 @@ struct KqTgLuts<KqIq2_sExt> {
     }
   }
 };
+
+// ---------------------------------------------------------------------------
+// Half-dot decode tables (KQ_MOE_HALF): the grid codecs' 8-bit magnitude
+// entries pre-expanded to half4 pairs in threadgroup memory, so the chunk
+// dequant is a table read plus a sign select in half and the dot runs in
+// half against a half-staged activation row. Specialized for the codecs
+// where the float path is ALU-bound at decode (iq2_xs, iq2_xxs, iq3_xxs);
+// every other codec reports has_half = false and never reaches these
+// kernels (host gate). deq_chunk16h mirrors deq_chunk16s: 16 unscaled
+// weights in natural order plus the chunk scale, applied by the caller in
+// float once per chunk.
+// ---------------------------------------------------------------------------
+
+// Negates lane j of a half4 where bit j of s (low 4 bits) is set.
+METAL_FUNC half4 kq_grid_sign4h(half4 v, uint s) {
+  return select(v, -v, bool4(s & 1, s & 2, s & 4, s & 8));
+}
+
+template <typename Codec>
+struct KqTgLutsH {
+  MLX_MTL_CONST bool has_half = false;
+  MLX_MTL_CONST int bytes = 0;
+  static METAL_FUNC void stage(threadgroup uint8_t*, ushort, ushort) {}
+  static METAL_FUNC void deq_chunk16h(
+      const device uint8_t*,
+      short,
+      thread half4x4& reg,
+      const threadgroup uint8_t*,
+      thread float& scale) {
+    reg = half4x4(half4(0.0h), half4(0.0h), half4(0.0h), half4(0.0h));
+    scale = 0.0f;
+  }
+};
+
+template <>
+struct KqTgLutsH<KqIq2_xsExt> {
+  MLX_MTL_CONST bool has_half = true;
+  MLX_MTL_CONST int bytes = 8192 + 128; // half4 grid[512][2] | ksigns[128]
+  static METAL_FUNC void
+  stage(threadgroup uint8_t* dst, ushort lin, ushort n_threads) {
+    threadgroup half4* gh = reinterpret_cast<threadgroup half4*>(dst);
+    const constant uint32_t* grid32 =
+        reinterpret_cast<const constant uint32_t*>(iq2xs_grid);
+    for (int i = lin; i < 1024; i += n_threads) {
+      gh[i] = half4(as_type<uchar4>(grid32[i]));
+    }
+    threadgroup uint32_t* d32 =
+        reinterpret_cast<threadgroup uint32_t*>(dst + 8192);
+    const constant uint32_t* signs32 =
+        reinterpret_cast<const constant uint32_t*>(ksigns_iq2xs);
+    for (int i = lin; i < 32; i += n_threads) {
+      d32[i] = signs32[i];
+    }
+  }
+  static METAL_FUNC void deq_chunk16h(
+      const device uint8_t* block,
+      short il,
+      thread half4x4& reg,
+      const threadgroup uint8_t* luts,
+      thread float& scale) {
+    const threadgroup half4* gh =
+        reinterpret_cast<const threadgroup half4*>(luts);
+    const threadgroup uint8_t* ksigns = luts + 8192;
+    const int ib32 = il / 2;
+    const int lbase = (il & 1) * 2;
+    const float d = float(*(const device half*)block);
+    const uint8_t sc = block[KQ_IQ2_XS_SCALES_OFFSET + ib32];
+    const int sc_nib = (lbase < 2) ? (sc & 0xf) : (sc >> 4);
+    scale = d * (0.5f + float(sc_nib)) * 0.25f;
+    const device uint16_t* qp = reinterpret_cast<const device uint16_t*>(
+        block + KQ_IQ2_XS_QS_OFFSET + ib32 * 8);
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+      const uint q = uint(qp[lbase + t]);
+      const uint s = uint(ksigns[q >> 9]);
+      reg[2 * t] = kq_grid_sign4h(gh[(q & 511) * 2], s);
+      reg[2 * t + 1] = kq_grid_sign4h(gh[(q & 511) * 2 + 1], s >> 4);
+    }
+  }
+};
+
+template <>
+struct KqTgLutsH<KqIq2_xxsExt> {
+  MLX_MTL_CONST bool has_half = true;
+  MLX_MTL_CONST int bytes = 4096 + 128; // half4 grid[256][2] | ksigns[128]
+  static METAL_FUNC void
+  stage(threadgroup uint8_t* dst, ushort lin, ushort n_threads) {
+    threadgroup half4* gh = reinterpret_cast<threadgroup half4*>(dst);
+    const constant uint32_t* grid32 =
+        reinterpret_cast<const constant uint32_t*>(iq2xxs_grid);
+    for (int i = lin; i < 512; i += n_threads) {
+      gh[i] = half4(as_type<uchar4>(grid32[i]));
+    }
+    threadgroup uint32_t* d32 =
+        reinterpret_cast<threadgroup uint32_t*>(dst + 4096);
+    const constant uint32_t* signs32 =
+        reinterpret_cast<const constant uint32_t*>(ksigns_iq2xs);
+    for (int i = lin; i < 32; i += n_threads) {
+      d32[i] = signs32[i];
+    }
+  }
+  static METAL_FUNC void deq_chunk16h(
+      const device uint8_t* block,
+      short il,
+      thread half4x4& reg,
+      const threadgroup uint8_t* luts,
+      thread float& scale) {
+    const threadgroup half4* gh =
+        reinterpret_cast<const threadgroup half4*>(luts);
+    const threadgroup uint8_t* ksigns = luts + 4096;
+    const int ib32 = il / 2;
+    const int lbase = (il & 1) * 2;
+    const float d = float(*(const device half*)block);
+    const device uint8_t* qs = block + KQ_IQ2_XXS_QS_OFFSET + ib32 * 8;
+    const device uint16_t* qs16 = reinterpret_cast<const device uint16_t*>(qs);
+    const uint32_t signbits = uint32_t(qs16[2]) | (uint32_t(qs16[3]) << 16);
+    scale = d * (0.5f + float(signbits >> 28)) * 0.25f;
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+      const int l = lbase + t;
+      const uint q = uint(qs[l]);
+      const uint s = uint(ksigns[(signbits >> (7 * l)) & 127]);
+      reg[2 * t] = kq_grid_sign4h(gh[q * 2], s);
+      reg[2 * t + 1] = kq_grid_sign4h(gh[q * 2 + 1], s >> 4);
+    }
+  }
+};
+
+template <>
+struct KqTgLutsH<KqIq3_xxsExt> {
+  MLX_MTL_CONST bool has_half = true;
+  MLX_MTL_CONST int bytes = 2048 + 128; // half4 grid[256] | ksigns[128]
+  static METAL_FUNC void
+  stage(threadgroup uint8_t* dst, ushort lin, ushort n_threads) {
+    threadgroup half4* gh = reinterpret_cast<threadgroup half4*>(dst);
+    for (int i = lin; i < 256; i += n_threads) {
+      gh[i] = half4(as_type<uchar4>(iq3xxs_grid[i]));
+    }
+    threadgroup uint32_t* d32 =
+        reinterpret_cast<threadgroup uint32_t*>(dst + 2048);
+    const constant uint32_t* signs32 =
+        reinterpret_cast<const constant uint32_t*>(ksigns_iq2xs);
+    for (int i = lin; i < 32; i += n_threads) {
+      d32[i] = signs32[i];
+    }
+  }
+  static METAL_FUNC void deq_chunk16h(
+      const device uint8_t* block,
+      short il,
+      thread half4x4& reg,
+      const threadgroup uint8_t* luts,
+      thread float& scale) {
+    const threadgroup half4* gh =
+        reinterpret_cast<const threadgroup half4*>(luts);
+    const threadgroup uint8_t* ksigns = luts + 2048;
+    const int ib32 = il / 2;
+    const int lbase = (il & 1) * 2;
+    const float d = float(*(const device half*)block);
+    const device uint8_t* qs = block + KQ_IQ3_XXS_QS_OFFSET + ib32 * 8;
+    const device uint16_t* gas = reinterpret_cast<const device uint16_t*>(
+        block + KQ_IQ3_XXS_GAS_OFFSET + ib32 * 4);
+    const uint32_t aux32 = uint32_t(gas[0]) | (uint32_t(gas[1]) << 16);
+    scale = d * (0.5f + float(aux32 >> 28)) * 0.5f;
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+      const int l = lbase + t;
+      const uint s = uint(ksigns[(aux32 >> (7 * l)) & 127]);
+      reg[2 * t] = kq_grid_sign4h(gh[qs[2 * l]], s);
+      reg[2 * t + 1] = kq_grid_sign4h(gh[qs[2 * l + 1]], s >> 4);
+    }
+  }
+};

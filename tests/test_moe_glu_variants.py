@@ -145,3 +145,68 @@ def test_sg_bit_identical(codec, sg, tmp_path):
     for key in ("mix", "glu"):
         a, b = outs["base"][key], outs["variant"][key]
         assert np.array_equal(a, b), f"{codec} {key} sg={sg} not bit-identical"
+
+
+_HALF_SNIPPET = r"""
+import json
+import sys
+sys.path.insert(0, sys.argv[1])
+import mlx.core as mx
+import test_moe_glu as tm
+
+codec, sx, dtype = sys.argv[2], sys.argv[3] or None, getattr(mx, sys.argv[4])
+res = tm._check_codec(codec, sx=sx, dtype=dtype)
+print("RESULT " + json.dumps(
+    None if res is None else [(n, float(r), bool(o)) for n, r, o in res]))
+"""
+
+# Half dots round each 4-wide product sum to half before the float chunk
+# accumulate; the fused outputs land near 1e-3 relative to the f32
+# reference against the 2e-3 bound of the float kernels.
+HALF_REL_BOUND = 6e-3
+
+
+@pytest.mark.parametrize("codec", ["iq2_xs", "iq2_xxs", "iq3_xxs"])
+@pytest.mark.parametrize("sx", ["", "q6_k"])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_half_dot_dispatch_and_accuracy(codec, sx, dtype):
+    """KQ_MOE_HALF=1 routes the grid codecs' glu / qmv / shexp / mix gathers
+    to the "_h" kernels (mix_ns has no half form and stays on the float
+    kernel) and every op stays within the half-dot bound of the f32
+    reference."""
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    r = subprocess.run(
+        [sys.executable, "-c", _HALF_SNIPPET, tests_dir, codec, sx, dtype],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "KQ_MOE_HALF": "1", "KQ_MOE_NX_LOG": "1"},
+    )
+    line = [l for l in r.stdout.splitlines() if l.startswith("RESULT ")]
+    assert line, r.stdout + r.stderr
+    import json
+
+    res = json.loads(line[-1][len("RESULT ") :])
+    if res is None:
+        pytest.skip(f"{sx or codec} fixture missing")
+    names = r.stderr
+    stem = codec if not sx else f"{codec}_sx_{sx}"
+    for op in (
+        "_moe_glu_gather_h_",
+        "_gather_qmv_h",
+        "_moe_glu_gather_shexp_h_",
+        "_gather_qmv_mix_h",
+    ):
+        want = (
+            f"kq_{codec}{op}"
+            if op in ("_moe_glu_gather_h_", "_gather_qmv_h")
+            else f"kq_{stem}{op}"
+        )
+        assert want in names, (want, names)
+    assert f"kq_{codec}_gather_qmv_mix_ns" in names and "mix_ns_h" not in names, names
+    for name, rel, ok in res:
+        bound = HALF_REL_BOUND if name in ("glu", "qmv", "shexp", "mix") else None
+        if bound is None:
+            assert ok, (name, rel)
+        else:
+            assert rel < bound, (name, rel)
