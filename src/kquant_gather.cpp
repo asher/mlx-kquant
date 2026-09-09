@@ -1064,6 +1064,51 @@ void KQuantGatherQMMSeg::eval_gpu(
   bool aligned = N % bn == 0;
   auto& ce = mx::metal::get_command_encoder(s);
 
+  // NAX variant: one dequant + one MMA pass per expert-major tile (the
+  // steel simdgroup-MMA kernel below is the pre-NAX fallback).
+  // KQ_DISABLE_GATHER_SEG_NAX=1 forces the ALU kernel (A/B lever).
+  static const bool seg_nax_disabled =
+      std::getenv("KQ_DISABLE_GATHER_SEG_NAX") != nullptr;
+  if (!seg_nax_disabled && kq_is_nax_available() && (K % 64 == 0) &&
+      (x.dtype() != mx::float32) && codec_has_nax(kquant_type_)) {
+    const bool align_N = aligned;
+    const bool align_K = true;
+    std::string nname;
+    nname.reserve(96);
+    mx::concatenate(
+        nname,
+        kq_kname_prefix(kquant_type_) + "gather_qmm_seg_nax_",
+        kq_type_string(x.dtype()),
+        "_gs_",
+        group_size_,
+        "_b_",
+        bits_,
+        "_bm_64_bn_64_bk_64_wm_2_wn_2");
+    mx::metal::MTLFCList func_consts = {
+        {&align_N, MTL::DataType::DataTypeBool, 201},
+        {&align_K, MTL::DataType::DataTypeBool, 202},
+    };
+    std::string hash_name;
+    hash_name.reserve(128);
+    mx::concatenate(
+        hash_name, nname, "_align_N_", align_N ? 't' : 'n', "_align_K_t");
+    auto kernel = kq_get_kernel(d, nname, hash_name, func_consts);
+    ce.set_compute_pipeline_state(kernel);
+    int c = 0;
+    ce.set_input_array(x, c++);
+    ce.set_input_array(w, c++);
+    ce.set_input_array(scales, c++);
+    ce.set_input_array(map, c++);
+    ce.set_input_array(counts, c++);
+    ce.set_output_array(out, c++);
+    ce.set_bytes(N, c++);
+    ce.set_bytes(K, c++);
+    MTL::Size group_dims(32, 2, 2);
+    MTL::Size grid_dims((N + bn - 1) / bn, map.shape(0), 1);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+    return;
+  }
+
   std::string kname;
   kname.reserve(96);
   mx::concatenate(

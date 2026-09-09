@@ -3848,5 +3848,254 @@ KQ_NAX_DEFINE_GATHER_RHS(q6_k, 256, 6, KqNaxQ6_KBlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(q3_k, 256, 3, KqNaxQ3_KBlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
 
+// Expert-major sorted gather GEMM on NAX: one threadgroup per (N tile, map
+// tile), where seg_map rows are (expert, row_start, num_rows <= BM) built by
+// expert_tile_map over the sorted routing. Unlike gather_qmm_rhs_nax, whose
+// fixed 64-row tiles straddle expert boundaries and pay a full Ws dequant +
+// MMA K-walk per segment they touch, every tile here holds rows of ONE
+// expert, so the weight slab is dequantized once per tile and the MMA
+// runs once; a partial last tile skips the simdgroup bands past num_rows.
+// x rows and y rows are the sorted layout (row_start offsets), w is indexed
+// by expert. Transpose-only, K % BK == 0 or the align_K tail path, N tail
+// via align_N.
+template <
+    typename T,
+    typename LoaderW,
+    int BM = 64,
+    int BN = 64,
+    int BK = 64,
+    int WM = 2,
+    int WN = 2>
+METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
+    const device T* x,
+    const device uint8_t* w,
+    const device uint32_t* seg_map,
+    device T* y,
+    const constant int& N,
+    const constant int& K,
+    threadgroup T* Ws,
+    uint3 tid,
+    uint simd_group_id,
+    uint simd_lane_id) {
+  static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
+  static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
+
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  const device uint32_t* seg = seg_map + 3 * tid.y;
+  const uint32_t expert = seg[0];
+  const size_t row0 = size_t(seg[1]);
+  const int num_rows = int(seg[2]);
+
+  const int K_w = (K / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
+  const int K_it = K / BK;
+  const size_t stride_w = size_t(N) * K_w;
+  const int y_col = tid.x * BN;
+  const size_t y_col_long = size_t(y_col);
+
+  const short tgp_bn = align_N ? BN : short(min(BN, N - y_col));
+
+  const int k_remain = K - K_it * BK;
+  const short2 tile_w = short2(k_remain, tgp_bn);
+
+  x += row0 * static_cast<size_t>(K);
+  y += row0 * static_cast<size_t>(N) + y_col_long;
+  const device uint8_t* wl = w + size_t(expert) * stride_w + y_col_long * K_w;
+
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+
+  const short tm = SM * (simd_group_id / WN);
+  const short tn = SN * (simd_group_id % WN);
+
+  // Rows this simdgroup's band owns; bands past num_rows do no MMA and no
+  // store. The barriers and the cooperative Ws dequant stay TG-uniform.
+  const short sgp_sm = short(min(int(SM), max(0, num_rows - int(tm))));
+  const short sgp_sn =
+      align_N ? SN : short(min(int(SN), max(0, (N - (y_col + tn)))));
+  const bool sg_active = sgp_sm > 0;
+  const bool is_unaligned_sm = (sgp_sm != SM);
+  const bool is_unaligned_bn = align_N ? false : (tgp_bn != BN);
+
+  constexpr short BR = TN;
+  constexpr short BC = TK;
+
+  using AccumType = float;
+
+  NAXTile<AccumType, TM, TN> Dtile;
+  Dtile.clear();
+
+  const device T* xn = x + tm * K;
+
+  thread LoaderW loader_w(wl, K, Ws, simd_group_id, simd_lane_id, 0);
+
+  dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
+    dispatch_bool(align_N || !is_unaligned_bn, [&](auto kAlignedN) {
+      for (int k = 0; k < K_it; k++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (kAlignedN.value) {
+          loader_w.load_unsafe();
+        } else {
+          loader_w.load_safe(short2(BK, tgp_bn));
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg_active) {
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, BR, BC> Btile;
+
+            // Prevents the Metal compiler from reordering loads across
+            // iterations.
+            volatile int compiler_barrier;
+
+            if constexpr (kAlignedM.value) {
+              Atile.load(xn + kk1, K);
+            } else {
+              Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+            }
+
+            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<true>{});
+
+            (void)compiler_barrier;
+          }
+        }
+
+        xn += BK;
+        loader_w.next();
+      }
+
+      if (!align_K) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_w.load_safe(tile_w);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg_active) {
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, BR, BC> Btile;
+
+            volatile int compiler_barrier;
+
+            const short psk = min(int(SK), max(0, (BK - kk1)));
+            Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
+
+            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<true>{});
+
+            (void)compiler_barrier;
+          }
+        }
+      }
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      if (sg_active) {
+        if constexpr (kAlignedN.value) {
+          if constexpr (kAlignedM.value) {
+            Dtile.store(y + tm * N + tn, N);
+          } else {
+            Dtile.store_slice(
+                y + tm * N + tn, N, short2(0, 0), short2(SN, sgp_sm));
+          }
+        } else {
+          Dtile.store_slice(
+              y + tm * N + tn, N, short2(0, 0), short2(sgp_sn, sgp_sm));
+        }
+      }
+    });
+  });
+}
+
+#define KQ_NAX_DEFINE_GATHER_SEG(codec, GROUP_CONST, bits_val, LOADER)         \
+  template <                                                                   \
+      typename T,                                                              \
+      int group_size,                                                          \
+      int bits,                                                                \
+      int BM,                                                                  \
+      int BN,                                                                  \
+      int BK,                                                                  \
+      int WM,                                                                  \
+      int WN>                                                                  \
+  [[kernel]] void kq_##codec##_gather_qmm_seg_nax(                             \
+      const device T* x [[buffer(0)]],                                         \
+      const device uint8_t* w [[buffer(1)]],                                   \
+      const device uint8_t* scales [[buffer(2)]],                              \
+      const device uint32_t* seg_map [[buffer(3)]],                            \
+      const device uint32_t* tile_count [[buffer(4)]],                         \
+      device T* y [[buffer(5)]],                                               \
+      const constant int& N [[buffer(6)]],                                     \
+      const constant int& K [[buffer(7)]],                                     \
+      uint3 tid [[threadgroup_position_in_grid]],                              \
+      uint simd_group_id [[simdgroup_index_in_threadgroup]],                   \
+      uint simd_lane_id [[thread_index_in_simdgroup]]) {                       \
+    (void)scales; /* wire-format blocks are self-scaled; no separate scales */ \
+    static_assert(                                                             \
+        group_size == GROUP_CONST,                                             \
+        #codec " NAX kernel requires group_size=" #GROUP_CONST);               \
+    static_assert(                                                             \
+        bits == bits_val, #codec " NAX kernel requires bits=" #bits_val);      \
+    /* Shape-only upper bound on the map: tiles past the count exit as a       \
+       whole threadgroup before any barrier. */                                \
+    if (tid.y >= tile_count[0]) {                                              \
+      return;                                                                  \
+    }                                                                          \
+    constexpr int BK_padded = (BK + 16 / sizeof(T));                           \
+    threadgroup T Ws[BN * BK_padded];                                          \
+    using LoaderW = LOADER<                                                    \
+        T,                                                                     \
+        BN,                                                                    \
+        BK,                                                                    \
+        BK_padded,                                                             \
+        /*reduction_dim=*/1,                                                   \
+        /*tgp_size=*/WM * WN * SIMD_SIZE>;                                     \
+    kq_gather_qmm_seg_nax_tgp_impl<T, LoaderW, BM, BN, BK, WM, WN>(            \
+        x, w, seg_map, y, N, K, Ws, tid, simd_group_id, simd_lane_id);         \
+  }
+
+KQ_NAX_DEFINE_GATHER_SEG(q8_0, 32, 8, KqNaxQ8_0BlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(q5_1, 32, 5, KqNaxQ5_1BlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(iq4_nl, 32, 4, KqNaxIq4_nlBlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(iq4_xs, 256, 4, KqNaxIq4_xsBlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(iq3_xxs, 256, 3, KqNaxIq3_xxsBlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(iq3_s, 256, 3, KqNaxIq3_sBlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(iq2_xxs, 256, 2, KqNaxIq2_xxsBlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(iq2_xs, 256, 2, KqNaxIq2_xsBlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(iq2_s, 256, 2, KqNaxIq2_sBlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(iq1_s, 256, 1, KqNaxIq1_sBlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(iq1_m, 256, 1, KqNaxIq1_mBlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(stq1_0, 256, 1, KqNaxStq1_0BlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(q4_0, 32, 4, KqNaxQ4_0BlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(q4_1, 32, 4, KqNaxQ4_1BlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(q5_0, 32, 5, KqNaxQ5_0BlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(q4_k, 256, 4, KqNaxQ4_KBlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(q5_k, 256, 5, KqNaxQ5_KBlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(q6_k, 256, 6, KqNaxQ6_KBlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(q3_k, 256, 3, KqNaxQ3_KBlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
+
+#undef KQ_NAX_DEFINE_GATHER_SEG
+
 #undef KQ_NAX_DEFINE_KERNELS
 #undef KQ_NAX_DEFINE_GATHER_RHS

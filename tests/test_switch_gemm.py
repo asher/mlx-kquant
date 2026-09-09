@@ -135,11 +135,16 @@ def test_nax_deferral(monkeypatch):
         sw, "_sorted_expert_gemm", lambda *a: calls.append(1) or orig(*a)
     )
     x, idx = _sorted_inputs(rng, 512, list(range(E)))
-    mx.eval(sw(x, idx, sorted_indices=True))  # NAX leaf reachable: defer
-    assert not calls
-    monkeypatch.setenv("KQ_DISABLE_NAX", "1")  # leaf gone: sorted arm fires
+    # Default on NAX: the sorted arm fires (its seg kernel has a NAX variant).
     mx.eval(sw(x, idx, sorted_indices=True))
     assert len(calls) == 1
+    # KQ_GATHER_SEG_NAX=0 (read live): defer to the rhs leaf while reachable.
+    monkeypatch.setenv("KQ_GATHER_SEG_NAX", "0")
+    mx.eval(sw(x, idx, sorted_indices=True))
+    assert len(calls) == 1
+    monkeypatch.setenv("KQ_DISABLE_NAX", "1")  # leaf gone: sorted arm fires
+    mx.eval(sw(x, idx, sorted_indices=True))
+    assert len(calls) == 2
 
 
 # ------------------------------------------------------- gather_qmm_seg op
@@ -287,6 +292,125 @@ def test_expert_tile_map_matches_host(counts):
     np.testing.assert_array_equal(order(g), order(r))
 
 
+def _nax_ok():
+    import mlx_kquant as kq
+
+    return bool(getattr(kq, "nax_gather_enabled", lambda c: False)("iq2_xs"))
+
+
+@pytest.mark.skipif(
+    bool(os.environ.get("KQUANT_FORCE_CPU")),
+    reason="gather_qmm_seg is Metal-only.",
+)
+@pytest.mark.parametrize("codec", ["iq2_xs", "iq3_xxs", "q4_k", "q8_0"])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_gather_qmm_seg_nax_matches_loop(codec, dtype):
+    """The NAX seg kernel (taken by default on NAX GPUs) matches the
+    per-expert loop on ragged segments: absent experts, partial tiles, and
+    the IQ codecs the prefill gathers run on. Skipped where the NAX variant
+    is unreachable (the ALU kernel is then the only one, covered above)."""
+    import mlx_kquant as kq
+
+    if not _nax_ok():
+        pytest.skip("NAX gather kernels unavailable on this GPU")
+    if codec == "q8_0":
+        rng = np.random.default_rng(11)
+        wf = rng.standard_normal((E, N, K)).astype(np.float32) * 0.1
+        from gguf import GGMLQuantizationType as GT
+        from gguf import quants
+
+        wire = np.stack(
+            [quants.quantize(wf[e], GT.Q8_0).astype(np.uint8) for e in range(E)]
+        )
+        sw = KQuantSwitchLinear(
+            num_experts=E, output_dims=N, input_dims=K, bias=False, codec=codec
+        )
+        sw.weight = mx.array(wire)
+    elif codec in ("iq2_xs", "iq3_xxs"):
+        # Random grid/sign bytes with a finite fp16 superblock scale (a random
+        # scale field is NaN or Inf often enough to poison the norm check).
+        rng = np.random.default_rng(12)
+        from mlx_kquant.codec_geometry import CODEC_GEOMETRY, bytes_per_row
+
+        bpb = CODEC_GEOMETRY[codec][2]
+        wire = rng.integers(0, 256, (E, N, bytes_per_row(codec, K)), dtype=np.uint8)
+        d = np.frombuffer(np.float16(0.01).tobytes(), dtype=np.uint8)
+        for b in range(0, wire.shape[-1], bpb):
+            wire[..., b : b + 2] = d
+        sw = KQuantSwitchLinear(
+            num_experts=E, output_dims=N, input_dims=K, bias=False, codec=codec
+        )
+        sw.weight = mx.array(wire)
+    else:
+        sw = _make_switch(codec)
+    w, s = sw["weight"], sw["scales"]
+    rng = np.random.default_rng(29)
+    counts = np.zeros(E, dtype=np.int64)
+    counts[[0, 1, 2, 3, 4, 5, 7]] = [1, 17, 63, 96, 129, 200, 48]
+    rows = int(counts.sum())
+    x = mx.array((rng.standard_normal((rows, K)) * 0.1).astype(np.float32)).astype(
+        dtype
+    )
+    maps = kq.expert_tile_map(_counts_to_indices(counts), E)
+    got = kq.gather_qmm_seg(x, w, s, sw.kquant_type, *maps)
+    refs, start = [], 0
+    for e in np.flatnonzero(counts):
+        c = int(counts[e])
+        refs.append(
+            kq.quantized_matmul(
+                x[start : start + c], w[e], s, sw.kquant_type, transpose=True
+            )
+        )
+        start += c
+    ref = mx.concatenate(refs)
+    mx.eval(got, ref)
+    assert got.shape == (rows, N) and got.dtype == ref.dtype
+    g = np.array(got.astype(mx.float32))
+    r = np.array(ref.astype(mx.float32))
+    rel = np.linalg.norm(g - r) / (np.linalg.norm(r) + 1e-6)
+    assert rel < 2e-3, f"{codec} {dtype}: rel {rel:.3e}"
+    # Every written row is finite and rows past a partial tile were not
+    # clobbered: the loop reference covers exactly the mapped rows.
+    assert np.isfinite(g).all()
+
+
+@pytest.mark.skipif(
+    bool(os.environ.get("KQUANT_FORCE_CPU")),
+    reason="gather_qmm_seg is Metal-only.",
+)
+def test_gather_qmm_seg_nax_unaligned_n():
+    import mlx_kquant as kq
+
+    if not _nax_ok():
+        pytest.skip("NAX gather kernels unavailable on this GPU")
+    rng = np.random.default_rng(37)
+    n_odd = 72
+    wire = np.stack([_synth_iq2xxs_wire(rng, n_odd) for _ in range(4)], 0)
+    w = mx.array(wire)
+    s = mx.zeros((1,), dtype=mx.uint8)
+    counts = np.array([65, 0, 3, 64], dtype=np.int64)
+    rows = int(counts.sum())
+    x = mx.array((rng.standard_normal((rows, K)) * 0.1).astype(np.float32)).astype(
+        mx.bfloat16
+    )
+    got = kq.gather_qmm_seg(x, w, s, "iq2_xxs", *_tile_maps(counts))
+    refs, start = [], 0
+    for e in np.flatnonzero(counts):
+        c = int(counts[e])
+        refs.append(
+            kq.quantized_matmul(
+                x[start : start + c], w[e], s, "iq2_xxs", transpose=True
+            )
+        )
+        start += c
+    ref = mx.concatenate(refs)
+    mx.eval(got, ref)
+    g = np.array(got.astype(mx.float32))
+    r = np.array(ref.astype(mx.float32))
+    rel = np.linalg.norm(g - r) / (np.linalg.norm(r) + 1e-6)
+    assert got.shape == (rows, n_odd) and rel < 2e-3, f"rel {rel:.3e}"
+
+
 @pytest.mark.skipif(
     bool(os.environ.get("KQUANT_FORCE_CPU")),
     reason="gather_qmm_seg is Metal-only.",
@@ -331,16 +455,16 @@ def test_seg_arm_defers_to_nax_gather(monkeypatch):
     monkeypatch.setattr(
         sw, "_sorted_expert_gemm", lambda *a: calls.append(1) or orig(*a)
     )
-    # NAX leaf reachable -> the sorted arm must defer to gather_qmm
+    # NAX leaf reachable and KQ_GATHER_SEG_NAX=0 -> the sorted arm defers
+    # to gather_qmm (the rhs leaf); by default it takes the seg path.
+    monkeypatch.setenv("KQ_GATHER_SEG_NAX", "0")
     monkeypatch.setattr(
         kqnn.kq, "nax_gather_enabled", lambda codec: True, raising=False
     )
     nax_out = sw(x, idx, sorted_indices=True)
     mx.eval(nax_out)
     assert not calls
-    monkeypatch.setattr(
-        kqnn.kq, "nax_gather_enabled", lambda codec: False, raising=False
-    )
+    monkeypatch.delenv("KQ_GATHER_SEG_NAX")
     seg_out = sw(x, idx, sorted_indices=True)
     mx.eval(seg_out)
     assert len(calls) == 1

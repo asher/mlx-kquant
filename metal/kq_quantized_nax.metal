@@ -303,4 +303,37 @@ instantiate_kquant_nax_codec(iq2_s, 256, 2)
 instantiate_kquant_nax_codec(iq1_s, 256, 1)
 instantiate_kquant_nax_codec(iq1_m, 256, 1)
 instantiate_kquant_nax_codec(stq1_0, 256, 1)
+
+// Expert-major sorted gather GEMM (gather_qmm_seg on NAX): BM=64 matches
+// the 64-row tiles expert_tile_map builds. No float x variant, same
+// reachability argument as the gather rhs macros.
+#define instantiate_kquant_nax_gather_seg(type, gs, bits, codec)             \
+  instantiate_kernel(                                                        \
+      "kquant_" #codec "_gather_qmm_seg_nax_" #type "_gs_" #gs "_b_" #bits  \
+          "_bm_64_bn_64_bk_64_wm_2_wn_2",                                    \
+      kq_ ## codec ## _gather_qmm_seg_nax,                                   \
+      type, gs, bits, 64, 64, 64, 2, 2)
+#define instantiate_kquant_nax_gather_seg_codec(codec, gs, bits)             \
+  instantiate_kquant_nax_gather_seg(float16_t,  gs, bits, codec)            \
+  instantiate_kquant_nax_gather_seg(bfloat16_t, gs, bits, codec)
+instantiate_kquant_nax_gather_seg_codec(q6_k, 256, 6)
+instantiate_kquant_nax_gather_seg_codec(q8_0, 32, 8)
+instantiate_kquant_nax_gather_seg_codec(q4_k, 256, 4)
+instantiate_kquant_nax_gather_seg_codec(q5_k, 256, 5)
+instantiate_kquant_nax_gather_seg_codec(q3_k, 256, 3)
+instantiate_kquant_nax_gather_seg_codec(q2_k, 256, 2)
+instantiate_kquant_nax_gather_seg_codec(q5_1, 32, 5)
+instantiate_kquant_nax_gather_seg_codec(q4_0, 32, 4)
+instantiate_kquant_nax_gather_seg_codec(q4_1, 32, 4)
+instantiate_kquant_nax_gather_seg_codec(q5_0, 32, 5)
+instantiate_kquant_nax_gather_seg_codec(iq4_nl, 32, 4)
+instantiate_kquant_nax_gather_seg_codec(iq4_xs, 256, 4)
+instantiate_kquant_nax_gather_seg_codec(iq3_xxs, 256, 3)
+instantiate_kquant_nax_gather_seg_codec(iq3_s, 256, 3)
+instantiate_kquant_nax_gather_seg_codec(iq2_xxs, 256, 2)
+instantiate_kquant_nax_gather_seg_codec(iq2_xs, 256, 2)
+instantiate_kquant_nax_gather_seg_codec(iq2_s, 256, 2)
+instantiate_kquant_nax_gather_seg_codec(iq1_s, 256, 1)
+instantiate_kquant_nax_gather_seg_codec(iq1_m, 256, 1)
+instantiate_kquant_nax_gather_seg_codec(stq1_0, 256, 1)
     // clang-format on

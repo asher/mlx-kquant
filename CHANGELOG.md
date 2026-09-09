@@ -6,6 +6,14 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- Sorted MoE prefill on NAX GPUs runs `gather_qmm_seg` on a NAX tile kernel
+  over the expert tile map (one weight dequant and one MMA pass per 64-row
+  tile of one expert) and `KQuantSwitchLinear` prefers it over the fixed-tile
+  `gather_qmm_rhs_nax` leaf, whose row tiles straddle expert segments. IQ2_XS
+  gate/up gathers at ~57 rows per expert go from 16 to 27 TFLOPS, IQ3_XXS
+  down from 24 to 35. `KQ_GATHER_SEG_NAX=0` restores the old routing.
+
 ## [0.4.7]
 
 ### Fixed

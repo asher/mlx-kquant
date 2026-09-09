@@ -49,8 +49,13 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
   by a small `kq_lora_densify` dispatch at eval, on the primitive's own stream.
 - **`gather_qmm_seg`** + **`expert_tile_map`** - expert-sorted MoE prefill as one GEMM per expert
   segment instead of per-row gathers. `expert_tile_map` builds the 64-row tile map on the GPU from the
-  sorted routing indices (no host sync); `gather_qmm_seg` walks it. Gated by `KQ_SWITCH_GEMM_MIN_ROWS`
-  (see [README](../README.md#environment-variables)).
+  sorted routing indices (no host sync); `gather_qmm_seg` walks it. On NAX GPUs the walk is a NAX
+  tile kernel: each threadgroup owns one 64-row tile of one expert, dequantizes its weight slab once
+  and runs one MMA pass, skipping the simdgroup bands past a partial tile's rows. The fixed-tile
+  `gather_qmm_rhs_nax` leaf pays that dequant and MMA walk once per expert segment a tile touches,
+  which at ~60 rows per expert (a 2048-token chunk over 288 experts) is ~2x; the seg kernel runs
+  1.5-1.7x faster there. `KQ_DISABLE_GATHER_SEG_NAX=1` forces the steel simdgroup-mma walk. Gated by
+  `KQ_SWITCH_GEMM_MIN_ROWS` (see [README](../README.md#environment-variables)).
 
 On NAX GPUs, `quantized_matmul` transpose (decode-orientation) shapes route by row count M: the
 mat-vec paths up to a per-codec crossover (M 6-9), a BM=32 double-buffered NAX tile through M 32,
@@ -214,7 +219,8 @@ Tuning levers (defaults are right for normal use):
 - **`metallib_loads`** / **`metallib_dir`** - whether the bundled metallib opened on the device, and
   where it lives.
 - **`nax_available`** / **`nax_gather_enabled`** - whether the GPU exposes NAX tensor units, and
-  whether the sorted-gather NAX GEMM leaf is reachable for a codec.
+  whether the sorted-gather NAX GEMM kernels (`gather_qmm_rhs_nax`, the `gather_qmm_seg` NAX walk)
+  are reachable for a codec.
 - **`cpu_neon_available`** - whether the arm64 NEON int8 GEMV path is compiled in.
 
 ## Feeder-loop primitives

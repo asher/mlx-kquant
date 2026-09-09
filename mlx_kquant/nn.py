@@ -229,13 +229,18 @@ class KQuantSwitchLinear(nn.Module):
         return x
 
     def _nax_gather_preferred(self, rows, k):
-        """Mirror gather_qmm's sorted-rhs NAX GEMM gate: on NAX GPUs that
-        tensor-core leaf beats the simdgroup-MMA seg kernel, so the sorted
-        arm defers to gather_qmm whenever the leaf is reachable."""
+        """Mirror gather_qmm's sorted-rhs NAX GEMM gate. On NAX GPUs the
+        sorted arm defaults to the expert-major seg kernel (gather_qmm_seg
+        picks its NAX variant): one dequant and one MMA pass per tile,
+        where the rhs leaf's fixed row tiles straddle expert boundaries and
+        repeat both per segment. KQ_GATHER_SEG_NAX=0 (read live, A/B lever)
+        defers to the rhs leaf instead whenever it is reachable."""
         if not (
             hasattr(kq, "nax_gather_enabled")
             and kq.nax_gather_enabled(self.kquant_type)
         ):
+            return False
+        if os.environ.get("KQ_GATHER_SEG_NAX", "1") != "0":
             return False
         return k % 64 == 0 and rows >= 16 and rows >= 4 * self.weight.shape[0]
 
