@@ -1707,13 +1707,10 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         hc_front_expand_reduce and hc_sinkhorn_collapse as one dispatch.
-        Every threadgroup runs the front reduction and arrives at a device
-        counter; the sumsq threadgroup then continues into the collapse
-        instead of the host launching a second kernel.
-
-        Single row only: the leading dims must multiply to 1. That fixes
-        the grid at 25 threadgroups, which is what keeps the whole grid
-        co-resident, and the continuation is only safe while it is.
+        Every threadgroup of a row runs the front reduction, publishes its
+        mix dot and increments the row's device arrival counter; the last
+        one to arrive runs the collapse instead of the host launching a
+        second kernel. No threadgroup waits, so any row count works.
 
         Args:
             x_sub (array): [..., D] sublayer output.

@@ -7,6 +7,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `hc_front_expand_collapse`: `hc_front_expand_reduce` and
+  `hc_sinkhorn_collapse` as one dispatch. Every threadgroup of a row
+  publishes its mix dot and increments a per-row arrival counter, and the
+  last one to arrive runs the collapse, so nothing waits and any row
+  count works. Bit-identical to the two ops it replaces, which both remain.
 - `sdpa_fa_indexed`: index-gathered attention over one shared K/V latent
   at head dim 512 for the absorbed-MLA sparse decode step. Each query's
   selected latent rows are read once through an int32 index list (-1 pads)
@@ -29,6 +34,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   GLU output).
 
 ### Changed
+- The hyper-connection M=1 glue kernels (`hc_front_reduce`,
+  `hc_front_expand_reduce`, `hc_sinkhorn_collapse`) run 1024 threads per
+  threadgroup, read the activation row once per column for all four
+  streams, and run the sinkhorn on a spare simdgroup while the others
+  collapse. The expanded stream stays bit-identical; the f32 dot and
+  sum-of-squares reductions change summation order (rounding level).
 - Sorted MoE prefill on NAX GPUs runs `gather_qmm_seg` on a NAX tile kernel
   over the expert tile map (one weight dequant and one MMA pass per 64-row
   tile of one expert) and `KQuantSwitchLinear` prefers it over the fixed-tile
@@ -227,11 +238,6 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `dsa_kv_qat` takes `f16_round=False`, which stops at the fp8 result and
   copies the RoPE tail through unchanged. Fuses the DeepSeek-V4 compressor
   emit-path quantization, which has no f16 cache step, into one dispatch.
-- `hc_front_expand_collapse`: `hc_front_expand_reduce` and
-  `hc_sinkhorn_collapse` as one dispatch, the sumsq threadgroup continuing
-  into the collapse behind a device arrival counter. Single row only, which
-  fixes the grid at the 25 threadgroups the wait needs co-resident.
-  Bit-identical to the two ops it replaces, which both remain.
 
 ### Changed
 - IQ4_NL decode is faster, because each mat-vec lane now reads eight weights

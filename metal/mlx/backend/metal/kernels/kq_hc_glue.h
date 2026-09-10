@@ -1,8 +1,11 @@
 // Fused hyper-connection glue kernels for the deepseek4 M=1 decode route.
 // Four streams (hc_mult 4) baked in; D is the per-stream hidden size.
-// Numerics mirror the certified gmlx JIT kernels exactly: f32 accumulate,
+// Numerics mirror the certified gmlx JIT kernels: f32 accumulate,
 // fast::exp sinkhorn, round-before-use in the fused expand, single
-// rounding at each T-dtype write.
+// rounding at each T-dtype write. The f32 reductions run in the order
+// written here (one thread per float4 column across the four streams,
+// then simd_sum, then the simdgroup partials in order), and the split and
+// fused routes share that order by construction.
 //
 //   kq_hc_front_reduce:       mixes_raw[m] = dot(x, fn[m]), plus the row
 //                             sum of squares (deferred rms factor). One
@@ -13,22 +16,70 @@
 //                             threadgroup also writes the expanded h.
 //   kq_hc_sinkhorn_collapse:  sinkhorn mix normalization plus collapse to
 //                             one stream with the sublayer RMSNorm folded
-//                             into the output. One threadgroup per row.
+//                             into the output. One threadgroup per row;
+//                             the last simdgroup runs the sinkhorn while
+//                             the others collapse.
 //   kq_hc_expand:             pre/comb expand of the sublayer output back
 //                             to four streams. Two threadgroups per row.
-//   kq_hc_front_expand_collapse: the two above as one dispatch, the
-//                             sumsq threadgroup continuing into the
-//                             collapse once an arrival counter says every
-//                             mix threadgroup has published its dot.
-//                             Single row, fixed 25-threadgroup grid.
+//   kq_hc_front_expand_collapse: the front and the collapse as one
+//                             dispatch: every threadgroup publishes its
+//                             dot and arrives at a per-row device counter,
+//                             and the last one to arrive runs the
+//                             collapse. No threadgroup waits.
 //
-// The expand_reduce and sinkhorn_collapse bodies live in shared inline
-// functions so the split and continuation routes run the same arithmetic
-// in the same order by construction and cannot drift apart.
+// Every kernel runs KQ_HC_NT threads per threadgroup (the dispatch side
+// uses the same count): at hidden sizes up to 4096 each thread owns one
+// float4 column of every stream, so a threadgroup issues all of its loads
+// at once instead of walking the row in strides, which is what the
+// dependent decode chain pays for. The bodies live in shared inline
+// functions so the split and fused routes cannot drift apart.
 
 #define KQ_HC 4
 #define KQ_HC_MIX ((2 + KQ_HC) * KQ_HC)
-#define KQ_HC_MAX_CHUNKS 8
+#define KQ_HC_NT 1024
+#define KQ_HC_NSG (KQ_HC_NT / 32)
+// The collapse: KQ_HC_NT - 32 worker threads own the float4 columns and
+// the last simdgroup runs the sinkhorn.
+#define KQ_HC_NC (KQ_HC_NT - 32)
+#define KQ_HC_MAX_CHUNKS ((8192 / 4 + KQ_HC_NC - 1) / KQ_HC_NC)
+
+// One f32 per thread to one value, valid on lane 0 of simdgroup 0 after
+// the call. partial is threadgroup scratch [NSG]; simdgroups at or past
+// NSG contribute nothing. Every thread of the threadgroup must call this
+// (it barriers).
+template <int NSG>
+inline float
+kq_hc_tg_sum(float acc, uint lane, uint sg, threadgroup float* partial) {
+  acc = simd_sum(acc);
+  if (lane == 0 && sg < (uint)NSG) {
+    partial[sg] = acc;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float v = 0.0f;
+  if (sg == 0) {
+    v = (lane < (uint)NSG) ? partial[lane] : 0.0f;
+    v = simd_sum(v);
+  }
+  return v;
+}
+
+#define KQ_HC_DOT16(acc, a0, a1, a2, a3, b0, b1, b2, b3) \
+  acc = fma(a0.x, b0.x, acc);                            \
+  acc = fma(a0.y, b0.y, acc);                            \
+  acc = fma(a0.z, b0.z, acc);                            \
+  acc = fma(a0.w, b0.w, acc);                            \
+  acc = fma(a1.x, b1.x, acc);                            \
+  acc = fma(a1.y, b1.y, acc);                            \
+  acc = fma(a1.z, b1.z, acc);                            \
+  acc = fma(a1.w, b1.w, acc);                            \
+  acc = fma(a2.x, b2.x, acc);                            \
+  acc = fma(a2.y, b2.y, acc);                            \
+  acc = fma(a2.z, b2.z, acc);                            \
+  acc = fma(a2.w, b2.w, acc);                            \
+  acc = fma(a3.x, b3.x, acc);                            \
+  acc = fma(a3.y, b3.y, acc);                            \
+  acc = fma(a3.z, b3.z, acc);                            \
+  acc = fma(a3.w, b3.w, acc);
 
 template <typename T>
 [[kernel]] void kq_hc_front_reduce(
@@ -42,56 +93,51 @@ template <typename T>
   const uint lane = tid % 32;
   const uint sg = tid / 32;
   const int KTOT = KQ_HC * D;
+  const uint D4q = (uint)D / 4;
 
   const uint row = tg / (KQ_HC_MIX + 1);
   const uint m = tg % (KQ_HC_MIX + 1);
 
-  const device T* xr = x + (int64_t)row * KTOT;
   using T4 = vec<T, 4>;
-  const device T4* x4 = (const device T4*)xr;
+  const device T4* x4 = (const device T4*)(x + (int64_t)row * KTOT);
 
   float acc = 0.0f;
   if (m < (uint)KQ_HC_MIX) {
     const device float4* f4 = (const device float4*)(fn + (int64_t)m * KTOT);
-    for (uint k = tid; k < (uint)(KTOT / 4); k += 256) {
-      float4 xv = float4(x4[k]);
-      float4 fv = f4[k];
-      acc = fma(xv.x, fv.x, acc);
-      acc = fma(xv.y, fv.y, acc);
-      acc = fma(xv.z, fv.z, acc);
-      acc = fma(xv.w, fv.w, acc);
+    for (uint d4 = tid; d4 < D4q; d4 += KQ_HC_NT) {
+      float4 x0 = float4(x4[0 * D4q + d4]);
+      float4 x1 = float4(x4[1 * D4q + d4]);
+      float4 x2 = float4(x4[2 * D4q + d4]);
+      float4 x3 = float4(x4[3 * D4q + d4]);
+      float4 f0 = f4[0 * D4q + d4];
+      float4 f1 = f4[1 * D4q + d4];
+      float4 f2 = f4[2 * D4q + d4];
+      float4 f3 = f4[3 * D4q + d4];
+      KQ_HC_DOT16(acc, x0, x1, x2, x3, f0, f1, f2, f3)
     }
   } else {
-    for (uint k = tid; k < (uint)(KTOT / 4); k += 256) {
-      float4 xv = float4(x4[k]);
-      acc = fma(xv.x, xv.x, acc);
-      acc = fma(xv.y, xv.y, acc);
-      acc = fma(xv.z, xv.z, acc);
-      acc = fma(xv.w, xv.w, acc);
+    for (uint d4 = tid; d4 < D4q; d4 += KQ_HC_NT) {
+      float4 x0 = float4(x4[0 * D4q + d4]);
+      float4 x1 = float4(x4[1 * D4q + d4]);
+      float4 x2 = float4(x4[2 * D4q + d4]);
+      float4 x3 = float4(x4[3 * D4q + d4]);
+      KQ_HC_DOT16(acc, x0, x1, x2, x3, x0, x1, x2, x3)
     }
   }
 
-  threadgroup float partial[8];
-  acc = simd_sum(acc);
-  if (lane == 0) {
-    partial[sg] = acc;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (sg == 0) {
-    float v = (lane < 8) ? partial[lane] : 0.0f;
-    v = simd_sum(v);
-    if (lane == 0) {
-      if (m < (uint)KQ_HC_MIX) {
-        mixes_raw[row * KQ_HC_MIX + m] = v;
-      } else {
-        sumsq[row] = v;
-      }
+  threadgroup float partial[KQ_HC_NSG];
+  float v = kq_hc_tg_sum<KQ_HC_NSG>(acc, lane, sg, partial);
+  if (sg == 0 && lane == 0) {
+    if (m < (uint)KQ_HC_MIX) {
+      mixes_raw[row * KQ_HC_MIX + m] = v;
+    } else {
+      sumsq[row] = v;
     }
   }
 }
 
 // Shared body of kq_hc_front_expand_reduce, also run by every threadgroup
-// of the fused continuation kernel. partial is threadgroup scratch [8].
+// of the fused kernel. partial is threadgroup scratch [KQ_HC_NSG].
 template <typename T>
 inline void kq_hc_front_expand_reduce_body(
     const device T* x_sub,
@@ -117,6 +163,13 @@ inline void kq_hc_front_expand_reduce_body(
   device T* hout = h_out + (int64_t)row * KTOT;
 
   const uint pb = row * 4, cb = row * 16;
+  const float p0 = post[pb + 0], p1 = post[pb + 1];
+  const float p2 = post[pb + 2], p3 = post[pb + 3];
+  // comb is [j][i]; the expand applies comb^T: h_i = sum_j comb[j][i] r_j
+  float c[16];
+  for (int j = 0; j < 16; ++j) {
+    c[j] = comb[cb + j];
+  }
 
   using T4 = vec<T, 4>;
   const device T4* xs4 = (const device T4*)xs;
@@ -125,57 +178,64 @@ inline void kq_hc_front_expand_reduce_body(
   const device float4* f4 = (const device float4*)(fn + (int64_t)m * KTOT);
 
   float acc = 0.0f;
-  for (uint i = 0; i < (uint)KQ_HC; ++i) {
-    const float pi = post[pb + i];
-    const float c0 = comb[cb + 0 * 4 + i];
-    const float c1 = comb[cb + 1 * 4 + i];
-    const float c2 = comb[cb + 2 * 4 + i];
-    const float c3 = comb[cb + 3 * 4 + i];
-    for (uint d4 = tid; d4 < D4q; d4 += 256) {
-      uint k = i * D4q + d4;
-      float4 xv = float4(xs4[d4]);
-      float4 r0 = float4(rr4[0 * D4q + d4]);
-      float4 r1 = float4(rr4[1 * D4q + d4]);
-      float4 r2 = float4(rr4[2 * D4q + d4]);
-      float4 r3 = float4(rr4[3 * D4q + d4]);
-      float4 e =
-          fma(float4(pi),
-              xv,
-              fma(float4(c0),
-                  r0,
-                  fma(float4(c1), r1, fma(float4(c2), r2, float4(c3) * r3))));
-      T4 hv = T4(e);
-      float4 hf = float4(hv);
-      if (m < (uint)KQ_HC_MIX) {
-        float4 fv = f4[k];
-        acc = fma(hf.x, fv.x, acc);
-        acc = fma(hf.y, fv.y, acc);
-        acc = fma(hf.z, fv.z, acc);
-        acc = fma(hf.w, fv.w, acc);
-      } else {
-        h4[k] = hv;
-        acc = fma(hf.x, hf.x, acc);
-        acc = fma(hf.y, hf.y, acc);
-        acc = fma(hf.z, hf.z, acc);
-        acc = fma(hf.w, hf.w, acc);
-      }
+  for (uint d4 = tid; d4 < D4q; d4 += KQ_HC_NT) {
+    float4 xv = float4(xs4[d4]);
+    float4 r0 = float4(rr4[0 * D4q + d4]);
+    float4 r1 = float4(rr4[1 * D4q + d4]);
+    float4 r2 = float4(rr4[2 * D4q + d4]);
+    float4 r3 = float4(rr4[3 * D4q + d4]);
+    // the same fma chain per stream as kq_hc_expand, rounded to T once
+    T4 hv0 = T4(fma(
+        float4(p0),
+        xv,
+        fma(float4(c[0]),
+            r0,
+            fma(float4(c[4]), r1, fma(float4(c[8]), r2, float4(c[12]) * r3)))));
+    T4 hv1 = T4(fma(
+        float4(p1),
+        xv,
+        fma(float4(c[1]),
+            r0,
+            fma(float4(c[5]), r1, fma(float4(c[9]), r2, float4(c[13]) * r3)))));
+    T4 hv2 = T4(
+        fma(float4(p2),
+            xv,
+            fma(float4(c[2]),
+                r0,
+                fma(float4(c[6]),
+                    r1,
+                    fma(float4(c[10]), r2, float4(c[14]) * r3)))));
+    T4 hv3 = T4(
+        fma(float4(p3),
+            xv,
+            fma(float4(c[3]),
+                r0,
+                fma(float4(c[7]),
+                    r1,
+                    fma(float4(c[11]), r2, float4(c[15]) * r3)))));
+    float4 h0 = float4(hv0), h1 = float4(hv1);
+    float4 h2 = float4(hv2), h3 = float4(hv3);
+    if (m < (uint)KQ_HC_MIX) {
+      float4 f0 = f4[0 * D4q + d4];
+      float4 f1 = f4[1 * D4q + d4];
+      float4 f2 = f4[2 * D4q + d4];
+      float4 f3 = f4[3 * D4q + d4];
+      KQ_HC_DOT16(acc, h0, h1, h2, h3, f0, f1, f2, f3)
+    } else {
+      h4[0 * D4q + d4] = hv0;
+      h4[1 * D4q + d4] = hv1;
+      h4[2 * D4q + d4] = hv2;
+      h4[3 * D4q + d4] = hv3;
+      KQ_HC_DOT16(acc, h0, h1, h2, h3, h0, h1, h2, h3)
     }
   }
 
-  acc = simd_sum(acc);
-  if (lane == 0) {
-    partial[sg] = acc;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (sg == 0) {
-    float v = (lane < 8) ? partial[lane] : 0.0f;
-    v = simd_sum(v);
-    if (lane == 0) {
-      if (m < (uint)KQ_HC_MIX) {
-        mixes_raw[row * KQ_HC_MIX + m] = v;
-      } else {
-        sumsq[row] = v;
-      }
+  float v = kq_hc_tg_sum<KQ_HC_NSG>(acc, lane, sg, partial);
+  if (sg == 0 && lane == 0) {
+    if (m < (uint)KQ_HC_MIX) {
+      mixes_raw[row * KQ_HC_MIX + m] = v;
+    } else {
+      sumsq[row] = v;
     }
   }
 }
@@ -193,7 +253,7 @@ template <typename T>
     const constant int& D [[buffer(8)]],
     uint tg [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]) {
-  threadgroup float partial[8];
+  threadgroup float partial[KQ_HC_NSG];
   kq_hc_front_expand_reduce_body<T>(
       x_sub,
       resid,
@@ -210,9 +270,12 @@ template <typename T>
       partial);
 }
 
-// Shared body of kq_hc_sinkhorn_collapse, also run by the continuation
-// threadgroup of the fused kernel. pre_shared is [KQ_HC], ssq_shared [8]
-// and inv_shared [1] of threadgroup scratch.
+// Shared body of kq_hc_sinkhorn_collapse, also run by the collapsing
+// threadgroup of the fused kernel. The first KQ_HC_NC threads collapse
+// the streams with the pre gates, which every thread derives on its own
+// from the mixes, while the last simdgroup runs the sinkhorn (post and
+// comb). ssq_shared is [KQ_HC_NSG] and inv_shared [1] of threadgroup
+// scratch.
 template <typename T>
 inline void kq_hc_sinkhorn_collapse_body(
     const device T* x,
@@ -230,14 +293,18 @@ inline void kq_hc_sinkhorn_collapse_body(
     const float norm_eps,
     uint row,
     uint tid,
-    threadgroup float* pre_shared,
     threadgroup float* ssq_shared,
     threadgroup float* inv_shared) {
+  constexpr int NSG = KQ_HC_NSG;
+  constexpr int NC = KQ_HC_NC;
+  constexpr int MAXC = KQ_HC_MAX_CHUNKS;
   const uint lane = tid % 32;
   const uint sg = tid / 32;
   const int BASE_OFF = 2 * KQ_HC;
   const float EPS = hc_eps;
   const float NEPS = norm_eps;
+  const bool worker = tid < (uint)NC;
+  const bool spare = (sg == (uint)(NSG - 1));
 
   const device float* mix = mixes_raw + row * KQ_HC_MIX;
   device float* post_out = post + row * KQ_HC;
@@ -245,21 +312,39 @@ inline void kq_hc_sinkhorn_collapse_body(
 
   const float factor = metal::rsqrt(sumsq[row] / (float)(KQ_HC * D) + NEPS);
 
-  if (sg == 0) {
-    const float pre_scale = scale[0] * factor;
+  const device T* x_row = x + (int64_t)row * (KQ_HC * D);
+  device T* out_row = collapsed + (int64_t)row * D;
+
+  using T4 = vec<T, 4>;
+  const device T4* x_row0 = (const device T4*)(x_row + 0 * D);
+  const device T4* x_row1 = (const device T4*)(x_row + 1 * D);
+  const device T4* x_row2 = (const device T4*)(x_row + 2 * D);
+  const device T4* x_row3 = (const device T4*)(x_row + 3 * D);
+  device T4* out4 = (device T4*)out_row;
+
+  const uint D4 = (uint)D / 4;
+  const uint chunks = (D4 + NC - 1) / NC;
+
+  const float pre_scale = scale[0] * factor;
+  const float p0 =
+      1.0f / (1.0f + metal::fast::exp(-(mix[0] * pre_scale + base[0]))) + EPS;
+  const float p1 =
+      1.0f / (1.0f + metal::fast::exp(-(mix[1] * pre_scale + base[1]))) + EPS;
+  const float p2 =
+      1.0f / (1.0f + metal::fast::exp(-(mix[2] * pre_scale + base[2]))) + EPS;
+  const float p3 =
+      1.0f / (1.0f + metal::fast::exp(-(mix[3] * pre_scale + base[3]))) + EPS;
+
+  if (spare) {
     const float post_scale = scale[1] * factor;
     const float comb_scale = scale[2] * factor;
 
     const float active = (lane < (uint)KQ_HC) ? 1.0f : 0.0f;
     const uint llane = metal::min(lane, (uint)(KQ_HC - 1));
 
-    float pre_z = mix[llane] * pre_scale + base[llane];
     float post_z = mix[KQ_HC + llane] * post_scale + base[KQ_HC + llane];
-    float pre_v = 1.0f / (1.0f + metal::fast::exp(-pre_z)) + EPS;
     float post_v = 2.0f / (1.0f + metal::fast::exp(-post_z));
-
     if (lane < (uint)KQ_HC) {
-      pre_shared[lane] = pre_v;
       post_out[lane] = post_v;
     }
 
@@ -290,32 +375,12 @@ inline void kq_hc_sinkhorn_collapse_body(
     }
   }
 
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  const float p0 = pre_shared[0];
-  const float p1 = pre_shared[1];
-  const float p2 = pre_shared[2];
-  const float p3 = pre_shared[3];
-
-  const device T* x_row = x + (int64_t)row * (KQ_HC * D);
-  device T* out_row = collapsed + (int64_t)row * D;
-
-  using T4 = vec<T, 4>;
-  const device T4* x_row0 = (const device T4*)(x_row + 0 * D);
-  const device T4* x_row1 = (const device T4*)(x_row + 1 * D);
-  const device T4* x_row2 = (const device T4*)(x_row + 2 * D);
-  const device T4* x_row3 = (const device T4*)(x_row + 3 * D);
-  device T4* out4 = (device T4*)out_row;
-
-  const uint D4 = (uint)D / 4;
-  const uint chunks = (D4 + 255) / 256;
-
-  float4 vals[KQ_HC_MAX_CHUNKS];
+  float4 vals[MAXC];
   float ssq = 0.0f;
   for (uint c = 0; c < chunks; ++c) {
-    uint d4 = c * 256 + tid;
+    uint d4 = c * NC + tid;
     float4 result = float4(0.0f);
-    if (d4 < D4) {
+    if (worker && d4 < D4) {
       float4 x0 = float4(x_row0[d4]);
       float4 x1 = float4(x_row1[d4]);
       float4 x2 = float4(x_row2[d4]);
@@ -330,24 +395,16 @@ inline void kq_hc_sinkhorn_collapse_body(
     vals[c] = result;
   }
 
-  ssq = simd_sum(ssq);
-  if (lane == 0) {
-    ssq_shared[sg] = ssq;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (sg == 0) {
-    float v = (lane < 8) ? ssq_shared[lane] : 0.0f;
-    v = simd_sum(v);
-    if (lane == 0) {
-      inv_shared[0] = metal::rsqrt(v / (float)D + NEPS);
-    }
+  float tot = kq_hc_tg_sum<NSG>(ssq, lane, sg, ssq_shared);
+  if (sg == 0 && lane == 0) {
+    inv_shared[0] = metal::rsqrt(tot / (float)D + NEPS);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const float inv = inv_shared[0];
 
   for (uint c = 0; c < chunks; ++c) {
-    uint d4 = c * 256 + tid;
-    if (d4 < D4) {
+    uint d4 = c * NC + tid;
+    if (worker && d4 < D4) {
       uint d = d4 * 4;
       float4 wv = float4(
           (float)w[d], (float)w[d + 1], (float)w[d + 2], (float)w[d + 3]);
@@ -373,8 +430,7 @@ template <typename T>
     const constant float& norm_eps [[buffer(12)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]) {
-  threadgroup float pre_shared[KQ_HC];
-  threadgroup float ssq_shared[8];
+  threadgroup float ssq_shared[KQ_HC_NSG];
   threadgroup float inv_shared[1];
   kq_hc_sinkhorn_collapse_body<T>(
       x,
@@ -392,23 +448,20 @@ template <typename T>
       norm_eps,
       row,
       tid,
-      pre_shared,
       ssq_shared,
       inv_shared);
 }
 
-// The two-dispatch front cycle as one dispatch. Every threadgroup runs the
-// expand_reduce body, publishes its device writes and arrives at the
-// counter; the sumsq threadgroup then continues into the collapse body
-// once all KQ_HC_MIX + 1 have arrived.
-//
-// The wait is unbounded on purpose. Metal gives no forward-progress
-// guarantee across threadgroups, so the protocol is safe only while the
-// whole grid is co-resident: the grid is a fixed KQ_HC_MIX + 1 = 25
-// threadgroups for a single row, which the host side enforces by
-// rejecting any other row count. A bounded spin would trade an
-// unschedulable grid, which is a visible hang, for a silently wrong
-// result, which is worse.
+// The two-dispatch front cycle as one dispatch. Every threadgroup of a
+// row runs the expand_reduce body, publishes its device writes and
+// increments the row's arrival counter; the threadgroup whose increment
+// completes the count of KQ_HC_MIX + 1 continues into the collapse body
+// over the mixes and h the others published. Nothing waits, so the grid
+// needs no co-residency and any row count works; the counter is zero on
+// entry (the host clears a fresh one per dispatch) and is left at
+// KQ_HC_MIX + 1. The collapsing threadgroup reads h and the mixes after
+// a device-scope fence on the acquiring side that matches the release
+// fence each publisher issues before its increment.
 template <typename T>
 [[kernel]] void kq_hc_front_expand_collapse(
     const device T* x_sub [[buffer(0)]],
@@ -432,10 +485,13 @@ template <typename T>
     const constant float& norm_eps [[buffer(18)]],
     uint tg [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]) {
-  threadgroup float partial[8];
-  threadgroup float pre_shared[KQ_HC];
-  threadgroup float ssq_shared[8];
+  threadgroup float partial[KQ_HC_NSG];
+  threadgroup float ssq_shared[KQ_HC_NSG];
   threadgroup float inv_shared[1];
+  threadgroup uint last_flag;
+
+  const uint row = tg / (KQ_HC_MIX + 1);
+  const uint m = tg % (KQ_HC_MIX + 1);
 
   kq_hc_front_expand_reduce_body<T>(
       x_sub,
@@ -447,28 +503,25 @@ template <typename T>
       mixes_raw,
       sumsq,
       D,
-      0u,
-      tg,
+      row,
+      m,
       tid,
       partial);
 
-  // publish this threadgroup's mix dot (or h and sumsq) before arriving
+  // publish this threadgroup's mix dot (or h and sumsq), then arrive
   threadgroup_barrier(mem_flags::mem_device);
   if (tid == 0) {
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst);
-    atomic_fetch_add_explicit(arrive, 1u, memory_order_relaxed);
-  }
-
-  if (tg != (uint)KQ_HC_MIX) {
-    return;
-  }
-
-  if (tid == 0) {
-    uint v = atomic_load_explicit(arrive, memory_order_relaxed);
-    while (v < (uint)(KQ_HC_MIX + 1)) {
-      v = atomic_load_explicit(arrive, memory_order_relaxed);
+    uint prev =
+        atomic_fetch_add_explicit(arrive + row, 1u, memory_order_relaxed);
+    last_flag = (prev == (uint)KQ_HC_MIX) ? 1u : 0u;
+    if (last_flag != 0u) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst);
     }
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (last_flag == 0u) {
+    return;
   }
   threadgroup_barrier(mem_flags::mem_device);
 
@@ -486,9 +539,8 @@ template <typename T>
       iters,
       hc_eps,
       norm_eps,
-      0u,
+      row,
       tid,
-      pre_shared,
       ssq_shared,
       inv_shared);
 }

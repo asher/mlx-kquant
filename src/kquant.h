@@ -861,12 +861,11 @@ std::vector<mx::array> hc_sinkhorn_collapse(
     float norm_eps,
     mx::StreamOrDevice s = {});
 
-// hc_front_expand_reduce and hc_sinkhorn_collapse as one dispatch: the
-// sumsq threadgroup continues into the collapse behind a device arrival
-// counter instead of the host launching a second kernel. Single row only
-// (the leading dims must multiply to 1), which fixes the grid at 25
-// threadgroups so the whole grid stays co-resident and the wait cannot
-// deadlock. Returns {h [..., 4, D], collapsed [..., D], post f32
+// hc_front_expand_reduce and hc_sinkhorn_collapse as one dispatch: every
+// threadgroup of a row publishes its mix dot and increments a per-row
+// device arrival counter, and the last one to arrive runs the collapse
+// instead of the host launching a second kernel. Nothing waits, so any
+// row count works. Returns {h [..., 4, D], collapsed [..., D], post f32
 // [..., 4], comb f32 [..., 4, 4]}, bit-identical to the split pair.
 std::vector<mx::array> hc_front_expand_collapse(
     mx::array x_sub,

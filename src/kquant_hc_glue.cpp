@@ -1,6 +1,7 @@
 // Fused deepseek4 hyper-connection glue ops for the single-token decode
 // route (see kq_hc_glue.h for the kernel shapes). Four streams (hc_mult 4)
 // baked; the gmlx caller gates on that. GPU only, like the dsa ops.
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -64,6 +65,10 @@ int check_streams(const mx::array& x, const char* op, const char* what) {
   return D;
 }
 
+// Threads per threadgroup of the front, collapse and fused kernels;
+// mirrors KQ_HC_NT in kq_hc_glue.h.
+constexpr int kHcThreads = 1024;
+
 void check_fn(const mx::array& fn, int D, const char* op) {
   if (fn.ndim() != 2 || fn.shape(0) != MIX || fn.shape(1) != HC * D) {
     throw std::invalid_argument(
@@ -97,7 +102,7 @@ void KQuantHcFrontReduce::eval_gpu(
   ce.set_output_array(outputs[1], 3);
   ce.set_bytes(D, 4);
   ce.dispatch_threadgroups(
-      MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(256, 1, 1));
+      MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(kHcThreads, 1, 1));
 }
 
 void KQuantHcFrontExpandReduce::eval_gpu(
@@ -127,7 +132,7 @@ void KQuantHcFrontExpandReduce::eval_gpu(
   ce.set_output_array(outputs[2], 7);
   ce.set_bytes(D, 8);
   ce.dispatch_threadgroups(
-      MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(256, 1, 1));
+      MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(kHcThreads, 1, 1));
 }
 
 void KQuantHcSinkhornCollapse::eval_gpu(
@@ -159,7 +164,7 @@ void KQuantHcSinkhornCollapse::eval_gpu(
   ce.set_bytes(iters_, 10);
   ce.set_bytes(hc_eps_, 11);
   ce.set_bytes(norm_eps_, 12);
-  ce.dispatch_threadgroups(MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1));
+  ce.dispatch_threadgroups(MTL::Size(rows, 1, 1), MTL::Size(kHcThreads, 1, 1));
 }
 
 void KQuantHcFrontExpandCollapse::eval_gpu(
@@ -172,22 +177,22 @@ void KQuantHcFrontExpandCollapse::eval_gpu(
   }
   const auto& resid = inputs[1];
   int D = resid.shape(-1);
+  int rows = int(resid.size() / (HC * D));
 
-  // Scratch the split route passes between its two dispatches, plus the
-  // arrival counter the continuation waits on. A fresh counter per
-  // dispatch is what makes the lifecycle safe: the buffer comes from an
-  // allocator that never hands back memory an in-flight batch still
-  // references, add_temporary retains it until this batch completes, and
-  // a command buffer that fails leaves a buffer that is simply dropped
-  // rather than one that has to be reset from the CPU under a partial
-  // value.
-  mx::array mixes_raw({1, MIX}, mx::float32, nullptr, {});
-  mx::array sumsq({1, 1}, mx::float32, nullptr, {});
-  mx::array arrive({1}, mx::uint32, nullptr, {});
+  // Scratch the split route passes between its two dispatches, plus one
+  // arrival counter per row. A fresh counter per dispatch is what makes
+  // the lifecycle safe: the buffer comes from an allocator that never
+  // hands back memory an in-flight batch still references, add_temporary
+  // retains it until this batch completes, and a command buffer that
+  // fails leaves a buffer that is simply dropped rather than one that has
+  // to be reset from the CPU under a partial value.
+  mx::array mixes_raw({rows, MIX}, mx::float32, nullptr, {});
+  mx::array sumsq({rows, 1}, mx::float32, nullptr, {});
+  mx::array arrive({rows}, mx::uint32, nullptr, {});
   mixes_raw.set_data(mx::allocator::malloc(mixes_raw.nbytes()));
   sumsq.set_data(mx::allocator::malloc(sumsq.nbytes()));
   arrive.set_data(mx::allocator::malloc(arrive.nbytes()));
-  *arrive.data<uint32_t>() = 0;
+  std::memset(arrive.data<uint32_t>(), 0, arrive.nbytes());
 
   auto& ce = mx::metal::get_command_encoder(s);
   ce.add_temporary(mixes_raw);
@@ -217,8 +222,8 @@ void KQuantHcFrontExpandCollapse::eval_gpu(
   ce.set_bytes(iters_, 16);
   ce.set_bytes(hc_eps_, 17);
   ce.set_bytes(norm_eps_, 18);
-  // fixed grid: one row, MIX + 1 threadgroups, all co-resident
-  ce.dispatch_threadgroups(MTL::Size(MIX + 1, 1, 1), MTL::Size(256, 1, 1));
+  ce.dispatch_threadgroups(
+      MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(kHcThreads, 1, 1));
 }
 
 void KQuantHcExpand::eval_gpu(
@@ -476,13 +481,6 @@ std::vector<mx::array> hc_front_expand_collapse(
   int D = check_streams(resid, op, "resid");
   check_fn(fn, D, op);
   int64_t rows = resid.size() / (int64_t(HC) * D);
-  // The continuation waits on threadgroups of its own grid, which is only
-  // safe while that grid is co-resident. One row keeps it at a fixed 25.
-  if (rows != 1) {
-    throw std::invalid_argument(
-        std::string(op) +
-        " is single row only: the leading dims of resid must multiply to 1.");
-  }
   if (x_sub.shape(-1) != D || x_sub.size() != resid.size() / HC) {
     throw std::invalid_argument(
         std::string(op) + " x_sub must be [..., D] matching resid.");
