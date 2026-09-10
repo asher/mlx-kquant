@@ -465,6 +465,32 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "gather_mix",
+      &mlx_kquant::gather_mix,
+      "y"_a,
+      "inv_order"_a,
+      "scores"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused unsort and score mix for sorted-prefill MoE:
+        out[t] = sum_s scores[t, s] * y[inv_order[t * k + s]] in one
+        dispatch, replacing the gather back to token order, the score
+        multiply and the sum over slots. f32 accumulation, one round at
+        the write, on every GPU and the CPU.
+
+        Args:
+            y (array): [rows, N] expert outputs in routing-sorted row
+                order (rows = T * k), float16/bfloat16, N a multiple of 4.
+            inv_order (array): [T * k] sorted row of each (token, slot)
+                pair, uint32 or int32 (the argsort of the sort order).
+            scores (array): [T, k] routing weights; cast to fp32.
+
+        Returns:
+            array: [T, N] in the y dtype.
+      )");
+
+  m.def(
       "rmsnorm_gate",
       &mlx_kquant::rmsnorm_gate,
       "x"_a,

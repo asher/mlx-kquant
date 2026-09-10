@@ -1300,6 +1300,39 @@ class KQuantKdaChunk : public mx::Primitive {
   float lb_;
 };
 
+// Fused unsort and score mix for sorted-prefill MoE:
+//   out[t, :] = sum_s scores[t, s] * y[inv_order[t * k + s], :]
+// y [rows, N] (float16/bfloat16, the expert outputs in routing-sorted row
+// order, rows = T * k), inv_order [T * k] (uint32/int32, the sorted row of
+// each (token, slot) pair), scores [T, k] (any float, used in fp32).
+// Returns [T, N] in the y dtype; f32 accumulation, one round at the write;
+// any GPU and the CPU.
+mx::array gather_mix(
+    mx::array y,
+    mx::array inv_order,
+    mx::array scores,
+    mx::StreamOrDevice s = {});
+
+// Fused unsort and mix primitive (see gather_mix). Inference-only.
+class KQuantGatherMix : public mx::Primitive {
+ public:
+  explicit KQuantGatherMix(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantGatherMix";
+  }
+  bool is_equivalent(const mx::Primitive&) const override {
+    return true;
+  }
+};
+
 // Fused output gate for gated-delta layers: rms_norm(x, w, eps) *
 // sigmoid(gate) over the last axis (64, 128 or 256 wide), x and gate
 // [..., D] in float16/bfloat16, w [D] in the same dtype. One dispatch, f32

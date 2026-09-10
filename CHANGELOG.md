@@ -7,68 +7,38 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- `kda_chunk`: the gated delta rule with a per-key-channel decay (KDA, the
-  GLM-5.3-Flash and Kimi Linear recurrence) over a whole sequence in
-  32-token chunks on tensor-op GPUs, the [Dv, Dk] state resident in
-  registers and the intra-chunk solve folded into matrix products, in
-  place of stepping token by token. Takes the log decay, returns the
-  output and the fp32 state; the CPU path runs the sequential recurrence.
-- `kda_chunk_gated`: `kda_chunk` with the decay formed inside the kernel
-  from the gate pre-activation (lb * sigmoid(a_scale * (a + dt_bias))),
-  so the fp32 log-decay tensor is never written.
-- `kda_conv`: the causal depthwise short conv of gated-delta prefill with
-  its silu, an optional per-head l2 norm with a folded scale and the tail
-  rows for the next call in one dispatch, on any GPU and the CPU.
-- `rmsnorm_gate`: rms_norm(x, w) * sigmoid(gate) over 64, 128 or 256
-  wide rows in one dispatch, the output gate of gated-delta layers.
-- `hc_front_expand_collapse`: `hc_front_expand_reduce` and
-  `hc_sinkhorn_collapse` as one dispatch. Every threadgroup of a row
-  publishes its mix dot and increments a per-row arrival counter, and the
-  last one to arrive runs the collapse, so nothing waits and any row
-  count works. Bit-identical to the two ops it replaces, which both remain.
+- Gated-delta (KDA) kernels for GLM-5.3-Flash and Kimi Linear.
+  `kda_chunk` and `kda_chunk_gated` run the delta rule with a
+  per-key-channel decay in 32-token chunks on tensor-op GPUs, with a
+  sequential CPU path. `kda_conv` fuses the causal short conv, its silu,
+  an optional per-head l2 norm and the tail state, and `rmsnorm_gate` is
+  the output gate.
+- `gather_mix`: the sorted-prefill MoE unsort and score-weighted sum over
+  the routed slots in one dispatch.
+- `hc_front_expand_collapse`: the hyper-connection front reduction and
+  sinkhorn collapse as one dispatch, bit-identical to the two ops it
+  replaces, which both remain.
 - `sdpa_fa_indexed`: index-gathered attention over one shared K/V latent
-  at head dim 512 for the absorbed-MLA sparse decode step. Each query's
-  selected latent rows are read once through an int32 index list (-1 pads)
-  instead of gathered into a copy and run through a materialized softmax.
-  A NAX tile kernel serves tensor-op GPUs and the `sdpa_fa_verify`
-  simdgroup tile serves the rest; `KQ_SDPA_IDX_NAX=0` forces the latter.
-- Fused MoE decode gathers at MTP verify widths (2 to 8 rows per step)
-  dequantize a routed expert once per pair of rows that select it, and
-  the shared expert once per pair of rows. Rows of a verify block share
-  most of their experts (3.65 of 8 measured on GLM-5.3-Flash), so a
-  two-row step reads about a quarter less expert weight. Outputs are
-  bit-identical to the per-row kernels. `KQ_MOE_DEDUP=0` restores the
-  per-row dispatch.
-- `KQ_MOE_HALF=1` (default off) switches the iq2_xs, iq2_xxs and iq3_xxs
-  fused MoE decode gathers (gate/up, shexp, qmv, score mix) to half-dot
-  kernels: the grid stages as half4 pairs, the activation row is staged as
-  half per threadgroup, and the chunk dots run in half with a float sum per
-  chunk. Shared-expert slots keep the float path. Outputs differ from the
-  float kernels at half rounding level (about 1e-3 relative on the fused
-  GLU output).
+  at head dim 512, for the absorbed-MLA sparse decode step. A NAX tile
+  kernel serves tensor-op GPUs and `KQ_SDPA_IDX_NAX=0` forces the
+  simdgroup kernel.
+- Fused MoE decode gathers at MTP verify widths dequantize each routed
+  expert once per pair of rows that select it. Outputs are bit-identical
+  to the per-row kernels and `KQ_MOE_DEDUP=0` restores them.
+- `KQ_MOE_HALF=1`, off by default, switches the iq2_xs, iq2_xxs and
+  iq3_xxs fused MoE decode gathers to half-dot kernels. Outputs differ
+  from the float kernels at half rounding level.
 
 ### Changed
 - The NAX loaders for iq2_xs, iq3_xxs, iq2_s and iq3_s fold the sign into
-  the grid bytes (one table lookup per 8 weights, then a sign-extending
-  byte extract per weight) and write the dequantized slab in 8-byte
-  vector stores. Every NAX kernel on these codecs takes the change and the
-  products are bit-identical to the scalar path. The `gather_qmm_seg` NAX
-  kernel also issues its MMA and store per 16-row sub-band, so a partial
-  tile pays for the rows it holds in 16-row steps. On a real 2048-token
-  GLM-5.3-Flash routing the IQ2_XS gate/up gather goes from 25 to 40
-  TFLOPS and the IQ3_XXS down gather from 33 to 37.
-- The hyper-connection M=1 glue kernels (`hc_front_reduce`,
-  `hc_front_expand_reduce`, `hc_sinkhorn_collapse`) run 1024 threads per
-  threadgroup, read the activation row once per column for all four
-  streams, and run the sinkhorn on a spare simdgroup while the others
-  collapse. The expanded stream stays bit-identical; the f32 dot and
-  sum-of-squares reductions change summation order (rounding level).
-- Sorted MoE prefill on NAX GPUs runs `gather_qmm_seg` on a NAX tile kernel
-  over the expert tile map (one weight dequant and one MMA pass per 64-row
-  tile of one expert) and `KQuantSwitchLinear` prefers it over the fixed-tile
-  `gather_qmm_rhs_nax` leaf, whose row tiles straddle expert segments. IQ2_XS
-  gate/up gathers at ~57 rows per expert go from 16 to 27 TFLOPS, IQ3_XXS
-  down from 24 to 35. `KQ_GATHER_SEG_NAX=0` restores the old routing.
+  the grid bytes. Every NAX kernel on these codecs takes the change and
+  the products stay bit-identical.
+- The hyper-connection M=1 glue kernels run 1024 threads per threadgroup
+  and read each activation row once for all four streams. The expanded
+  stream stays bit-identical and the f32 reductions change summation order.
+- Sorted MoE prefill on NAX GPUs runs `gather_qmm_seg` on an expert-major
+  tile kernel instead of the fixed-tile leaf, whose row tiles straddle
+  expert segments. `KQ_GATHER_SEG_NAX=0` restores the old routing.
 
 ## [0.4.7]
 
