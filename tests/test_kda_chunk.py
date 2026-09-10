@@ -125,6 +125,32 @@ def test_kda_chunk_chunking_is_transparent():
     assert _rel(s, s_all) < 1e-5
 
 
+@requires_nax_or_cpu
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("T", [64, 40, 3])
+def test_kda_chunk_gated_matches_log_g_form(dtype, T):
+    # The in-kernel gate equals kda_chunk on the same log gate formed in
+    # fp32, and both track the recurrence; padded lengths carry no decay.
+    B, H, lb = 1, 2, -5.0
+    q, k, v, _, beta, state = _make(B, T, H, dtype, lb, seed=T)
+    key = mx.random.key(T + 1)
+    k0, k1, k2 = mx.random.split(key, 3)
+    a = (mx.random.normal((B, T, H, D), key=k0) * 2).astype(dtype)
+    a_scale = mx.exp(mx.random.normal((H,), key=k1) * 0.3)
+    dt_bias = mx.random.normal((H, D), key=k2) * 0.5
+    log_g = lb * mx.sigmoid(a_scale[:, None] * (a.astype(mx.float32) + dt_bias))
+    mx.eval(a, a_scale, dt_bias, log_g)
+    y_g, s_g = kq.kda_chunk_gated(q, k, v, a, a_scale, dt_bias, beta, state, lb)
+    y_l, s_l = kq.kda_chunk(q, k, v, log_g, beta, state)
+    y_ref, s_ref = _ref(q, k, v, log_g, beta, state)
+    mx.eval(y_g, s_g, y_l, s_l, y_ref, s_ref)
+    assert y_g.shape == (B, T, H, D) and y_g.dtype == dtype
+    assert _rel(y_g, y_l) < 2e-3
+    assert _rel(s_g, s_l) < 2e-3
+    assert _rel(y_g, y_ref) < REL_BOUND[dtype]
+    assert _rel(s_g, s_ref) < REL_BOUND[dtype]
+
+
 def test_kda_chunk_rejects_bad_shapes():
     q, k, v, log_g, beta, state = _make(1, 32, 1, mx.bfloat16, -1.0, seed=1)
     with pytest.raises(ValueError):

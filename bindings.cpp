@@ -465,6 +465,99 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "rmsnorm_gate",
+      &mlx_kquant::rmsnorm_gate,
+      "x"_a,
+      "w"_a,
+      "gate"_a,
+      "eps"_a = 1e-6f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused output gate of gated-delta layers: rms_norm(x, w, eps) *
+        sigmoid(gate) over the last axis in one dispatch, f32 math with one
+        round at the write, on every GPU and the CPU.
+
+        Args:
+            x (array): [..., D], float16/bfloat16, D 64, 128 or 256.
+            w (array): [D] norm weight; cast to the x dtype.
+            gate (array): same shape as x; cast to the x dtype.
+            eps (float): norm epsilon.
+
+        Returns:
+            array: same shape and dtype as x.
+      )");
+
+  m.def(
+      "kda_conv",
+      &mlx_kquant::kda_conv,
+      "x"_a,
+      "state"_a,
+      "w"_a,
+      "head_dim"_a,
+      "scale"_a = 0.0f,
+      "eps"_a = 1e-6f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused causal short convolution for gated-delta prefill (KDA, GDN):
+        y[t] = silu(sum_j w[:, j] * in[t - K + 1 + j]) with in = [state; x],
+        then with scale != 0 an l2 norm over each head_dim-channel head
+        with the scale folded in (scale * rms_norm(y, eps)). One dispatch
+        replaces the concat, conv1d, silu, rms_norm and multiply, with all
+        math in f32 and one round at the write, on every GPU and the CPU.
+
+        Args:
+            x (array): [B, T, C], float16/bfloat16.
+            state (array): [B, K - 1, C] carried rows (zeros for a fresh
+                sequence); cast to the x dtype.
+            w (array): [C, K] or [C, K, 1] depthwise taps (the nn.Conv1d
+                weight layout), K from 2 to 8; cast to the x dtype.
+            head_dim (int): norm group width, 64, 128 or 256; C must be a
+                multiple of it.
+            scale (float): folded norm scale; 0 skips the norm.
+            eps (float): norm epsilon.
+
+        Returns:
+            tuple: (y [B, T, C], state_out [B, K - 1, C]), the last K - 1
+            rows of [state; x] for the next call.
+      )");
+
+  m.def(
+      "kda_chunk_gated",
+      &mlx_kquant::kda_chunk_gated,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "a"_a,
+      "a_scale"_a,
+      "dt_bias"_a,
+      "beta"_a,
+      "state"_a,
+      "lb"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        kda_chunk with the decay formed inside the kernel:
+        log_g = lb * sigmoid(a_scale[h] * (a + dt_bias[h, d])) per token and
+        key channel (the KDA gate of Kimi Linear and GLM-5.3-Flash), so the
+        fp32 gate tensor is never written.
+
+        Args:
+            q, k, v (array): [B, T, H, 128], one float dtype.
+            a (array): [B, T, H, 128] gate pre-activation in the q dtype.
+            a_scale (array): [H] per-head factor, exp(A_log); used in fp32.
+            dt_bias (array): H * 128 values ([H, 128] or flat); fp32.
+            beta (array): [B, T, H] write gate.
+            state (array): [B, H, 128, 128] incoming state, fp32.
+            lb (float): gate lower bound (log g in (lb, 0)).
+
+        Returns:
+            tuple: (o [B, T, H, 128] in the q dtype, state_out fp32), as
+            kda_chunk on that log gate.
+      )");
+
+  m.def(
       "kda_chunk",
       &mlx_kquant::kda_chunk,
       "q"_a,

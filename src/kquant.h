@@ -1255,10 +1255,29 @@ std::vector<mx::array> kda_chunk(
     mx::array state,
     mx::StreamOrDevice s = {});
 
-// Chunked KDA prefill primitive (see kda_chunk). Inference-only.
+// kda_chunk with the decay formed inside the kernel from the gate
+// pre-activation: log_g = lb * sigmoid(a_scale[h] * (a + dt_bias[h, d]))
+// with a [B, T, H, 128] in the q dtype, a_scale [H] and dt_bias [H * 128]
+// (any float dtype, used in fp32). Same outputs and numerics as kda_chunk
+// on that log gate, without the fp32 gate tensor.
+std::vector<mx::array> kda_chunk_gated(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    mx::array a,
+    mx::array a_scale,
+    mx::array dt_bias,
+    mx::array beta,
+    mx::array state,
+    float lb,
+    mx::StreamOrDevice s = {});
+
+// Chunked KDA prefill primitive (see kda_chunk, kda_chunk_gated).
+// Inference-only. t_real is the unpadded length; lb applies when gated.
 class KQuantKdaChunk : public mx::Primitive {
  public:
-  explicit KQuantKdaChunk(mx::Stream stream) : mx::Primitive(stream) {}
+  KQuantKdaChunk(mx::Stream stream, int t_real, bool gated, float lb)
+      : mx::Primitive(stream), t_real_(t_real), gated_(gated), lb_(lb) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -1274,6 +1293,91 @@ class KQuantKdaChunk : public mx::Primitive {
     return "KQuantKdaChunk";
   }
   bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int t_real_;
+  bool gated_;
+  float lb_;
+};
+
+// Fused output gate for gated-delta layers: rms_norm(x, w, eps) *
+// sigmoid(gate) over the last axis (64, 128 or 256 wide), x and gate
+// [..., D] in float16/bfloat16, w [D] in the same dtype. One dispatch, f32
+// math, one round at the write; any GPU and the CPU.
+mx::array rmsnorm_gate(
+    mx::array x,
+    mx::array w,
+    mx::array gate,
+    float eps,
+    mx::StreamOrDevice s = {});
+
+// Fused output gate primitive (see rmsnorm_gate). Inference-only.
+class KQuantRMSNormGate : public mx::Primitive {
+ public:
+  KQuantRMSNormGate(mx::Stream stream, float eps)
+      : mx::Primitive(stream), eps_(eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantRMSNormGate";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return eps_ == static_cast<const KQuantRMSNormGate&>(other).eps_;
+  }
+
+ private:
+  float eps_;
+};
+
+// Fused causal short convolution for gated-delta prefill (KDA, GDN):
+//   y[t] = silu(sum_j w[:, j] * in[t - K + 1 + j]),  in = [state; x]
+// over x [B, T, C] (float16/bfloat16), state [B, K - 1, C] (the carried
+// rows, same dtype) and the depthwise taps w [C, K] or [C, K, 1] (the
+// nn.Conv1d layout). With scale != 0 each head_dim-channel head of y is
+// l2-normalized with the scale folded in (scale * rms_norm(y, eps));
+// head_dim must be 64, 128 or 256. Returns (y [B, T, C], state_out
+// [B, K - 1, C]: the last K - 1 rows of [state; x]). All math in f32 with
+// one round at the write, on every GPU and on the CPU.
+std::vector<mx::array> kda_conv(
+    mx::array x,
+    mx::array state,
+    mx::array w,
+    int head_dim,
+    float scale,
+    float eps,
+    mx::StreamOrDevice s = {});
+
+// Fused short-conv primitive (see kda_conv). Inference-only.
+class KQuantKdaConv : public mx::Primitive {
+ public:
+  KQuantKdaConv(mx::Stream stream, int head_dim, float scale, float eps)
+      : mx::Primitive(stream), head_dim_(head_dim), scale_(scale), eps_(eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantKdaConv";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int head_dim_;
+  float scale_;
+  float eps_;
 };
 
 // Index-gathered matrix-tile attention (see sdpa_fa_indexed). Inference-only.

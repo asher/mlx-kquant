@@ -489,4 +489,130 @@ mx::array rmsnorm2_add(
       {std::move(a_c), std::move(wa_c), std::move(b_c), std::move(wb_c)});
 }
 
+// ---- rmsnorm_gate ----------------------------------------------------------
+
+namespace {
+
+template <typename T>
+void rmsnorm_gate_cpu_impl(
+    const mx::array& x,
+    const mx::array& w,
+    const mx::array& gate,
+    mx::array& out,
+    float eps) {
+  const int D = x.shape(-1);
+  const size_t rows = x.size() / D;
+  const T* xp = x.data<T>();
+  const T* wp = w.data<T>();
+  const T* gp = gate.data<T>();
+  T* op = out.data<T>();
+  for (size_t r = 0; r < rows; ++r) {
+    const T* xr = xp + r * D;
+    float ss = 0.0f;
+    for (int i = 0; i < D; ++i) {
+      const float v = static_cast<float>(xr[i]);
+      ss = std::fma(v, v, ss);
+    }
+    const float inv = 1.0f / std::sqrt(ss / static_cast<float>(D) + eps);
+    for (int i = 0; i < D; ++i) {
+      const float g = static_cast<float>(gp[r * D + i]);
+      op[r * D + i] = static_cast<T>(
+          static_cast<float>(xr[i]) * inv * static_cast<float>(wp[i]) /
+          (1.0f + std::exp(-g)));
+    }
+  }
+}
+
+} // namespace
+
+void KQuantRMSNormGate::eval_cpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+  auto& encoder = mx::cpu::get_command_encoder(stream());
+  for (const auto& in : inputs) {
+    encoder.set_input_array(in);
+  }
+  encoder.set_output_array(out);
+  encoder.dispatch([x = mx::array::unsafe_weak_copy(inputs[0]),
+                    w = mx::array::unsafe_weak_copy(inputs[1]),
+                    g = mx::array::unsafe_weak_copy(inputs[2]),
+                    out = mx::array::unsafe_weak_copy(out),
+                    eps = eps_]() mutable {
+    if (x.dtype() == mx::float16) {
+      rmsnorm_gate_cpu_impl<mx::float16_t>(x, w, g, out, eps);
+    } else {
+      rmsnorm_gate_cpu_impl<mx::bfloat16_t>(x, w, g, out, eps);
+    }
+  });
+}
+
+#ifdef _METAL_
+
+void KQuantRMSNormGate::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+  const auto& x = inputs[0];
+  const int D = x.shape(-1);
+  const int nrows = int(x.size() / D);
+  std::string kname = "kq_rmsnorm_gate_" + kq_type_string(x.dtype()) + "_" +
+      std::to_string(D / 32);
+  auto kernel = kq_get_kernel(d, kname);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(inputs[0], 0);
+  ce.set_input_array(inputs[1], 1);
+  ce.set_input_array(inputs[2], 2);
+  ce.set_output_array(out, 3);
+  ce.set_bytes(eps_, 4);
+  ce.set_bytes(nrows, 5);
+  MTL::Size group_dims(256, 1, 1);
+  MTL::Size grid_dims((nrows + 7) / 8, 1, 1);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+#else // !_METAL_
+
+void KQuantRMSNormGate::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error("[mlx_kquant.rmsnorm_gate] requires a Metal build.");
+}
+
+#endif
+
+mx::array rmsnorm_gate(
+    mx::array x,
+    mx::array w,
+    mx::array gate,
+    float eps,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const char* op = "[mlx_kquant.rmsnorm_gate]";
+  if (x.ndim() < 1) {
+    throw std::invalid_argument(std::string(op) + " x must be [..., D].");
+  }
+  const int D = x.shape(-1);
+  if (D != 64 && D != 128 && D != 256) {
+    throw std::invalid_argument(std::string(op) + " D must be 64, 128 or 256.");
+  }
+  if (gate.shape() != x.shape()) {
+    throw std::invalid_argument(
+        std::string(op) + " gate must match the shape of x.");
+  }
+  auto x_c = prep_act(x, op, "x", s);
+  auto g_c = prep_act(mx::astype(gate, x.dtype(), s), op, "gate", s);
+  auto w_c = prep_norm_weight(mx::astype(w, x.dtype(), s), x, D, op, "w", s);
+  return mx::array(
+      x_c.shape(),
+      x_c.dtype(),
+      std::make_shared<KQuantRMSNormGate>(s, eps),
+      {x_c, w_c, g_c});
+}
+
 } // namespace mlx_kquant

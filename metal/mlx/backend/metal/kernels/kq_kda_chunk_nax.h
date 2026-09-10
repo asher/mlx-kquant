@@ -34,7 +34,7 @@
 // the error does not grow with the sequence length. The per-chunk critical
 // path (one threadgroup per head, 40 cores) is what bounds the kernel, so
 // the solve runs in registers and the staged operands go through
-// threadgroup memory once. q, k, v [B, T, H, D] in T; gam, beta, state
+// threadgroup memory once. q, k, v [B, T, H, D] in T; log_g, beta, state
 // fp32; T % 32 == 0 (the host pads); D == 128.
 
 #pragma once
@@ -125,18 +125,25 @@ METAL_FUNC void mma_s_bt(
 
 } // namespace kq_kda
 
-template <typename T>
+// GATED: buffer 3 holds the gate pre-activation a [B, T, H, D] in T and the
+// per-token log gate is lb * sigmoid(a_scale[h] * (a + dt_bias[h, d])),
+// zero on the padded rows past T_real (the log_g form pads with zeros).
+template <typename T, bool GATED>
 [[kernel, max_total_threads_per_threadgroup(256)]] void kq_kda_chunk_nax(
     const device T* q [[buffer(0)]],
     const device T* k [[buffer(1)]],
     const device T* v [[buffer(2)]],
-    const device float* gam [[buffer(3)]],
+    const device void* gate_in [[buffer(3)]],
     const device float* beta [[buffer(4)]],
     const device float* state_in [[buffer(5)]],
     device T* y [[buffer(6)]],
     device float* state_out [[buffer(7)]],
     const constant int& T_len [[buffer(8)]],
     const constant int& H [[buffer(9)]],
+    const device float* a_scale [[buffer(10)]],
+    const device float* dt_bias [[buffer(11)]],
+    const constant float& lb [[buffer(12)]],
+    const constant int& T_real [[buffer(13)]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint tid [[thread_index_in_threadgroup]],
     uint3 tgid [[threadgroup_position_in_grid]]) {
@@ -161,7 +168,10 @@ template <typename T>
   const device T* qb = q + (size_t(b) * T_len * H + h) * D;
   const device T* kb = k + (size_t(b) * T_len * H + h) * D;
   const device T* vb = v + (size_t(b) * T_len * H + h) * D;
-  const device float* gb = gam + (size_t(b) * T_len * H + h) * D;
+  const device float* gb = static_cast<const device float*>(gate_in) +
+      (size_t(b) * T_len * H + h) * D;
+  const device T* ab =
+      static_cast<const device T*>(gate_in) + (size_t(b) * T_len * H + h) * D;
   const device float* betb = beta + size_t(b) * T_len * H + h;
   device T* yb = y + (size_t(b) * T_len * H + h) * D;
   const size_t soff = (size_t(b) * H + h) * D * D + size_t(dv0) * D;
@@ -184,10 +194,34 @@ template <typename T>
       bet[tid] = betb[size_t(t0 + tid) * H];
     }
     const device float* gr = gb + size_t(t0) * HD + d;
+    const device T* ar = ab + size_t(t0) * HD + d;
+    const float asc = GATED ? a_scale[h] : 0.0f;
+    const float dtb = GATED ? dt_bias[h * D + d] : 0.0f;
     const device T* kr = kb + size_t(t0) * HD + d;
     const device T* qr = qb + size_t(t0) * HD + d;
-    const float g15 = gr[15 * HD];
-    const float g31 = gr[31 * HD];
+    // gamma = the within-chunk prefix sum of the per-token log gate, read
+    // for all 32 rows of this channel (the two staging threads of a
+    // channel share the lines); the thread keeps its own 16.
+    float gam[16];
+    float gacc = 0.0f;
+    float g15 = 0.0f;
+    STEEL_PRAGMA_UNROLL
+    for (int r = 0; r < C; ++r) {
+      if (GATED) {
+        const float z = asc * (float(ar[r * HD]) + dtb);
+        const float lg = lb / (1.0f + metal::exp(-z));
+        gacc += (t0 + r < T_real) ? lg : 0.0f;
+      } else {
+        gacc += gr[r * HD];
+      }
+      if (r == 15) {
+        g15 = gacc;
+      }
+      if ((r >> 4) == hrow) {
+        gam[r & 15] = gacc;
+      }
+    }
+    const float g31 = gacc;
     if (hrow == 0) {
       gC[d] = metal::exp(g31);
     }
@@ -197,7 +231,7 @@ template <typename T>
     STEEL_PRAGMA_UNROLL
     for (int i = 0; i < 16; ++i) {
       const int r = hrow * 16 + i;
-      const float g = gr[r * HD];
+      const float g = gam[i];
       kv[i] = float(kr[r * HD]);
       qv[i] = float(qr[r * HD]);
       e15[i] = metal::exp(g - g15);

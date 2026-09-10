@@ -13,6 +13,14 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   registers and the intra-chunk solve folded into matrix products, in
   place of stepping token by token. Takes the log decay, returns the
   output and the fp32 state; the CPU path runs the sequential recurrence.
+- `kda_chunk_gated`: `kda_chunk` with the decay formed inside the kernel
+  from the gate pre-activation (lb * sigmoid(a_scale * (a + dt_bias))),
+  so the fp32 log-decay tensor is never written.
+- `kda_conv`: the causal depthwise short conv of gated-delta prefill with
+  its silu, an optional per-head l2 norm with a folded scale and the tail
+  rows for the next call in one dispatch, on any GPU and the CPU.
+- `rmsnorm_gate`: rms_norm(x, w) * sigmoid(gate) over 64, 128 or 256
+  wide rows in one dispatch, the output gate of gated-delta layers.
 - `hc_front_expand_collapse`: `hc_front_expand_reduce` and
   `hc_sinkhorn_collapse` as one dispatch. Every threadgroup of a row
   publishes its mix dot and increments a per-row arrival counter, and the
