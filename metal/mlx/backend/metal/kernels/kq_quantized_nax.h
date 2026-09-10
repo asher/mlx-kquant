@@ -3933,7 +3933,10 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
 
   using AccumType = float;
 
-  // One accumulator per 16-row sub-band of the simdgroup's SM rows.
+  // One accumulator per 16-row sub-band of the simdgroup's SM rows. TN
+  // stays even: tile_matmad_nax's TN == 1 branch (mlx 0.32.1) feeds both
+  // M fragments into one 16 x 16 left operand and leaves the second
+  // output fragment untouched, so rows 16..31 of each pair read zero.
   NAXTile<AccumType, 1, TN> Dsub[TM];
 #pragma unroll
   for (short mi = 0; mi < TM; mi++) {

@@ -415,6 +415,54 @@ def test_gather_qmm_seg_nax_unaligned_n():
     bool(os.environ.get("KQUANT_FORCE_CPU")),
     reason="gather_qmm_seg is Metal-only.",
 )
+@pytest.mark.parametrize("codec", ["iq2_xs", "iq3_xxs"])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_gather_qmm_seg_nax_grid_codec_unaligned_n(codec, dtype):
+    """The IQ grid codecs of the prefill gathers on an N tail past the last
+    32-column simdgroup band, with tiles of 1, 33 and 65 rows (one live
+    16-row sub-band, a partial second band, a second map tile) and a full
+    tile, all match the per-expert loop."""
+    import mlx_kquant as kq
+
+    if not _nax_ok():
+        pytest.skip("NAX gather kernels unavailable on this GPU")
+    from mlx_kquant.codec_geometry import CODEC_GEOMETRY, bytes_per_row
+
+    rng = np.random.default_rng(41)
+    n_odd = 72
+    bpb = CODEC_GEOMETRY[codec][2]
+    wire = rng.integers(0, 256, (4, n_odd, bytes_per_row(codec, K)), dtype=np.uint8)
+    d = np.frombuffer(np.float16(0.01).tobytes(), dtype=np.uint8)
+    for b in range(0, wire.shape[-1], bpb):
+        wire[..., b : b + 2] = d
+    w = mx.array(wire)
+    s = mx.zeros((1,), dtype=mx.uint8)
+    counts = np.array([1, 33, 65, 64], dtype=np.int64)
+    rows = int(counts.sum())
+    x = mx.array((rng.standard_normal((rows, K)) * 0.1).astype(np.float32)).astype(
+        dtype
+    )
+    got = kq.gather_qmm_seg(x, w, s, codec, *_tile_maps(counts))
+    refs, start = [], 0
+    for e in np.flatnonzero(counts):
+        c = int(counts[e])
+        refs.append(
+            kq.quantized_matmul(x[start : start + c], w[e], s, codec, transpose=True)
+        )
+        start += c
+    ref = mx.concatenate(refs)
+    mx.eval(got, ref)
+    g = np.array(got.astype(mx.float32))
+    r = np.array(ref.astype(mx.float32))
+    rel = np.linalg.norm(g - r) / (np.linalg.norm(r) + 1e-6)
+    assert got.shape == (rows, n_odd) and rel < 2e-3, f"{codec} {dtype}: rel {rel:.3e}"
+    assert np.isfinite(g).all()
+
+
+@pytest.mark.skipif(
+    bool(os.environ.get("KQUANT_FORCE_CPU")),
+    reason="gather_qmm_seg is Metal-only.",
+)
 def test_gather_qmm_seg_rejects_bad_inputs():
     import mlx_kquant as kq
 
