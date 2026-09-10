@@ -1209,6 +1209,425 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
 }
 
 // ---------------------------------------------------------------------------
+// Dedupe gathers for the MTP verify widths (T = 2..8 rows per step). The
+// rows of a verify block route to overlapping expert sets (GLM-5.3-Flash
+// measured 3.65 of 8 shared between two consecutive rows), and the plain
+// gathers dequantize a shared expert once per (row, slot) pair. These
+// kernels pair the (row, slot) pairs that route to one expert: the first
+// pair in row-major order owns the expert, dequantizes its weight row
+// once and dots it against both pairs' activation rows; the second pair's
+// threadgroup returns before staging. A third pair on the same expert
+// starts a new owner (pairs only: two accumulators keep the register
+// budget of the single-row kernels). Per row the chunk accumulation and
+// the reduce keep the single-row order, so the GLU outputs are
+// bit-identical to the plain kernels. The shared expert pairs rows the
+// same way (row 0 with row 1, row 2 with row 3, ...).
+//   moe_glu_gather_dd / moe_glu_gather_shexp_dd: grid (N-tiles, slots, T).
+//   gather_qmv_mix_ns_dd / gather_qmv_mix_dd: row pairs on the down
+//     projection (kq_ext_gather_qmv_mix_pair), the loop kernel's launch
+//     over row pairs, bit-identical to the loop kernels.
+// ---------------------------------------------------------------------------
+
+// One threadgroup LUT buffer sized for the larger of two codecs; the
+// branch that runs stages its own tables (branch conditions are
+// threadgroup-uniform, so the barrier inside is safe).
+#define KQ_EXT_DECL_LUTS2(CodecA, CodecB, name)            \
+  threadgroup uint4 name##_v                               \
+      [((KqTgLuts<CodecA>::bytes > KqTgLuts<CodecB>::bytes \
+             ? KqTgLuts<CodecA>::bytes                     \
+             : KqTgLuts<CodecB>::bytes) +                  \
+        15) /                                              \
+           16 +                                            \
+       1];                                                 \
+  threadgroup uint8_t* name = reinterpret_cast<threadgroup uint8_t*>(name##_v);
+#define KQ_EXT_STAGE_INTO(CodecT, name)                               \
+  if (KqTgLuts<CodecT>::bytes > 0) {                                  \
+    KqTgLuts<CodecT>::stage(                                          \
+        name, ushort(simd_gid * 32 + simd_lid), ushort(32 * tptg.y)); \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                  \
+  }
+
+// Pair ownership: pair p owns its expert when an even number of earlier
+// pairs route to the same expert; it then also serves the next such pair.
+METAL_FUNC int
+kq_dd_partner(const device uint32_t* indices, int p, int P, uint32_t e) {
+  int rank = 0;
+  for (int q = 0; q < p; ++q) {
+    rank += int(indices[q] == e);
+  }
+  if (rank & 1) {
+    return -2; // served by the previous pair
+  }
+  for (int q = p + 1; q < P; ++q) {
+    if (indices[q] == e) {
+      return q;
+    }
+  }
+  return -1; // sole owner
+}
+
+template <typename T, typename Codec, int NX>
+METAL_FUNC float2 kq_ext_row_partial_pair(
+    const device uint8_t* w,
+    const device T* x0,
+    const device T* x1,
+    int64_t row,
+    int K,
+    short tx,
+    const threadgroup uint8_t* luts) {
+  constexpr short chpb = Codec::superblock / 16;
+  const int nb = K / Codec::superblock;
+  const device uint8_t* w_row = w + row * (int64_t)nb * Codec::block_bytes;
+  float2 acc = float2(0.0f);
+  for (int ich = tx; 16 * ich < K; ich += NX) {
+    const device uint8_t* block =
+        w_row + (int64_t)(ich / chpb) * Codec::block_bytes;
+    float4x4 lw;
+    float sc;
+    KqTgLuts<Codec>::deq_chunk16s(block, short(ich % chpb), lw, luts, sc);
+    const device T* xp = x0 + ich * 16;
+    acc.x += sc *
+        (dot(lw[0], float4(*(const device vec<T, 4>*)(xp + 0))) +
+         dot(lw[1], float4(*(const device vec<T, 4>*)(xp + 4))) +
+         dot(lw[2], float4(*(const device vec<T, 4>*)(xp + 8))) +
+         dot(lw[3], float4(*(const device vec<T, 4>*)(xp + 12))));
+    xp = x1 + ich * 16;
+    acc.y += sc *
+        (dot(lw[0], float4(*(const device vec<T, 4>*)(xp + 0))) +
+         dot(lw[1], float4(*(const device vec<T, 4>*)(xp + 4))) +
+         dot(lw[2], float4(*(const device vec<T, 4>*)(xp + 8))) +
+         dot(lw[3], float4(*(const device vec<T, 4>*)(xp + 12))));
+  }
+  return acc;
+}
+
+// GLU pair form: (gate, up) for row x0 in .xy and for row x1 in .zw.
+template <typename T, typename Codec, int NX>
+METAL_FUNC float4 kq_ext_glu_row_partial_pair(
+    const device uint8_t* gw,
+    const device uint8_t* uw,
+    const device T* x0,
+    const device T* x1,
+    int64_t row,
+    int K,
+    short tx,
+    const threadgroup uint8_t* luts) {
+  constexpr short chpb = Codec::superblock / 16;
+  const int nb = K / Codec::superblock;
+  const int64_t row_off = row * (int64_t)nb * Codec::block_bytes;
+  const device uint8_t* g_row = gw + row_off;
+  const device uint8_t* u_row = uw + row_off;
+  float4 acc = float4(0.0f);
+  for (int ich = tx; 16 * ich < K; ich += NX) {
+    const int64_t boff = (int64_t)(ich / chpb) * Codec::block_bytes;
+    const short cch = short(ich % chpb);
+    const device T* xp = x0 + ich * 16;
+    const float4 a0 = float4(*(const device vec<T, 4>*)(xp + 0));
+    const float4 a1 = float4(*(const device vec<T, 4>*)(xp + 4));
+    const float4 a2 = float4(*(const device vec<T, 4>*)(xp + 8));
+    const float4 a3 = float4(*(const device vec<T, 4>*)(xp + 12));
+    const device T* yp = x1 + ich * 16;
+    float4x4 lw;
+    float sc;
+    KqTgLuts<Codec>::deq_chunk16s(g_row + boff, cch, lw, luts, sc);
+    acc.x += sc *
+        (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
+    acc.z += sc *
+        (dot(lw[0], float4(*(const device vec<T, 4>*)(yp + 0))) +
+         dot(lw[1], float4(*(const device vec<T, 4>*)(yp + 4))) +
+         dot(lw[2], float4(*(const device vec<T, 4>*)(yp + 8))) +
+         dot(lw[3], float4(*(const device vec<T, 4>*)(yp + 12))));
+    KqTgLuts<Codec>::deq_chunk16s(u_row + boff, cch, lw, luts, sc);
+    acc.y += sc *
+        (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
+    acc.w += sc *
+        (dot(lw[0], float4(*(const device vec<T, 4>*)(yp + 0))) +
+         dot(lw[1], float4(*(const device vec<T, 4>*)(yp + 4))) +
+         dot(lw[2], float4(*(const device vec<T, 4>*)(yp + 8))) +
+         dot(lw[3], float4(*(const device vec<T, 4>*)(yp + 12))));
+  }
+  return acc;
+}
+
+template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
+[[kernel]] void kq_ext_moe_glu_gather_dd(
+    const device uint8_t* gw [[buffer(0)]],
+    const device uint8_t* uw [[buffer(1)]],
+    const device T* x [[buffer(2)]],
+    const device uint32_t* indices [[buffer(3)]],
+    device T* out [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant float& limit [[buffer(7)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int RPS = 32 / NX;
+  const short tx = short(simd_lid % NX);
+  const short ty = short(simd_lid / NX);
+  const int R = tpg.y;
+  const int p = int(tid.z) * R + int(tid.y);
+  const uint32_t expert = indices[p];
+  const int q = kq_dd_partner(indices, p, R * int(tpg.z), expert);
+  if (q == -2) {
+    return;
+  }
+  const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
+  const int64_t wrow = (int64_t)expert * N + out_row;
+  x += (int64_t)tid.z * K;
+
+  KQ_EXT_STAGE_LUTS(Codec, kq_luts)
+  if (q < 0) {
+    const float2 gu =
+        kq_ext_glu_row_partial<T, Codec, NX>(gw, uw, x, wrow, K, tx, kq_luts);
+    const float g = kq_ext_reduce<NX>(gu.x);
+    const float u = kq_ext_reduce<NX>(gu.y);
+    if (tx == 0) {
+      out[(int64_t)p * N + out_row] =
+          static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
+    }
+    return;
+  }
+  const device T* x1 = x + (int64_t)(q / R - int(tid.z)) * K;
+  const float4 gu = kq_ext_glu_row_partial_pair<T, Codec, NX>(
+      gw, uw, x, x1, wrow, K, tx, kq_luts);
+  const float g0 = kq_ext_reduce<NX>(gu.x);
+  const float u0 = kq_ext_reduce<NX>(gu.y);
+  const float g1 = kq_ext_reduce<NX>(gu.z);
+  const float u1 = kq_ext_reduce<NX>(gu.w);
+  if (tx == 0) {
+    out[(int64_t)p * N + out_row] =
+        static_cast<T>(kq_glu_epilogue<ACT>(g0, u0, limit));
+    out[(int64_t)q * N + out_row] =
+        static_cast<T>(kq_glu_epilogue<ACT>(g1, u1, limit));
+  }
+}
+
+template <
+    typename T,
+    typename Codec,
+    typename SCodec,
+    int ACT,
+    int NX = KQ_EXT_NXPSG>
+[[kernel]] void kq_ext_moe_glu_gather_shexp_dd(
+    const device uint8_t* gw [[buffer(0)]],
+    const device uint8_t* uw [[buffer(1)]],
+    const device uint8_t* sgw [[buffer(2)]],
+    const device uint8_t* suw [[buffer(3)]],
+    const device T* x [[buffer(4)]],
+    const device uint32_t* indices [[buffer(5)]],
+    device T* out [[buffer(6)]],
+    const constant int& K [[buffer(7)]],
+    const constant int& N [[buffer(8)]],
+    const constant float& limit [[buffer(9)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int RPS = 32 / NX;
+  const short tx = short(simd_lid % NX);
+  const short ty = short(simd_lid / NX);
+  const int n_route = tpg.y - 1;
+  const int T_ = int(tpg.z);
+  const bool shared_slot = int(tid.y) == n_route;
+  // Output rows are (row, slot) over tpg.y slots; partner q is the other
+  // output row served by this threadgroup (-1: none, -2: served elsewhere).
+  const int p = int(tid.z) * int(tpg.y) + int(tid.y);
+  int q = -1;
+  int q_row = 0;
+  uint32_t expert = 0;
+  if (shared_slot) {
+    if (int(tid.z) & 1) {
+      return;
+    }
+    if (int(tid.z) + 1 < T_) {
+      q_row = int(tid.z) + 1;
+      q = q_row * int(tpg.y) + n_route;
+    }
+  } else {
+    const int pr = int(tid.z) * n_route + int(tid.y);
+    expert = indices[pr];
+    const int qr = kq_dd_partner(indices, pr, n_route * T_, expert);
+    if (qr == -2) {
+      return;
+    }
+    if (qr >= 0) {
+      q_row = qr / n_route;
+      q = q_row * int(tpg.y) + (qr % n_route);
+    }
+  }
+  const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
+  x += (int64_t)tid.z * K;
+
+  const device T* x1 = q < 0 ? x : x + (int64_t)(q_row - int(tid.z)) * K;
+  float4 gu = float4(0.0f);
+  KQ_EXT_DECL_LUTS2(Codec, SCodec, kq_luts)
+  if (shared_slot) {
+    KQ_EXT_STAGE_INTO(SCodec, kq_luts)
+    if (q < 0) {
+      gu.xy = kq_ext_glu_row_partial<T, SCodec, NX>(
+          sgw, suw, x, (int64_t)out_row, K, tx, kq_luts);
+    } else {
+      gu = kq_ext_glu_row_partial_pair<T, SCodec, NX>(
+          sgw, suw, x, x1, (int64_t)out_row, K, tx, kq_luts);
+    }
+  } else {
+    KQ_EXT_STAGE_INTO(Codec, kq_luts)
+    const int64_t wrow = (int64_t)expert * N + out_row;
+    if (q < 0) {
+      gu.xy =
+          kq_ext_glu_row_partial<T, Codec, NX>(gw, uw, x, wrow, K, tx, kq_luts);
+    } else {
+      gu = kq_ext_glu_row_partial_pair<T, Codec, NX>(
+          gw, uw, x, x1, wrow, K, tx, kq_luts);
+    }
+  }
+  const float g0 = kq_ext_reduce<NX>(gu.x);
+  const float u0 = kq_ext_reduce<NX>(gu.y);
+  const float g1 = kq_ext_reduce<NX>(gu.z);
+  const float u1 = kq_ext_reduce<NX>(gu.w);
+  if (tx == 0) {
+    out[(int64_t)p * N + out_row] =
+        static_cast<T>(kq_glu_epilogue<ACT>(g0, u0, limit));
+    if (q >= 0) {
+      out[(int64_t)q * N + out_row] =
+          static_cast<T>(kq_glu_epilogue<ACT>(g1, u1, limit));
+    }
+  }
+}
+
+// Row-pair mix (mix_ns and the shexp-slot mix): the loop kernel's launch
+// with each simdgroup serving rows (2z, 2z+1). Row 2z's slots run in slot
+// order; a slot whose expert row 2z+1 also routes dots both activation
+// rows against one dequantized weight chunk and parks the second row's
+// lane partial by its slot. Row 2z+1's unshared slots follow, and its
+// chain then runs in its own slot order, so both rows are bit-identical
+// to the loop kernel. A row that routes one expert twice pairs its k-th
+// copy with the other row's k-th copy. With SHEXP the last slot reads
+// `sw` and pairs the two rows unconditionally.
+// Dispatch: the loop kernel's group and grid with z = ceil(T / 2); host
+// gates S <= KQ_MOE_SP_MAX_S.
+template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
+[[kernel]] void kq_ext_gather_qmv_mix_pair(
+    const device uint8_t* w [[buffer(0)]],
+    const device uint8_t* sw [[buffer(1)]],
+    const device T* h [[buffer(2)]],
+    const device uint32_t* indices [[buffer(3)]],
+    const device float* scores [[buffer(4)]],
+    device T* out [[buffer(5)]],
+    const constant int& K [[buffer(6)]],
+    const constant int& N [[buffer(7)]],
+    const constant int& S [[buffer(8)]],
+    const constant int& SC [[buffer(9)]],
+    const constant int& T_ [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int RPS = 32 / NX;
+  const short tx = short(simd_lid % NX);
+  const short ty = short(simd_lid / NX);
+  const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
+  const int ra = 2 * int(tid.z);
+  const int rb = ra + 1;
+  const bool has_b = rb < T_;
+  const int n_route = SHEXP ? S - 1 : S;
+
+  KQ_EXT_STAGE_LUTS(Codec, kq_luts)
+  threadgroup uint4
+      kq_sluts_v[(SHEXP ? (KqTgLuts<SCodec>::bytes + 15) / 16 : 0) + 1];
+  threadgroup uint8_t* kq_sluts =
+      reinterpret_cast<threadgroup uint8_t*>(kq_sluts_v);
+  if (SHEXP && KqTgLuts<SCodec>::bytes > 0) {
+    KqTgLuts<SCodec>::stage(
+        kq_sluts, ushort(simd_gid * 32 + simd_lid), ushort(32 * tptg.y));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  float pb[KQ_MOE_SP_MAX_S + 1];
+  uint claimed = 0;
+  float result = 0.0f;
+  for (int slot = 0; slot < n_route; slot++) {
+    const int expert = int(indices[ra * n_route + slot]);
+    const device T* xa = h + ((int64_t)ra * S + slot) * K;
+    const int64_t wrow = (int64_t)expert * N + out_row;
+    int sb = -1;
+    if (has_b) {
+      int k = 0;
+      for (int u = 0; u < slot; ++u) {
+        k += int(int(indices[ra * n_route + u]) == expert);
+      }
+      for (int u = 0; u < n_route; ++u) {
+        if (int(indices[rb * n_route + u]) == expert) {
+          if (k == 0) {
+            sb = u;
+            break;
+          }
+          --k;
+        }
+      }
+    }
+    if (sb >= 0) {
+      const device T* xb = h + ((int64_t)rb * S + sb) * K;
+      const float2 p = kq_ext_row_partial_pair<T, Codec, NX>(
+          w, xa, xb, wrow, K, tx, kq_luts);
+      result += scores[ra * SC + slot] * p.x;
+      pb[sb] = p.y;
+      claimed |= 1u << sb;
+    } else {
+      result += scores[ra * SC + slot] *
+          kq_ext_row_partial<T, Codec, NX>(w, xa, wrow, K, tx, kq_luts);
+    }
+  }
+  if (SHEXP) {
+    // SC == S - 1: the shared slot's weight is an implicit 1
+    const device T* xa = h + ((int64_t)ra * S + n_route) * K;
+    const float wa = SC == S ? scores[ra * SC + n_route] : 1.0f;
+    if (has_b) {
+      const device T* xb = h + ((int64_t)rb * S + n_route) * K;
+      const float2 p = kq_ext_row_partial_pair<T, SCodec, NX>(
+          sw, xa, xb, (int64_t)out_row, K, tx, kq_sluts);
+      result += wa * p.x;
+      pb[n_route] = p.y;
+    } else {
+      result += wa *
+          kq_ext_row_partial<T, SCodec, NX>(
+                    sw, xa, (int64_t)out_row, K, tx, kq_sluts);
+    }
+  }
+  result = kq_ext_reduce<NX>(result);
+  if (tx == 0) {
+    out[(int64_t)ra * N + out_row] = static_cast<T>(result);
+  }
+  if (!has_b) {
+    return;
+  }
+  for (int slot = 0; slot < n_route; slot++) {
+    if ((claimed >> slot) & 1u) {
+      continue;
+    }
+    const int expert = int(indices[rb * n_route + slot]);
+    const device T* xb = h + ((int64_t)rb * S + slot) * K;
+    pb[slot] = kq_ext_row_partial<T, Codec, NX>(
+        w, xb, (int64_t)expert * N + out_row, K, tx, kq_luts);
+  }
+  result = 0.0f;
+  for (int slot = 0; slot < n_route; slot++) {
+    result += scores[rb * SC + slot] * pb[slot];
+  }
+  if (SHEXP) {
+    result += (SC == S ? scores[rb * SC + n_route] : 1.0f) * pb[n_route];
+  }
+  result = kq_ext_reduce<NX>(result);
+  if (tx == 0) {
+    out[(int64_t)rb * N + out_row] = static_cast<T>(result);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Router top-k (codec-independent float kernel): score E logits, pick the
 // top R (min-index tie-break), emit gather-ready indices [T, R] uint32 and
 // mix scores [T, R + SHARED] float32 in one dispatch. SCORING == 0 is f32

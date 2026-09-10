@@ -280,6 +280,10 @@ All optional; the defaults are right for normal use.
   call. A/B lever.
 - `KQ_DISABLE_GATHER_SEG_NAX=1` - run `gather_qmm_seg` on its steel simdgroup-mma kernel even where
   the NAX tile kernel is available. Read once per process. A/B lever.
+- `KQ_MOE_DEDUP=0` - on Metal, run the fused MoE gathers at verify widths (2 to 8 rows per
+  step) as one dispatch per (row, expert) pair instead of the default dedupe kernels, which
+  dequantize an expert once per pair of rows that select it. Read per call. Outputs are
+  bit-identical either way; `KQ_MOE_HALF=1` keeps its own kernels at every width. A/B lever.
 - `KQ_MOE_HALF=1` - on Metal, run the iq2_xs, iq2_xxs and iq3_xxs fused MoE decode gathers on the
   half-dot kernels (half grid tables, half-staged activations, half chunk dots with a float sum per
   chunk; shared-expert slots stay on the float path). Read per call. Default off: the outputs differ

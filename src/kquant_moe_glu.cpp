@@ -94,6 +94,30 @@ inline bool kq_moe_mix_ns_wide(const std::string& codec, int T, int K) {
       codec == "iq3_xxs";
 }
 
+// Dedupe gathers for the MTP verify widths (KQ_MOE_DEDUP, default on; 0
+// disables, read live once set): rows of a verify block route to
+// overlapping expert sets, and the "_dd" kernels pair the (row, slot)
+// pairs that share an expert so each expert is dequantized once per pair
+// of rows. The GLU gathers keep the per-pair grid and write both rows
+// from the owner; the down projection runs the loop kernel's launch over
+// row pairs. Outputs are bit-identical to the per-row kernels. The
+// half-dot kernels have no dedupe form; an explicit KQ_MOE_HALF=1 keeps
+// its kernels at every width and dedupe stands down.
+inline bool kq_moe_dedup(int T, int max_t) {
+  if (T < 2 || T > max_t) {
+    return false;
+  }
+  static const bool has_env = std::getenv("KQ_MOE_DEDUP") != nullptr;
+  if (has_env) {
+    const char* e = std::getenv("KQ_MOE_DEDUP");
+    if (e != nullptr && std::atoi(e) == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+constexpr int KQ_DD_MAX_T = 8;
+
 inline const char* kq_nx_suffix(int nx) {
   return nx == 32 ? "_nx32" : (nx == 16 ? "_nx16" : "");
 }
@@ -159,6 +183,45 @@ inline void kq_moe_log_kname(const std::string& kname) {
   if (seen.insert(kname).second) {
     std::fprintf(stderr, "[kq_moe] %s\n", kname.c_str());
   }
+}
+
+// Row-pair dedupe down projection (mix_ns and the shexp-slot mix): the
+// loop kernel's launch over row pairs; S is capped by the partial store.
+inline void kq_gather_qmv_pair_gpu(
+    mx::metal::Device& d,
+    const mx::Stream& s,
+    const std::string& kname,
+    const mx::array& w,
+    const mx::array& sw,
+    const mx::array& x,
+    const mx::array& indices,
+    const mx::array& scores,
+    mx::array& out,
+    int T,
+    int S,
+    int N,
+    int K,
+    int nx,
+    int sg) {
+  kq_moe_log_kname(kname);
+  auto kernel = kq_get_kernel(d, kname);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(w, 0);
+  ce.set_input_array(sw, 1);
+  ce.set_input_array(x, 2);
+  ce.set_input_array(indices, 3);
+  ce.set_input_array(scores, 4);
+  ce.set_output_array(out, 5);
+  ce.set_bytes(K, 6);
+  ce.set_bytes(N, 7);
+  ce.set_bytes(S, 8);
+  const int SC = scores.shape(1);
+  ce.set_bytes(SC, 9);
+  ce.set_bytes(T, 10);
+  MTL::Size group_dims(32, sg, 1);
+  MTL::Size grid_dims(N / (sg * 32 / nx), 1, (T + 1) / 2);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
 // Wide-NX variants exist only on the generic Ext kernels; tuned q6_k/q8_0
@@ -397,11 +460,15 @@ void KQuantMoEGLUKQ::eval_gpu(
   // The half kernels run at nx 8: 32 rows per threadgroup amortize the
   // staged activation row and half grid (nx 16 measured 10% slower).
   const bool use_half = !biased && kq_moe_half(kquant_type_, K);
+  const bool dd = !biased && !use_half && kq_moe_dedup(T, KQ_DD_MAX_T);
   const int nx = use_half ? 8 : kq_moe_pick_nx((int64_t)N * R * T, K, true);
-  const std::string stem = kq_gather_stem_nx(kquant_type_, K, nx);
+  std::string stem = kq_gather_stem_nx(kquant_type_, K, nx);
+  if (dd && (stem == "q6_k" || stem == "q8_0")) {
+    stem += "_ext"; // the dedupe kernels are Ext-only
+  }
   std::string kname = "kq_" + stem + "_moe_glu_gather_" +
-      (biased ? "bias_" : "") + (use_half ? "h_" : "") + act_ +
-      kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
+      (biased ? "bias_" : "") + (use_half ? "h_" : "") + (dd ? "dd_" : "") +
+      act_ + kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
   kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -535,14 +602,18 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   const bool use_half = kq_moe_half(kquant_type_, K) &&
       (shexp_type_ == kquant_type_ || shexp_type_ == "q5_k" ||
        shexp_type_ == "q6_k" || shexp_type_ == "q8_0");
+  const bool dd = !use_half && kq_moe_dedup(T, KQ_DD_MAX_T);
   const int nx =
       use_half ? 8 : kq_moe_pick_nx((int64_t)N * (R + 1) * T, K, true);
-  const std::string stem = shexp_type_ == kquant_type_
+  std::string stem = shexp_type_ == kquant_type_
       ? kq_gather_stem_nx(kquant_type_, K, nx)
       : kquant_type_ + "_sx_" + shexp_type_;
+  if (dd && (stem == "q6_k" || stem == "q8_0")) {
+    stem += "_ext";
+  }
   std::string kname = "kq_" + stem + "_moe_glu_gather_shexp_" +
-      (use_half ? "h_" : "") + act_ + kq_nx_suffix(nx) + "_" +
-      kq_type_string(x.dtype());
+      (use_half ? "h_" : "") + (dd ? "dd_" : "") + act_ + kq_nx_suffix(nx) +
+      "_" + kq_type_string(x.dtype());
   kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -595,12 +666,43 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   const bool use_half = kq_moe_half(kquant_type_, K) &&
       (shexp_type_ == kquant_type_ || shexp_type_ == "q5_k" ||
        shexp_type_ == "q6_k" || shexp_type_ == "q8_0");
+  const bool dd = !use_half && S <= 16 && kq_moe_dedup(T, KQ_DD_MAX_T);
+  if (dd) {
+    // The pair launch serves two rows per grid step, so the width pick
+    // sees a two-row step whatever the block width.
+    const int nx = kq_moe_pick_nx(
+        (int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, 2, K));
+    std::string stem = shexp_type_ == kquant_type_
+        ? kq_gather_stem_nx(kquant_type_, K, nx)
+        : kquant_type_ + "_sx_" + shexp_type_;
+    if (stem == "q6_k" || stem == "q8_0") {
+      stem += "_ext";
+    }
+    kq_gather_qmv_pair_gpu(
+        d,
+        s,
+        "kq_" + stem + "_gather_qmv_mix_dd" + kq_nx_suffix(nx) + "_" +
+            kq_type_string(x.dtype()),
+        w,
+        sw,
+        x,
+        indices,
+        scores,
+        out,
+        T,
+        S,
+        N,
+        K,
+        nx,
+        kq_moe_pick_sg(kquant_type_, N, nx));
+    return;
+  }
   int nx =
       kq_moe_pick_nx((int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, T, K));
   if (use_half && nx > 16) {
     nx = 16;
   }
-  const std::string stem = shexp_type_ == kquant_type_
+  std::string stem = shexp_type_ == kquant_type_
       ? kq_gather_stem_nx(kquant_type_, K, nx)
       : kquant_type_ + "_sx_" + shexp_type_;
   // Fine tiling on the tuned uniform-codec kernels only (see gather_qmv).
@@ -664,27 +766,48 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   // No fine tier: the Ext fine variants measured E2E-neutral and were
   // dropped. Decode-scale launches route to the slot-parallel variant
   // unless the codec widens (kq_moe_mix_ns_wide).
-  const int nx =
-      kq_moe_pick_nx((int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, T, K));
-  const bool sp = nx == 8 && kq_moe_sp((int64_t)T * (N / 8), S);
-  std::string kname = "kq_" + kquant_type_ + "_gather_qmv_mix_ns" +
-      (sp ? "_sp" : kq_nx_suffix(nx)) + "_" + kq_type_string(x.dtype());
-  kq_moe_log_kname(kname);
-  auto kernel = kq_get_kernel(d, kname);
-  auto& ce = mx::metal::get_command_encoder(s);
-  ce.set_compute_pipeline_state(kernel);
-  ce.set_input_array(w, 0);
-  ce.set_input_array(x, 1);
-  ce.set_input_array(indices, 2);
-  ce.set_input_array(scores, 3);
-  ce.set_output_array(out, 4);
-  ce.set_bytes(K, 5);
-  ce.set_bytes(N, 6);
-  ce.set_bytes(S, 7);
-  const int sg = sp ? 2 * S : kq_moe_pick_sg(kquant_type_, N, nx);
-  MTL::Size group_dims(32, sg, 1);
-  MTL::Size grid_dims(N / (sp ? 8 : (sg * 32 / nx)), 1, T);
-  ce.dispatch_threadgroups(grid_dims, group_dims);
+  const bool dd = S <= 16 && kq_moe_dedup(T, KQ_DD_MAX_T);
+  const int nx = kq_moe_pick_nx(
+      (int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, dd ? 2 : T, K));
+  if (dd) {
+    kq_gather_qmv_pair_gpu(
+        d,
+        s,
+        "kq_" + kquant_type_ + "_gather_qmv_mix_ns_dd" + kq_nx_suffix(nx) +
+            "_" + kq_type_string(x.dtype()),
+        w,
+        w,
+        x,
+        indices,
+        scores,
+        out,
+        T,
+        S,
+        N,
+        K,
+        nx,
+        kq_moe_pick_sg(kquant_type_, N, nx));
+  } else {
+    const bool sp = nx == 8 && kq_moe_sp((int64_t)T * (N / 8), S);
+    std::string kname = "kq_" + kquant_type_ + "_gather_qmv_mix_ns" +
+        (sp ? "_sp" : kq_nx_suffix(nx)) + "_" + kq_type_string(x.dtype());
+    kq_moe_log_kname(kname);
+    auto kernel = kq_get_kernel(d, kname);
+    auto& ce = mx::metal::get_command_encoder(s);
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(w, 0);
+    ce.set_input_array(x, 1);
+    ce.set_input_array(indices, 2);
+    ce.set_input_array(scores, 3);
+    ce.set_output_array(out, 4);
+    ce.set_bytes(K, 5);
+    ce.set_bytes(N, 6);
+    ce.set_bytes(S, 7);
+    const int sg = sp ? 2 * S : kq_moe_pick_sg(kquant_type_, N, nx);
+    MTL::Size group_dims(32, sg, 1);
+    MTL::Size grid_dims(N / (sp ? 8 : (sg * 32 / nx)), 1, T);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+  }
   if (lora_z) {
     kq_lora_mix_apply_gpu(d, s, *lora_z, scores, lv, out, T, S, N);
   }

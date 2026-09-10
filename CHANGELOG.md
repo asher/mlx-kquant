@@ -7,6 +7,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Fused MoE decode gathers at MTP verify widths (2 to 8 rows per step)
+  dequantize a routed expert once per pair of rows that select it, and
+  the shared expert once per pair of rows. Rows of a verify block share
+  most of their experts (3.65 of 8 measured on GLM-5.3-Flash), so a
+  two-row step reads about a quarter less expert weight. Outputs are
+  bit-identical to the per-row kernels. `KQ_MOE_DEDUP=0` restores the
+  per-row dispatch.
 - `KQ_MOE_HALF=1` (default off) switches the iq2_xs, iq2_xxs and iq3_xxs
   fused MoE decode gathers (gate/up, shexp, qmv, score mix) to half-dot
   kernels: the grid stages as half4 pairs, the activation row is staged as

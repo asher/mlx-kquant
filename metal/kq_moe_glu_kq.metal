@@ -94,7 +94,25 @@ instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
       kq_ext_moe_glu_gather_shexp, type, traits, traits, KQ_GLU_ACT_GELU, nx)  \
   instantiate_kernel(                                                         \
       "kq_" #codec "_gather_qmv_mix" sfx "_" #type,                           \
-      kq_ext_gather_qmv_mix, type, traits, traits, nx)
+      kq_ext_gather_qmv_mix, type, traits, traits, nx)                         \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_dd_silu" sfx "_" #type,                   \
+      kq_ext_moe_glu_gather_dd, type, traits, KQ_GLU_ACT_SILU, nx)             \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_dd_gelu" sfx "_" #type,                   \
+      kq_ext_moe_glu_gather_dd, type, traits, KQ_GLU_ACT_GELU, nx)             \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_dd_silu_limit" sfx "_" #type,             \
+      kq_ext_moe_glu_gather_dd, type, traits, KQ_GLU_ACT_SILU_LIMIT, nx)       \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_shexp_dd_silu" sfx "_" #type,             \
+      kq_ext_moe_glu_gather_shexp_dd, type, traits, traits, KQ_GLU_ACT_SILU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_shexp_dd_gelu" sfx "_" #type,             \
+      kq_ext_moe_glu_gather_shexp_dd, type, traits, traits, KQ_GLU_ACT_GELU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_dd" sfx "_" #type,                        \
+      kq_ext_gather_qmv_mix_pair, type, traits, traits, true, nx)              \
 
 #define instantiate_kq_ext_uniform(codec, traits, type)                       \
   instantiate_kq_ext_uniform_nx(codec, traits, type, 8, "")                    \
@@ -112,7 +130,16 @@ instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
       kq_ext_moe_glu_gather_shexp, type, traits, straits, KQ_GLU_ACT_GELU, nx) \
   instantiate_kernel(                                                         \
       "kq_" #codec "_sx_" #scodec "_gather_qmv_mix" sfx "_" #type,            \
-      kq_ext_gather_qmv_mix, type, traits, straits, nx)
+      kq_ext_gather_qmv_mix, type, traits, straits, nx)                        \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_dd_silu" sfx "_" #type, \
+      kq_ext_moe_glu_gather_shexp_dd, type, traits, straits, KQ_GLU_ACT_SILU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_dd_gelu" sfx "_" #type, \
+      kq_ext_moe_glu_gather_shexp_dd, type, traits, straits, KQ_GLU_ACT_GELU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_sx_" #scodec "_gather_qmv_mix_dd" sfx "_" #type,         \
+      kq_ext_gather_qmv_mix_pair, type, traits, straits, true, nx)             \
 
 #define instantiate_kq_ext_sx(codec, traits, scodec, straits, type)           \
   instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 8, "")        \
@@ -127,7 +154,14 @@ instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
       kq_ext_gather_qmv_mix_ns, bfloat16_t, traits, nx)                        \
   instantiate_kernel(                                                         \
       "kq_" #codec "_gather_qmv_mix_ns" sfx "_float16_t",                     \
-      kq_ext_gather_qmv_mix_ns, float16_t, traits, nx)
+      kq_ext_gather_qmv_mix_ns, float16_t, traits, nx)                         \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_ns_dd" sfx "_bfloat16_t",                 \
+      kq_ext_gather_qmv_mix_pair, bfloat16_t, traits, traits, false, nx)       \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_ns_dd" sfx "_float16_t",                  \
+      kq_ext_gather_qmv_mix_pair, float16_t, traits, traits, false, nx)
+
 
 // The slot-parallel variant is NX = 8 only (wide K-lanes measured
 // flat-to-negative; sp multiplies threads without shortening K-chains).
