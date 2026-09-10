@@ -394,11 +394,10 @@ void KQuantMoEGLUKQ::eval_gpu(
   int N = gw.shape(1);
   int K = x.shape(-1);
 
+  // The half kernels run at nx 8: 32 rows per threadgroup amortize the
+  // staged activation row and half grid (nx 16 measured 10% slower).
   const bool use_half = !biased && kq_moe_half(kquant_type_, K);
-  int nx = kq_moe_pick_nx((int64_t)N * R * T, K, true);
-  if (use_half && nx > 16) {
-    nx = 16;
-  }
+  const int nx = use_half ? 8 : kq_moe_pick_nx((int64_t)N * R * T, K, true);
   const std::string stem = kq_gather_stem_nx(kquant_type_, K, nx);
   std::string kname = "kq_" + stem + "_moe_glu_gather_" +
       (biased ? "bias_" : "") + (use_half ? "h_" : "") + act_ +
@@ -460,10 +459,7 @@ void KQuantGatherQMVKQ::eval_gpu(
   int K = x.shape(-1);
 
   const bool use_half = !biased && kq_moe_half(kquant_type_, K);
-  int nx = kq_moe_pick_nx((int64_t)N * R * T, K, false);
-  if (use_half && nx > 16) {
-    nx = 16;
-  }
+  const int nx = use_half ? 8 : kq_moe_pick_nx((int64_t)N * R * T, K, false);
   const std::string stem = kq_gather_stem_nx(kquant_type_, K, nx);
   // Fine tiling is instantiated only on the tuned q6_k/q8_0 kernels; the Ext
   // equivalents (2x and 4x threadgroup variants) measured E2E-neutral and
@@ -539,10 +535,8 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   const bool use_half = kq_moe_half(kquant_type_, K) &&
       (shexp_type_ == kquant_type_ || shexp_type_ == "q5_k" ||
        shexp_type_ == "q6_k" || shexp_type_ == "q8_0");
-  int nx = kq_moe_pick_nx((int64_t)N * (R + 1) * T, K, true);
-  if (use_half && nx > 16) {
-    nx = 16;
-  }
+  const int nx =
+      use_half ? 8 : kq_moe_pick_nx((int64_t)N * (R + 1) * T, K, true);
   const std::string stem = shexp_type_ == kquant_type_
       ? kq_gather_stem_nx(kquant_type_, K, nx)
       : kquant_type_ + "_sx_" + shexp_type_;
