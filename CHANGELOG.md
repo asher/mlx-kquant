@@ -34,6 +34,15 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   GLU output).
 
 ### Changed
+- The NAX loaders for iq2_xs, iq3_xxs, iq2_s and iq3_s fold the sign into
+  the grid bytes (one table lookup per 8 weights, then a sign-extending
+  byte extract per weight) and write the dequantized slab in 8-byte
+  vector stores. Every NAX kernel on these codecs takes the change and the
+  products are bit-identical to the scalar path. The `gather_qmm_seg` NAX
+  kernel also issues its MMA and store per 16-row sub-band, so a partial
+  tile pays for the rows it holds in 16-row steps. On a real 2048-token
+  GLM-5.3-Flash routing the IQ2_XS gate/up gather goes from 25 to 40
+  TFLOPS and the IQ3_XXS down gather from 33 to 37.
 - The hyper-connection M=1 glue kernels (`hc_front_reduce`,
   `hc_front_expand_reduce`, `hc_sinkhorn_collapse`) run 1024 threads per
   threadgroup, read the activation row once per column for all four

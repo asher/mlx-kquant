@@ -51,7 +51,7 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
   segment instead of per-row gathers. `expert_tile_map` builds the 64-row tile map on the GPU from the
   sorted routing indices (no host sync); `gather_qmm_seg` walks it. On NAX GPUs the walk is a NAX
   tile kernel: each threadgroup owns one 64-row tile of one expert, dequantizes its weight slab once
-  and runs one MMA pass, skipping the simdgroup bands past a partial tile's rows. The fixed-tile
+  and runs one MMA pass per 16-row sub-band a partial tile fills, skipping the rest. The fixed-tile
   `gather_qmm_rhs_nax` leaf pays that dequant and MMA walk once per expert segment a tile touches,
   which at ~60 rows per expert (a 2048-token chunk over 288 experts) is ~2x; the seg kernel runs
   1.5-1.7x faster there. `KQ_DISABLE_GATHER_SEG_NAX=1` forces the steel simdgroup-mma walk. Gated by

@@ -1084,17 +1084,6 @@ void KQuantGatherQMMSeg::eval_gpu(
         "_b_",
         bits_,
         "_bm_64_bn_64_bk_64_wm_2_wn_2");
-    // KQ_GATHER_SEG_NAX_VARIANT selects the K-walk (read live for A/Bs):
-    // unset or 0 = one slab; db = two slabs, one barrier per step;
-    // deqonly / mmaonly = measurement bounds, never a route.
-    if (const char* v = std::getenv("KQ_GATHER_SEG_NAX_VARIANT")) {
-      const std::string vs(v);
-      if (vs == "db" || vs == "deqonly" || vs == "mmaonly" || vs == "band16" ||
-          vs == "band16v2") {
-        nname += "_";
-        nname += vs;
-      }
-    }
     mx::metal::MTLFCList func_consts = {
         {&align_N, MTL::DataType::DataTypeBool, 201},
         {&align_K, MTL::DataType::DataTypeBool, 202},
