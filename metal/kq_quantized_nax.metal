@@ -312,7 +312,32 @@ instantiate_kquant_nax_codec(stq1_0, 256, 1)
       "kquant_" #codec "_gather_qmm_seg_nax_" #type "_gs_" #gs "_b_" #bits  \
           "_bm_64_bn_64_bk_64_wm_2_wn_2",                                    \
       kq_ ## codec ## _gather_qmm_seg_nax,                                   \
-      type, gs, bits, 64, 64, 64, 2, 2)
+      type, gs, bits, 64, 64, 64, 2, 2, 0)                                   \
+  instantiate_kernel(                                                        \
+      "kquant_" #codec "_gather_qmm_seg_nax_" #type "_gs_" #gs "_b_" #bits  \
+          "_bm_64_bn_64_bk_64_wm_2_wn_2_db",                                 \
+      kq_ ## codec ## _gather_qmm_seg_nax,                                   \
+      type, gs, bits, 64, 64, 64, 2, 2, 1)                                   \
+  instantiate_kernel(                                                        \
+      "kquant_" #codec "_gather_qmm_seg_nax_" #type "_gs_" #gs "_b_" #bits  \
+          "_bm_64_bn_64_bk_64_wm_2_wn_2_deqonly",                            \
+      kq_ ## codec ## _gather_qmm_seg_nax,                                   \
+      type, gs, bits, 64, 64, 64, 2, 2, 2)                                   \
+  instantiate_kernel(                                                        \
+      "kquant_" #codec "_gather_qmm_seg_nax_" #type "_gs_" #gs "_b_" #bits  \
+          "_bm_64_bn_64_bk_64_wm_2_wn_2_mmaonly",                            \
+      kq_ ## codec ## _gather_qmm_seg_nax,                                   \
+      type, gs, bits, 64, 64, 64, 2, 2, 3)                                   \
+  instantiate_kernel(                                                        \
+      "kquant_" #codec "_gather_qmm_seg_nax_" #type "_gs_" #gs "_b_" #bits  \
+          "_bm_64_bn_64_bk_64_wm_2_wn_2_band16",                             \
+      kq_ ## codec ## _gather_qmm_seg_nax,                                   \
+      type, gs, bits, 64, 64, 64, 2, 2, 4)                                   \
+  instantiate_kernel(                                                        \
+      "kquant_" #codec "_gather_qmm_seg_nax_" #type "_gs_" #gs "_b_" #bits  \
+          "_bm_64_bn_64_bk_64_wm_2_wn_2_band16v2",                           \
+      kq_ ## codec ## _gather_qmm_seg_nax,                                   \
+      type, gs, bits, 64, 64, 64, 2, 2, 5)
 #define instantiate_kquant_nax_gather_seg_codec(codec, gs, bits)             \
   instantiate_kquant_nax_gather_seg(float16_t,  gs, bits, codec)            \
   instantiate_kquant_nax_gather_seg(bfloat16_t, gs, bits, codec)
