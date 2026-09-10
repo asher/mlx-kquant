@@ -150,6 +150,14 @@ mechanism below.
   diagonal page is enforced in-kernel.
 - **`sdpa_fa_verify`** - speculative-verify attention on the matrix units for a GQA-folded query tile.
   Head dims 64 through 512; `return_lse` as above.
+- **`sdpa_fa_indexed`** - index-gathered attention over one shared K/V latent at head dim 512, the
+  absorbed-MLA sparse decode step: query j of `q [1, Hq, Q, 512]` attends the rows of `kv [1, 1, N,
+  512]` that `idx[j]` (int32, -1 pads) lists, so the selected rows are read once from the latent
+  with no gathered copy and no materialized `[Hq, M]` score matrix. Each 32-head strip walks one
+  split of the list; on tensor-op GPUs a NAX tile kernel gives each of eight simdgroups a 64-column
+  eighth of the head dim (partial `K @ Q^T` per eighth summed through threadgroup memory, `P @ V`
+  from the same resident fragments), elsewhere the `sdpa_fa_verify` simdgroup tile runs the list.
+  The per-split partials merge as `sdpa_fa_verify`. `KQ_SDPA_IDX_NAX=0` forces the simdgroup kernel.
 ## KVarN KV cache
 
 Variance-normalized KV-cache quantization: the method of Huawei's KVarN (Muller et al.,

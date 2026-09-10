@@ -293,6 +293,26 @@ mx::array sdpa_fa_verify(
     int splits = 0,
     mx::StreamOrDevice s = {});
 
+// Index-gathered attention over a shared K/V latent (absorbed MLA decode
+// with a sparse key selection). q [1, Hq, Q, D] attends, for query j, the
+// key rows of kv [1, 1, N, D] listed in idx [Q, M] (int32; a negative or
+// out-of-range entry is a padded slot). K and V are the one latent array.
+// Each 32-head strip of a query walks its split of the list reading every
+// listed row once from the latent: on tensor-op GPUs through a NAX tile
+// kernel whose eight simdgroups each own a 64-column eighth of the head
+// dim (S^T = K @ Q^T per eighth, summed through threadgroup memory, then
+// P @ V from the same resident fragments), elsewhere through the head_dim
+// 512 simdgroup tile of sdpa_fa_verify. The per-split partials merge as
+// sdpa_fa_verify. Head_dim 512, float16/bfloat16, B == 1, any Hq. Returns
+// [1, Hq, Q, D]. KQ_SDPA_IDX_NAX=0 forces the simdgroup kernel. Metal-only.
+mx::array sdpa_fa_indexed(
+    mx::array q,
+    mx::array kv,
+    mx::array idx,
+    float scale,
+    int splits = 0,
+    mx::StreamOrDevice s = {});
+
 // Fused shared-prefix cascade decode attention. Every batch row attends one
 // COMMON prefix (stored once, [1, Hkv, P, D]) plus its own private suffix
 // ([B, Hkv, Sp, D], optional per-row `starts` for left padding). Internally:
@@ -1191,6 +1211,32 @@ class KQuantSDPAFAVerify : public mx::Primitive {
   int kvarn_n_ = 0;
   int kvarn_n_attend_ = 0;
   bool kvarn_full_vis_ = false;
+};
+
+// Index-gathered matrix-tile attention (see sdpa_fa_indexed). Inference-only.
+class KQuantSDPAFAIndexed : public mx::Primitive {
+ public:
+  explicit KQuantSDPAFAIndexed(mx::Stream stream, float scale, int splits)
+      : mx::Primitive(stream), scale_(scale), splits_(splits) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSDPAFAIndexed";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int splits_;
 };
 
 // Block-sparse FA prefill over QSA-selected 4-row pages (see

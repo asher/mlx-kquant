@@ -7,6 +7,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `sdpa_fa_indexed`: index-gathered attention over one shared K/V latent
+  at head dim 512 for the absorbed-MLA sparse decode step. Each query's
+  selected latent rows are read once through an int32 index list (-1 pads)
+  instead of gathered into a copy and run through a materialized softmax.
+  A NAX tile kernel serves tensor-op GPUs and the `sdpa_fa_verify`
+  simdgroup tile serves the rest; `KQ_SDPA_IDX_NAX=0` forces the latter.
 - Fused MoE decode gathers at MTP verify widths (2 to 8 rows per step)
   dequantize a routed expert once per pair of rows that select it, and
   the shared expert once per pair of rows. Rows of a verify block share

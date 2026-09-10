@@ -233,6 +233,7 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_encode.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_sdpa.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_sdpa_nax.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_dsa_sparse_attn.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_dsa_indexer.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_dsa_indexer_mma.metal

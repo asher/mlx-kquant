@@ -289,6 +289,10 @@ All optional; the defaults are right for normal use.
   chunk; shared-expert slots stay on the float path). Read per call. Default off: the outputs differ
   from the float kernels at half rounding level. A/B lever.
 
+- `KQ_SDPA_IDX_NAX=0` - run `sdpa_fa_indexed` on its simdgroup kernel even where the NAX tile
+  kernel is available. Read once per process. The simdgroup kernel matches `sdpa_fa_verify` over
+  the gathered rows bit for bit; the NAX kernel differs at output rounding level. A/B lever.
+
 The model-specific kernels carry their own tuning levers, documented alongside each kernel in
 [docs/kernels.md](https://github.com/asher/mlx-kquant/blob/main/docs/kernels.md).
 

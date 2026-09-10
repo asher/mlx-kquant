@@ -439,6 +439,32 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_fa_indexed",
+      &mlx_kquant::sdpa_fa_indexed,
+      "q"_a,
+      "kv"_a,
+      "idx"_a,
+      "scale"_a,
+      "splits"_a = 0,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Index-gathered attention over a shared K/V latent, for an absorbed
+        MLA decode step with a sparse key selection. Query j of q
+        [1, Hq, Q, 512] attends the rows of kv [1, 1, N, 512] listed in
+        idx[j, :] (int32 [Q, M]; a negative or out-of-range entry is a
+        padded slot). K and V are the one latent array. Each 32-head strip
+        of a query reads every listed row once straight from the latent, so
+        the gather into a contiguous copy and the materialized softmax both
+        disappear. Tensor-op GPUs run a NAX tile kernel; other GPUs run the
+        head_dim-512 simdgroup tile of sdpa_fa_verify, whose result matches
+        sdpa_fa_verify over the gathered rows bit for bit when the list has
+        no padded slots (KQ_SDPA_IDX_NAX=0 forces that kernel anywhere).
+        Returns [1, Hq, Q, 512] in the query dtype. `splits` 0 picks the
+        default. Metal-only.
+      )");
+
+  m.def(
       "sdpa_decode_gqa_paged",
       &mlx_kquant::sdpa_decode_gqa_paged,
       "q"_a,
