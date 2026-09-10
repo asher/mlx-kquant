@@ -465,6 +465,36 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "kda_chunk",
+      &mlx_kquant::kda_chunk,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "log_g"_a,
+      "beta"_a,
+      "state"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Chunked KDA prefill: the per-key-channel gated delta rule
+        S_t = S_{t-1} diag(g_t) + beta_t (v_t - S_{t-1} diag(g_t) k_t) k_t^T,
+        o_t = S_t q_t, over a whole sequence. q, k, v are [B, T, H, 128]
+        (float16, bfloat16 or float32, one dtype), log_g [B, T, H, 128] the
+        per-channel log decay (log g_t, at most 0), beta [B, T, H] and
+        state [B, H, 128, 128] fp32 the incoming recurrent state. Returns
+        (o [B, T, H, 128] in the q dtype, state_out [B, H, 128, 128] fp32).
+        Tensor-op GPUs run the sequence in 32-token chunks with the state
+        resident on the matrix units, one threadgroup per (batch, head);
+        the products take bf16 operands with fp32 accumulation, so o and
+        state_out sit within about 4e-3 relative of the token-by-token
+        recurrence and the error does not grow with T. log_g must stay
+        above about -5.5 per token (16 tokens of decay within fp32 range).
+        The CPU path is the sequential recurrence in fp32; other GPUs raise,
+        so gate the call on nax_available(). T need not be a multiple of
+        32.
+      )");
+
+  m.def(
       "sdpa_decode_gqa_paged",
       &mlx_kquant::sdpa_decode_gqa_paged,
       "q"_a,

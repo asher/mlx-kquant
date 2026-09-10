@@ -1233,6 +1233,49 @@ class KQuantSDPAFAVerify : public mx::Primitive {
   bool kvarn_full_vis_ = false;
 };
 
+// Chunked KDA prefill: the per-key-channel gated delta rule
+//   S_t = S_{t-1} diag(g_t) + beta_t (v_t - S_{t-1} diag(g_t) k_t) k_t^T,
+//   o_t = S_t q_t
+// over q, k, v [B, T, H, 128] (float16/bfloat16/float32), log_g [B, T, H,
+// 128] (the per-channel log decay, any float dtype), beta [B, T, H] and the
+// incoming state [B, H, 128, 128] (fp32). Returns (o [B, T, H, 128] in the
+// q dtype, state_out [B, H, 128, 128] fp32). Tensor-op GPUs run one
+// threadgroup per (batch, head) over 32-token chunks with the state resident
+// in fragment registers and bf16 product operands (kq_kda_chunk_nax.h:
+// about 4e-3 relative of the token-by-token recurrence, flat in T; log_g
+// above about -5.5 per token); the CPU path is the sequential recurrence
+// in fp32. Other GPUs raise: check nax_available() and keep the sequential
+// kernel there. T is padded to whole chunks internally.
+std::vector<mx::array> kda_chunk(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    mx::array log_g,
+    mx::array beta,
+    mx::array state,
+    mx::StreamOrDevice s = {});
+
+// Chunked KDA prefill primitive (see kda_chunk). Inference-only.
+class KQuantKdaChunk : public mx::Primitive {
+ public:
+  explicit KQuantKdaChunk(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantKdaChunk";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+};
+
 // Index-gathered matrix-tile attention (see sdpa_fa_indexed). Inference-only.
 class KQuantSDPAFAIndexed : public mx::Primitive {
  public:

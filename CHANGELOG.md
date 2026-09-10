@@ -7,6 +7,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `kda_chunk`: the gated delta rule with a per-key-channel decay (KDA, the
+  GLM-5.3-Flash and Kimi Linear recurrence) over a whole sequence in
+  32-token chunks on tensor-op GPUs, the [Dv, Dk] state resident in
+  registers and the intra-chunk solve folded into matrix products, in
+  place of stepping token by token. Takes the log decay, returns the
+  output and the fp32 state; the CPU path runs the sequential recurrence.
 - `hc_front_expand_collapse`: `hc_front_expand_reduce` and
   `hc_sinkhorn_collapse` as one dispatch. Every threadgroup of a row
   publishes its mix dot and increments a per-row arrival counter, and the
