@@ -185,6 +185,7 @@ inline void kq_moe_log_kname(const std::string& kname) {
   }
 }
 
+#ifdef _METAL_
 // Row-pair dedupe down projection (mix_ns and the shexp-slot mix): the
 // loop kernel's launch over row pairs; S is capped by the partial store.
 inline void kq_gather_qmv_pair_gpu(
@@ -223,6 +224,7 @@ inline void kq_gather_qmv_pair_gpu(
   MTL::Size grid_dims(N / (sg * 32 / nx), 1, (T + 1) / 2);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
+#endif // _METAL_
 
 // Wide-NX variants exist only on the generic Ext kernels; tuned q6_k/q8_0
 // uniform dispatches reroute to their "_ext" stems when a wide NX is picked.
