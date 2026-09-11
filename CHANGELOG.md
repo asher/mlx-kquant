@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.8]
+
 ### Added
 - Gated-delta (KDA) kernels for GLM-5.3-Flash and Kimi Linear.
   `kda_chunk` and `kda_chunk_gated` run the delta rule with a
