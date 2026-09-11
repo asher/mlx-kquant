@@ -134,6 +134,23 @@ inline const char* kq_nx_suffix(int nx) {
 // back to the largest power of two that divides N's row tiling.
 // KQ_MOE_SG=2|4|8 forces a value for every Ext dispatch (A/B and tests);
 // read live once set.
+// 32 * sg threads must fit the pipeline, not just the device. iq2_xs asks
+// for 8 simdgroups where every other codec asks 2, and that kernel is the
+// most register-hungry of the family, so a GPU can support fewer threads
+// for it than the launch requests. An oversized dispatch is undefined, and
+// a paravirtual device answers it by hanging the command buffer rather
+// than returning garbage. Halve down the same ladder KQ_MOE_SG walks;
+// N stays divisible because the picker already made it so at the larger
+// value. KQ_MOE_NX_LOG=1 prints the cap beside the kernel name.
+template <typename K>
+inline int kq_moe_fit_sg(K kernel, int sg) {
+  const int cap = int(kernel->maxTotalThreadsPerThreadgroup());
+  while (sg > 1 && 32 * sg > cap) {
+    sg /= 2;
+  }
+  return sg;
+}
+
 inline int kq_moe_pick_sg(const std::string& codec, int N, int nx) {
   const int rps = 32 / nx;
   int sg = codec == "iq2_xs" ? 8 : 2;
@@ -174,14 +191,19 @@ inline bool kq_moe_sp(int64_t coarse_tgs, int S) {
 }
 
 // KQ_MOE_NX_LOG=1: print each fused-MoE kernel name once (dispatch audit).
-inline void kq_moe_log_kname(const std::string& kname) {
+inline void kq_moe_log_kname(const std::string& kname, int cap = 0) {
   static const bool log = std::getenv("KQ_MOE_NX_LOG") != nullptr;
   if (!log) {
     return;
   }
   static std::set<std::string> seen;
   if (seen.insert(kname).second) {
-    std::fprintf(stderr, "[kq_moe] %s\n", kname.c_str());
+    if (cap > 0) {
+      std::fprintf(
+          stderr, "[kq_moe] %s (pipeline max %d)\n", kname.c_str(), cap);
+    } else {
+      std::fprintf(stderr, "[kq_moe] %s\n", kname.c_str());
+    }
   }
 }
 
@@ -204,8 +226,8 @@ inline void kq_gather_qmv_pair_gpu(
     int K,
     int nx,
     int sg) {
-  kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
+  kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   ce.set_input_array(w, 0);
@@ -220,8 +242,9 @@ inline void kq_gather_qmv_pair_gpu(
   const int SC = scores.shape(1);
   ce.set_bytes(SC, 9);
   ce.set_bytes(T, 10);
-  MTL::Size group_dims(32, sg, 1);
-  MTL::Size grid_dims(N / (sg * 32 / nx), 1, (T + 1) / 2);
+  const int fsg = kq_moe_fit_sg(kernel, sg);
+  MTL::Size group_dims(32, fsg, 1);
+  MTL::Size grid_dims(N / (fsg * 32 / nx), 1, (T + 1) / 2);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 #endif // _METAL_
@@ -336,8 +359,8 @@ void KQuantMoEGLU::eval_gpu(
   float limit = limit_;
 
   std::string kname = "kq_moe_glu_gather_" + kq_type_string(x.dtype());
-  kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
+  kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   ce.set_input_array(gw, 0);
@@ -380,8 +403,8 @@ void KQuantGatherQMVBias::eval_gpu(
   const bool fine = kq_gather_fine((int64_t)(N / 8) * R * T);
   std::string kname = std::string("kq_gather_qmv_bias") +
       (fine ? "_fine_" : "_") + kq_type_string(x.dtype());
-  kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
+  kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   ce.set_input_array(w, 0);
@@ -420,8 +443,8 @@ void KQuantGatherQMVMixBias::eval_gpu(
   const bool fine = kq_gather_fine((int64_t)(N / 8) * T);
   std::string kname = std::string("kq_gather_qmv_mix_bias") +
       (fine ? "_fine_" : "_") + kq_type_string(x.dtype());
-  kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
+  kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   ce.set_input_array(w, 0);
@@ -471,8 +494,8 @@ void KQuantMoEGLUKQ::eval_gpu(
   std::string kname = "kq_" + stem + "_moe_glu_gather_" +
       (biased ? "bias_" : "") + (use_half ? "h_" : "") + (dd ? "dd_" : "") +
       act_ + kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
-  kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
+  kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   if (use_half) {
@@ -500,8 +523,10 @@ void KQuantMoEGLUKQ::eval_gpu(
   }
   // Tuned q6_k/q8_0 kernels (nx 8) are fixed at 2 simdgroups.
   const bool tuned = stem == "q6_k" || stem == "q8_0";
-  const int sg = use_half ? kq_moe_pick_sg_h(N, nx)
-                          : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx));
+  const int sg = kq_moe_fit_sg(
+      kernel,
+      use_half ? kq_moe_pick_sg_h(N, nx)
+               : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx)));
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / (sg * 32 / nx), R, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -539,8 +564,8 @@ void KQuantGatherQMVKQ::eval_gpu(
   std::string kname = "kq_" + stem + "_gather_qmv" + (biased ? "_bias" : "") +
       (use_half ? "_h" : "") + (fine ? "_fine" : kq_nx_suffix(nx)) + "_" +
       kq_type_string(x.dtype());
-  kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
+  kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   if (use_half) {
@@ -561,8 +586,10 @@ void KQuantGatherQMVKQ::eval_gpu(
     ce.set_bytes(K, 4);
     ce.set_bytes(N, 5);
   }
-  const int sg = use_half ? kq_moe_pick_sg_h(N, nx)
-                          : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx));
+  const int sg = kq_moe_fit_sg(
+      kernel,
+      use_half ? kq_moe_pick_sg_h(N, nx)
+               : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx)));
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / (fine ? 2 : (sg * 32 / nx)), R, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -616,8 +643,8 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   std::string kname = "kq_" + stem + "_moe_glu_gather_shexp_" +
       (use_half ? "h_" : "") + (dd ? "dd_" : "") + act_ + kq_nx_suffix(nx) +
       "_" + kq_type_string(x.dtype());
-  kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
+  kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   if (use_half) {
@@ -637,8 +664,10 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   const float limit = 0.0f;
   ce.set_bytes(limit, 9);
   const bool tuned = stem == "q6_k" || stem == "q8_0";
-  const int sg = use_half ? kq_moe_pick_sg_h(N, nx)
-                          : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx));
+  const int sg = kq_moe_fit_sg(
+      kernel,
+      use_half ? kq_moe_pick_sg_h(N, nx)
+               : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx)));
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / (sg * 32 / nx), R + 1, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -713,8 +742,8 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   std::string kname = "kq_" + stem + "_gather_qmv_mix" +
       (use_half ? "_h" : "") + (fine ? "_fine" : kq_nx_suffix(nx)) + "_" +
       kq_type_string(x.dtype());
-  kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
+  kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   if (use_half) {
@@ -731,8 +760,10 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   ce.set_bytes(S, 8);
   const int SC = scores.shape(1);
   ce.set_bytes(SC, 9);
-  const int sg = use_half ? kq_moe_pick_sg_h(N, nx)
-                          : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx));
+  const int sg = kq_moe_fit_sg(
+      kernel,
+      use_half ? kq_moe_pick_sg_h(N, nx)
+               : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx)));
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / (fine ? 2 : (sg * 32 / nx)), 1, T);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -790,11 +821,23 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
         nx,
         kq_moe_pick_sg(kquant_type_, N, nx));
   } else {
-    const bool sp = nx == 8 && kq_moe_sp((int64_t)T * (N / 8), S);
-    std::string kname = "kq_" + kquant_type_ + "_gather_qmv_mix_ns" +
-        (sp ? "_sp" : kq_nx_suffix(nx)) + "_" + kq_type_string(x.dtype());
-    kq_moe_log_kname(kname);
+    bool sp = nx == 8 && kq_moe_sp((int64_t)T * (N / 8), S);
+    auto ns_name = [&](bool slot_parallel) {
+      return "kq_" + kquant_type_ + "_gather_qmv_mix_ns" +
+          (slot_parallel ? "_sp" : kq_nx_suffix(nx)) + "_" +
+          kq_type_string(x.dtype());
+    };
+    std::string kname = ns_name(sp);
     auto kernel = kq_get_kernel(d, kname);
+    // The slot-parallel kernel gives each slot its own simdgroup pair, so
+    // its 64 * S threads cannot be halved the way the sg kernels can. When
+    // the pipeline will not take that many, drop to the general kernel.
+    if (sp && 64 * S > int(kernel->maxTotalThreadsPerThreadgroup())) {
+      sp = false;
+      kname = ns_name(sp);
+      kernel = kq_get_kernel(d, kname);
+    }
+    kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
     auto& ce = mx::metal::get_command_encoder(s);
     ce.set_compute_pipeline_state(kernel);
     ce.set_input_array(w, 0);
@@ -805,7 +848,8 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
     ce.set_bytes(K, 5);
     ce.set_bytes(N, 6);
     ce.set_bytes(S, 7);
-    const int sg = sp ? 2 * S : kq_moe_pick_sg(kquant_type_, N, nx);
+    const int sg =
+        sp ? 2 * S : kq_moe_fit_sg(kernel, kq_moe_pick_sg(kquant_type_, N, nx));
     MTL::Size group_dims(32, sg, 1);
     MTL::Size grid_dims(N / (sp ? 8 : (sg * 32 / nx)), 1, T);
     ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -840,8 +884,8 @@ void KQuantMoERouterTopK::eval_gpu(
   const auto& bias = has_bias_ ? inputs[1 + (has_pes_ ? 1 : 0)] : inputs[0];
 
   std::string kname = "kq_moe_router_topk_" + kq_type_string(logits.dtype());
-  kq_moe_log_kname(kname);
   auto kernel = kq_get_kernel(d, kname);
+  kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   ce.set_input_array(logits, 0);
