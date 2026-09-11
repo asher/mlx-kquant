@@ -22,11 +22,35 @@ pytestmark = pytest.mark.skipif(
     reason="fused MoE gathers are Metal-only kernels; no CPU path.",
 )
 
+
+def _run_child(argv, env, what):
+    """Run one arm in a subprocess and surface its output if it dies.
+
+    check=True raises CalledProcessError, whose message carries the command
+    and the exit status but not the child's stderr, so a crash in the child
+    reaches CI as an unreadable wall of quoted source. Assert instead and
+    put both streams in the message.
+    """
+    r = subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **env},
+    )
+    assert r.returncode == 0, (
+        f"{what} exited {r.returncode}\n"
+        f"--- child stdout ---\n{r.stdout}\n"
+        f"--- child stderr ---\n{r.stderr}"
+    )
+    return r
+
+
 _SNIPPET = r"""
 import sys
 import numpy as np
 import mlx.core as mx
 import mlx_kquant as kq
+
 
 codec, out_path = sys.argv[1], sys.argv[2]
 rng = np.random.default_rng(11)
@@ -114,13 +138,11 @@ def test_mix_ns_wide_pick(codec, T, tmp_path):
     outs, names = {}, {}
     for arm, env in (("auto", {}), ("nx8", {"KQ_MOE_NX": "8"})):
         f = tmp_path / f"{arm}.npy"
-        r = subprocess.run(
+        r = _run_child(
             [sys.executable, "-c", _WIDE_SNIPPET, codec, str(f), str(T)],
-            check=True,
-            capture_output=True,
-            text=True,
             # the per-row pick; verify widths route to the dedupe kernels
-            env={**os.environ, **env, "KQ_MOE_NX_LOG": "1", "KQ_MOE_DEDUP": "0"},
+            {**env, "KQ_MOE_NX_LOG": "1", "KQ_MOE_DEDUP": "0"},
+            f"wide {codec} T={T} arm {arm}",
         )
         outs[arm] = np.load(f)
         names[arm] = r.stdout + r.stderr
@@ -179,12 +201,10 @@ def test_half_dot_dispatch_and_accuracy(codec, sx, dtype):
     kernel) and every op stays within the half-dot bound of the f32
     reference."""
     tests_dir = os.path.dirname(os.path.abspath(__file__))
-    r = subprocess.run(
+    r = _run_child(
         [sys.executable, "-c", _HALF_SNIPPET, tests_dir, codec, sx, dtype],
-        check=True,
-        capture_output=True,
-        text=True,
-        env={**os.environ, "KQ_MOE_HALF": "1", "KQ_MOE_NX_LOG": "1"},
+        {"KQ_MOE_HALF": "1", "KQ_MOE_NX_LOG": "1"},
+        f"half {codec} sx={sx} {dtype}",
     )
     line = [l for l in r.stdout.splitlines() if l.startswith("RESULT ")]
     assert line, r.stdout + r.stderr
@@ -272,12 +292,10 @@ def test_dedup_bit_identical(codec, scodec, T, tmp_path):
     logs = {}
     for arm in ("0", "1"):
         out = tmp_path / f"dd{arm}.npz"
-        r = subprocess.run(
+        r = _run_child(
             [sys.executable, "-c", _DD_SNIPPET, codec, scodec, str(T), str(out)],
-            check=True,
-            capture_output=True,
-            text=True,
-            env={**os.environ, "KQ_MOE_DEDUP": arm, "KQ_MOE_NX_LOG": "1"},
+            {"KQ_MOE_DEDUP": arm, "KQ_MOE_NX_LOG": "1"},
+            f"dedup {codec}/{scodec} T={T} arm KQ_MOE_DEDUP={arm}",
         )
         outs[arm] = np.load(out)
         logs[arm] = r.stderr
