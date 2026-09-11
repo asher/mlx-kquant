@@ -49,8 +49,13 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
   by a small `kq_lora_densify` dispatch at eval, on the primitive's own stream.
 - **`gather_qmm_seg`** + **`expert_tile_map`** - expert-sorted MoE prefill as one GEMM per expert
   segment instead of per-row gathers. `expert_tile_map` builds the 64-row tile map on the GPU from the
-  sorted routing indices (no host sync); `gather_qmm_seg` walks it. Gated by `KQ_SWITCH_GEMM_MIN_ROWS`
-  (see [README](../README.md#environment-variables)).
+  sorted routing indices (no host sync); `gather_qmm_seg` walks it. On NAX GPUs the walk is a NAX
+  tile kernel: each threadgroup owns one 64-row tile of one expert, dequantizes its weight slab once
+  and runs one MMA pass per 16-row sub-band a partial tile fills, skipping the rest. The fixed-tile
+  `gather_qmm_rhs_nax` leaf pays that dequant and MMA walk once per expert segment a tile touches,
+  which at ~60 rows per expert (a 2048-token chunk over 288 experts) is ~2x; the seg kernel runs
+  1.5-1.7x faster there. `KQ_DISABLE_GATHER_SEG_NAX=1` forces the steel simdgroup-mma walk. Gated by
+  `KQ_SWITCH_GEMM_MIN_ROWS` (see [README](../README.md#environment-variables)).
 
 On NAX GPUs, `quantized_matmul` transpose (decode-orientation) shapes route by row count M: the
 mat-vec paths up to a per-codec crossover (M 6-9), a BM=32 double-buffered NAX tile through M 32,
@@ -145,6 +150,14 @@ mechanism below.
   diagonal page is enforced in-kernel.
 - **`sdpa_fa_verify`** - speculative-verify attention on the matrix units for a GQA-folded query tile.
   Head dims 64 through 512; `return_lse` as above.
+- **`sdpa_fa_indexed`** - index-gathered attention over one shared K/V latent at head dim 512, the
+  absorbed-MLA sparse decode step: query j of `q [1, Hq, Q, 512]` attends the rows of `kv [1, 1, N,
+  512]` that `idx[j]` (int32, -1 pads) lists, so the selected rows are read once from the latent
+  with no gathered copy and no materialized `[Hq, M]` score matrix. Each 32-head strip walks one
+  split of the list; on tensor-op GPUs a NAX tile kernel gives each of eight simdgroups a 64-column
+  eighth of the head dim (partial `K @ Q^T` per eighth summed through threadgroup memory, `P @ V`
+  from the same resident fragments), elsewhere the `sdpa_fa_verify` simdgroup tile runs the list.
+  The per-split partials merge as `sdpa_fa_verify`. `KQ_SDPA_IDX_NAX=0` forces the simdgroup kernel.
 ## KVarN KV cache
 
 Variance-normalized KV-cache quantization: the method of Huawei's KVarN (Muller et al.,
@@ -214,7 +227,8 @@ Tuning levers (defaults are right for normal use):
 - **`metallib_loads`** / **`metallib_dir`** - whether the bundled metallib opened on the device, and
   where it lives.
 - **`nax_available`** / **`nax_gather_enabled`** - whether the GPU exposes NAX tensor units, and
-  whether the sorted-gather NAX GEMM leaf is reachable for a codec.
+  whether the sorted-gather NAX GEMM kernels (`gather_qmm_rhs_nax`, the `gather_qmm_seg` NAX walk)
+  are reachable for a codec.
 - **`cpu_neon_available`** - whether the arm64 NEON int8 GEMV path is compiled in.
 
 ## Feeder-loop primitives

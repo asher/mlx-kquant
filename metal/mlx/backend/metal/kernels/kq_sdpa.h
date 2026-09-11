@@ -1658,9 +1658,217 @@ METAL_FUNC void kq_fa_stage_rows_paged(
     const int r = i / D4;
     const int c = i - r * D4;
     const int g = srow[r];
-    dst4[r * LDS4 + c] = g >= 0
-        ? ((const device T4*)(src + (size_t)g * seq_stride))[c]
-        : T4(T(0));
+    // Unconditional load (row 0 always exists) so the loads batch; a
+    // padded row selects zero afterwards.
+    const T4 v =
+        ((const device T4*)(src + (size_t)metal::max(g, 0) * seq_stride))[c];
+    dst4[r * LDS4 + c] = g >= 0 ? v : T4(T(0));
+  }
+}
+
+// Index-gathered attention over a shared K/V latent (absorbed MLA decode
+// with a sparse key selection): query j attends the key rows listed in
+// idx[j, :], where a negative or out-of-range entry is a padded slot. The
+// query tile is one BQ-head strip of one query (grid x strips of the head
+// axis, grid y the query, grid z the key split), so every row of a tile
+// walks the same list and one staged key tile serves BQ heads. The body is
+// the d-split verify kernel above (BQ / 8 row strips x 2 head-dim halves)
+// without the causal clamp (the list is already causal), the kvarn/q8
+// operands and the V restage: K and V are one array, so the staged K tile
+// serves P @ V. Partials land at row h * Q + j and the shared merge,
+// launched over (Hq, 1, Q), writes [1, Hq, Q, D] in place.
+template <typename T, int D, int BQ>
+[[kernel]] void kq_sdpa_fa_indexed_2pass_1(
+    const device T* queries [[buffer(0)]],
+    const device T* kv [[buffer(1)]],
+    const device int32_t* idx [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    device float* sums [[buffer(4)]],
+    device float* maxs [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& kv_len [[buffer(7)]],
+    const constant size_t& kv_seq_stride [[buffer(8)]],
+    const constant float& scale [[buffer(9)]],
+    const constant int& n_heads [[buffer(10)]],
+    const constant int& n_queries [[buffer(11)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint3 tid [[threadgroup_position_in_grid]]) {
+  constexpr int BK = 16; // keys staged per tile (full-D rows)
+  constexpr int kNWarps = (BQ / 8) * 2; // row strips x head-dim halves
+  constexpr int NT = kNWarps * 32;
+  constexpr short kFragSize = 8;
+  constexpr short TK = BK / kFragSize;
+  constexpr short DH = D / 2;
+  constexpr short TDH = DH / kFragSize;
+  constexpr short kPad = 16 / sizeof(T);
+  constexpr short LDS = D + kPad;
+
+  using MMAFrag_t = mlx::steel::BaseMMAFrag<float, kFragSize, kFragSize>;
+
+  threadgroup T KV_smem[BK * LDS];
+  threadgroup float S_smem[BQ * BK];
+  threadgroup int idx_smem[BK];
+
+  const int h0 = int(tid.x) * BQ;
+  const int query_idx = tid.y;
+  const int split_idx = tid.z;
+  const int rows_valid = min(BQ, n_heads - h0);
+
+  const int chunk = ((N + gqa_splits * BK - 1) / (gqa_splits * BK)) * BK;
+  const int k0 = split_idx * chunk;
+  const int k1 = min(k0 + chunk, N);
+  const device int32_t* idx_row = idx + (size_t)query_idx * N;
+
+  const short dh_half = simd_gid & 1;
+  const short strip = simd_gid >> 1;
+  const short2 sc = MMAFrag_t::get_coord(simd_lid);
+  const short sm = sc.y;
+  const short sn = sc.x;
+  const int row = int(strip) * kFragSize + sm;
+  const int flat_tid = int(simd_gid) * 32 + int(simd_lid);
+
+  // This half's Q columns of head h0 + row at query j (natural
+  // [1, Hq, Q, D] layout; heads past n_heads zero-fill).
+  mlx::steel::MMATile<float, 1, TDH, MMAFrag_t> Qtile;
+  {
+    const device T* qrow = queries +
+        ((size_t)(h0 + row) * n_queries + query_idx) * D + dh_half * DH + sn;
+    Qtile.template load_safe<T, 1, 1>(
+        qrow, D, short2(DH - sn, rows_valid - row));
+  }
+
+  mlx::steel::MMATile<float, 1, TK, MMAFrag_t> Stile;
+  mlx::steel::MMATile<float, 1, TK, MMAFrag_t> Ktile;
+  mlx::steel::MMATile<float, 1, 1, MMAFrag_t> Vtile;
+  mlx::steel::MMATile<float, 1, TDH, MMAFrag_t> Otile;
+  Otile.clear();
+
+  const float scale2 = scale * M_LOG2E_F;
+  float max_score = Limits<float>::finite_min;
+  float sum_score = 0;
+
+  for (int kt = k0; kt < k1; kt += BK) {
+    // Resolve this tile's slots (a padded, out-of-range or past-the-split
+    // slot stages as zero and is masked), then stage the rows. The first
+    // barrier orders the restage after the previous tile's P @ V.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (flat_tid < BK) {
+      const int slot = kt + flat_tid;
+      int g = slot < k1 ? int(idx_row[slot]) : -1;
+      idx_smem[flat_tid] = (g >= 0 && g < kv_len) ? g : -1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    kq_fa_stage_rows_paged<T, BK, D, LDS, NT>(
+        KV_smem, kv, kv_seq_stride, idx_smem, flat_tid);
+    Stile.clear();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    STEEL_PRAGMA_UNROLL
+    for (short dd = 0; dd < TDH; dd++) {
+      simdgroup_barrier(mem_flags::mem_none);
+      Ktile.template load<T, 1, 1, 1, LDS>(
+          &KV_smem[sn * LDS + dh_half * DH + dd * kFragSize + sm]);
+      simdgroup_barrier(mem_flags::mem_none);
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        MMAFrag_t::mma(
+            Stile.frag_at(0, ik),
+            Qtile.frag_at(0, dd),
+            Ktile.frag_at(0, ik),
+            Stile.frag_at(0, ik));
+      }
+    }
+
+    // Half-partial exchange; the scale folds into the read-back and a
+    // padded slot masks there.
+    if (dh_half == 0) {
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        STEEL_PRAGMA_UNROLL
+        for (short jj = 0; jj < MMAFrag_t::kElemCols; jj++) {
+          S_smem[row * BK + ik * kFragSize + sn + jj] =
+              Stile.frag_at(0, ik)[jj];
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (dh_half == 1) {
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        STEEL_PRAGMA_UNROLL
+        for (short jj = 0; jj < MMAFrag_t::kElemCols; jj++) {
+          S_smem[row * BK + ik * kFragSize + sn + jj] +=
+              Stile.frag_at(0, ik)[jj];
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    STEEL_PRAGMA_UNROLL
+    for (short ik = 0; ik < TK; ik++) {
+      STEEL_PRAGMA_UNROLL
+      for (short jj = 0; jj < MMAFrag_t::kElemCols; jj++) {
+        const short kk = ik * kFragSize + sn + jj;
+        Stile.frag_at(0, ik)[jj] = idx_smem[kk] < 0
+            ? Limits<float>::finite_min
+            : S_smem[row * BK + kk] * scale2;
+      }
+    }
+
+    // Online softmax on this thread's row; a row with no valid key yet
+    // keeps max at finite_min and zeroes its P row.
+    float new_max = max_score;
+    Stile.template row_reduce<KQMaxOp>(&new_max);
+    if (new_max > Limits<float>::finite_min) {
+      Stile.template row_bin_op<KQExpSubOp>(&new_max);
+      float factor = fast::exp2(max_score - new_max);
+      float tile_sum = 0;
+      Stile.template row_reduce<KQSumOp>(&tile_sum);
+      sum_score = sum_score * factor + tile_sum;
+      max_score = new_max;
+      Otile.template row_bin_op<KQMulOp>(&factor);
+    } else {
+      STEEL_PRAGMA_UNROLL
+      for (short ii = 0; ii < decltype(Stile)::kElemsPerTile; ii++) {
+        Stile.elems()[ii] = 0;
+      }
+    }
+
+    // O_half += P @ V[:, half] from the staged K rows (K == V).
+    STEEL_PRAGMA_UNROLL
+    for (short id = 0; id < TDH; id++) {
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        Vtile.template load<T, 1, 1, LDS, 1>(
+            &KV_smem
+                [(ik * kFragSize + sm) * LDS + dh_half * DH + id * kFragSize +
+                 sn]);
+        MMAFrag_t::mma(
+            Otile.frag_at(0, id),
+            Stile.frag_at(0, ik),
+            Vtile.frag_at(0, 0),
+            Otile.frag_at(0, id));
+      }
+    }
+  }
+
+  if (row < rows_valid) {
+    const size_t po =
+        ((size_t)(h0 + row) * n_queries + query_idx) * gqa_splits + split_idx;
+    device float* orow = out + po * D + dh_half * DH + sn;
+    STEEL_PRAGMA_UNROLL
+    for (short id = 0; id < TDH; id++) {
+      STEEL_PRAGMA_UNROLL
+      for (short jj = 0; jj < MMAFrag_t::kElemCols; jj++) {
+        orow[id * kFragSize + jj] = Otile.frag_at(0, id)[jj];
+      }
+    }
+    if (dh_half == 0 && sn == 0) {
+      sums[po] = sum_score;
+      maxs[po] = max_score == Limits<float>::finite_min
+          ? Limits<float>::finite_min
+          : max_score * M_LN2_F;
+    }
   }
 }
 

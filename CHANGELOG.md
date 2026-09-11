@@ -6,6 +6,41 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Gated-delta (KDA) kernels for GLM-5.3-Flash and Kimi Linear.
+  `kda_chunk` and `kda_chunk_gated` run the delta rule with a
+  per-key-channel decay in 32-token chunks on tensor-op GPUs, with a
+  sequential CPU path. `kda_conv` fuses the causal short conv, its silu,
+  an optional per-head l2 norm and the tail state, and `rmsnorm_gate` is
+  the output gate.
+- `gather_mix`: the sorted-prefill MoE unsort and score-weighted sum over
+  the routed slots in one dispatch.
+- `hc_front_expand_collapse`: the hyper-connection front reduction and
+  sinkhorn collapse as one dispatch, bit-identical to the two ops it
+  replaces, which both remain.
+- `sdpa_fa_indexed`: index-gathered attention over one shared K/V latent
+  at head dim 512, for the absorbed-MLA sparse decode step. A NAX tile
+  kernel serves tensor-op GPUs and `KQ_SDPA_IDX_NAX=0` forces the
+  simdgroup kernel.
+- Fused MoE decode gathers at MTP verify widths dequantize each routed
+  expert once per pair of rows that select it. Outputs are bit-identical
+  to the per-row kernels and `KQ_MOE_DEDUP=0` restores them.
+- `KQ_MOE_HALF=1`, off by default, switches the iq2_xs, iq2_xxs and
+  iq3_xxs fused MoE decode gathers to half-dot kernels. Outputs differ
+  from the float kernels at half rounding level.
+
+### Changed
+- The NAX loaders for iq2_xs, iq3_xxs, iq2_s and iq3_s fold the sign into
+  the grid bytes. Every NAX kernel on these codecs takes the change and
+  the products stay bit-identical.
+- The hyper-connection M=1 glue kernels run up to 1024 threads per
+  threadgroup, capped at what the GPU reports for each pipeline, and read
+  each activation row once for all four streams. The expanded stream stays
+  bit-identical and the f32 reductions change summation order.
+- Sorted MoE prefill on NAX GPUs runs `gather_qmm_seg` on an expert-major
+  tile kernel instead of the fixed-tile leaf, whose row tiles straddle
+  expert segments. `KQ_GATHER_SEG_NAX=0` restores the old routing.
+
 ## [0.4.7]
 
 ### Fixed

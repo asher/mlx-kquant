@@ -439,6 +439,181 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_fa_indexed",
+      &mlx_kquant::sdpa_fa_indexed,
+      "q"_a,
+      "kv"_a,
+      "idx"_a,
+      "scale"_a,
+      "splits"_a = 0,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Index-gathered attention over a shared K/V latent, for an absorbed
+        MLA decode step with a sparse key selection. Query j of q
+        [1, Hq, Q, 512] attends the rows of kv [1, 1, N, 512] listed in
+        idx[j, :] (int32 [Q, M]; a negative or out-of-range entry is a
+        padded slot). K and V are the one latent array. Each 32-head strip
+        of a query reads every listed row once straight from the latent, so
+        the gather into a contiguous copy and the materialized softmax both
+        disappear. Tensor-op GPUs run a NAX tile kernel; other GPUs run the
+        head_dim-512 simdgroup tile of sdpa_fa_verify, whose result matches
+        sdpa_fa_verify over the gathered rows bit for bit when the list has
+        no padded slots (KQ_SDPA_IDX_NAX=0 forces that kernel anywhere).
+        Returns [1, Hq, Q, 512] in the query dtype. `splits` 0 picks the
+        default. Metal-only.
+      )");
+
+  m.def(
+      "gather_mix",
+      &mlx_kquant::gather_mix,
+      "y"_a,
+      "inv_order"_a,
+      "scores"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused unsort and score mix for sorted-prefill MoE:
+        out[t] = sum_s scores[t, s] * y[inv_order[t * k + s]] in one
+        dispatch, replacing the gather back to token order, the score
+        multiply and the sum over slots. f32 accumulation, one round at
+        the write, on every GPU and the CPU.
+
+        Args:
+            y (array): [rows, N] expert outputs in routing-sorted row
+                order (rows = T * k), float16/bfloat16, N a multiple of 4.
+            inv_order (array): [T * k] sorted row of each (token, slot)
+                pair, uint32 or int32 (the argsort of the sort order).
+            scores (array): [T, k] routing weights; cast to fp32.
+
+        Returns:
+            array: [T, N] in the y dtype.
+      )");
+
+  m.def(
+      "rmsnorm_gate",
+      &mlx_kquant::rmsnorm_gate,
+      "x"_a,
+      "w"_a,
+      "gate"_a,
+      "eps"_a = 1e-6f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused output gate of gated-delta layers: rms_norm(x, w, eps) *
+        sigmoid(gate) over the last axis in one dispatch, f32 math with one
+        round at the write, on every GPU and the CPU.
+
+        Args:
+            x (array): [..., D], float16/bfloat16, D 64, 128 or 256.
+            w (array): [D] norm weight; cast to the x dtype.
+            gate (array): same shape as x; cast to the x dtype.
+            eps (float): norm epsilon.
+
+        Returns:
+            array: same shape and dtype as x.
+      )");
+
+  m.def(
+      "kda_conv",
+      &mlx_kquant::kda_conv,
+      "x"_a,
+      "state"_a,
+      "w"_a,
+      "head_dim"_a,
+      "scale"_a = 0.0f,
+      "eps"_a = 1e-6f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused causal short convolution for gated-delta prefill (KDA, GDN):
+        y[t] = silu(sum_j w[:, j] * in[t - K + 1 + j]) with in = [state; x],
+        then with scale != 0 an l2 norm over each head_dim-channel head
+        with the scale folded in (scale * rms_norm(y, eps)). One dispatch
+        replaces the concat, conv1d, silu, rms_norm and multiply, with all
+        math in f32 and one round at the write, on every GPU and the CPU.
+
+        Args:
+            x (array): [B, T, C], float16/bfloat16.
+            state (array): [B, K - 1, C] carried rows (zeros for a fresh
+                sequence); cast to the x dtype.
+            w (array): [C, K] or [C, K, 1] depthwise taps (the nn.Conv1d
+                weight layout), K from 2 to 8; cast to the x dtype.
+            head_dim (int): norm group width, 64, 128 or 256; C must be a
+                multiple of it.
+            scale (float): folded norm scale; 0 skips the norm.
+            eps (float): norm epsilon.
+
+        Returns:
+            tuple: (y [B, T, C], state_out [B, K - 1, C]), the last K - 1
+            rows of [state; x] for the next call.
+      )");
+
+  m.def(
+      "kda_chunk_gated",
+      &mlx_kquant::kda_chunk_gated,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "a"_a,
+      "a_scale"_a,
+      "dt_bias"_a,
+      "beta"_a,
+      "state"_a,
+      "lb"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        kda_chunk with the decay formed inside the kernel:
+        log_g = lb * sigmoid(a_scale[h] * (a + dt_bias[h, d])) per token and
+        key channel (the KDA gate of Kimi Linear and GLM-5.3-Flash), so the
+        fp32 gate tensor is never written.
+
+        Args:
+            q, k, v (array): [B, T, H, 128], one float dtype.
+            a (array): [B, T, H, 128] gate pre-activation in the q dtype.
+            a_scale (array): [H] per-head factor, exp(A_log); used in fp32.
+            dt_bias (array): H * 128 values ([H, 128] or flat); fp32.
+            beta (array): [B, T, H] write gate.
+            state (array): [B, H, 128, 128] incoming state, fp32.
+            lb (float): gate lower bound (log g in (lb, 0)).
+
+        Returns:
+            tuple: (o [B, T, H, 128] in the q dtype, state_out fp32), as
+            kda_chunk on that log gate.
+      )");
+
+  m.def(
+      "kda_chunk",
+      &mlx_kquant::kda_chunk,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "log_g"_a,
+      "beta"_a,
+      "state"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Chunked KDA prefill: the per-key-channel gated delta rule
+        S_t = S_{t-1} diag(g_t) + beta_t (v_t - S_{t-1} diag(g_t) k_t) k_t^T,
+        o_t = S_t q_t, over a whole sequence. q, k, v are [B, T, H, 128]
+        (float16, bfloat16 or float32, one dtype), log_g [B, T, H, 128] the
+        per-channel log decay (log g_t, at most 0), beta [B, T, H] and
+        state [B, H, 128, 128] fp32 the incoming recurrent state. Returns
+        (o [B, T, H, 128] in the q dtype, state_out [B, H, 128, 128] fp32).
+        Tensor-op GPUs run the sequence in 32-token chunks with the state
+        resident on the matrix units, one threadgroup per (batch, head);
+        the products take bf16 operands with fp32 accumulation, so o and
+        state_out sit within about 4e-3 relative of the token-by-token
+        recurrence and the error does not grow with T. log_g must stay
+        above about -5.5 per token (16 tokens of decay within fp32 range).
+        The CPU path is the sequential recurrence in fp32; other GPUs raise,
+        so gate the call on nax_available(). T need not be a multiple of
+        32.
+      )");
+
+  m.def(
       "sdpa_decode_gqa_paged",
       &mlx_kquant::sdpa_decode_gqa_paged,
       "q"_a,
@@ -1661,6 +1836,47 @@ NB_MODULE(_ext, m) {
         Returns:
             tuple: (collapsed [..., D], post f32 [..., 4],
             comb f32 [..., 4, 4]).
+      )");
+
+  m.def(
+      "hc_front_expand_collapse",
+      &mlx_kquant::hc_front_expand_collapse,
+      "x_sub"_a,
+      "resid"_a,
+      "post"_a,
+      "comb"_a,
+      "fn"_a,
+      "scale"_a,
+      "base"_a,
+      "w"_a,
+      "iters"_a,
+      "hc_eps"_a,
+      "norm_eps"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        hc_front_expand_reduce and hc_sinkhorn_collapse as one dispatch.
+        Every threadgroup of a row runs the front reduction, publishes its
+        mix dot and increments the row's device arrival counter; the last
+        one to arrive runs the collapse instead of the host launching a
+        second kernel. No threadgroup waits, so any row count works.
+
+        Args:
+            x_sub (array): [..., D] sublayer output.
+            resid (array): [..., 4, D] residual streams.
+            post (array): [..., 4] float32.
+            comb (array): [..., 4, 4] float32.
+            fn (array): [24, 4 * D] float32 mix matrix.
+            scale (array): [3] float32 pre/post/comb scales.
+            base (array): [24] float32 mix biases.
+            w (array): [D] sublayer norm weight, same dtype as resid.
+            iters (int): sinkhorn iterations.
+            hc_eps (float): sinkhorn epsilon.
+            norm_eps (float): rms_norm epsilon.
+
+        Returns:
+            tuple: (h [..., 4, D], collapsed [..., D], post f32 [..., 4],
+            comb f32 [..., 4, 4]); bit-identical to the split pair.
       )");
 
   m.def(

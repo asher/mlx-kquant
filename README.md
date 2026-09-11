@@ -234,9 +234,10 @@ weights. Measured on an M5 Max (128 GB):
 Transposed matmuls with a small row count (the speculative-decode verify regime) automatically route
 through a weight-read-amortizing `verify_qmv` kernel; `KQ_DISABLE_VERIFY_QMV=1` forces the plain
 per-row `qmv` path (see [Environment variables](#environment-variables)). Sorted MoE prefill batches
-(`sorted_indices=True`) route to a per-expert-segment GEMM on all GPUs - a NAX kernel where tensor
-units are available, a steel simdgroup-mma kernel with a rows-per-expert-adaptive row tile elsewhere
-- instead of decomposing into per-row gathers.
+(`sorted_indices=True`) route to a per-expert-segment GEMM on all GPUs instead of decomposing into
+per-row gathers: `KQuantSwitchLinear` takes the expert-major `gather_qmm_seg` walk (a NAX tile
+kernel where tensor units are available, steel simdgroup-mma elsewhere), and a bare
+`gather_qmm` call takes the fixed-tile `gather_qmm_rhs` kernels.
 
 ## How it works
 
@@ -274,6 +275,23 @@ All optional; the defaults are right for normal use.
   rows-per-expert-adaptive choice. Retuning lever for other GPU generations.
 - `KQ_SWITCH_GEMM_MIN_ROWS` - minimum routed rows before `KQuantSwitchLinear` takes the sorted
   per-expert GEMM arm on a prefill batch (default `512`; `0` disables it and keeps the plain gather).
+- `KQ_GATHER_SEG_NAX=0` - on NAX GPUs, send `KQuantSwitchLinear`'s sorted prefill arm to the
+  fixed-tile `gather_qmm_rhs_nax` leaf instead of the expert-major `gather_qmm_seg` walk. Read per
+  call. A/B lever.
+- `KQ_DISABLE_GATHER_SEG_NAX=1` - run `gather_qmm_seg` on its steel simdgroup-mma kernel even where
+  the NAX tile kernel is available. Read once per process. A/B lever.
+- `KQ_MOE_DEDUP=0` - on Metal, run the fused MoE gathers at verify widths (2 to 8 rows per
+  step) as one dispatch per (row, expert) pair instead of the default dedupe kernels, which
+  dequantize an expert once per pair of rows that select it. Read per call. Outputs are
+  bit-identical either way; `KQ_MOE_HALF=1` keeps its own kernels at every width. A/B lever.
+- `KQ_MOE_HALF=1` - on Metal, run the iq2_xs, iq2_xxs and iq3_xxs fused MoE decode gathers on the
+  half-dot kernels (half grid tables, half-staged activations, half chunk dots with a float sum per
+  chunk; shared-expert slots stay on the float path). Read per call. Default off: the outputs differ
+  from the float kernels at half rounding level. A/B lever.
+
+- `KQ_SDPA_IDX_NAX=0` - run `sdpa_fa_indexed` on its simdgroup kernel even where the NAX tile
+  kernel is available. Read once per process. The simdgroup kernel matches `sdpa_fa_verify` over
+  the gathered rows bit for bit; the NAX kernel differs at output rounding level. A/B lever.
 
 The model-specific kernels carry their own tuning levers, documented alongside each kernel in
 [docs/kernels.md](https://github.com/asher/mlx-kquant/blob/main/docs/kernels.md).

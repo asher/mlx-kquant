@@ -1,6 +1,13 @@
 // Fused deepseek4 hyper-connection glue ops for the single-token decode
 // route (see kq_hc_glue.h for the kernel shapes). Four streams (hc_mult 4)
 // baked; the gmlx caller gates on that. GPU only, like the dsa ops.
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -64,6 +71,11 @@ int check_streams(const mx::array& x, const char* op, const char* what) {
   return D;
 }
 
+// Threads per threadgroup the front, collapse and fused kernels ask for;
+// mirrors KQ_HC_NT in kq_hc_glue.h. The expand kernel asks for fewer.
+constexpr int kHcThreads = 1024;
+constexpr int kHcExpandThreads = 256;
+
 void check_fn(const mx::array& fn, int D, const char* op) {
   if (fn.ndim() != 2 || fn.shape(0) != MIX || fn.shape(1) != HC * D) {
     throw std::invalid_argument(
@@ -74,6 +86,81 @@ void check_fn(const mx::array& fn, int D, const char* op) {
 } // namespace
 
 #ifdef _METAL_
+
+namespace {
+
+// Threads per threadgroup for one launch: the smaller of the count the
+// kernel prefers and what this pipeline supports, rounded down to a whole
+// simdgroup. Register pressure puts the pipeline limit below the preferred
+// count on some GPUs, and an oversized dispatch is silent garbage rather
+// than an error (the same trap kq_sdpa_vector guards), so the kernels read
+// their own [[threads_per_threadgroup]] and stride by it. KQ_HC_NT_LOG=1
+// prints the limit and the choice once per kernel.
+template <typename K>
+inline int kq_hc_threads(K kernel, const std::string& kname, int want) {
+  int cap = int(kernel->maxTotalThreadsPerThreadgroup());
+  static const int forced = []() {
+    const char* e = std::getenv("KQ_HC_NT");
+    return e != nullptr ? std::atoi(e) : 0;
+  }();
+  if (forced > 0) {
+    cap = std::min(cap, forced);
+  }
+  const int nt = (std::min(want, cap) / 32) * 32;
+  if (nt < 32) {
+    throw std::runtime_error(
+        "[mlx_kquant.hc] " + kname + " supports only " + std::to_string(cap) +
+        " threads per threadgroup, below the one simdgroup it needs.");
+  }
+  static const bool log = std::getenv("KQ_HC_NT_LOG") != nullptr;
+  if (log) {
+    static std::set<std::string> seen;
+    if (seen.insert(kname).second) {
+      std::fprintf(
+          stderr,
+          "[kq_hc] %s pipeline max %d, launching %d\n",
+          kname.c_str(),
+          cap,
+          nt);
+    }
+  }
+  return nt;
+}
+
+// The four kernels that reduce in f32 (the two fronts and the two
+// collapses) must launch the same width as each other, not just a width
+// their own pipeline supports. Their threadgroup reductions sum in
+// simdgroup order, so a kernel that launches narrower sums in a
+// different order and its last ulp moves, which breaks the bit-identity
+// hc_front_expand_reduce claims against hc_front_reduce and
+// hc_front_expand_collapse claims against the split pair. Register
+// pressure differs per kernel, so the caps can differ on one GPU. Take
+// the smallest cap in the family and give it to all four. hc_expand
+// reduces nothing and keeps its own width.
+inline int kq_hc_family_threads(mx::metal::Device& d, const std::string& t) {
+  static std::mutex mu;
+  static std::map<std::string, int> cached;
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = cached.find(t);
+  if (it != cached.end()) {
+    return it->second;
+  }
+  const char* family[] = {
+      "kq_hc_front_reduce_",
+      "kq_hc_front_expand_reduce_",
+      "kq_hc_sinkhorn_collapse_",
+      "kq_hc_front_expand_collapse_"};
+  int nt = kHcThreads;
+  for (const char* base : family) {
+    const std::string kname = base + t;
+    nt =
+        std::min(nt, kq_hc_threads(kq_get_kernel(d, kname), kname, kHcThreads));
+  }
+  cached.emplace(t, nt);
+  return nt;
+}
+
+} // namespace
 
 void KQuantHcFrontReduce::eval_gpu(
     const std::vector<mx::array>& inputs,
@@ -96,8 +183,9 @@ void KQuantHcFrontReduce::eval_gpu(
   ce.set_output_array(outputs[0], 2);
   ce.set_output_array(outputs[1], 3);
   ce.set_bytes(D, 4);
+  const int nt = kq_hc_family_threads(d, kq_type_string(x.dtype()));
   ce.dispatch_threadgroups(
-      MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(256, 1, 1));
+      MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(nt, 1, 1));
 }
 
 void KQuantHcFrontExpandReduce::eval_gpu(
@@ -126,8 +214,9 @@ void KQuantHcFrontExpandReduce::eval_gpu(
   ce.set_output_array(outputs[1], 6);
   ce.set_output_array(outputs[2], 7);
   ce.set_bytes(D, 8);
+  const int nt = kq_hc_family_threads(d, kq_type_string(resid.dtype()));
   ce.dispatch_threadgroups(
-      MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(256, 1, 1));
+      MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(nt, 1, 1));
 }
 
 void KQuantHcSinkhornCollapse::eval_gpu(
@@ -159,7 +248,68 @@ void KQuantHcSinkhornCollapse::eval_gpu(
   ce.set_bytes(iters_, 10);
   ce.set_bytes(hc_eps_, 11);
   ce.set_bytes(norm_eps_, 12);
-  ce.dispatch_threadgroups(MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1));
+  const int nt = kq_hc_family_threads(d, kq_type_string(x.dtype()));
+  ce.dispatch_threadgroups(MTL::Size(rows, 1, 1), MTL::Size(nt, 1, 1));
+}
+
+void KQuantHcFrontExpandCollapse::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  for (auto& out : outputs) {
+    out.set_data(mx::allocator::malloc(out.nbytes()));
+  }
+  const auto& resid = inputs[1];
+  int D = resid.shape(-1);
+  int rows = int(resid.size() / (HC * D));
+
+  // Scratch the split route passes between its two dispatches, plus one
+  // arrival counter per row. A fresh counter per dispatch is what makes
+  // the lifecycle safe: the buffer comes from an allocator that never
+  // hands back memory an in-flight batch still references, add_temporary
+  // retains it until this batch completes, and a command buffer that
+  // fails leaves a buffer that is simply dropped rather than one that has
+  // to be reset from the CPU under a partial value.
+  mx::array mixes_raw({rows, MIX}, mx::float32, nullptr, {});
+  mx::array sumsq({rows, 1}, mx::float32, nullptr, {});
+  mx::array arrive({rows}, mx::uint32, nullptr, {});
+  mixes_raw.set_data(mx::allocator::malloc(mixes_raw.nbytes()));
+  sumsq.set_data(mx::allocator::malloc(sumsq.nbytes()));
+  arrive.set_data(mx::allocator::malloc(arrive.nbytes()));
+  std::memset(arrive.data<uint32_t>(), 0, arrive.nbytes());
+
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.add_temporary(mixes_raw);
+  ce.add_temporary(sumsq);
+  ce.add_temporary(arrive);
+
+  std::string kname =
+      "kq_hc_front_expand_collapse_" + kq_type_string(resid.dtype());
+  auto kernel = kq_get_kernel(d, kname);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(inputs[0], 0);
+  ce.set_input_array(resid, 1);
+  ce.set_input_array(inputs[2], 2);
+  ce.set_input_array(inputs[3], 3);
+  ce.set_input_array(inputs[4], 4);
+  ce.set_input_array(inputs[5], 5);
+  ce.set_input_array(inputs[6], 6);
+  ce.set_input_array(inputs[7], 7);
+  ce.set_output_array(outputs[0], 8);
+  ce.set_output_array(mixes_raw, 9);
+  ce.set_output_array(sumsq, 10);
+  ce.set_output_array(arrive, 11);
+  ce.set_output_array(outputs[1], 12);
+  ce.set_output_array(outputs[2], 13);
+  ce.set_output_array(outputs[3], 14);
+  ce.set_bytes(D, 15);
+  ce.set_bytes(iters_, 16);
+  ce.set_bytes(hc_eps_, 17);
+  ce.set_bytes(norm_eps_, 18);
+  const int nt = kq_hc_family_threads(d, kq_type_string(resid.dtype()));
+  ce.dispatch_threadgroups(
+      MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(nt, 1, 1));
 }
 
 void KQuantHcExpand::eval_gpu(
@@ -183,7 +333,8 @@ void KQuantHcExpand::eval_gpu(
   ce.set_input_array(inputs[3], 3);
   ce.set_output_array(out, 4);
   ce.set_bytes(D, 5);
-  ce.dispatch_threadgroups(MTL::Size(rows * 2, 1, 1), MTL::Size(256, 1, 1));
+  const int nt = kq_hc_threads(kernel, kname, kHcExpandThreads);
+  ce.dispatch_threadgroups(MTL::Size(rows * 2, 1, 1), MTL::Size(nt, 1, 1));
 }
 
 #else // !_METAL_
@@ -205,6 +356,13 @@ void KQuantHcSinkhornCollapse::eval_gpu(
     const std::vector<mx::array>&,
     std::vector<mx::array>&) {
   throw std::runtime_error("[mlx_kquant.hc_sinkhorn_collapse] requires Metal.");
+}
+
+void KQuantHcFrontExpandCollapse::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.hc_front_expand_collapse] requires Metal.");
 }
 
 void KQuantHcExpand::eval_gpu(
@@ -236,6 +394,13 @@ void KQuantHcSinkhornCollapse::eval_cpu(
       "[mlx_kquant.hc_sinkhorn_collapse] has no CPU implementation.");
 }
 
+void KQuantHcFrontExpandCollapse::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.hc_front_expand_collapse] has no CPU implementation.");
+}
+
 void KQuantHcExpand::eval_cpu(
     const std::vector<mx::array>&,
     std::vector<mx::array>&) {
@@ -244,6 +409,12 @@ void KQuantHcExpand::eval_cpu(
 
 bool KQuantHcSinkhornCollapse::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantHcSinkhornCollapse&>(other);
+  return iters_ == o.iters_ && hc_eps_ == o.hc_eps_ && norm_eps_ == o.norm_eps_;
+}
+
+bool KQuantHcFrontExpandCollapse::is_equivalent(
+    const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQuantHcFrontExpandCollapse&>(other);
   return iters_ == o.iters_ && hc_eps_ == o.hc_eps_ && norm_eps_ == o.norm_eps_;
 }
 
@@ -374,6 +545,84 @@ std::vector<mx::array> hc_sinkhorn_collapse(
       {std::move(x_c),
        std::move(m_c),
        std::move(q_c),
+       std::move(sc_c),
+       std::move(b_c),
+       std::move(w_c)});
+}
+
+std::vector<mx::array> hc_front_expand_collapse(
+    mx::array x_sub,
+    mx::array resid,
+    mx::array post,
+    mx::array comb,
+    mx::array fn,
+    mx::array scale,
+    mx::array base,
+    mx::array w,
+    int iters,
+    float hc_eps,
+    float norm_eps,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const char* op = "[mlx_kquant.hc_front_expand_collapse]";
+  int D = check_streams(resid, op, "resid");
+  check_fn(fn, D, op);
+  int64_t rows = resid.size() / (int64_t(HC) * D);
+  if (x_sub.shape(-1) != D || x_sub.size() != resid.size() / HC) {
+    throw std::invalid_argument(
+        std::string(op) + " x_sub must be [..., D] matching resid.");
+  }
+  if (x_sub.dtype() != resid.dtype()) {
+    throw std::invalid_argument(
+        std::string(op) + " x_sub and resid dtypes must match.");
+  }
+  if (int64_t(post.size()) != rows * HC ||
+      int64_t(comb.size()) != rows * HC * HC) {
+    throw std::invalid_argument(
+        std::string(op) + " post/comb must be [..., 4] / [..., 4, 4].");
+  }
+  if (scale.size() != 3 || int(base.size()) != MIX) {
+    throw std::invalid_argument(
+        std::string(op) + " scale must be [3] and base [24].");
+  }
+  if (w.ndim() != 1 || w.shape(0) != D || w.dtype() != resid.dtype()) {
+    throw std::invalid_argument(
+        std::string(op) + " w must be [D] in the activation dtype.");
+  }
+  if (iters < 1) {
+    throw std::invalid_argument(std::string(op) + " iters must be >= 1.");
+  }
+  auto xs_c = prep_hc_act(x_sub, op, "x_sub", s);
+  auto r_c = prep_hc_act(resid, op, "resid", s);
+  auto p_c = prep_hc_f32(post, op, "post", s);
+  auto c_c = prep_hc_f32(comb, op, "comb", s);
+  auto fn_c = prep_hc_f32(fn, op, "fn", s);
+  auto sc_c = prep_hc_f32(scale, op, "scale", s);
+  auto b_c = prep_hc_f32(base, op, "base", s);
+  auto w_c = mx::contiguous(w, false, s);
+
+  auto lead = resid.shape();
+  lead.pop_back();
+  lead.pop_back();
+  auto col_shape = lead;
+  col_shape.push_back(D);
+  auto post_shape = lead;
+  post_shape.push_back(HC);
+  auto comb_shape = lead;
+  comb_shape.push_back(HC);
+  comb_shape.push_back(HC);
+  return mx::array::make_arrays(
+      {resid.shape(),
+       std::move(col_shape),
+       std::move(post_shape),
+       std::move(comb_shape)},
+      {resid.dtype(), resid.dtype(), mx::float32, mx::float32},
+      std::make_shared<KQuantHcFrontExpandCollapse>(s, iters, hc_eps, norm_eps),
+      {std::move(xs_c),
+       std::move(r_c),
+       std::move(p_c),
+       std::move(c_c),
+       std::move(fn_c),
        std::move(sc_c),
        std::move(b_c),
        std::move(w_c)});

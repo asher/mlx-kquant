@@ -137,6 +137,106 @@ def test_front_expand_reduce_matches_composition(D):
     assert np.array_equal(np.array(ssq2), np.array(ssq_ref))
 
 
+@pytest.mark.parametrize("D", [1024, 2048, 4096, 8192, 1032])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("iters", [1, 2, ITERS])
+@pytest.mark.parametrize("rep", range(3))
+def test_front_expand_collapse_matches_split_pair(D, dtype, iters, rep):
+    # The continuation runs the same two inline bodies the split pair
+    # runs, so every output is bit identical, not merely close. Repeated
+    # because the arrival protocol is a race between threadgroups and one
+    # passing run is not evidence that it always converges.
+    x, fn, scale, base, w = _mk(23 + rep, D, dtype)
+    col = (mx.random.normal((1, 1, D)) * 0.05).astype(dtype)
+    post = mx.random.uniform(0.5, 1.5, (1, 1, HC)).astype(mx.float32)
+    comb = mx.random.uniform(0.1, 0.9, (1, 1, HC, HC)).astype(mx.float32)
+    comb = comb / comb.sum(axis=-1, keepdims=True)
+    mx.eval(col, post, comb)
+
+    h_ref, mr, ssq = kq.hc_front_expand_reduce(col, x, post, comb, fn)
+    c_ref, p_ref, cb_ref = kq.hc_sinkhorn_collapse(
+        h_ref,
+        mr,
+        ssq,
+        scale,
+        base,
+        w,
+        iters=iters,
+        hc_eps=HC_EPS,
+        norm_eps=NORM_EPS,
+    )
+    h, c, p, cb = kq.hc_front_expand_collapse(
+        col,
+        x,
+        post,
+        comb,
+        fn,
+        scale,
+        base,
+        w,
+        iters=iters,
+        hc_eps=HC_EPS,
+        norm_eps=NORM_EPS,
+    )
+    mx.eval(h_ref, c_ref, p_ref, cb_ref, h, c, p, cb)
+
+    assert np.array_equal(_np64(h), _np64(h_ref))
+    assert np.array_equal(_np64(c), _np64(c_ref))
+    assert np.array_equal(np.array(p), np.array(p_ref))
+    assert np.array_equal(np.array(cb), np.array(cb_ref))
+
+
+@pytest.mark.parametrize("rows", [2, 3, 8])
+@pytest.mark.parametrize("D", [1024, 4096])
+def test_front_expand_collapse_multi_row(rows, D):
+    # One arrival counter per row: a batch of rows collapses each row on
+    # its own last-arriving threadgroup, bit identical to the split pair
+    # on the same inputs. Launched repeatedly on the same inputs so an
+    # arrival race would show as a run-to-run difference.
+    mx.random.seed(41 + rows)
+    dtype = mx.bfloat16
+    x = (mx.random.normal((1, rows, HC, D)) * 0.05).astype(dtype)
+    _, fn, scale, base, w = _mk(7, D, dtype)
+    col = (mx.random.normal((1, rows, D)) * 0.05).astype(dtype)
+    post = mx.random.uniform(0.5, 1.5, (1, rows, HC)).astype(mx.float32)
+    comb = mx.random.uniform(0.1, 0.9, (1, rows, HC, HC)).astype(mx.float32)
+    comb = comb / comb.sum(axis=-1, keepdims=True)
+    mx.eval(x, col, post, comb)
+
+    h_ref, mr, ssq = kq.hc_front_expand_reduce(col, x, post, comb, fn)
+    c_ref, p_ref, cb_ref = kq.hc_sinkhorn_collapse(
+        h_ref,
+        mr,
+        ssq,
+        scale,
+        base,
+        w,
+        iters=ITERS,
+        hc_eps=HC_EPS,
+        norm_eps=NORM_EPS,
+    )
+    mx.eval(h_ref, c_ref, p_ref, cb_ref)
+    for _ in range(16):
+        h, c, p, cb = kq.hc_front_expand_collapse(
+            col,
+            x,
+            post,
+            comb,
+            fn,
+            scale,
+            base,
+            w,
+            iters=ITERS,
+            hc_eps=HC_EPS,
+            norm_eps=NORM_EPS,
+        )
+        mx.eval(h, c, p, cb)
+        assert np.array_equal(_np64(h), _np64(h_ref))
+        assert np.array_equal(_np64(c), _np64(c_ref))
+        assert np.array_equal(np.array(p), np.array(p_ref))
+        assert np.array_equal(np.array(cb), np.array(cb_ref))
+
+
 def test_input_validation():
     x, fn, scale, base, w = _mk(17, 2048)
     with pytest.raises(ValueError):

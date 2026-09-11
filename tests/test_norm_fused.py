@@ -146,3 +146,32 @@ def test_validation_errors():
         kq.add_rmsnorm(h, h, w, EPS, scale=mx.ones((2,), dtype=mx.bfloat16))
     with pytest.raises((ValueError, RuntimeError)):
         kq.rmsnorm2_add(h, w, mx.zeros((2, 32), dtype=mx.bfloat16), w, EPS)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize(
+    "shape", [(1, 40, 64, 128), (2, 3, 4, 64), (5, 256), (1, 7, 128)]
+)
+def test_rmsnorm_gate(dtype, shape):
+    mx.random.seed(11)
+    d = shape[-1]
+    x = mx.random.normal(shape).astype(dtype)
+    g = mx.random.normal(shape).astype(dtype)
+    w = (1.0 + 0.1 * mx.random.normal((d,))).astype(dtype)
+    ref = _rms_ref(x.astype(mx.float32), w.astype(mx.float32)) * mx.sigmoid(
+        g.astype(mx.float32)
+    )
+    got = kq.rmsnorm_gate(x, w, g, EPS)
+    assert got.shape == shape and got.dtype == dtype
+    assert _rel(got, ref) < _tol(dtype)
+    stock = mx.fast.rms_norm(x, w, EPS) * mx.sigmoid(g)
+    assert _rel(got, stock.astype(mx.float32)) < _tol(dtype)
+
+
+def test_rmsnorm_gate_rejects_bad_args():
+    x = mx.random.normal((3, 128)).astype(mx.bfloat16)
+    w = mx.ones((128,), dtype=mx.bfloat16)
+    with pytest.raises(ValueError):
+        kq.rmsnorm_gate(x, w, x[:, :64], EPS)
+    with pytest.raises(ValueError):
+        kq.rmsnorm_gate(x[:, :96], w[:96], x[:, :96], EPS)

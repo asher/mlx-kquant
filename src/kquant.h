@@ -293,6 +293,26 @@ mx::array sdpa_fa_verify(
     int splits = 0,
     mx::StreamOrDevice s = {});
 
+// Index-gathered attention over a shared K/V latent (absorbed MLA decode
+// with a sparse key selection). q [1, Hq, Q, D] attends, for query j, the
+// key rows of kv [1, 1, N, D] listed in idx [Q, M] (int32; a negative or
+// out-of-range entry is a padded slot). K and V are the one latent array.
+// Each 32-head strip of a query walks its split of the list reading every
+// listed row once from the latent: on tensor-op GPUs through a NAX tile
+// kernel whose eight simdgroups each own a 64-column eighth of the head
+// dim (S^T = K @ Q^T per eighth, summed through threadgroup memory, then
+// P @ V from the same resident fragments), elsewhere through the head_dim
+// 512 simdgroup tile of sdpa_fa_verify. The per-split partials merge as
+// sdpa_fa_verify. Head_dim 512, float16/bfloat16, B == 1, any Hq. Returns
+// [1, Hq, Q, D]. KQ_SDPA_IDX_NAX=0 forces the simdgroup kernel. Metal-only.
+mx::array sdpa_fa_indexed(
+    mx::array q,
+    mx::array kv,
+    mx::array idx,
+    float scale,
+    int splits = 0,
+    mx::StreamOrDevice s = {});
+
 // Fused shared-prefix cascade decode attention. Every batch row attends one
 // COMMON prefix (stored once, [1, Hkv, P, D]) plus its own private suffix
 // ([B, Hkv, Sp, D], optional per-row `starts` for left padding). Internally:
@@ -841,6 +861,26 @@ std::vector<mx::array> hc_sinkhorn_collapse(
     float norm_eps,
     mx::StreamOrDevice s = {});
 
+// hc_front_expand_reduce and hc_sinkhorn_collapse as one dispatch: every
+// threadgroup of a row publishes its mix dot and increments a per-row
+// device arrival counter, and the last one to arrive runs the collapse
+// instead of the host launching a second kernel. Nothing waits, so any
+// row count works. Returns {h [..., 4, D], collapsed [..., D], post f32
+// [..., 4], comb f32 [..., 4, 4]}, bit-identical to the split pair.
+std::vector<mx::array> hc_front_expand_collapse(
+    mx::array x_sub,
+    mx::array resid,
+    mx::array post,
+    mx::array comb,
+    mx::array fn,
+    mx::array scale,
+    mx::array base,
+    mx::array w,
+    int iters,
+    float hc_eps,
+    float norm_eps,
+    mx::StreamOrDevice s = {});
+
 // Expand the sublayer output x [..., D] back over resid [..., 4, D] with
 // the pre/comb coefficients. Returns [..., 4, D].
 mx::array hc_expand(
@@ -1191,6 +1231,212 @@ class KQuantSDPAFAVerify : public mx::Primitive {
   int kvarn_n_ = 0;
   int kvarn_n_attend_ = 0;
   bool kvarn_full_vis_ = false;
+};
+
+// Chunked KDA prefill: the per-key-channel gated delta rule
+//   S_t = S_{t-1} diag(g_t) + beta_t (v_t - S_{t-1} diag(g_t) k_t) k_t^T,
+//   o_t = S_t q_t
+// over q, k, v [B, T, H, 128] (float16/bfloat16/float32), log_g [B, T, H,
+// 128] (the per-channel log decay, any float dtype), beta [B, T, H] and the
+// incoming state [B, H, 128, 128] (fp32). Returns (o [B, T, H, 128] in the
+// q dtype, state_out [B, H, 128, 128] fp32). Tensor-op GPUs run one
+// threadgroup per (batch, head) over 32-token chunks with the state resident
+// in fragment registers and bf16 product operands (kq_kda_chunk_nax.h:
+// about 4e-3 relative of the token-by-token recurrence, flat in T; log_g
+// above about -5.5 per token); the CPU path is the sequential recurrence
+// in fp32. Other GPUs raise: check nax_available() and keep the sequential
+// kernel there. T is padded to whole chunks internally.
+std::vector<mx::array> kda_chunk(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    mx::array log_g,
+    mx::array beta,
+    mx::array state,
+    mx::StreamOrDevice s = {});
+
+// kda_chunk with the decay formed inside the kernel from the gate
+// pre-activation: log_g = lb * sigmoid(a_scale[h] * (a + dt_bias[h, d]))
+// with a [B, T, H, 128] in the q dtype, a_scale [H] and dt_bias [H * 128]
+// (any float dtype, used in fp32). Same outputs and numerics as kda_chunk
+// on that log gate, without the fp32 gate tensor.
+std::vector<mx::array> kda_chunk_gated(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    mx::array a,
+    mx::array a_scale,
+    mx::array dt_bias,
+    mx::array beta,
+    mx::array state,
+    float lb,
+    mx::StreamOrDevice s = {});
+
+// Chunked KDA prefill primitive (see kda_chunk, kda_chunk_gated).
+// Inference-only. t_real is the unpadded length; lb applies when gated.
+class KQuantKdaChunk : public mx::Primitive {
+ public:
+  KQuantKdaChunk(mx::Stream stream, int t_real, bool gated, float lb)
+      : mx::Primitive(stream), t_real_(t_real), gated_(gated), lb_(lb) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantKdaChunk";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int t_real_;
+  bool gated_;
+  float lb_;
+};
+
+// Fused unsort and score mix for sorted-prefill MoE:
+//   out[t, :] = sum_s scores[t, s] * y[inv_order[t * k + s], :]
+// y [rows, N] (float16/bfloat16, the expert outputs in routing-sorted row
+// order, rows = T * k), inv_order [T * k] (uint32/int32, the sorted row of
+// each (token, slot) pair), scores [T, k] (any float, used in fp32).
+// Returns [T, N] in the y dtype; f32 accumulation, one round at the write;
+// any GPU and the CPU.
+mx::array gather_mix(
+    mx::array y,
+    mx::array inv_order,
+    mx::array scores,
+    mx::StreamOrDevice s = {});
+
+// Fused unsort and mix primitive (see gather_mix). Inference-only.
+class KQuantGatherMix : public mx::Primitive {
+ public:
+  explicit KQuantGatherMix(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantGatherMix";
+  }
+  bool is_equivalent(const mx::Primitive&) const override {
+    return true;
+  }
+};
+
+// Fused output gate for gated-delta layers: rms_norm(x, w, eps) *
+// sigmoid(gate) over the last axis (64, 128 or 256 wide), x and gate
+// [..., D] in float16/bfloat16, w [D] in the same dtype. One dispatch, f32
+// math, one round at the write; any GPU and the CPU.
+mx::array rmsnorm_gate(
+    mx::array x,
+    mx::array w,
+    mx::array gate,
+    float eps,
+    mx::StreamOrDevice s = {});
+
+// Fused output gate primitive (see rmsnorm_gate). Inference-only.
+class KQuantRMSNormGate : public mx::Primitive {
+ public:
+  KQuantRMSNormGate(mx::Stream stream, float eps)
+      : mx::Primitive(stream), eps_(eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantRMSNormGate";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return eps_ == static_cast<const KQuantRMSNormGate&>(other).eps_;
+  }
+
+ private:
+  float eps_;
+};
+
+// Fused causal short convolution for gated-delta prefill (KDA, GDN):
+//   y[t] = silu(sum_j w[:, j] * in[t - K + 1 + j]),  in = [state; x]
+// over x [B, T, C] (float16/bfloat16), state [B, K - 1, C] (the carried
+// rows, same dtype) and the depthwise taps w [C, K] or [C, K, 1] (the
+// nn.Conv1d layout). With scale != 0 each head_dim-channel head of y is
+// l2-normalized with the scale folded in (scale * rms_norm(y, eps));
+// head_dim must be 64, 128 or 256. Returns (y [B, T, C], state_out
+// [B, K - 1, C]: the last K - 1 rows of [state; x]). All math in f32 with
+// one round at the write, on every GPU and on the CPU.
+std::vector<mx::array> kda_conv(
+    mx::array x,
+    mx::array state,
+    mx::array w,
+    int head_dim,
+    float scale,
+    float eps,
+    mx::StreamOrDevice s = {});
+
+// Fused short-conv primitive (see kda_conv). Inference-only.
+class KQuantKdaConv : public mx::Primitive {
+ public:
+  KQuantKdaConv(mx::Stream stream, int head_dim, float scale, float eps)
+      : mx::Primitive(stream), head_dim_(head_dim), scale_(scale), eps_(eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantKdaConv";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int head_dim_;
+  float scale_;
+  float eps_;
+};
+
+// Index-gathered matrix-tile attention (see sdpa_fa_indexed). Inference-only.
+class KQuantSDPAFAIndexed : public mx::Primitive {
+ public:
+  explicit KQuantSDPAFAIndexed(mx::Stream stream, float scale, int splits)
+      : mx::Primitive(stream), scale_(scale), splits_(splits) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSDPAFAIndexed";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int splits_;
 };
 
 // Block-sparse FA prefill over QSA-selected 4-row pages (see
@@ -2026,6 +2272,36 @@ class KQuantHcSinkhornCollapse : public mx::Primitive {
 
   const char* name() const override {
     return "KQuantHcSinkhornCollapse";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int iters_;
+  float hc_eps_;
+  float norm_eps_;
+};
+
+class KQuantHcFrontExpandCollapse : public mx::Primitive {
+ public:
+  explicit KQuantHcFrontExpandCollapse(
+      mx::Stream stream,
+      int iters,
+      float hc_eps,
+      float norm_eps)
+      : mx::Primitive(stream),
+        iters_(iters),
+        hc_eps_(hc_eps),
+        norm_eps_(norm_eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcFrontExpandCollapse";
   }
   bool is_equivalent(const mx::Primitive& other) const override;
 

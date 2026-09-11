@@ -138,6 +138,19 @@ instantiate_kq_sdpa_fa_verify(float16_t, 256, 64)
 instantiate_kq_sdpa_fa_verify_dsplit(bfloat16_t, 512)
 instantiate_kq_sdpa_fa_verify_dsplit(float16_t, 512)
 
+// Index-gathered attention over a shared K/V latent (absorbed MLA sparse
+// decode): the d-split tile walks the key rows an index list names.
+#define instantiate_kq_sdpa_fa_indexed(type, D, BQ)                     \
+  instantiate_kernel(                                                  \
+      "kq_sdpa_fa_indexed_2pass_1_" #type "_" #D "_bq" #BQ,            \
+      kq_sdpa_fa_indexed_2pass_1,                                      \
+      type,                                                            \
+      D,                                                               \
+      BQ)
+
+instantiate_kq_sdpa_fa_indexed(bfloat16_t, 512, 32)
+instantiate_kq_sdpa_fa_indexed(float16_t, 512, 32)
+
 instantiate_kq_sdpa_gqa_merge(bfloat16_t, 64)
 instantiate_kq_sdpa_gqa_merge(float16_t, 64)
 instantiate_kq_sdpa_gqa_merge(bfloat16_t, 128)

@@ -1009,9 +1009,10 @@ instantiate_kquant_gather_qmm_rhs_codec(256, 1, stq1_0)
 // Tile-map builder for gather_qmm_seg. One thread per expert-sorted row; the
 // thread whose row starts a 64-row tile appends (expert, row_start, num_rows)
 // with num_rows = min(64, rows left in the segment): only the last tile of a
-// segment can be partial, and the GEMM kernel skips dead row fragments at
-// simdgroup granularity. counts[0] receives the appended tile count and must
-// be zeroed first (kq_seg_zero_counts). Tile order is unspecified.
+// segment can be partial, and the GEMM kernels skip the dead row fragments
+// (16-row sub-bands on the NAX kernel). counts[0] receives the appended
+// tile count and must be zeroed first (kq_seg_zero_counts). Tile order is
+// unspecified.
 [[kernel]] void kq_seg_zero_counts(
     device uint32_t* counts [[buffer(0)]],
     uint i [[thread_position_in_grid]]) {

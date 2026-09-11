@@ -1164,3 +1164,135 @@ def test_sdpa_paged_validation():
         kq.sdpa_decode_gqa_paged(
             q, k, v, scale, good, starts=mx.zeros((B,), dtype=mx.float32)
         )
+
+
+# --- sdpa_fa_indexed: index-gathered attention over a shared latent -------
+
+
+def _ref_sdpa_indexed(q, kv, idx, scale):
+    """f32 reference: query j attends the kv rows idx[j] lists, padded slots
+    (negative or >= N) dropped."""
+    Q = q.shape[2]
+    lat = kv[0, 0].astype(mx.float32)
+    outs = []
+    for j in range(Q):
+        rows = [int(g) for g in idx[j].tolist() if 0 <= g < lat.shape[0]]
+        k = lat[mx.array(rows, dtype=mx.int32)]
+        sc = (q[0, :, j].astype(mx.float32) @ k.T) * scale
+        outs.append(mx.softmax(sc, axis=-1) @ k)
+    return mx.stack(outs, axis=1)[None].astype(q.dtype)
+
+
+def _make_indexed(n_heads, Q, N, M, pad, dtype, seed):
+    key = mx.random.key(seed)
+    k0, k1, k2 = mx.random.split(key, 3)
+    q = (mx.random.normal((1, n_heads, Q, 512), key=k0) * 0.3).astype(dtype)
+    kv = (mx.random.normal((1, 1, N, 512), key=k1) * 0.5).astype(dtype)
+    rows = []
+    for j in range(Q):
+        sel = mx.sort(
+            mx.random.permutation(N, key=mx.random.split(k2, Q)[j])[: M - pad]
+        )
+        rows.append(
+            mx.concatenate([sel, mx.full((pad,), -1, mx.int32)]).astype(mx.int32)
+        )
+    idx = mx.stack(rows)
+    mx.eval(q, kv, idx)
+    return q, kv, idx
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (64, 1, 2051, 2051, 0),  # glm-5.3-flash S=1: 64 heads, 512 pools x 4 + tail
+        (64, 2, 4307, 2051, 3),  # S=2 with padded slots
+        (40, 3, 700, 300, 5),  # partial 32-head strip, several queries
+        (8, 1, 100, 64, 0),  # one short strip
+        (64, 1, 9000, 8500, 1),  # crosses the splits 16 -> 32 default
+    ],
+)
+def test_sdpa_fa_indexed(shape, dtype):
+    n_heads, Q, N, M, pad = shape
+    q, kv, idx = _make_indexed(n_heads, Q, N, M, pad, dtype, seed=N + M)
+    scale = 512**-0.5
+    got = kq.sdpa_fa_indexed(q, kv, idx, scale)
+    ref = _ref_sdpa_indexed(q, kv, idx, scale)
+    _eval_or_skip(got, ref)
+    rel = _rel(got, ref)
+    assert got.shape == (1, n_heads, Q, 512)
+    assert rel < REL_BOUND[dtype], f"{shape} rel {rel:.3e}"
+
+
+@pytest.mark.parametrize("splits", [1, 4, 32])
+def test_sdpa_fa_indexed_splits(splits):
+    q, kv, idx = _make_indexed(64, 2, 2051, 2051, 0, mx.bfloat16, seed=7)
+    scale = 512**-0.5
+    got = kq.sdpa_fa_indexed(q, kv, idx, scale, splits)
+    ref = _ref_sdpa_indexed(q, kv, idx, scale)
+    _eval_or_skip(got, ref)
+    assert _rel(got, ref) < REL_BOUND[mx.bfloat16]
+
+
+def test_sdpa_fa_indexed_all_padded_row():
+    # a query whose list is all pads yields zeros, not NaN
+    q, kv, idx = _make_indexed(64, 2, 300, 128, 0, mx.float16, seed=3)
+    idx = mx.concatenate([idx[:1], mx.full((1, 128), -1, mx.int32)])
+    got = kq.sdpa_fa_indexed(q, kv, idx, 512**-0.5)
+    ref = _ref_sdpa_indexed(q[:, :, :1], kv, idx[:1], 512**-0.5)
+    _eval_or_skip(got, ref)
+    assert _rel(got[:, :, :1], ref) < REL_BOUND[mx.float16]
+    assert float(mx.abs(got[:, :, 1:]).max()) == 0.0
+
+
+_SIMDGROUP_BITEQ = """
+import mlx.core as mx, mlx_kquant as kq
+mx.random.seed(11)
+for dtype in (mx.bfloat16, mx.float16):
+    q = (mx.random.normal((1, 64, 1, 512)) * 0.3).astype(dtype)
+    kv = (mx.random.normal((1, 1, 2051, 512)) * 0.5).astype(dtype)
+    idx = mx.sort(mx.random.permutation(2051)[:1800]).astype(mx.int32)[None]
+    got = kq.sdpa_fa_indexed(q, kv, idx, 512**-0.5, 16)
+    g = kv[:, :, idx[0]]
+    ref = mx.concatenate(
+        [kq.sdpa_fa_verify(mx.contiguous(q[:, h:h + 32].reshape(1, 1, 32, 512)),
+                           g, g, 512**-0.5, 1, 16).reshape(1, 32, 1, 512)
+         for h in (0, 32)], axis=1)
+    mx.eval(got, ref)
+    print("BITEQ", int(mx.array_equal(got, ref)))
+"""
+
+
+def test_sdpa_fa_indexed_simdgroup_bit_equal_fa_verify():
+    # KQ_SDPA_IDX_NAX is read once per process: run the simdgroup kernel in
+    # a child and check it reproduces sdpa_fa_verify over the gathered rows.
+    import subprocess
+
+    env = dict(os.environ, KQ_SDPA_IDX_NAX="0")
+    r = subprocess.run(
+        [sys.executable, "-c", _SIMDGROUP_BITEQ],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if "pipeline limit" in r.stderr:
+        pytest.skip(r.stderr.strip().splitlines()[-1])
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.count("BITEQ 1") == 2, r.stdout
+
+
+def test_sdpa_fa_indexed_validation():
+    q, kv, idx = _make_indexed(64, 2, 300, 128, 0, mx.bfloat16, seed=5)
+    sc = 512**-0.5
+    with pytest.raises(ValueError):  # head dim
+        kq.sdpa_fa_indexed(q[..., :256], kv[..., :256], idx, sc)
+    with pytest.raises(ValueError):  # idx dtype
+        kq.sdpa_fa_indexed(q, kv, idx.astype(mx.int64), sc)
+    with pytest.raises(ValueError):  # idx rows != Q
+        kq.sdpa_fa_indexed(q, kv, idx[:1], sc)
+    with pytest.raises(ValueError):  # dtype mismatch
+        kq.sdpa_fa_indexed(q, kv.astype(mx.float16), idx, sc)
+    with pytest.raises(ValueError):  # kv heads
+        kq.sdpa_fa_indexed(q, mx.concatenate([kv, kv], axis=1), idx, sc)
+    with pytest.raises(ValueError):  # splits range
+        kq.sdpa_fa_indexed(q, kv, idx, sc, 256)
