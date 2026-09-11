@@ -4,6 +4,7 @@
 // dispatch (see kq_norm_fused.h for the kernel shapes). The scalar CPU evals
 // mirror the kernels' f32-accumulate / one-round-at-write semantics;
 // rms_norm semantics match mx::fast::rms_norm.
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -69,11 +70,19 @@ namespace {
 
 // One threadgroup per row, sized so each thread covers 4 contiguous elements
 // (KQ_NORM_NREADS); rows wider than 4096 loop strided inside the kernel.
-MTL::Size kq_norm_group_dims(int D) {
+// 1024 is the device ceiling, but the binding limit is the pipeline's own
+// maxTotalThreadsPerThreadgroup, which register pressure can put lower on
+// some GPUs, and an oversized dispatch is silent garbage rather than an
+// error. The kernels read their width from [[threads_per_threadgroup]] and
+// stride by it, so narrowing here only changes the reduction order.
+template <typename K>
+MTL::Size kq_norm_group_dims(int D, K kernel) {
   int threads = (D + 3) / 4;
   threads = ((threads + 31) / 32) * 32;
-  if (threads > 1024) {
-    threads = 1024;
+  const int cap = int(kernel->maxTotalThreadsPerThreadgroup());
+  threads = std::min(threads, (std::min(cap, 1024) / 32) * 32);
+  if (threads < 32) {
+    threads = 32;
   }
   return MTL::Size(threads, 1, 1);
 }
@@ -110,7 +119,7 @@ void KQuantAddRMSNorm::eval_gpu(
   ce.set_bytes(D, 5);
   ce.set_bytes(eps_, 6);
   ce.set_bytes(HAS_SCALE, 7);
-  MTL::Size group_dims = kq_norm_group_dims(D);
+  MTL::Size group_dims = kq_norm_group_dims(D, kernel);
   MTL::Size grid_dims(T, 1, 1);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
@@ -141,7 +150,7 @@ void KQuantRMSNormMulti3::eval_gpu(
   ce.set_output_array(outputs[2], 6);
   ce.set_bytes(D, 7);
   ce.set_bytes(eps_, 8);
-  MTL::Size group_dims = kq_norm_group_dims(D);
+  MTL::Size group_dims = kq_norm_group_dims(D, kernel);
   MTL::Size grid_dims(T, 1, 1);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
@@ -169,7 +178,7 @@ void KQuantRMSNorm2Add::eval_gpu(
   ce.set_output_array(out, 4);
   ce.set_bytes(D, 5);
   ce.set_bytes(eps_, 6);
-  MTL::Size group_dims = kq_norm_group_dims(D);
+  MTL::Size group_dims = kq_norm_group_dims(D, kernel);
   MTL::Size grid_dims(T, 1, 1);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
