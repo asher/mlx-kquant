@@ -245,11 +245,18 @@ from mlx_kquant.nn import bytes_per_row
 
 codec, scodec, T, out_path = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 rng = np.random.default_rng(23)
-E, N, K, S = 24, 256, 512, 4
+# Few experts and an eval per tensor: an iq2_xs encode of one expert slab
+# runs over a second of GPU work, and left lazy all six land in the same
+# command buffer as the gathers below, which is long enough to trip the
+# command buffer watchdog on a slow GPU. The encode is fixture cost, not
+# what this test asserts on, and fewer experts means rows share more, which
+# is the dedupe path.
+E, N, K, S = 8, 256, 512, 4
 def wire(e, n, k, c):
     w = mx.array((rng.standard_normal((e, n, k)) * 0.1).astype(np.float32))
     im = mx.ones((k,), dtype=mx.float32) if c.startswith("iq") else None
     wq, _ = kq.quantize(w, c, im)
+    mx.eval(wq)
     return wq
 gw, uw = wire(E, N, K, codec), wire(E, N, K, codec)
 dw = wire(E, K, N, codec)
