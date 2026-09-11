@@ -27,37 +27,44 @@
 //                             and the last one to arrive runs the
 //                             collapse. No threadgroup waits.
 //
-// Every kernel runs KQ_HC_NT threads per threadgroup (the dispatch side
-// uses the same count): at hidden sizes up to 4096 each thread owns one
+// Every kernel runs the launch size the host picked, up to KQ_HC_NT: at
+// hidden sizes up to 4096 and a full threadgroup each thread owns one
 // float4 column of every stream, so a threadgroup issues all of its loads
 // at once instead of walking the row in strides, which is what the
-// dependent decode chain pays for. The bodies live in shared inline
+// dependent decode chain pays for. A smaller launch strides and stays
+// correct. The bodies live in shared inline
 // functions so the split and fused routes cannot drift apart.
 
 #define KQ_HC 4
 #define KQ_HC_MIX ((2 + KQ_HC) * KQ_HC)
+// Threads per threadgroup the host asks for. Register pressure can put a
+// pipeline's maxTotalThreadsPerThreadgroup below this on some GPUs, so the
+// host launches the smaller of the two and every kernel strides by its own
+// [[threads_per_threadgroup]] rather than by this constant. Threadgroup
+// scratch is sized for the largest launch.
 #define KQ_HC_NT 1024
-#define KQ_HC_NSG (KQ_HC_NT / 32)
-// The collapse: KQ_HC_NT - 32 worker threads own the float4 columns and
-// the last simdgroup runs the sinkhorn.
-#define KQ_HC_NC (KQ_HC_NT - 32)
-#define KQ_HC_MAX_CHUNKS ((8192 / 4 + KQ_HC_NC - 1) / KQ_HC_NC)
+#define KQ_HC_NSG_MAX (KQ_HC_NT / 32)
+// The collapse gives the last simdgroup to the sinkhorn; the other
+// nt - 32 threads own the float4 columns.
 
 // One f32 per thread to one value, valid on lane 0 of simdgroup 0 after
-// the call. partial is threadgroup scratch [NSG]; simdgroups at or past
-// NSG contribute nothing. Every thread of the threadgroup must call this
+// the call. nsg is the launch's simdgroup count and partial is threadgroup
+// scratch [KQ_HC_NSG_MAX]. Every thread of the threadgroup must call this
 // (it barriers).
-template <int NSG>
-inline float
-kq_hc_tg_sum(float acc, uint lane, uint sg, threadgroup float* partial) {
+inline float kq_hc_tg_sum(
+    float acc,
+    uint lane,
+    uint sg,
+    uint nsg,
+    threadgroup float* partial) {
   acc = simd_sum(acc);
-  if (lane == 0 && sg < (uint)NSG) {
+  if (lane == 0 && sg < nsg) {
     partial[sg] = acc;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float v = 0.0f;
   if (sg == 0) {
-    v = (lane < (uint)NSG) ? partial[lane] : 0.0f;
+    v = (lane < nsg) ? partial[lane] : 0.0f;
     v = simd_sum(v);
   }
   return v;
@@ -89,7 +96,8 @@ template <typename T>
     device float* sumsq [[buffer(3)]],
     const constant int& D [[buffer(4)]],
     uint tg [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]]) {
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]]) {
   const uint lane = tid % 32;
   const uint sg = tid / 32;
   const int KTOT = KQ_HC * D;
@@ -104,7 +112,7 @@ template <typename T>
   float acc = 0.0f;
   if (m < (uint)KQ_HC_MIX) {
     const device float4* f4 = (const device float4*)(fn + (int64_t)m * KTOT);
-    for (uint d4 = tid; d4 < D4q; d4 += KQ_HC_NT) {
+    for (uint d4 = tid; d4 < D4q; d4 += nt) {
       float4 x0 = float4(x4[0 * D4q + d4]);
       float4 x1 = float4(x4[1 * D4q + d4]);
       float4 x2 = float4(x4[2 * D4q + d4]);
@@ -116,7 +124,7 @@ template <typename T>
       KQ_HC_DOT16(acc, x0, x1, x2, x3, f0, f1, f2, f3)
     }
   } else {
-    for (uint d4 = tid; d4 < D4q; d4 += KQ_HC_NT) {
+    for (uint d4 = tid; d4 < D4q; d4 += nt) {
       float4 x0 = float4(x4[0 * D4q + d4]);
       float4 x1 = float4(x4[1 * D4q + d4]);
       float4 x2 = float4(x4[2 * D4q + d4]);
@@ -125,8 +133,8 @@ template <typename T>
     }
   }
 
-  threadgroup float partial[KQ_HC_NSG];
-  float v = kq_hc_tg_sum<KQ_HC_NSG>(acc, lane, sg, partial);
+  threadgroup float partial[KQ_HC_NSG_MAX];
+  float v = kq_hc_tg_sum(acc, lane, sg, nt / 32, partial);
   if (sg == 0 && lane == 0) {
     if (m < (uint)KQ_HC_MIX) {
       mixes_raw[row * KQ_HC_MIX + m] = v;
@@ -137,7 +145,7 @@ template <typename T>
 }
 
 // Shared body of kq_hc_front_expand_reduce, also run by every threadgroup
-// of the fused kernel. partial is threadgroup scratch [KQ_HC_NSG].
+// of the fused kernel. partial is threadgroup scratch [KQ_HC_NSG_MAX].
 template <typename T>
 inline void kq_hc_front_expand_reduce_body(
     const device T* x_sub,
@@ -152,6 +160,7 @@ inline void kq_hc_front_expand_reduce_body(
     uint row,
     uint m,
     uint tid,
+    uint nt,
     threadgroup float* partial) {
   const uint lane = tid % 32;
   const uint sg = tid / 32;
@@ -178,7 +187,7 @@ inline void kq_hc_front_expand_reduce_body(
   const device float4* f4 = (const device float4*)(fn + (int64_t)m * KTOT);
 
   float acc = 0.0f;
-  for (uint d4 = tid; d4 < D4q; d4 += KQ_HC_NT) {
+  for (uint d4 = tid; d4 < D4q; d4 += nt) {
     float4 xv = float4(xs4[d4]);
     float4 r0 = float4(rr4[0 * D4q + d4]);
     float4 r1 = float4(rr4[1 * D4q + d4]);
@@ -230,7 +239,7 @@ inline void kq_hc_front_expand_reduce_body(
     }
   }
 
-  float v = kq_hc_tg_sum<KQ_HC_NSG>(acc, lane, sg, partial);
+  float v = kq_hc_tg_sum(acc, lane, sg, nt / 32, partial);
   if (sg == 0 && lane == 0) {
     if (m < (uint)KQ_HC_MIX) {
       mixes_raw[row * KQ_HC_MIX + m] = v;
@@ -252,8 +261,9 @@ template <typename T>
     device float* sumsq [[buffer(7)]],
     const constant int& D [[buffer(8)]],
     uint tg [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]]) {
-  threadgroup float partial[KQ_HC_NSG];
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]]) {
+  threadgroup float partial[KQ_HC_NSG_MAX];
   kq_hc_front_expand_reduce_body<T>(
       x_sub,
       resid,
@@ -267,14 +277,15 @@ template <typename T>
       tg / (KQ_HC_MIX + 1),
       tg % (KQ_HC_MIX + 1),
       tid,
+      nt,
       partial);
 }
 
 // Shared body of kq_hc_sinkhorn_collapse, also run by the collapsing
-// threadgroup of the fused kernel. The first KQ_HC_NC threads collapse
+// threadgroup of the fused kernel. The first nt - 32 threads collapse
 // the streams with the pre gates, which every thread derives on its own
 // from the mixes, while the last simdgroup runs the sinkhorn (post and
-// comb). ssq_shared is [KQ_HC_NSG] and inv_shared [1] of threadgroup
+// comb). ssq_shared is [KQ_HC_NSG_MAX] and inv_shared [1] of threadgroup
 // scratch.
 template <typename T>
 inline void kq_hc_sinkhorn_collapse_body(
@@ -293,18 +304,18 @@ inline void kq_hc_sinkhorn_collapse_body(
     const float norm_eps,
     uint row,
     uint tid,
+    uint nt,
     threadgroup float* ssq_shared,
     threadgroup float* inv_shared) {
-  constexpr int NSG = KQ_HC_NSG;
-  constexpr int NC = KQ_HC_NC;
-  constexpr int MAXC = KQ_HC_MAX_CHUNKS;
+  const uint NSG = nt / 32;
+  const uint NC = nt - 32;
   const uint lane = tid % 32;
   const uint sg = tid / 32;
   const int BASE_OFF = 2 * KQ_HC;
   const float EPS = hc_eps;
   const float NEPS = norm_eps;
-  const bool worker = tid < (uint)NC;
-  const bool spare = (sg == (uint)(NSG - 1));
+  const bool worker = tid < NC;
+  const bool spare = (sg == NSG - 1);
 
   const device float* mix = mixes_raw + row * KQ_HC_MIX;
   device float* post_out = post + row * KQ_HC;
@@ -375,27 +386,31 @@ inline void kq_hc_sinkhorn_collapse_body(
     }
   }
 
-  float4 vals[MAXC];
+  // Two passes over the columns, recomputing the collapse in the second
+  // rather than holding one float4 per chunk in registers: the chunk count
+  // rises as the launch shrinks, so caching them would make a smaller
+  // threadgroup cost more registers per thread, which is what lowers the
+  // launch size in the first place. The second pass re-reads the four
+  // streams the first pass just touched, and the fma chain is unchanged,
+  // so every output is bit-identical to the caching form.
   float ssq = 0.0f;
   for (uint c = 0; c < chunks; ++c) {
     uint d4 = c * NC + tid;
-    float4 result = float4(0.0f);
     if (worker && d4 < D4) {
       float4 x0 = float4(x_row0[d4]);
       float4 x1 = float4(x_row1[d4]);
       float4 x2 = float4(x_row2[d4]);
       float4 x3 = float4(x_row3[d4]);
-      result =
+      float4 result =
           fma(float4(p0),
               x0,
               fma(float4(p1), x1, fma(float4(p2), x2, float4(p3) * x3)));
       ssq += result.x * result.x + result.y * result.y + result.z * result.z +
           result.w * result.w;
     }
-    vals[c] = result;
   }
 
-  float tot = kq_hc_tg_sum<NSG>(ssq, lane, sg, ssq_shared);
+  float tot = kq_hc_tg_sum(ssq, lane, sg, NSG, ssq_shared);
   if (sg == 0 && lane == 0) {
     inv_shared[0] = metal::rsqrt(tot / (float)D + NEPS);
   }
@@ -405,10 +420,18 @@ inline void kq_hc_sinkhorn_collapse_body(
   for (uint c = 0; c < chunks; ++c) {
     uint d4 = c * NC + tid;
     if (worker && d4 < D4) {
+      float4 x0 = float4(x_row0[d4]);
+      float4 x1 = float4(x_row1[d4]);
+      float4 x2 = float4(x_row2[d4]);
+      float4 x3 = float4(x_row3[d4]);
+      float4 result =
+          fma(float4(p0),
+              x0,
+              fma(float4(p1), x1, fma(float4(p2), x2, float4(p3) * x3)));
       uint d = d4 * 4;
       float4 wv = float4(
           (float)w[d], (float)w[d + 1], (float)w[d + 2], (float)w[d + 3]);
-      out4[d4] = T4(vals[c] * inv * wv);
+      out4[d4] = T4(result * inv * wv);
     }
   }
 }
@@ -429,8 +452,9 @@ template <typename T>
     const constant float& hc_eps [[buffer(11)]],
     const constant float& norm_eps [[buffer(12)]],
     uint row [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]]) {
-  threadgroup float ssq_shared[KQ_HC_NSG];
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]]) {
+  threadgroup float ssq_shared[KQ_HC_NSG_MAX];
   threadgroup float inv_shared[1];
   kq_hc_sinkhorn_collapse_body<T>(
       x,
@@ -448,6 +472,7 @@ template <typename T>
       norm_eps,
       row,
       tid,
+      nt,
       ssq_shared,
       inv_shared);
 }
@@ -484,9 +509,10 @@ template <typename T>
     const constant float& hc_eps [[buffer(17)]],
     const constant float& norm_eps [[buffer(18)]],
     uint tg [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]]) {
-  threadgroup float partial[KQ_HC_NSG];
-  threadgroup float ssq_shared[KQ_HC_NSG];
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]]) {
+  threadgroup float partial[KQ_HC_NSG_MAX];
+  threadgroup float ssq_shared[KQ_HC_NSG_MAX];
   threadgroup float inv_shared[1];
   threadgroup uint last_flag;
 
@@ -506,6 +532,7 @@ template <typename T>
       row,
       m,
       tid,
+      nt,
       partial);
 
   // publish this threadgroup's mix dot (or h and sumsq), then arrive
@@ -541,6 +568,7 @@ template <typename T>
       norm_eps,
       row,
       tid,
+      nt,
       ssq_shared,
       inv_shared);
 }
@@ -554,7 +582,8 @@ template <typename T>
     device T* out [[buffer(4)]],
     const constant int& D [[buffer(5)]],
     uint tg [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]]) {
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]]) {
   const uint NTG = 2;
   const uint row = tg / NTG;
   const uint sub = tg % NTG;
@@ -588,7 +617,7 @@ template <typename T>
   device T4* o14 = (device T4*)(orow + 1 * D + d0);
   device T4* o24 = (device T4*)(orow + 2 * D + d0);
   device T4* o34 = (device T4*)(orow + 3 * D + d0);
-  for (uint k = tid; k < SPAN / 4; k += 256) {
+  for (uint k = tid; k < SPAN / 4; k += nt) {
     float4 xv = float4(x4[k]);
     float4 r0 = float4(r04[k]), r1 = float4(r14[k]);
     float4 r2 = float4(r24[k]), r3 = float4(r34[k]);

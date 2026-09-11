@@ -1,7 +1,11 @@
 // Fused deepseek4 hyper-connection glue ops for the single-token decode
 // route (see kq_hc_glue.h for the kernel shapes). Four streams (hc_mult 4)
 // baked; the gmlx caller gates on that. GPU only, like the dsa ops.
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -65,9 +69,10 @@ int check_streams(const mx::array& x, const char* op, const char* what) {
   return D;
 }
 
-// Threads per threadgroup of the front, collapse and fused kernels;
-// mirrors KQ_HC_NT in kq_hc_glue.h.
+// Threads per threadgroup the front, collapse and fused kernels ask for;
+// mirrors KQ_HC_NT in kq_hc_glue.h. The expand kernel asks for fewer.
 constexpr int kHcThreads = 1024;
+constexpr int kHcExpandThreads = 256;
 
 void check_fn(const mx::array& fn, int D, const char* op) {
   if (fn.ndim() != 2 || fn.shape(0) != MIX || fn.shape(1) != HC * D) {
@@ -79,6 +84,41 @@ void check_fn(const mx::array& fn, int D, const char* op) {
 } // namespace
 
 #ifdef _METAL_
+
+namespace {
+
+// Threads per threadgroup for one launch: the smaller of the count the
+// kernel prefers and what this pipeline supports, rounded down to a whole
+// simdgroup. Register pressure puts the pipeline limit below the preferred
+// count on some GPUs, and an oversized dispatch is silent garbage rather
+// than an error (the same trap kq_sdpa_vector guards), so the kernels read
+// their own [[threads_per_threadgroup]] and stride by it. KQ_HC_NT_LOG=1
+// prints the limit and the choice once per kernel.
+template <typename K>
+inline int kq_hc_threads(K kernel, const std::string& kname, int want) {
+  const int cap = int(kernel->maxTotalThreadsPerThreadgroup());
+  const int nt = (std::min(want, cap) / 32) * 32;
+  if (nt < 32) {
+    throw std::runtime_error(
+        "[mlx_kquant.hc] " + kname + " supports only " + std::to_string(cap) +
+        " threads per threadgroup, below the one simdgroup it needs.");
+  }
+  static const bool log = std::getenv("KQ_HC_NT_LOG") != nullptr;
+  if (log) {
+    static std::set<std::string> seen;
+    if (seen.insert(kname).second) {
+      std::fprintf(
+          stderr,
+          "[kq_hc] %s pipeline max %d, launching %d\n",
+          kname.c_str(),
+          cap,
+          nt);
+    }
+  }
+  return nt;
+}
+
+} // namespace
 
 void KQuantHcFrontReduce::eval_gpu(
     const std::vector<mx::array>& inputs,
@@ -101,8 +141,9 @@ void KQuantHcFrontReduce::eval_gpu(
   ce.set_output_array(outputs[0], 2);
   ce.set_output_array(outputs[1], 3);
   ce.set_bytes(D, 4);
+  const int nt = kq_hc_threads(kernel, kname, kHcThreads);
   ce.dispatch_threadgroups(
-      MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(kHcThreads, 1, 1));
+      MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(nt, 1, 1));
 }
 
 void KQuantHcFrontExpandReduce::eval_gpu(
@@ -131,8 +172,9 @@ void KQuantHcFrontExpandReduce::eval_gpu(
   ce.set_output_array(outputs[1], 6);
   ce.set_output_array(outputs[2], 7);
   ce.set_bytes(D, 8);
+  const int nt = kq_hc_threads(kernel, kname, kHcThreads);
   ce.dispatch_threadgroups(
-      MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(kHcThreads, 1, 1));
+      MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(nt, 1, 1));
 }
 
 void KQuantHcSinkhornCollapse::eval_gpu(
@@ -164,7 +206,8 @@ void KQuantHcSinkhornCollapse::eval_gpu(
   ce.set_bytes(iters_, 10);
   ce.set_bytes(hc_eps_, 11);
   ce.set_bytes(norm_eps_, 12);
-  ce.dispatch_threadgroups(MTL::Size(rows, 1, 1), MTL::Size(kHcThreads, 1, 1));
+  const int nt = kq_hc_threads(kernel, kname, kHcThreads);
+  ce.dispatch_threadgroups(MTL::Size(rows, 1, 1), MTL::Size(nt, 1, 1));
 }
 
 void KQuantHcFrontExpandCollapse::eval_gpu(
@@ -222,8 +265,9 @@ void KQuantHcFrontExpandCollapse::eval_gpu(
   ce.set_bytes(iters_, 16);
   ce.set_bytes(hc_eps_, 17);
   ce.set_bytes(norm_eps_, 18);
+  const int nt = kq_hc_threads(kernel, kname, kHcThreads);
   ce.dispatch_threadgroups(
-      MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(kHcThreads, 1, 1));
+      MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(nt, 1, 1));
 }
 
 void KQuantHcExpand::eval_gpu(
@@ -247,7 +291,8 @@ void KQuantHcExpand::eval_gpu(
   ce.set_input_array(inputs[3], 3);
   ce.set_output_array(out, 4);
   ce.set_bytes(D, 5);
-  ce.dispatch_threadgroups(MTL::Size(rows * 2, 1, 1), MTL::Size(256, 1, 1));
+  const int nt = kq_hc_threads(kernel, kname, kHcExpandThreads);
+  ce.dispatch_threadgroups(MTL::Size(rows * 2, 1, 1), MTL::Size(nt, 1, 1));
 }
 
 #else // !_METAL_

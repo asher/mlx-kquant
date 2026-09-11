@@ -33,9 +33,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The NAX loaders for iq2_xs, iq3_xxs, iq2_s and iq3_s fold the sign into
   the grid bytes. Every NAX kernel on these codecs takes the change and
   the products stay bit-identical.
-- The hyper-connection M=1 glue kernels run 1024 threads per threadgroup
-  and read each activation row once for all four streams. The expanded
-  stream stays bit-identical and the f32 reductions change summation order.
+- The hyper-connection M=1 glue kernels run up to 1024 threads per
+  threadgroup, capped at what the GPU reports for each pipeline, and read
+  each activation row once for all four streams. The expanded stream stays
+  bit-identical and the f32 reductions change summation order.
 - Sorted MoE prefill on NAX GPUs runs `gather_qmm_seg` on an expert-major
   tile kernel instead of the fixed-tile leaf, whose row tiles straddle
   expert segments. `KQ_GATHER_SEG_NAX=0` restores the old routing.
