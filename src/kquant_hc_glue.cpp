@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -96,7 +98,14 @@ namespace {
 // prints the limit and the choice once per kernel.
 template <typename K>
 inline int kq_hc_threads(K kernel, const std::string& kname, int want) {
-  const int cap = int(kernel->maxTotalThreadsPerThreadgroup());
+  int cap = int(kernel->maxTotalThreadsPerThreadgroup());
+  static const int forced = []() {
+    const char* e = std::getenv("KQ_HC_NT");
+    return e != nullptr ? std::atoi(e) : 0;
+  }();
+  if (forced > 0) {
+    cap = std::min(cap, forced);
+  }
   const int nt = (std::min(want, cap) / 32) * 32;
   if (nt < 32) {
     throw std::runtime_error(
@@ -115,6 +124,39 @@ inline int kq_hc_threads(K kernel, const std::string& kname, int want) {
           nt);
     }
   }
+  return nt;
+}
+
+// The four kernels that reduce in f32 (the two fronts and the two
+// collapses) must launch the same width as each other, not just a width
+// their own pipeline supports. Their threadgroup reductions sum in
+// simdgroup order, so a kernel that launches narrower sums in a
+// different order and its last ulp moves, which breaks the bit-identity
+// hc_front_expand_reduce claims against hc_front_reduce and
+// hc_front_expand_collapse claims against the split pair. Register
+// pressure differs per kernel, so the caps can differ on one GPU. Take
+// the smallest cap in the family and give it to all four. hc_expand
+// reduces nothing and keeps its own width.
+inline int kq_hc_family_threads(mx::metal::Device& d, const std::string& t) {
+  static std::mutex mu;
+  static std::map<std::string, int> cached;
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = cached.find(t);
+  if (it != cached.end()) {
+    return it->second;
+  }
+  const char* family[] = {
+      "kq_hc_front_reduce_",
+      "kq_hc_front_expand_reduce_",
+      "kq_hc_sinkhorn_collapse_",
+      "kq_hc_front_expand_collapse_"};
+  int nt = kHcThreads;
+  for (const char* base : family) {
+    const std::string kname = base + t;
+    nt =
+        std::min(nt, kq_hc_threads(kq_get_kernel(d, kname), kname, kHcThreads));
+  }
+  cached.emplace(t, nt);
   return nt;
 }
 
@@ -141,7 +183,7 @@ void KQuantHcFrontReduce::eval_gpu(
   ce.set_output_array(outputs[0], 2);
   ce.set_output_array(outputs[1], 3);
   ce.set_bytes(D, 4);
-  const int nt = kq_hc_threads(kernel, kname, kHcThreads);
+  const int nt = kq_hc_family_threads(d, kq_type_string(x.dtype()));
   ce.dispatch_threadgroups(
       MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(nt, 1, 1));
 }
@@ -172,7 +214,7 @@ void KQuantHcFrontExpandReduce::eval_gpu(
   ce.set_output_array(outputs[1], 6);
   ce.set_output_array(outputs[2], 7);
   ce.set_bytes(D, 8);
-  const int nt = kq_hc_threads(kernel, kname, kHcThreads);
+  const int nt = kq_hc_family_threads(d, kq_type_string(resid.dtype()));
   ce.dispatch_threadgroups(
       MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(nt, 1, 1));
 }
@@ -206,7 +248,7 @@ void KQuantHcSinkhornCollapse::eval_gpu(
   ce.set_bytes(iters_, 10);
   ce.set_bytes(hc_eps_, 11);
   ce.set_bytes(norm_eps_, 12);
-  const int nt = kq_hc_threads(kernel, kname, kHcThreads);
+  const int nt = kq_hc_family_threads(d, kq_type_string(x.dtype()));
   ce.dispatch_threadgroups(MTL::Size(rows, 1, 1), MTL::Size(nt, 1, 1));
 }
 
@@ -265,7 +307,7 @@ void KQuantHcFrontExpandCollapse::eval_gpu(
   ce.set_bytes(iters_, 16);
   ce.set_bytes(hc_eps_, 17);
   ce.set_bytes(norm_eps_, 18);
-  const int nt = kq_hc_threads(kernel, kname, kHcThreads);
+  const int nt = kq_hc_family_threads(d, kq_type_string(resid.dtype()));
   ce.dispatch_threadgroups(
       MTL::Size(rows * (MIX + 1), 1, 1), MTL::Size(nt, 1, 1));
 }
