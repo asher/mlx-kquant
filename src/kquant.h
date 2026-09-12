@@ -172,6 +172,10 @@ mx::array sdpa_vector(
 // b's attention to keys [starts[b], kL) -- a left-padded batched KV cache --
 // with fully padded-out key chunks skipped, not just masked. Values must be
 // in [0, kL - qL]; out-of-range starts read as empty rows (zero output).
+// Optional per-row key ends `ends` (int32 [B]) make kL the capacity bound:
+// row b attends [starts[b], ends[b]) with its causal block at ends[b], so
+// batched rows may differ in length without right-justification. Values
+// are clamped to [0, kL]; a row needs at least qL keys above its start.
 // q [B, n_q_heads, qL, D], k/v [B, n_kv_heads, kL, D] with contiguous D;
 // head/seq strides are read in place. head_dim 64/128/256/512; gqa_factor
 // <= 16. `splits` 0 picks the default; `tile_c` is the staged tile height
@@ -189,6 +193,7 @@ mx::array sdpa_decode_gqa(
     const std::optional<mx::array>& k_biases = std::nullopt,
     const std::optional<mx::array>& v_scales = std::nullopt,
     const std::optional<mx::array>& v_biases = std::nullopt,
+    const std::optional<mx::array>& ends = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // sdpa_decode_gqa returning {out, lse}: lse [B, n_q_heads, qL] float32 is
@@ -208,6 +213,7 @@ std::vector<mx::array> sdpa_decode_gqa_lse(
     const std::optional<mx::array>& k_biases = std::nullopt,
     const std::optional<mx::array>& v_scales = std::nullopt,
     const std::optional<mx::array>& v_biases = std::nullopt,
+    const std::optional<mx::array>& ends = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // Decode/verify GQA attention over a KVarN-backed KV cache (kq_kvarn.h wire
@@ -232,7 +238,11 @@ std::vector<mx::array> sdpa_decode_gqa_lse(
 // keys while the region map stays on the full n-key layout (the tail overlay
 // covers the rest). full_visibility lifts the per-query causal clamp; it
 // requires n_attend <= n - qL + 1 so every walked key precedes every query.
-// head_dim 128, 256 or 512. Metal-only.
+// Ragged batches: `ends` (int32 [B]) as sdpa_decode_gqa, with n the capacity
+// bound and the region map derived from each row's own end; `tail_rows` is
+// then the per-row form of n_attend (row b walks [starts[b], ends[b] -
+// tail_rows)), never combined with it, and full_visibility requires
+// tail_rows >= qL. head_dim 128, 256 or 512. Metal-only.
 mx::array sdpa_decode_gqa_kvarn(
     mx::array q,
     mx::array codes_k,
@@ -251,6 +261,8 @@ mx::array sdpa_decode_gqa_kvarn(
     const std::optional<mx::array>& starts = std::nullopt,
     int n_attend = 0,
     bool full_visibility = false,
+    const std::optional<mx::array>& ends = std::nullopt,
+    int tail_rows = 0,
     mx::StreamOrDevice s = {});
 
 // sdpa_decode_gqa_kvarn returning {out, lse}; lse as sdpa_decode_gqa_lse.
@@ -272,6 +284,8 @@ std::vector<mx::array> sdpa_decode_gqa_kvarn_lse(
     const std::optional<mx::array>& starts = std::nullopt,
     int n_attend = 0,
     bool full_visibility = false,
+    const std::optional<mx::array>& ends = std::nullopt,
+    int tail_rows = 0,
     mx::StreamOrDevice s = {});
 
 // Speculative-verify attention on the GPU matrix units for a GQA-folded query
@@ -1129,7 +1143,9 @@ class KQuantSDPAGQA : public mx::Primitive {
       int kvarn_v_bits = 0,
       int kvarn_n = 0,
       int kvarn_n_attend = 0,
-      bool kvarn_full_vis = false)
+      bool kvarn_full_vis = false,
+      bool has_ends = false,
+      int kvarn_tail_rows = 0)
       : mx::Primitive(stream),
         scale_(scale),
         splits_(splits),
@@ -1144,7 +1160,9 @@ class KQuantSDPAGQA : public mx::Primitive {
         kvarn_v_bits_(kvarn_v_bits),
         kvarn_n_(kvarn_n),
         kvarn_n_attend_(kvarn_n_attend),
-        kvarn_full_vis_(kvarn_full_vis) {}
+        kvarn_full_vis_(kvarn_full_vis),
+        has_ends_(has_ends),
+        kvarn_tail_rows_(kvarn_tail_rows) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -1176,6 +1194,8 @@ class KQuantSDPAGQA : public mx::Primitive {
   int kvarn_n_ = 0;
   int kvarn_n_attend_ = 0;
   bool kvarn_full_vis_ = false;
+  bool has_ends_ = false;
+  int kvarn_tail_rows_ = 0;
 };
 
 // Simdgroup-matrix FA verify attention (see sdpa_fa_verify). Inference-only.

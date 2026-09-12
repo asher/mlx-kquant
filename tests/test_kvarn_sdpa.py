@@ -135,6 +135,66 @@ def materialize(st, dtype):
     return refs
 
 
+def _pad_axis(a, n, axis):
+    pad = n - a.shape[axis]
+    if pad <= 0:
+        return a
+    shape = list(a.shape)
+    shape[axis] = pad
+    return mx.concatenate([a, mx.zeros(shape, a.dtype)], axis=axis)
+
+
+def build_ragged_state(ends, H, k_bits, v_bits, sink_cap=128, seed=0, d=D):
+    """Rows of different lengths over one capacity N = max(ends): each row
+    is its own build_state stacked on the batch axis (codes padded to the
+    widest record count, raw rows to N), so per-row region maps, sealed
+    counts and live lengths all differ. `rows` keeps the per-row states
+    for the materialized twin."""
+    N = max(ends)
+    rows = [
+        build_state(1, H, e, k_bits, v_bits, sink_cap=sink_cap, seed=seed + i, d=d)
+        for i, e in enumerate(ends)
+    ]
+    g_cap = max(r["codes_k"].shape[2] for r in rows)
+    st = {
+        "N": N,
+        "rows": rows,
+        "ends": list(ends),
+        "k_bits": k_bits,
+        "v_bits": v_bits,
+        "d": d,
+    }
+    for key in ("codes_k", "axes_k", "codes_v", "axes_v"):
+        st[key] = mx.concatenate([_pad_axis(r[key], g_cap, 2) for r in rows], axis=0)
+    for key in ("stage_k", "stage_v"):
+        st[key] = mx.concatenate([r[key] for r in rows], axis=0)
+    for key in ("kx", "vx"):
+        st[key] = mx.concatenate([_pad_axis(r[key], N, 2) for r in rows], axis=0)
+    return st
+
+
+def materialize_ragged(st, dtype):
+    """Per-row materialized twins padded to capacity, so the fp16 reference
+    runs with the same starts/ends the fused op takes."""
+    ks, vs = [], []
+    for r in st["rows"]:
+        k_m, v_m = materialize(r, dtype)
+        ks.append(_pad_axis(k_m, st["N"], 2))
+        vs.append(_pad_axis(v_m, st["N"], 2))
+    return mx.concatenate(ks, axis=0), mx.concatenate(vs, axis=0)
+
+
+def kvarn_args(st):
+    return (
+        st["codes_k"],
+        st["axes_k"],
+        st["codes_v"],
+        st["axes_v"],
+        st["stage_k"],
+        st["stage_v"],
+    )
+
+
 def run_pair(st, q, N, k_bits, v_bits, dtype=mx.float16, **kw):
     qm = mx.array(q).astype(dtype)
     scale = st["d"] ** -0.5
@@ -220,6 +280,139 @@ def test_starts_and_batch():
     starts = mx.array([0, 150, 296], dtype=mx.int32)
     out, ref = run_pair(st, q, 300, 6, 6, starts=starts)
     assert_bit_equal(out, ref)
+
+
+RAGGED_ENDS = [1000, 100, 700, 300]
+RAGGED_STARTS = [0, 0, 0, 150]
+
+
+@pytest.mark.parametrize("ql", [1, 2, 3, 4])
+def test_ends_match_ragged_reference(ql):
+    # Four rows over one 1000-key capacity: a row at capacity, a row shorter
+    # than the sink (its sink region is its whole length), a row whose end
+    # lands mid-record and a left-padded row. Each row's region map follows
+    # its own end, so the fused op must match the fp16 op over the per-row
+    # materialized twins with the same starts and ends, bit for bit.
+    st = build_ragged_state(RAGGED_ENDS, 2, 6, 6, seed=60 + ql)
+    q = mx.array(make_q(4, 8, ql))
+    starts = mx.array(RAGGED_STARTS, dtype=mx.int32)
+    ends = mx.array(RAGGED_ENDS, dtype=mx.int32)
+    out = kq.sdpa_decode_gqa_kvarn(
+        q, *kvarn_args(st), st["N"], SCALE, 6, 6, starts=starts, ends=ends
+    )
+    k_ref, v_ref = materialize_ragged(st, mx.float16)
+    ref = kq.sdpa_decode_gqa(q, k_ref, v_ref, SCALE, starts=starts, ends=ends)
+    _eval_or_skip(out, ref)
+    assert_bit_equal(out, ref)
+
+
+def test_ends_at_capacity_match_shared_watermark():
+    # ends at N on every row is the shared-watermark call
+    st = build_state(3, 2, 300, 6, 6, seed=61)
+    q = mx.array(make_q(3, 8, 1))
+    starts = mx.array([0, 150, 296], dtype=mx.int32)
+    ends = mx.full((3,), 300, dtype=mx.int32)
+    a = kq.sdpa_decode_gqa_kvarn(
+        q, *kvarn_args(st), 300, SCALE, 6, 6, starts=starts, ends=ends
+    )
+    b = kq.sdpa_decode_gqa_kvarn(q, *kvarn_args(st), 300, SCALE, 6, 6, starts=starts)
+    _eval_or_skip(a, b)
+    assert_bit_equal(a, b)
+
+
+@pytest.mark.parametrize("ql", [1, 2, 3, 4])
+@pytest.mark.parametrize(
+    "ends,tail_rows",
+    [
+        ([1000, 100, 700, 300], 128),
+        ([2000, 1100, 900, 1300], 1024),
+    ],
+)
+def test_ends_tail_lse_merge_composition(ends, tail_rows, ql):
+    # The ragged form of test_tail_lse_merge_composition: the body leg walks
+    # each row to tail_rows short of its own end with the clamp lifted, the
+    # tail leg is the plain op over the raw rows with per-row starts at
+    # ends - tail_rows, and the merge must reproduce one attention over the
+    # per-row concatenation. A row shorter than tail_rows has an empty
+    # body: its partial merges at zero weight (lse -inf), so the tail leg
+    # alone is the answer for that row.
+    starts = [0, 0, 0, 150]
+    st = build_ragged_state(ends, 2, 6, 6, seed=70 + ql + tail_rows)
+    N = st["N"]
+    q = mx.array(make_q(4, 8, ql))
+    st_mx = mx.array(starts, dtype=mx.int32)
+    en_mx = mx.array(ends, dtype=mx.int32)
+    body, lse_b = kq.sdpa_decode_gqa_kvarn(
+        q,
+        *kvarn_args(st),
+        N,
+        SCALE,
+        6,
+        6,
+        starts=st_mx,
+        ends=en_mx,
+        tail_rows=tail_rows,
+        full_visibility=True,
+        return_lse=True,
+    )
+    tail_starts = mx.array(
+        [max(s, e - tail_rows) for s, e in zip(starts, ends, strict=True)],
+        dtype=mx.int32,
+    )
+    tail, lse_t = kq.sdpa_decode_gqa(
+        q, st["kx"], st["vx"], SCALE, starts=tail_starts, ends=en_mx, return_lse=True
+    )
+    merged, lse_m = lse_merge(body, lse_b, tail, lse_t)
+
+    k_m, v_m = materialize_ragged(st, mx.float16)
+    in_body = mx.array([[p < e - tail_rows for p in range(N)] for e in ends])[
+        :, None, :, None
+    ]
+    k_ref = mx.where(in_body, k_m, st["kx"])
+    v_ref = mx.where(in_body, v_m, st["vx"])
+    ref, lse_ref = kq.sdpa_decode_gqa(
+        q, k_ref, v_ref, SCALE, starts=st_mx, ends=en_mx, return_lse=True
+    )
+    _eval_or_skip(merged, lse_m, ref, lse_ref, lse_b)
+    empty = [
+        b
+        for b, (s, e) in enumerate(zip(starts, ends, strict=True))
+        if e - s <= tail_rows
+    ]
+    assert empty, "the case must include a row entirely inside the tail"
+    for b in empty:
+        assert np.all(np.isneginf(np.array(lse_b[b])))
+    np.testing.assert_allclose(
+        np.array(merged), np.array(ref.astype(mx.float32)), rtol=2e-3, atol=2e-3
+    )
+    np.testing.assert_allclose(np.array(lse_m), np.array(lse_ref), rtol=1e-5, atol=1e-4)
+
+
+def test_ends_rejects_malformed():
+    st = build_state(2, 2, 300, 6, 6, seed=62)
+    q = mx.array(make_q(2, 8, 1))
+    q4 = mx.array(make_q(2, 8, 4))
+    args = kvarn_args(st)
+    ends = mx.array([300, 200], dtype=mx.int32)
+    with pytest.raises(ValueError, match="one element per batch row"):
+        kq.sdpa_decode_gqa_kvarn(q, *args, 300, SCALE, 6, 6, ends=ends[:1])
+    with pytest.raises(ValueError, match="int32"):
+        kq.sdpa_decode_gqa_kvarn(q, *args, 300, SCALE, 6, 6, ends=ends.astype(mx.int64))
+    with pytest.raises(ValueError, match="cannot be combined"):
+        kq.sdpa_decode_gqa_kvarn(q, *args, 300, SCALE, 6, 6, ends=ends, n_attend=200)
+    with pytest.raises(ValueError, match="tail_rows must be >= 0"):
+        kq.sdpa_decode_gqa_kvarn(q, *args, 300, SCALE, 6, 6, ends=ends, tail_rows=-1)
+    with pytest.raises(ValueError, match="tail_rows needs ends"):
+        kq.sdpa_decode_gqa_kvarn(q, *args, 300, SCALE, 6, 6, tail_rows=64)
+    with pytest.raises(ValueError, match="tail_rows >= query length"):
+        kq.sdpa_decode_gqa_kvarn(
+            q4, *args, 300, SCALE, 6, 6, ends=ends, tail_rows=3, full_visibility=True
+        )
+    # the boundary itself is in contract
+    out = kq.sdpa_decode_gqa_kvarn(
+        q4, *args, 300, SCALE, 6, 6, ends=ends, tail_rows=4, full_visibility=True
+    )
+    _eval_or_skip(out)
 
 
 def test_sinks_ride_through():

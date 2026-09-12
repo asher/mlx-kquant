@@ -63,6 +63,7 @@ struct KQKvarnMeta {
   int32_t n_rec_keys;
   int32_t live_row0;
   int32_t full_vis;
+  int32_t tail_rows;
   uint64_t stage_k_head;
   uint64_t stage_v_head;
 };
@@ -236,8 +237,10 @@ void KQuantSDPAGQA::eval_gpu(
   const bool kv_q8 = has_kv_q8_;
   const bool paged = paged_;
   const bool kvarn = has_kvarn_;
+  const bool ends = has_ends_;
   const size_t starts_idx = 3 + (sinks ? 1 : 0);
-  const size_t qkv_idx = starts_idx + (starts ? 1 : 0);
+  const size_t ends_idx = starts_idx + (starts ? 1 : 0);
+  const size_t qkv_idx = ends_idx + (ends ? 1 : 0);
   kq_sdpa_check_layout("sdpa_decode_gqa", q, k, v);
 
   int B = q.shape(0);
@@ -298,6 +301,7 @@ void KQuantSDPAGQA::eval_gpu(
   bool has_kvarn = kvarn;
   int kvarn_k_bits = kvarn_k_bits_;
   int kvarn_v_bits = kvarn_v_bits_;
+  bool has_ends = ends;
   mx::metal::MTLFCList fc = {
       {&splits, MTL::DataType::DataTypeInt, 2},
       {&has_sinks, MTL::DataType::DataTypeBool, 3},
@@ -309,6 +313,7 @@ void KQuantSDPAGQA::eval_gpu(
       {&has_kvarn, MTL::DataType::DataTypeBool, 9},
       {&kvarn_k_bits, MTL::DataType::DataTypeInt, 10},
       {&kvarn_v_bits, MTL::DataType::DataTypeInt, 11},
+      {&has_ends, MTL::DataType::DataTypeBool, 12},
   };
 
   // Pass 1: one threadgroup per (kv-head, batch, split); the whole GQA group
@@ -319,8 +324,8 @@ void KQuantSDPAGQA::eval_gpu(
     std::string kname = "kq_sdpa_gqa_2pass_1_" + ts + "_" + std::to_string(D) +
         "_c" + std::to_string(tile_c_) + (qL > 1 ? "_p2" : "");
     std::string hash = kname + "_s" + std::to_string(splits) +
-        (has_starts ? "_st1" : "_st0") + (has_kv_q8 ? "_q8" : "") +
-        (paged ? "_pg" : "") +
+        (has_starts ? "_st1" : "_st0") + (has_ends ? "_en1" : "") +
+        (has_kv_q8 ? "_q8" : "") + (paged ? "_pg" : "") +
         (kvarn ? "_kv" + std::to_string(kvarn_k_bits_) +
                  std::to_string(kvarn_v_bits_)
                : "");
@@ -397,6 +402,7 @@ void KQuantSDPAGQA::eval_gpu(
           std::max(0, (kvarn_n_ - sink_cap) / KQ_KVARN_GROUP) * KQ_KVARN_GROUP;
       kvm.live_row0 = sink_cap;
       kvm.full_vis = kvarn_full_vis_ ? 1 : 0;
+      kvm.tail_rows = kvarn_tail_rows_;
       kvm.stage_k_head = static_cast<uint64_t>(
           stk.shape(1) == 1 ? stk.strides(0) : stk.strides(1));
       kvm.stage_v_head = static_cast<uint64_t>(
@@ -411,6 +417,8 @@ void KQuantSDPAGQA::eval_gpu(
       }
     }
     ce.set_bytes(kvm, 28);
+    // Per-row ends (dummy when compiled out).
+    ce.set_input_array(ends ? inputs[ends_idx] : sums, 29);
     MTL::Size group_dims(32, gqa_factor, qL > 1 ? (qL + 1) / 2 : 1);
     MTL::Size grid_dims(n_kv_heads, B, splits);
     ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -1269,7 +1277,8 @@ bool KQuantSDPAGQA::is_equivalent(const mx::Primitive& other) const {
       paged_ == o.paged_ && has_kvarn_ == o.has_kvarn_ &&
       kvarn_k_bits_ == o.kvarn_k_bits_ && kvarn_v_bits_ == o.kvarn_v_bits_ &&
       kvarn_n_ == o.kvarn_n_ && kvarn_n_attend_ == o.kvarn_n_attend_ &&
-      kvarn_full_vis_ == o.kvarn_full_vis_;
+      kvarn_full_vis_ == o.kvarn_full_vis_ && has_ends_ == o.has_ends_ &&
+      kvarn_tail_rows_ == o.kvarn_tail_rows_;
 }
 
 static std::vector<mx::array> sdpa_decode_gqa_impl(
@@ -1286,6 +1295,7 @@ static std::vector<mx::array> sdpa_decode_gqa_impl(
     const std::optional<mx::array>& k_biases,
     const std::optional<mx::array>& v_scales,
     const std::optional<mx::array>& v_biases,
+    const std::optional<mx::array>& ends,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
 
@@ -1415,6 +1425,20 @@ static std::vector<mx::array> sdpa_decode_gqa_impl(
     st = mx::reshape(st, {q.shape(0)}, s);
     inputs.push_back(mx::contiguous(st, false, s));
   }
+  if (ends.has_value()) {
+    auto en = *ends;
+    if (en.size() != static_cast<size_t>(q.shape(0))) {
+      throw std::invalid_argument(
+          "[mlx_kquant.sdpa_decode_gqa] ends must have one element per "
+          "batch row.");
+    }
+    if (en.dtype() != mx::int32) {
+      throw std::invalid_argument(
+          "[mlx_kquant.sdpa_decode_gqa] ends must be int32.");
+    }
+    en = mx::reshape(en, {q.shape(0)}, s);
+    inputs.push_back(mx::contiguous(en, false, s));
+  }
   if (kv_q8) {
     for (const auto& a : {*k_scales, *k_biases, *v_scales, *v_biases}) {
       inputs.push_back(
@@ -1430,7 +1454,15 @@ static std::vector<mx::array> sdpa_decode_gqa_impl(
       sinks.has_value(),
       starts.has_value(),
       kv_q8,
-      return_lse);
+      return_lse,
+      /*paged=*/false,
+      /*has_kvarn=*/false,
+      /*kvarn_k_bits=*/0,
+      /*kvarn_v_bits=*/0,
+      /*kvarn_n=*/0,
+      /*kvarn_n_attend=*/0,
+      /*kvarn_full_vis=*/false,
+      /*has_ends=*/ends.has_value());
   auto out_shape = q.shape();
   if (return_lse) {
     mx::Shape lse_shape = {q.shape(0), q.shape(1), q.shape(2)};
@@ -1457,6 +1489,7 @@ mx::array sdpa_decode_gqa(
     const std::optional<mx::array>& k_biases,
     const std::optional<mx::array>& v_scales,
     const std::optional<mx::array>& v_biases,
+    const std::optional<mx::array>& ends,
     mx::StreamOrDevice s_) {
   return sdpa_decode_gqa_impl(
       false,
@@ -1472,6 +1505,7 @@ mx::array sdpa_decode_gqa(
       k_biases,
       v_scales,
       v_biases,
+      ends,
       s_)[0];
 }
 
@@ -1598,6 +1632,7 @@ std::vector<mx::array> sdpa_decode_gqa_lse(
     const std::optional<mx::array>& k_biases,
     const std::optional<mx::array>& v_scales,
     const std::optional<mx::array>& v_biases,
+    const std::optional<mx::array>& ends,
     mx::StreamOrDevice s_) {
   return sdpa_decode_gqa_impl(
       true,
@@ -1613,6 +1648,7 @@ std::vector<mx::array> sdpa_decode_gqa_lse(
       k_biases,
       v_scales,
       v_biases,
+      ends,
       s_);
 }
 
@@ -1635,6 +1671,8 @@ static std::vector<mx::array> sdpa_decode_gqa_kvarn_impl(
     const std::optional<mx::array>& starts,
     int n_attend,
     bool full_visibility,
+    const std::optional<mx::array>& ends,
+    int tail_rows,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
 
@@ -1737,7 +1775,30 @@ static std::vector<mx::array> sdpa_decode_gqa_kvarn_impl(
         "[mlx_kquant.sdpa_decode_gqa_kvarn] n_attend with query length > 1 "
         "requires full_visibility.");
   }
-  if (full_visibility) {
+  if (tail_rows < 0) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa_kvarn] tail_rows must be >= 0.");
+  }
+  if (tail_rows != 0 && !ends.has_value()) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa_kvarn] tail_rows needs ends; a shared "
+        "walk bound is n_attend.");
+  }
+  if (n_attend != 0 && ends.has_value()) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa_kvarn] n_attend and ends cannot be "
+        "combined; with ends the tail is tail_rows.");
+  }
+  if (full_visibility && ends.has_value()) {
+    // Per-row body walks end at ends[b] - tail_rows; every query's causal
+    // position is at or past ends[b] - qL, so the walk precedes it (and
+    // every query keeps at least one tail key) when tail_rows >= qL.
+    if (tail_rows < qL) {
+      throw std::invalid_argument(
+          "[mlx_kquant.sdpa_decode_gqa_kvarn] full_visibility with ends "
+          "requires tail_rows >= query length.");
+    }
+  } else if (full_visibility) {
     const int span = n_attend ? n_attend : n;
     if (span > n - qL + 1) {
       throw std::invalid_argument(
@@ -1808,6 +1869,20 @@ static std::vector<mx::array> sdpa_decode_gqa_kvarn_impl(
     st = mx::reshape(st, {B}, s);
     inputs.push_back(mx::contiguous(st, false, s));
   }
+  if (ends.has_value()) {
+    auto en = *ends;
+    if (en.size() != static_cast<size_t>(B)) {
+      throw std::invalid_argument(
+          "[mlx_kquant.sdpa_decode_gqa_kvarn] ends must have one element "
+          "per batch row.");
+    }
+    if (en.dtype() != mx::int32) {
+      throw std::invalid_argument(
+          "[mlx_kquant.sdpa_decode_gqa_kvarn] ends must be int32.");
+    }
+    en = mx::reshape(en, {B}, s);
+    inputs.push_back(mx::contiguous(en, false, s));
+  }
   inputs.push_back(std::move(ak));
   inputs.push_back(std::move(av));
   inputs.push_back(std::move(sk));
@@ -1828,7 +1903,9 @@ static std::vector<mx::array> sdpa_decode_gqa_kvarn_impl(
       v_bits,
       n,
       n_attend,
-      full_visibility);
+      full_visibility,
+      ends.has_value(),
+      tail_rows);
   auto out_shape = q.shape();
   if (return_lse) {
     mx::Shape lse_shape = {B, n_q_heads, qL};
@@ -1860,6 +1937,8 @@ mx::array sdpa_decode_gqa_kvarn(
     const std::optional<mx::array>& starts,
     int n_attend,
     bool full_visibility,
+    const std::optional<mx::array>& ends,
+    int tail_rows,
     mx::StreamOrDevice s_) {
   return sdpa_decode_gqa_kvarn_impl(
       false,
@@ -1880,6 +1959,8 @@ mx::array sdpa_decode_gqa_kvarn(
       starts,
       n_attend,
       full_visibility,
+      ends,
+      tail_rows,
       s_)[0];
 }
 
@@ -1901,6 +1982,8 @@ std::vector<mx::array> sdpa_decode_gqa_kvarn_lse(
     const std::optional<mx::array>& starts,
     int n_attend,
     bool full_visibility,
+    const std::optional<mx::array>& ends,
+    int tail_rows,
     mx::StreamOrDevice s_) {
   return sdpa_decode_gqa_kvarn_impl(
       true,
@@ -1921,6 +2004,8 @@ std::vector<mx::array> sdpa_decode_gqa_kvarn_lse(
       starts,
       n_attend,
       full_visibility,
+      ends,
+      tail_rows,
       s_);
 }
 

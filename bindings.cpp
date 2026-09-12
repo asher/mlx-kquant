@@ -247,6 +247,7 @@ NB_MODULE(_ext, m) {
          const std::optional<mx::array>& k_biases,
          const std::optional<mx::array>& v_scales,
          const std::optional<mx::array>& v_biases,
+         const std::optional<mx::array>& ends,
          bool return_lse,
          mx::StreamOrDevice s) -> nb::object {
         if (return_lse) {
@@ -263,6 +264,7 @@ NB_MODULE(_ext, m) {
               k_biases,
               v_scales,
               v_biases,
+              ends,
               s);
           return nb::make_tuple(outs[0], outs[1]);
         }
@@ -279,6 +281,7 @@ NB_MODULE(_ext, m) {
             k_biases,
             v_scales,
             v_biases,
+            ends,
             s));
       },
       "q"_a,
@@ -294,6 +297,7 @@ NB_MODULE(_ext, m) {
       "v_scales"_a = nb::none(),
       "v_biases"_a = nb::none(),
       nb::kw_only(),
+      "ends"_a = nb::none(),
       "return_lse"_a = false,
       "stream"_a = nb::none(),
       R"(
@@ -324,6 +328,13 @@ NB_MODULE(_ext, m) {
             starts (array, optional): per-batch-row key start offsets,
                 int32 [B], each in [0, kL - qL]; row b attends [starts[b],
                 kL). Out-of-range values read as an empty row (zero output).
+            ends (array, optional): per-batch-row key ends, int32 [B]; row b
+                attends [starts[b], ends[b]) with its causal block ending at
+                ends[b], and kL is then only the capacity every row fits in,
+                so batched rows may differ in length without
+                right-justification. Values are clamped to [0, kL]; a row
+                needs at least qL keys above its start, and a row with none
+                reads as empty (zero output).
 
         Returns:
             array: attention output [B, n_q_heads, qL, D]. With
@@ -1328,6 +1339,8 @@ NB_MODULE(_ext, m) {
          const std::optional<mx::array>& starts,
          int n_attend,
          bool full_visibility,
+         const std::optional<mx::array>& ends,
+         int tail_rows,
          bool return_lse,
          mx::StreamOrDevice s) -> nb::object {
         if (return_lse) {
@@ -1349,6 +1362,8 @@ NB_MODULE(_ext, m) {
               starts,
               n_attend,
               full_visibility,
+              ends,
+              tail_rows,
               s);
           return nb::make_tuple(outs[0], outs[1]);
         }
@@ -1370,6 +1385,8 @@ NB_MODULE(_ext, m) {
             starts,
             n_attend,
             full_visibility,
+            ends,
+            tail_rows,
             s));
       },
       "q"_a,
@@ -1390,6 +1407,8 @@ NB_MODULE(_ext, m) {
       nb::kw_only(),
       "n_attend"_a = 0,
       "full_visibility"_a = false,
+      "ends"_a = nb::none(),
+      "tail_rows"_a = 0,
       "return_lse"_a = false,
       "stream"_a = nb::none(),
       R"(
@@ -1434,9 +1453,18 @@ NB_MODULE(_ext, m) {
                 Precision-tail body segments set this to n minus the tail
                 overlay length.
             full_visibility (bool): lift the per-query causal clamp;
-                requires n_attend <= n - qL + 1 so every walked key
-                precedes every query. Used with return_lse for tail
-                merges.
+                requires n_attend <= n - qL + 1 (or, with ends,
+                tail_rows >= qL) so every walked key precedes every
+                query. Used with return_lse for tail merges.
+            ends (array, optional): int32 [B] per-row key ends, as
+                sdpa_decode_gqa: n is then the capacity bound and each
+                row's region map (sink rows, sealed groups, live rows)
+                follows its own end, so rows may seal at different times.
+            tail_rows (int): with ends, the number of trailing keys each
+                row leaves to the caller's tail leg: row b walks
+                [starts[b], ends[b] - tail_rows) while its region map
+                stays on ends[b]. The per-row form of n_attend; the two
+                are never combined.
             return_lse (bool): also return the natural-log softmax
                 normalizer [B, n_q_heads, qL] float32.
 

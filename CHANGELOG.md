@@ -6,6 +6,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Per-row `ends` on `sdpa_decode_gqa` and `sdpa_decode_gqa_kvarn`: batched
+  rows may differ in length over one capacity instead of sharing a
+  right-justified watermark. The kvarn op's `tail_rows` walks each row's
+  body short of its own end, the per-row form of `n_attend`, for a ragged
+  fp16 tail merge.
+
 ## [0.4.8]
 
 ### Added
