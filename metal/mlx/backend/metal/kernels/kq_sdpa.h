@@ -59,15 +59,27 @@ constant int kvarn_v_bits =
 // records; later keys read stage rows from live_row0. full_vis lifts the
 // per-query causal clamp (a precision-tail body segment ends before every
 // query's position, so all of its keys are visible at any query width).
+// tail_rows is the per-row form of n_attend for ragged rows (gqa_has_ends):
+// each row's walk stops that many keys short of its own end.
 // Mirrored in kquant_sdpa.cpp; layouts must match field for field.
 struct KQKvarnMeta {
   int sink_rows;
   int n_rec_keys;
   int live_row0;
   int full_vis;
+  int tail_rows;
   ulong stage_k_head;
   ulong stage_v_head;
 };
+
+// Per-row key ends (buffer 29): row b's keys run [row_start, ends[b]) with
+// the scalar N as the capacity bound, so batched rows may differ in length
+// without right-justification. With kvarn the region map derives per row
+// from its end (rows seal at different times) and kvm.tail_rows leaves the
+// row's last keys to the caller's tail leg. Compiled out when undefined.
+constant bool gqa_has_ends_fc [[function_constant(12)]];
+constant bool gqa_has_ends =
+    is_function_constant_defined(gqa_has_ends_fc) ? gqa_has_ends_fc : false;
 
 // KVarN tile staging shared by the decode and FA verify kernels. C divides
 // 128 and every region bound is group-aligned or N itself, so a C-key tile
@@ -439,6 +451,8 @@ template <typename T, typename PT, int D>
 // the sequence's trailing positions, causally clamped
 // (key <= N - q_len + query index). Requires gqa_factor * ceil(q_len / QPS)
 // <= 32 (1024-thread threadgroup) and gqa_splits <= 128 (pass-2 scratch).
+// With gqa_has_ends the row's own end replaces N in the clamp and in the
+// walk bound, and N is only the capacity every row fits in.
 
 template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
 [[kernel]] void kq_sdpa_gqa_2pass_1(
@@ -471,6 +485,7 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
     const device half* kvarn_stage_k [[buffer(26)]],
     const device half* kvarn_stage_v [[buffer(27)]],
     const constant KQKvarnMeta& kvm [[buffer(28)]],
+    const device int* ends [[buffer(29)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -500,7 +515,6 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
   // Contiguous, C-aligned chunk of the key axis for this threadgroup.
   const int chunk = ((N + gqa_splits * C - 1) / (gqa_splits * C)) * C;
   const int k0 = split_idx * chunk;
-  const int k1 = min(k0 + chunk, N);
 
   // Per-row key start (left-padded batched KV cache): row batch_idx attends
   // keys [row_start, N). Whole tiles below the start are skipped outright --
@@ -513,6 +527,28 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
     row_start = max(0, starts[batch_idx]);
     kt0 = max(k0, (row_start / C) * C);
   }
+
+  // Per-row key end (ragged batched KV cache): row batch_idx's keys run
+  // [row_start, row_end) with N the capacity bound, so rows need not share
+  // a watermark. The body walk stops tail_rows short of row_end (a kvarn
+  // tail merge leaves those keys to the caller's fp16 tail leg) and the
+  // causal clamp below is measured from row_end. With kvarn the region map
+  // follows this row's end, since rows seal at different times. A row whose
+  // body is empty writes the empty partial pass 2 folds at zero weight.
+  int row_end = N;
+  int body_end = N;
+  int sink_rows = kvm.sink_rows;
+  int n_rec_keys = kvm.n_rec_keys;
+  if (gqa_has_ends) {
+    row_end = clamp(ends[batch_idx], 0, N);
+    body_end = max(row_start, row_end - (gqa_kv_kvarn ? kvm.tail_rows : 0));
+    if (gqa_kv_kvarn) {
+      sink_rows = min(row_end, kvm.live_row0);
+      n_rec_keys =
+          max(0, (row_end - kvm.live_row0) / KQ_KVARN_GROUP) * KQ_KVARN_GROUP;
+    }
+  }
+  const int k1 = min(k0 + chunk, body_end);
 
   // With gqa_kv_q8 the k/v buffers hold packed uint32 wire and the strides
   // arrive in WORDS (D/4 per row); otherwise they hold T elements.
@@ -544,7 +580,7 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
       qf[p][ii] = active ? scale * float4(q4[(size_t)p * D4 + ii * NL + tx])
                          : float4(0);
     }
-    lim[p] = active ? (full_vis ? N - 1 : N - nq + qz0 + p) : -1;
+    lim[p] = active ? (full_vis ? row_end - 1 : row_end - nq + qz0 + p) : -1;
   }
 
   float max_score[QPS];
@@ -587,11 +623,10 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
     if (gqa_kv_kvarn) {
       threadgroup T* sKh = (threadgroup T*)sK;
       threadgroup T* sVh = (threadgroup T*)sV;
-      const int rec_end = kvm.sink_rows + kvm.n_rec_keys;
+      const int rec_end = sink_rows + n_rec_keys;
       const int n_valid = kend - kt;
-      if (kt < kvm.sink_rows || kt >= rec_end) {
-        const int srow0 =
-            kt < kvm.sink_rows ? kt : kvm.live_row0 + (kt - rec_end);
+      if (kt < sink_rows || kt >= rec_end) {
+        const int srow0 = kt < sink_rows ? kt : kvm.live_row0 + (kt - rec_end);
         kq_kvarn_stage_rows<T, C, D, D>(
             sKh,
             kvarn_stage_k + kv_hb * kvm.stage_k_head + (size_t)srow0 * D,
@@ -605,7 +640,7 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
             flat,
             n_threads);
       } else {
-        const int rk = kt - kvm.sink_rows;
+        const int rk = kt - sink_rows;
         const int rec = rk >> KQ_KVARN_GROUP_SHIFT; // sealed group index
         const int c0 = rk & (KQ_KVARN_GROUP - 1); // first token column
         kq_kvarn_stage_v<T, C, D, D>(

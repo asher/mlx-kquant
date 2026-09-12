@@ -132,8 +132,11 @@ mechanism below.
 - **`sdpa_decode_gqa`** - decode/verify GQA tuned for long KV caches: the key axis splits into coarse
   chunks streamed through threadgroup-staged K/V tiles shared by the GQA group, so device memory reads
   the KV once per chunk. Optional `starts` (int32 `[B]`) restricts row b to keys `[starts[b], kL)` for
-  left-padded batches, skipping fully padded-out chunks. Optional affine q8 K/V operands (scales and
-  biases, bits 8, group 64) dequantize on the tile stage. `return_lse=True` adds per-row log-sum-exp.
+  left-padded batches, skipping fully padded-out chunks. Optional `ends` (int32 `[B]`) gives row b its
+  own key end, `[starts[b], ends[b])` with the causal block at `ends[b]`, so `kL` is only the capacity
+  and batched rows may differ in length without right-justification. Optional affine q8 K/V operands
+  (scales and biases, bits 8, group 64) dequantize on the tile stage. `return_lse=True` adds per-row
+  log-sum-exp.
 - **`sdpa_decode_gqa_cascade`** - shared-prefix batched decode: every row attends one common prefix
   plus its own private suffix. The prefix is walked once for all rows on the matrix-unit tile, private
   suffixes run per row, one merge pass folds both; 1.6-4.2x over per-row calls at 14k-32k prefixes.
@@ -175,8 +178,9 @@ their cache layout.
   back; separate K and V kinds.
 - **`sdpa_decode_gqa_kvarn`** - decode attention over sealed records plus fp16 stage rows (the
   attention sink and the live tail), record groups dequantized at tile stage; `n_attend` walks the
-  record body only, so the caller merges an fp16 precision tail by log-sum-exp. Head dims 128, 256
-  and 512, q_len 1 to 4.
+  record body only, so the caller merges an fp16 precision tail by log-sum-exp. With `ends` each
+  row's region map follows its own end and `tail_rows` is the per-row form of `n_attend`, so a
+  ragged batch merges per-row tails the same way. Head dims 128, 256 and 512, q_len 1 to 4.
 - **`sdpa_fa_verify_kvarn`** - the same matrix-unit verify pass over a KVarN cache: sealed records
   dequantize at tile stage through the loaders `sdpa_decode_gqa_kvarn` uses, so the result matches
   `sdpa_fa_verify` over the materialized cache bit for bit. The verify-width route (q_len 2 to 8):
