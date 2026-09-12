@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.9]
+
 ### Added
 - Per-row `ends` on `sdpa_decode_gqa` and `sdpa_decode_gqa_kvarn`: batched
   rows may differ in length over one capacity instead of sharing a
