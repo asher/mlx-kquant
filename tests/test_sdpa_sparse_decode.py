@@ -159,10 +159,38 @@ def test_no_sinks_and_window_only():
     assert float(np.abs(np.array(got.astype(mx.float32)) - ref).max()) < 3e-3
 
 
+@pytest.mark.parametrize("L", [64, 200])
+def test_prefill_block_widths(L):
+    args, ref = _case(
+        1,
+        16,
+        L,
+        128,
+        L + 7,
+        96,
+        24,
+        mx.float16,
+        np.int32,
+        sinks=True,
+        masks=True,
+        pad=True,
+        seed=L,
+    )
+    _check(args, ref, 3e-3)
+
+
 def test_validation():
     q = mx.zeros((1, 4, 1, 128), mx.float16)
     win = mx.zeros((1, 1, 8, 128), mx.float16)
     pool = mx.zeros((1, 8, 128), mx.float16)
+    with pytest.raises(ValueError, match="4096"):
+        kq.sdpa_sparse_decode(
+            mx.zeros((1, 4, 4097, 128), mx.float16),
+            win,
+            pool,
+            mx.zeros((1, 4097, 4), mx.int32),
+            0.1,
+        )
     idx = mx.zeros((1, 1, 4), mx.int32)
     with pytest.raises(ValueError, match="head_dim"):
         kq.sdpa_sparse_decode(

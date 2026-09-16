@@ -876,17 +876,19 @@ NB_MODULE(_ext, m) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
-        Decode attention over two key sources with K == V: a window read
-        whole and a pool read through a per-query index list, as in the
+        Attention over two key sources with K == V: a window read whole
+        and a pool read through a per-query index list, as in the
         DeepSeek-V4 sparse attention step. The keys fan out over splits
         of threadgroups (one simdgroup per head and split) that write
         unnormalized f32 partials, and a merge renormalizes them with the
         per-head sink counted once. Replaces the gather, the two score
-        matmuls, the split softmax and the two value matmuls.
+        matmuls, the split softmax and the two value matmuls. Queries are
+        a batch dimension: a decode step, or a prefill block whose queries
+        share the window rows and keep their own index lists.
 
         Args:
             q (array): queries [B, H, L, D], float16/bfloat16; D in
-                {128, 256, 512}; L <= 16.
+                {128, 256, 512}; L <= 4096.
             window (array): [B, 1, W, D] rows every query attends.
             pool (array): [B, P, D] rows selected by ``idx``.
             idx (array): [B, L, N] int32/uint32 pool rows per query; a

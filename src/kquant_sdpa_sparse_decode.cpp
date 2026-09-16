@@ -28,6 +28,9 @@ namespace {
 constexpr int kHeadGroup = 8; // heads per split threadgroup
 constexpr int kKeyBlock = 8; // keys per staged block
 constexpr int kMaxSplits = 32;
+// Queries per call: a batch dimension of the grid, bounded by the f32
+// partials [B, L, splits, Hp, D] the merge reads back.
+constexpr int kMaxQueries = 4096;
 } // namespace
 
 #ifdef _METAL_
@@ -230,8 +233,10 @@ mx::array sdpa_sparse_decode(
     throw std::invalid_argument(
         std::string(op) + " idx must be int32 or uint32.");
   }
-  if (L < 1 || L > 16) {
-    throw std::invalid_argument(std::string(op) + " needs 1 <= L <= 16.");
+  if (L < 1 || L > kMaxQueries) {
+    throw std::invalid_argument(
+        std::string(op) + " needs 1 <= L <= " + std::to_string(kMaxQueries) +
+        ".");
   }
   if (window.shape(2) + idx.shape(2) < 1) {
     throw std::invalid_argument(std::string(op) + " needs at least one key.");
