@@ -736,7 +736,9 @@ mx::array gather_qmv_kq(
 // slot: shexp_gate_w / shexp_up_w are single-expert 2-D wire-byte tensors
 // [N, bytes_per_row(shexp codec)] shape-matched to one expert stack row.
 // shexp_kquant_type defaults to kquant_type; a different codec (mixed-codec
-// blocks, UD-style upcast shexp) must be q5_k, q6_k or q8_0.
+// blocks, UD-style upcast shexp) must be q5_k, q6_k or q8_0. act
+// "silu_limit" (deepseek-v4 LimitedSwiGLU) needs limit > 0 and clamps the
+// routed and the shared slots alike.
 // Returns [T, R + 1, N]; the last slot is the shared expert.
 mx::array moe_glu_gather_shexp_kq(
     mx::array x,
@@ -748,6 +750,7 @@ mx::array moe_glu_gather_shexp_kq(
     mx::array indices,
     const std::string& act = "silu",
     const std::string& shexp_kquant_type = "",
+    float limit = 0.0f,
     mx::StreamOrDevice s = {});
 
 // Down projection with the routing mix folded in: x [T, S, K] (slot S-1 =
@@ -2026,11 +2029,13 @@ class KQuantMoEGLUShexpKQ : public mx::Primitive {
       mx::Stream stream,
       std::string kquant_type,
       std::string act,
-      std::string shexp_type)
+      std::string shexp_type,
+      float limit = 0.0f)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         act_(std::move(act)),
-        shexp_type_(std::move(shexp_type)) {}
+        shexp_type_(std::move(shexp_type)),
+        limit_(limit) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -2051,6 +2056,7 @@ class KQuantMoEGLUShexpKQ : public mx::Primitive {
   std::string kquant_type_;
   std::string act_;
   std::string shexp_type_;
+  float limit_;
 };
 
 // K-quant gathered matvec with routing mix folded in (see gather_qmv_mix_kq).

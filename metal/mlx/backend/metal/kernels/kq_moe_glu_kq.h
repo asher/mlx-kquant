@@ -49,9 +49,13 @@ kq_glu_epilogue(float g, float u, float limit, float alpha = 1.0f) {
     const float sig = 1.0f / (1.0f + metal::exp(-alpha * g));
     return (g * sig) * (u + 1.0f);
   }
-  if (ACT == KQ_GLU_ACT_SILU_LIMIT) {
+  if (ACT == KQ_GLU_ACT_SILU_LIMIT ||
+      (ACT == KQ_GLU_ACT_SILU && limit > 0.0f)) {
     // deepseek-v4 LimitedSwiGLU: gate clamped from above only, up clamped
     // both sides, then plain silu(g) * u (alpha 1, no +1 -- NOT gpt-oss).
+    // The silu instantiations take the same clamp from a positive run-time
+    // limit; the shexp family dispatches silu_limit that way (no _silu_limit
+    // shexp kernels). Hosts pass 0 for plain silu.
     g = metal::min(g, limit);
     u = metal::clamp(u, -limit, limit);
   }

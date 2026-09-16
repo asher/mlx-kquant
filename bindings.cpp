@@ -1583,6 +1583,7 @@ NB_MODULE(_ext, m) {
       "indices"_a,
       "act"_a = "silu",
       "shexp_kquant_type"_a = "",
+      "limit"_a = 0.0f,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
@@ -1598,9 +1599,12 @@ NB_MODULE(_ext, m) {
             shexp_up_w (array): uint8 wire bytes (N, bytes_per_row).
             kquant_type (str): expert codec with a fused kernel.
             indices (array): expert indices [T, R].
-            act (str): 'silu' (default) or 'gelu' (tanh approx).
+            act (str): 'silu' (default), 'gelu' (tanh approx) or
+                'silu_limit' (deepseek-v4 LimitedSwiGLU: gate clamped from
+                above, up clamped both sides, routed and shared slots alike).
             shexp_kquant_type (str): shared-expert codec; '' (default) =
                 kquant_type. Mixed combos must be q5_k, q6_k or q8_0.
+            limit (float): the 'silu_limit' clamp; must be > 0 for that act.
 
         Returns:
             array: activated hidden states [T, R + 1, N] in x.dtype.

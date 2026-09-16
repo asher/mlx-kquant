@@ -14,6 +14,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   DeepSeek-V4.1 forms of the fused QAT round-trips (32-wide fp8 blocks over
   the whole window-KV row; the fp4 indexer round-trip without the Hadamard),
   bit-identical to the MLX graphs they replace.
+- `moe_glu_gather_shexp_kq(act="silu_limit", limit=...)`: the shared-expert
+  fold with the DeepSeek-V4 LimitedSwiGLU clamp on every slot, so a V4 MoE
+  block runs its shared expert inside the two routed gathers.
 
 ### Fixed
 - Zero-copy views for tensors no 1-D window can address, past `INT32_MAX * 8`
