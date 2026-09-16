@@ -193,13 +193,16 @@ def test_load_gguf_wire_over_int32(tmp_path):
 def test_load_gguf_wire_over_widest_window(tmp_path):
     """A tensor too large for a 1-D window at any width must still load
     zero-copy through a 2-D window. 34-byte q8_0 rows divide by 2 only, so the
-    widest 1-D window is uint16 and the ceiling is INT32_MAX * 2 bytes."""
+    widest 1-D window is uint16 and the ceiling is INT32_MAX * 2 bytes. An odd
+    row count leaves the tensor no power-of-two stride either, and the filler
+    ahead of it puts the data section off a 34-byte boundary, so only the
+    window base walking back page by page can align the rows."""
     import resource
     import sys
 
-    rows, row_bytes = 127_000_000, 34  # k=32 q8_0 blocks, ~4.32 GB
+    rows, row_bytes = 127_000_001, 34  # k=32 q8_0 blocks, ~4.32 GB
     nbytes = rows * row_bytes
-    assert nbytes > 2 * 2**31
+    assert nbytes > 2 * 2**31 and rows % 2 == 1
 
     # Zero fill keeps the pages untouched; a few marked rows carry the check.
     wire = np.zeros((rows, row_bytes), dtype=np.uint8)
@@ -209,6 +212,9 @@ def test_load_gguf_wire_over_widest_window(tmp_path):
 
     path = str(tmp_path / "wide.gguf")
     w = GGUFWriter(path, "smoke")
+    w.add_tensor(
+        "filler.q8", np.zeros((32_768, row_bytes), dtype=np.uint8), raw_dtype=GT.Q8_0
+    )
     w.add_tensor("wide.q8", wire, raw_dtype=GT.Q8_0)
     w.write_header_to_file()
     w.write_kv_data_to_file()
