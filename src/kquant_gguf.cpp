@@ -110,9 +110,12 @@ const char* zc_dtype_name(mx::Dtype d) {
 // is int32 - e.g. a >2 GB uint8 expert wire stack of a many-hundred-expert
 // MoE) is window-sliced at a wider integer dtype and view()ed back at the end;
 // slice and view both stay buffer-sharing on the contiguous window, so that
-// path is still no-copy. Returns nullopt when no wrap is possible (unaligned
-// window, or the last dim / offsets don't divide at any wide dtype either);
-// the caller then memcpy's.
+// path is still no-copy. Past INT32_MAX * 8 bytes no width is wide enough, and
+// a row byte count that is odd or 2/4-aligned lowers that ceiling to 2/4/8 GB,
+// so the window instead gets a second dimension and the tensor becomes a
+// whole-row slice of it - the case of a multi-ten-GB n-gram table. Returns
+// nullopt when no wrap is possible (unaligned window, or no row stride divides
+// both the window offset and the tensor); the caller then memcpy's.
 //
 // Alignment reasoning: gguflib mmaps at a page-aligned base and GGUF tensor
 // data sits at a 32-byte-aligned file offset, so `wd` is 32-aligned -> win_off
@@ -143,10 +146,13 @@ std::optional<mx::array> try_zero_copy_array(
   const size_t win_bytes = win_off + nbytes;
   const size_t int_max = static_cast<size_t>(std::numeric_limits<int>::max());
 
-  // Dtype the 1-D window is built and sliced at: normally the tensor's own,
+  // Dtype the window is built and sliced at: normally the tensor's own,
   // widened when the element count would overflow int32 shape dims.
   mx::Dtype win_dtype = dtype;
   size_t win_isz = isz;
+  // Nonzero makes the window 2-D with this many bytes per row, for a tensor
+  // too large for a 1-D window at any width.
+  size_t win_row_bytes = 0;
   if (win_bytes / isz > int_max) {
     const size_t last_bytes =
         shape.empty() ? 0 : static_cast<size_t>(shape.back()) * isz;
@@ -169,7 +175,32 @@ std::optional<mx::array> try_zero_copy_array(
       break;
     }
     if (!widened) {
-      return std::nullopt;
+      // No width makes the window a 1-D int32 shape: a tensor over
+      // INT32_MAX * 8 bytes cannot be. Give the window a second dimension
+      // instead, so each dim fits on its own. The row stride must divide
+      // win_off and nbytes, so the tensor stays a whole-row slice.
+      const size_t need = (win_bytes + int_max - 1) / int_max;
+      size_t p2 = isz;
+      while (p2 * 2 <= nbytes && nbytes % (p2 * 2) == 0 &&
+             win_off % (p2 * 2) == 0 && (p2 * 2) / isz <= int_max) {
+        p2 *= 2;
+      }
+      for (const size_t cand : {last_bytes, p2}) {
+        if (cand == 0 || cand < need || cand % isz != 0) {
+          continue;
+        }
+        if (cand / isz > int_max || win_bytes / cand > int_max) {
+          continue;
+        }
+        if (win_off % cand != 0 || nbytes % cand != 0) {
+          continue;
+        }
+        win_row_bytes = cand;
+        break;
+      }
+      if (win_row_bytes == 0) {
+        return std::nullopt;
+      }
     }
   }
   const size_t win_elems = win_bytes / win_isz;
@@ -187,6 +218,15 @@ std::optional<mx::array> try_zero_copy_array(
     zc_unregister(addr);
     mx::allocator::release(b);
   };
+  if (win_row_bytes != 0) {
+    const auto row_elems = static_cast<int>(win_row_bytes / win_isz);
+    const auto rows = static_cast<int>(win_bytes / win_row_bytes);
+    const auto first = static_cast<int>(win_off / win_row_bytes);
+    mx::array window(buf, mx::Shape{rows, row_elems}, win_dtype, del);
+    return mx::reshape(
+        mx::slice(window, mx::Shape{first, 0}, mx::Shape{rows, row_elems}),
+        shape);
+  }
   mx::array window(buf, mx::Shape{static_cast<int>(win_elems)}, win_dtype, del);
   mx::array view = mx::slice(
       window,

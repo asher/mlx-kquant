@@ -184,3 +184,46 @@ def test_load_gguf_wire_over_int32(tmp_path):
     for i in (0, 1, rows // 2, rows - 1):
         got = np.array(a[i])
         assert np.array_equal(got, wire[i * row_bytes : (i + 1) * row_bytes]), i
+
+
+@pytest.mark.skipif(
+    not __import__("os").environ.get("KQUANT_BIG_TESTS"),
+    reason="writes a >4 GiB GGUF; set KQUANT_BIG_TESTS=1 to run",
+)
+def test_load_gguf_wire_over_widest_window(tmp_path):
+    """A tensor too large for a 1-D window at any width must still load
+    zero-copy through a 2-D window. 34-byte q8_0 rows divide by 2 only, so the
+    widest 1-D window is uint16 and the ceiling is INT32_MAX * 2 bytes."""
+    import resource
+    import sys
+
+    rows, row_bytes = 127_000_000, 34  # k=32 q8_0 blocks, ~4.32 GB
+    nbytes = rows * row_bytes
+    assert nbytes > 2 * 2**31
+
+    # Zero fill keeps the pages untouched; a few marked rows carry the check.
+    wire = np.zeros((rows, row_bytes), dtype=np.uint8)
+    marks = (0, 1, rows // 2, rows - 1)
+    for i in marks:
+        wire[i] = np.arange(row_bytes, dtype=np.uint8) + (i % 251)
+
+    path = str(tmp_path / "wide.gguf")
+    w = GGUFWriter(path, "smoke")
+    w.add_tensor("wide.q8", wire, raw_dtype=GT.Q8_0)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+    scale = 1 if sys.platform == "darwin" else 1024  # ru_maxrss units
+    rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale
+    arrays, codecs, _meta, _shapes = kq.load_gguf(path, True)
+    rss1 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale
+
+    a = arrays["wide.q8"]
+    assert a.dtype == mx.uint8 and a.shape == (rows, row_bytes)
+    assert dict(codecs)["wide.q8"] == "q8_0"
+    assert rss1 - rss0 < 512 * 1024 * 1024, "load copied the wire bytes"
+
+    for i in marks:
+        assert np.array_equal(np.array(a[i]), wire[i]), i
