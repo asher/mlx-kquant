@@ -17,6 +17,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `moe_glu_gather_shexp_kq(act="silu_limit", limit=...)`: the shared-expert
   fold with the DeepSeek-V4 LimitedSwiGLU clamp on every slot, so a V4 MoE
   block runs its shared expert inside the two routed gathers.
+- `sdpa_sparse_decode`: decode attention over a window plus index-listed
+  pool rows (K == V) with sinks and optional masks, as two dispatches (a
+  key-split simdgroup-matrix kernel and a merge) at head dims 128, 256 and
+  512, for the DeepSeek-V4 sparse attention step.
 
 ### Fixed
 - Zero-copy views for tensors no 1-D window can address, past `INT32_MAX * 8`

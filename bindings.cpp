@@ -862,6 +862,50 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_sparse_decode",
+      &mlx_kquant::sdpa_sparse_decode,
+      "q"_a,
+      "window"_a,
+      "pool"_a,
+      "idx"_a,
+      "scale"_a,
+      "sinks"_a = nb::none(),
+      "win_mask"_a = nb::none(),
+      "sel_mask"_a = nb::none(),
+      "splits"_a = 0,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Decode attention over two key sources with K == V: a window read
+        whole and a pool read through a per-query index list, as in the
+        DeepSeek-V4 sparse attention step. The keys fan out over splits
+        of threadgroups (one simdgroup per head and split) that write
+        unnormalized f32 partials, and a merge renormalizes them with the
+        per-head sink counted once. Replaces the gather, the two score
+        matmuls, the split softmax and the two value matmuls.
+
+        Args:
+            q (array): queries [B, H, L, D], float16/bfloat16; D in
+                {128, 256, 512}; L <= 16.
+            window (array): [B, 1, W, D] rows every query attends.
+            pool (array): [B, P, D] rows selected by ``idx``.
+            idx (array): [B, L, N] int32/uint32 pool rows per query; a
+                negative or out-of-range entry is skipped.
+            scale (float): softmax scale.
+            sinks (array, optional): per-head [H] extra logit in the
+                softmax denominator.
+            win_mask (array, optional): bool [L, W] or [B, L, W]; False
+                drops the key.
+            sel_mask (array, optional): bool [L, N] or [B, L, N]; False
+                drops the listed row.
+            splits (int): key splits, 0 = automatic (also
+                KQ_SDPA_SPARSE_SPLITS).
+
+        Returns:
+            array: [B, H, L, D] in q's dtype. Metal-only.
+      )");
+
+  m.def(
       "dsa_sparse_attention",
       &mlx_kquant::dsa_sparse_attention,
       "q"_a,

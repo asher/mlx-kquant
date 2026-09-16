@@ -2747,4 +2747,62 @@ class KQuantEventWait : public mx::Primitive {
 std::pair<int, int> get_cb_caps();
 std::pair<int, int> set_cb_caps(int max_ops, int max_mb);
 
+// Sparse decode attention over a window [B, 1, W, D] read whole plus pool
+// [B, P, D] rows listed per query in idx [B, L, N] (int32/uint32; a negative
+// or out-of-range entry is skipped). K == V. Optional per-head sinks [H]
+// join the softmax denominator; optional bool masks win_mask [L, W] /
+// [B, L, W] and sel_mask [L, N] / [B, L, N] drop keys (False = dropped).
+// splits 0 picks the key-split count. Returns [B, H, L, D] in q's dtype.
+// Metal-only.
+mx::array sdpa_sparse_decode(
+    mx::array q,
+    mx::array window,
+    mx::array pool,
+    mx::array idx,
+    float scale,
+    const std::optional<mx::array>& sinks = std::nullopt,
+    const std::optional<mx::array>& win_mask = std::nullopt,
+    const std::optional<mx::array>& sel_mask = std::nullopt,
+    int splits = 0,
+    mx::StreamOrDevice s = {});
+
+class KQSdpaSparseDecode : public mx::Primitive {
+ public:
+  explicit KQSdpaSparseDecode(
+      mx::Stream stream,
+      float scale,
+      int splits,
+      bool has_sinks,
+      bool has_win_mask,
+      bool has_sel_mask)
+      : mx::Primitive(stream),
+        scale_(scale),
+        splits_(splits),
+        has_sinks_(has_sinks),
+        has_win_mask_(has_win_mask),
+        has_sel_mask_(has_sel_mask) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQSdpaSparseDecode";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int splits_;
+  bool has_sinks_;
+  bool has_win_mask_;
+  bool has_sel_mask_;
+};
+
 } // namespace mlx_kquant
