@@ -64,17 +64,18 @@ def _fp8_roundtrip(x, block=64):
     return mx.flatten(v, -2).astype(orig)
 
 
-def _ref(kv, n_rot):
+def _ref(kv, n_rot, block=64):
     orig = kv.dtype
     nope, rot = mx.split(kv, [kv.shape[-1] - n_rot], axis=-1)
-    kv = mx.concatenate([_fp8_roundtrip(nope), rot], axis=-1)
+    kv = mx.concatenate([_fp8_roundtrip(nope, block), rot], axis=-1)
     return kv.astype(mx.float16).astype(orig)
 
 
-def _ref_nof16(kv, n_rot):
-    """gguf-mlx Compressor.__call__ emit path (_qat == "fp8")."""
+def _ref_nof16(kv, n_rot, block=64):
+    """gguf-mlx Compressor.__call__ emit path (_qat == "fp8"); with
+    block 32 and n_rot 0 the DeepSeek-V4.1 window-KV site (_kv_qat)."""
     nope, rot = kv[..., : kv.shape[-1] - n_rot], kv[..., kv.shape[-1] - n_rot :]
-    return mx.concatenate([_fp8_roundtrip(nope), rot], axis=-1)
+    return mx.concatenate([_fp8_roundtrip(nope, block), rot], axis=-1)
 
 
 def _bits(a):
@@ -153,6 +154,39 @@ def test_dsa_kv_qat_nof16_differs_from_f16():
     assert int((_bits(a) != _bits(b)).sum()) > 0
     # rope tail: f16 saturates 1e20 to inf, the emit form leaves it alone
     assert float(b[0, -1]) == float(xt[0, -1])
+
+
+@pytest.mark.parametrize("n_rot", [0, 64], ids=["nrot0", "nrot64"])
+@pytest.mark.parametrize("f16_round", [True, False], ids=["f16", "nof16"])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("case", CASES, ids=[c[0] for c in CASES])
+def test_dsa_kv_qat_block32_bit_identity(case, dtype, f16_round, n_rot):
+    name, gen = case
+    rng = np.random.default_rng(13)
+    x = mx.array(gen(rng, (1024, 512 + n_rot), dtype)).astype(dtype)
+    mx.eval(x)
+    got = kq.dsa_kv_qat(x, n_rot, f16_round=f16_round, block=32)
+    ref = (_ref if f16_round else _ref_nof16)(x, n_rot, 32)
+    mx.eval(got, ref)
+    gb, rb = _bits(got), _bits(ref)
+    mismatch = int((gb != rb).sum())
+    assert mismatch == 0, (
+        f"{name} {dtype} f16_round={f16_round} n_rot={n_rot} block=32: "
+        f"{mismatch}/{gb.size} words differ "
+        f"(first at {np.argwhere(gb != rb)[:4].tolist()})"
+    )
+
+
+def test_dsa_kv_qat_block_rejects():
+    x = mx.zeros((4, 96), dtype=mx.float16)
+    with pytest.raises(ValueError):
+        kq.dsa_kv_qat(x, 0, block=48)
+    with pytest.raises(ValueError):
+        kq.dsa_kv_qat(mx.zeros((4, 80), dtype=mx.float16), 0, block=32)
+    got = kq.dsa_kv_qat(x, 0, block=32)
+    ref = _ref(x, 0, 32)
+    mx.eval(got, ref)
+    assert not int((_bits(got) != _bits(ref)).sum())
 
 
 def test_dsa_kv_qat_shapes_and_rejects():

@@ -1008,6 +1008,7 @@ NB_MODULE(_ext, m) {
       &mlx_kquant::dsa_indexer_qat,
       "x"_a,
       nb::kw_only(),
+      "hadamard"_a = true,
       "stream"_a = nb::none(),
       R"(
         DeepSeek-V4-Flash indexer activation QAT round-trip, fused: the
@@ -1017,9 +1018,15 @@ NB_MODULE(_ext, m) {
         an FLT_MIN*6 amax floor, clamp to +-6, tie-to-even rounding).
         One kernel in place of the multi-pass hadamard + quantize chain.
 
+        With ``hadamard`` false the transform is skipped and the FP4
+        round-trip applies to the raw row: the DeepSeek-V4.1 indexer
+        form, bit-identical to its compiled fp4-core chain.
+
         Args:
             x (array): any shape with a trailing dim of 128,
                 float16/bfloat16/float32.
+            hadamard (bool): apply the 128-wide Hadamard first. Default
+                True.
 
         Returns:
             array: same shape and dtype as ``x``.
@@ -1124,6 +1131,7 @@ NB_MODULE(_ext, m) {
       "n_rot"_a,
       nb::kw_only(),
       "f16_round"_a = true,
+      "block"_a = 64,
       "stream"_a = nb::none(),
       R"(
         DeepSeek-V4-Flash main-attention KV QAT round-trip, fused: the
@@ -1140,11 +1148,17 @@ NB_MODULE(_ext, m) {
         row is quantized but never passes through the f16 KV cache; it
         replaces the split + fp8-core + concat chain on its own.
 
+        ``block`` 32 quantizes 32-wide fp8 blocks instead of 64: with
+        ``n_rot`` 0 and ``f16_round`` False that is the DeepSeek-V4.1
+        window-KV form, the whole post-RoPE row in 32-blocks with no
+        fp16 round.
+
         Args:
             x (array): any shape with trailing dim D,
-                (D - n_rot) % 64 == 0; float16/bfloat16/float32.
+                (D - n_rot) % block == 0; float16/bfloat16/float32.
             n_rot (int): trailing RoPE dims excluded from the fp8 step.
             f16_round (bool): apply the trailing fp16 round. Default True.
+            block (int): fp8 block width, 64 or 32. Default 64.
 
         Returns:
             array: same shape and dtype as ``x``.

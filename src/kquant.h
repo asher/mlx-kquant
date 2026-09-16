@@ -614,8 +614,10 @@ mx::array dsa_indexer_score_decode(
 // amax floor FLT_MIN*6, clamp +-6, tie-to-even threshold ladder). x is any
 // shape with a trailing dim of 128; returns the same shape and dtype.
 // Bit-compatible with the mx.hadamard_transform + compiled fp4-core chain.
-// Metal-only.
-mx::array dsa_indexer_qat(mx::array x, mx::StreamOrDevice s = {});
+// hadamard false skips the transform: the FP4 round-trip on the raw row
+// (the V4.1 indexer form). Metal-only.
+mx::array
+dsa_indexer_qat(mx::array x, bool hadamard = true, mx::StreamOrDevice s = {});
 
 // Emit variant of dsa_indexer_qat: same Hadamard + E2M1 quantization, but
 // returns the quantized wire form instead of the dequantized round-trip:
@@ -668,14 +670,16 @@ mx::array dsa_indexer_scores_q(
 // floor 1e-4, clamp +-448, ties-to-even) on the leading dims, the trailing
 // n_rot RoPE dims fp8-exempt, then the whole row rounded through fp16 (the
 // f16 KV-cache step). x is any shape with trailing dim D where
-// (D - n_rot) % 64 == 0; returns the same shape and dtype. Bit-compatible
+// (D - n_rot) % block == 0; returns the same shape and dtype. Bit-compatible
 // with the split + fp8-core + concat + astype chain. Set f16_round false
 // for the compressor emit-path form, which stops at the fp8 result and
-// passes the RoPE tail through unchanged. Metal-only.
+// passes the RoPE tail through unchanged. block is 64 (V4) or 32 (V4.1's
+// whole-row window KV, with n_rot 0 and f16_round false). Metal-only.
 mx::array dsa_kv_qat(
     mx::array x,
     int n_rot,
     bool f16_round = true,
+    int block = 64,
     mx::StreamOrDevice s = {});
 
 // KVarN KV-cache group quantizer (BeeLlama variant): per 128-token group
@@ -1748,7 +1752,8 @@ class KQDsaIndexerScoreDecode : public mx::Primitive {
 // Inference-only, Metal-only.
 class KQDsaIndexerQat : public mx::Primitive {
  public:
-  explicit KQDsaIndexerQat(mx::Stream stream) : mx::Primitive(stream) {}
+  explicit KQDsaIndexerQat(mx::Stream stream, bool hadamard)
+      : mx::Primitive(stream), hadamard_(hadamard) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -1764,6 +1769,9 @@ class KQDsaIndexerQat : public mx::Primitive {
     return "KQDsaIndexerQat";
   }
   bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  bool hadamard_;
 };
 
 // Emit variant of KQDsaIndexerQat producing int8 codes + per-32-block
@@ -1855,8 +1863,11 @@ class KQDsaIndexerScoresQ : public mx::Primitive {
 // dsa_kv_qat). Inference-only, Metal-only.
 class KQDsaKvQat : public mx::Primitive {
  public:
-  explicit KQDsaKvQat(mx::Stream stream, int n_rot, bool f16_round)
-      : mx::Primitive(stream), n_rot_(n_rot), f16_round_(f16_round) {}
+  explicit KQDsaKvQat(mx::Stream stream, int n_rot, bool f16_round, int block)
+      : mx::Primitive(stream),
+        n_rot_(n_rot),
+        f16_round_(f16_round),
+        block_(block) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -1876,6 +1887,7 @@ class KQDsaKvQat : public mx::Primitive {
  private:
   int n_rot_;
   bool f16_round_;
+  int block_;
 };
 
 // KVarN group quantizer (see kvarn_quantize). Inference-only, Metal-only.

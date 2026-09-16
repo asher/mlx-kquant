@@ -63,9 +63,11 @@ def _e2m1_round(v):
     return s * q
 
 
-def _ref(x):
+def _ref(x, hadamard=True):
     orig = x.dtype
-    v = mx.hadamard_transform(x.astype(mx.float32))
+    v = x.astype(mx.float32)
+    if hadamard:
+        v = mx.hadamard_transform(v)
     v = mx.unflatten(v, -1, (-1, 32))
     amax = mx.maximum(mx.max(mx.abs(v), axis=-1, keepdims=True), 7.052966104933725e-38)
     scale = _exp2i(mx.ceil(mx.log2(amax / 6.0)))
@@ -118,6 +120,26 @@ def test_dsa_indexer_qat_bit_identity(case, dtype):
     mismatch = int((gb != rb).sum())
     assert mismatch == 0, (
         f"{name} {dtype}: {mismatch}/{gb.size} words differ "
+        f"(first at {np.argwhere(gb != rb)[:4].tolist()})"
+    )
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("case", CASES, ids=[c[0] for c in CASES])
+def test_dsa_indexer_qat_no_hadamard_bit_identity(case, dtype):
+    """gguf-mlx's V4.1 _indexer_qat: the fp4 block-32 round-trip on the
+    raw row, no Hadamard."""
+    name, gen = case
+    rng = np.random.default_rng(17)
+    x = mx.array(gen(rng, (4096, 128), dtype)).astype(dtype)
+    mx.eval(x)
+    got = kq.dsa_indexer_qat(x, hadamard=False)
+    ref = _ref(x, hadamard=False)
+    mx.eval(got, ref)
+    gb, rb = _bits(got), _bits(ref)
+    mismatch = int((gb != rb).sum())
+    assert mismatch == 0, (
+        f"{name} {dtype} no-hadamard: {mismatch}/{gb.size} words differ "
         f"(first at {np.argwhere(gb != rb)[:4].tolist()})"
     )
 

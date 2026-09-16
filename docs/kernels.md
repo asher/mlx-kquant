@@ -209,7 +209,9 @@ modifications, from omlx's `glm_moe_dsa` custom kernels (see the
   on its main-attention KV (per-64-block FP8-E4M3FN) and indexer activations (128-wide Hadamard then
   per-32-block FP4-E2M1), each bit-identical to the equivalent MLX graph. `dsa_kv_qat(...,
   f16_round=False)` drops the trailing fp16 round for the compressor emit path, whose pooled rows are
-  quantized but never stored in the f16 KV cache.
+  quantized but never stored in the f16 KV cache. DeepSeek-V4.1 takes `dsa_kv_qat(x, 0,
+  f16_round=False, block=32)` on its window KV and `dsa_indexer_qat(x, hadamard=False)` on its
+  indexer activations.
 
 Tuning levers (defaults are right for normal use):
 

@@ -10,6 +10,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `load_gguf(skip=...)`: named tensors load no array but still report their
   shape and codec, for a table the caller must read itself because it passes
   the device max buffer length.
+- `dsa_kv_qat(block=32)` and `dsa_indexer_qat(hadamard=False)`: the
+  DeepSeek-V4.1 forms of the fused QAT round-trips (32-wide fp8 blocks over
+  the whole window-KV row; the fp4 indexer round-trip without the Hadamard),
+  bit-identical to the MLX graphs they replace.
 
 ### Fixed
 - Zero-copy views for tensors no 1-D window can address, past `INT32_MAX * 8`

@@ -51,8 +51,9 @@ METAL_FUNC float kq_dsa_e2m1_snap(float a) {
 // Shared indexer-QAT core: fp32 Hadamard (mlx hadamard_n structure for
 // n=128) + per-32-block FP4 power-of-two scale. Leaves the scaled
 // transform in buf[lr] and block scales in qs[lr]; the two kernels below
-// differ only in what they store.
-template <typename T>
+// differ only in what they store. HAD false skips the Hadamard (the
+// V4.1 indexer quantizes the raw row; the host then passes scale 1).
+template <typename T, bool HAD = true>
 METAL_FUNC void kq_dsa_qat_row_core(
     const device T* x_row,
     bool active,
@@ -74,37 +75,39 @@ METAL_FUNC void kq_dsa_qat_row_core(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  float x[RAD];
+  if (HAD) {
+    float x[RAD];
 
-  // Radix-16 stage (h = 1): worker i owns the contiguous [16i, 16i+16).
-  STEEL_PRAGMA_UNROLL
-  for (short r = 0; r < RAD; r++) {
-    x[r] = buf[lr][i * RAD + r];
-  }
-  kq_dsa_qat_radix<RAD>(x);
-  STEEL_PRAGMA_UNROLL
-  for (short r = 0; r < RAD; r++) {
-    buf[lr][i * RAD + r] = x[r];
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Radix-16 stage (h = 1): worker i owns the contiguous [16i, 16i+16).
+    STEEL_PRAGMA_UNROLL
+    for (short r = 0; r < RAD; r++) {
+      x[r] = buf[lr][i * RAD + r];
+    }
+    kq_dsa_qat_radix<RAD>(x);
+    STEEL_PRAGMA_UNROLL
+    for (short r = 0; r < RAD; r++) {
+      buf[lr][i * RAD + r] = x[r];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Final radix-8 stage (h = 16): butterfly idx covers {idx + 16r}; the
-  // 16 butterflies partition the row, so the two per worker need no
-  // barrier between them (same invariant as mlx's final-radix loop).
-  STEEL_PRAGMA_UNROLL
-  for (short t = 0; t < 2; t++) {
-    const short idx = i + t * (N / RAD);
+    // Final radix-8 stage (h = 16): butterfly idx covers {idx + 16r}; the
+    // 16 butterflies partition the row, so the two per worker need no
+    // barrier between them (same invariant as mlx's final-radix loop).
     STEEL_PRAGMA_UNROLL
-    for (short r = 0; r < FINAL; r++) {
-      x[r] = buf[lr][idx + RAD * r];
+    for (short t = 0; t < 2; t++) {
+      const short idx = i + t * (N / RAD);
+      STEEL_PRAGMA_UNROLL
+      for (short r = 0; r < FINAL; r++) {
+        x[r] = buf[lr][idx + RAD * r];
+      }
+      kq_dsa_qat_radix<FINAL>(x);
+      STEEL_PRAGMA_UNROLL
+      for (short r = 0; r < FINAL; r++) {
+        buf[lr][idx + RAD * r] = x[r];
+      }
     }
-    kq_dsa_qat_radix<FINAL>(x);
-    STEEL_PRAGMA_UNROLL
-    for (short r = 0; r < FINAL; r++) {
-      buf[lr][idx + RAD * r] = x[r];
-    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // Hadamard scale (mlx applies it at write time) + per-worker |max| part.
   float local_max = 0.0f;
@@ -127,7 +130,7 @@ METAL_FUNC void kq_dsa_qat_row_core(
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-template <typename T>
+template <typename T, bool HAD>
 [[kernel, max_total_threads_per_threadgroup(256)]] void kq_dsa_indexer_qat(
     const device T* X [[buffer(0)]],
     device T* O [[buffer(1)]],
@@ -148,7 +151,8 @@ template <typename T>
   const int row = int(tgid.x) * ROWS + lr;
   const bool active = row < n_rows;
 
-  kq_dsa_qat_row_core(X + size_t(row) * N, active, lr, i, scale, buf, part, qs);
+  kq_dsa_qat_row_core<T, HAD>(
+      X + size_t(row) * N, active, lr, i, scale, buf, part, qs);
 
   if (active) {
     device T* o_row = O + size_t(row) * N;
@@ -303,7 +307,9 @@ template <typename T>
 // the storage-dtype fp8 result and copies the RoPE tail through unchanged,
 // which is the compressor emit-path form (ds4.c compressor site: the
 // pooled row is quantized but never passes through the f16 KV cache).
-template <typename T, bool F16R>
+// BLK is the fp8 block width: 64 (V4) or 32 (V4.1's whole-row window KV),
+// one simdgroup per block with BLK / 32 elements per lane.
+template <typename T, bool F16R, int BLK>
 [[kernel, max_total_threads_per_threadgroup(256)]] void kq_dsa_kv_qat(
     const device T* X [[buffer(0)]],
     device T* O [[buffer(1)]],
@@ -314,23 +320,24 @@ template <typename T, bool F16R>
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int NSG = 8; // 256 / 32
+  constexpr int EPL = BLK / 32; // elements per lane per block
   const device T* x_row = X + size_t(tgid) * D;
   device T* o_row = O + size_t(tgid) * D;
 
-  const int nblk = (D - NROT) / 64;
+  const int nblk = (D - NROT) / BLK;
   for (int b = int(simd_gid); b < nblk; b += NSG) {
-    float v[2];
+    float v[EPL];
     float local = 0.0f;
     STEEL_PRAGMA_UNROLL
-    for (int j = 0; j < 2; j++) {
-      v[j] = float(x_row[64 * b + 32 * j + int(simd_lid)]);
+    for (int j = 0; j < EPL; j++) {
+      v[j] = float(x_row[BLK * b + 32 * j + int(simd_lid)]);
       local = metal::max(local, metal::fabs(v[j]));
     }
     const float amax = metal::max(simd_max(local), 1e-4f);
     const float scale = metal::ldexp(
         1.0f, int(metal::ceil(metal::precise::log2(amax / 448.0f))));
     STEEL_PRAGMA_UNROLL
-    for (int j = 0; j < 2; j++) {
+    for (int j = 0; j < EPL; j++) {
       const float c = metal::clamp(v[j] / scale, -448.0f, 448.0f);
       const float a = metal::fabs(c);
       const float sgn = c > 0.0f ? 1.0f : (c < 0.0f ? -1.0f : 0.0f);
@@ -340,7 +347,7 @@ template <typename T, bool F16R>
       e = metal::clamp(e, -6.0f, 8.0f);
       const float q = metal::ldexp(1.0f, int(e) - 3);
       const float r = sgn * metal::rint(a / q) * q * scale;
-      o_row[64 * b + 32 * j + int(simd_lid)] =
+      o_row[BLK * b + 32 * j + int(simd_lid)] =
           F16R ? T(half(float(T(r)))) : T(r);
     }
   }

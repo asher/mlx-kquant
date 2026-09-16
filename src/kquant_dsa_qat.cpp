@@ -38,10 +38,11 @@ void KQDsaIndexerQat::eval_gpu(
 
   constexpr int rows_per_tg = 32;
   const int rows = int(x.size() / 128);
-  // mlx's hadamard_transform default scale for n=128.
-  const float scale = 1.0f / std::sqrt(128.0f);
+  // mlx's hadamard_transform default scale for n=128; 1 without it.
+  const float scale = hadamard_ ? 1.0f / std::sqrt(128.0f) : 1.0f;
 
-  const std::string kname = "kq_dsa_indexer_qat_" + kq_type_string(x.dtype());
+  const std::string kname = "kq_dsa_indexer_qat_" +
+      std::string(hadamard_ ? "" : "nohad_") + kq_type_string(x.dtype());
   auto kernel = kq_get_kernel(d, kname, kname, {});
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -136,6 +137,7 @@ void KQDsaKvQat::eval_gpu(
   const int n_rot = n_rot_;
 
   const std::string kname = "kq_dsa_kv_qat_" +
+      std::string(block_ == 32 ? "b32_" : "") +
       std::string(f16_round_ ? "" : "nof16_") + kq_type_string(x.dtype());
   auto kernel = kq_get_kernel(d, kname, kname, {});
   auto& ce = mx::metal::get_command_encoder(s);
@@ -194,8 +196,9 @@ std::vector<mx::Shape> KQDsaIndexerQat::output_shapes(
   return {inputs[0].shape()};
 }
 
-bool KQDsaIndexerQat::is_equivalent(const mx::Primitive&) const {
-  return true;
+bool KQDsaIndexerQat::is_equivalent(const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQDsaIndexerQat&>(other);
+  return hadamard_ == o.hadamard_;
 }
 
 void KQDsaIndexerQatQuant::eval_cpu(
@@ -248,23 +251,33 @@ std::vector<mx::Shape> KQDsaKvQat::output_shapes(
 
 bool KQDsaKvQat::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQDsaKvQat&>(other);
-  return n_rot_ == o.n_rot_ && f16_round_ == o.f16_round_;
+  return n_rot_ == o.n_rot_ && f16_round_ == o.f16_round_ && block_ == o.block_;
 }
 
-mx::array
-dsa_kv_qat(mx::array x, int n_rot, bool f16_round, mx::StreamOrDevice s_) {
+mx::array dsa_kv_qat(
+    mx::array x,
+    int n_rot,
+    bool f16_round,
+    int block,
+    mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
 
   if (x.ndim() < 1) {
     throw std::invalid_argument(
         "[mlx_kquant.dsa_kv_qat] x must have rank >= 1.");
   }
+  if (block != 32 && block != 64) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_kv_qat] block must be 32 or 64, got " << block
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
   const int D = x.shape(-1);
-  if (n_rot < 0 || n_rot > D || (D - n_rot) % 64 != 0 || D == n_rot) {
+  if (n_rot < 0 || n_rot > D || (D - n_rot) % block != 0 || D == n_rot) {
     std::ostringstream msg;
     msg << "[mlx_kquant.dsa_kv_qat] needs 0 <= n_rot < D and "
-        << "(D - n_rot) % 64 == 0 (64-wide fp8 blocks), got D = " << D
-        << ", n_rot = " << n_rot << ".";
+        << "(D - n_rot) % block == 0 (" << block
+        << "-wide fp8 blocks), got D = " << D << ", n_rot = " << n_rot << ".";
     throw std::invalid_argument(msg.str());
   }
   if (x.dtype() != mx::float16 && x.dtype() != mx::bfloat16 &&
@@ -281,11 +294,11 @@ dsa_kv_qat(mx::array x, int n_rot, bool f16_round, mx::StreamOrDevice s_) {
   return mx::array(
       std::move(out_shape),
       x.dtype(),
-      std::make_shared<KQDsaKvQat>(s, n_rot, f16_round),
+      std::make_shared<KQDsaKvQat>(s, n_rot, f16_round, block),
       std::move(inputs));
 }
 
-mx::array dsa_indexer_qat(mx::array x, mx::StreamOrDevice s_) {
+mx::array dsa_indexer_qat(mx::array x, bool hadamard, mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
 
   if (x.ndim() < 1 || x.shape(-1) != 128) {
@@ -311,7 +324,7 @@ mx::array dsa_indexer_qat(mx::array x, mx::StreamOrDevice s_) {
   return mx::array(
       std::move(out_shape),
       x.dtype(),
-      std::make_shared<KQDsaIndexerQat>(s),
+      std::make_shared<KQDsaIndexerQat>(s, hadamard),
       std::move(inputs));
 }
 
