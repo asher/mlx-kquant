@@ -110,9 +110,14 @@ const char* zc_dtype_name(mx::Dtype d) {
 // is int32 - e.g. a >2 GB uint8 expert wire stack of a many-hundred-expert
 // MoE) is window-sliced at a wider integer dtype and view()ed back at the end;
 // slice and view both stay buffer-sharing on the contiguous window, so that
-// path is still no-copy. Returns nullopt when no wrap is possible (unaligned
-// window, or the last dim / offsets don't divide at any wide dtype either);
-// the caller then memcpy's.
+// path is still no-copy. Past INT32_MAX * 8 bytes no width is wide enough, and
+// a row byte count that divides only by 2 or 4 lowers that ceiling to 4 or
+// 8 GB: a 30 GiB Q2_K n-gram table of 84-byte rows is past it, and the q8_0
+// build of the same table is far past it. The window then gets a second
+// dimension, and the tensor becomes a whole-row slice of it. That needs the
+// window to start a whole number of rows before the tensor, so the window base
+// walks back page by page until it does, bounded by the mmap base. Returns
+// nullopt when no wrap is possible; the caller then memcpy's.
 //
 // Alignment reasoning: gguflib mmaps at a page-aligned base and GGUF tensor
 // data sits at a 32-byte-aligned file offset, so `wd` is 32-aligned -> win_off
@@ -143,10 +148,15 @@ std::optional<mx::array> try_zero_copy_array(
   const size_t win_bytes = win_off + nbytes;
   const size_t int_max = static_cast<size_t>(std::numeric_limits<int>::max());
 
-  // Dtype the 1-D window is built and sliced at: normally the tensor's own,
+  // Dtype the window is built and sliced at: normally the tensor's own,
   // widened when the element count would overflow int32 shape dims.
   mx::Dtype win_dtype = dtype;
   size_t win_isz = isz;
+  // Nonzero makes the window 2-D with this many bytes per row, for a tensor
+  // too large for a 1-D window at any width, and win_back_pages then says how
+  // far below the tensor's own page the window starts.
+  size_t win_row_bytes = 0;
+  size_t win_back_pages = 0;
   if (win_bytes / isz > int_max) {
     const size_t last_bytes =
         shape.empty() ? 0 : static_cast<size_t>(shape.back()) * isz;
@@ -169,15 +179,56 @@ std::optional<mx::array> try_zero_copy_array(
       break;
     }
     if (!widened) {
-      return std::nullopt;
+      // No width makes the window a 1-D int32 shape: a tensor over
+      // INT32_MAX * 8 bytes cannot be. Give the window a second dimension
+      // instead, so each dim fits on its own. The row stride must divide the
+      // window offset and the tensor, so the tensor stays a whole-row slice.
+      const size_t need = (win_bytes + int_max - 1) / int_max;
+      const uintptr_t map_base = ctx_holder && ctx_holder->data != nullptr
+          ? reinterpret_cast<uintptr_t>(ctx_holder->data)
+          : win_base;
+      auto row_fits = [&](size_t s, size_t off) {
+        return s >= need && s % isz == 0 && s / isz <= int_max &&
+            nbytes % s == 0 && off % s == 0 && (off + nbytes) / s <= int_max;
+      };
+      // The tensor's own row. Walking the base back by whole pages changes the
+      // offset modulo the row, so an unaligned data section is recoverable.
+      if (last_bytes != 0) {
+        for (size_t k = 0; k <= last_bytes; ++k) {
+          if (win_base - map_base < k * page) {
+            break;
+          }
+          if (row_fits(last_bytes, win_off + k * page)) {
+            win_row_bytes = last_bytes;
+            win_back_pages = k;
+            break;
+          }
+        }
+      }
+      // Else the widest power-of-two stride the window offset already carries.
+      if (win_row_bytes == 0) {
+        size_t p2 = isz;
+        while (p2 * 2 <= nbytes && row_fits(p2 * 2, win_off)) {
+          p2 *= 2;
+        }
+        if (row_fits(p2, win_off)) {
+          win_row_bytes = p2;
+        }
+      }
+      if (win_row_bytes == 0) {
+        return std::nullopt;
+      }
     }
   }
   const size_t win_elems = win_bytes / win_isz;
   const size_t off_elems = win_off / win_isz;
   const size_t num_elems = nbytes / win_isz;
 
+  const uintptr_t buf_base = win_base - win_back_pages * page;
+  const size_t buf_off = win_off + win_back_pages * page;
+  const size_t buf_bytes = win_row_bytes != 0 ? buf_off + nbytes : win_bytes;
   mx::allocator::Buffer buf =
-      mx::allocator::make_buffer(reinterpret_cast<void*>(win_base), win_bytes);
+      mx::allocator::make_buffer(reinterpret_cast<void*>(buf_base), buf_bytes);
   if (buf.ptr() == nullptr) {
     return std::nullopt; // no-copy wrap rejected (e.g. alignment).
   }
@@ -187,6 +238,15 @@ std::optional<mx::array> try_zero_copy_array(
     zc_unregister(addr);
     mx::allocator::release(b);
   };
+  if (win_row_bytes != 0) {
+    const auto row_elems = static_cast<int>(win_row_bytes / isz);
+    const auto rows = static_cast<int>(buf_bytes / win_row_bytes);
+    const auto first = static_cast<int>(buf_off / win_row_bytes);
+    mx::array window(buf, mx::Shape{rows, row_elems}, win_dtype, del);
+    return mx::reshape(
+        mx::slice(window, mx::Shape{first, 0}, mx::Shape{rows, row_elems}),
+        shape);
+  }
   mx::array window(buf, mx::Shape{static_cast<int>(win_elems)}, win_dtype, del);
   mx::array view = mx::slice(
       window,
@@ -586,7 +646,10 @@ void read_metadata_value(
 
 } // namespace
 
-GgufLoadResult load_gguf(const std::string& path, bool zero_copy /* = true */) {
+GgufLoadResult load_gguf(
+    const std::string& path,
+    bool zero_copy /* = true */,
+    const std::vector<std::string>& skip /* = {} */) {
   {
     std::ifstream f(path.c_str());
     if (!f.good()) {
@@ -607,6 +670,7 @@ GgufLoadResult load_gguf(const std::string& path, bool zero_copy /* = true */) {
   }
 
   GgufLoadResult res;
+  const std::unordered_set<std::string> skip_set(skip.begin(), skip.end());
 
   // 1. metadata KVs (must be fully consumed before tensor infos so gguflib
   //    positions ctx->off at the tensor-info section).
@@ -630,6 +694,13 @@ GgufLoadResult load_gguf(const std::string& path, bool zero_copy /* = true */) {
       native_shape.push_back(static_cast<int64_t>(tensor.dim[i]));
     }
     res.tensor_shapes.emplace_back(name, std::move(native_shape));
+
+    if (!skip_set.empty() && skip_set.count(name)) {
+      if (const KQuantCodec* codec = gguf_type_to_kquant_codec(tensor.type)) {
+        res.codecs.emplace_back(name, codec->name);
+      }
+      continue;
+    }
 
     if (const KQuantCodec* codec = gguf_type_to_kquant_codec(tensor.type)) {
       load_block_tensor(
