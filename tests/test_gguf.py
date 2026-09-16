@@ -233,3 +233,25 @@ def test_load_gguf_wire_over_widest_window(tmp_path):
 
     for i in marks:
         assert np.array_equal(np.array(a[i]), wire[i]), i
+
+
+def test_load_gguf_skip(tmp_path):
+    """A skipped tensor gets no array but keeps its shape and codec."""
+    _f32, _src = _mint(tmp_path / "smoke.gguf")
+    arrays, codecs, _meta, shapes = kq.load_gguf(
+        str(tmp_path / "smoke.gguf"), True, ["layer.q8", "plain.f32"]
+    )
+
+    assert "layer.q8" not in arrays and "layer.q8.scales" not in arrays
+    assert "plain.f32" not in arrays
+    assert codecs["layer.q8"] == "q8_0"
+    assert list(shapes["layer.q8"]) == [64, 8]
+    assert list(shapes["plain.f32"]) == [16, 4]
+
+    # Everything else loads as usual.
+    assert arrays["layer.q4"].shape == (8, 64 // 2 + 2 * 2)
+    assert codecs["layer.q4"] == "q4_0"
+
+    # Default: nothing skipped.
+    arrays, _c, _m, _s = kq.load_gguf(str(tmp_path / "smoke.gguf"))
+    assert "layer.q8" in arrays and "plain.f32" in arrays

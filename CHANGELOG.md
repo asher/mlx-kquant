@@ -6,6 +6,17 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `load_gguf(skip=...)`: named tensors load no array but still report their
+  shape and codec, for a table the caller must read itself because it passes
+  the device max buffer length.
+
+### Fixed
+- Zero-copy views for tensors no 1-D window can address, past `INT32_MAX * 8`
+  bytes or lower when the row byte count divides only by 2 or 4. The window
+  gains a second dimension and the tensor becomes a whole-row slice of it, so
+  a large n-gram table is a view instead of a memcpy.
+
 ## [0.4.9]
 
 ### Added

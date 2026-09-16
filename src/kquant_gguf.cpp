@@ -646,7 +646,10 @@ void read_metadata_value(
 
 } // namespace
 
-GgufLoadResult load_gguf(const std::string& path, bool zero_copy /* = true */) {
+GgufLoadResult load_gguf(
+    const std::string& path,
+    bool zero_copy /* = true */,
+    const std::vector<std::string>& skip /* = {} */) {
   {
     std::ifstream f(path.c_str());
     if (!f.good()) {
@@ -667,6 +670,7 @@ GgufLoadResult load_gguf(const std::string& path, bool zero_copy /* = true */) {
   }
 
   GgufLoadResult res;
+  const std::unordered_set<std::string> skip_set(skip.begin(), skip.end());
 
   // 1. metadata KVs (must be fully consumed before tensor infos so gguflib
   //    positions ctx->off at the tensor-info section).
@@ -690,6 +694,13 @@ GgufLoadResult load_gguf(const std::string& path, bool zero_copy /* = true */) {
       native_shape.push_back(static_cast<int64_t>(tensor.dim[i]));
     }
     res.tensor_shapes.emplace_back(name, std::move(native_shape));
+
+    if (!skip_set.empty() && skip_set.count(name)) {
+      if (const KQuantCodec* codec = gguf_type_to_kquant_codec(tensor.type)) {
+        res.codecs.emplace_back(name, codec->name);
+      }
+      continue;
+    }
 
     if (const KQuantCodec* codec = gguf_type_to_kquant_codec(tensor.type)) {
       load_block_tensor(

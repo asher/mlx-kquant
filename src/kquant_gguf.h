@@ -60,7 +60,15 @@ struct GgufLoadResult {
 // be wrapped no-copy (unaligned window, >INT32_MAX elements) falls back to the
 // eager-memcpy constructor. When `zero_copy` is false every tensor is memcpy'd
 // (the original ~15 GB/s path) and the mmap is closed before returning.
-GgufLoadResult load_gguf(const std::string& path, bool zero_copy = true);
+//
+// Tensors named in `skip` get no array. Their shape and codec are still
+// reported, so a caller that reads such a tensor itself (a lookup table past
+// the device max buffer length, which no MTLBuffer can hold) keeps the
+// geometry it needs. A skipped tensor may also have an unsupported type.
+GgufLoadResult load_gguf(
+    const std::string& path,
+    bool zero_copy = true,
+    const std::vector<std::string>& skip = {});
 
 // Number of live zero-copy tensor views (registered mmap tensor ranges).
 size_t zero_copy_view_count();

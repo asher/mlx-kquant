@@ -2201,12 +2201,14 @@ NB_MODULE(_ext, m) {
   // --- GGUF loader ---
   m.def(
       "load_gguf",
-      [](const std::string& path, bool zero_copy) {
+      [](const std::string& path,
+         bool zero_copy,
+         const std::vector<std::string>& skip) {
         // Parse + mmap wrap can take seconds per shard; without the GIL
         // released a background load freezes the interpreter's UI threads.
         mlx_kquant::GgufLoadResult res = [&] {
           nb::gil_scoped_release nogil;
-          return mlx_kquant::load_gguf(path, zero_copy);
+          return mlx_kquant::load_gguf(path, zero_copy, skip);
         }();
 
         nb::dict arrays;
@@ -2229,6 +2231,7 @@ NB_MODULE(_ext, m) {
       },
       "path"_a,
       "zero_copy"_a = true,
+      "skip"_a = std::vector<std::string>{},
       R"(
         Load a GGUF file's tensors and metadata directly from gguflib's mmap.
 
@@ -2242,6 +2245,10 @@ NB_MODULE(_ext, m) {
         Args:
             path (str): GGUF file path.
             zero_copy (bool): view the mmap instead of copying (default True).
+            skip (list[str]): tensor names to load no array for. Their shape
+                and codec are still reported. Use it for a tensor the caller
+                reads itself, such as a lookup table past the device max
+                buffer length, which no MTLBuffer can hold.
 
         Returns:
             tuple[dict, dict, dict, dict]: ``(arrays, codecs, metadata, shapes)``:
