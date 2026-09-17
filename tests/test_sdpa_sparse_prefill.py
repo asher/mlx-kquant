@@ -262,3 +262,41 @@ def test_validation():
         kq.sdpa_sparse_prefill(
             q, win, pool, idx, 0.1, 4, sel_mask=mx.zeros((1, 7), mx.bool_)
         )
+
+
+@pytest.mark.parametrize("B", [1, 2])
+def test_strided_window_and_pool_match_contiguous(B):
+    """Prefix slices of larger buffers pass by stride; a transposed view
+    with a non-unit feature stride is copied at eval. All match exactly."""
+    args, _ = _case(
+        B,
+        64,
+        100,
+        128,
+        140,
+        700,
+        512,
+        128,
+        mx.float16,
+        np.int32,
+        sinks=True,
+        mask=True,
+        pad=True,
+    )
+    q, win, pool, idx, scale, band, kw = args
+    want = kq.sdpa_sparse_prefill(q, win, pool, idx, scale, band, **kw)
+    _, _, S, D = win.shape
+    P = pool.shape[1]
+
+    def z(*s):
+        return mx.zeros(s, dtype=pool.dtype)
+
+    wbuf = mx.concatenate([win, z(B, 1, 64, D)], axis=2)
+    pbuf = mx.concatenate([z(B, 5, D), pool, z(B, 300, D)], axis=1)
+    pt = mx.array(np.ascontiguousarray(np.swapaxes(np.array(pool), 1, 2)))
+    for w, p in [
+        (wbuf[:, :, :S], pbuf[:, 5 : 5 + P]),
+        (win, mx.swapaxes(pt, 1, 2)),
+    ]:
+        got = kq.sdpa_sparse_prefill(q, w, p, idx, scale, band, **kw)
+        assert mx.array_equal(got, want).item()

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -32,6 +33,20 @@ constexpr int kMaxSplits = 32;
 // Queries per call: a batch dimension of the grid, bounded by the f32
 // partials [B, L, splits, Hp, D] the merge reads back.
 constexpr int kMaxQueries = 4096;
+
+// A window [B, 1, S, D] or pool [B, P, D] as [B, rows * D]. The kernels
+// address rows D apart from a per-batch base.
+mx::array rows_flat(const mx::array& a, const char* op, mx::StreamOrDevice s) {
+  const int nd = a.ndim();
+  const int64_t rows = a.shape(nd - 2);
+  const int64_t flat = rows * a.shape(nd - 1);
+  if (flat > std::numeric_limits<int>::max()) {
+    throw std::invalid_argument(
+        std::string(op) +
+        " window or pool exceeds INT32_MAX elements per batch.");
+  }
+  return mx::reshape(a, {a.shape(0), static_cast<int>(flat)}, s);
+}
 } // namespace
 
 #ifdef _METAL_
@@ -41,10 +56,11 @@ void KQSdpaSparseDecode::eval_gpu(
     std::vector<mx::array>& outputs) {
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
+  auto& ce = mx::metal::get_command_encoder(s);
 
   const auto& q = inputs[0];
-  const auto& win = inputs[1];
-  const auto& pool = inputs[2];
+  const auto& win = inputs[1]; // [B|1, W * D], rows D apart
+  const auto& pool = inputs[2]; // [B|1, P * D], rows D apart
   const auto& idx = inputs[3];
   size_t next = 4;
   const mx::array* sinks = has_sinks_ ? &inputs[next++] : nullptr;
@@ -57,8 +73,8 @@ void KQSdpaSparseDecode::eval_gpu(
   const int H = q.shape(1);
   const int L = q.shape(2);
   const int D = q.shape(3);
-  const int W = win.shape(2);
-  const int P = pool.shape(1);
+  const int W = win.shape(1) / D;
+  const int P = pool.shape(1) / D;
   const int N = idx.shape(2);
   const int total = W + N;
 
@@ -113,9 +129,9 @@ void KQSdpaSparseDecode::eval_gpu(
   params.q_strides[1] = q.strides(1);
   params.q_strides[2] = q.strides(2);
   params.win_strides[0] = bcast(win, 0);
-  params.win_strides[1] = win.strides(2);
+  params.win_strides[1] = D;
   params.pool_strides[0] = bcast(pool, 0);
-  params.pool_strides[1] = pool.strides(1);
+  params.pool_strides[1] = D;
   params.idx_strides[0] = bcast(idx, 0);
   params.idx_strides[1] = idx.strides(1);
   if (wmask) {
@@ -130,7 +146,6 @@ void KQSdpaSparseDecode::eval_gpu(
   params.o_strides[1] = o.strides(1);
   params.o_strides[2] = o.strides(2);
 
-  auto& ce = mx::metal::get_command_encoder(s);
   const std::string ts = kq_type_string(q.dtype());
   const std::string is = idx.dtype() == mx::int32 ? "i32" : "u32";
   const std::string dtag = "_d" + std::to_string(D);
@@ -277,11 +292,15 @@ mx::array sdpa_sparse_decode(
         std::string(op) + " splits must be in [0, 32].");
   }
 
-  // Unit stride on the feature axis: force contiguity rather than trusting
-  // pre-eval flags (Contiguous donates when the input already is).
+  // q and idx: force contiguity rather than trusting pre-eval flags
+  // (Contiguous donates when the input already is). The window and pool
+  // go through a reshape to [B, rows * D] instead: a cache's prefix slice
+  // is a row-contiguous view, which Reshape keeps as a view at eval while
+  // Contiguous would copy it (its buffer is larger than the view), and
+  // any other layout Reshape copies.
   auto q_c = mx::contiguous(q, false, s);
-  auto win_c = mx::contiguous(mx::astype(window, dt, s), false, s);
-  auto pool_c = mx::contiguous(mx::astype(pool, dt, s), false, s);
+  auto win_c = rows_flat(mx::astype(window, dt, s), op, s);
+  auto pool_c = rows_flat(mx::astype(pool, dt, s), op, s);
   auto idx_c = mx::contiguous(idx, false, s);
   std::vector<mx::array> inputs = {
       std::move(q_c), std::move(win_c), std::move(pool_c), std::move(idx_c)};
@@ -373,10 +392,11 @@ void KQSdpaSparsePrefill::eval_gpu(
     std::vector<mx::array>& outputs) {
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
+  auto& ce = mx::metal::get_command_encoder(s);
 
   const auto& q = inputs[0];
-  const auto& win = inputs[1];
-  const auto& pool = inputs[2];
+  const auto& win = inputs[1]; // [B|1, S * D], rows D apart
+  const auto& pool = inputs[2]; // [B|1, P * D], rows D apart
   const auto& idx = inputs[3];
   size_t next = 4;
   const mx::array* sinks = has_sinks_ ? &inputs[next++] : nullptr;
@@ -388,8 +408,8 @@ void KQSdpaSparsePrefill::eval_gpu(
   const int H = q.shape(1);
   const int L = q.shape(2);
   const int D = q.shape(3);
-  const int S = win.shape(2);
-  const int P = pool.shape(1);
+  const int S = win.shape(1) / D;
+  const int P = pool.shape(1) / D;
   const int N = idx.shape(2);
   const PrefillCfg cfg = prefill_cfg(D);
   const int hgroups = (H + cfg.hg - 1) / cfg.hg;
@@ -413,9 +433,9 @@ void KQSdpaSparsePrefill::eval_gpu(
   params.q_strides[1] = q.strides(1);
   params.q_strides[2] = q.strides(2);
   params.win_strides[0] = bcast(win, 0);
-  params.win_strides[1] = win.strides(2);
+  params.win_strides[1] = D;
   params.pool_strides[0] = bcast(pool, 0);
-  params.pool_strides[1] = pool.strides(1);
+  params.pool_strides[1] = D;
   params.idx_strides[0] = bcast(idx, 0);
   params.idx_strides[1] = idx.strides(1);
   if (smask) {
@@ -426,7 +446,6 @@ void KQSdpaSparsePrefill::eval_gpu(
   params.o_strides[1] = o.strides(1);
   params.o_strides[2] = o.strides(2);
 
-  auto& ce = mx::metal::get_command_encoder(s);
   const std::string ts = kq_type_string(q.dtype());
   const std::string is = idx.dtype() == mx::int32 ? "i32" : "u32";
   auto kernel = kq_get_kernel(
@@ -534,9 +553,10 @@ mx::array sdpa_sparse_prefill(
         std::string(op) + " q must be float16 or bfloat16.");
   }
 
+  // As in sdpa_sparse_decode: the window and pool pass as row views.
   auto q_c = mx::contiguous(q, false, s);
-  auto win_c = mx::contiguous(mx::astype(window, dt, s), false, s);
-  auto pool_c = mx::contiguous(mx::astype(pool, dt, s), false, s);
+  auto win_c = rows_flat(mx::astype(window, dt, s), op, s);
+  auto pool_c = rows_flat(mx::astype(pool, dt, s), op, s);
   auto idx_c = mx::contiguous(idx, false, s);
   std::vector<mx::array> inputs = {
       std::move(q_c), std::move(win_c), std::move(pool_c), std::move(idx_c)};

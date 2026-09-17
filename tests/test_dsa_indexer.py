@@ -371,3 +371,21 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+@pytest.mark.parametrize("B", [1, 2])
+def test_dsa_indexer_score_decode_strided_keys_match(B):
+    """A cache's prefix slice of the key buffer passes as a view at B == 1;
+    at B > 1 the batch stride differs from P * D and the op copies. A
+    transposed view (feature stride not 1) is copied too. All match."""
+    QL, P = 2, 1027
+    q, k, w = _make_decode_qkw(B, QL, P, mx.float16, seed=31)
+    want = kq.dsa_indexer_score_decode(q, k, w, 4106, 4)
+    kbuf = mx.concatenate(
+        [mx.zeros((B, 5, D), dtype=k.dtype), k, mx.zeros((B, 300, D), dtype=k.dtype)],
+        axis=1,
+    )
+    kt = mx.array(np.ascontiguousarray(np.swapaxes(np.array(k), 1, 2)))
+    for keys in (kbuf[:, 5 : 5 + P], mx.swapaxes(kt, 1, 2)):
+        got = kq.dsa_indexer_score_decode(q, keys, w, 4106, 4)
+        assert mx.array_equal(got, want).item()

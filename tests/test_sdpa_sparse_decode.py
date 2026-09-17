@@ -213,3 +213,48 @@ def test_validation():
         )
     with pytest.raises(ValueError, match="splits"):
         kq.sdpa_sparse_decode(q, win, pool, idx, 0.1, splits=40)
+
+
+def _strided_variants(win, pool):
+    """The layouts a caller may hand over: prefix slices of larger buffers
+    (with and without a leading offset), which the eval addresses by
+    stride, and a transposed view with a non-unit feature stride, which
+    it copies at eval."""
+    B, _, W, D = win.shape
+    P = pool.shape[1]
+
+    def z(*s):
+        return mx.zeros(s, dtype=pool.dtype)
+
+    wbuf = mx.concatenate([win, z(B, 1, 64, D)], axis=2)
+    pbuf = mx.concatenate([pool, z(B, 300, D)], axis=1)
+    pbuf2 = mx.concatenate([z(B, 5, D), pool, z(B, 11, D)], axis=1)
+    pt = mx.array(np.ascontiguousarray(np.swapaxes(np.array(pool), 1, 2)))
+    return [
+        (wbuf[:, :, :W], pbuf[:, :P]),
+        (win, pbuf2[:, 5 : 5 + P]),
+        (win, mx.swapaxes(pt, 1, 2)),
+    ]
+
+
+@pytest.mark.parametrize("B", [1, 2])
+def test_strided_window_and_pool_match_contiguous(B):
+    args, _ = _case(
+        B,
+        64,
+        2,
+        128,
+        128,
+        700,
+        512,
+        mx.float16,
+        np.int32,
+        sinks=True,
+        masks=True,
+        pad=True,
+    )
+    q, win, pool, idx, scale, kw = args
+    want = kq.sdpa_sparse_decode(q, win, pool, idx, scale, **kw)
+    for w, p in _strided_variants(win, pool):
+        got = kq.sdpa_sparse_decode(q, w, p, idx, scale, **kw)
+        assert mx.array_equal(got, want).item()

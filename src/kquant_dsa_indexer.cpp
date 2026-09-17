@@ -227,9 +227,10 @@ void KQDsaIndexerScoreDecode::eval_gpu(
     std::vector<mx::array>& outputs) {
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
+  auto& ce = mx::metal::get_command_encoder(s);
 
   const auto& q = inputs[0];
-  const auto& k = inputs[1];
+  const auto& k = inputs[1]; // [B, P * D], the row-major key block
   const auto& weights = inputs[2];
   auto& out = outputs[0];
 
@@ -241,7 +242,7 @@ void KQDsaIndexerScoreDecode::eval_gpu(
   const int B = q.shape(0);
   const int H = q.shape(1);
   const int QL = q.shape(2);
-  const int P = k.shape(1);
+  const int P = k.shape(1) / q.shape(3);
 
   const bool wf = weights.dtype() == mx::float32;
   const std::string kname = "kq_dsa_indexer_score_decode_" +
@@ -250,7 +251,6 @@ void KQDsaIndexerScoreDecode::eval_gpu(
       std::to_string(QL);
 
   auto kernel = kq_get_kernel(d, kname, kname, {});
-  auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
 
   ce.set_input_array(q, 0);
@@ -485,9 +485,20 @@ mx::array dsa_indexer_score_decode(
   }
 
   // See dsa_indexer_scores: pre-eval flags are unreliable, contiguous is
-  // a no-op at eval when the input already is.
+  // a no-op at eval when the input already is. At B == 1 the keys go
+  // through a reshape to [1, P * D] instead: a cache's prefix slice is a
+  // row-contiguous view that Reshape keeps as a view at eval, while
+  // Contiguous would copy it (its buffer is larger than the view); any
+  // other layout Reshape copies. The kernel steps batches by P * D, so a
+  // batch of slices still needs the contiguous copy.
   auto q = mx::contiguous(mx::astype(queries, final_type, s), false, s);
-  auto k = mx::contiguous(mx::astype(keys, final_type, s), false, s);
+  auto k = mx::reshape(
+      mx::astype(keys, final_type, s),
+      {keys.shape(0), keys.shape(1) * keys.shape(2)},
+      s);
+  if (keys.shape(0) > 1) {
+    k = mx::contiguous(k, false, s);
+  }
   auto w = mx::contiguous(
       mx::astype(weights, weights_f32 ? mx::float32 : final_type, s), false, s);
 
