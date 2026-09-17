@@ -341,25 +341,26 @@ kq_dsa_indexer_score(
   }
 }
 
-// Decode-width direct score: sum_h relu(q[h, j] . k[r]) * w[j, h] for
-// QL <= 4 query rows against every pooled row, one simdgroup per R-row
-// group, never materializing the [H, P] per-head scores. Each lane holds
-// one half4 of each key row; q rows stream from device (L2-resident) and
-// are shared across the group's R rows. Pooled visibility follows
-// PoolingCache.make_mask: row r is visible to query j iff
-// r < (q_offset + j + 1) / ratio, and every row is visible when QL == 1;
-// invisible rows score the dtype's finite min so the radix top-k orders
-// them last (matching the inline path's masked argpartition). WT is the
-// head-weight storage type: fp32 keeps sign-free head gates exact for the
-// runtimes that pin them (glm5), the dot and accumulation are fp32 either
-// way.
+// Decode-width score: sum_h relu(q[h, j] . k[r]) * w[j, h] for QL <= 4
+// query rows against every pooled row, never materializing the [H, P]
+// per-head scores. Each threadgroup stages the query block for one row j
+// in threadgroup memory and streams its key range in NB x 8 row blocks:
+// S[heads, keys] = Q K^T over 8x8 tiles, relu, then the weighted head sum
+// is one more tile product with the head weights in row 0 of an otherwise
+// zero tile, so row 0 of the accumulator holds the scores. The keys are
+// the only DRAM traffic; H below 8 is padded with zero rows. Pooled
+// visibility follows PoolingCache.make_mask: row r is visible to query j
+// iff r < (q_offset + j + 1) / ratio, and every row is visible when
+// QL == 1; invisible rows score the dtype's finite min so the radix top-k
+// orders them last. WT is the head-weight storage type: fp32 keeps
+// sign-free head gates exact for the runtimes that pin them (glm5).
 template <
     typename T,
     int QL,
     int H = 64,
     int D = 128,
-    int SGS = 4,
-    int R = 8,
+    int SGS = 8,
+    int NB = 1,
     typename WT = T>
 [[kernel, max_total_threads_per_threadgroup(SGS * 32)]] void
 kq_dsa_indexer_score_decode(
@@ -370,64 +371,150 @@ kq_dsa_indexer_score_decode(
     const constant int& P [[buffer(4)]],
     const constant int& q_offset [[buffer(5)]],
     const constant int& ratio [[buffer(6)]],
+    const constant int& keys_per_tg [[buffer(7)]],
     uint3 tid [[threadgroup_position_in_grid]],
     ushort simd_gid [[simdgroup_index_in_threadgroup]],
     ushort simd_lid [[thread_index_in_simdgroup]]) {
-  static_assert(D == 4 * 32, "one half4 of the key row per lane");
+  using MatT = metal::simdgroup_matrix<T, 8, 8>;
+  using MatF = metal::simdgroup_matrix<float, 8, 8>;
+  constexpr int NHT = (H + 7) / 8;
+  constexpr int HP = NHT * 8;
+  constexpr int NDT = D / 8;
+  constexpr int CH = D / 8; // 8-wide chunks per row
+  constexpr int LD = D + 8; // padded row (bank spread, 16-byte aligned)
+  constexpr int KB = NB * 8;
+  constexpr int NTH = SGS * 32;
+
+  threadgroup T Qs[HP * LD];
+  threadgroup float Wsm[NHT * 64];
+  threadgroup T Ktail[KB * LD];
+  threadgroup float Os[SGS * 64];
 
   const int b = int(tid.z);
-  const int row0 = (int(tid.x) * SGS + int(simd_gid)) * R;
-  if (row0 >= P) {
+  const int tg0 = int(tid.x) * keys_per_tg;
+  if (tg0 >= P) {
     return;
   }
-  const int nrows = metal::min(R, P - row0);
+  const int tg1 = metal::min(P, tg0 + keys_per_tg);
+  const int nblk = (tg1 - tg0 + KB - 1) / KB;
+  const int tidx = int(simd_gid) * 32 + int(simd_lid);
 
-  const device T* kb = K + (size_t(b) * P + size_t(row0)) * D + simd_lid * 4;
-  vec<T, 4> kf[R];
-  STEEL_PRAGMA_UNROLL
-  for (int i = 0; i < R; ++i) {
-    kf[i] = i < nrows
-        ? *reinterpret_cast<const device vec<T, 4>*>(kb + size_t(i) * D)
-        : vec<T, 4>(0);
-  }
-
-  float acc[R][QL];
-  STEEL_PRAGMA_UNROLL
-  for (int i = 0; i < R; ++i) {
-    STEEL_PRAGMA_UNROLL
-    for (int j = 0; j < QL; ++j) {
-      acc[i][j] = 0.0f;
+  if (HP > H) {
+    for (int i = tidx; i < (HP - H) * LD; i += NTH) {
+      Qs[H * LD + i] = T(0);
     }
   }
 
-  const device T* qb = Q + size_t(b) * H * QL * D + simd_lid * 4;
+  const device T* qb = Q + size_t(b) * H * QL * D;
   const device WT* wb = W + size_t(b) * QL * H;
-  for (int h = 0; h < H; ++h) {
-    STEEL_PRAGMA_UNROLL
-    for (int j = 0; j < QL; ++j) {
-      const float4 qf = float4(*reinterpret_cast<const device vec<T, 4>*>(
-          qb + (size_t(h) * QL + j) * D));
-      const float w = float(wb[size_t(j) * H + h]);
-      STEEL_PRAGMA_UNROLL
-      for (int i = 0; i < R; ++i) {
-        const float dotv = simd_sum(metal::dot(qf, float4(kf[i])));
-        acc[i][j] += metal::max(dotv, 0.0f) * w;
-      }
-    }
-  }
+  const device T* kb = K + size_t(b) * size_t(P) * D;
+  device T* ob = out + size_t(b) * QL * size_t(P);
 
-  if (simd_lid != 0) {
-    return;
-  }
-  device T* ob = out + size_t(b) * QL * size_t(P) + row0;
-  STEEL_PRAGMA_UNROLL
   for (int j = 0; j < QL; ++j) {
-    const int vlim = QL == 1 ? P : metal::min(P, (q_offset + j + 1) / ratio);
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    for (int c = tidx; c < H * CH; c += NTH) {
+      const int h = c / CH;
+      const int d = (c % CH) * 8;
+      *reinterpret_cast<threadgroup vec<T, 8>*>(Qs + h * LD + d) =
+          *reinterpret_cast<const device vec<T, 8>*>(
+              qb + (size_t(h) * QL + j) * D + d);
+    }
+    for (int i = tidx; i < NHT * 64; i += NTH) {
+      const int r = (i % 64) / 8;
+      const int h = (i / 64) * 8 + (i % 8);
+      Wsm[i] = (r == 0 && h < H) ? float(wb[size_t(j) * H + h]) : 0.0f;
+    }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+    MatF Wf[NHT];
     STEEL_PRAGMA_UNROLL
-    for (int i = 0; i < R; ++i) {
-      if (i < nrows) {
-        ob[size_t(j) * P + i] =
-            row0 + i < vlim ? static_cast<T>(acc[i][j]) : Limits<T>::finite_min;
+    for (int ht = 0; ht < NHT; ++ht) {
+      simdgroup_load(Wf[ht], Wsm + ht * 64, 8);
+    }
+    const int vlim = QL == 1 ? P : metal::min(P, (q_offset + j + 1) / ratio);
+
+    for (int blk = int(simd_gid); blk < nblk; blk += SGS) {
+      const int key0 = tg0 + blk * KB;
+      MatT Kt[NB][NDT];
+      if (key0 + KB <= P) {
+        STEEL_PRAGMA_UNROLL
+        for (int nb = 0; nb < NB; ++nb) {
+          const device T* kr = kb + size_t(key0 + nb * 8) * D;
+          STEEL_PRAGMA_UNROLL
+          for (int dt = 0; dt < NDT; ++dt) {
+            simdgroup_load(Kt[nb][dt], kr + dt * 8, D, ulong2(0, 0), true);
+          }
+        }
+      } else {
+        // Only the last block of the pool lands here: stage it with zero
+        // rows past P so the tile loads stay in bounds.
+        for (int c = int(simd_lid); c < KB * CH; c += 32) {
+          const int r = c / CH;
+          const int d = (c % CH) * 8;
+          *reinterpret_cast<threadgroup vec<T, 8>*>(Ktail + r * LD + d) =
+              key0 + r < P ? *reinterpret_cast<const device vec<T, 8>*>(
+                                 kb + size_t(key0 + r) * D + d)
+                           : vec<T, 8>(0);
+        }
+        simdgroup_barrier(metal::mem_flags::mem_threadgroup);
+        STEEL_PRAGMA_UNROLL
+        for (int nb = 0; nb < NB; ++nb) {
+          STEEL_PRAGMA_UNROLL
+          for (int dt = 0; dt < NDT; ++dt) {
+            simdgroup_load(
+                Kt[nb][dt],
+                Ktail + nb * 8 * LD + dt * 8,
+                LD,
+                ulong2(0, 0),
+                true);
+          }
+        }
+      }
+
+      MatF acc[NB];
+      STEEL_PRAGMA_UNROLL
+      for (int nb = 0; nb < NB; ++nb) {
+        acc[nb] = MatF(0.0f);
+      }
+      STEEL_PRAGMA_UNROLL
+      for (int ht = 0; ht < NHT; ++ht) {
+        MatF St[NB];
+        STEEL_PRAGMA_UNROLL
+        for (int nb = 0; nb < NB; ++nb) {
+          St[nb] = MatF(0.0f);
+        }
+        STEEL_PRAGMA_UNROLL
+        for (int dt = 0; dt < NDT; ++dt) {
+          MatT Qt;
+          simdgroup_load(Qt, Qs + ht * 8 * LD + dt * 8, LD);
+          STEEL_PRAGMA_UNROLL
+          for (int nb = 0; nb < NB; ++nb) {
+            simdgroup_multiply_accumulate(St[nb], Qt, Kt[nb][dt], St[nb]);
+          }
+        }
+        STEEL_PRAGMA_UNROLL
+        for (int nb = 0; nb < NB; ++nb) {
+          St[nb].thread_elements()[0] =
+              metal::max(St[nb].thread_elements()[0], 0.0f);
+          St[nb].thread_elements()[1] =
+              metal::max(St[nb].thread_elements()[1], 0.0f);
+          simdgroup_multiply_accumulate(acc[nb], Wf[ht], St[nb], acc[nb]);
+        }
+      }
+
+      threadgroup float* os = Os + int(simd_gid) * 64;
+      STEEL_PRAGMA_UNROLL
+      for (int nb = 0; nb < NB; ++nb) {
+        simdgroup_store(acc[nb], os, 8);
+        simdgroup_barrier(metal::mem_flags::mem_threadgroup);
+        if (simd_lid < 8) {
+          const int r = key0 + nb * 8 + int(simd_lid);
+          if (r < P) {
+            ob[size_t(j) * P + r] =
+                r < vlim ? static_cast<T>(os[simd_lid]) : Limits<T>::finite_min;
+          }
+        }
+        simdgroup_barrier(metal::mem_flags::mem_threadgroup);
       }
     }
   }

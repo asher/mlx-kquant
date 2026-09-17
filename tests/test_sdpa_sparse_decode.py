@@ -237,6 +237,113 @@ def _strided_variants(win, pool):
     ]
 
 
+def _on_grid_pool(pool):
+    """The pool snapped to the latent FP4 grid (fp16), so the packed form
+    reproduces it bit-for-bit."""
+    v = np.array(pool.astype(mx.float32))
+    g = v.reshape(*v.shape[:-1], -1, 16)
+    amax = np.maximum(np.abs(g).max(-1, keepdims=True), 6.0 * 2.0**-9)
+    e = np.clip(np.floor(np.log2(amax / 6.0)), -6.0, 8.0)
+    q = 2.0 ** (e - 3.0)
+    scale = np.round(amax / 6.0 / q) * q
+    c = np.clip(g / scale, -6.0, 6.0)
+    a = np.abs(c)
+    m = np.where(
+        a <= 0.25,
+        0.0,
+        np.where(
+            a < 0.75,
+            0.5,
+            np.where(
+                a <= 1.25,
+                1.0,
+                np.where(
+                    a < 1.75,
+                    1.5,
+                    np.where(
+                        a <= 2.5,
+                        2.0,
+                        np.where(a < 3.5, 3.0, np.where(a <= 5.0, 4.0, 6.0)),
+                    ),
+                ),
+            ),
+        ),
+    )
+    return mx.array((np.sign(c) * m * scale).reshape(v.shape)).astype(mx.float16)
+
+
+@pytest.mark.parametrize("D", [128, 512])
+@pytest.mark.parametrize("B,L,splits", [(1, 1, 0), (2, 3, 4), (1, 40, 1)])
+def test_packed_pool_matches_fp16_pool(D, B, L, splits):
+    args, _ = _case(
+        B,
+        16,
+        L,
+        D,
+        24,
+        300,
+        40,
+        mx.float16,
+        np.int32,
+        sinks=True,
+        masks=True,
+        pad=True,
+        seed=D + L,
+    )
+    q, win, pool, idx, scale, kw = args
+    pool = _on_grid_pool(pool)
+    codes, scales = kq.latent_fp4_pack(pool)
+    assert mx.array_equal(kq.latent_fp4_unpack(codes, scales), pool).item()
+    want = kq.sdpa_sparse_decode(q, win, pool, idx, scale, splits=splits, **kw)
+    got = kq.sdpa_sparse_decode(
+        q, win, codes, idx, scale, splits=splits, pool_scales=scales, **kw
+    )
+    assert mx.array_equal(got, want).item()
+    # A prefix slice of a larger packed buffer passes by stride as well.
+    P = pool.shape[1]
+    cbuf = mx.concatenate([codes, mx.zeros((B, 100, D // 2), mx.uint8)], axis=1)
+    sbuf = mx.concatenate([scales, mx.zeros((B, 100, D // 16), mx.uint8)], axis=1)
+    got = kq.sdpa_sparse_decode(
+        q,
+        win,
+        cbuf[:, :P],
+        idx,
+        scale,
+        splits=splits,
+        pool_scales=sbuf[:, :P],
+        **kw,
+    )
+    assert mx.array_equal(got, want).item()
+
+
+def test_packed_pool_without_window_rows():
+    args, _ = _case(
+        1,
+        8,
+        2,
+        256,
+        0,
+        64,
+        16,
+        mx.float16,
+        np.int32,
+        sinks=False,
+        masks=False,
+        pad=True,
+        seed=11,
+    )
+    q, win, pool, idx, scale, kw = args
+    pool = _on_grid_pool(pool)
+    codes, scales = kq.latent_fp4_pack(pool)
+    want = kq.sdpa_sparse_decode(q, win, pool, idx, scale)
+    got = kq.sdpa_sparse_decode(q, win, codes, idx, scale, pool_scales=scales)
+    assert mx.array_equal(got, want).item()
+    with pytest.raises(ValueError, match="packed pool"):
+        kq.sdpa_sparse_decode(q, win, codes, idx, scale, pool_scales=scales[:, :, :1])
+    with pytest.raises(ValueError, match="packed pool"):
+        kq.sdpa_sparse_decode(q, win, pool, idx, scale, pool_scales=scales)
+
+
 @pytest.mark.parametrize("B", [1, 2])
 def test_strided_window_and_pool_match_contiguous(B):
     args, _ = _case(

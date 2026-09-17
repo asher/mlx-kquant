@@ -13,19 +13,22 @@
 // weigh zero, which matches an additive -inf mask without inf arithmetic.
 // A lone split (p->direct) normalizes in place, sinks included, and writes
 // the output rows itself; otherwise the merge kernel renormalizes the split
-// partials with the head's sink counted once.
+// partials with the head's sink counted once. PK reads the pool in the
+// latent_fp4_pack form (Pool holds the code bytes, PoolScales the scale
+// bytes) and dequantizes each row chunk as it stages.
 #pragma once
 
 #include <metal_simdgroup>
 #include <metal_simdgroup_matrix>
 
+#include "mlx/backend/metal/kernels/kq_latent_fp4.h"
 #include "mlx/backend/metal/kernels/kq_sdpa_sparse_decode_params.h"
 
 constant constexpr float kSdpaSparseNegBig = -1e30f;
 
 #define KQ_UNROLL _Pragma("clang loop unroll(full)")
 
-template <typename T, typename IdxT, int D, int HG>
+template <typename T, typename IdxT, int D, int HG, bool PK>
 [[kernel]] void kq_sdpa_sparse_decode_split(
     const device T* Q [[buffer(0)]],
     const device T* Win [[buffer(1)]],
@@ -39,6 +42,7 @@ template <typename T, typename IdxT, int D, int HG>
     const constant KQSdpaSparseDecodeParams* p [[buffer(9)]],
     const device T* Sinks [[buffer(10)]],
     device T* O [[buffer(11)]],
+    const device uchar* PoolScales [[buffer(12)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
@@ -113,6 +117,10 @@ template <typename T, typename IdxT, int D, int HG>
   const int k1 = metal::min(total, k0 + p->keys_per_split);
   const device T* win_b = Win + size_t(b) * p->win_strides[0];
   const device T* pool_b = Pool + size_t(b) * p->pool_strides[0];
+  const device uchar* pool_c = reinterpret_cast<const device uchar*>(Pool) +
+      size_t(b) * (p->pool_strides[0] / 2);
+  const device uchar* pool_s =
+      PoolScales + size_t(b) * (p->pool_strides[0] / 16);
   const device IdxT* idx_bl =
       Idx + size_t(b) * p->idx_strides[0] + size_t(l) * p->idx_strides[1];
   const device bool* wm = p->has_win_mask
@@ -124,48 +132,74 @@ template <typename T, typename IdxT, int D, int HG>
           size_t(l) * p->sel_mask_strides[1]
       : nullptr;
   // Dead slots stage a row that exists so every load stays unconditional.
-  const device T* safe_row = W > 0 ? win_b : pool_b;
+  const bool safe_pk = PK && W == 0;
+  const device T* safe_row = W > 0 ? win_b
+      : PK                         ? reinterpret_cast<const device T*>(pool_c)
+                                   : pool_b;
   const float sl2 = p->scale_log2;
 
-  // Rows of block j0 (uniform across the threadgroup) into registers.
+  // Rows of block j0 (uniform across the threadgroup) into registers: a
+  // 16-byte chunk of T, or (PK) its code word in .x and scale byte in .y.
   uint4 pre[SV];
+  bool pkf[SV];
   int okbits = 0;
-#define KQ_SPARSE_FETCH(j0)                                                \
-  {                                                                        \
-    const device T* rows[KB];                                              \
-    okbits = 0;                                                            \
-    KQ_UNROLL                                                              \
-    for (int k = 0; k < KB; ++k) {                                         \
-      const int j = (j0) + k;                                              \
-      bool v = j < k1;                                                     \
-      const device T* row = safe_row;                                      \
-      if (v) {                                                             \
-        if (j < W) {                                                       \
-          v = (wm == nullptr) || wm[j];                                    \
-          row = win_b + size_t(j) * p->win_strides[1];                     \
-        } else {                                                           \
-          const int n = j - W;                                             \
-          v = (sm == nullptr) || sm[n];                                    \
-          if (v) {                                                         \
-            const int64_t r = int64_t(idx_bl[n]);                          \
-            v = r >= 0 && r < int64_t(p->P);                               \
-            if (v) {                                                       \
-              row = pool_b + size_t(r) * p->pool_strides[1];               \
-            }                                                              \
-          }                                                                \
-        }                                                                  \
-      }                                                                    \
-      okbits |= int(v) << k;                                               \
-      rows[k] = row;                                                       \
-    }                                                                      \
-    KQ_UNROLL                                                              \
-    for (int i = 0; i < SV; ++i) {                                         \
-      const int v = tix + i * NTH;                                         \
-      if (v < KB * CHR) {                                                  \
-        pre[i] =                                                           \
-            reinterpret_cast<const device uint4*>(rows[v / CHR])[v % CHR]; \
-      }                                                                    \
-    }                                                                      \
+#define KQ_SPARSE_FETCH(j0)                                            \
+  {                                                                    \
+    const device T* rows[KB];                                          \
+    const device uchar* srows[KB];                                     \
+    int pkbits = 0;                                                    \
+    okbits = 0;                                                        \
+    KQ_UNROLL                                                          \
+    for (int k = 0; k < KB; ++k) {                                     \
+      const int j = (j0) + k;                                          \
+      bool v = j < k1;                                                 \
+      const device T* row = safe_row;                                  \
+      const device uchar* srow = pool_s;                               \
+      bool pk = safe_pk;                                               \
+      if (v) {                                                         \
+        if (j < W) {                                                   \
+          v = (wm == nullptr) || wm[j];                                \
+          row = win_b + size_t(j) * p->win_strides[1];                 \
+          pk = false;                                                  \
+        } else {                                                       \
+          const int n = j - W;                                         \
+          v = (sm == nullptr) || sm[n];                                \
+          if (v) {                                                     \
+            const int64_t r = int64_t(idx_bl[n]);                      \
+            v = r >= 0 && r < int64_t(p->P);                           \
+            if (v) {                                                   \
+              if (PK) {                                                \
+                row = reinterpret_cast<const device T*>(               \
+                    pool_c + size_t(r) * (D / 2));                     \
+                srow = pool_s + size_t(r) * (D / 16);                  \
+                pk = true;                                             \
+              } else {                                                 \
+                row = pool_b + size_t(r) * p->pool_strides[1];         \
+              }                                                        \
+            }                                                          \
+          }                                                            \
+        }                                                              \
+      }                                                                \
+      okbits |= int(v) << k;                                           \
+      pkbits |= int(pk) << k;                                          \
+      rows[k] = row;                                                   \
+      srows[k] = srow;                                                 \
+    }                                                                  \
+    KQ_UNROLL                                                          \
+    for (int i = 0; i < SV; ++i) {                                     \
+      const int v = tix + i * NTH;                                     \
+      if (v < KB * CHR) {                                              \
+        const int k = v / CHR;                                         \
+        const int c = v % CHR;                                         \
+        pkf[i] = PK && ((pkbits >> k) & 1);                            \
+        if (pkf[i]) {                                                  \
+          pre[i].x = reinterpret_cast<const device uint*>(rows[k])[c]; \
+          pre[i].y = srows[k][c / 2];                                  \
+        } else {                                                       \
+          pre[i] = reinterpret_cast<const device uint4*>(rows[k])[c];  \
+        }                                                              \
+      }                                                                \
+    }                                                                  \
   }
 
   if (k0 < k1) {
@@ -176,8 +210,11 @@ template <typename T, typename IdxT, int D, int HG>
     for (int i = 0; i < SV; ++i) {
       const int v = tix + i * NTH;
       if (v < KB * CHR) {
+        const uint4 x = pkf[i] ? as_type<uint4>(kq_fp4_chunk8<T>(
+                                     pre[i].x, kq_fp4_e4m3_decode(pre[i].y)))
+                               : pre[i];
         *reinterpret_cast<threadgroup uint4*>(
-            Ks + (v / CHR) * LD + (v % CHR) * 8) = pre[i];
+            Ks + (v / CHR) * LD + (v % CHR) * 8) = x;
       }
     }
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -357,7 +394,7 @@ constant constexpr int kSdpaSparseDead = -2147483647 - 1;
 // addresses resolve once per pass into a threadgroup table (window rows as
 // ~row, pool rows as row, dead slots as kSdpaSparseDead), so a block fetch
 // reads the table instead of chasing the index and mask loads.
-template <typename T, typename IdxT, int D, int HG, int DS, int KB>
+template <typename T, typename IdxT, int D, int HG, int DS, int KB, bool PK>
 [[kernel]] void kq_sdpa_sparse_prefill(
     const device T* Q [[buffer(0)]],
     const device T* Win [[buffer(1)]],
@@ -367,6 +404,7 @@ template <typename T, typename IdxT, int D, int HG, int DS, int KB>
     const device T* Sinks [[buffer(5)]],
     device T* O [[buffer(6)]],
     const constant KQSdpaSparsePrefillParams* p [[buffer(7)]],
+    const device uchar* PoolScales [[buffer(8)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
@@ -444,6 +482,10 @@ template <typename T, typename IdxT, int D, int HG, int DS, int KB>
   const int total = Wl + p->N;
   const device T* win_b = Win + size_t(b) * p->win_strides[0];
   const device T* pool_b = Pool + size_t(b) * p->pool_strides[0];
+  const device uchar* pool_c = reinterpret_cast<const device uchar*>(Pool) +
+      size_t(b) * (p->pool_strides[0] / 2);
+  const device uchar* pool_s =
+      PoolScales + size_t(b) * (p->pool_strides[0] / 16);
   const device IdxT* idx_bl =
       Idx + size_t(b) * p->idx_strides[0] + size_t(l) * p->idx_strides[1];
   const device bool* sm = p->has_sel_mask
@@ -453,25 +495,35 @@ template <typename T, typename IdxT, int D, int HG, int DS, int KB>
   const float sl2 = p->scale_log2;
 
   // Rows of block j0 into registers through the table; dead slots stage
-  // window row 0 so every load stays unconditional.
+  // window row 0 so every load stays unconditional. A packed pool row
+  // lands as its code word in .x and scale byte in .y.
   uint4 pre[SV];
-#define KQ_SPARSE_PF_FETCH(j0)                                        \
-  {                                                                   \
-    KQ_UNROLL                                                         \
-    for (int i = 0; i < SV; ++i) {                                    \
-      const int v = tix + i * NTH;                                    \
-      if (v < KB * CHR) {                                             \
-        const int j = (j0) + v / CHR;                                 \
-        const int e = j < pe ? tab[j - pb] : DEAD;                    \
-        const device T* row = win_b;                                  \
-        if (e >= 0) {                                                 \
-          row = pool_b + size_t(e) * p->pool_strides[1];              \
-        } else if (e != DEAD) {                                       \
-          row = win_b + size_t(~e) * p->win_strides[1];               \
-        }                                                             \
-        pre[i] = reinterpret_cast<const device uint4*>(row)[v % CHR]; \
-      }                                                               \
-    }                                                                 \
+  bool pkf[SV];
+#define KQ_SPARSE_PF_FETCH(j0)                                    \
+  {                                                               \
+    KQ_UNROLL                                                     \
+    for (int i = 0; i < SV; ++i) {                                \
+      const int v = tix + i * NTH;                                \
+      if (v < KB * CHR) {                                         \
+        const int j = (j0) + v / CHR;                             \
+        const int c = v % CHR;                                    \
+        const int e = j < pe ? tab[j - pb] : DEAD;                \
+        pkf[i] = PK && e >= 0;                                    \
+        if (pkf[i]) {                                             \
+          pre[i].x = reinterpret_cast<const device uint*>(        \
+              pool_c + size_t(e) * (D / 2))[c];                   \
+          pre[i].y = pool_s[size_t(e) * (D / 16) + c / 2];        \
+        } else {                                                  \
+          const device T* row = win_b;                            \
+          if (e >= 0) {                                           \
+            row = pool_b + size_t(e) * p->pool_strides[1];        \
+          } else if (e != DEAD) {                                 \
+            row = win_b + size_t(~e) * p->win_strides[1];         \
+          }                                                       \
+          pre[i] = reinterpret_cast<const device uint4*>(row)[c]; \
+        }                                                         \
+      }                                                           \
+    }                                                             \
   }
 
   for (int pb = 0; pb < total; pb += MAXK) {
@@ -499,8 +551,11 @@ template <typename T, typename IdxT, int D, int HG, int DS, int KB>
       for (int i = 0; i < SV; ++i) {
         const int v = tix + i * NTH;
         if (v < KB * CHR) {
+          const uint4 x = pkf[i] ? as_type<uint4>(kq_fp4_chunk8<T>(
+                                       pre[i].x, kq_fp4_e4m3_decode(pre[i].y)))
+                                 : pre[i];
           *reinterpret_cast<threadgroup uint4*>(
-              Ks + (v / CHR) * LD + (v % CHR) * 8) = pre[i];
+              Ks + (v / CHR) * LD + (v % CHR) * 8) = x;
         }
       }
       threadgroup_barrier(metal::mem_flags::mem_threadgroup);

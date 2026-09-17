@@ -60,9 +60,10 @@ void KQSdpaSparseDecode::eval_gpu(
 
   const auto& q = inputs[0];
   const auto& win = inputs[1]; // [B|1, W * D], rows D apart
-  const auto& pool = inputs[2]; // [B|1, P * D], rows D apart
+  const auto& pool = inputs[2]; // [B|1, P * D] (packed: [B|1, P * D / 2] codes)
   const auto& idx = inputs[3];
   size_t next = 4;
+  const mx::array* pscales = packed_ ? &inputs[next++] : nullptr;
   const mx::array* sinks = has_sinks_ ? &inputs[next++] : nullptr;
   const mx::array* wmask = has_win_mask_ ? &inputs[next++] : nullptr;
   const mx::array* smask = has_sel_mask_ ? &inputs[next++] : nullptr;
@@ -74,7 +75,7 @@ void KQSdpaSparseDecode::eval_gpu(
   const int L = q.shape(2);
   const int D = q.shape(3);
   const int W = win.shape(1) / D;
-  const int P = pool.shape(1) / D;
+  const int P = packed_ ? pool.shape(1) * 2 / D : pool.shape(1) / D;
   const int N = idx.shape(2);
   const int total = W + N;
 
@@ -130,7 +131,9 @@ void KQSdpaSparseDecode::eval_gpu(
   params.q_strides[2] = q.strides(2);
   params.win_strides[0] = bcast(win, 0);
   params.win_strides[1] = D;
-  params.pool_strides[0] = bcast(pool, 0);
+  // Packed batch stride in T units: the kernel halves it for the code
+  // bytes and takes a sixteenth for the scale bytes.
+  params.pool_strides[0] = bcast(pool, 0) * (packed_ ? 2 : 1);
   params.pool_strides[1] = D;
   params.idx_strides[0] = bcast(idx, 0);
   params.idx_strides[1] = idx.strides(1);
@@ -152,7 +155,7 @@ void KQSdpaSparseDecode::eval_gpu(
   auto split_kernel = kq_get_kernel(
       d,
       "kq_sdpa_sparse_decode_split_" + ts + "_" + is + dtag + "_hg" +
-          std::to_string(hg));
+          std::to_string(hg) + (packed_ ? "_pk" : ""));
   ce.set_compute_pipeline_state(split_kernel);
   ce.set_input_array(q, 0);
   ce.set_input_array(win, 1);
@@ -164,6 +167,7 @@ void KQSdpaSparseDecode::eval_gpu(
   ce.set_bytes(params, 9);
   ce.set_input_array(sinks ? *sinks : q, 10);
   ce.set_output_array(o, 11);
+  ce.set_input_array(pscales ? *pscales : idx, 12);
   if (params.direct) {
     // No partials: the split kernel writes O and never touches 6-8.
     ce.set_input_array(q, 6);
@@ -228,8 +232,41 @@ bool KQSdpaSparseDecode::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQSdpaSparseDecode&>(other);
   return scale_ == o.scale_ && splits_ == o.splits_ &&
       has_sinks_ == o.has_sinks_ && has_win_mask_ == o.has_win_mask_ &&
-      has_sel_mask_ == o.has_sel_mask_;
+      has_sel_mask_ == o.has_sel_mask_ && packed_ == o.packed_;
 }
+
+namespace {
+
+// The pool's row width in values: D for a T pool, 2 * codes width for a
+// packed one (whose scales must then be [B|1, P, D / 16] uint8).
+void check_pool(
+    const char* op,
+    const mx::array& pool,
+    const std::optional<mx::array>& scales,
+    int D) {
+  if (!scales.has_value()) {
+    if (pool.shape(2) != D) {
+      std::ostringstream msg;
+      msg << op << " pool rows must be " << D << " wide; got " << pool.shape()
+          << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    return;
+  }
+  if (pool.dtype() != mx::uint8 || scales->dtype() != mx::uint8 ||
+      scales->ndim() != 3 || pool.shape(2) != D / 2 ||
+      scales->shape(2) != D / 16 || scales->shape(0) != pool.shape(0) ||
+      scales->shape(1) != pool.shape(1)) {
+    std::ostringstream msg;
+    msg << op << " a packed pool is uint8 codes [B, P, " << D / 2
+        << "] with uint8 pool_scales [B, P, " << D / 16 << "]; got "
+        << pool.shape() << " " << pool.dtype() << " and " << scales->shape()
+        << " " << scales->dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
+} // namespace
 
 mx::array sdpa_sparse_decode(
     mx::array q,
@@ -241,6 +278,7 @@ mx::array sdpa_sparse_decode(
     const std::optional<mx::array>& win_mask,
     const std::optional<mx::array>& sel_mask,
     int splits,
+    const std::optional<mx::array>& pool_scales,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.sdpa_sparse_decode]";
@@ -261,7 +299,8 @@ mx::array sdpa_sparse_decode(
     throw std::invalid_argument(
         std::string(op) + " head_dim must be 128, 256 or 512.");
   }
-  if (window.shape(1) != 1 || window.shape(3) != D || pool.shape(2) != D ||
+  check_pool(op, pool, pool_scales, D);
+  if (window.shape(1) != 1 || window.shape(3) != D ||
       (window.shape(0) != B && window.shape(0) != 1) ||
       (pool.shape(0) != B && pool.shape(0) != 1) ||
       (idx.shape(0) != B && idx.shape(0) != 1) || idx.shape(1) != L) {
@@ -300,10 +339,14 @@ mx::array sdpa_sparse_decode(
   // any other layout Reshape copies.
   auto q_c = mx::contiguous(q, false, s);
   auto win_c = rows_flat(mx::astype(window, dt, s), op, s);
-  auto pool_c = rows_flat(mx::astype(pool, dt, s), op, s);
+  auto pool_c = rows_flat(
+      pool_scales.has_value() ? pool : mx::astype(pool, dt, s), op, s);
   auto idx_c = mx::contiguous(idx, false, s);
   std::vector<mx::array> inputs = {
       std::move(q_c), std::move(win_c), std::move(pool_c), std::move(idx_c)};
+  if (pool_scales.has_value()) {
+    inputs.push_back(rows_flat(*pool_scales, op, s));
+  }
 
   if (sinks.has_value()) {
     if (sinks->size() != static_cast<size_t>(H)) {
@@ -344,7 +387,8 @@ mx::array sdpa_sparse_decode(
           splits,
           sinks.has_value(),
           win_mask.has_value(),
-          sel_mask.has_value()),
+          sel_mask.has_value(),
+          pool_scales.has_value()),
       std::move(inputs));
 }
 
@@ -396,9 +440,10 @@ void KQSdpaSparsePrefill::eval_gpu(
 
   const auto& q = inputs[0];
   const auto& win = inputs[1]; // [B|1, S * D], rows D apart
-  const auto& pool = inputs[2]; // [B|1, P * D], rows D apart
+  const auto& pool = inputs[2]; // [B|1, P * D] (packed: [B|1, P * D / 2] codes)
   const auto& idx = inputs[3];
   size_t next = 4;
+  const mx::array* pscales = packed_ ? &inputs[next++] : nullptr;
   const mx::array* sinks = has_sinks_ ? &inputs[next++] : nullptr;
   const mx::array* smask = has_sel_mask_ ? &inputs[next++] : nullptr;
   auto& o = outputs[0];
@@ -409,7 +454,7 @@ void KQSdpaSparsePrefill::eval_gpu(
   const int L = q.shape(2);
   const int D = q.shape(3);
   const int S = win.shape(1) / D;
-  const int P = pool.shape(1) / D;
+  const int P = packed_ ? pool.shape(1) * 2 / D : pool.shape(1) / D;
   const int N = idx.shape(2);
   const PrefillCfg cfg = prefill_cfg(D);
   const int hgroups = (H + cfg.hg - 1) / cfg.hg;
@@ -434,7 +479,7 @@ void KQSdpaSparsePrefill::eval_gpu(
   params.q_strides[2] = q.strides(2);
   params.win_strides[0] = bcast(win, 0);
   params.win_strides[1] = D;
-  params.pool_strides[0] = bcast(pool, 0);
+  params.pool_strides[0] = bcast(pool, 0) * (packed_ ? 2 : 1);
   params.pool_strides[1] = D;
   params.idx_strides[0] = bcast(idx, 0);
   params.idx_strides[1] = idx.strides(1);
@@ -452,7 +497,7 @@ void KQSdpaSparsePrefill::eval_gpu(
       d,
       "kq_sdpa_sparse_prefill_" + ts + "_" + is + "_d" + std::to_string(D) +
           "_hg" + std::to_string(cfg.hg) + "_ds" + std::to_string(cfg.ds) +
-          "_kb" + std::to_string(cfg.kb));
+          "_kb" + std::to_string(cfg.kb) + (packed_ ? "_pk" : ""));
   ce.set_compute_pipeline_state(kernel);
   ce.set_input_array(q, 0);
   ce.set_input_array(win, 1);
@@ -463,6 +508,7 @@ void KQSdpaSparsePrefill::eval_gpu(
   ce.set_input_array(sinks ? *sinks : q, 5);
   ce.set_output_array(o, 6);
   ce.set_bytes(params, 7);
+  ce.set_input_array(pscales ? *pscales : idx, 8);
   ce.dispatch_threadgroups(
       MTL::Size(1, hgroups, B * L), MTL::Size(cfg.hg / 8 * cfg.ds * 32, 1, 1));
 }
@@ -493,7 +539,7 @@ std::vector<mx::Shape> KQSdpaSparsePrefill::output_shapes(
 bool KQSdpaSparsePrefill::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQSdpaSparsePrefill&>(other);
   return scale_ == o.scale_ && band_ == o.band_ && has_sinks_ == o.has_sinks_ &&
-      has_sel_mask_ == o.has_sel_mask_;
+      has_sel_mask_ == o.has_sel_mask_ && packed_ == o.packed_;
 }
 
 mx::array sdpa_sparse_prefill(
@@ -505,6 +551,7 @@ mx::array sdpa_sparse_prefill(
     int band,
     const std::optional<mx::array>& sinks,
     const std::optional<mx::array>& sel_mask,
+    const std::optional<mx::array>& pool_scales,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.sdpa_sparse_prefill]";
@@ -525,7 +572,8 @@ mx::array sdpa_sparse_prefill(
     throw std::invalid_argument(
         std::string(op) + " head_dim must be 128, 256 or 512.");
   }
-  if (window.shape(1) != 1 || window.shape(3) != D || pool.shape(2) != D ||
+  check_pool(op, pool, pool_scales, D);
+  if (window.shape(1) != 1 || window.shape(3) != D ||
       (window.shape(0) != B && window.shape(0) != 1) ||
       (pool.shape(0) != B && pool.shape(0) != 1) ||
       (idx.shape(0) != B && idx.shape(0) != 1) || idx.shape(1) != L) {
@@ -556,10 +604,14 @@ mx::array sdpa_sparse_prefill(
   // As in sdpa_sparse_decode: the window and pool pass as row views.
   auto q_c = mx::contiguous(q, false, s);
   auto win_c = rows_flat(mx::astype(window, dt, s), op, s);
-  auto pool_c = rows_flat(mx::astype(pool, dt, s), op, s);
+  auto pool_c = rows_flat(
+      pool_scales.has_value() ? pool : mx::astype(pool, dt, s), op, s);
   auto idx_c = mx::contiguous(idx, false, s);
   std::vector<mx::array> inputs = {
       std::move(q_c), std::move(win_c), std::move(pool_c), std::move(idx_c)};
+  if (pool_scales.has_value()) {
+    inputs.push_back(rows_flat(*pool_scales, op, s));
+  }
 
   if (sinks.has_value()) {
     if (sinks->size() != static_cast<size_t>(H)) {
@@ -590,7 +642,12 @@ mx::array sdpa_sparse_prefill(
       q.shape(),
       dt,
       std::make_shared<KQSdpaSparsePrefill>(
-          s, scale, band, sinks.has_value(), sel_mask.has_value()),
+          s,
+          scale,
+          band,
+          sinks.has_value(),
+          sel_mask.has_value(),
+          pool_scales.has_value()),
       std::move(inputs));
 }
 

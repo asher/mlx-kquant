@@ -644,6 +644,21 @@ std::vector<mx::array> dsa_indexer_qat_pack(
     mx::array x,
     mx::StreamOrDevice s = {});
 
+// FP4 rows at rest: x [..., D] (D % 16 == 0) -> {codes uint8 [..., D / 2]
+// (E2M1 nibbles, low nibble first), scales uint8 [..., D / 16] (one E4M3
+// byte per 16 values)}. Rows on ds4's latent QAT grid (scale = e4m3(amax /
+// 6), values e2m1(v / scale) * scale) pack exactly: latent_fp4_unpack
+// returns them bit-for-bit (a group may re-derive a smaller scale with
+// doubled codes; the products are the same). Other rows take the QAT
+// projection. The sparse attention kernels read this form directly
+// (sdpa_sparse_decode / sdpa_sparse_prefill pool_scales). Metal-only.
+std::vector<mx::array> latent_fp4_pack(mx::array x, mx::StreamOrDevice s = {});
+mx::array latent_fp4_unpack(
+    mx::array codes,
+    mx::array scales,
+    mx::Dtype dtype = mx::float16,
+    mx::StreamOrDevice s = {});
+
 // dsa_indexer_scores on pre-quantized operands (no fp16 operand path, no
 // internal quantize): codes_q int8 [B, H, M, 128] + scales_q f32
 // [B, H, M, 4] and codes_k int8 [B, 1, N, 128] + scales_k f32 [B, 1, N, 4]
@@ -1862,6 +1877,52 @@ class KQDsaIndexerScoresQ : public mx::Primitive {
   int causal_q_offset_;
 };
 
+// FP4 rows at rest for the sparse attention pool (see latent_fp4_pack).
+// Inference-only, Metal-only.
+class KQLatentFp4Pack : public mx::Primitive {
+ public:
+  explicit KQLatentFp4Pack(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQLatentFp4Pack";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+};
+
+class KQLatentFp4Unpack : public mx::Primitive {
+ public:
+  explicit KQLatentFp4Unpack(mx::Stream stream, mx::Dtype dtype)
+      : mx::Primitive(stream), dtype_(dtype) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQLatentFp4Unpack";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  mx::Dtype dtype_;
+};
+
 // DeepSeek-V4-Flash fused main-attention KV QAT round-trip (see
 // dsa_kv_qat). Inference-only, Metal-only.
 class KQDsaKvQat : public mx::Primitive {
@@ -2754,6 +2815,9 @@ std::pair<int, int> set_cb_caps(int max_ops, int max_mb);
 // [B, L, W] and sel_mask [L, N] / [B, L, N] drop keys (False = dropped).
 // splits 0 picks the key-split count. Returns [B, H, L, D] in q's dtype.
 // Metal-only.
+// With pool_scales, pool is the uint8 [B, P, D / 2] code array of
+// latent_fp4_pack and pool_scales its uint8 [B, P, D / 16] scales; the
+// rows dequantize as they stage.
 mx::array sdpa_sparse_decode(
     mx::array q,
     mx::array window,
@@ -2764,6 +2828,7 @@ mx::array sdpa_sparse_decode(
     const std::optional<mx::array>& win_mask = std::nullopt,
     const std::optional<mx::array>& sel_mask = std::nullopt,
     int splits = 0,
+    const std::optional<mx::array>& pool_scales = std::nullopt,
     mx::StreamOrDevice s = {});
 
 class KQSdpaSparseDecode : public mx::Primitive {
@@ -2774,13 +2839,15 @@ class KQSdpaSparseDecode : public mx::Primitive {
       int splits,
       bool has_sinks,
       bool has_win_mask,
-      bool has_sel_mask)
+      bool has_sel_mask,
+      bool packed)
       : mx::Primitive(stream),
         scale_(scale),
         splits_(splits),
         has_sinks_(has_sinks),
         has_win_mask_(has_win_mask),
-        has_sel_mask_(has_sel_mask) {}
+        has_sel_mask_(has_sel_mask),
+        packed_(packed) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -2803,6 +2870,7 @@ class KQSdpaSparseDecode : public mx::Primitive {
   bool has_sinks_;
   bool has_win_mask_;
   bool has_sel_mask_;
+  bool packed_;
 };
 
 // Prefill form of sdpa_sparse_decode: query l of window [B, 1, S, D]
@@ -2820,6 +2888,7 @@ mx::array sdpa_sparse_prefill(
     int band,
     const std::optional<mx::array>& sinks = std::nullopt,
     const std::optional<mx::array>& sel_mask = std::nullopt,
+    const std::optional<mx::array>& pool_scales = std::nullopt,
     mx::StreamOrDevice s = {});
 
 class KQSdpaSparsePrefill : public mx::Primitive {
@@ -2829,12 +2898,14 @@ class KQSdpaSparsePrefill : public mx::Primitive {
       float scale,
       int band,
       bool has_sinks,
-      bool has_sel_mask)
+      bool has_sel_mask,
+      bool packed)
       : mx::Primitive(stream),
         scale_(scale),
         band_(band),
         has_sinks_(has_sinks),
-        has_sel_mask_(has_sel_mask) {}
+        has_sel_mask_(has_sel_mask),
+        packed_(packed) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -2856,6 +2927,7 @@ class KQSdpaSparsePrefill : public mx::Primitive {
   int band_;
   bool has_sinks_;
   bool has_sel_mask_;
+  bool packed_;
 };
 
 } // namespace mlx_kquant

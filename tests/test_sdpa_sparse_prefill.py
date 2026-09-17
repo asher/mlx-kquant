@@ -264,6 +264,46 @@ def test_validation():
         )
 
 
+@pytest.mark.parametrize("D", [128, 512])
+@pytest.mark.parametrize("B,bcast", [(1, False), (2, True)])
+def test_packed_pool_matches_fp16_pool(D, B, bcast):
+    from test_sdpa_sparse_decode import _on_grid_pool
+
+    args, _ = _case(
+        B,
+        16,
+        70,
+        D,
+        90,
+        600,
+        48,
+        16,
+        mx.float16,
+        np.int32,
+        sinks=True,
+        mask=True,
+        pad=True,
+        bcast=bcast,
+        seed=D,
+    )
+    q, win, pool, idx, scale, band, kw = args
+    pool = _on_grid_pool(pool)
+    codes, scales = kq.latent_fp4_pack(pool)
+    want = kq.sdpa_sparse_prefill(q, win, pool, idx, scale, band, **kw)
+    got = kq.sdpa_sparse_prefill(
+        q, win, codes, idx, scale, band, pool_scales=scales, **kw
+    )
+    assert mx.array_equal(got, want).item()
+    P = pool.shape[1]
+    nb = pool.shape[0]
+    cbuf = mx.concatenate([codes, mx.zeros((nb, 50, D // 2), mx.uint8)], axis=1)
+    sbuf = mx.concatenate([scales, mx.zeros((nb, 50, D // 16), mx.uint8)], axis=1)
+    got = kq.sdpa_sparse_prefill(
+        q, win, cbuf[:, :P], idx, scale, band, pool_scales=sbuf[:, :P], **kw
+    )
+    assert mx.array_equal(got, want).item()
+
+
 @pytest.mark.parametrize("B", [1, 2])
 def test_strided_window_and_pool_match_contiguous(B):
     """Prefix slices of larger buffers pass by stride; a transposed view

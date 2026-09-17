@@ -7,6 +7,7 @@
 // kernels from the AOT metallib with function constants (300 causal,
 // 301 weights-lh, 302 bucketed emission). Inference-only (no CPU eval).
 // omlx is Apache-2.0: see mlx_kquant/licenses/omlx-LICENSE.
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <sstream>
@@ -236,9 +237,6 @@ void KQDsaIndexerScoreDecode::eval_gpu(
 
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
-  // Mirrors the kernel's SGS = 4 simdgroups x R = 8 rows per threadgroup.
-  constexpr int rows_per_tg = 32;
-
   const int B = q.shape(0);
   const int H = q.shape(1);
   const int QL = q.shape(2);
@@ -250,6 +248,14 @@ void KQDsaIndexerScoreDecode::eval_gpu(
       std::string(wf ? "wf_" : "") + kq_type_string(q.dtype()) + "_ql" +
       std::to_string(QL);
 
+  // Keys per threadgroup: a multiple of the kernel's SGS x 8 rows, at
+  // least 128 and sized for about 512 threadgroups (the query staging
+  // amortizes past 128; the plateau holds to 512 on M3 Max).
+  constexpr int sgs = 8;
+  constexpr int rows = sgs * 8;
+  int kpt = std::max(128, (P + 511) / 512);
+  kpt = (kpt + rows - 1) / rows * rows;
+
   auto kernel = kq_get_kernel(d, kname, kname, {});
   ce.set_compute_pipeline_state(kernel);
 
@@ -260,9 +266,10 @@ void KQDsaIndexerScoreDecode::eval_gpu(
   ce.set_bytes(P, 4);
   ce.set_bytes(q_offset_, 5);
   ce.set_bytes(ratio_, 6);
+  ce.set_bytes(kpt, 7);
 
-  MTL::Size group_dims(32, 4, 1);
-  MTL::Size grid_dims((P + rows_per_tg - 1) / rows_per_tg, 1, B);
+  MTL::Size group_dims(32, sgs, 1);
+  MTL::Size grid_dims((P + kpt - 1) / kpt, 1, B);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 

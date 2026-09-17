@@ -874,6 +874,7 @@ NB_MODULE(_ext, m) {
       "sel_mask"_a = nb::none(),
       "splits"_a = 0,
       nb::kw_only(),
+      "pool_scales"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Attention over two key sources with K == V: a window read whole
@@ -902,6 +903,9 @@ NB_MODULE(_ext, m) {
                 drops the listed row.
             splits (int): key splits, 0 = automatic (also
                 KQ_SDPA_SPARSE_SPLITS).
+            pool_scales (array, optional): uint8 [B, P, D / 16]; when
+                given, ``pool`` is the uint8 [B, P, D / 2] code array of
+                latent_fp4_pack and the rows dequantize as they stage.
 
         Returns:
             array: [B, H, L, D] in q's dtype. Metal-only.
@@ -919,6 +923,7 @@ NB_MODULE(_ext, m) {
       "sinks"_a = nb::none(),
       "sel_mask"_a = nb::none(),
       nb::kw_only(),
+      "pool_scales"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Prefill form of sdpa_sparse_decode: one threadgroup per query and
@@ -943,6 +948,7 @@ NB_MODULE(_ext, m) {
                 softmax denominator.
             sel_mask (array, optional): bool [L, N] or [B, L, N]; False
                 drops the listed row.
+            pool_scales (array, optional): as in sdpa_sparse_decode.
 
         Returns:
             array: [B, H, L, D] in q's dtype. Metal-only.
@@ -1209,6 +1215,52 @@ NB_MODULE(_ext, m) {
         Returns:
             array: scores [B, 1, M, N]; bfloat16 for bfloat16 weights,
             else float16.
+      )");
+
+  m.def(
+      "latent_fp4_pack",
+      &mlx_kquant::latent_fp4_pack,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        FP4 rows at rest for the sparse attention pool: groups of 16
+        values, one E2M1 nibble each (low nibble first) and one E4M3 scale
+        byte per group. Rows on the DeepSeek-V4.1 latent QAT grid (scale =
+        e4m3(amax / 6), values e2m1(v / scale) * scale) pack exactly and
+        latent_fp4_unpack returns them bit-for-bit; other rows take the
+        same projection the QAT does. sdpa_sparse_decode and
+        sdpa_sparse_prefill read this form through ``pool_scales``.
+
+        Args:
+            x (array): [..., D] with D a multiple of 16; fp16/bf16/fp32.
+
+        Returns:
+            tuple(array, array): codes uint8 [..., D / 2] and scales uint8
+            [..., D / 16]. Metal-only.
+      )");
+
+  m.def(
+      "latent_fp4_unpack",
+      [](mx::array codes,
+         mx::array scales,
+         std::optional<mx::Dtype> dtype,
+         mx::StreamOrDevice s) {
+        return mlx_kquant::latent_fp4_unpack(
+            std::move(codes),
+            std::move(scales),
+            dtype.value_or(mx::float16),
+            s);
+      },
+      "codes"_a,
+      "scales"_a,
+      "dtype"_a = nb::none(),
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Rows of latent_fp4_pack back as ``dtype`` (fp16 default, bf16 or
+        fp32): codes [..., D / 2] and scales [..., D / 16] -> [..., D].
+        Metal-only.
       )");
 
   m.def(
