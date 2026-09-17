@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.10]
+
 ### Added
 - `load_gguf(skip=...)`: named tensors load no array but still report their
   shape and codec, for a table the caller must read itself because it passes
