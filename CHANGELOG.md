@@ -11,35 +11,22 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shape and codec, for a table the caller must read itself because it passes
   the device max buffer length.
 - `dsa_kv_qat(block=32)` and `dsa_indexer_qat(hadamard=False)`: the
-  DeepSeek-V4.1 forms of the fused QAT round-trips (32-wide fp8 blocks over
-  the whole window-KV row; the fp4 indexer round-trip without the Hadamard),
-  bit-identical to the MLX graphs they replace.
+  DeepSeek-V4.1 forms of the fused QAT round-trips.
 - `moe_glu_gather_shexp_kq(act="silu_limit", limit=...)`: the shared-expert
-  fold with the DeepSeek-V4 LimitedSwiGLU clamp on every slot, so a V4 MoE
-  block runs its shared expert inside the two routed gathers.
-- `sdpa_sparse_decode`: attention over a window plus index-listed pool
-  rows (K == V) with sinks and optional masks, as two dispatches (a
-  key-split simdgroup-matrix kernel and a merge) at head dims 128, 256 and
-  512, for the DeepSeek-V4 sparse attention step. Queries are a batch
-  dimension, so a prefill block of up to 4096 goes through the same call,
-  and the window and pool pass as slices of a larger cache buffer with no
-  copy. With `pool_scales=` the pool is the packed form of
-  `latent_fp4_pack` and its rows dequantize as they stage.
-- `sdpa_sparse_prefill`: the prefill form of `sdpa_sparse_decode` (same
-  operands, head dims and packed pool), one threadgroup per query and head
-  group over the window rows its position reaches plus its listed pool
-  rows, so a prompt block is one dispatch instead of a decode-kernel call
-  per band.
-- `latent_fp4_pack` and `latent_fp4_unpack`: rows at rest as E2M1 codes
-  with one E4M3 scale per 16 values, 288 bytes per 512-wide row instead of
-  1024. Rows on the DeepSeek-V4.1 latent QAT grid pack and unpack
-  bit-for-bit; other rows land on the grid the way that QAT projects them.
+  fold with the DeepSeek-V4 clamp.
+- `sdpa_sparse_decode`: attention over a window plus index-listed pool rows
+  at head dims 128, 256 and 512, for the DeepSeek-V4 sparse attention step.
+  With `pool_scales=` it reads the pool in its `latent_fp4_pack` form.
+- `sdpa_sparse_prefill`: the prefill form of `sdpa_sparse_decode`, one
+  dispatch per prompt block.
+- `latent_fp4_pack` and `latent_fp4_unpack`: rows at rest as FP4 codes with
+  one scale per 16 values, so a 512-wide row takes 288 bytes instead of
+  1024.
 
 ### Changed
-- `dsa_indexer_score_decode` runs on simdgroup matrix tiles instead of a
-  lane-per-key reduction, 2.7x faster at 256K keys, with the same scores.
-  With `cand=` it scores only the listed key rows, so the second level of
-  a two-level top-k costs the same at every depth.
+- `dsa_indexer_score_decode` runs on simdgroup matrix tiles, several times
+  faster at depth with the same scores. With `cand=` it scores only the
+  listed key rows.
 
 ### Fixed
 - `dsa_indexer_score_decode` no longer copies a key block that is a prefix
