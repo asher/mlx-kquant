@@ -29,7 +29,8 @@ constant constexpr float kSdpaSparseNegBig = -1e30f;
 #define KQ_UNROLL _Pragma("clang loop unroll(full)")
 
 template <typename T, typename IdxT, int D, int HG, bool PK>
-[[kernel]] void kq_sdpa_sparse_decode_split(
+[[kernel, max_total_threads_per_threadgroup((HG / 4) * 32)]] void
+kq_sdpa_sparse_decode_split(
     const device T* Q [[buffer(0)]],
     const device T* Win [[buffer(1)]],
     const device T* Pool [[buffer(2)]],
@@ -395,7 +396,8 @@ constant constexpr int kSdpaSparseDead = -2147483647 - 1;
 // ~row, pool rows as row, dead slots as kSdpaSparseDead), so a block fetch
 // reads the table instead of chasing the index and mask loads.
 template <typename T, typename IdxT, int D, int HG, int DS, int KB, bool PK>
-[[kernel]] void kq_sdpa_sparse_prefill(
+[[kernel, max_total_threads_per_threadgroup((HG / 8) * DS * 32)]] void
+kq_sdpa_sparse_prefill(
     const device T* Q [[buffer(0)]],
     const device T* Win [[buffer(1)]],
     const device T* Pool [[buffer(2)]],

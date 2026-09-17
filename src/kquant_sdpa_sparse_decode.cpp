@@ -156,6 +156,15 @@ void KQSdpaSparseDecode::eval_gpu(
       d,
       "kq_sdpa_sparse_decode_split_" + ts + "_" + is + dtag + "_hg" +
           std::to_string(hg) + (packed_ ? "_pk" : ""));
+  // Register-heavy pipeline: some GPUs cap it below the dispatch width, and
+  // Metal turns an oversized dispatch into silent garbage, not an error.
+  const size_t tg = size_t(hg / 4) * 32;
+  if (tg > split_kernel->maxTotalThreadsPerThreadgroup()) {
+    throw std::runtime_error(
+        "[mlx_kquant.sdpa_sparse_decode] threadgroup of " + std::to_string(tg) +
+        " threads exceeds this GPU's pipeline limit (" +
+        std::to_string(split_kernel->maxTotalThreadsPerThreadgroup()) + ").");
+  }
   ce.set_compute_pipeline_state(split_kernel);
   ce.set_input_array(q, 0);
   ce.set_input_array(win, 1);
@@ -174,7 +183,7 @@ void KQSdpaSparseDecode::eval_gpu(
     ce.set_input_array(q, 7);
     ce.set_input_array(q, 8);
     ce.dispatch_threadgroups(
-        MTL::Size(n_splits, hgroups, B * L), MTL::Size(hg / 4 * 32, 1, 1));
+        MTL::Size(n_splits, hgroups, B * L), MTL::Size(tg, 1, 1));
     return;
   }
 
@@ -191,7 +200,7 @@ void KQSdpaSparseDecode::eval_gpu(
   ce.set_output_array(ms, 7);
   ce.set_output_array(ls, 8);
   ce.dispatch_threadgroups(
-      MTL::Size(n_splits, hgroups, B * L), MTL::Size(hg / 4 * 32, 1, 1));
+      MTL::Size(n_splits, hgroups, B * L), MTL::Size(tg, 1, 1));
 
   auto merge_kernel =
       kq_get_kernel(d, "kq_sdpa_sparse_decode_merge_" + ts + dtag);
@@ -498,6 +507,15 @@ void KQSdpaSparsePrefill::eval_gpu(
       "kq_sdpa_sparse_prefill_" + ts + "_" + is + "_d" + std::to_string(D) +
           "_hg" + std::to_string(cfg.hg) + "_ds" + std::to_string(cfg.ds) +
           "_kb" + std::to_string(cfg.kb) + (packed_ ? "_pk" : ""));
+  // Register-heavy pipeline: some GPUs cap it below the dispatch width, and
+  // Metal turns an oversized dispatch into silent garbage, not an error.
+  const size_t tg = size_t(cfg.hg / 8) * cfg.ds * 32;
+  if (tg > kernel->maxTotalThreadsPerThreadgroup()) {
+    throw std::runtime_error(
+        "[mlx_kquant.sdpa_sparse_prefill] threadgroup of " +
+        std::to_string(tg) + " threads exceeds this GPU's pipeline limit (" +
+        std::to_string(kernel->maxTotalThreadsPerThreadgroup()) + ").");
+  }
   ce.set_compute_pipeline_state(kernel);
   ce.set_input_array(q, 0);
   ce.set_input_array(win, 1);
@@ -509,8 +527,7 @@ void KQSdpaSparsePrefill::eval_gpu(
   ce.set_output_array(o, 6);
   ce.set_bytes(params, 7);
   ce.set_input_array(pscales ? *pscales : idx, 8);
-  ce.dispatch_threadgroups(
-      MTL::Size(1, hgroups, B * L), MTL::Size(cfg.hg / 8 * cfg.ds * 32, 1, 1));
+  ce.dispatch_threadgroups(MTL::Size(1, hgroups, B * L), MTL::Size(tg, 1, 1));
 }
 
 #else // !_METAL_
