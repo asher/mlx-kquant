@@ -862,6 +862,99 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_sparse_decode",
+      &mlx_kquant::sdpa_sparse_decode,
+      "q"_a,
+      "window"_a,
+      "pool"_a,
+      "idx"_a,
+      "scale"_a,
+      "sinks"_a = nb::none(),
+      "win_mask"_a = nb::none(),
+      "sel_mask"_a = nb::none(),
+      "splits"_a = 0,
+      nb::kw_only(),
+      "pool_scales"_a = nb::none(),
+      "stream"_a = nb::none(),
+      R"(
+        Attention over two key sources with K == V: a window read whole
+        and a pool read through a per-query index list, as in the
+        DeepSeek-V4 sparse attention step. The keys fan out over splits
+        of threadgroups (one simdgroup per head and split) that write
+        unnormalized f32 partials, and a merge renormalizes them with the
+        per-head sink counted once. Replaces the gather, the two score
+        matmuls, the split softmax and the two value matmuls. Queries are
+        a batch dimension: a decode step, or a prefill block whose queries
+        share the window rows and keep their own index lists.
+
+        Args:
+            q (array): queries [B, H, L, D], float16/bfloat16; D in
+                {128, 256, 512}; L <= 4096.
+            window (array): [B, 1, W, D] rows every query attends.
+            pool (array): [B, P, D] rows selected by ``idx``.
+            idx (array): [B, L, N] int32/uint32 pool rows per query; a
+                negative or out-of-range entry is skipped.
+            scale (float): softmax scale.
+            sinks (array, optional): per-head [H] extra logit in the
+                softmax denominator.
+            win_mask (array, optional): bool [L, W] or [B, L, W]; False
+                drops the key.
+            sel_mask (array, optional): bool [L, N] or [B, L, N]; False
+                drops the listed row.
+            splits (int): key splits, 0 = automatic (also
+                KQ_SDPA_SPARSE_SPLITS).
+            pool_scales (array, optional): uint8 [B, P, D / 16]; when
+                given, ``pool`` is the uint8 [B, P, D / 2] code array of
+                latent_fp4_pack and the rows dequantize as they stage.
+
+        Returns:
+            array: [B, H, L, D] in q's dtype. Metal-only.
+      )");
+
+  m.def(
+      "sdpa_sparse_prefill",
+      &mlx_kquant::sdpa_sparse_prefill,
+      "q"_a,
+      "window"_a,
+      "pool"_a,
+      "idx"_a,
+      "scale"_a,
+      "band"_a,
+      "sinks"_a = nb::none(),
+      "sel_mask"_a = nb::none(),
+      nb::kw_only(),
+      "pool_scales"_a = nb::none(),
+      "stream"_a = nb::none(),
+      R"(
+        Prefill form of sdpa_sparse_decode: one threadgroup per query and
+        head group, no key split. Query l sits at window row
+        pos = S - L + l and reads the rows [pos - band + 1, pos] (the
+        sliding window, itself included) plus the pool rows its index list
+        names. The kernel derives the window band from the position, so
+        no window mask is read; the row addresses of a query resolve once
+        into a threadgroup table before the key blocks stream through.
+
+        Args:
+            q (array): queries [B, H, L, D], float16/bfloat16; D in
+                {128, 256, 512}.
+            window (array): [B, 1, S, D] rows, S >= L; the last L rows
+                are the queries' own positions.
+            pool (array): [B, P, D] rows selected by ``idx``.
+            idx (array): [B, L, N] int32/uint32 pool rows per query; a
+                negative or out-of-range entry is skipped.
+            scale (float): softmax scale.
+            band (int): window rows a query reads, its own included.
+            sinks (array, optional): per-head [H] extra logit in the
+                softmax denominator.
+            sel_mask (array, optional): bool [L, N] or [B, L, N]; False
+                drops the listed row.
+            pool_scales (array, optional): as in sdpa_sparse_decode.
+
+        Returns:
+            array: [B, H, L, D] in q's dtype. Metal-only.
+      )");
+
+  m.def(
       "dsa_sparse_attention",
       &mlx_kquant::dsa_sparse_attention,
       "q"_a,
@@ -977,6 +1070,7 @@ NB_MODULE(_ext, m) {
       "q_offset"_a,
       "ratio"_a,
       nb::kw_only(),
+      "cand"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Decode-width lightning-indexer scores, fused:
@@ -986,7 +1080,10 @@ NB_MODULE(_ext, m) {
         global scale is folded out. Pooled visibility follows
         PoolingCache.make_mask(qL, q_offset): row p is visible to query j
         iff p < (q_offset + j + 1) // ratio, and every row is visible when
-        qL == 1; invisible rows score the dtype's finite min.
+        qL == 1; invisible rows score the dtype's finite min. With ``cand``
+        column c of query j scores key row cand[b, j, c] instead of row c
+        and the result is [B, 1, qL, NC]; a negative or out-of-range entry
+        scores the finite min.
 
         Args:
             queries (array): [B, H, qL, 128], H in {4, 32, 64}, qL in
@@ -998,9 +1095,12 @@ NB_MODULE(_ext, m) {
             q_offset (int): absolute position of query row 0's step
                 (make_mask's ``offset``).
             ratio (int): pooled compression ratio.
+            cand (array, optional): int32/uint32 [B, qL, NC] key rows to
+                score per query (a two-level top-k's candidate list).
 
         Returns:
-            array: scores [B, 1, qL, P] shaped for dsa_topk_indices.
+            array: scores [B, 1, qL, P] ([B, 1, qL, NC] with ``cand``)
+            shaped for dsa_topk_indices.
       )");
 
   m.def(
@@ -1008,6 +1108,7 @@ NB_MODULE(_ext, m) {
       &mlx_kquant::dsa_indexer_qat,
       "x"_a,
       nb::kw_only(),
+      "hadamard"_a = true,
       "stream"_a = nb::none(),
       R"(
         DeepSeek-V4-Flash indexer activation QAT round-trip, fused: the
@@ -1017,9 +1118,15 @@ NB_MODULE(_ext, m) {
         an FLT_MIN*6 amax floor, clamp to +-6, tie-to-even rounding).
         One kernel in place of the multi-pass hadamard + quantize chain.
 
+        With ``hadamard`` false the transform is skipped and the FP4
+        round-trip applies to the raw row: the DeepSeek-V4.1 indexer
+        form, bit-identical to its compiled fp4-core chain.
+
         Args:
             x (array): any shape with a trailing dim of 128,
                 float16/bfloat16/float32.
+            hadamard (bool): apply the 128-wide Hadamard first. Default
+                True.
 
         Returns:
             array: same shape and dtype as ``x``.
@@ -1118,12 +1225,59 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "latent_fp4_pack",
+      &mlx_kquant::latent_fp4_pack,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        FP4 rows at rest for the sparse attention pool: groups of 16
+        values, one E2M1 nibble each (low nibble first) and one E4M3 scale
+        byte per group. Rows on the DeepSeek-V4.1 latent QAT grid (scale =
+        e4m3(amax / 6), values e2m1(v / scale) * scale) pack exactly and
+        latent_fp4_unpack returns them bit-for-bit; other rows take the
+        same projection the QAT does. sdpa_sparse_decode and
+        sdpa_sparse_prefill read this form through ``pool_scales``.
+
+        Args:
+            x (array): [..., D] with D a multiple of 16; fp16/bf16/fp32.
+
+        Returns:
+            tuple(array, array): codes uint8 [..., D / 2] and scales uint8
+            [..., D / 16]. Metal-only.
+      )");
+
+  m.def(
+      "latent_fp4_unpack",
+      [](mx::array codes,
+         mx::array scales,
+         std::optional<mx::Dtype> dtype,
+         mx::StreamOrDevice s) {
+        return mlx_kquant::latent_fp4_unpack(
+            std::move(codes),
+            std::move(scales),
+            dtype.value_or(mx::float16),
+            s);
+      },
+      "codes"_a,
+      "scales"_a,
+      "dtype"_a = nb::none(),
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Rows of latent_fp4_pack back as ``dtype`` (fp16 default, bf16 or
+        fp32): codes [..., D / 2] and scales [..., D / 16] -> [..., D].
+        Metal-only.
+      )");
+
+  m.def(
       "dsa_kv_qat",
       &mlx_kquant::dsa_kv_qat,
       "x"_a,
       "n_rot"_a,
       nb::kw_only(),
       "f16_round"_a = true,
+      "block"_a = 64,
       "stream"_a = nb::none(),
       R"(
         DeepSeek-V4-Flash main-attention KV QAT round-trip, fused: the
@@ -1140,11 +1294,17 @@ NB_MODULE(_ext, m) {
         row is quantized but never passes through the f16 KV cache; it
         replaces the split + fp8-core + concat chain on its own.
 
+        ``block`` 32 quantizes 32-wide fp8 blocks instead of 64: with
+        ``n_rot`` 0 and ``f16_round`` False that is the DeepSeek-V4.1
+        window-KV form, the whole post-RoPE row in 32-blocks with no
+        fp16 round.
+
         Args:
             x (array): any shape with trailing dim D,
-                (D - n_rot) % 64 == 0; float16/bfloat16/float32.
+                (D - n_rot) % block == 0; float16/bfloat16/float32.
             n_rot (int): trailing RoPE dims excluded from the fp8 step.
             f16_round (bool): apply the trailing fp16 round. Default True.
+            block (int): fp8 block width, 64 or 32. Default 64.
 
         Returns:
             array: same shape and dtype as ``x``.
@@ -1569,6 +1729,7 @@ NB_MODULE(_ext, m) {
       "indices"_a,
       "act"_a = "silu",
       "shexp_kquant_type"_a = "",
+      "limit"_a = 0.0f,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
@@ -1584,9 +1745,12 @@ NB_MODULE(_ext, m) {
             shexp_up_w (array): uint8 wire bytes (N, bytes_per_row).
             kquant_type (str): expert codec with a fused kernel.
             indices (array): expert indices [T, R].
-            act (str): 'silu' (default) or 'gelu' (tanh approx).
+            act (str): 'silu' (default), 'gelu' (tanh approx) or
+                'silu_limit' (deepseek-v4 LimitedSwiGLU: gate clamped from
+                above, up clamped both sides, routed and shared slots alike).
             shexp_kquant_type (str): shared-expert codec; '' (default) =
                 kquant_type. Mixed combos must be q5_k, q6_k or q8_0.
+            limit (float): the 'silu_limit' clamp; must be > 0 for that act.
 
         Returns:
             array: activated hidden states [T, R + 1, N] in x.dtype.

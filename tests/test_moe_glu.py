@@ -234,11 +234,8 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0):
     rel = _rel(got, r)
     out.append(("qmv", rel, rel < REL_BOUND))
 
-    # moe_glu_gather_shexp_kq (shexp codec = scodec). No silu_limit shexp
-    # instantiations exist (the clamped shared experts stay in Python), so
-    # silu_limit runs exercise the shexp op with plain silu.
-    act = "silu" if act == "silu_limit" else act
-    limit = 0.0 if act != "silu_limit" else limit
+    # moe_glu_gather_shexp_kq (shexp codec = scodec); silu_limit clamps the
+    # shared slot too.
     got = kq.moe_glu_gather_shexp_kq(
         x,
         dw,
@@ -249,6 +246,7 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0):
         inds,
         act=act,
         shexp_kquant_type=("" if scodec == codec else scodec),
+        limit=limit,
     )
     mx.eval(got)
     routed = np.stack(
@@ -681,6 +679,11 @@ def main(argv=None) -> int:
         run("iq2_xxs", act="silu_limit", dtype=mx.bfloat16, limit=0.05)
     if not allow or "q2_k" in allow:
         run("q2_k", act="silu_limit", limit=0.05)
+    # V4-Flash mixed-codec blocks: q8_0 shared expert over the low-bit stacks
+    if not allow or "iq2_xxs" in allow:
+        run("iq2_xxs", sx="q8_0", act="silu_limit", limit=0.05)
+    if not allow or "q2_k" in allow:
+        run("q2_k", sx="q8_0", act="silu_limit", dtype=mx.bfloat16, limit=0.05)
     if not allow or "q6_k" in allow:
         run("q6_k", act="silu_limit", limit=0.05)
     if not allow or "q8_0" in allow:
@@ -726,6 +729,8 @@ def test_silu_limit_requires_positive_limit():
     w = mx.zeros((4, 8, 16), dtype=mx.uint8)
     with pytest.raises(ValueError, match="limit"):
         kq.moe_glu_gather_kq(x, w, w, "q8_0", inds, act="silu_limit")
+    with pytest.raises(ValueError, match="limit"):
+        kq.moe_glu_gather_shexp_kq(x, w, w, w[0], w[0], "q8_0", inds, act="silu_limit")
 
 
 def test_swiglu_clamp_validation():

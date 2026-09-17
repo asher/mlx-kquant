@@ -10,8 +10,27 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `load_gguf(skip=...)`: named tensors load no array but still report their
   shape and codec, for a table the caller must read itself because it passes
   the device max buffer length.
+- `dsa_kv_qat(block=32)` and `dsa_indexer_qat(hadamard=False)`: the
+  DeepSeek-V4.1 forms of the fused QAT round-trips.
+- `moe_glu_gather_shexp_kq(act="silu_limit", limit=...)`: the shared-expert
+  fold with the DeepSeek-V4 clamp.
+- `sdpa_sparse_decode`: attention over a window plus index-listed pool rows
+  at head dims 128, 256 and 512, for the DeepSeek-V4 sparse attention step.
+  With `pool_scales=` it reads the pool in its `latent_fp4_pack` form.
+- `sdpa_sparse_prefill`: the prefill form of `sdpa_sparse_decode`, one
+  dispatch per prompt block.
+- `latent_fp4_pack` and `latent_fp4_unpack`: rows at rest as FP4 codes with
+  one scale per 16 values, so a 512-wide row takes 288 bytes instead of
+  1024.
+
+### Changed
+- `dsa_indexer_score_decode` runs on simdgroup matrix tiles, several times
+  faster at depth with the same scores. With `cand=` it scores only the
+  listed key rows.
 
 ### Fixed
+- `dsa_indexer_score_decode` no longer copies a key block that is a prefix
+  slice of a larger cache buffer.
 - Zero-copy views for tensors no 1-D window can address, past `INT32_MAX * 8`
   bytes or lower when the row byte count divides only by 2 or 4. The window
   gains a second dimension and the tensor becomes a whole-row slice of it, so
