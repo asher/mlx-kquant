@@ -1070,6 +1070,7 @@ NB_MODULE(_ext, m) {
       "q_offset"_a,
       "ratio"_a,
       nb::kw_only(),
+      "cand"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Decode-width lightning-indexer scores, fused:
@@ -1079,7 +1080,10 @@ NB_MODULE(_ext, m) {
         global scale is folded out. Pooled visibility follows
         PoolingCache.make_mask(qL, q_offset): row p is visible to query j
         iff p < (q_offset + j + 1) // ratio, and every row is visible when
-        qL == 1; invisible rows score the dtype's finite min.
+        qL == 1; invisible rows score the dtype's finite min. With ``cand``
+        column c of query j scores key row cand[b, j, c] instead of row c
+        and the result is [B, 1, qL, NC]; a negative or out-of-range entry
+        scores the finite min.
 
         Args:
             queries (array): [B, H, qL, 128], H in {4, 32, 64}, qL in
@@ -1091,9 +1095,12 @@ NB_MODULE(_ext, m) {
             q_offset (int): absolute position of query row 0's step
                 (make_mask's ``offset``).
             ratio (int): pooled compression ratio.
+            cand (array, optional): int32/uint32 [B, qL, NC] key rows to
+                score per query (a two-level top-k's candidate list).
 
         Returns:
-            array: scores [B, 1, qL, P] shaped for dsa_topk_indices.
+            array: scores [B, 1, qL, P] ([B, 1, qL, NC] with ``cand``)
+            shaped for dsa_topk_indices.
       )");
 
   m.def(

@@ -38,6 +38,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - `dsa_indexer_score_decode` runs on simdgroup matrix tiles instead of a
   lane-per-key reduction, 2.7x faster at 256K keys, with the same scores.
+  With `cand=` it scores only the listed key rows, so the second level of
+  a two-level top-k costs the same at every depth.
 
 ### Fixed
 - `dsa_indexer_score_decode` no longer copies a key block that is a prefix

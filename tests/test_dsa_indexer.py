@@ -389,3 +389,50 @@ def test_dsa_indexer_score_decode_strided_keys_match(B):
     for keys in (kbuf[:, 5 : 5 + P], mx.swapaxes(kt, 1, 2)):
         got = kq.dsa_indexer_score_decode(q, keys, w, 4106, 4)
         assert mx.array_equal(got, want).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "QL,P,NC,H,wf32",
+    [
+        (1, 4096, 1000, 64, False),
+        (3, 1027, 517, 64, True),
+        (2, 300, 64, 32, False),
+        (4, 2066, 2048, 4, False),
+    ],
+)
+def test_dsa_indexer_score_decode_cand(dtype, QL, P, NC, H, wf32):
+    """cand columns score exactly what the full scorer gives those rows;
+    negative and out-of-range entries score the finite min."""
+    q, k, w = _make_decode_qkw(
+        2, QL, P, dtype, seed=41, H=H, wdtype=mx.float32 if wf32 else None
+    )
+    q_offset, ratio = 4106, 4
+    rng = np.random.default_rng(5)
+    cand = rng.integers(0, P, (2, QL, NC)).astype(np.int32)
+    cand[:, :, :3] = np.array([-1, P, P + 9])
+    full = kq.dsa_indexer_score_decode(q, k, w, q_offset, ratio)
+    got = kq.dsa_indexer_score_decode(q, k, w, q_offset, ratio, cand=mx.array(cand))
+    mx.eval(full, got)
+    assert got.shape == (2, 1, QL, NC) and got.dtype == dtype
+    g = np.array(got.astype(mx.float32))
+    f = np.array(full.astype(mx.float32))
+    fmin = float(mx.finfo(dtype).min)
+    for b in range(2):
+        for j in range(QL):
+            for c in range(NC):
+                r = int(cand[b, j, c])
+                want = f[b, 0, j, r] if 0 <= r < P else fmin
+                assert g[b, 0, j, c] == want, (b, j, c, r)
+    same = kq.dsa_indexer_score_decode(
+        q, k, w, q_offset, ratio, cand=mx.array(cand).astype(mx.uint32)
+    )
+    assert mx.array_equal(same, got).item()
+    with pytest.raises(ValueError, match="cand"):
+        kq.dsa_indexer_score_decode(
+            q, k, w, q_offset, ratio, cand=mx.zeros((2, QL + 1, 8), mx.int32)
+        )
+    with pytest.raises(ValueError, match="cand"):
+        kq.dsa_indexer_score_decode(
+            q, k, w, q_offset, ratio, cand=mx.zeros((2, QL, 8), mx.int64)
+        )

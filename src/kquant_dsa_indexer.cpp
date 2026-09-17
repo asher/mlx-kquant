@@ -241,19 +241,24 @@ void KQDsaIndexerScoreDecode::eval_gpu(
   const int H = q.shape(1);
   const int QL = q.shape(2);
   const int P = k.shape(1) / q.shape(3);
+  // Columns scored per query: the candidate list's width, else every row.
+  const mx::array& cand = cand_ ? inputs[3] : q;
+  const int NC = cand_ ? cand.shape(2) : P;
 
   const bool wf = weights.dtype() == mx::float32;
   const std::string kname = "kq_dsa_indexer_score_decode_" +
       (H == 64 && !wf ? std::string() : "h" + std::to_string(H) + "_") +
       std::string(wf ? "wf_" : "") + kq_type_string(q.dtype()) + "_ql" +
-      std::to_string(QL);
+      std::to_string(QL) + (cand_ ? "_cand" : "");
 
   // Keys per threadgroup: a multiple of the kernel's SGS x 8 rows, at
   // least 128 and sized for about 512 threadgroups (the query staging
   // amortizes past 128; the plateau holds to 512 on M3 Max).
-  constexpr int sgs = 8;
-  constexpr int rows = sgs * 8;
-  int kpt = std::max(128, (P + 511) / 512);
+  // The candidate arm stages every block per simdgroup, so it runs 4
+  // simdgroups to fit the threadgroup memory.
+  const int sgs = cand_ ? 4 : 8;
+  const int rows = sgs * 8;
+  int kpt = std::max(128, (NC + 511) / 512);
   kpt = (kpt + rows - 1) / rows * rows;
 
   auto kernel = kq_get_kernel(d, kname, kname, {});
@@ -267,9 +272,11 @@ void KQDsaIndexerScoreDecode::eval_gpu(
   ce.set_bytes(q_offset_, 5);
   ce.set_bytes(ratio_, 6);
   ce.set_bytes(kpt, 7);
+  ce.set_input_array(cand, 8);
+  ce.set_bytes(NC, 9);
 
   MTL::Size group_dims(32, sgs, 1);
-  MTL::Size grid_dims((P + kpt - 1) / kpt, 1, B);
+  MTL::Size grid_dims((NC + kpt - 1) / kpt, 1, B);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -426,12 +433,13 @@ std::vector<mx::Shape> KQDsaIndexerScoreDecode::output_shapes(
     const std::vector<mx::array>& inputs) {
   const auto& q = inputs[0];
   const auto& k = inputs[1];
-  return {mx::Shape{q.shape(0), 1, q.shape(2), k.shape(1)}};
+  const int cols = cand_ ? inputs[3].shape(2) : k.shape(1);
+  return {mx::Shape{q.shape(0), 1, q.shape(2), cols}};
 }
 
 bool KQDsaIndexerScoreDecode::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQDsaIndexerScoreDecode&>(other);
-  return q_offset_ == o.q_offset_ && ratio_ == o.ratio_;
+  return q_offset_ == o.q_offset_ && ratio_ == o.ratio_ && cand_ == o.cand_;
 }
 
 mx::array dsa_indexer_score_decode(
@@ -440,6 +448,7 @@ mx::array dsa_indexer_score_decode(
     mx::array weights,
     int q_offset,
     int ratio,
+    const std::optional<mx::array>& cand,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
 
@@ -479,6 +488,16 @@ mx::array dsa_indexer_score_decode(
         "[mlx_kquant.dsa_indexer_score_decode] q_offset must be >= 0 and "
         "ratio >= 1.");
   }
+  if (cand &&
+      (cand->ndim() != 3 || cand->shape(0) != B || cand->shape(1) != QL ||
+       cand->shape(2) < 1 ||
+       (cand->dtype() != mx::int32 && cand->dtype() != mx::uint32))) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_indexer_score_decode] cand must be int32 or "
+        << "uint32 [B, qL, NC], got " << cand->shape() << " " << cand->dtype()
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
 
   // fp32 head weights are read as fp32 (the wf kernel arm); anything else
   // follows the q/k dtype. Scores always emit in the q/k dtype.
@@ -509,12 +528,16 @@ mx::array dsa_indexer_score_decode(
   auto w = mx::contiguous(
       mx::astype(weights, weights_f32 ? mx::float32 : final_type, s), false, s);
 
-  mx::Shape out_shape{B, 1, QL, keys.shape(1)};
+  mx::Shape out_shape{B, 1, QL, cand ? cand->shape(2) : keys.shape(1)};
   std::vector<mx::array> inputs = {std::move(q), std::move(k), std::move(w)};
+  if (cand) {
+    inputs.push_back(mx::contiguous(mx::astype(*cand, mx::int32, s), false, s));
+  }
   return mx::array(
       std::move(out_shape),
       final_type,
-      std::make_shared<KQDsaIndexerScoreDecode>(s, q_offset, ratio),
+      std::make_shared<KQDsaIndexerScoreDecode>(
+          s, q_offset, ratio, cand.has_value()),
       std::move(inputs));
 }
 

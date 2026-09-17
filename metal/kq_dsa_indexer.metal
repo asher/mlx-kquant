@@ -32,7 +32,10 @@ instantiate_kq_dsa_topk_indices(bfloat16_t, bfloat16_t, 512, 1024);
 #define instantiate_kq_dsa_indexer_score_decode(tname, dtype, ql, h, hs, wt, ws) \
   instantiate_kernel(                                                               \
       "kq_dsa_indexer_score_decode_" hs ws #tname "_ql" #ql,                        \
-      kq_dsa_indexer_score_decode, dtype, ql, h, 128, 8, 1, wt)
+      kq_dsa_indexer_score_decode, dtype, ql, h, 128, 8, 1, wt)                     \
+  instantiate_kernel(                                                               \
+      "kq_dsa_indexer_score_decode_" hs ws #tname "_ql" #ql "_cand",                \
+      kq_dsa_indexer_score_decode, dtype, ql, h, 128, 4, 1, wt, true)
 
 #define instantiate_kq_dsa_indexer_score_decode_all(tname, dtype, h, hs)  \
   instantiate_kq_dsa_indexer_score_decode(tname, dtype, 1, h, hs, dtype, ""); \

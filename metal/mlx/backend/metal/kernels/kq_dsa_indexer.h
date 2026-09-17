@@ -354,6 +354,9 @@ kq_dsa_indexer_score(
 // QL == 1; invisible rows score the dtype's finite min so the radix top-k
 // orders them last. WT is the head-weight storage type: fp32 keeps
 // sign-free head gates exact for the runtimes that pin them (glm5).
+// CAND: column c of query j scores key row C[b, j, c] instead of row c
+// (the candidate list of a two-level top-k), the output is [B, 1, QL, NC]
+// and a negative or out-of-range entry scores the finite min.
 template <
     typename T,
     int QL,
@@ -361,17 +364,20 @@ template <
     int D = 128,
     int SGS = 8,
     int NB = 1,
-    typename WT = T>
+    typename WT = T,
+    bool CAND = false>
 [[kernel, max_total_threads_per_threadgroup(SGS * 32)]] void
 kq_dsa_indexer_score_decode(
     const device T* Q [[buffer(0)]], // [B, H, QL, D]
     const device T* K [[buffer(1)]], // [B, P, D]
     const device WT* W [[buffer(2)]], // [B, QL, H]
-    device T* out [[buffer(3)]], // [B, 1, QL, P]
+    device T* out [[buffer(3)]], // [B, 1, QL, P] or [B, 1, QL, NC]
     const constant int& P [[buffer(4)]],
     const constant int& q_offset [[buffer(5)]],
     const constant int& ratio [[buffer(6)]],
     const constant int& keys_per_tg [[buffer(7)]],
+    const device int* C [[buffer(8)]], // [B, QL, NC] key rows (CAND)
+    const constant int& NC [[buffer(9)]],
     uint3 tid [[threadgroup_position_in_grid]],
     ushort simd_gid [[simdgroup_index_in_threadgroup]],
     ushort simd_lid [[thread_index_in_simdgroup]]) {
@@ -387,17 +393,22 @@ kq_dsa_indexer_score_decode(
 
   threadgroup T Qs[HP * LD];
   threadgroup float Wsm[NHT * 64];
-  threadgroup T Ktail[KB * LD];
+  // Staged key rows: one tile per simdgroup under CAND (every block is
+  // staged), one for the whole threadgroup otherwise (only the last is).
+  constexpr int NKT = CAND ? SGS : 1;
+  threadgroup T Ktail[NKT * KB * LD];
   threadgroup float Os[SGS * 64];
 
+  const int ncol = CAND ? NC : P;
   const int b = int(tid.z);
   const int tg0 = int(tid.x) * keys_per_tg;
-  if (tg0 >= P) {
+  if (tg0 >= ncol) {
     return;
   }
-  const int tg1 = metal::min(P, tg0 + keys_per_tg);
+  const int tg1 = metal::min(ncol, tg0 + keys_per_tg);
   const int nblk = (tg1 - tg0 + KB - 1) / KB;
   const int tidx = int(simd_gid) * 32 + int(simd_lid);
+  threadgroup T* kt = Ktail + (CAND ? int(simd_gid) : 0) * KB * LD;
 
   if (HP > H) {
     for (int i = tidx; i < (HP - H) * LD; i += NTH) {
@@ -408,7 +419,7 @@ kq_dsa_indexer_score_decode(
   const device T* qb = Q + size_t(b) * H * QL * D;
   const device WT* wb = W + size_t(b) * QL * H;
   const device T* kb = K + size_t(b) * size_t(P) * D;
-  device T* ob = out + size_t(b) * QL * size_t(P);
+  device T* ob = out + size_t(b) * QL * size_t(ncol);
 
   for (int j = 0; j < QL; ++j) {
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -432,11 +443,13 @@ kq_dsa_indexer_score_decode(
       simdgroup_load(Wf[ht], Wsm + ht * 64, 8);
     }
     const int vlim = QL == 1 ? P : metal::min(P, (q_offset + j + 1) / ratio);
+    // Candidate rows of query j (CAND only; never read otherwise).
+    const device int* cj = C + (size_t(b) * QL + j) * size_t(CAND ? NC : 0);
 
     for (int blk = int(simd_gid); blk < nblk; blk += SGS) {
       const int key0 = tg0 + blk * KB;
       MatT Kt[NB][NDT];
-      if (key0 + KB <= P) {
+      if (!CAND && key0 + KB <= P) {
         STEEL_PRAGMA_UNROLL
         for (int nb = 0; nb < NB; ++nb) {
           const device T* kr = kb + size_t(key0 + nb * 8) * D;
@@ -446,15 +459,22 @@ kq_dsa_indexer_score_decode(
           }
         }
       } else {
-        // Only the last block of the pool lands here: stage it with zero
-        // rows past P so the tile loads stay in bounds.
-        for (int c = int(simd_lid); c < KB * CH; c += 32) {
-          const int r = c / CH;
-          const int d = (c % CH) * 8;
-          *reinterpret_cast<threadgroup vec<T, 8>*>(Ktail + r * LD + d) =
-              key0 + r < P ? *reinterpret_cast<const device vec<T, 8>*>(
-                                 kb + size_t(key0 + r) * D + d)
-                           : vec<T, 8>(0);
+        // Candidate rows, or the last block of the pool: stage the rows
+        // with zeros where the row is out of range so the tile loads
+        // stay in bounds.
+        for (int ch = int(simd_lid); ch < KB * CH; ch += 32) {
+          const int r = ch / CH;
+          const int d = (ch % CH) * 8;
+          const int col = key0 + r;
+          int kr = col;
+          if (CAND) {
+            kr = col < NC ? cj[col] : -1;
+          }
+          const bool ok = kr >= 0 && kr < P;
+          *reinterpret_cast<threadgroup vec<T, 8>*>(kt + r * LD + d) = ok
+              ? *reinterpret_cast<const device vec<T, 8>*>(
+                    kb + size_t(kr) * D + d)
+              : vec<T, 8>(0);
         }
         simdgroup_barrier(metal::mem_flags::mem_threadgroup);
         STEEL_PRAGMA_UNROLL
@@ -462,11 +482,7 @@ kq_dsa_indexer_score_decode(
           STEEL_PRAGMA_UNROLL
           for (int dt = 0; dt < NDT; ++dt) {
             simdgroup_load(
-                Kt[nb][dt],
-                Ktail + nb * 8 * LD + dt * 8,
-                LD,
-                ulong2(0, 0),
-                true);
+                Kt[nb][dt], kt + nb * 8 * LD + dt * 8, LD, ulong2(0, 0), true);
           }
         }
       }
@@ -508,10 +524,17 @@ kq_dsa_indexer_score_decode(
         simdgroup_store(acc[nb], os, 8);
         simdgroup_barrier(metal::mem_flags::mem_threadgroup);
         if (simd_lid < 8) {
-          const int r = key0 + nb * 8 + int(simd_lid);
-          if (r < P) {
-            ob[size_t(j) * P + r] =
-                r < vlim ? static_cast<T>(os[simd_lid]) : Limits<T>::finite_min;
+          const int col = key0 + nb * 8 + int(simd_lid);
+          if (col < ncol) {
+            int kr = col;
+            bool ok = true;
+            if (CAND) {
+              kr = cj[col];
+              ok = kr >= 0 && kr < P;
+            }
+            ob[size_t(j) * ncol + col] = ok && kr < vlim
+                ? static_cast<T>(os[simd_lid])
+                : Limits<T>::finite_min;
           }
         }
         simdgroup_barrier(metal::mem_flags::mem_threadgroup);

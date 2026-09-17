@@ -599,13 +599,17 @@ mx::array dsa_topk_indices(
 // PoolingCache.make_mask(qL, q_offset): row i is visible to query j iff
 // i < (q_offset + j + 1) / ratio, and every row is visible when qL == 1;
 // invisible rows score the dtype's finite min. Returns [B, 1, qL, P] scores
-// shaped for dsa_topk_indices. Metal-only.
+// shaped for dsa_topk_indices. With cand [B, qL, NC] (int32/uint32 key
+// rows, the candidate list of a two-level top-k) column c of query j scores
+// row cand[b, j, c] and the result is [B, 1, qL, NC]; a negative or
+// out-of-range entry scores the finite min. Metal-only.
 mx::array dsa_indexer_score_decode(
     mx::array queries,
     mx::array keys,
     mx::array weights,
     int q_offset,
     int ratio,
+    const std::optional<mx::array>& cand = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // DeepSeek-V4-Flash indexer activation QAT round-trip, fused: 128-wide
@@ -1743,8 +1747,15 @@ class KQDsaTopKIndices : public mx::Primitive {
 // dsa_indexer_score_decode). Inference-only, Metal-only.
 class KQDsaIndexerScoreDecode : public mx::Primitive {
  public:
-  explicit KQDsaIndexerScoreDecode(mx::Stream stream, int q_offset, int ratio)
-      : mx::Primitive(stream), q_offset_(q_offset), ratio_(ratio) {}
+  explicit KQDsaIndexerScoreDecode(
+      mx::Stream stream,
+      int q_offset,
+      int ratio,
+      bool cand = false)
+      : mx::Primitive(stream),
+        q_offset_(q_offset),
+        ratio_(ratio),
+        cand_(cand) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -1764,6 +1775,7 @@ class KQDsaIndexerScoreDecode : public mx::Primitive {
  private:
   int q_offset_;
   int ratio_;
+  bool cand_;
 };
 
 // DeepSeek-V4-Flash fused indexer QAT round-trip (see dsa_indexer_qat).
