@@ -23,11 +23,21 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   512, for the DeepSeek-V4 sparse attention step. Queries are a batch
   dimension, so a prefill block of up to 4096 goes through the same call,
   and the window and pool pass as slices of a larger cache buffer with no
-  copy.
+  copy. With `pool_scales=` the pool is the packed form of
+  `latent_fp4_pack` and its rows dequantize as they stage.
 - `sdpa_sparse_prefill`: the prefill form of `sdpa_sparse_decode` (same
-  operands and head dims), one threadgroup per query and head group over
-  the window rows its position reaches plus its listed pool rows, so a
-  prompt block is one dispatch instead of a decode-kernel call per band.
+  operands, head dims and packed pool), one threadgroup per query and head
+  group over the window rows its position reaches plus its listed pool
+  rows, so a prompt block is one dispatch instead of a decode-kernel call
+  per band.
+- `latent_fp4_pack` and `latent_fp4_unpack`: rows at rest as E2M1 codes
+  with one E4M3 scale per 16 values, 288 bytes per 512-wide row instead of
+  1024. Rows on the DeepSeek-V4.1 latent QAT grid pack and unpack
+  bit-for-bit; other rows land on the grid the way that QAT projects them.
+
+### Changed
+- `dsa_indexer_score_decode` runs on simdgroup matrix tiles instead of a
+  lane-per-key reduction, 2.7x faster at 256K keys, with the same scores.
 
 ### Fixed
 - `dsa_indexer_score_decode` no longer copies a key block that is a prefix
