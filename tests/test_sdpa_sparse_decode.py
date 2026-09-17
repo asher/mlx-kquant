@@ -154,18 +154,20 @@ def test_no_sinks_and_window_only():
         pad=False,
     )
     q, win, pool, idx, scale, kw = args
-    got = kq.sdpa_sparse_decode(q, win, pool, idx, scale)
-    mx.eval(got)
-    assert float(np.abs(np.array(got.astype(mx.float32)) - ref).max()) < 3e-3
+    for splits in (0, 1):
+        got = kq.sdpa_sparse_decode(q, win, pool, idx, scale, splits=splits)
+        mx.eval(got)
+        assert float(np.abs(np.array(got.astype(mx.float32)) - ref).max()) < 3e-3
 
 
 @pytest.mark.parametrize("L", [64, 200])
-def test_prefill_block_widths(L):
+@pytest.mark.parametrize("D,H", [(128, 16), (512, 64), (256, 12)])
+def test_prefill_block_widths(L, D, H):
     args, ref = _case(
         1,
-        16,
+        H,
         L,
-        128,
+        D,
         L + 7,
         96,
         24,
@@ -177,6 +179,7 @@ def test_prefill_block_widths(L):
         seed=L,
     )
     _check(args, ref, 3e-3)
+    _check(args, ref, 3e-3, splits=3)
 
 
 def test_validation():

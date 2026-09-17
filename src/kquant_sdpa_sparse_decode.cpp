@@ -61,10 +61,21 @@ void KQSdpaSparseDecode::eval_gpu(
   const int N = idx.shape(2);
   const int total = W + N;
 
+  // A decode step spreads its few queries over 8-head groups; a prefill
+  // block has queries to spare, so 16 heads share each staged key block.
+  // KQ_SDPA_SPARSE_HG=8|16|32|64 forces one (A/B lever).
+  int hg = L > 1 ? 2 * kHeadGroup : kHeadGroup;
+  {
+    static const char* env = std::getenv("KQ_SDPA_SPARSE_HG");
+    const int v = env ? std::atoi(env) : 0;
+    if (v == 8 || v == 16 || v == 32 || v == 64) {
+      hg = v;
+    }
+  }
   // Enough threadgroups to cover the GPU: head groups x (B * L) x splits.
   // Splits hold whole 8-key blocks, so the count can land under the ask.
-  const int hgroups = (H + kHeadGroup - 1) / kHeadGroup;
-  const int Hp = hgroups * kHeadGroup;
+  const int hgroups = (H + hg - 1) / hg;
+  const int Hp = hgroups * hg;
   int n_splits = splits_;
   if (n_splits <= 0) {
     static const char* env = std::getenv("KQ_SDPA_SPARSE_SPLITS");
@@ -95,6 +106,7 @@ void KQSdpaSparseDecode::eval_gpu(
   params.has_sinks = sinks != nullptr;
   params.has_win_mask = wmask != nullptr;
   params.has_sel_mask = smask != nullptr;
+  params.direct = n_splits == 1;
   params.scale_log2 = scale_ * 1.4426950408889634f;
   params.q_strides[0] = q.strides(0);
   params.q_strides[1] = q.strides(1);
@@ -117,22 +129,14 @@ void KQSdpaSparseDecode::eval_gpu(
   params.o_strides[1] = o.strides(1);
   params.o_strides[2] = o.strides(2);
 
-  mx::array oacc({B, L, n_splits, Hp, D}, mx::float32, nullptr, {});
-  mx::array ms({B, L, n_splits, Hp}, mx::float32, nullptr, {});
-  mx::array ls({B, L, n_splits, Hp}, mx::float32, nullptr, {});
-  oacc.set_data(mx::allocator::malloc(oacc.nbytes()));
-  ms.set_data(mx::allocator::malloc(ms.nbytes()));
-  ls.set_data(mx::allocator::malloc(ls.nbytes()));
   auto& ce = mx::metal::get_command_encoder(s);
-  ce.add_temporary(oacc);
-  ce.add_temporary(ms);
-  ce.add_temporary(ls);
-
   const std::string ts = kq_type_string(q.dtype());
   const std::string is = idx.dtype() == mx::int32 ? "i32" : "u32";
   const std::string dtag = "_d" + std::to_string(D);
-  auto split_kernel =
-      kq_get_kernel(d, "kq_sdpa_sparse_decode_split_" + ts + "_" + is + dtag);
+  auto split_kernel = kq_get_kernel(
+      d,
+      "kq_sdpa_sparse_decode_split_" + ts + "_" + is + dtag + "_hg" +
+          std::to_string(hg));
   ce.set_compute_pipeline_state(split_kernel);
   ce.set_input_array(q, 0);
   ce.set_input_array(win, 1);
@@ -141,12 +145,33 @@ void KQSdpaSparseDecode::eval_gpu(
   // Absent optionals bind a placeholder the kernel never reads.
   ce.set_input_array(wmask ? *wmask : idx, 4);
   ce.set_input_array(smask ? *smask : idx, 5);
+  ce.set_bytes(params, 9);
+  ce.set_input_array(sinks ? *sinks : q, 10);
+  ce.set_output_array(o, 11);
+  if (params.direct) {
+    // No partials: the split kernel writes O and never touches 6-8.
+    ce.set_input_array(q, 6);
+    ce.set_input_array(q, 7);
+    ce.set_input_array(q, 8);
+    ce.dispatch_threadgroups(
+        MTL::Size(n_splits, hgroups, B * L), MTL::Size(hg / 4 * 32, 1, 1));
+    return;
+  }
+
+  mx::array oacc({B, L, n_splits, Hp, D}, mx::float32, nullptr, {});
+  mx::array ms({B, L, n_splits, Hp}, mx::float32, nullptr, {});
+  mx::array ls({B, L, n_splits, Hp}, mx::float32, nullptr, {});
+  oacc.set_data(mx::allocator::malloc(oacc.nbytes()));
+  ms.set_data(mx::allocator::malloc(ms.nbytes()));
+  ls.set_data(mx::allocator::malloc(ls.nbytes()));
+  ce.add_temporary(oacc);
+  ce.add_temporary(ms);
+  ce.add_temporary(ls);
   ce.set_output_array(oacc, 6);
   ce.set_output_array(ms, 7);
   ce.set_output_array(ls, 8);
-  ce.set_bytes(params, 9);
   ce.dispatch_threadgroups(
-      MTL::Size(n_splits, hgroups, B * L), MTL::Size(64, 1, 1));
+      MTL::Size(n_splits, hgroups, B * L), MTL::Size(hg / 4 * 32, 1, 1));
 
   auto merge_kernel =
       kq_get_kernel(d, "kq_sdpa_sparse_decode_merge_" + ts + dtag);

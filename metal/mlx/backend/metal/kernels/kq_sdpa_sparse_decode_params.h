@@ -16,6 +16,7 @@ struct KQSdpaSparseDecodeParams {
   int has_sinks;
   int has_win_mask;
   int has_sel_mask;
+  int direct; ///< One split: the split kernel normalizes and writes O
   float scale_log2; ///< softmax scale times log2(e)
 
   int64_t q_strides[3]; ///< B, H, L (D contiguous)

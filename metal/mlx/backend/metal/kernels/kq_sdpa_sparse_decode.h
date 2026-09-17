@@ -2,16 +2,17 @@
 // and a pool [P, D] read through a per-query index list [N]. K == V (the
 // absorbed-MLA latent).
 //
-// Split kernel: one threadgroup of two simdgroups per (8-head group, query,
-// key split). Blocks of 8 key rows are staged through one threadgroup
-// buffer (each simdgroup stages and owns one half of D), scored
-// against the 8 queries with simdgroup matrix ops (partial scores summed
-// across the two halves), run through an exp2-space online softmax held per
-// row in the fragment layout, and accumulated into fp32 output tiles.
-// Masked or out-of-range rows score kNegBig and weigh zero, which matches
-// an additive -inf mask without inf arithmetic. The footprint stays small
-// (one 8-row buffer, the queries pass through it once) so several
-// threadgroups share a core. The merge kernel renormalizes the split
+// Split kernel: one threadgroup per (HG-head group, query, key split), two
+// simdgroups per 8 heads (each owns one half of D). Blocks of 8 key rows are
+// staged through one threadgroup buffer shared by every simdgroup, scored
+// against the 8 queries of each simdgroup with simdgroup matrix ops (partial
+// scores summed across the two halves), run through an exp2-space online
+// softmax held per row in the fragment layout, and accumulated into fp32
+// output tiles. The next block's rows are fetched into registers while the
+// current block computes. Masked or out-of-range rows score kNegBig and
+// weigh zero, which matches an additive -inf mask without inf arithmetic.
+// A lone split (p->direct) normalizes in place, sinks included, and writes
+// the output rows itself; otherwise the merge kernel renormalizes the split
 // partials with the head's sink counted once.
 #pragma once
 
@@ -24,7 +25,7 @@ constant constexpr float kSdpaSparseNegBig = -1e30f;
 
 #define KQ_UNROLL _Pragma("clang loop unroll(full)")
 
-template <typename T, typename IdxT, int D>
+template <typename T, typename IdxT, int D, int HG>
 [[kernel]] void kq_sdpa_sparse_decode_split(
     const device T* Q [[buffer(0)]],
     const device T* Win [[buffer(1)]],
@@ -36,52 +37,62 @@ template <typename T, typename IdxT, int D>
     device float* Ms [[buffer(7)]],
     device float* Ls [[buffer(8)]],
     const constant KQSdpaSparseDecodeParams* p [[buffer(9)]],
+    const device T* Sinks [[buffer(10)]],
+    device T* O [[buffer(11)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-  constexpr int HG = 8; // heads per threadgroup
   constexpr int KB = 8; // keys per block
+  constexpr int KT = KB / 8; // 8-key tiles per block
+  constexpr int NSG = HG / 4; // simdgroups: two per 8-head subgroup
+  constexpr int NTH = NSG * 32;
   constexpr int LD = D + 8; // padded row (bank spread, 16-byte aligned)
   constexpr int DH = D / 2; // dims per simdgroup
   constexpr int NT = DH / 8; // 8x8 tiles per simdgroup along D
-  constexpr int CH = DH / 8; // 16-byte chunks per half row
+  constexpr int CHR = D / 8; // 16-byte chunks per row
+  constexpr int SV = (KB * CHR + NTH - 1) / NTH; // staged chunks per thread
+  static_assert(HG % 8 == 0, "head groups are 8-head tiles");
   using MatT = metal::simdgroup_matrix<T, 8, 8>;
   using MatF = metal::simdgroup_matrix<float, 8, 8>;
 
-  static_assert(HG == KB, "the query rows pass through the key buffer");
   threadgroup T Ks[KB * LD];
-  threadgroup float Sx[2][32][2];
+  threadgroup float Sx[NSG][32][2 * KT];
 
   const int s = int(tid.x);
   const int h0 = int(tid.y) * HG;
   const int b = int(tid.z) / p->L;
   const int l = int(tid.z) % p->L;
   const int g = int(simd_gid);
+  const int hs = g >> 1; // 8-head subgroup of this simdgroup
+  const int dh = g & 1; // D half of this simdgroup
   const int H = p->H;
   const int tix = g * 32 + int(lane);
 
-  // Queries of the 8 heads (rows past H repeat the last head; their
-  // partials are never read).
+  // Queries, 8 heads per round through the key buffer (rows past H repeat
+  // the last head; their partials are never read).
+  MatT Qt[NT];
   {
     const device T* qb =
         Q + size_t(b) * p->q_strides[0] + size_t(l) * p->q_strides[2];
-    constexpr int QCH = D / 8;
-    for (int v = tix; v < HG * QCH; v += 64) {
-      const int r = v / QCH;
-      const int c = v % QCH;
-      const int h = metal::min(h0 + r, H - 1);
-      const uint4 x = *reinterpret_cast<const device uint4*>(
-          qb + size_t(h) * p->q_strides[1] + c * 8);
-      *reinterpret_cast<threadgroup uint4*>(Ks + r * LD + c * 8) = x;
+    for (int sg = 0; sg < HG / 8; ++sg) {
+      for (int v = tix; v < 8 * CHR; v += NTH) {
+        const int r = v / CHR;
+        const int c = v % CHR;
+        const int h = metal::min(h0 + sg * 8 + r, H - 1);
+        const uint4 x = *reinterpret_cast<const device uint4*>(
+            qb + size_t(h) * p->q_strides[1] + c * 8);
+        *reinterpret_cast<threadgroup uint4*>(Ks + r * LD + c * 8) = x;
+      }
+      threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+      if (hs == sg) {
+        KQ_UNROLL
+        for (int t = 0; t < NT; ++t) {
+          simdgroup_load(Qt[t], Ks + dh * DH + t * 8, LD);
+        }
+      }
+      threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     }
   }
-  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-  MatT Qt[NT];
-  KQ_UNROLL
-  for (int t = 0; t < NT; ++t) {
-    simdgroup_load(Qt[t], Ks + g * DH + t * 8, LD);
-  }
-  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
   MatF Ot[NT];
   KQ_UNROLL
   for (int t = 0; t < NT; ++t) {
@@ -116,72 +127,113 @@ template <typename T, typename IdxT, int D>
   const device T* safe_row = W > 0 ? win_b : pool_b;
   const float sl2 = p->scale_log2;
 
+  // Rows of block j0 (uniform across the threadgroup) into registers.
+  uint4 pre[SV];
+  int okbits = 0;
+#define KQ_SPARSE_FETCH(j0)                                                \
+  {                                                                        \
+    const device T* rows[KB];                                              \
+    okbits = 0;                                                            \
+    KQ_UNROLL                                                              \
+    for (int k = 0; k < KB; ++k) {                                         \
+      const int j = (j0) + k;                                              \
+      bool v = j < k1;                                                     \
+      const device T* row = safe_row;                                      \
+      if (v) {                                                             \
+        if (j < W) {                                                       \
+          v = (wm == nullptr) || wm[j];                                    \
+          row = win_b + size_t(j) * p->win_strides[1];                     \
+        } else {                                                           \
+          const int n = j - W;                                             \
+          v = (sm == nullptr) || sm[n];                                    \
+          if (v) {                                                         \
+            const int64_t r = int64_t(idx_bl[n]);                          \
+            v = r >= 0 && r < int64_t(p->P);                               \
+            if (v) {                                                       \
+              row = pool_b + size_t(r) * p->pool_strides[1];               \
+            }                                                              \
+          }                                                                \
+        }                                                                  \
+      }                                                                    \
+      okbits |= int(v) << k;                                               \
+      rows[k] = row;                                                       \
+    }                                                                      \
+    KQ_UNROLL                                                              \
+    for (int i = 0; i < SV; ++i) {                                         \
+      const int v = tix + i * NTH;                                         \
+      if (v < KB * CHR) {                                                  \
+        pre[i] =                                                           \
+            reinterpret_cast<const device uint4*>(rows[v / CHR])[v % CHR]; \
+      }                                                                    \
+    }                                                                      \
+  }
+
+  if (k0 < k1) {
+    KQ_SPARSE_FETCH(k0);
+  }
   for (int j0 = k0; j0 < k1; j0 += KB) {
-    // Rows of this block (uniform across the threadgroup).
-    const device T* rows[KB];
-    int okbits = 0;
     KQ_UNROLL
-    for (int k = 0; k < KB; ++k) {
-      const int j = j0 + k;
-      bool v = j < k1;
-      const device T* row = safe_row;
-      if (v) {
-        if (j < W) {
-          v = (wm == nullptr) || wm[j];
-          row = win_b + size_t(j) * p->win_strides[1];
-        } else {
-          const int n = j - W;
-          v = (sm == nullptr) || sm[n];
-          if (v) {
-            const int64_t r = int64_t(idx_bl[n]);
-            v = r >= 0 && r < int64_t(p->P);
-            if (v) {
-              row = pool_b + size_t(r) * p->pool_strides[1];
-            }
-          }
-        }
-      }
-      okbits |= int(v) << k;
-      rows[k] = row + g * DH;
-    }
-    // Stage this simdgroup's half of the 8 rows.
-    if (int(lane) < CH) {
-      KQ_UNROLL
-      for (int k = 0; k < KB; ++k) {
-        const uint4 x = reinterpret_cast<const device uint4*>(rows[k])[lane];
-        *reinterpret_cast<threadgroup uint4*>(Ks + k * LD + g * DH + lane * 8) =
-            x;
+    for (int i = 0; i < SV; ++i) {
+      const int v = tix + i * NTH;
+      if (v < KB * CHR) {
+        *reinterpret_cast<threadgroup uint4*>(
+            Ks + (v / CHR) * LD + (v % CHR) * 8) = pre[i];
       }
     }
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    const int cur_ok = okbits;
+    if (j0 + KB < k1) {
+      KQ_SPARSE_FETCH(j0 + KB);
+    }
 
     // Partial scores over this half of D, then the other half's.
-    MatF St = MatF(0.0f);
+    MatF St[KT];
     KQ_UNROLL
-    for (int t = 0; t < NT; ++t) {
-      MatT Kt;
-      simdgroup_load(Kt, Ks + g * DH + t * 8, LD, ulong2(0, 0), true);
-      simdgroup_multiply_accumulate(St, Qt[t], Kt, St);
+    for (int kt = 0; kt < KT; ++kt) {
+      St[kt] = MatF(0.0f);
+      KQ_UNROLL
+      for (int t = 0; t < NT; ++t) {
+        MatT Kt;
+        simdgroup_load(
+            Kt, Ks + kt * 8 * LD + dh * DH + t * 8, LD, ulong2(0, 0), true);
+        simdgroup_multiply_accumulate(St[kt], Qt[t], Kt, St[kt]);
+      }
+      Sx[g][lane][2 * kt] = St[kt].thread_elements()[0];
+      Sx[g][lane][2 * kt + 1] = St[kt].thread_elements()[1];
     }
-    Sx[g][lane][0] = St.thread_elements()[0];
-    Sx[g][lane][1] = St.thread_elements()[1];
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    const bool ok0 = (okbits >> fn) & 1;
-    const bool ok1 = (okbits >> (fn + 1)) & 1;
-    const float s0 = ok0 ? (St.thread_elements()[0] + Sx[1 - g][lane][0]) * sl2
-                         : kSdpaSparseNegBig;
-    const float s1 = ok1 ? (St.thread_elements()[1] + Sx[1 - g][lane][1]) * sl2
-                         : kSdpaSparseNegBig;
+    float sc[2 * KT];
+    bool ok[2 * KT];
+    float mb = kSdpaSparseNegBig;
+    KQ_UNROLL
+    for (int kt = 0; kt < KT; ++kt) {
+      ok[2 * kt] = (cur_ok >> (kt * 8 + fn)) & 1;
+      ok[2 * kt + 1] = (cur_ok >> (kt * 8 + fn + 1)) & 1;
+      sc[2 * kt] = ok[2 * kt]
+          ? (St[kt].thread_elements()[0] + Sx[g ^ 1][lane][2 * kt]) * sl2
+          : kSdpaSparseNegBig;
+      sc[2 * kt + 1] = ok[2 * kt + 1]
+          ? (St[kt].thread_elements()[1] + Sx[g ^ 1][lane][2 * kt + 1]) * sl2
+          : kSdpaSparseNegBig;
+      mb = metal::max(mb, metal::max(sc[2 * kt], sc[2 * kt + 1]));
+    }
 
     // Online softmax per row (the 4 lanes of a row hold the same state).
-    float mb = metal::max(s0, s1);
     mb = metal::max(mb, simd_shuffle_xor(mb, 1));
     mb = metal::max(mb, simd_shuffle_xor(mb, 8));
     const float m_new = metal::max(m_row, mb);
     const float alpha = fast::exp2(m_row - m_new);
-    const float p0 = ok0 ? fast::exp2(s0 - m_new) : 0.0f;
-    const float p1 = ok1 ? fast::exp2(s1 - m_new) : 0.0f;
-    float ps = p0 + p1;
+    float ps = 0.0f;
+    MatT Pt[KT];
+    KQ_UNROLL
+    for (int kt = 0; kt < KT; ++kt) {
+      const float p0 = ok[2 * kt] ? fast::exp2(sc[2 * kt] - m_new) : 0.0f;
+      const float p1 =
+          ok[2 * kt + 1] ? fast::exp2(sc[2 * kt + 1] - m_new) : 0.0f;
+      ps += p0 + p1;
+      Pt[kt].thread_elements()[0] = T(p0);
+      Pt[kt].thread_elements()[1] = T(p1);
+    }
     ps += simd_shuffle_xor(ps, 1);
     ps += simd_shuffle_xor(ps, 8);
     l_row = l_row * alpha + ps;
@@ -191,27 +243,54 @@ template <typename T, typename IdxT, int D>
       Ot[t].thread_elements()[0] *= alpha;
       Ot[t].thread_elements()[1] *= alpha;
     }
-    MatT Pt;
-    Pt.thread_elements()[0] = T(p0);
-    Pt.thread_elements()[1] = T(p1);
     KQ_UNROLL
-    for (int t = 0; t < NT; ++t) {
-      MatT Kt;
-      simdgroup_load(Kt, Ks + g * DH + t * 8, LD);
-      simdgroup_multiply_accumulate(Ot[t], Pt, Kt, Ot[t]);
+    for (int kt = 0; kt < KT; ++kt) {
+      KQ_UNROLL
+      for (int t = 0; t < NT; ++t) {
+        MatT Kt;
+        simdgroup_load(Kt, Ks + kt * 8 * LD + dh * DH + t * 8, LD);
+        simdgroup_multiply_accumulate(Ot[t], Pt[kt], Kt, Ot[t]);
+      }
     }
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
   }
+#undef KQ_SPARSE_FETCH
+
+  const int hq = h0 + hs * 8; // first head of this simdgroup
+  if (p->direct) {
+    // The only split: normalize here, the sink as one more logit.
+    const int h = hq + fm;
+    float m_all = m_row;
+    float l_all = l_row;
+    if (p->has_sinks) {
+      const float sink_m = M_LOG2E_F * float(Sinks[metal::min(h, H - 1)]);
+      m_all = metal::max(m_row, sink_m);
+      l_all = l_row * fast::exp2(m_row - m_all) + fast::exp2(sink_m - m_all);
+    }
+    const float wgt = fast::exp2(m_row - m_all) / l_all;
+    if (h < H) {
+      device T* out = O + size_t(b) * p->o_strides[0] +
+          size_t(h) * p->o_strides[1] + size_t(l) * p->o_strides[2] + dh * DH;
+      KQ_UNROLL
+      for (int t = 0; t < NT; ++t) {
+        metal::vec<T, 2> o2(
+            T(Ot[t].thread_elements()[0] * wgt),
+            T(Ot[t].thread_elements()[1] * wgt));
+        *reinterpret_cast<device metal::vec<T, 2>*>(out + t * 8 + fn) = o2;
+      }
+    }
+    return;
+  }
 
   const size_t bls = (size_t(b) * p->L + l) * p->n_splits + s;
-  device float* ob = Oacc + (bls * p->Hp + h0) * D + g * DH;
+  device float* ob = Oacc + (bls * p->Hp + hq) * D + dh * DH;
   KQ_UNROLL
   for (int t = 0; t < NT; ++t) {
     simdgroup_store(Ot[t], ob + t * 8, D);
   }
-  if (g == 0 && fn == 0) {
-    Ms[bls * p->Hp + h0 + fm] = m_row;
-    Ls[bls * p->Hp + h0 + fm] = l_row;
+  if (dh == 0 && fn == 0) {
+    Ms[bls * p->Hp + hq + fm] = m_row;
+    Ls[bls * p->Hp + hq + fm] = l_row;
   }
 }
 
