@@ -3,6 +3,7 @@
 // kq_sdpa_sparse_decode.h. Inference-only (no CPU eval).
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <sstream>
 #include <stdexcept>
@@ -325,6 +326,251 @@ mx::array sdpa_sparse_decode(
           sinks.has_value(),
           win_mask.has_value(),
           sel_mask.has_value()),
+      std::move(inputs));
+}
+
+// ---------------------------------------------------------------------------
+// Prefill form: one threadgroup per (head group, query), the band derived
+// from the query position, no key split.
+
+namespace {
+struct PrefillCfg {
+  int hg; // heads per threadgroup
+  int ds; // simdgroups per 8-head subgroup (D slices)
+  int kb; // keys per staged block
+};
+// The first entry is the default and is instantiated at every head dim;
+// the rest exist at head dim 512 only (KQ_SDPA_SPARSE_PREFILL_CFG=hg,ds,kb).
+constexpr PrefillCfg kPrefillCfgs[] = {
+    {16, 4, 8},
+    {32, 4, 8},
+    {16, 2, 8},
+};
+
+PrefillCfg prefill_cfg(int D) {
+  PrefillCfg cfg = kPrefillCfgs[0];
+  const char* env = std::getenv("KQ_SDPA_SPARSE_PREFILL_CFG");
+  if (env == nullptr || D != 512) {
+    return cfg;
+  }
+  int hg = 0, ds = 0, kb = 0;
+  if (std::sscanf(env, "%d,%d,%d", &hg, &ds, &kb) != 3) {
+    return cfg;
+  }
+  for (const auto& c : kPrefillCfgs) {
+    if (c.hg == hg && c.ds == ds && c.kb == kb) {
+      return c;
+    }
+  }
+  return cfg;
+}
+} // namespace
+
+#ifdef _METAL_
+
+void KQSdpaSparsePrefill::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+
+  const auto& q = inputs[0];
+  const auto& win = inputs[1];
+  const auto& pool = inputs[2];
+  const auto& idx = inputs[3];
+  size_t next = 4;
+  const mx::array* sinks = has_sinks_ ? &inputs[next++] : nullptr;
+  const mx::array* smask = has_sel_mask_ ? &inputs[next++] : nullptr;
+  auto& o = outputs[0];
+  o.set_data(mx::allocator::malloc(o.nbytes()));
+
+  const int B = q.shape(0);
+  const int H = q.shape(1);
+  const int L = q.shape(2);
+  const int D = q.shape(3);
+  const int S = win.shape(2);
+  const int P = pool.shape(1);
+  const int N = idx.shape(2);
+  const PrefillCfg cfg = prefill_cfg(D);
+  const int hgroups = (H + cfg.hg - 1) / cfg.hg;
+
+  auto bcast = [](const mx::array& a, int axis) -> int64_t {
+    return a.shape(axis) == 1 ? 0 : a.strides(axis);
+  };
+  KQSdpaSparsePrefillParams params{};
+  params.B = B;
+  params.H = H;
+  params.L = L;
+  params.S = S;
+  params.P = P;
+  params.N = N;
+  params.band = band_;
+  params.koff = S - L;
+  params.has_sinks = sinks != nullptr;
+  params.has_sel_mask = smask != nullptr;
+  params.scale_log2 = scale_ * 1.4426950408889634f;
+  params.q_strides[0] = q.strides(0);
+  params.q_strides[1] = q.strides(1);
+  params.q_strides[2] = q.strides(2);
+  params.win_strides[0] = bcast(win, 0);
+  params.win_strides[1] = win.strides(2);
+  params.pool_strides[0] = bcast(pool, 0);
+  params.pool_strides[1] = pool.strides(1);
+  params.idx_strides[0] = bcast(idx, 0);
+  params.idx_strides[1] = idx.strides(1);
+  if (smask) {
+    params.sel_mask_strides[0] = bcast(*smask, 0);
+    params.sel_mask_strides[1] = smask->strides(1);
+  }
+  params.o_strides[0] = o.strides(0);
+  params.o_strides[1] = o.strides(1);
+  params.o_strides[2] = o.strides(2);
+
+  auto& ce = mx::metal::get_command_encoder(s);
+  const std::string ts = kq_type_string(q.dtype());
+  const std::string is = idx.dtype() == mx::int32 ? "i32" : "u32";
+  auto kernel = kq_get_kernel(
+      d,
+      "kq_sdpa_sparse_prefill_" + ts + "_" + is + "_d" + std::to_string(D) +
+          "_hg" + std::to_string(cfg.hg) + "_ds" + std::to_string(cfg.ds) +
+          "_kb" + std::to_string(cfg.kb));
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(q, 0);
+  ce.set_input_array(win, 1);
+  ce.set_input_array(pool, 2);
+  ce.set_input_array(idx, 3);
+  // Absent optionals bind a placeholder the kernel never reads.
+  ce.set_input_array(smask ? *smask : idx, 4);
+  ce.set_input_array(sinks ? *sinks : q, 5);
+  ce.set_output_array(o, 6);
+  ce.set_bytes(params, 7);
+  ce.dispatch_threadgroups(
+      MTL::Size(1, hgroups, B * L), MTL::Size(cfg.hg / 8 * cfg.ds * 32, 1, 1));
+}
+
+#else // !_METAL_
+
+void KQSdpaSparsePrefill::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.sdpa_sparse_prefill] requires a Metal build.");
+}
+
+#endif
+
+void KQSdpaSparsePrefill::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.sdpa_sparse_prefill] has no CPU implementation.");
+}
+
+std::vector<mx::Shape> KQSdpaSparsePrefill::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  return {inputs[0].shape()};
+}
+
+bool KQSdpaSparsePrefill::is_equivalent(const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQSdpaSparsePrefill&>(other);
+  return scale_ == o.scale_ && band_ == o.band_ && has_sinks_ == o.has_sinks_ &&
+      has_sel_mask_ == o.has_sel_mask_;
+}
+
+mx::array sdpa_sparse_prefill(
+    mx::array q,
+    mx::array window,
+    mx::array pool,
+    mx::array idx,
+    float scale,
+    int band,
+    const std::optional<mx::array>& sinks,
+    const std::optional<mx::array>& sel_mask,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const char* op = "[mlx_kquant.sdpa_sparse_prefill]";
+
+  if (q.ndim() != 4 || window.ndim() != 4 || pool.ndim() != 3 ||
+      idx.ndim() != 3) {
+    std::ostringstream msg;
+    msg << op << " expected q [B, H, L, D], window [B, 1, S, D], pool "
+        << "[B, P, D], idx [B, L, N]; got " << q.shape() << ", "
+        << window.shape() << ", " << pool.shape() << ", " << idx.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  const int B = q.shape(0);
+  const int H = q.shape(1);
+  const int L = q.shape(2);
+  const int D = q.shape(3);
+  if (D != 128 && D != 256 && D != 512) {
+    throw std::invalid_argument(
+        std::string(op) + " head_dim must be 128, 256 or 512.");
+  }
+  if (window.shape(1) != 1 || window.shape(3) != D || pool.shape(2) != D ||
+      (window.shape(0) != B && window.shape(0) != 1) ||
+      (pool.shape(0) != B && pool.shape(0) != 1) ||
+      (idx.shape(0) != B && idx.shape(0) != 1) || idx.shape(1) != L) {
+    std::ostringstream msg;
+    msg << op << " incompatible shapes: " << q.shape() << ", " << window.shape()
+        << ", " << pool.shape() << ", " << idx.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (L < 1 || window.shape(2) < L) {
+    std::ostringstream msg;
+    msg << op << " window needs at least L rows (the queries' own); got "
+        << window.shape() << " for L = " << L << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (band < 1) {
+    throw std::invalid_argument(std::string(op) + " band must be >= 1.");
+  }
+  if (idx.dtype() != mx::int32 && idx.dtype() != mx::uint32) {
+    throw std::invalid_argument(
+        std::string(op) + " idx must be int32 or uint32.");
+  }
+  auto dt = q.dtype();
+  if (dt != mx::float16 && dt != mx::bfloat16) {
+    throw std::invalid_argument(
+        std::string(op) + " q must be float16 or bfloat16.");
+  }
+
+  auto q_c = mx::contiguous(q, false, s);
+  auto win_c = mx::contiguous(mx::astype(window, dt, s), false, s);
+  auto pool_c = mx::contiguous(mx::astype(pool, dt, s), false, s);
+  auto idx_c = mx::contiguous(idx, false, s);
+  std::vector<mx::array> inputs = {
+      std::move(q_c), std::move(win_c), std::move(pool_c), std::move(idx_c)};
+
+  if (sinks.has_value()) {
+    if (sinks->size() != static_cast<size_t>(H)) {
+      throw std::invalid_argument(
+          std::string(op) + " sinks must have H elements.");
+    }
+    inputs.push_back(mx::contiguous(
+        mx::astype(mx::reshape(*sinks, {H}, s), dt, s), false, s));
+  }
+  if (sel_mask.has_value()) {
+    const int N = idx.shape(2);
+    if (sel_mask->dtype() != mx::bool_) {
+      throw std::invalid_argument(std::string(op) + " sel_mask must be bool.");
+    }
+    const int64_t n = static_cast<int64_t>(sel_mask->size());
+    if (n != int64_t(L) * N && n != int64_t(B) * L * N) {
+      std::ostringstream msg;
+      msg << op << " sel_mask must be [L, " << N << "] or [B, L, " << N
+          << "]; got " << sel_mask->shape() << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    const int mb = n == int64_t(L) * N ? 1 : B;
+    inputs.push_back(
+        mx::contiguous(mx::reshape(*sel_mask, {mb, L, N}, s), false, s));
+  }
+
+  return mx::array(
+      q.shape(),
+      dt,
+      std::make_shared<KQSdpaSparsePrefill>(
+          s, scale, band, sinks.has_value(), sel_mask.has_value()),
       std::move(inputs));
 }
 

@@ -27,3 +27,26 @@ struct KQSdpaSparseDecodeParams {
   int64_t sel_mask_strides[2]; ///< B (0 = broadcast), L (N contiguous)
   int64_t o_strides[3]; ///< B, H, L
 };
+
+// kq_sdpa_sparse_prefill: query l reads the window rows [pos - band + 1,
+// pos] with pos = koff + l, then its listed pool rows. No key split.
+struct KQSdpaSparsePrefillParams {
+  int B; ///< Batch
+  int H; ///< Query heads
+  int L; ///< Query positions
+  int S; ///< Window rows; the last L hold the queries' own positions
+  int P; ///< Pool rows (the index list selects among them)
+  int N; ///< Listed pool rows per query
+  int band; ///< Window rows a query reads, its own included
+  int koff; ///< S - L: window row of query 0
+  int has_sinks;
+  int has_sel_mask;
+  float scale_log2; ///< softmax scale times log2(e)
+
+  int64_t q_strides[3]; ///< B, H, L (D contiguous)
+  int64_t win_strides[2]; ///< B (0 = broadcast), row
+  int64_t pool_strides[2]; ///< B (0 = broadcast), row
+  int64_t idx_strides[2]; ///< B (0 = broadcast), L (N contiguous)
+  int64_t sel_mask_strides[2]; ///< B (0 = broadcast), L (N contiguous)
+  int64_t o_strides[3]; ///< B, H, L
+};

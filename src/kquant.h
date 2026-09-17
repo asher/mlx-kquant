@@ -2805,4 +2805,57 @@ class KQSdpaSparseDecode : public mx::Primitive {
   bool has_sel_mask_;
 };
 
+// Prefill form of sdpa_sparse_decode: query l of window [B, 1, S, D]
+// (S >= L, the last L rows are the queries' own positions) reads the rows
+// [pos - band + 1, pos] with pos = S - L + l, then the pool [B, P, D] rows
+// listed in idx [B, L, N]. K == V. Optional sinks [H] and sel_mask [L, N] /
+// [B, L, N] as in sdpa_sparse_decode; no window mask, the band is the
+// mask. One dispatch, no key split. Returns [B, H, L, D]. Metal-only.
+mx::array sdpa_sparse_prefill(
+    mx::array q,
+    mx::array window,
+    mx::array pool,
+    mx::array idx,
+    float scale,
+    int band,
+    const std::optional<mx::array>& sinks = std::nullopt,
+    const std::optional<mx::array>& sel_mask = std::nullopt,
+    mx::StreamOrDevice s = {});
+
+class KQSdpaSparsePrefill : public mx::Primitive {
+ public:
+  explicit KQSdpaSparsePrefill(
+      mx::Stream stream,
+      float scale,
+      int band,
+      bool has_sinks,
+      bool has_sel_mask)
+      : mx::Primitive(stream),
+        scale_(scale),
+        band_(band),
+        has_sinks_(has_sinks),
+        has_sel_mask_(has_sel_mask) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQSdpaSparsePrefill";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int band_;
+  bool has_sinks_;
+  bool has_sel_mask_;
+};
+
 } // namespace mlx_kquant

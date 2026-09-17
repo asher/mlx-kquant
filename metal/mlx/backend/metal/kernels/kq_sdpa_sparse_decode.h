@@ -345,3 +345,265 @@ template <typename T, int D>
       size_t(h) * p->o_strides[1] + size_t(l) * p->o_strides[2];
   reinterpret_cast<device V4*>(out)[t] = V4(acc);
 }
+
+constant constexpr int kSdpaSparsePrefillPass = 1024; // row-table entries
+constant constexpr int kSdpaSparseDead = -2147483647 - 1;
+
+// Prefill form: one threadgroup per (HG-head group, query), no key split.
+// The keys are the query's own band of the window array, [pos - band + 1,
+// pos] with pos = koff + l, then its listed pool rows. Each 8-head subgroup
+// spreads over DS simdgroups (one D slice each, partial scores summed
+// through Sx) and KB rows go through a staged buffer per block. Row
+// addresses resolve once per pass into a threadgroup table (window rows as
+// ~row, pool rows as row, dead slots as kSdpaSparseDead), so a block fetch
+// reads the table instead of chasing the index and mask loads.
+template <typename T, typename IdxT, int D, int HG, int DS, int KB>
+[[kernel]] void kq_sdpa_sparse_prefill(
+    const device T* Q [[buffer(0)]],
+    const device T* Win [[buffer(1)]],
+    const device T* Pool [[buffer(2)]],
+    const device IdxT* Idx [[buffer(3)]],
+    const device bool* SelMask [[buffer(4)]],
+    const device T* Sinks [[buffer(5)]],
+    device T* O [[buffer(6)]],
+    const constant KQSdpaSparsePrefillParams* p [[buffer(7)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int KT = KB / 8; // 8-key tiles per block
+  constexpr int NSG = (HG / 8) * DS; // simdgroups
+  constexpr int NTH = NSG * 32;
+  constexpr int LD = D + 8; // padded row (bank spread, 16-byte aligned)
+  constexpr int DH = D / DS; // dims per simdgroup
+  constexpr int NT = DH / 8; // 8x8 tiles per simdgroup along D
+  constexpr int CHR = D / 8; // 16-byte chunks per row
+  constexpr int SV = (KB * CHR + NTH - 1) / NTH; // staged chunks per thread
+  constexpr int MAXK = kSdpaSparsePrefillPass;
+  constexpr int DEAD = kSdpaSparseDead;
+  static_assert(HG % 8 == 0, "head groups are 8-head tiles");
+  static_assert(DH % 8 == 0, "D slices are 8-wide tiles");
+  static_assert(KB % 8 == 0, "key blocks are 8-key tiles");
+  using MatT = metal::simdgroup_matrix<T, 8, 8>;
+  using MatF = metal::simdgroup_matrix<float, 8, 8>;
+
+  threadgroup T Ks[KB * LD];
+  threadgroup float Sx[NSG][32][2 * KT];
+  threadgroup int tab[MAXK];
+
+  const int h0 = int(tid.y) * HG;
+  const int b = int(tid.z) / p->L;
+  const int l = int(tid.z) % p->L;
+  const int g = int(simd_gid);
+  const int hs = g / DS; // 8-head subgroup of this simdgroup
+  const int dh = g % DS; // D slice of this simdgroup
+  const int H = p->H;
+  const int tix = g * 32 + int(lane);
+
+  // Queries, 8 heads per round through the key buffer (rows past H repeat
+  // the last head; their output is never written).
+  MatT Qt[NT];
+  {
+    const device T* qb =
+        Q + size_t(b) * p->q_strides[0] + size_t(l) * p->q_strides[2];
+    for (int sg = 0; sg < HG / 8; ++sg) {
+      for (int v = tix; v < 8 * CHR; v += NTH) {
+        const int r = v / CHR;
+        const int c = v % CHR;
+        const int h = metal::min(h0 + sg * 8 + r, H - 1);
+        const uint4 x = *reinterpret_cast<const device uint4*>(
+            qb + size_t(h) * p->q_strides[1] + c * 8);
+        *reinterpret_cast<threadgroup uint4*>(Ks + r * LD + c * 8) = x;
+      }
+      threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+      if (hs == sg) {
+        KQ_UNROLL
+        for (int t = 0; t < NT; ++t) {
+          simdgroup_load(Qt[t], Ks + dh * DH + t * 8, LD);
+        }
+      }
+      threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    }
+  }
+  MatF Ot[NT];
+  KQ_UNROLL
+  for (int t = 0; t < NT; ++t) {
+    Ot[t] = MatF(0.0f);
+  }
+
+  // Fragment layout of an 8x8 simdgroup matrix: this lane holds row fm,
+  // columns fn and fn + 1; lanes lane^1 and lane^8 share the row.
+  const int qid = int(lane) / 4;
+  const int fm = (qid & 4) + ((int(lane) / 2) % 4);
+  const int fn = (qid & 2) * 2 + (int(lane) % 2) * 2;
+  float m_row = kSdpaSparseNegBig;
+  float l_row = 0.0f;
+
+  const int pos = p->koff + l;
+  const int w0 = metal::max(0, pos - p->band + 1);
+  const int Wl = pos + 1 - w0;
+  const int total = Wl + p->N;
+  const device T* win_b = Win + size_t(b) * p->win_strides[0];
+  const device T* pool_b = Pool + size_t(b) * p->pool_strides[0];
+  const device IdxT* idx_bl =
+      Idx + size_t(b) * p->idx_strides[0] + size_t(l) * p->idx_strides[1];
+  const device bool* sm = p->has_sel_mask
+      ? SelMask + size_t(b) * p->sel_mask_strides[0] +
+          size_t(l) * p->sel_mask_strides[1]
+      : nullptr;
+  const float sl2 = p->scale_log2;
+
+  // Rows of block j0 into registers through the table; dead slots stage
+  // window row 0 so every load stays unconditional.
+  uint4 pre[SV];
+#define KQ_SPARSE_PF_FETCH(j0)                                        \
+  {                                                                   \
+    KQ_UNROLL                                                         \
+    for (int i = 0; i < SV; ++i) {                                    \
+      const int v = tix + i * NTH;                                    \
+      if (v < KB * CHR) {                                             \
+        const int j = (j0) + v / CHR;                                 \
+        const int e = j < pe ? tab[j - pb] : DEAD;                    \
+        const device T* row = win_b;                                  \
+        if (e >= 0) {                                                 \
+          row = pool_b + size_t(e) * p->pool_strides[1];              \
+        } else if (e != DEAD) {                                       \
+          row = win_b + size_t(~e) * p->win_strides[1];               \
+        }                                                             \
+        pre[i] = reinterpret_cast<const device uint4*>(row)[v % CHR]; \
+      }                                                               \
+    }                                                                 \
+  }
+
+  for (int pb = 0; pb < total; pb += MAXK) {
+    const int pe = metal::min(total, pb + MAXK);
+    for (int k = tix; k < pe - pb; k += NTH) {
+      const int j = pb + k;
+      int e = DEAD;
+      if (j < Wl) {
+        e = ~(w0 + j);
+      } else {
+        const int n = j - Wl;
+        if (sm == nullptr || sm[n]) {
+          const int64_t r = int64_t(idx_bl[n]);
+          if (r >= 0 && r < int64_t(p->P)) {
+            e = int(r);
+          }
+        }
+      }
+      tab[k] = e;
+    }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    KQ_SPARSE_PF_FETCH(pb);
+    for (int j0 = pb; j0 < pe; j0 += KB) {
+      KQ_UNROLL
+      for (int i = 0; i < SV; ++i) {
+        const int v = tix + i * NTH;
+        if (v < KB * CHR) {
+          *reinterpret_cast<threadgroup uint4*>(
+              Ks + (v / CHR) * LD + (v % CHR) * 8) = pre[i];
+        }
+      }
+      threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+      if (j0 + KB < pe) {
+        KQ_SPARSE_PF_FETCH(j0 + KB);
+      }
+
+      // Partial scores over this slice of D, then the other slices'.
+      MatF St[KT];
+      KQ_UNROLL
+      for (int kt = 0; kt < KT; ++kt) {
+        St[kt] = MatF(0.0f);
+        KQ_UNROLL
+        for (int t = 0; t < NT; ++t) {
+          MatT Kt;
+          simdgroup_load(
+              Kt, Ks + kt * 8 * LD + dh * DH + t * 8, LD, ulong2(0, 0), true);
+          simdgroup_multiply_accumulate(St[kt], Qt[t], Kt, St[kt]);
+        }
+        Sx[g][lane][2 * kt] = St[kt].thread_elements()[0];
+        Sx[g][lane][2 * kt + 1] = St[kt].thread_elements()[1];
+      }
+      threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+      float sc[2 * KT];
+      bool ok[2 * KT];
+      float mb = kSdpaSparseNegBig;
+      KQ_UNROLL
+      for (int kt = 0; kt < KT; ++kt) {
+        KQ_UNROLL
+        for (int c = 0; c < 2; ++c) {
+          const int j = j0 + kt * 8 + fn + c;
+          const bool v = j < pe && tab[j - pb] != DEAD;
+          float s = St[kt].thread_elements()[c];
+          KQ_UNROLL
+          for (int ds = 0; ds < DS; ++ds) {
+            if (ds != dh) {
+              s += Sx[hs * DS + ds][lane][2 * kt + c];
+            }
+          }
+          ok[2 * kt + c] = v;
+          sc[2 * kt + c] = v ? s * sl2 : kSdpaSparseNegBig;
+          mb = metal::max(mb, sc[2 * kt + c]);
+        }
+      }
+
+      // Online softmax per row (the 4 lanes of a row hold the same state).
+      mb = metal::max(mb, simd_shuffle_xor(mb, 1));
+      mb = metal::max(mb, simd_shuffle_xor(mb, 8));
+      const float m_new = metal::max(m_row, mb);
+      const float alpha = fast::exp2(m_row - m_new);
+      float ps = 0.0f;
+      MatT Pt[KT];
+      KQ_UNROLL
+      for (int kt = 0; kt < KT; ++kt) {
+        const float p0 = ok[2 * kt] ? fast::exp2(sc[2 * kt] - m_new) : 0.0f;
+        const float p1 =
+            ok[2 * kt + 1] ? fast::exp2(sc[2 * kt + 1] - m_new) : 0.0f;
+        ps += p0 + p1;
+        Pt[kt].thread_elements()[0] = T(p0);
+        Pt[kt].thread_elements()[1] = T(p1);
+      }
+      ps += simd_shuffle_xor(ps, 1);
+      ps += simd_shuffle_xor(ps, 8);
+      l_row = l_row * alpha + ps;
+      m_row = m_new;
+      KQ_UNROLL
+      for (int t = 0; t < NT; ++t) {
+        Ot[t].thread_elements()[0] *= alpha;
+        Ot[t].thread_elements()[1] *= alpha;
+      }
+      KQ_UNROLL
+      for (int kt = 0; kt < KT; ++kt) {
+        KQ_UNROLL
+        for (int t = 0; t < NT; ++t) {
+          MatT Kt;
+          simdgroup_load(Kt, Ks + kt * 8 * LD + dh * DH + t * 8, LD);
+          simdgroup_multiply_accumulate(Ot[t], Pt[kt], Kt, Ot[t]);
+        }
+      }
+      threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    }
+  }
+#undef KQ_SPARSE_PF_FETCH
+
+  // Normalize here, the sink as one more logit.
+  const int h = h0 + hs * 8 + fm;
+  float m_all = m_row;
+  float l_all = l_row;
+  if (p->has_sinks) {
+    const float sink_m = M_LOG2E_F * float(Sinks[metal::min(h, H - 1)]);
+    m_all = metal::max(m_row, sink_m);
+    l_all = l_row * fast::exp2(m_row - m_all) + fast::exp2(sink_m - m_all);
+  }
+  const float wgt = fast::exp2(m_row - m_all) / l_all;
+  if (h < H) {
+    device T* out = O + size_t(b) * p->o_strides[0] +
+        size_t(h) * p->o_strides[1] + size_t(l) * p->o_strides[2] + dh * DH;
+    KQ_UNROLL
+    for (int t = 0; t < NT; ++t) {
+      metal::vec<T, 2> o2(
+          T(Ot[t].thread_elements()[0] * wgt),
+          T(Ot[t].thread_elements()[1] * wgt));
+      *reinterpret_cast<device metal::vec<T, 2>*>(out + t * 8 + fn) = o2;
+    }
+  }
+}

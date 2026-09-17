@@ -22,6 +22,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   key-split simdgroup-matrix kernel and a merge) at head dims 128, 256 and
   512, for the DeepSeek-V4 sparse attention step. Queries are a batch
   dimension, so a prefill block of up to 4096 goes through the same call.
+- `sdpa_sparse_prefill`: the prefill form of `sdpa_sparse_decode` (same
+  operands and head dims), one threadgroup per query and head group over
+  the window rows its position reaches plus its listed pool rows, so a
+  prompt block is one dispatch instead of a decode-kernel call per band.
 
 ### Fixed
 - Zero-copy views for tensors no 1-D window can address, past `INT32_MAX * 8`

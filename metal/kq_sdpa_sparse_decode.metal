@@ -30,4 +30,24 @@
 instantiate_kq_sdpa_sparse_decode_d(128)
 instantiate_kq_sdpa_sparse_decode_d(256)
 instantiate_kq_sdpa_sparse_decode_d(512)
+
+// Prefill form: (head group, D slices, keys per block) configurations. The
+// host default must be instantiated at every head dim; the rest are the
+// KQ_SDPA_SPARSE_PREFILL_CFG A/B set at head dim 512.
+#define instantiate_kq_sdpa_sparse_prefill(tname, dtype, iname, itype, d, hg, ds, kb) \
+  instantiate_kernel(                                                               \
+      "kq_sdpa_sparse_prefill_" #tname "_" #iname "_d" #d "_hg" #hg "_ds" #ds "_kb" #kb, \
+      kq_sdpa_sparse_prefill, dtype, itype, d, hg, ds, kb)
+
+#define instantiate_kq_sdpa_sparse_prefill_cfg(d, hg, ds, kb)                                   \
+  instantiate_kq_sdpa_sparse_prefill(float16_t, half, i32, int32_t, d, hg, ds, kb)               \
+  instantiate_kq_sdpa_sparse_prefill(float16_t, half, u32, uint32_t, d, hg, ds, kb)              \
+  instantiate_kq_sdpa_sparse_prefill(bfloat16_t, bfloat16_t, i32, int32_t, d, hg, ds, kb)        \
+  instantiate_kq_sdpa_sparse_prefill(bfloat16_t, bfloat16_t, u32, uint32_t, d, hg, ds, kb)
+
+instantiate_kq_sdpa_sparse_prefill_cfg(128, 16, 4, 8)
+instantiate_kq_sdpa_sparse_prefill_cfg(256, 16, 4, 8)
+instantiate_kq_sdpa_sparse_prefill_cfg(512, 16, 4, 8)
+instantiate_kq_sdpa_sparse_prefill_cfg(512, 32, 4, 8)
+instantiate_kq_sdpa_sparse_prefill_cfg(512, 16, 2, 8)
     // clang-format on

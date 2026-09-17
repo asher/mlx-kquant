@@ -908,6 +908,47 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_sparse_prefill",
+      &mlx_kquant::sdpa_sparse_prefill,
+      "q"_a,
+      "window"_a,
+      "pool"_a,
+      "idx"_a,
+      "scale"_a,
+      "band"_a,
+      "sinks"_a = nb::none(),
+      "sel_mask"_a = nb::none(),
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Prefill form of sdpa_sparse_decode: one threadgroup per query and
+        head group, no key split. Query l sits at window row
+        pos = S - L + l and reads the rows [pos - band + 1, pos] (the
+        sliding window, itself included) plus the pool rows its index list
+        names. The kernel derives the window band from the position, so
+        no window mask is read; the row addresses of a query resolve once
+        into a threadgroup table before the key blocks stream through.
+
+        Args:
+            q (array): queries [B, H, L, D], float16/bfloat16; D in
+                {128, 256, 512}.
+            window (array): [B, 1, S, D] rows, S >= L; the last L rows
+                are the queries' own positions.
+            pool (array): [B, P, D] rows selected by ``idx``.
+            idx (array): [B, L, N] int32/uint32 pool rows per query; a
+                negative or out-of-range entry is skipped.
+            scale (float): softmax scale.
+            band (int): window rows a query reads, its own included.
+            sinks (array, optional): per-head [H] extra logit in the
+                softmax denominator.
+            sel_mask (array, optional): bool [L, N] or [B, L, N]; False
+                drops the listed row.
+
+        Returns:
+            array: [B, H, L, D] in q's dtype. Metal-only.
+      )");
+
+  m.def(
       "dsa_sparse_attention",
       &mlx_kquant::dsa_sparse_attention,
       "q"_a,
