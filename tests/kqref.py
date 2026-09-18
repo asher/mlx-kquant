@@ -169,7 +169,9 @@ def _quantize_pq2_0(data: np.ndarray) -> np.ndarray:
     nb = x.shape[0]
     amax = np.abs(x).max(axis=1)
     d = amax.astype(np.float16)
-    inv = np.where(amax > 0.0, 1.0 / amax, 0.0).astype(np.float32)
+    inv = np.zeros_like(amax)
+    np.divide(1.0, amax, out=inv, where=amax > 0.0)
+    inv = inv.astype(np.float32)
     q = _round_half_away(x * inv[:, None]).astype(np.int32) + 1
     q = np.clip(q, 0, 3).astype(np.uint8).reshape(nb, 32, 4)
     out = np.zeros((nb, 34), dtype=np.uint8)
@@ -232,7 +234,9 @@ def _quantize_ptq1_0(data: np.ndarray) -> np.ndarray:
     nb = x.shape[0]
     amax = np.abs(x).max(axis=1)
     d = amax.astype(np.float16)
-    inv = np.where(amax > 0.0, 1.0 / amax, 0.0).astype(np.float32)
+    inv = np.zeros_like(amax)
+    np.divide(1.0, amax, out=inv, where=amax > 0.0)
+    inv = inv.astype(np.float32)
     trits = (_round_half_away(x * inv[:, None]).astype(np.int64) + 1).astype(np.uint16)
     # Trit n weighs 3^(4-n) in its byte; the qh bytes carry four trits and the
     # reference shifts them up one place, which the same weight table does.

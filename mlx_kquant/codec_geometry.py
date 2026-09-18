@@ -51,10 +51,9 @@ CODEC_GEOMETRY: dict[str, tuple[int, int, int, int]] = {
     "nvfp4": (16, 4, 36, 64),
 }
 
-# Codecs that load but cannot be produced by kq.quantize. The native-fp codecs
-# are decode-only wire codecs; the Prism codecs stay here until their
-# encoders land. Every other codec has a CPU or CPU/Metal encoder.
-DECODE_ONLY_CODECS: frozenset[str] = frozenset({"mxfp4", "nvfp4", "pq2_0", "ptq1_0"})
+# Codecs that load but cannot be produced by kq.quantize: the native-fp codecs
+# are decode-only wire codecs. Every other codec has a CPU or CPU/Metal encoder.
+DECODE_ONLY_CODECS: frozenset[str] = frozenset({"mxfp4", "nvfp4"})
 
 # Every codec the ``kq.quantize`` encoder can produce: the ten K-quant/legacy
 # codecs on CPU or Metal (the four legacy block codecs + q8_0 ignore an imatrix).

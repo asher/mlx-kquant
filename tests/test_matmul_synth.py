@@ -49,6 +49,8 @@ CODECS = {
     "iq1_s": GT.IQ1_S,
     "iq1_m": GT.IQ1_M,
     "stq1_0": GT.STQ1_0,
+    "pq2_0": GT.PQ2_0,
+    "ptq1_0": GT.PTQ1_0,
 }
 # ggml marks these imatrix-required; kq.quantize rejects them without one.
 REQ_IMAT = {"iq2_xxs", "iq2_xs", "iq1_s"}

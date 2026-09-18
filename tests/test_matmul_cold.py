@@ -63,8 +63,6 @@ REQUIRED_IMATRIX = {"iq2_xxs", "iq2_xs", "iq1_s"}
 DECODE_ONLY = {
     "mxfp4": (17, 32),
     "nvfp4": (36, 64),
-    "pq2_0": (34, 128),
-    "ptq1_0": (28, 128),
 }
 N, K, M = 1024, 1024, 64
 

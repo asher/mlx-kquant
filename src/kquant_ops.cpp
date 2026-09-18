@@ -684,9 +684,10 @@ std::vector<mx::array> quantize(
   }
 
   auto s = mx::to_stream(s_);
-  // IQ and stq1_0 encoders are CPU-only; force the CPU stream so eval_cpu
-  // runs even when the caller passed stream=gpu.
-  if (kquant_type.rfind("iq", 0) == 0 || kquant_type == "stq1_0") {
+  // The IQ, stq1_0 and Prism encoders are CPU-only; force the CPU stream so
+  // eval_cpu runs even when the caller passed stream=gpu.
+  if (kquant_type.rfind("iq", 0) == 0 || kquant_type == "stq1_0" ||
+      kquant_type == "pq2_0" || kquant_type == "ptq1_0") {
     s = mx::default_stream(mx::Device::cpu);
   }
 
