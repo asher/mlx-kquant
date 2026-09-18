@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.11]
+
 ### Fixed
 - `moe_router_topk`: a row whose logits were all NaN returned expert index
   4294967295, which crashed any caller that indexed by expert id, and a row
