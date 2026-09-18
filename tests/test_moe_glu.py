@@ -617,6 +617,45 @@ def _check_router():
         mx.eval(inds, sc)
         if not np.all(np.isfinite(np.array(sc))):
             fails.append(f"E={e} R={r} sigmoid negative-logits nonfinite scores")
+    # NaN rows: indices stay in range and distinct, finite rows are unaffected.
+    for scoring, norm in (
+        ("softmax", True),
+        ("sqrtsoftplus", True),
+        ("sigmoid", False),
+    ):
+        e, r = 64, 6
+        logits_np = rng.standard_normal((4, e)).astype(np.float32)
+        logits_np[1] = np.nan
+        logits_np[2, : e - r + 1] = np.nan
+        logits_np[3, 5] = np.inf
+        inds, sc = kq.moe_router_topk(
+            mx.array(logits_np), r, norm, shared_gate=False, scoring=scoring
+        )
+        mx.eval(inds, sc)
+        got_i = np.array(inds)
+        if got_i.max() >= e:
+            fails.append(f"{scoring} NaN rows: index {got_i.max()} out of range")
+            continue
+        for t in range(4):
+            if len(set(got_i[t])) != r:
+                fails.append(f"{scoring} NaN rows t={t} duplicate indices {got_i[t]}")
+        if set(got_i[1]) != set(range(r)):
+            fails.append(f"{scoring} all-NaN row picked {got_i[1]}")
+        finite = np.arange(e - r + 1, e)
+        if not set(finite) <= set(got_i[2]):
+            fails.append(
+                f"{scoring} partial-NaN row dropped a finite expert: {got_i[2]}"
+            )
+        x0 = logits_np[0]
+        if scoring == "softmax":
+            p0 = np.exp(x0 - x0.max())
+        elif scoring == "sigmoid":
+            p0 = 1.0 / (1.0 + np.exp(-x0))
+        else:
+            p0 = np.sqrt(np.log1p(np.exp(x0)))
+        top = np.argsort(-p0, kind="stable")[:r]
+        if set(got_i[0]) != set(top):
+            fails.append(f"{scoring} finite row beside NaN rows picked {got_i[0]}")
     return fails
 
 

@@ -1754,7 +1754,15 @@ template <typename T>
       if (HAS_BIAS) {
         v += bias[e];
       }
-      if (v > bv || (v == bv && uint(e) < bi)) {
+      // A NaN entry and a taken entry (-inf) are not candidates. Tested on
+      // the bits: under fast-math a float NaN test may fold away and a
+      // compare against NaN may come out either way, which is how a NaN
+      // row once produced 0xffffffff, and -inf ties the -inf init.
+      const uint vb = as_type<uint>(v);
+      const bool skip =
+          ((vb & 0x7f800000u) == 0x7f800000u && (vb & 0x007fffffu) != 0u) ||
+          vb == 0xff800000u;
+      if (!skip && (v > bv || (v == bv && uint(e) < bi))) {
         bv = v;
         bi = uint(e);
       }
@@ -1774,6 +1782,20 @@ template <typename T>
         if (red_v[i] > wv || (red_v[i] == wv && red_i[i] < wi)) {
           wv = red_v[i];
           wi = red_i[i];
+        }
+      }
+      if (wi == 0xffffffffu) {
+        // Every remaining entry is NaN. Emit the lowest expert not yet
+        // taken so indices stay in range; its score is the NaN the
+        // reference would give. Taken entries are read back from win_i.
+        for (int e = 0; e < E && wi == 0xffffffffu; e++) {
+          bool taken = false;
+          for (int q = 0; q < r; q++) {
+            taken = taken || (win_i[q] == uint(e));
+          }
+          if (!taken) {
+            wi = uint(e);
+          }
         }
       }
       indices[(int64_t)tid * R + r] = wi;
