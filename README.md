@@ -350,6 +350,8 @@ are informed by our analysis of the mixed-precision quants that [Unsloth][unslot
 | iq1_s   | 256 | 1 |  50 | grid + delta |
 | iq1_m   | 256 | 1 |  56 | grid + delta, scattered scale |
 | stq1_0  | 256 | 1 |  42 | ternary codebook, one forced zero per 4 (QAT) |
+| pq2_0   | 128 | 2 |  34 | Prism four-level 2-bit, fp16 scale per 128 (ggml type 142) |
+| ptq1_0  | 128 | 1 |  28 | Prism base-3 ternary, fp16 scale per 128 (ggml type 143) |
 | mxfp4   |  32 | 4 |  17 | e8m0 scale, E2M1 values (decode-only) |
 | nvfp4   |  64 | 4 |  36 | 4x ue4m3-scaled 16-value groups (decode-only) |
 

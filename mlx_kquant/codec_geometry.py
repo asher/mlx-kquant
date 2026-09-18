@@ -40,6 +40,10 @@ CODEC_GEOMETRY: dict[str, tuple[int, int, int, int]] = {
     "iq1_m": (256, 1, 56, 256),
     # stq1_0: QAT structured-sparse ternary (llama.cpp PR #22836).
     "stq1_0": (256, 1, 42, 256),
+    # Prism codecs (PrismML/llama.cpp, ggml types 142 and 143): 128-wide blocks
+    # with one fp16 scale. pq2_0 is four-level 2-bit, ptq1_0 is base-3 ternary.
+    "pq2_0": (128, 2, 34, 128),
+    "ptq1_0": (128, 1, 28, 128),
     # Native-fp codecs (OCP micro-scaling floats): mxfp4 is one e8m0 scale per
     # 32 E2M1 values; nvfp4 packs four 16-value ue4m3-scaled groups per
     # 64-weight block, so group_size (16) != weights_per_block (64).
@@ -47,10 +51,10 @@ CODEC_GEOMETRY: dict[str, tuple[int, int, int, int]] = {
     "nvfp4": (16, 4, 36, 64),
 }
 
-# Codecs that load but cannot be produced by kq.quantize: the native-fp
-# codecs are decode-only wire codecs (every K-quant/legacy/IQ codec has a
-# CPU or CPU/Metal encoder).
-DECODE_ONLY_CODECS: frozenset[str] = frozenset({"mxfp4", "nvfp4"})
+# Codecs that load but cannot be produced by kq.quantize. The native-fp codecs
+# are decode-only wire codecs; the Prism codecs stay here until their
+# encoders land. Every other codec has a CPU or CPU/Metal encoder.
+DECODE_ONLY_CODECS: frozenset[str] = frozenset({"mxfp4", "nvfp4", "pq2_0", "ptq1_0"})
 
 # Every codec the ``kq.quantize`` encoder can produce: the ten K-quant/legacy
 # codecs on CPU or Metal (the four legacy block codecs + q8_0 ignore an imatrix).

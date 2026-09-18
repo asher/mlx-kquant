@@ -1,10 +1,16 @@
-"""gguf.quants-compatible oracle shim adding STQ1_0, which gguf-py lacks.
+"""gguf.quants-compatible oracle shim for the codecs gguf-py lacks.
 
-Exports the STQ1_0 sentinel (the single Python-side type-id constant), a GT
-proxy over GGMLQuantizationType, and a quants proxy whose quantize/dequantize
-handle the sentinel with the NumPy reference codec below and delegate real enum
-members to gguf.quants. Any random qs/sign wire is valid, and
-quantize(dequantize(wire)) == wire whenever d > 0.
+gguf-py has no STQ1_0, PQ2_0 or PTQ1_0. Each gets a sentinel type (the single
+Python-side type-id constant), registered into ``GGML_QUANT_SIZES`` so
+GGUFWriter can synthesize files and into the enum's value map so GGUFReader
+opens real files. ``GT`` proxies GGMLQuantizationType with the sentinels
+added; ``quants`` proxies gguf.quants with quantize/dequantize routed to the
+NumPy reference codecs below for the sentinels and delegated otherwise.
+
+STQ1_0: any random qs/sign wire is valid, and quantize(dequantize(wire)) ==
+wire whenever d > 0. PQ2_0: any wire is valid; codes 0..3 decode to -1..+2
+and the encoder emits only 0..2. PTQ1_0: every byte decodes (the trit
+extraction is total over 0..255), but only encoder-produced bytes round-trip.
 """
 
 from __future__ import annotations
@@ -15,6 +21,42 @@ from gguf import quants as _gguf_quants
 from gguf.constants import GGML_QUANT_SIZES
 
 STQ1_0_TYPE_ID = 43  # llama.cpp PR #22836 (unmerged -- may shift)
+PQ2_0_TYPE_ID = 142  # PrismML/llama.cpp 8bbb28b76 (Prism-private)
+PTQ1_0_TYPE_ID = 143  # PrismML/llama.cpp e19819227 (Prism-private)
+
+
+class _SentinelType:
+    def __init__(self, name: str, value: int) -> None:
+        self.name = name
+        self.value = value
+
+    def __int__(self) -> int:
+        return self.value
+
+    def __index__(self) -> int:
+        return self.value
+
+    def __repr__(self) -> str:
+        return self.name
+
+
+STQ1_0 = _SentinelType("STQ1_0", STQ1_0_TYPE_ID)
+PQ2_0 = _SentinelType("PQ2_0", PQ2_0_TYPE_ID)
+PTQ1_0 = _SentinelType("PTQ1_0", PTQ1_0_TYPE_ID)
+
+
+def _f16_bytes(d: np.ndarray) -> np.ndarray:
+    return d.astype(np.float16).view(np.uint16).astype("<u2").view(np.uint8)
+
+
+def _round_half_away(v: np.ndarray) -> np.ndarray:
+    """C ``roundf``/``lroundf``: halves go away from zero, unlike np.round."""
+    return np.sign(v) * np.floor(np.abs(v) + 0.5)
+
+
+# ---------------------------------------------------------------------------
+# STQ1_0
+# ---------------------------------------------------------------------------
 
 _CODEBOOK = np.array(
     # sign = 0
@@ -61,42 +103,6 @@ _QPACK_TO_SLOT[_CODEBOOK] = np.arange(32) & 0xF
 _QPACK_TO_SIGN[_CODEBOOK] = np.arange(32) >> 4
 
 
-class _Stq1_0Type:
-    name = "STQ1_0"
-    value = STQ1_0_TYPE_ID
-
-    def __int__(self) -> int:
-        return STQ1_0_TYPE_ID
-
-    def __index__(self) -> int:
-        return STQ1_0_TYPE_ID
-
-    def __repr__(self) -> str:
-        return "STQ1_0"
-
-
-STQ1_0 = _Stq1_0Type()
-# Lets GGUFWriter synthesize STQ1_0 files (a non-enum key is fine).
-GGML_QUANT_SIZES[STQ1_0] = (256, 42)
-# GGMLQuantizationType(43) resolves to the sentinel instead of raising, so
-# GGUFReader opens real STQ1_0 files.
-GGMLQuantizationType._value2member_map_.setdefault(STQ1_0_TYPE_ID, STQ1_0)
-
-
-class _GTProxy:
-    STQ1_0 = STQ1_0
-
-    def __getattr__(self, name: str):
-        return getattr(GGMLQuantizationType, name)
-
-
-GT = _GTProxy()
-
-
-def _is_stq1_0(qtype) -> bool:
-    return qtype is STQ1_0 or getattr(qtype, "name", None) == "STQ1_0"
-
-
 def _dequantize_stq1_0(data: np.ndarray) -> np.ndarray:
     data = np.ascontiguousarray(data, dtype=np.uint8)
     shape = data.shape
@@ -135,19 +141,163 @@ def _quantize_stq1_0(data: np.ndarray) -> np.ndarray:
     out = np.zeros((nb, 42), dtype=np.uint8)
     out[:, :32] = slot[:, :, 0] | (slot[:, :, 1] << 4)
     out[:, 32:40] = (sign << np.arange(8)).sum(axis=2).astype(np.uint8)
-    out[:, 40:42] = d.view(np.uint16).astype("<u2").view(np.uint8).reshape(nb, 2)
+    out[:, 40:42] = _f16_bytes(d).reshape(nb, 2)
     return out.reshape(shape[:-1] + (shape[-1] // 256 * 42,))
 
 
+# ---------------------------------------------------------------------------
+# PQ2_0: [fp16 d][32 x u8 qs], element j at byte j/4 bits (j%4)*2, code - 1.
+# ---------------------------------------------------------------------------
+
+
+def _dequantize_pq2_0(data: np.ndarray) -> np.ndarray:
+    data = np.ascontiguousarray(data, dtype=np.uint8)
+    shape = data.shape
+    blocks = data.reshape(-1, 34)
+    nb = blocks.shape[0]
+    d = blocks[:, 0:2].copy().view(np.float16).astype(np.float32)
+    qs = blocks[:, 2:34]
+    codes = (qs[:, :, None] >> np.arange(0, 8, 2, dtype=np.uint8)) & 3
+    w = codes.reshape(nb, 128).astype(np.float32) - 1.0
+    return (w * d).reshape(shape[:-1] + (shape[-1] // 34 * 128,))
+
+
+def _quantize_pq2_0(data: np.ndarray) -> np.ndarray:
+    x = np.ascontiguousarray(data, dtype=np.float32)
+    shape = x.shape
+    x = x.reshape(-1, 128)
+    nb = x.shape[0]
+    amax = np.abs(x).max(axis=1)
+    d = amax.astype(np.float16)
+    inv = np.where(amax > 0.0, 1.0 / amax, 0.0).astype(np.float32)
+    q = _round_half_away(x * inv[:, None]).astype(np.int32) + 1
+    q = np.clip(q, 0, 3).astype(np.uint8).reshape(nb, 32, 4)
+    out = np.zeros((nb, 34), dtype=np.uint8)
+    out[:, 0:2] = _f16_bytes(d).reshape(nb, 2)
+    out[:, 2:34] = q[..., 0] | (q[..., 1] << 2) | (q[..., 2] << 4) | (q[..., 3] << 6)
+    return out.reshape(shape[:-1] + (shape[-1] // 128 * 34,))
+
+
+# ---------------------------------------------------------------------------
+# PTQ1_0: [24 x u8 qs][2 x u8 qh][fp16 d]. qs bytes hold five base-3 trits,
+# qh bytes four; the element order follows the reference's stage walk
+# {32, 16, 8} over qs, then qh. Trit n of byte b is ((b * 3^n) mod 256) * 3
+# >> 8; the value is trit - 1.
+# ---------------------------------------------------------------------------
+
+_PTQ1_0_STAGES = (32, 16, 8)
+_PTQ1_0_QS = 24
+_PTQ1_0_QH = 2
+_POW3 = np.array([1, 3, 9, 27, 81, 243], dtype=np.uint16)
+
+
+def _ptq1_0_order() -> np.ndarray:
+    """(payload byte, trit) for each of the 128 elements, derived from the
+    stage walk so it holds at any qs length the stages can tile."""
+    order = []
+    j = 0
+    for c in _PTQ1_0_STAGES:
+        while j + c <= _PTQ1_0_QS:
+            for n in range(5):
+                for m in range(c):
+                    order.append((j + m, n))
+            j += c
+    for n in range(4):
+        for h in range(_PTQ1_0_QH):
+            order.append((_PTQ1_0_QS + h, n))
+    out = np.array(order, dtype=np.int64)
+    assert out.shape == (128, 2)
+    return out
+
+
+PTQ1_0_ORDER = _ptq1_0_order()
+
+
+def _dequantize_ptq1_0(data: np.ndarray) -> np.ndarray:
+    data = np.ascontiguousarray(data, dtype=np.uint8)
+    shape = data.shape
+    blocks = data.reshape(-1, 28)
+    payload = blocks[:, : _PTQ1_0_QS + _PTQ1_0_QH].astype(np.uint16)
+    d = blocks[:, 26:28].copy().view(np.float16).astype(np.float32)
+    byte_idx, trit = PTQ1_0_ORDER[:, 0], PTQ1_0_ORDER[:, 1]
+    q = (payload[:, byte_idx] * _POW3[trit]) & 0xFF
+    xi = ((q * 3) >> 8).astype(np.float32) - 1.0
+    return (xi * d).reshape(shape[:-1] + (shape[-1] // 28 * 128,))
+
+
+def _quantize_ptq1_0(data: np.ndarray) -> np.ndarray:
+    x = np.ascontiguousarray(data, dtype=np.float32)
+    shape = x.shape
+    x = x.reshape(-1, 128)
+    nb = x.shape[0]
+    amax = np.abs(x).max(axis=1)
+    d = amax.astype(np.float16)
+    inv = np.where(amax > 0.0, 1.0 / amax, 0.0).astype(np.float32)
+    trits = (_round_half_away(x * inv[:, None]).astype(np.int64) + 1).astype(np.uint16)
+    # Trit n weighs 3^(4-n) in its byte; the qh bytes carry four trits and the
+    # reference shifts them up one place, which the same weight table does.
+    byte_idx, trit = PTQ1_0_ORDER[:, 0], PTQ1_0_ORDER[:, 1]
+    weight = np.zeros((128, _PTQ1_0_QS + _PTQ1_0_QH), dtype=np.uint16)
+    weight[np.arange(128), byte_idx] = _POW3[4 - trit]
+    q5 = trits @ weight  # [nb, 26], each < 243
+    packed = ((q5.astype(np.uint32) * 256 + 242) // 243).astype(np.uint8)
+    out = np.zeros((nb, 28), dtype=np.uint8)
+    out[:, :26] = packed
+    out[:, 26:28] = _f16_bytes(d).reshape(nb, 2)
+    return out.reshape(shape[:-1] + (shape[-1] // 128 * 28,))
+
+
+# ---------------------------------------------------------------------------
+# Registry and the gguf-py proxies
+# ---------------------------------------------------------------------------
+
+# sentinel -> (weights_per_block, bytes_per_block, dequantize, quantize)
+SENTINELS = {
+    STQ1_0: (256, 42, _dequantize_stq1_0, _quantize_stq1_0),
+    PQ2_0: (128, 34, _dequantize_pq2_0, _quantize_pq2_0),
+    PTQ1_0: (128, 28, _dequantize_ptq1_0, _quantize_ptq1_0),
+}
+_BY_NAME = {s.name: s for s in SENTINELS}
+
+for _s, (_wpb, _bpb, _dq, _q) in SENTINELS.items():
+    # Lets GGUFWriter synthesize files of the sentinel type (a non-enum key is
+    # fine), and GGMLQuantizationType(id) resolve to it so GGUFReader opens
+    # real files.
+    GGML_QUANT_SIZES[_s] = (_wpb, _bpb)
+    GGMLQuantizationType._value2member_map_.setdefault(_s.value, _s)
+
+
+class _GTProxy:
+    STQ1_0 = STQ1_0
+    PQ2_0 = PQ2_0
+    PTQ1_0 = PTQ1_0
+
+    def __getattr__(self, name: str):
+        return getattr(GGMLQuantizationType, name)
+
+
+GT = _GTProxy()
+
+
+def _sentinel(qtype):
+    if isinstance(qtype, str):
+        return _BY_NAME.get(qtype)
+    if qtype in SENTINELS:
+        return qtype
+    return _BY_NAME.get(getattr(qtype, "name", None))
+
+
 def dequantize(data: np.ndarray, qtype) -> np.ndarray:
-    if _is_stq1_0(qtype):
-        return _dequantize_stq1_0(data)
+    s = _sentinel(qtype)
+    if s is not None:
+        return SENTINELS[s][2](data)
     return _gguf_quants.dequantize(data, qtype)
 
 
 def quantize(data: np.ndarray, qtype) -> np.ndarray:
-    if _is_stq1_0(qtype):
-        return _quantize_stq1_0(data)
+    s = _sentinel(qtype)
+    if s is not None:
+        return SENTINELS[s][3](data)
     return _gguf_quants.quantize(data, qtype)
 
 
@@ -160,3 +310,38 @@ class _QuantsProxy:
 
 
 quants = _QuantsProxy()
+
+
+# ---------------------------------------------------------------------------
+# Synthesized test wire for the codecs the tests cannot encode through gguf-py
+# ---------------------------------------------------------------------------
+
+# fp16 d sits at byte 0 unless listed here; IQ1_M and nvfp4 carry no fp16 d.
+_D_OFFSET = {"stq1_0": 40, "ptq1_0": 26}
+
+
+def is_synth(codec: str) -> bool:
+    """Whether the tests feed this codec random structurally-valid wire
+    instead of quantizing real values through gguf-py."""
+    return codec.startswith("iq") or codec in ("nvfp4", "stq1_0", "pq2_0", "ptq1_0")
+
+
+def synth_wire(rng: np.random.Generator, codec: str, bpb: int, n_blocks: int):
+    """Random wire with a sane scale so dequant cannot hit Inf/NaN: fp16 d in
+    0.02..0.08 at the codec's d offset; nvfp4's four ue4m3 group scales at
+    bytes 0..3; IQ1_M's fp16 scale in the top nibble of each of the four
+    uint16 scale words at offset 48."""
+    wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
+    if codec == "nvfp4":
+        wire[:, 0:4] = rng.integers(0x30, 0x41, (n_blocks, 4), dtype=np.uint8)
+        return wire
+    d = rng.uniform(0.02, 0.08, n_blocks).astype(np.float16)
+    if codec == "iq1_m":
+        dbits = d.view(np.uint16)
+        for k, byteidx in enumerate((49, 51, 53, 55)):  # high byte of each word
+            nib = ((dbits >> (4 * k)) & 0xF).astype(np.uint8)
+            wire[:, byteidx] = (wire[:, byteidx] & 0x0F) | (nib << 4)
+        return wire
+    off = _D_OFFSET.get(codec, 0)
+    wire[:, off : off + 2] = d.view(np.uint8).reshape(n_blocks, 2)
+    return wire

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the CPU decode path (eval_cpu) for all 14 codecs.
+"""Validate the CPU decode path (eval_cpu) for every codec.
 
 Every kq call is pinned to ``stream=mx.cpu``, so this exercises the scalar CPU
 decoders (dequantize / quantized_matmul / gather_qmm) and runs with no GPU - the
@@ -26,7 +26,7 @@ import sys
 import mlx.core as mx
 import numpy as np
 import pytest
-from kqref import GT, quants
+from kqref import GT, is_synth, quants, synth_wire
 
 import mlx_kquant as kq
 
@@ -54,9 +54,14 @@ CODECS = {
     "iq1_s": (GT.IQ1_S, 256, 50, 1, False),
     "iq1_m": (GT.IQ1_M, 256, 56, 1, False),
     "stq1_0": (GT.STQ1_0, 256, 42, 1, False),
+    "pq2_0": (GT.PQ2_0, 128, 34, 2, False),
+    "ptq1_0": (GT.PTQ1_0, 128, 28, 1, False),
     "mxfp4": (GT.MXFP4, 32, 17, 4, False),
     "nvfp4": (GT.NVFP4, 64, 36, 4, False),
 }
+
+# Codecs whose Metal kernels have not landed yet; the CPU-vs-GPU A/B skips them.
+CPU_ONLY = {"pq2_0", "ptq1_0"}
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 N, K = 256, 512  # K % 256 and % 64 == 0
@@ -67,34 +72,11 @@ gpu = pytest.mark.skipif(
 )
 
 
-def _synth_iq_wire(rng, bpb, n_blocks):
-    """Structurally-valid random IQ wire: random bytes with a sane fp16 d so
-    dequant can't hit Inf/NaN. Most IQ structs carry d at block offset 0; IQ1_M
-    (bpb 56) has no d -- its fp16 scale is the top nibble of each of the four
-    uint16 scale words at offset 48 -- so seed those nibbles instead."""
-    wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
-    if bpb == 36:  # nvfp4: four ue4m3 group scales at offsets 0-3
-        wire[:, 0:4] = rng.integers(0x30, 0x41, (n_blocks, 4), dtype=np.uint8)
-        return wire
-    d = rng.uniform(0.02, 0.08, n_blocks).astype(np.float16)
-    if bpb == 56:  # IQ1_M: scale reconstructed from scattered top nibbles
-        dbits = d.view(np.uint16)
-        for k, byteidx in enumerate((49, 51, 53, 55)):  # high byte of each word
-            nib = ((dbits >> (4 * k)) & 0xF).astype(np.uint8)
-            wire[:, byteidx] = (wire[:, byteidx] & 0x0F) | (nib << 4)
-    elif bpb == 42:
-        # stq1_0: fp16 d at bytes 40:42; everything else is valid wire.
-        wire[:, 40:42] = d.view(np.uint8).reshape(n_blocks, 2)
-    else:
-        wire[:, 0:2] = d.view(np.uint8).reshape(n_blocks, 2)
-    return wire
-
-
 def _dense_wire_and_ref(codec, gtype, is_kquant):
     """(wire uint8[N, packed], ref float32[N, K]) or (None, None) if missing."""
-    if codec.startswith("iq") or codec in ("nvfp4", "stq1_0"):
+    if is_synth(codec):
         wpb, bpb = CODECS[codec][1], CODECS[codec][2]
-        wire = _synth_iq_wire(np.random.default_rng(7), bpb, N * (K // wpb))
+        wire = synth_wire(np.random.default_rng(7), codec, bpb, N * (K // wpb))
         wire = wire.reshape(N, (K // wpb) * bpb)
         ref = quants.dequantize(np.ascontiguousarray(wire), gtype).astype(np.float32)
         return wire, ref
@@ -113,11 +95,11 @@ def _dense_wire_and_ref(codec, gtype, is_kquant):
 
 def _moe_wire_and_ref(codec, gtype, is_kquant):
     """(wire uint8[E, N, packed], ref float32[E, N, K]) or (None, None)."""
-    if codec.startswith("iq") or codec in ("nvfp4", "stq1_0"):
+    if is_synth(codec):
         wpb, bpb = CODECS[codec][1], CODECS[codec][2]
         rng = np.random.default_rng(11)
         wires = [
-            _synth_iq_wire(rng, bpb, N * (K // wpb)).reshape(N, (K // wpb) * bpb)
+            synth_wire(rng, codec, bpb, N * (K // wpb)).reshape(N, (K // wpb) * bpb)
             for _ in range(E_MOE)
         ]
         refs = [quants.dequantize(np.ascontiguousarray(w), gtype) for w in wires]
@@ -231,6 +213,8 @@ def test_cpu_gather_qmm_matches_reference():
 def test_cpu_vs_gpu_dequantize_bit_exact():
     """f32 dequant is a pure decode - CPU and GPU must produce identical bytes."""
     for codec, (gtype, _wpb, _bpb, _bits, is_kq) in CODECS.items():
+        if codec in CPU_ONLY:
+            continue
         wire, _ref = _dense_wire_and_ref(codec, gtype, is_kq)
         assert wire is not None, f"{codec}: missing fixture - run gen_fixtures.py"
         w = mx.array(wire)

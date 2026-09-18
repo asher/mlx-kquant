@@ -761,6 +761,67 @@ void dequantize_stq1_0(const uint8_t* w, T* out, std::size_t num_weights) {
   }
 }
 
+// PQ2_0: fp16 d, then 32 bytes of 2-bit codes, element j at byte j/4 bits
+// (j%4)*2. Code c decodes as (c - 1) * d, so code 3 is +2.
+template <typename T>
+void dequantize_pq2_0(const uint8_t* w, T* out, std::size_t num_weights) {
+  constexpr int block_weights = 128;
+  constexpr int block_bytes = 34;
+  std::size_t num_blocks = num_weights / block_weights;
+  for (std::size_t b = 0; b < num_blocks; b++) {
+    const uint8_t* block = w + b * block_bytes;
+    float d = read_f16(block);
+    const uint8_t* qs = block + 2;
+    T* y = out + b * block_weights;
+    for (int j = 0; j < block_weights; j++) {
+      const int q = (qs[j >> 2] >> (2 * (j & 3))) & 3;
+      y[j] = static_cast<T>(d * static_cast<float>(q - 1));
+    }
+  }
+}
+
+// PTQ1_0: 24 qs bytes of five base-3 trits each, two qh bytes of four, fp16
+// d last. The stage walk over qs is the reference's {32, 16, 8}; at 24 bytes
+// the 32 stage never fires, so trit n of qs[m] (m < 16) is element 16n + m
+// and trit n of qs[16 + m] (m < 8) is element 80 + 8n + m. Trit n of byte b
+// is ((b * 3^n) mod 256) * 3 >> 8; the value is trit - 1.
+template <typename T>
+void dequantize_ptq1_0(const uint8_t* w, T* out, std::size_t num_weights) {
+  constexpr int block_weights = 128;
+  constexpr int block_bytes = 28;
+  constexpr std::size_t qs_bytes = 24;
+  constexpr std::size_t qh_bytes = 2;
+  constexpr std::size_t stages[3] = {32, 16, 8};
+  constexpr uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
+  std::size_t num_blocks = num_weights / block_weights;
+  for (std::size_t b = 0; b < num_blocks; b++) {
+    const uint8_t* block = w + b * block_bytes;
+    const uint8_t* qs = block;
+    const uint8_t* qh = block + qs_bytes;
+    float d = read_f16(block + qs_bytes + qh_bytes);
+    T* y = out + b * block_weights;
+    std::size_t j = 0;
+    for (std::size_t c : stages) {
+      for (; j + c <= qs_bytes; j += c) {
+        for (int n = 0; n < 5; n++) {
+          for (std::size_t m = 0; m < c; m++) {
+            const uint8_t q = static_cast<uint8_t>(qs[j + m] * pow3[n]);
+            const int xi = (static_cast<uint16_t>(q) * 3) >> 8;
+            *y++ = static_cast<T>(d * static_cast<float>(xi - 1));
+          }
+        }
+      }
+    }
+    for (int n = 0; n < 4; n++) {
+      for (std::size_t h = 0; h < qh_bytes; h++) {
+        const uint8_t q = static_cast<uint8_t>(qh[h] * pow3[n]);
+        const int xi = (static_cast<uint16_t>(q) * 3) >> 8;
+        *y++ = static_cast<T>(d * static_cast<float>(xi - 1));
+      }
+    }
+  }
+}
+
 // --------------------------------------------------------------------------
 // Shared CPU worker pool
 // --------------------------------------------------------------------------
@@ -1025,6 +1086,10 @@ DequantFnF32 dequant_fn_f32(const std::string& t) {
     return &dequantize_iq1_m<float>;
   } else if (t == "stq1_0") {
     return &dequantize_stq1_0<float>;
+  } else if (t == "pq2_0") {
+    return &dequantize_pq2_0<float>;
+  } else if (t == "ptq1_0") {
+    return &dequantize_ptq1_0<float>;
   } else if (t == "mxfp4") {
     return &dequantize_mxfp4<float>;
   } else if (t == "nvfp4") {
@@ -1207,6 +1272,10 @@ void kquant_dequantize_dispatch(
     dequantize_iq1_m(w, out, num_weights);
   } else if (kquant_type == "stq1_0") {
     dequantize_stq1_0(w, out, num_weights);
+  } else if (kquant_type == "pq2_0") {
+    dequantize_pq2_0(w, out, num_weights);
+  } else if (kquant_type == "ptq1_0") {
+    dequantize_ptq1_0(w, out, num_weights);
   } else if (kquant_type == "mxfp4") {
     dequantize_mxfp4(w, out, num_weights);
   } else if (kquant_type == "nvfp4") {

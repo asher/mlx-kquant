@@ -61,6 +61,33 @@ if(NOT _C MATCHES "\"stq1_0\"")
   message(STATUS "gguflib: patched gguflib.c (STQ1_0 type-features)")
 endif()
 
+# Prism codecs (PrismML/llama.cpp, no upstream PR): PQ2_0 = type 142, 128 vals
+# / 34 B; PTQ1_0 = type 143, 128 vals / 28 B. The type-features table is
+# positional, so slots 44..141 get placeholder rows.
+file(READ "${_h}" _H)
+if(NOT _H MATCHES "GGUF_TYPE_PTQ1_0")
+  string(REPLACE
+    "    GGUF_TYPE_STQ1_0 = 43,\n    GGUF_TYPE_COUNT,"
+    "    GGUF_TYPE_STQ1_0 = 43,\n    GGUF_TYPE_PQ2_0 = 142,\n    GGUF_TYPE_PTQ1_0 = 143,\n    GGUF_TYPE_COUNT,"
+    _H "${_H}")
+  file(WRITE "${_h}" "${_H}")
+  message(STATUS "gguflib: patched gguflib.h (PQ2_0/PTQ1_0; COUNT=144)")
+endif()
+
+file(READ "${_c}" _C)
+if(NOT _C MATCHES "\"ptq1_0\"")
+  set(_fill "")
+  foreach(_i RANGE 44 141)
+    string(APPEND _fill "    {\"unused_${_i}\", 0, 0},\n")
+  endforeach()
+  string(REPLACE
+    "    {\"stq1_0\", 256, 42},\n}"
+    "    {\"stq1_0\", 256, 42},\n${_fill}    {\"pq2_0\", 128, 34},\n    {\"ptq1_0\", 128, 28},\n}"
+    _C "${_C}")
+  file(WRITE "${_c}" "${_C}")
+  message(STATUS "gguflib: patched gguflib.c (PQ2_0/PTQ1_0 type-features)")
+endif()
+
 # Correct two upstream IQ block-geometry errors (antirez's table predates the
 # final ggml IQ layout): IQ1_S is 50 B / 256 (it had 110), and IQ4_NL is the
 # ONLY flat IQ codec at 18 B / 32 (it had 256/50 = IQ1_S's geometry). The IQ4_NL
@@ -122,7 +149,8 @@ endif()
 # landed. Every marker must appear in the final text or the configure fails.
 file(READ "${_h}" _H)
 file(READ "${_c}" _C)
-foreach(_m "GGUF_TYPE_MXFP4" "GGUF_TYPE_STQ1_0" "gguf_open_ro")
+foreach(_m "GGUF_TYPE_MXFP4" "GGUF_TYPE_STQ1_0" "GGUF_TYPE_PTQ1_0"
+        "gguf_open_ro")
   if(NOT _H MATCHES "${_m}")
     message(FATAL_ERROR
       "gguflib patch did not land: '${_m}' missing from gguflib.h "
@@ -131,8 +159,8 @@ foreach(_m "GGUF_TYPE_MXFP4" "GGUF_TYPE_STQ1_0" "gguf_open_ro")
 endforeach()
 # _prot,_flags appears only in the mutated mmap() argument list, so it is the
 # one marker that witnesses that REPLACE specifically.
-foreach(_m "\"mxfp4\"" "\"stq1_0\"" "iq4_nl\", 32, 18" "gguf_open_ro"
-        "_prot,_flags")
+foreach(_m "\"mxfp4\"" "\"stq1_0\"" "\"pq2_0\", 128, 34" "\"ptq1_0\", 128, 28"
+        "iq4_nl\", 32, 18" "gguf_open_ro" "_prot,_flags")
   if(NOT _C MATCHES "${_m}")
     message(FATAL_ERROR
       "gguflib patch did not land: '${_m}' missing from gguflib.c "
