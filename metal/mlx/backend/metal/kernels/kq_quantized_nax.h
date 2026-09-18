@@ -3434,6 +3434,138 @@ struct KqNaxStq1_0BlockLoader {
   }
 };
 
+// Prism codecs (128-weight blocks): a 32-weight k-tile is chunks 2s and
+// 2s+1 of deq_chunk16; four k-tiles per block, two per 64-wide BCOLS step.
+template <
+    typename Ext,
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct KqNaxPrismBlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
+  MLX_MTL_CONST int weights_per_block = Ext::superblock;
+  MLX_MTL_CONST int bytes_per_block = Ext::block_bytes;
+  MLX_MTL_CONST int k_tile_size = 32;
+  MLX_MTL_CONST int k_tiles_per_block = weights_per_block / k_tile_size;
+
+  static_assert(BCOLS == 64, "Prism NAX loader requires BCOLS == 64.");
+  static_assert(
+      (BCOLS * BROWS) % tgp_size == 0,
+      "tgp_size must evenly divide BCOLS * BROWS.");
+
+  MLX_MTL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
+  static_assert(n_reads == k_tile_size, "Prism NAX expects n_reads == 32.");
+
+  const int src_ld;
+  const int row_bytes;
+  const int tile_stride;
+  const short fixed_kt_base;
+
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+  short kt_base;
+
+  KqNaxPrismBlockLoader(
+      const device uint8_t* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      int col_in_block = 0) thread
+      : src_ld(src_ld_),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
+        tile_stride(
+            reduction_dim
+                ? 0
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
+        fixed_kt_base(reduction_dim == 0 ? (col_in_block / k_tile_size) : 0),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj((thread_idx % TCOLS) * n_reads),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
+        kt_base(0) {}
+
+  void load_unsafe() const thread {
+    static_assert(
+        dst_ld % 4 == 0, "vec4 threadgroup stores need dst_ld % 4 == 0");
+    const short sb =
+        (reduction_dim == 1 ? kt_base : fixed_kt_base) + bj / k_tile_size;
+#pragma unroll
+    for (short c = 0; c < 2; ++c) {
+      float4x4 reg;
+      Ext::deq_chunk16(src, 2 * sb + c, reg);
+#pragma unroll
+      for (short k = 0; k < 4; ++k) {
+        *(threadgroup vec<T, 4>*)(dst + 16 * c + 4 * k) = vec<T, 4>(reg[k]);
+      }
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const thread {
+    if (bi >= src_tile_dim.y) {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() thread {
+    if (reduction_dim == 1) {
+      kt_base += 2;
+      if (kt_base == k_tiles_per_block) {
+        kt_base = 0;
+        src += bytes_per_block;
+      }
+    } else {
+      src += tile_stride;
+    }
+  }
+};
+
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+using KqNaxPq2_0BlockLoader = KqNaxPrismBlockLoader<
+    KqPq2_0Ext,
+    T,
+    BROWS,
+    BCOLS,
+    dst_ld,
+    reduction_dim,
+    tgp_size>;
+
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+using KqNaxPtq1_0BlockLoader = KqNaxPrismBlockLoader<
+    KqPtq1_0Ext,
+    T,
+    BROWS,
+    BCOLS,
+    dst_ld,
+    reduction_dim,
+    tgp_size>;
+
 KQ_NAX_DEFINE_KERNELS(iq4_nl, 32, 4, KqNaxIq4_nlBlockLoader)
 KQ_NAX_DEFINE_KERNELS(iq4_xs, 256, 4, KqNaxIq4_xsBlockLoader)
 KQ_NAX_DEFINE_KERNELS(iq3_xxs, 256, 3, KqNaxIq3_xxsBlockLoader)
@@ -3444,6 +3576,8 @@ KQ_NAX_DEFINE_KERNELS(iq2_s, 256, 2, KqNaxIq2_sBlockLoader)
 KQ_NAX_DEFINE_KERNELS(iq1_s, 256, 1, KqNaxIq1_sBlockLoader)
 KQ_NAX_DEFINE_KERNELS(iq1_m, 256, 1, KqNaxIq1_mBlockLoader)
 KQ_NAX_DEFINE_KERNELS(stq1_0, 256, 1, KqNaxStq1_0BlockLoader)
+KQ_NAX_DEFINE_KERNELS(pq2_0, 128, 2, KqNaxPq2_0BlockLoader)
+KQ_NAX_DEFINE_KERNELS(ptq1_0, 128, 1, KqNaxPtq1_0BlockLoader)
 KQ_NAX_DEFINE_KERNELS(q4_0, 32, 4, KqNaxQ4_0BlockLoader)
 KQ_NAX_DEFINE_KERNELS(q4_1, 32, 4, KqNaxQ4_1BlockLoader)
 KQ_NAX_DEFINE_KERNELS(q5_0, 32, 5, KqNaxQ5_0BlockLoader)
@@ -3553,6 +3687,8 @@ KQ_NAX_DEFINE_SPLITK_KERNEL(iq2_s, 256, 2, KqNaxIq2_sBlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(iq1_s, 256, 1, KqNaxIq1_sBlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(iq1_m, 256, 1, KqNaxIq1_mBlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(stq1_0, 256, 1, KqNaxStq1_0BlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(pq2_0, 128, 2, KqNaxPq2_0BlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(ptq1_0, 128, 1, KqNaxPtq1_0BlockLoader)
 
 template <
     typename T,
@@ -3844,6 +3980,8 @@ KQ_NAX_DEFINE_GATHER_RHS(iq2_s, 256, 2, KqNaxIq2_sBlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(iq1_s, 256, 1, KqNaxIq1_sBlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(iq1_m, 256, 1, KqNaxIq1_mBlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(stq1_0, 256, 1, KqNaxStq1_0BlockLoader)
+KQ_NAX_DEFINE_GATHER_RHS(pq2_0, 128, 2, KqNaxPq2_0BlockLoader)
+KQ_NAX_DEFINE_GATHER_RHS(ptq1_0, 128, 1, KqNaxPtq1_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(q4_0, 32, 4, KqNaxQ4_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(q4_1, 32, 4, KqNaxQ4_1BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(q5_0, 32, 5, KqNaxQ5_0BlockLoader)
@@ -4094,6 +4232,8 @@ KQ_NAX_DEFINE_GATHER_SEG(iq2_s, 256, 2, KqNaxIq2_sBlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(iq1_s, 256, 1, KqNaxIq1_sBlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(iq1_m, 256, 1, KqNaxIq1_mBlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(stq1_0, 256, 1, KqNaxStq1_0BlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(pq2_0, 128, 2, KqNaxPq2_0BlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(ptq1_0, 128, 1, KqNaxPtq1_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(q4_0, 32, 4, KqNaxQ4_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(q4_1, 32, 4, KqNaxQ4_1BlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(q5_0, 32, 5, KqNaxQ5_0BlockLoader)

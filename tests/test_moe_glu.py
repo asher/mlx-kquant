@@ -40,7 +40,7 @@ import sys
 import mlx.core as mx
 import numpy as np
 import pytest
-from kqref import GT, quants
+from kqref import GT, is_synth, quants, synth_wire
 
 import mlx_kquant as kq
 
@@ -71,6 +71,8 @@ CODECS = {
     "iq1_s": (GT.IQ1_S, 256, 50, False),
     "iq1_m": (GT.IQ1_M, 256, 56, False),
     "stq1_0": (GT.STQ1_0, 256, 42, False),
+    "pq2_0": (GT.PQ2_0, 128, 34, False),
+    "ptq1_0": (GT.PTQ1_0, 128, 28, False),
     "mxfp4": (GT.MXFP4, 32, 17, False),
     "nvfp4": (GT.NVFP4, 64, 36, False),
 }
@@ -81,39 +83,23 @@ T, R = 3, 2  # tokens, routed slots (S = R + 1 with the shared expert)
 REL_BOUND = 2e-3  # dequant is bit-exact; residual is f32 reorder + f16 x
 
 
-def _synth_iq_wire(rng, bpb, n_blocks):
-    """Structurally-valid random IQ wire (gguf-py is decode-only for IQ):
-    random bytes with a sane fp16 d at block offset 0 (IQ1_M: scale nibbles)
-    so dequant can't hit Inf/NaN."""
-    wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
-    if bpb == 36:  # nvfp4: four ue4m3 group scales, kept small for f16 GLU
-        wire[:, 0:4] = rng.integers(0x08, 0x19, (n_blocks, 4), dtype=np.uint8)
-        return wire
-    # Keep d small: random scale/grid bits already reach the codec's max
-    # magnitude, and the GLU product act(g) * u must stay inside f16 range
+def _synth_wire(rng, codec, bpb, n_blocks):
+    # Keep the scales small: random scale/grid bits already reach the codec's
+    # max magnitude, and the GLU product act(g) * u must stay inside f16 range
     # (iq4_xs random wire hits |w| ~ 80 at d = 0.02).
-    d = rng.uniform(0.004, 0.01, n_blocks).astype(np.float16)
-    if bpb == 56:
-        dbits = d.view(np.uint16)
-        for k, byteidx in enumerate((49, 51, 53, 55)):
-            nib = ((dbits >> (4 * k)) & 0xF).astype(np.uint8)
-            wire[:, byteidx] = (wire[:, byteidx] & 0x0F) | (nib << 4)
-    elif bpb == 42:
-        # stq1_0: fp16 d at bytes 40:42; everything else is valid wire.
-        wire[:, 40:42] = d.view(np.uint8).reshape(n_blocks, 2)
-    else:
-        wire[:, 0:2] = d.view(np.uint8).reshape(n_blocks, 2)
-    return wire
+    return synth_wire(
+        rng, codec, bpb, n_blocks, d_range=(0.004, 0.01), nvfp4_scales=(0x08, 0x19)
+    )
 
 
 def _wire_and_ref(codec, seed=11, k=K):
     """Return (wire uint8[E, N, packed], ref float32[E, N, k]) or (None, None)
     when a K-quant fixture is missing. k only varies for synthesized codecs."""
     gtype, wpb, bpb, is_kq = CODECS[codec]
-    if codec.startswith("iq") or codec in ("nvfp4", "stq1_0"):
+    if is_synth(codec):
         rng = np.random.default_rng(seed)
         wires = [
-            _synth_iq_wire(rng, bpb, N * (k // wpb)).reshape(N, (k // wpb) * bpb)
+            _synth_wire(rng, codec, bpb, N * (k // wpb)).reshape(N, (k // wpb) * bpb)
             for _ in range(E)
         ]
         refs = [quants.dequantize(np.ascontiguousarray(w), gtype) for w in wires]

@@ -60,9 +60,6 @@ CODECS = {
     "nvfp4": (GT.NVFP4, 64, 36, 4, False),
 }
 
-# Codecs whose Metal kernels have not landed yet; the CPU-vs-GPU A/B skips them.
-CPU_ONLY = {"pq2_0", "ptq1_0"}
-
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 N, K = 256, 512  # K % 256 and % 64 == 0
 E_MOE = 4  # experts for the gather sweep
@@ -213,8 +210,6 @@ def test_cpu_gather_qmm_matches_reference():
 def test_cpu_vs_gpu_dequantize_bit_exact():
     """f32 dequant is a pure decode - CPU and GPU must produce identical bytes."""
     for codec, (gtype, _wpb, _bpb, _bits, is_kq) in CODECS.items():
-        if codec in CPU_ONLY:
-            continue
         wire, _ref = _dense_wire_and_ref(codec, gtype, is_kq)
         assert wire is not None, f"{codec}: missing fixture - run gen_fixtures.py"
         w = mx.array(wire)

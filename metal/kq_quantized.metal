@@ -413,6 +413,8 @@ instantiate_mv_ext_all(iq2_s, 256, 2)
 instantiate_mv_ext_all(iq1_s, 256, 1)
 instantiate_mv_ext_all(iq1_m, 256, 1)
 instantiate_mv_ext_all(stq1_0, 256, 1)
+instantiate_mv_ext_all(pq2_0, 128, 2)
+instantiate_mv_ext_all(ptq1_0, 128, 1)
 
 // Wide-M rows-per-thread experiment (KQ_MV_EXT_NR=2): each thread owns nr0=2
 // output rows and shares one activation load across them, halving activation
@@ -956,6 +958,41 @@ instantiate_kquant_iq1_m_for_type(float16_t)
 instantiate_kquant_stq1_0_for_type(float)
 instantiate_kquant_stq1_0_for_type(bfloat16_t)
 instantiate_kquant_stq1_0_for_type(float16_t)
+
+// Prism codecs (128-weight blocks): the stq1_0 set, parameterized.
+#define instantiate_kquant_prism_for_type(codec, gs, bits, type)      \
+  instantiate_kquant_batched(qmv_fast, type, gs, bits, 0, codec)      \
+  instantiate_kquant_batched(qmv_fast, type, gs, bits, 1, codec)      \
+  instantiate_kquant_batched(qmv_fast_fine, type, gs, bits, 0, codec) \
+  instantiate_kquant_batched(qmv_fine, type, gs, bits, 0, codec)      \
+  instantiate_kquant_batched(qmv,      type, gs, bits, 0, codec)      \
+  instantiate_kquant_batched(qmv,      type, gs, bits, 1, codec)      \
+  instantiate_kquant_qmm_t(type, gs, bits, true, 0, codec)            \
+  instantiate_kquant_qmm_t(type, gs, bits, true, 1, codec)            \
+  instantiate_kquant_qmm_t(type, gs, bits, false, 0, codec)           \
+  instantiate_kquant_qmm_t(type, gs, bits, false, 1, codec)           \
+  instantiate_kquant_qmm_t_splitk(type, gs, bits, true, codec)        \
+  instantiate_kquant_qmm_t_splitk(type, gs, bits, false, codec)       \
+  instantiate_kquant_qmm_t_splitk_bm16(type, gs, bits, true, codec)   \
+  instantiate_kquant_qmm_t_splitk_bm8(type, gs, bits, true, codec)    \
+  instantiate_kquant_qmm_t_splitk_bm16(type, gs, bits, false, codec)  \
+  instantiate_kquant_qmm_t_splitk_bm8(type, gs, bits, false, codec)   \
+  instantiate_kquant_qmm_n(type, gs, bits, 0, codec)                  \
+  instantiate_kquant_qmm_n(type, gs, bits, 1, codec)                  \
+  instantiate_kquant_gather_qmv(gather_qmv_fast, type, gs, bits, codec) \
+  instantiate_kquant_gather_qmv(gather_qmv,      type, gs, bits, codec) \
+  instantiate_kquant_gather_qmm_t(type, gs, bits, true, codec)        \
+  instantiate_kquant_gather_qmm_t(type, gs, bits, false, codec)       \
+  instantiate_kquant_gather_qmm_seg_t(type, gs, bits, true, codec)    \
+  instantiate_kquant_gather_qmm_seg_t(type, gs, bits, false, codec)   \
+  instantiate_kquant_gather_qmm_n(type, gs, bits, codec)              \
+  instantiate_kquant_dequantize(type, gs, bits, codec)
+instantiate_kquant_prism_for_type(pq2_0, 128, 2, float)
+instantiate_kquant_prism_for_type(pq2_0, 128, 2, bfloat16_t)
+instantiate_kquant_prism_for_type(pq2_0, 128, 2, float16_t)
+instantiate_kquant_prism_for_type(ptq1_0, 128, 1, float)
+instantiate_kquant_prism_for_type(ptq1_0, 128, 1, bfloat16_t)
+instantiate_kquant_prism_for_type(ptq1_0, 128, 1, float16_t)
 // clang-format on
 
 // clang-format off
@@ -1005,6 +1042,8 @@ instantiate_kquant_gather_qmm_rhs_codec(256, 2, iq2_s)
 instantiate_kquant_gather_qmm_rhs_codec(256, 1, iq1_s)
 instantiate_kquant_gather_qmm_rhs_codec(256, 1, iq1_m)
 instantiate_kquant_gather_qmm_rhs_codec(256, 1, stq1_0)
+instantiate_kquant_gather_qmm_rhs_codec(128, 2, pq2_0)
+instantiate_kquant_gather_qmm_rhs_codec(128, 1, ptq1_0)
 
 // Tile-map builder for gather_qmm_seg. One thread per expert-sorted row; the
 // thread whose row starts a 64-row tile appends (expert, row_start, num_rows)

@@ -326,16 +326,29 @@ def is_synth(codec: str) -> bool:
     return codec.startswith("iq") or codec in ("nvfp4", "stq1_0", "pq2_0", "ptq1_0")
 
 
-def synth_wire(rng: np.random.Generator, codec: str, bpb: int, n_blocks: int):
+def synth_wire(
+    rng: np.random.Generator,
+    codec: str,
+    bpb: int,
+    n_blocks: int,
+    *,
+    d_range: tuple[float, float] = (0.02, 0.08),
+    nvfp4_scales: tuple[int, int] = (0x30, 0x41),
+):
     """Random wire with a sane scale so dequant cannot hit Inf/NaN: fp16 d in
-    0.02..0.08 at the codec's d offset; nvfp4's four ue4m3 group scales at
-    bytes 0..3; IQ1_M's fp16 scale in the top nibble of each of the four
-    uint16 scale words at offset 48."""
+    ``d_range`` at the codec's d offset; nvfp4's four ue4m3 group scales at
+    bytes 0..3 drawn from ``nvfp4_scales``; mxfp4's e8m0 scale near 1; IQ1_M's
+    fp16 scale in the top nibble of each of the four uint16 scale words at
+    offset 48."""
     wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
     if codec == "nvfp4":
-        wire[:, 0:4] = rng.integers(0x30, 0x41, (n_blocks, 4), dtype=np.uint8)
+        lo, hi = nvfp4_scales
+        wire[:, 0:4] = rng.integers(lo, hi, (n_blocks, 4), dtype=np.uint8)
         return wire
-    d = rng.uniform(0.02, 0.08, n_blocks).astype(np.float16)
+    if codec == "mxfp4":
+        wire[:, 0] = rng.integers(121, 132, n_blocks, dtype=np.uint8)
+        return wire
+    d = rng.uniform(*d_range, n_blocks).astype(np.float16)
     if codec == "iq1_m":
         dbits = d.view(np.uint16)
         for k, byteidx in enumerate((49, 51, 53, 55)):  # high byte of each word

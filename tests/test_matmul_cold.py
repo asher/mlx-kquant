@@ -51,13 +51,21 @@ CODECS = [
     "iq1_s",
     "iq1_m",
     "stq1_0",
+    "pq2_0",
+    "ptq1_0",
     "mxfp4",
     "nvfp4",
 ]
 REQUIRED_IMATRIX = {"iq2_xxs", "iq2_xs", "iq1_s"}
-# Decode-only wire codecs: no kq.quantize, the cold check synthesizes wire
-# bytes and oracles them through gguf-py's numpy dequant.
-DECODE_ONLY = {"mxfp4", "nvfp4"}
+# Decode-only wire codecs, (bytes, weights) per block: no kq.quantize, the
+# cold check synthesizes wire bytes and oracles them through the numpy
+# dequant.
+DECODE_ONLY = {
+    "mxfp4": (17, 32),
+    "nvfp4": (36, 64),
+    "pq2_0": (34, 128),
+    "ptq1_0": (28, 128),
+}
 N, K, M = 1024, 1024, 64
 
 
@@ -69,7 +77,7 @@ def _cold_check(codec: str) -> int:
     """
     import mlx.core as mx
     import numpy as np
-    from kqref import GT, quants
+    from kqref import GT, quants, synth_wire
 
     import mlx_kquant as kq
 
@@ -77,14 +85,8 @@ def _cold_check(codec: str) -> int:
     rng = np.random.default_rng(0)
 
     if codec in DECODE_ONLY:
-        # Synthesized wire (moderate scale bytes so dequant can't hit Inf/NaN).
-        bpb, wpb = (17, 32) if codec == "mxfp4" else (36, 64)
-        n_blocks = N * (K // wpb)
-        wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
-        if codec == "mxfp4":
-            wire[:, 0] = rng.integers(121, 132, n_blocks, dtype=np.uint8)
-        else:
-            wire[:, 0:4] = rng.integers(0x30, 0x41, (n_blocks, 4), dtype=np.uint8)
+        bpb, wpb = DECODE_ONLY[codec]
+        wire = synth_wire(rng, codec, bpb, N * (K // wpb))
         wq_np = np.ascontiguousarray(wire.reshape(N, (K // wpb) * bpb))
         scales = mx.zeros((1,), dtype=mx.uint8)
     else:
