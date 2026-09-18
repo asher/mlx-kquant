@@ -1866,6 +1866,10 @@ NB_MODULE(_ext, m) {
             scale (float): uniform multiplier on emitted routed scores
                 (routed_scaling_factor).
 
+        A row whose remaining logits are all NaN takes the lowest expert
+        ids not yet picked, so indices are always in [0, E); the scores
+        of such picks are NaN.
+
         Returns:
             tuple: (indices [T, top_k] uint32,
             scores [T, top_k + shared_gate] float32).

@@ -115,7 +115,8 @@ load feeds both projections.
 - **`moe_glu_gather`** - the MLX packed-mxfp4 counterpart.
 - **`moe_router_topk`** - the router in one dispatch: f32 scoring (`softmax`, or `sqrtsoftplus` for
   DeepSeek-V4), top-k with a min-index tie-break, optional bias-ranked selection, optional
-  renormalization, and an optional per-expert scale.
+  renormalization, and an optional per-expert scale. Indices are always in range: a row whose
+  remaining logits are all NaN takes the lowest expert ids not yet picked, with NaN scores.
 
 The GLU activation is selected per model: plain SwiGLU/GELU, the clamped `silu_limit`
 (`silu(min(g, limit)) * clip(u, -limit, limit)`) that DeepSeek-V4's `LimitedSwiGLU` needs, or

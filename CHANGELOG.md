@@ -6,6 +6,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- `moe_router_topk`: a row whose logits were all NaN returned expert index
+  4294967295, which crashed any caller that indexed by expert id, and a row
+  with fewer finite logits than `top_k` repeated an expert it had already
+  picked. NaN entries now rank below every value and such a row routes its
+  remaining picks to the lowest expert ids not yet taken.
+
 ## [0.4.10]
 
 ### Added
