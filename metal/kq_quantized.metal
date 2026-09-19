@@ -964,6 +964,7 @@ instantiate_kquant_stq1_0_for_type(float16_t)
   instantiate_kquant_batched(qmv_fast, type, gs, bits, 0, codec)      \
   instantiate_kquant_batched(qmv_fast, type, gs, bits, 1, codec)      \
   instantiate_kquant_batched(qmv_fast_fine, type, gs, bits, 0, codec) \
+  instantiate_kquant_batched(verify_qmv, type, gs, bits, 0, codec)   \
   instantiate_kquant_batched(qmv_fine, type, gs, bits, 0, codec)      \
   instantiate_kquant_batched(qmv,      type, gs, bits, 0, codec)      \
   instantiate_kquant_batched(qmv,      type, gs, bits, 1, codec)      \

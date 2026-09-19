@@ -255,6 +255,11 @@ static int kq_splitk_min_m_nax_alu(const std::string& t) {
 //   M12. Entry 5.
 // The bm16 tile that preceded bm8 entered q4_k/q3_k/q5_k/q6_k/iq3_s/
 // iq3_xxs/iq4_nl at 6, iq2_s and q8_0 at 8, iq4_xs at 10.
+// Widest M the Prism verify_qmv kernels serve by default.
+static int kq_prism_verify_max_m() {
+  return 4;
+}
+
 static int kq_splitk_min_m(const std::string& t) {
   if (kq_is_nax_available()) {
     return kq_splitk_min_m_nax_alu(t);
@@ -1487,7 +1492,12 @@ void KQuantMatmul::eval_gpu_base(
         kquant_type_ == "stq1_0" || kquant_type_ == "pq2_0" ||
         kquant_type_ == "ptq1_0" || kquant_type_ == "mxfp4" ||
         kquant_type_ == "nvfp4";
-    const bool mv_ext_default_on = codec_has_mv_ext;
+    // The Prism codecs decode each block once per row in verify_qmv and
+    // once per activation row in mv_ext, so M 2..4 takes verify_qmv;
+    // split-K enters at 5.
+    const bool is_prism = kquant_type_ == "pq2_0" || kquant_type_ == "ptq1_0";
+    const bool mv_ext_default_on =
+        codec_has_mv_ext && !(is_prism && M <= kq_prism_verify_max_m());
     // Width gate for the DEFAULT path (the A/B force-on KQ_VERIFY_EXT=1 ignores
     // it). Measured DRAM-cold across every wired codec (M5 Max, [17408x5120],
     // working set streamed far past the SLC): at M==2 verify_qmv holds its

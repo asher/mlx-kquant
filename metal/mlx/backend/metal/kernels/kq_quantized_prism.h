@@ -76,14 +76,31 @@ struct KqPq2_0Ext {
   }
 };
 
+// Half2 pair decode of one lane's 16 codes, held as one uint whose bits
+// 2j..2j+1 are code j. Codes j and j+8 sit 16 bits apart, so one mask and
+// one or put them into the mantissas of a half2 with value 1024 + 4^j c,
+// and one half2 fma turns that into (c - 1) / 16 exactly: the 1/16 keeps
+// the half accumulator away from overflow and the -1 is the codec offset.
+// Pairs 5..7 read the word shifted down by 10 bits so their codes also
+// land below the 1024 mantissa bit.
+METAL_FUNC void kq_pq2_0_decode_pairs(uint wv, thread half2* h) {
+#pragma unroll
+  for (short j = 0; j < 8; ++j) {
+    const short jj = j < 5 ? j : j - 5;
+    const uint src = j < 5 ? wv : wv >> 10;
+    const uint p = (src & (0x00030003u << (2 * jj))) | 0x64006400u;
+    const half scale = half(1.0f / float(16 << (2 * jj)));
+    h[j] =
+        fma(as_type<half2>(p),
+            half2(scale),
+            half2(-1024.0h * scale - half(1.0f / 16.0f)));
+  }
+}
+
 // M=1 mat-vec: eight lanes per block, four blocks per simdgroup pass, 16
-// contiguous weights per lane, held as one uint whose bits 2j..2j+1 are
-// code j. Codes j and j+8 sit 16 bits apart, so one mask and one or put
-// them into the mantissas of a half2 with value 1024 + 4^j c, and one
-// half2 fma turns that into c / 16 exactly (the 1/16 keeps the half
-// accumulator away from overflow). Two half MACs per instruction against
-// the activation pair (y_j, y_j+8) keep the decode near the load-only
-// rate; the -1 offset is one fp32 subtraction of sum y per block.
+// contiguous weights per lane decoded as half2 pairs. Two half MACs per
+// instruction against the activation pair (y_j, y_j+8) keep the decode
+// near the load-only rate.
 template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
 METAL_FUNC void kq_pq2_0_qmv_impl(
     const device uint8_t* w,
@@ -120,11 +137,9 @@ METAL_FUNC void kq_pq2_0_qmv_impl(
     const vec<T, 8> lo = *(const device vec<T, 8>*)(xb);
     const vec<T, 8> hi = *(const device vec<T, 8>*)(xb + 8);
     A2 y2[8];
-    U sumy = 0;
 #pragma unroll
     for (short j = 0; j < 8; ++j) {
       y2[j] = A2(float(lo[j]), float(hi[j]));
-      sumy += float(lo[j]) + float(hi[j]);
     }
     // A static row loop lets the compiler interleave the rows' loads; the
     // tail threadgroup recomputes its last row and drops it at the store.
@@ -134,30 +149,108 @@ METAL_FUNC void kq_pq2_0_qmv_impl(
           static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
               row_bytes +
           ib * KQ_PQ2_0_BLOCK_BYTES;
-      const U d = U(float(*(const device half*)(sb)));
+      const U d16 = 16.0f * U(float(*(const device half*)(sb)));
       const device ushort* qs =
           (const device ushort*)(sb + KQ_PQ2_0_QS_OFFSET + 4 * it);
-      const uint wv = uint(qs[0]) | (uint(qs[1]) << 16);
+      half2 h[8];
+      kq_pq2_0_decode_pairs(uint(qs[0]) | (uint(qs[1]) << 16), h);
       A2 acc = A2(0, 0);
 #pragma unroll
       for (short j = 0; j < 8; ++j) {
-        // Pairs 5..7 read the word shifted down by 10 bits so their codes
-        // also land below the 1024 mantissa bit.
-        const short jj = j < 5 ? j : j - 5;
-        const uint src = j < 5 ? wv : wv >> 10;
-        const uint p = (src & (0x00030003u << (2 * jj))) | 0x64006400u;
-        const half scale = half(1.0f / float(16 << (2 * jj)));
-        const half2 h =
-            fma(as_type<half2>(p), half2(scale), half2(-1024.0h * scale));
-        acc = fma(A2(h), y2[j], acc);
+        acc = fma(A2(h[j]), y2[j], acc);
       }
-      result[row] += d * (16.0f * (float(acc.x) + float(acc.y)) - sumy);
+      result[row] += d16 * (float(acc.x) + float(acc.y));
     }
   }
   for (int row = 0; row < results_per_simdgroup; row++) {
     U r = simd_sum(result[row]);
     if (simd_lid == 0 && row < active_rows) {
       y[out_row + row] = static_cast<T>(r);
+    }
+  }
+}
+
+// Verify-shaped mat-vec (M = vm in 2..KQ_PRISM_MAX_VM activation rows, see
+// kq_q8_0_verify_qmv_impl): the same lane geometry as the M=1 kernel, each
+// row's pairs decoded once per block and dotted against every activation
+// row. Non-batched only; bit-identical to the M=1 kernel per row.
+MLX_MTL_CONST int KQ_PRISM_MAX_VM = 8;
+
+template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
+METAL_FUNC void kq_pq2_0_verify_qmv_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(group_size == KQ_PQ2_0_SUPERBLOCK, "PQ2_0 requires gs=128");
+  static_assert(bits == 2, "PQ2_0 requires bits=2");
+  constexpr int num_simdgroups = 2;
+  constexpr int blocks_per_pass = 4;
+  typedef metal::conditional_t<metal::is_same_v<T, float>, float2, half2> A2;
+  typedef float U;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+  if (out_row >= out_vec_size) {
+    return;
+  }
+  const int active_rows = min(results_per_simdgroup, out_vec_size - out_row);
+  const int nb = in_vec_size / KQ_PQ2_0_SUPERBLOCK;
+  const int row_bytes = nb * KQ_PQ2_0_BLOCK_BYTES;
+  const short ix = simd_lid >> 3;
+  const short it = simd_lid & 7;
+  U result[KQ_PRISM_MAX_VM][results_per_simdgroup] = {{0}};
+  for (int ib = ix; ib < nb; ib += blocks_per_pass) {
+    half2 h[results_per_simdgroup][8];
+    U d16[results_per_simdgroup];
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* sb = w +
+          static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
+              row_bytes +
+          ib * KQ_PQ2_0_BLOCK_BYTES;
+      d16[row] = 16.0f * U(float(*(const device half*)(sb)));
+      const device ushort* qs =
+          (const device ushort*)(sb + KQ_PQ2_0_QS_OFFSET + 4 * it);
+      kq_pq2_0_decode_pairs(uint(qs[0]) | (uint(qs[1]) << 16), h[row]);
+    }
+#pragma unroll
+    for (int m = 0; m < KQ_PRISM_MAX_VM; m++) {
+      if (m < vm) {
+        const device T* xb =
+            x + m * in_vec_size + ib * KQ_PQ2_0_SUPERBLOCK + it * 16;
+        const vec<T, 8> lo = *(const device vec<T, 8>*)(xb);
+        const vec<T, 8> hi = *(const device vec<T, 8>*)(xb + 8);
+        A2 y2[8];
+#pragma unroll
+        for (short j = 0; j < 8; ++j) {
+          y2[j] = A2(float(lo[j]), float(hi[j]));
+        }
+#pragma unroll
+        for (int row = 0; row < results_per_simdgroup; row++) {
+          A2 acc = A2(0, 0);
+#pragma unroll
+          for (short j = 0; j < 8; ++j) {
+            acc = fma(A2(h[row][j]), y2[j], acc);
+          }
+          result[m][row] += d16[row] * (float(acc.x) + float(acc.y));
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int m = 0; m < KQ_PRISM_MAX_VM; m++) {
+    if (m < vm) {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        U r = simd_sum(result[m][row]);
+        if (simd_lid == 0 && row < active_rows) {
+          y[m * out_vec_size + out_row + row] = static_cast<T>(r);
+        }
+      }
     }
   }
 }
@@ -362,6 +455,111 @@ METAL_FUNC void kq_ptq1_0_qmv_impl(
     U r = simd_sum(result[row]);
     if (simd_lid == 0 && row < active_rows) {
       y[out_row + row] = static_cast<T>(r);
+    }
+  }
+}
+
+// Verify-shaped mat-vec (M = vm in 2..KQ_PRISM_MAX_VM): the M=1 lane
+// geometry, but the lane decodes its 16 trits to values once per row and
+// block (the trit chain is the codec's cost, so it is paid once, not per
+// activation row) and dots them against every activation row.
+template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
+METAL_FUNC void kq_ptq1_0_verify_qmv_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(group_size == KQ_PTQ1_0_SUPERBLOCK, "PTQ1_0 requires gs=128");
+  static_assert(bits == 1, "PTQ1_0 requires bits=1");
+  constexpr int num_simdgroups = 2;
+  constexpr int blocks_per_pass = 4;
+  typedef float U;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+  if (out_row >= out_vec_size) {
+    return;
+  }
+  const int active_rows = min(results_per_simdgroup, out_vec_size - out_row);
+  const int nb = in_vec_size / KQ_PTQ1_0_SUPERBLOCK;
+  const int row_bytes = nb * KQ_PTQ1_0_BLOCK_BYTES;
+  const short ix = simd_lid >> 3;
+  const short it = simd_lid & 7;
+  const float pow3f[4] = {1.0f, 3.0f, 9.0f, 27.0f};
+  const U ph = pow3f[it >> 1];
+  U result[KQ_PRISM_MAX_VM][results_per_simdgroup] = {{0}};
+  for (int ib = ix; ib < nb; ib += blocks_per_pass) {
+    // t[row][0..4], [5..9]: bytes qs[2it], qs[2it+1] (elements 16n + m);
+    // [10..14]: qs[16 + it] (elements 80 + 8n + it); [15]: the qh trit
+    // (element 120 + it). Values are trit - 1.
+    U t[results_per_simdgroup][16];
+    U d[results_per_simdgroup];
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* sb = w +
+          static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
+              row_bytes +
+          ib * KQ_PTQ1_0_BLOCK_BYTES;
+      d[row] = U(float(*(const device half*)(sb + KQ_PTQ1_0_D_OFFSET)));
+#pragma unroll
+      for (short k = 0; k < 3; ++k) {
+        const U u = U(sb[k < 2 ? 2 * it + k : 16 + it]) * (1.0f / 256.0f);
+        const float p3[5] = {3.0f, 9.0f, 27.0f, 81.0f, 243.0f};
+        U g = 0;
+#pragma unroll
+        for (short n = 0; n < 5; ++n) {
+          const U gn = floor(p3[n] * u);
+          t[row][5 * k + n] = gn - 3.0f * g - 1.0f;
+          g = gn;
+        }
+      }
+      {
+        const U u = U(sb[KQ_PTQ1_0_QH_OFFSET + (it & 1)]) * (1.0f / 256.0f);
+        t[row][15] = floor(3.0f * ph * u) - 3.0f * floor(ph * u) - 1.0f;
+      }
+    }
+#pragma unroll
+    for (int m = 0; m < KQ_PRISM_MAX_VM; m++) {
+      if (m < vm) {
+        const device T* xb = x + m * in_vec_size + ib * KQ_PTQ1_0_SUPERBLOCK;
+        U xs[16];
+#pragma unroll
+        for (short k = 0; k < 2; ++k) {
+#pragma unroll
+          for (short n = 0; n < 5; ++n) {
+            xs[5 * k + n] = U(xb[16 * n + 2 * it + k]);
+          }
+        }
+#pragma unroll
+        for (short n = 0; n < 5; ++n) {
+          xs[10 + n] = U(xb[80 + 8 * n + it]);
+        }
+        xs[15] = U(xb[120 + it]);
+#pragma unroll
+        for (int row = 0; row < results_per_simdgroup; row++) {
+          U acc = 0;
+#pragma unroll
+          for (short i = 0; i < 16; ++i) {
+            acc = fma(t[row][i], xs[i], acc);
+          }
+          result[m][row] += d[row] * acc;
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int m = 0; m < KQ_PRISM_MAX_VM; m++) {
+    if (m < vm) {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        U r = simd_sum(result[m][row]);
+        if (simd_lid == 0 && row < active_rows) {
+          y[m * out_vec_size + out_row + row] = static_cast<T>(r);
+        }
+      }
     }
   }
 }
@@ -759,6 +957,22 @@ using KqPtq1_0BlockLoader = KqPrismBlockLoader<
       uint simd_lid [[thread_index_in_simdgroup]]) {                         \
     kq_##CODEC##_qmv_fast_impl<T, group_size, bits, 1>(                      \
         w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);        \
+  }                                                                          \
+                                                                             \
+  template <typename T, int group_size, int bits, bool batched>              \
+  [[kernel]] void kq_##CODEC##_verify_qmv(                                   \
+      const device uint8_t* w,                                               \
+      const device uint8_t* /* scales */,                                    \
+      const device T* x,                                                     \
+      device T* y,                                                           \
+      const constant int& in_vec_size,                                       \
+      const constant int& out_vec_size,                                      \
+      const constant int& vm,                                                \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    kq_##CODEC##_verify_qmv_impl<T, group_size, bits>(                       \
+        w, x, y, in_vec_size, out_vec_size, vm, tid, simd_gid, simd_lid);    \
   }                                                                          \
                                                                              \
   template <typename T, int group_size, int bits, bool batched>              \

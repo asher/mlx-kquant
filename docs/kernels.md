@@ -106,7 +106,10 @@ set with the same inherited, uncalibrated NAX policy. The `ptq1_0` M=1 kernel po
 byte-owning lane layout and the exact-float base-3 coefficient collapse, so a block's payload is
 read once and each trit costs a floor and an fma. The `pq2_0` M=1 kernel masks each pair of 2-bit
 codes into the mantissas of a half2 and runs the dot as half2 fmas, two weights per instruction,
-which brings it close to the rate of a kernel that only loads the bytes.
+which brings it close to the rate of a kernel that only loads the bytes. Both codecs have a
+`verify_qmv` sibling that decodes each row's block once and dots it against every activation row;
+it serves M 2 to 4 by default (the `mv_ext` re-decode per row costs `ptq1_0` 3x there) and split-K
+enters at M 5.
 
 ## MoE GLU
 
