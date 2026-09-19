@@ -14,8 +14,10 @@ Two layers:
   ten K-quant/legacy codecs: `q2_k, q3_k, q4_k, q5_k, q6_k` and `q4_0, q4_1, q5_0, q5_1, q8_0`, plus
   nine IQ codecs
   (`iq4_nl, iq4_xs, iq3_s, iq3_xxs, iq2_xxs, iq2_xs, iq2_s, iq1_s, iq1_m`), plus the QAT
-  structured-sparse ternary codec `stq1_0` - all twenty decode,
-  matmul (incl. tensor-core prefill), and encode (IQ and stq1_0 encode is CPU-only) - plus the native-fp wire
+  structured-sparse ternary codec `stq1_0` and the two PrismML Ternary Bonsai codecs `pq2_0, ptq1_0`
+  (ggml types 142 and 143, private to the PrismML llama.cpp fork, so the ids may change) - all
+  twenty-two decode, matmul (incl. tensor-core prefill), and encode (IQ, stq1_0 and Prism encode is
+  CPU-only) - plus the native-fp wire
   codecs `mxfp4, nvfp4` (decode, CPU NEON + Metal matmul, and the fused MoE family incl. biased
   gpt-oss experts; no encoder - GGUFs ship these tensors pre-quantized). On top of these four core
   ops the namespace also carries fused decode/prefill kernels (MoE GLU and router, attention, norm
@@ -249,9 +251,9 @@ kernel where tensor units are available, steel simdgroup-mma elsewhere), and a b
 - **Codec registry** derives `group_size`/`bits` from the codec name, so callers pass only
   `kquant_type`.
 - **CPU and GPU execution.** The decode ops (`dequantize` / `quantized_matmul` / `gather_qmm`) run on
-  either stream for all twenty codecs; `quantize` (encode) covers the ten K-quant/legacy codecs on
-  either stream and the nine IQ codecs plus `stq1_0` CPU-only (ggml has no GPU quantizer for
-  these), so the full
+  either stream for all twenty-two codecs; `quantize` (encode) covers the ten K-quant/legacy codecs
+  on either stream and the nine IQ codecs plus `stq1_0`, `pq2_0` and `ptq1_0` CPU-only (ggml has no
+  GPU quantizer for these), so the full
   quantize/decode pipeline (and the op tests) runs in CI without a GPU. The per-block `dequantize` is
   a scalar, bit-exact (per-codec, vs the `gguf.quants` reference quantizer) decoder. The CPU **matmul**
   and **gather** are tuned for Apple Silicon: a shared worker pool over output rows, NEON int8
@@ -380,7 +382,7 @@ python -m pytest tests/
 ## Limitations
 
 - **GPU path is Apple-Silicon Metal only.** No ROCm or CUDA support. Every op also has a CPU path
-  (`stream=mx.cpu`) — decode for all twenty codecs, encode for all twenty (IQ and stq1_0 encode is CPU-only) — so the extension
+  (`stream=mx.cpu`) — decode for all twenty-two codecs, encode for all twenty-two (IQ, stq1_0 and Prism encode is CPU-only) — so the extension
   still builds and runs without Metal (see
   [How it works](#how-it-works) and [Install](#install)).
 - **Linux model forwards need `MLX_DISABLE_COMPILE=1`.** Stock MLX's CPU compile JIT generates C++
