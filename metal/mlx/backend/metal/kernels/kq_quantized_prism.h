@@ -77,11 +77,13 @@ struct KqPq2_0Ext {
 };
 
 // M=1 mat-vec: eight lanes per block, four blocks per simdgroup pass, 16
-// contiguous weights per lane. With g_k = floor(4^k u) the four 2-bit fields
-// of a byte are g_1, g_2 - 4 g_1, g_3 - 4 g_2 and b - 4 g_3, so
-//   sum_n t_n y_n = g_1 (y_3 - 4 y_2) + g_2 (y_2 - 4 y_1)
-//                 + g_3 (y_1 - 4 y_0) + b y_0
-// and the -1 offset is one subtraction of sum y per block.
+// contiguous weights per lane, held as one uint whose bits 2j..2j+1 are
+// code j. Codes j and j+8 sit 16 bits apart, so one mask and one or put
+// them into the mantissas of a half2 with value 1024 + 4^j c, and one
+// half2 fma turns that into c / 16 exactly (the 1/16 keeps the half
+// accumulator away from overflow). Two half MACs per instruction against
+// the activation pair (y_j, y_j+8) keep the decode near the load-only
+// rate; the -1 offset is one fp32 subtraction of sum y per block.
 template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
 METAL_FUNC void kq_pq2_0_qmv_impl(
     const device uint8_t* w,
@@ -96,6 +98,9 @@ METAL_FUNC void kq_pq2_0_qmv_impl(
   static_assert(bits == 2, "PQ2_0 requires bits=2");
   constexpr int num_simdgroups = 2;
   constexpr int blocks_per_pass = 4;
+  // fp32 activations keep an fp32 pair accumulator; half inputs stay in
+  // the half pipe.
+  typedef metal::conditional_t<metal::is_same_v<T, float>, float2, half2> A2;
   typedef float U;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
@@ -112,34 +117,41 @@ METAL_FUNC void kq_pq2_0_qmv_impl(
   U result[results_per_simdgroup] = {0};
   for (int ib = ix; ib < nb; ib += blocks_per_pass) {
     const device T* xb = x + ib * KQ_PQ2_0_SUPERBLOCK + it * 16;
-    U c[16];
+    const vec<T, 8> lo = *(const device vec<T, 8>*)(xb);
+    const vec<T, 8> hi = *(const device vec<T, 8>*)(xb + 8);
+    A2 y2[8];
     U sumy = 0;
 #pragma unroll
-    for (short j = 0; j < 4; ++j) {
-      const float4 v = float4(*(const device vec<T, 4>*)(xb + 4 * j));
-      sumy += (v[0] + v[1]) + (v[2] + v[3]);
-      c[4 * j + 0] = v[3] - 4.0f * v[2];
-      c[4 * j + 1] = v[2] - 4.0f * v[1];
-      c[4 * j + 2] = v[1] - 4.0f * v[0];
-      c[4 * j + 3] = v[0];
+    for (short j = 0; j < 8; ++j) {
+      y2[j] = A2(float(lo[j]), float(hi[j]));
+      sumy += float(lo[j]) + float(hi[j]);
     }
-    for (int row = 0; row < active_rows; row++) {
+    // A static row loop lets the compiler interleave the rows' loads; the
+    // tail threadgroup recomputes its last row and drops it at the store.
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* sb = w +
-          static_cast<int64_t>(out_row + row) * row_bytes +
+          static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
+              row_bytes +
           ib * KQ_PQ2_0_BLOCK_BYTES;
       const U d = U(float(*(const device half*)(sb)));
-      const device uint8_t* qs = sb + KQ_PQ2_0_QS_OFFSET + 4 * it;
-      U acc = 0;
+      const device ushort* qs =
+          (const device ushort*)(sb + KQ_PQ2_0_QS_OFFSET + 4 * it);
+      const uint wv = uint(qs[0]) | (uint(qs[1]) << 16);
+      A2 acc = A2(0, 0);
 #pragma unroll
-      for (short j = 0; j < 4; ++j) {
-        const U b = U(qs[j]);
-        const U u = b * (1.0f / 256.0f);
-        acc += floor(4.0f * u) * c[4 * j + 0];
-        acc += floor(16.0f * u) * c[4 * j + 1];
-        acc += floor(64.0f * u) * c[4 * j + 2];
-        acc += b * c[4 * j + 3];
+      for (short j = 0; j < 8; ++j) {
+        // Pairs 5..7 read the word shifted down by 10 bits so their codes
+        // also land below the 1024 mantissa bit.
+        const short jj = j < 5 ? j : j - 5;
+        const uint src = j < 5 ? wv : wv >> 10;
+        const uint p = (src & (0x00030003u << (2 * jj))) | 0x64006400u;
+        const half scale = half(1.0f / float(16 << (2 * jj)));
+        const half2 h =
+            fma(as_type<half2>(p), half2(scale), half2(-1024.0h * scale));
+        acc = fma(A2(h), y2[j], acc);
       }
-      result[row] += d * (acc - sumy);
+      result[row] += d * (16.0f * (float(acc.x) + float(acc.y)) - sumy);
     }
   }
   for (int row = 0; row < results_per_simdgroup; row++) {
@@ -321,9 +333,11 @@ METAL_FUNC void kq_ptq1_0_qmv_impl(
     }
     c[15] = U(xb[120 + it]);
     sumy += c[15];
-    for (int row = 0; row < active_rows; row++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* sb = w +
-          static_cast<int64_t>(out_row + row) * row_bytes +
+          static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
+              row_bytes +
           ib * KQ_PTQ1_0_BLOCK_BYTES;
       const U d = U(float(*(const device half*)(sb + KQ_PTQ1_0_D_OFFSET)));
       U acc = 0;
