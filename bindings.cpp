@@ -78,6 +78,18 @@ NB_MODULE(_ext, m) {
       "True when the GPU supports the NAX (tensor-core) matmul kernels.");
 
   m.def(
+      "gpu_core_count",
+      &mlx_kquant::gpu_core_count,
+      "GPU core count from IOKit (KQ_GPU_CORES overrides it); 0 when unknown.");
+
+  m.def(
+      "qmv_fine_max_n",
+      &mlx_kquant::qmv_fine_max_n,
+      "kquant_type"_a,
+      "Largest N at which the single-row mat-vec takes the fine tiling for "
+      "this codec on this GPU; 0 means coarse.");
+
+  m.def(
       "nax_gather_enabled",
       &mlx_kquant::nax_gather_enabled,
       "kquant_type"_a,

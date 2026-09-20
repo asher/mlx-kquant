@@ -144,6 +144,26 @@ inline int kquant_qmv_fine_default_max_n(const std::string& kquant_type) {
   return 0;
 }
 
+// The ceilings above were calibrated on a 40-core GPU. A part with fewer
+// cores saturates its grid at a proportionally smaller N, so when
+// KQ_GPU_CORES names the part's core count the ceiling scales with it.
+// Unset, the calibrated value applies on every part (the scaling is not
+// yet measured on a smaller GPU).
+constexpr int kq_fine_reference_cores = 40;
+inline int kquant_qmv_fine_max_n(const std::string& kquant_type) {
+  const int base = kquant_qmv_fine_default_max_n(kquant_type);
+  if (base == 0 || std::getenv("KQ_GPU_CORES") == nullptr) {
+    return base;
+  }
+  const int cores = gpu_core_count();
+  if (cores <= 0 || cores == kq_fine_reference_cores) {
+    return base;
+  }
+  const long scaled = static_cast<long>(base) * cores / kq_fine_reference_cores;
+  const int rounded = static_cast<int>(scaled / 256 * 256);
+  return std::min(std::max(rounded, 512), 32768);
+}
+
 // Codecs with a verify_qmv kernel (the small-M weight-read-amortizing leaf).
 // Kept as an explicit allow-list so the dispatch only routes to a kernel that
 // was actually instantiated in kq_quantized.metal; new codecs are added here

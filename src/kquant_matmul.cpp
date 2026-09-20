@@ -802,7 +802,7 @@ void qmv(
   const bool use_fine = fine_ok &&
       (qmv_fine_env == 1 ||
        (qmv_fine_env != 0 && M == 1 &&
-        N <= kquant_qmv_fine_default_max_n(kquant_type)));
+        N <= kquant_qmv_fine_max_n(kquant_type)));
   const int rows_per_tg = use_fine ? 2 : bn;
   MTL::Size group_dims(bk, 2, 1);
   MTL::Size grid_dims(M, (N + rows_per_tg - 1) / rows_per_tg, B);
@@ -867,7 +867,7 @@ void qmv_bias(
   const int qmv_fine_env = qmv_fine_e != nullptr ? std::atoi(qmv_fine_e) : -1;
   const bool use_fine = codec_has_qmv_fine(kquant_type) &&
       (qmv_fine_env == 1 ||
-       (qmv_fine_env != 0 && N <= kquant_qmv_fine_default_max_n(kquant_type)));
+       (qmv_fine_env != 0 && N <= kquant_qmv_fine_max_n(kquant_type)));
   const int rows_per_tg = use_fine ? 2 : bn;
   MTL::Size group_dims(bk, 2, 1);
   MTL::Size grid_dims(1, (N + rows_per_tg - 1) / rows_per_tg, 1);
@@ -1671,6 +1671,11 @@ void KQuantQmvBias::eval_gpu(
   }
 }
 
+int qmv_fine_max_n(const std::string& kquant_type) {
+  return codec_has_qmv_fine(kquant_type) ? kquant_qmv_fine_max_n(kquant_type)
+                                         : 0;
+}
+
 #else
 
 void KQuantQmvBias::eval_gpu(
@@ -1678,6 +1683,10 @@ void KQuantQmvBias::eval_gpu(
     std::vector<mx::array>&) {
   throw std::runtime_error(
       "[mlx_kquant] quantized_matmul_qmv_bias has no GPU implementation.");
+}
+
+int qmv_fine_max_n(const std::string&) {
+  return 0;
 }
 
 #endif // _METAL_
