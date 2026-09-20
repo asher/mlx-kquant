@@ -277,8 +277,10 @@ METAL_FUNC void kq_q4_0_qmv_impl(
       yl[i + 9] = b1 * (U(1) / U(4096));
     }
 
-    for (int row = 0; row < active_rows; row++) {
-      const int row_idx = out_row + row;
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const int row_idx = min(out_row + row, out_vec_size - 1);
       const device uint8_t* block_addr = w +
           static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_0_BLOCK_BYTES;
       const U d = U(kq_q4_0_d(block_addr));
@@ -1027,8 +1029,10 @@ METAL_FUNC void kq_q4_1_qmv_impl(
       yl[i + 9] = b1 * (U(1) / U(4096));
     }
 
-    for (int row = 0; row < active_rows; row++) {
-      const int row_idx = out_row + row;
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const int row_idx = min(out_row + row, out_vec_size - 1);
       const device uint8_t* block_addr = w +
           static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q4_1_BLOCK_BYTES;
       const U d = U(kq_q4_1_d(block_addr));
@@ -1801,8 +1805,10 @@ METAL_FUNC void kq_q5_0_qmv_impl(
       yl[i + 9] = b1 * (U(1) / U(4096));
     }
 
-    for (int row = 0; row < active_rows; row++) {
-      const int row_idx = out_row + row;
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const int row_idx = min(out_row + row, out_vec_size - 1);
       const device uint8_t* block_addr = w +
           static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_0_BLOCK_BYTES;
       const U d = U(kq_q5_0_d(block_addr));
@@ -2434,9 +2440,12 @@ METAL_FUNC void kq_iq4_nl_qmv_impl(
       xt[k] = U(xb[k]);
       xt[bytes_per_lane + k] = U(xb[KQ_IQ4_NL_GROUP / 2 + k]);
     }
-    for (int row = 0; row < active_rows; row++) {
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* blk = w +
-          static_cast<int64_t>(out_row + row) * row_bytes +
+          static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
+              row_bytes +
           ib * KQ_IQ4_NL_BLOCK_BYTES;
       const U d = U(float(*(const device half*)blk));
       const device ushort* qw = reinterpret_cast<const device ushort*>(

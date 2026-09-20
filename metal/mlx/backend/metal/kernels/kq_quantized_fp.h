@@ -132,9 +132,10 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
       w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
 }
 
-// MXFP4 mat-vec: one impl for both qmv and qmv_fast (the LUT decode is cheap,
-// so there's no separate aligned fast path). Lane `simd_lid` owns weight
-// `lane` of every 32-block; simd_sum reduces the 32 lanes.
+// MXFP4 mat-vec: one impl for both qmv and qmv_fast. A simdgroup pass
+// covers 16 blocks, two lanes per block; a lane owns 8 qs bytes, so its 16
+// weights are the low and the high nibbles of those bytes, and its x values
+// come in as four float4 reused across the row loop.
 template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
 METAL_FUNC void kq_mxfp4_qmv_impl(
     const device uint8_t* w,
@@ -148,6 +149,7 @@ METAL_FUNC void kq_mxfp4_qmv_impl(
   static_assert(group_size == KQ_MXFP4_GROUP, "MXFP4 requires gs=32");
   static_assert(bits == 4, "MXFP4 requires bits=4");
   constexpr int num_simdgroups = 2;
+  constexpr int blocks_per_pass = 16;
   typedef float U;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
@@ -159,19 +161,45 @@ METAL_FUNC void kq_mxfp4_qmv_impl(
   const int nb = in_vec_size / KQ_MXFP4_GROUP;
   x += tid.x * in_vec_size;
   y += tid.x * out_vec_size;
-  const bool is_high = simd_lid >= 16;
-  const int byteidx = is_high ? int(simd_lid) - 16 : int(simd_lid);
+  const int ix = simd_lid / 2;
+  const int it = simd_lid % 2;
   U result[results_per_simdgroup] = {0};
-  for (int ib = 0; ib < nb; ib++) {
-    const U xv = U(x[ib * KQ_MXFP4_GROUP + simd_lid]);
-    for (int row = 0; row < active_rows; row++) {
+  for (int ib = ix; ib < nb; ib += blocks_per_pass) {
+    const device T* xb = x + ib * KQ_MXFP4_GROUP + it * 8;
+    const float4 yl0(xb[0], xb[1], xb[2], xb[3]);
+    const float4 yl1(xb[16], xb[17], xb[18], xb[19]);
+    const float4 yl2(xb[4], xb[5], xb[6], xb[7]);
+    const float4 yl3(xb[20], xb[21], xb[22], xb[23]);
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* blk = w +
-          static_cast<int64_t>(out_row + row) * row_bytes +
+          static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
+              row_bytes +
           ib * KQ_MXFP4_BLOCK_BYTES;
       const U d = U(kq_fp_e8m0_scale(blk[0]));
-      const uint8_t b = blk[KQ_MXFP4_QS_OFFSET + byteidx];
-      const int nib = is_high ? (b >> 4) : (b & 0x0F);
-      result[row] += d * U(kq_fp_e2m1_lut[nib]) * xv;
+      const device uint8_t* q = blk + KQ_MXFP4_QS_OFFSET + 8 * it;
+      float4 acc = yl0 *
+          float4(kq_fp_e2m1_lut[q[0] & 0x0F],
+                 kq_fp_e2m1_lut[q[1] & 0x0F],
+                 kq_fp_e2m1_lut[q[2] & 0x0F],
+                 kq_fp_e2m1_lut[q[3] & 0x0F]);
+      acc += yl1 *
+          float4(kq_fp_e2m1_lut[q[0] >> 4],
+                 kq_fp_e2m1_lut[q[1] >> 4],
+                 kq_fp_e2m1_lut[q[2] >> 4],
+                 kq_fp_e2m1_lut[q[3] >> 4]);
+      acc += yl2 *
+          float4(kq_fp_e2m1_lut[q[4] & 0x0F],
+                 kq_fp_e2m1_lut[q[5] & 0x0F],
+                 kq_fp_e2m1_lut[q[6] & 0x0F],
+                 kq_fp_e2m1_lut[q[7] & 0x0F]);
+      acc += yl3 *
+          float4(kq_fp_e2m1_lut[q[4] >> 4],
+                 kq_fp_e2m1_lut[q[5] >> 4],
+                 kq_fp_e2m1_lut[q[6] >> 4],
+                 kq_fp_e2m1_lut[q[7] >> 4]);
+      result[row] += d * ((acc.x + acc.y) + (acc.z + acc.w));
     }
   }
   for (int row = 0; row < results_per_simdgroup; row++) {
@@ -647,9 +675,12 @@ METAL_FUNC void kq_nvfp4_qmv_impl(
   for (int ib = 0; ib < nb; ib++) {
     const U xv0 = U(x[ib * KQ_NVFP4_SUPERBLOCK + simd_lid]);
     const U xv1 = U(x[ib * KQ_NVFP4_SUPERBLOCK + 32 + simd_lid]);
-    for (int row = 0; row < active_rows; row++) {
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* blk = w +
-          static_cast<int64_t>(out_row + row) * row_bytes +
+          static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
+              row_bytes +
           ib * KQ_NVFP4_BLOCK_BYTES;
       const U d0 = U(kq_fp_ue4m3_scale(blk[g0]));
       const U d1 = U(kq_fp_ue4m3_scale(blk[g0 + 2]));

@@ -16,6 +16,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rows that a Hadamard-folded weight expects, with an optional grouped-head
   permute of the row.
 
+### Changed
+- The M=1 mat-vec kernels loop over their output rows with a static trip
+  count, which lets the compiler interleave the rows' loads. The iq, fp4 and
+  stq1_0 codecs decode markedly faster; the K-quant and legacy codecs were
+  already at the bandwidth floor and are unchanged.
+
+
 ## [0.4.11]
 
 ### Fixed

@@ -204,9 +204,12 @@ METAL_FUNC void kq_stq1_0_qmv_impl(
     for (int i = 0; i < vpt; i++) {
       xt[i] = U(x[ib * KQ_STQ1_0_SUPERBLOCK + simd_lid * vpt + i]);
     }
-    for (int row = 0; row < active_rows; row++) {
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* sb = w +
-          static_cast<int64_t>(out_row + row) * row_bytes +
+          static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
+              row_bytes +
           ib * KQ_STQ1_0_BLOCK_BYTES;
       const U d = U(float(*(const device half*)(sb + KQ_STQ1_0_D_OFFSET)));
       const device ushort* qsw =

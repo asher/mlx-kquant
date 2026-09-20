@@ -63,6 +63,11 @@ the BM=64 tile above that with a double-buffered `_db` variant on the M 33-64 ba
 a BM=128 tile from M 193 when ceil(M/64) is even. Every floor is a measured per-codec policy
 (`kq_smallbm_policy` in `src/kquant_matmul.cpp`).
 
+The M=1 mat-vec kernels loop over their two or four output rows with a static trip count and a
+clamped row index, so the compiler interleaves the rows' loads; the tail threadgroup recomputes its
+last row and drops it at the store. `q2_k` and `q3_k` keep the runtime bound: the static form measured no
+faster for them.
+
 Tuning levers (defaults are right for normal use):
 
 - `KQ_NAX_SMALL_BM` - small-M routing. `0` restores the old routing (mat-vec paths below M 13 and
