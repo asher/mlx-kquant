@@ -445,7 +445,12 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits, bool aligned_N>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    int small_bm = 0>
 [[kernel]] void kq_q4_0_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -463,7 +468,9 @@ template <typename T, int group_size, int bits, bool aligned_N>
   static_assert(
       group_size == KQ_Q4_0_GROUP, "Q4_0 kernel requires group_size=32");
   static_assert(bits == 4, "Q4_0 kernel requires bits=4");
-  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BM = small_bm ? small_bm : 32;
+  constexpr int BK = 32, BN = small_bm ? 64 : 32;
+  constexpr int WM = BM == 8 ? 1 : 2, WN = 4 / WM;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -481,7 +488,7 @@ template <typename T, int group_size, int bits, bool aligned_N>
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       wl,
       x,
       y,
@@ -746,6 +753,47 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
   kq_mv_ext_impl<T, KqQ4_0Ext, r1ptg, nsg, nxpsg>(
       w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
 }
+
+// Register-resident MMA verify (kq_verify_mma.h). Lane L owns bytes
+// 4L..4L+3 of qs: fragments (n0, n2), (n1, n3), (h0, h2), (h1, h3) of
+// its four low and four high nibbles, each pair masked into the
+// mantissas of a half2 (1024 + q) and offset by 1032 = 1024 + 8.
+struct KqQ4_0Mma {
+  static constant constexpr int block_k = KQ_Q4_0_GROUP;
+  static constant constexpr int block_bytes = KQ_Q4_0_BLOCK_BYTES;
+  static constant constexpr int d_offset = KQ_Q4_0_D_OFFSET;
+  static METAL_FUNC int perm(int f, int col) {
+    return 16 * ((f % 4) >> 1) + 4 * (col / 2) + (f & 1) + 2 * (col & 1);
+  }
+  template <int NT>
+  static METAL_FUNC void block(
+      thread const KqVmmaRows<NT>& rows,
+      int boff,
+      short L,
+      const threadgroup half* xb,
+      thread simdgroup_half8x8 (&acc)[NT]) {
+    uint lo[NT], hi[NT];
+    for (short t = 0; t < NT; ++t) {
+      const packed_ushort2 v2 =
+          *(const device packed_ushort2*)(rows.p[t] + boff + KQ_Q4_0_QS_OFFSET +
+                                          4 * L);
+      const uint wv = uint(v2.x) | (uint(v2.y) << 16);
+      lo[t] = wv & 0x0F0F0F0Fu;
+      hi[t] = (wv >> 4) & 0x0F0F0F0Fu;
+    }
+    for (short f = 0; f < 4; ++f) {
+      half2 a[NT];
+      for (short t = 0; t < NT; ++t) {
+        const uint src = (f < 2 ? lo[t] : hi[t]) >> (8 * (f & 1));
+        a[t] =
+            as_type<half2>((src & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
+      }
+      kq_vmma_step<NT>(xb + 64 * f, a, acc);
+    }
+  }
+};
+
+KQ_DEFINE_VERIFY_MMA_KERNEL(q4_0, KqQ4_0Mma, 2)
 
 // Q4_1: 20 bytes/32 weights. [fp16 d][fp16 m][uint8 qs[16]]. w[i] = d * q4 + m.
 
@@ -1208,7 +1256,12 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits, bool aligned_N>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    int small_bm = 0>
 [[kernel]] void kq_q4_1_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -1226,7 +1279,9 @@ template <typename T, int group_size, int bits, bool aligned_N>
   static_assert(
       group_size == KQ_Q4_1_GROUP, "Q4_1 kernel requires group_size=32");
   static_assert(bits == 4, "Q4_1 kernel requires bits=4");
-  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BM = small_bm ? small_bm : 32;
+  constexpr int BK = 32, BN = small_bm ? 64 : 32;
+  constexpr int WM = BM == 8 ? 1 : 2, WN = 4 / WM;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -1244,7 +1299,7 @@ template <typename T, int group_size, int bits, bool aligned_N>
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       wl,
       x,
       y,
@@ -1985,7 +2040,12 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits, bool aligned_N>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    int small_bm = 0>
 [[kernel]] void kq_q5_0_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -2003,7 +2063,9 @@ template <typename T, int group_size, int bits, bool aligned_N>
   static_assert(
       group_size == KQ_Q5_0_GROUP, "Q5_0 kernel requires group_size=32");
   static_assert(bits == 5, "Q5_0 kernel requires bits=5");
-  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BM = small_bm ? small_bm : 32;
+  constexpr int BK = 32, BN = small_bm ? 64 : 32;
+  constexpr int WM = BM == 8 ? 1 : 2, WN = 4 / WM;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -2021,7 +2083,7 @@ template <typename T, int group_size, int bits, bool aligned_N>
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       wl,
       x,
       y,

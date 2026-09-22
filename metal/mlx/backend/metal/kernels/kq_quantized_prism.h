@@ -1036,3 +1036,109 @@ using KqPtq1_0BlockLoader = KqPrismBlockLoader<
 
 KQ_PRISM_DEFINE_KERNELS(pq2_0, 128, 2, KqPq2_0Ext, KqPq2_0BlockLoader)
 KQ_PRISM_DEFINE_KERNELS(ptq1_0, 128, 1, KqPtq1_0Ext, KqPtq1_0BlockLoader)
+
+// Register-resident MMA verify (kq_verify_mma.h). PQ2_0: lane L owns the
+// two 16-code words at bytes 8L..8L+7 of qs; fragment (j, j+8) of a word
+// is the pair of code j in each half, masked into the mantissas of a
+// half2 (1024 * 4^j + code) and scaled back by 4^-j, which is exact in
+// half. Codes 5..7 come from the word shifted down by ten bits.
+struct KqPq2_0Mma {
+  static constant constexpr int block_k = KQ_PQ2_0_SUPERBLOCK;
+  static constant constexpr int block_bytes = KQ_PQ2_0_BLOCK_BYTES;
+  static constant constexpr int d_offset = 0;
+  static METAL_FUNC int perm(int f, int col) {
+    return 32 * (col / 2) + 16 * (f / 8) + (f % 8) + 8 * (col & 1);
+  }
+  template <int NT>
+  static METAL_FUNC void block(
+      thread const KqVmmaRows<NT>& rows,
+      int boff,
+      short L,
+      const threadgroup half* xb,
+      thread simdgroup_half8x8 (&acc)[NT]) {
+    uint wv[NT][2];
+    for (short t = 0; t < NT; ++t) {
+      const packed_ushort4 v =
+          *(const device packed_ushort4*)(rows.p[t] + boff +
+                                          KQ_PQ2_0_QS_OFFSET + 8 * L);
+      wv[t][0] = uint(v.x) | (uint(v.y) << 16);
+      wv[t][1] = uint(v.z) | (uint(v.w) << 16);
+    }
+    for (short h = 0; h < 2; ++h) {
+      for (short j = 0; j < 8; ++j) {
+        const short jj = j < 5 ? j : j - 5;
+        const uint mask = 0x00030003u << (2 * jj);
+        const half scale = half(1.0f / float(1 << (2 * jj)));
+        const half off = -half(1024.0f / float(1 << (2 * jj))) - 1.0h;
+        half2 a[NT];
+        for (short t = 0; t < NT; ++t) {
+          const uint src = j < 5 ? wv[t][h] : (wv[t][h] >> 10);
+          a[t] =
+              fma(as_type<half2>((src & mask) | 0x64006400u),
+                  half2(scale),
+                  half2(off));
+        }
+        kq_vmma_step<NT>(xb + 64 * (8 * h + j), a, acc);
+      }
+    }
+  }
+};
+
+// PTQ1_0: lane L owns byte pair (8p + 2L, 8p + 2L + 1) of qs for p < 3,
+// decoded as a half2 base-3 recurrence u = b / 256, t = floor(3u),
+// u = 3u - t (every step exact in half); fragment 5p + level is that
+// level's trit pair. Fragment 15 is qh: lane L takes level L of (qh0, qh1).
+struct KqPtq1_0Mma {
+  static constant constexpr int block_k = KQ_PTQ1_0_SUPERBLOCK;
+  static constant constexpr int block_bytes = KQ_PTQ1_0_BLOCK_BYTES;
+  static constant constexpr int d_offset = KQ_PTQ1_0_D_OFFSET;
+  static METAL_FUNC int perm(int f, int col) {
+    if (f == 15) {
+      return 120 + 2 * (col / 2) + (col & 1);
+    }
+    const int byte = 8 * (f / 5) + 2 * (col / 2) + (col & 1);
+    const int level = f % 5;
+    return byte < 16 ? 16 * level + byte : 80 + 8 * level + (byte - 16);
+  }
+  template <int NT>
+  static METAL_FUNC void block(
+      thread const KqVmmaRows<NT>& rows,
+      int boff,
+      short L,
+      const threadgroup half* xb,
+      thread simdgroup_half8x8 (&acc)[NT]) {
+    for (short p = 0; p < 3; ++p) {
+      half2 u[NT];
+      for (short t = 0; t < NT; ++t) {
+        const ushort v =
+            *(const device ushort*)(rows.p[t] + boff + 8 * p + 2 * L);
+        u[t] = half2(half(v & 0xFFu), half(v >> 8)) * half2(1.0h / 256.0h);
+      }
+      for (short lv = 0; lv < 5; ++lv) {
+        half2 a[NT];
+        for (short t = 0; t < NT; ++t) {
+          const half2 tt = floor(u[t] * half2(3.0h));
+          u[t] = fma(half2(3.0h), u[t], -tt);
+          a[t] = tt - half2(1.0h);
+        }
+        kq_vmma_step<NT>(xb + 64 * (5 * p + lv), a, acc);
+      }
+    }
+    half2 a[NT];
+    for (short t = 0; t < NT; ++t) {
+      const ushort v =
+          *(const device ushort*)(rows.p[t] + boff + KQ_PTQ1_0_QH_OFFSET);
+      half2 u = half2(half(v & 0xFFu), half(v >> 8)) * half2(1.0h / 256.0h);
+      half2 tt = floor(u * half2(3.0h));
+      for (short lv = 0; lv < L; ++lv) {
+        u = fma(half2(3.0h), u, -tt);
+        tt = floor(u * half2(3.0h));
+      }
+      a[t] = tt - half2(1.0h);
+    }
+    kq_vmma_step<NT>(xb + 64 * 15, a, acc);
+  }
+};
+
+KQ_DEFINE_VERIFY_MMA_KERNEL(pq2_0, KqPq2_0Mma, 2)
+KQ_DEFINE_VERIFY_MMA_KERNEL(ptq1_0, KqPtq1_0Mma, 1)
