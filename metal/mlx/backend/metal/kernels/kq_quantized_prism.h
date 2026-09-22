@@ -263,47 +263,68 @@ inline void kq_ptq1_0_deq_chunk16(
     thread float4x4& reg) {
   // il 0..4 are the 16-byte chunk at trit il; il 5 and 6 are the 8-byte
   // chunk at trits 2(il-5) and 2(il-5)+1, each byte read once for both;
-  // il 7 is that chunk at trit 4 followed by the qh tail.
-  const float pow3f[6] = {1.0f, 3.0f, 9.0f, 27.0f, 81.0f, 243.0f};
+  // il 7 is that chunk at trit 4 followed by the qh tail. Blocks sit at a
+  // 4-byte stride, so the payload loads as words; 3^n / 256 and its
+  // product with a byte are exact in float.
+  const float pow3f[6] = {
+      1.0f / 256.0f,
+      3.0f / 256.0f,
+      9.0f / 256.0f,
+      27.0f / 256.0f,
+      81.0f / 256.0f,
+      243.0f / 256.0f};
   const float d = float(*(const device half*)(block + KQ_PTQ1_0_D_OFFSET));
   if (il < 5) {
-    const device uint8_t* qs = block;
+    const device uint* qw = (const device uint*)block;
     const float c0 = pow3f[il];
     const float c1 = 3.0f * c0;
 #pragma unroll
-    for (short k = 0; k < 16; ++k) {
-      const float u = float(qs[k]) * (1.0f / 256.0f);
-      reg[k / 4][k % 4] = d * (floor(c1 * u) - 3.0f * floor(c0 * u) - 1.0f);
+    for (short w = 0; w < 4; ++w) {
+      const uchar4 b = as_type<uchar4>(qw[w]);
+#pragma unroll
+      for (short k = 0; k < 4; ++k) {
+        const float fb = float(b[k]);
+        reg[w][k] = fma(d, floor(c1 * fb) - 3.0f * floor(c0 * fb), -d);
+      }
     }
   } else if (il < 7) {
-    const device uint8_t* qs = block + 16;
+    const device uint* qw = (const device uint*)(block + 16);
     const float c0 = pow3f[2 * (il - 5)];
     const float c1 = 3.0f * c0;
     const float c2 = 3.0f * c1;
 #pragma unroll
-    for (short k = 0; k < 8; ++k) {
-      const float u = float(qs[k]) * (1.0f / 256.0f);
-      const float g0 = floor(c0 * u);
-      const float g1 = floor(c1 * u);
-      const float g2 = floor(c2 * u);
-      reg[k / 4][k % 4] = d * (g1 - 3.0f * g0 - 1.0f);
-      reg[(k + 8) / 4][(k + 8) % 4] = d * (g2 - 3.0f * g1 - 1.0f);
+    for (short w = 0; w < 2; ++w) {
+      const uchar4 b = as_type<uchar4>(qw[w]);
+#pragma unroll
+      for (short k = 0; k < 4; ++k) {
+        const float fb = float(b[k]);
+        const float g0 = floor(c0 * fb);
+        const float g1 = floor(c1 * fb);
+        const float g2 = floor(c2 * fb);
+        reg[w][k] = fma(d, g1 - 3.0f * g0, -d);
+        reg[w + 2][k] = fma(d, g2 - 3.0f * g1, -d);
+      }
     }
   } else {
-    const device uint8_t* qs = block + 16;
+    const device uint* qw = (const device uint*)(block + 16);
 #pragma unroll
-    for (short k = 0; k < 8; ++k) {
-      const float u = float(qs[k]) * (1.0f / 256.0f);
-      reg[k / 4][k % 4] =
-          d * (floor(243.0f * u) - 3.0f * floor(81.0f * u) - 1.0f);
+    for (short w = 0; w < 2; ++w) {
+      const uchar4 b = as_type<uchar4>(qw[w]);
+#pragma unroll
+      for (short k = 0; k < 4; ++k) {
+        const float fb = float(b[k]);
+        reg[w][k] =
+            fma(d, floor(pow3f[5] * fb) - 3.0f * floor(pow3f[4] * fb), -d);
+      }
     }
-    const device uint8_t* qh = block + KQ_PTQ1_0_QH_OFFSET;
+    const ushort qh = *(const device ushort*)(block + KQ_PTQ1_0_QH_OFFSET);
+    const float fq[2] = {float(qh & 0xFF), float(qh >> 8)};
 #pragma unroll
     for (short k = 0; k < 8; ++k) {
       const float c0 = pow3f[k >> 1];
-      const float u = float(qh[k & 1]) * (1.0f / 256.0f);
+      const float fb = fq[k & 1];
       reg[(k + 8) / 4][(k + 8) % 4] =
-          d * (floor(3.0f * c0 * u) - 3.0f * floor(c0 * u) - 1.0f);
+          fma(d, floor(3.0f * c0 * fb) - 3.0f * floor(c0 * fb), -d);
     }
   }
 }
