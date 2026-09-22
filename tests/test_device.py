@@ -1,14 +1,34 @@
-import platform
+import re
+import subprocess
 import sys
 
 import mlx_kquant as kq
 
 
-def test_gpu_core_count_probe():
+def _ioreg_core_count():
+    """The count ioreg shows for the accelerator, 0 when the entry or the
+    property is absent (a virtual machine), None when ioreg is unavailable."""
+    try:
+        out = subprocess.run(
+            ["ioreg", "-r", "-c", "AGXAccelerator", "-d", "1"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r'"gpu-core-count" = (\d+)', out)
+    return int(m.group(1)) if m else 0
+
+
+def test_gpu_core_count_probe(monkeypatch):
+    monkeypatch.delenv("KQ_GPU_CORES", raising=False)
     n = kq.gpu_core_count()
     assert isinstance(n, int) and n >= 0
-    if sys.platform == "darwin" and platform.machine() == "arm64":
-        assert n > 0
+    if sys.platform == "darwin":
+        expected = _ioreg_core_count()
+        if expected is not None:
+            assert n == expected
 
 
 def test_gpu_core_count_override(monkeypatch):
