@@ -17,6 +17,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `hadamard_rotate`: the signed block Walsh-Hadamard rotation of activation
   rows that a Hadamard-folded weight expects, with an optional grouped-head
   permute of the row.
+- `glu_hadamard`: a swiglu or sigmoid output gate fused with that rotation,
+  so a folded down or output projection gets its input in one dispatch.
 
 ### Changed
 - `pq2_0` and `ptq1_0` at M 3 to 8, and `q4_0` at M 2 to 8, run on

@@ -266,6 +266,10 @@ Tuning levers (defaults are right for normal use):
   width go through threadgroup memory, and the rest stay in registers. `perm=(rep, nk, hd)` reads
   the row in grouped head order first, which is the fold's `gdn_v_grouped` permute for the
   gated-delta output projection at no extra dispatch. `signs=None` is the identity sign mode.
+- **`glu_hadamard`** - a gated activation fused with the `hadamard_rotate` rotation, `H (signs *
+  (act(gate) * x))` in one dispatch, for a folded projection whose input a gated activation
+  produces. `activation="silu"` is the swiglu in front of a down projection and `"sigmoid"` an
+  attention output gate. The threadgroup layout and the rounding are those of `hadamard_rotate`.
 
 ## Introspection
 
