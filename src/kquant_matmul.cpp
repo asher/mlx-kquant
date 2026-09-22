@@ -705,11 +705,14 @@ void verify_mma(
   const int k_partition = (K / group_size / splits) * group_size;
   const int part_stride = M * N;
 
-  array partials({splits, M, N}, x.dtype(), nullptr, {});
-  partials.set_data(mx::allocator::malloc(partials.nbytes()));
-
   auto& ce = mx::metal::get_command_encoder(s);
-  ce.add_temporary(partials);
+  // One split writes out directly; the partials and the fold exist only
+  // for splits > 1.
+  array partials({splits, M, N}, x.dtype(), nullptr, {});
+  if (splits > 1) {
+    partials.set_data(mx::allocator::malloc(partials.nbytes()));
+    ce.add_temporary(partials);
+  }
 
   std::string type_string = kq_type_string(x.dtype());
   std::string kname;
@@ -730,7 +733,7 @@ void verify_mma(
   ce.set_input_array(w, c++);
   ce.set_input_array(scales, c++);
   ce.set_input_array(x, c++);
-  ce.set_output_array(partials, c++);
+  ce.set_output_array(splits > 1 ? partials : out, c++);
   ce.set_bytes(K, c++);
   ce.set_bytes(N, c++);
   ce.set_bytes(M, c++);
@@ -739,6 +742,9 @@ void verify_mma(
   MTL::Size group_dims(256, 1, 1);
   MTL::Size grid_dims((N + rows - 1) / rows, 1, splits);
   ce.dispatch_threadgroups(grid_dims, group_dims);
+  if (splits == 1) {
+    return;
+  }
 
   std::string aname = "kquant_qmm_splitk_accum_" + type_string;
   auto accum = kq_get_kernel(d, aname);
@@ -1491,8 +1497,11 @@ void KQuantMatmul::eval_gpu_base(
              : 0);
   if (vmma_rows > 0 && vmma_min_m > 0 && M >= vmma_min_m && M <= 8 &&
       transpose_ && non_batched && x.dtype() != mx::float32) {
+    // Split-K fills the grid for the projection shapes; a head-sized N
+    // already has more threadgroups than the GPU holds, and there the
+    // partials only cost traffic.
     const int nblk = K / group_size_;
-    int sp = std::min(16, nblk);
+    int sp = (N + vmma_rows - 1) / vmma_rows >= 1024 ? 1 : std::min(16, nblk);
     while (sp > 1 && nblk % sp != 0) {
       --sp;
     }

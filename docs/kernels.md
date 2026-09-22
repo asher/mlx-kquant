@@ -125,7 +125,8 @@ GPUs without NAX. Each simdgroup decodes a block of its weight rows straight int
 fragments, with the k order inside the block permuted so every lane extracts the code pairs it
 holds cheapest, and multiplies them against the activations staged once per K chunk, so the weight
 bytes are read once for all M rows and the tile's threadgroup staging of the weights disappears.
-Split-K over the wire blocks feeds the same partial fold as `qmm_splitk`.
+Split-K over the wire blocks feeds the same partial fold as `qmm_splitk` on the projection
+shapes; a head-sized N already fills the GPU with one split and writes the output directly.
 Measured on M3 Max at the Bonsai gate and down shapes against the routes they displace: `pq2_0`
 1.15x at M 3 and 1.7x at M 8, `ptq1_0` 1.2x at M 3 and 2.0x at M 8, `q4_0` 1.2x at M 2 and 1.5x
 at M 8. Split-K enters at M 9 for these three codecs.
