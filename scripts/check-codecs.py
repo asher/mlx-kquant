@@ -41,9 +41,10 @@ def _parse_readme_table() -> dict[str, tuple[int, int, int]]:
     text = (REPO / "README.md").read_text()
     out: dict[str, tuple[int, int, int]] = {}
     # Rows look like: | q2_k  | 256 | 2 |  84 | K-quant superblock |
-    # (iq*, stq*, and the native-fp codecs mxfp4/nvfp4 included).
+    # (iq*, stq*, the Prism pq*/ptq* pair, and the native-fp codecs
+    # mxfp4/nvfp4 included).
     row = re.compile(
-        r"^\|\s*((?:st)?i?q\d[\w]*|mxfp4|nvfp4)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|",
+        r"^\|\s*((?:st|pt|p)?i?q\d[\w]*|mxfp4|nvfp4)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|",
         re.MULTILINE,
     )
     for m in row.finditer(text):

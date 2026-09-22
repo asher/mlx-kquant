@@ -101,7 +101,15 @@ but only the pre-NAX floors are measured (M3 Max: plain split-K entry M 5). Its 
 inherited from `iq1_s` and needs M5-silicon calibration: `bm128_min_m`
 (`benchmarks/bench_qmm_bm128_ab.py`), the NAX split-K entry in `kq_splitk_nax_min_m`
 (`benchmarks/bench_verify_band_ab.py`), `kq_splitk_min_m_nax_alu`, and db64 candidacy (no `_db`
-instantiation yet).
+instantiation yet). The PrismML codecs `pq2_0` and `ptq1_0` (128-wide blocks) ship the same kernel
+set with the same inherited, uncalibrated NAX policy. The `ptq1_0` M=1 kernel ports the fork's
+byte-owning lane layout and the exact-float base-3 coefficient collapse, so a block's payload is
+read once and each trit costs a floor and an fma. The `pq2_0` M=1 kernel masks each pair of 2-bit
+codes into the mantissas of a half2 and runs the dot as half2 fmas, two weights per instruction,
+which brings it close to the rate of a kernel that only loads the bytes. Both codecs have a
+`verify_qmv` sibling that decodes each row's block once and dots it against every activation row;
+it serves M 2 to 4 by default (the `mv_ext` re-decode per row costs `ptq1_0` 3x there) and split-K
+enters at M 5.
 
 ## MoE GLU
 
@@ -227,6 +235,17 @@ Tuning levers (defaults are right for normal use):
 - **`rmsnorm2_add`** - two independent RMS norms plus an add in one dispatch.
 - **`rmsnorm_multi3`** - three RMS norms of one tensor sharing its mean-square reduction (the QK-norm
   plus a third head-norm shape).
+
+## Hadamard rotation
+
+- **`hadamard_rotate`** - the signed block Walsh-Hadamard rotation a Hadamard-folded weight expects
+  of its input (PrismML's Ternary Bonsai GGUFs store `W H diag(s)` and read `y = W (H (s * x))`):
+  each contiguous `block`-wide chunk (256 to 4096) of the last axis becomes `H (signs * x)` with `H`
+  normalized and self-inverse, all math in f32 with one rounding to the input dtype. One threadgroup
+  of 256 threads per (row, block); butterflies below the simd width shuffle, those up to the group
+  width go through threadgroup memory, and the rest stay in registers. `perm=(rep, nk, hd)` reads
+  the row in grouped head order first, which is the fold's `gdn_v_grouped` permute for the
+  gated-delta output projection at no extra dispatch. `signs=None` is the identity sign mode.
 
 ## Introspection
 

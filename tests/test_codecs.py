@@ -27,7 +27,7 @@ import sys
 
 import mlx.core as mx
 import numpy as np
-from kqref import GT, quants
+from kqref import GT, is_synth, quants, synth_wire
 
 import mlx_kquant as kq
 
@@ -53,6 +53,8 @@ CODECS = {
     "iq1_s": (GT.IQ1_S, 256, 50, 1, False),
     "iq1_m": (GT.IQ1_M, 256, 56, 1, False),
     "stq1_0": (GT.STQ1_0, 256, 42, 1, False),
+    "pq2_0": (GT.PQ2_0, 128, 34, 2, False),
+    "ptq1_0": (GT.PTQ1_0, 128, 28, 1, False),
     "mxfp4": (GT.MXFP4, 32, 17, 4, False),
     "nvfp4": (GT.NVFP4, 64, 36, 4, False),
 }
@@ -71,34 +73,10 @@ def _qmm(x, w, sc, gs, bits, codec, transpose=True):
     return kq.quantized_matmul(x, w, sc, codec, transpose=transpose)
 
 
-def _synth_iq_wire(rng, bpb, n_blocks):
-    """Structurally-valid random IQ wire (gguf-py is decode-only for IQ): random
-    bytes with a sane fp16 d at block offset 0 so dequant can't hit Inf/NaN."""
-    wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
-    if bpb == 36:  # nvfp4: four ue4m3 group scales at offsets 0-3
-        wire[:, 0:4] = rng.integers(0x30, 0x41, (n_blocks, 4), dtype=np.uint8)
-        return wire
-    d = rng.uniform(0.02, 0.08, n_blocks).astype(np.float16)
-    if bpb == 56:
-        # IQ1_M has no super-block d; its fp16 scale is rebuilt from the top
-        # nibbles of the four uint16 scale words (bytes 49/51/53/55). Seed those
-        # so the reconstructed scale is a sane (non-NaN) fp16.
-        dbits = d.view(np.uint16)
-        for k, byteidx in enumerate((49, 51, 53, 55)):
-            nib = ((dbits >> (4 * k)) & 0xF).astype(np.uint8)
-            wire[:, byteidx] = (wire[:, byteidx] & 0x0F) | (nib << 4)
-    elif bpb == 42:
-        # stq1_0: fp16 d at bytes 40:42; everything else is valid wire.
-        wire[:, 40:42] = d.view(np.uint8).reshape(n_blocks, 2)
-    else:
-        wire[:, 0:2] = d.view(np.uint8).reshape(n_blocks, 2)
-    return wire
-
-
 def _wire_and_ref(codec, gtype, wpb, bpb, is_kquant):
     """Return (wire uint8[N, packed], ref float32[N, K])."""
-    if codec.startswith("iq") or codec in ("nvfp4", "stq1_0"):
-        wire = _synth_iq_wire(np.random.default_rng(7), bpb, N * (K // wpb))
+    if is_synth(codec):
+        wire = synth_wire(np.random.default_rng(7), codec, bpb, N * (K // wpb))
         wire = wire.reshape(N, (K // wpb) * bpb)
         ref = quants.dequantize(np.ascontiguousarray(wire), gtype).astype(np.float32)
         return wire, ref

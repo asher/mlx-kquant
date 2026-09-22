@@ -28,7 +28,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 import mlx.core as mx  # noqa: E402
-from test_codecs import CODECS, _synth_iq_wire  # noqa: E402
+from kqref import synth_wire  # noqa: E402
+from test_codecs import CODECS  # noqa: E402
 
 import mlx_kquant as kq  # noqa: E402
 
@@ -70,7 +71,7 @@ ENCODABLE = [
     "q5_0",
     "q5_1",
 ]
-IQ = [c for c in CODECS if c.startswith("iq") or c == "stq1_0"]
+IQ = [c for c in CODECS if c.startswith("iq") or c in ("stq1_0", "pq2_0", "ptq1_0")]
 
 
 def _sweep(codec, w, s, ref_w, n_out, ms=MS):
@@ -98,7 +99,7 @@ def _iq_setup(codec, n_out):
 
     gtype, wpb, bpb, _, _ = CODECS[codec]
     rng = np.random.default_rng(7)
-    wire = _synth_iq_wire(rng, bpb, n_out * (K // wpb))
+    wire = synth_wire(rng, codec, bpb, n_out * (K // wpb))
     wire = wire.reshape(n_out, (K // wpb) * bpb)
     ref = quants.dequantize(np.ascontiguousarray(wire), gtype)
     ref_w = mx.array(ref.astype(np.float32)).T

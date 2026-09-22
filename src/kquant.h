@@ -5,6 +5,7 @@
 
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -2240,6 +2241,59 @@ class KQuantMoERouterTopK : public mx::Primitive {
   bool has_bias_;
   int scoring_;
   float scale_;
+};
+
+// Signed block Walsh-Hadamard rotation of activation rows: the run-time
+// half of a Hadamard-folded weight. out = H_block((s * perm(x))) per
+// contiguous ``block``-wide chunk of the last axis, H normalized by
+// 1/sqrt(block) (self-inverse), s an optional float32 [K] sign vector,
+// perm an optional (rep, nk, hd) tiled-to-grouped head permute of the
+// row. All math in f32, one rounding to x.dtype at the store. block in
+// {256, 512, 1024, 2048, 4096}; K a multiple of block.
+mx::array hadamard_rotate(
+    mx::array x,
+    const std::optional<mx::array>& signs,
+    int block,
+    const std::optional<std::tuple<int, int, int>>& perm = std::nullopt,
+    mx::StreamOrDevice s = {});
+
+class KQuantHadamard : public mx::Primitive {
+ public:
+  explicit KQuantHadamard(
+      mx::Stream stream,
+      int block,
+      bool has_signs,
+      int perm_rep,
+      int perm_nk,
+      int perm_hd)
+      : mx::Primitive(stream),
+        block_(block),
+        has_signs_(has_signs),
+        perm_rep_(perm_rep),
+        perm_nk_(perm_nk),
+        perm_hd_(perm_hd) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantHadamard";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int block_;
+  bool has_signs_;
+  int perm_rep_;
+  int perm_nk_;
+  int perm_hd_;
 };
 
 // Fused (residual + rms_norm(h, w)) * scale (see add_rmsnorm).

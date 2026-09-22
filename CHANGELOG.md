@@ -6,6 +6,16 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `pq2_0` and `ptq1_0`: the PrismML Ternary Bonsai codecs (ggml types 142
+  and 143, 128-wide blocks with one fp16 scale; `pq2_0` four-level 2-bit,
+  `ptq1_0` base-3 packed ternary) with the full decode, matmul, NAX, gather
+  and MoE GLU kernel set and CPU encoders. The ids are private to the PrismML
+  llama.cpp fork and may change.
+- `hadamard_rotate`: the signed block Walsh-Hadamard rotation of activation
+  rows that a Hadamard-folded weight expects, with an optional grouped-head
+  permute of the row.
+
 ## [0.4.11]
 
 ### Fixed

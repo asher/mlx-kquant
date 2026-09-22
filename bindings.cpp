@@ -2,6 +2,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
@@ -1873,6 +1874,37 @@ NB_MODULE(_ext, m) {
         Returns:
             tuple: (indices [T, top_k] uint32,
             scores [T, top_k + shared_gate] float32).
+      )");
+
+  m.def(
+      "hadamard_rotate",
+      &mlx_kquant::hadamard_rotate,
+      "x"_a,
+      "signs"_a = nb::none(),
+      nb::kw_only(),
+      "block"_a,
+      "perm"_a = nb::none(),
+      "stream"_a = nb::none(),
+      R"(
+        Signed block Walsh-Hadamard rotation of activation rows, the
+        run-time half of a Hadamard-folded weight: each contiguous
+        ``block``-wide chunk of the last axis becomes H (signs * x) with H
+        the normalized natural-order Walsh-Hadamard matrix (self-inverse).
+        All math in f32, one rounding to x.dtype at the store.
+
+        Args:
+            x (array): [..., K], float16/bfloat16/float32, K a multiple of
+                block.
+            signs (array, optional): float32 [K] vector of +1/-1 applied
+                before the transform; identity when absent.
+            block (int): transform width, one of 256, 512, 1024, 2048, 4096.
+            perm (tuple, optional): (rep, nk, hd) with rep * nk * hd == K;
+                the row is first read in grouped head order
+                (tiled [rep, nk, hd] -> [nk, rep, hd]) and signs index the
+                permuted position.
+
+        Returns:
+            array: same shape and dtype as x.
       )");
 
   m.def(

@@ -128,8 +128,9 @@ static KqSmallBmPolicy kq_smallbm_policy(const std::string& t) {
   if (t == "q5_0") {
     return {true, 7, 8192, 961};
   }
-  if (t == "iq1_s" || t == "stq1_0") {
-    // stq1_0 starts on the iq1_s policy; re-tune with bench_qmm_bm128_ab.
+  if (t == "iq1_s" || t == "stq1_0" || t == "pq2_0" || t == "ptq1_0") {
+    // stq1_0 and the Prism codecs start on the iq1_s policy; re-tune with
+    // bench_qmm_bm128_ab.
     return {true, 0, 0, 449};
   }
   return {false, 0, 0, 193}; // iq2_xs, iq2_s, iq1_m
@@ -198,7 +199,8 @@ static bool kq_splitk_codec(const std::string& t) {
   return t == "q4_k" || t == "q5_k" || t == "q6_k" || t == "q3_k" ||
       t == "q2_k" || t == "q8_0" || t == "iq4_xs" || t == "iq4_nl" ||
       t == "iq3_xxs" || t == "iq3_s" || t == "iq2_xxs" || t == "iq2_xs" ||
-      t == "iq2_s" || t == "iq1_s" || t == "iq1_m" || t == "stq1_0";
+      t == "iq2_s" || t == "iq1_s" || t == "iq1_m" || t == "stq1_0" ||
+      t == "pq2_0" || t == "ptq1_0";
 }
 
 // Non-NAX default split-K entry M per codec (0 = env lever only).
@@ -253,6 +255,11 @@ static int kq_splitk_min_m_nax_alu(const std::string& t) {
 //   M12. Entry 5.
 // The bm16 tile that preceded bm8 entered q4_k/q3_k/q5_k/q6_k/iq3_s/
 // iq3_xxs/iq4_nl at 6, iq2_s and q8_0 at 8, iq4_xs at 10.
+// Widest M the Prism verify_qmv kernels serve by default.
+static int kq_prism_verify_max_m() {
+  return 4;
+}
+
 static int kq_splitk_min_m(const std::string& t) {
   if (kq_is_nax_available()) {
     return kq_splitk_min_m_nax_alu(t);
@@ -261,7 +268,7 @@ static int kq_splitk_min_m(const std::string& t) {
     return 4;
   }
   if (t == "q5_k" || t == "q8_0" || t == "iq4_nl" || t == "iq3_xxs" ||
-      t == "iq3_s" || t == "stq1_0") {
+      t == "iq3_s" || t == "stq1_0" || t == "pq2_0" || t == "ptq1_0") {
     return 5;
   }
   if (t == "q3_k") {
@@ -296,8 +303,10 @@ static int kq_splitk_nax_min_m(const std::string& t) {
   if (t == "q6_k" || t == "iq1_m") {
     return 12;
   }
-  if (t == "iq3_s" || t == "iq2_xxs" || t == "iq1_s" || t == "stq1_0") {
-    // stq1_0 is inherited from iq1_s, not measured (M5 calibration pending).
+  if (t == "iq3_s" || t == "iq2_xxs" || t == "iq1_s" || t == "stq1_0" ||
+      t == "pq2_0" || t == "ptq1_0") {
+    // stq1_0 and the Prism codecs inherit iq1_s, not measured (M5
+    // calibration pending).
     return 10;
   }
   if (t == "q2_k" || t == "q3_k" || t == "q4_k" || t == "q5_k" || t == "q8_0" ||
@@ -1480,9 +1489,15 @@ void KQuantMatmul::eval_gpu_base(
         kquant_type_ == "iq3_xxs" || kquant_type_ == "iq2_xxs" ||
         kquant_type_ == "iq2_xs" || kquant_type_ == "iq2_s" ||
         kquant_type_ == "iq1_s" || kquant_type_ == "iq1_m" ||
-        kquant_type_ == "stq1_0" || kquant_type_ == "mxfp4" ||
+        kquant_type_ == "stq1_0" || kquant_type_ == "pq2_0" ||
+        kquant_type_ == "ptq1_0" || kquant_type_ == "mxfp4" ||
         kquant_type_ == "nvfp4";
-    const bool mv_ext_default_on = codec_has_mv_ext;
+    // The Prism codecs decode each block once per row in verify_qmv and
+    // once per activation row in mv_ext, so M 2..4 takes verify_qmv;
+    // split-K enters at 5.
+    const bool is_prism = kquant_type_ == "pq2_0" || kquant_type_ == "ptq1_0";
+    const bool mv_ext_default_on =
+        codec_has_mv_ext && !(is_prism && M <= kq_prism_verify_max_m());
     // Width gate for the DEFAULT path (the A/B force-on KQ_VERIFY_EXT=1 ignores
     // it). Measured DRAM-cold across every wired codec (M5 Max, [17408x5120],
     // working set streamed far past the SLC): at M==2 verify_qmv holds its

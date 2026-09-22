@@ -31,6 +31,8 @@ static const std::vector<KQuantCodec>& registry() {
       {"iq1_s", 256, 50, 1, true, true, true, true},
       {"iq1_m", 256, 56, 1, true, true, true, false},
       {"stq1_0", 256, 42, 1, true, true, true, false},
+      {"pq2_0", 128, 34, 2, true, true, true, false},
+      {"ptq1_0", 128, 28, 1, true, true, true, false},
       {"mxfp4", 32, 17, 4, true, false, false, false},
       {"nvfp4", 64, 36, 4, true, false, false, false},
   };

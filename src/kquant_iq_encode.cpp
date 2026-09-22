@@ -2158,6 +2158,67 @@ void quantize_stq1_0_block(const T* xb, uint8_t* block) {
   }
 }
 
+// Port of quantize_row_pq2_0_ref (PrismML/llama.cpp): d = amax, code =
+// round(x / d) + 1 clipped to 0..3, four codes per byte, low bits first. The
+// imatrix is ignored.
+template <typename T>
+void quantize_pq2_0_block(const T* xb, uint8_t* block) {
+  float amax = 0.0f;
+  for (int j = 0; j < 128; ++j) {
+    amax = std::max(amax, std::fabs(static_cast<float>(xb[j])));
+  }
+  const float id = amax > 0.0f ? 1.0f / amax : 0.0f;
+  write_f16(block, amax);
+  uint8_t* qs = block + 2;
+  std::memset(qs, 0, 32);
+  for (int j = 0; j < 128; ++j) {
+    int q = static_cast<int>(std::round(static_cast<float>(xb[j]) * id)) + 1;
+    q = std::min(std::max(q, 0), 3);
+    qs[j >> 2] |= static_cast<uint8_t>(q << (2 * (j & 3)));
+  }
+}
+
+// Port of quantize_row_ptq1_0_ref (PrismML/llama.cpp): d = amax, trit =
+// lround(x / d) + 1; five trits per qs byte in the {32, 16, 8} stage order,
+// four per qh byte shifted up one place, each byte scaled by ceil(256 / 243)
+// so the decoder's (b * 3^n mod 256) * 3 >> 8 recovers trit n. The imatrix
+// is ignored.
+template <typename T>
+void quantize_ptq1_0_block(const T* xb, uint8_t* block) {
+  constexpr std::size_t qs_bytes = 24, qh_bytes = 2;
+  constexpr std::size_t stages[3] = {32, 16, 8};
+  float amax = 0.0f;
+  for (int j = 0; j < 128; ++j) {
+    amax = std::max(amax, std::fabs(static_cast<float>(xb[j])));
+  }
+  const float id = amax > 0.0f ? 1.0f / amax : 0.0f;
+  write_f16(block + 26, amax);
+  const T* x = xb;
+  std::size_t j = 0;
+  for (std::size_t c : stages) {
+    for (; j + c <= qs_bytes; j += c) {
+      for (std::size_t m = 0; m < c; ++m) {
+        unsigned q = 0;
+        for (std::size_t n = 0; n < 5; ++n) {
+          const long xi = std::lround(static_cast<float>(x[m + n * c]) * id);
+          q = q * 3 + static_cast<unsigned>(xi + 1);
+        }
+        block[j + m] = static_cast<uint8_t>((q * 256 + 242) / 243);
+      }
+      x += 5 * c;
+    }
+  }
+  for (std::size_t h = 0; h < qh_bytes; ++h) {
+    unsigned q = 0;
+    for (std::size_t m = 0; m < 4; ++m) {
+      const long xi = std::lround(static_cast<float>(x[h + m * qh_bytes]) * id);
+      q = q * 3 + static_cast<unsigned>(xi + 1);
+    }
+    q *= 3;
+    block[qs_bytes + h] = static_cast<uint8_t>((q * 256 + 242) / 243);
+  }
+}
+
 } // namespace
 
 template <typename T>
@@ -2237,6 +2298,18 @@ void kquant_iq_quantize_dispatch(
     std::size_t nblocks = num_weights / wpb;
     for (std::size_t b = 0; b < nblocks; ++b) {
       quantize_stq1_0_block<T>(w + b * wpb, out + b * bpb);
+    }
+  } else if (kquant_type == "pq2_0") {
+    constexpr int wpb = 128, bpb = 34;
+    std::size_t nblocks = num_weights / wpb;
+    for (std::size_t b = 0; b < nblocks; ++b) {
+      quantize_pq2_0_block<T>(w + b * wpb, out + b * bpb);
+    }
+  } else if (kquant_type == "ptq1_0") {
+    constexpr int wpb = 128, bpb = 28;
+    std::size_t nblocks = num_weights / wpb;
+    for (std::size_t b = 0; b < nblocks; ++b) {
+      quantize_ptq1_0_block<T>(w + b * wpb, out + b * bpb);
     }
   } else {
     throw std::runtime_error(
