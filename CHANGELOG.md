@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.12]
+
 ### Added
 - `pq2_0` and `ptq1_0`: the PrismML Ternary Bonsai codecs (ggml types 142
   and 143, 128-wide blocks with one fp16 scale; `pq2_0` four-level 2-bit,
