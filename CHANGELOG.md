@@ -16,6 +16,19 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rows that a Hadamard-folded weight expects, with an optional grouped-head
   permute of the row.
 
+### Changed
+- The M=1 mat-vec kernels loop over their output rows with a static trip
+  count, which lets the compiler interleave the rows' loads. The iq, fp4 and
+  stq1_0 codecs decode markedly faster; the K-quant and legacy codecs were
+  already at the bandwidth floor and are unchanged.
+- The `mxfp4` M=1 mat-vec reads each block with two lanes of eight bytes and
+  keeps the activation in registers across its rows, in place of one weight
+  per lane, so the GGUF wire tensors decode at about twice the rate.
+- `gpu_core_count` reads the GPU core count from IOKit, and `KQ_GPU_CORES`
+  opts the M=1 mat-vec's fine-tiling ceiling into scaling by that count, for
+  parts with fewer cores than the machine the ceilings were calibrated on.
+
+
 ## [0.4.11]
 
 ### Fixed

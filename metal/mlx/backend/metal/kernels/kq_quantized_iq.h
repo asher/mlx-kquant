@@ -1112,9 +1112,12 @@ METAL_FUNC void kq_iq4_xs_qmv_impl(
       xlo[i] = U(xb[i]);
       xhi[i] = U(xb[16 + i]);
     }
-    for (int row = 0; row < active_rows; row++) {
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* sb = w +
-          static_cast<int64_t>(out_row + row) * row_bytes +
+          static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
+              row_bytes +
           ib * KQ_IQ4_XS_BLOCK_BYTES;
       const U d = U(float(*(const device half*)sb));
       const uint scales_h = uint(*(const device ushort*)(sb + 2));
@@ -1580,9 +1583,12 @@ METAL_FUNC void kq_iq3_xxs_qmv_impl(
     for (int i = 0; i < vpt; i++) {
       xt[i] = U(x[ib * KQ_IQ3_XXS_SUPERBLOCK + simd_lid * vpt + i]);
     }
-    for (int row = 0; row < active_rows; row++) {
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* sb = w +
-          static_cast<int64_t>(out_row + row) * row_bytes +
+          static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
+              row_bytes +
           ib * KQ_IQ3_XXS_BLOCK_BYTES;
       const U d = U(float(*(const device half*)sb));
       const device uint8_t* qs = sb + KQ_IQ3_XXS_QS_OFFSET + s * 8;
@@ -2047,9 +2053,12 @@ METAL_FUNC void kq_iq3_s_qmv_impl(
     for (int i = 0; i < vpt; i++) {
       xt[i] = U(x[ib * KQ_IQ3_S_SUPERBLOCK + simd_lid * vpt + i]);
     }
-    for (int row = 0; row < active_rows; row++) {
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* sb = w +
-          static_cast<int64_t>(out_row + row) * row_bytes +
+          static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
+              row_bytes +
           ib * KQ_IQ3_S_BLOCK_BYTES;
       const U d = U(float(*(const device half*)sb));
       const device uint8_t* scales = sb + KQ_IQ3_S_SCALES_OFFSET;
@@ -2523,9 +2532,12 @@ METAL_FUNC void kq_iq2_xxs_qmv_impl(
     for (int i = 0; i < vpt; i++) {
       xt[i] = U(x[ib * KQ_IQ2_XXS_SUPERBLOCK + simd_lid * vpt + i]);
     }
-    for (int row = 0; row < active_rows; row++) {
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* sb = w +
-          static_cast<int64_t>(out_row + row) * row_bytes +
+          static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
+              row_bytes +
           ib * KQ_IQ2_XXS_BLOCK_BYTES;
       const U d = U(float(*(const device half*)sb));
       const device uint8_t* qs = sb + KQ_IQ2_XXS_QS_OFFSET + s * 8;
@@ -2994,9 +3006,12 @@ METAL_FUNC void kq_iq2_xs_qmv_impl(
     for (int i = 0; i < vpt; i++) {
       xt[i] = U(x[ib * KQ_IQ2_XS_SUPERBLOCK + simd_lid * vpt + i]);
     }
-    for (int row = 0; row < active_rows; row++) {
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* sb = w +
-          static_cast<int64_t>(out_row + row) * row_bytes +
+          static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
+              row_bytes +
           ib * KQ_IQ2_XS_BLOCK_BYTES;
       const U d = U(float(*(const device half*)sb));
       // The qs entry is a 2-aligned uint16: one ushort load instead of
@@ -3468,9 +3483,12 @@ METAL_FUNC void kq_iq2_s_qmv_impl(
     for (int i = 0; i < vpt; i++) {
       xt[i] = U(x[ib * KQ_IQ2_S_SUPERBLOCK + simd_lid * vpt + i]);
     }
-    for (int row = 0; row < active_rows; row++) {
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* sb = w +
-          static_cast<int64_t>(out_row + row) * row_bytes +
+          static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
+              row_bytes +
           ib * KQ_IQ2_S_BLOCK_BYTES;
       const U d = U(float(*(const device half*)sb));
       const device uint8_t* qs = sb + KQ_IQ2_S_QS_OFFSET + s * 4;
@@ -3945,9 +3963,12 @@ METAL_FUNC void kq_iq1_s_qmv_impl(
     for (int i = 0; i < vpt; i++) {
       xt[i] = U(x[ib * KQ_IQ1_S_SUPERBLOCK + simd_lid * vpt + i]);
     }
-    for (int row = 0; row < active_rows; row++) {
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* sb = w +
-          static_cast<int64_t>(out_row + row) * row_bytes +
+          static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
+              row_bytes +
           ib * KQ_IQ1_S_BLOCK_BYTES;
       const U d = U(float(*(const device half*)sb));
       // The qh entry is a 2-aligned uint16: one ushort load instead of
@@ -4416,9 +4437,12 @@ METAL_FUNC void kq_iq1_m_qmv_impl(
     for (int i = 0; i < vpt; i++) {
       xt[i] = U(x[ib * KQ_IQ1_M_SUPERBLOCK + simd_lid * vpt + i]);
     }
-    for (int row = 0; row < active_rows; row++) {
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* sb = w +
-          static_cast<int64_t>(out_row + row) * row_bytes +
+          static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
+              row_bytes +
           ib * KQ_IQ1_M_BLOCK_BYTES;
       // Blocks are 56 bytes and scales sit at +48, so the 8-byte scale
       // block is always 8-aligned: one vector load replaces eight byte

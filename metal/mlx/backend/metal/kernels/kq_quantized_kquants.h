@@ -382,8 +382,10 @@ METAL_FUNC void kq_q4_k_qmv_impl(
     }
 
     const int sb_id = k / KQ_Q4_K_SUPERBLOCK;
-    for (int row = 0; row < active_rows; row++) {
-      const int row_idx = out_row + row;
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const int row_idx = min(out_row + row, out_vec_size - 1);
       const device uint8_t* sb_addr = w +
           static_cast<int64_t>(row_idx) * row_bytes +
           sb_id * KQ_Q4_K_BLOCK_BYTES;
@@ -1383,8 +1385,10 @@ METAL_FUNC void kq_q5_k_qmv_impl(
       sumy[3] += yh[i + 8];
     }
 
-    for (int row = 0; row < active_rows; row++) {
-      const int row_idx = out_row + row;
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const int row_idx = min(out_row + row, out_vec_size - 1);
       const device uint8_t* sb_addr = w +
           static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_K_BLOCK_BYTES;
 
@@ -2335,8 +2339,10 @@ METAL_FUNC void kq_q6_k_qmv_impl(
       yl[4 * l + 3] = U(x[x_base + l + 96]);
     }
 
-    for (int row = 0; row < active_rows; row++) {
-      const int row_idx = out_row + row;
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const int row_idx = min(out_row + row, out_vec_size - 1);
       const device uint8_t* sb_addr = w +
           static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q6_K_BLOCK_BYTES;
 

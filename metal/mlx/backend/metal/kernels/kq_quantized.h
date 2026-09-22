@@ -1352,8 +1352,10 @@ METAL_FUNC void kq_q8_0_qmv_impl(
     const int block_id = k_global / KQ_Q8_0_GROUP;
     const int within = k_global - block_id * KQ_Q8_0_GROUP;
 
-    for (int row = 0; row < active_rows; row++) {
-      const int row_idx = out_row + row;
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const int row_idx = min(out_row + row, out_vec_size - 1);
       const device uint8_t* row_base =
           w + static_cast<int64_t>(row_idx) * row_bytes;
       const device uint8_t* block_addr =
@@ -2279,8 +2281,10 @@ METAL_FUNC void kq_q5_1_qmv_impl(
       yl[i + 9] = b1 * (U(1) / U(4096));
     }
 
-    for (int row = 0; row < active_rows; row++) {
-      const int row_idx = out_row + row;
+    // static trip count; the clamped tail row is dropped at the store
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const int row_idx = min(out_row + row, out_vec_size - 1);
       const device uint8_t* block_addr = w +
           static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q5_1_BLOCK_BYTES;
       const U d = U(kq_q5_1_d(block_addr));

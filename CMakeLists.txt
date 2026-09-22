@@ -164,7 +164,8 @@ target_sources(
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_encode.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_arena.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_event.cpp
-         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gguf.cpp)
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gguf.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_device.cpp)
 
 # The IQ CPU encoders must match llama-quantize bit-for-bit on the deterministic
 # codecs, so this TU is compiled with FMA contraction off (the float reductions
@@ -188,6 +189,9 @@ target_link_libraries(mlx_kquant_ext PUBLIC mlx)
 if(APPLE)
   target_compile_definitions(mlx_kquant_ext PUBLIC KQ_USE_ACCELERATE)
   target_link_libraries(mlx_kquant_ext PUBLIC "-framework Accelerate")
+  # The GPU core count probe (src/kquant_device.cpp) reads the IOKit registry.
+  target_link_libraries(mlx_kquant_ext PUBLIC "-framework IOKit"
+                                              "-framework CoreFoundation")
 endif()
 # arm64: NEON-dotprod int8 GEMV kernels for the fused small-M CPU matmul.
 # The TU is compiled only on arm64/aarch64 hosts; execution is further gated

@@ -31,6 +31,15 @@ bool metallib_loads();
 // non-Metal builds and pre-NAX GPUs).
 bool nax_available();
 
+// GPU core count from the IOKit accelerator entry (KQ_GPU_CORES overrides
+// it); 0 when unknown.
+int gpu_core_count();
+
+// Largest N at which the M=1 mat-vec takes the fine (2 rows per threadgroup)
+// tiling for this codec; 0 means coarse. The calibrated ceiling unless
+// KQ_GPU_CORES is set, which scales it by cores/40. On Metal only.
+int qmv_fine_max_n(const std::string& kquant_type);
+
 // True when gather_qmm's sorted-rhs NAX GEMM leaf can serve `kquant_type`
 // here: NAX hardware present, the codec ships NAX kernels, and KQ_DISABLE_NAX
 // is unset (read live). Callers with their own sorted-prefill arms (e.g. the
