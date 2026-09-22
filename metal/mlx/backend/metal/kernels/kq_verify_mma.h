@@ -2,29 +2,32 @@
 
 // Register-resident simdgroup-MMA verify kernels for the M <= 8 band.
 //
-// Each simdgroup owns NT tiles of 8 weight rows. A block of every row is
-// decoded straight into 8x8 A fragments (rows n, cols k) by lane-owned
-// bytes, the activations are staged once per K chunk as B^T (rows k, cols
-// m) in threadgroup memory, and one simdgroup_multiply_accumulate per
-// fragment accumulates D (rows n, cols m). The per-block accumulator is
-// half; the block scale is applied to it in float. Split-K over grid z
-// writes T partials that kquant_qmm_splitk_accum folds.
+// Each of the 8 simdgroups owns NT tiles of 8 weight rows. A block of
+// every row is decoded straight into 8x8 A fragments (rows n, cols k) by
+// lane-owned bytes, the activations are staged once per K chunk as B^T
+// (rows k, cols m) in threadgroup memory in natural k order, and one
+// simdgroup_multiply_accumulate per fragment accumulates D (rows n, cols
+// m). The per-block accumulator is half; the block scale is applied to it
+// in float. Split-K over grid z writes T partials that
+// kquant_qmm_splitk_accum folds.
 //
 // The k order inside a block is a fixed per-codec permutation
 // (Codec::perm) chosen so each lane's fragment elements are the code pairs
-// it can extract cheapest; the staging applies the same permutation to x,
-// so the dot is unchanged. Fragment layout is MLX steel's
-// BaseMMAFrag<T, 8, 8>: lane l holds row (l/4 & 4) + (l/2 % 4) and columns
-// (l/4 & 2) * 2 + (l % 2) * 2, +1 of every operand.
+// it can extract cheapest; the B fragment of fragment f reads the staged
+// row perm(f, fm), so the dot is unchanged. Fragment layout is MLX steel's
+// BaseMMAFrag<T, 8, 8>: lane l holds row fm = (l/4 & 4) + (l/2 % 4) and
+// columns fn = (l/4 & 2) * 2 + (l % 2) * 2, fn + 1 of every operand.
 //
 // Codec contract:
 //   block_k, block_bytes, d_offset
 //   perm(f, col): element index of fragment f (0..block_k/8-1), column col
-//   block<NT>(rows, boff, L, xb, acc): decode block boff of each row and
-//     accumulate its block_k/8 fragments; L = fn / 2 is the lane's column
-//     pair, xb the B fragment base for this block (fragment f at xb+64f).
+//   block<NT>(rows, boff, L, fm, xb, acc): decode block boff of each row
+//     and accumulate its block_k/8 fragments; L = fn / 2 is the lane's
+//     column pair, xb the staged B base of this block (fragment f at
+//     xb + 8 * perm(f, fm)).
 
-MLX_MTL_CONST int KQ_VMMA_THREADS = 128;
+MLX_MTL_CONST int KQ_VMMA_THREADS = 256;
+MLX_MTL_CONST int KQ_VMMA_NSG = KQ_VMMA_THREADS / 32;
 MLX_MTL_CONST int KQ_VMMA_KC = 512;
 
 template <int NT>
@@ -63,13 +66,12 @@ METAL_FUNC void kq_verify_mma_impl(
     uint simd_lid) {
   constexpr int KC = KQ_VMMA_KC;
   constexpr int BK = Codec::block_k;
-  constexpr int NF = BK / 8;
   const int row_bytes = (K / BK) * Codec::block_bytes;
   const short qid = simd_lid / 4;
   const short fm = (qid & 4) + ((simd_lid / 2) % 4);
   const short fn = (qid & 2) * 2 + (simd_lid % 2) * 2;
   const short L = fn / 2;
-  const int n = tid.x * (4 * 8 * NT) + simd_gid * 8 * NT + fm;
+  const int n = tid.x * (KQ_VMMA_NSG * 8 * NT) + simd_gid * 8 * NT + fm;
   KqVmmaRows<NT> rows;
   for (short t = 0; t < NT; ++t) {
     rows.p[t] = w + static_cast<int64_t>(min(n + 8 * t, N - 1)) * row_bytes;
@@ -84,9 +86,7 @@ METAL_FUNC void kq_verify_mma_impl(
     const int kn = min(KC, kend - kc);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int kk = lid; kk < kn; kk += KQ_VMMA_THREADS) {
-      const int f = kk >> 3;
-      const int e = (f / NF) * BK + Codec::perm(f % NF, kk & 7);
-      const device T* xe = x + kc + e;
+      const device T* xe = x + kc + kk;
       vec<half, 8> v;
       for (short m = 0; m < 8; ++m) {
         v[m] = m < M ? half(float(xe[m * K])) : half(0);
@@ -96,12 +96,12 @@ METAL_FUNC void kq_verify_mma_impl(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int kb = 0; kb < kn; kb += BK) {
       const int boff = ((kc + kb) / BK) * Codec::block_bytes;
-      const threadgroup half* xb = XsT + (kb + fm) * 8 + fn;
+      const threadgroup half* xb = XsT + kb * 8 + fn;
       simdgroup_half8x8 acc[NT];
       for (short t = 0; t < NT; ++t) {
         acc[t] = make_filled_simdgroup_matrix<half, 8, 8>(half(0));
       }
-      Codec::template block<NT>(rows, boff, L, xb, acc);
+      Codec::template block<NT>(rows, boff, L, fm, xb, acc);
       for (short t = 0; t < NT; ++t) {
         const float d =
             float(*(const device half*)(rows.p[t] + boff + Codec::d_offset));
@@ -123,8 +123,8 @@ METAL_FUNC void kq_verify_mma_impl(
   }
 }
 
-// Entry point: qmm_t_splitk's buffer layout, grid (ceil(N / (32 NT)), 1,
-// splits), 128 threads.
+// Entry point: qmm_t_splitk's buffer layout, grid (ceil(N / (64 NT)), 1,
+// splits), 256 threads.
 #define KQ_DEFINE_VERIFY_MMA_KERNEL(CODEC, TRAITS, NT)                   \
   template <typename T, int group_size, int bits>                        \
   [[kernel]] void kq_##CODEC##_verify_mma(                               \

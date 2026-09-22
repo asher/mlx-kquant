@@ -120,14 +120,14 @@ which brings it close to the rate of a kernel that only loads the bytes. Both co
 it serves M 2 by default (the `mv_ext` re-decode per row costs `ptq1_0` 3x there).
 
 The register-resident MMA verify kernels (`verify_mma`) serve `pq2_0` and `ptq1_0` at M 3 to 8
-(M 4 to 8 on float16 activations, where `verify_qmv` holds M 3) and `q4_0` at M 2 to 8 on GPUs
-without NAX. Each simdgroup decodes a block of its weight rows straight into 8x8 simdgroup-matrix
+(`pq2_0` from M 4 on float16 activations, where `verify_qmv` holds M 3) and `q4_0` at M 2 to 8 on
+GPUs without NAX. Each simdgroup decodes a block of its weight rows straight into 8x8 simdgroup-matrix
 fragments, with the k order inside the block permuted so every lane extracts the code pairs it
 holds cheapest, and multiplies them against the activations staged once per K chunk, so the weight
 bytes are read once for all M rows and the tile's threadgroup staging of the weights disappears.
 Split-K over the wire blocks feeds the same partial fold as `qmm_splitk`.
 Measured on M3 Max at the Bonsai gate and down shapes against the routes they displace: `pq2_0`
-1.1x at M 3 and 1.5x at M 8, `ptq1_0` 1.15x at M 3 and 1.7x at M 8, `q4_0` 1.1x at M 2 and 1.4x
+1.15x at M 3 and 1.7x at M 8, `ptq1_0` 1.2x at M 3 and 2.0x at M 8, `q4_0` 1.2x at M 2 and 1.5x
 at M 8. Split-K enters at M 9 for these three codecs.
 
 ## MoE GLU

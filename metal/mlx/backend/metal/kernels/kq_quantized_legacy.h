@@ -770,6 +770,7 @@ struct KqQ4_0Mma {
       thread const KqVmmaRows<NT>& rows,
       int boff,
       short L,
+      short fm,
       const threadgroup half* xb,
       thread simdgroup_half8x8 (&acc)[NT]) {
     uint lo[NT], hi[NT];
@@ -788,7 +789,7 @@ struct KqQ4_0Mma {
         a[t] =
             as_type<half2>((src & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
       }
-      kq_vmma_step<NT>(xb + 64 * f, a, acc);
+      kq_vmma_step<NT>(xb + 8 * perm(f, fm), a, acc);
     }
   }
 };

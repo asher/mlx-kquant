@@ -275,17 +275,20 @@ static int kq_prism_verify_max_m() {
 // Entry M of the register-resident MMA verify route (verify_mma), which
 // runs through M8. Measured on M3 Max at gate (17408x5120) and down
 // (5120x17408) against the route it displaces (verify_qmv or mv_ext
-// through M4, the bm8 tile from M5). bf16 activations: pq2_0 0.88x at
-// M2, 1.08-1.13x at M3, 1.45-1.62x at M8; ptq1_0 0.95x at M2, 1.15-1.18x
-// at M3, 1.67-1.79x at M8. verify_qmv runs faster on f16 activations
-// (pq2_0 M3 141 vs 179 us at gate), which moves the Prism entries to M4
-// there: pq2_0 0.89-0.99x at M3, 1.11-1.21x at M4; ptq1_0 0.98-1.06x at
-// M3, 1.17-1.37x at M4. q4_0 (mv_ext below M5) 1.04-1.20x at M2 and
-// 1.29-1.38x at M3 on either dtype. Below the entry the mat-vec kernels
-// hold.
+// through M4, the bm8 tile from M5). bf16 activations: pq2_0 0.89-0.93x
+// at M2, 1.15-1.16x at M3, 1.64-1.72x at M8; ptq1_0 1.00-1.02x at M2,
+// 1.20-1.23x at M3, 1.96-2.02x at M8; q4_0 1.20-1.25x at M2, 1.38x at
+// M3, 1.46-1.51x at M8. verify_qmv runs faster on f16 activations (pq2_0
+// M3 141 vs 179 us at gate), which moves the pq2_0 entry to M4 there
+// (0.93-1.02x at M3, 1.17-1.21x at M4); ptq1_0 holds M3 on f16
+// (1.05-1.12x) and q4_0 M2 (1.09-1.23x). Below the entry the mat-vec
+// kernels hold.
 static int kq_verify_mma_min_m(const std::string& t, bool f16) {
-  if (t == "pq2_0" || t == "ptq1_0") {
+  if (t == "pq2_0") {
     return f16 ? 4 : 3;
+  }
+  if (t == "ptq1_0") {
+    return 3;
   }
   if (t == "q4_0") {
     return 2;
@@ -733,7 +736,7 @@ void verify_mma(
   ce.set_bytes(M, c++);
   ce.set_bytes(k_partition, c++);
   ce.set_bytes(part_stride, c++);
-  MTL::Size group_dims(128, 1, 1);
+  MTL::Size group_dims(256, 1, 1);
   MTL::Size grid_dims((N + rows - 1) / rows, 1, splits);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 

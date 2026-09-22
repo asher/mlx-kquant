@@ -1054,6 +1054,7 @@ struct KqPq2_0Mma {
       thread const KqVmmaRows<NT>& rows,
       int boff,
       short L,
+      short fm,
       const threadgroup half* xb,
       thread simdgroup_half8x8 (&acc)[NT]) {
     uint wv[NT][2];
@@ -1078,7 +1079,7 @@ struct KqPq2_0Mma {
                   half2(scale),
                   half2(off));
         }
-        kq_vmma_step<NT>(xb + 64 * (8 * h + j), a, acc);
+        kq_vmma_step<NT>(xb + 8 * perm(8 * h + j, fm), a, acc);
       }
     }
   }
@@ -1105,6 +1106,7 @@ struct KqPtq1_0Mma {
       thread const KqVmmaRows<NT>& rows,
       int boff,
       short L,
+      short fm,
       const threadgroup half* xb,
       thread simdgroup_half8x8 (&acc)[NT]) {
     for (short p = 0; p < 3; ++p) {
@@ -1121,7 +1123,7 @@ struct KqPtq1_0Mma {
           u[t] = fma(half2(3.0h), u[t], -tt);
           a[t] = tt - half2(1.0h);
         }
-        kq_vmma_step<NT>(xb + 64 * (5 * p + lv), a, acc);
+        kq_vmma_step<NT>(xb + 8 * perm(5 * p + lv, fm), a, acc);
       }
     }
     half2 a[NT];
@@ -1136,7 +1138,7 @@ struct KqPtq1_0Mma {
       }
       a[t] = tt - half2(1.0h);
     }
-    kq_vmma_step<NT>(xb + 64 * 15, a, acc);
+    kq_vmma_step<NT>(xb + 8 * perm(15, fm), a, acc);
   }
 };
 
