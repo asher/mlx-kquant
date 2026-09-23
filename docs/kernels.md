@@ -98,8 +98,9 @@ Tuning levers (defaults are right for normal use):
   Entry points come from a per-device table. K-quants, legacy quants and the IQ codecs, M <= 32.
 - `KQ_VERIFY_MMA` - the register-resident MMA verify route (below). A value of `2` or more forces
   it at that M and above on any GPU, `0` disables it. Unset takes the per-codec entry in
-  `kq_verify_mma_min_m` on GPUs without NAX and leaves NAX GPUs on their tiles. M <= 8; read
-  live per call.
+  `kq_verify_mma_min_m` on GPUs without NAX and leaves the route off on NAX GPUs. NAX split-K is
+  checked first, so a forced run at or above its entry also needs `KQ_QMM_SPLITK_NAX=0`. M <= 8;
+  read live per call.
 - `KQ_MV_EXT_SB` / `KQ_MV_EXT_NX` / `KQ_MV_EXT_HD` - `mv_ext` activation-traffic experiments:
   shuffle-broadcast (`1`), wide nxpsg (`16`/`32`), half-precision chunk dots (`1`). q6_k M 4-12
   only. `HD` measured +4-5% at M 8; the rest flat to negative on M5 Max. Kept as probes. Default
@@ -117,7 +118,8 @@ read once and each trit costs a floor and an fma. The `pq2_0` M=1 kernel masks e
 codes into the mantissas of a half2 and runs the dot as half2 fmas, two weights per instruction,
 which brings it close to the rate of a kernel that only loads the bytes. Both codecs have a
 `verify_qmv` sibling that decodes each row's block once and dots it against every activation row;
-it serves M 2 by default (the `mv_ext` re-decode per row costs `ptq1_0` 3x there).
+it serves M 2 by default, and M 2 to 4 on NAX GPUs (the `mv_ext` re-decode per row costs
+`ptq1_0` 3x there).
 
 The register-resident MMA verify kernels (`verify_mma`) serve `pq2_0` and `ptq1_0` at M 3 to 8
 (`pq2_0` from M 4 on float16 activations, where `verify_qmv` holds M 3) and `q4_0` at M 2 to 8 on
@@ -129,7 +131,8 @@ Split-K over the wire blocks feeds the same partial fold as `qmm_splitk` on the 
 shapes; a head-sized N already fills the GPU with one split and writes the output directly.
 Measured on M3 Max at the Bonsai gate and down shapes against the routes they displace: `pq2_0`
 1.15x at M 3 and 1.7x at M 8, `ptq1_0` 1.2x at M 3 and 2.0x at M 8, `q4_0` 1.2x at M 2 and 1.5x
-at M 8. Split-K enters at M 9 for these three codecs.
+at M 8. Split-K enters at M 9 for these three codecs. On NAX GPUs, where the route is off by
+default, `pq2_0` and `ptq1_0` run `mv_ext` from M 5 up to their NAX split-K entry at M 10.
 
 ## MoE GLU
 
