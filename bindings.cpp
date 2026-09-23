@@ -1920,6 +1920,36 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "glu_hadamard",
+      &mlx_kquant::glu_hadamard,
+      "x"_a,
+      "gate"_a,
+      "signs"_a = nb::none(),
+      nb::kw_only(),
+      "block"_a,
+      "activation"_a = "silu",
+      "stream"_a = nb::none(),
+      R"(
+        A gated activation fused with the signed block Walsh-Hadamard
+        rotation of hadamard_rotate: H (signs * (act(gate) * x)), the input
+        of a Hadamard-folded projection, in one dispatch. All math in f32,
+        one rounding to x.dtype.
+
+        Args:
+            x (array): [..., K], float16/bfloat16/float32, K a multiple of
+                block.
+            gate (array): same shape and dtype as x.
+            signs (array, optional): float32 [K] vector of +1/-1 applied
+                before the transform; identity when absent.
+            block (int): transform width, one of 256, 512, 1024, 2048, 4096.
+            activation (str): "silu" (swiglu, act(g) = g * sigmoid(g)) or
+                "sigmoid" (an output gate). Default "silu".
+
+        Returns:
+            array: same shape and dtype as x.
+      )");
+
+  m.def(
       "add_rmsnorm",
       &mlx_kquant::add_rmsnorm,
       "h"_a,

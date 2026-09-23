@@ -200,7 +200,8 @@ static bool kq_splitk_codec(const std::string& t) {
       t == "q2_k" || t == "q8_0" || t == "iq4_xs" || t == "iq4_nl" ||
       t == "iq3_xxs" || t == "iq3_s" || t == "iq2_xxs" || t == "iq2_xs" ||
       t == "iq2_s" || t == "iq1_s" || t == "iq1_m" || t == "stq1_0" ||
-      t == "pq2_0" || t == "ptq1_0";
+      t == "pq2_0" || t == "ptq1_0" || t == "q4_0" || t == "q4_1" ||
+      t == "q5_0" || t == "q5_1";
 }
 
 // Non-NAX default split-K entry M per codec (0 = env lever only).
@@ -219,7 +220,12 @@ static int kq_splitk_min_m_nax_alu(const std::string& t) {
   if (t == "q4_k" || t == "q3_k" || t == "iq3_xxs" || t == "iq4_nl") {
     return 8;
   }
-  if (t == "q5_k") {
+  if (t == "q4_0" || t == "q4_1") {
+    // Inherited from q4_k; not measured on NAX silicon.
+    return 8;
+  }
+  if (t == "q5_k" || t == "q5_0" || t == "q5_1") {
+    // q5_0 and q5_1 inherit q5_k; not measured on NAX silicon.
     return 10;
   }
   if (t == "q6_k" || t == "iq3_s") {
@@ -253,6 +259,12 @@ static int kq_splitk_min_m_nax_alu(const std::string& t) {
 //   plain qmm_t at M13 and the tile wins 0.72-0.84x at M16. Entry 13.
 // - stq1_0: 1.02-1.05x at M5, 0.94-0.97x at M4, 1.15-1.49x through
 //   M12. Entry 5.
+// - q4_0, q4_1, q5_0, q5_1 (measured 2026-09-22 at the first two
+//   shapes, M 2-32; before this their only band kernel was mv_ext,
+//   which decays to 0.22x of the tile by M16): q4_0 0.90x at M5,
+//   1.03x at M4; q5_0 0.94-1.03x at M4, 0.88-0.92x at M5; q4_1 and
+//   q5_1 0.89-0.97x at M4, 1.14x at M3. Entries 5, 4, 5, 4; from M6
+//   the tile wins 1.3-2.8x on every shape.
 // The bm16 tile that preceded bm8 entered q4_k/q3_k/q5_k/q6_k/iq3_s/
 // iq3_xxs/iq4_nl at 6, iq2_s and q8_0 at 8, iq4_xs at 10.
 // Widest M the Prism verify_qmv kernels serve by default.
@@ -260,15 +272,41 @@ static int kq_prism_verify_max_m() {
   return 4;
 }
 
+// Entry M of the register-resident MMA verify route (verify_mma), which
+// runs through M8. Measured on M3 Max at gate (17408x5120) and down
+// (5120x17408) against the route it displaces (verify_qmv or mv_ext
+// through M4, the bm8 tile from M5). bf16 activations: pq2_0 0.89-0.93x
+// at M2, 1.15-1.16x at M3, 1.64-1.72x at M8; ptq1_0 1.00-1.02x at M2,
+// 1.20-1.23x at M3, 1.96-2.02x at M8; q4_0 1.20-1.25x at M2, 1.38x at
+// M3, 1.46-1.51x at M8. verify_qmv runs faster on f16 activations (pq2_0
+// M3 141 vs 179 us at gate), which moves the pq2_0 entry to M4 there
+// (0.93-1.02x at M3, 1.17-1.21x at M4); ptq1_0 holds M3 on f16
+// (1.05-1.12x) and q4_0 M2 (1.09-1.23x). Below the entry the mat-vec
+// kernels hold.
+static int kq_verify_mma_min_m(const std::string& t, bool f16) {
+  if (t == "pq2_0") {
+    return f16 ? 4 : 3;
+  }
+  if (t == "ptq1_0") {
+    return 3;
+  }
+  if (t == "q4_0") {
+    return 2;
+  }
+  return 0;
+}
+
 static int kq_splitk_min_m(const std::string& t) {
   if (kq_is_nax_available()) {
     return kq_splitk_min_m_nax_alu(t);
   }
-  if (t == "q4_k" || t == "q6_k" || t == "q2_k" || t == "iq2_xxs") {
+  if (t == "q4_k" || t == "q6_k" || t == "q2_k" || t == "iq2_xxs" ||
+      t == "q4_1" || t == "q5_1") {
     return 4;
   }
   if (t == "q5_k" || t == "q8_0" || t == "iq4_nl" || t == "iq3_xxs" ||
-      t == "iq3_s" || t == "stq1_0" || t == "pq2_0" || t == "ptq1_0") {
+      t == "iq3_s" || t == "stq1_0" || t == "pq2_0" || t == "ptq1_0" ||
+      t == "q4_0" || t == "q5_0") {
     return 5;
   }
   if (t == "q3_k") {
@@ -626,6 +664,87 @@ void qmm_splitk(
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, splits);
   ce.dispatch_threadgroups(grid_dims, group_dims);
+
+  std::string aname = "kquant_qmm_splitk_accum_" + type_string;
+  auto accum = kq_get_kernel(d, aname);
+  ce.set_compute_pipeline_state(accum);
+  const int n_elems = M * N;
+  c = 0;
+  ce.set_input_array(partials, c++);
+  ce.set_output_array(out, c++);
+  ce.set_bytes(n_elems, c++);
+  ce.set_bytes(splits, c++);
+  ce.set_bytes(part_stride, c++);
+  MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
+  MTL::Size agroup(256, 1, 1);
+  ce.dispatch_threads(agrid, agroup);
+}
+
+// Register-resident MMA verify for M <= 8 (kq_verify_mma.h): each
+// simdgroup decodes its rows' blocks straight into 8x8 fragments and
+// runs one simdgroup MMA per fragment against the activations staged
+// once per K chunk, so the weight read is amortized over all M rows
+// without the tile's threadgroup staging of the weights. Split-K over
+// grid z with qmm_splitk's partial/fold shape; slices are whole wire
+// blocks. Non-batched transpose shapes, bf16 or f16 activations.
+void verify_mma(
+    const array& x,
+    const array& w,
+    const array& scales,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    int splits,
+    Device& d,
+    const Stream& s,
+    const std::string& kquant_type) {
+  const int rows = codec_verify_mma_rows(kquant_type);
+  const int k_partition = (K / group_size / splits) * group_size;
+  const int part_stride = M * N;
+
+  auto& ce = mx::metal::get_command_encoder(s);
+  // One split writes out directly; the partials and the fold exist only
+  // for splits > 1.
+  array partials({splits, M, N}, x.dtype(), nullptr, {});
+  if (splits > 1) {
+    partials.set_data(mx::allocator::malloc(partials.nbytes()));
+    ce.add_temporary(partials);
+  }
+
+  std::string type_string = kq_type_string(x.dtype());
+  std::string kname;
+  kname.reserve(64);
+  mx::concatenate(
+      kname,
+      kq_kname_prefix(kquant_type) + "verify_mma_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits);
+
+  auto kernel = kq_get_kernel(d, kname);
+  ce.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  ce.set_input_array(w, c++);
+  ce.set_input_array(scales, c++);
+  ce.set_input_array(x, c++);
+  ce.set_output_array(splits > 1 ? partials : out, c++);
+  ce.set_bytes(K, c++);
+  ce.set_bytes(N, c++);
+  ce.set_bytes(M, c++);
+  ce.set_bytes(k_partition, c++);
+  ce.set_bytes(part_stride, c++);
+  MTL::Size group_dims(256, 1, 1);
+  MTL::Size grid_dims((N + rows - 1) / rows, 1, splits);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+  if (splits == 1) {
+    return;
+  }
 
   std::string aname = "kquant_qmm_splitk_accum_" + type_string;
   auto accum = kq_get_kernel(d, aname);
@@ -1364,10 +1483,37 @@ void KQuantMatmul::eval_gpu_base(
     }
   }
 
+  // Register-resident MMA verify, kq_verify_mma_min_m through M8 on
+  // non-NAX GPUs (the NAX small-M tiles are uncalibrated against it).
+  // KQ_VERIFY_MMA=<m> forces the entry at M >= m on any GPU, 0 disables;
+  // read live so an A/B can flip arms on one generator.
+  const char* vmma_e = std::getenv("KQ_VERIFY_MMA");
+  const int vmma_env = vmma_e != nullptr ? std::atoi(vmma_e) : -1;
+  const int vmma_rows = codec_verify_mma_rows(kquant_type_);
+  const int vmma_min_m = vmma_env >= 2
+      ? vmma_env
+      : (vmma_env == -1 && !kq_is_nax_available()
+             ? kq_verify_mma_min_m(kquant_type_, x.dtype() == mx::float16)
+             : 0);
+  if (vmma_rows > 0 && vmma_min_m > 0 && M >= vmma_min_m && M <= 8 &&
+      transpose_ && non_batched && x.dtype() != mx::float32) {
+    // Split-K fills the grid for the projection shapes; a head-sized N
+    // already has more threadgroups than the GPU holds, and there the
+    // partials only cost traffic.
+    const int nblk = K / group_size_;
+    int sp = (N + vmma_rows - 1) / vmma_rows >= 1024 ? 1 : std::min(16, nblk);
+    while (sp > 1 && nblk % sp != 0) {
+      --sp;
+    }
+    verify_mma(
+        x, w, scales, out, group_size_, bits_, M, N, K, sp, d, s, kquant_type_);
+    return;
+  }
+
   // Split-K qmm: the occupancy lever for the small-M band; see
   // qmm_splitk. The route needs a >1 divisor of the wire-block count
-  // at or under the target. K-quants + q8_0 only for now
-  // (instantiation coverage). Default routing is non-NAX only and
+  // at or under the target. Codecs in kq_splitk_codec (instantiation
+  // coverage). Default routing is non-NAX only and
   // enters at kq_splitk_min_m. KQ_QMM_SPLITK=<target splits> forces
   // the route for all M <= 32 (A/B lever). KQ_QMM_SPLITK=0 disables
   // both.

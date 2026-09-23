@@ -1980,6 +1980,9 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
       w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
 }
 
+// Register-resident MMA verify kernels, used by the legacy and Prism headers.
+#include "mlx/backend/metal/kernels/kq_verify_mma.h"
+
 #include "mlx/backend/metal/kernels/kq_quantized_legacy.h"
 
 // Q5_1: 24 bytes/32 weights. [fp16 d][fp16 m][uint32 qh][uint8 qs[16]].
@@ -2470,7 +2473,12 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits, bool aligned_N>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    int small_bm = 0>
 [[kernel]] void kq_q5_1_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -2488,7 +2496,9 @@ template <typename T, int group_size, int bits, bool aligned_N>
   static_assert(
       group_size == KQ_Q5_1_GROUP, "Q5_1 kernel requires group_size=32");
   static_assert(bits == 5, "Q5_1 kernel requires bits=5");
-  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BM = small_bm ? small_bm : 32;
+  constexpr int BK = 32, BN = small_bm ? 64 : 32;
+  constexpr int WM = BM == 8 ? 1 : 2, WN = 4 / WM;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -2506,7 +2516,7 @@ template <typename T, int group_size, int bits, bool aligned_N>
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       wl,
       x,
       y,

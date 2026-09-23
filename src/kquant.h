@@ -2305,6 +2305,51 @@ class KQuantHadamard : public mx::Primitive {
   int perm_hd_;
 };
 
+// Gated activation feeding a Hadamard-folded projection, fused with its
+// rotation: H_block(signs * (act(gate) * x)), act "silu" (swiglu) or
+// "sigmoid" (an attention output gate). Math in f32, one rounding to
+// x.dtype. gate matches x in shape and dtype.
+mx::array glu_hadamard(
+    mx::array x,
+    mx::array gate,
+    const std::optional<mx::array>& signs,
+    int block,
+    const std::string& activation = "silu",
+    mx::StreamOrDevice s = {});
+
+class KQuantGluHadamard : public mx::Primitive {
+ public:
+  explicit KQuantGluHadamard(
+      mx::Stream stream,
+      int block,
+      bool has_signs,
+      bool sigmoid)
+      : mx::Primitive(stream),
+        block_(block),
+        has_signs_(has_signs),
+        sigmoid_(sigmoid) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantGluHadamard";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int block_;
+  bool has_signs_;
+  bool sigmoid_;
+};
+
 // Fused (residual + rms_norm(h, w)) * scale (see add_rmsnorm).
 // Inference-only.
 class KQuantAddRMSNorm : public mx::Primitive {

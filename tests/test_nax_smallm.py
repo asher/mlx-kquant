@@ -74,9 +74,9 @@ ENCODABLE = [
 IQ = [c for c in CODECS if c.startswith("iq") or c in ("stq1_0", "pq2_0", "ptq1_0")]
 
 
-def _sweep(codec, w, s, ref_w, n_out, ms=MS):
+def _sweep(codec, w, s, ref_w, n_out, ms=MS, dtype=mx.bfloat16, k=K):
     for m in ms:
-        x = (mx.random.normal((m, K)) * 0.5).astype(mx.bfloat16)
+        x = (mx.random.normal((m, k)) * 0.5).astype(dtype)
         y = kq.quantized_matmul(x, w, s, codec, transpose=True)
         y = y.astype(mx.float32)
         ref = x.astype(mx.float32) @ ref_w
@@ -168,3 +168,76 @@ def test_alu_splitk_band(codec, nax_off):
 def test_alu_splitk_band_iq(codec, nax_off):
     w, s, ref_w = _iq_setup(codec, 1000)
     _sweep(codec, w, s, ref_w, 1000, ms=ALU_SPLITK_MS)
+
+
+# Register-resident MMA verify band (kq_verify_mma.h): KQ_VERIFY_MMA=2
+# forces the route at every M in 2..8 on any GPU, so the kernel is checked
+# at every row count and both activation dtypes it is instantiated for,
+# on an aligned and a ragged N (the row clamp past N). K=1000 blocks the
+# route (the codecs need a whole number of wire blocks), so K stays 1024.
+VERIFY_MMA_CODECS = ["pq2_0", "ptq1_0", "q4_0"]
+VERIFY_MMA_MS = [2, 3, 4, 5, 6, 7, 8]
+
+
+@pytest.fixture
+def verify_mma_forced(monkeypatch):
+    monkeypatch.setenv("KQ_VERIFY_MMA", "2")
+
+
+def _verify_mma_setup(codec, n_out, k=K):
+    if codec in ENCODABLE:
+        mx.random.seed(11)
+        wf = mx.random.normal((n_out, k)) * 0.1
+        w, s = kq.quantize(wf, codec)
+        ref_w = kq.dequantize(w, s, codec).astype(mx.float32).T
+        mx.eval(w, s, ref_w)
+        return w, s, ref_w
+    from kqref import quants
+
+    gtype, wpb, bpb, _, _ = CODECS[codec]
+    rng = np.random.default_rng(7)
+    wire = synth_wire(rng, codec, bpb, n_out * (k // wpb))
+    wire = wire.reshape(n_out, (k // wpb) * bpb)
+    ref = quants.dequantize(np.ascontiguousarray(wire), gtype)
+    ref_w = mx.array(ref.astype(np.float32)).T
+    w = mx.array(wire)
+    s = mx.zeros((1,), dtype=mx.uint8)
+    mx.eval(w, s, ref_w)
+    mx.random.seed(11)
+    return w, s, ref_w
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("n_out", [1024, 1000])
+@pytest.mark.parametrize("codec", VERIFY_MMA_CODECS)
+def test_verify_mma_band(codec, n_out, dtype, verify_mma_forced):
+    w, s, ref_w = _verify_mma_setup(codec, n_out)
+    _sweep(codec, w, s, ref_w, n_out, ms=VERIFY_MMA_MS, dtype=dtype)
+
+
+@pytest.mark.parametrize("codec", VERIFY_MMA_CODECS)
+def test_verify_mma_ragged_chunk(codec, verify_mma_forced):
+    # 2176 = 17 blocks of 128: one split of 4 full 512-wide chunks plus a
+    # 128-wide tail for the Prism codecs, and 4 splits of 512 + 32 for
+    # q4_0, so the partial-chunk path runs on both block widths.
+    k = 2176
+    w, s, ref_w = _verify_mma_setup(codec, 1000, k=k)
+    _sweep(codec, w, s, ref_w, 1000, ms=[2, 8], k=k)
+
+
+@pytest.mark.parametrize("codec", VERIFY_MMA_CODECS)
+def test_verify_mma_default_matches_forced(codec, monkeypatch):
+    # The default route at M8 and the forced route agree to the bf16
+    # output rounding, whichever kernel the default picks.
+    w, s, ref_w = _verify_mma_setup(codec, 1024)
+    x = (mx.random.normal((8, K)) * 0.5).astype(mx.bfloat16)
+    monkeypatch.setenv("KQ_VERIFY_MMA", "2")
+    y_forced = kq.quantized_matmul(x, w, s, codec, transpose=True)
+    monkeypatch.setenv("KQ_VERIFY_MMA", "0")
+    y_off = kq.quantized_matmul(x, w, s, codec, transpose=True)
+    mx.eval(y_forced, y_off)
+    err = float(
+        mx.abs(y_forced.astype(mx.float32) - y_off.astype(mx.float32)).max()
+        / (mx.abs(y_off.astype(mx.float32)).max() + 1e-6)
+    )
+    assert err < 2e-2, f"{codec}: forced vs off rel err {err:.3e}"

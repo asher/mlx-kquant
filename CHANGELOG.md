@@ -6,6 +6,20 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `glu_hadamard`: a swiglu or sigmoid output gate fused with the
+  `hadamard_rotate` rotation, so a folded down or output projection gets its
+  input in one dispatch.
+
+### Changed
+- `pq2_0` and `ptq1_0` at M 3 to 8, and `q4_0` at M 2 to 8, run on
+  register-resident simdgroup-MMA verify kernels that decode each weight
+  block straight into matrix fragments and read it once for all M rows.
+  `KQ_VERIFY_MMA` forces or disables the route.
+- `q4_0`, `q4_1`, `q5_0` and `q5_1` join the split-K small-M tiles, with
+  the bm8 and bm16 variants, so their M 5 to 32 band no longer runs on the
+  per-row mat-vec.
+
 ## [0.4.12]
 
 ### Added

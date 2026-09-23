@@ -263,47 +263,68 @@ inline void kq_ptq1_0_deq_chunk16(
     thread float4x4& reg) {
   // il 0..4 are the 16-byte chunk at trit il; il 5 and 6 are the 8-byte
   // chunk at trits 2(il-5) and 2(il-5)+1, each byte read once for both;
-  // il 7 is that chunk at trit 4 followed by the qh tail.
-  const float pow3f[6] = {1.0f, 3.0f, 9.0f, 27.0f, 81.0f, 243.0f};
+  // il 7 is that chunk at trit 4 followed by the qh tail. Blocks sit at a
+  // 4-byte stride, so the payload loads as words; 3^n / 256 and its
+  // product with a byte are exact in float.
+  const float pow3f[6] = {
+      1.0f / 256.0f,
+      3.0f / 256.0f,
+      9.0f / 256.0f,
+      27.0f / 256.0f,
+      81.0f / 256.0f,
+      243.0f / 256.0f};
   const float d = float(*(const device half*)(block + KQ_PTQ1_0_D_OFFSET));
   if (il < 5) {
-    const device uint8_t* qs = block;
+    const device uint* qw = (const device uint*)block;
     const float c0 = pow3f[il];
     const float c1 = 3.0f * c0;
 #pragma unroll
-    for (short k = 0; k < 16; ++k) {
-      const float u = float(qs[k]) * (1.0f / 256.0f);
-      reg[k / 4][k % 4] = d * (floor(c1 * u) - 3.0f * floor(c0 * u) - 1.0f);
+    for (short w = 0; w < 4; ++w) {
+      const uchar4 b = as_type<uchar4>(qw[w]);
+#pragma unroll
+      for (short k = 0; k < 4; ++k) {
+        const float fb = float(b[k]);
+        reg[w][k] = fma(d, floor(c1 * fb) - 3.0f * floor(c0 * fb), -d);
+      }
     }
   } else if (il < 7) {
-    const device uint8_t* qs = block + 16;
+    const device uint* qw = (const device uint*)(block + 16);
     const float c0 = pow3f[2 * (il - 5)];
     const float c1 = 3.0f * c0;
     const float c2 = 3.0f * c1;
 #pragma unroll
-    for (short k = 0; k < 8; ++k) {
-      const float u = float(qs[k]) * (1.0f / 256.0f);
-      const float g0 = floor(c0 * u);
-      const float g1 = floor(c1 * u);
-      const float g2 = floor(c2 * u);
-      reg[k / 4][k % 4] = d * (g1 - 3.0f * g0 - 1.0f);
-      reg[(k + 8) / 4][(k + 8) % 4] = d * (g2 - 3.0f * g1 - 1.0f);
+    for (short w = 0; w < 2; ++w) {
+      const uchar4 b = as_type<uchar4>(qw[w]);
+#pragma unroll
+      for (short k = 0; k < 4; ++k) {
+        const float fb = float(b[k]);
+        const float g0 = floor(c0 * fb);
+        const float g1 = floor(c1 * fb);
+        const float g2 = floor(c2 * fb);
+        reg[w][k] = fma(d, g1 - 3.0f * g0, -d);
+        reg[w + 2][k] = fma(d, g2 - 3.0f * g1, -d);
+      }
     }
   } else {
-    const device uint8_t* qs = block + 16;
+    const device uint* qw = (const device uint*)(block + 16);
 #pragma unroll
-    for (short k = 0; k < 8; ++k) {
-      const float u = float(qs[k]) * (1.0f / 256.0f);
-      reg[k / 4][k % 4] =
-          d * (floor(243.0f * u) - 3.0f * floor(81.0f * u) - 1.0f);
+    for (short w = 0; w < 2; ++w) {
+      const uchar4 b = as_type<uchar4>(qw[w]);
+#pragma unroll
+      for (short k = 0; k < 4; ++k) {
+        const float fb = float(b[k]);
+        reg[w][k] =
+            fma(d, floor(pow3f[5] * fb) - 3.0f * floor(pow3f[4] * fb), -d);
+      }
     }
-    const device uint8_t* qh = block + KQ_PTQ1_0_QH_OFFSET;
+    const ushort qh = *(const device ushort*)(block + KQ_PTQ1_0_QH_OFFSET);
+    const float fq[2] = {float(qh & 0xFF), float(qh >> 8)};
 #pragma unroll
     for (short k = 0; k < 8; ++k) {
       const float c0 = pow3f[k >> 1];
-      const float u = float(qh[k & 1]) * (1.0f / 256.0f);
+      const float fb = fq[k & 1];
       reg[(k + 8) / 4][(k + 8) % 4] =
-          d * (floor(3.0f * c0 * u) - 3.0f * floor(c0 * u) - 1.0f);
+          fma(d, floor(3.0f * c0 * fb) - 3.0f * floor(c0 * fb), -d);
     }
   }
 }
@@ -1036,3 +1057,111 @@ using KqPtq1_0BlockLoader = KqPrismBlockLoader<
 
 KQ_PRISM_DEFINE_KERNELS(pq2_0, 128, 2, KqPq2_0Ext, KqPq2_0BlockLoader)
 KQ_PRISM_DEFINE_KERNELS(ptq1_0, 128, 1, KqPtq1_0Ext, KqPtq1_0BlockLoader)
+
+// Register-resident MMA verify (kq_verify_mma.h). PQ2_0: lane L owns the
+// two 16-code words at bytes 8L..8L+7 of qs; fragment (j, j+8) of a word
+// is the pair of code j in each half, masked into the mantissas of a
+// half2 (1024 * 4^j + code) and scaled back by 4^-j, which is exact in
+// half. Codes 5..7 come from the word shifted down by ten bits.
+struct KqPq2_0Mma {
+  static constant constexpr int block_k = KQ_PQ2_0_SUPERBLOCK;
+  static constant constexpr int block_bytes = KQ_PQ2_0_BLOCK_BYTES;
+  static constant constexpr int d_offset = 0;
+  static METAL_FUNC int perm(int f, int col) {
+    return 32 * (col / 2) + 16 * (f / 8) + (f % 8) + 8 * (col & 1);
+  }
+  template <int NT>
+  static METAL_FUNC void block(
+      thread const KqVmmaRows<NT>& rows,
+      int boff,
+      short L,
+      short fm,
+      const threadgroup half* xb,
+      thread simdgroup_half8x8 (&acc)[NT]) {
+    uint wv[NT][2];
+    for (short t = 0; t < NT; ++t) {
+      const packed_ushort4 v =
+          *(const device packed_ushort4*)(rows.p[t] + boff +
+                                          KQ_PQ2_0_QS_OFFSET + 8 * L);
+      wv[t][0] = uint(v.x) | (uint(v.y) << 16);
+      wv[t][1] = uint(v.z) | (uint(v.w) << 16);
+    }
+    for (short h = 0; h < 2; ++h) {
+      for (short j = 0; j < 8; ++j) {
+        const short jj = j < 5 ? j : j - 5;
+        const uint mask = 0x00030003u << (2 * jj);
+        const half scale = half(1.0f / float(1 << (2 * jj)));
+        const half off = -half(1024.0f / float(1 << (2 * jj))) - 1.0h;
+        half2 a[NT];
+        for (short t = 0; t < NT; ++t) {
+          const uint src = j < 5 ? wv[t][h] : (wv[t][h] >> 10);
+          a[t] =
+              fma(as_type<half2>((src & mask) | 0x64006400u),
+                  half2(scale),
+                  half2(off));
+        }
+        kq_vmma_step<NT>(xb + 8 * perm(8 * h + j, fm), a, acc);
+      }
+    }
+  }
+};
+
+// PTQ1_0: lane L owns byte pair (8p + 2L, 8p + 2L + 1) of qs for p < 3,
+// decoded as a half2 base-3 recurrence u = b / 256, t = floor(3u),
+// u = 3u - t (every step exact in half); fragment 5p + level is that
+// level's trit pair. Fragment 15 is qh: lane L takes level L of (qh0, qh1).
+struct KqPtq1_0Mma {
+  static constant constexpr int block_k = KQ_PTQ1_0_SUPERBLOCK;
+  static constant constexpr int block_bytes = KQ_PTQ1_0_BLOCK_BYTES;
+  static constant constexpr int d_offset = KQ_PTQ1_0_D_OFFSET;
+  static METAL_FUNC int perm(int f, int col) {
+    if (f == 15) {
+      return 120 + 2 * (col / 2) + (col & 1);
+    }
+    const int byte = 8 * (f / 5) + 2 * (col / 2) + (col & 1);
+    const int level = f % 5;
+    return byte < 16 ? 16 * level + byte : 80 + 8 * level + (byte - 16);
+  }
+  template <int NT>
+  static METAL_FUNC void block(
+      thread const KqVmmaRows<NT>& rows,
+      int boff,
+      short L,
+      short fm,
+      const threadgroup half* xb,
+      thread simdgroup_half8x8 (&acc)[NT]) {
+    for (short p = 0; p < 3; ++p) {
+      half2 u[NT];
+      for (short t = 0; t < NT; ++t) {
+        const ushort v =
+            *(const device ushort*)(rows.p[t] + boff + 8 * p + 2 * L);
+        u[t] = half2(half(v & 0xFFu), half(v >> 8)) * half2(1.0h / 256.0h);
+      }
+      for (short lv = 0; lv < 5; ++lv) {
+        half2 a[NT];
+        for (short t = 0; t < NT; ++t) {
+          const half2 tt = floor(u[t] * half2(3.0h));
+          u[t] = fma(half2(3.0h), u[t], -tt);
+          a[t] = tt - half2(1.0h);
+        }
+        kq_vmma_step<NT>(xb + 8 * perm(5 * p + lv, fm), a, acc);
+      }
+    }
+    half2 a[NT];
+    for (short t = 0; t < NT; ++t) {
+      const ushort v =
+          *(const device ushort*)(rows.p[t] + boff + KQ_PTQ1_0_QH_OFFSET);
+      half2 u = half2(half(v & 0xFFu), half(v >> 8)) * half2(1.0h / 256.0h);
+      half2 tt = floor(u * half2(3.0h));
+      for (short lv = 0; lv < L; ++lv) {
+        u = fma(half2(3.0h), u, -tt);
+        tt = floor(u * half2(3.0h));
+      }
+      a[t] = tt - half2(1.0h);
+    }
+    kq_vmma_step<NT>(xb + 8 * perm(15, fm), a, acc);
+  }
+};
+
+KQ_DEFINE_VERIFY_MMA_KERNEL(pq2_0, KqPq2_0Mma, 2)
+KQ_DEFINE_VERIFY_MMA_KERNEL(ptq1_0, KqPtq1_0Mma, 1)
