@@ -3,8 +3,8 @@
 // d.get_kernel(name, lib); the op guarantees row-contiguity before dispatch and
 // kernel-name type tokens come from kq_type_string. NAX (tensor-core)
 // availability is probed via kq_is_nax_available. qmm_splitk / qmm_nax_splitk
-// (env-gated, KQ_QMM_SPLITK / KQ_QMM_SPLITK_NAX) partition K for the
-// small-M band on the steel and NAX tiles respectively; qvm_split_k stays
+// (KQ_QMM_SPLITK / KQ_QMM_SPLITK_NAX) partition K for the small-M band on
+// the steel and NAX tiles respectively; qvm_split_k stays
 // omitted - plain qvm is identical with less parallelism. KQuantMatmul itself
 // never carries a bias (a separate elementwise add is fine off the
 // decode-latency-critical path); the decode-only bias-fused fast path lives in
@@ -480,8 +480,9 @@ static int kq_qmm_splitk_env() {
   return v;
 }
 
-// Default split target; resolves down to a divisor of K / max(gs, BK),
-// so the realised count is coarser (K=6656 and K=19968 both give 13).
+// Default split target. kq_nax_split resolves it against the slice count
+// K / max(gs, BK), so the realised count is coarser (K=6656 and K=19968
+// both give 13).
 // One target for all codecs: over routed cells only, 16 is best for 15
 // of 19 and within 1% for the rest.
 static constexpr int kq_splitk_nax_target = 16;
@@ -964,13 +965,14 @@ void verify_nax(
   ce.dispatch_threads(agrid, agroup);
 }
 
-// Split-K qmm_t on the NAX BM=32 tile (KQ_QMM_SPLITK_NAX experiment). Same
+// Split-K qmm_t on the NAX BM=32 tile (KQ_QMM_SPLITK_NAX). Same
 // partial/fold shape as qmm_splitk, but slices run the tensor-core tile:
 // the steel splitk probe measured per-TG pipeline bound (~140-160 GB/s flat
 // in splits), while the NAX small-M cap is TG-count starvation -- the lever
 // splitk actually multiplies. Slice starts must be superblock-aligned so
-// every loader instance begins at kt_base 0; the caller guarantees splits
-// divides K / max(superblock, BK). Non-batched transpose shapes only.
+// every loader instance begins at kt_base 0. k_part is the slice length, a
+// multiple of max(superblock, BK), and the kernel cuts the last slice at K.
+// Non-batched transpose shapes only.
 void qmm_nax_splitk(
     const array& x,
     const array& w,
@@ -984,10 +986,10 @@ void qmm_nax_splitk(
     int splits,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    int k_partition) {
   constexpr int bm = 32, bn = 64;
   constexpr int wm = 2, wn = 2;
-  const int k_partition = K / splits;
   const int part_stride = M * N;
 
   array partials({splits, M, N}, x.dtype(), nullptr, {});
@@ -1443,6 +1445,38 @@ static int kq_split_count(int target, int nblk) {
   return sp;
 }
 
+// NAX split-K slicing over nblk units of max(block, BK) weights. Returns
+// the split count and sets per to the units in each slice. The divisor
+// count cuts equal slices. Slices of ceil(nblk / target) units with a
+// shorter last one take over when they more than double that count. A
+// unit count with no divisor near the target (68 at K 17408 and 43 at
+// K 11008 on the 256-weight codecs) otherwise leaves the grid short of
+// threadgroups, and within 2x the extra partials cost more than the added
+// threadgroups gain. KQ_SPLITK_RAGGED (read live) is a probe lever. 0
+// keeps the divisor count and 2 takes the ragged count whenever it is
+// larger.
+static int kq_nax_split(int target, int nblk, int& per) {
+  if (nblk < 2) {
+    per = nblk;
+    return 1;
+  }
+  const int sp = kq_split_count(target, nblk);
+  per = nblk / sp;
+  const char* e = std::getenv("KQ_SPLITK_RAGGED");
+  const int mode = e != nullptr ? std::atoi(e) : 1;
+  if (mode == 0) {
+    return sp;
+  }
+  const int t = std::min(target, nblk);
+  const int per_r = (nblk + t - 1) / t;
+  const int sp_r = (nblk + per_r - 1) / per_r;
+  if (sp_r > (mode == 2 ? sp : 2 * sp)) {
+    per = per_r;
+    return sp_r;
+  }
+  return sp;
+}
+
 // verify_mma split count. Split-K fills the grid for the projection
 // shapes; a head-sized N already has more threadgroups than the GPU holds,
 // and there the partials only cost traffic.
@@ -1552,9 +1586,12 @@ bool kq_forced_route(
     const int target = (e != nullptr && std::atoi(e) > 1)
         ? std::atoi(e)
         : kq_splitk_nax_target;
-    const int sp = kq_split_count(target, K / std::max(group_size, 64));
+    const int q = std::max(group_size, 64);
+    int per = 0;
+    const int sp = kq_nax_split(target, K / q, per);
     if (nax_ok && sp > 1) {
-      qmm_nax_splitk(x, w, scales, out, group_size, bits, M, N, K, sp, d, s, t);
+      qmm_nax_splitk(
+          x, w, scales, out, group_size, bits, M, N, K, sp, d, s, t, per * q);
       return true;
     }
     return false;
@@ -1921,8 +1958,8 @@ void KQuantMatmul::eval_gpu_base(
       M <= 8 && transpose_ && non_batched && x.dtype() != mx::float32;
 
   // NAX split-K, entering at kq_splitk_nax_min_m through M32; see
-  // qmm_nax_splitk. Slice quantum max(superblock, BK) keeps every slice
-  // starting a loader at kt_base 0 for both gs families.
+  // qmm_nax_splitk. Slice unit max(block, BK) keeps every slice starting
+  // a loader at kt_base 0 for all three block sizes (32, 128, 256).
   // KQ_QMM_SPLITK_NAX=<splits> forces the route for all M <= 32, 1 uses
   // the default target, 0 disables. Read live so an A/B can flip arms
   // on one generator. The default entry yields to verify_mma, to a
@@ -1942,8 +1979,9 @@ void KQuantMatmul::eval_gpu_base(
       x.dtype() != mx::float32) {
     const int qmm_splitk_nax_env =
         sk_nax_env > 1 ? sk_nax_env : kq_splitk_nax_target;
-    const int sp =
-        kq_split_count(qmm_splitk_nax_env, K / std::max(group_size_, 64));
+    const int q = std::max(group_size_, 64);
+    int per = 0;
+    const int sp = kq_nax_split(qmm_splitk_nax_env, K / q, per);
     if (sp > 1) {
       qmm_nax_splitk(
           x,
@@ -1958,7 +1996,8 @@ void KQuantMatmul::eval_gpu_base(
           sp,
           d,
           s,
-          kquant_type_);
+          kquant_type_,
+          per * q);
       return;
     }
   }

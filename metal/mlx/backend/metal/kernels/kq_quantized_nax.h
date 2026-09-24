@@ -3632,13 +3632,14 @@ KQ_NAX_DEFINE_KERNELS(q6_k, 256, 6, KqNaxQ6_KBlockLoader)
 KQ_NAX_DEFINE_KERNELS(q3_k, 256, 3, KqNaxQ3_KBlockLoader)
 KQ_NAX_DEFINE_KERNELS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
 
-// Split-K qmm_t on the NAX tile (KQ_QMM_SPLITK_NAX, small-M experiment):
+// Split-K qmm_t on the NAX tile (KQ_QMM_SPLITK_NAX):
 // grid.z indexes K-slices; each slice walks k_partition_size weights from a
 // superblock-aligned start and stores a T partial tile at
 // tid.z * split_k_partition_stride. The shared kquant_qmm_splitk_accum pass
 // folds slices in f32. The host guarantees k_partition_size is a multiple
 // of both the codec superblock and BK, so every slice starts the loader at
-// kt_base 0. Non-batched transpose shapes only; no swizzle (grid.y is a
+// kt_base 0. The last slice stops at K, so it may be shorter than the
+// others. Non-batched transpose shapes only; no swizzle (grid.y is a
 // single row tile in the target band).
 #define KQ_NAX_DEFINE_SPLITK_KERNEL(codec, GROUP_CONST, bits_val, LOADER)    \
   template <                                                                 \
@@ -3688,6 +3689,7 @@ KQ_NAX_DEFINE_KERNELS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
     auto wl = w;                                                             \
     wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block; \
     y += int(tid.z) * static_cast<int64_t>(split_k_partition_stride);        \
+    const int k_len = min(k_partition_size, K - k_start);                    \
     kq_qmm_t_nax_tgp_impl<                                                   \
         T,                                                                   \
         LoaderW,                                                             \
@@ -3698,18 +3700,7 @@ KQ_NAX_DEFINE_KERNELS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
         WM,                                                                  \
         WN,                                                                  \
         kWsBufs == 2>(                                                       \
-        wl,                                                                  \
-        x,                                                                   \
-        y,                                                                   \
-        Ws,                                                                  \
-        K,                                                                   \
-        N,                                                                   \
-        M,                                                                   \
-        tid,                                                                 \
-        lid,                                                                 \
-        simd_gid,                                                            \
-        simd_lid,                                                            \
-        k_partition_size);                                                   \
+        wl, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid, k_len);         \
   }
 
 KQ_NAX_DEFINE_SPLITK_KERNEL(q6_k, 256, 6, KqNaxQ6_KBlockLoader)

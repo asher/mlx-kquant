@@ -22,6 +22,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - On NAX GPUs, matmuls with 2 to 12 activation rows, such as batched decode
   and multi-token verification, pick faster kernels on every codec, most of
   all at small output widths. `KQ_NAX_QMV` controls the new per-row route.
+- On NAX GPUs, matmuls with a few activation rows run faster at inner
+  dimensions such as 11008, 17408 and 18944, which split-K could not divide
+  evenly into enough slices. `KQ_SPLITK_RAGGED=0` restores the equal split.
 
 ### Fixed
 - `q4_0` matmuls with 2 to 8 activation rows no longer return inf when one

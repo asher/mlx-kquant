@@ -91,6 +91,18 @@ un-split tile 1.1-1.5x faster at M 7 to 16. On the BM=64 tile, `iq2_xs`, `iq2_s`
 entry (median over nine codecs). The short last row tile of a taller matmul keeps the plain walk,
 because the full tiles set the time there and the split measured slower.
 
+The NAX split-K route cuts K into units of max(block, 64) weights and targets 16 slices of whole
+units. It takes the largest count at or under the target that divides the units evenly, unless
+equal slices with a shorter last one give more than twice as many. This covers inner dimensions
+whose unit count has no divisor near 16, such as 11008, 17408 and 18944 on the 256-weight codecs.
+`KQ_SPLITK_RAGGED=2` takes the ragged count wherever it is larger.
+
+Measured on M5 Max at M 8 to 24 with the weights streamed from DRAM, the shorter last slice runs
+`q4_k` 1.1x faster at 5120x17408, 1.5x at 3584x18944, 2x at 4096x11008 and 4-5x at 896x4864. The
+other codecs range from no change (`pq2_0` at 3584x18944) to 5.7x (`iq1_s` at 896x4864). Where the
+even count is at least half the ragged one, the ragged count ran from 11% slower to 1.26x faster
+depending on codec and shape, with no consistent direction, so the route keeps the even count.
+
 The M=1 mat-vec kernels loop over their two or four output rows with a static trip count and a
 clamped row index, so the compiler interleaves the rows' loads; the tail threadgroup recomputes its
 last row and drops it at the store. `q2_k` and `q3_k` keep the runtime bound: the static form measured no
@@ -135,13 +147,17 @@ Tuning levers (defaults are right for normal use):
   the kernel, `0` forces `verify_qmv` where the codec has it and per-row qmv elsewhere, and unset
   takes the per-codec default. On NAX GPUs a set value also keeps per-row qmv and NAX split-K off
   the band. Read once per process.
-- `KQ_QMM_SPLITK_NAX` - split-K on the NAX BM=32 tile. `0` disables the route, and a value at or
-  above `1` forces it and sets the target slice count. Unset takes the per-codec entry M in
-  `kq_nax_small_m` (one for N <= 1024, one above), measured on M5 Max, which yields to a forced
-  `KQ_QMM_SPLITK` and to a set `KQ_VERIFY_EXT` through M 12. Every codec with NAX kernels, M <= 32.
-  Read live per call, so both arms can share one process.
+- `KQ_QMM_SPLITK_NAX` - split-K on the NAX BM=32 tile. `0` disables the route, `1` forces it at
+  the default target of 16 slices, and a larger value forces it with that target. Unset takes the
+  per-codec entry M in `kq_nax_small_m` (one for N <= 1024, one above), measured on M5 Max, which
+  yields to a forced `KQ_QMM_SPLITK` and to a set `KQ_VERIFY_EXT` through M 12. Every codec with
+  NAX kernels, M <= 32. Read live per call, so both arms can share one process.
 - `KQ_QMM_SPLITK` - the same lever for the plain small-M qmm, used when NAX is absent or disabled.
   Entry points come from a per-device table. K-quants, legacy quants and the IQ codecs, M <= 32.
+- `KQ_SPLITK_RAGGED` - slice count of the NAX split-K route. `0` keeps equal slices, the largest
+  count at or under the target that divides the slice units, and `2` takes the ragged count
+  whenever it is larger. Unset takes it only where it more than doubles the equal count. Read live
+  per call.
 - `KQ_VERIFY_MMA` - the register-resident MMA verify route (below). A value of `2` or more forces
   it at that M and above on any GPU, `0` or `1` disables it. Unset takes the per-codec entry from
   the device's table (`kq_verify_mma_min_m` without NAX, `kq_verify_mma_min_m_nax` with it); the

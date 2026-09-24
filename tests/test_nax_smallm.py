@@ -389,6 +389,56 @@ def test_nax_short_tile_ksplit_odd_k_steps(codec, route, monkeypatch):
     _sweep(codec, w, s, ref_w, 1000, ms=[1, 5, 8, 16], k=k)
 
 
+# NAX split-K slices K in units of max(block, 64) weights. A prime count
+# of 19 units has no divisor to split on, so the route cuts 9 slices of 2
+# units and a last slice of 1. The default routing, with the route forced
+# on through KQ_QMM_SPLITK_NAX, runs the same slices bit for bit. With
+# KQ_SPLITK_RAGGED=0 the divisor count is 1 and the route declines.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX tile only")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("codec", ENCODABLE + IQ)
+def test_nax_splitk_ragged(codec, dtype, monkeypatch):
+    monkeypatch.delenv("KQ_SPLITK_RAGGED", raising=False)
+    k = 19 * max(CODECS[codec][1], 64)
+    w, s, ref_w = _verify_mma_setup(codec, 1000, k=k)
+    monkeypatch.setenv("KQ_QMM_ROUTE", "nax_splitk")
+    monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
+    _sweep(codec, w, s, ref_w, 1000, ms=[1, 5, 8, 16, 32], dtype=dtype, k=k)
+    x = (mx.random.normal((16, k)) * 0.5).astype(dtype)
+    y_forced = kq.quantized_matmul(x, w, s, codec, transpose=True)
+    monkeypatch.delenv("KQ_QMM_ROUTE")
+    monkeypatch.setenv("KQ_QMM_SPLITK_NAX", "1")
+    y_default = kq.quantized_matmul(x, w, s, codec, transpose=True)
+    assert _bits_equal(y_forced, y_default)
+    monkeypatch.delenv("KQ_QMM_SPLITK_NAX")
+    monkeypatch.setenv("KQ_QMM_ROUTE", "nax_splitk")
+    monkeypatch.setenv("KQ_SPLITK_RAGGED", "0")
+    x = mx.zeros((8, k), dtype=dtype)
+    with pytest.raises(RuntimeError, match="does not serve"):
+        mx.eval(kq.quantized_matmul(x, w, s, codec, transpose=True))
+
+
+# Ragged slices replace the divisor count only when they more than double
+# it. 68 units divide into 4 and run as 14 ragged slices. 35 units divide
+# into 7, and 12 ragged slices would not double that.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX tile only")
+@pytest.mark.parametrize("units, ragged", [(68, True), (35, False)])
+def test_nax_splitk_ragged_rule(units, ragged, monkeypatch):
+    monkeypatch.delenv("KQ_SPLITK_RAGGED", raising=False)
+    k = 256 * units
+    w, s, ref_w = _verify_mma_setup("q4_k", 256, k=k)
+    monkeypatch.setenv("KQ_QMM_ROUTE", "nax_splitk")
+    monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
+    x = (mx.random.normal((8, k)) * 0.5).astype(mx.bfloat16)
+    ys = {}
+    for v in ("0", "1"):
+        monkeypatch.setenv("KQ_SPLITK_RAGGED", v)
+        ys[v] = kq.quantized_matmul(x, w, s, "q4_k", transpose=True)
+        mx.eval(ys[v])
+    assert _bits_equal(ys["0"], ys["1"]) != ragged
+    _sweep("q4_k", w, s, ref_w, 256, ms=[8], k=k)
+
+
 # The verify_mma entries on float16 activations (the bfloat16 sweeps above
 # cover the same widths). Per-row qmv claims the entries at N 1000 by
 # default, so it is off here.
