@@ -70,8 +70,10 @@ covers, 16 on the BM=32 tile and 32 on the BM=64 tile, the second row would mult
 Both rows then compute the live rows, each walks half of every K step, and the two partial results
 are summed in threadgroup memory before the store. Measured on M5 Max over the 22 NAX codecs with
 the weights streamed from DRAM, the NAX split-K route runs 1.05-1.3x faster at M 8 to 16 and the
-un-split tile 1.1-1.5x faster at M 7 to 16. The short last row tile of a taller matmul keeps
-the plain walk, because the full tiles set the time there and the split measured slower.
+un-split tile 1.1-1.5x faster at M 7 to 16. On the BM=64 tile, `iq2_xs`, `iq2_s` and `iq1_m` run
+1.3-1.5x faster at M 13 to 32, and the gathered NAX tile runs about 1.3x faster at 32 rows per
+entry (median over nine codecs). The short last row tile of a taller matmul keeps the plain walk,
+because the full tiles set the time there and the split measured slower.
 
 The M=1 mat-vec kernels loop over their two or four output rows with a static trip count and a
 clamped row index, so the compiler interleaves the rows' loads; the tail threadgroup recomputes its
@@ -133,14 +135,14 @@ the NAX split-K entry in `kq_splitk_nax_min_m` (`benchmarks/bench_verify_band_ab
 `pq2_0` and `ptq1_0` (128-wide blocks) ship the same kernel set. Their NAX split-K entry is measured
 on M5 Max at M 9, where `verify_mma` hands off. The `bm128_min_m` and db64 floors are still
 inherited from `iq1_s`. The `ptq1_0` M=1 kernel gives each 28-byte block four lanes. Each lane
-reads its six trit bytes in two loads and shares one word load for the high-trit bytes and the
-scale, then decodes every byte with the exact-float base-3 coefficient collapse, which costs five
-precomputed activation coefficients and one floor per trit. A simdgroup computes four output rows,
-so the fast kernel covers eight rows per threadgroup. Measured on M5 Max at the Ternary Bonsai 2 27B
-projection shapes with the weights streamed from DRAM, it reads 360-440 GB/s, 1.2-1.3x the previous
-two-rows-per-simdgroup layout. The `pq2_0` M=1 kernel masks each pair of 2-bit codes into the mantissas of a
-half2 and runs the dot as half2 fmas, two weights per instruction, which brings it close to the rate
-of a kernel that only loads the bytes. Both codecs have a `verify_qmv` sibling that decodes each
+reads its six trit bytes in two loads plus the word that holds the high-trit bytes and the scale,
+and decodes the trits with the exact-float base-3 coefficient collapse, in which floors of the
+scaled byte value multiply precomputed activation coefficients instead of extracting each trit. A
+simdgroup computes four output rows, so the fast kernel covers eight rows per threadgroup. Measured
+on M5 Max at the Ternary Bonsai 2 27B projection shapes with the weights streamed from DRAM, it
+reads 360-440 GB/s, 1.2-1.3x the previous two-rows-per-simdgroup layout. The `pq2_0` M=1 kernel
+masks each pair of 2-bit codes into the mantissas of a half2 and runs the dot as half2 fmas, two
+weights per instruction, which brings it close to the rate of a kernel that only loads the bytes. Both codecs have a `verify_qmv` sibling that decodes each
 row's block once and dots it against every activation row; it serves M 2 by default. On NAX GPUs it
 serves `pq2_0` at M 2 to 4 and `ptq1_0` at M 2, below their `verify_mma` entries (the `mv_ext`
 re-decode per row costs `ptq1_0` 3x there).

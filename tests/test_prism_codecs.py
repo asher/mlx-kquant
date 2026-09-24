@@ -134,11 +134,23 @@ def test_real_file_rows_decode_bit_exact(codec):
 
 # The PTQ1_0 M=1 mat-vec runs qmv_fast (four rows per simdgroup) when N is a
 # multiple of 8 and K of 256, and plain qmv (two rows per simdgroup)
-# otherwise, including the partial last threadgroup. Every shape and
-# activation dtype must match the numpy oracle.
+# otherwise. The shapes cover one and several eight-block passes, a pass
+# count that is not a multiple of eight blocks, and odd N, whose last
+# threadgroup has one live row. float32 activations run the bfloat16 kernel.
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 @pytest.mark.parametrize(
-    "n,k", [(1024, 1024), (1004, 1024), (1002, 1024), (256, 640), (8, 128)]
+    "n,k",
+    [
+        (1024, 1024),
+        (1024, 2304),
+        (512, 4096),
+        (1004, 1024),
+        (1002, 1024),
+        (1001, 4096),
+        (1003, 768),
+        (256, 640),
+        (8, 128),
+    ],
 )
 def test_ptq1_0_matvec_shapes(n, k, dtype):
     rng = np.random.default_rng(3)

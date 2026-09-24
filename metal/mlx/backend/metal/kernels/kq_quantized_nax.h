@@ -71,8 +71,8 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
   // each BK step's two SK substeps, and SG-row 1's partial Dtile is summed
   // into SG-row 0's through Ws after the K walk. Not applied to the short
   // last row-tile of a taller M, where the full tiles set the time and the
-  // split measured slower. Needs the reduction to fit one Ws buffer, which
-  // excludes the BM=128 tile.
+  // split measured slower. Needs the float reduction to fit one Ws buffer,
+  // which holds for BM=32 and BM=64 at 2-byte T.
   constexpr int kRedFloats = WN * TM * TN * 16 * 16;
   constexpr bool kCanKSplit = WM == 2 && BK == 2 * SK &&
       kRedFloats * sizeof(float) <= BN * BK_padded * sizeof(T);
@@ -233,30 +233,33 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
-      if (ksplit) {
-        constexpr short NE = decltype(Dtile)::kElemsPerFrag;
-        constexpr short NF = decltype(Dtile)::kNumFrags;
-        static_assert(WN * NF * NE * SIMD_SIZE == kRedFloats, "K-split layout");
-        threadgroup float* red = reinterpret_cast<threadgroup float*>(Ws) +
-            (simd_gid % WN) * (NF * NE * SIMD_SIZE) + simd_lid;
-        if (sg_row == 1) {
+      if constexpr (kCanKSplit) {
+        if (ksplit) {
+          constexpr short NE = decltype(Dtile)::kElemsPerFrag;
+          constexpr short NF = decltype(Dtile)::kNumFrags;
+          static_assert(
+              WN * NF * NE * SIMD_SIZE == kRedFloats, "K-split layout");
+          threadgroup float* red = reinterpret_cast<threadgroup float*>(Ws) +
+              (simd_gid % WN) * (NF * NE * SIMD_SIZE) + simd_lid;
+          if (sg_row == 1) {
+            STEEL_PRAGMA_UNROLL
+            for (short f = 0; f < NF; ++f) {
+              STEEL_PRAGMA_UNROLL
+              for (short e = 0; e < NE; ++e) {
+                red[(f * NE + e) * SIMD_SIZE] = Dtile.val_frags[f][e];
+              }
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (sg_row == 1) {
+            return;
+          }
           STEEL_PRAGMA_UNROLL
           for (short f = 0; f < NF; ++f) {
             STEEL_PRAGMA_UNROLL
             for (short e = 0; e < NE; ++e) {
-              red[(f * NE + e) * SIMD_SIZE] = Dtile.val_frags[f][e];
+              Dtile.val_frags[f][e] += red[(f * NE + e) * SIMD_SIZE];
             }
-          }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg_row == 1) {
-          return;
-        }
-        STEEL_PRAGMA_UNROLL
-        for (short f = 0; f < NF; ++f) {
-          STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < NE; ++e) {
-            Dtile.val_frags[f][e] += red[(f * NE + e) * SIMD_SIZE];
           }
         }
       }

@@ -501,8 +501,8 @@ METAL_FUNC void kq_ptq1_0_qmv_impl(
   }
 }
 
-// Verify-shaped mat-vec (M = vm in 2..KQ_PRISM_MAX_VM): the M=1 lane
-// geometry, but the lane decodes its 16 trits to values once per row and
+// Verify-shaped mat-vec (M = vm in 2..KQ_PRISM_MAX_VM): eight lanes per
+// block, four blocks per pass; the lane decodes its 16 trits once per row and
 // block (the trit chain is the codec's cost, so it is paid once, not per
 // activation row) and dots them against every activation row.
 template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
