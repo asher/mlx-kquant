@@ -1,7 +1,7 @@
 """Per-route timing of the small-M transpose band, one process.
 
 Source of the NAX-GPU small-M routing entries in src/kquant_matmul.cpp
-(kq_verify_nax_min_m, kq_verify_mma_min_m_nax, kq_splitk_nax_min_m,
+(kq_nax_small_m, kq_verify_nax_min_m, kq_verify_mma_min_m_nax,
 kq_smallbm_policy route_min).
 
 Each arm forces one route through KQ_QMM_ROUTE, which the op reads live per

@@ -57,13 +57,29 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
   1.5-1.7x faster there. `KQ_DISABLE_GATHER_SEG_NAX=1` forces the steel simdgroup-mma walk. Gated by
   `KQ_SWITCH_GEMM_MIN_ROWS` (see [README](../README.md#environment-variables)).
 
-On NAX GPUs, `quantized_matmul` transpose (decode-orientation) shapes route by row count M: the
-mat-vec paths up to a per-codec crossover (M 6-9), a BM=32 double-buffered NAX tile through M 32,
-the BM=64 tile above that with a double-buffered `_db` variant on the M 33-64 band at large N, and
-a BM=128 tile from M 193 when ceil(M/64) is even. Every floor is a measured per-codec policy
-(`kq_smallbm_policy` in `src/kquant_matmul.cpp`). The codecs with a register-resident MMA verify
-kernel (`pq2_0`, `ptq1_0`, `q4_0`) take it through M 8 instead, as described at the end of this
-section.
+On NAX GPUs, `quantized_matmul` transpose (decode-orientation) shapes route by row count M and
+output width N. Per-row qmv serves M 2 up to a per-codec limit, the mat-vec paths (`mv_ext`,
+`verify_qmv`) serve the widths above it, and split-K on a BM=32 double-buffered NAX tile takes over
+from a per-codec entry through M 32. Above M 32 the BM=64 tile runs, with a double-buffered `_db`
+variant on the M 33-64 band at large N, and a BM=128 tile from M 193 when ceil(M/64) is even. The
+codecs with a register-resident verify kernel (`pq2_0`, `ptq1_0`, `q4_0`) take it through M 8 above
+the qmv limit, as described at the end of this section. Every limit and floor is a measured
+per-codec policy (`kq_nax_small_m` and `kq_smallbm_policy` in `src/kquant_matmul.cpp`).
+
+Per-row qmv reads the weight once per activation row, the later rows from the cache, and its grid
+grows with M. It holds widest where the mat-vec grids are too small to fill the GPU, so its limit
+falls with N. At N 512 and below, 13 of the 22 NAX codecs keep it through M 7 or 8. At N 1024 most
+keep it through M 2 to 5, and above N 2048 only `pq2_0`, `ptq1_0`, `q4_0`, `q4_1`, `q4_k` and
+`q2_k` keep it, at M 2. Split-K enters at M 2 to 9 for N 1024 and below and at M 3 to 9 above.
+Above N 1024, `iq2_xxs` keeps `mv_ext` through M 12, where its split-K tile runs slower, and `q6_k`
+at vocab-head widths runs the un-split BM=32 tile at M 8.
+
+The table was fitted on M5 Max to the fastest route per cell over the 22 codecs and 14 shapes, M 2
+to 12 on the projection shapes and M 2 to 8 on the smaller ones, with the weights streamed from
+DRAM (`benchmarks/bench_verify_routes.py`). Its route runs at 1.01x the fastest on those cells and
+1.02x on 10 shapes held out of the fit (geometric means), against 1.24x on both for the entries it
+replaced. The largest gains are `q4_k` and `q4_1` at M 7 (1.7-1.9x at the projection shapes),
+`iq2_xs` and `iq2_s` at M 8 to 12 (2.1-2.2x), and qmv at M 2 on N 1024 and below (1.1-3x).
 
 A NAX tile runs two rows of simdgroups. When the whole matmul has no more rows than one of them
 covers, 16 on the BM=32 tile and 32 on the BM=64 tile, the second row would multiply only padding.
@@ -110,10 +126,20 @@ Tuning levers (defaults are right for normal use):
 - `KQ_MV_EXT_NR` - `2` selects the two-rows-per-thread `mv_ext` variant (q6_k, M 5-12), which
   halves activation cache traffic but measured no faster than the shipped kernels. Kept as a probe
   for future silicon. Default `1` (shipped behavior).
-- `KQ_QMM_SPLITK_NAX` - split-K on the NAX BM=32 tile; `0` disables the route, a value at or above
-  `1` forces it and sets the target slice count. Unset takes the per-codec entry M in
-  `kq_splitk_nax_min_m`, measured on M5 Max. Every codec with NAX kernels, M <= 32; read live per
-  call, so both arms can share one process.
+- `KQ_NAX_QMV` - per-row qmv at small M on NAX GPUs. `0` disables the route, a value of `2` or
+  more serves M 2 through that value at every N. Unset takes the per-codec limit for the call's N
+  in `kq_nax_small_m`, which yields to a forced `KQ_VERIFY_NAX` or `KQ_VERIFY_MMA` on a codec they
+  serve, a forced `KQ_QMM_SPLITK_NAX` or `KQ_QMM_SPLITK`, and a set `KQ_VERIFY_EXT`.
+  `KQ_DISABLE_NAX=1` turns it off. Read live per call.
+- `KQ_VERIFY_EXT` - the mat-vec route on the M 2-12 band. `1` forces `mv_ext` for every codec with
+  the kernel, `0` forces `verify_qmv` where the codec has it and per-row qmv elsewhere, and unset
+  takes the per-codec default. On NAX GPUs a set value also keeps per-row qmv and NAX split-K off
+  the band. Read once per process.
+- `KQ_QMM_SPLITK_NAX` - split-K on the NAX BM=32 tile. `0` disables the route, and a value at or
+  above `1` forces it and sets the target slice count. Unset takes the per-codec entry M in
+  `kq_nax_small_m` (one for N <= 1024, one above), measured on M5 Max, which yields to a forced
+  `KQ_QMM_SPLITK` and to a set `KQ_VERIFY_EXT` through M 12. Every codec with NAX kernels, M <= 32.
+  Read live per call, so both arms can share one process.
 - `KQ_QMM_SPLITK` - the same lever for the plain small-M qmm, used when NAX is absent or disabled.
   Entry points come from a per-device table. K-quants, legacy quants and the IQ codecs, M <= 32.
 - `KQ_VERIFY_MMA` - the register-resident MMA verify route (below). A value of `2` or more forces
@@ -135,25 +161,25 @@ Tuning levers (defaults are right for normal use):
   only. `HD` measured +4-5% at M 8; the rest flat to negative on M5 Max. Kept as probes. Default
   off.
 
-`stq1_0` (structured-sparse ternary, llama.cpp PR #22836) ships the full ALU and NAX kernel set, but
-only the pre-NAX floors are measured (M3 Max: plain split-K entry M 5). Its NAX policy is inherited
-from `iq1_s` and needs M5-silicon calibration: `bm128_min_m` (`benchmarks/bench_qmm_bm128_ab.py`),
-the NAX split-K entry in `kq_splitk_nax_min_m` (`benchmarks/bench_verify_band_ab.py`),
-`kq_splitk_min_m_nax_alu`, and db64 candidacy (no `_db` instantiation yet). The PrismML codecs
-`pq2_0` and `ptq1_0` (128-wide blocks) ship the same kernel set. Their NAX split-K entry is measured
-on M5 Max at M 9, where the verify kernels hand off. The `bm128_min_m` and db64 floors are still
-inherited from `iq1_s`. The `ptq1_0` M=1 kernel gives each 28-byte block four lanes. Each lane
-reads its six trit bytes in two loads plus the word that holds the high-trit bytes and the scale,
-and decodes the trits with the exact-float base-3 coefficient collapse, in which floors of the
-scaled byte value multiply precomputed activation coefficients instead of extracting each trit. A
-simdgroup computes four output rows, so the fast kernel covers eight rows per threadgroup. Measured
-on M5 Max at the Ternary Bonsai 2 27B projection shapes with the weights streamed from DRAM, it
-reads 360-440 GB/s, 1.2-1.3x the previous two-rows-per-simdgroup layout. The `pq2_0` M=1 kernel
+`stq1_0` (structured-sparse ternary, llama.cpp PR #22836) ships the full ALU and NAX kernel set. Its
+pre-NAX floors are measured (M3 Max: plain split-K entry M 5), and so are its NAX small-M routes in
+`kq_nax_small_m`. The rest of its NAX policy is inherited from `iq1_s` and needs M5-silicon
+calibration: `bm128_min_m` (`benchmarks/bench_qmm_bm128_ab.py`), `kq_splitk_min_m_nax_alu`, and db64
+candidacy (no `_db` instantiation yet). The PrismML codecs `pq2_0` and `ptq1_0` (128-wide blocks)
+ship the same kernel set. Their NAX split-K entry is M 9, where the verify kernels hand off. The
+`bm128_min_m` and db64 floors are still inherited from `iq1_s`. The `ptq1_0` M=1 kernel gives each
+28-byte block four lanes. Each lane reads its six trit bytes in two loads plus the word that holds
+the high-trit bytes and the scale, and decodes the trits with the exact-float base-3 coefficient
+collapse, in which floors of the scaled byte value multiply precomputed activation coefficients
+instead of extracting each trit. A simdgroup computes four output rows, so the fast kernel covers
+eight rows per threadgroup. Measured on M5 Max at the Ternary Bonsai 2 27B projection shapes with
+the weights streamed from DRAM, it reads 360-440 GB/s, 1.2-1.3x the previous
+two-rows-per-simdgroup layout. The `pq2_0` M=1 kernel
 masks each pair of 2-bit codes into the mantissas of a half2 and runs the dot as half2 fmas, two
 weights per instruction, which brings it close to the rate of a kernel that only loads the bytes.
 Both codecs have a `verify_qmv` sibling that decodes each row's block once and dots it against every
-activation row. It serves M 2 on every GPU, below the `verify_nax` and `verify_mma` entries (the
-`mv_ext` re-decode per row costs `ptq1_0` 3x there).
+activation row. It serves M 2 below the `verify_mma` entry on GPUs without NAX, where the `mv_ext`
+re-decode per row costs `ptq1_0` 3x. On NAX GPUs per-row qmv serves M 2.
 
 The register-resident MMA verify kernels (`verify_mma`) serve `pq2_0`, `ptq1_0` and `q4_0` through
 M 8. Each simdgroup decodes a block of its weight rows straight into 8x8 simdgroup-matrix fragments,
@@ -174,19 +200,20 @@ The entry M depends on the device. Without NAX, `pq2_0` and `ptq1_0` enter at M 
 on float16 activations, where `verify_qmv` holds M 3) and `q4_0` at M 2. Measured on M3 Max at the
 Bonsai gate and down shapes against the routes they displace: `pq2_0` 1.15x at M 3 and 1.7x at
 M 8, `ptq1_0` 1.2x at M 3 and 2.0x at M 8, `q4_0` 1.2x at M 2 and 1.5x at M 8. Split-K enters at
-M 9 for these three codecs. On NAX GPUs the mat-vec kernels hold longer, so `ptq1_0` enters at M 3,
-`pq2_0` and `q4_0` enter at M 5 on the calls that `verify_nax` declines, and NAX split-K takes M 9
-and up. Measured on M5 Max over the eight Ternary Bonsai 2 27B projection and head shapes with the
-weights streamed from DRAM (`benchmarks/bench_verify_routes.py`), against the mat-vec route each
-displaces, on bfloat16 activations: `pq2_0` 1.1-1.3x at M 5 and 1.6-2.1x at M 8, `ptq1_0` 1.0-1.2x
-at M 3 and 2.5-3.1x at M 8, `q4_0` 1.0-1.4x at M 5 and 1.1-1.4x at M 8. Float16 activations give
-the same entries.
+M 9 for these three codecs. On NAX GPUs the mat-vec kernels hold longer, so above the per-row qmv
+limit `ptq1_0` enters at M 3, `pq2_0` and `q4_0` enter at M 5 on the calls that `verify_nax`
+declines, and NAX split-K takes M 9 and up. Measured on M5 Max over the eight Ternary Bonsai 2 27B
+projection and head shapes with the weights streamed from DRAM
+(`benchmarks/bench_verify_routes.py`), against the mat-vec route each displaces, on bfloat16
+activations: `pq2_0` 1.1-1.3x at M 5 and 1.6-2.1x at M 8, `ptq1_0` 1.0-1.2x at M 3 and 2.5-3.1x
+at M 8, `q4_0` 1.0-1.4x at M 5 and 1.1-1.4x at M 8. Float16 activations give the same entries.
 
 On NAX GPUs, `pq2_0` and `q4_0` take the register-fed NAX verify kernels (`verify_nax`) from M 3
-through M 8. Each simdgroup owns 32 weight rows and decodes every block of them straight into the
-right operand of a 16x32x16 NAX matmul, with the block scale folded into the half weights. The left
-operand holds the activation rows padded to 16, read from device memory in the same permuted k
-order as `verify_mma`, so nothing is staged in threadgroup memory and the loop has no barriers. The
+through M 8, above the per-row qmv limit where that limit is wider (N 2048 and below). Each
+simdgroup owns 32 weight rows and decodes every block of them straight into the right operand of a
+16x32x16 NAX matmul, with the block scale folded into the half weights. The left operand holds the
+activation rows padded to 16, read from device memory in the same permuted k order as
+`verify_mma`, so nothing is staged in threadgroup memory and the loop has no barriers. The
 accumulator is float32, which removes the half-range limit of `verify_mma`.
 
 A simdgroup's device loads and NAX ops do not overlap, so the kernel hides its loads through the

@@ -1,6 +1,6 @@
 """Thermally-paired A/B of the NAX split-K tile (KQ_QMM_SPLITK_NAX) per codec.
 
-Source of the kq_splitk_nax_min_m entries in src/kquant_matmul.cpp.
+A/B check of the NAX split-K entries in kq_nax_small_m (src/kquant_matmul.cpp).
 Measured on an M5 Max; re-run on new silicon before trusting them.
 
 KQ_QMM_SPLITK_NAX is read live per dispatch, so all arms share one

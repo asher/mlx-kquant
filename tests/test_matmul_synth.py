@@ -12,10 +12,12 @@ shared dequant bug cannot cancel out of both sides:
 
     quantized_matmul(x, w, transpose=True)  ~=  x @ gguf_py.dequantize(w).T
 
-The M-sweep covers M=1 (qmv), M in [2,8] (the verify mv_ext kernel) and a large
-M (qmm). KQ_VERIFY_EXT=0 forces the pre-mv_ext fallback (verify_qmv for K/legacy,
-per-row dispatch_qmv for IQ); run the suite under that env to A/B both paths -
-both must match the oracle.
+The M-sweep covers M=1 (qmv), M in [2,8] (the verify mv_ext kernel, or per-row
+qmv where NAX GPUs route this small N to it) and a large M (qmm). A second arm
+forces mv_ext through KQ_QMM_ROUTE so it meets the oracle on every GPU.
+KQ_VERIFY_EXT=0 forces the pre-mv_ext fallback (verify_qmv for K/legacy, per-row
+dispatch_qmv for IQ). Run the suite under that env to A/B both paths, which must
+both match the oracle.
 """
 
 from __future__ import annotations
@@ -55,14 +57,17 @@ CODECS = {
 # ggml marks these imatrix-required; kq.quantize rejects them without one.
 REQ_IMAT = {"iq2_xxs", "iq2_xs", "iq1_s"}
 N, K = 256, 512
-# 1 takes qmv, 2 through 8 take the verify mv_ext kernel, and 64 takes
-# qmm. Without a large M the block loaders never run, so the prefill
-# path of every codec goes untested.
+# 1 takes qmv, 2 through 8 take the verify mv_ext kernel (or per-row qmv
+# on NAX GPUs), and 64 takes qmm. Without a large M the block loaders
+# never run, so the prefill path of every codec goes untested.
 MS = (1, 2, 3, 4, 8, 64)
 
 
+@pytest.mark.parametrize("route", ["default", "mv_ext"])
 @pytest.mark.parametrize("codec", list(CODECS))
-def test_matmul_synth(codec):
+def test_matmul_synth(codec, route, monkeypatch):
+    if route != "default":
+        monkeypatch.setenv("KQ_QMM_ROUTE", route)
     gtype = CODECS[codec]
     rng = np.random.default_rng(0)
     w_np = (rng.standard_normal((N, K)) * 0.1).astype(np.float32)

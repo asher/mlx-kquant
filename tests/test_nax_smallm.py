@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Small-M NAX qmm routing validation (all NAX codecs).
 
-The batch-decode M range routes every NAX codec through three regimes: the
-mv paths (up to a per-codec crossover at M 6-9), the double-buffered BM=32
-NAX tile (crossover through 32), and the classic BM=64 NAX tile (M >= 33).
-This sweeps M across every seam and bounds each result against a
-dequantize-based float32 reference, on both an aligned and a ragged N. The
+The batch-decode M range routes every NAX codec through four regimes: per-row
+qmv (M 2 up to a per-codec limit that falls with N), the mv paths, the
+double-buffered BM=32 NAX tile with split-K (from a per-codec entry through
+32), and the classic BM=64 NAX tile (M >= 33). This sweeps M across every
+seam and bounds each result against a dequantize-based float32 reference,
+on both an aligned and a ragged N, with the qmv route on and off. The
 BM=128 band tests extend the sweep so every codec dispatches the BM=128
 tile on at least one tier cell. On non-NAX GPUs the small-M route falls
 back to the mv paths and BM stays 64; the numeric contract is identical,
@@ -20,7 +21,9 @@ Run locally on GPU (per-phase NAX gate, not hosted CI).
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import sys
 
 import numpy as np
@@ -111,9 +114,19 @@ def _iq_setup(codec, n_out):
     return w, s, ref_w
 
 
+@pytest.fixture(params=["", "0"], ids=["qmv", "noqmv"])
+def nax_qmv(request, monkeypatch):
+    """Default routing, and with the NAX per-row qmv route off so the
+    mat-vec and split-K bands stay covered at the N the qmv route claims."""
+    if request.param:
+        monkeypatch.setenv("KQ_NAX_QMV", request.param)
+    else:
+        monkeypatch.delenv("KQ_NAX_QMV", raising=False)
+
+
 @pytest.mark.parametrize("n_out", [1024, 1000])
 @pytest.mark.parametrize("codec", ENCODABLE)
-def test_smallm_routing(codec, n_out):
+def test_smallm_routing(codec, n_out, nax_qmv):
     w, s, ref_w = _encodable_setup(codec, n_out)
     _sweep(codec, w, s, ref_w, n_out)
 
@@ -141,9 +154,28 @@ def test_db64_band_dispatch(codec):
 
 @pytest.mark.parametrize("n_out", [1024, 1000])
 @pytest.mark.parametrize("codec", IQ)
-def test_smallm_routing_iq(codec, n_out):
+def test_smallm_routing_iq(codec, n_out, nax_qmv):
     w, s, ref_w = _iq_setup(codec, n_out)
     _sweep(codec, w, s, ref_w, n_out)
+
+
+# N 500 sits in the narrowest qmv bucket (N <= 512), where most codecs
+# take per-row qmv through M 7-8 before split-K.
+@pytest.mark.parametrize("codec", ENCODABLE + IQ)
+def test_smallm_routing_small_n(codec):
+    w, s, ref_w = _setup(codec, 500)
+    _sweep(codec, w, s, ref_w, 500, ms=range(2, 11))
+
+
+# The mat-vec kernel at a ragged N on every codec, forced. On NAX GPUs the
+# default routing reaches it at N 1000 only between the qmv limit and the
+# split-K entry, which is empty for most codecs.
+@pytest.mark.parametrize("codec", ENCODABLE + IQ)
+def test_mv_ext_ragged_n(codec, monkeypatch):
+    w, s, ref_w = _setup(codec, 1000)
+    monkeypatch.setenv("KQ_QMM_ROUTE", "mv_ext")
+    monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
+    _sweep(codec, w, s, ref_w, 1000, ms=range(2, 13))
 
 
 # Non-NAX split-K band, which the rest of this file cannot reach on NAX
@@ -358,9 +390,11 @@ def test_nax_short_tile_ksplit_odd_k_steps(codec, route, monkeypatch):
 
 
 # The verify_mma entries on float16 activations (the bfloat16 sweeps above
-# cover the same widths).
+# cover the same widths). Per-row qmv claims the entries at N 1000 by
+# default, so it is off here.
 @pytest.mark.parametrize("codec", VMMA_CODECS)
-def test_verify_mma_entries_f16(codec):
+def test_verify_mma_entries_f16(codec, monkeypatch):
+    monkeypatch.setenv("KQ_NAX_QMV", "0")
     w, s, ref_w = _setup(codec, 1000)
     _sweep(codec, w, s, ref_w, 1000, ms=[2, 3, 4, 5, 8, 9], dtype=mx.float16)
 
@@ -419,8 +453,8 @@ def test_verify_nax_splits(codec, k, splits, dtype, monkeypatch):
 
 
 # A q4_0 K that is an odd count of 32-wide blocks is not a whole number of
-# the kernel's 64-wide steps: the route declines it and the default routing
-# falls through to verify_mma.
+# the kernel's 64-wide steps. The route declines it, and the default
+# routing runs per-row qmv at M 5 and verify_mma at M 8.
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
 def test_verify_nax_q4_0_odd_blocks(monkeypatch):
     k = 1056
@@ -482,11 +516,13 @@ def _bits_equal(a, b):
 # bit-identical to the forced kernel it should run and differs from the
 # other, and the two agree to the output rounding. The route is chosen
 # when the graph evaluates, so each output evaluates under its own
-# environment.
+# environment. Per-row qmv claims these widths at N 1000 by default, so
+# it is off here.
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("codec", VNAX_CODECS)
 def test_verify_nax_default_dispatch(codec, dtype, monkeypatch):
+    monkeypatch.setenv("KQ_NAX_QMV", "0")
     w, s, _ = _setup(codec, 1000)
 
     def run(x, route=None):
@@ -528,10 +564,11 @@ def test_verify_nax_default_dispatch(codec, dtype, monkeypatch):
 
 # A forced KQ_VERIFY_MMA or KQ_QMM_SPLITK_NAX takes precedence over the
 # default verify_nax entry, so an A/B arm times the route it names. An
-# explicit KQ_VERIFY_NAX wins back.
+# explicit KQ_VERIFY_NAX wins back. Per-row qmv is off, as above.
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
 @pytest.mark.parametrize("codec", VNAX_CODECS)
 def test_verify_nax_yields_to_forced_levers(codec, monkeypatch):
+    monkeypatch.setenv("KQ_NAX_QMV", "0")
     w, s, _ = _setup(codec, 1000)
     x = (mx.random.normal((6, K)) * 0.5).astype(mx.bfloat16)
 
@@ -557,3 +594,219 @@ def test_verify_nax_yields_to_forced_levers(codec, monkeypatch):
     assert _bits_equal(run(KQ_VERIFY_MMA="7"), y_nax)
     assert _bits_equal(run(KQ_QMM_SPLITK_NAX="8"), y_sk)
     assert _bits_equal(run(KQ_QMM_SPLITK_NAX="8", KQ_VERIFY_NAX="3"), y_nax)
+
+
+# kq_nax_small_m for the codecs the dispatch tests pin: the per-row qmv
+# limit per N bucket (N <= 512, 1024, 2048, larger), then the split-K
+# entries for N <= 1024 and above.
+NAX_SMALL_M = {
+    "pq2_0": ((8, 5, 3, 2), 9, 9),
+    "ptq1_0": ((8, 5, 3, 2), 9, 9),
+    "q4_0": ((8, 6, 3, 2), 8, 8),
+    "q4_k": ((8, 5, 4, 2), 2, 5),
+    "q6_k": ((7, 2, 1, 1), 8, 9),
+    "q8_0": ((7, 6, 2, 1), 2, 7),
+    "iq2_xs": ((1, 1, 1, 1), 2, 4),
+    "iq2_xxs": ((8, 5, 2, 1), 9, 13),
+}
+# verify_mma entries on NAX GPUs (kq_verify_mma_min_m_nax) for the codecs
+# verify_nax does not serve, and the qmv rows per threadgroup of the two
+# codecs whose M 2 mat-vec route is verify_qmv.
+VMMA_NAX_ENTRY = {"ptq1_0": 3}
+QMV_BN = {"q4_k": 4, "q8_0": 8}
+# Per-row qmv, mv_ext and verify_qmv dot the exact weights in float32 and
+# agree bit for bit on most codecs, so a pin cannot tell them apart. The
+# NAX tiles and the verify kernels round the weights to a 16-bit type, so
+# the pins check every seam against those, whose results differ.
+BITSAME = {"qmv", "mv_ext", "verify_qmv"}
+# Read once per process, so the default routing tests skip when they are set.
+STATIC_LEVERS = ("KQ_VERIFY_EXT", "KQ_QMM_SPLITK")
+
+
+def _nax_default_route(codec, n, m, qmv=True):
+    qmv_m, splitk_small, splitk = NAX_SMALL_M[codec]
+    b = 0 if n <= 512 else 1 if n <= 1024 else 2 if n <= 2048 else 3
+    if qmv and m <= qmv_m[b]:
+        return "qmv"
+    if codec in VNAX_CODECS and 3 <= m <= 8:
+        return "verify_nax"
+    if VMMA_NAX_ENTRY.get(codec, 9) <= m <= 8:
+        return "verify_mma"
+    if m >= (splitk_small if n <= 1024 else splitk):
+        return "nax_splitk"
+    if m == 2 and codec in QMV_BN:
+        return "verify_qmv" if n % QMV_BN[codec] == 0 else "qmv"
+    return "mv_ext"
+
+
+def _run_route(monkeypatch, x, w, s, codec, route=None):
+    if route is None:
+        monkeypatch.delenv("KQ_QMM_ROUTE", raising=False)
+    else:
+        monkeypatch.setenv("KQ_QMM_ROUTE", route)
+    y = kq.quantized_matmul(x, w, s, codec, transpose=True)
+    mx.eval(y)
+    monkeypatch.delenv("KQ_QMM_ROUTE", raising=False)
+    return y
+
+
+def _clear_levers(monkeypatch):
+    if any(os.environ.get(k) is not None for k in STATIC_LEVERS):
+        pytest.skip("a process-static routing lever is set")
+    for k in (
+        "KQ_NAX_QMV",
+        "KQ_VERIFY_NAX",
+        "KQ_VERIFY_MMA",
+        "KQ_QMM_SPLITK_NAX",
+        "KQ_DISABLE_NAX",
+        "KQ_QMM_ROUTE",
+        "KQ_QMM_ROUTE_STRICT",
+    ):
+        monkeypatch.delenv(k, raising=False)
+
+
+# The default small-M routing on NAX GPUs runs the kernel the per-codec
+# table names, bit for bit, on both sides of every N bucket edge and
+# across each seam: the qmv limit, the verify routes, the split-K entry
+# and the mat-vec band between. Each pin is also checked against the
+# route a limit one step off would give, unless both are in BITSAME.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX routing only")
+@pytest.mark.parametrize("n_out", [512, 513, 1024, 1025, 2048, 2049, 4096])
+@pytest.mark.parametrize("codec", sorted(NAX_SMALL_M))
+def test_nax_small_m_default_dispatch(codec, n_out, monkeypatch):
+    _clear_levers(monkeypatch)
+    w, s, _ = _setup(codec, n_out)
+    ms = [2, 3, 4, 5, 6, 7, 8, 9]
+    if codec == "iq2_xxs":
+        ms += [12, 13]
+    for m in ms:
+        x = (mx.random.normal((m, K)) * 0.5).astype(mx.bfloat16)
+        expect = _nax_default_route(codec, n_out, m)
+        y_def = _run_route(monkeypatch, x, w, s, codec)
+        y_exp = _run_route(monkeypatch, x, w, s, codec, expect)
+        tag = f"{codec} N{n_out} M{m} expect {expect}"
+        assert _bits_equal(y_def, y_exp), tag
+        if expect == "qmv":
+            alt = _nax_default_route(codec, n_out, m, qmv=False)
+        else:
+            alt = "qmv"
+        if not {expect, alt} <= BITSAME:
+            y_alt = _run_route(monkeypatch, x, w, s, codec, alt)
+            assert not _bits_equal(y_def, y_alt), f"{tag} vs {alt}"
+
+
+# KQ_NAX_QMV=0 turns the route off and a value sets the limit at every N.
+# The default yields to a forced KQ_VERIFY_NAX or KQ_VERIFY_MMA on a codec
+# they serve and to a forced KQ_QMM_SPLITK_NAX, and an explicit
+# KQ_NAX_QMV wins back. KQ_DISABLE_NAX turns it off with the NAX routes.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX routing only")
+def test_nax_qmv_levers(monkeypatch):
+    _clear_levers(monkeypatch)
+
+    def run(codec, w, s, x, route=None, **env):
+        _clear_levers(monkeypatch)
+        for k, v in env.items():
+            monkeypatch.setenv(k, v)
+        y = _run_route(monkeypatch, x, w, s, codec, route)
+        _clear_levers(monkeypatch)
+        return y
+
+    w, s, _ = _setup("q4_0", 500)
+    x = (mx.random.normal((4, K)) * 0.5).astype(mx.bfloat16)
+    y_qmv = run("q4_0", w, s, x, "qmv")
+    y_nax = run("q4_0", w, s, x, "verify_nax")
+    y_mma = run("q4_0", w, s, x, "verify_mma")
+    y_sk = run("q4_0", w, s, x, "nax_splitk", KQ_QMM_SPLITK_NAX="8")
+    for y in (y_nax, y_mma, y_sk):
+        assert not _bits_equal(y, y_qmv)
+    assert _bits_equal(run("q4_0", w, s, x), y_qmv)
+    assert _bits_equal(run("q4_0", w, s, x, KQ_NAX_QMV="0"), y_nax)
+    assert _bits_equal(run("q4_0", w, s, x, KQ_VERIFY_NAX="3"), y_nax)
+    assert _bits_equal(run("q4_0", w, s, x, KQ_VERIFY_NAX="5"), y_qmv)
+    y = run("q4_0", w, s, x, KQ_VERIFY_MMA="2", KQ_VERIFY_NAX="0")
+    assert _bits_equal(y, y_mma)
+    assert _bits_equal(run("q4_0", w, s, x, KQ_QMM_SPLITK_NAX="8"), y_sk)
+    y = run("q4_0", w, s, x, KQ_QMM_SPLITK_NAX="8", KQ_NAX_QMV="4")
+    assert _bits_equal(y, y_qmv)
+
+    # A verify lever on a codec it does not serve leaves qmv in place: at
+    # N 500 the q4_k limit is 8 and split-K enters at 2.
+    w, s, _ = _setup("q4_k", 500)
+    x = (mx.random.normal((4, K)) * 0.5).astype(mx.bfloat16)
+    y_qmv = run("q4_k", w, s, x, "qmv")
+    assert not _bits_equal(y_qmv, run("q4_k", w, s, x, "nax_splitk"))
+    assert _bits_equal(run("q4_k", w, s, x, KQ_VERIFY_NAX="2"), y_qmv)
+    assert _bits_equal(run("q4_k", w, s, x, KQ_VERIFY_MMA="2"), y_qmv)
+
+    # KQ_NAX_QMV widens the route past the table at a large N.
+    w, s, _ = _setup("q4_k", 4096)
+    x = (mx.random.normal((6, K)) * 0.5).astype(mx.bfloat16)
+    y_qmv = run("q4_k", w, s, x, "qmv")
+    y_sk = run("q4_k", w, s, x, "nax_splitk")
+    assert not _bits_equal(y_qmv, y_sk)
+    assert _bits_equal(run("q4_k", w, s, x), y_sk)
+    assert _bits_equal(run("q4_k", w, s, x, KQ_NAX_QMV="6"), y_qmv)
+
+    # KQ_DISABLE_NAX turns the route off even when KQ_NAX_QMV asks for it.
+    # pq2_0 at M 5 is the check: its non-NAX routes there (mv_ext,
+    # verify_mma) differ from qmv bit for bit.
+    w, s, _ = _setup("pq2_0", 500)
+    x = (mx.random.normal((5, K)) * 0.5).astype(mx.bfloat16)
+    y_off = run("pq2_0", w, s, x, KQ_DISABLE_NAX="1")
+    assert not _bits_equal(y_off, run("pq2_0", w, s, x, "qmv"))
+    y = run("pq2_0", w, s, x, KQ_DISABLE_NAX="1", KQ_NAX_QMV="8")
+    assert _bits_equal(y, y_off)
+
+
+# Probe for the process-static levers: prints, per named route, whether the
+# default output equals that route's output bit for bit.
+_STATIC_PROBE = """
+import json, os, sys
+import mlx.core as mx
+import mlx_kquant as kq
+codec, m = sys.argv[1], int(sys.argv[2])
+mx.random.seed(11)
+w, s = kq.quantize(mx.random.normal((1000, 1024)) * 0.1, codec)
+x = (mx.random.normal((m, 1024)) * 0.5).astype(mx.bfloat16)
+def run(route=None):
+    os.environ.pop("KQ_QMM_ROUTE", None)
+    if route:
+        os.environ["KQ_QMM_ROUTE"] = route
+    y = kq.quantized_matmul(x, w, s, codec, transpose=True)
+    mx.eval(y)
+    return y
+y = run()
+print(json.dumps({r: bool(mx.array_equal(y, run(r)).item()) for r in sys.argv[3:]}))
+"""
+
+
+# KQ_VERIFY_EXT and KQ_QMM_SPLITK are read once per process, so each case
+# runs in a fresh interpreter. A set KQ_VERIFY_EXT keeps per-row qmv and
+# NAX split-K off the mat-vec band, and a forced KQ_QMM_SPLITK keeps them
+# off its band. At N 1000 the q4_k qmv limit is 5 and split-K enters at 2,
+# and pq2_0 runs verify_nax from M 3. The ALU and NAX split-K tiles agree
+# bit for bit at this K, so the KQ_QMM_SPLITK case checks the qmv yield.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX routing only")
+@pytest.mark.parametrize(
+    "lever, codec, m, expect, other",
+    [
+        ("KQ_VERIFY_EXT=1", "q4_k", 3, "mv_ext", "nax_splitk"),
+        ("KQ_VERIFY_EXT=1", "pq2_0", 3, "verify_nax", "qmv"),
+        ("KQ_VERIFY_EXT=0", "q4_k", 3, "verify_qmv", "nax_splitk"),
+        ("KQ_VERIFY_EXT=0", "pq2_0", 3, "verify_nax", "qmv"),
+        ("KQ_QMM_SPLITK=8", "q4_k", 3, "splitk", "qmv"),
+    ],
+)
+def test_nax_small_m_yields_to_static_levers(lever, codec, m, expect, other):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KQ_")}
+    name, value = lever.split("=")
+    env[name] = value
+    out = subprocess.run(
+        [sys.executable, "-c", _STATIC_PROBE, codec, str(m), expect, other],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    res = json.loads(out.stdout.strip().splitlines()[-1])
+    assert res[expect] and not res[other], (lever, codec, m, res)

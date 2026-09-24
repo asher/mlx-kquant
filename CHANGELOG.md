@@ -19,6 +19,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   such as speculative-decode verification, run faster. The same holds up to
   32 rows on the 64-row tile, which `iq2_xs`, `iq2_s`, `iq1_m` and gathered
   matmuls use.
+- On NAX GPUs, matmuls with 2 to 12 activation rows, such as batched decode
+  and multi-token verification, pick faster kernels on every codec, most of
+  all at small output widths. `KQ_NAX_QMV` controls the new per-row route.
 
 ### Fixed
 - `q4_0` matmuls with 2 to 8 activation rows no longer return inf when one
