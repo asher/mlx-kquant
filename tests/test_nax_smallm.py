@@ -39,9 +39,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 K = 1024
-# Every routing seam: mv tail (2, 6), verify_mma entries (3, 5) and
-# their mat-vec neighbour (4), per-codec qmm crossover (7-10), NAX BM=32
-# body/edges (12, 13, 16, 24, 31, 32), BM=64 handoff (33, 64). The _db
+# Every routing seam: mv tail (2, 6), verify_mma and verify_nax entries
+# (3, 5) and their mat-vec neighbour (4), per-codec qmm crossover (7-10),
+# NAX BM=32 body/edges (12, 13, 16, 24, 31, 32), BM=64 handoff (33, 64). The _db
 # double-buffered variant of the 33-64 band is N-gated far above these
 # widths; test_db64_band_dispatch covers it at the policy floors.
 MS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 16, 24, 31, 32, 33, 48, 64]
@@ -183,6 +183,7 @@ VERIFY_MMA_MS = [2, 3, 4, 5, 6, 7, 8]
 @pytest.fixture
 def verify_mma_forced(monkeypatch):
     monkeypatch.setenv("KQ_VERIFY_MMA", "2")
+    monkeypatch.setenv("KQ_VERIFY_NAX", "0")
 
 
 def _verify_mma_setup(codec, n_out, k=K):
@@ -229,14 +230,19 @@ def test_verify_mma_ragged_chunk(codec, verify_mma_forced):
 @pytest.mark.parametrize("codec", VERIFY_MMA_CODECS)
 def test_verify_mma_default_matches_forced(codec, monkeypatch):
     # The default route at M8 and the forced route agree to the bf16
-    # output rounding, whichever kernel the default picks.
+    # output rounding, whichever kernel the default picks. The route is
+    # chosen when the graph evaluates, so each output evaluates under its
+    # own environment.
     w, s, ref_w = _verify_mma_setup(codec, 1024)
     x = (mx.random.normal((8, K)) * 0.5).astype(mx.bfloat16)
+    monkeypatch.setenv("KQ_VERIFY_NAX", "0")
     monkeypatch.setenv("KQ_VERIFY_MMA", "2")
     y_forced = kq.quantized_matmul(x, w, s, codec, transpose=True)
+    mx.eval(y_forced)
     monkeypatch.setenv("KQ_VERIFY_MMA", "0")
     y_off = kq.quantized_matmul(x, w, s, codec, transpose=True)
-    mx.eval(y_forced, y_off)
+    mx.eval(y_off)
+    assert not bool(mx.array_equal(y_forced, y_off).item())
     err = float(
         mx.abs(y_forced.astype(mx.float32) - y_off.astype(mx.float32)).max()
         / (mx.abs(y_off.astype(mx.float32)).max() + 1e-6)
@@ -253,6 +259,7 @@ QMM_ROUTES = [
     "verify_qmv",
     "mv_ext",
     "verify_mma",
+    "verify_nax",
     "splitk",
     "nax",
     "nax_splitk",
@@ -271,6 +278,7 @@ def test_qmm_route_probe(codec, route, monkeypatch):
 
 
 VMMA_CODECS = ["pq2_0", "ptq1_0", "q4_0"]
+VNAX_CODECS = ["pq2_0", "q4_0"]
 
 
 def _setup(codec, n_out):
@@ -291,6 +299,8 @@ def _route_serves(route, codec, m):
         return 2 <= m <= 12
     if route == "verify_mma":
         return codec in VMMA_CODECS and m <= 8
+    if route == "verify_nax":
+        return kq.nax_available() and codec in VNAX_CODECS and m <= 8
     if route == "splitk":
         return True
     return kq.nax_available()
@@ -374,3 +384,176 @@ def test_verify_mma_outlier_channel(codec, dtype, monkeypatch):
         assert bool(mx.isfinite(y).all()), f"{codec} M{m}: non-finite output"
         err = float((mx.abs(y - ref)).max() / (mx.abs(ref).max() + 1e-6))
         assert err < 2e-2, f"{codec} M{m}: rel err {err:.3e}"
+
+
+# The register-fed NAX verify route (verify_nax) serves pq2_0 and q4_0
+# through M 8 on NAX GPUs. Forced at every width it serves, both
+# activation dtypes, aligned and ragged N (the row clamp in the last
+# simdgroup's 32 rows).
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("n_out", [1024, 1000, 40, 20])
+@pytest.mark.parametrize("codec", VNAX_CODECS)
+def test_verify_nax_band(codec, n_out, dtype, monkeypatch):
+    w, s, ref_w = _setup(codec, n_out)
+    monkeypatch.setenv("KQ_QMM_ROUTE", "verify_nax")
+    monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
+    _sweep(codec, w, s, ref_w, n_out, ms=range(1, 9), dtype=dtype)
+
+
+# Split counts across the K walk. K 2176 is 17 pq2_0 blocks (no split
+# divides it) and 34 q4_0 steps of 64, K 1920 is 15 and 30 steps (odd
+# counts 3 and 5), K 4096 is 32 and 64. The forced counts cover the
+# partial fold wherever they divide the steps.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("splits", ["", "2", "3", "4", "5", "8"])
+@pytest.mark.parametrize("k", [2176, 1920, 4096])
+@pytest.mark.parametrize("codec", VNAX_CODECS)
+def test_verify_nax_splits(codec, k, splits, dtype, monkeypatch):
+    w, s, ref_w = _verify_mma_setup(codec, 1000, k=k)
+    monkeypatch.setenv("KQ_QMM_ROUTE", "verify_nax")
+    monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
+    monkeypatch.setenv("KQ_VERIFY_NAX_SPLITS", splits)
+    _sweep(codec, w, s, ref_w, 1000, ms=[1, 5, 8], dtype=dtype, k=k)
+
+
+# A q4_0 K that is an odd count of 32-wide blocks is not a whole number of
+# the kernel's 64-wide steps: the route declines it and the default routing
+# falls through to verify_mma.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+def test_verify_nax_q4_0_odd_blocks(monkeypatch):
+    k = 1056
+    w, s, ref_w = _verify_mma_setup("q4_0", 1000, k=k)
+    monkeypatch.setenv("KQ_QMM_ROUTE", "verify_nax")
+    monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
+    x = mx.zeros((8, k), dtype=mx.bfloat16)
+    with pytest.raises(RuntimeError, match="does not serve"):
+        mx.eval(kq.quantized_matmul(x, w, s, "q4_0", transpose=True))
+    monkeypatch.delenv("KQ_QMM_ROUTE")
+    monkeypatch.delenv("KQ_QMM_ROUTE_STRICT")
+    _sweep("q4_0", w, s, ref_w, 1000, ms=[5, 8], k=k)
+
+
+# KQ_DISABLE_NAX turns the route off with the other NAX routes.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+@pytest.mark.parametrize("codec", VNAX_CODECS)
+def test_verify_nax_disable_nax(codec, monkeypatch):
+    w, s, ref_w = _setup(codec, 1000)
+    monkeypatch.setenv("KQ_DISABLE_NAX", "1")
+    monkeypatch.setenv("KQ_QMM_ROUTE", "verify_nax")
+    monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
+    x = mx.zeros((8, K), dtype=mx.bfloat16)
+    with pytest.raises(RuntimeError, match="does not serve"):
+        mx.eval(kq.quantized_matmul(x, w, s, codec, transpose=True))
+    monkeypatch.delenv("KQ_QMM_ROUTE")
+    monkeypatch.delenv("KQ_QMM_ROUTE_STRICT")
+    _sweep(codec, w, s, ref_w, 1000, ms=[3, 5, 8])
+
+
+# verify_nax folds the block scale into half weights and accumulates in
+# float32, so one activation channel near the top of the half range stays
+# finite and within the contract.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("codec", VNAX_CODECS)
+def test_verify_nax_outlier_channel(codec, dtype, monkeypatch):
+    w, s, ref_w = _setup(codec, 1000)
+    monkeypatch.setenv("KQ_QMM_ROUTE", "verify_nax")
+    monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
+    for m in (1, 5, 8):
+        x = mx.random.normal((m, K)) * 0.5
+        x[:, 7] = 3.0e4
+        x = x.astype(dtype)
+        y = kq.quantized_matmul(x, w, s, codec, transpose=True).astype(mx.float32)
+        ref = x.astype(mx.float32) @ ref_w
+        mx.eval(y, ref)
+        assert bool(mx.isfinite(y).all()), f"{codec} M{m}: non-finite output"
+        err = float((mx.abs(y - ref)).max() / (mx.abs(ref).max() + 1e-6))
+        assert err < 2e-2, f"{codec} M{m}: rel err {err:.3e}"
+
+
+def _bits_equal(a, b):
+    return bool(mx.array_equal(a, b).item())
+
+
+# The default route dispatches verify_nax from its entry, and
+# KQ_VERIFY_NAX moves the entry both ways: the default output is
+# bit-identical to the forced kernel it should run and differs from the
+# other, and the two agree to the output rounding. The route is chosen
+# when the graph evaluates, so each output evaluates under its own
+# environment.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("codec", VNAX_CODECS)
+def test_verify_nax_default_dispatch(codec, dtype, monkeypatch):
+    w, s, _ = _setup(codec, 1000)
+
+    def run(x, route=None):
+        if route is None:
+            monkeypatch.delenv("KQ_QMM_ROUTE", raising=False)
+        else:
+            monkeypatch.setenv("KQ_QMM_ROUTE", route)
+        y = kq.quantized_matmul(x, w, s, codec, transpose=True)
+        mx.eval(y)
+        monkeypatch.delenv("KQ_QMM_ROUTE", raising=False)
+        return y
+
+    cases = [
+        (2, None, None),
+        (3, None, "nax"),
+        (5, None, "nax"),
+        (8, None, "nax"),
+        (2, "2", "nax"),
+        (8, "0", "mma"),
+    ]
+    for m, entry, expect in cases:
+        if entry is None:
+            monkeypatch.delenv("KQ_VERIFY_NAX", raising=False)
+        else:
+            monkeypatch.setenv("KQ_VERIFY_NAX", entry)
+        x = (mx.random.normal((m, K)) * 0.5).astype(dtype)
+        y_def = run(x)
+        y_nax = run(x, "verify_nax")
+        y_mma = run(x, "verify_mma")
+        tag = f"{codec} M{m} KQ_VERIFY_NAX={entry}"
+        assert _bits_equal(y_def, y_nax) == (expect == "nax"), tag
+        assert _bits_equal(y_def, y_mma) == (expect == "mma"), tag
+        err = float(
+            mx.abs(y_nax.astype(mx.float32) - y_mma.astype(mx.float32)).max()
+            / (mx.abs(y_mma.astype(mx.float32)).max() + 1e-6)
+        )
+        assert err < 2e-2, f"{tag}: verify_nax vs verify_mma rel err {err:.3e}"
+
+
+# A forced KQ_VERIFY_MMA or KQ_QMM_SPLITK_NAX takes precedence over the
+# default verify_nax entry, so an A/B arm times the route it names. An
+# explicit KQ_VERIFY_NAX wins back.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+@pytest.mark.parametrize("codec", VNAX_CODECS)
+def test_verify_nax_yields_to_forced_levers(codec, monkeypatch):
+    w, s, _ = _setup(codec, 1000)
+    x = (mx.random.normal((6, K)) * 0.5).astype(mx.bfloat16)
+
+    def run(route=None, **env):
+        for k in ("KQ_VERIFY_MMA", "KQ_QMM_SPLITK_NAX", "KQ_VERIFY_NAX"):
+            monkeypatch.delenv(k, raising=False)
+        for k, v in env.items():
+            monkeypatch.setenv(k, v)
+        if route is None:
+            monkeypatch.delenv("KQ_QMM_ROUTE", raising=False)
+        else:
+            monkeypatch.setenv("KQ_QMM_ROUTE", route)
+        y = kq.quantized_matmul(x, w, s, codec, transpose=True)
+        mx.eval(y)
+        return y
+
+    y_nax = run("verify_nax")
+    y_mma = run("verify_mma")
+    y_sk = run("nax_splitk", KQ_QMM_SPLITK_NAX="8")
+    assert not _bits_equal(y_nax, y_mma)
+    assert not _bits_equal(y_nax, y_sk)
+    assert _bits_equal(run(KQ_VERIFY_MMA="2"), y_mma)
+    assert _bits_equal(run(KQ_VERIFY_MMA="7"), y_nax)
+    assert _bits_equal(run(KQ_QMM_SPLITK_NAX="8"), y_sk)
+    assert _bits_equal(run(KQ_QMM_SPLITK_NAX="8", KQ_VERIFY_NAX="3"), y_nax)

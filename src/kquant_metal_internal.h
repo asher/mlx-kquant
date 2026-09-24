@@ -202,6 +202,19 @@ inline int codec_verify_mma_rows(const std::string& kquant_type) {
   return 0;
 }
 
+// Codecs with a register-fed NAX verify kernel (kq_verify_nax.h) and the K
+// its loop consumes per iteration (wire blocks per iteration times the
+// block width); 0 for codecs without the kernel. NAX GPUs, M <= 8 only.
+inline int codec_verify_nax_kstep(const std::string& kquant_type) {
+  if (kquant_type == "pq2_0") {
+    return 128;
+  }
+  if (kquant_type == "q4_0") {
+    return 64;
+  }
+  return 0;
+}
+
 // quantized.cpp:133-175
 inline int get_qmv_batch_limit(int D, int O, Device& d) {
   auto arch_size = d.get_architecture().back();

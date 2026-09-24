@@ -1,8 +1,8 @@
 """Per-route timing of the small-M transpose band, one process.
 
 Source of the NAX-GPU small-M routing entries in src/kquant_matmul.cpp
-(kq_verify_mma_min_m_nax, kq_splitk_nax_min_m, kq_smallbm_policy
-route_min).
+(kq_verify_nax_min_m, kq_verify_mma_min_m_nax, kq_splitk_nax_min_m,
+kq_smallbm_policy route_min).
 
 Each arm forces one route through KQ_QMM_ROUTE, which the op reads live per
 call, so every arm shares one process and one resident copy of the
@@ -42,6 +42,7 @@ ROUTES = [
     "verify_qmv",
     "mv_ext",
     "verify_mma",
+    "verify_nax",
     "splitk",
     "nax",
     "nax_splitk",
@@ -72,6 +73,7 @@ VERIFY_QMV = {
     "ptq1_0",
 }
 VERIFY_MMA = {"pq2_0", "ptq1_0", "q4_0"}
+VERIFY_NAX = {"pq2_0": 128, "q4_0": 64}
 NO_NAX = {"mxfp4", "nvfp4"}
 
 
@@ -85,6 +87,8 @@ def applies(route, codec, M, K, nax):
         return 2 <= M <= 12
     if route == "verify_mma":
         return codec in VERIFY_MMA and M <= 8
+    if route == "verify_nax":
+        return nax and codec in VERIFY_NAX and M <= 8 and K % VERIFY_NAX[codec] == 0
     if route == "splitk":
         return codec not in NO_NAX
     if route in ("nax", "nax_splitk"):
