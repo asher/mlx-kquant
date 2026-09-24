@@ -67,6 +67,13 @@ inline int kquant_qmv_bn(const std::string& kquant_type) {
   return 8;
 }
 
+// Rows per threadgroup of the M=1 qmv_fast kernel: kquant_qmv_bn, except
+// ptq1_0, whose qmv_fast runs four rows per simdgroup
+// (KQ_PRISM_DEFINE_KERNELS FAST_RPS).
+inline int kquant_qmv_fast_bn(const std::string& kquant_type) {
+  return kquant_type == "ptq1_0" ? 8 : kquant_qmv_bn(kquant_type);
+}
+
 // quantized.cpp:63-65 (kquant branch). KQuant blocks are 32 or 256 weights.
 inline int qmv_fast_k_align() {
   return 256;

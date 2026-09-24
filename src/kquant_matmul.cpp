@@ -947,12 +947,13 @@ void qmv(
       (qmv_fine_env == 1 ||
        (qmv_fine_env != 0 && M == 1 &&
         N <= kquant_qmv_fine_max_n(kquant_type)));
-  const int rows_per_tg = use_fine ? 2 : bn;
+  const int fast_bn = kquant_qmv_fast_bn(kquant_type);
+  bool fast = (N % fast_bn == 0) && (K % qmv_fast_k_align() == 0);
+  const int rows_per_tg = use_fine ? 2 : (fast ? fast_bn : bn);
   MTL::Size group_dims(bk, 2, 1);
   MTL::Size grid_dims(M, (N + rows_per_tg - 1) / rows_per_tg, B);
 
   std::string type_string = kq_type_string(x.dtype());
-  bool fast = (N % bn == 0) && (K % qmv_fast_k_align() == 0);
   std::string kname;
   kname.reserve(64);
   mx::concatenate(

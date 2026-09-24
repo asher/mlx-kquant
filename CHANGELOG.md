@@ -14,6 +14,7 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - On NAX GPUs, `pq2_0`, `ptq1_0` and `q4_0` matmuls with 3 to 8 activation
   rows, such as speculative-decode verification, run faster.
+- `ptq1_0` matmuls with one activation row, such as plain decode, run faster.
 
 ### Fixed
 - `q4_0` matmuls with 2 to 8 activation rows no longer return inf when one
