@@ -316,6 +316,23 @@ def test_qmm_route_probe_strict(codec, route, monkeypatch):
     _sweep(codec, w, s, ref_w, 1000, ms=[8])
 
 
+# A NAX matmul whose rows fit one SG-row splits its K walk across both
+# SG-rows and sums the halves through threadgroup memory. Forced through
+# the split-K tile and the un-split tile at every width to 16, both
+# activation dtypes, aligned and ragged N. The codecs without a BM=32
+# policy run the un-split route on the BM=64 tile.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX tile only")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("route", ["nax_splitk", "nax"])
+@pytest.mark.parametrize("n_out", [1024, 1000])
+@pytest.mark.parametrize("codec", ENCODABLE + IQ)
+def test_nax_short_tile_ksplit(codec, n_out, route, dtype, monkeypatch):
+    w, s, ref_w = _setup(codec, n_out)
+    monkeypatch.setenv("KQ_QMM_ROUTE", route)
+    monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
+    _sweep(codec, w, s, ref_w, n_out, ms=range(1, 17), dtype=dtype)
+
+
 # The verify_mma entries on float16 activations (the bfloat16 sweeps above
 # cover the same widths).
 @pytest.mark.parametrize("codec", VMMA_CODECS)

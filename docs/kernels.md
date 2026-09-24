@@ -65,6 +65,14 @@ a BM=128 tile from M 193 when ceil(M/64) is even. Every floor is a measured per-
 kernel (`pq2_0`, `ptq1_0`, `q4_0`) take it through M 8 instead, as described at the end of this
 section.
 
+A NAX tile runs two rows of simdgroups. When the whole matmul has no more rows than one of them
+covers, 16 on the BM=32 tile and 32 on the BM=64 tile, the second row would multiply only padding.
+Both rows then compute the live rows, each walks half of every K step, and the two partial results
+are summed in threadgroup memory before the store. Measured on M5 Max over the 22 NAX codecs with
+the weights streamed from DRAM, the NAX split-K route runs 1.05-1.3x faster at M 8 to 16 and the
+un-split tile 1.1-1.5x faster at M 7 to 16. The short last row tile of a taller matmul keeps
+the plain walk, because the full tiles set the time there and the split measured slower.
+
 The M=1 mat-vec kernels loop over their two or four output rows with a static trip count and a
 clamped row index, so the compiler interleaves the rows' loads; the tail threadgroup recomputes its
 last row and drops it at the store. `q2_k` and `q3_k` keep the runtime bound: the static form measured no
