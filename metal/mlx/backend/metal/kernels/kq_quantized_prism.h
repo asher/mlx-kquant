@@ -1067,6 +1067,7 @@ struct KqPq2_0Mma {
   static constant constexpr int block_k = KQ_PQ2_0_SUPERBLOCK;
   static constant constexpr int block_bytes = KQ_PQ2_0_BLOCK_BYTES;
   static constant constexpr int d_offset = 0;
+  static constant constexpr float d_scale = 1.0f;
   static METAL_FUNC int perm(int f, int col) {
     return 32 * (col / 2) + 16 * (f / 8) + (f % 8) + 8 * (col & 1);
   }
@@ -1114,6 +1115,7 @@ struct KqPtq1_0Mma {
   static constant constexpr int block_k = KQ_PTQ1_0_SUPERBLOCK;
   static constant constexpr int block_bytes = KQ_PTQ1_0_BLOCK_BYTES;
   static constant constexpr int d_offset = KQ_PTQ1_0_D_OFFSET;
+  static constant constexpr float d_scale = 1.0f;
   static METAL_FUNC int perm(int f, int col) {
     if (f == 15) {
       return 120 + 2 * (col / 2) + (col & 1);

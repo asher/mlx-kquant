@@ -1255,18 +1255,6 @@ static bool kq_codec_has_mv_ext(const std::string& t) {
       t == "ptq1_0" || t == "mxfp4" || t == "nvfp4";
 }
 
-// verify_mma split count. Split-K fills the grid for the projection
-// shapes; a head-sized N already has more threadgroups than the GPU holds,
-// and there the partials only cost traffic.
-static int kq_verify_mma_splits(int N, int K, int group_size, int rows) {
-  const int nblk = K / group_size;
-  int sp = (N + rows - 1) / rows >= 1024 ? 1 : std::min(16, nblk);
-  while (sp > 1 && nblk % sp != 0) {
-    --sp;
-  }
-  return sp;
-}
-
 // Largest divisor of nblk at or under target (1 = no split).
 static int kq_split_count(int target, int nblk) {
   int sp = std::min(target, nblk);
@@ -1274,6 +1262,13 @@ static int kq_split_count(int target, int nblk) {
     --sp;
   }
   return sp;
+}
+
+// verify_mma split count. Split-K fills the grid for the projection
+// shapes; a head-sized N already has more threadgroups than the GPU holds,
+// and there the partials only cost traffic.
+static int kq_verify_mma_splits(int N, int K, int group_size, int rows) {
+  return (N + rows - 1) / rows >= 1024 ? 1 : kq_split_count(16, K / group_size);
 }
 
 // KQ_QMM_ROUTE dispatch: runs the named route when it serves the codec and
@@ -1585,34 +1580,45 @@ void KQuantMatmul::eval_gpu_base(
 
   // Probe lever: KQ_QMM_ROUTE=<route> forces one small-M route for
   // transpose, non-batched shapes with M <= 32 where the route serves the
-  // codec and shape; anything else takes the default routing below. Routes:
-  // qmv, verify_qmv, mv_ext, verify_mma, splitk, nax, nax_splitk. Read live
-  // so a route sweep shares one process (benchmarks/bench_verify_routes.py).
-  if (transpose_ && non_batched && M <= 32 && x.dtype() != mx::float32) {
+  // codec and shape; anything else takes the default routing below, or
+  // throws under KQ_QMM_ROUTE_STRICT=1 so a sweep never times the default
+  // under a forced route's name. Routes: qmv, verify_qmv, mv_ext,
+  // verify_mma, splitk, nax, nax_splitk. Read live so a route sweep shares
+  // one process (benchmarks/bench_verify_routes.py).
+  if (transpose_) {
     const char* route_e = std::getenv("KQ_QMM_ROUTE");
-    if (route_e != nullptr && route_e[0] != '\0' &&
-        kq_forced_route(
-            route_e,
-            x,
-            w,
-            scales,
-            out,
-            group_size_,
-            bits_,
-            M,
-            N,
-            K,
-            d,
-            s,
-            kquant_type_)) {
-      return;
+    if (route_e != nullptr && route_e[0] != '\0') {
+      if (non_batched && M <= 32 && x.dtype() != mx::float32 &&
+          kq_forced_route(
+              route_e,
+              x,
+              w,
+              scales,
+              out,
+              group_size_,
+              bits_,
+              M,
+              N,
+              K,
+              d,
+              s,
+              kquant_type_)) {
+        return;
+      }
+      const char* strict_e = std::getenv("KQ_QMM_ROUTE_STRICT");
+      if (strict_e != nullptr && std::atoi(strict_e) == 1) {
+        throw std::runtime_error(
+            "[mlx_kquant] KQ_QMM_ROUTE=" + std::string(route_e) +
+            " does not serve " + kquant_type_ + " at M=" + std::to_string(M) +
+            ", N=" + std::to_string(N) + ", K=" + std::to_string(K) + ".");
+      }
     }
   }
 
   // Register-resident MMA verify, from the per-device entry
   // (kq_verify_mma_min_m, kq_verify_mma_min_m_nax) through M8.
-  // KQ_VERIFY_MMA=<m> forces the entry at M >= m, 0 disables; read live
-  // so an A/B can flip arms on one generator. Decided ahead of NAX
+  // KQ_VERIFY_MMA=<m> forces the entry at M >= m, 0 or 1 disables; read
+  // live so an A/B can flip arms on one generator. Decided ahead of NAX
   // split-K, whose default entry yields to it.
   const char* vmma_e = std::getenv("KQ_VERIFY_MMA");
   const int vmma_env = vmma_e != nullptr ? std::atoi(vmma_e) : -1;
@@ -1645,12 +1651,8 @@ void KQuantMatmul::eval_gpu_base(
       x.dtype() != mx::float32) {
     const int qmm_splitk_nax_env =
         sk_nax_env > 1 ? sk_nax_env : kq_splitk_nax_target;
-    const int sliceq = std::max(group_size_, 64);
-    const int nblk = K / sliceq;
-    int sp = std::min(qmm_splitk_nax_env, nblk);
-    while (sp > 1 && nblk % sp != 0) {
-      --sp;
-    }
+    const int sp =
+        kq_split_count(qmm_splitk_nax_env, K / std::max(group_size_, 64));
     if (sp > 1) {
       qmm_nax_splitk(
           x,
@@ -1698,11 +1700,7 @@ void KQuantMatmul::eval_gpu_base(
   if (splitk_route && transpose_ && non_batched && M <= 32 &&
       kq_splitk_codec(kquant_type_)) {
     const int splitk_target = qmm_splitk_env > 1 ? qmm_splitk_env : 16;
-    const int nblk = K / group_size_;
-    int sp = std::min(splitk_target, nblk);
-    while (sp > 1 && nblk % sp != 0) {
-      --sp;
-    }
+    const int sp = kq_split_count(splitk_target, K / group_size_);
     if (sp > 1) {
       qmm_splitk(
           x,

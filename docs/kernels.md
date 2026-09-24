@@ -87,9 +87,13 @@ Tuning levers (defaults are right for normal use):
   to the NAX qmm, bypassing the mat-vec route claims, for crossover measurement below M 13. Unset
   (off) by default.
 - `KQ_QMM_ROUTE` - probe lever: forces one small-M route (`qmv`, `verify_qmv`, `mv_ext`,
-  `verify_mma`, `splitk`, `nax`, `nax_splitk`) for transpose shapes with M <= 32 where that route
-  serves the codec and shape; any other call takes the default routing. Read live per call, so
-  `benchmarks/bench_verify_routes.py` times every route in one process. Unset (off) by default.
+  `verify_mma`, `splitk`, `nax`, `nax_splitk`) for transpose, non-batched shapes with M <= 32 where
+  that route serves the codec and shape; any other call takes the default routing. Read live per
+  call, so `benchmarks/bench_verify_routes.py` times every route in one process. Unset (off) by
+  default.
+- `KQ_QMM_ROUTE_STRICT` - `1` makes a transpose call that the forced `KQ_QMM_ROUTE` cannot serve
+  raise instead of taking the default routing, so a sweep never times the default under a forced
+  route's name. Off by default.
 - `KQ_NAX_SWIZZLE` - `1` enables the row-tile traversal swizzle (folds row-tiles into grid.x for
   SLC reuse of the weight band). Falsified on M5 Max, where the M>64 band is per-threadgroup-bound
   rather than DRAM-bound; kept as a probe for future silicon. Default off.
@@ -103,30 +107,31 @@ Tuning levers (defaults are right for normal use):
 - `KQ_QMM_SPLITK` - the same lever for the plain small-M qmm, used when NAX is absent or disabled.
   Entry points come from a per-device table. K-quants, legacy quants and the IQ codecs, M <= 32.
 - `KQ_VERIFY_MMA` - the register-resident MMA verify route (below). A value of `2` or more forces
-  it at that M and above on any GPU, `0` disables it. Unset takes the per-codec entry from the
-  device's table (`kq_verify_mma_min_m` without NAX, `kq_verify_mma_min_m_nax` with it). The NAX
-  split-K default entry yields to the route, but a forced `KQ_QMM_SPLITK_NAX` takes precedence.
-  M <= 8; read live per call.
+  it at that M and above on any GPU, `0` or `1` disables it. Unset takes the per-codec entry from
+  the device's table (`kq_verify_mma_min_m` without NAX, `kq_verify_mma_min_m_nax` with it); the
+  table follows the hardware, so `KQ_DISABLE_NAX` does not change it. The NAX split-K default
+  entry yields to the route, but a forced `KQ_QMM_SPLITK_NAX` takes precedence. M <= 8; read live
+  per call.
 - `KQ_MV_EXT_SB` / `KQ_MV_EXT_NX` / `KQ_MV_EXT_HD` - `mv_ext` activation-traffic experiments:
   shuffle-broadcast (`1`), wide nxpsg (`16`/`32`), half-precision chunk dots (`1`). q6_k M 4-12
   only. `HD` measured +4-5% at M 8; the rest flat to negative on M5 Max. Kept as probes. Default
   off.
 
-`stq1_0` (structured-sparse ternary, llama.cpp PR #22836) ships the full ALU and NAX kernel set,
-but only the pre-NAX floors are measured (M3 Max: plain split-K entry M 5). Its NAX policy is
-inherited from `iq1_s` and needs M5-silicon calibration: `bm128_min_m`
-(`benchmarks/bench_qmm_bm128_ab.py`), the NAX split-K entry in `kq_splitk_nax_min_m`
-(`benchmarks/bench_verify_band_ab.py`), `kq_splitk_min_m_nax_alu`, and db64 candidacy (no `_db`
-instantiation yet). The PrismML codecs `pq2_0` and `ptq1_0` (128-wide blocks) ship the same kernel
-set. Their NAX split-K entry is measured on M5 Max at M 9, where `verify_mma` hands off. The
-`bm128_min_m` and db64 floors are still inherited from `iq1_s`. The `ptq1_0` M=1 kernel ports the fork's
-byte-owning lane layout and the exact-float base-3 coefficient collapse, so a block's payload is
-read once and each trit costs a floor and an fma. The `pq2_0` M=1 kernel masks each pair of 2-bit
-codes into the mantissas of a half2 and runs the dot as half2 fmas, two weights per instruction,
-which brings it close to the rate of a kernel that only loads the bytes. Both codecs have a
-`verify_qmv` sibling that decodes each row's block once and dots it against every activation row;
-it serves M 2 by default. On NAX GPUs it serves `pq2_0` at M 2 to 4 and `ptq1_0` at M 2, below
-their `verify_mma` entries (the `mv_ext` re-decode per row costs `ptq1_0` 3x there).
+`stq1_0` (structured-sparse ternary, llama.cpp PR #22836) ships the full ALU and NAX kernel set, but
+only the pre-NAX floors are measured (M3 Max: plain split-K entry M 5). Its NAX policy is inherited
+from `iq1_s` and needs M5-silicon calibration: `bm128_min_m` (`benchmarks/bench_qmm_bm128_ab.py`),
+the NAX split-K entry in `kq_splitk_nax_min_m` (`benchmarks/bench_verify_band_ab.py`),
+`kq_splitk_min_m_nax_alu`, and db64 candidacy (no `_db` instantiation yet). The PrismML codecs
+`pq2_0` and `ptq1_0` (128-wide blocks) ship the same kernel set. Their NAX split-K entry is measured
+on M5 Max at M 9, where `verify_mma` hands off. The `bm128_min_m` and db64 floors are still
+inherited from `iq1_s`. The `ptq1_0` M=1 kernel ports the fork's byte-owning lane layout and the
+exact-float base-3 coefficient collapse, so a block's payload is read once and each trit costs a
+floor and an fma. The `pq2_0` M=1 kernel masks each pair of 2-bit codes into the mantissas of a
+half2 and runs the dot as half2 fmas, two weights per instruction, which brings it close to the rate
+of a kernel that only loads the bytes. Both codecs have a `verify_qmv` sibling that decodes each
+row's block once and dots it against every activation row; it serves M 2 by default. On NAX GPUs it
+serves `pq2_0` at M 2 to 4 and `ptq1_0` at M 2, below their `verify_mma` entries (the `mv_ext`
+re-decode per row costs `ptq1_0` 3x there).
 
 The register-resident MMA verify kernels (`verify_mma`) serve `pq2_0`, `ptq1_0` and `q4_0` through
 M 8. Each simdgroup decodes a block of its weight rows straight into 8x8 simdgroup-matrix fragments,
@@ -135,6 +140,13 @@ and multiplies them against the activations staged once per K chunk, so the weig
 once for all M rows and the tile's threadgroup staging of the weights disappears. Split-K over the
 wire blocks feeds the same partial fold as `qmm_splitk` on the projection shapes; a head-sized N
 already fills the GPU with one split and writes the output directly.
+
+The kernels stage the activations as half and sum each block in a half accumulator, so an activation
+beyond the half range (magnitude 65504) overflows. The `pq2_0` and `ptq1_0` codes are -1, 0 and 1,
+so a block's sum overflows only when its 128 activations add up past that range. The `q4_0` kernel
+decodes its codes scaled by 1/16 and applies the 16 in the float block scale, so one channel near
+the half limit cannot overflow a block of 32 products. A float accumulator removes the limit but
+runs `pq2_0` at half speed.
 
 The entry M depends on the device. Without NAX, `pq2_0` and `ptq1_0` enter at M 3 (`pq2_0` at M 4
 on float16 activations, where `verify_qmv` holds M 3) and `q4_0` at M 2. Measured on M3 Max at the

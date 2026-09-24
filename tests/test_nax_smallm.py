@@ -268,3 +268,78 @@ def test_qmm_route_probe(codec, route, monkeypatch):
         w, s, ref_w = _iq_setup(codec, 1000)
     monkeypatch.setenv("KQ_QMM_ROUTE", route)
     _sweep(codec, w, s, ref_w, 1000, ms=[1, 2, 5, 8, 12, 16, 33])
+
+
+VMMA_CODECS = ["pq2_0", "ptq1_0", "q4_0"]
+
+
+def _setup(codec, n_out):
+    if codec in ENCODABLE:
+        return _encodable_setup(codec, n_out)
+    return _iq_setup(codec, n_out)
+
+
+def _route_serves(route, codec, m):
+    """The KQ_QMM_ROUTE guards in kq_forced_route for N 1000, K 1024."""
+    if m > 32:
+        return False
+    if route == "qmv":
+        return True
+    if route == "verify_qmv":
+        return 2 <= m <= 8
+    if route == "mv_ext":
+        return 2 <= m <= 12
+    if route == "verify_mma":
+        return codec in VMMA_CODECS and m <= 8
+    if route == "splitk":
+        return True
+    return kq.nax_available()
+
+
+# Under KQ_QMM_ROUTE_STRICT=1 a declined route raises instead of running
+# the default routing, so a served width proves the route itself ran.
+@pytest.mark.parametrize("route", QMM_ROUTES)
+@pytest.mark.parametrize("codec", ["pq2_0", "ptq1_0", "q4_0", "q4_k"])
+def test_qmm_route_probe_strict(codec, route, monkeypatch):
+    w, s, ref_w = _setup(codec, 1000)
+    monkeypatch.setenv("KQ_QMM_ROUTE", route)
+    monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
+    for m in [1, 2, 5, 8, 9, 12, 16, 33]:
+        if _route_serves(route, codec, m):
+            _sweep(codec, w, s, ref_w, 1000, ms=[m])
+        else:
+            x = mx.zeros((m, K), dtype=mx.bfloat16)
+            with pytest.raises(RuntimeError, match="does not serve"):
+                mx.eval(kq.quantized_matmul(x, w, s, codec, transpose=True))
+    # A declined call leaves the stream usable for the next one.
+    monkeypatch.delenv("KQ_QMM_ROUTE")
+    _sweep(codec, w, s, ref_w, 1000, ms=[8])
+
+
+# The verify_mma entries on float16 activations (the bfloat16 sweeps above
+# cover the same widths).
+@pytest.mark.parametrize("codec", VMMA_CODECS)
+def test_verify_mma_entries_f16(codec):
+    w, s, ref_w = _setup(codec, 1000)
+    _sweep(codec, w, s, ref_w, 1000, ms=[2, 3, 4, 5, 8, 9], dtype=mx.float16)
+
+
+# verify_mma sums each block in a half accumulator. One activation channel
+# near the top of the half range must not overflow it; q4_0 multiplies it
+# by up to 8 before the kernel's 1/16 prescale.
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("codec", VMMA_CODECS)
+def test_verify_mma_outlier_channel(codec, dtype, monkeypatch):
+    w, s, ref_w = _setup(codec, 1000)
+    monkeypatch.setenv("KQ_QMM_ROUTE", "verify_mma")
+    monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
+    for m in (2, 5, 8):
+        x = mx.random.normal((m, K)) * 0.5
+        x[:, 7] = 3.0e4
+        x = x.astype(dtype)
+        y = kq.quantized_matmul(x, w, s, codec, transpose=True).astype(mx.float32)
+        ref = x.astype(mx.float32) @ ref_w
+        mx.eval(y, ref)
+        assert bool(mx.isfinite(y).all()), f"{codec} M{m}: non-finite output"
+        err = float((mx.abs(y - ref)).max() / (mx.abs(ref).max() + 1e-6))
+        assert err < 2e-2, f"{codec} M{m}: rel err {err:.3e}"

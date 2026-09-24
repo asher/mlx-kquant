@@ -757,11 +757,14 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
 // Register-resident MMA verify (kq_verify_mma.h). Lane L owns bytes
 // 4L..4L+3 of qs: fragments (n0, n2), (n1, n3), (h0, h2), (h1, h3) of
 // its four low and four high nibbles, each pair masked into the
-// mantissas of a half2 (1024 + q) and offset by 1032 = 1024 + 8.
+// mantissas of a half2 (1024 + q) and mapped by one fma to (q - 8) / 16,
+// exact in half. The 1/16 keeps a block of 32 products inside half range
+// for activations up to the half limit; d_scale restores it.
 struct KqQ4_0Mma {
   static constant constexpr int block_k = KQ_Q4_0_GROUP;
   static constant constexpr int block_bytes = KQ_Q4_0_BLOCK_BYTES;
   static constant constexpr int d_offset = KQ_Q4_0_D_OFFSET;
+  static constant constexpr float d_scale = 16.0f;
   static METAL_FUNC int perm(int f, int col) {
     return 16 * ((f % 4) >> 1) + 4 * (col / 2) + (f & 1) + 2 * (col & 1);
   }
@@ -787,7 +790,9 @@ struct KqQ4_0Mma {
       for (short t = 0; t < NT; ++t) {
         const uint src = (f < 2 ? lo[t] : hi[t]) >> (8 * (f & 1));
         a[t] =
-            as_type<half2>((src & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
+            fma(as_type<half2>((src & 0x000F000Fu) | 0x64006400u),
+                half2(1.0h / 16.0h),
+                half2(-64.5h));
       }
       kq_vmma_step<NT>(xb + 8 * perm(f, fm), a, acc);
     }

@@ -7,12 +7,17 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- `KQ_QMM_ROUTE` probe lever and `benchmarks/bench_verify_routes.py`, which
-  time every small-M route of a codec in one process.
+- `KQ_QMM_ROUTE` and `KQ_QMM_ROUTE_STRICT` probe levers and
+  `benchmarks/bench_verify_routes.py`, which time every small-M route of a
+  codec in one process.
 
 ### Changed
-- On NAX GPUs, speculative decode on `pq2_0`, `ptq1_0` and `q4_0` targets
-  verifies drafts on the register-resident MMA kernels and runs faster.
+- On NAX GPUs, `pq2_0`, `ptq1_0` and `q4_0` matmuls with 3 to 8 activation
+  rows, such as speculative-decode verification, run faster.
+
+### Fixed
+- `q4_0` matmuls with 2 to 8 activation rows no longer return inf when one
+  activation channel exceeds about 8000.
 
 ## [0.4.13]
 

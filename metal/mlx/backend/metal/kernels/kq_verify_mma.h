@@ -8,7 +8,9 @@
 // (rows k, cols m) in threadgroup memory in natural k order, and one
 // simdgroup_multiply_accumulate per fragment accumulates D (rows n, cols
 // m). The per-block accumulator is half; the block scale is applied to it
-// in float. Split-K over grid z writes T partials that
+// in float. A codec whose code magnitudes could carry a block's sum out of
+// half range decodes scaled-down codes and restores the factor through
+// d_scale. Split-K over grid z writes T partials that
 // kquant_qmm_splitk_accum folds.
 //
 // The k order inside a block is a fixed per-codec permutation
@@ -19,7 +21,7 @@
 // columns fn = (l/4 & 2) * 2 + (l % 2) * 2, fn + 1 of every operand.
 //
 // Codec contract:
-//   block_k, block_bytes, d_offset
+//   block_k, block_bytes, d_offset, d_scale (factor on the block scale)
 //   perm(f, col): element index of fragment f (0..block_k/8-1), column col
 //   block<NT>(rows, boff, L, fm, xb, acc): decode block boff of each row
 //     and accumulate its block_k/8 fragments; L = fn / 2 is the lane's
@@ -103,7 +105,7 @@ METAL_FUNC void kq_verify_mma_impl(
       }
       Codec::template block<NT>(rows, boff, L, fm, xb, acc);
       for (short t = 0; t < NT; ++t) {
-        const float d =
+        const float d = Codec::d_scale *
             float(*(const device half*)(rows.p[t] + boff + Codec::d_offset));
         c[t] += d *
             float2(reinterpret_cast<thread half2&>(acc[t].thread_elements()));
