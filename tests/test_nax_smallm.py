@@ -39,11 +39,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 K = 1024
-# Every routing seam: mv tail (2, 6), per-codec qmm crossover (7-10),
-# NAX BM=32 body/edges (12, 13, 16, 24, 31, 32), BM=64 handoff (33, 64).
-# The _db double-buffered variant of the 33-64 band is N-gated far above
-# these widths; test_db64_band_dispatch covers it at the policy floors.
-MS = [2, 6, 7, 8, 9, 10, 12, 13, 16, 24, 31, 32, 33, 48, 64]
+# Every routing seam: mv tail (2, 6), verify_mma entries (3, 5) and
+# their mat-vec neighbour (4), per-codec qmm crossover (7-10), NAX BM=32
+# body/edges (12, 13, 16, 24, 31, 32), BM=64 handoff (33, 64). The _db
+# double-buffered variant of the 33-64 band is N-gated far above these
+# widths; test_db64_band_dispatch covers it at the policy floors.
+MS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 16, 24, 31, 32, 33, 48, 64]
 
 # BM=128 band: every entry has even ceil(M/64). M224/256 dispatch the
 # tile for the 193 tier only (q6_k plus the IQ grid codecs); M512 adds
@@ -241,3 +242,29 @@ def test_verify_mma_default_matches_forced(codec, monkeypatch):
         / (mx.abs(y_off.astype(mx.float32)).max() + 1e-6)
     )
     assert err < 2e-2, f"{codec}: forced vs off rel err {err:.3e}"
+
+
+# KQ_QMM_ROUTE forces one small-M route per call (the probe behind
+# benchmarks/bench_verify_routes.py). Every route either serves the call
+# or declines it to the default routing, so each must hold the numeric
+# contract at every width it can see, including the widths it declines.
+QMM_ROUTES = [
+    "qmv",
+    "verify_qmv",
+    "mv_ext",
+    "verify_mma",
+    "splitk",
+    "nax",
+    "nax_splitk",
+]
+
+
+@pytest.mark.parametrize("route", QMM_ROUTES)
+@pytest.mark.parametrize("codec", ["pq2_0", "ptq1_0", "q4_0", "q4_k"])
+def test_qmm_route_probe(codec, route, monkeypatch):
+    if codec in ENCODABLE:
+        w, s, ref_w = _encodable_setup(codec, 1000)
+    else:
+        w, s, ref_w = _iq_setup(codec, 1000)
+    monkeypatch.setenv("KQ_QMM_ROUTE", route)
+    _sweep(codec, w, s, ref_w, 1000, ms=[1, 2, 5, 8, 12, 16, 33])

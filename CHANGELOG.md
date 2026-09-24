@@ -6,6 +6,14 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `KQ_QMM_ROUTE` probe lever and `benchmarks/bench_verify_routes.py`, which
+  time every small-M route of a codec in one process.
+
+### Changed
+- On NAX GPUs, speculative decode on `pq2_0`, `ptq1_0` and `q4_0` targets
+  verifies drafts on the register-resident MMA kernels and runs faster.
+
 ## [0.4.13]
 
 ### Added
