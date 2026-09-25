@@ -323,13 +323,20 @@ static int kq_verify_mma_min_m_nax(const std::string& t) {
 // the lowest M from which the kernel is within 1.03x of the route it
 // displaces at every larger M on every Qwen3.8-27B projection and head
 // shape (M5 Max, bf16). q8_0 at M 5 is faster over a forward but 1.05x
-// slower at N 6144, K 5120. q4_0 holds M 3 on both of its kernels.
-static int kq_verify_nax_min_m(const std::string& t) {
+// slower at N 6144, K 5120. q4_0 holds M 3 on both of its kernels. q6_k
+// enters at M 5 (at M 4 it ran up to 1.04x slower than mv_ext on
+// bfloat16 and up to 1.08x on float16), and at M 3 on a vocab head (N >=
+// 100000, as in kq_smallm_route_min), where mv_ext decays with N and the
+// kernel ran 1.09-1.16x faster at M 3.
+static int kq_verify_nax_min_m(const std::string& t, int N) {
   if (t == "pq2_0" || t == "q4_0" || t == "q4_k" || t == "q5_k") {
     return 3;
   }
   if (t == "q8_0") {
     return 6;
+  }
+  if (t == "q6_k") {
+    return N >= 100000 ? 3 : 5;
   }
   return 0;
 }
@@ -372,12 +379,12 @@ static int kq_splitk_min_m(const std::string& t) {
 // env lever only). The un-split BM=32 grid is ceil(N/64) threadgroups
 // with a serial in-tile K walk, and split-K multiplies the threadgroup
 // count. Between qmv and split-K, the verify routes (verify_nax for
-// pq2_0, q4_0, q8_0, q4_k and q5_k, verify_mma for ptq1_0) keep their own
-// entries through M 8, so those codecs' split-K entries take only the
-// widths above M 8 and the calls verify_nax declines. Other codecs run the
-// mat-vec kernels (mv_ext, verify_qmv) there, or the BM=32 tile from
-// kq_smallm_route_min where that sits below the split-K entry (q6_k at
-// vocab-head N, M 8).
+// pq2_0, q4_0, q8_0, q4_k, q5_k and q6_k, verify_mma for ptq1_0) keep
+// their own entries through M 8, so those codecs' split-K entries take
+// only the widths above M 8 and the calls verify_nax declines. Other
+// codecs run the mat-vec kernels (mv_ext, verify_qmv) there, or the BM=32
+// tile from kq_smallm_route_min where that sits below the split-K entry
+// (q6_k at vocab-head N, M 8, on the calls verify_nax declines).
 //
 // Fitted on M5 Max to the fastest route per cell over 22 codecs and 14
 // shapes (N 256-17408, K 2048-17408), M 2-12 on the projection shapes
@@ -916,19 +923,20 @@ static int kq_verify_nax_call_kstep(int K, const std::string& t) {
   return codec_verify_nax_kstep(t);
 }
 
-// verify_nax serves a K of whole steps from an aligned weight base. The
-// q8_0 and eight-block q4_0 kernels read their weights as 4-byte words
-// and the q4_k and q5_k kernels as 16-byte words, and a zero-copy GGUF
-// tensor or an offset view can start off that alignment, so such a call
-// declines. The 4-byte check applies to every other codec of the route
-// too. The q5_k step is half a superblock, but its kernel reads
-// whole superblocks, so q5_k also needs K in whole superblocks. Rows of
-// such a K stay aligned with the base.
+// verify_nax serves a K of whole steps from an aligned weight base. A
+// zero-copy GGUF tensor or an offset view can start off that alignment,
+// so such a call declines. The q4_k and q5_k kernels read 16-byte words
+// and the q6_k kernel 2-byte words, since every other 210-byte superblock
+// starts 2 mod 4. The other codecs take a 4-byte check, which the q8_0
+// and eight-block q4_0 kernels need for their 4-byte words. The K-quant
+// kernels also need K in whole superblocks, since the q5_k and q6_k steps
+// are half of one. Rows of such a K stay aligned with the base.
 static bool
 kq_verify_nax_fits(const array& w, int K, int kstep, const std::string& t) {
   const bool kq = t == "q4_k" || t == "q5_k";
-  const uintptr_t align = kq ? 15 : 3;
-  return kstep > 0 && K % (kq ? 256 : kstep) == 0 &&
+  const bool sb = kq || t == "q6_k";
+  const uintptr_t align = kq ? 15 : t == "q6_k" ? 1 : 3;
+  return kstep > 0 && K % (sb ? 256 : kstep) == 0 &&
       (reinterpret_cast<uintptr_t>(w.data<uint8_t>()) & align) == 0;
 }
 
@@ -1542,11 +1550,28 @@ static int kq_verify_mma_splits(int N, int K, int group_size, int rows) {
 // simdgroups: grids just past that (N 12288 at 2 splits, N 6144 at 4) ran
 // 1.1x slower than the smaller grid on M5 Max.
 // The count is the largest divisor of the K steps at or under the target,
-// at most 16. KQ_VERIFY_NAX_SPLITS=<n> replaces the target (probe lever).
+// at most 16. q6_k instead targets about 1280 simdgroups and a K walk of
+// at most 2560, and takes the smallest divisor at or above that, or the
+// largest under it when no divisor up to 16 reaches it. Its grids of about
+// 768 simdgroups (N 12288 at 2 splits, N 6144 at 4) ran 1.10-1.15x slower
+// than grids of 1280 to 1536 on M5 Max, and the vocab head at 1 split
+// 1.06-1.07x slower than at 2. KQ_VERIFY_NAX_SPLITS=<n> replaces the
+// target (probe lever).
 static int kq_verify_nax_splits(int N, int K, int kstep, const std::string& t) {
   const char* e = std::getenv("KQ_VERIFY_NAX_SPLITS");
   const int env = e != nullptr ? std::atoi(e) : 0;
   const int sgs = (N + 31) / 32;
+  if (t == "q6_k" && env <= 0) {
+    const int steps = K / kstep;
+    const int want =
+        std::min(16, std::max((1280 + sgs - 1) / sgs, (K + 2559) / 2560));
+    for (int sp = want; sp <= std::min(16, steps); ++sp) {
+      if (steps % sp == 0) {
+        return sp;
+      }
+    }
+    return kq_split_count(want, steps);
+  }
   int target = (600 + sgs - 1) / sgs;
   if (t == "q4_0" && kstep == 64) {
     target = std::max(target, (K + 639) / 640);
@@ -1971,7 +1996,7 @@ void KQuantMatmul::eval_gpu_base(
         sk_force >= 1;
     int vnax_min_m = vnax_env;
     if (vnax_env == -1) {
-      vnax_min_m = other_forced ? 0 : kq_verify_nax_min_m(kquant_type_);
+      vnax_min_m = other_forced ? 0 : kq_verify_nax_min_m(kquant_type_, N);
     }
     if (vnax_min_m > 0 && M >= vnax_min_m &&
         kq_verify_nax_fits(w, K, kstep, kquant_type_)) {
