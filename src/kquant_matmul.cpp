@@ -11,6 +11,7 @@
 // the KQuantQmvBias primitive below (qmv_bias), which reuses this file's qmv
 // dispatch helpers.
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -322,7 +323,7 @@ static int kq_verify_mma_min_m_nax(const std::string& t) {
 // the lowest M from which the kernel is within 1.03x of the route it
 // displaces at every larger M on every Qwen3.8-27B projection and head
 // shape (M5 Max, bf16). q8_0 at M 5 is faster over a forward but 1.05x
-// at N 6144, K 5120.
+// slower at N 6144, K 5120.
 static int kq_verify_nax_min_m(const std::string& t) {
   if (t == "pq2_0" || t == "q4_0") {
     return 3;
@@ -371,11 +372,12 @@ static int kq_splitk_min_m(const std::string& t) {
 // env lever only). The un-split BM=32 grid is ceil(N/64) threadgroups
 // with a serial in-tile K walk, and split-K multiplies the threadgroup
 // count. Between qmv and split-K, the verify routes (verify_nax for
-// pq2_0 and q4_0, verify_mma for ptq1_0) keep their own entries through
-// M 8, so those codecs' split-K entries only take the widths above M 8.
-// Other codecs run the mat-vec kernels (mv_ext, verify_qmv) there, or
-// the BM=32 tile from kq_smallm_route_min where that sits below the
-// split-K entry (q6_k at vocab-head N, M 8).
+// pq2_0, q4_0 and q8_0, verify_mma for ptq1_0) keep their own entries
+// through M 8, so those codecs' split-K entries take only the widths
+// above M 8 and the q8_0 calls verify_nax declines. Other codecs run the
+// mat-vec kernels (mv_ext, verify_qmv) there, or the BM=32 tile from
+// kq_smallm_route_min where that sits below the split-K entry (q6_k at
+// vocab-head N, M 8).
 //
 // Fitted on M5 Max to the fastest route per cell over 22 codecs and 14
 // shapes (N 256-17408, K 2048-17408), M 2-12 on the projection shapes
@@ -388,7 +390,9 @@ static int kq_splitk_min_m(const std::string& t) {
 // the projection shapes, up to 9x at N 256, where the BM=32 tile ran),
 // iq2_xs and iq2_s at M 8-12 (2.1-2.2x), and qmv at M 2 on N <= 1024
 // (1.1-3x). Above N 1024, iq2_xxs keeps the mat-vec kernels through
-// M 12, where its split-K tile runs 1.2-3.6x slower.
+// M 12, where its split-K tile runs 1.2-3.6x slower. These figures cover
+// the table's own routes. verify_nax takes its band from them where it
+// measured faster.
 struct KqNaxSmallM {
   int qmv_m[4];
   int splitk_small;
@@ -399,7 +403,8 @@ static KqNaxSmallM kq_nax_small_m(const std::string& t) {
     return {{7, 2, 1, 1}, 8, 9};
   }
   if (t == "q8_0") {
-    return {{7, 6, 2, 1}, 2, 7};
+    // qmv stops at M 5 for N <= 1024, where verify_nax is faster from M 6.
+    return {{7, 5, 2, 1}, 2, 7};
   }
   if (t == "q4_k") {
     return {{8, 5, 4, 2}, 2, 5};
@@ -895,6 +900,15 @@ void verify_mma(
   MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
   MTL::Size agroup(256, 1, 1);
   ce.dispatch_threads(agrid, agroup);
+}
+
+// verify_nax serves a K of whole steps from a 4-byte aligned weight base.
+// The q8_0 kernel reads its weights as 4-byte words, and a zero-copy GGUF
+// tensor or an offset view can start 2 mod 4, so such a call declines.
+// Whole rows of a K the other codecs step through stay aligned with it.
+static bool kq_verify_nax_fits(const array& w, int K, int kstep) {
+  return kstep > 0 && K % kstep == 0 &&
+      (reinterpret_cast<uintptr_t>(w.data<uint8_t>()) & 3) == 0;
 }
 
 // Register-fed NAX verify for M <= 8 (kq_verify_nax.h): each simdgroup
@@ -1564,8 +1578,8 @@ bool kq_forced_route(
   }
   if (r == "verify_nax") {
     const int kstep = codec_verify_nax_kstep(t);
-    if (kq_is_nax_available() && codec_has_nax(t) && kstep > 0 && M <= 8 &&
-        K % kstep == 0) {
+    if (kq_is_nax_available() && codec_has_nax(t) && M <= 8 &&
+        kq_verify_nax_fits(w, K, kstep)) {
       const int sp = kq_verify_nax_splits(N, K, kstep, t);
       verify_nax(x, w, scales, out, group_size, bits, M, N, K, sp, d, s, t);
       return true;
@@ -1928,7 +1942,7 @@ void KQuantMatmul::eval_gpu_base(
     if (vnax_env == -1) {
       vnax_min_m = other_forced ? 0 : kq_verify_nax_min_m(kquant_type_);
     }
-    if (kstep > 0 && vnax_min_m > 0 && M >= vnax_min_m && K % kstep == 0) {
+    if (vnax_min_m > 0 && M >= vnax_min_m && kq_verify_nax_fits(w, K, kstep)) {
       const int sp = kq_verify_nax_splits(N, K, kstep, kquant_type_);
       verify_nax(
           x,

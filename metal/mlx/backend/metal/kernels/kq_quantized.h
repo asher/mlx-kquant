@@ -1989,8 +1989,8 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
 // has its sign bits flipped and is masked into the mantissas of a half2
 // (1024 + 128 + q), which one fma maps to q / 256, exact in half. The
 // 1/256 keeps every product within half its activation, so one channel
-// near the top of the half range stays finite in the block sum; d_scale
-// restores it.
+// near the top of the half range stays finite in the block sum, and
+// d_scale restores the factor.
 struct KqQ8_0Mma {
   static constant constexpr int block_k = KQ_Q8_0_GROUP;
   static constant constexpr int block_bytes = KQ_Q8_0_BLOCK_BYTES;

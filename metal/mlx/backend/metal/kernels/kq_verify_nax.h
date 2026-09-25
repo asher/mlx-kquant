@@ -9,27 +9,28 @@
 //
 // Each of the 4 simdgroups owns 32 weight rows. Lane (fm, q) of the
 // matmul2d 16x32x16 fragment holds rows fm + 8r (r < 4) of the right
-// operand and decodes lane-quad q's bytes of each block of those rows
+// operand and decodes lane-quad q's bytes of each unit of those rows
 // straight into it. The left operand is activation rows 0..7, with rows
-// 8..15 as padding, loaded from device memory per block in the codec's k
+// 8..15 as padding, loaded from device memory per unit in the codec's k
 // order. Nothing is staged in threadgroup memory and there are no
 // barriers. Each simdgroup keeps one f32 accumulator. Split-K over grid z
 // writes T partials that kquant_qmm_splitk_accum folds.
 //
-// A unit is one or more wire blocks. For pq2_0 and q4_0, step s of a unit
-// consumes the codec's verify_mma fragments 2s and 2s + 1
-// (kq_verify_mma.h), and left element 2 jp + e is the activation at that
-// codec's perm(2s + jp, 2q + e). The q8_0 unit is four wire blocks with
-// its own order (KqQ8_0Nax). The block scale is folded into the half
-// weights. Device loads and NAX ops of one simdgroup do not overlap, so
-// occupancy hides the loads and the host sizes the split count for it
-// (kq_verify_nax_splits). pq2_0 and q4_0 load a unit's activation steps
-// ahead of its NAX ops, and q8_0, whose Words are larger, loads one step
-// at a time; each order measured faster for its codecs on M5 Max. The
-// right operand is written in element order, which ran 1.6x faster than
-// a strided order.
+// A unit is one or more wire blocks, and step s of a unit is its s-th
+// 16-wide NAX op. For pq2_0 and q4_0, step s consumes the codec's
+// verify_mma fragments 2s and 2s + 1 (kq_verify_mma.h), and left element
+// 2 jp + e is the activation at that codec's perm(2s + jp, 2q + e). The
+// q8_0 unit is four wire blocks with its own order (KqQ8_0Nax). The block
+// scale is folded into the half weights. Device loads and NAX ops of one
+// simdgroup do not overlap, so occupancy hides the loads and the host
+// sizes the split count for it (kq_verify_nax_splits). pq2_0 and q4_0
+// load a unit's activation steps ahead of its NAX ops. q8_0, whose Words
+// are larger, loads one step at a time. Each order measured faster for
+// its codecs on M5 Max. The right operand is written in element order,
+// which ran 1.6x faster than a strided order.
 //
 // Codec contract (KqXxxNax):
+//   group: the wire block's weights, the kernel's group_size
 //   block_k, block_bytes: the unit's weights and bytes
 //   ub: units per loop iteration
 //   x_ahead: load the iteration's activation steps before its NAX ops
@@ -44,6 +45,7 @@ MLX_MTL_CONST int KQ_VNAX_NSG = 4;
 // PQ2_0: lane-quad q owns the two 16-code words at qs bytes 8q..8q+7.
 // Pair f is code f % 8 of word f / 8 in each half (KqPq2_0Mma).
 struct KqPq2_0Nax {
+  static constant constexpr int group = KQ_PQ2_0_SUPERBLOCK;
   static constant constexpr int block_k = KQ_PQ2_0_SUPERBLOCK;
   static constant constexpr int block_bytes = KQ_PQ2_0_BLOCK_BYTES;
   static constant constexpr int ub = 1;
@@ -88,6 +90,7 @@ struct KqPq2_0Nax {
 // 1024 + code in the half mantissa, minus 1032, times d. Two 32-weight
 // blocks per iteration.
 struct KqQ4_0Nax {
+  static constant constexpr int group = KQ_Q4_0_GROUP;
   static constant constexpr int block_k = KQ_Q4_0_GROUP;
   static constant constexpr int block_bytes = KQ_Q4_0_BLOCK_BYTES;
   static constant constexpr int ub = 2;
@@ -124,10 +127,13 @@ struct KqQ4_0Nax {
 // lane-quad q owns block q of it, so a lane's loads run along one row.
 // The qs bytes are read as aligned words, with a 2-byte funnel shift for
 // the blocks whose qs start 2 mod 4, so a row's bytes must start 4-byte
-// aligned (whole rows of a K that is a multiple of 128). Step s takes
-// word s: pairs (b0, b2), (b1, b3), sign bits flipped, as 1152 + code in
-// the half mantissa, minus 1152, times d.
+// aligned: whole rows of a K that is a multiple of 128, from a weight
+// base the host checks. A block without the shift reads word 7 again in
+// place of word 8, so no load leaves the unit. Step s takes word s: pairs
+// (b0, b2), (b1, b3), sign bits flipped, as 1152 + code in the half
+// mantissa, minus 1152, times d.
 struct KqQ8_0Nax {
+  static constant constexpr int group = KQ_Q8_0_GROUP;
   static constant constexpr int block_k = 4 * KQ_Q8_0_GROUP;
   static constant constexpr int block_bytes = 4 * KQ_Q8_0_BLOCK_BYTES;
   static constant constexpr int ub = 1;
@@ -147,7 +153,7 @@ struct KqQ8_0Nax {
     for (short i = 0; i < 8; ++i) {
       t[i] = wp[i];
     }
-    t[8] = sh ? wp[8] : 0u;
+    t[8] = wp[sh ? 8 : 7];
     for (short i = 0; i < 8; ++i) {
       o.w[i] = sh ? ((t[i] >> 16) | (t[i + 1] << 16)) : t[i];
     }
@@ -288,33 +294,33 @@ METAL_FUNC void kq_verify_nax_impl(
 
 // Entry point: qmm_t_splitk's buffer layout, grid (ceil(N / 128), 1,
 // splits), 128 threads.
-#define KQ_DEFINE_VERIFY_NAX_KERNEL(CODEC, TRAITS)                    \
-  template <typename T, int group_size, int bits>                     \
-  [[kernel]] void kq_##CODEC##_verify_nax(                            \
-      const device uint8_t* w,                                        \
-      const device uint8_t* /* scales */,                             \
-      const device T* x,                                              \
-      device T* y,                                                    \
-      const constant int& K,                                          \
-      const constant int& N,                                          \
-      const constant int& M,                                          \
-      const constant int& k_partition_size,                           \
-      const constant int& split_k_partition_stride,                   \
-      uint3 tid [[threadgroup_position_in_grid]],                     \
-      uint simd_gid [[simdgroup_index_in_threadgroup]],               \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                  \
-    static_assert(TRAITS::block_k % group_size == 0, #CODEC " unit"); \
-    kq_verify_nax_impl<T, TRAITS>(                                    \
-        w,                                                            \
-        x,                                                            \
-        y + tid.z * static_cast<int64_t>(split_k_partition_stride),   \
-        K,                                                            \
-        N,                                                            \
-        M,                                                            \
-        k_partition_size,                                             \
-        tid,                                                          \
-        simd_gid,                                                     \
-        simd_lid);                                                    \
+#define KQ_DEFINE_VERIFY_NAX_KERNEL(CODEC, TRAITS)                     \
+  template <typename T, int group_size, int bits>                      \
+  [[kernel]] void kq_##CODEC##_verify_nax(                             \
+      const device uint8_t* w,                                         \
+      const device uint8_t* /* scales */,                              \
+      const device T* x,                                               \
+      device T* y,                                                     \
+      const constant int& K,                                           \
+      const constant int& N,                                           \
+      const constant int& M,                                           \
+      const constant int& k_partition_size,                            \
+      const constant int& split_k_partition_stride,                    \
+      uint3 tid [[threadgroup_position_in_grid]],                      \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                   \
+    static_assert(group_size == TRAITS::group, #CODEC " block width"); \
+    kq_verify_nax_impl<T, TRAITS>(                                     \
+        w,                                                             \
+        x,                                                             \
+        y + tid.z * static_cast<int64_t>(split_k_partition_stride),    \
+        K,                                                             \
+        N,                                                             \
+        M,                                                             \
+        k_partition_size,                                              \
+        tid,                                                           \
+        simd_gid,                                                      \
+        simd_lid);                                                     \
   }
 
 KQ_DEFINE_VERIFY_NAX_KERNEL(pq2_0, KqPq2_0Nax)
