@@ -208,7 +208,7 @@ def test_alu_splitk_band_iq(codec, nax_off):
 # at every row count and both activation dtypes it is instantiated for,
 # on an aligned and a ragged N (the row clamp past N). K=1000 blocks the
 # route (the codecs need a whole number of wire blocks), so K stays 1024.
-VERIFY_MMA_CODECS = ["pq2_0", "ptq1_0", "q4_0"]
+VERIFY_MMA_CODECS = ["pq2_0", "ptq1_0", "q4_0", "q8_0"]
 VERIFY_MMA_MS = [2, 3, 4, 5, 6, 7, 8]
 
 
@@ -253,7 +253,7 @@ def test_verify_mma_band(codec, n_out, dtype, verify_mma_forced):
 def test_verify_mma_ragged_chunk(codec, verify_mma_forced):
     # 2176 = 17 blocks of 128: one split of 4 full 512-wide chunks plus a
     # 128-wide tail for the Prism codecs, and 4 splits of 512 + 32 for
-    # q4_0, so the partial-chunk path runs on both block widths.
+    # q4_0 and q8_0, so the partial-chunk path runs on both block widths.
     k = 2176
     w, s, ref_w = _verify_mma_setup(codec, 1000, k=k)
     _sweep(codec, w, s, ref_w, 1000, ms=[2, 8], k=k)
@@ -309,8 +309,10 @@ def test_qmm_route_probe(codec, route, monkeypatch):
     _sweep(codec, w, s, ref_w, 1000, ms=[1, 2, 5, 8, 12, 16, 33])
 
 
-VMMA_CODECS = ["pq2_0", "ptq1_0", "q4_0"]
-VNAX_CODECS = ["pq2_0", "q4_0"]
+VMMA_CODECS = ["pq2_0", "ptq1_0", "q4_0", "q8_0"]
+# verify_nax entries on NAX GPUs (kq_verify_nax_min_m).
+VNAX_ENTRY = {"pq2_0": 3, "q4_0": 3, "q8_0": 6}
+VNAX_CODECS = list(VNAX_ENTRY)
 
 
 def _setup(codec, n_out):
@@ -470,8 +472,8 @@ def test_verify_mma_outlier_channel(codec, dtype, monkeypatch):
         assert err < 2e-2, f"{codec} M{m}: rel err {err:.3e}"
 
 
-# The register-fed NAX verify route (verify_nax) serves pq2_0 and q4_0
-# through M 8 on NAX GPUs. Forced at every width it serves, both
+# The register-fed NAX verify route (verify_nax) serves pq2_0, q4_0 and
+# q8_0 through M 8 on NAX GPUs. Forced at every width it serves, both
 # activation dtypes, aligned and ragged N (the row clamp in the last
 # simdgroup's 32 rows).
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
@@ -485,10 +487,10 @@ def test_verify_nax_band(codec, n_out, dtype, monkeypatch):
     _sweep(codec, w, s, ref_w, n_out, ms=range(1, 9), dtype=dtype)
 
 
-# Split counts across the K walk. K 2176 is 17 pq2_0 blocks (no split
-# divides it) and 34 q4_0 steps of 64, K 1920 is 15 and 30 steps (odd
-# counts 3 and 5), K 4096 is 32 and 64. The forced counts cover the
-# partial fold wherever they divide the steps.
+# Split counts across the K walk. K 2176 is 17 steps of 128 for pq2_0 and
+# q8_0 (no split divides it) and 34 q4_0 steps of 64, K 1920 is 15 and 30
+# steps (odd counts 3 and 5), K 4096 is 32 and 64. The forced counts cover
+# the partial fold wherever they divide the steps.
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("splits", ["", "2", "3", "4", "5", "8"])
@@ -564,10 +566,11 @@ def _bits_equal(a, b):
 # The default route dispatches verify_nax from its entry, and
 # KQ_VERIFY_NAX moves the entry both ways: the default output is
 # bit-identical to the forced kernel it should run and differs from the
-# other, and the two agree to the output rounding. The route is chosen
-# when the graph evaluates, so each output evaluates under its own
-# environment. Per-row qmv claims these widths at N 1000 by default, so
-# it is off here.
+# other, and the two agree to the output rounding. With verify_nax off,
+# pq2_0 and q4_0 fall back to verify_mma at M 8 and q8_0 to NAX split-K.
+# The route is chosen when the graph evaluates, so each output evaluates
+# under its own environment. Per-row qmv claims these widths at N 1000 by
+# default, so it is off here.
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("codec", VNAX_CODECS)
@@ -585,13 +588,14 @@ def test_verify_nax_default_dispatch(codec, dtype, monkeypatch):
         monkeypatch.delenv("KQ_QMM_ROUTE", raising=False)
         return y
 
+    e = VNAX_ENTRY[codec]
     cases = [
-        (2, None, None),
-        (3, None, "nax"),
-        (5, None, "nax"),
+        (e - 1, None, None),
+        (e, None, "nax"),
+        ((e + 8) // 2, None, "nax"),
         (8, None, "nax"),
         (2, "2", "nax"),
-        (8, "0", "mma"),
+        (8, "0", "mma" if VMMA_NAX_FALLBACK.get(codec, 9) <= 8 else None),
     ]
     for m, entry, expect in cases:
         if entry is None:
@@ -620,7 +624,8 @@ def test_verify_nax_default_dispatch(codec, dtype, monkeypatch):
 def test_verify_nax_yields_to_forced_levers(codec, monkeypatch):
     monkeypatch.setenv("KQ_NAX_QMV", "0")
     w, s, _ = _setup(codec, 1000)
-    x = (mx.random.normal((6, K)) * 0.5).astype(mx.bfloat16)
+    m = max(6, VNAX_ENTRY[codec])
+    x = (mx.random.normal((m, K)) * 0.5).astype(mx.bfloat16)
 
     def run(route=None, **env):
         for k in ("KQ_VERIFY_MMA", "KQ_QMM_SPLITK_NAX", "KQ_VERIFY_NAX"):
@@ -641,7 +646,7 @@ def test_verify_nax_yields_to_forced_levers(codec, monkeypatch):
     assert not _bits_equal(y_nax, y_mma)
     assert not _bits_equal(y_nax, y_sk)
     assert _bits_equal(run(KQ_VERIFY_MMA="2"), y_mma)
-    assert _bits_equal(run(KQ_VERIFY_MMA="7"), y_nax)
+    assert _bits_equal(run(KQ_VERIFY_MMA=str(m + 1)), y_nax)
     assert _bits_equal(run(KQ_QMM_SPLITK_NAX="8"), y_sk)
     assert _bits_equal(run(KQ_QMM_SPLITK_NAX="8", KQ_VERIFY_NAX="3"), y_nax)
 
@@ -660,9 +665,11 @@ NAX_SMALL_M = {
     "iq2_xxs": ((8, 5, 2, 1), 9, 13),
 }
 # verify_mma entries on NAX GPUs (kq_verify_mma_min_m_nax) for the codecs
-# verify_nax does not serve, and the qmv rows per threadgroup of the two
-# codecs whose M 2 mat-vec route is verify_qmv.
+# verify_nax does not serve, the entries of those it does serve (the route
+# with verify_nax off), and the qmv rows per threadgroup of the two codecs
+# whose M 2 mat-vec route is verify_qmv.
 VMMA_NAX_ENTRY = {"ptq1_0": 3}
+VMMA_NAX_FALLBACK = {"pq2_0": 5, "q4_0": 5}
 QMV_BN = {"q4_k": 4, "q8_0": 8}
 # Per-row qmv, mv_ext and verify_qmv dot the exact weights in float32 and
 # agree bit for bit on most codecs, so a pin cannot tell them apart. The
@@ -678,7 +685,7 @@ def _nax_default_route(codec, n, m, qmv=True):
     b = 0 if n <= 512 else 1 if n <= 1024 else 2 if n <= 2048 else 3
     if qmv and m <= qmv_m[b]:
         return "qmv"
-    if codec in VNAX_CODECS and 3 <= m <= 8:
+    if VNAX_ENTRY.get(codec, 9) <= m <= 8:
         return "verify_nax"
     if VMMA_NAX_ENTRY.get(codec, 9) <= m <= 8:
         return "verify_mma"

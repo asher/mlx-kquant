@@ -318,9 +318,19 @@ static int kq_verify_mma_min_m_nax(const std::string& t) {
   return 0;
 }
 
-// verify_nax entry on NAX GPUs; 0 = no kernel for the codec.
+// verify_nax entry on NAX GPUs; 0 = no kernel for the codec. The entry is
+// the lowest M from which the kernel is within 1.03x of the route it
+// displaces at every larger M on every Qwen3.8-27B projection and head
+// shape (M5 Max, bf16). q8_0 at M 5 is faster over a forward but 1.05x
+// at N 6144, K 5120.
 static int kq_verify_nax_min_m(const std::string& t) {
-  return codec_verify_nax_kstep(t) > 0 ? 3 : 0;
+  if (t == "pq2_0" || t == "q4_0") {
+    return 3;
+  }
+  if (t == "q8_0") {
+    return 6;
+  }
+  return 0;
 }
 
 static int kq_splitk_min_m(const std::string& t) {

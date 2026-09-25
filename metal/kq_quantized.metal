@@ -1026,6 +1026,8 @@ instantiate_kquant_verify_mma(bfloat16_t, 128, 1, ptq1_0)
 instantiate_kquant_verify_mma(float16_t, 128, 1, ptq1_0)
 instantiate_kquant_verify_mma(bfloat16_t, 32, 4, q4_0)
 instantiate_kquant_verify_mma(float16_t, 32, 4, q4_0)
+instantiate_kquant_verify_mma(bfloat16_t, 32, 8, q8_0)
+instantiate_kquant_verify_mma(float16_t, 32, 8, q8_0)
 // clang-format on
 
 // clang-format off

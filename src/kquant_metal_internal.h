@@ -193,7 +193,8 @@ inline int verify_qmv_max_rows() {
 // the output rows one of its threadgroups covers (8 simdgroups of 8 rows
 // per row tile); 0 for codecs without the kernel. M <= 8 only.
 inline int codec_verify_mma_rows(const std::string& kquant_type) {
-  if (kquant_type == "pq2_0" || kquant_type == "q4_0") {
+  if (kquant_type == "pq2_0" || kquant_type == "q4_0" ||
+      kquant_type == "q8_0") {
     return 128;
   }
   if (kquant_type == "ptq1_0") {
@@ -203,10 +204,10 @@ inline int codec_verify_mma_rows(const std::string& kquant_type) {
 }
 
 // Codecs with a register-fed NAX verify kernel (kq_verify_nax.h) and the K
-// its loop consumes per iteration (wire blocks per iteration times the
-// block width); 0 for codecs without the kernel. NAX GPUs, M <= 8 only.
+// its loop consumes per iteration (units per iteration times the unit
+// width); 0 for codecs without the kernel. NAX GPUs, M <= 8 only.
 inline int codec_verify_nax_kstep(const std::string& kquant_type) {
-  if (kquant_type == "pq2_0") {
+  if (kquant_type == "pq2_0" || kquant_type == "q8_0") {
     return 128;
   }
   if (kquant_type == "q4_0") {

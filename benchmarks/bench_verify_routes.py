@@ -72,8 +72,8 @@ VERIFY_QMV = {
     "pq2_0",
     "ptq1_0",
 }
-VERIFY_MMA = {"pq2_0", "ptq1_0", "q4_0"}
-VERIFY_NAX = {"pq2_0": 128, "q4_0": 64}
+VERIFY_MMA = {"pq2_0", "ptq1_0", "q4_0", "q8_0"}
+VERIFY_NAX = {"pq2_0": 128, "q4_0": 64, "q8_0": 128}
 NO_NAX = {"mxfp4", "nvfp4"}
 
 
