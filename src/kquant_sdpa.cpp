@@ -105,7 +105,8 @@ int kq_sdpa_blocks(int N, int n_simds, Device& d) {
   return blocks;
 }
 
-// Split count for sdpa_fa_verify when the caller passes 0. The grid is
+// Split count for sdpa_fa_verify, and for the shared-prefix pass of
+// sdpa_decode_gqa_cascade, when the caller passes 0. The grid is
 // (Hkv, B, splits), so with few KV heads the decode buckets leave most of a
 // large GPU idle below about 12k keys. On the architecture classes MLX's
 // GEMM tuning treats as large (s, c, d) the count rises until about 512
@@ -867,9 +868,10 @@ void KQuantSDPACascade::eval_gpu(
   int n_rows = B * gqa_factor * qL;
   float scale = scale_;
 
+  // The shared pass is the fa verify tile on a (Hkv, 1, splits) grid.
   int s_sh = splits_shared_;
   if (s_sh == 0) {
-    s_sh = P <= 8192 ? 16 : P <= 24576 ? 32 : P <= 49152 ? 64 : 128;
+    s_sh = kq_fa_verify_splits(1, n_kv_heads, n_rows, D, P, d);
   }
   int s_pr = splits_priv_;
   if (s_pr == 0) {

@@ -855,6 +855,38 @@ def test_sdpa_cascade_fused_bq48():
     assert rel < REL_BOUND[mx.bfloat16], f"bq48 cascade rel {rel:.3e}"
 
 
+@pytest.mark.parametrize(
+    "B,Hq,Hkv,D,want",
+    [
+        (4, 16, 2, 256, 64),  # 32 shared rows at 2 kv heads
+        (8, 32, 8, 128, 32),  # 32 shared rows at head_dim 128
+    ],
+)
+def test_sdpa_cascade_default_shared_splits(B, Hq, Hkv, D, want):
+    # The shared-prefix pass takes sdpa_fa_verify's split count on the
+    # large GPU classes; elsewhere it keeps the decode bucket.
+    if mx.device_info()["architecture"][-1] not in "scd":
+        want = 16
+    P, Sp = 4096, 257
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, mx.bfloat16, seed=27, strided=False)
+    q, k_pr, v_pr = _make(B, Hq, Hkv, 1, Sp, D, mx.bfloat16, seed=28, strided=False)
+    k_full = mx.contiguous(
+        mx.concatenate([mx.broadcast_to(k_sh, (B, Hkv, P, D)), k_pr], axis=2)
+    )
+    v_full = mx.contiguous(
+        mx.concatenate([mx.broadcast_to(v_sh, (B, Hkv, P, D)), v_pr], axis=2)
+    )
+    ref = kq.sdpa_decode_gqa(q, k_full, v_full, scale)
+    got = kq.sdpa_decode_gqa_cascade(q, k_sh, v_sh, k_pr, v_pr, scale)
+    pinned = kq.sdpa_decode_gqa_cascade(
+        q, k_sh, v_sh, k_pr, v_pr, scale, splits_shared=want
+    )
+    _eval_or_skip(got, pinned, ref)
+    assert mx.array_equal(got, pinned)
+    assert _rel(got, ref) < REL_BOUND[mx.bfloat16]
+
+
 def test_sdpa_cascade_fused_starts():
     # per-row private left-pad: keys below starts[b] in the PRIVATE region
     # are excluded; the shared prefix is always fully attended
