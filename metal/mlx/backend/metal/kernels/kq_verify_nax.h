@@ -16,18 +16,19 @@
 // barriers. Each simdgroup keeps one f32 accumulator. Split-K over grid z
 // writes T partials that kquant_qmm_splitk_accum folds.
 //
-// A unit is one or more wire blocks, and step s of a unit is its s-th
-// 16-wide NAX op. For pq2_0 and q4_0, step s consumes the codec's
-// verify_mma fragments 2s and 2s + 1 (kq_verify_mma.h), and left element
-// 2 jp + e is the activation at that codec's perm(2s + jp, 2q + e). The
-// q8_0 unit is four wire blocks with its own order (KqQ8_0Nax). The block
-// scale is folded into the half weights. Device loads and NAX ops of one
-// simdgroup do not overlap, so occupancy hides the loads and the host
-// sizes the split count for it (kq_verify_nax_splits). pq2_0 and q4_0
-// load a unit's activation steps ahead of its NAX ops. q8_0, whose Words
-// are larger, loads one step at a time. Each order measured faster for
-// its codecs on M5 Max. The right operand is written in element order,
-// which ran 1.6x faster than a strided order.
+// A unit is one or more wire blocks, or half of one, and step s of a unit
+// is its s-th 16-wide NAX op. For pq2_0 and q4_0, step s consumes the
+// codec's verify_mma fragments 2s and 2s + 1 (kq_verify_mma.h), and left
+// element 2 jp + e is the activation at that codec's perm(2s + jp,
+// 2q + e). The q8_0 unit is four wire blocks, the q4_k unit a superblock
+// and the q5_k unit half a superblock, each with its own order. Block
+// scales and mins are folded into the half weights. Device loads and NAX
+// ops of one simdgroup do not overlap, so occupancy hides the loads and
+// the host sizes the split count for it (kq_verify_nax_splits). pq2_0 and
+// q4_0 load a unit's activation steps ahead of its NAX ops. q8_0, q4_k
+// and q5_k, whose Words are larger, load one step at a time. Each order
+// measured faster for its codecs on M5 Max. The right operand is written
+// in element order, which ran 1.6x faster than a strided order.
 //
 // Codec contract (KqXxxNax):
 //   group: the wire block's weights, the kernel's group_size
@@ -35,7 +36,7 @@
 //   ub: units per loop iteration
 //   x_ahead: load the iteration's activation steps before its NAX ops
 //   Words: a lane's decode state for one unit of one row
-//   load(bp, q): Words of unit bp for lane-quad q
+//   load(row, u, q): Words of unit u of the row for lane-quad q
 //   pair(words, f): fragment f's element pair, block scale applied
 //   xstep<T>(xb, q, s): left elements 0..3 of step s, xb the unit's
 //     first activation of the lane's row
@@ -54,7 +55,8 @@ struct KqPq2_0Nax {
     uint w[2];
     half d;
   };
-  static METAL_FUNC Words load(const device uint8_t* bp, short q) {
+  static METAL_FUNC Words load(const device uint8_t* row, int u, short q) {
+    const device uint8_t* bp = row + u * block_bytes;
     Words o;
     o.d = *(const device half*)bp;
     const packed_ushort4 v =
@@ -100,7 +102,8 @@ struct KqQ4_0Nax {
     uint hi;
     half d;
   };
-  static METAL_FUNC Words load(const device uint8_t* bp, short q) {
+  static METAL_FUNC Words load(const device uint8_t* row, int u, short q) {
+    const device uint8_t* bp = row + u * block_bytes;
     Words o;
     o.d = *(const device half*)(bp + KQ_Q4_0_D_OFFSET);
     const packed_ushort2 v =
@@ -142,7 +145,8 @@ struct KqQ8_0Nax {
     uint w[8];
     half d;
   };
-  static METAL_FUNC Words load(const device uint8_t* bp, short q) {
+  static METAL_FUNC Words load(const device uint8_t* row, int u, short q) {
+    const device uint8_t* bp = row + u * block_bytes;
     Words o;
     const int b = KQ_Q8_0_BLOCK_BYTES * q;
     o.d = *(const device half*)(bp + b + KQ_Q8_0_D_OFFSET);
@@ -169,6 +173,150 @@ struct KqQ8_0Nax {
   static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
     const vec<T, 4> p =
         *(const device vec<T, 4>*)(xb + KQ_Q8_0_GROUP * q + 4 * s);
+    return vec<T, 4>(p[0], p[2], p[1], p[3]);
+  }
+};
+
+// Sub-block j's 6-bit scale and min of a q4_k or q5_k superblock, from the
+// header words holding scale bytes 0-3 (y), 4-7 (z) and 8-11 (w), as
+// ggml's get_scale_min_k4.
+METAL_FUNC uint2 kq_vnax_scale_min_k4(short j, uint y, uint z, uint w) {
+  if (j < 4) {
+    return uint2((y >> (8 * j)) & 63, (z >> (8 * j)) & 63);
+  }
+  const short jj = j - 4;
+  const uint b = w >> (8 * jj);
+  return uint2(
+      (b & 0xF) | (((y >> (8 * jj + 6)) & 3) << 4),
+      ((b >> 4) & 0xF) | (((z >> (8 * jj + 6)) & 3) << 4));
+}
+
+// Weight pair of 4-bit (or 5-bit) codes src at bytes 0 and 2, as
+// code * ds - dm of the sub-block that hi selects. ds and dm are rounded
+// to half before the fma, so a weight near zero, where the two terms
+// cancel, carries up to about 1.6e-3 of the sub-block's largest weight
+// in error, against one half rounding on the other routes. That is 2-5%
+// of one quantization step.
+METAL_FUNC half2 kq_vnax_kpair(uint src, half2 ds, half2 dm, bool hi) {
+  const half2 qv =
+      as_type<half2>((src & 0x00FF00FFu) | 0x64006400u) - half2(1024.0h);
+  return fma(qv, half2(hi ? ds.y : ds.x), -half2(hi ? dm.y : dm.x));
+}
+
+// Q4_K: the unit is one superblock (256 weights, 144 bytes), and
+// lane-quad q owns qs chunk q, the 32 bytes holding sub-blocks 2q (low
+// nibbles, k 64q + l) and 2q + 1 (high nibbles, k 64q + 32 + l), read as
+// two 16-byte loads beside the 16-byte header. Step s takes word s % 8,
+// low nibbles for s < 8. Rows start 16-byte aligned from a weight base
+// the host checks.
+struct KqQ4_KNax {
+  static constant constexpr int group = KQ_Q4_K_SUPERBLOCK;
+  static constant constexpr int block_k = KQ_Q4_K_SUPERBLOCK;
+  static constant constexpr int block_bytes = KQ_Q4_K_BLOCK_BYTES;
+  static constant constexpr int ub = 1;
+  static constant constexpr bool x_ahead = false;
+  struct Words {
+    uint w[8];
+    half2 ds;
+    half2 dm;
+  };
+  static METAL_FUNC Words load(const device uint8_t* row, int u, short q) {
+    const device uint8_t* bp = row + u * block_bytes;
+    Words o;
+    const uint4 h = *(const device uint4*)bp;
+    const device uint4* qp =
+        (const device uint4*)(bp + KQ_Q4_K_QS_OFFSET + 32 * q);
+    const uint4 v0 = qp[0];
+    const uint4 v1 = qp[1];
+    o.w[0] = v0.x;
+    o.w[1] = v0.y;
+    o.w[2] = v0.z;
+    o.w[3] = v0.w;
+    o.w[4] = v1.x;
+    o.w[5] = v1.y;
+    o.w[6] = v1.z;
+    o.w[7] = v1.w;
+    const uint2 a = kq_vnax_scale_min_k4(2 * q, h.y, h.z, h.w);
+    const uint2 b = kq_vnax_scale_min_k4(2 * q + 1, h.y, h.z, h.w);
+    const half2 dd = as_type<half2>(h.x);
+    o.ds = half2(half(a.x), half(b.x)) * dd.x;
+    o.dm = half2(half(a.y), half(b.y)) * dd.y;
+    return o;
+  }
+  static METAL_FUNC half2 pair(thread const Words& o, short f) {
+    const short s = f >> 1;
+    const bool hi = s >= 8;
+    const uint wv = (hi ? (o.w[s & 7] >> 4) : o.w[s & 7]) & 0x0F0F0F0Fu;
+    return kq_vnax_kpair(wv >> (8 * (f & 1)), o.ds, o.dm, hi);
+  }
+  template <typename T>
+  static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
+    const vec<T, 4> p =
+        *(const device vec<T, 4>*)(xb + 64 * q + 32 * (s >> 3) + 4 * (s & 7));
+    return vec<T, 4>(p[0], p[2], p[1], p[3]);
+  }
+};
+
+// Q5_K: the unit is half a superblock h (128 weights), and lane-quad q
+// owns the 16 qs bytes 16 (q & 1) of chunk jc = 2h + (q >> 1), holding
+// sub-blocks 2jc (low nibbles) and 2jc + 1 (high nibbles), and the qh
+// bytes of the same positions, whose bits 2jc and 2jc + 1 are the fifth
+// bits. The load packs the fifth bits of word i into bits 2i and 2i + 1
+// of each byte of one word. Step s takes word s % 4, low nibbles for
+// s < 4. block_bytes is half the superblock's bytes and feeds only the
+// row stride, since load addresses the whole superblock of unit u. Rows
+// start 16-byte aligned from a weight base the host checks, with K in
+// whole superblocks.
+struct KqQ5_KNax {
+  static constant constexpr int group = KQ_Q5_K_SUPERBLOCK;
+  static constant constexpr int block_k = KQ_Q5_K_SUPERBLOCK / 2;
+  static constant constexpr int block_bytes = KQ_Q5_K_BLOCK_BYTES / 2;
+  static constant constexpr int ub = 1;
+  static constant constexpr bool x_ahead = false;
+  struct Words {
+    uint w[4];
+    uint hb;
+    half2 ds;
+    half2 dm;
+  };
+  static METAL_FUNC Words load(const device uint8_t* row, int u, short q) {
+    const device uint8_t* bp = row + (u >> 1) * KQ_Q5_K_BLOCK_BYTES;
+    const short jc = 2 * (u & 1) + (q >> 1);
+    Words o;
+    const uint4 h = *(const device uint4*)bp;
+    const uint4 hv =
+        *(const device uint4*)(bp + KQ_Q5_K_QH_OFFSET + 16 * (q & 1));
+    const uint4 v =
+        *(const device uint4*)(bp + KQ_Q5_K_QS_OFFSET + 32 * jc + 16 * (q & 1));
+    o.w[0] = v.x;
+    o.w[1] = v.y;
+    o.w[2] = v.z;
+    o.w[3] = v.w;
+    o.hb = ((hv.x >> (2 * jc)) & 0x03030303u) |
+        (((hv.y >> (2 * jc)) & 0x03030303u) << 2) |
+        (((hv.z >> (2 * jc)) & 0x03030303u) << 4) |
+        (((hv.w >> (2 * jc)) & 0x03030303u) << 6);
+    const uint2 a = kq_vnax_scale_min_k4(2 * jc, h.y, h.z, h.w);
+    const uint2 b = kq_vnax_scale_min_k4(2 * jc + 1, h.y, h.z, h.w);
+    const half2 dd = as_type<half2>(h.x);
+    o.ds = half2(half(a.x), half(b.x)) * dd.x;
+    o.dm = half2(half(a.y), half(b.y)) * dd.y;
+    return o;
+  }
+  static METAL_FUNC half2 pair(thread const Words& o, short f) {
+    const short s = f >> 1;
+    const bool hi = s >= 4;
+    const short i = s & 3;
+    const uint lo4 = (hi ? (o.w[i] >> 4) : o.w[i]) & 0x0F0F0F0Fu;
+    const uint q5 =
+        lo4 | (((o.hb >> (2 * i + (hi ? 1 : 0))) & 0x01010101u) << 4);
+    return kq_vnax_kpair(q5 >> (8 * (f & 1)), o.ds, o.dm, hi);
+  }
+  template <typename T>
+  static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
+    const vec<T, 4> p =
+        *(const device vec<T, 4>*)(xb + 64 * (q >> 1) + 16 * (q & 1) +
+                                   32 * (s >> 2) + 4 * (s & 3));
     return vec<T, 4>(p[0], p[2], p[1], p[3]);
   }
 };
@@ -238,8 +386,7 @@ METAL_FUNC void kq_verify_nax_impl(
     for (short u = 0; u < UB; ++u) {
 #pragma unroll
       for (short r = 0; r < 4; ++r) {
-        wv[u][r] =
-            Codec::load(row(r) + ((kb + u * BK) / BK) * Codec::block_bytes, q);
+        wv[u][r] = Codec::load(row(r), (kb + u * BK) / BK, q);
       }
     }
     vec<T, 4> xa[UB][SPB];
@@ -326,3 +473,5 @@ METAL_FUNC void kq_verify_nax_impl(
 KQ_DEFINE_VERIFY_NAX_KERNEL(pq2_0, KqPq2_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_0, KqQ4_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q8_0, KqQ8_0Nax)
+KQ_DEFINE_VERIFY_NAX_KERNEL(q4_k, KqQ4_KNax)
+KQ_DEFINE_VERIFY_NAX_KERNEL(q5_k, KqQ5_KNax)
