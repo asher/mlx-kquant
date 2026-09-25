@@ -1483,6 +1483,23 @@ def test_sdpa_fa_indexed_splits(splits):
     assert _rel(got, ref) < REL_BOUND[mx.bfloat16]
 
 
+@pytest.mark.parametrize("Q,want", [(1, 16), (3, 8), (8, 4), (16, 2)])
+def test_sdpa_fa_indexed_default_splits(Q, want):
+    # The NAX kernel on the large GPU classes drops the split count as the
+    # queries grow, since each split writes float32 partials; elsewhere the
+    # decode bucket stays.
+    if not kq.nax_available() or mx.device_info()["architecture"][-1] not in "scd":
+        want = 16
+    q, kv, idx = _make_indexed(64, Q, 4096, 2051, 0, mx.bfloat16, seed=Q)
+    scale = 512**-0.5
+    got = kq.sdpa_fa_indexed(q, kv, idx, scale)
+    pinned = kq.sdpa_fa_indexed(q, kv, idx, scale, want)
+    ref = _ref_sdpa_indexed(q, kv, idx, scale)
+    _eval_or_skip(got, pinned, ref)
+    assert mx.array_equal(got, pinned)
+    assert _rel(got, ref) < REL_BOUND[mx.bfloat16]
+
+
 def test_sdpa_fa_indexed_all_padded_row():
     # a query whose list is all pads yields zeros, not NaN
     q, kv, idx = _make_indexed(64, 2, 300, 128, 0, mx.float16, seed=3)

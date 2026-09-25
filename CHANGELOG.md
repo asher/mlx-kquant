@@ -30,6 +30,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   draft tokens.
 - On Max and Ultra GPUs, `sdpa_fa_verify` and `sdpa_decode_gqa_cascade` run
   faster, most of all with few KV heads below about 16k keys.
+- On Max and Ultra NAX GPUs, `sdpa_fa_indexed` runs faster at 3 or more
+  queries, such as a sparse-attention step verifying MTP drafts.
 
 ### Fixed
 - `q4_0` matmuls with 2 to 8 activation rows no longer return inf when one

@@ -145,6 +145,33 @@ int kq_fa_verify_splits(
   return std::min({splits, cap, 128});
 }
 
+// Split count for sdpa_fa_indexed when the caller passes 0: the decode
+// bucket over the M listed keys. The NAX kernel on the s, c and d classes
+// writes 32 heads by 512 float32 partials per split, so once about 512
+// simdgroups are in flight (32-head strips by queries by splits, 8 each)
+// more splits cost more than they return. There the count drops to the
+// largest power of two under that fill, never above the bucket and never
+// below 2. Tuned on M5 Max at 64 heads and 2051 keys.
+int kq_fa_indexed_splits(
+    int n_heads,
+    int n_queries,
+    int M,
+    bool nax,
+    Device& d) {
+  int splits = M <= 8192 ? 16 : M <= 24576 ? 32 : M <= 49152 ? 64 : 128;
+  char devc = d.get_architecture().back();
+  if (!nax || (devc != 's' && devc != 'c' && devc != 'd')) {
+    return splits;
+  }
+  const int strips = (n_heads + 31) / 32;
+  const int fill = 512 / (strips * n_queries * 8);
+  int s_fill = 2;
+  while (s_fill * 2 <= fill) {
+    s_fill *= 2;
+  }
+  return std::min(splits, s_fill);
+}
+
 } // namespace
 
 void KQuantSDPA::eval_gpu(
@@ -718,9 +745,20 @@ void KQuantSDPAFAIndexed::eval_gpu(
   int D = q.shape(3);
   int kv_len = kv.shape(2);
   int M = idx.shape(1);
+
+  // Tensor-op hardware runs the NAX kernel (eight simdgroups per 32-head
+  // strip); otherwise the simdgroup kernel, one threadgroup per (32-head
+  // strip, query, split). KQ_SDPA_IDX_NAX=0 forces the simdgroup kernel on
+  // any GPU.
+  static const bool nax_env = [] {
+    const char* e = std::getenv("KQ_SDPA_IDX_NAX");
+    return !e || std::atoi(e) != 0;
+  }();
+  const bool use_nax = nax_env && kq_is_nax_available();
+
   int splits = splits_;
   if (splits == 0) {
-    splits = M <= 8192 ? 16 : M <= 24576 ? 32 : M <= 49152 ? 64 : 128;
+    splits = kq_fa_indexed_splits(n_heads, n_queries, M, use_nax, d);
   }
   size_t kv_seq_stride = static_cast<size_t>(kv.strides(2));
   float scale = scale_;
@@ -759,15 +797,7 @@ void KQuantSDPAFAIndexed::eval_gpu(
       {&zero_bits, MTL::DataType::DataTypeInt, 11},
   };
 
-  // Pass 1. Tensor-op hardware runs the NAX kernel (eight simdgroups per
-  // 32-head strip); otherwise the simdgroup kernel, one threadgroup per
-  // (32-head strip, query, split). KQ_SDPA_IDX_NAX=0 forces the simdgroup
-  // kernel on any GPU.
-  static const bool nax_env = [] {
-    const char* e = std::getenv("KQ_SDPA_IDX_NAX");
-    return !e || std::atoi(e) != 0;
-  }();
-  const bool use_nax = nax_env && kq_is_nax_available();
+  // Pass 1.
   {
     constexpr int strip = 32;
     std::string kname;
