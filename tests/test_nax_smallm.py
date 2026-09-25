@@ -556,13 +556,11 @@ def test_verify_nax_k_declines(codec, k, monkeypatch):
 
 
 # The q8_0, eight-block q4_0 and q2_k kernels read their weights as 4-byte
-# words, so a weight base that starts 2 mod 4, as a zero-copy tensor from a
-# GGUF with a small alignment can, declines the route. A base 4 bytes in
-# runs it. Both match the reference, and the default route at M 8 takes
-# the displaced route on the misaligned base (NAX split-K for q8_0,
-# verify_mma for q4_0). The q2_k NAX tile routes return wrong results on a
-# base 2 mod 4, a defect outside verify_nax, so the default route is not
-# swept on a misaligned q2_k base.
+# words, so a q8_0 or q4_0 weight view that starts 2 mod 4 declines the
+# route. A base 4 bytes in runs it. Both match the reference, and the
+# default route at M 8 takes the displaced route on the misaligned base
+# (NAX split-K for q8_0, verify_mma for q4_0). A q2_k base 2 mod 4 raises
+# before any route runs (tests/test_weight_base.py).
 VNAX_DISPLACED_M8 = {"q8_0": "nax_splitk", "q4_0": "verify_mma"}
 
 
@@ -578,11 +576,13 @@ def test_verify_nax_word_weight_alignment(codec, offset, monkeypatch):
     monkeypatch.setenv("KQ_QMM_ROUTE", "verify_nax")
     monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
     x = (mx.random.normal((8, K)) * 0.5).astype(mx.bfloat16)
+    if offset % 4 and codec == "q2_k":
+        with pytest.raises(ValueError, match="4-byte boundary"):
+            mx.eval(kq.quantized_matmul(x, wv, s, codec, transpose=True))
+        return
     if offset % 4:
         with pytest.raises(RuntimeError, match="does not serve"):
             mx.eval(kq.quantized_matmul(x, wv, s, codec, transpose=True))
-        if codec not in VNAX_DISPLACED_M8:
-            return
     else:
         y_nax = kq.quantized_matmul(x, wv, s, codec, transpose=True)
         y_ref = kq.quantized_matmul(x, w, s, codec, transpose=True)
@@ -621,10 +621,10 @@ def test_verify_nax_q4_0_two_block_lever(dtype, monkeypatch):
     _sweep("q4_0", w, s, ref_w, 1000, ms=[1, 3, 8], dtype=dtype, k=k)
 
 
-# The q4_k and q5_k kernels read their weights as 16-byte words, so a
-# weight base off 16-byte alignment declines the route, and a base 16
-# bytes in runs it bit for bit like the aligned tensor. The default route
-# at M 8 takes NAX split-K on the misaligned bases.
+# The q4_k and q5_k kernels read their weights as 16-byte words. A base
+# 16 bytes in runs the route bit for bit like the aligned tensor, and a
+# base 4 or 8 bytes in raises before any route runs
+# (tests/test_weight_base.py).
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
 @pytest.mark.parametrize("offset", [4, 8, 16])
 @pytest.mark.parametrize("codec", ["q4_k", "q5_k"])
@@ -638,27 +638,23 @@ def test_verify_nax_kquant_weight_alignment(codec, offset, monkeypatch):
     monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
     x = (mx.random.normal((8, K)) * 0.5).astype(mx.bfloat16)
     if offset % 16:
-        with pytest.raises(RuntimeError, match="does not serve"):
+        with pytest.raises(ValueError, match="16-byte boundary"):
             mx.eval(kq.quantized_matmul(x, wv, s, codec, transpose=True))
-    else:
-        y_nax = kq.quantized_matmul(x, wv, s, codec, transpose=True)
-        y_ref = kq.quantized_matmul(x, w, s, codec, transpose=True)
-        mx.eval(y_nax, y_ref)
-        assert _bits_equal(y_nax, y_ref)
+        return
+    y_nax = kq.quantized_matmul(x, wv, s, codec, transpose=True)
+    y_ref = kq.quantized_matmul(x, w, s, codec, transpose=True)
+    mx.eval(y_nax, y_ref)
+    assert _bits_equal(y_nax, y_ref)
     monkeypatch.delenv("KQ_QMM_ROUTE")
     monkeypatch.delenv("KQ_QMM_ROUTE_STRICT")
     _sweep(codec, wv, s, ref_w, 1000, ms=[3, 8])
-    if offset % 16:
-        y_def = _run_route(monkeypatch, x, wv, s, codec)
-        y_sk = _run_route(monkeypatch, x, w, s, codec, "nax_splitk")
-        assert _bits_equal(y_def, y_sk)
 
 
 # The q6_k and q3_k kernels read 2-byte words, since every other 210- or
 # 110-byte superblock starts 2 mod 4. A base 2 or 16 bytes in runs the
 # route bit for bit like the aligned tensor, and the default route matches
-# the reference on it. An odd base declines the route. No other kq kernel
-# serves an odd base either, so the default route is not swept there.
+# the reference on it. An odd base raises before any route runs
+# (tests/test_weight_base.py).
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
 @pytest.mark.parametrize("offset", [1, 2, 16])
 @pytest.mark.parametrize("codec", ["q6_k", "q3_k"])
@@ -671,7 +667,7 @@ def test_verify_nax_half_word_weight_alignment(codec, offset, monkeypatch):
     monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
     x = (mx.random.normal((8, K)) * 0.5).astype(mx.bfloat16)
     if offset % 2:
-        with pytest.raises(RuntimeError, match="does not serve"):
+        with pytest.raises(ValueError, match="2-byte boundary"):
             mx.eval(kq.quantized_matmul(x, wv, s, codec, transpose=True))
         return
     y_nax = kq.quantized_matmul(x, wv, s, codec, transpose=True)

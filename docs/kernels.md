@@ -283,9 +283,11 @@ cells, and 1.10x slower at worst.
 
 A K that is not a whole number of K steps declines the route, and the K-quant kernels also need K in
 whole 256-weight superblocks. A two-block `q4_0` K with an odd count of blocks therefore runs on the
-mat-vec kernels at M 3 and 4 and on `verify_mma` from M 5. A weight base off the alignment in the
-table declines too, as a zero-copy tensor from a GGUF with a smaller alignment or an offset view can
-be. `ptq1_0` has no NAX verify kernel, because its base-3 decode does not hide under the NAX ops and
+mat-vec kernels at M 3 and 4 and on `verify_mma` from M 5. A `pq2_0`, `q4_0` or `q8_0` weight view
+that starts 2 bytes past a 4-byte boundary declines too, and the other routes serve it. For the
+K-quant codecs the table's weight base is the alignment every GPU kernel of the codec needs, so a
+start off it raises, as [the wire-byte contract](integration.md#the-wire-byte-contract) describes.
+`ptq1_0` has no NAX verify kernel, because its base-3 decode does not hide under the NAX ops and
 measured slower than `verify_mma`.
 
 The entry is the lowest M from which the kernel runs within 1.03x of the route it displaces at every

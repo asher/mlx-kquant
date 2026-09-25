@@ -938,15 +938,16 @@ static int kq_verify_nax_call_kstep(int K, const std::string& t) {
   return codec_verify_nax_kstep(t);
 }
 
-// verify_nax serves a K of whole steps from an aligned weight base. A
-// zero-copy GGUF tensor or an offset view can start off that alignment,
-// so such a call declines. The q4_k and q5_k kernels read 16-byte words.
-// The q6_k and q3_k kernels read 2-byte words, since every other 210- or
-// 110-byte superblock starts 2 mod 4. The other codecs take a 4-byte
-// check, which the q8_0, eight-block q4_0 and q2_k kernels need for their
-// 4-byte words. The K-quant kernels also need K in whole superblocks,
-// since the q2_k, q3_k, q5_k and q6_k steps are half of one. Rows of such
-// a K stay aligned with the base.
+// verify_nax serves a K of whole steps from an aligned weight base. The
+// q4_k and q5_k kernels read 16-byte words. The q6_k and q3_k kernels read
+// 2-byte words, since every other 210- or 110-byte superblock starts 2 mod
+// 4. The other codecs take a 4-byte check, which the q8_0, eight-block
+// q4_0 and q2_k kernels need for their 4-byte words. kq_check_weight_base
+// raises first on every K-quant base this check would decline, so the
+// decline reaches only q8_0, q4_0 and pq2_0 bases 2 mod 4, which the other
+// routes serve. The K-quant kernels also need K in whole superblocks, since
+// the q2_k, q3_k, q5_k and q6_k steps are half of one. Rows of such a K
+// stay aligned with the base.
 static bool
 kq_verify_nax_fits(const array& w, int K, int kstep, const std::string& t) {
   const bool kq = t == "q4_k" || t == "q5_k";
@@ -1894,12 +1895,13 @@ void KQuantMatmul::eval_gpu_base(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
-  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   // inputs are row-contiguous (ensured by the op): x, w (uint8), scales.
   const auto& x = inputs[0];
   const auto& w = inputs[1];
   const auto& scales = inputs[2];
+  kq_check_weight_base(w, kquant_type_, "quantized_matmul");
+  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   bool non_batched = w.ndim() == 2 && x.flags().row_contiguous;
   int K = x.shape(-1);
@@ -2408,12 +2410,13 @@ void KQuantQmvBias::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
-  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   const auto& x = inputs[0];
   const auto& w = inputs[1];
   const auto& scales = inputs[2];
   const auto& bias = inputs[3];
+  kq_check_weight_base(w, kquant_type_, "quantized_matmul_qmv_bias");
+  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int K = x.shape(-1);
   int N = out.shape(-1);

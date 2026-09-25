@@ -468,7 +468,6 @@ void KQuantMoEGLUKQ::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
-  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   // Biased (swiglu_clamp) layout: gw, uw, gb, ub, x, indices.
   const bool biased = inputs.size() == 6;
@@ -476,6 +475,9 @@ void KQuantMoEGLUKQ::eval_gpu(
   const auto& uw = inputs[1];
   const auto& x = inputs[biased ? 4 : 2];
   const auto& indices = inputs.back();
+  kq_check_weight_base(gw, kquant_type_, "moe_glu_gather_kq");
+  kq_check_weight_base(uw, kquant_type_, "moe_glu_gather_kq");
+  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = indices.shape(0);
   int R = indices.shape(1);
@@ -538,7 +540,6 @@ void KQuantGatherQMVKQ::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
-  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   // Biased layout: w, b, x, indices (then the LoRA operands, if any).
   const size_t n_base = inputs.size() - kq_lora_input_count(lora_flags_);
@@ -546,6 +547,8 @@ void KQuantGatherQMVKQ::eval_gpu(
   const auto& w = inputs[0];
   const auto& x = inputs[biased ? 2 : 1];
   const auto& indices = inputs[n_base - 1];
+  kq_check_weight_base(w, kquant_type_, "gather_qmv_kq");
+  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = indices.shape(0);
   int R = indices.shape(1);
@@ -612,7 +615,6 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
-  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   const auto& gw = inputs[0];
   const auto& uw = inputs[1];
@@ -620,6 +622,11 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   const auto& suw = inputs[3];
   const auto& x = inputs[4];
   const auto& indices = inputs[5];
+  kq_check_weight_base(gw, kquant_type_, "moe_glu_gather_shexp_kq");
+  kq_check_weight_base(uw, kquant_type_, "moe_glu_gather_shexp_kq");
+  kq_check_weight_base(sgw, shexp_type_, "moe_glu_gather_shexp_kq");
+  kq_check_weight_base(suw, shexp_type_, "moe_glu_gather_shexp_kq");
+  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = indices.shape(0);
   int R = indices.shape(1);
@@ -679,13 +686,15 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
-  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   const auto& w = inputs[0];
   const auto& sw = inputs[1];
   const auto& x = inputs[2];
   const auto& indices = inputs[3];
   const auto& scores = inputs[4];
+  kq_check_weight_base(w, kquant_type_, "gather_qmv_mix_kq");
+  kq_check_weight_base(sw, shexp_type_, "gather_qmv_mix_kq");
+  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = x.shape(0);
   int S = x.shape(1);
@@ -775,12 +784,13 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
-  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   const auto& w = inputs[0];
   const auto& x = inputs[1];
   const auto& indices = inputs[2];
   const auto& scores = inputs[3];
+  kq_check_weight_base(w, kquant_type_, "gather_qmv_mix_ns_kq");
+  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = x.shape(0);
   int S = x.shape(1);
@@ -1468,6 +1478,8 @@ mx::array moe_glu_gather_kq(
   check_kq_expert_stack(
       "[mlx_kquant.moe_glu_gather_kq]", gate_w, kquant_type, K);
   check_kq_expert_stack("[mlx_kquant.moe_glu_gather_kq]", up_w, kquant_type, K);
+  kq_check_weight_base_at_build(gate_w, kquant_type, s, "moe_glu_gather_kq");
+  kq_check_weight_base_at_build(up_w, kquant_type, s, "moe_glu_gather_kq");
   if (gate_w.shape(0) != up_w.shape(0) || gate_w.shape(1) != up_w.shape(1)) {
     throw std::invalid_argument(
         "[mlx_kquant.moe_glu_gather_kq] gate/up expert shapes must match.");
@@ -1533,6 +1545,7 @@ mx::array gather_qmv_kq(
   }
   int K = x.shape(2);
   check_kq_expert_stack("[mlx_kquant.gather_qmv_kq]", w, kquant_type, K);
+  kq_check_weight_base_at_build(w, kquant_type, s, "gather_qmv_kq");
   if (bias.has_value()) {
     if (kquant_type != "mxfp4" && kquant_type != "nvfp4") {
       throw std::invalid_argument(
@@ -1637,6 +1650,14 @@ mx::array moe_glu_gather_shexp_kq(
 
   auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
   mx::Shape out_shape = {x.shape(0), indices.shape(1) + 1, N};
+  kq_check_weight_base_at_build(
+      gate_w, kquant_type, s, "moe_glu_gather_shexp_kq");
+  kq_check_weight_base_at_build(
+      up_w, kquant_type, s, "moe_glu_gather_shexp_kq");
+  kq_check_weight_base_at_build(
+      shexp_gate_w, shexp_type, s, "moe_glu_gather_shexp_kq");
+  kq_check_weight_base_at_build(
+      shexp_up_w, shexp_type, s, "moe_glu_gather_shexp_kq");
   return mx::array(
       std::move(out_shape),
       dt,
@@ -1693,6 +1714,8 @@ mx::array gather_qmv_mix_kq(
 
   auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
   mx::Shape out_shape = {x.shape(0), w.shape(1)};
+  kq_check_weight_base_at_build(w, kquant_type, s, "gather_qmv_mix_kq");
+  kq_check_weight_base_at_build(shexp_w, shexp_type, s, "gather_qmv_mix_kq");
   return mx::array(
       std::move(out_shape),
       dt,
@@ -1737,6 +1760,7 @@ mx::array gather_qmv_mix_ns_kq(
   }
   int K = x.shape(2);
   check_kq_expert_stack(op, w, kquant_type, K);
+  kq_check_weight_base_at_build(w, kquant_type, s, "gather_qmv_mix_ns_kq");
 
   auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
   const int E = w.shape(0);

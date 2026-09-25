@@ -37,6 +37,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 - `q4_0` matmuls with 2 to 8 activation rows no longer return inf when one
   activation channel exceeds about 8000.
+- GPU ops on a packed weight that starts off the 2- to 16-byte boundary its
+  codec needs raise `ValueError` instead of returning wrong values or NaN.
+- `load_gguf` copies a tensor that a GGUF with a small `general.alignment`
+  places off its codec's boundary, so the GPU ops accept it.
 
 ## [0.4.13]
 

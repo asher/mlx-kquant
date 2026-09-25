@@ -2481,7 +2481,8 @@ NB_MODULE(_ext, m) {
         over the mmap (a Metal newBufferWithBytesNoCopy per tensor, kept mapped
         until the last viewing array is freed) - no per-tensor allocation or
         byte-copy. With ``zero_copy=False`` every tensor is memcpy'd out of the
-        mmap (~15 GB/s). Tensors that can't be wrapped no-copy fall back to the
+        mmap (~15 GB/s). Tensors that can't be wrapped no-copy, or that start
+        off the byte boundary their codec's GPU kernels need, fall back to the
         copy path transparently.
 
         Args:
