@@ -28,6 +28,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `sdpa_fa_verify` and `sdpa_decode_gqa_cascade` run faster when the folded
   query holds 33 to 48 rows, such as Qwen3.x full attention verifying 6 to 8
   draft tokens.
+- On larger GPUs such as the M5 Max, `sdpa_fa_verify` runs faster below
+  about 16k keys with few KV heads, and on 33 to 64 row folds past 16k keys.
 
 ### Fixed
 - `q4_0` matmuls with 2 to 8 activation rows no longer return inf when one

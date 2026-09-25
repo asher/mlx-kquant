@@ -676,6 +676,31 @@ def test_sdpa_fa_verify_bq64_strided_kv():
     _check_fa(256, 4, kL=3071, dtype=mx.bfloat16, Hkv=2, G=16, strided=True, splits=16)
 
 
+@pytest.mark.parametrize(
+    "D,Hkv,G,qL,kL,want",
+    [
+        (256, 2, 12, 2, 4096, 64),  # fills 512 simdgroups at 2 kv heads
+        (256, 4, 6, 8, 20000, 128),  # 48-row fold past 16k keys
+        (512, 2, 4, 8, 2048, 32),  # d-split kernel, 8 simdgroups each
+        (128, 4, 8, 4, 1040, 32),  # capped at one 32-key tile per split
+        (64, 8, 4, 8, 8192, 32),  # 1024 simdgroups at head_dim <= 128
+    ],
+)
+def test_sdpa_fa_verify_default_splits(D, Hkv, G, qL, kL, want):
+    # On the large GPU classes splits=0 raises the count past the decode
+    # bucket to fill the GPU; elsewhere it keeps the bucket.
+    if mx.device_info()["architecture"][-1] not in "scd":
+        want = 16 if kL <= 8192 else 32
+    q, k, v = _make(1, Hkv, Hkv, G * qL, kL, D, mx.bfloat16, seed=kL + D, strided=False)
+    scale = 1.0 / (D**0.5)
+    got = kq.sdpa_fa_verify(q, k, v, scale, q_len=qL)
+    pinned = kq.sdpa_fa_verify(q, k, v, scale, q_len=qL, splits=want)
+    ref = _ref_sdpa_fold(q, k, v, scale, qL)
+    _eval_or_skip(got, pinned, ref)
+    assert mx.array_equal(got, pinned)
+    assert _rel(got, ref) < REL_BOUND[mx.bfloat16]
+
+
 @pytest.mark.parametrize("D", [64, 128])
 @pytest.mark.parametrize("G", [32, 64])
 def test_sdpa_fa_verify_cascade_fold(D, G):

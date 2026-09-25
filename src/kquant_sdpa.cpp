@@ -105,6 +105,45 @@ int kq_sdpa_blocks(int N, int n_simds, Device& d) {
   return blocks;
 }
 
+// Split count for sdpa_fa_verify when the caller passes 0. The grid is
+// (Hkv, B, splits), so with few KV heads the decode buckets leave most of a
+// large GPU idle below about 12k keys. On the architecture classes MLX's
+// GEMM tuning treats as large (s, c, d) the count rises until about 512
+// simdgroups are in flight (1024 at head_dim <= 128, whose tiles are
+// lighter), never below the decode bucket and never past one 32-key tile
+// per split; folds over 32 rows take 128 splits past 16k keys. Powers of
+// two only, since each count is its own pipeline. Tuned on M5 Max; other
+// classes keep the decode buckets.
+int kq_fa_verify_splits(
+    int B,
+    int n_kv_heads,
+    int n_rows,
+    int D,
+    int kL,
+    Device& d) {
+  int splits = kL <= 8192 ? 16 : kL <= 24576 ? 32 : kL <= 49152 ? 64 : 128;
+  char devc = d.get_architecture().back();
+  if (devc != 's' && devc != 'c' && devc != 'd') {
+    return splits;
+  }
+  const int bq = n_rows <= 32 ? 32 : n_rows <= 48 ? 48 : 64;
+  const int sg_per_tg = D == 512 ? 8 : bq / 8;
+  const int fill = (D >= 256 ? 512 : 1024) / (B * n_kv_heads * sg_per_tg);
+  int s_fill = 1;
+  while (s_fill * 2 <= fill) {
+    s_fill *= 2;
+  }
+  splits = std::max(splits, s_fill);
+  if (n_rows > 32 && kL > 16384) {
+    splits = 128;
+  }
+  int cap = 16;
+  while (cap * 2 <= kL / 32) {
+    cap *= 2;
+  }
+  return std::min({splits, cap, 128});
+}
+
 } // namespace
 
 void KQuantSDPA::eval_gpu(
@@ -487,11 +526,9 @@ void KQuantSDPAFAVerify::eval_gpu(
   int D = q.shape(3);
   int kL = kvarn ? (kvarn_n_attend_ ? kvarn_n_attend_ : kvarn_n_) : k.shape(2);
   int q_len = q_len_;
-  // Same coarse split buckets as sdpa_decode_gqa (a per-kL value would mint
-  // a new pipeline specialization every decode step).
   int splits = splits_;
   if (splits == 0) {
-    splits = kL <= 8192 ? 16 : kL <= 24576 ? 32 : kL <= 49152 ? 64 : 128;
+    splits = kq_fa_verify_splits(B, n_kv_heads, n_rows, D, kL, d);
   }
 
   size_t k_head_stride =
