@@ -323,7 +323,7 @@ static int kq_verify_mma_min_m_nax(const std::string& t) {
 // the lowest M from which the kernel is within 1.03x of the route it
 // displaces at every larger M on every Qwen3.8-27B projection and head
 // shape (M5 Max, bf16). q8_0 at M 5 is faster over a forward but 1.05x
-// slower at N 6144, K 5120.
+// slower at N 6144, K 5120. q4_0 holds M 3 on both of its kernels.
 static int kq_verify_nax_min_m(const std::string& t) {
   if (t == "pq2_0" || t == "q4_0" || t == "q4_k" || t == "q5_k") {
     return 3;
@@ -902,13 +902,28 @@ void verify_mma(
   ce.dispatch_threads(agrid, agroup);
 }
 
+// K per verify_nax iteration for this call. q4_0 runs its eight-block
+// kernel (q4_0_sb, 256 weights per step) where K is a multiple of 256,
+// and its two-block kernel (64) elsewhere. KQ_VERIFY_NAX_Q4_0_SB=0 keeps
+// the two-block kernel (probe lever, read live per call).
+static int kq_verify_nax_call_kstep(int K, const std::string& t) {
+  if (t == "q4_0" && K % 256 == 0) {
+    const char* e = std::getenv("KQ_VERIFY_NAX_Q4_0_SB");
+    if (e == nullptr || std::atoi(e) != 0) {
+      return 256;
+    }
+  }
+  return codec_verify_nax_kstep(t);
+}
+
 // verify_nax serves a K of whole steps from an aligned weight base. The
-// q8_0 kernel reads its weights as 4-byte words and the q4_k and q5_k
-// kernels as 16-byte words, and a zero-copy GGUF tensor or an offset view
-// can start off that alignment, so such a call declines. The q5_k step is
-// half a superblock, but its kernel reads whole superblocks, so q5_k also
-// needs K in whole superblocks. Rows of such a K stay aligned with the
-// base.
+// q8_0 and eight-block q4_0 kernels read their weights as 4-byte words
+// and the q4_k and q5_k kernels as 16-byte words, and a zero-copy GGUF
+// tensor or an offset view can start off that alignment, so such a call
+// declines. The 4-byte check applies to every other codec of the route
+// too. The q5_k step is half a superblock, but its kernel reads
+// whole superblocks, so q5_k also needs K in whole superblocks. Rows of
+// such a K stay aligned with the base.
 static bool
 kq_verify_nax_fits(const array& w, int K, int kstep, const std::string& t) {
   const bool kq = t == "q4_k" || t == "q5_k";
@@ -933,11 +948,11 @@ void verify_nax(
     int M,
     int N,
     int K,
+    int kstep,
     int splits,
     Device& d,
     const Stream& s,
     const std::string& kquant_type) {
-  const int kstep = codec_verify_nax_kstep(kquant_type);
   const int k_partition = (K / kstep / splits) * kstep;
   const int part_stride = M * N;
 
@@ -953,7 +968,9 @@ void verify_nax(
   kname.reserve(64);
   mx::concatenate(
       kname,
-      kq_kname_prefix(kquant_type) + "verify_nax_",
+      (kquant_type == "q4_0" && kstep == 256 ? "kquant_q4_0_sb_"
+                                             : kq_kname_prefix(kquant_type)) +
+          "verify_nax_",
       type_string,
       "_gs_",
       group_size,
@@ -1516,13 +1533,14 @@ static int kq_verify_mma_splits(int N, int K, int group_size, int rows) {
 
 // verify_nax split count. Device loads and NAX ops of one simdgroup do not
 // overlap, so the kernel runs at the rate its resident simdgroups hide the
-// loads. The target grid is about 600 simdgroups of 32 rows. q4_0 also
-// targets a K walk of 640 per simdgroup (8 splits at K 5120), which
-// measured faster at every Bonsai shape on M5 Max, the vocab head
-// included, where the grid is full without splits. q4_k and q5_k take
-// floor(640 / simdgroups), so they split only while the grid stays at or
-// under 640 simdgroups: grids just past that (N 12288 at 2 splits, N 6144
-// at 4) ran 1.1x slower than the smaller grid on M5 Max.
+// loads. The target grid is about 600 simdgroups of 32 rows. The
+// two-block q4_0 kernel also targets a K walk of 640 per simdgroup (8
+// splits at K 5120), which measured faster at every Bonsai shape on M5
+// Max, the vocab head included, where the grid is full without splits.
+// q4_k, q5_k and the eight-block q4_0 kernel take floor(640 /
+// simdgroups), so they split only while the grid stays at or under 640
+// simdgroups: grids just past that (N 12288 at 2 splits, N 6144 at 4) ran
+// 1.1x slower than the smaller grid on M5 Max.
 // The count is the largest divisor of the K steps at or under the target,
 // at most 16. KQ_VERIFY_NAX_SPLITS=<n> replaces the target (probe lever).
 static int kq_verify_nax_splits(int N, int K, int kstep, const std::string& t) {
@@ -1530,9 +1548,9 @@ static int kq_verify_nax_splits(int N, int K, int kstep, const std::string& t) {
   const int env = e != nullptr ? std::atoi(e) : 0;
   const int sgs = (N + 31) / 32;
   int target = (600 + sgs - 1) / sgs;
-  if (t == "q4_0") {
+  if (t == "q4_0" && kstep == 64) {
     target = std::max(target, (K + 639) / 640);
-  } else if (t == "q4_k" || t == "q5_k") {
+  } else if (t == "q4_k" || t == "q5_k" || t == "q4_0") {
     target = 640 / sgs;
   }
   target = env > 0 ? env : std::min(16, std::max(1, target));
@@ -1588,11 +1606,12 @@ bool kq_forced_route(
     return false;
   }
   if (r == "verify_nax") {
-    const int kstep = codec_verify_nax_kstep(t);
+    const int kstep = kq_verify_nax_call_kstep(K, t);
     if (kq_is_nax_available() && codec_has_nax(t) && M <= 8 &&
         kq_verify_nax_fits(w, K, kstep, t)) {
       const int sp = kq_verify_nax_splits(N, K, kstep, t);
-      verify_nax(x, w, scales, out, group_size, bits, M, N, K, sp, d, s, t);
+      verify_nax(
+          x, w, scales, out, group_size, bits, M, N, K, kstep, sp, d, s, t);
       return true;
     }
     return false;
@@ -1940,7 +1959,7 @@ void KQuantMatmul::eval_gpu_base(
   // KQ_QMM_SPLITK_NAX, so their arms time the route they name.
   if (transpose_ && non_batched && M <= 8 && x.dtype() != mx::float32 &&
       kq_is_nax_available() && codec_has_nax(kquant_type_)) {
-    const int kstep = codec_verify_nax_kstep(kquant_type_);
+    const int kstep = kq_verify_nax_call_kstep(K, kquant_type_);
     const char* vnax_e = std::getenv("KQ_VERIFY_NAX");
     const int vnax_env = vnax_e != nullptr ? std::atoi(vnax_e) : -1;
     const char* vmma_f = std::getenv("KQ_VERIFY_MMA");
@@ -1967,6 +1986,7 @@ void KQuantMatmul::eval_gpu_base(
           M,
           N,
           K,
+          kstep,
           sp,
           d,
           s,

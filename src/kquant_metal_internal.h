@@ -205,7 +205,9 @@ inline int codec_verify_mma_rows(const std::string& kquant_type) {
 
 // Codecs with a register-fed NAX verify kernel (kq_verify_nax.h) and the K
 // its loop consumes per iteration (units per iteration times the unit
-// width); 0 for codecs without the kernel. NAX GPUs, M <= 8 only.
+// width); 0 for codecs without the kernel. NAX GPUs, M <= 8 only. q4_0
+// lists its two-block kernel; the host runs the eight-block kernel (256)
+// where K is a multiple of 256 (kq_verify_nax_call_kstep).
 inline int codec_verify_nax_kstep(const std::string& kquant_type) {
   if (kquant_type == "pq2_0" || kquant_type == "q8_0") {
     return 128;
