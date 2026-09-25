@@ -108,13 +108,13 @@ int kq_sdpa_blocks(int N, int n_simds, Device& d) {
 // Split count for sdpa_fa_verify, and for the shared-prefix pass of
 // sdpa_decode_gqa_cascade, when the caller passes 0. The grid is
 // (Hkv, B, splits), so with few KV heads the decode buckets leave most of a
-// large GPU idle below about 12k keys. On the architecture classes MLX's
-// GEMM tuning treats as large (s, c, d) the count rises until about 512
-// simdgroups are in flight (1024 at head_dim <= 128, whose tiles are
-// lighter), never below the decode bucket and never past one 32-key tile
-// per split; folds over 32 rows take 128 splits past 16k keys. Powers of
-// two only, since each count is its own pipeline. Tuned on M5 Max; other
-// classes keep the decode buckets.
+// large GPU idle below about 16k keys. On the architecture classes MLX's NAX
+// GEMM routes as larger devices (s for Max, d for Ultra, and c) the count
+// rises until about 512 simdgroups are in flight (1024 at head_dim <= 128,
+// whose tiles are lighter). It never drops below the decode bucket, and from
+// 512 keys up it stays at or under one split per 32 keys. Folds over 32 rows
+// take 128 splits past 16k keys. Powers of two only, since each count is its
+// own pipeline. Tuned on M5 Max; base and Pro chips keep the decode buckets.
 int kq_fa_verify_splits(
     int B,
     int n_kv_heads,

@@ -680,9 +680,11 @@ def test_sdpa_fa_verify_bq64_strided_kv():
     "D,Hkv,G,qL,kL,want",
     [
         (256, 2, 12, 2, 4096, 64),  # fills 512 simdgroups at 2 kv heads
-        (256, 4, 6, 8, 20000, 128),  # 48-row fold past 16k keys
+        (256, 4, 6, 8, 16384, 32),  # 48-row fold at 16k keys keeps the bucket
+        (256, 4, 6, 8, 16385, 128),  # 48-row fold past 16k keys
         (512, 2, 4, 8, 2048, 32),  # d-split kernel, 8 simdgroups each
-        (128, 4, 8, 4, 1040, 32),  # capped at one 32-key tile per split
+        (128, 4, 8, 4, 1040, 32),  # at most one split per 32 keys
+        (256, 2, 12, 2, 700, 16),  # under 1024 keys the cap stays at 16
         (64, 8, 4, 8, 8192, 32),  # 1024 simdgroups at head_dim <= 128
     ],
 )
@@ -856,18 +858,20 @@ def test_sdpa_cascade_fused_bq48():
 
 
 @pytest.mark.parametrize(
-    "B,Hq,Hkv,D,want",
+    "B,Hq,Hkv,D,P,want",
     [
-        (4, 16, 2, 256, 64),  # 32 shared rows at 2 kv heads
-        (8, 32, 8, 128, 32),  # 32 shared rows at head_dim 128
+        (4, 16, 2, 256, 4096, 64),  # 32 shared rows at 2 kv heads
+        (8, 32, 8, 128, 4096, 32),  # 32 shared rows at head_dim 128
+        (4, 8, 2, 512, 4096, 32),  # d-split kernel, 8 simdgroups each
+        (8, 24, 4, 256, 16385, 128),  # 48 shared rows past 16k keys
     ],
 )
-def test_sdpa_cascade_default_shared_splits(B, Hq, Hkv, D, want):
+def test_sdpa_cascade_default_shared_splits(B, Hq, Hkv, D, P, want):
     # The shared-prefix pass takes sdpa_fa_verify's split count on the
     # large GPU classes; elsewhere it keeps the decode bucket.
     if mx.device_info()["architecture"][-1] not in "scd":
-        want = 16
-    P, Sp = 4096, 257
+        want = 16 if P <= 8192 else 32
+    Sp = 257
     scale = 1.0 / (D**0.5)
     _, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, mx.bfloat16, seed=27, strided=False)
     q, k_pr, v_pr = _make(B, Hq, Hkv, 1, Sp, D, mx.bfloat16, seed=28, strided=False)
