@@ -371,4 +371,8 @@ instantiate_kquant_verify_nax(bfloat16_t, 256, 5, q5_k)
 instantiate_kquant_verify_nax(float16_t, 256, 5, q5_k)
 instantiate_kquant_verify_nax(bfloat16_t, 256, 6, q6_k)
 instantiate_kquant_verify_nax(float16_t, 256, 6, q6_k)
+instantiate_kquant_verify_nax(bfloat16_t, 256, 3, q3_k)
+instantiate_kquant_verify_nax(float16_t, 256, 3, q3_k)
+instantiate_kquant_verify_nax(bfloat16_t, 256, 2, q2_k)
+instantiate_kquant_verify_nax(float16_t, 256, 2, q2_k)
     // clang-format on

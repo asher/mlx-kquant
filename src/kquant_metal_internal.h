@@ -218,7 +218,8 @@ inline int codec_verify_nax_kstep(const std::string& kquant_type) {
   if (kquant_type == "q4_k") {
     return 256;
   }
-  if (kquant_type == "q5_k" || kquant_type == "q6_k") {
+  if (kquant_type == "q5_k" || kquant_type == "q6_k" || kquant_type == "q3_k" ||
+      kquant_type == "q2_k") {
     return 128;
   }
   return 0;

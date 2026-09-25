@@ -13,7 +13,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 - On NAX GPUs, speculative-decode verification runs faster on `pq2_0`,
-  `ptq1_0`, `q4_0`, `q8_0`, `q4_k`, `q5_k` and `q6_k` weights.
+  `ptq1_0`, `q4_0`, `q8_0`, `q2_k`, `q3_k`, `q4_k`, `q5_k` and `q6_k`
+  weights.
 - `ptq1_0` matmuls with one activation row, such as plain decode, run faster.
 - On NAX GPUs, matmuls with up to 16 activation rows that run on a NAX tile,
   such as speculative-decode verification, run faster. The same holds up to
