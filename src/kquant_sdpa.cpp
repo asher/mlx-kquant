@@ -540,10 +540,11 @@ void KQuantSDPAFAVerify::eval_gpu(
 
   // Pass 1: one threadgroup per (kv-head, batch, split) streams its key
   // chunk through the simdgroup-matrix tile. head_dim 256 runs a simdgroup
-  // per 8 tile rows ((BQ/8)*32 threads); 512 runs the 256-thread d-split
-  // variant (BQ 32 only, capped at the op).
+  // per 8 tile rows ((BQ/8)*32 threads, BQ the smallest of 32, 48, 64 that
+  // holds the fold); 512 runs the 256-thread d-split variant (BQ 32 only,
+  // capped at the op).
   {
-    const int bq = n_rows <= 32 ? 32 : 64;
+    const int bq = n_rows <= 32 ? 32 : n_rows <= 48 ? 48 : 64;
     std::string kname = "kq_sdpa_fa_verify_2pass_1_" + ts + "_" +
         std::to_string(D) + "_bq" + std::to_string(bq);
     std::string hash = kname + "_s" + std::to_string(splits) +
@@ -957,7 +958,7 @@ void KQuantSDPACascade::eval_gpu(
         {&f, MTL::DataType::DataTypeBool, 3},
         {&q8, MTL::DataType::DataTypeBool, 5},
     };
-    const int bq = n_rows <= 32 ? 32 : 64;
+    const int bq = n_rows <= 32 ? 32 : n_rows <= 48 ? 48 : 64;
     std::string kname = "kq_sdpa_fa_verify_2pass_1_" + ts + "_" +
         std::to_string(D) + "_bq" + std::to_string(bq);
     std::string hash =

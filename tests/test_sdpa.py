@@ -647,10 +647,29 @@ def test_sdpa_fa_verify_bq64_full_tile(dtype):
     _check_fa(256, 4, kL=4096, dtype=dtype, Hkv=2, G=16)
 
 
-@pytest.mark.parametrize("G,qL", [(8, 5), (12, 4), (10, 6)])
+@pytest.mark.parametrize("G,qL", [(10, 6), (7, 7), (14, 4)])
 def test_sdpa_fa_verify_bq64_padded(G, qL):
-    # 33..63 rows: BQ=64 with padding rows in the upper simdgroups
+    # 49..63 rows: BQ=64 with padding rows in the upper simdgroups
     _check_fa(256, qL, kL=2048, dtype=mx.bfloat16, Hkv=2, G=G)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_sdpa_fa_verify_bq48_full_tile(D, dtype):
+    # gqa6 x qL8 = 48 rows (qwen3.x full attention at a DFlash 2 block of
+    # 8): fills the BQ=48 tile exactly
+    _check_fa(D, 8, kL=4096, dtype=dtype, Hkv=4, G=6)
+
+
+@pytest.mark.parametrize("G,qL", [(8, 5), (6, 6), (6, 7), (12, 4)])
+def test_sdpa_fa_verify_bq48_padded(G, qL):
+    # 33..48 rows: BQ=48, padding rows in the top simdgroup below 48
+    _check_fa(256, qL, kL=2048, dtype=mx.bfloat16, Hkv=2, G=G)
+
+
+def test_sdpa_fa_verify_bq48_strided_split_straddle():
+    # the last qL keys alone in the final split, over a strided cache view
+    _check_fa(256, 8, kL=4098, dtype=mx.bfloat16, Hkv=4, G=6, strided=True, splits=128)
 
 
 def test_sdpa_fa_verify_bq64_strided_kv():
@@ -788,6 +807,27 @@ def test_sdpa_cascade_fused_matches_concat(D, dtype):
     rel = _rel(got, ref)
     print(f"  [cascade] fused D={D} {dtype}: rel={rel:.3e}")
     assert rel < REL_BOUND[dtype], f"fused cascade rel {rel:.3e}"
+
+
+def test_sdpa_cascade_fused_bq48():
+    # B * G = 48 folded rows: the cascade's shared-prefix pass on the BQ=48
+    # tile
+    B, Hq, Hkv, D = 12, 32, 8, 128
+    P, Sp = 3071, 257
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, mx.bfloat16, seed=25, strided=False)
+    q, k_pr, v_pr = _make(B, Hq, Hkv, 1, Sp, D, mx.bfloat16, seed=26, strided=False)
+    k_full = mx.contiguous(
+        mx.concatenate([mx.broadcast_to(k_sh, (B, Hkv, P, D)), k_pr], axis=2)
+    )
+    v_full = mx.contiguous(
+        mx.concatenate([mx.broadcast_to(v_sh, (B, Hkv, P, D)), v_pr], axis=2)
+    )
+    ref = kq.sdpa_decode_gqa(q, k_full, v_full, scale)
+    got = kq.sdpa_decode_gqa_cascade(q, k_sh, v_sh, k_pr, v_pr, scale)
+    _eval_or_skip(got, ref)
+    rel = _rel(got, ref)
+    assert rel < REL_BOUND[mx.bfloat16], f"bq48 cascade rel {rel:.3e}"
 
 
 def test_sdpa_cascade_fused_starts():

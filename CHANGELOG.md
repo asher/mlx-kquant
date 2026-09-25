@@ -25,6 +25,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - On NAX GPUs, matmuls with a few activation rows run faster at inner
   dimensions such as 11008, 17408 and 18944, which split-K could not divide
   evenly into enough slices. `KQ_SPLITK_RAGGED=0` restores the equal split.
+- `sdpa_fa_verify` and `sdpa_decode_gqa_cascade` run faster when the folded
+  query holds 33 to 48 rows, such as Qwen3.x full attention verifying 6 to 8
+  draft tokens.
 
 ### Fixed
 - `q4_0` matmuls with 2 to 8 activation rows no longer return inf when one

@@ -103,7 +103,8 @@ instantiate_kq_sdpa_gqa_p2(bfloat16_t, 64, 32, 4)
 instantiate_kq_sdpa_gqa_p2(float16_t, 64, 32, 4)
 
 // Simdgroup-matrix FA verify pass 1 (folded GQA, one BQ-row Q tile: BQ 32
-// covers folds to gqa8 x qL4, BQ 64 to gqa16 x qL4 / gqa8 x qL8); the
+// covers folds to gqa8 x qL4, BQ 48 to gqa6 x qL8 / gqa12 x qL4, BQ 64 to
+// gqa16 x qL4 / gqa8 x qL8); the
 // merge reuses kq_sdpa_gqa_2pass_2. head_dim 256 uses the register-resident
 // kernel ((BQ/8)*32 threads); head_dim 512 uses the 256-thread d-split
 // variant (Q/O halves per simdgroup pair, S exchanged through threadgroup
@@ -125,14 +126,20 @@ instantiate_kq_sdpa_gqa_p2(float16_t, 64, 32, 4)
 
 instantiate_kq_sdpa_fa_verify(bfloat16_t, 64, 32)
 instantiate_kq_sdpa_fa_verify(float16_t, 64, 32)
+instantiate_kq_sdpa_fa_verify(bfloat16_t, 64, 48)
+instantiate_kq_sdpa_fa_verify(float16_t, 64, 48)
 instantiate_kq_sdpa_fa_verify(bfloat16_t, 64, 64)
 instantiate_kq_sdpa_fa_verify(float16_t, 64, 64)
 instantiate_kq_sdpa_fa_verify(bfloat16_t, 128, 32)
 instantiate_kq_sdpa_fa_verify(float16_t, 128, 32)
+instantiate_kq_sdpa_fa_verify(bfloat16_t, 128, 48)
+instantiate_kq_sdpa_fa_verify(float16_t, 128, 48)
 instantiate_kq_sdpa_fa_verify(bfloat16_t, 128, 64)
 instantiate_kq_sdpa_fa_verify(float16_t, 128, 64)
 instantiate_kq_sdpa_fa_verify(bfloat16_t, 256, 32)
 instantiate_kq_sdpa_fa_verify(float16_t, 256, 32)
+instantiate_kq_sdpa_fa_verify(bfloat16_t, 256, 48)
+instantiate_kq_sdpa_fa_verify(float16_t, 256, 48)
 instantiate_kq_sdpa_fa_verify(bfloat16_t, 256, 64)
 instantiate_kq_sdpa_fa_verify(float16_t, 256, 64)
 instantiate_kq_sdpa_fa_verify_dsplit(bfloat16_t, 512)

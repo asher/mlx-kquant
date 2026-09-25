@@ -928,7 +928,7 @@ METAL_FUNC void kq_fa_stage_rows_q8(
 // Simdgroup-matrix (steel MMA) speculative-verify attention, pass 1. The
 // caller folds the GQA group into the query rows -- q [B, Hq, qL, D] becomes
 // [B, Hkv, G*qL, D] with kv-major heads -- so the kernel sees an MHA problem
-// whose n_rows = G*qL <= BQ queries fill one BQ-row tile (BQ 32 or 64; one
+// whose n_rows = G*qL <= BQ queries fill one BQ-row tile (BQ 32, 48 or 64; one
 // 8-row fragment strip per simdgroup, so per-thread register pressure is
 // BQ-independent), held in per-thread fragments (each thread owns one row of
 // every 8x8 fragment, so the online-softmax row max/sum live in registers
