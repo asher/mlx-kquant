@@ -74,6 +74,11 @@ inline int kquant_qmv_fast_bn(const std::string& kquant_type) {
   return kquant_type == "ptq1_0" ? 8 : kquant_qmv_bn(kquant_type);
 }
 
+// Output rows and simdgroups per threadgroup of the split-K M=1 qmv. Must
+// match KQ_Q6_K_SPLITK_RPS and KQ_Q6_K_SPLITK_NSG in kq_quantized_kquants.h.
+constexpr int kq_q6_k_splitk_rps = 4;
+constexpr int kq_q6_k_splitk_nsg = 8;
+
 // quantized.cpp:63-65 (kquant branch). KQuant blocks are 32 or 256 weights.
 inline int qmv_fast_k_align() {
   return 256;

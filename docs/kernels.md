@@ -110,6 +110,20 @@ clamped row index, so the compiler interleaves the rows' loads; the tail threadg
 last row and drops it at the store. `q2_k` and `q3_k` keep the runtime bound: the static form measured no
 faster for them.
 
+A `q6_k` `quantized_matmul` with one activation row and no batch dimensions runs a split-K kernel
+when 4 divides N. The MoE gathers keep their own kernels. The eight simdgroups of a threadgroup
+share four output rows, divide the superblocks between them and add their partial sums in
+threadgroup memory. Each thread assembles four 6-bit codes at a time from 32-bit words and
+pre-scales the activation for byte b of a word by 2^(-8b), so a weight costs one AND, one convert
+and one FMA.
+
+Under sustained decode the GPU runs below its top clock, where the per-row kernels turn ALU-bound.
+Measured on M5 Max over 90 seconds of back-to-back mat-vecs at the gemma-4 31B MLP shapes, the
+split-K kernel read 450-465 GB/s at the lowest clock, against 385-395 GB/s for the per-row kernels
+and about 530 GB/s for bf16 GEMV. Once the clock dropped it read 1.12-1.14x the per-row rate at
+inner dimensions of 4096 and 5120, and matched it at 2048 and below. In short runs at a high clock
+the two kernels are within 3% of each other on every shape measured.
+
 Tuning levers (defaults are right for normal use):
 
 - `KQ_NAX_SMALL_BM` - small-M routing. `0` restores the old routing (mat-vec paths below M 13 and
@@ -145,6 +159,13 @@ Tuning levers (defaults are right for normal use):
   in `kq_nax_small_m`, which yields to a forced `KQ_VERIFY_NAX` or `KQ_VERIFY_MMA` on a codec they
   serve, a forced `KQ_QMM_SPLITK_NAX` or `KQ_QMM_SPLITK`, and a set `KQ_VERIFY_EXT`.
   `KQ_DISABLE_NAX=1` turns it off. Read live per call.
+- `KQ_QMV_FINE` - tiling of the per-row mat-vec. `1` forces two output rows per threadgroup, `0`
+  forces the coarse tiling, and unset takes the fine tiling at one activation row up to the
+  per-codec N ceiling that `kq.qmv_fine_max_n(codec)` reports. Read live per call.
+- `KQ_QMV_SPLITK` - the `q6_k` split-K kernel for one activation row. `0` restores the per-row
+  kernels, as does a set `KQ_QMV_FINE`, so a tiling A/B keeps measuring the tiling it names. A
+  lever that forces another route at one row, such as `KQ_VERIFY_NAX=1`, takes precedence. Read
+  live per call.
 - `KQ_VERIFY_EXT` - the mat-vec route on the M 2-12 band. `1` forces `mv_ext` for every codec with
   the kernel, `0` forces `verify_qmv` where the codec has it and per-row qmv elsewhere, and unset
   takes the per-codec default. On NAX GPUs a set value also keeps per-row qmv and NAX split-K off

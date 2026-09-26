@@ -273,6 +273,8 @@ All optional; the defaults are right for normal use.
   mat-vec takes the fine tiling. The ceilings were calibrated on a 40-core GPU and apply as-is
   when unset; set it to the part's core count (`kq.gpu_core_count()` reads it from IOKit, 0 in a
   virtual machine) to scale them by cores/40. `kq.qmv_fine_max_n(codec)` reports the ceiling in effect.
+  `q6_k` takes the fine tiling only where its split-K mat-vec does not run
+  ([kernels.md](docs/kernels.md#quantized-matmul-and-moe-gather-fusions)).
 - `KQ_DISABLE_VERIFY_QMV=1` - on Metal, force the plain per-row `qmv` path instead of the
   weight-read-amortizing `verify_qmv` kernel. An A/B debugging lever, not a tuning knob.
 - `KQ_DISABLE_GATHER_RHS_ALU=1` - on Metal without NAX, force sorted MoE prefill back to the
