@@ -1559,20 +1559,17 @@ static int kq_verify_mma_splits(int N, int K, int group_size, int rows) {
 
 // verify_nax split count from GPU waves of 640 simdgroups, the M5 Max
 // figure. Count sp costs ceil(simdgroups * sp / 640) waves of steps / sp
-// K steps each, plus simdgroups * sp / 2560 for its partials. The count is
-// the cheapest power of two that divides the K steps. Another divisor
-// replaces it only when it costs at most 3/4 as much, since counts 5 and
-// 10 ran up to 1.07x slower than the powers of two the model ranked below
-// them at N 12288 and 6144, K 5120. The 70 steps of K 8960 still split
-// finely, and N 1024, K 5120 takes 20 splits, which ran 1.13-1.23x faster
-// than 8. Over q3_k and q2_k sweeps at M 4 and 8 on 15 shapes, the
-// Qwen3.8-27B projections and head and N 1024 to 4096 at K 4096 to 8960,
-// the count ran within 1.03x of the best measured count on 55 of 60 cells.
-// The worst cell is q3_k at N 4096, K 4096, M 4, where it takes 4 splits
-// and runs 1.10x slower than 32.
-static int kq_verify_nax_wave_splits(int sgs, int steps) {
+// K steps each, plus simdgroups * sp / partial_c for its partials. The
+// count is the cheapest power of two that divides the K steps. Another
+// divisor replaces it only when it costs at most 3/4 as much, since on
+// q3_k and q2_k counts 5 and 10 ran up to 1.07x slower than the powers of
+// two the model ranked below them at N 12288 and 6144, K 5120. The count
+// has no cap, so the 70 steps of K 8960 still split finely, and N 1024,
+// K 5120 takes 20 splits, which ran 1.13-1.23x faster than 8 on q3_k and
+// q2_k.
+static int kq_verify_nax_wave_splits(int sgs, int steps, double partial_c) {
   const auto cost = [&](int sp) {
-    return double((sgs * sp + 639) / 640) * (steps / sp) + sgs * sp / 2560.0;
+    return double((sgs * sp + 639) / 640) * (steps / sp) + sgs * sp / partial_c;
   };
   int best = 1;
   int other = 0;
@@ -1589,31 +1586,50 @@ static int kq_verify_nax_wave_splits(int sgs, int steps) {
   return other > 0 && cost(other) <= 0.75 * cost(best) ? other : best;
 }
 
-// verify_nax split count. Device loads and NAX ops of one simdgroup do not
-// overlap, so the kernel runs at the rate its resident simdgroups hide the
-// loads. The target grid is about 600 simdgroups of 32 rows. The
-// two-block q4_0 kernel also targets a K walk of 640 per simdgroup (8
-// splits at K 5120), which measured faster at every Bonsai shape on M5
-// Max, the vocab head included, where the grid is full without splits.
-// q4_k, q5_k and the eight-block q4_0 kernel take floor(640 /
-// simdgroups), so they split only while the grid stays at or under 640
-// simdgroups, since grids just past that (N 12288 at 2 splits, N 6144 at
-// 4) ran 1.1x slower than the smaller grid on M5 Max.
-// The count is the largest divisor of the K steps at or under the target,
-// at most 16. q6_k instead targets about 1280 simdgroups and a K walk of
-// at most 2560, and takes the smallest divisor at or above that, or the
-// largest under it when no divisor up to 16 reaches it. Its grids of about
-// 768 simdgroups (N 12288 at 2 splits, N 6144 at 4) ran 1.10-1.15x slower
-// than grids of 1280 to 1536 on M5 Max, and the vocab head at 1 split
-// 1.06-1.07x slower than at 2. q3_k and q2_k take the count from
-// kq_verify_nax_wave_splits, with no cap of 16. KQ_VERIFY_NAX_SPLITS=<n>
-// replaces the target (probe lever).
+// Partial charge of kq_verify_nax_wave_splits per codec, or 0 for the
+// codecs on a simdgroup target. q4_k and the eight-block q4_0 kernel fit
+// best at 640, and q2_k, q3_k and q5_k at 2560. The fit ran on M5 Max in
+// bfloat16 at M 3 for q4_0, q4_k and q5_k, M 4 for q2_k and q3_k, and M 8,
+// over the eight Qwen3.8-27B projection and head shapes and 12 shapes of
+// N 1024 to 14336 at K 2048 to 14336. On q4_0, q4_k and q5_k the count ran
+// within 1.03x of the best measured count on 101 of 120 cells and 1.12x
+// slower at worst, where a grid of at most 640 simdgroups managed 92 cells
+// and 1.65x. It cut the verify_nax matmul time of one Qwen3.8-27B forward
+// by 2.4-2.8% on q5_k and 0.05-0.4% on q4_0 and q4_k. q6_k and q8_0 keep
+// their simdgroup targets, which beat the wave count on that matmul time
+// by 0.3-0.9%, the largest share at N 17408, K 5120.
+static double kq_verify_nax_partial_c(const std::string& t, int kstep) {
+  if (t == "q4_k" || (t == "q4_0" && kstep == 256)) {
+    return 640.0;
+  }
+  if (t == "q2_k" || t == "q3_k" || t == "q5_k") {
+    return 2560.0;
+  }
+  return 0.0;
+}
+
+// verify_nax split count. The wave codecs take kq_verify_nax_wave_splits.
+// The others target about 600 simdgroups of 32 rows, since device loads
+// and NAX ops of one simdgroup do not overlap and the kernel runs at the
+// rate its resident simdgroups hide the loads. The two-block q4_0 kernel
+// also targets a K walk of 640 per simdgroup, 8 splits at K 5120, which
+// measured faster at every Ternary Bonsai 2 27B shape on M5 Max, the vocab
+// head included, where the grid is full without splits. Their count is the
+// largest divisor of the K steps at or under the target, at most 16. q6_k
+// instead targets about 1280 simdgroups and a K walk of at most 2560, and
+// takes the smallest divisor at or above that, or the largest under it
+// when no divisor up to 16 reaches it. Its grids of about 768 simdgroups,
+// N 12288 at 2 splits and N 6144 at 4, ran 1.10-1.15x slower than grids
+// of 1280 to 1536 on M5 Max, and the vocab head at 1 split 1.06-1.07x
+// slower than at 2. KQ_VERIFY_NAX_SPLITS=<n> replaces the target on every
+// codec (probe lever).
 static int kq_verify_nax_splits(int N, int K, int kstep, const std::string& t) {
   const char* e = std::getenv("KQ_VERIFY_NAX_SPLITS");
   const int env = e != nullptr ? std::atoi(e) : 0;
   const int sgs = (N + 31) / 32;
-  if ((t == "q3_k" || t == "q2_k") && env <= 0) {
-    return kq_verify_nax_wave_splits(sgs, K / kstep);
+  const double partial_c = kq_verify_nax_partial_c(t, kstep);
+  if (partial_c > 0.0 && env <= 0) {
+    return kq_verify_nax_wave_splits(sgs, K / kstep, partial_c);
   }
   if (t == "q6_k" && env <= 0) {
     const int steps = K / kstep;
@@ -1629,8 +1645,6 @@ static int kq_verify_nax_splits(int N, int K, int kstep, const std::string& t) {
   int target = (600 + sgs - 1) / sgs;
   if (t == "q4_0" && kstep == 64) {
     target = std::max(target, (K + 639) / 640);
-  } else if (t == "q4_k" || t == "q5_k" || t == "q4_0") {
-    target = 640 / sgs;
   }
   target = env > 0 ? env : std::min(16, std::max(1, target));
   return kq_split_count(target, K / kstep);

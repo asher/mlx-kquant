@@ -719,24 +719,39 @@ def test_verify_nax_q6_k_split_rule(n_out, k, count, other, monkeypatch):
     assert err < 2e-2 * float(mx.abs(ref).max())
 
 
-# q3_k and q2_k take the cheapest power-of-two split count by GPU waves of
-# 640 simdgroups, or another divisor that costs at most 3/4 as much. N
-# 12288, K 5120 takes 8 over 5, which the waves alone would pick. N 1536,
-# K 8960 (70 steps) takes 35 over 10, since the powers of two stop at 2.
-# N 5120, K 6144 takes 4 over 8 and 12. N 1024, K 5120 takes 20, above
-# 16. The default count runs bit for bit like the count forced through the
-# lever, and unlike the neighbouring count.
-@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
-@pytest.mark.parametrize(
-    "n_out, k, count, other",
-    [
-        (12288, 5120, 8, 5),
-        (1536, 8960, 35, 10),
-        (5120, 6144, 4, 8),
-        (1024, 5120, 20, 10),
+# q2_k, q3_k, q4_k, q5_k and the eight-block q4_0 kernel take the cheapest
+# power-of-two split count by GPU waves of 640 simdgroups, or another
+# divisor that costs at most 3/4 as much, with a partial charge of 640 for
+# q4_k and q4_0 and 2560 for the others. At 2560, N 12288, K 5120 takes 8,
+# since 5 costs less in the model but not 3/4 as much, and N 1536, K 8960
+# takes 35 over 10. At 640 the same N 1536, K 8960 in 256-weight steps
+# takes 7 over 35. N 2560, K 9728 takes 38 at 2560 and 19 at 640, where 2
+# splits ran up to 1.65x slower than 19. N 6144, K 5120 in 256-weight steps
+# takes 2 over 10. N 1024, K 5120 takes 20, above 16, which on q4_k is
+# every K step. The default count runs bit for bit like the count forced
+# through the lever, and unlike the neighbouring count.
+WAVE_SPLITS = [
+    *[
+        (codec, n_out, k, count, other)
+        for codec in ("q5_k", "q3_k", "q2_k")
+        for n_out, k, count, other in [
+            (12288, 5120, 8, 5),
+            (1536, 8960, 35, 10),
+            (2560, 9728, 38, 19),
+            (1024, 5120, 20, 10),
+        ]
     ],
-)
-@pytest.mark.parametrize("codec", ["q3_k", "q2_k"])
+    ("q4_k", 6144, 5120, 2, 10),
+    ("q4_k", 1536, 8960, 7, 35),
+    ("q4_k", 2560, 9728, 19, 38),
+    ("q4_k", 1024, 5120, 20, 10),
+    ("q4_0", 6144, 5120, 2, 10),
+    ("q4_0", 2560, 9728, 19, 38),
+]
+
+
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+@pytest.mark.parametrize("codec, n_out, k, count, other", WAVE_SPLITS)
 def test_verify_nax_wave_split_rule(codec, n_out, k, count, other, monkeypatch):
     wf = mx.random.normal((64, k), key=mx.random.key(4)) * 0.1
     w1, s = kq.quantize(wf, codec)

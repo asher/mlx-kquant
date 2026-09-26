@@ -242,19 +242,19 @@ accumulator is float32, which removes the half-range limit of `verify_mma`.
 A simdgroup's device loads and NAX ops do not overlap, so the kernel hides its loads through the
 simdgroups resident beside it, and the host sizes the split count for that. The kernels differ in
 the weights one K step decodes, the bytes each lane quad loads, when the activations load and the
-split target, as the table lists.
+split rule, as the table lists.
 
-| kernel | K step | lane quad loads | activations | split target | weight base |
+| kernel | K step | lane quad loads | activations | split rule | weight base |
 |---|---|---|---|---|---|
 | `pq2_0` | 128 | a piece of one block from each of 8 rows | a K step ahead | about 600 simdgroups | 4-byte |
 | `q4_0`, two-block | 64 | a piece of one block from each of 8 rows | a K step ahead | about 600 simdgroups, K walk 640 | 4-byte |
-| `q4_0`, eight-block | 256 | two whole blocks of one row, as nine 4-byte words | per NAX op | up to 640 simdgroups | 4-byte |
+| `q4_0`, eight-block | 256 | two whole blocks of one row, as nine 4-byte words | per NAX op | waves, partial charge 640 | 4-byte |
 | `q8_0` | 128 | one whole block of one row | per NAX op | about 600 simdgroups | 4-byte |
-| `q4_k` | 256 | the 16-byte header and a 32-byte quarter of one row's codes | per NAX op | up to 640 simdgroups | 16-byte |
-| `q5_k` | 128 | the header, 16 bytes of codes and their 16 bytes of high bits | per NAX op | up to 640 simdgroups | 16-byte |
+| `q4_k` | 256 | the 16-byte header and a 32-byte quarter of one row's codes | per NAX op | waves, partial charge 640 | 16-byte |
+| `q5_k` | 128 | the header, 16 bytes of codes and their 16 bytes of high bits | per NAX op | waves, partial charge 2560 | 16-byte |
 | `q6_k` | 128 | 16 bytes of low codes and their 16 bytes of high bits, as 2-byte words | per NAX op | about 1280 simdgroups, K walk 2560 | 2-byte |
-| `q3_k` | 128 | 8 bytes of low codes, their 8 bytes of high bits and the 12 scale bytes, as 2-byte words | per NAX op | GPU waves of 640 simdgroups | 2-byte |
-| `q2_k` | 128 | 8 bytes of codes and 8 bytes of scales and mins | per NAX op | GPU waves of 640 simdgroups | 4-byte |
+| `q3_k` | 128 | 8 bytes of low codes, their 8 bytes of high bits and the 12 scale bytes, as 2-byte words | per NAX op | waves, partial charge 2560 | 2-byte |
+| `q2_k` | 128 | 8 bytes of codes and 8 bytes of scales and mins | per NAX op | waves, partial charge 2560 | 4-byte |
 
 The `pq2_0` and two-block `q4_0` kernels decode each block in the permuted k order of `verify_mma`.
 The other kernels keep each lane's loads on one row, which measured faster. Spreading a `q8_0`
@@ -265,21 +265,23 @@ half weights. Loading a whole K step of activations ahead measured faster for `p
 two-block `q4_0` kernel, while the kernels with larger decoded words load them one NAX op at a time,
 since loading ahead ran `q4_k` 1.6-2x slower.
 
-Except on `q3_k` and `q2_k`, split counts are the largest divisor of the K steps at or under the
-target, at most 16. For `q6_k` the count is the smallest divisor at or above the target, or the
-largest under it when no divisor up to 16 reaches it. `q4_k`, `q5_k` and the eight-block `q4_0`
-kernel split only while the grid stays at or under 640 simdgroups, since grids just past that ran
-about 1.1x slower. `q6_k` grids of about 768 simdgroups ran 1.10-1.15x slower than grids of 1280 to
-1536. The two-block `q4_0` kernel's K walk of 640 per simdgroup measured faster even at the vocab
-head, where the grid is full without splits, and the `q6_k` head ran 1.06-1.07x slower on one split
-than on two.
+Split counts for `pq2_0`, `q8_0` and the two-block `q4_0` kernel are the largest divisor of the K
+steps at or under their target, at most 16. The two-block kernel's K walk of 640 per simdgroup
+measured faster even at the vocab head, where the grid is full without splits. For `q6_k` the count
+is the smallest divisor at or above the target, or the largest under it when no divisor up to 16
+reaches it. `q6_k` grids of about 768 simdgroups ran 1.10-1.15x slower than grids of 1280 to 1536,
+and the `q6_k` head ran 1.06-1.07x slower on one split than on two.
 
-The `q3_k` and `q2_k` kernels take their count from a model of GPU waves of 640 simdgroups. A count
-costs its waves times the K steps each simdgroup walks, plus a charge for its partials. The cheapest
-power of two that divides the K steps wins, unless another divisor costs at most 3/4 as much, and
-the count has no cap. N 1024, K 5120 therefore takes 20 splits, which ran 1.13-1.23x faster than 8.
-Over 15 shapes at M 4 and 8, the count ran within 1.03x of the best measured count on 55 of 60
-cells, and 1.10x slower at worst.
+The other kernels take their count from a model of GPU waves of 640 simdgroups. A count costs its
+waves times the K steps each simdgroup walks, plus the simdgroups of all its splits divided by the
+codec's partial charge. The charge is 640 for `q4_k` and the eight-block `q4_0` kernel and 2560 for
+`q2_k`, `q3_k` and `q5_k`. The cheapest power of two that divides the K steps wins, unless another divisor costs
+at most 3/4 as much, and the count has no cap. N 1024, K 5120 therefore takes 20 splits, which ran
+1.13-1.23x faster than 8 on `q3_k` and `q2_k`. The `q5_k` vocab head takes 4 splits and runs
+1.14-1.32x faster than on 1. Across the Qwen3.8-27B projection and head shapes and N 1024 to 14336
+at K 2048 to 14336, timed on M5 Max with bfloat16 activations, the count ran within 1.03x of the
+best measured count on 164 of 200 cells and 1.13x slower at worst. The sweep ran at M 3 for `q4_0`,
+`q4_k` and `q5_k`, M 4 for `q2_k` and `q3_k`, and M 8.
 
 A K that is not a whole number of K steps declines the route, and the K-quant kernels also need K in
 whole 256-weight superblocks. A two-block `q4_0` K with an odd count of blocks therefore runs on the
@@ -302,7 +304,7 @@ with every weight in the codec. Float16 activations give the same entries.
 | `q4_0` | M 3 | `mv_ext` at M 3 and 4, `verify_mma` from M 5 | 1.03-1.30x | 1.09-1.36x | 43.4 to 33.6 ms |
 | `q8_0` | M 6 | per-row qmv or `mv_ext` at M 6, NAX split-K at M 7 and 8 | 1.02-1.35x | 1.10-1.25x | 65 to 56 ms |
 | `q4_k` | M 3 | `mv_ext` at M 3 and 4, NAX split-K from M 5 | 1.03-1.32x | 1.18-1.39x | 45.6 to 34.2 ms |
-| `q5_k` | M 3 | `mv_ext` at M 3 and 4, NAX split-K from M 5 | 1.03-1.17x | 1.21-1.50x | 61.7 to 46.1 ms |
+| `q5_k` | M 3 | `mv_ext` at M 3 and 4, NAX split-K from M 5 | 1.10-1.17x | 1.30-1.51x | 61.6 to 44.7 ms |
 | `q6_k` | M 5, M 3 at N >= 100000 | the fastest other route per call | 1.09-1.18x | 1.19-1.74x | 71.7 to 47.1 ms |
 | `q3_k` | M 4, M 3 at N >= 100000 | the fastest other route per call | 1.08-1.24x | 1.18-1.44x | 55.7 to 41.3 ms |
 | `q2_k` | M 4 above N 4096, M 5 up to it, M 3 at N >= 100000 | the fastest other route per call | 1.06-1.23x | 1.07-1.27x | 44.4 to 37.6 ms |
