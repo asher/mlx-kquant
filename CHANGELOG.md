@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.14]
+
 ### Added
 - `KQ_QMM_ROUTE` and `KQ_QMM_ROUTE_STRICT` probe levers and
   `benchmarks/bench_verify_routes.py`, which time every small-M route of a
