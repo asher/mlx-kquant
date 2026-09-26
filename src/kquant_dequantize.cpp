@@ -97,6 +97,7 @@ void KQuantDequantize::eval_gpu(
     std::vector<mx::array>& outputs) {
   auto& w = inputs[0]; // uint8 wire bytes, row-contiguous (ensured by the op)
   auto& scales = inputs[1]; // vestigial placeholder, ignored by the kernel
+  kq_check_weight_base(w, kquant_type_, "dequantize");
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
 

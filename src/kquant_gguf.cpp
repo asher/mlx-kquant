@@ -23,6 +23,7 @@
 
 #include "kquant_codec.h"
 #include "kquant_gguf.h"
+#include "kquant_internal.h"
 
 #include "mlx/allocator.h"
 #include "mlx/dtype.h"
@@ -120,9 +121,11 @@ const char* zc_dtype_name(mx::Dtype d) {
 // nullopt when no wrap is possible; the caller then memcpy's.
 //
 // Alignment reasoning: gguflib mmaps at a page-aligned base and GGUF tensor
-// data sits at a 32-byte-aligned file offset, so `wd` is 32-aligned -> win_off
-// is a multiple of every dtype's itemsize (1/2/4/8) and win_base is
-// page-aligned (the pointer-alignment newBufferWithBytesNoCopy requires).
+// data sits at a file offset aligned to general.alignment, 32 by default and
+// a multiple of 8 by the spec, so `wd` is 8-aligned -> win_off is a multiple
+// of every dtype's itemsize (1/2/4/8) and win_base is page-aligned (the
+// pointer-alignment newBufferWithBytesNoCopy requires). load_block_tensor
+// also checks the codec's GPU start alignment before it asks for a view.
 std::optional<mx::array> try_zero_copy_array(
     const void* wd,
     size_t nbytes,
@@ -142,7 +145,7 @@ std::optional<mx::array> try_zero_copy_array(
   const uintptr_t win_base = addr & ~(static_cast<uintptr_t>(page) - 1);
   const size_t win_off = static_cast<size_t>(addr - win_base);
   if (win_off % isz != 0) {
-    return std::nullopt; // 32-byte GGUF alignment should make this unreachable.
+    return std::nullopt; // 8-byte GGUF alignment should make this unreachable.
   }
 
   const size_t win_bytes = win_off + nbytes;
@@ -449,8 +452,14 @@ void load_block_tensor(
         "[load_gguf] NULL tensor data pointer for " + name);
   }
 
+  // A GGUF with a general.alignment under 16 can place a tensor off the
+  // start alignment the codec's GPU kernels need. Such a tensor is copied
+  // into a new buffer instead of viewed, so the ops accept it.
+  const bool base_ok = reinterpret_cast<uintptr_t>(tensor.weights_data) %
+          kq_weight_base_align(codec_name) ==
+      0;
   mx::array packed_arr = [&]() -> mx::array {
-    if (zero_copy) {
+    if (zero_copy && base_ok) {
       if (auto a = try_zero_copy_array(
               tensor.weights_data,
               tensor.bsize,

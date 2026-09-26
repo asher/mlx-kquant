@@ -66,7 +66,21 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
   constexpr short TN = SN / 16;
   constexpr short TK = SK / 16;
 
-  const short tm = SM * (simd_gid / WN);
+  // K-split for short matmuls: when all M rows fit one SG-row, SG-row 1
+  // would multiply padding. Both SG-rows then take rows 0..SM-1 and split
+  // each BK step's two SK substeps, and SG-row 1's partial Dtile is summed
+  // into SG-row 0's through Ws after the K walk. Not applied to the short
+  // last row-tile of a taller M, where the full tiles set the time and the
+  // split measured slower. Needs the float reduction to fit one Ws buffer,
+  // which holds for BM=32 and BM=64 at 2-byte T.
+  constexpr int kRedFloats = WN * TM * TN * 16 * 16;
+  constexpr bool kCanKSplit = WM == 2 && BK == 2 * SK &&
+      kRedFloats * sizeof(float) <= BN * BK_padded * sizeof(T);
+  const bool ksplit = kCanKSplit && M <= SM;
+  const short sg_row = simd_gid / WN;
+  const short tm = ksplit ? 0 : SM * sg_row;
+  const short kk_first = ksplit ? SK * sg_row : 0;
+  const short kk_stride = ksplit ? BK : SK;
   const short tn = SN * (simd_gid % WN);
 
   constexpr bool transpose_a = false;
@@ -148,7 +162,7 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
           const threadgroup T* Wcur = Ws + (step & 1) * WS_STRIDE;
 
           STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          for (int kk1 = kk_first; kk1 < BK; kk1 += kk_stride) {
             NAXTile<T, TM, TK> Atile;
             NAXTile<T, TN, TK> Btile;
 
@@ -188,7 +202,7 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
           STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          for (int kk1 = kk_first; kk1 < BK; kk1 += kk_stride) {
             NAXTile<T, TM, TK> Atile;
             NAXTile<T, TN, TK> Btile;
 
@@ -218,6 +232,37 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
       }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      if constexpr (kCanKSplit) {
+        if (ksplit) {
+          constexpr short NE = decltype(Dtile)::kElemsPerFrag;
+          constexpr short NF = decltype(Dtile)::kNumFrags;
+          static_assert(
+              WN * NF * NE * SIMD_SIZE == kRedFloats, "K-split layout");
+          threadgroup float* red = reinterpret_cast<threadgroup float*>(Ws) +
+              (simd_gid % WN) * (NF * NE * SIMD_SIZE) + simd_lid;
+          if (sg_row == 1) {
+            STEEL_PRAGMA_UNROLL
+            for (short f = 0; f < NF; ++f) {
+              STEEL_PRAGMA_UNROLL
+              for (short e = 0; e < NE; ++e) {
+                red[(f * NE + e) * SIMD_SIZE] = Dtile.val_frags[f][e];
+              }
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (sg_row == 1) {
+            return;
+          }
+          STEEL_PRAGMA_UNROLL
+          for (short f = 0; f < NF; ++f) {
+            STEEL_PRAGMA_UNROLL
+            for (short e = 0; e < NE; ++e) {
+              Dtile.val_frags[f][e] += red[(f * NE + e) * SIMD_SIZE];
+            }
+          }
+        }
+      }
 
       if constexpr (kAlignedM.value && kAlignedN.value) {
         Dtile.store(y + tm * N + tn, N);
@@ -3587,13 +3632,14 @@ KQ_NAX_DEFINE_KERNELS(q6_k, 256, 6, KqNaxQ6_KBlockLoader)
 KQ_NAX_DEFINE_KERNELS(q3_k, 256, 3, KqNaxQ3_KBlockLoader)
 KQ_NAX_DEFINE_KERNELS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
 
-// Split-K qmm_t on the NAX tile (KQ_QMM_SPLITK_NAX, small-M experiment):
+// Split-K qmm_t on the NAX tile (KQ_QMM_SPLITK_NAX):
 // grid.z indexes K-slices; each slice walks k_partition_size weights from a
 // superblock-aligned start and stores a T partial tile at
 // tid.z * split_k_partition_stride. The shared kquant_qmm_splitk_accum pass
 // folds slices in f32. The host guarantees k_partition_size is a multiple
 // of both the codec superblock and BK, so every slice starts the loader at
-// kt_base 0. Non-batched transpose shapes only; no swizzle (grid.y is a
+// kt_base 0. The last slice stops at K, so it may be shorter than the
+// others. Non-batched transpose shapes only; no swizzle (grid.y is a
 // single row tile in the target band).
 #define KQ_NAX_DEFINE_SPLITK_KERNEL(codec, GROUP_CONST, bits_val, LOADER)    \
   template <                                                                 \
@@ -3643,6 +3689,7 @@ KQ_NAX_DEFINE_KERNELS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
     auto wl = w;                                                             \
     wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block; \
     y += int(tid.z) * static_cast<int64_t>(split_k_partition_stride);        \
+    const int k_len = min(k_partition_size, K - k_start);                    \
     kq_qmm_t_nax_tgp_impl<                                                   \
         T,                                                                   \
         LoaderW,                                                             \
@@ -3653,18 +3700,7 @@ KQ_NAX_DEFINE_KERNELS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
         WM,                                                                  \
         WN,                                                                  \
         kWsBufs == 2>(                                                       \
-        wl,                                                                  \
-        x,                                                                   \
-        y,                                                                   \
-        Ws,                                                                  \
-        K,                                                                   \
-        N,                                                                   \
-        M,                                                                   \
-        tid,                                                                 \
-        lid,                                                                 \
-        simd_gid,                                                            \
-        simd_lid,                                                            \
-        k_partition_size);                                                   \
+        wl, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid, k_len);         \
   }
 
 KQ_NAX_DEFINE_SPLITK_KERNEL(q6_k, 256, 6, KqNaxQ6_KBlockLoader)

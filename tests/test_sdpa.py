@@ -647,14 +647,60 @@ def test_sdpa_fa_verify_bq64_full_tile(dtype):
     _check_fa(256, 4, kL=4096, dtype=dtype, Hkv=2, G=16)
 
 
-@pytest.mark.parametrize("G,qL", [(8, 5), (12, 4), (10, 6)])
+@pytest.mark.parametrize("G,qL", [(10, 6), (7, 7), (14, 4)])
 def test_sdpa_fa_verify_bq64_padded(G, qL):
-    # 33..63 rows: BQ=64 with padding rows in the upper simdgroups
+    # 49..63 rows: BQ=64 with padding rows in the upper simdgroups
     _check_fa(256, qL, kL=2048, dtype=mx.bfloat16, Hkv=2, G=G)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_sdpa_fa_verify_bq48_full_tile(D, dtype):
+    # gqa6 x qL8 = 48 rows (qwen3.x full attention at a DFlash 2 block of
+    # 8): fills the BQ=48 tile exactly
+    _check_fa(D, 8, kL=4096, dtype=dtype, Hkv=4, G=6)
+
+
+@pytest.mark.parametrize("G,qL", [(8, 5), (6, 6), (6, 7), (12, 4)])
+def test_sdpa_fa_verify_bq48_padded(G, qL):
+    # 33..48 rows: BQ=48, padding rows in the top simdgroup below 48
+    _check_fa(256, qL, kL=2048, dtype=mx.bfloat16, Hkv=2, G=G)
+
+
+def test_sdpa_fa_verify_bq48_strided_split_straddle():
+    # the last qL keys alone in the final split, over a strided cache view
+    _check_fa(256, 8, kL=4098, dtype=mx.bfloat16, Hkv=4, G=6, strided=True, splits=128)
 
 
 def test_sdpa_fa_verify_bq64_strided_kv():
     _check_fa(256, 4, kL=3071, dtype=mx.bfloat16, Hkv=2, G=16, strided=True, splits=16)
+
+
+@pytest.mark.parametrize(
+    "D,Hkv,G,qL,kL,want",
+    [
+        (256, 2, 12, 2, 4096, 64),  # fills 512 simdgroups at 2 kv heads
+        (256, 4, 6, 8, 16384, 32),  # 48-row fold at 16k keys keeps the bucket
+        (256, 4, 6, 8, 16385, 128),  # 48-row fold past 16k keys
+        (512, 2, 4, 8, 2048, 32),  # d-split kernel, 8 simdgroups each
+        (128, 4, 8, 4, 1040, 32),  # at most one split per 32 keys
+        (256, 2, 12, 2, 700, 16),  # under 1024 keys the cap stays at 16
+        (64, 8, 4, 8, 8192, 32),  # 1024 simdgroups at head_dim <= 128
+    ],
+)
+def test_sdpa_fa_verify_default_splits(D, Hkv, G, qL, kL, want):
+    # On the large GPU classes splits=0 raises the count past the decode
+    # bucket to fill the GPU; elsewhere it keeps the bucket.
+    if mx.device_info()["architecture"][-1] not in "scd":
+        want = 16 if kL <= 8192 else 32
+    q, k, v = _make(1, Hkv, Hkv, G * qL, kL, D, mx.bfloat16, seed=kL + D, strided=False)
+    scale = 1.0 / (D**0.5)
+    got = kq.sdpa_fa_verify(q, k, v, scale, q_len=qL)
+    pinned = kq.sdpa_fa_verify(q, k, v, scale, q_len=qL, splits=want)
+    ref = _ref_sdpa_fold(q, k, v, scale, qL)
+    _eval_or_skip(got, pinned, ref)
+    assert mx.array_equal(got, pinned)
+    assert _rel(got, ref) < REL_BOUND[mx.bfloat16]
 
 
 @pytest.mark.parametrize("D", [64, 128])
@@ -788,6 +834,61 @@ def test_sdpa_cascade_fused_matches_concat(D, dtype):
     rel = _rel(got, ref)
     print(f"  [cascade] fused D={D} {dtype}: rel={rel:.3e}")
     assert rel < REL_BOUND[dtype], f"fused cascade rel {rel:.3e}"
+
+
+def test_sdpa_cascade_fused_bq48():
+    # B * G = 48 folded rows: the cascade's shared-prefix pass on the BQ=48
+    # tile
+    B, Hq, Hkv, D = 12, 32, 8, 128
+    P, Sp = 3071, 257
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, mx.bfloat16, seed=25, strided=False)
+    q, k_pr, v_pr = _make(B, Hq, Hkv, 1, Sp, D, mx.bfloat16, seed=26, strided=False)
+    k_full = mx.contiguous(
+        mx.concatenate([mx.broadcast_to(k_sh, (B, Hkv, P, D)), k_pr], axis=2)
+    )
+    v_full = mx.contiguous(
+        mx.concatenate([mx.broadcast_to(v_sh, (B, Hkv, P, D)), v_pr], axis=2)
+    )
+    ref = kq.sdpa_decode_gqa(q, k_full, v_full, scale)
+    got = kq.sdpa_decode_gqa_cascade(q, k_sh, v_sh, k_pr, v_pr, scale)
+    _eval_or_skip(got, ref)
+    rel = _rel(got, ref)
+    assert rel < REL_BOUND[mx.bfloat16], f"bq48 cascade rel {rel:.3e}"
+
+
+@pytest.mark.parametrize(
+    "B,Hq,Hkv,D,P,want",
+    [
+        (4, 16, 2, 256, 4096, 64),  # 32 shared rows at 2 kv heads
+        (8, 32, 8, 128, 4096, 32),  # 32 shared rows at head_dim 128
+        (4, 8, 2, 512, 4096, 32),  # d-split kernel, 8 simdgroups each
+        (8, 24, 4, 256, 16385, 128),  # 48 shared rows past 16k keys
+    ],
+)
+def test_sdpa_cascade_default_shared_splits(B, Hq, Hkv, D, P, want):
+    # The shared-prefix pass takes sdpa_fa_verify's split count on the
+    # large GPU classes; elsewhere it keeps the decode bucket.
+    if mx.device_info()["architecture"][-1] not in "scd":
+        want = 16 if P <= 8192 else 32
+    Sp = 257
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, mx.bfloat16, seed=27, strided=False)
+    q, k_pr, v_pr = _make(B, Hq, Hkv, 1, Sp, D, mx.bfloat16, seed=28, strided=False)
+    k_full = mx.contiguous(
+        mx.concatenate([mx.broadcast_to(k_sh, (B, Hkv, P, D)), k_pr], axis=2)
+    )
+    v_full = mx.contiguous(
+        mx.concatenate([mx.broadcast_to(v_sh, (B, Hkv, P, D)), v_pr], axis=2)
+    )
+    ref = kq.sdpa_decode_gqa(q, k_full, v_full, scale)
+    got = kq.sdpa_decode_gqa_cascade(q, k_sh, v_sh, k_pr, v_pr, scale)
+    pinned = kq.sdpa_decode_gqa_cascade(
+        q, k_sh, v_sh, k_pr, v_pr, scale, splits_shared=want
+    )
+    _eval_or_skip(got, pinned, ref)
+    assert mx.array_equal(got, pinned)
+    assert _rel(got, ref) < REL_BOUND[mx.bfloat16]
 
 
 def test_sdpa_cascade_fused_starts():
@@ -1379,6 +1480,23 @@ def test_sdpa_fa_indexed_splits(splits):
     got = kq.sdpa_fa_indexed(q, kv, idx, scale, splits)
     ref = _ref_sdpa_indexed(q, kv, idx, scale)
     _eval_or_skip(got, ref)
+    assert _rel(got, ref) < REL_BOUND[mx.bfloat16]
+
+
+@pytest.mark.parametrize("Q,want", [(1, 16), (3, 8), (8, 4), (16, 2)])
+def test_sdpa_fa_indexed_default_splits(Q, want):
+    # The NAX kernel on the large GPU classes drops the split count as the
+    # queries grow, since each split writes float32 partials; elsewhere the
+    # decode bucket stays.
+    if not kq.nax_available() or mx.device_info()["architecture"][-1] not in "scd":
+        want = 16
+    q, kv, idx = _make_indexed(64, Q, 4096, 2051, 0, mx.bfloat16, seed=Q)
+    scale = 512**-0.5
+    got = kq.sdpa_fa_indexed(q, kv, idx, scale)
+    pinned = kq.sdpa_fa_indexed(q, kv, idx, scale, want)
+    ref = _ref_sdpa_indexed(q, kv, idx, scale)
+    _eval_or_skip(got, pinned, ref)
+    assert mx.array_equal(got, pinned)
     assert _rel(got, ref) < REL_BOUND[mx.bfloat16]
 
 

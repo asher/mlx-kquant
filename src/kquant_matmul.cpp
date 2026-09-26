@@ -3,14 +3,15 @@
 // d.get_kernel(name, lib); the op guarantees row-contiguity before dispatch and
 // kernel-name type tokens come from kq_type_string. NAX (tensor-core)
 // availability is probed via kq_is_nax_available. qmm_splitk / qmm_nax_splitk
-// (env-gated, KQ_QMM_SPLITK / KQ_QMM_SPLITK_NAX) partition K for the
-// small-M band on the steel and NAX tiles respectively; qvm_split_k stays
+// (KQ_QMM_SPLITK / KQ_QMM_SPLITK_NAX) partition K for the small-M band on
+// the steel and NAX tiles respectively; qvm_split_k stays
 // omitted - plain qvm is identical with less parallelism. KQuantMatmul itself
 // never carries a bias (a separate elementwise add is fine off the
 // decode-latency-critical path); the decode-only bias-fused fast path lives in
 // the KQuantQmvBias primitive below (qmv_bias), which reuses this file's qmv
 // dispatch helpers.
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -104,7 +105,9 @@ static KqSmallBmPolicy kq_smallbm_policy(const std::string& t) {
     return {true, 9, 0, 193};
   }
   if (t == "iq2_xxs") {
-    return {true, 10, 0, 193};
+    // No sub-13 route. The tile runs slower than mv_ext and split-K
+    // through M 12 (17408x5120 M 10 715 us against 408 and 567).
+    return {true, 0, 0, 193};
   }
   if (t == "iq4_xs") {
     return {true, 11, 0, 193};
@@ -141,7 +144,7 @@ static KqSmallBmPolicy kq_smallbm_policy(const std::string& t) {
 // codecs at decode projection shapes, where the qmm grid is only
 // ceil(N/64) threadgroups and the in-tile K walk serializes (measured at
 // [4096x14336] down, [4096x4096] q/o, [1024x4096] GQA k/v). Weak-mv
-// codecs (q4_k, q2_k, q5_k, iq2_xxs) measured clean at all three shapes
+// codecs (q4_k, q2_k, q5_k) measured clean at all three shapes
 // and keep the table value; iq4_xs loses its whole M11-12 window at
 // small N and drops the route there.
 static int kq_smallm_route_min(const std::string& t, int N, int K) {
@@ -296,6 +299,63 @@ static int kq_verify_mma_min_m(const std::string& t, bool f16) {
   return 0;
 }
 
+// NAX GPUs: entry M of verify_mma against the default route it displaces
+// (verify_qmv, mv_ext or the BM=32 tile below the NAX split-K entry, NAX
+// split-K from it). Measured on M5 Max over the eight Bonsai / Qwen3.8-27B
+// projection and head shapes with the weights streamed from DRAM
+// (benchmarks/bench_verify_routes.py); the entry is the lowest M with no
+// regression on any shape, and bf16 and f16 activations agree. bf16:
+// pq2_0 0.93-1.13x at M4, 1.09-1.31x at M5, 1.55-2.09x at M8; ptq1_0
+// 1.00-1.17x at M3, 2.5-3.1x at M8; q4_0 0.94-1.07x at M4, 1.03-1.41x at
+// M5, 1.10-1.39x at M8. f16: pq2_0 0.91-1.01x at M4, 1.16-1.33x at M5;
+// ptq1_0 1.05-1.18x at M3; q4_0 0.86-1.39x at M4, 1.10-1.46x at M5.
+static int kq_verify_mma_min_m_nax(const std::string& t) {
+  if (t == "pq2_0" || t == "q4_0") {
+    return 5;
+  }
+  if (t == "ptq1_0") {
+    return 3;
+  }
+  return 0;
+}
+
+// verify_nax entry on NAX GPUs; 0 = no kernel for the codec. The entry is
+// the lowest M from which the kernel is within 1.03x of the route it
+// displaces at every larger M on every Qwen3.8-27B projection and head
+// shape (M5 Max, bf16). q8_0 at M 5 is faster over a forward but 1.05x
+// slower at N 6144, K 5120. q4_0 holds M 3 on both of its kernels. q6_k
+// enters at M 5 (at M 4 it ran up to 1.04x slower than mv_ext on
+// bfloat16 and up to 1.08x on float16), and at M 3 on a vocab head (N >=
+// 100000, as in kq_smallm_route_min), where mv_ext decays with N and the
+// kernel ran 1.09-1.16x faster at M 3.
+//
+// q3_k and q2_k enter at M 4. At M 3, N 6144, K 5120 ran 1.04x and 1.12x
+// slower than the fastest other route on bf16, and q2_k up to 1.17x on
+// f16. On a vocab head they enter at M 3, where the kernel ran 1.04-1.21x
+// faster. Their entries were also checked at N 1024 to 4096 on K 4096 to
+// 8960 and both activation types. There q2_k runs up to 1.14x slower than
+// mv_ext at M 4, so it enters at M 5 up to N 4096. q3_k keeps M 4 there
+// and runs within 1.03x of the fastest other route, except at N 2048, K
+// 4096 on f16, where it runs 1.04-1.06x behind mv_ext, about 1 us.
+static int kq_verify_nax_min_m(const std::string& t, int N) {
+  if (t == "pq2_0" || t == "q4_0" || t == "q4_k" || t == "q5_k") {
+    return 3;
+  }
+  if (t == "q8_0") {
+    return 6;
+  }
+  if (t == "q6_k") {
+    return N >= 100000 ? 3 : 5;
+  }
+  if (t == "q3_k") {
+    return N >= 100000 ? 3 : 4;
+  }
+  if (t == "q2_k") {
+    return N >= 100000 ? 3 : N > 4096 ? 4 : 5;
+  }
+  return 0;
+}
+
 static int kq_splitk_min_m(const std::string& t) {
   if (kq_is_nax_available()) {
     return kq_splitk_min_m_nax_alu(t);
@@ -324,39 +384,142 @@ static int kq_splitk_min_m(const std::string& t) {
   return 0;
 }
 
-// Default NAX split-K entry M per codec (0 = env lever only). The
-// un-split BM=32 grid is ceil(N/64) x 1 threadgroups with a serial
-// in-tile K walk, so the verify band pays per row; splitting K
-// multiplies threadgroup count. The win scales with how starved the
-// grid is: 1.6-2.5x at [256x6656], 1.0-1.2x at vocab-head N.
+// NAX GPUs: small-M route limits per codec. qmv_m[b] is the widest M
+// that per-row qmv serves in N bucket b (N <= 512, N <= 1024, N <= 2048,
+// larger), and 1 leaves it at M 1. Each row reads the weight again, the
+// later rows from the cache, and the qmv grid grows with M where the
+// mat-vec kernels' grid is bound by N, so qmv holds widest at small N
+// and on the codecs whose M=1 kernel runs near the bandwidth floor. NAX
+// split-K enters at splitk_small for N <= 1024 and at splitk above (0 =
+// env lever only). The un-split BM=32 grid is ceil(N/64) threadgroups
+// with a serial in-tile K walk, and split-K multiplies the threadgroup
+// count. Between qmv and split-K, the verify routes (verify_nax for
+// pq2_0, q4_0, q8_0 and q2_k to q6_k, verify_mma for ptq1_0) keep
+// their own entries through M 8, so those codecs' split-K entries take
+// only the widths above M 8 and the calls verify_nax declines. Other
+// codecs run the mat-vec kernels (mv_ext, verify_qmv) there, or the BM=32
+// tile from kq_smallm_route_min where that sits below the split-K entry
+// (q6_k at vocab-head N, M 8, on the calls verify_nax declines).
 //
-// Entry is the lowest M with no regression on any measured shape.
-// Measured 2026-08-13 on M5 Max at target 16 over seven shapes
-// (benchmarks/bench_verify_band_ab.py). No N gate needed: vocab-head
-// shapes stay >= 1.0 at every entry.
-static int kq_splitk_nax_min_m(const std::string& t) {
-  if (t == "iq2_xs" || t == "iq2_s") {
-    return 16;
+// Fitted on M5 Max to the fastest route per cell over 22 codecs and 14
+// shapes (N 256-17408, K 2048-17408), M 2-12 on the projection shapes
+// and M 2-8 on the smaller ones, with every route forced through
+// KQ_QMM_ROUTE in one process (benchmarks/bench_verify_routes.py).
+// Over those 2640 cells the table's route runs at 1.008x the fastest
+// (geometric mean) against 1.24x for the entries it replaces, and 112
+// cells run more than 5% slow against 1376. On 10 held-out shapes it
+// runs at 1.02x. The widest gains are q4_k and q4_1 at M 7 (1.7-1.9x on
+// the projection shapes, up to 9x at N 256, where the BM=32 tile ran),
+// iq2_xs and iq2_s at M 8-12 (2.1-2.2x), and qmv at M 2 on N <= 1024
+// (1.1-3x). Above N 1024, iq2_xxs keeps the mat-vec kernels through
+// M 12, where its split-K tile runs 1.2-3.6x slower. These figures cover
+// the table's own routes. verify_nax takes its band from them where it
+// measured faster.
+struct KqNaxSmallM {
+  int qmv_m[4];
+  int splitk_small;
+  int splitk;
+};
+static KqNaxSmallM kq_nax_small_m(const std::string& t) {
+  if (t == "q6_k") {
+    return {{7, 2, 1, 1}, 8, 9};
   }
-  if (t == "q6_k" || t == "iq1_m") {
-    return 12;
+  if (t == "q8_0") {
+    // qmv stops at M 5 for N <= 1024, where verify_nax is faster from M 6.
+    return {{7, 5, 2, 1}, 2, 7};
   }
-  if (t == "iq3_s" || t == "iq2_xxs" || t == "iq1_s" || t == "stq1_0" ||
-      t == "pq2_0" || t == "ptq1_0") {
-    // stq1_0 and the Prism codecs inherit iq1_s, not measured (M5
-    // calibration pending).
-    return 10;
+  if (t == "q4_k") {
+    return {{8, 5, 4, 2}, 2, 5};
   }
-  if (t == "q2_k" || t == "q3_k" || t == "q4_k" || t == "q5_k" || t == "q8_0" ||
-      t == "q4_0" || t == "q4_1" || t == "q5_0" || t == "q5_1" ||
-      t == "iq4_nl" || t == "iq4_xs" || t == "iq3_xxs") {
-    return 8;
+  if (t == "q5_k") {
+    return {{7, 3, 2, 1}, 2, 5};
   }
-  return 0;
+  if (t == "q3_k") {
+    return {{7, 3, 1, 1}, 5, 5};
+  }
+  if (t == "q2_k") {
+    return {{8, 5, 3, 2}, 2, 5};
+  }
+  if (t == "q4_0") {
+    return {{8, 6, 3, 2}, 8, 8};
+  }
+  if (t == "q4_1") {
+    return {{8, 8, 5, 2}, 2, 5};
+  }
+  if (t == "q5_0") {
+    return {{3, 3, 2, 1}, 2, 4};
+  }
+  if (t == "q5_1") {
+    return {{4, 3, 2, 1}, 2, 4};
+  }
+  if (t == "iq4_nl") {
+    return {{4, 3, 2, 1}, 2, 5};
+  }
+  if (t == "iq4_xs" || t == "iq3_xxs") {
+    return {{5, 3, 2, 1}, 2, 5};
+  }
+  if (t == "iq3_s") {
+    return {{2, 2, 1, 1}, 2, 5};
+  }
+  if (t == "iq2_xxs") {
+    return {{8, 5, 2, 1}, 9, 13};
+  }
+  if (t == "iq2_xs") {
+    return {{1, 1, 1, 1}, 2, 4};
+  }
+  if (t == "iq2_s") {
+    return {{5, 2, 1, 1}, 2, 5};
+  }
+  if (t == "iq1_s") {
+    return {{8, 3, 1, 1}, 2, 6};
+  }
+  if (t == "iq1_m") {
+    return {{8, 3, 1, 1}, 6, 8};
+  }
+  if (t == "stq1_0") {
+    return {{3, 1, 1, 1}, 2, 3};
+  }
+  if (t == "pq2_0" || t == "ptq1_0") {
+    return {{8, 5, 3, 2}, 9, 9};
+  }
+  return {{1, 1, 1, 1}, 0, 0};
 }
 
-// Default split target; resolves down to a divisor of K / max(gs, BK),
-// so the realised count is coarser (K=6656 and K=19968 both give 13).
+// Widest M per-row qmv serves by default on NAX GPUs.
+static int kq_nax_qmv_max_m(const std::string& t, int N) {
+  const int b = N <= 512 ? 0 : N <= 1024 ? 1 : N <= 2048 ? 2 : 3;
+  return kq_nax_small_m(t).qmv_m[b];
+}
+
+// Default NAX split-K entry M (0 = env lever only).
+static int kq_splitk_nax_min_m(const std::string& t, int N) {
+  const KqNaxSmallM p = kq_nax_small_m(t);
+  return N <= 1024 ? p.splitk_small : p.splitk;
+}
+
+// KQ_VERIFY_EXT, read once per process. 0 forces verify_qmv and 1 forces
+// mv_ext on the mat-vec band (M 2-12), -1 leaves the per-codec default.
+static int kq_verify_ext_env() {
+  static const int v = []() {
+    const char* e = std::getenv("KQ_VERIFY_EXT");
+    return e != nullptr ? std::atoi(e) : -1;
+  }();
+  return v;
+}
+
+// KQ_QMM_SPLITK, read once per process. A target above 1 forces the ALU
+// split-K route for M <= 32, 0 disables it, -1 leaves the default.
+static int kq_qmm_splitk_env() {
+  static const int v = []() {
+    const char* e = std::getenv("KQ_QMM_SPLITK");
+    return e != nullptr ? std::atoi(e) : -1;
+  }();
+  return v;
+}
+
+// Default split target. kq_nax_split resolves it against the slice count
+// K / max(gs, BK), so the realised count is coarser (K=6656 and K=19968
+// both give 13).
 // One target for all codecs: over routed cells only, 16 is best for 15
 // of 19 and within 1% for the rest.
 static constexpr int kq_splitk_nax_target = 16;
@@ -761,13 +924,128 @@ void verify_mma(
   ce.dispatch_threads(agrid, agroup);
 }
 
-// Split-K qmm_t on the NAX BM=32 tile (KQ_QMM_SPLITK_NAX experiment). Same
+// K per verify_nax iteration for this call. q4_0 runs its eight-block
+// kernel (q4_0_sb, 256 weights per step) where K is a multiple of 256,
+// and its two-block kernel (64) elsewhere. KQ_VERIFY_NAX_Q4_0_SB=0 keeps
+// the two-block kernel (probe lever, read live per call).
+static int kq_verify_nax_call_kstep(int K, const std::string& t) {
+  if (t == "q4_0" && K % 256 == 0) {
+    const char* e = std::getenv("KQ_VERIFY_NAX_Q4_0_SB");
+    if (e == nullptr || std::atoi(e) != 0) {
+      return 256;
+    }
+  }
+  return codec_verify_nax_kstep(t);
+}
+
+// verify_nax serves a K of whole steps from an aligned weight base. The
+// q4_k and q5_k kernels read 16-byte words. The q6_k and q3_k kernels read
+// 2-byte words, since every other 210- or 110-byte superblock starts 2 mod
+// 4. The other codecs take a 4-byte check, which the q8_0, eight-block
+// q4_0 and q2_k kernels need for their 4-byte words. kq_check_weight_base
+// raises first on every K-quant base this check would decline, so the
+// decline reaches only q8_0, q4_0 and pq2_0 bases 2 mod 4, which the other
+// routes serve. The K-quant kernels also need K in whole superblocks, since
+// the q2_k, q3_k, q5_k and q6_k steps are half of one. Rows of such a K
+// stay aligned with the base.
+static bool
+kq_verify_nax_fits(const array& w, int K, int kstep, const std::string& t) {
+  const bool kq = t == "q4_k" || t == "q5_k";
+  const bool half_word = t == "q6_k" || t == "q3_k";
+  const bool sb = kq || half_word || t == "q2_k";
+  const uintptr_t align = kq ? 15 : half_word ? 1 : 3;
+  return kstep > 0 && K % (sb ? 256 : kstep) == 0 &&
+      (reinterpret_cast<uintptr_t>(w.data<uint8_t>()) & align) == 0;
+}
+
+// Register-fed NAX verify for M <= 8 (kq_verify_nax.h): each simdgroup
+// decodes 32 weight rows straight into the right operand of a matmul2d
+// against activation rows padded to 16, with the activations loaded from
+// device memory per block and nothing staged. Same partial/fold shape as
+// verify_mma. Non-batched transpose shapes, bf16 or f16 activations, NAX
+// GPUs.
+void verify_nax(
+    const array& x,
+    const array& w,
+    const array& scales,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    int kstep,
+    int splits,
+    Device& d,
+    const Stream& s,
+    const std::string& kquant_type) {
+  const int k_partition = (K / kstep / splits) * kstep;
+  const int part_stride = M * N;
+
+  auto& ce = mx::metal::get_command_encoder(s);
+  array partials({splits, M, N}, x.dtype(), nullptr, {});
+  if (splits > 1) {
+    partials.set_data(mx::allocator::malloc(partials.nbytes()));
+    ce.add_temporary(partials);
+  }
+
+  std::string type_string = kq_type_string(x.dtype());
+  std::string kname;
+  kname.reserve(64);
+  mx::concatenate(
+      kname,
+      (kquant_type == "q4_0" && kstep == 256 ? "kquant_q4_0_sb_"
+                                             : kq_kname_prefix(kquant_type)) +
+          "verify_nax_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits);
+
+  auto kernel = kq_get_kernel(d, kname);
+  ce.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  ce.set_input_array(w, c++);
+  ce.set_input_array(scales, c++);
+  ce.set_input_array(x, c++);
+  ce.set_output_array(splits > 1 ? partials : out, c++);
+  ce.set_bytes(K, c++);
+  ce.set_bytes(N, c++);
+  ce.set_bytes(M, c++);
+  ce.set_bytes(k_partition, c++);
+  ce.set_bytes(part_stride, c++);
+  MTL::Size group_dims(128, 1, 1);
+  MTL::Size grid_dims((N + 127) / 128, 1, splits);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+  if (splits == 1) {
+    return;
+  }
+
+  std::string aname = "kquant_qmm_splitk_accum_" + type_string;
+  auto accum = kq_get_kernel(d, aname);
+  ce.set_compute_pipeline_state(accum);
+  const int n_elems = M * N;
+  c = 0;
+  ce.set_input_array(partials, c++);
+  ce.set_output_array(out, c++);
+  ce.set_bytes(n_elems, c++);
+  ce.set_bytes(splits, c++);
+  ce.set_bytes(part_stride, c++);
+  MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
+  MTL::Size agroup(256, 1, 1);
+  ce.dispatch_threads(agrid, agroup);
+}
+
+// Split-K qmm_t on the NAX BM=32 tile (KQ_QMM_SPLITK_NAX). Same
 // partial/fold shape as qmm_splitk, but slices run the tensor-core tile:
 // the steel splitk probe measured per-TG pipeline bound (~140-160 GB/s flat
 // in splits), while the NAX small-M cap is TG-count starvation -- the lever
 // splitk actually multiplies. Slice starts must be superblock-aligned so
-// every loader instance begins at kt_base 0; the caller guarantees splits
-// divides K / max(superblock, BK). Non-batched transpose shapes only.
+// every loader instance begins at kt_base 0. k_part is the slice length, a
+// multiple of max(superblock, BK), and the kernel cuts the last slice at K.
+// Non-batched transpose shapes only.
 void qmm_nax_splitk(
     const array& x,
     const array& w,
@@ -781,10 +1059,10 @@ void qmm_nax_splitk(
     int splits,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    int k_partition) {
   constexpr int bm = 32, bn = 64;
   constexpr int wm = 2, wn = 2;
-  const int k_partition = K / splits;
   const int part_stride = M * N;
 
   array partials({splits, M, N}, x.dtype(), nullptr, {});
@@ -922,12 +1200,13 @@ void qmv(
       (qmv_fine_env == 1 ||
        (qmv_fine_env != 0 && M == 1 &&
         N <= kquant_qmv_fine_max_n(kquant_type)));
-  const int rows_per_tg = use_fine ? 2 : bn;
+  const int fast_bn = kquant_qmv_fast_bn(kquant_type);
+  bool fast = (N % fast_bn == 0) && (K % qmv_fast_k_align() == 0);
+  const int rows_per_tg = use_fine ? 2 : (fast ? fast_bn : bn);
   MTL::Size group_dims(bk, 2, 1);
   MTL::Size grid_dims(M, (N + rows_per_tg - 1) / rows_per_tg, B);
 
   std::string type_string = kq_type_string(x.dtype());
-  bool fast = (N % bn == 0) && (K % qmv_fast_k_align() == 0);
   std::string kname;
   kname.reserve(64);
   mx::concatenate(
@@ -1217,6 +1496,256 @@ void dispatch_qmv(
   qmv(x, w, scales, out, group_size, bits, M, N, K, d, s, kquant_type);
 }
 
+// Every wired codec has an mv_ext kernel: q8_0, the five K-quants, the
+// four legacy non-K (q4_0/q4_1/q5_0/q5_1), all nine IQ, stq1_0, the Prism
+// codecs, and the native-fp wire codecs (mxfp4/nvfp4). Validated
+// bit-exact, so default-on == has-kernel.
+static bool kq_codec_has_mv_ext(const std::string& t) {
+  return t == "q8_0" || t == "q2_k" || t == "q3_k" || t == "q4_k" ||
+      t == "q5_k" || t == "q6_k" || t == "q4_0" || t == "q4_1" || t == "q5_0" ||
+      t == "q5_1" || t == "iq4_nl" || t == "iq4_xs" || t == "iq3_s" ||
+      t == "iq3_xxs" || t == "iq2_xxs" || t == "iq2_xs" || t == "iq2_s" ||
+      t == "iq1_s" || t == "iq1_m" || t == "stq1_0" || t == "pq2_0" ||
+      t == "ptq1_0" || t == "mxfp4" || t == "nvfp4";
+}
+
+// Largest divisor of nblk at or under target (1 = no split).
+static int kq_split_count(int target, int nblk) {
+  int sp = std::min(target, nblk);
+  while (sp > 1 && nblk % sp != 0) {
+    --sp;
+  }
+  return sp;
+}
+
+// NAX split-K slicing over nblk units of max(block, BK) weights. Returns
+// the split count and sets per to the units in each slice. The divisor
+// count cuts equal slices. Slices of ceil(nblk / target) units with a
+// shorter last one take over when they more than double that count. A
+// unit count with no divisor near the target (68 at K 17408 and 43 at
+// K 11008 on the 256-weight codecs) otherwise leaves the grid short of
+// threadgroups, and within 2x the extra partials cost more than the added
+// threadgroups gain. KQ_SPLITK_RAGGED (read live) is a probe lever. 0
+// keeps the divisor count and 2 takes the ragged count whenever it is
+// larger.
+static int kq_nax_split(int target, int nblk, int& per) {
+  if (nblk < 2) {
+    per = nblk;
+    return 1;
+  }
+  const int sp = kq_split_count(target, nblk);
+  per = nblk / sp;
+  const char* e = std::getenv("KQ_SPLITK_RAGGED");
+  const int mode = e != nullptr ? std::atoi(e) : 1;
+  if (mode == 0) {
+    return sp;
+  }
+  const int t = std::min(target, nblk);
+  const int per_r = (nblk + t - 1) / t;
+  const int sp_r = (nblk + per_r - 1) / per_r;
+  if (sp_r > (mode == 2 ? sp : 2 * sp)) {
+    per = per_r;
+    return sp_r;
+  }
+  return sp;
+}
+
+// verify_mma split count. Split-K fills the grid for the projection
+// shapes; a head-sized N already has more threadgroups than the GPU holds,
+// and there the partials only cost traffic.
+static int kq_verify_mma_splits(int N, int K, int group_size, int rows) {
+  return (N + rows - 1) / rows >= 1024 ? 1 : kq_split_count(16, K / group_size);
+}
+
+// verify_nax split count from GPU waves of 640 simdgroups, the M5 Max
+// figure. Count sp costs ceil(simdgroups * sp / 640) waves of steps / sp
+// K steps each, plus simdgroups * sp / partial_c for its partials. The
+// count is the cheapest power of two that divides the K steps. Another
+// divisor replaces it only when it costs at most 3/4 as much, since on
+// q3_k and q2_k counts 5 and 10 ran up to 1.07x slower than the powers of
+// two the model ranked below them at N 12288 and 6144, K 5120. The count
+// has no cap, so the 70 steps of K 8960 still split finely, and N 1024,
+// K 5120 takes 20 splits, which ran 1.13-1.23x faster than 8 on q3_k and
+// q2_k.
+static int kq_verify_nax_wave_splits(int sgs, int steps, double partial_c) {
+  const auto cost = [&](int sp) {
+    return double((sgs * sp + 639) / 640) * (steps / sp) + sgs * sp / partial_c;
+  };
+  int best = 1;
+  int other = 0;
+  for (int sp = 2; sp <= steps; ++sp) {
+    if (steps % sp != 0) {
+      continue;
+    }
+    if ((sp & (sp - 1)) == 0) {
+      best = cost(sp) < cost(best) ? sp : best;
+    } else if (other == 0 || cost(sp) < cost(other)) {
+      other = sp;
+    }
+  }
+  return other > 0 && cost(other) <= 0.75 * cost(best) ? other : best;
+}
+
+// Partial charge of kq_verify_nax_wave_splits per codec, or 0 for the
+// codecs on a simdgroup target. q4_k and the eight-block q4_0 kernel fit
+// best at 640, and q2_k, q3_k and q5_k at 2560. The fit ran on M5 Max in
+// bfloat16 at M 3 for q4_0, q4_k and q5_k, M 4 for q2_k and q3_k, and M 8,
+// over the eight Qwen3.8-27B projection and head shapes and 12 shapes of
+// N 1024 to 14336 at K 2048 to 14336. On q4_0, q4_k and q5_k the count ran
+// within 1.03x of the best measured count on 101 of 120 cells and 1.12x
+// slower at worst, where a grid of at most 640 simdgroups managed 92 cells
+// and 1.65x. It cut the verify_nax matmul time of one Qwen3.8-27B forward
+// by 2.4-2.8% on q5_k and 0.05-0.4% on q4_0 and q4_k. q6_k and q8_0 keep
+// their simdgroup targets, which beat the wave count on that matmul time
+// by 0.3-0.9%, the largest share at N 17408, K 5120.
+static double kq_verify_nax_partial_c(const std::string& t, int kstep) {
+  if (t == "q4_k" || (t == "q4_0" && kstep == 256)) {
+    return 640.0;
+  }
+  if (t == "q2_k" || t == "q3_k" || t == "q5_k") {
+    return 2560.0;
+  }
+  return 0.0;
+}
+
+// verify_nax split count. The wave codecs take kq_verify_nax_wave_splits.
+// The others target about 600 simdgroups of 32 rows, since device loads
+// and NAX ops of one simdgroup do not overlap and the kernel runs at the
+// rate its resident simdgroups hide the loads. The two-block q4_0 kernel
+// also targets a K walk of 640 per simdgroup, 8 splits at K 5120, which
+// measured faster at every Ternary Bonsai 2 27B shape on M5 Max, the vocab
+// head included, where the grid is full without splits. Their count is the
+// largest divisor of the K steps at or under the target, at most 16. q6_k
+// instead targets about 1280 simdgroups and a K walk of at most 2560, and
+// takes the smallest divisor at or above that, or the largest under it
+// when no divisor up to 16 reaches it. Its grids of about 768 simdgroups,
+// N 12288 at 2 splits and N 6144 at 4, ran 1.10-1.15x slower than grids
+// of 1280 to 1536 on M5 Max, and the vocab head at 1 split 1.06-1.07x
+// slower than at 2. KQ_VERIFY_NAX_SPLITS=<n> replaces the target on every
+// codec (probe lever).
+static int kq_verify_nax_splits(int N, int K, int kstep, const std::string& t) {
+  const char* e = std::getenv("KQ_VERIFY_NAX_SPLITS");
+  const int env = e != nullptr ? std::atoi(e) : 0;
+  const int sgs = (N + 31) / 32;
+  const double partial_c = kq_verify_nax_partial_c(t, kstep);
+  if (partial_c > 0.0 && env <= 0) {
+    return kq_verify_nax_wave_splits(sgs, K / kstep, partial_c);
+  }
+  if (t == "q6_k" && env <= 0) {
+    const int steps = K / kstep;
+    const int want =
+        std::min(16, std::max((1280 + sgs - 1) / sgs, (K + 2559) / 2560));
+    for (int sp = want; sp <= std::min(16, steps); ++sp) {
+      if (steps % sp == 0) {
+        return sp;
+      }
+    }
+    return kq_split_count(want, steps);
+  }
+  int target = (600 + sgs - 1) / sgs;
+  if (t == "q4_0" && kstep == 64) {
+    target = std::max(target, (K + 639) / 640);
+  }
+  target = env > 0 ? env : std::min(16, std::max(1, target));
+  return kq_split_count(target, K / kstep);
+}
+
+// KQ_QMM_ROUTE dispatch: runs the named route when it serves the codec and
+// shape and returns true, otherwise returns false. Transpose, non-batched,
+// non-f32 shapes with M <= 32 only (the caller checks).
+bool kq_forced_route(
+    const char* route,
+    const array& x,
+    const array& w,
+    const array& scales,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    Device& d,
+    const Stream& s,
+    const std::string& t) {
+  const std::string r(route);
+  const KQuantCodec* codec = codec_by_name(t);
+  const int wpb = codec ? codec->weights_per_block : 256;
+  if (r == "qmv") {
+    dispatch_qmv(x, w, scales, out, group_size, bits, M, N, K, d, s, t);
+    return true;
+  }
+  if (r == "verify_qmv") {
+    if (M >= 2 && M <= verify_qmv_max_rows() && N % kquant_qmv_bn(t) == 0 &&
+        K % qmv_fast_k_align() == 0 && codec_has_verify_qmv(t)) {
+      verify_qmv(x, w, scales, out, group_size, bits, M, N, K, d, s, t);
+      return true;
+    }
+    return false;
+  }
+  if (r == "mv_ext") {
+    if (kq_codec_has_mv_ext(t) && M >= 2 && M <= 12 && K % wpb == 0) {
+      verify_mv_ext(x, w, scales, out, group_size, bits, M, N, K, d, s, t);
+      return true;
+    }
+    return false;
+  }
+  if (r == "verify_mma") {
+    const int rows = codec_verify_mma_rows(t);
+    if (rows > 0 && M <= 8) {
+      const int sp = kq_verify_mma_splits(N, K, group_size, rows);
+      verify_mma(x, w, scales, out, group_size, bits, M, N, K, sp, d, s, t);
+      return true;
+    }
+    return false;
+  }
+  if (r == "verify_nax") {
+    const int kstep = kq_verify_nax_call_kstep(K, t);
+    if (kq_is_nax_available() && codec_has_nax(t) && M <= 8 &&
+        kq_verify_nax_fits(w, K, kstep, t)) {
+      const int sp = kq_verify_nax_splits(N, K, kstep, t);
+      verify_nax(
+          x, w, scales, out, group_size, bits, M, N, K, kstep, sp, d, s, t);
+      return true;
+    }
+    return false;
+  }
+  if (r == "splitk") {
+    const char* e = std::getenv("KQ_QMM_SPLITK");
+    const int target = (e != nullptr && std::atoi(e) > 1) ? std::atoi(e) : 16;
+    const int sp = kq_split_count(target, K / group_size);
+    if (kq_splitk_codec(t) && sp > 1) {
+      qmm_splitk(x, w, scales, out, group_size, bits, M, N, K, sp, d, s, t);
+      return true;
+    }
+    return false;
+  }
+  const bool nax_ok =
+      kq_is_nax_available() && codec_has_nax(t) && (K % 64 == 0);
+  if (r == "nax") {
+    if (nax_ok) {
+      qmm(x, w, scales, out, true, group_size, bits, M, N, K, d, s, t);
+      return true;
+    }
+    return false;
+  }
+  if (r == "nax_splitk") {
+    const char* e = std::getenv("KQ_QMM_SPLITK_NAX");
+    const int target = (e != nullptr && std::atoi(e) > 1)
+        ? std::atoi(e)
+        : kq_splitk_nax_target;
+    const int q = std::max(group_size, 64);
+    int per = 0;
+    const int sp = kq_nax_split(target, K / q, per);
+    if (nax_ok && sp > 1) {
+      qmm_nax_splitk(
+          x, w, scales, out, group_size, bits, M, N, K, sp, d, s, t, per * q);
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
 } // namespace
 
 #endif // _METAL_
@@ -1380,12 +1909,13 @@ void KQuantMatmul::eval_gpu_base(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
-  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   // inputs are row-contiguous (ensured by the op): x, w (uint8), scales.
   const auto& x = inputs[0];
   const auto& w = inputs[1];
   const auto& scales = inputs[2];
+  kq_check_weight_base(w, kquant_type_, "quantized_matmul");
+  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   bool non_batched = w.ndim() == 2 && x.flags().row_contiguous;
   int K = x.shape(-1);
@@ -1442,28 +1972,167 @@ void KQuantMatmul::eval_gpu_base(
     return;
   }
 
+  // Probe lever: KQ_QMM_ROUTE=<route> forces one small-M route for
+  // transpose, non-batched shapes with M <= 32 where the route serves the
+  // codec and shape; anything else takes the default routing below, or
+  // throws under KQ_QMM_ROUTE_STRICT=1 so a sweep never times the default
+  // under a forced route's name. Routes: qmv, verify_qmv, mv_ext,
+  // verify_mma, verify_nax, splitk, nax, nax_splitk. Read live so a route
+  // sweep shares one process (benchmarks/bench_verify_routes.py).
+  if (transpose_) {
+    const char* route_e = std::getenv("KQ_QMM_ROUTE");
+    if (route_e != nullptr && route_e[0] != '\0') {
+      if (non_batched && M <= 32 && x.dtype() != mx::float32 &&
+          kq_forced_route(
+              route_e,
+              x,
+              w,
+              scales,
+              out,
+              group_size_,
+              bits_,
+              M,
+              N,
+              K,
+              d,
+              s,
+              kquant_type_)) {
+        return;
+      }
+      const char* strict_e = std::getenv("KQ_QMM_ROUTE_STRICT");
+      if (strict_e != nullptr && std::atoi(strict_e) == 1) {
+        throw std::runtime_error(
+            "[mlx_kquant] KQ_QMM_ROUTE=" + std::string(route_e) +
+            " does not serve " + kquant_type_ + " at M=" + std::to_string(M) +
+            ", N=" + std::to_string(N) + ", K=" + std::to_string(K) + ".");
+      }
+    }
+  }
+
+  // Per-row qmv on NAX GPUs, M 2 through kq_nax_qmv_max_m for the call's
+  // N. KQ_NAX_QMV=<m> sets the limit to m at every N, and 0 disables the
+  // route. The default yields to a forced KQ_VERIFY_NAX or KQ_VERIFY_MMA
+  // on a codec they serve, a forced KQ_QMM_SPLITK_NAX or KQ_QMM_SPLITK,
+  // and a set KQ_VERIFY_EXT, so their arms time the route they name.
+  // KQ_DISABLE_NAX turns it off, since the limits are measured against
+  // the NAX routes. KQ_NAX_QMV is read live so an A/B can flip arms on
+  // one generator.
+  if (transpose_ && non_batched && M >= 2 && M <= 32 &&
+      x.dtype() != mx::float32 && kq_is_nax_available() &&
+      codec_has_nax(kquant_type_)) {
+    const char* qmv_e = std::getenv("KQ_NAX_QMV");
+    int qmv_max_m = qmv_e != nullptr ? std::atoi(qmv_e) : -1;
+    if (qmv_max_m == -1) {
+      const char* vnax_f = std::getenv("KQ_VERIFY_NAX");
+      const int vnax_force = vnax_f != nullptr ? std::atoi(vnax_f) : -1;
+      const char* vmma_f = std::getenv("KQ_VERIFY_MMA");
+      const int vmma_force = vmma_f != nullptr ? std::atoi(vmma_f) : -1;
+      const char* sk_f = std::getenv("KQ_QMM_SPLITK_NAX");
+      const int sk_force = sk_f != nullptr ? std::atoi(sk_f) : -1;
+      const int ext = kq_verify_ext_env();
+      const bool forced = (vnax_force >= 1 && M >= vnax_force &&
+                           codec_verify_nax_kstep(kquant_type_) > 0) ||
+          (vmma_force >= 2 && M >= vmma_force &&
+           codec_verify_mma_rows(kquant_type_) > 0) ||
+          sk_force >= 1 || kq_qmm_splitk_env() > 1 || ext == 0 || ext == 1;
+      qmv_max_m = forced ? 0 : kq_nax_qmv_max_m(kquant_type_, N);
+    }
+    if (M <= qmv_max_m) {
+      dispatch_qmv(
+          x, w, scales, out, group_size_, bits_, M, N, K, d, s, kquant_type_);
+      return;
+    }
+  }
+
+  // Register-fed NAX verify, from kq_verify_nax_min_m through M8; see
+  // verify_nax. KQ_VERIFY_NAX=<m> forces the entry at M >= m, and 0
+  // disables it. Read live so an A/B can flip arms on one generator.
+  // KQ_DISABLE_NAX turns it off with the other NAX routes. Decided ahead
+  // of verify_mma and NAX split-K, but the default entry yields to a
+  // forced KQ_VERIFY_MMA on a codec verify_mma serves, or a forced
+  // KQ_QMM_SPLITK_NAX, so their arms time the route they name.
+  if (transpose_ && non_batched && M <= 8 && x.dtype() != mx::float32 &&
+      kq_is_nax_available() && codec_has_nax(kquant_type_)) {
+    const int kstep = kq_verify_nax_call_kstep(K, kquant_type_);
+    const char* vnax_e = std::getenv("KQ_VERIFY_NAX");
+    const int vnax_env = vnax_e != nullptr ? std::atoi(vnax_e) : -1;
+    const char* vmma_f = std::getenv("KQ_VERIFY_MMA");
+    const int vmma_force = vmma_f != nullptr ? std::atoi(vmma_f) : -1;
+    const char* sk_f = std::getenv("KQ_QMM_SPLITK_NAX");
+    const int sk_force = sk_f != nullptr ? std::atoi(sk_f) : -1;
+    const bool other_forced = (vmma_force >= 2 && M >= vmma_force &&
+                               codec_verify_mma_rows(kquant_type_) > 0) ||
+        sk_force >= 1;
+    int vnax_min_m = vnax_env;
+    if (vnax_env == -1) {
+      vnax_min_m = other_forced ? 0 : kq_verify_nax_min_m(kquant_type_, N);
+    }
+    if (vnax_min_m > 0 && M >= vnax_min_m &&
+        kq_verify_nax_fits(w, K, kstep, kquant_type_)) {
+      const int sp = kq_verify_nax_splits(N, K, kstep, kquant_type_);
+      verify_nax(
+          x,
+          w,
+          scales,
+          out,
+          group_size_,
+          bits_,
+          M,
+          N,
+          K,
+          kstep,
+          sp,
+          d,
+          s,
+          kquant_type_);
+      return;
+    }
+  }
+
+  // Register-resident MMA verify, from the per-device entry
+  // (kq_verify_mma_min_m, kq_verify_mma_min_m_nax) through M8.
+  // KQ_VERIFY_MMA=<m> forces the entry at M >= m, 0 or 1 disables; read
+  // live so an A/B can flip arms on one generator. Decided ahead of NAX
+  // split-K, whose default entry yields to it.
+  const char* vmma_e = std::getenv("KQ_VERIFY_MMA");
+  const int vmma_env = vmma_e != nullptr ? std::atoi(vmma_e) : -1;
+  const int vmma_rows = codec_verify_mma_rows(kquant_type_);
+  int vmma_min_m = 0;
+  if (vmma_env >= 2) {
+    vmma_min_m = vmma_env;
+  } else if (vmma_env == -1) {
+    vmma_min_m = kq_is_nax_available()
+        ? kq_verify_mma_min_m_nax(kquant_type_)
+        : kq_verify_mma_min_m(kquant_type_, x.dtype() == mx::float16);
+  }
+  const bool vmma_route = vmma_rows > 0 && vmma_min_m > 0 && M >= vmma_min_m &&
+      M <= 8 && transpose_ && non_batched && x.dtype() != mx::float32;
+
   // NAX split-K, entering at kq_splitk_nax_min_m through M32; see
-  // qmm_nax_splitk. Slice quantum max(superblock, BK) keeps every slice
-  // starting a loader at kt_base 0 for both gs families.
+  // qmm_nax_splitk. Slice unit max(block, BK) keeps every slice starting
+  // a loader at kt_base 0 for all three block sizes (32, 128, 256).
   // KQ_QMM_SPLITK_NAX=<splits> forces the route for all M <= 32, 1 uses
   // the default target, 0 disables. Read live so an A/B can flip arms
-  // on one generator.
+  // on one generator. The default entry yields to verify_mma, to a
+  // forced KQ_QMM_SPLITK, and to a set KQ_VERIFY_EXT through M 12, so
+  // those arms time the route they name.
   const char* sk_nax_e = std::getenv("KQ_QMM_SPLITK_NAX");
   const int sk_nax_env = sk_nax_e != nullptr ? std::atoi(sk_nax_e) : -1;
-  const int sk_nax_min_m = kq_splitk_nax_min_m(kquant_type_);
+  const int sk_nax_min_m = kq_splitk_nax_min_m(kquant_type_, N);
+  const int ext_env = kq_verify_ext_env();
+  const bool sk_nax_yields = vmma_route || kq_qmm_splitk_env() > 1 ||
+      ((ext_env == 0 || ext_env == 1) && M <= 12);
   const bool sk_nax_route = sk_nax_env >= 1 ||
-      (sk_nax_env == -1 && sk_nax_min_m > 0 && M >= sk_nax_min_m);
+      (sk_nax_env == -1 && sk_nax_min_m > 0 && M >= sk_nax_min_m &&
+       !sk_nax_yields);
   if (sk_nax_route && transpose_ && non_batched && M <= 32 &&
       codec_has_nax(kquant_type_) && kq_is_nax_available() && (K % 64 == 0) &&
       x.dtype() != mx::float32) {
     const int qmm_splitk_nax_env =
         sk_nax_env > 1 ? sk_nax_env : kq_splitk_nax_target;
-    const int sliceq = std::max(group_size_, 64);
-    const int nblk = K / sliceq;
-    int sp = std::min(qmm_splitk_nax_env, nblk);
-    while (sp > 1 && nblk % sp != 0) {
-      --sp;
-    }
+    const int q = std::max(group_size_, 64);
+    int per = 0;
+    const int sp = kq_nax_split(qmm_splitk_nax_env, K / q, per);
     if (sp > 1) {
       qmm_nax_splitk(
           x,
@@ -1478,33 +2147,14 @@ void KQuantMatmul::eval_gpu_base(
           sp,
           d,
           s,
-          kquant_type_);
+          kquant_type_,
+          per * q);
       return;
     }
   }
 
-  // Register-resident MMA verify, kq_verify_mma_min_m through M8 on
-  // non-NAX GPUs (the NAX small-M tiles are uncalibrated against it).
-  // KQ_VERIFY_MMA=<m> forces the entry at M >= m on any GPU, 0 disables;
-  // read live so an A/B can flip arms on one generator.
-  const char* vmma_e = std::getenv("KQ_VERIFY_MMA");
-  const int vmma_env = vmma_e != nullptr ? std::atoi(vmma_e) : -1;
-  const int vmma_rows = codec_verify_mma_rows(kquant_type_);
-  const int vmma_min_m = vmma_env >= 2
-      ? vmma_env
-      : (vmma_env == -1 && !kq_is_nax_available()
-             ? kq_verify_mma_min_m(kquant_type_, x.dtype() == mx::float16)
-             : 0);
-  if (vmma_rows > 0 && vmma_min_m > 0 && M >= vmma_min_m && M <= 8 &&
-      transpose_ && non_batched && x.dtype() != mx::float32) {
-    // Split-K fills the grid for the projection shapes; a head-sized N
-    // already has more threadgroups than the GPU holds, and there the
-    // partials only cost traffic.
-    const int nblk = K / group_size_;
-    int sp = (N + vmma_rows - 1) / vmma_rows >= 1024 ? 1 : std::min(16, nblk);
-    while (sp > 1 && nblk % sp != 0) {
-      --sp;
-    }
+  if (vmma_route) {
+    const int sp = kq_verify_mma_splits(N, K, group_size_, vmma_rows);
     verify_mma(
         x, w, scales, out, group_size_, bits_, M, N, K, sp, d, s, kquant_type_);
     return;
@@ -1517,10 +2167,7 @@ void KQuantMatmul::eval_gpu_base(
   // enters at kq_splitk_min_m. KQ_QMM_SPLITK=<target splits> forces
   // the route for all M <= 32 (A/B lever). KQ_QMM_SPLITK=0 disables
   // both.
-  static const int qmm_splitk_env = []() {
-    const char* e = std::getenv("KQ_QMM_SPLITK");
-    return e != nullptr ? std::atoi(e) : -1; // -1 = per-codec default
-  }();
+  const int qmm_splitk_env = kq_qmm_splitk_env();
   const int splitk_min_m = kq_splitk_min_m(kquant_type_);
   // Hardware AND codec: KQ_DISABLE_NAX lands in codec_has_nax, so
   // keying off availability alone left this unreachable on NAX silicon.
@@ -1531,11 +2178,7 @@ void KQuantMatmul::eval_gpu_base(
   if (splitk_route && transpose_ && non_batched && M <= 32 &&
       kq_splitk_codec(kquant_type_)) {
     const int splitk_target = qmm_splitk_env > 1 ? qmm_splitk_env : 16;
-    const int nblk = K / group_size_;
-    int sp = std::min(splitk_target, nblk);
-    while (sp > 1 && nblk % sp != 0) {
-      --sp;
-    }
+    const int sp = kq_split_count(splitk_target, K / group_size_);
     if (sp > 1) {
       qmm_splitk(
           x,
@@ -1617,30 +2260,11 @@ void KQuantMatmul::eval_gpu_base(
     // verify_qmv and per-row qmv. On by default for the codecs in
     // mv_ext_default_on; KQ_VERIFY_EXT=0 forces the verify_qmv path, =1 forces
     // mv_ext for any codec that has the kernel (A/B lever).
-    static const int verify_ext = []() {
-      const char* e = std::getenv("KQ_VERIFY_EXT");
-      return e != nullptr ? std::atoi(e) : -1; // -1 = per-codec default
-    }();
-    // Every wired codec now has an mv_ext kernel: q8_0, the five K-quants, the
-    // four legacy non-K (q4_0/q4_1/q5_0/q5_1), all nine IQ, stq1_0, and the
-    // native-fp wire codecs (mxfp4/nvfp4). Validated bit-exact, so default-on
-    // == has-kernel.
-    const bool codec_has_mv_ext = kquant_type_ == "q8_0" ||
-        kquant_type_ == "q2_k" || kquant_type_ == "q3_k" ||
-        kquant_type_ == "q4_k" || kquant_type_ == "q5_k" ||
-        kquant_type_ == "q6_k" || kquant_type_ == "q4_0" ||
-        kquant_type_ == "q4_1" || kquant_type_ == "q5_0" ||
-        kquant_type_ == "q5_1" || kquant_type_ == "iq4_nl" ||
-        kquant_type_ == "iq4_xs" || kquant_type_ == "iq3_s" ||
-        kquant_type_ == "iq3_xxs" || kquant_type_ == "iq2_xxs" ||
-        kquant_type_ == "iq2_xs" || kquant_type_ == "iq2_s" ||
-        kquant_type_ == "iq1_s" || kquant_type_ == "iq1_m" ||
-        kquant_type_ == "stq1_0" || kquant_type_ == "pq2_0" ||
-        kquant_type_ == "ptq1_0" || kquant_type_ == "mxfp4" ||
-        kquant_type_ == "nvfp4";
+    const int verify_ext = kq_verify_ext_env();
+    const bool codec_has_mv_ext = kq_codec_has_mv_ext(kquant_type_);
     // The Prism codecs decode each block once per row in verify_qmv and
     // once per activation row in mv_ext, so M 2..4 takes verify_qmv;
-    // split-K enters at 5.
+    // verify_mma or split-K take the band above.
     const bool is_prism = kquant_type_ == "pq2_0" || kquant_type_ == "ptq1_0";
     const bool mv_ext_default_on =
         codec_has_mv_ext && !(is_prism && M <= kq_prism_verify_max_m());
@@ -1655,7 +2279,8 @@ void KQuantMatmul::eval_gpu_base(
     // draft-width-1 verify, so M==2 routes to mv_ext for all codecs except
     // the two where verify_qmv measures faster. IQ has no verify_qmv kernel,
     // so mv_ext stays on at every M>=2. stq1_0 (also verify_qmv-less) is not
-    // caught by the "iq" prefix but passes via !verify_qmv_wins_m2.
+    // caught by the "iq" prefix but passes via !verify_qmv_wins_m2. On NAX
+    // GPUs per-row qmv claims the widths kq_nax_small_m gives it first.
     const bool is_iq = kquant_type_.rfind("iq", 0) == 0;
     const bool verify_qmv_wins_m2 =
         kquant_type_ == "q4_k" || kquant_type_ == "q8_0";
@@ -1799,12 +2424,13 @@ void KQuantQmvBias::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
-  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   const auto& x = inputs[0];
   const auto& w = inputs[1];
   const auto& scales = inputs[2];
   const auto& bias = inputs[3];
+  kq_check_weight_base(w, kquant_type_, "quantized_matmul_qmv_bias");
+  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int K = x.shape(-1);
   int N = out.shape(-1);

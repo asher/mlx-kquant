@@ -105,6 +105,73 @@ int kq_sdpa_blocks(int N, int n_simds, Device& d) {
   return blocks;
 }
 
+// Split count for sdpa_fa_verify, and for the shared-prefix pass of
+// sdpa_decode_gqa_cascade, when the caller passes 0. The grid is
+// (Hkv, B, splits), so with few KV heads the decode buckets leave most of a
+// large GPU idle below about 16k keys. On the architecture classes MLX's NAX
+// GEMM routes as larger devices (s for Max, d for Ultra, and c) the count
+// rises until about 512 simdgroups are in flight (1024 at head_dim <= 128,
+// whose tiles are lighter). It never drops below the decode bucket, and from
+// 512 keys up it stays at or under one split per 32 keys. Folds over 32 rows
+// take 128 splits past 16k keys. Powers of two only, since each count is its
+// own pipeline. Tuned on M5 Max; base and Pro chips keep the decode buckets.
+int kq_fa_verify_splits(
+    int B,
+    int n_kv_heads,
+    int n_rows,
+    int D,
+    int kL,
+    Device& d) {
+  int splits = kL <= 8192 ? 16 : kL <= 24576 ? 32 : kL <= 49152 ? 64 : 128;
+  char devc = d.get_architecture().back();
+  if (devc != 's' && devc != 'c' && devc != 'd') {
+    return splits;
+  }
+  const int bq = n_rows <= 32 ? 32 : n_rows <= 48 ? 48 : 64;
+  const int sg_per_tg = D == 512 ? 8 : bq / 8;
+  const int fill = (D >= 256 ? 512 : 1024) / (B * n_kv_heads * sg_per_tg);
+  int s_fill = 1;
+  while (s_fill * 2 <= fill) {
+    s_fill *= 2;
+  }
+  splits = std::max(splits, s_fill);
+  if (n_rows > 32 && kL > 16384) {
+    splits = 128;
+  }
+  int cap = 16;
+  while (cap * 2 <= kL / 32) {
+    cap *= 2;
+  }
+  return std::min({splits, cap, 128});
+}
+
+// Split count for sdpa_fa_indexed when the caller passes 0: the decode
+// bucket over the M listed keys. The NAX kernel on the s, c and d classes
+// writes 32 heads by 512 float32 partials per split, so once about 512
+// simdgroups are in flight (32-head strips by queries by splits, 8 each)
+// more splits cost more than they return. There the count drops to the
+// largest power of two under that fill, never above the bucket and never
+// below 2. Tuned on M5 Max at 64 heads and 2051 keys.
+int kq_fa_indexed_splits(
+    int n_heads,
+    int n_queries,
+    int M,
+    bool nax,
+    Device& d) {
+  int splits = M <= 8192 ? 16 : M <= 24576 ? 32 : M <= 49152 ? 64 : 128;
+  char devc = d.get_architecture().back();
+  if (!nax || (devc != 's' && devc != 'c' && devc != 'd')) {
+    return splits;
+  }
+  const int strips = (n_heads + 31) / 32;
+  const int fill = 512 / (strips * n_queries * 8);
+  int s_fill = 2;
+  while (s_fill * 2 <= fill) {
+    s_fill *= 2;
+  }
+  return std::min(splits, s_fill);
+}
+
 } // namespace
 
 void KQuantSDPA::eval_gpu(
@@ -487,11 +554,9 @@ void KQuantSDPAFAVerify::eval_gpu(
   int D = q.shape(3);
   int kL = kvarn ? (kvarn_n_attend_ ? kvarn_n_attend_ : kvarn_n_) : k.shape(2);
   int q_len = q_len_;
-  // Same coarse split buckets as sdpa_decode_gqa (a per-kL value would mint
-  // a new pipeline specialization every decode step).
   int splits = splits_;
   if (splits == 0) {
-    splits = kL <= 8192 ? 16 : kL <= 24576 ? 32 : kL <= 49152 ? 64 : 128;
+    splits = kq_fa_verify_splits(B, n_kv_heads, n_rows, D, kL, d);
   }
 
   size_t k_head_stride =
@@ -540,10 +605,11 @@ void KQuantSDPAFAVerify::eval_gpu(
 
   // Pass 1: one threadgroup per (kv-head, batch, split) streams its key
   // chunk through the simdgroup-matrix tile. head_dim 256 runs a simdgroup
-  // per 8 tile rows ((BQ/8)*32 threads); 512 runs the 256-thread d-split
-  // variant (BQ 32 only, capped at the op).
+  // per 8 tile rows ((BQ/8)*32 threads, BQ the smallest of 32, 48, 64 that
+  // holds the fold); 512 runs the 256-thread d-split variant (BQ 32 only,
+  // capped at the op).
   {
-    const int bq = n_rows <= 32 ? 32 : 64;
+    const int bq = n_rows <= 32 ? 32 : n_rows <= 48 ? 48 : 64;
     std::string kname = "kq_sdpa_fa_verify_2pass_1_" + ts + "_" +
         std::to_string(D) + "_bq" + std::to_string(bq);
     std::string hash = kname + "_s" + std::to_string(splits) +
@@ -679,9 +745,20 @@ void KQuantSDPAFAIndexed::eval_gpu(
   int D = q.shape(3);
   int kv_len = kv.shape(2);
   int M = idx.shape(1);
+
+  // Tensor-op hardware runs the NAX kernel (eight simdgroups per 32-head
+  // strip); otherwise the simdgroup kernel, one threadgroup per (32-head
+  // strip, query, split). KQ_SDPA_IDX_NAX=0 forces the simdgroup kernel on
+  // any GPU.
+  static const bool nax_env = [] {
+    const char* e = std::getenv("KQ_SDPA_IDX_NAX");
+    return !e || std::atoi(e) != 0;
+  }();
+  const bool use_nax = nax_env && kq_is_nax_available();
+
   int splits = splits_;
   if (splits == 0) {
-    splits = M <= 8192 ? 16 : M <= 24576 ? 32 : M <= 49152 ? 64 : 128;
+    splits = kq_fa_indexed_splits(n_heads, n_queries, M, use_nax, d);
   }
   size_t kv_seq_stride = static_cast<size_t>(kv.strides(2));
   float scale = scale_;
@@ -720,15 +797,7 @@ void KQuantSDPAFAIndexed::eval_gpu(
       {&zero_bits, MTL::DataType::DataTypeInt, 11},
   };
 
-  // Pass 1. Tensor-op hardware runs the NAX kernel (eight simdgroups per
-  // 32-head strip); otherwise the simdgroup kernel, one threadgroup per
-  // (32-head strip, query, split). KQ_SDPA_IDX_NAX=0 forces the simdgroup
-  // kernel on any GPU.
-  static const bool nax_env = [] {
-    const char* e = std::getenv("KQ_SDPA_IDX_NAX");
-    return !e || std::atoi(e) != 0;
-  }();
-  const bool use_nax = nax_env && kq_is_nax_available();
+  // Pass 1.
   {
     constexpr int strip = 32;
     std::string kname;
@@ -829,9 +898,10 @@ void KQuantSDPACascade::eval_gpu(
   int n_rows = B * gqa_factor * qL;
   float scale = scale_;
 
+  // The shared pass is the fa verify tile on a (Hkv, 1, splits) grid.
   int s_sh = splits_shared_;
   if (s_sh == 0) {
-    s_sh = P <= 8192 ? 16 : P <= 24576 ? 32 : P <= 49152 ? 64 : 128;
+    s_sh = kq_fa_verify_splits(1, n_kv_heads, n_rows, D, P, d);
   }
   int s_pr = splits_priv_;
   if (s_pr == 0) {
@@ -957,7 +1027,7 @@ void KQuantSDPACascade::eval_gpu(
         {&f, MTL::DataType::DataTypeBool, 3},
         {&q8, MTL::DataType::DataTypeBool, 5},
     };
-    const int bq = n_rows <= 32 ? 32 : 64;
+    const int bq = n_rows <= 32 ? 32 : n_rows <= 48 ? 48 : 64;
     std::string kname = "kq_sdpa_fa_verify_2pass_1_" + ts + "_" +
         std::to_string(D) + "_bq" + std::to_string(bq);
     std::string hash =

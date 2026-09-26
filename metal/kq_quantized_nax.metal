@@ -7,6 +7,7 @@
 #include "mlx/backend/metal/kernels/steel/gemm/nax.h"
 #include "mlx/backend/metal/kernels/steel/gemm/loader.h"
 #include "mlx/backend/metal/kernels/kq_quantized_nax.h"
+#include "mlx/backend/metal/kernels/kq_verify_nax.h"
 
 #define instantiate_kquant_nax_qmm_t(                                                      \
     type, gs, bits, aligned_N, batched, bm, bn, wm, wn, codec)                             \
@@ -348,4 +349,30 @@ instantiate_kquant_nax_gather_seg_codec(iq1_m, 256, 1)
 instantiate_kquant_nax_gather_seg_codec(stq1_0, 256, 1)
 instantiate_kquant_nax_gather_seg_codec(pq2_0, 128, 2)
 instantiate_kquant_nax_gather_seg_codec(ptq1_0, 128, 1)
+
+// Register-fed NAX verify kernels (kq_verify_nax.h), M <= 8, half and
+// bfloat activations, for the codecs whose decode hides under the NAX ops.
+#define instantiate_kquant_verify_nax(type, gs, bits, codec)          \
+  instantiate_kernel(                                                 \
+      "kquant_" #codec "_verify_nax_" #type "_gs_" #gs "_b_" #bits,   \
+      kq_ ## codec ## _verify_nax,                                    \
+      type, gs, bits)
+instantiate_kquant_verify_nax(bfloat16_t, 128, 2, pq2_0)
+instantiate_kquant_verify_nax(float16_t, 128, 2, pq2_0)
+instantiate_kquant_verify_nax(bfloat16_t, 32, 4, q4_0)
+instantiate_kquant_verify_nax(float16_t, 32, 4, q4_0)
+instantiate_kquant_verify_nax(bfloat16_t, 32, 4, q4_0_sb)
+instantiate_kquant_verify_nax(float16_t, 32, 4, q4_0_sb)
+instantiate_kquant_verify_nax(bfloat16_t, 32, 8, q8_0)
+instantiate_kquant_verify_nax(float16_t, 32, 8, q8_0)
+instantiate_kquant_verify_nax(bfloat16_t, 256, 4, q4_k)
+instantiate_kquant_verify_nax(float16_t, 256, 4, q4_k)
+instantiate_kquant_verify_nax(bfloat16_t, 256, 5, q5_k)
+instantiate_kquant_verify_nax(float16_t, 256, 5, q5_k)
+instantiate_kquant_verify_nax(bfloat16_t, 256, 6, q6_k)
+instantiate_kquant_verify_nax(float16_t, 256, 6, q6_k)
+instantiate_kquant_verify_nax(bfloat16_t, 256, 3, q3_k)
+instantiate_kquant_verify_nax(float16_t, 256, 3, q3_k)
+instantiate_kquant_verify_nax(bfloat16_t, 256, 2, q2_k)
+instantiate_kquant_verify_nax(float16_t, 256, 2, q2_k)
     // clang-format on

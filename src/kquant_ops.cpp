@@ -7,6 +7,7 @@
 
 #include "kquant.h"
 #include "kquant_codec.h"
+#include "kquant_internal.h"
 #include "kquant_lora_epilogue.h"
 
 #include "mlx/utils.h" // to_stream
@@ -126,6 +127,8 @@ mx::array dequantize(
   // Row-contiguize at the op level so eval_gpu can assume dense inputs.
   auto w_c = w.flags().row_contiguous ? w : mx::contiguous(w, false, s);
 
+  kq_check_weight_base_at_build(w, kquant_type, s, "dequantize");
+
   // For every kquant codec, group_size == weights_per_block (32 or 256).
   return mx::array(
       std::move(out_shape),
@@ -193,6 +196,7 @@ mx::array quantized_matmul(
   }
 
   auto s = mx::to_stream(s_);
+  kq_check_weight_base_at_build(w, kquant_type, s, "quantized_matmul");
 
   // Cast x to the output dtype, then matrix-row-contiguize x / w / scales at
   // the op level so eval_gpu can assume dense inputs.
@@ -316,6 +320,7 @@ mx::array quantized_matmul_qmv_bias(
   }
 
   auto s = mx::to_stream(s_);
+  kq_check_weight_base_at_build(w, kquant_type, s, "quantized_matmul_qmv_bias");
 
   auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
   auto w_c = kq_ensure_row_contiguous_matrix(w, s);
@@ -443,6 +448,7 @@ mx::array gather_qmm(
   }
 
   auto s = mx::to_stream(s_);
+  kq_check_weight_base_at_build(w, kquant_type, s, "gather_qmm");
 
   // Default + broadcast the indices, then cast to uint32.
   mx::array lhs_indices = kq_indices_or_default(lhs_indices_, x, s);
@@ -615,6 +621,7 @@ mx::array gather_qmm_seg(
   }
 
   auto s = mx::to_stream(s_);
+  kq_check_weight_base_at_build(w, kquant_type, s, "gather_qmm_seg");
   auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
   // The kernel computes each expert's base pointer as expert * N * K_w, so w
   // must be fully row-contiguous (no strided expert dim).

@@ -130,3 +130,36 @@ def test_real_file_rows_decode_bit_exact(codec):
         if checked == 6:
             break
     assert checked == 6, f"only {checked} {want_name} tensors in {path}"
+
+
+# The PTQ1_0 M=1 mat-vec runs qmv_fast (four rows per simdgroup) when N is a
+# multiple of 8 and K of 256, and plain qmv (two rows per simdgroup)
+# otherwise. The shapes cover one and several eight-block passes, a pass
+# count that is not a multiple of eight blocks, and odd N, whose last
+# threadgroup has one live row. float32 activations run the bfloat16 kernel.
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "n,k",
+    [
+        (1024, 1024),
+        (1024, 2304),
+        (512, 4096),
+        (1004, 1024),
+        (1002, 1024),
+        (1001, 4096),
+        (1003, 768),
+        (256, 640),
+        (8, 128),
+    ],
+)
+def test_ptq1_0_matvec_shapes(n, k, dtype):
+    rng = np.random.default_rng(3)
+    wire = synth_wire(rng, "ptq1_0", 28, n * (k // 128)).reshape(n, k // 128 * 28)
+    deq = quants.dequantize(np.ascontiguousarray(wire), "PTQ1_0")
+    scales = mx.zeros((1,), dtype=mx.uint8)
+    x = mx.array((rng.standard_normal((1, k)) * 0.5).astype(np.float32)).astype(dtype)
+    ref = np.array(x.astype(mx.float32)) @ deq.T
+    out = kq.quantized_matmul(x, mx.array(wire), scales, "ptq1_0", transpose=True)
+    got = np.array(out.astype(mx.float32))
+    err = float(np.abs(got - ref).max() / (np.abs(ref).max() + 1e-6))
+    assert err < 2e-2, f"N{n} K{k} {dtype}: rel err {err:.3e}"

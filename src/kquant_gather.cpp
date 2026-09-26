@@ -822,7 +822,6 @@ void KQuantGatherQMM::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
-  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   // inputs are row-contiguous (ensured by the op):
   //   x (float), w (uint8), scales, lhs_indices (uint32), rhs_indices (uint32).
@@ -831,6 +830,8 @@ void KQuantGatherQMM::eval_gpu(
   const auto& scales = inputs[2];
   const auto& lhs_indices = inputs[3];
   const auto& rhs_indices = inputs[4];
+  kq_check_weight_base(w, kquant_type_, "gather_qmm");
+  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int K = x.shape(-1);
   int M = x.shape(-2);
@@ -1047,7 +1048,6 @@ void KQuantGatherQMMSeg::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
-  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   // inputs are row-contiguous (ensured by the op): x [R, K] (float),
   // w [E, N, bpr] (uint8), scales, map [T, 3] (uint32), counts [1].
@@ -1056,6 +1056,8 @@ void KQuantGatherQMMSeg::eval_gpu(
   const auto& scales = inputs[2];
   const auto& map = inputs[3];
   const auto& counts = inputs[4];
+  kq_check_weight_base(w, kquant_type_, "gather_qmm_seg");
+  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int K = x.shape(-1);
   int N = w.shape(1);

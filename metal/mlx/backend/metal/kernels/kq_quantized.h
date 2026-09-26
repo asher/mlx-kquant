@@ -1980,8 +1980,56 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
       w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
 }
 
-// Register-resident MMA verify kernels, used by the legacy and Prism headers.
+// Register-resident MMA verify kernels, used here and by the legacy and
+// Prism headers.
 #include "mlx/backend/metal/kernels/kq_verify_mma.h"
+
+// Register-resident MMA verify (kq_verify_mma.h). Lane L owns qs bytes
+// 8L..8L+7: fragments (b0, b2), (b1, b3), (b4, b6), (b5, b7). Each pair
+// has its sign bits flipped and is masked into the mantissas of a half2
+// (1024 + 128 + q), which one fma maps to q / 256, exact in half. The
+// 1/256 keeps every product within half its activation, so one channel
+// near the top of the half range stays finite in the block sum, and
+// d_scale restores the factor.
+struct KqQ8_0Mma {
+  static constant constexpr int block_k = KQ_Q8_0_GROUP;
+  static constant constexpr int block_bytes = KQ_Q8_0_BLOCK_BYTES;
+  static constant constexpr int d_offset = KQ_Q8_0_D_OFFSET;
+  static constant constexpr float d_scale = 256.0f;
+  static METAL_FUNC int perm(int f, int col) {
+    return 8 * (col / 2) + 4 * (f >> 1) + (f & 1) + 2 * (col & 1);
+  }
+  template <int NT>
+  static METAL_FUNC void block(
+      thread const KqVmmaRows<NT>& rows,
+      int boff,
+      short L,
+      short fm,
+      const threadgroup half* xb,
+      thread simdgroup_half8x8 (&acc)[NT]) {
+    uint wv[NT][2];
+    for (short t = 0; t < NT; ++t) {
+      const packed_ushort4 v =
+          *(const device packed_ushort4*)(rows.p[t] + boff + KQ_Q8_0_Q_OFFSET +
+                                          8 * L);
+      wv[t][0] = uint(v.x) | (uint(v.y) << 16);
+      wv[t][1] = uint(v.z) | (uint(v.w) << 16);
+    }
+    for (short f = 0; f < 4; ++f) {
+      half2 a[NT];
+      for (short t = 0; t < NT; ++t) {
+        const uint src = (wv[t][f >> 1] >> (8 * (f & 1))) & 0x00FF00FFu;
+        a[t] =
+            fma(as_type<half2>((src ^ 0x00800080u) | 0x64006400u),
+                half2(1.0h / 256.0h),
+                half2(-4.5h));
+      }
+      kq_vmma_step<NT>(xb + 8 * perm(f, fm), a, acc);
+    }
+  }
+};
+
+KQ_DEFINE_VERIFY_MMA_KERNEL(q8_0, KqQ8_0Mma, 2)
 
 #include "mlx/backend/metal/kernels/kq_quantized_legacy.h"
 

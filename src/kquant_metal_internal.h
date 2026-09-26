@@ -67,6 +67,13 @@ inline int kquant_qmv_bn(const std::string& kquant_type) {
   return 8;
 }
 
+// Rows per threadgroup of the M=1 qmv_fast kernel: kquant_qmv_bn, except
+// ptq1_0, whose qmv_fast runs four rows per simdgroup
+// (KQ_PRISM_DEFINE_KERNELS FAST_RPS).
+inline int kquant_qmv_fast_bn(const std::string& kquant_type) {
+  return kquant_type == "ptq1_0" ? 8 : kquant_qmv_bn(kquant_type);
+}
+
 // quantized.cpp:63-65 (kquant branch). KQuant blocks are 32 or 256 weights.
 inline int qmv_fast_k_align() {
   return 256;
@@ -186,11 +193,34 @@ inline int verify_qmv_max_rows() {
 // the output rows one of its threadgroups covers (8 simdgroups of 8 rows
 // per row tile); 0 for codecs without the kernel. M <= 8 only.
 inline int codec_verify_mma_rows(const std::string& kquant_type) {
-  if (kquant_type == "pq2_0" || kquant_type == "q4_0") {
+  if (kquant_type == "pq2_0" || kquant_type == "q4_0" ||
+      kquant_type == "q8_0") {
     return 128;
   }
   if (kquant_type == "ptq1_0") {
     return 64;
+  }
+  return 0;
+}
+
+// Codecs with a register-fed NAX verify kernel (kq_verify_nax.h) and the K
+// its loop consumes per iteration (units per iteration times the unit
+// width); 0 for codecs without the kernel. NAX GPUs, M <= 8 only. q4_0
+// lists its two-block kernel; the host runs the eight-block kernel (256)
+// where K is a multiple of 256 (kq_verify_nax_call_kstep).
+inline int codec_verify_nax_kstep(const std::string& kquant_type) {
+  if (kquant_type == "pq2_0" || kquant_type == "q8_0") {
+    return 128;
+  }
+  if (kquant_type == "q4_0") {
+    return 64;
+  }
+  if (kquant_type == "q4_k") {
+    return 256;
+  }
+  if (kquant_type == "q5_k" || kquant_type == "q6_k" || kquant_type == "q3_k" ||
+      kquant_type == "q2_k") {
+    return 128;
   }
   return 0;
 }

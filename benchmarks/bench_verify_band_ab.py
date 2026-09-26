@@ -1,6 +1,6 @@
 """Thermally-paired A/B of the NAX split-K tile (KQ_QMM_SPLITK_NAX) per codec.
 
-Source of the kq_splitk_nax_min_m entries in src/kquant_matmul.cpp.
+A/B check of the NAX split-K entries in kq_nax_small_m (src/kquant_matmul.cpp).
 Measured on an M5 Max; re-run on new silicon before trusting them.
 
 KQ_QMM_SPLITK_NAX is read live per dispatch, so all arms share one
@@ -55,18 +55,26 @@ THUE_MORSE = [bin(i).count("1") & 1 for i in range(8)]
 
 
 def group_size_of(codec):
+    if codec in ("pq2_0", "ptq1_0"):
+        return 128
     return 32 if codec in ("q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "iq4_nl") else 256
 
 
 def effective_sp(target, K, gs):
-    """Mirror the host-side split resolution: the target resolves down to
-    a divisor of K / max(gs, BK). Different targets can be one kernel."""
-    sliceq = max(gs, 64)
-    nblk = K // sliceq
+    """Mirror the host-side split resolution (kq_nax_split at the default
+    KQ_SPLITK_RAGGED): the divisor of K / max(gs, BK) at or under the
+    target, or the ragged count when that is more than twice as large.
+    Different targets can be one kernel."""
+    nblk = K // max(gs, 64)
+    if nblk < 2:
+        return 1
     sp = min(target, nblk)
     while sp > 1 and nblk % sp != 0:
         sp -= 1
-    return sp
+    t = min(target, nblk)
+    per = -(-nblk // t)
+    sp_r = -(-nblk // per)
+    return sp_r if sp_r > 2 * sp else sp
 
 
 def probe_layout(codec, N, K):

@@ -31,6 +31,15 @@ wq, scales = kq.quantize(w, "q4_k")                      # float -> wire bytes (
 y = kq.quantized_matmul(x, wq, scales, "q4_k", transpose=True)   # x @ dequant(w).T
 ```
 
+On the GPU, a `q4_k` or `q5_k` weight must start on a 16-byte boundary and an `iq4_xs` or `iq1_m`
+weight on an 8-byte one. `q2_k`, `q4_1`, `q5_1` and `ptq1_0` need 4 bytes, `mxfp4` and `nvfp4` can
+start anywhere, and every other codec needs 2. An op raises `ValueError` on a weight that misses its
+boundary. It raises from the call when the weight is evaluated and row-contiguous, and from
+`mx.eval` otherwise. Arrays that MLX allocates and tensors from `kq.load_gguf` always meet the
+boundary, as do slices of them that start on a block boundary. A view that starts inside a block can
+miss it, and a copy in a new buffer, such as `mx.array(np.array(w))`, runs. The CPU kernels accept
+any start.
+
 ## Codecs
 
 Twenty-four codecs (the ten K-quant/legacy encodable on either stream, the nine IQ plus
