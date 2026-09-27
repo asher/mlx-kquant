@@ -181,9 +181,10 @@ def test_mv_ext_ragged_n(codec, monkeypatch):
 # Non-NAX split-K band, which the rest of this file cannot reach on NAX
 # silicon: M 2 sits below every codec entry, 6-8 cover the bm8 tile for
 # the codecs whose entry is at or under them, 10-16 the bm16 tile, 17-32
-# the BM32 tile up to its ceiling, and 33 is the handoff back to plain
-# qmm. KQ_DISABLE_NAX is read live, so toggling it re-routes in-process.
-ALU_SPLITK_MS = [2, 6, 7, 8, 10, 12, 16, 17, 24, 32, 33]
+# the BM32 tile up to its ceiling, 33-128 the mid-M band (split-K at this
+# narrow N), and 129 is the handoff back to plain qmm. KQ_DISABLE_NAX is
+# read live, so toggling it re-routes in-process.
+ALU_SPLITK_MS = [2, 6, 7, 8, 10, 12, 16, 17, 24, 32, 33, 48, 64, 65, 100, 128, 129]
 
 
 @pytest.fixture
@@ -201,6 +202,32 @@ def test_alu_splitk_band(codec, nax_off):
 def test_alu_splitk_band_iq(codec, nax_off):
     w, s, ref_w = _iq_setup(codec, 1000)
     _sweep(codec, w, s, ref_w, 1000, ms=ALU_SPLITK_MS)
+
+
+# The mid-M rule takes split-K on non-NAX GPUs while the BM64 qmm grid,
+# ceil(N/64) x ceil(M/64) threadgroups, is under three per core. With 40
+# cores pinned, N 1000 at M 48 (16 threadgroups) matches the forced
+# split-K output bit for bit and N 8192 (128) matches plain qmm. The two
+# routes differ in their bits, so the comparison tells them apart.
+@pytest.mark.parametrize("n_out,taken", [(1000, "1"), (8192, "0")])
+@pytest.mark.parametrize("codec", ["q4_k", "q8_0"])
+def test_alu_midm_splitk_rule(codec, n_out, taken, nax_off, monkeypatch):
+    monkeypatch.setenv("KQ_GPU_CORES", "40")
+    w, s, _ = _encodable_setup(codec, n_out)
+    x = (mx.random.normal((48, K)) * 0.5).astype(mx.bfloat16)
+
+    def run(route):
+        if route is None:
+            monkeypatch.delenv("KQ_QMM_MIDM", raising=False)
+        else:
+            monkeypatch.setenv("KQ_QMM_MIDM", route)
+        y = kq.quantized_matmul(x, w, s, codec, transpose=True)
+        mx.eval(y)
+        return y
+
+    default = run(None)
+    assert _bits_equal(default, run(taken))
+    assert not _bits_equal(default, run("0" if taken == "1" else "1"))
 
 
 # Register-resident MMA verify band (kq_verify_mma.h): KQ_VERIFY_MMA=2

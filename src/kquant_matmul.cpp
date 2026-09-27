@@ -747,7 +747,8 @@ void qmm(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// Split-K qmm_t for the small-M decode band. The plain tile grid is only
+// Split-K qmm_t for the small-M decode band and the mid-M band on non-NAX
+// GPUs (see kq_midm_splitk). The plain tile grid is only
 // ceil(N/64) x 1 threadgroups at decode shapes with M <= 32 (84 at
 // [5376 x 21504]) and the in-tile K walk serializes, capping qmm/NAX at
 // 160-257 GB/s while mv_ext decays past M~4 on L2 activation re-reads.
@@ -1509,6 +1510,18 @@ static bool kq_codec_has_mv_ext(const std::string& t) {
       t == "ptq1_0" || t == "mxfp4" || t == "nvfp4";
 }
 
+// Mid-M split-K entry on non-NAX GPUs. From M 33 through 128 the BM64 qmm
+// grid is ceil(N/64) x ceil(M/64) threadgroups, and under three per GPU
+// core the in-tile K walk leaves cores idle. Split-K on the BM32 tile then
+// wins: on an M3 Max at M 56 on the Qwen3.8-27B projections, 1.5x at N 5120
+// and 6144, 3x at N 1024 and 7x at N 48; at N 10240 and up qmm stays
+// ahead.
+static bool kq_midm_splitk(int M, int N) {
+  const int cores = gpu_core_count();
+  const int grid = ((N + 63) / 64) * ((M + 63) / 64);
+  return grid < 3 * (cores > 0 ? cores : 40);
+}
+
 // Largest divisor of nblk at or under target (1 = no split).
 static int kq_split_count(int target, int nblk) {
   int sp = std::min(target, nblk);
@@ -2226,6 +2239,38 @@ void KQuantMatmul::eval_gpu_base(
         s,
         kquant_type_);
     return;
+  }
+
+  // Mid-M split-K on non-NAX GPUs where kq_midm_splitk finds the qmm grid
+  // short of threadgroups. KQ_QMM_MIDM (read live) is a probe lever: 0
+  // keeps qmm and 1 takes split-K at every M 33-128. KQ_QMM_SPLITK=0 turns
+  // it off with the small-M route, and a larger value sets its target.
+  if (transpose_ && non_batched && M > 32 && M <= 128 && !nax_path &&
+      qmm_splitk_env != 0 && kq_splitk_codec(kquant_type_) &&
+      x.dtype() != mx::float32) {
+    const char* me = std::getenv("KQ_QMM_MIDM");
+    const int midm = me != nullptr ? std::atoi(me) : -1;
+    if (midm == 1 || (midm == -1 && kq_midm_splitk(M, N))) {
+      const int target = qmm_splitk_env > 1 ? qmm_splitk_env : 16;
+      const int sp = kq_split_count(target, K / group_size_);
+      if (sp > 1) {
+        qmm_splitk(
+            x,
+            w,
+            scales,
+            out,
+            group_size_,
+            bits_,
+            M,
+            N,
+            K,
+            sp,
+            d,
+            s,
+            kquant_type_);
+        return;
+      }
+    }
   }
 
   if (M >= vector_limit) {
