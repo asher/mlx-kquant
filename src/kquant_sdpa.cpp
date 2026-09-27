@@ -68,6 +68,31 @@ struct KQKvarnMeta {
   uint64_t stage_v_head;
 };
 
+// Mirror of the Metal-side KQKvBatch (kq_sdpa.h, buffer 30): the k and v
+// batch strides, so a batch stride other than n_kv_heads * head stride reads
+// the right rows.
+struct KQKvBatch {
+  uint64_t k;
+  uint64_t v;
+};
+
+KQKvBatch kq_kv_batch(const array& k, const array& v) {
+  return {
+      static_cast<uint64_t>(k.strides(0)), static_cast<uint64_t>(v.strides(0))};
+}
+
+// The scale, axes and stage operands of quantized and KVarN caches are
+// addressed as (b * n_kv_heads + h) * head stride, so their batch and head
+// axes must be contiguous with each other. The caches build them that way.
+void kq_sdpa_check_batch_heads(const char* op, const array& a) {
+  if (a.shape(0) > 1 && a.shape(1) > 1 &&
+      a.strides(0) != static_cast<int64_t>(a.shape(1)) * a.strides(1)) {
+    throw std::runtime_error(
+        std::string("[mlx_kquant.") + op +
+        "] quantized-KV operands need batch-contiguous heads.");
+  }
+}
+
 // Number of key-blocks to split the reduction across. Mirrors MLX's own
 // sdpa_vector_2pass heuristic: more blocks only when there are enough
 // simdgroups per kv-head (n_simds = gqa_factor * qL) to justify the extra
@@ -262,6 +287,7 @@ void KQuantSDPA::eval_gpu(
     ce.set_bytes(v_head_stride, 9);
     ce.set_bytes(v_seq_stride, 10);
     ce.set_bytes(scale, 11);
+    ce.set_bytes(kq_kv_batch(k, v), 30);
     MTL::Size group_dims(32, gqa_factor, qL);
     MTL::Size grid_dims(n_kv_heads, B, blocks);
     ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -448,6 +474,11 @@ void KQuantSDPAGQA::eval_gpu(
           axv.shape(1) == 1 ? axv.strides(0) : axv.strides(1));
       vs_seq_stride = static_cast<size_t>(axv.strides(2));
     }
+    if (kv_q8 || kvarn) {
+      for (int i = 0; i < 4; i++) {
+        kq_sdpa_check_batch_heads("sdpa_decode_gqa", inputs[qkv_idx + i]);
+      }
+    }
     for (int i = 0; i < 4; i++) {
       ce.set_input_array(kv_q8 ? inputs[qkv_idx + i] : sums, 14 + i);
     }
@@ -486,6 +517,7 @@ void KQuantSDPAGQA::eval_gpu(
     ce.set_bytes(kvm, 28);
     // Per-row ends (dummy when compiled out).
     ce.set_input_array(ends ? inputs[ends_idx] : sums, 29);
+    ce.set_bytes(kq_kv_batch(k, v), 30);
     MTL::Size group_dims(32, gqa_factor, qL > 1 ? (qL + 1) / 2 : 1);
     MTL::Size grid_dims(n_kv_heads, B, splits);
     ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -980,6 +1012,9 @@ void KQuantSDPACascade::eval_gpu(
       const auto& kbi = inputs[q8_base + 5];
       const auto& vsc = inputs[q8_base + 6];
       const auto& vbi = inputs[q8_base + 7];
+      for (const auto* a : {&ksc, &kbi, &vsc, &vbi}) {
+        kq_sdpa_check_batch_heads("sdpa_decode_gqa_cascade", *a);
+      }
       ce.set_input_array(ksc, 14);
       ce.set_input_array(kbi, 15);
       ce.set_input_array(vsc, 16);
@@ -1012,6 +1047,8 @@ void KQuantSDPACascade::eval_gpu(
     const int pzero = 0;
     ce.set_input_array(sums1, 22);
     ce.set_bytes(pzero, 23);
+    ce.set_input_array(sums1, 29);
+    ce.set_bytes(kq_kv_batch(k_pr, v_pr), 30);
     MTL::Size group_dims(32, gqa_factor, qL > 1 ? (qL + 1) / 2 : 1);
     MTL::Size grid_dims(n_kv_heads, B, s_pr);
     ce.dispatch_threadgroups(grid_dims, group_dims);

@@ -346,6 +346,142 @@ def test_sdpa_decode_gqa_batched_nostarts(D):
     assert _rel(got, ref) < REL_BOUND[mx.bfloat16]
 
 
+def _make_batch_major(B, Hq, Hkv, qL, kL, D, dtype, seed, lazy):
+    """q plus K and V as transposed views of [B, kL, Hkv, D] buffers, the
+    layout of a projection before any cache: the batch stride is
+    kL * Hkv * D, not Hkv times the head stride. lazy leaves the views
+    unevaluated, so the op sees them without real strides at build time."""
+    key = mx.random.key(seed)
+    k0, k1, k2 = mx.random.split(key, 3)
+    q = mx.random.normal((B, Hq, qL, D), key=k0).astype(dtype)
+    kb = mx.random.normal((B, kL, Hkv, D), key=k1).astype(dtype)
+    vb = mx.random.normal((B, kL, Hkv, D), key=k2).astype(dtype)
+    mx.eval(q, kb, vb)
+    k = kb.transpose(0, 2, 1, 3)
+    v = vb.transpose(0, 2, 1, 3)
+    if not lazy:
+        mx.eval(k, v)
+    return q, k, v
+
+
+@pytest.mark.parametrize("lazy", [False, True])
+@pytest.mark.parametrize("qL", [1, 3])
+@pytest.mark.parametrize("D", [256, 512])
+def test_sdpa_vector_batch_major_kv(D, qL, lazy):
+    # every batch row reads its own keys when the batch stride is not
+    # n_kv_heads * head stride
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make_batch_major(2, 16, 4, qL, 1500, D, mx.bfloat16, D + qL, lazy)
+    got = kq.sdpa_vector(q, k, v, scale, causal=qL > 1)
+    ref = _ref_sdpa(q, k, v, scale, qL > 1)
+    _eval_or_skip(got, ref)
+    for b in range(2):
+        rel = _rel(got[b], ref[b])
+        assert rel < REL_BOUND[mx.bfloat16], f"row {b} rel {rel:.3e}"
+
+
+@pytest.mark.parametrize("lazy", [False, True])
+@pytest.mark.parametrize("qL", [1, 2])
+@pytest.mark.parametrize("D", [64, 512])
+def test_sdpa_decode_gqa_batch_major_kv(D, qL, lazy):
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make_batch_major(3, 32, 4, qL, 3000, D, mx.bfloat16, D + qL, lazy)
+    got = kq.sdpa_decode_gqa(q, k, v, scale)
+    ref = _ref_sdpa_sinks(q, k, v, scale, None)
+    _eval_or_skip(got, ref)
+    for b in range(3):
+        rel = _rel(got[b], ref[b])
+        assert rel < REL_BOUND[mx.bfloat16], f"row {b} rel {rel:.3e}"
+
+
+def test_sdpa_paged_batch_major_kv():
+    # every page selected on a batch-major cache == the dense reference
+    import numpy as np
+
+    B, Hq, Hkv, D, S = 2, 16, 4, 128, 2048
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make_batch_major(B, Hq, Hkv, 1, S, D, mx.bfloat16, 61, False)
+    tot = S // 32
+    pg = np.broadcast_to(np.arange(tot, dtype=np.int32), (B, Hkv, tot)).copy()
+    got = kq.sdpa_decode_gqa_paged(q, k, v, scale, mx.array(pg))
+    ref = _ref_sdpa_sinks(q, k, v, scale, None)
+    _eval_or_skip(got, ref)
+    for b in range(B):
+        rel = _rel(got[b], ref[b])
+        assert rel < REL_BOUND[mx.bfloat16], f"row {b} rel {rel:.3e}"
+
+
+def test_sdpa_cascade_batch_major_private_kv():
+    # the per-row leg of the cascade reads batch-major private keys
+    B, Hq, Hkv, D = 3, 32, 8, 128
+    P, Sp = 1023, 257
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, mx.bfloat16, seed=62, strided=False)
+    q, k_pr, v_pr = _make_batch_major(B, Hq, Hkv, 1, Sp, D, mx.bfloat16, 63, False)
+    k_full = mx.concatenate([mx.broadcast_to(k_sh, (B, Hkv, P, D)), k_pr], axis=2)
+    v_full = mx.concatenate([mx.broadcast_to(v_sh, (B, Hkv, P, D)), v_pr], axis=2)
+    ref = _ref_sdpa_sinks(q, k_full, v_full, scale, None)
+    got = kq.sdpa_decode_gqa_cascade(q, k_sh, v_sh, k_pr, v_pr, scale)
+    _eval_or_skip(got, ref)
+    for b in range(B):
+        rel = _rel(got[b], ref[b])
+        assert rel < REL_BOUND[mx.bfloat16], f"row {b} rel {rel:.3e}"
+
+
+def _q8_batch_major(B, Hkv, S, D, seed):
+    # q8 wire as batch-major views, plus the reference it dequantizes to
+    x = mx.random.normal((B, S, Hkv, D), key=mx.random.key(seed)).astype(mx.float16)
+    w, sc, bi = mx.quantize(x, group_size=64, bits=8)
+    mx.eval(w, sc, bi)
+    ref = mx.dequantize(w, sc, bi, group_size=64, bits=8).transpose(0, 2, 1, 3)
+
+    def t(a):
+        return a.transpose(0, 2, 1, 3)
+
+    return t(w), t(sc), t(bi), ref
+
+
+def test_sdpa_decode_gqa_q8_batch_major():
+    # batch-major q8 wire reads the right rows; its scale and bias operands
+    # must keep batch and heads contiguous, and a batch-major view of them
+    # raises instead of reading another row's groups
+    B, Hq, Hkv, S, D = 2, 16, 4, 1024, 128
+    scale = 1.0 / (D**0.5)
+    q = mx.random.normal((B, Hq, 1, D), key=mx.random.key(64)).astype(mx.float16)
+    kw, ks, kb, kref = _q8_batch_major(B, Hkv, S, D, 65)
+    vw, vs, vb, vref = _q8_batch_major(B, Hkv, S, D, 66)
+    packed = [mx.contiguous(a) for a in (ks, kb, vs, vb)]
+    got = kq.sdpa_decode_gqa(
+        q,
+        kw,
+        vw,
+        scale,
+        k_scales=packed[0],
+        k_biases=packed[1],
+        v_scales=packed[2],
+        v_biases=packed[3],
+    )
+    ref = _ref_sdpa_sinks(q, kref, vref, scale, None)
+    _eval_or_skip(got, ref)
+    for b in range(B):
+        rel = _rel(got[b], ref[b])
+        assert rel < REL_BOUND[mx.float16], f"row {b} rel {rel:.3e}"
+    mx.eval(ks, kb, vs, vb)
+    with pytest.raises(RuntimeError, match="batch-contiguous heads"):
+        mx.eval(
+            kq.sdpa_decode_gqa(
+                q,
+                kw,
+                vw,
+                scale,
+                k_scales=ks,
+                k_biases=kb,
+                v_scales=vs,
+                v_biases=vb,
+            )
+        )
+
+
 def test_sdpa_decode_gqa_starts_zero_matches_plain():
     # all-zero starts must match the no-starts call on the same inputs
     scale = 1.0 / (512**0.5)

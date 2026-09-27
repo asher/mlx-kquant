@@ -17,6 +17,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `q6_k` matmuls with one activation row, such as plain decode, run faster under sustained load.
   `KQ_QMV_SPLITK=0` restores the previous kernels.
 
+### Fixed
+- Batched `sdpa_vector` and `sdpa_decode_gqa` calls (plain, paged, KVarN and the cascade's
+  per-row keys) no longer return wrong values past the first batch row when K and V are views
+  such as a transposed `[B, S, H, D]` projection.
+- Quantized-KV scales and biases, and KVarN axes and stage rows, that are batch-major views
+  raise at evaluation instead of reading another row's values.
+
 ## [0.4.14]
 
 ### Added

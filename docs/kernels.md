@@ -383,7 +383,9 @@ term; requires the expert biases and is instantiated for `mxfp4`/`nvfp4` only).
 ## Attention
 
 Scaled-dot-product variants for shapes stock MLX's fused allowlist excludes, plus the sparse
-mechanism below.
+mechanism below. The ops read K and V in place through their strides, batch-major views included.
+The q8 scales and biases and the KVarN axes and stage rows are addressed per batch row and head as
+the caches lay them out, and a batch-major view of them raises at evaluation.
 
 - **`sdpa_vector`** - vector SDPA for large head dims (256, 512) - e.g. DeepSeek MLA - which MLX's
   fused vector path does not cover.

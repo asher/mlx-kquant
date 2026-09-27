@@ -72,6 +72,15 @@ struct KQKvarnMeta {
   ulong stage_v_head;
 };
 
+// K/V batch strides (buffer 30), in the units of the head and seq strides.
+// Rows address as b * batch + h * head, so a batch stride other than
+// n_kv_heads * head (a transposed [B, S, H, D] view) reads the right rows.
+// Mirrored in kquant_sdpa.cpp.
+struct KQKvBatch {
+  ulong k;
+  ulong v;
+};
+
 // Per-row key ends (buffer 29): row b's keys run [row_start, ends[b]) with
 // the scalar N as the capacity bound, so batched rows may differ in length
 // without right-justification. With kvarn the region map derives per row
@@ -286,6 +295,7 @@ template <typename T, typename PT, int D, int V = D>
     const constant size_t& v_head_stride [[buffer(9)]],
     const constant size_t& v_seq_stride [[buffer(10)]],
     const constant float& scale [[buffer(11)]],
+    const constant KQKvBatch& kvb [[buffer(30)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -314,11 +324,10 @@ template <typename T, typename PT, int D, int V = D>
   const int o_offset = q_batch_head_idx * q_seq_len + q_seq_idx;
 
   queries += o_offset * D + simd_lid * qk_per_thread;
-  const int kv_batch_head_idx = batch_idx * num_kv_heads + kv_head_idx;
-  keys += kv_batch_head_idx * k_head_stride + block_idx * k_seq_stride +
-      simd_lid * qk_per_thread;
-  values += kv_batch_head_idx * v_head_stride + block_idx * v_seq_stride +
-      simd_lid * v_per_thread;
+  keys += batch_idx * kvb.k + kv_head_idx * k_head_stride +
+      block_idx * k_seq_stride + simd_lid * qk_per_thread;
+  values += batch_idx * kvb.v + kv_head_idx * v_head_stride +
+      block_idx * v_seq_stride + simd_lid * v_per_thread;
   out += o_offset * blocks * V + block_idx * V + simd_lid * v_per_thread;
   sums += o_offset * blocks + block_idx;
   maxs += o_offset * blocks + block_idx;
@@ -486,6 +495,7 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
     const device half* kvarn_stage_v [[buffer(27)]],
     const constant KQKvarnMeta& kvm [[buffer(28)]],
     const device int* ends [[buffer(29)]],
+    const constant KQKvBatch& kvb [[buffer(30)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -551,16 +561,15 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
   const int k1 = min(k0 + chunk, body_end);
 
   // With gqa_kv_q8 the k/v buffers hold packed uint32 wire and the strides
-  // arrive in WORDS (D/4 per row); otherwise they hold T elements.
-  const device T* kbase =
-      keys + (size_t)(batch_idx * num_kv_heads + kv_head_idx) * k_head_stride;
-  const device T* vbase =
-      values + (size_t)(batch_idx * num_kv_heads + kv_head_idx) * v_head_stride;
+  // arrive in WORDS (D/4 per row); otherwise they hold T elements. The
+  // scale, axes and stage operands are batch-contiguous (host-checked).
+  const size_t k_bh = batch_idx * kvb.k + (size_t)kv_head_idx * k_head_stride;
+  const size_t v_bh = batch_idx * kvb.v + (size_t)kv_head_idx * v_head_stride;
+  const device T* kbase = keys + k_bh;
+  const device T* vbase = values + v_bh;
   const size_t kv_hb = (size_t)(batch_idx * num_kv_heads + kv_head_idx);
-  const device uint32_t* kwbase =
-      (const device uint32_t*)keys + kv_hb * k_head_stride;
-  const device uint32_t* vwbase =
-      (const device uint32_t*)values + kv_hb * v_head_stride;
+  const device uint32_t* kwbase = (const device uint32_t*)keys + k_bh;
+  const device uint32_t* vwbase = (const device uint32_t*)values + v_bh;
   const device T* ksb = k_scales + kv_hb * ks_head_stride;
   const device T* kbb = k_biases + kv_hb * ks_head_stride;
   const device T* vsb = v_scales + kv_hb * vs_head_stride;
