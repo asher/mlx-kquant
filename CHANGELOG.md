@@ -6,6 +6,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- On GPUs without NAX (M1-M4), matmuls with 33 to 128 activation rows run
+  faster on narrow output widths, such as the short prompts of a structured
+  decision. `KQ_QMM_MIDM=0` keeps the previous kernel.
+
 ## [0.4.14]
 
 ### Added

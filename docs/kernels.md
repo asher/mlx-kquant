@@ -156,6 +156,12 @@ Tuning levers (defaults are right for normal use):
   NAX kernels, M <= 32. Read live per call, so both arms can share one process.
 - `KQ_QMM_SPLITK` - the same lever for the plain small-M qmm, used when NAX is absent or disabled.
   Entry points come from a per-device table. K-quants, legacy quants and the IQ codecs, M <= 32.
+  `0` also turns off the `KQ_QMM_MIDM` route, and a larger value sets its slice target.
+- `KQ_QMM_MIDM` - split-K on the BM=32 tile for M 33-128 when NAX is absent or disabled. `0` keeps
+  the BM=64 qmm and `1` forces split-K at every M in the band. Unset takes split-K where the qmm
+  grid, ceil(N/64) x ceil(M/64) threadgroups, is under three per GPU core (`KQ_GPU_CORES` sets the
+  count), such as the narrow projections of a short prompt. The codecs of `KQ_QMM_SPLITK`. Read
+  live per call.
 - `KQ_SPLITK_RAGGED` - slice count of the NAX split-K route. `0` keeps equal slices, the largest
   count at or under the target that divides the slice units, and `2` takes the ragged count
   whenever it is larger. Unset takes it only where it more than doubles the equal count. Read live
