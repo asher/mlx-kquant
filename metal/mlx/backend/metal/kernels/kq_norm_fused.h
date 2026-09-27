@@ -12,6 +12,9 @@
 //     post-attention hidden state).
 //   kq_rmsnorm2_add:  out = rms_norm(a, wa) + rms_norm(b, wb) -- two
 //     independent norms plus the branch merge (gemma-4 MoE: h1 + h2).
+//   kq_add_rmsnorm_norm:  out = (residual + rms_norm(h, w)) [* scale] and
+//     rms_norm(out, w_next), the post-norm residual plus the norm that reads
+//     it next, rounded like the unfused ops (see its own comment).
 //
 // All math in f32 (accumulate, normalize, add), one round to T at the write;
 // rms_norm(x, w) = w * x * rsqrt(mean(x^2) + eps), matching
@@ -245,6 +248,114 @@ template <typename T>
       const float o = float(wa[i]) * float(arow[i]) * inva +
           float(wb[i]) * float(brow[i]) * invb;
       orow[i] = static_cast<T>(o);
+    }
+  }
+}
+
+// kq_add_rmsnorm_norm: out = (residual + rms_norm(h, w)) [* scale] and
+// normed = rms_norm(out, w_next), bit-identical to the unfused composition of
+// mx::fast::rms_norm, add and multiply. Every step rounds to T where that
+// composition rounds, and both reductions follow MLX's rms kernels. C == 1 is
+// rms_single_row, with the threadgroup sized to the row and 4 contiguous
+// elements per thread. C > 1 is rms_looped at 1024 threads, C chunks of 4096
+// elements. All operands load before the first reduction.
+inline float kq_rms_inv(
+    float acc,
+    uint simd_lid,
+    uint simd_gid,
+    uint nsg,
+    float d,
+    float eps,
+    threadgroup float* sums) {
+  acc = simd_sum(acc);
+  if (simd_lid == 0) {
+    sums[simd_gid] = acc;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // Every simdgroup reduces the partials itself. The lanes and their values
+  // match MLX's simdgroup 0 (unused lanes zero), so the sum is the same.
+  acc = simd_sum(simd_lid < nsg ? sums[simd_lid] : 0.0f);
+  return metal::precise::rsqrt(acc / d + eps);
+}
+
+// The row width and the scale flag are function constants, so each width
+// gets its own pipeline with the chunk bounds folded at pipeline build.
+constant int kq_arnn_D [[function_constant(330)]];
+constant bool kq_arnn_has_scale [[function_constant(331)]];
+
+template <typename T, int C>
+[[kernel, max_total_threads_per_threadgroup(1024)]] void kq_add_rmsnorm_norm(
+    const device T* h [[buffer(0)]],
+    const device T* residual [[buffer(1)]],
+    const device T* w [[buffer(2)]],
+    const device T* w_next [[buffer(3)]],
+    const device T* lscale [[buffer(4)]],
+    device T* out [[buffer(5)]],
+    device T* normed [[buffer(6)]],
+    const constant float& eps [[buffer(7)]],
+    const constant float& eps_next [[buffer(8)]],
+    uint tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint ntg [[threads_per_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int N = C * KQ_NORM_NREADS;
+  const int D = kq_arnn_D;
+  threadgroup float sums0[32];
+  threadgroup float sums1[32];
+
+  const size_t row = size_t(tid) * D;
+  const uint nsg = (ntg + 31) / 32;
+  const float d = float(D);
+
+  float hv[N], rv[N], wv[N], wn[N];
+  for (int c = 0; c < C; c++) {
+    for (int i = 0; i < KQ_NORM_NREADS; i++) {
+      const int j = c * KQ_NORM_NREADS + i;
+      const uint idx = c * ntg * KQ_NORM_NREADS + lid * KQ_NORM_NREADS + i;
+      const bool ok = idx < uint(D);
+      hv[j] = ok ? float(h[row + idx]) : 0.0f;
+      rv[j] = ok ? float(residual[row + idx]) : 0.0f;
+      wv[j] = ok ? float(w[idx]) : 0.0f;
+      wn[j] = ok ? float(w_next[idx]) : 0.0f;
+    }
+  }
+  const float sc = kq_arnn_has_scale ? float(lscale[0]) : 1.0f;
+
+  float acc = 0;
+  for (int j = 0; j < N; j++) {
+    acc += hv[j] * hv[j];
+  }
+  const float inv = kq_rms_inv(acc, simd_lid, simd_gid, nsg, d, eps, sums0);
+
+  float ov[N];
+  float acc_o = 0;
+  for (int c = 0; c < C; c++) {
+    for (int i = 0; i < KQ_NORM_NREADS; i++) {
+      const int j = c * KQ_NORM_NREADS + i;
+      const uint idx = c * ntg * KQ_NORM_NREADS + lid * KQ_NORM_NREADS + i;
+      const T n = static_cast<T>(wv[j] * float(static_cast<T>(hv[j] * inv)));
+      T o = static_cast<T>(rv[j] + float(n));
+      if (kq_arnn_has_scale) {
+        o = static_cast<T>(float(o) * sc);
+      }
+      ov[j] = idx < uint(D) ? float(o) : 0.0f;
+      acc_o += ov[j] * ov[j];
+      if (idx < uint(D)) {
+        out[row + idx] = o;
+      }
+    }
+  }
+  const float inv_o =
+      kq_rms_inv(acc_o, simd_lid, simd_gid, nsg, d, eps_next, sums1);
+  for (int c = 0; c < C; c++) {
+    for (int i = 0; i < KQ_NORM_NREADS; i++) {
+      const int j = c * KQ_NORM_NREADS + i;
+      const uint idx = c * ntg * KQ_NORM_NREADS + lid * KQ_NORM_NREADS + i;
+      if (idx < uint(D)) {
+        normed[row + idx] =
+            static_cast<T>(wn[j] * float(static_cast<T>(ov[j] * inv_o)));
+      }
     }
   }
 }

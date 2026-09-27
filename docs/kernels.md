@@ -482,6 +482,11 @@ Tuning levers (defaults are right for normal use):
 - **`rmsnorm2_add`** - two independent RMS norms plus an add in one dispatch.
 - **`rmsnorm_multi3`** - three RMS norms of one tensor sharing its mean-square reduction (the QK-norm
   plus a third head-norm shape).
+- **`add_rmsnorm_norm`** - `out = (residual + rms_norm(h, weight)) * scale` and `normed =
+  rms_norm(out, next_weight)` in one dispatch, bit-identical to the same composition of MLX ops. A
+  decoder layer uses it where a residual sum feeds the next norm, such as the pre-feedforward norm
+  after attention or the next layer's input norm. Rows wider than 16384 and CPU streams run the
+  composition.
 
 ## Hadamard rotation
 

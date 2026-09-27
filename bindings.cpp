@@ -2026,6 +2026,43 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "add_rmsnorm_norm",
+      &mlx_kquant::add_rmsnorm_norm,
+      "h"_a,
+      "residual"_a,
+      "weight"_a,
+      "next_weight"_a,
+      "eps"_a,
+      "scale"_a = nb::none(),
+      "next_eps"_a = nb::none(),
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Post-norm residual plus the norm that reads it next, in one
+        dispatch. It computes out = (residual + rms_norm(h, weight)) * scale
+        and rms_norm(out, next_weight). Every step rounds to the input dtype
+        where the unfused mx.fast.rms_norm, add and multiply ops round, so
+        both outputs are bit-identical to that composition. CPU streams,
+        rows wider than 16384 and GPUs whose pipeline cannot hold the
+        threadgroup run the composition itself.
+
+        Args:
+            h (array): [..., D], float16/bfloat16.
+            residual (array): same shape and dtype as h.
+            weight (array): [D] norm weight for h, same dtype as h.
+            next_weight (array): [D] norm weight for out, same dtype as h.
+            eps (float): rms_norm epsilon for h.
+            scale (array, optional): size-1 scalar multiplying the sum, same
+                dtype as h; no multiply when absent.
+            next_eps (float, optional): rms_norm epsilon for out; eps when
+                absent.
+
+        Returns:
+            list(array): [out, rms_norm(out, next_weight)], each the shape
+            and dtype of h.
+      )");
+
+  m.def(
       "hc_front_reduce",
       &mlx_kquant::hc_front_reduce,
       "x"_a,

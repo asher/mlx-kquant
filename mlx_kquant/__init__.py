@@ -23,6 +23,7 @@ import mlx.core as _mx  # noqa: F401
 
 from ._ext import (  # noqa: F401
     add_rmsnorm,
+    add_rmsnorm_norm,
     arena_alloc,
     codec_has_matmul,
     codec_has_moe_glu,
@@ -123,6 +124,7 @@ __all__ = [
     "HAS_LORA_EPILOGUE",
     "KVARN_RECORD_VERSION",
     "add_rmsnorm",
+    "add_rmsnorm_norm",
     "arena_alloc",
     "codec_has_matmul",
     "codec_has_moe_glu",

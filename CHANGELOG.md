@@ -6,6 +6,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `add_rmsnorm_norm`: a residual add with the norm before it and the norm
+  after it in one dispatch, bit-identical to the unfused MLX ops.
+
 ### Changed
 - On GPUs without NAX (M1-M4), matmuls with 33 to 128 activation rows run
   faster on narrow output widths, such as the short prompts of a structured

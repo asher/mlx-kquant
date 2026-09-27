@@ -9,11 +9,13 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 
 #include "kquant.h"
 #include "kquant_internal.h" // kq_type_string
 
 #include "mlx/backend/cpu/encoder.h"
+#include "mlx/fast.h"
 #include "mlx/ops.h"
 #include "mlx/utils.h"
 
@@ -60,6 +62,24 @@ mx::array prep_norm_weight(
         std::string(op) + " " + what + " dtype must match the activations.");
   }
   return mx::contiguous(w, false, s);
+}
+
+// Threadgroup width and 4096-element chunk count for add_rmsnorm_norm, in
+// the layout of MLX's rms kernels. Rows up to 4096 get a row-sized
+// threadgroup (rms_single_row) and wider rows get 1024 threads (rms_looped).
+// Only 1 to 4 chunks are instantiated, and wider rows run the composition.
+constexpr int kAddRMSNormNormMaxD = 4 * 4096;
+
+std::pair<int, int> add_rmsnorm_norm_layout(int D) {
+  if (D <= 4096) {
+    const int threads = std::max(32, ((D + 3) / 4 + 31) / 32 * 32);
+    return {threads, 1};
+  }
+  return {1024, (D + 4095) / 4096};
+}
+
+std::string add_rmsnorm_norm_kname(mx::Dtype dt, int C) {
+  return "kq_add_rmsnorm_norm_" + kq_type_string(dt) + "_" + std::to_string(C);
 }
 
 } // namespace
@@ -183,7 +203,99 @@ void KQuantRMSNorm2Add::eval_gpu(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+namespace {
+
+// D and the scale flag are function constants 330 and 331, so the pipeline
+// is keyed by width and scale as well as dtype and chunk count.
+MTL::ComputePipelineState* add_rmsnorm_norm_kernel(
+    mx::metal::Device& d,
+    mx::Dtype dt,
+    int D,
+    bool has_scale) {
+  const int C = add_rmsnorm_norm_layout(D).second;
+  const std::string kname = add_rmsnorm_norm_kname(dt, C);
+  int d_const = D;
+  bool scale_const = has_scale;
+  mx::metal::MTLFCList func_consts = {
+      {&d_const, MTL::DataType::DataTypeInt, 330},
+      {&scale_const, MTL::DataType::DataTypeBool, 331},
+  };
+  const std::string hash_name =
+      kname + "_d" + std::to_string(D) + (has_scale ? "_s" : "");
+  return kq_get_kernel(d, kname, hash_name, func_consts);
+}
+
+} // namespace
+
+void KQuantAddRMSNormNorm::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  for (auto& out : outputs) {
+    out.set_data(mx::allocator::malloc(out.nbytes()));
+  }
+
+  const auto& h = inputs[0];
+  // scale must be a bound buffer even when unused; h stands in.
+  const auto& lscale = has_scale_ ? inputs[4] : inputs[0];
+  int D = h.shape(-1);
+  int T = int(h.size() / D);
+  const int threads = add_rmsnorm_norm_layout(D).first;
+
+  auto kernel = add_rmsnorm_norm_kernel(d, h.dtype(), D, has_scale_);
+  // The op checked this at build time; a narrower pipeline would silently
+  // skip rows here.
+  if (int(kernel->maxTotalThreadsPerThreadgroup()) < threads) {
+    throw std::runtime_error(
+        "[mlx_kquant.add_rmsnorm_norm] pipeline cannot hold the threadgroup.");
+  }
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(h, 0);
+  ce.set_input_array(inputs[1], 1);
+  ce.set_input_array(inputs[2], 2);
+  ce.set_input_array(inputs[3], 3);
+  ce.set_input_array(lscale, 4);
+  ce.set_output_array(outputs[0], 5);
+  ce.set_output_array(outputs[1], 6);
+  ce.set_bytes(eps_, 7);
+  ce.set_bytes(next_eps_, 8);
+  ce.dispatch_threadgroups(MTL::Size(T, 1, 1), MTL::Size(threads, 1, 1));
+}
+
+namespace {
+
+// True when the add_rmsnorm_norm pipeline for this width holds its
+// threadgroup on the stream's device.
+bool add_rmsnorm_norm_fits(
+    int D,
+    mx::Dtype dt,
+    bool has_scale,
+    const mx::Stream& s) {
+  auto& d = mx::metal::device(s.device);
+  auto kernel = add_rmsnorm_norm_kernel(d, dt, D, has_scale);
+  return int(kernel->maxTotalThreadsPerThreadgroup()) >=
+      add_rmsnorm_norm_layout(D).first;
+}
+
+} // namespace
+
 #else // !_METAL_
+
+void KQuantAddRMSNormNorm::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error("[mlx_kquant.add_rmsnorm_norm] requires Metal.");
+}
+
+namespace {
+
+bool add_rmsnorm_norm_fits(int, mx::Dtype, bool, const mx::Stream&) {
+  return false;
+}
+
+} // namespace
 
 void KQuantAddRMSNorm::eval_gpu(
     const std::vector<mx::array>&,
@@ -496,6 +608,84 @@ mx::array rmsnorm2_add(
       a.dtype(),
       std::make_shared<KQuantRMSNorm2Add>(s, eps),
       {std::move(a_c), std::move(wa_c), std::move(b_c), std::move(wb_c)});
+}
+
+void KQuantAddRMSNormNorm::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.add_rmsnorm_norm] CPU streams build the unfused ops.");
+}
+
+bool KQuantAddRMSNormNorm::is_equivalent(const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQuantAddRMSNormNorm&>(other);
+  return eps_ == o.eps_ && next_eps_ == o.next_eps_ &&
+      has_scale_ == o.has_scale_;
+}
+
+std::vector<mx::Shape> KQuantAddRMSNormNorm::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  return {inputs[0].shape(), inputs[0].shape()};
+}
+
+std::vector<mx::array> add_rmsnorm_norm(
+    mx::array h,
+    mx::array residual,
+    mx::array weight,
+    mx::array next_weight,
+    float eps,
+    const std::optional<mx::array>& scale,
+    std::optional<float> next_eps,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const char* op = "[mlx_kquant.add_rmsnorm_norm]";
+  if (h.ndim() < 1 || h.shape(-1) < 1) {
+    throw std::invalid_argument(std::string(op) + " h must have a last axis.");
+  }
+  if (residual.shape() != h.shape() || residual.dtype() != h.dtype()) {
+    throw std::invalid_argument(
+        std::string(op) + " residual must match h in shape and dtype.");
+  }
+  const int D = h.shape(-1);
+  const float eps_next = next_eps.value_or(eps);
+  auto h_c = prep_act(h, op, "h", s);
+  auto r_c = prep_act(residual, op, "residual", s);
+  auto w_c = prep_norm_weight(weight, h, D, op, "weight", s);
+  auto wn_c = prep_norm_weight(next_weight, h, D, op, "next_weight", s);
+  std::optional<mx::array> sc_c;
+  if (scale.has_value()) {
+    const auto& sc = *scale;
+    if (sc.size() != 1) {
+      throw std::invalid_argument(std::string(op) + " scale must be size 1.");
+    }
+    if (sc.dtype() != h.dtype()) {
+      throw std::invalid_argument(
+          std::string(op) + " scale dtype must match the activations.");
+    }
+    // A 0-d scale keeps the composition's output at the shape of h.
+    sc_c = mx::contiguous(mx::reshape(sc, {}, s), false, s);
+  }
+
+  if (s.device.type == mx::Device::DeviceType::cpu || D > kAddRMSNormNormMaxD ||
+      !add_rmsnorm_norm_fits(D, h.dtype(), scale.has_value(), s)) {
+    auto out = mx::add(r_c, mx::fast::rms_norm(h_c, w_c, eps, s), s);
+    if (sc_c.has_value()) {
+      out = mx::multiply(out, *sc_c, s);
+    }
+    return {out, mx::fast::rms_norm(out, wn_c, eps_next, s)};
+  }
+
+  std::vector<mx::array> inputs = {
+      std::move(h_c), std::move(r_c), std::move(w_c), std::move(wn_c)};
+  if (sc_c.has_value()) {
+    inputs.push_back(*sc_c);
+  }
+  return mx::array::make_arrays(
+      {h.shape(), h.shape()},
+      {h.dtype(), h.dtype()},
+      std::make_shared<KQuantAddRMSNormNorm>(
+          s, eps, eps_next, scale.has_value()),
+      std::move(inputs));
 }
 
 // ---- rmsnorm_gate ----------------------------------------------------------
