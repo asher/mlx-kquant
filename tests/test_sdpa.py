@@ -482,6 +482,67 @@ def test_sdpa_decode_gqa_q8_batch_major():
         )
 
 
+def test_sdpa_batch_size_mismatch():
+    # K, V or q8 operands with another batch size than q raise instead of
+    # reading past the arrays
+    q, k, v = _make(2, 16, 4, 1, 256, 128, mx.float16, seed=67, strided=False)
+    with pytest.raises(ValueError, match="batch size"):
+        kq.sdpa_decode_gqa(q, k[:1], v[:1], 1.0)
+    q5, k5, v5 = _make(2, 16, 4, 1, 256, 512, mx.bfloat16, seed=68, strided=False)
+    with pytest.raises(ValueError, match="batch size"):
+        kq.sdpa_vector(q5, k5, v5[:1], 1.0)
+    kw, ks, kb = _q8(k)
+    vw, vs, vb = _q8(v)
+    with pytest.raises(ValueError, match="scales/biases"):
+        kq.sdpa_decode_gqa(
+            q, kw, vw, 1.0, k_scales=ks[:1], k_biases=kb, v_scales=vs, v_biases=vb
+        )
+
+
+def test_sdpa_cascade_q8_batch_major_private():
+    # the per-row leg reads a batch-major private q8 wire, and batch-major
+    # private scales and biases raise at evaluation
+    B, Hq, Hkv, D, P, Sp = 2, 16, 4, 128, 511, 257
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, mx.float16, seed=75, strided=False)
+    ksh, vsh = _q8(k_sh), _q8(v_sh)
+    q = mx.random.normal((B, Hq, 1, D), key=mx.random.key(76)).astype(mx.float16)
+    kw, ks, kb, kref = _q8_batch_major(B, Hkv, Sp, D, 77)
+    vw, vs, vb, vref = _q8_batch_major(B, Hkv, Sp, D, 78)
+
+    def call(ops):
+        return kq.sdpa_decode_gqa_cascade(
+            q,
+            ksh[0],
+            vsh[0],
+            kw,
+            vw,
+            scale,
+            k_shared_scales=ksh[1],
+            k_shared_biases=ksh[2],
+            v_shared_scales=vsh[1],
+            v_shared_biases=vsh[2],
+            k_priv_scales=ops[0],
+            k_priv_biases=ops[1],
+            v_priv_scales=ops[2],
+            v_priv_biases=ops[3],
+        )
+
+    got = call([mx.contiguous(a) for a in (ks, kb, vs, vb)])
+    k_sd = mx.dequantize(*ksh, group_size=64, bits=8)
+    v_sd = mx.dequantize(*vsh, group_size=64, bits=8)
+    k_full = mx.concatenate([mx.broadcast_to(k_sd, (B, Hkv, P, D)), kref], axis=2)
+    v_full = mx.concatenate([mx.broadcast_to(v_sd, (B, Hkv, P, D)), vref], axis=2)
+    ref = _ref_sdpa_sinks(q, k_full, v_full, scale, None)
+    _eval_or_skip(got, ref)
+    for b in range(B):
+        rel = _rel(got[b], ref[b])
+        assert rel < REL_BOUND[mx.float16], f"row {b} rel {rel:.3e}"
+    mx.eval(ks, kb, vs, vb)
+    with pytest.raises(RuntimeError, match="batch-contiguous heads"):
+        mx.eval(call([ks, kb, vs, vb]))
+
+
 def test_sdpa_decode_gqa_starts_zero_matches_plain():
     # all-zero starts must match the no-starts call on the same inputs
     scale = 1.0 / (512**0.5)

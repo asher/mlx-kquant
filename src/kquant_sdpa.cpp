@@ -83,7 +83,8 @@ KQKvBatch kq_kv_batch(const array& k, const array& v) {
 
 // The scale, axes and stage operands of quantized and KVarN caches are
 // addressed as (b * n_kv_heads + h) * head stride, so their batch and head
-// axes must be contiguous with each other. The caches build them that way.
+// axes must be contiguous with each other. The caches build them that way,
+// and the KVarN ops pack theirs, so for those the check is a guard only.
 void kq_sdpa_check_batch_heads(const char* op, const array& a) {
   if (a.shape(0) > 1 && a.shape(1) > 1 &&
       a.strides(0) != static_cast<int64_t>(a.shape(1)) * a.strides(1)) {
@@ -335,6 +336,11 @@ void KQuantSDPAGQA::eval_gpu(
   const size_t ends_idx = starts_idx + (starts ? 1 : 0);
   const size_t qkv_idx = ends_idx + (ends ? 1 : 0);
   kq_sdpa_check_layout("sdpa_decode_gqa", q, k, v);
+  if (kv_q8 || kvarn) {
+    for (int i = 0; i < 4; i++) {
+      kq_sdpa_check_batch_heads("sdpa_decode_gqa", inputs[qkv_idx + i]);
+    }
+  }
 
   int B = q.shape(0);
   int n_q_heads = q.shape(1);
@@ -473,11 +479,6 @@ void KQuantSDPAGQA::eval_gpu(
       vs_head_stride = static_cast<size_t>(
           axv.shape(1) == 1 ? axv.strides(0) : axv.strides(1));
       vs_seq_stride = static_cast<size_t>(axv.strides(2));
-    }
-    if (kv_q8 || kvarn) {
-      for (int i = 0; i < 4; i++) {
-        kq_sdpa_check_batch_heads("sdpa_decode_gqa", inputs[qkv_idx + i]);
-      }
     }
     for (int i = 0; i < 4; i++) {
       ce.set_input_array(kv_q8 ? inputs[qkv_idx + i] : sums, 14 + i);
@@ -918,6 +919,11 @@ void KQuantSDPACascade::eval_gpu(
   const int q8_base = 6 + int(starts);
   kq_sdpa_check_layout("sdpa_decode_gqa_cascade", q, k_pr, v_pr);
   kq_sdpa_check_layout("sdpa_decode_gqa_cascade", qf, k_sh, v_sh);
+  if (kv_q8) {
+    for (int i = 4; i < 8; i++) {
+      kq_sdpa_check_batch_heads("sdpa_decode_gqa_cascade", inputs[q8_base + i]);
+    }
+  }
 
   int B = q.shape(0);
   int n_q_heads = q.shape(1);
@@ -1012,9 +1018,6 @@ void KQuantSDPACascade::eval_gpu(
       const auto& kbi = inputs[q8_base + 5];
       const auto& vsc = inputs[q8_base + 6];
       const auto& vbi = inputs[q8_base + 7];
-      for (const auto* a : {&ksc, &kbi, &vsc, &vbi}) {
-        kq_sdpa_check_batch_heads("sdpa_decode_gqa_cascade", *a);
-      }
       ce.set_input_array(ksc, 14);
       ce.set_input_array(kbi, 15);
       ce.set_input_array(vsc, 16);
@@ -1330,6 +1333,10 @@ mx::array sdpa_vector(
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_vector] n_q_heads must be a multiple of n_kv_heads.");
   }
+  if (k.shape(0) != q.shape(0) || v.shape(0) != q.shape(0)) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_vector] k and v must have q's batch size.");
+  }
   int qL = q.shape(2);
   int gqa_factor = n_q_heads / n_kv_heads;
   // pass-1 threadgroup is 32 * gqa_factor * qL threads; cap at the Metal max.
@@ -1437,6 +1444,7 @@ static std::vector<mx::array> sdpa_decode_gqa_impl(
     }
     for (const auto& a : {*k_scales, *k_biases, *v_scales, *v_biases}) {
       if (a.dtype() != q.dtype() || a.ndim() != 4 || a.shape(-1) != D / 64 ||
+          a.shape(0) != q.shape(0) || a.shape(1) != k.shape(1) ||
           a.shape(2) != k.shape(2)) {
         throw std::invalid_argument(
             "[mlx_kquant.sdpa_decode_gqa] quantized KV scales/biases must "
@@ -1465,6 +1473,10 @@ static std::vector<mx::array> sdpa_decode_gqa_impl(
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa] n_q_heads must be a multiple of "
         "n_kv_heads.");
+  }
+  if (k.shape(0) != q.shape(0) || v.shape(0) != q.shape(0)) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa] k and v must have q's batch size.");
   }
   int gqa_factor = n_q_heads / n_kv_heads;
   if (gqa_factor > 16) {
