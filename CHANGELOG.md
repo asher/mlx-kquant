@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.15]
+
 ### Added
 - `add_rmsnorm_norm`: a residual add with the norm before it and the norm
   after it in one dispatch, bit-identical to the unfused MLX ops.
