@@ -2163,6 +2163,10 @@ METAL_FUNC void kq_q6_k_qmv_fast_impl(
 MLX_MTL_CONST int KQ_Q6_K_SPLITK_RPS = 4;
 MLX_MTL_CONST int KQ_Q6_K_SPLITK_NSG = 8;
 
+// Row width K of kq_q6_k_qmv_splitk. A function constant, so each width gets
+// its own pipeline with the superblock count and row stride folded.
+constant int kq_q6_k_splitk_k [[function_constant(340)]];
+
 // 32-bit word from a 2-byte-aligned address (Q6_K rows are 210 bytes).
 inline uint kq_q6_k_ld32(const device uint8_t* p) {
   const device ushort* h = (const device ushort*)p;
@@ -2182,7 +2186,7 @@ METAL_FUNC void kq_q6_k_qmv_splitk_impl(
     const device uint8_t* w,
     const device T* x,
     device T* y,
-    const constant int& in_vec_size,
+    const int in_vec_size,
     threadgroup float* red,
     uint3 tid,
     uint simd_gid,
@@ -2906,7 +2910,7 @@ template <typename T, int group_size, int bits, bool batched>
     const device uint8_t* /* scales */,
     const device T* x,
     device T* y,
-    const constant int& in_vec_size,
+    const constant int& /* in_vec_size, see kq_q6_k_splitk_k */,
     const constant int& /* out_vec_size */,
     const constant int& /* x_batch_ndims */,
     const constant int* /* x_shape */,
@@ -2923,7 +2927,7 @@ template <typename T, int group_size, int bits, bool batched>
   static_assert(bits == 6, "Q6_K kernel requires bits=6");
   threadgroup float red[KQ_Q6_K_SPLITK_NSG * KQ_Q6_K_SPLITK_RPS];
   kq_q6_k_qmv_splitk_impl<T, KQ_Q6_K_SPLITK_RPS, KQ_Q6_K_SPLITK_NSG>(
-      w, x, y, in_vec_size, red, tid, simd_gid, simd_lid);
+      w, x, y, kq_q6_k_splitk_k, red, tid, simd_gid, simd_lid);
 }
 
 // `batched` is carried only so this reuses the instantiate_kquant_batched

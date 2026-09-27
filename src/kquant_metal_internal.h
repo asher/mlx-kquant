@@ -396,8 +396,7 @@ inline MTL::ComputePipelineState* kq_get_kernel(
   return d.get_kernel(kname, lib);
 }
 
-// Func-constant variant for kernels specialized via an MTLFCList (the only kq
-// consumer is gather_qmm_rhs_nax: align_M/N/K at constant ids 200/201/202).
+// Func-constant variant for kernels specialized via an MTLFCList.
 // hash_name must encode the func-const values so each specialization gets a
 // distinct pipeline-state cache entry (d.get_kernel(name, lib, hash, consts)).
 inline MTL::ComputePipelineState* kq_get_kernel(

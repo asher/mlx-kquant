@@ -115,7 +115,9 @@ when 4 divides N. The MoE gathers keep their own kernels. The eight simdgroups o
 share four output rows, divide the superblocks between them and add their partial sums in
 threadgroup memory. Each thread assembles four 6-bit codes at a time from 32-bit words and
 pre-scales the activation for byte b of a word by 2^(-8b), so a weight costs one AND, one convert
-and one FMA.
+and one FMA. The row width is a Metal function constant, so each width gets its own pipeline with
+the superblock count and row stride folded. Under sustained load that ran about 1% faster than
+reading the width at run time.
 
 Under sustained decode the GPU runs below its top clock, where the per-row kernels turn ALU-bound.
 Measured on M5 Max over 90 seconds of back-to-back mat-vecs at the gemma-4 31B MLP shapes, the

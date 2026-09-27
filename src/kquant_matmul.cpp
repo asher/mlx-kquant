@@ -1201,7 +1201,12 @@ static bool qmv_splitk(
       "_b_",
       bits,
       "_batch_0");
-  auto kernel = kq_get_kernel(d, kname);
+  // K is function constant 340, so the pipeline is keyed by row width too.
+  int k_const = K;
+  mx::metal::MTLFCList func_consts = {
+      {&k_const, MTL::DataType::DataTypeInt, 340}};
+  auto kernel =
+      kq_get_kernel(d, kname, kname + "_k" + std::to_string(K), func_consts);
   if (int(kernel->maxTotalThreadsPerThreadgroup()) < 32 * nsg) {
     return false;
   }
