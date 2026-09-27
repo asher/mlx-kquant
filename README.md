@@ -300,6 +300,10 @@ All optional; the defaults are right for normal use.
 - `KQ_SDPA_IDX_NAX=0` - run `sdpa_fa_indexed` on its simdgroup kernel even where the NAX tile
   kernel is available. Read once per process. The simdgroup kernel matches `sdpa_fa_verify` over
   the gathered rows bit for bit; the NAX kernel differs at output rounding level. A/B lever.
+- `KQ_GQA_NAX=0` - run the one-query head-dim-512 pass of `sdpa_decode_gqa` on its simdgroup kernel
+  even where the NAX kernel is available. Read per call. The two kernels differ at rounding level,
+  and in fp16 the NAX kernel's error against a float32 reference is about twice the simdgroup
+  kernel's. A/B lever.
 
 The model-specific kernels carry their own tuning levers, documented alongside each kernel in
 [docs/kernels.md](https://github.com/asher/mlx-kquant/blob/main/docs/kernels.md).

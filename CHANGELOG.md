@@ -16,6 +16,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   decision. `KQ_QMM_MIDM=0` keeps the previous kernel.
 - `q6_k` matmuls with one activation row, such as plain decode, run faster
   under sustained load. `KQ_QMV_SPLITK=0` restores the previous kernels.
+- On NAX GPUs, `sdpa_decode_gqa` runs one query at head dim 512 faster, such
+  as gemma-4 global-layer decode. `KQ_GQA_NAX=0` restores the previous kernel.
 
 ### Fixed
 - Batched `sdpa_vector`, `sdpa_decode_gqa` and cascade calls return correct

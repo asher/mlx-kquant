@@ -5,7 +5,9 @@ produces (identical fp32 expression and rounding), and everything downstream
 of the tile stage is the sdpa_decode_gqa machinery unchanged. The reference
 therefore materializes the cache (sink + dequantized records + live) into a
 plain fp16 KV and runs sdpa_decode_gqa with identical splits/tile_c: outputs
-must match bit for bit, including lse.
+must match bit for bit, including lse. The reference keeps the simdgroup
+pass 1 (KQ_GQA_NAX=0), since at head dim 512 the plain op may otherwise take
+the tensor-op pass, whose rounding differs.
 """
 
 from __future__ import annotations
@@ -25,6 +27,11 @@ pytestmark = pytest.mark.skipif(
 
 D = 128
 SCALE = D**-0.5
+
+
+@pytest.fixture(autouse=True)
+def _simdgroup_reference(monkeypatch):
+    monkeypatch.setenv("KQ_GQA_NAX", "0")
 
 
 def quantize_head(x, bits, kind):

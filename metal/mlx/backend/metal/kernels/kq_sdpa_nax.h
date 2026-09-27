@@ -320,3 +320,271 @@ kq_sdpa_fa_indexed_nax_2pass_1(
     }
   }
 }
+
+// Decode-width (one query) GQA attention at head_dim 512 on the tensor-op
+// units, pass 1 of the sdpa_decode_gqa split-K form. It writes the same
+// per-split partials as kq_sdpa_gqa_2pass_1, so kq_sdpa_gqa_2pass_2 merges
+// either. The scalar kernel does four multiply-adds per K/V byte on the
+// shader ALUs and falls short of bandwidth when the GPU clock drops; here
+// both matmuls run as 16x32x16 tensor ops with the group's q heads as the
+// fragment rows (gqa <= 8, rows past it zero).
+//
+// One threadgroup per (kv head, batch row, key split), eight simdgroups, a
+// tile of 256 keys. For S = Q K^T each simdgroup owns 32 keys over the full
+// head dim, with Q staged once in threadgroup memory. The simdgroups
+// exchange their tile maxima, park P (heads x 256 keys, float) in
+// threadgroup memory, and for O += P V each owns a 64-column slice of the
+// head dim over all 256 keys. Every K and V row is read once per
+// threadgroup. Inside a fragment the 16-wide contraction index is a
+// permutation of the head dim, and Q uses the same one: lane quad g reads
+// dims 16g..16g+15 of each 64-dim block, 32 contiguous bytes per row.
+template <typename T>
+[[kernel, max_total_threads_per_threadgroup(256)]] void kq_sdpa_gqa_nax_2pass_1(
+    const device T* queries [[buffer(0)]],
+    const device T* keys [[buffer(1)]],
+    const device T* values [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    device float* sums [[buffer(4)]],
+    device float* maxs [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant size_t& k_head_stride [[buffer(7)]],
+    const constant size_t& k_seq_stride [[buffer(8)]],
+    const constant size_t& v_head_stride [[buffer(9)]],
+    const constant size_t& v_seq_stride [[buffer(10)]],
+    const constant float& scale [[buffer(11)]],
+    const constant int& gqa [[buffer(12)]],
+    const constant size_t& k_batch_stride [[buffer(13)]],
+    const constant size_t& v_batch_stride [[buffer(14)]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]]) {
+  using namespace kq_sdpa_nax;
+  constexpr int D = 512;
+  constexpr int NSG = 8;
+  constexpr int KS = 32; // keys per simdgroup in S
+  constexpr int BK = NSG * KS; // keys per tile
+  constexpr int DC = D / NSG; // output columns per simdgroup in P V
+  constexpr int GM = 8; // q heads per group (fragment rows used)
+  constexpr int PLD = BK + 4; // P row stride (floats)
+  using T4 = metal::vec<T, 4>;
+  using frag_t = typename BaseNAXFrag::dtype_frag_t<T>;
+  using ffrag_t = typename BaseNAXFrag::dtype_frag_t<float>;
+
+  threadgroup T sQ[GM * D];
+  threadgroup float sP[GM * PLD];
+  threadgroup float sM[NSG * GM]; // tile maxima, then row sums
+
+  const int n_kv_heads = tpg.x;
+  const size_t hb = (size_t)tid.y * n_kv_heads + tid.x;
+  const size_t k_bh = tid.y * k_batch_stride + tid.x * k_head_stride;
+  const size_t v_bh = tid.y * v_batch_stride + tid.x * v_head_stride;
+  const int split_idx = tid.z;
+  const short sg = simd_group_id;
+  const short2 sc = BaseNAXFrag::get_coord();
+  const short fm = sc.y; // head row of this lane (and fm + 8, unused)
+  const short fn = sc.x;
+  const short goff = (fn >> 2) * 16; // lane quad's 16-dim slice
+  const bool row_lead = (simd_lane_id & 9) == 0; // fn == 0
+
+  // Whole tiles per split: a partial tile costs as long as a full one.
+  const int chunk = ((N + gqa_splits * BK - 1) / (gqa_splits * BK)) * BK;
+  const int k0 = split_idx * chunk;
+  const int k1 = min(k0 + chunk, N);
+
+  // Partials row for head fm of this group ([B, Hq, 1, splits, D]).
+  const size_t po = (hb * gqa + fm) * gqa_splits + split_idx;
+  device float* dst = out + po * D + sg * DC + goff;
+
+  if (k0 >= k1) {
+    // Empty split: pass 2 folds it at zero weight.
+    if (fm < gqa) {
+      STEEL_PRAGMA_UNROLL
+      for (short cc = 0; cc < 4; cc++) {
+        *(device float4*)(dst + cc * 4) = float4(0);
+      }
+      if (sg == 0 && row_lead) {
+        sums[po] = 0;
+        maxs[po] = Limits<float>::finite_min;
+      }
+    }
+    return;
+  }
+
+  {
+    const device T4* q4 = (const device T4*)(queries + hb * gqa * D);
+    threadgroup T4* sQ4 = (threadgroup T4*)sQ;
+    for (int i = simd_lane_id + 32 * sg; i < GM * D / 4; i += 32 * NSG) {
+      sQ4[i] = i < gqa * (D / 4) ? q4[i] : T4(T(0));
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const device T* kbase = keys + k_bh + goff;
+  const device T* vbase = values + v_bh + sg * DC + goff;
+  const threadgroup T* qrow = sQ + fm * D + goff;
+  const float scale2 = scale * M_LOG2E_F;
+
+  ffrag_t O[4];
+  STEEL_PRAGMA_UNROLL
+  for (short cc = 0; cc < 4; cc++) {
+    O[cc] = ffrag_t(0);
+  }
+  float m_run = Limits<float>::finite_min; // row fm, log2 domain
+  float l_run = 0; // this lane's share of row fm's sum
+
+  for (int kt = k0; kt < k1; kt += BK) {
+    // S (heads x 32 keys) for this simdgroup's keys. Lane rows are keys
+    // kb + fm, + 8, + 16, + 24; rows past N read row N - 1 and mask.
+    const int kb = kt + sg * KS;
+    ffrag_t S0 = ffrag_t(0);
+    ffrag_t S1 = ffrag_t(0);
+    if (kb < k1) {
+      const device T* kr[4];
+      STEEL_PRAGMA_UNROLL
+      for (short r = 0; r < 4; r++) {
+        kr[r] = kbase + (size_t)min(kb + fm + 8 * r, N - 1) * k_seq_stride;
+      }
+      STEEL_PRAGMA_UNROLL
+      for (short blk = 0; blk < D / 64; blk++) {
+        T4 kv[4][4];
+        T4 qv[4];
+        STEEL_PRAGMA_UNROLL
+        for (short s = 0; s < 4; s++) {
+          STEEL_PRAGMA_UNROLL
+          for (short r = 0; r < 4; r++) {
+            kv[r][s] = *(const device T4*)(kr[r] + blk * 64 + s * 4);
+          }
+          qv[s] = *(const threadgroup T4*)(qrow + blk * 64 + s * 4);
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short s = 0; s < 4; s++) {
+          frag_t a, b0, b1;
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < 4; j++) {
+            a[j] = qv[s][j];
+            a[4 + j] = T(0);
+            b0[j] = kv[0][s][j];
+            b0[4 + j] = kv[1][s][j];
+            b1[j] = kv[2][s][j];
+            b1[4 + j] = kv[3][s][j];
+          }
+          BaseNAXFrag::mma(
+              S0, S1, a, metal::false_type{}, b0, b1, metal::true_type{});
+        }
+      }
+    }
+
+    // Scale and mask (keys kb + fn + j in S0, kb + 16 + fn + j in S1), then
+    // the tile max of row fm across the simdgroups.
+    float sv[8];
+    float tmax = Limits<float>::finite_min;
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < 4; j++) {
+      sv[j] = kb + fn + j < k1 ? S0[j] * scale2 : Limits<float>::finite_min;
+      sv[4 + j] =
+          kb + 16 + fn + j < k1 ? S1[j] * scale2 : Limits<float>::finite_min;
+      tmax = max(tmax, max(sv[j], sv[4 + j]));
+    }
+    tmax = max(tmax, simd_shuffle_xor(tmax, ushort(1)));
+    tmax = max(tmax, simd_shuffle_xor(tmax, ushort(8)));
+    if (row_lead) {
+      sM[sg * GM + fm] = tmax;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float new_m = m_run;
+    STEEL_PRAGMA_UNROLL
+    for (short q = 0; q < NSG; q++) {
+      new_m = max(new_m, sM[q * GM + fm]);
+    }
+    const float factor = fast::exp2(m_run - new_m);
+    m_run = new_m;
+    float4 p0, p1;
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < 4; j++) {
+      p0[j] = fast::exp2(sv[j] - new_m);
+      p1[j] = fast::exp2(sv[4 + j] - new_m);
+    }
+    l_run = l_run * factor + (p0[0] + p0[1] + p0[2] + p0[3]) +
+        (p1[0] + p1[1] + p1[2] + p1[3]);
+    *(threadgroup float4*)(sP + fm * PLD + sg * KS + fn) = p0;
+    *(threadgroup float4*)(sP + fm * PLD + sg * KS + 16 + fn) = p1;
+    STEEL_PRAGMA_UNROLL
+    for (short cc = 0; cc < 4; cc++) {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < 4; j++) {
+        O[cc][j] *= factor;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // O += P V over the tile's keys for this simdgroup's 64 columns. Lane
+    // rows are keys kt + 16 kc + fm and + 8; masked keys carry P = 0.
+    STEEL_PRAGMA_UNROLL
+    for (short kc = 0; kc < BK / 16; kc++) {
+      if (kt + kc * 16 < k1) {
+        const int r0 = kt + kc * 16 + fm;
+        const device T* vr0 = vbase + (size_t)min(r0, N - 1) * v_seq_stride;
+        const device T* vr1 = vbase + (size_t)min(r0 + 8, N - 1) * v_seq_stride;
+        T4 v0[4], v1[4];
+        STEEL_PRAGMA_UNROLL
+        for (short s = 0; s < 4; s++) {
+          v0[s] = *(const device T4*)(vr0 + s * 4);
+          v1[s] = *(const device T4*)(vr1 + s * 4);
+        }
+        const float4 pa =
+            *(const threadgroup float4*)(sP + fm * PLD + kc * 16 + fn);
+        ffrag_t a;
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < 4; j++) {
+          a[j] = pa[j];
+          a[4 + j] = 0.0f;
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short pp = 0; pp < 2; pp++) {
+          frag_t b0, b1;
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < 4; j++) {
+            b0[j] = v0[2 * pp][j];
+            b0[4 + j] = v1[2 * pp][j];
+            b1[j] = v0[2 * pp + 1][j];
+            b1[4 + j] = v1[2 * pp + 1][j];
+          }
+          BaseNAXFrag::mma(
+              O[2 * pp],
+              O[2 * pp + 1],
+              a,
+              metal::false_type{},
+              b0,
+              b1,
+              metal::false_type{});
+        }
+      }
+    }
+  }
+
+  // Row sums across the lane quad pair and the simdgroups; the max is the
+  // same in every simdgroup.
+  l_run += simd_shuffle_xor(l_run, ushort(1));
+  l_run += simd_shuffle_xor(l_run, ushort(8));
+  if (row_lead) {
+    sM[sg * GM + fm] = l_run;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (fm < gqa) {
+    STEEL_PRAGMA_UNROLL
+    for (short cc = 0; cc < 4; cc++) {
+      *(device float4*)(dst + cc * 4) =
+          float4(O[cc][0], O[cc][1], O[cc][2], O[cc][3]);
+    }
+    if (sg == 0 && row_lead) {
+      float l = 0;
+      STEEL_PRAGMA_UNROLL
+      for (short q = 0; q < NSG; q++) {
+        l += sM[q * GM + fm];
+      }
+      sums[po] = l;
+      maxs[po] = m_run * M_LN2_F;
+    }
+  }
+}

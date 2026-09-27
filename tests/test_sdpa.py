@@ -278,6 +278,151 @@ def test_sdpa_gqa_verify_short_kv():
     _check_gqa(64, kL=17, dtype=mx.bfloat16, splits=16, qL=4)
 
 
+# One query at head_dim 512 with gqa <= 8 runs pass 1 on the tensor-op units
+# on NAX GPUs once KV heads x batch x keys reaches 3072, and KQ_GQA_NAX=0
+# keeps the simdgroup kernel. The op reads the variable at each call, so
+# these cases run both kernels against the reference and the simdgroup
+# kernel keeps its coverage on NAX machines.
+@pytest.fixture(params=["0", "1"], ids=["simdgroup", "nax"])
+def gqa_pass1(request, monkeypatch):
+    if request.param == "1" and not kq.nax_available():
+        pytest.skip("the tensor-op pass 1 needs NAX")
+    monkeypatch.setenv("KQ_GQA_NAX", request.param)
+    return request.param
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("G", [1, 4, 8])
+def test_sdpa_decode_gqa_hd512_route(gqa_pass1, G, dtype):
+    _check_gqa(512, kL=4300, dtype=dtype, Hq=2 * G, Hkv=2)
+
+
+@pytest.mark.parametrize("kL", [1, 255, 767, 768, 769, 1023, 1024, 1025, 2047])
+def test_sdpa_decode_gqa_hd512_route_edges(gqa_pass1, kL):
+    # both sides of the 3072-row switch, partial last tiles, and fewer
+    # tiles than splits
+    _check_gqa(512, kL=kL, dtype=mx.bfloat16, Hq=32, Hkv=4)
+
+
+@pytest.mark.parametrize("splits", [1, 3, 8, 64, 128])
+def test_sdpa_decode_gqa_hd512_route_splits(gqa_pass1, splits):
+    # 3 leaves a short last split, 64 and 128 leave most splits empty
+    _check_gqa(512, kL=4300, dtype=mx.bfloat16, Hq=32, Hkv=4, splits=splits)
+
+
+@pytest.mark.parametrize(
+    "Hq,Hkv,kL", [(128, 16, 200), (24, 8, 400), (40, 8, 400), (56, 8, 400)]
+)
+def test_sdpa_decode_gqa_hd512_route_heads(gqa_pass1, Hq, Hkv, kL):
+    # fewer keys than one 256-key tile, and groups of 3, 5 and 7
+    _check_gqa(512, kL=kL, dtype=mx.bfloat16, Hq=Hq, Hkv=Hkv)
+
+
+def test_sdpa_decode_gqa_hd512_route_sinks_strided(gqa_pass1):
+    _check_gqa(512, kL=3071, dtype=mx.bfloat16, Hq=16, Hkv=2, sinks=True, strided=True)
+
+
+@pytest.mark.parametrize("layout", ["batch_major", "batch_major_lazy", "strided"])
+def test_sdpa_decode_gqa_hd512_route_batch(gqa_pass1, layout):
+    scale = 1.0 / (512**0.5)
+    if layout == "strided":
+        q, k, v = _make(3, 32, 4, 1, 2000, 512, mx.bfloat16, seed=71, strided=True)
+    else:
+        lazy = layout == "batch_major_lazy"
+        q, k, v = _make_batch_major(3, 32, 4, 1, 2000, 512, mx.bfloat16, 70, lazy)
+    got = kq.sdpa_decode_gqa(q, k, v, scale)
+    ref = _ref_sdpa_sinks(q, k, v, scale, None)
+    _eval_or_skip(got, ref)
+    for b in range(3):
+        rel = _rel(got[b], ref[b])
+        assert rel < REL_BOUND[mx.bfloat16], f"row {b} rel {rel:.3e}"
+
+
+@pytest.mark.parametrize(
+    "B,Hq,Hkv,kL", [(4, 32, 4, 200), (16, 32, 4, 300), (2, 8, 1, 1600)]
+)
+def test_sdpa_decode_gqa_hd512_route_batch_splits(gqa_pass1, B, Hq, Hkv, kL):
+    # a tile per split at batch 4, one automatic split at batch 16, and one
+    # KV head over two batch rows
+    scale = 1.0 / (512**0.5)
+    q, k, v = _make(B, Hq, Hkv, 1, kL, 512, mx.bfloat16, seed=B + kL, strided=False)
+    got = kq.sdpa_decode_gqa(q, k, v, scale)
+    ref = _ref_sdpa_sinks(q, k, v, scale, None)
+    _eval_or_skip(got, ref)
+    for b in range(B):
+        rel = _rel(got[b], ref[b])
+        assert rel < REL_BOUND[mx.bfloat16], f"row {b} rel {rel:.3e}"
+
+
+def test_sdpa_decode_gqa_hd512_route_lse(gqa_pass1):
+    D, kL = 512, 3000
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(2, 16, 2, 1, kL, D, mx.float16, seed=72, strided=False)
+    got, lse = kq.sdpa_decode_gqa(q, k, v, scale, return_lse=True)
+    kr = mx.repeat(k, 8, axis=1).astype(mx.float32)
+    s = (q.astype(mx.float32) @ kr.swapaxes(-1, -2)) * scale
+    lse_ref = mx.logsumexp(s, axis=-1)
+    ref = _ref_sdpa_sinks(q, k, v, scale, None)
+    _eval_or_skip(got, lse, ref, lse_ref)
+    assert _rel(got, ref) < REL_BOUND[mx.float16]
+    assert float(mx.abs(lse.reshape(lse_ref.shape) - lse_ref).max()) < 1e-3
+
+
+def _gqa_pass1_pair(monkeypatch, q, k, v, scale):
+    # The op reads KQ_GQA_NAX when it evaluates, so each arm evaluates
+    # before the next flag is set.
+    outs = []
+    for flag in ("0", "1"):
+        monkeypatch.setenv("KQ_GQA_NAX", flag)
+        outs.append(kq.sdpa_decode_gqa(q, k, v, scale))
+        _eval_or_skip(outs[-1])
+    ref = _ref_sdpa_sinks(q, k, v, scale, None)
+    mx.eval(ref)
+    return outs, ref
+
+
+def test_sdpa_decode_gqa_hd512_switch(monkeypatch):
+    # The two kernels round differently, so KQ_GQA_NAX leaves the output
+    # unchanged at 767 keys over 4 KV heads and changes it at 768, where
+    # KV heads x keys reaches 3072.
+    if not kq.nax_available():
+        pytest.skip("the tensor-op pass 1 needs NAX")
+    scale = 1.0 / (512**0.5)
+    for kL, same in ((767, True), (768, False)):
+        q, k, v = _make(1, 32, 4, 1, kL, 512, mx.bfloat16, seed=kL, strided=False)
+        (off, on), ref = _gqa_pass1_pair(monkeypatch, q, k, v, scale)
+        assert mx.array_equal(off, on).item() is same, f"kL={kL}"
+        assert _rel(on, ref) < REL_BOUND[mx.bfloat16]
+
+
+@pytest.mark.parametrize("pad", ["rows", "batch"])
+def test_sdpa_decode_gqa_hd512_unaligned_strides(monkeypatch, pad):
+    # K and V rows 1032 bytes apart, or batch rows 8 bytes past a multiple
+    # of 8 elements. The tensor-op kernel takes strides in multiples of 8
+    # elements, so both settings run the simdgroup kernel.
+    D, kL, B = 512, 2000, 2
+    scale = 1.0 / (D**0.5)
+    k0, k1, k2 = mx.random.split(mx.random.key(74), 3)
+    q = mx.random.normal((B, 16, 1, D), key=k0).astype(mx.bfloat16)
+    if pad == "rows":
+        kb = mx.random.normal((B, 2, kL, D + 4), key=k1).astype(mx.bfloat16)
+        vb = mx.random.normal((B, 2, kL, D + 4), key=k2).astype(mx.bfloat16)
+        mx.eval(q, kb, vb)
+        k, v = kb[..., :D], vb[..., :D]
+    else:
+        n = 2 * kL * D
+        kb = mx.random.normal((B * (n + 4),), key=k1).astype(mx.bfloat16)
+        vb = mx.random.normal((B * (n + 4),), key=k2).astype(mx.bfloat16)
+        mx.eval(q, kb, vb)
+        shape, strides = (B, 2, kL, D), (n + 4, kL * D, D, 1)
+        k = mx.as_strided(kb, shape, strides)
+        v = mx.as_strided(vb, shape, strides)
+    (off, on), ref = _gqa_pass1_pair(monkeypatch, q, k, v, scale)
+    for b in range(B):
+        assert _rel(off[b], ref[b]) < REL_BOUND[mx.bfloat16], f"row {b}"
+    assert mx.array_equal(off, on).item()
+
+
 def _ref_sdpa_starts(q, k, v, scale, pads, qL):
     # per-row f32 reference on the visible tail [pads[b], kL)
     outs = []
@@ -543,8 +688,11 @@ def test_sdpa_cascade_q8_batch_major_private():
         mx.eval(call([ks, kb, vs, vb]))
 
 
-def test_sdpa_decode_gqa_starts_zero_matches_plain():
-    # all-zero starts must match the no-starts call on the same inputs
+def test_sdpa_decode_gqa_starts_zero_matches_plain(monkeypatch):
+    # all-zero starts must match the no-starts call on the same inputs. A
+    # call with starts keeps the simdgroup pass 1, so the plain call is
+    # pinned to it too.
+    monkeypatch.setenv("KQ_GQA_NAX", "0")
     scale = 1.0 / (512**0.5)
     q, k, v = _make(4, 24, 4, 1, 2048, 512, mx.bfloat16, seed=3, strided=False)
     starts = mx.zeros((4,), dtype=mx.int32)
@@ -683,9 +831,11 @@ def test_sdpa_decode_gqa_ends_short_bodies(start):
     )
 
 
-def test_sdpa_decode_gqa_ends_at_capacity_matches_plain():
+def test_sdpa_decode_gqa_ends_at_capacity_matches_plain(monkeypatch):
     # ends at kL on every row must match the no-ends call on the same
-    # inputs, with and without starts
+    # inputs, with and without starts. A call with ends keeps the simdgroup
+    # pass 1, so the plain call is pinned to it too.
+    monkeypatch.setenv("KQ_GQA_NAX", "0")
     scale = 1.0 / (512**0.5)
     q, k, v = _make(4, 24, 4, 1, 2048, 512, mx.bfloat16, seed=7, strided=False)
     ends = mx.full((4,), 2048, dtype=mx.int32)
