@@ -68,6 +68,32 @@ struct KQKvarnMeta {
   uint64_t stage_v_head;
 };
 
+// Mirror of the Metal-side KQKvBatch (kq_sdpa.h, buffer 30): the k and v
+// batch strides, so a batch stride other than n_kv_heads * head stride reads
+// the right rows.
+struct KQKvBatch {
+  uint64_t k;
+  uint64_t v;
+};
+
+KQKvBatch kq_kv_batch(const array& k, const array& v) {
+  return {
+      static_cast<uint64_t>(k.strides(0)), static_cast<uint64_t>(v.strides(0))};
+}
+
+// The scale, axes and stage operands of quantized and KVarN caches are
+// addressed as (b * n_kv_heads + h) * head stride, so their batch and head
+// axes must be contiguous with each other. The caches build them that way,
+// and the KVarN ops pack theirs, so for those the check is a guard only.
+void kq_sdpa_check_batch_heads(const char* op, const array& a) {
+  if (a.shape(0) > 1 && a.shape(1) > 1 &&
+      a.strides(0) != static_cast<int64_t>(a.shape(1)) * a.strides(1)) {
+    throw std::runtime_error(
+        std::string("[mlx_kquant.") + op +
+        "] quantized-KV operands need batch-contiguous heads.");
+  }
+}
+
 // Number of key-blocks to split the reduction across. Mirrors MLX's own
 // sdpa_vector_2pass heuristic: more blocks only when there are enough
 // simdgroups per kv-head (n_simds = gqa_factor * qL) to justify the extra
@@ -172,6 +198,31 @@ int kq_fa_indexed_splits(
   return std::min(splits, s_fill);
 }
 
+// Split count for the tensor-op pass 1 (kq_sdpa_gqa_nax_2pass_1): the
+// largest power of two that keeps (kv heads x batch x splits) at or under
+// kQGqaNaxGroups threadgroups, and 1 once kv heads x batch alone passes
+// that count. On M5 Max that count ran fastest for 1, 2 and
+// 4 KV heads and at batch 4 from 17k keys up, 2-9% ahead of twice the splits
+// and 18-24% ahead of half. It ignores the depth, so a decode run keeps one
+// pipeline.
+constexpr int kQGqaNaxGroups = 32;
+
+// The tensor-op pass 1 takes over once (kv heads x batch x keys) reaches
+// this many rows. Below it too few of its 256-key tiles hold keys, and the
+// simdgroup kernel's finer splits keep more threadgroups busy: at 1024 rows
+// over 4 KV heads it ran 0.83x that kernel, at 3072 rows 1.02-1.82x over 1,
+// 2 and 4 KV heads on M5 Max.
+constexpr size_t kQGqaNaxMinRows = 3072;
+
+int kq_gqa_nax_splits(int n_kv_heads, int B) {
+  const int rows = n_kv_heads * B;
+  int splits = 1;
+  while (splits * 2 * rows <= kQGqaNaxGroups) {
+    splits *= 2;
+  }
+  return splits;
+}
+
 } // namespace
 
 void KQuantSDPA::eval_gpu(
@@ -262,6 +313,7 @@ void KQuantSDPA::eval_gpu(
     ce.set_bytes(v_head_stride, 9);
     ce.set_bytes(v_seq_stride, 10);
     ce.set_bytes(scale, 11);
+    ce.set_bytes(kq_kv_batch(k, v), 30);
     MTL::Size group_dims(32, gqa_factor, qL);
     MTL::Size grid_dims(n_kv_heads, B, blocks);
     ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -309,6 +361,11 @@ void KQuantSDPAGQA::eval_gpu(
   const size_t ends_idx = starts_idx + (starts ? 1 : 0);
   const size_t qkv_idx = ends_idx + (ends ? 1 : 0);
   kq_sdpa_check_layout("sdpa_decode_gqa", q, k, v);
+  if (kv_q8 || kvarn) {
+    for (int i = 0; i < 4; i++) {
+      kq_sdpa_check_batch_heads("sdpa_decode_gqa", inputs[qkv_idx + i]);
+    }
+  }
 
   int B = q.shape(0);
   int n_q_heads = q.shape(1);
@@ -329,12 +386,6 @@ void KQuantSDPAGQA::eval_gpu(
   if (paged) {
     n_pages = static_cast<int>(inputs.back().shape(2));
   }
-  int splits = splits_;
-  if (splits == 0) {
-    const int span = paged ? n_pages * tile_c_ : kL;
-    splits = span <= 8192 ? 16 : span <= 24576 ? 32 : span <= 49152 ? 64 : 128;
-  }
-
   size_t k_head_stride =
       static_cast<size_t>(k.shape(1) == 1 ? k.strides(0) : k.strides(1));
   size_t k_seq_stride = static_cast<size_t>(k.strides(2));
@@ -342,6 +393,28 @@ void KQuantSDPAGQA::eval_gpu(
       static_cast<size_t>(v.shape(1) == 1 ? v.strides(0) : v.strides(1));
   size_t v_seq_stride = static_cast<size_t>(v.strides(2));
   float scale = scale_;
+
+  // One query at head_dim 512 on NAX GPUs runs pass 1 on the matrix units
+  // (kq_sdpa_nax.h) with the same partials and merge, from kQGqaNaxMinRows.
+  // Its rounding differs from the simdgroup kernel's, and its split count
+  // follows the batch size. KQ_GQA_NAX=0, read at each call, keeps the
+  // simdgroup kernel.
+  const char* nax_e = std::getenv("KQ_GQA_NAX");
+  const bool use_nax = (!nax_e || std::atoi(nax_e) != 0) && D == 512 &&
+      qL == 1 && gqa_factor <= 8 && !kv_q8 && !paged && !kvarn && !starts &&
+      !ends && size_t(n_kv_heads) * B * kL >= kQGqaNaxMinRows &&
+      k_head_stride % 8 == 0 && k_seq_stride % 8 == 0 &&
+      v_head_stride % 8 == 0 && v_seq_stride % 8 == 0 &&
+      (B == 1 || (k.strides(0) % 8 == 0 && v.strides(0) % 8 == 0)) &&
+      kq_is_nax_available();
+
+  int splits = splits_;
+  if (splits == 0 && use_nax) {
+    splits = kq_gqa_nax_splits(n_kv_heads, B);
+  } else if (splits == 0) {
+    const int span = paged ? n_pages * tile_c_ : kL;
+    splits = span <= 8192 ? 16 : span <= 24576 ? 32 : span <= 49152 ? 64 : 128;
+  }
 
   // Coarse per-split partials (float32) + running max/sum, merged by pass 2.
   mx::Shape part_shape = {B, n_q_heads, qL, splits, D};
@@ -383,11 +456,44 @@ void KQuantSDPAGQA::eval_gpu(
       {&has_ends, MTL::DataType::DataTypeBool, 12},
   };
 
+  // Pass 1 on the matrix units: one threadgroup of eight simdgroups per
+  // (kv-head, batch, split).
+  if (use_nax) {
+    std::string kname = "kq_sdpa_gqa_nax_2pass_1_" + ts;
+    std::string hash = kname + "_s" + std::to_string(splits);
+    auto kernel = kq_get_kernel(d, kname, hash, fc);
+    if (kernel->maxTotalThreadsPerThreadgroup() < 256) {
+      throw std::runtime_error(
+          "[mlx_kquant.sdpa_decode_gqa] threadgroup of 256 threads exceeds "
+          "this GPU's pipeline limit (" +
+          std::to_string(kernel->maxTotalThreadsPerThreadgroup()) + ").");
+    }
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(q, 0);
+    ce.set_input_array(k, 1);
+    ce.set_input_array(v, 2);
+    ce.set_output_array(partials, 3);
+    ce.set_output_array(sums, 4);
+    ce.set_output_array(maxs, 5);
+    ce.set_bytes(kL, 6);
+    ce.set_bytes(k_head_stride, 7);
+    ce.set_bytes(k_seq_stride, 8);
+    ce.set_bytes(v_head_stride, 9);
+    ce.set_bytes(v_seq_stride, 10);
+    ce.set_bytes(scale, 11);
+    ce.set_bytes(gqa_factor, 12);
+    const KQKvBatch kvb = kq_kv_batch(k, v);
+    ce.set_bytes(kvb.k, 13);
+    ce.set_bytes(kvb.v, 14);
+    ce.dispatch_threadgroups(
+        MTL::Size(n_kv_heads, B, splits), MTL::Size(32, 8, 1));
+  }
+
   // Pass 1: one threadgroup per (kv-head, batch, split); the whole GQA group
   // (and, at verify width, every query pair -- the threadgroup z axis) shares
   // each staged K/V tile. qL > 1 dispatches the _p2 (two queries per
   // simdgroup) instantiation.
-  {
+  if (!use_nax) {
     std::string kname = "kq_sdpa_gqa_2pass_1_" + ts + "_" + std::to_string(D) +
         "_c" + std::to_string(tile_c_) + (qL > 1 ? "_p2" : "");
     std::string hash = kname + "_s" + std::to_string(splits) +
@@ -486,6 +592,7 @@ void KQuantSDPAGQA::eval_gpu(
     ce.set_bytes(kvm, 28);
     // Per-row ends (dummy when compiled out).
     ce.set_input_array(ends ? inputs[ends_idx] : sums, 29);
+    ce.set_bytes(kq_kv_batch(k, v), 30);
     MTL::Size group_dims(32, gqa_factor, qL > 1 ? (qL + 1) / 2 : 1);
     MTL::Size grid_dims(n_kv_heads, B, splits);
     ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -886,6 +993,11 @@ void KQuantSDPACascade::eval_gpu(
   const int q8_base = 6 + int(starts);
   kq_sdpa_check_layout("sdpa_decode_gqa_cascade", q, k_pr, v_pr);
   kq_sdpa_check_layout("sdpa_decode_gqa_cascade", qf, k_sh, v_sh);
+  if (kv_q8) {
+    for (int i = 4; i < 8; i++) {
+      kq_sdpa_check_batch_heads("sdpa_decode_gqa_cascade", inputs[q8_base + i]);
+    }
+  }
 
   int B = q.shape(0);
   int n_q_heads = q.shape(1);
@@ -1012,6 +1124,8 @@ void KQuantSDPACascade::eval_gpu(
     const int pzero = 0;
     ce.set_input_array(sums1, 22);
     ce.set_bytes(pzero, 23);
+    ce.set_input_array(sums1, 29);
+    ce.set_bytes(kq_kv_batch(k_pr, v_pr), 30);
     MTL::Size group_dims(32, gqa_factor, qL > 1 ? (qL + 1) / 2 : 1);
     MTL::Size grid_dims(n_kv_heads, B, s_pr);
     ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -1293,6 +1407,10 @@ mx::array sdpa_vector(
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_vector] n_q_heads must be a multiple of n_kv_heads.");
   }
+  if (k.shape(0) != q.shape(0) || v.shape(0) != q.shape(0)) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_vector] k and v must have q's batch size.");
+  }
   int qL = q.shape(2);
   int gqa_factor = n_q_heads / n_kv_heads;
   // pass-1 threadgroup is 32 * gqa_factor * qL threads; cap at the Metal max.
@@ -1400,6 +1518,7 @@ static std::vector<mx::array> sdpa_decode_gqa_impl(
     }
     for (const auto& a : {*k_scales, *k_biases, *v_scales, *v_biases}) {
       if (a.dtype() != q.dtype() || a.ndim() != 4 || a.shape(-1) != D / 64 ||
+          a.shape(0) != q.shape(0) || a.shape(1) != k.shape(1) ||
           a.shape(2) != k.shape(2)) {
         throw std::invalid_argument(
             "[mlx_kquant.sdpa_decode_gqa] quantized KV scales/biases must "
@@ -1428,6 +1547,10 @@ static std::vector<mx::array> sdpa_decode_gqa_impl(
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa] n_q_heads must be a multiple of "
         "n_kv_heads.");
+  }
+  if (k.shape(0) != q.shape(0) || v.shape(0) != q.shape(0)) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa] k and v must have q's batch size.");
   }
   int gqa_factor = n_q_heads / n_kv_heads;
   if (gqa_factor > 16) {

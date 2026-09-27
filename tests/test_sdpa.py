@@ -278,6 +278,151 @@ def test_sdpa_gqa_verify_short_kv():
     _check_gqa(64, kL=17, dtype=mx.bfloat16, splits=16, qL=4)
 
 
+# One query at head_dim 512 with gqa <= 8 runs pass 1 on the tensor-op units
+# on NAX GPUs once KV heads x batch x keys reaches 3072, and KQ_GQA_NAX=0
+# keeps the simdgroup kernel. The op reads the variable at each call, so
+# these cases run both kernels against the reference and the simdgroup
+# kernel keeps its coverage on NAX machines.
+@pytest.fixture(params=["0", "1"], ids=["simdgroup", "nax"])
+def gqa_pass1(request, monkeypatch):
+    if request.param == "1" and not kq.nax_available():
+        pytest.skip("the tensor-op pass 1 needs NAX")
+    monkeypatch.setenv("KQ_GQA_NAX", request.param)
+    return request.param
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("G", [1, 4, 8])
+def test_sdpa_decode_gqa_hd512_route(gqa_pass1, G, dtype):
+    _check_gqa(512, kL=4300, dtype=dtype, Hq=2 * G, Hkv=2)
+
+
+@pytest.mark.parametrize("kL", [1, 255, 767, 768, 769, 1023, 1024, 1025, 2047])
+def test_sdpa_decode_gqa_hd512_route_edges(gqa_pass1, kL):
+    # both sides of the 3072-row switch, partial last tiles, and fewer
+    # tiles than splits
+    _check_gqa(512, kL=kL, dtype=mx.bfloat16, Hq=32, Hkv=4)
+
+
+@pytest.mark.parametrize("splits", [1, 3, 8, 64, 128])
+def test_sdpa_decode_gqa_hd512_route_splits(gqa_pass1, splits):
+    # 3 leaves a short last split, 64 and 128 leave most splits empty
+    _check_gqa(512, kL=4300, dtype=mx.bfloat16, Hq=32, Hkv=4, splits=splits)
+
+
+@pytest.mark.parametrize(
+    "Hq,Hkv,kL", [(128, 16, 200), (24, 8, 400), (40, 8, 400), (56, 8, 400)]
+)
+def test_sdpa_decode_gqa_hd512_route_heads(gqa_pass1, Hq, Hkv, kL):
+    # fewer keys than one 256-key tile, and groups of 3, 5 and 7
+    _check_gqa(512, kL=kL, dtype=mx.bfloat16, Hq=Hq, Hkv=Hkv)
+
+
+def test_sdpa_decode_gqa_hd512_route_sinks_strided(gqa_pass1):
+    _check_gqa(512, kL=3071, dtype=mx.bfloat16, Hq=16, Hkv=2, sinks=True, strided=True)
+
+
+@pytest.mark.parametrize("layout", ["batch_major", "batch_major_lazy", "strided"])
+def test_sdpa_decode_gqa_hd512_route_batch(gqa_pass1, layout):
+    scale = 1.0 / (512**0.5)
+    if layout == "strided":
+        q, k, v = _make(3, 32, 4, 1, 2000, 512, mx.bfloat16, seed=71, strided=True)
+    else:
+        lazy = layout == "batch_major_lazy"
+        q, k, v = _make_batch_major(3, 32, 4, 1, 2000, 512, mx.bfloat16, 70, lazy)
+    got = kq.sdpa_decode_gqa(q, k, v, scale)
+    ref = _ref_sdpa_sinks(q, k, v, scale, None)
+    _eval_or_skip(got, ref)
+    for b in range(3):
+        rel = _rel(got[b], ref[b])
+        assert rel < REL_BOUND[mx.bfloat16], f"row {b} rel {rel:.3e}"
+
+
+@pytest.mark.parametrize(
+    "B,Hq,Hkv,kL", [(4, 32, 4, 200), (16, 32, 4, 300), (2, 8, 1, 1600)]
+)
+def test_sdpa_decode_gqa_hd512_route_batch_splits(gqa_pass1, B, Hq, Hkv, kL):
+    # a tile per split at batch 4, one automatic split at batch 16, and one
+    # KV head over two batch rows
+    scale = 1.0 / (512**0.5)
+    q, k, v = _make(B, Hq, Hkv, 1, kL, 512, mx.bfloat16, seed=B + kL, strided=False)
+    got = kq.sdpa_decode_gqa(q, k, v, scale)
+    ref = _ref_sdpa_sinks(q, k, v, scale, None)
+    _eval_or_skip(got, ref)
+    for b in range(B):
+        rel = _rel(got[b], ref[b])
+        assert rel < REL_BOUND[mx.bfloat16], f"row {b} rel {rel:.3e}"
+
+
+def test_sdpa_decode_gqa_hd512_route_lse(gqa_pass1):
+    D, kL = 512, 3000
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(2, 16, 2, 1, kL, D, mx.float16, seed=72, strided=False)
+    got, lse = kq.sdpa_decode_gqa(q, k, v, scale, return_lse=True)
+    kr = mx.repeat(k, 8, axis=1).astype(mx.float32)
+    s = (q.astype(mx.float32) @ kr.swapaxes(-1, -2)) * scale
+    lse_ref = mx.logsumexp(s, axis=-1)
+    ref = _ref_sdpa_sinks(q, k, v, scale, None)
+    _eval_or_skip(got, lse, ref, lse_ref)
+    assert _rel(got, ref) < REL_BOUND[mx.float16]
+    assert float(mx.abs(lse.reshape(lse_ref.shape) - lse_ref).max()) < 1e-3
+
+
+def _gqa_pass1_pair(monkeypatch, q, k, v, scale):
+    # The op reads KQ_GQA_NAX when it evaluates, so each arm evaluates
+    # before the next flag is set.
+    outs = []
+    for flag in ("0", "1"):
+        monkeypatch.setenv("KQ_GQA_NAX", flag)
+        outs.append(kq.sdpa_decode_gqa(q, k, v, scale))
+        _eval_or_skip(outs[-1])
+    ref = _ref_sdpa_sinks(q, k, v, scale, None)
+    mx.eval(ref)
+    return outs, ref
+
+
+def test_sdpa_decode_gqa_hd512_switch(monkeypatch):
+    # The two kernels round differently, so KQ_GQA_NAX leaves the output
+    # unchanged at 767 keys over 4 KV heads and changes it at 768, where
+    # KV heads x keys reaches 3072.
+    if not kq.nax_available():
+        pytest.skip("the tensor-op pass 1 needs NAX")
+    scale = 1.0 / (512**0.5)
+    for kL, same in ((767, True), (768, False)):
+        q, k, v = _make(1, 32, 4, 1, kL, 512, mx.bfloat16, seed=kL, strided=False)
+        (off, on), ref = _gqa_pass1_pair(monkeypatch, q, k, v, scale)
+        assert mx.array_equal(off, on).item() is same, f"kL={kL}"
+        assert _rel(on, ref) < REL_BOUND[mx.bfloat16]
+
+
+@pytest.mark.parametrize("pad", ["rows", "batch"])
+def test_sdpa_decode_gqa_hd512_unaligned_strides(monkeypatch, pad):
+    # K and V rows 1032 bytes apart, or batch rows 8 bytes past a multiple
+    # of 8 elements. The tensor-op kernel takes strides in multiples of 8
+    # elements, so both settings run the simdgroup kernel.
+    D, kL, B = 512, 2000, 2
+    scale = 1.0 / (D**0.5)
+    k0, k1, k2 = mx.random.split(mx.random.key(74), 3)
+    q = mx.random.normal((B, 16, 1, D), key=k0).astype(mx.bfloat16)
+    if pad == "rows":
+        kb = mx.random.normal((B, 2, kL, D + 4), key=k1).astype(mx.bfloat16)
+        vb = mx.random.normal((B, 2, kL, D + 4), key=k2).astype(mx.bfloat16)
+        mx.eval(q, kb, vb)
+        k, v = kb[..., :D], vb[..., :D]
+    else:
+        n = 2 * kL * D
+        kb = mx.random.normal((B * (n + 4),), key=k1).astype(mx.bfloat16)
+        vb = mx.random.normal((B * (n + 4),), key=k2).astype(mx.bfloat16)
+        mx.eval(q, kb, vb)
+        shape, strides = (B, 2, kL, D), (n + 4, kL * D, D, 1)
+        k = mx.as_strided(kb, shape, strides)
+        v = mx.as_strided(vb, shape, strides)
+    (off, on), ref = _gqa_pass1_pair(monkeypatch, q, k, v, scale)
+    for b in range(B):
+        assert _rel(off[b], ref[b]) < REL_BOUND[mx.bfloat16], f"row {b}"
+    assert mx.array_equal(off, on).item()
+
+
 def _ref_sdpa_starts(q, k, v, scale, pads, qL):
     # per-row f32 reference on the visible tail [pads[b], kL)
     outs = []
@@ -346,8 +491,208 @@ def test_sdpa_decode_gqa_batched_nostarts(D):
     assert _rel(got, ref) < REL_BOUND[mx.bfloat16]
 
 
-def test_sdpa_decode_gqa_starts_zero_matches_plain():
-    # all-zero starts must match the no-starts call on the same inputs
+def _make_batch_major(B, Hq, Hkv, qL, kL, D, dtype, seed, lazy):
+    """q plus K and V as transposed views of [B, kL, Hkv, D] buffers, the
+    layout of a projection before any cache: the batch stride is
+    kL * Hkv * D, not Hkv times the head stride. lazy leaves the views
+    unevaluated, so the op sees them without real strides at build time."""
+    key = mx.random.key(seed)
+    k0, k1, k2 = mx.random.split(key, 3)
+    q = mx.random.normal((B, Hq, qL, D), key=k0).astype(dtype)
+    kb = mx.random.normal((B, kL, Hkv, D), key=k1).astype(dtype)
+    vb = mx.random.normal((B, kL, Hkv, D), key=k2).astype(dtype)
+    mx.eval(q, kb, vb)
+    k = kb.transpose(0, 2, 1, 3)
+    v = vb.transpose(0, 2, 1, 3)
+    if not lazy:
+        mx.eval(k, v)
+    return q, k, v
+
+
+@pytest.mark.parametrize("lazy", [False, True])
+@pytest.mark.parametrize("qL", [1, 3])
+@pytest.mark.parametrize("D", [256, 512])
+def test_sdpa_vector_batch_major_kv(D, qL, lazy):
+    # every batch row reads its own keys when the batch stride is not
+    # n_kv_heads * head stride
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make_batch_major(2, 16, 4, qL, 1500, D, mx.bfloat16, D + qL, lazy)
+    got = kq.sdpa_vector(q, k, v, scale, causal=qL > 1)
+    ref = _ref_sdpa(q, k, v, scale, qL > 1)
+    _eval_or_skip(got, ref)
+    for b in range(2):
+        rel = _rel(got[b], ref[b])
+        assert rel < REL_BOUND[mx.bfloat16], f"row {b} rel {rel:.3e}"
+
+
+@pytest.mark.parametrize("lazy", [False, True])
+@pytest.mark.parametrize("qL", [1, 2])
+@pytest.mark.parametrize("D", [64, 512])
+def test_sdpa_decode_gqa_batch_major_kv(D, qL, lazy):
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make_batch_major(3, 32, 4, qL, 3000, D, mx.bfloat16, D + qL, lazy)
+    got = kq.sdpa_decode_gqa(q, k, v, scale)
+    ref = _ref_sdpa_sinks(q, k, v, scale, None)
+    _eval_or_skip(got, ref)
+    for b in range(3):
+        rel = _rel(got[b], ref[b])
+        assert rel < REL_BOUND[mx.bfloat16], f"row {b} rel {rel:.3e}"
+
+
+def test_sdpa_paged_batch_major_kv():
+    # every page selected on a batch-major cache == the dense reference
+    import numpy as np
+
+    B, Hq, Hkv, D, S = 2, 16, 4, 128, 2048
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make_batch_major(B, Hq, Hkv, 1, S, D, mx.bfloat16, 61, False)
+    tot = S // 32
+    pg = np.broadcast_to(np.arange(tot, dtype=np.int32), (B, Hkv, tot)).copy()
+    got = kq.sdpa_decode_gqa_paged(q, k, v, scale, mx.array(pg))
+    ref = _ref_sdpa_sinks(q, k, v, scale, None)
+    _eval_or_skip(got, ref)
+    for b in range(B):
+        rel = _rel(got[b], ref[b])
+        assert rel < REL_BOUND[mx.bfloat16], f"row {b} rel {rel:.3e}"
+
+
+def test_sdpa_cascade_batch_major_private_kv():
+    # the per-row leg of the cascade reads batch-major private keys
+    B, Hq, Hkv, D = 3, 32, 8, 128
+    P, Sp = 1023, 257
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, mx.bfloat16, seed=62, strided=False)
+    q, k_pr, v_pr = _make_batch_major(B, Hq, Hkv, 1, Sp, D, mx.bfloat16, 63, False)
+    k_full = mx.concatenate([mx.broadcast_to(k_sh, (B, Hkv, P, D)), k_pr], axis=2)
+    v_full = mx.concatenate([mx.broadcast_to(v_sh, (B, Hkv, P, D)), v_pr], axis=2)
+    ref = _ref_sdpa_sinks(q, k_full, v_full, scale, None)
+    got = kq.sdpa_decode_gqa_cascade(q, k_sh, v_sh, k_pr, v_pr, scale)
+    _eval_or_skip(got, ref)
+    for b in range(B):
+        rel = _rel(got[b], ref[b])
+        assert rel < REL_BOUND[mx.bfloat16], f"row {b} rel {rel:.3e}"
+
+
+def _q8_batch_major(B, Hkv, S, D, seed):
+    # q8 wire as batch-major views, plus the reference it dequantizes to
+    x = mx.random.normal((B, S, Hkv, D), key=mx.random.key(seed)).astype(mx.float16)
+    w, sc, bi = mx.quantize(x, group_size=64, bits=8)
+    mx.eval(w, sc, bi)
+    ref = mx.dequantize(w, sc, bi, group_size=64, bits=8).transpose(0, 2, 1, 3)
+
+    def t(a):
+        return a.transpose(0, 2, 1, 3)
+
+    return t(w), t(sc), t(bi), ref
+
+
+def test_sdpa_decode_gqa_q8_batch_major():
+    # batch-major q8 wire reads the right rows; its scale and bias operands
+    # must keep batch and heads contiguous, and a batch-major view of them
+    # raises instead of reading another row's groups
+    B, Hq, Hkv, S, D = 2, 16, 4, 1024, 128
+    scale = 1.0 / (D**0.5)
+    q = mx.random.normal((B, Hq, 1, D), key=mx.random.key(64)).astype(mx.float16)
+    kw, ks, kb, kref = _q8_batch_major(B, Hkv, S, D, 65)
+    vw, vs, vb, vref = _q8_batch_major(B, Hkv, S, D, 66)
+    packed = [mx.contiguous(a) for a in (ks, kb, vs, vb)]
+    got = kq.sdpa_decode_gqa(
+        q,
+        kw,
+        vw,
+        scale,
+        k_scales=packed[0],
+        k_biases=packed[1],
+        v_scales=packed[2],
+        v_biases=packed[3],
+    )
+    ref = _ref_sdpa_sinks(q, kref, vref, scale, None)
+    _eval_or_skip(got, ref)
+    for b in range(B):
+        rel = _rel(got[b], ref[b])
+        assert rel < REL_BOUND[mx.float16], f"row {b} rel {rel:.3e}"
+    mx.eval(ks, kb, vs, vb)
+    with pytest.raises(RuntimeError, match="batch-contiguous heads"):
+        mx.eval(
+            kq.sdpa_decode_gqa(
+                q,
+                kw,
+                vw,
+                scale,
+                k_scales=ks,
+                k_biases=kb,
+                v_scales=vs,
+                v_biases=vb,
+            )
+        )
+
+
+def test_sdpa_batch_size_mismatch():
+    # K, V or q8 operands with another batch size than q raise instead of
+    # reading past the arrays
+    q, k, v = _make(2, 16, 4, 1, 256, 128, mx.float16, seed=67, strided=False)
+    with pytest.raises(ValueError, match="batch size"):
+        kq.sdpa_decode_gqa(q, k[:1], v[:1], 1.0)
+    q5, k5, v5 = _make(2, 16, 4, 1, 256, 512, mx.bfloat16, seed=68, strided=False)
+    with pytest.raises(ValueError, match="batch size"):
+        kq.sdpa_vector(q5, k5, v5[:1], 1.0)
+    kw, ks, kb = _q8(k)
+    vw, vs, vb = _q8(v)
+    with pytest.raises(ValueError, match="scales/biases"):
+        kq.sdpa_decode_gqa(
+            q, kw, vw, 1.0, k_scales=ks[:1], k_biases=kb, v_scales=vs, v_biases=vb
+        )
+
+
+def test_sdpa_cascade_q8_batch_major_private():
+    # the per-row leg reads a batch-major private q8 wire, and batch-major
+    # private scales and biases raise at evaluation
+    B, Hq, Hkv, D, P, Sp = 2, 16, 4, 128, 511, 257
+    scale = 1.0 / (D**0.5)
+    _, k_sh, v_sh = _make(1, Hq, Hkv, 1, P, D, mx.float16, seed=75, strided=False)
+    ksh, vsh = _q8(k_sh), _q8(v_sh)
+    q = mx.random.normal((B, Hq, 1, D), key=mx.random.key(76)).astype(mx.float16)
+    kw, ks, kb, kref = _q8_batch_major(B, Hkv, Sp, D, 77)
+    vw, vs, vb, vref = _q8_batch_major(B, Hkv, Sp, D, 78)
+
+    def call(ops):
+        return kq.sdpa_decode_gqa_cascade(
+            q,
+            ksh[0],
+            vsh[0],
+            kw,
+            vw,
+            scale,
+            k_shared_scales=ksh[1],
+            k_shared_biases=ksh[2],
+            v_shared_scales=vsh[1],
+            v_shared_biases=vsh[2],
+            k_priv_scales=ops[0],
+            k_priv_biases=ops[1],
+            v_priv_scales=ops[2],
+            v_priv_biases=ops[3],
+        )
+
+    got = call([mx.contiguous(a) for a in (ks, kb, vs, vb)])
+    k_sd = mx.dequantize(*ksh, group_size=64, bits=8)
+    v_sd = mx.dequantize(*vsh, group_size=64, bits=8)
+    k_full = mx.concatenate([mx.broadcast_to(k_sd, (B, Hkv, P, D)), kref], axis=2)
+    v_full = mx.concatenate([mx.broadcast_to(v_sd, (B, Hkv, P, D)), vref], axis=2)
+    ref = _ref_sdpa_sinks(q, k_full, v_full, scale, None)
+    _eval_or_skip(got, ref)
+    for b in range(B):
+        rel = _rel(got[b], ref[b])
+        assert rel < REL_BOUND[mx.float16], f"row {b} rel {rel:.3e}"
+    mx.eval(ks, kb, vs, vb)
+    with pytest.raises(RuntimeError, match="batch-contiguous heads"):
+        mx.eval(call([ks, kb, vs, vb]))
+
+
+def test_sdpa_decode_gqa_starts_zero_matches_plain(monkeypatch):
+    # all-zero starts must match the no-starts call on the same inputs. A
+    # call with starts keeps the simdgroup pass 1, so the plain call is
+    # pinned to it too.
+    monkeypatch.setenv("KQ_GQA_NAX", "0")
     scale = 1.0 / (512**0.5)
     q, k, v = _make(4, 24, 4, 1, 2048, 512, mx.bfloat16, seed=3, strided=False)
     starts = mx.zeros((4,), dtype=mx.int32)
@@ -486,9 +831,11 @@ def test_sdpa_decode_gqa_ends_short_bodies(start):
     )
 
 
-def test_sdpa_decode_gqa_ends_at_capacity_matches_plain():
+def test_sdpa_decode_gqa_ends_at_capacity_matches_plain(monkeypatch):
     # ends at kL on every row must match the no-ends call on the same
-    # inputs, with and without starts
+    # inputs, with and without starts. A call with ends keeps the simdgroup
+    # pass 1, so the plain call is pinned to it too.
+    monkeypatch.setenv("KQ_GQA_NAX", "0")
     scale = 1.0 / (512**0.5)
     q, k, v = _make(4, 24, 4, 1, 2048, 512, mx.bfloat16, seed=7, strided=False)
     ends = mx.full((4,), 2048, dtype=mx.int32)

@@ -6,10 +6,26 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `add_rmsnorm_norm`: a residual add with the norm before it and the norm
+  after it in one dispatch, bit-identical to the unfused MLX ops.
+
 ### Changed
 - On GPUs without NAX (M1-M4), matmuls with 33 to 128 activation rows run
   faster on narrow output widths, such as the short prompts of a structured
   decision. `KQ_QMM_MIDM=0` keeps the previous kernel.
+- `q6_k` matmuls with one activation row, such as plain decode, run faster
+  under sustained load. `KQ_QMV_SPLITK=0` restores the previous kernels.
+- On NAX GPUs, `sdpa_decode_gqa` runs one query at head dim 512 faster, such
+  as gemma-4 global-layer decode. `KQ_GQA_NAX=0` restores the previous kernel.
+
+### Fixed
+- Batched `sdpa_vector`, `sdpa_decode_gqa` and cascade calls return correct
+  rows past the first when K and V are batch-major views.
+- `sdpa_vector` and `sdpa_decode_gqa` raise on a K or V batch size other than
+  q's instead of reading past the array.
+- q8 scales and biases that are batch-major views raise at evaluation instead
+  of reading another row's values.
 
 ## [0.4.14]
 

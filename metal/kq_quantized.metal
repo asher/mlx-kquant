@@ -356,6 +356,7 @@ instantiate_kquant_q5_k_for_type(float16_t)
   instantiate_kquant_batched(qmv_fast, type, 256, 6, 0, q6_k)            \
   instantiate_kquant_batched(qmv_fast, type, 256, 6, 1, q6_k)            \
   instantiate_kquant_batched(qmv_fast_fine, type, 256, 6, 0, q6_k)       \
+  instantiate_kquant_batched(qmv_splitk, type, 256, 6, 0, q6_k)          \
   instantiate_kquant_batched(qmv_fine, type, 256, 6, 0, q6_k)            \
   instantiate_kquant_batched(qmv,      type, 256, 6, 0, q6_k)            \
   instantiate_kquant_batched(qmv,      type, 256, 6, 1, q6_k)            \

@@ -10,17 +10,26 @@ instantiate_kernel("kq_rmsnorm_multi3_bfloat16_t", kq_rmsnorm_multi3, bfloat16_t
 instantiate_kernel("kq_rmsnorm_multi3_float16_t", kq_rmsnorm_multi3, float16_t)
 instantiate_kernel("kq_rmsnorm2_add_bfloat16_t", kq_rmsnorm2_add, bfloat16_t)
 instantiate_kernel("kq_rmsnorm2_add_float16_t", kq_rmsnorm2_add, float16_t)
-// clang-format on
+
+#define instantiate_kq_add_rmsnorm_norm(type, c) \
+  instantiate_kernel("kq_add_rmsnorm_norm_" #type "_" #c, kq_add_rmsnorm_norm, type, c)
+
+instantiate_kq_add_rmsnorm_norm(bfloat16_t, 1)
+instantiate_kq_add_rmsnorm_norm(bfloat16_t, 2)
+instantiate_kq_add_rmsnorm_norm(bfloat16_t, 3)
+instantiate_kq_add_rmsnorm_norm(bfloat16_t, 4)
+instantiate_kq_add_rmsnorm_norm(float16_t, 1)
+instantiate_kq_add_rmsnorm_norm(float16_t, 2)
+instantiate_kq_add_rmsnorm_norm(float16_t, 3)
+instantiate_kq_add_rmsnorm_norm(float16_t, 4)
 
 #define instantiate_kq_rmsnorm_gate(type, npt) \
-  instantiate_kernel(                          \
-      "kq_rmsnorm_gate_" #type "_" #npt, kq_rmsnorm_gate, type, npt)
+  instantiate_kernel("kq_rmsnorm_gate_" #type "_" #npt, kq_rmsnorm_gate, type, npt)
 
-                        instantiate_kq_rmsnorm_gate(
-                            bfloat16_t,
-                            2) instantiate_kq_rmsnorm_gate(bfloat16_t, 4)
-                            instantiate_kq_rmsnorm_gate(
-                                bfloat16_t,
-                                8) instantiate_kq_rmsnorm_gate(float16_t, 2)
-                                instantiate_kq_rmsnorm_gate(float16_t, 4)
-                                    instantiate_kq_rmsnorm_gate(float16_t, 8)
+instantiate_kq_rmsnorm_gate(bfloat16_t, 2)
+instantiate_kq_rmsnorm_gate(bfloat16_t, 4)
+instantiate_kq_rmsnorm_gate(bfloat16_t, 8)
+instantiate_kq_rmsnorm_gate(float16_t, 2)
+instantiate_kq_rmsnorm_gate(float16_t, 4)
+instantiate_kq_rmsnorm_gate(float16_t, 8)
+    // clang-format on

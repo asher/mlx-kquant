@@ -11,3 +11,12 @@
 
 instantiate_kq_sdpa_fa_indexed_nax(bfloat16_t)
 instantiate_kq_sdpa_fa_indexed_nax(float16_t)
+
+#define instantiate_kq_sdpa_gqa_nax(type)                              \
+  instantiate_kernel(                                                  \
+      "kq_sdpa_gqa_nax_2pass_1_" #type,                                \
+      kq_sdpa_gqa_nax_2pass_1,                                         \
+      type)
+
+instantiate_kq_sdpa_gqa_nax(bfloat16_t)
+instantiate_kq_sdpa_gqa_nax(float16_t)

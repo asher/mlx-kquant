@@ -875,6 +875,23 @@ mx::array rmsnorm2_add(
     float eps,
     mx::StreamOrDevice s = {});
 
+// {out, rms_norm(out, next_weight)} with out = (residual + rms_norm(h,
+// weight)) * scale, which is a post-norm residual and the norm that reads it
+// next in one dispatch. Unlike the ops above, every step rounds to the
+// activation dtype where the unfused mx::fast::rms_norm / add / multiply
+// composition rounds, so both outputs are bit-identical to it. next_eps
+// defaults to eps. CPU streams, rows wider than 16384 and GPUs whose pipeline
+// cannot hold the threadgroup build that composition instead.
+std::vector<mx::array> add_rmsnorm_norm(
+    mx::array h,
+    mx::array residual,
+    mx::array weight,
+    mx::array next_weight,
+    float eps,
+    const std::optional<mx::array>& scale = std::nullopt,
+    std::optional<float> next_eps = std::nullopt,
+    mx::StreamOrDevice s = {});
+
 // Fused deepseek4 hyper-connection glue for the single-token decode route
 // (hc_mult 4 only; see kq_hc_glue.h). x is [..., 4, D] with D % 8 == 0 and
 // D <= 8192; fn is float32 [24, 4 * D]. Returns {mixes_raw f32 [..., 24],
@@ -2427,6 +2444,41 @@ class KQuantRMSNorm2Add : public mx::Primitive {
 
  private:
   float eps_;
+};
+
+// Post-norm residual plus the next norm (see add_rmsnorm_norm).
+// Inference-only, GPU-only: the op builds the unfused composition elsewhere.
+class KQuantAddRMSNormNorm : public mx::Primitive {
+ public:
+  explicit KQuantAddRMSNormNorm(
+      mx::Stream stream,
+      float eps,
+      float next_eps,
+      bool has_scale)
+      : mx::Primitive(stream),
+        eps_(eps),
+        next_eps_(next_eps),
+        has_scale_(has_scale) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantAddRMSNormNorm";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float eps_;
+  float next_eps_;
+  bool has_scale_;
 };
 
 // Fused hyper-connection glue primitives (see hc_front_reduce and friends).

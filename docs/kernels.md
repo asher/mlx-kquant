@@ -110,6 +110,22 @@ clamped row index, so the compiler interleaves the rows' loads; the tail threadg
 last row and drops it at the store. `q2_k` and `q3_k` keep the runtime bound: the static form measured no
 faster for them.
 
+A `q6_k` `quantized_matmul` with one activation row and no batch dimensions runs a split-K kernel
+when 4 divides N. The MoE gathers keep their own kernels. The eight simdgroups of a threadgroup
+share four output rows, divide the superblocks between them and add their partial sums in
+threadgroup memory. Each thread assembles four 6-bit codes at a time from 32-bit words and
+pre-scales the activation for byte b of a word by 2^(-8b), so a weight costs one AND, one convert
+and one FMA. The row width is a Metal function constant, so each width gets its own pipeline with
+the superblock count and row stride folded. Under sustained load that ran about 1% faster than
+reading the width at run time.
+
+Under sustained decode the GPU runs below its top clock, where the per-row kernels turn ALU-bound.
+Measured on M5 Max over 90 seconds of back-to-back mat-vecs at the gemma-4 31B MLP shapes, the
+split-K kernel read 450-465 GB/s at the lowest clock, against 385-395 GB/s for the per-row kernels
+and about 530 GB/s for bf16 GEMV. Once the clock dropped it read 1.12-1.14x the per-row rate at
+inner dimensions of 4096 and 5120, and matched it at 2048 and below. In short runs at a high clock
+the two kernels are within 3% of each other on every shape measured.
+
 Tuning levers (defaults are right for normal use):
 
 - `KQ_NAX_SMALL_BM` - small-M routing. `0` restores the old routing (mat-vec paths below M 13 and
@@ -145,6 +161,13 @@ Tuning levers (defaults are right for normal use):
   in `kq_nax_small_m`, which yields to a forced `KQ_VERIFY_NAX` or `KQ_VERIFY_MMA` on a codec they
   serve, a forced `KQ_QMM_SPLITK_NAX` or `KQ_QMM_SPLITK`, and a set `KQ_VERIFY_EXT`.
   `KQ_DISABLE_NAX=1` turns it off. Read live per call.
+- `KQ_QMV_FINE` - tiling of the per-row mat-vec. `1` forces two output rows per threadgroup, `0`
+  forces the coarse tiling, and unset takes the fine tiling at one activation row up to the
+  per-codec N ceiling that `kq.qmv_fine_max_n(codec)` reports. Read live per call.
+- `KQ_QMV_SPLITK` - the `q6_k` split-K kernel for one activation row. `0` restores the per-row
+  kernels, as does a set `KQ_QMV_FINE`, so a tiling A/B keeps measuring the tiling it names. A
+  lever that forces another route at one row, such as `KQ_VERIFY_NAX=1`, takes precedence. Read
+  live per call.
 - `KQ_VERIFY_EXT` - the mat-vec route on the M 2-12 band. `1` forces `mv_ext` for every codec with
   the kernel, `0` forces `verify_qmv` where the codec has it and per-row qmv elsewhere, and unset
   takes the per-codec default. On NAX GPUs a set value also keeps per-row qmv and NAX split-K off
@@ -360,7 +383,10 @@ term; requires the expert biases and is instantiated for `mxfp4`/`nvfp4` only).
 ## Attention
 
 Scaled-dot-product variants for shapes stock MLX's fused allowlist excludes, plus the sparse
-mechanism below.
+mechanism below. The ops read K and V in place through their strides, batch-major views included.
+The q8 scales and biases are addressed per batch row and head as the caches lay them out, and a
+batch-major view of them raises at evaluation. The KVarN ops copy their codes, axes and stage rows
+into a packed layout first.
 
 - **`sdpa_vector`** - vector SDPA for large head dims (256, 512) - e.g. DeepSeek MLA - which MLX's
   fused vector path does not cover.
@@ -371,7 +397,16 @@ mechanism below.
   own key end, `[starts[b], ends[b])` with the causal block at `ends[b]`, so `kL` is only the capacity
   and batched rows may differ in length without right-justification. Optional affine q8 K/V operands
   (scales and biases, bits 8, group 64) dequantize on the tile stage. `return_lse=True` adds per-row
-  log-sum-exp.
+  log-sum-exp. On NAX GPUs one query at head dim 512 with up to 8 query heads per KV head runs the
+  chunk pass on the matrix units once KV heads x batch x keys reaches 3072. That needs K and V
+  strides in multiples of 8 elements and no `starts`, `ends` or q8 operands. Below 3072 the
+  simdgroup kernel's finer splits keep more of the GPU busy. Eight simdgroups share each 256-key
+  tile, each scoring 32 keys over the full head dim and then accumulating a 64-column slice of
+  `P @ V`. The automatic split count is the largest power of two that keeps KV heads x batch x
+  splits at 32 or under, and 1 once KV heads x batch passes 32. It ignores the depth, so it falls
+  as the batch grows. The two kernels round differently, so the same rows are not bit-identical
+  between this pass, the simdgroup kernel (`starts`, `ends`, q8) and another batch size.
+  `KQ_GQA_NAX=0` forces the simdgroup kernel.
 - **`sdpa_decode_gqa_cascade`** - shared-prefix batched decode: every row attends one common prefix
   plus its own private suffix. The prefix is walked once for all rows on the matrix-unit tile, private
   suffixes run per row, one merge pass folds both; 1.6-4.2x over per-row calls at 14k-32k prefixes.
@@ -461,6 +496,11 @@ Tuning levers (defaults are right for normal use):
 - **`rmsnorm2_add`** - two independent RMS norms plus an add in one dispatch.
 - **`rmsnorm_multi3`** - three RMS norms of one tensor sharing its mean-square reduction (the QK-norm
   plus a third head-norm shape).
+- **`add_rmsnorm_norm`** - `out = (residual + rms_norm(h, weight)) * scale` and `normed =
+  rms_norm(out, next_weight)` in one dispatch, bit-identical to the same composition of MLX ops. A
+  decoder layer uses it where a residual sum feeds the next norm, such as the pre-feedforward norm
+  after attention or the next layer's input norm. Rows wider than 16384 and CPU streams run the
+  composition.
 
 ## Hadamard rotation
 

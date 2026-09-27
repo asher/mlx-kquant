@@ -1168,6 +1168,62 @@ void qvm(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// Dispatches the split-K M=1 q6_k mat-vec, kq_q6_k_qmv_splitk. The
+// simdgroups of a threadgroup split each row along K, which keeps the kernel
+// on memory bandwidth at the lower GPU clocks of sustained decode, where the
+// per-row kernels turn ALU-bound. Returns false, dispatching nothing, when
+// the shape or pipeline does not fit.
+static bool qmv_splitk(
+    const array& x,
+    const array& w,
+    const array& scales,
+    array& out,
+    int group_size,
+    int bits,
+    int N,
+    int K,
+    Device& d,
+    const Stream& s,
+    const std::string& kquant_type) {
+  constexpr int rps = kq_q6_k_splitk_rps;
+  constexpr int nsg = kq_q6_k_splitk_nsg;
+  if (kquant_type != "q6_k" || N % rps != 0 || K % qmv_fast_k_align() != 0) {
+    return false;
+  }
+  std::string kname;
+  kname.reserve(64);
+  mx::concatenate(
+      kname,
+      kq_kname_prefix(kquant_type) + "qmv_splitk_",
+      kq_type_string(x.dtype()),
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_batch_0");
+  // K is function constant 340, so the pipeline is keyed by row width too.
+  int k_const = K;
+  mx::metal::MTLFCList func_consts = {
+      {&k_const, MTL::DataType::DataTypeInt, 340}};
+  auto kernel =
+      kq_get_kernel(d, kname, kname + "_k" + std::to_string(K), func_consts);
+  if (int(kernel->maxTotalThreadsPerThreadgroup()) < 32 * nsg) {
+    return false;
+  }
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  int c = 0;
+  ce.set_input_array(w, c++);
+  ce.set_input_array(scales, c++);
+  ce.set_input_array(x, c++);
+  ce.set_output_array(out, c++);
+  ce.set_bytes(K, c++);
+  ce.set_bytes(N, c++);
+  add_strides_and_shapes(ce, true, x, w, scales, c);
+  ce.dispatch_threadgroups(MTL::Size(1, N / rps, 1), MTL::Size(32, nsg, 1));
+  return true;
+}
+
 // Matrix-times-vector quantized kernel dispatch (no biases).
 void qmv(
     const array& x,
@@ -1196,6 +1252,16 @@ void qmv(
   // thermally-paired A/Bs; getenv cost is noise per dispatch.
   const char* qmv_fine_e = std::getenv("KQ_QMV_FINE");
   const int qmv_fine_env = qmv_fine_e != nullptr ? std::atoi(qmv_fine_e) : -1;
+
+  // The split-K kernel takes M == 1, B == 1 unless KQ_QMV_SPLITK=0 or
+  // KQ_QMV_FINE names a per-row tiling. Read live like KQ_QMV_FINE.
+  const char* splitk_e = std::getenv("KQ_QMV_SPLITK");
+  const bool splitk_on = splitk_e == nullptr || std::atoi(splitk_e) != 0;
+  if (M == 1 && B == 1 && splitk_on && qmv_fine_env == -1 &&
+      qmv_splitk(
+          x, w, scales, out, group_size, bits, N, K, d, s, kquant_type)) {
+    return;
+  }
   const bool fine_ok = B == 1 && codec_has_qmv_fine(kquant_type);
   const bool use_fine = fine_ok &&
       (qmv_fine_env == 1 ||
@@ -1308,7 +1374,9 @@ void qmv_bias(
 // M activation rows, amortizing the dominant weight read; the per-row qmv would
 // re-read it M times (M on grid_dims.x). Non-batched only; M (= vm) in
 // [2, verify_qmv_max_rows()], codec in codec_has_verify_qmv. Bit-for-bit
-// identical to running qmv per row.
+// identical to running the per-row qmv kernels on each row. The q6_k split-K
+// kernel that serves M == 1 sums in another order, so a q6_k row can differ
+// from it in the last bit.
 void verify_qmv(
     const array& x,
     const array& w,
