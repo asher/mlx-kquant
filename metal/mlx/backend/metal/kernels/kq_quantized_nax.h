@@ -21,7 +21,8 @@ template <
     const int BN = 64,
     const int WM = 2,
     const int WN = 2,
-    const bool use_db = false>
+    const bool use_db = false,
+    const bool tail_ksplit = false>
 METAL_FUNC void kq_qmm_t_nax_tgp_impl(
     const device uint8_t* w,
     const device T* x,
@@ -69,14 +70,17 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
   // K-split for short matmuls: when all M rows fit one SG-row, SG-row 1
   // would multiply padding. Both SG-rows then take rows 0..SM-1 and split
   // each BK step's two SK substeps, and SG-row 1's partial Dtile is summed
-  // into SG-row 0's through Ws after the K walk. Not applied to the short
-  // last row-tile of a taller M, where the full tiles set the time and the
-  // split measured slower. Needs the float reduction to fit one Ws buffer,
-  // which holds for BM=32 and BM=64 at 2-byte T.
+  // into SG-row 0's through Ws after the K walk. The plain tile applies it
+  // only when M fits one SG-row: on the short last row-tile of a taller M
+  // the full tiles set the time and the split measured slower. The split-K
+  // wrapper (tail_ksplit) applies it per row-tile, since its grid runs many
+  // waves and the padding MMA of a short last tile adds to the total (M5
+  // Max, q4_k 17408x5120 at M 33-48, 1.13x). Needs the float reduction to
+  // fit one Ws buffer, which holds for BM=32 and BM=64 at 2-byte T.
   constexpr int kRedFloats = WN * TM * TN * 16 * 16;
   constexpr bool kCanKSplit = WM == 2 && BK == 2 * SK &&
       kRedFloats * sizeof(float) <= BN * BK_padded * sizeof(T);
-  const bool ksplit = kCanKSplit && M <= SM;
+  const bool ksplit = kCanKSplit && (tail_ksplit ? M - y_row : M) <= SM;
   const short sg_row = simd_gid / WN;
   const short tm = ksplit ? 0 : SM * sg_row;
   const short kk_first = ksplit ? SK * sg_row : 0;
@@ -3699,8 +3703,8 @@ KQ_NAX_DEFINE_KERNELS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
         BN,                                                                  \
         WM,                                                                  \
         WN,                                                                  \
-        kWsBufs == 2>(                                                       \
-        wl, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid, k_len);         \
+        kWsBufs == 2,                                                        \
+        true>(wl, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid, k_len);   \
   }
 
 KQ_NAX_DEFINE_SPLITK_KERNEL(q6_k, 256, 6, KqNaxQ6_KBlockLoader)

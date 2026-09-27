@@ -304,13 +304,17 @@ def _nax_ok():
 )
 @pytest.mark.parametrize("codec", ["iq2_xs", "iq3_xxs", "q4_k", "q8_0"])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-def test_gather_qmm_seg_nax_matches_loop(codec, dtype):
+def test_gather_qmm_seg_nax_matches_loop(codec, dtype, monkeypatch):
     """The NAX seg kernel (taken by default on NAX GPUs) matches the
     per-expert loop on ragged segments: absent experts, partial tiles, and
     the IQ codecs the prefill gathers run on. Skipped where the NAX variant
     is unreachable (the ALU kernel is then the only one, covered above)."""
     import mlx_kquant as kq
 
+    # Loop reference on the BM=64 NAX tile, one K walk like the seg kernel.
+    # The mid-M split-K route rounds each K slice to the activation dtype,
+    # which in bfloat16 alone moves it past the bound.
+    monkeypatch.setenv("KQ_QMM_MIDM", "0")
     if not _nax_ok():
         pytest.skip("NAX gather kernels unavailable on this GPU")
     if codec == "q8_0":
@@ -378,9 +382,11 @@ def test_gather_qmm_seg_nax_matches_loop(codec, dtype):
     bool(os.environ.get("KQUANT_FORCE_CPU")),
     reason="gather_qmm_seg is Metal-only.",
 )
-def test_gather_qmm_seg_nax_unaligned_n():
+def test_gather_qmm_seg_nax_unaligned_n(monkeypatch):
     import mlx_kquant as kq
 
+    # Loop reference on the BM=64 NAX tile, as in the test above.
+    monkeypatch.setenv("KQ_QMM_MIDM", "0")
     if not _nax_ok():
         pytest.skip("NAX gather kernels unavailable on this GPU")
     rng = np.random.default_rng(37)
@@ -417,13 +423,15 @@ def test_gather_qmm_seg_nax_unaligned_n():
 )
 @pytest.mark.parametrize("codec", ["iq2_xs", "iq3_xxs"])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-def test_gather_qmm_seg_nax_grid_codec_unaligned_n(codec, dtype):
+def test_gather_qmm_seg_nax_grid_codec_unaligned_n(codec, dtype, monkeypatch):
     """The IQ grid codecs of the prefill gathers on an N tail past the last
     32-column simdgroup band, with tiles of 1, 33 and 65 rows (one live
     16-row sub-band, a partial second band, a second map tile) and a full
     tile, all match the per-expert loop."""
     import mlx_kquant as kq
 
+    # Loop reference on the BM=64 NAX tile, as in the test above.
+    monkeypatch.setenv("KQ_QMM_MIDM", "0")
     if not _nax_ok():
         pytest.skip("NAX gather kernels unavailable on this GPU")
     from mlx_kquant.codec_geometry import CODEC_GEOMETRY, bytes_per_row

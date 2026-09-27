@@ -60,8 +60,10 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
 On NAX GPUs, `quantized_matmul` transpose (decode-orientation) shapes route by row count M and
 output width N. Per-row qmv serves M 2 up to a per-codec limit, the mat-vec paths (`mv_ext`,
 `verify_qmv`) serve the widths above it, and split-K on a BM=32 double-buffered NAX tile takes over
-from a per-codec entry through M 32. Above M 32 the BM=64 tile runs, with a double-buffered `_db`
-variant on the M 33-64 band at large N, and a BM=128 tile from M 193 when ceil(M/64) is even. Above
+from a per-codec entry through M 32. From M 33 to 128, split-K also takes the calls where the
+BM=64 grid wastes the GPU, as described below. Elsewhere above M 32 the BM=64 tile runs, with a
+double-buffered `_db` variant on the M 33-64 band at large N, and a BM=128 tile from M 193 when
+ceil(M/64) is even. Above
 the qmv limit, the verify kernels take the widths through M 8 on the codecs that have them. The
 NAX verify kernel serves `pq2_0`, `q4_0`, `q8_0` and `q2_k` to `q6_k` from a per-codec entry,
 and the register-resident MMA verify kernel serves `ptq1_0`, as described at the end of this
@@ -90,8 +92,21 @@ are summed in threadgroup memory before the store. Measured on M5 Max over the 2
 the weights streamed from DRAM, the NAX split-K route runs 1.05-1.3x faster at M 8 to 16 and the
 un-split tile 1.1-1.5x faster at M 7 to 16. On the BM=64 tile, `iq2_xs`, `iq2_s` and `iq1_m` run
 1.3-1.5x faster at M 13 to 32, and the gathered NAX tile runs about 1.3x faster at 32 rows per
-entry (median over nine codecs). The short last row tile of a taller matmul keeps the plain walk,
-because the full tiles set the time there and the split measured slower.
+entry (median over nine codecs). On the un-split tiles, the short last row tile of a taller matmul
+keeps the plain walk, because the full tiles set the time there and the split measured slower. The
+split-K kernel splits every row tile that fits one row of simdgroups, since its grid runs many
+waves and each padded multiply adds to the total.
+
+From M 33 to 128 the BM=64 grid is ceil(N/64) x ceil(M/64) threadgroups, and each one walks all of
+K. Under three threadgroups per GPU core, as on the narrow projections of a short prompt, most cores
+sit idle, and split-K runs with a target of 16 slices. From M 65 to 96 the last row tile holds at
+most 32 live rows, which the split-K kernel runs at half the padded multiplies, so split-K runs
+there with a target of 8 slices up to 16 threadgroups per core. The split-K tile is BM=32 through
+M 48, where its last row tile holds at most 16 rows, and BM=64 above. On M5 Max over the 22 NAX
+codecs and eight projection shapes, with the weights streamed from DRAM, this runs 1.29x faster
+than the BM=64 tile when each shape is weighted by its calls in a forward of a 27B hybrid model,
+and no cell runs more than 2% slower. Whole forwards of that model run 19-22% faster at 33 to 64
+rows and 17% faster at 80 and 96. `KQ_QMM_MIDM=0` keeps the BM=64 tile.
 
 The NAX split-K route cuts K into units of max(block, 64) weights and targets 16 slices of whole
 units. It takes the largest count at or under the target that divides the units evenly, unless
@@ -176,15 +191,17 @@ Tuning levers (defaults are right for normal use):
   the default target of 16 slices, and a larger value forces it with that target. Unset takes the
   per-codec entry M in `kq_nax_small_m` (one for N <= 1024, one above), measured on M5 Max, which
   yields to a forced `KQ_QMM_SPLITK` and to a set `KQ_VERIFY_EXT` through M 12. Every codec with
-  NAX kernels, M <= 32. Read live per call, so both arms can share one process.
+  NAX kernels, M <= 32. `0` also turns off the `KQ_QMM_MIDM` route on NAX GPUs, and a larger value
+  sets its slice target. Read live per call, so both arms can share one process.
 - `KQ_QMM_SPLITK` - the same lever for the plain small-M qmm, used when NAX is absent or disabled.
   Entry points come from a per-device table. K-quants, legacy quants and the IQ codecs, M <= 32.
   `0` also turns off the `KQ_QMM_MIDM` route, and a larger value sets its slice target.
-- `KQ_QMM_MIDM` - split-K on the BM=32 tile for M 33-128 when NAX is absent or disabled. `0` keeps
-  the BM=64 qmm and `1` forces split-K at every M in the band. Unset takes split-K where the qmm
-  grid, ceil(N/64) x ceil(M/64) threadgroups, is under three per GPU core (`KQ_GPU_CORES` sets the
-  count), such as the narrow projections of a short prompt. The codecs of `KQ_QMM_SPLITK`. Read
-  live per call.
+- `KQ_QMM_MIDM` - split-K for M 33-128. `0` keeps the BM=64 qmm and `1` forces split-K at every M
+  in the band. Unset takes split-K where the qmm grid, ceil(N/64) x ceil(M/64) threadgroups, is
+  under three per GPU core (`KQ_GPU_CORES` sets the count), such as the narrow projections of a
+  short prompt. On NAX GPUs it also takes M 65-96 up to 16 threadgroups per core and runs the NAX
+  split-K tile on every codec with NAX kernels. When NAX is absent or disabled it runs the BM=32
+  tile on the codecs of `KQ_QMM_SPLITK`. Read live per call.
 - `KQ_SPLITK_RAGGED` - slice count of the NAX split-K route. `0` keeps equal slices, the largest
   count at or under the target that divides the slice units, and `2` takes the ragged count
   whenever it is larger. Unset takes it only where it more than doubles the equal count. Read live
