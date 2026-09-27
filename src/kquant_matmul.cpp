@@ -1039,7 +1039,7 @@ void verify_nax(
   ce.dispatch_threads(agrid, agroup);
 }
 
-// Split-K qmm_t on the NAX BM=32 tile (KQ_QMM_SPLITK_NAX). Same
+// Split-K qmm_t on the NAX BM=32 or BM=64 tile (KQ_QMM_SPLITK_NAX). Same
 // partial/fold shape as qmm_splitk, but slices run the tensor-core tile:
 // the steel splitk probe measured per-TG pipeline bound (~140-160 GB/s flat
 // in splits), while the NAX small-M cap is TG-count starvation -- the lever
@@ -1061,8 +1061,9 @@ void qmm_nax_splitk(
     Device& d,
     const Stream& s,
     const std::string& kquant_type,
-    int k_partition) {
-  constexpr int bm = 32, bn = 64;
+    int k_partition,
+    int bm = 32) {
+  constexpr int bn = 64;
   constexpr int wm = 2, wn = 2;
   const int part_stride = M * N;
 
@@ -1084,7 +1085,9 @@ void qmm_nax_splitk(
       group_size,
       "_b_",
       bits,
-      "_bm32_bn64_bk64_wm2_wn2",
+      "_bm",
+      bm,
+      "_bn64_bk64_wm2_wn2",
       aligned ? "_alN_true" : "_alN_false");
 
   auto kernel = kq_get_kernel(d, kname);
@@ -1588,6 +1591,27 @@ static bool kq_midm_splitk(int M, int N) {
   const int cores = gpu_core_count();
   const int grid = ((N + 63) / 64) * ((M + 63) / 64);
   return grid < 3 * (cores > 0 ? cores : 40);
+}
+
+// Mid-M split-K target on NAX GPUs, 0 for the BM64 qmm. Under three
+// threadgroups per core (kq_midm_splitk) the target is 16. From M 65 to 96
+// the last BM64 row tile holds at most 32 rows, which the split-K kernel
+// runs K-split at half the padding MMA, and the target is 8 up to 16
+// threadgroups per core (the widest grid measured is 13.6). On an M5 Max
+// over 22 codecs, M 33-128 and eight projection shapes, the rule runs 1.29x
+// the NAX tile weighted by calls per forward, and no cell loses more than
+// 2%. At four or five per core, N 10240 at M 33-64 (one full wave) loses
+// up to 1.6x, and M 97-128 wins or loses by codec.
+static int kq_midm_nax_target(int M, int N) {
+  if (kq_midm_splitk(M, N)) {
+    return kq_splitk_nax_target;
+  }
+  const int cores = gpu_core_count();
+  const int grid = ((N + 63) / 64) * ((M + 63) / 64);
+  if (M >= 65 && M <= 96 && grid < 16 * (cores > 0 ? cores : 40)) {
+    return 8;
+  }
+  return 0;
 }
 
 // Largest divisor of nblk at or under target (1 = no split).
@@ -2336,6 +2360,47 @@ void KQuantMatmul::eval_gpu_base(
             d,
             s,
             kquant_type_);
+        return;
+      }
+    }
+  }
+
+  // Mid-M split-K on NAX GPUs where kq_midm_nax_target gives a target.
+  // BM32 through M 48, where the last row tile holds at most 16 rows and
+  // runs K-split, and BM64 above. KQ_QMM_MIDM (read live) is the same probe
+  // lever. KQ_QMM_SPLITK_NAX=0 turns it off with the small-M route, and a
+  // larger value sets its target.
+  if (transpose_ && non_batched && M > 32 && M <= 128 && nax_path &&
+      (K % 64 == 0) && x.dtype() != mx::float32) {
+    const char* me = std::getenv("KQ_QMM_MIDM");
+    const int midm = me != nullptr ? std::atoi(me) : -1;
+    const char* ske = std::getenv("KQ_QMM_SPLITK_NAX");
+    const int sk_env = ske != nullptr ? std::atoi(ske) : -1;
+    const int rule = kq_midm_nax_target(M, N);
+    if (sk_env != 0 && (midm == 1 || (midm == -1 && rule > 0))) {
+      const int target = sk_env > 1 ? sk_env
+          : rule > 0                ? rule
+                                    : kq_splitk_nax_target;
+      const int q = std::max(group_size_, 64);
+      int per = 0;
+      const int sp = kq_nax_split(target, K / q, per);
+      if (sp > 1) {
+        qmm_nax_splitk(
+            x,
+            w,
+            scales,
+            out,
+            group_size_,
+            bits_,
+            M,
+            N,
+            K,
+            sp,
+            d,
+            s,
+            kquant_type_,
+            per * q,
+            M <= 48 ? 32 : 64);
         return;
       }
     }

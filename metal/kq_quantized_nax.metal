@@ -117,23 +117,27 @@
   instantiate_kquant_nax_qmm_t_smallbm(codec, float16_t,  gs, bits)          \
   instantiate_kquant_nax_qmm_t_smallbm(codec, bfloat16_t, gs, bits)
 
-// Split-K qmm_t on the NAX BM=32 tile (KQ_QMM_SPLITK_NAX experiment):
+// Split-K qmm_t on the NAX BM=32 and BM=64 tiles (KQ_QMM_SPLITK_NAX):
 // grid.z K-slices into T partials + shared accum fold. The plain small-M
 // grid is TG-count starved (ceil(N/64) x 1 threadgroups at decode shapes);
 // splitting K multiplies occupancy without touching the fragment shape.
 // Full K/IQ codec coverage, matching the bm32 tile's instantiation set; no
 // batched or float x variants (route gates match qmm_nax and non_batched).
-#define instantiate_kquant_nax_qmm_t_splitk(type, gs, bits, aligned_N, codec) \
+// BM=64 serves the mid-M route above M 48 and BM=32 every M below it.
+#define instantiate_kquant_nax_qmm_t_splitk(type, gs, bits, aligned_N, bm, codec) \
   instantiate_kernel(                                                        \
       "kquant_" #codec "_qmm_t_nax_splitk_" #type "_gs_" #gs "_b_" #bits     \
-          "_bm32_bn64_bk64_wm2_wn2_alN_" #aligned_N,                         \
+          "_bm" #bm "_bn64_bk64_wm2_wn2_alN_" #aligned_N,                    \
       kq_ ## codec ## _qmm_t_nax_splitk,                                     \
-      type, gs, bits, aligned_N, 32, 64, 2, 2)
+      type, gs, bits, aligned_N, bm, 64, 2, 2)
+#define instantiate_kquant_nax_splitk_bm(codec, gs, bits, bm)                \
+  instantiate_kquant_nax_qmm_t_splitk(float16_t,  gs, bits, true,  bm, codec) \
+  instantiate_kquant_nax_qmm_t_splitk(float16_t,  gs, bits, false, bm, codec) \
+  instantiate_kquant_nax_qmm_t_splitk(bfloat16_t, gs, bits, true,  bm, codec) \
+  instantiate_kquant_nax_qmm_t_splitk(bfloat16_t, gs, bits, false, bm, codec)
 #define instantiate_kquant_nax_splitk(codec, gs, bits)                       \
-  instantiate_kquant_nax_qmm_t_splitk(float16_t,  gs, bits, true,  codec)    \
-  instantiate_kquant_nax_qmm_t_splitk(float16_t,  gs, bits, false, codec)    \
-  instantiate_kquant_nax_qmm_t_splitk(bfloat16_t, gs, bits, true,  codec)    \
-  instantiate_kquant_nax_qmm_t_splitk(bfloat16_t, gs, bits, false, codec)
+  instantiate_kquant_nax_splitk_bm(codec, gs, bits, 32)                      \
+  instantiate_kquant_nax_splitk_bm(codec, gs, bits, 64)
 instantiate_kquant_nax_splitk(q6_k, 256, 6)
 instantiate_kquant_nax_splitk(q8_0, 32, 8)
 instantiate_kquant_nax_splitk(q4_k, 256, 4)

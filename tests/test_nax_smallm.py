@@ -230,6 +230,66 @@ def test_alu_midm_splitk_rule(codec, n_out, taken, nax_off, monkeypatch):
     assert not _bits_equal(default, run("0" if taken == "1" else "1"))
 
 
+# Mid-M band on NAX GPUs, where N 1000 keeps the rule on through M 128.
+# 33-48 run the BM32 split-K tile, whose last row tile (1 to 16 rows) runs
+# K-split. 49-128 run the BM64 tile, whose last row tile runs K-split from
+# 65 to 96 and is full at 64 and 128. 129 hands off to the BM64 qmm. On
+# non-NAX GPUs the ALU mid-M route serves the same rows.
+NAX_MIDM_MS = [33, 40, 48, 49, 56, 64, 65, 80, 96, 97, 112, 128, 129]
+
+
+@pytest.mark.parametrize("codec", ENCODABLE)
+def test_nax_midm_band(codec):
+    w, s, ref_w = _encodable_setup(codec, 1000)
+    _sweep(codec, w, s, ref_w, 1000, ms=NAX_MIDM_MS)
+
+
+@pytest.mark.parametrize("codec", IQ)
+def test_nax_midm_band_iq(codec):
+    w, s, ref_w = _iq_setup(codec, 1000)
+    _sweep(codec, w, s, ref_w, 1000, ms=NAX_MIDM_MS)
+
+
+# The NAX mid-M rule, with 40 cores pinned. Under three threadgroups per
+# core the route runs: N 1000 at M 48 and 112 (16 and 32). From M 65 to 96
+# it runs up to 16 per core: N 8192 at M 96 (256). N 8192 at M 48 and 112
+# (128 and 256) keep the BM64 qmm. Each default output matches the forced
+# arm it names bit for bit and differs from the other, and
+# KQ_QMM_SPLITK_NAX=0 turns the route off with the small-M one.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX tile only")
+@pytest.mark.parametrize(
+    "m,n_out,taken",
+    [
+        (48, 1000, "1"),
+        (112, 1000, "1"),
+        (96, 8192, "1"),
+        (48, 8192, "0"),
+        (112, 8192, "0"),
+    ],
+)
+@pytest.mark.parametrize("codec", ["q4_k", "q8_0"])
+def test_nax_midm_splitk_rule(codec, m, n_out, taken, monkeypatch):
+    monkeypatch.setenv("KQ_GPU_CORES", "40")
+    w, s, _ = _encodable_setup(codec, n_out)
+    x = (mx.random.normal((m, K)) * 0.5).astype(mx.bfloat16)
+
+    def run(route):
+        if route is None:
+            monkeypatch.delenv("KQ_QMM_MIDM", raising=False)
+        else:
+            monkeypatch.setenv("KQ_QMM_MIDM", route)
+        y = kq.quantized_matmul(x, w, s, codec, transpose=True)
+        mx.eval(y)
+        return y
+
+    default = run(None)
+    tile = run("0")
+    assert _bits_equal(default, run(taken))
+    assert not _bits_equal(default, run("0" if taken == "1" else "1"))
+    monkeypatch.setenv("KQ_QMM_SPLITK_NAX", "0")
+    assert _bits_equal(run(None), tile)
+
+
 # Register-resident MMA verify band (kq_verify_mma.h): KQ_VERIFY_MMA=2
 # forces the route at every M in 2..8 on any GPU, so the kernel is checked
 # at every row count and both activation dtypes it is instantiated for,
