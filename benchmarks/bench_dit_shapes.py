@@ -20,10 +20,16 @@ Order: one discarded warmup pass, which also records the kernel each kq
 arm ran, then rounds of Thue-Morse slots. Each slot visits every shape in
 a fresh interleaved order. A visit opens with --visit-warmup discarded
 calls, since the first call after a shape switch runs slow. Inside a visit
-the arm list rotates by one per visit and reverses on odd slots, so a
-paired ratio compares calls made seconds apart. Round 0 is the first-round
-column, later rounds the settled column. Markdown and JSON out; the JSON
-keeps every sample.
+the arm list reverses on odd slots, so the two calls of every pair swap
+order with the Thue-Morse bit and a round of 8 slots splits each pair 4/4.
+A paired ratio compares calls made seconds apart. Round 0 is the
+first-round column, later rounds the settled column.
+
+Per cell, ratios carry a 95 percent CI of the paired median, from order
+statistics; its half-width is the cell's noise floor. Per op, the pooled
+median of all settled pairs is the aggregate, reported beside the spread
+of the per-cell medians. Markdown and JSON out; the JSON keeps every
+sample and pair.
 
 A versus A: --arms kq,kq_aa. Plan only: --plan-only.
 """
@@ -150,8 +156,6 @@ def run_pass(dtype, groups, args, store, desc, t_start):
                     for a, c in arm_instances(g, args.arms)
                     if (gi, cell_key(a, c)) not in errors
                 ]
-                k = visit % len(inst)
-                inst = inst[k:] + inst[:k]
                 if tm:
                     inst.reverse()
                 for arm, codec in inst[: args.visit_warmup]:
@@ -194,7 +198,7 @@ def run_pass(dtype, groups, args, store, desc, t_start):
                 "tile": tile,
                 "error": errors.get((gi, key)),
                 "samples": [
-                    [r, s, round(t, 3), ms] for (_v, r, s, t, ms) in sm.get(key, [])
+                    [r, s, round(t, 4), ms] for (_v, r, s, t, ms) in sm.get(key, [])
                 ],
             }
             rec.update(split_stats(sm.get(key, []), args.rounds, 1, 4))
@@ -228,9 +232,42 @@ def run_pass(dtype, groups, args, store, desc, t_start):
                 pr = paired(sm, a, b)
                 if pr:
                     ratios[name] = split_stats(pr, args.rounds, 0, 1)
+                    ratios[name]["pairs"] = [[r, v] for r, v in pr]
             cells.append({"codec": codec, "arms": arms, "ratios": ratios})
         out_groups.append(dict(g, shared=shared, cells=cells))
     return out_groups
+
+
+def aggregates(groups, rounds):
+    """Per op and ratio: the pooled median of every settled pair across the
+    op's cells, with its CI, beside the spread of per-cell medians and of
+    per-cell CI half-widths."""
+    by = {}
+    for g in groups:
+        op = f"{g['family']}.{g['op']}"
+        for c in g["cells"]:
+            for name, rt in c["ratios"].items():
+                e = by.setdefault((op, name), {"pairs": [], "cells": [], "half": []})
+                e["pairs"] += [v for r, v in rt["pairs"] if r > 0 or rounds == 1]
+                st = rt.get("settled") or rt.get("all")
+                if st:
+                    e["cells"].append(st["median"])
+                    if st["ci95_half"] is not None:
+                        e["half"].append(st["ci95_half"])
+    out = []
+    for (op, name), e in by.items():
+        out.append(
+            {
+                "op": op,
+                "ratio": name,
+                "pooled": dc.summarize(e["pairs"]),
+                "cell_medians": dc.summarize(e["cells"]),
+                "cell_ci95_half": dc.summarize(e["half"]),
+                "cell_ci95_half_max": max(e["half"]) if e["half"] else None,
+                "cells": len(e["cells"]),
+            }
+        )
+    return out
 
 
 def fmt(v, spec=".3f"):
@@ -299,6 +336,29 @@ def markdown(result):
                 row += f" {fmt(pick_first(rt.get('aa/kq')))} |"
                 lines.append(row)
         lines.append("")
+        lines.append(
+            "Aggregate per op: pooled median of settled pairs with its 95 percent "
+            "CI; per-cell medians p10 to p90; per-cell CI half-width median and "
+            "max."
+        )
+        lines.append("")
+        lines.append(
+            "| op | ratio | cells | pairs | pooled | CI | cell p10 | cell p90 "
+            "| cell CI half med | cell CI half max |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|---|---|")
+        for ag in p["aggregate"]:
+            po, cm, ch = ag["pooled"], ag["cell_medians"], ag["cell_ci95_half"]
+            ci = po["ci95"] if po else None
+            lines.append(
+                f"| {ag['op']} | {ag['ratio']} | {ag['cells']} "
+                f"| {po['n'] if po else 0} | {fmt(po and po['median'], '.4f')} "
+                f"| {f'{ci[0]:.4f} to {ci[1]:.4f}' if ci else '-'} "
+                f"| {fmt(cm and cm['p10'])} | {fmt(cm and cm['p90'])} "
+                f"| {fmt(ch and ch['median'], '.1%')} "
+                f"| {fmt(ag['cell_ci95_half_max'], '.1%')} |"
+            )
+        lines.append("")
         errs = [
             (g, c["codec"], arm, rec["error"])
             for g in p["groups"]
@@ -340,7 +400,7 @@ def main():
     ap.add_argument("--dtypes", default="bfloat16,float16")
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--slots", type=int, default=8)
-    ap.add_argument("--inner", type=int, default=1, help="calls per sample")
+    ap.add_argument("--inner", type=int, default=3, help="calls per sample")
     ap.add_argument(
         "--visit-warmup",
         type=int,
@@ -405,6 +465,7 @@ def main():
                 "groups": run_pass(dtype, groups, args, store, desc, t_start),
             }
         )
+        passes[-1]["aggregate"] = aggregates(passes[-1]["groups"], args.rounds)
     result = {
         "machine": desc,
         "args": vars(args),
