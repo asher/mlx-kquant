@@ -10,8 +10,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `KQ_TUNE_LIVE=1` makes the NAX tile levers take effect on the next call, so
   tile A/B runs share one process. `KQ_QMM_LOG` now logs NAX tile dispatches.
 - `KQ_NAX_TILE` and `KQ_QMM_TILE` pin the quantized matmul tile, and raise
-  with the kernel name on a tile that is not built. `kq.metallib_kernels()`
-  lists the built kernels.
+  with the kernel name on a tile that is not built; `KQ_QMM_TILE` accepts
+  only `64,64,2,2` for now. `kq.metallib_kernels()` lists the built kernels.
 - `kq.max_threadgroup_memory()` reports the GPU's threadgroup memory limit.
 - `benchmarks/bench_dit_shapes.py` and `benchmarks/bench_roofline.py` time
   matmul tiles against stock and MLX affine arms at diffusion model shapes.
