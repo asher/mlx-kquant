@@ -6,14 +6,14 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0]
+
 ### Changed
 - On NAX GPUs (M5), matmuls with 33 to 128 activation rows run faster, such
   as the short prompts of a structured decision. `KQ_QMM_MIDM=0` keeps the
   previous kernel.
-- mlx pin bumped to 0.32.2 (nanobind 2.15.0 to match its ABI). Picks up
-  the upstream fix for dequantize misreading strided operands
-  (ml-explore/mlx#4381) and the compile-cache exit segfault; a new pin
-  test holds both the version and the strided-operand behavior.
+- Requires mlx 0.32.2, which fixes wrong values from dequantizing a strided
+  array and a crash at process exit.
 - `mlx-kquant[tools]` now installs beside transformers 5.13.1 and later, as
   mlx-vlm 0.7 requires. Only 5.13.0, which cannot import mlx-lm, is excluded.
 
