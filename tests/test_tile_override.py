@@ -216,6 +216,32 @@ _ALU_NAME = re.compile(
 )
 
 
+def test_tile_names_match_known_patterns():
+    # Every qmm_t tile kernel outside the split-K and gather families must
+    # match a pattern above, so a new tile family cannot escape the
+    # enumerating test below.
+    _metal()
+    names = kq.metallib_kernels()
+    nax = [
+        n
+        for n in names
+        if "_qmm_t_nax_" in n and "_gather_" not in n and "_qmm_t_nax_splitk_" not in n
+    ]
+    alu = [
+        n
+        for n in names
+        if re.search(r"_qmm_t_(bfloat16_t|float16_t|float)_", n) and "_gather_" not in n
+    ]
+    assert alu, "no qmm_t kernels in the metallib"
+    for pat, group in ((_NAX_NAME, nax), (_ALU_NAME, alu)):
+        bad = [
+            n
+            for n in group
+            if not (m := pat.match(n)) or m["codec"] not in CODEC_GEOMETRY
+        ]
+        assert not bad, bad[:5]
+
+
 def _selectable(codec):
     """Calls that dispatch every qmm_t tile kernel of `codec` an override can
     select: half and bfloat activations, unbatched (the op flattens a batch
