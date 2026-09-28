@@ -129,6 +129,10 @@ def split_stats(rows, rounds, round_at, value_at):
     }
 
 
+def raw_path(json_out, dtype):
+    return f"{json_out}.{dtype}.raw"
+
+
 def run_pass(dtype, groups, args, store, desc, t_start):
     import mlx.core as mx
 
@@ -194,6 +198,22 @@ def run_pass(dtype, groups, args, store, desc, t_start):
                 f"[{dtype}] round {r} slot {s} done at "
                 f"{time.perf_counter() - t_start:.0f} s",
                 flush=True,
+            )
+
+    # Raw samples reach disk before any statistics, so a failure in the
+    # summaries cannot lose a run. main removes the file after the final JSON.
+    if args.json_out:
+        with open(raw_path(args.json_out, dtype), "w") as f:
+            json.dump(
+                {
+                    "dtype": dtype,
+                    "groups": groups,
+                    "inner": inner,
+                    "kernels": {f"{gi}|{k}": v for (gi, k), v in kernels.items()},
+                    "errors": {f"{gi}|{k}": v for (gi, k), v in errors.items()},
+                    "samples": samples,
+                },
+                f,
             )
 
     out_groups = []
@@ -509,6 +529,8 @@ def main():
     if args.json_out:
         with open(args.json_out, "w") as f:
             json.dump(result, f)
+        for dtype in args.dtypes:
+            os.remove(raw_path(args.json_out, dtype))
     md = markdown(result)
     if args.md_out:
         with open(args.md_out, "w") as f:

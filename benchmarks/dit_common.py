@@ -8,7 +8,6 @@ repository root or from here.
 from __future__ import annotations
 
 import hashlib
-import math
 import os
 import platform
 import re
@@ -17,6 +16,7 @@ import sys
 import tempfile
 import time
 import zlib
+from fractions import Fraction
 
 # Tile levers must be live before mlx_kquant reads them on its first call.
 os.environ["KQ_TUNE_LIVE"] = "1"
@@ -341,15 +341,17 @@ def cell(family, op, rows, batch, shrink=1):
 def median_ci(s, conf=0.95):
     """Distribution-free CI of the median of sorted values `s` from order
     statistics: [s(k), s(n+1-k)] with the largest k whose binomial tail
-    stays within (1 - conf) / 2. None when n is too small."""
+    stays within (1 - conf) / 2. None when n is too small. The tail is
+    summed in integers, so it stays exact for any n."""
     n = len(s)
-    alpha = (1.0 - conf) / 2
-    k, cum = 0, 0.0
+    alpha = Fraction(1.0 - conf).limit_denominator(10**6) / 2
+    bound = alpha.numerator << n
+    k, cum, term = 0, 0, 1
     while k < n:
-        nxt = cum + math.comb(n, k) / 2.0**n
-        if nxt > alpha:
+        nxt = cum + term
+        if nxt * alpha.denominator > bound:
             break
-        cum, k = nxt, k + 1
+        cum, term, k = nxt, term * (n - k) // (k + 1), k + 1
     if k < 1:
         return None
     return s[k - 1], s[n - k]
