@@ -143,17 +143,25 @@ the two kernels are within 3% of each other on every shape measured.
 
 Tuning levers (defaults are right for normal use):
 
+- `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
+  `KQ_NAX_DB64`, `KQ_NAX_SWIZZLE`) and `KQ_QMM_LOG` read their variables on every dispatch, so
+  one process can switch tiles between calls on one resident copy of the weights. Unset, each of
+  them keeps its first read for the life of the process. Read once per process.
+- `KQ_QMM_LOG` - set to any value, logs the kernel name, shape and grid of every NAX and ALU qmm
+  tile dispatch to stderr, one `[kq qmm]` line each. Read once per process unless
+  `KQ_TUNE_LIVE=1`.
 - `KQ_NAX_SMALL_BM` - small-M routing. `0` restores the old routing (mat-vec paths below M 13 and
   no BM=32 tile), `2` forces BM=32 for policy-excluded codecs, unset or `1` follows the per-codec
-  policy.
+  policy. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_NAX_BM128` - BM=128 band. `0` off, `1` forces the floor to M 193 for every codec, `2` drops
   the floor entirely (any even ceil(M/64), probing the M65-128 wash band), unset follows the
   per-codec entry floors (193/449/961 tiers, measured on M5 Max by
-  `benchmarks/bench_qmm_bm128_ab.py`; re-run it before trusting them on new silicon).
+  `benchmarks/bench_qmm_bm128_ab.py`; re-run it before trusting them on new silicon). Read once
+  per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_NAX_DB64` - double-buffered M 33-64 band. `0` off, `1` drops the N floor, unset follows the
   per-codec N floors. Only the five policy-enabled codecs (q6_k, q8_0, q4_1, q5_1, q5_0) carry
   `_db` instantiations, so `1` is bounded by availability; probing another codec needs its
-  instantiation restored and a metallib rebuild.
+  instantiation restored and a metallib rebuild. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_FORCE_QMM_MIN_M` - probe lever: routes transpose shapes with M at or above the value straight
   to the NAX qmm, bypassing the mat-vec route claims, for crossover measurement below M 13. Unset
   (off) by default.
@@ -167,7 +175,8 @@ Tuning levers (defaults are right for normal use):
   route's name. Off by default.
 - `KQ_NAX_SWIZZLE` - `1` enables the row-tile traversal swizzle (folds row-tiles into grid.x for
   SLC reuse of the weight band). Falsified on M5 Max, where the M>64 band is per-threadgroup-bound
-  rather than DRAM-bound; kept as a probe for future silicon. Default off.
+  rather than DRAM-bound; kept as a probe for future silicon. Default off. Read once per process
+  unless `KQ_TUNE_LIVE=1`.
 - `KQ_MV_EXT_NR` - `2` selects the two-rows-per-thread `mv_ext` variant (q6_k, M 5-12), which
   halves activation cache traffic but measured no faster than the shipped kernels. Kept as a probe
   for future silicon. Default `1` (shipped behavior).

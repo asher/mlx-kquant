@@ -6,6 +6,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `KQ_TUNE_LIVE=1` makes the NAX tile levers take effect on the next call, so
+  tile A/B runs share one process. `KQ_QMM_LOG` now logs NAX tile dispatches.
+
 ## [0.5.0]
 
 ### Changed

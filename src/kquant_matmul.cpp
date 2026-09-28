@@ -497,6 +497,77 @@ static int kq_splitk_nax_min_m(const std::string& t, int N) {
   return N <= 1024 ? p.splitk_small : p.splitk;
 }
 
+// Integer value of an environment lever, or `unset` when the variable is
+// absent.
+static int kq_env_int(const char* name, int unset) {
+  const char* e = std::getenv(name);
+  return e == nullptr ? unset : std::atoi(e);
+}
+
+// KQ_TUNE_LIVE=1, read once per process, makes the tile levers below read
+// their variables on every dispatch, so one process can switch tiles
+// between calls on one resident copy of the weights. Without it each tile
+// lever keeps its first read for the life of the process.
+static bool kq_tune_live() {
+  static const bool live = kq_env_int("KQ_TUNE_LIVE", 0) != 0;
+  return live;
+}
+
+// KQ_NAX_SMALL_BM: 0 = off, 2 = force bm32 for policy-excluded codecs,
+// unset or 1 = per-codec policy. Read by the BM=32 tile pick in qmm_nax
+// and by the small-M qmm route in eval_gpu_base.
+static int kq_nax_small_bm_mode() {
+  static const int cached = kq_env_int("KQ_NAX_SMALL_BM", 1);
+  return kq_tune_live() ? kq_env_int("KQ_NAX_SMALL_BM", 1) : cached;
+}
+
+// KQ_NAX_BM128: 0 = off, 1 = floor 193 for all codecs, 2 = no floor,
+// unset (-1) = per-codec floor.
+static int kq_nax_bm128_mode() {
+  static const int cached = kq_env_int("KQ_NAX_BM128", -1);
+  return kq_tune_live() ? kq_env_int("KQ_NAX_BM128", -1) : cached;
+}
+
+// KQ_NAX_DB64: 0 = off, 1 = no N floor, unset (-1) = per-codec N floor.
+static int kq_nax_db64_mode() {
+  static const int cached = kq_env_int("KQ_NAX_DB64", -1);
+  return kq_tune_live() ? kq_env_int("KQ_NAX_DB64", -1) : cached;
+}
+
+// KQ_NAX_SWIZZLE: nonzero = row-tile traversal swizzle on.
+static bool kq_nax_swizzle_on() {
+  static const bool cached = kq_env_int("KQ_NAX_SWIZZLE", 0) != 0;
+  return kq_tune_live() ? kq_env_int("KQ_NAX_SWIZZLE", 0) != 0 : cached;
+}
+
+// KQ_QMM_LOG set (any value): the qmm tiles log the kernel name and shape
+// of each dispatch to stderr.
+static bool kq_qmm_log() {
+  static const bool cached = std::getenv("KQ_QMM_LOG") != nullptr;
+  return kq_tune_live() ? std::getenv("KQ_QMM_LOG") != nullptr : cached;
+}
+
+// One KQ_QMM_LOG line: kernel name, shape and grid of a qmm tile dispatch.
+static void kq_log_qmm(
+    const std::string& kname,
+    int M,
+    int N,
+    int K,
+    const MTL::Size& grid) {
+  if (kq_qmm_log()) {
+    std::fprintf(
+        stderr,
+        "[kq qmm] %s M=%d N=%d K=%d grid=%lu,%lu,%lu\n",
+        kname.c_str(),
+        M,
+        N,
+        K,
+        static_cast<unsigned long>(grid.width),
+        static_cast<unsigned long>(grid.height),
+        static_cast<unsigned long>(grid.depth));
+  }
+}
+
 // KQ_VERIFY_EXT, read once per process. 0 forces verify_qmv and 1 forces
 // mv_ext on the mat-vec band (M 2-12), -1 leaves the per-codec default.
 static int kq_verify_ext_env() {
@@ -547,10 +618,7 @@ void qmm_nax(
   // are db_safe and have smallbm instantiations only. KQ_NAX_SMALL_BM:
   // 0 = off, 2 = force bm32 for policy-excluded codecs (crossover
   // finding), unset or 1 = per-codec policy.
-  static const int small_bm_mode = []() {
-    const char* e = std::getenv("KQ_NAX_SMALL_BM");
-    return e == nullptr ? 1 : std::atoi(e);
-  }();
+  const int small_bm_mode = kq_nax_small_bm_mode();
   // Window ends at 32: above it grid.y goes to 2 and every weight column
   // tile streams once per M-tile, which halves per-weight bandwidth at
   // DRAM-bound (measured: q6_k M48 146 GB/s on bm32 vs 184 on bm64).
@@ -571,10 +639,7 @@ void qmm_nax(
   // codecs (crossover finding), 2 = drop the floor entirely (probes the
   // M65-128 wash band, symmetric with KQ_NAX_SMALL_BM=2), unset =
   // per-codec policy.
-  static const int bm128_mode = []() {
-    const char* e = std::getenv("KQ_NAX_BM128");
-    return e == nullptr ? -1 : std::atoi(e);
-  }();
+  const int bm128_mode = kq_nax_bm128_mode();
   int bm128_min_m = kq_smallbm_policy(kquant_type).bm128_min_m;
   if (bm128_mode != 0 && transpose && ((M + 63) / 64) % 2 == 0 &&
       (bm128_mode == 1       ? M >= 193
@@ -590,10 +655,7 @@ void qmm_nax(
   // (db64_min_n > 0) carry _db instantiations, so 1 is bounded by
   // availability; probing another codec needs its instantiation
   // restored and a metallib rebuild.
-  static const int db64_mode = []() {
-    const char* e = std::getenv("KQ_NAX_DB64");
-    return e == nullptr ? -1 : std::atoi(e);
-  }();
+  const int db64_mode = kq_nax_db64_mode();
   int db64_min_n = kq_smallbm_policy(kquant_type).db64_min_n;
   bool use_db64 = transpose && bm == 64 && M >= 33 && M <= 64 &&
       db64_min_n > 0 &&
@@ -607,11 +669,7 @@ void qmm_nax(
   // count). kq_swizzle_tid in the kernel derives the fold factor from
   // threadgroups_per_grid; padded row-tiles early-return.
   // KQ_NAX_SWIZZLE: 1 = on (experiment lever; default off).
-  static const bool swizzle_on = []() {
-    const char* e = std::getenv("KQ_NAX_SWIZZLE");
-    return e != nullptr && std::atoi(e) != 0;
-  }();
-  if (swizzle_on && transpose && bm == 64) {
+  if (kq_nax_swizzle_on() && transpose && bm == 64) {
     int y_tiles = (M + bm - 1) / bm;
     if (y_tiles >= 2) {
       int log = y_tiles >= 4 ? 2 : 1;
@@ -648,6 +706,8 @@ void qmm_nax(
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
       batched ? "_batch_1" : "_batch_0",
       use_db64 ? "_db" : "");
+
+  kq_log_qmm(kname, M, N, K, grid_dims);
 
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -725,11 +785,7 @@ void qmm(
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
       batched ? "_batch_1" : "_batch_0");
 
-  static const bool qmm_log = std::getenv("KQ_QMM_LOG") != nullptr;
-  if (qmm_log) {
-    std::fprintf(
-        stderr, "[kq qmm] %s M=%d N=%d K=%d\n", kname.c_str(), M, N, K);
-  }
+  kq_log_qmm(kname, M, N, K, grid_dims);
 
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -2309,10 +2365,7 @@ void KQuantMatmul::eval_gpu_base(
   // 249-287 vs 149-256, q2_k M>=8 133-194 vs 88-135, iq3_xxs M>=8
   // 163-175 vs 102-158). KQ_NAX_SMALL_BM=0 restores the old routing
   // (same switch that picks the BM=32 tile in qmm_nax).
-  static const bool nax_smallm_route = []() {
-    const char* e = std::getenv("KQ_NAX_SMALL_BM");
-    return e == nullptr || std::atoi(e) != 0;
-  }();
+  const bool nax_smallm_route = kq_nax_small_bm_mode() != 0;
   int smallm_min = kq_smallm_route_min(kquant_type_, N, K);
   if (nax_smallm_route && transpose_ && non_batched && smallm_min > 0 &&
       M >= smallm_min && M <= 12 && kq_is_nax_available() && (K % 64 == 0) &&
