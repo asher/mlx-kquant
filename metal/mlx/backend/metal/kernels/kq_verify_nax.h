@@ -589,11 +589,11 @@ struct KqQ2_KNax {
   }
 };
 
-template <typename T, typename Codec>
+template <typename T, typename Codec, typename U = T>
 METAL_FUNC void kq_verify_nax_impl(
     const device uint8_t* w,
     const device T* x,
-    device T* y,
+    device U* y,
     const constant int& K,
     const constant int& N,
     const constant int& M,
@@ -701,7 +701,7 @@ METAL_FUNC void kq_verify_nax_impl(
     for (short j = 0; j < 4; ++j) {
       const int n = n0 + 16 * f + fn + j;
       if (n < N) {
-        y[static_cast<int64_t>(fm) * N + n] = static_cast<T>(cc[f * 8 + j]);
+        y[static_cast<int64_t>(fm) * N + n] = static_cast<U>(cc[f * 8 + j]);
       }
     }
   }
@@ -710,12 +710,12 @@ METAL_FUNC void kq_verify_nax_impl(
 // Entry point: qmm_t_splitk's buffer layout, grid (ceil(N / 128), 1,
 // splits), 128 threads.
 #define KQ_DEFINE_VERIFY_NAX_KERNEL(CODEC, TRAITS)                     \
-  template <typename T, int group_size, int bits>                      \
+  template <typename T, int group_size, int bits, typename U = T>      \
   [[kernel]] void kq_##CODEC##_verify_nax(                             \
       const device uint8_t* w,                                         \
       const device uint8_t* /* scales */,                              \
       const device T* x,                                               \
-      device T* y,                                                     \
+      device U* y,                                                     \
       const constant int& K,                                           \
       const constant int& N,                                           \
       const constant int& M,                                           \
@@ -725,7 +725,7 @@ METAL_FUNC void kq_verify_nax_impl(
       uint simd_gid [[simdgroup_index_in_threadgroup]],                \
       uint simd_lid [[thread_index_in_simdgroup]]) {                   \
     static_assert(group_size == TRAITS::group, #CODEC " block width"); \
-    kq_verify_nax_impl<T, TRAITS>(                                     \
+    kq_verify_nax_impl<T, TRAITS, U>(                                  \
         w,                                                             \
         x,                                                             \
         y + tid.z * static_cast<int64_t>(split_k_partition_stride),    \

@@ -22,6 +22,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - On NAX GPUs (M5), matmuls with 4096 or more activation rows run the BM=128
   tile at any row count. `KQ_NAX_BM128_ODD_M=0` keeps the previous tile.
 
+### Fixed
+- Split-K matmuls at 128 or fewer rows, MTP verify among them, no longer round
+  each K slice to bf16 or fp16 before the sum. `KQ_SPLITK_F32=0` restores it.
+
 ## [0.5.0]
 
 ### Changed

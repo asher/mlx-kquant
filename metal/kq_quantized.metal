@@ -27,6 +27,15 @@
       aligned_N,                                                            \
       batched)
 
+// Split-K kernels come in pairs: the plain name stores T partials, and
+// the _pf32 twin stores float partials for kquant_qmm_splitk_accum_*_pf32
+// (the default, KQ_SPLITK_F32). Float activations already store float
+// partials through the plain kernel, so only the 2-byte types have a twin.
+#define instantiate_pf32_float(...)
+#define instantiate_pf32_float16_t(...) instantiate_kernel(__VA_ARGS__)
+#define instantiate_pf32_bfloat16_t(...) instantiate_kernel(__VA_ARGS__)
+#define instantiate_pf32(type, ...) instantiate_pf32_ ## type(__VA_ARGS__)
+
 #define instantiate_kquant_qmm_t_splitk(type, gs, bits, aligned_N, codec) \
   instantiate_kernel(                                                     \
       "kquant_" #codec "_qmm_t_splitk_" #type "_gs_" #gs "_b_" #bits      \
@@ -35,7 +44,18 @@
       type,                                                               \
       gs,                                                                 \
       bits,                                                               \
-      aligned_N)
+      aligned_N)                                                          \
+  instantiate_pf32(                                                       \
+      type,                                                               \
+      "kquant_" #codec "_qmm_t_splitk_" #type "_gs_" #gs "_b_" #bits      \
+          "_alN_" #aligned_N "_pf32",                                     \
+      kq_ ## codec ## _qmm_t_splitk,                                      \
+      type,                                                               \
+      gs,                                                                 \
+      bits,                                                               \
+      aligned_N,                                                          \
+      0,                                                                  \
+      float)
 
 // BM=16 and BM=8 split-K tiles for M <= 16 and M <= 8 (codecs with the
 // small_bm template arm).
@@ -48,7 +68,18 @@
       gs,                                                                      \
       bits,                                                                    \
       aligned_N,                                                               \
-      16)
+      16)                                                                      \
+  instantiate_pf32(                                                            \
+      type,                                                                    \
+      "kquant_" #codec "_qmm_t_splitk_bm16_" #type "_gs_" #gs "_b_" #bits      \
+          "_alN_" #aligned_N "_pf32",                                          \
+      kq_ ## codec ## _qmm_t_splitk,                                           \
+      type,                                                                    \
+      gs,                                                                      \
+      bits,                                                                    \
+      aligned_N,                                                               \
+      16,                                                                      \
+      float)
 #define instantiate_kquant_qmm_t_splitk_bm8(type, gs, bits, aligned_N, codec) \
   instantiate_kernel(                                                         \
       "kquant_" #codec "_qmm_t_splitk_bm8_" #type "_gs_" #gs "_b_" #bits      \
@@ -58,7 +89,18 @@
       gs,                                                                     \
       bits,                                                                   \
       aligned_N,                                                              \
-      8)
+      8)                                                                      \
+  instantiate_pf32(                                                           \
+      type,                                                                   \
+      "kquant_" #codec "_qmm_t_splitk_bm8_" #type "_gs_" #gs "_b_" #bits      \
+          "_alN_" #aligned_N "_pf32",                                         \
+      kq_ ## codec ## _qmm_t_splitk,                                          \
+      type,                                                                   \
+      gs,                                                                     \
+      bits,                                                                   \
+      aligned_N,                                                              \
+      8,                                                                      \
+      float)
 
 #define instantiate_kquant_qmm_n(type, gs, bits, batched, codec)        \
   instantiate_kernel(                                                   \
@@ -1020,7 +1062,15 @@ instantiate_kquant_prism_for_type(ptq1_0, 128, 1, float16_t)
       kq_ ## codec ## _verify_mma,                                    \
       type,                                                           \
       gs,                                                             \
-      bits)
+      bits)                                                           \
+  instantiate_kernel(                                                 \
+      "kquant_" #codec "_verify_mma_" #type "_gs_" #gs "_b_" #bits    \
+          "_pf32",                                                    \
+      kq_ ## codec ## _verify_mma,                                    \
+      type,                                                           \
+      gs,                                                             \
+      bits,                                                           \
+      float)
 instantiate_kquant_verify_mma(bfloat16_t, 128, 2, pq2_0)
 instantiate_kquant_verify_mma(float16_t, 128, 2, pq2_0)
 instantiate_kquant_verify_mma(bfloat16_t, 128, 1, ptq1_0)
@@ -1136,12 +1186,14 @@ instantiate_kquant_gather_qmm_rhs_codec(128, 1, ptq1_0)
 }
 
 // Split-K partial fold for qmm_t_splitk: y[i] = (T)(f32 sum over the
-// splits axis of partials[z * stride + i]). Partials carry one T rounding
-// per slice; the fold accumulates in f32 and rounds once more. One thread
-// per output element; cost is noise next to the GEMM pass.
-template <typename T>
+// splits axis of partials[z * stride + i]). The fold accumulates in f32
+// and rounds once. Float partials (P = float, the _pf32 kernels) keep the
+// result at that one output rounding; T partials add one T rounding per
+// slice. One thread per output element; cost is noise next to the GEMM
+// pass.
+template <typename T, typename P = T>
 [[kernel]] void kq_qmm_splitk_accum(
-    const device T* partials [[buffer(0)]],
+    const device P* partials [[buffer(0)]],
     device T* y [[buffer(1)]],
     const constant int& n_elems [[buffer(2)]],
     const constant int& splits [[buffer(3)]],
@@ -1164,7 +1216,16 @@ template <typename T>
       kq_qmm_splitk_accum,                      \
       type)
 
+#define instantiate_kq_qmm_splitk_accum_pf32(type) \
+  instantiate_kernel(                              \
+      "kquant_qmm_splitk_accum_" #type "_pf32",    \
+      kq_qmm_splitk_accum,                         \
+      type,                                        \
+      float)
+
 instantiate_kq_qmm_splitk_accum(float)
 instantiate_kq_qmm_splitk_accum(bfloat16_t)
 instantiate_kq_qmm_splitk_accum(float16_t)
+instantiate_kq_qmm_splitk_accum_pf32(bfloat16_t)
+instantiate_kq_qmm_splitk_accum_pf32(float16_t)
     // clang-format on

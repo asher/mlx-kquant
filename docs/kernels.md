@@ -145,7 +145,7 @@ Tuning levers (defaults are right for normal use):
 
 - `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
   `KQ_NAX_BM128_ODD_M`, `KQ_NAX_DB64`, `KQ_NAX_SWIZZLE`), the tile overrides (`KQ_NAX_TILE`,
-  `KQ_QMM_TILE`) and `KQ_QMM_LOG` read their variables on every dispatch, so one process can
+  `KQ_QMM_TILE`), `KQ_SPLITK_F32` and `KQ_QMM_LOG` read their variables on every dispatch, so one process can
   switch tiles between calls on one resident copy of the weights; `benchmarks/bench_dit_shapes.py`
   runs its tile arms this way. It reads the environment on every dispatch, so it is for single-threaded A/B runs
   that set these variables between calls. Unset (off) by default, and then each of them keeps its
@@ -162,8 +162,14 @@ Tuning levers (defaults are right for normal use):
   `_bm<bm>_bn<bn>_wm<wm>_wn<wn>` before `_alN` and raises until such a kernel is built. Unset
   (off) by default. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_QMM_LOG` - set to any value, logs the kernel name, shape and grid of every NAX and ALU qmm
-  tile dispatch to stderr, one `[kq qmm]` line each. Unset (off) by default. Read once per
-  process unless `KQ_TUNE_LIVE=1`.
+  tile dispatch and every split-K dispatch to stderr, one `[kq qmm]` line each. Unset (off) by
+  default. Read once per process unless `KQ_TUNE_LIVE=1`.
+- `KQ_SPLITK_F32` - partial dtype of the split-K routes (`splitk`, `nax_splitk`, the
+  `KQ_QMM_MIDM` band, and `verify_mma` and `verify_nax` when they split K). `1` stores each K
+  slice's partial in float, so the fold rounds the result once, as the unsplit kernels do. `0`
+  stores the partials in the activation dtype, which rounds each slice once more before the fold;
+  it keeps the previous kernels for A/B runs. Float activations store float partials either way.
+  Default `1`. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_NAX_SMALL_BM` - small-M routing. `0` restores the old routing (mat-vec paths below M 13 and
   no BM=32 tile), `2` forces BM=32 for policy-excluded codecs, unset or `1` follows the per-codec
   policy. Read once per process unless `KQ_TUNE_LIVE=1`.
@@ -249,6 +255,8 @@ Tuning levers (defaults are right for normal use):
 - `KQ_VERIFY_NAX_SPLITS` - probe lever: the split-K target for `verify_nax` in place of the
   per-codec rule (the largest divisor of the K steps at or under the value is used). Unset (off)
   by default.
+- `KQ_VERIFY_MMA_SPLITS` - probe lever: the same split-K target for `verify_mma`; `1` runs it
+  unsplit. Unset (off) by default. Read live per call.
 - `KQ_VERIFY_NAX_Q4_0_SB` - probe lever: `0` keeps `q4_0` on the two-block `verify_nax` kernel at
   a K that is a multiple of 256, where the eight-block kernel runs by default. Read live per call.
 - `KQ_MV_EXT_SB` / `KQ_MV_EXT_NX` / `KQ_MV_EXT_HD` - `mv_ext` activation-traffic experiments:

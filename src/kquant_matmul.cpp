@@ -557,6 +557,30 @@ static bool kq_nax_swizzle_on() {
   return kq_tune_live() ? kq_env_int("KQ_NAX_SWIZZLE", 0) != 0 : cached;
 }
 
+// KQ_SPLITK_F32: 1 (default) = the split-K routes (qmm_splitk, verify_mma,
+// verify_nax, qmm_nax_splitk) store their K-slice partials in float, so
+// the fold rounds the result once; 0 = partials in the activation dtype,
+// which rounds every slice once more before the fold (the previous
+// behavior). Read once per process unless KQ_TUNE_LIVE=1.
+static bool kq_splitk_f32() {
+  static const bool cached = kq_env_int("KQ_SPLITK_F32", 1) != 0;
+  return kq_tune_live() ? kq_env_int("KQ_SPLITK_F32", 1) != 0 : cached;
+}
+
+// Partial dtype and kernel name suffix of a split-K call. Float
+// activations store float partials through the plain kernels either way.
+struct KqSplitkPartials {
+  mx::Dtype dtype;
+  std::string suffix;
+};
+
+static KqSplitkPartials kq_splitk_partials(mx::Dtype dt) {
+  if (dt != mx::float32 && kq_splitk_f32()) {
+    return {mx::float32, "_pf32"};
+  }
+  return {dt, ""};
+}
+
 // KQ_QMM_LOG set (any value): the qmm tiles log the kernel name and shape
 // of each dispatch to stderr.
 static bool kq_qmm_log() {
@@ -925,10 +949,10 @@ void qmm(
 // [5376 x 21504]) and the in-tile K walk serializes, capping qmm/NAX at
 // 160-257 GB/s while mv_ext decays past M~4 on L2 activation re-reads.
 // Partitioning K across grid.z multiplies threadgroup count by `splits`;
-// each slice writes a T partial tile and a second tiny pass folds them in
-// f32. Slice starts must land on wire-block boundaries, so the partition
-// is a multiple of group_size (the caller guarantees splits divides
-// K / group_size). Non-batched transpose shapes only.
+// each slice writes a float partial tile (T under KQ_SPLITK_F32=0) and a
+// second tiny pass folds them in f32. Slice starts must land on wire-block
+// boundaries, so the partition is a multiple of group_size (the caller
+// guarantees splits divides K / group_size). Non-batched transpose shapes only.
 void qmm_splitk(
     const array& x,
     const array& w,
@@ -961,8 +985,9 @@ void qmm_splitk(
   const int bn = small ? 64 : 32;
   const int k_partition = (K / group_size / splits) * group_size;
   const int part_stride = M * N;
+  const KqSplitkPartials pp = kq_splitk_partials(x.dtype());
 
-  array partials({splits, M, N}, x.dtype(), nullptr, {});
+  array partials({splits, M, N}, pp.dtype, nullptr, {});
   partials.set_data(mx::allocator::malloc(partials.nbytes()));
 
   auto& ce = mx::metal::get_command_encoder(s);
@@ -982,7 +1007,8 @@ void qmm_splitk(
       group_size,
       "_b_",
       bits,
-      aligned ? "_alN_true" : "_alN_false");
+      aligned ? "_alN_true" : "_alN_false",
+      pp.suffix);
 
   auto kernel = kq_get_kernel(d, kname);
   ce.set_compute_pipeline_state(kernel);
@@ -999,9 +1025,10 @@ void qmm_splitk(
   ce.set_bytes(part_stride, c++);
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, splits);
+  kq_log_qmm(kname, M, N, K, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 
-  std::string aname = "kquant_qmm_splitk_accum_" + type_string;
+  std::string aname = "kquant_qmm_splitk_accum_" + type_string + pp.suffix;
   auto accum = kq_get_kernel(d, aname);
   ce.set_compute_pipeline_state(accum);
   const int n_elems = M * N;
@@ -1044,7 +1071,9 @@ void verify_mma(
   auto& ce = mx::metal::get_command_encoder(s);
   // One split writes out directly; the partials and the fold exist only
   // for splits > 1.
-  array partials({splits, M, N}, x.dtype(), nullptr, {});
+  const KqSplitkPartials pp = splits > 1 ? kq_splitk_partials(x.dtype())
+                                         : KqSplitkPartials{x.dtype(), ""};
+  array partials({splits, M, N}, pp.dtype, nullptr, {});
   if (splits > 1) {
     partials.set_data(mx::allocator::malloc(partials.nbytes()));
     ce.add_temporary(partials);
@@ -1060,7 +1089,8 @@ void verify_mma(
       "_gs_",
       group_size,
       "_b_",
-      bits);
+      bits,
+      pp.suffix);
 
   auto kernel = kq_get_kernel(d, kname);
   ce.set_compute_pipeline_state(kernel);
@@ -1077,12 +1107,13 @@ void verify_mma(
   ce.set_bytes(part_stride, c++);
   MTL::Size group_dims(256, 1, 1);
   MTL::Size grid_dims((N + rows - 1) / rows, 1, splits);
+  kq_log_qmm(kname, M, N, K, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
   if (splits == 1) {
     return;
   }
 
-  std::string aname = "kquant_qmm_splitk_accum_" + type_string;
+  std::string aname = "kquant_qmm_splitk_accum_" + type_string + pp.suffix;
   auto accum = kq_get_kernel(d, aname);
   ce.set_compute_pipeline_state(accum);
   const int n_elems = M * N;
@@ -1156,7 +1187,9 @@ void verify_nax(
   const int part_stride = M * N;
 
   auto& ce = mx::metal::get_command_encoder(s);
-  array partials({splits, M, N}, x.dtype(), nullptr, {});
+  const KqSplitkPartials pp = splits > 1 ? kq_splitk_partials(x.dtype())
+                                         : KqSplitkPartials{x.dtype(), ""};
+  array partials({splits, M, N}, pp.dtype, nullptr, {});
   if (splits > 1) {
     partials.set_data(mx::allocator::malloc(partials.nbytes()));
     ce.add_temporary(partials);
@@ -1174,7 +1207,8 @@ void verify_nax(
       "_gs_",
       group_size,
       "_b_",
-      bits);
+      bits,
+      pp.suffix);
 
   auto kernel = kq_get_kernel(d, kname);
   ce.set_compute_pipeline_state(kernel);
@@ -1191,12 +1225,13 @@ void verify_nax(
   ce.set_bytes(part_stride, c++);
   MTL::Size group_dims(128, 1, 1);
   MTL::Size grid_dims((N + 127) / 128, 1, splits);
+  kq_log_qmm(kname, M, N, K, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
   if (splits == 1) {
     return;
   }
 
-  std::string aname = "kquant_qmm_splitk_accum_" + type_string;
+  std::string aname = "kquant_qmm_splitk_accum_" + type_string + pp.suffix;
   auto accum = kq_get_kernel(d, aname);
   ce.set_compute_pipeline_state(accum);
   const int n_elems = M * N;
@@ -1238,8 +1273,9 @@ void qmm_nax_splitk(
   constexpr int bn = 64;
   constexpr int wm = 2, wn = 2;
   const int part_stride = M * N;
+  const KqSplitkPartials pp = kq_splitk_partials(x.dtype());
 
-  array partials({splits, M, N}, x.dtype(), nullptr, {});
+  array partials({splits, M, N}, pp.dtype, nullptr, {});
   partials.set_data(mx::allocator::malloc(partials.nbytes()));
 
   auto& ce = mx::metal::get_command_encoder(s);
@@ -1260,7 +1296,8 @@ void qmm_nax_splitk(
       "_bm",
       bm,
       "_bn64_bk64_wm2_wn2",
-      aligned ? "_alN_true" : "_alN_false");
+      aligned ? "_alN_true" : "_alN_false",
+      pp.suffix);
 
   auto kernel = kq_get_kernel(d, kname);
   ce.set_compute_pipeline_state(kernel);
@@ -1277,9 +1314,10 @@ void qmm_nax_splitk(
   ce.set_bytes(part_stride, c++);
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, splits);
+  kq_log_qmm(kname, M, N, K, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 
-  std::string aname = "kquant_qmm_splitk_accum_" + type_string;
+  std::string aname = "kquant_qmm_splitk_accum_" + type_string + pp.suffix;
   auto accum = kq_get_kernel(d, aname);
   ce.set_compute_pipeline_state(accum);
   const int n_elems = M * N;
@@ -1829,8 +1867,13 @@ static int kq_nax_split(int target, int nblk, int& per) {
 
 // verify_mma split count. Split-K fills the grid for the projection
 // shapes; a head-sized N already has more threadgroups than the GPU holds,
-// and there the partials only cost traffic.
+// and there the partials only cost traffic. KQ_VERIFY_MMA_SPLITS=<n> sets
+// the target instead (probe lever, read live; 1 runs unsplit).
 static int kq_verify_mma_splits(int N, int K, int group_size, int rows) {
+  const int env = kq_env_int("KQ_VERIFY_MMA_SPLITS", 0);
+  if (env > 0) {
+    return kq_split_count(env, K / group_size);
+  }
   return (N + rows - 1) / rows >= 1024 ? 1 : kq_split_count(16, K / group_size);
 }
 

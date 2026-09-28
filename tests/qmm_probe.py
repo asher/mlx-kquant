@@ -5,7 +5,13 @@ test that sets them needs a fresh interpreter. ``run_probe`` starts one with
 a clean ``KQ_*`` environment, runs a list of ``quantized_matmul`` calls,
 and returns per call the ``KQ_QMM_LOG`` lines it printed (kernel name and
 grid), its error if it raised, and its relative Frobenius error against a
-float64 reference built from ``kq.dequantize`` weights.
+float64 reference built from ``kq.dequantize`` weights. A call with
+``"r2": true`` also gets ``rel2`` against those weights rounded to the
+activation dtype, and ``floor1``/``floor2``, the error of rounding each
+reference to the output dtype. A call with ``"ulp_vs": i`` gets ``ulp``,
+the largest ulp distance to call ``i``'s output, and ``rdiff``, the
+relative Frobenius distance to it. ``"design": "lead"`` draws nonnegative
+weights and activations whose first K column is 1024.
 
 Under ``KQUANT_FORCE_CPU`` the child runs on the CPU device and never
 touches Metal, so the same probe covers both streams.
@@ -35,13 +41,24 @@ from kqref import is_synth, synth_wire
 
 DT = {"bfloat16": mx.bfloat16, "float16": mx.float16}
 _weights = {}
+_dequant = {}
 
 
-def weights(codec, n, k):
-    key = (codec, n, k)
+def weights(codec, n, k, design):
+    # design "lead": nonnegative weights, so every partial sum only grows.
+    # design "tiled": 64 quantized rows repeated to n, for wide N at little
+    # quantize cost.
+    key = (codec, n, k, design)
     if key not in _weights:
         _, _, bpb, wpb = CODEC_GEOMETRY[codec]
-        if is_synth(codec) or codec in DECODE_ONLY_CODECS:
+        if design == "lead":
+            wf = mx.abs(mx.random.normal((n, k), key=mx.random.key(2))) * 0.05
+            w, s = kq.quantize(wf, codec)
+        elif design == "tiled":
+            wf = mx.random.normal((64, k), key=mx.random.key(4)) * 0.1
+            w1, s = kq.quantize(wf, codec)
+            w = mx.contiguous(mx.tile(w1, (n // 64, 1)))
+        elif is_synth(codec) or codec in DECODE_ONLY_CODECS:
             rng = np.random.default_rng(n * 131 + k)
             wire = synth_wire(rng, codec, bpb, n * (k // wpb))
             w = mx.array(wire.reshape(n, (k // wpb) * bpb))
@@ -49,31 +66,68 @@ def weights(codec, n, k):
         else:
             wf = mx.random.normal((n, k), key=mx.random.key(n * 7 + k)) * 0.1
             w, s = kq.quantize(wf, codec)
-        wd = kq.dequantize(w, s, codec, dtype=mx.float32)
-        mx.eval(w, s, wd)
-        _weights[key] = (w, s, np.array(wd).astype(np.float64))
+        mx.eval(w, s)
+        _weights[key] = (w, s)
     return _weights[key]
 
 
-def activations(shape, dtype, layout, seed):
+def dequantized(codec, n, k, design):
+    # The float64 weights of weights(), built on the first check.
+    key = (codec, n, k, design)
+    if key not in _dequant:
+        w, s = weights(codec, n, k, design)
+        wd = kq.dequantize(w, s, codec, dtype=mx.float32)
+        _dequant[key] = np.array(wd).astype(np.float64)
+    return _dequant[key]
+
+
+def activations(shape, dtype, layout, seed, design):
+    # design "lead": nonnegative activations whose first K column is 1024,
+    # so the first K slice of a split holds most of each output.
     key = mx.random.key(seed)
+    lead = design == "lead"
+
+    def draw(s):
+        if lead:
+            return mx.abs(mx.random.normal(s, key=key)) * 0.01
+        return mx.random.normal(s, key=key) * 0.5
+
     if layout == "dense":
-        x = (mx.random.normal(shape, key=key) * 0.5).astype(dtype)
+        x = draw(shape)
+        if lead:
+            x[..., 0] = 1024.0
+        x = x.astype(dtype)
         mx.eval(x)
         return x
     if layout == "transposed":
         # A lazy transposed view: the op sees an unevaluated swapaxes.
         t = shape[:-2] + [shape[-1], shape[-2]]
-        xt = (mx.random.normal(t, key=key) * 0.5).astype(dtype)
+        xt = draw(t)
+        if lead:
+            xt[..., 0, :] = 1024.0
+        xt = xt.astype(dtype)
         mx.eval(xt)
         return mx.swapaxes(xt, -1, -2)
     if layout == "strided":
         # Every other column of a wider array.
         wide = shape[:-1] + [2 * shape[-1]]
-        xw = (mx.random.normal(wide, key=key) * 0.5).astype(dtype)
+        xw = draw(wide)
+        if lead:
+            xw[..., 0] = 1024.0
+        xw = xw.astype(dtype)
         mx.eval(xw)
         return xw[..., ::2]
     raise ValueError(layout)
+
+
+def rel(a, b):
+    return float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-30))
+
+
+def rounded(a, dtype):
+    # a rounded to dtype, back in float64.
+    r = mx.array(a.astype(np.float32)).astype(dtype).astype(mx.float32)
+    return np.array(r).astype(np.float64)
 
 
 def ordered(bits):
@@ -83,6 +137,7 @@ def ordered(bits):
 
 outs = []
 results = []
+_refs = {}
 for i, c in enumerate(spec["calls"]):
     for name, value in c.get("env", {}).items():
         if value is None:
@@ -90,8 +145,11 @@ for i, c in enumerate(spec["calls"]):
         else:
             os.environ[name] = str(value)
     dtype = DT[c.get("dtype", "bfloat16")]
-    w, s, wd = weights(c["codec"], c["n"], c["shape"][-1])
-    x = activations(list(c["shape"]), dtype, c.get("layout", "dense"), c.get("seed", i))
+    design = c.get("design", "normal")
+    w, s = weights(c["codec"], c["n"], c["shape"][-1], design)
+    x = activations(
+        list(c["shape"]), dtype, c.get("layout", "dense"), c.get("seed", i), design
+    )
     os.write(2, f"[probe] {i}\n".encode())
     res = {"i": i, "error": None, "rel": None, "ulp": None}
     try:
@@ -104,15 +162,39 @@ for i, c in enumerate(spec["calls"]):
         continue
     outs.append(y)
     if spec.get("check", True):
-        xn = np.array(x.astype(mx.float32)).astype(np.float64)
-        ref = xn @ wd.T
+        # Calls that differ only in env share their references.
+        rkey = (
+            c["codec"], c["n"], tuple(c["shape"]), str(dtype),
+            c.get("layout", "dense"), c.get("seed", i), design,
+        )
+        if rkey not in _refs:
+            wd = dequantized(c["codec"], c["n"], c["shape"][-1], design)
+            xn = np.array(x.astype(mx.float32)).astype(np.float64)
+            _refs[rkey] = {"xn": xn, "ref": xn @ wd.T}
+        refs = _refs[rkey]
+        ref = refs["ref"]
         got = np.array(y.astype(mx.float32)).astype(np.float64)
         res["rel"] = float(np.linalg.norm(got - ref) / (np.linalg.norm(ref) + 1e-30))
+        if c.get("r2"):
+            # R2: weights rounded to the activation dtype. floor1 and floor2:
+            # the error of rounding each reference to the output dtype.
+            if "ref2" not in refs:
+                wd = dequantized(c["codec"], c["n"], c["shape"][-1], design)
+                refs["ref2"] = refs["xn"] @ rounded(wd, dtype).T
+                refs["floor1"] = rel(rounded(ref, dtype), ref)
+                refs["floor2"] = rel(rounded(refs["ref2"], dtype), refs["ref2"])
+            res["rel2"] = rel(got, refs["ref2"])
+            res["floor1"] = refs["floor1"]
+            res["floor2"] = refs["floor2"]
     base = c.get("ulp_vs")
     if base is not None and outs[base] is not None:
         a = np.array(y.view(mx.uint16))
         b = np.array(outs[base].view(mx.uint16))
         res["ulp"] = int(np.abs(ordered(a) - ordered(b)).max())
+        # Relative Frobenius distance to that call's output.
+        yb = np.array(outs[base].astype(mx.float32)).astype(np.float64)
+        ya = np.array(y.astype(mx.float32)).astype(np.float64)
+        res["rdiff"] = rel(ya, yb)
     results.append(res)
 print(json.dumps(results))
 """

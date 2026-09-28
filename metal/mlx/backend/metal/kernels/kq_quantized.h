@@ -107,6 +107,7 @@ MLX_MTL_CONST int SIMD_SIZE = 32;
 
 struct kq_empty {};
 
+// U is the type of y: T for a whole matmul, float for a split-K partial.
 template <
     typename T,
     typename LoaderW,
@@ -115,11 +116,12 @@ template <
     const int BK = 32,
     const int BN = 32,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    typename U = T>
 METAL_FUNC void kq_qmm_t_impl(
     const device uint8_t* w,
     const device T* x,
-    device T* y,
+    device U* y,
     threadgroup T* Xs,
     threadgroup T* Ws,
     const constant int& K,
@@ -140,7 +142,7 @@ METAL_FUNC void kq_qmm_t_impl(
 
   using mma_t = mlx::steel::BlockMMA<
       T,
-      T,
+      U,
       BM,
       BN,
       BK,
@@ -1527,12 +1529,13 @@ template <
     int group_size,
     int bits,
     bool aligned_N,
-    int small_bm = 0>
+    int small_bm = 0,
+    typename U = T>
 [[kernel]] void kq_q8_0_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
     const device T* x,
-    device T* y,
+    device U* y,
     const constant int& K,
     const constant int& N,
     const constant int& M,
@@ -1565,7 +1568,7 @@ template <
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, U>(
       wl,
       x,
       y,
@@ -2526,12 +2529,13 @@ template <
     int group_size,
     int bits,
     bool aligned_N,
-    int small_bm = 0>
+    int small_bm = 0,
+    typename U = T>
 [[kernel]] void kq_q5_1_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
     const device T* x,
-    device T* y,
+    device U* y,
     const constant int& K,
     const constant int& N,
     const constant int& M,
@@ -2564,7 +2568,7 @@ template <
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, U>(
       wl,
       x,
       y,

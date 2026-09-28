@@ -852,12 +852,13 @@ using KqPtq1_0BlockLoader = KqPrismBlockLoader<
       int group_size,                                                        \
       int bits,                                                              \
       bool aligned_N,                                                        \
-      int small_bm = 0>                                                      \
+      int small_bm = 0,                                                      \
+      typename U = T>                                                        \
   [[kernel]] void kq_##CODEC##_qmm_t_splitk(                                 \
       const device uint8_t* w,                                               \
       const device uint8_t* /* scales */,                                    \
       const device T* x,                                                     \
-      device T* y,                                                           \
+      device U* y,                                                           \
       const constant int& K,                                                 \
       const constant int& N,                                                 \
       const constant int& M,                                                 \
@@ -881,7 +882,7 @@ using KqPtq1_0BlockLoader = KqPrismBlockLoader<
     auto wl = w;                                                             \
     wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block; \
     y += tid.z * static_cast<int64_t>(split_k_partition_stride);             \
-    kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(                \
+    kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, U>(             \
         wl,                                                                  \
         x,                                                                   \
         y,                                                                   \

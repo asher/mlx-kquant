@@ -52,11 +52,11 @@ METAL_FUNC void kq_vmma_step(
   }
 }
 
-template <typename T, typename Codec, int NT>
+template <typename T, typename Codec, int NT, typename U = T>
 METAL_FUNC void kq_verify_mma_impl(
     const device uint8_t* w,
     const device T* x,
-    device T* y,
+    device U* y,
     const constant int& K,
     const constant int& N,
     const constant int& M,
@@ -116,10 +116,10 @@ METAL_FUNC void kq_verify_mma_impl(
     const int nt = n + 8 * t;
     if (nt < N) {
       if (fn < M) {
-        y[fn * N + nt] = static_cast<T>(c[t].x);
+        y[fn * N + nt] = static_cast<U>(c[t].x);
       }
       if (fn + 1 < M) {
-        y[(fn + 1) * N + nt] = static_cast<T>(c[t].y);
+        y[(fn + 1) * N + nt] = static_cast<U>(c[t].y);
       }
     }
   }
@@ -128,12 +128,12 @@ METAL_FUNC void kq_verify_mma_impl(
 // Entry point: qmm_t_splitk's buffer layout, grid (ceil(N / (64 NT)), 1,
 // splits), 256 threads.
 #define KQ_DEFINE_VERIFY_MMA_KERNEL(CODEC, TRAITS, NT)                   \
-  template <typename T, int group_size, int bits>                        \
+  template <typename T, int group_size, int bits, typename U = T>        \
   [[kernel]] void kq_##CODEC##_verify_mma(                               \
       const device uint8_t* w,                                           \
       const device uint8_t* /* scales */,                                \
       const device T* x,                                                 \
-      device T* y,                                                       \
+      device U* y,                                                       \
       const constant int& K,                                             \
       const constant int& N,                                             \
       const constant int& M,                                             \
@@ -145,7 +145,7 @@ METAL_FUNC void kq_verify_mma_impl(
       uint simd_lid [[thread_index_in_simdgroup]]) {                     \
     static_assert(group_size == TRAITS::block_k, #CODEC " block width"); \
     threadgroup half XsT[KQ_VMMA_KC * 8];                                \
-    kq_verify_mma_impl<T, TRAITS, NT>(                                   \
+    kq_verify_mma_impl<T, TRAITS, NT, U>(                                \
         w,                                                               \
         x,                                                               \
         y + tid.z * static_cast<int64_t>(split_k_partition_stride),      \

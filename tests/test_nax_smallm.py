@@ -21,6 +21,7 @@ Run locally on GPU (per-phase NAX gate, not hosted CI).
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import subprocess
@@ -32,6 +33,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 import mlx.core as mx  # noqa: E402
 from kqref import synth_wire  # noqa: E402
+from qmm_probe import run_probe  # noqa: E402
 from test_codecs import CODECS  # noqa: E402
 
 import mlx_kquant as kq  # noqa: E402
@@ -523,24 +525,37 @@ def test_nax_splitk_ragged(codec, dtype, monkeypatch):
         mx.eval(kq.quantized_matmul(x, w, s, codec, transpose=True))
 
 
+def _split_depths(calls, env):
+    """Grid depth, the K slice count, of the one kernel each call logs. The
+    split routes fold float partials, so the slice count rarely shows in the
+    output bits; KQ_QMM_LOG names it."""
+    res = run_probe(calls, env={**env, "KQ_QMM_LOG": "1"}, check=False)
+    depths = []
+    for c, r in zip(calls, res, strict=True):
+        assert r["error"] is None, (c, r["error"])
+        assert len(r["kernels"]) == 1, (c, r["kernels"])
+        depths.append(r["kernels"][0][1][2])
+    return depths
+
+
 # Ragged slices replace the divisor count only when they more than double
 # it. 68 units divide into 4 and run as 14 ragged slices. 35 units divide
 # into 7, and 12 ragged slices would not double that.
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX tile only")
 @pytest.mark.parametrize("units, ragged", [(68, True), (35, False)])
 def test_nax_splitk_ragged_rule(units, ragged, monkeypatch):
-    monkeypatch.delenv("KQ_SPLITK_RAGGED", raising=False)
     k = 256 * units
+    calls = [
+        {"codec": "q4_k", "shape": [8, k], "n": 256, "env": {"KQ_SPLITK_RAGGED": v}}
+        for v in ("0", "1")
+    ]
+    env = {"KQ_QMM_ROUTE": "nax_splitk", "KQ_QMM_ROUTE_STRICT": "1"}
+    d0, d1 = _split_depths(calls, env)
+    assert (d0 != d1) == ragged, (d0, d1)
+    monkeypatch.setenv("KQ_SPLITK_RAGGED", "1")
     w, s, ref_w = _verify_mma_setup("q4_k", 256, k=k)
     monkeypatch.setenv("KQ_QMM_ROUTE", "nax_splitk")
     monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
-    x = (mx.random.normal((8, k)) * 0.5).astype(mx.bfloat16)
-    ys = {}
-    for v in ("0", "1"):
-        monkeypatch.setenv("KQ_SPLITK_RAGGED", v)
-        ys[v] = kq.quantized_matmul(x, w, s, "q4_k", transpose=True)
-        mx.eval(ys[v])
-    assert _bits_equal(ys["0"], ys["1"]) != ragged
     _sweep("q4_k", w, s, ref_w, 256, ms=[8], k=k)
 
 
@@ -771,14 +786,14 @@ def test_verify_nax_half_word_weight_alignment(codec, offset, monkeypatch):
 # or above max(ceil(1280 / simdgroups), ceil(K / 2560)), at most 16, else
 # the largest divisor under it. N 3072, K 4096 targets 14 and takes 16 of
 # 32 steps. N 1024, K 5120 targets 16, which does not divide 40 steps, and
-# takes 10. N 20480, K 10240 targets 4 from the K walk. The default count
-# runs bit for bit like the count forced through the lever, and unlike the
-# neighbouring count.
+# takes 10. N 20480, K 10240 targets 4 from the K walk. The default runs
+# that many slices, as the lever forcing it does, and bit for bit like it;
+# the lever also moves the count to the neighbouring one.
+Q6_K_SPLITS = [(3072, 4096, 16, 8), (1024, 5120, 10, 8), (20480, 10240, 4, 2)]
+
+
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
-@pytest.mark.parametrize(
-    "n_out, k, count, other",
-    [(3072, 4096, 16, 8), (1024, 5120, 10, 8), (20480, 10240, 4, 2)],
-)
+@pytest.mark.parametrize("n_out, k, count, other", Q6_K_SPLITS)
 def test_verify_nax_q6_k_split_rule(n_out, k, count, other, monkeypatch):
     wf = mx.random.normal((64, k), key=mx.random.key(4)) * 0.1
     w1, s = kq.quantize(wf, "q6_k")
@@ -800,7 +815,7 @@ def test_verify_nax_q6_k_split_rule(n_out, k, count, other, monkeypatch):
 
     y_def = run()
     assert _bits_equal(y_def, run(count))
-    assert not _bits_equal(y_def, run(other))
+    assert _verify_nax_depths()[("q6_k", n_out, k)] == (count, count, other)
     ref = x.astype(mx.float32) @ ref_w
     err = float(mx.abs(y_def[:, :64].astype(mx.float32) - ref).max())
     assert err < 2e-2 * float(mx.abs(ref).max())
@@ -815,8 +830,9 @@ def test_verify_nax_q6_k_split_rule(n_out, k, count, other, monkeypatch):
 # takes 7 over 35. N 2560, K 9728 takes 38 at 2560 and 19 at 640, where 2
 # splits ran up to 1.65x slower than 19. N 6144, K 5120 in 256-weight steps
 # takes 2 over 10. N 1024, K 5120 takes 20, above 16, which on q4_k is
-# every K step. The default count runs bit for bit like the count forced
-# through the lever, and unlike the neighbouring count.
+# every K step. The default runs that many slices, as the lever forcing it
+# does, and bit for bit like it; the lever also moves the count to the
+# neighbouring one.
 WAVE_SPLITS = [
     *[
         (codec, n_out, k, count, other)
@@ -835,6 +851,30 @@ WAVE_SPLITS = [
     ("q4_0", 6144, 5120, 2, 10),
     ("q4_0", 2560, 9728, 19, 38),
 ]
+
+
+@functools.cache
+def _verify_nax_depths():
+    """(default, count, other) slice counts per (codec, N, K) of the split
+    rule tests, from one probe process."""
+    cases = [("q6_k", n, k, c, o) for n, k, c, o in Q6_K_SPLITS] + WAVE_SPLITS
+    calls = [
+        {
+            "codec": codec,
+            "shape": [8, k],
+            "n": n_out,
+            "design": "tiled",
+            "env": {"KQ_VERIFY_NAX_SPLITS": splits},
+        }
+        for codec, n_out, k, count, other in cases
+        for splits in (None, count, other)
+    ]
+    env = {"KQ_QMM_ROUTE": "verify_nax", "KQ_QMM_ROUTE_STRICT": "1"}
+    d = _split_depths(calls, env)
+    return {
+        (codec, n_out, k): tuple(d[3 * i : 3 * i + 3])
+        for i, (codec, n_out, k, _, _) in enumerate(cases)
+    }
 
 
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
@@ -860,7 +900,7 @@ def test_verify_nax_wave_split_rule(codec, n_out, k, count, other, monkeypatch):
 
     y_def = run()
     assert _bits_equal(y_def, run(count))
-    assert not _bits_equal(y_def, run(other))
+    assert _verify_nax_depths()[(codec, n_out, k)] == (count, count, other)
     ref = x.astype(mx.float32) @ ref_w
     err = float(mx.abs(y_def[:, :64].astype(mx.float32) - ref).max())
     assert err < 2e-2 * float(mx.abs(ref).max())
@@ -1305,7 +1345,8 @@ def test_nax_qmv_levers(monkeypatch):
 
 
 # Probe for the process-static levers: prints, per named route, whether the
-# default output equals that route's output bit for bit.
+# default output equals that route's output bit for bit, and marks each run
+# on stderr ahead of the kernels KQ_QMM_LOG names for it.
 _STATIC_PROBE = """
 import json, os, sys
 import mlx.core as mx
@@ -1318,12 +1359,25 @@ def run(route=None):
     os.environ.pop("KQ_QMM_ROUTE", None)
     if route:
         os.environ["KQ_QMM_ROUTE"] = route
+    os.write(2, ("[run] " + (route or "default") + chr(10)).encode())
     y = kq.quantized_matmul(x, w, s, codec, transpose=True)
     mx.eval(y)
     return y
 y = run()
 print(json.dumps({r: bool(mx.array_equal(y, run(r)).item()) for r in sys.argv[3:]}))
 """
+
+
+def _logged_kernels(stderr):
+    """Kernel names KQ_QMM_LOG printed per [run] marker of _STATIC_PROBE."""
+    names, cur = {}, None
+    for line in stderr.splitlines():
+        if line.startswith("[run] "):
+            cur = line.split()[1]
+            names[cur] = []
+        elif line.startswith("[kq qmm] ") and cur is not None:
+            names[cur].append(line.split()[2])
+    return names
 
 
 # KQ_VERIFY_EXT and KQ_QMM_SPLITK are read once per process, so each case
@@ -1346,6 +1400,7 @@ def test_nax_small_m_yields_to_static_levers(lever, codec, m, expect, other):
     env = {k: v for k, v in os.environ.items() if not k.startswith("KQ_")}
     name, value = lever.split("=")
     env[name] = value
+    env["KQ_QMM_LOG"] = "1"
     others = other.split(",")
     out = subprocess.run(
         [sys.executable, "-c", _STATIC_PROBE, codec, str(m), expect, *others],
@@ -1354,5 +1409,10 @@ def test_nax_small_m_yields_to_static_levers(lever, codec, m, expect, other):
         text=True,
         check=True,
     )
-    res = json.loads(out.stdout.strip().splitlines()[-1])
+    bits = json.loads(out.stdout.strip().splitlines()[-1])
+    names = _logged_kernels(out.stderr)
+    # A route matches the default when its output bits and its logged
+    # kernels both do: split routes that fold float partials can agree in
+    # every bit.
+    res = {r: bits[r] and names[r] == names["default"] for r in bits}
     assert res[expect] and not any(res[o] for o in others), (lever, codec, m, res)

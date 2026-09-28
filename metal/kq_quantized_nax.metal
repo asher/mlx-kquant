@@ -129,7 +129,12 @@
       "kquant_" #codec "_qmm_t_nax_splitk_" #type "_gs_" #gs "_b_" #bits     \
           "_bm" #bm "_bn64_bk64_wm2_wn2_alN_" #aligned_N,                    \
       kq_ ## codec ## _qmm_t_nax_splitk,                                     \
-      type, gs, bits, aligned_N, bm, 64, 2, 2)
+      type, gs, bits, aligned_N, bm, 64, 2, 2)                               \
+  instantiate_kernel(                                                        \
+      "kquant_" #codec "_qmm_t_nax_splitk_" #type "_gs_" #gs "_b_" #bits     \
+          "_bm" #bm "_bn64_bk64_wm2_wn2_alN_" #aligned_N "_pf32",            \
+      kq_ ## codec ## _qmm_t_nax_splitk,                                     \
+      type, gs, bits, aligned_N, bm, 64, 2, 2, float)
 #define instantiate_kquant_nax_splitk_bm(codec, gs, bits, bm)                \
   instantiate_kquant_nax_qmm_t_splitk(float16_t,  gs, bits, true,  bm, codec) \
   instantiate_kquant_nax_qmm_t_splitk(float16_t,  gs, bits, false, bm, codec) \
@@ -364,7 +369,12 @@ instantiate_kquant_nax_gather_seg_codec(ptq1_0, 128, 1)
   instantiate_kernel(                                                 \
       "kquant_" #codec "_verify_nax_" #type "_gs_" #gs "_b_" #bits,   \
       kq_ ## codec ## _verify_nax,                                    \
-      type, gs, bits)
+      type, gs, bits)                                                 \
+  instantiate_kernel(                                                 \
+      "kquant_" #codec "_verify_nax_" #type "_gs_" #gs "_b_" #bits    \
+          "_pf32",                                                    \
+      kq_ ## codec ## _verify_nax,                                    \
+      type, gs, bits, float)
 instantiate_kquant_verify_nax(bfloat16_t, 128, 2, pq2_0)
 instantiate_kquant_verify_nax(float16_t, 128, 2, pq2_0)
 instantiate_kquant_verify_nax(bfloat16_t, 32, 4, q4_0)

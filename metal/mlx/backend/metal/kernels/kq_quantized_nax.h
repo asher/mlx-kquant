@@ -22,11 +22,12 @@ template <
     const int WM = 2,
     const int WN = 2,
     const bool use_db = false,
-    const bool tail_ksplit = false>
+    const bool tail_ksplit = false,
+    typename U = T>
 METAL_FUNC void kq_qmm_t_nax_tgp_impl(
     const device uint8_t* w,
     const device T* x,
-    device T* y,
+    device U* y,
     threadgroup T* Ws,
     const constant int& K,
     const constant int& N,
@@ -3644,13 +3645,13 @@ KQ_NAX_DEFINE_KERNELS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
 
 // Split-K qmm_t on the NAX tile (KQ_QMM_SPLITK_NAX):
 // grid.z indexes K-slices; each slice walks k_partition_size weights from a
-// superblock-aligned start and stores a T partial tile at
-// tid.z * split_k_partition_stride. The shared kquant_qmm_splitk_accum pass
-// folds slices in f32. The host guarantees k_partition_size is a multiple
-// of both the codec superblock and BK, so every slice starts the loader at
-// kt_base 0. The last slice stops at K, so it may be shorter than the
-// others. Non-batched transpose shapes only; no swizzle (grid.y is a
-// single row tile in the target band).
+// superblock-aligned start and stores a U partial tile (float, or T under
+// KQ_SPLITK_F32=0) at tid.z * split_k_partition_stride. The shared
+// kquant_qmm_splitk_accum pass folds slices in f32. The host guarantees
+// k_partition_size is a multiple of both the codec superblock and BK, so every
+// slice starts the loader at kt_base 0. The last slice stops at K, so it may be
+// shorter than the others. Non-batched transpose shapes only; no swizzle
+// (grid.y is a single row tile in the target band).
 #define KQ_NAX_DEFINE_SPLITK_KERNEL(codec, GROUP_CONST, bits_val, LOADER)    \
   template <                                                                 \
       typename T,                                                            \
@@ -3660,12 +3661,13 @@ KQ_NAX_DEFINE_KERNELS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
       int BM,                                                                \
       int BN,                                                                \
       int WM,                                                                \
-      int WN>                                                                \
+      int WN,                                                                \
+      typename U = T>                                                        \
   [[kernel]] void kq_##codec##_qmm_t_nax_splitk(                             \
       const device uint8_t* w,                                               \
       const device uint8_t* /* scales */,                                    \
       const device T* x,                                                     \
-      device T* y,                                                           \
+      device U* y,                                                           \
       const constant int& K,                                                 \
       const constant int& N,                                                 \
       const constant int& M,                                                 \
@@ -3710,7 +3712,8 @@ KQ_NAX_DEFINE_KERNELS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
         WM,                                                                  \
         WN,                                                                  \
         kWsBufs == 2,                                                        \
-        true>(wl, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid, k_len);   \
+        true,                                                                \
+        U>(wl, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid, k_len);      \
   }
 
 KQ_NAX_DEFINE_SPLITK_KERNEL(q6_k, 256, 6, KqNaxQ6_KBlockLoader)
