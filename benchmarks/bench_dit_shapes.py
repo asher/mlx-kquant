@@ -18,10 +18,12 @@ visit and pair with every codec in it.
 
 Order: one discarded warmup pass, which also records the kernel each kq
 arm ran, then rounds of Thue-Morse slots. Each slot visits every shape in
-a fresh interleaved order. Inside a visit the arm list rotates by one per
-visit and reverses on odd slots, so a paired ratio compares calls made
-seconds apart. Round 0 is the first-round column, later rounds the settled
-column. Markdown and JSON out; the JSON keeps every sample.
+a fresh interleaved order. A visit opens with --visit-warmup discarded
+calls, since the first call after a shape switch runs slow. Inside a visit
+the arm list rotates by one per visit and reverses on odd slots, so a
+paired ratio compares calls made seconds apart. Round 0 is the first-round
+column, later rounds the settled column. Markdown and JSON out; the JSON
+keeps every sample.
 
 A versus A: --arms kq,kq_aa. Plan only: --plan-only.
 """
@@ -82,6 +84,7 @@ def plan_summary(groups, arms, rounds, slots, est_tflops):
         calls += n
         flops += n * 2.0 * g["M"] * g["K"] * g["N"]
     per_round = {"calls": calls * slots, "tflop": flops * slots / 1e12}
+    # Visit warmup calls are not counted.
     per_round["est_min"] = per_round["tflop"] / est_tflops / 60
     total_min = per_round["est_min"] * (rounds + 1.0 / slots)
     return per_round, total_min
@@ -151,6 +154,10 @@ def run_pass(dtype, groups, args, store, desc, t_start):
                 inst = inst[k:] + inst[:k]
                 if tm:
                     inst.reverse()
+                for arm, codec in inst[: args.visit_warmup]:
+                    fn = dc.make_fn(arm, codec, g, dt, store)
+                    dc.set_tile(dc.ARM_TILE.get(arm), nax)
+                    dc.time_fn(fn, 1)
                 for arm, codec in inst:
                     fn = dc.make_fn(arm, codec, g, dt, store)
                     dc.set_tile(dc.ARM_TILE.get(arm), nax)
@@ -334,6 +341,12 @@ def main():
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--slots", type=int, default=8)
     ap.add_argument("--inner", type=int, default=1, help="calls per sample")
+    ap.add_argument(
+        "--visit-warmup",
+        type=int,
+        default=1,
+        help="discarded calls at the start of each shape visit",
+    )
     ap.add_argument("--shrink", type=int, default=1, help="divide rows, K, N")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
