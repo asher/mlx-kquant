@@ -27,6 +27,11 @@ column and later rounds the settled column. Round 0 is not a cold figure:
 the GPU slows within seconds of load, and bench_dit_thermal.py gives the
 cold rate per machine.
 
+A sample is --inner calls evaluated together and divided, so the sync
+per evaluation is spread; shapes whose fastest arm runs under
+--min-sample-ms per call take more calls, up to --max-inner, and every arm
+of a shape uses the same count.
+
 Per cell, ratios carry a 95 percent CI of the paired median, from order
 statistics; its half-width is the cell's noise floor. Per op, the pooled
 median of all settled pairs is the aggregate, reported beside the spread
@@ -40,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import sys
@@ -84,15 +90,15 @@ def arm_instances(group, arms):
     return out
 
 
-def plan_summary(groups, arms, rounds, slots, est_tflops):
+def plan_summary(groups, arms, rounds, slots, est_tflops, inner):
     calls = 0
     flops = 0.0
     for g in groups:
-        n = len(arm_instances(g, arms))
+        n = len(arm_instances(g, arms)) * inner
         calls += n
         flops += n * 2.0 * g["M"] * g["K"] * g["N"]
     per_round = {"calls": calls * slots, "tflop": flops * slots / 1e12}
-    # Visit warmup calls are not counted.
+    # Visit warmup calls and the extra calls of fast shapes are not counted.
     per_round["est_min"] = per_round["tflop"] / est_tflops / 60
     total_min = per_round["est_min"] * (rounds + 1.0 / slots)
     return per_round, total_min
@@ -128,6 +134,7 @@ def run_pass(dtype, groups, args, store, desc, t_start):
     arch = desc["architecture"]
     kernels = {}
     errors = {}
+    calib = {}
     samples = [dict() for _ in groups]
 
     # Warmup pass, discarded; records the kernel each kq arm dispatches.
@@ -140,9 +147,15 @@ def run_pass(dtype, groups, args, store, desc, t_start):
                 with dc.KernelLog() as log:
                     mx.eval(fn())
                 kernels[(gi, key)] = log.kernels[-1] if log.kernels else None
+                calib.setdefault(gi, []).append(dc.time_fn(fn, 1))
             except ValueError as e:
                 errors[(gi, key)] = str(e)
             dc.set_tile(None, nax)
+    inner = []
+    for gi in range(len(groups)):
+        fastest = min(calib.get(gi, [args.min_sample_ms]))
+        n = math.ceil(args.min_sample_ms / max(fastest, 1e-3))
+        inner.append(min(args.max_inner, max(args.inner, n)))
     print(f"[{dtype}] warmup done at {time.perf_counter() - t_start:.0f} s", flush=True)
 
     visit = 0
@@ -167,7 +180,7 @@ def run_pass(dtype, groups, args, store, desc, t_start):
                 for arm, codec in inst:
                     fn = dc.make_fn(arm, codec, g, dt, store)
                     dc.set_tile(dc.ARM_TILE.get(arm), nax)
-                    ms = dc.time_fn(fn, args.inner)
+                    ms = dc.time_fn(fn, inner[gi])
                     t = time.perf_counter() - t_start
                     samples[gi].setdefault(cell_key(arm, codec), []).append(
                         (visit, r, s, t, ms)
@@ -236,7 +249,7 @@ def run_pass(dtype, groups, args, store, desc, t_start):
                     ratios[name] = split_stats(pr, args.rounds, 0, 1)
                     ratios[name]["pairs"] = [[r, v] for r, v in pr]
             cells.append({"codec": codec, "arms": arms, "ratios": ratios})
-        out_groups.append(dict(g, shared=shared, cells=cells))
+        out_groups.append(dict(g, inner=inner[gi], shared=shared, cells=cells))
     return out_groups
 
 
@@ -292,7 +305,8 @@ def markdown(result):
     lines = ["# DiT shape arms", "", dc.descriptor_md(result["machine"]), ""]
     a = result["args"]
     lines.append(
-        f"Rounds {a['rounds']} x {a['slots']} Thue-Morse slots, inner {a['inner']}, "
+        f"Rounds {a['rounds']} x {a['slots']} Thue-Morse slots, inner {a['inner']} "
+        f"(up to {a['max_inner']} under {a['min_sample_ms']} ms per call), "
         f"shrink {a['shrink']}. Times are settled medians in ms (all rounds when "
         "there is one); ratios are medians of per-visit paired ratios; "
         "round 0 = median of round 0, which is not a cold figure (see "
@@ -405,6 +419,13 @@ def main():
     ap.add_argument("--slots", type=int, default=8)
     ap.add_argument("--inner", type=int, default=3, help="calls per sample")
     ap.add_argument(
+        "--min-sample-ms",
+        type=float,
+        default=10.0,
+        help="shapes faster than this per call take more calls per sample",
+    )
+    ap.add_argument("--max-inner", type=int, default=64)
+    ap.add_argument(
         "--visit-warmup",
         type=int,
         default=1,
@@ -439,7 +460,7 @@ def main():
         heavy_codecs = parse_list(args.heavy_codecs)
     groups = build_groups(args, heavy_codecs)
     per_round, total_min = plan_summary(
-        groups, args.arms, args.rounds, args.slots, args.est_tflops
+        groups, args.arms, args.rounds, args.slots, args.est_tflops, args.inner
     )
     cells = sum(len(g["codecs"]) for g in groups)
     print(

@@ -286,14 +286,16 @@ def make_fn(arm, codec, g, dt, store):
 
 
 def time_fn(fn, inner):
+    """ms per call over `inner` calls evaluated together, so one sync (about
+    0.17 ms) is spread over all of them."""
     import mlx.core as mx
 
     t0 = time.perf_counter()
-    for _ in range(inner):
-        y = fn()
-        mx.eval(y)
-        del y
-    return (time.perf_counter() - t0) * 1e3 / inner
+    ys = [fn() for _ in range(inner)]
+    mx.eval(*ys)
+    ms = (time.perf_counter() - t0) * 1e3 / inner
+    del ys
+    return ms
 
 
 def cell(family, op, rows, batch, shrink=1):
