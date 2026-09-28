@@ -22,8 +22,10 @@ a fresh interleaved order. A visit opens with --visit-warmup discarded
 calls, since the first call after a shape switch runs slow. Inside a visit
 the arm list reverses on odd slots, so the two calls of every pair swap
 order with the Thue-Morse bit and a round of 8 slots splits each pair 4/4.
-A paired ratio compares calls made seconds apart. Round 0 is the
-first-round column, later rounds the settled column.
+A paired ratio compares calls made seconds apart. Round 0 gets its own
+column and later rounds the settled column. Round 0 is not a cold figure:
+the GPU slows within seconds of load, and bench_dit_thermal.py gives the
+cold rate per machine.
 
 Per cell, ratios carry a 95 percent CI of the paired median, from order
 statistics; its half-width is the cell's noise floor. Per op, the pooled
@@ -107,12 +109,12 @@ def paired(samples, a, b):
 
 
 def split_stats(rows, rounds, round_at, value_at):
-    """First-round, settled (later rounds) and all-round summaries."""
-    first = [p[value_at] for p in rows if p[round_at] == 0]
+    """Round 0, settled (later rounds) and all-round summaries."""
+    round0 = [p[value_at] for p in rows if p[round_at] == 0]
     settled = [p[value_at] for p in rows if p[round_at] > 0]
     allv = [p[value_at] for p in rows]
     return {
-        "first": dc.summarize(first),
+        "round0": dc.summarize(round0),
         "settled": dc.summarize(settled) if rounds > 1 else None,
         "all": dc.summarize(allv),
     }
@@ -281,8 +283,8 @@ def pick(stats, key="median"):
     return s[key] if s else None
 
 
-def pick_first(stats):
-    s = (stats or {}).get("first")
+def pick_round0(stats):
+    s = (stats or {}).get("round0")
     return s["median"] if s else None
 
 
@@ -293,7 +295,8 @@ def markdown(result):
         f"Rounds {a['rounds']} x {a['slots']} Thue-Morse slots, inner {a['inner']}, "
         f"shrink {a['shrink']}. Times are settled medians in ms (all rounds when "
         "there is one); ratios are medians of per-visit paired ratios; "
-        "first = round 0 median."
+        "round 0 = median of round 0, which is not a cold figure (see "
+        "bench_dit_thermal.py for the cold rate)."
     )
     lines.append("")
     for p in result["passes"]:
@@ -322,7 +325,7 @@ def markdown(result):
         lines.append(
             "| op | L x B | codec | "
             + " | ".join(names)
-            + " | first kq/affine | first aa/kq |"
+            + " | round 0 kq/affine | round 0 aa/kq |"
         )
         lines.append("|---|---|---|" + "---|" * (len(names) + 2))
         for g in p["groups"]:
@@ -332,8 +335,8 @@ def markdown(result):
                     f"| {g['family']}.{g['op']} | {g['L']} x {g['B']} | {c['codec']} |"
                 )
                 row += "".join(f" {fmt(pick(rt.get(n)))} |" for n in names)
-                row += f" {fmt(pick_first(rt.get('kq/affine')))} |"
-                row += f" {fmt(pick_first(rt.get('aa/kq')))} |"
+                row += f" {fmt(pick_round0(rt.get('kq/affine')))} |"
+                row += f" {fmt(pick_round0(rt.get('aa/kq')))} |"
                 lines.append(row)
         lines.append("")
         lines.append(
