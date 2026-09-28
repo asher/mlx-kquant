@@ -39,6 +39,11 @@ median of all settled pairs is the aggregate, reported beside the spread
 of the per-cell medians. Markdown and JSON out; the JSON keeps every
 sample and pair.
 
+Every sample also goes to a JSON Lines raw log (--raw-out, by default
+beside --json-out) as each slot ends, so a run that stops or fails keeps
+every finished slot. --reaggregate rebuilds the JSON and Markdown from a
+raw log without running anything, and marks a partial run.
+
 A versus A: --arms kq,kq_aa. Plan only: --plan-only.
 """
 
@@ -52,6 +57,7 @@ import random
 import sys
 import time
 
+import bench_stats as bs
 import dit_common as dc
 
 
@@ -123,22 +129,75 @@ def split_stats(rows, rounds, round_at, value_at):
     settled = [p[value_at] for p in rows if p[round_at] > 0]
     allv = [p[value_at] for p in rows]
     return {
-        "round0": dc.summarize(round0),
-        "settled": dc.summarize(settled) if rounds > 1 else None,
-        "all": dc.summarize(allv),
+        "round0": bs.summarize(round0),
+        "settled": bs.summarize(settled) if rounds > 1 else None,
+        "all": bs.summarize(allv),
     }
 
 
-def raw_path(json_out, dtype):
-    return f"{json_out}.{dtype}.raw"
+class RawLog:
+    """JSON Lines log of a run: a meta record, then per dtype a warmup
+    record and one record per finished slot, then an end record. Each
+    record is flushed and synced as it is written."""
+
+    def __init__(self, path):
+        self.f = open(path, "w") if path else None
+
+    def write(self, rec):
+        if self.f is None:
+            return
+        self.f.write(json.dumps(rec) + "\n")
+        self.f.flush()
+        os.fsync(self.f.fileno())
+
+    def close(self):
+        if self.f is not None:
+            self.f.close()
+            self.f = None
 
 
-def run_pass(dtype, groups, args, store, desc, t_start):
+def load_raw(path):
+    """Meta record, per-dtype measurements and end record (empty when the
+    run stopped early) from a raw log. A last line cut short is skipped."""
+    with open(path) as f:
+        lines = [line for line in f.read().split("\n") if line.strip()]
+    recs = []
+    for i, line in enumerate(lines):
+        try:
+            recs.append(json.loads(line))
+        except json.JSONDecodeError:
+            if i < len(lines) - 1:
+                raise
+    if not recs or recs[0].get("kind") != "meta":
+        raise ValueError(f"{path}: no meta record")
+    meta, measured, end = recs[0], {}, {}
+    ngroups = len(meta["groups"])
+    for rec in recs[1:]:
+        if rec["kind"] == "warmup":
+            measured[rec["dtype"]] = {
+                "inner": rec["inner"],
+                "kernels": {(gi, k): v for gi, k, v in rec["kernels"]},
+                "errors": {(gi, k): v for gi, k, v in rec["errors"]},
+                "samples": [dict() for _ in range(ngroups)],
+                "slots": 0,
+            }
+        elif rec["kind"] == "slot":
+            m = measured[rec["dtype"]]
+            for gi, key, visit, r, s, t, ms in rec["samples"]:
+                m["samples"][gi].setdefault(key, []).append((visit, r, s, t, ms))
+            m["slots"] += 1
+        elif rec["kind"] == "end":
+            end = rec
+    return meta, measured, end
+
+
+def measure_pass(dtype, groups, args, store, desc, t_start, raw):
+    """Warmup and timed rounds for one dtype. Samples go to `raw` as each
+    slot ends; no statistics here."""
     import mlx.core as mx
 
     dt = dc.mx_dtype(dtype)
     nax = desc["nax"]
-    arch = desc["architecture"]
     kernels = {}
     errors = {}
     calib = {}
@@ -163,11 +222,22 @@ def run_pass(dtype, groups, args, store, desc, t_start):
         fastest = min(calib.get(gi, [args.min_sample_ms]))
         n = math.ceil(args.min_sample_ms / max(fastest, 1e-3))
         inner.append(min(args.max_inner, max(args.inner, n)))
+    raw.write(
+        {
+            "kind": "warmup",
+            "dtype": dtype,
+            "inner": inner,
+            "kernels": [[gi, k, v] for (gi, k), v in kernels.items()],
+            "errors": [[gi, k, v] for (gi, k), v in errors.items()],
+        }
+    )
     print(f"[{dtype}] warmup done at {time.perf_counter() - t_start:.0f} s", flush=True)
 
     visit = 0
+    slots = 0
     for r in range(args.rounds):
         for s in range(args.slots):
+            rows = []
             tm = dc.THUE_MORSE[s % 8]
             order = list(range(len(groups)))
             random.Random(args.seed * 7919 + r * 131 + s).shuffle(order)
@@ -188,37 +258,38 @@ def run_pass(dtype, groups, args, store, desc, t_start):
                     fn = dc.make_fn(arm, codec, g, dt, store)
                     dc.set_tile(dc.ARM_TILE.get(arm), nax)
                     ms = dc.time_fn(fn, inner[gi])
-                    t = time.perf_counter() - t_start
-                    samples[gi].setdefault(cell_key(arm, codec), []).append(
-                        (visit, r, s, t, ms)
-                    )
+                    t = round(time.perf_counter() - t_start, 4)
+                    key = cell_key(arm, codec)
+                    samples[gi].setdefault(key, []).append((visit, r, s, t, ms))
+                    rows.append([gi, key, visit, r, s, t, ms])
                 dc.set_tile(None, nax)
                 visit += 1
+            raw.write(
+                {"kind": "slot", "dtype": dtype, "round": r, "slot": s, "samples": rows}
+            )
+            slots += 1
             print(
                 f"[{dtype}] round {r} slot {s} done at "
                 f"{time.perf_counter() - t_start:.0f} s",
                 flush=True,
             )
+    return {
+        "inner": inner,
+        "kernels": kernels,
+        "errors": errors,
+        "samples": samples,
+        "slots": slots,
+    }
 
-    # Raw samples reach disk before any statistics, so a failure in the
-    # summaries cannot lose a run. main removes the file after the final JSON.
-    if args.json_out:
-        with open(raw_path(args.json_out, dtype), "w") as f:
-            json.dump(
-                {
-                    "dtype": dtype,
-                    "groups": groups,
-                    "inner": inner,
-                    "kernels": {f"{gi}|{k}": v for (gi, k), v in kernels.items()},
-                    "errors": {f"{gi}|{k}": v for (gi, k), v in errors.items()},
-                    "samples": samples,
-                },
-                f,
-            )
 
+def summarize_pass(groups, m, rounds, arm_names, desc):
+    """Per-cell records and paired ratios from one dtype's measurements."""
+    nax = desc["nax"]
+    arch = desc["architecture"]
+    kernels, errors, inner = m["kernels"], m["errors"], m["inner"]
     out_groups = []
     for gi, g in enumerate(groups):
-        sm = samples[gi]
+        sm = m["samples"][gi]
         M, N, K = g["M"], g["N"], g["K"]
 
         def arm_record(arm, codec, gi=gi, sm=sm, M=M, N=N, K=K):
@@ -235,21 +306,19 @@ def run_pass(dtype, groups, args, store, desc, t_start):
                 "kernel": kernels.get((gi, key)),
                 "tile": tile,
                 "error": errors.get((gi, key)),
-                "samples": [
-                    [r, s, round(t, 4), ms] for (_v, r, s, t, ms) in sm.get(key, [])
-                ],
+                "samples": [[r, s, t, ms] for (_v, r, s, t, ms) in sm.get(key, [])],
             }
-            rec.update(split_stats(sm.get(key, []), args.rounds, 1, 4))
+            rec.update(split_stats(sm.get(key, []), rounds, 1, 4))
             return rec
 
         shared = {}
-        for arm, codec in arm_instances(g, args.arms):
+        for arm, codec in arm_instances(g, arm_names):
             if codec is None:
                 shared[arm] = arm_record(arm, None)
         cells = []
         for codec in g["codecs"]:
             arms = {}
-            for arm, c in arm_instances(g, args.arms):
+            for arm, c in arm_instances(g, arm_names):
                 if c == codec:
                     arms[arm] = arm_record(arm, codec)
             ratios = {}
@@ -269,7 +338,7 @@ def run_pass(dtype, groups, args, store, desc, t_start):
             ):
                 pr = paired(sm, a, b)
                 if pr:
-                    ratios[name] = split_stats(pr, args.rounds, 0, 1)
+                    ratios[name] = split_stats(pr, rounds, 0, 1)
                     ratios[name]["pairs"] = [[r, v] for r, v in pr]
             cells.append({"codec": codec, "arms": arms, "ratios": ratios})
         out_groups.append(dict(g, inner=inner[gi], shared=shared, cells=cells))
@@ -298,14 +367,62 @@ def aggregates(groups, rounds):
             {
                 "op": op,
                 "ratio": name,
-                "pooled": dc.summarize(e["pairs"]),
-                "cell_medians": dc.summarize(e["cells"]),
-                "cell_ci95_half": dc.summarize(e["half"]),
+                "pooled": bs.summarize(e["pairs"]),
+                "cell_medians": bs.summarize(e["cells"]),
+                "cell_ci95_half": bs.summarize(e["half"]),
                 "cell_ci95_half_max": max(e["half"]) if e["half"] else None,
                 "cells": len(e["cells"]),
             }
         )
     return out
+
+
+def build_result(meta, measured, end, raw_path):
+    """The report from a meta record and per-dtype measurements, live or
+    read back from a raw log."""
+    a = meta["args"]
+    groups = meta["groups"]
+    planned = a["rounds"] * a["slots"]
+    passes = []
+    last_t = None
+    for dtype, m in measured.items():
+        pg = summarize_pass(groups, m, a["rounds"], a["arms"], meta["machine"])
+        passes.append(
+            {
+                "dtype": dtype,
+                "slots_done": m["slots"],
+                "slots_planned": planned,
+                "groups": pg,
+                "aggregate": aggregates(pg, a["rounds"]),
+            }
+        )
+        for sm in m["samples"]:
+            for rows in sm.values():
+                for row in rows:
+                    last_t = row[3] if last_t is None else max(last_t, row[3])
+    return {
+        "machine": meta["machine"],
+        "args": a,
+        "heavy_codecs": meta["heavy_codecs"],
+        "wall_s": end.get("wall_s", last_t),
+        "peak_memory_bytes": end.get("peak_memory_bytes"),
+        "mlx_kquant_file": meta["mlx_kquant_file"],
+        "raw": raw_path,
+        "complete": bool(end),
+        "passes": passes,
+    }
+
+
+def write_outputs(result, json_out, md_out):
+    if json_out:
+        with open(json_out, "w") as f:
+            json.dump(result, f)
+    md = markdown(result)
+    if md_out:
+        with open(md_out, "w") as f:
+            f.write(md + "\n")
+    else:
+        print(md)
 
 
 def fmt(v, spec=".3f"):
@@ -336,9 +453,18 @@ def markdown(result):
         "bench_dit_thermal.py for the cold rate)."
     )
     lines.append("")
+    if not result.get("complete", True):
+        lines.append(
+            "Partial run: the raw log has no end record, so the figures cover "
+            "the slots it holds."
+        )
+        lines.append("")
     for p in result["passes"]:
         lines.append(f"## {p['dtype']}")
         lines.append("")
+        if p.get("slots_done", 0) < p.get("slots_planned", 0):
+            lines.append(f"{p['slots_done']} of {p['slots_planned']} slots ran.")
+            lines.append("")
         lines.append(
             "| op | L x B | M | codec | kq tile | kq ms | kq IQR | dense | affine "
             "| bm64 | bm128 | deq |"
@@ -417,7 +543,7 @@ def markdown(result):
     return "\n".join(lines)
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -466,7 +592,23 @@ def main():
     ap.add_argument("--plan-only", action="store_true")
     ap.add_argument("--json-out")
     ap.add_argument("--md-out")
-    args = ap.parse_args()
+    ap.add_argument(
+        "--raw-out",
+        help="JSON Lines log of every sample, written as each slot ends "
+        "(default: --json-out plus .raw.jsonl)",
+    )
+    ap.add_argument(
+        "--reaggregate",
+        metavar="RAW",
+        help="rebuild the JSON and Markdown from a raw log without running "
+        "anything; only --json-out and --md-out apply",
+    )
+    args = ap.parse_args(argv)
+    if args.reaggregate:
+        meta, measured, end = load_raw(args.reaggregate)
+        result = build_result(meta, measured, end, args.reaggregate)
+        write_outputs(result, args.json_out, args.md_out)
+        return 0
     args.families = parse_list(args.families)
     args.ops = parse_list(args.ops)
     args.rows = parse_list(args.rows, int)
@@ -505,38 +647,45 @@ def main():
         os.environ.pop(k, None)
     desc = dc.machine_descriptor()
     store = dc.Store(args.seed)
-    t_start = time.perf_counter()
-    passes = []
-    for dtype in args.dtypes:
-        store.clear_dtype()
-        mx.clear_cache()
-        passes.append(
-            {
-                "dtype": dtype,
-                "groups": run_pass(dtype, groups, args, store, desc, t_start),
-            }
-        )
-        passes[-1]["aggregate"] = aggregates(passes[-1]["groups"], args.rounds)
-    result = {
+    raw_out = args.raw_out
+    if raw_out is None and args.json_out:
+        raw_out = args.json_out + ".raw.jsonl"
+    raw = RawLog(raw_out)
+    meta = {
+        "kind": "meta",
         "machine": desc,
         "args": vars(args),
         "heavy_codecs": heavy_codecs,
+        "groups": groups,
+        "mlx_kquant_file": os.path.dirname(kq.__file__),
+    }
+    raw.write(meta)
+    t_start = time.perf_counter()
+    measured = {}
+    for dtype in args.dtypes:
+        store.clear_dtype()
+        mx.clear_cache()
+        measured[dtype] = measure_pass(dtype, groups, args, store, desc, t_start, raw)
+    end = {
+        "kind": "end",
         "wall_s": time.perf_counter() - t_start,
         "peak_memory_bytes": mx.get_peak_memory(),
-        "mlx_kquant_file": os.path.dirname(kq.__file__),
-        "passes": passes,
     }
-    if args.json_out:
-        with open(args.json_out, "w") as f:
-            json.dump(result, f)
-        for dtype in args.dtypes:
-            os.remove(raw_path(args.json_out, dtype))
-    md = markdown(result)
-    if args.md_out:
-        with open(args.md_out, "w") as f:
-            f.write(md + "\n")
-    else:
-        print(md)
+    raw.write(end)
+    raw.close()
+    try:
+        result = build_result(meta, measured, end, raw_out)
+        write_outputs(result, args.json_out, args.md_out)
+    except Exception:
+        if raw_out:
+            print(
+                f"summaries failed; the samples are in {raw_out}, and "
+                f"--reaggregate {raw_out} rebuilds the reports",
+                file=sys.stderr,
+                flush=True,
+            )
+        raise
+    return 0
 
 
 if __name__ == "__main__":

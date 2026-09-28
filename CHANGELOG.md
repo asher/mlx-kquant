@@ -15,6 +15,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `kq.max_threadgroup_memory()` reports the GPU's threadgroup memory limit.
 - `benchmarks/bench_dit_shapes.py` and `benchmarks/bench_roofline.py` time
   matmul tiles against stock and MLX affine arms at diffusion model shapes.
+- `bench_dit_shapes.py` logs samples as each slot ends, and `--reaggregate`
+  rebuilds its reports from that log after a stopped or failed run.
 
 ## [0.5.0]
 
