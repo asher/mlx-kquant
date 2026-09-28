@@ -9,6 +9,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - `KQ_TUNE_LIVE=1` makes the NAX tile levers take effect on the next call, so
   tile A/B runs share one process. `KQ_QMM_LOG` now logs NAX tile dispatches.
+- `KQ_NAX_TILE` and `KQ_QMM_TILE` pin the quantized matmul tile, and raise
+  with the kernel name on a tile that is not built. `kq.metallib_kernels()`
+  lists the built kernels.
 
 ## [0.5.0]
 

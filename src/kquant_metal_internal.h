@@ -396,6 +396,17 @@ inline MTL::ComputePipelineState* kq_get_kernel(
   return d.get_kernel(kname, lib);
 }
 
+// True when the bundled metallib carries a function named kname. Looks the
+// name up without building a pipeline, so a tile override can raise with
+// the kernel name before any dispatch.
+inline bool kq_has_kernel(Device& d, const std::string& kname) {
+  static MTL::Library* lib = d.get_library("mlx_kquant", metallib_dir());
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  auto fn = NS::TransferPtr(lib->newFunction(
+      NS::String::string(kname.c_str(), NS::UTF8StringEncoding)));
+  return fn.get() != nullptr;
+}
+
 // Func-constant variant for kernels specialized via an MTLFCList.
 // hash_name must encode the func-const values so each specialization gets a
 // distinct pipeline-state cache entry (d.get_kernel(name, lib, hash, consts)).

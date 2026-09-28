@@ -12,7 +12,9 @@
 // dispatch helpers.
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -547,6 +549,68 @@ static bool kq_qmm_log() {
   return kq_tune_live() ? std::getenv("KQ_QMM_LOG") != nullptr : cached;
 }
 
+// A qmm tile: rows and columns per threadgroup, and the grid of
+// simdgroups over them.
+struct KqTile {
+  int bm;
+  int bn;
+  int wm;
+  int wn;
+};
+
+static std::string kq_tile_string(const KqTile& t) {
+  return std::to_string(t.bm) + "," + std::to_string(t.bn) + "," +
+      std::to_string(t.wm) + "," + std::to_string(t.wn);
+}
+
+// Reads a tile override "bm,bn,wm,wn". Unset or empty gives none, and a
+// malformed value raises with the lever name.
+static std::optional<KqTile> kq_read_tile(const char* lever) {
+  const char* e = std::getenv(lever);
+  if (e == nullptr || e[0] == '\0') {
+    return std::nullopt;
+  }
+  KqTile t{};
+  char tail = 0;
+  const int n =
+      std::sscanf(e, "%d,%d,%d,%d%c", &t.bm, &t.bn, &t.wm, &t.wn, &tail);
+  if (n != 4 || t.bm <= 0 || t.bn <= 0 || t.wm <= 0 || t.wn <= 0) {
+    throw std::invalid_argument(
+        std::string("[mlx_kquant] ") + lever + "=" + e +
+        " is not bm,bn,wm,wn (four positive integers).");
+  }
+  return t;
+}
+
+// KQ_NAX_TILE pins the NAX qmm_t tile of transpose calls in place of the
+// BM=32, BM=64 and BM=128 policy. Read once per process unless
+// KQ_TUNE_LIVE=1.
+static std::optional<KqTile> kq_nax_tile() {
+  static const std::optional<KqTile> cached = kq_read_tile("KQ_NAX_TILE");
+  return kq_tune_live() ? kq_read_tile("KQ_NAX_TILE") : cached;
+}
+
+// KQ_QMM_TILE pins the qmm_t tile of transpose calls on the path without
+// NAX. Read once per process unless KQ_TUNE_LIVE=1.
+static std::optional<KqTile> kq_qmm_tile() {
+  static const std::optional<KqTile> cached = kq_read_tile("KQ_QMM_TILE");
+  return kq_tune_live() ? kq_read_tile("KQ_QMM_TILE") : cached;
+}
+
+// Raises when a tile override selects a kernel the metallib does not
+// carry, naming the kernel.
+static void kq_require_tile_kernel(
+    Device& d,
+    const char* lever,
+    const KqTile& t,
+    const std::string& kname) {
+  if (!kq_has_kernel(d, kname)) {
+    throw std::invalid_argument(
+        std::string("[mlx_kquant] ") + lever + "=" + kq_tile_string(t) +
+        " selects kernel " + kname + ", which is not instantiated.");
+  }
+}
+
 // One KQ_QMM_LOG line: kernel name, shape and grid of a qmm tile dispatch.
 static void kq_log_qmm(
     const std::string& kname,
@@ -647,6 +711,15 @@ void qmm_nax(
                              : M >= bm128_min_m)) {
     bm = 128;
   }
+  // KQ_NAX_TILE replaces the tile the policy above picked.
+  const std::optional<KqTile> tile =
+      transpose ? kq_nax_tile() : std::optional<KqTile>();
+  if (tile) {
+    bm = tile->bm;
+    bn = tile->bn;
+    wm = tile->wm;
+    wn = tile->wn;
+  }
   // M33-64 band: the name-suffixed _db BM=64 variant double-buffers Ws
   // (bm32 here would stream weights twice via grid.y=2; blanket DB@64
   // regressed M96+ -3-15% and prefill -3-7%, so it is band-gated).
@@ -657,8 +730,8 @@ void qmm_nax(
   // restored and a metallib rebuild.
   const int db64_mode = kq_nax_db64_mode();
   int db64_min_n = kq_smallbm_policy(kquant_type).db64_min_n;
-  bool use_db64 = transpose && bm == 64 && M >= 33 && M <= 64 &&
-      db64_min_n > 0 &&
+  bool use_db64 = transpose && bm == 64 && bn == 64 && wm == 2 && wn == 2 &&
+      M >= 33 && M <= 64 && db64_min_n > 0 &&
       (db64_mode == 1 || (db64_mode == -1 && N >= db64_min_n));
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
@@ -707,6 +780,9 @@ void qmm_nax(
       batched ? "_batch_1" : "_batch_0",
       use_db64 ? "_db" : "");
 
+  if (tile) {
+    kq_require_tile_kernel(d, "KQ_NAX_TILE", *tile, kname);
+  }
   kq_log_qmm(kname, M, N, K, grid_dims);
 
   auto kernel = kq_get_kernel(d, kname);
@@ -766,6 +842,22 @@ void qmm(
   int wm = 2, wn = 2;
   int bm = 64;
   int bn = transpose ? 64 : 32;
+  // KQ_QMM_TILE replaces the tile. The shipped bm64 bn64 wm2 wn2 tile keeps
+  // its plain kernel name, and any other tile carries its geometry in the
+  // name.
+  const std::optional<KqTile> tile =
+      transpose ? kq_qmm_tile() : std::optional<KqTile>();
+  std::string tile_tag;
+  if (tile) {
+    bm = tile->bm;
+    bn = tile->bn;
+    wm = tile->wm;
+    wn = tile->wn;
+    if (bm != 64 || bn != 64 || wm != 2 || wn != 2) {
+      tile_tag = "_bm" + std::to_string(bm) + "_bn" + std::to_string(bn) +
+          "_wm" + std::to_string(wm) + "_wn" + std::to_string(wn);
+    }
+  }
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
 
@@ -782,9 +874,13 @@ void qmm(
       group_size,
       "_b_",
       bits,
+      tile_tag,
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
       batched ? "_batch_1" : "_batch_0");
 
+  if (tile) {
+    kq_require_tile_kernel(d, "KQ_QMM_TILE", *tile, kname);
+  }
   kq_log_qmm(kname, M, N, K, grid_dims);
 
   auto kernel = kq_get_kernel(d, kname);

@@ -27,6 +27,10 @@ std::string metallib_dir();
 // Returns false only on a non-Metal build.
 bool metallib_loads();
 
+// Sorted names of the kernels in the bundled metallib (empty on non-Metal
+// builds).
+std::vector<std::string> metallib_kernels();
+
 // True when the GPU supports the NAX (tensor-core) matmul kernels (false on
 // non-Metal builds and pre-NAX GPUs).
 bool nax_available();

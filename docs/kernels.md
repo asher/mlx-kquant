@@ -144,9 +144,20 @@ the two kernels are within 3% of each other on every shape measured.
 Tuning levers (defaults are right for normal use):
 
 - `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
-  `KQ_NAX_DB64`, `KQ_NAX_SWIZZLE`) and `KQ_QMM_LOG` read their variables on every dispatch, so
-  one process can switch tiles between calls on one resident copy of the weights. Unset, each of
-  them keeps its first read for the life of the process. Read once per process.
+  `KQ_NAX_DB64`, `KQ_NAX_SWIZZLE`), the tile overrides (`KQ_NAX_TILE`, `KQ_QMM_TILE`) and
+  `KQ_QMM_LOG` read their variables on every dispatch, so one process can switch tiles between
+  calls on one resident copy of the weights. Unset, each of them keeps its first read for the life
+  of the process. Read once per process.
+- `KQ_NAX_TILE` - `bm,bn,wm,wn` pins the NAX `qmm_t` tile of every transpose call that reaches it,
+  in place of the BM=32, BM=64 and BM=128 policy (BK stays 64). The `_db` variant still follows
+  `KQ_NAX_DB64` on the bm64 bn64 wm2 wn2 tile. A tile the metallib does not carry raises a
+  `ValueError` that names the missing kernel, and `kq.metallib_kernels()` lists the ones it
+  carries. Unset (off) by default. Read once per process unless `KQ_TUNE_LIVE=1`.
+- `KQ_QMM_TILE` - the same override for the `qmm_t` tile on the path without NAX (GPUs without
+  NAX, `KQ_DISABLE_NAX=1`, or a codec or shape the NAX tile does not serve). The shipped tile is
+  `64,64,2,2` and keeps its plain kernel name; any other tile is looked up under a name that
+  carries `_bm<bm>_bn<bn>_wm<wm>_wn<wn>` before `_alN`. Unset (off) by default. Read once per
+  process unless `KQ_TUNE_LIVE=1`.
 - `KQ_QMM_LOG` - set to any value, logs the kernel name, shape and grid of every NAX and ALU qmm
   tile dispatch to stderr, one `[kq qmm]` line each. Read once per process unless
   `KQ_TUNE_LIVE=1`.
@@ -548,6 +559,8 @@ Tuning levers (defaults are right for normal use):
 - **`codecs`** - the list of supported codec names.
 - **`metallib_loads`** / **`metallib_dir`** - whether the bundled metallib opened on the device, and
   where it lives.
+- `metallib_kernels` - the sorted names of the kernels in the bundled metallib (empty without
+  Metal), the names `KQ_NAX_TILE` and `KQ_QMM_TILE` select from.
 - **`nax_available`** / **`nax_gather_enabled`** - whether the GPU exposes NAX tensor units, and
   whether the sorted-gather NAX GEMM kernels (`gather_qmm_rhs_nax`, the `gather_qmm_seg` NAX walk)
   are reachable for a codec.

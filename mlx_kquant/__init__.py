@@ -5,7 +5,7 @@ stock ``mlx`` wheel.
 
 Current API:
   * ``codecs`` / ``metallib_dir`` / ``metallib_loads`` /
-    ``cpu_neon_available`` - toolchain self-checks.
+    ``metallib_kernels`` / ``cpu_neon_available`` - toolchain self-checks.
   * ``dequantize`` - GGUF K-quant wire bytes -> float array.
   * ``quantized_matmul`` - x @ dequant(w) for K-quant weights.
   * ``quantized_matmul_qmv_bias`` - decode-only (M=1) bias-fused variant of
@@ -71,6 +71,7 @@ from ._ext import (  # noqa: F401
     latent_fp4_unpack,
     load_gguf,
     metallib_dir,
+    metallib_kernels,
     metallib_loads,
     moe_glu_gather,
     moe_glu_gather_kq,
@@ -169,6 +170,7 @@ __all__ = [
     "latent_fp4_unpack",
     "load_gguf",
     "metallib_dir",
+    "metallib_kernels",
     "metallib_loads",
     "moe_glu_gather",
     "moe_glu_gather_kq",

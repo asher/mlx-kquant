@@ -748,6 +748,24 @@ bool metallib_loads() {
 #endif
 }
 
+std::vector<std::string> metallib_kernels() {
+#ifdef _METAL_
+  auto& d = mx::metal::device(mx::Device::gpu);
+  MTL::Library* lib = d.get_library("mlx_kquant", metallib_dir());
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  NS::Array* names = lib->functionNames();
+  std::vector<std::string> out;
+  out.reserve(names->count());
+  for (NS::UInteger i = 0; i < names->count(); ++i) {
+    out.emplace_back(names->object<NS::String>(i)->utf8String());
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+#else
+  return {};
+#endif
+}
+
 bool nax_available() {
 #ifdef _METAL_
   return kq_is_nax_available();

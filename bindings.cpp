@@ -67,6 +67,12 @@ NB_MODULE(_ext, m) {
       "Load the bundled metallib via the Metal device (toolchain self-check).");
 
   m.def(
+      "metallib_kernels",
+      &mlx_kquant::metallib_kernels,
+      "Sorted names of the kernels in the bundled metallib (empty on builds "
+      "without Metal). Tile overrides select from these names.");
+
+  m.def(
       "cpu_neon_available",
       &mlx_kquant::kq_cpu_neon_available,
       "True when the arm64 NEON int8 CPU GEMV kernels can run here (arm64 "

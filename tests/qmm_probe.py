@@ -30,7 +30,7 @@ import mlx.core as mx
 if os.environ.get("KQUANT_FORCE_CPU"):
     mx.set_default_device(mx.cpu)
 import mlx_kquant as kq
-from mlx_kquant.codec_geometry import CODEC_GEOMETRY
+from mlx_kquant.codec_geometry import CODEC_GEOMETRY, DECODE_ONLY_CODECS
 from kqref import is_synth, synth_wire
 
 DT = {"bfloat16": mx.bfloat16, "float16": mx.float16}
@@ -41,7 +41,7 @@ def weights(codec, n, k):
     key = (codec, n, k)
     if key not in _weights:
         _, _, bpb, wpb = CODEC_GEOMETRY[codec]
-        if is_synth(codec):
+        if is_synth(codec) or codec in DECODE_ONLY_CODECS:
             rng = np.random.default_rng(n * 131 + k)
             wire = synth_wire(rng, codec, bpb, n * (k // wpb))
             w = mx.array(wire.reshape(n, (k // wpb) * bpb))
