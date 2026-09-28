@@ -201,11 +201,11 @@ def run_pass(dtype, groups, args, store, desc, t_start):
         def arm_record(arm, codec, gi=gi, sm=sm, M=M, N=N, K=K):
             key = cell_key(arm, codec)
             if arm == "dense":
-                tile = dc.mlx_dense_tile(M, N, K, arch)
+                tile = dc.mlx_dense_tile(M, N, K, arch, nax)
             elif arm.startswith("affine"):
-                tile = dc.MLX_AFFINE_TILE
+                tile = dc.mlx_affine_tile(nax)
             elif arm == "deq":
-                tile = dc.mlx_dense_tile(M, N, K, arch)
+                tile = dc.mlx_dense_tile(M, N, K, arch, nax)
             else:
                 tile = dc.tile_of(kernels.get((gi, key)))
             rec = {

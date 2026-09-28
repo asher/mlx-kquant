@@ -186,17 +186,29 @@ def tile_bm_bn(tile):
     return (int(m[1]), int(m[2])) if m else (None, None)
 
 
-def mlx_dense_tile(M, N, K, arch):
-    """Tile of MLX's NAX GEMM for a float matmul, derived from its dispatch
-    rule; MLX does not log it."""
+def mlx_dense_tile(M, N, K, arch, nax):
+    """Tile of MLX's GEMM for a half or bfloat x @ w.T, derived from its
+    dispatch rule; MLX does not log it."""
     letter = arch[-1:] if arch else ""
-    if letter in ("s", "c", "d"):
-        bk = 64 if (K >= 8192 and K > M + N) else 256
-        return f"bm64 bn128 bk{bk} wm2 wn4 (rule)"
-    return "bm128 bn128 bk512 wm4 wn4 (rule)"
+    if nax:
+        if letter in ("s", "c", "d"):
+            bk = 64 if (K >= 8192 and K > M + N) else 256
+            return f"bm64 bn128 bk{bk} wm2 wn4 (rule)"
+        return "bm128 bn128 bk512 wm4 wn4 (rule)"
+    if letter in ("g", "p"):
+        return "bm64 bn32 bk32 wm2 wn2 (rule)"
+    if letter == "d":
+        if M * N >= 1 << 20 and 2 * max(M, N) > K:
+            return "bm64 bn64 bk16 wm1 wn2 (rule)"
+        return "bm64 bn32 bk32 wm2 wn2 (rule)"
+    return "bm64 bn64 bk16 wm2 wn2 (rule)"
 
 
-MLX_AFFINE_TILE = "bm64 bn64 bk64 wm2 wn2 (rule)"
+def mlx_affine_tile(nax):
+    """Tile of MLX's affine quantized matmul, from its dispatch rule."""
+    if nax:
+        return "bm64 bn64 bk64 wm2 wn2 (rule)"
+    return "bm32 bn32 bk32 wm2 wn2 (rule)"
 
 
 ARM_TILE = {"kq": None, "kq_aa": None, "kq_bm64": TILE_BM64}
