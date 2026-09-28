@@ -146,8 +146,9 @@ Tuning levers (defaults are right for normal use):
 - `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
   `KQ_NAX_DB64`, `KQ_NAX_SWIZZLE`), the tile overrides (`KQ_NAX_TILE`, `KQ_QMM_TILE`) and
   `KQ_QMM_LOG` read their variables on every dispatch, so one process can switch tiles between
-  calls on one resident copy of the weights. Unset, each of them keeps its first read for the life
-  of the process. Read once per process.
+  calls on one resident copy of the weights; `benchmarks/bench_dit_shapes.py` runs its tile arms
+  this way. Unset, each of them keeps its first read for the life of the process. Read once per
+  process.
 - `KQ_NAX_TILE` - `bm,bn,wm,wn` pins the NAX `qmm_t` tile of every transpose call that reaches it,
   in place of the BM=32, BM=64 and BM=128 policy (BK stays 64). The `_db` variant still follows
   `KQ_NAX_DB64` on the bm64 bn64 wm2 wn2 tile. A tile the metallib does not carry raises a
