@@ -12,6 +12,7 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `KQ_NAX_TILE` and `KQ_QMM_TILE` pin the quantized matmul tile, and raise
   with the kernel name on a tile that is not built. `kq.metallib_kernels()`
   lists the built kernels.
+- `kq.max_threadgroup_memory()` reports the GPU's threadgroup memory limit.
 
 ## [0.5.0]
 

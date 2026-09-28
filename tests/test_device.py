@@ -60,3 +60,12 @@ def test_fine_ceiling_scales_with_cores(monkeypatch):
     monkeypatch.setenv("KQ_GPU_CORES", "80")
     assert kq.qmv_fine_max_n("q6_k") == 32768
     assert kq.qmv_fine_max_n("nvfp4") == 0
+
+
+def test_max_threadgroup_memory():
+    n = kq.max_threadgroup_memory()
+    if sys.platform == "darwin":
+        # Every Apple GPU with Metal 3 has at least 32 KiB.
+        assert n >= 32768
+    else:
+        assert n == 0

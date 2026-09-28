@@ -766,6 +766,15 @@ std::vector<std::string> metallib_kernels() {
 #endif
 }
 
+int max_threadgroup_memory() {
+#ifdef _METAL_
+  auto& d = mx::metal::device(mx::Device::gpu);
+  return static_cast<int>(d.mtl_device()->maxThreadgroupMemoryLength());
+#else
+  return 0;
+#endif
+}
+
 bool nax_available() {
 #ifdef _METAL_
   return kq_is_nax_available();

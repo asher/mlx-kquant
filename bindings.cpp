@@ -89,6 +89,11 @@ NB_MODULE(_ext, m) {
       "GPU core count from IOKit (KQ_GPU_CORES overrides it); 0 when unknown.");
 
   m.def(
+      "max_threadgroup_memory",
+      &mlx_kquant::max_threadgroup_memory,
+      "The GPU's threadgroup memory limit in bytes; 0 without Metal.");
+
+  m.def(
       "qmv_fine_max_n",
       &mlx_kquant::qmv_fine_max_n,
       "kquant_type"_a,

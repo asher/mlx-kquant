@@ -39,6 +39,9 @@ bool nax_available();
 // it); 0 when unknown.
 int gpu_core_count();
 
+// The GPU's threadgroup memory limit in bytes; 0 on non-Metal builds.
+int max_threadgroup_memory();
+
 // Largest N at which the M=1 mat-vec takes the fine (2 rows per threadgroup)
 // tiling for this codec; 0 means coarse. The calibrated ceiling unless
 // KQ_GPU_CORES is set, which scales it by cores/40. On Metal only.

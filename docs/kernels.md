@@ -565,6 +565,8 @@ Tuning levers (defaults are right for normal use):
   whether the sorted-gather NAX GEMM kernels (`gather_qmm_rhs_nax`, the `gather_qmm_seg` NAX walk)
   are reachable for a codec.
 - **`cpu_neon_available`** - whether the arm64 NEON int8 GEMV path is compiled in.
+- `gpu_core_count` / `max_threadgroup_memory` - the GPU core count from IOKit (`KQ_GPU_CORES`
+  overrides it) and the threadgroup memory limit in bytes, both 0 when unknown.
 
 ## Feeder-loop primitives
 
