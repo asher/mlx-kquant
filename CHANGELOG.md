@@ -18,6 +18,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `bench_dit_shapes.py` logs samples as each slot ends, and `--reaggregate`
   rebuilds its reports from that log after a stopped or failed run.
 
+### Changed
+- On NAX GPUs (M5), matmuls with 4096 or more activation rows run the BM=128
+  tile at any row count. `KQ_NAX_BM128_ODD_M=0` keeps the previous tile.
+
 ## [0.5.0]
 
 ### Changed

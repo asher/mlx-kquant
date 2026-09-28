@@ -530,6 +530,21 @@ static int kq_nax_bm128_mode() {
   return kq_tune_live() ? kq_env_int("KQ_NAX_BM128", -1) : cached;
 }
 
+// KQ_NAX_BM128_ODD_M: lowest M at which the BM=128 tile also runs when
+// ceil(M/64) is odd, 0 = never (the parity rule at every M). The row-live
+// guard in the tile skips the A loads and MMA of the dead simdgroup row of
+// the last row tile, so there the half-live tile does the loads and MMA of
+// one BM=64 tile. From the default of 4096 that tile holds at most 1.6
+// percent of the rows; the default is not yet a measured crossover.
+static constexpr int kq_bm128_odd_m_default = 4096;
+static int kq_nax_bm128_odd_m() {
+  static const int cached =
+      kq_env_int("KQ_NAX_BM128_ODD_M", kq_bm128_odd_m_default);
+  return kq_tune_live()
+      ? kq_env_int("KQ_NAX_BM128_ODD_M", kq_bm128_odd_m_default)
+      : cached;
+}
+
 // KQ_NAX_DB64: 0 = off, 1 = no N floor, unset (-1) = per-codec N floor.
 static int kq_nax_db64_mode() {
   static const int cached = kq_env_int("KQ_NAX_DB64", -1);
@@ -702,10 +717,15 @@ void qmm_nax(
   // policy table). KQ_NAX_BM128: 0 = off, 1 = force floor 193 for all
   // codecs (crossover finding), 2 = drop the floor entirely (probes the
   // M65-128 wash band, symmetric with KQ_NAX_SMALL_BM=2), unset =
-  // per-codec policy.
+  // per-codec policy. The loss cells predate the row-live guard, and from
+  // KQ_NAX_BM128_ODD_M (default 4096) the tile runs at either parity;
+  // KQ_NAX_BM128_ODD_M=0 keeps the parity rule at every M.
   const int bm128_mode = kq_nax_bm128_mode();
   int bm128_min_m = kq_smallbm_policy(kquant_type).bm128_min_m;
-  if (bm128_mode != 0 && transpose && ((M + 63) / 64) % 2 == 0 &&
+  const int bm128_odd_m = kq_nax_bm128_odd_m();
+  const bool bm128_rows =
+      ((M + 63) / 64) % 2 == 0 || (bm128_odd_m > 0 && M >= bm128_odd_m);
+  if (bm128_mode != 0 && transpose && bm128_rows &&
       (bm128_mode == 1       ? M >= 193
            : bm128_mode == 2 ? true
                              : M >= bm128_min_m)) {

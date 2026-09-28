@@ -144,10 +144,10 @@ the two kernels are within 3% of each other on every shape measured.
 Tuning levers (defaults are right for normal use):
 
 - `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
-  `KQ_NAX_DB64`, `KQ_NAX_SWIZZLE`), the tile overrides (`KQ_NAX_TILE`, `KQ_QMM_TILE`) and
-  `KQ_QMM_LOG` read their variables on every dispatch, so one process can switch tiles between
-  calls on one resident copy of the weights; `benchmarks/bench_dit_shapes.py` runs its tile arms
-  this way. It reads the environment on every dispatch, so it is for single-threaded A/B runs
+  `KQ_NAX_BM128_ODD_M`, `KQ_NAX_DB64`, `KQ_NAX_SWIZZLE`), the tile overrides (`KQ_NAX_TILE`,
+  `KQ_QMM_TILE`) and `KQ_QMM_LOG` read their variables on every dispatch, so one process can
+  switch tiles between calls on one resident copy of the weights; `benchmarks/bench_dit_shapes.py`
+  runs its tile arms this way. It reads the environment on every dispatch, so it is for single-threaded A/B runs
   that set these variables between calls. Unset (off) by default, and then each of them keeps its
   first read for the life of the process. Read once per process.
 - `KQ_NAX_TILE` - `bm,bn,wm,wn` pins the NAX `qmm_t` tile of every transpose call that reaches it,
@@ -171,6 +171,11 @@ Tuning levers (defaults are right for normal use):
   the floor entirely (any even ceil(M/64), probing the M65-128 wash band), unset follows the
   per-codec entry floors (193/449/961 tiers, measured on M5 Max by
   `benchmarks/bench_qmm_bm128_ab.py`; re-run it before trusting them on new silicon). Read once
+  per process unless `KQ_TUNE_LIVE=1`.
+- `KQ_NAX_BM128_ODD_M` - the M from which the BM=128 band also takes an odd ceil(M/64), whose last
+  row tile holds 64 rows or fewer. The tile skips the activation loads and matrix work of rows past
+  M there, so that tile does the work of one BM=64 tile. Default `4096`, where it holds at most
+  1.6% of the rows; `0` keeps the even ceil(M/64) rule at every M, the policy before this lever. Read once
   per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_NAX_DB64` - double-buffered M 33-64 band. `0` off, `1` drops the N floor, unset follows the
   per-codec N floors. Only the five policy-enabled codecs (q6_k, q8_0, q4_1, q5_1, q5_0) carry

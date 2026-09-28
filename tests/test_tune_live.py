@@ -111,7 +111,8 @@ def test_default_levers_unchanged_by_tune_live():
 
 
 # The routing at DiT row counts: per image, and with a batch of two
-# flattened into M. BM=128 runs where ceil(M/64) is even.
+# flattened into M. From 4096 rows the default runs BM=128 at either
+# parity; under KQ_NAX_BM128_ODD_M=0 BM=128 runs where ceil(M/64) is even.
 DIT_TILES = {
     4096: 128,
     4128: 64,
@@ -134,17 +135,21 @@ DIT_TILES_B2 = {
 }
 
 
+@pytest.mark.parametrize("parity", [False, True])
 @pytest.mark.parametrize("codec", ["q4_k", "q5_k", "q6_k", "q8_0"])
-def test_default_tile_at_dit_rows(codec):
+def test_default_tile_at_dit_rows(codec, parity):
     _gpu_nax()
     calls = []
     expect = []
     for rows, bm in DIT_TILES.items():
         calls.append({"codec": codec, "shape": [1, rows, K], "n": 64})
-        expect.append((rows, bm))
+        expect.append((rows, bm if parity else 128))
         calls.append({"codec": codec, "shape": [2, rows, K], "n": 64})
-        expect.append((2 * rows, DIT_TILES_B2[rows]))
-    res = run_probe(calls, env={"KQ_QMM_LOG": "1"}, check=False)
+        expect.append((2 * rows, DIT_TILES_B2[rows] if parity else 128))
+    env = {"KQ_QMM_LOG": "1"}
+    if parity:
+        env["KQ_NAX_BM128_ODD_M"] = "0"
+    res = run_probe(calls, env=env, check=False)
     for r, (m, bm) in zip(res, expect, strict=True):
         name, grid = _only_kernel(r)
         assert tile_of(name)[0] == bm, (m, name)

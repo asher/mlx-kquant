@@ -199,10 +199,14 @@ instantiate_kquant_nax_db64(q5_0, 32, 5)
 // per-threadgroup work (loader dequant + MMA issue, real DRAM ~half
 // peak); BM=128 halves the row-tile count and with it total loader
 // dequant per unique weight. A loads straight from device, so the cost
-// is Dtile registers: 8 accumulator fragments vs 4. Dispatched only when
-// ceil(M/64) is even and M >= 193 (padding parity with BM=64; q6_k ABBA
-// at three shapes: +9-25% M224-512, prefill M512-2048 +8-10% hot,
-// +31-40% cold). KQ_NAX_BM128=0 kills.
+// is Dtile registers: 8 accumulator fragments vs 4. Dispatched when
+// ceil(M/64) is even and M is at or above the per-codec floor (padding
+// parity with BM=64; q6_k ABBA at three shapes: +9-25% M224-512, prefill
+// M512-2048 +8-10% hot, +31-40% cold), and at every M from
+// KQ_NAX_BM128_ODD_M, where the row-live guard in kq_qmm_t_nax_tgp_impl
+// runs a last row tile of 64 rows or fewer with the loads and MMA of a
+// BM=64 tile.
+// KQ_NAX_BM128=0 kills.
 #define instantiate_kquant_nax_qmm_t_bm128(codec, type, gs, bits)             \
   instantiate_kquant_nax_qmm_t(type, gs, bits, true,  1, 128, 64, 2, 2, codec) \
   instantiate_kquant_nax_qmm_t(type, gs, bits, true,  0, 128, 64, 2, 2, codec) \

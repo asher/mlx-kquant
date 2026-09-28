@@ -49,7 +49,8 @@ def _only_kernel(res):
 
 def test_nax_tile_selects_kernel():
     _nax()
-    # 4128 rows: the policy runs BM=64 (ceil(4128/64) is odd).
+    # 4128 rows under the parity rule: the policy runs BM=64 (ceil(4128/64)
+    # is odd).
     call = {"codec": "q4_k", "shape": [1, 4128, K], "n": 128}
     calls = [
         dict(call),
@@ -57,7 +58,7 @@ def test_nax_tile_selects_kernel():
         dict(call, env={"KQ_NAX_TILE": TILES[32]}),
         dict(call, env={"KQ_NAX_TILE": None}),
     ]
-    res = run_probe(calls, env=LIVE, check=False)
+    res = run_probe(calls, env=dict(LIVE, KQ_NAX_BM128_ODD_M="0"), check=False)
     got = [_only_kernel(r) for r in res]
     assert [tile_of(n)[0] for n, _ in got] == [64, 128, 32, 64]
     assert [g for _, g in got] == [(2, 65, 1), (2, 33, 1), (2, 129, 1), (2, 65, 1)]

@@ -101,6 +101,12 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
   // than either uniform path. The safe path costs ~3%, so branch on the
   // tile, clamp per SG.
   const bool is_unaligned_sm = (M - y_row) < BM;
+  // Row-live guard: a simdgroup row whose rows all lie at or beyond M keeps
+  // its share of the weight decode and every barrier, and skips the A load,
+  // the MMA and the store. Uniform per simdgroup, since a simdgroup row
+  // shares one tm. Lets a BM=128 tile carry a last row tile of 64 rows or
+  // fewer with the loads and MMA of one BM=64 tile.
+  const bool sg_live = tm < M - y_row;
 
   const short sgp_sn = aligned_N ? SN : short(min(int(SN), N - (y_col + tn)));
 
@@ -166,7 +172,7 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
           const threadgroup T* Wcur = Ws + (step & 1) * WS_STRIDE;
 
           STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = kk_first; kk1 < BK; kk1 += kk_stride) {
+          for (int kk1 = kk_first; sg_live && kk1 < BK; kk1 += kk_stride) {
             NAXTile<T, TM, TK> Atile;
             NAXTile<T, TN, TK> Btile;
 
@@ -206,7 +212,7 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
           STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = kk_first; kk1 < BK; kk1 += kk_stride) {
+          for (int kk1 = kk_first; sg_live && kk1 < BK; kk1 += kk_stride) {
             NAXTile<T, TM, TK> Atile;
             NAXTile<T, TN, TK> Btile;
 
@@ -272,7 +278,7 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
         Dtile.store(y + tm * N + tn, N);
       } else if (kAlignedM.value && sgp_sn == SN) {
         Dtile.store(y + tm * N + tn, N);
-      } else {
+      } else if (sg_live) {
         Dtile.store_safe(y + tm * N + tn, N, short2(sgp_sn, sgp_sm));
       }
     });
