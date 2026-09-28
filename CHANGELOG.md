@@ -14,6 +14,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the upstream fix for dequantize misreading strided operands
   (ml-explore/mlx#4381) and the compile-cache exit segfault; a new pin
   test holds both the version and the strided-operand behavior.
+- `mlx-kquant[tools]` now installs beside transformers 5.13.1 and later, as
+  mlx-vlm 0.7 requires. Only 5.13.0, which cannot import mlx-lm, is excluded.
 
 ## [0.4.15]
 
