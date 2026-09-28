@@ -4,19 +4,27 @@ Reads bench_dit_shapes.py JSON and, per cell and arm, computes:
 
   NAX floor    2*M*K*N over the stock matmul rate at a cube of --cube
                (per activation dtype)
-  ALU floor    decoded weights N*K*ceil(M/BM), times the codec's ops per
-               weight, over the rate of an fp32 multiply-add chain written
-               with mx.fast.metal_kernel
-  bytes floor  x_bytes*ceil(N/BN) + w_bytes*ceil(M/BM) + out_bytes over the
-               copy bandwidth of a large elementwise op, with no cache reuse
+  ALU floor    decoded weights N*K*ceil(M/BM), times the codec's ALU ops
+               per weight, over the rate of an fp32 multiply-add chain
+               written with mx.fast.metal_kernel
+  bytes floor  compulsory traffic: x, w and out each moved once, over the
+               copy bandwidth of a large elementwise op
 
 and reports measured time over the largest floor, and which floor binds.
+Two columns sit beside the floors without entering them:
+
+  loads        scalar byte loads per decoded weight (Q6_K: its 210-byte
+               blocks rule out vector loads), counted as issue slots at the
+               ALU rate
+  no reuse     x_bytes*ceil(N/BN) + w_bytes*ceil(M/BM) + out_bytes, the
+               traffic with no cache reuse across tiles, an upper bound
+
 BM and BN come from the kernel each kq arm logged; the dense and affine
 arms use MLX's dispatch rule. Ops per weight are hand counts of the NAX
-loaders (kq_quantized_nax.h) and the chain rate counts a multiply-add as
-one op, as the counts do, so the ALU floor is an estimate; --ops-per-weight
-overrides a count. Rates are measured here unless --rates names a JSON a
-previous run wrote.
+loaders (kq_quantized_nax.h); where a count is a range the floor takes the
+low end. The chain rate counts a multiply-add as one op, as the counts do,
+so the ALU floor is an estimate; --ops-per-weight overrides a count. Rates
+are measured here unless --rates names a JSON a previous run wrote.
 """
 
 from __future__ import annotations
@@ -40,8 +48,8 @@ OPS_PER_WEIGHT = {
     "q4_1": 4.13,
     "q5_0": 8.19,
     "q4_k": 5.22,
-    "q5_k": 8.25,
-    "q6_k": 10.53,
+    "q5_k": 8.3,
+    "q6_k": 8.4,
     "q3_k": 8.44,
     "q2_k": 4.81,
     "iq4_nl": 5.09,
@@ -57,6 +65,10 @@ OPS_PER_WEIGHT = {
     "pq2_0": 5.25,
     "ptq1_0": 9.50,
 }
+# High end where a count is a range.
+OPS_PER_WEIGHT_HIGH = {"q5_k": 9.3}
+# Scalar byte loads per decoded weight, outside the ALU count.
+SCALAR_LOADS_PER_WEIGHT = {"q6_k": 2.0}
 # MLX affine: nibble or byte extract, two conversions, one multiply-add.
 AFFINE_OPS = 4.0
 
@@ -135,15 +147,21 @@ def measure_rates(dtypes, cube, alu_elems, alu_chain, bw_mib, reps):
     return rates
 
 
-def floors(M, K, N, wbits, bm, bn, ops, dtype, rates):
+def floors(M, K, N, wbits, bm, bn, ops, loads, dtype, rates):
+    """Floors in ms, the binding one, and the two side columns."""
     nax = 2.0 * M * K * N / rates["matmul_flops"][dtype]
-    alu = N * K * math.ceil(M / bm) * ops / rates["alu_ops"] if ops else 0.0
-    w_bytes = N * K * wbits / 8
-    moved = M * K * 2 * math.ceil(N / bn) + w_bytes * math.ceil(M / bm) + M * N * 2
-    byts = moved / rates["copy_bytes"]
-    fl = {"nax": nax * 1e3, "alu": alu * 1e3, "bytes": byts * 1e3}
+    decoded = N * K * math.ceil(M / bm)
+    alu = decoded * ops / rates["alu_ops"]
+    x_bytes, w_bytes, out_bytes = M * K * 2, N * K * wbits / 8, M * N * 2
+    compulsory = (x_bytes + w_bytes + out_bytes) / rates["copy_bytes"]
+    no_reuse = x_bytes * math.ceil(N / bn) + w_bytes * math.ceil(M / bm) + out_bytes
+    fl = {"nax": nax * 1e3, "alu": alu * 1e3, "bytes": compulsory * 1e3}
     bind = max(fl, key=fl.get)
-    return fl, bind
+    side = {
+        "loads": decoded * loads / rates["alu_ops"] * 1e3,
+        "no_reuse_bytes": no_reuse / rates["copy_bytes"] * 1e3,
+    }
+    return fl, bind, side
 
 
 def settled(rec):
@@ -159,7 +177,7 @@ def cell_rows(result, rates, ops_over, arms):
             M, K, N = g["M"], g["K"], g["N"]
             ref = []
             if "dense" in arms and "dense" in g["shared"]:
-                ref.append(("dense", None, g["shared"]["dense"], 16.0, 0.0))
+                ref.append(("dense", None, g["shared"]["dense"], 16.0, 0.0, 0.0))
             for c in g["cells"]:
                 codec = c["codec"]
                 bits = dc.affine_bits(codec)
@@ -169,18 +187,24 @@ def cell_rows(result, rates, ops_over, arms):
                     and aff
                     and not any(r[0] == f"affine{bits}" for r in ref)
                 ):
-                    ref.append((f"affine{bits}", None, aff, bits + 0.5, AFFINE_OPS))
+                    ref.append(
+                        (f"affine{bits}", None, aff, bits + 0.5, AFFINE_OPS, 0.0)
+                    )
                 ops = ops_over.get(codec, OPS_PER_WEIGHT.get(codec))
+                loads = SCALAR_LOADS_PER_WEIGHT.get(codec, 0.0)
                 for arm in ("kq", "kq_bm64", "kq_bm128"):
                     rec = c["arms"].get(arm)
                     if arm in arms and rec and not rec.get("error"):
-                        ref.append((arm, codec, rec, dc.weight_bits(codec), ops))
-            for arm, codec, rec, wbits, ops in ref:
+                        wb = dc.weight_bits(codec)
+                        ref.append((arm, codec, rec, wb, ops, loads))
+            for arm, codec, rec, wbits, ops, loads in ref:
                 ms = settled(rec)
                 bm, bn = dc.tile_bm_bn(rec.get("tile"))
                 if ms is None or bm is None:
                     continue
-                fl, bind = floors(M, K, N, wbits, bm, bn, ops or 0.0, dtype, rates)
+                fl, bind, side = floors(
+                    M, K, N, wbits, bm, bn, ops or 0.0, loads, dtype, rates
+                )
                 out.append(
                     {
                         "dtype": dtype,
@@ -196,9 +220,12 @@ def cell_rows(result, rates, ops_over, arms):
                         "tile": rec.get("tile"),
                         "ms": ms,
                         "floors_ms": fl,
+                        "side_ms": side,
                         "binding": bind,
                         "over_floor": ms / fl[bind],
                         "ops_per_weight": ops,
+                        "ops_per_weight_high": OPS_PER_WEIGHT_HIGH.get(codec),
+                        "scalar_loads_per_weight": loads,
                     }
                 )
     return out
@@ -220,18 +247,19 @@ def markdown(rows, rates, desc):
         lines.append("")
         lines.append(
             "| op | L x B | M | arm | codec | tile | ms | NAX | ALU | bytes "
-            "| binds | ms / floor |"
+            "| binds | ms / floor | loads | no reuse |"
         )
-        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for r in rows:
             if r["dtype"] != dtype:
                 continue
-            f = r["floors_ms"]
+            f, sd = r["floors_ms"], r["side_ms"]
             lines.append(
                 f"| {r['family']}.{r['op']} | {r['L']} x {r['B']} | {r['M']} "
                 f"| {r['arm']} | {r['codec'] or '-'} | {r['tile']} | {r['ms']:.3f} "
                 f"| {f['nax']:.3f} | {f['alu']:.3f} | {f['bytes']:.3f} "
-                f"| {r['binding']} | {r['over_floor']:.2f} |"
+                f"| {r['binding']} | {r['over_floor']:.2f} "
+                f"| {sd['loads']:.3f} | {sd['no_reuse_bytes']:.3f} |"
             )
         lines.append("")
     return "\n".join(lines)
@@ -284,6 +312,8 @@ def main():
             print("warning: input was measured on another build", file=sys.stderr)
         rows += cell_rows(r, rates, ops_over, arms)
     out = {"machine": desc, "rates": rates, "ops_per_weight": OPS_PER_WEIGHT}
+    out["ops_per_weight_high"] = OPS_PER_WEIGHT_HIGH
+    out["scalar_loads_per_weight"] = SCALAR_LOADS_PER_WEIGHT
     out["ops_overrides"] = ops_over
     out["rows"] = rows
     if args.json_out:
