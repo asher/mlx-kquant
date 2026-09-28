@@ -78,7 +78,7 @@ def child(args):
 
     for fam in args.families:
         for op in dc.FAMILIES[fam]["ops"]:
-            for L in args.rows or dc.FAMILIES[fam]["rows"]:
+            for L in dc.op_rows(fam, op, args.rows):
                 for B in args.batches:
                     g = dc.cell(fam, op, L, B, args.shrink)
                     for codec in args.codecs:

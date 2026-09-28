@@ -2,7 +2,8 @@
 
 Cells are (op, rows per item L, batch B, codec). A batch of two runs as
 [2, L, K], which the op flattens to 2L rows, so the tile policy can pick a
-different tile at B 2 than at B 1. Arms, switched by live levers
+different tile at B 2 than at B 1. The modulation linears run at one row
+per item, where the tile arms do not apply. Arms, switched by live levers
 (KQ_TUNE_LIVE=1 is set on import of dit_common):
 
   dense     stock matmul on a dense weight in the activation dtype
@@ -64,7 +65,7 @@ def build_groups(args, heavy_codecs):
         spec = dc.FAMILIES[fam]
         ops = [o for o in spec["ops"] if not args.ops or o in args.ops]
         for op in ops:
-            for L in args.rows or spec["rows"]:
+            for L in dc.op_rows(fam, op, args.rows):
                 for B in args.batches:
                     g = dc.cell(fam, op, L, B, args.shrink)
                     g["heavy"] = (fam, op, L, B) in dc.HEAVY
@@ -85,7 +86,9 @@ def arm_instances(group, arms):
             out.append((f"affine{bits}", None))
     for c in group["codecs"]:
         for a in ("kq", "kq_bm64", "kq_bm128", "deq", "kq_aa"):
-            if a in arms:
+            # Tile arms do not apply at one row per item, where the mat-vec
+            # routes run.
+            if a in arms and not (group["vector"] and a in dc.ARM_TILE_FORCED):
                 out.append((a, c))
     return out
 
@@ -400,7 +403,11 @@ def main():
     )
     ap.add_argument("--families", default=",".join(dc.FAMILIES))
     ap.add_argument("--ops", default="", help="subset of op names, comma separated")
-    ap.add_argument("--rows", default="", help="rows per item; default per family")
+    ap.add_argument(
+        "--rows",
+        default="",
+        help="rows per item; default per family (modulation ops keep one row)",
+    )
     ap.add_argument("--batches", default="1,2")
     ap.add_argument("--codecs", default=",".join(dc.MAIN_CODECS))
     ap.add_argument(

@@ -27,7 +27,8 @@ TESTS_DIR = os.path.join(
 
 # (K, N) per linear. Rows per item are image tokens plus padded caption
 # tokens at 1024 and 2048 pixels, each also run as a batch of two; Qwen-Image
-# adds two text lengths that are not multiples of 32.
+# adds two text lengths that are not multiples of 32. The modulation linears
+# take one row per image (the timestep embedding), so they run at M 1 and 2.
 IMAGE_ROWS = [4096, 4128, 4192, 4256, 4608, 4640, 16384, 16896]
 FAMILIES = {
     "zimage": {
@@ -39,6 +40,7 @@ FAMILIES = {
             "adaln": (256, 15360),
         },
         "rows": IMAGE_ROWS,
+        "op_rows": {"adaln": [1]},
     },
     "qwen_image": {
         "ops": {
@@ -48,6 +50,7 @@ FAMILIES = {
             "mod": (4096, 16384),
         },
         "rows": IMAGE_ROWS + [4096 + 77, 4096 + 213],
+        "op_rows": {"mod": [1]},
     },
 }
 # The two heaviest cells by FLOPs per step, where every NAX codec runs.
@@ -60,6 +63,7 @@ THUE_MORSE = [bin(i).count("1") & 1 for i in range(8)]
 
 TILE_BM64 = "64,64,2,2"
 TILE_BM128 = "128,64,2,2"
+ARM_TILE_FORCED = ("kq_bm64", "kq_bm128")
 
 DTYPES = ("bfloat16", "float16")
 
@@ -310,6 +314,13 @@ def time_fn(fn, inner):
     return ms
 
 
+def op_rows(family, op, rows=None):
+    """Rows per item for an op: its fixed rows if it has them, else `rows`
+    or the family's image rows."""
+    spec = FAMILIES[family]
+    return spec["op_rows"].get(op) or rows or spec["rows"]
+
+
 def cell(family, op, rows, batch, shrink=1):
     """One shape visit: family op at `rows` per item and `batch` items."""
     K, N = FAMILIES[family]["ops"][op]
@@ -323,6 +334,7 @@ def cell(family, op, rows, batch, shrink=1):
         "B": batch,
         "M": batch * L,
         "L_model": rows,
+        "vector": op in FAMILIES[family]["op_rows"],
     }
 
 
