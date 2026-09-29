@@ -642,8 +642,8 @@ Tuning levers (defaults are right for normal use):
 
   q and k are float16 or bfloat16 and the outputs keep that dtype. The weights and tables may be any
   float dtype and are used in f32. The norm and the rotation run in f32 with one rounding at the
-  write, so the output is within 1 ulp of the exact result. The unfused composition also rounds the
-  normalized value before the rotation.
+  write, so nearly every output element is the exact result rounded to the output dtype. The unfused
+  composition also rounds the normalized value before the rotation.
 
   One threadgroup per `(b, l)` row covers every head of q and k, with 16 lanes per head row. Each
   lane loads its cosines, sines and weights once per row and reuses them across heads. Head dims 64,
