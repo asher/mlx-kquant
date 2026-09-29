@@ -1904,16 +1904,27 @@ static bool kq_midm_splitk(int M, int N) {
 // the NAX tile weighted by calls per forward, and no cell loses more than
 // 2%. At four or five per core, N 10240 at M 33-64 (one full wave) loses
 // up to 1.6x, and M 97-128 wins or loses by codec.
-static int kq_midm_nax_target(int M, int N) {
-  if (kq_midm_splitk(M, N)) {
-    return kq_splitk_nax_target;
-  }
+// q4_0 and q8_0 cut K in units of 64 weights, so at K 5120 these targets
+// write 16 or 8 partials where the 256-weight codecs write 10 or 5. With
+// float partials (f32) that traffic costs more than the added threadgroups
+// gain, and the two codecs target 10 from M 33 to 64 and 5 from M 65 to 96.
+// On an M5 Max over the Qwen3.8-27B projections on float16 activations,
+// per cell against 16 and 8: 0.79-1.01x the time at M 33-64, and
+// 0.67-1.11x at M 65-96, where every cell above 1.03x has K 6144 or 17408.
+// bfloat16 with KQ_SPLITK_F32=1 takes the same targets, not measured there.
+static int kq_midm_nax_target(int M, int N, const std::string& t, bool f32) {
   const int cores = gpu_core_count();
   const int grid = ((N + 63) / 64) * ((M + 63) / 64);
-  if (M >= 65 && M <= 96 && grid < 16 * (cores > 0 ? cores : 40)) {
-    return 8;
+  int target = 0;
+  if (kq_midm_splitk(M, N)) {
+    target = kq_splitk_nax_target;
+  } else if (M >= 65 && M <= 96 && grid < 16 * (cores > 0 ? cores : 40)) {
+    target = 8;
   }
-  return 0;
+  if (target > 0 && f32 && M <= 96 && (t == "q4_0" || t == "q8_0")) {
+    return M <= 64 ? 10 : 5;
+  }
+  return target;
 }
 
 // KQ_SPLITK_CAP=<n> (probe lever, read live) caps the default slice target
@@ -2697,7 +2708,8 @@ void KQuantMatmul::eval_gpu_base(
       (K % 64 == 0) && x.dtype() != mx::float32) {
     const int midm = kq_env_int("KQ_QMM_MIDM", -1);
     const int sk_env = kq_env_int("KQ_QMM_SPLITK_NAX", -1);
-    const int rule = kq_midm_nax_target(M, N);
+    const int rule = kq_midm_nax_target(
+        M, N, kquant_type_, kq_splitk_partials(x.dtype()).dtype == mx::float32);
     if (sk_env != 0 && (midm == 1 || (midm == -1 && rule > 0))) {
       const int target = sk_env > 1 ? sk_env
           : rule > 0                ? rule
