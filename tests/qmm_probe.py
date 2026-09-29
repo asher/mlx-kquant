@@ -54,7 +54,8 @@ def weights(codec, n, k, design):
     # design "tiled": 64 quantized rows repeated to n, for wide N at little
     # quantize cost. design "big": small weights, nonnegative where the
     # codec quantizes, so large activations give a large sum per block and
-    # a moderate output.
+    # a moderate output. design "cancel": weights near +0.05 on the first
+    # half of K and -0.05 on the second, so the halves cancel.
     key = (codec, n, k, design)
     if key not in _weights:
         _, _, bpb, wpb = CODEC_GEOMETRY[codec]
@@ -69,6 +70,10 @@ def weights(codec, n, k, design):
         elif design == "big":
             wf = mx.abs(mx.random.normal((n, k), key=mx.random.key(2))) * 1e-3
             w, s = kq.quantize(wf, codec)
+        elif design == "cancel":
+            sign = mx.where(mx.arange(k) < k // 2, 1.0, -1.0)
+            noise = mx.random.normal((n, k), key=mx.random.key(3)) * 0.002
+            w, s = kq.quantize(0.05 * sign[None, :] + noise, codec)
         elif design == "tiled":
             wf = mx.random.normal((64, k), key=mx.random.key(4)) * 0.1
             w1, s = kq.quantize(wf, codec)
@@ -98,7 +103,8 @@ def dequantized(codec, n, k, design):
 
 def activations(shape, dtype, layout, seed, design):
     # design "lead": nonnegative activations whose first K column is 1024,
-    # so the first K slice of a split holds most of each output.
+    # so the first K slice of a split holds most of each output. design
+    # "cancel": activations near 3e4.
     key = mx.random.key(seed)
     lead = design == "lead"
 
@@ -108,6 +114,8 @@ def activations(shape, dtype, layout, seed, design):
         if design == "big":
             # 2e4 and up, inside the float16 range.
             return mx.minimum(mx.abs(mx.random.normal(s, key=key)) * 1e4 + 2e4, 6e4)
+        if design == "cancel":
+            return mx.random.uniform(-100.0, 100.0, s, key=key) + 3e4
         return mx.random.normal(s, key=key) * 0.5
 
     if layout == "dense":
@@ -199,6 +207,7 @@ for i, c in enumerate(spec["calls"]):
         ref = refs["ref"]
         got = np.array(y.astype(mx.float32)).astype(np.float64)
         res["rel"] = float(np.linalg.norm(got - ref) / (np.linalg.norm(ref) + 1e-30))
+        res["nonfinite"] = int((~np.isfinite(got)).sum())
         if c.get("r2"):
             # R2: weights rounded to the activation dtype. floor1 and floor2:
             # the error of rounding each reference to the output dtype.

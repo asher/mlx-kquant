@@ -557,14 +557,17 @@ static bool kq_nax_swizzle_on() {
   return kq_tune_live() ? kq_env_int("KQ_NAX_SWIZZLE", 0) != 0 : cached;
 }
 
-// KQ_SPLITK_F32: 0 (default) = the split-K routes (qmm_splitk, verify_mma,
-// verify_nax, qmm_nax_splitk) store their K-slice partials in the
-// activation dtype, which rounds every slice once more before the fold;
-// 1 = partials in float, so the fold rounds the result once. Read once
-// per process unless KQ_TUNE_LIVE=1.
-static bool kq_splitk_f32() {
-  static const bool cached = kq_env_int("KQ_SPLITK_F32", 0) != 0;
-  return kq_tune_live() ? kq_env_int("KQ_SPLITK_F32", 0) != 0 : cached;
+// KQ_SPLITK_F32 picks the dtype of the K-slice partials of the split-K
+// routes (qmm_splitk, verify_mma, verify_nax, qmm_nax_splitk). Unset
+// (default): float16 activations store float partials, since a float16
+// partial can pass 65504 where the sum does not, and bfloat16 activations
+// store bfloat16 partials, which round every slice once more before the
+// fold. 1 = float partials for both, so the fold rounds the result once;
+// 0 = partials in the activation dtype for both. Read once per process
+// unless KQ_TUNE_LIVE=1.
+static int kq_splitk_f32_mode() {
+  static const int cached = kq_env_int("KQ_SPLITK_F32", -1);
+  return kq_tune_live() ? kq_env_int("KQ_SPLITK_F32", -1) : cached;
 }
 
 // Partial dtype and kernel name suffix of a split-K call. Float
@@ -582,7 +585,8 @@ static KqSplitkPartials kq_splitk_partials(mx::Dtype dt, bool f32) {
 }
 
 static KqSplitkPartials kq_splitk_partials(mx::Dtype dt) {
-  return kq_splitk_partials(dt, kq_splitk_f32());
+  const int mode = kq_splitk_f32_mode();
+  return kq_splitk_partials(dt, mode < 0 ? dt == mx::float16 : mode != 0);
 }
 
 // KQ_QMM_LOG set (any value): the qmm tiles log the kernel name and shape
@@ -1081,7 +1085,7 @@ static std::string kq_splitk_accum_kname(
 // [5376 x 21504]) and the in-tile K walk serializes, capping qmm/NAX at
 // 160-257 GB/s while mv_ext decays past M~4 on L2 activation re-reads.
 // Partitioning K across grid.z multiplies threadgroup count by `splits`;
-// each slice writes a partial tile in T (float under KQ_SPLITK_F32=1) and
+// each slice writes a partial tile, float or T by kq_splitk_partials, and
 // a second tiny pass folds them in f32. Slice starts must land on wire-block
 // boundaries, so the partition is a multiple of group_size (the caller
 // guarantees splits divides K / group_size). Non-batched transpose shapes only.

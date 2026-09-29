@@ -1,5 +1,5 @@
-"""Split-K partials: the activation dtype by default, float under
-KQ_SPLITK_F32=1.
+"""Split-K partials: float on float16 and bfloat16 on bfloat16 by default,
+float on both under KQ_SPLITK_F32=1, the activation dtype on both under 0.
 
 The split routes (qmm_splitk, verify_mma, verify_nax, qmm_nax_splitk) fold
 their K slices in f32. With float partials the fold rounds the result once,
@@ -15,9 +15,9 @@ output and its rounding shows fully. At K 12288 and N 256:
   the tile run within 2 percent of that floor.
 - Every split route stays within 1 ulp and half an output rounding of its
   reference: the tile, or the same verify route run as one slice.
-- KQ_SPLITK_F32=0, the default, dispatches the T-partial kernels, which sit
-  more than one output rounding from that reference, with an R2 excess
-  above half the floor on the qmm routes.
+- KQ_SPLITK_F32=0 dispatches the T-partial kernels, which sit more than
+  one output rounding from that reference, with an R2 excess above half
+  the floor on the qmm routes.
 
 Dense, lazy transposed, strided and batch-of-two inputs all take the
 checks. On the CPU stream the levers do nothing: every pair of calls
@@ -203,38 +203,49 @@ def test_splitk_partials(codec, dtype):
                 assert dist > 1.0, (where, dist)
 
 
-# With no KQ_SPLITK_F32 set, a split call dispatches the T-partial kernel,
-# and KQ_SPLITK_F32=1 its float twin.
-def test_splitk_f32_default_off():
+# With no KQ_SPLITK_F32 set, a float16 split call dispatches the float
+# partial kernel and a bfloat16 one the T-partial kernel. KQ_SPLITK_F32=1
+# takes the float twin and 0 the T-partial kernel on both.
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_splitk_f32_default(dtype):
     if force_cpu():
         pytest.skip("GPU split-K kernels")
-    call = {"codec": "q4_k", "shape": [8, K], "n": N, "dtype": "bfloat16"}
+    call = {"codec": "q4_k", "shape": [8, K], "n": N, "dtype": dtype}
     env = {"KQ_QMM_LOG": "1", "KQ_QMM_ROUTE": "splitk", **FORCE}
     names = []
-    for extra in ({}, {"KQ_SPLITK_F32": "1"}):
+    for extra in ({}, {"KQ_SPLITK_F32": "1"}, {"KQ_SPLITK_F32": "0"}):
         (r,) = run_probe([call], env={**env, **extra})
         assert r["error"] is None, r["error"]
         ((name, grid),) = r["kernels"]
         assert "_qmm_t_splitk_" in name and grid[2] > 1, (name, grid)
         names.append(name)
-    assert not names[0].endswith("_pf32"), names
-    assert names[1] == names[0] + "_pf32", names
+    plain = names[2]
+    assert not plain.endswith("_pf32"), names
+    assert names[1] == plain + "_pf32", names
+    assert names[0] == (plain + "_pf32" if dtype == "float16" else plain), names
 
 
 # Without KQ_TUNE_LIVE, KQ_SPLITK_F32 is read once per process: a change
 # after the first split call does not reach the later ones.
-def test_splitk_f32_keeps_first_read():
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_splitk_f32_keeps_first_read(dtype):
     if force_cpu():
         pytest.skip("GPU split-K kernels")
-    call = {"codec": "q4_k", "shape": [8, K], "n": N, "dtype": "bfloat16"}
+    call = {"codec": "q4_k", "shape": [8, K], "n": N, "dtype": dtype}
     env = {"KQ_QMM_LOG": "1", "KQ_QMM_ROUTE": "splitk", **FORCE}
-    for first, later in (("1", [None, "0"]), ("0", [None, "1"])):
+    unset_pf32 = dtype == "float16"
+    arms = [
+        ("1", [None, "0"], True),
+        ("0", [None, "1"], False),
+        (None, ["0" if unset_pf32 else "1"], unset_pf32),
+    ]
+    for first, later, pf32 in arms:
         calls = [call] + [dict(call, env={"KQ_SPLITK_F32": v}) for v in later]
-        res = run_probe(calls, env={**env, "KQ_SPLITK_F32": first})
+        first_env = {} if first is None else {"KQ_SPLITK_F32": first}
+        res = run_probe(calls, env={**env, **first_env})
         names = []
         for r in res:
             assert r["error"] is None, r["error"]
             ((name, _),) = r["kernels"]
             names.append(name)
-        pf32 = first == "1"
-        assert all(n.endswith("_pf32") == pf32 for n in names), names
+        assert all(n.endswith("_pf32") == pf32 for n in names), (first, names)

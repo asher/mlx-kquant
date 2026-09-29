@@ -8,12 +8,13 @@ dtype and sums each block in float. With float partials
 (KQ_SPLITK_F32=1) it keeps the R1 model on both designs: the result sits
 within a tenth of an output rounding of float64 over the exact weights.
 The tile rounds the weights to the activation dtype (R2), so the two sit
-within two output roundings of each other. With the default partials in
-the activation dtype each K slice rounds once more, which adds about one
-output rounding: the result stays finite and within one and a half output
-roundings of the R1 model. KQ_VERIFY_MMA_HALF=1 selects the half kernels,
-whose range stops at 65504. With the default partials on ordinary float16
-activations, their error beyond the R1 model is at least three times that
+within two output roundings of each other. With partials in the
+activation dtype (KQ_SPLITK_F32=0) each K slice rounds once more, which
+adds about one output rounding: the result stays finite and within one and
+a half output roundings of the R1 model. KQ_VERIFY_MMA_HALF=1 selects the
+half kernels, whose range stops at 65504. With the same partials on
+ordinary float16 activations, their error beyond the R1 model is at least
+three times that
 of the float kernels.
 """
 

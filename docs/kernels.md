@@ -166,13 +166,15 @@ Tuning levers (defaults are right for normal use):
   or not, to stderr, one `[kq qmm]` line each. The grid depth is the K slice count. The mat-vec
   routes (`qmv`, `verify_qmv`, `mv_ext`) do not log. Unset (off) by default. Read once per
   process unless `KQ_TUNE_LIVE=1`.
-- `KQ_SPLITK_F32` - opt-in float partials for the split-K routes (`splitk`, `nax_splitk`, the
-  `KQ_QMM_MIDM` band, and `verify_mma` and `verify_nax` when they split K). `1` stores each K
-  slice's partial in float, so the fold rounds the result once, as the unsplit kernels do. The
-  default `0` keeps the previous kernels, which store the partials in the activation dtype and so
-  round each slice once more before the fold. Where one K slice carries most of an output, that
-  puts the split result more than one output rounding from the unsplit one. Float activations
-  store float partials either way. Read once per process unless `KQ_TUNE_LIVE=1`.
+- `KQ_SPLITK_F32` - partial dtype of the split-K routes (`splitk`, `nax_splitk`, the
+  `KQ_QMM_MIDM` band, and `verify_mma` and `verify_nax` when they split K). Float partials let the
+  fold round the result once, as the unsplit kernels do. Partials in the activation dtype round
+  each slice once more before the fold, and where one K slice carries most of an output, that puts
+  the split result more than one output rounding from the unsplit one. On float16 they also stop at
+  65504, so a slice sum past it turns to inf even where the output is finite. Unset, float16
+  activations store float partials and bfloat16 activations keep the previous bfloat16 partials.
+  `1` stores float partials on both, and `0` stores partials in the activation dtype on both.
+  Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_NAX_SMALL_BM` - small-M routing. `0` restores the old routing (mat-vec paths below M 13 and
   no BM=32 tile), `2` forces BM=32 for policy-excluded codecs, unset or `1` follows the per-codec
   policy. Read once per process unless `KQ_TUNE_LIVE=1`.
@@ -309,16 +311,17 @@ head-sized N already fills the GPU with one split and writes the output directly
 
 The kernels decode the codes exactly in half and keep the activations in their own dtype in
 threadgroup memory. Both widen to float in the fragment, so each block sums in float and the block
-scale applies in float. Unsplit, or split with `KQ_SPLITK_F32=1`, the result rounds once, as the
-mat-vec kernels do with the exact weights, at any activation magnitude. `KQ_VERIFY_MMA_HALF=1` runs
-the half kernels these replace, which stage the activations as half and sum each block in half.
-There an activation beyond the half range (magnitude 65504), such as a bfloat16 outlier, turns to
-inf, and so does a block sum past it. On ordinary activations with float partials, the error of the
-half kernels runs 0.4 to 0.9 output roundings beyond the rounding of the float64 result on
-bfloat16, and 4 to 7 on float16, and the float kernels run within 0.01. The default partials in the
-activation dtype add about one output rounding to a split call of either kernel, which puts the half
-kernels at 1.1 to 1.4 on bfloat16 and 4 to 7.5 on float16, and the float kernels at about 1 on
-both. An earlier float accumulator ran `pq2_0` at half the speed of the half kernels, and the float
+scale applies in float. Unsplit, or split with float partials (the float16 default, and
+`KQ_SPLITK_F32=1`), the result rounds once, as the mat-vec kernels do with the exact weights, at
+any activation magnitude. `KQ_VERIFY_MMA_HALF=1` runs the half kernels these replace, which stage
+the activations as half and sum each block in half. There an activation beyond the half range
+(magnitude 65504), such as a bfloat16 outlier, turns to inf, and so does a block sum past it. On
+ordinary activations with float partials, the error of the half kernels runs 0.4 to 0.9 output
+roundings beyond the rounding of the float64 result on bfloat16, and 4 to 7 on float16, and the
+float kernels run within 0.01. Partials in the activation dtype (the bfloat16 default, and
+`KQ_SPLITK_F32=0`) add about one output rounding to a split call of either kernel, which puts the
+half kernels at 1.1 to 1.4 on bfloat16 and 4 to 7.5 on float16, and the float kernels at about 1
+on both. An earlier float accumulator ran `pq2_0` at half the speed of the half kernels, and the float
 kernels have not been timed against them.
 
 The entry M depends on the device. Without NAX, `pq2_0` and `ptq1_0` enter at M 3 (`pq2_0` at M 4

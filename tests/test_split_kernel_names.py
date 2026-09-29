@@ -1,7 +1,8 @@
 """Split-K kernel names, with no dispatch.
 
 Each split-K kernel on bfloat16 or float16 activations has a _pf32 twin
-that stores float partials (KQ_SPLITK_F32=1), each twin has its base
+that stores float partials (float16 by default, bfloat16 under
+KQ_SPLITK_F32=1), each twin has its base
 kernel, and float activations have no twin. Every name the split-K
 dispatchers can build must be in the metallib.
 """

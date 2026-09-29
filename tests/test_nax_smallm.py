@@ -576,7 +576,7 @@ def test_nax_splitk_ragged(codec, dtype, monkeypatch):
 def _logged(calls, env):
     """(error, kernels) per call from one probe process with KQ_QMM_LOG on.
     Two routes can agree in every output bit, the split routes most of all
-    under KQ_SPLITK_F32=1, so which route ran, and with how many K slices,
+    with float partials, so which route ran, and with how many K slices,
     need not show in the output; the log names both. A probe that fails
     returns its failure in every entry instead of raising, so the tests
     that share it fail on their own entries."""
@@ -1564,6 +1564,6 @@ def test_nax_small_m_yields_to_static_levers(lever, codec, m, expect, other):
     names = _logged_kernels(out.stderr)
     # A route matches the default when its output bits and its logged
     # kernels both do: two routes can agree in every bit, split routes most
-    # of all under KQ_SPLITK_F32=1.
+    # of all with float partials.
     res = {r: bits[r] and names[r] == names["default"] for r in bits}
     assert res[expect] and not any(res[o] for o in others), (lever, codec, m, res)

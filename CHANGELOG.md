@@ -19,14 +19,16 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rebuilds its reports from that log after a stopped or failed run.
 - `KQ_SPLITK_CAP` limits the K slices of matmuls with 32 or fewer rows by the
   GPU core count, for A/B runs on wide matmuls such as a vocab head.
-- `KQ_SPLITK_F32=1` makes split-K matmuls at 128 or fewer rows, MTP verify
-  among them, round once instead of once per K slice. Off by default.
+- `KQ_SPLITK_F32=1` makes bfloat16 split-K matmuls, MTP verify among them,
+  round once instead of once per K slice. `0` restores the old float16 kernels.
 
 ### Changed
 - On NAX GPUs (M5), prefill and image steps of 4096 or more tokens no longer
   change matmul kernels with the token count. The 4096 threshold is provisional.
 
 ### Fixed
+- A float16 matmul of 128 or fewer rows split over K, MTP verify among them,
+  no longer returns inf where its output is finite.
 - Matmuls of 2 to 8 rows on q4_0, pq2_0 and ptq1_0 weights, MTP verify among
   them, no longer return inf for activations past 65504, and fp16 error drops 3-5x.
 
