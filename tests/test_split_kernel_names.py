@@ -21,7 +21,19 @@ from qmm_probe import force_cpu
 
 import mlx_kquant as kq
 
-pytestmark = pytest.mark.skipif(force_cpu(), reason="Metal kernel names")
+
+def _no_metallib():
+    """True under KQUANT_FORCE_CPU, on a build without Metal, or when the
+    bundled metallib does not load."""
+    if force_cpu():
+        return True
+    try:
+        return not kq.metallib_loads()
+    except Exception:
+        return True
+
+
+pytestmark = pytest.mark.skipif(_no_metallib(), reason="Metal kernel names")
 
 FAMILY = re.compile(
     r"_(qmm_t_splitk|qmm_t_nax_splitk|verify_mma|verify_nax)_|^kquant_qmm_splitk_accum_"
