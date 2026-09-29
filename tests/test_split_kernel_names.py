@@ -9,7 +9,11 @@ be in the metallib.
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
+import sys
 
 import pytest
 from mlx_kquant._ext import _split_kernel_names
@@ -83,3 +87,28 @@ def test_host_split_names_exist():
     for end in ("_pf32", "_h", "_h_pf32"):
         assert any(n.endswith(end) for n in host), end
     assert not any(TYPE.search(n.removesuffix("_pf32"))[1] == "float" for n in host)
+
+
+def test_host_names_follow_the_dispatch_levers():
+    # The enumerator takes its tiles and verify_nax steps from the dispatch
+    # helpers, so the levers that retire a tile or a step retire its names.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KQ_")}
+    env.update(KQ_QMM_SPLITK_BM8="0", KQ_VERIFY_NAX_Q4_0_SB="0")
+    code = (
+        "import json; from mlx_kquant._ext import _split_kernel_names as f; "
+        "print(json.dumps(f()))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    names = set(json.loads(out.stdout.strip().splitlines()[-1]))
+    host = set(_split_kernel_names())
+    assert names < host
+    retired = {
+        n for n in host if "_splitk_bm8_" in n or n.startswith("kquant_q4_0_sb_")
+    }
+    assert retired and host - names == retired

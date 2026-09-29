@@ -15,9 +15,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 
 #include "kquant.h"
 #include "kquant_codec.h"
@@ -973,6 +975,12 @@ static KqSplitkTile kq_splitk_tile(int M, const std::string& t) {
   return {bm8 ? 8 : (small ? 16 : 32), small ? 64 : 32};
 }
 
+// NAX split-K tile rows: BM=32 through M 48, where the last row tile of
+// the mid-M band holds at most 16 rows, and BM=64 above.
+static int kq_nax_splitk_bm(int M) {
+  return M <= 48 ? 32 : 64;
+}
+
 // Kernel names of the split-K routes and their fold. The dispatchers and
 // split_kernel_names build the names here, so a test of the names that
 // split_kernel_names lists covers every name a dispatch can ask for.
@@ -1369,8 +1377,8 @@ void qmm_nax_splitk(
     Device& d,
     const Stream& s,
     const std::string& kquant_type,
-    int k_partition,
-    int bm = 32) {
+    int k_partition) {
+  const int bm = kq_nax_splitk_bm(M);
   constexpr int bn = 64;
   constexpr int wm = 2, wn = 2;
   const int part_stride = M * N;
@@ -2695,9 +2703,8 @@ void KQuantMatmul::eval_gpu_base(
     }
   }
 
-  // Mid-M split-K on NAX GPUs where kq_midm_nax_target gives a target.
-  // BM32 through M 48, where the last row tile holds at most 16 rows and
-  // runs K-split, and BM64 above. KQ_QMM_MIDM (read live) is the same probe
+  // Mid-M split-K on NAX GPUs where kq_midm_nax_target gives a target, on
+  // the tile kq_nax_splitk_bm picks. KQ_QMM_MIDM (read live) is the same probe
   // lever. KQ_QMM_SPLITK_NAX=0 turns it off with the small-M route, and a
   // larger value sets its target.
   if (transpose_ && non_batched && M > 32 && M <= 128 && nax_path &&
@@ -2729,8 +2736,7 @@ void KQuantMatmul::eval_gpu_base(
             d,
             s,
             kquant_type_,
-            per * q,
-            M <= 48 ? 32 : 64);
+            per * q);
         return;
       }
     }
@@ -2958,11 +2964,12 @@ int qmv_fine_max_n(const std::string& kquant_type) {
 
 // Every kernel name the split-K dispatchers can build, over the codecs
 // their gates admit and the bfloat16 and float16 activations the ops pass,
-// both tiles or kernel variants, both N alignments and both partial
-// dtypes. The gates read the codec table, not KQ_DISABLE_NAX. Names repeat
-// across routes.
+// both N alignments, both partial dtypes and both verify_mma variants. The
+// tiles, NAX tile rows and verify_nax steps come from the dispatch helpers
+// over every M the split routes serve (1 to 128) and every K kind, under
+// this process's levers. The gates read the codec table, not
+// KQ_DISABLE_NAX. Names repeat across routes.
 std::vector<std::string> split_kernel_names() {
-  const KqSplitkTile tiles[] = {{8, 64}, {16, 64}, {32, 32}};
   std::vector<std::string> out;
   auto each_suffix = [](mx::Dtype dt, auto&& f) {
     f(kq_splitk_partials(dt, false).suffix);
@@ -2978,10 +2985,25 @@ std::vector<std::string> split_kernel_names() {
     const KQuantCodec* codec = codec_by_name(t);
     const int gs = codec->weights_per_block;
     const int bits = codec->bits;
+    std::set<std::pair<int, int>> tiles;
+    std::set<int> nax_bms;
+    for (int M = 1; M <= 128; ++M) {
+      const KqSplitkTile tile = kq_splitk_tile(M, t);
+      tiles.insert({tile.bm, tile.bn});
+      nax_bms.insert(kq_nax_splitk_bm(M));
+    }
+    // K of whole codec steps, and a multiple of 256 steps, which covers
+    // every step kq_verify_nax_call_kstep picks.
+    const int kstep = codec_verify_nax_kstep(t);
+    std::set<int> ksteps;
+    for (int K : {kstep, 256 * kstep}) {
+      ksteps.insert(kq_verify_nax_call_kstep(K, t));
+    }
     for (mx::Dtype dt : {mx::bfloat16, mx::float16}) {
       const std::string ts = kq_type_string(dt);
       if (kq_splitk_codec(t)) {
-        for (const KqSplitkTile& tile : tiles) {
+        for (const auto& [bm, bn] : tiles) {
+          const KqSplitkTile tile{bm, bn};
           for (bool aligned : {true, false}) {
             each_suffix(dt, [&](const std::string& sfx) {
               out.push_back(
@@ -2991,7 +3013,7 @@ std::vector<std::string> split_kernel_names() {
         }
       }
       if (codec->has_nax_kernel) {
-        for (int bm : {32, 64}) {
+        for (int bm : nax_bms) {
           for (bool aligned : {true, false}) {
             each_suffix(dt, [&](const std::string& sfx) {
               out.push_back(
@@ -3007,12 +3029,7 @@ std::vector<std::string> split_kernel_names() {
           });
         }
       }
-      const int kstep = codec_verify_nax_kstep(t);
       if (codec->has_nax_kernel && kstep > 0) {
-        std::vector<int> ksteps = {kstep};
-        if (t == "q4_0") {
-          ksteps.push_back(256);
-        }
         for (int k : ksteps) {
           each_suffix(dt, [&](const std::string& sfx) {
             out.push_back(kq_verify_nax_kname(t, ts, gs, bits, k, sfx));
