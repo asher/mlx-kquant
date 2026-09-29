@@ -373,11 +373,33 @@ def _verify_mma_setup(codec, n_out, k=K):
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("n_out", [1024, 1000])
+@pytest.mark.parametrize("n_out", [1024, 1000, 40])
 @pytest.mark.parametrize("codec", VERIFY_MMA_CODECS)
 def test_verify_mma_band(codec, n_out, dtype, verify_mma_forced):
     w, s, ref_w = _verify_mma_setup(codec, n_out)
     _sweep(codec, w, s, ref_w, n_out, ms=VERIFY_MMA_MS, dtype=dtype)
+
+
+# Output rows per verify_mma threadgroup: 8 simdgroups of 8-row tiles, one
+# tile each on pq2_0 and ptq1_0 and two on q4_0 and q8_0.
+VERIFY_MMA_ROWS = {"pq2_0": 64, "ptq1_0": 64, "q4_0": 128, "q8_0": 128}
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+@pytest.mark.parametrize("codec", VERIFY_MMA_CODECS)
+def test_verify_mma_grid(codec, dtype):
+    ns = (1024, 1000)
+    calls = [{"codec": codec, "shape": [8, K], "n": n, "dtype": dtype} for n in ns]
+    env = {
+        "KQ_QMM_ROUTE": "verify_mma",
+        "KQ_QMM_ROUTE_STRICT": "1",
+        "KQ_VERIFY_MMA_SPLITS": "1",
+    }
+    rows = VERIFY_MMA_ROWS[codec]
+    for n, entry in zip(ns, _logged(calls, env), strict=True):
+        name, grid = _one_kernel(entry)
+        assert "_verify_mma_" in name, name
+        assert grid == (-(-n // rows), 1, 1), (name, grid)
 
 
 @pytest.mark.parametrize("codec", VERIFY_MMA_CODECS)

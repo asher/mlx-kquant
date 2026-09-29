@@ -1188,5 +1188,11 @@ struct KqPtq1_0Mma {
   }
 };
 
-KQ_DEFINE_VERIFY_MMA_KERNEL(pq2_0, KqPq2_0Mma, 2)
+// One row tile per simdgroup (NT 1). A pq2_0 block runs its 16 fragment
+// MMAs into one accumulator per row tile, a chain of dependent MMAs whose
+// latency, longer in float than in half, bounds the kernel; one row tile
+// per simdgroup doubles the threadgroups that hide it. On an M5 Max over
+// the Qwen3.8-27B shapes at M 2 to 8 the float kernel ran in 0.45-0.52x
+// its time at two row tiles.
+KQ_DEFINE_VERIFY_MMA_KERNEL(pq2_0, KqPq2_0Mma, 1)
 KQ_DEFINE_VERIFY_MMA_KERNEL(ptq1_0, KqPtq1_0Mma, 1)
