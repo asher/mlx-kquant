@@ -7,8 +7,8 @@ less accurate than the unfused composition, which rounds the normalized
 value to the input dtype before the rotation.
 
 Inputs come in the layouts a caller passes: packed, sliced from one fused
-qkv output, lazily transposed, misaligned for vector loads, and with a
-non-unit head-dim stride.
+qkv output, lazily transposed, misaligned for vector loads by the start, the
+head stride or the row stride, and with a non-unit head-dim stride.
 """
 
 from __future__ import annotations
@@ -27,7 +27,10 @@ import mlx_kquant as kq
 EPS = 1e-6
 DTYPES = [mx.bfloat16, mx.float16]
 KERNEL_DIMS = [64, 96, 128, 256]
-LAYOUTS = ["packed", "qkv", "transposed", "misaligned", "dstride"]
+# Views that start aligned and have an odd head or row stride, and a packed
+# view that starts one element off. Each misses the vector width in one place.
+ODD = ["hstride", "lstride", "offset"]
+LAYOUTS = ["packed", "qkv", "transposed", "misaligned", "dstride"] + ODD
 
 
 def _metal():
@@ -49,6 +52,19 @@ def _weights(D, dtype, seed):
     rng = np.random.default_rng(seed)
     w = (1.0 + 0.2 * rng.standard_normal((2, D))).astype(np.float32)
     return mx.array(w[0]).astype(dtype), mx.array(w[1]).astype(dtype)
+
+
+def _odd_view(x, layout):
+    """A view of the values of x [B, L, H, D] in one of the ODD layouts."""
+    B, L, H, D = x.shape
+    if layout == "hstride":
+        return mx.pad(x, [(0, 0), (0, 0), (0, 0), (0, 1)])[..., :D]
+    if layout == "lstride":
+        wide = mx.pad(x.reshape(B, L, H * D), [(0, 0), (0, 0), (0, 1)])
+        return wide[..., : H * D].reshape(B, L, H, D)
+    if layout == "offset":
+        return mx.pad(x.reshape(-1), (1, 0))[1:].reshape(B, L, H, D)
+    raise ValueError(layout)
 
 
 def _inputs(B, L, H, D, dtype, layout, seed=0, scale=None):
@@ -79,6 +95,9 @@ def _inputs(B, L, H, D, dtype, layout, seed=0, scale=None):
     elif layout == "dstride":
         q = draw((B, L, D, H)).transpose(0, 1, 3, 2)
         k = draw((B, L, D, H)).transpose(0, 1, 3, 2)
+    elif layout in ODD:
+        q = _odd_view(draw((B, L, H, D)), layout)
+        k = _odd_view(draw((B, L, H, D)), layout)
     else:
         raise ValueError(layout)
     mx.eval(q, k)
@@ -311,8 +330,8 @@ def test_kernel_set():
 @pytest.mark.parametrize("name", _kernel_names() if _metal() else [])
 def test_every_kernel(name):
     # Each kernel runs both load paths: vector loads on the fused qkv slice,
-    # element loads on a misaligned view. The two read the same values and
-    # must agree bit for bit.
+    # element loads on a misaligned view and on each ODD view. All read the
+    # same values and must agree bit for bit.
     m = re.fullmatch(r"kq_qk_norm_rope_(bfloat16|float16)_t_(\d+)", name)
     assert m, name
     dtype = getattr(mx, m.group(1))
@@ -339,3 +358,8 @@ def test_every_kernel(name):
     for a, b in zip(vec, strided, strict=True):
         assert mx.array_equal(a, b).item()
     assert mx.array_equal(vec[0], packed[0]).item()
+    for layout in ODD:
+        qv, kv = _odd_view(qa, layout), _odd_view(ka, layout)
+        mx.eval(qv, kv)
+        for a, b in zip(vec, _check(qv, kv, q_w, k_w, cos, sin), strict=True):
+            assert mx.array_equal(a, b).item()
