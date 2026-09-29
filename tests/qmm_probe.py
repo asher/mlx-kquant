@@ -10,8 +10,11 @@ float64 reference built from ``kq.dequantize`` weights. A call with
 activation dtype, and ``floor1``/``floor2``, the error of rounding each
 reference to the output dtype. A call with ``"ulp_vs": i`` gets ``ulp``,
 the largest ulp distance to call ``i``'s output, and ``rdiff``, the
-relative Frobenius distance to it. ``"design": "lead"`` draws nonnegative
-weights and activations whose first K column is 1024.
+relative Frobenius distance to it. Every call gets ``digest``, a hash of
+its output bits, to compare calls across probe processes.
+
+``"design": "lead"`` draws nonnegative weights and activations whose first
+K column is 1024.
 
 Under ``KQUANT_FORCE_CPU`` the child runs on the CPU device and never
 touches Metal, so the same probe covers both streams.
@@ -28,7 +31,7 @@ import sys
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _CHILD = r"""
-import json, os, sys
+import hashlib, json, os, sys
 import numpy as np
 spec = json.loads(sys.argv[1])
 sys.path.insert(0, spec["tests_dir"])
@@ -161,6 +164,9 @@ for i, c in enumerate(spec["calls"]):
         results.append(res)
         continue
     outs.append(y)
+    # Digest of the output bits, to compare calls across probe processes.
+    bits = y.view(mx.uint16) if y.dtype in DT.values() else y
+    res["digest"] = hashlib.sha1(np.array(bits).tobytes()).hexdigest()
     if spec.get("check", True):
         # Calls that differ only in env share their references.
         rkey = (

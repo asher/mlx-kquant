@@ -943,6 +943,27 @@ void qmm(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// qmm_splitk tile. The bm16 tile halves the MMA row-padding waste at
+// small M and widens BN to 64 so each K-step does more MMA work per
+// barrier; the bm8 tile halves it again for M <= 8 (one simdgroup along M,
+// four along N). On M3 Max the bm16 tile is bound per weight, not per byte
+// (q8_0 ~240 GB/s and q6_k ~180 GB/s both ~220 G weights/s), and the BM32
+// tile costs 1.45x per weight for 2x the MMA, so MMA issue is ~45% of the
+// tile. KQ_QMM_SPLITK_BM8=0 keeps M <= 8 on the bm16 tile.
+struct KqSplitkTile {
+  int bm;
+  int bn;
+};
+static KqSplitkTile kq_splitk_tile(int M, const std::string& t) {
+  static const bool bm8_enabled = []() {
+    const char* e = std::getenv("KQ_QMM_SPLITK_BM8");
+    return e == nullptr || std::atoi(e) != 0;
+  }();
+  const bool small = M <= 16 && kq_splitk_codec(t);
+  const bool bm8 = small && bm8_enabled && M <= 8;
+  return {bm8 ? 8 : (small ? 16 : 32), small ? 64 : 32};
+}
+
 // Split-K qmm_t for the small-M decode band and the mid-M band on non-NAX
 // GPUs (see kq_midm_splitk). The plain tile grid is only
 // ceil(N/64) x 1 threadgroups at decode shapes with M <= 32 (84 at
@@ -968,21 +989,11 @@ void qmm_splitk(
     const Stream& s,
     const std::string& kquant_type) {
   constexpr int wm = 2, wn = 2;
-  // The bm16 tile halves the MMA row-padding waste at small M and
-  // widens BN to 64 so each K-step does more MMA work per barrier; the
-  // bm8 tile halves it again for M <= 8 (one simdgroup along M, four
-  // along N). On M3 Max the bm16 tile is bound per weight, not per
-  // byte (q8_0 ~240 GB/s and q6_k ~180 GB/s both ~220 G weights/s), and
-  // the BM32 tile costs 1.45x per weight for 2x the MMA, so MMA issue is
-  // ~45% of the tile. KQ_QMM_SPLITK_BM8=0 keeps M <= 8 on the bm16 tile.
-  static const bool bm8_enabled = []() {
-    const char* e = std::getenv("KQ_QMM_SPLITK_BM8");
-    return e == nullptr || std::atoi(e) != 0;
-  }();
-  const bool small = M <= 16 && kq_splitk_codec(kquant_type);
-  const bool bm8 = small && bm8_enabled && M <= 8;
-  const int bm = bm8 ? 8 : (small ? 16 : 32);
-  const int bn = small ? 64 : 32;
+  const KqSplitkTile tile = kq_splitk_tile(M, kquant_type);
+  const int bm = tile.bm;
+  const int bn = tile.bn;
+  const bool bm8 = bm == 8;
+  const bool small = bn == 64;
   const int k_partition = (K / group_size / splits) * group_size;
   const int part_stride = M * N;
   const KqSplitkPartials pp = kq_splitk_partials(x.dtype());
@@ -1824,6 +1835,27 @@ static int kq_midm_nax_target(int M, int N) {
   return 0;
 }
 
+// KQ_SPLITK_CAP=<n> (probe lever, read live) caps the default slice target
+// of the small-M split-K routes (NAX split-K and the ALU split route, M <=
+// 32) so the split grid holds at most n threadgroups per GPU core
+// (KQ_GPU_CORES sets the count). A grid that already holds n per core
+// takes one slice, and the call falls through to the next route. Unset
+// or 0 keeps the fixed target of 16 at every N, so a wide N such as a
+// vocab head, whose grid already fills the GPU, still writes up to 16
+// partials. A target forced through KQ_QMM_SPLITK_NAX or KQ_QMM_SPLITK
+// is not capped.
+static int kq_splitk_capped(int target, int grid) {
+  const int cap = kq_env_int("KQ_SPLITK_CAP", 0);
+  if (cap <= 0) {
+    return target;
+  }
+  const int cores = gpu_core_count();
+  const int64_t room =
+      int64_t(cap) * (cores > 0 ? cores : 40) / std::max(grid, 1);
+  return static_cast<int>(
+      std::max<int64_t>(1, std::min<int64_t>(target, room)));
+}
+
 // Largest divisor of nblk at or under target (1 = no split).
 static int kq_split_count(int target, int nblk) {
   int sp = std::min(target, nblk);
@@ -2448,8 +2480,11 @@ void KQuantMatmul::eval_gpu_base(
   if (sk_nax_route && transpose_ && non_batched && M <= 32 &&
       codec_has_nax(kquant_type_) && kq_is_nax_available() && (K % 64 == 0) &&
       x.dtype() != mx::float32) {
-    const int qmm_splitk_nax_env =
-        sk_nax_env > 1 ? sk_nax_env : kq_splitk_nax_target;
+    // The BM32 tile's grid, ceil(N/64) x ceil(M/32), sizes the cap.
+    const int qmm_splitk_nax_env = sk_nax_env > 1
+        ? sk_nax_env
+        : kq_splitk_capped(
+              kq_splitk_nax_target, ((N + 63) / 64) * ((M + 31) / 32));
     const int q = std::max(group_size_, 64);
     int per = 0;
     const int sp = kq_nax_split(qmm_splitk_nax_env, K / q, per);
@@ -2497,7 +2532,11 @@ void KQuantMatmul::eval_gpu_base(
        !nax_path);
   if (splitk_route && transpose_ && non_batched && M <= 32 &&
       kq_splitk_codec(kquant_type_)) {
-    const int splitk_target = qmm_splitk_env > 1 ? qmm_splitk_env : 16;
+    const KqSplitkTile tile = kq_splitk_tile(M, kquant_type_);
+    const int grid =
+        ((N + tile.bn - 1) / tile.bn) * ((M + tile.bm - 1) / tile.bm);
+    const int splitk_target =
+        qmm_splitk_env > 1 ? qmm_splitk_env : kq_splitk_capped(16, grid);
     const int sp = kq_split_count(splitk_target, K / group_size_);
     if (sp > 1) {
       qmm_splitk(
