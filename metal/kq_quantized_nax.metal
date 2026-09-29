@@ -90,7 +90,6 @@
   instantiate_kquant_nax_gather_qmm_rhs(type, gs, bits, false, nn, 64, 64, 2, 2, codec)
 
 #define instantiate_kquant_nax_codec(codec, gs, bits)                                      \
-  instantiate_kquant_nax_codec_for_type(codec, float,       gs, bits)                      \
   instantiate_kquant_nax_codec_for_type(codec, float16_t,   gs, bits)                      \
   instantiate_kquant_nax_codec_for_type(codec, bfloat16_t,  gs, bits)
 

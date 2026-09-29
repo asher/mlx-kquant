@@ -25,6 +25,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - On NAX GPUs (M5), prefill and image steps of 4096 or more tokens no longer
   change matmul kernels with the token count. The 4096 threshold is provisional.
+- The bundled metallib is 22 MB smaller. It drops the float activation matmul
+  kernels, which no call ran: float32 activations run the bfloat16 kernels.
 
 ### Fixed
 - A float16 matmul of 128 or fewer rows split over K, MTP verify among them,

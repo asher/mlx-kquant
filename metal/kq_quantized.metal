@@ -6,6 +6,10 @@
 #include "mlx/backend/metal/kernels/quantized_utils.h"
 #include "mlx/backend/metal/kernels/kq_quantized.h"
 
+// The ops cast float32 activations to bfloat16 before dispatch, so the
+// kernels that take activations exist for bfloat16 and float16 only, and
+// float keeps its dequantize kernels.
+
 #define instantiate_kquant_batched(func, type, gs, bits, batched, codec)  \
   instantiate_kernel(                                                     \
       "kquant_" #codec "_" #func "_" #type "_gs_" #gs "_b_" #bits         \
@@ -29,17 +33,10 @@
 
 // Split-K kernels come in pairs: the plain name stores T partials, and
 // the _pf32 twin stores float partials for kquant_qmm_splitk_accum_*_pf32
-// (float16 by default, bfloat16 under KQ_SPLITK_F32=1). The ops cast
-// float32 activations to bfloat16, so only the 2-byte types have split
-// kernels.
-#define instantiate_split_float(...)
-#define instantiate_split_float16_t(...) instantiate_kernel(__VA_ARGS__)
-#define instantiate_split_bfloat16_t(...) instantiate_kernel(__VA_ARGS__)
-#define instantiate_split(type, ...) instantiate_split_ ## type(__VA_ARGS__)
+// (float16 by default, bfloat16 under KQ_SPLITK_F32=1).
 
 #define instantiate_kquant_qmm_t_splitk(type, gs, bits, aligned_N, codec) \
-  instantiate_split(                                                      \
-      type,                                                               \
+  instantiate_kernel(                                                     \
       "kquant_" #codec "_qmm_t_splitk_" #type "_gs_" #gs "_b_" #bits      \
           "_alN_" #aligned_N,                                             \
       kq_ ## codec ## _qmm_t_splitk,                                      \
@@ -47,8 +44,7 @@
       gs,                                                                 \
       bits,                                                               \
       aligned_N)                                                          \
-  instantiate_split(                                                      \
-      type,                                                               \
+  instantiate_kernel(                                                     \
       "kquant_" #codec "_qmm_t_splitk_" #type "_gs_" #gs "_b_" #bits      \
           "_alN_" #aligned_N "_pf32",                                     \
       kq_ ## codec ## _qmm_t_splitk,                                      \
@@ -62,8 +58,7 @@
 // BM=16 and BM=8 split-K tiles for M <= 16 and M <= 8 (codecs with the
 // small_bm template arm).
 #define instantiate_kquant_qmm_t_splitk_bm16(type, gs, bits, aligned_N, codec) \
-  instantiate_split(                                                           \
-      type,                                                                    \
+  instantiate_kernel(                                                          \
       "kquant_" #codec "_qmm_t_splitk_bm16_" #type "_gs_" #gs "_b_" #bits      \
           "_alN_" #aligned_N,                                                  \
       kq_ ## codec ## _qmm_t_splitk,                                           \
@@ -72,8 +67,7 @@
       bits,                                                                    \
       aligned_N,                                                               \
       16)                                                                      \
-  instantiate_split(                                                           \
-      type,                                                                    \
+  instantiate_kernel(                                                          \
       "kquant_" #codec "_qmm_t_splitk_bm16_" #type "_gs_" #gs "_b_" #bits      \
           "_alN_" #aligned_N "_pf32",                                          \
       kq_ ## codec ## _qmm_t_splitk,                                           \
@@ -84,8 +78,7 @@
       16,                                                                      \
       float)
 #define instantiate_kquant_qmm_t_splitk_bm8(type, gs, bits, aligned_N, codec) \
-  instantiate_split(                                                          \
-      type,                                                                   \
+  instantiate_kernel(                                                         \
       "kquant_" #codec "_qmm_t_splitk_bm8_" #type "_gs_" #gs "_b_" #bits      \
           "_alN_" #aligned_N,                                                 \
       kq_ ## codec ## _qmm_t_splitk,                                          \
@@ -94,8 +87,7 @@
       bits,                                                                   \
       aligned_N,                                                              \
       8)                                                                      \
-  instantiate_split(                                                          \
-      type,                                                                   \
+  instantiate_kernel(                                                         \
       "kquant_" #codec "_qmm_t_splitk_bm8_" #type "_gs_" #gs "_b_" #bits      \
           "_alN_" #aligned_N "_pf32",                                         \
       kq_ ## codec ## _qmm_t_splitk,                                          \
@@ -194,7 +186,7 @@
   instantiate_kquant_gather_qmm_n(type, 32, 8, q8_0)                    \
   instantiate_kquant_dequantize(type, 32, 8, q8_0)
 
-instantiate_kquant_q8_0_for_type(float)
+instantiate_kquant_dequantize(float, 32, 8, q8_0)
 instantiate_kquant_q8_0_for_type(bfloat16_t)
 instantiate_kquant_q8_0_for_type(float16_t)
 
@@ -227,7 +219,7 @@ instantiate_kquant_q8_0_for_type(float16_t)
   instantiate_kquant_gather_qmm_n(type, 32, 5, q5_1)                    \
   instantiate_kquant_dequantize(type, 32, 5, q5_1)
 
-instantiate_kquant_q5_1_for_type(float)
+instantiate_kquant_dequantize(float, 32, 5, q5_1)
 instantiate_kquant_q5_1_for_type(bfloat16_t)
 instantiate_kquant_q5_1_for_type(float16_t)
 
@@ -260,7 +252,7 @@ instantiate_kquant_q5_1_for_type(float16_t)
   instantiate_kquant_gather_qmm_n(type, 32, 4, q4_0)                    \
   instantiate_kquant_dequantize(type, 32, 4, q4_0)
 
-instantiate_kquant_q4_0_for_type(float)
+instantiate_kquant_dequantize(float, 32, 4, q4_0)
 instantiate_kquant_q4_0_for_type(bfloat16_t)
 instantiate_kquant_q4_0_for_type(float16_t)
 
@@ -293,7 +285,7 @@ instantiate_kquant_q4_0_for_type(float16_t)
   instantiate_kquant_gather_qmm_n(type, 32, 4, q4_1)                    \
   instantiate_kquant_dequantize(type, 32, 4, q4_1)
 
-instantiate_kquant_q4_1_for_type(float)
+instantiate_kquant_dequantize(float, 32, 4, q4_1)
 instantiate_kquant_q4_1_for_type(bfloat16_t)
 instantiate_kquant_q4_1_for_type(float16_t)
 
@@ -326,7 +318,7 @@ instantiate_kquant_q4_1_for_type(float16_t)
   instantiate_kquant_gather_qmm_n(type, 32, 5, q5_0)                    \
   instantiate_kquant_dequantize(type, 32, 5, q5_0)
 
-instantiate_kquant_q5_0_for_type(float)
+instantiate_kquant_dequantize(float, 32, 5, q5_0)
 instantiate_kquant_q5_0_for_type(bfloat16_t)
 instantiate_kquant_q5_0_for_type(float16_t)
 
@@ -359,7 +351,7 @@ instantiate_kquant_q5_0_for_type(float16_t)
   instantiate_kquant_gather_qmm_n(type, 256, 4, q4_k)                    \
   instantiate_kquant_dequantize(type, 256, 4, q4_k)
 
-instantiate_kquant_q4_k_for_type(float)
+instantiate_kquant_dequantize(float, 256, 4, q4_k)
 instantiate_kquant_q4_k_for_type(bfloat16_t)
 instantiate_kquant_q4_k_for_type(float16_t)
 
@@ -392,7 +384,7 @@ instantiate_kquant_q4_k_for_type(float16_t)
   instantiate_kquant_gather_qmm_n(type, 256, 5, q5_k)                    \
   instantiate_kquant_dequantize(type, 256, 5, q5_k)
 
-instantiate_kquant_q5_k_for_type(float)
+instantiate_kquant_dequantize(float, 256, 5, q5_k)
 instantiate_kquant_q5_k_for_type(bfloat16_t)
 instantiate_kquant_q5_k_for_type(float16_t)
 
@@ -427,7 +419,7 @@ instantiate_kquant_q5_k_for_type(float16_t)
   instantiate_kquant_gather_qmm_n(type, 256, 6, q6_k)                    \
   instantiate_kquant_dequantize(type, 256, 6, q6_k)
 
-instantiate_kquant_q6_k_for_type(float)
+instantiate_kquant_dequantize(float, 256, 6, q6_k)
 instantiate_kquant_q6_k_for_type(bfloat16_t)
 instantiate_kquant_q6_k_for_type(float16_t)
 
@@ -451,7 +443,6 @@ instantiate_kquant_q6_k_for_type(float16_t)
   instantiate_mv_ext(codec, type, gs, bits, 11)                         \
   instantiate_mv_ext(codec, type, gs, bits, 12)
 #define instantiate_mv_ext_all(codec, gs, bits)                        \
-  instantiate_mv_ext_for_type(codec, gs, bits, float)                   \
   instantiate_mv_ext_for_type(codec, gs, bits, bfloat16_t)              \
   instantiate_mv_ext_for_type(codec, gs, bits, float16_t)
 instantiate_mv_ext_all(q8_0, 32, 8)
@@ -497,7 +488,6 @@ instantiate_mv_ext_all(ptq1_0, 128, 1)
   instantiate_mv_ext_nr2(codec, type, gs, bits, 11)                     \
   instantiate_mv_ext_nr2(codec, type, gs, bits, 12)
 #define instantiate_mv_ext_nr2_all(codec, gs, bits)                     \
-  instantiate_mv_ext_nr2_for_type(codec, gs, bits, float)               \
   instantiate_mv_ext_nr2_for_type(codec, gs, bits, bfloat16_t)          \
   instantiate_mv_ext_nr2_for_type(codec, gs, bits, float16_t)
 instantiate_mv_ext_nr2_all(q6_k, 256, 6)
@@ -523,7 +513,6 @@ instantiate_mv_ext_nr2_all(q6_k, 256, 6)
   instantiate_mv_ext_sb(codec, type, gs, bits, 11)                      \
   instantiate_mv_ext_sb(codec, type, gs, bits, 12)
 #define instantiate_mv_ext_sb_all(codec, gs, bits)                      \
-  instantiate_mv_ext_sb_for_type(codec, gs, bits, float)                \
   instantiate_mv_ext_sb_for_type(codec, gs, bits, bfloat16_t)           \
   instantiate_mv_ext_sb_for_type(codec, gs, bits, float16_t)
 instantiate_mv_ext_sb_all(q6_k, 256, 6)
@@ -549,7 +538,6 @@ instantiate_mv_ext_sb_all(q6_k, 256, 6)
   instantiate_mv_ext_nx(codec, type, gs, bits, 11, nx)                  \
   instantiate_mv_ext_nx(codec, type, gs, bits, 12, nx)
 #define instantiate_mv_ext_nx_all(codec, gs, bits, nx)                  \
-  instantiate_mv_ext_nx_for_type(codec, gs, bits, float, nx)            \
   instantiate_mv_ext_nx_for_type(codec, gs, bits, bfloat16_t, nx)       \
   instantiate_mv_ext_nx_for_type(codec, gs, bits, float16_t, nx)
 instantiate_mv_ext_nx_all(q6_k, 256, 6, 16)
@@ -610,7 +598,7 @@ instantiate_mv_ext_hd_all(q6_k, 256, 6)
   instantiate_kquant_gather_qmm_n(type, 256, 3, q3_k)                    \
   instantiate_kquant_dequantize(type, 256, 3, q3_k)
 
-instantiate_kquant_q3_k_for_type(float)
+instantiate_kquant_dequantize(float, 256, 3, q3_k)
 instantiate_kquant_q3_k_for_type(bfloat16_t)
 instantiate_kquant_q3_k_for_type(float16_t)
 
@@ -643,7 +631,7 @@ instantiate_kquant_q3_k_for_type(float16_t)
   instantiate_kquant_gather_qmm_n(type, 256, 2, q2_k)                    \
   instantiate_kquant_dequantize(type, 256, 2, q2_k)
 
-instantiate_kquant_q2_k_for_type(float)
+instantiate_kquant_dequantize(float, 256, 2, q2_k)
 instantiate_kquant_q2_k_for_type(bfloat16_t)
 instantiate_kquant_q2_k_for_type(float16_t)
 
@@ -677,7 +665,7 @@ instantiate_kquant_q2_k_for_type(float16_t)
   instantiate_kquant_gather_qmm_n(type, 32, 4, iq4_nl)               \
   instantiate_kquant_dequantize(type, 32, 4, iq4_nl)
 
-instantiate_kquant_iq4_nl_for_type(float)
+instantiate_kquant_dequantize(float, 32, 4, iq4_nl)
 instantiate_kquant_iq4_nl_for_type(bfloat16_t)
 instantiate_kquant_iq4_nl_for_type(float16_t)
 
@@ -703,7 +691,7 @@ instantiate_kquant_iq4_nl_for_type(float16_t)
   instantiate_kquant_gather_qmm_n(type, 32, 4, mxfp4)                \
   instantiate_kquant_dequantize(type, 32, 4, mxfp4)
 
-instantiate_kquant_mxfp4_for_type(float)
+instantiate_kquant_dequantize(float, 32, 4, mxfp4)
 instantiate_kquant_mxfp4_for_type(bfloat16_t)
 instantiate_kquant_mxfp4_for_type(float16_t)
 
@@ -729,7 +717,7 @@ instantiate_kquant_mxfp4_for_type(float16_t)
   instantiate_kquant_gather_qmm_n(type, 64, 4, nvfp4)                \
   instantiate_kquant_dequantize(type, 64, 4, nvfp4)
 
-instantiate_kquant_nvfp4_for_type(float)
+instantiate_kquant_dequantize(float, 64, 4, nvfp4)
 instantiate_kquant_nvfp4_for_type(bfloat16_t)
 instantiate_kquant_nvfp4_for_type(float16_t)
 
@@ -761,7 +749,7 @@ instantiate_kquant_nvfp4_for_type(float16_t)
   instantiate_kquant_gather_qmm_n(type, 256, 4, iq4_xs)              \
   instantiate_kquant_dequantize(type, 256, 4, iq4_xs)
 
-instantiate_kquant_iq4_xs_for_type(float)
+instantiate_kquant_dequantize(float, 256, 4, iq4_xs)
 instantiate_kquant_iq4_xs_for_type(bfloat16_t)
 instantiate_kquant_iq4_xs_for_type(float16_t)
 
@@ -793,7 +781,7 @@ instantiate_kquant_iq4_xs_for_type(float16_t)
   instantiate_kquant_gather_qmm_n(type, 256, 3, iq3_xxs)             \
   instantiate_kquant_dequantize(type, 256, 3, iq3_xxs)
 
-instantiate_kquant_iq3_xxs_for_type(float)
+instantiate_kquant_dequantize(float, 256, 3, iq3_xxs)
 instantiate_kquant_iq3_xxs_for_type(bfloat16_t)
 instantiate_kquant_iq3_xxs_for_type(float16_t)
 
@@ -825,7 +813,7 @@ instantiate_kquant_iq3_xxs_for_type(float16_t)
   instantiate_kquant_gather_qmm_n(type, 256, 3, iq3_s)              \
   instantiate_kquant_dequantize(type, 256, 3, iq3_s)
 
-instantiate_kquant_iq3_s_for_type(float)
+instantiate_kquant_dequantize(float, 256, 3, iq3_s)
 instantiate_kquant_iq3_s_for_type(bfloat16_t)
 instantiate_kquant_iq3_s_for_type(float16_t)
 
@@ -857,7 +845,7 @@ instantiate_kquant_iq3_s_for_type(float16_t)
   instantiate_kquant_gather_qmm_n(type, 256, 2, iq2_xxs)             \
   instantiate_kquant_dequantize(type, 256, 2, iq2_xxs)
 
-instantiate_kquant_iq2_xxs_for_type(float)
+instantiate_kquant_dequantize(float, 256, 2, iq2_xxs)
 instantiate_kquant_iq2_xxs_for_type(bfloat16_t)
 instantiate_kquant_iq2_xxs_for_type(float16_t)
 
@@ -889,7 +877,7 @@ instantiate_kquant_iq2_xxs_for_type(float16_t)
   instantiate_kquant_gather_qmm_n(type, 256, 2, iq2_xs)              \
   instantiate_kquant_dequantize(type, 256, 2, iq2_xs)
 
-instantiate_kquant_iq2_xs_for_type(float)
+instantiate_kquant_dequantize(float, 256, 2, iq2_xs)
 instantiate_kquant_iq2_xs_for_type(bfloat16_t)
 instantiate_kquant_iq2_xs_for_type(float16_t)
 
@@ -921,7 +909,7 @@ instantiate_kquant_iq2_xs_for_type(float16_t)
   instantiate_kquant_gather_qmm_n(type, 256, 2, iq2_s)               \
   instantiate_kquant_dequantize(type, 256, 2, iq2_s)
 
-instantiate_kquant_iq2_s_for_type(float)
+instantiate_kquant_dequantize(float, 256, 2, iq2_s)
 instantiate_kquant_iq2_s_for_type(bfloat16_t)
 instantiate_kquant_iq2_s_for_type(float16_t)
 
@@ -952,7 +940,7 @@ instantiate_kquant_iq2_s_for_type(float16_t)
   instantiate_kquant_gather_qmm_seg_t(type, 256, 1, false, iq1_s) \
   instantiate_kquant_gather_qmm_n(type, 256, 1, iq1_s)               \
   instantiate_kquant_dequantize(type, 256, 1, iq1_s)
-instantiate_kquant_iq1_s_for_type(float)
+instantiate_kquant_dequantize(float, 256, 1, iq1_s)
 instantiate_kquant_iq1_s_for_type(bfloat16_t)
 instantiate_kquant_iq1_s_for_type(float16_t)
 
@@ -983,7 +971,7 @@ instantiate_kquant_iq1_s_for_type(float16_t)
   instantiate_kquant_gather_qmm_seg_t(type, 256, 1, false, iq1_m) \
   instantiate_kquant_gather_qmm_n(type, 256, 1, iq1_m)               \
   instantiate_kquant_dequantize(type, 256, 1, iq1_m)
-instantiate_kquant_iq1_m_for_type(float)
+instantiate_kquant_dequantize(float, 256, 1, iq1_m)
 instantiate_kquant_iq1_m_for_type(bfloat16_t)
 instantiate_kquant_iq1_m_for_type(float16_t)
 
@@ -1014,7 +1002,7 @@ instantiate_kquant_iq1_m_for_type(float16_t)
   instantiate_kquant_gather_qmm_seg_t(type, 256, 1, false, stq1_0) \
   instantiate_kquant_gather_qmm_n(type, 256, 1, stq1_0)               \
   instantiate_kquant_dequantize(type, 256, 1, stq1_0)
-instantiate_kquant_stq1_0_for_type(float)
+instantiate_kquant_dequantize(float, 256, 1, stq1_0)
 instantiate_kquant_stq1_0_for_type(bfloat16_t)
 instantiate_kquant_stq1_0_for_type(float16_t)
 
@@ -1047,10 +1035,10 @@ instantiate_kquant_stq1_0_for_type(float16_t)
   instantiate_kquant_gather_qmm_seg_t(type, gs, bits, false, codec)   \
   instantiate_kquant_gather_qmm_n(type, gs, bits, codec)              \
   instantiate_kquant_dequantize(type, gs, bits, codec)
-instantiate_kquant_prism_for_type(pq2_0, 128, 2, float)
+instantiate_kquant_dequantize(float, 128, 2, pq2_0)
 instantiate_kquant_prism_for_type(pq2_0, 128, 2, bfloat16_t)
 instantiate_kquant_prism_for_type(pq2_0, 128, 2, float16_t)
-instantiate_kquant_prism_for_type(ptq1_0, 128, 1, float)
+instantiate_kquant_dequantize(float, 128, 1, ptq1_0)
 instantiate_kquant_prism_for_type(ptq1_0, 128, 1, bfloat16_t)
 instantiate_kquant_prism_for_type(ptq1_0, 128, 1, float16_t)
 
@@ -1121,7 +1109,6 @@ instantiate_kquant_verify_mma(float16_t, 32, 8, q8_0)
   instantiate_kquant_gather_qmm_rhs(type, gs, bits, false, 16, codec)
 
 #define instantiate_kquant_gather_qmm_rhs_codec(gs, bits, codec)             \
-  instantiate_kquant_gather_qmm_rhs_for_type(float, gs, bits, codec)         \
   instantiate_kquant_gather_qmm_rhs_for_type(float16_t, gs, bits, codec)     \
   instantiate_kquant_gather_qmm_rhs_for_type(bfloat16_t, gs, bits, codec)
 
