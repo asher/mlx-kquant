@@ -249,9 +249,12 @@ Tuning levers (defaults are right for normal use):
 - `KQ_SPLITK_CAP` - probe lever: caps the default slice target of the small-M split-K routes
   (`nax_splitk` and the ALU `splitk` route, M <= 32) so the split grid holds at most that many
   threadgroups per GPU core (`KQ_GPU_CORES` sets the count). A call whose grid already holds that
-  many takes one slice and runs the next route: the BM=32 tile from M 13, and at M 9 to 12 the
-  small-M qmm route, `mv_ext` or per-row qmv. Unset or `0` keeps the target of 16 at every N, so a
-  wide N such as a vocab head still writes up to 16 partials. A target forced through
+  many takes one slice and runs what it runs with the split route off. From M 13 that is usually
+  the BM=32 tile, or per-row qmv below the qmv batch limit, which is 18 on M5 Max at K and N up to
+  2048 and up to 32 on Ultra parts. At M 9 to 12 it is the small-M qmm route, `mv_ext` or per-row
+  qmv. The ALU route falls through the same way, to the ALU qmm tile in place of the NAX one.
+  `verify_mma` and `verify_nax` are not capped. Unset or `0` keeps the target of 16 at every N, so
+  a wide N such as a vocab head still writes up to 16 partials. A target forced through
   `KQ_QMM_SPLITK_NAX` or `KQ_QMM_SPLITK` is not capped. Read live per call.
 - `KQ_VERIFY_MMA` - the register-resident MMA verify route (below). A value of `2` or more forces
   it at that M and above on any GPU, `0` or `1` disables it. Unset takes the per-codec entry from

@@ -17,8 +17,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   matmul tiles against stock and MLX affine arms at diffusion model shapes.
 - `bench_dit_shapes.py` logs samples as each slot ends, and `--reaggregate`
   rebuilds its reports from that log after a stopped or failed run.
-- `KQ_SPLITK_CAP` limits the K slices of matmuls with 32 or fewer rows by the
-  GPU core count, for A/B runs on wide matmuls such as a vocab head.
+- `KQ_SPLITK_CAP` caps the K slices of the NAX and ALU split-K routes at 32 or
+  fewer rows by GPU core count, for A/B runs on wide ones such as a vocab head.
 - `KQ_SPLITK_F32=1` makes bfloat16 split-K matmuls, MTP verify among them,
   round once instead of once per K slice. `0` restores the old float16 kernels.
 

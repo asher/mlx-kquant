@@ -1914,7 +1914,10 @@ static int kq_midm_nax_target(int M, int N) {
 // of the small-M split-K routes (NAX split-K and the ALU split route, M <=
 // 32) so the split grid holds at most n threadgroups per GPU core
 // (KQ_GPU_CORES sets the count). A grid that already holds n per core
-// takes one slice, and the call falls through to the next route. Unset
+// takes one slice, and the call runs what it runs with the split route
+// off: from M 13 usually the qmm tile (BM=32 on NAX GPUs), or per-row qmv
+// below get_qmv_batch_limit, and at M 9 to 12 the small-M qmm route,
+// mv_ext or per-row qmv. verify_mma and verify_nax are not capped. Unset
 // or 0 keeps the fixed target of 16 at every N, so a wide N such as a
 // vocab head, whose grid already fills the GPU, still writes up to 16
 // partials. A target forced through KQ_QMM_SPLITK_NAX or KQ_QMM_SPLITK
