@@ -27,6 +27,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 - Split-K matmuls at 128 or fewer rows, MTP verify among them, no longer round
   each K slice to bf16 or fp16 before the sum. `KQ_SPLITK_F32=0` restores it.
+- Matmuls of 2 to 8 rows on q4_0, pq2_0 and ptq1_0 weights, MTP verify among
+  them, no longer return inf for activations past 65504, and fp16 error drops 4-7x.
 
 ## [0.5.0]
 

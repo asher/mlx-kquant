@@ -1060,7 +1060,11 @@ void qmm_splitk(
 // once per K chunk, so the weight read is amortized over all M rows
 // without the tile's threadgroup staging of the weights. Split-K over
 // grid z with qmm_splitk's partial/fold shape; slices are whole wire
-// blocks. Non-batched transpose shapes, bf16 or f16 activations.
+// blocks. Non-batched transpose shapes, bf16 or f16 activations, which
+// stay in their dtype while each block sums in float.
+// KQ_VERIFY_MMA_HALF=1 (probe lever, read live) runs the _h kernels, which
+// stage the activations as half and sum each block in half, for timing
+// against them; their range stops at 65504.
 void verify_mma(
     const array& x,
     const array& w,
@@ -1101,6 +1105,7 @@ void verify_mma(
       group_size,
       "_b_",
       bits,
+      kq_env_int("KQ_VERIFY_MMA_HALF", 0) == 1 ? "_h" : "",
       pp.suffix);
 
   auto kernel = kq_get_kernel(d, kname);

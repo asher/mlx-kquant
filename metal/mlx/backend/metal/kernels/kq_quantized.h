@@ -1990,10 +1990,10 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
 // Register-resident MMA verify (kq_verify_mma.h). Lane L owns qs bytes
 // 8L..8L+7: fragments (b0, b2), (b1, b3), (b4, b6), (b5, b7). Each pair
 // has its sign bits flipped and is masked into the mantissas of a half2
-// (1024 + 128 + q), which one fma maps to q / 256, exact in half. The
-// 1/256 keeps every product within half its activation, so one channel
-// near the top of the half range stays finite in the block sum, and
-// d_scale restores the factor.
+// (1024 + 128 + q), which one fma maps to q / 256, exact in half, and
+// d_scale restores the factor. In the half kernels the 1/256 keeps every
+// product within half its activation, so one channel near the top of the
+// half range stays finite in the block sum.
 struct KqQ8_0Mma {
   static constant constexpr int block_k = KQ_Q8_0_GROUP;
   static constant constexpr int block_bytes = KQ_Q8_0_BLOCK_BYTES;
@@ -2002,14 +2002,14 @@ struct KqQ8_0Mma {
   static METAL_FUNC int perm(int f, int col) {
     return 8 * (col / 2) + 4 * (f >> 1) + (f & 1) + 2 * (col & 1);
   }
-  template <int NT>
+  template <int NT, typename X, typename A>
   static METAL_FUNC void block(
       thread const KqVmmaRows<NT>& rows,
       int boff,
       short L,
       short fm,
-      const threadgroup half* xb,
-      thread simdgroup_half8x8 (&acc)[NT]) {
+      const threadgroup X* xb,
+      thread simdgroup_matrix<A, 8, 8> (&acc)[NT]) {
     uint wv[NT][2];
     for (short t = 0; t < NT; ++t) {
       const packed_ushort4 v =

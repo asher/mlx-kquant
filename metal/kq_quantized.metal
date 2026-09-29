@@ -1054,8 +1054,9 @@ instantiate_kquant_prism_for_type(ptq1_0, 128, 1, float)
 instantiate_kquant_prism_for_type(ptq1_0, 128, 1, bfloat16_t)
 instantiate_kquant_prism_for_type(ptq1_0, 128, 1, float16_t)
 
-// Register-resident MMA verify kernels (kq_verify_mma.h), M <= 8, half
-// activations staged from bf16 or f16.
+// Register-resident MMA verify kernels (kq_verify_mma.h), M <= 8. The
+// activations stay in bf16 or f16 and each block sums in float. The _h
+// twins stage half activations and sum in half (KQ_VERIFY_MMA_HALF).
 #define instantiate_kquant_verify_mma(type, gs, bits, codec)          \
   instantiate_kernel(                                                 \
       "kquant_" #codec "_verify_mma_" #type "_gs_" #gs "_b_" #bits,   \
@@ -1070,7 +1071,25 @@ instantiate_kquant_prism_for_type(ptq1_0, 128, 1, float16_t)
       type,                                                           \
       gs,                                                             \
       bits,                                                           \
-      float)
+      float)                                                          \
+  instantiate_kernel(                                                 \
+      "kquant_" #codec "_verify_mma_" #type "_gs_" #gs "_b_" #bits    \
+          "_h",                                                       \
+      kq_ ## codec ## _verify_mma,                                    \
+      type,                                                           \
+      gs,                                                             \
+      bits,                                                           \
+      type,                                                           \
+      true)                                                           \
+  instantiate_kernel(                                                 \
+      "kquant_" #codec "_verify_mma_" #type "_gs_" #gs "_b_" #bits    \
+          "_h_pf32",                                                  \
+      kq_ ## codec ## _verify_mma,                                    \
+      type,                                                           \
+      gs,                                                             \
+      bits,                                                           \
+      float,                                                          \
+      true)
 instantiate_kquant_verify_mma(bfloat16_t, 128, 2, pq2_0)
 instantiate_kquant_verify_mma(float16_t, 128, 2, pq2_0)
 instantiate_kquant_verify_mma(bfloat16_t, 128, 1, ptq1_0)

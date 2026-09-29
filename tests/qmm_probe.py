@@ -14,7 +14,9 @@ relative Frobenius distance to it. Every call gets ``digest``, a hash of
 its output bits, to compare calls across probe processes.
 
 ``"design": "lead"`` draws nonnegative weights and activations whose first
-K column is 1024.
+K column is 1024. ``"design": "big"`` draws small weights and dense
+activations from 2e4 up, with bfloat16 column 0 at 1e5, past the half
+range.
 
 Under ``KQUANT_FORCE_CPU`` the child runs on the CPU device and never
 touches Metal, so the same probe covers both streams.
@@ -50,12 +52,22 @@ _dequant = {}
 def weights(codec, n, k, design):
     # design "lead": nonnegative weights, so every partial sum only grows.
     # design "tiled": 64 quantized rows repeated to n, for wide N at little
-    # quantize cost.
+    # quantize cost. design "big": small weights, nonnegative where the
+    # codec quantizes, so large activations give a large sum per block and
+    # a moderate output.
     key = (codec, n, k, design)
     if key not in _weights:
         _, _, bpb, wpb = CODEC_GEOMETRY[codec]
         if design == "lead":
             wf = mx.abs(mx.random.normal((n, k), key=mx.random.key(2))) * 0.05
+            w, s = kq.quantize(wf, codec)
+        elif design == "big" and is_synth(codec):
+            rng = np.random.default_rng(n * 131 + k)
+            wire = synth_wire(rng, codec, bpb, n * (k // wpb), d_range=(1e-4, 4e-4))
+            w = mx.array(wire.reshape(n, (k // wpb) * bpb))
+            s = mx.zeros((1,), dtype=mx.uint8)
+        elif design == "big":
+            wf = mx.abs(mx.random.normal((n, k), key=mx.random.key(2))) * 1e-3
             w, s = kq.quantize(wf, codec)
         elif design == "tiled":
             wf = mx.random.normal((64, k), key=mx.random.key(4)) * 0.1
@@ -93,12 +105,18 @@ def activations(shape, dtype, layout, seed, design):
     def draw(s):
         if lead:
             return mx.abs(mx.random.normal(s, key=key)) * 0.01
+        if design == "big":
+            # 2e4 and up, inside the float16 range.
+            return mx.minimum(mx.abs(mx.random.normal(s, key=key)) * 1e4 + 2e4, 6e4)
         return mx.random.normal(s, key=key) * 0.5
 
     if layout == "dense":
         x = draw(shape)
         if lead:
             x[..., 0] = 1024.0
+        if design == "big" and dtype == mx.bfloat16:
+            # One column past the half range.
+            x[..., 0] = 1e5
         x = x.astype(dtype)
         mx.eval(x)
         return x

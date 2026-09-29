@@ -759,8 +759,9 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
 // 4L..4L+3 of qs: fragments (n0, n2), (n1, n3), (h0, h2), (h1, h3) of
 // its four low and four high nibbles, each pair masked into the
 // mantissas of a half2 (1024 + q) and mapped by one fma to (q - 8) / 16,
-// exact in half. The 1/16 keeps a block of 32 products inside half range
-// for activations up to the half limit; d_scale restores it.
+// exact in half, and d_scale restores the 1/16. In the half kernels it
+// keeps one channel near the half limit, times a code of up to 8, inside
+// half range.
 struct KqQ4_0Mma {
   static constant constexpr int block_k = KQ_Q4_0_GROUP;
   static constant constexpr int block_bytes = KQ_Q4_0_BLOCK_BYTES;
@@ -769,14 +770,14 @@ struct KqQ4_0Mma {
   static METAL_FUNC int perm(int f, int col) {
     return 16 * ((f % 4) >> 1) + 4 * (col / 2) + (f & 1) + 2 * (col & 1);
   }
-  template <int NT>
+  template <int NT, typename X, typename A>
   static METAL_FUNC void block(
       thread const KqVmmaRows<NT>& rows,
       int boff,
       short L,
       short fm,
-      const threadgroup half* xb,
-      thread simdgroup_half8x8 (&acc)[NT]) {
+      const threadgroup X* xb,
+      thread simdgroup_matrix<A, 8, 8> (&acc)[NT]) {
     uint lo[NT], hi[NT];
     for (short t = 0; t < NT; ++t) {
       const packed_ushort2 v2 =

@@ -267,6 +267,10 @@ Tuning levers (defaults are right for normal use):
   by default.
 - `KQ_VERIFY_MMA_SPLITS` - probe lever: the same split-K target for `verify_mma`; `1` runs it
   unsplit. Unset (off) by default. Read live per call.
+- `KQ_VERIFY_MMA_HALF` - probe lever: `1` runs the `verify_mma` half kernels (name suffix `_h`),
+  which stage the activations as half and sum each block in half, so an activation or a block sum
+  past 65504 turns to inf. For timing against the float kernels only. Unset (off) by default. Read
+  live per call.
 - `KQ_VERIFY_NAX_Q4_0_SB` - probe lever: `0` keeps `q4_0` on the two-block `verify_nax` kernel at
   a K that is a multiple of 256, where the eight-block kernel runs by default. Read live per call.
 - `KQ_MV_EXT_SB` / `KQ_MV_EXT_NX` / `KQ_MV_EXT_HD` - `mv_ext` activation-traffic experiments:
@@ -302,12 +306,16 @@ are read once for all M rows and the tile's threadgroup staging of the weights d
 over the wire blocks feeds the same partial fold as `qmm_splitk` on the projection shapes; a
 head-sized N already fills the GPU with one split and writes the output directly.
 
-The kernels stage the activations as half and sum each block in a half accumulator, so an activation
-beyond the half range (magnitude 65504) overflows. The `pq2_0` and `ptq1_0` codes are -1, 0 and 1,
-so a block's sum overflows only when its 128 activations add up past that range. The `q4_0` and
-`q8_0` kernels decode their codes scaled by 1/16 and 1/256 and apply the factor in the float block
-scale, so one channel near the half limit cannot overflow a block of 32 products. A float
-accumulator removes the limit but runs `pq2_0` at half speed.
+The kernels decode the codes exactly in half and keep the activations in their own dtype in
+threadgroup memory. Both widen to float in the fragment, so each block sums in float and the block
+scale applies in float. The result rounds once, as the mat-vec kernels do with the exact weights,
+at any activation magnitude. `KQ_VERIFY_MMA_HALF=1` runs the half kernels these replace, which stage
+the activations as half and sum each block in half. There an activation beyond the half range
+(magnitude 65504), such as a bfloat16 outlier, turns to inf, and so does a block sum past it. On
+ordinary activations the error of the half kernels runs 0.4 to 0.9 output roundings beyond the
+rounding of the float64 result on bfloat16, and 4 to 7 on float16. The float kernels run within
+0.01. An earlier float accumulator ran `pq2_0` at half the speed of the half kernels, and the float
+kernels have not been timed against them.
 
 The entry M depends on the device. Without NAX, `pq2_0` and `ptq1_0` enter at M 3 (`pq2_0` at M 4
 on float16 activations, where `verify_qmv` holds M 3) and `q4_0` at M 2. Measured on M3 Max at the
@@ -329,7 +337,7 @@ wider. Each simdgroup owns 32 weight rows and decodes every block of them straig
 right operand of a 16x32x16 NAX matmul, with the block scale folded into the half weights. The left
 operand holds the activation rows padded to 16, read from device memory in the k order of the
 decoded weights, so nothing is staged in threadgroup memory and the loop has no barriers. The
-accumulator is float32, which removes the half-range limit of `verify_mma`.
+accumulator is float32.
 
 A simdgroup's device loads and NAX ops do not overlap, so the kernel hides its loads through the
 simdgroups resident beside it, and the host sizes the split count for that. The kernels differ in

@@ -279,7 +279,8 @@ inline std::string kq_gather_stem_nx(const std::string& t, int K, int nx) {
 // experts keep the float path. Read live once set (KQ_MOE_NX pattern) so
 // interleaved in-process A/Bs can flip arms. K is capped so the staged row
 // plus the largest half table (iq2_xs, 8.3 KB) stays inside the 32 KB
-// threadgroup budget.
+// threadgroup budget. An activation past the half range (65504) turns to
+// inf in the staged row.
 inline bool kq_moe_half(const std::string& codec, int K) {
   static const bool has_env = std::getenv("KQ_MOE_HALF") != nullptr;
   if (!has_env) {

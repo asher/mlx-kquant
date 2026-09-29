@@ -1094,14 +1094,14 @@ struct KqPq2_0Mma {
   static METAL_FUNC int perm(int f, int col) {
     return 32 * (col / 2) + 16 * (f / 8) + (f % 8) + 8 * (col & 1);
   }
-  template <int NT>
+  template <int NT, typename X, typename A>
   static METAL_FUNC void block(
       thread const KqVmmaRows<NT>& rows,
       int boff,
       short L,
       short fm,
-      const threadgroup half* xb,
-      thread simdgroup_half8x8 (&acc)[NT]) {
+      const threadgroup X* xb,
+      thread simdgroup_matrix<A, 8, 8> (&acc)[NT]) {
     uint wv[NT][2];
     for (short t = 0; t < NT; ++t) {
       const packed_ushort4 v =
@@ -1147,14 +1147,14 @@ struct KqPtq1_0Mma {
     const int level = f % 5;
     return byte < 16 ? 16 * level + byte : 80 + 8 * level + (byte - 16);
   }
-  template <int NT>
+  template <int NT, typename X, typename A>
   static METAL_FUNC void block(
       thread const KqVmmaRows<NT>& rows,
       int boff,
       short L,
       short fm,
-      const threadgroup half* xb,
-      thread simdgroup_half8x8 (&acc)[NT]) {
+      const threadgroup X* xb,
+      thread simdgroup_matrix<A, 8, 8> (&acc)[NT]) {
     for (short p = 0; p < 3; ++p) {
       half2 u[NT];
       for (short t = 0; t < NT; ++t) {
