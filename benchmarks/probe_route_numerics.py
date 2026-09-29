@@ -35,7 +35,16 @@ import sys
 
 import dit_common as dc
 
-ROUTES = ["qmv", "mv_ext", "verify_mma", "verify_nax", "nax_splitk", "nax"]
+ROUTES = [
+    "qmv",
+    "verify_qmv",
+    "mv_ext",
+    "verify_mma",
+    "verify_nax",
+    "splitk",
+    "nax_splitk",
+    "nax",
+]
 DEFAULT_CELLS = (
     # K sweep at a mid-M split band row count and at a DiT prefill row count.
     "64:1024:256,64:3072:256,64:12288:256,"
@@ -132,7 +141,12 @@ def probe(args):
             for arm, route, fn, w1, w2, env in arms:
                 try:
                     y, kname = run(fn, env)
-                except RuntimeError:
+                except RuntimeError as e:
+                    # A forced route that cannot serve the cell raises under
+                    # KQ_QMM_ROUTE_STRICT; any other error, such as a
+                    # missing kernel, is a failure.
+                    if "does not serve" not in str(e):
+                        raise
                     continue
                 got = f64(y)
                 row = {
