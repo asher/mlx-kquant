@@ -162,8 +162,10 @@ Tuning levers (defaults are right for normal use):
   `_bm<bm>_bn<bn>_wm<wm>_wn<wn>` before `_alN` and raises until such a kernel is built. Unset
   (off) by default. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_QMM_LOG` - set to any value, logs the kernel name, shape and grid of every NAX and ALU qmm
-  tile dispatch and every split-K dispatch to stderr, one `[kq qmm]` line each. Unset (off) by
-  default. Read once per process unless `KQ_TUNE_LIVE=1`.
+  tile dispatch, every split-K dispatch, and every `verify_mma` and `verify_nax` dispatch, split
+  or not, to stderr, one `[kq qmm]` line each. The grid depth is the K slice count. The mat-vec
+  routes (`qmv`, `verify_qmv`, `mv_ext`) do not log. Unset (off) by default. Read once per
+  process unless `KQ_TUNE_LIVE=1`.
 - `KQ_SPLITK_F32` - partial dtype of the split-K routes (`splitk`, `nax_splitk`, the
   `KQ_QMM_MIDM` band, and `verify_mma` and `verify_nax` when they split K). `1` stores each K
   slice's partial in float, so the fold rounds the result once, as the unsplit kernels do. `0`
@@ -179,10 +181,11 @@ Tuning levers (defaults are right for normal use):
   `benchmarks/bench_qmm_bm128_ab.py`; re-run it before trusting them on new silicon). Read once
   per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_NAX_BM128_ODD_M` - the M from which the BM=128 band also takes an odd ceil(M/64), whose last
-  row tile holds 64 rows or fewer. The tile skips the activation loads and matrix work of rows past
-  M there, so that tile does the work of one BM=64 tile. Default `4096`, where it holds at most
-  1.6% of the rows; `0` keeps the even ceil(M/64) rule at every M, the policy before this lever. Read once
-  per process unless `KQ_TUNE_LIVE=1`.
+  row tile holds 64 rows or fewer. There the simdgroup row with no row below M skips its
+  activation loads, matrix work and store, so that tile does the loads and matrix work of one
+  BM=64 tile. Default `4096`, where that tile holds at most 1.6% of the rows. The default is a
+  provisional value, not a measured crossover. `0` keeps the even ceil(M/64) rule at every M, the
+  policy before this lever. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_NAX_DB64` - double-buffered M 33-64 band. `0` off, `1` drops the N floor, unset follows the
   per-codec N floors. Only the five policy-enabled codecs (q6_k, q8_0, q4_1, q5_1, q5_0) carry
   `_db` instantiations, so `1` is bounded by availability; probing another codec needs its

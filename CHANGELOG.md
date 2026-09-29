@@ -19,8 +19,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rebuilds its reports from that log after a stopped or failed run.
 
 ### Changed
-- On NAX GPUs (M5), matmuls with 4096 or more activation rows run the BM=128
-  tile at any row count. `KQ_NAX_BM128_ODD_M=0` keeps the previous tile.
+- On NAX GPUs (M5), prefill and image steps of 4096 or more tokens no longer
+  change matmul kernels with the token count. The 4096 threshold is provisional.
 
 ### Fixed
 - Split-K matmuls at 128 or fewer rows, MTP verify among them, no longer round
