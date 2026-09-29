@@ -85,13 +85,13 @@ def _inputs(B, L, H, D, dtype, layout, seed=0, scale=None):
     return q, k
 
 
-def _ref(x, w, cos, sin):
+def _ref(x, w, cos, sin, eps=EPS):
     """float64 rms_norm and interleaved-pair rotation, as [B, H, L, D]."""
     x = np.asarray(x.astype(mx.float32), dtype=np.float64)
     w = np.asarray(w.astype(mx.float32), dtype=np.float64)
     c = np.asarray(cos, dtype=np.float64)[None, :, None, :]
     s = np.asarray(sin, dtype=np.float64)[None, :, None, :]
-    y = x / np.sqrt((x * x).mean(-1, keepdims=True) + EPS) * w
+    y = x / np.sqrt((x * x).mean(-1, keepdims=True) + eps) * w
     o = np.empty_like(y)
     o[..., 0::2] = y[..., 0::2] * c - y[..., 1::2] * s
     o[..., 1::2] = y[..., 0::2] * s + y[..., 1::2] * c
@@ -118,7 +118,7 @@ def _ulps(got, ref, dtype):
     return np.abs(_bits(g) - _bits(np.asarray(r.view(mx.int16))))
 
 
-def _composed(q, k, q_w, k_w, cos, sin):
+def _composed(q, k, q_w, k_w, cos, sin, eps=EPS):
     """The unfused composition: mx.fast.rms_norm, then the rotation in f32."""
 
     def rope(x):
@@ -130,8 +130,8 @@ def _composed(q, k, q_w, k_w, cos, sin):
         return mx.stack([x0 * c - x1 * s, x0 * s + x1 * c], axis=-1).reshape(b, n, h, d)
 
     dt = q.dtype
-    qo = rope(mx.fast.rms_norm(q, q_w, EPS)).astype(dt)
-    ko = rope(mx.fast.rms_norm(k, k_w, EPS)).astype(dt)
+    qo = rope(mx.fast.rms_norm(q, q_w, eps)).astype(dt)
+    ko = rope(mx.fast.rms_norm(k, k_w, eps)).astype(dt)
     return qo.transpose(0, 2, 1, 3), ko.transpose(0, 2, 1, 3)
 
 
@@ -143,19 +143,19 @@ def _graph(*outs):
             return f.read()
 
 
-def _check(q, k, q_w, k_w, cos, sin, against_composed=True):
+def _check(q, k, q_w, k_w, cos, sin, against_composed=True, eps=EPS):
     """Run the op, check shape, dtype and accuracy, return the outputs. On
     the GPU a kernel head dim must build the fused primitive, and any other
     head dim the composition."""
     B, L, H, D = q.shape
-    qo, ko = kq.qk_norm_rope(q, k, q_w, k_w, cos, sin, EPS)
+    qo, ko = kq.qk_norm_rope(q, k, q_w, k_w, cos, sin, eps)
     fused = _metal() and D in KERNEL_DIMS
     assert ("KQuantQkNormRope" in _graph(qo, ko)) == fused
     mx.eval(qo, ko)
     assert qo.shape == (B, H, L, D) and ko.shape == (B, H, L, D)
     assert qo.dtype == q.dtype and ko.dtype == q.dtype
-    refs = (_ref(q, q_w, cos, sin), _ref(k, k_w, cos, sin))
-    comp = _composed(q, k, q_w, k_w, cos, sin) if against_composed else None
+    refs = (_ref(q, q_w, cos, sin, eps), _ref(k, k_w, cos, sin, eps))
+    comp = _composed(q, k, q_w, k_w, cos, sin, eps) if against_composed else None
     for i, (got, ref) in enumerate(zip((qo, ko), refs, strict=True)):
         g = np.asarray(got.astype(mx.float32), dtype=np.float64)
         assert np.isfinite(g).all()
@@ -223,6 +223,29 @@ def test_large_activations(dtype, scale):
     q_w, k_w = _weights(D, dtype, 12)
     cos, sin = _tables(L, D, 13)
     _check(q, k, q_w, k_w, cos, sin, against_composed=False)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize(
+    "scale,eps,zero_row", [(1e-3, 1e-5, False), (None, 0.5, False), (None, 1e-5, True)]
+)
+def test_eps(dtype, scale, eps, zero_row):
+    # At inputs of 1e-3 the mean square is below the Z-Image eps of 1e-5, and
+    # eps 0.5 is half the mean square of unit inputs, so in both eps changes
+    # every output. A head row of zeros comes out as zeros, since eps keeps
+    # its rsqrt finite.
+    B, L, H, D = 2, 21, 3, 128
+    q, k = _inputs(B, L, H, D, dtype, "packed", seed=19, scale=scale)
+    if zero_row:
+        q[1, 4, 2] = 0
+        k[0, 7, 0] = 0
+        mx.eval(q, k)
+    q_w, k_w = _weights(D, dtype, 20)
+    cos, sin = _tables(L, D, 21)
+    qo, ko = _check(q, k, q_w, k_w, cos, sin, against_composed=False, eps=eps)
+    if zero_row:
+        assert (np.asarray(qo[1, 2, 4].astype(mx.float32)) == 0).all()
+        assert (np.asarray(ko[0, 0, 7].astype(mx.float32)) == 0).all()
 
 
 def test_float32_weights_and_tables():
