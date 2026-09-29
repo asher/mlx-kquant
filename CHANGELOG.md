@@ -20,21 +20,22 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `KQ_SPLITK_CAP` caps the K slices of the NAX and ALU split-K routes at 32 or
   fewer rows by GPU core count, for A/B runs on wide ones such as a vocab head.
 - `KQ_SPLITK_F32=1` makes bfloat16 split-K matmuls, MTP verify among them,
-  round once instead of once per K slice. `0` restores the old float16 kernels.
+  round once instead of once per K slice. `0` stores float16 partials again,
+  which can return inf.
 
 ### Changed
 - On NAX GPUs (M5), prefill and image steps of 4096 or more tokens no longer
   change matmul kernels with the token count. The 4096 threshold is provisional.
-- The bundled metallib is 22 MB smaller. It drops the float activation matmul
-  kernels, which no call ran: float32 activations run the bfloat16 kernels.
+- The bundled metallib drops the float32-activation matmul kernels, which no
+  call reached, about 22 MB.
 
 ### Fixed
 - A float16 matmul of 128 or fewer rows split over K, MTP verify among them,
   no longer returns inf where its output is finite.
 - Matmuls of 2 to 8 rows on q4_0, pq2_0 and ptq1_0 weights, MTP verify among
   them, no longer return inf for activations past 65504, and fp16 error drops 3-5x.
-- Decode steps on pq2_0 weights no longer return inf for bfloat16 activations
-  past 65504.
+- Decode and MTP verify steps on pq2_0 weights no longer return inf for
+  bfloat16 activations past 65504.
 - `KQ_MOE_HALF=1` no longer returns inf for activations of a few hundred and
   up; only activations past 65504 still do.
 - Tuning levers that default on or to a per-codec rule, such as `KQ_QMV_SPLITK`
