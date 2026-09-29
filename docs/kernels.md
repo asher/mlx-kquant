@@ -317,7 +317,7 @@ inf, and so does a block sum past it. On ordinary activations with float partial
 half kernels runs 0.4 to 0.9 output roundings beyond the rounding of the float64 result on
 bfloat16, and 4 to 7 on float16, and the float kernels run within 0.01. The default partials in the
 activation dtype add about one output rounding to a split call of either kernel, which puts the half
-kernels at 1.1 to 1.4 on bfloat16 and 4 to 7.5 on float16, and the float kernels at 1.0 to 1.1 on
+kernels at 1.1 to 1.4 on bfloat16 and 4 to 7.5 on float16, and the float kernels at about 1 on
 both. An earlier float accumulator ran `pq2_0` at half the speed of the half kernels, and the float
 kernels have not been timed against them.
 
