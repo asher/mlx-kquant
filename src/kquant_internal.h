@@ -18,6 +18,16 @@ namespace mlx_kquant {
 // Throws on other dtypes.
 std::string kq_type_string(mx::Dtype d);
 
+// Integer value of the environment lever `name`. Absent or empty reads as
+// `unset`; 0, false, off and no read as 0; 1, true, on and yes read as 1;
+// any other integer reads as itself. Any other value reads as `unset`, with
+// a warning on stderr the first time the lever holds it.
+int kq_env_lever(const char* name, int unset);
+
+// kq_env_lever for a lever whose set values are 0 and 1: any other integer
+// also reads as `unset`, with the same warning.
+int kq_env_flag(const char* name, int unset);
+
 // KVarN key/value widths the record codec supports.
 inline bool kq_kvarn_bits_ok(int bits) {
   return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||

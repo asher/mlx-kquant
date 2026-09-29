@@ -399,8 +399,7 @@ void KQuantSDPAGQA::eval_gpu(
   // Its rounding differs from the simdgroup kernel's, and its split count
   // follows the batch size. KQ_GQA_NAX=0, read at each call, keeps the
   // simdgroup kernel.
-  const char* nax_e = std::getenv("KQ_GQA_NAX");
-  const bool use_nax = (!nax_e || std::atoi(nax_e) != 0) && D == 512 &&
+  const bool use_nax = kq_env_flag("KQ_GQA_NAX", 1) != 0 && D == 512 &&
       qL == 1 && gqa_factor <= 8 && !kv_q8 && !paged && !kvarn && !starts &&
       !ends && size_t(n_kv_heads) * B * kL >= kQGqaNaxMinRows &&
       k_head_stride % 8 == 0 && k_seq_stride % 8 == 0 &&
@@ -857,10 +856,7 @@ void KQuantSDPAFAIndexed::eval_gpu(
   // strip); otherwise the simdgroup kernel, one threadgroup per (32-head
   // strip, query, split). KQ_SDPA_IDX_NAX=0 forces the simdgroup kernel on
   // any GPU.
-  static const bool nax_env = [] {
-    const char* e = std::getenv("KQ_SDPA_IDX_NAX");
-    return !e || std::atoi(e) != 0;
-  }();
+  static const bool nax_env = kq_env_flag("KQ_SDPA_IDX_NAX", 1) != 0;
   const bool use_nax = nax_env && kq_is_nax_available();
 
   int splits = splits_;

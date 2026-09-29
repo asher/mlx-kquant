@@ -501,11 +501,10 @@ static int kq_splitk_nax_min_m(const std::string& t, int N) {
   return N <= 1024 ? p.splitk_small : p.splitk;
 }
 
-// Integer value of an environment lever, or `unset` when the variable is
-// absent.
+// Integer value of an environment lever (kq_env_lever): `unset` when the
+// variable is absent, empty or not a value the lever takes.
 static int kq_env_int(const char* name, int unset) {
-  const char* e = std::getenv(name);
-  return e == nullptr ? unset : std::atoi(e);
+  return kq_env_lever(name, unset);
 }
 
 // KQ_TUNE_LIVE=1, read once per process, makes the tile levers below read
@@ -568,8 +567,8 @@ static bool kq_nax_swizzle_on() {
 // 0 = partials in the activation dtype for both. Read once per process
 // unless KQ_TUNE_LIVE=1.
 static int kq_splitk_f32_mode() {
-  static const int cached = kq_env_int("KQ_SPLITK_F32", -1);
-  return kq_tune_live() ? kq_env_int("KQ_SPLITK_F32", -1) : cached;
+  static const int cached = kq_env_flag("KQ_SPLITK_F32", -1);
+  return kq_tune_live() ? kq_env_flag("KQ_SPLITK_F32", -1) : cached;
 }
 
 // Partial dtype and kernel name suffix of a split-K call. The ops cast
@@ -685,20 +684,14 @@ static void kq_log_qmm(
 // KQ_VERIFY_EXT, read once per process. 0 forces verify_qmv and 1 forces
 // mv_ext on the mat-vec band (M 2-12), -1 leaves the per-codec default.
 static int kq_verify_ext_env() {
-  static const int v = []() {
-    const char* e = std::getenv("KQ_VERIFY_EXT");
-    return e != nullptr ? std::atoi(e) : -1;
-  }();
+  static const int v = kq_env_int("KQ_VERIFY_EXT", -1);
   return v;
 }
 
 // KQ_QMM_SPLITK, read once per process. A target above 1 forces the ALU
 // split-K route for M <= 32, 0 disables it, -1 leaves the default.
 static int kq_qmm_splitk_env() {
-  static const int v = []() {
-    const char* e = std::getenv("KQ_QMM_SPLITK");
-    return e != nullptr ? std::atoi(e) : -1;
-  }();
+  static const int v = kq_env_int("KQ_QMM_SPLITK", -1);
   return v;
 }
 
@@ -966,10 +959,7 @@ struct KqSplitkTile {
   int bn;
 };
 static KqSplitkTile kq_splitk_tile(int M, const std::string& t) {
-  static const bool bm8_enabled = []() {
-    const char* e = std::getenv("KQ_QMM_SPLITK_BM8");
-    return e == nullptr || std::atoi(e) != 0;
-  }();
+  static const bool bm8_enabled = kq_env_int("KQ_QMM_SPLITK_BM8", 1) != 0;
   const bool small = M <= 16 && kq_splitk_codec(t);
   const bool bm8 = small && bm8_enabled && M <= 8;
   return {bm8 ? 8 : (small ? 16 : 32), small ? 64 : 32};
@@ -1255,8 +1245,7 @@ void verify_mma(
 // the two-block kernel (probe lever, read live per call).
 static int kq_verify_nax_call_kstep(int K, const std::string& t) {
   if (t == "q4_0" && K % 256 == 0) {
-    const char* e = std::getenv("KQ_VERIFY_NAX_Q4_0_SB");
-    if (e == nullptr || std::atoi(e) != 0) {
+    if (kq_env_int("KQ_VERIFY_NAX_Q4_0_SB", 1) != 0) {
       return 256;
     }
   }
@@ -1559,13 +1548,11 @@ void qmv(
   // forces fine, =0 forces coarse (A/B lever). Read live (KQ_DISABLE_NAX
   // precedent) so one process can interleave coarse/fine for
   // thermally-paired A/Bs; getenv cost is noise per dispatch.
-  const char* qmv_fine_e = std::getenv("KQ_QMV_FINE");
-  const int qmv_fine_env = qmv_fine_e != nullptr ? std::atoi(qmv_fine_e) : -1;
+  const int qmv_fine_env = kq_env_int("KQ_QMV_FINE", -1);
 
   // The split-K kernel takes M == 1, B == 1 unless KQ_QMV_SPLITK=0 or
   // KQ_QMV_FINE names a per-row tiling. Read live like KQ_QMV_FINE.
-  const char* splitk_e = std::getenv("KQ_QMV_SPLITK");
-  const bool splitk_on = splitk_e == nullptr || std::atoi(splitk_e) != 0;
+  const bool splitk_on = kq_env_int("KQ_QMV_SPLITK", 1) != 0;
   if (M == 1 && B == 1 && splitk_on && qmv_fine_env == -1 &&
       qmv_splitk(
           x, w, scales, out, group_size, bits, N, K, d, s, kquant_type)) {
@@ -1637,8 +1624,7 @@ void qmv_bias(
 
   // Same fine-tiling policy as qmv() above; M == 1 is the shape contract
   // here, so only the codec ceiling gates the default.
-  const char* qmv_fine_e = std::getenv("KQ_QMV_FINE");
-  const int qmv_fine_env = qmv_fine_e != nullptr ? std::atoi(qmv_fine_e) : -1;
+  const int qmv_fine_env = kq_env_int("KQ_QMV_FINE", -1);
   const bool use_fine = codec_has_qmv_fine(kquant_type) &&
       (qmv_fine_env == 1 ||
        (qmv_fine_env != 0 && N <= kquant_qmv_fine_max_n(kquant_type)));
@@ -1713,10 +1699,8 @@ void verify_qmv(
   // default. Only q8_0 and q6_k have the fine kernel instantiated.
   // KQ_VERIFY_FINE=1 forces fine for both, KQ_VERIFY_FINE=0 forces coarse for
   // both (A/B lever).
-  static const int verify_fine = []() {
-    const char* e = std::getenv("KQ_VERIFY_FINE");
-    return e != nullptr ? std::atoi(e) : -1; // -1 = per-codec default
-  }();
+  // -1 = per-codec default.
+  static const int verify_fine = kq_env_int("KQ_VERIFY_FINE", -1);
   bool codec_has_fine = (kquant_type == "q8_0" || kquant_type == "q6_k");
   bool default_fine = (kquant_type == "q8_0"); // q6_k neutral -> coarse default
   bool use_fine = codec_has_fine &&
@@ -1970,8 +1954,7 @@ static int kq_nax_split(int target, int nblk, int& per) {
   }
   const int sp = kq_split_count(target, nblk);
   per = nblk / sp;
-  const char* e = std::getenv("KQ_SPLITK_RAGGED");
-  const int mode = e != nullptr ? std::atoi(e) : 1;
+  const int mode = kq_env_int("KQ_SPLITK_RAGGED", 1);
   if (mode == 0) {
     return sp;
   }
@@ -2460,15 +2443,11 @@ void KQuantMatmul::eval_gpu_base(
   if (transpose_ && non_batched && M >= 2 && M <= 32 &&
       x.dtype() != mx::float32 && kq_is_nax_available() &&
       codec_has_nax(kquant_type_)) {
-    const char* qmv_e = std::getenv("KQ_NAX_QMV");
-    int qmv_max_m = qmv_e != nullptr ? std::atoi(qmv_e) : -1;
+    int qmv_max_m = kq_env_int("KQ_NAX_QMV", -1);
     if (qmv_max_m == -1) {
-      const char* vnax_f = std::getenv("KQ_VERIFY_NAX");
-      const int vnax_force = vnax_f != nullptr ? std::atoi(vnax_f) : -1;
-      const char* vmma_f = std::getenv("KQ_VERIFY_MMA");
-      const int vmma_force = vmma_f != nullptr ? std::atoi(vmma_f) : -1;
-      const char* sk_f = std::getenv("KQ_QMM_SPLITK_NAX");
-      const int sk_force = sk_f != nullptr ? std::atoi(sk_f) : -1;
+      const int vnax_force = kq_env_int("KQ_VERIFY_NAX", -1);
+      const int vmma_force = kq_env_int("KQ_VERIFY_MMA", -1);
+      const int sk_force = kq_env_int("KQ_QMM_SPLITK_NAX", -1);
       const int ext = kq_verify_ext_env();
       const bool forced = (vnax_force >= 1 && M >= vnax_force &&
                            codec_verify_nax_kstep(kquant_type_) > 0) ||
@@ -2494,12 +2473,9 @@ void KQuantMatmul::eval_gpu_base(
   if (transpose_ && non_batched && M <= 8 && x.dtype() != mx::float32 &&
       kq_is_nax_available() && codec_has_nax(kquant_type_)) {
     const int kstep = kq_verify_nax_call_kstep(K, kquant_type_);
-    const char* vnax_e = std::getenv("KQ_VERIFY_NAX");
-    const int vnax_env = vnax_e != nullptr ? std::atoi(vnax_e) : -1;
-    const char* vmma_f = std::getenv("KQ_VERIFY_MMA");
-    const int vmma_force = vmma_f != nullptr ? std::atoi(vmma_f) : -1;
-    const char* sk_f = std::getenv("KQ_QMM_SPLITK_NAX");
-    const int sk_force = sk_f != nullptr ? std::atoi(sk_f) : -1;
+    const int vnax_env = kq_env_int("KQ_VERIFY_NAX", -1);
+    const int vmma_force = kq_env_int("KQ_VERIFY_MMA", -1);
+    const int sk_force = kq_env_int("KQ_QMM_SPLITK_NAX", -1);
     const bool other_forced = (vmma_force >= 2 && M >= vmma_force &&
                                codec_verify_mma_rows(kquant_type_) > 0) ||
         sk_force >= 1;
@@ -2534,8 +2510,7 @@ void KQuantMatmul::eval_gpu_base(
   // KQ_VERIFY_MMA=<m> forces the entry at M >= m, 0 or 1 disables; read
   // live so an A/B can flip arms on one generator. Decided ahead of NAX
   // split-K, whose default entry yields to it.
-  const char* vmma_e = std::getenv("KQ_VERIFY_MMA");
-  const int vmma_env = vmma_e != nullptr ? std::atoi(vmma_e) : -1;
+  const int vmma_env = kq_env_int("KQ_VERIFY_MMA", -1);
   const int vmma_rows = codec_verify_mma_rows(kquant_type_);
   int vmma_min_m = 0;
   if (vmma_env >= 2) {
@@ -2556,8 +2531,7 @@ void KQuantMatmul::eval_gpu_base(
   // on one generator. The default entry yields to verify_mma, to a
   // forced KQ_QMM_SPLITK, and to a set KQ_VERIFY_EXT through M 12, so
   // those arms time the route they name.
-  const char* sk_nax_e = std::getenv("KQ_QMM_SPLITK_NAX");
-  const int sk_nax_env = sk_nax_e != nullptr ? std::atoi(sk_nax_e) : -1;
+  const int sk_nax_env = kq_env_int("KQ_QMM_SPLITK_NAX", -1);
   const int sk_nax_min_m = kq_splitk_nax_min_m(kquant_type_, N);
   const int ext_env = kq_verify_ext_env();
   const bool sk_nax_yields = vmma_route || kq_qmm_splitk_env() > 1 ||
@@ -2679,8 +2653,7 @@ void KQuantMatmul::eval_gpu_base(
   if (transpose_ && non_batched && M > 32 && M <= 128 && !nax_path &&
       qmm_splitk_env != 0 && kq_splitk_codec(kquant_type_) &&
       x.dtype() != mx::float32) {
-    const char* me = std::getenv("KQ_QMM_MIDM");
-    const int midm = me != nullptr ? std::atoi(me) : -1;
+    const int midm = kq_env_int("KQ_QMM_MIDM", -1);
     if (midm == 1 || (midm == -1 && kq_midm_splitk(M, N))) {
       const int target = qmm_splitk_env > 1 ? qmm_splitk_env : 16;
       const int sp = kq_split_count(target, K / group_size_);
@@ -2710,10 +2683,8 @@ void KQuantMatmul::eval_gpu_base(
   // larger value sets its target.
   if (transpose_ && non_batched && M > 32 && M <= 128 && nax_path &&
       (K % 64 == 0) && x.dtype() != mx::float32) {
-    const char* me = std::getenv("KQ_QMM_MIDM");
-    const int midm = me != nullptr ? std::atoi(me) : -1;
-    const char* ske = std::getenv("KQ_QMM_SPLITK_NAX");
-    const int sk_env = ske != nullptr ? std::atoi(ske) : -1;
+    const int midm = kq_env_int("KQ_QMM_MIDM", -1);
+    const int sk_env = kq_env_int("KQ_QMM_SPLITK_NAX", -1);
     const int rule = kq_midm_nax_target(M, N);
     if (sk_env != 0 && (midm == 1 || (midm == -1 && rule > 0))) {
       const int target = sk_env > 1 ? sk_env

@@ -240,8 +240,8 @@ _LOG = re.compile(r"^\[kq qmm\] (\S+) M=(\d+) N=(\d+) K=(\d+) grid=(\d+),(\d+),(
 def run_probe(calls, env=None, check=True, timeout=900):
     """Run ``calls`` in a fresh interpreter whose environment keeps no
     ``KQ_*`` variable but those in ``env``. Returns one dict per call with
-    ``kernels`` (list of (name, grid) from KQ_QMM_LOG), ``error``, ``rel``
-    and ``ulp``."""
+    ``kernels`` (list of (name, grid) from KQ_QMM_LOG), ``stderr`` (its
+    other stderr lines), ``error``, ``rel`` and ``ulp``."""
     child_env = {k: v for k, v in os.environ.items() if not k.startswith("KQ_")}
     child_env.update(env or {})
     spec = {"tests_dir": TESTS_DIR, "calls": calls, "check": check}
@@ -255,18 +255,25 @@ def run_probe(calls, env=None, check=True, timeout=900):
     assert r.returncode == 0, r.stderr[-6000:]
     results = json.loads(r.stdout.strip().splitlines()[-1])
     logs = {}
+    other = {}
     cur = None
     for line in r.stderr.splitlines():
         if line.startswith("[probe] "):
             cur = int(line.split()[1])
             logs[cur] = []
+            other[cur] = []
+            continue
+        if cur is None:
             continue
         m = _LOG.match(line)
-        if m and cur is not None:
+        if m:
             grid = tuple(int(g) for g in m.group(5, 6, 7))
             logs[cur].append((m.group(1), grid))
+        else:
+            other[cur].append(line)
     for res in results:
         res["kernels"] = logs.get(res["i"], [])
+        res["stderr"] = other.get(res["i"], [])
     return results
 
 

@@ -108,13 +108,7 @@ inline bool kq_moe_dedup(int T, int max_t) {
     return false;
   }
   static const bool has_env = std::getenv("KQ_MOE_DEDUP") != nullptr;
-  if (has_env) {
-    const char* e = std::getenv("KQ_MOE_DEDUP");
-    if (e != nullptr && std::atoi(e) == 0) {
-      return false;
-    }
-  }
-  return true;
+  return !has_env || kq_env_flag("KQ_MOE_DEDUP", 1) != 0;
 }
 constexpr int KQ_DD_MAX_T = 8;
 
@@ -183,11 +177,8 @@ inline bool kq_moe_sp(int64_t coarse_tgs, int S) {
     return false; // threadgroup is 64 * S threads; 1024 cap => S <= 16
   }
   static const bool has_env = std::getenv("KQ_MOE_SP") != nullptr;
-  if (has_env) {
-    const char* e = std::getenv("KQ_MOE_SP");
-    return e != nullptr && std::atoi(e) != 0;
-  }
-  return coarse_tgs < 2048;
+  const int v = has_env ? kq_env_flag("KQ_MOE_SP", -1) : -1;
+  return v == -1 ? coarse_tgs < 2048 : v != 0;
 }
 
 // KQ_MOE_NX_LOG=1: print each fused-MoE kernel name once (dispatch audit).
@@ -318,17 +309,8 @@ inline int kq_moe_pick_sg_h(int N, int nx) {
 
 inline bool kq_gather_fine(int64_t coarse_tgs) {
   static const bool has_env = std::getenv("KQ_GATHER_FINE") != nullptr;
-  if (has_env) {
-    const char* e = std::getenv("KQ_GATHER_FINE");
-    const int v = e == nullptr ? -1 : std::atoi(e);
-    if (v == 0) {
-      return false;
-    }
-    if (v == 1) {
-      return true;
-    }
-  }
-  return coarse_tgs < 2048;
+  const int v = has_env ? kq_env_flag("KQ_GATHER_FINE", -1) : -1;
+  return v == -1 ? coarse_tgs < 2048 : v != 0;
 }
 
 } // namespace

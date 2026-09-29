@@ -37,6 +37,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   past 65504.
 - `KQ_MOE_HALF=1` no longer returns inf for activations of a few hundred and
   up; only activations past 65504 still do.
+- Tuning levers that default on or to a per-codec rule, such as `KQ_QMV_SPLITK`
+  and `KQ_MOE_DEDUP`, keep that default when set empty instead of turning off.
 
 ## [0.5.0]
 

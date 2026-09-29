@@ -174,7 +174,9 @@ Tuning levers (defaults are right for normal use):
   65504, so a slice sum past it turns to inf even where the output is finite. Unset, float16
   activations store float partials and bfloat16 activations keep the previous bfloat16 partials.
   `1` stores float partials on both, and `0` stores partials in the activation dtype on both.
-  Read once per process unless `KQ_TUNE_LIVE=1`.
+  `true`, `on` and `yes` read as `1`, and `false`, `off` and `no` as `0`. An empty value reads as
+  unset, and any other value reads as unset with a warning on stderr. Read once per process unless
+  `KQ_TUNE_LIVE=1`.
 - `KQ_NAX_SMALL_BM` - small-M routing. `0` restores the old routing (mat-vec paths below M 13 and
   no BM=32 tile), `2` forces BM=32 for policy-excluded codecs, unset or `1` follows the per-codec
   policy. Read once per process unless `KQ_TUNE_LIVE=1`.
