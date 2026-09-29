@@ -34,8 +34,26 @@ SHAPES = [
 ]
 
 
-def _bm128_codecs():
+# The codecs with NAX kernels; each carries the BM=128 tile.
+NAX_CODECS = sorted(
+    [
+        "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "q8_0",
+        "q4_0", "q4_1", "q5_0", "q5_1",
+        "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s",
+        "iq4_nl", "iq4_xs", "stq1_0", "pq2_0", "ptq1_0",
+    ]
+)  # fmt: skip
+
+
+def _metallib_bm128_codecs():
+    """The BM=128 codecs the metallib carries, or None when there is no
+    metallib to read: a build without Metal, or KQUANT_FORCE_CPU, under
+    which this module never touches the GPU."""
+    if force_cpu():
+        return None
     names = kq.metallib_kernels()
+    if not names:
+        return None
     return sorted(
         {
             n[len("kquant_") : n.index("_qmm_t_nax_")]
@@ -49,7 +67,8 @@ def _bm128_codecs():
     )
 
 
-BM128_CODECS = _bm128_codecs()
+METALLIB_BM128_CODECS = _metallib_bm128_codecs()
+BM128_CODECS = NAX_CODECS if METALLIB_BM128_CODECS is None else METALLIB_BM128_CODECS
 
 
 def _nax_gpu():
@@ -63,7 +82,10 @@ def _kernel(res):
 
 
 def test_bm128_codecs_found():
-    assert set(MAIN_CODECS) <= set(BM128_CODECS), BM128_CODECS
+    if METALLIB_BM128_CODECS is None:
+        pytest.skip("no metallib loaded")
+    assert METALLIB_BM128_CODECS == NAX_CODECS
+    assert set(MAIN_CODECS) <= set(BM128_CODECS)
 
 
 def test_odd_rows_policy():
