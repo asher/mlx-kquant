@@ -45,6 +45,8 @@ from mlx_kquant.codec_geometry import CODEC_GEOMETRY, DECODE_ONLY_CODECS
 from kqref import is_synth, synth_wire
 
 DT = {"bfloat16": mx.bfloat16, "float16": mx.float16}
+# float32 activations too: the op casts them to bfloat16.
+X_DT = {**DT, "float32": mx.float32}
 _weights = {}
 _dequant = {}
 
@@ -173,7 +175,7 @@ for i, c in enumerate(spec["calls"]):
             os.environ.pop(name, None)
         else:
             os.environ[name] = str(value)
-    dtype = DT[c.get("dtype", "bfloat16")]
+    dtype = X_DT[c.get("dtype", "bfloat16")]
     design = c.get("design", "normal")
     w, s = weights(c["codec"], c["n"], c["shape"][-1], design)
     x = activations(

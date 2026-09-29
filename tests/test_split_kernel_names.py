@@ -1,10 +1,10 @@
 """Split-K kernel names, with no dispatch.
 
-Each split-K kernel on bfloat16 or float16 activations has a _pf32 twin
-that stores float partials (float16 by default, bfloat16 under
-KQ_SPLITK_F32=1), each twin has its base
-kernel, and float activations have no twin. Every name the split-K
-dispatchers can build must be in the metallib.
+Each split-K kernel has a _pf32 twin that stores float partials (float16
+by default, bfloat16 under KQ_SPLITK_F32=1), and each twin has its base
+kernel. The ops cast float32 activations to bfloat16, so no split-K kernel
+takes float activations. Every name the split-K dispatchers can build must
+be in the metallib.
 """
 
 from __future__ import annotations
@@ -28,20 +28,21 @@ FLOAT = "kquant_q4_k_qmm_t_splitk_bm8_float_gs_256_b_4_alN_true"
 
 
 def _pairing_errors(names):
-    """(reason, name) per break: a split-K kernel on 2-byte activations
-    without its _pf32 twin, a twin without its base, a twin on float
-    activations."""
+    """(reason, name) per break: a split-K kernel on float activations, a
+    kernel without its _pf32 twin, a twin without its base."""
     names = set(names)
     errors = []
     for n in sorted(names):
+        if not FAMILY.search(n):
+            continue
         base = n.removesuffix("_pf32")
         m = TYPE.search(base)
-        if n != base:
+        if m and m[1] == "float":
+            errors.append(("float", n))
+        elif n != base:
             if base not in names:
                 errors.append(("no base", n))
-            if m and m[1] == "float":
-                errors.append(("float twin", n))
-        elif FAMILY.search(n) and m and m[1] != "float" and n + "_pf32" not in names:
+        elif n + "_pf32" not in names:
             errors.append(("no twin", n))
     return errors
 
@@ -56,11 +57,12 @@ def test_split_kernels_pair():
 def test_pairing_check_flags_breaks():
     names = set(kq.metallib_kernels())
     twin = BASE + "_pf32"
-    assert {BASE, twin, FLOAT} <= names
+    assert {BASE, twin} <= names and FLOAT not in names
     assert _pairing_errors(names - {BASE}) == [("no base", twin)]
     assert _pairing_errors(names - {twin}) == [("no twin", BASE)]
+    assert _pairing_errors(names | {FLOAT}) == [("float", FLOAT)]
     bad = FLOAT + "_pf32"
-    assert _pairing_errors(names | {bad}) == [("float twin", bad)]
+    assert _pairing_errors(names | {bad}) == [("float", bad)]
 
 
 def test_host_split_names_exist():
@@ -71,7 +73,6 @@ def test_host_split_names_exist():
     for frag in (
         "_qmm_t_splitk_bm8_",
         "_qmm_t_splitk_bm16_",
-        "_qmm_t_splitk_float_",
         "_qmm_t_nax_splitk_",
         "_verify_mma_",
         "_verify_nax_",
@@ -81,3 +82,4 @@ def test_host_split_names_exist():
         assert any(frag in n for n in host), frag
     for end in ("_pf32", "_h", "_h_pf32"):
         assert any(n.endswith(end) for n in host), end
+    assert not any(TYPE.search(n.removesuffix("_pf32"))[1] == "float" for n in host)

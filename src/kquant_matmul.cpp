@@ -570,15 +570,16 @@ static int kq_splitk_f32_mode() {
   return kq_tune_live() ? kq_env_int("KQ_SPLITK_F32", -1) : cached;
 }
 
-// Partial dtype and kernel name suffix of a split-K call. Float
-// activations store float partials through the plain kernels either way.
+// Partial dtype and kernel name suffix of a split-K call. The ops cast
+// float32 activations to bfloat16, so dt is bfloat16 or float16, the
+// only types with split kernels.
 struct KqSplitkPartials {
   mx::Dtype dtype;
   std::string suffix;
 };
 
 static KqSplitkPartials kq_splitk_partials(mx::Dtype dt, bool f32) {
-  if (dt != mx::float32 && f32) {
+  if (f32) {
     return {mx::float32, "_pf32"};
   }
   return {dt, ""};
@@ -2955,24 +2956,19 @@ int qmv_fine_max_n(const std::string& kquant_type) {
                                          : 0;
 }
 
-// Every kernel name the split-K dispatchers can build, over the codecs and
-// activation dtypes their gates admit, both tiles or kernel variants, both
-// N alignments and both KQ_SPLITK_F32 values. The gates read the codec
-// table, not KQ_DISABLE_NAX. Names repeat across routes.
+// Every kernel name the split-K dispatchers can build, over the codecs
+// their gates admit and the bfloat16 and float16 activations the ops pass,
+// both tiles or kernel variants, both N alignments and both partial
+// dtypes. The gates read the codec table, not KQ_DISABLE_NAX. Names repeat
+// across routes.
 std::vector<std::string> split_kernel_names() {
-  const mx::Dtype two_byte[] = {mx::bfloat16, mx::float16};
-  const mx::Dtype all[] = {mx::float32, mx::bfloat16, mx::float16};
   const KqSplitkTile tiles[] = {{8, 64}, {16, 64}, {32, 32}};
   std::vector<std::string> out;
   auto each_suffix = [](mx::Dtype dt, auto&& f) {
-    const std::string plain = kq_splitk_partials(dt, false).suffix;
-    const std::string f32 = kq_splitk_partials(dt, true).suffix;
-    f(plain);
-    if (f32 != plain) {
-      f(f32);
-    }
+    f(kq_splitk_partials(dt, false).suffix);
+    f(kq_splitk_partials(dt, true).suffix);
   };
-  for (mx::Dtype dt : all) {
+  for (mx::Dtype dt : {mx::bfloat16, mx::float16}) {
     const std::string ts = kq_type_string(dt);
     each_suffix(dt, [&](const std::string& sfx) {
       out.push_back(kq_splitk_accum_kname(ts, sfx));
@@ -2982,11 +2978,9 @@ std::vector<std::string> split_kernel_names() {
     const KQuantCodec* codec = codec_by_name(t);
     const int gs = codec->weights_per_block;
     const int bits = codec->bits;
-    if (kq_splitk_codec(t)) {
-      // The small-M route admits float activations; the mid-M band and
-      // the other routes do not.
-      for (mx::Dtype dt : all) {
-        const std::string ts = kq_type_string(dt);
+    for (mx::Dtype dt : {mx::bfloat16, mx::float16}) {
+      const std::string ts = kq_type_string(dt);
+      if (kq_splitk_codec(t)) {
         for (const KqSplitkTile& tile : tiles) {
           for (bool aligned : {true, false}) {
             each_suffix(dt, [&](const std::string& sfx) {
@@ -2996,9 +2990,6 @@ std::vector<std::string> split_kernel_names() {
           }
         }
       }
-    }
-    for (mx::Dtype dt : two_byte) {
-      const std::string ts = kq_type_string(dt);
       if (codec->has_nax_kernel) {
         for (int bm : {32, 64}) {
           for (bool aligned : {true, false}) {

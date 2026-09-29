@@ -29,16 +29,17 @@
 
 // Split-K kernels come in pairs: the plain name stores T partials, and
 // the _pf32 twin stores float partials for kquant_qmm_splitk_accum_*_pf32
-// (float16 by default, bfloat16 under KQ_SPLITK_F32=1). Float activations
-// already store float
-// partials through the plain kernel, so only the 2-byte types have a twin.
-#define instantiate_pf32_float(...)
-#define instantiate_pf32_float16_t(...) instantiate_kernel(__VA_ARGS__)
-#define instantiate_pf32_bfloat16_t(...) instantiate_kernel(__VA_ARGS__)
-#define instantiate_pf32(type, ...) instantiate_pf32_ ## type(__VA_ARGS__)
+// (float16 by default, bfloat16 under KQ_SPLITK_F32=1). The ops cast
+// float32 activations to bfloat16, so only the 2-byte types have split
+// kernels.
+#define instantiate_split_float(...)
+#define instantiate_split_float16_t(...) instantiate_kernel(__VA_ARGS__)
+#define instantiate_split_bfloat16_t(...) instantiate_kernel(__VA_ARGS__)
+#define instantiate_split(type, ...) instantiate_split_ ## type(__VA_ARGS__)
 
 #define instantiate_kquant_qmm_t_splitk(type, gs, bits, aligned_N, codec) \
-  instantiate_kernel(                                                     \
+  instantiate_split(                                                      \
+      type,                                                               \
       "kquant_" #codec "_qmm_t_splitk_" #type "_gs_" #gs "_b_" #bits      \
           "_alN_" #aligned_N,                                             \
       kq_ ## codec ## _qmm_t_splitk,                                      \
@@ -46,7 +47,7 @@
       gs,                                                                 \
       bits,                                                               \
       aligned_N)                                                          \
-  instantiate_pf32(                                                       \
+  instantiate_split(                                                      \
       type,                                                               \
       "kquant_" #codec "_qmm_t_splitk_" #type "_gs_" #gs "_b_" #bits      \
           "_alN_" #aligned_N "_pf32",                                     \
@@ -61,7 +62,8 @@
 // BM=16 and BM=8 split-K tiles for M <= 16 and M <= 8 (codecs with the
 // small_bm template arm).
 #define instantiate_kquant_qmm_t_splitk_bm16(type, gs, bits, aligned_N, codec) \
-  instantiate_kernel(                                                          \
+  instantiate_split(                                                           \
+      type,                                                                    \
       "kquant_" #codec "_qmm_t_splitk_bm16_" #type "_gs_" #gs "_b_" #bits      \
           "_alN_" #aligned_N,                                                  \
       kq_ ## codec ## _qmm_t_splitk,                                           \
@@ -70,7 +72,7 @@
       bits,                                                                    \
       aligned_N,                                                               \
       16)                                                                      \
-  instantiate_pf32(                                                            \
+  instantiate_split(                                                           \
       type,                                                                    \
       "kquant_" #codec "_qmm_t_splitk_bm16_" #type "_gs_" #gs "_b_" #bits      \
           "_alN_" #aligned_N "_pf32",                                          \
@@ -82,7 +84,8 @@
       16,                                                                      \
       float)
 #define instantiate_kquant_qmm_t_splitk_bm8(type, gs, bits, aligned_N, codec) \
-  instantiate_kernel(                                                         \
+  instantiate_split(                                                          \
+      type,                                                                   \
       "kquant_" #codec "_qmm_t_splitk_bm8_" #type "_gs_" #gs "_b_" #bits      \
           "_alN_" #aligned_N,                                                 \
       kq_ ## codec ## _qmm_t_splitk,                                          \
@@ -91,7 +94,7 @@
       bits,                                                                   \
       aligned_N,                                                              \
       8)                                                                      \
-  instantiate_pf32(                                                           \
+  instantiate_split(                                                          \
       type,                                                                   \
       "kquant_" #codec "_qmm_t_splitk_bm8_" #type "_gs_" #gs "_b_" #bits      \
           "_alN_" #aligned_N "_pf32",                                         \
@@ -1243,7 +1246,6 @@ template <typename T, typename P = T>
       type,                                        \
       float)
 
-instantiate_kq_qmm_splitk_accum(float)
 instantiate_kq_qmm_splitk_accum(bfloat16_t)
 instantiate_kq_qmm_splitk_accum(float16_t)
 instantiate_kq_qmm_splitk_accum_pf32(bfloat16_t)

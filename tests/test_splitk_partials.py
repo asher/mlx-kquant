@@ -249,3 +249,17 @@ def test_splitk_f32_keeps_first_read(dtype):
             ((name, _),) = r["kernels"]
             names.append(name)
         assert all(n.endswith("_pf32") == pf32 for n in names), (first, names)
+
+
+# The ops cast float32 activations to bfloat16, so a float32 split call
+# runs the bfloat16 kernel and returns bfloat16.
+def test_splitk_float32_runs_bfloat16_kernel():
+    if force_cpu():
+        pytest.skip("GPU split-K kernels")
+    call = {"codec": "q4_k", "shape": [8, K], "n": N, "dtype": "float32"}
+    env = {"KQ_QMM_LOG": "1", "KQ_QMM_ROUTE": "splitk", **FORCE}
+    (r,) = run_probe([call], env=env)
+    assert r["error"] is None, r["error"]
+    ((name, grid),) = r["kernels"]
+    assert "_qmm_t_splitk_bm8_bfloat16_t_" in name and grid[2] > 1, (name, grid)
+    assert r["rel"] < 1e-2, r["rel"]
