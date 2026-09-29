@@ -3,8 +3,9 @@
 Each split-K kernel has a _pf32 twin that stores float partials (float16
 by default, bfloat16 under KQ_SPLITK_F32=1), and each twin has its base
 kernel. The ops cast float32 activations to bfloat16, so no split-K kernel
-takes float activations. Every name the split-K dispatchers can build must
-be in the metallib.
+takes float activations, and a codec outside the split-K codecs has no
+split-K kernel. Every name the split-K dispatchers can build must be in the
+metallib.
 """
 
 from __future__ import annotations
@@ -39,13 +40,24 @@ FAMILY = re.compile(
     r"_(qmm_t_splitk|qmm_t_nax_splitk|verify_mma|verify_nax)_|^kquant_qmm_splitk_accum_"
 )
 TYPE = re.compile(r"_(bfloat16_t|float16_t|float)(?=_gs_|$)")
+CODEC = re.compile(
+    r"^kquant_(.+?)_(?:sb_)?(?:qmm_t_splitk|qmm_t_nax_splitk|verify_mma|verify_nax)_"
+)
 BASE = "kquant_q4_k_qmm_t_splitk_bm8_bfloat16_t_gs_256_b_4_alN_true"
 FLOAT = "kquant_q4_k_qmm_t_splitk_bm8_float_gs_256_b_4_alN_true"
+FP4 = "kquant_mxfp4_qmm_t_splitk_bfloat16_t_gs_32_b_4_alN_true"
 
 
-def _pairing_errors(names):
-    """(reason, name) per break: a split-K kernel on float activations, a
-    kernel without its _pf32 twin, a twin without its base."""
+def _split_codecs():
+    """The codecs kq_splitk_codec admits: those the host enumerator names a
+    qmm_t_splitk kernel for."""
+    return {CODEC.match(n)[1] for n in _split_kernel_names() if "_qmm_t_splitk_" in n}
+
+
+def _pairing_errors(names, codecs):
+    """(reason, name) per break: a split-K kernel on float activations, one
+    for a codec outside codecs, a kernel without its _pf32 twin, a twin
+    without its base."""
     names = set(names)
     errors = []
     for n in sorted(names):
@@ -53,8 +65,11 @@ def _pairing_errors(names):
             continue
         base = n.removesuffix("_pf32")
         m = TYPE.search(base)
+        c = CODEC.match(n)
         if m and m[1] == "float":
             errors.append(("float", n))
+        elif c and c[1] not in codecs:
+            errors.append(("codec", n))
         elif n != base:
             if base not in names:
                 errors.append(("no base", n))
@@ -67,18 +82,21 @@ def test_split_kernels_pair():
     names = kq.metallib_kernels()
     split = [n for n in names if FAMILY.search(n)]
     assert any(n.endswith("_pf32") for n in split), len(split)
-    assert _pairing_errors(names) == []
+    assert _pairing_errors(names, _split_codecs()) == []
 
 
 def test_pairing_check_flags_breaks():
     names = set(kq.metallib_kernels())
+    codecs = _split_codecs()
+    assert "q4_k" in codecs and "mxfp4" not in codecs, sorted(codecs)
     twin = BASE + "_pf32"
-    assert {BASE, twin} <= names and FLOAT not in names
-    assert _pairing_errors(names - {BASE}) == [("no base", twin)]
-    assert _pairing_errors(names - {twin}) == [("no twin", BASE)]
-    assert _pairing_errors(names | {FLOAT}) == [("float", FLOAT)]
+    assert {BASE, twin} <= names and not {FLOAT, FP4} & names
+    assert _pairing_errors(names - {BASE}, codecs) == [("no base", twin)]
+    assert _pairing_errors(names - {twin}, codecs) == [("no twin", BASE)]
+    assert _pairing_errors(names | {FLOAT}, codecs) == [("float", FLOAT)]
     bad = FLOAT + "_pf32"
-    assert _pairing_errors(names | {bad}) == [("float", bad)]
+    assert _pairing_errors(names | {bad}, codecs) == [("float", bad)]
+    assert _pairing_errors(names | {FP4}, codecs) == [("codec", FP4)]
 
 
 def test_host_split_names_exist():
