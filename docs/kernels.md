@@ -275,7 +275,9 @@ Tuning levers (defaults are right for normal use):
   unsplit. Unset (off) by default. Read live per call.
 - `KQ_VERIFY_MMA_HALF` - probe lever: `1` runs the `verify_mma` half kernels (name suffix `_h`),
   which stage the activations as half and sum each block in half, so an activation or a block sum
-  past 65504 turns to inf. For timing against the float kernels only. Unset (off) by default. Read
+  past 65504 turns to inf. On pq2_0 and ptq1_0 the codes enter that sum unscaled, so a 128-weight
+  block can pass 65504 with activations of magnitude 256 (pq2_0) or 512 (ptq1_0) when the codes and
+  activations agree in sign. For timing against the float kernels only. Unset (off) by default. Read
   live per call.
 - `KQ_VERIFY_NAX_Q4_0_SB` - probe lever: `0` keeps `q4_0` on the two-block `verify_nax` kernel at
   a K that is a multiple of 256, where the eight-block kernel runs by default. Read live per call.

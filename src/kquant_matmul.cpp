@@ -1173,7 +1173,8 @@ void qmm_splitk(
 // stay in their dtype while each block sums in float.
 // KQ_VERIFY_MMA_HALF=1 (probe lever, read live) runs the _h kernels, which
 // stage the activations as half and sum each block in half, for timing
-// against them; their range stops at 65504.
+// against them; their range stops at 65504, which a pq2_0 or ptq1_0 block
+// sum of unscaled codes reaches at activations of 256 or 512.
 void verify_mma(
     const array& x,
     const array& w,
