@@ -33,6 +33,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   them, no longer return inf for activations past 65504, and fp16 error drops 3-5x.
 - Decode steps on pq2_0 weights no longer return inf for bfloat16 activations
   past 65504.
+- `KQ_MOE_HALF=1` no longer returns inf for activations of a few hundred and
+  up; only activations past 65504 still do.
 
 ## [0.5.0]
 

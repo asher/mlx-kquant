@@ -293,9 +293,10 @@ All optional; the defaults are right for normal use.
   dequantize an expert once per pair of rows that select it. Read per call. Outputs are
   bit-identical either way; `KQ_MOE_HALF=1` keeps its own kernels at every width. A/B lever.
 - `KQ_MOE_HALF=1` - on Metal, run the iq2_xs, iq2_xxs and iq3_xxs fused MoE decode gathers on the
-  half-dot kernels (half grid tables, half-staged activations, half chunk dots with a float sum per
-  chunk; shared-expert slots stay on the float path). Read per call. Default off: the outputs differ
-  from the float kernels at half rounding level. A/B lever.
+  half-dot kernels (half grid tables and half-staged activations, with each chunk dotted in float;
+  shared-expert slots stay on the float path). Read per call. Default off: the outputs differ from
+  the float kernels at half rounding level, and an activation past 65504 in magnitude turns to inf.
+  A/B lever.
 
 - `KQ_SDPA_IDX_NAX=0` - run `sdpa_fa_indexed` on its simdgroup kernel even where the NAX tile
   kernel is available. Read once per process. The simdgroup kernel matches `sdpa_fa_verify` over

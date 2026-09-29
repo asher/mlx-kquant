@@ -155,9 +155,12 @@ def _rel(got, ref):
     return float(np.linalg.norm(g - ref) / (np.linalg.norm(ref) + 1e-6))
 
 
-def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0):
-    """Run all five gather ops for one (expert codec, shexp codec) pair.
-    Returns list of (name, rel, ok)."""
+def _check_codec(
+    codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0, x_scale=0.1
+):
+    """Run all five gather ops for one (expert codec, shexp codec) pair on
+    activations of standard deviation x_scale. Returns list of (name, rel,
+    ok)."""
     scodec = sx or codec
     wire, ref = _wire_and_ref(codec, k=k)
     if wire is None:
@@ -174,7 +177,7 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0):
     sgw, suw, sdw = mx.array(swire[2]), mx.array(swire[3]), mx.array(swire[1])
     sg_ref, su_ref, sd_ref = sref[2], sref[3], sref[1]
 
-    x_np = (rng.standard_normal((T, k)) * 0.1).astype(np.float16)
+    x_np = (rng.standard_normal((T, k)) * x_scale).astype(np.float16)
     x = mx.array(x_np).astype(dtype)
     xf = np.array(x.astype(mx.float32))  # exactly what the kernel reads
     inds_np = rng.integers(0, E, size=(T, R)).astype(np.uint32)
@@ -205,7 +208,7 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0):
     out.append(("glu", rel, rel < REL_BOUND))
 
     # gather_qmv_kq
-    h_np = (rng.standard_normal((T, R, k)) * 0.1).astype(np.float16)
+    h_np = (rng.standard_normal((T, R, k)) * x_scale).astype(np.float16)
     h = mx.array(h_np).astype(dtype)
     hf = np.array(h.astype(mx.float32))
     got = kq.gather_qmv_kq(h, dw, codec, inds)
@@ -258,7 +261,7 @@ def _check_codec(codec, sx=None, act="silu", dtype=mx.float16, k=K, limit=0.0):
 
     # gather_qmv_mix_kq (shexp codec = scodec)
     S = R + 1
-    hs_np = (rng.standard_normal((T, S, k)) * 0.1).astype(np.float16)
+    hs_np = (rng.standard_normal((T, S, k)) * x_scale).astype(np.float16)
     hs = mx.array(hs_np).astype(dtype)
     hsf = np.array(hs.astype(mx.float32))
     sc_np = rng.uniform(0.05, 0.9, size=(T, S)).astype(np.float32)

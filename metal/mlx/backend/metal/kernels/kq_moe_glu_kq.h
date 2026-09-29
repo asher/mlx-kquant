@@ -1833,12 +1833,14 @@ template <typename T>
 // changes per chunk: the grid entry comes back as half4 pairs (no u64 byte
 // unpack), the activation row is read from a half copy staged once per
 // threadgroup in dynamic threadgroup memory (buffer threadgroup(0), K halves,
-// host-sized), and the four 4-wide dots run in half with a float sum per
-// chunk before the chunk scale. Expert rows only: the shared-expert slot in
-// the shexp / mix kernels keeps the float path over the device activation
-// row, so the shexp numerics are unchanged. Outputs differ from the float
-// kernels at the half rounding level (about 1e-3 relative on the fused GLU
-// output at K=4096, against a bf16 floor near 9e-4).
+// host-sized), and the four 4-wide dots widen both halves to float, so
+// each product and the chunk sum run in float before the chunk scale: a
+// grid code (up to 62) times any half activation stays in range, and only
+// an activation past 65504 turns to inf in the staged row. Expert rows
+// only: the shared-expert slot in the shexp / mix kernels keeps the float
+// path over the device activation row, so the shexp numerics are
+// unchanged. Outputs differ from the float kernels at the half rounding
+// level of the staged activations.
 // ---------------------------------------------------------------------------
 
 #define KQ_EXT_STAGE_LUTS_H(CodecT, name)                               \
@@ -1884,8 +1886,8 @@ METAL_FUNC float kq_ext_row_partial_h(
     KqTgLutsH<Codec>::deq_chunk16h(block, short(ich % chpb), lw, luts, sc);
     const threadgroup half4* xp = xs + ich * 4;
     acc += sc *
-        (float(dot(lw[0], xp[0])) + float(dot(lw[1], xp[1])) +
-         float(dot(lw[2], xp[2])) + float(dot(lw[3], xp[3])));
+        (dot(float4(lw[0]), float4(xp[0])) + dot(float4(lw[1]), float4(xp[1])) +
+         dot(float4(lw[2]), float4(xp[2])) + dot(float4(lw[3]), float4(xp[3])));
   }
   return acc;
 }
@@ -1909,20 +1911,20 @@ METAL_FUNC float2 kq_ext_glu_row_partial_h(
     const int64_t boff = (int64_t)(ich / chpb) * Codec::block_bytes;
     const short cch = short(ich % chpb);
     const threadgroup half4* xp = xs + ich * 4;
-    const half4 a0 = xp[0];
-    const half4 a1 = xp[1];
-    const half4 a2 = xp[2];
-    const half4 a3 = xp[3];
+    const float4 a0 = float4(xp[0]);
+    const float4 a1 = float4(xp[1]);
+    const float4 a2 = float4(xp[2]);
+    const float4 a3 = float4(xp[3]);
     half4x4 lw;
     float sc;
     KqTgLutsH<Codec>::deq_chunk16h(g_row + boff, cch, lw, luts, sc);
     acc.x += sc *
-        (float(dot(lw[0], a0)) + float(dot(lw[1], a1)) + float(dot(lw[2], a2)) +
-         float(dot(lw[3], a3)));
+        (dot(float4(lw[0]), a0) + dot(float4(lw[1]), a1) +
+         dot(float4(lw[2]), a2) + dot(float4(lw[3]), a3));
     KqTgLutsH<Codec>::deq_chunk16h(u_row + boff, cch, lw, luts, sc);
     acc.y += sc *
-        (float(dot(lw[0], a0)) + float(dot(lw[1], a1)) + float(dot(lw[2], a2)) +
-         float(dot(lw[3], a3)));
+        (dot(float4(lw[0]), a0) + dot(float4(lw[1]), a1) +
+         dot(float4(lw[2]), a2) + dot(float4(lw[3]), a3));
   }
   return acc;
 }
