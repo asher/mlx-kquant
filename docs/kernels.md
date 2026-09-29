@@ -302,8 +302,10 @@ instead of extracting each trit. A simdgroup computes four output rows, so the f
 eight rows per threadgroup. Measured on M5 Max at the Ternary Bonsai 2 27B projection shapes with
 the weights streamed from DRAM, it reads 360-440 GB/s, 1.2-1.3x the previous
 two-rows-per-simdgroup layout. The `pq2_0` M=1 kernel
-masks each pair of 2-bit codes into the mantissas of a half2 and runs the dot as half2 fmas, two
-weights per instruction, which brings it close to the rate of a kernel that only loads the bytes.
+masks each pair of 2-bit codes into the mantissas of a half2. On float16 activations it runs the dot
+as half2 fmas, two weights per instruction, which brings it close to the rate of a kernel that only
+loads the bytes. On bfloat16 activations it widens each pair to float and runs the dot as float2
+fmas, since a bfloat16 value past 65504 does not fit in half.
 Both codecs have a `verify_qmv` sibling that decodes each row's block once and dots it against every
 activation row. It serves M 2 below the `verify_mma` entry on GPUs without NAX, where the `mv_ext`
 re-decode per row costs `ptq1_0` 3x. On NAX GPUs per-row qmv serves M 2.

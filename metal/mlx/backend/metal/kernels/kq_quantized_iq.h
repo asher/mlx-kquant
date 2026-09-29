@@ -5188,13 +5188,13 @@ struct KqTgLuts<KqIq2_sExt> {
 // ---------------------------------------------------------------------------
 // Half-dot decode tables (KQ_MOE_HALF): the grid codecs' 8-bit magnitude
 // entries pre-expanded to half4 pairs in threadgroup memory, so the chunk
-// dequant is a table read plus a sign select in half and the dot runs in
-// half against a half-staged activation row. Specialized for the codecs
-// where the float path is ALU-bound at decode (iq2_xs, iq2_xxs, iq3_xxs);
-// every other codec reports has_half = false and never reaches these
-// kernels (host gate). deq_chunk16h mirrors deq_chunk16s: 16 unscaled
-// weights in natural order plus the chunk scale, applied by the caller in
-// float once per chunk.
+// dequant is a table read plus a sign select in half. The caller widens
+// the weights and a half-staged activation row to float for each chunk
+// dot. Specialized for the codecs where the float path is ALU-bound at
+// decode (iq2_xs, iq2_xxs, iq3_xxs); every other codec reports has_half =
+// false and never reaches these kernels (host gate). deq_chunk16h mirrors
+// deq_chunk16s: 16 unscaled weights in natural order plus the chunk scale,
+// applied by the caller in float once per chunk.
 // ---------------------------------------------------------------------------
 
 // Negates lane j of a half4 where bit j of s (low 4 bits) is set.

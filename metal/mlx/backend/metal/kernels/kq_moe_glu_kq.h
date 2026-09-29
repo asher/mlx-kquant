@@ -2063,8 +2063,8 @@ template <
 }
 
 // Score-mixed down gather with the shared-expert slot folded in: the routed
-// slots restage their h row per slot (two barriers each) and dot in half;
-// the shared slot stays on the float path.
+// slots restage their h row as half per slot (two barriers each) and dot
+// each chunk in float; the shared slot stays on the float path.
 template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
 [[kernel]] void kq_ext_gather_qmv_mix_h(
     const device uint8_t* w [[buffer(0)]],
