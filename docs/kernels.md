@@ -625,6 +625,34 @@ Tuning levers (defaults are right for normal use):
   after attention or the next layer's input norm. Rows wider than 16384 and CPU streams run the
   composition.
 
+## Attention q and k norm with RoPE
+
+- `qk_norm_rope` - the per-head RMSNorm and rotary embedding that a diffusion transformer applies
+  to q and k before attention, both tensors in one dispatch. Each head row `x` of q (weight `q_w`)
+  and of k (weight `k_w`) becomes `y = x * rsqrt(mean(x^2) + eps) * w`, and then each interleaved
+  pair `(y[2i], y[2i + 1])` of sequence row `l` rotates by the angle whose cosine and sine are
+  `cos[l, i]` and `sin[l, i]`. The tables hold one angle per row and pair, so any position scheme
+  works, such as the caption index and image row and column of a three-axis image RoPE. The angles
+  of `mx.fast.rope` follow the sequence index and cannot express these positions.
+
+  The op reads q and k `[B, L, H, D]` in place through their strides, so the q and k slices of one
+  fused qkv output need no copy, and lazy transposed views work the same way. The batch shares the
+  `[L, D / 2]` tables. It returns `(q_out, k_out)`, each row-contiguous `[B, H, L, D]`, the layout
+  attention reads, so no transpose copy follows.
+
+  q and k are float16 or bfloat16 and the outputs keep that dtype. The weights and tables may be any
+  float dtype and are used in f32. The norm and the rotation run in f32 with one rounding at the
+  write, so the output is within 1 ulp of the exact result. The unfused composition also rounds the
+  normalized value before the rotation.
+
+  One threadgroup per `(b, l)` row covers every head of q and k, with 16 lanes per head row. Each
+  lane loads its cosines, sines and weights once per row and reuses them across heads. Head dims 64,
+  96, 128 and 256 have kernels in both dtypes. Views whose head-dim stride is 1 and whose rows start
+  on the vector width take vector loads, and any other view takes element loads through its strides.
+
+  CPU streams, and GPU calls at other even head dims, run the same math as stock MLX ops, an f32 norm
+  and rotation followed by one cast to the input dtype and a transposed copy.
+
 ## Hadamard rotation
 
 - **`hadamard_rotate`** - the signed block Walsh-Hadamard rotation a Hadamard-folded weight expects
