@@ -98,9 +98,9 @@ METAL_FUNC void kq_pq2_0_decode_pairs(uint wv, thread half2* h) {
 }
 
 // M=1 mat-vec: eight lanes per block, four blocks per simdgroup pass, 16
-// contiguous weights per lane decoded as half2 pairs. Two half MACs per
-// instruction against the activation pair (y_j, y_j+8) keep the decode
-// near the load-only rate.
+// contiguous weights per lane decoded as half2 pairs. For float16
+// activations, two half MACs per instruction against the activation pair
+// (y_j, y_j+8) keep the decode near the load-only rate.
 template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
 METAL_FUNC void kq_pq2_0_qmv_impl(
     const device uint8_t* w,
@@ -115,9 +115,9 @@ METAL_FUNC void kq_pq2_0_qmv_impl(
   static_assert(bits == 2, "PQ2_0 requires bits=2");
   constexpr int num_simdgroups = 2;
   constexpr int blocks_per_pass = 4;
-  // fp32 activations keep an fp32 pair accumulator; half inputs stay in
-  // the half pipe.
-  typedef metal::conditional_t<metal::is_same_v<T, float>, float2, half2> A2;
+  // float16 activations stay in the half pipe. Other activations keep a
+  // float pair accumulator: bfloat16 values past 65504 do not fit in half.
+  typedef metal::conditional_t<metal::is_same_v<T, half>, half2, float2> A2;
   typedef float U;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
@@ -191,7 +191,7 @@ METAL_FUNC void kq_pq2_0_verify_qmv_impl(
   static_assert(bits == 2, "PQ2_0 requires bits=2");
   constexpr int num_simdgroups = 2;
   constexpr int blocks_per_pass = 4;
-  typedef metal::conditional_t<metal::is_same_v<T, float>, float2, half2> A2;
+  typedef metal::conditional_t<metal::is_same_v<T, half>, half2, float2> A2;
   typedef float U;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;

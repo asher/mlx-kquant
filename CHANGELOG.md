@@ -31,6 +31,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   no longer returns inf where its output is finite.
 - Matmuls of 2 to 8 rows on q4_0, pq2_0 and ptq1_0 weights, MTP verify among
   them, no longer return inf for activations past 65504, and fp16 error drops 3-5x.
+- Decode steps on pq2_0 weights no longer return inf for bfloat16 activations
+  past 65504.
 
 ## [0.5.0]
 
