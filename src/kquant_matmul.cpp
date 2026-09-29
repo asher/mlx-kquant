@@ -557,14 +557,14 @@ static bool kq_nax_swizzle_on() {
   return kq_tune_live() ? kq_env_int("KQ_NAX_SWIZZLE", 0) != 0 : cached;
 }
 
-// KQ_SPLITK_F32: 1 (default) = the split-K routes (qmm_splitk, verify_mma,
-// verify_nax, qmm_nax_splitk) store their K-slice partials in float, so
-// the fold rounds the result once; 0 = partials in the activation dtype,
-// which rounds every slice once more before the fold (the previous
-// behavior). Read once per process unless KQ_TUNE_LIVE=1.
+// KQ_SPLITK_F32: 0 (default) = the split-K routes (qmm_splitk, verify_mma,
+// verify_nax, qmm_nax_splitk) store their K-slice partials in the
+// activation dtype, which rounds every slice once more before the fold;
+// 1 = partials in float, so the fold rounds the result once. Read once
+// per process unless KQ_TUNE_LIVE=1.
 static bool kq_splitk_f32() {
-  static const bool cached = kq_env_int("KQ_SPLITK_F32", 1) != 0;
-  return kq_tune_live() ? kq_env_int("KQ_SPLITK_F32", 1) != 0 : cached;
+  static const bool cached = kq_env_int("KQ_SPLITK_F32", 0) != 0;
+  return kq_tune_live() ? kq_env_int("KQ_SPLITK_F32", 0) != 0 : cached;
 }
 
 // Partial dtype and kernel name suffix of a split-K call. Float
@@ -970,8 +970,8 @@ static KqSplitkTile kq_splitk_tile(int M, const std::string& t) {
 // [5376 x 21504]) and the in-tile K walk serializes, capping qmm/NAX at
 // 160-257 GB/s while mv_ext decays past M~4 on L2 activation re-reads.
 // Partitioning K across grid.z multiplies threadgroup count by `splits`;
-// each slice writes a float partial tile (T under KQ_SPLITK_F32=0) and a
-// second tiny pass folds them in f32. Slice starts must land on wire-block
+// each slice writes a partial tile in T (float under KQ_SPLITK_F32=1) and
+// a second tiny pass folds them in f32. Slice starts must land on wire-block
 // boundaries, so the partition is a multiple of group_size (the caller
 // guarantees splits divides K / group_size). Non-batched transpose shapes only.
 void qmm_splitk(

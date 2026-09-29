@@ -29,7 +29,7 @@
 
 // Split-K kernels come in pairs: the plain name stores T partials, and
 // the _pf32 twin stores float partials for kquant_qmm_splitk_accum_*_pf32
-// (the default, KQ_SPLITK_F32). Float activations already store float
+// (KQ_SPLITK_F32=1). Float activations already store float
 // partials through the plain kernel, so only the 2-byte types have a twin.
 #define instantiate_pf32_float(...)
 #define instantiate_pf32_float16_t(...) instantiate_kernel(__VA_ARGS__)

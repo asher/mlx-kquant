@@ -1,4 +1,5 @@
-"""Split-K partials: float by default, KQ_SPLITK_F32=0 keeps the old ones.
+"""Split-K partials: the activation dtype by default, float under
+KQ_SPLITK_F32=1.
 
 The split routes (qmm_splitk, verify_mma, verify_nax, qmm_nax_splitk) fold
 their K slices in f32. With float partials the fold rounds the result once,
@@ -14,9 +15,9 @@ output and its rounding shows fully. At K 12288 and N 256:
   the tile run within 2 percent of that floor.
 - Every split route stays within 1 ulp and half an output rounding of its
   reference: the tile, or the same verify route run as one slice.
-- KQ_SPLITK_F32=0 dispatches the T-partial kernels, which sit more than one
-  output rounding from that reference, with an R2 excess above half the
-  floor on the qmm routes.
+- KQ_SPLITK_F32=0, the default, dispatches the T-partial kernels, which sit
+  more than one output rounding from that reference, with an R2 excess
+  above half the floor on the qmm routes.
 
 Dense, lazy transposed, strided and batch-of-two inputs all take the
 checks. On the CPU stream the levers do nothing: every pair of calls
@@ -200,3 +201,21 @@ def test_splitk_partials(codec, dtype):
                 assert e2 > 0.5, (where, e2)
             if ref is not None:
                 assert dist > 1.0, (where, dist)
+
+
+# With no KQ_SPLITK_F32 set, a split call dispatches the T-partial kernel,
+# and KQ_SPLITK_F32=1 its float twin.
+def test_splitk_f32_default_off():
+    if force_cpu():
+        pytest.skip("GPU split-K kernels")
+    call = {"codec": "q4_k", "shape": [8, K], "n": N, "dtype": "bfloat16"}
+    env = {"KQ_QMM_LOG": "1", "KQ_QMM_ROUTE": "splitk", **FORCE}
+    names = []
+    for extra in ({}, {"KQ_SPLITK_F32": "1"}):
+        (r,) = run_probe([call], env={**env, **extra})
+        assert r["error"] is None, r["error"]
+        ((name, grid),) = r["kernels"]
+        assert "_qmm_t_splitk_" in name and grid[2] > 1, (name, grid)
+        names.append(name)
+    assert not names[0].endswith("_pf32"), names
+    assert names[1] == names[0] + "_pf32", names

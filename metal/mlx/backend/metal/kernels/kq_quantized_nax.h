@@ -3645,8 +3645,8 @@ KQ_NAX_DEFINE_KERNELS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
 
 // Split-K qmm_t on the NAX tile (KQ_QMM_SPLITK_NAX):
 // grid.z indexes K-slices; each slice walks k_partition_size weights from a
-// superblock-aligned start and stores a U partial tile (float, or T under
-// KQ_SPLITK_F32=0) at tid.z * split_k_partition_stride. The shared
+// superblock-aligned start and stores a U partial tile (T, or float under
+// KQ_SPLITK_F32=1) at tid.z * split_k_partition_stride. The shared
 // kquant_qmm_splitk_accum pass folds slices in f32. The host guarantees
 // k_partition_size is a multiple of both the codec superblock and BK, so every
 // slice starts the loader at kt_base 0. The last slice stops at K, so it may be
