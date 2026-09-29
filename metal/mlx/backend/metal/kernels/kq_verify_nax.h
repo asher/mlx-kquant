@@ -14,7 +14,8 @@
 // 8..15 as padding, loaded from device memory per unit in the codec's k
 // order. Nothing is staged in threadgroup memory and there are no
 // barriers. Each simdgroup keeps one f32 accumulator. Split-K over grid z
-// writes T partials that kquant_qmm_splitk_accum folds.
+// writes U partials, T or float as in kq_qmm_t_impl, that
+// kquant_qmm_splitk_accum folds.
 //
 // A unit is one or more wire blocks, or half of one, and step s of a unit
 // is its s-th 16-wide NAX op. For pq2_0 and q4_0, step s consumes the

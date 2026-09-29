@@ -107,7 +107,9 @@ MLX_MTL_CONST int SIMD_SIZE = 32;
 
 struct kq_empty {};
 
-// U is the type of y: T for a whole matmul, float for a split-K partial.
+// U is the type of y: T for a whole matmul and for the split-K partials
+// of the plain kernels, float for the _pf32 kernels (float16 by default,
+// bfloat16 under KQ_SPLITK_F32=1).
 template <
     typename T,
     typename LoaderW,
