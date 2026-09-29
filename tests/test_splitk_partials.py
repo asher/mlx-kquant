@@ -219,3 +219,22 @@ def test_splitk_f32_default_off():
         names.append(name)
     assert not names[0].endswith("_pf32"), names
     assert names[1] == names[0] + "_pf32", names
+
+
+# Without KQ_TUNE_LIVE, KQ_SPLITK_F32 is read once per process: a change
+# after the first split call does not reach the later ones.
+def test_splitk_f32_keeps_first_read():
+    if force_cpu():
+        pytest.skip("GPU split-K kernels")
+    call = {"codec": "q4_k", "shape": [8, K], "n": N, "dtype": "bfloat16"}
+    env = {"KQ_QMM_LOG": "1", "KQ_QMM_ROUTE": "splitk", **FORCE}
+    for first, later in (("1", [None, "0"]), ("0", [None, "1"])):
+        calls = [call] + [dict(call, env={"KQ_SPLITK_F32": v}) for v in later]
+        res = run_probe(calls, env={**env, "KQ_SPLITK_F32": first})
+        names = []
+        for r in res:
+            assert r["error"] is None, r["error"]
+            ((name, _),) = r["kernels"]
+            names.append(name)
+        pf32 = first == "1"
+        assert all(n.endswith("_pf32") == pf32 for n in names), names

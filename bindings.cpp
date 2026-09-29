@@ -94,6 +94,12 @@ NB_MODULE(_ext, m) {
       "The GPU's threadgroup memory limit in bytes; 0 without Metal.");
 
   m.def(
+      "_split_kernel_names",
+      &mlx_kquant::split_kernel_names,
+      "Every kernel name the split-K dispatchers can build, for the kernel "
+      "name tests (empty without Metal).");
+
+  m.def(
       "qmv_fine_max_n",
       &mlx_kquant::qmv_fine_max_n,
       "kquant_type"_a,

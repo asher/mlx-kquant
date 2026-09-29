@@ -574,11 +574,15 @@ struct KqSplitkPartials {
   std::string suffix;
 };
 
-static KqSplitkPartials kq_splitk_partials(mx::Dtype dt) {
-  if (dt != mx::float32 && kq_splitk_f32()) {
+static KqSplitkPartials kq_splitk_partials(mx::Dtype dt, bool f32) {
+  if (dt != mx::float32 && f32) {
     return {mx::float32, "_pf32"};
   }
   return {dt, ""};
+}
+
+static KqSplitkPartials kq_splitk_partials(mx::Dtype dt) {
+  return kq_splitk_partials(dt, kq_splitk_f32());
 }
 
 // KQ_QMM_LOG set (any value): the qmm tiles log the kernel name and shape
@@ -964,6 +968,113 @@ static KqSplitkTile kq_splitk_tile(int M, const std::string& t) {
   return {bm8 ? 8 : (small ? 16 : 32), small ? 64 : 32};
 }
 
+// Kernel names of the split-K routes and their fold. The dispatchers and
+// split_kernel_names build the names here, so a test of the names that
+// split_kernel_names lists covers every name a dispatch can ask for.
+static std::string kq_qmm_splitk_kname(
+    const std::string& t,
+    const std::string& ts,
+    int gs,
+    int bits,
+    KqSplitkTile tile,
+    bool aligned,
+    const std::string& suffix) {
+  std::string kname;
+  kname.reserve(64);
+  mx::concatenate(
+      kname,
+      kq_kname_prefix(t) +
+          (tile.bm == 8
+               ? "qmm_t_splitk_bm8_"
+               : (tile.bn == 64 ? "qmm_t_splitk_bm16_" : "qmm_t_splitk_")),
+      ts,
+      "_gs_",
+      gs,
+      "_b_",
+      bits,
+      aligned ? "_alN_true" : "_alN_false",
+      suffix);
+  return kname;
+}
+
+static std::string kq_qmm_nax_splitk_kname(
+    const std::string& t,
+    const std::string& ts,
+    int gs,
+    int bits,
+    int bm,
+    bool aligned,
+    const std::string& suffix) {
+  std::string kname;
+  kname.reserve(80);
+  mx::concatenate(
+      kname,
+      kq_kname_prefix(t) + "qmm_t_nax_splitk_",
+      ts,
+      "_gs_",
+      gs,
+      "_b_",
+      bits,
+      "_bm",
+      bm,
+      "_bn64_bk64_wm2_wn2",
+      aligned ? "_alN_true" : "_alN_false",
+      suffix);
+  return kname;
+}
+
+// half selects the KQ_VERIFY_MMA_HALF kernels.
+static std::string kq_verify_mma_kname(
+    const std::string& t,
+    const std::string& ts,
+    int gs,
+    int bits,
+    bool half,
+    const std::string& suffix) {
+  std::string kname;
+  kname.reserve(64);
+  mx::concatenate(
+      kname,
+      kq_kname_prefix(t) + "verify_mma_",
+      ts,
+      "_gs_",
+      gs,
+      "_b_",
+      bits,
+      half ? "_h" : "",
+      suffix);
+  return kname;
+}
+
+// kstep 256 on q4_0 selects its eight-block kernel.
+static std::string kq_verify_nax_kname(
+    const std::string& t,
+    const std::string& ts,
+    int gs,
+    int bits,
+    int kstep,
+    const std::string& suffix) {
+  std::string kname;
+  kname.reserve(64);
+  mx::concatenate(
+      kname,
+      (t == "q4_0" && kstep == 256 ? "kquant_q4_0_sb_" : kq_kname_prefix(t)) +
+          "verify_nax_",
+      ts,
+      "_gs_",
+      gs,
+      "_b_",
+      bits,
+      suffix);
+  return kname;
+}
+
+static std::string kq_splitk_accum_kname(
+    const std::string& ts,
+    const std::string& suffix) {
+  return "kquant_qmm_splitk_accum_" + ts + suffix;
+}
+
 // Split-K qmm_t for the small-M decode band and the mid-M band on non-NAX
 // GPUs (see kq_midm_splitk). The plain tile grid is only
 // ceil(N/64) x 1 threadgroups at decode shapes with M <= 32 (84 at
@@ -992,8 +1103,6 @@ void qmm_splitk(
   const KqSplitkTile tile = kq_splitk_tile(M, kquant_type);
   const int bm = tile.bm;
   const int bn = tile.bn;
-  const bool bm8 = bm == 8;
-  const bool small = bn == 64;
   const int k_partition = (K / group_size / splits) * group_size;
   const int part_stride = M * N;
   const KqSplitkPartials pp = kq_splitk_partials(x.dtype());
@@ -1005,21 +1114,8 @@ void qmm_splitk(
   ce.add_temporary(partials);
 
   std::string type_string = kq_type_string(x.dtype());
-  bool aligned = N % bn == 0;
-  std::string kname;
-  kname.reserve(64);
-  mx::concatenate(
-      kname,
-      kq_kname_prefix(kquant_type) +
-          (bm8 ? "qmm_t_splitk_bm8_"
-               : (small ? "qmm_t_splitk_bm16_" : "qmm_t_splitk_")),
-      type_string,
-      "_gs_",
-      group_size,
-      "_b_",
-      bits,
-      aligned ? "_alN_true" : "_alN_false",
-      pp.suffix);
+  const std::string kname = kq_qmm_splitk_kname(
+      kquant_type, type_string, group_size, bits, tile, N % bn == 0, pp.suffix);
 
   auto kernel = kq_get_kernel(d, kname);
   ce.set_compute_pipeline_state(kernel);
@@ -1039,7 +1135,7 @@ void qmm_splitk(
   kq_log_qmm(kname, M, N, K, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 
-  std::string aname = "kquant_qmm_splitk_accum_" + type_string + pp.suffix;
+  const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
   auto accum = kq_get_kernel(d, aname);
   ce.set_compute_pipeline_state(accum);
   const int n_elems = M * N;
@@ -1095,17 +1191,12 @@ void verify_mma(
   }
 
   std::string type_string = kq_type_string(x.dtype());
-  std::string kname;
-  kname.reserve(64);
-  mx::concatenate(
-      kname,
-      kq_kname_prefix(kquant_type) + "verify_mma_",
+  const std::string kname = kq_verify_mma_kname(
+      kquant_type,
       type_string,
-      "_gs_",
       group_size,
-      "_b_",
       bits,
-      kq_env_int("KQ_VERIFY_MMA_HALF", 0) == 1 ? "_h" : "",
+      kq_env_int("KQ_VERIFY_MMA_HALF", 0) == 1,
       pp.suffix);
 
   auto kernel = kq_get_kernel(d, kname);
@@ -1129,7 +1220,7 @@ void verify_mma(
     return;
   }
 
-  std::string aname = "kquant_qmm_splitk_accum_" + type_string + pp.suffix;
+  const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
   auto accum = kq_get_kernel(d, aname);
   ce.set_compute_pipeline_state(accum);
   const int n_elems = M * N;
@@ -1212,19 +1303,8 @@ void verify_nax(
   }
 
   std::string type_string = kq_type_string(x.dtype());
-  std::string kname;
-  kname.reserve(64);
-  mx::concatenate(
-      kname,
-      (kquant_type == "q4_0" && kstep == 256 ? "kquant_q4_0_sb_"
-                                             : kq_kname_prefix(kquant_type)) +
-          "verify_nax_",
-      type_string,
-      "_gs_",
-      group_size,
-      "_b_",
-      bits,
-      pp.suffix);
+  const std::string kname = kq_verify_nax_kname(
+      kquant_type, type_string, group_size, bits, kstep, pp.suffix);
 
   auto kernel = kq_get_kernel(d, kname);
   ce.set_compute_pipeline_state(kernel);
@@ -1247,7 +1327,7 @@ void verify_nax(
     return;
   }
 
-  std::string aname = "kquant_qmm_splitk_accum_" + type_string + pp.suffix;
+  const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
   auto accum = kq_get_kernel(d, aname);
   ce.set_compute_pipeline_state(accum);
   const int n_elems = M * N;
@@ -1298,22 +1378,8 @@ void qmm_nax_splitk(
   ce.add_temporary(partials);
 
   std::string type_string = kq_type_string(x.dtype());
-  bool aligned = N % bn == 0;
-  std::string kname;
-  kname.reserve(80);
-  mx::concatenate(
-      kname,
-      kq_kname_prefix(kquant_type) + "qmm_t_nax_splitk_",
-      type_string,
-      "_gs_",
-      group_size,
-      "_b_",
-      bits,
-      "_bm",
-      bm,
-      "_bn64_bk64_wm2_wn2",
-      aligned ? "_alN_true" : "_alN_false",
-      pp.suffix);
+  const std::string kname = kq_qmm_nax_splitk_kname(
+      kquant_type, type_string, group_size, bits, bm, N % bn == 0, pp.suffix);
 
   auto kernel = kq_get_kernel(d, kname);
   ce.set_compute_pipeline_state(kernel);
@@ -1333,7 +1399,7 @@ void qmm_nax_splitk(
   kq_log_qmm(kname, M, N, K, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 
-  std::string aname = "kquant_qmm_splitk_accum_" + type_string + pp.suffix;
+  const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
   auto accum = kq_get_kernel(d, aname);
   ce.set_compute_pipeline_state(accum);
   const int n_elems = M * N;
@@ -2882,6 +2948,84 @@ int qmv_fine_max_n(const std::string& kquant_type) {
                                          : 0;
 }
 
+// Every kernel name the split-K dispatchers can build, over the codecs and
+// activation dtypes their gates admit, both tiles or kernel variants, both
+// N alignments and both KQ_SPLITK_F32 values. The gates read the codec
+// table, not KQ_DISABLE_NAX. Names repeat across routes.
+std::vector<std::string> split_kernel_names() {
+  const mx::Dtype two_byte[] = {mx::bfloat16, mx::float16};
+  const mx::Dtype all[] = {mx::float32, mx::bfloat16, mx::float16};
+  const KqSplitkTile tiles[] = {{8, 64}, {16, 64}, {32, 32}};
+  std::vector<std::string> out;
+  auto each_suffix = [](mx::Dtype dt, auto&& f) {
+    const std::string plain = kq_splitk_partials(dt, false).suffix;
+    const std::string f32 = kq_splitk_partials(dt, true).suffix;
+    f(plain);
+    if (f32 != plain) {
+      f(f32);
+    }
+  };
+  for (mx::Dtype dt : all) {
+    const std::string ts = kq_type_string(dt);
+    each_suffix(dt, [&](const std::string& sfx) {
+      out.push_back(kq_splitk_accum_kname(ts, sfx));
+    });
+  }
+  for (const std::string& t : codec_names()) {
+    const KQuantCodec* codec = codec_by_name(t);
+    const int gs = codec->weights_per_block;
+    const int bits = codec->bits;
+    if (kq_splitk_codec(t)) {
+      // The small-M route admits float activations; the mid-M band and
+      // the other routes do not.
+      for (mx::Dtype dt : all) {
+        const std::string ts = kq_type_string(dt);
+        for (const KqSplitkTile& tile : tiles) {
+          for (bool aligned : {true, false}) {
+            each_suffix(dt, [&](const std::string& sfx) {
+              out.push_back(
+                  kq_qmm_splitk_kname(t, ts, gs, bits, tile, aligned, sfx));
+            });
+          }
+        }
+      }
+    }
+    for (mx::Dtype dt : two_byte) {
+      const std::string ts = kq_type_string(dt);
+      if (codec->has_nax_kernel) {
+        for (int bm : {32, 64}) {
+          for (bool aligned : {true, false}) {
+            each_suffix(dt, [&](const std::string& sfx) {
+              out.push_back(
+                  kq_qmm_nax_splitk_kname(t, ts, gs, bits, bm, aligned, sfx));
+            });
+          }
+        }
+      }
+      if (codec_verify_mma_rows(t) > 0) {
+        for (bool half : {false, true}) {
+          each_suffix(dt, [&](const std::string& sfx) {
+            out.push_back(kq_verify_mma_kname(t, ts, gs, bits, half, sfx));
+          });
+        }
+      }
+      const int kstep = codec_verify_nax_kstep(t);
+      if (codec->has_nax_kernel && kstep > 0) {
+        std::vector<int> ksteps = {kstep};
+        if (t == "q4_0") {
+          ksteps.push_back(256);
+        }
+        for (int k : ksteps) {
+          each_suffix(dt, [&](const std::string& sfx) {
+            out.push_back(kq_verify_nax_kname(t, ts, gs, bits, k, sfx));
+          });
+        }
+      }
+    }
+  }
+  return out;
+}
+
 #else
 
 void KQuantQmvBias::eval_gpu(
@@ -2893,6 +3037,10 @@ void KQuantQmvBias::eval_gpu(
 
 int qmv_fine_max_n(const std::string&) {
   return 0;
+}
+
+std::vector<std::string> split_kernel_names() {
+  return {};
 }
 
 #endif // _METAL_
