@@ -577,7 +577,9 @@ NB_MODULE(_ext, m) {
         q and k are read through their strides, so slices of one fused qkv
         output need no copy. On the GPU head dims 64, 96, 128 and 256 run
         the fused kernel; other even head dims and CPU streams run the same
-        math as stock ops.
+        math as stock ops. The op is for inference. On the GPU the fused
+        kernel has no gradient or vmap, and mx.grad or mx.vmap through it
+        raises.
 
         Args:
             q (array): [B, L, H, D], float16/bfloat16, D even.

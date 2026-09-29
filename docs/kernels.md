@@ -651,7 +651,9 @@ Tuning levers (defaults are right for normal use):
   on the vector width take vector loads, and any other view takes element loads through its strides.
 
   CPU streams, and GPU calls at other even head dims, run the same math as stock MLX ops, an f32 norm
-  and rotation followed by one cast to the input dtype and a transposed copy.
+  and rotation followed by one cast to the input dtype and a transposed copy. The op is for
+  inference. On the GPU the fused kernel has no gradient or vmap, and `mx.grad` or `mx.vmap` through
+  it raises.
 
 ## Hadamard rotation
 
