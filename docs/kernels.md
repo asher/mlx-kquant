@@ -275,12 +275,12 @@ Tuning levers (defaults are right for normal use):
   by default.
 - `KQ_VERIFY_MMA_SPLITS` - probe lever: the same split-K target for `verify_mma`; `1` runs it
   unsplit. Unset (off) by default. Read live per call.
-- `KQ_VERIFY_MMA_HALF` - probe lever: `1` runs the `verify_mma` half kernels (name suffix `_h`),
-  which stage the activations as half and sum each block in half, so an activation or a block sum
-  past 65504 turns to inf. On pq2_0 and ptq1_0 the codes enter that sum unscaled, so a 128-weight
-  block can pass 65504 with activations of magnitude 256 (pq2_0) or 512 (ptq1_0) when the codes and
-  activations agree in sign. For timing against the float kernels only. Unset (off) by default. Read
-  live per call.
+- `KQ_VERIFY_MMA_HALF` - probe lever: `1` runs the `verify_mma` half kernels (name suffix `_h`) of
+  pq2_0, q4_0 and q8_0, which stage the activations as half and sum each block in half, so an
+  activation or a block sum past 65504 turns to inf. On pq2_0 the codes enter that sum unscaled, so
+  a 128-weight block can pass 65504 with activations of magnitude 256 when the codes and activations
+  agree in sign. ptq1_0 has no half kernels and stays on its float kernels. For timing against the
+  float kernels only. Unset (off) by default. Read live per call.
 - `KQ_VERIFY_NAX_Q4_0_SB` - probe lever: `0` keeps `q4_0` on the two-block `verify_nax` kernel at
   a K that is a multiple of 256, where the eight-block kernel runs by default. Read live per call.
 - `KQ_MV_EXT_SB` / `KQ_MV_EXT_NX` / `KQ_MV_EXT_HD` - `mv_ext` activation-traffic experiments:
@@ -332,17 +332,18 @@ The kernels decode the codes exactly in half and keep the activations in their o
 threadgroup memory. Both widen to float in the fragment, so each block sums in float and the block
 scale applies in float. Unsplit, or split with float partials (the float16 default, and
 `KQ_SPLITK_F32=1`), the result rounds once, as the mat-vec kernels do with the exact weights, at any
-activation magnitude. `KQ_VERIFY_MMA_HALF=1` runs the half kernels these replace, which stage the
-activations as half and sum each block in half. There an activation beyond the half range (magnitude
-65504), such as a bfloat16 outlier, turns to inf, and so does a block sum past it. On ordinary
-activations with float partials, the error of the half kernels runs 0.4 to 0.9 output roundings
-beyond the rounding of the float64 result on bfloat16, and 4 to 7 on float16, and the float kernels
-run within 0.01. Partials in the activation dtype (the bfloat16 default, and `KQ_SPLITK_F32=0`) add
-about one output rounding to a split call of either kernel, which puts the half kernels at 1.1 to
-1.4 on bfloat16 and 4 to 7.5 on float16, and the float kernels at about 1 on both. Against the half
-kernels over the same shapes and M on the M5 Max, the float kernels take 0.90-1.00x the time for
-`pq2_0` and 0.94-1.02x for `q4_0` on bfloat16, and 0.99-1.01x for `pq2_0` and 1.00-1.05x for `q4_0`
-on float16.
+activation magnitude. `KQ_VERIFY_MMA_HALF=1` runs the half kernels of `pq2_0`, `q4_0` and `q8_0`,
+which stage the activations as half and sum each block in half. There an activation beyond the half
+range (magnitude 65504), such as a bfloat16 outlier, turns to inf, and so does a block sum past it.
+On ordinary activations with float partials, the error of the half kernels runs 0.4 to 0.9 output
+roundings beyond the rounding of the float64 result on bfloat16, and 4 to 7 on float16, and the
+float kernels run within 0.01. Partials in the activation dtype (the bfloat16 default, and
+`KQ_SPLITK_F32=0`) add about one output rounding to a split call of either kernel, which puts the
+half kernels at 1.1 to 1.4 on bfloat16 and 4 to 7.5 on float16, and the float kernels at about 1 on
+both. Against the half kernels over the same shapes and M on the M5 Max, the float kernels take
+0.90-1.00x the time for `pq2_0` and 0.94-1.02x for `q4_0` on bfloat16, and 0.99-1.01x for `pq2_0`
+and 1.00-1.05x for `q4_0` on float16. `ptq1_0` has no half kernels, since in float it runs in
+0.90-1.03x the time of a half build.
 
 The entry M depends on the device. Without NAX, `pq2_0` and `ptq1_0` enter at M 3 (`pq2_0` at M 4
 on float16 activations, where `verify_qmv` holds M 3) and `q4_0` at M 2. Measured on M3 Max at the

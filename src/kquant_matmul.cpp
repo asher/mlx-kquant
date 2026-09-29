@@ -1026,6 +1026,21 @@ static std::string kq_qmm_nax_splitk_kname(
   return kname;
 }
 
+// verify_mma codecs with half kernels; ptq1_0 runs as fast in float and
+// has none.
+static bool kq_verify_mma_has_half(const std::string& t) {
+  return t == "pq2_0" || t == "q4_0" || t == "q8_0";
+}
+
+// KQ_VERIFY_MMA_HALF=1 (probe lever, read live) runs the half kernels on
+// the codecs that have them, for timing against the float kernels. They
+// stage the activations as half and sum each block in half, so their range
+// stops at 65504, which a pq2_0 block sum of unscaled codes reaches at
+// activations of 256.
+static bool kq_verify_mma_half(const std::string& t) {
+  return kq_verify_mma_has_half(t) && kq_env_int("KQ_VERIFY_MMA_HALF", 0) == 1;
+}
+
 // half selects the KQ_VERIFY_MMA_HALF kernels.
 static std::string kq_verify_mma_kname(
     const std::string& t,
@@ -1160,11 +1175,8 @@ void qmm_splitk(
 // without the tile's threadgroup staging of the weights. Split-K over
 // grid z with qmm_splitk's partial/fold shape; slices are whole wire
 // blocks. Non-batched transpose shapes, bf16 or f16 activations, which
-// stay in their dtype while each block sums in float.
-// KQ_VERIFY_MMA_HALF=1 (probe lever, read live) runs the _h kernels, which
-// stage the activations as half and sum each block in half, for timing
-// against them; their range stops at 65504, which a pq2_0 or ptq1_0 block
-// sum of unscaled codes reaches at activations of 256 or 512.
+// stay in their dtype while each block sums in float. kq_verify_mma_half
+// selects the half kernels.
 void verify_mma(
     const array& x,
     const array& w,
@@ -1200,7 +1212,7 @@ void verify_mma(
       type_string,
       group_size,
       bits,
-      kq_env_int("KQ_VERIFY_MMA_HALF", 0) == 1,
+      kq_verify_mma_half(kquant_type),
       pp.suffix);
 
   auto kernel = kq_get_kernel(d, kname);
@@ -2936,11 +2948,11 @@ int qmv_fine_max_n(const std::string& kquant_type) {
 
 // Every kernel name the split-K dispatchers can build, over the codecs
 // their gates admit and the bfloat16 and float16 activations the ops pass,
-// both N alignments, both partial dtypes and both verify_mma variants. The
-// tiles, NAX tile rows and verify_nax steps come from the dispatch helpers
-// over every M the split routes serve (1 to 128) and every K kind, under
-// this process's levers. The gates read the codec table, not
-// KQ_DISABLE_NAX. Names repeat across routes.
+// both N alignments, both partial dtypes and the verify_mma float and half
+// kernels a codec has. The tiles, NAX tile rows and verify_nax steps come
+// from the dispatch helpers over every M the split routes serve (1 to 128)
+// and every K kind, under this process's levers. The gates read the codec
+// table, not KQ_DISABLE_NAX. Names repeat across routes.
 std::vector<std::string> split_kernel_names() {
   std::vector<std::string> out;
   auto each_suffix = [](mx::Dtype dt, auto&& f) {
@@ -2996,6 +3008,9 @@ std::vector<std::string> split_kernel_names() {
       }
       if (codec_verify_mma_rows(t) > 0) {
         for (bool half : {false, true}) {
+          if (half && !kq_verify_mma_has_half(t)) {
+            continue;
+          }
           each_suffix(dt, [&](const std::string& sfx) {
             out.push_back(kq_verify_mma_kname(t, ts, gs, bits, half, sfx));
           });
