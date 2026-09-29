@@ -1453,6 +1453,51 @@ class KQuantRMSNormGate : public mx::Primitive {
   float eps_;
 };
 
+// Fused per-head RMSNorm and RoPE of the DiT attention q and k:
+//   y = rms_norm(x, w, eps), then each interleaved pair (y[2i], y[2i + 1])
+//   rotates by the angle whose cos and sin are cos[l, i] and sin[l, i].
+// q and k [B, L, H, D] (float16/bfloat16, any strides: a slice of a fused
+// qkv output is read in place), q_w and k_w [D], cos and sin [L, D / 2]
+// (any float dtype, used in f32; one angle per row, so any position scheme
+// works). Returns (q_out, k_out) as row-contiguous [B, H, L, D] in the
+// input dtype. f32 math, one round at the write. On the GPU head dims 64,
+// 96, 128 and 256 run one fused dispatch; other even head dims and CPU
+// streams run the same math as stock ops.
+std::pair<mx::array, mx::array> qk_norm_rope(
+    mx::array q,
+    mx::array k,
+    mx::array q_w,
+    mx::array k_w,
+    mx::array cos,
+    mx::array sin,
+    float eps,
+    mx::StreamOrDevice s = {});
+
+// Fused qk norm and RoPE primitive (see qk_norm_rope). Inference-only.
+class KQuantQkNormRope : public mx::Primitive {
+ public:
+  KQuantQkNormRope(mx::Stream stream, float eps)
+      : mx::Primitive(stream), eps_(eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantQkNormRope";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float eps_;
+};
+
 // Fused causal short convolution for gated-delta prefill (KDA, GDN):
 //   y[t] = silu(sum_j w[:, j] * in[t - K + 1 + j]),  in = [state; x]
 // over x [B, T, C] (float16/bfloat16), state [B, K - 1, C] (the carried

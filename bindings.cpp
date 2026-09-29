@@ -556,6 +556,45 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "qk_norm_rope",
+      &mlx_kquant::qk_norm_rope,
+      "q"_a,
+      "k"_a,
+      "q_w"_a,
+      "k_w"_a,
+      "cos"_a,
+      "sin"_a,
+      "eps"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Per-head RMSNorm and RoPE of attention q and k in one dispatch:
+        y = rms_norm(x, w, eps) over the head dim, then each interleaved
+        pair (y[2i], y[2i + 1]) rotates by the angle with cosine cos[l, i]
+        and sine sin[l, i]. The output is written in the attention layout,
+        so no transpose copy follows. f32 math with one round at the write.
+
+        q and k are read through their strides, so slices of one fused qkv
+        output need no copy. On the GPU head dims 64, 96, 128 and 256 run
+        the fused kernel; other even head dims and CPU streams run the same
+        math as stock ops.
+
+        Args:
+            q (array): [B, L, H, D], float16/bfloat16, D even.
+            k (array): same shape and dtype as q.
+            q_w (array): [D] q norm weight, any float dtype.
+            k_w (array): [D] k norm weight, any float dtype.
+            cos (array): [L, D / 2] per-row cosines, any float dtype, shared
+                by the batch.
+            sin (array): [L, D / 2] per-row sines.
+            eps (float): norm epsilon.
+
+        Returns:
+            tuple(array, array): q and k as row-contiguous [B, H, L, D] in
+            the input dtype.
+      )");
+
+  m.def(
       "kda_conv",
       &mlx_kquant::kda_conv,
       "x"_a,
