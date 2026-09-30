@@ -338,15 +338,18 @@ def test_nax_midm_splitk_rule(codec, m, n_out, taken, monkeypatch):
 # Slice targets of the NAX mid-M rule with 40 cores pinned. At K 5120 q4_0
 # and q8_0 cut 80 units of 64 weights, so the slice count is the target.
 # With float partials the two codecs target 10 from M 33 to 64 and 5 from
-# M 65 to 96. With partials in the activation dtype they keep 16 under
-# three threadgroups per core and 8 from M 65 to 96 up to 16 per core. M 112
-# keeps 16 either way. (M, N): (float partials, activation-dtype partials).
-NAX_MIDM_K = 5120
+# M 65 to 96, and 8 from M 65 to 96 above K 5120, where 5 would leave 4
+# slices of the 96 or 272 units. With partials in the activation dtype they
+# keep 16 under three threadgroups per core and 8 from M 65 to 96 up to 16
+# per core. M 112 keeps 16 either way.
+# (M, N, K): (float partials, activation-dtype partials).
 NAX_MIDM_TARGETS = {
-    (48, 1000): (10, 16),
-    (80, 1000): (5, 16),
-    (80, 5120): (5, 8),
-    (112, 1000): (16, 16),
+    (48, 1000, 5120): (10, 16),
+    (80, 1000, 5120): (5, 16),
+    (80, 5120, 5120): (5, 8),
+    (80, 5120, 6144): (8, 8),
+    (96, 5120, 17408): (8, 8),
+    (112, 1000, 5120): (16, 16),
 }
 # (activation dtype, KQ_SPLITK_F32): whether the partials are float.
 NAX_MIDM_PARTIALS = {
@@ -359,12 +362,11 @@ NAX_MIDM_PARTIALS = {
 
 @functools.cache
 def _nax_midm_targets_logged(dtype, f32_env):
-    """_logged entry per (codec, M, N) of NAX_MIDM_TARGETS in one probe
+    """_logged entry per (codec, M, N, K) of NAX_MIDM_TARGETS in one probe
     process with KQ_SPLITK_F32 as given and 40 cores pinned."""
-    cases = [(c, m, n) for c in ("q4_0", "q8_0") for m, n in NAX_MIDM_TARGETS]
+    cases = [(c, *shape) for c in ("q4_0", "q8_0") for shape in NAX_MIDM_TARGETS]
     calls = [
-        {"codec": c, "shape": [m, NAX_MIDM_K], "n": n, "dtype": dtype}
-        for c, m, n in cases
+        {"codec": c, "shape": [m, k], "n": n, "dtype": dtype} for c, m, n, k in cases
     ]
     env = {"KQ_GPU_CORES": "40"}
     if f32_env is not None:
@@ -378,11 +380,11 @@ def _nax_midm_targets_logged(dtype, f32_env):
 def test_nax_midm_targets(codec, dtype, f32_env):
     f32 = NAX_MIDM_PARTIALS[(dtype, f32_env)]
     logged = _nax_midm_targets_logged(dtype, f32_env)
-    for (m, n), targets in NAX_MIDM_TARGETS.items():
-        name, grid = _one_kernel(logged[(codec, m, n)])
+    for (m, n, k), targets in NAX_MIDM_TARGETS.items():
+        name, grid = _one_kernel(logged[(codec, m, n, k)])
         assert "_qmm_t_nax_splitk_" in name, name
         assert name.endswith("_pf32") == f32, name
-        assert grid[2] == targets[0 if f32 else 1], (m, n, name, grid)
+        assert grid[2] == targets[0 if f32 else 1], (m, n, k, name, grid)
 
 
 # Register-resident MMA verify band (kq_verify_mma.h): KQ_VERIFY_MMA=2

@@ -1911,8 +1911,13 @@ static bool kq_midm_splitk(int M, int N) {
 // On an M5 Max over the Qwen3.8-27B projections on float16 activations,
 // per cell against 16 and 8: 0.79-1.01x the time at M 33-64, and
 // 0.67-1.11x at M 65-96, where every cell above 1.03x has K 6144 or 17408.
-// bfloat16 with KQ_SPLITK_F32=1 takes the same targets, not measured there.
-static int kq_midm_nax_target(int M, int N, const std::string& t, bool f32) {
+// There a target of 5 leaves 4 slices (96 and 272 units), so above K 5120
+// the target from M 65 to 96 stays 8: 0.88-0.97x the time of 4 slices, and
+// 0.99-1.02x at K 6144 M 96, where the CI spans 1. Measured at K 5120, 6144
+// and 17408 only. bfloat16 with KQ_SPLITK_F32=1 takes the same targets, not
+// measured there.
+static int
+kq_midm_nax_target(int M, int N, int K, const std::string& t, bool f32) {
   const int cores = gpu_core_count();
   const int grid = ((N + 63) / 64) * ((M + 63) / 64);
   int target = 0;
@@ -1922,7 +1927,7 @@ static int kq_midm_nax_target(int M, int N, const std::string& t, bool f32) {
     target = 8;
   }
   if (target > 0 && f32 && M <= 96 && (t == "q4_0" || t == "q8_0")) {
-    return M <= 64 ? 10 : 5;
+    return M <= 64 ? 10 : (K > 5120 ? 8 : 5);
   }
   return target;
 }
@@ -2709,7 +2714,11 @@ void KQuantMatmul::eval_gpu_base(
     const int midm = kq_env_int("KQ_QMM_MIDM", -1);
     const int sk_env = kq_env_int("KQ_QMM_SPLITK_NAX", -1);
     const int rule = kq_midm_nax_target(
-        M, N, kquant_type_, kq_splitk_partials(x.dtype()).dtype == mx::float32);
+        M,
+        N,
+        K,
+        kquant_type_,
+        kq_splitk_partials(x.dtype()).dtype == mx::float32);
     if (sk_env != 0 && (midm == 1 || (midm == -1 && rule > 0))) {
       const int target = sk_env > 1 ? sk_env
           : rule > 0                ? rule
