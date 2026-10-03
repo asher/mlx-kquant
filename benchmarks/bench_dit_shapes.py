@@ -42,7 +42,17 @@ sample and pair.
 Every sample also goes to a JSON Lines raw log (--raw-out, by default
 beside --json-out) as each slot ends, so a run that stops or fails keeps
 every finished slot. --reaggregate rebuilds the JSON and Markdown from a
-raw log without running anything, and marks a partial run.
+raw log without running anything, and marks a partial run. --resume
+continues a stopped run from its raw log: it keeps the finished slots and
+the warmup's call counts, and runs the slots left, in the same order.
+
+Memory: MLX keeps freed buffers in its cache for reuse, and every shape
+leaves its own sizes there, so a sweep of many shapes would otherwise hold
+the outputs of all of them. --cache-limit-gib bounds the cache, and the
+visit warmup runs a full sample so the timed calls reuse cached outputs
+as they did before the limit. Each slot record carries the active, cache
+and process footprint bytes after every visit; --mem-trace prints them
+as they are taken.
 
 A versus A: --arms kq,kq_aa. Plan only: --plan-only.
 """
@@ -50,6 +60,9 @@ A versus A: --arms kq,kq_aa. Plan only: --plan-only.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
+import gc
 import json
 import math
 import os
@@ -135,13 +148,49 @@ def split_stats(rows, rounds, round_at, value_at):
     }
 
 
+_LIBC = None
+
+
+def footprint_bytes():
+    """The process physical footprint on macOS, which memory limits
+    count, cache included; None elsewhere."""
+    global _LIBC
+    if sys.platform != "darwin":
+        return None
+    if _LIBC is None:
+        _LIBC = ctypes.CDLL(ctypes.util.find_library("c"))
+    buf = ctypes.create_string_buffer(512)
+    # RUSAGE_INFO_V4; ri_phys_footprint is at byte 72.
+    if _LIBC.proc_pid_rusage(os.getpid(), 4, buf) != 0:
+        return None
+    return int.from_bytes(buf.raw[72:80], "little")
+
+
+def mem_row(mx, gi, trace=False):
+    row = [gi, mx.get_active_memory(), mx.get_cache_memory(), footprint_bytes()]
+    if trace:
+        gib = [None if v is None else round(v / 2**30, 3) for v in row[1:]]
+        print("mem", gi, *gib, flush=True)
+    return row
+
+
+def complete_lines(path):
+    """Drops a last line cut short, so records can be appended."""
+    with open(path) as f:
+        text = f.read()
+    if text and not text.endswith("\n"):
+        text = text[: text.rfind("\n") + 1]
+        with open(path, "w") as f:
+            f.write(text)
+
+
 class RawLog:
     """JSON Lines log of a run: a meta record, then per dtype a warmup
     record and one record per finished slot, then an end record. Each
     record is flushed and synced as it is written."""
 
-    def __init__(self, path):
-        self.f = open(path, "w") if path else None
+    def __init__(self, path, mode="w"):
+        self.f = open(path, mode) if path else None
 
     def write(self, rec):
         if self.f is None:
@@ -191,9 +240,11 @@ def load_raw(path):
     return meta, measured, end
 
 
-def measure_pass(dtype, groups, args, store, desc, t_start, raw):
+def measure_pass(dtype, groups, args, store, desc, t_start, raw, prior=None):
     """Warmup and timed rounds for one dtype. Samples go to `raw` as each
-    slot ends; no statistics here."""
+    slot ends; no statistics here. `prior` is the part of the pass a raw
+    log holds: its slots are skipped, and its warmup's call counts and
+    kernels are kept."""
     import mlx.core as mx
 
     dt = dc.mx_dtype(dtype)
@@ -202,6 +253,7 @@ def measure_pass(dtype, groups, args, store, desc, t_start, raw):
     errors = {}
     calib = {}
     samples = [dict() for _ in groups]
+    mem = []
 
     # Warmup pass, discarded; records the kernel each kq arm dispatches.
     for gi, g in enumerate(groups):
@@ -217,27 +269,45 @@ def measure_pass(dtype, groups, args, store, desc, t_start, raw):
             except ValueError as e:
                 errors[(gi, key)] = str(e)
             dc.set_tile(None, nax)
+        mem.append(mem_row(mx, gi, args.mem_trace))
     inner = []
     for gi in range(len(groups)):
         fastest = min(calib.get(gi, [args.min_sample_ms]))
         n = math.ceil(args.min_sample_ms / max(fastest, 1e-3))
         inner.append(min(args.max_inner, max(args.inner, n)))
-    raw.write(
-        {
-            "kind": "warmup",
-            "dtype": dtype,
-            "inner": inner,
-            "kernels": [[gi, k, v] for (gi, k), v in kernels.items()],
-            "errors": [[gi, k, v] for (gi, k), v in errors.items()],
-        }
-    )
-    print(f"[{dtype}] warmup done at {time.perf_counter() - t_start:.0f} s", flush=True)
-
+    done = set()
     visit = 0
     slots = 0
+    if prior is None:
+        raw.write(
+            {
+                "kind": "warmup",
+                "dtype": dtype,
+                "inner": inner,
+                "kernels": [[gi, k, v] for (gi, k), v in kernels.items()],
+                "errors": [[gi, k, v] for (gi, k), v in errors.items()],
+                "mem": mem,
+            }
+        )
+    else:
+        inner = prior["inner"]
+        kernels = prior["kernels"]
+        errors = prior["errors"]
+        samples = prior["samples"]
+        slots = prior["slots"]
+        for sm in samples:
+            for rows in sm.values():
+                for v, r, s, _, _ in rows:
+                    done.add((r, s))
+                    visit = max(visit, v + 1)
+    print(f"[{dtype}] warmup done at {time.perf_counter() - t_start:.0f} s", flush=True)
+
     for r in range(args.rounds):
         for s in range(args.slots):
+            if (r, s) in done:
+                continue
             rows = []
+            mem = []
             tm = dc.THUE_MORSE[s % 8]
             order = list(range(len(groups)))
             random.Random(args.seed * 7919 + r * 131 + s).shuffle(order)
@@ -253,7 +323,7 @@ def measure_pass(dtype, groups, args, store, desc, t_start, raw):
                 for arm, codec in inst[: args.visit_warmup]:
                     fn = dc.make_fn(arm, codec, g, dt, store)
                     dc.set_tile(dc.ARM_TILE.get(arm), nax)
-                    dc.time_fn(fn, 1)
+                    dc.time_fn(fn, inner[gi])
                 for arm, codec in inst:
                     fn = dc.make_fn(arm, codec, g, dt, store)
                     dc.set_tile(dc.ARM_TILE.get(arm), nax)
@@ -263,14 +333,24 @@ def measure_pass(dtype, groups, args, store, desc, t_start, raw):
                     samples[gi].setdefault(key, []).append((visit, r, s, t, ms))
                     rows.append([gi, key, visit, r, s, t, ms])
                 dc.set_tile(None, nax)
+                mem.append(mem_row(mx, gi, args.mem_trace))
                 visit += 1
             raw.write(
-                {"kind": "slot", "dtype": dtype, "round": r, "slot": s, "samples": rows}
+                {
+                    "kind": "slot",
+                    "dtype": dtype,
+                    "round": r,
+                    "slot": s,
+                    "samples": rows,
+                    "mem": mem,
+                }
             )
             slots += 1
+            fp = [m[3] for m in mem if m[3] is not None]
+            fp = f", footprint up to {max(fp) / 2**30:.1f} GiB" if fp else ""
             print(
                 f"[{dtype}] round {r} slot {s} done at "
-                f"{time.perf_counter() - t_start:.0f} s",
+                f"{time.perf_counter() - t_start:.0f} s{fp}",
                 flush=True,
             )
     return {
@@ -598,6 +678,25 @@ def main(argv=None):
         "(default: --json-out plus .raw.jsonl)",
     )
     ap.add_argument(
+        "--cache-limit-gib",
+        type=float,
+        default=8.0,
+        help="MLX buffer cache limit; it must hold the outputs of one sample "
+        "of the largest shape, or the timed calls allocate. Negative keeps "
+        "the MLX default",
+    )
+    ap.add_argument(
+        "--mem-trace",
+        action="store_true",
+        help="print active, cache and footprint GiB after every visit",
+    )
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue the run in the raw log (same arguments): keep its "
+        "finished slots and run the rest",
+    )
+    ap.add_argument(
         "--reaggregate",
         metavar="RAW",
         help="rebuild the JSON and Markdown from a raw log without running "
@@ -645,12 +744,13 @@ def main(argv=None):
 
     for k in ("KQ_NAX_TILE", "KQ_QMM_TILE", "KQ_QMM_LOG"):
         os.environ.pop(k, None)
+    if args.cache_limit_gib >= 0:
+        mx.set_cache_limit(int(args.cache_limit_gib * 2**30))
     desc = dc.machine_descriptor()
     store = dc.Store(args.seed)
     raw_out = args.raw_out
     if raw_out is None and args.json_out:
         raw_out = args.json_out + ".raw.jsonl"
-    raw = RawLog(raw_out)
     meta = {
         "kind": "meta",
         "machine": desc,
@@ -659,13 +759,37 @@ def main(argv=None):
         "groups": groups,
         "mlx_kquant_file": os.path.dirname(kq.__file__),
     }
-    raw.write(meta)
+    prior = {}
+    if args.resume and raw_out and os.path.exists(raw_out):
+        complete_lines(raw_out)
+        meta0, prior, end0 = load_raw(raw_out)
+        if meta0["groups"] != groups or any(
+            meta0["args"].get(k) != getattr(args, k)
+            for k in ("arms", "dtypes", "rounds", "slots", "seed", "shrink")
+        ):
+            sys.exit(f"{raw_out}: another run's raw log; --resume needs the same plan")
+        if end0:
+            result = build_result(meta0, prior, end0, raw_out)
+            write_outputs(result, args.json_out, args.md_out)
+            return 0
+        meta = meta0
+        raw = RawLog(raw_out, "a")
+    else:
+        raw = RawLog(raw_out)
+        raw.write(meta)
     t_start = time.perf_counter()
     measured = {}
     for dtype in args.dtypes:
         store.clear_dtype()
+        gc.collect()
         mx.clear_cache()
-        measured[dtype] = measure_pass(dtype, groups, args, store, desc, t_start, raw)
+        p = prior.get(dtype)
+        if p is not None and p["slots"] == args.rounds * args.slots:
+            measured[dtype] = p
+            continue
+        measured[dtype] = measure_pass(
+            dtype, groups, args, store, desc, t_start, raw, p
+        )
     end = {
         "kind": "end",
         "wall_s": time.perf_counter() - t_start,

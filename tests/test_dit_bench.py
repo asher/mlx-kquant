@@ -1,5 +1,6 @@
-"""The DiT benchmark harness: the median CI at any sample count, and
-rebuilding reports from a raw log. Pure Python, no GPU."""
+"""The DiT benchmark harness: the median CI at any sample count, rebuilding
+reports from a raw log, and, at tiny shapes in a child process, the cache
+limit, the per-visit memory records and resuming a stopped run."""
 
 from __future__ import annotations
 
@@ -116,3 +117,102 @@ def test_reaggregate_rebuilds_a_stopped_run(tmp_path):
     md = md_out.read_text()
     assert "Partial run" in md
     assert "16 of 24 slots ran." in md
+
+
+# Two tiny shapes, two rounds of two slots, one call per sample.
+_TINY = [
+    "--families",
+    "zimage",
+    "--ops",
+    "qkv,out",
+    "--rows",
+    "64",
+    "--batches",
+    "1",
+    "--codecs",
+    "q4_k",
+    "--heavy-codecs",
+    "none",
+    "--arms",
+    "kq,kq_aa",
+    "--dtypes",
+    "bfloat16",
+    "--rounds",
+    "2",
+    "--slots",
+    "2",
+    "--inner",
+    "1",
+    "--max-inner",
+    "1",
+    "--min-sample-ms",
+    "0.001",
+    "--shrink",
+    "16",
+]
+
+
+def _bench(tmp_path, *extra):
+    json_out = tmp_path / "run.json"
+    out = subprocess.run(
+        [
+            sys.executable,
+            os.path.join(BENCH_DIR, "bench_dit_shapes.py"),
+            *_TINY,
+            "--json-out",
+            str(json_out),
+            "--md-out",
+            str(tmp_path / "run.md"),
+            *extra,
+        ],
+        check=True,
+        timeout=300,
+        capture_output=True,
+        text=True,
+    )
+    raw = tmp_path / "run.json.raw.jsonl"
+    recs = [json.loads(line) for line in raw.read_text().splitlines()]
+    return json.loads(json_out.read_text()), raw, recs, out.stdout
+
+
+def test_cache_limit_and_memory_per_visit(tmp_path):
+    limit = 1 << 20
+    result, _, recs, out = _bench(
+        tmp_path, "--cache-limit-gib", str(limit / 2**30), "--mem-trace"
+    )
+    assert result["complete"]
+    assert recs[0]["args"]["cache_limit_gib"] == limit / 2**30
+    slots = [r for r in recs if r["kind"] == "slot"]
+    (warm,) = [r for r in recs if r["kind"] == "warmup"]
+    assert len(slots) == 4
+    for rec in [warm, *slots]:
+        assert sorted(m[0] for m in rec["mem"]) == [0, 1]
+        for _, active, cache, fp in rec["mem"]:
+            assert active > 0
+            assert cache <= limit
+            assert (fp is None) == (sys.platform != "darwin")
+    # The trace prints every visit of the warmup and the four slots.
+    traced = [line.split()[1] for line in out.splitlines() if line.startswith("mem ")]
+    assert sorted(traced) == ["0"] * 5 + ["1"] * 5
+
+
+def test_resume_runs_only_the_slots_left(tmp_path):
+    _, raw, recs, _ = _bench(tmp_path)
+    lines = raw.read_text().splitlines()
+    # Meta, warmup and two slots, then a record cut short.
+    assert [r["kind"] for r in recs[:4]] == ["meta", "warmup", "slot", "slot"]
+    raw.write_text("\n".join(lines[:4]) + "\n" + lines[4][:20])
+    result, _, after, _ = _bench(tmp_path, "--resume")
+    assert after[:4] == recs[:4]
+    assert [r["kind"] for r in after] == ["meta", "warmup"] + ["slot"] * 4 + ["end"]
+    done = [(r["round"], r["slot"]) for r in after if r["kind"] == "slot"]
+    assert sorted(done) == [(0, 0), (0, 1), (1, 0), (1, 1)]
+    visits = [row[2] for r in after if r["kind"] == "slot" for row in r["samples"]]
+    assert len(set(visits)) == 8
+    assert result["complete"]
+    (p,) = result["passes"]
+    assert p["slots_done"] == p["slots_planned"] == 4
+    # A complete log only rebuilds the reports.
+    before = raw.read_text()
+    _bench(tmp_path, "--resume")
+    assert raw.read_text() == before
