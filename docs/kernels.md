@@ -128,6 +128,15 @@ equal slices with a shorter last one give more than twice as many. This covers i
 whose unit count has no divisor near 16, such as 11008, 17408 and 18944 on the 256-weight codecs.
 `KQ_SPLITK_RAGGED=2` takes the ragged count wherever it is larger.
 
+At M 32 and below, a call whose BM=32 grid already holds 16 threadgroups per GPU core, such as a
+vocab head, takes one slice where the call without the split runs the same BM=32 tile. `q6_k` and
+`iq2_xxs` below M 32 and `q8_0` below M 13 keep the target of 16 there, as do calls that would
+leave the BM=32 tile for an mv route or the BM=64 tile. Below a full grid, `q4_0` and `q8_0` on
+float partials hold the split grid to 16 threadgroups per core, except `q8_0` below M 13. On
+M5 Max, against a target of 16 at N 49152, 151936 and 248320 and M 9 to 32, the single slice runs
+0.68-1.05x the time, and summed over a forward pass, weighted by the calls per shape, no codec
+runs slower. The float-partial cap runs 0.75-1.02x at N 5120 to 17408.
+
 Measured on M5 Max at M 8 to 24 with the weights streamed from DRAM, the shorter last slice runs
 `q4_k` 1.1x faster at 5120x17408, 1.5x at 3584x18944, 2x at 4096x11008 and 4-5x at 896x4864. The
 other codecs range from no change (`pq2_0` at 3584x18944) to 5.7x (`iq1_s` at 896x4864). Where the
@@ -284,8 +293,9 @@ Tuning levers (defaults are right for normal use):
   the BM=32 tile, or per-row qmv below the qmv batch limit, which is 18 on M5 Max at K and N up to
   2048 and up to 32 on Ultra parts. At M 9 to 12 it is the small-M qmm route, `mv_ext` or per-row
   qmv. The ALU route falls through the same way, to the ALU qmm tile in place of the NAX one.
-  `verify_mma` and `verify_nax` are not capped. Unset or `0` keeps the target of 16 at every N, so
-  a wide N such as a vocab head still writes up to 16 partials. A target forced through
+  `verify_mma` and `verify_nax` are not capped. `0` keeps the target of 16 at every N on both
+  routes, so a wide N such as a vocab head writes up to 16 partials. Unset keeps it on the ALU route
+  and takes the NAX default described with the NAX split-K route. A target forced through
   `KQ_QMM_SPLITK_NAX` or `KQ_QMM_SPLITK` is not capped. Read live per call.
 - `KQ_VERIFY_MMA` - the register-resident MMA verify route (below). A value of `2` or more forces
   it at that M and above on any GPU, `0` or `1` disables it. Unset takes the per-codec entry from

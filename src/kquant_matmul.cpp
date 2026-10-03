@@ -1972,13 +1972,15 @@ kq_midm_nax_target(int M, int N, int K, const std::string& t, bool f32) {
 // takes one slice, and the call runs what it runs with the split route
 // off: from M 13 usually the qmm tile (BM=32 on NAX GPUs), or per-row qmv
 // below get_qmv_batch_limit, and at M 9 to 12 the small-M qmm route,
-// mv_ext or per-row qmv. verify_mma and verify_nax are not capped. Unset
-// or 0 keeps the fixed target of 16 at every N, so a wide N such as a
-// vocab head, whose grid already fills the GPU, still writes up to 16
-// partials. A target forced through KQ_QMM_SPLITK_NAX or KQ_QMM_SPLITK
-// is not capped.
-static int kq_splitk_capped(int target, int grid) {
-  const int cap = kq_env_int("KQ_SPLITK_CAP", 0);
+// mv_ext or per-row qmv. verify_mma and verify_nax are not capped. 0 keeps
+// the fixed target of 16 at every N on both routes. Unset keeps it on the
+// ALU route and takes kq_splitk_nax_default on the NAX route. A target
+// forced through KQ_QMM_SPLITK_NAX or KQ_QMM_SPLITK is not capped.
+static int kq_splitk_cap_env() {
+  return kq_env_int("KQ_SPLITK_CAP", -1);
+}
+
+static int kq_splitk_capped(int target, int grid, int cap) {
   if (cap <= 0) {
     return target;
   }
@@ -1987,6 +1989,54 @@ static int kq_splitk_capped(int target, int grid) {
       int64_t(cap) * (cores > 0 ? cores : 40) / std::max(grid, 1);
   return static_cast<int>(
       std::max<int64_t>(1, std::min<int64_t>(target, room)));
+}
+
+// True when a call of M <= 32 rows with the split route off runs the
+// BM=32 NAX tile: the codec takes that tile, and below M 13 it also takes
+// the small-M qmm route at this M. Otherwise the call runs an mv route or
+// the BM=64 tile.
+static bool kq_unsplit_takes_bm32(int M, int N, int K, const std::string& t) {
+  const int mode = kq_nax_small_bm_mode();
+  if (mode == 0 || (mode != 2 && !kq_smallbm_policy(t).bm32)) {
+    return false;
+  }
+  if (M > 12) {
+    return true;
+  }
+  const int m = kq_smallm_route_min(t, N, K);
+  return m > 0 && M >= m;
+}
+
+// Default slice target of the NAX split-K route at M <= 32. A grid that
+// already holds 16 threadgroups per core, such as a vocab head, takes one
+// slice where the call without the split runs the same BM=32 tile, except
+// q6_k and iq2_xxs below M 32, where the split still wins. Where that call
+// would leave the tile for an mv route or the BM=64 tile, the split stays.
+// Below a full grid, q4_0 and q8_0 on float partials hold the split grid
+// to 16 threadgroups per core, and the rest keep the target of 16. q8_0
+// below M 13 keeps the target on every grid, where both the single slice
+// and the float-partial cap measured slower.
+static int kq_splitk_nax_default(
+    int M,
+    int N,
+    int K,
+    int grid,
+    const std::string& t,
+    bool f32) {
+  if (t == "q8_0" && M <= 12) {
+    return kq_splitk_nax_target;
+  }
+  const int cores = gpu_core_count();
+  const int64_t full = int64_t(16) * (cores > 0 ? cores : 40);
+  if (grid >= full) {
+    const bool keep = (M < 32 && (t == "q6_k" || t == "iq2_xxs")) ||
+        !kq_unsplit_takes_bm32(M, N, K, t);
+    return keep ? kq_splitk_nax_target : 1;
+  }
+  if (f32 && (t == "q4_0" || t == "q8_0")) {
+    return kq_splitk_capped(kq_splitk_nax_target, grid, 16);
+  }
+  return kq_splitk_nax_target;
 }
 
 // Largest divisor of nblk at or under target (1 = no split).
@@ -2604,10 +2654,17 @@ void KQuantMatmul::eval_gpu_base(
       codec_has_nax(kquant_type_) && kq_is_nax_available() && (K % 64 == 0) &&
       x.dtype() != mx::float32) {
     // The BM32 tile's grid, ceil(N/64) x ceil(M/32), sizes the cap.
-    const int qmm_splitk_nax_env = sk_nax_env > 1
-        ? sk_nax_env
-        : kq_splitk_capped(
-              kq_splitk_nax_target, ((N + 63) / 64) * ((M + 31) / 32));
+    const int grid = ((N + 63) / 64) * ((M + 31) / 32);
+    const int cap = kq_splitk_cap_env();
+    const int qmm_splitk_nax_env = sk_nax_env > 1 ? sk_nax_env
+        : cap >= 0 ? kq_splitk_capped(kq_splitk_nax_target, grid, cap)
+                   : kq_splitk_nax_default(
+                         M,
+                         N,
+                         K,
+                         grid,
+                         kquant_type_,
+                         kq_splitk_partials(x.dtype()).dtype == mx::float32);
     const int q = std::max(group_size_, 64);
     int per = 0;
     const int sp = kq_nax_split(qmm_splitk_nax_env, K / q, per);
@@ -2658,8 +2715,9 @@ void KQuantMatmul::eval_gpu_base(
     const KqSplitkTile tile = kq_splitk_tile(M, kquant_type_);
     const int grid =
         ((N + tile.bn - 1) / tile.bn) * ((M + tile.bm - 1) / tile.bm);
-    const int splitk_target =
-        qmm_splitk_env > 1 ? qmm_splitk_env : kq_splitk_capped(16, grid);
+    const int splitk_target = qmm_splitk_env > 1
+        ? qmm_splitk_env
+        : kq_splitk_capped(16, grid, kq_splitk_cap_env());
     const int sp = kq_split_count(splitk_target, K / group_size_);
     if (sp > 1) {
       qmm_splitk(

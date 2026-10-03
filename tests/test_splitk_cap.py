@@ -11,6 +11,13 @@ split route off bit for bit, and float64 within the R1 bound. A partial
 cap cuts the slice count, a forced target is not capped, and 0 keeps the
 fixed target. The mat-vec routes do not log, so the output digest shows
 which of them ran.
+
+Unset, the cap keeps the fixed target on the ALU route, and the NAX route
+takes its default: one slice at a grid of 16 threadgroups per core or more
+where the call without the split runs the same BM=32 tile, except q6_k and
+iq2_xxs below M 32, and q4_0 and q8_0 on float partials held to 16
+threadgroups per core below a full grid. q8_0 below M 13 keeps the target
+on every grid.
 """
 
 from __future__ import annotations
@@ -197,3 +204,130 @@ def test_alu_cap_partial():
     assert depth == [10, 2, 4], depth
     for r in res + forced:
         assert r["rel"] < R1, r["rel"]
+
+
+# Unset, the NAX route takes a slice target by grid, codec and partials. 4
+# cores pinned make N 4096 a full grid at every M through 32: 64 BM=32
+# tiles, 16 per core. A full grid takes one slice and runs what the call
+# with the split route off runs where that call runs the BM=32 tile.
+# The split stays where it would run an mv route (iq4_xs at M 9, below its
+# small-M qmm route at N 4096) or the BM=64 tile (iq2_xs), for q6_k and
+# iq2_xxs below M 32, and for q8_0 below M 13. KQ_SPLITK_CAP=0 keeps the
+# fixed target.
+HEAD_ENV = {"KQ_GPU_CORES": "4", "KQ_QMM_LOG": "1"}
+HEAD_CODECS = ["q4_0", "q4_k", "q6_k", "q8_0", "iq4_xs", "iq2_xs", "iq2_xxs"]
+HEAD_MS = [9, 15, 16, 32]
+HEAD_DTYPES = ["bfloat16", "float16"]
+# iq2_xxs enters the split route at M 13.
+HEAD_CASES = [
+    (c, m) for c in HEAD_CODECS for m in HEAD_MS if not (c == "iq2_xxs" and m < 13)
+]
+
+
+def _head_keeps_split(codec, m):
+    if codec == "iq2_xs":
+        return True
+    if codec in ("q6_k", "iq2_xxs"):
+        return m < 32
+    return codec in ("q8_0", "iq4_xs") and m <= 12
+
+
+@functools.cache
+def _nax_head():
+    arms = [
+        {"KQ_SPLITK_CAP": None, "KQ_QMM_SPLITK_NAX": None},
+        {"KQ_SPLITK_CAP": "0", "KQ_QMM_SPLITK_NAX": None},
+        {"KQ_SPLITK_CAP": None, "KQ_QMM_SPLITK_NAX": "0"},
+    ]
+    cases = [(c, m, dt) for c, m in HEAD_CASES for dt in HEAD_DTYPES]
+    calls = [dict(_call(c, m, env), dtype=dt) for c, m, dt in cases for env in arms]
+    res = _probe(calls, HEAD_ENV)
+    return {case: res[3 * i : 3 * i + 3] for i, case in enumerate(cases)}
+
+
+@pytest.mark.parametrize("dtype", HEAD_DTYPES)
+@pytest.mark.parametrize(("codec", "m"), HEAD_CASES)
+def test_nax_default_full_grid_takes_one_slice(codec, m, dtype):
+    if not _nax_gpu():
+        pytest.skip("NAX split-K route")
+    default, fixed, off = _nax_head()[(codec, m, dtype)]
+    _split(fixed, "_qmm_t_nax_splitk_")
+    assert fixed["rel"] < R1, fixed["rel"]
+    if _head_keeps_split(codec, m):
+        assert default["kernels"] == fixed["kernels"], default["kernels"]
+        assert default["digest"] == fixed["digest"]
+    else:
+        _same(default, off)
+        assert tile_of(off["kernels"][0][0])[0] == 32, off["kernels"]
+
+
+# q8_0 below M 13 keeps the split on a full grid also where the call
+# without it runs the BM=32 tile: at N 8192 its small-M qmm route starts
+# at M 8.
+@pytest.mark.parametrize("dtype", HEAD_DTYPES)
+@pytest.mark.parametrize("m", [9, 12])
+def test_nax_default_q8_0_small_m_full_grid_keeps_split(m, dtype):
+    if not _nax_gpu():
+        pytest.skip("NAX split-K route")
+    arms = [{"KQ_SPLITK_CAP": None}, {"KQ_SPLITK_CAP": "0"}, {"KQ_QMM_SPLITK_NAX": "0"}]
+    default, fixed, off = _probe(
+        [dict(_call("q8_0", m, env, n=8192), dtype=dtype) for env in arms], HEAD_ENV
+    )
+    _split(fixed, "_qmm_t_nax_splitk_")
+    assert tile_of(off["kernels"][0][0])[0] == 32, off["kernels"]
+    assert default["kernels"] == fixed["kernels"], default["kernels"]
+    assert default["digest"] == fixed["digest"]
+    assert default["rel"] < R1, default["rel"]
+
+
+# Below a full grid the target stays 16, except q4_0 and q8_0 on float
+# partials, which hold 16 threadgroups per core. With 40 cores at N 4096 and
+# M 16 that leaves room for 10 slices. Float partials are the default on
+# float16 and KQ_SPLITK_F32=1 sets them on bfloat16.
+@pytest.mark.parametrize("codec", ["q4_0", "q8_0", "q4_k"])
+def test_nax_default_float_partials_cap(codec):
+    if not _nax_gpu():
+        pytest.skip("NAX split-K route")
+    arms = [
+        ("float16", {"KQ_SPLITK_CAP": None}),
+        ("float16", {"KQ_SPLITK_CAP": "0"}),
+        ("bfloat16", {"KQ_SPLITK_CAP": None}),
+    ]
+    calls = [dict(_call(codec, 16, env), dtype=dt) for dt, env in arms]
+    res = _probe(calls, CORES)
+    depth = [_split(r, "_qmm_t_nax_splitk_")[1][2] for r in res]
+    want = {"q4_0": [10, 16, 16], "q8_0": [10, 16, 16], "q4_k": [10, 10, 10]}
+    assert depth == want[codec], depth
+    for r in res:
+        assert r["rel"] < R1, r["rel"]
+
+
+# q8_0 on float partials keeps the target of 16 below M 13.
+def test_nax_default_float_partials_q8_0_small_m():
+    if not _nax_gpu():
+        pytest.skip("NAX split-K route")
+    res = _probe(
+        [
+            dict(_call("q8_0", m, {"KQ_SPLITK_CAP": None}), dtype="float16")
+            for m in (9, 12)
+        ],
+        CORES,
+    )
+    depth = [_split(r, "_qmm_t_nax_splitk_")[1][2] for r in res]
+    assert depth == [16, 16], depth
+    for r in res:
+        assert r["rel"] < R1, r["rel"]
+
+
+# KQ_SPLITK_F32 is read once, so float partials on bfloat16 run in their own
+# process.
+@pytest.mark.parametrize("codec", ["q4_0", "q8_0"])
+def test_nax_default_float_partials_cap_bfloat16(codec):
+    if not _nax_gpu():
+        pytest.skip("NAX split-K route")
+    res = _probe(
+        [_call(codec, 16, {"KQ_SPLITK_CAP": None})], dict(CORES, KQ_SPLITK_F32="1")
+    )
+    depth = [_split(r, "_qmm_t_nax_splitk_")[1][2] for r in res]
+    assert depth == [10], depth
+    assert res[0]["rel"] < R1, res[0]["rel"]
