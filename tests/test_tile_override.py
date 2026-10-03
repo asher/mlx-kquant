@@ -176,24 +176,50 @@ def test_tile_numerics(codec, dtype):
             assert tile_of(_only_kernel(r)[0])[0] == want
 
 
-@pytest.mark.parametrize("codec", MAIN_CODECS)
+def _qmm_codecs():
+    return sorted(c for c in CODEC_GEOMETRY if kq.codec_has_matmul(c))
+
+
+def _nax_tiles(codec):
+    """BM of every unsplit qmm_t NAX tile of `codec` in the metallib."""
+    out = set()
+    for name in kq.metallib_kernels():
+        m = _NAX_NAME.match(name)
+        if m and m["codec"] == codec and m["db"] is None and m["bn"] == "64":
+            out.add(int(m["bm"]))
+    return sorted(out)
+
+
+@pytest.mark.parametrize("codec", _qmm_codecs())
 def test_tile_rows_above_int16(codec):
     # 32768 rows, and a batch of two at 16896 rows flattened to 33792, past
-    # the int16 row span the tile clamps before narrowing.
-    tiles = [None] if force_cpu() else [64, 32, 128]
-    widths = [96] if force_cpu() else [96, 128]
+    # the int16 row span the tile clamps before narrowing, on every tile the
+    # codec carries and on folded row-tile orders (KQ_NAX_SWIZZLE).
+    nax = not force_cpu() and kq.nax_available()
+    envs = [{}]
+    tiles = _nax_tiles(codec) if nax else []
+    if tiles:
+        # BM=64 first: every other tile agrees with it within 1 ulp.
+        tiles.sort(key=lambda bm: bm != 64)
+        envs = [{"KQ_NAX_TILE": TILES[bm]} for bm in tiles]
+        envs += [
+            {"KQ_NAX_TILE": TILES[64], "KQ_NAX_SWIZZLE": "2"},
+            {"KQ_NAX_TILE": TILES[128], "KQ_NAX_SWIZZLE": "1"},
+            {"KQ_NAX_TILE": TILES[128], "KQ_NAX_SWIZZLE": "2"},
+        ]
     calls = []
     for shape in ([1, 32768, K], [2, 16896, K]):
-        for n in widths:
+        for n in (96, 128):
             base = len(calls)
-            for j, bm in enumerate(tiles):
+            for j, env in enumerate(envs):
+                full = {"KQ_NAX_TILE": None, "KQ_NAX_SWIZZLE": None, **env}
                 calls.append(
                     {
                         "codec": codec,
                         "shape": shape,
                         "n": n,
                         "seed": base,
-                        "env": {"KQ_NAX_TILE": TILES.get(bm)},
+                        "env": full,
                         "ulp_vs": base if j else None,
                     }
                 )
@@ -203,6 +229,9 @@ def test_tile_rows_above_int16(codec):
         assert r["rel"] < R1["bfloat16"], (c, r["rel"])
         if r["ulp"] is not None:
             assert r["ulp"] <= 1, (c, r["ulp"])
+        if tiles and c["env"]["KQ_NAX_TILE"]:
+            want = int(c["env"]["KQ_NAX_TILE"].split(",")[0])
+            assert tile_of(_only_kernel(r)[0])[0] == want, c
 
 
 _NAX_NAME = re.compile(
