@@ -10,6 +10,19 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _clear_mlx_cache():
+    # MLX keeps freed buffers in its cache, and its default limit is near the
+    # device memory. Clear it after each test, so the process footprint over a
+    # session stays at the largest single test.
+    yield
+    import mlx.core as mx
+
+    mx.clear_cache()
+
 
 def pytest_configure(config):
     # The logic tests touch only small mx array ops and never dispatch a kquant
