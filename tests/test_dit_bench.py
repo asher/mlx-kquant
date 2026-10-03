@@ -114,7 +114,10 @@ def test_reaggregate_rebuilds_a_stopped_run(tmp_path):
     # Round 0 is left out of the pooled figure.
     assert ag["pooled"]["n"] == 8
     assert ag["pooled"]["median"] == pytest.approx(1.01)
+    # A log without a sample mode is from the independent-call bench.
+    assert result["sample_mode"] == "independent"
     md = md_out.read_text()
+    assert "do not compare with chained runs" in md
     assert "Partial run" in md
     assert "16 of 24 slots ran." in md
 
@@ -178,13 +181,28 @@ def _bench(tmp_path, *extra):
 def test_cache_limit_and_memory_per_visit(tmp_path):
     limit = 1 << 20
     result, _, recs, out = _bench(
-        tmp_path, "--cache-limit-gib", str(limit / 2**30), "--mem-trace"
+        tmp_path,
+        "--cache-limit-gib",
+        str(limit / 2**30),
+        "--mem-trace",
+        "--visit-warmup-calls",
+        "1,full",
     )
     assert result["complete"]
+    assert result["sample_mode"] == recs[0]["sample_mode"] == "chain"
+    assert "dependent call chains" in (tmp_path / "run.md").read_text()
     assert recs[0]["args"]["cache_limit_gib"] == limit / 2**30
     slots = [r for r in recs if r["kind"] == "slot"]
     (warm,) = [r for r in recs if r["kind"] == "warmup"]
     assert len(slots) == 4
+    assert [r["visit_warmup_calls"] for r in slots] == ["1", "full"] * 2
+    for rec in slots:
+        # One glue sample per visit, beside each arm's.
+        keys = [row[1] for row in rec["samples"]]
+        assert keys.count("glue") == 2
+        assert len(keys) == 6
+    (p,) = result["passes"]
+    assert all("glue" in g["shared"] for g in p["groups"])
     for rec in [warm, *slots]:
         assert sorted(m[0] for m in rec["mem"]) == [0, 1]
         for _, active, cache, fp in rec["mem"]:
@@ -216,3 +234,51 @@ def test_resume_runs_only_the_slots_left(tmp_path):
     before = raw.read_text()
     _bench(tmp_path, "--resume")
     assert raw.read_text() == before
+
+
+_CHAIN = textwrap.dedent(
+    """
+    import json, sys
+    sys.path.insert(0, sys.argv[1])
+    import mlx.core as mx
+    import dit_common as dc
+
+    seen = []
+
+    def f(a):
+        seen.append(a)
+        # The second call's output trips the tie, so the third call is fed
+        # zeros: only a chained call sees it.
+        return a + (1e31 if len(seen) == 2 else 0.0)
+
+    x0 = mx.ones((2, 3), dtype=mx.float32)
+    y = dc.chain(f, x0, 4)
+    mx.eval(y)
+    b = dc.tie(mx.ones((4,), dtype=mx.bfloat16), x0.astype(mx.bfloat16))
+    ms = dc.chain_ms(lambda a: a * 2, x0, 3)
+    print(json.dumps({
+        "first": [float(a[0, 0]) for a in seen],
+        "out": float(y[0, 0]),
+        "tie_dtype": str(b.dtype),
+        "ms": ms,
+    }))
+    """
+)
+
+
+def test_sample_is_one_dependent_chain(tmp_path):
+    script = tmp_path / "chain.py"
+    script.write_text(_CHAIN)
+    # A child process, since dit_common sets KQ_TUNE_LIVE on import.
+    out = subprocess.run(
+        [sys.executable, str(script), BENCH_DIR],
+        check=True,
+        timeout=120,
+        capture_output=True,
+        text=True,
+    )
+    r = json.loads(out.stdout.splitlines()[-1])
+    assert r["first"] == [1.0, 1.0, 0.0, 1.0]
+    assert r["out"] == 1.0
+    assert r["tie_dtype"] == "mlx.core.bfloat16"
+    assert r["ms"] > 0

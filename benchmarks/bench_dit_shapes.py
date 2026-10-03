@@ -19,8 +19,9 @@ visit and pair with every codec in it.
 
 Order: one discarded warmup pass, which also records the kernel each kq
 arm ran, then rounds of Thue-Morse slots. Each slot visits every shape in
-a fresh interleaved order. A visit opens with --visit-warmup discarded
-calls, since the first call after a shape switch runs slow. Inside a visit
+a fresh interleaved order. A visit opens with a discarded sample of the
+first --visit-warmup arms, since the first call after a shape switch runs
+slow; --visit-warmup-calls sets its call count. Inside a visit
 the arm list reverses on odd slots, so the two calls of every pair swap
 order with the Thue-Morse bit and a round of 8 slots splits each pair 4/4.
 A paired ratio compares calls made seconds apart. Round 0 gets its own
@@ -28,10 +29,17 @@ column and later rounds the settled column. Round 0 is not a cold figure:
 the GPU slows within seconds of load, and bench_dit_thermal.py gives the
 cold rate per machine.
 
-A sample is --inner calls evaluated together and divided, so the sync
-per evaluation is spread; shapes whose fastest arm runs under
---min-sample-ms per call take more calls, up to --max-inner, and every arm
-of a shape uses the same count.
+A sample is a chain of --inner calls in one evaluation, divided by the
+count. Each call is fed a tie of the previous output (the activation
+again, selected on the output's first element), so the GPU runs the calls
+one after another, as in a model forward; calls evaluated together without
+the tie overlap, which slows some kernels and speeds others. Every visit
+also times the tie chain alone ("glue"), and each sample of the visit has
+it subtracted. Shapes whose fastest arm runs under --min-sample-ms per call
+take more calls, up to --max-inner, and every arm of a shape uses the same
+count. Reports and raw logs carry "sample_mode": "chain"; a log without it
+is from the earlier independent-call bench, and its figures do not compare
+with chained ones.
 
 Per cell, ratios carry a 95 percent CI of the paired median, from order
 statistics; its half-width is the cell's noise floor. Per op, the pooled
@@ -49,8 +57,8 @@ the warmup's call counts, and runs the slots left, in the same order.
 Memory: MLX keeps freed buffers in its cache for reuse, and every shape
 leaves its own sizes there, so a sweep of many shapes would otherwise hold
 the outputs of all of them. --cache-limit-gib bounds the cache, and the
-visit warmup runs a full sample so the timed calls reuse cached outputs
-as they did before the limit. Each slot record carries the active, cache
+visit warmup runs a full sample by default so the timed calls reuse
+cached buffers. Each slot record carries the active, cache
 and process footprint bytes after every visit; --mem-trace prints them
 as they are taken.
 
@@ -259,13 +267,13 @@ def measure_pass(dtype, groups, args, store, desc, t_start, raw, prior=None):
     for gi, g in enumerate(groups):
         for arm, codec in arm_instances(g, args.arms):
             key = cell_key(arm, codec)
-            fn = dc.make_fn(arm, codec, g, dt, store)
+            x0, f = dc.make_call(arm, codec, g, dt, store)
             dc.set_tile(dc.ARM_TILE.get(arm), nax)
             try:
                 with dc.KernelLog() as log:
-                    mx.eval(fn())
+                    mx.eval(f(x0))
                 kernels[(gi, key)] = log.kernels[-1] if log.kernels else None
-                calib.setdefault(gi, []).append(dc.time_fn(fn, 1))
+                calib.setdefault(gi, []).append(dc.chain_ms(f, x0, 1))
             except ValueError as e:
                 errors[(gi, key)] = str(e)
             dc.set_tile(None, nax)
@@ -309,6 +317,7 @@ def measure_pass(dtype, groups, args, store, desc, t_start, raw, prior=None):
             rows = []
             mem = []
             tm = dc.THUE_MORSE[s % 8]
+            warm = args.visit_warmup_calls[s % len(args.visit_warmup_calls)]
             order = list(range(len(groups)))
             random.Random(args.seed * 7919 + r * 131 + s).shuffle(order)
             for gi in order:
@@ -320,14 +329,20 @@ def measure_pass(dtype, groups, args, store, desc, t_start, raw, prior=None):
                 ]
                 if tm:
                     inst.reverse()
+                wcalls = inner[gi] if warm == "full" else int(warm)
                 for arm, codec in inst[: args.visit_warmup]:
-                    fn = dc.make_fn(arm, codec, g, dt, store)
+                    x0, f = dc.make_call(arm, codec, g, dt, store)
                     dc.set_tile(dc.ARM_TILE.get(arm), nax)
-                    dc.time_fn(fn, inner[gi])
+                    dc.chain_ms(f, x0, wcalls)
+                x0 = store.act(g, dt)
+                glue = dc.chain_ms(lambda a: a, x0, inner[gi])
+                t = round(time.perf_counter() - t_start, 4)
+                samples[gi].setdefault("glue", []).append((visit, r, s, t, glue))
+                rows.append([gi, "glue", visit, r, s, t, glue])
                 for arm, codec in inst:
-                    fn = dc.make_fn(arm, codec, g, dt, store)
+                    x0, f = dc.make_call(arm, codec, g, dt, store)
                     dc.set_tile(dc.ARM_TILE.get(arm), nax)
-                    ms = dc.time_fn(fn, inner[gi])
+                    ms = dc.chain_ms(f, x0, inner[gi]) - glue
                     t = round(time.perf_counter() - t_start, 4)
                     key = cell_key(arm, codec)
                     samples[gi].setdefault(key, []).append((visit, r, s, t, ms))
@@ -341,6 +356,7 @@ def measure_pass(dtype, groups, args, store, desc, t_start, raw, prior=None):
                     "dtype": dtype,
                     "round": r,
                     "slot": s,
+                    "visit_warmup_calls": warm,
                     "samples": rows,
                     "mem": mem,
                 }
@@ -380,6 +396,8 @@ def summarize_pass(groups, m, rounds, arm_names, desc):
                 tile = dc.mlx_affine_tile(nax)
             elif arm == "deq":
                 tile = dc.mlx_dense_tile(M, N, K, arch, nax)
+            elif arm == "glue":
+                tile = None
             else:
                 tile = dc.tile_of(kernels.get((gi, key)))
             rec = {
@@ -395,6 +413,8 @@ def summarize_pass(groups, m, rounds, arm_names, desc):
         for arm, codec in arm_instances(g, arm_names):
             if codec is None:
                 shared[arm] = arm_record(arm, None)
+        if "glue" in sm:
+            shared["glue"] = arm_record("glue", None)
         cells = []
         for codec in g["codecs"]:
             arms = {}
@@ -488,6 +508,7 @@ def build_result(meta, measured, end, raw_path):
         "peak_memory_bytes": end.get("peak_memory_bytes"),
         "mlx_kquant_file": meta["mlx_kquant_file"],
         "raw": raw_path,
+        "sample_mode": meta.get("sample_mode", "independent"),
         "complete": bool(end),
         "passes": passes,
     }
@@ -524,6 +545,16 @@ def pick_round0(stats):
 def markdown(result):
     lines = ["# DiT shape arms", "", dc.descriptor_md(result["machine"]), ""]
     a = result["args"]
+    if result.get("sample_mode", "independent") == "chain":
+        lines.append(
+            "Samples are dependent call chains with the tie chain (glue) subtracted."
+        )
+    else:
+        lines.append(
+            "Samples are independent calls evaluated together (earlier "
+            "bench): do not compare with chained runs."
+        )
+    lines.append("")
     lines.append(
         f"Rounds {a['rounds']} x {a['slots']} Thue-Morse slots, inner {a['inner']} "
         f"(up to {a['max_inner']} under {a['min_sample_ms']} ms per call), "
@@ -662,7 +693,14 @@ def main(argv=None):
         "--visit-warmup",
         type=int,
         default=1,
-        help="discarded calls at the start of each shape visit",
+        help="arms that run a discarded sample at the start of each shape visit",
+    )
+    ap.add_argument(
+        "--visit-warmup-calls",
+        default="full",
+        help="calls in that discarded sample: 'full' (the sample's count) or "
+        "a number; a comma list cycles over the slots (A versus B of the "
+        "warmup in one process)",
     )
     ap.add_argument("--shrink", type=int, default=1, help="divide rows, K, N")
     ap.add_argument("--seed", type=int, default=0)
@@ -715,6 +753,7 @@ def main(argv=None):
     args.codecs = parse_list(args.codecs)
     args.arms = parse_list(args.arms)
     args.dtypes = parse_list(args.dtypes)
+    args.visit_warmup_calls = parse_list(args.visit_warmup_calls)
 
     import mlx.core as mx
 
@@ -758,14 +797,19 @@ def main(argv=None):
         "heavy_codecs": heavy_codecs,
         "groups": groups,
         "mlx_kquant_file": os.path.dirname(kq.__file__),
+        "sample_mode": "chain",
     }
     prior = {}
     if args.resume and raw_out and os.path.exists(raw_out):
         complete_lines(raw_out)
         meta0, prior, end0 = load_raw(raw_out)
-        if meta0["groups"] != groups or any(
-            meta0["args"].get(k) != getattr(args, k)
-            for k in ("arms", "dtypes", "rounds", "slots", "seed", "shrink")
+        if (
+            meta0.get("sample_mode") != "chain"
+            or meta0["groups"] != groups
+            or any(
+                meta0["args"].get(k) != getattr(args, k)
+                for k in ("arms", "dtypes", "rounds", "slots", "seed", "shrink")
+            )
         ):
             sys.exit(f"{raw_out}: another run's raw log; --resume needs the same plan")
         if end0:

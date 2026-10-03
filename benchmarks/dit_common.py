@@ -278,7 +278,9 @@ class Store:
         return self.x[key]
 
 
-def make_fn(arm, codec, g, dt, store):
+def make_call(arm, codec, g, dt, store):
+    """(x0, f): the arm's op as a function of its activation, and the
+    activation of the shape."""
     import mlx.core as mx
 
     import mlx_kquant as kq
@@ -286,17 +288,51 @@ def make_fn(arm, codec, g, dt, store):
     x = store.act(g, dt)
     if arm == "dense":
         wd = store.dense_w(g, dt)
-        return lambda: x @ wd.T
+        return x, lambda a: a @ wd.T
     if arm.startswith("affine"):
         bits = int(arm[len("affine") :])
         wq, sc, bi = store.affine_w(g, dt, bits)
-        return lambda: mx.quantized_matmul(
-            x, wq, sc, bi, transpose=True, group_size=64, bits=bits
+        return x, lambda a: mx.quantized_matmul(
+            a, wq, sc, bi, transpose=True, group_size=64, bits=bits
         )
     w, s = store.kq(g, codec)
     if arm == "deq":
-        return lambda: x @ kq.dequantize(w, s, codec, dtype=dt).T
-    return lambda: kq.quantized_matmul(x, w, s, codec, transpose=True)
+        return x, lambda a: a @ kq.dequantize(w, s, codec, dtype=dt).T
+    return x, lambda a: kq.quantized_matmul(a, w, s, codec, transpose=True)
+
+
+def make_fn(arm, codec, g, dt, store):
+    x, f = make_call(arm, codec, g, dt, store)
+    return lambda: f(x)
+
+
+def tie(o, x0):
+    """x0 again, computed from the first element of `o`, so a call fed the
+    result starts after the call that made `o` has finished."""
+    import mlx.core as mx
+
+    return mx.where(o.reshape(-1)[:1] > 1e30, 0.0, x0)
+
+
+def chain(f, x0, n):
+    """n calls of f, each fed the tie of the previous output: one lazy
+    dependent chain."""
+    x = x0
+    for _ in range(n):
+        x = tie(f(x), x0)
+    return x
+
+
+def chain_ms(f, x0, n):
+    """ms per call over a chain of n calls in one evaluation. The GPU runs
+    the calls one after another, as in a model forward; independent calls in
+    one evaluation would overlap."""
+    import mlx.core as mx
+
+    x = chain(f, x0, n)
+    t0 = time.perf_counter()
+    mx.eval(x)
+    return (time.perf_counter() - t0) * 1e3 / n
 
 
 def time_fn(fn, inner):
