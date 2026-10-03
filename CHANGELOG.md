@@ -44,6 +44,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   up; only activations past 65504 still do.
 - Tuning levers that default on or to a per-codec rule, such as `KQ_QMV_SPLITK`
   and `KQ_MOE_DEDUP`, keep that default when set empty instead of turning off.
+- After `patch_mlx_lm_load()`, `mlx_lm.utils.load_model` builds a kquant
+  checkpoint with the caller's `get_model_classes` instead of the stock class.
+  `mlx_kquant.loader.load` takes it too.
 
 ## [0.5.0]
 

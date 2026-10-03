@@ -208,7 +208,8 @@ points, each a narrow shim over a stable mlx-lm function:
 
 `patch_mlx_lm_load()` is the **load-only** shim - all an inference / eval / serving consumer needs. It
 wraps `mlx_lm.utils.load_model` so a kquant config routes through `loader.load`, and every non-kquant
-checkpoint falls through unchanged. Because everything mlx-lm exposes is built on `load_model`,
+checkpoint falls through unchanged. A `get_model_classes` the caller passes reaches `loader.load` and
+picks the model class there too. Because everything mlx-lm exposes is built on `load_model`,
 `mlx_lm.load`, `mlx_lm.generate`, and the CLIs all then open a kquant checkpoint transparently:
 
 ```python
