@@ -10,6 +10,7 @@
 // decode-latency-critical path); the decode-only bias-fused fast path lives in
 // the KQuantQmvBias primitive below (qmv_bias), which reuses this file's qmv
 // dispatch helpers.
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -546,11 +547,28 @@ static int kq_nax_bm128_odd_m() {
       : cached;
 }
 
-// KQ_NAX_Q6K_BK128: 0 = q6_k keeps BK=64 on the BM=64 and BM=128 tiles,
-// unset or 1 = BK=128.
-static bool kq_nax_q6k_bk128_on() {
-  static const bool cached = kq_env_flag("KQ_NAX_Q6K_BK128", 1) != 0;
-  return kq_tune_live() ? kq_env_flag("KQ_NAX_Q6K_BK128", 1) != 0 : cached;
+// KQ_NAX_<Q6K|Q5K|Q3K>_BK128: K tile of the codec on the BM=64 and BM=128
+// tiles, unset or 1 = 128, 0 = 64.
+static constexpr int kq_nax_bk128_codecs = 3;
+static int kq_nax_bk128_slot(const std::string& t) {
+  return t == "q6_k" ? 0 : t == "q5_k" ? 1 : t == "q3_k" ? 2 : -1;
+}
+static bool kq_nax_bk128_on(const std::string& t) {
+  static constexpr const char* env[kq_nax_bk128_codecs] = {
+      "KQ_NAX_Q6K_BK128", "KQ_NAX_Q5K_BK128", "KQ_NAX_Q3K_BK128"};
+  static constexpr int dflt[kq_nax_bk128_codecs] = {1, 1, 1};
+  const int i = kq_nax_bk128_slot(t);
+  if (i < 0) {
+    return false;
+  }
+  static const std::array<bool, kq_nax_bk128_codecs> cached = [] {
+    std::array<bool, kq_nax_bk128_codecs> a{};
+    for (int j = 0; j < kq_nax_bk128_codecs; j++) {
+      a[j] = kq_env_flag(env[j], dflt[j]) != 0;
+    }
+    return a;
+  }();
+  return kq_tune_live() ? kq_env_flag(env[i], dflt[i]) != 0 : cached[i];
 }
 
 // KQ_NAX_DB64: 0 = off, 1 = no N floor, unset (-1) = per-codec N floor.
@@ -788,11 +806,12 @@ void qmm_nax(
   bool use_db64 = transpose && bm == 64 && bn == 64 && wm == 2 && wn == 2 &&
       M >= 33 && M <= 64 && db64_min_n > 0 &&
       (db64_mode == 1 || (db64_mode == -1 && N >= db64_min_n));
-  // q6_k on the BM=64 and BM=128 tiles walks K 128 weights per step, one
-  // half super-block per tile (KqNaxQ6_KHalfLoader), and reads each ql and
-  // qh byte once where BK=64 reads it on two tiles. Bit-identical output.
-  if (kquant_type == "q6_k" && transpose && !use_db64 && bn == 64 && wm == 2 &&
-      wn == 2 && (bm == 64 || bm == 128) && kq_nax_q6k_bk128_on()) {
+  // q6_k, q5_k and q3_k on the BM=64 and BM=128 tiles walk K 128 weights
+  // per step, one half super-block per tile (the half loaders), where a code
+  // byte that spans 128 weights is read once instead of on two or four
+  // tiles. Bit-identical output.
+  if (transpose && !use_db64 && bn == 64 && wm == 2 && wn == 2 &&
+      (bm == 64 || bm == 128) && kq_nax_bk128_on(kquant_type)) {
     bk = 128;
   }
   MTL::Size group_dims(32, wn, wm);

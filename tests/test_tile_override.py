@@ -269,7 +269,9 @@ def _selectable(codec):
                 env = {
                     "KQ_NAX_TILE": tile,
                     "KQ_NAX_DB64": "1" if db else "0",
-                    "KQ_NAX_Q6K_BK128": "1" if m["bk"] == "128" else "0",
+                    "KQ_NAX_" + codec.replace("_", "").upper() + "_BK128": (
+                        "1" if m["bk"] == "128" else "0"
+                    ),
                     "KQ_QMM_MIDM": "0",
                     "KQ_DISABLE_NAX": None,
                     "KQ_QMM_TILE": None,

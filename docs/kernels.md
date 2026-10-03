@@ -63,8 +63,8 @@ output width N. Per-row qmv serves M 2 up to a per-codec limit, the mat-vec path
 from a per-codec entry through M 32. From M 33 to 128, split-K also takes the calls where the
 BM=64 grid wastes the GPU, as described below. Elsewhere above M 32 the BM=64 tile runs, with a
 double-buffered `_db` variant on the M 33-64 band at large N, and a BM=128 tile from M 193 when
-ceil(M/64) is even. `q6_k` runs the BM=64 and BM=128 tiles on a K tile of 128
-(`KQ_NAX_Q6K_BK128`). Above
+ceil(M/64) is even. `q6_k`, `q5_k` and `q3_k` run the BM=64 and BM=128 tiles on a K tile of 128
+(`KQ_NAX_Q6K_BK128`, `KQ_NAX_Q5K_BK128`, `KQ_NAX_Q3K_BK128`). Above
 the qmv limit, the verify kernels take the widths through M 8 on the codecs that have them. The
 NAX verify kernel serves `pq2_0`, `q4_0`, `q8_0` and `q2_k` to `q6_k` from a per-codec entry,
 and the register-resident MMA verify kernel serves `ptq1_0`, as described at the end of this
@@ -158,7 +158,7 @@ the two kernels are within 3% of each other on every shape measured.
 Tuning levers (defaults are right for normal use):
 
 - `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
-  `KQ_NAX_BM128_ODD_M`, `KQ_NAX_DB64`, `KQ_NAX_Q6K_BK128`, `KQ_NAX_SWIZZLE`), the tile overrides
+  `KQ_NAX_BM128_ODD_M`, `KQ_NAX_DB64`, the `_BK128` levers, `KQ_NAX_SWIZZLE`), the tile overrides
   (`KQ_NAX_TILE`, `KQ_QMM_TILE`), `KQ_SPLITK_F32` and `KQ_QMM_LOG` read their variables on every
   dispatch, so one process can switch tiles between calls on one resident copy of the weights;
   `benchmarks/bench_dit_shapes.py` runs its tile arms this way. It reads the environment on every
@@ -166,7 +166,7 @@ Tuning levers (defaults are right for normal use):
   (off) by default, and then each of them keeps its first read for the life of the process. Read
   once per process.
 - `KQ_NAX_TILE` - `bm,bn,wm,wn` pins the NAX `qmm_t` tile of every transpose call that reaches it,
-  in place of the BM=32, BM=64 and BM=128 policy. BK stays 64, except where `KQ_NAX_Q6K_BK128` sets
+  in place of the BM=32, BM=64 and BM=128 policy. BK stays 64, except where a `_BK128` lever sets
   it. The `_db` variant still follows `KQ_NAX_DB64` on the bm64 bn64 wm2 wn2 tile. A tile the
   metallib does not carry raises a `ValueError` that names the missing kernel, and
   `kq.metallib_kernels()` lists the ones it carries. Unset (off) by default. Read once per process
@@ -211,13 +211,18 @@ Tuning levers (defaults are right for normal use):
   per-codec N floors. Only the five policy-enabled codecs (q6_k, q8_0, q4_1, q5_1, q5_0) carry
   `_db` instantiations, so `1` is bounded by availability; probing another codec needs its
   instantiation restored and a metallib rebuild. Read once per process unless `KQ_TUNE_LIVE=1`.
-- `KQ_NAX_Q6K_BK128` - K tile of `q6_k` on the BM=64 and BM=128 tiles. Unset or `1`, the tile walks
-  K 128 weights per step, one half of a super-block per step, and each thread reads its low and high
-  code bytes once, where BK=64 reads each of them on two steps. The output is bit-identical. On an
-  M5 Max, per cell against BK=64 on bfloat16 and float16 activations: 0.87-0.96x the time on the
-  BM=128 tile at diffusion model shapes (M 4096 and 4608, N and K 3840 to 24576), and 0.79-0.99x on
-  the BM=64 tile from M 160 to 2112 at N and K 3840 to 17408. `0` keeps BK=64. The BM=32 tile and
-  the `_db` variant keep BK=64. Read once per process unless `KQ_TUNE_LIVE=1`.
+- `KQ_NAX_Q6K_BK128`, `KQ_NAX_Q5K_BK128`, `KQ_NAX_Q3K_BK128` - K tile of `q6_k`, `q5_k` and `q3_k`
+  on the BM=64 and BM=128 tiles. Unset or `1`, the tile walks K 128 weights per step, one half of a
+  super-block per step, and each thread reads its code bytes once, where BK=64 reads them on two or
+  four steps. The output is bit-identical. On an M5 Max, per cell against BK=64 on bfloat16 and
+  float16 activations, on the BM=128 tile at diffusion model shapes (M 4096 and 4608, N and K 3840
+  to 24576): `q6_k` 0.87-0.96x the time, `q5_k` 0.93-1.00x, `q3_k` 0.92-1.03x. On the BM=64 tile
+  from M 128 to 2112 at N and K 3840 to 17408: `q6_k` 0.79-1.01x, `q5_k` 0.89-1.00x, `q3_k`
+  0.88-1.00x, except on grids of 240 threadgroups (N 5120 at M 160 and 192), where `q5_k` takes
+  1.06-1.17x and `q3_k` 1.01-1.06x, and of 480 (N 10240 at M 160 and 192), where `q5_k` takes
+  1.02-1.06x. No threshold on threadgroups per core, K or M removes these at a lower total time.
+  `0` keeps BK=64. The BM=32 tile and the `_db` variant keep BK=64. Read
+  once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_FORCE_QMM_MIN_M` - probe lever: routes transpose shapes with M at or above the value straight
   to the NAX qmm, bypassing the mat-vec route claims, for crossover measurement below M 13. Unset
   (off) by default.
