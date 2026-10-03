@@ -28,6 +28,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which can return inf.
 
 ### Changed
+- `KQ_NAX_SWIZZLE=n` folds 2^n row tiles on the BM=64 and BM=128 NAX tiles.
+  `1` now folds two row tiles, where it folded four.
 - `bench_dit_shapes.py` times each sample as one dependent call chain. Its
   earlier samples overlapped calls on the GPU, which skewed kq against dense.
 - On NAX GPUs (M5), prefill and image steps of 4096 or more tokens no longer

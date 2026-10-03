@@ -81,13 +81,35 @@ using mx::Stream;
 //   +13% (q5_k, q3_k) -- the k-quants, q8_0, and the cheap-loader IQs.
 // - 961: the flat quartet only wins the deepest bands (+1-7% at M1024)
 //   and loses or washes below.
+// Large-M row: the tile, the row-tile fold (swizzle_log, 0 = none) and the
+// shape floor (M >= min_m at either ceil(M/64) parity, N >= min_n; min_m 0 =
+// never) of the image-generation band. A codec without measurements takes
+// the row of its loader class and is marked inherited.
+struct KqLargeM {
+  int bm;
+  int bn;
+  int wm;
+  int wn;
+  int swizzle_log;
+  int min_m;
+  int min_n;
+  bool inherited;
+};
 struct KqSmallBmPolicy {
   bool bm32;
   int route_min;
   int db64_min_n;
   int bm128_min_m;
+  KqLargeM large;
 };
+static KqLargeM kq_largem_row(const std::string& t);
+static KqSmallBmPolicy kq_smallbm_base(const std::string& t);
 static KqSmallBmPolicy kq_smallbm_policy(const std::string& t) {
+  KqSmallBmPolicy p = kq_smallbm_base(t);
+  p.large = kq_largem_row(t);
+  return p;
+}
+static KqSmallBmPolicy kq_smallbm_base(const std::string& t) {
   if (t == "q4_k" || t == "q3_k") {
     return {true, 7, 0, 449};
   }
@@ -142,6 +164,35 @@ static KqSmallBmPolicy kq_smallbm_policy(const std::string& t) {
     return {true, 0, 0, 449};
   }
   return {false, 0, 0, 193}; // iq2_xs, iq2_s, iq1_m
+}
+
+// Loader classes of the large-M rows: the 256-weight k-quant loaders, the
+// 32-weight flat block loaders, and the rest (the IQ grid and ternary
+// loaders).
+enum class KqLoaderClass { kquant, flat, grid };
+static KqLoaderClass kq_loader_class(const std::string& t) {
+  if (t == "q2_k" || t == "q3_k" || t == "q4_k" || t == "q5_k" || t == "q6_k") {
+    return KqLoaderClass::kquant;
+  }
+  if (t == "q4_0" || t == "q4_1" || t == "q5_0" || t == "q5_1" || t == "q8_0" ||
+      t == "iq4_nl") {
+    return KqLoaderClass::flat;
+  }
+  return KqLoaderClass::grid;
+}
+
+// Measured on M5 Max with benchmarks/bench_dit_shapes.py at the DiT rows
+// (4096 to 33792). A row with inherited = true is its loader class's row.
+static KqLargeM kq_largem_row(const std::string& t) {
+  switch (kq_loader_class(t)) {
+    case KqLoaderClass::kquant:
+      return {128, 64, 2, 2, 0, 4096, 0, true};
+    case KqLoaderClass::flat:
+      return {128, 64, 2, 2, 0, 4096, 0, true};
+    case KqLoaderClass::grid:
+      return {128, 64, 2, 2, 0, 4096, 0, true};
+  }
+  return {128, 64, 2, 2, 0, 4096, 0, true};
 }
 
 // Shape-adjusted sub-13 route threshold. The table crossovers were tuned
@@ -533,18 +584,13 @@ static int kq_nax_bm128_mode() {
 }
 
 // KQ_NAX_BM128_ODD_M: lowest M at which the BM=128 tile also runs when
-// ceil(M/64) is odd, 0 = never (the parity rule at every M). The row-live
-// guard in the tile skips the A loads and MMA of the dead simdgroup row of
-// the last row tile, so there the half-live tile does the loads and MMA of
-// one BM=64 tile. From the default of 4096 that tile holds at most 1.6
-// percent of the rows; the default is not yet a measured crossover.
-static constexpr int kq_bm128_odd_m_default = 4096;
+// ceil(M/64) is odd, 0 = never (the parity rule at every M), unset (-1) =
+// min_m of the codec's large-M row. The row-live guard in the tile skips
+// the A loads and MMA of the dead simdgroup row of the last row tile, so
+// there the half-live tile does the loads and MMA of one BM=64 tile.
 static int kq_nax_bm128_odd_m() {
-  static const int cached =
-      kq_env_int("KQ_NAX_BM128_ODD_M", kq_bm128_odd_m_default);
-  return kq_tune_live()
-      ? kq_env_int("KQ_NAX_BM128_ODD_M", kq_bm128_odd_m_default)
-      : cached;
+  static const int cached = kq_env_int("KQ_NAX_BM128_ODD_M", -1);
+  return kq_tune_live() ? kq_env_int("KQ_NAX_BM128_ODD_M", -1) : cached;
 }
 
 // KQ_NAX_<Q6K|Q5K|Q3K>_BK128: K tile of the codec on the BM=64 and BM=128
@@ -577,10 +623,12 @@ static int kq_nax_db64_mode() {
   return kq_tune_live() ? kq_env_int("KQ_NAX_DB64", -1) : cached;
 }
 
-// KQ_NAX_SWIZZLE: nonzero = row-tile traversal swizzle on.
-static bool kq_nax_swizzle_on() {
-  static const bool cached = kq_env_int("KQ_NAX_SWIZZLE", 0) != 0;
-  return kq_tune_live() ? kq_env_int("KQ_NAX_SWIZZLE", 0) != 0 : cached;
+// KQ_NAX_SWIZZLE: row-tile fold log on the BM=64 and BM=128 tiles, 0 =
+// off, unset (-1) = swizzle_log of the codec's large-M row where that row
+// applies and off elsewhere.
+static int kq_nax_swizzle_log() {
+  static const int cached = kq_env_int("KQ_NAX_SWIZZLE", -1);
+  return kq_tune_live() ? kq_env_int("KQ_NAX_SWIZZLE", -1) : cached;
 }
 
 // KQ_SPLITK_F32 picks the dtype of the K-slice partials of the split-K
@@ -770,19 +818,29 @@ void qmm_nax(
   // policy table). KQ_NAX_BM128: 0 = off, 1 = force floor 193 for all
   // codecs (crossover finding), 2 = drop the floor entirely (probes the
   // M65-128 wash band, symmetric with KQ_NAX_SMALL_BM=2), unset =
-  // per-codec policy. The loss cells predate the row-live guard, and from
-  // KQ_NAX_BM128_ODD_M (default 4096) the tile runs at either parity;
-  // KQ_NAX_BM128_ODD_M=0 keeps the parity rule at every M.
+  // per-codec policy. The loss cells predate the row-live guard. From the
+  // codec's large-M row (min_m, min_n) the row's tile runs at either
+  // parity; KQ_NAX_BM128_ODD_M replaces min_m, and 0 keeps the parity rule
+  // at every M.
   const int bm128_mode = kq_nax_bm128_mode();
-  int bm128_min_m = kq_smallbm_policy(kquant_type).bm128_min_m;
-  const int bm128_odd_m = kq_nax_bm128_odd_m();
-  const bool bm128_rows =
-      ((M + 63) / 64) % 2 == 0 || (bm128_odd_m > 0 && M >= bm128_odd_m);
+  const KqSmallBmPolicy policy = kq_smallbm_policy(kquant_type);
+  const KqLargeM& large = policy.large;
+  const int odd_m_env = kq_nax_bm128_odd_m();
+  const int bm128_odd_m = odd_m_env >= 0 ? odd_m_env : large.min_m;
+  const bool large_rows = transpose && bm128_mode != 0 && bm128_odd_m > 0 &&
+      M >= bm128_odd_m && N >= large.min_n;
+  const bool bm128_rows = ((M + 63) / 64) % 2 == 0 || large_rows;
   if (bm128_mode != 0 && transpose && bm128_rows &&
       (bm128_mode == 1       ? M >= 193
            : bm128_mode == 2 ? true
-                             : M >= bm128_min_m)) {
+                             : M >= policy.bm128_min_m)) {
     bm = 128;
+  }
+  if (large_rows) {
+    bm = large.bm;
+    bn = large.bn;
+    wm = large.wm;
+    wn = large.wn;
   }
   // KQ_NAX_TILE replaces the tile the policy above picked.
   const std::optional<KqTile> tile =
@@ -821,15 +879,23 @@ void qmm_nax(
   // row-tiles 2..2^log read it from SLC instead of re-streaming DRAM
   // (weight-normalized bandwidth otherwise divides by the row-tile
   // count). kq_swizzle_tid in the kernel derives the fold factor from
-  // threadgroups_per_grid; padded row-tiles early-return.
-  // KQ_NAX_SWIZZLE: 1 = on (experiment lever; default off).
-  if (kq_nax_swizzle_on() && transpose && bm == 64) {
-    int y_tiles = (M + bm - 1) / bm;
-    if (y_tiles >= 2) {
-      int log = y_tiles >= 4 ? 2 : 1;
+  // threadgroups_per_grid; padded row-tiles early-return. The fold is
+  // capped at the row-tile count. KQ_NAX_SWIZZLE sets the log; unset, the
+  // large-M row's swizzle_log applies on the row's own tile (not under
+  // KQ_NAX_TILE).
+  const int swizzle_env = kq_nax_swizzle_log();
+  int swizzle_log = swizzle_env >= 0 ? swizzle_env
+      : (large_rows && !tile)        ? large.swizzle_log
+                                     : 0;
+  if (swizzle_log > 0 && transpose && (bm == 64 || bm == 128)) {
+    const int y_tiles = (M + bm - 1) / bm;
+    while (swizzle_log > 0 && (1 << swizzle_log) > y_tiles) {
+      swizzle_log--;
+    }
+    if (swizzle_log > 0) {
       grid_dims = MTL::Size(
-          static_cast<size_t>((N + bn - 1) / bn) << log,
-          (y_tiles + (1 << log) - 1) >> log,
+          static_cast<size_t>((N + bn - 1) / bn) << swizzle_log,
+          (y_tiles + (1 << swizzle_log) - 1) >> swizzle_log,
           B);
     }
   }

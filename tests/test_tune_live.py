@@ -31,12 +31,12 @@ LEVER_CALLS = [
     {"codec": "q6_k", "shape": [256, K], "n": N},
     # 1: BM128 unset.
     {"codec": "q6_k", "shape": [256, K], "n": N, "env": {"KQ_NAX_BM128": None}},
-    # 2: BM128 off again, swizzle on.
+    # 2: BM128 off again, a fold of four row tiles.
     {
         "codec": "q6_k",
         "shape": [256, K],
         "n": N,
-        "env": {"KQ_NAX_BM128": "0", "KQ_NAX_SWIZZLE": "1"},
+        "env": {"KQ_NAX_BM128": "0", "KQ_NAX_SWIZZLE": "2"},
     },
     # 3: the M 33-64 band with the N floor dropped.
     {
