@@ -522,13 +522,14 @@ into a packed layout first.
   (scales and biases, bits 8, group 64) dequantize on the tile stage. `return_lse=True` adds per-row
   log-sum-exp. On NAX GPUs one query at head dim 512 with up to 8 query heads per KV head runs the
   chunk pass on the matrix units once KV heads x batch x keys reaches 3072. That needs K and V
-  strides in multiples of 8 elements and no `starts`, `ends` or q8 operands. Below 3072 the
+  strides in multiples of 8 elements and no `ends` or q8 operands. With `starts` it skips the
+  padded keys of each row as the simdgroup kernel does. Below 3072 the
   simdgroup kernel's finer splits keep more of the GPU busy. Eight simdgroups share each 256-key
   tile, each scoring 32 keys over the full head dim and then accumulating a 64-column slice of
   `P @ V`. The automatic split count is the largest power of two that keeps KV heads x batch x
   splits at 32 or under, and 1 once KV heads x batch passes 32. It ignores the depth, so it falls
   as the batch grows. The two kernels round differently, so the same rows are not bit-identical
-  between this pass, the simdgroup kernel (`starts`, `ends`, q8) and another batch size.
+  between this pass, the simdgroup kernel (`ends`, q8) and another batch size.
   `KQ_GQA_NAX=0` forces the simdgroup kernel.
 - **`sdpa_decode_gqa_cascade`** - shared-prefix batched decode: every row attends one common prefix
   plus its own private suffix. The prefix is walked once for all rows on the matrix-unit tile, private

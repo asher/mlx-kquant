@@ -30,6 +30,7 @@ using namespace metal;
 using namespace mlx::steel;
 
 constant int gqa_splits [[function_constant(2)]];
+constant bool gqa_has_starts [[function_constant(4)]];
 
 namespace kq_sdpa_nax {
 
@@ -338,6 +339,11 @@ kq_sdpa_fa_indexed_nax_2pass_1(
 // threadgroup. Inside a fragment the 16-wide contraction index is a
 // permutation of the head dim, and Q uses the same one: lane quad g reads
 // dims 16g..16g+15 of each 64-dim block, 32 contiguous bytes per row.
+//
+// With starts (a left-padded batched KV cache), batch row b attends keys
+// [starts[b], N). Whole tiles below the start are skipped, keys below it
+// in the first tile are masked, and K and V rows are read from the start
+// up, so the pad rows are never read.
 template <typename T>
 [[kernel, max_total_threads_per_threadgroup(256)]] void kq_sdpa_gqa_nax_2pass_1(
     const device T* queries [[buffer(0)]],
@@ -355,6 +361,7 @@ template <typename T>
     const constant int& gqa [[buffer(12)]],
     const constant size_t& k_batch_stride [[buffer(13)]],
     const constant size_t& v_batch_stride [[buffer(14)]],
+    const device int* starts [[buffer(15)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -391,12 +398,15 @@ template <typename T>
   const int chunk = ((N + gqa_splits * BK - 1) / (gqa_splits * BK)) * BK;
   const int k0 = split_idx * chunk;
   const int k1 = min(k0 + chunk, N);
+  // First key of this batch row, and the first tile that holds one.
+  const int row_start = gqa_has_starts ? max(0, starts[tid.y]) : 0;
+  const int kt0 = max(k0, (row_start / BK) * BK);
 
   // Partials row for head fm of this group ([B, Hq, 1, splits, D]).
   const size_t po = (hb * gqa + fm) * gqa_splits + split_idx;
   device float* dst = out + po * D + sg * DC + goff;
 
-  if (k0 >= k1) {
+  if (max(k0, row_start) >= k1) {
     // Empty split: pass 2 folds it at zero weight.
     if (fm < gqa) {
       STEEL_PRAGMA_UNROLL
@@ -433,17 +443,21 @@ template <typename T>
   float m_run = Limits<float>::finite_min; // row fm, log2 domain
   float l_run = 0; // this lane's share of row fm's sum
 
-  for (int kt = k0; kt < k1; kt += BK) {
+  // The first tile holds a key at or above row_start, so the running max is
+  // finite from the first tile on.
+  for (int kt = kt0; kt < k1; kt += BK) {
     // S (heads x 32 keys) for this simdgroup's keys. Lane rows are keys
-    // kb + fm, + 8, + 16, + 24; rows past N read row N - 1 and mask.
+    // kb + fm, + 8, + 16, + 24; rows past N read row N - 1, rows below
+    // row_start read row row_start, and both mask.
     const int kb = kt + sg * KS;
     ffrag_t S0 = ffrag_t(0);
     ffrag_t S1 = ffrag_t(0);
-    if (kb < k1) {
+    if (kb < k1 && kb + KS > row_start) {
       const device T* kr[4];
       STEEL_PRAGMA_UNROLL
       for (short r = 0; r < 4; r++) {
-        kr[r] = kbase + (size_t)min(kb + fm + 8 * r, N - 1) * k_seq_stride;
+        kr[r] = kbase +
+            (size_t)min(max(kb + fm + 8 * r, row_start), N - 1) * k_seq_stride;
       }
       STEEL_PRAGMA_UNROLL
       for (short blk = 0; blk < D / 64; blk++) {
@@ -481,9 +495,12 @@ template <typename T>
     float tmax = Limits<float>::finite_min;
     STEEL_PRAGMA_UNROLL
     for (short j = 0; j < 4; j++) {
-      sv[j] = kb + fn + j < k1 ? S0[j] * scale2 : Limits<float>::finite_min;
-      sv[4 + j] =
-          kb + 16 + fn + j < k1 ? S1[j] * scale2 : Limits<float>::finite_min;
+      const int ka = kb + fn + j;
+      const int kc = ka + 16;
+      sv[j] = ka < k1 && ka >= row_start ? S0[j] * scale2
+                                         : Limits<float>::finite_min;
+      sv[4 + j] = kc < k1 && kc >= row_start ? S1[j] * scale2
+                                             : Limits<float>::finite_min;
       tmax = max(tmax, max(sv[j], sv[4 + j]));
     }
     tmax = max(tmax, simd_shuffle_xor(tmax, ushort(1)));
@@ -522,10 +539,12 @@ template <typename T>
     // rows are keys kt + 16 kc + fm and + 8; masked keys carry P = 0.
     STEEL_PRAGMA_UNROLL
     for (short kc = 0; kc < BK / 16; kc++) {
-      if (kt + kc * 16 < k1) {
+      if (kt + kc * 16 < k1 && kt + kc * 16 + 16 > row_start) {
         const int r0 = kt + kc * 16 + fm;
-        const device T* vr0 = vbase + (size_t)min(r0, N - 1) * v_seq_stride;
-        const device T* vr1 = vbase + (size_t)min(r0 + 8, N - 1) * v_seq_stride;
+        const device T* vr0 =
+            vbase + (size_t)min(max(r0, row_start), N - 1) * v_seq_stride;
+        const device T* vr1 =
+            vbase + (size_t)min(max(r0 + 8, row_start), N - 1) * v_seq_stride;
         T4 v0[4], v1[4];
         STEEL_PRAGMA_UNROLL
         for (short s = 0; s < 4; s++) {

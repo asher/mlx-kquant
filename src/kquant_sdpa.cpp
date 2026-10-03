@@ -395,13 +395,13 @@ void KQuantSDPAGQA::eval_gpu(
   float scale = scale_;
 
   // One query at head_dim 512 on NAX GPUs runs pass 1 on the matrix units
-  // (kq_sdpa_nax.h) with the same partials and merge, from kQGqaNaxMinRows.
-  // Its rounding differs from the simdgroup kernel's, and its split count
-  // follows the batch size. KQ_GQA_NAX=0, read at each call, keeps the
-  // simdgroup kernel.
+  // (kq_sdpa_nax.h) with the same partials and merge, from kQGqaNaxMinRows,
+  // with or without starts. Its rounding differs from the simdgroup
+  // kernel's, and its split count follows the batch size. KQ_GQA_NAX=0,
+  // read at each call, keeps the simdgroup kernel.
   const bool use_nax = kq_env_flag("KQ_GQA_NAX", 1) != 0 && D == 512 &&
-      qL == 1 && gqa_factor <= 8 && !kv_q8 && !paged && !kvarn && !starts &&
-      !ends && size_t(n_kv_heads) * B * kL >= kQGqaNaxMinRows &&
+      qL == 1 && gqa_factor <= 8 && !kv_q8 && !paged && !kvarn && !ends &&
+      size_t(n_kv_heads) * B * kL >= kQGqaNaxMinRows &&
       k_head_stride % 8 == 0 && k_seq_stride % 8 == 0 &&
       v_head_stride % 8 == 0 && v_seq_stride % 8 == 0 &&
       (B == 1 || (k.strides(0) % 8 == 0 && v.strides(0) % 8 == 0)) &&
@@ -459,7 +459,8 @@ void KQuantSDPAGQA::eval_gpu(
   // (kv-head, batch, split).
   if (use_nax) {
     std::string kname = "kq_sdpa_gqa_nax_2pass_1_" + ts;
-    std::string hash = kname + "_s" + std::to_string(splits);
+    std::string hash =
+        kname + "_s" + std::to_string(splits) + (has_starts ? "_st1" : "_st0");
     auto kernel = kq_get_kernel(d, kname, hash, fc);
     if (kernel->maxTotalThreadsPerThreadgroup() < 256) {
       throw std::runtime_error(
@@ -484,6 +485,8 @@ void KQuantSDPAGQA::eval_gpu(
     const KQKvBatch kvb = kq_kv_batch(k, v);
     ce.set_bytes(kvb.k, 13);
     ce.set_bytes(kvb.v, 14);
+    // Without starts, sums is a dummy binding (the read is compiled out).
+    ce.set_input_array(starts ? inputs[starts_idx] : sums, 15);
     ce.dispatch_threadgroups(
         MTL::Size(n_kv_heads, B, splits), MTL::Size(32, 8, 1));
   }
