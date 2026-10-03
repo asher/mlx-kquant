@@ -63,6 +63,10 @@ and process footprint bytes after every visit; --mem-trace prints them
 as they are taken.
 
 A versus A: --arms kq,kq_aa. Plan only: --plan-only.
+
+Lever arms: --env-arm NAME:VAR=VALUE[,VAR=VALUE] defines a kq arm that
+runs with those environment levers set (read live), adds it to --arms and
+pairs it with kq as NAME/kq, for example --env-arm sw1:KQ_NAX_SWIZZLE=1.
 """
 
 from __future__ import annotations
@@ -103,6 +107,35 @@ def build_groups(args, heavy_codecs):
     return groups
 
 
+CODEC_ARMS = ("kq", "kq_bm64", "kq_bm128", "deq", "kq_aa")
+SHARED_ARMS = ("dense", "affine")
+
+
+def lever_arms(arms):
+    """Arms defined by --env-arm, in --arms order."""
+    return [a for a in arms if a not in CODEC_ARMS and a not in SHARED_ARMS]
+
+
+def parse_env_arms(specs):
+    """{name: {VAR: VALUE}} from --env-arm NAME:VAR=VALUE[,VAR=VALUE]."""
+    out = {}
+    for spec in specs:
+        name, sep, body = spec.partition(":")
+        env = dict(kv.split("=", 1) for kv in body.split(",") if kv)
+        if not sep or not name or not env or name in CODEC_ARMS + SHARED_ARMS:
+            raise SystemExit(f"--env-arm {spec!r}: want NAME:VAR=VALUE[,VAR=VALUE]")
+        out[name] = env
+    return out
+
+
+def set_arm_env(arm, env_arms):
+    """Sets the levers of a lever arm and clears those of the others."""
+    for env in env_arms.values():
+        for k in env:
+            os.environ.pop(k, None)
+    os.environ.update(env_arms.get(arm, {}))
+
+
 def arm_instances(group, arms):
     """(arm, codec) pairs one visit runs; codec is None for shared arms."""
     out = []
@@ -112,10 +145,11 @@ def arm_instances(group, arms):
         for bits in sorted({dc.affine_bits(c) for c in group["codecs"]}):
             out.append((f"affine{bits}", None))
     for c in group["codecs"]:
-        for a in ("kq", "kq_bm64", "kq_bm128", "deq", "kq_aa"):
-            # Tile arms do not apply at one row per item, where the mat-vec
-            # routes run.
-            if a in arms and not (group["vector"] and a in dc.ARM_TILE_FORCED):
+        for a in CODEC_ARMS + tuple(lever_arms(arms)):
+            # Tile and lever arms do not apply at one row per item, where the
+            # mat-vec routes run.
+            forced = a in dc.ARM_TILE_FORCED or a not in CODEC_ARMS
+            if a in arms and not (group["vector"] and forced):
                 out.append((a, c))
     return out
 
@@ -257,6 +291,7 @@ def measure_pass(dtype, groups, args, store, desc, t_start, raw, prior=None):
 
     dt = dc.mx_dtype(dtype)
     nax = desc["nax"]
+    env_arms = parse_env_arms(args.env_arm)
     kernels = {}
     errors = {}
     calib = {}
@@ -269,6 +304,7 @@ def measure_pass(dtype, groups, args, store, desc, t_start, raw, prior=None):
             key = cell_key(arm, codec)
             x0, f = dc.make_call(arm, codec, g, dt, store)
             dc.set_tile(dc.ARM_TILE.get(arm), nax)
+            set_arm_env(arm, env_arms)
             try:
                 with dc.KernelLog() as log:
                     mx.eval(f(x0))
@@ -277,6 +313,7 @@ def measure_pass(dtype, groups, args, store, desc, t_start, raw, prior=None):
             except ValueError as e:
                 errors[(gi, key)] = str(e)
             dc.set_tile(None, nax)
+            set_arm_env(None, env_arms)
         mem.append(mem_row(mx, gi, args.mem_trace))
     inner = []
     for gi in range(len(groups)):
@@ -333,6 +370,7 @@ def measure_pass(dtype, groups, args, store, desc, t_start, raw, prior=None):
                 for arm, codec in inst[: args.visit_warmup]:
                     x0, f = dc.make_call(arm, codec, g, dt, store)
                     dc.set_tile(dc.ARM_TILE.get(arm), nax)
+                    set_arm_env(arm, env_arms)
                     dc.chain_ms(f, x0, wcalls)
                 x0 = store.act(g, dt)
                 glue = dc.chain_ms(lambda a: a, x0, inner[gi])
@@ -342,12 +380,14 @@ def measure_pass(dtype, groups, args, store, desc, t_start, raw, prior=None):
                 for arm, codec in inst:
                     x0, f = dc.make_call(arm, codec, g, dt, store)
                     dc.set_tile(dc.ARM_TILE.get(arm), nax)
+                    set_arm_env(arm, env_arms)
                     ms = dc.chain_ms(f, x0, inner[gi]) - glue
                     t = round(time.perf_counter() - t_start, 4)
                     key = cell_key(arm, codec)
                     samples[gi].setdefault(key, []).append((visit, r, s, t, ms))
                     rows.append([gi, key, visit, r, s, t, ms])
                 dc.set_tile(None, nax)
+                set_arm_env(None, env_arms)
                 mem.append(mem_row(mx, gi, args.mem_trace))
                 visit += 1
             raw.write(
@@ -435,6 +475,10 @@ def summarize_pass(groups, m, rounds, arm_names, desc):
                 ),
                 ("deq/kq", cell_key("deq", codec), cell_key("kq", codec)),
                 ("aa/kq", cell_key("kq_aa", codec), cell_key("kq", codec)),
+                *(
+                    (f"{a}/kq", cell_key(a, codec), cell_key("kq", codec))
+                    for a in lever_arms(arm_names)
+                ),
             ):
                 pr = paired(sm, a, b)
                 if pr:
@@ -596,6 +640,7 @@ def markdown(result):
                 )
         lines.append("")
         names = ["kq/dense", "kq/affine", "bm128/bm64", "deq/kq", "aa/kq"]
+        names += [f"{arm}/kq" for arm in lever_arms(a["arms"])]
         lines.append(
             "| op | L x B | codec | "
             + " | ".join(names)
@@ -696,6 +741,14 @@ def main(argv=None):
         help="arms that run a discarded sample at the start of each shape visit",
     )
     ap.add_argument(
+        "--env-arm",
+        action="append",
+        default=[],
+        metavar="NAME:VAR=VALUE[,VAR=VALUE]",
+        help="a kq arm run with these environment levers, paired with kq as "
+        "NAME/kq (repeatable)",
+    )
+    ap.add_argument(
         "--visit-warmup-calls",
         default="full",
         help="calls in that discarded sample: 'full' (the sample's count) or "
@@ -752,6 +805,12 @@ def main(argv=None):
     args.batches = parse_list(args.batches, int)
     args.codecs = parse_list(args.codecs)
     args.arms = parse_list(args.arms)
+    for name in parse_env_arms(args.env_arm):
+        if name not in args.arms:
+            args.arms.append(name)
+    unknown = set(lever_arms(args.arms)) - set(parse_env_arms(args.env_arm))
+    if unknown:
+        ap.error(f"arms without a definition: {sorted(unknown)}")
     args.dtypes = parse_list(args.dtypes)
     args.visit_warmup_calls = parse_list(args.visit_warmup_calls)
 
@@ -808,7 +867,15 @@ def main(argv=None):
             or meta0["groups"] != groups
             or any(
                 meta0["args"].get(k) != getattr(args, k)
-                for k in ("arms", "dtypes", "rounds", "slots", "seed", "shrink")
+                for k in (
+                    "arms",
+                    "env_arm",
+                    "dtypes",
+                    "rounds",
+                    "slots",
+                    "seed",
+                    "shrink",
+                )
             )
         ):
             sys.exit(f"{raw_out}: another run's raw log; --resume needs the same plan")

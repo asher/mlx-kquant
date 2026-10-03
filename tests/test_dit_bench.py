@@ -282,3 +282,22 @@ def test_sample_is_one_dependent_chain(tmp_path):
     assert r["out"] == 1.0
     assert r["tie_dtype"] == "mlx.core.bfloat16"
     assert r["ms"] > 0
+
+
+def test_lever_arm_pairs_with_kq(tmp_path):
+    result, _, recs, _ = _bench(
+        tmp_path, "--env-arm", "sw1:KQ_NAX_SWIZZLE=1,KQ_QMM_MIDM=0"
+    )
+    assert recs[0]["args"]["arms"] == ["kq", "kq_aa", "sw1"]
+    (p,) = result["passes"]
+    for g in p["groups"]:
+        (c,) = g["cells"]
+        assert set(c["arms"]) == {"kq", "kq_aa", "sw1"}
+        assert c["ratios"]["sw1/kq"]["pairs"]
+    assert "sw1/kq" in (tmp_path / "run.md").read_text()
+
+
+@pytest.mark.parametrize("spec", ["sw1", "sw1:", ":KQ_NAX_SWIZZLE=1", "kq:A=1"])
+def test_lever_arm_malformed(tmp_path, spec):
+    with pytest.raises(subprocess.CalledProcessError):
+        _bench(tmp_path, "--env-arm", spec)
