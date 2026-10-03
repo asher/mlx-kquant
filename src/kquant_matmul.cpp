@@ -546,6 +546,13 @@ static int kq_nax_bm128_odd_m() {
       : cached;
 }
 
+// KQ_NAX_Q6K_BK128: 0 = q6_k keeps BK=64 on the BM=64 and BM=128 tiles,
+// unset or 1 = BK=128.
+static bool kq_nax_q6k_bk128_on() {
+  static const bool cached = kq_env_flag("KQ_NAX_Q6K_BK128", 1) != 0;
+  return kq_tune_live() ? kq_env_flag("KQ_NAX_Q6K_BK128", 1) != 0 : cached;
+}
+
 // KQ_NAX_DB64: 0 = off, 1 = no N floor, unset (-1) = per-codec N floor.
 static int kq_nax_db64_mode() {
   static const int cached = kq_env_int("KQ_NAX_DB64", -1);
@@ -781,6 +788,13 @@ void qmm_nax(
   bool use_db64 = transpose && bm == 64 && bn == 64 && wm == 2 && wn == 2 &&
       M >= 33 && M <= 64 && db64_min_n > 0 &&
       (db64_mode == 1 || (db64_mode == -1 && N >= db64_min_n));
+  // q6_k on the BM=64 and BM=128 tiles walks K 128 weights per step, one
+  // half super-block per tile (KqNaxQ6_KHalfLoader), and reads each ql and
+  // qh byte once where BK=64 reads it on two tiles. Bit-identical output.
+  if (kquant_type == "q6_k" && transpose && !use_db64 && bn == 64 && wm == 2 &&
+      wn == 2 && (bm == 64 || bm == 128) && kq_nax_q6k_bk128_on()) {
+    bk = 128;
+  }
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
   // Row-tile traversal swizzle (M > 64): fold row-tiles into grid.x so

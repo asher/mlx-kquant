@@ -207,7 +207,8 @@ def test_tile_rows_above_int16(codec):
 
 _NAX_NAME = re.compile(
     r"^kquant_(?P<codec>.+?)_qmm_t_nax_(?P<type>bfloat16_t|float16_t|float)"
-    r"_gs_\d+_b_\d+_bm(?P<bm>\d+)_bn(?P<bn>\d+)_bk64_wm(?P<wm>\d+)_wn(?P<wn>\d+)"
+    r"_gs_\d+_b_\d+_bm(?P<bm>\d+)_bn(?P<bn>\d+)_bk(?P<bk>64|128)_wm(?P<wm>\d+)"
+    r"_wn(?P<wn>\d+)"
     r"_alN_(?P<al>true|false)_batch_(?P<batch>[01])(?P<db>_db)?$"
 )
 _ALU_NAME = re.compile(
@@ -268,6 +269,7 @@ def _selectable(codec):
                 env = {
                     "KQ_NAX_TILE": tile,
                     "KQ_NAX_DB64": "1" if db else "0",
+                    "KQ_NAX_Q6K_BK128": "1" if m["bk"] == "128" else "0",
                     "KQ_QMM_MIDM": "0",
                     "KQ_DISABLE_NAX": None,
                     "KQ_QMM_TILE": None,

@@ -26,6 +26,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - On NAX GPUs (M5), prefill and image steps of 4096 or more tokens no longer
   change matmul kernels with the token count. The 4096 threshold is provisional.
+- On NAX GPUs (M5), `q6_k` matmuls in prefill and image steps run 5 to 20%
+  faster, with the same output.
 - The bundled metallib drops the float32-activation matmul kernels, which no
   call reached, about 22 MB.
 

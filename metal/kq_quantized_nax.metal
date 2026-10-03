@@ -242,6 +242,32 @@ instantiate_kquant_nax_bm128(iq1_m, 256, 1)
 instantiate_kquant_nax_bm128(stq1_0, 256, 1)
 instantiate_kquant_nax_bm128(pq2_0, 128, 2)
 instantiate_kquant_nax_bm128(ptq1_0, 128, 1)
+// q6_k on the BM=64 and BM=128 tiles with a K tile of 128
+// (KqNaxQ6_KHalfLoader). KQ_NAX_Q6K_BK128=0 keeps the BK=64 kernels.
+#define instantiate_kquant_nax_q6_k_bk128(type, aligned_N, batched, bm)       \
+  instantiate_kernel(                                                        \
+      "kquant_q6_k_qmm_t_nax_" #type "_gs_256_b_6"                           \
+          "_bm" #bm "_bn64_bk128_wm2_wn2"                                    \
+          "_alN_" #aligned_N "_batch_" #batched,                             \
+      kq_q6_k_qmm_t_nax_bk128,                                               \
+      type,                                                                  \
+      256,                                                                   \
+      6,                                                                     \
+      aligned_N,                                                             \
+      batched,                                                               \
+      bm,                                                                    \
+      64,                                                                    \
+      2,                                                                     \
+      2)
+#define instantiate_kquant_nax_q6_k_bk128_bm(type, bm)                       \
+  instantiate_kquant_nax_q6_k_bk128(type, true,  1, bm)                      \
+  instantiate_kquant_nax_q6_k_bk128(type, true,  0, bm)                      \
+  instantiate_kquant_nax_q6_k_bk128(type, false, 1, bm)                      \
+  instantiate_kquant_nax_q6_k_bk128(type, false, 0, bm)
+instantiate_kquant_nax_q6_k_bk128_bm(float16_t,  64)
+instantiate_kquant_nax_q6_k_bk128_bm(bfloat16_t, 64)
+instantiate_kquant_nax_q6_k_bk128_bm(float16_t,  128)
+instantiate_kquant_nax_q6_k_bk128_bm(bfloat16_t, 128)
 
 // Small-BM gather_qmm_rhs tile for the few-rows-per-expert prefill regime
 // (MoE top-k at chat chunk sizes: rows/E ~ 4-32). Every expert segment in
