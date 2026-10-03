@@ -53,6 +53,8 @@ every finished slot. --reaggregate rebuilds the JSON and Markdown from a
 raw log without running anything, and marks a partial run. --resume
 continues a stopped run from its raw log: it keeps the finished slots and
 the warmup's call counts, and runs the slots left, in the same order.
+--time-budget-min splits a long run into processes that each stop after
+the slot that passes the budget.
 
 Memory: MLX keeps freed buffers in its cache for reuse, and every shape
 leaves its own sizes there, so a sweep of many shapes would otherwise hold
@@ -409,6 +411,17 @@ def measure_pass(dtype, groups, args, store, desc, t_start, raw, prior=None):
                 f"{time.perf_counter() - t_start:.0f} s{fp}",
                 flush=True,
             )
+            budget = args.time_budget_min
+            left = slots < args.rounds * args.slots
+            if budget and left and time.perf_counter() - t_start >= budget * 60:
+                return {
+                    "inner": inner,
+                    "kernels": kernels,
+                    "errors": errors,
+                    "samples": samples,
+                    "slots": slots,
+                    "stopped": True,
+                }
     return {
         "inner": inner,
         "kernels": kernels,
@@ -782,6 +795,13 @@ def main(argv=None):
         help="print active, cache and footprint GiB after every visit",
     )
     ap.add_argument(
+        "--time-budget-min",
+        type=float,
+        default=0,
+        help="stop after the slot that ends past this many minutes, without "
+        "an end record, so the run continues under --resume (0: no budget)",
+    )
+    ap.add_argument(
         "--resume",
         action="store_true",
         help="continue the run in the raw log (same arguments): keep its "
@@ -901,6 +921,14 @@ def main(argv=None):
         measured[dtype] = measure_pass(
             dtype, groups, args, store, desc, t_start, raw, p
         )
+        if measured[dtype].get("stopped"):
+            break
+    if any(m.get("stopped") for m in measured.values()):
+        raw.close()
+        print("stopped at the time budget; --resume continues the run", flush=True)
+        result = build_result(meta, {**prior, **measured}, {}, raw_out)
+        write_outputs(result, args.json_out, args.md_out)
+        return 0
     end = {
         "kind": "end",
         "wall_s": time.perf_counter() - t_start,

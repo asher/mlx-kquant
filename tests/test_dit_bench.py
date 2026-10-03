@@ -301,3 +301,21 @@ def test_lever_arm_pairs_with_kq(tmp_path):
 def test_lever_arm_malformed(tmp_path, spec):
     with pytest.raises(subprocess.CalledProcessError):
         _bench(tmp_path, "--env-arm", spec)
+
+
+def test_time_budget_splits_a_run(tmp_path):
+    # A budget that every slot passes: each process runs one slot and stops,
+    # and --resume continues until the run is complete.
+    runs = 0
+    while True:
+        result, _, recs, out = _bench(tmp_path, "--time-budget-min", "1e-9", "--resume")
+        runs += 1
+        if result["complete"]:
+            break
+        assert "--resume continues" in out
+        assert runs < 6
+    assert runs == 4
+    assert [r["kind"] for r in recs].count("slot") == 4
+    assert recs[-1]["kind"] == "end"
+    (p,) = result["passes"]
+    assert p["slots_done"] == p["slots_planned"] == 4
