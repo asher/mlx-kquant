@@ -25,6 +25,9 @@ TILES = {64: "64,64,2,2", 128: "128,64,2,2"}
 # The fold log of each codec's large-M row (src/kquant_matmul.cpp,
 # kq_largem_row); codecs not listed fold nothing.
 POLICY_LOG: dict[str, int] = {}
+# Codecs whose large-M row is measured; the rest take their loader class's
+# row, the same tile and floor today.
+MEASURED = {"q4_k", "q5_k", "q6_k", "q8_0"}
 # A k-quant on K tiles of 64 and of 128, a flat block codec, IQ grid codecs
 # and a ternary codec.
 CODECS = ["q4_k", "q6_k", "q8_0", "q4_0", "iq2_xxs", "iq4_xs", "stq1_0"]
@@ -125,3 +128,14 @@ def test_swizzle_lever_keeps_first_read():
     res = run_probe(calls, env=env, check=False)
     want = _fold(4128, 128, 192, 2)
     assert [_kernel(r)[1] for r in res] == [want, want]
+
+
+@pytest.mark.parametrize("codec", kq.codecs())
+def test_large_row(codec):
+    from mlx_kquant._ext import _nax_large_row
+
+    row = _nax_large_row(codec)
+    if not row:
+        pytest.skip("no Metal")
+    want = [128, 64, 2, 2, POLICY_LOG.get(codec, 0), 4096, 0]
+    assert row == want + [int(codec not in MEASURED)]

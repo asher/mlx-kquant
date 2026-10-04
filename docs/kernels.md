@@ -326,6 +326,23 @@ Tuning levers (defaults are right for normal use):
   only. `HD` measured +4-5% at M 8; the rest flat to negative on M5 Max. Kept as probes. Default
   off.
 
+Large-M rows. On NAX GPUs a transpose call at M 4096 or more takes the codec's large-M row from
+`kq_largem_row` in `src/kquant_matmul.cpp`: the tile, the row-tile fold and the shape floor (M at
+or above min M at either ceil(M/64) parity, N at or above min N). A codec without measurements
+takes the row of its loader class (the 256-weight k-quant loaders, the 32-weight flat block
+loaders, or the IQ grid and ternary loaders) and is marked inherited. The measured rows come from
+`benchmarks/bench_dit_shapes.py` on an M5 Max at the diffusion transformer rows (M 4096 to 33792
+at the Z-Image and Qwen-Image projection shapes). There the BM=128 tile takes 0.89-0.96x the
+BM=64 time at rows with an odd ceil(M/64), and per projection the median fold of 2 row tiles
+takes 1.00-1.26x the unfolded time, of 4 row tiles 1.03-1.58x.
+
+| Codecs | Tile (bm, bn, wm, wn) | Fold log | Min M | Min N | Row |
+|---|---|---|---|---|---|
+| `q4_k`, `q5_k`, `q6_k`, `q8_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | measured |
+| `q2_k`, `q3_k` | 128, 64, 2, 2 | 0 | 4096 | 0 | inherited, k-quant class |
+| `q4_0`, `q4_1`, `q5_0`, `q5_1`, `iq4_nl` | 128, 64, 2, 2 | 0 | 4096 | 0 | inherited, flat class |
+| the other codecs | 128, 64, 2, 2 | 0 | 4096 | 0 | inherited, grid class |
+
 `stq1_0` (structured-sparse ternary, llama.cpp PR #22836) ships the full ALU and NAX kernel set. Its
 pre-NAX floors are measured (M3 Max: plain split-K entry M 5), and so are its NAX small-M routes in
 `kq_nax_small_m`. The rest of its NAX policy is inherited from `iq1_s` and needs M5-silicon

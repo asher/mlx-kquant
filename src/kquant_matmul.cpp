@@ -183,7 +183,12 @@ static KqLoaderClass kq_loader_class(const std::string& t) {
 
 // Measured on M5 Max with benchmarks/bench_dit_shapes.py at the DiT rows
 // (4096 to 33792). A row with inherited = true is its loader class's row.
+// Measured rows: BM=128 is faster than BM=64 at every odd-tile row from
+// 4096, and every row-tile fold is slower than none.
 static KqLargeM kq_largem_row(const std::string& t) {
+  if (t == "q4_k" || t == "q5_k" || t == "q6_k" || t == "q8_0") {
+    return {128, 64, 2, 2, 0, 4096, 0, false};
+  }
   switch (kq_loader_class(t)) {
     case KqLoaderClass::kquant:
       return {128, 64, 2, 2, 0, 4096, 0, true};
@@ -3131,6 +3136,11 @@ int qmv_fine_max_n(const std::string& kquant_type) {
 // from the dispatch helpers over every M the split routes serve (1 to 128)
 // and every K kind, under this process's levers. The gates read the codec
 // table, not KQ_DISABLE_NAX. Names repeat across routes.
+std::vector<int> nax_large_row(const std::string& kquant_type) {
+  KqLargeM r = kq_largem_row(kquant_type);
+  return {r.bm, r.bn, r.wm, r.wn, r.swizzle_log, r.min_m, r.min_n, r.inherited};
+}
+
 std::vector<std::string> split_kernel_names() {
   std::vector<std::string> out;
   auto each_suffix = [](mx::Dtype dt, auto&& f) {
@@ -3217,6 +3227,10 @@ void KQuantQmvBias::eval_gpu(
 
 int qmv_fine_max_n(const std::string&) {
   return 0;
+}
+
+std::vector<int> nax_large_row(const std::string&) {
+  return {};
 }
 
 std::vector<std::string> split_kernel_names() {
