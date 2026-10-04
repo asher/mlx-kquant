@@ -122,6 +122,87 @@ def test_reaggregate_rebuilds_a_stopped_run(tmp_path):
     assert "16 of 24 slots ran." in md
 
 
+_ORDER_WRITER = textwrap.dedent(
+    """
+    import json, sys
+    sys.path.insert(0, sys.argv[1])
+    import bench_dit_shapes as b
+    import dit_common as dc
+    raw, json_out, md_out = sys.argv[2:5]
+    g = {"family": "zimage", "op": "qkv", "K": 256, "N": 704, "L": 64, "B": 1,
+         "M": 64, "L_model": 4096, "vector": False, "heavy": False,
+         "codecs": ["q4_k"]}
+    args = {"rounds": 3, "slots": 8, "inner": 3, "max_inner": 64,
+            "min_sample_ms": 10.0, "shrink": 16, "arms": ["kq", "kq_aa"]}
+    machine = {"device": "gpu", "architecture": "applegpu_g17s", "arch_gen": 17,
+               "arch_letter": "s", "gpu_cores": 40, "nax": True,
+               "max_threadgroup_memory": 32768, "os": "26", "mlx": "0.32.2",
+               "mlx_kquant": "0.5.0", "metallib_sha256": None, "tf32": True}
+    log = b.RawLog(raw)
+    log.write({"kind": "meta", "machine": machine, "args": args,
+               "heavy_codecs": [], "groups": [g], "mlx_kquant_file": "kq",
+               "sample_mode": "chain"})
+    log.write({"kind": "warmup", "dtype": "bfloat16", "inner": [3],
+               "kernels": [[0, "kq/q4_k", "k"], [0, "kq_aa/q4_k", "k"]],
+               "errors": []})
+    # kq_aa takes 1.02x kq, and the second call of a visit 1.1x the first.
+    visit, t = 0, 0.0
+    for r in range(3):
+        for s in range(8):
+            arms = [("kq/q4_k", 1.0), ("kq_aa/q4_k", 1.02)]
+            if dc.THUE_MORSE[s]:
+                arms.reverse()
+            rows = []
+            for i, (key, ms) in enumerate(arms):
+                t += 1.0
+                rows.append([0, key, visit, r, s, t, ms * (1.1 if i else 1.0)])
+            log.write({"kind": "slot", "dtype": "bfloat16", "round": r,
+                       "slot": s, "samples": rows})
+            visit += 1
+    log.write({"kind": "end", "wall_s": 1.0})
+    log.close()
+    sys.exit(b.main(["--reaggregate", raw, "--json-out", json_out,
+                     "--md-out", md_out]))
+    """
+)
+
+
+def test_ratio_balances_call_order(tmp_path):
+    raw = tmp_path / "run.json.raw.jsonl"
+    json_out = tmp_path / "run.json"
+    script = tmp_path / "writer.py"
+    script.write_text(_ORDER_WRITER)
+    subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            BENCH_DIR,
+            str(raw),
+            str(json_out),
+            str(tmp_path / "run.md"),
+        ],
+        check=True,
+        timeout=120,
+    )
+    result = json.loads(json_out.read_text())
+    (p,) = result["passes"]
+    (g,) = p["groups"]
+    (c,) = g["cells"]
+    rt = c["ratios"]["aa/kq"]
+    # The pairs of the two orders, 1.122 and 0.927, meet at 1.02.
+    assert rt["order"] == pytest.approx(1.1**2)
+    assert sorted({round(v, 9) for _r, v, _f in rt["pairs_raw"]}) == [
+        round(1.02 / 1.1, 9),
+        round(1.02 * 1.1, 9),
+    ]
+    st = rt["settled"]
+    assert st["median"] == pytest.approx(1.02)
+    assert st["p10"] == pytest.approx(st["p90"])
+    (ag,) = [a for a in p["aggregate"] if a["ratio"] == "aa/kq"]
+    assert ag["pooled"]["median"] == pytest.approx(1.02)
+    assert ag["cell_order"]["median"] == pytest.approx(1.1**2)
+
+
 # Two tiny shapes, two rounds of two slots, one call per sample.
 _TINY = [
     "--families",

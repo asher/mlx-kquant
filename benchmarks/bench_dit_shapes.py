@@ -41,6 +41,13 @@ count. Reports and raw logs carry "sample_mode": "chain"; a log without it
 is from the earlier independent-call bench, and its figures do not compare
 with chained ones.
 
+The later call of a visit runs slower than the earlier one (up to 20
+percent at compute-bound shapes), so a cell's paired ratios form two
+modes, one per call order, split 4/4 by the Thue-Morse bit. Per cell, the
+ratios of each order are scaled to meet at the geometric mean of the two
+order medians, and the factor between them is reported as "order"; the
+raw pairs stay in the JSON as "pairs_raw".
+
 Per cell, ratios carry a 95 percent CI of the paired median, from order
 statistics; its half-width is the cell's noise floor. Per op, the pooled
 median of all settled pairs is the aggregate, reported beside the spread
@@ -175,9 +182,39 @@ def cell_key(arm, codec):
 
 
 def paired(samples, a, b):
-    """Per-visit ratios a/b over the visits that ran both arms."""
-    sb = {v: ms for (v, _r, _s, _t, ms) in samples.get(b, [])}
-    return [(r, ms / sb[v]) for (v, r, _s, _t, ms) in samples.get(a, []) if v in sb]
+    """Per-visit ratios a/b over the visits that ran both arms, each with
+    True when a ran first in the visit, False when b did, and None when the
+    times do not tell."""
+    sb = {v: (t, ms) for (v, _r, _s, t, ms) in samples.get(b, [])}
+    out = []
+    for v, r, _s, t, ms in samples.get(a, []):
+        if v in sb:
+            tb, mb = sb[v]
+            out.append((r, ms / mb, None if t == tb else t < tb))
+    return out
+
+
+def order_balance(pairs):
+    """The later call of a visit runs slower, so the ratios of the visits
+    where a ran first and of those where b ran first form two modes, and
+    their pooled median falls anywhere between them. Scale each order's
+    ratios by the square root of the order factor (median of b first over
+    median of a first) so both meet at the geometric mean of the two
+    medians. Returns the scaled (round, ratio) pairs and the factor, which
+    is None unless both orders ran with positive medians (a sample under its
+    glue time gives a ratio at or below 0)."""
+    af = [v for _r, v, f in pairs if f is True]
+    bf = [v for _r, v, f in pairs if f is False]
+    ma = bs.summarize(af)["median"] if af else 0
+    mb = bs.summarize(bf)["median"] if bf else 0
+    if ma <= 0 or mb <= 0:
+        return [(r, v) for r, v, _f in pairs], None
+    order = mb / ma
+    k = math.sqrt(order)
+    scaled = []
+    for r, v, f in pairs:
+        scaled.append((r, v * k if f is True else v / k if f is False else v))
+    return scaled, order
 
 
 def split_stats(rows, rounds, round_at, value_at):
@@ -493,10 +530,13 @@ def summarize_pass(groups, m, rounds, arm_names, desc):
                     for a in lever_arms(arm_names)
                 ),
             ):
-                pr = paired(sm, a, b)
-                if pr:
+                raw_pairs = paired(sm, a, b)
+                if raw_pairs:
+                    pr, order = order_balance(raw_pairs)
                     ratios[name] = split_stats(pr, rounds, 0, 1)
+                    ratios[name]["order"] = order
                     ratios[name]["pairs"] = [[r, v] for r, v in pr]
+                    ratios[name]["pairs_raw"] = [list(p) for p in raw_pairs]
             cells.append({"codec": codec, "arms": arms, "ratios": ratios})
         out_groups.append(dict(g, inner=inner[gi], shared=shared, cells=cells))
     return out_groups
@@ -511,8 +551,12 @@ def aggregates(groups, rounds):
         op = f"{g['family']}.{g['op']}"
         for c in g["cells"]:
             for name, rt in c["ratios"].items():
-                e = by.setdefault((op, name), {"pairs": [], "cells": [], "half": []})
+                e = by.setdefault(
+                    (op, name), {"pairs": [], "cells": [], "half": [], "order": []}
+                )
                 e["pairs"] += [v for r, v in rt["pairs"] if r > 0 or rounds == 1]
+                if rt.get("order") is not None:
+                    e["order"].append(rt["order"])
                 st = rt.get("settled") or rt.get("all")
                 if st:
                     e["cells"].append(st["median"])
@@ -528,6 +572,7 @@ def aggregates(groups, rounds):
                 "cell_medians": bs.summarize(e["cells"]),
                 "cell_ci95_half": bs.summarize(e["half"]),
                 "cell_ci95_half_max": max(e["half"]) if e["half"] else None,
+                "cell_order": bs.summarize(e["order"]),
                 "cells": len(e["cells"]),
             }
         )
@@ -616,9 +661,13 @@ def markdown(result):
         f"Rounds {a['rounds']} x {a['slots']} Thue-Morse slots, inner {a['inner']} "
         f"(up to {a['max_inner']} under {a['min_sample_ms']} ms per call), "
         f"shrink {a['shrink']}. Times are settled medians in ms (all rounds when "
-        "there is one); ratios are medians of per-visit paired ratios; "
-        "round 0 = median of round 0, which is not a cold figure (see "
-        "bench_dit_thermal.py for the cold rate)."
+        "there is one); ratios are medians of per-visit paired ratios, "
+        "balanced over call order: the later call of a visit runs slower, "
+        "so per cell the pairs in which each arm ran first are scaled to "
+        "meet at the geometric mean of their two medians, and order is the "
+        "factor between them (later over earlier); round 0 = median of "
+        "round 0, which is not a cold figure (see bench_dit_thermal.py for "
+        "the cold rate)."
     )
     lines.append("")
     if not result.get("complete", True):
@@ -674,16 +723,17 @@ def markdown(result):
         lines.append(
             "Aggregate per op: pooled median of settled pairs with its 95 percent "
             "CI; per-cell medians p10 to p90; per-cell CI half-width median and "
-            "max."
+            "max; per-cell order factor median."
         )
         lines.append("")
         lines.append(
             "| op | ratio | cells | pairs | pooled | CI | cell p10 | cell p90 "
-            "| cell CI half med | cell CI half max |"
+            "| cell CI half med | cell CI half max | order |"
         )
-        lines.append("|---|---|---|---|---|---|---|---|---|---|")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
         for ag in p["aggregate"]:
             po, cm, ch = ag["pooled"], ag["cell_medians"], ag["cell_ci95_half"]
+            co = ag.get("cell_order")
             ci = po["ci95"] if po else None
             lines.append(
                 f"| {ag['op']} | {ag['ratio']} | {ag['cells']} "
@@ -691,7 +741,8 @@ def markdown(result):
                 f"| {f'{ci[0]:.4f} to {ci[1]:.4f}' if ci else '-'} "
                 f"| {fmt(cm and cm['p10'])} | {fmt(cm and cm['p90'])} "
                 f"| {fmt(ch and ch['median'], '.1%')} "
-                f"| {fmt(ag['cell_ci95_half_max'], '.1%')} |"
+                f"| {fmt(ag['cell_ci95_half_max'], '.1%')} "
+                f"| {fmt(co and co['median'])} |"
             )
         lines.append("")
         errs = [
