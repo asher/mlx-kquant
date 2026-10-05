@@ -1620,6 +1620,100 @@ struct KqNaxQ4_KBlockLoader {
 
 // Q5_K: 176 bytes per 256-weight super-block. Q4_K layout + qh[32] high bits.
 
+// Q4_K on a K tile of 128: one tile is the sub-blocks 4h to 4h + 3 of half
+// h, the qs pairs 2h and 2h + 1. Two threads share a row, 16 positions l
+// each. A thread reads qs[64h + l] and qs[64h + 32 + l] and the four scale
+// and min pairs of its half once per tile, where the BK=64 loader reads two
+// pairs on each of its two tiles.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct KqNaxQ4_KHalfLoader {
+  MLX_MTL_CONST int weights_per_block = KQ_Q4_K_SUPERBLOCK;
+  MLX_MTL_CONST int bytes_per_block = KQ_Q4_K_BLOCK_BYTES;
+  static_assert(BCOLS == 128, "Q4_K half loader requires BCOLS == 128.");
+  static_assert(reduction_dim == 1, "Q4_K half loader serves qmm_t only.");
+  static_assert(BROWS * 2 == tgp_size, "Q4_K half loader: 2 threads per row.");
+
+  MLX_MTL_CONST short TCOLS = 2;
+  MLX_MTL_CONST short n_pos = 16;
+  // load_unsafe depends on half_idx only.
+  MLX_MTL_CONST bool db_safe = true;
+
+  const short thread_idx;
+  const short bi;
+  const short lj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+  short half_idx;
+
+  KqNaxQ4_KHalfLoader(
+      const device uint8_t* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]]) thread
+      : thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        lj((thread_idx % TCOLS) * n_pos),
+        dst(dst_ + bi * dst_ld + lj),
+        src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
+        half_idx(0) {}
+
+  void load_unsafe() thread {
+    const float d = float(*(const device half*)(src + KQ_Q4_K_D_OFFSET));
+    const float dmin = float(*(const device half*)(src + KQ_Q4_K_DMIN_OFFSET));
+    const device uint8_t* scales12 = src + KQ_Q4_K_SCALES_OFFSET;
+    float es[4], em[4];
+#pragma unroll
+    for (short q = 0; q < 4; q++) {
+      uint8_t sc6, mn6;
+      kq_get_scale_min_k4(half_idx * 4 + q, scales12, sc6, mn6);
+      es[q] = d * float(sc6);
+      em[q] = dmin * float(mn6);
+    }
+    const device uint8_t* qs = src + KQ_Q4_K_QS_OFFSET + half_idx * 64 + lj;
+    const uint4 a_v = *reinterpret_cast<const device uint4*>(qs);
+    const uint4 b_v = *reinterpret_cast<const device uint4*>(qs + 32);
+    const thread uint8_t* a = reinterpret_cast<const thread uint8_t*>(&a_v);
+    const thread uint8_t* b = reinterpret_cast<const thread uint8_t*>(&b_v);
+#pragma unroll
+    for (short j = 0; j < n_pos; j++) {
+      dst[j] = T(es[0] * float(a[j] & 0x0F) - em[0]);
+      dst[32 + j] = T(es[1] * float(a[j] >> 4) - em[1]);
+      dst[64 + j] = T(es[2] * float(b[j] & 0x0F) - em[2]);
+      dst[96 + j] = T(es[3] * float(b[j] >> 4) - em[3]);
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) thread {
+    if (bi >= src_tile_dim.y) {
+#pragma unroll
+      for (short j = 0; j < n_pos; j++) {
+        dst[j] = T(0);
+        dst[32 + j] = T(0);
+        dst[64 + j] = T(0);
+        dst[96 + j] = T(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() thread {
+    half_idx += 1;
+    if (half_idx == 2) {
+      half_idx = 0;
+      src += bytes_per_block;
+    }
+  }
+};
+
 template <
     typename T,
     short BROWS,
@@ -4024,6 +4118,7 @@ KQ_NAX_DEFINE_KERNELS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q6_k, 256, 6, KqNaxQ6_KHalfLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q5_k, 256, 5, KqNaxQ5_KHalfLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q3_k, 256, 3, KqNaxQ3_KHalfLoader)
+KQ_NAX_DEFINE_BK128_KERNEL(q4_k, 256, 4, KqNaxQ4_KHalfLoader)
 #undef KQ_NAX_DEFINE_BK128_KERNEL
 
 // Split-K qmm_t on the NAX tile (KQ_QMM_SPLITK_NAX):

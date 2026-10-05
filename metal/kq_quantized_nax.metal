@@ -272,6 +272,7 @@ instantiate_kquant_nax_bm128(ptq1_0, 128, 1)
 instantiate_kquant_nax_bk128_codec(q6_k, 256, 6)
 instantiate_kquant_nax_bk128_codec(q5_k, 256, 5)
 instantiate_kquant_nax_bk128_codec(q3_k, 256, 3)
+instantiate_kquant_nax_bk128_codec(q4_k, 256, 4)
 
 // Small-BM gather_qmm_rhs tile for the few-rows-per-expert prefill regime
 // (MoE top-k at chat chunk sizes: rows/E ~ 4-32). Every expert segment in

@@ -2,7 +2,8 @@
 
 On NAX GPUs the BM=64 and BM=128 tiles of q6_k, q5_k and q3_k dispatch the
 ``_bk128`` kernels by default, the codec's ``KQ_NAX_<codec>_BK128=0`` keeps
-the ``_bk64`` ones, and the two give bit-identical outputs. The BM=32 tile
+the ``_bk64`` ones, and the two give bit-identical outputs. q4_k carries the
+``_bk128`` kernels behind ``KQ_NAX_Q4K_BK128=1``. The BM=32 tile
 and the ``_db`` variant keep BK=64. Each case runs in a fresh interpreter
 (tests/qmm_probe.py) and checks the result against float64 with exact
 kq.dequantize weights, on the CPU stream too, where the lever leaves the
@@ -21,7 +22,10 @@ LIVE = {"KQ_TUNE_LIVE": "1", "KQ_QMM_LOG": "1"}
 # Three super-blocks, so the loader walks two halves per block across
 # block boundaries.
 K = 768
-CODECS = {"q6_k": 6, "q5_k": 5, "q3_k": 3}
+CODECS = {"q6_k": 6, "q5_k": 5, "q3_k": 3, "q4_k": 4}
+# Codecs whose BM=64 and BM=128 tiles take the K tile of 128 unless the
+# lever is 0.
+DEFAULT_ON = {"q6_k", "q5_k", "q3_k"}
 
 
 def _lever(codec):
@@ -107,7 +111,12 @@ def test_bk128_dispatch(codec):
             False,
         ),
         (dict(base, shape=[160, K]), 64, 64, False),
-        (dict(base, shape=[4096, K], env={lever: None}), 128, 128, False),
+        (
+            dict(base, shape=[4096, K], env={lever: None}),
+            128,
+            128 if codec in DEFAULT_ON else 64,
+            False,
+        ),
     ]
     if codec == "q6_k":
         # The M 33-64 _db band from N 16384.

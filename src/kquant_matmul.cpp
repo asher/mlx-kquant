@@ -623,16 +623,23 @@ static int kq_nax_bm128_odd_m() {
   return kq_tune_live() ? kq_env_int("KQ_NAX_BM128_ODD_M", -1) : cached;
 }
 
-// KQ_NAX_<Q6K|Q5K|Q3K>_BK128: K tile of the codec on the BM=64 and BM=128
-// tiles, unset or 1 = 128, 0 = 64.
-static constexpr int kq_nax_bk128_codecs = 3;
+// KQ_NAX_<Q6K|Q5K|Q3K|Q4K>_BK128: K tile of the codec on the BM=64 and
+// BM=128 tiles, 1 = 128, 0 = 64, unset = the codec's default.
+static constexpr int kq_nax_bk128_codecs = 4;
 static int kq_nax_bk128_slot(const std::string& t) {
-  return t == "q6_k" ? 0 : t == "q5_k" ? 1 : t == "q3_k" ? 2 : -1;
+  return t == "q6_k" ? 0
+      : t == "q5_k"  ? 1
+      : t == "q3_k"  ? 2
+      : t == "q4_k"  ? 3
+                     : -1;
 }
 static bool kq_nax_bk128_on(const std::string& t) {
   static constexpr const char* env[kq_nax_bk128_codecs] = {
-      "KQ_NAX_Q6K_BK128", "KQ_NAX_Q5K_BK128", "KQ_NAX_Q3K_BK128"};
-  static constexpr int dflt[kq_nax_bk128_codecs] = {1, 1, 1};
+      "KQ_NAX_Q6K_BK128",
+      "KQ_NAX_Q5K_BK128",
+      "KQ_NAX_Q3K_BK128",
+      "KQ_NAX_Q4K_BK128"};
+  static constexpr int dflt[kq_nax_bk128_codecs] = {1, 1, 1, 0};
   const int i = kq_nax_bk128_slot(t);
   if (i < 0) {
     return false;
