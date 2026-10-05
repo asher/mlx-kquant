@@ -192,9 +192,10 @@ def _nax_tiles(codec):
 
 @pytest.mark.parametrize("codec", _qmm_codecs())
 def test_tile_rows_above_int16(codec):
-    # 32768 rows, and a batch of two at 16896 rows flattened to 33792, past
-    # the int16 row span the tile clamps before narrowing, on every tile the
-    # codec carries and on folded row-tile orders (KQ_NAX_SWIZZLE).
+    # 32768 and 32769 rows (an even and an odd ceil(M/64)), and a batch of
+    # two at 16896 rows flattened to 33792, past the int16 row span the tile
+    # clamps before narrowing, on every tile the codec carries and on folded
+    # row-tile orders (KQ_NAX_SWIZZLE).
     nax = not force_cpu() and kq.nax_available()
     envs = [{}]
     tiles = _nax_tiles(codec) if nax else []
@@ -208,7 +209,7 @@ def test_tile_rows_above_int16(codec):
             {"KQ_NAX_TILE": TILES[128], "KQ_NAX_SWIZZLE": "2"},
         ]
     calls = []
-    for shape in ([1, 32768, K], [2, 16896, K]):
+    for shape in ([1, 32768, K], [1, 32769, K], [2, 16896, K]):
         for n in (96, 128):
             base = len(calls)
             for j, env in enumerate(envs):
