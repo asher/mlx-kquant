@@ -214,7 +214,9 @@ Tuning levers (defaults are right for normal use):
   row tile holds 64 rows or fewer. There the simdgroup row with no row below M skips its
   activation loads, matrix work and store, so that tile does the loads and matrix work of one
   BM=64 tile. Unset, the codec's large-M row sets it (see below). `0` keeps the even ceil(M/64)
-  rule at every M, the policy before this lever. Read once per process unless `KQ_TUNE_LIVE=1`.
+  rule at every M, the policy before this lever, and turns off the large-M rows with their K
+  ceiling, so BM=128 also runs above the ceiling at an even ceil(M/64). Read once per process
+  unless `KQ_TUNE_LIVE=1`.
 - `KQ_NAX_DB64` - double-buffered M 33-64 band. `0` off, `1` drops the N floor, unset follows the
   per-codec N floors. Only the five policy-enabled codecs (q6_k, q8_0, q4_1, q5_1, q5_0) carry
   `_db` instantiations, so `1` is bounded by availability; probing another codec needs its
