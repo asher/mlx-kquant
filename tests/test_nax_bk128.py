@@ -1,14 +1,15 @@
 """NAX qmm_t on a K tile of 128 (the half super-block and pair loaders).
 
-On NAX GPUs the BM=64 and BM=128 tiles of q6_k, q5_k and q3_k dispatch the
-``_bk128`` kernels by default, the codec's ``KQ_NAX_<codec>_BK128=0`` keeps
-the ``_bk64`` ones, and the two give bit-identical outputs. q4_k and the
-32-weight block and IQ codecs carry the ``_bk128`` kernels behind
-``KQ_NAX_<codec>_BK128=1``, and a 32-weight block codec takes them only at
-K % 128 == 0. The BM=32 tile and the ``_db`` variant keep BK=64. Each
-case runs in a fresh interpreter (tests/qmm_probe.py) and checks the result
-against float64 with exact kq.dequantize weights, on the CPU stream too,
-where the lever leaves the result alone.
+On NAX GPUs the BM=64 and BM=128 tiles of q6_k, q5_k, q4_k and q3_k
+dispatch the ``_bk128`` kernels by default, the codec's
+``KQ_NAX_<codec>_BK128=0`` keeps the ``_bk64`` ones, and the two give
+bit-identical outputs. The 32-weight block and IQ codecs carry the
+``_bk128`` kernels behind ``KQ_NAX_<codec>_BK128=1``, and a 32-weight block
+codec takes them only at K % 128 == 0. The BM=32 tile and the ``_db``
+variant keep BK=64. Each case runs in a fresh interpreter
+(tests/qmm_probe.py) and checks the result against float64 with exact
+kq.dequantize weights, on the CPU stream too, where the lever leaves the
+result alone.
 """
 
 from __future__ import annotations
@@ -47,7 +48,7 @@ CODECS = {
 }
 # Codecs whose BM=64 and BM=128 tiles take the K tile of 128 unless the
 # lever is 0.
-DEFAULT_ON = {"q6_k", "q5_k", "q3_k"}
+DEFAULT_ON = {"q6_k", "q5_k", "q4_k", "q3_k"}
 # Codecs without a BM=32 tile, whose M 16 runs the BM=64 one.
 NO_BM32 = {"iq2_xs", "iq2_s", "iq1_m"}
 

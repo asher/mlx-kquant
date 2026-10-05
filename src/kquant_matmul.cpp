@@ -635,7 +635,7 @@ static constexpr KqBk128Lever kq_nax_bk128_levers[] = {
     {"q6_k", "KQ_NAX_Q6K_BK128", 1},
     {"q5_k", "KQ_NAX_Q5K_BK128", 1},
     {"q3_k", "KQ_NAX_Q3K_BK128", 1},
-    {"q4_k", "KQ_NAX_Q4K_BK128", 0},
+    {"q4_k", "KQ_NAX_Q4K_BK128", 1},
     {"q8_0", "KQ_NAX_Q8_0_BK128", 0},
     {"q4_0", "KQ_NAX_Q4_0_BK128", 0},
     {"q4_1", "KQ_NAX_Q4_1_BK128", 0},
@@ -927,10 +927,11 @@ void qmm_nax(
       M >= 33 && M <= 64 && db64_min_n > 0 &&
       (db64_mode == 1 || (db64_mode == -1 && N >= db64_min_n));
   // Codecs with a BK=128 lever on the BM=64 and BM=128 tiles walk K 128
-  // weights per step: the k-quant half loaders take one half super-block
-  // per tile, where a code byte that spans 128 weights is read once instead
-  // of on two or four tiles, and the pair loaders run two BK=64 loaders per
-  // tile. Bit-identical output. A 32-weight block codec needs K % 128 == 0.
+  // weights per step (q6_k, q5_k, q4_k and q3_k by default): the k-quant half
+  // loaders take one half super-block per tile, where a code byte that spans
+  // 128 weights is read once instead of on two or four tiles, and the pair
+  // loaders run two BK=64 loaders per tile. Bit-identical output. A 32-weight
+  // block codec needs K % 128 == 0.
   if (transpose && !use_db64 && bn == 64 && wm == 2 && wn == 2 &&
       (bm == 64 || bm == 128) && K % 128 == 0 && kq_nax_bk128_on(kquant_type)) {
     bk = 128;
