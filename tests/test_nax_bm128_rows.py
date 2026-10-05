@@ -130,6 +130,45 @@ def test_odd_rows_lever_keeps_first_read():
     assert [tile_of(_kernel(r)[0])[0] for r in res] == [64, 64]
 
 
+# K ceilings of the large-M rows (kq_largem_max_k): above it, from M 4096,
+# the BM=64 tile runs at either parity.
+MAX_K = {"q2_k": 4096, "q8_0": 10240, "q4_0": 10240, "stq1_0": 12288}
+
+
+@pytest.mark.parametrize("codec", sorted(MAX_K))
+def test_large_rows_k_ceiling(codec):
+    if not _nax_gpu():
+        pytest.skip("NAX tile policy")
+    top = MAX_K[codec]
+    calls = []
+    for k in (top, top + 2048):
+        for rows in (4096, 4128):
+            calls.append({"codec": codec, "shape": [1, rows, k], "n": 64})
+    # KQ_NAX_BM128_ODD_M=0 turns the large-M rows off: the parity rule
+    # runs BM=128 at an even ceil(M/64) at any K.
+    calls.append(
+        {
+            "codec": codec,
+            "shape": [1, 4096, top + 2048],
+            "n": 64,
+            "env": {"KQ_NAX_BM128_ODD_M": "0"},
+        }
+    )
+    res = run_probe(calls, env=LIVE)
+    got = [tile_of(_kernel(r)[0])[0] for r in res]
+    assert got == [128, 128, 64, 64, 128], got
+    for c, r in zip(calls, res, strict=True):
+        assert r["rel"] < R1["bfloat16"], (c, r["rel"])
+
+
+def test_large_rows_no_k_ceiling():
+    if not _nax_gpu():
+        pytest.skip("NAX tile policy")
+    calls = [{"codec": "q6_k", "shape": [1, 4128, 16384], "n": 64}]
+    res = run_probe(calls, env=LIVE)
+    assert tile_of(_kernel(res[0])[0])[0] == 128
+
+
 @pytest.mark.parametrize("codec", BM128_CODECS)
 def test_bm128_rows_known_answer(codec):
     nax = _nax_gpu()

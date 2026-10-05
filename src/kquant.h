@@ -48,8 +48,8 @@ int max_threadgroup_memory();
 int qmv_fine_max_n(const std::string& kquant_type);
 
 // The NAX qmm_t large-M row of a codec: bm, bn, wm, wn, swizzle_log, min_m,
-// min_n and inherited (1 when the row is its loader class's row); empty on
-// non-Metal builds.
+// min_n, max_k and inherited (1 when the tile and floor are its loader
+// class's); empty on non-Metal builds.
 std::vector<int> nax_large_row(const std::string& kquant_type);
 
 // Every kernel name the split-K dispatchers can build (qmm_splitk,

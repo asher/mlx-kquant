@@ -28,6 +28,14 @@ POLICY_LOG: dict[str, int] = {}
 # Codecs whose large-M row is measured; the rest take their loader class's
 # row, the same tile and floor today.
 MEASURED = {"q4_k", "q5_k", "q6_k", "q8_0"}
+# K ceiling of each row (kq_largem_max_k); codecs not listed have none.
+MAX_K = {
+    "q2_k": 4096, "pq2_0": 4096,
+    "q4_k": 10240, "q8_0": 10240, "q4_0": 10240, "q4_1": 10240,
+    "q5_0": 10240, "q5_1": 10240, "iq2_s": 10240, "iq2_xs": 10240,
+    "iq3_s": 10240,
+    "iq3_xxs": 12288, "iq4_nl": 12288, "stq1_0": 12288,
+}  # fmt: skip
 # A k-quant on K tiles of 64 and of 128, a flat block codec, IQ grid codecs
 # and a ternary codec.
 CODECS = ["q4_k", "q6_k", "q8_0", "q4_0", "iq2_xxs", "iq4_xs", "stq1_0"]
@@ -137,5 +145,5 @@ def test_large_row(codec):
     row = _nax_large_row(codec)
     if not row:
         pytest.skip("no Metal")
-    want = [128, 64, 2, 2, POLICY_LOG.get(codec, 0), 4096, 0]
+    want = [128, 64, 2, 2, POLICY_LOG.get(codec, 0), 4096, 0, MAX_K.get(codec, 0)]
     assert row == want + [int(codec not in MEASURED)]

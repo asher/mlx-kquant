@@ -38,6 +38,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   faster, with the same output.
 - On NAX GPUs (M5), `q5_k` and `q3_k` matmuls in prefill and image steps run
   up to 10% faster on most shapes, with the same output.
+- On NAX GPUs (M5), image-step matmuls of 4096 or more rows at a large K, such
+  as the Qwen-Image MLP down projection, run 2 to 10% faster on most codecs.
 - On NAX GPUs (M5), output heads and `q4_0` and `q8_0` float16 matmuls at 9 to
   32 rows, as in batched decode and speculative verify, run up to 30% faster.
 - On NAX GPUs (M5), batched gemma-4 decode of prompts of different lengths

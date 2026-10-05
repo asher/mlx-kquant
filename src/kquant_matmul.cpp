@@ -81,10 +81,12 @@ using mx::Stream;
 //   +13% (q5_k, q3_k) -- the k-quants, q8_0, and the cheap-loader IQs.
 // - 961: the flat quartet only wins the deepest bands (+1-7% at M1024)
 //   and loses or washes below.
-// Large-M row: the tile, the row-tile fold (swizzle_log, 0 = none) and the
+// Large-M row: the tile, the row-tile fold (swizzle_log, 0 = none), the
 // shape floor (M >= min_m at either ceil(M/64) parity, N >= min_n; min_m 0 =
-// never) of the image-generation band. A codec without measurements takes
-// the row of its loader class and is marked inherited.
+// never) and the K ceiling (max_k: above it the row runs BM=64; 0 = none)
+// of the image-generation band. A codec whose tile and floor are not
+// measured takes those of its loader class and is marked inherited; max_k
+// is measured for every codec with NAX kernels.
 struct KqLargeM {
   int bm;
   int bn;
@@ -93,6 +95,7 @@ struct KqLargeM {
   int swizzle_log;
   int min_m;
   int min_n;
+  int max_k;
   bool inherited;
 };
 struct KqSmallBmPolicy {
@@ -181,23 +184,45 @@ static KqLoaderClass kq_loader_class(const std::string& t) {
   return KqLoaderClass::grid;
 }
 
+// K above which BM=128 runs slower than BM=64 from M 4096, the largest K
+// before the first measured loss of more than 1% (geometric mean over M
+// 4128, 8256 and 16384 at N 4096, K 10240, 12288 and 16384; K 3840 and
+// 4096 win for every codec). 0: no loss up to K 16384. The BK=128 tiles
+// (q3_k, q5_k, q6_k) win at every K, and so do iq1_s, iq1_m, iq2_xxs,
+// iq4_xs and ptq1_0.
+static int kq_largem_max_k(const std::string& t) {
+  if (t == "q2_k" || t == "pq2_0") {
+    return 4096;
+  }
+  if (t == "q4_k" || t == "q8_0" || t == "q4_0" || t == "q4_1" || t == "q5_0" ||
+      t == "q5_1" || t == "iq2_s" || t == "iq2_xs" || t == "iq3_s") {
+    return 10240;
+  }
+  if (t == "iq3_xxs" || t == "iq4_nl" || t == "stq1_0") {
+    return 12288;
+  }
+  return 0;
+}
+
 // Measured on M5 Max with benchmarks/bench_dit_shapes.py at the DiT rows
-// (4096 to 33792). A row with inherited = true is its loader class's row.
-// Measured rows: BM=128 is faster than BM=64 at every odd-tile row from
-// 4096, and every row-tile fold is slower than none.
+// (4096 to 33792). A row with inherited = true takes its loader class's
+// tile and floor. Measured rows: BM=128 is faster than BM=64 at every
+// odd-tile row from 4096 up to the K ceiling, and every row-tile fold is
+// slower than none.
 static KqLargeM kq_largem_row(const std::string& t) {
+  const int max_k = kq_largem_max_k(t);
   if (t == "q4_k" || t == "q5_k" || t == "q6_k" || t == "q8_0") {
-    return {128, 64, 2, 2, 0, 4096, 0, false};
+    return {128, 64, 2, 2, 0, 4096, 0, max_k, false};
   }
   switch (kq_loader_class(t)) {
     case KqLoaderClass::kquant:
-      return {128, 64, 2, 2, 0, 4096, 0, true};
+      return {128, 64, 2, 2, 0, 4096, 0, max_k, true};
     case KqLoaderClass::flat:
-      return {128, 64, 2, 2, 0, 4096, 0, true};
+      return {128, 64, 2, 2, 0, 4096, 0, max_k, true};
     case KqLoaderClass::grid:
-      return {128, 64, 2, 2, 0, 4096, 0, true};
+      return {128, 64, 2, 2, 0, 4096, 0, max_k, true};
   }
-  return {128, 64, 2, 2, 0, 4096, 0, true};
+  return {128, 64, 2, 2, 0, 4096, 0, max_k, true};
 }
 
 // Shape-adjusted sub-13 route threshold. The table crossovers were tuned
@@ -825,8 +850,9 @@ void qmm_nax(
   // M65-128 wash band, symmetric with KQ_NAX_SMALL_BM=2), unset =
   // per-codec policy. The loss cells predate the row-live guard. From the
   // codec's large-M row (min_m, min_n) the row's tile runs at either
-  // parity; KQ_NAX_BM128_ODD_M replaces min_m, and 0 keeps the parity rule
-  // at every M.
+  // parity, and above the row's K ceiling the BM=64 tile runs instead;
+  // KQ_NAX_BM128_ODD_M replaces min_m, and 0 keeps the parity rule at
+  // every M.
   const int bm128_mode = kq_nax_bm128_mode();
   const KqSmallBmPolicy policy = kq_smallbm_policy(kquant_type);
   const KqLargeM& large = policy.large;
@@ -842,7 +868,7 @@ void qmm_nax(
     bm = 128;
   }
   if (large_rows) {
-    bm = large.bm;
+    bm = large.max_k > 0 && K > large.max_k ? 64 : large.bm;
     bn = large.bn;
     wm = large.wm;
     wn = large.wn;
@@ -3138,7 +3164,16 @@ int qmv_fine_max_n(const std::string& kquant_type) {
 // table, not KQ_DISABLE_NAX. Names repeat across routes.
 std::vector<int> nax_large_row(const std::string& kquant_type) {
   KqLargeM r = kq_largem_row(kquant_type);
-  return {r.bm, r.bn, r.wm, r.wn, r.swizzle_log, r.min_m, r.min_n, r.inherited};
+  return {
+      r.bm,
+      r.bn,
+      r.wm,
+      r.wn,
+      r.swizzle_log,
+      r.min_m,
+      r.min_n,
+      r.max_k,
+      r.inherited};
 }
 
 std::vector<std::string> split_kernel_names() {

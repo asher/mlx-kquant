@@ -327,21 +327,35 @@ Tuning levers (defaults are right for normal use):
   off.
 
 Large-M rows. On NAX GPUs a transpose call at M 4096 or more takes the codec's large-M row from
-`kq_largem_row` in `src/kquant_matmul.cpp`: the tile, the row-tile fold and the shape floor (M at
-or above min M at either ceil(M/64) parity, N at or above min N). A codec without measurements
-takes the row of its loader class (the 256-weight k-quant loaders, the 32-weight flat block
-loaders, or the IQ grid and ternary loaders) and is marked inherited. The measured rows come from
+`kq_largem_row` in `src/kquant_matmul.cpp`: the tile, the row-tile fold, the shape floor (M at or
+above min M at either ceil(M/64) parity, N at or above min N) and the K ceiling, above which the
+BM=64 tile runs at either parity. A codec whose tile and floor are not measured takes those of its
+loader class (the 256-weight k-quant loaders, the 32-weight flat block loaders, or the IQ grid and
+ternary loaders) and is marked inherited. The measured rows come from
 `benchmarks/bench_dit_shapes.py` on an M5 Max at the diffusion transformer rows (M 4096 to 33792
-at the Z-Image and Qwen-Image projection shapes). There the BM=128 tile takes 0.89-0.96x the
-BM=64 time at rows with an odd ceil(M/64), and per projection the median fold of 2 row tiles
-takes 1.00-1.26x the unfolded time, of 4 row tiles 1.03-1.58x.
+at the Z-Image and Qwen-Image projection shapes). There the BM=128 tile takes 0.85-0.99x the
+BM=64 time at rows with an odd ceil(M/64) up to the K ceiling, and 1.01-1.09x above it (`q4_k`
+and `q8_0` at K 12288), and per projection the median fold of 2 row tiles takes 1.00-1.26x the
+unfolded time, of 4 row tiles 1.03-1.58x.
 
-| Codecs | Tile (bm, bn, wm, wn) | Fold log | Min M | Min N | Row |
-|---|---|---|---|---|---|
-| `q4_k`, `q5_k`, `q6_k`, `q8_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | measured |
-| `q2_k`, `q3_k` | 128, 64, 2, 2 | 0 | 4096 | 0 | inherited, k-quant class |
-| `q4_0`, `q4_1`, `q5_0`, `q5_1`, `iq4_nl` | 128, 64, 2, 2 | 0 | 4096 | 0 | inherited, flat class |
-| the other codecs | 128, 64, 2, 2 | 0 | 4096 | 0 | inherited, grid class |
+The K ceiling is measured for every codec with NAX kernels at N 4096 and M 4128, 8256 and 16384:
+it is the largest K before the first K (of 10240, 12288 and 16384) where BM=128 takes more than
+1.01x the BM=64 time over the three M. Every codec wins at K 3840 and 4096. The tiles that walk K
+128 weights per step (`q3_k`, `q5_k`, `q6_k`) win at every K measured, while the flat block
+codecs `q4_0`, `q4_1`, `q5_0`, `q5_1` and `q8_0` lose 1.04-1.11x at K 12288 and 16384.
+
+| Codecs | Tile (bm, bn, wm, wn) | Fold log | Min M | Min N | Max K | Row |
+|---|---|---|---|---|---|---|
+| `q4_k`, `q8_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 10240 | measured |
+| `q5_k`, `q6_k` | 128, 64, 2, 2 | 0 | 4096 | 0 | none | measured |
+| `q2_k` | 128, 64, 2, 2 | 0 | 4096 | 0 | 4096 | inherited, k-quant class |
+| `q3_k` | 128, 64, 2, 2 | 0 | 4096 | 0 | none | inherited, k-quant class |
+| `q4_0`, `q4_1`, `q5_0`, `q5_1` | 128, 64, 2, 2 | 0 | 4096 | 0 | 10240 | inherited, flat class |
+| `iq4_nl` | 128, 64, 2, 2 | 0 | 4096 | 0 | 12288 | inherited, flat class |
+| `pq2_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 4096 | inherited, grid class |
+| `iq2_s`, `iq2_xs`, `iq3_s` | 128, 64, 2, 2 | 0 | 4096 | 0 | 10240 | inherited, grid class |
+| `iq3_xxs`, `stq1_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 12288 | inherited, grid class |
+| `iq1_s`, `iq1_m`, `iq2_xxs`, `iq4_xs`, `ptq1_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | none | inherited, grid class |
 
 `stq1_0` (structured-sparse ternary, llama.cpp PR #22836) ships the full ALU and NAX kernel set. Its
 pre-NAX floors are measured (M3 Max: plain split-K entry M 5), and so are its NAX small-M routes in

@@ -104,7 +104,8 @@ NB_MODULE(_ext, m) {
       &mlx_kquant::nax_large_row,
       "kquant_type"_a,
       "The codec's NAX qmm_t large-M row as [bm, bn, wm, wn, swizzle_log, "
-      "min_m, min_n, inherited], for the policy tests (empty without Metal).");
+      "min_m, min_n, max_k, inherited], for the policy tests (empty without "
+      "Metal).");
 
   m.def(
       "qmv_fine_max_n",
