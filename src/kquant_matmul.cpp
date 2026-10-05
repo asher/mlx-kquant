@@ -623,23 +623,45 @@ static int kq_nax_bm128_odd_m() {
   return kq_tune_live() ? kq_env_int("KQ_NAX_BM128_ODD_M", -1) : cached;
 }
 
-// KQ_NAX_<Q6K|Q5K|Q3K|Q4K>_BK128: K tile of the codec on the BM=64 and
-// BM=128 tiles, 1 = 128, 0 = 64, unset = the codec's default.
-static constexpr int kq_nax_bk128_codecs = 4;
+// KQ_NAX_<codec>_BK128 (KQ_NAX_Q6K_BK128, KQ_NAX_Q8_0_BK128,
+// KQ_NAX_IQ4_XS_BK128, ...): K tile of the codec on the BM=64 and BM=128
+// tiles, 1 = 128, 0 = 64, unset = the codec's default.
+struct KqBk128Lever {
+  const char* type;
+  const char* env;
+  int dflt;
+};
+static constexpr KqBk128Lever kq_nax_bk128_levers[] = {
+    {"q6_k", "KQ_NAX_Q6K_BK128", 1},
+    {"q5_k", "KQ_NAX_Q5K_BK128", 1},
+    {"q3_k", "KQ_NAX_Q3K_BK128", 1},
+    {"q4_k", "KQ_NAX_Q4K_BK128", 0},
+    {"q8_0", "KQ_NAX_Q8_0_BK128", 0},
+    {"q4_0", "KQ_NAX_Q4_0_BK128", 0},
+    {"q4_1", "KQ_NAX_Q4_1_BK128", 0},
+    {"q5_0", "KQ_NAX_Q5_0_BK128", 0},
+    {"q5_1", "KQ_NAX_Q5_1_BK128", 0},
+    {"iq4_nl", "KQ_NAX_IQ4_NL_BK128", 0},
+    {"iq4_xs", "KQ_NAX_IQ4_XS_BK128", 0},
+    {"iq3_xxs", "KQ_NAX_IQ3_XXS_BK128", 0},
+    {"iq3_s", "KQ_NAX_IQ3_S_BK128", 0},
+    {"iq2_xxs", "KQ_NAX_IQ2_XXS_BK128", 0},
+    {"iq2_xs", "KQ_NAX_IQ2_XS_BK128", 0},
+    {"iq2_s", "KQ_NAX_IQ2_S_BK128", 0},
+    {"iq1_s", "KQ_NAX_IQ1_S_BK128", 0},
+    {"iq1_m", "KQ_NAX_IQ1_M_BK128", 0},
+};
+static constexpr int kq_nax_bk128_codecs =
+    sizeof(kq_nax_bk128_levers) / sizeof(kq_nax_bk128_levers[0]);
 static int kq_nax_bk128_slot(const std::string& t) {
-  return t == "q6_k" ? 0
-      : t == "q5_k"  ? 1
-      : t == "q3_k"  ? 2
-      : t == "q4_k"  ? 3
-                     : -1;
+  for (int j = 0; j < kq_nax_bk128_codecs; j++) {
+    if (t == kq_nax_bk128_levers[j].type) {
+      return j;
+    }
+  }
+  return -1;
 }
 static bool kq_nax_bk128_on(const std::string& t) {
-  static constexpr const char* env[kq_nax_bk128_codecs] = {
-      "KQ_NAX_Q6K_BK128",
-      "KQ_NAX_Q5K_BK128",
-      "KQ_NAX_Q3K_BK128",
-      "KQ_NAX_Q4K_BK128"};
-  static constexpr int dflt[kq_nax_bk128_codecs] = {1, 1, 1, 0};
   const int i = kq_nax_bk128_slot(t);
   if (i < 0) {
     return false;
@@ -647,11 +669,13 @@ static bool kq_nax_bk128_on(const std::string& t) {
   static const std::array<bool, kq_nax_bk128_codecs> cached = [] {
     std::array<bool, kq_nax_bk128_codecs> a{};
     for (int j = 0; j < kq_nax_bk128_codecs; j++) {
-      a[j] = kq_env_flag(env[j], dflt[j]) != 0;
+      a[j] = kq_env_flag(
+                 kq_nax_bk128_levers[j].env, kq_nax_bk128_levers[j].dflt) != 0;
     }
     return a;
   }();
-  return kq_tune_live() ? kq_env_flag(env[i], dflt[i]) != 0 : cached[i];
+  const KqBk128Lever& l = kq_nax_bk128_levers[i];
+  return kq_tune_live() ? kq_env_flag(l.env, l.dflt) != 0 : cached[i];
 }
 
 // KQ_NAX_DB64: 0 = off, 1 = no N floor, unset (-1) = per-codec N floor.
@@ -902,12 +926,13 @@ void qmm_nax(
   bool use_db64 = transpose && bm == 64 && bn == 64 && wm == 2 && wn == 2 &&
       M >= 33 && M <= 64 && db64_min_n > 0 &&
       (db64_mode == 1 || (db64_mode == -1 && N >= db64_min_n));
-  // q6_k, q5_k and q3_k on the BM=64 and BM=128 tiles walk K 128 weights
-  // per step, one half super-block per tile (the half loaders), where a code
-  // byte that spans 128 weights is read once instead of on two or four
-  // tiles. Bit-identical output.
+  // Codecs with a BK=128 lever on the BM=64 and BM=128 tiles walk K 128
+  // weights per step: the k-quant half loaders take one half super-block
+  // per tile, where a code byte that spans 128 weights is read once instead
+  // of on two or four tiles, and the pair loaders run two BK=64 loaders per
+  // tile. Bit-identical output. A 32-weight block codec needs K % 128 == 0.
   if (transpose && !use_db64 && bn == 64 && wm == 2 && wn == 2 &&
-      (bm == 64 || bm == 128) && kq_nax_bk128_on(kquant_type)) {
+      (bm == 64 || bm == 128) && K % 128 == 0 && kq_nax_bk128_on(kquant_type)) {
     bk = 128;
   }
   MTL::Size group_dims(32, wn, wm);

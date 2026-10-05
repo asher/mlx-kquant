@@ -274,6 +274,12 @@ def test_tile_names_match_known_patterns():
         assert not bad, bad[:5]
 
 
+def _bk128_lever(codec):
+    if codec.endswith("_k"):
+        return "KQ_NAX_" + codec.replace("_", "").upper() + "_BK128"
+    return "KQ_NAX_" + codec.upper() + "_BK128"
+
+
 def _selectable(codec):
     """Calls that dispatch every qmm_t tile kernel of `codec` an override can
     select: half and bfloat activations, unbatched (the op flattens a batch
@@ -299,9 +305,7 @@ def _selectable(codec):
                 env = {
                     "KQ_NAX_TILE": tile,
                     "KQ_NAX_DB64": "1" if db else "0",
-                    "KQ_NAX_" + codec.replace("_", "").upper() + "_BK128": (
-                        "1" if m["bk"] == "128" else "0"
-                    ),
+                    _bk128_lever(codec): "1" if m["bk"] == "128" else "0",
                     "KQ_QMM_MIDM": "0",
                     "KQ_DISABLE_NAX": None,
                     "KQ_QMM_TILE": None,

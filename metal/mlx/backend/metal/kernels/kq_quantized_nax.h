@@ -4047,7 +4047,84 @@ KQ_NAX_DEFINE_KERNELS(q6_k, 256, 6, KqNaxQ6_KBlockLoader)
 KQ_NAX_DEFINE_KERNELS(q3_k, 256, 3, KqNaxQ3_KBlockLoader)
 KQ_NAX_DEFINE_KERNELS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
 
-// qmm_t on a K tile of 128 with a half-super-block loader (one Ws buffer).
+// BK=128 tile from two BK=64 loaders of a db_safe codec: lo fills K columns
+// 0-63 of the tile and hi columns 64-127, one BK=64 position apart, and
+// next() moves both two positions. The tile holds the same weights as two
+// BK=64 tiles, so the output is bit-identical. Half the barriers and loop
+// steps of BK=64 per K.
+template <typename T, short BCOLS, short reduction_dim, typename Half>
+struct KqNaxPairLoader {
+  static_assert(BCOLS == 128, "pair loader requires BCOLS == 128.");
+  static_assert(reduction_dim == 1, "pair loader serves qmm_t only.");
+  static_assert(Half::db_safe, "pair loader requires a db_safe loader.");
+  MLX_MTL_CONST int weights_per_block = Half::weights_per_block;
+  MLX_MTL_CONST int bytes_per_block = Half::bytes_per_block;
+  MLX_MTL_CONST bool db_safe = true;
+
+  Half lo;
+  Half hi;
+
+  KqNaxPairLoader(
+      const device uint8_t* src,
+      const int src_ld,
+      threadgroup T* dst,
+      ushort simd_group_id,
+      ushort simd_lane_id) thread
+      : lo(src, src_ld, dst, simd_group_id, simd_lane_id),
+        hi(src, src_ld, dst + 64, simd_group_id, simd_lane_id) {
+    hi.next();
+  }
+
+  void load_unsafe() const thread {
+    lo.load_unsafe();
+    hi.load_unsafe();
+  }
+
+  void load_safe(short2 src_tile_dim) const thread {
+    lo.load_safe(src_tile_dim);
+    hi.load_safe(src_tile_dim);
+  }
+
+  void next() thread {
+    lo.next();
+    lo.next();
+    hi.next();
+    hi.next();
+  }
+};
+
+#define KQ_NAX_DEFINE_PAIR_LOADER(NAME, HALF) \
+  template <                                  \
+      typename T,                             \
+      short BROWS,                            \
+      short BCOLS,                            \
+      short dst_ld,                           \
+      short reduction_dim,                    \
+      short tgp_size>                         \
+  using NAME = KqNaxPairLoader<               \
+      T,                                      \
+      BCOLS,                                  \
+      reduction_dim,                          \
+      HALF<T, BROWS, BCOLS / 2, dst_ld, reduction_dim, tgp_size>>;
+
+KQ_NAX_DEFINE_PAIR_LOADER(KqNaxQ8_0PairLoader, KqNaxQ8_0BlockLoader)
+KQ_NAX_DEFINE_PAIR_LOADER(KqNaxQ4_0PairLoader, KqNaxQ4_0BlockLoader)
+KQ_NAX_DEFINE_PAIR_LOADER(KqNaxQ4_1PairLoader, KqNaxQ4_1BlockLoader)
+KQ_NAX_DEFINE_PAIR_LOADER(KqNaxQ5_0PairLoader, KqNaxQ5_0BlockLoader)
+KQ_NAX_DEFINE_PAIR_LOADER(KqNaxQ5_1PairLoader, KqNaxQ5_1BlockLoader)
+KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq4_nlPairLoader, KqNaxIq4_nlBlockLoader)
+KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq4_xsPairLoader, KqNaxIq4_xsBlockLoader)
+KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq3_xxsPairLoader, KqNaxIq3_xxsBlockLoader)
+KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq3_sPairLoader, KqNaxIq3_sBlockLoader)
+KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq2_xxsPairLoader, KqNaxIq2_xxsBlockLoader)
+KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq2_xsPairLoader, KqNaxIq2_xsBlockLoader)
+KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq2_sPairLoader, KqNaxIq2_sBlockLoader)
+KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq1_sPairLoader, KqNaxIq1_sBlockLoader)
+KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq1_mPairLoader, KqNaxIq1_mBlockLoader)
+#undef KQ_NAX_DEFINE_PAIR_LOADER
+
+// qmm_t on a K tile of 128 with a half-super-block or pair loader (one Ws
+// buffer).
 // The MMA walks K in the same 32-wide steps as on BK=64, so the output is
 // bit-identical to the BK=64 kernel of the same tile.
 #define KQ_NAX_DEFINE_BK128_KERNEL(codec, GROUP_CONST, bits_val, LOADER) \
@@ -4119,6 +4196,20 @@ KQ_NAX_DEFINE_BK128_KERNEL(q6_k, 256, 6, KqNaxQ6_KHalfLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q5_k, 256, 5, KqNaxQ5_KHalfLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q3_k, 256, 3, KqNaxQ3_KHalfLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q4_k, 256, 4, KqNaxQ4_KHalfLoader)
+KQ_NAX_DEFINE_BK128_KERNEL(q8_0, 32, 8, KqNaxQ8_0PairLoader)
+KQ_NAX_DEFINE_BK128_KERNEL(q4_0, 32, 4, KqNaxQ4_0PairLoader)
+KQ_NAX_DEFINE_BK128_KERNEL(q4_1, 32, 4, KqNaxQ4_1PairLoader)
+KQ_NAX_DEFINE_BK128_KERNEL(q5_0, 32, 5, KqNaxQ5_0PairLoader)
+KQ_NAX_DEFINE_BK128_KERNEL(q5_1, 32, 5, KqNaxQ5_1PairLoader)
+KQ_NAX_DEFINE_BK128_KERNEL(iq4_nl, 32, 4, KqNaxIq4_nlPairLoader)
+KQ_NAX_DEFINE_BK128_KERNEL(iq4_xs, 256, 4, KqNaxIq4_xsPairLoader)
+KQ_NAX_DEFINE_BK128_KERNEL(iq3_xxs, 256, 3, KqNaxIq3_xxsPairLoader)
+KQ_NAX_DEFINE_BK128_KERNEL(iq3_s, 256, 3, KqNaxIq3_sPairLoader)
+KQ_NAX_DEFINE_BK128_KERNEL(iq2_xxs, 256, 2, KqNaxIq2_xxsPairLoader)
+KQ_NAX_DEFINE_BK128_KERNEL(iq2_xs, 256, 2, KqNaxIq2_xsPairLoader)
+KQ_NAX_DEFINE_BK128_KERNEL(iq2_s, 256, 2, KqNaxIq2_sPairLoader)
+KQ_NAX_DEFINE_BK128_KERNEL(iq1_s, 256, 1, KqNaxIq1_sPairLoader)
+KQ_NAX_DEFINE_BK128_KERNEL(iq1_m, 256, 1, KqNaxIq1_mPairLoader)
 #undef KQ_NAX_DEFINE_BK128_KERNEL
 
 // Split-K qmm_t on the NAX tile (KQ_QMM_SPLITK_NAX):

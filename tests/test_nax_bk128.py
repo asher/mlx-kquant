@@ -1,18 +1,20 @@
-"""K-quant NAX qmm_t on a K tile of 128 (the half super-block loaders).
+"""NAX qmm_t on a K tile of 128 (the half super-block and pair loaders).
 
 On NAX GPUs the BM=64 and BM=128 tiles of q6_k, q5_k and q3_k dispatch the
 ``_bk128`` kernels by default, the codec's ``KQ_NAX_<codec>_BK128=0`` keeps
-the ``_bk64`` ones, and the two give bit-identical outputs. q4_k carries the
-``_bk128`` kernels behind ``KQ_NAX_Q4K_BK128=1``. The BM=32 tile
-and the ``_db`` variant keep BK=64. Each case runs in a fresh interpreter
-(tests/qmm_probe.py) and checks the result against float64 with exact
-kq.dequantize weights, on the CPU stream too, where the lever leaves the
-result alone.
+the ``_bk64`` ones, and the two give bit-identical outputs. q4_k and the
+32-weight block and IQ codecs carry the ``_bk128`` kernels behind
+``KQ_NAX_<codec>_BK128=1``, and a 32-weight block codec takes them only at
+K % 128 == 0. The BM=32 tile and the ``_db`` variant keep BK=64. Each
+case runs in a fresh interpreter (tests/qmm_probe.py) and checks the result
+against float64 with exact kq.dequantize weights, on the CPU stream too,
+where the lever leaves the result alone.
 """
 
 from __future__ import annotations
 
 import pytest
+from kqref import is_synth
 from qmm_probe import force_cpu, run_probe, tile_of
 
 import mlx_kquant as kq
@@ -22,14 +24,43 @@ LIVE = {"KQ_TUNE_LIVE": "1", "KQ_QMM_LOG": "1"}
 # Three super-blocks, so the loader walks two halves per block across
 # block boundaries.
 K = 768
-CODECS = {"q6_k": 6, "q5_k": 5, "q3_k": 3, "q4_k": 4}
+# codec: (group size, bits)
+CODECS = {
+    "q6_k": (256, 6),
+    "q5_k": (256, 5),
+    "q3_k": (256, 3),
+    "q4_k": (256, 4),
+    "q8_0": (32, 8),
+    "q4_0": (32, 4),
+    "q4_1": (32, 4),
+    "q5_0": (32, 5),
+    "q5_1": (32, 5),
+    "iq4_nl": (32, 4),
+    "iq4_xs": (256, 4),
+    "iq3_xxs": (256, 3),
+    "iq3_s": (256, 3),
+    "iq2_xxs": (256, 2),
+    "iq2_xs": (256, 2),
+    "iq2_s": (256, 2),
+    "iq1_s": (256, 1),
+    "iq1_m": (256, 1),
+}
 # Codecs whose BM=64 and BM=128 tiles take the K tile of 128 unless the
 # lever is 0.
 DEFAULT_ON = {"q6_k", "q5_k", "q3_k"}
+# Codecs without a BM=32 tile, whose M 16 runs the BM=64 one.
+NO_BM32 = {"iq2_xs", "iq2_s", "iq1_m"}
 
 
 def _lever(codec):
-    return "KQ_NAX_" + codec.replace("_", "").upper() + "_BK128"
+    if codec.endswith("_k"):
+        return "KQ_NAX_" + codec.replace("_", "").upper() + "_BK128"
+    return "KQ_NAX_" + codec.upper() + "_BK128"
+
+
+def _designs(codec):
+    # "lead" quantizes real values, which the synthetic-wire codecs skip.
+    return ("normal",) if is_synth(codec) else ("normal", "lead")
 
 
 def _nax_gpu():
@@ -53,16 +84,16 @@ def test_bk128_kernels_in_metallib():
     if not names:
         pytest.skip("no metallib loaded")
     # Every qmm_t tile kernel on a K tile of 128, of any codec, so the other
-    # K-quants carry none.
+    # codecs carry none.
     got = sorted(
         n
         for n in names
         if n.startswith("kquant_") and "_qmm_t_nax_" in n and "_bk128_" in n
     )
     want = sorted(
-        f"kquant_{c}_qmm_t_nax_{t}_gs_256_b_{b}_bm{bm}_bn64_bk128_wm2_wn2"
+        f"kquant_{c}_qmm_t_nax_{t}_gs_{gs}_b_{b}_bm{bm}_bn64_bk128_wm2_wn2"
         f"_alN_{al}_batch_{bt}"
-        for c, b in CODECS.items()
+        for c, (gs, b) in CODECS.items()
         for t in ("float16_t", "bfloat16_t")
         for bm in (64, 128)
         for al in ("true", "false")
@@ -93,7 +124,12 @@ def test_bk128_dispatch(codec):
         (dict(base, shape=[80, K]), 64, 128, False),
         (dict(base, shape=[48, K]), 64, 128, False),
         # KQ_QMM_ROUTE=nax sends M 16 to the BM=32 tile.
-        (dict(base, shape=[16, K], env={"KQ_QMM_ROUTE": "nax"}), 32, 64, False),
+        (
+            dict(base, shape=[16, K], env={"KQ_QMM_ROUTE": "nax"}),
+            64 if codec in NO_BM32 else 32,
+            128 if codec in NO_BM32 else 64,
+            False,
+        ),
         (
             dict(
                 base,
@@ -165,7 +201,7 @@ def test_bk128_bit_identical(codec, dtype):
     lever = _lever(codec)
     calls = []
     for shape, n in SHAPES:
-        for design in ("normal", "lead"):
+        for design in _designs(codec):
             base = len(calls)
             call = {
                 "codec": codec,
@@ -221,3 +257,22 @@ def test_bk128_rows_above_int16(codec):
         if c.get("ulp_vs") is not None:
             assert r["ulp"] == 0, (c, r["ulp"])
             assert r["digest"] == res[c["ulp_vs"]]["digest"], c
+
+
+@pytest.mark.parametrize(
+    "codec", sorted(c for c, (gs, _) in CODECS.items() if gs == 32)
+)
+def test_bk128_k_multiple_of_128(codec):
+    # A 32-weight block codec takes the K tile of 128 at K 896 and keeps
+    # BK=64 at K 704, a multiple of 64 and not of 128.
+    nax = _nax_gpu()
+    lever = _lever(codec)
+    calls = [
+        {"codec": codec, "shape": [4096, k], "n": 128, "seed": k} for k in (896, 704)
+    ]
+    res = run_probe(calls, env=dict(LIVE, **{lever: "1"}))
+    for c, r, bk in zip(calls, res, (128, 64), strict=True):
+        assert r["error"] is None, (c, r["error"])
+        assert r["rel"] < R1["bfloat16"], (c, r["rel"])
+        if nax:
+            assert _bk(_kernel(r)[0]) == bk, c
