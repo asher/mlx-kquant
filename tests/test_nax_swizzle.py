@@ -32,9 +32,8 @@ MEASURED = {"q4_k", "q5_k", "q6_k", "q8_0"}
 MAX_K = {
     "q2_k": 4096, "pq2_0": 4096,
     "q4_k": 10240, "q8_0": 10240, "q4_0": 10240, "q4_1": 10240,
-    "q5_0": 10240, "q5_1": 10240, "iq2_s": 10240, "iq2_xs": 10240,
-    "iq3_s": 10240,
-    "iq3_xxs": 12288, "iq4_nl": 12288, "stq1_0": 12288,
+    "q5_0": 10240, "q5_1": 10240,
+    "iq4_nl": 12288, "stq1_0": 12288,
 }  # fmt: skip
 # A k-quant on K tiles of 64 and of 128, a flat block codec, IQ grid codecs
 # and a ternary codec.

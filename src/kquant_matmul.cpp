@@ -187,18 +187,19 @@ static KqLoaderClass kq_loader_class(const std::string& t) {
 // K above which BM=128 runs slower than BM=64 from M 4096, the largest K
 // before the first measured loss of more than 1% (geometric mean over M
 // 4128, 8256 and 16384 at N 4096, K 10240, 12288 and 16384; K 3840 and
-// 4096 win for every codec). 0: no loss up to K 16384. The BK=128 tiles
-// (q3_k, q5_k, q6_k) win at every K, and so do iq1_s, iq1_m, iq2_xxs,
-// iq4_xs and ptq1_0.
+// 4096 win for every codec). 0: no loss up to K 16384. On the BK=128 tiles
+// q3_k, q5_k, q6_k, iq2_s, iq2_xs, iq3_s and iq3_xxs win at every K, and so
+// do iq1_s, iq1_m, iq2_xxs, iq4_xs and ptq1_0 on BK=64. A ceiling holds for
+// the codec's default K tile.
 static int kq_largem_max_k(const std::string& t) {
   if (t == "q2_k" || t == "pq2_0") {
     return 4096;
   }
   if (t == "q4_k" || t == "q8_0" || t == "q4_0" || t == "q4_1" || t == "q5_0" ||
-      t == "q5_1" || t == "iq2_s" || t == "iq2_xs" || t == "iq3_s") {
+      t == "q5_1") {
     return 10240;
   }
-  if (t == "iq3_xxs" || t == "iq4_nl" || t == "stq1_0") {
+  if (t == "iq4_nl" || t == "stq1_0") {
     return 12288;
   }
   return 0;
@@ -623,9 +624,11 @@ static int kq_nax_bm128_odd_m() {
   return kq_tune_live() ? kq_env_int("KQ_NAX_BM128_ODD_M", -1) : cached;
 }
 
-// KQ_NAX_<codec>_BK128 (KQ_NAX_Q6K_BK128, KQ_NAX_Q8_0_BK128,
-// KQ_NAX_IQ4_XS_BK128, ...): K tile of the codec on the BM=64 and BM=128
-// tiles, 1 = 128, 0 = 64, unset = the codec's default.
+// KQ_NAX_<codec>_BK128 (KQ_NAX_Q6K_BK128, KQ_NAX_Q4_0_BK128,
+// KQ_NAX_IQ3_S_BK128, ...): K tile of the codec on the BM=64 and BM=128
+// tiles, 1 = 128, 0 = 64, unset = the codec's default. Codecs not listed
+// keep BK=64: q8_0, q5_1, iq4_xs, iq2_xxs, iq1_s and iq1_m measured slower
+// on BK=128 at diffusion model rows.
 struct KqBk128Lever {
   const char* type;
   const char* env;
@@ -636,20 +639,14 @@ static constexpr KqBk128Lever kq_nax_bk128_levers[] = {
     {"q5_k", "KQ_NAX_Q5K_BK128", 1},
     {"q3_k", "KQ_NAX_Q3K_BK128", 1},
     {"q4_k", "KQ_NAX_Q4K_BK128", 1},
-    {"q8_0", "KQ_NAX_Q8_0_BK128", 0},
-    {"q4_0", "KQ_NAX_Q4_0_BK128", 0},
-    {"q4_1", "KQ_NAX_Q4_1_BK128", 0},
-    {"q5_0", "KQ_NAX_Q5_0_BK128", 0},
-    {"q5_1", "KQ_NAX_Q5_1_BK128", 0},
-    {"iq4_nl", "KQ_NAX_IQ4_NL_BK128", 0},
-    {"iq4_xs", "KQ_NAX_IQ4_XS_BK128", 0},
-    {"iq3_xxs", "KQ_NAX_IQ3_XXS_BK128", 0},
-    {"iq3_s", "KQ_NAX_IQ3_S_BK128", 0},
-    {"iq2_xxs", "KQ_NAX_IQ2_XXS_BK128", 0},
-    {"iq2_xs", "KQ_NAX_IQ2_XS_BK128", 0},
-    {"iq2_s", "KQ_NAX_IQ2_S_BK128", 0},
-    {"iq1_s", "KQ_NAX_IQ1_S_BK128", 0},
-    {"iq1_m", "KQ_NAX_IQ1_M_BK128", 0},
+    {"q4_0", "KQ_NAX_Q4_0_BK128", 1},
+    {"q4_1", "KQ_NAX_Q4_1_BK128", 1},
+    {"q5_0", "KQ_NAX_Q5_0_BK128", 1},
+    {"iq4_nl", "KQ_NAX_IQ4_NL_BK128", 1},
+    {"iq3_xxs", "KQ_NAX_IQ3_XXS_BK128", 1},
+    {"iq3_s", "KQ_NAX_IQ3_S_BK128", 1},
+    {"iq2_xs", "KQ_NAX_IQ2_XS_BK128", 1},
+    {"iq2_s", "KQ_NAX_IQ2_S_BK128", 1},
 };
 static constexpr int kq_nax_bk128_codecs =
     sizeof(kq_nax_bk128_levers) / sizeof(kq_nax_bk128_levers[0]);
@@ -927,11 +924,10 @@ void qmm_nax(
       M >= 33 && M <= 64 && db64_min_n > 0 &&
       (db64_mode == 1 || (db64_mode == -1 && N >= db64_min_n));
   // Codecs with a BK=128 lever on the BM=64 and BM=128 tiles walk K 128
-  // weights per step (q6_k, q5_k, q4_k and q3_k by default): the k-quant half
-  // loaders take one half super-block per tile, where a code byte that spans
-  // 128 weights is read once instead of on two or four tiles, and the pair
-  // loaders run two BK=64 loaders per tile. Bit-identical output. A 32-weight
-  // block codec needs K % 128 == 0.
+  // weights per step: the k-quant half loaders take one half super-block per
+  // tile, where a code byte that spans 128 weights is read once instead of on
+  // two or four tiles, and the pair loaders run two BK=64 loaders per tile.
+  // Bit-identical output. A 32-weight block codec needs K % 128 == 0.
   if (transpose && !use_db64 && bn == 64 && wm == 2 && wn == 2 &&
       (bm == 64 || bm == 128) && K % 128 == 0 && kq_nax_bk128_on(kquant_type)) {
     bk = 128;

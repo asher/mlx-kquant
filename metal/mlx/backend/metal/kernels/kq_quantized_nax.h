@@ -4107,20 +4107,14 @@ struct KqNaxPairLoader {
       reduction_dim,                          \
       HALF<T, BROWS, BCOLS / 2, dst_ld, reduction_dim, tgp_size>>;
 
-KQ_NAX_DEFINE_PAIR_LOADER(KqNaxQ8_0PairLoader, KqNaxQ8_0BlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxQ4_0PairLoader, KqNaxQ4_0BlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxQ4_1PairLoader, KqNaxQ4_1BlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxQ5_0PairLoader, KqNaxQ5_0BlockLoader)
-KQ_NAX_DEFINE_PAIR_LOADER(KqNaxQ5_1PairLoader, KqNaxQ5_1BlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq4_nlPairLoader, KqNaxIq4_nlBlockLoader)
-KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq4_xsPairLoader, KqNaxIq4_xsBlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq3_xxsPairLoader, KqNaxIq3_xxsBlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq3_sPairLoader, KqNaxIq3_sBlockLoader)
-KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq2_xxsPairLoader, KqNaxIq2_xxsBlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq2_xsPairLoader, KqNaxIq2_xsBlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq2_sPairLoader, KqNaxIq2_sBlockLoader)
-KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq1_sPairLoader, KqNaxIq1_sBlockLoader)
-KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq1_mPairLoader, KqNaxIq1_mBlockLoader)
 #undef KQ_NAX_DEFINE_PAIR_LOADER
 
 // qmm_t on a K tile of 128 with a half-super-block or pair loader (one Ws
@@ -4196,20 +4190,14 @@ KQ_NAX_DEFINE_BK128_KERNEL(q6_k, 256, 6, KqNaxQ6_KHalfLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q5_k, 256, 5, KqNaxQ5_KHalfLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q3_k, 256, 3, KqNaxQ3_KHalfLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q4_k, 256, 4, KqNaxQ4_KHalfLoader)
-KQ_NAX_DEFINE_BK128_KERNEL(q8_0, 32, 8, KqNaxQ8_0PairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q4_0, 32, 4, KqNaxQ4_0PairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q4_1, 32, 4, KqNaxQ4_1PairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q5_0, 32, 5, KqNaxQ5_0PairLoader)
-KQ_NAX_DEFINE_BK128_KERNEL(q5_1, 32, 5, KqNaxQ5_1PairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(iq4_nl, 32, 4, KqNaxIq4_nlPairLoader)
-KQ_NAX_DEFINE_BK128_KERNEL(iq4_xs, 256, 4, KqNaxIq4_xsPairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(iq3_xxs, 256, 3, KqNaxIq3_xxsPairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(iq3_s, 256, 3, KqNaxIq3_sPairLoader)
-KQ_NAX_DEFINE_BK128_KERNEL(iq2_xxs, 256, 2, KqNaxIq2_xxsPairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(iq2_xs, 256, 2, KqNaxIq2_xsPairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(iq2_s, 256, 2, KqNaxIq2_sPairLoader)
-KQ_NAX_DEFINE_BK128_KERNEL(iq1_s, 256, 1, KqNaxIq1_sPairLoader)
-KQ_NAX_DEFINE_BK128_KERNEL(iq1_m, 256, 1, KqNaxIq1_mPairLoader)
 #undef KQ_NAX_DEFINE_BK128_KERNEL
 
 // Split-K qmm_t on the NAX tile (KQ_QMM_SPLITK_NAX):

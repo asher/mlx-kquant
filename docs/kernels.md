@@ -63,8 +63,9 @@ output width N. Per-row qmv serves M 2 up to a per-codec limit, the mat-vec path
 from a per-codec entry through M 32. From M 33 to 128, split-K also takes the calls where the
 BM=64 grid wastes the GPU, as described below. Elsewhere above M 32 the BM=64 tile runs, with a
 double-buffered `_db` variant on the M 33-64 band at large N, and a BM=128 tile from M 193 when
-ceil(M/64) is even. `q6_k`, `q5_k`, `q4_k` and `q3_k` run the BM=64 and BM=128 tiles on a K tile
-of 128 (`KQ_NAX_Q6K_BK128`, `KQ_NAX_Q5K_BK128`, `KQ_NAX_Q4K_BK128`, `KQ_NAX_Q3K_BK128`). Above
+ceil(M/64) is even. The k-quants `q3_k` to `q6_k`, the flat block codecs `q4_0`, `q4_1` and `q5_0`,
+and `iq4_nl`, `iq3_xxs`, `iq3_s`, `iq2_xs` and `iq2_s` run the BM=64 and BM=128 tiles on a K tile
+of 128 (the `_BK128` levers). Above
 the qmv limit, the verify kernels take the widths through M 8 on the codecs that have them. The
 NAX verify kernel serves `pq2_0`, `q4_0`, `q8_0` and `q2_k` to `q6_k` from a per-codec entry,
 and the register-resident MMA verify kernel serves `ptq1_0`, as described at the end of this
@@ -221,20 +222,27 @@ Tuning levers (defaults are right for normal use):
   per-codec N floors. Only the five policy-enabled codecs (q6_k, q8_0, q4_1, q5_1, q5_0) carry
   `_db` instantiations, so `1` is bounded by availability; probing another codec needs its
   instantiation restored and a metallib rebuild. Read once per process unless `KQ_TUNE_LIVE=1`.
-- `KQ_NAX_Q6K_BK128`, `KQ_NAX_Q5K_BK128`, `KQ_NAX_Q4K_BK128`, `KQ_NAX_Q3K_BK128` - K tile of `q6_k`,
-  `q5_k`, `q4_k` and `q3_k` on the BM=64 and BM=128 tiles. Unset or `1`, the tile walks K 128
-  weights per step, one half of a super-block per step, and each thread reads its code bytes once,
-  where BK=64 reads them on two or four steps. The output is bit-identical. On an M5 Max, per cell
-  against BK=64 on bfloat16 and float16 activations, on the BM=128 tile at diffusion model shapes (M
-  4096 and 4608, N and K 3840 to 24576): `q6_k` 0.87-0.96x the time, `q5_k` 0.93-1.00x, `q3_k`
-  0.92-1.03x. On the BM=64 tile from M 128 to 2112 at N and K 3840 to 17408: `q6_k` 0.79-1.01x,
-  `q5_k` 0.89-1.00x, `q3_k` 0.88-1.00x, except on grids of 240 threadgroups (N 5120 at M 160 and
-  192), where `q5_k` takes 1.06-1.17x and `q3_k` 1.01-1.06x, and of 480 (N 10240 at M 160 and 192),
-  where `q5_k` takes 1.02-1.06x. No threshold on threadgroups per core, K or M removes these at a
-  lower total time. `q4_k` at the diffusion model rows (M 4128 to 16896 at N and K 3840 to 12288)
-  takes 0.95-1.00x on bfloat16 and 0.96-1.00x on float16, against an A/A spread of 0.98-1.02x. `0`
-  keeps BK=64. The BM=32 tile and the `_db` variant keep BK=64. Read once per process unless
-  `KQ_TUNE_LIVE=1`.
+- `KQ_NAX_<codec>_BK128` (`KQ_NAX_Q6K_BK128`, `KQ_NAX_Q5K_BK128`, `KQ_NAX_Q4K_BK128`,
+  `KQ_NAX_Q3K_BK128`, `KQ_NAX_Q4_0_BK128`, `KQ_NAX_Q4_1_BK128`, `KQ_NAX_Q5_0_BK128`,
+  `KQ_NAX_IQ4_NL_BK128`, `KQ_NAX_IQ3_XXS_BK128`, `KQ_NAX_IQ3_S_BK128`, `KQ_NAX_IQ2_XS_BK128`,
+  `KQ_NAX_IQ2_S_BK128`) - K tile of the codec on the BM=64 and BM=128 tiles. Unset or `1`, the tile
+  walks K 128 weights per step. On the k-quants it takes one half of a super-block per step, and
+  each thread reads its code bytes once, where BK=64 reads them on two or four steps. On the other
+  codecs two BK=64 loaders fill the tile, which halves the barriers per K, and a 32-weight block
+  codec needs K % 128 == 0. The output is bit-identical. On an M5 Max, per cell against BK=64 on
+  bfloat16 and float16 activations, on the BM=128 tile at diffusion model shapes (M 4096 and 4608, N
+  and K 3840 to 24576): `q6_k` 0.87-0.96x the time, `q5_k` 0.93-1.00x, `q3_k` 0.92-1.03x. On the
+  BM=64 tile from M 128 to 2112 at N and K 3840 to 17408: `q6_k` 0.79-1.01x, `q5_k` 0.89-1.00x,
+  `q3_k` 0.88-1.00x, except on grids of 240 threadgroups (N 5120 at M 160 and 192), where `q5_k`
+  takes 1.06-1.17x and `q3_k` 1.01-1.06x, and of 480 (N 10240 at M 160 and 192), where `q5_k` takes
+  1.02-1.06x. No threshold on threadgroups per core, K or M removes these at a lower total time. At
+  the diffusion model rows (M 4128 to 16896 at N and K 3840 to 12288, bfloat16 and float16, with the
+  K ceilings below), against an A/A spread of 0.98-1.03x: `q4_k` 0.95-1.00x, `q4_0` 0.97-1.01x,
+  `q4_1` 0.97-1.03x, `q5_0` 0.96-1.01x, `iq4_nl` 0.93-1.00x, `iq3_xxs` 0.93-1.02x, `iq3_s`
+  0.92-1.03x, `iq2_xs` and `iq2_s` 0.95-1.01x. `q8_0`, `q5_1`, `iq4_xs`, `iq1_m` and `iq1_s` took
+  1.01-1.06x at some of those cells and `iq2_xxs` 1.04-1.07x at all of them, so they keep BK=64 and
+  carry no `_bk128` kernels. `0` keeps BK=64. The BM=32 tile and the `_db` variant keep BK=64. Read
+  once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_FORCE_QMM_MIN_M` - probe lever: routes transpose shapes with M at or above the value straight
   to the NAX qmm, bypassing the mat-vec route claims, for crossover measurement below M 13. Unset
   (off) by default.
@@ -344,9 +352,13 @@ unfolded time, of 4 row tiles 1.03-1.58x.
 
 The K ceiling is measured for every codec with NAX kernels at N 4096 and M 4128, 8256 and 16384:
 it is the largest K before the first K (of 10240, 12288 and 16384) where BM=128 takes more than
-1.01x the BM=64 time over the three M. Every codec wins at K 3840 and 4096. The tiles that walk K
-128 weights per step (`q3_k`, `q5_k`, `q6_k`) win at every K measured, while the flat block
-codecs `q4_0`, `q4_1`, `q5_0`, `q5_1` and `q8_0` lose 1.04-1.11x at K 12288 and 16384.
+1.01x the BM=64 time over the three M, measured on the codec's default K tile. Every codec wins at
+K 3840 and 4096. On the K tile of 128, `q3_k`, `q5_k`, `q6_k`, `iq3_xxs`, `iq3_s`, `iq2_xs` and
+`iq2_s` win at every K measured (`iq3_s` 0.91-0.94x, the other IQ codecs 0.93-1.00x), while the
+flat block codecs lose at K 12288 and 16384: `q4_0` and `q4_1` 1.02-1.06x on the K tile of 128,
+`q5_1` and `q8_0` 1.04-1.11x on 64. A ceiling moves only where the new tile takes at most the old
+time at every M measured: on the K tile of 128 at K 12288, `q4_k` and `q5_0` take 1.00-1.02x over
+the three M and 1.02-1.03x at M 4128, so they keep K 10240.
 
 | Codecs | Tile (bm, bn, wm, wn) | Fold log | Min M | Min N | Max K | Row |
 |---|---|---|---|---|---|---|
@@ -357,8 +369,8 @@ codecs `q4_0`, `q4_1`, `q5_0`, `q5_1` and `q8_0` lose 1.04-1.11x at K 12288 and 
 | `q4_0`, `q4_1`, `q5_0`, `q5_1` | 128, 64, 2, 2 | 0 | 4096 | 0 | 10240 | inherited, flat class |
 | `iq4_nl` | 128, 64, 2, 2 | 0 | 4096 | 0 | 12288 | inherited, flat class |
 | `pq2_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 4096 | inherited, grid class |
-| `iq2_s`, `iq2_xs`, `iq3_s` | 128, 64, 2, 2 | 0 | 4096 | 0 | 10240 | inherited, grid class |
-| `iq3_xxs`, `stq1_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 12288 | inherited, grid class |
+| `stq1_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 12288 | inherited, grid class |
+| `iq2_s`, `iq2_xs`, `iq3_s`, `iq3_xxs` | 128, 64, 2, 2 | 0 | 4096 | 0 | none | inherited, grid class |
 | `iq1_s`, `iq1_m`, `iq2_xxs`, `iq4_xs`, `ptq1_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | none | inherited, grid class |
 
 `stq1_0` (structured-sparse ternary, llama.cpp PR #22836) ships the full ALU and NAX kernel set. Its

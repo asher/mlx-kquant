@@ -161,12 +161,18 @@ def test_large_rows_k_ceiling(codec):
         assert r["rel"] < R1["bfloat16"], (c, r["rel"])
 
 
-def test_large_rows_no_k_ceiling():
+# Codecs whose large-M row has no K ceiling, on BK=64 and on BK=128 tiles.
+NO_MAX_K = ["q6_k", "iq2_s", "iq2_xs", "iq3_s", "iq3_xxs", "iq4_xs"]
+
+
+@pytest.mark.parametrize("codec", NO_MAX_K)
+def test_large_rows_no_k_ceiling(codec):
     if not _nax_gpu():
         pytest.skip("NAX tile policy")
-    calls = [{"codec": "q6_k", "shape": [1, 4128, 16384], "n": 64}]
+    calls = [{"codec": codec, "shape": [1, 4128, 16384], "n": 64}]
     res = run_probe(calls, env=LIVE)
     assert tile_of(_kernel(res[0])[0])[0] == 128
+    assert res[0]["rel"] < R1["bfloat16"], res[0]["rel"]
 
 
 @pytest.mark.parametrize("codec", BM128_CODECS)

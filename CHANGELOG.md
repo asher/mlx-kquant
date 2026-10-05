@@ -41,6 +41,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   up to 10% faster on most shapes, with the same output.
 - On NAX GPUs (M5), `q4_k` matmuls in image steps run up to 5% faster, with
   the same output.
+- On NAX GPUs (M5), `q4_0`, `q4_1`, `q5_0`, `iq4_nl`, `iq3_xxs`, `iq3_s`,
+  `iq2_xs` and `iq2_s` matmuls in image steps run up to 8% faster, with the
+  same output.
 - On NAX GPUs (M5), matmuls of 4096 or more rows at a large K, in image steps
   such as the Qwen-Image MLP down projection and in text prefill of 4096 or
   more tokens, run 1 to 8% faster on most codecs.
