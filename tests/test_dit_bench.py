@@ -236,6 +236,79 @@ _TINY = [
 ]
 
 
+_ZERO_WRITER = textwrap.dedent(
+    """
+    import json, sys
+    sys.path.insert(0, sys.argv[1])
+    import bench_dit_shapes as b
+    raw, json_out, md_out = sys.argv[2:5]
+    g = {"family": "zimage", "op": "qkv", "K": 256, "N": 704, "L": 64, "B": 1,
+         "M": 64, "L_model": 4096, "vector": False, "heavy": False,
+         "codecs": ["q4_k"]}
+    args = {"rounds": 2, "slots": 2, "inner": 1, "max_inner": 1,
+            "min_sample_ms": 0.001, "shrink": 16, "arms": ["kq", "kq_aa"]}
+    machine = {"device": "gpu", "architecture": "applegpu_g17s", "arch_gen": 17,
+               "arch_letter": "s", "gpu_cores": 40, "nax": True,
+               "max_threadgroup_memory": 32768, "os": "26", "mlx": "0.32.2",
+               "mlx_kquant": "0.5.0", "metallib_sha256": None, "tf32": True}
+    log = b.RawLog(raw)
+    log.write({"kind": "meta", "machine": machine, "args": args,
+               "heavy_codecs": [], "groups": [g], "mlx_kquant_file": "kq",
+               "sample_mode": "chain"})
+    log.write({"kind": "warmup", "dtype": "bfloat16", "inner": [1],
+               "kernels": [[0, "kq/q4_k", "k"], [0, "kq_aa/q4_k", "k"]],
+               "errors": []})
+    # At tiny shapes a sample (time less glue time) sits near 0. One kq
+    # sample is exactly 0 and one is below it.
+    kq_ms = {(0, 0): 0.01, (0, 1): -0.004, (1, 0): 0.0, (1, 1): 0.01}
+    visit, t = 0, 0.0
+    for r in range(2):
+        for s in range(2):
+            rows = []
+            for key, ms in (("kq/q4_k", kq_ms[(r, s)]), ("kq_aa/q4_k", 0.012)):
+                t += 1.0
+                rows.append([0, key, visit, r, s, t, ms])
+            log.write({"kind": "slot", "dtype": "bfloat16", "round": r,
+                       "slot": s, "samples": rows})
+            visit += 1
+    log.write({"kind": "end", "wall_s": 1.0})
+    log.close()
+    sys.exit(b.main(["--reaggregate", raw, "--json-out", json_out,
+                     "--md-out", md_out]))
+    """
+)
+
+
+def test_report_builds_with_a_zero_sample(tmp_path):
+    """A sample equal to its glue time is 0 ms; the visit has no ratio."""
+    json_out = tmp_path / "run.json"
+    script = tmp_path / "writer.py"
+    script.write_text(_ZERO_WRITER)
+    out = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            BENCH_DIR,
+            str(tmp_path / "run.json.raw.jsonl"),
+            str(json_out),
+            str(tmp_path / "run.md"),
+        ],
+        timeout=120,
+        capture_output=True,
+        text=True,
+    )
+    assert out.returncode == 0, out.stderr[-3000:]
+    result = json.loads(json_out.read_text())
+    assert result["complete"]
+    (p,) = result["passes"]
+    (g,) = p["groups"]
+    (c,) = g["cells"]
+    rt = c["ratios"]["aa/kq"]
+    # Four visits, three ratios: the zero kq sample of round 1 has none.
+    assert sorted(round(v, 9) for _r, v, _f in rt["pairs_raw"]) == [-3.0, 1.2, 1.2]
+    assert len(c["arms"]["kq"]["samples"]) == 4
+
+
 def _bench(tmp_path, *extra):
     json_out = tmp_path / "run.json"
     out = subprocess.run(
@@ -249,11 +322,17 @@ def _bench(tmp_path, *extra):
             str(tmp_path / "run.md"),
             *extra,
         ],
-        check=True,
         timeout=300,
         capture_output=True,
         text=True,
     )
+    if out.returncode != 0:
+        # pytest prints this with a failure. The exit status alone names no
+        # cause.
+        sys.stderr.write(out.stderr[-3000:])
+        raise subprocess.CalledProcessError(
+            out.returncode, out.args, out.stdout, out.stderr
+        )
     raw = tmp_path / "run.json.raw.jsonl"
     recs = [json.loads(line) for line in raw.read_text().splitlines()]
     return json.loads(json_out.read_text()), raw, recs, out.stdout

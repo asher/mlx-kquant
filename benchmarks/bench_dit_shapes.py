@@ -184,12 +184,16 @@ def cell_key(arm, codec):
 def paired(samples, a, b):
     """Per-visit ratios a/b over the visits that ran both arms, each with
     True when a ran first in the visit, False when b did, and None when the
-    times do not tell."""
+    times do not tell. A visit whose b sample is exactly 0 has no ratio and
+    is left out: a sample is a time less its glue time, so at tiny shapes
+    it lands on either side of 0 and can hit it."""
     sb = {v: (t, ms) for (v, _r, _s, t, ms) in samples.get(b, [])}
     out = []
     for v, r, _s, t, ms in samples.get(a, []):
         if v in sb:
             tb, mb = sb[v]
+            if mb == 0:
+                continue
             out.append((r, ms / mb, None if t == tb else t < tb))
     return out
 
