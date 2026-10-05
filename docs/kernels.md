@@ -544,6 +544,40 @@ shapes. On float16 activations the gains shrink to at most 1.10x, and the losses
 12288 grow to 1.05-1.10x. Over one Qwen3.8-27B forward in `q4_0` at M 8, the eight-block kernel
 takes 7% off the matmul time on bfloat16 activations and 3% on float16.
 
+## GLU product of two quantized matmuls
+
+- `quantized_matmul_glu` - `y = act(x @ Wg^T) * (x @ Wu^T)` for two packed weights of one codec and
+  one shape, the gated feed-forward of a diffusion transformer block. `act` is `silu` or
+  `gelu_tanh`. The weights are two arrays, or the two row bands of one fused gate and up weight.
+
+  On a NAX GPU (M5), for `q4_k` weights whose inner dim is a multiple of 128 and from 1024
+  activation rows, one dispatch computes the product. Each threadgroup owns a 128 by 64 tile of y.
+  It walks K over the gate weight, applies the activation in f32 and stores the tile, then walks K
+  over the up weight and multiplies the stored tile into the sum before the final store. y is the
+  only buffer the op writes, so a call peaks at one output where the unfused ops peak at two.
+
+  Measured on an M5 Max against the two matmuls and the stock activation and product, as the median
+  of rotated rounds in one process:
+
+  | K, N, activations | Rows | Fused over unfused |
+  |---|---|---|
+  | 3840, 10240, bfloat16 | 1056, 2080 | 0.91, 0.89 |
+  | 3840, 10240, bfloat16 | 4128, 4608, 8208, 16416 | 0.96, 0.97, 0.96, 0.97 |
+  | 3840, 10240, float16 | 1056, 4128, 16416 | 0.95, 0.94, 1.00 |
+  | 4096, 12288, bfloat16 | 4128, 16416 | 0.94, 0.97 |
+
+  From 4128 rows the gain is the activation and product pass that the kernel removes, 3 to 4
+  percent. float16 at 16416 rows is a tie.
+
+  x is float16 or bfloat16, and float32 x runs in bfloat16 as in `quantized_matmul`. Leading batch
+  dims fold into rows. The activation and the product run in f32, with one rounding of the
+  activation and one of the product. A float16 output saturates at the largest finite value, the
+  activation before the product and the product at the store, where the unfused ops return inf.
+
+  Every other case builds the same product from `quantized_matmul` and stock ops: other codecs,
+  fewer rows, other inner dims, CPU streams and GPUs without NAX. `KQ_GLU=0` builds it on every
+  call. The op is for inference, and `mx.grad` or `mx.vmap` through the fused kernel raises.
+
 ## MoE GLU
 
 Fused gate/up expert matvecs with the GLU epilogue applied in the same dispatch, so each activation
