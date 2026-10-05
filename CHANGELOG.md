@@ -32,6 +32,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `1` now folds two row tiles, where it folded four.
 - `bench_dit_shapes.py` times each sample as one dependent call chain. Its
   earlier samples overlapped calls on the GPU, which skewed kq against dense.
+- `bench_dit_shapes.py` ratios balance the two call orders of each pair. The
+  later call of a visit runs up to 20% slower, which split ratios into two modes.
 - On NAX GPUs (M5), prefill and image steps of 4096 or more tokens no longer
   change matmul kernels with the token count. The 4096 threshold is provisional.
 - On NAX GPUs (M5), `q6_k` matmuls in prefill and image steps run 5 to 20%
