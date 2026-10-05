@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project aims to
 adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0]
 
 ### Added
 - `kq.qk_norm_rope` normalizes and rotates DiT attention q and k in one
@@ -17,10 +17,6 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `kq.max_threadgroup_memory()` reports the GPU's threadgroup memory limit.
 - `benchmarks/bench_dit_shapes.py` and `benchmarks/bench_roofline.py` time
   matmul tiles against stock and MLX affine arms at diffusion model shapes.
-- `bench_dit_shapes.py` logs samples as each slot ends, and `--reaggregate`
-  rebuilds its reports from that log after a stopped or failed run.
-- `bench_dit_shapes.py --env-arm` times a kq arm under its own levers, paired
-  with the default kq arm in the same process.
 - `KQ_SPLITK_CAP` caps the K slices of the NAX and ALU split-K routes at 32 or
   fewer rows by GPU core count, for A/B runs on wide ones such as a vocab head.
 - `KQ_SPLITK_F32=1` makes bfloat16 split-K matmuls, MTP verify among them,
@@ -28,20 +24,24 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which can return inf.
 
 ### Changed
+- On NAX GPUs (M5), matmuls with 33 to 128 activation rows run faster, such
+  as the short prompts of a structured decision. `KQ_QMM_MIDM=0` keeps the
+  previous kernel.
+- Requires mlx 0.32.2, which fixes wrong values from dequantizing a strided
+  array and a crash at process exit.
+- `mlx-kquant[tools]` now installs beside transformers 5.13.1 and later, as
+  mlx-vlm 0.7 requires. Only 5.13.0, which cannot import mlx-lm, is excluded.
 - `KQ_NAX_SWIZZLE=n` folds 2^n row tiles on the BM=64 and BM=128 NAX tiles.
   `1` now folds two row tiles, where it folded four.
-- `bench_dit_shapes.py` times each sample as one dependent call chain. Its
-  earlier samples overlapped calls on the GPU, which skewed kq against dense.
-- `bench_dit_shapes.py` ratios balance the two call orders of each pair. The
-  later call of a visit runs up to 20% slower, which split ratios into two modes.
 - On NAX GPUs (M5), prefill and image steps of 4096 or more tokens no longer
-  change matmul kernels with the token count. The 4096 threshold is provisional.
+  change matmul kernels with the token count.
 - On NAX GPUs (M5), `q6_k` matmuls in prefill and image steps run 5 to 20%
   faster, with the same output.
 - On NAX GPUs (M5), `q5_k` and `q3_k` matmuls in prefill and image steps run
   up to 10% faster on most shapes, with the same output.
-- On NAX GPUs (M5), image-step matmuls of 4096 or more rows at a large K, such
-  as the Qwen-Image MLP down projection, run 2 to 10% faster on most codecs.
+- On NAX GPUs (M5), matmuls of 4096 or more rows at a large K, in image steps
+  such as the Qwen-Image MLP down projection and in text prefill of 4096 or
+  more tokens, run 1 to 8% faster on most codecs.
 - On NAX GPUs (M5), output heads and `q4_0` and `q8_0` float16 matmuls at 9 to
   32 rows, as in batched decode and speculative verify, run up to 30% faster.
 - On NAX GPUs (M5), batched gemma-4 decode of prompts of different lengths
@@ -63,17 +63,6 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - After `patch_mlx_lm_load()`, `mlx_lm.utils.load_model` builds a kquant
   checkpoint with the caller's `get_model_classes` instead of the stock class.
   `mlx_kquant.loader.load` takes it too.
-
-## [0.5.0]
-
-### Changed
-- On NAX GPUs (M5), matmuls with 33 to 128 activation rows run faster, such
-  as the short prompts of a structured decision. `KQ_QMM_MIDM=0` keeps the
-  previous kernel.
-- Requires mlx 0.32.2, which fixes wrong values from dequantizing a strided
-  array and a crash at process exit.
-- `mlx-kquant[tools]` now installs beside transformers 5.13.1 and later, as
-  mlx-vlm 0.7 requires. Only 5.13.0, which cannot import mlx-lm, is excluded.
 
 ## [0.4.15]
 
