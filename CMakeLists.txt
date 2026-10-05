@@ -12,6 +12,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(BUILD_SHARED_LIBS "Build extensions as a shared library" ON)
+option(KQ_PROBE_KERNELS "Build the probe tiles of kernels under measurement" OFF)
 
 # ----------------------------- Dependencies -----------------------------
 # Pick the right interpreter. mlx.extension.CMakeBuild invokes cmake WITHOUT
@@ -154,6 +155,7 @@ target_sources(
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_moe_glu.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_norm_fused.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_qk_norm_rope.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_matmul_fused.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_hadamard.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_lora_epilogue.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_hc_glue.cpp
@@ -228,6 +230,13 @@ target_link_options(mlx_kquant_ext PRIVATE ${KQ_WHOLE_ARCHIVE_GGUFLIB})
 # repo's kq_*.h + quantized_utils.h (which adds load_vector) win;
 # steel/gemm/*, utils.h, etc. fall through to the stock wheel headers.
 if(MLX_BUILD_METAL)
+  # Probe tiles are measured against the shipped ones and stay out of a
+  # release metallib.
+  set(KQ_PROBE_METAL_SOURCES "")
+  if(KQ_PROBE_KERNELS)
+    list(APPEND KQ_PROBE_METAL_SOURCES
+         ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax_epi_probe.metal)
+  endif()
   # The metallib has no depfile; header edits retrigger it only through DEPS.
   file(GLOB KQ_METAL_KERNEL_HEADERS CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_LIST_DIR}/metal/mlx/backend/metal/kernels/*.h)
@@ -241,6 +250,7 @@ if(MLX_BUILD_METAL)
     SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax_epi.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_encode.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_sdpa.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_sdpa_nax.metal
@@ -264,6 +274,7 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_hc_lowrank.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_route_shed.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_skinny_mv.metal
+    ${KQ_PROBE_METAL_SOURCES}
     INCLUDE_DIRS
     ${CMAKE_CURRENT_LIST_DIR}/metal
     ${MLX_INCLUDE_DIRS}

@@ -605,6 +605,43 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "quantized_matmul_glu",
+      &mlx_kquant::quantized_matmul_glu,
+      "x"_a,
+      "w_gate"_a,
+      "w_up"_a,
+      "kquant_type"_a,
+      "activation"_a = "silu",
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        GLU product of two quantized matmuls that share x:
+        y = act(x @ Wg^T) * (x @ Wu^T).
+
+        On a NAX GPU, for codecs with a GLU kernel and K a multiple of 64,
+        one dispatch walks K once for both weights and writes y once. Both
+        sums stay in f32, the activation and the product run in f32, and
+        the result is rounded once at the store. A float16 store clamps to
+        the finite half range. Every other case builds the same product
+        from quantized_matmul and stock ops, which round each matmul to the
+        activation dtype first. The op is for inference. On the GPU the
+        fused kernel has no gradient or vmap, and mx.grad or mx.vmap
+        through it raises.
+
+        Args:
+            x (array): [..., K], float16/bfloat16. float32 runs in bfloat16.
+            w_gate (array): [N, K bytes] uint8 wire bytes, the weight under
+                the activation.
+            w_up (array): same shape and codec as w_gate. The two may be
+                row slices of one wider weight.
+            kquant_type (str): the codec of both weights.
+            activation (str): "silu" or "gelu_tanh".
+
+        Returns:
+            array: [..., N] in the dtype quantized_matmul gives for x.
+      )");
+
+  m.def(
       "kda_conv",
       &mlx_kquant::kda_conv,
       "x"_a,

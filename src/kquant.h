@@ -1503,6 +1503,53 @@ class KQuantQkNormRope : public mx::Primitive {
   float eps_;
 };
 
+// GLU product of two quantized matmuls that share x:
+//   y = act(x @ Wg^T) * (x @ Wu^T)
+// x [..., K] (float16/bfloat16; float32 runs in bfloat16), w_gate and w_up
+// 2-D uint8 wire bytes of one codec and one shape [N, K bytes], which may
+// be row slices of one wider weight. activation is "silu" or "gelu_tanh".
+// Returns [..., N] in the dtype quantized_matmul gives for x. On a NAX GPU,
+// for codecs with a GLU kernel and K a multiple of 64, one dispatch walks K
+// once for both weights, keeps both sums in f32, and rounds once at the
+// store; a float16 store clamps to the finite half range. Every other case
+// builds the product from quantized_matmul and stock ops.
+mx::array quantized_matmul_glu(
+    mx::array x,
+    mx::array w_gate,
+    mx::array w_up,
+    const std::string& kquant_type,
+    const std::string& activation = "silu",
+    mx::StreamOrDevice s = {});
+
+// Quantized matmul with an epilogue fused into the store (see
+// quantized_matmul_glu). Inference-only.
+class KQuantMatmulFused : public mx::Primitive {
+ public:
+  KQuantMatmulFused(mx::Stream stream, std::string kquant_type, int act)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        act_(act) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantMatmulFused";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+  int act_; // 0 = silu, 1 = gelu (tanh form)
+};
+
 // Fused causal short convolution for gated-delta prefill (KDA, GDN):
 //   y[t] = silu(sum_j w[:, j] * in[t - K + 1 + j]),  in = [state; x]
 // over x [B, T, C] (float16/bfloat16), state [B, K - 1, C] (the carried
