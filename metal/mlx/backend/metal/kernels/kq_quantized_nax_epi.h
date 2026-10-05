@@ -547,6 +547,10 @@ METAL_FUNC void kq_qmm_t_nax_glu_walks_impl(
 KQ_NAX_DEFINE_GLU_KERNEL(q4_k, KqNaxQ4_KBlockLoader, KqNaxQ4_KHalfLoader)
 KQ_NAX_DEFINE_GLU_D128_KERNEL(q4_k, KqNaxQ4_KHalfLoader)
 KQ_NAX_DEFINE_GLU_WALKS_KERNEL(q4_k, KqNaxQ4_KBlockLoader, KqNaxQ4_KHalfLoader)
+KQ_NAX_DEFINE_GLU_WALKS_KERNEL(q5_k, KqNaxQ5_KBlockLoader, KqNaxQ5_KHalfLoader)
+KQ_NAX_DEFINE_GLU_WALKS_KERNEL(q6_k, KqNaxQ6_KBlockLoader, KqNaxQ6_KHalfLoader)
+// q8_0 has a K tile of 64 only.
+KQ_NAX_DEFINE_GLU_WALKS_KERNEL(q8_0, KqNaxQ8_0BlockLoader, KqNaxQ8_0BlockLoader)
 #undef KQ_NAX_DEFINE_GLU_WALKS_KERNEL
 #undef KQ_NAX_DEFINE_GLU_KERNEL
 #undef KQ_NAX_DEFINE_GLU_D128_KERNEL

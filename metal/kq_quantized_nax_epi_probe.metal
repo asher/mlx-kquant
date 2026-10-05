@@ -70,4 +70,6 @@
   instantiate_kquant_nax_glu_walks_tile(codec, 128, 64)
 
 instantiate_kquant_nax_glu_probe_codec(q4_k)
+instantiate_kquant_nax_glu_walks_tile(q5_k, 128, 64)
+instantiate_kquant_nax_glu_walks_tile(q6_k, 128, 64)
     // clang-format on

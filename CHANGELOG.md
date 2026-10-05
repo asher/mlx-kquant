@@ -10,9 +10,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `kq.qk_norm_rope` normalizes and rotates DiT attention q and k in one
   dispatch, about 25x faster than the unfused ops at Z-Image shapes.
 - `kq.quantized_matmul_glu` computes a gated feed-forward product of two
-  `q4_k` weights in one dispatch on NAX GPUs (M5). From 4128 rows it runs 3 to
-  4% faster than the unfused ops on bfloat16 and ties them on float16 at 16416
-  rows, and a call peaks at one output buffer where they peak at two.
+  `q4_k`, `q5_k`, `q6_k` or `q8_0` weights in one dispatch on NAX GPUs (M5).
+  From 4128 rows it runs up to 6% faster than the unfused ops, and a call
+  peaks at one output buffer where they peak at two. `q8_0` on float16 keeps
+  the unfused ops, which are faster there.
 - `KQ_TUNE_LIVE=1` makes the NAX tile levers take effect on the next call, so
   tile A/B runs share one process. `KQ_QMM_LOG` now logs NAX tile dispatches.
 - `KQ_NAX_TILE` and `KQ_QMM_TILE` pin the quantized matmul tile, and raise

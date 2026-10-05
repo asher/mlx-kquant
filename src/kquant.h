@@ -1509,10 +1509,13 @@ class KQuantQkNormRope : public mx::Primitive {
 // 2-D uint8 wire bytes of one codec and one shape [N, K bytes], which may
 // be row slices of one wider weight. activation is "silu" or "gelu_tanh".
 // Returns [..., N] in the dtype quantized_matmul gives for x. On a NAX GPU,
-// for codecs with a GLU kernel and K a multiple of 64, one dispatch walks K
-// once for both weights, keeps both sums in f32, and rounds once at the
-// store; a float16 store clamps to the finite half range. Every other case
-// builds the product from quantized_matmul and stock ops.
+// for codecs with a GLU kernel (q8_0 on bfloat16 only), K a multiple of the
+// codec's K tile (64 for q8_0, 128 for the others) and at least 1024 rows,
+// one dispatch walks K
+// for the gate weight and then for the up weight, keeps both sums in f32,
+// and rounds once at the store; a float16 store clamps to the finite half
+// range. Every other case builds the product from quantized_matmul and
+// stock ops.
 mx::array quantized_matmul_glu(
     mx::array x,
     mx::array w_gate,

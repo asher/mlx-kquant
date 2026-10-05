@@ -3,9 +3,10 @@
 //
 // GLU product: y = act(x @ Wg^T) * (x @ Wu^T) over two packed weights of
 // one codec and one shape. On a NAX GPU, for the codecs with a GLU kernel,
-// from kGluMinRows rows and with K a multiple of 128, one dispatch computes
-// the product with y as its only output buffer. Every other case builds
-// the same product from quantized_matmul and stock ops.
+// from kGluMinRows rows and with K a whole number of the codec's K tiles,
+// one dispatch computes the product with y as its only output buffer.
+// Every other case builds the same product from quantized_matmul and stock
+// ops.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -64,9 +65,18 @@ mx::array glu_activation(const mx::array& g, int act, mx::Stream s) {
   return mx::multiply(g, mx::sigmoid(g, s), s);
 }
 
-// Codecs with a GLU kernel in the metallib.
-bool glu_has_kernel(const std::string& t) {
-  return t == "q4_k";
+// K tile of the GLU kernel for a codec and an activation dtype, 0 where
+// the op builds the composition. The q8_0 decoder has a K tile of 64 only,
+// and its kernel runs on bfloat16 only: on float16 it measured slower than
+// the composition.
+int glu_kernel_bk(const std::string& t, mx::Dtype dt) {
+  if (t == "q4_k" || t == "q5_k" || t == "q6_k") {
+    return 128;
+  }
+  if (t == "q8_0" && dt == mx::bfloat16) {
+    return 64;
+  }
+  return 0;
 }
 
 bool glu_tune_live() {
@@ -148,11 +158,11 @@ void KQuantMatmulFused::eval_gpu(
   const int M = static_cast<int>(x.size() / K);
 
   int bm = 128;
-  int bk = K % 128 == 0 ? 128 : 64;
+  int bk = glu_kernel_bk(kquant_type_, x.dtype());
   if (const int v = glu_bm_lever(); v > 0) {
     bm = v;
   }
-  if (const int v = glu_bk_lever(); v > 0 && K % v == 0) {
+  if (const int v = glu_bk_lever(); v > 0 && v <= bk && K % v == 0) {
     bk = v;
   }
   const int bn = 64;
@@ -273,12 +283,19 @@ mx::array quantized_matmul_glu(
   }
   auto s = mx::to_stream(s_);
 
-  const int bk_lever = glu_bk_lever();
+  // K must be a whole number of the codec's K tiles (of the lever's tile
+  // when KQ_GLU_BK selects a smaller one).
+  // float32 x runs in bfloat16, as in quantized_matmul.
+  const mx::Dtype out_type =
+      x.dtype() == mx::float32 ? mx::bfloat16 : x.dtype();
+  int bk = glu_kernel_bk(kquant_type, out_type);
+  if (const int v = glu_bk_lever(); v > 0 && v <= bk) {
+    bk = v;
+  }
   const int64_t rows = K > 0 ? static_cast<int64_t>(x.size()) / K : 0;
   bool fused = s.device == mx::Device::gpu && nax_available() && glu_on() &&
-      glu_has_kernel(kquant_type) && K % (bk_lever > 0 ? bk_lever : 128) == 0 &&
-      x.ndim() >= 2 && rows >= glu_min_rows() && rows > 0 &&
-      w_gate.shape(0) > 0;
+      bk > 0 && K % bk == 0 && x.ndim() >= 2 && rows >= glu_min_rows() &&
+      rows > 0 && w_gate.shape(0) > 0;
   if (!fused) {
     auto scales = mx::zeros({1}, mx::uint8, s);
     auto g = quantized_matmul(
@@ -304,9 +321,6 @@ mx::array quantized_matmul_glu(
     return mx::multiply(glu_activation(g, act, s), u, s);
   }
 
-  // float32 x runs in bfloat16, as in quantized_matmul.
-  const mx::Dtype out_type =
-      x.dtype() == mx::float32 ? mx::bfloat16 : x.dtype();
   kq_check_weight_base_at_build(w_gate, kquant_type, s, "quantized_matmul_glu");
   kq_check_weight_base_at_build(w_up, kquant_type, s, "quantized_matmul_glu");
   // Every operand gets a Contiguous node: the strides of an unevaluated

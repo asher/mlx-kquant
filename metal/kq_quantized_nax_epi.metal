@@ -26,4 +26,9 @@
   instantiate_kquant_nax_glu_walks(codec, bfloat16_t, false, bm, bk)
 
 instantiate_kquant_nax_glu_walks_tile(q4_k, 128, 128)
+instantiate_kquant_nax_glu_walks_tile(q5_k, 128, 128)
+instantiate_kquant_nax_glu_walks_tile(q6_k, 128, 128)
+// q8_0 on bfloat16 only: on float16 it measured slower than the unfused ops.
+instantiate_kquant_nax_glu_walks(q8_0, bfloat16_t, true,  128, 64)
+instantiate_kquant_nax_glu_walks(q8_0, bfloat16_t, false, 128, 64)
     // clang-format on

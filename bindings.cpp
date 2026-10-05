@@ -618,11 +618,13 @@ NB_MODULE(_ext, m) {
         GLU product of two quantized matmuls that share x:
         y = act(x @ Wg^T) * (x @ Wu^T).
 
-        On a NAX GPU, for codecs with a GLU kernel and K a multiple of 64,
-        one dispatch walks K once for both weights and writes y once. Both
-        sums stay in f32, the activation and the product run in f32, and
-        the result is rounded once at the store. A float16 store clamps to
-        the finite half range. Every other case builds the same product
+        On a NAX GPU, for q4_k, q5_k and q6_k weights and for q8_0 weights
+        on bfloat16, with K a multiple of the codec's K tile (64 for q8_0,
+        128 for the others) and at least 1024 rows, one dispatch walks K
+        for the gate weight and then for the up weight and writes y once.
+        Both sums stay in f32, the activation and the product run in f32,
+        and the result is rounded once at the store. A float16 store clamps
+        to the finite half range. Every other case builds the same product
         from quantized_matmul and stock ops, which round each matmul to the
         activation dtype first. The op is for inference. On the GPU the
         fused kernel has no gradient or vmap, and mx.grad or mx.vmap

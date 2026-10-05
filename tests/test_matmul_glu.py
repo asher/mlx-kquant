@@ -6,9 +6,11 @@ runs the activation and the product in float32 and rounds the activation
 once and the product once, so it should be no less accurate than the
 composition, which rounds each matmul to the activation dtype first.
 
-The op runs the kernel from MIN_ROWS rows and builds the composition
-below. In-process cases cover both sides of that bound, partial row tiles,
-both parities of the row-tile count and counts above 32767. Inputs come
+The op runs the kernel from MIN_ROWS rows, for the codecs of GLU_CODECS
+(q8_0 on bfloat16 only) and an inner dim that is a whole number of the
+codec's K tiles, and builds the composition otherwise. In-process cases
+cover both sides of the row bound, each codec, partial row tiles, both
+parities of the row-tile count and counts above 32767. Inputs come
 dense, as a lazy transposed view, as a strided view and with one and two
 batch dims. The kernel below MIN_ROWS and the probe tiles run in a fresh
 interpreter, since the levers are read once per process.
@@ -36,6 +38,12 @@ CPU_REL = 5e-2
 K = 768
 # Rows from which the op runs the fused kernel (kGluMinRows).
 MIN_ROWS = 1024
+# Codecs with a fused kernel, and the K tile each runs.
+GLU_CODECS = {"q4_k": 128, "q5_k": 128, "q6_k": 128, "q8_0": 64}
+OTHER_CODECS = ["q5_k", "q6_k", "q8_0"]
+# Codecs whose kernel runs on bfloat16 only. On float16 the op builds the
+# composition, which measured faster there.
+BF16_ONLY = {"q8_0"}
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _W = {}
@@ -45,8 +53,11 @@ def _nax():
     return not force_cpu() and kq.nax_available()
 
 
-def _fused(rows=MIN_ROWS):
-    return _nax() and rows >= MIN_ROWS
+def _fused(rows=MIN_ROWS, codec="q4_k", k=K, dtype=mx.bfloat16):
+    tile = GLU_CODECS.get(codec, 0)
+    if codec in BF16_ONLY and dtype != mx.bfloat16:
+        tile = 0
+    return _nax() and rows >= MIN_ROWS and tile > 0 and k % tile == 0
 
 
 def _weights(codec, n, k, seed=0):
@@ -124,7 +135,7 @@ def _check(x, n, dtype, activation="silu", codec="q4_k", k=K):
     comp = _composed(x, wg, wu, codec, activation)
     mx.eval(comp)
     err_c = _rel(_f64(comp), ref)
-    if not _fused(x.size // k):
+    if not _fused(x.size // k, codec, k, dtype):
         # The op is the composition here. On the CPU a few rows run the int8
         # GEMV path, which is good to about 1e-2 per matmul.
         assert mx.array_equal(y, comp).item()
@@ -242,10 +253,58 @@ def test_glu_float16_store_saturates():
     assert (np.sign(got[over]) == np.sign(ref[over])).all()
 
 
-@pytest.mark.parametrize("codec", ["q6_k", "q8_0"])
+@pytest.mark.parametrize("dtype", DTYPES, ids=["bf16", "f16"])
+@pytest.mark.parametrize("m", [1023, 1024, 1039, 1100, 1152])
+@pytest.mark.parametrize("n", [64, 200])
+@pytest.mark.parametrize("codec", OTHER_CODECS)
+def test_glu_codecs_rows_and_columns(codec, n, m, dtype):
+    _check(_x([m, K], dtype, m * 7 + n), n, dtype, codec=codec)
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["bf16", "f16"])
+@pytest.mark.parametrize("codec", OTHER_CODECS)
+def test_glu_codecs_image_rows(codec, dtype):
+    _check(_x([4128, K], dtype, 4128), 128, dtype, codec=codec)
+
+
+@pytest.mark.parametrize("codec", OTHER_CODECS)
+def test_glu_codecs_gelu(codec):
+    _check(
+        _x([1100, K], mx.bfloat16, 5, scale=2.0), 96, mx.bfloat16, "gelu_tanh", codec
+    )
+
+
+@pytest.mark.parametrize("codec", OTHER_CODECS)
+def test_glu_codecs_rows_above_32767(codec):
+    m = 32769
+    (wg, wg64), (wu, wu64) = _weights(codec, 96, 256)
+    x = _x([m, 256], mx.bfloat16, m)
+    y = kq.quantized_matmul_glu(x, wg, wu, codec)
+    mx.eval(y)
+    ref = _ref(x, wg64, wu64)
+    got = _f64(y)
+    for rows in (slice(0, m), slice(0, 256), slice(m - 300, m)):
+        assert _rel(got[rows], ref[rows]) <= R1[mx.bfloat16]
+
+
+@pytest.mark.parametrize("k", [832, 800])
+def test_glu_q8_0_inner_dim_rule(k):
+    """q8_0 has a K tile of 64: 832 is 13 tiles and runs the kernel, 800 is
+    not a whole number of tiles and builds the composition."""
+    assert _fused(1100, "q8_0", k) == (_nax() and k == 832)
+    _check(_x([1100, k], mx.bfloat16, k), 96, mx.bfloat16, codec="q8_0", k=k)
+
+
+def test_glu_q8_0_float16_composes():
+    """q8_0 on float16 is the composition at every row count."""
+    assert not _fused(4128, "q8_0", K, mx.float16)
+    _check(_x([4128, K], mx.float16, 23), 96, mx.float16, codec="q8_0")
+
+
+@pytest.mark.parametrize("codec", ["q3_k", "q4_0"])
 def test_glu_codec_without_kernel_composes(codec):
     (wg, wg64), (wu, wu64) = _weights(codec, 96, K)
-    x = _x([130, K], mx.bfloat16, 15)
+    x = _x([1100, K], mx.bfloat16, 15)
     y = kq.quantized_matmul_glu(x, wg, wu, codec)
     mx.eval(y)
     assert _rel(_f64(y), _ref(x, wg64, wu64)) <= R1[mx.bfloat16]
@@ -287,28 +346,33 @@ def test_glu_kernels_in_metallib():
     if not names:
         pytest.skip("no metallib loaded")
     glu = {n for n in names if "_qmm_t_nax_glu_" in n}
-    # The tile the op runs. A build with KQ_PROBE_KERNELS=ON carries more.
+    # The tile the op runs for each codec. A build with KQ_PROBE_KERNELS=ON
+    # carries more.
     want = {
-        f"kquant_q4_k_qmm_t_nax_glu_{t}_bm128_bn64_bk128w_wm2_wn2_alN_{al}"
+        f"kquant_{c}_qmm_t_nax_glu_{t}_bm128_bn64_bk{bk}w_wm2_wn2_alN_{al}"
+        for c, bk in GLU_CODECS.items()
         for t in ("float16_t", "bfloat16_t")
         for al in ("true", "false")
+        if t == "bfloat16_t" or c not in BF16_ONLY
     }
     assert want <= glu, sorted(want - glu)
-    # Every GLU kernel is a q4_k tile of a known form: K tile 64 or 128,
-    # with d (two unpadded Ws buffers) or w (two K walks).
+    # Every GLU kernel is a tile of a known form of one of those codecs: K
+    # tile 64 or 128, with d (two unpadded Ws buffers) or w (two K walks).
     pat = re.compile(
-        r"^kquant_q4_k_qmm_t_nax_glu_(bfloat16_t|float16_t)_bm(64|128)_bn64"
+        r"^kquant_(" + "|".join(GLU_CODECS) + r")_qmm_t_nax_glu_"
+        r"(bfloat16_t|float16_t)_bm(64|128)_bn64"
         r"_bk(64|128|128d|64w|128w)_wm2_wn2_alN_(true|false)$"
     )
     bad = sorted(n for n in glu if not pat.match(n))
     assert not bad, bad[:5]
 
 
-def _built_tiles():
-    """(BM, K tile) of every GLU kernel in the metallib."""
+def _built_tiles(codec="q4_k"):
+    """(BM, K tile) of every GLU kernel of a codec in the metallib."""
     tiles = set()
+    head = f"kquant_{codec}_qmm_t_nax_glu_bfloat16_t_"
     for n in kq.metallib_kernels():
-        if "_qmm_t_nax_glu_bfloat16_t_" in n and n.endswith("alN_true"):
+        if n.startswith(head) and n.endswith("alN_true"):
             f = n.split("_")
             bm = next(p for p in f if p.startswith("bm"))[2:]
             bk = next(p for p in f if p.startswith("bk"))[2:]
@@ -328,7 +392,7 @@ import test_matmul_glu as t
 out = []
 for m, n, dt in spec["cells"]:
     dtype = getattr(mx, dt)
-    (wg, wg64), (wu, wu64) = t._weights("q4_k", n, t.K)
+    (wg, wg64), (wu, wu64) = t._weights(spec["codec"], n, t.K)
     x = t._x([m, t.K], dtype, m * 7 + n)
     row = {"m": m, "n": n, "dtype": dt}
     for bm, bk in spec["tiles"]:
@@ -336,7 +400,7 @@ for m, n, dt in spec["cells"]:
         os.environ["KQ_GLU_BK"] = bk.rstrip("dw")
         os.environ["KQ_GLU_DUAL128"] = "1" if bk.endswith("d") else "0"
         os.environ["KQ_GLU_WALKS"] = "1" if bk.endswith("w") else "0"
-        y = kq.quantized_matmul_glu(x, wg, wu, "q4_k")
+        y = kq.quantized_matmul_glu(x, wg, wu, spec["codec"])
         mx.eval(y)
         got = t._f64(y)
         row[f"{bm},{bk}"] = {
@@ -348,7 +412,8 @@ print("RESULT " + json.dumps(out))
 """
 
 
-def test_glu_kernel_below_min_rows_and_tiles_agree():
+@pytest.mark.parametrize("codec", list(GLU_CODECS))
+def test_glu_kernel_below_min_rows_and_tiles_agree(codec):
     """The kernel at any row count, and one set of bits per kernel form."""
     if not _nax():
         pytest.skip("the fused kernel needs a NAX GPU")
@@ -356,15 +421,16 @@ def test_glu_kernel_below_min_rows_and_tiles_agree():
     # 128 on one, 128d on two unpadded ones. Two K walks (64w, 128w) round
     # the gate activation to the output dtype before the product, so those
     # bits form their own group.
-    tiles = _built_tiles()
-    assert (128, "128w") in tiles
+    tiles = _built_tiles(codec)
+    assert (128, f"{GLU_CODECS[codec]}w") in tiles
+    rows = (1, 16, 17, 63, 65, 127, 129, 300, 449, 577, 4128)
     cells = [
         (m, n, dt)
-        for m in (1, 16, 17, 63, 65, 127, 129, 300, 449, 577, 4128)
+        for m in (rows if codec == "q4_k" else rows[::3])
         for n in (64, 96, 200)
         for dt in ("bfloat16", "float16")
     ]
-    spec = {"tests_dir": TESTS_DIR, "tiles": tiles, "cells": cells}
+    spec = {"tests_dir": TESTS_DIR, "tiles": tiles, "cells": cells, "codec": codec}
     env = dict(os.environ, KQ_TUNE_LIVE="1", KQ_QMM_LOG="1", KQ_GLU_MIN_ROWS="1")
     p = subprocess.run(
         [sys.executable, "-c", _CHILD, json.dumps(spec)],

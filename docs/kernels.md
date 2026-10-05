@@ -550,8 +550,10 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
   one shape, the gated feed-forward of a diffusion transformer block. `act` is `silu` or
   `gelu_tanh`. The weights are two arrays, or the two row bands of one fused gate and up weight.
 
-  On a NAX GPU (M5), for `q4_k` weights whose inner dim is a multiple of 128 and from 1024
-  activation rows, one dispatch computes the product. Each threadgroup owns a 128 by 64 tile of y.
+  On a NAX GPU (M5), from 1024 activation rows, one dispatch computes the product for `q4_k`,
+  `q5_k` and `q6_k` weights whose inner dim is a multiple of 128, and for `q8_0` weights on
+  bfloat16 activations whose inner dim is a multiple of 64. Each threadgroup owns a 128 by 64 tile
+  of y.
   It walks K over the gate weight, applies the activation in f32 and stores the tile, then walks K
   over the up weight and multiplies the stored tile into the sum before the final store. y is the
   only buffer the op writes, so a call peaks at one output where the unfused ops peak at two.
@@ -559,15 +561,24 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
   Measured on an M5 Max against the two matmuls and the stock activation and product, as the median
   of rotated rounds in one process:
 
-  | K, N, activations | Rows | Fused over unfused |
-  |---|---|---|
-  | 3840, 10240, bfloat16 | 1056, 2080 | 0.91, 0.89 |
-  | 3840, 10240, bfloat16 | 4128, 4608, 8208, 16416 | 0.96, 0.97, 0.96, 0.97 |
-  | 3840, 10240, float16 | 1056, 4128, 16416 | 0.95, 0.94, 1.00 |
-  | 4096, 12288, bfloat16 | 4128, 16416 | 0.94, 0.97 |
+  | K, N, activations | Rows | `q4_k` | `q5_k` | `q6_k` | `q8_0` |
+  |---|---|---|---|---|---|
+  | 3840, 10240, bfloat16 | 1056 | 0.91 | 0.99 | 0.96 | 0.99 |
+  | 3840, 10240, bfloat16 | 2080 | 0.89 | 0.88 | 0.87 | 0.93 |
+  | 3840, 10240, bfloat16 | 4128 | 0.96 | 0.94 | 0.96 | 0.96 |
+  | 3840, 10240, bfloat16 | 4608 | 0.97 | 0.96 | 0.97 | 0.96 |
+  | 3840, 10240, bfloat16 | 8208 | 0.96 | 0.96 | 0.97 | 0.97 |
+  | 3840, 10240, bfloat16 | 16416 | 0.97 | 0.97 | 0.99 | 0.98 |
+  | 3840, 10240, float16 | 1056 | 0.95 | 1.00 | 0.98 | 1.02 |
+  | 3840, 10240, float16 | 4128 | 0.94 | 0.96 | 0.97 | 0.98 |
+  | 3840, 10240, float16 | 16416 | 1.00 | 0.98 | 0.99 | 1.04 |
+  | 4096, 12288, bfloat16 | 4128 | 0.94 | 0.95 | 0.95 | 0.97 |
+  | 4096, 12288, bfloat16 | 16416 | 0.97 | 0.97 | 0.97 | 0.99 |
 
-  From 4128 rows the gain is the activation and product pass that the kernel removes, 3 to 4
-  percent. float16 at 16416 rows is a tie.
+  From 4128 rows the gain is the activation and product pass that the kernel removes, 1 to 6
+  percent. `q4_k` on float16 at 16416 rows is a tie. The `q8_0` kernel is slower than the unfused
+  ops on float16 at 1056 and 16416 rows, so `q8_0` on float16 builds the unfused ops.
+  `benchmarks/bench_glu.py` repeats the table for one codec.
 
   x is float16 or bfloat16, and float32 x runs in bfloat16 as in `quantized_matmul`. Leading batch
   dims fold into rows. The activation and the product run in f32, with one rounding of the
@@ -575,7 +586,8 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
   activation before the product and the product at the store, where the unfused ops return inf.
 
   Every other case builds the same product from `quantized_matmul` and stock ops: other codecs,
-  fewer rows, other inner dims, CPU streams and GPUs without NAX. `KQ_GLU=0` builds it on every
+  `q8_0` on float16, fewer rows, other inner dims, CPU streams and GPUs without NAX. `KQ_GLU=0`
+  builds it on every
   call. The op is for inference, and `mx.grad` or `mx.vmap` through the fused kernel raises.
 
 ## MoE GLU
