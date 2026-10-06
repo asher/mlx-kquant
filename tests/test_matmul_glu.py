@@ -857,7 +857,11 @@ def test_glu_tile_levers_belong_to_a_probe_build():
     if not _nax():
         pytest.skip("the fused kernel needs a NAX GPU")
     call = {"codec": "q5_k", "m": 1100, "n": 96, "dtype": "bfloat16"}
-    (r,) = _glu_probe([call], env={"KQ_GLU_BM": "64", "KQ_GLU_WALKS": "0"})
+    env = {"KQ_GLU_BM": "64", "KQ_GLU_WALKS": "0"}
+    if not _probe_kernels():
+        # A release build reads none of the four.
+        env.update({"KQ_GLU_BK": "64", "KQ_GLU_DUAL128": "1"})
+    (r,) = _glu_probe([call], env=env)
     head = "kquant_q5_k_qmm_t_nax_glu_bfloat16_t_"
     if _probe_kernels():
         # q5_k has no one-walk kernel in any build.
