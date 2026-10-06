@@ -1607,6 +1607,81 @@ class KQuantMatmulFused : public mx::Primitive {
   int act_; // 0 = silu, 1 = gelu (tanh form)
 };
 
+// Quantized matmul with a low-rank term:
+//   y = x @ W^T + (strength * (x @ A)) @ B
+// x [..., K] (float16/bfloat16; float32 runs in bfloat16), w 2-D uint8 wire
+// bytes [N, K bytes], lora_a [K, R] and lora_b [R, N] in any float dtype
+// (they run in the dtype of y). strength scales the R columns of x @ A: one
+// element, or [R]. bands is empty or holds rows of (col_start, col_end,
+// z_start, rank): the columns [col_start, col_end) of y take the ranks
+// [z_start, z_start + rank) and that block of lora_b, and a column outside
+// every band takes no low-rank term. Bands are in column order and
+// disjoint. Several adapters are one call: their A columns and B rows are
+// joined, with one strength per column.
+// Returns [..., N] in the dtype quantized_matmul gives for x. On a NAX GPU,
+// for q4_k weights on bfloat16, K a multiple of 128, at least 1024 rows,
+// every band starting on a multiple of 64 columns, at most 16 bands and a
+// rank of at most 256 per band, stock ops compute z = strength * (x @ A)
+// and one dispatch walks K for the weight and then the rank for z and B in
+// the same f32 sums, with y as its only output buffer and one rounding at
+// the store. Every other case builds the sum from quantized_matmul and
+// stock ops.
+mx::array quantized_matmul_lora(
+    mx::array x,
+    mx::array w,
+    const std::string& kquant_type,
+    mx::array lora_a,
+    mx::array lora_b,
+    const std::optional<mx::array>& strength = std::nullopt,
+    const std::vector<int>& bands = {},
+    mx::StreamOrDevice s = {});
+
+// Quantized matmul with a low-rank term in the reduction (see
+// quantized_matmul_lora). Inputs are x, w, z and B. vjp and jvp are those
+// of the unfused ops, wrt x, z and B: the quantized weight is frozen, as
+// in KQuantMatmul.
+class KQuantMatmulLora : public mx::Primitive {
+ public:
+  KQuantMatmulLora(
+      mx::Stream stream,
+      std::string kquant_type,
+      std::vector<int> bands)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        bands_(std::move(bands)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantMatmulLora";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+  std::vector<mx::array> vjp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<mx::array>& outputs) override;
+  std::vector<mx::array> jvp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& tangents,
+      const std::vector<int>& argnums) override;
+
+ private:
+  std::string kquant_type_;
+  // Rows of (col_start, col_end, z_start, rank); empty for one band over
+  // every column and every rank.
+  std::vector<int> bands_;
+};
+
 // Fused causal short convolution for gated-delta prefill (KDA, GDN):
 //   y[t] = silu(sum_j w[:, j] * in[t - K + 1 + j]),  in = [state; x]
 // over x [B, T, C] (float16/bfloat16), state [B, K - 1, C] (the carried

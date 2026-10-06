@@ -654,6 +654,84 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "quantized_matmul_lora",
+      [](mx::array x,
+         mx::array w,
+         const std::string& kquant_type,
+         mx::array lora_a,
+         mx::array lora_b,
+         const std::optional<mx::array>& strength,
+         const std::optional<std::vector<std::vector<int>>>& bands,
+         mx::StreamOrDevice s) {
+        std::vector<int> flat;
+        if (bands.has_value()) {
+          for (const auto& row : *bands) {
+            if (row.size() != 4) {
+              throw std::invalid_argument(
+                  "[mlx_kquant.quantized_matmul_lora] bands must hold rows "
+                  "of (col_start, col_end, z_start, rank).");
+            }
+            flat.insert(flat.end(), row.begin(), row.end());
+          }
+        }
+        return mlx_kquant::quantized_matmul_lora(
+            std::move(x),
+            std::move(w),
+            kquant_type,
+            std::move(lora_a),
+            std::move(lora_b),
+            strength,
+            flat,
+            s);
+      },
+      "x"_a,
+      "w"_a,
+      "kquant_type"_a,
+      "lora_a"_a,
+      "lora_b"_a,
+      nb::kw_only(),
+      "strength"_a = nb::none(),
+      "bands"_a = nb::none(),
+      "stream"_a = nb::none(),
+      R"(
+        Quantized matmul with a low-rank term:
+        y = x @ W^T + (strength * (x @ A)) @ B.
+
+        On a NAX GPU, for q4_k weights on bfloat16, with K a multiple of
+        128, at least 1024 rows, every band starting on a multiple of 64
+        columns, at most 16 bands and a rank of at most 256 per band, stock
+        ops compute z = strength * (x @ A) and one dispatch walks K for the
+        weight and then the rank for z and B in the same f32 sums. y is the
+        only output buffer and is rounded once, at the store. Every other
+        case builds the same sum from quantized_matmul and stock ops, which
+        round the matmul to the activation dtype before the add. mx.grad
+        gives the gradient with respect to x, lora_a, lora_b and strength
+        at every row count: the gradient of the kernel runs the unfused
+        ops. The weight is frozen, as in quantized_matmul.
+
+        Several adapters are one call: join their A columns and their B
+        rows, and give one strength per column.
+
+        Args:
+            x (array): [..., K], float16/bfloat16. float32 runs in bfloat16.
+            w (array): [N, K bytes] uint8 wire bytes.
+            kquant_type (str): the codec of w.
+            lora_a (array): [K, R], any float dtype.
+            lora_b (array): [R, N], any float dtype.
+            strength (array, optional): one element, or [R]: the scale of
+                each column of x @ A. A new value needs no new trace.
+            bands (sequence, optional): rows of (col_start, col_end,
+                z_start, rank), in column order and disjoint. The columns
+                [col_start, col_end) of y take the ranks [z_start, z_start
+                + rank) and that block of lora_b. A column outside every
+                band takes no low-rank term. Without bands every column
+                takes every rank.
+
+        Returns:
+            array: [..., N] in the dtype quantized_matmul gives for x.
+      )");
+
+  m.def(
       "kda_conv",
       &mlx_kquant::kda_conv,
       "x"_a,

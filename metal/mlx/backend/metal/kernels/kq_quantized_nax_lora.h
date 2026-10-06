@@ -1,0 +1,307 @@
+// NAX qmm_t kernel with a low-rank term in the same reduction, built on the
+// tile and loaders of kq_quantized_nax.h. Separate entry points, so the
+// plain qmm_t kernels keep their code.
+//
+//   y = x @ W^T + z @ B
+//
+// x [M, K], W a quantized weight [N, K], z [M, R] and B [R, N] in the
+// dtype of x. A threadgroup owns one [BM, BN] tile of y. It walks K as the
+// plain kernel does, then runs the rank of its column band as more K
+// steps: the weight tile fills from B and the A tile loads z. The sum
+// stays in the f32 accumulator and is rounded once at the store, so y is
+// written once and never read.
+#include "mlx/backend/metal/kernels/kq_quantized_nax.h"
+
+// band_z, band_rank and band_cols describe the column band of the
+// threadgroup's tile: the first z column, the rank, and how many of the
+// tile's columns lie in the band. A tile outside every band has rank 0 and
+// runs the plain walk alone.
+template <
+    typename T,
+    typename LoaderW,
+    const bool aligned_N,
+    const int BM,
+    const int BK,
+    const int BN,
+    const int WM,
+    const int WN>
+METAL_FUNC void kq_qmm_t_nax_lora_impl(
+    const device uint8_t* w,
+    const device T* x,
+    const device T* z,
+    const device T* b,
+    device T* y,
+    threadgroup T* Ws,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    const constant int& R,
+    const int band_z,
+    const int band_rank,
+    const int band_cols,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(BK % 32 == 0, "BK must be a multiple of the MMA K step");
+  // The fill of the tail gives each of the 4 simdgroups 16 columns.
+  static_assert(WM * WN == 4 && BN == 64, "tail fill layout");
+
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  const int K_w = (K / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+
+  x += y_row * static_cast<int64_t>(K);
+  w += static_cast<int64_t>(y_col) * K_w;
+  y += y_row * static_cast<int64_t>(N) + y_col;
+  z += y_row * static_cast<int64_t>(R) + band_z;
+  b += band_z * static_cast<int64_t>(N) + y_col;
+
+  LoaderW loader_w(w, K, Ws, simd_gid, simd_lid);
+
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+
+  const short tm = SM * (simd_gid / WN);
+  const short tn = SN * (simd_gid % WN);
+
+  constexpr bool transpose_a = false;
+  constexpr bool transpose_b = true;
+
+  // Spans are clamped in int before narrowing: M and N pass 32767.
+  const short sgp_sm = short(min(int(SM), M - (y_row + tm)));
+  const bool is_unaligned_sm = (M - y_row) < BM;
+  // A simdgroup row at or beyond M keeps its share of the weight decode,
+  // of the tail fill and every barrier, and skips the A loads, the MMAs
+  // and the store.
+  const bool sg_live = tm < M - y_row;
+
+  const short sgp_sn = aligned_N ? SN : short(min(int(SN), N - (y_col + tn)));
+  const short tgp_bn = aligned_N ? BN : min(BN, int(N - (y_col)));
+  const bool is_unaligned_bn = aligned_N ? false : (tgp_bn != BN);
+
+  NAXTile<float, TM, TN> Dtile;
+  Dtile.clear();
+
+  x += tm * K;
+  z += tm * R;
+
+  dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
+    dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
+      for (int k = 0; k < K; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (kAlignedN.value) {
+          loader_w.load_unsafe();
+        } else {
+          loader_w.load_safe(short2(BK, tgp_bn));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        STEEL_PRAGMA_NO_UNROLL
+        for (int kk1 = 0; sg_live && kk1 < BK; kk1 += SK) {
+          NAXTile<T, TM, TK> Atile;
+          NAXTile<T, TN, TK> Btile;
+
+          volatile int compiler_barrier;
+
+          if constexpr (kAlignedM.value) {
+            Atile.load(x + kk1, K);
+          } else {
+            Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+          }
+
+          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+          tile_matmad_nax(
+              Dtile,
+              Atile,
+              metal::bool_constant<transpose_a>{},
+              Btile,
+              metal::bool_constant<transpose_b>{});
+
+          (void)compiler_barrier;
+        }
+
+        x += BK;
+        loader_w.next();
+      }
+
+      // The tail: up to BK ranks a step. Thread (simd_gid, simd_lid)
+      // fills 16 columns of the rank rows simd_lid, simd_lid + 32, ... of
+      // the weight tile from B. A rank row past the band's rank and a
+      // column past the band's end are filled with zero, and the A tile
+      // loads zero past the band's rank, so that neither a z column of
+      // another band nor a B value of another band enters the sum.
+      STEEL_PRAGMA_NO_UNROLL
+      for (int r0 = 0; r0 < band_rank; r0 += BK) {
+        const short rk = short(min(int(BK), band_rank - r0));
+        const short kk_end = short(((rk + SK - 1) / SK) * SK);
+        const short n0 = short(16 * simd_gid);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        STEEL_PRAGMA_NO_UNROLL
+        for (short j = short(simd_lid); j < kk_end; j += SIMD_SIZE) {
+          const device T* bj = b + (r0 + j) * static_cast<int64_t>(N) + n0;
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < 16; i++) {
+            T v = T(0);
+            if (j < rk && n0 + i < band_cols) {
+              v = bj[i];
+            }
+            Ws[(n0 + i) * BK_padded + j] = v;
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        STEEL_PRAGMA_NO_UNROLL
+        for (int kk1 = 0; sg_live && kk1 < kk_end; kk1 += SK) {
+          NAXTile<T, TM, TK> Atile;
+          NAXTile<T, TN, TK> Btile;
+
+          volatile int compiler_barrier;
+
+          const short zk = short(min(int(SK), rk - kk1));
+          if constexpr (kAlignedM.value) {
+            if (zk == SK) {
+              Atile.load(z + r0 + kk1, R);
+            } else {
+              Atile.load_safe(z + r0 + kk1, R, short2(zk, SM));
+            }
+          } else {
+            Atile.load_safe(z + r0 + kk1, R, short2(zk, sgp_sm));
+          }
+
+          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+          tile_matmad_nax(
+              Dtile,
+              Atile,
+              metal::bool_constant<transpose_a>{},
+              Btile,
+              metal::bool_constant<transpose_b>{});
+
+          (void)compiler_barrier;
+        }
+      }
+
+      if (!sg_live) {
+        return;
+      }
+
+      if constexpr (kAlignedM.value && kAlignedN.value) {
+        Dtile.store(y + tm * N + tn, N);
+      } else if (kAlignedM.value && sgp_sn == SN) {
+        Dtile.store(y + tm * N + tn, N);
+      } else {
+        Dtile.store_safe(y + tm * N + tn, N, short2(sgp_sn, sgp_sm));
+      }
+    });
+  });
+}
+
+// Kernel of one codec. LOADER64 decodes a K tile of 64 and LOADER128 a K
+// tile of 128. bands holds n_bands rows of (col_start, col_end, z_start,
+// rank), disjoint in columns, with every col_start on a column tile.
+#define KQ_NAX_DEFINE_LORA_KERNEL(codec, LOADER64, LOADER128)             \
+  template <                                                              \
+      typename T,                                                         \
+      bool aligned_N,                                                     \
+      int BM,                                                             \
+      int BN,                                                             \
+      int BK,                                                             \
+      int WM,                                                             \
+      int WN>                                                             \
+  [[kernel]] void kq_##codec##_qmm_t_nax_lora(                            \
+      const device uint8_t* w,                                            \
+      const device T* x,                                                  \
+      const device T* z,                                                  \
+      const device T* b,                                                  \
+      device T* y,                                                        \
+      const constant int& K,                                              \
+      const constant int& N,                                              \
+      const constant int& M,                                              \
+      const constant int& R,                                              \
+      const constant int& n_bands,                                        \
+      const constant int* bands,                                          \
+      uint3 tid [[threadgroup_position_in_grid]],                         \
+      uint3 tgp_grid [[threadgroups_per_grid]],                           \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                   \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                      \
+    tid = kq_swizzle_tid(tid, tgp_grid, N, BN);                           \
+    if (int(tid.y) * BM >= M) {                                           \
+      return;                                                             \
+    }                                                                     \
+    const int y_col = int(tid.x) * BN;                                    \
+    int band_z = 0;                                                       \
+    int band_rank = 0;                                                    \
+    int band_cols = 0;                                                    \
+    for (int i = 0; i < n_bands; i++) {                                   \
+      const int col_start = bands[4 * i];                                 \
+      const int col_end = bands[4 * i + 1];                               \
+      if (y_col >= col_start && y_col < col_end) {                        \
+        band_z = bands[4 * i + 2];                                        \
+        band_rank = bands[4 * i + 3];                                     \
+        band_cols = min(BN, col_end - y_col);                             \
+      }                                                                   \
+    }                                                                     \
+    constexpr int BK_padded = (BK + 16 / sizeof(T));                      \
+    threadgroup T Ws[BN * BK_padded];                                     \
+    if constexpr (BK == 64) {                                             \
+      using LoaderW = LOADER64<                                           \
+          T,                                                              \
+          BN,                                                             \
+          64,                                                             \
+          BK_padded,                                                      \
+          /*reduction_dim=*/1,                                            \
+          /*tgp_size=*/WM * WN * SIMD_SIZE>;                              \
+      kq_qmm_t_nax_lora_impl<T, LoaderW, aligned_N, BM, 64, BN, WM, WN>(  \
+          w,                                                              \
+          x,                                                              \
+          z,                                                              \
+          b,                                                              \
+          y,                                                              \
+          Ws,                                                             \
+          K,                                                              \
+          N,                                                              \
+          M,                                                              \
+          R,                                                              \
+          band_z,                                                         \
+          band_rank,                                                      \
+          band_cols,                                                      \
+          tid,                                                            \
+          simd_gid,                                                       \
+          simd_lid);                                                      \
+    } else {                                                              \
+      using LoaderW = LOADER128<                                          \
+          T,                                                              \
+          BN,                                                             \
+          128,                                                            \
+          BK_padded,                                                      \
+          /*reduction_dim=*/1,                                            \
+          /*tgp_size=*/WM * WN * SIMD_SIZE>;                              \
+      kq_qmm_t_nax_lora_impl<T, LoaderW, aligned_N, BM, 128, BN, WM, WN>( \
+          w,                                                              \
+          x,                                                              \
+          z,                                                              \
+          b,                                                              \
+          y,                                                              \
+          Ws,                                                             \
+          K,                                                              \
+          N,                                                              \
+          M,                                                              \
+          R,                                                              \
+          band_z,                                                         \
+          band_rank,                                                      \
+          band_cols,                                                      \
+          tid,                                                            \
+          simd_gid,                                                       \
+          simd_lid);                                                      \
+    }                                                                     \
+  }
+
+KQ_NAX_DEFINE_LORA_KERNEL(q4_k, KqNaxQ4_KBlockLoader, KqNaxQ4_KHalfLoader)
+#undef KQ_NAX_DEFINE_LORA_KERNEL
