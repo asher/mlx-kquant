@@ -784,11 +784,7 @@ static void kq_require_tile_kernel(
     const char* lever,
     const KqTile& t,
     const std::string& kname) {
-  if (!kq_has_kernel(d, kname)) {
-    throw std::invalid_argument(
-        std::string("[mlx_kquant] ") + lever + "=" + kq_tile_string(t) +
-        " selects kernel " + kname + ", which is not instantiated.");
-  }
+  kq_require_kernel(d, std::string(lever) + "=" + kq_tile_string(t), kname);
 }
 
 // One KQ_QMM_LOG line: kernel name, shape and grid of a qmm tile dispatch.

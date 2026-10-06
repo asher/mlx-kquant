@@ -8,9 +8,10 @@ packed weights [N, K] of one codec. Arms, all in one process:
   two_mm       the two matmuls alone, both evaluated, with no activation
                and no product: the part a fused kernel cannot remove
   glu          kq.quantized_matmul_glu with no lever set
-  glu:BMxBK    kq.quantized_matmul_glu on one tile, for a build with
-               KQ_PROBE_KERNELS=ON. BK takes a suffix: w for the two-walk
-               kernel, d for the one-walk kernel on two unpadded buffers
+  glu:BMxBK    kq.quantized_matmul_glu on one tile, in a build with
+               KQ_PROBE_KERNELS=ON only (--tiles). BK takes a suffix: w for
+               the two-walk kernel, d for the one-walk kernel on two
+               unpadded buffers
 
 Where the op has no fused kernel for the codec, the dtype, the shape or
 the GPU, glu is the composition, and composed against two_mm prices what a
@@ -363,6 +364,14 @@ def main():
         return
     a.cells = [c for c in a.cells.split(";") if c]
     a.tiles = [t for t in a.tiles.split(",") if t]
+    if a.tiles:
+        from mlx_kquant._ext import _probe_kernels
+
+        if not _probe_kernels():
+            ap.error(
+                "--tiles needs a build with KQ_PROBE_KERNELS=ON: this build "
+                "has one tile per codec and reads no tile lever"
+            )
     a.skip = [s for s in a.skip.split(",") if s]
     run(a)
 

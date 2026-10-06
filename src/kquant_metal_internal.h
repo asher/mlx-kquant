@@ -12,6 +12,7 @@
 
 #include <cstdlib>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -405,6 +406,19 @@ inline bool kq_has_kernel(Device& d, const std::string& kname) {
   auto fn = NS::TransferPtr(lib->newFunction(
       NS::String::string(kname.c_str(), NS::UTF8StringEncoding)));
   return fn.get() != nullptr;
+}
+
+// Raises when a lever setting selects a kernel the metallib does not carry,
+// naming the setting and the kernel.
+inline void kq_require_kernel(
+    Device& d,
+    const std::string& setting,
+    const std::string& kname) {
+  if (!kq_has_kernel(d, kname)) {
+    throw std::invalid_argument(
+        "[mlx_kquant] " + setting + " selects kernel " + kname +
+        ", which is not instantiated.");
+  }
 }
 
 // Func-constant variant for kernels specialized via an MTLFCList.

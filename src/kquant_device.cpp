@@ -111,6 +111,17 @@ int kq_env_flag(const char* name, int unset) {
   return parse_env_lever(name, unset, true);
 }
 
+int kq_env_lever_from(const char* name, int unset, int lowest) {
+  const int v = parse_env_lever(name, unset, false);
+  if (v >= lowest) {
+    return v;
+  }
+  const char* e = std::getenv(name);
+  const std::string takes = "an integer of at least " + std::to_string(lowest);
+  warn_env_lever(name, e != nullptr ? e : "", takes.c_str());
+  return unset;
+}
+
 int gpu_core_count() {
   const char* e = std::getenv("KQ_GPU_CORES");
   if (e != nullptr) {

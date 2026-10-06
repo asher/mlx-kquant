@@ -111,19 +111,23 @@ bool glu_on() {
 
 // Rows from which the fused kernel runs. The kernel is measured against
 // the composition from 1056 rows up; fewer rows build the composition.
-// KQ_GLU_MIN_ROWS replaces the bound.
+// KQ_GLU_MIN_ROWS replaces the bound with a value of at least 1. A value
+// below 1 keeps the bound, with a warning.
 constexpr int kGluMinRows = 1024;
 int glu_min_rows() {
-  static const int cached = kq_env_lever("KQ_GLU_MIN_ROWS", kGluMinRows);
-  return glu_tune_live() ? kq_env_lever("KQ_GLU_MIN_ROWS", kGluMinRows)
+  static const int cached =
+      kq_env_lever_from("KQ_GLU_MIN_ROWS", kGluMinRows, 1);
+  return glu_tune_live() ? kq_env_lever_from("KQ_GLU_MIN_ROWS", kGluMinRows, 1)
                          : cached;
 }
 
-// The op runs the two-walk kernel on a row tile of 128 and a K tile of
-// 128. KQ_GLU_BM and KQ_GLU_BK (64 or 128), KQ_GLU_WALKS=0 (the one-walk
-// kernel) and KQ_GLU_DUAL128=1 select probe kernels, which exist in a
-// build with KQ_PROBE_KERNELS=ON only. All are read once per process
-// unless KQ_TUNE_LIVE=1.
+// The op runs the two-walk kernel on a row tile of 128 and the codec's K
+// tile. A build with KQ_PROBE_KERNELS=ON carries more tiles and reads the
+// levers that select them: KQ_GLU_BM and KQ_GLU_BK (64 or 128),
+// KQ_GLU_WALKS=0 (the one-walk kernel) and KQ_GLU_DUAL128=1. They are read
+// once per process unless KQ_TUNE_LIVE=1. A release build has one tile per
+// codec and reads none of them.
+#ifdef KQ_PROBE_KERNELS
 int glu_lever(const char* name) {
   const int v = kq_env_lever(name, -1);
   return v == 64 || v == 128 ? v : -1;
@@ -145,6 +149,20 @@ bool glu_dual128() {
   static const bool cached = kq_env_flag("KQ_GLU_DUAL128", 0) != 0;
   return glu_tune_live() ? kq_env_flag("KQ_GLU_DUAL128", 0) != 0 : cached;
 }
+#else
+int glu_bm_lever() {
+  return -1;
+}
+int glu_bk_lever() {
+  return -1;
+}
+bool glu_walks() {
+  return true;
+}
+bool glu_dual128() {
+  return false;
+}
+#endif
 
 bool glu_log() {
   static const bool cached = std::getenv("KQ_QMM_LOG") != nullptr;
@@ -225,13 +243,27 @@ void KQuantMatmulFused::eval_gpu(
 
   const bool aligned = N % bn == 0;
   bool saturate = x.dtype() == mx::float16;
+  const bool walks = glu_walks();
+  const bool dual = !walks && bk == 128 && glu_dual128();
   const std::string kname = kq_kname_prefix(kquant_type_) + "qmm_t_nax_glu_" +
       kq_type_string(x.dtype()) + "_bm" + std::to_string(bm) + "_bn64_bk" +
       std::to_string(bk) +
-      (glu_walks()                      ? "w"
-           : bk == 128 && glu_dual128() ? "d"
-                                        : "") +
+      (walks      ? "w"
+           : dual ? "d"
+                  : "") +
       "_wm2_wn2_alN_" + (aligned ? "true" : "false");
+#ifdef KQ_PROBE_KERNELS
+  // A probe lever can name a tile that this codec or dtype has no kernel
+  // for. Raise with the levers and the kernel name before the dispatch.
+  if (bm != 128 || bk != glu_kernel_bk(kquant_type_, x.dtype()) || !walks) {
+    kq_require_kernel(
+        d,
+        "KQ_GLU_BM=" + std::to_string(bm) + " KQ_GLU_BK=" + std::to_string(bk) +
+            " KQ_GLU_WALKS=" + (walks ? "1" : "0") +
+            " KQ_GLU_DUAL128=" + (dual ? "1" : "0"),
+        kname);
+  }
+#endif
   const std::string hash_name =
       kname + "_act" + std::to_string(act_) + (saturate ? "_sat" : "");
   mx::metal::MTLFCList func_consts = {

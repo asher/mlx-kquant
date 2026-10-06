@@ -524,3 +524,28 @@ def test_bench_glu_runs_a_tiny_cell(tmp_path):
     assert 0.95 <= pk["glu"] <= 2.2, pk
     assert cell["check"]["glu"] < 2e-2
     assert "| glu |" in (tmp_path / "glu.md").read_text()
+
+
+def test_bench_glu_tiles_need_a_probe_build(tmp_path):
+    """A release build reads no tile lever, so --tiles is refused there
+    before anything runs."""
+    from mlx_kquant._ext import _probe_kernels
+
+    if _probe_kernels():
+        pytest.skip("a probe build runs --tiles")
+    out = subprocess.run(
+        [
+            sys.executable,
+            os.path.join(BENCH_DIR, "bench_glu.py"),
+            "--tiles",
+            "64x64",
+            "--out",
+            str(tmp_path / "glu"),
+        ],
+        timeout=120,
+        capture_output=True,
+        text=True,
+    )
+    assert out.returncode == 2, out.stderr[-2000:]
+    assert "KQ_PROBE_KERNELS=ON" in out.stderr
+    assert not (tmp_path / "glu.json").exists()

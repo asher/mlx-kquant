@@ -28,6 +28,10 @@ int kq_env_lever(const char* name, int unset);
 // also reads as `unset`, with the same warning.
 int kq_env_flag(const char* name, int unset);
 
+// kq_env_lever for a lever whose set values start at `lowest`: a smaller
+// integer also reads as `unset`, with the same warning.
+int kq_env_lever_from(const char* name, int unset, int lowest);
+
 // KVarN key/value widths the record codec supports.
 inline bool kq_kvarn_bits_ok(int bits) {
   return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||

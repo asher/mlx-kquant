@@ -656,3 +656,113 @@ def test_glu_kernel_below_min_rows_and_tiles_agree(codec):
         for walks, group in hashes.items():
             # A release build has no one-walk tile, so that group is empty.
             assert len(group) <= 1, (row["m"], row["n"], row["dtype"], walks)
+
+
+_PROBE = r"""
+import json, os, sys
+spec = json.loads(sys.argv[1])
+sys.path.insert(0, spec["tests_dir"])
+import mlx.core as mx
+import mlx_kquant as kq
+import test_matmul_glu as t
+
+out = []
+for i, c in enumerate(spec["calls"]):
+    dtype = getattr(mx, c["dtype"])
+    act = c.get("activation", "silu")
+    k = c.get("k", t.K)
+    (wg, wg64), (wu, wu64) = t._weights(c["codec"], c["n"], k)
+    x = t._x([c["m"], k], dtype, 7 * c["m"] + c["n"])
+    os.environ.update(c.get("env", {}))
+    print(f"[probe] {i}", file=sys.stderr, flush=True)
+    res = {"error": None}
+    try:
+        y = kq.quantized_matmul_glu(x, wg, wu, c["codec"], act)
+        mx.eval(y)
+        res["rel"] = t._rel(t._f64(y), t._ref(x, wg64, wu64, act))
+    except Exception as e:
+        res["error"] = f"{type(e).__name__}: {e}"
+    out.append(res)
+print("RESULT " + json.dumps(out))
+"""
+
+
+def _glu_probe(calls, env=None):
+    """Run GLU calls in a fresh interpreter that keeps no KQ_ variable but
+    those of env and of each call. Per call: glu (the GLU kernels that
+    KQ_QMM_LOG named), plain (the other kernels), stderr (its other
+    lines), error and rel."""
+    child_env = {k: v for k, v in os.environ.items() if not k.startswith("KQ_")}
+    child_env.update({"KQ_QMM_LOG": "1", **(env or {})})
+    spec = {"tests_dir": TESTS_DIR, "calls": calls}
+    p = subprocess.run(
+        [sys.executable, "-c", _PROBE, json.dumps(spec)],
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert p.returncode == 0, p.stderr[-3000:]
+    line = [ln for ln in p.stdout.splitlines() if ln.startswith("RESULT ")][-1]
+    results = json.loads(line[len("RESULT ") :])
+    cur = None
+    for ln in p.stderr.splitlines():
+        if ln.startswith("[probe] "):
+            cur = results[int(ln.split()[1])]
+            cur.update(glu=[], plain=[], stderr=[])
+        elif cur is None:
+            continue
+        elif ln.startswith("[kq qmm] "):
+            name = ln.split()[2]
+            cur["glu" if "_glu_" in name else "plain"].append(name)
+        else:
+            cur["stderr"].append(ln)
+    return results
+
+
+def test_glu_min_rows_lever_starts_at_one():
+    """KQ_GLU_MIN_ROWS moves the row bound. A value below 1 keeps the
+    bound of 1024 rows, with one warning per value."""
+    if not _nax():
+        pytest.skip("the fused kernel needs a NAX GPU")
+    call = {"codec": "q4_k", "m": 600, "n": 96, "dtype": "bfloat16"}
+    values = [
+        ("600", True, False),
+        ("601", False, False),
+        ("1", True, False),
+        ("0", False, True),
+        ("0", False, False),
+        ("-4", False, True),
+        ("false", False, True),
+    ]
+    calls = [dict(call, env={"KQ_GLU_MIN_ROWS": v}) for v, _, _ in values]
+    res = _glu_probe(calls, env={"KQ_TUNE_LIVE": "1"})
+    for (v, fused, warns), r in zip(values, res, strict=True):
+        assert r["error"] is None, (v, r["error"])
+        assert r["rel"] <= R1[mx.bfloat16], (v, r["rel"])
+        assert len(r["glu"]) == (1 if fused else 0), (v, r["glu"])
+        assert len(r["plain"]) == (0 if fused else 2), (v, r["plain"])
+        warned = [ln for ln in r["stderr"] if f"KQ_GLU_MIN_ROWS={v} is not" in ln]
+        assert len(warned) == warns, (v, r["stderr"])
+        if warns:
+            assert "at least 1" in warned[0]
+
+
+def test_glu_tile_levers_belong_to_a_probe_build():
+    """A release build reads no tile lever. A probe build raises for a tile
+    the codec has no kernel for, with the levers and the kernel name."""
+    if not _nax():
+        pytest.skip("the fused kernel needs a NAX GPU")
+    call = {"codec": "q5_k", "m": 1100, "n": 96, "dtype": "bfloat16"}
+    (r,) = _glu_probe([call], env={"KQ_GLU_BM": "64", "KQ_GLU_WALKS": "0"})
+    head = "kquant_q5_k_qmm_t_nax_glu_bfloat16_t_"
+    if _probe_kernels():
+        # q5_k has no one-walk kernel in any build.
+        assert r["error"] is not None and r["error"].startswith("ValueError")
+        assert "KQ_GLU_BM=64" in r["error"] and "KQ_GLU_WALKS=0" in r["error"]
+        assert head + "bm64_bn64_bk128_wm2_wn2_alN_false" in r["error"]
+        assert "not instantiated" in r["error"]
+    else:
+        assert r["error"] is None, r["error"]
+        assert r["glu"] == [head + "bm128_bn64_bk128w_wm2_wn2_alN_false"]
+        assert r["rel"] <= R1[mx.bfloat16]

@@ -169,12 +169,12 @@ Tuning levers (defaults are right for normal use):
 
 - `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
   `KQ_NAX_BM128_ODD_M`, `KQ_NAX_DB64`, the `_BK128` levers, `KQ_NAX_SWIZZLE`), the tile overrides
-  (`KQ_NAX_TILE`, `KQ_QMM_TILE`), `KQ_SPLITK_F32` and `KQ_QMM_LOG` read their variables on every
-  dispatch, so one process can switch tiles between calls on one resident copy of the weights;
-  `benchmarks/bench_dit_shapes.py` runs its tile arms this way. It reads the environment on every
-  dispatch, so it is for single-threaded A/B runs that set these variables between calls. Unset
-  (off) by default, and then each of them keeps its first read for the life of the process. Read
-  once per process.
+  (`KQ_NAX_TILE`, `KQ_QMM_TILE`), `KQ_SPLITK_F32`, `KQ_QMM_LOG` and the `quantized_matmul_glu`
+  levers (`KQ_GLU`, `KQ_GLU_MIN_ROWS`) read their variables on every dispatch, so one process can
+  switch tiles between calls on one resident copy of the weights; `benchmarks/bench_dit_shapes.py`
+  runs its tile arms this way. It reads the environment on every dispatch, so it is for
+  single-threaded A/B runs that set these variables between calls. Unset (off) by default, and
+  then each of them keeps its first read for the life of the process. Read once per process.
 - `KQ_NAX_TILE` - `bm,bn,wm,wn` pins the NAX `qmm_t` tile of every transpose call that reaches it,
   in place of the BM=32, BM=64 and BM=128 policy. BK stays 64, except where a `_BK128` lever sets
   it. The `_db` variant still follows `KQ_NAX_DB64` on the bm64 bn64 wm2 wn2 tile. A tile the
@@ -188,10 +188,10 @@ Tuning levers (defaults are right for normal use):
   `_bm<bm>_bn<bn>_wm<wm>_wn<wn>` before `_alN` and raises until such a kernel is built. Unset
   (off) by default. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_QMM_LOG` - set to any value, logs the kernel name, shape and grid of every NAX and ALU qmm
-  tile dispatch, every split-K dispatch, and every `verify_mma` and `verify_nax` dispatch, split
-  or not, to stderr, one `[kq qmm]` line each. The grid depth is the K slice count. The mat-vec
-  routes (`qmv`, `verify_qmv`, `mv_ext`) do not log. Unset (off) by default. Read once per
-  process unless `KQ_TUNE_LIVE=1`.
+  tile dispatch, every split-K dispatch, every `verify_mma` and `verify_nax` dispatch, split or
+  not, and every fused `quantized_matmul_glu` dispatch to stderr, one `[kq qmm]` line each. The
+  grid depth is the K slice count. The mat-vec routes (`qmv`, `verify_qmv`, `mv_ext`) do not log.
+  Unset (off) by default. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_SPLITK_F32` - partial dtype of the split-K routes (`splitk`, `nax_splitk`, the
   `KQ_QMM_MIDM` band, and `verify_mma` and `verify_nax` when they split K). Float partials let the
   fold round the result once, as the unsplit kernels do. Partials in the activation dtype round
@@ -589,8 +589,19 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
   unfused ops give them.
 
   Every other case builds the same product from `quantized_matmul` and stock ops: other codecs,
-  `q8_0` on float16, fewer rows, other inner dims, CPU streams and GPUs without NAX. `KQ_GLU=0`
-  builds it on every call.
+  `q8_0` on float16, fewer rows, other inner dims, CPU streams and GPUs without NAX.
+
+  Levers, each read once per process unless `KQ_TUNE_LIVE=1`:
+
+  - `KQ_GLU` - `0` builds the unfused ops on every call. Unset (on) by default.
+  - `KQ_GLU_MIN_ROWS` - the row count from which the fused kernel runs, an integer of at least 1.
+    A value below 1 keeps the default, with a warning on stderr. Default 1024.
+
+  A build with the CMake option `KQ_PROBE_KERNELS=ON`, which `KQ_PROBE_KERNELS=1` in the
+  environment of the build selects, also carries the tiles that the shipped ones were measured
+  against. It reads `KQ_GLU_BM`, `KQ_GLU_BK`, `KQ_GLU_WALKS` and `KQ_GLU_DUAL128` to select one,
+  and a tile it does not carry for the codec raises a `ValueError` that names the levers and the
+  kernel. A release build reads none of the four.
 
   `mx.grad` gives the gradient with respect to x at every row count: the gradient of the fused
   kernel runs the unfused ops. The weights are frozen, as in `quantized_matmul`. `mx.jvp` and
