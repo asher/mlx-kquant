@@ -254,6 +254,39 @@ def test_glu_float16_store_saturates():
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["bf16", "f16"])
+@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+@pytest.mark.parametrize("codec", ["q4_k", "q6_k"])
+def test_glu_nan_and_inf_pass(codec, activation, dtype):
+    """A NaN or an infinity in x gives NaN and inf where the unfused ops
+    give them. The float16 store saturates finite values only."""
+    n, m = 96, 1100
+    (wg, _), (wu, _) = _weights(codec, n, K)
+    xn = np.array(_x([m, K], dtype, 31).astype(mx.float32))
+    # Rows of the first, a middle and the partial last row tile.
+    xn[3, 5] = np.nan
+    xn[200, 700] = np.inf
+    xn[511, 0] = -np.inf
+    xn[640, 100] = np.inf
+    xn[640, 101] = -np.inf
+    xn[1090, 767] = -np.inf
+    xn[1099, 300] = np.nan
+    x = mx.array(xn).astype(dtype)
+    mx.eval(x)
+    y = kq.quantized_matmul_glu(x, wg, wu, codec, activation)
+    comp = _composed(x, wg, wu, codec, activation)
+    mx.eval(y, comp)
+    got = np.array(y.astype(mx.float32))
+    ref = np.array(comp.astype(mx.float32))
+    assert np.isnan(ref).any() and np.isinf(ref).any()
+    assert (np.isnan(got) == np.isnan(ref)).all()
+    assert (np.isinf(got) == np.isinf(ref)).all()
+    inf = np.isinf(ref)
+    assert (got[inf] == ref[inf]).all()
+    ok = np.isfinite(ref)
+    assert _rel(got[ok].astype(np.float64), ref[ok].astype(np.float64)) <= 2 * R1[dtype]
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["bf16", "f16"])
 @pytest.mark.parametrize("m", [1023, 1024, 1039, 1100, 1152])
 @pytest.mark.parametrize("n", [64, 200])
 @pytest.mark.parametrize("codec", OTHER_CODECS)

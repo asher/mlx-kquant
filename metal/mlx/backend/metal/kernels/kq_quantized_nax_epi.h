@@ -13,8 +13,17 @@
 
 // 0 = silu, 1 = gelu (tanh form).
 constant int kq_epi_act [[function_constant(360)]];
-// Clamp to the finite half range before the store (float16 outputs).
+// Saturate at the finite half range before the store (float16 outputs).
 constant bool kq_epi_saturate [[function_constant(361)]];
+
+// A finite value past the half range stores the largest finite half with
+// its sign. A NaN and an infinity pass: clamp() returns its lower bound for
+// a NaN, so the two sides are compared one at a time.
+METAL_FUNC float kq_epi_saturate16(float v) {
+  v = (v > 65504.0f && v <= FLT_MAX) ? 65504.0f : v;
+  v = (v < -65504.0f && v >= -FLT_MAX) ? -65504.0f : v;
+  return v;
+}
 
 METAL_FUNC float kq_epi_activation(float g) {
   if (kq_epi_act == 1) {
@@ -210,7 +219,7 @@ METAL_FUNC void kq_qmm_t_nax_glu_impl(
         for (short e = 0; e < NE; ++e) {
           float v = kq_epi_activation(Dg.val_frags[f][e]) * Du.val_frags[f][e];
           if (kq_epi_saturate) {
-            v = clamp(v, -65504.0f, 65504.0f);
+            v = kq_epi_saturate16(v);
           }
           Dg.val_frags[f][e] = v;
         }
@@ -230,8 +239,9 @@ METAL_FUNC void kq_qmm_t_nax_glu_impl(
 // GLU product in two K walks with one f32 tile: the gate walk stores
 // act(x @ Wg^T) to y in the output dtype, the up walk reads that tile back
 // and stores the product. One accumulator tile is live at a time, as in
-// the plain kernels. With the saturating store the activation is clamped
-// to the finite half range before the product, and the product after it.
+// the plain kernels. With the saturating store a finite activation past
+// the half range is stored as the largest finite half before the product,
+// and a finite product after it. A NaN or an infinity passes.
 template <
     typename T,
     typename LoaderW,
@@ -351,7 +361,7 @@ METAL_FUNC void kq_qmm_t_nax_glu_walks_impl(
             for (short e = 0; e < NE; ++e) {
               float v = kq_epi_activation(Dtile.val_frags[f][e]);
               if (kq_epi_saturate) {
-                v = clamp(v, -65504.0f, 65504.0f);
+                v = kq_epi_saturate16(v);
               }
               Dtile.val_frags[f][e] = v;
             }
@@ -371,7 +381,7 @@ METAL_FUNC void kq_qmm_t_nax_glu_walks_impl(
             for (short e = 0; e < NE; ++e) {
               float v = Ctile.val_frags[f][e] * Dtile.val_frags[f][e];
               if (kq_epi_saturate) {
-                v = clamp(v, -65504.0f, 65504.0f);
+                v = kq_epi_saturate16(v);
               }
               Dtile.val_frags[f][e] = v;
             }

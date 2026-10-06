@@ -582,8 +582,10 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
 
   x is float16 or bfloat16, and float32 x runs in bfloat16 as in `quantized_matmul`. Leading batch
   dims fold into rows. The activation and the product run in f32, with one rounding of the
-  activation and one of the product. A float16 output saturates at the largest finite value, the
-  activation before the product and the product at the store, where the unfused ops return inf.
+  activation and one of the product. A finite float16 result past the half range is stored as the
+  largest finite value with its sign, the activation before the product and the product at the
+  store, where the unfused ops return inf. A NaN or an infinity in x gives NaN and inf where the
+  unfused ops give them.
 
   Every other case builds the same product from `quantized_matmul` and stock ops: other codecs,
   `q8_0` on float16, fewer rows, other inner dims, CPU streams and GPUs without NAX. `KQ_GLU=0`
