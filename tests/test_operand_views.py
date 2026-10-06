@@ -14,9 +14,10 @@ the call or not:
   builder gives for a view that has memory;
 - the keys and values of sdpa_prefill_block_sparse are refused when their
   head dim is not dense, as in the other attention ops;
-- the window, pool and pool scales of the sparse attention ops are copied
-  when a row of theirs is not dense, and a packed pool is copied when its
-  codes and scales step batches differently.
+- the window, pool and pool scales of the sparse attention ops and the
+  keys of dsa_indexer_score_decode are copied when a row of theirs is not
+  dense, and a packed pool is copied when its codes and scales step
+  batches differently.
 
 An operand that is dense adds no node to the graph.
 
@@ -625,3 +626,23 @@ def test_sparse_packed_pool_views(op, batch, state):
     # buffer, and the dense scales do not.
     _check_embedded(_embedded(codes, 1), lambda v: run(v, scales), want, state)
     _check_embedded(_embedded(scales, 1), lambda v: run(codes, v), want, state)
+
+
+@metal_only
+@pytest.mark.parametrize("state", ["lazy", "evaluated"])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16], ids=["f16", "bf16"])
+def test_indexer_score_decode_key_views(dtype, state):
+    """One sequence passes its keys through a reshape that keeps a view."""
+    rng = np.random.default_rng(11)
+    heads, ql, rows, d = 64, 2, 1027, 128
+    q = mx.array(rng.standard_normal((1, heads, ql, d)) * 0.4).astype(dtype)
+    k = mx.array(rng.standard_normal((1, rows, d)) * 0.4).astype(dtype)
+    w = mx.array(rng.standard_normal((1, ql, heads)) * 0.2).astype(dtype)
+    mx.eval(q, k, w)
+    want = kq.dsa_indexer_score_decode(q, k, w, 4106, 4)
+    _check_embedded(
+        _embedded(k, 1),
+        lambda v: kq.dsa_indexer_score_decode(q, v, w, 4106, 4),
+        want,
+        state,
+    )

@@ -70,6 +70,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dim that are not evaluated before the call, instead of reading them as dense.
 - `sdpa_sparse_decode` and `sdpa_sparse_prefill` return correct values for a
   window, pool or pool scales view with a strided or reversed last dim.
+- `dsa_indexer_score_decode` returns correct scores for one sequence whose
+  keys are a view with a strided or reversed last dim.
 - `quantized_matmul` returns zeros for an inner dim of 0. On a CPU stream a
   weight with no rows ended the process at more than 16 rows of x.
 - A float16 matmul of 128 or fewer rows split over K, MTP verify among them,

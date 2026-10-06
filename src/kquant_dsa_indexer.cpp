@@ -231,7 +231,10 @@ void KQDsaIndexerScoreDecode::eval_gpu(
   auto& ce = mx::metal::get_command_encoder(s);
 
   const auto& q = inputs[0];
-  const auto& k = inputs[1]; // [B, P * D], the row-major key block
+  // [B, P * D], the row-major key block. A batch is row-major from the
+  // builder. One sequence comes through a reshape that can keep a view
+  // with an element stride other than 1, which is copied here.
+  const mx::array k = kq_unit_stride_gpu(inputs[1], s);
   const auto& weights = inputs[2];
   auto& out = outputs[0];
 
@@ -514,9 +517,10 @@ mx::array dsa_indexer_score_decode(
   // a no-op at eval when the input already is. At B == 1 the keys go
   // through a reshape to [1, P * D] instead: a cache's prefix slice is a
   // row-contiguous view that Reshape keeps as a view at eval, while
-  // Contiguous would copy it (its buffer is larger than the view); any
-  // other layout Reshape copies. The kernel steps batches by P * D, so a
-  // batch of slices still needs the contiguous copy.
+  // Contiguous would copy it (its buffer is larger than the view).
+  // Reshape keeps other views too, and the eval copies one whose rows
+  // are not dense. The kernel steps batches by P * D, so a batch of
+  // slices still needs the contiguous copy.
   auto q = mx::contiguous(mx::astype(queries, final_type, s), false, s);
   auto k = mx::reshape(
       mx::astype(keys, final_type, s),
