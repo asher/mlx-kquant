@@ -554,10 +554,10 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
   On a NAX GPU (M5), from 1024 activation rows, one dispatch computes the product for `q4_k`,
   `q5_k` and `q6_k` weights whose inner dim is a multiple of 128, and for `q8_0` weights on
   bfloat16 activations whose inner dim is a multiple of 64. Each threadgroup owns a 128 by 64 tile
-  of y.
-  It walks K over the gate weight, applies the activation in f32 and stores the tile, then walks K
-  over the up weight and multiplies the stored tile into the sum before the final store. y is the
-  only buffer the op writes, so a call peaks at one output where the unfused ops peak at two.
+  of y. It walks K over the gate weight, applies the activation in f32 and stores the tile, then
+  walks K over the up weight and multiplies the stored tile into the sum before the final store.
+  y is the only buffer the op writes, so a call peaks at one output where the unfused ops peak at
+  two with `silu` and at three with `gelu_tanh`.
 
   Measured on an M5 Max against the two matmuls and the stock activation and product, as the median
   of rotated rounds in one process:
@@ -577,9 +577,10 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
   | 4096, 12288, bfloat16 | 16416 | 0.97 | 0.97 | 0.97 | 0.99 |
 
   From 4128 rows the gain is the activation and product pass that the kernel removes, 1 to 6
-  percent. `q4_k` on float16 at 16416 rows is a tie. The `q8_0` kernel is slower than the unfused
-  ops on float16 at 1056 and 16416 rows, so `q8_0` on float16 builds the unfused ops.
-  `benchmarks/bench_glu.py` repeats the table for one codec.
+  percent. `q4_k` on float16 at 16416 rows is a tie. The `q8_0` cells on float16 come from a
+  kernel that the build does not carry: it ran slower than the unfused ops at 1056 and 16416 rows,
+  and they are the reason `q8_0` on float16 builds the unfused ops. `benchmarks/bench_glu.py`
+  repeats the table for one codec, for the kernels the build carries.
 
   x is float16 or bfloat16, and float32 x runs in bfloat16 as in `quantized_matmul`. Leading batch
   dims fold into rows. The activation and the product run in f32, with one rounding of the
