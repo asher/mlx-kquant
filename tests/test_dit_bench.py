@@ -461,7 +461,13 @@ def test_lever_arm_pairs_with_kq(tmp_path):
     for g in p["groups"]:
         (c,) = g["cells"]
         assert set(c["arms"]) == {"kq", "kq_aa", "sw1"}
-        assert c["ratios"]["sw1/kq"]["pairs"]
+        # Every visit pairs the lever arm with kq. A visit whose kq sample
+        # is at or below 0 has no ratio and is counted as dropped, and at a
+        # shape this small any visit can be one.
+        rt = c["ratios"]["sw1/kq"]
+        visits = len(c["arms"]["kq"]["samples"])
+        assert visits == len(c["arms"]["sw1"]["samples"]) > 0
+        assert len(rt["pairs_raw"]) + rt["dropped"] == visits
     assert "sw1/kq" in (tmp_path / "run.md").read_text()
 
 
