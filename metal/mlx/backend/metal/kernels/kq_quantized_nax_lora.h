@@ -14,10 +14,13 @@
 
 // The walk of a band's rank, 32 ranks a step, into the accumulator of a
 // simdgroup. sg_cols is how many of the simdgroup's columns lie in the
-// band, and sg_rows how many of its rows lie in M. Past the band's rank
-// the A tile and the B tile load zero, and past the band's end the B tile
-// loads zero, so that neither a z column nor a B value of another band
-// enters the sum, whatever it holds.
+// band, and sg_rows how many of its rows lie in M. A simdgroup with no
+// column in the band runs no step, so no value of z reaches its columns.
+// Past the band's rank the A tile and the B tile load zero, so no z column
+// and no B row of another band enters the sum, whatever it holds. Past the
+// band's end the B tile loads zero. The host runs this kernel only for
+// bands that end on a simdgroup's column tile or at N, so a simdgroup holds
+// no stored column outside its band.
 template <
     typename T,
     const bool aligned_M,
@@ -73,8 +76,8 @@ METAL_FUNC void kq_qmm_t_nax_lora_tail(
 
 // band_z, band_rank and band_cols describe the column band of the
 // threadgroup's tile: the first z column, the rank, and how many of the
-// tile's columns lie in the band. A tile outside every band has rank 0 and
-// runs the plain walk alone.
+// tile's columns lie in the band. A tile with no column in a band has
+// band_cols at or below 0 and runs the plain walk alone.
 template <
     typename T,
     typename LoaderW,
@@ -211,8 +214,11 @@ METAL_FUNC void kq_qmm_t_nax_lora_impl(
 }
 
 // Kernel of one codec. LOADER64 decodes a K tile of 64 and LOADER128 a K
-// tile of 128. bands holds n_bands rows of (col_start, col_end, z_start,
-// rank), disjoint in columns, with every col_start on a column tile.
+// tile of 128; a codec with one K tile names its loader twice. bands holds
+// n_bands rows of (col_start, col_end, z_start, rank), disjoint and in
+// column order, with every col_start on a column tile. The tile takes the
+// last band that starts at or before it: past that band's end band_cols is
+// at or below 0.
 #define KQ_NAX_DEFINE_LORA_KERNEL(codec, LOADER64, LOADER128)             \
   template <                                                              \
       typename T,                                                         \
@@ -247,12 +253,10 @@ METAL_FUNC void kq_qmm_t_nax_lora_impl(
     int band_rank = 0;                                                    \
     int band_cols = 0;                                                    \
     for (int i = 0; i < n_bands; i++) {                                   \
-      const int col_start = bands[4 * i];                                 \
-      const int col_end = bands[4 * i + 1];                               \
-      if (y_col >= col_start && y_col < col_end) {                        \
+      if (y_col >= bands[4 * i]) {                                        \
         band_z = bands[4 * i + 2];                                        \
         band_rank = bands[4 * i + 3];                                     \
-        band_cols = min(BN, col_end - y_col);                             \
+        band_cols = min(BN, bands[4 * i + 1] - y_col);                    \
       }                                                                   \
     }                                                                     \
     constexpr int BK_padded = (BK + 16 / sizeof(T));                      \
@@ -311,4 +315,7 @@ METAL_FUNC void kq_qmm_t_nax_lora_impl(
   }
 
 KQ_NAX_DEFINE_LORA_KERNEL(q4_k, KqNaxQ4_KBlockLoader, KqNaxQ4_KHalfLoader)
+KQ_NAX_DEFINE_LORA_KERNEL(q5_k, KqNaxQ5_KBlockLoader, KqNaxQ5_KHalfLoader)
+KQ_NAX_DEFINE_LORA_KERNEL(q6_k, KqNaxQ6_KBlockLoader, KqNaxQ6_KHalfLoader)
+KQ_NAX_DEFINE_LORA_KERNEL(q8_0, KqNaxQ8_0BlockLoader, KqNaxQ8_0BlockLoader)
 #undef KQ_NAX_DEFINE_LORA_KERNEL

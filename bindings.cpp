@@ -697,13 +697,17 @@ NB_MODULE(_ext, m) {
         Quantized matmul with a low-rank term:
         y = x @ W^T + (strength * (x @ A)) @ B.
 
-        On a NAX GPU, for q4_k weights on bfloat16, with at least 1024
-        rows, every band starting on a multiple of 64 columns, at most 16
-        bands and a rank of at most 256 per band (without bands, a rank of
-        at most 256), stock ops compute z = strength * (x @ A) and one
-        dispatch walks the rank for z and B and then K for the weight in
-        the same f32 sums. y is the only output buffer and is rounded once,
-        at the store. Every other case builds the same sum from
+        On a NAX GPU, for q4_k, q5_k, q6_k and q8_0 weights on bfloat16
+        with K up to 4096 and N of at least K, with at least 4096 rows
+        (from 1024 rows where N is at least 8192), every band starting on
+        a multiple of 64 columns and ending on a multiple of 32 columns or
+        at N, at most 16 bands and a rank of at most 256 per band (without
+        bands, a rank of at most 256), stock ops compute
+        z = strength * (x @ A) and one dispatch walks the rank for z and B
+        and then K for the weight in the same f32 sums. y is the only
+        output buffer and is rounded once, at the store. KQ_QMM_LORA=2
+        runs the kernel from 1024 rows at every K and N, and 0 turns the
+        kernel off. Every other case builds the same sum from
         quantized_matmul and stock ops, which round the matmul to the
         activation dtype before the add. mx.grad gives the gradient with
         respect to x, lora_a, lora_b and strength at every row count: the

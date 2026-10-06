@@ -20,6 +20,11 @@
       2,                                                                     \
       2)
 
-instantiate_kquant_nax_lora(q4_k, bfloat16_t, true,  128, 128)
-instantiate_kquant_nax_lora(q4_k, bfloat16_t, false, 128, 128)
+#define instantiate_kquant_nax_lora_codec(codec, bk)                         \
+  instantiate_kquant_nax_lora(codec, bfloat16_t, true,  128, bk)             \
+  instantiate_kquant_nax_lora(codec, bfloat16_t, false, 128, bk)
+instantiate_kquant_nax_lora_codec(q4_k, 128)
+instantiate_kquant_nax_lora_codec(q5_k, 128)
+instantiate_kquant_nax_lora_codec(q6_k, 128)
+instantiate_kquant_nax_lora_codec(q8_0, 64)
     // clang-format on

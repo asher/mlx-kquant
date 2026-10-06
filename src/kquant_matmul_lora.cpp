@@ -3,11 +3,12 @@
 //
 //   y = x @ W^T + (strength * (x @ A)) @ B
 //
-// On a NAX GPU, for the codecs with a kernel, from kLoraMinRows rows, stock
-// ops compute z = strength * (x @ A) and one dispatch computes the product
-// and adds z @ B in its accumulator, with y as its only output buffer.
-// Every other case builds the same sum from quantized_matmul and stock
-// ops.
+// On a NAX GPU, for the codecs with a kernel (q4_k, q5_k, q6_k and q8_0 on
+// bfloat16), from kLoraMinRows rows, on the shapes of lora_shape_rule,
+// stock ops compute z = strength * (x @ A) and one dispatch computes the
+// product and adds z @ B in its accumulator, with y as its only output
+// buffer. Every other case builds the same sum from quantized_matmul and
+// stock ops.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -41,6 +42,8 @@ const char* kLoraOp = "[mlx_kquant.quantized_matmul_lora]";
 
 // Column tile of the kernel. A band starts on a column tile.
 constexpr int kLoraBn = 64;
+// Column tile of a simdgroup. A band ends on one, or at N.
+constexpr int kLoraSn = 32;
 // Largest rank of one band the kernel runs.
 constexpr int kLoraMaxRank = 256;
 // Most bands the kernel looks through per threadgroup.
@@ -49,8 +52,14 @@ constexpr int kLoraMaxBands = 16;
 // K tile of the kernel for a codec and an activation dtype, 0 where the op
 // builds the composition.
 int lora_kernel_bk(const std::string& t, mx::Dtype dt) {
-  if (t == "q4_k" && dt == mx::bfloat16) {
+  if (dt != mx::bfloat16) {
+    return 0;
+  }
+  if (t == "q4_k" || t == "q5_k" || t == "q6_k") {
     return 128;
+  }
+  if (t == "q8_0") {
+    return 64;
   }
   return 0;
 }
@@ -60,10 +69,12 @@ bool lora_tune_live() {
   return live;
 }
 
-// KQ_QMM_LORA=0 builds the composition on every call.
-bool lora_on() {
-  static const bool cached = kq_env_flag("KQ_QMM_LORA", 1) != 0;
-  return lora_tune_live() ? kq_env_flag("KQ_QMM_LORA", 1) != 0 : cached;
+// KQ_QMM_LORA: 0 = the composition on every call, 2 = the kernel wherever
+// it can run, unset, 1 or any other value = the shape rule
+// (lora_shape_rule).
+int lora_mode() {
+  static const int cached = kq_env_lever("KQ_QMM_LORA", 1);
+  return lora_tune_live() ? kq_env_lever("KQ_QMM_LORA", 1) : cached;
 }
 
 // Rows from which the kernel runs. KQ_QMM_LORA_MIN_ROWS replaces the bound
@@ -76,6 +87,22 @@ int lora_min_rows() {
   return lora_tune_live()
       ? kq_env_lever_from("KQ_QMM_LORA_MIN_ROWS", kLoraMinRows, 1)
       : cached;
+}
+
+// The shapes on which the kernel runs under the default mode: those where
+// it measured faster than the unfused ops. The kernel removes the second
+// pass over y, a cost in proportion to N. It waits for z, a cost in
+// proportion to K that the unfused product does not pay, since x @ A runs
+// beside it. So the kernel is faster where N is at least K, and its share
+// of the call falls as K grows: above kLoraRuleK the two forms tie. Where N
+// is near K the gain is about one percent and holds from kLoraRuleRows
+// rows. Below that row count the kernel runs from N of kLoraRuleWideN.
+constexpr int kLoraRuleK = 4096;
+constexpr int kLoraRuleRows = 4096;
+constexpr int kLoraRuleWideN = 8192;
+bool lora_shape_rule(int K, int N, int64_t rows) {
+  return K <= kLoraRuleK && N >= K &&
+      (rows >= kLoraRuleRows || N >= kLoraRuleWideN);
 }
 
 bool lora_log() {
@@ -439,15 +466,24 @@ mx::array quantized_matmul_lora(
         s);
   }
 
+  // The kernel walks K in whole K tiles, so a K off the tile runs the
+  // composition (q8_0 only: the K-quant codecs hold K in blocks of 256).
   const int bk = lora_kernel_bk(kquant_type, out_type);
-  bool fused = s.device == mx::Device::gpu && nax_available() && lora_on() &&
-      bk > 0 && rows >= lora_min_rows();
+  const int mode = lora_mode();
+  bool fused = s.device == mx::Device::gpu && nax_available() && mode != 0 &&
+      bk > 0 && K % bk == 0 && rows >= lora_min_rows() &&
+      (mode == 2 || lora_shape_rule(K, N, rows));
   if (bands.empty()) {
     fused = fused && R <= kLoraMaxRank;
   } else {
     fused = fused && bands.size() / 4 <= kLoraMaxBands;
     for (size_t i = 0; i < bands.size(); i += 4) {
-      fused = fused && bands[i] % kLoraBn == 0 && bands[i + 3] <= kLoraMaxRank;
+      // A band that ended inside a simdgroup's columns would put z times
+      // zero on the columns after it, which is not zero for a z that is
+      // not finite.
+      const bool end_ok = bands[i + 1] % kLoraSn == 0 || bands[i + 1] == N;
+      fused = fused && bands[i] % kLoraBn == 0 && end_ok &&
+          bands[i + 3] <= kLoraMaxRank;
     }
   }
 

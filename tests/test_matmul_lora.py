@@ -1,9 +1,14 @@
 """quantized_matmul_lora: y = x @ W^T + (strength * (x @ A)) @ B.
 
-On a NAX GPU the op runs one kernel for q4_k weights on bfloat16 from 1024
-rows: stock ops compute z = strength * (x @ A), and the kernel walks the
-rank for z and B and then K for the weight in the same f32 sums. Everywhere
-else it builds the sum from quantized_matmul and stock ops.
+On a NAX GPU the op runs one kernel for q4_k, q5_k, q6_k and q8_0 weights
+on bfloat16 from 1024 rows: stock ops compute z = strength * (x @ A), and
+the kernel walks the rank for z and B and then K for the weight in the same
+f32 sums. Everywhere else it builds the sum from quantized_matmul and stock
+ops. By itself the op gives the kernel only the calls of its shape rule
+(K up to 4096, N of at least K and, below 4096 rows, N of at least 8192).
+The weights here are narrow, so the tests of this module run under
+KQ_QMM_LORA=2, which runs the kernel wherever it can run, and the rule is
+tested in fresh interpreters.
 
 - R1: relative Frobenius error against the float64 sum, at most 6e-3 on
   bfloat16 and 1e-3 on float16.
@@ -39,32 +44,69 @@ CPU_REL = 5e-2
 K = 768
 # Rows from which the op runs the kernel (kLoraMinRows).
 MIN_ROWS = 1024
-# Column tile: a band starts on a multiple of it.
+# Column tile: a band starts on a multiple of it. A band ends on the column
+# tile of a simdgroup, or at N.
 BN = 64
+SN = 32
 # Largest rank of a band, and most bands, the kernel runs.
 MAX_RANK = 256
 MAX_BANDS = 16
-# Codec and activation dtype pairs with a kernel.
-KERNELS = {("q4_k", mx.bfloat16)}
+# The shape rule: by itself the op gives the kernel a weight with K up to
+# RULE_K and N of at least K, from RULE_ROWS rows, and below that row count
+# only with N of at least RULE_WIDE_N.
+RULE_K = 4096
+RULE_ROWS = 4096
+RULE_WIDE_N = 8192
+# Codecs with a kernel on bfloat16, and the K tile of each kernel. K is a
+# whole number of K tiles where the kernel runs.
+KERNEL_BK = {"q4_k": 128, "q5_k": 128, "q6_k": 128, "q8_0": 64}
+CODECS = list(KERNEL_BK)
+KERNELS = {(c, mx.bfloat16) for c in CODECS}
+# Every kernel, and float16 once: float16 has no kernel.
+PAIRS = [(c, mx.bfloat16) for c in CODECS] + [("q4_k", mx.float16)]
+PAIR_IDS = [f"{c}-bf16" for c in CODECS] + ["q4_k-f16"]
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _W = {}
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _kernel_wherever_it_can_run():
+    """KQ_QMM_LORA=2 for the calls of this module. The op reads the lever
+    at its first call in the process and keeps it, and no other module
+    calls the op."""
+    old = os.environ.get("KQ_QMM_LORA")
+    os.environ["KQ_QMM_LORA"] = "2"
+    yield
+    if old is None:
+        del os.environ["KQ_QMM_LORA"]
+    else:
+        os.environ["KQ_QMM_LORA"] = old
 
 
 def _nax():
     return not force_cpu() and kq.nax_available()
 
 
-def _fused(rows, rank, codec="q4_k", dtype=mx.bfloat16, bands=None):
-    """The dispatch rule of the op."""
+def _shape_rule(k, n, rows):
+    """The calls on which the op picks the kernel by itself."""
+    return k <= RULE_K and n >= k and (rows >= RULE_ROWS or n >= RULE_WIDE_N)
+
+
+def _fused(rows, rank, n, codec="q4_k", dtype=mx.bfloat16, bands=None, k=K):
+    """Where the kernel can run: the dispatch rule of the op under
+    KQ_QMM_LORA=2."""
     if not _nax() or (codec, dtype) not in KERNELS:
+        return False
+    if k % KERNEL_BK[codec]:
         return False
     if rows < MIN_ROWS or rank == 0:
         return False
     if bands is None:
         return rank <= MAX_RANK
     return len(bands) <= MAX_BANDS and all(
-        cs % BN == 0 and rb <= MAX_RANK for cs, _, _, rb in bands
+        cs % BN == 0 and (ce % SN == 0 or ce == n) and rb <= MAX_RANK
+        for cs, ce, _, rb in bands
     )
 
 
@@ -172,7 +214,7 @@ def _check(x, w, wd, a, b, codec="q4_k", strength=None, bands=None, cols=None):
     assert np.isfinite(got).all()
     ref = _ref(x, wd, a, b, strength, bands)[:, sel]
     err = _rel(got, ref)
-    if not _fused(x.size // k, a.shape[1], codec, dtype, bands):
+    if not _fused(x.size // k, a.shape[1], n, codec, dtype, bands, k):
         comp = _composed(x, w, a, b, codec, strength, bands)
         mx.eval(comp)
         assert np.array_equal(_f64(comp).reshape(-1, n)[:, sel], got)
@@ -192,37 +234,48 @@ def _case(m, n, r, dtype=mx.bfloat16, codec="q4_k", k=K, seed=0, **kw):
     return _check(_x([m, k], dtype, 7 * m + n + r), w, wd, a, b, codec, **kw)
 
 
-@pytest.mark.parametrize("dtype", DTYPES, ids=["bf16", "f16"])
+@pytest.mark.parametrize(("codec", "dtype"), PAIRS, ids=PAIR_IDS)
 @pytest.mark.parametrize(
     "m", [1, 17, 577, 1023, 1024, 1025, 1039, 1040, 1100, 1151, 1152]
 )
 @pytest.mark.parametrize("n", [64, 96, 200])
-def test_lora_rows_and_columns(m, n, dtype):
+def test_lora_rows_and_columns(m, n, codec, dtype):
     # Below MIN_ROWS the op is the composition. From there up: a last row
     # tile of 1 row, 15 and 16 rows, 76 rows, 127 rows and none, with N on
     # and off the column tile.
-    _case(m, n, 16, dtype)
+    _case(m, n, 16, dtype, codec)
 
 
+@pytest.mark.parametrize("codec", CODECS)
 @pytest.mark.parametrize("r", [1, 4, 16, 31, 32, 33, 64, 80, 96, 130, 192, 256, 257])
 @pytest.mark.parametrize("n", [128, 200])
-def test_lora_ranks(r, n):
+def test_lora_ranks(r, n, codec):
     # A rank below, at and above the step of 32, no multiple of 64, several
     # steps, the largest rank of the kernel and one above it.
-    _case(1100, n, r)
+    _case(1100, n, r, codec=codec)
 
 
+@pytest.mark.parametrize("codec", CODECS)
 @pytest.mark.parametrize("m", [4127, 4128, 4608])
-def test_lora_image_rows(m):
+def test_lora_image_rows(m, codec):
     n = 192
     bands = [(0, 64, 0, 64), (64, 128, 64, 64), (128, 192, 128, 64)]
-    _case(m, n, 192, bands=bands)
+    _case(m, n, 192, codec=codec, bands=bands)
 
 
+@pytest.mark.parametrize("codec", CODECS)
 @pytest.mark.parametrize("m", [32768, 32769, 33792])
-def test_lora_rows_above_32767(m):
+def test_lora_rows_above_32767(m, codec):
     # Row offsets pass a 16-bit index: every row is compared.
-    _case(m, 64, 16, k=256)
+    _case(m, 64, 16, codec=codec, k=256)
+
+
+@pytest.mark.parametrize("k", [832, 800, 96, 32])
+def test_lora_q8_0_inner_dim_off_the_k_tile(k):
+    # q8_0 holds K in blocks of 32 and its kernel walks K in tiles of 64: a
+    # K off the tile is the composition.
+    err, err2 = _case(1100, 96, 16, codec="q8_0", k=k)
+    assert (err2 is not None) == (_nax() and k % 64 == 0)
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["bf16", "f16"])
@@ -236,7 +289,7 @@ def test_lora_batch(batch, dtype):
     y = kq.quantized_matmul_lora(x, w, "q4_k", a, b)
     flat = kq.quantized_matmul_lora(x.reshape(batch * m, K), w, "q4_k", a, b)
     mx.eval(y, flat)
-    if _fused(batch * m, r, dtype=dtype) == _fused(m, r, dtype=dtype):
+    if _fused(batch * m, r, n, dtype=dtype) == _fused(m, r, n, dtype=dtype):
         assert mx.array_equal(y.reshape(batch * m, n), flat).item()
 
 
@@ -276,7 +329,12 @@ BANDS = {
     "three": (192, 48, [(0, 64, 0, 16), (64, 128, 16, 16), (128, 192, 32, 16)]),
     # Columns before, between and after the bands take no low-rank term.
     "gaps": (320, 40, [(64, 128, 0, 24), (192, 256, 24, 16)]),
-    # A band that ends inside a column tile, and N off the tile.
+    # A band that ends on the column tile of a simdgroup, and a band that
+    # ends at N off the tile.
+    "end_on_half_tile": (300, 40, [(0, 96, 0, 24), (128, 300, 24, 16)]),
+    # A band of the last 44 columns, after columns in no band.
+    "end_at_n": (300, 40, [(64, 128, 0, 24), (256, 300, 24, 16)]),
+    # A band that ends inside the columns of a simdgroup: the composition.
     "end_in_tile": (300, 40, [(0, 100, 0, 24), (128, 250, 24, 16)]),
     # A band of rank 0, and a band that takes no rank from the first columns
     # of z.
@@ -295,21 +353,25 @@ BANDS = {
 }
 
 
+@pytest.mark.parametrize("codec", CODECS)
 @pytest.mark.parametrize("m", [1023, 1100])
 @pytest.mark.parametrize("name", list(BANDS))
-def test_lora_bands(name, m):
+def test_lora_bands(name, m, codec):
     n, r, bands = BANDS[name]
-    _case(m, n, r, bands=bands)
+    _case(m, n, r, codec=codec, bands=bands)
 
 
-def test_lora_band_columns_are_isolated():
+@pytest.mark.parametrize("end", [96, 100])
+@pytest.mark.parametrize("codec", CODECS)
+def test_lora_band_columns_are_isolated(codec, end):
     """A band reads its own ranks of z and its own block of B, whatever the
     rest holds: an infinite strength on the ranks of the other band and
     infinite values in B outside the two blocks leave the columns of the
-    first band finite and right."""
+    first band finite and right. The first band ends on the column tile of
+    a simdgroup (the kernel) and inside one (the composition)."""
     n, r, m = 192, 32, 1100
-    bands = [(0, 100, 0, 20), (128, 192, 20, 12)]
-    w, wd = _weight("q4_k", n, K)
+    bands = [(0, end, 0, 20), (128, 192, 20, 12)]
+    w, wd = _weight(codec, n, K)
     a, b = _ab(K, n, r, mx.bfloat16)
     mask = np.ones((r, n), dtype=bool)
     for cs, ce, z0, rb in bands:
@@ -318,8 +380,35 @@ def test_lora_band_columns_are_isolated():
     strength = mx.array([1.0] * 20 + [float("inf")] * 12)
     x = _x([m, K], mx.bfloat16, 23)
     # The columns of the first band, then the columns outside every band.
-    _check(x, w, wd, a, b, strength=strength, bands=bands, cols=(0, 100))
-    _check(x, w, wd, a, b, strength=strength, bands=bands, cols=(100, 128))
+    kw = dict(codec=codec, strength=strength, bands=bands)
+    _check(x, w, wd, a, b, cols=(0, end), **kw)
+    _check(x, w, wd, a, b, cols=(end, 128), **kw)
+
+
+@pytest.mark.parametrize("end", [96, 100])
+@pytest.mark.parametrize("m", [1023, 1100])
+@pytest.mark.parametrize("codec", CODECS)
+def test_lora_z_that_is_not_finite_stays_in_its_band(codec, m, end):
+    """A column outside every band takes no term of z. With an infinite
+    strength every column of a band is not finite, and every other column
+    is finite and right: the columns before the first band, the columns
+    after it in its column tile, a column tile between two bands, and the
+    columns after the last band. The first band ends on the column tile of
+    a simdgroup (the kernel) and inside one (the composition)."""
+    n, r = 448, 32
+    bands = [(64, end, 0, 20), (192, 256, 20, 12)]
+    w, wd = _weight(codec, n, K)
+    a, b = _ab(K, n, r, mx.bfloat16)
+    strength = mx.array(float("inf"))
+    x = _x([m, K], mx.bfloat16, 113)
+    kw = dict(codec=codec, strength=strength, bands=bands)
+    for cols in ((0, 64), (end, 128), (128, 192), (256, 448)):
+        _check(x, w, wd, a, b, cols=cols, **kw)
+    y = _f64(
+        kq.quantized_matmul_lora(x, w, codec, a, b, strength=strength, bands=bands)
+    )
+    for cs, ce, _, _ in bands:
+        assert not np.isfinite(y[:, cs:ce]).any()
 
 
 @pytest.mark.parametrize("m", [1023, 1100])
@@ -339,7 +428,7 @@ def test_lora_strength(m):
     base = kq.quantized_matmul(x, w, mx.zeros((1,), dtype=mx.uint8), "q4_k", True)
     mx.eval(y, one, zero, base)
     assert mx.array_equal(y, one).item()
-    if _fused(m, r):
+    if _fused(m, r, n):
         # The K walk of the kernel may not be the tile of quantized_matmul.
         assert _rel(_f64(zero), _f64(base)) <= 1e-3
     else:
@@ -430,11 +519,14 @@ def test_lora_rank_zero_and_empty_inputs():
 
 def _check_views(views, call, state):
     """call(view) against call(dense copy of the view). On the GPU the two
-    have the same bits. On the CPU stream the stock matmul rounds a product
-    with a transposed second operand once, and a product of dense operands
-    with about 1.3 times that error, so the two differ by a rounding of the
-    activation dtype, where a view read with the wrong strides differs by
-    its whole size."""
+    have the same bits. On the CPU stream the bound is one rounding of the
+    activation dtype (R1), not bit equality: the stock matmul there sums a
+    product with a transposed second operand and a product of dense
+    operands in different orders. Both are right to about one rounding
+    against the exact sum, the dense order with about 1.3 times the error
+    of the other. That is the accuracy of the stock op on bfloat16 and
+    float16, so the two calls may differ by a rounding. A view read with
+    the wrong strides differs by its whole size."""
     for name, make in views.items():
         want = call(_dense(make()))
         view = make()
@@ -463,22 +555,21 @@ def _weight_views(w):
     }
 
 
+@pytest.mark.parametrize("codec", CODECS)
 @pytest.mark.parametrize("m", [1023, 1100])
 @pytest.mark.parametrize("state", ["lazy", "evaluated"])
-def test_lora_operand_views(state, m):
+def test_lora_operand_views(state, m, codec):
     """A view of any operand gives the bits of its dense copy, lazy or
     evaluated, on both sides of the row bound."""
     n, r = 96, 16
-    w, wd = _weight("q4_k", n, K)
+    w, wd = _weight(codec, n, K)
     a, b = _ab(K, n, r, mx.bfloat16)
     x = _x([m, K], mx.bfloat16, 47)
     s = mx.array(np.linspace(0.5, 1.5, r).astype(np.float32)).astype(mx.bfloat16)
     bands = [(0, 64, 0, 16), (64, 96, 4, 12)]
 
     def call(x_=x, w_=w, a_=a, b_=b, s_=s):
-        return kq.quantized_matmul_lora(
-            x_, w_, "q4_k", a_, b_, strength=s_, bands=bands
-        )
+        return kq.quantized_matmul_lora(x_, w_, codec, a_, b_, strength=s_, bands=bands)
 
     _check_views(
         _strided(_x([2 * m, 2 * K], mx.bfloat16, 53)), lambda v: call(x_=v), state
@@ -495,15 +586,25 @@ def test_lora_operand_views(state, m):
     _check_views(views, lambda v: call(s_=v), state)
     # The views of x keep the result right, not only equal to the copy.
     xv = _strided(_x([2 * m, 2 * K], mx.bfloat16, 53))["odd_cols"]()
-    _check(xv, w, wd, a, b, strength=s, bands=bands)
+    _check(xv, w, wd, a, b, codec, strength=s, bands=bands)
 
 
-@pytest.mark.parametrize("codec", ["q5_k", "q6_k", "q8_0", "q3_k", "q4_0"])
-def test_lora_codec_without_kernel_composes(codec):
+@pytest.mark.parametrize(
+    ("codec", "dtype"),
+    [
+        ("q3_k", mx.bfloat16),
+        ("q4_0", mx.bfloat16),
+        ("q5_k", mx.float16),
+        ("q6_k", mx.float16),
+        ("q8_0", mx.float16),
+    ],
+    ids=["q3_k-bf16", "q4_0-bf16", "q5_k-f16", "q6_k-f16", "q8_0-f16"],
+)
+def test_lora_codec_without_kernel_composes(codec, dtype):
     n, r = 96, 16
     w, wd = _weight(codec, n, K)
-    a, b = _ab(K, n, r, mx.bfloat16)
-    err, err2 = _check(_x([1100, K], mx.bfloat16, 71), w, wd, a, b, codec)
+    a, b = _ab(K, n, r, dtype)
+    err, err2 = _check(_x([1100, K], dtype, 71), w, wd, a, b, codec)
     assert err2 is None
 
 
@@ -691,10 +792,7 @@ def test_lora_kernels_in_metallib():
     if not names:
         pytest.skip("no metallib loaded")
     lora = {n for n in names if "_qmm_t_nax_lora_" in n}
-    want = {
-        f"kquant_q4_k_qmm_t_nax_lora_bfloat16_t_bm128_bn64_bk128_wm2_wn2_alN_{al}"
-        for al in ("true", "false")
-    }
+    want = {_name(n, codec) for n in (64, 96) for codec in CODECS}
     assert lora == want, sorted(lora ^ want)
 
 
@@ -710,9 +808,16 @@ out = []
 for i, c in enumerate(spec["calls"]):
     dtype = getattr(mx, c.get("dtype", "bfloat16"))
     codec = c.get("codec", "q4_k")
-    w, wd = t._weight(codec, c["n"], t.K)
-    a, b = t._ab(t.K, c["n"], c["r"], dtype)
-    x = t._x(c.get("shape", [c["m"], t.K]), dtype, 7 * c["m"] + c["n"])
+    k = c.get("k", t.K)
+    if c.get("tile"):
+        # A wide weight as copies of a block of rows.
+        w, wd = t._weight(codec, c["tile"], k)
+        w = mx.tile(w, (c["n"] // c["tile"], 1))
+        wd = t.np.tile(wd, (c["n"] // c["tile"], 1))
+    else:
+        w, wd = t._weight(codec, c["n"], k)
+    a, b = t._ab(k, c["n"], c["r"], dtype)
+    x = t._x(c.get("shape", [c["m"], k]), dtype, 7 * c["m"] + c["n"])
     bands = c.get("bands")
     os.environ.update(c.get("env", {}))
     print(f"[probe] {i}", file=sys.stderr, flush=True)
@@ -757,10 +862,11 @@ def _probe(calls, env=None):
     return results
 
 
-def _name(n):
+def _name(n, codec="q4_k"):
     aligned = "true" if n % 64 == 0 else "false"
     return (
-        f"kquant_q4_k_qmm_t_nax_lora_bfloat16_t_bm128_bn64_bk128_wm2_wn2_alN_{aligned}"
+        f"kquant_{codec}_qmm_t_nax_lora_bfloat16_t_bm128_bn64_bk{KERNEL_BK[codec]}"
+        f"_wm2_wn2_alN_{aligned}"
     )
 
 
@@ -769,7 +875,7 @@ def _expect(calls, results, kernel):
         assert r["error"] is None, (c, r["error"])
         assert r["rel"] <= R1[getattr(mx, c.get("dtype", "bfloat16"))], (c, r["rel"])
         if k:
-            assert r["lora"] == [_name(c["n"])], (c, r["lora"])
+            assert r["lora"] == [_name(c["n"], c.get("codec", "q4_k"))], (c, r["lora"])
             assert r["plain"] == [], (c, r["plain"])
         else:
             assert r["lora"] == [], (c, r["lora"])
@@ -777,9 +883,9 @@ def _expect(calls, results, kernel):
 
 
 def test_lora_kernel_that_runs():
-    """KQ_QMM_LOG names the kernel of each call. Inside the dispatch rule
-    the low-rank kernel runs, once, and no matmul tile. Outside it one
-    matmul tile runs and no low-rank kernel."""
+    """KQ_QMM_LOG names the kernel of each call. With KQ_QMM_LORA=2, where
+    the kernel can run it runs, once, and no matmul tile. Everywhere else
+    one matmul tile runs and no low-rank kernel."""
     if not _nax():
         pytest.skip("the kernel needs a NAX GPU")
     sixteen = BANDS["sixteen"]
@@ -796,28 +902,97 @@ def test_lora_kernel_that_runs():
             False,
         ),
         ({"m": 1100, "n": 192, "r": 32, "bands": BANDS["start_off_tile"][2]}, False),
+        ({"m": 1100, "n": 300, "r": 40, "bands": BANDS["end_on_half_tile"][2]}, True),
+        ({"m": 1100, "n": 300, "r": 40, "bands": BANDS["end_at_n"][2]}, True),
+        ({"m": 1100, "n": 300, "r": 40, "bands": BANDS["end_in_tile"][2]}, False),
         ({"m": 1100, "n": 128, "r": 256, "bands": [(0, 128, 0, 256)]}, True),
         ({"m": 1100, "n": 128, "r": 300, "bands": BANDS["rank_above_max"][2]}, False),
         ({"m": 2200, "n": 128, "r": 16, "shape": [2, 1100, K]}, True),
         ({"m": 1100, "n": 128, "r": 16, "dtype": "float16"}, False),
-        ({"m": 1100, "n": 128, "r": 16, "codec": "q5_k"}, False),
+        ({"m": 1100, "n": 128, "r": 16, "codec": "q5_k"}, True),
+        ({"m": 1100, "n": 96, "r": 16, "codec": "q5_k"}, True),
+        ({"m": 1100, "n": 128, "r": 16, "codec": "q6_k"}, True),
+        ({"m": 1100, "n": 96, "r": 16, "codec": "q6_k"}, True),
+        ({"m": 1100, "n": 128, "r": 16, "codec": "q8_0"}, True),
+        ({"m": 1100, "n": 96, "r": 16, "codec": "q8_0"}, True),
+        ({"m": 1100, "n": 128, "r": 16, "codec": "q8_0", "k": 832}, True),
+        ({"m": 1100, "n": 128, "r": 16, "codec": "q8_0", "k": 800}, False),
+        ({"m": 1100, "n": 128, "r": 16, "codec": "q6_k", "dtype": "float16"}, False),
+        ({"m": 1100, "n": 128, "r": 16, "codec": "q3_k"}, False),
+        ({"m": 1100, "n": 128, "r": 16, "codec": "q4_0"}, False),
     ]
-    _expect([c for c, _ in calls], _probe([c for c, _ in calls]), [k for _, k in calls])
+    res = _probe([c for c, _ in calls], env={"KQ_QMM_LORA": "2"})
+    _expect([c for c, _ in calls], res, [k for _, k in calls])
+
+
+def _wide(k, n, **kw):
+    """A call on a weight [n, k] made of copies of 64 rows."""
+    return {"m": 1100, "n": n, "r": 16, "k": k, "tile": 64, **kw}
+
+
+# Both sides of each bound of the shape rule. From RULE_ROWS rows: N against
+# K, and K against RULE_K. Below RULE_ROWS rows: N against RULE_WIDE_N.
+RULE_CASES = [
+    (_wide(256, 256, m=RULE_ROWS), True),
+    (_wide(256, 256, m=RULE_ROWS - 1), False),
+    (_wide(256, 192, m=RULE_ROWS), False),
+    (_wide(RULE_K, RULE_K, m=RULE_ROWS), True),
+    (_wide(RULE_K + 256, RULE_K + 256, m=RULE_ROWS), False),
+    (_wide(64, 64, m=RULE_ROWS, codec="q8_0"), True),
+    (_wide(128, 64, m=RULE_ROWS, codec="q8_0"), False),
+    (_wide(256, RULE_WIDE_N), True),
+    (_wide(256, RULE_WIDE_N - 64), False),
+    (_wide(RULE_K, RULE_WIDE_N), True),
+    (_wide(RULE_K + 256, RULE_WIDE_N), False),
+]
+
+
+def test_lora_shape_rule():
+    """With KQ_QMM_LORA unset the op gives the kernel the calls of the
+    shape rule and builds the composition for every other call."""
+    if not _nax():
+        pytest.skip("the kernel needs a NAX GPU")
+    calls = [c for c, _ in RULE_CASES]
+    want = [k for _, k in RULE_CASES]
+    assert want == [_shape_rule(c["k"], c["n"], c["m"]) for c in calls]
+    _expect(calls, _probe(calls), want)
 
 
 def test_lora_levers():
-    """KQ_QMM_LORA=0 builds the composition at every row count.
-    KQ_QMM_LORA_MIN_ROWS moves the row bound, down to one row of a 1-D x."""
+    """KQ_QMM_LORA=0 (or off) builds the composition on every call. 2 runs
+    the kernel outside the shape rule, inside its other bounds. 1, or a
+    value that is no mode, is the shape rule. KQ_QMM_LORA_MIN_ROWS moves the
+    row bound, down to one row of a 1-D x."""
     if not _nax():
         pytest.skip("the kernel needs a NAX GPU")
-    calls = [{"m": 1100, "n": 128, "r": 16}, {"m": 4608, "n": 128, "r": 64}]
-    _expect(calls, _probe(calls, env={"KQ_QMM_LORA": "0"}), [False, False])
+    inside, outside = _wide(K, RULE_WIDE_N), _wide(K, 128)
+    calls = [inside, outside, {**inside, "m": 4608, "r": 64}]
+    for value in ("0", "off"):
+        res = _probe(calls, env={"KQ_QMM_LORA": value})
+        _expect(calls, res, [False, False, False])
+    calls = [
+        inside,
+        outside,
+        _wide(RULE_K + 256, RULE_K + 256),
+        {**outside, "m": 1023},
+        {**outside, "r": 257},
+        {**outside, "dtype": "float16"},
+    ]
+    res = _probe(calls, env={"KQ_QMM_LORA": "2"})
+    _expect(calls, res, [True, True, True, False, False, False])
+    calls = [inside, outside]
+    for value in ("1", "3", "-1", "on", "x"):
+        _expect(calls, _probe(calls, env={"KQ_QMM_LORA": value}), [True, False])
     calls = [
         {"m": 600, "n": 128, "r": 16},
         {"m": 511, "n": 128, "r": 16},
         {"m": 512, "n": 128, "r": 16},
     ]
-    res = _probe(calls, env={"KQ_QMM_LORA_MIN_ROWS": "512"})
+    res = _probe(calls, env={"KQ_QMM_LORA": "2", "KQ_QMM_LORA_MIN_ROWS": "512"})
     _expect(calls, res, [True, False, True])
     calls = [{"m": 1, "n": 128, "r": 16, "shape": [K]}]
-    _expect(calls, _probe(calls, env={"KQ_QMM_LORA_MIN_ROWS": "1"}), [True])
+    res = _probe(calls, env={"KQ_QMM_LORA": "2", "KQ_QMM_LORA_MIN_ROWS": "1"})
+    _expect(calls, res, [True])
+    # The row bound holds inside the shape rule too.
+    calls = [{**inside, "m": 1023}, {**inside, "m": 1024}]
+    _expect(calls, _probe(calls), [False, True])
