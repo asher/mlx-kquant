@@ -570,17 +570,15 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
   | 3840, 10240, bfloat16 | 4608 | 0.97 | 0.96 | 0.97 | 0.96 |
   | 3840, 10240, bfloat16 | 8208 | 0.96 | 0.96 | 0.97 | 0.97 |
   | 3840, 10240, bfloat16 | 16416 | 0.97 | 0.97 | 0.99 | 0.98 |
-  | 3840, 10240, float16 | 1056 | 0.95 | 1.00 | 0.98 | 1.02 |
-  | 3840, 10240, float16 | 4128 | 0.94 | 0.96 | 0.97 | 0.98 |
-  | 3840, 10240, float16 | 16416 | 1.00 | 0.98 | 0.99 | 1.04 |
+  | 3840, 10240, float16 | 1056 | 0.95 | 1.00 | 0.98 | - |
+  | 3840, 10240, float16 | 4128 | 0.94 | 0.96 | 0.97 | - |
+  | 3840, 10240, float16 | 16416 | 1.00 | 0.98 | 0.99 | - |
   | 4096, 12288, bfloat16 | 4128 | 0.94 | 0.95 | 0.95 | 0.97 |
   | 4096, 12288, bfloat16 | 16416 | 0.97 | 0.97 | 0.97 | 0.99 |
 
   From 4128 rows the gain is the activation and product pass that the kernel removes, 1 to 6
-  percent. `q4_k` on float16 at 16416 rows is a tie. The `q8_0` cells on float16 come from a
-  kernel that the build does not carry: it ran slower than the unfused ops at 1056 and 16416 rows,
-  and they are the reason `q8_0` on float16 builds the unfused ops. `benchmarks/bench_glu.py`
-  repeats the table for one codec, for the kernels the build carries.
+  percent. `q4_k` on float16 at 16416 rows is a tie. `q8_0` on float16 builds the unfused ops, so
+  it has no cell. `benchmarks/bench_glu.py` repeats the table for one codec.
 
   x is float16 or bfloat16, and float32 x runs in bfloat16 as in `quantized_matmul`. Leading batch
   dims fold into rows. The activation and the product run in f32, with one rounding of the
