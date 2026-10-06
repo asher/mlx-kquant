@@ -94,6 +94,26 @@ void kq_sdpa_check_batch_heads(const char* op, const array& a) {
   }
 }
 
+// The scales and biases of one side of a quantized cache. The kernel reads
+// both with the head and sequence strides of the scales and with a unit
+// stride in the last dim, so the two need one layout. An unevaluated view
+// reports dense strides to the builder, so the check runs here.
+void kq_sdpa_check_q8_pair(const char* op, const array& sc, const array& bi) {
+  if (sc.size() == 0) {
+    return;
+  }
+  bool ok = sc.shape(3) == 1 || (sc.strides(3) == 1 && bi.strides(3) == 1);
+  for (int i = 0; i < 3 && ok; i++) {
+    ok = sc.shape(i) == 1 || sc.strides(i) == bi.strides(i);
+  }
+  if (!ok) {
+    throw std::runtime_error(
+        std::string("[mlx_kquant.") + op +
+        "] quantized-KV scales and biases need one layout with a "
+        "contiguous last dim.");
+  }
+}
+
 // Number of key-blocks to split the reduction across. Mirrors MLX's own
 // sdpa_vector_2pass heuristic: more blocks only when there are enough
 // simdgroups per kv-head (n_simds = gqa_factor * qL) to justify the extra
@@ -364,6 +384,12 @@ void KQuantSDPAGQA::eval_gpu(
   if (kv_q8 || kvarn) {
     for (int i = 0; i < 4; i++) {
       kq_sdpa_check_batch_heads("sdpa_decode_gqa", inputs[qkv_idx + i]);
+    }
+  }
+  if (kv_q8) {
+    for (int i = 0; i < 4; i += 2) {
+      kq_sdpa_check_q8_pair(
+          "sdpa_decode_gqa", inputs[qkv_idx + i], inputs[qkv_idx + i + 1]);
     }
   }
 
@@ -995,6 +1021,12 @@ void KQuantSDPACascade::eval_gpu(
   if (kv_q8) {
     for (int i = 4; i < 8; i++) {
       kq_sdpa_check_batch_heads("sdpa_decode_gqa_cascade", inputs[q8_base + i]);
+    }
+    for (int i = 0; i < 8; i += 2) {
+      kq_sdpa_check_q8_pair(
+          "sdpa_decode_gqa_cascade",
+          inputs[q8_base + i],
+          inputs[q8_base + i + 1]);
     }
   }
 

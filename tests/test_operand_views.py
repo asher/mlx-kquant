@@ -17,7 +17,9 @@ the call or not:
 - the window, pool and pool scales of the sparse attention ops and the
   keys of dsa_indexer_score_decode are copied when a row of theirs is not
   dense, and a packed pool is copied when its codes and scales step
-  batches differently.
+  batches differently;
+- the scales and biases of a quantized cache are refused when the two
+  differ in layout or their last dim is not dense.
 
 An operand that is dense adds no node to the graph.
 
@@ -646,3 +648,100 @@ def test_indexer_score_decode_key_views(dtype, state):
         want,
         state,
     )
+
+
+# ---------------- scales and biases of a quantized cache ----------------
+
+
+def _q8_case(batch=1, hq=16, hkv=4, rows=256, d=128):
+    q = mx.random.normal((batch, hq, 1, d), key=mx.random.key(64)).astype(mx.float16)
+    k = mx.random.normal((batch, hkv, rows, d), key=mx.random.key(65))
+    v = mx.random.normal((batch, hkv, rows, d), key=mx.random.key(66))
+    kw, ks, kb = mx.quantize(k.astype(mx.float16), group_size=64, bits=8)
+    vw, vs, vb = mx.quantize(v.astype(mx.float16), group_size=64, bits=8)
+    mx.eval(q, kw, ks, kb, vw, vs, vb)
+    return q, (kw, ks, kb), (vw, vs, vb)
+
+
+def _q8_pair_cells(call, ks, kb):
+    """call(k_scales, k_biases) with one pair of a quantized cache."""
+    msg = "scales and biases need one layout"
+    want = call(ks, kb)
+    mx.eval(want)
+    views_s = _embedded(ks, 2)
+    views_b = _embedded(kb, 2)
+    # Both as prefix slices of longer buffers, the layout of a cache with
+    # spare rows: read in place.
+    for state in ("lazy", "evaluated"):
+        sv, bv = views_s["prefix"](), views_b["prefix"]()
+        if state == "evaluated":
+            mx.eval(sv, bv)
+        assert _same(call(sv, bv), want), state
+    # One of the two as a prefix slice: the head strides differ.
+    for state in ("lazy", "evaluated"):
+        bv = views_b["prefix"]()
+        sv = views_s["prefix"]()
+        if state == "evaluated":
+            mx.eval(sv, bv)
+        _refused(lambda bv=bv: call(ks, bv), RuntimeError, msg)
+        _refused(lambda sv=sv: call(sv, kb), RuntimeError, msg)
+    # A last dim that is every other element. With memory the builder
+    # copies it, without memory the eval refuses it.
+    for views, pick in ((views_s, 0), (views_b, 1)):
+        for name in ("even_cols", "odd_cols", "reversed"):
+            view = views[name]()
+            pair = [ks, kb]
+            pair[pick] = view
+            _refused(lambda pair=pair: call(*pair), RuntimeError, msg)
+        view = views["even_cols"]()
+        mx.eval(view)
+        pair = [ks, kb]
+        pair[pick] = view
+        assert _same(call(*pair), want)
+
+
+@metal_only
+def test_q8_scale_and_bias_layout_decode_gqa():
+    q, (kw, ks, kb), (vw, vs, vb) = _q8_case()
+    scale = 128**-0.5
+
+    def call_k(s, b):
+        return kq.sdpa_decode_gqa(
+            q, kw, vw, scale, k_scales=s, k_biases=b, v_scales=vs, v_biases=vb
+        )
+
+    def call_v(s, b):
+        return kq.sdpa_decode_gqa(
+            q, kw, vw, scale, k_scales=ks, k_biases=kb, v_scales=s, v_biases=b
+        )
+
+    _q8_pair_cells(call_k, ks, kb)
+    _q8_pair_cells(call_v, vs, vb)
+
+
+@metal_only
+def test_q8_scale_and_bias_layout_cascade():
+    q, (kw, ks, kb), (vw, vs, vb) = _q8_case(batch=2, rows=64)
+    _, (sw, ss, sb), (tw, ts, tb) = _q8_case(batch=1, rows=511)
+    scale = 128**-0.5
+
+    def call(shared_k, priv_k):
+        return kq.sdpa_decode_gqa_cascade(
+            q,
+            sw,
+            tw,
+            kw,
+            vw,
+            scale,
+            k_shared_scales=shared_k[0],
+            k_shared_biases=shared_k[1],
+            v_shared_scales=ts,
+            v_shared_biases=tb,
+            k_priv_scales=priv_k[0],
+            k_priv_biases=priv_k[1],
+            v_priv_scales=vs,
+            v_priv_biases=vb,
+        )
+
+    _q8_pair_cells(lambda s, b: call((s, b), (ks, kb)), ss, sb)
+    _q8_pair_cells(lambda s, b: call((ss, sb), (s, b)), ks, kb)

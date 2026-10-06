@@ -72,6 +72,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   window, pool or pool scales view with a strided or reversed last dim.
 - `dsa_indexer_score_decode` returns correct scores for one sequence whose
   keys are a view with a strided or reversed last dim.
+- `sdpa_decode_gqa` and the cascade raise for quantized-cache scales and biases
+  that differ in layout or have a strided last dim, instead of misreading them.
 - `quantized_matmul` returns zeros for an inner dim of 0. On a CPU stream a
   weight with no rows ended the process at more than 16 rows of x.
 - A float16 matmul of 128 or fewer rows split over K, MTP verify among them,
