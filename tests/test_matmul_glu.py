@@ -499,6 +499,27 @@ def test_glu_jvp_and_vmap_do_not_depend_on_the_row_count():
     assert "KQuantMatmul" in seen["jvp"][0]
 
 
+def test_glu_compiled_function_with_both_activations():
+    """Two calls that differ in the activation alone stay two nodes when a
+    compiled function holds both."""
+    (wg, _), (wu, _) = _weights("q4_k", 96, K)
+    x = _x([1100, K], mx.bfloat16, 67)
+
+    def both(t):
+        a = kq.quantized_matmul_glu(t, wg, wu, "q4_k", "silu")
+        b = kq.quantized_matmul_glu(t, wg, wu, "q4_k", "gelu_tanh")
+        # mx.compile merges equivalent nodes but never an output of the
+        # function, so the two calls feed the outputs. The casts are exact.
+        return a.astype(mx.float32), b.astype(mx.float32)
+
+    a, b = mx.compile(both)(x)
+    ra, rb = both(x)
+    mx.eval(a, b, ra, rb)
+    assert mx.array_equal(a, ra).item()
+    assert mx.array_equal(b, rb).item()
+    assert not mx.array_equal(ra, rb).item()
+
+
 def test_glu_compiles_and_repeats():
     (wg, _), (wu, _) = _weights("q4_k", 96, K)
     x = _x([1100, K], mx.bfloat16, 17)
@@ -766,3 +787,147 @@ def test_glu_tile_levers_belong_to_a_probe_build():
         assert r["error"] is None, r["error"]
         assert r["glu"] == [head + "bm128_bn64_bk128w_wm2_wn2_alN_false"]
         assert r["rel"] <= R1[mx.bfloat16]
+
+
+def _glu_name(codec, dtype, n):
+    """The kernel the op runs for a codec, an activation dtype and N."""
+    aligned = "true" if n % 64 == 0 else "false"
+    return (
+        f"kquant_{codec}_qmm_t_nax_glu_{dtype}_t_bm128_bn64"
+        f"_bk{GLU_CODECS[codec]}w_wm2_wn2_alN_{aligned}"
+    )
+
+
+@pytest.mark.parametrize("codec", list(GLU_CODECS))
+def test_glu_kernel_that_runs(codec):
+    """KQ_QMM_LOG names the kernel of each call. From 1024 rows a codec
+    with a kernel for the dtype runs it, once, and no matmul tile: for both
+    dtypes, N on and off the column tile and both activations. At 1023
+    rows, and for q8_0 on float16, the two matmuls run and no GLU kernel."""
+    if not _nax():
+        pytest.skip("the fused kernel needs a NAX GPU")
+    calls = [
+        {"codec": codec, "m": m, "n": n, "dtype": dt, "activation": act}
+        for dt in ("bfloat16", "float16")
+        for m, n, act in (
+            (1100, 64, "silu"),
+            (1100, 96, "silu"),
+            (1100, 64, "gelu_tanh"),
+            (1100, 96, "gelu_tanh"),
+            (1024, 96, "silu"),
+            (1023, 96, "silu"),
+        )
+    ]
+    res = _glu_probe(calls)
+    for c, r in zip(calls, res, strict=True):
+        assert r["error"] is None, (c, r["error"])
+        assert r["rel"] <= R1[getattr(mx, c["dtype"])], (c, r["rel"])
+        has_kernel = c["dtype"] == "bfloat16" or codec not in BF16_ONLY
+        if c["m"] >= MIN_ROWS and has_kernel:
+            assert r["glu"] == [_glu_name(codec, c["dtype"], c["n"])], (c, r["glu"])
+            assert r["plain"] == [], (c, r["plain"])
+        else:
+            assert r["glu"] == [], (c, r["glu"])
+            assert len(r["plain"]) == 2, (c, r["plain"])
+
+
+def test_glu_lever_off_runs_the_unfused_ops():
+    """KQ_GLU=0: no GLU kernel at any row count, for any codec."""
+    if not _nax():
+        pytest.skip("the fused kernel needs a NAX GPU")
+    calls = [
+        {"codec": codec, "m": 1100, "n": 96, "dtype": "bfloat16"}
+        for codec in GLU_CODECS
+    ]
+    off = _glu_probe(calls, env={"KQ_GLU": "0"})
+    on = _glu_probe(calls, env={"KQ_GLU": "1"})
+    for c, r0, r1 in zip(calls, off, on, strict=True):
+        assert r0["error"] is None and r1["error"] is None
+        assert r0["glu"] == [] and len(r0["plain"]) == 2, (c, r0)
+        assert r1["glu"] == [_glu_name(c["codec"], "bfloat16", 96)], (c, r1)
+        assert r0["rel"] <= R1[mx.bfloat16]
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["bf16", "f16"])
+@pytest.mark.parametrize("codec", ["q4_k", "q6_k"])
+def test_glu_gelu_below_saturation(codec, dtype):
+    """gelu_tanh on gate sums of about 1.4, where the tanh is far from 1
+    and the cubic term of its argument shows in the result."""
+    _check(_x([1100, K], dtype, 71, scale=0.5), 96, dtype, "gelu_tanh", codec)
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["bf16", "f16"])
+@pytest.mark.parametrize("n", [1, 17, 63])
+def test_glu_columns_below_one_tile(n, dtype):
+    """N below the column tile of 64: one partial tile."""
+    _check(_x([1100, K], dtype, 73 + n), n, dtype)
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["bf16", "f16"])
+def test_glu_columns_above_32767(dtype):
+    """N past 32767 with a partial last row tile and N off the column
+    tile, where a 16-bit column span would wrap. The reference covers the
+    first and the last columns."""
+    n, k, m = 32833, 256, 1100
+    (wg, wg64), (wu, wu64) = _weights("q4_k", n, k)
+    x = _x([m, k], dtype, 77)
+    y = kq.quantized_matmul_glu(x, wg, wu, "q4_k")
+    mx.eval(y)
+    assert y.shape == (m, n)
+    x64 = _f64(x)
+    for cols in (slice(0, 256), slice(n - 300, n)):
+        ref = _act(x64 @ wg64[cols].T, "silu") * (x64 @ wu64[cols].T)
+        got = _f64(y[:, cols])
+        # All rows, and the partial last row tile alone.
+        for rows in (slice(0, m), slice(1024, m)):
+            assert _rel(got[rows], ref[rows]) <= R1[dtype], (cols, rows)
+    del y
+
+
+def test_glu_float16_activation_saturates_beside_a_small_up():
+    """A float16 gate activation past the half range is stored as 65504, so
+    the product with a small up sum is finite: 65504 times the up sum. The
+    gate weight reads the first two K blocks and the up weight the third,
+    so x sets the size of each sum."""
+    m, n = 1100, 96
+    if not _fused(m, dtype=mx.float16):
+        pytest.skip("the unfused ops return inf here")
+    kg = 512
+    wf = mx.random.normal((2, n, K), key=mx.random.key(83)) * 0.1
+    cols = mx.arange(K)
+    wg, _ = kq.quantize(mx.where(cols < kg, wf[0], 0.0), "q4_k")
+    wu, _ = kq.quantize(mx.where(cols < kg, 0.0, wf[1]), "q4_k")
+    s = mx.zeros((1,), dtype=mx.uint8)
+    wg64, wu64 = (_f64(kq.dequantize(w, s, "q4_k", dtype=mx.float32)) for w in (wg, wu))
+    big = mx.random.uniform(-3e4, 3e4, (m, K), key=mx.random.key(85))
+    small = mx.random.normal((m, K), key=mx.random.key(87)) * 0.1
+    x = mx.where(cols < kg, big, small).astype(mx.float16)
+    mx.eval(x, wg, wu)
+    g = _f64(x) @ wg64.T
+    u = _f64(x) @ wu64.T
+    over = (g > 66000.0) & (np.abs(u) < 0.9) & (np.abs(u) > 1e-3)
+    assert over.mean() > 0.02
+    y = kq.quantized_matmul_glu(x, wg, wu, "q4_k")
+    mx.eval(y)
+    got = _f64(y)
+    assert np.isfinite(got[over]).all()
+    assert _rel(got[over], 65504.0 * u[over]) <= 2 * R1[mx.float16]
+
+
+def test_glu_zero_size_inputs():
+    """No rows, no output columns and an inner dim of 0 give an array of
+    the composed shape."""
+    (wg, _), (wu, _) = _weights("q4_k", 96, K)
+    for shape in ([0, K], [2, 0, K], [0, 3, K]):
+        y = kq.quantized_matmul_glu(mx.zeros(shape, dtype=mx.bfloat16), wg, wu, "q4_k")
+        mx.eval(y)
+        assert y.shape == (*shape[:-1], 96) and y.dtype == mx.bfloat16
+    x = _x([1100, K], mx.bfloat16, 89)
+    y = kq.quantized_matmul_glu(x, wg[:0], wu[:0], "q4_k")
+    mx.eval(y)
+    assert y.shape == (1100, 0) and y.dtype == mx.bfloat16
+    w0 = mx.zeros((96, 0), dtype=mx.uint8)
+    y = kq.quantized_matmul_glu(mx.zeros((1100, 0), dtype=mx.float16), w0, w0, "q4_k")
+    mx.eval(y)
+    assert y.shape == (1100, 96) and y.dtype == mx.float16
+    assert not y.astype(mx.float32).any().item()
