@@ -149,6 +149,41 @@ def test_qmv_bias_weight_views(dtype, state):
         assert mx.array_equal(y, ref).item(), (name, state)
 
 
+@pytest.mark.parametrize("state", ["lazy", "evaluated"])
+@pytest.mark.parametrize("sorted_indices", [False, True], ids=["unsorted", "sorted"])
+@pytest.mark.parametrize("rows", [6, 300])
+def test_gather_qmm_weight_views(rows, sorted_indices, state):
+    """An expert stack that is every other row of each expert. The rows
+    of a matrix are dense and the matrices are not, with and without the
+    sorted_indices promise."""
+    experts = 4
+    stack = _dense(_wire("q8_0", experts * 2 * N, K, 12).reshape(experts, 2 * N, -1))
+    mx.eval(stack)
+    rng = np.random.default_rng(rows)
+    rhs = mx.array(np.sort(rng.integers(0, experts, size=rows)).astype(np.uint32))
+    x = _x(rows, K, mx.float16).reshape(rows, 1, K)
+
+    def call(w):
+        return kq.gather_qmm(
+            x,
+            w,
+            SCALES,
+            "q8_0",
+            rhs_indices=rhs,
+            transpose=True,
+            sorted_indices=sorted_indices,
+        )
+
+    for make in (lambda: stack[:, 0::2], lambda: stack[:, 1::2]):
+        ref = call(_dense(make()))
+        view = make()
+        if state == "evaluated":
+            mx.eval(view)
+        y = call(view)
+        mx.eval(y, ref)
+        assert mx.array_equal(y, ref).item()
+
+
 def test_weight_with_memory_adds_no_node():
     """The call gmlx makes in decode: an evaluated weight with dense rows.
     Its graph is the cast-free x layout node and the matmul, and nothing
