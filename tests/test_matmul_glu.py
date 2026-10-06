@@ -395,6 +395,23 @@ def test_glu_float16_store_saturates():
     assert (np.sign(got[over]) == np.sign(ref[over])).all()
 
 
+def test_glu_bfloat16_result_above_the_float16_range():
+    """The float16 store saturates at 65504. bfloat16 holds the products
+    past it, and the op returns them."""
+    n = 64
+    (wg, wg64), (wu, wu64) = _weights("q4_k", n, K)
+    x = _x([1088, K], mx.bfloat16, 13, scale=200.0)
+    ref = _ref(x, wg64, wu64)
+    assert (np.abs(ref) > 65504.0).mean() > 0.05
+    y = kq.quantized_matmul_glu(x, wg, wu, "q4_k")
+    mx.eval(y)
+    got = _f64(y)
+    assert np.isfinite(got).all()
+    assert _rel(got, ref) <= (R1[mx.bfloat16] if _nax() else CPU_REL)
+    over = np.abs(ref) > 70000.0
+    assert over.any() and (np.abs(got[over]) > 65536.0).all()
+
+
 @pytest.mark.parametrize("dtype", DTYPES, ids=["bf16", "f16"])
 @pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
 @pytest.mark.parametrize("codec", ["q4_k", "q6_k"])
