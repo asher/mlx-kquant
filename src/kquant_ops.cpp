@@ -182,9 +182,39 @@ mx::array quantized_matmul(
   }
 
   auto s = mx::to_stream(s_);
+  const bool lora =
+      lora_a.has_value() || lora_b.has_value() || lora_rows.has_value();
+  if (lora && w.ndim() != 2) {
+    throw std::invalid_argument(
+        "[mlx_kquant.quantized_matmul] the LoRA epilogue needs a 2-D w.");
+  }
+  // Rows of x, which the leading dims give for any inner dim.
+  int rows = 1;
+  for (int i = 0; i + 1 < static_cast<int>(x.ndim()); i++) {
+    rows *= x.shape(i);
+  }
   // An inner dim of 0 makes every sum empty, so the result is zeros. The
-  // kernels divide by the inner dim.
+  // kernels divide by the inner dim. The LoRA arguments pass the checks of
+  // a full call first.
   if (w_inner_dims == 0) {
+    if (lora) {
+      std::vector<mx::array> checked;
+      kq_lora_prep(
+          "[mlx_kquant.quantized_matmul]",
+          lora_a,
+          lora_b,
+          std::nullopt,
+          std::nullopt,
+          lora_rows,
+          out_type,
+          w_inner_dims,
+          w_outer_dims,
+          0,
+          {rows},
+          1,
+          s,
+          checked);
+    }
     auto shape = x.shape();
     shape.back() = w_outer_dims;
     return mx::zeros(shape, out_type, s);
@@ -202,17 +232,12 @@ mx::array quantized_matmul(
 
   std::vector<mx::array> op_inputs = {x_c, w_c, scales_c};
   int lora_flags = 0;
-  if (lora_a.has_value() || lora_b.has_value() || lora_rows.has_value()) {
-    if (w.ndim() != 2) {
-      throw std::invalid_argument(
-          "[mlx_kquant.quantized_matmul] the LoRA epilogue needs a 2-D w.");
-    }
+  if (lora) {
     // The epilogue walks x as dense [rows, K] rows; views that are only
     // matrix-contiguous with a leading stride gap get copied.
     if (!kq_rows_dense(op_inputs[0])) {
       op_inputs[0] = mx::contiguous(op_inputs[0], false, s);
     }
-    const int rows = static_cast<int>(x_c.size() / w_inner_dims);
     lora_flags = kq_lora_prep(
         "[mlx_kquant.quantized_matmul]",
         lora_a,

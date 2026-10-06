@@ -56,3 +56,45 @@ def test_empty_inputs(codec, op, dtype):
         y = f(x, w)
         mx.eval(y)
         assert y.shape == (m, N) and mx.isfinite(y.astype(mx.float32)).all().item()
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=["bf16", "f16"])
+def test_inner_dim_of_zero_checks_the_lora_arguments(dtype):
+    """An inner dim of 0 returns zeros only after the LoRA arguments pass
+    the checks of a full call."""
+    m, r = 4, 8
+    x = mx.zeros((m, 0), dtype=dtype)
+    w = mx.zeros((N, 0), dtype=mx.uint8)
+    a = mx.zeros((0, r), dtype=dtype)
+    b = mx.zeros((r, N), dtype=dtype)
+    rows = mx.ones((m,))
+
+    def call(**lora):
+        return kq.quantized_matmul(x, w, SCALES, "q4_k", True, **lora)
+
+    y = call(lora_a=a, lora_b=b, lora_rows=rows)
+    mx.eval(y)
+    assert y.shape == (m, N) and y.dtype == dtype
+    assert not y.astype(mx.float32).any().item()
+    other = mx.float16 if dtype == mx.bfloat16 else mx.bfloat16
+    for bad in (
+        {"lora_a": a},
+        {"lora_rows": rows},
+        {"lora_a": a.astype(other), "lora_b": b},
+        {"lora_a": mx.zeros((3, r), dtype=dtype), "lora_b": b},
+        {"lora_a": a, "lora_b": mx.zeros((r, N + 1), dtype=dtype)},
+        {"lora_a": a, "lora_b": mx.zeros((r + 1, N), dtype=dtype)},
+        {"lora_a": a, "lora_b": b, "lora_rows": mx.ones((m + 1,))},
+    ):
+        with pytest.raises(ValueError):
+            call(**bad)
+    with pytest.raises(ValueError, match="2-D w"):
+        kq.quantized_matmul(
+            x,
+            mx.zeros((2, N, 0), dtype=mx.uint8),
+            SCALES,
+            "q4_k",
+            True,
+            lora_a=a,
+            lora_b=b,
+        )
