@@ -64,6 +64,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   strided view that is not evaluated before the call, such as `w[::-1]`.
 - `route_shed` returns correct slots for strided views of its indices,
   scores or slot table.
+- The fused MoE ops and `moe_router_topk` take a strided activation or logits
+  view that is not evaluated before the call, and raise for such a stack.
 - `quantized_matmul` returns zeros for an inner dim of 0. On a CPU stream a
   weight with no rows ended the process at more than 16 rows of x.
 - A float16 matmul of 128 or fewer rows split over K, MTP verify among them,

@@ -7,13 +7,17 @@ ops here decide the layout of an operand in their eval, where every input
 has memory, so a view gives the same result whether it is evaluated before
 the call or not:
 
-- the three operands of route_shed are copied when they are not
-  row-major.
+- an activation, router logits and the three operands of route_shed are
+  copied when they are not row-major;
+- an expert stack, a shared-expert tensor and the packed mxfp4 weights and
+  scales are refused when they are not row-major, with the message the op
+  builder gives for a view that has memory.
 
 An operand that is dense adds no node to the graph.
 
 route_shed runs on the default device, so the suite covers the GPU and,
-under KQUANT_FORCE_CPU, the CPU stream.
+under KQUANT_FORCE_CPU, the CPU stream. The other ops are Metal-only
+kernels with no CPU eval, and their cases are skipped there.
 """
 
 from __future__ import annotations
@@ -137,3 +141,305 @@ def test_route_shed_adds_no_node():
     assert set(_nodes(*outs)) == feed | {"KQuantRouteShed"}
     outs = kq.route_shed(idx2[:T, 0::2], sc, slot2[0::2])
     assert set(_nodes(*outs)) == {"KQuantRouteShed", "Slice"}
+
+
+# ------------------------- fused MoE gathers --------------------------
+
+
+def _stack(codec, seed, n=N, experts=E):
+    """A K-quant expert stack uint8 [experts, n, bytes_per_row]."""
+    key = (codec, seed, n, experts)
+    if key not in _W:
+        wf = mx.random.normal((experts * n, K), key=mx.random.key(seed)) * 0.1
+        w, _ = kq.quantize(wf, codec)
+        w = _dense(w.reshape(experts, n, -1))
+        mx.eval(w)
+        _W[key] = w
+    return _W[key]
+
+
+def _shexp(codec, e):
+    """A shared-expert tensor uint8 [N, bytes_per_row] in its own buffer."""
+    key = (codec, "shexp", e)
+    if key not in _W:
+        _W[key] = _dense(_stack(codec, 3)[e])
+        mx.eval(_W[key])
+    return _W[key]
+
+
+def _acts(shape, dtype, seed):
+    """Activations of twice the row and column count, for _strided."""
+    full = (*shape[:-2], 2 * shape[-2], 2 * shape[-1])
+    x = (mx.random.normal(full, key=mx.random.key(seed)) * 0.1).astype(dtype)
+    mx.eval(x)
+    return x
+
+
+def _x_views(x2):
+    """_strided over the last two dims of a 2-D or 3-D activation base."""
+    if x2.ndim == 2:
+        return _strided(x2)
+    t, s2, k2 = x2.shape
+    s, k = s2 // 2, k2 // 2
+    return {
+        "even_cols": lambda: x2[:, :s, 0::2],
+        "even_slots": lambda: x2[:, 0::2, :k],
+        "reversed": lambda: x2[::-1][:, :s, :k],
+        "col_band": lambda: x2[:, :s, k // 2 : k // 2 + k],
+    }
+
+
+def _routing(seed=3, slots=R):
+    rng = np.random.default_rng(seed)
+    inds = mx.array(rng.integers(0, E, size=(T, slots)).astype(np.uint32))
+    sc = mx.array(rng.uniform(0.05, 0.9, size=(T, slots)).astype(np.float32))
+    mx.eval(inds, sc)
+    return inds, sc
+
+
+def _kq_ops(codec):
+    """name -> (shape of x, call(x)) for the K-quant fused MoE ops."""
+    gw, uw = _stack(codec, 1), _stack(codec, 2)
+    sgw, suw = _shexp(codec, 0), _shexp(codec, 1)
+    inds, _ = _routing()
+    inds_s, sc_s = _routing(4, S)
+    r = 4
+    la = (mx.random.normal((E, K, r), key=mx.random.key(8)) * 0.05).astype(mx.float16)
+    lb = (mx.random.normal((E, r, N), key=mx.random.key(9)) * 0.05).astype(mx.float16)
+    mx.eval(la, lb)
+    return {
+        "moe_glu_gather_kq": (
+            (T, K),
+            lambda x: kq.moe_glu_gather_kq(x, gw, uw, codec, inds),
+        ),
+        "gather_qmv_kq": (
+            (T, R, K),
+            lambda x: kq.gather_qmv_kq(x, gw, codec, inds),
+        ),
+        "gather_qmv_kq_lora": (
+            (T, R, K),
+            lambda x: kq.gather_qmv_kq(x, gw, codec, inds, lora_a=la, lora_b=lb),
+        ),
+        "moe_glu_gather_shexp_kq": (
+            (T, K),
+            lambda x: kq.moe_glu_gather_shexp_kq(x, gw, uw, sgw, suw, codec, inds),
+        ),
+        "gather_qmv_mix_kq": (
+            (T, S, K),
+            lambda x: kq.gather_qmv_mix_kq(x, gw, sgw, codec, inds, sc_s),
+        ),
+        "gather_qmv_mix_ns_kq": (
+            (T, S, K),
+            lambda x: kq.gather_qmv_mix_ns_kq(x, gw, codec, inds_s, sc_s),
+        ),
+        "gather_qmv_mix_ns_kq_lora": (
+            (T, S, K),
+            lambda x: kq.gather_qmv_mix_ns_kq(
+                x, gw, codec, inds_s, sc_s, lora_a=la, lora_b=lb
+            ),
+        ),
+    }
+
+
+KQ_OPS = [
+    "moe_glu_gather_kq",
+    "gather_qmv_kq",
+    "gather_qmv_kq_lora",
+    "moe_glu_gather_shexp_kq",
+    "gather_qmv_mix_kq",
+    "gather_qmv_mix_ns_kq",
+    "gather_qmv_mix_ns_kq_lora",
+]
+
+
+@metal_only
+@pytest.mark.parametrize("state", ["lazy", "evaluated"])
+@pytest.mark.parametrize("codec", ["q4_k", "q8_0"])
+@pytest.mark.parametrize("op", KQ_OPS)
+def test_moe_activation_views(op, codec, state):
+    shape, call = _kq_ops(codec)[op]
+    _check_views(_x_views(_acts(shape, mx.float16, 21)), call, state)
+
+
+def _mxfp4_stack(seed):
+    """A packed mxfp4 stack: uint32 [E, N, K / 8] codes, uint8 [E, N, K / 32]
+    block exponents near 2^-6, float32 [E, N] bias."""
+    rng = np.random.default_rng(seed)
+    w = mx.array(rng.integers(0, 2**32, size=(E, N, K // 8), dtype=np.uint32))
+    sc = mx.array(rng.integers(118, 124, size=(E, N, K // 32), dtype=np.uint8))
+    b = mx.array(rng.uniform(-0.2, 0.2, (E, N)).astype(np.float32))
+    mx.eval(w, sc, b)
+    return w, sc, b
+
+
+def _mxfp4_ops():
+    gw, gs, gb = _mxfp4_stack(1)
+    uw, us, ub = _mxfp4_stack(2)
+    inds, sc = _routing()
+    return {
+        "moe_glu_gather": (
+            (T, K),
+            lambda x: kq.moe_glu_gather(x, gw, gs, gb, uw, us, ub, inds),
+        ),
+        "gather_qmv_bias": (
+            (T, R, K),
+            lambda x: kq.gather_qmv_bias(x, gw, gs, gb, inds),
+        ),
+        "gather_qmv_mix_bias": (
+            (T, R, K),
+            lambda x: kq.gather_qmv_mix_bias(x, gw, gs, gb, inds, sc),
+        ),
+    }
+
+
+@metal_only
+@pytest.mark.parametrize("state", ["lazy", "evaluated"])
+@pytest.mark.parametrize(
+    "op", ["moe_glu_gather", "gather_qmv_bias", "gather_qmv_mix_bias"]
+)
+def test_moe_mxfp4_activation_views(op, state):
+    shape, call = _mxfp4_ops()[op]
+    _check_views(_x_views(_acts(shape, mx.float16, 23)), call, state)
+
+
+@metal_only
+@pytest.mark.parametrize("state", ["lazy", "evaluated"])
+@pytest.mark.parametrize(
+    "dtype", [mx.float32, mx.float16, mx.bfloat16], ids=["f32", "f16", "bf16"]
+)
+def test_moe_router_logit_views(dtype, state):
+    n_experts = 128
+    lw = (mx.random.normal((2 * 7, 2 * n_experts), key=mx.random.key(5)) * 2).astype(
+        dtype
+    )
+    mx.eval(lw)
+    for shared in (False, True):
+        _check_views(
+            _strided(lw),
+            lambda v, shared=shared: kq.moe_router_topk(v, 4, True, shared_gate=shared),
+            state,
+        )
+
+
+@metal_only
+def test_moe_dense_activation_adds_no_node():
+    """The call a decode step makes: an unevaluated activation that is
+    row-major. Its graph is the op, the ops that feed x and the layout node
+    of the indices."""
+    gw, uw = _stack("q4_k", 1), _stack("q4_k", 2)
+    inds, _ = _routing()
+    x = _dense(_acts((T, K), mx.float16, 21)[:T, :K])
+    feed = _nodes(x * 1.0)
+    assert "Multiply" in feed and "Contiguous" not in feed
+    y = kq.moe_glu_gather_kq(x * 1.0, gw, uw, "q4_k", inds)
+    assert _nodes(y) == sorted([*feed, "Contiguous", "KQuantMoEGLUKQ"])
+    lw = mx.random.normal((7, 128), key=mx.random.key(5))
+    mx.eval(lw)
+    outs = kq.moe_router_topk(lw * 1.0, 4, True, shared_gate=False)
+    assert set(_nodes(*outs)) == {*_nodes(lw * 1.0), "KQuantMoERouterTopK"}
+
+
+def _refused(call, kind, match):
+    with pytest.raises(kind, match=match):
+        mx.eval(call())
+
+
+@metal_only
+@pytest.mark.parametrize("codec", ["q4_k", "q8_0"])
+def test_moe_strided_stack_is_refused(codec):
+    """The gate and up halves of one fused stack are not row-major: the
+    expert stride is the fused row count. The op refuses them, evaluated
+    (at the call) or not (at eval), and never reads them as dense."""
+    gu = _stack(codec, 5, n=2 * N)
+    gw, uw = _stack(codec, 1), _stack(codec, 2)
+    sg2 = _dense(_stack(codec, 3, n=2 * N)[0])
+    sgw = _shexp(codec, 0)
+    mx.eval(sg2)
+    inds, _ = _routing()
+    inds_s, sc_s = _routing(4, S)
+    x = _dense(_acts((T, K), mx.float16, 21)[:T, :K])
+    h = _dense(_acts((T, R, K), mx.float16, 22)[:, :R, :K])
+    hs = _dense(_acts((T, S, K), mx.float16, 22)[:, :S, :K])
+    msg = "weights must be row-contiguous"
+    calls = {
+        "glu_gate": lambda g: kq.moe_glu_gather_kq(x, g, uw, codec, inds),
+        "glu_up": lambda g: kq.moe_glu_gather_kq(x, gw, g, codec, inds),
+        "qmv": lambda g: kq.gather_qmv_kq(h, g, codec, inds),
+        "shexp_gate": lambda g: kq.moe_glu_gather_shexp_kq(
+            x, g, uw, sgw, sgw, codec, inds
+        ),
+        "mix": lambda g: kq.gather_qmv_mix_kq(hs, g, sgw, codec, inds, sc_s),
+        "mix_ns": lambda g: kq.gather_qmv_mix_ns_kq(hs, g, codec, inds_s, sc_s),
+    }
+    for name, call in calls.items():
+        for half in (lambda: gu[:, :N], lambda: gu[:, N:]):
+            _refused(lambda call=call, half=half: call(half()), ValueError, msg)
+            view = half()
+            mx.eval(view)
+            with pytest.raises(ValueError, match=msg):
+                call(view)
+        # The same rows in their own buffer run.
+        assert _same(call(_dense(gu[:, :N])), call(_dense(gu[:, :N]))), name
+    # A shared-expert tensor of every other row.
+    shexp = {
+        "shexp_gate": lambda v: kq.moe_glu_gather_shexp_kq(
+            x, gw, uw, v, sgw, codec, inds
+        ),
+        "shexp_up": lambda v: kq.moe_glu_gather_shexp_kq(
+            x, gw, uw, sgw, v, codec, inds
+        ),
+        "mix": lambda v: kq.gather_qmv_mix_kq(hs, gw, v, codec, inds, sc_s),
+    }
+    for call in shexp.values():
+        _refused(lambda call=call: call(sg2[0::2]), ValueError, "shared-expert " + msg)
+        view = sg2[0::2]
+        mx.eval(view)
+        with pytest.raises(ValueError, match="shared-expert " + msg):
+            call(view)
+
+
+@metal_only
+@pytest.mark.parametrize("state", ["lazy", "evaluated"])
+def test_moe_row_major_stack_views_run(state):
+    """A band of experts from a larger stack is row-major at an offset. It
+    is read in place, evaluated or not."""
+    codec = "q4_k"
+    big = _stack(codec, 6, experts=2 * E)
+    uw = _stack(codec, 2)
+    inds, _ = _routing()
+    x = _dense(_acts((T, K), mx.float16, 21)[:T, :K])
+    want = kq.moe_glu_gather_kq(x, _dense(big[2 : 2 + E]), uw, codec, inds)
+    band = big[2 : 2 + E]
+    if state == "evaluated":
+        mx.eval(band)
+    assert _same(kq.moe_glu_gather_kq(x, band, uw, codec, inds), want)
+
+
+@metal_only
+def test_moe_mxfp4_strided_stack_is_refused():
+    gw, gs, gb = _mxfp4_stack(1)
+    uw, us, ub = _mxfp4_stack(2)
+    w2 = mx.concatenate([gw, uw], axis=1)
+    s2 = mx.concatenate([gs, us], axis=1)
+    mx.eval(w2, s2)
+    inds, sc = _routing()
+    x = _dense(_acts((T, K), mx.float16, 21)[:T, :K])
+    h = _dense(_acts((T, R, K), mx.float16, 22)[:, :R, :K])
+    msg = "weights/scales must be row-contiguous"
+    calls = [
+        lambda w, s: kq.moe_glu_gather(x, w, s, gb, uw, us, ub, inds),
+        lambda w, s: kq.moe_glu_gather(x, gw, gs, gb, w, s, ub, inds),
+        lambda w, s: kq.gather_qmv_bias(h, w, s, gb, inds),
+        lambda w, s: kq.gather_qmv_mix_bias(h, w, s, gb, inds, sc),
+    ]
+    for call in calls:
+        # A strided weight with dense scales, and dense weights with
+        # strided scales.
+        _refused(lambda call=call: call(w2[:, :N], gs), ValueError, msg)
+        _refused(lambda call=call: call(gw, s2[:, N:]), ValueError, msg)
+        wv, sv = w2[:, :N], s2[:, N:]
+        mx.eval(wv, sv)
+        with pytest.raises(ValueError, match=msg):
+            call(wv, gs)
+        with pytest.raises(ValueError, match=msg):
+            call(gw, sv)
