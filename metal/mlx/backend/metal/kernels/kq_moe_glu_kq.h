@@ -31,6 +31,20 @@
 #define KQ_GLU_ACT_SILU_LIMIT 2
 #define KQ_GLU_ACT_SWIGLU_CLAMP 3
 
+// The clamps of the limited activations, as mx.minimum and mx.clip give
+// them: a NaN passes. min() and clamp() return a bound for a NaN, which
+// would turn a NaN gate or up value into a finite output, so each side is
+// one comparison.
+inline float kq_glu_cap(float g, float limit) {
+  return g > limit ? limit : g;
+}
+
+inline float kq_glu_clip(float u, float limit) {
+  u = u > limit ? limit : u;
+  u = u < -limit ? -limit : u;
+  return u;
+}
+
 template <int ACT>
 inline float
 kq_glu_epilogue(float g, float u, float limit, float alpha = 1.0f) {
@@ -44,8 +58,8 @@ kq_glu_epilogue(float g, float u, float limit, float alpha = 1.0f) {
     // gpt-oss clamped SwiGLU: gate clamped from above only, up clamped both
     // sides, sigmoid slope alpha, and a (u + 1) linear term -- matches the
     // packed kq_moe_glu_gather epilogue (kq_moe_glu.h).
-    g = metal::min(g, limit);
-    u = metal::clamp(u, -limit, limit);
+    g = kq_glu_cap(g, limit);
+    u = kq_glu_clip(u, limit);
     const float sig = 1.0f / (1.0f + metal::exp(-alpha * g));
     return (g * sig) * (u + 1.0f);
   }
@@ -56,8 +70,8 @@ kq_glu_epilogue(float g, float u, float limit, float alpha = 1.0f) {
     // The silu instantiations take the same clamp from a positive run-time
     // limit; the shexp family dispatches silu_limit that way (no _silu_limit
     // shexp kernels). Hosts pass 0 for plain silu.
-    g = metal::min(g, limit);
-    u = metal::clamp(u, -limit, limit);
+    g = kq_glu_cap(g, limit);
+    u = kq_glu_clip(u, limit);
   }
   const float sig = 1.0f / (1.0f + metal::exp(-g));
   return (g * sig) * u;

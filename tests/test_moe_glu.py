@@ -794,6 +794,100 @@ def test_swiglu_clamp_validation():
         kq.gather_qmv_kq(h, wq8, "q8_0", inds, bias=b)
 
 
+def _nan_rows(got):
+    return np.isnan(np.array(got.astype(mx.float32)))
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16], ids=["f16", "bf16"])
+def test_limited_glu_passes_a_nan(dtype):
+    """The limited activations clamp the gate from above and the up value
+    on both sides. A NaN gate or up value gives NaN, as mx.minimum and
+    mx.clip give, and never the value of a bound. A NaN in x reaches both
+    values, and a NaN block scale in the up weight or a NaN up bias reaches
+    the up value alone."""
+    rng = np.random.default_rng(3)
+    inds_np = np.array([[0, 1], [2, 3], [1, 0]], dtype=np.uint32)
+    inds = mx.array(inds_np)
+    x_np = (rng.standard_normal((T, K)) * 0.1).astype(np.float16)
+    x = mx.array(x_np).astype(dtype)
+    x_bad_np = x_np.copy()
+    x_bad_np[1, 7] = np.nan
+    x_bad = mx.array(x_bad_np).astype(dtype)
+    row = 5
+
+    def expect_up(e):
+        # NaN where a slot routes to expert e, at output row `row`.
+        want = np.zeros((T, R, N), dtype=bool)
+        want[:, :, row] = inds_np == e
+        return want
+
+    # silu_limit on q8_0 wire: block 0 of up row [2, row] gets a NaN scale.
+    wire, _ = _wire_and_ref("q8_0")
+    up_np = wire[::-1].copy()
+    up_bad = up_np.copy()
+    up_bad[2, row, 0:2] = np.frombuffer(np.float16(np.nan).tobytes(), np.uint8)
+    gw, uw, uwb = mx.array(wire), mx.array(up_np), mx.array(up_bad)
+    for shexp in (False, True):
+
+        def call(xx, up, shexp=shexp):
+            if shexp:
+                return kq.moe_glu_gather_shexp_kq(
+                    xx, gw, up, gw[0], uw[0], "q8_0", inds, act="silu_limit", limit=0.05
+                )[:, :R]
+            return kq.moe_glu_gather_kq(
+                xx, gw, up, "q8_0", inds, act="silu_limit", limit=0.05
+            )
+
+        clean = call(x, uw)
+        got_x = call(x_bad, uw)
+        got_w = call(x, uwb)
+        mx.eval(clean, got_x, got_w)
+        assert not _nan_rows(clean).any()
+        nx, nw = _nan_rows(got_x), _nan_rows(got_w)
+        assert nx[1].all() and not nx[[0, 2]].any(), shexp
+        assert (nw == expect_up(2)).all(), shexp
+        keep = mx.array(~expect_up(2))
+        assert mx.array_equal(mx.where(keep, got_w, 0), mx.where(keep, clean, 0)).item()
+
+    # swiglu_clamp with biases on mxfp4 wire, and the packed mxfp4 kernel.
+    wire, _ = _wire_and_ref("mxfp4")
+    up_np = wire[::-1].copy()
+    gw, uw = mx.array(wire), mx.array(up_np)
+    gb_np = rng.uniform(-0.2, 0.2, (E, N)).astype(np.float32)
+    ub_np = rng.uniform(-0.2, 0.2, (E, N)).astype(np.float32)
+    bad_np = ub_np.copy()
+    bad_np[1, row] = np.nan
+    gb, ub, ub_bad = mx.array(gb_np), mx.array(ub_np), mx.array(bad_np)
+    pgw, pgs = (mx.array(a) for a in _mxfp4_deinterleave_np(wire))
+    puw, pus = (mx.array(a) for a in _mxfp4_deinterleave_np(up_np))
+    calls = {
+        "wire": lambda xx, b: kq.moe_glu_gather_kq(
+            xx,
+            gw,
+            uw,
+            "mxfp4",
+            inds,
+            act="swiglu_clamp",
+            limit=0.05,
+            gate_bias=gb,
+            up_bias=b,
+            alpha=1.702,
+        ),
+        "packed": lambda xx, b: kq.moe_glu_gather(
+            xx, pgw, pgs, gb, puw, pus, b, inds, 1.702, 0.05
+        ),
+    }
+    for name, call in calls.items():
+        clean = call(x, ub)
+        got_x = call(x_bad, ub)
+        got_b = call(x, ub_bad)
+        mx.eval(clean, got_x, got_b)
+        assert not _nan_rows(clean).any(), name
+        nx, nb = _nan_rows(got_x), _nan_rows(got_b)
+        assert nx[1].all() and not nx[[0, 2]].any(), name
+        assert (nb == expect_up(1)).all(), name
+
+
 def test_moe_glu():
     """pytest entry: runs the full codec-matrix sweep."""
     assert main([]) == 0

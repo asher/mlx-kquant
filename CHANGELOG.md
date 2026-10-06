@@ -74,6 +74,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keys are a view with a strided or reversed last dim.
 - `sdpa_decode_gqa` and the cascade raise for quantized-cache scales and biases
   that differ in layout or have a strided last dim, instead of misreading them.
+- The fused MoE ops with a limited activation (`silu_limit`, `swiglu_clamp`)
+  return NaN for a NaN gate or up value instead of the value of the limit.
 - `quantized_matmul` returns zeros for an inner dim of 0. On a CPU stream a
   weight with no rows ended the process at more than 16 rows of x.
 - A float16 matmul of 128 or fewer rows split over K, MTP verify among them,

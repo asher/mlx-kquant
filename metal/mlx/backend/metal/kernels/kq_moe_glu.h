@@ -158,8 +158,12 @@ template <typename T>
     if (simd_lid == 0) {
       g += gb[row0 + r];
       u += ub[row0 + r];
-      g = min(g, (U)limit);
-      u = metal::clamp(u, -(U)limit, (U)limit);
+      // As mx.minimum and mx.clip: a NaN passes. min() and clamp() return
+      // a bound for a NaN, so each side is one comparison.
+      const U lim = (U)limit;
+      g = g > lim ? lim : g;
+      u = u > lim ? lim : u;
+      u = u < -lim ? -lim : u;
       const U sig = 1.0f / (1.0f + metal::exp(-alpha * g));
       out[r] = static_cast<T>((g * sig) * (u + 1.0f));
     }
