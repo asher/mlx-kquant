@@ -1,8 +1,8 @@
 """quantized_matmul_lora: y = x @ W^T + (strength * (x @ A)) @ B.
 
 On a NAX GPU the op runs one kernel for q4_k weights on bfloat16 from 1024
-rows: stock ops compute z = strength * (x @ A), and the kernel walks K for
-the weight and then the rank for z and B in the same f32 sums. Everywhere
+rows: stock ops compute z = strength * (x @ A), and the kernel walks the
+rank for z and B and then K for the weight in the same f32 sums. Everywhere
 else it builds the sum from quantized_matmul and stock ops.
 
 - R1: relative Frobenius error against the float64 sum, at most 6e-3 on
@@ -415,13 +415,26 @@ def test_lora_rank_zero_and_empty_inputs():
     )
     mx.eval(y)
     assert y.shape == (1100, 0)
+    # No inner dim: every sum is empty, so y is zero.
+    y = kq.quantized_matmul_lora(
+        mx.zeros((5, 0), dtype=mx.bfloat16),
+        mx.zeros((n, 0), dtype=mx.uint8),
+        "q4_k",
+        mx.zeros((0, 16)),
+        b,
+    )
+    mx.eval(y)
+    assert y.shape == (5, n) and y.dtype == mx.bfloat16
+    assert not _f64(y).any()
 
 
 def _check_views(views, call, state):
     """call(view) against call(dense copy of the view). On the GPU the two
-    have the same bits. On the CPU stream the stock matmul reads a
-    transposed operand in place and sums in another order, so the two are
-    equal to the rounding of the activation dtype."""
+    have the same bits. On the CPU stream the stock matmul rounds a product
+    with a transposed second operand once, and a product of dense operands
+    with about 1.3 times that error, so the two differ by a rounding of the
+    activation dtype, where a view read with the wrong strides differs by
+    its whole size."""
     for name, make in views.items():
         want = call(_dense(make()))
         view = make()
@@ -430,7 +443,7 @@ def _check_views(views, call, state):
         got = call(view)
         mx.eval(got, want)
         if force_cpu():
-            assert _rel(_f64(got), _f64(want)) <= 1e-3, (name, state)
+            assert _rel(_f64(got), _f64(want)) <= R1[mx.bfloat16], (name, state)
         else:
             assert mx.array_equal(got, want).item(), (name, state)
 
@@ -548,6 +561,88 @@ def test_lora_compiles_and_repeats():
     assert mx.array_equal(first, plain).item()
 
 
+def test_lora_compiled_function_with_two_band_tables():
+    """Two calls that differ in the band table alone stay two nodes when a
+    compiled function holds both."""
+    n, r, m = 128, 32, 1100
+    w, _ = _weight("q4_k", n, K)
+    a, b = _ab(K, n, r, mx.bfloat16)
+    x = _x([m, K], mx.bfloat16, 103)
+    one = [(0, 64, 0, 16), (64, 128, 16, 16)]
+    two = [(0, 64, 16, 16), (64, 128, 0, 16)]
+
+    def both(t):
+        p = kq.quantized_matmul_lora(t, w, "q4_k", a, b, bands=one)
+        q = kq.quantized_matmul_lora(t, w, "q4_k", a, b, bands=two)
+        # mx.compile merges equivalent nodes but never an output of the
+        # function, so the two calls feed the outputs. The casts are exact.
+        return p.astype(mx.float32), q.astype(mx.float32)
+
+    p, q = mx.compile(both)(x)
+    rp, rq = both(x)
+    mx.eval(p, q, rp, rq)
+    assert mx.array_equal(p, rp).item()
+    assert mx.array_equal(q, rq).item()
+    assert not mx.array_equal(rp, rq).item()
+
+
+def test_lora_runs_on_the_stream_of_the_call():
+    """A call on a stream that is not the default one builds the
+    composition on that stream, at a row count that takes the kernel on
+    the default one."""
+    if force_cpu() or mx.default_device() != mx.gpu:
+        pytest.skip("the CPU is the default device")
+    n, r, m = 96, 16, 1100
+    w, wd = _weight("q4_k", n, K)
+    a, b = _ab(K, n, r, mx.bfloat16)
+    x = _x([m, K], mx.bfloat16, 97)
+    y = kq.quantized_matmul_lora(x, w, "q4_k", a, b, stream=mx.cpu)
+    with mx.stream(mx.cpu):
+        ref = _composed(x, w, a, b)
+    mx.eval(y, ref)
+    assert mx.array_equal(y, ref).item()
+    assert _rel(_f64(y), _ref(x, wd, a, b)) <= CPU_REL
+
+
+def test_lora_jvp_and_vmap_do_not_depend_on_the_row_count():
+    """quantized_matmul has no jvp and no vmap, so both raise for the
+    composition. The kernel raises the same way."""
+    n, r = 96, 16
+    w, _ = _weight("q4_k", n, K)
+    a, b = _ab(K, n, r, mx.bfloat16)
+    seen = {"jvp": [], "vmap": []}
+    for m in (1023, 1100):
+        x = _x([2, m, K], mx.bfloat16, 101)
+
+        def f(t):
+            return kq.quantized_matmul_lora(t, w, "q4_k", a, b)
+
+        with pytest.raises(ValueError) as e:
+            mx.eval(mx.jvp(f, [x[0]], [x[0]])[1])
+        seen["jvp"].append(str(e.value))
+        with pytest.raises(ValueError) as e:
+            mx.eval(mx.vmap(f)(x))
+        seen["vmap"].append(type(e.value))
+    assert seen["jvp"][0] == seen["jvp"][1], seen["jvp"]
+    assert "KQuantMatmul" in seen["jvp"][0]
+
+
+def test_lora_weight_is_frozen():
+    """A gradient with respect to the weight raises at every row count."""
+    n, r = 96, 16
+    w, _ = _weight("q4_k", n, K)
+    a, b = _ab(K, n, r, mx.bfloat16)
+    for m in (1023, 1100):
+        x = _x([m, K], mx.bfloat16, 107)
+
+        def loss(w_, x_=x):
+            y = kq.quantized_matmul_lora(x_, w_, "q4_k", a, b)
+            return y.astype(mx.float32).sum()
+
+        with pytest.raises(ValueError):
+            mx.eval(mx.grad(loss)(w))
+
+
 def test_lora_argument_errors():
     n, r = 96, 16
     w, _ = _weight("q4_k", n, K)
@@ -555,11 +650,15 @@ def test_lora_argument_errors():
     x = _x([4, K], mx.bfloat16, 89)
 
     def bad(match, x_=x, w_=w, a_=a, b_=b, codec="q4_k", **kw):
-        with pytest.raises(ValueError, match=match):
+        # The error names this op, not an op it builds from.
+        with pytest.raises(ValueError, match=r"quantized_matmul_lora\] .*" + match):
             kq.quantized_matmul_lora(x_, w_, codec, a_, b_, **kw)
 
     bad("Unknown kquant_type", codec="q9_z")
     bad("2-D uint8", w_=w.astype(mx.float32))
+    bad("2-D uint8", w_=w.reshape(1, n, -1))
+    bad("whole number", w_=w[:, :-1])
+    bad("x last dim", x_=mx.array(1.0, dtype=mx.bfloat16))
     bad("x last dim", x_=x[:, :-1])
     bad("floating x", x_=x.astype(mx.int32))
     bad("lora_a must be", a_=a[:-1])
@@ -568,10 +667,13 @@ def test_lora_argument_errors():
     bad("lora_b must be", b_=b[:-1])
     bad("lora_b must be", b_=b[:, :-1])
     bad("lora_b must be", b_=b.astype(mx.int32))
+    bad("lora_b must be", b_=b.reshape(r, n, 1))
     bad("strength must be", strength=mx.ones((r + 1,)))
     bad("strength must be", strength=mx.ones((1, r)))
+    bad("strength must be", strength=mx.ones((r, 1)))
     bad("strength must be", strength=mx.ones((r,), dtype=mx.int32))
     bad("rows of", bands=[(0, 64, 0)])
+    bad("rows of", bands=[(0, 64, 0), (64, 96, 0, 8, 8)])
     bad("column order", bands=[(64, 96, 0, 8), (0, 64, 8, 8)])
     bad("column order", bands=[(0, 64, 0, 8), (63, 96, 8, 8)])
     bad("column order", bands=[(32, 32, 0, 8)])
