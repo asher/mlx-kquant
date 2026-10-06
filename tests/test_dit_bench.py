@@ -280,7 +280,9 @@ _ZERO_WRITER = textwrap.dedent(
 
 
 def test_report_builds_with_a_zero_sample(tmp_path):
-    """A sample equal to its glue time is 0 ms; the visit has no ratio."""
+    """A reference sample at or below 0 ms (a time at or under its glue
+    time) gives its visit no ratio. The report counts the visits left out
+    and marks the ratio."""
     json_out = tmp_path / "run.json"
     script = tmp_path / "writer.py"
     script.write_text(_ZERO_WRITER)
@@ -304,9 +306,15 @@ def test_report_builds_with_a_zero_sample(tmp_path):
     (g,) = p["groups"]
     (c,) = g["cells"]
     rt = c["ratios"]["aa/kq"]
-    # Four visits, three ratios: the zero kq sample of round 1 has none.
-    assert sorted(round(v, 9) for _r, v, _f in rt["pairs_raw"]) == [-3.0, 1.2, 1.2]
+    # Four visits, two ratios: the kq samples of 0 and of -0.004 ms have
+    # none.
+    assert sorted(round(v, 9) for _r, v, _f in rt["pairs_raw"]) == [1.2, 1.2]
+    assert rt["dropped"] == 2
+    assert rt["ref_floor"] is True
     assert len(c["arms"]["kq"]["samples"]) == 4
+    md = (tmp_path / "run.md").read_text()
+    assert "zimage.qkv 64 x 1 q4_k aa/kq: 2 of 4" in md
+    assert "1.200* |" in md
 
 
 def _bench(tmp_path, *extra):

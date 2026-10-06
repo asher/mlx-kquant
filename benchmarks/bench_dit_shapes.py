@@ -48,6 +48,14 @@ ratios of each order are scaled to meet at the geometric mean of the two
 order medians, and the factor between them is reported as "order"; the
 raw pairs stay in the JSON as "pairs_raw".
 
+A sample is a time less its glue time, so at a tiny shape it lands on
+either side of 0. A visit whose reference sample is at or below 0 has no
+ratio and is left out, and each ratio carries the count as "dropped". A
+ratio whose reference sits at the timer floor (a reference sample at or
+below 0, or a reference median under twice the p10 to p90 width of the
+glue times) is marked with * in the Markdown and "ref_floor" in the JSON:
+its value says little.
+
 Per cell, ratios carry a 95 percent CI of the paired median, from order
 statistics; its half-width is the cell's noise floor. Per op, the pooled
 median of all settled pairs is the aggregate, reported beside the spread
@@ -184,18 +192,36 @@ def cell_key(arm, codec):
 def paired(samples, a, b):
     """Per-visit ratios a/b over the visits that ran both arms, each with
     True when a ran first in the visit, False when b did, and None when the
-    times do not tell. A visit whose b sample is exactly 0 has no ratio and
-    is left out: a sample is a time less its glue time, so at tiny shapes
-    it lands on either side of 0 and can hit it."""
+    times do not tell. Returns the ratios and the number of visits left
+    out. A visit whose b sample is at or below 0 has no ratio: a sample is
+    a time less its glue time, so at tiny shapes it lands on either side
+    of 0, and a ratio to such a reference measures nothing."""
     sb = {v: (t, ms) for (v, _r, _s, t, ms) in samples.get(b, [])}
     out = []
+    dropped = 0
     for v, r, _s, t, ms in samples.get(a, []):
         if v in sb:
             tb, mb = sb[v]
-            if mb == 0:
+            if mb <= 0:
+                dropped += 1
                 continue
             out.append((r, ms / mb, None if t == tb else t < tb))
-    return out
+    return out, dropped
+
+
+def at_timer_floor(samples, b):
+    """True when the samples of reference arm b sit at the timer floor: one
+    of them is at or below 0, or their median is under twice the p10 to
+    p90 width of the glue times that were subtracted from them."""
+    ref = [ms for (_v, _r, _s, _t, ms) in samples.get(b, [])]
+    if not ref:
+        return False
+    if min(ref) <= 0:
+        return True
+    glue = bs.summarize([ms for (_v, _r, _s, _t, ms) in samples.get("glue", [])])
+    if not glue:
+        return False
+    return bs.summarize(ref)["median"] < 2 * (glue["p90"] - glue["p10"])
 
 
 def order_balance(pairs):
@@ -534,13 +560,15 @@ def summarize_pass(groups, m, rounds, arm_names, desc):
                     for a in lever_arms(arm_names)
                 ),
             ):
-                raw_pairs = paired(sm, a, b)
-                if raw_pairs:
+                raw_pairs, dropped = paired(sm, a, b)
+                if raw_pairs or dropped:
                     pr, order = order_balance(raw_pairs)
                     ratios[name] = split_stats(pr, rounds, 0, 1)
                     ratios[name]["order"] = order
                     ratios[name]["pairs"] = [[r, v] for r, v in pr]
                     ratios[name]["pairs_raw"] = [list(p) for p in raw_pairs]
+                    ratios[name]["dropped"] = dropped
+                    ratios[name]["ref_floor"] = at_timer_floor(sm, b)
             cells.append({"codec": codec, "arms": arms, "ratios": ratios})
         out_groups.append(dict(g, inner=inner[gi], shared=shared, cells=cells))
     return out_groups
@@ -643,6 +671,10 @@ def pick(stats, key="median"):
     return s[key] if s else None
 
 
+def floor_mark(stats):
+    return "*" if stats and stats.get("ref_floor") else ""
+
+
 def pick_round0(stats):
     s = (stats or {}).get("round0")
     return s["median"] if s else None
@@ -713,17 +745,42 @@ def markdown(result):
             + " | round 0 kq/affine | round 0 aa/kq |"
         )
         lines.append("|---|---|---|" + "---|" * (len(names) + 2))
+        floored, left_out = False, []
         for g in p["groups"]:
             for c in g["cells"]:
                 rt = c["ratios"]
                 row = (
                     f"| {g['family']}.{g['op']} | {g['L']} x {g['B']} | {c['codec']} |"
                 )
-                row += "".join(f" {fmt(pick(rt.get(n)))} |" for n in names)
+                row += "".join(
+                    f" {fmt(pick(rt.get(n)))}{floor_mark(rt.get(n))} |" for n in names
+                )
                 row += f" {fmt(pick_round0(rt.get('kq/affine')))} |"
                 row += f" {fmt(pick_round0(rt.get('aa/kq')))} |"
                 lines.append(row)
+                for n, r in rt.items():
+                    if r.get("ref_floor"):
+                        floored = True
+                    if r.get("dropped"):
+                        total = r["dropped"] + len(r["pairs_raw"])
+                        left_out.append(
+                            f"{g['family']}.{g['op']} {g['L']} x {g['B']} "
+                            f"{c['codec']} {n}: {r['dropped']} of {total}"
+                        )
         lines.append("")
+        if floored:
+            lines.append(
+                "A ratio marked * has its reference at the timer floor: a "
+                "reference sample at or below 0, or a reference median under "
+                "twice the p10 to p90 width of the glue times."
+            )
+            lines.append("")
+        if left_out:
+            lines.append(
+                "Visits left out of a ratio, their reference sample at or "
+                "below 0: " + "; ".join(left_out) + "."
+            )
+            lines.append("")
         lines.append(
             "Aggregate per op: pooled median of settled pairs with its 95 percent "
             "CI; per-cell medians p10 to p90; per-cell CI half-width median and "
