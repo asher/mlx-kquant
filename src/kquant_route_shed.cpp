@@ -8,6 +8,7 @@
 // ordering exactly (parity harness in tests/test_route_shed.py).
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "kquant.h"
 #include "kquant_internal.h"
@@ -38,13 +39,14 @@ void KQuantRouteShed::eval_gpu(
     std::vector<mx::array>& outputs) {
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
+  // The kernel reads the three operands as dense memory: a view with other
+  // strides is copied first.
+  const mx::array indices = kq_row_major_gpu(inputs[0], s);
+  const mx::array scores = kq_row_major_gpu(inputs[1], s);
+  const mx::array table = kq_row_major_gpu(inputs[2], s);
   for (auto& out : outputs) {
     out.set_data(mx::allocator::malloc(out.nbytes()));
   }
-
-  const auto& indices = inputs[0];
-  const auto& scores = inputs[1];
-  const auto& table = inputs[2];
 
   int R = indices.shape(-1);
   int T = int(indices.size() / R);
@@ -107,9 +109,13 @@ void KQuantRouteShed::eval_cpu(
         const int R = indices.shape(-1);
         const int64_t T = indices.size() / R;
         const int E = table.shape(0);
-        const uint32_t* idp = indices.data<uint32_t>();
-        const float* scp = scores.data<float>();
-        const int32_t* tbp = table.data<int32_t>();
+        // Dense memory for the loop: a view with other strides is copied.
+        std::vector<uint32_t> id_store;
+        std::vector<float> sc_store;
+        std::vector<int32_t> tb_store;
+        const uint32_t* idp = kq_row_major_cpu(indices, id_store);
+        const float* scp = kq_row_major_cpu(scores, sc_store);
+        const int32_t* tbp = kq_row_major_cpu(table, tb_store);
         uint32_t* slp = slots.data<uint32_t>();
         float* mxp = mix.data<float>();
         int32_t* mip = miss_ids.data<int32_t>();
@@ -222,15 +228,15 @@ std::vector<mx::array> route_shed(
     throw std::invalid_argument(std::string(op) + " slot_table must be int32.");
   }
 
-  auto contig = [&](const mx::array& a) {
-    return a.flags().row_contiguous ? a : mx::contiguous(a, false, s);
-  };
+  // The operands go in as they are. indices and scores are unevaluated on
+  // most calls, so their strides are not known here, and each eval reads a
+  // view that is not row-major through a row-major copy.
   const auto& shape = indices.shape();
   return mx::array::make_arrays(
       {shape, shape, shape, shape},
       {mx::uint32, mx::float32, mx::int32, mx::float32},
       std::make_shared<KQuantRouteShed>(s),
-      {contig(indices), contig(scores), contig(slot_table)});
+      {indices, scores, slot_table});
 }
 
 } // namespace mlx_kquant
