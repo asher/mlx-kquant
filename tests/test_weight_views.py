@@ -132,6 +132,23 @@ def test_glu_weight_views(codec, m, dtype, state):
             assert mx.array_equal(y, ref).item(), (codec, m, name, activation)
 
 
+@pytest.mark.parametrize("state", ["lazy", "evaluated"])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=["bf16", "f16"])
+def test_qmv_bias_weight_views(dtype, state):
+    """The weight of the bias-fused mat-vec, which runs q8_0."""
+    x = _x(1, K, dtype)
+    b = (mx.random.normal((N,), key=mx.random.key(9)) * 4).astype(dtype)
+    mx.eval(b)
+    for name, make in _views("q8_0").items():
+        ref = kq.quantized_matmul_qmv_bias(x, _dense(make()), SCALES, b, "q8_0")
+        view = make()
+        if state == "evaluated":
+            mx.eval(view)
+        y = kq.quantized_matmul_qmv_bias(x, view, SCALES, b, "q8_0")
+        mx.eval(y, ref)
+        assert mx.array_equal(y, ref).item(), (name, state)
+
+
 def test_weight_with_memory_adds_no_node():
     """The call gmlx makes in decode: an evaluated weight with dense rows.
     Its graph is the cast-free x layout node and the matmul, and nothing
