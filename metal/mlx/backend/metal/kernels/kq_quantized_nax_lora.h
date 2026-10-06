@@ -6,10 +6,10 @@
 //
 // x [M, K], W a quantized weight [N, K], z [M, R] and B [R, N] in the
 // dtype of x. A threadgroup owns one [BM, BN] tile of y. It walks K as the
-// plain kernel does, then runs the rank of its column band as more K
-// steps: the weight tile fills from B and the A tile loads z. The sum
-// stays in the f32 accumulator and is rounded once at the store, so y is
-// written once and never read.
+// plain kernel does, then walks the rank of its column band in steps of
+// 32: the A tile loads z and the B tile loads B, both straight from their
+// buffers. The sum stays in the f32 accumulator and is rounded once at the
+// store, so y is written once and never read.
 #include "mlx/backend/metal/kernels/kq_quantized_nax.h"
 
 // band_z, band_rank and band_cols describe the column band of the
@@ -43,8 +43,6 @@ METAL_FUNC void kq_qmm_t_nax_lora_impl(
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   static_assert(BK % 32 == 0, "BK must be a multiple of the MMA K step");
-  // The fill of the tail gives each of the 4 simdgroups 16 columns.
-  static_assert(WM * WN == 4 && BN == 64, "tail fill layout");
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
@@ -77,9 +75,8 @@ METAL_FUNC void kq_qmm_t_nax_lora_impl(
   // Spans are clamped in int before narrowing: M and N pass 32767.
   const short sgp_sm = short(min(int(SM), M - (y_row + tm)));
   const bool is_unaligned_sm = (M - y_row) < BM;
-  // A simdgroup row at or beyond M keeps its share of the weight decode,
-  // of the tail fill and every barrier, and skips the A loads, the MMAs
-  // and the store.
+  // A simdgroup row at or beyond M keeps its share of the weight decode
+  // and every barrier, and skips the A loads, the MMAs and the store.
   const bool sg_live = tm < M - y_row;
 
   const short sgp_sn = aligned_N ? SN : short(min(int(SN), N - (y_col + tn)));
@@ -131,61 +128,46 @@ METAL_FUNC void kq_qmm_t_nax_lora_impl(
         loader_w.next();
       }
 
-      // The tail: up to BK ranks a step. Thread (simd_gid, simd_lid)
-      // fills 16 columns of the rank rows simd_lid, simd_lid + 32, ... of
-      // the weight tile from B. A rank row past the band's rank and a
-      // column past the band's end are filled with zero, and the A tile
-      // loads zero past the band's rank, so that neither a z column of
-      // another band nor a B value of another band enters the sum.
+      // The tail: 32 ranks a step. sg_cols is how many of the simdgroup's
+      // columns lie in the band. Past the band's rank the A tile and the B
+      // tile load zero, and past the band's end the B tile loads zero, so
+      // that neither a z column nor a B value of another band enters the
+      // sum, whatever it holds.
+      const short sg_cols = short(clamp(band_cols - int(tn), 0, int(SN)));
+      b += tn;
       STEEL_PRAGMA_NO_UNROLL
-      for (int r0 = 0; r0 < band_rank; r0 += BK) {
-        const short rk = short(min(int(BK), band_rank - r0));
-        const short kk_end = short(((rk + SK - 1) / SK) * SK);
-        const short n0 = short(16 * simd_gid);
+      for (int r0 = 0; sg_live && sg_cols > 0 && r0 < band_rank; r0 += SK) {
+        NAXTile<T, TM, TK> Atile;
+        NAXTile<T, TK, TN> Btile;
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        STEEL_PRAGMA_NO_UNROLL
-        for (short j = short(simd_lid); j < kk_end; j += SIMD_SIZE) {
-          const device T* bj = b + (r0 + j) * static_cast<int64_t>(N) + n0;
-          STEEL_PRAGMA_UNROLL
-          for (short i = 0; i < 16; i++) {
-            T v = T(0);
-            if (j < rk && n0 + i < band_cols) {
-              v = bj[i];
-            }
-            Ws[(n0 + i) * BK_padded + j] = v;
-          }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        volatile int compiler_barrier;
 
-        STEEL_PRAGMA_NO_UNROLL
-        for (int kk1 = 0; sg_live && kk1 < kk_end; kk1 += SK) {
-          NAXTile<T, TM, TK> Atile;
-          NAXTile<T, TN, TK> Btile;
-
-          volatile int compiler_barrier;
-
-          const short zk = short(min(int(SK), rk - kk1));
-          if constexpr (kAlignedM.value) {
-            if (zk == SK) {
-              Atile.load(z + r0 + kk1, R);
-            } else {
-              Atile.load_safe(z + r0 + kk1, R, short2(zk, SM));
-            }
+        const short zk = short(min(int(SK), band_rank - r0));
+        if constexpr (kAlignedM.value) {
+          if (zk == SK) {
+            Atile.load(z + r0, R);
           } else {
-            Atile.load_safe(z + r0 + kk1, R, short2(zk, sgp_sm));
+            Atile.load_safe(z + r0, R, short2(zk, SM));
           }
-
-          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
-          tile_matmad_nax(
-              Dtile,
-              Atile,
-              metal::bool_constant<transpose_a>{},
-              Btile,
-              metal::bool_constant<transpose_b>{});
-
-          (void)compiler_barrier;
+        } else {
+          Atile.load_safe(z + r0, R, short2(zk, sgp_sm));
         }
+
+        const device T* br = b + r0 * static_cast<int64_t>(N);
+        if (zk == SK && sg_cols == SN) {
+          Btile.load(br, N);
+        } else {
+          Btile.load_safe(br, N, short2(sg_cols, zk));
+        }
+
+        tile_matmad_nax(
+            Dtile,
+            Atile,
+            metal::bool_constant<false>{},
+            Btile,
+            metal::bool_constant<false>{});
+
+        (void)compiler_barrier;
       }
 
       if (!sg_live) {

@@ -41,7 +41,7 @@ const char* kLoraOp = "[mlx_kquant.quantized_matmul_lora]";
 
 // Column tile of the kernel. A band starts on a column tile.
 constexpr int kLoraBn = 64;
-// Largest rank of one band the kernel runs: two K steps of 128.
+// Largest rank of one band the kernel runs.
 constexpr int kLoraMaxRank = 256;
 // Most bands the kernel looks through per threadgroup.
 constexpr int kLoraMaxBands = 16;
@@ -448,7 +448,7 @@ mx::array quantized_matmul_lora(
 
   const int bk = lora_kernel_bk(kquant_type, out_type);
   bool fused = s.device == mx::Device::gpu && nax_available() && lora_on() &&
-      bk > 0 && K % bk == 0 && x.ndim() >= 2 && rows >= lora_min_rows();
+      bk > 0 && rows >= lora_min_rows();
   if (bands.empty()) {
     fused = fused && R <= kLoraMaxRank;
   } else {
