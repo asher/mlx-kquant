@@ -11,6 +11,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dispatch, about 25x faster than the unfused ops at Z-Image shapes.
 - `kq.quantized_matmul_glu` computes a gated feed-forward product of two packed
   weights. On NAX GPUs (M5) a call holds one output buffer, not two or three.
+- `kq.quantized_matmul_lora` adds a low-rank adapter term to a packed matmul. On
+  NAX GPUs (M5), `q4_k` image steps with a LoRA run up to 6% faster per layer.
 - `KQ_TUNE_LIVE=1` makes the NAX tile levers take effect on the next call, so
   tile A/B runs share one process. `KQ_QMM_LOG` now logs NAX tile dispatches.
 - `KQ_NAX_TILE` and `KQ_QMM_TILE` pin the quantized matmul tile, and raise

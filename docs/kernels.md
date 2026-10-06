@@ -169,8 +169,9 @@ Tuning levers (defaults are right for normal use):
 
 - `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
   `KQ_NAX_BM128_ODD_M`, `KQ_NAX_DB64`, the `_BK128` levers, `KQ_NAX_SWIZZLE`), the tile overrides
-  (`KQ_NAX_TILE`, `KQ_QMM_TILE`), `KQ_SPLITK_F32`, `KQ_QMM_LOG` and the `quantized_matmul_glu`
-  levers (`KQ_GLU`, `KQ_GLU_MIN_ROWS`) read their variables on every dispatch, so one process can
+  (`KQ_NAX_TILE`, `KQ_QMM_TILE`), `KQ_SPLITK_F32`, `KQ_QMM_LOG`, the `quantized_matmul_glu`
+  levers (`KQ_GLU`, `KQ_GLU_MIN_ROWS`) and the `quantized_matmul_lora` levers (`KQ_QMM_LORA`,
+  `KQ_QMM_LORA_MIN_ROWS`) read their variables on every dispatch, so one process can
   switch tiles between calls on one resident copy of the weights; `benchmarks/bench_dit_shapes.py`
   runs its tile arms this way. It reads the environment on every dispatch, so it is for
   single-threaded A/B runs that set these variables between calls. Unset (off) by default, and
@@ -189,8 +190,8 @@ Tuning levers (defaults are right for normal use):
   (off) by default. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_QMM_LOG` - set to any value, logs the kernel name, shape and grid of every NAX and ALU qmm
   tile dispatch, every split-K dispatch, every `verify_mma` and `verify_nax` dispatch, split or
-  not, and every fused `quantized_matmul_glu` dispatch to stderr, one `[kq qmm]` line each. The
-  grid depth is the K slice count. The mat-vec routes (`qmv`, `verify_qmv`, `mv_ext`) do not log.
+  not, and every fused `quantized_matmul_glu` and `quantized_matmul_lora` dispatch to stderr, one
+  `[kq qmm]` line each. The grid depth is the K slice count. The mat-vec routes (`qmv`, `verify_qmv`, `mv_ext`) do not log.
   Unset (off) by default. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_SPLITK_F32` - partial dtype of the split-K routes (`splitk`, `nax_splitk`, the
   `KQ_QMM_MIDM` band, and `verify_mma` and `verify_nax` when they split K). Float partials let the
@@ -607,6 +608,66 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
   fused kernel sums the gate term and the up term of the gradient in bfloat16, where the unfused
   ops sum them in float32, so the two gradients differ by one bfloat16 rounding, about 2e-3
   relative. `mx.jvp` and `mx.vmap` raise at every row count, since `quantized_matmul` has neither.
+
+## Quantized matmul with a low-rank term
+
+- `quantized_matmul_lora` - `y = x @ W^T + (strength * (x @ A)) @ B` for a packed weight and a
+  low-rank adapter, `lora_a` [K, R] and `lora_b` [R, N], at the row counts of a diffusion
+  transformer step. `strength` is one element, or one value per rank. It is an input array, so a
+  new value needs no reload and no new trace of a compiled function. Several adapters are one
+  call: join their A columns and their B rows, and give one strength per rank.
+
+  `bands` holds rows of (col_start, col_end, z_start, rank), in column order and disjoint. The
+  columns of a band take that block of ranks and that block of `lora_b`, and a column outside
+  every band takes no low-rank term. A fused q, k and v weight with one adapter per projection is
+  three bands, so no projection multiplies the ranks of another.
+
+  On a NAX GPU (M5), from 1024 activation rows, for `q4_k` weights on bfloat16 activations, stock
+  ops compute `z = strength * (x @ A)` and one dispatch computes the product and adds `z @ B`.
+  Each threadgroup owns a 128 by 64 tile of y. It walks the rank of its column band 32 ranks a
+  step, with z and B read from their buffers, then walks K over the weight, and stores the tile.
+  Both walks add into one f32 sum, which is rounded once at the store. y is the only buffer the
+  dispatch writes, where the unfused ops write the product and then read and write it again for
+  the sum. The kernel takes a rank of at most 256 without bands, and with bands at most 16 of
+  them, each starting on a multiple of 64 columns and holding at most 256 ranks.
+
+  Measured on an M5 Max against `quantized_matmul`, `x @ A` and one `mx.addmm`, at 4608 rows, as
+  the median of four processes of rotated rounds, kernel time over unfused time:
+
+  | K, N | Rank 16 | Rank 64 |
+  |---|---|---|
+  | 3840, 11520, three bands | 0.96 | 0.94 |
+  | 3840, 3840 | 0.98 | 0.98 |
+  | 3840, 10240 | 0.97 | 0.98 |
+  | 10240, 3840 | 1.00 | 1.00 |
+  | 4096, 4096 | 0.99 | 0.98 |
+  | 4096, 24576, two bands | 0.96 | 0.96 |
+  | 12288, 4096 | 0.97 | 0.96 |
+
+  The gain is the second pass over y that the kernel removes, 1 to 6 percent of the call. Where K
+  is wide and N is narrow that pass is small beside `x @ A`, and the two forms tie. At 1056 rows
+  the kernel takes 0.96 to 0.97 of the unfused time at N 11520 and 24576, and ties it at N 3840
+  and 4096.
+
+  x is float16 or bfloat16, and float32 x runs in bfloat16 as in `quantized_matmul`. Leading batch
+  dims fold into rows. `lora_a`, `lora_b` and `strength` take any float dtype and run in the dtype
+  of y.
+
+  Every other case builds the same sum from `quantized_matmul` and stock ops, which round the
+  product to the activation dtype before the add: other codecs, float16 activations, fewer rows,
+  a larger rank, more bands, a band that starts off a multiple of 64 columns, CPU streams and GPUs
+  without NAX. A rank of zero, an x of no rows and a weight of no rows return the product alone.
+
+  Levers, each read once per process unless `KQ_TUNE_LIVE=1`:
+
+  - `KQ_QMM_LORA` - `0` builds the unfused ops on every call. Unset (on) by default.
+  - `KQ_QMM_LORA_MIN_ROWS` - the row count from which the kernel runs, an integer of at least 1.
+    A value below 1 keeps the default, with a warning on stderr. Default 1024.
+
+  `mx.grad` gives the gradient with respect to x, `lora_a`, `lora_b` and `strength` at every row
+  count: the gradient of the kernel runs the unfused ops. The weight is frozen, as in
+  `quantized_matmul`. `mx.jvp` and `mx.vmap` raise at every row count, since `quantized_matmul` has
+  neither.
 
 ## MoE GLU
 

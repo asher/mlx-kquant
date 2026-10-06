@@ -1619,13 +1619,13 @@ class KQuantMatmulFused : public mx::Primitive {
 // disjoint. Several adapters are one call: their A columns and B rows are
 // joined, with one strength per column.
 // Returns [..., N] in the dtype quantized_matmul gives for x. On a NAX GPU,
-// for q4_k weights on bfloat16, K a multiple of 128, at least 1024 rows,
-// every band starting on a multiple of 64 columns, at most 16 bands and a
-// rank of at most 256 per band, stock ops compute z = strength * (x @ A)
-// and one dispatch walks K for the weight and then the rank for z and B in
-// the same f32 sums, with y as its only output buffer and one rounding at
-// the store. Every other case builds the sum from quantized_matmul and
-// stock ops.
+// for q4_k weights on bfloat16, at least 1024 rows, every band starting on
+// a multiple of 64 columns, at most 16 bands and a rank of at most 256 per
+// band (without bands, a rank of at most 256), stock ops compute
+// z = strength * (x @ A) and one dispatch walks the rank for z and B and
+// then K for the weight in the same f32 sums, with y as its only output
+// buffer and one rounding at the store. Every other case builds the sum
+// from quantized_matmul and stock ops.
 mx::array quantized_matmul_lora(
     mx::array x,
     mx::array w,

@@ -697,17 +697,18 @@ NB_MODULE(_ext, m) {
         Quantized matmul with a low-rank term:
         y = x @ W^T + (strength * (x @ A)) @ B.
 
-        On a NAX GPU, for q4_k weights on bfloat16, with K a multiple of
-        128, at least 1024 rows, every band starting on a multiple of 64
-        columns, at most 16 bands and a rank of at most 256 per band, stock
-        ops compute z = strength * (x @ A) and one dispatch walks K for the
-        weight and then the rank for z and B in the same f32 sums. y is the
-        only output buffer and is rounded once, at the store. Every other
-        case builds the same sum from quantized_matmul and stock ops, which
-        round the matmul to the activation dtype before the add. mx.grad
-        gives the gradient with respect to x, lora_a, lora_b and strength
-        at every row count: the gradient of the kernel runs the unfused
-        ops. The weight is frozen, as in quantized_matmul.
+        On a NAX GPU, for q4_k weights on bfloat16, with at least 1024
+        rows, every band starting on a multiple of 64 columns, at most 16
+        bands and a rank of at most 256 per band (without bands, a rank of
+        at most 256), stock ops compute z = strength * (x @ A) and one
+        dispatch walks the rank for z and B and then K for the weight in
+        the same f32 sums. y is the only output buffer and is rounded once,
+        at the store. Every other case builds the same sum from
+        quantized_matmul and stock ops, which round the matmul to the
+        activation dtype before the add. mx.grad gives the gradient with
+        respect to x, lora_a, lora_b and strength at every row count: the
+        gradient of the kernel runs the unfused ops. The weight is frozen,
+        as in quantized_matmul.
 
         Several adapters are one call: join their A columns and their B
         rows, and give one strength per column.
