@@ -94,6 +94,12 @@ NB_MODULE(_ext, m) {
       "The GPU's threadgroup memory limit in bytes; 0 without Metal.");
 
   m.def(
+      "_probe_kernels",
+      &mlx_kquant::probe_kernels,
+      "True in a build with the CMake option KQ_PROBE_KERNELS=ON, for the "
+      "kernel name tests.");
+
+  m.def(
       "_split_kernel_names",
       &mlx_kquant::split_kernel_names,
       "Every kernel name the split-K dispatchers can build, for the kernel "

@@ -31,6 +31,10 @@ bool metallib_loads();
 // builds).
 std::vector<std::string> metallib_kernels();
 
+// True in a build with the CMake option KQ_PROBE_KERNELS=ON: the metallib
+// carries the probe tiles and the levers that select them are read.
+bool probe_kernels();
+
 // True when the GPU supports the NAX (tensor-core) matmul kernels (false on
 // non-Metal builds and pre-NAX GPUs).
 bool nax_available();

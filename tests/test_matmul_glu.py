@@ -29,6 +29,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
+from mlx_kquant._ext import _probe_kernels
 from qmm_probe import force_cpu
 
 import mlx_kquant as kq
@@ -532,8 +533,7 @@ def test_glu_kernels_in_metallib():
     if not names:
         pytest.skip("no metallib loaded")
     glu = {n for n in names if "_qmm_t_nax_glu_" in n}
-    # The tile the op runs for each codec. A build with KQ_PROBE_KERNELS=ON
-    # carries more.
+    # The tile the op runs for each codec.
     want = {
         f"kquant_{c}_qmm_t_nax_glu_{t}_bm128_bn64_bk{bk}w_wm2_wn2_alN_{al}"
         for c, bk in GLU_CODECS.items()
@@ -542,6 +542,13 @@ def test_glu_kernels_in_metallib():
         if t == "bfloat16_t" or c not in BF16_ONLY
     }
     assert want <= glu, sorted(want - glu)
+    # A release build carries those and no other GLU kernel. A build with
+    # KQ_PROBE_KERNELS=ON carries the probe tiles too, and the module that
+    # reads their levers reports the option.
+    if _probe_kernels():
+        assert glu > want
+    else:
+        assert glu == want, sorted(glu - want)
     # Every GLU kernel is a tile of a known form of one of those codecs: K
     # tile 64 or 128, with d (two unpadded Ws buffers) or w (two K walks).
     pat = re.compile(

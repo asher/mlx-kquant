@@ -225,6 +225,14 @@ endif()
 target_link_libraries(mlx_kquant_ext PUBLIC gguflib)
 target_link_options(mlx_kquant_ext PRIVATE ${KQ_WHOLE_ARCHIVE_GGUFLIB})
 
+# A probe build carries the probe tiles and reads the levers that select
+# them. A release build compiles those levers out. PUBLIC, because the
+# sources above are PUBLIC and so are compiled into the Python module too,
+# and that copy is the one the bindings call.
+if(KQ_PROBE_KERNELS)
+  target_compile_definitions(mlx_kquant_ext PUBLIC KQ_PROBE_KERNELS)
+endif()
+
 # ----------------------------- Metal library -----------------------------
 # The kq_* kernels compiled into a single mlx_kquant.metallib.
 # The repo's metal/ dir is searched BEFORE the stock-wheel include tree so the

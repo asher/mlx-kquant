@@ -761,6 +761,14 @@ int max_threadgroup_memory() {
 #endif
 }
 
+bool probe_kernels() {
+#ifdef KQ_PROBE_KERNELS
+  return true;
+#else
+  return false;
+#endif
+}
+
 bool nax_available() {
 #ifdef _METAL_
   return kq_is_nax_available();
