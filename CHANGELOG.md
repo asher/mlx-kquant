@@ -57,8 +57,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   call reached, about 22 MB.
 
 ### Fixed
-- `quantized_matmul` and `gather_qmm` return correct values for a strided
-  weight view that is not evaluated before the call, such as `w[0::2]`.
+- `quantized_matmul`, `quantized_matmul_qmv_bias` and `gather_qmm` return
+  correct values for a strided weight view that is not evaluated before the
+  call, such as `w[0::2]`.
 - `dequantize`, `quantize` and the bias of `quantized_matmul_qmv_bias` take a
   strided view that is not evaluated before the call, such as `w[::-1]`.
 - `quantized_matmul` returns zeros for an inner dim of 0. On a CPU stream a
