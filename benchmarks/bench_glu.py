@@ -22,11 +22,12 @@ fused kernel is the op's default: it is, where glu is at or below composed
 in every cell.
 
 Order: every arm of a cell runs once to build its pipelines and is compared
-with composed, and the MLX peak of one call of each arm is taken. Then each
-round visits every arm once, in an order that rotates with the round and
-reverses on odd cycles. A visit is one discarded call and --calls timed
-calls, each evaluated alone; the sample is their median. Ratios pair the
-arms inside a round. The JSON is rewritten after every round, with the
+with composed. Then the MLX peak of one call of each arm is taken, over the
+memory that is live once the buffers of the calls before it are released.
+Then each round visits every arm once, in an order that rotates with the
+round and reverses on odd cycles. A visit is one discarded call and --calls
+timed calls, each evaluated alone; the sample is their median. Ratios pair
+the arms inside a round. The JSON is rewritten after every round, with the
 process footprint of that round.
 """
 
@@ -96,6 +97,24 @@ def phys_footprint():
 
 def med(v):
     return statistics.median(v)
+
+
+def settle(mx):
+    """Active MLX memory once the buffers of finished calls are released.
+    A buffer is returned when its command buffer completes, which can be
+    after the call that dropped the array, so read until five readings
+    10 ms apart agree."""
+    mx.synchronize()
+    last, same = -1, 0
+    for _ in range(500):
+        mx.clear_cache()
+        cur = mx.get_active_memory()
+        same = same + 1 if cur == last else 0
+        last = cur
+        if same >= 5:
+            break
+        time.sleep(0.01)
+    return last
 
 
 def tile_env(tile):
@@ -206,10 +225,10 @@ def run(a):
                     cell["check"][n] = (d / mx.linalg.norm(ref)).item()
                 del y
             ref = None
-            # MLX peak over the live arrays during one call, in outputs.
+            # MLX peak of one call over the memory live before it, in
+            # outputs. The baseline waits for the arm before to let go.
             for n in names:
-                mx.clear_cache()
-                act0 = mx.get_active_memory()
+                act0 = settle(mx)
                 mx.reset_peak_memory()
                 y = arms[n](x)
                 pk = mx.get_peak_memory() - act0
@@ -268,7 +287,7 @@ def report(res, path):
         f"{a['rounds']} rounds, {a['calls']} calls per visit. Ratios are "
         "medians of per-round pairs against composed; the range is the "
         "smallest and largest round. Peak is the MLX peak of one call over "
-        "the live arrays, in output buffers.",
+        "the memory live before it, in output buffers.",
         "",
         "| dtype | K | N | M | Arm | ms per call | Ratio to composed | Range | "
         "Rounds below 1 | Peak, outputs | Difference to composed |",
@@ -328,7 +347,12 @@ def main():
     ap.add_argument("--cells", default=DEFAULT_CELLS)
     ap.add_argument("--rounds", type=int, default=16)
     ap.add_argument("--calls", type=int, default=6)
-    ap.add_argument("--tiles", default="", help="comma list of glu:BMxBK arms")
+    ap.add_argument(
+        "--tiles",
+        default="",
+        help="comma list of BMxBK tiles, such as 64x64,128x128d; each adds an "
+        "arm glu:BMxBK",
+    )
     ap.add_argument("--skip", default="", help="comma list of arms to leave out")
     ap.add_argument("--cache-gib", type=int, default=2, help="MLX cache limit")
     ap.add_argument("--report", action="store_true", help="rebuild the .md")

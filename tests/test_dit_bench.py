@@ -487,3 +487,40 @@ def test_time_budget_splits_a_run(tmp_path):
     assert recs[-1]["kind"] == "end"
     (p,) = result["passes"]
     assert p["slots_done"] == p["slots_planned"] == 4
+
+
+def test_bench_glu_runs_a_tiny_cell(tmp_path):
+    """bench_glu.py end to end on one tiny cell: the arms, the report and
+    the peak of one call per arm. An arm writes at least its output, and
+    the unfused arms hold two outputs."""
+    out = subprocess.run(
+        [
+            sys.executable,
+            os.path.join(BENCH_DIR, "bench_glu.py"),
+            "--codec",
+            "q4_k",
+            "--cells",
+            "bfloat16:256:512:1100",
+            "--rounds",
+            "2",
+            "--calls",
+            "1",
+            "--out",
+            str(tmp_path / "glu"),
+        ],
+        timeout=300,
+        capture_output=True,
+        text=True,
+    )
+    assert out.returncode == 0, out.stderr[-3000:]
+    res = json.loads((tmp_path / "glu.json").read_text())
+    (cell,) = res["cells"]
+    assert cell["arms"] == ["composed", "composed_aa", "two_mm", "glu"]
+    assert len(cell["samples"]) == 2 * 4
+    pk = cell["peak_outputs"]
+    for arm in ("composed", "composed_aa", "two_mm"):
+        assert 1.9 <= pk[arm] <= 2.2, pk
+    # One output where the fused kernel ran, two where the op composed.
+    assert 0.95 <= pk["glu"] <= 2.2, pk
+    assert cell["check"]["glu"] < 2e-2
+    assert "| glu |" in (tmp_path / "glu.md").read_text()
