@@ -452,6 +452,52 @@ def test_glu_codec_without_kernel_composes(codec):
     assert mx.array_equal(y, comp).item()
 
 
+@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+@pytest.mark.parametrize("m", [1023, 1100])
+def test_glu_gradient_is_the_gradient_of_the_composition(m, activation):
+    """mx.grad wrt x on both sides of the row bound. The fused kernel has
+    the vjp of the unfused ops."""
+    n = 96
+    (wg, _), (wu, _) = _weights("q4_k", n, K)
+    x = _x([m, K], mx.bfloat16, 53)
+    c = mx.random.normal((m, n), key=mx.random.key(59))
+    mx.eval(c)
+
+    def loss(f):
+        return lambda t: (f(t).astype(mx.float32) * c).sum()
+
+    g_op = mx.grad(
+        loss(lambda t: kq.quantized_matmul_glu(t, wg, wu, "q4_k", activation))
+    )(x)
+    g_ref = mx.grad(loss(lambda t: _composed(t, wg, wu, "q4_k", activation)))(x)
+    mx.eval(g_op, g_ref)
+    assert g_op.shape == x.shape and g_op.dtype == x.dtype
+    ref = _f64(g_ref)
+    assert np.isfinite(ref).all() and np.abs(ref).max() > 0
+    assert _rel(_f64(g_op), ref) <= 1e-6
+
+
+def test_glu_jvp_and_vmap_do_not_depend_on_the_row_count():
+    """quantized_matmul has no jvp and no vmap, so both raise for the
+    composition. The fused kernel raises the same way."""
+    (wg, _), (wu, _) = _weights("q4_k", 96, K)
+    seen = {"jvp": [], "vmap": []}
+    for m in (1023, 1100):
+        x = _x([m, K], mx.bfloat16, 61)
+
+        def f(t):
+            return kq.quantized_matmul_glu(t, wg, wu, "q4_k")
+
+        with pytest.raises(ValueError) as e:
+            mx.eval(mx.jvp(f, [x], [x])[1])
+        seen["jvp"].append(str(e.value))
+        with pytest.raises(ValueError) as e:
+            mx.eval(mx.vmap(f)(x))
+        seen["vmap"].append(type(e.value))
+    assert seen["jvp"][0] == seen["jvp"][1], seen["jvp"]
+    assert "KQuantMatmul" in seen["jvp"][0]
+
+
 def test_glu_compiles_and_repeats():
     (wg, _), (wu, _) = _weights("q4_k", 96, K)
     x = _x([1100, K], mx.bfloat16, 17)

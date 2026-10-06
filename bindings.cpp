@@ -626,9 +626,10 @@ NB_MODULE(_ext, m) {
         and the result is rounded once at the store. A float16 store clamps
         to the finite half range. Every other case builds the same product
         from quantized_matmul and stock ops, which round each matmul to the
-        activation dtype first. The op is for inference. On the GPU the
-        fused kernel has no gradient or vmap, and mx.grad or mx.vmap
-        through it raises.
+        activation dtype first. mx.grad gives the gradient with respect
+        to x at every row count: the gradient of the fused kernel runs the
+        unfused ops. The weights are frozen, as in quantized_matmul.
+        mx.jvp and mx.vmap raise at every row count.
 
         Args:
             x (array): [..., K], float16/bfloat16. float32 runs in bfloat16.

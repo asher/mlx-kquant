@@ -23,6 +23,7 @@
 #include "mlx/allocator.h"
 #include "mlx/compile.h"
 #include "mlx/ops.h"
+#include "mlx/transforms.h"
 #include "mlx/utils.h"
 
 #ifdef _METAL_
@@ -150,6 +151,40 @@ bool glu_log() {
   return glu_tune_live() ? std::getenv("KQ_QMM_LOG") != nullptr : cached;
 }
 
+// The product from quantized_matmul and stock ops. The op builds this
+// where it has no fused kernel, and the gradient of the fused kernel is
+// the gradient of this.
+mx::array glu_composed(
+    const mx::array& x,
+    const mx::array& w_gate,
+    const mx::array& w_up,
+    const std::string& kquant_type,
+    int act,
+    mx::Stream s) {
+  auto scales = mx::zeros({1}, mx::uint8, s);
+  auto g = quantized_matmul(
+      x,
+      w_gate,
+      scales,
+      kquant_type,
+      true,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      s);
+  auto u = quantized_matmul(
+      x,
+      w_up,
+      scales,
+      kquant_type,
+      true,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      s);
+  return mx::multiply(glu_activation(g, act, s), u, s);
+}
+
 } // namespace
 
 #ifdef _METAL_
@@ -249,6 +284,53 @@ void KQuantMatmulFused::eval_cpu(
       std::string(kGluOp) + " CPU streams build the composed ops.");
 }
 
+// The fused kernel computes the function of the composition, so its
+// derivatives are the composition's: the gradient wrt x, with the quantized
+// weights frozen as in quantized_matmul. A derivative then does not depend
+// on which side of the row bound a call falls.
+std::vector<mx::array> KQuantMatmulFused::vjp(
+    const std::vector<mx::array>& primals,
+    const std::vector<mx::array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<mx::array>&) {
+  for (auto arg : argnums) {
+    if (arg != 0) {
+      throw std::invalid_argument(
+          "[mlx_kquant] quantized_matmul_glu vjp: no gradient wrt the "
+          "quantized weights (the kquant base is frozen).");
+    }
+  }
+  auto fun = [&](const std::vector<mx::array>& in) {
+    return std::vector<mx::array>{glu_composed(
+        in[0], primals[1], primals[2], kquant_type_, act_, stream())};
+  };
+  auto vjps =
+      mx::vjp(fun, std::vector<mx::array>{primals[0]}, cotangents).second;
+  return std::vector<mx::array>(argnums.size(), vjps[0]);
+}
+
+std::vector<mx::array> KQuantMatmulFused::jvp(
+    const std::vector<mx::array>& primals,
+    const std::vector<mx::array>& tangents,
+    const std::vector<int>& argnums) {
+  for (auto arg : argnums) {
+    if (arg != 0) {
+      throw std::invalid_argument(
+          "[mlx_kquant] quantized_matmul_glu jvp: no derivative wrt the "
+          "quantized weights (the kquant base is frozen).");
+    }
+  }
+  auto fun = [&](const std::vector<mx::array>& in) {
+    return std::vector<mx::array>{glu_composed(
+        in[0], primals[1], primals[2], kquant_type_, act_, stream())};
+  };
+  return mx::jvp(
+             fun,
+             std::vector<mx::array>{primals[0]},
+             std::vector<mx::array>{tangents[0]})
+      .second;
+}
+
 bool KQuantMatmulFused::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMatmulFused&>(other);
   return kquant_type_ == o.kquant_type_ && act_ == o.act_;
@@ -318,28 +400,7 @@ mx::array quantized_matmul_glu(
       bk > 0 && K % bk == 0 && x.ndim() >= 2 && rows >= glu_min_rows() &&
       rows > 0 && w_gate.shape(0) > 0;
   if (!fused) {
-    auto scales = mx::zeros({1}, mx::uint8, s);
-    auto g = quantized_matmul(
-        x,
-        w_gate,
-        scales,
-        kquant_type,
-        true,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        s);
-    auto u = quantized_matmul(
-        x,
-        w_up,
-        scales,
-        kquant_type,
-        true,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        s);
-    return mx::multiply(glu_activation(g, act, s), u, s);
+    return glu_composed(x, w_gate, w_up, kquant_type, act, s);
   }
 
   kq_check_weight_base_at_build(w_gate, kquant_type, s, "quantized_matmul_glu");

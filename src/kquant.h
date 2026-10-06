@@ -1554,7 +1554,8 @@ mx::array quantized_matmul_glu(
     mx::StreamOrDevice s = {});
 
 // Quantized matmul with an epilogue fused into the store (see
-// quantized_matmul_glu). Inference-only.
+// quantized_matmul_glu). vjp and jvp are those of the unfused ops, wrt x
+// only: the quantized weights are frozen, as in KQuantMatmul.
 class KQuantMatmulFused : public mx::Primitive {
  public:
   KQuantMatmulFused(mx::Stream stream, std::string kquant_type, int act)
@@ -1576,6 +1577,16 @@ class KQuantMatmulFused : public mx::Primitive {
     return "KQuantMatmulFused";
   }
   bool is_equivalent(const mx::Primitive& other) const override;
+
+  std::vector<mx::array> vjp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<mx::array>& outputs) override;
+  std::vector<mx::array> jvp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& tangents,
+      const std::vector<int>& argnums) override;
 
  private:
   std::string kquant_type_;

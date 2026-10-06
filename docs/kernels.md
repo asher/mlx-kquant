@@ -590,8 +590,11 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
 
   Every other case builds the same product from `quantized_matmul` and stock ops: other codecs,
   `q8_0` on float16, fewer rows, other inner dims, CPU streams and GPUs without NAX. `KQ_GLU=0`
-  builds it on every
-  call. The op is for inference, and `mx.grad` or `mx.vmap` through the fused kernel raises.
+  builds it on every call.
+
+  `mx.grad` gives the gradient with respect to x at every row count: the gradient of the fused
+  kernel runs the unfused ops. The weights are frozen, as in `quantized_matmul`. `mx.jvp` and
+  `mx.vmap` raise at every row count, since `quantized_matmul` has neither.
 
 ## MoE GLU
 
