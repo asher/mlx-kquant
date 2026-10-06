@@ -317,7 +317,9 @@ kq_lora_mix_apply(
 
 // Densify a strided LoRA operand into a row-major temporary (host side
 // kq_lora_view_gpu). Element-size templated: 2-byte (half/bfloat) and 4-byte
-// (float/uint32/int32) operands share one kernel each.
+// (float/uint32/int32) operands share one kernel each. The 1-byte form
+// copies a packed weight view whose rows are not dense (host side
+// kquant_dense.cpp).
 struct KqLoraDensifyArgs {
   int shape[8];
   int64_t strides[8];

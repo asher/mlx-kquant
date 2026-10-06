@@ -103,6 +103,33 @@ inline void kq_check_weight_base_at_build(
   }
 }
 
+// True when the last two dims of a are laid out as dense rows: the last
+// dim has stride 1 and the dim before it has the row length as its stride.
+// The matmul kernels walk a weight that way and take the strides of any
+// leading dims. The answer means something only for an array with memory.
+inline bool kq_matrix_rows_dense(const mx::array& a) {
+  const int nd = static_cast<int>(a.ndim());
+  if (nd == 0) {
+    return true;
+  }
+  if (nd < 2) {
+    return a.strides()[0] == 1;
+  }
+  return a.strides()[nd - 1] == 1 &&
+      a.strides()[nd - 2] == static_cast<int64_t>(a.shape(nd - 1));
+}
+
+// Op-builder form. An x with memory comes back as it is when its matrix
+// rows are dense, and as a row-major copy otherwise. An x without memory
+// has no strides to read yet, so it gets a KQuantMatrixDense node, which
+// decides at eval.
+mx::array kq_matrix_dense(const mx::array& x, const mx::Stream& s);
+
+// Eval form for a GPU primitive: a itself when its matrix rows are dense,
+// else a row-major copy made by one dispatch on s, which the command buffer
+// keeps alive. a has a 1-, 2- or 4-byte dtype and at most 8 dims.
+mx::array kq_matrix_dense_gpu(const mx::array& a, const mx::Stream& s);
+
 // 64-bit variant of mx::elem_to_loc (mlx/backend/common/utils.h), whose linear
 // index parameter is a 32-bit int. That truncates offsets into tensors whose
 // flattened element count exceeds 2^31 - e.g. a stacked MoE expert weight whose

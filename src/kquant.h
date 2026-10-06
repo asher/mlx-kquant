@@ -1067,6 +1067,35 @@ class KQuantDequantize : public mx::Primitive {
   int bits_;
 };
 
+// Lays out the last two dims of a weight operand as dense rows, at eval.
+// An op builder cannot do this from strides: an array without memory
+// reports a dense layout whatever view it becomes. An input whose last two
+// dims are dense rows passes through with its buffer, strides and offset.
+// Any other input is copied row-major. Inference-only.
+class KQuantMatrixDense : public mx::Primitive {
+ public:
+  explicit KQuantMatrixDense(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override {
+    return {inputs[0].shape()};
+  }
+
+  const char* name() const override {
+    return "KQuantMatrixDense";
+  }
+  bool is_equivalent(const mx::Primitive&) const override {
+    return true;
+  }
+};
+
 // Quantized matmul. vjp implements only the gradient wrt x (re-dispatch with
 // the transpose flipped) so LoRA can train on a frozen kquant base; jvp/vmap
 // and the gradient wrt the quantized weights/scales inherit the base-class

@@ -156,6 +156,7 @@ target_sources(
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_norm_fused.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_qk_norm_rope.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_matmul_fused.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_dense.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_hadamard.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_lora_epilogue.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_hc_glue.cpp

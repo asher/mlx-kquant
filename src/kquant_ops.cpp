@@ -23,16 +23,19 @@ namespace mlx_kquant {
 
 namespace {
 
-// Matrix-contiguity helper. A "matrix-contiguous" tensor only needs
-// its LAST TWO dims densely packed (stride(-2)==shape(-1) && stride(-1)==1); a
-// strided LEADING/batch dim is fine because the qmv/qmm/gather kernels walk it
-// via the strides passed in add_strides_and_shapes. Using full
-// mx::contiguous() here instead would force a copy of the whole tensor whenever
-// the leading dim is strided - e.g. the gate/up halves of a fused MoE
-// gate_up_exps tensor are slices [..., :H, :] / [..., H:, :] whose expert
-// (leading) stride is 2*H rows: matrix-contiguous but NOT row_contiguous, so
-// full contiguify copies ~142 MB PER gather call (the decode MoE 5x
-// regression).
+// Matrix-contiguity. A "matrix-contiguous" tensor only needs its LAST TWO
+// dims densely packed (stride(-2)==shape(-1) && stride(-1)==1); a strided
+// LEADING/batch dim is fine because the qmv/qmm/gather kernels walk it via
+// the strides passed in add_strides_and_shapes. Using full mx::contiguous()
+// instead would force a copy of the whole tensor whenever the leading dim is
+// strided - e.g. the gate/up halves of a fused MoE gate_up_exps tensor are
+// slices [..., :H, :] / [..., H:, :] whose expert (leading) stride is 2*H
+// rows: matrix-contiguous but NOT row_contiguous, so full contiguify copies
+// ~142 MB PER gather call (the decode MoE 5x regression). w and scales go
+// through kq_matrix_dense (kquant_dense.cpp), which reads the strides of an
+// array that has memory and leaves any other array to a node that decides
+// at eval.
+
 // True when the elements of x are laid out row-major in memory (size-1
 // dims ignored), so a kernel can walk them as dense rows without a copy.
 inline bool kq_rows_dense(const mx::array& x) {
@@ -47,23 +50,6 @@ inline bool kq_rows_dense(const mx::array& x) {
     expect *= x.shape(i);
   }
   return true;
-}
-
-inline mx::array kq_ensure_row_contiguous_matrix(
-    const mx::array& x,
-    mx::StreamOrDevice s) {
-  if (x.ndim() < 2) {
-    if (x.strides()[0] == 1) {
-      return x;
-    }
-  } else {
-    auto stride_0 = x.strides()[x.ndim() - 2];
-    auto stride_1 = x.strides()[x.ndim() - 1];
-    if (stride_0 == static_cast<int64_t>(x.shape(-1)) && stride_1 == 1) {
-      return x;
-    }
-  }
-  return mx::contiguous(x, false, s);
 }
 
 // x always gets an unconditional Contiguous node: build-time strides of an
@@ -201,8 +187,8 @@ mx::array quantized_matmul(
   // Cast x to the output dtype, then matrix-row-contiguize x / w / scales at
   // the op level so eval_gpu can assume dense inputs.
   auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
-  auto w_c = kq_ensure_row_contiguous_matrix(w, s);
-  auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
+  auto w_c = kq_matrix_dense(w, s);
+  auto scales_c = kq_matrix_dense(scales, s);
 
   auto out_shape = x_c.shape();
   out_shape.back() = w_outer_dims;
@@ -323,8 +309,8 @@ mx::array quantized_matmul_qmv_bias(
   kq_check_weight_base_at_build(w, kquant_type, s, "quantized_matmul_qmv_bias");
 
   auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
-  auto w_c = kq_ensure_row_contiguous_matrix(w, s);
-  auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
+  auto w_c = kq_matrix_dense(w, s);
+  auto scales_c = kq_matrix_dense(scales, s);
   auto bias_c = mx::astype(bias, out_type, s);
   bias_c =
       bias_c.flags().row_contiguous ? bias_c : mx::contiguous(bias_c, false, s);
@@ -492,9 +478,9 @@ mx::array gather_qmm(
   // short-circuit here skipped the compaction on the slice's first eval and
   // handed the stride-less rhs kernels an expert stride they mis-walk.
   // Contiguous::eval aliases zero-copy when w turns out packed anyway.
-  auto w_c = rhs_reachable ? mx::contiguous(w, false, s)
-                           : kq_ensure_row_contiguous_matrix(w, s);
-  auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
+  auto w_c =
+      rhs_reachable ? mx::contiguous(w, false, s) : kq_matrix_dense(w, s);
+  auto scales_c = kq_matrix_dense(scales, s);
 
   return mx::array(
       std::move(out_shape),
@@ -626,7 +612,7 @@ mx::array gather_qmm_seg(
   // The kernel computes each expert's base pointer as expert * N * K_w, so w
   // must be fully row-contiguous (no strided expert dim).
   auto w_c = mx::contiguous(w, false, s);
-  auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
+  auto scales_c = kq_matrix_dense(scales, s);
   auto map_c = mx::contiguous(map, false, s);
   auto cnt_c = mx::contiguous(counts, false, s);
 
