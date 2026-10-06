@@ -13,7 +13,10 @@ the call or not:
   scales are refused when they are not row-major, with the message the op
   builder gives for a view that has memory;
 - the keys and values of sdpa_prefill_block_sparse are refused when their
-  head dim is not dense, as in the other attention ops.
+  head dim is not dense, as in the other attention ops;
+- the window, pool and pool scales of the sparse attention ops are copied
+  when a row of theirs is not dense, and a packed pool is copied when its
+  codes and scales step batches differently.
 
 An operand that is dense adds no node to the graph.
 
@@ -491,3 +494,134 @@ def test_bs_prefill_strided_head_dim():
     msg = "k/v head_dim must be contiguous"
     _refused(lambda: call(k2[..., 0::2], _dense(v2[..., 0::2])), RuntimeError, msg)
     _refused(lambda: call(_dense(k2[..., 0::2]), v2[..., 0::2]), RuntimeError, msg)
+
+
+# ----------------- sparse attention window and pool rows -----------------
+
+
+def _embedded(a, rows_axis):
+    """Views that hold the values of a and are not row-major, as builders of
+    a fresh view. The first three have dims that fold into one run, which a
+    reshape keeps as a view with an element stride other than 1."""
+    junk = (a.astype(mx.float32) * 3 + 1).astype(a.dtype)
+    cols = a.shape[-1]
+    even = mx.stack([a, junk], axis=-1).reshape(*a.shape[:-1], 2 * cols)
+    odd = mx.stack([junk, a], axis=-1).reshape(*a.shape[:-1], 2 * cols)
+    flip = _dense(a[..., ::-1, ::-1])
+    longer = mx.concatenate([a, junk], axis=rows_axis)
+    turned = _dense(mx.swapaxes(a, -1, -2))
+    mx.eval(even, odd, flip, longer, turned)
+    rows = a.shape[rows_axis]
+    pre = (slice(None),) * rows_axis
+    return {
+        "even_cols": lambda: even[..., 0::2],
+        "odd_cols": lambda: odd[..., 1::2],
+        "reversed": lambda: flip[..., ::-1, ::-1],
+        "prefix": lambda: longer[(*pre, slice(0, rows))],
+        "transposed": lambda: mx.swapaxes(turned, -1, -2),
+    }
+
+
+def _check_embedded(views, call, want, state):
+    for name, make in views.items():
+        view = make()
+        if state == "evaluated":
+            mx.eval(view)
+        assert _same(call(view), want), (name, state)
+
+
+@metal_only
+@pytest.mark.parametrize("state", ["lazy", "evaluated"])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_sparse_decode_row_views(batch, state):
+    from test_sdpa_sparse_decode import _case
+
+    args, _ = _case(
+        batch, 16, 2, 128, 24, 300, 40, mx.float16, np.int32, True, True, True
+    )
+    q, win, pool, idx, scale, kw = args
+    mx.eval(q, win, pool, idx)
+    want = kq.sdpa_sparse_decode(q, win, pool, idx, scale, **kw)
+    _check_embedded(
+        _embedded(win, 2),
+        lambda v: kq.sdpa_sparse_decode(q, v, pool, idx, scale, **kw),
+        want,
+        state,
+    )
+    _check_embedded(
+        _embedded(pool, 1),
+        lambda v: kq.sdpa_sparse_decode(q, win, v, idx, scale, **kw),
+        want,
+        state,
+    )
+
+
+@metal_only
+@pytest.mark.parametrize("state", ["lazy", "evaluated"])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_sparse_prefill_row_views(batch, state):
+    from test_sdpa_sparse_prefill import _case
+
+    args, _ = _case(
+        batch, 16, 20, 128, 40, 300, 48, 16, mx.float16, np.int32, True, True, True
+    )
+    q, win, pool, idx, scale, band, kw = args
+    mx.eval(q, win, pool, idx)
+    want = kq.sdpa_sparse_prefill(q, win, pool, idx, scale, band, **kw)
+    _check_embedded(
+        _embedded(win, 2),
+        lambda v: kq.sdpa_sparse_prefill(q, v, pool, idx, scale, band, **kw),
+        want,
+        state,
+    )
+    _check_embedded(
+        _embedded(pool, 1),
+        lambda v: kq.sdpa_sparse_prefill(q, win, v, idx, scale, band, **kw),
+        want,
+        state,
+    )
+
+
+@metal_only
+@pytest.mark.parametrize("state", ["lazy", "evaluated"])
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("op", ["decode", "prefill"])
+def test_sparse_packed_pool_views(op, batch, state):
+    """A packed pool is codes and scales. Each is read with a unit stride in
+    a row, and a batch is stepped by the stride of the codes, with an eighth
+    of it for the scales. A view of either that steps differently gives the
+    values of its copy."""
+    from test_sdpa_sparse_decode import _on_grid_pool
+
+    if op == "decode":
+        from test_sdpa_sparse_decode import _case
+
+        args, _ = _case(
+            batch, 16, 2, 128, 24, 300, 40, mx.float16, np.int32, True, True, True
+        )
+        q, win, pool, idx, scale, kw = args
+
+        def run(codes, scales):
+            return kq.sdpa_sparse_decode(
+                q, win, codes, idx, scale, pool_scales=scales, **kw
+            )
+    else:
+        from test_sdpa_sparse_prefill import _case
+
+        args, _ = _case(
+            batch, 16, 20, 128, 40, 300, 48, 16, mx.float16, np.int32, True, True, True
+        )
+        q, win, pool, idx, scale, band, kw = args
+
+        def run(codes, scales):
+            return kq.sdpa_sparse_prefill(
+                q, win, codes, idx, scale, band, pool_scales=scales, **kw
+            )
+
+    codes, scales = kq.latent_fp4_pack(_on_grid_pool(pool))
+    mx.eval(q, win, idx, codes, scales)
+    want = run(codes, scales)
+    # The prefix view of the codes alone steps batches by the longer
+    # buffer, and the dense scales do not.
+    _check_embedded(_embedded(codes, 1), lambda v: run(v, scales), want, state)
+    _check_embedded(_embedded(scales, 1), lambda v: run(codes, v), want, state)

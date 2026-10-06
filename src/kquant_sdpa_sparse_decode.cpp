@@ -47,6 +47,37 @@ mx::array rows_flat(const mx::array& a, const char* op, mx::StreamOrDevice s) {
   }
   return mx::reshape(a, {a.shape(0), static_cast<int>(flat)}, s);
 }
+
+#ifdef _METAL_
+// The window, pool and pool scales as the kernels read them. A reshape to
+// [B, rows * D] keeps a view whenever the dims of its input fold into the
+// two of its output, so a row can come out with an element stride other
+// than 1, which is copied here. The kernels step the batches of a packed
+// pool by the stride of its codes and take an eighth of it for the scales,
+// so codes and scales that step differently are copied too.
+struct SparseRows {
+  mx::array win;
+  mx::array pool;
+  mx::array scales; // the pool again when it is not packed
+};
+
+SparseRows sparse_rows(
+    const mx::array& win,
+    const mx::array& pool,
+    const mx::array* scales,
+    const mx::Stream& s) {
+  SparseRows r{
+      kq_unit_stride_gpu(win, s),
+      kq_unit_stride_gpu(pool, s),
+      scales ? kq_unit_stride_gpu(*scales, s) : pool};
+  if (scales && r.pool.size() > 0 && r.pool.shape(0) != 1 &&
+      r.pool.strides(0) != 8 * r.scales.strides(0)) {
+    r.pool = kq_dense_copy_gpu(r.pool, s);
+    r.scales = kq_dense_copy_gpu(r.scales, s);
+  }
+  return r;
+}
+#endif
 } // namespace
 
 #ifdef _METAL_
@@ -59,11 +90,13 @@ void KQSdpaSparseDecode::eval_gpu(
   auto& ce = mx::metal::get_command_encoder(s);
 
   const auto& q = inputs[0];
-  const auto& win = inputs[1]; // [B|1, W * D], rows D apart
-  const auto& pool = inputs[2]; // [B|1, P * D] (packed: [B|1, P * D / 2] codes)
   const auto& idx = inputs[3];
   size_t next = 4;
-  const mx::array* pscales = packed_ ? &inputs[next++] : nullptr;
+  const SparseRows rows =
+      sparse_rows(inputs[1], inputs[2], packed_ ? &inputs[next++] : nullptr, s);
+  const auto& win = rows.win; // [B|1, W * D], rows D apart
+  const auto& pool = rows.pool; // [B|1, P * D] (packed: [B|1, P * D / 2] codes)
+  const mx::array* pscales = packed_ ? &rows.scales : nullptr;
   const mx::array* sinks = has_sinks_ ? &inputs[next++] : nullptr;
   const mx::array* wmask = has_win_mask_ ? &inputs[next++] : nullptr;
   const mx::array* smask = has_sel_mask_ ? &inputs[next++] : nullptr;
@@ -344,8 +377,9 @@ mx::array sdpa_sparse_decode(
   // (Contiguous donates when the input already is). The window and pool
   // go through a reshape to [B, rows * D] instead: a cache's prefix slice
   // is a row-contiguous view, which Reshape keeps as a view at eval while
-  // Contiguous would copy it (its buffer is larger than the view), and
-  // any other layout Reshape copies.
+  // Contiguous would copy it (its buffer is larger than the view). Reshape
+  // keeps other views too, and the eval copies one whose rows are not
+  // dense.
   auto q_c = mx::contiguous(q, false, s);
   auto win_c = rows_flat(mx::astype(window, dt, s), op, s);
   auto pool_c = rows_flat(
@@ -448,11 +482,13 @@ void KQSdpaSparsePrefill::eval_gpu(
   auto& ce = mx::metal::get_command_encoder(s);
 
   const auto& q = inputs[0];
-  const auto& win = inputs[1]; // [B|1, S * D], rows D apart
-  const auto& pool = inputs[2]; // [B|1, P * D] (packed: [B|1, P * D / 2] codes)
   const auto& idx = inputs[3];
   size_t next = 4;
-  const mx::array* pscales = packed_ ? &inputs[next++] : nullptr;
+  const SparseRows rows =
+      sparse_rows(inputs[1], inputs[2], packed_ ? &inputs[next++] : nullptr, s);
+  const auto& win = rows.win; // [B|1, S * D], rows D apart
+  const auto& pool = rows.pool; // [B|1, P * D] (packed: [B|1, P * D / 2] codes)
+  const mx::array* pscales = packed_ ? &rows.scales : nullptr;
   const mx::array* sinks = has_sinks_ ? &inputs[next++] : nullptr;
   const mx::array* smask = has_sel_mask_ ? &inputs[next++] : nullptr;
   auto& o = outputs[0];
