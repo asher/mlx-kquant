@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "mlx/array.h"
 #include "mlx/stream.h"
@@ -140,6 +141,36 @@ mx::array kq_row_major(const mx::array& x, const mx::Stream& s);
 // keeps alive. a has a 1-, 2- or 4-byte dtype and at most 8 dims.
 mx::array kq_matrix_dense_gpu(const mx::array& a, const mx::Stream& s);
 
+// A row-major copy of a in a buffer the command buffer keeps alive,
+// whatever the layout of a. The dtype and dim limits are those above.
+mx::array kq_dense_copy_gpu(const mx::array& a, const mx::Stream& s);
+
+// The same for an operand a kernel reads as one row-major run: a itself
+// when it is row-major, else the row-major copy. An op whose operand is
+// unevaluated on most calls, such as an activation, binds the result of
+// this in its eval and adds no node for the operand.
+mx::array kq_row_major_gpu(const mx::array& a, const mx::Stream& s);
+
+// The same for an operand a kernel reads with a unit stride in its last
+// dim and the operand's own strides in the dims before it: a itself when
+// the last stride is 1, else the row-major copy.
+mx::array kq_unit_stride_gpu(const mx::array& a, const mx::Stream& s);
+
+// Eval guard for an operand an op does not copy, such as an expert stack:
+// throws std::invalid_argument(what + " must be row-contiguous.") when a
+// is not row-major. An op builder can run it only on an array that has
+// memory, since any other array reports the default dense strides.
+inline void kq_check_row_major(const mx::array& a, const std::string& what) {
+  if (!a.flags().row_contiguous) {
+    throw std::invalid_argument(what + " must be row-contiguous.");
+  }
+}
+
+// True when a has memory, so that its strides and flags are its own.
+inline bool kq_has_layout(const mx::array& a) {
+  return a.status() != mx::array::Status::unscheduled;
+}
+
 // 64-bit variant of mx::elem_to_loc (mlx/backend/common/utils.h), whose linear
 // index parameter is a 32-bit int. That truncates offsets into tensors whose
 // flattened element count exceeds 2^31 - e.g. a stacked MoE expert weight whose
@@ -157,6 +188,23 @@ inline int64_t elem_to_loc64(
     elem = q;
   }
   return loc;
+}
+
+// Eval form for a CPU primitive, called inside its dispatched task: the
+// elements of a in row-major order, a's own memory when a is row-major and
+// else a copy held by store.
+template <typename T>
+const T* kq_row_major_cpu(const mx::array& a, std::vector<T>& store) {
+  const T* p = a.data<T>();
+  if (a.flags().row_contiguous) {
+    return p;
+  }
+  const int64_t n = static_cast<int64_t>(a.size());
+  store.resize(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; i++) {
+    store[static_cast<size_t>(i)] = p[elem_to_loc64(i, a.shape(), a.strides())];
+  }
+  return store.data();
 }
 
 } // namespace mlx_kquant

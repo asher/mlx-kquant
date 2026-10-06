@@ -11,6 +11,12 @@
 // kq_row_major is the same for an operand that a kernel reads as one
 // row-major run, such as the bytes dequantize decodes: there the node
 // aliases only an input that is row-major in all of its dims.
+//
+// The _gpu forms decide inside a primitive's own eval, where every input
+// has memory: they return the input when its layout is the one the kernel
+// reads and a row-major copy otherwise. An op uses them for an operand that
+// is unevaluated on most calls, such as an activation, which then costs no
+// node when it is dense.
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -87,15 +93,15 @@ namespace {
 void dense_copy_gpu(const mx::array& a, mx::array& out, const mx::Stream& s) {
   if (!dense_copy_ok(a)) {
     throw std::invalid_argument(
-        "[mlx_kquant] a strided weight view must have a 1-, 2- or 4-byte "
-        "dtype and at most 8 dims.");
+        "[mlx_kquant] a strided view must have a 1-, 2- or 4-byte dtype "
+        "and at most 8 dims.");
   }
   // The copy kernel indexes its threads with 32 bits.
   if (a.size() > UINT32_MAX) {
     throw std::invalid_argument(
-        "[mlx_kquant] a weight view of more than 4294967295 elements whose "
-        "rows are not dense cannot be copied at eval. Evaluate a contiguous "
-        "copy of it first, for example with mx.contiguous(w).");
+        "[mlx_kquant] a strided view of more than 4294967295 elements "
+        "cannot be copied at eval. Evaluate a contiguous copy of it first, "
+        "for example with mx.contiguous(w).");
   }
   auto& d = mx::metal::device(s.device);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -124,15 +130,33 @@ void dense_copy_gpu(const mx::array& a, mx::array& out, const mx::Stream& s) {
 
 } // namespace
 
-mx::array kq_matrix_dense_gpu(const mx::array& a, const mx::Stream& s) {
-  if (a.size() == 0 || kq_matrix_rows_dense(a)) {
-    return a;
-  }
+mx::array kq_dense_copy_gpu(const mx::array& a, const mx::Stream& s) {
   mx::array t(a.shape(), a.dtype(), nullptr, {});
   t.set_data(mx::allocator::malloc(t.nbytes()));
   dense_copy_gpu(a, t, s);
   mx::metal::get_command_encoder(s).add_temporary(t);
   return t;
+}
+
+mx::array kq_matrix_dense_gpu(const mx::array& a, const mx::Stream& s) {
+  if (a.size() == 0 || kq_matrix_rows_dense(a)) {
+    return a;
+  }
+  return kq_dense_copy_gpu(a, s);
+}
+
+mx::array kq_row_major_gpu(const mx::array& a, const mx::Stream& s) {
+  if (a.size() == 0 || a.flags().row_contiguous) {
+    return a;
+  }
+  return kq_dense_copy_gpu(a, s);
+}
+
+mx::array kq_unit_stride_gpu(const mx::array& a, const mx::Stream& s) {
+  if (a.size() == 0 || a.ndim() == 0 || a.strides().back() == 1) {
+    return a;
+  }
+  return kq_dense_copy_gpu(a, s);
 }
 
 void KQuantMatrixDense::eval_gpu(
@@ -151,6 +175,18 @@ void KQuantMatrixDense::eval_gpu(
 #else // !_METAL_
 
 mx::array kq_matrix_dense_gpu(const mx::array&, const mx::Stream&) {
+  throw std::runtime_error("[mlx_kquant] GPU eval requires a Metal build.");
+}
+
+mx::array kq_dense_copy_gpu(const mx::array&, const mx::Stream&) {
+  throw std::runtime_error("[mlx_kquant] GPU eval requires a Metal build.");
+}
+
+mx::array kq_row_major_gpu(const mx::array&, const mx::Stream&) {
+  throw std::runtime_error("[mlx_kquant] GPU eval requires a Metal build.");
+}
+
+mx::array kq_unit_stride_gpu(const mx::array&, const mx::Stream&) {
   throw std::runtime_error("[mlx_kquant] GPU eval requires a Metal build.");
 }
 
