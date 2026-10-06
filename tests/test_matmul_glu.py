@@ -344,6 +344,22 @@ def test_glu_unfused_ops_follow_the_compile_switch(activation):
         mx.enable_compile()
 
 
+@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+def test_glu_unfused_ops_run_on_the_stream_of_the_call(activation):
+    """An unfused call on a stream that is not the default one has the bits
+    of the stock form built on that stream. The two devices round the
+    activation differently, so the bits tell where it ran."""
+    if force_cpu() or mx.default_device() != mx.gpu:
+        pytest.skip("the CPU is the default device")
+    (wg, _), (wu, _) = _weights("q3_k", 96, K)
+    x = _x([64, K], mx.bfloat16, 61)
+    y = kq.quantized_matmul_glu(x, wg, wu, "q3_k", activation, stream=mx.cpu)
+    with mx.stream(mx.cpu):
+        ref = _composed(x, wg, wu, "q3_k", activation)
+    mx.eval(y, ref)
+    assert mx.array_equal(y, ref).item()
+
+
 @pytest.mark.parametrize("dtype", DTYPES, ids=["bf16", "f16"])
 @pytest.mark.parametrize("state", ["lazy", "evaluated"])
 def test_glu_strided_weight_views(state, dtype):
