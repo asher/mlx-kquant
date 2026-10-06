@@ -60,8 +60,11 @@ def _views(codec):
     wide = mx.concatenate([w, w2], axis=1)
     stack = mx.stack([w, w2])
     turned = _dense(mx.swapaxes(w[:N], 0, 1))
-    mx.eval(wide, stack, turned)
+    flipped = _dense(w[:N, ::-1])
+    mx.eval(wide, stack, turned, flipped)
     return {
+        # Rows of the right length that run backwards in memory.
+        "reversed_cols": lambda: flipped[:, ::-1],
         # Rows that are not dense: every other row, from row 0 and row 1.
         "even_rows": lambda: w[0::2],
         "odd_rows": lambda: w[1::2],
