@@ -548,7 +548,8 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
 
 - `quantized_matmul_glu` - `y = act(x @ Wg^T) * (x @ Wu^T)` for two packed weights of one codec and
   one shape, the gated feed-forward of a diffusion transformer block. `act` is `silu` or
-  `gelu_tanh`. The weights are two arrays, or the two row bands of one fused gate and up weight.
+  `gelu_tanh`. The weights are two arrays, or the two row bands of one fused gate and up weight,
+  which the kernel reads in place.
 
   On a NAX GPU (M5), from 1024 activation rows, one dispatch computes the product for `q4_k`,
   `q5_k` and `q6_k` weights whose inner dim is a multiple of 128, and for `q8_0` weights on

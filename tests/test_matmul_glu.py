@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 import mlx.core as mx
 import numpy as np
@@ -226,6 +227,92 @@ def test_glu_row_slices_of_one_weight(dtype):
     mx.eval(y, y2)
     assert _rel(_f64(y), _ref(x, wg64, wu64)) <= R1[dtype]
     assert mx.array_equal(y, y2).item()
+
+
+def _settle():
+    """Active memory once the buffers of finished evals are released."""
+    mx.synchronize()
+    last, same = -1, 0
+    for _ in range(400):
+        mx.clear_cache()
+        cur = mx.get_active_memory()
+        same = same + 1 if cur == last else 0
+        last = cur
+        if same >= 4:
+            break
+        time.sleep(0.005)
+    return last
+
+
+def _peak_outputs(build, out_bytes):
+    """MLX peak of one evaluated call over the memory live before it, in
+    output buffers. The call runs once first, so pipelines and constants
+    are in place."""
+    y = build()
+    mx.eval(y)
+    del y
+    base = _settle()
+    mx.reset_peak_memory()
+    y = build()
+    mx.eval(y)
+    peak = mx.get_peak_memory() - base
+    del y
+    return peak / out_bytes
+
+
+def test_glu_row_bands_are_read_in_place():
+    """Two row bands of one weight on the fused path: the call allocates
+    its output and no copy of a band. The two bands are half an output."""
+    if not _fused():
+        pytest.skip("the fused kernel needs a NAX GPU")
+    n, k, m = 2048, 1024, 1100
+    (wg, _), (wu, _) = _weights("q4_k", n, k)
+    both = mx.concatenate([wg, wu], axis=0)
+    mx.eval(both)
+    x = _x([m, k], mx.bfloat16, 41)
+    out_bytes = m * n * 2
+    assert 2 * wg.nbytes > 0.5 * out_bytes
+    for lazy in (True, False):
+        bands = (both[:n], both[n:])
+        if not lazy:
+            mx.eval(*bands)
+
+        def build(bands=bands, lazy=lazy):
+            g, u = (both[:n], both[n:]) if lazy else bands
+            return kq.quantized_matmul_glu(x, g, u, "q4_k")
+
+        peak = _peak_outputs(build, out_bytes)
+        assert 0.99 <= peak <= 1.05, (lazy, peak)
+    y = kq.quantized_matmul_glu(x, both[:n], both[n:], "q4_k")
+    ref = kq.quantized_matmul_glu(x, wg, wu, "q4_k")
+    mx.eval(y, ref)
+    assert mx.array_equal(y, ref).item()
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["bf16", "f16"])
+@pytest.mark.parametrize("state", ["lazy", "evaluated"])
+def test_glu_strided_weight_views(state, dtype):
+    """Weights whose rows are not dense: every other row of one weight, and
+    a column band of a wider one. The fused path copies them at eval."""
+    n = 96
+    (wg, wg64), (wu, wu64) = _weights("q4_k", n, K)
+    rows = mx.stack([wg, wu], axis=1).reshape(2 * n, -1)
+    cols = mx.concatenate([wg, wu], axis=1)
+    mx.eval(rows, cols)
+    kb = wg.shape[1]
+    x = _x([1100, K], dtype, 43)
+    ref = kq.quantized_matmul_glu(x, wg, wu, "q4_k")
+    for make in (
+        lambda: (rows[0::2], rows[1::2]),
+        lambda: (cols[:, :kb], cols[:, kb:]),
+    ):
+        g, u = make()
+        if state == "evaluated":
+            mx.eval(g, u)
+        y = kq.quantized_matmul_glu(x, g, u, "q4_k")
+        mx.eval(y, ref)
+        assert mx.array_equal(y, ref).item()
+    assert _rel(_f64(ref), _ref(x, wg64, wu64)) <= R1[dtype]
 
 
 def test_glu_float16_store_saturates():

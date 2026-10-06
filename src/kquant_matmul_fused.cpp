@@ -142,8 +142,11 @@ void KQuantMatmulFused::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   const auto& x = inputs[0];
-  const auto& wg = inputs[1];
-  const auto& wu = inputs[2];
+  // A weight whose rows are dense binds as it is, at its own offset, so a
+  // row band of a wider weight is read in place. Any other view is copied
+  // to dense rows first.
+  const mx::array wg = kq_matrix_dense_gpu(inputs[1], s);
+  const mx::array wu = kq_matrix_dense_gpu(inputs[2], s);
   auto& out = outputs[0];
   kq_check_weight_base(wg, kquant_type_, "quantized_matmul_glu");
   kq_check_weight_base(wu, kquant_type_, "quantized_matmul_glu");
@@ -323,19 +326,18 @@ mx::array quantized_matmul_glu(
 
   kq_check_weight_base_at_build(w_gate, kquant_type, s, "quantized_matmul_glu");
   kq_check_weight_base_at_build(w_up, kquant_type, s, "quantized_matmul_glu");
-  // Every operand gets a Contiguous node: the strides of an unevaluated
-  // array mean nothing at build time. The node aliases an operand that
-  // lands row-contiguous, which a row slice of a wider weight does.
+  // x gets a Contiguous node: the strides of an unevaluated array mean
+  // nothing at build time. The weights go in as they are and the eval
+  // looks at their strides. A Contiguous node would copy a row band of a
+  // wider weight on every call, since its buffer is larger than the band.
   auto x_c = mx::contiguous(mx::astype(x, out_type, s), false, s);
-  auto wg_c = mx::contiguous(w_gate, false, s);
-  auto wu_c = mx::contiguous(w_up, false, s);
   auto out_shape = x.shape();
   out_shape.back() = w_gate.shape(0);
   return mx::array(
       std::move(out_shape),
       out_type,
       std::make_shared<KQuantMatmulFused>(s, kquant_type, act),
-      {std::move(x_c), std::move(wg_c), std::move(wu_c)});
+      {std::move(x_c), std::move(w_gate), std::move(w_up)});
 }
 
 } // namespace mlx_kquant
