@@ -58,6 +58,30 @@ def test_empty_inputs(codec, op, dtype):
         assert y.shape == (m, N) and mx.isfinite(y.astype(mx.float32)).all().item()
 
 
+@pytest.mark.parametrize(
+    "dtype", [mx.float32, mx.bfloat16, mx.float16], ids=["f32", "bf16", "f16"]
+)
+@pytest.mark.parametrize("m", [4, 1100])
+def test_inner_dim_of_zero_has_the_dtype_of_a_full_call(m, dtype):
+    """The zeros for an inner dim of 0 have the dtype the op computes in,
+    which for float32 x is not the dtype of x."""
+    full = kq.quantized_matmul(
+        mx.zeros((m, K), dtype=dtype), _wire("q4_k"), SCALES, "q4_k", True
+    )
+    y = kq.quantized_matmul(
+        mx.zeros((m, 0), dtype=dtype),
+        mx.zeros((N, 0), dtype=mx.uint8),
+        SCALES,
+        "q4_k",
+        True,
+    )
+    mx.eval(y)
+    assert y.shape == (m, N) and y.dtype == full.dtype
+    assert not y.astype(mx.float32).any().item()
+    if dtype == mx.float32:
+        assert y.dtype == mx.bfloat16
+
+
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=["bf16", "f16"])
 def test_inner_dim_of_zero_checks_the_lora_arguments(dtype):
     """An inner dim of 0 returns zeros only after the LoRA arguments pass
