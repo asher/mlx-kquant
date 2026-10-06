@@ -8,6 +8,9 @@
 // gives any other array a KQuantMatrixDense node. The node aliases an input
 // whose matrix rows are dense, whatever the stride of its leading dims and
 // the size of its buffer, and copies any other input row-major.
+// kq_row_major is the same for an operand that a kernel reads as one
+// row-major run, such as the bytes dequantize decodes: there the node
+// aliases only an input that is row-major in all of its dims.
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -52,6 +55,27 @@ mx::array kq_matrix_dense(const mx::array& x, const mx::Stream& s) {
   }
   return mx::array(
       x.shape(), x.dtype(), std::make_shared<KQuantMatrixDense>(s), {x});
+}
+
+mx::array kq_row_major(const mx::array& x, const mx::Stream& s) {
+  if (x.status() != mx::array::Status::unscheduled) {
+    return x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  }
+  if (x.size() <= 1) {
+    return x;
+  }
+  if (!dense_copy_ok(x)) {
+    return mx::contiguous(x, false, s);
+  }
+  return mx::array(
+      x.shape(), x.dtype(), std::make_shared<KQuantMatrixDense>(s, true), {x});
+}
+
+bool KQuantMatrixDense::passes(const mx::array& in) const {
+  if (in.size() == 0) {
+    return true;
+  }
+  return whole_ ? in.flags().row_contiguous : kq_matrix_rows_dense(in);
 }
 
 #ifdef _METAL_
@@ -116,7 +140,7 @@ void KQuantMatrixDense::eval_gpu(
     std::vector<mx::array>& outputs) {
   const auto& in = inputs[0];
   auto& out = outputs[0];
-  if (in.size() == 0 || kq_matrix_rows_dense(in)) {
+  if (passes(in)) {
     out.copy_shared_buffer(in);
     return;
   }
@@ -143,7 +167,7 @@ void KQuantMatrixDense::eval_cpu(
     std::vector<mx::array>& outputs) {
   const auto& in = inputs[0];
   auto& out = outputs[0];
-  if (in.size() == 0 || kq_matrix_rows_dense(in)) {
+  if (passes(in)) {
     out.copy_shared_buffer(in);
     return;
   }

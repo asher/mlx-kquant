@@ -1075,10 +1075,12 @@ class KQuantDequantize : public mx::Primitive {
 // An op builder cannot do this from strides: an array without memory
 // reports a dense layout whatever view it becomes. An input whose last two
 // dims are dense rows passes through with its buffer, strides and offset.
-// Any other input is copied row-major. Inference-only.
+// Any other input is copied row-major. With `whole`, an input passes
+// through only when all of its dims are row-major. Inference-only.
 class KQuantMatrixDense : public mx::Primitive {
  public:
-  explicit KQuantMatrixDense(mx::Stream stream) : mx::Primitive(stream) {}
+  explicit KQuantMatrixDense(mx::Stream stream, bool whole = false)
+      : mx::Primitive(stream), whole_(whole) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -1095,9 +1097,15 @@ class KQuantMatrixDense : public mx::Primitive {
   const char* name() const override {
     return "KQuantMatrixDense";
   }
-  bool is_equivalent(const mx::Primitive&) const override {
-    return true;
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return whole_ == static_cast<const KQuantMatrixDense&>(other).whole_;
   }
+
+ private:
+  // True when the input passes through as it is.
+  bool passes(const mx::array& in) const;
+
+  bool whole_;
 };
 
 // Quantized matmul. vjp implements only the gradient wrt x (re-dispatch with

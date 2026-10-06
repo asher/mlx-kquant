@@ -1,11 +1,13 @@
-"""Views of a packed weight.
+"""Views of a packed weight and of the other operands a kernel reads dense.
 
 quantized_matmul and the ops built on it walk the last two dims of a
 packed weight as dense rows. A view with other strides has to give the
 values of its contiguous copy, whether the view has memory when the op is
 built or not. An unevaluated view reports dense strides whatever it
 becomes, so the op decides for it at eval, in a KQuantMatrixDense node. A
-weight that has memory and dense rows adds no node.
+weight that has memory and dense rows adds no node. The same holds for the
+bytes dequantize decodes, the floats quantize encodes and the bias of the
+fused mat-vec.
 
 The cases run on the default device, so the suite covers the GPU and, under
 KQUANT_FORCE_CPU, the CPU stream.
@@ -172,3 +174,90 @@ def test_dense_lazy_view_keeps_its_buffer():
     grown = mx.get_peak_memory() - base
     # The band is 4.4 MB. The output and x layout node are a few KB.
     assert grown < w.nbytes // 8, (grown, w.nbytes)
+
+
+# dequantize decodes its input as one row-major run of bytes, quantize
+# encodes its float input the same way, and the bias of the fused mat-vec
+# is read as dense elements. A view passes through when it is row-major in
+# all of its dims and is copied otherwise, lazy or not.
+
+
+@pytest.mark.parametrize("state", ["lazy", "evaluated"])
+@pytest.mark.parametrize("codec", CODECS)
+def test_dequantize_weight_views(codec, state):
+    views = _views(codec)
+    w = _wire(codec, 2 * N, K, 1)
+    views["reversed"] = lambda: w[::-1][:N]
+    for name, make in views.items():
+        ref = kq.dequantize(_dense(make()), SCALES, codec, dtype=mx.float32)
+        view = make()
+        if state == "evaluated":
+            mx.eval(view)
+        y = kq.dequantize(view, SCALES, codec, dtype=mx.float32)
+        mx.eval(y, ref)
+        assert mx.array_equal(y, ref).item(), (codec, name, state)
+
+
+def test_dequantize_nodes():
+    """A weight with memory adds no node. A lazy view gets the node that
+    decides at eval."""
+    w = _wire("q4_k", 2 * N, K, 1)
+    assert _nodes(kq.dequantize(w, SCALES, "q4_k")) == ["KQuantDequantize"]
+    names = _nodes(kq.dequantize(w[0::2], SCALES, "q4_k"))
+    assert names.count("KQuantMatrixDense") == 1
+
+
+@pytest.mark.parametrize("state", ["lazy", "evaluated"])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16], ids=["f32", "f16"])
+@pytest.mark.parametrize("codec", ["q4_k", "q8_0"])
+def test_quantize_float_views(codec, dtype, state):
+    wf = (mx.random.normal((2 * N, 2 * K), key=mx.random.key(3)) * 0.1).astype(dtype)
+    turned = _dense(mx.swapaxes(wf[:N, :K], 0, 1))
+    im2 = mx.abs(mx.random.normal((2 * K,), key=mx.random.key(4))) + 0.5
+    mx.eval(wf, turned, im2)
+    views = {
+        "even_rows": lambda: wf[0::2, :K],
+        "row_band": lambda: wf[N // 2 : N // 2 + N, :K],
+        "even_cols": lambda: wf[:N, 0::2],
+        "reversed": lambda: wf[::-1][:N, K:],
+        "transposed": lambda: mx.swapaxes(turned, 0, 1),
+    }
+    for name, make in views.items():
+        # q4_k weighs its error by an importance vector.
+        for imatrix in (None, lambda: im2[0::2]) if codec == "q4_k" else (None,):
+            ref_im = None if imatrix is None else _dense(imatrix())
+            ref, _ = kq.quantize(_dense(make()), codec, ref_im)
+            view = make()
+            im = None if imatrix is None else imatrix()
+            if state == "evaluated":
+                mx.eval(view)
+                if im is not None:
+                    mx.eval(im)
+            y, _ = kq.quantize(view, codec, im)
+            mx.eval(y, ref)
+            assert mx.array_equal(y, ref).item(), (codec, name, state)
+
+
+@pytest.mark.parametrize("state", ["lazy", "evaluated"])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=["bf16", "f16"])
+def test_qmv_bias_views(dtype, state):
+    # The bias-fused mat-vec runs q8_0 weights.
+    w = _wire("q8_0", 2 * N, K, 1)[:N]
+    mx.eval(w)
+    x = _x(1, K, dtype)
+    b2 = (mx.random.normal((2 * N,), key=mx.random.key(9)) * 4).astype(dtype)
+    mx.eval(b2)
+    for name, make in {
+        "every_other": lambda: b2[0::2],
+        "reversed": lambda: b2[::-1][:N],
+        "band": lambda: b2[N // 2 : N // 2 + N],
+    }.items():
+        # numpy has no bfloat16, and float32 holds both dtypes exactly.
+        dense = _dense(make().astype(mx.float32)).astype(dtype)
+        ref = kq.quantized_matmul_qmv_bias(x, w, SCALES, dense, "q8_0")
+        bias = make()
+        if state == "evaluated":
+            mx.eval(bias)
+        y = kq.quantized_matmul_qmv_bias(x, w, SCALES, bias, "q8_0")
+        mx.eval(y, ref)
+        assert mx.array_equal(y, ref).item(), (name, state)

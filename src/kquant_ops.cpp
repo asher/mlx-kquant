@@ -110,8 +110,8 @@ mx::array dequantize(
   out_shape.back() =
       (w.shape(-1) / codec->bytes_per_block) * codec->weights_per_block;
 
-  // Row-contiguize at the op level so eval_gpu can assume dense inputs.
-  auto w_c = w.flags().row_contiguous ? w : mx::contiguous(w, false, s);
+  // Row-major bytes for the kernel. A w without memory is decided at eval.
+  auto w_c = kq_row_major(w, s);
 
   kq_check_weight_base_at_build(w, kquant_type, s, "dequantize");
 
@@ -311,9 +311,7 @@ mx::array quantized_matmul_qmv_bias(
   auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
   auto w_c = kq_matrix_dense(w, s);
   auto scales_c = kq_matrix_dense(scales, s);
-  auto bias_c = mx::astype(bias, out_type, s);
-  bias_c =
-      bias_c.flags().row_contiguous ? bias_c : mx::contiguous(bias_c, false, s);
+  auto bias_c = kq_row_major(mx::astype(bias, out_type, s), s);
 
   auto out_shape = x_c.shape();
   out_shape.back() = N;
@@ -689,14 +687,11 @@ std::vector<mx::array> quantize(
       (w.shape(-1) / codec->weights_per_block) * codec->bytes_per_block;
   mx::Shape s_shape = {1};
 
-  // Row-contiguize w (+ imatrix) at the op level; eval_gpu trusts contiguity.
-  auto w_c = w.flags().row_contiguous ? w : mx::contiguous(w, false, s);
-  std::vector<mx::array> inputs = {w_c};
+  // Row-major w and imatrix for the encoder. An operand without memory is
+  // decided at eval.
+  std::vector<mx::array> inputs = {kq_row_major(w, s)};
   if (imatrix.has_value()) {
-    auto im_c = imatrix->flags().row_contiguous
-        ? *imatrix
-        : mx::contiguous(*imatrix, false, s);
-    inputs.push_back(im_c);
+    inputs.push_back(kq_row_major(*imatrix, s));
   }
 
   return mx::array::make_arrays(

@@ -129,6 +129,12 @@ inline bool kq_matrix_rows_dense(const mx::array& a) {
 // decides at eval.
 mx::array kq_matrix_dense(const mx::array& x, const mx::Stream& s);
 
+// Op-builder form for an operand a kernel reads as one row-major run: an x
+// with memory comes back as it is when it is row-major, and as a row-major
+// copy otherwise. An x without memory gets a KQuantMatrixDense node that
+// decides at eval, and passes a row-major x through with its buffer.
+mx::array kq_row_major(const mx::array& x, const mx::Stream& s);
+
 // Eval form for a GPU primitive: a itself when its matrix rows are dense,
 // else a row-major copy made by one dispatch on s, which the command buffer
 // keeps alive. a has a 1-, 2- or 4-byte dtype and at most 8 dims.
