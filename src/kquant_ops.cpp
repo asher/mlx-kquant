@@ -36,22 +36,6 @@ namespace {
 // array that has memory and leaves any other array to a node that decides
 // at eval.
 
-// True when the elements of x are laid out row-major in memory (size-1
-// dims ignored), so a kernel can walk them as dense rows without a copy.
-inline bool kq_rows_dense(const mx::array& x) {
-  int64_t expect = 1;
-  for (int i = x.ndim() - 1; i >= 0; --i) {
-    if (x.shape(i) == 1) {
-      continue;
-    }
-    if (x.strides()[i] != expect) {
-      return false;
-    }
-    expect *= x.shape(i);
-  }
-  return true;
-}
-
 // x always gets an unconditional Contiguous node: build-time strides of an
 // unevaluated array are meaningless, so a stride check here can hand the
 // kernels a lazy transpose whose rows they mis-walk as dense (rows past the
@@ -233,11 +217,8 @@ mx::array quantized_matmul(
   std::vector<mx::array> op_inputs = {x_c, w_c, scales_c};
   int lora_flags = 0;
   if (lora) {
-    // The epilogue walks x as dense [rows, K] rows; views that are only
-    // matrix-contiguous with a leading stride gap get copied.
-    if (!kq_rows_dense(op_inputs[0])) {
-      op_inputs[0] = mx::contiguous(op_inputs[0], false, s);
-    }
+    // The epilogue walks x as dense [rows, K] rows, which the Contiguous
+    // node of x gives it.
     lora_flags = kq_lora_prep(
         "[mlx_kquant.quantized_matmul]",
         lora_a,
