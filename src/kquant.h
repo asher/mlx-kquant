@@ -1544,11 +1544,13 @@ class KQuantQkNormRope : public mx::Primitive {
 // Returns [..., N] in the dtype quantized_matmul gives for x. On a NAX GPU,
 // for codecs with a GLU kernel (q8_0 on bfloat16 only), K a multiple of the
 // codec's K tile (64 for q8_0, 128 for the others) and at least 1024 rows,
-// one dispatch walks K
-// for the gate weight and then for the up weight, keeps both sums in f32,
-// and rounds once at the store; a float16 store clamps to the finite half
-// range. Every other case builds the product from quantized_matmul and
-// stock ops.
+// one dispatch walks K for the gate weight and stores the activation of
+// that sum in y, then walks K for the up weight and multiplies the stored
+// activation into that sum at the final store. The sums, the activation and
+// the product run in f32, with one rounding of the activation to the dtype
+// of y and one of the product. A float16 store keeps a finite value in the
+// finite half range, and a NaN or an infinity passes. Every other case
+// builds the product from quantized_matmul and stock ops.
 mx::array quantized_matmul_glu(
     mx::array x,
     mx::array w_gate,

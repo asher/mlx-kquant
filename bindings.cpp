@@ -626,16 +626,19 @@ NB_MODULE(_ext, m) {
 
         On a NAX GPU, for q4_k, q5_k and q6_k weights and for q8_0 weights
         on bfloat16, with K a multiple of the codec's K tile (64 for q8_0,
-        128 for the others) and at least 1024 rows, one dispatch walks K
-        for the gate weight and then for the up weight and writes y once.
-        Both sums stay in f32, the activation and the product run in f32,
-        and the result is rounded once at the store. A float16 store clamps
-        to the finite half range. Every other case builds the same product
-        from quantized_matmul and stock ops, which round each matmul to the
-        activation dtype first. mx.grad gives the gradient with respect
-        to x at every row count: the gradient of the fused kernel runs the
-        unfused ops. The weights are frozen, as in quantized_matmul.
-        mx.jvp and mx.vmap raise at every row count.
+        128 for the others) and at least 1024 rows, one dispatch computes
+        the product with y as its only buffer. It walks K for the gate
+        weight and stores the activation of that sum in y, then walks K for
+        the up weight and multiplies the stored activation into that sum at
+        the final store. The sums, the activation and the product run in
+        f32, with one rounding of the activation to the dtype of y and one
+        of the product. A float16 store keeps a finite value in the finite
+        half range, and a NaN or an infinity passes. Every other case
+        builds the same product from quantized_matmul and stock ops, which
+        round each matmul to the activation dtype first. mx.grad gives the
+        gradient with respect to x at every row count: the gradient of the
+        fused kernel runs the unfused ops. The weights are frozen, as in
+        quantized_matmul. mx.jvp and mx.vmap raise at every row count.
 
         Args:
             x (array): [..., K], float16/bfloat16. float32 runs in bfloat16.
