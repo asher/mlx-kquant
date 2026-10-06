@@ -103,7 +103,15 @@ mx::array lora_add(
   auto add_block =
       [&](const mx::array& y, const mx::array& zz, const mx::array& bb) {
         if (zz.ndim() < 2) {
-          return mx::add(y, mx::matmul(zz, bb, s), s);
+          // One row: the 2-D call on that row, with its bits.
+          auto row = mx::addmm(
+              mx::expand_dims(y, 0, s),
+              mx::expand_dims(zz, 0, s),
+              bb,
+              1.0f,
+              1.0f,
+              s);
+          return mx::squeeze(row, 0, s);
         }
         return mx::addmm(y, zz, bb, 1.0f, 1.0f, s);
       };

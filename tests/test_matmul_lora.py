@@ -28,7 +28,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from qmm_probe import force_cpu
-from test_operand_views import _check_views, _strided
+from test_operand_views import _dense, _strided
 
 import mlx_kquant as kq
 
@@ -415,6 +415,24 @@ def test_lora_rank_zero_and_empty_inputs():
     )
     mx.eval(y)
     assert y.shape == (1100, 0)
+
+
+def _check_views(views, call, state):
+    """call(view) against call(dense copy of the view). On the GPU the two
+    have the same bits. On the CPU stream the stock matmul reads a
+    transposed operand in place and sums in another order, so the two are
+    equal to the rounding of the activation dtype."""
+    for name, make in views.items():
+        want = call(_dense(make()))
+        view = make()
+        if state == "evaluated":
+            mx.eval(view)
+        got = call(view)
+        mx.eval(got, want)
+        if force_cpu():
+            assert _rel(_f64(got), _f64(want)) <= 1e-3, (name, state)
+        else:
+            assert mx.array_equal(got, want).item(), (name, state)
 
 
 def _weight_views(w):
