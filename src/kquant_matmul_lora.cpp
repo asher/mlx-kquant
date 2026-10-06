@@ -3,11 +3,11 @@
 //
 //   y = x @ W^T + (strength * (x @ A)) @ B
 //
-// On a NAX GPU, for the codecs with a kernel, from kLoraMinRows rows and
-// with K a whole number of the codec's K tiles, stock ops compute
-// z = strength * (x @ A) and one dispatch computes the product and adds
-// z @ B in its accumulator, with y as its only output buffer. Every other
-// case builds the same sum from quantized_matmul and stock ops.
+// On a NAX GPU, for the codecs with a kernel, from kLoraMinRows rows, stock
+// ops compute z = strength * (x @ A) and one dispatch computes the product
+// and adds z @ B in its accumulator, with y as its only output buffer.
+// Every other case builds the same sum from quantized_matmul and stock
+// ops.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -100,23 +100,8 @@ mx::array lora_add(
     const mx::array& b,
     const std::vector<int>& bands,
     mx::Stream s) {
-  auto add_block =
-      [&](const mx::array& y, const mx::array& zz, const mx::array& bb) {
-        if (zz.ndim() < 2) {
-          // One row: the 2-D call on that row, with its bits.
-          auto row = mx::addmm(
-              mx::expand_dims(y, 0, s),
-              mx::expand_dims(zz, 0, s),
-              bb,
-              1.0f,
-              1.0f,
-              s);
-          return mx::squeeze(row, 0, s);
-        }
-        return mx::addmm(y, zz, bb, 1.0f, 1.0f, s);
-      };
   if (bands.empty()) {
-    return add_block(base, z, b);
+    return mx::addmm(base, z, b, 1.0f, 1.0f, s);
   }
   const int N = base.shape(-1);
   std::vector<mx::array> parts;
@@ -132,7 +117,7 @@ mx::array lora_add(
     auto y = last_axis_slice(base, cs, ce, s);
     if (rb > 0) {
       auto bb = mx::slice(b, {z0, cs}, {z0 + rb, ce}, s);
-      y = add_block(y, last_axis_slice(z, z0, z0 + rb, s), bb);
+      y = mx::addmm(y, last_axis_slice(z, z0, z0 + rb, s), bb, 1.0f, 1.0f, s);
     }
     parts.push_back(std::move(y));
     col = ce;
