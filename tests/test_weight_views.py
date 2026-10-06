@@ -253,6 +253,30 @@ def test_dequantize_weight_views(codec, state):
         assert mx.array_equal(y, ref).item(), (codec, name, state)
 
 
+@pytest.mark.parametrize("state", ["lazy", "evaluated"])
+def test_dequantize_and_quantize_3d_views(state):
+    """Every other matrix of a 3-D input. Each matrix has dense rows, and
+    the run of bytes or floats as a whole is not row-major."""
+    wf = mx.random.normal((8, 16, K), key=mx.random.key(3)) * 0.1
+    w, _ = kq.quantize(wf, "q8_0")
+    mx.eval(wf, w)
+    for step in (slice(0, None, 2), slice(1, None, 2), slice(None, None, -1)):
+        ref = kq.dequantize(_dense(w[step]), SCALES, "q8_0", dtype=mx.float32)
+        view = w[step]
+        if state == "evaluated":
+            mx.eval(view)
+        y = kq.dequantize(view, SCALES, "q8_0", dtype=mx.float32)
+        mx.eval(y, ref)
+        assert mx.array_equal(y, ref).item(), (step, state)
+        ref, _ = kq.quantize(_dense(wf[step]), "q8_0")
+        view = wf[step]
+        if state == "evaluated":
+            mx.eval(view)
+        y, _ = kq.quantize(view, "q8_0")
+        mx.eval(y, ref)
+        assert mx.array_equal(y, ref).item(), (step, state)
+
+
 def test_dequantize_nodes():
     """A weight with memory adds no node. A lazy view gets the node that
     decides at eval."""
