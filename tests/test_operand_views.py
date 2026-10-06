@@ -11,7 +11,9 @@ the call or not:
   copied when they are not row-major;
 - an expert stack, a shared-expert tensor and the packed mxfp4 weights and
   scales are refused when they are not row-major, with the message the op
-  builder gives for a view that has memory.
+  builder gives for a view that has memory;
+- the keys and values of sdpa_prefill_block_sparse are refused when their
+  head dim is not dense, as in the other attention ops.
 
 An operand that is dense adds no node to the graph.
 
@@ -443,3 +445,49 @@ def test_moe_mxfp4_strided_stack_is_refused():
             call(wv, gs)
         with pytest.raises(ValueError, match=msg):
             call(gw, sv)
+
+
+# ------------------- sdpa_prefill_block_sparse k and v -------------------
+
+
+def _bs_case():
+    """The block sparse prefill at head dim 256, with keys and values twice
+    as wide as the op reads."""
+    from test_sdpa import _bs_prefill_lists
+
+    hq, hkv, d, s, length, topk, r = 24, 2, 256, 4096, 64, 16, 4
+    offset = s - length
+    q = mx.random.normal((1, hq, length, d), key=mx.random.key(1)).astype(mx.bfloat16)
+    k2 = mx.random.normal((1, hkv, s, 2 * d), key=mx.random.key(2)).astype(mx.bfloat16)
+    v2 = mx.random.normal((1, hkv, s, 2 * d), key=mx.random.key(3)).astype(mx.bfloat16)
+    mx.eval(q, k2, v2)
+    rng = np.random.default_rng(3)
+    sel = np.zeros((length, topk), dtype=np.int64)
+    for t in range(length):
+        sel[t] = rng.choice((offset + t + 1) // r, size=topk, replace=False)
+    pages, pmask, counts = (mx.array(a) for a in _bs_prefill_lists(sel, offset, s))
+    return q, k2, v2, pages, pmask, counts, offset
+
+
+@metal_only
+def test_bs_prefill_strided_head_dim():
+    """Keys and values whose head dim is every other element of a wider
+    buffer. Evaluated, the op copies them. Unevaluated, it cannot see the
+    strides when it is built, and the eval refuses them as the other
+    attention ops do."""
+    q, k2, v2, pages, pmask, counts, offset = _bs_case()
+
+    def call(k, v):
+        return kq.sdpa_prefill_block_sparse(
+            q, k, v, 0.0625, pages, pmask, counts, offset
+        )
+
+    want = call(_dense(k2[..., 0::2]), _dense(v2[..., 0::2]))
+    mx.eval(want)
+    assert mx.isfinite(want.astype(mx.float32)).all().item()
+    kv, vv = k2[..., 0::2], v2[..., 0::2]
+    mx.eval(kv, vv)
+    assert _same(call(kv, vv), want)
+    msg = "k/v head_dim must be contiguous"
+    _refused(lambda: call(k2[..., 0::2], _dense(v2[..., 0::2])), RuntimeError, msg)
+    _refused(lambda: call(_dense(k2[..., 0::2]), v2[..., 0::2]), RuntimeError, msg)

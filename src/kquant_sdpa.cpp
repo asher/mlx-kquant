@@ -1258,6 +1258,7 @@ void KQuantSDPABSPrefill::eval_gpu(
   const auto& pmask = inputs[4];
   const auto& counts = inputs[5];
   auto& out = outputs[0];
+  kq_sdpa_check_layout("sdpa_prefill_block_sparse", q, k, v);
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int n_kv_heads = q.shape(1);

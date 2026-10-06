@@ -66,6 +66,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scores or slot table.
 - The fused MoE ops and `moe_router_topk` take a strided activation or logits
   view that is not evaluated before the call, and raise for such a stack.
+- `sdpa_prefill_block_sparse` raises for keys or values with a strided head
+  dim that are not evaluated before the call, instead of reading them as dense.
 - `quantized_matmul` returns zeros for an inner dim of 0. On a CPU stream a
   weight with no rows ended the process at more than 16 rows of x.
 - A float16 matmul of 128 or fewer rows split over K, MTP verify among them,
