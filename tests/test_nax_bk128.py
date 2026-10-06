@@ -77,11 +77,14 @@ def test_bk128_kernels_in_metallib():
     if not names:
         pytest.skip("no metallib loaded")
     # Every qmm_t tile kernel on a K tile of 128, of any codec, so the other
-    # codecs carry none.
+    # codecs carry none. test_matmul_lora.py holds the low-rank names.
     got = sorted(
         n
         for n in names
-        if n.startswith("kquant_") and "_qmm_t_nax_" in n and "_bk128_" in n
+        if n.startswith("kquant_")
+        and "_qmm_t_nax_" in n
+        and "_bk128_" in n
+        and "_qmm_t_nax_lora_" not in n
     )
     want = sorted(
         f"kquant_{c}_qmm_t_nax_{t}_gs_{gs}_b_{b}_bm{bm}_bn64_bk128_wm2_wn2"
