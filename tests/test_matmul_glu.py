@@ -347,8 +347,9 @@ def test_glu_unfused_ops_follow_the_compile_switch(activation):
 @pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
 def test_glu_unfused_ops_run_on_the_stream_of_the_call(activation):
     """An unfused call on a stream that is not the default one has the bits
-    of the stock form built on that stream. The two devices round the
-    activation differently, so the bits tell where it ran."""
+    of the stock form built on that stream. For silu the two devices round
+    the activation differently at this input, so the bits tell where it ran.
+    For gelu_tanh they agree here, and that case checks the value alone."""
     if force_cpu() or mx.default_device() != mx.gpu:
         pytest.skip("the CPU is the default device")
     (wg, _), (wu, _) = _weights("q3_k", 96, K)
