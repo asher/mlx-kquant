@@ -489,12 +489,23 @@ def test_glu_codec_without_kernel_composes(codec):
 
 @pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
 @pytest.mark.parametrize("m", [1023, 1100])
-def test_glu_gradient_is_the_gradient_of_the_composition(m, activation):
+@pytest.mark.parametrize(
+    "dtype", [mx.bfloat16, mx.float16, mx.float32], ids=["bf16", "f16", "f32"]
+)
+def test_glu_gradient_is_the_gradient_of_the_composition(dtype, m, activation):
     """mx.grad wrt x on both sides of the row bound. The fused kernel has
-    the vjp of the unfused ops."""
+    the vjp of the unfused ops, bit for bit on float16 and bfloat16 x.
+
+    float32 x is cast to bfloat16 before the fused node, so the node sums
+    the gate term and the up term of the gradient in bfloat16 and the
+    unfused ops sum them in float32. The two differ by the rounding of that
+    one sum. bfloat16 keeps 8 significant bits, so one rounding moves a
+    value by at most 2^-8 = 3.9e-3 of itself and by about 1.7e-3 in the
+    root mean square, and the difference measures 1.8e-3. The bound is
+    6e-3, the bound on a bfloat16 result against float64."""
     n = 96
     (wg, _), (wu, _) = _weights("q4_k", n, K)
-    x = _x([m, K], mx.bfloat16, 53)
+    x = _x([m, K], dtype, 53)
     c = mx.random.normal((m, n), key=mx.random.key(59))
     mx.eval(c)
 
@@ -509,7 +520,11 @@ def test_glu_gradient_is_the_gradient_of_the_composition(m, activation):
     assert g_op.shape == x.shape and g_op.dtype == x.dtype
     ref = _f64(g_ref)
     assert np.isfinite(ref).all() and np.abs(ref).max() > 0
-    assert _rel(_f64(g_op), ref) <= 1e-6
+    if dtype == mx.float32 and _fused(m):
+        rel = _rel(_f64(g_op), ref)
+        assert rel <= R1[mx.bfloat16], rel
+    else:
+        assert mx.array_equal(g_op, g_ref).item()
 
 
 def test_glu_jvp_and_vmap_do_not_depend_on_the_row_count():

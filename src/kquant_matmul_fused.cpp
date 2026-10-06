@@ -322,8 +322,14 @@ void KQuantMatmulFused::eval_cpu(
 
 // The fused kernel computes the function of the composition, so its
 // derivatives are the composition's: the gradient wrt x, with the quantized
-// weights frozen as in quantized_matmul. A derivative then does not depend
-// on which side of the row bound a call falls.
+// weights frozen as in quantized_matmul. For float16 and bfloat16 x a
+// derivative then does not depend on which side of the row bound a call
+// falls. float32 x is cast to bfloat16 before this node, so the gate term
+// and the up term of the gradient are summed in bfloat16 here and the sum
+// is cast to float32. The composition casts x once per matmul, so it casts
+// each term to float32 and sums there. The two gradients differ by the
+// rounding of that one bfloat16 sum, and neither is closer to the exact
+// gradient.
 std::vector<mx::array> KQuantMatmulFused::vjp(
     const std::vector<mx::array>& primals,
     const std::vector<mx::array>& cotangents,

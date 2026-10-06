@@ -603,8 +603,10 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
   kernel. A release build reads none of the four.
 
   `mx.grad` gives the gradient with respect to x at every row count: the gradient of the fused
-  kernel runs the unfused ops. The weights are frozen, as in `quantized_matmul`. `mx.jvp` and
-  `mx.vmap` raise at every row count, since `quantized_matmul` has neither.
+  kernel runs the unfused ops. The weights are frozen, as in `quantized_matmul`. For float32 x the
+  fused kernel sums the gate term and the up term of the gradient in bfloat16, where the unfused
+  ops sum them in float32, so the two gradients differ by one bfloat16 rounding, about 2e-3
+  relative. `mx.jvp` and `mx.vmap` raise at every row count, since `quantized_matmul` has neither.
 
 ## MoE GLU
 
