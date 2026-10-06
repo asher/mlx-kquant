@@ -310,6 +310,40 @@ def test_glu_composition_is_the_stock_form(activation, dtype):
     assert op <= (3.05 if activation == "gelu_tanh" else 2.05), op
 
 
+def _node_kinds(*outputs):
+    """Kinds of the primitives in the graph of the outputs. A compiled
+    function is one node, named after the ops it holds."""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("r", suffix=".dot") as f:
+        mx.export_to_dot(f.name, *outputs)
+        text = f.read()
+    names = re.findall(r'label ="([A-Za-z0-9_]+)"', text)
+    return sorted("Compiled" if n.startswith("Compiled") else n for n in names)
+
+
+@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+def test_glu_unfused_ops_follow_the_compile_switch(activation):
+    """The unfused path builds its activation as mlx.nn does in either
+    state of mx's compile switch: one compiled function while the switch is
+    on and separate ops while it is off, whatever the state was at an
+    earlier call. 64 rows build the unfused ops on every device."""
+    (wg, _), (wu, _) = _weights("q4_k", 96, K)
+    x = _x([64, K], mx.bfloat16, 71)
+    try:
+        for on in (True, False, True, False):
+            (mx.enable_compile if on else mx.disable_compile)()
+            y = kq.quantized_matmul_glu(x, wg, wu, "q4_k", activation)
+            ref = _composed(x, wg, wu, "q4_k", activation)
+            kinds = _node_kinds(y)
+            assert kinds == _node_kinds(ref), (on, kinds)
+            assert ("Compiled" in kinds) == on, (on, kinds)
+            mx.eval(y, ref)
+            assert mx.array_equal(y, ref).item(), on
+    finally:
+        mx.enable_compile()
+
+
 @pytest.mark.parametrize("dtype", DTYPES, ids=["bf16", "f16"])
 @pytest.mark.parametrize("state", ["lazy", "evaluated"])
 def test_glu_strided_weight_views(state, dtype):

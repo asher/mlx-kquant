@@ -53,11 +53,12 @@ int glu_act_kind(const std::string& activation) {
 }
 
 // The activation of the composition, built the way mlx.nn builds silu and
-// gelu_approx: one compiled elementwise function of the same ops in the
-// same order, with the constants a Python scalar gives. The composition
-// then has the bits and the peak memory of nn.silu(g) * u and
-// nn.gelu_approx(g) * u: the compiled function writes into g's buffer,
-// where separate ops hold a buffer per step.
+// gelu_approx: the same ops in the same order, with the constants a Python
+// scalar gives, as one compiled elementwise function while mx's compile
+// switch is on and as separate ops while it is off. The composition then
+// has the bits and the peak memory of nn.silu(g) * u and
+// nn.gelu_approx(g) * u in either state: the compiled function writes into
+// g's buffer, where separate ops hold a buffer per step.
 std::vector<mx::array> glu_silu(const std::vector<mx::array>& in) {
   const auto& x = in[0];
   return {mx::multiply(x, mx::sigmoid(x))};
@@ -75,13 +76,16 @@ std::vector<mx::array> glu_gelu_tanh(const std::vector<mx::array>& in) {
 }
 
 mx::array glu_activation(const mx::array& g, int act, mx::Stream s) {
-  // Never destroyed: a compiled function erases its cache entry when it
-  // goes, and at process exit the cache can go first.
-  static const auto* silu = new auto(mx::compile(glu_silu, true));
-  static const auto* gelu = new auto(mx::compile(glu_gelu_tanh, true));
-  // The ops of a compiled function run on the default stream.
+  // mx::compile reads the compile switch when it is called, so the call is
+  // made per activation, as a call of nn.silu does. With the switch off it
+  // returns the function as it is. With it on it returns a wrapper around
+  // the compiled function, which the compile cache keys by the function
+  // pointer: the function is compiled once per thread, and the wrapper
+  // owns no cache entry, so nothing is erased when it goes.
+  auto fn = mx::compile(act == 1 ? glu_gelu_tanh : glu_silu, true);
+  // The ops of the function run on the default stream.
   mx::StreamContext on_stream(s);
-  return (act == 1 ? *gelu : *silu)({g})[0];
+  return fn({g})[0];
 }
 
 // K tile of the GLU kernel for a codec and an activation dtype, 0 where
