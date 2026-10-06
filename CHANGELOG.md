@@ -61,6 +61,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   weight view that is not evaluated before the call, such as `w[0::2]`.
 - `dequantize`, `quantize` and the bias of `quantized_matmul_qmv_bias` take a
   strided view that is not evaluated before the call, such as `w[::-1]`.
+- `quantized_matmul` returns zeros for an inner dim of 0. On a CPU stream a
+  weight with no rows ended the process at more than 16 rows of x.
 - A float16 matmul of 128 or fewer rows split over K, MTP verify among them,
   no longer returns inf where its output is finite.
 - Matmuls of 2 to 8 rows on q4_0, pq2_0 and ptq1_0 weights, MTP verify among

@@ -2438,6 +2438,11 @@ void KQuantMatmul::eval_cpu(
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   auto& encoder = mx::cpu::get_command_encoder(stream());
+  // An empty output has nothing to compute. The op returns zeros for an
+  // inner dim of 0, so the row size below is not 0.
+  if (out.size() == 0) {
+    return;
+  }
   encoder.set_input_array(x);
   encoder.set_input_array(w);
   encoder.set_output_array(out);
@@ -2572,6 +2577,9 @@ void KQuantMatmul::eval_gpu_base(
   const auto& scales = inputs[2];
   kq_check_weight_base(w, kquant_type_, "quantized_matmul");
   out.set_data(mx::allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return;
+  }
 
   bool non_batched = w.ndim() == 2 && x.flags().row_contiguous;
   int K = x.shape(-1);

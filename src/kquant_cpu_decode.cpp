@@ -1321,6 +1321,15 @@ void kquant_qmm_cpu(
     throw std::runtime_error(
         "[mlx_kquant] quantized_matmul: unsupported codec: " + kquant_type);
   }
+  // No rows or no columns leave nothing to write, and an inner dim of 0
+  // gives zeros. The GEMM below takes no leading dim of 0.
+  if (M <= 0 || N <= 0) {
+    return;
+  }
+  if (K <= 0) {
+    std::fill_n(result, static_cast<std::size_t>(M) * N, T(0.0f));
+    return;
+  }
   const int w_rows = transpose_w ? N : K;
   const int w_cols = transpose_w ? K : N;
   const std::size_t row_bytes =

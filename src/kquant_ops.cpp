@@ -182,6 +182,13 @@ mx::array quantized_matmul(
   }
 
   auto s = mx::to_stream(s_);
+  // An inner dim of 0 makes every sum empty, so the result is zeros. The
+  // kernels divide by the inner dim.
+  if (w_inner_dims == 0) {
+    auto shape = x.shape();
+    shape.back() = w_outer_dims;
+    return mx::zeros(shape, out_type, s);
+  }
   kq_check_weight_base_at_build(w, kquant_type, s, "quantized_matmul");
 
   // Cast x to the output dtype, then matrix-row-contiguize x / w / scales at
