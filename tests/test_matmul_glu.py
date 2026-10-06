@@ -26,6 +26,7 @@ import sys
 import time
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import pytest
 from qmm_probe import force_cpu
@@ -110,17 +111,13 @@ def _rel(a, b):
 
 
 def _composed(x, wg, wu, codec, activation="silu"):
+    """The form a caller writes without the op. Where the op has no fused
+    kernel it builds this, bit for bit."""
     s = mx.zeros((1,), dtype=mx.uint8)
     g = kq.quantized_matmul(x, wg, s, codec, True)
     u = kq.quantized_matmul(x, wu, s, codec, True)
-    if activation == "gelu_tanh":
-        # The op's own order: the cube first, then the scaled sum.
-        g3 = g * g * g
-        z = 0.7978845608028654 * (g + 0.044715 * g3)
-        a = (0.5 * g) * (1.0 + mx.tanh(z))
-    else:
-        a = g * mx.sigmoid(g)
-    return a * u
+    act = nn.gelu_approx if activation == "gelu_tanh" else nn.silu
+    return act(g) * u
 
 
 def _check(x, n, dtype, activation="silu", codec="q4_k", k=K):
@@ -287,6 +284,29 @@ def test_glu_row_bands_are_read_in_place():
     ref = kq.quantized_matmul_glu(x, wg, wu, "q4_k")
     mx.eval(y, ref)
     assert mx.array_equal(y, ref).item()
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["bf16", "f16"])
+@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+def test_glu_composition_is_the_stock_form(activation, dtype):
+    """A codec with no fused kernel: the op has the bits and the peak of
+    the stock activation on one matmul times the other. That is two
+    outputs with nn.silu, which writes into its input, and three with
+    nn.gelu_approx, which does not."""
+    n, k, m = 2048, 1024, 1100
+    (wg, _), (wu, _) = _weights("q3_k", n, k)
+    x = _x([m, k], dtype, 47)
+    y = kq.quantized_matmul_glu(x, wg, wu, "q3_k", activation)
+    comp = _composed(x, wg, wu, "q3_k", activation)
+    mx.eval(y, comp)
+    assert mx.array_equal(y, comp).item()
+    out_bytes = m * n * 2
+    op = _peak_outputs(
+        lambda: kq.quantized_matmul_glu(x, wg, wu, "q3_k", activation), out_bytes
+    )
+    stock = _peak_outputs(lambda: _composed(x, wg, wu, "q3_k", activation), out_bytes)
+    assert abs(op - stock) <= 0.05, (op, stock)
+    assert op <= (3.05 if activation == "gelu_tanh" else 2.05), op
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["bf16", "f16"])

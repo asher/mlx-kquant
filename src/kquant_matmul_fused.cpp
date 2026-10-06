@@ -14,13 +14,16 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "kquant.h"
 #include "kquant_codec.h"
 #include "kquant_internal.h"
 
 #include "mlx/allocator.h"
+#include "mlx/compile.h"
 #include "mlx/ops.h"
+#include "mlx/utils.h"
 
 #ifdef _METAL_
 #include "kquant_metal_internal.h"
@@ -48,21 +51,36 @@ int glu_act_kind(const std::string& activation) {
       activation + "'.");
 }
 
+// The activation of the composition, built the way mlx.nn builds silu and
+// gelu_approx: one compiled elementwise function of the same ops in the
+// same order, with the constants a Python scalar gives. The composition
+// then has the bits and the peak memory of nn.silu(g) * u and
+// nn.gelu_approx(g) * u: the compiled function writes into g's buffer,
+// where separate ops hold a buffer per step.
+std::vector<mx::array> glu_silu(const std::vector<mx::array>& in) {
+  const auto& x = in[0];
+  return {mx::multiply(x, mx::sigmoid(x))};
+}
+
+std::vector<mx::array> glu_gelu_tanh(const std::vector<mx::array>& in) {
+  // 0.5 * x * (1 + tanh(sqrt(2 / pi) * (x + 0.044715 * x ** 3)))
+  const auto& x = in[0];
+  const auto dt = x.dtype();
+  auto x3 = mx::power(x, mx::array(3, dt));
+  auto sum = mx::add(x, mx::multiply(mx::array(0.044715f, dt), x3));
+  auto t = mx::tanh(mx::multiply(mx::array(0.7978845608028654f, dt), sum));
+  return {mx::multiply(
+      mx::multiply(mx::array(0.5f, dt), x), mx::add(mx::array(1, dt), t))};
+}
+
 mx::array glu_activation(const mx::array& g, int act, mx::Stream s) {
-  if (act == 1) {
-    // 0.5 g (1 + tanh(sqrt(2 / pi) (g + 0.044715 g^3)))
-    auto dt = g.dtype();
-    auto g3 = mx::multiply(mx::multiply(g, g, s), g, s);
-    auto u = mx::multiply(
-        mx::array(0.7978845608028654f, dt),
-        mx::add(g, mx::multiply(mx::array(0.044715f, dt), g3, s), s),
-        s);
-    return mx::multiply(
-        mx::multiply(mx::array(0.5f, dt), g, s),
-        mx::add(mx::array(1.0f, dt), mx::tanh(u, s), s),
-        s);
-  }
-  return mx::multiply(g, mx::sigmoid(g, s), s);
+  // Never destroyed: a compiled function erases its cache entry when it
+  // goes, and at process exit the cache can go first.
+  static const auto* silu = new auto(mx::compile(glu_silu, true));
+  static const auto* gelu = new auto(mx::compile(glu_gelu_tanh, true));
+  // The ops of a compiled function run on the default stream.
+  mx::StreamContext on_stream(s);
+  return (act == 1 ? *gelu : *silu)({g})[0];
 }
 
 // K tile of the GLU kernel for a codec and an activation dtype, 0 where
