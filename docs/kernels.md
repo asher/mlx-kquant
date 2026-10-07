@@ -628,22 +628,24 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
   rank, and y is `quantized_matmul(x, w)`, bit for bit.
 
   On a NAX GPU (M5), for `q4_k`, `q5_k`, `q6_k` and `q8_0` weights on bfloat16 activations with K
-  up to 4096 and N of at least K, from 4096 activation rows, and from 1024 rows where N is at
-  least 8192, stock ops compute `z = strength * (x @ A)` and one dispatch computes the product and
-  adds `z @ B`. Each threadgroup owns a 128 by 64 tile of y. It walks the rank of its column band
-  32 ranks a step, with z and B read from their buffers, then walks K over the weight, and stores
-  the tile. Both walks add into one f32 sum, which is rounded once at the store. y is the only
-  buffer the dispatch writes, where the unfused ops write the product and then read and write it
-  again for the sum. The kernel takes a rank of at most 256 without bands, and with bands at most
-  16 of them, each starting on a multiple of 64 columns, ending on a multiple of 32 columns or at
-  N, and holding at most 256 ranks. The `q8_0` kernel walks K in tiles of 64, so a `q8_0` weight
-  whose K is no multiple of 64 runs the unfused ops.
+  up to 4096 and N of at least K, from 4096 activation rows where no column takes more than 128
+  ranks, and from 1024 rows at every rank where N is at least 8192, stock ops compute
+  `z = strength * (x @ A)` and one dispatch computes the product and adds `z @ B`. Each
+  threadgroup owns a 128 by 64 tile of y. It walks the rank of its column band 32 ranks a step,
+  with z and B read from their buffers, then walks K over the weight, and stores the tile. Both
+  walks add into one f32 sum, which is rounded once at the store. y is the only buffer the
+  dispatch writes, where the unfused ops write the product and then read and write it again for
+  the sum. The kernel takes a rank of at most 256 without bands, and with bands at most 16 of
+  them, each starting on a multiple of 64 columns, ending on a multiple of 32 columns or at N, and
+  holding at most 256 ranks. The `q8_0` kernel walks K in tiles of 64, so a `q8_0` weight whose K
+  is no multiple of 64 runs the unfused ops.
 
-  The bounds on K, N and rows are where the kernel measured faster. It removes the second pass
-  over y, a cost in proportion to N. It waits for `x @ A`, a cost in proportion to K, where the
-  unfused product runs beside `x @ A`. So the kernel gains where N is at least K, and its gain is
-  a share of the call that falls as K grows. Where N is near K the gain is about one percent, and
-  it holds from 4096 rows.
+  The bounds on K, N, rows and rank are where the kernel measured faster. It removes the second
+  pass over y, a cost in proportion to N. It waits for `x @ A`, a cost in proportion to K and to
+  the rank, where the unfused product runs beside `x @ A`. So the kernel gains where N is at least
+  K, and its gain is a share of the call that falls as K grows. Where N is near K the gain is
+  about one percent, and it holds from 4096 rows and up to a rank of 128. With bands, the rank
+  that counts is the rank of the largest band.
 
   Measured on an M5 Max against `quantized_matmul`, `x @ A` and one `mx.addmm`, one call an eval,
   at 4608 rows on `q4_k`, as the median of four processes of rotated rounds, kernel time over
@@ -693,6 +695,55 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
   | 3840, 11520, three bands | 0.97, 0.94 | 0.96, 0.93 |
   | 4096, 24576, two bands | 0.96, 0.94 | 0.93, 0.93 |
 
+  The tables from here on are the median of four processes that run the two forms in alternating
+  slots, one call an eval. Ranks 128 and 256 at 4608 rows on `q4_k`. At rank 256 the two shapes
+  with N of K are outside the bounds:
+
+  | K, N | Rank 128 | Rank 256 |
+  |---|---|---|
+  | 3840, 3840 | 0.99 | 1.00 |
+  | 4096, 4096 | 0.98 | 1.01 |
+  | 3840, 10240 | 0.97 | 0.99 |
+  | 3840, 11520, three bands | 0.93 | 0.90 |
+  | 4096, 24576, two bands | 0.97 | 0.95 |
+
+  From 4096 rows up on `q4_k`, rank 16 and rank 64:
+
+  | K, N | 4096 rows | 8192 rows | 16384 rows |
+  |---|---|---|---|
+  | 3840, 3840 | 1.00, 1.00 | 0.98, 0.98 | 0.97, 0.97 |
+  | 4096, 4096 | 1.00, 0.99 | 0.97, 0.98 | 0.96, 0.97 |
+  | 3840, 11520, three bands | 0.97, 0.94 | 0.96, 0.94 | 0.97, 0.93 |
+
+  The other codecs below 4096 rows, rank 16 and rank 64:
+
+  | K, N | Rows | `q5_k` | `q6_k` | `q8_0` |
+  |---|---|---|---|---|
+  | 4096, 8192 | 1056 | 0.98, 0.97 | 0.95, 0.94 | 0.98, 0.98 |
+  | 4096, 8192 | 2112 | 0.97, 0.96 | 0.94, 0.94 | 0.98, 0.98 |
+  | 3840, 10240 | 1056 | 0.97, 0.96 | 0.94, 0.93 | 0.99, 1.00 |
+  | 3840, 10240 | 2112 | 0.96, 0.96 | 0.92, 0.92 | 0.97, 0.98 |
+  | 3840, 11520, three bands | 1056 | 0.96, 0.92 | 0.93, 0.92 | 0.99, 0.96 |
+  | 3840, 11520, three bands | 2112 | 0.94, 0.92 | 0.91, 0.90 | 0.96, 0.94 |
+  | 4096, 24576, two bands | 1056 | 0.95, 0.93 | 0.92, 0.91 | 0.95, 0.94 |
+  | 4096, 24576, two bands | 2112 | 0.93, 0.92 | 0.90, 0.89 | 0.93, 0.92 |
+
+  K below 2048 on `q4_k`. A call here takes 0.2 to 2.4 ms, and two runs of the unfused ops differ
+  by up to 4 percent at the smallest:
+
+  | K, N | Rows | Rank 16 | Rank 64 |
+  |---|---|---|---|
+  | 1536, 1536 | 4608 | 0.99 | 0.97 |
+  | 1024, 1024 | 4608 | 0.99 | 0.95 |
+  | 512, 512 | 4608 | 0.97 | 0.97 |
+  | 256, 256 | 4608 | 0.99 | 0.99 |
+  | 1024, 8192 | 1056 | 1.01 | 0.94 |
+  | 1024, 8192 | 4608 | 0.87 | 0.87 |
+  | 512, 8192 | 1056 | 0.95 | 0.95 |
+  | 512, 8192 | 4608 | 0.79 | 0.80 |
+  | 256, 8192 | 1056 | 0.94 | 0.91 |
+  | 256, 8192 | 4608 | 0.70 | 0.72 |
+
   x is float16 or bfloat16, and float32 x runs in bfloat16 as in `quantized_matmul`. Leading batch
   dims fold into rows. `lora_a`, `lora_b` and `strength` take any float dtype and run in the dtype
   of y. K, N and R are each below 2^25 and x holds fewer than 2^31 rows: the kernel computes
@@ -700,17 +751,17 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
 
   Every other case builds the same sum from `quantized_matmul` and stock ops, which round the
   product to the activation dtype before the add: other codecs, float16 activations, fewer rows,
-  K above 4096, N below K, N below 8192 under 4096 rows, a larger rank, more bands, a band that
-  starts off a multiple of 64 columns or ends before N off a multiple of 32, a `q8_0` K off a
-  multiple of 64, CPU streams and GPUs without NAX. A rank of zero, an x of no rows and a weight
-  of no rows return the product alone.
+  K above 4096, N below K, N below 8192 under 4096 rows or with more than 128 ranks on a column,
+  a rank above 256, more bands, a band that starts off a multiple of 64 columns or ends before N
+  off a multiple of 32, a `q8_0` K off a multiple of 64, CPU streams and GPUs without NAX. A rank
+  of zero, an x of no rows and a weight of no rows return the product alone.
 
   Levers, each read once per process unless `KQ_TUNE_LIVE=1`. The op reads them when it is
   called and builds its graph, so a compiled function keeps the kernel choice of its trace:
 
   - `KQ_QMM_LORA` - `0` builds the unfused ops on every call. `2` runs the kernel at every K and
     N from 1024 rows, inside its other bounds. Unset, `1` or any other value keeps the bounds on
-    K, N and rows.
+    K, N, rows and rank.
   - `KQ_QMM_LORA_MIN_ROWS` - the lowest row count at which the kernel runs, an integer of at
     least 1. A value below 1 keeps the default, with a warning on stderr. Default 1024.
 
