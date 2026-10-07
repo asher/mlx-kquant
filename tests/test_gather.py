@@ -53,6 +53,7 @@ CODECS = {
     "iq1_m": (GT.IQ1_M, 256, 56, 1, False),
     "stq1_0": (GT.STQ1_0, 256, 42, 1, False),
     "pq2_0": (GT.PQ2_0, 128, 34, 2, False),
+    "q2_0": (GT.Q2_0, 64, 18, 2, False),
     "ptq1_0": (GT.PTQ1_0, 128, 28, 1, False),
     "mxfp4": (GT.MXFP4, 32, 17, 4, False),
     "nvfp4": (GT.NVFP4, 64, 36, 4, False),

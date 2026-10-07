@@ -6,6 +6,10 @@
 // j/4, code - 1 in {-1, 0, +1, +2}. The block stride is 2 mod 4, so only
 // half and byte loads are alignment-safe.
 //
+// Q2_0 (ggml type 42), 18 bytes [fp16 d][16 x u8 qs]: the PQ2_0 code layout
+// on a 64-weight block. It shares the PQ2_0 decode helpers and kernels, which
+// take the block width as a template argument.
+//
 // PTQ1_0, 28 bytes [24 x u8 qs][2 x u8 qh][fp16 d]: five base-3 trits per
 // qs byte, four per qh byte, trit - 1. Element e < 80 is trit e>>4 of
 // qs[e&15]; 80 <= e < 120 is trit (e-80)>>3 of qs[16+((e-80)&7)]; e >= 120
@@ -19,6 +23,9 @@
 MLX_MTL_CONST int KQ_PQ2_0_SUPERBLOCK = 128;
 MLX_MTL_CONST int KQ_PQ2_0_BLOCK_BYTES = 34;
 MLX_MTL_CONST int KQ_PQ2_0_QS_OFFSET = 2;
+
+MLX_MTL_CONST int KQ_Q2_0_SUPERBLOCK = 64;
+MLX_MTL_CONST int KQ_Q2_0_BLOCK_BYTES = 18;
 
 MLX_MTL_CONST int KQ_PTQ1_0_SUPERBLOCK = 128;
 MLX_MTL_CONST int KQ_PTQ1_0_BLOCK_BYTES = 28;
@@ -48,8 +55,10 @@ inline void kq_pq2_0_deq_chunk16(
   }
 }
 
-template <typename T>
-METAL_FUNC void kq_pq2_0_dequantize_impl(
+// SB weights and BB bytes per block: 128 and 34 for PQ2_0, 64 and 18 for
+// Q2_0.
+template <typename T, int SB, int BB>
+METAL_FUNC void kq_pq2_0_dequantize_sb_impl(
     const device uint8_t* w,
     device T* out,
     const constant uint& num_weights,
@@ -57,19 +66,47 @@ METAL_FUNC void kq_pq2_0_dequantize_impl(
   if (gid >= num_weights) {
     return;
   }
-  const int sb_id = gid / KQ_PQ2_0_SUPERBLOCK;
-  const int j = gid - sb_id * KQ_PQ2_0_SUPERBLOCK;
-  const device uint8_t* sb =
-      w + static_cast<int64_t>(sb_id) * KQ_PQ2_0_BLOCK_BYTES;
+  const int sb_id = gid / SB;
+  const int j = gid - sb_id * SB;
+  const device uint8_t* sb = w + static_cast<int64_t>(sb_id) * BB;
   const float d = float(*(const device half*)(sb));
   const uint8_t b = sb[KQ_PQ2_0_QS_OFFSET + (j >> 2)];
   const short code = (b >> (2 * (j & 3))) & 3;
   out[gid] = T(d * float(code - 1));
 }
 
+template <typename T>
+METAL_FUNC void kq_pq2_0_dequantize_impl(
+    const device uint8_t* w,
+    device T* out,
+    const constant uint& num_weights,
+    uint gid) {
+  kq_pq2_0_dequantize_sb_impl<T, KQ_PQ2_0_SUPERBLOCK, KQ_PQ2_0_BLOCK_BYTES>(
+      w, out, num_weights, gid);
+}
+
+template <typename T>
+METAL_FUNC void kq_q2_0_dequantize_impl(
+    const device uint8_t* w,
+    device T* out,
+    const constant uint& num_weights,
+    uint gid) {
+  kq_pq2_0_dequantize_sb_impl<T, KQ_Q2_0_SUPERBLOCK, KQ_Q2_0_BLOCK_BYTES>(
+      w, out, num_weights, gid);
+}
+
 struct KqPq2_0Ext {
   MLX_MTL_CONST int superblock = KQ_PQ2_0_SUPERBLOCK;
   MLX_MTL_CONST int block_bytes = KQ_PQ2_0_BLOCK_BYTES;
+  static METAL_FUNC void
+  deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
+    kq_pq2_0_deq_chunk16(block, il, reg);
+  }
+};
+
+struct KqQ2_0Ext {
+  MLX_MTL_CONST int superblock = KQ_Q2_0_SUPERBLOCK;
+  MLX_MTL_CONST int block_bytes = KQ_Q2_0_BLOCK_BYTES;
   static METAL_FUNC void
   deq_chunk16(const device uint8_t* block, short il, thread float4x4& reg) {
     kq_pq2_0_deq_chunk16(block, il, reg);
@@ -97,12 +134,12 @@ METAL_FUNC void kq_pq2_0_decode_pairs(uint wv, thread half2* h) {
   }
 }
 
-// M=1 mat-vec: eight lanes per block, four blocks per simdgroup pass, 16
-// contiguous weights per lane decoded as half2 pairs. Two half MACs per
-// instruction against the activation pair (y_j, y_j+8) keep the decode
-// near the load-only rate.
-template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
-METAL_FUNC void kq_pq2_0_qmv_impl(
+// M=1 mat-vec: SB / 16 lanes per block (eight for PQ2_0, four for Q2_0), 32
+// lanes of blocks per simdgroup pass, 16 contiguous weights per lane decoded
+// as half2 pairs. Two half MACs per instruction against the activation pair
+// (y_j, y_j+8) keep the decode near the load-only rate.
+template <typename T, int SB, int BB, int results_per_simdgroup>
+METAL_FUNC void kq_pq2_0_qmv_sb_impl(
     const device uint8_t* w,
     const device T* x,
     device T* y,
@@ -111,10 +148,9 @@ METAL_FUNC void kq_pq2_0_qmv_impl(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  static_assert(group_size == KQ_PQ2_0_SUPERBLOCK, "PQ2_0 requires gs=128");
-  static_assert(bits == 2, "PQ2_0 requires bits=2");
   constexpr int num_simdgroups = 2;
-  constexpr int blocks_per_pass = 4;
+  constexpr int lanes = SB / 16;
+  constexpr int blocks_per_pass = 32 / lanes;
   // fp32 activations keep an fp32 pair accumulator; half inputs stay in
   // the half pipe.
   typedef metal::conditional_t<metal::is_same_v<T, float>, float2, half2> A2;
@@ -125,15 +161,15 @@ METAL_FUNC void kq_pq2_0_qmv_impl(
     return;
   }
   const int active_rows = min(results_per_simdgroup, out_vec_size - out_row);
-  const int nb = in_vec_size / KQ_PQ2_0_SUPERBLOCK;
-  const int row_bytes = nb * KQ_PQ2_0_BLOCK_BYTES;
+  const int nb = in_vec_size / SB;
+  const int row_bytes = nb * BB;
   x += tid.x * in_vec_size;
   y += tid.x * out_vec_size;
-  const short ix = simd_lid >> 3;
-  const short it = simd_lid & 7;
+  const short ix = simd_lid / lanes;
+  const short it = simd_lid % lanes;
   U result[results_per_simdgroup] = {0};
   for (int ib = ix; ib < nb; ib += blocks_per_pass) {
-    const device T* xb = x + ib * KQ_PQ2_0_SUPERBLOCK + it * 16;
+    const device T* xb = x + ib * SB + it * 16;
     const vec<T, 8> lo = *(const device vec<T, 8>*)(xb);
     const vec<T, 8> hi = *(const device vec<T, 8>*)(xb + 8);
     A2 y2[8];
@@ -148,7 +184,7 @@ METAL_FUNC void kq_pq2_0_qmv_impl(
       const device uint8_t* sb = w +
           static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
               row_bytes +
-          ib * KQ_PQ2_0_BLOCK_BYTES;
+          ib * BB;
       const U d16 = 16.0f * U(float(*(const device half*)(sb)));
       const device ushort* qs =
           (const device ushort*)(sb + KQ_PQ2_0_QS_OFFSET + 4 * it);
@@ -176,8 +212,8 @@ METAL_FUNC void kq_pq2_0_qmv_impl(
 // row. Non-batched only; bit-identical to the M=1 kernel per row.
 MLX_MTL_CONST int KQ_PRISM_MAX_VM = 8;
 
-template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
-METAL_FUNC void kq_pq2_0_verify_qmv_impl(
+template <typename T, int SB, int BB, int results_per_simdgroup>
+METAL_FUNC void kq_pq2_0_verify_qmv_sb_impl(
     const device uint8_t* w,
     const device T* x,
     device T* y,
@@ -187,10 +223,9 @@ METAL_FUNC void kq_pq2_0_verify_qmv_impl(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  static_assert(group_size == KQ_PQ2_0_SUPERBLOCK, "PQ2_0 requires gs=128");
-  static_assert(bits == 2, "PQ2_0 requires bits=2");
   constexpr int num_simdgroups = 2;
-  constexpr int blocks_per_pass = 4;
+  constexpr int lanes = SB / 16;
+  constexpr int blocks_per_pass = 32 / lanes;
   typedef metal::conditional_t<metal::is_same_v<T, float>, float2, half2> A2;
   typedef float U;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
@@ -199,10 +234,10 @@ METAL_FUNC void kq_pq2_0_verify_qmv_impl(
     return;
   }
   const int active_rows = min(results_per_simdgroup, out_vec_size - out_row);
-  const int nb = in_vec_size / KQ_PQ2_0_SUPERBLOCK;
-  const int row_bytes = nb * KQ_PQ2_0_BLOCK_BYTES;
-  const short ix = simd_lid >> 3;
-  const short it = simd_lid & 7;
+  const int nb = in_vec_size / SB;
+  const int row_bytes = nb * BB;
+  const short ix = simd_lid / lanes;
+  const short it = simd_lid % lanes;
   U result[KQ_PRISM_MAX_VM][results_per_simdgroup] = {{0}};
   for (int ib = ix; ib < nb; ib += blocks_per_pass) {
     half2 h[results_per_simdgroup][8];
@@ -212,7 +247,7 @@ METAL_FUNC void kq_pq2_0_verify_qmv_impl(
       const device uint8_t* sb = w +
           static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
               row_bytes +
-          ib * KQ_PQ2_0_BLOCK_BYTES;
+          ib * BB;
       d16[row] = 16.0f * U(float(*(const device half*)(sb)));
       const device ushort* qs =
           (const device ushort*)(sb + KQ_PQ2_0_QS_OFFSET + 4 * it);
@@ -221,8 +256,7 @@ METAL_FUNC void kq_pq2_0_verify_qmv_impl(
 #pragma unroll
     for (int m = 0; m < KQ_PRISM_MAX_VM; m++) {
       if (m < vm) {
-        const device T* xb =
-            x + m * in_vec_size + ib * KQ_PQ2_0_SUPERBLOCK + it * 16;
+        const device T* xb = x + m * in_vec_size + ib * SB + it * 16;
         const vec<T, 8> lo = *(const device vec<T, 8>*)(xb);
         const vec<T, 8> hi = *(const device vec<T, 8>*)(xb + 8);
         A2 y2[8];
@@ -253,6 +287,88 @@ METAL_FUNC void kq_pq2_0_verify_qmv_impl(
       }
     }
   }
+}
+
+template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
+METAL_FUNC void kq_pq2_0_qmv_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(group_size == KQ_PQ2_0_SUPERBLOCK, "PQ2_0 requires gs=128");
+  static_assert(bits == 2, "PQ2_0 requires bits=2");
+  kq_pq2_0_qmv_sb_impl<
+      T,
+      KQ_PQ2_0_SUPERBLOCK,
+      KQ_PQ2_0_BLOCK_BYTES,
+      results_per_simdgroup>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
+METAL_FUNC void kq_pq2_0_verify_qmv_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(group_size == KQ_PQ2_0_SUPERBLOCK, "PQ2_0 requires gs=128");
+  static_assert(bits == 2, "PQ2_0 requires bits=2");
+  kq_pq2_0_verify_qmv_sb_impl<
+      T,
+      KQ_PQ2_0_SUPERBLOCK,
+      KQ_PQ2_0_BLOCK_BYTES,
+      results_per_simdgroup>(
+      w, x, y, in_vec_size, out_vec_size, vm, tid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
+METAL_FUNC void kq_q2_0_qmv_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(group_size == KQ_Q2_0_SUPERBLOCK, "Q2_0 requires gs=64");
+  static_assert(bits == 2, "Q2_0 requires bits=2");
+  kq_pq2_0_qmv_sb_impl<
+      T,
+      KQ_Q2_0_SUPERBLOCK,
+      KQ_Q2_0_BLOCK_BYTES,
+      results_per_simdgroup>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
+METAL_FUNC void kq_q2_0_verify_qmv_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& vm,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(group_size == KQ_Q2_0_SUPERBLOCK, "Q2_0 requires gs=64");
+  static_assert(bits == 2, "Q2_0 requires bits=2");
+  kq_pq2_0_verify_qmv_sb_impl<
+      T,
+      KQ_Q2_0_SUPERBLOCK,
+      KQ_Q2_0_BLOCK_BYTES,
+      results_per_simdgroup>(
+      w, x, y, in_vec_size, out_vec_size, vm, tid, simd_gid, simd_lid);
 }
 
 // ================================ PTQ1_0 ================================
@@ -738,6 +854,22 @@ template <
     short dst_ld,
     short reduction_dim,
     short tgp_size>
+using KqQ2_0BlockLoader = KqPrismBlockLoader<
+    KqQ2_0Ext,
+    T,
+    BROWS,
+    BCOLS,
+    dst_ld,
+    reduction_dim,
+    tgp_size>;
+
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
 using KqPtq1_0BlockLoader = KqPrismBlockLoader<
     KqPtq1_0Ext,
     T,
@@ -1079,6 +1211,7 @@ using KqPtq1_0BlockLoader = KqPrismBlockLoader<
 
 KQ_PRISM_DEFINE_KERNELS(pq2_0, 128, 2, KqPq2_0Ext, KqPq2_0BlockLoader, 2)
 KQ_PRISM_DEFINE_KERNELS(ptq1_0, 128, 1, KqPtq1_0Ext, KqPtq1_0BlockLoader, 4)
+KQ_PRISM_DEFINE_KERNELS(q2_0, 64, 2, KqQ2_0Ext, KqQ2_0BlockLoader, 2)
 
 // Register-resident MMA verify (kq_verify_mma.h). PQ2_0: lane L owns the
 // two 16-code words at bytes 8L..8L+7 of qs; fragment (j, j+8) of a word
@@ -1125,6 +1258,49 @@ struct KqPq2_0Mma {
         }
         kq_vmma_step<NT>(xb + 8 * perm(8 * h + j, fm), a, acc);
       }
+    }
+  }
+};
+
+// Q2_0: lane L owns the one 16-code word at bytes 4L..4L+3 of qs, decoded
+// as a PQ2_0 word.
+struct KqQ2_0Mma {
+  static constant constexpr int block_k = KQ_Q2_0_SUPERBLOCK;
+  static constant constexpr int block_bytes = KQ_Q2_0_BLOCK_BYTES;
+  static constant constexpr int d_offset = 0;
+  static constant constexpr float d_scale = 1.0f;
+  static METAL_FUNC int perm(int f, int col) {
+    return 16 * (col / 2) + f + 8 * (col & 1);
+  }
+  template <int NT>
+  static METAL_FUNC void block(
+      thread const KqVmmaRows<NT>& rows,
+      int boff,
+      short L,
+      short fm,
+      const threadgroup half* xb,
+      thread simdgroup_half8x8 (&acc)[NT]) {
+    uint wv[NT];
+    for (short t = 0; t < NT; ++t) {
+      const packed_ushort2 v =
+          *(const device packed_ushort2*)(rows.p[t] + boff +
+                                          KQ_PQ2_0_QS_OFFSET + 4 * L);
+      wv[t] = uint(v.x) | (uint(v.y) << 16);
+    }
+    for (short j = 0; j < 8; ++j) {
+      const short jj = j < 5 ? j : j - 5;
+      const uint mask = 0x00030003u << (2 * jj);
+      const half scale = half(1.0f / float(1 << (2 * jj)));
+      const half off = -half(1024.0f / float(1 << (2 * jj))) - 1.0h;
+      half2 a[NT];
+      for (short t = 0; t < NT; ++t) {
+        const uint src = j < 5 ? wv[t] : (wv[t] >> 10);
+        a[t] =
+            fma(as_type<half2>((src & mask) | 0x64006400u),
+                half2(scale),
+                half2(off));
+      }
+      kq_vmma_step<NT>(xb + 8 * perm(j, fm), a, acc);
     }
   }
 };
@@ -1189,3 +1365,4 @@ struct KqPtq1_0Mma {
 
 KQ_DEFINE_VERIFY_MMA_KERNEL(pq2_0, KqPq2_0Mma, 2)
 KQ_DEFINE_VERIFY_MMA_KERNEL(ptq1_0, KqPtq1_0Mma, 1)
+KQ_DEFINE_VERIFY_MMA_KERNEL(q2_0, KqQ2_0Mma, 2)

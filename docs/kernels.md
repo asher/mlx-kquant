@@ -233,7 +233,9 @@ pre-NAX floors are measured (M3 Max: plain split-K entry M 5), and so are its NA
 `kq_nax_small_m`. The rest of its NAX policy is inherited from `iq1_s` and needs M5-silicon
 calibration: `bm128_min_m` (`benchmarks/bench_qmm_bm128_ab.py`), `kq_splitk_min_m_nax_alu`, and db64
 candidacy (no `_db` instantiation yet). The PrismML codecs `pq2_0` and `ptq1_0` (128-wide blocks)
-ship the same kernel set. Their NAX split-K entry is M 9, where the verify kernels hand off. The
+ship the same kernel set. `q2_0` (64-wide blocks, the `pq2_0` code layout) runs the `pq2_0`
+kernels at its block width and takes the `pq2_0` route entries, which are not yet measured for
+it. Their NAX split-K entry is M 9, where the verify kernels hand off. The
 `bm128_min_m` and db64 floors are still inherited from `iq1_s`. The `ptq1_0` M=1 kernel gives each
 28-byte block four lanes. Each lane reads its six trit bytes in two loads plus the word that holds
 the high-trit bytes and the scale, and decodes the trits with the exact-float base-3 coefficient

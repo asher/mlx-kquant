@@ -75,7 +75,11 @@ ENCODABLE = [
     "q5_0",
     "q5_1",
 ]
-IQ = [c for c in CODECS if c.startswith("iq") or c in ("stq1_0", "pq2_0", "ptq1_0")]
+IQ = [
+    c
+    for c in CODECS
+    if c.startswith("iq") or c in ("stq1_0", "pq2_0", "ptq1_0", "q2_0")
+]
 
 
 def _sweep(codec, w, s, ref_w, n_out, ms=MS, dtype=mx.bfloat16, k=K):
@@ -295,7 +299,7 @@ def test_nax_midm_splitk_rule(codec, m, n_out, taken, monkeypatch):
 # at every row count and both activation dtypes it is instantiated for,
 # on an aligned and a ragged N (the row clamp past N). K=1000 blocks the
 # route (the codecs need a whole number of wire blocks), so K stays 1024.
-VERIFY_MMA_CODECS = ["pq2_0", "ptq1_0", "q4_0", "q8_0"]
+VERIFY_MMA_CODECS = ["pq2_0", "ptq1_0", "q2_0", "q4_0", "q8_0"]
 VERIFY_MMA_MS = [2, 3, 4, 5, 6, 7, 8]
 
 
@@ -386,7 +390,7 @@ QMM_ROUTES = [
 
 
 @pytest.mark.parametrize("route", QMM_ROUTES)
-@pytest.mark.parametrize("codec", ["pq2_0", "ptq1_0", "q4_0", "q4_k"])
+@pytest.mark.parametrize("codec", ["pq2_0", "ptq1_0", "q2_0", "q4_0", "q4_k"])
 def test_qmm_route_probe(codec, route, monkeypatch):
     if codec in ENCODABLE:
         w, s, ref_w = _encodable_setup(codec, 1000)
@@ -396,11 +400,12 @@ def test_qmm_route_probe(codec, route, monkeypatch):
     _sweep(codec, w, s, ref_w, 1000, ms=[1, 2, 5, 8, 12, 16, 33])
 
 
-VMMA_CODECS = ["pq2_0", "ptq1_0", "q4_0", "q8_0"]
+VMMA_CODECS = ["pq2_0", "ptq1_0", "q2_0", "q4_0", "q8_0"]
 # verify_nax entries on NAX GPUs below N 100000 (kq_verify_nax_min_m).
 # q2_k enters one row earlier above N 4096.
 VNAX_ENTRY = {
     "pq2_0": 3,
+    "q2_0": 3,
     "q4_0": 3,
     "q8_0": 6,
     "q4_k": 3,
@@ -446,7 +451,7 @@ def _route_serves(route, codec, m):
 # Under KQ_QMM_ROUTE_STRICT=1 a declined route raises instead of running
 # the default routing, so a served width proves the route itself ran.
 @pytest.mark.parametrize("route", QMM_ROUTES)
-@pytest.mark.parametrize("codec", ["pq2_0", "ptq1_0", "q4_0", "q4_k"])
+@pytest.mark.parametrize("codec", ["pq2_0", "ptq1_0", "q2_0", "q4_0", "q4_k"])
 def test_qmm_route_probe_strict(codec, route, monkeypatch):
     w, s, ref_w = _setup(codec, 1000)
     monkeypatch.setenv("KQ_QMM_ROUTE", route)
@@ -1138,6 +1143,7 @@ NAX_SMALL_M = {
     "q3_k": ((7, 3, 1, 1), 5, 5),
     "q2_k": ((8, 5, 3, 2), 2, 5),
     "pq2_0": ((8, 5, 3, 2), 9, 9),
+    "q2_0": ((8, 5, 3, 2), 9, 9),
     "ptq1_0": ((8, 5, 3, 2), 9, 9),
     "q4_0": ((8, 6, 3, 2), 8, 8),
     "q4_k": ((8, 5, 4, 2), 2, 5),
@@ -1151,9 +1157,9 @@ NAX_SMALL_M = {
 # verify_nax shadows on the codecs it serves, and the qmv rows per
 # threadgroup of the two codecs whose M 2 mat-vec route is verify_qmv.
 # The Prism codecs take verify_qmv through M 4 (kq_prism_verify_max_m).
-VMMA_NAX_ENTRY = {"ptq1_0": 3, "pq2_0": 5, "q4_0": 5}
+VMMA_NAX_ENTRY = {"ptq1_0": 3, "pq2_0": 5, "q2_0": 5, "q4_0": 5}
 QMV_BN = {"q4_k": 4, "q8_0": 8}
-PRISM_VERIFY_MAX_M = {"pq2_0": 4, "ptq1_0": 4}
+PRISM_VERIFY_MAX_M = {"pq2_0": 4, "ptq1_0": 4, "q2_0": 4}
 # Per-row qmv, mv_ext and verify_qmv dot the exact weights in float32 and
 # agree bit for bit on most codecs, so a pin cannot tell them apart. The
 # NAX tiles and the verify kernels round the weights to a 16-bit type, so

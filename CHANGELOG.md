@@ -6,6 +6,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `q2_0` codec (ggml type 42, 64-weight blocks with one fp16 scale): GGUFs
+  with `Q2_0` tensors load zero-copy and run on the CPU and Metal kernels.
+
 ### Changed
 - On NAX GPUs (M5), matmuls with 33 to 128 activation rows run faster, such
   as the short prompts of a structured decision. `KQ_QMM_MIDM=0` keeps the

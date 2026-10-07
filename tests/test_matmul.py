@@ -57,6 +57,7 @@ CODEC_BY_NAME = {
     "iq1_m": (GGMLQuantizationType.IQ1_M, 256, 56, 1),
     "stq1_0": (GGMLQuantizationType.STQ1_0, 256, 42, 1),
     "pq2_0": (GGMLQuantizationType.PQ2_0, 128, 34, 2),
+    "q2_0": (GGMLQuantizationType.Q2_0, 64, 18, 2),
     "ptq1_0": (GGMLQuantizationType.PTQ1_0, 128, 28, 1),
 }
 
