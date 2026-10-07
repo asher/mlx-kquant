@@ -61,11 +61,13 @@ SN = 32
 MAX_RANK = 256
 MAX_BANDS = 16
 # The shape rule: by itself the op gives the kernel a weight with K up to
-# RULE_K and N of at least K, from RULE_ROWS rows, and below that row count
-# only with N of at least RULE_WIDE_N.
+# RULE_K and N of at least K, from RULE_ROWS rows where no column takes more
+# than RULE_RANK ranks, and below that row count or above that rank only
+# with N of at least RULE_WIDE_N.
 RULE_K = 4096
 RULE_ROWS = 4096
 RULE_WIDE_N = 8192
+RULE_RANK = 128
 # Codecs with a kernel on bfloat16, and the K tile of each kernel. K is a
 # whole number of K tiles where the kernel runs.
 KERNEL_BK = {"q4_k": 128, "q5_k": 128, "q6_k": 128, "q8_0": 64}
@@ -97,9 +99,11 @@ def _nax():
     return not force_cpu() and kq.nax_available()
 
 
-def _shape_rule(k, n, rows):
-    """The calls on which the op picks the kernel by itself."""
-    return k <= RULE_K and n >= k and (rows >= RULE_ROWS or n >= RULE_WIDE_N)
+def _shape_rule(k, n, rows, rank):
+    """The calls on which the op picks the kernel by itself. rank is the
+    most ranks a column takes."""
+    near = rows >= RULE_ROWS and rank <= RULE_RANK
+    return k <= RULE_K and n >= k and (n >= RULE_WIDE_N or near)
 
 
 def _fused(rows, rank, n, codec="q4_k", dtype=mx.bfloat16, bands=None, k=K):
@@ -1284,11 +1288,15 @@ def _wide(k, n, **kw):
     return {"m": 1100, "n": n, "r": 16, "k": k, "tile": 64, **kw}
 
 
-# Both sides of each bound of the shape rule, one row, one column or one K
-# tile apart. From RULE_ROWS rows: N against K, and K against RULE_K.
-# Below RULE_ROWS rows: N against RULE_WIDE_N. The next K above RULE_K that
-# a kernel can walk is one K tile of q8_0 above it (64); the K-quant codecs
-# hold K in blocks of 256.
+# Both sides of each bound of the shape rule, one row, one column, one rank
+# or one K tile apart. From RULE_ROWS rows: N against K, and K against
+# RULE_K. Below RULE_ROWS rows: N against RULE_WIDE_N. The next K above
+# RULE_K that a kernel can walk is one K tile of q8_0 above it (64); the
+# K-quant codecs hold K in blocks of 256. Then the rank against RULE_RANK
+# where N is below RULE_WIDE_N: the rank of a call with no table, and the
+# rank of the largest band with one.
+_HALVES = [(0, 128, 0, RULE_RANK), (128, 256, RULE_RANK, RULE_RANK)]
+_HALVES_OVER = [(0, 128, 0, RULE_RANK + 1), (128, 256, RULE_RANK + 1, 1)]
 RULE_CASES = [
     (_wide(256, 256, m=RULE_ROWS), True),
     (_wide(256, 256, m=RULE_ROWS - 1), False),
@@ -1306,6 +1314,13 @@ RULE_CASES = [
     (_wide(RULE_K, RULE_WIDE_N), True),
     (_wide(RULE_K + 256, RULE_WIDE_N), False),
     (_wide(RULE_K + 64, RULE_WIDE_N, codec="q8_0"), False),
+    (_wide(256, 256, m=RULE_ROWS, r=RULE_RANK), True),
+    (_wide(256, 256, m=RULE_ROWS, r=RULE_RANK + 1), False),
+    (_wide(256, RULE_WIDE_N - 1, m=RULE_ROWS, r=RULE_RANK + 1), False),
+    (_wide(256, RULE_WIDE_N, m=RULE_ROWS, r=RULE_RANK + 1), True),
+    (_wide(256, RULE_WIDE_N, r=MAX_RANK), True),
+    (_wide(256, 256, m=RULE_ROWS, r=2 * RULE_RANK, bands=_HALVES), True),
+    (_wide(256, 256, m=RULE_ROWS, r=RULE_RANK + 2, bands=_HALVES_OVER), False),
 ]
 
 
@@ -1316,7 +1331,11 @@ def test_lora_shape_rule():
         pytest.skip("the kernel needs a NAX GPU")
     calls = [c for c, _ in RULE_CASES]
     want = [k for _, k in RULE_CASES]
-    assert want == [_shape_rule(c["k"], c["n"], c["m"]) for c in calls]
+
+    def rank(c):
+        return max(b[3] for b in c["bands"]) if c.get("bands") else c["r"]
+
+    assert want == [_shape_rule(c["k"], c["n"], c["m"], rank(c)) for c in calls]
     _expect(calls, _probe(calls), want)
 
 
