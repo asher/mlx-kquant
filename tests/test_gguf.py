@@ -68,6 +68,41 @@ def test_load_gguf(tmp_path):
         assert list(shapes[name]) == [64, 8]
 
 
+@pytest.mark.parametrize("name", ["STQ1_0", "PQ2_0", "PTQ1_0", "Q2_0"])
+def test_load_gguf_codecs_newer_than_gguf_py(tmp_path, name):
+    """A tensor of a ggml type gguf-py has no member for loads with its
+    codec name, its wire bytes and its logical shape, as a zero-copy view
+    and as a copy. The parser sizes the tensor from its own type table, so a
+    type missing there fails the load."""
+    from kqref import SENTINELS, synth_wire
+
+    ((sent, (wpb, bpb, _, _)),) = [
+        (s, v) for s, v in SENTINELS.items() if s.name == name
+    ]
+    codec = name.lower()
+    rows, k = 6, 4 * 256
+    wire = synth_wire(np.random.default_rng(1), codec, bpb, rows * k // wpb)
+    wire = wire.reshape(rows, k // wpb * bpb)
+    path = str(tmp_path / f"{codec}.gguf")
+    w = GGUFWriter(path, "smoke")
+    w.add_tensor("pad.f32", np.zeros((3,), dtype=np.float32), raw_dtype=GT.F32)
+    w.add_tensor("layer.w", wire, raw_dtype=sent)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    for zero_copy in (True, False):
+        arrays, codecs, _, shapes = kq.load_gguf(path, zero_copy=zero_copy)
+        assert codecs["layer.w"] == codec
+        assert list(shapes["layer.w"]) == [k, rows]
+        got = arrays["layer.w"]
+        assert got.dtype == mx.uint8
+        assert np.array_equal(np.array(got), wire)
+        aliases = kq.verify_zero_copy_views([("layer.w", got)], ["layer.w"])
+        assert bool(aliases) == zero_copy
+        del arrays, got
+
+
 def test_zero_copy_matches_copy(tmp_path):
     """zero_copy=True (no-copy mmap views) must be byte-identical to zero_copy=
     False (eager memcpy). Mints its own GGUF, compares kq-vs-kq.

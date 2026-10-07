@@ -308,12 +308,12 @@ const KQuantCodec* gguf_type_to_kquant_codec(uint32_t t) {
       return codec_by_name("iq1_m");
     // Bare literals (MXFP4=39, NVFP4=40, Q2_0=42, STQ1_0=43, PQ2_0=142,
     // PTQ1_0=143): gguflib's enum may predate these types.
-    case 42:
-      return codec_by_name("q2_0");
     case 39:
       return codec_by_name("mxfp4");
     case 40:
       return codec_by_name("nvfp4");
+    case 42:
+      return codec_by_name("q2_0");
     case 43:
       return codec_by_name("stq1_0");
     case 142:
