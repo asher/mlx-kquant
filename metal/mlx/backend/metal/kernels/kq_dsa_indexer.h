@@ -82,7 +82,15 @@ kq_dsa_topk_indices_16bit(
     scan_limit = valid_length;
   }
 
-  for (int i = int(tid); i < scan_limit; i += THREADS) {
+  // Each thread owns one contiguous index range, and the ranges in thread
+  // order are index order. The select reads the row three times, and a
+  // strided walk would touch every cache line of it from every thread.
+  const uint otid = simd_group * 32 + simd_lane;
+  const int chunk = (scan_limit + THREADS - 1) / THREADS;
+  const int lo = metal::min(scan_limit, int(otid) * chunk);
+  const int hi = metal::min(scan_limit, lo + chunk);
+
+  for (int i = lo; i < hi; ++i) {
     const uint key = kq_dsa_ordered_key_16(row_scores[i]);
     atomic_fetch_add_explicit(&hist[key >> 8], 1, memory_order_relaxed);
   }
@@ -110,7 +118,7 @@ kq_dsa_topk_indices_16bit(
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   const uint threshold_hi = state[0];
-  for (int i = int(tid); i < scan_limit; i += THREADS) {
+  for (int i = lo; i < hi; ++i) {
     const uint key = kq_dsa_ordered_key_16(row_scores[i]);
     if ((key >> 8) == threshold_hi) {
       atomic_fetch_add_explicit(&hist[key & 0xff], 1, memory_order_relaxed);
@@ -129,63 +137,50 @@ kq_dsa_topk_indices_16bit(
       }
       greater += count;
     }
-    const uint threshold_key = (threshold_hi << 8) | threshold_lo;
-    state[2] = threshold_key;
+    state[2] = (threshold_hi << 8) | threshold_lo;
     state[3] = greater;
-    atomic_store_explicit(&counters[0], 0, memory_order_relaxed);
-    atomic_store_explicit(&counters[1], greater, memory_order_relaxed);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Stable block-ordered compaction; every step is index-ordered so the
-  // emitted array is bitwise reproducible. Greater keys fill [0, greater),
-  // threshold ties fill [greater, TOPK) lowest-index-first.
+  // Stable index-ordered compaction, so the emitted array is bitwise
+  // reproducible. Greater keys fill [0, greater), threshold ties fill
+  // [greater, TOPK) lowest-index-first. A thread counts its range, takes
+  // its output position from the counts of the threads before it, then
+  // writes: two barriers for a row of any length.
   const uint threshold_key = state[2];
   threadgroup uint sg_gt[THREADS / 32];
   threadgroup uint sg_tie[THREADS / 32];
-  threadgroup uint bases[2];
-  if (tid == 0) {
-    bases[0] = 0; // next slot for strictly-greater keys
-    bases[1] = state[3]; // count of strictly-greater keys
+  uint n_gt = 0;
+  uint n_tie = 0;
+  for (int i = lo; i < hi; ++i) {
+    const uint key = kq_dsa_ordered_key_16(row_scores[i]);
+    n_gt += uint(key > threshold_key);
+    n_tie += uint(key == threshold_key);
+  }
+  uint gt_pos = simd_prefix_exclusive_sum(n_gt);
+  uint tie_pos = simd_prefix_exclusive_sum(n_tie);
+  if (simd_lane == 31) {
+    sg_gt[simd_group] = gt_pos + n_gt;
+    sg_tie[simd_group] = tie_pos + n_tie;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int base = 0; base < scan_limit; base += THREADS) {
-    const int i = base + int(tid);
-    bool is_gt = false;
-    bool is_tie = false;
-    if (i < scan_limit) {
+  tie_pos += state[3];
+  for (uint g = 0; g < simd_group; ++g) {
+    gt_pos += sg_gt[g];
+    tie_pos += sg_tie[g];
+  }
+  if (n_gt + n_tie != 0) {
+    for (int i = lo; i < hi; ++i) {
       const uint key = kq_dsa_ordered_key_16(row_scores[i]);
-      is_gt = (key > threshold_key);
-      is_tie = (key == threshold_key);
-    }
-    const uint gt_lane = simd_prefix_exclusive_sum(uint(is_gt));
-    const uint tie_lane = simd_prefix_exclusive_sum(uint(is_tie));
-    if (simd_lane == 31) {
-      sg_gt[simd_group] = gt_lane + uint(is_gt);
-      sg_tie[simd_group] = tie_lane + uint(is_tie);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (is_gt || is_tie) {
-      uint pos = is_gt ? (bases[0] + gt_lane) : (bases[1] + tie_lane);
-      for (uint g = 0; g < simd_group; ++g) {
-        pos += is_gt ? sg_gt[g] : sg_tie[g];
-      }
-      if (pos < uint(TOPK)) {
-        row_out[pos] = O(i);
+      if (key > threshold_key) {
+        row_out[gt_pos++] = O(i);
+      } else if (key == threshold_key) {
+        if (tie_pos < uint(TOPK)) {
+          row_out[tie_pos] = O(i);
+        }
+        ++tie_pos;
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-      uint gt_tot = 0;
-      uint tie_tot = 0;
-      for (uint g = 0; g < THREADS / 32; ++g) {
-        gt_tot += sg_gt[g];
-        tie_tot += sg_tie[g];
-      }
-      bases[0] += gt_tot;
-      bases[1] += tie_tot;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   (void)kq_dsa_bucketed_topk; // unused: emission is identical in both modes
   (void)counters;
