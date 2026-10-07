@@ -700,12 +700,13 @@ NB_MODULE(_ext, m) {
 
         On a NAX GPU, for q4_k, q5_k, q6_k and q8_0 weights on bfloat16
         with K up to 4096 and N of at least K, with at least 4096 rows
-        (from 1024 rows where N is at least 8192), every band starting on
-        a multiple of 64 columns and ending on a multiple of 32 columns or
-        at N, at most 16 bands and a rank of at most 256 per band (without
-        bands, a rank of at most 256), stock ops compute
-        z = strength * (x @ A) and one dispatch walks the rank for z and B
-        and then K for the weight in the same f32 sums. y is the only
+        and at most 128 ranks per column (from 1024 rows and at every rank
+        where N is at least 8192), every band starting on a multiple of 64
+        columns and ending on a multiple of 32 columns or at N, at most 16
+        bands and a rank of at most 256 per band (without bands, a rank of
+        at most 256), stock ops compute z = strength * (x @ A) and one
+        dispatch walks the rank for z and B and then K for the weight in
+        the same f32 sums. y is the only
         output buffer and is rounded once, at the store. KQ_QMM_LORA=2
         runs the kernel from 1024 rows at every K and N, and 0 turns the
         kernel off. Every other case builds the same sum from

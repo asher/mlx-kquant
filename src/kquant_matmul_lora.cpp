@@ -9,6 +9,7 @@
 // product and adds z @ B in its accumulator, with y as its only output
 // buffer. Every other case builds the same sum from quantized_matmul and
 // stock ops.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -99,15 +100,18 @@ int lora_min_rows() {
 // pass over y, a cost in proportion to N. It waits for z, a cost in
 // proportion to K that the unfused product does not pay, since x @ A runs
 // beside it. So the kernel is faster where N is at least K, and its share
-// of the call falls as K grows: above kLoraRuleK the two forms tie. Where N
-// is near K the gain is about one percent and holds from kLoraRuleRows
-// rows. Below that row count the kernel runs from N of kLoraRuleWideN.
+// of the call falls as K grows: above kLoraRuleK the two forms tie. From N
+// of kLoraRuleWideN the kernel runs at every row count and rank it takes.
+// Where N is nearer K the gain is about one percent: it holds from
+// kLoraRuleRows rows and up to a rank of kLoraRuleRank, since the wait for
+// z grows with the rank. rank is the most ranks a column takes.
 constexpr int kLoraRuleK = 4096;
 constexpr int kLoraRuleRows = 4096;
 constexpr int kLoraRuleWideN = 8192;
-bool lora_shape_rule(int K, int N, int64_t rows) {
+constexpr int kLoraRuleRank = 128;
+bool lora_shape_rule(int K, int N, int64_t rows, int rank) {
   return K <= kLoraRuleK && N >= K &&
-      (rows >= kLoraRuleRows || N >= kLoraRuleWideN);
+      (N >= kLoraRuleWideN || (rows >= kLoraRuleRows && rank <= kLoraRuleRank));
 }
 
 bool lora_log() {
@@ -576,9 +580,15 @@ mx::array quantized_matmul_lora(
   // composition (q8_0 only: the K-quant codecs hold K in blocks of 256).
   const int bk = lora_kernel_bk(kquant_type, out_type);
   const int mode = lora_mode();
+  // The most ranks a column takes: every rank with no table, the rank of
+  // the largest band with one.
+  int col_rank = bands.empty() ? R : 0;
+  for (size_t i = 0; i < bands.size(); i += 4) {
+    col_rank = std::max(col_rank, bands[i + 3]);
+  }
   bool fused = s.device == mx::Device::gpu && nax_available() && mode != 0 &&
       bk > 0 && K % bk == 0 && rows >= lora_min_rows() &&
-      (mode == 2 || lora_shape_rule(K, N, rows));
+      (mode == 2 || lora_shape_rule(K, N, rows, col_rank));
   if (bands.empty()) {
     fused = fused && R <= kLoraMaxRank;
   } else {
