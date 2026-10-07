@@ -1611,13 +1611,15 @@ class KQuantMatmulFused : public mx::Primitive {
 //   y = x @ W^T + (strength * (x @ A)) @ B
 // x [..., K] (float16/bfloat16; float32 runs in bfloat16), w 2-D uint8 wire
 // bytes [N, K bytes], lora_a [K, R] and lora_b [R, N] in any float dtype
-// (they run in the dtype of y). strength scales the R columns of x @ A: one
-// element, or [R]. bands is empty or holds rows of (col_start, col_end,
-// z_start, rank): the columns [col_start, col_end) of y take the ranks
-// [z_start, z_start + rank) and that block of lora_b, and a column outside
-// every band takes no low-rank term. Bands are in column order and
-// disjoint. Several adapters are one call: their A columns and B rows are
-// joined, with one strength per column.
+// (they run in the dtype of y). strength scales the R columns of x @ A: a
+// 0-D array, [1] or [R]. bands holds rows of (col_start, col_end, z_start,
+// rank): the columns [col_start, col_end) of y take the ranks [z_start,
+// z_start + rank) and that block of lora_b, and a column outside every band
+// takes no low-rank term. Bands are in column order and disjoint. Without
+// bands (nullopt) every column takes every rank. With a table of no row no
+// column takes one, and y is the product alone. Several adapters are one
+// call: their A columns and B rows are joined, with one strength per
+// column. K, N and R are below 2^25 and x holds fewer than 2^31 rows.
 // Returns [..., N] in the dtype quantized_matmul gives for x. On a NAX GPU,
 // for q4_k, q5_k, q6_k and q8_0 weights on bfloat16 with K up to 4096 and N
 // of at least K, at least 4096 rows (from 1024 rows where N is at least
@@ -1635,13 +1637,14 @@ mx::array quantized_matmul_lora(
     mx::array lora_a,
     mx::array lora_b,
     const std::optional<mx::array>& strength = std::nullopt,
-    const std::vector<int>& bands = {},
+    const std::optional<std::vector<int>>& bands = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // Quantized matmul with a low-rank term in the reduction (see
-// quantized_matmul_lora). Inputs are x, w, z and B. vjp and jvp are those
-// of the unfused ops, wrt x, z and B: the quantized weight is frozen, as
-// in KQuantMatmul.
+// quantized_matmul_lora). Inputs are x, w, z and B. vjp, jvp and vmap are
+// those of the unfused ops. The vjp is wrt x, z and B: the quantized weight
+// is frozen, as in KQuantMatmul. jvp and vmap run for z and B and refuse x
+// and the weight by the name of KQuantMatmul, which has neither.
 class KQuantMatmulLora : public mx::Primitive {
  public:
   KQuantMatmulLora(
@@ -1676,6 +1679,9 @@ class KQuantMatmulLora : public mx::Primitive {
       const std::vector<mx::array>& primals,
       const std::vector<mx::array>& tangents,
       const std::vector<int>& argnums) override;
+  std::pair<std::vector<mx::array>, std::vector<int>> vmap(
+      const std::vector<mx::array>& inputs,
+      const std::vector<int>& axes) override;
 
  private:
   std::string kquant_type_;

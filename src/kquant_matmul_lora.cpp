@@ -48,6 +48,11 @@ constexpr int kLoraSn = 32;
 constexpr int kLoraMaxRank = 256;
 // Most bands the kernel looks through per threadgroup.
 constexpr int kLoraMaxBands = 16;
+// Sizes the op refuses. The kernel offsets a row tile by a 32-bit product
+// of 64 rows and a row length (K, N or R), which wraps from 2^25, and
+// holds the row count in an int.
+constexpr int64_t kLoraMaxCols = int64_t{1} << 25;
+constexpr int64_t kLoraMaxRows = int64_t{1} << 31;
 
 // K tile of the kernel for a codec and an activation dtype, 0 where the op
 // builds the composition.
@@ -118,18 +123,90 @@ mx::array last_axis_slice(const mx::array& a, int lo, int hi, mx::Stream s) {
   return mx::slice(a, std::move(start), std::move(stop), s);
 }
 
+// c + a @ b by the stock op, with c copied to dense memory first when it
+// has one column. On the GPU the stock op reads a first argument of one
+// column and several rows at a step that is not its row stride, so a
+// column of a wider array comes out wrong (docs/upstream-defects.md). A
+// dense c is passed through with no copy, and a c of two or more columns
+// is read in place, as before.
+mx::array
+lora_addmm(mx::array c, const mx::array& a, const mx::array& b, mx::Stream s) {
+  if (c.shape(-1) == 1) {
+    c = mx::contiguous(c, false, s);
+  }
+  return mx::addmm(std::move(c), a, b, 1.0f, 1.0f, s);
+}
+
+// The base product and z on their way into the banded sum: the identity,
+// on the buffer of its input, under every transform. The stock Slice ops
+// that cut the bands have no shape rule, so a shapeless compiled function
+// cannot hold the banded sum. Each array that a Slice cuts first passes
+// through this node, so the node comes before every Slice in the order of
+// a trace and refuses by the name of the op.
+class LoraBandedInput : public mx::UnaryPrimitive {
+ public:
+  explicit LoraBandedInput(mx::Stream stream) : mx::UnaryPrimitive(stream) {}
+
+  void eval_cpu(const std::vector<mx::array>& inputs, mx::array& out) override {
+    out.copy_shared_buffer(inputs[0]);
+  }
+  void eval_gpu(const std::vector<mx::array>& inputs, mx::array& out) override {
+    out.copy_shared_buffer(inputs[0]);
+  }
+
+  const char* name() const override {
+    return "KQuantLoraBandedInput";
+  }
+  bool is_equivalent(const mx::Primitive&) const override {
+    return true;
+  }
+
+  std::vector<mx::array> vjp(
+      const std::vector<mx::array>&,
+      const std::vector<mx::array>& cotangents,
+      const std::vector<int>&,
+      const std::vector<mx::array>&) override {
+    return {cotangents[0]};
+  }
+  std::vector<mx::array> jvp(
+      const std::vector<mx::array>&,
+      const std::vector<mx::array>& tangents,
+      const std::vector<int>&) override {
+    return {tangents[0]};
+  }
+  std::pair<std::vector<mx::array>, std::vector<int>> vmap(
+      const std::vector<mx::array>& inputs,
+      const std::vector<int>& axes) override {
+    return {{inputs[0]}, axes};
+  }
+
+  std::vector<mx::Shape> output_shapes(const std::vector<mx::array>&) override {
+    throw std::invalid_argument(
+        std::string(kLoraOp) +
+        " A shapeless compiled function cannot hold a call with bands that "
+        "builds the unfused ops. Compile it with fixed shapes, or trace it "
+        "on a call that runs the kernel.");
+  }
+};
+
 // base + z @ B over the bands. With no band table every column takes
 // every rank. With one, a band's columns take its ranks and its block of
 // B, and a column outside every band takes none.
 mx::array lora_add(
-    const mx::array& base,
-    const mx::array& z,
+    const mx::array& base_,
+    const mx::array& z_,
     const mx::array& b,
     const std::vector<int>& bands,
     mx::Stream s) {
   if (bands.empty()) {
-    return mx::addmm(base, z, b, 1.0f, 1.0f, s);
+    return lora_addmm(base_, z_, b, s);
   }
+  auto banded_input = [&s](const mx::array& a) {
+    return mx::array(
+        a.shape(), a.dtype(), std::make_shared<LoraBandedInput>(s), {a});
+  };
+  const mx::array base = banded_input(base_);
+  const mx::array z = banded_input(z_);
   const int N = base.shape(-1);
   std::vector<mx::array> parts;
   int col = 0;
@@ -144,7 +221,7 @@ mx::array lora_add(
     auto y = last_axis_slice(base, cs, ce, s);
     if (rb > 0) {
       auto bb = mx::slice(b, {z0, cs}, {z0 + rb, ce}, s);
-      y = mx::addmm(y, last_axis_slice(z, z0, z0 + rb, s), bb, 1.0f, 1.0f, s);
+      y = lora_addmm(std::move(y), last_axis_slice(z, z0, z0 + rb, s), bb, s);
     }
     parts.push_back(std::move(y));
     col = ce;
@@ -225,7 +302,9 @@ void KQuantMatmulLora::eval_gpu(
   const int n_bands = static_cast<int>(bands.size() / 4);
 
   MTL::Size group_dims(32, 2, 2);
-  MTL::Size grid_dims((N + kLoraBn - 1) / kLoraBn, (M + bm - 1) / bm, 1);
+  // M may be within a row tile of the largest int.
+  MTL::Size grid_dims(
+      (N + kLoraBn - 1) / kLoraBn, (static_cast<size_t>(M) + bm - 1) / bm, 1);
   if (lora_log()) {
     std::fprintf(
         stderr,
@@ -276,21 +355,21 @@ void KQuantMatmulLora::eval_cpu(
       std::string(kLoraOp) + " CPU streams build the composed ops.");
 }
 
-// The kernel computes the function of the composition, so its derivatives
-// are the composition's: with respect to x, z and B, with the quantized
-// weight frozen as in quantized_matmul. z is built from x, A and the
-// strength by stock ops before this node, so their derivatives follow
-// from the one with respect to z.
+// The kernel computes the function of the composition, so its vjp is the
+// composition's: with respect to x, z and B, with the quantized weight
+// frozen as in quantized_matmul. z is built from x, A and the strength by
+// stock ops before this node, so their gradients follow from the one with
+// respect to z.
 namespace {
 
 constexpr int kLoraArgOfInput[] = {0, -1, 1, 2};
 
-void lora_check_argnums(const std::vector<int>& argnums, const char* what) {
+void lora_check_argnums(const std::vector<int>& argnums) {
   for (auto arg : argnums) {
     if (arg == 1) {
       throw std::invalid_argument(
-          std::string("[mlx_kquant] quantized_matmul_lora ") + what +
-          " wrt the quantized weight (the kquant base is frozen).");
+          "[mlx_kquant] quantized_matmul_lora vjp: no gradient wrt the "
+          "quantized weight (the kquant base is frozen).");
     }
   }
 }
@@ -302,7 +381,7 @@ std::vector<mx::array> KQuantMatmulLora::vjp(
     const std::vector<mx::array>& cotangents,
     const std::vector<int>& argnums,
     const std::vector<mx::array>&) {
-  lora_check_argnums(argnums, "vjp: no gradient");
+  lora_check_argnums(argnums);
   auto fun = [&](const std::vector<mx::array>& in) {
     return std::vector<mx::array>{lora_composed(
         in[0], primals[1], in[1], in[2], kquant_type_, bands_, stream())};
@@ -319,28 +398,39 @@ std::vector<mx::array> KQuantMatmulLora::vjp(
   return out;
 }
 
+// jvp and vmap are the transforms of the composition, over the inputs that
+// carry a tangent or a batch axis. The others enter as constants. So a
+// tangent or a batch of z or B (of lora_a, lora_b or the strength) runs on
+// stock ops, and one of x or of the weight reaches quantized_matmul, which
+// has neither transform and refuses by its own name, as it does where the
+// op builds the composition.
 std::vector<mx::array> KQuantMatmulLora::jvp(
     const std::vector<mx::array>& primals,
     const std::vector<mx::array>& tangents,
     const std::vector<int>& argnums) {
-  lora_check_argnums(argnums, "jvp: no derivative");
-  // A tangent of zero for the float inputs that are not in argnums.
-  std::vector<mx::array> tan = {
-      mx::zeros_like(primals[0], stream()),
-      mx::zeros_like(primals[2], stream()),
-      mx::zeros_like(primals[3], stream())};
-  for (size_t i = 0; i < argnums.size(); i++) {
-    tan[kLoraArgOfInput[argnums[i]]] = tangents[i];
+  auto fun = [&](const std::vector<mx::array>& in) {
+    std::vector<mx::array> full = primals;
+    for (size_t i = 0; i < argnums.size(); i++) {
+      full[argnums[i]] = in[i];
+    }
+    return std::vector<mx::array>{lora_composed(
+        full[0], full[1], full[2], full[3], kquant_type_, bands_, stream())};
+  };
+  std::vector<mx::array> at;
+  for (auto arg : argnums) {
+    at.push_back(primals[arg]);
   }
+  return mx::jvp(fun, at, tangents).second;
+}
+
+std::pair<std::vector<mx::array>, std::vector<int>> KQuantMatmulLora::vmap(
+    const std::vector<mx::array>& inputs,
+    const std::vector<int>& axes) {
   auto fun = [&](const std::vector<mx::array>& in) {
     return std::vector<mx::array>{lora_composed(
-        in[0], primals[1], in[1], in[2], kquant_type_, bands_, stream())};
+        in[0], in[1], in[2], in[3], kquant_type_, bands_, stream())};
   };
-  return mx::jvp(
-             fun,
-             std::vector<mx::array>{primals[0], primals[2], primals[3]},
-             tan)
-      .second;
+  return {mx::vmap(fun, axes, {0})(inputs), {0}};
 }
 
 bool KQuantMatmulLora::is_equivalent(const mx::Primitive& other) const {
@@ -362,9 +452,13 @@ mx::array quantized_matmul_lora(
     mx::array lora_a,
     mx::array lora_b,
     const std::optional<mx::array>& strength,
-    const std::vector<int>& bands,
+    const std::optional<std::vector<int>>& bands_,
     mx::StreamOrDevice s_) {
   const std::string op = kLoraOp;
+  // No table: every column takes every rank, which the code below holds as
+  // an empty vector. A table with no row: no column takes a rank.
+  const bool no_band = bands_.has_value() && bands_->empty();
+  const std::vector<int> bands = bands_.value_or(std::vector<int>{});
   const KQuantCodec* codec = codec_by_name(kquant_type);
   if (codec == nullptr) {
     throw std::invalid_argument(
@@ -406,15 +500,28 @@ mx::array quantized_matmul_lora(
         op + " lora_b must be a float array [R, N] with R " +
         std::to_string(R) + " and N " + std::to_string(N) + ".");
   }
+  if (K >= kLoraMaxCols || N >= kLoraMaxCols || R >= kLoraMaxCols) {
+    throw std::invalid_argument(
+        op + " K, N and R must each be below " + std::to_string(kLoraMaxCols) +
+        " (2^25): K " + std::to_string(K) + ", N " + std::to_string(N) +
+        ", R " + std::to_string(R) + ".");
+  }
+  const int64_t rows = K > 0 ? static_cast<int64_t>(x.size()) / K : 0;
+  if (rows >= kLoraMaxRows) {
+    throw std::invalid_argument(
+        op + " x must hold fewer than " + std::to_string(kLoraMaxRows) +
+        " (2^31) rows: it holds " + std::to_string(rows) + ".");
+  }
   if (strength.has_value()) {
     const auto& st = *strength;
-    const bool shape_ok =
-        st.size() == 1 || (st.ndim() == 1 && st.shape(0) == R);
+    // 0-D, [1] or [R]. Any other shape would broadcast z to more dims.
+    const bool shape_ok = st.ndim() == 0 ||
+        (st.ndim() == 1 && (st.shape(0) == 1 || st.shape(0) == R));
     if (!shape_ok || !mx::issubdtype(st.dtype(), mx::floating)) {
       throw std::invalid_argument(
           op +
-          " strength must be a float array of one element or of shape "
-          "[R] with R " +
+          " strength must be a float array of no dim, of shape [1] or of "
+          "shape [R] with R " +
           std::to_string(R) + ".");
     }
   }
@@ -450,9 +557,8 @@ mx::array quantized_matmul_lora(
   // float32 x runs in bfloat16, as in quantized_matmul.
   const mx::Dtype out_type =
       x.dtype() == mx::float32 ? mx::bfloat16 : x.dtype();
-  const int64_t rows = K > 0 ? static_cast<int64_t>(x.size()) / K : 0;
   auto scales = mx::zeros({1}, mx::uint8, s);
-  if (rows == 0 || N == 0 || R == 0) {
+  if (rows == 0 || N == 0 || R == 0 || no_band) {
     // Nothing to add: the base product, with its shape and dtype.
     return quantized_matmul(
         x,

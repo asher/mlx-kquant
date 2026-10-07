@@ -663,15 +663,16 @@ NB_MODULE(_ext, m) {
          const std::optional<mx::array>& strength,
          const std::optional<std::vector<std::vector<int>>>& bands,
          mx::StreamOrDevice s) {
-        std::vector<int> flat;
+        std::optional<std::vector<int>> flat;
         if (bands.has_value()) {
+          flat.emplace();
           for (const auto& row : *bands) {
             if (row.size() != 4) {
               throw std::invalid_argument(
                   "[mlx_kquant.quantized_matmul_lora] bands must hold rows "
                   "of (col_start, col_end, z_start, rank).");
             }
-            flat.insert(flat.end(), row.begin(), row.end());
+            flat->insert(flat->end(), row.begin(), row.end());
           }
         }
         return mlx_kquant::quantized_matmul_lora(
@@ -712,25 +713,39 @@ NB_MODULE(_ext, m) {
         activation dtype before the add. mx.grad gives the gradient with
         respect to x, lora_a, lora_b and strength at every row count: the
         gradient of the kernel runs the unfused ops. The weight is frozen,
-        as in quantized_matmul.
+        as in quantized_matmul. mx.jvp and mx.vmap run with respect to
+        lora_a, lora_b and strength at every row count. With respect to x
+        both raise "Not implemented for KQuantMatmul" at every row count,
+        since quantized_matmul has neither.
 
         Several adapters are one call: join their A columns and their B
         rows, and give one strength per column.
 
+        A function compiled with shapeless=True keeps the path of its
+        trace at every later shape: a trace that ran the kernel runs it
+        below 1024 rows too, and the result is right there. A shapeless
+        function cannot hold a call with bands that builds the unfused
+        ops: that call raises ValueError.
+
         Args:
             x (array): [..., K], float16/bfloat16. float32 runs in bfloat16.
-            w (array): [N, K bytes] uint8 wire bytes.
+                Fewer than 2^31 rows.
+            w (array): [N, K bytes] uint8 wire bytes. K and N below 2^25.
             kquant_type (str): the codec of w.
-            lora_a (array): [K, R], any float dtype.
+            lora_a (array): [K, R], any float dtype. R below 2^25.
             lora_b (array): [R, N], any float dtype.
-            strength (array, optional): one element, or [R]: the scale of
-                each column of x @ A. A new value needs no new trace.
+            strength (array, optional): the scale of each column of
+                x @ A, in any float dtype: a 0-D array or [1] for one
+                scale, or [R] for one per column. Any other shape raises
+                ValueError. A new value needs no new trace.
             bands (sequence, optional): rows of (col_start, col_end,
                 z_start, rank), in column order and disjoint. The columns
                 [col_start, col_end) of y take the ranks [z_start, z_start
                 + rank) and that block of lora_b. A column outside every
-                band takes no low-rank term. Without bands every column
-                takes every rank.
+                band takes no low-rank term. None (the default): every
+                column takes every rank. An empty sequence: no column
+                takes a rank, and y is quantized_matmul(x, w), bit for
+                bit.
 
         Returns:
             array: [..., N] in the dtype quantized_matmul gives for x.
