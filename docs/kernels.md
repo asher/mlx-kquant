@@ -169,13 +169,15 @@ Tuning levers (defaults are right for normal use):
 
 - `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
   `KQ_NAX_BM128_ODD_M`, `KQ_NAX_DB64`, the `_BK128` levers, `KQ_NAX_SWIZZLE`), the tile overrides
-  (`KQ_NAX_TILE`, `KQ_QMM_TILE`), `KQ_SPLITK_F32`, `KQ_QMM_LOG`, the `quantized_matmul_glu`
-  levers (`KQ_GLU`, `KQ_GLU_MIN_ROWS`) and the `quantized_matmul_lora` levers (`KQ_QMM_LORA`,
-  `KQ_QMM_LORA_MIN_ROWS`) read their variables on every dispatch, so one process can
-  switch tiles between calls on one resident copy of the weights; `benchmarks/bench_dit_shapes.py`
-  runs its tile arms this way. It reads the environment on every dispatch, so it is for
-  single-threaded A/B runs that set these variables between calls. Unset (off) by default, and
-  then each of them keeps its first read for the life of the process. Read once per process.
+  (`KQ_NAX_TILE`, `KQ_QMM_TILE`), `KQ_SPLITK_F32` and `KQ_QMM_LOG` read their variables on every
+  dispatch, so one process can switch tiles between calls on one resident copy of the weights;
+  `benchmarks/bench_dit_shapes.py` runs its tile arms this way. It reads the environment on every
+  dispatch, so it is for single-threaded A/B runs that set these variables between calls. The
+  `quantized_matmul_glu` levers (`KQ_GLU`, `KQ_GLU_MIN_ROWS`) and the `quantized_matmul_lora`
+  levers (`KQ_QMM_LORA`, `KQ_QMM_LORA_MIN_ROWS`) are read when the op is called and builds its
+  graph, not when a kernel is dispatched, so a compiled function keeps the kernel choice of its
+  trace. Unset (off) by default, and then each of them keeps its first read for the life of the
+  process. Read once per process.
 - `KQ_NAX_TILE` - `bm,bn,wm,wn` pins the NAX `qmm_t` tile of every transpose call that reaches it,
   in place of the BM=32, BM=64 and BM=128 policy. BK stays 64, except where a `_BK128` lever sets
   it. The `_db` variant still follows `KQ_NAX_DB64` on the bm64 bn64 wm2 wn2 tile. A tile the
@@ -613,14 +615,17 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
 
 - `quantized_matmul_lora` - `y = x @ W^T + (strength * (x @ A)) @ B` for a packed weight and a
   low-rank adapter, `lora_a` [K, R] and `lora_b` [R, N], at the row counts of a diffusion
-  transformer step. `strength` is one element, or one value per rank. It is an input array, so a
-  new value needs no reload and no new trace of a compiled function. Several adapters are one
-  call: join their A columns and their B rows, and give one strength per rank.
+  transformer step. `strength` is a 0-D array or [1] for one scale, or [R] for one per rank, and
+  any other shape raises a `ValueError`. It is an input array, so a new value needs no reload and
+  no new trace of a compiled function. Several adapters are one call: join their A columns and
+  their B rows, and give one strength per rank.
 
   `bands` holds rows of (col_start, col_end, z_start, rank), in column order and disjoint. The
   columns of a band take that block of ranks and that block of `lora_b`, and a column outside
   every band takes no low-rank term. A fused q, k and v weight with one adapter per projection is
-  three bands, so no projection multiplies the ranks of another.
+  three bands, so no projection multiplies the ranks of another. `bands=None`, the default, is no
+  table: every column takes every rank. `bands=[]` is a table with no band: no column takes a
+  rank, and y is `quantized_matmul(x, w)`, bit for bit.
 
   On a NAX GPU (M5), for `q4_k`, `q5_k`, `q6_k` and `q8_0` weights on bfloat16 activations with K
   up to 4096 and N of at least K, from 4096 activation rows, and from 1024 rows where N is at
@@ -690,7 +695,8 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
 
   x is float16 or bfloat16, and float32 x runs in bfloat16 as in `quantized_matmul`. Leading batch
   dims fold into rows. `lora_a`, `lora_b` and `strength` take any float dtype and run in the dtype
-  of y.
+  of y. K, N and R are each below 2^25 and x holds fewer than 2^31 rows: the kernel computes
+  addresses inside a row tile in 32 bits, and a call past either limit raises a `ValueError`.
 
   Every other case builds the same sum from `quantized_matmul` and stock ops, which round the
   product to the activation dtype before the add: other codecs, float16 activations, fewer rows,
@@ -699,7 +705,8 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
   multiple of 64, CPU streams and GPUs without NAX. A rank of zero, an x of no rows and a weight
   of no rows return the product alone.
 
-  Levers, each read once per process unless `KQ_TUNE_LIVE=1`:
+  Levers, each read once per process unless `KQ_TUNE_LIVE=1`. The op reads them when it is
+  called and builds its graph, so a compiled function keeps the kernel choice of its trace:
 
   - `KQ_QMM_LORA` - `0` builds the unfused ops on every call. `2` runs the kernel at every K and
     N from 1024 rows, inside its other bounds. Unset, `1` or any other value keeps the bounds on
@@ -707,10 +714,22 @@ takes 7% off the matmul time on bfloat16 activations and 3% on float16.
   - `KQ_QMM_LORA_MIN_ROWS` - the lowest row count at which the kernel runs, an integer of at
     least 1. A value below 1 keeps the default, with a warning on stderr. Default 1024.
 
-  `mx.grad` gives the gradient with respect to x, `lora_a`, `lora_b` and `strength` at every row
-  count: the gradient of the kernel runs the unfused ops. The weight is frozen, as in
-  `quantized_matmul`. `mx.jvp` and `mx.vmap` raise at every row count, since `quantized_matmul` has
-  neither.
+  A function compiled with `shapeless=True` keeps the path of its trace at every later shape. A
+  trace that ran the kernel runs it at every row count, below 1024 rows and outside the bounds on
+  rows too, and the result is right there. A trace that built the unfused ops keeps them. A
+  shapeless function cannot hold a call with `bands` that builds the unfused ops, since the stock
+  slices that cut the bands have no shape rule: that call raises a `ValueError` that names
+  `quantized_matmul_lora`. Compile such a function with fixed shapes.
+
+  `mx.grad` gives the gradient with respect to x, `lora_a`, `lora_b` and `strength`, alone or in
+  any combination, at every row count: the gradient of the kernel runs the unfused ops. The weight
+  is frozen, as in `quantized_matmul`. `mx.jvp` and `mx.vmap` run with respect to `lora_a`,
+  `lora_b` and `strength` at every row count, on the unfused ops. With respect to x both raise
+  `Not implemented for KQuantMatmul` at every row count, since `quantized_matmul` has neither.
+
+  The unfused ops add each band with `mx.addmm`. On the GPU that stock op misreads a first
+  argument of one column that is a view of a wider array, so the op hands it a dense copy of a
+  one-column band ([upstream-defects.md](upstream-defects.md)). Wider bands are read in place.
 
 ## MoE GLU
 
