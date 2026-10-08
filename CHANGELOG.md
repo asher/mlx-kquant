@@ -10,6 +10,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `dsa_topk_indices` runs faster with the same indices in the same order,
   about 4x on a row of 65,536 scores. `KQ_DSA_TOPK_CHUNKS=1` keeps a row in
   one threadgroup.
+- `dsa_indexer_score_decode` with 4 heads scores 2 to 4 query rows in about
+  the time of one, with the same scores. `KQ_DSA_SCORE_PAIR=0` keeps the
+  previous kernel.
 
 ### Fixed
 - `load_gguf(zero_copy=True)` copied a tensor of many GiB into memory when it

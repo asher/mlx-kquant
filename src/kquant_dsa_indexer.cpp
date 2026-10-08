@@ -246,10 +246,16 @@ void KQDsaIndexerScoreDecode::eval_gpu(
   const int NC = cand_ ? cand.shape(2) : P;
 
   const bool wf = weights.dtype() == mx::float32;
+  // 4 heads fill half a query tile, so 2 to 4 query rows go two to a tile
+  // and share one read of the keys. KQ_DSA_SCORE_PAIR=0 keeps one row per
+  // tile and one pass over the keys per row.
+  const char* pair_env = std::getenv("KQ_DSA_SCORE_PAIR");
+  const bool pair =
+      H == 4 && QL > 1 && !cand_ && !(pair_env && std::string(pair_env) == "0");
   const std::string kname = "kq_dsa_indexer_score_decode_" +
       (H == 64 && !wf ? std::string() : "h" + std::to_string(H) + "_") +
       std::string(wf ? "wf_" : "") + kq_type_string(q.dtype()) + "_ql" +
-      std::to_string(QL) + (cand_ ? "_cand" : "");
+      std::to_string(QL) + (cand_ ? "_cand" : "") + (pair ? "_pair" : "");
 
   // Keys per threadgroup: a multiple of the kernel's SGS x 8 rows, at
   // least 128 and sized for about 512 threadgroups (the query staging

@@ -68,6 +68,23 @@ instantiate_kq_dsa_topk_split_all(bfloat16_t, bfloat16_t)
   instantiate_kq_dsa_indexer_score_decode(tname, dtype, 3, h, "h" #h "_", float, "wf_"); \
   instantiate_kq_dsa_indexer_score_decode(tname, dtype, 4, h, "h" #h "_", float, "wf_")
 
+// Two query rows per tile, 4 heads only.
+#define instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, ql, wt, ws) \
+  instantiate_kernel(                                                           \
+      "kq_dsa_indexer_score_decode_h4_" ws #tname "_ql" #ql "_pair",            \
+      kq_dsa_indexer_score_decode, dtype, ql, 4, 128, 8, 1, wt, false, true)
+
+#define instantiate_kq_dsa_indexer_score_decode_pair_all(tname, dtype)       \
+  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 2, dtype, "");  \
+  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 3, dtype, "");  \
+  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 4, dtype, "");  \
+  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 2, float, "wf_"); \
+  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 3, float, "wf_"); \
+  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 4, float, "wf_")
+
+instantiate_kq_dsa_indexer_score_decode_pair_all(float16_t, half);
+instantiate_kq_dsa_indexer_score_decode_pair_all(bfloat16_t, bfloat16_t);
+
 instantiate_kq_dsa_indexer_score_decode_all(float16_t, half, 64, "");
 instantiate_kq_dsa_indexer_score_decode_all(float16_t, half, 32, "h32_");
 instantiate_kq_dsa_indexer_score_decode_all(float16_t, half, 4, "h4_");

@@ -456,6 +456,45 @@ def test_dsa_indexer_score_decode_rejects_bad_shapes():
         kq.dsa_indexer_score_decode(q, k, w, -1, 4)
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("H", [4, 32, 64])
+@pytest.mark.parametrize("wf32", [False, True], ids=["w16", "w32"])
+def test_dsa_indexer_score_decode_rows_batched_match_rows_alone(dtype, H, wf32):
+    """A query row scores the same beside other rows as alone, bit for bit,
+    and columns past its visible pool score the finite min. With 4 heads, 2
+    to 4 rows share query tiles and one read of the keys."""
+    fmin = float(mx.finfo(dtype).min)
+    for QL in (2, 3, 4):
+        for P in (517, 4099):
+            q, k, w = _make_decode_qkw(
+                2, QL, P, dtype, seed=47 + QL, H=H, wdtype=mx.float32 if wf32 else None
+            )
+            q_offset = P * 4 - QL
+            got = kq.dsa_indexer_score_decode(q, k, w, q_offset, 4)
+            assert got.shape == (2, 1, QL, P)
+            for j in range(QL):
+                alone = kq.dsa_indexer_score_decode(
+                    q[:, :, j : j + 1], k, w[:, j : j + 1], q_offset, 4
+                )
+                vlim = min(P, (q_offset + j + 1) // 4)
+                assert mx.array_equal(got[:, 0, j, :vlim], alone[:, 0, 0, :vlim]).item()
+                assert mx.all(got[:, 0, j, vlim:] == fmin).item(), (QL, P, j)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("QL", [2, 3, 4])
+def test_dsa_indexer_score_decode_pair_switch(monkeypatch, dtype, QL):
+    """KQ_DSA_SCORE_PAIR=0 keeps one query row per tile; the scores do not
+    change."""
+    q, k, w = _make_decode_qkw(2, QL, 1027, dtype, seed=53, H=4)
+    paired = kq.dsa_indexer_score_decode(q, k, w, 4106, 4)
+    mx.eval(paired)
+    monkeypatch.setenv("KQ_DSA_SCORE_PAIR", "0")
+    single = kq.dsa_indexer_score_decode(q, k, w, 4106, 4)
+    mx.eval(single)
+    assert mx.array_equal(paired, single).item()
+
+
 def main() -> int:
     rc = pytest.main([__file__, "-q"])
     return int(rc)
