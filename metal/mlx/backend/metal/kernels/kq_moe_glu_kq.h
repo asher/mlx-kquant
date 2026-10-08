@@ -1269,6 +1269,66 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
   }
 }
 
+// Slot-parallel kq_ext_gather_qmv_mix: each simdgroup pair owns one slot,
+// the shared expert's slot S - 1 included, as in
+// kq_ext_gather_qmv_mix_ns_sp. The slot-0 pair replays the loop kernel's
+// score chain, so outputs are bit-identical to it. Dispatch: group
+// (32, 2 * S, 1), grid (N / (2 * RPS), 1, T); host gates
+// S <= KQ_MOE_SP_MAX_S.
+template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
+[[kernel]] void kq_ext_gather_qmv_mix_sp(
+    const device uint8_t* w [[buffer(0)]],
+    const device uint8_t* sw [[buffer(1)]],
+    const device T* h [[buffer(2)]],
+    const device uint32_t* indices [[buffer(3)]],
+    const device float* scores [[buffer(4)]],
+    device T* out [[buffer(5)]],
+    const constant int& K [[buffer(6)]],
+    const constant int& N [[buffer(7)]],
+    const constant int& S [[buffer(8)]],
+    const constant int& SC [[buffer(9)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int RPS = 32 / NX;
+  const short tx = short(simd_lid % NX);
+  const short ty = short(simd_lid / NX);
+  const int slot = int(simd_gid >> 1);
+  const short lrow = short((simd_gid & 1) * RPS) + ty;
+  const int out_row = tid.x * (2 * RPS) + lrow;
+
+  KQ_EXT_STAGE_LUTS(Codec, kq_luts)
+  KQ_EXT_STAGE_LUTS(SCodec, kq_sluts)
+
+  threadgroup float parts[2 * RPS][NX][KQ_MOE_SP_MAX_S];
+
+  const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
+  if (slot < S - 1) {
+    const int expert = int(indices[tid.z * (S - 1) + slot]);
+    parts[lrow][tx][slot] = kq_ext_row_partial<T, Codec, NX>(
+        w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
+  } else {
+    parts[lrow][tx][slot] = kq_ext_row_partial<T, SCodec, NX>(
+        sw, xs, (int64_t)out_row, K, tx, kq_sluts);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (slot == 0) {
+    float result = 0.0f;
+    for (int s = 0; s < S - 1; s++) {
+      result += scores[tid.z * SC + s] * parts[lrow][tx][s];
+    }
+    // SC == S - 1: the shared slot's weight is an implicit 1
+    result += (SC == S ? scores[tid.z * SC + (S - 1)] : 1.0f) *
+        parts[lrow][tx][S - 1];
+    result = kq_ext_reduce<NX>(result);
+    if (tx == 0) {
+      out[(int64_t)tid.z * N + out_row] = static_cast<T>(result);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Dedupe gathers for the MTP verify widths (T = 2..8 rows per step). The
 // rows of a verify block route to overlapping expert sets (GLM-5.3-Flash

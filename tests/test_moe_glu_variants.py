@@ -1,13 +1,14 @@
-"""Fused-MoE launch-shape A/Bs: slot-parallel mix_ns (_sp), the Ext
-gather simdgroups-per-threadgroup pick (KQ_MOE_SG) and the verify-width
-dedupe gathers (KQ_MOE_DEDUP).
+"""Fused-MoE launch-shape A/Bs: slot-parallel mix and mix_ns (_sp), the
+Ext gather simdgroups-per-threadgroup pick (KQ_MOE_SG), the verify-width
+dedupe gathers (KQ_MOE_DEDUP) and the form of a score-mixed down gather
+(KQ_MOE_MIX_FORM).
 
 These variants restructure parallelism only (the slot loop spreads onto
 simdgroup pairs; more rows share one staged LUT; one owner per expert
 dots the pair of rows that share it) and must be bit-identical to the
 base launch. Each arm runs in a subprocess so the live-read env latches
-(KQ_MOE_SP, KQ_MOE_SG, KQ_MOE_DEDUP) see the variable from the first
-dispatch.
+(KQ_MOE_SP, KQ_MOE_SG, KQ_MOE_DEDUP, KQ_MOE_MIX_FORM) see the variable from
+the first dispatch.
 """
 
 import os
@@ -301,7 +302,9 @@ def test_dedup_bit_identical(codec, scodec, T, tmp_path):
         out = tmp_path / f"dd{arm}.npz"
         r = _run_child(
             [sys.executable, "-c", _DD_SNIPPET, codec, scodec, str(T), str(out)],
-            {"KQ_MOE_DEDUP": arm, "KQ_MOE_NX_LOG": "1"},
+            # this shape underfills the device, where the slot-parallel
+            # form goes first: force the pair form on the mixed gathers
+            {"KQ_MOE_DEDUP": arm, "KQ_MOE_NX_LOG": "1", "KQ_MOE_MIX_FORM": "dd"},
             f"dedup {codec}/{scodec} T={T} arm KQ_MOE_DEDUP={arm}",
         )
         outs[arm] = np.load(out)
@@ -327,3 +330,111 @@ def test_dedup_bit_identical(codec, scodec, T, tmp_path):
     ):
         assert want in logs["1"], (want, logs["1"])
     assert "_dd" not in logs["0"], logs["0"]
+
+
+_FORM_SNIPPET = r"""
+import sys
+import numpy as np
+import mlx.core as mx
+import mlx_kquant as kq
+
+codec, scodec, T, N, out_path = (
+    sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5])
+rng = np.random.default_rng(31)
+E, K, S = 6, 256, 5
+def wire(n, c):
+    w = mx.array((rng.standard_normal((n, K)) * 0.1).astype(np.float32))
+    im = mx.ones((K,), dtype=mx.float32) if c.startswith("iq") else None
+    wq, _ = kq.quantize(w, c, im)
+    mx.eval(wq)
+    return wq
+dw = wire(E * N, codec).reshape(E, N, -1)
+sdw = wire(N, scodec)
+base = rng.integers(0, E, size=(T, S)).astype(np.uint32)
+base[:, 0] = 3
+inds = mx.array(base)
+sc = mx.array(rng.uniform(0.05, 0.9, size=(T, S)).astype(np.float32))
+scs = mx.array(rng.uniform(0.05, 0.9, size=(T, S + 1)).astype(np.float32))
+h = mx.array((rng.standard_normal((T, S, K)) * 0.05).astype(np.float16))
+hs = mx.array((rng.standard_normal((T, S + 1, K)) * 0.05).astype(np.float16))
+outs = {
+    "mix_ns": kq.gather_qmv_mix_ns_kq(h, dw, codec, inds, sc),
+    # one score per slot, then routed scores only (the shared slot at 1)
+    "mix": kq.gather_qmv_mix_kq(
+        hs, dw, sdw, codec, inds, scs, shexp_kquant_type=scodec),
+    "mix_unit": kq.gather_qmv_mix_kq(
+        hs, dw, sdw, codec, inds, sc, shexp_kquant_type=scodec),
+}
+mx.eval(*outs.values())
+np.savez(out_path, **{k: np.array(v.astype(mx.float32)) for k, v in outs.items()})
+"""
+
+
+def _form_arms(codec, scodec, T, N, tmp_path, arms):
+    outs, logs = {}, {}
+    for arm in arms:
+        out = tmp_path / f"form_{arm}.npz"
+        env = {"KQ_MOE_NX_LOG": "1"}
+        if arm != "default":
+            env["KQ_MOE_MIX_FORM"] = arm
+        r = _run_child(
+            [
+                sys.executable,
+                "-c",
+                _FORM_SNIPPET,
+                codec,
+                scodec,
+                str(T),
+                str(N),
+                str(out),
+            ],
+            env,
+            f"mix form {codec}/{scodec} T={T} N={N} arm {arm}",
+        )
+        outs[arm] = np.load(out)
+        logs[arm] = r.stderr
+    return outs, logs
+
+
+@pytest.mark.parametrize(
+    "codec,scodec",
+    [
+        ("q2_0", "q2_0"),
+        ("q2_0", "iq4_nl"),
+        ("q4_k", "q4_k"),
+        ("iq2_xs", "q6_k"),
+        ("iq3_xxs", "q5_k"),
+    ],
+)
+@pytest.mark.parametrize("T", [1, 2, 5])
+def test_mix_sp_bit_identical(codec, scodec, T, tmp_path):
+    """KQ_MOE_MIX_FORM=loop against sp on both score-mixed down gathers:
+    identical bytes with one score per slot and with routed scores only,
+    and the slot-parallel kernels serve the default on a grid that
+    underfills the device."""
+    outs, logs = _form_arms(codec, scodec, T, 256, tmp_path, ("loop", "sp", "default"))
+    for name in ("mix_ns", "mix", "mix_unit"):
+        a = outs["loop"][name]
+        assert np.isfinite(a).all() and np.abs(a).max() > 0, name
+        for arm in ("sp", "default"):
+            b = outs[arm][name]
+            assert np.array_equal(a, b), (name, arm, np.abs(a - b).max())
+    stem = codec if scodec == codec else f"{codec}_sx_{scodec}"
+    for arm in ("sp", "default"):
+        for want in (
+            f"kq_{codec}_gather_qmv_mix_ns_sp_",
+            f"kq_{stem}_gather_qmv_mix_sp_",
+        ):
+            assert want in logs[arm], (arm, want, logs[arm])
+    assert "_sp_" not in logs["loop"] and "_dd" not in logs["loop"], logs["loop"]
+
+
+def test_mix_form_wide_grid_keeps_pair(tmp_path):
+    """A grid that fills the device stays on the dedupe row-pair kernels."""
+    outs, logs = _form_arms("q4_0", "q4_0", 2, 8192, tmp_path, ("default", "loop"))
+    for want in ("kq_q4_0_gather_qmv_mix_ns_dd", "kq_q4_0_gather_qmv_mix_dd"):
+        assert want in logs["default"], (want, logs["default"])
+    assert "_sp_" not in logs["default"], logs["default"]
+    for name in ("mix_ns", "mix", "mix_unit"):
+        a, b = outs["loop"][name], outs["default"][name]
+        assert np.array_equal(a, b), (name, np.abs(a - b).max())

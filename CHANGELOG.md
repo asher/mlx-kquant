@@ -16,6 +16,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `quantized_matmul` on `iq4_xs` and `iq4_nl` weights runs up to 1.4x faster
   at 3 to 8 activation rows on M5 GPUs. `KQ_VERIFY_NAX=0` keeps the previous
   routes.
+- `gather_qmv_mix_kq` and `gather_qmv_mix_ns_kq` run up to 1.5x faster at
+  decode and verify widths on expert stacks with a few thousand output rows.
+  `KQ_MOE_MIX_FORM=dd` keeps the previous kernel from 2 rows.
 
 ### Fixed
 - `load_gguf(zero_copy=True)` copied a tensor of many GiB into memory when it

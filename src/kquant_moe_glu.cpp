@@ -190,6 +190,35 @@ inline bool kq_moe_sp(int64_t coarse_tgs, int S) {
   return coarse_tgs < 2048;
 }
 
+// Form of a score-mixed down gather (mix and mix_ns) where more than one
+// applies: the loop kernel, the slot-parallel kernel or the dedupe row-pair
+// kernel. The pair kernel runs the loop launch over half the rows, so on a
+// grid that underfills the device it loses to the slot-parallel kernel
+// until the two rows of a pair share about two thirds of their experts.
+// The slot-parallel kernel goes first where it applies, the pair kernel
+// serves the wider grids. Fit: benchmarks/bench_moe_mix_forms.py.
+// KQ_MOE_MIX_FORM=loop|sp|dd forces a form where it applies (probe lever,
+// read live once set).
+enum { KQ_MIX_LOOP = 0, KQ_MIX_SP = 1, KQ_MIX_DD = 2 };
+
+inline int kq_moe_mix_form(bool sp_ok, bool dd_ok) {
+  static const bool has_env = std::getenv("KQ_MOE_MIX_FORM") != nullptr;
+  if (has_env) {
+    const char* e = std::getenv("KQ_MOE_MIX_FORM");
+    const std::string v = e == nullptr ? "" : e;
+    if (v == "loop") {
+      return KQ_MIX_LOOP;
+    }
+    if (v == "sp") {
+      return sp_ok ? KQ_MIX_SP : KQ_MIX_LOOP;
+    }
+    if (v == "dd") {
+      return dd_ok ? KQ_MIX_DD : KQ_MIX_LOOP;
+    }
+  }
+  return sp_ok ? KQ_MIX_SP : dd_ok ? KQ_MIX_DD : KQ_MIX_LOOP;
+}
+
 // KQ_MOE_NX_LOG=1: print each fused-MoE kernel name once (dispatch audit).
 inline void kq_moe_log_kname(const std::string& kname, int cap = 0) {
   static const bool log = std::getenv("KQ_MOE_NX_LOG") != nullptr;
@@ -732,13 +761,49 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   int N = w.shape(1);
   int K = x.shape(-1);
 
-  // Same codec-keyed widening as mix_ns (the shexp-slot mix has no
-  // slot-parallel form; its nx8 launch is the mix_ns non-sp baseline).
+  // Same codec-keyed widening as mix_ns. The slot-parallel form serves the
+  // generic kernels at nx 8; the tuned q6_k and q8_0 kernels keep their
+  // fine tier.
   const bool use_half = kq_moe_half(kquant_type_, K) &&
       (shexp_type_ == kquant_type_ || shexp_type_ == "q5_k" ||
        shexp_type_ == "q6_k" || shexp_type_ == "q8_0");
-  const bool dd = !use_half && S <= 16 && kq_moe_dedup(T, KQ_DD_MAX_T);
-  if (dd) {
+  const bool dd_ok = !use_half && S <= 16 && kq_moe_dedup(T, KQ_DD_MAX_T);
+  const std::string sp_stem = shexp_type_ == kquant_type_
+      ? kq_gather_stem(kquant_type_, K)
+      : kquant_type_ + "_sx_" + shexp_type_;
+  const bool sp_ok = !use_half && sp_stem != "q6_k" && sp_stem != "q8_0" &&
+      kq_moe_pick_nx(
+          (int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, T, K)) == 8 &&
+      kq_moe_sp((int64_t)T * (N / 8), S);
+  const int form = kq_moe_mix_form(sp_ok, dd_ok);
+  if (form == KQ_MIX_SP) {
+    const std::string kname =
+        "kq_" + sp_stem + "_gather_qmv_mix_sp_" + kq_type_string(x.dtype());
+    auto kernel = kq_get_kernel(d, kname);
+    // 64 * S threads must fit the pipeline; the loop kernel serves the
+    // call when they do not.
+    if (64 * S <= int(kernel->maxTotalThreadsPerThreadgroup())) {
+      kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
+      auto& ce = mx::metal::get_command_encoder(s);
+      ce.set_compute_pipeline_state(kernel);
+      ce.set_input_array(w, 0);
+      ce.set_input_array(sw, 1);
+      ce.set_input_array(x, 2);
+      ce.set_input_array(indices, 3);
+      ce.set_input_array(scores, 4);
+      ce.set_output_array(out, 5);
+      ce.set_bytes(K, 6);
+      ce.set_bytes(N, 7);
+      ce.set_bytes(S, 8);
+      const int SC = scores.shape(1);
+      ce.set_bytes(SC, 9);
+      MTL::Size group_dims(32, 2 * S, 1);
+      MTL::Size grid_dims(N / 8, 1, T);
+      ce.dispatch_threadgroups(grid_dims, group_dims);
+      return;
+    }
+  }
+  if (form == KQ_MIX_DD) {
     // The pair launch serves two rows per grid step, so the width pick
     // sees a two-row step whatever the block width.
     const int nx = kq_moe_pick_nx(
@@ -840,7 +905,12 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   // No fine tier: the Ext fine variants measured E2E-neutral and were
   // dropped. Decode-scale launches route to the slot-parallel variant
   // unless the codec widens (kq_moe_mix_ns_wide).
-  const bool dd = S <= 16 && kq_moe_dedup(T, KQ_DD_MAX_T);
+  const bool dd_ok = S <= 16 && kq_moe_dedup(T, KQ_DD_MAX_T);
+  const bool sp_ok =
+      kq_moe_pick_nx(
+          (int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, T, K)) == 8 &&
+      kq_moe_sp((int64_t)T * (N / 8), S);
+  const bool dd = kq_moe_mix_form(sp_ok, dd_ok) == KQ_MIX_DD;
   const int nx = kq_moe_pick_nx(
       (int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, dd ? 2 : T, K));
   if (dd) {
@@ -862,7 +932,8 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
         nx,
         kq_moe_pick_sg(kquant_type_, N, nx));
   } else {
-    bool sp = nx == 8 && kq_moe_sp((int64_t)T * (N / 8), S);
+    bool sp = nx == 8 && kq_moe_sp((int64_t)T * (N / 8), S) &&
+        kq_moe_mix_form(true, false) == KQ_MIX_SP;
     auto ns_name = [&](bool slot_parallel) {
       return "kq_" + kquant_type_ + "_gather_qmv_mix_ns" +
           (slot_parallel ? "_sp" : kq_nx_suffix(nx)) + "_" +

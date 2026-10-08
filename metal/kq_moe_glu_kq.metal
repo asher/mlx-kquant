@@ -114,10 +114,17 @@ instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
       "kq_" #codec "_gather_qmv_mix_dd" sfx "_" #type,                        \
       kq_ext_gather_qmv_mix_pair, type, traits, traits, true, nx)              \
 
+// Slot-parallel shared-expert mix, NX = 8 only as for mix_ns.
+#define instantiate_kq_ext_mix_sp(stem, traits, straits, type)                \
+  instantiate_kernel(                                                         \
+      "kq_" stem "_gather_qmv_mix_sp_" #type,                                 \
+      kq_ext_gather_qmv_mix_sp, type, traits, straits, 8)
+
 #define instantiate_kq_ext_uniform(codec, traits, type)                       \
   instantiate_kq_ext_uniform_nx(codec, traits, type, 8, "")                    \
   instantiate_kq_ext_uniform_nx(codec, traits, type, 16, "_nx16")              \
-  instantiate_kq_ext_uniform_nx(codec, traits, type, 32, "_nx32")
+  instantiate_kq_ext_uniform_nx(codec, traits, type, 32, "_nx32")              \
+  instantiate_kq_ext_mix_sp(#codec, traits, traits, type)
 
 // Mixed-codec shared expert: shexp tensors in scodec over codec expert
 // stacks (UD-style upcast shexp). Dispatch key "kq_<codec>_sx_<scodec>_...".
@@ -144,7 +151,8 @@ instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
 #define instantiate_kq_ext_sx(codec, traits, scodec, straits, type)           \
   instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 8, "")        \
   instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 16, "_nx16")  \
-  instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 32, "_nx32")
+  instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 32, "_nx32")  \
+  instantiate_kq_ext_mix_sp(#codec "_sx_" #scodec, traits, straits, type)
 
 // No-shared-expert mix (gemma-style weighted sum; always the generic kernel,
 // q6_k/q8_0 included).
@@ -196,7 +204,8 @@ instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
 // one tier below q6_k): nx 8 and 16 only, the auto pick caps at 16.
 #define instantiate_kq_ext_sx_q5k(codec, traits, type)                        \
   instantiate_kq_ext_sx_nx(codec, traits, q5_k, KqQ5_KExt, type, 8, "")        \
-  instantiate_kq_ext_sx_nx(codec, traits, q5_k, KqQ5_KExt, type, 16, "_nx16")
+  instantiate_kq_ext_sx_nx(codec, traits, q5_k, KqQ5_KExt, type, 16, "_nx16")  \
+  instantiate_kq_ext_mix_sp(#codec "_sx_q5_k", traits, KqQ5_KExt, type)
 
 #define instantiate_kq_ext_all(codec, traits)                                 \
   instantiate_kq_ext_uniform(codec, traits, bfloat16_t)                        \
@@ -299,7 +308,8 @@ instantiate_kq_ext_sx2_lowbit(iq1_m, KqIq1_mExt)
 #define instantiate_kq_ext_sx_mix(codec, traits, scodec, straits, type)       \
   instantiate_kq_ext_sx_mix_nx(codec, traits, scodec, straits, type, 8, "")    \
   instantiate_kq_ext_sx_mix_nx(codec, traits, scodec, straits, type, 16, "_nx16") \
-  instantiate_kq_ext_sx_mix_nx(codec, traits, scodec, straits, type, 32, "_nx32")
+  instantiate_kq_ext_sx_mix_nx(codec, traits, scodec, straits, type, 32, "_nx32") \
+  instantiate_kq_ext_mix_sp(#codec "_sx_" #scodec, traits, straits, type)
 
 instantiate_kq_ext_sx_mix(q2_0, KqQ2_0Ext, iq4_nl, KqIq4_nlExt, bfloat16_t)
 instantiate_kq_ext_sx_mix(q2_0, KqQ2_0Ext, iq4_nl, KqIq4_nlExt, float16_t)
