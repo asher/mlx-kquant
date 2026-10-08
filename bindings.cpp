@@ -106,6 +106,24 @@ NB_MODULE(_ext, m) {
       "(kq.moe_glu_gather_kq and friends).");
 
   m.def(
+      "shexp_glu_combo_has_kernel",
+      &mlx_kquant::shexp_glu_combo_has_kernel,
+      "kquant_type"_a,
+      "shexp_gate_type"_a,
+      "shexp_up_type"_a,
+      "True when moe_glu_gather_shexp_kq has a kernel for expert stacks in "
+      "kquant_type with the shared expert's gate and up tensors in these "
+      "two codecs.");
+
+  m.def(
+      "shexp_mix_combo_has_kernel",
+      &mlx_kquant::shexp_mix_combo_has_kernel,
+      "kquant_type"_a,
+      "shexp_type"_a,
+      "True when gather_qmv_mix_kq has a kernel for expert stacks in "
+      "kquant_type with the shared expert's down tensor in shexp_type.");
+
+  m.def(
       "codec_has_matmul",
       [](const std::string& kquant_type) {
         const auto* codec = mlx_kquant::codec_by_name(kquant_type);
@@ -1743,6 +1761,7 @@ NB_MODULE(_ext, m) {
       "act"_a = "silu",
       "shexp_kquant_type"_a = "",
       "limit"_a = 0.0f,
+      "shexp_up_kquant_type"_a = "",
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
@@ -1762,8 +1781,12 @@ NB_MODULE(_ext, m) {
                 'silu_limit' (deepseek-v4 LimitedSwiGLU: gate clamped from
                 above, up clamped both sides, routed and shared slots alike).
             shexp_kquant_type (str): shared-expert codec; '' (default) =
-                kquant_type. Mixed combos must be q5_k, q6_k or q8_0.
+                kquant_type. Mixed combos must be q5_k, q6_k or q8_0, or
+                pass shexp_glu_combo_has_kernel.
             limit (float): the 'silu_limit' clamp; must be > 0 for that act.
+            shexp_up_kquant_type (str): codec of shexp_up_w when it differs
+                from shexp_gate_w's; '' (default) = shexp_kquant_type. Split
+                combos run act 'silu' only.
 
         Returns:
             array: activated hidden states [T, R + 1, N] in x.dtype.
@@ -1795,7 +1818,8 @@ NB_MODULE(_ext, m) {
             scores (array): mix weights [T, S], or [T, S - 1] with the
                 shared slot at an implicit weight of 1; cast to float32.
             shexp_kquant_type (str): shared-expert codec; '' (default) =
-                kquant_type. Mixed combos must be q5_k, q6_k or q8_0.
+                kquant_type. Mixed combos must be q5_k, q6_k or q8_0, or
+                pass shexp_mix_combo_has_kernel.
 
         Returns:
             array: mixed output [T, N] in x.dtype.

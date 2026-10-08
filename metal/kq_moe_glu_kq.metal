@@ -254,6 +254,56 @@ instantiate_kq_ext_sx_q5k(q6_k, KqQ6_KExt, float16_t)
 instantiate_kq_ext_sx_q5k(q8_0, KqQ8_0Ext, bfloat16_t)
 instantiate_kq_ext_sx_q5k(q8_0, KqQ8_0Ext, float16_t)
 
+// Split-codec shared expert (kq_ext_moe_glu_gather_shexp2): the per-tensor
+// codec picks of the low-bit i-quant builds, where the shared expert's gate
+// and up are each one of iq4_xs / iq3_s / q6_k over iq2_s / iq2_xxs / iq1_m
+// expert stacks. Dispatch key "kq_<codec>_sx2_<gate>_<up>_...".
+#define instantiate_kq_ext_sx2_nx(codec, traits, sg, sgt, su, sut, type, nx, sfx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_sx2_" #sg "_" #su "_moe_glu_gather_shexp_silu" sfx "_" #type, \
+      kq_ext_moe_glu_gather_shexp2, type, traits, sgt, sut, KQ_GLU_ACT_SILU, nx)
+
+#define instantiate_kq_ext_sx2(codec, traits, sg, sgt, su, sut)               \
+  instantiate_kq_ext_sx2_nx(codec, traits, sg, sgt, su, sut, bfloat16_t, 8, "") \
+  instantiate_kq_ext_sx2_nx(codec, traits, sg, sgt, su, sut, bfloat16_t, 16, "_nx16") \
+  instantiate_kq_ext_sx2_nx(codec, traits, sg, sgt, su, sut, bfloat16_t, 32, "_nx32") \
+  instantiate_kq_ext_sx2_nx(codec, traits, sg, sgt, su, sut, float16_t, 8, "") \
+  instantiate_kq_ext_sx2_nx(codec, traits, sg, sgt, su, sut, float16_t, 16, "_nx16") \
+  instantiate_kq_ext_sx2_nx(codec, traits, sg, sgt, su, sut, float16_t, 32, "_nx32")
+
+// q6_k / q6_k is the upcast pair above.
+#define instantiate_kq_ext_sx2_lowbit(codec, traits)                          \
+  instantiate_kq_ext_sx2(codec, traits, iq4_xs, KqIq4_xsExt, iq4_xs, KqIq4_xsExt) \
+  instantiate_kq_ext_sx2(codec, traits, iq4_xs, KqIq4_xsExt, iq3_s, KqIq3_sExt) \
+  instantiate_kq_ext_sx2(codec, traits, iq4_xs, KqIq4_xsExt, q6_k, KqQ6_KExt)  \
+  instantiate_kq_ext_sx2(codec, traits, iq3_s, KqIq3_sExt, iq4_xs, KqIq4_xsExt) \
+  instantiate_kq_ext_sx2(codec, traits, iq3_s, KqIq3_sExt, iq3_s, KqIq3_sExt)  \
+  instantiate_kq_ext_sx2(codec, traits, iq3_s, KqIq3_sExt, q6_k, KqQ6_KExt)    \
+  instantiate_kq_ext_sx2(codec, traits, q6_k, KqQ6_KExt, iq4_xs, KqIq4_xsExt)  \
+  instantiate_kq_ext_sx2(codec, traits, q6_k, KqQ6_KExt, iq3_s, KqIq3_sExt)
+
+instantiate_kq_ext_sx2_lowbit(iq2_s, KqIq2_sExt)
+instantiate_kq_ext_sx2_lowbit(iq2_xxs, KqIq2_xxsExt)
+instantiate_kq_ext_sx2_lowbit(iq1_m, KqIq1_mExt)
+
+// Down mix for the same builds: q2_0 expert stacks with an iq4_nl shared
+// expert. Mix kernels only; the pair has no GLU gather.
+#define instantiate_kq_ext_sx_mix_nx(codec, traits, scodec, straits, type, nx, sfx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_sx_" #scodec "_gather_qmv_mix" sfx "_" #type,            \
+      kq_ext_gather_qmv_mix, type, traits, straits, nx)                        \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_sx_" #scodec "_gather_qmv_mix_dd" sfx "_" #type,         \
+      kq_ext_gather_qmv_mix_pair, type, traits, straits, true, nx)
+
+#define instantiate_kq_ext_sx_mix(codec, traits, scodec, straits, type)       \
+  instantiate_kq_ext_sx_mix_nx(codec, traits, scodec, straits, type, 8, "")    \
+  instantiate_kq_ext_sx_mix_nx(codec, traits, scodec, straits, type, 16, "_nx16") \
+  instantiate_kq_ext_sx_mix_nx(codec, traits, scodec, straits, type, 32, "_nx32")
+
+instantiate_kq_ext_sx_mix(q2_0, KqQ2_0Ext, iq4_nl, KqIq4_nlExt, bfloat16_t)
+instantiate_kq_ext_sx_mix(q2_0, KqQ2_0Ext, iq4_nl, KqIq4_nlExt, float16_t)
+
 // q6_k/q8_0 mix_ns (generic; no tuned ns kernels exist).
 instantiate_kq_ext_mix_ns(q6_k, KqQ6_KExt)
 instantiate_kq_ext_mix_ns(q8_0, KqQ8_0Ext)

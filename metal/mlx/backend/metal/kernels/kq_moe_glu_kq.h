@@ -1065,6 +1065,63 @@ template <
   }
 }
 
+// kq_ext_moe_glu_gather_shexp with the shared expert's gate and up tensors
+// each in its own codec (quantizers that pick a codec per tensor). The
+// shared slot runs two single-row dots; the routed slots are unchanged.
+template <
+    typename T,
+    typename Codec,
+    typename SGCodec,
+    typename SUCodec,
+    int ACT,
+    int NX = KQ_EXT_NXPSG>
+[[kernel]] void kq_ext_moe_glu_gather_shexp2(
+    const device uint8_t* gw [[buffer(0)]],
+    const device uint8_t* uw [[buffer(1)]],
+    const device uint8_t* sgw [[buffer(2)]],
+    const device uint8_t* suw [[buffer(3)]],
+    const device T* x [[buffer(4)]],
+    const device uint32_t* indices [[buffer(5)]],
+    device T* out [[buffer(6)]],
+    const constant int& K [[buffer(7)]],
+    const constant int& N [[buffer(8)]],
+    const constant float& limit [[buffer(9)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int RPS = 32 / NX;
+  const short tx = short(simd_lid % NX);
+  const short ty = short(simd_lid / NX);
+  const int n_route = tpg.y - 1;
+  const bool shared_slot = int(tid.y) == n_route;
+  const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
+
+  x += (int64_t)tid.z * K;
+  out += ((int64_t)tid.z * tpg.y + tid.y) * N;
+
+  KQ_EXT_STAGE_LUTS(Codec, kq_luts)
+  KQ_EXT_STAGE_LUTS(SGCodec, kq_sgluts)
+  KQ_EXT_STAGE_LUTS(SUCodec, kq_suluts)
+  float2 gu;
+  if (shared_slot) {
+    gu.x = kq_ext_row_partial<T, SGCodec, NX>(
+        sgw, x, (int64_t)out_row, K, tx, kq_sgluts);
+    gu.y = kq_ext_row_partial<T, SUCodec, NX>(
+        suw, x, (int64_t)out_row, K, tx, kq_suluts);
+  } else {
+    const int expert = int(indices[tid.z * n_route + tid.y]);
+    gu = kq_ext_glu_row_partial<T, Codec, NX>(
+        gw, uw, x, (int64_t)expert * N + out_row, K, tx, kq_luts);
+  }
+  const float g = kq_ext_reduce<NX>(gu.x);
+  const float u = kq_ext_reduce<NX>(gu.y);
+  if (tx == 0) {
+    out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
+  }
+}
+
 // No-shared-expert mix (gemma-style MoE: plain score-weighted sum over the
 // routed slots): indices and scores are both [T, S], every slot gathers from
 // the expert stack.
@@ -1676,33 +1733,38 @@ template <typename T>
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int NT = 256;
   constexpr int NSG = NT / 32;
-  threadgroup float p[KQ_ROUTER_MAX_E];
-  threadgroup float red_v[NSG];
-  threadgroup uint red_i[NSG];
-  threadgroup float stat[2];
+  constexpr int OWN = KQ_ROUTER_MAX_E / NT;
+  constexpr uint NEG_INF = 0xff800000u;
+  constexpr uint NONE = 0xffffffffu;
+  threadgroup float red_m[NSG];
+  threadgroup float red_s[NSG];
+  // Each simdgroup's own top R, in order: ranking value, expert, score.
+  threadgroup float cand_v[NSG * KQ_ROUTER_MAX_R];
+  threadgroup uint cand_i[NSG * KQ_ROUTER_MAX_R];
+  threadgroup float cand_p[NSG * KQ_ROUTER_MAX_R];
   threadgroup float win_v[KQ_ROUTER_MAX_R];
   threadgroup uint win_i[KQ_ROUTER_MAX_R];
 
   const device T* lrow = logits + (int64_t)tid * (E + SHARED);
 
-  // SCORING is threadgroup-uniform, so barriers inside each arm are safe.
-  float gsum = 1.0f;
+  // This thread's experts are lid, lid + NT, ...: their scores stay in
+  // registers. SCORING is threadgroup-uniform, so the barrier inside the
+  // softmax arm is safe.
+  float pl[OWN];
   if (SCORING == 1) {
-    for (int e = lid; e < E; e += NT) {
+    for (int k = 0, e = lid; e < E; k++, e += NT) {
       const float x = float(lrow[e]);
       // Stable softplus: max(x, 0) + log1p(exp(-|x|)); series for tiny z
       // where log(1 + z) loses bits.
       const float z = metal::exp(-metal::abs(x));
       const float l1p =
           (z < 1e-4f) ? metal::fma(-0.5f * z, z, z) : metal::log(1.0f + z);
-      p[e] = metal::sqrt(metal::max(x, 0.0f) + l1p);
+      pl[k] = metal::sqrt(metal::max(x, 0.0f) + l1p);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
   } else if (SCORING == 2) {
-    for (int e = lid; e < E; e += NT) {
-      p[e] = 1.0f / (1.0f + metal::exp(-float(lrow[e])));
+    for (int k = 0, e = lid; e < E; k++, e += NT) {
+      pl[k] = 1.0f / (1.0f + metal::exp(-float(lrow[e])));
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
   } else {
     float m = -INFINITY;
     for (int e = lid; e < E; e += NT) {
@@ -1710,104 +1772,126 @@ template <typename T>
     }
     m = simd_max(m);
     if (simd_lid == 0) {
-      red_v[simd_gid] = m;
+      red_m[simd_gid] = m;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid == 0) {
-      float g = red_v[0];
-      for (int i = 1; i < NSG; i++) {
-        g = metal::max(g, red_v[i]);
-      }
-      stat[0] = g;
+    float gmax = red_m[0];
+    for (int i = 1; i < NSG; i++) {
+      gmax = metal::max(gmax, red_m[i]);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float gmax = stat[0];
 
     float s = 0;
-    for (int e = lid; e < E; e += NT) {
+    for (int k = 0, e = lid; e < E; k++, e += NT) {
       const float v = metal::exp(float(lrow[e]) - gmax);
-      p[e] = v;
+      pl[k] = v;
       s += v;
     }
     s = simd_sum(s);
     if (simd_lid == 0) {
-      red_v[simd_gid] = s;
+      red_s[simd_gid] = s;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid == 0) {
-      float g = 0;
-      for (int i = 0; i < NSG; i++) {
-        g += red_v[i];
-      }
-      stat[1] = g;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    gsum = stat[1];
   }
 
+  // Ranking values. A NaN entry and a -inf entry are not candidates; -inf
+  // marks both. Tested on the bits: under fast-math a float NaN test may
+  // fold away and a compare against NaN may come out either way, which is
+  // how a NaN row once produced 0xffffffff.
+  float kv[OWN];
+  for (int k = 0, e = lid; e < E; k++, e += NT) {
+    float v = pl[k];
+    if (HAS_BIAS) {
+      v += bias[e];
+    }
+    const uint vb = as_type<uint>(v);
+    const bool skip =
+        ((vb & 0x7f800000u) == 0x7f800000u && (vb & 0x007fffffu) != 0u) ||
+        vb == NEG_INF;
+    kv[k] = skip ? as_type<float>(NEG_INF) : v;
+  }
+
+  // The order is: candidates by value, the lower expert first on a tie,
+  // then the entries that are not candidates by expert. An expert in the
+  // row's top R is in its simdgroup's top R, so each simdgroup lists its
+  // own top R with simd reductions and no barrier.
+  uint taken = 0;
   for (int r = 0; r < R; r++) {
-    // -inf init/sentinel: biased ranking values can be negative.
     float bv = -INFINITY;
-    uint bi = 0xffffffffu;
-    for (int e = lid; e < E; e += NT) {
-      float v = p[e];
-      if (HAS_BIAS) {
-        v += bias[e];
+    uint bi = NONE;
+    uint fi = NONE;
+    for (int k = 0, e = lid; e < E; k++, e += NT) {
+      if ((taken >> k) & 1u) {
+        continue;
       }
-      // A NaN entry and a taken entry (-inf) are not candidates. Tested on
-      // the bits: under fast-math a float NaN test may fold away and a
-      // compare against NaN may come out either way, which is how a NaN
-      // row once produced 0xffffffff, and -inf ties the -inf init.
-      const uint vb = as_type<uint>(v);
-      const bool skip =
-          ((vb & 0x7f800000u) == 0x7f800000u && (vb & 0x007fffffu) != 0u) ||
-          vb == 0xff800000u;
-      if (!skip && (v > bv || (v == bv && uint(e) < bi))) {
+      const float v = kv[k];
+      if (as_type<uint>(v) == NEG_INF) {
+        fi = metal::min(fi, uint(e));
+      } else if (bi == NONE || v > bv || (v == bv && uint(e) < bi)) {
         bv = v;
         bi = uint(e);
       }
     }
     const float sv = simd_max(bv);
-    uint cand = bv == sv ? bi : 0xffffffffu;
-    cand = simd_min(cand);
-    if (simd_lid == 0) {
-      red_v[simd_gid] = sv;
-      red_i[simd_gid] = cand;
+    uint wi = simd_min((bi != NONE && bv == sv) ? bi : NONE);
+    float wv = sv;
+    if (wi == NONE) {
+      wi = simd_min(fi);
+      wv = as_type<float>(NEG_INF);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid == 0) {
-      float wv = red_v[0];
-      uint wi = red_i[0];
-      for (int i = 1; i < NSG; i++) {
-        if (red_v[i] > wv || (red_v[i] == wv && red_i[i] < wi)) {
-          wv = red_v[i];
-          wi = red_i[i];
-        }
+    const int c = int(simd_gid) * R + r;
+    if (wi == NONE) {
+      if (simd_lid == 0) {
+        cand_v[c] = wv;
+        cand_i[c] = NONE;
+        cand_p[c] = 0.0f;
       }
-      if (wi == 0xffffffffu) {
-        // Every remaining entry is NaN. Emit the lowest expert not yet
-        // taken so indices stay in range; its score is the NaN the
-        // reference would give. Taken entries are read back from win_i.
-        for (int e = 0; e < E && wi == 0xffffffffu; e++) {
-          bool taken = false;
-          for (int q = 0; q < r; q++) {
-            taken = taken || (win_i[q] == uint(e));
-          }
-          if (!taken) {
-            wi = uint(e);
-          }
-        }
-      }
-      indices[(int64_t)tid * R + r] = wi;
-      // Emitted score is the unbiased p[wi] (== wv when HAS_BIAS == 0).
-      win_v[r] = p[wi];
-      win_i[r] = wi;
-      p[wi] = -INFINITY;
+    } else if (wi % uint(NT) == lid) {
+      const uint k = wi / uint(NT);
+      taken |= 1u << k;
+      cand_v[c] = wv;
+      cand_i[c] = wi;
+      cand_p[c] = pl[k];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Merge: the slot of a listed expert is how many listed experts come
+  // before it. One thread per list entry, one barrier for any R.
+  const int NC = NSG * R;
+  if (int(lid) < NC) {
+    const uint ci = cand_i[lid];
+    if (ci != NONE) {
+      const float4 cv4 = float4(cand_v[lid]);
+      const uint4 ci4 = uint4(ci);
+      const threadgroup float4* dv =
+          reinterpret_cast<const threadgroup float4*>(cand_v);
+      const threadgroup uint4* di =
+          reinterpret_cast<const threadgroup uint4*>(cand_i);
+      uint4 acc = uint4(0);
+      for (int b = 0; b < NC / 4; b++) {
+        const uint4 gt = select(uint4(0), uint4(1), dv[b] > cv4);
+        const uint4 eq = select(uint4(0), uint4(1), dv[b] == cv4);
+        const uint4 lo = select(uint4(0), uint4(1), di[b] < ci4);
+        acc += gt | (eq & lo);
+      }
+      const uint rank = acc.x + acc.y + acc.z + acc.w;
+      if (rank < uint(R)) {
+        indices[(int64_t)tid * R + rank] = ci;
+        // Emitted score is the unbiased one.
+        win_v[rank] = cand_p[lid];
+        win_i[rank] = ci;
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 
   if (lid == 0) {
+    float gsum = 1.0f;
+    if (SCORING == 0) {
+      gsum = 0;
+      for (int i = 0; i < NSG; i++) {
+        gsum += red_s[i];
+      }
+    }
     float ps = 0;
     for (int r = 0; r < R; r++) {
       ps += win_v[r];

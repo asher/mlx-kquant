@@ -9,8 +9,14 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - `q2_0` codec (ggml type 42, 64-weight blocks with one fp16 scale): GGUFs
   with `Q2_0` tensors load zero-copy and run on the CPU and Metal kernels.
+- `moe_glu_gather_shexp_kq` takes `shexp_up_kquant_type`, so the shared
+  expert's gate and up tensors can each use their own codec.
+  `shexp_glu_combo_has_kernel` and `shexp_mix_combo_has_kernel` list the
+  codec combinations with a fused kernel.
 
 ### Changed
+- `moe_router_topk` picks more than one expert per row faster, about a
+  quarter at 10 of 512, with the same indices and scores.
 - On NAX GPUs (M5), matmuls with 33 to 128 activation rows run faster, such
   as the short prompts of a structured decision. `KQ_QMM_MIDM=0` keeps the
   previous kernel.

@@ -792,6 +792,183 @@ def test_swiglu_clamp_validation():
         kq.gather_qmv_kq(h, wq8, "q8_0", inds, bias=b)
 
 
+@pytest.mark.parametrize("scoring", ["softmax", "sqrtsoftplus", "sigmoid"])
+@pytest.mark.parametrize("e", [16, 64, 250, 512, 1000, 1024])
+def test_router_topk_exact_order(scoring, e):
+    """Slot r holds the r-th best expert: by score, the lower expert first
+    on a tie, then the entries that are not candidates (NaN, -inf score) by
+    expert. Logits sit 0.01 apart so the scoring keeps their order."""
+    rng = np.random.default_rng(e)
+    rows = []
+    for _ in range(3):
+        rows.append(rng.permutation(e).astype(np.float32) * 0.01 - 0.005 * e)
+    tie = rows[0].copy()
+    tie[rng.permutation(e)[: e // 2]] = tie.max()  # ties across threads
+    rows.append(tie)
+    rows.append(np.full(e, 0.25, np.float32))  # one value: 0, 1, 2, ...
+    part = rows[1].copy()
+    part[rng.permutation(e)[: e - 3]] = np.nan  # 3 candidates left
+    rows.append(part)
+    rows.append(np.full(e, np.nan, np.float32))
+    lg = np.stack(rows)
+    for dt in (mx.float32, mx.bfloat16):
+        seen = np.array(mx.array(lg).astype(dt).astype(mx.float32))
+        for r in (1, 2, 6, 10, 16):
+            inds, _ = kq.moe_router_topk(
+                mx.array(lg).astype(dt), r, True, shared_gate=False, scoring=scoring
+            )
+            got = np.array(inds)
+            for t, row in enumerate(seen):
+                ok = ~np.isnan(row)
+                idx = np.arange(e)
+                want = np.concatenate(
+                    [idx[ok][np.lexsort((idx[ok], -row[ok]))], idx[~ok]]
+                )[:r]
+                assert got[t].tolist() == want.tolist(), (dt, r, t)
+
+
+def test_router_topk_minus_inf_bias_ranks_last():
+    """A -inf selection bias takes an expert out of the candidates; it is
+    emitted only after every candidate, lowest expert first."""
+    e, r = 64, 6
+    lg = (np.arange(e, dtype=np.float32) * 0.01)[None]
+    bias = np.zeros(e, np.float32)
+    bias[: e - 4] = -np.inf
+    inds, _ = kq.moe_router_topk(
+        mx.array(lg), r, True, shared_gate=False, bias=mx.array(bias), scoring="sigmoid"
+    )
+    assert np.array(inds)[0].tolist() == [63, 62, 61, 60, 0, 1]
+
+
+_LOWBIT_SHEXP = ("iq4_xs", "iq3_s", "q6_k")
+
+
+@pytest.mark.parametrize("codec", ["iq2_s", "iq2_xxs", "iq1_m"])
+@pytest.mark.parametrize("sg", _LOWBIT_SHEXP)
+@pytest.mark.parametrize("su", _LOWBIT_SHEXP)
+def test_shexp_gate_and_up_in_two_codecs(codec, sg, su):
+    """moe_glu_gather_shexp_kq with the shared expert's gate and up tensors
+    each in its own codec, against the f32 reference."""
+    assert kq.shexp_glu_combo_has_kernel(codec, sg, su)
+    wire, ref = _wire_and_ref(codec)
+    gwire, gref = _wire_and_ref(sg, seed=13)
+    uwire, uref = _wire_and_ref(su, seed=17)
+    if wire is None or gwire is None or uwire is None:
+        pytest.skip("K-quant fixture missing")
+    up_ref = ref[::-1].copy()
+    dw, up_stack = mx.array(wire), mx.array(wire[::-1].copy())
+    rng = np.random.default_rng(3)
+    for dtype in (mx.float16, mx.bfloat16):
+        for t, r in ((1, 2), (4, 3), (3, 10)):
+            x = mx.array((rng.standard_normal((t, K)) * 0.1).astype(np.float16))
+            x = x.astype(dtype)
+            xf = np.array(x.astype(mx.float32))
+            inds_np = rng.integers(0, E, size=(t, r)).astype(np.uint32)
+            got = kq.moe_glu_gather_shexp_kq(
+                x,
+                dw,
+                up_stack,
+                mx.array(gwire[2]),
+                mx.array(uwire[3]),
+                codec,
+                mx.array(inds_np),
+                shexp_kquant_type=sg,
+                shexp_up_kquant_type=su,
+            )
+            want = np.stack(
+                [
+                    np.stack(
+                        [
+                            _glu_np(xf[i] @ ref[e].T, xf[i] @ up_ref[e].T, "silu")
+                            for e in inds_np[i]
+                        ]
+                        + [_glu_np(xf[i] @ gref[2].T, xf[i] @ uref[3].T, "silu")],
+                        0,
+                    )
+                    for i in range(t)
+                ],
+                0,
+            )
+            assert got.shape == (t, r + 1, N)
+            # round the reference as the kernel output is rounded: bf16
+            # keeps 8 significant bits, which alone is near REL_BOUND
+            want = np.array(mx.array(want).astype(dtype).astype(mx.float32))
+            assert _rel(got, want) < REL_BOUND, (dtype, t, r)
+
+
+def test_shexp_split_codec_rejects_what_has_no_kernel():
+    x = mx.zeros((1, K), dtype=mx.float16)
+    inds = mx.zeros((1, 2), dtype=mx.uint32)
+    wire, _ = _wire_and_ref("iq2_s")
+    gwire, _ = _wire_and_ref("iq4_xs", seed=13)
+    uwire, _ = _wire_and_ref("iq3_s", seed=17)
+    w, sg, su = mx.array(wire), mx.array(gwire[0]), mx.array(uwire[0])
+    assert not kq.shexp_glu_combo_has_kernel("q4_k", "iq4_xs", "iq3_s")
+    assert not kq.shexp_glu_combo_has_kernel("iq2_s", "iq4_xs", "iq4_nl")
+    with pytest.raises(ValueError, match="no fused kernel"):
+        kq.moe_glu_gather_shexp_kq(
+            x,
+            w,
+            w,
+            sg,
+            su,
+            "iq2_s",
+            inds,
+            act="gelu",
+            shexp_kquant_type="iq4_xs",
+            shexp_up_kquant_type="iq3_s",
+        )
+    assert not kq.shexp_mix_combo_has_kernel("q2_0", "iq4_xs")
+    h = mx.zeros((1, 3, K), dtype=mx.float16)
+    dwire, _ = _wire_and_ref("q2_0")
+    with pytest.raises(ValueError, match="no fused kernel"):
+        kq.gather_qmv_mix_kq(
+            h,
+            mx.array(dwire),
+            sg,
+            "q2_0",
+            inds,
+            mx.ones((1, 3)),
+            shexp_kquant_type="iq4_xs",
+        )
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("t,r", [(1, 2), (4, 3), (3, 10)])
+def test_mix_q2_0_experts_with_iq4_nl_shared_expert(dtype, t, r):
+    """gather_qmv_mix_kq for q2_0 expert stacks with an iq4_nl shared
+    expert, against the f32 reference."""
+    assert kq.shexp_mix_combo_has_kernel("q2_0", "iq4_nl")
+    wire, ref = _wire_and_ref("q2_0")
+    swire, sref = _wire_and_ref("iq4_nl", seed=13)
+    rng = np.random.default_rng(t * 31 + r)
+    s = r + 1
+    hs = mx.array((rng.standard_normal((t, s, K)) * 0.1).astype(np.float16))
+    hs = hs.astype(dtype)
+    hsf = np.array(hs.astype(mx.float32))
+    sc_np = rng.uniform(0.05, 0.9, size=(t, s)).astype(np.float32)
+    inds_np = rng.integers(0, E, size=(t, r)).astype(np.uint32)
+    got = kq.gather_qmv_mix_kq(
+        hs,
+        mx.array(wire),
+        mx.array(swire[1]),
+        "q2_0",
+        mx.array(inds_np),
+        mx.array(sc_np),
+        shexp_kquant_type="iq4_nl",
+    )
+    want = np.stack(
+        [
+            sum(sc_np[i, j] * (hsf[i, j] @ ref[inds_np[i, j]].T) for j in range(r))
+            + sc_np[i, r] * (hsf[i, r] @ sref[1].T)
+            for i in range(t)
+        ],
+        0,
+    )
+    want = np.array(mx.array(want).astype(dtype).astype(mx.float32))
+    assert _rel(got, want) < REL_BOUND
+
+
 def test_moe_glu():
     """pytest entry: runs the full codec-matrix sweep."""
     assert main([]) == 0
