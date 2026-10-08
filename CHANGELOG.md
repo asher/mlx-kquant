@@ -6,6 +6,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- `load_gguf(zero_copy=True)` copied a tensor of many GiB into memory when it
+  was the first tensor in its file. It now loads as a view like the rest.
+
 ## [0.4.16]
 
 ### Added

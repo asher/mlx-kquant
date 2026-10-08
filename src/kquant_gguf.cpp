@@ -209,12 +209,18 @@ std::optional<mx::array> try_zero_copy_array(
         }
       }
       // Else the widest power-of-two stride the window offset already carries.
+      // The search starts at the first one that is wide enough: a narrower
+      // stride never fits, and a tensor at the head of its file has no pages
+      // below it to walk back over.
       if (win_row_bytes == 0) {
         size_t p2 = isz;
-        while (p2 * 2 <= nbytes && row_fits(p2 * 2, win_off)) {
+        while (p2 < need) {
           p2 *= 2;
         }
         if (row_fits(p2, win_off)) {
+          while (p2 * 2 <= nbytes && row_fits(p2 * 2, win_off)) {
+            p2 *= 2;
+          }
           win_row_bytes = p2;
         }
       }
