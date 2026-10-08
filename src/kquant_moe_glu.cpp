@@ -1293,6 +1293,15 @@ bool shexp_mix_combo_has_kernel(
       (kquant_type == "q2_0" && shexp_type == "iq4_nl");
 }
 
+bool shexp_mix_slot_parallel(
+    const std::string& kquant_type,
+    const std::string& shexp_type) {
+  // The tuned q6_k and q8_0 kernels keep their fine tier.
+  const bool tuned = shexp_type == kquant_type &&
+      (kquant_type == "q6_k" || kquant_type == "q8_0");
+  return !tuned && shexp_mix_combo_has_kernel(kquant_type, shexp_type);
+}
+
 namespace {
 
 // Shared validation for one packed-mxfp4 expert stack (w, scales, bias).

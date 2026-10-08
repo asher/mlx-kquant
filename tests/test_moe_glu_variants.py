@@ -438,3 +438,47 @@ def test_mix_form_wide_grid_keeps_pair(tmp_path):
     for name in ("mix_ns", "mix", "mix_unit"):
         a, b = outs["loop"][name], outs["default"][name]
         assert np.array_equal(a, b), (name, np.abs(a - b).max())
+
+
+_SP_COVER_SNIPPET = r"""
+import numpy as np
+import mlx.core as mx
+import mlx_kquant as kq
+from mlx_kquant.codec_geometry import CODEC_GEOMETRY
+
+rng = np.random.default_rng(7)
+N, K, S = 64, 256, 3
+def wire(c, lead):
+    bpb, wpb = CODEC_GEOMETRY[c][2:]
+    size = (*lead, N, (K // wpb) * bpb)
+    return mx.array(rng.integers(0, 256, size=size, dtype=np.uint8))
+h = mx.zeros((1, S + 1, K), dtype=mx.float16)
+inds = mx.array(np.arange(S, dtype=np.uint32)[None])
+for c in kq.codecs():
+    for sc in dict.fromkeys((c, "q5_k", "q6_k", "q8_0", "iq4_nl")):
+        if not kq.shexp_mix_combo_has_kernel(c, sc):
+            continue
+        y = kq.gather_qmv_mix_kq(
+            h, wire(c, (4,)), wire(sc, ()), c, inds, mx.ones((1, S + 1)),
+            shexp_kquant_type=sc)
+        mx.eval(y)
+        print("PAIR", c, sc, int(kq.shexp_mix_slot_parallel(c, sc)))
+"""
+
+
+def test_shexp_mix_slot_parallel_matches_dispatch():
+    """Every codec combination shexp_mix_slot_parallel lists dispatches its
+    slot-parallel kernel at one row, and the others do not."""
+    r = _run_child(
+        [sys.executable, "-c", _SP_COVER_SNIPPET],
+        {"KQ_MOE_NX_LOG": "1"},
+        "slot-parallel cover",
+    )
+    pairs = [ln.split()[1:] for ln in r.stdout.splitlines() if ln.startswith("PAIR")]
+    assert len(pairs) > 40, r.stdout
+    assert ["q2_0", "iq4_nl", "1"] in pairs
+    assert ["q6_k", "q6_k", "0"] in pairs and ["q8_0", "q8_0", "0"] in pairs
+    for codec, scodec, listed in pairs:
+        stem = codec if scodec == codec else f"{codec}_sx_{scodec}"
+        name = f"kq_{stem}_gather_qmv_mix_sp_"
+        assert (name in r.stderr) == (listed == "1"), (codec, scodec, listed)

@@ -6,6 +6,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `shexp_mix_slot_parallel` reports whether `gather_qmv_mix_kq` runs a codec
+  combination on its slot-parallel kernel.
+
 ### Changed
 - `dsa_topk_indices` runs faster with the same indices in the same order,
   about 4x on a row of 65,536 scores. `KQ_DSA_TOPK_CHUNKS=1` keeps a row in

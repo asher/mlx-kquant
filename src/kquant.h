@@ -559,6 +559,12 @@ bool shexp_mix_combo_has_kernel(
     const std::string& kquant_type,
     const std::string& shexp_type);
 
+// True when gather_qmv_mix_kq runs that combination on its slot-parallel
+// kernel at decode and verify widths.
+bool shexp_mix_slot_parallel(
+    const std::string& kquant_type,
+    const std::string& shexp_type);
+
 // DeepSeek-V4-Flash sparse attention: sliding local window + gathered
 // indexer-selected pooled rows + per-head sinks in one dispatch (flash
 // online softmax, f32 accumulation). q [B, 64, qL, 512] (qL >= 1: decode,

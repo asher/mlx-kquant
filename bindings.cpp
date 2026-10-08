@@ -124,6 +124,14 @@ NB_MODULE(_ext, m) {
       "kquant_type with the shared expert's down tensor in shexp_type.");
 
   m.def(
+      "shexp_mix_slot_parallel",
+      &mlx_kquant::shexp_mix_slot_parallel,
+      "kquant_type"_a,
+      "shexp_type"_a,
+      "True when gather_qmv_mix_kq runs that codec combination on its "
+      "slot-parallel kernel at decode and verify widths.");
+
+  m.def(
       "codec_has_matmul",
       [](const std::string& kquant_type) {
         const auto* codec = mlx_kquant::codec_by_name(kquant_type);
