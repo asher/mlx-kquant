@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.16]
+
 ### Added
 - `q2_0` codec (ggml type 42, 64-weight blocks with one fp16 scale): GGUFs
   with `Q2_0` tensors load zero-copy and run on the CPU and Metal kernels.
