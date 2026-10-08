@@ -631,6 +631,169 @@ struct KqQ2_KNax {
   }
 };
 
+// The iq4 codebook as half pairs: entry (a | b << 4) holds
+// kvalues_iq4nl[a] in its low half and kvalues_iq4nl[b] in its high half,
+// so one gather decodes two 4-bit codes.
+static const constant uint kq_vnax_iq4_pairs[256] = {
+    0xD7F0D7F0u, 0xD7F0D680u, 0xD7F0D530u, 0xD7F0D410u, 0xD7F0D220u,
+    0xD7F0D060u, 0xD7F0CD80u, 0xD7F0C900u, 0xD7F03C00u, 0xD7F04A80u,
+    0xD7F04E40u, 0xD7F050C0u, 0xD7F052A0u, 0xD7F05450u, 0xD7F05590u,
+    0xD7F05710u, 0xD680D7F0u, 0xD680D680u, 0xD680D530u, 0xD680D410u,
+    0xD680D220u, 0xD680D060u, 0xD680CD80u, 0xD680C900u, 0xD6803C00u,
+    0xD6804A80u, 0xD6804E40u, 0xD68050C0u, 0xD68052A0u, 0xD6805450u,
+    0xD6805590u, 0xD6805710u, 0xD530D7F0u, 0xD530D680u, 0xD530D530u,
+    0xD530D410u, 0xD530D220u, 0xD530D060u, 0xD530CD80u, 0xD530C900u,
+    0xD5303C00u, 0xD5304A80u, 0xD5304E40u, 0xD53050C0u, 0xD53052A0u,
+    0xD5305450u, 0xD5305590u, 0xD5305710u, 0xD410D7F0u, 0xD410D680u,
+    0xD410D530u, 0xD410D410u, 0xD410D220u, 0xD410D060u, 0xD410CD80u,
+    0xD410C900u, 0xD4103C00u, 0xD4104A80u, 0xD4104E40u, 0xD41050C0u,
+    0xD41052A0u, 0xD4105450u, 0xD4105590u, 0xD4105710u, 0xD220D7F0u,
+    0xD220D680u, 0xD220D530u, 0xD220D410u, 0xD220D220u, 0xD220D060u,
+    0xD220CD80u, 0xD220C900u, 0xD2203C00u, 0xD2204A80u, 0xD2204E40u,
+    0xD22050C0u, 0xD22052A0u, 0xD2205450u, 0xD2205590u, 0xD2205710u,
+    0xD060D7F0u, 0xD060D680u, 0xD060D530u, 0xD060D410u, 0xD060D220u,
+    0xD060D060u, 0xD060CD80u, 0xD060C900u, 0xD0603C00u, 0xD0604A80u,
+    0xD0604E40u, 0xD06050C0u, 0xD06052A0u, 0xD0605450u, 0xD0605590u,
+    0xD0605710u, 0xCD80D7F0u, 0xCD80D680u, 0xCD80D530u, 0xCD80D410u,
+    0xCD80D220u, 0xCD80D060u, 0xCD80CD80u, 0xCD80C900u, 0xCD803C00u,
+    0xCD804A80u, 0xCD804E40u, 0xCD8050C0u, 0xCD8052A0u, 0xCD805450u,
+    0xCD805590u, 0xCD805710u, 0xC900D7F0u, 0xC900D680u, 0xC900D530u,
+    0xC900D410u, 0xC900D220u, 0xC900D060u, 0xC900CD80u, 0xC900C900u,
+    0xC9003C00u, 0xC9004A80u, 0xC9004E40u, 0xC90050C0u, 0xC90052A0u,
+    0xC9005450u, 0xC9005590u, 0xC9005710u, 0x3C00D7F0u, 0x3C00D680u,
+    0x3C00D530u, 0x3C00D410u, 0x3C00D220u, 0x3C00D060u, 0x3C00CD80u,
+    0x3C00C900u, 0x3C003C00u, 0x3C004A80u, 0x3C004E40u, 0x3C0050C0u,
+    0x3C0052A0u, 0x3C005450u, 0x3C005590u, 0x3C005710u, 0x4A80D7F0u,
+    0x4A80D680u, 0x4A80D530u, 0x4A80D410u, 0x4A80D220u, 0x4A80D060u,
+    0x4A80CD80u, 0x4A80C900u, 0x4A803C00u, 0x4A804A80u, 0x4A804E40u,
+    0x4A8050C0u, 0x4A8052A0u, 0x4A805450u, 0x4A805590u, 0x4A805710u,
+    0x4E40D7F0u, 0x4E40D680u, 0x4E40D530u, 0x4E40D410u, 0x4E40D220u,
+    0x4E40D060u, 0x4E40CD80u, 0x4E40C900u, 0x4E403C00u, 0x4E404A80u,
+    0x4E404E40u, 0x4E4050C0u, 0x4E4052A0u, 0x4E405450u, 0x4E405590u,
+    0x4E405710u, 0x50C0D7F0u, 0x50C0D680u, 0x50C0D530u, 0x50C0D410u,
+    0x50C0D220u, 0x50C0D060u, 0x50C0CD80u, 0x50C0C900u, 0x50C03C00u,
+    0x50C04A80u, 0x50C04E40u, 0x50C050C0u, 0x50C052A0u, 0x50C05450u,
+    0x50C05590u, 0x50C05710u, 0x52A0D7F0u, 0x52A0D680u, 0x52A0D530u,
+    0x52A0D410u, 0x52A0D220u, 0x52A0D060u, 0x52A0CD80u, 0x52A0C900u,
+    0x52A03C00u, 0x52A04A80u, 0x52A04E40u, 0x52A050C0u, 0x52A052A0u,
+    0x52A05450u, 0x52A05590u, 0x52A05710u, 0x5450D7F0u, 0x5450D680u,
+    0x5450D530u, 0x5450D410u, 0x5450D220u, 0x5450D060u, 0x5450CD80u,
+    0x5450C900u, 0x54503C00u, 0x54504A80u, 0x54504E40u, 0x545050C0u,
+    0x545052A0u, 0x54505450u, 0x54505590u, 0x54505710u, 0x5590D7F0u,
+    0x5590D680u, 0x5590D530u, 0x5590D410u, 0x5590D220u, 0x5590D060u,
+    0x5590CD80u, 0x5590C900u, 0x55903C00u, 0x55904A80u, 0x55904E40u,
+    0x559050C0u, 0x559052A0u, 0x55905450u, 0x55905590u, 0x55905710u,
+    0x5710D7F0u, 0x5710D680u, 0x5710D530u, 0x5710D410u, 0x5710D220u,
+    0x5710D060u, 0x5710CD80u, 0x5710C900u, 0x57103C00u, 0x57104A80u,
+    0x57104E40u, 0x571050C0u, 0x571052A0u, 0x57105450u, 0x57105590u,
+    0x57105710u,
+};
+
+// Pair of iq4 codes at bytes 0 and 2 of src, as codebook value times dl.
+METAL_FUNC half2 kq_vnax_iq4pair(uint src, half dl) {
+  return as_type<half2>(
+             kq_vnax_iq4_pairs[(src & 0xFu) | ((src >> 12) & 0xF0u)]) *
+      dl;
+}
+
+// IQ4_XS: the unit is one superblock (256 weights, 136 bytes), and
+// lane-quad q owns sub-blocks 2q and 2q + 1, the 32 qs bytes at 32q, read
+// as four 8-byte loads beside the 8-byte header. A sub-block's 16 bytes
+// hold weights 0 to 15 in their low nibbles and 16 to 31 in their high
+// nibbles. Step s takes sub-block 2q + (s >> 3), word s % 4 of it, low
+// nibbles for s % 8 < 4. A sub-block's scale d * (ls - 32) is rounded to
+// half before it meets the codebook value, one rounding more than the
+// other routes. Rows start 8-byte aligned from a weight base the host
+// checks.
+struct KqIq4XsNax {
+  static constant constexpr int group = KQ_IQ4_XS_SUPERBLOCK;
+  static constant constexpr int block_k = KQ_IQ4_XS_SUPERBLOCK;
+  static constant constexpr int block_bytes = KQ_IQ4_XS_BLOCK_BYTES;
+  static constant constexpr int ub = 1;
+  static constant constexpr bool x_ahead = false;
+  struct Words {
+    uint w[8];
+    half2 dl;
+  };
+  static METAL_FUNC Words load(const device uint8_t* row, int u, short q) {
+    const device uint8_t* bp = row + u * block_bytes;
+    Words o;
+    const uint2 h = *(const device uint2*)bp;
+    const device uint2* qp =
+        (const device uint2*)(bp + KQ_IQ4_XS_QS_OFFSET + 32 * q);
+#pragma unroll
+    for (short i = 0; i < 4; ++i) {
+      const uint2 v = qp[i];
+      o.w[2 * i] = v.x;
+      o.w[2 * i + 1] = v.y;
+    }
+    const uint sl = h.y >> (8 * q);
+    const uint sh = h.x >> (16 + 4 * q);
+    const int ls0 = int((sl & 0xFu) | ((sh & 3u) << 4)) - 32;
+    const int ls1 = int(((sl >> 4) & 0xFu) | (((sh >> 2) & 3u) << 4)) - 32;
+    o.dl = half2(half(ls0), half(ls1)) * as_type<half>(ushort(h.x & 0xFFFFu));
+    return o;
+  }
+  static METAL_FUNC half2 pair(thread const Words& o, short f) {
+    const short s = f >> 1;
+    const short b = s >> 3;
+    const uint w = o.w[4 * b + (s & 3)];
+    const uint src = (((s >> 2) & 1) ? (w >> 4) : w) >> (8 * (f & 1));
+    return kq_vnax_iq4pair(src, o.dl[b]);
+  }
+  template <typename T>
+  static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + 64 * q + 4 * s);
+    return vec<T, 4>(p[0], p[2], p[1], p[3]);
+  }
+};
+
+// IQ4_NL: the q4_0 wire with the iq4 codebook in place of code - 8. The
+// unit is eight wire blocks (256 weights, 144 bytes), read as in
+// KqQ4_0SbNax.
+struct KqIq4NlNax {
+  static constant constexpr int group = KQ_IQ4_NL_GROUP;
+  static constant constexpr int block_k = 8 * KQ_IQ4_NL_GROUP;
+  static constant constexpr int block_bytes = 8 * KQ_IQ4_NL_BLOCK_BYTES;
+  static constant constexpr int ub = 1;
+  static constant constexpr bool x_ahead = false;
+  struct Words {
+    uint w[8];
+    half2 d;
+  };
+  static METAL_FUNC Words load(const device uint8_t* row, int u, short q) {
+    const device uint* wp = (const device uint*)(row + u * block_bytes +
+                                                 2 * KQ_IQ4_NL_BLOCK_BYTES * q);
+    uint t[9];
+#pragma unroll
+    for (short i = 0; i < 9; ++i) {
+      t[i] = wp[i];
+    }
+    Words o;
+    o.d = half2(
+        as_type<half>(ushort(t[0] & 0xFFFFu)),
+        as_type<half>(ushort(t[4] >> 16)));
+#pragma unroll
+    for (short i = 0; i < 4; ++i) {
+      o.w[i] = (t[i] >> 16) | (t[i + 1] << 16);
+      o.w[4 + i] = t[5 + i];
+    }
+    return o;
+  }
+  static METAL_FUNC half2 pair(thread const Words& o, short f) {
+    const short s = f >> 1;
+    const short b = s >> 3;
+    const uint w = o.w[4 * b + (s & 3)];
+    const uint src = (((s >> 2) & 1) ? (w >> 4) : w) >> (8 * (f & 1));
+    return kq_vnax_iq4pair(src, o.d[b]);
+  }
+  template <typename T>
+  static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + 64 * q + 4 * s);
+    return vec<T, 4>(p[0], p[2], p[1], p[3]);
+  }
+};
+
 template <typename T, typename Codec>
 METAL_FUNC void kq_verify_nax_impl(
     const device uint8_t* w,
@@ -786,6 +949,8 @@ KQ_DEFINE_VERIFY_NAX_KERNEL(q4_0, KqQ4_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_0_sb, KqQ4_0SbNax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q8_0, KqQ8_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_k, KqQ4_KNax)
+KQ_DEFINE_VERIFY_NAX_KERNEL(iq4_xs, KqIq4XsNax)
+KQ_DEFINE_VERIFY_NAX_KERNEL(iq4_nl, KqIq4NlNax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q5_k, KqQ5_KNax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q6_k, KqQ6_KNax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q3_k, KqQ3_KNax)

@@ -13,6 +13,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `dsa_indexer_score_decode` with 4 heads scores 2 to 4 query rows in about
   the time of one, with the same scores. `KQ_DSA_SCORE_PAIR=0` keeps the
   previous kernel.
+- `quantized_matmul` on `iq4_xs` and `iq4_nl` weights runs up to 1.4x faster
+  at 3 to 8 activation rows on M5 GPUs. `KQ_VERIFY_NAX=0` keeps the previous
+  routes.
 
 ### Fixed
 - `load_gguf(zero_copy=True)` copied a tensor of many GiB into memory when it

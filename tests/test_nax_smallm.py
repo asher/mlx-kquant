@@ -416,6 +416,8 @@ VNAX_ENTRY = {
 }
 VNAX_WIDE_N = {"q2_k": 4096}
 VNAX_CODECS = list(VNAX_ENTRY)
+# The iq4 entry moves with N and K (test_verify_nax_iq4_entry).
+VNAX_IQ4 = ["iq4_xs", "iq4_nl"]
 
 
 def _vnax_entry(codec, n):
@@ -589,7 +591,7 @@ def test_verify_mma_outlier_channel(codec, dtype, monkeypatch):
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("n_out", [1024, 1000, 40, 20])
 @pytest.mark.parametrize(
-    "codec, sb", [(c, None) for c in VNAX_CODECS] + [("q4_0", "0")]
+    "codec, sb", [(c, None) for c in VNAX_CODECS + VNAX_IQ4] + [("q4_0", "0")]
 )
 def test_verify_nax_band(codec, sb, n_out, dtype, monkeypatch):
     w, s, ref_w = _setup(codec, n_out)
@@ -612,13 +614,15 @@ VNAX_SPLIT_K = {
     c: [4352, 3840, 4096] if c in VNAX_SB else [2176, 1920, 4096] for c in VNAX_CODECS
 }
 VNAX_SPLIT_K["q4_0"] += [3840, 4352]
+for _c in VNAX_IQ4:
+    VNAX_SPLIT_K[_c] = [4352, 3840, 4096]
 
 
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("splits", ["", "2", "3", "4", "5", "8"])
 @pytest.mark.parametrize(
-    "codec, k", [(c, k) for c in VNAX_CODECS for k in VNAX_SPLIT_K[c]]
+    "codec, k", [(c, k) for c in VNAX_CODECS + VNAX_IQ4 for k in VNAX_SPLIT_K[c]]
 )
 def test_verify_nax_splits(codec, k, splits, dtype, monkeypatch):
     w, s, ref_w = _verify_mma_setup(codec, 1000, k=k)
@@ -629,12 +633,15 @@ def test_verify_nax_splits(codec, k, splits, dtype, monkeypatch):
 
 
 # A K that is not a whole number of the kernel's steps declines the route:
-# a q4_0 K with an odd count of 32-wide blocks (64-wide steps), and a q8_0
-# K that is not a multiple of 128, with K % 64 of 0 and 32. The default
-# routing then runs per-row qmv at M 5 and verify_mma at M 8 for q4_0, and
-# NAX split-K from M 6 for q8_0.
+# a q4_0 K with an odd count of 32-wide blocks (64-wide steps), a q8_0 K
+# that is not a multiple of 128, with K % 64 of 0 and 32, and an iq4_nl K
+# that is not a multiple of 256. The default routing then runs per-row qmv
+# at M 5 and verify_mma at M 8 for q4_0, and NAX split-K from M 6 for
+# q8_0.
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
-@pytest.mark.parametrize("codec, k", [("q4_0", 1056), ("q8_0", 1088), ("q8_0", 1056)])
+@pytest.mark.parametrize(
+    "codec, k", [("q4_0", 1056), ("q8_0", 1088), ("q8_0", 1056), ("iq4_nl", 1056)]
+)
 def test_verify_nax_k_declines(codec, k, monkeypatch):
     w, s, ref_w = _verify_mma_setup(codec, 1000, k=k)
     monkeypatch.setenv("KQ_QMM_ROUTE", "verify_nax")
@@ -971,9 +978,116 @@ def test_verify_nax_q4_0_random_wire(n_out, k, splits, dtype, monkeypatch):
     _sweep("q4_0", w, s, ref_w, n_out, ms=range(1, 9), dtype=dtype, k=k)
 
 
+# Random iq4_xs and iq4_nl wire bytes cover every code and every 6-bit
+# sub-block scale, with d of both signs, against gguf-py's dequant. The
+# second d range is half-subnormal. The "3" count starts splits inside the
+# K walk at K 3840 and 5376.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("splits", ["", "3"])
+@pytest.mark.parametrize("d_lo, d_hi", [(0.002, 0.01), (1e-6, 6e-5)])
+@pytest.mark.parametrize("n_out, k", [(136, 1024), (1000, 3840), (40, 5376)])
+@pytest.mark.parametrize("codec", VNAX_IQ4)
+def test_verify_nax_iq4_random_wire(
+    codec, n_out, k, d_lo, d_hi, splits, dtype, monkeypatch
+):
+    from kqref import quants
+
+    gtype, wpb, bpb, _, _ = CODECS[codec]
+    rng = np.random.default_rng(5)
+    wire = synth_wire(rng, codec, bpb, n_out * (k // wpb))
+    d = rng.uniform(d_lo, d_hi, wire.shape[0])
+    d = d * rng.choice([-1, 1], wire.shape[0])
+    wire[:, 0:2] = d.astype(np.float16).view(np.uint8).reshape(-1, 2)
+    wire = wire.reshape(n_out, (k // wpb) * bpb)
+    ref = quants.dequantize(np.ascontiguousarray(wire), gtype)
+    assert np.isfinite(ref).all()
+    ref_w = mx.array(ref.astype(np.float32)).T
+    w = mx.array(wire)
+    s = mx.zeros((1,), dtype=mx.uint8)
+    mx.eval(w, s, ref_w)
+    mx.random.seed(11)
+    if splits:
+        monkeypatch.setenv("KQ_VERIFY_NAX_SPLITS", splits)
+    monkeypatch.setenv("KQ_QMM_ROUTE", "verify_nax")
+    monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
+    _sweep(codec, w, s, ref_w, n_out, ms=range(1, 9), dtype=dtype, k=k)
+
+
+# The iq4_nl kernel reads 4-byte words, so a weight view that starts 2 mod
+# 4 declines the route and the default routing serves it. A base 4 bytes
+# in runs the route with the bits of the aligned weight.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+@pytest.mark.parametrize("offset", [2, 4])
+def test_verify_nax_iq4_nl_weight_alignment(offset, monkeypatch):
+    k = 4096
+    w, s, ref_w = _verify_mma_setup("iq4_nl", 2048, k=k)
+    pad = mx.zeros((offset,), dtype=mx.uint8)
+    wv = mx.concatenate([pad, w.reshape(-1)])[offset:].reshape(w.shape)
+    mx.eval(wv)
+    monkeypatch.setenv("KQ_QMM_ROUTE", "verify_nax")
+    monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
+    x = (mx.random.normal((8, k)) * 0.5).astype(mx.bfloat16)
+    if offset % 4:
+        with pytest.raises(RuntimeError, match="does not serve"):
+            mx.eval(kq.quantized_matmul(x, wv, s, "iq4_nl", transpose=True))
+    else:
+        y_nax = kq.quantized_matmul(x, wv, s, "iq4_nl", transpose=True)
+        y_ref = kq.quantized_matmul(x, w, s, "iq4_nl", transpose=True)
+        mx.eval(y_nax, y_ref)
+        assert _bits_equal(y_nax, y_ref)
+    monkeypatch.delenv("KQ_QMM_ROUTE")
+    monkeypatch.delenv("KQ_QMM_ROUTE_STRICT")
+    _sweep("iq4_nl", wv, s, ref_w, 2048, ms=[3, 4, 8], k=k)
+    y_def = _run_route(monkeypatch, x, wv, s, "iq4_nl")
+    y_nax = _run_route(monkeypatch, x, w, s, "iq4_nl", "verify_nax")
+    assert _bits_equal(y_def, y_nax) == (offset % 4 == 0)
+
+
+# The iq4 entry by shape (kq_verify_nax_min_m): M 3 at K 6144 and wider
+# and on a vocab head, M 4 at K 4096 to 5120 and at N 10240 and wider on a
+# narrower K, M 5 on the other shapes from N 2048, none under N 2048. On
+# float16 an entry under M 5 sits one row higher, except on a vocab head.
+# The default output carries the bits of verify_nax from the entry through
+# M 8 and other bits below it.
+VNAX_IQ4_ENTRY = [
+    (2560, 6144, 3),
+    (2048, 4096, 4),
+    (2048, 5120, 4),
+    (10240, 2560, 4),
+    (10239, 2560, 5),
+    (2048, 3840, 5),
+    (2047, 6144, 0),
+    (100000, 256, 3),
+    (99999, 256, 4),
+]
+
+
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("n_out, k, entry", VNAX_IQ4_ENTRY)
+@pytest.mark.parametrize("codec", VNAX_IQ4)
+def test_verify_nax_iq4_entry(codec, n_out, k, entry, dtype, monkeypatch):
+    _clear_levers(monkeypatch)
+    if dtype == mx.float16 and 0 < entry < 5 and n_out < 100000:
+        entry += 1
+    gtype, wpb, bpb, _, _ = CODECS[codec]
+    rng = np.random.default_rng(3)
+    seed = synth_wire(rng, codec, bpb, 64 * (k // wpb)).reshape(64, -1)
+    w = mx.contiguous(mx.tile(mx.array(seed), (n_out // 64 + 1, 1))[:n_out])
+    s = mx.zeros((1,), dtype=mx.uint8)
+    mx.eval(w)
+    for m in (2, 3, 4, 5, 8):
+        x = (mx.random.normal((m, k)) * 0.5).astype(dtype)
+        y_def = _run_route(monkeypatch, x, w, s, codec)
+        y_nax = _run_route(monkeypatch, x, w, s, codec, "verify_nax")
+        tag = f"{codec} N{n_out} K{k} M{m} entry {entry}"
+        assert _bits_equal(y_def, y_nax) == (0 < entry <= m), tag
+
+
 # KQ_DISABLE_NAX turns the route off with the other NAX routes.
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
-@pytest.mark.parametrize("codec", VNAX_CODECS)
+@pytest.mark.parametrize("codec", VNAX_CODECS + VNAX_IQ4)
 def test_verify_nax_disable_nax(codec, monkeypatch):
     w, s, ref_w = _setup(codec, 1000)
     monkeypatch.setenv("KQ_DISABLE_NAX", "1")
