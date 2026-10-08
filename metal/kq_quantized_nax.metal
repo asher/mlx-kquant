@@ -159,6 +159,7 @@ instantiate_kquant_nax_splitk(iq1_s, 256, 1)
 instantiate_kquant_nax_splitk(iq1_m, 256, 1)
 instantiate_kquant_nax_splitk(stq1_0, 256, 1)
 instantiate_kquant_nax_splitk(pq2_0, 128, 2)
+instantiate_kquant_nax_splitk(q2_0, 64, 2)
 instantiate_kquant_nax_splitk(ptq1_0, 128, 1)
 
 // Double-buffered BM=64 qmm_t, name-suffixed _db: dispatched by the host
@@ -233,6 +234,7 @@ instantiate_kquant_nax_bm128(iq1_s, 256, 1)
 instantiate_kquant_nax_bm128(iq1_m, 256, 1)
 instantiate_kquant_nax_bm128(stq1_0, 256, 1)
 instantiate_kquant_nax_bm128(pq2_0, 128, 2)
+instantiate_kquant_nax_bm128(q2_0, 64, 2)
 instantiate_kquant_nax_bm128(ptq1_0, 128, 1)
 
 // Small-BM gather_qmm_rhs tile for the few-rows-per-expert prefill regime
@@ -271,6 +273,7 @@ instantiate_kquant_nax_gather_rhs_bm32(iq1_s, 256, 1)
 instantiate_kquant_nax_gather_rhs_bm32(iq1_m, 256, 1)
 instantiate_kquant_nax_gather_rhs_bm32(stq1_0, 256, 1)
 instantiate_kquant_nax_gather_rhs_bm32(pq2_0, 128, 2)
+instantiate_kquant_nax_gather_rhs_bm32(q2_0, 64, 2)
 instantiate_kquant_nax_gather_rhs_bm32(ptq1_0, 128, 1)
 
 instantiate_kquant_nax_smallbm(q6_k, 256, 6)
@@ -294,6 +297,7 @@ instantiate_kquant_nax_smallbm(iq1_s, 256, 1)
 instantiate_kquant_nax_smallbm(iq1_m, 256, 1)
 instantiate_kquant_nax_smallbm(stq1_0, 256, 1)
 instantiate_kquant_nax_smallbm(pq2_0, 128, 2)
+instantiate_kquant_nax_smallbm(q2_0, 64, 2)
 instantiate_kquant_nax_smallbm(ptq1_0, 128, 1)
 
 instantiate_kquant_nax_codec(q8_0, 32, 8)
@@ -317,6 +321,7 @@ instantiate_kquant_nax_codec(iq1_s, 256, 1)
 instantiate_kquant_nax_codec(iq1_m, 256, 1)
 instantiate_kquant_nax_codec(stq1_0, 256, 1)
 instantiate_kquant_nax_codec(pq2_0, 128, 2)
+instantiate_kquant_nax_codec(q2_0, 64, 2)
 instantiate_kquant_nax_codec(ptq1_0, 128, 1)
 
 // Expert-major sorted gather GEMM (gather_qmm_seg on NAX): BM=64 matches
@@ -352,6 +357,7 @@ instantiate_kquant_nax_gather_seg_codec(iq1_s, 256, 1)
 instantiate_kquant_nax_gather_seg_codec(iq1_m, 256, 1)
 instantiate_kquant_nax_gather_seg_codec(stq1_0, 256, 1)
 instantiate_kquant_nax_gather_seg_codec(pq2_0, 128, 2)
+instantiate_kquant_nax_gather_seg_codec(q2_0, 64, 2)
 instantiate_kquant_nax_gather_seg_codec(ptq1_0, 128, 1)
 
 // Register-fed NAX verify kernels (kq_verify_nax.h), M <= 8, half and
@@ -362,7 +368,9 @@ instantiate_kquant_nax_gather_seg_codec(ptq1_0, 128, 1)
       kq_ ## codec ## _verify_nax,                                    \
       type, gs, bits)
 instantiate_kquant_verify_nax(bfloat16_t, 128, 2, pq2_0)
+instantiate_kquant_verify_nax(bfloat16_t, 64, 2, q2_0)
 instantiate_kquant_verify_nax(float16_t, 128, 2, pq2_0)
+instantiate_kquant_verify_nax(float16_t, 64, 2, q2_0)
 instantiate_kquant_verify_nax(bfloat16_t, 32, 4, q4_0)
 instantiate_kquant_verify_nax(float16_t, 32, 4, q4_0)
 instantiate_kquant_verify_nax(bfloat16_t, 32, 4, q4_0_sb)

@@ -188,6 +188,31 @@ def test_dsa_topk_indices_deterministic_ties(dtype, bucketed):
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("K", [513, 1024, 70001, 262144])
+def test_dsa_topk_indices_long_row_order(dtype, K):
+    """Rows of any length emit the same array: keys above the threshold in
+    index order, then threshold ties lowest-index-first. K covers a row the
+    threads do not divide evenly and threads with an empty range."""
+    rng = np.random.default_rng(K)
+    topk = 512
+    # + 0.0 drops the negative zeros: the kernel orders -0.0 below 0.0
+    raw = np.round(rng.standard_normal((1, 1, 2, K)) * 16) / 16 + 0.0
+    raw[0, 0, 1, -3:] = 50.0  # winners in the last thread's range
+    scores = mx.array(raw).astype(dtype)
+    got = kq.dsa_topk_indices(scores, topk, bucketed=True)
+    mx.eval(got)
+    vals = np.array(scores.astype(mx.float32))
+    for l in range(2):
+        v = vals[0, 0, l]
+        thr = np.partition(v, -topk)[-topk]
+        above = np.flatnonzero(v > thr)
+        ties = np.flatnonzero(v == thr)[: topk - len(above)]
+        np.testing.assert_array_equal(
+            np.array(got)[0, 0, l], np.concatenate([above, ties]).astype(np.uint32)
+        )
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_dsa_topk_indices_causal_prefix(dtype):
     rng = np.random.default_rng(13)
     B, L, K, topk = 1, 640, 640, 512

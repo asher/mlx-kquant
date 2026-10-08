@@ -52,6 +52,7 @@ CODECS = [
     "iq1_m",
     "stq1_0",
     "pq2_0",
+    "q2_0",
     "ptq1_0",
     "mxfp4",
     "nvfp4",

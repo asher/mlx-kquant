@@ -88,6 +88,48 @@ struct KqPq2_0Nax {
   }
 };
 
+// Q2_0: lane-quad q owns the one 16-code word at qs bytes 4q..4q+3. Pair f
+// is code f of the word in each half (KqQ2_0Mma). Two 64-weight blocks per
+// iteration.
+struct KqQ2_0Nax {
+  static constant constexpr int group = KQ_Q2_0_SUPERBLOCK;
+  static constant constexpr int block_k = KQ_Q2_0_SUPERBLOCK;
+  static constant constexpr int block_bytes = KQ_Q2_0_BLOCK_BYTES;
+  static constant constexpr int ub = 2;
+  static constant constexpr bool x_ahead = true;
+  struct Words {
+    uint w;
+    half d;
+  };
+  static METAL_FUNC Words load(const device uint8_t* row, int u, short q) {
+    const device uint8_t* bp = row + u * block_bytes;
+    Words o;
+    o.d = *(const device half*)bp;
+    const packed_ushort2 v =
+        *(const device packed_ushort2*)(bp + KQ_PQ2_0_QS_OFFSET + 4 * q);
+    o.w = uint(v.x) | (uint(v.y) << 16);
+    return o;
+  }
+  static METAL_FUNC half2 pair(thread const Words& o, short f) {
+    const short jj = f < 5 ? f : f - 5;
+    const uint src = f < 5 ? o.w : (o.w >> 10);
+    const uint mask = 0x00030003u << (2 * jj);
+    const half scale = half(1.0f / float(1 << (2 * jj)));
+    const half off = -half(1024.0f / float(1 << (2 * jj))) - 1.0h;
+    return fma(as_type<half2>((src & mask) | 0x64006400u),
+               half2(scale),
+               half2(off)) *
+        o.d;
+  }
+  template <typename T>
+  static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
+    const int o = 16 * q + 2 * s;
+    const vec<T, 2> p0 = *(const device vec<T, 2>*)(xb + o);
+    const vec<T, 2> p1 = *(const device vec<T, 2>*)(xb + o + 8);
+    return vec<T, 4>(p0.x, p1.x, p0.y, p1.y);
+  }
+};
+
 // Q4_0: lane-quad q owns qs bytes 4q..4q+3. Pairs (n0, n2), (n1, n3),
 // (h0, h2), (h1, h3) of its low and high nibbles (KqQ4_0Mma), as
 // 1024 + code in the half mantissa, minus 1032, times d. Two 32-weight
@@ -739,6 +781,7 @@ METAL_FUNC void kq_verify_nax_impl(
   }
 
 KQ_DEFINE_VERIFY_NAX_KERNEL(pq2_0, KqPq2_0Nax)
+KQ_DEFINE_VERIFY_NAX_KERNEL(q2_0, KqQ2_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_0, KqQ4_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_0_sb, KqQ4_0SbNax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q8_0, KqQ8_0Nax)

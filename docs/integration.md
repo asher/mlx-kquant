@@ -42,8 +42,8 @@ any start.
 
 ## Codecs
 
-Twenty-four codecs (the ten K-quant/legacy encodable on either stream, the nine IQ plus
-`stq1_0`, `pq2_0` and `ptq1_0` CPU-encodable, and the two fp wire codecs decode-only), all defined in
+Twenty-five codecs (the ten K-quant/legacy encodable on either stream, the nine IQ plus
+`stq1_0`, `pq2_0`, `ptq1_0` and `q2_0` CPU-encodable, and the two fp wire codecs decode-only), all defined in
 `mlx_kquant.codec_geometry.CODEC_GEOMETRY` as
 `(group_size, bits, bytes_per_block, weights_per_block)`:
 
@@ -71,19 +71,21 @@ Twenty-four codecs (the ten K-quant/legacy encodable on either stream, the nine 
 | `stq1_0` | 1 | 256 | 42 | structured ternary codebook, QAT (CPU encode) |
 | `pq2_0` | 2 | 128 | 34 | Prism four-level 2-bit, fp16 scale per block, ggml type 142 (CPU encode) |
 | `ptq1_0` | 1 | 128 | 28 | Prism base-3 packed ternary, fp16 scale per block, ggml type 143 (CPU encode) |
+| `q2_0` | 2 | 64 | 18 | four-level 2-bit, fp16 scale per block, ggml type 42 (CPU encode) |
 | `mxfp4` | 4 | 32 | 17 | micro-scaling fp4, E8M0 block scale (decode-only) |
 | `nvfp4` | 4 | 64 | 36 | micro-scaling fp4, UE4M3 sub-scales (decode-only) |
 
 `weights_per_block` (`wpb`) is the granularity that matters for layout: K-quants pack 256 weights per
-superblock, the block codecs 32. The duck-typed `group_size` attribute on a `KQuant*` module
+superblock, the block codecs 32, `q2_0` 64 and the Prism codecs 128. The duck-typed `group_size` attribute on a `KQuant*` module
 equals `wpb`. The ten K-quant/legacy codecs encode on CPU or Metal; the nine IQ codecs, `stq1_0`,
-`pq2_0` and `ptq1_0` encode CPU-only (the IQ encoders are importance-weighted and ggml's
+`pq2_0`, `ptq1_0` and `q2_0` encode CPU-only (the IQ encoders are importance-weighted and ggml's
 imatrix-required trio rejects a missing **imatrix**; the ternary and Prism codecs ignore it, since
 QAT fixes their rounding); `mxfp4`/`nvfp4` have no encoder (GGUFs ship those tensors
 pre-quantized). The K-quant **imatrix** steers only the five superblock K-quants (`wpb == 256`) and
 is a no-op on the `wpb == 32` legacy codecs. The two Prism codecs are private to the PrismML
 llama.cpp fork (its Ternary Bonsai GGUFs), so their ggml type ids may change; `pq2_0` decodes code
-3 as +2 although the reference encoder never emits it.
+3 as +2 although the reference encoder never emits it. `q2_0` is the `pq2_0` code layout on a
+64-weight block, runs the same kernels and takes the same routes.
 
 Presets (`mlx_kquant.recipes`) are **purely codec-name-based** - there is no affine "4-bit / 8-bit"
 abstraction that resolves to a codec. A preset (`q4_k_s/m/xl/moe`, `q5_k_s/m/xl/moe`, `q3_k_m`,

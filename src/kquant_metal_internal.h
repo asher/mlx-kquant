@@ -61,7 +61,8 @@ inline int kquant_qmv_bn(const std::string& kquant_type) {
       kquant_type == "iq2_xxs" || kquant_type == "iq2_xs" ||
       kquant_type == "iq2_s" || kquant_type == "iq1_s" ||
       kquant_type == "iq1_m" || kquant_type == "stq1_0" ||
-      kquant_type == "pq2_0" || kquant_type == "ptq1_0") {
+      kquant_type == "pq2_0" || kquant_type == "q2_0" ||
+      kquant_type == "ptq1_0") {
     return 4;
   }
   return 8;
@@ -119,7 +120,8 @@ inline bool codec_has_qmv_fine(const std::string& kquant_type) {
       kquant_type == "iq2_xxs" || kquant_type == "iq2_xs" ||
       kquant_type == "iq2_s" || kquant_type == "iq1_s" ||
       kquant_type == "iq1_m" || kquant_type == "stq1_0" ||
-      kquant_type == "pq2_0" || kquant_type == "ptq1_0";
+      kquant_type == "pq2_0" || kquant_type == "q2_0" ||
+      kquant_type == "ptq1_0";
 }
 
 // Default fine-tiling ceiling per codec: the qmv dispatch uses the fine
@@ -185,7 +187,8 @@ inline bool codec_has_verify_qmv(const std::string& kquant_type) {
       kquant_type == "q4_k" || kquant_type == "q5_k" || kquant_type == "q5_1" ||
       kquant_type == "q3_k" || kquant_type == "q2_k" || kquant_type == "q4_0" ||
       kquant_type == "q4_1" || kquant_type == "q5_0" ||
-      kquant_type == "pq2_0" || kquant_type == "ptq1_0";
+      kquant_type == "pq2_0" || kquant_type == "q2_0" ||
+      kquant_type == "ptq1_0";
 }
 
 // Largest activation-row count (M) the verify_qmv kernels are instantiated for;
@@ -198,8 +201,8 @@ inline int verify_qmv_max_rows() {
 // the output rows one of its threadgroups covers (8 simdgroups of 8 rows
 // per row tile); 0 for codecs without the kernel. M <= 8 only.
 inline int codec_verify_mma_rows(const std::string& kquant_type) {
-  if (kquant_type == "pq2_0" || kquant_type == "q4_0" ||
-      kquant_type == "q8_0") {
+  if (kquant_type == "pq2_0" || kquant_type == "q2_0" ||
+      kquant_type == "q4_0" || kquant_type == "q8_0") {
     return 128;
   }
   if (kquant_type == "ptq1_0") {
@@ -214,7 +217,8 @@ inline int codec_verify_mma_rows(const std::string& kquant_type) {
 // lists its two-block kernel; the host runs the eight-block kernel (256)
 // where K is a multiple of 256 (kq_verify_nax_call_kstep).
 inline int codec_verify_nax_kstep(const std::string& kquant_type) {
-  if (kquant_type == "pq2_0" || kquant_type == "q8_0") {
+  if (kquant_type == "pq2_0" || kquant_type == "q2_0" ||
+      kquant_type == "q8_0") {
     return 128;
   }
   if (kquant_type == "q4_0") {

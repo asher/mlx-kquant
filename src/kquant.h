@@ -545,6 +545,20 @@ mx::array moe_glu_gather_kq(
 // True when the codec has the fused MoE GLU/gather kernel family above.
 bool codec_has_moe_glu(const std::string& kquant_type);
 
+// True when moe_glu_gather_shexp_kq has a kernel for expert stacks in
+// kquant_type with the shared expert's gate in shexp_gate_type and its up
+// in shexp_up_type ("silu" only when the three are not one upcast pair).
+bool shexp_glu_combo_has_kernel(
+    const std::string& kquant_type,
+    const std::string& shexp_gate_type,
+    const std::string& shexp_up_type);
+
+// True when gather_qmv_mix_kq has a kernel for expert stacks in kquant_type
+// with the shared expert's down tensor in shexp_type.
+bool shexp_mix_combo_has_kernel(
+    const std::string& kquant_type,
+    const std::string& shexp_type);
+
 // DeepSeek-V4-Flash sparse attention: sliding local window + gathered
 // indexer-selected pooled rows + per-head sinks in one dispatch (flash
 // online softmax, f32 accumulation). q [B, 64, qL, 512] (qL >= 1: decode,
@@ -780,6 +794,7 @@ mx::array moe_glu_gather_shexp_kq(
     const std::string& act = "silu",
     const std::string& shexp_kquant_type = "",
     float limit = 0.0f,
+    const std::string& shexp_up_kquant_type = "",
     mx::StreamOrDevice s = {});
 
 // Down projection with the routing mix folded in: x [T, S, K] (slot S-1 =
@@ -2130,11 +2145,14 @@ class KQuantMoEGLUShexpKQ : public mx::Primitive {
       std::string kquant_type,
       std::string act,
       std::string shexp_type,
-      float limit = 0.0f)
+      float limit = 0.0f,
+      std::string shexp_up_type = "")
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         act_(std::move(act)),
         shexp_type_(std::move(shexp_type)),
+        shexp_up_type_(
+            shexp_up_type.empty() ? shexp_type_ : std::move(shexp_up_type)),
         limit_(limit) {}
 
   void eval_cpu(
@@ -2155,7 +2173,8 @@ class KQuantMoEGLUShexpKQ : public mx::Primitive {
  private:
   std::string kquant_type_;
   std::string act_;
-  std::string shexp_type_;
+  std::string shexp_type_; // the shared expert's gate codec
+  std::string shexp_up_type_;
   float limit_;
 };
 

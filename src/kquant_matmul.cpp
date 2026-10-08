@@ -131,7 +131,8 @@ static KqSmallBmPolicy kq_smallbm_policy(const std::string& t) {
   if (t == "q5_0") {
     return {true, 7, 8192, 961};
   }
-  if (t == "iq1_s" || t == "stq1_0" || t == "pq2_0" || t == "ptq1_0") {
+  if (t == "iq1_s" || t == "stq1_0" || t == "pq2_0" || t == "q2_0" ||
+      t == "ptq1_0") {
     // stq1_0 and the Prism codecs start on the iq1_s policy; re-tune with
     // bench_qmm_bm128_ab.
     return {true, 0, 0, 449};
@@ -203,8 +204,8 @@ static bool kq_splitk_codec(const std::string& t) {
       t == "q2_k" || t == "q8_0" || t == "iq4_xs" || t == "iq4_nl" ||
       t == "iq3_xxs" || t == "iq3_s" || t == "iq2_xxs" || t == "iq2_xs" ||
       t == "iq2_s" || t == "iq1_s" || t == "iq1_m" || t == "stq1_0" ||
-      t == "pq2_0" || t == "ptq1_0" || t == "q4_0" || t == "q4_1" ||
-      t == "q5_0" || t == "q5_1";
+      t == "pq2_0" || t == "q2_0" || t == "ptq1_0" || t == "q4_0" ||
+      t == "q4_1" || t == "q5_0" || t == "q5_1";
 }
 
 // Non-NAX default split-K entry M per codec (0 = env lever only).
@@ -287,7 +288,7 @@ static int kq_prism_verify_max_m() {
 // (1.05-1.12x) and q4_0 M2 (1.09-1.23x). Below the entry the mat-vec
 // kernels hold.
 static int kq_verify_mma_min_m(const std::string& t, bool f16) {
-  if (t == "pq2_0") {
+  if (t == "pq2_0" || t == "q2_0") {
     return f16 ? 4 : 3;
   }
   if (t == "ptq1_0") {
@@ -310,7 +311,7 @@ static int kq_verify_mma_min_m(const std::string& t, bool f16) {
 // M5, 1.10-1.39x at M8. f16: pq2_0 0.91-1.01x at M4, 1.16-1.33x at M5;
 // ptq1_0 1.05-1.18x at M3; q4_0 0.86-1.39x at M4, 1.10-1.46x at M5.
 static int kq_verify_mma_min_m_nax(const std::string& t) {
-  if (t == "pq2_0" || t == "q4_0") {
+  if (t == "pq2_0" || t == "q2_0" || t == "q4_0") {
     return 5;
   }
   if (t == "ptq1_0") {
@@ -338,7 +339,8 @@ static int kq_verify_mma_min_m_nax(const std::string& t) {
 // and runs within 1.03x of the fastest other route, except at N 2048, K
 // 4096 on f16, where it runs 1.04-1.06x behind mv_ext, about 1 us.
 static int kq_verify_nax_min_m(const std::string& t, int N) {
-  if (t == "pq2_0" || t == "q4_0" || t == "q4_k" || t == "q5_k") {
+  if (t == "pq2_0" || t == "q2_0" || t == "q4_0" || t == "q4_k" ||
+      t == "q5_k") {
     return 3;
   }
   if (t == "q8_0") {
@@ -365,8 +367,8 @@ static int kq_splitk_min_m(const std::string& t) {
     return 4;
   }
   if (t == "q5_k" || t == "q8_0" || t == "iq4_nl" || t == "iq3_xxs" ||
-      t == "iq3_s" || t == "stq1_0" || t == "pq2_0" || t == "ptq1_0" ||
-      t == "q4_0" || t == "q5_0") {
+      t == "iq3_s" || t == "stq1_0" || t == "pq2_0" || t == "q2_0" ||
+      t == "ptq1_0" || t == "q4_0" || t == "q5_0") {
     return 5;
   }
   if (t == "q3_k") {
@@ -479,7 +481,7 @@ static KqNaxSmallM kq_nax_small_m(const std::string& t) {
   if (t == "stq1_0") {
     return {{3, 1, 1, 1}, 2, 3};
   }
-  if (t == "pq2_0" || t == "ptq1_0") {
+  if (t == "pq2_0" || t == "q2_0" || t == "ptq1_0") {
     return {{8, 5, 3, 2}, 9, 9};
   }
   return {{1, 1, 1, 1}, 0, 0};
@@ -1578,7 +1580,7 @@ static bool kq_codec_has_mv_ext(const std::string& t) {
       t == "q5_1" || t == "iq4_nl" || t == "iq4_xs" || t == "iq3_s" ||
       t == "iq3_xxs" || t == "iq2_xxs" || t == "iq2_xs" || t == "iq2_s" ||
       t == "iq1_s" || t == "iq1_m" || t == "stq1_0" || t == "pq2_0" ||
-      t == "ptq1_0" || t == "mxfp4" || t == "nvfp4";
+      t == "q2_0" || t == "ptq1_0" || t == "mxfp4" || t == "nvfp4";
 }
 
 // Mid-M split-K entry on non-NAX GPUs. From M 33 through 128 the BM64 qmm
@@ -2443,7 +2445,8 @@ void KQuantMatmul::eval_gpu_base(
     // The Prism codecs decode each block once per row in verify_qmv and
     // once per activation row in mv_ext, so M 2..4 takes verify_qmv;
     // verify_mma or split-K take the band above.
-    const bool is_prism = kquant_type_ == "pq2_0" || kquant_type_ == "ptq1_0";
+    const bool is_prism = kquant_type_ == "pq2_0" || kquant_type_ == "q2_0" ||
+        kquant_type_ == "ptq1_0";
     const bool mv_ext_default_on =
         codec_has_mv_ext && !(is_prism && M <= kq_prism_verify_max_m());
     // Width gate for the DEFAULT path (the A/B force-on KQ_VERIFY_EXT=1 ignores

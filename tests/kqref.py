@@ -1,7 +1,7 @@
 """gguf.quants-compatible oracle shim for the codecs gguf-py lacks.
 
-gguf-py has no STQ1_0, PQ2_0 or PTQ1_0. Each gets a sentinel type (the single
-Python-side type-id constant), registered into ``GGML_QUANT_SIZES`` so
+gguf-py has no STQ1_0, PQ2_0, PTQ1_0 or Q2_0 codec. Each gets a sentinel type
+(the single Python-side type-id constant), registered into ``GGML_QUANT_SIZES`` so
 GGUFWriter can synthesize files and into the enum's value map so GGUFReader
 opens real files. ``GT`` proxies GGMLQuantizationType with the sentinels
 added; ``quants`` proxies gguf.quants with quantize/dequantize routed to the
@@ -9,7 +9,8 @@ NumPy reference codecs below for the sentinels and delegated otherwise.
 
 STQ1_0: any random qs/sign wire is valid, and quantize(dequantize(wire)) ==
 wire whenever d > 0. PQ2_0: any wire is valid; codes 0..3 decode to -1..+2
-and the encoder emits only 0..2. PTQ1_0: every byte decodes (the trit
+and the encoder emits only 0..2. Q2_0 is the PQ2_0 layout on a 64-weight
+block. PTQ1_0: every byte decodes (the trit
 extraction is total over 0..255), but only encoder-produced bytes round-trip.
 """
 
@@ -23,6 +24,7 @@ from gguf.constants import GGML_QUANT_SIZES
 STQ1_0_TYPE_ID = 43  # llama.cpp PR #22836 (unmerged -- may shift)
 PQ2_0_TYPE_ID = 142  # PrismML/llama.cpp 8bbb28b76 (Prism-private)
 PTQ1_0_TYPE_ID = 143  # PrismML/llama.cpp e19819227 (Prism-private)
+Q2_0_TYPE_ID = 42  # llama.cpp GGML_TYPE_Q2_0
 
 
 class _SentinelType:
@@ -43,6 +45,7 @@ class _SentinelType:
 STQ1_0 = _SentinelType("STQ1_0", STQ1_0_TYPE_ID)
 PQ2_0 = _SentinelType("PQ2_0", PQ2_0_TYPE_ID)
 PTQ1_0 = _SentinelType("PTQ1_0", PTQ1_0_TYPE_ID)
+Q2_0 = _SentinelType("Q2_0", Q2_0_TYPE_ID)
 
 
 def _f16_bytes(d: np.ndarray) -> np.ndarray:
@@ -147,25 +150,28 @@ def _quantize_stq1_0(data: np.ndarray) -> np.ndarray:
 
 # ---------------------------------------------------------------------------
 # PQ2_0: [fp16 d][32 x u8 qs], element j at byte j/4 bits (j%4)*2, code - 1.
+# Q2_0: the same layout with 16 qs bytes (wpb 64).
 # ---------------------------------------------------------------------------
 
 
-def _dequantize_pq2_0(data: np.ndarray) -> np.ndarray:
+def _dequantize_pq2_0(data: np.ndarray, wpb: int = 128) -> np.ndarray:
     data = np.ascontiguousarray(data, dtype=np.uint8)
     shape = data.shape
-    blocks = data.reshape(-1, 34)
+    bpb = 2 + wpb // 4
+    blocks = data.reshape(-1, bpb)
     nb = blocks.shape[0]
     d = blocks[:, 0:2].copy().view(np.float16).astype(np.float32)
-    qs = blocks[:, 2:34]
+    qs = blocks[:, 2:bpb]
     codes = (qs[:, :, None] >> np.arange(0, 8, 2, dtype=np.uint8)) & 3
-    w = codes.reshape(nb, 128).astype(np.float32) - 1.0
-    return (w * d).reshape(shape[:-1] + (shape[-1] // 34 * 128,))
+    w = codes.reshape(nb, wpb).astype(np.float32) - 1.0
+    return (w * d).reshape(shape[:-1] + (shape[-1] // bpb * wpb,))
 
 
-def _quantize_pq2_0(data: np.ndarray) -> np.ndarray:
+def _quantize_pq2_0(data: np.ndarray, wpb: int = 128) -> np.ndarray:
     x = np.ascontiguousarray(data, dtype=np.float32)
     shape = x.shape
-    x = x.reshape(-1, 128)
+    bpb = 2 + wpb // 4
+    x = x.reshape(-1, wpb)
     nb = x.shape[0]
     amax = np.abs(x).max(axis=1)
     d = amax.astype(np.float16)
@@ -173,11 +179,19 @@ def _quantize_pq2_0(data: np.ndarray) -> np.ndarray:
     np.divide(1.0, amax, out=inv, where=amax > 0.0)
     inv = inv.astype(np.float32)
     q = _round_half_away(x * inv[:, None]).astype(np.int32) + 1
-    q = np.clip(q, 0, 3).astype(np.uint8).reshape(nb, 32, 4)
-    out = np.zeros((nb, 34), dtype=np.uint8)
+    q = np.clip(q, 0, 3).astype(np.uint8).reshape(nb, wpb // 4, 4)
+    out = np.zeros((nb, bpb), dtype=np.uint8)
     out[:, 0:2] = _f16_bytes(d).reshape(nb, 2)
-    out[:, 2:34] = q[..., 0] | (q[..., 1] << 2) | (q[..., 2] << 4) | (q[..., 3] << 6)
-    return out.reshape(shape[:-1] + (shape[-1] // 128 * 34,))
+    out[:, 2:bpb] = q[..., 0] | (q[..., 1] << 2) | (q[..., 2] << 4) | (q[..., 3] << 6)
+    return out.reshape(shape[:-1] + (shape[-1] // wpb * bpb,))
+
+
+def _dequantize_q2_0(data: np.ndarray) -> np.ndarray:
+    return _dequantize_pq2_0(data, 64)
+
+
+def _quantize_q2_0(data: np.ndarray) -> np.ndarray:
+    return _quantize_pq2_0(data, 64)
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +274,7 @@ SENTINELS = {
     STQ1_0: (256, 42, _dequantize_stq1_0, _quantize_stq1_0),
     PQ2_0: (128, 34, _dequantize_pq2_0, _quantize_pq2_0),
     PTQ1_0: (128, 28, _dequantize_ptq1_0, _quantize_ptq1_0),
+    Q2_0: (64, 18, _dequantize_q2_0, _quantize_q2_0),
 }
 _BY_NAME = {s.name: s for s in SENTINELS}
 
@@ -275,6 +290,7 @@ class _GTProxy:
     STQ1_0 = STQ1_0
     PQ2_0 = PQ2_0
     PTQ1_0 = PTQ1_0
+    Q2_0 = Q2_0
 
     def __getattr__(self, name: str):
         return getattr(GGMLQuantizationType, name)
@@ -327,7 +343,13 @@ _D_OFFSET = {"stq1_0": 40, "ptq1_0": 26}
 def is_synth(codec: str) -> bool:
     """Whether the tests feed this codec random structurally-valid wire
     instead of quantizing real values through gguf-py."""
-    return codec.startswith("iq") or codec in ("nvfp4", "stq1_0", "pq2_0", "ptq1_0")
+    return codec.startswith("iq") or codec in (
+        "nvfp4",
+        "stq1_0",
+        "pq2_0",
+        "ptq1_0",
+        "q2_0",
+    )
 
 
 def synth_wire(

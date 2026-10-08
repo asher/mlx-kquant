@@ -43,11 +43,12 @@ IQ_ENCODE_CODECS = {
     "iq1_m": (GT.IQ1_M, 256, 1, 0.65),
     "stq1_0": (GT.STQ1_0, 256, 1, 2.5),
     "pq2_0": (GT.PQ2_0, 128, 2, 1.0),
+    "q2_0": (GT.Q2_0, 64, 2, 1.0),
     "ptq1_0": (GT.PTQ1_0, 128, 1, 1.0),
 }
 
 # stq1_0 (QAT) and the Prism codecs ignore the imatrix.
-IMATRIX_STEERS = set(IQ_ENCODE_CODECS) - {"stq1_0", "pq2_0", "ptq1_0"}
+IMATRIX_STEERS = set(IQ_ENCODE_CODECS) - {"stq1_0", "pq2_0", "ptq1_0", "q2_0"}
 
 # Codecs ggml marks imatrix-required: kq.quantize rejects them without an
 # imatrix (mirrors ggml_quantize_requires_imatrix). The rest fall back gracefully
@@ -153,7 +154,7 @@ def test_stq1_0_encode_decode_idempotent():
     assert np.array_equal(quants.quantize(w_np, GT.STQ1_0), wire)
 
 
-@pytest.mark.parametrize("codec", ["pq2_0", "ptq1_0"])
+@pytest.mark.parametrize("codec", ["pq2_0", "ptq1_0", "q2_0"])
 def test_prism_encode_matches_numpy_reference(codec):
     """The C++ encoder must match kqref's NumPy port byte-for-byte, zero
     blocks (amax == 0) included; the rel-Frobenius tripwire cannot see a
@@ -166,7 +167,7 @@ def test_prism_encode_matches_numpy_reference(codec):
     assert np.array_equal(_encode_wire(codec, z), quants.quantize(z, gtype))
 
 
-@pytest.mark.parametrize("codec", ["pq2_0", "ptq1_0"])
+@pytest.mark.parametrize("codec", ["pq2_0", "ptq1_0", "q2_0"])
 def test_prism_encode_decode_idempotent(codec):
     """encode(decode(wire)) == wire for encoder-produced wire: the three
     levels re-select themselves at d = amax. Random wire is excluded on
