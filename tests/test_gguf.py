@@ -271,6 +271,55 @@ def test_load_gguf_wire_over_widest_window(tmp_path):
         assert np.array_equal(np.array(a[i]), wire[i]), i
 
 
+@pytest.mark.skipif(
+    not __import__("os").environ.get("KQUANT_BIG_TESTS"),
+    reason="writes a >4 GiB GGUF; set KQUANT_BIG_TESTS=1 to run",
+)
+def test_load_gguf_wire_over_widest_window_at_file_head(tmp_path):
+    """The same oversize tensor as the first one in its file. Its data starts
+    in the first page, off a 34-byte boundary, so the window base has no pages
+    to walk back over and the rows cannot align. The row count divides by 64,
+    so a power-of-two stride carries the window instead."""
+    import resource
+    import sys
+
+    from gguf import GGUFReader
+
+    rows, row_bytes = 127_000_064, 34  # k=32 q8_0 blocks, ~4.32 GB
+    nbytes = rows * row_bytes
+    assert nbytes > 2 * 2**31 and rows % 64 == 0
+
+    wire = np.zeros((rows, row_bytes), dtype=np.uint8)
+    marks = (0, 1, rows // 2, rows - 1)
+    for i in marks:
+        wire[i] = np.arange(row_bytes, dtype=np.uint8) + (i % 251)
+
+    path = str(tmp_path / "head.gguf")
+    w = GGUFWriter(path, "smoke")
+    w.add_tensor("head.q8", wire, raw_dtype=GT.Q8_0)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    del wire
+
+    start = int(GGUFReader(path).tensors[0].data_offset)
+    assert start < 16384 and start % row_bytes != 0
+
+    scale = 1 if sys.platform == "darwin" else 1024  # ru_maxrss units
+    rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale
+    arrays, codecs, _meta, _shapes = kq.load_gguf(path, True)
+    a = arrays["head.q8"]
+    assert a.dtype == mx.uint8 and a.shape == (rows, row_bytes)
+    assert dict(codecs)["head.q8"] == "q8_0"
+
+    for i in marks:
+        want = np.arange(row_bytes, dtype=np.uint8) + (i % 251)
+        assert np.array_equal(np.array(a[i]), want), i
+    rss1 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale
+    assert rss1 - rss0 < 512 * 1024 * 1024, "load copied the wire bytes"
+
+
 def test_load_gguf_skip(tmp_path):
     """A skipped tensor gets no array but keeps its shape and codec."""
     _f32, _src = _mint(tmp_path / "smoke.gguf")
