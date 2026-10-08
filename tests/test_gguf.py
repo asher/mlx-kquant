@@ -99,7 +99,8 @@ def test_load_gguf_codecs_newer_than_gguf_py(tmp_path, name):
         assert got.dtype == mx.uint8
         assert np.array_equal(np.array(got), wire)
         aliases = kq.verify_zero_copy_views([("layer.w", got)], ["layer.w"])
-        assert bool(aliases) == zero_copy
+        # a build without Metal has no zero-copy view: every load is a copy
+        assert bool(aliases) == (zero_copy and mx.metal.is_available())
         del arrays, got
 
 

@@ -156,6 +156,9 @@ def _mint_adapter(base_dir, adapter_dir):
 
     patch_mlx_lm_lora()
     model, _ = load(base_dir)
+    # As the mlx-lm trainer does: with the base frozen, the saved file holds
+    # the lora tensors only. mlx-lm 0.32.0 rejects an adapter with others.
+    model.freeze()
     lora_params = {"rank": 8, "scale": 2.0, "dropout": 0.0}
     linear_to_lora_layers(model, num_layers=2, config=lora_params)
 
