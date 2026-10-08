@@ -212,6 +212,73 @@ def test_dsa_topk_indices_long_row_order(dtype, K):
         )
 
 
+def _topk_forced(monkeypatch, chunks, scores, topk, **kw):
+    """The select with the row split over `chunks` threadgroups. The op
+    reads the count when it runs, so the eval happens under the setting."""
+    monkeypatch.setenv("KQ_DSA_TOPK_CHUNKS", str(chunks))
+    got = kq.dsa_topk_indices(scores, topk, bucketed=True, **kw)
+    mx.eval(got)
+    return np.array(got)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("extra", [0, 1, 37, 3000, 68000])
+def test_dsa_topk_indices_split_rows_emit_the_same_array(
+    monkeypatch, dtype, topk, extra
+):
+    """A row split over 2, 4, 8 or 16 threadgroups emits the array the
+    one-threadgroup kernel emits: keys above the threshold in index order,
+    then threshold ties lowest-index-first. K covers chunks with no keys,
+    chunks the threads do not divide evenly, and winners in the last chunk."""
+    K = topk + extra
+    rng = np.random.default_rng(K)
+    raw = np.round(rng.standard_normal((2, 1, 3, K)) * 16) / 16 + 0.0
+    raw[0, 0, 1, -3:] = 50.0
+    # + 0.0 drops the negative zeros: the kernel orders -0.0 below 0.0
+    raw[1, 0, 0] = np.round(raw[1, 0, 0]) + 0.0  # a fat threshold bucket
+    raw[1, 0, 2] = np.sort(raw[1, 0, 2])  # every winner at the row's end
+    scores = mx.array(raw).astype(dtype)
+    vals = np.array(scores.astype(mx.float32))
+    one = _topk_forced(monkeypatch, 1, scores, topk)
+    for b in range(2):
+        for l in range(3):
+            v = vals[b, 0, l]
+            thr = np.partition(v, -topk)[-topk]
+            above = np.flatnonzero(v > thr)
+            ties = np.flatnonzero(v == thr)[: topk - len(above)]
+            np.testing.assert_array_equal(
+                one[b, 0, l], np.concatenate([above, ties]).astype(np.uint32)
+            )
+    for chunks in (2, 4, 8, 16):
+        np.testing.assert_array_equal(
+            _topk_forced(monkeypatch, chunks, scores, topk), one, f"chunks={chunks}"
+        )
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("chunks", [1, 2, 4, 8, 16])
+def test_dsa_topk_indices_split_rows_causal_prefix(monkeypatch, dtype, chunks):
+    """Split rows keep the causal scan limit: rows at or under topk emit
+    the identity prefix, longer rows never select past their horizon."""
+    rng = np.random.default_rng(23)
+    B, L, K, topk = 2, 700, 1300, 512
+    scores = mx.array(rng.standard_normal((B, 1, L, K))).astype(dtype)
+    sel = _topk_forced(monkeypatch, chunks, scores, topk, causal_valid_prefix=True)
+    vals = np.array(scores.astype(mx.float32))
+    for b in range(B):
+        for q in range(0, L, 7):
+            valid = min(K, max(0, K - L + q + 1))
+            row = vals[b, 0, q].copy()
+            row[valid:] = 100.0  # poison: must never be selected
+            _check_topk_row(row, sel[b, 0, q], topk, valid)
+    if chunks > 1:
+        np.testing.assert_array_equal(
+            sel,
+            _topk_forced(monkeypatch, 1, scores, topk, causal_valid_prefix=True),
+        )
+
+
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_dsa_topk_indices_causal_prefix(dtype):
     rng = np.random.default_rng(13)

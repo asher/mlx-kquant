@@ -17,6 +17,12 @@
 //    tie-break; the order inside the row is not sorted. Function constant
 //    302 is accepted for ABI parity and has no effect.
 //
+//  * kq_dsa_topk_hist_hi, kq_dsa_topk_hist_lo, kq_dsa_topk_emit -- the same
+//    select with each row split over CHUNKS threadgroups, one dispatch
+//    per kernel. CHUNKS is a template constant: read at run time, the
+//    chunk arithmetic costs more than a short row's scan. The emitted array is
+//    the one-threadgroup array bit for bit.
+//
 // Score kernel body byte-identical to omlx apart from the renames. The
 // top-k emission is intentionally not: omlx compacts through atomic
 // counters, which is nondeterministic under 16-bit tie pileup; do not
@@ -39,6 +45,117 @@ METAL_FUNC uint kq_dsa_ordered_key_16(T x) {
   return (bits & 0x8000) ? uint((~bits) & 0xffff) : uint(bits | 0x8000);
 }
 
+// The index range one thread scans. A row is cut into `chunks`
+// contiguous chunks, one per threadgroup, and a chunk into one contiguous
+// range per thread, so ranges in (chunk, thread) order are index order.
+// The select reads the row three times, and a strided walk would touch
+// every cache line of it from every thread. `valid` is the scan limit of
+// the row. `prefix` marks a causal row at or under topk: it has no select
+// to run and emits its valid prefix.
+struct KQDsaTopKRange {
+  int lo;
+  int hi;
+  int valid;
+  bool prefix;
+};
+
+METAL_FUNC KQDsaTopKRange kq_dsa_topk_range(
+    const constant KQDsaTopKParams* params,
+    uint row,
+    uint chunk,
+    uint otid,
+    int chunks,
+    int threads) {
+  KQDsaTopKRange r;
+  r.valid = params->K;
+  r.prefix = false;
+  if (params->causal_valid_prefix) {
+    const int q = int(row % uint(params->L));
+    r.valid =
+        metal::min(params->K, metal::max(0, params->K - params->L + q + 1));
+    r.prefix = r.valid <= params->topk;
+  }
+  const int span = (r.valid + chunks - 1) / chunks;
+  const int c0 = metal::min(r.valid, int(chunk) * span);
+  const int c1 = metal::min(r.valid, c0 + span);
+  const int per = (c1 - c0 + threads - 1) / threads;
+  r.lo = metal::min(c1, c0 + int(otid) * per);
+  r.hi = metal::min(c1, r.lo + per);
+  return r;
+}
+
+// Running sum of v over the first 256 threads in thread order, this thread
+// included, for two counters at once. Holds one barrier. Thread t carries
+// histogram bin 255 - t, so the sum counts keys from the top bin down and
+// the one thread whose bin crosses topk knows the threshold: no thread
+// walks the bins alone.
+METAL_FUNC uint2 kq_dsa_topk_scan(
+    uint2 v,
+    threadgroup uint2* sg_run,
+    uint otid,
+    uint simd_lane,
+    uint simd_group) {
+  uint2 run = simd_prefix_inclusive_sum(v);
+  if (otid < 256 && simd_lane == 31) {
+    sg_run[simd_group] = run;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (otid < 256) {
+    for (uint g = 0; g < simd_group; ++g) {
+      run += sg_run[g];
+    }
+  }
+  return run;
+}
+
+// Stable index-ordered compaction, so the emitted array is bitwise
+// reproducible. Keys above the threshold fill [0, greater), threshold ties
+// fill [greater, topk) lowest-index-first. A thread counts its range, takes
+// its output position from the counts of the threads before it, then
+// writes: one barrier for a range of any length. gt_base and tie_base are
+// the positions of the first thread of this threadgroup.
+template <typename T, typename O>
+METAL_FUNC void kq_dsa_topk_compact(
+    const device T* row_scores,
+    device O* row_out,
+    int lo,
+    int hi,
+    uint threshold_key,
+    uint gt_base,
+    uint tie_base,
+    uint topk,
+    threadgroup uint2* sg_cnt,
+    uint simd_lane,
+    uint simd_group) {
+  uint2 n = uint2(0);
+  for (int i = lo; i < hi; ++i) {
+    const uint key = kq_dsa_ordered_key_16(row_scores[i]);
+    n += uint2(uint(key > threshold_key), uint(key == threshold_key));
+  }
+  uint2 pos = simd_prefix_exclusive_sum(n);
+  if (simd_lane == 31) {
+    sg_cnt[simd_group] = pos + n;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  pos += uint2(gt_base, tie_base);
+  for (uint g = 0; g < simd_group; ++g) {
+    pos += sg_cnt[g];
+  }
+  if (n.x + n.y != 0) {
+    for (int i = lo; i < hi; ++i) {
+      const uint key = kq_dsa_ordered_key_16(row_scores[i]);
+      if (key > threshold_key) {
+        row_out[pos.x++] = O(i);
+      } else if (key == threshold_key) {
+        if (pos.y < topk) {
+          row_out[pos.y] = O(i);
+        }
+        ++pos.y;
+      }
+    }
+  }
+}
+
 template <typename T, typename O, int TOPK, int THREADS>
 [[kernel, max_total_threads_per_threadgroup(THREADS)]] void
 kq_dsa_topk_indices_16bit(
@@ -54,71 +171,50 @@ kq_dsa_topk_indices_16bit(
   }
 
   threadgroup atomic_uint hist[256];
-  threadgroup atomic_uint counters[2];
+  threadgroup uint2 sg_run[8];
+  threadgroup uint2 sg_cnt[THREADS / 32];
   threadgroup uint state[4];
 
-  if (tid < 256) {
-    atomic_store_explicit(&hist[tid], 0, memory_order_relaxed);
-  }
-  if (tid < 2) {
-    atomic_store_explicit(&counters[tid], 0, memory_order_relaxed);
+  const uint otid = simd_group * 32 + simd_lane;
+  const int bin = 255 - int(otid);
+  if (otid < 256) {
+    atomic_store_explicit(&hist[otid], 0, memory_order_relaxed);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   const device T* row_scores = scores + size_t(row) * params->K;
   device O* row_out = out + size_t(row) * TOPK;
 
-  int scan_limit = params->K;
-  if (params->causal_valid_prefix) {
-    const int q = int(row % uint(params->L));
-    const int valid_length =
-        metal::min(params->K, metal::max(0, params->K - params->L + q + 1));
-    if (valid_length <= TOPK) {
-      for (int i = int(tid); i < TOPK; i += THREADS) {
-        row_out[i] = O(i < valid_length ? i : 0);
-      }
-      return;
+  const KQDsaTopKRange r = kq_dsa_topk_range(params, row, 0, otid, 1, THREADS);
+  if (r.prefix) {
+    for (int i = int(tid); i < TOPK; i += THREADS) {
+      row_out[i] = O(i < r.valid ? i : 0);
     }
-    scan_limit = valid_length;
+    return;
   }
 
-  // Each thread owns one contiguous index range, and the ranges in thread
-  // order are index order. The select reads the row three times, and a
-  // strided walk would touch every cache line of it from every thread.
-  const uint otid = simd_group * 32 + simd_lane;
-  const int chunk = (scan_limit + THREADS - 1) / THREADS;
-  const int lo = metal::min(scan_limit, int(otid) * chunk);
-  const int hi = metal::min(scan_limit, lo + chunk);
-
-  for (int i = lo; i < hi; ++i) {
+  for (int i = r.lo; i < r.hi; ++i) {
     const uint key = kq_dsa_ordered_key_16(row_scores[i]);
     atomic_fetch_add_explicit(&hist[key >> 8], 1, memory_order_relaxed);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  if (tid == 0) {
-    uint greater = 0;
-    uint threshold_hi = 0;
-    for (int h = 255; h >= 0; --h) {
-      const uint count = atomic_load_explicit(&hist[h], memory_order_relaxed);
-      if (greater + count >= uint(TOPK)) {
-        threshold_hi = uint(h);
-        break;
-      }
-      greater += count;
-    }
-    state[0] = threshold_hi;
-    state[1] = greater;
+  uint2 v = uint2(0);
+  if (otid < 256) {
+    v.x = atomic_load_explicit(&hist[bin], memory_order_relaxed);
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  if (tid < 256) {
-    atomic_store_explicit(&hist[tid], 0, memory_order_relaxed);
+  uint2 run = kq_dsa_topk_scan(v, sg_run, otid, simd_lane, simd_group);
+  if (otid < 256) {
+    if (run.x >= uint(TOPK) && run.x - v.x < uint(TOPK)) {
+      state[0] = uint(bin);
+      state[1] = run.x - v.x;
+    }
+    atomic_store_explicit(&hist[otid], 0, memory_order_relaxed);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   const uint threshold_hi = state[0];
-  for (int i = lo; i < hi; ++i) {
+  for (int i = r.lo; i < r.hi; ++i) {
     const uint key = kq_dsa_ordered_key_16(row_scores[i]);
     if ((key >> 8) == threshold_hi) {
       atomic_fetch_add_explicit(&hist[key & 0xff], 1, memory_order_relaxed);
@@ -126,64 +222,219 @@ kq_dsa_topk_indices_16bit(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  if (tid == 0) {
-    uint greater = state[1];
-    uint threshold_lo = 0;
-    for (int l = 255; l >= 0; --l) {
-      const uint count = atomic_load_explicit(&hist[l], memory_order_relaxed);
-      if (greater + count >= uint(TOPK)) {
-        threshold_lo = uint(l);
-        break;
-      }
-      greater += count;
+  v = uint2(0);
+  if (otid < 256) {
+    v.x = atomic_load_explicit(&hist[bin], memory_order_relaxed);
+  }
+  run = kq_dsa_topk_scan(v, sg_run, otid, simd_lane, simd_group);
+  if (otid < 256) {
+    const uint above = state[1] + run.x - v.x;
+    if (above + v.x >= uint(TOPK) && above < uint(TOPK)) {
+      state[2] = (threshold_hi << 8) | uint(bin);
+      state[3] = above;
     }
-    state[2] = (threshold_hi << 8) | threshold_lo;
-    state[3] = greater;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Stable index-ordered compaction, so the emitted array is bitwise
-  // reproducible. Greater keys fill [0, greater), threshold ties fill
-  // [greater, TOPK) lowest-index-first. A thread counts its range, takes
-  // its output position from the counts of the threads before it, then
-  // writes: two barriers for a row of any length.
-  const uint threshold_key = state[2];
-  threadgroup uint sg_gt[THREADS / 32];
-  threadgroup uint sg_tie[THREADS / 32];
-  uint n_gt = 0;
-  uint n_tie = 0;
-  for (int i = lo; i < hi; ++i) {
-    const uint key = kq_dsa_ordered_key_16(row_scores[i]);
-    n_gt += uint(key > threshold_key);
-    n_tie += uint(key == threshold_key);
+  kq_dsa_topk_compact(
+      row_scores,
+      row_out,
+      r.lo,
+      r.hi,
+      state[2],
+      0u,
+      state[3],
+      uint(TOPK),
+      sg_cnt,
+      simd_lane,
+      simd_group);
+  (void)kq_dsa_bucketed_topk; // unused: emission is identical in both modes
+}
+
+// Split select, dispatch 1 of 3: the high-byte histogram of one chunk.
+// hist_hi is [rows, CHUNKS, 256].
+template <typename T, int CHUNKS, int THREADS>
+[[kernel, max_total_threads_per_threadgroup(THREADS)]] void kq_dsa_topk_hist_hi(
+    const device T* scores [[buffer(0)]],
+    device uint* hist_hi [[buffer(1)]],
+    const constant KQDsaTopKParams* params [[buffer(2)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  const uint row = tg / uint(CHUNKS);
+  const uint chunk = tg % uint(CHUNKS);
+  if (row >= uint(params->rows)) {
+    return;
   }
-  uint gt_pos = simd_prefix_exclusive_sum(n_gt);
-  uint tie_pos = simd_prefix_exclusive_sum(n_tie);
-  if (simd_lane == 31) {
-    sg_gt[simd_group] = gt_pos + n_gt;
-    sg_tie[simd_group] = tie_pos + n_tie;
+
+  threadgroup atomic_uint hist[256];
+  const uint otid = simd_group * 32 + simd_lane;
+  if (otid < 256) {
+    atomic_store_explicit(&hist[otid], 0, memory_order_relaxed);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  tie_pos += state[3];
-  for (uint g = 0; g < simd_group; ++g) {
-    gt_pos += sg_gt[g];
-    tie_pos += sg_tie[g];
+
+  const KQDsaTopKRange r =
+      kq_dsa_topk_range(params, row, chunk, otid, CHUNKS, THREADS);
+  if (r.prefix) {
+    return;
   }
-  if (n_gt + n_tie != 0) {
-    for (int i = lo; i < hi; ++i) {
-      const uint key = kq_dsa_ordered_key_16(row_scores[i]);
-      if (key > threshold_key) {
-        row_out[gt_pos++] = O(i);
-      } else if (key == threshold_key) {
-        if (tie_pos < uint(TOPK)) {
-          row_out[tie_pos] = O(i);
-        }
-        ++tie_pos;
-      }
+  const device T* row_scores = scores + size_t(row) * params->K;
+  for (int i = r.lo; i < r.hi; ++i) {
+    const uint key = kq_dsa_ordered_key_16(row_scores[i]);
+    atomic_fetch_add_explicit(&hist[key >> 8], 1, memory_order_relaxed);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (otid < 256) {
+    hist_hi[(size_t(row) * CHUNKS + chunk) * 256 + otid] =
+        atomic_load_explicit(&hist[otid], memory_order_relaxed);
+  }
+}
+
+// Split select, dispatch 2 of 3: every threadgroup sums the high-byte
+// histograms of the row, finds the threshold high byte, and counts the low
+// bytes of its chunk inside that bucket. hist_lo is
+// [rows, CHUNKS, KQ_DSA_TOPK_LO_STRIDE]: 256 low-byte counts, then the
+// threshold high byte, the keys of the row above it, and the keys above it
+// in the chunks before this one.
+template <typename T, int CHUNKS, int THREADS>
+[[kernel, max_total_threads_per_threadgroup(THREADS)]] void kq_dsa_topk_hist_lo(
+    const device T* scores [[buffer(0)]],
+    const device uint* hist_hi [[buffer(1)]],
+    device uint* hist_lo [[buffer(2)]],
+    const constant KQDsaTopKParams* params [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  const uint row = tg / uint(CHUNKS);
+  const uint chunk = tg % uint(CHUNKS);
+  if (row >= uint(params->rows)) {
+    return;
+  }
+
+  threadgroup atomic_uint hist[256];
+  threadgroup uint2 sg_run[8];
+  threadgroup uint state[3];
+
+  const uint otid = simd_group * 32 + simd_lane;
+  const int bin = 255 - int(otid);
+  const KQDsaTopKRange r =
+      kq_dsa_topk_range(params, row, chunk, otid, CHUNKS, THREADS);
+  if (r.prefix) {
+    return;
+  }
+  const uint topk = uint(params->topk);
+  const size_t row_base = size_t(row) * CHUNKS;
+
+  // x: the bin over the whole row. y: the bin over the chunks before this.
+  uint2 v = uint2(0);
+  if (otid < 256) {
+    for (int c = 0; c < CHUNKS; ++c) {
+      const uint n = hist_hi[(row_base + c) * 256 + bin];
+      v.x += n;
+      v.y += c < int(chunk) ? n : 0u;
+    }
+    atomic_store_explicit(&hist[otid], 0, memory_order_relaxed);
+  }
+  const uint2 run = kq_dsa_topk_scan(v, sg_run, otid, simd_lane, simd_group);
+  if (otid < 256 && run.x >= topk && run.x - v.x < topk) {
+    state[0] = uint(bin);
+    state[1] = run.x - v.x;
+    state[2] = run.y - v.y;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint threshold_hi = state[0];
+  const device T* row_scores = scores + size_t(row) * params->K;
+  for (int i = r.lo; i < r.hi; ++i) {
+    const uint key = kq_dsa_ordered_key_16(row_scores[i]);
+    if ((key >> 8) == threshold_hi) {
+      atomic_fetch_add_explicit(&hist[key & 0xff], 1, memory_order_relaxed);
     }
   }
-  (void)kq_dsa_bucketed_topk; // unused: emission is identical in both modes
-  (void)counters;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  device uint* o = hist_lo + (row_base + chunk) * KQ_DSA_TOPK_LO_STRIDE;
+  if (otid < 256) {
+    o[otid] = atomic_load_explicit(&hist[otid], memory_order_relaxed);
+  }
+  if (otid < 3) {
+    o[256 + otid] = state[otid];
+  }
+}
+
+// Split select, dispatch 3 of 3: every threadgroup sums the low-byte
+// histograms of the row, finds the threshold key and where its chunk
+// starts in the output, and compacts its chunk.
+template <typename T, typename O, int CHUNKS, int THREADS>
+[[kernel, max_total_threads_per_threadgroup(THREADS)]] void kq_dsa_topk_emit(
+    const device T* scores [[buffer(0)]],
+    const device uint* hist_lo [[buffer(1)]],
+    device O* out [[buffer(2)]],
+    const constant KQDsaTopKParams* params [[buffer(3)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  const uint row = tg / uint(CHUNKS);
+  const uint chunk = tg % uint(CHUNKS);
+  if (row >= uint(params->rows)) {
+    return;
+  }
+
+  threadgroup uint2 sg_run[8];
+  threadgroup uint2 sg_cnt[THREADS / 32];
+  threadgroup uint state[3];
+
+  const uint otid = simd_group * 32 + simd_lane;
+  const int bin = 255 - int(otid);
+  const uint topk = uint(params->topk);
+  device O* row_out = out + size_t(row) * params->topk;
+  const KQDsaTopKRange r =
+      kq_dsa_topk_range(params, row, chunk, otid, CHUNKS, THREADS);
+  if (r.prefix) {
+    if (chunk == 0) {
+      for (int i = int(tid); i < params->topk; i += THREADS) {
+        row_out[i] = O(i < r.valid ? i : 0);
+      }
+    }
+    return;
+  }
+  const size_t row_base = size_t(row) * CHUNKS;
+  const device uint* mine =
+      hist_lo + (row_base + chunk) * KQ_DSA_TOPK_LO_STRIDE;
+
+  uint2 v = uint2(0);
+  if (otid < 256) {
+    for (int c = 0; c < CHUNKS; ++c) {
+      const uint n = hist_lo[(row_base + c) * KQ_DSA_TOPK_LO_STRIDE + bin];
+      v.x += n;
+      v.y += c < int(chunk) ? n : 0u;
+    }
+  }
+  const uint2 run = kq_dsa_topk_scan(v, sg_run, otid, simd_lane, simd_group);
+  if (otid < 256) {
+    const uint above = mine[257] + run.x - v.x;
+    if (above + v.x >= topk && above < topk) {
+      state[0] = (mine[256] << 8) | uint(bin);
+      state[1] = mine[258] + run.y - v.y;
+      state[2] = above + v.y;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  kq_dsa_topk_compact(
+      scores + size_t(row) * params->K,
+      row_out,
+      r.lo,
+      r.hi,
+      state[0],
+      state[1],
+      state[2],
+      topk,
+      sg_cnt,
+      simd_lane,
+      simd_group);
 }
 
 template <typename T, int BM, int BN, int BK, int WM, int WN>
