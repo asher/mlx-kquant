@@ -843,6 +843,9 @@ on the shapes of N 2048 and wider.
   Every other case builds the same sum from `quantized_matmul` and stock ops, which round the
   product and the gated product to the output dtype before the add: other codecs, float16
   activations, fewer rows, a `q8_0` K off a multiple of 64, CPU streams and GPUs without NAX.
+  The op rounds once from 1024 rows counted across the batch, so x of shape [2, 512, K] runs the
+  kernel while each [512, K] half on its own runs the unfused ops, and the two can differ in the
+  last bit.
 
   Lever, read once per process unless `KQ_TUNE_LIVE=1`. The op reads it when it is called and
   builds its graph, so a compiled function keeps the kernel choice of its trace:
@@ -872,9 +875,10 @@ on the shapes of N 2048 and wider.
 
   On an M5 Max, at the decoder shapes of Z-Image and Qwen-Image 2.1 (H and W 256 to 1024, C 128 to
   1152), the kernel runs 31 to 54 TFLOPS, 0.25 to 0.34 of the time of MLX's convolution without the
-  Winograd transform. MLX's Winograd path is faster on the 256 to 1152 channel shapes, with an error
-  to the float64 result 35 times larger on a 256 channel layer. A whole Z-Image decode at 1024 pixels takes 0.36 of its time on the
-  convolution without Winograd.
+  Winograd transform. MLX's Winograd path is faster where O is 256 to 1152, with an error to the
+  float64 result 35 times larger on a 256 channel layer. At O 128 the kernel takes about half the
+  time of the Winograd path, and at O 144 MLX takes no Winograd transform. A whole Z-Image decode
+  at 1024 pixels takes 0.36 of its time on the convolution without Winograd.
 
   Every other case builds MLX's `conv_general` on the flipped kernel, which takes its implicit GEMM
   and not the Winograd transform, then a stock add of the bias, which rounds the convolution before
