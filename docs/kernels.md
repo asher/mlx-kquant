@@ -279,8 +279,8 @@ at M 8, `q4_0` 1.0-1.4x at M 5 and 1.1-1.4x at M 8. Float16 activations give the
 The `q8_0` kernel has no default entry on either class of GPU, so it runs only where
 `KQ_VERIFY_MMA` or `KQ_QMM_ROUTE=verify_mma` forces it.
 
-On NAX GPUs, the register-fed NAX verify kernels (`verify_nax`) serve `pq2_0`, `q4_0`, `q8_0` and
-`q2_k` to `q6_k` from a per-codec entry through M 8, above the per-row qmv limit where that limit is
+On NAX GPUs, the register-fed NAX verify kernels (`verify_nax`) serve `pq2_0`, `q4_0`, `q8_0`,
+`q2_k` to `q6_k`, `iq4_xs` and `iq4_nl` from a per-codec entry through M 8, above the per-row qmv limit where that limit is
 wider. Each simdgroup owns 32 weight rows and decodes every block of them straight into the
 right operand of a 16x32x16 NAX matmul, with the block scale folded into the half weights. The left
 operand holds the activation rows padded to 16, read from device memory in the k order of the
@@ -303,6 +303,8 @@ split rule, as the table lists.
 | `q6_k` | 128 | 16 bytes of low codes and their 16 bytes of high bits, as 2-byte words | per NAX op | about 1280 simdgroups, K walk 2560 | 2-byte |
 | `q3_k` | 128 | 8 bytes of low codes, their 8 bytes of high bits and the 12 scale bytes, as 2-byte words | per NAX op | waves, partial charge 2560 | 2-byte |
 | `q2_k` | 128 | 8 bytes of codes and 8 bytes of scales and mins | per NAX op | waves, partial charge 2560 | 4-byte |
+| `iq4_xs` | 256 | the 8-byte header and a 32-byte quarter of one row's codes, as 8-byte words | per NAX op | waves, partial charge 640 | 8-byte |
+| `iq4_nl` | 256 | two whole blocks of one row, as nine 4-byte words | per NAX op | waves, partial charge 640 | 4-byte |
 
 The `pq2_0` and two-block `q4_0` kernels decode each block in the permuted k order of `verify_mma`.
 The other kernels keep each lane's loads on one row, which measured faster. Spreading a `q8_0`
@@ -322,8 +324,8 @@ and the `q6_k` head ran 1.06-1.07x slower on one split than on two.
 
 The other kernels take their count from a model of GPU waves of 640 simdgroups. A count costs its
 waves times the K steps each simdgroup walks, plus the simdgroups of all its splits divided by the
-codec's partial charge. The charge is 640 for `q4_k` and the eight-block `q4_0` kernel and 2560 for
-`q2_k`, `q3_k` and `q5_k`. The cheapest power of two that divides the K steps wins, unless another divisor costs
+codec's partial charge. The charge is 640 for `q4_k`, the eight-block `q4_0` kernel, `iq4_xs` and
+`iq4_nl`, and 2560 for `q2_k`, `q3_k` and `q5_k`. The cheapest power of two that divides the K steps wins, unless another divisor costs
 at most 3/4 as much, and the count has no cap. N 1024, K 5120 therefore takes 20 splits, which ran
 1.13-1.23x faster than 8 on `q3_k` and `q2_k`. The `q5_k` vocab head takes 4 splits and runs
 1.14-1.32x faster than on 1. Across the Qwen3.8-27B projection and head shapes and N 1024 to 14336
@@ -333,9 +335,10 @@ best measured count on 164 of 200 cells and 1.13x slower at worst. The sweep ran
 
 A K that is not a whole number of K steps declines the route, and the K-quant kernels also need K in
 whole 256-weight superblocks. A two-block `q4_0` K with an odd count of blocks therefore runs on the
-mat-vec kernels at M 3 and 4 and on `verify_mma` from M 5. A `pq2_0`, `q4_0` or `q8_0` weight view
-that starts 2 bytes past a 4-byte boundary declines too, and the other routes serve it. For the
-K-quant codecs the table's weight base is the alignment every GPU kernel of the codec needs, so a
+mat-vec kernels at M 3 and 4 and on `verify_mma` from M 5. An `iq4_nl` K that is not a multiple of
+256 declines as well. A `pq2_0`, `q4_0`, `q8_0` or `iq4_nl` weight view that starts 2 bytes past a
+4-byte boundary declines too, and the other routes serve it. For the K-quant codecs and `iq4_xs`
+the table's weight base is the alignment every GPU kernel of the codec needs, so a
 start off it raises, as [the wire-byte contract](integration.md#the-wire-byte-contract) describes.
 `ptq1_0` has no NAX verify kernel, because its base-3 decode does not hide under the NAX ops and
 measured slower than `verify_mma`.
@@ -378,6 +381,25 @@ runs 1.03-1.15x faster on the Qwen3.8-27B shapes with N 10240 and up or K above 
 shapes. On float16 activations the gains shrink to at most 1.10x, and the losses at N 6144 and
 12288 grow to 1.05-1.10x. Over one Qwen3.8-27B forward in `q4_0` at M 8, the eight-block kernel
 takes 7% off the matmul time on bfloat16 activations and 3% on float16.
+
+The `iq4_xs` and `iq4_nl` kernels look both codes of a pair up in one 256-entry table of half
+pairs and run at the rate of the `q4_k` kernel, flat in M. Their mat-vec routes run faster than
+those of `q4_k` at M 2 to 4, so the entry moves with the shape:
+
+| shape | entry, bfloat16 | entry, float16 | time against the default route at the entry |
+|---|---|---|---|
+| N >= 100000 | M 3 | M 3 | 0.82-0.97x |
+| K >= 6144 | M 3 | M 4 | 0.79-1.01x |
+| K 4096 to 5120 | M 4 | M 5 | 0.79-1.00x |
+| a narrower K, N >= 10240 | M 4 | M 5 | 0.91-1.03x |
+| a narrower K, N 2048 to 10239 | M 5 | M 5 | 0.88-1.00x, and 1.04-1.08x at N 4096, K 2560 |
+| N under 2048 | none | none | the kernel ran up to 1.19x slower through M 5 |
+
+The bfloat16 column was fitted on M5 Max over 32 shapes of N 1024 to 248320 and K 2048 to 17408.
+On float16 activations the mat-vec routes run faster and the kernel the same, so at the bfloat16
+entries the kernel ran up to 1.10x slower at K 4096 and 1.21x slower at N 12288, K 2560, and each
+entry under M 5 sits one row higher. At M 8 the kernel runs 1.05-1.39x faster than NAX split-K
+on the shapes of N 2048 and wider.
 
 ## MoE GLU
 

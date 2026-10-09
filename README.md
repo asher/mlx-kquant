@@ -293,6 +293,11 @@ All optional; the defaults are right for normal use.
   step) as one dispatch per (row, expert) pair instead of the default dedupe kernels, which
   dequantize an expert once per pair of rows that select it. Read per call. Outputs are
   bit-identical either way; `KQ_MOE_HALF=1` keeps its own kernels at every width. A/B lever.
+- `KQ_MOE_MIX_FORM=loop|sp|dd` - on Metal, force the kernel form of the score-mixed MoE down
+  gathers (`gather_qmv_mix_kq`, `gather_qmv_mix_ns_kq`) where it applies: `loop` runs every expert
+  slot in one thread, `sp` gives each slot its own simdgroup pair, `dd` is the dedupe row-pair
+  kernel. By default `sp` serves launches under 2048 threadgroups and `dd` serves wider ones at 2
+  to 8 rows. Read per call. `loop` and `sp` give identical bytes. A/B lever.
 - `KQ_MOE_HALF=1` - on Metal, run the iq2_xs, iq2_xxs and iq3_xxs fused MoE decode gathers on the
   half-dot kernels (half grid tables, half-staged activations, half chunk dots with a float sum per
   chunk; shared-expert slots stay on the float path). Read per call. Default off: the outputs differ

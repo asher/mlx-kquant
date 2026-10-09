@@ -6,6 +6,24 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `shexp_mix_slot_parallel` reports whether `gather_qmv_mix_kq` runs a codec
+  combination on its slot-parallel kernel.
+
+### Changed
+- `dsa_topk_indices` runs faster with the same indices in the same order,
+  about 4x on a row of 65,536 scores. `KQ_DSA_TOPK_CHUNKS=1` keeps a row in
+  one threadgroup.
+- `dsa_indexer_score_decode` with 4 heads scores 2 to 4 query rows in about
+  the time of one, with the same scores. `KQ_DSA_SCORE_PAIR=0` keeps the
+  previous kernel.
+- `quantized_matmul` on `iq4_xs` and `iq4_nl` weights runs up to 1.4x faster
+  at 3 to 8 activation rows on M5 GPUs. `KQ_VERIFY_NAX=0` keeps the previous
+  routes.
+- `gather_qmv_mix_kq` and `gather_qmv_mix_ns_kq` run up to 1.5x faster at
+  decode and verify widths on expert stacks with a few thousand output rows.
+  `KQ_MOE_MIX_FORM=dd` keeps the previous kernel from 2 rows.
+
 ### Fixed
 - `load_gguf(zero_copy=True)` copied a tensor of many GiB into memory when it
   was the first tensor in its file. It now loads as a view like the rest.

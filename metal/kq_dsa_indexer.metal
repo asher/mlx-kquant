@@ -23,10 +23,31 @@
 instantiate_kq_dsa_indexer_score(float16_t, half, 64, 64, 16, 2, 2);
 instantiate_kq_dsa_indexer_score(bfloat16_t, bfloat16_t, 64, 64, 16, 2, 2);
 
-instantiate_kq_dsa_topk_indices(float16_t, half, 2048, 1024);
-instantiate_kq_dsa_topk_indices(bfloat16_t, bfloat16_t, 2048, 1024);
-instantiate_kq_dsa_topk_indices(float16_t, half, 512, 1024);
-instantiate_kq_dsa_topk_indices(bfloat16_t, bfloat16_t, 512, 1024);
+instantiate_kq_dsa_topk_indices(float16_t, half, 2048, 512);
+instantiate_kq_dsa_topk_indices(bfloat16_t, bfloat16_t, 2048, 512);
+instantiate_kq_dsa_topk_indices(float16_t, half, 512, 512);
+instantiate_kq_dsa_topk_indices(bfloat16_t, bfloat16_t, 512, 512);
+
+// Split select: any topk, one row over `chunks` threadgroups.
+#define instantiate_kq_dsa_topk_split(tname, dtype, chunks, threads)           \
+  instantiate_kernel(                                                          \
+      "kq_dsa_topk_hist_hi_" #tname "_c" #chunks "_t" #threads,                \
+      kq_dsa_topk_hist_hi, dtype, chunks, threads)                             \
+  instantiate_kernel(                                                          \
+      "kq_dsa_topk_hist_lo_" #tname "_c" #chunks "_t" #threads,                \
+      kq_dsa_topk_hist_lo, dtype, chunks, threads)                             \
+  instantiate_kernel(                                                          \
+      "kq_dsa_topk_emit_" #tname "_c" #chunks "_t" #threads,                   \
+      kq_dsa_topk_emit, dtype, uint, chunks, threads)
+
+#define instantiate_kq_dsa_topk_split_all(tname, dtype) \
+  instantiate_kq_dsa_topk_split(tname, dtype, 2, 512)   \
+  instantiate_kq_dsa_topk_split(tname, dtype, 4, 512)   \
+  instantiate_kq_dsa_topk_split(tname, dtype, 8, 512)   \
+  instantiate_kq_dsa_topk_split(tname, dtype, 16, 512)
+
+instantiate_kq_dsa_topk_split_all(float16_t, half)
+instantiate_kq_dsa_topk_split_all(bfloat16_t, bfloat16_t)
 
 // Decode scorer: heads 4/32/64, 16-bit or fp32 head weights.
 #define instantiate_kq_dsa_indexer_score_decode(tname, dtype, ql, h, hs, wt, ws) \
@@ -46,6 +67,23 @@ instantiate_kq_dsa_topk_indices(bfloat16_t, bfloat16_t, 512, 1024);
   instantiate_kq_dsa_indexer_score_decode(tname, dtype, 2, h, "h" #h "_", float, "wf_"); \
   instantiate_kq_dsa_indexer_score_decode(tname, dtype, 3, h, "h" #h "_", float, "wf_"); \
   instantiate_kq_dsa_indexer_score_decode(tname, dtype, 4, h, "h" #h "_", float, "wf_")
+
+// Two query rows per tile, 4 heads only.
+#define instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, ql, wt, ws) \
+  instantiate_kernel(                                                           \
+      "kq_dsa_indexer_score_decode_h4_" ws #tname "_ql" #ql "_pair",            \
+      kq_dsa_indexer_score_decode, dtype, ql, 4, 128, 8, 1, wt, false, true)
+
+#define instantiate_kq_dsa_indexer_score_decode_pair_all(tname, dtype)       \
+  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 2, dtype, "");  \
+  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 3, dtype, "");  \
+  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 4, dtype, "");  \
+  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 2, float, "wf_"); \
+  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 3, float, "wf_"); \
+  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 4, float, "wf_")
+
+instantiate_kq_dsa_indexer_score_decode_pair_all(float16_t, half);
+instantiate_kq_dsa_indexer_score_decode_pair_all(bfloat16_t, bfloat16_t);
 
 instantiate_kq_dsa_indexer_score_decode_all(float16_t, half, 64, "");
 instantiate_kq_dsa_indexer_score_decode_all(float16_t, half, 32, "h32_");

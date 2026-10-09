@@ -338,7 +338,30 @@ static int kq_verify_mma_min_m_nax(const std::string& t) {
 // mv_ext at M 4, so it enters at M 5 up to N 4096. q3_k keeps M 4 there
 // and runs within 1.03x of the fastest other route, except at N 2048, K
 // 4096 on f16, where it runs 1.04-1.06x behind mv_ext, about 1 us.
-static int kq_verify_nax_min_m(const std::string& t, int N) {
+//
+// iq4_xs and iq4_nl run the kernel at the rate of q4_k, flat in M, and
+// their mat-vec routes run faster than q4_k's at M 2 to 4, so the entry
+// moves with the shape. It was fitted on bf16 over 32 shapes of N 1024 to
+// 248320 and K 2048 to 17408. K 6144 and wider enters at M 3 (0.79-1.01x
+// of the default route), K 4096 to 5120 at M 4 (0.79-1.00x), a narrower K
+// at M 4 from N 10240 (0.91-1.03x) and at M 5 below it (0.88-1.00x, and
+// 1.04-1.08x at N 4096, K 2560, about 1 us). Under N 2048 the kernel ran
+// up to 1.19x slower through M 5 and has no entry. On float16 the mat-vec
+// routes run faster and the kernel the same, so an entry under M 5 moves
+// up one row: at the bf16 entries the kernel ran up to 1.10x slower on K
+// 4096 and 1.21x at N 12288, K 2560. A vocab head keeps M 3 on both types
+// (0.97x).
+static int kq_verify_nax_min_m(const std::string& t, int N, int K, bool f16) {
+  if (t == "iq4_xs" || t == "iq4_nl") {
+    if (N >= 100000) {
+      return 3;
+    }
+    if (N < 2048) {
+      return 0;
+    }
+    const int m = K >= 6144 ? 3 : (K >= 4096 || N >= 10240) ? 4 : 5;
+    return f16 ? std::min(5, m + 1) : m;
+  }
   if (t == "pq2_0" || t == "q2_0" || t == "q4_0" || t == "q4_k" ||
       t == "q5_k") {
     return 3;
@@ -944,19 +967,20 @@ static int kq_verify_nax_call_kstep(int K, const std::string& t) {
 // verify_nax serves a K of whole steps from an aligned weight base. The
 // q4_k and q5_k kernels read 16-byte words. The q6_k and q3_k kernels read
 // 2-byte words, since every other 210- or 110-byte superblock starts 2 mod
-// 4. The other codecs take a 4-byte check, which the q8_0, eight-block
-// q4_0 and q2_k kernels need for their 4-byte words. kq_check_weight_base
-// raises first on every K-quant base this check would decline, so the
-// decline reaches only q8_0, q4_0 and pq2_0 bases 2 mod 4, which the other
-// routes serve. The K-quant kernels also need K in whole superblocks, since
-// the q2_k, q3_k, q5_k and q6_k steps are half of one. Rows of such a K
+// 4. The iq4_xs kernel reads 8-byte words. The other codecs take a 4-byte
+// check, which the q8_0, eight-block q4_0, iq4_nl and q2_k kernels need
+// for their 4-byte words. kq_check_weight_base raises first on every
+// K-quant and iq4_xs base this check would decline, so the decline
+// reaches only q8_0, q4_0, iq4_nl and pq2_0 bases 2 mod 4, which the
+// other routes serve. The K-quant kernels also need K in whole superblocks,
+// since the q2_k, q3_k, q5_k and q6_k steps are half of one. Rows of such a K
 // stay aligned with the base.
 static bool
 kq_verify_nax_fits(const array& w, int K, int kstep, const std::string& t) {
   const bool kq = t == "q4_k" || t == "q5_k";
   const bool half_word = t == "q6_k" || t == "q3_k";
   const bool sb = kq || half_word || t == "q2_k";
-  const uintptr_t align = kq ? 15 : half_word ? 1 : 3;
+  const uintptr_t align = kq ? 15 : half_word ? 1 : t == "iq4_xs" ? 7 : 3;
   return kstep > 0 && K % (sb ? 256 : kstep) == 0 &&
       (reinterpret_cast<uintptr_t>(w.data<uint8_t>()) & align) == 0;
 }
@@ -1706,7 +1730,8 @@ static int kq_verify_nax_wave_splits(int sgs, int steps, double partial_c) {
 // their simdgroup targets, which beat the wave count on that matmul time
 // by 0.3-0.9%, the largest share at N 17408, K 5120.
 static double kq_verify_nax_partial_c(const std::string& t, int kstep) {
-  if (t == "q4_k" || (t == "q4_0" && kstep == 256)) {
+  if (t == "q4_k" || (t == "q4_0" && kstep == 256) || t == "iq4_xs" ||
+      t == "iq4_nl") {
     return 640.0;
   }
   if (t == "q2_k" || t == "q3_k" || t == "q5_k") {
@@ -2172,7 +2197,9 @@ void KQuantMatmul::eval_gpu_base(
         sk_force >= 1;
     int vnax_min_m = vnax_env;
     if (vnax_env == -1) {
-      vnax_min_m = other_forced ? 0 : kq_verify_nax_min_m(kquant_type_, N);
+      vnax_min_m = other_forced
+          ? 0
+          : kq_verify_nax_min_m(kquant_type_, N, K, x.dtype() == mx::float16);
     }
     if (vnax_min_m > 0 && M >= vnax_min_m &&
         kq_verify_nax_fits(w, K, kstep, kquant_type_)) {

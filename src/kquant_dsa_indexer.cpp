@@ -246,10 +246,16 @@ void KQDsaIndexerScoreDecode::eval_gpu(
   const int NC = cand_ ? cand.shape(2) : P;
 
   const bool wf = weights.dtype() == mx::float32;
+  // 4 heads fill half a query tile, so 2 to 4 query rows go two to a tile
+  // and share one read of the keys. KQ_DSA_SCORE_PAIR=0 keeps one row per
+  // tile and one pass over the keys per row.
+  const char* pair_env = std::getenv("KQ_DSA_SCORE_PAIR");
+  const bool pair =
+      H == 4 && QL > 1 && !cand_ && !(pair_env && std::string(pair_env) == "0");
   const std::string kname = "kq_dsa_indexer_score_decode_" +
       (H == 64 && !wf ? std::string() : "h" + std::to_string(H) + "_") +
       std::string(wf ? "wf_" : "") + kq_type_string(q.dtype()) + "_ql" +
-      std::to_string(QL) + (cand_ ? "_cand" : "");
+      std::to_string(QL) + (cand_ ? "_cand" : "") + (pair ? "_pair" : "");
 
   // Keys per threadgroup: a multiple of the kernel's SGS x 8 rows, at
   // least 128 and sized for about 512 threadgroups (the query staging
@@ -280,6 +286,43 @@ void KQDsaIndexerScoreDecode::eval_gpu(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+namespace {
+
+// Threadgroups one row of the top-k select is split over: 1, 2, 4, 8 or
+// 16. One threadgroup runs on one GPU core, so a long row in one
+// threadgroup is bound by that core however few rows there are; split, the
+// row costs three dispatches and uses the idle cores. 1 keeps the
+// one-dispatch kernel: short rows, where the extra dispatches cost more
+// than the scan, and many rows, which fill the cores without a split.
+// Fitted with benchmarks/bench_dsa_topk_chunks.py. KQ_DSA_TOPK_CHUNKS
+// forces a count, rounded down to a power of two.
+int kq_dsa_topk_chunks(int rows, int K) {
+  constexpr int max_chunks = 16;
+  if (const char* e = std::getenv("KQ_DSA_TOPK_CHUNKS")) {
+    const int v = std::atoi(e);
+    if (v >= 1) {
+      int g = 1;
+      while (2 * g <= std::min(v, max_chunks)) {
+        g *= 2;
+      }
+      return g;
+    }
+  }
+  if (K < 12288 || rows > 128) {
+    return 1;
+  }
+  int g = 1;
+  while (g < max_chunks && K / (2 * g) >= 1024) {
+    g *= 2;
+  }
+  while (g > 1 && rows * g > 64 && K / g < 8000) {
+    g /= 2;
+  }
+  return g;
+}
+
+} // namespace
+
 void KQDsaTopKIndices::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
@@ -290,26 +333,13 @@ void KQDsaTopKIndices::eval_gpu(
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
-  constexpr int threads = 1024;
+  constexpr int threads = 512;
 
   const int B = scores.shape(0);
   const int L = scores.shape(2);
   const int K = scores.shape(3);
   const int rows = B * L;
-
-  const std::string kname = "kq_dsa_topk_indices_" +
-      kq_type_string(scores.dtype()) + "_topk" + std::to_string(topk_) + "_t" +
-      std::to_string(threads);
-
-  bool bucketed = bucketed_;
-  mx::metal::MTLFCList func_consts = {
-      {&bucketed, MTL::DataType::DataTypeBool, 302},
-  };
-  const std::string hash_name = kname + "_bucketed_" + (bucketed ? 't' : 'n');
-
-  auto kernel = kq_get_kernel(d, kname, hash_name, func_consts);
-  auto& ce = mx::metal::get_command_encoder(s);
-  ce.set_compute_pipeline_state(kernel);
+  const int chunks = kq_dsa_topk_chunks(rows, K);
 
   KQDsaTopKParams params{
       /* int rows = */ rows,
@@ -318,12 +348,62 @@ void KQDsaTopKIndices::eval_gpu(
       /* int topk = */ topk_,
       /* bool causal_valid_prefix = */ causal_valid_prefix_};
 
-  ce.set_input_array(scores, 0);
-  ce.set_output_array(out, 1);
-  ce.set_bytes(params, 2);
-
+  auto& ce = mx::metal::get_command_encoder(s);
   MTL::Size group_dims(threads, 1, 1);
-  MTL::Size grid_dims(rows, 1, 1);
+  const std::string tail = kq_type_string(scores.dtype()) + "_c" +
+      std::to_string(chunks) + "_t" + std::to_string(threads);
+
+  if (chunks == 1) {
+    const std::string kname = "kq_dsa_topk_indices_" +
+        kq_type_string(scores.dtype()) + "_topk" + std::to_string(topk_) +
+        "_t" + std::to_string(threads);
+
+    bool bucketed = bucketed_;
+    mx::metal::MTLFCList func_consts = {
+        {&bucketed, MTL::DataType::DataTypeBool, 302},
+    };
+    const std::string hash_name = kname + "_bucketed_" + (bucketed ? 't' : 'n');
+
+    auto kernel = kq_get_kernel(d, kname, hash_name, func_consts);
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(scores, 0);
+    ce.set_output_array(out, 1);
+    ce.set_bytes(params, 2);
+    ce.dispatch_threadgroups(MTL::Size(rows, 1, 1), group_dims);
+    return;
+  }
+
+  // Per-chunk histograms the three dispatches hand on. Every word a later
+  // dispatch reads is written by the one before it.
+  mx::array hist_hi({rows, chunks, 256}, mx::uint32, nullptr, {});
+  mx::array hist_lo(
+      {rows, chunks, KQ_DSA_TOPK_LO_STRIDE}, mx::uint32, nullptr, {});
+  hist_hi.set_data(mx::allocator::malloc(hist_hi.nbytes()));
+  hist_lo.set_data(mx::allocator::malloc(hist_lo.nbytes()));
+  ce.add_temporary(hist_hi);
+  ce.add_temporary(hist_lo);
+  MTL::Size grid_dims(size_t(rows) * chunks, 1, 1);
+
+  ce.set_compute_pipeline_state(
+      kq_get_kernel(d, "kq_dsa_topk_hist_hi_" + tail));
+  ce.set_input_array(scores, 0);
+  ce.set_output_array(hist_hi, 1);
+  ce.set_bytes(params, 2);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+
+  ce.set_compute_pipeline_state(
+      kq_get_kernel(d, "kq_dsa_topk_hist_lo_" + tail));
+  ce.set_input_array(scores, 0);
+  ce.set_input_array(hist_hi, 1);
+  ce.set_output_array(hist_lo, 2);
+  ce.set_bytes(params, 3);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+
+  ce.set_compute_pipeline_state(kq_get_kernel(d, "kq_dsa_topk_emit_" + tail));
+  ce.set_input_array(scores, 0);
+  ce.set_input_array(hist_lo, 1);
+  ce.set_output_array(out, 2);
+  ce.set_bytes(params, 3);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
