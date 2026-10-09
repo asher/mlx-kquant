@@ -9,7 +9,9 @@ transform) and a stock add of the bias.
 - R1: relative Frobenius error against the float64 convolution, at most
   6e-3 on bfloat16 and 1e-3 on float16.
 - R2: on the kernel, the error sits at the one rounding of y: at most 1.05
-  times the error of the float64 result rounded to bfloat16.
+  times the error of the float64 result rounded to bfloat16, and each
+  element within ULPS ulp of bfloat16 at the float64 result plus 2^-20
+  times the sum of |x w| over its taps and channels.
 - Where the op has no kernel, y is the composition a caller writes, bit for
   bit.
 
@@ -38,6 +40,11 @@ MIN_ROWS = 1024
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 # Tiles of the metallib: the two the op picks, and two for KQ_CONV_TILE.
 TILES = [(128, 128, 4, 4), (128, 64, 4, 2), (64, 128, 2, 4), (64, 64, 2, 2)]
+# R2 per element: the ulp count and the allowance for the f32 sums per unit
+# of sum |x w|. Bfloat16 holds 8 significant bits, its smallest normal has
+# np.frexp exponent -125.
+ULPS = 2
+SUM_TOL = 2.0**-20
 
 
 def _nax():
@@ -69,9 +76,12 @@ def _inputs(b, h, w, c, o, dtype=mx.bfloat16, bias=True, seed=0):
     return x, wt, bs
 
 
-def _ref(x, w, bias):
-    """The float64 convolution, pixels flattened."""
+def _ref(x, w, bias, mag=False):
+    """The float64 convolution, pixels flattened. mag=True gives sum |x w|
+    per element, without the bias."""
     xd, wd = _f64(x), _f64(w)
+    if mag:
+        xd, wd, bias = np.abs(xd), np.abs(wd), None
     b, h, wid, c = xd.shape
     o = wd.shape[0]
     xp = np.pad(xd, ((0, 0), (1, 1), (1, 1), (0, 0)))
@@ -80,6 +90,16 @@ def _ref(x, w, bias):
     if bias is not None:
         y = y + _f64(bias)
     return y
+
+
+def _ulps(got, ref, mag):
+    """The largest error in ulp of bfloat16 at |ref|, after the allowance of
+    SUM_TOL * mag for the f32 sums, and its pixel and column."""
+    e = np.frexp(np.abs(ref))[1]
+    e = np.where(ref == 0, -125, np.maximum(e, -125))
+    u = (np.abs(got - ref) - SUM_TOL * mag) / np.ldexp(1.0, e - 8)
+    i = np.unravel_index(int(np.argmax(u)), u.shape)
+    return float(u[i]), tuple(int(v) for v in i)
 
 
 def _composed(x, w, bias):
@@ -111,6 +131,8 @@ def _check(x, w, bias):
     assert err <= R1[x.dtype], err
     floor = _rel(_f64(mx.array(ref.astype(np.float32)).astype(x.dtype)), ref)
     assert err <= 1.05 * floor + 1e-5, (err, floor)
+    worst = _ulps(got, ref, _ref(x, w, bias, mag=True))
+    assert worst[0] <= ULPS, worst
     return err, err / floor
 
 
@@ -323,6 +345,7 @@ for i, c in enumerate(spec["calls"]):
         res["rel"] = t._rel(got, ref)
         res["floor"] = t._rel(
             t._f64(mx.array(ref.astype(t.np.float32)).astype(mx.bfloat16)), ref)
+        res["ulps"] = t._ulps(got, ref, t._ref(x, w, b, mag=True))
     except Exception as e:
         res["error"] = f"{type(e).__name__}: {e}"
     out.append(res)
@@ -390,6 +413,7 @@ def test_conv_known_answer_of_every_kernel():
         tile = tuple(int(v) for v in c["env"]["KQ_CONV_TILE"].split(","))
         assert r["kernels"] == [_name(tile)], (c, r["kernels"])
         assert r["rel"] <= 1.05 * r["floor"] + 1e-5, (c, r["rel"], r["floor"])
+        assert r["ulps"][0] <= ULPS, (c, r["ulps"])
 
 
 def test_conv_tile_choice_and_levers():

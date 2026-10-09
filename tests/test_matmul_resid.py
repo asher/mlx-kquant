@@ -9,7 +9,8 @@ quantized_matmul and stock ops.
   bfloat16 and 1e-3 on float16.
 - R2: against the model of the kernel, with the weight rounded to the
   activation dtype, exact sums and one rounding of y. The kernel sits at
-  the error of that one rounding.
+  the error of that one rounding, and each element is within ULPS ulp of
+  the output dtype at the model plus 2^-20 times the sum of |g x_k w_k|.
 - Where the op has no kernel, y is the composition a caller writes, bit
   for bit, and every column of it is held against the float64 sum (COL).
 
@@ -48,6 +49,11 @@ KERNEL_BK = {"q4_k": 128, "q5_k": 128, "q6_k": 128, "q8_0": 64}
 MAX_K = {"q4_k": 10240, "q5_k": 0, "q6_k": 0, "q8_0": 10240}
 CODECS = list(KERNEL_BK)
 GATES = ["none", "n", "batch"]
+# R2 per element: the ulp count and the allowance for the f32 sums per unit
+# of sum |g x_k w_k|. Bfloat16 holds 8 significant bits, its smallest
+# normal has np.frexp exponent -125.
+ULPS = 2
+SUM_TOL = 2.0**-20
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _W = {}
@@ -74,6 +80,16 @@ def _rounded(v, dtype):
 
 def _rel(a, b):
     return float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-30))
+
+
+def _ulps(got, ref, mag):
+    """The largest error in ulp of bfloat16 at |ref|, after the allowance of
+    SUM_TOL * mag for the f32 sums, and its row and column."""
+    e = np.frexp(np.abs(ref))[1]
+    e = np.where(ref == 0, -125, np.maximum(e, -125))
+    u = (np.abs(got - ref) - SUM_TOL * mag) / np.ldexp(1.0, e - 8)
+    i = np.unravel_index(int(np.argmax(u)), u.shape)
+    return float(u[i]), tuple(int(v) for v in i)
 
 
 def _col(a, b):
@@ -112,17 +128,23 @@ def _gate(kind, xshape, n, dtype, seed):
     return g
 
 
-def _ref(x, wd, r, g, model=None):
+def _ref(x, wd, r, g, model=None, mag=False):
     """The float64 sum, rows flattened. model=dtype rounds the weight to
-    that dtype, as the kernel reads it."""
+    that dtype, as the kernel reads it. mag=True gives sum |g x_k w_k| per
+    element in place of the sum."""
     out = mx.bfloat16 if x.dtype == mx.float32 else x.dtype
     n, k = wd.shape
     x64 = _f64(x.astype(out)).reshape(-1, k)
     if model is not None:
         wd = _rounded(wd, model)
+    if mag:
+        x64, wd = np.abs(x64), np.abs(wd)
     prod = (x64 @ wd.T).reshape(tuple(x.shape[:-1]) + (n,))
     if g is not None:
-        prod = _f64(g.astype(out)) * prod
+        gd = _f64(g.astype(out))
+        prod = (np.abs(gd) if mag else gd) * prod
+    if mag:
+        return prod.reshape(-1, n)
     return (_f64(r.astype(out)) + prod).reshape(-1, n)
 
 
@@ -162,6 +184,9 @@ def _check(x, w, wd, r, g, codec="q4_k"):
     floor2 = _rel(_rounded(ref2, dtype), ref2)
     err2 = _rel(got, ref2)
     assert err2 <= 1.05 * floor2 + 2e-5, (err2, floor2)
+    mag = _ref(x, wd, r, g, model=dtype, mag=True)
+    worst = _ulps(got, ref2, mag)
+    assert worst[0] <= ULPS, worst
     return err, err2
 
 
@@ -561,6 +586,8 @@ for i, c in enumerate(spec["calls"]):
         ref2 = t._ref(x, wd, r, g, model=mx.bfloat16)
         res["rel2"] = t._rel(got, ref2)
         res["floor2"] = t._rel(t._rounded(ref2, mx.bfloat16), ref2)
+        mag = t._ref(x, wd, r, g, model=mx.bfloat16, mag=True)
+        res["ulps"] = t._ulps(got, ref2, mag)
     except Exception as e:
         res["error"] = f"{type(e).__name__}: {e}"
     out.append(res)
@@ -608,6 +635,7 @@ def _expect(calls, results, kernel):
             assert r["resid"] == [want], (c, r["resid"])
             assert r["plain"] == [], (c, r["plain"])
             assert r["rel2"] <= 1.05 * r["floor2"] + 2e-5, (c, r["rel2"], r["floor2"])
+            assert r["ulps"][0] <= ULPS, (c, r["ulps"])
         else:
             assert r["resid"] == [], (c, r["resid"])
             assert len(r["plain"]) == 1, (c, r["plain"])
