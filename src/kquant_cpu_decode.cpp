@@ -780,6 +780,24 @@ void dequantize_pq2_0(const uint8_t* w, T* out, std::size_t num_weights) {
   }
 }
 
+// Q2_0 (ggml type 42): the PQ2_0 code layout on a 64-weight, 18-byte block.
+template <typename T>
+void dequantize_q2_0(const uint8_t* w, T* out, std::size_t num_weights) {
+  constexpr int block_weights = 64;
+  constexpr int block_bytes = 18;
+  std::size_t num_blocks = num_weights / block_weights;
+  for (std::size_t b = 0; b < num_blocks; b++) {
+    const uint8_t* block = w + b * block_bytes;
+    float d = read_f16(block);
+    const uint8_t* qs = block + 2;
+    T* y = out + b * block_weights;
+    for (int j = 0; j < block_weights; j++) {
+      const int q = (qs[j >> 2] >> (2 * (j & 3))) & 3;
+      y[j] = static_cast<T>(d * static_cast<float>(q - 1));
+    }
+  }
+}
+
 // PTQ1_0: 24 qs bytes of five base-3 trits each, two qh bytes of four, fp16
 // d last. The stage walk over qs is the reference's {32, 16, 8}; at 24 bytes
 // the 32 stage never fires, so trit n of qs[m] (m < 16) is element 16n + m
@@ -1088,6 +1106,8 @@ DequantFnF32 dequant_fn_f32(const std::string& t) {
     return &dequantize_stq1_0<float>;
   } else if (t == "pq2_0") {
     return &dequantize_pq2_0<float>;
+  } else if (t == "q2_0") {
+    return &dequantize_q2_0<float>;
   } else if (t == "ptq1_0") {
     return &dequantize_ptq1_0<float>;
   } else if (t == "mxfp4") {
@@ -1274,6 +1294,8 @@ void kquant_dequantize_dispatch(
     dequantize_stq1_0(w, out, num_weights);
   } else if (kquant_type == "pq2_0") {
     dequantize_pq2_0(w, out, num_weights);
+  } else if (kquant_type == "q2_0") {
+    dequantize_q2_0(w, out, num_weights);
   } else if (kquant_type == "ptq1_0") {
     dequantize_ptq1_0(w, out, num_weights);
   } else if (kquant_type == "mxfp4") {

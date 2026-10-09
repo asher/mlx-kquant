@@ -32,7 +32,7 @@ import mlx_kquant as kq
 
 pytestmark = pytest.mark.skipif(force_cpu(), reason="GPU verify route")
 
-CODECS = ["pq2_0", "ptq1_0", "q4_0", "q8_0"]
+CODECS = ["pq2_0", "ptq1_0", "q2_0", "q4_0", "q8_0"]
 DTYPES = ["bfloat16", "float16"]
 # design: (K, N)
 DESIGNS = {"normal": (4096, 512), "big": (1024, 256)}

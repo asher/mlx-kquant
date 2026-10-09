@@ -689,8 +689,18 @@ def test_lora_operand_views(state, m, codec):
         ("q5_k", mx.float16),
         ("q6_k", mx.float16),
         ("q8_0", mx.float16),
+        ("q2_0", mx.bfloat16),
+        ("pq2_0", mx.bfloat16),
     ],
-    ids=["q3_k-bf16", "q4_0-bf16", "q5_k-f16", "q6_k-f16", "q8_0-f16"],
+    ids=[
+        "q3_k-bf16",
+        "q4_0-bf16",
+        "q5_k-f16",
+        "q6_k-f16",
+        "q8_0-f16",
+        "q2_0-bf16",
+        "pq2_0-bf16",
+    ],
 )
 def test_lora_codec_without_kernel_composes(codec, dtype):
     n, r = 96, 16

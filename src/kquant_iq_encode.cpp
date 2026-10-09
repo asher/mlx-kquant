@@ -2160,18 +2160,18 @@ void quantize_stq1_0_block(const T* xb, uint8_t* block) {
 
 // Port of quantize_row_pq2_0_ref (PrismML/llama.cpp): d = amax, code =
 // round(x / d) + 1 clipped to 0..3, four codes per byte, low bits first. The
-// imatrix is ignored.
-template <typename T>
+// imatrix is ignored. At wpb 64 it is ggml's quantize_row_q2_0_ref.
+template <typename T, int wpb = 128>
 void quantize_pq2_0_block(const T* xb, uint8_t* block) {
   float amax = 0.0f;
-  for (int j = 0; j < 128; ++j) {
+  for (int j = 0; j < wpb; ++j) {
     amax = std::max(amax, std::fabs(static_cast<float>(xb[j])));
   }
   const float id = amax > 0.0f ? 1.0f / amax : 0.0f;
   write_f16(block, amax);
   uint8_t* qs = block + 2;
-  std::memset(qs, 0, 32);
-  for (int j = 0; j < 128; ++j) {
+  std::memset(qs, 0, wpb / 4);
+  for (int j = 0; j < wpb; ++j) {
     int q = static_cast<int>(std::round(static_cast<float>(xb[j]) * id)) + 1;
     q = std::min(std::max(q, 0), 3);
     qs[j >> 2] |= static_cast<uint8_t>(q << (2 * (j & 3)));
@@ -2304,6 +2304,12 @@ void kquant_iq_quantize_dispatch(
     std::size_t nblocks = num_weights / wpb;
     for (std::size_t b = 0; b < nblocks; ++b) {
       quantize_pq2_0_block<T>(w + b * wpb, out + b * bpb);
+    }
+  } else if (kquant_type == "q2_0") {
+    constexpr int wpb = 64, bpb = 18;
+    std::size_t nblocks = num_weights / wpb;
+    for (std::size_t b = 0; b < nblocks; ++b) {
+      quantize_pq2_0_block<T, wpb>(w + b * wpb, out + b * bpb);
     }
   } else if (kquant_type == "ptq1_0") {
     constexpr int wpb = 128, bpb = 28;

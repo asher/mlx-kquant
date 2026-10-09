@@ -191,3 +191,38 @@ def test_live_levers_numerics(dtype):
     for c, r in zip(calls, res, strict=True):
         assert r["error"] is None, (c, r["error"])
         assert r["rel"] < R1[dtype], (c, r["rel"])
+
+
+# q2_0 takes the tile levers of every NAX codec: BM=128 from M 449 at an
+# even ceil(M/64), the BM=32 tile at M 16.
+Q2_0_CALLS = [
+    {"codec": "q2_0", "shape": [512, K], "n": N},
+    {"codec": "q2_0", "shape": [512, K], "n": N, "env": {"KQ_NAX_BM128": "0"}},
+    {"codec": "q2_0", "shape": [512, K], "n": N, "env": {"KQ_NAX_SWIZZLE": "1"}},
+    {
+        "codec": "q2_0",
+        "shape": [16, K],
+        "n": N,
+        "env": {"KQ_NAX_SWIZZLE": None, "KQ_QMM_ROUTE": "nax"},
+    },
+    {"codec": "q2_0", "shape": [16, K], "n": N, "env": {"KQ_NAX_SMALL_BM": "0"}},
+    {
+        "codec": "q2_0",
+        "shape": [512, K],
+        "n": N,
+        "env": {"KQ_QMM_ROUTE": None, "KQ_NAX_TILE": "32,64,2,2"},
+    },
+]
+
+
+def test_q2_0_levers_live():
+    res = run_probe(Q2_0_CALLS, env={"KQ_QMM_LOG": "1", "KQ_TUNE_LIVE": "1"})
+    for c, r in zip(Q2_0_CALLS, res, strict=True):
+        assert r["error"] is None, (c, r["error"])
+        assert r["rel"] < R1["bfloat16"], (c, r["rel"])
+    if force_cpu() or not kq.nax_available():
+        return
+    got = [_only_kernel(r) for r in res]
+    assert [tile_of(n)[0] for n, _ in got] == [128, 64, 64, 32, 64, 32]
+    assert [g for _, g in got[:3]] == [(2, 4, 1), (2, 8, 1), (4, 4, 1)]
+    assert got[5][1] == (2, 16, 1)

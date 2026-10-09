@@ -44,6 +44,8 @@ CODEC_GEOMETRY: dict[str, tuple[int, int, int, int]] = {
     # with one fp16 scale. pq2_0 is four-level 2-bit, ptq1_0 is base-3 ternary.
     "pq2_0": (128, 2, 34, 128),
     "ptq1_0": (128, 1, 28, 128),
+    # q2_0 (ggml type 42): the pq2_0 code layout on a 64-weight block.
+    "q2_0": (64, 2, 18, 64),
     # Native-fp codecs (OCP micro-scaling floats): mxfp4 is one e8m0 scale per
     # 32 E2M1 values; nvfp4 packs four 16-value ue4m3-scaled groups per
     # 64-weight block, so group_size (16) != weights_per_block (64).

@@ -68,6 +68,42 @@ def test_load_gguf(tmp_path):
         assert list(shapes[name]) == [64, 8]
 
 
+@pytest.mark.parametrize("name", ["STQ1_0", "PQ2_0", "PTQ1_0", "Q2_0"])
+def test_load_gguf_codecs_newer_than_gguf_py(tmp_path, name):
+    """A tensor of a ggml type gguf-py has no member for loads with its
+    codec name, its wire bytes and its logical shape, as a zero-copy view
+    and as a copy. The parser sizes the tensor from its own type table, so a
+    type missing there fails the load."""
+    from kqref import SENTINELS, synth_wire
+
+    ((sent, (wpb, bpb, _, _)),) = [
+        (s, v) for s, v in SENTINELS.items() if s.name == name
+    ]
+    codec = name.lower()
+    rows, k = 6, 4 * 256
+    wire = synth_wire(np.random.default_rng(1), codec, bpb, rows * k // wpb)
+    wire = wire.reshape(rows, k // wpb * bpb)
+    path = str(tmp_path / f"{codec}.gguf")
+    w = GGUFWriter(path, "smoke")
+    w.add_tensor("pad.f32", np.zeros((3,), dtype=np.float32), raw_dtype=GT.F32)
+    w.add_tensor("layer.w", wire, raw_dtype=sent)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    for zero_copy in (True, False):
+        arrays, codecs, _, shapes = kq.load_gguf(path, zero_copy=zero_copy)
+        assert codecs["layer.w"] == codec
+        assert list(shapes["layer.w"]) == [k, rows]
+        got = arrays["layer.w"]
+        assert got.dtype == mx.uint8
+        assert np.array_equal(np.array(got), wire)
+        aliases = kq.verify_zero_copy_views([("layer.w", got)], ["layer.w"])
+        # a build without Metal has no zero-copy view: every load is a copy
+        assert bool(aliases) == (zero_copy and mx.metal.is_available())
+        del arrays, got
+
+
 def test_zero_copy_matches_copy(tmp_path):
     """zero_copy=True (no-copy mmap views) must be byte-identical to zero_copy=
     False (eager memcpy). Mints its own GGUF, compares kq-vs-kq.
@@ -233,6 +269,55 @@ def test_load_gguf_wire_over_widest_window(tmp_path):
 
     for i in marks:
         assert np.array_equal(np.array(a[i]), wire[i]), i
+
+
+@pytest.mark.skipif(
+    not __import__("os").environ.get("KQUANT_BIG_TESTS"),
+    reason="writes a >4 GiB GGUF; set KQUANT_BIG_TESTS=1 to run",
+)
+def test_load_gguf_wire_over_widest_window_at_file_head(tmp_path):
+    """The same oversize tensor as the first one in its file. Its data starts
+    in the first page, off a 34-byte boundary, so the window base has no pages
+    to walk back over and the rows cannot align. The row count divides by 64,
+    so a power-of-two stride carries the window instead."""
+    import resource
+    import sys
+
+    from gguf import GGUFReader
+
+    rows, row_bytes = 127_000_064, 34  # k=32 q8_0 blocks, ~4.32 GB
+    nbytes = rows * row_bytes
+    assert nbytes > 2 * 2**31 and rows % 64 == 0
+
+    wire = np.zeros((rows, row_bytes), dtype=np.uint8)
+    marks = (0, 1, rows // 2, rows - 1)
+    for i in marks:
+        wire[i] = np.arange(row_bytes, dtype=np.uint8) + (i % 251)
+
+    path = str(tmp_path / "head.gguf")
+    w = GGUFWriter(path, "smoke")
+    w.add_tensor("head.q8", wire, raw_dtype=GT.Q8_0)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    del wire
+
+    start = int(GGUFReader(path).tensors[0].data_offset)
+    assert start < 16384 and start % row_bytes != 0
+
+    scale = 1 if sys.platform == "darwin" else 1024  # ru_maxrss units
+    rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale
+    arrays, codecs, _meta, _shapes = kq.load_gguf(path, True)
+    a = arrays["head.q8"]
+    assert a.dtype == mx.uint8 and a.shape == (rows, row_bytes)
+    assert dict(codecs)["head.q8"] == "q8_0"
+
+    for i in marks:
+        want = np.arange(row_bytes, dtype=np.uint8) + (i % 251)
+        assert np.array_equal(np.array(a[i]), want), i
+    rss1 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale
+    assert rss1 - rss0 < 512 * 1024 * 1024, "load copied the wire bytes"
 
 
 def test_load_gguf_skip(tmp_path):

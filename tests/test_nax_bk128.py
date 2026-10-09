@@ -177,6 +177,26 @@ def test_bk128_lever_keeps_first_read(codec):
         assert [_bk(_kernel(r)[0]) for r in res] == [want, want]
 
 
+# The 2-bit block codecs carry no kernel on a K tile of 128: with a lever of
+# their name set they run the BK=64 kernels of the BM=128 and BM=64 tiles.
+@pytest.mark.parametrize("codec", ["pq2_0", "q2_0"])
+def test_no_bk128_codec_keeps_bk64(codec):
+    nax = _nax_gpu()
+    calls = [
+        {"codec": codec, "shape": [rows, K], "n": n, "seed": rows}
+        for rows, n in ((4096, 128), (4128, 96), (160, 128))
+    ]
+    res = run_probe(calls, env=dict(LIVE, **{_lever(codec): "1"}))
+    for c, r, bm in zip(calls, res, (128, 128, 64), strict=True):
+        assert r["error"] is None, (c, r["error"])
+        assert r["rel"] < R1["bfloat16"], (c, r["rel"])
+        assert r["nonfinite"] == 0, c
+        if nax:
+            name, _ = _kernel(r)
+            assert _bk(name) == 64, (c, name)
+            assert tile_of(name)[0] == bm, (c, name)
+
+
 # (shape, n): BM=128 at an even and an odd row-tile count, BM=64, N not a
 # multiple of 64, and batches of two flattened into 512 rows (BM=128) and
 # 544 rows (BM=64).

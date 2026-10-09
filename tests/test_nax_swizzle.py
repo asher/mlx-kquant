@@ -30,7 +30,7 @@ POLICY_LOG: dict[str, int] = {}
 MEASURED = {"q4_k", "q5_k", "q6_k", "q8_0"}
 # K ceiling of each row (kq_largem_max_k); codecs not listed have none.
 MAX_K = {
-    "q2_k": 4096, "pq2_0": 4096,
+    "q2_k": 4096, "pq2_0": 4096, "q2_0": 4096,
     "q4_k": 10240, "q8_0": 10240, "q4_0": 10240, "q4_1": 10240,
     "q5_0": 10240, "q5_1": 10240,
     "iq4_nl": 12288, "stq1_0": 12288,

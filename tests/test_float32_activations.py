@@ -31,6 +31,7 @@ ROUTES = [
     ("q4_0", 4, "verify_qmv"),
     ("q4_k", 4, "mv_ext"),
     ("pq2_0", 4, "verify_mma"),
+    ("q2_0", 4, "verify_mma"),
     ("q4_0", 4, "verify_nax"),
     ("q4_k", 8, "splitk"),
     ("q4_k", 16, "nax"),

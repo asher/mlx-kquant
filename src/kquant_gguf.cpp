@@ -209,12 +209,18 @@ std::optional<mx::array> try_zero_copy_array(
         }
       }
       // Else the widest power-of-two stride the window offset already carries.
+      // The search starts at the first one that is wide enough: a narrower
+      // stride never fits, and a tensor at the head of its file has no pages
+      // below it to walk back over.
       if (win_row_bytes == 0) {
         size_t p2 = isz;
-        while (p2 * 2 <= nbytes && row_fits(p2 * 2, win_off)) {
+        while (p2 < need) {
           p2 *= 2;
         }
         if (row_fits(p2, win_off)) {
+          while (p2 * 2 <= nbytes && row_fits(p2 * 2, win_off)) {
+            p2 *= 2;
+          }
           win_row_bytes = p2;
         }
       }
@@ -306,12 +312,14 @@ const KQuantCodec* gguf_type_to_kquant_codec(uint32_t t) {
       return codec_by_name("iq1_s");
     case GGUF_TYPE_IQ1_M:
       return codec_by_name("iq1_m");
-    // Bare literals (MXFP4=39, NVFP4=40, STQ1_0=43, PQ2_0=142, PTQ1_0=143):
-    // gguflib's enum may predate these types.
+    // Bare literals (MXFP4=39, NVFP4=40, Q2_0=42, STQ1_0=43, PQ2_0=142,
+    // PTQ1_0=143): gguflib's enum may predate these types.
     case 39:
       return codec_by_name("mxfp4");
     case 40:
       return codec_by_name("nvfp4");
+    case 42:
+      return codec_by_name("q2_0");
     case 43:
       return codec_by_name("stq1_0");
     case 142:

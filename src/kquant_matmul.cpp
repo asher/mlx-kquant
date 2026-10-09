@@ -161,7 +161,8 @@ static KqSmallBmPolicy kq_smallbm_base(const std::string& t) {
   if (t == "q5_0") {
     return {true, 7, 8192, 961};
   }
-  if (t == "iq1_s" || t == "stq1_0" || t == "pq2_0" || t == "ptq1_0") {
+  if (t == "iq1_s" || t == "stq1_0" || t == "pq2_0" || t == "q2_0" ||
+      t == "ptq1_0") {
     // stq1_0 and the Prism codecs start on the iq1_s policy; re-tune with
     // bench_qmm_bm128_ab.
     return {true, 0, 0, 449};
@@ -190,9 +191,10 @@ static KqLoaderClass kq_loader_class(const std::string& t) {
 // 4096 win for every codec). 0: no loss up to K 16384. On the BK=128 tiles
 // q3_k, q5_k, q6_k, iq2_s, iq2_xs, iq3_s and iq3_xxs win at every K, and so
 // do iq1_s, iq1_m, iq2_xxs, iq4_xs and ptq1_0 on BK=64. A ceiling holds for
-// the codec's default K tile.
+// the codec's default K tile. q2_0 takes the pq2_0 ceiling; it is not
+// measured.
 static int kq_largem_max_k(const std::string& t) {
-  if (t == "q2_k" || t == "pq2_0") {
+  if (t == "q2_k" || t == "pq2_0" || t == "q2_0") {
     return 4096;
   }
   if (t == "q4_k" || t == "q8_0" || t == "q4_0" || t == "q4_1" || t == "q5_0" ||
@@ -290,8 +292,8 @@ static bool kq_splitk_codec(const std::string& t) {
       t == "q2_k" || t == "q8_0" || t == "iq4_xs" || t == "iq4_nl" ||
       t == "iq3_xxs" || t == "iq3_s" || t == "iq2_xxs" || t == "iq2_xs" ||
       t == "iq2_s" || t == "iq1_s" || t == "iq1_m" || t == "stq1_0" ||
-      t == "pq2_0" || t == "ptq1_0" || t == "q4_0" || t == "q4_1" ||
-      t == "q5_0" || t == "q5_1";
+      t == "pq2_0" || t == "q2_0" || t == "ptq1_0" || t == "q4_0" ||
+      t == "q4_1" || t == "q5_0" || t == "q5_1";
 }
 
 // Non-NAX default split-K entry M per codec (0 = env lever only).
@@ -374,7 +376,7 @@ static int kq_prism_verify_max_m() {
 // (1.05-1.12x) and q4_0 M2 (1.09-1.23x). Below the entry the mat-vec
 // kernels hold.
 static int kq_verify_mma_min_m(const std::string& t, bool f16) {
-  if (t == "pq2_0") {
+  if (t == "pq2_0" || t == "q2_0") {
     return f16 ? 4 : 3;
   }
   if (t == "ptq1_0") {
@@ -397,7 +399,7 @@ static int kq_verify_mma_min_m(const std::string& t, bool f16) {
 // M5, 1.10-1.39x at M8. f16: pq2_0 0.91-1.01x at M4, 1.16-1.33x at M5;
 // ptq1_0 1.05-1.18x at M3; q4_0 0.86-1.39x at M4, 1.10-1.46x at M5.
 static int kq_verify_mma_min_m_nax(const std::string& t) {
-  if (t == "pq2_0" || t == "q4_0") {
+  if (t == "pq2_0" || t == "q2_0" || t == "q4_0") {
     return 5;
   }
   if (t == "ptq1_0") {
@@ -424,8 +426,32 @@ static int kq_verify_mma_min_m_nax(const std::string& t) {
 // mv_ext at M 4, so it enters at M 5 up to N 4096. q3_k keeps M 4 there
 // and runs within 1.03x of the fastest other route, except at N 2048, K
 // 4096 on f16, where it runs 1.04-1.06x behind mv_ext, about 1 us.
-static int kq_verify_nax_min_m(const std::string& t, int N) {
-  if (t == "pq2_0" || t == "q4_0" || t == "q4_k" || t == "q5_k") {
+//
+// iq4_xs and iq4_nl run the kernel at the rate of q4_k, flat in M, and
+// their mat-vec routes run faster than q4_k's at M 2 to 4, so the entry
+// moves with the shape. It was fitted on bf16 over 32 shapes of N 1024 to
+// 248320 and K 2048 to 17408. K 6144 and wider enters at M 3 (0.79-1.01x
+// of the default route), K 4096 to 5120 at M 4 (0.79-1.00x), a narrower K
+// at M 4 from N 10240 (0.91-1.03x) and at M 5 below it (0.88-1.00x, and
+// 1.04-1.08x at N 4096, K 2560, about 1 us). Under N 2048 the kernel ran
+// up to 1.19x slower through M 5 and has no entry. On float16 the mat-vec
+// routes run faster and the kernel the same, so an entry under M 5 moves
+// up one row: at the bf16 entries the kernel ran up to 1.10x slower on K
+// 4096 and 1.21x at N 12288, K 2560. A vocab head keeps M 3 on both types
+// (0.97x).
+static int kq_verify_nax_min_m(const std::string& t, int N, int K, bool f16) {
+  if (t == "iq4_xs" || t == "iq4_nl") {
+    if (N >= 100000) {
+      return 3;
+    }
+    if (N < 2048) {
+      return 0;
+    }
+    const int m = K >= 6144 ? 3 : (K >= 4096 || N >= 10240) ? 4 : 5;
+    return f16 ? std::min(5, m + 1) : m;
+  }
+  if (t == "pq2_0" || t == "q2_0" || t == "q4_0" || t == "q4_k" ||
+      t == "q5_k") {
     return 3;
   }
   if (t == "q8_0") {
@@ -452,8 +478,8 @@ static int kq_splitk_min_m(const std::string& t) {
     return 4;
   }
   if (t == "q5_k" || t == "q8_0" || t == "iq4_nl" || t == "iq3_xxs" ||
-      t == "iq3_s" || t == "stq1_0" || t == "pq2_0" || t == "ptq1_0" ||
-      t == "q4_0" || t == "q5_0") {
+      t == "iq3_s" || t == "stq1_0" || t == "pq2_0" || t == "q2_0" ||
+      t == "ptq1_0" || t == "q4_0" || t == "q5_0") {
     return 5;
   }
   if (t == "q3_k") {
@@ -566,7 +592,7 @@ static KqNaxSmallM kq_nax_small_m(const std::string& t) {
   if (t == "stq1_0") {
     return {{3, 1, 1, 1}, 2, 3};
   }
-  if (t == "pq2_0" || t == "ptq1_0") {
+  if (t == "pq2_0" || t == "q2_0" || t == "ptq1_0") {
     return {{8, 5, 3, 2}, 9, 9};
   }
   return {{1, 1, 1, 1}, 0, 0};
@@ -1182,9 +1208,9 @@ static std::string kq_qmm_nax_splitk_kname(
 }
 
 // verify_mma codecs with half kernels; ptq1_0 runs as fast in float and
-// has none.
+// has none. q2_0 has them as pq2_0 does.
 static bool kq_verify_mma_has_half(const std::string& t) {
-  return t == "pq2_0" || t == "q4_0" || t == "q8_0";
+  return t == "pq2_0" || t == "q2_0" || t == "q4_0" || t == "q8_0";
 }
 
 // KQ_VERIFY_MMA_HALF=1 (probe lever, read live) runs the half kernels on
@@ -1422,19 +1448,20 @@ static int kq_verify_nax_call_kstep(int K, const std::string& t) {
 // verify_nax serves a K of whole steps from an aligned weight base. The
 // q4_k and q5_k kernels read 16-byte words. The q6_k and q3_k kernels read
 // 2-byte words, since every other 210- or 110-byte superblock starts 2 mod
-// 4. The other codecs take a 4-byte check, which the q8_0, eight-block
-// q4_0 and q2_k kernels need for their 4-byte words. kq_check_weight_base
-// raises first on every K-quant base this check would decline, so the
-// decline reaches only q8_0, q4_0 and pq2_0 bases 2 mod 4, which the other
-// routes serve. The K-quant kernels also need K in whole superblocks, since
-// the q2_k, q3_k, q5_k and q6_k steps are half of one. Rows of such a K
+// 4. The iq4_xs kernel reads 8-byte words. The other codecs take a 4-byte
+// check, which the q8_0, eight-block q4_0, iq4_nl and q2_k kernels need
+// for their 4-byte words. kq_check_weight_base raises first on every
+// K-quant and iq4_xs base this check would decline, so the decline
+// reaches only q8_0, q4_0, iq4_nl and pq2_0 bases 2 mod 4, which the
+// other routes serve. The K-quant kernels also need K in whole superblocks,
+// since the q2_k, q3_k, q5_k and q6_k steps are half of one. Rows of such a K
 // stay aligned with the base.
 static bool
 kq_verify_nax_fits(const array& w, int K, int kstep, const std::string& t) {
   const bool kq = t == "q4_k" || t == "q5_k";
   const bool half_word = t == "q6_k" || t == "q3_k";
   const bool sb = kq || half_word || t == "q2_k";
-  const uintptr_t align = kq ? 15 : half_word ? 1 : 3;
+  const uintptr_t align = kq ? 15 : half_word ? 1 : t == "iq4_xs" ? 7 : 3;
   return kstep > 0 && K % (sb ? 256 : kstep) == 0 &&
       (reinterpret_cast<uintptr_t>(w.data<uint8_t>()) & align) == 0;
 }
@@ -2035,7 +2062,7 @@ static bool kq_codec_has_mv_ext(const std::string& t) {
       t == "q5_1" || t == "iq4_nl" || t == "iq4_xs" || t == "iq3_s" ||
       t == "iq3_xxs" || t == "iq2_xxs" || t == "iq2_xs" || t == "iq2_s" ||
       t == "iq1_s" || t == "iq1_m" || t == "stq1_0" || t == "pq2_0" ||
-      t == "ptq1_0" || t == "mxfp4" || t == "nvfp4";
+      t == "q2_0" || t == "ptq1_0" || t == "mxfp4" || t == "nvfp4";
 }
 
 // Mid-M split-K entry on non-NAX GPUs. From M 33 through 128 the BM64 qmm
@@ -2255,7 +2282,8 @@ static int kq_verify_nax_wave_splits(int sgs, int steps, double partial_c) {
 // their simdgroup targets, which beat the wave count on that matmul time
 // by 0.3-0.9%, the largest share at N 17408, K 5120.
 static double kq_verify_nax_partial_c(const std::string& t, int kstep) {
-  if (t == "q4_k" || (t == "q4_0" && kstep == 256)) {
+  if (t == "q4_k" || (t == "q4_0" && kstep == 256) || t == "iq4_xs" ||
+      t == "iq4_nl") {
     return 640.0;
   }
   if (t == "q2_k" || t == "q3_k" || t == "q5_k") {
@@ -2722,7 +2750,9 @@ void KQuantMatmul::eval_gpu_base(
         sk_force >= 1;
     int vnax_min_m = vnax_env;
     if (vnax_env == -1) {
-      vnax_min_m = other_forced ? 0 : kq_verify_nax_min_m(kquant_type_, N);
+      vnax_min_m = other_forced
+          ? 0
+          : kq_verify_nax_min_m(kquant_type_, N, K, x.dtype() == mx::float16);
     }
     if (vnax_min_m > 0 && M >= vnax_min_m &&
         kq_verify_nax_fits(w, K, kstep, kquant_type_)) {
@@ -3005,7 +3035,8 @@ void KQuantMatmul::eval_gpu_base(
     // The Prism codecs decode each block once per row in verify_qmv and
     // once per activation row in mv_ext, so M 2..4 takes verify_qmv;
     // verify_mma or split-K take the band above.
-    const bool is_prism = kquant_type_ == "pq2_0" || kquant_type_ == "ptq1_0";
+    const bool is_prism = kquant_type_ == "pq2_0" || kquant_type_ == "q2_0" ||
+        kquant_type_ == "ptq1_0";
     const bool mv_ext_default_on =
         codec_has_mv_ext && !(is_prism && M <= kq_prism_verify_max_m());
     // Width gate for the DEFAULT path (the A/B force-on KQ_VERIFY_EXT=1 ignores

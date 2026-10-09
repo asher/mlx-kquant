@@ -1,4 +1,4 @@
-"""Prism codec (PQ2_0, PTQ1_0) oracles and real-file decode checks.
+"""Prism codec (PQ2_0, PTQ1_0) and Q2_0 oracles and real-file decode checks.
 
 The element map of PTQ1_0 is the one place a port can go wrong without any
 kernel being involved, so it is pinned three ways: the stage-derived order in
@@ -103,6 +103,38 @@ def test_pq2_0_quantize_round_trips_three_level_values():
     back = quants.dequantize(wire, "PQ2_0")
     assert np.array_equal(back, x)
     assert np.array_equal(quants.quantize(back, "PQ2_0"), wire)
+
+
+def test_q2_0_is_the_pq2_0_layout_on_64_weight_blocks():
+    """ggml dequantize_row_q2_0: element j is bits (j % 4) * 2 of qs byte
+    j / 4, value (code - 1) * d, 64 weights and 18 bytes per block."""
+    rng = np.random.default_rng(11)
+    wire = synth_wire(rng, "q2_0", 18, 32)
+    want = np.empty((32, 64), dtype=np.float32)
+    for b in range(32):
+        d = np.float32(wire[b, 0:2].copy().view(np.float16)[0])
+        for j in range(64):
+            q = (int(wire[b, 2 + j // 4]) >> ((j % 4) * 2)) & 3
+            want[b, j] = np.float32(q - 1) * d
+    assert np.array_equal(quants.dequantize(wire, "Q2_0"), want)
+    out = kq.dequantize(
+        mx.array(wire), mx.zeros((1,), mx.uint8), "q2_0", dtype=mx.float32, stream=CPU
+    )
+    assert np.array_equal(np.array(out), want)
+
+
+def test_q2_0_quantize_round_trips_three_level_values():
+    rng = np.random.default_rng(13)
+    x = rng.integers(-1, 2, size=(16, 512)).astype(np.float32) * 0.25
+    x[:, ::64] = 0.25  # every block has a nonzero amax
+    wire = quants.quantize(x, "Q2_0")
+    assert wire.shape == (16, 512 // 64 * 18)
+    back = quants.dequantize(wire, "Q2_0")
+    assert np.array_equal(back, x)
+    assert np.array_equal(quants.quantize(back, "Q2_0"), wire)
+    enc = kq.quantize(mx.array(x), "q2_0", stream=CPU)
+    enc = enc[0] if isinstance(enc, (tuple, list)) else enc
+    assert np.array_equal(np.array(enc), wire)
 
 
 @pytest.mark.parametrize("codec", sorted(PRISM_FILES))

@@ -88,6 +88,25 @@ if(NOT _C MATCHES "\"ptq1_0\"")
   message(STATUS "gguflib: patched gguflib.c (PQ2_0/PTQ1_0 type-features)")
 endif()
 
+# Q2_0 (llama.cpp GGML_TYPE_Q2_0, type 42): 64 vals / 18 B. It takes the
+# placeholder row the STQ1_0 patch left at slot 42.
+file(READ "${_h}" _H)
+if(NOT _H MATCHES "GGUF_TYPE_Q2_0")
+  string(REPLACE
+    "    GGUF_TYPE_Q1_0 = 41,\n    GGUF_TYPE_STQ1_0 = 43,"
+    "    GGUF_TYPE_Q1_0 = 41,\n    GGUF_TYPE_Q2_0 = 42,\n    GGUF_TYPE_STQ1_0 = 43,"
+    _H "${_H}")
+  file(WRITE "${_h}" "${_H}")
+  message(STATUS "gguflib: patched gguflib.h (Q2_0)")
+endif()
+
+file(READ "${_c}" _C)
+if(NOT _C MATCHES "\"q2_0\"")
+  string(REPLACE "{\"unused_42\", 0, 0}" "{\"q2_0\", 64, 18}" _C "${_C}")
+  file(WRITE "${_c}" "${_C}")
+  message(STATUS "gguflib: patched gguflib.c (Q2_0 type-features)")
+endif()
+
 # Correct two upstream IQ block-geometry errors (antirez's table predates the
 # final ggml IQ layout): IQ1_S is 50 B / 256 (it had 110), and IQ4_NL is the
 # ONLY flat IQ codec at 18 B / 32 (it had 256/50 = IQ1_S's geometry). The IQ4_NL
@@ -150,7 +169,7 @@ endif()
 file(READ "${_h}" _H)
 file(READ "${_c}" _C)
 foreach(_m "GGUF_TYPE_MXFP4" "GGUF_TYPE_STQ1_0" "GGUF_TYPE_PTQ1_0"
-        "gguf_open_ro")
+        "GGUF_TYPE_Q2_0" "gguf_open_ro")
   if(NOT _H MATCHES "${_m}")
     message(FATAL_ERROR
       "gguflib patch did not land: '${_m}' missing from gguflib.h "
@@ -160,7 +179,7 @@ endforeach()
 # _prot,_flags appears only in the mutated mmap() argument list, so it is the
 # one marker that witnesses that REPLACE specifically.
 foreach(_m "\"mxfp4\"" "\"stq1_0\"" "\"pq2_0\", 128, 34" "\"ptq1_0\", 128, 28"
-        "iq4_nl\", 32, 18" "gguf_open_ro" "_prot,_flags")
+        "\"q2_0\", 64, 18" "iq4_nl\", 32, 18" "gguf_open_ro" "_prot,_flags")
   if(NOT _C MATCHES "${_m}")
     message(FATAL_ERROR
       "gguflib patch did not land: '${_m}' missing from gguflib.c "

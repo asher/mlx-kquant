@@ -35,7 +35,7 @@ BASE_ALIGN = {
     "nvfp4": 1,
 }
 # verify_nax's own start check, stricter than BASE_ALIGN for these codecs.
-VNAX_BASE = {"pq2_0": 4, "q4_0": 4, "q8_0": 4}
+VNAX_BASE = {"pq2_0": 4, "q2_0": 4, "q4_0": 4, "q8_0": 4}
 N, K = 256, 512
 E, R = 4, 2
 

@@ -1,4 +1,4 @@
-"""PQ2_0 mat-vec past the half range.
+"""PQ2_0 and Q2_0 mat-vec past the half range.
 
 The "big" design draws activations from 2e4 up, with one bfloat16 column
 at 1e5, against small weights, so the output stays inside the bfloat16
@@ -7,7 +7,7 @@ activations in float, so the result is finite and sits within a tenth of
 an output rounding of float64 over the exact weights. float16 activations
 keep the half pipe, whose codes are pre-scaled by 1/16 so a lane's sum
 stays below the largest activation; its half sums add about two output
-roundings.
+roundings. q2_0 runs the same kernels on a 64-weight block.
 """
 
 from __future__ import annotations
@@ -34,11 +34,11 @@ def _excess(r, floor):
 
 
 @functools.cache
-def _probe():
+def _probe(codec="pq2_0"):
     cases = [(d, t, m, r) for d in DESIGNS for t in DTYPES for m, r in ROUTES]
     calls = [
         {
-            "codec": "pq2_0",
+            "codec": codec,
             "shape": [m, 1024],
             "n": 256,
             "dtype": dtype,
@@ -63,7 +63,17 @@ def _probe():
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("design", DESIGNS)
 def test_pq2_0_mv_range(design, dtype, m, route):
-    r = _probe()[(design, dtype, m, route)]
+    _check(_probe()[(design, dtype, m, route)], dtype)
+
+
+@pytest.mark.parametrize("m,route", ROUTES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("design", DESIGNS)
+def test_q2_0_mv_range(design, dtype, m, route):
+    _check(_probe("q2_0")[(design, dtype, m, route)], dtype)
+
+
+def _check(r, dtype):
     assert r["error"] is None, r["error"]
     # The mat-vec routes log no tile kernel.
     assert r["kernels"] == [], r["kernels"]

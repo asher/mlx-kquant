@@ -510,7 +510,7 @@ def test_glu_q8_0_float16_composes():
     _check(_x([4128, K], mx.float16, 23), 96, mx.float16, codec="q8_0")
 
 
-@pytest.mark.parametrize("codec", ["q3_k", "q4_0"])
+@pytest.mark.parametrize("codec", ["q3_k", "q4_0", "q2_0", "pq2_0"])
 def test_glu_codec_without_kernel_composes(codec):
     (wg, wg64), (wu, wu64) = _weights(codec, 96, K)
     x = _x([1100, K], mx.bfloat16, 15)

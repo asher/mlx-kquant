@@ -40,7 +40,7 @@ NAX_CODECS = sorted(
         "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "q8_0",
         "q4_0", "q4_1", "q5_0", "q5_1",
         "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s",
-        "iq4_nl", "iq4_xs", "stq1_0", "pq2_0", "ptq1_0",
+        "iq4_nl", "iq4_xs", "stq1_0", "pq2_0", "ptq1_0", "q2_0",
     ]
 )  # fmt: skip
 
@@ -132,7 +132,8 @@ def test_odd_rows_lever_keeps_first_read():
 
 # K ceilings of the large-M rows (kq_largem_max_k): above it, from M 4096,
 # the BM=64 tile runs at either parity.
-MAX_K = {"q2_k": 4096, "q8_0": 10240, "q4_0": 10240, "stq1_0": 12288}
+# q2_0 takes the pq2_0 ceiling.
+MAX_K = {"q2_k": 4096, "q2_0": 4096, "q8_0": 10240, "q4_0": 10240, "stq1_0": 12288}
 
 
 @pytest.mark.parametrize("codec", sorted(MAX_K))

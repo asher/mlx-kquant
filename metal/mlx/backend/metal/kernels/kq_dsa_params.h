@@ -26,12 +26,17 @@ struct KQDsaSparseAttentionParams {
   int64_t O_strides[3]; ///< Output strides (B, H, L, D = 1)
 };
 
-// Parameters for the kq DSA radix top-k select (kq_dsa_topk_indices_16bit).
+// Parameters for the kq DSA radix top-k select (kq_dsa_topk_indices_16bit
+// and the split kq_dsa_topk_hist_hi / hist_lo / emit).
 // Layout matches omlx's OMLXDSATopKParams field-for-field.
 struct KQDsaTopKParams {
   int rows; ///< B * L score rows
   int L; ///< Query length (per-row causal position = row % L)
   int K; ///< Scores per row
-  int topk; ///< Selection count (also baked into the kernel template)
+  int topk; ///< Selection count (also baked into the one-dispatch template)
   bool causal_valid_prefix; ///< Clamp the scan to the causal prefix
 };
+
+// Row stride of the split select's low-byte histogram: 256 counts and
+// three words of threshold state, padded.
+#define KQ_DSA_TOPK_LO_STRIDE 260

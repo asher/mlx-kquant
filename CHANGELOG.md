@@ -29,9 +29,6 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which can return inf.
 
 ### Changed
-- On NAX GPUs (M5), matmuls with 33 to 128 activation rows run faster, such
-  as the short prompts of a structured decision. `KQ_QMM_MIDM=0` keeps the
-  previous kernel.
 - Requires mlx 0.32.2, which fixes wrong values from dequantizing a strided
   array and a crash at process exit.
 - `mlx-kquant[tools]` now installs beside transformers 5.13.1 and later, as
@@ -83,9 +80,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   weight with no rows ended the process at more than 16 rows of x.
 - A float16 matmul of 128 or fewer rows split over K, MTP verify among them,
   no longer returns inf where its output is finite.
-- Matmuls of 2 to 8 rows on q4_0, pq2_0 and ptq1_0 weights, MTP verify among
+- Matmuls of 2 to 8 rows on q4_0, pq2_0, q2_0 and ptq1_0 weights, MTP verify among
   them, no longer return inf for activations past 65504, and fp16 error drops 3-5x.
-- Decode and MTP verify steps on pq2_0 weights no longer return inf for
+- Decode and MTP verify steps on pq2_0 and q2_0 weights no longer return inf for
   bfloat16 activations past 65504.
 - `KQ_MOE_HALF=1` no longer returns inf for activations of a few hundred and
   up; only activations past 65504 still do.
@@ -94,6 +91,47 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - After `patch_mlx_lm_load()`, `mlx_lm.utils.load_model` builds a kquant
   checkpoint with the caller's `get_model_classes` instead of the stock class.
   `mlx_kquant.loader.load` takes it too.
+
+## [0.4.17]
+
+### Added
+- `shexp_mix_slot_parallel` reports whether `gather_qmv_mix_kq` runs a codec
+  combination on its slot-parallel kernel.
+
+### Changed
+- `dsa_topk_indices` runs faster with the same indices in the same order,
+  about 4x on a row of 65,536 scores. `KQ_DSA_TOPK_CHUNKS=1` keeps a row in
+  one threadgroup.
+- `dsa_indexer_score_decode` with 4 heads scores 2 to 4 query rows in about
+  the time of one, with the same scores. `KQ_DSA_SCORE_PAIR=0` keeps the
+  previous kernel.
+- `quantized_matmul` on `iq4_xs` and `iq4_nl` weights runs up to 1.4x faster
+  at 3 to 8 activation rows on M5 GPUs. `KQ_VERIFY_NAX=0` keeps the previous
+  routes.
+- `gather_qmv_mix_kq` and `gather_qmv_mix_ns_kq` run up to 1.5x faster at
+  decode and verify widths on expert stacks with a few thousand output rows.
+  `KQ_MOE_MIX_FORM=dd` keeps the previous kernel from 2 rows.
+
+### Fixed
+- `load_gguf(zero_copy=True)` copied a tensor of many GiB into memory when it
+  was the first tensor in its file. It now loads as a view like the rest.
+
+## [0.4.16]
+
+### Added
+- `q2_0` codec (ggml type 42, 64-weight blocks with one fp16 scale): GGUFs
+  with `Q2_0` tensors load zero-copy and run on the CPU and Metal kernels.
+- `moe_glu_gather_shexp_kq` takes `shexp_up_kquant_type`, so the shared
+  expert's gate and up tensors can each use their own codec.
+  `shexp_glu_combo_has_kernel` and `shexp_mix_combo_has_kernel` list the
+  codec combinations with a fused kernel.
+
+### Changed
+- `moe_router_topk` picks more than one expert per row faster, about a
+  quarter at 10 of 512, with the same indices and scores.
+- On NAX GPUs (M5), matmuls with 33 to 128 activation rows run faster, such
+  as the short prompts of a structured decision. `KQ_QMM_MIDM=0` keeps the
+  previous kernel.
 
 ## [0.4.15]
 
