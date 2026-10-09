@@ -16,6 +16,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the layer shapes of an image model, 4% at the median.
 - `kq.quantized_matmul_residual` adds a residual, gated or not, to a packed
   matmul in one call. On NAX GPUs (M5) it costs what the matmul alone costs.
+- `kq.conv2d_3x3` runs the 3x3 convolutions of an image VAE decoder. On NAX
+  GPUs (M5) a bfloat16 call takes 0.25 to 0.34 of the time of MLX's convolution.
 - `KQ_TUNE_LIVE=1` makes the NAX tile levers take effect on the next call, so
   tile A/B runs share one process. `KQ_QMM_LOG` now logs NAX tile dispatches.
 - `KQ_NAX_TILE` and `KQ_QMM_TILE` pin the quantized matmul tile, and raise

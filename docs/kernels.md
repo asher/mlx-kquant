@@ -169,15 +169,16 @@ Tuning levers (defaults are right for normal use):
 
 - `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
   `KQ_NAX_BM128_ODD_M`, `KQ_NAX_DB64`, the `_BK128` levers, `KQ_NAX_SWIZZLE`), the tile overrides
-  (`KQ_NAX_TILE`, `KQ_QMM_TILE`), `KQ_SPLITK_F32` and `KQ_QMM_LOG` read their variables on every
-  dispatch, so one process can switch tiles between calls on one resident copy of the weights;
-  `benchmarks/bench_dit_shapes.py` runs its tile arms this way. It reads the environment on every
-  dispatch, so it is for single-threaded A/B runs that set these variables between calls. The
-  `quantized_matmul_glu` levers (`KQ_GLU`, `KQ_GLU_MIN_ROWS`), the `quantized_matmul_lora` levers
-  (`KQ_QMM_LORA`, `KQ_QMM_LORA_MIN_ROWS`) and the `quantized_matmul_residual` lever
-  (`KQ_QMM_RESID`) are read when the op is called and builds its graph, not when a kernel is
-  dispatched, so a compiled function keeps the kernel choice of its trace. Unset (off) by default, and then each of them keeps its first read for the life of the
-  process. Read once per process.
+  (`KQ_NAX_TILE`, `KQ_QMM_TILE`, `KQ_CONV_TILE`), `KQ_SPLITK_F32` and `KQ_QMM_LOG` read their
+  variables on every dispatch, so one process can switch tiles between calls on one resident copy of
+  the weights; `benchmarks/bench_dit_shapes.py` runs its tile arms this way. It reads the
+  environment on every dispatch, so it is for single-threaded A/B runs that set these variables
+  between calls. The `quantized_matmul_glu` levers (`KQ_GLU`, `KQ_GLU_MIN_ROWS`), the
+  `quantized_matmul_lora` levers (`KQ_QMM_LORA`, `KQ_QMM_LORA_MIN_ROWS`), the
+  `quantized_matmul_residual` lever (`KQ_QMM_RESID`) and the `conv2d_3x3` lever (`KQ_CONV_NAX`) are
+  read when the op is called and builds its graph, not when a kernel is dispatched, so a compiled
+  function keeps the kernel choice of its trace. Unset (off) by default, and then each of them keeps
+  its first read for the life of the process. Read once per process.
 - `KQ_NAX_TILE` - `bm,bn,wm,wn` pins the NAX `qmm_t` tile of every transpose call that reaches it,
   in place of the BM=32, BM=64 and BM=128 policy. BK stays 64, except where a `_BK128` lever sets
   it. The `_db` variant still follows `KQ_NAX_DB64` on the bm64 bn64 wm2 wn2 tile. A tile the
@@ -191,11 +192,11 @@ Tuning levers (defaults are right for normal use):
   `_bm<bm>_bn<bn>_wm<wm>_wn<wn>` before `_alN` and raises until such a kernel is built. Unset
   (off) by default. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_QMM_LOG` - set to any value, logs the kernel name, shape and grid of every NAX and ALU qmm
-  tile dispatch, every split-K dispatch, every `verify_mma` and `verify_nax` dispatch, split or
-  not, and every fused `quantized_matmul_glu`, `quantized_matmul_lora` and
-  `quantized_matmul_residual` dispatch to stderr, one
-  `[kq qmm]` line each. The grid depth is the K slice count. The mat-vec routes (`qmv`, `verify_qmv`, `mv_ext`) do not log.
-  Unset (off) by default. Read once per process unless `KQ_TUNE_LIVE=1`.
+  tile dispatch, every split-K dispatch, every `verify_mma` and `verify_nax` dispatch, split or not,
+  and every fused `quantized_matmul_glu`, `quantized_matmul_lora` and `quantized_matmul_residual`
+  dispatch, and every `conv2d_3x3` dispatch to stderr, one `[kq qmm]` line each. The grid depth is
+  the K slice count. The mat-vec routes (`qmv`, `verify_qmv`, `mv_ext`) do not log. Unset (off) by
+  default. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_SPLITK_F32` - partial dtype of the split-K routes (`splitk`, `nax_splitk`, the
   `KQ_QMM_MIDM` band, and `verify_mma` and `verify_nax` when they split K). Float partials let the
   fold round the result once, as the unsplit kernels do. Partials in the activation dtype round
@@ -853,6 +854,44 @@ on the shapes of N 2048 and wider.
   the gradient of the kernel runs the unfused ops. The weight is frozen, as in `quantized_matmul`.
   `mx.jvp` and `mx.vmap` run with respect to the residual and the gate. With respect to x both
   raise `Not implemented for KQuantMatmul`, since `quantized_matmul` has neither.
+
+## 3x3 convolution
+
+- `conv2d_3x3` - `y = conv(x, w) + bias` for a 3x3 kernel, stride 1, padding 1, channels last:
+  the convolutions that carry the decoder of an image VAE. `x` is [B, H, W, C], `w` is
+  [O, 3, 3, C] in the layout of `nn.Conv2d`, and `bias` is [O] or None. `w` and `bias` run in the
+  dtype of x. The result is the cross-correlation `nn.Conv2d` computes, with zeros outside the
+  image.
+
+  On a NAX GPU (M5), for bfloat16 with C a multiple of 16, from 1024 output pixels, one dispatch
+  computes y as an implicit GEMM: rows are output pixels, columns are the O filters, and K walks the
+  9 taps and C channels, 32 channels a step, into one f32 sum per output. Each row reads its tap
+  from x in place, zeros where the tap falls off the image, so no patch buffer is written. The bias
+  is added in f32 and y is rounded once. Each threadgroup owns a 128 by 128 tile of y, or 128 by 64
+  where a 64 column tile pads O less (O 144 and 288, for example).
+
+  On an M5 Max, at the decoder shapes of Z-Image and Qwen-Image 2.1 (H and W 256 to 1024, C 128 to
+  1152), the kernel runs 31 to 54 TFLOPS, 0.25 to 0.34 of the time of MLX's convolution without the
+  Winograd transform. MLX's Winograd path is faster on the 256 to 1152 channel shapes, with an error
+  to the float64 result 35 times larger on a 256 channel layer. A whole Z-Image decode at 1024 pixels takes 0.36 of its time on the
+  convolution without Winograd.
+
+  Every other case builds MLX's `conv_general` on the flipped kernel, which takes its implicit GEMM
+  and not the Winograd transform, then a stock add of the bias, which rounds the convolution before
+  the add: float16 and float32, C off a multiple of 16, fewer pixels, CPU streams and GPUs without
+  NAX.
+
+  Levers. The op reads `KQ_CONV_NAX` when it is called and builds its graph, so a compiled function
+  keeps the kernel choice of its trace. `KQ_CONV_TILE` is read at dispatch. Each is read once per
+  process unless `KQ_TUNE_LIVE=1`:
+
+  - `KQ_CONV_NAX` - `0` builds the composition on every call. `2` runs the kernel at every pixel
+    count. Unset, `1` or any other value runs it from 1024 pixels.
+  - `KQ_CONV_TILE` - `bm,bn,wm,wn` pins the tile. The metallib carries `128,128,4,4`,
+    `128,64,4,2`, `64,128,2,4` and `64,64,2,2`; any other tile raises a `ValueError` that names the
+    missing kernel.
+
+  `mx.grad`, `mx.jvp` and `mx.vmap` run the composition, so they give what MLX's convolution gives.
 
 ## MoE GLU
 

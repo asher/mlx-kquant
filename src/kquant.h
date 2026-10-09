@@ -1712,6 +1712,56 @@ class KQuantMatmulLora : public mx::Primitive {
   std::vector<int> bands_;
 };
 
+// 3x3 convolution, stride 1, padding 1, channels last:
+//   y = conv(x, w) + bias
+// x [B, H, W, C] in a float dtype, w [O, 3, 3, C] and bias [O] in any float
+// dtype (they run in the dtype of x). Returns [B, H, W, O] in the dtype of
+// x. On a NAX GPU, for bfloat16 with C a multiple of 16, from 1024 output
+// pixels, one dispatch computes y as an implicit GEMM with f32 sums and
+// one rounding. Every other case builds MLX's convolution on the flipped
+// kernel (its implicit GEMM, no Winograd transform) and a stock add.
+mx::array conv2d_3x3(
+    mx::array x,
+    mx::array w,
+    const std::optional<mx::array>& bias = std::nullopt,
+    mx::StreamOrDevice s = {});
+
+// 3x3 convolution as an implicit GEMM (see conv2d_3x3). Inputs are x, w
+// and, with a bias, the bias. vjp, jvp and vmap are those of the composed
+// convolution.
+class KQuantConv3x3 : public mx::Primitive {
+ public:
+  explicit KQuantConv3x3(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantConv3x3";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+  std::vector<mx::array> vjp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<mx::array>& outputs) override;
+  std::vector<mx::array> jvp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& tangents,
+      const std::vector<int>& argnums) override;
+  std::pair<std::vector<mx::array>, std::vector<int>> vmap(
+      const std::vector<mx::array>& inputs,
+      const std::vector<int>& axes) override;
+};
+
 // Quantized matmul with a residual epilogue:
 //   y = residual + gate * (x @ W^T)
 // x [..., K] (float16/bfloat16; float32 runs in bfloat16), w 2-D uint8 wire

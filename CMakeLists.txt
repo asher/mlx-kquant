@@ -158,6 +158,7 @@ target_sources(
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_matmul_fused.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_matmul_lora.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_matmul_resid.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_conv_nax.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_dense.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_hadamard.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_lora_epilogue.cpp
@@ -264,6 +265,7 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax_epi.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax_lora.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax_resid.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_conv_nax.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_encode.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_sdpa.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_sdpa_nax.metal

@@ -779,6 +779,38 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "conv2d_3x3",
+      &mlx_kquant::conv2d_3x3,
+      "x"_a,
+      "w"_a,
+      nb::kw_only(),
+      "bias"_a = nb::none(),
+      "stream"_a = nb::none(),
+      R"(
+        3x3 convolution, stride 1, padding 1, channels last:
+        y = conv(x, w) + bias, as mx.conv2d(x, w, padding=1) + bias.
+
+        On a NAX GPU, for bfloat16 with C a multiple of 16, from 1024
+        output pixels, one dispatch computes y as an implicit GEMM: f32
+        sums over the 9 taps and C channels, the bias added in f32, one
+        rounding. KQ_CONV_NAX=2 runs the kernel at every pixel count, and
+        0 turns it off. Every other case builds MLX's convolution on the
+        flipped kernel, which takes its implicit GEMM with f32 sums and not
+        its Winograd transform, then a stock add of the bias. mx.grad,
+        mx.jvp and mx.vmap run on that composition.
+
+        Args:
+            x (array): [B, H, W, C], a float dtype. B H W C and B H W O
+                below 2^31 for the kernel.
+            w (array): [O, 3, 3, C] in any float dtype. It runs in the
+                dtype of x.
+            bias (array, optional): [O] in any float dtype.
+
+        Returns:
+            array: [B, H, W, O] in the dtype of x.
+      )");
+
+  m.def(
       "quantized_matmul_residual",
       &mlx_kquant::quantized_matmul_residual,
       "x"_a,
