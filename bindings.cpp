@@ -779,6 +779,50 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "quantized_matmul_residual",
+      &mlx_kquant::quantized_matmul_residual,
+      "x"_a,
+      "w"_a,
+      "kquant_type"_a,
+      "residual"_a,
+      nb::kw_only(),
+      "gate"_a = nb::none(),
+      "stream"_a = nb::none(),
+      R"(
+        Quantized matmul with a residual epilogue:
+        y = residual + gate * (x @ W^T).
+
+        The residual add of a transformer block after its output
+        projection, with the gate of an adaptive norm where the block has
+        one. On a NAX GPU, for q4_k, q5_k, q6_k and q8_0 weights on
+        bfloat16, from 1024 rows, one dispatch walks K into f32 sums and
+        stores residual + gate * sum, rounded once: the product is never
+        written. KQ_QMM_RESID=2 runs the kernel at every row count, and 0
+        turns it off. Every other case builds the same sum from
+        quantized_matmul and stock ops, which round the product and the
+        gated product to the output dtype before the add. mx.grad gives
+        the gradient with respect to x, residual and gate: the gradient of
+        the kernel runs the unfused ops. The weight is frozen, as in
+        quantized_matmul. mx.jvp and mx.vmap run with respect to residual
+        and gate. With respect to x both raise "Not implemented for
+        KQuantMatmul", since quantized_matmul has neither.
+
+        Args:
+            x (array): [..., K], float16/bfloat16. float32 runs in bfloat16.
+                Fewer than 2^31 rows.
+            w (array): [N, K bytes] uint8 wire bytes. K and N below 2^25.
+            kquant_type (str): the codec of w.
+            residual (array): the output shape, x's shape with N last, in
+                any float dtype. It runs in the output dtype.
+            gate (array, optional): [N], or x's batch dims, then 1, then N
+                (one row per batch), in any float dtype. It runs in the
+                output dtype. None (the default): y = residual + x @ W^T.
+
+        Returns:
+            array: [..., N] in the dtype quantized_matmul gives for x.
+      )");
+
+  m.def(
       "kda_conv",
       &mlx_kquant::kda_conv,
       "x"_a,

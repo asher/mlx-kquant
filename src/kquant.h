@@ -1712,6 +1712,68 @@ class KQuantMatmulLora : public mx::Primitive {
   std::vector<int> bands_;
 };
 
+// Quantized matmul with a residual epilogue:
+//   y = residual + gate * (x @ W^T)
+// x [..., K] (float16/bfloat16; float32 runs in bfloat16), w 2-D uint8 wire
+// bytes [N, K bytes], residual of the output shape [..., N], gate optional:
+// [N], or x's batch dims, then 1, then N (one gate row per batch, as an
+// adaptive norm gives). With no gate y = residual + x @ W^T. The residual
+// and the gate run in the output dtype. K and N are below 2^25 and x holds
+// fewer than 2^31 rows. Returns [..., N] in the dtype quantized_matmul
+// gives for x. On a NAX GPU, for q4_k, q5_k, q6_k and q8_0 weights on
+// bfloat16, from 1024 rows, one dispatch walks K into f32 sums and stores
+// residual + gate * sum, rounded once. Every other case builds the sum from
+// quantized_matmul and stock ops, which round the product and the gated
+// product to the output dtype before the add.
+mx::array quantized_matmul_residual(
+    mx::array x,
+    mx::array w,
+    const std::string& kquant_type,
+    mx::array residual,
+    const std::optional<mx::array>& gate = std::nullopt,
+    mx::StreamOrDevice s = {});
+
+// Quantized matmul with a residual epilogue (see quantized_matmul_residual).
+// Inputs are x, w, the residual and, when gated, the gate. vjp, jvp and
+// vmap are those of the unfused ops. The vjp is wrt x, the residual and the
+// gate: the quantized weight is frozen, as in KQuantMatmul.
+class KQuantMatmulResid : public mx::Primitive {
+ public:
+  KQuantMatmulResid(mx::Stream stream, std::string kquant_type)
+      : mx::Primitive(stream), kquant_type_(std::move(kquant_type)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantMatmulResid";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+  std::vector<mx::array> vjp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<mx::array>& outputs) override;
+  std::vector<mx::array> jvp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& tangents,
+      const std::vector<int>& argnums) override;
+  std::pair<std::vector<mx::array>, std::vector<int>> vmap(
+      const std::vector<mx::array>& inputs,
+      const std::vector<int>& axes) override;
+
+ private:
+  std::string kquant_type_;
+};
+
 // Fused causal short convolution for gated-delta prefill (KDA, GDN):
 //   y[t] = silu(sum_j w[:, j] * in[t - K + 1 + j]),  in = [state; x]
 // over x [B, T, C] (float16/bfloat16), state [B, K - 1, C] (the carried

@@ -173,10 +173,10 @@ Tuning levers (defaults are right for normal use):
   dispatch, so one process can switch tiles between calls on one resident copy of the weights;
   `benchmarks/bench_dit_shapes.py` runs its tile arms this way. It reads the environment on every
   dispatch, so it is for single-threaded A/B runs that set these variables between calls. The
-  `quantized_matmul_glu` levers (`KQ_GLU`, `KQ_GLU_MIN_ROWS`) and the `quantized_matmul_lora`
-  levers (`KQ_QMM_LORA`, `KQ_QMM_LORA_MIN_ROWS`) are read when the op is called and builds its
-  graph, not when a kernel is dispatched, so a compiled function keeps the kernel choice of its
-  trace. Unset (off) by default, and then each of them keeps its first read for the life of the
+  `quantized_matmul_glu` levers (`KQ_GLU`, `KQ_GLU_MIN_ROWS`), the `quantized_matmul_lora` levers
+  (`KQ_QMM_LORA`, `KQ_QMM_LORA_MIN_ROWS`) and the `quantized_matmul_residual` lever
+  (`KQ_QMM_RESID`) are read when the op is called and builds its graph, not when a kernel is
+  dispatched, so a compiled function keeps the kernel choice of its trace. Unset (off) by default, and then each of them keeps its first read for the life of the
   process. Read once per process.
 - `KQ_NAX_TILE` - `bm,bn,wm,wn` pins the NAX `qmm_t` tile of every transpose call that reaches it,
   in place of the BM=32, BM=64 and BM=128 policy. BK stays 64, except where a `_BK128` lever sets
@@ -192,7 +192,8 @@ Tuning levers (defaults are right for normal use):
   (off) by default. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_QMM_LOG` - set to any value, logs the kernel name, shape and grid of every NAX and ALU qmm
   tile dispatch, every split-K dispatch, every `verify_mma` and `verify_nax` dispatch, split or
-  not, and every fused `quantized_matmul_glu` and `quantized_matmul_lora` dispatch to stderr, one
+  not, and every fused `quantized_matmul_glu`, `quantized_matmul_lora` and
+  `quantized_matmul_residual` dispatch to stderr, one
   `[kq qmm]` line each. The grid depth is the K slice count. The mat-vec routes (`qmv`, `verify_qmv`, `mv_ext`) do not log.
   Unset (off) by default. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_SPLITK_F32` - partial dtype of the split-K routes (`splitk`, `nax_splitk`, the
@@ -815,6 +816,43 @@ on the shapes of N 2048 and wider.
   The unfused ops add each band with `mx.addmm`. On the GPU that stock op misreads a first
   argument of one column that is a view of a wider array, so the op hands it a dense copy of a
   one-column band ([upstream-defects.md](upstream-defects.md)). Wider bands are read in place.
+
+## Quantized matmul with a residual epilogue
+
+- `quantized_matmul_residual` - `y = residual + gate * (x @ W^T)` for a packed weight: the
+  residual add after the output projection of a transformer block, with the gate of an adaptive
+  norm where the block has one. `residual` has the output shape. `gate` is [N], or x's batch dims,
+  then 1, then N (one gate row per batch item), and `gate=None` gives `residual + x @ W^T`. The
+  residual and the gate run in the output dtype, the dtype `quantized_matmul` gives for x.
+
+  On a NAX GPU (M5), for `q4_k`, `q5_k`, `q6_k` and `q8_0` weights on bfloat16 activations, from
+  1024 activation rows, one dispatch walks K into one f32 sum per output, then reads its tile of the
+  residual and its columns of the gate and stores `residual + gate * sum`, rounded once. The product
+  is never written, where the unfused ops write it, then read it and the residual and write the
+  sum, or two passes on stock elementwise ops. Each threadgroup owns a 128 by 64 tile of y, or 64 by
+  64 for `q4_k` and `q8_0` above K 10240, the K ceiling of the large-row tile of
+  `quantized_matmul`. A gate per batch item runs the batch in the grid. The `q8_0` kernel walks K
+  in tiles of 64, so a `q8_0` weight whose K is no multiple of 64 runs the unfused ops.
+
+  At Qwen-Image 2.1 step shapes (4096 rows a batch item, N 4096, bfloat16) on an M5 Max, the call
+  costs what the product alone costs: 0.928 of the unfused ops at K 4096 on `q5_k` and 0.973 at K
+  12288 on `q4_k`, at batch 1, against 0.916 and 0.973 for the product alone. A compiled
+  `x + gate * y` after the product gives 0.982 and 0.984.
+
+  Every other case builds the same sum from `quantized_matmul` and stock ops, which round the
+  product and the gated product to the output dtype before the add: other codecs, float16
+  activations, fewer rows, a `q8_0` K off a multiple of 64, CPU streams and GPUs without NAX.
+
+  Lever, read once per process unless `KQ_TUNE_LIVE=1`. The op reads it when it is called and
+  builds its graph, so a compiled function keeps the kernel choice of its trace:
+
+  - `KQ_QMM_RESID` - `0` builds the unfused ops on every call. `2` runs the kernel at every row
+    count. Unset, `1` or any other value runs it from 1024 rows.
+
+  `mx.grad` gives the gradient with respect to x, the residual and the gate at every row count:
+  the gradient of the kernel runs the unfused ops. The weight is frozen, as in `quantized_matmul`.
+  `mx.jvp` and `mx.vmap` run with respect to the residual and the gate. With respect to x both
+  raise `Not implemented for KQuantMatmul`, since `quantized_matmul` has neither.
 
 ## MoE GLU
 

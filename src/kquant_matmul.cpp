@@ -2432,6 +2432,10 @@ bool kq_forced_route(
 
 } // namespace
 
+int kq_nax_large_max_k(const std::string& kquant_type) {
+  return kq_largem_max_k(kquant_type);
+}
+
 #endif // _METAL_
 
 std::vector<mx::Shape> KQuantMatmul::output_shapes(
