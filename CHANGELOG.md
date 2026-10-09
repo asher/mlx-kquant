@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.17]
+
 ### Added
 - `shexp_mix_slot_parallel` reports whether `gather_qmv_mix_kq` runs a codec
   combination on its slot-parallel kernel.
