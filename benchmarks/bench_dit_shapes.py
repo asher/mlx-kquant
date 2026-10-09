@@ -84,6 +84,7 @@ A versus A: --arms kq,kq_aa. Plan only: --plan-only.
 Lever arms: --env-arm NAME:VAR=VALUE[,VAR=VALUE] defines a kq arm that
 runs with those environment levers set (read live), adds it to --arms and
 pairs it with kq as NAME/kq, for example --env-arm sw1:KQ_NAX_SWIZZLE=1.
+A value may hold commas: --env-arm t:KQ_NAX_TILE=128,128,2,4,KQ_NAX_Q4K_BK128=0.
 """
 
 from __future__ import annotations
@@ -96,6 +97,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import time
 
@@ -138,7 +140,10 @@ def parse_env_arms(specs):
     out = {}
     for spec in specs:
         name, sep, body = spec.partition(":")
-        env = dict(kv.split("=", 1) for kv in body.split(",") if kv)
+        # A comma starts the next pair only before VAR=, so a value may hold
+        # commas, as KQ_NAX_TILE=bm,bn,wm,wn does.
+        pairs = re.split(r",(?=[A-Za-z_][A-Za-z0-9_]*=)", body)
+        env = dict(kv.split("=", 1) for kv in pairs if kv)
         if not sep or not name or not env or name in CODEC_ARMS + SHARED_ARMS:
             raise SystemExit(f"--env-arm {spec!r}: want NAME:VAR=VALUE[,VAR=VALUE]")
         out[name] = env
