@@ -249,10 +249,11 @@ _ALU_NAME = re.compile(
 
 
 def test_tile_names_match_known_patterns():
-    # Every qmm_t tile kernel outside the split-K, gather, GLU and low-rank
-    # families must match a pattern above, so a new tile family cannot escape
-    # the enumerating test below. test_matmul_glu.py holds the GLU names and
-    # test_matmul_lora.py the low-rank ones.
+    # Every qmm_t tile kernel outside the split-K, gather, GLU, low-rank and
+    # residual families must match a pattern above, so a new tile family cannot
+    # escape the enumerating test below. test_matmul_glu.py holds the GLU names,
+    # test_matmul_lora.py the low-rank ones and test_matmul_resid.py the
+    # residual ones.
     _metal()
     names = kq.metallib_kernels()
     other = (
@@ -260,6 +261,7 @@ def test_tile_names_match_known_patterns():
         "_qmm_t_nax_splitk_",
         "_qmm_t_nax_glu_",
         "_qmm_t_nax_lora_",
+        "_qmm_t_nax_resid_",
     )
     nax = [n for n in names if "_qmm_t_nax_" in n and not any(o in n for o in other)]
     alu = [
