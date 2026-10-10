@@ -72,6 +72,32 @@ and the register-resident MMA verify kernel serves `ptq1_0`, as described at the
 section. Every limit and floor is a measured per-codec policy (`kq_nax_small_m` and
 `kq_smallbm_policy` in `src/kquant_matmul.cpp`).
 
+On GPUs without NAX, the `qmm_t` kernel decodes each weight tile inside its K loop, once for every
+64-row tile of the activations. From a floor in rows it is faster to decode the whole weight once
+with `kq.dequantize` and run the stock matmul, and a transposed `quantized_matmul` on a 2-D weight
+takes that route where its chip class has a row for the codec. A row is keyed on the architecture
+generation, the GPU core count, the codec, the rows of x (a batch counts all of its rows) and N
+(`kDequantizeRows` in `src/kquant_ops.cpp`). A chip class without rows keeps the kernel, as do NAX
+GPUs, CPU streams, calls with the LoRA epilogue arguments and every call while `KQ_QMM_TILE` is
+set. The route holds a copy of the weight in the activation dtype while the call runs, N x K x 2
+bytes (201 MB for a 4096 x 24576 weight). `quantized_matmul_glu`, `quantized_matmul_lora` and
+`quantized_matmul_residual` build their products from `quantized_matmul` on these GPUs, so they take
+the route too. The choice is made when the op builds its graph, and the output is within 1 ulp of
+the kernel's.
+
+| chip class | codecs | rows from | N from |
+|---|---|---|---|
+| M3 Max, 40 GPU cores (`applegpu_g15s`) | `q3_k`, `q5_k`, `q6_k`, `nvfp4`, `ptq1_0` | 2048 | 3840 |
+| M3 Max, 40 GPU cores (`applegpu_g15s`) | `q4_k` | 16384 | 3840 |
+
+The decode pass runs at 1.0-1.15x the time of a copy of its output and costs the same at any row
+count, so the route loses below its floor: at 128 rows it takes 1.4-1.9x the kernel's time. On the
+other codecs the route measured inside the noise of an A versus A arm at 2048 to 16416 rows, and on
+`q8_0` it gains 1-4% of a step, also inside it; they keep the kernel. A larger kernel tile does not
+help on this chip: five tiles of 128 rows or columns ran 0.98-1.27x the time of bm64 bn64 per cell
+at 4128 rows, slower on 51 of 56 cells of the two closest, against an A versus A range of
+0.98-1.03.
+
 Per-row qmv reads the weight once per activation row, the later rows from the cache, and its grid
 grows with M. It holds widest where the mat-vec grids are too small to fill the GPU, so its limit
 falls with N. At N 512 and below, 13 of the 22 NAX codecs keep it through M 7 or 8. At N 1024 most
@@ -189,8 +215,10 @@ Tuning levers (defaults are right for normal use):
   NAX, `KQ_DISABLE_NAX=1`, or a codec or shape the NAX tile does not serve). The metallib
   carries only the shipped tile, so `64,64,2,2` is the one value that runs today; it keeps its
   plain kernel name. Any other tile is looked up under a name that carries
-  `_bm<bm>_bn<bn>_wm<wm>_wn<wn>` before `_alN` and raises until such a kernel is built. Unset
-  (off) by default. Read once per process unless `KQ_TUNE_LIVE=1`.
+  `_bm<bm>_bn<bn>_wm<wm>_wn<wn>` before `_alN` and raises until such a kernel is built. Set, it
+  also keeps calls on the kernel where a dequantize row would take them (see above), and that
+  choice is read when the op builds its graph. Unset (off) by default. Read once per process
+  unless `KQ_TUNE_LIVE=1`.
 - `KQ_QMM_LOG` - set to any value, logs the kernel name, shape and grid of every NAX and ALU qmm
   tile dispatch, every split-K dispatch, every `verify_mma` and `verify_nax` dispatch, split or not,
   and every fused `quantized_matmul_glu`, `quantized_matmul_lora` and `quantized_matmul_residual`
