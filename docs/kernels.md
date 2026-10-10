@@ -90,10 +90,12 @@ products from `quantized_matmul` on these GPUs, so they take it too.
 | `q3_k`, `q5_k`, `q6_k`, `nvfp4`, `ptq1_0` | 2048 | 3840 to 12288 | 3840 to 24576 |
 | `q4_k` | 16384 | 3840 to 12288 | 3840 to 24576 |
 
-The route holds a copy of the weight in the activation dtype while the call runs, N x K x 2 bytes,
-at most 604 MB at 24576 x 12288; the range keeps a vocabulary head on the kernel. Its vjp runs the
-quantized matmul the other way, as the kernel's does, so a backward pass holds no dense copy and
-the gradient wrt x is the kernel path's. The choice is made when the op builds its graph, so a
+The route holds a copy of the weight in the activation dtype while the call runs, N x K x 2 bytes
+per call, at most 604 MB at 24576 x 12288; the range keeps a vocabulary head on the kernel.
+`quantized_matmul_glu` builds its product from two calls on these GPUs, so it holds two copies, up
+to about 1.2 GB. The gradient wrt x runs the quantized matmul the other way, as on the kernel path,
+so a backward pass holds no dense copy, and a gradient wrt the weight or the scales raises as it
+does there. The choice is made when the op builds its graph, so a
 function compiled with `shapeless=True` keeps the choice of its trace at other row counts. On the
 output elements above 1% of the root mean square of a float64 reference, the route is within 1 ulp
 of the kernel in bfloat16 and within 2 ulp in float16, and its error against that reference is
