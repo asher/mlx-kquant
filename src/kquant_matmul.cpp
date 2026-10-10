@@ -2436,6 +2436,10 @@ int kq_nax_large_max_k(const std::string& kquant_type) {
   return kq_largem_max_k(kquant_type);
 }
 
+bool kq_qmm_tile_pinned() {
+  return kq_qmm_tile().has_value();
+}
+
 #endif // _METAL_
 
 std::vector<mx::Shape> KQuantMatmul::output_shapes(

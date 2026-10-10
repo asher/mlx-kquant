@@ -114,6 +114,19 @@ NB_MODULE(_ext, m) {
       "Metal).");
 
   m.def(
+      "_alu_dequantize_row",
+      &mlx_kquant::alu_dequantize_row,
+      "arch_gen"_a,
+      "cores"_a,
+      "nax"_a,
+      "kquant_type"_a,
+      "M"_a,
+      "N"_a,
+      "The row that runs a plain transposed quantized_matmul as dequantize "
+      "then the stock matmul, for a chip class, codec, rows of x and N, as "
+      "[min_m, min_n, inherited]; empty where the qmm_t kernel runs.");
+
+  m.def(
       "qmv_fine_max_n",
       &mlx_kquant::qmv_fine_max_n,
       "kquant_type"_a,

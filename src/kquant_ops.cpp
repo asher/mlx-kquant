@@ -45,7 +45,46 @@ inline mx::array kq_dense_x(const mx::array& x, mx::StreamOrDevice s) {
   return mx::contiguous(x, false, s);
 }
 
+// Rows that run a plain transposed quantized_matmul as dequantize then the
+// stock matmul on a GPU without NAX. The dequantize pass costs N x K once,
+// so it pays from a floor in M, where the stock matmul outruns the qmm_t
+// kernel's in-loop decode. A row belongs to the chip class it was measured
+// on; a codec marked inherited takes another codec's floor unmeasured.
+struct KqDequantizeRow {
+  int arch_gen;
+  int cores;
+  const char* codec;
+  int min_m;
+  int min_n;
+  int inherited;
+};
+
+constexpr KqDequantizeRow kDequantizeRows[] = {
+    {15, 40, "q4_k", 16384, 3840, 0},
+    {15, 40, "q5_k", 2048, 3840, 0},
+    {15, 40, "q6_k", 2048, 3840, 0},
+};
+
 } // namespace
+
+std::vector<int> alu_dequantize_row(
+    int arch_gen,
+    int cores,
+    bool nax,
+    const std::string& kquant_type,
+    int M,
+    int N) {
+  if (nax) {
+    return {};
+  }
+  for (const auto& r : kDequantizeRows) {
+    if (r.arch_gen == arch_gen && r.cores == cores && kquant_type == r.codec &&
+        M >= r.min_m && N >= r.min_n) {
+      return {r.min_m, r.min_n, r.inherited};
+    }
+  }
+  return {};
+}
 
 // ----------------------------- ops -----------------------------
 
@@ -204,6 +243,24 @@ mx::array quantized_matmul(
     return mx::zeros(shape, out_type, s);
   }
   kq_check_weight_base_at_build(w, kquant_type, s, "quantized_matmul");
+
+#ifdef _METAL_
+  if (transpose && !lora && w.ndim() == 2 && s.device == mx::Device::gpu &&
+      !kq_qmm_tile_pinned()) {
+    auto& d = mx::metal::device(mx::Device::gpu);
+    const std::vector<int> row = alu_dequantize_row(
+        d.get_architecture_gen(),
+        gpu_core_count(),
+        kq_is_nax_available(),
+        kquant_type,
+        rows,
+        w_outer_dims);
+    if (!row.empty()) {
+      auto w_f = dequantize(w, scales, kquant_type, out_type, s);
+      return mx::matmul(mx::astype(x, out_type, s), mx::transpose(w_f, s), s);
+    }
+  }
+#endif
 
   // Cast x to the output dtype, then matrix-row-contiguize x / w / scales at
   // the op level so eval_gpu can assume dense inputs.

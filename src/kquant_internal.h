@@ -37,6 +37,10 @@ int kq_env_lever_from(const char* name, int unset, int lowest);
 // runs the BM=64 tile in place of BM=128. 0 = no ceiling.
 int kq_nax_large_max_k(const std::string& kquant_type);
 
+// True when KQ_QMM_TILE pins the plain qmm_t tile, which also keeps a call
+// off the dequantize row. Metal builds only.
+bool kq_qmm_tile_pinned();
+
 // KVarN key/value widths the record codec supports.
 inline bool kq_kvarn_bits_ok(int bits) {
   return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
