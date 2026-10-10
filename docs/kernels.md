@@ -74,28 +74,40 @@ section. Every limit and floor is a measured per-codec policy (`kq_nax_small_m` 
 
 On GPUs without NAX, the `qmm_t` kernel decodes each weight tile inside its K loop, once for every
 64-row tile of the activations. From a floor in rows it is faster to decode the whole weight once
-with `kq.dequantize` and run the stock matmul, and a transposed `quantized_matmul` on a 2-D weight
-takes that route where its chip class has a row for the codec. A row is keyed on the architecture
-generation, the GPU core count, the codec, the rows of x (a batch counts all of its rows) and N
-(`kDequantizeRows` in `src/kquant_ops.cpp`). A chip class without rows keeps the kernel, as do NAX
-GPUs, CPU streams, calls with the LoRA epilogue arguments and every call while `KQ_QMM_TILE` is
-set. The route holds a copy of the weight in the activation dtype while the call runs, N x K x 2
-bytes (201 MB for a 4096 x 24576 weight). `quantized_matmul_glu`, `quantized_matmul_lora` and
-`quantized_matmul_residual` build their products from `quantized_matmul` on these GPUs, so they take
-the route too. The choice is made when the op builds its graph, and the output is within 1 ulp of
-the kernel's.
+with `kq.dequantize` and run the stock matmul. A transposed `quantized_matmul` on a 2-D weight takes
+that route on the GPUs without NAX before M5 when its codec has a row below, its rows of x reach the
+floor (a batch counts all of its rows), K is from 3840 to 12288 and N from 3840 to 24576
+(`kDequantizeRows` in `src/kquant_ops.cpp`). Those GPUs are the ones whose architecture string is
+`applegpu_g<gen><suffix>` with a generation from 13 to 16 (M1 to M4) and a suffix other than `p`
+(phones), without NAX. Any other string keeps the kernel, as do NAX GPUs, CPU streams, calls with the
+LoRA epilogue arguments, a 3-D weight, `transpose=False` and every call while `KQ_QMM_TILE` is set.
+`gather_qmm` without indices on a 2-D weight is the plain call and takes the route.
+`quantized_matmul_glu`, `quantized_matmul_lora` and `quantized_matmul_residual` build their
+products from `quantized_matmul` on these GPUs, so they take it too.
 
-| chip class | codecs | rows from | N from |
+| codecs | rows from | K | N |
 |---|---|---|---|
-| M3 Max, 40 GPU cores (`applegpu_g15s`) | `q3_k`, `q5_k`, `q6_k`, `nvfp4`, `ptq1_0` | 2048 | 3840 |
-| M3 Max, 40 GPU cores (`applegpu_g15s`) | `q4_k` | 16384 | 3840 |
+| `q3_k`, `q5_k`, `q6_k`, `nvfp4`, `ptq1_0` | 2048 | 3840 to 12288 | 3840 to 24576 |
+| `q4_k` | 16384 | 3840 to 12288 | 3840 to 24576 |
 
-Measured on that chip with `benchmarks/bench_dit_shapes.py` over the seven Z-Image and Qwen-Image
-linears at 2048, 4128 and 16416 rows, batch 1 and 2, bfloat16 and float16, against an A versus A arm
-that stays within 0.98-1.02 per step: the kernel takes 1.49-1.63x the route's time per step on
-`nvfp4`, 1.06-1.14x on `ptq1_0`, 1.03-1.12x on `q3_k` and `q6_k`, 1.01-1.10x on `q5_k` (1.01-1.03x
-at 2048 rows) and 1.02-1.05x on `q4_k` from its floor. No linear runs slower outside the A versus A
-range, and the route takes 0.96-1.07x the time of the stock matmul on unquantized weights.
+The route holds a copy of the weight in the activation dtype while the call runs, N x K x 2 bytes,
+at most 604 MB at 24576 x 12288; the range keeps a vocabulary head on the kernel. Its vjp runs the
+quantized matmul the other way, as the kernel's does, so a backward pass holds no dense copy and
+the gradient wrt x is the kernel path's. The choice is made when the op builds its graph, so a
+function compiled with `shapeless=True` keeps the choice of its trace at other row counts. On the
+output elements above 1% of the root mean square of a float64 reference, the route is within 1 ulp
+of the kernel in bfloat16 and within 2 ulp in float16, and its error against that reference is
+within 1% of the kernel's. Nearer zero, where the terms of a sum cancel, the two summation orders
+differ by more ulp.
+
+The rows and the range were measured on M3 Max (`applegpu_g15s`, 40 GPU cores), and the other GPUs
+of the class take them unmeasured. Measured with `benchmarks/bench_dit_shapes.py` over the seven
+Z-Image and Qwen-Image linears at 2048, 4128 and 16416 rows, batch 1 and 2, bfloat16 and float16,
+against an A versus A arm that stays within 0.98-1.02 per step: the kernel takes 1.49-1.63x the
+route's time per step on `nvfp4`, 1.06-1.14x on `ptq1_0`, 1.03-1.12x on `q3_k` and `q6_k`,
+1.01-1.10x on `q5_k` (1.01-1.03x at 2048 rows) and 1.02-1.05x on `q4_k` from its floor. No linear
+runs slower outside the A versus A range, and the route takes 0.96-1.07x the time of the stock
+matmul on unquantized weights.
 
 The decode pass runs at 1.0-1.15x the time of a copy of its output and costs the same at any row
 count, so the route loses below its floor: at 128 rows it takes 1.4-1.9x the kernel's time. On the
@@ -208,7 +220,8 @@ Tuning levers (defaults are right for normal use):
   environment on every dispatch, so it is for single-threaded A/B runs that set these variables
   between calls. The `quantized_matmul_glu` levers (`KQ_GLU`, `KQ_GLU_MIN_ROWS`), the
   `quantized_matmul_lora` levers (`KQ_QMM_LORA`, `KQ_QMM_LORA_MIN_ROWS`), the
-  `quantized_matmul_residual` lever (`KQ_QMM_RESID`) and the `conv2d_3x3` lever (`KQ_CONV_NAX`) are
+  `quantized_matmul_residual` lever (`KQ_QMM_RESID`), the dequantize route lever
+  (`KQ_DEQUANT_ROUTE`) and the `conv2d_3x3` lever (`KQ_CONV_NAX`) are
   read when the op is called and builds its graph, not when a kernel is dispatched, so a compiled
   function keeps the kernel choice of its trace. Unset (off) by default, and then each of them keeps
   its first read for the life of the process. Read once per process.
@@ -223,15 +236,22 @@ Tuning levers (defaults are right for normal use):
   carries only the shipped tile, so `64,64,2,2` is the one value that runs today; it keeps its
   plain kernel name. Any other tile is looked up under a name that carries
   `_bm<bm>_bn<bn>_wm<wm>_wn<wn>` before `_alN` and raises until such a kernel is built. Set, it
-  also keeps calls on the kernel where a dequantize row would take them (see above), and that
+  also keeps calls on the kernel where the dequantize route would take them (see above), and that
   choice is read when the op builds its graph. Unset (off) by default. Read once per process
   unless `KQ_TUNE_LIVE=1`.
+- `KQ_DEQUANT_ROUTE` - `auto` runs the dequantize route described above on the GPUs it is for,
+  `off` keeps the `qmm_t` kernel on every GPU, and `force` runs the route on any GPU, NAX GPUs
+  included, for the codecs, rows and range of its table, so that tests run its code on any
+  machine. Any other value warns once and reads as `auto`. `auto` by default. Read when the op
+  builds its graph, once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_QMM_LOG` - set to any value, logs the kernel name, shape and grid of every NAX and ALU qmm
   tile dispatch, every split-K dispatch, every `verify_mma` and `verify_nax` dispatch, split or not,
   and every fused `quantized_matmul_glu`, `quantized_matmul_lora` and `quantized_matmul_residual`
   dispatch, and every `conv2d_3x3` dispatch to stderr, one `[kq qmm]` line each. The grid depth is
-  the K slice count. The mat-vec routes (`qmv`, `verify_qmv`, `mv_ext`) do not log. Unset (off) by
-  default. Read once per process unless `KQ_TUNE_LIVE=1`.
+  the K slice count. A call that takes the dequantize route logs one
+  `[kq dequant] <codec> M=<rows> N=<n> K=<k>` line when the op builds its graph. The mat-vec
+  routes (`qmv`, `verify_qmv`, `mv_ext`) do not log. Unset (off) by default. Read once per process
+  unless `KQ_TUNE_LIVE=1`.
 - `KQ_SPLITK_F32` - partial dtype of the split-K routes (`splitk`, `nax_splitk`, the
   `KQ_QMM_MIDM` band, and `verify_mma` and `verify_nax` when they split K). Float partials let the
   fold round the result once, as the unsplit kernels do. Partials in the activation dtype round

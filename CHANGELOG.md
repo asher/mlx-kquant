@@ -28,6 +28,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   matmul tiles against stock and MLX affine arms at diffusion model shapes.
 - `KQ_SPLITK_CAP` caps the K slices of the NAX and ALU split-K routes at 32 or
   fewer rows by GPU core count, for A/B runs on wide ones such as a vocab head.
+- `KQ_DEQUANT_ROUTE=force` runs the dequantize route on any GPU, and
+  `KQ_QMM_LOG` logs each call that takes it.
 - `KQ_SPLITK_F32=1` makes bfloat16 split-K matmuls, MTP verify among them,
   round once instead of once per K slice. `0` stores float16 partials again,
   which can return inf.
@@ -57,10 +59,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   32 rows, as in batched decode and speculative verify, run up to 30% faster.
 - On NAX GPUs (M5), batched gemma-4 decode of prompts of different lengths
   runs 1 to 2% faster. `KQ_GQA_NAX=0` restores the previous kernel.
-- On M3 Max with 40 GPU cores, `q3_k`, `q5_k`, `q6_k`, `nvfp4` and `ptq1_0`
-  matmuls of 2048 or more rows, and `q4_k` of 16384 or more, dequantize the
-  weight and run MLX's matmul. Image steps' linears run 1 to 12% faster,
-  `nvfp4` 33 to 39%.
+- On GPUs without NAX before M5, plain `q3_k`, `q5_k`, `q6_k`, `nvfp4` and
+  `ptq1_0` matmuls of 2048 or more rows, and `q4_k` of 16384 or more, at K 3840
+  to 12288 and N 3840 to 24576, dequantize the weight and run MLX's matmul. On
+  M3 Max they run 1 to 12% faster, `nvfp4` 33 to 39%. `KQ_DEQUANT_ROUTE=off`
+  keeps the quantized kernel.
 - The bundled metallib drops the float32-activation matmul kernels, which no
   call reached, about 22 MB.
 
