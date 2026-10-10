@@ -31,7 +31,14 @@ PIN = {"KQ_QMM_TILE": "64,64,2,2"}
 
 # M3 Max with 40 GPU cores (applegpu_g15s): codec -> (min_m, inherited).
 ROW_CLASS = (15, 40)
-ROWS = {"q4_k": (16384, 0), "q5_k": (2048, 0), "q6_k": (2048, 0)}
+ROWS = {
+    "nvfp4": (2048, 0),
+    "ptq1_0": (2048, 0),
+    "q3_k": (2048, 0),
+    "q4_k": (16384, 0),
+    "q5_k": (2048, 0),
+    "q6_k": (2048, 0),
+}
 MIN_N = 3840
 
 MATMUL_CODECS = sorted(c for c in CODEC_GEOMETRY if kq.codec_has_matmul(c))
