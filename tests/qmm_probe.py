@@ -12,9 +12,10 @@ reference to the output dtype. A call with ``"ulp_vs": i`` gets ``ulp``,
 the largest ulp distance to call ``i``'s output, and ``rdiff``, the
 relative Frobenius distance to it, and with the check ``ulp_big``, the
 largest ulp distance on the elements whose reference is above 1% of its
-root mean square. ``"check_rows": [[lo, hi], ...]`` limits the check and
-the ulp comparison to those rows of x's flattened leading dims, so a call
-with many rows holds float64 copies of only those rows. Every call gets
+root mean square. ``"check_block": B`` runs the check and the ulp
+comparison over every row of x's flattened leading dims, B rows at a
+time, so a call with many rows holds float64 copies of B rows; it reports
+``checked``, the number of rows it read. Every call gets
 ``digest``, a hash of its output bits, to compare calls across probe
 processes.
 
@@ -174,12 +175,58 @@ def ordered(bits):
 outs = []
 results = []
 _refs = {}
-def picked(a, rows):
-    # The rows [lo, hi) of a's flattened leading dims, or all of a.
-    if not rows:
-        return a
-    flat = a.reshape(-1, a.shape[-1])
-    return mx.concatenate([flat[lo:hi] for lo, hi in rows])
+def as64(a):
+    return np.array(a.astype(mx.float32)).astype(np.float64)
+
+
+def blocked_check(c, x, y, other, wd, refs, res):
+    # The check and the ulp comparison to other over every row, check_block
+    # rows at a time. Norms add up over the blocks; ulp counts take the max.
+    # ulp_big needs the root mean square of the whole reference first: the
+    # first call of a reference keeps its sum of squares.
+    blk = c["check_block"]
+    xf = x.reshape(-1, x.shape[-1])
+    yf = y.reshape(-1, y.shape[-1])
+    of = other.reshape(-1, other.shape[-1]) if other is not None else None
+    mx.eval(xf, yf)
+    rows = xf.shape[0]
+    starts = range(0, rows, blk)
+
+    def ref_of(lo):
+        return as64(xf[lo : lo + blk]) @ wd.T
+
+    thr = 0.0
+    if of is not None:
+        mx.eval(of)
+        if "sumsq" not in refs:
+            refs["sumsq"] = sum(float((ref_of(lo) ** 2).sum()) for lo in starts)
+        thr = 1e-2 * np.sqrt(refs["sumsq"] / (rows * yf.shape[-1]))
+    d2 = r2 = dd = b2 = 0.0
+    ulp = ulp_big = checked = 0
+    for lo in starts:
+        ref = ref_of(lo)
+        got = as64(yf[lo : lo + blk])
+        d2 += float(((got - ref) ** 2).sum())
+        r2 += float((ref * ref).sum())
+        checked += ref.shape[0]
+        if of is not None:
+            a = ordered(np.array(yf[lo : lo + blk].view(mx.uint16)))
+            b = ordered(np.array(of[lo : lo + blk].view(mx.uint16)))
+            d = np.abs(a - b)
+            ulp = max(ulp, int(d.max()))
+            big = np.abs(ref) > thr
+            if big.any():
+                ulp_big = max(ulp_big, int(d[big].max()))
+            yb = as64(of[lo : lo + blk])
+            dd += float(((got - yb) ** 2).sum())
+            b2 += float((yb * yb).sum())
+    refs["sumsq"] = r2
+    res["rel"] = float(np.sqrt(d2) / (np.sqrt(r2) + 1e-30))
+    res["checked"] = checked
+    if of is not None:
+        res["ulp"] = ulp
+        res["ulp_big"] = ulp_big
+        res["rdiff"] = float(np.sqrt(dd) / (np.sqrt(b2) + 1e-30))
 
 
 _ulp_bases = {c["ulp_vs"] for c in spec["calls"] if c.get("ulp_vs") is not None}
@@ -210,22 +257,28 @@ for i, c in enumerate(spec["calls"]):
     # Digest of the output bits, to compare calls across probe processes.
     bits = y.view(mx.uint16) if y.dtype in DT.values() else y
     res["digest"] = hashlib.sha1(memoryview(np.array(bits))).hexdigest()
-    if spec.get("check", True):
-        # Calls that differ only in env share their references.
-        rkey = (
-            c["codec"], c["n"], tuple(c["shape"]), str(dtype),
-            c.get("layout", "dense"), c.get("seed", i), design,
-            tuple(map(tuple, c.get("check_rows") or ())),
-        )
+    base = c.get("ulp_vs")
+    blocked = spec.get("check", True) and c.get("check_block")
+    # Calls that differ only in env share their references.
+    rkey = (
+        c["codec"], c["n"], tuple(c["shape"]), str(dtype),
+        c.get("layout", "dense"), c.get("seed", i), design,
+        c.get("check_block"),
+    )
+    if blocked:
+        assert not c.get("r2"), "r2 takes no check_block"
+        wd = dequantized(c["codec"], c["n"], c["shape"][-1], design)
+        other = outs[base] if base is not None else None
+        blocked_check(c, x, y, other, wd, _refs.setdefault(rkey, {}), res)
+        res["nonfinite"] = int((~mx.isfinite(y)).sum().item())
+    elif spec.get("check", True):
         if rkey not in _refs:
             wd = dequantized(c["codec"], c["n"], c["shape"][-1], design)
-            xs = picked(x, c.get("check_rows"))
-            xn = np.array(xs.astype(mx.float32)).astype(np.float64)
+            xn = as64(x)
             _refs[rkey] = {"xn": xn, "ref": xn @ wd.T}
         refs = _refs[rkey]
         ref = refs["ref"]
-        ys = picked(y, c.get("check_rows"))
-        got = np.array(ys.astype(mx.float32)).astype(np.float64)
+        got = as64(y)
         res["rel"] = float(np.linalg.norm(got - ref) / (np.linalg.norm(ref) + 1e-30))
         res["nonfinite"] = int((~mx.isfinite(y)).sum().item())
         if c.get("r2"):
@@ -239,15 +292,13 @@ for i, c in enumerate(spec["calls"]):
             res["rel2"] = rel(got, refs["ref2"])
             res["floor1"] = refs["floor1"]
             res["floor2"] = refs["floor2"]
-    base = c.get("ulp_vs")
-    if base is not None and outs[base] is not None:
-        rows = c.get("check_rows") if spec.get("check", True) else None
-        a = np.array(picked(y, rows).view(mx.uint16))
-        b = np.array(picked(outs[base], rows).view(mx.uint16))
+    if base is not None and outs[base] is not None and not blocked:
+        a = np.array(y.view(mx.uint16))
+        b = np.array(outs[base].view(mx.uint16))
         res["ulp"] = int(np.abs(ordered(a) - ordered(b)).max())
         # Relative Frobenius distance to that call's output.
-        yb = np.array(picked(outs[base], rows).astype(mx.float32)).astype(np.float64)
-        ya = np.array(picked(y, rows).astype(mx.float32)).astype(np.float64)
+        yb = as64(outs[base])
+        ya = as64(y)
         res["rdiff"] = rel(ya, yb)
         if spec.get("check", True):
             # The largest ulp distance on the elements above 1% of the

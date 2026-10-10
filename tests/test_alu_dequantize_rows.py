@@ -265,22 +265,16 @@ def test_nax_route_unchanged(codec):
         assert res[i]["digest"] == res[i + 1]["digest"], (calls[i], calls[i + 1])
 
 
-def _check_rows(rows):
-    # Past 4096 rows the float64 and ulp checks read 1024 rows at each end
-    # and across the middle, where a batch of two meets, so a check holds
-    # float64 copies of 3072 rows at most.
-    if rows <= 4096:
-        return None
-    mid = rows // 2
-    return [[0, 1024], [mid - 512, mid + 512], [rows - 1024, rows]]
+# The float64 and ulp checks read every row, 1024 rows at a time, so a
+# check holds float64 copies of 1024 rows.
+CHECK_BLOCK = 1024
 
 
-def _pair(codec, shape, dtype, layout, seed, check_rows=None):
+def _pair(codec, shape, dtype, layout, seed):
     # The route, then the kernel on the same inputs, its ulp held to the
     # route's.
-    rows = shape[0] * shape[1]
     route = _call(codec, shape, MIN_N, _route_env(codec), dtype=dtype, layout=layout)
-    route.update(seed=seed, check_rows=check_rows or _check_rows(rows))
+    route.update(seed=seed, check_block=CHECK_BLOCK)
     return [route, dict(route, env=KERNEL_ENV)]
 
 
@@ -300,6 +294,7 @@ def _check_pairs(calls, res, dtype):
         ((name, _),) = k["kernels"]
         assert "_qmm_t_" in name and "_nax_" not in name, name
         for x in (r, k):
+            assert x["checked"] == c["shape"][0] * c["shape"][1], (c, x["checked"])
             assert x["rel"] < R1[dtype], (c, x["rel"])
             assert x["nonfinite"] == 0, c
         # The route's error against float64 is the kernel's.
@@ -312,6 +307,8 @@ def _check_pairs(calls, res, dtype):
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 @pytest.mark.parametrize("codec", sorted(ROWS))
 def test_route_numerics(codec, dtype, layout):
+    # The floor in one batch and in two, every row checked: for q4_k all
+    # 16384 rows, row 8192 where the two batches meet among them.
     _metal()
     min_m = ROWS[codec]
     calls = _with_ulp(
@@ -337,18 +334,12 @@ def test_route_k_max(codec, dtype):
     _check_pairs(calls, run_probe(calls, env=LIVE), dtype)
 
 
-# Rows of the 32769-row call that the checks read: both ends, the middle
-# and the rows around 32767.
-INT16_ROWS = [[0, 512], [16128, 16640], [32256, 32769]]
-
-
 @pytest.mark.parametrize("codec", sorted(ROWS))
 def test_route_rows_above_int16(codec):
-    # 32769 rows on the route against the kernel and float64.
+    # 32769 rows on the route against the kernel and float64, every row
+    # checked, so rows 32767 and 32768 past the int16 range among them.
     _metal()
-    calls = _with_ulp(
-        _pair(codec, [1, 32769, MIN_K], "bfloat16", "dense", 0, check_rows=INT16_ROWS)
-    )
+    calls = _with_ulp(_pair(codec, [1, 32769, MIN_K], "bfloat16", "dense", 0))
     _check_pairs(calls, run_probe(calls, env=LIVE), "bfloat16")
 
 
@@ -441,21 +432,45 @@ def active(window):
     return least
 
 
+def settled():
+    # Reads until two windows agree, so the buffers an earlier arm freed
+    # are back before the base is taken.
+    prev = active(0.2)
+    for _ in range(5):
+        cur = active(0.2)
+        if cur == prev:
+            break
+        prev = cur
+    return cur
+
+
+def forward(fn):
+    # What the pending backward graph holds after the forward.
+    mx.clear_cache()
+    base = settled()
+    loss, g = mx.value_and_grad(fn)(x)
+    mx.eval(loss)
+    return base, loss, g, active(0.2) - base
+
+
 out = {}
 grads = {}
 for arm, fn in (("route", f), ("kernel", f), ("composed", composed)):
     case(arm, spec.get(arm + "_env", {}))
-    mx.clear_cache()
-    base = active(0.2)
-    loss, g = mx.value_and_grad(fn)(x)
-    mx.eval(loss)
-    # What the pending backward graph holds after the forward. A slow
-    # completion handler gets up to five longer windows on the route arm.
-    held = active(0.2) - base
-    for _ in range(5 if arm == "route" else 0):
-        if held < spec["held_below"]:
+    base, loss, g, held = forward(fn)
+    # A late completion handler moves a reading. On the route it leaves
+    # buffers not yet freed in the reading, which then gets up to five
+    # longer windows. On the stock product it leaves them in the base,
+    # and the arm runs again, up to five times.
+    for _ in range(5):
+        if arm == "route" and held >= spec["held_below"]:
+            held = active(1.0) - base
+        elif arm == "composed" and held < spec["dense"]:
+            mx.eval(g)
+            del loss, g
+            base, loss, g, held = forward(fn)
+        else:
             break
-        held = active(1.0) - base
     mx.eval(g)
     grads[arm] = g
     out[arm] = {"held": held, "loss": loss.item(), "dtype": str(g.dtype)}
@@ -490,6 +505,42 @@ for arm in ("route", "kernel"):
             out[name] = None
         except Exception as e:
             out[name] = f"{type(e).__name__}: {e}"
+print(json.dumps(out))
+"""
+)
+
+_TRANSFORM_CHILD = (
+    _PRELUDE
+    + r"""
+codec, m, n, k = spec["codec"], spec["m"], spec["n"], spec["k"]
+w, s = weights(codec, n, k)
+w2, _ = weights(codec, n, k, seed=1)
+x = (mx.random.normal((m, k), key=mx.random.key(1)) * 0.5).astype(mx.bfloat16)
+a = (mx.random.normal((k, 16), key=mx.random.key(5)) * 0.05).astype(mx.bfloat16)
+b = (mx.random.normal((16, n), key=mx.random.key(6)) * 0.05).astype(mx.bfloat16)
+r = (mx.random.normal((m, n), key=mx.random.key(7)) * 0.5).astype(mx.bfloat16)
+mx.eval(x, a, b, r)
+ops = {
+    "matmul": lambda t: kq.quantized_matmul(t, w, s, codec, transpose=True),
+    "glu": lambda t: kq.quantized_matmul_glu(t, w, w2, codec),
+    "lora": lambda t: kq.quantized_matmul_lora(t, w, codec, a, b),
+    "residual": lambda t: kq.quantized_matmul_residual(t, w, codec, r),
+}
+transforms = {
+    "jvp": lambda f: mx.jvp(f, [x], [x])[1],
+    "vmap": lambda f: mx.vmap(f)(mx.stack([x, x * 0.5])),
+}
+out = {}
+for arm in ("route", "kernel"):
+    for op, f in ops.items():
+        for tr, run in transforms.items():
+            name = f"{arm}_{op}_{tr}"
+            case(name, spec[arm + "_env"])
+            try:
+                mx.eval(run(f))
+                out[name] = None
+            except Exception as e:
+                out[name] = f"{type(e).__name__}: {e}"
 print(json.dumps(out))
 """
 )
@@ -613,6 +664,7 @@ def test_route_vjp(codec, dtype, layout):
         "route_env": _route_env(codec),
         "kernel_env": KERNEL_ENV,
         "held_below": MIN_N * MAX_K * 2 // 4,
+        "dense": MIN_N * MAX_K * 2,
     }
     out, logs = _run_child(_GRAD_CHILD, spec, LIVE)
     assert _child_routed(logs["route"]), logs["route"]
@@ -640,6 +692,30 @@ def test_route_weight_grad_raises(codec):
         assert r == k, out
         assert _child_routed(logs[f"route_{argnum}"]), logs
         assert not _child_routed(logs[f"kernel_{argnum}"]), logs
+
+
+def test_route_jvp_vmap_refuse_as_kernel():
+    # jvp and vmap wrt x of quantized_matmul, glu, lora and residual at a
+    # routed shape raise by the name KQuantMatmul, as on the kernel, so the
+    # error text does not change at the row floor. vmap of glu refuses on
+    # its fused node, before any quantized_matmul is built.
+    _metal()
+    codec = "q6_k"
+    spec = {"codec": codec, "m": ROWS[codec], "n": MIN_N, "k": MIN_K}
+    force = {"KQ_QMM_TILE": None, "KQ_DISABLE_NAX": None, "KQ_DEQUANT_ROUTE": "force"}
+    spec.update(route_env=force, kernel_env=KERNEL_ENV)
+    out, logs = _run_child(_TRANSFORM_CHILD, spec, LIVE)
+    for op in ("matmul", "glu", "lora", "residual"):
+        for tr in ("jvp", "vmap"):
+            r, k = out[f"route_{op}_{tr}"], out[f"kernel_{op}_{tr}"]
+            fused = (op, tr) == ("glu", "vmap")
+            node = "KQuantMatmulFused" if fused else "KQuantMatmul"
+            want = f"ValueError: [Primitive::{tr}] Not implemented for {node}."
+            assert r == want, (op, tr, out)
+            assert r == k, (op, tr, out)
+            routed = _child_routed(logs[f"route_{op}_{tr}"])
+            assert routed != fused, (op, tr, logs)
+            assert not _child_routed(logs[f"kernel_{op}_{tr}"]), (op, tr, logs)
 
 
 @pytest.mark.parametrize("codec", ["nvfp4", "q6_k"])

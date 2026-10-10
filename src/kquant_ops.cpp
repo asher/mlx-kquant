@@ -498,6 +498,21 @@ std::vector<mx::array> KQuantDequantRoute::vjp(
   return vjps;
 }
 
+std::vector<mx::array> KQuantDequantRoute::jvp(
+    const std::vector<mx::array>&,
+    const std::vector<mx::array>&,
+    const std::vector<int>&) {
+  throw std::invalid_argument(
+      "[Primitive::jvp] Not implemented for KQuantMatmul.");
+}
+
+std::pair<std::vector<mx::array>, std::vector<int>> KQuantDequantRoute::vmap(
+    const std::vector<mx::array>&,
+    const std::vector<int>&) {
+  throw std::invalid_argument(
+      "[Primitive::vmap] Not implemented for KQuantMatmul.");
+}
+
 mx::array quantized_matmul_qmv_bias(
     mx::array x,
     mx::array w,

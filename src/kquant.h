@@ -1220,6 +1220,7 @@ class KQuantMatmul : public mx::Primitive {
 // product under stop_gradient; the output shares y's buffer. The gradient
 // wrt x runs the quantized matmul the other way, so no backward pass keeps
 // the dense copy, and the gradient wrt w or scales throws, as on the kernel.
+// jvp and vmap throw the base-class text with the name KQuantMatmul.
 class KQuantDequantRoute : public mx::Primitive {
  public:
   explicit KQuantDequantRoute(mx::Stream stream, std::string kquant_type)
@@ -1250,6 +1251,15 @@ class KQuantDequantRoute : public mx::Primitive {
       const std::vector<mx::array>& cotangents,
       const std::vector<int>& argnums,
       const std::vector<mx::array>& outputs) override;
+  // jvp and vmap refuse by the name KQuantMatmul, as the kernel path does,
+  // so the error text does not depend on which path a call takes.
+  std::vector<mx::array> jvp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& tangents,
+      const std::vector<int>& argnums) override;
+  std::pair<std::vector<mx::array>, std::vector<int>> vmap(
+      const std::vector<mx::array>& inputs,
+      const std::vector<int>& axes) override;
 
  private:
   std::string kquant_type_;
