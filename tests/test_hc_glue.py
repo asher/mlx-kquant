@@ -13,6 +13,8 @@ Usage: test_hc_glue.py
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 
 import mlx.core as mx
 import numpy as np
@@ -235,6 +237,117 @@ def test_front_expand_collapse_multi_row(rows, D):
         assert np.array_equal(_np64(c), _np64(c_ref))
         assert np.array_equal(np.array(p), np.array(p_ref))
         assert np.array_equal(np.array(cb), np.array(cb_ref))
+
+
+# GLM-5.3's hyper-connection decode: hidden 4096, 20 sinkhorn iterations,
+# norm eps 1e-5, and 92 cycles per token.
+GLM_D, GLM_NORM_EPS, GLM_CYCLES = 4096, 1e-5, 92
+
+
+def _glm_inputs(rows, dtype, seed):
+    ks = mx.random.split(mx.random.key(seed), 8)
+    x_sub = (mx.random.normal((1, rows, GLM_D), key=ks[0]) * 0.5).astype(dtype)
+    resid = (mx.random.normal((1, rows, HC, GLM_D), key=ks[1]) * 2.0).astype(dtype)
+    post = 2 * mx.sigmoid(mx.random.normal((1, rows, HC), key=ks[2]))
+    c = mx.softmax(mx.random.normal((1, rows, HC, HC), key=ks[3]), axis=-1)
+    comb = c / c.sum(axis=-2, keepdims=True)
+    fn = mx.random.normal((MIX, HC * GLM_D), key=ks[4]) * 0.02
+    scale = mx.array([0.3, 0.2, 0.25], dtype=mx.float32)
+    base = mx.random.normal((MIX,), key=ks[5]) * 0.5
+    w = (1.0 + 0.1 * mx.random.normal((GLM_D,), key=ks[6])).astype(dtype)
+    mx.eval(x_sub, resid, post, comb, fn, scale, base, w)
+    return x_sub, resid, post, comb, fn, scale, base, w
+
+
+def _glm_fused(x_sub, resid, post, comb, fn, scale, base, w):
+    return kq.hc_front_expand_collapse(
+        x_sub,
+        resid,
+        post,
+        comb,
+        fn,
+        scale,
+        base,
+        w,
+        iters=ITERS,
+        hc_eps=HC_EPS,
+        norm_eps=GLM_NORM_EPS,
+    )
+
+
+def _glm_pair(x_sub, resid, post, comb, fn, scale, base, w):
+    h, mixes, ssq = kq.hc_front_expand_reduce(x_sub, resid, post, comb, fn)
+    x, p, cb = kq.hc_sinkhorn_collapse(
+        h,
+        mixes,
+        ssq,
+        scale,
+        base,
+        w,
+        iters=ITERS,
+        hc_eps=HC_EPS,
+        norm_eps=GLM_NORM_EPS,
+    )
+    return h, x, p, cb
+
+
+def _glm_chain(fun, args):
+    # The cycles of one token in one evaluation, each fed by the last; the
+    # collapsed output stands in for the sublayer's.
+    x_sub, resid, post, comb, fn, scale, base, w = args
+    outs = []
+    for _ in range(GLM_CYCLES):
+        h, x, p, cb = fun(x_sub, resid, post, comb, fn, scale, base, w)
+        outs.append((h, x, p, cb))
+        x_sub, resid, post, comb = x, h, p, cb
+    mx.eval(outs)
+    return outs
+
+
+@pytest.mark.parametrize("rows", [1, 2, 4, 8])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_front_expand_collapse_glm53_chain(rows, dtype):
+    # At GLM-5.3's decode shapes the fused cycle equals the split pair bit
+    # for bit, every cycle of a token's chain.
+    args = _glm_inputs(rows, dtype, 211 + rows)
+    fused = _glm_chain(_glm_fused, args)
+    pair = _glm_chain(_glm_pair, args)
+    for i, (f, p) in enumerate(zip(fused, pair, strict=True)):
+        for name, a, b in zip(("h", "x", "post", "comb"), f, p, strict=True):
+            assert mx.array_equal(a, b).item(), (i, name)
+
+
+_NT_CHILD = r"""
+import mlx.core as mx
+import mlx_kquant as kq
+x = mx.zeros((1, 1, 4, 1024), dtype=mx.bfloat16)
+fn = mx.zeros((24, 4096), dtype=mx.float32)
+try:
+    mx.eval(kq.hc_front_reduce(x, fn))
+    print("no error")
+except Exception as e:
+    print(f"{type(e).__name__}: {e}")
+"""
+
+
+@pytest.mark.parametrize("nt", ["32", "63"])
+def test_family_width_floor(nt):
+    # The collapse gives one simdgroup to the sinkhorn and the rest to the
+    # columns, so a launch of one simdgroup would have no column workers.
+    # Capped below two simdgroups, the family raises before any launch.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KQ_")}
+    env["KQ_HC_NT"] = nt
+    r = subprocess.run(
+        [sys.executable, "-c", _NT_CHILD],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert r.returncode == 0, r.stderr[-4000:]
+    out = r.stdout.strip().splitlines()[-1]
+    assert out.startswith("RuntimeError: [mlx_kquant.hc] kq_hc_front_reduce_"), out
+    assert "below the 64 it needs" in out, out
 
 
 def test_input_validation():
