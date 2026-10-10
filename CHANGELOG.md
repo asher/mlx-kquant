@@ -6,6 +6,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- On GPUs of two dies such as M5 Ultra, `hc_front_expand_collapse` could read stale values from
+  other threadgroups and give garbage GLM-5.3 decode; its handoff is now device coherent.
+- Hyper-connection kernels capped below 64 threads per threadgroup raise an error instead of hanging.
+
 ## [0.4.17]
 
 ### Added

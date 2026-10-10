@@ -88,6 +88,26 @@ inline float kq_hc_tg_sum(
   acc = fma(a3.z, b3.z, acc);                            \
   acc = fma(a3.w, b3.w, acc);
 
+// Pointer types of the buffers the fused kernel hands from one threadgroup
+// to another (h, the mix dots, the sum of squares). By default device
+// memory has threadgroup coherence: a plain store is visible only to the
+// threads of its own threadgroup. A coherent(device) pointer makes its
+// loads and stores visible across the threadgroups of a dispatch once
+// they are synchronized (MSL spec 4.8, Memory Coherency). The split
+// kernels hand off at a dispatch boundary and keep plain pointers, so the
+// bodies take the qualifier as a parameter (C) and every access in them
+// goes through these types.
+template <typename T, bool C>
+struct kq_hc_ptr {
+  typedef device T* type;
+  typedef const device T* ctype;
+};
+template <typename T>
+struct kq_hc_ptr<T, true> {
+  typedef device coherent(device) T* type;
+  typedef const device coherent(device) T* ctype;
+};
+
 template <typename T>
 [[kernel]] void kq_hc_front_reduce(
     const device T* x [[buffer(0)]],
@@ -145,17 +165,18 @@ template <typename T>
 }
 
 // Shared body of kq_hc_front_expand_reduce, also run by every threadgroup
-// of the fused kernel. partial is threadgroup scratch [KQ_HC_NSG_MAX].
-template <typename T>
+// of the fused kernel, with coherent(device) outputs there (C).
+// partial is threadgroup scratch [KQ_HC_NSG_MAX].
+template <typename T, bool C>
 inline void kq_hc_front_expand_reduce_body(
     const device T* x_sub,
     const device T* resid,
     const device float* post,
     const device float* comb,
     const device float* fn,
-    device T* h_out,
-    device float* mixes_raw,
-    device float* sumsq,
+    typename kq_hc_ptr<T, C>::type h_out,
+    typename kq_hc_ptr<float, C>::type mixes_raw,
+    typename kq_hc_ptr<float, C>::type sumsq,
     const int D,
     uint row,
     uint m,
@@ -169,7 +190,7 @@ inline void kq_hc_front_expand_reduce_body(
 
   const device T* xs = x_sub + (int64_t)row * D;
   const device T* rr = resid + (int64_t)row * KTOT;
-  device T* hout = h_out + (int64_t)row * KTOT;
+  typename kq_hc_ptr<T, C>::type hout = h_out + (int64_t)row * KTOT;
 
   const uint pb = row * 4, cb = row * 16;
   const float p0 = post[pb + 0], p1 = post[pb + 1];
@@ -183,7 +204,7 @@ inline void kq_hc_front_expand_reduce_body(
   using T4 = vec<T, 4>;
   const device T4* xs4 = (const device T4*)xs;
   const device T4* rr4 = (const device T4*)rr;
-  device T4* h4 = (device T4*)hout;
+  typename kq_hc_ptr<T4, C>::type h4 = (typename kq_hc_ptr<T4, C>::type)hout;
   const device float4* f4 = (const device float4*)(fn + (int64_t)m * KTOT);
 
   float acc = 0.0f;
@@ -264,7 +285,7 @@ template <typename T>
     uint tid [[thread_position_in_threadgroup]],
     uint nt [[threads_per_threadgroup]]) {
   threadgroup float partial[KQ_HC_NSG_MAX];
-  kq_hc_front_expand_reduce_body<T>(
+  kq_hc_front_expand_reduce_body<T, false>(
       x_sub,
       resid,
       post,
@@ -286,12 +307,13 @@ template <typename T>
 // the streams with the pre gates, which every thread derives on its own
 // from the mixes, while the last simdgroup runs the sinkhorn (post and
 // comb). ssq_shared is [KQ_HC_NSG_MAX] and inv_shared [1] of threadgroup
-// scratch.
-template <typename T>
+// scratch. The fused kernel reads x, mixes_raw and sumsq through
+// coherent(device) pointers (C).
+template <typename T, bool C>
 inline void kq_hc_sinkhorn_collapse_body(
-    const device T* x,
-    const device float* mixes_raw,
-    const device float* sumsq,
+    typename kq_hc_ptr<T, C>::ctype x,
+    typename kq_hc_ptr<float, C>::ctype mixes_raw,
+    typename kq_hc_ptr<float, C>::ctype sumsq,
     const device float* scale,
     const device float* base,
     const device T* w,
@@ -317,20 +339,21 @@ inline void kq_hc_sinkhorn_collapse_body(
   const bool worker = tid < NC;
   const bool spare = (sg == NSG - 1);
 
-  const device float* mix = mixes_raw + row * KQ_HC_MIX;
+  typename kq_hc_ptr<float, C>::ctype mix = mixes_raw + row * KQ_HC_MIX;
   device float* post_out = post + row * KQ_HC;
   device float* comb_out = comb + row * KQ_HC * KQ_HC;
 
   const float factor = metal::rsqrt(sumsq[row] / (float)(KQ_HC * D) + NEPS);
 
-  const device T* x_row = x + (int64_t)row * (KQ_HC * D);
+  typename kq_hc_ptr<T, C>::ctype x_row = x + (int64_t)row * (KQ_HC * D);
   device T* out_row = collapsed + (int64_t)row * D;
 
   using T4 = vec<T, 4>;
-  const device T4* x_row0 = (const device T4*)(x_row + 0 * D);
-  const device T4* x_row1 = (const device T4*)(x_row + 1 * D);
-  const device T4* x_row2 = (const device T4*)(x_row + 2 * D);
-  const device T4* x_row3 = (const device T4*)(x_row + 3 * D);
+  using X4 = typename kq_hc_ptr<T4, C>::ctype;
+  X4 x_row0 = (X4)(x_row + 0 * D);
+  X4 x_row1 = (X4)(x_row + 1 * D);
+  X4 x_row2 = (X4)(x_row + 2 * D);
+  X4 x_row3 = (X4)(x_row + 3 * D);
   device T4* out4 = (device T4*)out_row;
 
   const uint D4 = (uint)D / 4;
@@ -359,9 +382,10 @@ inline void kq_hc_sinkhorn_collapse_body(
       post_out[lane] = post_v;
     }
 
-    float4 v =
-        (*(const device float4*)(mix + BASE_OFF + llane * KQ_HC) * comb_scale +
-         *(const device float4*)(base + BASE_OFF + llane * KQ_HC)) *
+    float4 v = (*(typename kq_hc_ptr<float4, C>::ctype)(
+                    mix + BASE_OFF + llane * KQ_HC) *
+                    comb_scale +
+                *(const device float4*)(base + BASE_OFF + llane * KQ_HC)) *
         active;
 
     float row_max = metal::max(metal::max(v.x, v.y), metal::max(v.z, v.w));
@@ -456,7 +480,7 @@ template <typename T>
     uint nt [[threads_per_threadgroup]]) {
   threadgroup float ssq_shared[KQ_HC_NSG_MAX];
   threadgroup float inv_shared[1];
-  kq_hc_sinkhorn_collapse_body<T>(
+  kq_hc_sinkhorn_collapse_body<T, false>(
       x,
       mixes_raw,
       sumsq,
@@ -484,9 +508,11 @@ template <typename T>
 // over the mixes and h the others published. Nothing waits, so the grid
 // needs no co-residency and any row count works; the counter is zero on
 // entry (the host clears a fresh one per dispatch) and is left at
-// KQ_HC_MIX + 1. The collapsing threadgroup reads h and the mixes after
-// a device-scope fence on the acquiring side that matches the release
-// fence each publisher issues before its increment.
+// KQ_HC_MIX + 1. h, the mixes and the sum of squares pass between
+// threadgroups through coherent(device) pointers (MSL spec 4.8): a plain
+// device store is visible only within its own threadgroup, which on a GPU
+// of two dies can leave the collapse reading stale values. Every thread
+// fences at device scope after it publishes and before it reads.
 template <typename T>
 [[kernel]] void kq_hc_front_expand_collapse(
     const device T* x_sub [[buffer(0)]],
@@ -497,9 +523,9 @@ template <typename T>
     const device float* scale [[buffer(5)]],
     const device float* base [[buffer(6)]],
     const device T* w [[buffer(7)]],
-    device T* h_out [[buffer(8)]],
-    device float* mixes_raw [[buffer(9)]],
-    device float* sumsq [[buffer(10)]],
+    device coherent(device) T* h_out [[buffer(8)]],
+    device coherent(device) float* mixes_raw [[buffer(9)]],
+    device coherent(device) float* sumsq [[buffer(10)]],
     device atomic_uint* arrive [[buffer(11)]],
     device T* collapsed [[buffer(12)]],
     device float* post_out [[buffer(13)]],
@@ -514,12 +540,14 @@ template <typename T>
   threadgroup float partial[KQ_HC_NSG_MAX];
   threadgroup float ssq_shared[KQ_HC_NSG_MAX];
   threadgroup float inv_shared[1];
-  threadgroup uint last_flag;
+  // An array, which tid 0 writes before the barrier that precedes every
+  // read: as a scalar the compiler sees the paths that skip the write.
+  threadgroup uint last_flag[1];
 
   const uint row = tg / (KQ_HC_MIX + 1);
   const uint m = tg % (KQ_HC_MIX + 1);
 
-  kq_hc_front_expand_reduce_body<T>(
+  kq_hc_front_expand_reduce_body<T, true>(
       x_sub,
       resid,
       post_in,
@@ -535,24 +563,32 @@ template <typename T>
       nt,
       partial);
 
-  // publish this threadgroup's mix dot (or h and sumsq), then arrive
+  // Publish this threadgroup's mix dot (or h and sumsq), then arrive.
+  // A seq_cst fence is a release and an acquire fence (MSL spec 6.16.3);
+  // the acquire and release orders on a fence need Metal 4.1 (6.16.1).
+  // The barrier orders every thread's stores before tid 0, which fences
+  // before its fetch_add (release). The tid 0 of the last group fences
+  // after the fetch_add (acquire), and the barrier carries that to the
+  // other threads before they read.
   threadgroup_barrier(mem_flags::mem_device);
   if (tid == 0) {
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst);
+    atomic_thread_fence(
+        mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     uint prev =
         atomic_fetch_add_explicit(arrive + row, 1u, memory_order_relaxed);
-    last_flag = (prev == (uint)KQ_HC_MIX) ? 1u : 0u;
-    if (last_flag != 0u) {
-      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst);
+    const uint last = (prev == (uint)KQ_HC_MIX) ? 1u : 0u;
+    if (last != 0u) {
+      atomic_thread_fence(
+          mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     }
+    last_flag[0] = last;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (last_flag == 0u) {
+  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+  if (last_flag[0] == 0u) {
     return;
   }
-  threadgroup_barrier(mem_flags::mem_device);
 
-  kq_hc_sinkhorn_collapse_body<T>(
+  kq_hc_sinkhorn_collapse_body<T, true>(
       h_out,
       mixes_raw,
       sumsq,
