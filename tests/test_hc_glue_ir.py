@@ -5,7 +5,9 @@ from every threadgroup of a row to the last one to arrive, inside one
 dispatch. By default device memory has threadgroup coherence (MSL spec
 4.8, Memory Coherency), so those accesses must be coherent(device), which
 the compiler lowers to air.store.device_coherent and
-air.load.device_coherent. The split kernels hand off at a dispatch
+air.load.device_coherent. h crosses as raw bits in uint2 vectors: the
+paravirtual GPU of the macos-26 CI runners lowers the coherent forms of
+bfloat vectors wrongly. The split kernels hand off at a dispatch
 boundary and keep plain accesses. Compiles metal/kq_hc_glue.metal to LLVM
 IR with xcrun metal, as the build does; skips where that is missing.
 
@@ -28,6 +30,7 @@ MLX_INCLUDE = os.path.join(os.path.dirname(mx.__file__), "include")
 
 _DEFINE = re.compile(r"^define [^@]*@([\w.$]+)\(")
 _CALL = re.compile(r"@([\w.$]+)\(")
+_COHERENT_BF16 = re.compile(r"@air\.(?:load|store)\.device_coherent\.[\w.]*bf16[\w.]*")
 
 
 def _metal():
@@ -93,6 +96,14 @@ def test_fused_handoff_is_device_coherent(defines):
         body = _reach(defines, name)
         assert "@air.store.device_coherent." in body, name
         assert "@air.load.device_coherent." in body, name
+
+
+def test_fused_handoff_has_no_bfloat_coherent_access(defines):
+    # Every coherent access of h is a bitcast to uint2, for every T.
+    for name in _kernels(defines, "kq_hc_front_expand_collapse"):
+        body = _reach(defines, name)
+        bad = set(_COHERENT_BF16.findall(body))
+        assert not bad, (name, sorted(bad))
 
 
 @pytest.mark.parametrize(

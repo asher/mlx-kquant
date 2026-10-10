@@ -96,16 +96,42 @@ inline float kq_hc_tg_sum(
 // they are synchronized (MSL spec 4.8, Memory Coherency). The split
 // kernels hand off at a dispatch boundary and keep plain pointers, so the
 // bodies take the qualifier as a parameter (C) and every access in them
-// goes through these types.
-template <typename T, bool C>
+// goes through these types. A vector of four 16-bit values (T4) crosses as
+// its raw bits in a uint2, with put on the store and get on the load: the
+// paravirtual GPU of the macos-26 CI runners lowers coherent accesses of
+// bfloat vectors wrongly and those of 32-bit elements right.
+template <typename T, bool C, bool BITS = (C && sizeof(T) == 8)>
 struct kq_hc_ptr {
   typedef device T* type;
   typedef const device T* ctype;
+  static inline T put(T v) {
+    return v;
+  }
+  static inline T get(T v) {
+    return v;
+  }
 };
 template <typename T>
-struct kq_hc_ptr<T, true> {
+struct kq_hc_ptr<T, true, false> {
   typedef device coherent(device) T* type;
   typedef const device coherent(device) T* ctype;
+  static inline T put(T v) {
+    return v;
+  }
+  static inline T get(T v) {
+    return v;
+  }
+};
+template <typename T>
+struct kq_hc_ptr<T, true, true> {
+  typedef device coherent(device) uint2* type;
+  typedef const device coherent(device) uint2* ctype;
+  static inline uint2 put(T v) {
+    return as_type<uint2>(v);
+  }
+  static inline T get(uint2 v) {
+    return as_type<T>(v);
+  }
 };
 
 template <typename T>
@@ -252,10 +278,10 @@ inline void kq_hc_front_expand_reduce_body(
       float4 f3 = f4[3 * D4q + d4];
       KQ_HC_DOT16(acc, h0, h1, h2, h3, f0, f1, f2, f3)
     } else {
-      h4[0 * D4q + d4] = hv0;
-      h4[1 * D4q + d4] = hv1;
-      h4[2 * D4q + d4] = hv2;
-      h4[3 * D4q + d4] = hv3;
+      h4[0 * D4q + d4] = kq_hc_ptr<T4, C>::put(hv0);
+      h4[1 * D4q + d4] = kq_hc_ptr<T4, C>::put(hv1);
+      h4[2 * D4q + d4] = kq_hc_ptr<T4, C>::put(hv2);
+      h4[3 * D4q + d4] = kq_hc_ptr<T4, C>::put(hv3);
       KQ_HC_DOT16(acc, h0, h1, h2, h3, h0, h1, h2, h3)
     }
   }
@@ -421,10 +447,10 @@ inline void kq_hc_sinkhorn_collapse_body(
   for (uint c = 0; c < chunks; ++c) {
     uint d4 = c * NC + tid;
     if (worker && d4 < D4) {
-      float4 x0 = float4(x_row0[d4]);
-      float4 x1 = float4(x_row1[d4]);
-      float4 x2 = float4(x_row2[d4]);
-      float4 x3 = float4(x_row3[d4]);
+      float4 x0 = float4(kq_hc_ptr<T4, C>::get(x_row0[d4]));
+      float4 x1 = float4(kq_hc_ptr<T4, C>::get(x_row1[d4]));
+      float4 x2 = float4(kq_hc_ptr<T4, C>::get(x_row2[d4]));
+      float4 x3 = float4(kq_hc_ptr<T4, C>::get(x_row3[d4]));
       float4 result =
           fma(float4(p0),
               x0,
@@ -444,10 +470,10 @@ inline void kq_hc_sinkhorn_collapse_body(
   for (uint c = 0; c < chunks; ++c) {
     uint d4 = c * NC + tid;
     if (worker && d4 < D4) {
-      float4 x0 = float4(x_row0[d4]);
-      float4 x1 = float4(x_row1[d4]);
-      float4 x2 = float4(x_row2[d4]);
-      float4 x3 = float4(x_row3[d4]);
+      float4 x0 = float4(kq_hc_ptr<T4, C>::get(x_row0[d4]));
+      float4 x1 = float4(kq_hc_ptr<T4, C>::get(x_row1[d4]));
+      float4 x2 = float4(kq_hc_ptr<T4, C>::get(x_row2[d4]));
+      float4 x3 = float4(kq_hc_ptr<T4, C>::get(x_row3[d4]));
       float4 result =
           fma(float4(p0),
               x0,
