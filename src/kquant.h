@@ -56,19 +56,19 @@ int qmv_fine_max_n(const std::string& kquant_type);
 // class's); empty on non-Metal builds.
 std::vector<int> nax_large_row(const std::string& kquant_type);
 
-// The row on a GPU without NAX that runs a plain transposed
-// quantized_matmul as dequantize then the stock matmul, for a chip class
-// (architecture generation and GPU core count), a codec, the rows of x and
-// N: min_m, min_n and inherited (1 when the codec takes another codec's
-// floor unmeasured). Empty on NAX GPUs, on a chip class or codec with no
-// row and below the floor, where the qmm_t kernel runs.
+// The row that runs a plain transposed quantized_matmul as dequantize then
+// the stock matmul by default, for an architecture string (as
+// get_architecture gives it), NAX, a codec, the rows of x, N and K: min_m,
+// min_k, max_k, min_n and max_n. Empty where the qmm_t kernel runs: on NAX
+// GPUs, outside applegpu_g13 to g16 with a suffix other than p, for a codec
+// without a row, below its floor in M and outside the K and N range.
 std::vector<int> alu_dequantize_row(
-    int arch_gen,
-    int cores,
+    const std::string& arch,
     bool nax,
     const std::string& kquant_type,
     int M,
-    int N);
+    int N,
+    int K);
 
 // Every kernel name the split-K dispatchers can build (qmm_splitk,
 // qmm_nax_splitk, verify_mma, verify_nax and their fold), for the kernel

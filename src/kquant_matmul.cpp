@@ -2440,6 +2440,19 @@ bool kq_qmm_tile_pinned() {
   return kq_qmm_tile().has_value();
 }
 
+static int kq_read_dequant_route() {
+  return kq_env_choice("KQ_DEQUANT_ROUTE", {"auto", "off", "force"}, 0);
+}
+
+int kq_dequant_route_mode() {
+  static const int cached = kq_read_dequant_route();
+  return kq_tune_live() ? kq_read_dequant_route() : cached;
+}
+
+bool kq_qmm_log_on() {
+  return kq_qmm_log();
+}
+
 #endif // _METAL_
 
 std::vector<mx::Shape> KQuantMatmul::output_shapes(

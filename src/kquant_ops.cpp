@@ -1,6 +1,8 @@
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
 #include <filesystem>
 #include <sstream>
 #include <stdexcept>
@@ -10,6 +12,7 @@
 #include "kquant_internal.h"
 #include "kquant_lora_epilogue.h"
 
+#include "mlx/transforms.h" // custom_vjp
 #include "mlx/utils.h" // to_stream
 
 #ifdef _METAL_
@@ -45,48 +48,117 @@ inline mx::array kq_dense_x(const mx::array& x, mx::StreamOrDevice s) {
   return mx::contiguous(x, false, s);
 }
 
-// Rows that run a plain transposed quantized_matmul as dequantize then the
-// stock matmul on a GPU without NAX. The dequantize pass costs N x K once,
-// so it pays from a floor in M, where the stock matmul outruns the qmm_t
-// kernel's in-loop decode. A row belongs to the chip class it was measured
-// on; a codec marked inherited takes another codec's floor unmeasured.
+// Codecs whose plain transposed quantized_matmul runs as dequantize then the
+// stock matmul on a GPU without NAX before M5, from a floor in the rows of
+// x. The qmm_t kernel decodes each weight tile once per 64-row tile of x;
+// the dequantize pass decodes the weight once, so it pays from the floor,
+// where the stock matmul outruns the in-loop decode. Floors measured on M3
+// Max, and applied to the whole class.
 struct KqDequantizeRow {
-  int arch_gen;
-  int cores;
   const char* codec;
   int min_m;
-  int min_n;
-  int inherited;
 };
 
 constexpr KqDequantizeRow kDequantizeRows[] = {
-    {15, 40, "nvfp4", 2048, 3840, 0},
-    {15, 40, "ptq1_0", 2048, 3840, 0},
-    {15, 40, "q3_k", 2048, 3840, 0},
-    {15, 40, "q4_k", 16384, 3840, 0},
-    {15, 40, "q5_k", 2048, 3840, 0},
-    {15, 40, "q6_k", 2048, 3840, 0},
+    {"nvfp4", 2048},
+    {"ptq1_0", 2048},
+    {"q3_k", 2048},
+    {"q4_k", 16384},
+    {"q5_k", 2048},
+    {"q6_k", 2048},
 };
+
+// The measured range of the route. The dense copy of the weight lives while
+// the call runs, so N x K caps it at 24576 x 12288 x 2 bytes; a vocabulary
+// head keeps the kernel.
+constexpr int kDequantizeMinK = 3840;
+constexpr int kDequantizeMaxK = 12288;
+constexpr int kDequantizeMinN = 3840;
+constexpr int kDequantizeMaxN = 24576;
+
+// The row for a codec and shape, the chip class aside: min_m, min_k, max_k,
+// min_n and max_n, or empty.
+std::vector<int>
+kq_dequantize_shape_row(const std::string& kquant_type, int M, int N, int K) {
+  if (K < kDequantizeMinK || K > kDequantizeMaxK || N < kDequantizeMinN ||
+      N > kDequantizeMaxN) {
+    return {};
+  }
+  for (const auto& r : kDequantizeRows) {
+    if (kquant_type == r.codec && M >= r.min_m) {
+      return {
+          r.min_m,
+          kDequantizeMinK,
+          kDequantizeMaxK,
+          kDequantizeMinN,
+          kDequantizeMaxN};
+    }
+  }
+  return {};
+}
+
+// True for the chip classes the route runs on by default: an architecture
+// string applegpu_g<gen><suffix> with a two digit generation from 13 (M1)
+// to 16 (M4), a one letter suffix other than p (phones), and no NAX. Any
+// other string keeps the kernel.
+bool kq_dequantize_class(const std::string& arch, bool nax) {
+  if (nax) {
+    return false;
+  }
+  const std::string head = "applegpu_g";
+  if (arch.size() != head.size() + 3 || arch.compare(0, head.size(), head)) {
+    return false;
+  }
+  const char d0 = arch[head.size()];
+  const char d1 = arch[head.size() + 1];
+  const char suffix = arch[head.size() + 2];
+  if (!std::isdigit(static_cast<unsigned char>(d0)) ||
+      !std::isdigit(static_cast<unsigned char>(d1)) ||
+      !std::islower(static_cast<unsigned char>(suffix)) || suffix == 'p') {
+    return false;
+  }
+  const int gen = (d0 - '0') * 10 + (d1 - '0');
+  return gen >= 13 && gen <= 16;
+}
+
+#ifdef _METAL_
+// This GPU's class verdict, read once per process. NAX first.
+bool kq_dequantize_class_here() {
+  static const bool here = []() {
+    if (kq_is_nax_available()) {
+      return false;
+    }
+    auto& d = mx::metal::device(mx::Device::gpu);
+    return kq_dequantize_class(d.get_architecture(), false);
+  }();
+  return here;
+}
+#endif
+
+// Dequantize then the stock matmul. Its vjp runs on the quantized weight,
+// as KQuantMatmul::vjp does, so no backward pass keeps the dense copy; the
+// frozen wire bytes and scales get zeros.
+mx::array kq_dequantize_matmul(
+    const mx::array& x,
+    const mx::array& w,
+    const mx::array& scales,
+    const std::string& kquant_type,
+    mx::Dtype out_type,
+    mx::Stream s);
 
 } // namespace
 
 std::vector<int> alu_dequantize_row(
-    int arch_gen,
-    int cores,
+    const std::string& arch,
     bool nax,
     const std::string& kquant_type,
     int M,
-    int N) {
-  if (nax) {
+    int N,
+    int K) {
+  if (!kq_dequantize_class(arch, nax)) {
     return {};
   }
-  for (const auto& r : kDequantizeRows) {
-    if (r.arch_gen == arch_gen && r.cores == cores && kquant_type == r.codec &&
-        M >= r.min_m && N >= r.min_n) {
-      return {r.min_m, r.min_n, r.inherited};
-    }
-  }
-  return {};
+  return kq_dequantize_shape_row(kquant_type, M, N, K);
 }
 
 // ----------------------------- ops -----------------------------
@@ -248,19 +320,23 @@ mx::array quantized_matmul(
   kq_check_weight_base_at_build(w, kquant_type, s, "quantized_matmul");
 
 #ifdef _METAL_
-  if (transpose && !lora && w.ndim() == 2 && s.device == mx::Device::gpu &&
-      !kq_qmm_tile_pinned()) {
-    auto& d = mx::metal::device(mx::Device::gpu);
-    const std::vector<int> row = alu_dequantize_row(
-        d.get_architecture_gen(),
-        gpu_core_count(),
-        kq_is_nax_available(),
-        kquant_type,
-        rows,
-        w_outer_dims);
-    if (!row.empty()) {
-      auto w_f = dequantize(w, scales, kquant_type, out_type, s);
-      return mx::matmul(mx::astype(x, out_type, s), mx::transpose(w_f, s), s);
+  if (transpose && !lora && w.ndim() == 2 && s.device == mx::Device::gpu) {
+    const bool here = kq_dequantize_class_here();
+    const int mode = kq_dequant_route_mode();
+    if (((here && mode == kDequantAuto) || mode == kDequantForce) &&
+        !kq_qmm_tile_pinned() &&
+        !kq_dequantize_shape_row(kquant_type, rows, w_outer_dims, w_inner_dims)
+             .empty()) {
+      if (kq_qmm_log_on()) {
+        std::fprintf(
+            stderr,
+            "[kq dequant] %s M=%d N=%d K=%d\n",
+            kquant_type.c_str(),
+            rows,
+            w_outer_dims,
+            w_inner_dims);
+      }
+      return kq_dequantize_matmul(x, w, scales, kquant_type, out_type, s);
     }
   }
 #endif
@@ -307,6 +383,44 @@ mx::array quantized_matmul(
           lora_flags),
       std::move(op_inputs));
 }
+
+namespace {
+
+mx::array kq_dequantize_matmul(
+    const mx::array& x,
+    const mx::array& w,
+    const mx::array& scales,
+    const std::string& kquant_type,
+    mx::Dtype out_type,
+    mx::Stream s) {
+  auto forward = [kquant_type, out_type, s](const std::vector<mx::array>& in) {
+    auto w_f = dequantize(in[1], in[2], kquant_type, out_type, s);
+    return std::vector<mx::array>{
+        mx::matmul(mx::astype(in[0], out_type, s), mx::transpose(w_f, s), s)};
+  };
+  auto backward = [kquant_type, s](
+                      const std::vector<mx::array>& primals,
+                      const std::vector<mx::array>& cotangents,
+                      const std::vector<mx::array>&) {
+    auto dx = quantized_matmul(
+        cotangents[0],
+        primals[1],
+        primals[2],
+        kquant_type,
+        false,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        s);
+    return std::vector<mx::array>{
+        mx::astype(dx, primals[0].dtype(), s),
+        mx::zeros_like(primals[1], s),
+        mx::zeros_like(primals[2], s)};
+  };
+  return mx::custom_vjp(forward, backward)({x, w, scales})[0];
+}
+
+} // namespace
 
 mx::array quantized_matmul_qmv_bias(
     mx::array x,

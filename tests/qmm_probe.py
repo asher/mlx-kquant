@@ -10,7 +10,9 @@ float64 reference built from ``kq.dequantize`` weights. A call with
 activation dtype, and ``floor1``/``floor2``, the error of rounding each
 reference to the output dtype. A call with ``"ulp_vs": i`` gets ``ulp``,
 the largest ulp distance to call ``i``'s output, and ``rdiff``, the
-relative Frobenius distance to it. Every call gets ``digest``, a hash of
+relative Frobenius distance to it, and with the check ``ulp_big``, the
+largest ulp distance on the elements whose reference is above 1% of its
+root mean square. Every call gets ``digest``, a hash of
 its output bits, to compare calls across probe processes.
 
 ``"design": "lead"`` draws nonnegative weights and activations whose first
@@ -230,6 +232,14 @@ for i, c in enumerate(spec["calls"]):
         yb = np.array(outs[base].astype(mx.float32)).astype(np.float64)
         ya = np.array(y.astype(mx.float32)).astype(np.float64)
         res["rdiff"] = rel(ya, yb)
+        if spec.get("check", True):
+            # The largest ulp distance on the elements above 1% of the
+            # reference's root mean square, away from the cancellations
+            # near zero where any change of summation order moves many ulp.
+            ref = _refs[rkey]["ref"]
+            big = np.abs(ref) > 1e-2 * np.sqrt(np.mean(ref * ref))
+            d = np.abs(ordered(a) - ordered(b))
+            res["ulp_big"] = int(d[big].max()) if big.any() else 0
     results.append(res)
 print(json.dumps(results))
 """

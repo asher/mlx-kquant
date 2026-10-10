@@ -122,6 +122,29 @@ int kq_env_lever_from(const char* name, int unset, int lowest) {
   return unset;
 }
 
+int kq_env_choice(
+    const char* name,
+    const std::vector<std::string>& choices,
+    int unset) {
+  const char* e = std::getenv(name);
+  if (e == nullptr || e[0] == '\0') {
+    return unset;
+  }
+  std::string v;
+  for (const char* c = e; *c != '\0'; ++c) {
+    v += static_cast<char>(std::tolower(static_cast<unsigned char>(*c)));
+  }
+  std::string takes = "one of";
+  for (size_t i = 0; i < choices.size(); ++i) {
+    if (v == choices[i]) {
+      return static_cast<int>(i);
+    }
+    takes += (i == 0 ? " " : ", ") + choices[i];
+  }
+  warn_env_lever(name, e, takes.c_str());
+  return unset;
+}
+
 int gpu_core_count() {
   const char* e = std::getenv("KQ_GPU_CORES");
   if (e != nullptr) {

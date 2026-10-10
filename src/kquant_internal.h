@@ -33,13 +33,31 @@ int kq_env_flag(const char* name, int unset);
 // integer also reads as `unset`, with the same warning.
 int kq_env_lever_from(const char* name, int unset, int lowest);
 
+// Index in `choices` (lower case) of the environment lever `name`, read in
+// any case. Absent or empty reads as `unset`; any other value reads as
+// `unset`, with the same warning.
+int kq_env_choice(
+    const char* name,
+    const std::vector<std::string>& choices,
+    int unset);
+
 // K ceiling of the codec's large-M NAX tile: above it the plain qmm_t
 // runs the BM=64 tile in place of BM=128. 0 = no ceiling.
 int kq_nax_large_max_k(const std::string& kquant_type);
 
 // True when KQ_QMM_TILE pins the plain qmm_t tile, which also keeps a call
-// off the dequantize row. Metal builds only.
+// off the dequantize route. Metal builds only.
 bool kq_qmm_tile_pinned();
+
+// KQ_DEQUANT_ROUTE: auto (the chip classes of the dequantize route), off
+// (never) or force (on any GPU, for the codecs and shapes of the route).
+// Read once per process unless KQ_TUNE_LIVE=1. Metal builds only.
+enum KqDequantRoute { kDequantAuto = 0, kDequantOff = 1, kDequantForce = 2 };
+int kq_dequant_route_mode();
+
+// True when KQ_QMM_LOG is set, read as the qmm tiles read it. Metal builds
+// only.
+bool kq_qmm_log_on();
 
 // KVarN key/value widths the record codec supports.
 inline bool kq_kvarn_bits_ok(int bits) {

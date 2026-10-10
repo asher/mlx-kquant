@@ -116,15 +116,16 @@ NB_MODULE(_ext, m) {
   m.def(
       "_alu_dequantize_row",
       &mlx_kquant::alu_dequantize_row,
-      "arch_gen"_a,
-      "cores"_a,
+      "arch"_a,
       "nax"_a,
       "kquant_type"_a,
       "M"_a,
       "N"_a,
+      "K"_a,
       "The row that runs a plain transposed quantized_matmul as dequantize "
-      "then the stock matmul, for a chip class, codec, rows of x and N, as "
-      "[min_m, min_n, inherited]; empty where the qmm_t kernel runs.");
+      "then the stock matmul by default, for an architecture string, NAX, "
+      "codec, rows of x, N and K, as [min_m, min_k, max_k, min_n, max_n]; "
+      "empty where the qmm_t kernel runs.");
 
   m.def(
       "qmv_fine_max_n",
