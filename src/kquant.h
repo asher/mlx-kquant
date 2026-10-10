@@ -70,6 +70,20 @@ std::vector<int> alu_dequantize_row(
     int N,
     int K);
 
+// Whether a plain transposed quantized_matmul on a 2-D weight on a GPU
+// stream takes the dequantize route, for an architecture string, NAX, the
+// KQ_DEQUANT_ROUTE mode ("auto", "off" or "force"), whether KQ_QMM_TILE
+// pins the tile, a codec, the rows of x, N and K. The op decides with this.
+bool dequantize_route_takes(
+    const std::string& arch,
+    bool nax,
+    const std::string& mode,
+    bool pinned,
+    const std::string& kquant_type,
+    int M,
+    int N,
+    int K);
+
 // Every kernel name the split-K dispatchers can build (qmm_splitk,
 // qmm_nax_splitk, verify_mma, verify_nax and their fold), for the kernel
 // name tests; empty on non-Metal builds.
@@ -1199,6 +1213,46 @@ class KQuantMatmul : public mx::Primitive {
   void eval_gpu_base(
       const std::vector<mx::array>& inputs,
       std::vector<mx::array>& outputs);
+};
+
+// The output of a matmul that runs as dequantize then the stock matmul,
+// with the vjp of KQuantMatmul. inputs = {y, x, w, scales}, where y is the
+// product under stop_gradient; the output shares y's buffer. The gradient
+// wrt x runs the quantized matmul the other way, so no backward pass keeps
+// the dense copy, and the gradient wrt w or scales throws, as on the kernel.
+class KQuantDequantRoute : public mx::Primitive {
+ public:
+  explicit KQuantDequantRoute(mx::Stream stream, std::string kquant_type)
+      : mx::Primitive(stream), kquant_type_(std::move(kquant_type)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override {
+    return {inputs[0].shape()};
+  }
+
+  const char* name() const override {
+    return "KQuantDequantRoute";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return kquant_type_ ==
+        static_cast<const KQuantDequantRoute&>(other).kquant_type_;
+  }
+
+  std::vector<mx::array> vjp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<mx::array>& outputs) override;
+
+ private:
+  std::string kquant_type_;
 };
 
 // Bias-fused decode-only (M=1) qmv/qmv_fast dispatch -- see

@@ -21,7 +21,8 @@ import sys
 
 import mlx.core as mx
 import pytest
-from mlx_kquant._ext import _alu_dequantize_row
+from kqref import is_synth
+from mlx_kquant._ext import _alu_dequantize_row, _dequantize_route_takes
 from qmm_probe import TESTS_DIR, force_cpu, run_probe
 
 import mlx_kquant as kq
@@ -45,9 +46,10 @@ ROWS = {
 MIN_K, MAX_K = 3840, 12288
 MIN_N, MAX_N = 3840, 24576
 
-# Architecture strings with a row (generation 13 to 16, not a phone) and
-# without one (phones, M5 and later, earlier generations, malformed).
-ROW_CLASS = [f"applegpu_g{g}{c}" for g in (13, 14, 15, 16) for c in "gsd"]
+# Architecture strings with a row (generation 13 to 16, any suffix letter
+# but p) and without one (phones, M5 and later, earlier generations,
+# malformed).
+ROW_CLASS = [f"applegpu_g{g}{c}" for g in (13, 14, 15, 16) for c in "gsdc"]
 NO_ROW_CLASS = [f"applegpu_g{g}p" for g in (13, 14, 15, 16, 17, 18)] + [
     "applegpu_g17g",
     "applegpu_g17s",
@@ -145,6 +147,50 @@ def test_rows_by_chip_class(codec):
                 assert got == [], (arch, nax, got)
 
 
+MODES = ["auto", "off", "force"]
+
+
+@pytest.mark.parametrize("codec", sorted(ROWS) + ["q8_0"])
+def test_route_decision_by_mode(codec):
+    # The op's decision: off and a pinned KQ_QMM_TILE never route, force
+    # routes on any GPU, auto only on the classes with a row, and each only
+    # for a codec row at a shape inside its floor and range.
+    min_m = ROWS.get(codec, 2048)
+    inside = (min_m, MIN_N, MIN_K)
+    outside = [
+        (min_m - 1, MIN_N, MIN_K),
+        (min_m, MAX_N + 64, MIN_K),
+        (min_m, MIN_N, MAX_K + 256),
+    ]
+    classes = [(a, False, True) for a in ROW_CLASS] + [
+        ("applegpu_g15s", True, False),
+        ("applegpu_g17s", True, False),
+        ("applegpu_g17s", False, False),
+        ("applegpu_g16p", False, False),
+        ("unknown", False, False),
+    ]
+    for arch, nax, on_class in classes:
+        assert bool(_alu_dequantize_row(arch, nax, codec, *inside)) == (
+            on_class and codec in ROWS
+        ), arch
+        for mode in MODES:
+            for pinned in (False, True):
+                want = (
+                    codec in ROWS
+                    and not pinned
+                    and (mode == "force" or (mode == "auto" and on_class))
+                )
+                got = _dequantize_route_takes(arch, nax, mode, pinned, codec, *inside)
+                assert got == want, (arch, nax, mode, pinned, got)
+                for shape in outside:
+                    got = _dequantize_route_takes(
+                        arch, nax, mode, pinned, codec, *shape
+                    )
+                    assert not got, (arch, nax, mode, pinned, shape)
+    with pytest.raises(ValueError, match="auto, off or force"):
+        _dequantize_route_takes("applegpu_g15s", False, "on", False, codec, *inside)
+
+
 def _call(codec, shape, n, env, **kw):
     return dict({"codec": codec, "shape": shape, "n": n, "env": env}, **kw)
 
@@ -178,7 +224,10 @@ def test_dispatch_on_this_gpu(codec):
         ([1, min_m, MIN_K], MIN_N, dict(route, KQ_DEQUANT_ROUTE="auto"), here),
         ([1, min_m, MIN_K], MIN_N, dict(route, KQ_DEQUANT_ROUTE="on"), here),
     ]
-    calls = [_call(codec, shape, n, env) for shape, n, env, _ in cases]
+    # The calls check no values, so the quantized codecs take 64 quantized
+    # rows tiled to N, which spares quantizing the widest weights.
+    design = "normal" if is_synth(codec) else "tiled"
+    calls = [_call(codec, shape, n, env, design=design) for shape, n, env, _ in cases]
     res = run_probe(calls, env=LIVE, check=False)
     for c, (*_, want), r in zip(calls, cases, res, strict=True):
         assert r["error"] is None, (c, r["error"])
@@ -216,12 +265,22 @@ def test_nax_route_unchanged(codec):
         assert res[i]["digest"] == res[i + 1]["digest"], (calls[i], calls[i + 1])
 
 
-def _pair(codec, shape, dtype, layout, seed):
+def _check_rows(rows):
+    # Past 4096 rows the float64 and ulp checks read 1024 rows at each end
+    # and across the middle, where a batch of two meets, so a check holds
+    # float64 copies of 3072 rows at most.
+    if rows <= 4096:
+        return None
+    mid = rows // 2
+    return [[0, 1024], [mid - 512, mid + 512], [rows - 1024, rows]]
+
+
+def _pair(codec, shape, dtype, layout, seed, check_rows=None):
     # The route, then the kernel on the same inputs, its ulp held to the
     # route's.
-    route = _call(
-        codec, shape, MIN_N, _route_env(codec), dtype=dtype, layout=layout, seed=seed
-    )
+    rows = shape[0] * shape[1]
+    route = _call(codec, shape, MIN_N, _route_env(codec), dtype=dtype, layout=layout)
+    route.update(seed=seed, check_rows=check_rows or _check_rows(rows))
     return [route, dict(route, env=KERNEL_ENV)]
 
 
@@ -278,11 +337,18 @@ def test_route_k_max(codec, dtype):
     _check_pairs(calls, run_probe(calls, env=LIVE), dtype)
 
 
+# Rows of the 32769-row call that the checks read: both ends, the middle
+# and the rows around 32767.
+INT16_ROWS = [[0, 512], [16128, 16640], [32256, 32769]]
+
+
 @pytest.mark.parametrize("codec", sorted(ROWS))
 def test_route_rows_above_int16(codec):
     # 32769 rows on the route against the kernel and float64.
     _metal()
-    calls = _with_ulp(_pair(codec, [1, 32769, MIN_K], "bfloat16", "dense", 0))
+    calls = _with_ulp(
+        _pair(codec, [1, 32769, MIN_K], "bfloat16", "dense", 0, check_rows=INT16_ROWS)
+    )
     _check_pairs(calls, run_probe(calls, env=LIVE), "bfloat16")
 
 
@@ -335,8 +401,19 @@ import time
 
 codec, m, n, k = spec["codec"], spec["m"], spec["n"], spec["k"]
 w, s = weights(codec, n, k)
-dt = {"bfloat16": mx.bfloat16, "float32": mx.float32}[spec["dtype"]]
-x = (mx.random.normal((m, k), key=mx.random.key(1)) * 0.5).astype(dt)
+dt = getattr(mx, spec["dtype"])
+key = mx.random.key(1)
+layout = spec["layout"]
+if layout == "batched":
+    x = (mx.random.normal((2, m // 2, k), key=key) * 0.5).astype(dt)
+elif layout == "transposed":
+    # A lazy transposed view.
+    x = mx.swapaxes((mx.random.normal((k, m), key=key) * 0.5).astype(dt), 0, 1)
+elif layout == "strided":
+    # Every other column of a wider array.
+    x = (mx.random.normal((m, 2 * k), key=key) * 0.5).astype(dt)[:, ::2]
+else:
+    x = (mx.random.normal((m, k), key=key) * 0.5).astype(dt)
 mx.eval(x)
 
 
@@ -351,18 +428,17 @@ def composed(x):
     return (x.astype(mx.bfloat16) @ wf.T).astype(mx.float32).sum()
 
 
-def active():
+def active(window):
     # The buffers a finished command buffer frees go back in its completion
-    # handler, so read until two reads agree.
+    # handler, after the wait returns. Nothing allocates meanwhile, so the
+    # least of the reads over the window is what stays held.
     mx.synchronize()
-    last = mx.get_active_memory()
-    for _ in range(100):
+    least = mx.get_active_memory()
+    end = time.monotonic() + window
+    while time.monotonic() < end:
         time.sleep(0.01)
-        now = mx.get_active_memory()
-        if now == last:
-            break
-        last = now
-    return last
+        least = min(least, mx.get_active_memory())
+    return least
 
 
 out = {}
@@ -370,17 +446,50 @@ grads = {}
 for arm, fn in (("route", f), ("kernel", f), ("composed", composed)):
     case(arm, spec.get(arm + "_env", {}))
     mx.clear_cache()
-    base = active()
+    base = active(0.2)
     loss, g = mx.value_and_grad(fn)(x)
     mx.eval(loss)
-    # What the pending backward graph holds after the forward.
-    held = active() - base
+    # What the pending backward graph holds after the forward. A slow
+    # completion handler gets up to five longer windows on the route arm.
+    held = active(0.2) - base
+    for _ in range(5 if arm == "route" else 0):
+        if held < spec["held_below"]:
+            break
+        held = active(1.0) - base
     mx.eval(g)
     grads[arm] = g
     out[arm] = {"held": held, "loss": loss.item(), "dtype": str(g.dtype)}
 gr, gk = grads["route"], grads["kernel"]
 out["grad_equal"] = bool(mx.array_equal(gr, gk).item())
 out["dense"] = n * k * 2
+print(json.dumps(out))
+"""
+)
+
+_WGRAD_CHILD = (
+    _PRELUDE
+    + r"""
+codec, m, n, k = spec["codec"], spec["m"], spec["n"], spec["k"]
+w, s = weights(codec, n, k)
+x = (mx.random.normal((m, k), key=mx.random.key(1)) * 0.5).astype(mx.bfloat16)
+mx.eval(x)
+
+
+def loss(x, w, s):
+    y = kq.quantized_matmul(x, w, s, codec, transpose=True)
+    return y.astype(mx.float32).sum()
+
+
+out = {}
+for arm in ("route", "kernel"):
+    for argnum in (1, 2):
+        name = f"{arm}_{argnum}"
+        case(name, spec[arm + "_env"])
+        try:
+            mx.eval(mx.grad(loss, argnums=argnum)(x, w, s))
+            out[name] = None
+        except Exception as e:
+            out[name] = f"{type(e).__name__}: {e}"
 print(json.dumps(out))
 """
 )
@@ -477,11 +586,18 @@ def _child_routed(lines):
     return any(x.startswith("[kq dequant] ") for x in lines)
 
 
-@pytest.mark.parametrize(
-    "codec,dtype",
-    [(c, "bfloat16") for c in sorted(ROWS)] + [("q6_k", "float32")],
-)
-def test_route_vjp(codec, dtype):
+VJP_CASES = [(c, "bfloat16", "dense") for c in sorted(ROWS)] + [
+    ("q6_k", "float32", "dense"),
+    ("q6_k", "float16", "dense"),
+    ("nvfp4", "float16", "dense"),
+    ("q6_k", "bfloat16", "batched"),
+    ("q6_k", "bfloat16", "transposed"),
+    ("q6_k", "float16", "strided"),
+]
+
+
+@pytest.mark.parametrize("codec,dtype,layout", VJP_CASES)
+def test_route_vjp(codec, dtype, layout):
     # value_and_grad through a routed call: after the forward the pending
     # backward holds no dense copy of the weight, where the same product in
     # stock ops holds one, and the gradient wrt x is the kernel path's bit
@@ -493,8 +609,10 @@ def test_route_vjp(codec, dtype):
         "n": MIN_N,
         "k": MAX_K,
         "dtype": dtype,
+        "layout": layout,
         "route_env": _route_env(codec),
         "kernel_env": KERNEL_ENV,
+        "held_below": MIN_N * MAX_K * 2 // 4,
     }
     out, logs = _run_child(_GRAD_CHILD, spec, LIVE)
     assert _child_routed(logs["route"]), logs["route"]
@@ -506,6 +624,22 @@ def test_route_vjp(codec, dtype):
     assert out["grad_equal"], out
     lr, lk = out["route"]["loss"], out["kernel"]["loss"]
     assert abs(lr - lk) <= 1e-3 * abs(lk), out
+
+
+@pytest.mark.parametrize("codec", ["nvfp4", "q6_k"])
+def test_route_weight_grad_raises(codec):
+    # The gradient wrt the wire bytes or the scales raises on the route as
+    # on the kernel, with the same message.
+    _metal()
+    spec = {"codec": codec, "m": ROWS[codec], "n": MIN_N, "k": MIN_K}
+    spec.update(route_env=_route_env(codec), kernel_env=KERNEL_ENV)
+    out, logs = _run_child(_WGRAD_CHILD, spec, LIVE)
+    for argnum, msg in ((1, "no gradient wrt the quantized weights"), (2, "scales")):
+        r, k = out[f"route_{argnum}"], out[f"kernel_{argnum}"]
+        assert r is not None and msg in r, out
+        assert r == k, out
+        assert _child_routed(logs[f"route_{argnum}"]), logs
+        assert not _child_routed(logs[f"kernel_{argnum}"]), logs
 
 
 @pytest.mark.parametrize("codec", ["nvfp4", "q6_k"])

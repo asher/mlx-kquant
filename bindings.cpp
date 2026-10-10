@@ -128,6 +128,22 @@ NB_MODULE(_ext, m) {
       "empty where the qmm_t kernel runs.");
 
   m.def(
+      "_dequantize_route_takes",
+      &mlx_kquant::dequantize_route_takes,
+      "arch"_a,
+      "nax"_a,
+      "mode"_a,
+      "pinned"_a,
+      "kquant_type"_a,
+      "M"_a,
+      "N"_a,
+      "K"_a,
+      "Whether a plain transposed quantized_matmul on a 2-D weight on a GPU "
+      "stream takes the dequantize route, for an architecture string, NAX, "
+      "the KQ_DEQUANT_ROUTE mode, a pinned KQ_QMM_TILE, codec, rows of x, N "
+      "and K.");
+
+  m.def(
       "qmv_fine_max_n",
       &mlx_kquant::qmv_fine_max_n,
       "kquant_type"_a,

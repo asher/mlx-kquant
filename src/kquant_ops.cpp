@@ -12,7 +12,6 @@
 #include "kquant_internal.h"
 #include "kquant_lora_epilogue.h"
 
-#include "mlx/transforms.h" // custom_vjp
 #include "mlx/utils.h" // to_stream
 
 #ifdef _METAL_
@@ -121,6 +120,27 @@ bool kq_dequantize_class(const std::string& arch, bool nax) {
   return gen >= 13 && gen <= 16;
 }
 
+// Whether a plain transposed call on a 2-D weight on a GPU stream takes the
+// route: never under off or while KQ_QMM_TILE pins the tile, on any GPU
+// under force, on the class under auto, and then only for a codec row and
+// shape of the table.
+bool kq_dequantize_route_takes(
+    bool on_class,
+    int mode,
+    bool pinned,
+    const std::string& kquant_type,
+    int M,
+    int N,
+    int K) {
+  if (mode == kDequantOff || pinned) {
+    return false;
+  }
+  if (mode != kDequantForce && !on_class) {
+    return false;
+  }
+  return !kq_dequantize_shape_row(kquant_type, M, N, K).empty();
+}
+
 #ifdef _METAL_
 // This GPU's class verdict, read once per process. NAX first.
 bool kq_dequantize_class_here() {
@@ -135,9 +155,8 @@ bool kq_dequantize_class_here() {
 }
 #endif
 
-// Dequantize then the stock matmul. Its vjp runs on the quantized weight,
-// as KQuantMatmul::vjp does, so no backward pass keeps the dense copy; the
-// frozen wire bytes and scales get zeros.
+// Dequantize then the stock matmul, carried by KQuantDequantRoute for the
+// vjp of the kernel path.
 mx::array kq_dequantize_matmul(
     const mx::array& x,
     const mx::array& w,
@@ -159,6 +178,29 @@ std::vector<int> alu_dequantize_row(
     return {};
   }
   return kq_dequantize_shape_row(kquant_type, M, N, K);
+}
+
+bool dequantize_route_takes(
+    const std::string& arch,
+    bool nax,
+    const std::string& mode,
+    bool pinned,
+    const std::string& kquant_type,
+    int M,
+    int N,
+    int K) {
+  int m = kDequantAuto;
+  if (mode == "off") {
+    m = kDequantOff;
+  } else if (mode == "force") {
+    m = kDequantForce;
+  } else if (mode != "auto") {
+    throw std::invalid_argument(
+        "[mlx_kquant] dequantize route mode must be auto, off or force, got '" +
+        mode + "'.");
+  }
+  return kq_dequantize_route_takes(
+      kq_dequantize_class(arch, nax), m, pinned, kquant_type, M, N, K);
 }
 
 // ----------------------------- ops -----------------------------
@@ -322,11 +364,14 @@ mx::array quantized_matmul(
 #ifdef _METAL_
   if (transpose && !lora && w.ndim() == 2 && s.device == mx::Device::gpu) {
     const bool here = kq_dequantize_class_here();
-    const int mode = kq_dequant_route_mode();
-    if (((here && mode == kDequantAuto) || mode == kDequantForce) &&
-        !kq_qmm_tile_pinned() &&
-        !kq_dequantize_shape_row(kquant_type, rows, w_outer_dims, w_inner_dims)
-             .empty()) {
+    if (kq_dequantize_route_takes(
+            here,
+            kq_dequant_route_mode(),
+            kq_qmm_tile_pinned(),
+            kquant_type,
+            rows,
+            w_outer_dims,
+            w_inner_dims)) {
       if (kq_qmm_log_on()) {
         std::fprintf(
             stderr,
@@ -393,34 +438,65 @@ mx::array kq_dequantize_matmul(
     const std::string& kquant_type,
     mx::Dtype out_type,
     mx::Stream s) {
-  auto forward = [kquant_type, out_type, s](const std::vector<mx::array>& in) {
-    auto w_f = dequantize(in[1], in[2], kquant_type, out_type, s);
-    return std::vector<mx::array>{
-        mx::matmul(mx::astype(in[0], out_type, s), mx::transpose(w_f, s), s)};
-  };
-  auto backward = [kquant_type, s](
-                      const std::vector<mx::array>& primals,
-                      const std::vector<mx::array>& cotangents,
-                      const std::vector<mx::array>&) {
-    auto dx = quantized_matmul(
-        cotangents[0],
-        primals[1],
-        primals[2],
-        kquant_type,
-        false,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        s);
-    return std::vector<mx::array>{
-        mx::astype(dx, primals[0].dtype(), s),
-        mx::zeros_like(primals[1], s),
-        mx::zeros_like(primals[2], s)};
-  };
-  return mx::custom_vjp(forward, backward)({x, w, scales})[0];
+  auto w_f = dequantize(w, scales, kquant_type, out_type, s);
+  auto y = mx::stop_gradient(
+      mx::matmul(mx::astype(x, out_type, s), mx::transpose(w_f, s), s), s);
+  auto shape = y.shape();
+  return mx::array(
+      std::move(shape),
+      out_type,
+      std::make_shared<KQuantDequantRoute>(s, kquant_type),
+      {y, x, w, scales});
 }
 
 } // namespace
+
+void KQuantDequantRoute::eval_cpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  outputs[0].copy_shared_buffer(inputs[0]);
+}
+
+void KQuantDequantRoute::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  outputs[0].copy_shared_buffer(inputs[0]);
+}
+
+std::vector<mx::array> KQuantDequantRoute::vjp(
+    const std::vector<mx::array>& primals,
+    const std::vector<mx::array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<mx::array>&) {
+  // primals = {y (stop_gradient), x, w, scales}, as KQuantMatmul::vjp: x
+  // gets the quantized matmul the other way, w and scales throw.
+  std::vector<mx::array> vjps;
+  for (auto arg : argnums) {
+    if (arg == 0) {
+      vjps.push_back(cotangents[0]);
+    } else if (arg == 1) {
+      auto dx = quantized_matmul(
+          cotangents[0],
+          primals[2],
+          primals[3],
+          kquant_type_,
+          false,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          stream());
+      vjps.push_back(mx::astype(dx, primals[1].dtype(), stream()));
+    } else if (arg == 2) {
+      throw std::invalid_argument(
+          "[mlx_kquant] quantized_matmul vjp: no gradient wrt the quantized "
+          "weights (the kquant base is frozen).");
+    } else {
+      throw std::invalid_argument(
+          "[mlx_kquant] quantized_matmul vjp: no gradient wrt scales.");
+    }
+  }
+  return vjps;
+}
 
 mx::array quantized_matmul_qmv_bias(
     mx::array x,

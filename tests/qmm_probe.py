@@ -12,8 +12,11 @@ reference to the output dtype. A call with ``"ulp_vs": i`` gets ``ulp``,
 the largest ulp distance to call ``i``'s output, and ``rdiff``, the
 relative Frobenius distance to it, and with the check ``ulp_big``, the
 largest ulp distance on the elements whose reference is above 1% of its
-root mean square. Every call gets ``digest``, a hash of
-its output bits, to compare calls across probe processes.
+root mean square. ``"check_rows": [[lo, hi], ...]`` limits the check and
+the ulp comparison to those rows of x's flattened leading dims, so a call
+with many rows holds float64 copies of only those rows. Every call gets
+``digest``, a hash of its output bits, to compare calls across probe
+processes.
 
 ``"design": "lead"`` draws nonnegative weights and activations whose first
 K column is 1024. ``"design": "big"`` draws small weights and dense
@@ -171,6 +174,15 @@ def ordered(bits):
 outs = []
 results = []
 _refs = {}
+def picked(a, rows):
+    # The rows [lo, hi) of a's flattened leading dims, or all of a.
+    if not rows:
+        return a
+    flat = a.reshape(-1, a.shape[-1])
+    return mx.concatenate([flat[lo:hi] for lo, hi in rows])
+
+
+_ulp_bases = {c["ulp_vs"] for c in spec["calls"] if c.get("ulp_vs") is not None}
 for i, c in enumerate(spec["calls"]):
     for name, value in c.get("env", {}).items():
         if value is None:
@@ -193,25 +205,29 @@ for i, c in enumerate(spec["calls"]):
         outs.append(None)
         results.append(res)
         continue
-    outs.append(y)
+    # Keep the output only for the calls that compare against it.
+    outs.append(y if i in _ulp_bases else None)
     # Digest of the output bits, to compare calls across probe processes.
     bits = y.view(mx.uint16) if y.dtype in DT.values() else y
-    res["digest"] = hashlib.sha1(np.array(bits).tobytes()).hexdigest()
+    res["digest"] = hashlib.sha1(memoryview(np.array(bits))).hexdigest()
     if spec.get("check", True):
         # Calls that differ only in env share their references.
         rkey = (
             c["codec"], c["n"], tuple(c["shape"]), str(dtype),
             c.get("layout", "dense"), c.get("seed", i), design,
+            tuple(map(tuple, c.get("check_rows") or ())),
         )
         if rkey not in _refs:
             wd = dequantized(c["codec"], c["n"], c["shape"][-1], design)
-            xn = np.array(x.astype(mx.float32)).astype(np.float64)
+            xs = picked(x, c.get("check_rows"))
+            xn = np.array(xs.astype(mx.float32)).astype(np.float64)
             _refs[rkey] = {"xn": xn, "ref": xn @ wd.T}
         refs = _refs[rkey]
         ref = refs["ref"]
-        got = np.array(y.astype(mx.float32)).astype(np.float64)
+        ys = picked(y, c.get("check_rows"))
+        got = np.array(ys.astype(mx.float32)).astype(np.float64)
         res["rel"] = float(np.linalg.norm(got - ref) / (np.linalg.norm(ref) + 1e-30))
-        res["nonfinite"] = int((~np.isfinite(got)).sum())
+        res["nonfinite"] = int((~mx.isfinite(y)).sum().item())
         if c.get("r2"):
             # R2: weights rounded to the activation dtype. floor1 and floor2:
             # the error of rounding each reference to the output dtype.
@@ -225,12 +241,13 @@ for i, c in enumerate(spec["calls"]):
             res["floor2"] = refs["floor2"]
     base = c.get("ulp_vs")
     if base is not None and outs[base] is not None:
-        a = np.array(y.view(mx.uint16))
-        b = np.array(outs[base].view(mx.uint16))
+        rows = c.get("check_rows") if spec.get("check", True) else None
+        a = np.array(picked(y, rows).view(mx.uint16))
+        b = np.array(picked(outs[base], rows).view(mx.uint16))
         res["ulp"] = int(np.abs(ordered(a) - ordered(b)).max())
         # Relative Frobenius distance to that call's output.
-        yb = np.array(outs[base].astype(mx.float32)).astype(np.float64)
-        ya = np.array(y.astype(mx.float32)).astype(np.float64)
+        yb = np.array(picked(outs[base], rows).astype(mx.float32)).astype(np.float64)
+        ya = np.array(picked(y, rows).astype(mx.float32)).astype(np.float64)
         res["rdiff"] = rel(ya, yb)
         if spec.get("check", True):
             # The largest ulp distance on the elements above 1% of the
@@ -241,6 +258,8 @@ for i, c in enumerate(spec["calls"]):
             d = np.abs(ordered(a) - ordered(b))
             res["ulp_big"] = int(d[big].max()) if big.any() else 0
     results.append(res)
+    # Return freed buffers, so the child holds about one call at a time.
+    mx.clear_cache()
 print(json.dumps(results))
 """
 

@@ -51,8 +51,10 @@ bool kq_qmm_tile_pinned();
 
 // KQ_DEQUANT_ROUTE: auto (the chip classes of the dequantize route), off
 // (never) or force (on any GPU, for the codecs and shapes of the route).
-// Read once per process unless KQ_TUNE_LIVE=1. Metal builds only.
 enum KqDequantRoute { kDequantAuto = 0, kDequantOff = 1, kDequantForce = 2 };
+
+// The KQ_DEQUANT_ROUTE mode, read once per process unless KQ_TUNE_LIVE=1.
+// Metal builds only.
 int kq_dequant_route_mode();
 
 // True when KQ_QMM_LOG is set, read as the qmm tiles read it. Metal builds
