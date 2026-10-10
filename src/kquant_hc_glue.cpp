@@ -94,10 +94,12 @@ namespace {
 // simdgroup. Register pressure puts the pipeline limit below the preferred
 // count on some GPUs, and an oversized dispatch is silent garbage rather
 // than an error (the same trap kq_sdpa_vector guards), so the kernels read
-// their own [[threads_per_threadgroup]] and stride by it. KQ_HC_NT_LOG=1
-// prints the limit and the choice once per kernel.
+// their own [[threads_per_threadgroup]] and stride by it. least is the
+// smallest width the kernel runs at. KQ_HC_NT_LOG=1 prints the limit and
+// the choice once per kernel.
 template <typename K>
-inline int kq_hc_threads(K kernel, const std::string& kname, int want) {
+inline int
+kq_hc_threads(K kernel, const std::string& kname, int want, int least) {
   int cap = int(kernel->maxTotalThreadsPerThreadgroup());
   static const int forced = []() {
     const char* e = std::getenv("KQ_HC_NT");
@@ -107,10 +109,11 @@ inline int kq_hc_threads(K kernel, const std::string& kname, int want) {
     cap = std::min(cap, forced);
   }
   const int nt = (std::min(want, cap) / 32) * 32;
-  if (nt < 32) {
+  if (nt < least) {
     throw std::runtime_error(
         "[mlx_kquant.hc] " + kname + " supports only " + std::to_string(cap) +
-        " threads per threadgroup, below the one simdgroup it needs.");
+        " threads per threadgroup, below the " + std::to_string(least) +
+        " it needs.");
   }
   static const bool log = std::getenv("KQ_HC_NT_LOG") != nullptr;
   if (log) {
@@ -136,7 +139,9 @@ inline int kq_hc_threads(K kernel, const std::string& kname, int want) {
 // hc_front_expand_collapse claims against the split pair. Register
 // pressure differs per kernel, so the caps can differ on one GPU. Take
 // the smallest cap in the family and give it to all four. hc_expand
-// reduces nothing and keeps its own width.
+// reduces nothing and keeps its own width. The collapse gives one
+// simdgroup to the sinkhorn and the others to the columns, so the family
+// needs two simdgroups.
 inline int kq_hc_family_threads(mx::metal::Device& d, const std::string& t) {
   static std::mutex mu;
   static std::map<std::string, int> cached;
@@ -153,8 +158,8 @@ inline int kq_hc_family_threads(mx::metal::Device& d, const std::string& t) {
   int nt = kHcThreads;
   for (const char* base : family) {
     const std::string kname = base + t;
-    nt =
-        std::min(nt, kq_hc_threads(kq_get_kernel(d, kname), kname, kHcThreads));
+    nt = std::min(
+        nt, kq_hc_threads(kq_get_kernel(d, kname), kname, kHcThreads, 64));
   }
   cached.emplace(t, nt);
   return nt;
@@ -333,7 +338,7 @@ void KQuantHcExpand::eval_gpu(
   ce.set_input_array(inputs[3], 3);
   ce.set_output_array(out, 4);
   ce.set_bytes(D, 5);
-  const int nt = kq_hc_threads(kernel, kname, kHcExpandThreads);
+  const int nt = kq_hc_threads(kernel, kname, kHcExpandThreads, 32);
   ce.dispatch_threadgroups(MTL::Size(rows * 2, 1, 1), MTL::Size(nt, 1, 1));
 }
 
