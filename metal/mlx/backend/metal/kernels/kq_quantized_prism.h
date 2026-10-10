@@ -935,7 +935,11 @@ using KqPtq1_0BlockLoader = KqPrismBlockLoader<
       int group_size,                                                        \
       int bits,                                                              \
       bool aligned_N,                                                        \
-      bool batched>                                                          \
+      bool batched,                                                          \
+      int BM = 64,                                                           \
+      int BN = 64,                                                           \
+      int WM = 2,                                                            \
+      int WN = 2>                                                            \
   [[kernel]] void kq_##CODEC##_qmm_t(                                        \
       const device uint8_t* w,                                               \
       const device uint8_t* /* scales */,                                    \
@@ -971,12 +975,12 @@ using KqPtq1_0BlockLoader = KqPrismBlockLoader<
     }                                                                        \
     static_assert(group_size == SB, #CODEC " requires gs=" #SB);             \
     static_assert(bits == BITS, #CODEC " requires bits=" #BITS);             \
-    constexpr int BM = 64, BK = 32, BN = 64;                                 \
+    constexpr int BK = 32;                                                   \
     constexpr int BK_padded = (BK + 16 / sizeof(T));                         \
     threadgroup T Xs[BM * BK_padded];                                        \
     threadgroup T Ws[BN * BK_padded];                                        \
-    using LoaderW = LOADER<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;      \
-    kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(                        \
+    using LoaderW = LOADER<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;    \
+    kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(                \
         w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);          \
   }                                                                          \
                                                                              \
