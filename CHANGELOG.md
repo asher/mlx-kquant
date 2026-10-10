@@ -57,6 +57,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   32 rows, as in batched decode and speculative verify, run up to 30% faster.
 - On NAX GPUs (M5), batched gemma-4 decode of prompts of different lengths
   runs 1 to 2% faster. `KQ_GQA_NAX=0` restores the previous kernel.
+- On M3 Max with 40 GPU cores, `q3_k`, `q5_k`, `q6_k`, `nvfp4` and `ptq1_0`
+  matmuls of 2048 or more rows, and `q4_k` of 16384 or more, dequantize the
+  weight and run MLX's matmul. Image steps' linears run 1 to 12% faster,
+  `nvfp4` 33 to 39%.
 - The bundled metallib drops the float32-activation matmul kernels, which no
   call reached, about 22 MB.
 

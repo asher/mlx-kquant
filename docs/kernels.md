@@ -90,6 +90,13 @@ the kernel's.
 | M3 Max, 40 GPU cores (`applegpu_g15s`) | `q3_k`, `q5_k`, `q6_k`, `nvfp4`, `ptq1_0` | 2048 | 3840 |
 | M3 Max, 40 GPU cores (`applegpu_g15s`) | `q4_k` | 16384 | 3840 |
 
+Measured on that chip with `benchmarks/bench_dit_shapes.py` over the seven Z-Image and Qwen-Image
+linears at 2048, 4128 and 16416 rows, batch 1 and 2, bfloat16 and float16, against an A versus A arm
+that stays within 0.98-1.02 per step: the kernel takes 1.49-1.63x the route's time per step on
+`nvfp4`, 1.06-1.14x on `ptq1_0`, 1.03-1.12x on `q3_k` and `q6_k`, 1.01-1.10x on `q5_k` (1.01-1.03x
+at 2048 rows) and 1.02-1.05x on `q4_k` from its floor. No linear runs slower outside the A versus A
+range, and the route takes 0.96-1.07x the time of the stock matmul on unquantized weights.
+
 The decode pass runs at 1.0-1.15x the time of a copy of its output and costs the same at any row
 count, so the route loses below its floor: at 128 rows it takes 1.4-1.9x the kernel's time. On the
 other codecs the route measured inside the noise of an A versus A arm at 2048 to 16416 rows, and on
