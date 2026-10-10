@@ -91,7 +91,9 @@ products from `quantized_matmul` on these GPUs, so they take it too.
 | `q4_k` | 16384 | 3840 to 12288 | 3840 to 24576 |
 
 The route holds a copy of the weight in the activation dtype while the call runs, N x K x 2 bytes
-per call, at most 604 MB at 24576 x 12288; the range keeps a vocabulary head on the kernel.
+per call, at most 604 MB at 24576 x 12288; the range keeps a vocabulary head on the kernel. Each
+routed call holds its copy until its command buffer completes, so consecutive routed layers can each
+hold one at the same time.
 `quantized_matmul_glu` builds its product from two calls on these GPUs, so it holds two copies, up
 to about 1.2 GB. The gradient wrt x runs the quantized matmul the other way, as on the kernel path,
 so a backward pass holds no dense copy, and a gradient wrt the weight or the scales raises as it
