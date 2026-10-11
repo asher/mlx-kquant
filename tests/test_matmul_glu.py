@@ -291,9 +291,11 @@ def test_glu_row_bands_are_read_in_place():
 @pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
 def test_glu_composition_is_the_stock_form(activation, dtype):
     """A codec with no fused kernel: the op has the bits and the peak of
-    the stock activation on one matmul times the other. That is two
-    outputs with nn.silu, which writes into its input, and three with
-    nn.gelu_approx, which does not."""
+    the stock activation on one matmul times the other. That is the peak
+    of the activation on an input made in the same eval, plus the other
+    output. Where the activation runs compiled, that is two outputs with
+    nn.silu, which writes into its input, and three with nn.gelu_approx,
+    which does not. As separate ops (MLX_DISABLE_COMPILE) it is one more."""
     n, k, m = 2048, 1024, 1100
     (wg, _), (wu, _) = _weights("q3_k", n, k)
     x = _x([m, k], dtype, 47)
@@ -307,7 +309,12 @@ def test_glu_composition_is_the_stock_form(activation, dtype):
     )
     stock = _peak_outputs(lambda: _composed(x, wg, wu, "q3_k", activation), out_bytes)
     assert abs(op - stock) <= 0.05, (op, stock)
-    assert op <= (3.05 if activation == "gelu_tanh" else 2.05), op
+    # On a materialized input nn.silu peaks at one output compiled or not,
+    # so the input is made in the measured eval.
+    act = nn.gelu_approx if activation == "gelu_tanh" else nn.silu
+    a = _x([m, n], dtype, 53)
+    act_peak = _peak_outputs(lambda: act(a * 2), out_bytes)
+    assert op <= act_peak + 1.05, (op, act_peak)
 
 
 def _node_kinds(*outputs):

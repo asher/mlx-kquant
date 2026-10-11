@@ -495,10 +495,37 @@ def test_time_budget_splits_a_run(tmp_path):
     assert p["slots_done"] == p["slots_planned"] == 4
 
 
+# In a fresh process on the bench's device, the MLX peak of nn.silu on an
+# input made in the same eval, in outputs, taken as the bench takes its
+# peaks: one where silu runs compiled and writes into its input, two where
+# it runs as separate ops (MLX_DISABLE_COMPILE).
+_SILU_PEAK = textwrap.dedent(
+    """
+    import sys
+    sys.path.insert(0, sys.argv[1])
+    import mlx.core as mx
+    import mlx.nn as nn
+    from bench_glu import settle
+    m, n = int(sys.argv[2]), int(sys.argv[3])
+    a = (mx.random.normal((m, n), key=mx.random.key(3)) * 0.5).astype(mx.bfloat16)
+    mx.eval(a)
+    for _ in range(2):
+        base = settle(mx)
+        mx.reset_peak_memory()
+        y = nn.silu(a * 2)
+        mx.eval(y)
+        peak = (mx.get_peak_memory() - base) / (m * n * 2)
+        del y
+    print(peak)
+    """
+)
+
+
 def test_bench_glu_runs_a_tiny_cell(tmp_path):
     """bench_glu.py end to end on one tiny cell: the arms, the report and
-    the peak of one call per arm. An arm writes at least its output, and
-    the unfused arms hold two outputs."""
+    the peak of one call per arm. An arm writes at least its output.
+    two_mm holds two outputs, and the composed arms the peak of silu on
+    one output plus the other output."""
     out = subprocess.run(
         [
             sys.executable,
@@ -523,11 +550,21 @@ def test_bench_glu_runs_a_tiny_cell(tmp_path):
     (cell,) = res["cells"]
     assert cell["arms"] == ["composed", "composed_aa", "two_mm", "glu"]
     assert len(cell["samples"]) == 2 * 4
+    probe = subprocess.run(
+        [sys.executable, "-c", _SILU_PEAK, BENCH_DIR, "1100", "512"],
+        check=True,
+        timeout=120,
+        capture_output=True,
+        text=True,
+    )
+    silu = float(probe.stdout.split()[-1])
     pk = cell["peak_outputs"]
-    for arm in ("composed", "composed_aa", "two_mm"):
-        assert 1.9 <= pk[arm] <= 2.2, pk
-    # One output where the fused kernel ran, two where the op composed.
-    assert 0.95 <= pk["glu"] <= 2.2, pk
+    assert 1.9 <= pk["two_mm"] <= 2.2, pk
+    for arm in ("composed", "composed_aa"):
+        assert silu + 0.9 <= pk[arm] <= silu + 1.2, (pk, silu)
+    # One output where the fused kernel ran, the composed peak where the op
+    # composed.
+    assert 0.95 <= pk["glu"] <= silu + 1.2, (pk, silu)
     assert cell["check"]["glu"] < 2e-2
     assert "| glu |" in (tmp_path / "glu.md").read_text()
 
