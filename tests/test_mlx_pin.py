@@ -27,8 +27,8 @@ def _quantized(shape):
 
 
 def test_mlx_pin_version():
-    assert mx.__version__ == "0.32.2", (
-        f"mlx {mx.__version__}: package is certified against the 0.32.2 pin"
+    assert mx.__version__ == "0.32.3", (
+        f"mlx {mx.__version__}: package is certified against the 0.32.3 pin"
     )
 
 

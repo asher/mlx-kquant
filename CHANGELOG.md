@@ -35,7 +35,7 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which can return inf.
 
 ### Changed
-- Requires mlx 0.32.2, which fixes wrong values from dequantizing a strided
+- Requires mlx 0.32.3, which fixes wrong values from dequantizing a strided
   array and a crash at process exit.
 - `mlx-kquant[tools]` now installs beside transformers 5.13.1 and later, as
   mlx-vlm 0.7 requires. Only 5.13.0, which cannot import mlx-lm, is excluded.

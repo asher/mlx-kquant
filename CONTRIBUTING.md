@@ -12,7 +12,7 @@ front-end. A few notes to get productive quickly.
 
   ```sh
   python -m venv .venv && source .venv/bin/activate
-  pip install "mlx==0.32.2" "nanobind==2.15.0" "cmake>=3.27"
+  pip install "mlx==0.32.3" "nanobind==3.0.1" "cmake>=3.27"
   pip install -e ".[dev,tools]"   # builds _ext + mlx_kquant.metallib
   ```
 
