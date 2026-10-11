@@ -337,6 +337,9 @@ def test_glu_unfused_ops_follow_the_compile_switch(activation):
     earlier call. 64 rows build the unfused ops on every device."""
     (wg, _), (wu, _) = _weights("q4_k", 96, K)
     x = _x([64, K], mx.bfloat16, 71)
+    # The switch as found, which MLX_DISABLE_COMPILE sets off, goes back
+    # after the test.
+    found_on = "Compiled" in _node_kinds(nn.silu(x))
     try:
         for on in (True, False, True, False):
             (mx.enable_compile if on else mx.disable_compile)()
@@ -348,7 +351,7 @@ def test_glu_unfused_ops_follow_the_compile_switch(activation):
             mx.eval(y, ref)
             assert mx.array_equal(y, ref).item(), on
     finally:
-        mx.enable_compile()
+        (mx.enable_compile if found_on else mx.disable_compile)()
 
 
 @pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
