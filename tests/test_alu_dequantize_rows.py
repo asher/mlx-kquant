@@ -530,8 +530,11 @@ transforms = {
     "jvp": lambda f: mx.jvp(f, [x], [x])[1],
     "vmap": lambda f: mx.vmap(f)(mx.stack([x, x * 0.5])),
 }
-out = {}
+out = {"nax": kq.nax_available()}
 for arm in ("route", "kernel"):
+    # A forward glu call first, so the log shows the node this env builds.
+    case(f"{arm}_glu_forward", spec[arm + "_env"])
+    mx.eval(ops["glu"](x))
     for op, f in ops.items():
         for tr, run in transforms.items():
             name = f"{arm}_{op}_{tr}"
@@ -694,27 +697,37 @@ def test_route_weight_grad_raises(codec):
         assert not _child_routed(logs[f"kernel_{argnum}"]), logs
 
 
-def test_route_jvp_vmap_refuse_as_kernel():
+@pytest.mark.parametrize("glu", ["default", "off"])
+def test_route_jvp_vmap_refuse_as_kernel(glu):
     # jvp and vmap wrt x of quantized_matmul, glu, lora and residual at a
     # routed shape raise by the name KQuantMatmul, as on the kernel, so the
-    # error text does not change at the row floor. vmap of glu refuses on
-    # its fused node, before any quantized_matmul is built.
+    # error text does not change at the row floor. Where glu builds its
+    # fused node (a NAX GPU with KQ_GLU on, KQ_DISABLE_NAX or not), vmap of
+    # glu refuses on that node, before any quantized_matmul is built.
+    # Elsewhere, and under KQ_GLU=0 on any GPU, glu builds two
+    # quantized_matmul calls, which route and refuse as KQuantMatmul.
     _metal()
     codec = "q6_k"
     spec = {"codec": codec, "m": ROWS[codec], "n": MIN_N, "k": MIN_K}
+    lever = {"KQ_GLU": "0" if glu == "off" else None}
     force = {"KQ_QMM_TILE": None, "KQ_DISABLE_NAX": None, "KQ_DEQUANT_ROUTE": "force"}
-    spec.update(route_env=force, kernel_env=KERNEL_ENV)
+    spec.update(route_env=dict(force, **lever), kernel_env=dict(KERNEL_ENV, **lever))
     out, logs = _run_child(_TRANSFORM_CHILD, spec, LIVE)
+    fused = out["nax"] and glu == "default"
+    for arm in ("route", "kernel"):
+        # The forward call runs the fused kernel exactly where the node is.
+        lines = logs[f"{arm}_glu_forward"]
+        assert any("_glu_" in x for x in lines) == fused, (arm, out["nax"], lines)
     for op in ("matmul", "glu", "lora", "residual"):
         for tr in ("jvp", "vmap"):
             r, k = out[f"route_{op}_{tr}"], out[f"kernel_{op}_{tr}"]
-            fused = (op, tr) == ("glu", "vmap")
-            node = "KQuantMatmulFused" if fused else "KQuantMatmul"
+            on_node = fused and (op, tr) == ("glu", "vmap")
+            node = "KQuantMatmulFused" if on_node else "KQuantMatmul"
             want = f"ValueError: [Primitive::{tr}] Not implemented for {node}."
             assert r == want, (op, tr, out)
-            assert r == k, (op, tr, out)
+            assert k == want, (op, tr, out)
             routed = _child_routed(logs[f"route_{op}_{tr}"])
-            assert routed != fused, (op, tr, logs)
+            assert routed != on_node, (op, tr, logs)
             assert not _child_routed(logs[f"kernel_{op}_{tr}"]), (op, tr, logs)
 
 
