@@ -697,23 +697,25 @@ def test_route_weight_grad_raises(codec):
         assert not _child_routed(logs[f"kernel_{argnum}"]), logs
 
 
-@pytest.mark.parametrize("glu", ["default", "off"])
-def test_route_jvp_vmap_refuse_as_kernel(glu):
+@pytest.mark.parametrize("fused_ops", ["default", "off"])
+def test_route_jvp_vmap_refuse_as_kernel(fused_ops):
     # jvp and vmap wrt x of quantized_matmul, glu, lora and residual at a
     # routed shape raise by the name KQuantMatmul, as on the kernel, so the
     # error text does not change at the row floor. Where glu builds its
     # fused node (a NAX GPU with KQ_GLU on, KQ_DISABLE_NAX or not), vmap of
     # glu refuses on that node, before any quantized_matmul is built.
-    # Elsewhere, and under KQ_GLU=0 on any GPU, glu builds two
-    # quantized_matmul calls, which route and refuse as KQuantMatmul.
+    # Elsewhere glu builds two quantized_matmul calls, which route and
+    # refuse as KQuantMatmul. off turns the fused glu, lora and residual
+    # nodes off, so any GPU builds what a GPU without NAX builds.
     _metal()
     codec = "q6_k"
     spec = {"codec": codec, "m": ROWS[codec], "n": MIN_N, "k": MIN_K}
-    lever = {"KQ_GLU": "0" if glu == "off" else None}
+    off = "0" if fused_ops == "off" else None
+    lever = {"KQ_GLU": off, "KQ_QMM_LORA": off, "KQ_QMM_RESID": off}
     force = {"KQ_QMM_TILE": None, "KQ_DISABLE_NAX": None, "KQ_DEQUANT_ROUTE": "force"}
     spec.update(route_env=dict(force, **lever), kernel_env=dict(KERNEL_ENV, **lever))
     out, logs = _run_child(_TRANSFORM_CHILD, spec, LIVE)
-    fused = out["nax"] and glu == "default"
+    fused = out["nax"] and fused_ops == "default"
     for arm in ("route", "kernel"):
         # The forward call runs the fused kernel exactly where the node is.
         lines = logs[f"{arm}_glu_forward"]
