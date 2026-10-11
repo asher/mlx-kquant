@@ -329,6 +329,7 @@ def _node_kinds(*outputs):
     return sorted("Compiled" if n.startswith("Compiled") else n for n in names)
 
 
+@pytest.mark.usefixtures("compile_on")
 @pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
 def test_glu_unfused_ops_follow_the_compile_switch(activation):
     """The unfused path builds its activation as mlx.nn does in either
@@ -337,21 +338,15 @@ def test_glu_unfused_ops_follow_the_compile_switch(activation):
     earlier call. 64 rows build the unfused ops on every device."""
     (wg, _), (wu, _) = _weights("q4_k", 96, K)
     x = _x([64, K], mx.bfloat16, 71)
-    # The switch as found, which MLX_DISABLE_COMPILE sets off, goes back
-    # after the test.
-    found_on = "Compiled" in _node_kinds(nn.silu(x))
-    try:
-        for on in (True, False, True, False):
-            (mx.enable_compile if on else mx.disable_compile)()
-            y = kq.quantized_matmul_glu(x, wg, wu, "q4_k", activation)
-            ref = _composed(x, wg, wu, "q4_k", activation)
-            kinds = _node_kinds(y)
-            assert kinds == _node_kinds(ref), (on, kinds)
-            assert ("Compiled" in kinds) == on, (on, kinds)
-            mx.eval(y, ref)
-            assert mx.array_equal(y, ref).item(), on
-    finally:
-        (mx.enable_compile if found_on else mx.disable_compile)()
+    for on in (True, False, True, False):
+        (mx.enable_compile if on else mx.disable_compile)()
+        y = kq.quantized_matmul_glu(x, wg, wu, "q4_k", activation)
+        ref = _composed(x, wg, wu, "q4_k", activation)
+        kinds = _node_kinds(y)
+        assert kinds == _node_kinds(ref), (on, kinds)
+        assert ("Compiled" in kinds) == on, (on, kinds)
+        mx.eval(y, ref)
+        assert mx.array_equal(y, ref).item(), on
 
 
 @pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])

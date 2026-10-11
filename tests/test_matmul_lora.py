@@ -527,6 +527,7 @@ def test_lora_strength(m):
         assert mx.array_equal(zero, base).item()
 
 
+@pytest.mark.usefixtures("compile_on")
 def test_lora_strength_change_needs_no_new_trace():
     n, r, m = 128, 16, 1100
     w, wd = _weight("q4_k", n, K)
@@ -859,6 +860,7 @@ def _kq_nodes(y):
     return [n for n in _nodes(y) if n.startswith("KQuant")]
 
 
+@pytest.mark.usefixtures("compile_on")
 @pytest.mark.parametrize("banded", [False, True], ids=["no_table", "bands"])
 def test_lora_shapeless_compile_keeps_the_path_of_its_trace(banded):
     """A function compiled with shapeless=True and traced on a call that
@@ -886,6 +888,7 @@ def test_lora_shapeless_compile_keeps_the_path_of_its_trace(banded):
         assert err <= R1[mx.bfloat16], (shape, err)
 
 
+@pytest.mark.usefixtures("compile_on")
 def test_lora_shapeless_compile_of_the_unfused_ops():
     """Traced below the row bound, a shapeless function builds the unfused
     ops and keeps them above the bound. With bands the unfused ops hold
