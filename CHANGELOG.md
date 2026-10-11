@@ -4,7 +4,101 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project aims to
 adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0]
+
+### Added
+- `kq.qk_norm_rope` normalizes and rotates DiT attention q and k in one
+  dispatch, about 25x faster than the unfused ops at Z-Image shapes.
+- `kq.quantized_matmul_glu` computes a gated feed-forward product of two packed
+  weights. On NAX GPUs (M5) a call holds one output buffer, not two or three.
+- `kq.quantized_matmul_lora` adds a low-rank adapter term to a packed matmul in
+  one call. On NAX GPUs (M5) the call is 0 to 11% faster than the unfused ops on
+  the layer shapes of an image model, 4% at the median.
+- `kq.quantized_matmul_residual` adds a residual, gated or not, to a packed
+  matmul in one call. On NAX GPUs (M5) it costs what the matmul alone costs.
+- `kq.conv2d_3x3` runs the 3x3 convolutions of an image VAE decoder. On NAX
+  GPUs (M5) a bfloat16 call takes 0.25 to 0.34 of the time of MLX's convolution.
+- `KQ_TUNE_LIVE=1` makes the NAX tile levers take effect on the next call, so
+  tile A/B runs share one process. `KQ_QMM_LOG` now logs NAX tile dispatches.
+- `KQ_NAX_TILE` and `KQ_QMM_TILE` pin the quantized matmul tile, and raise
+  with the kernel name on a tile that is not built; `KQ_QMM_TILE` accepts
+  only `64,64,2,2` for now. `kq.metallib_kernels()` lists the built kernels.
+- `kq.max_threadgroup_memory()` reports the GPU's threadgroup memory limit.
+- `benchmarks/bench_dit_shapes.py` and `benchmarks/bench_roofline.py` time
+  matmul tiles against stock and MLX affine arms at diffusion model shapes.
+- `KQ_SPLITK_CAP` caps the K slices of the NAX and ALU split-K routes at 32 or
+  fewer rows by GPU core count, for A/B runs on wide ones such as a vocab head.
+- `KQ_DEQUANT_ROUTE` turns the dequantize route off or forces it on any GPU,
+  and `KQ_QMM_LOG` logs each call that takes it.
+- `KQ_SPLITK_F32=1` makes bfloat16 split-K matmuls, MTP verify among them,
+  round once instead of once per K slice. `0` stores float16 partials again,
+  which can return inf.
+
+### Changed
+- Requires mlx 0.32.3, which fixes wrong values from dequantizing a strided
+  array and a crash at process exit.
+- `mlx-kquant[tools]` now installs beside transformers 5.13.1 and later, as
+  mlx-vlm 0.7 requires. Only 5.13.0, which cannot import mlx-lm, is excluded.
+- `KQ_NAX_SWIZZLE=n` folds 2^n row tiles on the BM=64 and BM=128 NAX tiles.
+  `1` now folds two row tiles, where it folded four.
+- On NAX GPUs (M5), prefill and image steps of 4096 or more tokens no longer
+  change matmul kernels with the token count.
+- On NAX GPUs (M5), `q6_k` matmuls in prefill and image steps run 5 to 20%
+  faster, with the same output.
+- On NAX GPUs (M5), `q5_k` and `q3_k` matmuls in prefill and image steps run
+  up to 10% faster on most shapes, with the same output.
+- On NAX GPUs (M5), `q4_k` matmuls in image steps run up to 5% faster, with
+  the same output.
+- On NAX GPUs (M5), `q4_0`, `q4_1`, `q5_0`, `iq4_nl`, `iq3_xxs`, `iq3_s`,
+  `iq2_xs` and `iq2_s` matmuls in image steps run up to 8% faster, with the
+  same output.
+- On NAX GPUs (M5), matmuls of 4096 or more rows at a large K, in image steps
+  such as the Qwen-Image MLP down projection and in text prefill of 4096 or
+  more tokens, run 1 to 8% faster on most codecs.
+- On NAX GPUs (M5), output heads and `q4_0` and `q8_0` float16 matmuls at 9 to
+  32 rows, as in batched decode and speculative verify, run up to 30% faster.
+- On NAX GPUs (M5), batched gemma-4 decode of prompts of different lengths
+  runs 1 to 2% faster. `KQ_GQA_NAX=0` restores the previous kernel.
+- On M3 Max, `q3_k` to `q6_k`, `nvfp4` and `ptq1_0` matmuls from 2048 rows (`q4_k` 16384), K 3840-12288,
+  N 3840-24576, run up to 12% faster, `nvfp4` 39%; other pre-M5 GPUs without NAX take the rows unmeasured.
+- The bundled metallib drops the float32-activation matmul kernels, which no
+  call reached, about 22 MB.
+
+### Fixed
+- `quantized_matmul`, `quantized_matmul_qmv_bias` and `gather_qmm` return
+  correct values for a strided weight view that is not evaluated before the
+  call, such as `w[0::2]`.
+- `dequantize`, `quantize` and the bias of `quantized_matmul_qmv_bias` take a
+  strided view that is not evaluated before the call, such as `w[::-1]`.
+- `route_shed` returns correct slots for strided views of its indices,
+  scores or slot table.
+- The fused MoE ops and `moe_router_topk` take a strided activation or logits
+  view that is not evaluated before the call, and raise for such a stack.
+- `sdpa_prefill_block_sparse` raises for keys or values with a strided head
+  dim that are not evaluated before the call, instead of reading them as dense.
+- `sdpa_sparse_decode` and `sdpa_sparse_prefill` return correct values for a
+  window, pool or pool scales view with a strided or reversed last dim.
+- `dsa_indexer_score_decode` returns correct scores for one sequence whose
+  keys are a view with a strided or reversed last dim.
+- `sdpa_decode_gqa` and the cascade raise for quantized-cache scales and biases
+  that differ in layout or have a strided last dim, instead of misreading them.
+- The fused MoE ops with a limited activation (`silu_limit`, `swiglu_clamp`)
+  return NaN for a NaN gate or up value instead of the value of the limit.
+- `quantized_matmul` returns zeros for an inner dim of 0. On a CPU stream a
+  weight with no rows ended the process at more than 16 rows of x.
+- A float16 matmul of 128 or fewer rows split over K, MTP verify among them,
+  no longer returns inf where its output is finite.
+- Matmuls of 2 to 8 rows on q4_0, pq2_0, q2_0 and ptq1_0 weights, MTP verify among
+  them, no longer return inf for activations past 65504, and fp16 error drops 3-5x.
+- Decode and MTP verify steps on pq2_0 and q2_0 weights no longer return inf for
+  bfloat16 activations past 65504.
+- `KQ_MOE_HALF=1` no longer returns inf for activations of a few hundred and
+  up; only activations past 65504 still do.
+- Tuning levers that default on or to a per-codec rule, such as `KQ_QMV_SPLITK`
+  and `KQ_MOE_DEDUP`, keep that default when set empty instead of turning off.
+- After `patch_mlx_lm_load()`, `mlx_lm.utils.load_model` builds a kquant
+  checkpoint with the caller's `get_model_classes` instead of the stock class.
+  `mlx_kquant.loader.load` takes it too.
 
 ## [0.4.18]
 

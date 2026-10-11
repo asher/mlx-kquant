@@ -10,7 +10,7 @@ Everything here runs against a **stock `mlx` wheel** - importing `mlx_kquant` ad
 namespace; it does **not** register `mode="kquant"` onto `mx.*`, so integrations call `kq.*`
 explicitly.
 
-**Compatibility.** The ops require stock `mlx==0.32.1` (the C++ extension is ABI-pinned to it). The
+**Compatibility.** The ops require stock `mlx==0.32.3` (the C++ extension is ABI-pinned to it). The
 `[tools]` integration points below (loader, recipes, the mlx-lm patch) additionally need
 `mlx-lm>=0.27`. The on-disk checkpoint format is stable and mirrors what a future in-core kquant mode
 would read.
@@ -210,7 +210,8 @@ points, each a narrow shim over a stable mlx-lm function:
 
 `patch_mlx_lm_load()` is the **load-only** shim - all an inference / eval / serving consumer needs. It
 wraps `mlx_lm.utils.load_model` so a kquant config routes through `loader.load`, and every non-kquant
-checkpoint falls through unchanged. Because everything mlx-lm exposes is built on `load_model`,
+checkpoint falls through unchanged. A `get_model_classes` the caller passes reaches `loader.load` and
+picks the model class there too. Because everything mlx-lm exposes is built on `load_model`,
 `mlx_lm.load`, `mlx_lm.generate`, and the CLIs all then open a kquant checkpoint transparently:
 
 ```python

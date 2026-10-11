@@ -136,8 +136,9 @@ METAL_FUNC void kq_pq2_0_decode_pairs(uint wv, thread half2* h) {
 
 // M=1 mat-vec: SB / 16 lanes per block (eight for PQ2_0, four for Q2_0), 32
 // lanes of blocks per simdgroup pass, 16 contiguous weights per lane decoded
-// as half2 pairs. Two half MACs per instruction against the activation pair
-// (y_j, y_j+8) keep the decode near the load-only rate.
+// as half2 pairs. For float16 activations, two half MACs per instruction
+// against the activation pair (y_j, y_j+8) keep the decode near the
+// load-only rate.
 template <typename T, int SB, int BB, int results_per_simdgroup>
 METAL_FUNC void kq_pq2_0_qmv_sb_impl(
     const device uint8_t* w,
@@ -151,9 +152,9 @@ METAL_FUNC void kq_pq2_0_qmv_sb_impl(
   constexpr int num_simdgroups = 2;
   constexpr int lanes = SB / 16;
   constexpr int blocks_per_pass = 32 / lanes;
-  // fp32 activations keep an fp32 pair accumulator; half inputs stay in
-  // the half pipe.
-  typedef metal::conditional_t<metal::is_same_v<T, float>, float2, half2> A2;
+  // float16 activations stay in the half pipe. Other activations keep a
+  // float pair accumulator: bfloat16 values past 65504 do not fit in half.
+  typedef metal::conditional_t<metal::is_same_v<T, half>, half2, float2> A2;
   typedef float U;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
@@ -226,7 +227,7 @@ METAL_FUNC void kq_pq2_0_verify_qmv_sb_impl(
   constexpr int num_simdgroups = 2;
   constexpr int lanes = SB / 16;
   constexpr int blocks_per_pass = 32 / lanes;
-  typedef metal::conditional_t<metal::is_same_v<T, float>, float2, half2> A2;
+  typedef metal::conditional_t<metal::is_same_v<T, half>, half2, float2> A2;
   typedef float U;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
@@ -934,7 +935,11 @@ using KqPtq1_0BlockLoader = KqPrismBlockLoader<
       int group_size,                                                        \
       int bits,                                                              \
       bool aligned_N,                                                        \
-      bool batched>                                                          \
+      bool batched,                                                          \
+      int BM = 64,                                                           \
+      int BN = 64,                                                           \
+      int WM = 2,                                                            \
+      int WN = 2>                                                            \
   [[kernel]] void kq_##CODEC##_qmm_t(                                        \
       const device uint8_t* w,                                               \
       const device uint8_t* /* scales */,                                    \
@@ -970,12 +975,12 @@ using KqPtq1_0BlockLoader = KqPrismBlockLoader<
     }                                                                        \
     static_assert(group_size == SB, #CODEC " requires gs=" #SB);             \
     static_assert(bits == BITS, #CODEC " requires bits=" #BITS);             \
-    constexpr int BM = 64, BK = 32, BN = 64;                                 \
+    constexpr int BK = 32;                                                   \
     constexpr int BK_padded = (BK + 16 / sizeof(T));                         \
     threadgroup T Xs[BM * BK_padded];                                        \
     threadgroup T Ws[BN * BK_padded];                                        \
-    using LoaderW = LOADER<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;      \
-    kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(                        \
+    using LoaderW = LOADER<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;    \
+    kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(                \
         w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);          \
   }                                                                          \
                                                                              \
@@ -984,12 +989,13 @@ using KqPtq1_0BlockLoader = KqPrismBlockLoader<
       int group_size,                                                        \
       int bits,                                                              \
       bool aligned_N,                                                        \
-      int small_bm = 0>                                                      \
+      int small_bm = 0,                                                      \
+      typename U = T>                                                        \
   [[kernel]] void kq_##CODEC##_qmm_t_splitk(                                 \
       const device uint8_t* w,                                               \
       const device uint8_t* /* scales */,                                    \
       const device T* x,                                                     \
-      device T* y,                                                           \
+      device U* y,                                                           \
       const constant int& K,                                                 \
       const constant int& N,                                                 \
       const constant int& M,                                                 \
@@ -1013,7 +1019,7 @@ using KqPtq1_0BlockLoader = KqPrismBlockLoader<
     auto wl = w;                                                             \
     wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block; \
     y += tid.z * static_cast<int64_t>(split_k_partition_stride);             \
-    kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(                \
+    kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, U>(             \
         wl,                                                                  \
         x,                                                                   \
         y,                                                                   \
@@ -1226,14 +1232,14 @@ struct KqPq2_0Mma {
   static METAL_FUNC int perm(int f, int col) {
     return 32 * (col / 2) + 16 * (f / 8) + (f % 8) + 8 * (col & 1);
   }
-  template <int NT>
+  template <int NT, typename X, typename A>
   static METAL_FUNC void block(
       thread const KqVmmaRows<NT>& rows,
       int boff,
       short L,
       short fm,
-      const threadgroup half* xb,
-      thread simdgroup_half8x8 (&acc)[NT]) {
+      const threadgroup X* xb,
+      thread simdgroup_matrix<A, 8, 8> (&acc)[NT]) {
     uint wv[NT][2];
     for (short t = 0; t < NT; ++t) {
       const packed_ushort4 v =
@@ -1272,14 +1278,14 @@ struct KqQ2_0Mma {
   static METAL_FUNC int perm(int f, int col) {
     return 16 * (col / 2) + f + 8 * (col & 1);
   }
-  template <int NT>
+  template <int NT, typename X, typename A>
   static METAL_FUNC void block(
       thread const KqVmmaRows<NT>& rows,
       int boff,
       short L,
       short fm,
-      const threadgroup half* xb,
-      thread simdgroup_half8x8 (&acc)[NT]) {
+      const threadgroup X* xb,
+      thread simdgroup_matrix<A, 8, 8> (&acc)[NT]) {
     uint wv[NT];
     for (short t = 0; t < NT; ++t) {
       const packed_ushort2 v =
@@ -1322,14 +1328,14 @@ struct KqPtq1_0Mma {
     const int level = f % 5;
     return byte < 16 ? 16 * level + byte : 80 + 8 * level + (byte - 16);
   }
-  template <int NT>
+  template <int NT, typename X, typename A>
   static METAL_FUNC void block(
       thread const KqVmmaRows<NT>& rows,
       int boff,
       short L,
       short fm,
-      const threadgroup half* xb,
-      thread simdgroup_half8x8 (&acc)[NT]) {
+      const threadgroup X* xb,
+      thread simdgroup_matrix<A, 8, 8> (&acc)[NT]) {
     for (short p = 0; p < 3; ++p) {
       half2 u[NT];
       for (short t = 0; t < NT; ++t) {
@@ -1363,6 +1369,13 @@ struct KqPtq1_0Mma {
   }
 };
 
-KQ_DEFINE_VERIFY_MMA_KERNEL(pq2_0, KqPq2_0Mma, 2)
+// One row tile per simdgroup (NT 1). A pq2_0 block runs its 16 fragment
+// MMAs into one accumulator per row tile, a chain of dependent MMAs whose
+// latency, longer in float than in half, bounds the kernel; one row tile
+// per simdgroup doubles the threadgroups that hide it. On an M5 Max over
+// the Qwen3.8-27B shapes at M 2 to 8 the float kernel ran in 0.45-0.52x
+// its time at two row tiles. q2_0 runs the same chain, 8 fragment MMAs per
+// 64-weight block, and takes the pq2_0 row tile count; it is not measured.
+KQ_DEFINE_VERIFY_MMA_KERNEL(pq2_0, KqPq2_0Mma, 1)
 KQ_DEFINE_VERIFY_MMA_KERNEL(ptq1_0, KqPtq1_0Mma, 1)
-KQ_DEFINE_VERIFY_MMA_KERNEL(q2_0, KqQ2_0Mma, 2)
+KQ_DEFINE_VERIFY_MMA_KERNEL(q2_0, KqQ2_0Mma, 1)

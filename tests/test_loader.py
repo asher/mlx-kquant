@@ -217,6 +217,63 @@ def test_patched_load_model_file_trusted(tmp_path):
         mlx_lm_patch._trust_remote_code = False
 
 
+def _resolver_and_calls():
+    # A caller-owned class resolver: a llama subclass, so the checkpoint's
+    # weights load into it unchanged.
+    llama_model, llama_args = _get_classes(_tiny_llama_cfg())
+    owned = type("OwnedModel", (llama_model,), {})
+    calls = []
+
+    def get_model_classes(config):
+        calls.append(config["model_type"])
+        return owned, llama_args
+
+    return owned, get_model_classes, calls
+
+
+def _saved_tiny_llama(tmp_path):
+    from mlx_kquant.convert import quantize_model, save
+
+    cfg = _tiny_llama_cfg()
+    qmodel, qconfig = quantize_model(_build(cfg), cfg, preset="q4_k_m")
+    save(tmp_path, qmodel, qconfig)
+    return qmodel
+
+
+def test_load_honors_get_model_classes(tmp_path):
+    # The caller's resolver picks the class; the weights and the KQuant swap
+    # are the same as with the default resolver.
+    qmodel = _saved_tiny_llama(tmp_path)
+    owned, get_model_classes, calls = _resolver_and_calls()
+    model, _ = load(tmp_path, get_model_classes=get_model_classes)
+    assert type(model) is owned
+    assert calls == ["llama"]
+    x = mx.array([[1, 2, 3, 4, 5]])
+    out, ref = model(x), qmodel(x)
+    mx.eval(out, ref)
+    assert bool(mx.array_equal(out, ref).item())
+
+
+def test_patched_load_model_honors_get_model_classes(tmp_path):
+    # Through the mlx-lm seam, a kquant checkpoint must build the class the
+    # caller's get_model_classes returns, as stock load_model does for every
+    # other checkpoint.
+    import mlx_lm.utils
+
+    from mlx_kquant.mlx_lm_patch import patch_mlx_lm_load
+
+    qmodel = _saved_tiny_llama(tmp_path)
+    owned, get_model_classes, calls = _resolver_and_calls()
+    patch_mlx_lm_load()
+    model, _ = mlx_lm.utils.load_model(tmp_path, get_model_classes=get_model_classes)
+    assert type(model) is owned
+    assert calls == ["llama"]
+    x = mx.array([[1, 2, 3, 4, 5]])
+    out, ref = model(x), qmodel(x)
+    mx.eval(out, ref)
+    assert bool(mx.array_equal(out, ref).item())
+
+
 def test_resolve_path_typo_is_not_a_repo_id():
     # A nonexistent path-shaped input must say "no such file", not bounce off
     # the HF Hub validator's repo-id naming-rules message. No network needed.

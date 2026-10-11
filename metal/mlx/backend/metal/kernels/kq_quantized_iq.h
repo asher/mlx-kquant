@@ -1274,7 +1274,16 @@ struct KqIq4_xsBlockLoader {
   }
 };
 
-template <typename T, int group_size, int bits, bool aligned_N, bool batched>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool batched,
+    int BM = 64,
+    int BN = 64,
+    int WM = 2,
+    int WN = 2>
 [[kernel]] void kq_iq4_xs_qmm_t(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -1310,13 +1319,13 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
   }
   static_assert(group_size == KQ_IQ4_XS_SUPERBLOCK, "IQ4_XS requires gs=256");
   static_assert(bits == 4, "IQ4_XS requires bits=4");
-  constexpr int BM = 64, BK = 32, BN = 64;
+  constexpr int BK = 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
   using LoaderW =
-      KqIq4_xsBlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      KqIq4_xsBlockLoader<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
@@ -1325,12 +1334,13 @@ template <
     int group_size,
     int bits,
     bool aligned_N,
-    int small_bm = 0>
+    int small_bm = 0,
+    typename U = T>
 [[kernel]] void kq_iq4_xs_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
     const device T* x,
-    device T* y,
+    device U* y,
     const constant int& K,
     const constant int& N,
     const constant int& M,
@@ -1355,7 +1365,7 @@ template <
   auto wl = w;
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, U>(
       wl,
       x,
       y,
@@ -1745,7 +1755,16 @@ struct KqIq3_xxsBlockLoader {
   }
 };
 
-template <typename T, int group_size, int bits, bool aligned_N, bool batched>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool batched,
+    int BM = 64,
+    int BN = 64,
+    int WM = 2,
+    int WN = 2>
 [[kernel]] void kq_iq3_xxs_qmm_t(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -1781,13 +1800,13 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
   }
   static_assert(group_size == KQ_IQ3_XXS_SUPERBLOCK, "IQ3_XXS requires gs=256");
   static_assert(bits == 3, "IQ3_XXS requires bits=3");
-  constexpr int BM = 64, BK = 32, BN = 64;
+  constexpr int BK = 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
   using LoaderW =
-      KqIq3_xxsBlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      KqIq3_xxsBlockLoader<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
@@ -1796,12 +1815,13 @@ template <
     int group_size,
     int bits,
     bool aligned_N,
-    int small_bm = 0>
+    int small_bm = 0,
+    typename U = T>
 [[kernel]] void kq_iq3_xxs_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
     const device T* x,
-    device T* y,
+    device U* y,
     const constant int& K,
     const constant int& N,
     const constant int& M,
@@ -1826,7 +1846,7 @@ template <
   auto wl = w;
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, U>(
       wl,
       x,
       y,
@@ -2223,7 +2243,16 @@ struct KqIq3_sBlockLoader {
   }
 };
 
-template <typename T, int group_size, int bits, bool aligned_N, bool batched>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool batched,
+    int BM = 64,
+    int BN = 64,
+    int WM = 2,
+    int WN = 2>
 [[kernel]] void kq_iq3_s_qmm_t(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -2259,13 +2288,13 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
   }
   static_assert(group_size == KQ_IQ3_S_SUPERBLOCK, "IQ3_S requires gs=256");
   static_assert(bits == 3, "IQ3_S requires bits=3");
-  constexpr int BM = 64, BK = 32, BN = 64;
+  constexpr int BK = 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
   using LoaderW =
-      KqIq3_sBlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      KqIq3_sBlockLoader<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
@@ -2274,12 +2303,13 @@ template <
     int group_size,
     int bits,
     bool aligned_N,
-    int small_bm = 0>
+    int small_bm = 0,
+    typename U = T>
 [[kernel]] void kq_iq3_s_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
     const device T* x,
-    device T* y,
+    device U* y,
     const constant int& K,
     const constant int& N,
     const constant int& M,
@@ -2304,7 +2334,7 @@ template <
   auto wl = w;
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, U>(
       wl,
       x,
       y,
@@ -2697,7 +2727,16 @@ struct KqIq2_xxsBlockLoader {
   }
 };
 
-template <typename T, int group_size, int bits, bool aligned_N, bool batched>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool batched,
+    int BM = 64,
+    int BN = 64,
+    int WM = 2,
+    int WN = 2>
 [[kernel]] void kq_iq2_xxs_qmm_t(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -2733,13 +2772,13 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
   }
   static_assert(group_size == KQ_IQ2_XXS_SUPERBLOCK, "IQ2_XXS requires gs=256");
   static_assert(bits == 2, "IQ2_XXS requires bits=2");
-  constexpr int BM = 64, BK = 32, BN = 64;
+  constexpr int BK = 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
   using LoaderW =
-      KqIq2_xxsBlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      KqIq2_xxsBlockLoader<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
@@ -2748,12 +2787,13 @@ template <
     int group_size,
     int bits,
     bool aligned_N,
-    int small_bm = 0>
+    int small_bm = 0,
+    typename U = T>
 [[kernel]] void kq_iq2_xxs_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
     const device T* x,
-    device T* y,
+    device U* y,
     const constant int& K,
     const constant int& N,
     const constant int& M,
@@ -2778,7 +2818,7 @@ template <
   auto wl = w;
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, U>(
       wl,
       x,
       y,
@@ -3174,7 +3214,16 @@ struct KqIq2_xsBlockLoader {
   }
 };
 
-template <typename T, int group_size, int bits, bool aligned_N, bool batched>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool batched,
+    int BM = 64,
+    int BN = 64,
+    int WM = 2,
+    int WN = 2>
 [[kernel]] void kq_iq2_xs_qmm_t(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -3210,13 +3259,13 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
   }
   static_assert(group_size == KQ_IQ2_XS_SUPERBLOCK, "IQ2_XS requires gs=256");
   static_assert(bits == 2, "IQ2_XS requires bits=2");
-  constexpr int BM = 64, BK = 32, BN = 64;
+  constexpr int BK = 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
   using LoaderW =
-      KqIq2_xsBlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      KqIq2_xsBlockLoader<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
@@ -3225,12 +3274,13 @@ template <
     int group_size,
     int bits,
     bool aligned_N,
-    int small_bm = 0>
+    int small_bm = 0,
+    typename U = T>
 [[kernel]] void kq_iq2_xs_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
     const device T* x,
-    device T* y,
+    device U* y,
     const constant int& K,
     const constant int& N,
     const constant int& M,
@@ -3255,7 +3305,7 @@ template <
   auto wl = w;
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, U>(
       wl,
       x,
       y,
@@ -3653,7 +3703,16 @@ struct KqIq2_sBlockLoader {
   }
 };
 
-template <typename T, int group_size, int bits, bool aligned_N, bool batched>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool batched,
+    int BM = 64,
+    int BN = 64,
+    int WM = 2,
+    int WN = 2>
 [[kernel]] void kq_iq2_s_qmm_t(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -3689,13 +3748,13 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
   }
   static_assert(group_size == KQ_IQ2_S_SUPERBLOCK, "IQ2_S requires gs=256");
   static_assert(bits == 2, "IQ2_S requires bits=2");
-  constexpr int BM = 64, BK = 32, BN = 64;
+  constexpr int BK = 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
   using LoaderW =
-      KqIq2_sBlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      KqIq2_sBlockLoader<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
@@ -3704,12 +3763,13 @@ template <
     int group_size,
     int bits,
     bool aligned_N,
-    int small_bm = 0>
+    int small_bm = 0,
+    typename U = T>
 [[kernel]] void kq_iq2_s_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
     const device T* x,
-    device T* y,
+    device U* y,
     const constant int& K,
     const constant int& N,
     const constant int& M,
@@ -3734,7 +3794,7 @@ template <
   auto wl = w;
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, U>(
       wl,
       x,
       y,
@@ -4120,7 +4180,16 @@ struct KqIq1_sBlockLoader {
   }
 };
 
-template <typename T, int group_size, int bits, bool aligned_N, bool batched>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool batched,
+    int BM = 64,
+    int BN = 64,
+    int WM = 2,
+    int WN = 2>
 [[kernel]] void kq_iq1_s_qmm_t(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -4156,13 +4225,13 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
   }
   static_assert(group_size == KQ_IQ1_S_SUPERBLOCK, "IQ1_S requires gs=256");
   static_assert(bits == 1, "IQ1_S requires bits=1");
-  constexpr int BM = 64, BK = 32, BN = 64;
+  constexpr int BK = 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
   using LoaderW =
-      KqIq1_sBlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      KqIq1_sBlockLoader<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
@@ -4171,12 +4240,13 @@ template <
     int group_size,
     int bits,
     bool aligned_N,
-    int small_bm = 0>
+    int small_bm = 0,
+    typename U = T>
 [[kernel]] void kq_iq1_s_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
     const device T* x,
-    device T* y,
+    device U* y,
     const constant int& K,
     const constant int& N,
     const constant int& M,
@@ -4201,7 +4271,7 @@ template <
   auto wl = w;
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, U>(
       wl,
       x,
       y,
@@ -4610,7 +4680,16 @@ struct KqIq1_mBlockLoader {
   }
 };
 
-template <typename T, int group_size, int bits, bool aligned_N, bool batched>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool batched,
+    int BM = 64,
+    int BN = 64,
+    int WM = 2,
+    int WN = 2>
 [[kernel]] void kq_iq1_m_qmm_t(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -4646,13 +4725,13 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
   }
   static_assert(group_size == KQ_IQ1_M_SUPERBLOCK, "IQ1_M requires gs=256");
   static_assert(bits == 1, "IQ1_M requires bits=1");
-  constexpr int BM = 64, BK = 32, BN = 64;
+  constexpr int BK = 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
   using LoaderW =
-      KqIq1_mBlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      KqIq1_mBlockLoader<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
@@ -4661,12 +4740,13 @@ template <
     int group_size,
     int bits,
     bool aligned_N,
-    int small_bm = 0>
+    int small_bm = 0,
+    typename U = T>
 [[kernel]] void kq_iq1_m_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
     const device T* x,
-    device T* y,
+    device U* y,
     const constant int& K,
     const constant int& N,
     const constant int& M,
@@ -4691,7 +4771,7 @@ template <
   auto wl = w;
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, U>(
       wl,
       x,
       y,
@@ -5180,13 +5260,13 @@ struct KqTgLuts<KqIq2_sExt> {
 // ---------------------------------------------------------------------------
 // Half-dot decode tables (KQ_MOE_HALF): the grid codecs' 8-bit magnitude
 // entries pre-expanded to half4 pairs in threadgroup memory, so the chunk
-// dequant is a table read plus a sign select in half and the dot runs in
-// half against a half-staged activation row. Specialized for the codecs
-// where the float path is ALU-bound at decode (iq2_xs, iq2_xxs, iq3_xxs);
-// every other codec reports has_half = false and never reaches these
-// kernels (host gate). deq_chunk16h mirrors deq_chunk16s: 16 unscaled
-// weights in natural order plus the chunk scale, applied by the caller in
-// float once per chunk.
+// dequant is a table read plus a sign select in half. The caller widens
+// the weights and a half-staged activation row to float for each chunk
+// dot. Specialized for the codecs where the float path is ALU-bound at
+// decode (iq2_xs, iq2_xxs, iq3_xxs); every other codec reports has_half =
+// false and never reaches these kernels (host gate). deq_chunk16h mirrors
+// deq_chunk16s: 16 unscaled weights in natural order plus the chunk scale,
+// applied by the caller in float once per chunk.
 // ---------------------------------------------------------------------------
 
 // Negates lane j of a half4 where bit j of s (low 4 bits) is set.

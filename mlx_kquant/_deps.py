@@ -20,7 +20,7 @@ def require_tools() -> None:
     or broken.
 
     A present-but-broken mlx-lm raises whatever its import died on (e.g.
-    transformers 5.13 rejects mlx-lm <= 0.31.3's tokenizer registration with
+    transformers 5.13.0 rejects mlx-lm <= 0.31.3's tokenizer registration with
     an ``AttributeError``); surface that as a version-conflict hint instead of
     a raw traceback from a dependency's internals.
     """
@@ -32,6 +32,6 @@ def require_tools() -> None:
         raise ImportError(
             "mlx-kquant: mlx-lm is installed but failed to import, which "
             "usually means an incompatible dependency version (for example "
-            "transformers 5.13 breaks mlx-lm <= 0.31.3; fix with: pip install "
-            f"'transformers<5.13'). Underlying error: {e!r}"
+            "transformers 5.13.0 breaks mlx-lm <= 0.31.3; fix with: pip install "
+            f"'transformers!=5.13.0'). Underlying error: {e!r}"
         ) from e

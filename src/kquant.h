@@ -27,6 +27,14 @@ std::string metallib_dir();
 // Returns false only on a non-Metal build.
 bool metallib_loads();
 
+// Sorted names of the kernels in the bundled metallib (empty on non-Metal
+// builds).
+std::vector<std::string> metallib_kernels();
+
+// True in a build with the CMake option KQ_PROBE_KERNELS=ON: the metallib
+// carries the probe tiles and the levers that select them are read.
+bool probe_kernels();
+
 // True when the GPU supports the NAX (tensor-core) matmul kernels (false on
 // non-Metal builds and pre-NAX GPUs).
 bool nax_available();
@@ -35,10 +43,51 @@ bool nax_available();
 // it); 0 when unknown.
 int gpu_core_count();
 
+// The GPU's threadgroup memory limit in bytes; 0 on non-Metal builds.
+int max_threadgroup_memory();
+
 // Largest N at which the M=1 mat-vec takes the fine (2 rows per threadgroup)
 // tiling for this codec; 0 means coarse. The calibrated ceiling unless
 // KQ_GPU_CORES is set, which scales it by cores/40. On Metal only.
 int qmv_fine_max_n(const std::string& kquant_type);
+
+// The NAX qmm_t large-M row of a codec: bm, bn, wm, wn, swizzle_log, min_m,
+// min_n, max_k and inherited (1 when the tile and floor are its loader
+// class's); empty on non-Metal builds.
+std::vector<int> nax_large_row(const std::string& kquant_type);
+
+// The row that runs a plain transposed quantized_matmul as dequantize then
+// the stock matmul by default, for an architecture string (as
+// get_architecture gives it), NAX, a codec, the rows of x, N and K: min_m,
+// min_k, max_k, min_n and max_n. Empty where the qmm_t kernel runs: on NAX
+// GPUs, outside applegpu_g13 to g16 with a suffix other than p, for a codec
+// without a row, below its floor in M and outside the K and N range.
+std::vector<int> alu_dequantize_row(
+    const std::string& arch,
+    bool nax,
+    const std::string& kquant_type,
+    int M,
+    int N,
+    int K);
+
+// Whether a plain transposed quantized_matmul on a 2-D weight on a GPU
+// stream takes the dequantize route, for an architecture string, NAX, the
+// KQ_DEQUANT_ROUTE mode ("auto", "off" or "force"), whether KQ_QMM_TILE
+// pins the tile, a codec, the rows of x, N and K. The op decides with this.
+bool dequantize_route_takes(
+    const std::string& arch,
+    bool nax,
+    const std::string& mode,
+    bool pinned,
+    const std::string& kquant_type,
+    int M,
+    int N,
+    int K);
+
+// Every kernel name the split-K dispatchers can build (qmm_splitk,
+// qmm_nax_splitk, verify_mma, verify_nax and their fold), for the kernel
+// name tests; empty on non-Metal builds.
+std::vector<std::string> split_kernel_names();
 
 // True when gather_qmm's sorted-rhs NAX GEMM leaf can serve `kquant_type`
 // here: NAX hardware present, the codec ships NAX kernels, and KQ_DISABLE_NAX
@@ -1071,6 +1120,43 @@ class KQuantDequantize : public mx::Primitive {
   int bits_;
 };
 
+// Lays out the last two dims of a weight operand as dense rows, at eval.
+// An op builder cannot do this from strides: an array without memory
+// reports a dense layout whatever view it becomes. An input whose last two
+// dims are dense rows passes through with its buffer, strides and offset.
+// Any other input is copied row-major. With `whole`, an input passes
+// through only when all of its dims are row-major. Inference-only.
+class KQuantMatrixDense : public mx::Primitive {
+ public:
+  explicit KQuantMatrixDense(mx::Stream stream, bool whole = false)
+      : mx::Primitive(stream), whole_(whole) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override {
+    return {inputs[0].shape()};
+  }
+
+  const char* name() const override {
+    return "KQuantMatrixDense";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return whole_ == static_cast<const KQuantMatrixDense&>(other).whole_;
+  }
+
+ private:
+  // True when the input passes through as it is.
+  bool passes(const mx::array& in) const;
+
+  bool whole_;
+};
+
 // Quantized matmul. vjp implements only the gradient wrt x (re-dispatch with
 // the transpose flipped) so LoRA can train on a frozen kquant base; jvp/vmap
 // and the gradient wrt the quantized weights/scales inherit the base-class
@@ -1127,6 +1213,56 @@ class KQuantMatmul : public mx::Primitive {
   void eval_gpu_base(
       const std::vector<mx::array>& inputs,
       std::vector<mx::array>& outputs);
+};
+
+// The output of a matmul that runs as dequantize then the stock matmul,
+// with the vjp of KQuantMatmul. inputs = {y, x, w, scales}, where y is the
+// product under stop_gradient; the output shares y's buffer. The gradient
+// wrt x runs the quantized matmul the other way, so no backward pass keeps
+// the dense copy, and the gradient wrt w or scales throws, as on the kernel.
+// jvp and vmap throw the base-class text with the name KQuantMatmul.
+class KQuantDequantRoute : public mx::Primitive {
+ public:
+  explicit KQuantDequantRoute(mx::Stream stream, std::string kquant_type)
+      : mx::Primitive(stream), kquant_type_(std::move(kquant_type)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override {
+    return {inputs[0].shape()};
+  }
+
+  const char* name() const override {
+    return "KQuantDequantRoute";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return kquant_type_ ==
+        static_cast<const KQuantDequantRoute&>(other).kquant_type_;
+  }
+
+  std::vector<mx::array> vjp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<mx::array>& outputs) override;
+  // jvp and vmap refuse by the name KQuantMatmul, as the kernel path does,
+  // so the error text does not depend on which path a call takes.
+  std::vector<mx::array> jvp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& tangents,
+      const std::vector<int>& argnums) override;
+  std::pair<std::vector<mx::array>, std::vector<int>> vmap(
+      const std::vector<mx::array>& inputs,
+      const std::vector<int>& axes) override;
+
+ private:
+  std::string kquant_type_;
 };
 
 // Bias-fused decode-only (M=1) qmv/qmv_fast dispatch -- see
@@ -1460,6 +1596,310 @@ class KQuantRMSNormGate : public mx::Primitive {
 
  private:
   float eps_;
+};
+
+// Fused per-head RMSNorm and RoPE of the DiT attention q and k:
+//   y = rms_norm(x, w, eps), then each interleaved pair (y[2i], y[2i + 1])
+//   rotates by the angle whose cos and sin are cos[l, i] and sin[l, i].
+// q and k [B, L, H, D] (float16/bfloat16, any strides: a slice of a fused
+// qkv output is read in place), q_w and k_w [D], cos and sin [L, D / 2]
+// (any float dtype, used in f32; one angle per row, so any position scheme
+// works). Returns (q_out, k_out) as row-contiguous [B, H, L, D] in the
+// input dtype. f32 math, one round at the write. On the GPU head dims 64,
+// 96, 128 and 256 run one fused dispatch; other even head dims and CPU
+// streams run the same math as stock ops.
+std::pair<mx::array, mx::array> qk_norm_rope(
+    mx::array q,
+    mx::array k,
+    mx::array q_w,
+    mx::array k_w,
+    mx::array cos,
+    mx::array sin,
+    float eps,
+    mx::StreamOrDevice s = {});
+
+// Fused qk norm and RoPE primitive (see qk_norm_rope). Inference-only.
+class KQuantQkNormRope : public mx::Primitive {
+ public:
+  KQuantQkNormRope(mx::Stream stream, float eps)
+      : mx::Primitive(stream), eps_(eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantQkNormRope";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float eps_;
+};
+
+// GLU product of two quantized matmuls that share x:
+//   y = act(x @ Wg^T) * (x @ Wu^T)
+// x [..., K] (float16/bfloat16; float32 runs in bfloat16), w_gate and w_up
+// 2-D uint8 wire bytes of one codec and one shape [N, K bytes], which may
+// be row slices of one wider weight. activation is "silu" or "gelu_tanh".
+// Returns [..., N] in the dtype quantized_matmul gives for x. On a NAX GPU,
+// for codecs with a GLU kernel (q8_0 on bfloat16 only), K a multiple of the
+// codec's K tile (64 for q8_0, 128 for the others) and at least 1024 rows,
+// one dispatch walks K for the gate weight and stores the activation of
+// that sum in y, then walks K for the up weight and multiplies the stored
+// activation into that sum at the final store. The sums, the activation and
+// the product run in f32, with one rounding of the activation to the dtype
+// of y and one of the product. A float16 store keeps a finite value in the
+// finite half range, and a NaN or an infinity passes. Every other case
+// builds the product from quantized_matmul and stock ops.
+mx::array quantized_matmul_glu(
+    mx::array x,
+    mx::array w_gate,
+    mx::array w_up,
+    const std::string& kquant_type,
+    const std::string& activation = "silu",
+    mx::StreamOrDevice s = {});
+
+// Quantized matmul with an epilogue fused into the store (see
+// quantized_matmul_glu). vjp and jvp are those of the unfused ops, wrt x
+// only: the quantized weights are frozen, as in KQuantMatmul.
+class KQuantMatmulFused : public mx::Primitive {
+ public:
+  KQuantMatmulFused(mx::Stream stream, std::string kquant_type, int act)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        act_(act) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantMatmulFused";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+  std::vector<mx::array> vjp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<mx::array>& outputs) override;
+  std::vector<mx::array> jvp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& tangents,
+      const std::vector<int>& argnums) override;
+
+ private:
+  std::string kquant_type_;
+  int act_; // 0 = silu, 1 = gelu (tanh form)
+};
+
+// Quantized matmul with a low-rank term:
+//   y = x @ W^T + (strength * (x @ A)) @ B
+// x [..., K] (float16/bfloat16; float32 runs in bfloat16), w 2-D uint8 wire
+// bytes [N, K bytes], lora_a [K, R] and lora_b [R, N] in any float dtype
+// (they run in the dtype of y). strength scales the R columns of x @ A: a
+// 0-D array, [1] or [R]. bands holds rows of (col_start, col_end, z_start,
+// rank): the columns [col_start, col_end) of y take the ranks [z_start,
+// z_start + rank) and that block of lora_b, and a column outside every band
+// takes no low-rank term. Bands are in column order and disjoint. Without
+// bands (nullopt) every column takes every rank. With a table of no row no
+// column takes one, and y is the product alone. Several adapters are one
+// call: their A columns and B rows are joined, with one strength per
+// column. K, N and R are below 2^25 and x holds fewer than 2^31 rows.
+// Returns [..., N] in the dtype quantized_matmul gives for x. On a NAX GPU,
+// for q4_k, q5_k, q6_k and q8_0 weights on bfloat16 with K up to 4096 and N
+// of at least K, at least 4096 rows and at most 128 ranks per column (from
+// 1024 rows and at every rank where N is at least 8192), every band
+// starting on a multiple of 64 columns and ending on a multiple of 32
+// columns or at N, at most 16 bands and a rank of at most 256 per band
+// (without bands, a rank of at most 256), stock ops compute
+// z = strength * (x @ A) and one dispatch walks the rank for z and B and
+// then K for the weight in the same f32 sums, with y as its only output
+// buffer and one rounding at the store. Every other case builds the sum
+// from quantized_matmul and stock ops.
+mx::array quantized_matmul_lora(
+    mx::array x,
+    mx::array w,
+    const std::string& kquant_type,
+    mx::array lora_a,
+    mx::array lora_b,
+    const std::optional<mx::array>& strength = std::nullopt,
+    const std::optional<std::vector<int>>& bands = std::nullopt,
+    mx::StreamOrDevice s = {});
+
+// Quantized matmul with a low-rank term in the reduction (see
+// quantized_matmul_lora). Inputs are x, w, z and B. vjp, jvp and vmap are
+// those of the unfused ops. The vjp is wrt x, z and B: the quantized weight
+// is frozen, as in KQuantMatmul. jvp and vmap run for z and B and refuse x
+// and the weight by the name of KQuantMatmul, which has neither.
+class KQuantMatmulLora : public mx::Primitive {
+ public:
+  KQuantMatmulLora(
+      mx::Stream stream,
+      std::string kquant_type,
+      std::vector<int> bands)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        bands_(std::move(bands)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantMatmulLora";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+  std::vector<mx::array> vjp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<mx::array>& outputs) override;
+  std::vector<mx::array> jvp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& tangents,
+      const std::vector<int>& argnums) override;
+  std::pair<std::vector<mx::array>, std::vector<int>> vmap(
+      const std::vector<mx::array>& inputs,
+      const std::vector<int>& axes) override;
+
+ private:
+  std::string kquant_type_;
+  // Rows of (col_start, col_end, z_start, rank); empty for one band over
+  // every column and every rank.
+  std::vector<int> bands_;
+};
+
+// 3x3 convolution, stride 1, padding 1, channels last:
+//   y = conv(x, w) + bias
+// x [B, H, W, C] in a float dtype, w [O, 3, 3, C] and bias [O] in any float
+// dtype (they run in the dtype of x). Returns [B, H, W, O] in the dtype of
+// x. On a NAX GPU, for bfloat16 with C a multiple of 16, from 1024 output
+// pixels, one dispatch computes y as an implicit GEMM with f32 sums and
+// one rounding. Every other case builds MLX's convolution on the flipped
+// kernel (its implicit GEMM, no Winograd transform) and a stock add.
+mx::array conv2d_3x3(
+    mx::array x,
+    mx::array w,
+    const std::optional<mx::array>& bias = std::nullopt,
+    mx::StreamOrDevice s = {});
+
+// 3x3 convolution as an implicit GEMM (see conv2d_3x3). Inputs are x, w
+// and, with a bias, the bias. vjp, jvp and vmap are those of the composed
+// convolution.
+class KQuantConv3x3 : public mx::Primitive {
+ public:
+  explicit KQuantConv3x3(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantConv3x3";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+  std::vector<mx::array> vjp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<mx::array>& outputs) override;
+  std::vector<mx::array> jvp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& tangents,
+      const std::vector<int>& argnums) override;
+  std::pair<std::vector<mx::array>, std::vector<int>> vmap(
+      const std::vector<mx::array>& inputs,
+      const std::vector<int>& axes) override;
+};
+
+// Quantized matmul with a residual epilogue:
+//   y = residual + gate * (x @ W^T)
+// x [..., K] (float16/bfloat16; float32 runs in bfloat16), w 2-D uint8 wire
+// bytes [N, K bytes], residual of the output shape [..., N], gate optional:
+// [N], or x's batch dims, then 1, then N (one gate row per batch, as an
+// adaptive norm gives). With no gate y = residual + x @ W^T. The residual
+// and the gate run in the output dtype. K and N are below 2^25 and x holds
+// fewer than 2^31 rows. Returns [..., N] in the dtype quantized_matmul
+// gives for x. On a NAX GPU, for q4_k, q5_k, q6_k and q8_0 weights on
+// bfloat16, from 1024 rows, one dispatch walks K into f32 sums and stores
+// residual + gate * sum, rounded once. Every other case builds the sum from
+// quantized_matmul and stock ops, which round the product and the gated
+// product to the output dtype before the add.
+mx::array quantized_matmul_residual(
+    mx::array x,
+    mx::array w,
+    const std::string& kquant_type,
+    mx::array residual,
+    const std::optional<mx::array>& gate = std::nullopt,
+    mx::StreamOrDevice s = {});
+
+// Quantized matmul with a residual epilogue (see quantized_matmul_residual).
+// Inputs are x, w, the residual and, when gated, the gate. vjp, jvp and
+// vmap are those of the unfused ops. The vjp is wrt x, the residual and the
+// gate: the quantized weight is frozen, as in KQuantMatmul.
+class KQuantMatmulResid : public mx::Primitive {
+ public:
+  KQuantMatmulResid(mx::Stream stream, std::string kquant_type)
+      : mx::Primitive(stream), kquant_type_(std::move(kquant_type)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantMatmulResid";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+  std::vector<mx::array> vjp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<mx::array>& outputs) override;
+  std::vector<mx::array> jvp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& tangents,
+      const std::vector<int>& argnums) override;
+  std::pair<std::vector<mx::array>, std::vector<int>> vmap(
+      const std::vector<mx::array>& inputs,
+      const std::vector<int>& axes) override;
+
+ private:
+  std::string kquant_type_;
 };
 
 // Fused causal short convolution for gated-delta prefill (KDA, GDN):

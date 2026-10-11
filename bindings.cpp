@@ -67,6 +67,12 @@ NB_MODULE(_ext, m) {
       "Load the bundled metallib via the Metal device (toolchain self-check).");
 
   m.def(
+      "metallib_kernels",
+      &mlx_kquant::metallib_kernels,
+      "Sorted names of the kernels in the bundled metallib (empty on builds "
+      "without Metal). Tile overrides select from these names.");
+
+  m.def(
       "cpu_neon_available",
       &mlx_kquant::kq_cpu_neon_available,
       "True when the arm64 NEON int8 CPU GEMV kernels can run here (arm64 "
@@ -81,6 +87,61 @@ NB_MODULE(_ext, m) {
       "gpu_core_count",
       &mlx_kquant::gpu_core_count,
       "GPU core count from IOKit (KQ_GPU_CORES overrides it); 0 when unknown.");
+
+  m.def(
+      "max_threadgroup_memory",
+      &mlx_kquant::max_threadgroup_memory,
+      "The GPU's threadgroup memory limit in bytes; 0 without Metal.");
+
+  m.def(
+      "_probe_kernels",
+      &mlx_kquant::probe_kernels,
+      "True in a build with the CMake option KQ_PROBE_KERNELS=ON, for the "
+      "kernel name tests.");
+
+  m.def(
+      "_split_kernel_names",
+      &mlx_kquant::split_kernel_names,
+      "Every kernel name the split-K dispatchers can build, for the kernel "
+      "name tests (empty without Metal).");
+
+  m.def(
+      "_nax_large_row",
+      &mlx_kquant::nax_large_row,
+      "kquant_type"_a,
+      "The codec's NAX qmm_t large-M row as [bm, bn, wm, wn, swizzle_log, "
+      "min_m, min_n, max_k, inherited], for the policy tests (empty without "
+      "Metal).");
+
+  m.def(
+      "_alu_dequantize_row",
+      &mlx_kquant::alu_dequantize_row,
+      "arch"_a,
+      "nax"_a,
+      "kquant_type"_a,
+      "M"_a,
+      "N"_a,
+      "K"_a,
+      "The row that runs a plain transposed quantized_matmul as dequantize "
+      "then the stock matmul by default, for an architecture string, NAX, "
+      "codec, rows of x, N and K, as [min_m, min_k, max_k, min_n, max_n]; "
+      "empty where the qmm_t kernel runs.");
+
+  m.def(
+      "_dequantize_route_takes",
+      &mlx_kquant::dequantize_route_takes,
+      "arch"_a,
+      "nax"_a,
+      "mode"_a,
+      "pinned"_a,
+      "kquant_type"_a,
+      "M"_a,
+      "N"_a,
+      "K"_a,
+      "Whether a plain transposed quantized_matmul on a 2-D weight on a GPU "
+      "stream takes the dequantize route, for an architecture string, NAX, "
+      "the KQ_DEQUANT_ROUTE mode, a pinned KQ_QMM_TILE, codec, rows of x, N "
+      "and K.");
 
   m.def(
       "qmv_fine_max_n",
@@ -562,6 +623,265 @@ NB_MODULE(_ext, m) {
 
         Returns:
             array: same shape and dtype as x.
+      )");
+
+  m.def(
+      "qk_norm_rope",
+      &mlx_kquant::qk_norm_rope,
+      "q"_a,
+      "k"_a,
+      "q_w"_a,
+      "k_w"_a,
+      "cos"_a,
+      "sin"_a,
+      "eps"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Per-head RMSNorm and RoPE of attention q and k in one dispatch:
+        y = rms_norm(x, w, eps) over the head dim, then each interleaved
+        pair (y[2i], y[2i + 1]) rotates by the angle with cosine cos[l, i]
+        and sine sin[l, i]. The output is written in the attention layout,
+        so no transpose copy follows. f32 math with one round at the write.
+
+        q and k are read through their strides, so slices of one fused qkv
+        output need no copy. On the GPU head dims 64, 96, 128 and 256 run
+        the fused kernel; other even head dims and CPU streams run the same
+        math as stock ops. The op is for inference. On the GPU the fused
+        kernel has no gradient or vmap, and mx.grad or mx.vmap through it
+        raises.
+
+        Args:
+            q (array): [B, L, H, D], float16/bfloat16, D even.
+            k (array): same shape and dtype as q.
+            q_w (array): [D] q norm weight, any float dtype.
+            k_w (array): [D] k norm weight, any float dtype.
+            cos (array): [L, D / 2] per-row cosines, any float dtype, shared
+                by the batch.
+            sin (array): [L, D / 2] per-row sines.
+            eps (float): norm epsilon.
+
+        Returns:
+            tuple(array, array): q and k as row-contiguous [B, H, L, D] in
+            the input dtype.
+      )");
+
+  m.def(
+      "quantized_matmul_glu",
+      &mlx_kquant::quantized_matmul_glu,
+      "x"_a,
+      "w_gate"_a,
+      "w_up"_a,
+      "kquant_type"_a,
+      "activation"_a = "silu",
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        GLU product of two quantized matmuls that share x:
+        y = act(x @ Wg^T) * (x @ Wu^T).
+
+        On a NAX GPU, for q4_k, q5_k and q6_k weights and for q8_0 weights
+        on bfloat16, with K a multiple of the codec's K tile (64 for q8_0,
+        128 for the others) and at least 1024 rows, one dispatch computes
+        the product with y as its only buffer. It walks K for the gate
+        weight and stores the activation of that sum in y, then walks K for
+        the up weight and multiplies the stored activation into that sum at
+        the final store. The sums, the activation and the product run in
+        f32, with one rounding of the activation to the dtype of y and one
+        of the product. A float16 store keeps a finite value in the finite
+        half range, and a NaN or an infinity passes. Every other case
+        builds the same product from quantized_matmul and stock ops, which
+        round each matmul to the activation dtype first. mx.grad gives the
+        gradient with respect to x at every row count: the gradient of the
+        fused kernel runs the unfused ops. The weights are frozen, as in
+        quantized_matmul. mx.jvp and mx.vmap raise at every row count.
+
+        Args:
+            x (array): [..., K], float16/bfloat16. float32 runs in bfloat16.
+            w_gate (array): [N, K bytes] uint8 wire bytes, the weight under
+                the activation.
+            w_up (array): same shape and codec as w_gate. The two may be
+                row slices of one wider weight.
+            kquant_type (str): the codec of both weights.
+            activation (str): "silu" or "gelu_tanh".
+
+        Returns:
+            array: [..., N] in the dtype quantized_matmul gives for x.
+      )");
+
+  m.def(
+      "quantized_matmul_lora",
+      [](mx::array x,
+         mx::array w,
+         const std::string& kquant_type,
+         mx::array lora_a,
+         mx::array lora_b,
+         const std::optional<mx::array>& strength,
+         const std::optional<std::vector<std::vector<int>>>& bands,
+         mx::StreamOrDevice s) {
+        std::optional<std::vector<int>> flat;
+        if (bands.has_value()) {
+          flat.emplace();
+          for (const auto& row : *bands) {
+            if (row.size() != 4) {
+              throw std::invalid_argument(
+                  "[mlx_kquant.quantized_matmul_lora] bands must hold rows "
+                  "of (col_start, col_end, z_start, rank).");
+            }
+            flat->insert(flat->end(), row.begin(), row.end());
+          }
+        }
+        return mlx_kquant::quantized_matmul_lora(
+            std::move(x),
+            std::move(w),
+            kquant_type,
+            std::move(lora_a),
+            std::move(lora_b),
+            strength,
+            flat,
+            s);
+      },
+      "x"_a,
+      "w"_a,
+      "kquant_type"_a,
+      "lora_a"_a,
+      "lora_b"_a,
+      nb::kw_only(),
+      "strength"_a = nb::none(),
+      "bands"_a = nb::none(),
+      "stream"_a = nb::none(),
+      R"(
+        Quantized matmul with a low-rank term:
+        y = x @ W^T + (strength * (x @ A)) @ B.
+
+        On a NAX GPU, for q4_k, q5_k, q6_k and q8_0 weights on bfloat16
+        with K up to 4096 and N of at least K, with at least 4096 rows
+        and at most 128 ranks per column (from 1024 rows and at every rank
+        where N is at least 8192), every band starting on a multiple of 64
+        columns and ending on a multiple of 32 columns or at N, at most 16
+        bands and a rank of at most 256 per band (without bands, a rank of
+        at most 256), stock ops compute z = strength * (x @ A) and one
+        dispatch walks the rank for z and B and then K for the weight in
+        the same f32 sums. y is the only
+        output buffer and is rounded once, at the store. KQ_QMM_LORA=2
+        runs the kernel from 1024 rows at every K and N, and 0 turns the
+        kernel off. Every other case builds the same sum from
+        quantized_matmul and stock ops, which round the matmul to the
+        activation dtype before the add. mx.grad gives the gradient with
+        respect to x, lora_a, lora_b and strength at every row count: the
+        gradient of the kernel runs the unfused ops. The weight is frozen,
+        as in quantized_matmul. mx.jvp and mx.vmap run with respect to
+        lora_a, lora_b and strength at every row count. With respect to x
+        both raise "Not implemented for KQuantMatmul" at every row count,
+        since quantized_matmul has neither.
+
+        Several adapters are one call: join their A columns and their B
+        rows, and give one strength per column.
+
+        A function compiled with shapeless=True keeps the path of its
+        trace at every later shape: a trace that ran the kernel runs it
+        below 1024 rows too, and the result is right there. A shapeless
+        function cannot hold a call with bands that builds the unfused
+        ops: that call raises ValueError.
+
+        Args:
+            x (array): [..., K], float16/bfloat16. float32 runs in bfloat16.
+                Fewer than 2^31 rows.
+            w (array): [N, K bytes] uint8 wire bytes. K and N below 2^25.
+            kquant_type (str): the codec of w.
+            lora_a (array): [K, R], any float dtype. R below 2^25.
+            lora_b (array): [R, N], any float dtype.
+            strength (array, optional): the scale of each column of
+                x @ A, in any float dtype: a 0-D array or [1] for one
+                scale, or [R] for one per column. Any other shape raises
+                ValueError. A new value needs no new trace.
+            bands (sequence, optional): rows of (col_start, col_end,
+                z_start, rank), in column order and disjoint. The columns
+                [col_start, col_end) of y take the ranks [z_start, z_start
+                + rank) and that block of lora_b. A column outside every
+                band takes no low-rank term. None (the default): every
+                column takes every rank. An empty sequence: no column
+                takes a rank, and y is quantized_matmul(x, w), bit for
+                bit.
+
+        Returns:
+            array: [..., N] in the dtype quantized_matmul gives for x.
+      )");
+
+  m.def(
+      "conv2d_3x3",
+      &mlx_kquant::conv2d_3x3,
+      "x"_a,
+      "w"_a,
+      nb::kw_only(),
+      "bias"_a = nb::none(),
+      "stream"_a = nb::none(),
+      R"(
+        3x3 convolution, stride 1, padding 1, channels last:
+        y = conv(x, w) + bias, as mx.conv2d(x, w, padding=1) + bias.
+
+        On a NAX GPU, for bfloat16 with C a multiple of 16, from 1024
+        output pixels, one dispatch computes y as an implicit GEMM: f32
+        sums over the 9 taps and C channels, the bias added in f32, one
+        rounding. KQ_CONV_NAX=2 runs the kernel at every pixel count, and
+        0 turns it off. Every other case builds MLX's convolution on the
+        flipped kernel, which takes its implicit GEMM with f32 sums and not
+        its Winograd transform, then a stock add of the bias. mx.grad,
+        mx.jvp and mx.vmap run on that composition.
+
+        Args:
+            x (array): [B, H, W, C], a float dtype. B H W C and B H W O
+                below 2^31 for the kernel.
+            w (array): [O, 3, 3, C] in any float dtype. It runs in the
+                dtype of x.
+            bias (array, optional): [O] in any float dtype.
+
+        Returns:
+            array: [B, H, W, O] in the dtype of x.
+      )");
+
+  m.def(
+      "quantized_matmul_residual",
+      &mlx_kquant::quantized_matmul_residual,
+      "x"_a,
+      "w"_a,
+      "kquant_type"_a,
+      "residual"_a,
+      nb::kw_only(),
+      "gate"_a = nb::none(),
+      "stream"_a = nb::none(),
+      R"(
+        Quantized matmul with a residual epilogue:
+        y = residual + gate * (x @ W^T).
+
+        The residual add of a transformer block after its output
+        projection, with the gate of an adaptive norm where the block has
+        one. On a NAX GPU, for q4_k, q5_k, q6_k and q8_0 weights on
+        bfloat16, from 1024 rows, one dispatch walks K into f32 sums and
+        stores residual + gate * sum, rounded once: the product is never
+        written. KQ_QMM_RESID=2 runs the kernel at every row count, and 0
+        turns it off. Every other case builds the same sum from
+        quantized_matmul and stock ops, which round the product and the
+        gated product to the output dtype before the add. mx.grad gives
+        the gradient with respect to x, residual and gate: the gradient of
+        the kernel runs the unfused ops. The weight is frozen, as in
+        quantized_matmul. mx.jvp and mx.vmap run with respect to residual
+        and gate. With respect to x both raise "Not implemented for
+        KQuantMatmul", since quantized_matmul has neither.
+
+        Args:
+            x (array): [..., K], float16/bfloat16. float32 runs in bfloat16.
+                Fewer than 2^31 rows.
+            w (array): [N, K bytes] uint8 wire bytes. K and N below 2^25.
+            kquant_type (str): the codec of w.
+            residual (array): the output shape, x's shape with N last, in
+                any float dtype. It runs in the output dtype.
+            gate (array, optional): [N], or x's batch dims, then 1, then N
+                (one row per batch), in any float dtype. It runs in the
+                output dtype. None (the default): y = residual + x @ W^T.
+
+        Returns:
+            array: [..., N] in the dtype quantized_matmul gives for x.
       )");
 
   m.def(

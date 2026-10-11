@@ -39,7 +39,7 @@ def test_require_tools_missing(monkeypatch, _no_mlx_lm):
 
 
 def test_require_tools_broken(monkeypatch, _no_mlx_lm):
-    # e.g. transformers 5.13 rejecting mlx-lm's tokenizer registration
+    # e.g. transformers 5.13.0 rejecting mlx-lm's tokenizer registration
     _install_finder(
         monkeypatch, AttributeError("'str' object has no attribute '__module__'")
     )

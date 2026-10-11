@@ -31,6 +31,20 @@
 #define KQ_GLU_ACT_SILU_LIMIT 2
 #define KQ_GLU_ACT_SWIGLU_CLAMP 3
 
+// The clamps of the limited activations, as mx.minimum and mx.clip give
+// them: a NaN passes. min() and clamp() return a bound for a NaN, which
+// would turn a NaN gate or up value into a finite output, so each side is
+// one comparison.
+inline float kq_glu_cap(float g, float limit) {
+  return g > limit ? limit : g;
+}
+
+inline float kq_glu_clip(float u, float limit) {
+  u = u > limit ? limit : u;
+  u = u < -limit ? -limit : u;
+  return u;
+}
+
 template <int ACT>
 inline float
 kq_glu_epilogue(float g, float u, float limit, float alpha = 1.0f) {
@@ -44,8 +58,8 @@ kq_glu_epilogue(float g, float u, float limit, float alpha = 1.0f) {
     // gpt-oss clamped SwiGLU: gate clamped from above only, up clamped both
     // sides, sigmoid slope alpha, and a (u + 1) linear term -- matches the
     // packed kq_moe_glu_gather epilogue (kq_moe_glu.h).
-    g = metal::min(g, limit);
-    u = metal::clamp(u, -limit, limit);
+    g = kq_glu_cap(g, limit);
+    u = kq_glu_clip(u, limit);
     const float sig = 1.0f / (1.0f + metal::exp(-alpha * g));
     return (g * sig) * (u + 1.0f);
   }
@@ -56,8 +70,8 @@ kq_glu_epilogue(float g, float u, float limit, float alpha = 1.0f) {
     // The silu instantiations take the same clamp from a positive run-time
     // limit; the shexp family dispatches silu_limit that way (no _silu_limit
     // shexp kernels). Hosts pass 0 for plain silu.
-    g = metal::min(g, limit);
-    u = metal::clamp(u, -limit, limit);
+    g = kq_glu_cap(g, limit);
+    u = kq_glu_clip(u, limit);
   }
   const float sig = 1.0f / (1.0f + metal::exp(-g));
   return (g * sig) * u;
@@ -1977,12 +1991,14 @@ template <typename T>
 // changes per chunk: the grid entry comes back as half4 pairs (no u64 byte
 // unpack), the activation row is read from a half copy staged once per
 // threadgroup in dynamic threadgroup memory (buffer threadgroup(0), K halves,
-// host-sized), and the four 4-wide dots run in half with a float sum per
-// chunk before the chunk scale. Expert rows only: the shared-expert slot in
-// the shexp / mix kernels keeps the float path over the device activation
-// row, so the shexp numerics are unchanged. Outputs differ from the float
-// kernels at the half rounding level (about 1e-3 relative on the fused GLU
-// output at K=4096, against a bf16 floor near 9e-4).
+// host-sized), and the four 4-wide dots widen both halves to float, so
+// each product and the chunk sum run in float before the chunk scale: a
+// grid code (up to 62) times any half activation stays in range, and only
+// an activation past 65504 turns to inf in the staged row. Expert rows
+// only: the shared-expert slot in the shexp / mix kernels keeps the float
+// path over the device activation row, so the shexp numerics are
+// unchanged. Outputs differ from the float kernels at the half rounding
+// level of the staged activations.
 // ---------------------------------------------------------------------------
 
 #define KQ_EXT_STAGE_LUTS_H(CodecT, name)                               \
@@ -2028,8 +2044,8 @@ METAL_FUNC float kq_ext_row_partial_h(
     KqTgLutsH<Codec>::deq_chunk16h(block, short(ich % chpb), lw, luts, sc);
     const threadgroup half4* xp = xs + ich * 4;
     acc += sc *
-        (float(dot(lw[0], xp[0])) + float(dot(lw[1], xp[1])) +
-         float(dot(lw[2], xp[2])) + float(dot(lw[3], xp[3])));
+        (dot(float4(lw[0]), float4(xp[0])) + dot(float4(lw[1]), float4(xp[1])) +
+         dot(float4(lw[2]), float4(xp[2])) + dot(float4(lw[3]), float4(xp[3])));
   }
   return acc;
 }
@@ -2053,20 +2069,20 @@ METAL_FUNC float2 kq_ext_glu_row_partial_h(
     const int64_t boff = (int64_t)(ich / chpb) * Codec::block_bytes;
     const short cch = short(ich % chpb);
     const threadgroup half4* xp = xs + ich * 4;
-    const half4 a0 = xp[0];
-    const half4 a1 = xp[1];
-    const half4 a2 = xp[2];
-    const half4 a3 = xp[3];
+    const float4 a0 = float4(xp[0]);
+    const float4 a1 = float4(xp[1]);
+    const float4 a2 = float4(xp[2]);
+    const float4 a3 = float4(xp[3]);
     half4x4 lw;
     float sc;
     KqTgLutsH<Codec>::deq_chunk16h(g_row + boff, cch, lw, luts, sc);
     acc.x += sc *
-        (float(dot(lw[0], a0)) + float(dot(lw[1], a1)) + float(dot(lw[2], a2)) +
-         float(dot(lw[3], a3)));
+        (dot(float4(lw[0]), a0) + dot(float4(lw[1]), a1) +
+         dot(float4(lw[2]), a2) + dot(float4(lw[3]), a3));
     KqTgLutsH<Codec>::deq_chunk16h(u_row + boff, cch, lw, luts, sc);
     acc.y += sc *
-        (float(dot(lw[0], a0)) + float(dot(lw[1], a1)) + float(dot(lw[2], a2)) +
-         float(dot(lw[3], a3)));
+        (dot(float4(lw[0]), a0) + dot(float4(lw[1]), a1) +
+         dot(float4(lw[2]), a2) + dot(float4(lw[3]), a3));
   }
   return acc;
 }
@@ -2205,8 +2221,8 @@ template <
 }
 
 // Score-mixed down gather with the shared-expert slot folded in: the routed
-// slots restage their h row per slot (two barriers each) and dot in half;
-// the shared slot stays on the float path.
+// slots restage their h row as half per slot (two barriers each) and dot
+// each chunk in float; the shared slot stays on the float path.
 template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
 [[kernel]] void kq_ext_gather_qmv_mix_h(
     const device uint8_t* w [[buffer(0)]],

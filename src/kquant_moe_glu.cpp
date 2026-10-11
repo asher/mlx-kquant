@@ -108,13 +108,7 @@ inline bool kq_moe_dedup(int T, int max_t) {
     return false;
   }
   static const bool has_env = std::getenv("KQ_MOE_DEDUP") != nullptr;
-  if (has_env) {
-    const char* e = std::getenv("KQ_MOE_DEDUP");
-    if (e != nullptr && std::atoi(e) == 0) {
-      return false;
-    }
-  }
-  return true;
+  return !has_env || kq_env_flag("KQ_MOE_DEDUP", 1) != 0;
 }
 constexpr int KQ_DD_MAX_T = 8;
 
@@ -183,11 +177,8 @@ inline bool kq_moe_sp(int64_t coarse_tgs, int S) {
     return false; // threadgroup is 64 * S threads; 1024 cap => S <= 16
   }
   static const bool has_env = std::getenv("KQ_MOE_SP") != nullptr;
-  if (has_env) {
-    const char* e = std::getenv("KQ_MOE_SP");
-    return e != nullptr && std::atoi(e) != 0;
-  }
-  return coarse_tgs < 2048;
+  const int v = has_env ? kq_env_flag("KQ_MOE_SP", -1) : -1;
+  return v == -1 ? coarse_tgs < 2048 : v != 0;
 }
 
 // Form of a score-mixed down gather (mix and mix_ns) where more than one
@@ -304,11 +295,12 @@ inline std::string kq_gather_stem_nx(const std::string& t, int K, int nx) {
 // float decode is ALU-bound at decode widths (iq2_xs, iq2_xxs, iq3_xxs) run
 // the "_h" kernels, which stage the grid as half4 pairs, stage the
 // activation row as half in dynamic threadgroup memory (K halves), and dot
-// in half with a float sum per 16-weight chunk. Expert slots only; shared
-// experts keep the float path. Read live once set (KQ_MOE_NX pattern) so
-// interleaved in-process A/Bs can flip arms. K is capped so the staged row
-// plus the largest half table (iq2_xs, 8.3 KB) stays inside the 32 KB
-// threadgroup budget.
+// each 16-weight chunk in float. Expert slots only; shared experts keep the
+// float path. Read live once set (KQ_MOE_NX pattern) so interleaved
+// in-process A/Bs can flip arms. K is capped so the staged row plus the
+// largest half table (iq2_xs, 8.3 KB) stays inside the 32 KB threadgroup
+// budget. An activation past the half range (65504) turns to inf in the
+// staged row.
 inline bool kq_moe_half(const std::string& codec, int K) {
   static const bool has_env = std::getenv("KQ_MOE_HALF") != nullptr;
   if (!has_env) {
@@ -346,17 +338,38 @@ inline int kq_moe_pick_sg_h(int N, int nx) {
 
 inline bool kq_gather_fine(int64_t coarse_tgs) {
   static const bool has_env = std::getenv("KQ_GATHER_FINE") != nullptr;
-  if (has_env) {
-    const char* e = std::getenv("KQ_GATHER_FINE");
-    const int v = e == nullptr ? -1 : std::atoi(e);
-    if (v == 0) {
-      return false;
-    }
-    if (v == 1) {
-      return true;
-    }
+  const int v = has_env ? kq_env_flag("KQ_GATHER_FINE", -1) : -1;
+  return v == -1 ? coarse_tgs < 2048 : v != 0;
+}
+
+// Layout of the operands the MoE kernels read without strides. An
+// unevaluated view reports the default dense strides to an op builder, so
+// the builders decide only for an operand that has memory, and each eval
+// decides for the rest before it binds a buffer.
+//
+// The kernels find expert e of a stack at e * N * bytes_per_row and read a
+// shared-expert tensor as dense rows. A stack is too large to copy on a
+// call, so a stack or a shared-expert tensor that is not row-major is
+// refused, with the builder's message.
+inline std::string moe_op(const char* name) {
+  return std::string("[mlx_kquant.") + name + "]";
+}
+
+inline void moe_check_stack(const char* name, const mx::array& w) {
+  kq_check_row_major(w, moe_op(name) + " weights");
+}
+
+inline void moe_check_shexp(const char* name, const mx::array& w) {
+  kq_check_row_major(w, moe_op(name) + " shared-expert weights");
+}
+
+// The packed-mxfp4 stacks carry a companion scales tensor.
+inline void
+moe_check_stack(const char* name, const mx::array& w, const mx::array& sc) {
+  if (!w.flags().row_contiguous || !sc.flags().row_contiguous) {
+    throw std::invalid_argument(
+        moe_op(name) + " weights/scales must be row-contiguous.");
   }
-  return coarse_tgs < 2048;
 }
 
 } // namespace
@@ -369,7 +382,6 @@ void KQuantMoEGLU::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
-  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   const auto& gw = inputs[0];
   const auto& gs = inputs[1];
@@ -377,8 +389,12 @@ void KQuantMoEGLU::eval_gpu(
   const auto& uw = inputs[3];
   const auto& us = inputs[4];
   const auto& ub = inputs[5];
-  const auto& x = inputs[6];
   const auto& indices = inputs[7];
+  moe_check_stack("moe_glu_gather", gw, gs);
+  moe_check_stack("moe_glu_gather", uw, us);
+  // x is read as dense rows: a view with other strides is copied first.
+  const mx::array x = kq_row_major_gpu(inputs[6], s);
+  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = indices.shape(0);
   int R = indices.shape(1);
@@ -416,13 +432,14 @@ void KQuantGatherQMVBias::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
-  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   const auto& w = inputs[0];
   const auto& sc = inputs[1];
   const auto& b = inputs[2];
-  const auto& x = inputs[3];
   const auto& indices = inputs[4];
+  moe_check_stack("gather_qmv_bias", w, sc);
+  const mx::array x = kq_row_major_gpu(inputs[3], s);
+  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = indices.shape(0);
   int R = indices.shape(1);
@@ -455,14 +472,15 @@ void KQuantGatherQMVMixBias::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
-  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   const auto& w = inputs[0];
   const auto& sc = inputs[1];
   const auto& b = inputs[2];
-  const auto& x = inputs[3];
   const auto& indices = inputs[4];
   const auto& scores = inputs[5];
+  moe_check_stack("gather_qmv_mix_bias", w, sc);
+  const mx::array x = kq_row_major_gpu(inputs[3], s);
+  out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = indices.shape(0);
   int S = indices.shape(1);
@@ -502,10 +520,12 @@ void KQuantMoEGLUKQ::eval_gpu(
   const bool biased = inputs.size() == 6;
   const auto& gw = inputs[0];
   const auto& uw = inputs[1];
-  const auto& x = inputs[biased ? 4 : 2];
   const auto& indices = inputs.back();
+  moe_check_stack("moe_glu_gather_kq", gw);
+  moe_check_stack("moe_glu_gather_kq", uw);
   kq_check_weight_base(gw, kquant_type_, "moe_glu_gather_kq");
   kq_check_weight_base(uw, kquant_type_, "moe_glu_gather_kq");
+  const mx::array x = kq_row_major_gpu(inputs[biased ? 4 : 2], s);
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = indices.shape(0);
@@ -574,9 +594,10 @@ void KQuantGatherQMVKQ::eval_gpu(
   const size_t n_base = inputs.size() - kq_lora_input_count(lora_flags_);
   const bool biased = n_base == 4;
   const auto& w = inputs[0];
-  const auto& x = inputs[biased ? 2 : 1];
   const auto& indices = inputs[n_base - 1];
+  moe_check_stack("gather_qmv_kq", w);
   kq_check_weight_base(w, kquant_type_, "gather_qmv_kq");
+  const mx::array x = kq_row_major_gpu(inputs[biased ? 2 : 1], s);
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = indices.shape(0);
@@ -649,12 +670,16 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   const auto& uw = inputs[1];
   const auto& sgw = inputs[2];
   const auto& suw = inputs[3];
-  const auto& x = inputs[4];
   const auto& indices = inputs[5];
+  moe_check_stack("moe_glu_gather_shexp_kq", gw);
+  moe_check_stack("moe_glu_gather_shexp_kq", uw);
+  moe_check_shexp("moe_glu_gather_shexp_kq", sgw);
+  moe_check_shexp("moe_glu_gather_shexp_kq", suw);
   kq_check_weight_base(gw, kquant_type_, "moe_glu_gather_shexp_kq");
   kq_check_weight_base(uw, kquant_type_, "moe_glu_gather_shexp_kq");
   kq_check_weight_base(sgw, shexp_type_, "moe_glu_gather_shexp_kq");
   kq_check_weight_base(suw, shexp_up_type_, "moe_glu_gather_shexp_kq");
+  const mx::array x = kq_row_major_gpu(inputs[4], s);
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = indices.shape(0);
@@ -749,11 +774,13 @@ void KQuantGatherQMVMixKQ::eval_gpu(
 
   const auto& w = inputs[0];
   const auto& sw = inputs[1];
-  const auto& x = inputs[2];
   const auto& indices = inputs[3];
   const auto& scores = inputs[4];
+  moe_check_stack("gather_qmv_mix_kq", w);
+  moe_check_shexp("gather_qmv_mix_kq", sw);
   kq_check_weight_base(w, kquant_type_, "gather_qmv_mix_kq");
   kq_check_weight_base(sw, shexp_type_, "gather_qmv_mix_kq");
+  const mx::array x = kq_row_major_gpu(inputs[2], s);
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = x.shape(0);
@@ -882,10 +909,11 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   auto& out = outputs[0];
 
   const auto& w = inputs[0];
-  const auto& x = inputs[1];
   const auto& indices = inputs[2];
   const auto& scores = inputs[3];
+  moe_check_stack("gather_qmv_mix_ns_kq", w);
   kq_check_weight_base(w, kquant_type_, "gather_qmv_mix_ns_kq");
+  const mx::array x = kq_row_major_gpu(inputs[1], s);
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = x.shape(0);
@@ -978,10 +1006,12 @@ void KQuantMoERouterTopK::eval_gpu(
   auto& d = mx::metal::device(s.device);
   auto& indices = outputs[0];
   auto& scores = outputs[1];
+  // The kernel reads logits as dense rows: a view with other strides is
+  // copied first.
+  const mx::array logits = kq_row_major_gpu(inputs[0], s);
   indices.set_data(mx::allocator::malloc(indices.nbytes()));
   scores.set_data(mx::allocator::malloc(scores.nbytes()));
 
-  const auto& logits = inputs[0];
   int SHARED = shared_ ? 1 : 0;
   int HAS_PES = has_pes_ ? 1 : 0;
   int HAS_BIAS = has_bias_ ? 1 : 0;
@@ -992,8 +1022,8 @@ void KQuantMoERouterTopK::eval_gpu(
   int R = top_k_;
   int NORM = norm_ ? 1 : 0;
   // pes/bias must be bound buffers even when unused; logits stands in.
-  const auto& pes = has_pes_ ? inputs[1] : inputs[0];
-  const auto& bias = has_bias_ ? inputs[1 + (has_pes_ ? 1 : 0)] : inputs[0];
+  const auto& pes = has_pes_ ? inputs[1] : logits;
+  const auto& bias = has_bias_ ? inputs[1 + (has_pes_ ? 1 : 0)] : logits;
 
   std::string kname = "kq_moe_router_topk_" + kq_type_string(logits.dtype());
   auto kernel = kq_get_kernel(d, kname);
@@ -1338,7 +1368,9 @@ void check_expert_stack(
     throw std::invalid_argument(
         std::string(op) + " K must be a multiple of 32.");
   }
-  if (!w.flags().row_contiguous || !sc.flags().row_contiguous) {
+  // An operand without memory is checked at eval.
+  if ((kq_has_layout(w) && !w.flags().row_contiguous) ||
+      (kq_has_layout(sc) && !sc.flags().row_contiguous)) {
     throw std::invalid_argument(
         std::string(op) + " weights/scales must be row-contiguous.");
   }
@@ -1346,6 +1378,18 @@ void check_expert_stack(
 
 mx::array prep_bias(const mx::array& b, mx::StreamOrDevice s) {
   return mx::contiguous(mx::astype(b, mx::float32, s), false, s);
+}
+
+// x or router logits for a kernel that reads dense rows. An array with
+// memory is copied here when it is not row-major. An array without memory
+// reports the default dense strides, so it goes in as it is and the eval
+// decides (kq_row_major_gpu): x is unevaluated on nearly every call, and a
+// node here would cost every one of them.
+mx::array moe_dense_x(const mx::array& x, mx::StreamOrDevice s) {
+  if (kq_has_layout(x) && !x.flags().row_contiguous) {
+    return mx::contiguous(x, false, s);
+  }
+  return x;
 }
 
 mx::array prep_indices(const mx::array& idx, mx::StreamOrDevice s) {
@@ -1384,9 +1428,9 @@ void check_kq_expert_stack(
     throw std::invalid_argument(
         std::string(op) + " N must be a multiple of 8.");
   }
-  if (!w.flags().row_contiguous) {
-    throw std::invalid_argument(
-        std::string(op) + " weights must be row-contiguous.");
+  // A stack without memory is checked at eval.
+  if (kq_has_layout(w)) {
+    kq_check_row_major(w, std::string(op) + " weights");
   }
 }
 
@@ -1416,9 +1460,9 @@ void check_kq_shexp_row(
         std::string(op) +
         " shared-expert weights must match the expert stack row shape.");
   }
-  if (!w.flags().row_contiguous) {
-    throw std::invalid_argument(
-        std::string(op) + " shared-expert weights must be row-contiguous.");
+  // A tensor without memory is checked at eval.
+  if (kq_has_layout(w)) {
+    kq_check_row_major(w, std::string(op) + " shared-expert weights");
   }
 }
 
@@ -1464,7 +1508,7 @@ mx::array moe_glu_gather(
         "[mlx_kquant.moe_glu_gather] gate/up expert shapes must match.");
   }
 
-  auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  auto x_c = moe_dense_x(x, s);
   mx::Shape out_shape = {x.shape(0), indices.shape(1), gate_w.shape(1)};
   return mx::array(
       std::move(out_shape),
@@ -1505,7 +1549,7 @@ mx::array gather_qmv_bias(
   int K = x.shape(2);
   check_expert_stack("[mlx_kquant.gather_qmv_bias]", w, scales, bias, K);
 
-  auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  auto x_c = moe_dense_x(x, s);
   mx::Shape out_shape = {x.shape(0), x.shape(1), w.shape(1)};
   return mx::array(
       std::move(out_shape),
@@ -1548,7 +1592,7 @@ mx::array gather_qmv_mix_bias(
   int K = x.shape(2);
   check_expert_stack(op, w, scales, bias, K);
 
-  auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  auto x_c = moe_dense_x(x, s);
   mx::Shape out_shape = {x.shape(0), w.shape(1)};
   return mx::array(
       std::move(out_shape),
@@ -1637,7 +1681,7 @@ mx::array moe_glu_gather_kq(
     }
   }
 
-  auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  auto x_c = moe_dense_x(x, s);
   mx::Shape out_shape = {x.shape(0), indices.shape(1), gate_w.shape(1)};
   std::vector<mx::array> op_inputs = {std::move(gate_w), std::move(up_w)};
   if (biased) {
@@ -1702,7 +1746,7 @@ mx::array gather_qmv_kq(
     }
   }
 
-  auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  auto x_c = moe_dense_x(x, s);
   const int E = w.shape(0);
   const int N = w.shape(1);
   mx::Shape out_shape = {x.shape(0), x.shape(1), N};
@@ -1797,7 +1841,7 @@ mx::array moe_glu_gather_shexp_kq(
   check_kq_shexp_row(op, shexp_gate_w, shexp_type, K, N);
   check_kq_shexp_row(op, shexp_up_w, shexp_up_type, K, N);
 
-  auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  auto x_c = moe_dense_x(x, s);
   mx::Shape out_shape = {x.shape(0), indices.shape(1) + 1, N};
   kq_check_weight_base_at_build(
       gate_w, kquant_type, s, "moe_glu_gather_shexp_kq");
@@ -1866,7 +1910,7 @@ mx::array gather_qmv_mix_kq(
   check_kq_expert_stack(op, w, kquant_type, K);
   check_kq_shexp_row(op, shexp_w, shexp_type, K, w.shape(1));
 
-  auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  auto x_c = moe_dense_x(x, s);
   mx::Shape out_shape = {x.shape(0), w.shape(1)};
   kq_check_weight_base_at_build(w, kquant_type, s, "gather_qmv_mix_kq");
   kq_check_weight_base_at_build(shexp_w, shexp_type, s, "gather_qmv_mix_kq");
@@ -1916,7 +1960,7 @@ mx::array gather_qmv_mix_ns_kq(
   check_kq_expert_stack(op, w, kquant_type, K);
   kq_check_weight_base_at_build(w, kquant_type, s, "gather_qmv_mix_ns_kq");
 
-  auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  auto x_c = moe_dense_x(x, s);
   const int E = w.shape(0);
   const int N = w.shape(1);
   mx::Shape out_shape = {x.shape(0), N};
@@ -1997,8 +2041,7 @@ std::vector<mx::array> moe_router_topk(
     throw std::invalid_argument(std::string(op) + " requires E <= 1024.");
   }
 
-  auto l_c =
-      logits.flags().row_contiguous ? logits : mx::contiguous(logits, false, s);
+  auto l_c = moe_dense_x(logits, s);
   int T = l_c.shape(0);
   std::vector<mx::array> inputs = {std::move(l_c)};
   if (per_expert_scale.has_value()) {

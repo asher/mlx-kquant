@@ -12,6 +12,7 @@
 
 #include <cstdlib>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -198,14 +199,15 @@ inline int verify_qmv_max_rows() {
 }
 
 // Codecs with a register-resident MMA verify kernel (kq_verify_mma.h) and
-// the output rows one of its threadgroups covers (8 simdgroups of 8 rows
-// per row tile); 0 for codecs without the kernel. M <= 8 only.
+// the output rows one of its threadgroups covers: 8 simdgroups of 8-row
+// tiles, two tiles each for q4_0 and q8_0 and one for pq2_0, q2_0 and
+// ptq1_0; 0 for codecs without the kernel. M <= 8 only.
 inline int codec_verify_mma_rows(const std::string& kquant_type) {
-  if (kquant_type == "pq2_0" || kquant_type == "q2_0" ||
-      kquant_type == "q4_0" || kquant_type == "q8_0") {
+  if (kquant_type == "q4_0" || kquant_type == "q8_0") {
     return 128;
   }
-  if (kquant_type == "ptq1_0") {
+  if (kquant_type == "pq2_0" || kquant_type == "q2_0" ||
+      kquant_type == "ptq1_0") {
     return 64;
   }
   return 0;
@@ -399,6 +401,30 @@ inline MTL::ComputePipelineState* kq_get_kernel(
     const std::string& kname) {
   static MTL::Library* lib = d.get_library("mlx_kquant", metallib_dir());
   return d.get_kernel(kname, lib);
+}
+
+// True when the bundled metallib carries a function named kname. Looks the
+// name up without building a pipeline, so a tile override can raise with
+// the kernel name before any dispatch.
+inline bool kq_has_kernel(Device& d, const std::string& kname) {
+  static MTL::Library* lib = d.get_library("mlx_kquant", metallib_dir());
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  auto fn = NS::TransferPtr(lib->newFunction(
+      NS::String::string(kname.c_str(), NS::UTF8StringEncoding)));
+  return fn.get() != nullptr;
+}
+
+// Raises when a lever setting selects a kernel the metallib does not carry,
+// naming the setting and the kernel.
+inline void kq_require_kernel(
+    Device& d,
+    const std::string& setting,
+    const std::string& kname) {
+  if (!kq_has_kernel(d, kname)) {
+    throw std::invalid_argument(
+        "[mlx_kquant] " + setting + " selects kernel " + kname +
+        ", which is not instantiated.");
+  }
 }
 
 // Func-constant variant for kernels specialized via an MTLFCList.

@@ -102,7 +102,10 @@ void KQDsaSparseAttention::eval_gpu(
   // memory (two threadgroups per core) plus finer live-arm buckets win there;
   // dense 512-entry lists keep the 256-wide tile (fewer per-tile softmax
   // rescales / selected[] builds). KQ_DSA_BK=128/256 overrides for tuning.
-  static const char* bk_env = std::getenv("KQ_DSA_BK");
+  static const char* bk_env = [] {
+    const char* e = std::getenv("KQ_DSA_BK");
+    return e != nullptr && e[0] != '\0' ? e : nullptr;
+  }();
   const std::string bk_tag = bk_env
       ? ((std::string(bk_env) == "128") ? "bk128" : "bk256")
       : ((topkN <= 128) ? "bk128" : "bk256");

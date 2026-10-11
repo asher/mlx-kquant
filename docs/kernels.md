@@ -63,12 +63,63 @@ output width N. Per-row qmv serves M 2 up to a per-codec limit, the mat-vec path
 from a per-codec entry through M 32. From M 33 to 128, split-K also takes the calls where the
 BM=64 grid wastes the GPU, as described below. Elsewhere above M 32 the BM=64 tile runs, with a
 double-buffered `_db` variant on the M 33-64 band at large N, and a BM=128 tile from M 193 when
-ceil(M/64) is even. Above
+ceil(M/64) is even. The k-quants `q3_k` to `q6_k`, the flat block codecs `q4_0`, `q4_1` and `q5_0`,
+and `iq4_nl`, `iq3_xxs`, `iq3_s`, `iq2_xs` and `iq2_s` run the BM=64 and BM=128 tiles on a K tile
+of 128 (the `_BK128` levers). Above
 the qmv limit, the verify kernels take the widths through M 8 on the codecs that have them. The
 NAX verify kernel serves `pq2_0`, `q4_0`, `q8_0` and `q2_k` to `q6_k` from a per-codec entry,
 and the register-resident MMA verify kernel serves `ptq1_0`, as described at the end of this
 section. Every limit and floor is a measured per-codec policy (`kq_nax_small_m` and
 `kq_smallbm_policy` in `src/kquant_matmul.cpp`).
+
+On GPUs without NAX, the `qmm_t` kernel decodes each weight tile inside its K loop, once for every
+64-row tile of the activations. From a floor in rows it is faster to decode the whole weight once
+with `kq.dequantize` and run the stock matmul. A transposed `quantized_matmul` on a 2-D weight takes
+that route on the GPUs without NAX before M5 when its codec has a row below, its rows of x reach the
+floor (a batch counts all of its rows), K is from 3840 to 12288 and N from 3840 to 24576
+(`kDequantizeRows` in `src/kquant_ops.cpp`). Those GPUs are the ones whose architecture string is
+`applegpu_g<gen><suffix>` with a generation from 13 to 16 (M1 to M4) and a suffix other than `p`
+(phones), without NAX. Any other string keeps the kernel, as do NAX GPUs, CPU streams, calls with the
+LoRA epilogue arguments, a 3-D weight, `transpose=False` and every call while `KQ_QMM_TILE` is set.
+`gather_qmm` without indices on a 2-D weight is the plain call and takes the route.
+`quantized_matmul_glu`, `quantized_matmul_lora` and `quantized_matmul_residual` build their
+products from `quantized_matmul` on these GPUs, so they take it too.
+
+| codecs | rows from | K | N |
+|---|---|---|---|
+| `q3_k`, `q5_k`, `q6_k`, `nvfp4`, `ptq1_0` | 2048 | 3840 to 12288 | 3840 to 24576 |
+| `q4_k` | 16384 | 3840 to 12288 | 3840 to 24576 |
+
+The route holds a copy of the weight in the activation dtype while the call runs, N x K x 2 bytes
+per call, at most 604 MB at 24576 x 12288; the range keeps a vocabulary head on the kernel. Each
+routed call holds its copy until its command buffer completes, so consecutive routed layers can each
+hold one at the same time.
+`quantized_matmul_glu` builds its product from two calls on these GPUs, so it holds two copies, up
+to about 1.2 GB. The gradient wrt x runs the quantized matmul the other way, as on the kernel path,
+so a backward pass holds no dense copy, and a gradient wrt the weight or the scales raises as it
+does there. The choice is made when the op builds its graph, so a
+function compiled with `shapeless=True` keeps the choice of its trace at other row counts. On the
+output elements above 1% of the root mean square of a float64 reference, the route is within 1 ulp
+of the kernel in bfloat16 and within 2 ulp in float16, and its error against that reference is
+within 1% of the kernel's. Nearer zero, where the terms of a sum cancel, the two summation orders
+differ by more ulp.
+
+The rows and the range were measured on M3 Max (`applegpu_g15s`, 40 GPU cores), and the other GPUs
+of the class take them unmeasured. Measured with `benchmarks/bench_dit_shapes.py` over the seven
+Z-Image and Qwen-Image linears at 2048, 4128 and 16416 rows, batch 1 and 2, bfloat16 and float16,
+against an A versus A arm that stays within 0.98-1.02 per step: the kernel takes 1.49-1.63x the
+route's time per step on `nvfp4`, 1.06-1.14x on `ptq1_0`, 1.03-1.12x on `q3_k` and `q6_k`,
+1.01-1.10x on `q5_k` (1.01-1.03x at 2048 rows) and 1.02-1.05x on `q4_k` from its floor. No linear
+runs slower outside the A versus A range, and the route takes 0.96-1.07x the time of the stock
+matmul on unquantized weights.
+
+The decode pass runs at 1.0-1.15x the time of a copy of its output and costs the same at any row
+count, so the route loses below its floor: at 128 rows it takes 1.4-1.9x the kernel's time. On the
+other codecs the route measured inside the noise of an A versus A arm at 2048 to 16416 rows, and on
+`q8_0` it gains 1-4% of a step, also inside it; they keep the kernel. A larger kernel tile does not
+help on this chip: five tiles of 128 rows or columns ran 0.98-1.27x the time of bm64 bn64 per cell
+at 4128 rows, slower on 51 of 56 cells of the two closest, against an A versus A range of
+0.98-1.03.
 
 Per-row qmv reads the weight once per activation row, the later rows from the cache, and its grid
 grows with M. It holds widest where the mat-vec grids are too small to fill the GPU, so its limit
@@ -108,11 +159,33 @@ than the BM=64 tile when each shape is weighted by its calls in a forward of a 2
 and no cell runs more than 2% slower. Whole forwards of that model run 19-22% faster at 33 to 64
 rows and 17% faster at 80 and 96. `KQ_QMM_MIDM=0` keeps the BM=64 tile.
 
+With float partials (the float16 default, and `KQ_SPLITK_F32=1`), `q4_0` and `q8_0` target 10 slices
+from M 33 to 64, and from M 65 to 96 they target 5 up to K 5120 and 8 above. They cut K in units of
+64 weights, so at K 5120 the targets of 16 and 8 write 16 or 8 partials where the 256-weight codecs
+write 10 or 5, and a float partial is twice the size of a bfloat16 one. On M5 Max over the eight
+projection shapes on float16 activations, each cell of shape and M takes 0.79-1.01x the time of a
+target of 16 from M 33 to 64, and 0.67-1.02x the time of 16 or 8 from M 65 to 96 at K 5120. Above
+K 5120 a target of 5 leaves 4 slices of the 96 or 272 units, so the target there stays 8. Those
+cells take 0.88-0.97x the time of 4 slices, and 0.99-1.02x at K 6144 and M 96. Weighted by calls per
+forward, M 65 to 96 run 0.96-0.99x the time of a target of 5 at every K. The K threshold was
+measured at K 5120, 6144 and 17408 only.
+The rule keys on the partials, so bfloat16 with `KQ_SPLITK_F32=1` takes these targets too, though
+they were not measured there. bfloat16 on its default bfloat16 partials keeps 16 and 8.
+
 The NAX split-K route cuts K into units of max(block, 64) weights and targets 16 slices of whole
 units. It takes the largest count at or under the target that divides the units evenly, unless
 equal slices with a shorter last one give more than twice as many. This covers inner dimensions
 whose unit count has no divisor near 16, such as 11008, 17408 and 18944 on the 256-weight codecs.
 `KQ_SPLITK_RAGGED=2` takes the ragged count wherever it is larger.
+
+At M 32 and below, a call whose BM=32 grid already holds 16 threadgroups per GPU core, such as a
+vocab head, takes one slice where the call without the split runs the same BM=32 tile. `q6_k` and
+`iq2_xxs` below M 32 and `q8_0` below M 13 keep the target of 16 there, as do calls that would
+leave the BM=32 tile for an mv route or the BM=64 tile. Below a full grid, `q4_0` and `q8_0` on
+float partials hold the split grid to 16 threadgroups per core, except `q8_0` below M 13. On
+M5 Max, against a target of 16 at N 49152, 151936 and 248320 and M 9 to 32, the single slice runs
+0.68-1.05x the time, and summed over a forward pass, weighted by the calls per shape, no codec
+runs slower. The float-partial cap runs 0.75-1.02x at N 5120 to 17408.
 
 Measured on M5 Max at M 8 to 24 with the weights streamed from DRAM, the shorter last slice runs
 `q4_k` 1.1x faster at 5120x17408, 1.5x at 3584x18944, 2x at 4096x11008 and 4-5x at 896x4864. The
@@ -143,17 +216,97 @@ the two kernels are within 3% of each other on every shape measured.
 
 Tuning levers (defaults are right for normal use):
 
+- `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
+  `KQ_NAX_BM128_ODD_M`, `KQ_NAX_DB64`, the `_BK128` levers, `KQ_NAX_SWIZZLE`), the tile overrides
+  (`KQ_NAX_TILE`, `KQ_QMM_TILE`, `KQ_CONV_TILE`), `KQ_SPLITK_F32` and `KQ_QMM_LOG` read their
+  variables on every dispatch, so one process can switch tiles between calls on one resident copy of
+  the weights; `benchmarks/bench_dit_shapes.py` runs its tile arms this way. It reads the
+  environment on every dispatch, so it is for single-threaded A/B runs that set these variables
+  between calls. The `quantized_matmul_glu` levers (`KQ_GLU`, `KQ_GLU_MIN_ROWS`), the
+  `quantized_matmul_lora` levers (`KQ_QMM_LORA`, `KQ_QMM_LORA_MIN_ROWS`), the
+  `quantized_matmul_residual` lever (`KQ_QMM_RESID`), the dequantize route lever
+  (`KQ_DEQUANT_ROUTE`) and the `conv2d_3x3` lever (`KQ_CONV_NAX`) are
+  read when the op is called and builds its graph, not when a kernel is dispatched, so a compiled
+  function keeps the kernel choice of its trace. Unset (off) by default, and then each of them keeps
+  its first read for the life of the process. Read once per process.
+- `KQ_NAX_TILE` - `bm,bn,wm,wn` pins the NAX `qmm_t` tile of every transpose call that reaches it,
+  in place of the BM=32, BM=64 and BM=128 policy. BK stays 64, except where a `_BK128` lever sets
+  it. The `_db` variant still follows `KQ_NAX_DB64` on the bm64 bn64 wm2 wn2 tile. A tile the
+  metallib does not carry raises a `ValueError` that names the missing kernel, and
+  `kq.metallib_kernels()` lists the ones it carries. Unset (off) by default. Read once per process
+  unless `KQ_TUNE_LIVE=1`.
+- `KQ_QMM_TILE` - the same override for the `qmm_t` tile on the path without NAX (GPUs without
+  NAX, `KQ_DISABLE_NAX=1`, or a codec or shape the NAX tile does not serve). The metallib
+  carries only the shipped tile, so `64,64,2,2` is the one value that runs today; it keeps its
+  plain kernel name. Any other tile is looked up under a name that carries
+  `_bm<bm>_bn<bn>_wm<wm>_wn<wn>` before `_alN` and raises until such a kernel is built. Set, it
+  also keeps calls on the kernel where the dequantize route would take them (see above), and that
+  choice is read when the op builds its graph. Unset (off) by default. Read once per process
+  unless `KQ_TUNE_LIVE=1`.
+- `KQ_DEQUANT_ROUTE` - `auto` runs the dequantize route described above on the GPUs it is for,
+  `off` keeps the `qmm_t` kernel on every GPU, and `force` runs the route on any GPU, NAX GPUs
+  included, for the codecs, rows and range of its table, so that tests run its code on any
+  machine. Any other value warns once and reads as `auto`. `auto` by default. Read when the op
+  builds its graph, once per process unless `KQ_TUNE_LIVE=1`.
+- `KQ_QMM_LOG` - set to any value, logs the kernel name, shape and grid of every NAX and ALU qmm
+  tile dispatch, every split-K dispatch, every `verify_mma` and `verify_nax` dispatch, split or not,
+  and every fused `quantized_matmul_glu`, `quantized_matmul_lora` and `quantized_matmul_residual`
+  dispatch, and every `conv2d_3x3` dispatch to stderr, one `[kq qmm]` line each. The grid depth is
+  the K slice count. A call that takes the dequantize route logs one
+  `[kq dequant] <codec> M=<rows> N=<n> K=<k>` line when the op builds its graph. The mat-vec
+  routes (`qmv`, `verify_qmv`, `mv_ext`) do not log. Unset (off) by default. Read once per process
+  unless `KQ_TUNE_LIVE=1`.
+- `KQ_SPLITK_F32` - partial dtype of the split-K routes (`splitk`, `nax_splitk`, the
+  `KQ_QMM_MIDM` band, and `verify_mma` and `verify_nax` when they split K). Float partials let the
+  fold round the result once, as the unsplit kernels do. Partials in the activation dtype round
+  each slice once more before the fold, and where one K slice carries most of an output, that puts
+  the split result more than one output rounding from the unsplit one. On float16 they also stop at
+  65504, so a slice sum past it turns to inf even where the output is finite. Unset, float16
+  activations store float partials and bfloat16 activations keep the previous bfloat16 partials.
+  `1` stores float partials on both, and `0` stores partials in the activation dtype on both.
+  `true`, `on` and `yes` read as `1`, and `false`, `off` and `no` as `0`. An empty value reads as
+  unset, and any other value reads as unset with a warning on stderr. Read once per process unless
+  `KQ_TUNE_LIVE=1`.
 - `KQ_NAX_SMALL_BM` - small-M routing. `0` restores the old routing (mat-vec paths below M 13 and
   no BM=32 tile), `2` forces BM=32 for policy-excluded codecs, unset or `1` follows the per-codec
-  policy.
+  policy. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_NAX_BM128` - BM=128 band. `0` off, `1` forces the floor to M 193 for every codec, `2` drops
   the floor entirely (any even ceil(M/64), probing the M65-128 wash band), unset follows the
   per-codec entry floors (193/449/961 tiers, measured on M5 Max by
-  `benchmarks/bench_qmm_bm128_ab.py`; re-run it before trusting them on new silicon).
+  `benchmarks/bench_qmm_bm128_ab.py`; re-run it before trusting them on new silicon). Read once
+  per process unless `KQ_TUNE_LIVE=1`.
+- `KQ_NAX_BM128_ODD_M` - the M from which the BM=128 band also takes an odd ceil(M/64), whose last
+  row tile holds 64 rows or fewer. There the simdgroup row with no row below M skips its
+  activation loads, matrix work and store, so that tile does the loads and matrix work of one
+  BM=64 tile. Unset, the codec's large-M row sets it (see below). `0` keeps the even ceil(M/64)
+  rule at every M, the policy before this lever, and turns off the large-M rows with their K
+  ceiling, so BM=128 also runs above the ceiling at an even ceil(M/64). Read once per process
+  unless `KQ_TUNE_LIVE=1`.
 - `KQ_NAX_DB64` - double-buffered M 33-64 band. `0` off, `1` drops the N floor, unset follows the
   per-codec N floors. Only the five policy-enabled codecs (q6_k, q8_0, q4_1, q5_1, q5_0) carry
   `_db` instantiations, so `1` is bounded by availability; probing another codec needs its
-  instantiation restored and a metallib rebuild.
+  instantiation restored and a metallib rebuild. Read once per process unless `KQ_TUNE_LIVE=1`.
+- `KQ_NAX_<codec>_BK128` (`KQ_NAX_Q6K_BK128`, `KQ_NAX_Q5K_BK128`, `KQ_NAX_Q4K_BK128`,
+  `KQ_NAX_Q3K_BK128`, `KQ_NAX_Q4_0_BK128`, `KQ_NAX_Q4_1_BK128`, `KQ_NAX_Q5_0_BK128`,
+  `KQ_NAX_IQ4_NL_BK128`, `KQ_NAX_IQ3_XXS_BK128`, `KQ_NAX_IQ3_S_BK128`, `KQ_NAX_IQ2_XS_BK128`,
+  `KQ_NAX_IQ2_S_BK128`) - K tile of the codec on the BM=64 and BM=128 tiles. Unset or `1`, the tile
+  walks K 128 weights per step. On the k-quants it takes one half of a super-block per step, and
+  each thread reads its code bytes once, where BK=64 reads them on two or four steps. On the other
+  codecs two BK=64 loaders fill the tile, which halves the barriers per K, and a 32-weight block
+  codec needs K % 128 == 0. The output is bit-identical. On an M5 Max, per cell against BK=64 on
+  bfloat16 and float16 activations, on the BM=128 tile at diffusion model shapes (M 4096 and 4608, N
+  and K 3840 to 24576): `q6_k` 0.87-0.96x the time, `q5_k` 0.93-1.00x, `q3_k` 0.92-1.03x. On the
+  BM=64 tile from M 128 to 2112 at N and K 3840 to 17408: `q6_k` 0.79-1.01x, `q5_k` 0.89-1.00x,
+  `q3_k` 0.88-1.00x, except on grids of 240 threadgroups (N 5120 at M 160 and 192), where `q5_k`
+  takes 1.06-1.17x and `q3_k` 1.01-1.06x, and of 480 (N 10240 at M 160 and 192), where `q5_k` takes
+  1.02-1.06x. No threshold on threadgroups per core, K or M removes these at a lower total time. At
+  the diffusion model rows (M 4128 to 16896 at N and K 3840 to 12288, bfloat16 and float16, with the
+  K ceilings below), against an A/A spread of 0.98-1.03x: `q4_k` 0.95-1.00x, `q4_0` 0.97-1.01x,
+  `q4_1` 0.97-1.03x, `q5_0` 0.96-1.01x, `iq4_nl` 0.93-1.00x, `iq3_xxs` 0.93-1.02x, `iq3_s`
+  0.92-1.03x, `iq2_xs` and `iq2_s` 0.95-1.01x. `q8_0`, `q5_1`, `iq4_xs`, `iq1_m` and `iq1_s` took
+  1.01-1.06x at some of those cells and `iq2_xxs` 1.04-1.07x at all of them, so they keep BK=64 and
+  carry no `_bk128` kernels. `0` keeps BK=64. The BM=32 tile and the `_db` variant keep BK=64. Read
+  once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_FORCE_QMM_MIN_M` - probe lever: routes transpose shapes with M at or above the value straight
   to the NAX qmm, bypassing the mat-vec route claims, for crossover measurement below M 13. Unset
   (off) by default.
@@ -165,9 +318,10 @@ Tuning levers (defaults are right for normal use):
 - `KQ_QMM_ROUTE_STRICT` - `1` makes a transpose call that the forced `KQ_QMM_ROUTE` cannot serve
   raise instead of taking the default routing, so a sweep never times the default under a forced
   route's name. Off by default.
-- `KQ_NAX_SWIZZLE` - `1` enables the row-tile traversal swizzle (folds row-tiles into grid.x for
-  SLC reuse of the weight band). Falsified on M5 Max, where the M>64 band is per-threadgroup-bound
-  rather than DRAM-bound; kept as a probe for future silicon. Default off.
+- `KQ_NAX_SWIZZLE` - row-tile traversal swizzle on the BM=64 and BM=128 tiles: `n` folds 2^n row
+  tiles into grid.x, so consecutive threadgroups share one weight column band, capped at the
+  row-tile count. `0` is off. Unset, the codec's large-M row sets the fold on that row's tile and
+  nothing else folds. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_MV_EXT_NR` - `2` selects the two-rows-per-thread `mv_ext` variant (q6_k, M 5-12), which
   halves activation cache traffic but measured no faster than the shipped kernels. Kept as a probe
   for future silicon. Default `1` (shipped behavior).
@@ -196,16 +350,28 @@ Tuning levers (defaults are right for normal use):
 - `KQ_QMM_SPLITK` - the same lever for the plain small-M qmm, used when NAX is absent or disabled.
   Entry points come from a per-device table. K-quants, legacy quants and the IQ codecs, M <= 32.
   `0` also turns off the `KQ_QMM_MIDM` route, and a larger value sets its slice target.
-- `KQ_QMM_MIDM` - split-K for M 33-128. `0` keeps the BM=64 qmm and `1` forces split-K at every M
-  in the band. Unset takes split-K where the qmm grid, ceil(N/64) x ceil(M/64) threadgroups, is
-  under three per GPU core (`KQ_GPU_CORES` sets the count), such as the narrow projections of a
-  short prompt. On NAX GPUs it also takes M 65-96 up to 16 threadgroups per core and runs the NAX
-  split-K tile on every codec with NAX kernels. When NAX is absent or disabled it runs the BM=32
-  tile on the codecs of `KQ_QMM_SPLITK`. Read live per call.
+- `KQ_QMM_MIDM` - split-K for M 33-128. `0` keeps the BM=64 qmm and `1` forces split-K at every M in
+  the band. Unset takes split-K where the qmm grid, ceil(N/64) x ceil(M/64) threadgroups, is under
+  three per GPU core (`KQ_GPU_CORES` sets the count), such as the narrow projections of a short
+  prompt. On NAX GPUs it also takes M 65-96 up to 16 threadgroups per core and runs the NAX split-K
+  tile on every codec with NAX kernels, and there `q4_0` and `q8_0` on float partials target 10
+  slices through M 64, and from M 65 to 96 5 up to K 5120 and 8 above. When NAX is absent or
+  disabled it runs the BM=32 tile on the codecs of `KQ_QMM_SPLITK`. Read live per call.
 - `KQ_SPLITK_RAGGED` - slice count of the NAX split-K route. `0` keeps equal slices, the largest
   count at or under the target that divides the slice units, and `2` takes the ragged count
   whenever it is larger. Unset takes it only where it more than doubles the equal count. Read live
   per call.
+- `KQ_SPLITK_CAP` - probe lever: caps the default slice target of the small-M split-K routes
+  (`nax_splitk` and the ALU `splitk` route, M <= 32) so the split grid holds at most that many
+  threadgroups per GPU core (`KQ_GPU_CORES` sets the count). A call whose grid already holds that
+  many takes one slice and runs what it runs with the split route off. From M 13 that is usually
+  the BM=32 tile, or per-row qmv below the qmv batch limit, which is 18 on M5 Max at K and N up to
+  2048 and up to 32 on Ultra parts. At M 9 to 12 it is the small-M qmm route, `mv_ext` or per-row
+  qmv. The ALU route falls through the same way, to the ALU qmm tile in place of the NAX one.
+  `verify_mma` and `verify_nax` are not capped. `0` keeps the target of 16 at every N on both
+  routes, so a wide N such as a vocab head writes up to 16 partials. Unset keeps it on the ALU route
+  and takes the NAX default described with the NAX split-K route. A target forced through
+  `KQ_QMM_SPLITK_NAX` or `KQ_QMM_SPLITK` is not capped. Read live per call.
 - `KQ_VERIFY_MMA` - the register-resident MMA verify route (below). A value of `2` or more forces
   it at that M and above on any GPU, `0` or `1` disables it. Unset takes the per-codec entry from
   the device's table (`kq_verify_mma_min_m` without NAX, `kq_verify_mma_min_m_nax` with it); the
@@ -221,12 +387,56 @@ Tuning levers (defaults are right for normal use):
 - `KQ_VERIFY_NAX_SPLITS` - probe lever: the split-K target for `verify_nax` in place of the
   per-codec rule (the largest divisor of the K steps at or under the value is used). Unset (off)
   by default.
+- `KQ_VERIFY_MMA_SPLITS` - probe lever: the same split-K target for `verify_mma`; `1` runs it
+  unsplit. Unset (off) by default. Read live per call.
+- `KQ_VERIFY_MMA_HALF` - probe lever: `1` runs the `verify_mma` half kernels (name suffix `_h`) of
+  pq2_0, q2_0, q4_0 and q8_0, which stage the activations as half and sum each block in half, so an
+  activation or a block sum past 65504 turns to inf. On pq2_0 the codes enter that sum unscaled, so
+  a 128-weight block can pass 65504 with activations of magnitude 256 when the codes and activations
+  agree in sign. ptq1_0 has no half kernels and stays on its float kernels. For timing against the
+  float kernels only. Unset (off) by default. Read live per call.
 - `KQ_VERIFY_NAX_Q4_0_SB` - probe lever: `0` keeps `q4_0` on the two-block `verify_nax` kernel at
   a K that is a multiple of 256, where the eight-block kernel runs by default. Read live per call.
 - `KQ_MV_EXT_SB` / `KQ_MV_EXT_NX` / `KQ_MV_EXT_HD` - `mv_ext` activation-traffic experiments:
   shuffle-broadcast (`1`), wide nxpsg (`16`/`32`), half-precision chunk dots (`1`). q6_k M 4-12
   only. `HD` measured +4-5% at M 8; the rest flat to negative on M5 Max. Kept as probes. Default
   off.
+
+Large-M rows. On NAX GPUs a transpose call at M 4096 or more takes the codec's large-M row from
+`kq_largem_row` in `src/kquant_matmul.cpp`: the tile, the row-tile fold, the shape floor (M at or
+above min M at either ceil(M/64) parity, N at or above min N) and the K ceiling, above which the
+BM=64 tile runs at either parity. A codec whose tile and floor are not measured takes those of its
+loader class (the 256-weight k-quant loaders, the 32-weight flat block loaders, or the IQ grid and
+ternary loaders) and is marked inherited. The measured rows come from
+`benchmarks/bench_dit_shapes.py` on an M5 Max at the diffusion transformer rows (M 4096 to 33792
+at the Z-Image and Qwen-Image projection shapes). There the BM=128 tile takes 0.85-0.99x the
+BM=64 time at rows with an odd ceil(M/64) up to the K ceiling, and 1.01-1.09x above it (`q4_k`
+and `q8_0` at K 12288), and per projection the median fold of 2 row tiles takes 1.00-1.26x the
+unfolded time, of 4 row tiles 1.03-1.58x.
+
+The K ceiling is measured for every codec with NAX kernels at N 4096 and M 4128, 8256 and 16384:
+it is the largest K before the first K (of 10240, 12288 and 16384) where BM=128 takes more than
+1.01x the BM=64 time over the three M, measured on the codec's default K tile. Every codec wins at
+K 3840 and 4096. On the K tile of 128, `q3_k`, `q5_k`, `q6_k`, `iq3_xxs`, `iq3_s`, `iq2_xs` and
+`iq2_s` win at every K measured (`iq3_s` 0.91-0.94x, the other IQ codecs 0.93-1.00x), while the
+flat block codecs lose at K 12288 and 16384: `q4_0` and `q4_1` 1.02-1.06x on the K tile of 128,
+`q5_1` and `q8_0` 1.04-1.11x on 64. A ceiling moves only where the new tile takes at most the old
+time at every M measured: on the K tile of 128 at K 12288, `q4_k` and `q5_0` take 1.00-1.02x over
+the three M and 1.02-1.03x at M 4128, so they keep K 10240.
+
+| Codecs | Tile (bm, bn, wm, wn) | Fold log | Min M | Min N | Max K | Row |
+|---|---|---|---|---|---|---|
+| `q4_k`, `q8_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 10240 | measured |
+| `q5_k`, `q6_k` | 128, 64, 2, 2 | 0 | 4096 | 0 | none | measured |
+| `q2_k` | 128, 64, 2, 2 | 0 | 4096 | 0 | 4096 | inherited, k-quant class |
+| `q3_k` | 128, 64, 2, 2 | 0 | 4096 | 0 | none | inherited, k-quant class |
+| `q4_0`, `q4_1`, `q5_0`, `q5_1` | 128, 64, 2, 2 | 0 | 4096 | 0 | 10240 | inherited, flat class |
+| `iq4_nl` | 128, 64, 2, 2 | 0 | 4096 | 0 | 12288 | inherited, flat class |
+| `pq2_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 4096 | inherited, grid class |
+| `q2_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 4096 | inherited, grid class; the K ceiling is that of `pq2_0`, not measured |
+| `stq1_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 12288 | inherited, grid class |
+| `iq2_s`, `iq2_xs`, `iq3_s`, `iq3_xxs` | 128, 64, 2, 2 | 0 | 4096 | 0 | none | inherited, grid class |
+| `iq1_s`, `iq1_m`, `iq2_xxs`, `iq4_xs`, `ptq1_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | none | inherited, grid class |
 
 `stq1_0` (structured-sparse ternary, llama.cpp PR #22836) ships the full ALU and NAX kernel set. Its
 pre-NAX floors are measured (M3 Max: plain split-K entry M 5), and so are its NAX small-M routes in
@@ -235,7 +445,15 @@ calibration: `bm128_min_m` (`benchmarks/bench_qmm_bm128_ab.py`), `kq_splitk_min_
 candidacy (no `_db` instantiation yet). The PrismML codecs `pq2_0` and `ptq1_0` (128-wide blocks)
 ship the same kernel set. `q2_0` (64-wide blocks, the `pq2_0` code layout) runs the `pq2_0`
 kernels at its block width and takes the `pq2_0` route entries, which are not yet measured for
-it. Their NAX split-K entry is M 9, where the verify kernels hand off. The
+it. On the large-M and image ops `q2_0` inherits what `pq2_0` has and no kernel was built for it:
+the grid class large-M row with the `pq2_0` K ceiling, the BM=32, BM=64 and BM=128 tiles on the K
+tile of 64 (neither codec has a `_bk128` kernel, and a `KQ_NAX_Q2_0_BK128` variable is not read),
+the split-K kernels with their float partial twins, and `verify_mma` at one row tile per simdgroup
+with the float kernels by default and the half kernels under `KQ_VERIFY_MMA_HALF`. `KQ_NAX_TILE`,
+`KQ_QMM_TILE` and the tile levers under `KQ_TUNE_LIVE` apply to it as to every NAX codec. Left out:
+`quantized_matmul_glu` and `quantized_matmul_lora` have no `q2_0` or `pq2_0` kernel and build the
+product from `quantized_matmul` and stock ops, and like every codec `q2_0` has no kernel on float
+activations (float32 runs the bfloat16 kernels). Their NAX split-K entry is M 9, where the verify kernels hand off. The
 `bm128_min_m` and db64 floors are still inherited from `iq1_s`. The `ptq1_0` M=1 kernel gives each
 28-byte block four lanes. Each lane reads its six trit bytes in two loads plus the word that holds
 the high-trit bytes and the scale, and decodes the trits with the exact-float base-3 coefficient
@@ -244,26 +462,49 @@ instead of extracting each trit. A simdgroup computes four output rows, so the f
 eight rows per threadgroup. Measured on M5 Max at the Ternary Bonsai 2 27B projection shapes with
 the weights streamed from DRAM, it reads 360-440 GB/s, 1.2-1.3x the previous
 two-rows-per-simdgroup layout. The `pq2_0` M=1 kernel
-masks each pair of 2-bit codes into the mantissas of a half2 and runs the dot as half2 fmas, two
-weights per instruction, which brings it close to the rate of a kernel that only loads the bytes.
+masks each pair of 2-bit codes into the mantissas of a half2. On float16 activations it runs the dot
+as half2 fmas, two weights per instruction, which brings it close to the rate of a kernel that only
+loads the bytes. On bfloat16 activations it widens each pair to float and runs the dot as float2
+fmas, since a bfloat16 value past 65504 does not fit in half.
 Both codecs have a `verify_qmv` sibling that decodes each row's block once and dots it against every
 activation row. It serves M 2 below the `verify_mma` entry on GPUs without NAX, where the `mv_ext`
 re-decode per row costs `ptq1_0` 3x. On NAX GPUs per-row qmv serves M 2.
 
-The register-resident MMA verify kernels (`verify_mma`) serve `pq2_0`, `ptq1_0`, `q4_0` and `q8_0`
-through M 8. Each simdgroup decodes a block of its weight rows straight into 8x8 simdgroup-matrix
+The register-resident MMA verify kernels (`verify_mma`) serve `pq2_0`, `ptq1_0`, `q2_0`, `q4_0` and
+`q8_0` through M 8. Each simdgroup decodes a block of its weight rows straight into 8x8 simdgroup-matrix
 fragments, with the k order inside the block permuted so every lane extracts the code pairs it holds
 cheapest, and multiplies them against the activations staged once per K chunk, so the weight bytes
 are read once for all M rows and the tile's threadgroup staging of the weights disappears. Split-K
 over the wire blocks feeds the same partial fold as `qmm_splitk` on the projection shapes; a
 head-sized N already fills the GPU with one split and writes the output directly.
 
-The kernels stage the activations as half and sum each block in a half accumulator, so an activation
-beyond the half range (magnitude 65504) overflows. The `pq2_0` and `ptq1_0` codes are -1, 0 and 1,
-so a block's sum overflows only when its 128 activations add up past that range. The `q4_0` and
-`q8_0` kernels decode their codes scaled by 1/16 and 1/256 and apply the factor in the float block
-scale, so one channel near the half limit cannot overflow a block of 32 products. A float
-accumulator removes the limit but runs `pq2_0` at half speed.
+A threadgroup is 8 simdgroups, and each owns two 8-row tiles on `q4_0` and `q8_0` and one on
+`pq2_0`, `q2_0` and `ptq1_0` (`q2_0` runs the `pq2_0` chain at 8 fragment MMAs per 64-weight block
+and takes its one-tile layout, which is not measured for it). A `pq2_0` block runs its 16 fragment
+MMAs into one accumulator per row tile, so the MMAs form a dependent chain whose latency, longer in
+float than in half, bounds the kernel. At two row tiles per simdgroup the float kernel took about
+twice the time of the half kernel on the M5 Max. One row tile doubles the threadgroups that hide the
+latency, and the float kernel then runs in 0.45-0.52x of its two-tile time over the Qwen3.8-27B
+projection and head shapes at M 2 to 8. Splitting each chain over two or four accumulators recovered
+most of that too, and staging the activations as half with float accumulators did not. `q4_0` and
+`ptq1_0` gained nothing from either change.
+
+The kernels decode the codes exactly in half and keep the activations in their own dtype in
+threadgroup memory. Both widen to float in the fragment, so each block sums in float and the block
+scale applies in float. Unsplit, or split with float partials (the float16 default, and
+`KQ_SPLITK_F32=1`), the result rounds once, as the mat-vec kernels do with the exact weights, at any
+activation magnitude. `KQ_VERIFY_MMA_HALF=1` runs the half kernels of `pq2_0`, `q2_0`, `q4_0` and
+`q8_0`, which stage the activations as half and sum each block in half. There an activation beyond the half
+range (magnitude 65504), such as a bfloat16 outlier, turns to inf, and so does a block sum past it.
+On ordinary activations with float partials, the error of the half kernels runs 0.4 to 0.9 output
+roundings beyond the rounding of the float64 result on bfloat16, and 4 to 7 on float16, and the
+float kernels run within 0.01. Partials in the activation dtype (the bfloat16 default, and
+`KQ_SPLITK_F32=0`) add about one output rounding to a split call of either kernel, which puts the
+half kernels at 1.1 to 1.4 on bfloat16 and 4 to 7.5 on float16, and the float kernels at about 1 on
+both. Against the half kernels over the same shapes and M on the M5 Max, the float kernels take
+0.90-1.00x the time for `pq2_0` and 0.94-1.02x for `q4_0` on bfloat16, and 0.99-1.01x for `pq2_0`
+and 1.00-1.05x for `q4_0` on float16. `ptq1_0` has no half kernels, since in float it runs in
+0.90-1.03x the time of a half build.
 
 The entry M depends on the device. Without NAX, `pq2_0` and `ptq1_0` enter at M 3 (`pq2_0` at M 4
 on float16 activations, where `verify_qmv` holds M 3) and `q4_0` at M 2. Measured on M3 Max at the
@@ -285,7 +526,7 @@ wider. Each simdgroup owns 32 weight rows and decodes every block of them straig
 right operand of a 16x32x16 NAX matmul, with the block scale folded into the half weights. The left
 operand holds the activation rows padded to 16, read from device memory in the k order of the
 decoded weights, so nothing is staged in threadgroup memory and the loop has no barriers. The
-accumulator is float32, which removes the half-range limit of `verify_mma`.
+accumulator is float32.
 
 A simdgroup's device loads and NAX ops do not overlap, so the kernel hides its loads through the
 simdgroups resident beside it, and the host sizes the split count for that. The kernels differ in
@@ -401,6 +642,320 @@ entries the kernel ran up to 1.10x slower at K 4096 and 1.21x slower at N 12288,
 entry under M 5 sits one row higher. At M 8 the kernel runs 1.05-1.39x faster than NAX split-K
 on the shapes of N 2048 and wider.
 
+## GLU product of two quantized matmuls
+
+- `quantized_matmul_glu` - `y = act(x @ Wg^T) * (x @ Wu^T)` for two packed weights of one codec and
+  one shape, the gated feed-forward of a diffusion transformer block. `act` is `silu` or
+  `gelu_tanh`. The weights are two arrays, or the two row bands of one fused gate and up weight,
+  which the kernel reads in place.
+
+  On a NAX GPU (M5), from 1024 activation rows, one dispatch computes the product for `q4_k`,
+  `q5_k` and `q6_k` weights whose inner dim is a multiple of 128, and for `q8_0` weights on
+  bfloat16 activations whose inner dim is a multiple of 64. Each threadgroup owns a 128 by 64 tile
+  of y. It walks K over the gate weight, applies the activation in f32 and stores the tile, then
+  walks K over the up weight and multiplies the stored tile into the sum before the final store.
+  y is the only buffer the op writes, so a call peaks at one output where the unfused ops peak at
+  two with `silu` and at three with `gelu_tanh`.
+
+  Measured on an M5 Max against the two matmuls and the stock activation and product, as the median
+  of rotated rounds in one process:
+
+  | K, N, activations | Rows | `q4_k` | `q5_k` | `q6_k` | `q8_0` |
+  |---|---|---|---|---|---|
+  | 3840, 10240, bfloat16 | 1056 | 0.91 | 0.99 | 0.96 | 0.99 |
+  | 3840, 10240, bfloat16 | 2080 | 0.89 | 0.88 | 0.87 | 0.93 |
+  | 3840, 10240, bfloat16 | 4128 | 0.96 | 0.94 | 0.96 | 0.96 |
+  | 3840, 10240, bfloat16 | 4608 | 0.97 | 0.96 | 0.97 | 0.96 |
+  | 3840, 10240, bfloat16 | 8208 | 0.96 | 0.96 | 0.97 | 0.97 |
+  | 3840, 10240, bfloat16 | 16416 | 0.97 | 0.97 | 0.99 | 0.98 |
+  | 3840, 10240, float16 | 1056 | 0.95 | 1.00 | 0.98 | - |
+  | 3840, 10240, float16 | 4128 | 0.94 | 0.96 | 0.97 | - |
+  | 3840, 10240, float16 | 16416 | 1.00 | 0.98 | 0.99 | - |
+  | 4096, 12288, bfloat16 | 4128 | 0.94 | 0.95 | 0.95 | 0.97 |
+  | 4096, 12288, bfloat16 | 16416 | 0.97 | 0.97 | 0.97 | 0.99 |
+
+  From 4128 rows the gain is the activation and product pass that the kernel removes, 1 to 6
+  percent. `q4_k` on float16 at 16416 rows is a tie. `q8_0` on float16 builds the unfused ops, so
+  it has no cell. `benchmarks/bench_glu.py` repeats the table for one codec.
+
+  x is float16 or bfloat16, and float32 x runs in bfloat16 as in `quantized_matmul`. Leading batch
+  dims fold into rows. The activation and the product run in f32, with one rounding of the
+  activation and one of the product. A finite float16 result past the half range is stored as the
+  largest finite value with its sign, the activation before the product and the product at the
+  store, where the unfused ops return inf. A NaN or an infinity in x gives NaN and inf where the
+  unfused ops give them.
+
+  Every other case builds the same product from `quantized_matmul` and stock ops: other codecs,
+  `q8_0` on float16, fewer rows, other inner dims, CPU streams and GPUs without NAX.
+
+  Levers, each read once per process unless `KQ_TUNE_LIVE=1`:
+
+  - `KQ_GLU` - `0` builds the unfused ops on every call. Unset (on) by default.
+  - `KQ_GLU_MIN_ROWS` - the row count from which the fused kernel runs, an integer of at least 1.
+    A value below 1 keeps the default, with a warning on stderr. Default 1024.
+
+  A build with the CMake option `KQ_PROBE_KERNELS=ON`, which `KQ_PROBE_KERNELS=1` in the
+  environment of the build selects, also carries the tiles that the shipped ones were measured
+  against. It reads `KQ_GLU_BM`, `KQ_GLU_BK`, `KQ_GLU_WALKS` and `KQ_GLU_DUAL128` to select one,
+  and a tile it does not carry for the codec raises a `ValueError` that names the levers and the
+  kernel. A release build reads none of the four.
+
+  `mx.grad` gives the gradient with respect to x at every row count: the gradient of the fused
+  kernel runs the unfused ops. The weights are frozen, as in `quantized_matmul`. For float32 x the
+  fused kernel sums the gate term and the up term of the gradient in bfloat16, where the unfused
+  ops sum them in float32, so the two gradients differ by one bfloat16 rounding, about 2e-3
+  relative. `mx.jvp` and `mx.vmap` raise at every row count, since `quantized_matmul` has neither.
+
+## Quantized matmul with a low-rank term
+
+- `quantized_matmul_lora` - `y = x @ W^T + (strength * (x @ A)) @ B` for a packed weight and a
+  low-rank adapter, `lora_a` [K, R] and `lora_b` [R, N], at the row counts of a diffusion
+  transformer step. `strength` is a 0-D array or [1] for one scale, or [R] for one per rank, and
+  any other shape raises a `ValueError`. It is an input array, so a new value needs no reload and
+  no new trace of a compiled function. Several adapters are one call: join their A columns and
+  their B rows, and give one strength per rank.
+
+  `bands` holds rows of (col_start, col_end, z_start, rank), in column order and disjoint. The
+  columns of a band take that block of ranks and that block of `lora_b`, and a column outside
+  every band takes no low-rank term. A fused q, k and v weight with one adapter per projection is
+  three bands, so no projection multiplies the ranks of another. `bands=None`, the default, is no
+  table: every column takes every rank. `bands=[]` is a table with no band: no column takes a
+  rank, and y is `quantized_matmul(x, w)`, bit for bit.
+
+  On a NAX GPU (M5), for `q4_k`, `q5_k`, `q6_k` and `q8_0` weights on bfloat16 activations with K
+  up to 4096 and N of at least K, from 4096 activation rows where no column takes more than 128
+  ranks, and from 1024 rows at every rank where N is at least 8192, stock ops compute
+  `z = strength * (x @ A)` and one dispatch computes the product and adds `z @ B`. Each
+  threadgroup owns a 128 by 64 tile of y. It walks the rank of its column band 32 ranks a step,
+  with z and B read from their buffers, then walks K over the weight, and stores the tile. Both
+  walks add into one f32 sum, which is rounded once at the store. y is the only buffer the
+  dispatch writes, where the unfused ops write the product and then read and write it again for
+  the sum. The kernel takes a rank of at most 256 without bands, and with bands at most 16 of
+  them, each starting on a multiple of 64 columns, ending on a multiple of 32 columns or at N, and
+  holding at most 256 ranks. The `q8_0` kernel walks K in tiles of 64, so a `q8_0` weight whose K
+  is no multiple of 64 runs the unfused ops.
+
+  The bounds on K, N, rows and rank are where the kernel measured faster. It removes the second
+  pass over y, a cost in proportion to N. It waits for `x @ A`, a cost in proportion to K and to
+  the rank, where the unfused product runs beside `x @ A`. So the kernel gains where N is at least
+  K, and its gain is a share of the call that falls as K grows. Where N is near K the gain is
+  about one percent, and it holds from 4096 rows and up to a rank of 128. With bands, the rank
+  that counts is the rank of the largest band.
+
+  Measured on an M5 Max against `quantized_matmul`, `x @ A` and one `mx.addmm`, one call an eval,
+  at 4608 rows on `q4_k`, as the median of four processes of rotated rounds, kernel time over
+  unfused time:
+
+  | K, N | Rank 16 | Rank 64 |
+  |---|---|---|
+  | 2048, 2048 | 0.99 | 0.96 |
+  | 3072, 3072 | 0.98 | 0.97 |
+  | 3840, 3840 | 0.99 | 0.98 |
+  | 3840, 10240 | 0.97 | 0.97 |
+  | 3840, 11520, three bands | 0.96 | 0.94 |
+  | 4096, 4096 | 0.99 | 0.99 |
+  | 4096, 24576, two bands | 0.96 | 0.96 |
+
+  Outside the bounds, with the kernel run under `KQ_QMM_LORA=2`:
+
+  | K, N | Rank 16 | Rank 64 |
+  |---|---|---|
+  | 4096, 1024 | 1.03 | 1.03 |
+  | 4096, 2048 | 1.01 | 0.98 |
+  | 6144, 1536 | 1.04 | 1.02 |
+  | 10240, 3840 | 1.02 | 1.02 |
+  | 12288, 4096 | 1.01 | 1.02 |
+  | 5120, 5120 | 0.99 | 0.99 |
+  | 6144, 6144 | 0.99 | 0.99 |
+  | 8192, 8192 | 0.99 | 1.00 |
+
+  The other codecs inside the bounds, at the same rows, rank 16 and rank 64:
+
+  | K, N | `q5_k` | `q6_k` | `q8_0` |
+  |---|---|---|---|
+  | 3840, 3840 | 0.99, 0.98 | 0.99, 0.98 | 0.98, 0.98 |
+  | 3840, 11520, three bands | 0.96, 0.94 | 0.96, 0.94 | 0.96, 0.94 |
+  | 4096, 24576, two bands | 0.96, 0.96 | 0.97, 0.96 | 0.96, 0.96 |
+
+  Below 4096 rows on `q4_k`, rank 16 and rank 64. The first three shapes are outside the bounds
+  there and ran under `KQ_QMM_LORA=2`:
+
+  | K, N | 1056 rows | 2112 rows |
+  |---|---|---|
+  | 2048, 4096 | 1.08, 1.00 | 1.02, 0.99 |
+  | 3840, 3840 | 1.02, 0.99 | 1.03, 1.02 |
+  | 4096, 4096 | 1.02, 1.01 | 1.04, 1.03 |
+  | 4096, 8192 | 0.99, 0.98 | 0.98, 0.98 |
+  | 3840, 10240 | 0.99, 0.98 | 0.96, 0.96 |
+  | 3840, 11520, three bands | 0.97, 0.94 | 0.96, 0.93 |
+  | 4096, 24576, two bands | 0.96, 0.94 | 0.93, 0.93 |
+
+  The tables from here on are the median of four processes that run the two forms in alternating
+  slots, one call an eval. Ranks 128 and 256 at 4608 rows on `q4_k`. At rank 256 the two shapes
+  with N of K are outside the bounds:
+
+  | K, N | Rank 128 | Rank 256 |
+  |---|---|---|
+  | 3840, 3840 | 0.99 | 1.00 |
+  | 4096, 4096 | 0.98 | 1.01 |
+  | 3840, 10240 | 0.97 | 0.99 |
+  | 3840, 11520, three bands | 0.93 | 0.90 |
+  | 4096, 24576, two bands | 0.97 | 0.95 |
+
+  From 4096 rows up on `q4_k`, rank 16 and rank 64:
+
+  | K, N | 4096 rows | 8192 rows | 16384 rows |
+  |---|---|---|---|
+  | 3840, 3840 | 1.00, 1.00 | 0.98, 0.98 | 0.97, 0.97 |
+  | 4096, 4096 | 1.00, 0.99 | 0.97, 0.98 | 0.96, 0.97 |
+  | 3840, 11520, three bands | 0.97, 0.94 | 0.96, 0.94 | 0.97, 0.93 |
+
+  The other codecs below 4096 rows, rank 16 and rank 64:
+
+  | K, N | Rows | `q5_k` | `q6_k` | `q8_0` |
+  |---|---|---|---|---|
+  | 4096, 8192 | 1056 | 0.98, 0.97 | 0.95, 0.94 | 0.98, 0.98 |
+  | 4096, 8192 | 2112 | 0.97, 0.96 | 0.94, 0.94 | 0.98, 0.98 |
+  | 3840, 10240 | 1056 | 0.97, 0.96 | 0.94, 0.93 | 0.99, 1.00 |
+  | 3840, 10240 | 2112 | 0.96, 0.96 | 0.92, 0.92 | 0.97, 0.98 |
+  | 3840, 11520, three bands | 1056 | 0.96, 0.92 | 0.93, 0.92 | 0.99, 0.96 |
+  | 3840, 11520, three bands | 2112 | 0.94, 0.92 | 0.91, 0.90 | 0.96, 0.94 |
+  | 4096, 24576, two bands | 1056 | 0.95, 0.93 | 0.92, 0.91 | 0.95, 0.94 |
+  | 4096, 24576, two bands | 2112 | 0.93, 0.92 | 0.90, 0.89 | 0.93, 0.92 |
+
+  K below 2048 on `q4_k`. A call here takes 0.2 to 2.4 ms, and two runs of the unfused ops differ
+  by up to 4 percent at the smallest:
+
+  | K, N | Rows | Rank 16 | Rank 64 |
+  |---|---|---|---|
+  | 1536, 1536 | 4608 | 0.99 | 0.97 |
+  | 1024, 1024 | 4608 | 0.99 | 0.95 |
+  | 512, 512 | 4608 | 0.97 | 0.97 |
+  | 256, 256 | 4608 | 0.99 | 0.99 |
+  | 1024, 8192 | 1056 | 1.01 | 0.94 |
+  | 1024, 8192 | 4608 | 0.87 | 0.87 |
+  | 512, 8192 | 1056 | 0.95 | 0.95 |
+  | 512, 8192 | 4608 | 0.79 | 0.80 |
+  | 256, 8192 | 1056 | 0.94 | 0.91 |
+  | 256, 8192 | 4608 | 0.70 | 0.72 |
+
+  x is float16 or bfloat16, and float32 x runs in bfloat16 as in `quantized_matmul`. Leading batch
+  dims fold into rows. `lora_a`, `lora_b` and `strength` take any float dtype and run in the dtype
+  of y. K, N and R are each below 2^25 and x holds fewer than 2^31 rows: the kernel computes
+  addresses inside a row tile in 32 bits, and a call past either limit raises a `ValueError`.
+
+  Every other case builds the same sum from `quantized_matmul` and stock ops, which round the
+  product to the activation dtype before the add: other codecs, float16 activations, fewer rows,
+  K above 4096, N below K, N below 8192 under 4096 rows or with more than 128 ranks on a column,
+  a rank above 256, more bands, a band that starts off a multiple of 64 columns or ends before N
+  off a multiple of 32, a `q8_0` K off a multiple of 64, CPU streams and GPUs without NAX. A rank
+  of zero, an x of no rows and a weight of no rows return the product alone.
+
+  Levers, each read once per process unless `KQ_TUNE_LIVE=1`. The op reads them when it is
+  called and builds its graph, so a compiled function keeps the kernel choice of its trace:
+
+  - `KQ_QMM_LORA` - `0` builds the unfused ops on every call. `2` runs the kernel at every K and
+    N from 1024 rows, inside its other bounds. Unset, `1` or any other value keeps the bounds on
+    K, N, rows and rank.
+  - `KQ_QMM_LORA_MIN_ROWS` - the lowest row count at which the kernel runs, an integer of at
+    least 1. A value below 1 keeps the default, with a warning on stderr. Default 1024.
+
+  A function compiled with `shapeless=True` keeps the path of its trace at every later shape. A
+  trace that ran the kernel runs it at every row count, below 1024 rows and outside the bounds on
+  rows too, and the result is right there. A trace that built the unfused ops keeps them. A
+  shapeless function cannot hold a call with `bands` that builds the unfused ops, since the stock
+  slices that cut the bands have no shape rule: that call raises a `ValueError` that names
+  `quantized_matmul_lora`. Compile such a function with fixed shapes.
+
+  `mx.grad` gives the gradient with respect to x, `lora_a`, `lora_b` and `strength`, alone or in
+  any combination, at every row count: the gradient of the kernel runs the unfused ops. The weight
+  is frozen, as in `quantized_matmul`. `mx.jvp` and `mx.vmap` run with respect to `lora_a`,
+  `lora_b` and `strength` at every row count, on the unfused ops. With respect to x both raise
+  `Not implemented for KQuantMatmul` at every row count, since `quantized_matmul` has neither.
+
+  The unfused ops add each band with `mx.addmm`. On the GPU that stock op misreads a first
+  argument of one column that is a view of a wider array, so the op hands it a dense copy of a
+  one-column band ([upstream-defects.md](upstream-defects.md)). Wider bands are read in place.
+
+## Quantized matmul with a residual epilogue
+
+- `quantized_matmul_residual` - `y = residual + gate * (x @ W^T)` for a packed weight: the
+  residual add after the output projection of a transformer block, with the gate of an adaptive
+  norm where the block has one. `residual` has the output shape. `gate` is [N], or x's batch dims,
+  then 1, then N (one gate row per batch item), and `gate=None` gives `residual + x @ W^T`. The
+  residual and the gate run in the output dtype, the dtype `quantized_matmul` gives for x.
+
+  On a NAX GPU (M5), for `q4_k`, `q5_k`, `q6_k` and `q8_0` weights on bfloat16 activations, from
+  1024 activation rows, one dispatch walks K into one f32 sum per output, then reads its tile of the
+  residual and its columns of the gate and stores `residual + gate * sum`, rounded once. The product
+  is never written, where the unfused ops write it, then read it and the residual and write the
+  sum, or two passes on stock elementwise ops. Each threadgroup owns a 128 by 64 tile of y, or 64 by
+  64 for `q4_k` and `q8_0` above K 10240, the K ceiling of the large-row tile of
+  `quantized_matmul`. A gate per batch item runs the batch in the grid. The `q8_0` kernel walks K
+  in tiles of 64, so a `q8_0` weight whose K is no multiple of 64 runs the unfused ops.
+
+  At Qwen-Image 2.1 step shapes (4096 rows a batch item, N 4096, bfloat16) on an M5 Max, the call
+  costs what the product alone costs: 0.928 of the unfused ops at K 4096 on `q5_k` and 0.973 at K
+  12288 on `q4_k`, at batch 1, against 0.916 and 0.973 for the product alone. A compiled
+  `x + gate * y` after the product gives 0.982 and 0.984.
+
+  Every other case builds the same sum from `quantized_matmul` and stock ops, which round the
+  product and the gated product to the output dtype before the add: other codecs, float16
+  activations, fewer rows, a `q8_0` K off a multiple of 64, CPU streams and GPUs without NAX.
+  The op rounds once from 1024 rows counted across the batch, so x of shape [2, 512, K] runs the
+  kernel while each [512, K] half on its own runs the unfused ops, and the two can differ in the
+  last bit.
+
+  Lever, read once per process unless `KQ_TUNE_LIVE=1`. The op reads it when it is called and
+  builds its graph, so a compiled function keeps the kernel choice of its trace:
+
+  - `KQ_QMM_RESID` - `0` builds the unfused ops on every call. `2` runs the kernel at every row
+    count. Unset, `1` or any other value runs it from 1024 rows.
+
+  `mx.grad` gives the gradient with respect to x, the residual and the gate at every row count:
+  the gradient of the kernel runs the unfused ops. The weight is frozen, as in `quantized_matmul`.
+  `mx.jvp` and `mx.vmap` run with respect to the residual and the gate. With respect to x both
+  raise `Not implemented for KQuantMatmul`, since `quantized_matmul` has neither.
+
+## 3x3 convolution
+
+- `conv2d_3x3` - `y = conv(x, w) + bias` for a 3x3 kernel, stride 1, padding 1, channels last:
+  the convolutions that carry the decoder of an image VAE. `x` is [B, H, W, C], `w` is
+  [O, 3, 3, C] in the layout of `nn.Conv2d`, and `bias` is [O] or None. `w` and `bias` run in the
+  dtype of x. The result is the cross-correlation `nn.Conv2d` computes, with zeros outside the
+  image.
+
+  On a NAX GPU (M5), for bfloat16 with C a multiple of 16, from 1024 output pixels, one dispatch
+  computes y as an implicit GEMM: rows are output pixels, columns are the O filters, and K walks the
+  9 taps and C channels, 32 channels a step, into one f32 sum per output. Each row reads its tap
+  from x in place, zeros where the tap falls off the image, so no patch buffer is written. The bias
+  is added in f32 and y is rounded once. Each threadgroup owns a 128 by 128 tile of y, or 128 by 64
+  where a 64 column tile pads O less (O 144 and 288, for example).
+
+  On an M5 Max, at the decoder shapes of Z-Image and Qwen-Image 2.1 (H and W 256 to 1024, C 128 to
+  1152), the kernel runs 31 to 54 TFLOPS, 0.25 to 0.34 of the time of MLX's convolution without the
+  Winograd transform. MLX's Winograd path is faster where O is 256 to 1152, with an error to the
+  float64 result 35 times larger on a 256 channel layer. At O 128 the kernel takes about half the
+  time of the Winograd path, and at O 144 MLX takes no Winograd transform. A whole Z-Image decode
+  at 1024 pixels takes 0.36 of its time on the convolution without Winograd.
+
+  Every other case builds MLX's `conv_general` on the flipped kernel, which takes its implicit GEMM
+  and not the Winograd transform, then a stock add of the bias, which rounds the convolution before
+  the add: float16 and float32, C off a multiple of 16, fewer pixels, CPU streams and GPUs without
+  NAX.
+
+  Levers. The op reads `KQ_CONV_NAX` when it is called and builds its graph, so a compiled function
+  keeps the kernel choice of its trace. `KQ_CONV_TILE` is read at dispatch. Each is read once per
+  process unless `KQ_TUNE_LIVE=1`:
+
+  - `KQ_CONV_NAX` - `0` builds the composition on every call. `2` runs the kernel at every pixel
+    count. Unset, `1` or any other value runs it from 1024 pixels.
+  - `KQ_CONV_TILE` - `bm,bn,wm,wn` pins the tile. The metallib carries `128,128,4,4`,
+    `128,64,4,2`, `64,128,2,4` and `64,64,2,2`; any other tile raises a `ValueError` that names the
+    missing kernel.
+
+  `mx.grad`, `mx.jvp` and `mx.vmap` run the composition, so they give what MLX's convolution gives.
+
 ## MoE GLU
 
 Fused gate/up expert matvecs with the GLU epilogue applied in the same dispatch, so each activation
@@ -440,13 +995,14 @@ into a packed layout first.
   (scales and biases, bits 8, group 64) dequantize on the tile stage. `return_lse=True` adds per-row
   log-sum-exp. On NAX GPUs one query at head dim 512 with up to 8 query heads per KV head runs the
   chunk pass on the matrix units once KV heads x batch x keys reaches 3072. That needs K and V
-  strides in multiples of 8 elements and no `starts`, `ends` or q8 operands. Below 3072 the
+  strides in multiples of 8 elements and no `ends` or q8 operands. With `starts` it skips the
+  padded keys of each row as the simdgroup kernel does. Below 3072 the
   simdgroup kernel's finer splits keep more of the GPU busy. Eight simdgroups share each 256-key
   tile, each scoring 32 keys over the full head dim and then accumulating a 64-column slice of
   `P @ V`. The automatic split count is the largest power of two that keeps KV heads x batch x
   splits at 32 or under, and 1 once KV heads x batch passes 32. It ignores the depth, so it falls
   as the batch grows. The two kernels round differently, so the same rows are not bit-identical
-  between this pass, the simdgroup kernel (`starts`, `ends`, q8) and another batch size.
+  between this pass, the simdgroup kernel (`ends`, q8) and another batch size.
   `KQ_GQA_NAX=0` forces the simdgroup kernel.
 - **`sdpa_decode_gqa_cascade`** - shared-prefix batched decode: every row attends one common prefix
   plus its own private suffix. The prefix is walked once for all rows on the matrix-unit tile, private
@@ -543,6 +1099,36 @@ Tuning levers (defaults are right for normal use):
   after attention or the next layer's input norm. Rows wider than 16384 and CPU streams run the
   composition.
 
+## Attention q and k norm with RoPE
+
+- `qk_norm_rope` - the per-head RMSNorm and rotary embedding that a diffusion transformer applies
+  to q and k before attention, both tensors in one dispatch. Each head row `x` of q (weight `q_w`)
+  and of k (weight `k_w`) becomes `y = x * rsqrt(mean(x^2) + eps) * w`, and then each interleaved
+  pair `(y[2i], y[2i + 1])` of sequence row `l` rotates by the angle whose cosine and sine are
+  `cos[l, i]` and `sin[l, i]`. The tables hold one angle per row and pair, so any position scheme
+  works, such as the caption index and image row and column of a three-axis image RoPE. The angles
+  of `mx.fast.rope` follow the sequence index and cannot express these positions.
+
+  The op reads q and k `[B, L, H, D]` in place through their strides, so the q and k slices of one
+  fused qkv output need no copy, and lazy transposed views work the same way. The batch shares the
+  `[L, D / 2]` tables. It returns `(q_out, k_out)`, each row-contiguous `[B, H, L, D]`, the layout
+  attention reads, so no transpose copy follows.
+
+  q and k are float16 or bfloat16 and the outputs keep that dtype. The weights and tables may be any
+  float dtype and are used in f32. The norm and the rotation run in f32 with one rounding at the
+  write, so nearly every output element is the exact result rounded to the output dtype. The unfused
+  composition also rounds the normalized value before the rotation.
+
+  One threadgroup per `(b, l)` row covers every head of q and k, with 16 lanes per head row. Each
+  lane loads its cosines, sines and weights once per row and reuses them across heads. Head dims 64,
+  96, 128 and 256 have kernels in both dtypes. Views whose head-dim stride is 1 and whose rows start
+  on the vector width take vector loads, and any other view takes element loads through its strides.
+
+  CPU streams, and GPU calls at other even head dims, run the same math as stock MLX ops, an f32 norm
+  and rotation followed by one cast to the input dtype and a transposed copy. The op is for
+  inference. On the GPU the fused kernel has no gradient or vmap, and `mx.grad` or `mx.vmap` through
+  it raises.
+
 ## Hadamard rotation
 
 - **`hadamard_rotate`** - the signed block Walsh-Hadamard rotation a Hadamard-folded weight expects
@@ -563,10 +1149,14 @@ Tuning levers (defaults are right for normal use):
 - **`codecs`** - the list of supported codec names.
 - **`metallib_loads`** / **`metallib_dir`** - whether the bundled metallib opened on the device, and
   where it lives.
+- `metallib_kernels` - the sorted names of the kernels in the bundled metallib (empty without
+  Metal), the names `KQ_NAX_TILE` and `KQ_QMM_TILE` select from.
 - **`nax_available`** / **`nax_gather_enabled`** - whether the GPU exposes NAX tensor units, and
   whether the sorted-gather NAX GEMM kernels (`gather_qmm_rhs_nax`, the `gather_qmm_seg` NAX walk)
   are reachable for a codec.
 - **`cpu_neon_available`** - whether the arm64 NEON int8 GEMV path is compiled in.
+- `gpu_core_count` / `max_threadgroup_memory` - the GPU core count from IOKit (`KQ_GPU_CORES`
+  overrides it) and the threadgroup memory limit in bytes, both 0 when unknown.
 
 ## Feeder-loop primitives
 

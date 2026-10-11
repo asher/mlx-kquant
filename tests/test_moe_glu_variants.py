@@ -182,15 +182,45 @@ import mlx.core as mx
 import test_moe_glu as tm
 
 codec, sx, dtype = sys.argv[2], sys.argv[3] or None, getattr(mx, sys.argv[4])
-res = tm._check_codec(codec, sx=sx, dtype=dtype)
+res = tm._check_codec(codec, sx=sx, dtype=dtype, x_scale=float(sys.argv[5]))
 print("RESULT " + json.dumps(
     None if res is None else [(n, float(r), bool(o)) for n, r, o in res]))
 """
 
-# Half dots round each 4-wide product sum to half before the float chunk
-# accumulate; the fused outputs land near 1e-3 relative to the f32
-# reference against the 2e-3 bound of the float kernels.
+# Half dots stage the grid and the activations in half and sum each
+# chunk's products in float; the fused outputs land near 2e-4 relative to
+# the f32 reference on float16 and near 2e-3 on bfloat16, where the float
+# kernels are bound at 2e-3.
 HALF_REL_BOUND = 6e-3
+HALF_OPS = ("glu", "qmv", "shexp", "mix")
+
+
+def _half_run(codec, sx, dtype, x_scale):
+    """KQ_MOE_HALF=1 results of test_moe_glu._check_codec in a child, and
+    the kernel names it logged."""
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    r = _run_child(
+        [
+            sys.executable,
+            "-c",
+            _HALF_SNIPPET,
+            tests_dir,
+            codec,
+            sx,
+            dtype,
+            str(x_scale),
+        ],
+        {"KQ_MOE_HALF": "1", "KQ_MOE_NX_LOG": "1"},
+        f"half {codec} sx={sx} {dtype} x_scale={x_scale}",
+    )
+    line = [l for l in r.stdout.splitlines() if l.startswith("RESULT ")]
+    assert line, r.stdout + r.stderr
+    import json
+
+    res = json.loads(line[-1][len("RESULT ") :])
+    if res is None:
+        pytest.skip(f"{sx or codec} fixture missing")
+    return res, r.stderr
 
 
 @pytest.mark.parametrize("codec", ["iq2_xs", "iq2_xxs", "iq3_xxs"])
@@ -201,20 +231,7 @@ def test_half_dot_dispatch_and_accuracy(codec, sx, dtype):
     to the "_h" kernels (mix_ns has no half form and stays on the float
     kernel) and every op stays within the half-dot bound of the f32
     reference."""
-    tests_dir = os.path.dirname(os.path.abspath(__file__))
-    r = _run_child(
-        [sys.executable, "-c", _HALF_SNIPPET, tests_dir, codec, sx, dtype],
-        {"KQ_MOE_HALF": "1", "KQ_MOE_NX_LOG": "1"},
-        f"half {codec} sx={sx} {dtype}",
-    )
-    line = [l for l in r.stdout.splitlines() if l.startswith("RESULT ")]
-    assert line, r.stdout + r.stderr
-    import json
-
-    res = json.loads(line[-1][len("RESULT ") :])
-    if res is None:
-        pytest.skip(f"{sx or codec} fixture missing")
-    names = r.stderr
+    res, names = _half_run(codec, sx, dtype, 0.1)
     stem = codec if not sx else f"{codec}_sx_{sx}"
     for op in (
         "_moe_glu_gather_h_",
@@ -230,11 +247,26 @@ def test_half_dot_dispatch_and_accuracy(codec, sx, dtype):
         assert want in names, (want, names)
     assert f"kq_{codec}_gather_qmv_mix_ns" in names and "mix_ns_h" not in names, names
     for name, rel, ok in res:
-        bound = HALF_REL_BOUND if name in ("glu", "qmv", "shexp", "mix") else None
-        if bound is None:
-            assert ok, (name, rel)
+        if name in HALF_OPS:
+            assert rel < HALF_REL_BOUND, (name, rel)
         else:
-            assert rel < bound, (name, rel)
+            assert ok, (name, rel)
+
+
+@pytest.mark.parametrize("codec", ["iq2_xs", "iq2_xxs", "iq3_xxs"])
+def test_half_dot_range(codec):
+    """Activations of standard deviation 2e3 stay finite under
+    KQ_MOE_HALF=1: a grid code (up to 62) times such an activation passes
+    65504, so each product and the chunk sum run in float. bfloat16 keeps
+    the GLU outputs in range."""
+    res, names = _half_run(codec, "", "bfloat16", 2e3)
+    for op in ("_moe_glu_gather_h_", "_gather_qmv_h"):
+        assert f"kq_{codec}{op}" in names, (op, names)
+    for name, rel, ok in res:
+        if name in HALF_OPS:
+            assert rel < HALF_REL_BOUND, (name, rel)
+        else:
+            assert ok, (name, rel)
 
 
 _DD_SNIPPET = r"""

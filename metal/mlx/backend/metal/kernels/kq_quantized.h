@@ -107,6 +107,9 @@ MLX_MTL_CONST int SIMD_SIZE = 32;
 
 struct kq_empty {};
 
+// U is the type of y: T for a whole matmul and for the split-K partials
+// of the plain kernels, float for the _pf32 kernels (float16 by default,
+// bfloat16 under KQ_SPLITK_F32=1).
 template <
     typename T,
     typename LoaderW,
@@ -115,11 +118,12 @@ template <
     const int BK = 32,
     const int BN = 32,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    typename U = T>
 METAL_FUNC void kq_qmm_t_impl(
     const device uint8_t* w,
     const device T* x,
-    device T* y,
+    device U* y,
     threadgroup T* Xs,
     threadgroup T* Ws,
     const constant int& K,
@@ -135,12 +139,11 @@ METAL_FUNC void kq_qmm_t_impl(
 
   (void)lid;
 
-  static_assert(WM * WN == 4, "the tile runs on four simdgroups");
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
   using mma_t = mlx::steel::BlockMMA<
       T,
-      T,
+      U,
       BM,
       BN,
       BK,
@@ -1470,7 +1473,16 @@ struct KqQ8_0BlockLoader {
   }
 };
 
-template <typename T, int group_size, int bits, bool aligned_N, bool batched>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool batched,
+    int BM = 64,
+    int BN = 64,
+    int WM = 2,
+    int WN = 2>
 [[kernel]] void kq_q8_0_qmm_t(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -1507,7 +1519,7 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
   static_assert(
       group_size == KQ_Q8_0_GROUP, "Q8_0 kernel requires group_size=32");
   static_assert(bits == 8, "Q8_0 kernel requires bits=8");
-  constexpr int BM = 64, BK = 32, BN = 64;
+  constexpr int BK = 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -1517,8 +1529,8 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
       BK,
       BK_padded,
       /*reduction_dim=*/1,
-      /*tgp_size=*/2 * 2 * SIMD_SIZE>;
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      /*tgp_size=*/WM * WN * SIMD_SIZE>;
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
@@ -1527,12 +1539,13 @@ template <
     int group_size,
     int bits,
     bool aligned_N,
-    int small_bm = 0>
+    int small_bm = 0,
+    typename U = T>
 [[kernel]] void kq_q8_0_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
     const device T* x,
-    device T* y,
+    device U* y,
     const constant int& K,
     const constant int& N,
     const constant int& M,
@@ -1565,7 +1578,7 @@ template <
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, U>(
       wl,
       x,
       y,
@@ -1987,10 +2000,10 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
 // Register-resident MMA verify (kq_verify_mma.h). Lane L owns qs bytes
 // 8L..8L+7: fragments (b0, b2), (b1, b3), (b4, b6), (b5, b7). Each pair
 // has its sign bits flipped and is masked into the mantissas of a half2
-// (1024 + 128 + q), which one fma maps to q / 256, exact in half. The
-// 1/256 keeps every product within half its activation, so one channel
-// near the top of the half range stays finite in the block sum, and
-// d_scale restores the factor.
+// (1024 + 128 + q), which one fma maps to q / 256, exact in half, and
+// d_scale restores the factor. In the half kernels the 1/256 keeps every
+// product within half its activation, so one channel near the top of the
+// half range stays finite in the block sum.
 struct KqQ8_0Mma {
   static constant constexpr int block_k = KQ_Q8_0_GROUP;
   static constant constexpr int block_bytes = KQ_Q8_0_BLOCK_BYTES;
@@ -1999,14 +2012,14 @@ struct KqQ8_0Mma {
   static METAL_FUNC int perm(int f, int col) {
     return 8 * (col / 2) + 4 * (f >> 1) + (f & 1) + 2 * (col & 1);
   }
-  template <int NT>
+  template <int NT, typename X, typename A>
   static METAL_FUNC void block(
       thread const KqVmmaRows<NT>& rows,
       int boff,
       short L,
       short fm,
-      const threadgroup half* xb,
-      thread simdgroup_half8x8 (&acc)[NT]) {
+      const threadgroup X* xb,
+      thread simdgroup_matrix<A, 8, 8> (&acc)[NT]) {
     uint wv[NT][2];
     for (short t = 0; t < NT; ++t) {
       const packed_ushort4 v =
@@ -2469,7 +2482,16 @@ struct KqQ5_1BlockLoader {
   }
 };
 
-template <typename T, int group_size, int bits, bool aligned_N, bool batched>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool batched,
+    int BM = 64,
+    int BN = 64,
+    int WM = 2,
+    int WN = 2>
 [[kernel]] void kq_q5_1_qmm_t(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -2506,7 +2528,7 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
   static_assert(
       group_size == KQ_Q5_1_GROUP, "Q5_1 kernel requires group_size=32");
   static_assert(bits == 5, "Q5_1 kernel requires bits=5");
-  constexpr int BM = 64, BK = 32, BN = 64;
+  constexpr int BK = 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -2516,8 +2538,8 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
       BK,
       BK_padded,
       /*reduction_dim=*/1,
-      /*tgp_size=*/2 * 2 * SIMD_SIZE>;
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      /*tgp_size=*/WM * WN * SIMD_SIZE>;
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
@@ -2526,12 +2548,13 @@ template <
     int group_size,
     int bits,
     bool aligned_N,
-    int small_bm = 0>
+    int small_bm = 0,
+    typename U = T>
 [[kernel]] void kq_q5_1_qmm_t_splitk(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
     const device T* x,
-    device T* y,
+    device U* y,
     const constant int& K,
     const constant int& N,
     const constant int& M,
@@ -2564,7 +2587,7 @@ template <
   wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, U>(
       wl,
       x,
       y,

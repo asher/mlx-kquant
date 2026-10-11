@@ -300,7 +300,16 @@ struct KqMxfp4BlockLoader {
   }
 };
 
-template <typename T, int group_size, int bits, bool aligned_N, bool batched>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool batched,
+    int BM = 64,
+    int BN = 64,
+    int WM = 2,
+    int WN = 2>
 [[kernel]] void kq_mxfp4_qmm_t(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -336,58 +345,14 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
   }
   static_assert(group_size == KQ_MXFP4_GROUP, "MXFP4 requires gs=32");
   static_assert(bits == 4, "MXFP4 requires bits=4");
-  constexpr int BM = 64, BK = 32, BN = 64;
+  constexpr int BK = 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
   using LoaderW =
-      KqMxfp4BlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      KqMxfp4BlockLoader<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
-}
-
-template <typename T, int group_size, int bits, bool aligned_N>
-[[kernel]] void kq_mxfp4_qmm_t_splitk(
-    const device uint8_t* w,
-    const device uint8_t* /* scales */,
-    const device T* x,
-    device T* y,
-    const constant int& K,
-    const constant int& N,
-    const constant int& M,
-    const constant int& k_partition_size,
-    const constant int& split_k_partition_stride,
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint lid [[thread_index_in_threadgroup]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  static_assert(group_size == KQ_MXFP4_GROUP, "MXFP4 requires gs=32");
-  static_assert(bits == 4, "MXFP4 requires bits=4");
-  constexpr int BM = 32, BK = 32, BN = 32;
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
-  threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BN * BK_padded];
-  using LoaderW =
-      KqMxfp4BlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
-  const int k_start = tid.z * k_partition_size;
-  x += k_start;
-  auto wl = w;
-  wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
-  y += tid.z * static_cast<int64_t>(split_k_partition_stride);
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
-      wl,
-      x,
-      y,
-      Xs,
-      Ws,
-      K,
-      N,
-      M,
-      k_partition_size,
-      tid,
-      lid,
-      simd_gid,
-      simd_lid);
 }
 
 template <typename T, int group_size, int bits, bool batched>
@@ -810,7 +775,16 @@ struct KqNvfp4BlockLoader {
   }
 };
 
-template <typename T, int group_size, int bits, bool aligned_N, bool batched>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    bool batched,
+    int BM = 64,
+    int BN = 64,
+    int WM = 2,
+    int WN = 2>
 [[kernel]] void kq_nvfp4_qmm_t(
     const device uint8_t* w,
     const device uint8_t* /* scales */,
@@ -846,58 +820,14 @@ template <typename T, int group_size, int bits, bool aligned_N, bool batched>
   }
   static_assert(group_size == KQ_NVFP4_SUPERBLOCK, "NVFP4 requires gs=64");
   static_assert(bits == 4, "NVFP4 requires bits=4");
-  constexpr int BM = 64, BK = 32, BN = 64;
+  constexpr int BK = 32;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
   using LoaderW =
-      KqNvfp4BlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
+      KqNvfp4BlockLoader<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
-}
-
-template <typename T, int group_size, int bits, bool aligned_N>
-[[kernel]] void kq_nvfp4_qmm_t_splitk(
-    const device uint8_t* w,
-    const device uint8_t* /* scales */,
-    const device T* x,
-    device T* y,
-    const constant int& K,
-    const constant int& N,
-    const constant int& M,
-    const constant int& k_partition_size,
-    const constant int& split_k_partition_stride,
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint lid [[thread_index_in_threadgroup]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  static_assert(group_size == KQ_NVFP4_SUPERBLOCK, "NVFP4 requires gs=64");
-  static_assert(bits == 4, "NVFP4 requires bits=4");
-  constexpr int BM = 32, BK = 32, BN = 32;
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
-  threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BN * BK_padded];
-  using LoaderW =
-      KqNvfp4BlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
-  const int k_start = tid.z * k_partition_size;
-  x += k_start;
-  auto wl = w;
-  wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
-  y += tid.z * static_cast<int64_t>(split_k_partition_stride);
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(
-      wl,
-      x,
-      y,
-      Xs,
-      Ws,
-      K,
-      N,
-      M,
-      k_partition_size,
-      tid,
-      lid,
-      simd_gid,
-      simd_lid);
 }
 
 template <typename T, int group_size, int bits, bool batched>

@@ -1,6 +1,8 @@
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
 #include <filesystem>
 #include <sstream>
 #include <stdexcept>
@@ -23,48 +25,18 @@ namespace mlx_kquant {
 
 namespace {
 
-// Matrix-contiguity helper. A "matrix-contiguous" tensor only needs
-// its LAST TWO dims densely packed (stride(-2)==shape(-1) && stride(-1)==1); a
-// strided LEADING/batch dim is fine because the qmv/qmm/gather kernels walk it
-// via the strides passed in add_strides_and_shapes. Using full
-// mx::contiguous() here instead would force a copy of the whole tensor whenever
-// the leading dim is strided - e.g. the gate/up halves of a fused MoE
-// gate_up_exps tensor are slices [..., :H, :] / [..., H:, :] whose expert
-// (leading) stride is 2*H rows: matrix-contiguous but NOT row_contiguous, so
-// full contiguify copies ~142 MB PER gather call (the decode MoE 5x
-// regression).
-// True when the elements of x are laid out row-major in memory (size-1
-// dims ignored), so a kernel can walk them as dense rows without a copy.
-inline bool kq_rows_dense(const mx::array& x) {
-  int64_t expect = 1;
-  for (int i = x.ndim() - 1; i >= 0; --i) {
-    if (x.shape(i) == 1) {
-      continue;
-    }
-    if (x.strides()[i] != expect) {
-      return false;
-    }
-    expect *= x.shape(i);
-  }
-  return true;
-}
-
-inline mx::array kq_ensure_row_contiguous_matrix(
-    const mx::array& x,
-    mx::StreamOrDevice s) {
-  if (x.ndim() < 2) {
-    if (x.strides()[0] == 1) {
-      return x;
-    }
-  } else {
-    auto stride_0 = x.strides()[x.ndim() - 2];
-    auto stride_1 = x.strides()[x.ndim() - 1];
-    if (stride_0 == static_cast<int64_t>(x.shape(-1)) && stride_1 == 1) {
-      return x;
-    }
-  }
-  return mx::contiguous(x, false, s);
-}
+// Matrix-contiguity. A "matrix-contiguous" tensor only needs its LAST TWO
+// dims densely packed (stride(-2)==shape(-1) && stride(-1)==1); a strided
+// LEADING/batch dim is fine because the qmv/qmm/gather kernels walk it via
+// the strides passed in add_strides_and_shapes. Using full mx::contiguous()
+// instead would force a copy of the whole tensor whenever the leading dim is
+// strided - e.g. the gate/up halves of a fused MoE gate_up_exps tensor are
+// slices [..., :H, :] / [..., H:, :] whose expert (leading) stride is 2*H
+// rows: matrix-contiguous but NOT row_contiguous, so full contiguify copies
+// ~142 MB PER gather call (the decode MoE 5x regression). w and scales go
+// through kq_matrix_dense (kquant_dense.cpp), which reads the strides of an
+// array that has memory and leaves any other array to a node that decides
+// at eval.
 
 // x always gets an unconditional Contiguous node: build-time strides of an
 // unevaluated array are meaningless, so a stride check here can hand the
@@ -75,7 +47,161 @@ inline mx::array kq_dense_x(const mx::array& x, mx::StreamOrDevice s) {
   return mx::contiguous(x, false, s);
 }
 
+// Codecs whose plain transposed quantized_matmul runs as dequantize then the
+// stock matmul on a GPU without NAX before M5, from a floor in the rows of
+// x. The qmm_t kernel decodes each weight tile once per 64-row tile of x;
+// the dequantize pass decodes the weight once, so it pays from the floor,
+// where the stock matmul outruns the in-loop decode. Floors measured on M3
+// Max, and applied to the whole class.
+struct KqDequantizeRow {
+  const char* codec;
+  int min_m;
+};
+
+constexpr KqDequantizeRow kDequantizeRows[] = {
+    {"nvfp4", 2048},
+    {"ptq1_0", 2048},
+    {"q3_k", 2048},
+    {"q4_k", 16384},
+    {"q5_k", 2048},
+    {"q6_k", 2048},
+};
+
+// The measured range of the route. The dense copy of the weight lives while
+// the call runs, so N x K caps it at 24576 x 12288 x 2 bytes; a vocabulary
+// head keeps the kernel.
+constexpr int kDequantizeMinK = 3840;
+constexpr int kDequantizeMaxK = 12288;
+constexpr int kDequantizeMinN = 3840;
+constexpr int kDequantizeMaxN = 24576;
+
+// The row for a codec and shape, the chip class aside: min_m, min_k, max_k,
+// min_n and max_n, or empty.
+std::vector<int>
+kq_dequantize_shape_row(const std::string& kquant_type, int M, int N, int K) {
+  if (K < kDequantizeMinK || K > kDequantizeMaxK || N < kDequantizeMinN ||
+      N > kDequantizeMaxN) {
+    return {};
+  }
+  for (const auto& r : kDequantizeRows) {
+    if (kquant_type == r.codec && M >= r.min_m) {
+      return {
+          r.min_m,
+          kDequantizeMinK,
+          kDequantizeMaxK,
+          kDequantizeMinN,
+          kDequantizeMaxN};
+    }
+  }
+  return {};
+}
+
+// True for the chip classes the route runs on by default: an architecture
+// string applegpu_g<gen><suffix> with a two digit generation from 13 (M1)
+// to 16 (M4), a one letter suffix other than p (phones), and no NAX. Any
+// other string keeps the kernel.
+bool kq_dequantize_class(const std::string& arch, bool nax) {
+  if (nax) {
+    return false;
+  }
+  const std::string head = "applegpu_g";
+  if (arch.size() != head.size() + 3 || arch.compare(0, head.size(), head)) {
+    return false;
+  }
+  const char d0 = arch[head.size()];
+  const char d1 = arch[head.size() + 1];
+  const char suffix = arch[head.size() + 2];
+  if (!std::isdigit(static_cast<unsigned char>(d0)) ||
+      !std::isdigit(static_cast<unsigned char>(d1)) ||
+      !std::islower(static_cast<unsigned char>(suffix)) || suffix == 'p') {
+    return false;
+  }
+  const int gen = (d0 - '0') * 10 + (d1 - '0');
+  return gen >= 13 && gen <= 16;
+}
+
+// Whether a plain transposed call on a 2-D weight on a GPU stream takes the
+// route: never under off or while KQ_QMM_TILE pins the tile, on any GPU
+// under force, on the class under auto, and then only for a codec row and
+// shape of the table.
+bool kq_dequantize_route_takes(
+    bool on_class,
+    int mode,
+    bool pinned,
+    const std::string& kquant_type,
+    int M,
+    int N,
+    int K) {
+  if (mode == kDequantOff || pinned) {
+    return false;
+  }
+  if (mode != kDequantForce && !on_class) {
+    return false;
+  }
+  return !kq_dequantize_shape_row(kquant_type, M, N, K).empty();
+}
+
+#ifdef _METAL_
+// This GPU's class verdict, read once per process. NAX first.
+bool kq_dequantize_class_here() {
+  static const bool here = []() {
+    if (kq_is_nax_available()) {
+      return false;
+    }
+    auto& d = mx::metal::device(mx::Device::gpu);
+    return kq_dequantize_class(d.get_architecture(), false);
+  }();
+  return here;
+}
+#endif
+
+// Dequantize then the stock matmul, carried by KQuantDequantRoute for the
+// vjp of the kernel path.
+mx::array kq_dequantize_matmul(
+    const mx::array& x,
+    const mx::array& w,
+    const mx::array& scales,
+    const std::string& kquant_type,
+    mx::Dtype out_type,
+    mx::Stream s);
+
 } // namespace
+
+std::vector<int> alu_dequantize_row(
+    const std::string& arch,
+    bool nax,
+    const std::string& kquant_type,
+    int M,
+    int N,
+    int K) {
+  if (!kq_dequantize_class(arch, nax)) {
+    return {};
+  }
+  return kq_dequantize_shape_row(kquant_type, M, N, K);
+}
+
+bool dequantize_route_takes(
+    const std::string& arch,
+    bool nax,
+    const std::string& mode,
+    bool pinned,
+    const std::string& kquant_type,
+    int M,
+    int N,
+    int K) {
+  int m = kDequantAuto;
+  if (mode == "off") {
+    m = kDequantOff;
+  } else if (mode == "force") {
+    m = kDequantForce;
+  } else if (mode != "auto") {
+    throw std::invalid_argument(
+        "[mlx_kquant] dequantize route mode must be auto, off or force, got '" +
+        mode + "'.");
+  }
+  return kq_dequantize_route_takes(
+      kq_dequantize_class(arch, nax), m, pinned, kquant_type, M, N, K);
+}
 
 // ----------------------------- ops -----------------------------
 
@@ -124,8 +250,8 @@ mx::array dequantize(
   out_shape.back() =
       (w.shape(-1) / codec->bytes_per_block) * codec->weights_per_block;
 
-  // Row-contiguize at the op level so eval_gpu can assume dense inputs.
-  auto w_c = w.flags().row_contiguous ? w : mx::contiguous(w, false, s);
+  // Row-major bytes for the kernel. A w without memory is decided at eval.
+  auto w_c = kq_row_major(w, s);
 
   kq_check_weight_base_at_build(w, kquant_type, s, "dequantize");
 
@@ -196,30 +322,84 @@ mx::array quantized_matmul(
   }
 
   auto s = mx::to_stream(s_);
+  const bool lora =
+      lora_a.has_value() || lora_b.has_value() || lora_rows.has_value();
+  if (lora && w.ndim() != 2) {
+    throw std::invalid_argument(
+        "[mlx_kquant.quantized_matmul] the LoRA epilogue needs a 2-D w.");
+  }
+  // Rows of x, which the leading dims give for any inner dim.
+  int rows = 1;
+  for (int i = 0; i + 1 < static_cast<int>(x.ndim()); i++) {
+    rows *= x.shape(i);
+  }
+  // An inner dim of 0 makes every sum empty, so the result is zeros. The
+  // kernels divide by the inner dim. The LoRA arguments pass the checks of
+  // a full call first.
+  if (w_inner_dims == 0) {
+    if (lora) {
+      std::vector<mx::array> checked;
+      kq_lora_prep(
+          "[mlx_kquant.quantized_matmul]",
+          lora_a,
+          lora_b,
+          std::nullopt,
+          std::nullopt,
+          lora_rows,
+          out_type,
+          w_inner_dims,
+          w_outer_dims,
+          0,
+          {rows},
+          1,
+          s,
+          checked);
+    }
+    auto shape = x.shape();
+    shape.back() = w_outer_dims;
+    return mx::zeros(shape, out_type, s);
+  }
   kq_check_weight_base_at_build(w, kquant_type, s, "quantized_matmul");
+
+#ifdef _METAL_
+  if (transpose && !lora && w.ndim() == 2 && s.device == mx::Device::gpu) {
+    const bool here = kq_dequantize_class_here();
+    if (kq_dequantize_route_takes(
+            here,
+            kq_dequant_route_mode(),
+            kq_qmm_tile_pinned(),
+            kquant_type,
+            rows,
+            w_outer_dims,
+            w_inner_dims)) {
+      if (kq_qmm_log_on()) {
+        std::fprintf(
+            stderr,
+            "[kq dequant] %s M=%d N=%d K=%d\n",
+            kquant_type.c_str(),
+            rows,
+            w_outer_dims,
+            w_inner_dims);
+      }
+      return kq_dequantize_matmul(x, w, scales, kquant_type, out_type, s);
+    }
+  }
+#endif
 
   // Cast x to the output dtype, then matrix-row-contiguize x / w / scales at
   // the op level so eval_gpu can assume dense inputs.
   auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
-  auto w_c = kq_ensure_row_contiguous_matrix(w, s);
-  auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
+  auto w_c = kq_matrix_dense(w, s);
+  auto scales_c = kq_matrix_dense(scales, s);
 
   auto out_shape = x_c.shape();
   out_shape.back() = w_outer_dims;
 
   std::vector<mx::array> op_inputs = {x_c, w_c, scales_c};
   int lora_flags = 0;
-  if (lora_a.has_value() || lora_b.has_value() || lora_rows.has_value()) {
-    if (w.ndim() != 2) {
-      throw std::invalid_argument(
-          "[mlx_kquant.quantized_matmul] the LoRA epilogue needs a 2-D w.");
-    }
-    // The epilogue walks x as dense [rows, K] rows; views that are only
-    // matrix-contiguous with a leading stride gap get copied.
-    if (!kq_rows_dense(op_inputs[0])) {
-      op_inputs[0] = mx::contiguous(op_inputs[0], false, s);
-    }
-    const int rows = static_cast<int>(x_c.size() / w_inner_dims);
+  if (lora) {
+    // The epilogue walks x as dense [rows, K] rows, which the Contiguous
+    // node of x gives it.
     lora_flags = kq_lora_prep(
         "[mlx_kquant.quantized_matmul]",
         lora_a,
@@ -247,6 +427,90 @@ mx::array quantized_matmul(
           transpose,
           lora_flags),
       std::move(op_inputs));
+}
+
+namespace {
+
+mx::array kq_dequantize_matmul(
+    const mx::array& x,
+    const mx::array& w,
+    const mx::array& scales,
+    const std::string& kquant_type,
+    mx::Dtype out_type,
+    mx::Stream s) {
+  auto w_f = dequantize(w, scales, kquant_type, out_type, s);
+  auto y = mx::stop_gradient(
+      mx::matmul(mx::astype(x, out_type, s), mx::transpose(w_f, s), s), s);
+  auto shape = y.shape();
+  return mx::array(
+      std::move(shape),
+      out_type,
+      std::make_shared<KQuantDequantRoute>(s, kquant_type),
+      {y, x, w, scales});
+}
+
+} // namespace
+
+void KQuantDequantRoute::eval_cpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  outputs[0].copy_shared_buffer(inputs[0]);
+}
+
+void KQuantDequantRoute::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  outputs[0].copy_shared_buffer(inputs[0]);
+}
+
+std::vector<mx::array> KQuantDequantRoute::vjp(
+    const std::vector<mx::array>& primals,
+    const std::vector<mx::array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<mx::array>&) {
+  // primals = {y (stop_gradient), x, w, scales}, as KQuantMatmul::vjp: x
+  // gets the quantized matmul the other way, w and scales throw.
+  std::vector<mx::array> vjps;
+  for (auto arg : argnums) {
+    if (arg == 0) {
+      vjps.push_back(cotangents[0]);
+    } else if (arg == 1) {
+      auto dx = quantized_matmul(
+          cotangents[0],
+          primals[2],
+          primals[3],
+          kquant_type_,
+          false,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          stream());
+      vjps.push_back(mx::astype(dx, primals[1].dtype(), stream()));
+    } else if (arg == 2) {
+      throw std::invalid_argument(
+          "[mlx_kquant] quantized_matmul vjp: no gradient wrt the quantized "
+          "weights (the kquant base is frozen).");
+    } else {
+      throw std::invalid_argument(
+          "[mlx_kquant] quantized_matmul vjp: no gradient wrt scales.");
+    }
+  }
+  return vjps;
+}
+
+std::vector<mx::array> KQuantDequantRoute::jvp(
+    const std::vector<mx::array>&,
+    const std::vector<mx::array>&,
+    const std::vector<int>&) {
+  throw std::invalid_argument(
+      "[Primitive::jvp] Not implemented for KQuantMatmul.");
+}
+
+std::pair<std::vector<mx::array>, std::vector<int>> KQuantDequantRoute::vmap(
+    const std::vector<mx::array>&,
+    const std::vector<int>&) {
+  throw std::invalid_argument(
+      "[Primitive::vmap] Not implemented for KQuantMatmul.");
 }
 
 mx::array quantized_matmul_qmv_bias(
@@ -323,11 +587,9 @@ mx::array quantized_matmul_qmv_bias(
   kq_check_weight_base_at_build(w, kquant_type, s, "quantized_matmul_qmv_bias");
 
   auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
-  auto w_c = kq_ensure_row_contiguous_matrix(w, s);
-  auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
-  auto bias_c = mx::astype(bias, out_type, s);
-  bias_c =
-      bias_c.flags().row_contiguous ? bias_c : mx::contiguous(bias_c, false, s);
+  auto w_c = kq_matrix_dense(w, s);
+  auto scales_c = kq_matrix_dense(scales, s);
+  auto bias_c = kq_row_major(mx::astype(bias, out_type, s), s);
 
   auto out_shape = x_c.shape();
   out_shape.back() = N;
@@ -492,9 +754,9 @@ mx::array gather_qmm(
   // short-circuit here skipped the compaction on the slice's first eval and
   // handed the stride-less rhs kernels an expert stride they mis-walk.
   // Contiguous::eval aliases zero-copy when w turns out packed anyway.
-  auto w_c = rhs_reachable ? mx::contiguous(w, false, s)
-                           : kq_ensure_row_contiguous_matrix(w, s);
-  auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
+  auto w_c =
+      rhs_reachable ? mx::contiguous(w, false, s) : kq_matrix_dense(w, s);
+  auto scales_c = kq_matrix_dense(scales, s);
 
   return mx::array(
       std::move(out_shape),
@@ -626,7 +888,7 @@ mx::array gather_qmm_seg(
   // The kernel computes each expert's base pointer as expert * N * K_w, so w
   // must be fully row-contiguous (no strided expert dim).
   auto w_c = mx::contiguous(w, false, s);
-  auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
+  auto scales_c = kq_matrix_dense(scales, s);
   auto map_c = mx::contiguous(map, false, s);
   auto cnt_c = mx::contiguous(counts, false, s);
 
@@ -704,14 +966,11 @@ std::vector<mx::array> quantize(
       (w.shape(-1) / codec->weights_per_block) * codec->bytes_per_block;
   mx::Shape s_shape = {1};
 
-  // Row-contiguize w (+ imatrix) at the op level; eval_gpu trusts contiguity.
-  auto w_c = w.flags().row_contiguous ? w : mx::contiguous(w, false, s);
-  std::vector<mx::array> inputs = {w_c};
+  // Row-major w and imatrix for the encoder. An operand without memory is
+  // decided at eval.
+  std::vector<mx::array> inputs = {kq_row_major(w, s)};
   if (imatrix.has_value()) {
-    auto im_c = imatrix->flags().row_contiguous
-        ? *imatrix
-        : mx::contiguous(*imatrix, false, s);
-    inputs.push_back(im_c);
+    inputs.push_back(kq_row_major(*imatrix, s));
   }
 
   return mx::array::make_arrays(
@@ -743,6 +1002,41 @@ bool metallib_loads() {
   auto& d = mx::metal::device(mx::Device::gpu);
   // get_library throws if <dir>/mlx_kquant.metallib is missing or unreadable.
   d.get_library("mlx_kquant", metallib_dir());
+  return true;
+#else
+  return false;
+#endif
+}
+
+std::vector<std::string> metallib_kernels() {
+#ifdef _METAL_
+  auto& d = mx::metal::device(mx::Device::gpu);
+  MTL::Library* lib = d.get_library("mlx_kquant", metallib_dir());
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  NS::Array* names = lib->functionNames();
+  std::vector<std::string> out;
+  out.reserve(names->count());
+  for (NS::UInteger i = 0; i < names->count(); ++i) {
+    out.emplace_back(names->object<NS::String>(i)->utf8String());
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+#else
+  return {};
+#endif
+}
+
+int max_threadgroup_memory() {
+#ifdef _METAL_
+  auto& d = mx::metal::device(mx::Device::gpu);
+  return static_cast<int>(d.mtl_device()->maxThreadgroupMemoryLength());
+#else
+  return 0;
+#endif
+}
+
+bool probe_kernels() {
+#ifdef KQ_PROBE_KERNELS
   return true;
 #else
   return false;

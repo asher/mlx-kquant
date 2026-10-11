@@ -109,6 +109,7 @@ def _patched_load_model(
             strict=strict,
             model_config=model_config,
             trust_remote_code=_trust_remote_code,
+            get_model_classes=get_model_classes,
         )
 
     kwargs = {}

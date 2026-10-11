@@ -23,8 +23,9 @@ import glob
 import importlib
 import importlib.util
 import json
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 
@@ -116,6 +117,7 @@ def load(
     trust_remote_code: bool = False,
     model_config: dict | None = None,
     revision: str | None = None,
+    get_model_classes: Callable[..., tuple[type, Any]] | None = None,
 ) -> tuple[nn.Module, dict]:
     """Load a kquant checkpoint and return ``(model, config)``.
 
@@ -128,6 +130,11 @@ def load(
             imported and executed (arbitrary code). Off by default.
         model_config: optional overrides merged into the loaded config.
         revision: optional HF revision (branch / tag / commit).
+        get_model_classes: optional ``get_model_classes(config=config)`` that
+            returns ``(Model, ModelArgs)``, as mlx-lm's ``load_model`` takes;
+            by default the mlx-lm class for ``config["model_type"]``. A
+            ``model_file`` the checkpoint declares takes precedence, as in
+            mlx-lm.
 
     Returns:
         ``(model, config)`` with ``KQuant*`` modules installed and weights loaded.
@@ -182,6 +189,8 @@ def load(
         arch = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(arch)
         model_class, args_class = arch.Model, arch.ModelArgs
+    elif get_model_classes is not None:
+        model_class, args_class = get_model_classes(config=config)
     else:
         model_class, args_class = _get_classes(config)
 

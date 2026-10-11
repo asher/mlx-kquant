@@ -688,11 +688,10 @@ def test_sdpa_cascade_q8_batch_major_private():
         mx.eval(call([ks, kb, vs, vb]))
 
 
-def test_sdpa_decode_gqa_starts_zero_matches_plain(monkeypatch):
-    # all-zero starts must match the no-starts call on the same inputs. A
-    # call with starts keeps the simdgroup pass 1, so the plain call is
-    # pinned to it too.
-    monkeypatch.setenv("KQ_GQA_NAX", "0")
+def test_sdpa_decode_gqa_starts_zero_matches_plain(gqa_pass1):
+    # all-zero starts must match the no-starts call on the same inputs, on
+    # either pass 1. The tensor-op kernel runs the same arithmetic at a
+    # start of 0, so its output is bit-identical.
     scale = 1.0 / (512**0.5)
     q, k, v = _make(4, 24, 4, 1, 2048, 512, mx.bfloat16, seed=3, strided=False)
     starts = mx.zeros((4,), dtype=mx.int32)
@@ -700,6 +699,84 @@ def test_sdpa_decode_gqa_starts_zero_matches_plain(monkeypatch):
     b = kq.sdpa_decode_gqa(q, k, v, scale)
     _eval_or_skip(a, b)
     assert _rel(a, b) < 1e-6
+    if gqa_pass1 == "1":
+        assert mx.array_equal(a, b).item()
+
+
+# Left-padded rows at head_dim 512 on both pass 1 kernels: pad 0, a pad on
+# a 256-key tile boundary, a pad mid-tile, the maximum in-contract pad (one
+# visible key), pads that leave whole splits empty, the serve pads of three
+# rows one prefill tick apart, and the gemma-4 31b global layer at batch 8.
+@pytest.mark.parametrize(
+    "kL,B,Hq,Hkv,pads,splits,dtype",
+    [
+        (3071, 4, 32, 4, [0, 1024, 1543, 3070], 16, mx.bfloat16),
+        (3071, 4, 32, 4, [0, 1024, 1543, 3070], 0, mx.float16),
+        (4300, 2, 16, 2, [3000, 4299], 64, mx.bfloat16),
+        (4300, 3, 32, 4, [0, 1, 2], 0, mx.bfloat16),
+        (8192, 8, 32, 4, None, 0, mx.bfloat16),
+    ],
+)
+def test_sdpa_decode_gqa_hd512_route_starts(
+    gqa_pass1, kL, B, Hq, Hkv, pads, splits, dtype
+):
+    _check_gqa_starts(
+        512,
+        kL=kL,
+        dtype=dtype,
+        B=B,
+        Hq=Hq,
+        Hkv=Hkv,
+        pads=pads,
+        strided=True,
+        splits=splits,
+    )
+
+
+def test_sdpa_decode_gqa_hd512_starts_takes_nax(monkeypatch):
+    # With starts the tensor-op pass 1 runs from the same 3072-row switch,
+    # so KQ_GQA_NAX changes the output there (the kernels round
+    # differently).
+    if not kq.nax_available():
+        pytest.skip("the tensor-op pass 1 needs NAX")
+    scale = 1.0 / (512**0.5)
+    q, k, v = _make(3, 32, 4, 1, 2000, 512, mx.bfloat16, seed=81, strided=False)
+    pads = [0, 1, 2]
+    starts = mx.array(pads, dtype=mx.int32)
+    outs = []
+    for flag in ("0", "1"):
+        monkeypatch.setenv("KQ_GQA_NAX", flag)
+        outs.append(kq.sdpa_decode_gqa(q, k, v, scale, starts=starts))
+        _eval_or_skip(outs[-1])
+    ref = _ref_sdpa_starts(q, k, v, scale, pads, 1)
+    mx.eval(ref)
+    assert not mx.array_equal(outs[0], outs[1]).item()
+    for out in outs:
+        assert _rel(out, ref) < REL_BOUND[mx.bfloat16]
+
+
+def test_sdpa_decode_gqa_hd512_starts_skips_pad_rows(monkeypatch):
+    # The tensor-op pass 1 never reads K or V below a row's start: NaN in
+    # every pad row, including the pad keys of a partly padded tile, leaves
+    # the output finite and equal to the reference.
+    if not kq.nax_available():
+        pytest.skip("the tensor-op pass 1 needs NAX")
+    monkeypatch.setenv("KQ_GQA_NAX", "1")
+    D, kL, B = 512, 2000, 3
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(B, 32, 4, 1, kL, D, mx.bfloat16, seed=82, strided=False)
+    pads = [0, 300, 1031]
+    pos = mx.arange(kL).reshape(1, 1, kL, 1)
+    pad = pos < mx.array(pads).reshape(B, 1, 1, 1)
+    nan = mx.array(float("nan"), dtype=mx.bfloat16)
+    kn = mx.where(pad, nan, k)
+    vn = mx.where(pad, nan, v)
+    starts = mx.array(pads, dtype=mx.int32)
+    got = kq.sdpa_decode_gqa(q, kn, vn, scale, starts=starts)
+    ref = _ref_sdpa_starts(q, k, v, scale, pads, 1)
+    _eval_or_skip(got, ref)
+    assert mx.isfinite(got.astype(mx.float32)).all().item()
+    assert _rel(got, ref) < REL_BOUND[mx.bfloat16]
 
 
 @pytest.mark.parametrize("qL", [2, 4])

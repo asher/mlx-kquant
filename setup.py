@@ -16,6 +16,14 @@ os.environ["CMAKE_ARGS"] = (
     f"{os.environ.get('CMAKE_ARGS', '')} -DPython_EXECUTABLE={sys.executable}".strip()
 )
 
+# KQ_PROBE_KERNELS is a cached CMake option, so every build names its value:
+# without it a build after a probe build keeps the probe kernels. The
+# environment variable KQ_PROBE_KERNELS=1 asks for a probe build; a
+# -DKQ_PROBE_KERNELS in CMAKE_ARGS is left alone.
+if "-DKQ_PROBE_KERNELS" not in os.environ["CMAKE_ARGS"]:
+    probe = os.environ.get("KQ_PROBE_KERNELS", "").lower() in ("1", "on", "true", "yes")
+    os.environ["CMAKE_ARGS"] += f" -DKQ_PROBE_KERNELS={'ON' if probe else 'OFF'}"
+
 # Force the Metal deployment target to 26.2 on macOS.
 # https://github.com/ml-explore/mlx/issues/3586
 if sys.platform == "darwin":

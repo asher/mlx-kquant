@@ -165,6 +165,38 @@ def test_gpu_weight_base(codec):
 
 
 @GPU
+@pytest.mark.parametrize("codec", ["q4_k", "q5_k", "q6_k", "q8_0"])
+def test_gpu_weight_base_glu(codec):
+    """quantized_matmul_glu checks the start of both weights: in its fused
+    kernel, which runs from 1024 rows on a NAX GPU, and through
+    quantized_matmul elsewhere."""
+    a = _align(codec)
+    wg, _ = _wire(codec, (N, K))
+    wu, _ = _wire(codec, (N, K), seed=4)
+    for m in (64, 1100):
+        x = (mx.random.normal((m, K), key=mx.random.key(m)) * 0.5).astype(mx.bfloat16)
+        fused = m >= 1024 and kq.nax_available()
+        msg = _msg(
+            "quantized_matmul_glu" if fused else "quantized_matmul", codec, a // 2
+        )
+        for j in range(2):
+
+            def call(o, j=j, x=x):
+                g = wg if o is None or j != 0 else _shift(wg, o)
+                u = wu if o is None or j != 1 else _shift(wu, o)
+                return kq.quantized_matmul_glu(x, g, u, codec)
+
+            _check(call, sorted({a, 16}), a // 2, msg)
+        # A weight that is not yet evaluated raises from the eval instead.
+        y = kq.quantized_matmul_glu(x, wg, _shift(wu, a // 2, evaluate=False), codec)
+        with pytest.raises(ValueError, match=msg):
+            mx.eval(y)
+        # The stream keeps working.
+        ref = kq.quantized_matmul_glu(x, wg, wu, codec)
+        assert _equal(kq.quantized_matmul_glu(x, _shift(wg, 16), wu, codec), ref)
+
+
+@GPU
 def test_gpu_weight_base_qmv_bias():
     codec = "q8_0"
     w, s = _wire(codec, (N, K))

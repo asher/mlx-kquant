@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.27)
 project(mlx_kquant LANGUAGES CXX C)
 
 # ----------------------------- Setup -----------------------------
-# C++20: MLX 0.32.1's public headers (device.h, stream.h) use defaulted
+# C++20: MLX 0.32.3's public headers (device.h, stream.h) use defaulted
 # comparison operators, a C++20 feature. Apple Clang accepts them as an
 # extension under -std=c++17, but GCC (the Linux toolchain) rejects them, so a
 # C++17 standard breaks the Metal-free Linux build. 20 builds cleanly on both.
@@ -12,6 +12,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(BUILD_SHARED_LIBS "Build extensions as a shared library" ON)
+option(KQ_PROBE_KERNELS "Build the probe tiles of kernels under measurement" OFF)
 
 # ----------------------------- Dependencies -----------------------------
 # Pick the right interpreter. mlx.extension.CMakeBuild invokes cmake WITHOUT
@@ -37,7 +38,7 @@ find_package(
 # "incompatible function arguments". Build isolation installs the pin;
 # non-isolated dev builds (build_ext --inplace, -e --no-build-isolation) use
 # whatever the venv has - guard that path here.
-set(KQ_NANOBIND_PIN "2.13.0")
+set(KQ_NANOBIND_PIN "3.0.1")
 execute_process(
   COMMAND "${Python_EXECUTABLE}" -c "import nanobind; print(nanobind.__version__)"
   OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -153,6 +154,12 @@ target_sources(
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_kvarn.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_moe_glu.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_norm_fused.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_qk_norm_rope.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_matmul_fused.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_matmul_lora.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_matmul_resid.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_conv_nax.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_dense.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_hadamard.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_lora_epilogue.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_hc_glue.cpp
@@ -221,12 +228,27 @@ endif()
 target_link_libraries(mlx_kquant_ext PUBLIC gguflib)
 target_link_options(mlx_kquant_ext PRIVATE ${KQ_WHOLE_ARCHIVE_GGUFLIB})
 
+# A probe build carries the probe tiles and reads the levers that select
+# them. A release build compiles those levers out. PUBLIC, because the
+# sources above are PUBLIC and so are compiled into the Python module too,
+# and that copy is the one the bindings call.
+if(KQ_PROBE_KERNELS)
+  target_compile_definitions(mlx_kquant_ext PUBLIC KQ_PROBE_KERNELS)
+endif()
+
 # ----------------------------- Metal library -----------------------------
 # The kq_* kernels compiled into a single mlx_kquant.metallib.
 # The repo's metal/ dir is searched BEFORE the stock-wheel include tree so the
 # repo's kq_*.h + quantized_utils.h (which adds load_vector) win;
 # steel/gemm/*, utils.h, etc. fall through to the stock wheel headers.
 if(MLX_BUILD_METAL)
+  # Probe tiles are measured against the shipped ones and stay out of a
+  # release metallib.
+  set(KQ_PROBE_METAL_SOURCES "")
+  if(KQ_PROBE_KERNELS)
+    list(APPEND KQ_PROBE_METAL_SOURCES
+         ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax_epi_probe.metal)
+  endif()
   # The metallib has no depfile; header edits retrigger it only through DEPS.
   file(GLOB KQ_METAL_KERNEL_HEADERS CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_LIST_DIR}/metal/mlx/backend/metal/kernels/*.h)
@@ -240,6 +262,10 @@ if(MLX_BUILD_METAL)
     SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax_epi.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax_lora.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax_resid.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_conv_nax.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_encode.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_sdpa.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_sdpa_nax.metal
@@ -256,12 +282,14 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_glu.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_glu_kq.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_norm_fused.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_qk_norm_rope.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_hadamard.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_lora_epilogue.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_hc_glue.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_hc_lowrank.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_route_shed.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_skinny_mv.metal
+    ${KQ_PROBE_METAL_SOURCES}
     INCLUDE_DIRS
     ${CMAKE_CURRENT_LIST_DIR}/metal
     ${MLX_INCLUDE_DIRS}
@@ -296,7 +324,7 @@ if(BUILD_SHARED_LIBS)
     # installed mlx wheel at runtime. _ext.so lives in site-packages/mlx_kquant/,
     # libmlx in site-packages/mlx/lib/, so ../mlx/lib reaches it. (The absolute
     # build-tree rpath MLXConfig adds works only on the build machine; this is
-    # what makes a redistributed wheel find the ABI-pinned mlx==0.32.1. delocate
+    # what makes a redistributed wheel find the ABI-pinned mlx==0.32.3. delocate
     # must therefore *exclude* libmlx from vendoring - see [tool.cibuildwheel].)
     target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path)
     target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path/../mlx/lib)

@@ -52,14 +52,14 @@ pip install mlx-kquant            # the K-quant ops + precompiled metallib
 pip install "mlx-kquant[tools]"   # the CLI (quantize / run / chat / lora / fuse)
 ```
 
-Either pulls the ABI-matched `mlx==0.32.1` automatically.
+Either pulls the ABI-matched `mlx==0.32.3` automatically.
 
 **From source** (or to develop) needs the Metal toolchain (`xcrun metal`); the metallib compiles at
 install time, no runtime JIT:
 
 ```sh
 git clone https://github.com/asher/mlx-kquant && cd mlx-kquant
-pip install "mlx==0.32.1"         # pinned, ABI-matched stock wheel (pulls the Metal backend)
+pip install "mlx==0.32.3"         # pinned, ABI-matched stock wheel (pulls the Metal backend)
 pip install -e ".[tools]"         # builds _ext + mlx_kquant.metallib; adds mlx-lm for the CLI
 ```
 
@@ -70,7 +70,7 @@ x86_64 stays on the scalar/threaded path.) The base `mlx` wheel ships no backend
 install the CPU one explicitly:
 
 ```sh
-pip install "mlx[cpu]==0.32.1"   # base frontend + libmlx CPU backend
+pip install "mlx[cpu]==0.32.3"   # base frontend + libmlx CPU backend
 pip install -e . --no-build-isolation
 ```
 
@@ -299,9 +299,10 @@ All optional; the defaults are right for normal use.
   kernel. By default `sp` serves launches under 2048 threadgroups and `dd` serves wider ones at 2
   to 8 rows. Read per call. `loop` and `sp` give identical bytes. A/B lever.
 - `KQ_MOE_HALF=1` - on Metal, run the iq2_xs, iq2_xxs and iq3_xxs fused MoE decode gathers on the
-  half-dot kernels (half grid tables, half-staged activations, half chunk dots with a float sum per
-  chunk; shared-expert slots stay on the float path). Read per call. Default off: the outputs differ
-  from the float kernels at half rounding level. A/B lever.
+  half-dot kernels (half grid tables and half-staged activations, with each chunk dotted in float;
+  shared-expert slots stay on the float path). Read per call. Default off: the outputs differ from
+  the float kernels at half rounding level, and an activation past 65504 in magnitude turns to inf.
+  A/B lever.
 
 - `KQ_SDPA_IDX_NAX=0` - run `sdpa_fa_indexed` on its simdgroup kernel even where the NAX tile
   kernel is available. Read once per process. The simdgroup kernel matches `sdpa_fa_verify` over
@@ -376,7 +377,7 @@ are informed by our analysis of the mixed-precision quants that [Unsloth][unslot
 
 ## Version pinning
 
-Pinned to `mlx==0.32.1`. The kernels include MLX's steel headers and the extension links `libmlx`,
+Pinned to `mlx==0.32.3`. The kernels include MLX's steel headers and the extension links `libmlx`,
 binding it to that release's ABI and header API. To move to a newer MLX: update the bundled headers
 under `metal/mlx/backend/metal/kernels/` for that wheel, rebuild, and re-run the test suite.
 
@@ -390,10 +391,10 @@ python -m pytest tests/
 
 - **macOS 26.2 (Tahoe) or later on Apple Silicon** (M-series). Building from source needs the Metal
   toolchain (`xcrun metal`).
-- **Linux** (x86_64 or aarch64) is supported CPU-only. Build against `mlx[cpu]==0.32.1`, no Metal
+- **Linux** (x86_64 or aarch64) is supported CPU-only. Build against `mlx[cpu]==0.32.3`, no Metal
   toolchain required. See [Install](#install) and [Limitations](#limitations).
-- **Python >= 3.10** (the pinned `mlx==0.32.1` ships no cp39 wheel).
-- **`mlx==0.32.1`** exactly - the kernels include MLX's steel headers and the extension links
+- **Python >= 3.10** (the pinned `mlx==0.32.3` ships no cp39 wheel).
+- **`mlx==0.32.3`** exactly - the kernels include MLX's steel headers and the extension links
   `libmlx`, so the ABI is version-locked (see [Version pinning](#version-pinning)).
 
 ## Limitations

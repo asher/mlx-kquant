@@ -90,7 +90,6 @@
   instantiate_kquant_nax_gather_qmm_rhs(type, gs, bits, false, nn, 64, 64, 2, 2, codec)
 
 #define instantiate_kquant_nax_codec(codec, gs, bits)                                      \
-  instantiate_kquant_nax_codec_for_type(codec, float,       gs, bits)                      \
   instantiate_kquant_nax_codec_for_type(codec, float16_t,   gs, bits)                      \
   instantiate_kquant_nax_codec_for_type(codec, bfloat16_t,  gs, bits)
 
@@ -129,7 +128,12 @@
       "kquant_" #codec "_qmm_t_nax_splitk_" #type "_gs_" #gs "_b_" #bits     \
           "_bm" #bm "_bn64_bk64_wm2_wn2_alN_" #aligned_N,                    \
       kq_ ## codec ## _qmm_t_nax_splitk,                                     \
-      type, gs, bits, aligned_N, bm, 64, 2, 2)
+      type, gs, bits, aligned_N, bm, 64, 2, 2)                               \
+  instantiate_kernel(                                                        \
+      "kquant_" #codec "_qmm_t_nax_splitk_" #type "_gs_" #gs "_b_" #bits     \
+          "_bm" #bm "_bn64_bk64_wm2_wn2_alN_" #aligned_N "_pf32",            \
+      kq_ ## codec ## _qmm_t_nax_splitk,                                     \
+      type, gs, bits, aligned_N, bm, 64, 2, 2, float)
 #define instantiate_kquant_nax_splitk_bm(codec, gs, bits, bm)                \
   instantiate_kquant_nax_qmm_t_splitk(float16_t,  gs, bits, true,  bm, codec) \
   instantiate_kquant_nax_qmm_t_splitk(float16_t,  gs, bits, false, bm, codec) \
@@ -200,10 +204,14 @@ instantiate_kquant_nax_db64(q5_0, 32, 5)
 // per-threadgroup work (loader dequant + MMA issue, real DRAM ~half
 // peak); BM=128 halves the row-tile count and with it total loader
 // dequant per unique weight. A loads straight from device, so the cost
-// is Dtile registers: 8 accumulator fragments vs 4. Dispatched only when
-// ceil(M/64) is even and M >= 193 (padding parity with BM=64; q6_k ABBA
-// at three shapes: +9-25% M224-512, prefill M512-2048 +8-10% hot,
-// +31-40% cold). KQ_NAX_BM128=0 kills.
+// is Dtile registers: 8 accumulator fragments vs 4. Dispatched when
+// ceil(M/64) is even and M is at or above the per-codec floor (padding
+// parity with BM=64; q6_k ABBA at three shapes: +9-25% M224-512, prefill
+// M512-2048 +8-10% hot, +31-40% cold), and at every M from
+// KQ_NAX_BM128_ODD_M, where the row-live guard in kq_qmm_t_nax_tgp_impl
+// runs a last row tile of 64 rows or fewer with the loads and MMA of a
+// BM=64 tile.
+// KQ_NAX_BM128=0 kills.
 #define instantiate_kquant_nax_qmm_t_bm128(codec, type, gs, bits)             \
   instantiate_kquant_nax_qmm_t(type, gs, bits, true,  1, 128, 64, 2, 2, codec) \
   instantiate_kquant_nax_qmm_t(type, gs, bits, true,  0, 128, 64, 2, 2, codec) \
@@ -236,6 +244,45 @@ instantiate_kquant_nax_bm128(stq1_0, 256, 1)
 instantiate_kquant_nax_bm128(pq2_0, 128, 2)
 instantiate_kquant_nax_bm128(q2_0, 64, 2)
 instantiate_kquant_nax_bm128(ptq1_0, 128, 1)
+// The BM=64 and BM=128 tiles on a K tile of 128 (half super-block or pair
+// loaders), per codec. KQ_NAX_<codec>_BK128=0 keeps the BK=64 kernels.
+#define instantiate_kquant_nax_bk128(codec, gs, b, type, al, batched, bm)    \
+  instantiate_kernel(                                                        \
+      "kquant_" #codec "_qmm_t_nax_" #type "_gs_" #gs "_b_" #b               \
+          "_bm" #bm "_bn64_bk128_wm2_wn2"                                    \
+          "_alN_" #al "_batch_" #batched,                                    \
+      kq_##codec##_qmm_t_nax_bk128,                                          \
+      type,                                                                  \
+      gs,                                                                    \
+      b,                                                                     \
+      al,                                                                    \
+      batched,                                                               \
+      bm,                                                                    \
+      64,                                                                    \
+      2,                                                                     \
+      2)
+#define instantiate_kquant_nax_bk128_bm(codec, gs, b, type, bm)              \
+  instantiate_kquant_nax_bk128(codec, gs, b, type, true,  1, bm)             \
+  instantiate_kquant_nax_bk128(codec, gs, b, type, true,  0, bm)             \
+  instantiate_kquant_nax_bk128(codec, gs, b, type, false, 1, bm)             \
+  instantiate_kquant_nax_bk128(codec, gs, b, type, false, 0, bm)
+#define instantiate_kquant_nax_bk128_codec(codec, gs, b)                     \
+  instantiate_kquant_nax_bk128_bm(codec, gs, b, float16_t,  64)              \
+  instantiate_kquant_nax_bk128_bm(codec, gs, b, bfloat16_t, 64)              \
+  instantiate_kquant_nax_bk128_bm(codec, gs, b, float16_t,  128)             \
+  instantiate_kquant_nax_bk128_bm(codec, gs, b, bfloat16_t, 128)
+instantiate_kquant_nax_bk128_codec(q6_k, 256, 6)
+instantiate_kquant_nax_bk128_codec(q5_k, 256, 5)
+instantiate_kquant_nax_bk128_codec(q3_k, 256, 3)
+instantiate_kquant_nax_bk128_codec(q4_k, 256, 4)
+instantiate_kquant_nax_bk128_codec(q4_0, 32, 4)
+instantiate_kquant_nax_bk128_codec(q4_1, 32, 4)
+instantiate_kquant_nax_bk128_codec(q5_0, 32, 5)
+instantiate_kquant_nax_bk128_codec(iq4_nl, 32, 4)
+instantiate_kquant_nax_bk128_codec(iq3_xxs, 256, 3)
+instantiate_kquant_nax_bk128_codec(iq3_s, 256, 3)
+instantiate_kquant_nax_bk128_codec(iq2_xs, 256, 2)
+instantiate_kquant_nax_bk128_codec(iq2_s, 256, 2)
 
 // Small-BM gather_qmm_rhs tile for the few-rows-per-expert prefill regime
 // (MoE top-k at chat chunk sizes: rows/E ~ 4-32). Every expert segment in
@@ -366,7 +413,12 @@ instantiate_kquant_nax_gather_seg_codec(ptq1_0, 128, 1)
   instantiate_kernel(                                                 \
       "kquant_" #codec "_verify_nax_" #type "_gs_" #gs "_b_" #bits,   \
       kq_ ## codec ## _verify_nax,                                    \
-      type, gs, bits)
+      type, gs, bits)                                                 \
+  instantiate_kernel(                                                 \
+      "kquant_" #codec "_verify_nax_" #type "_gs_" #gs "_b_" #bits    \
+          "_pf32",                                                    \
+      kq_ ## codec ## _verify_nax,                                    \
+      type, gs, bits, float)
 instantiate_kquant_verify_nax(bfloat16_t, 128, 2, pq2_0)
 instantiate_kquant_verify_nax(bfloat16_t, 64, 2, q2_0)
 instantiate_kquant_verify_nax(float16_t, 128, 2, pq2_0)
