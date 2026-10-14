@@ -2720,10 +2720,92 @@ std::vector<mx::array> KQuantMatmul::vjp(
 
 #ifdef _METAL_
 
-// One verify_nax dispatch per four weights where the widest weight would
-// take the verify_nax route at this M, and quantized_matmul per weight
-// otherwise. The route levers of quantized_matmul apply: KQ_NAX_QMV,
-// KQ_VERIFY_NAX and KQ_DISABLE_NAX through kq_is_nax_available.
+// Probe lever: KQ_FORCE_QMM_MIN_M=<m> routes transpose shapes with M >= m
+// straight to qmm (-> NAX), bypassing the mv_ext/verify_qmv claims, for
+// qmm-vs-mv_ext crossover measurement below M=13. Read once per process.
+static int kq_force_qmm_min_m() {
+  static const int m = []() {
+    const char* e = std::getenv("KQ_FORCE_QMM_MIN_M");
+    return e != nullptr ? std::atoi(e) : 0;
+  }();
+  return m;
+}
+
+// KQ_QMM_ROUTE=<route> is set (see eval_gpu_base).
+static bool kq_qmm_route_forced() {
+  const char* e = std::getenv("KQ_QMM_ROUTE");
+  return e != nullptr && e[0] != '\0';
+}
+
+enum class KqSmallMRoute { other, qmv, verify_nax };
+
+// The NAX small-M route quantized_matmul takes for a transposed,
+// non-batched call on a float16 or bfloat16 x of M rows, once the forced
+// KQ_FORCE_QMM_MIN_M and KQ_QMM_ROUTE routes are out of the way: per-row
+// qmv, verify_nax (still subject to kq_verify_nax_fits), or a later route.
+// quantized_matmul_multi joins weights into one verify_nax dispatch only
+// where this returns verify_nax for the widest weight.
+//
+// Per-row qmv on NAX GPUs, M 2 through kq_nax_qmv_max_m for the call's
+// N. KQ_NAX_QMV=<m> sets the limit to m at every N, and 0 disables the
+// route. The default yields to a forced KQ_VERIFY_NAX or KQ_VERIFY_MMA
+// on a codec they serve, a forced KQ_QMM_SPLITK_NAX or KQ_QMM_SPLITK,
+// and a set KQ_VERIFY_EXT, so their arms time the route they name.
+// KQ_DISABLE_NAX turns it off, since the limits are measured against
+// the NAX routes. KQ_NAX_QMV is read live so an A/B can flip arms on
+// one generator.
+//
+// Register-fed NAX verify, from kq_verify_nax_min_m through M8; see
+// verify_nax. KQ_VERIFY_NAX=<m> forces the entry at M >= m, and 0
+// disables it. Read live so an A/B can flip arms on one generator.
+// KQ_DISABLE_NAX turns it off with the other NAX routes. Decided ahead
+// of verify_mma and NAX split-K, but the default entry yields to a
+// forced KQ_VERIFY_MMA on a codec verify_mma serves, or a forced
+// KQ_QMM_SPLITK_NAX, so their arms time the route they name.
+static KqSmallMRoute
+kq_nax_small_m_route(const std::string& t, int M, int N, int K, bool f16) {
+  if (M < 1 || M > 32 || !kq_is_nax_available() || !codec_has_nax(t)) {
+    return KqSmallMRoute::other;
+  }
+  const int vnax_env = kq_env_int("KQ_VERIFY_NAX", -1);
+  const int vmma_force = kq_env_int("KQ_VERIFY_MMA", -1);
+  const int sk_force = kq_env_int("KQ_QMM_SPLITK_NAX", -1);
+  if (M >= 2) {
+    int qmv_max_m = kq_env_int("KQ_NAX_QMV", -1);
+    if (qmv_max_m == -1) {
+      const int ext = kq_verify_ext_env();
+      const bool forced =
+          (vnax_env >= 1 && M >= vnax_env && codec_verify_nax_kstep(t) > 0) ||
+          (vmma_force >= 2 && M >= vmma_force &&
+           codec_verify_mma_rows(t) > 0) ||
+          sk_force >= 1 || kq_qmm_splitk_env() > 1 || ext == 0 || ext == 1;
+      qmv_max_m = forced ? 0 : kq_nax_qmv_max_m(t, N);
+    }
+    if (M <= qmv_max_m) {
+      return KqSmallMRoute::qmv;
+    }
+  }
+  if (M <= 8) {
+    const bool other_forced =
+        (vmma_force >= 2 && M >= vmma_force && codec_verify_mma_rows(t) > 0) ||
+        sk_force >= 1;
+    int vnax_min_m = vnax_env;
+    if (vnax_env == -1) {
+      vnax_min_m = other_forced ? 0 : kq_verify_nax_min_m(t, N, K, f16);
+    }
+    if (vnax_min_m > 0 && M >= vnax_min_m) {
+      return KqSmallMRoute::verify_nax;
+    }
+  }
+  return KqSmallMRoute::other;
+}
+
+// One verify_nax dispatch per four weights where quantized_matmul would
+// take the verify_nax route on the widest weight at this M, and
+// quantized_matmul per weight otherwise. The narrower weights ride along on
+// that route. Every route lever of quantized_matmul applies, through
+// kq_nax_small_m_route, and a forced KQ_QMM_ROUTE or KQ_FORCE_QMM_MIN_M
+// runs quantized_matmul per weight.
 void KQuantMatmulMulti::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
@@ -2745,20 +2827,14 @@ void KQuantMatmulMulti::eval_gpu(
     n_max = std::max(n_max, w.shape(0));
   }
   const int kstep = kq_verify_nax_call_kstep(K, kquant_type_);
-  bool multi = M >= 2 && M <= 8 && n_max > 0 && x.flags().row_contiguous &&
-      x.dtype() != mx::float32 && kq_is_nax_available() &&
-      codec_has_nax(kquant_type_) && kstep > 0;
+  const int force_min_m = kq_force_qmm_min_m();
+  bool multi = n_max > 0 && kstep > 0 && x.flags().row_contiguous &&
+      x.dtype() != mx::float32 && !kq_qmm_route_forced() &&
+      !(force_min_m > 0 && M >= force_min_m) &&
+      kq_nax_small_m_route(
+          kquant_type_, M, n_max, K, x.dtype() == mx::float16) ==
+          KqSmallMRoute::verify_nax;
   if (multi) {
-    int qmv_max_m = kq_env_int("KQ_NAX_QMV", -1);
-    if (qmv_max_m == -1) {
-      qmv_max_m = kq_nax_qmv_max_m(kquant_type_, n_max);
-    }
-    int vnax_min_m = kq_env_int("KQ_VERIFY_NAX", -1);
-    if (vnax_min_m == -1) {
-      vnax_min_m =
-          kq_verify_nax_min_m(kquant_type_, n_max, K, x.dtype() == mx::float16);
-    }
-    multi = M > qmv_max_m && vnax_min_m > 0 && M >= vnax_min_m;
     for (const auto& w : ws) {
       multi = multi && kq_verify_nax_fits(w, K, kstep, kquant_type_);
     }
@@ -2858,13 +2934,8 @@ void KQuantMatmul::eval_gpu_base(
   // through to dispatch_qmv below rather than throw; a qmv_quad kernel would be
   // a perf-only path for an essentially-dead case.
 
-  // Probe lever: KQ_FORCE_QMM_MIN_M=<m> routes transpose shapes with M >= m
-  // straight to qmm (-> NAX), bypassing the mv_ext/verify_qmv claims, for
-  // qmm-vs-mv_ext crossover measurement below M=13.
-  static const int force_qmm_min_m = []() {
-    const char* e = std::getenv("KQ_FORCE_QMM_MIN_M");
-    return e != nullptr ? std::atoi(e) : 0;
-  }();
+  // Probe lever KQ_FORCE_QMM_MIN_M (kq_force_qmm_min_m).
+  const int force_qmm_min_m = kq_force_qmm_min_m();
   if (force_qmm_min_m > 0 && transpose_ && M >= force_qmm_min_m) {
     qmm(x,
         w,
@@ -2919,60 +2990,17 @@ void KQuantMatmul::eval_gpu_base(
     }
   }
 
-  // Per-row qmv on NAX GPUs, M 2 through kq_nax_qmv_max_m for the call's
-  // N. KQ_NAX_QMV=<m> sets the limit to m at every N, and 0 disables the
-  // route. The default yields to a forced KQ_VERIFY_NAX or KQ_VERIFY_MMA
-  // on a codec they serve, a forced KQ_QMM_SPLITK_NAX or KQ_QMM_SPLITK,
-  // and a set KQ_VERIFY_EXT, so their arms time the route they name.
-  // KQ_DISABLE_NAX turns it off, since the limits are measured against
-  // the NAX routes. KQ_NAX_QMV is read live so an A/B can flip arms on
-  // one generator.
-  if (transpose_ && non_batched && M >= 2 && M <= 32 &&
-      x.dtype() != mx::float32 && kq_is_nax_available() &&
-      codec_has_nax(kquant_type_)) {
-    int qmv_max_m = kq_env_int("KQ_NAX_QMV", -1);
-    if (qmv_max_m == -1) {
-      const int vnax_force = kq_env_int("KQ_VERIFY_NAX", -1);
-      const int vmma_force = kq_env_int("KQ_VERIFY_MMA", -1);
-      const int sk_force = kq_env_int("KQ_QMM_SPLITK_NAX", -1);
-      const int ext = kq_verify_ext_env();
-      const bool forced = (vnax_force >= 1 && M >= vnax_force &&
-                           codec_verify_nax_kstep(kquant_type_) > 0) ||
-          (vmma_force >= 2 && M >= vmma_force &&
-           codec_verify_mma_rows(kquant_type_) > 0) ||
-          sk_force >= 1 || kq_qmm_splitk_env() > 1 || ext == 0 || ext == 1;
-      qmv_max_m = forced ? 0 : kq_nax_qmv_max_m(kquant_type_, N);
-    }
-    if (M <= qmv_max_m) {
+  // Per-row qmv and verify_nax on NAX GPUs: kq_nax_small_m_route.
+  if (transpose_ && non_batched && x.dtype() != mx::float32) {
+    const KqSmallMRoute route =
+        kq_nax_small_m_route(kquant_type_, M, N, K, x.dtype() == mx::float16);
+    if (route == KqSmallMRoute::qmv) {
       dispatch_qmv(
           x, w, scales, out, group_size_, bits_, M, N, K, d, s, kquant_type_);
       return;
     }
-  }
-
-  // Register-fed NAX verify, from kq_verify_nax_min_m through M8; see
-  // verify_nax. KQ_VERIFY_NAX=<m> forces the entry at M >= m, and 0
-  // disables it. Read live so an A/B can flip arms on one generator.
-  // KQ_DISABLE_NAX turns it off with the other NAX routes. Decided ahead
-  // of verify_mma and NAX split-K, but the default entry yields to a
-  // forced KQ_VERIFY_MMA on a codec verify_mma serves, or a forced
-  // KQ_QMM_SPLITK_NAX, so their arms time the route they name.
-  if (transpose_ && non_batched && M <= 8 && x.dtype() != mx::float32 &&
-      kq_is_nax_available() && codec_has_nax(kquant_type_)) {
     const int kstep = kq_verify_nax_call_kstep(K, kquant_type_);
-    const int vnax_env = kq_env_int("KQ_VERIFY_NAX", -1);
-    const int vmma_force = kq_env_int("KQ_VERIFY_MMA", -1);
-    const int sk_force = kq_env_int("KQ_QMM_SPLITK_NAX", -1);
-    const bool other_forced = (vmma_force >= 2 && M >= vmma_force &&
-                               codec_verify_mma_rows(kquant_type_) > 0) ||
-        sk_force >= 1;
-    int vnax_min_m = vnax_env;
-    if (vnax_env == -1) {
-      vnax_min_m = other_forced
-          ? 0
-          : kq_verify_nax_min_m(kquant_type_, N, K, x.dtype() == mx::float16);
-    }
-    if (vnax_min_m > 0 && M >= vnax_min_m &&
+    if (route == KqSmallMRoute::verify_nax &&
         kq_verify_nax_fits(w, K, kstep, kquant_type_)) {
       const int sp = kq_verify_nax_splits(N, K, kstep, kquant_type_);
       verify_nax(

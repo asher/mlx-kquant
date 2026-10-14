@@ -2,9 +2,9 @@
 
 On a NAX GPU the op runs one verify_nax dispatch per four weights at 2 to
 8 rows, where quantized_matmul would run verify_nax on the widest weight.
-With the split count forced to one value, the verify_nax entry at M 2 and
-the per-row qmv route off, quantized_matmul per weight runs the same
-kernel body and fold, so the outputs match bit for bit. At the default
+With the split count forced to one value and the verify_nax entry forced
+at M 2, quantized_matmul per weight runs the same kernel body and fold, so
+the outputs match bit for bit. At the default
 levers the joint grid can take another split count than each weight
 alone, so the outputs are checked
 against a float64 reference built from kq.dequantize weights. Every other
@@ -13,6 +13,7 @@ case runs quantized_matmul per weight, which the CPU stream checks.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -20,9 +21,11 @@ import sys
 import mlx.core as mx
 import numpy as np
 import pytest
+from kqref import synth_wire
 from qmm_probe import force_cpu
 
 import mlx_kquant as kq
+from mlx_kquant.codec_geometry import CODEC_GEOMETRY
 
 DTYPES = [mx.bfloat16, mx.float16]
 R1 = {mx.bfloat16: 6e-3, mx.float16: 1e-3}
@@ -73,15 +76,29 @@ def _per_weight(x, ws, codec):
 
 @pytest.fixture
 def exact_levers(monkeypatch):
-    """One split count, verify_nax from M 2 and no per-row qmv route, so
-    quantized_matmul runs verify_nax on every weight the op joins."""
+    """One split count and verify_nax forced from M 2, which also turns the
+    default per-row qmv route off, so quantized_matmul runs verify_nax on
+    every weight the op joins."""
 
     def set_splits(n):
         monkeypatch.setenv("KQ_VERIFY_NAX_SPLITS", str(n))
 
-    monkeypatch.setenv("KQ_NAX_QMV", "0")
     monkeypatch.setenv("KQ_VERIFY_NAX", "2")
     return set_splits
+
+
+def _synth(codec, n, k, seed):
+    # Codecs kq.quantize does not encode: random valid wire.
+    _, _, bpb, wpb = CODEC_GEOMETRY[codec]
+    rng = np.random.default_rng(seed)
+    wire = synth_wire(rng, codec, bpb, n * (k // wpb))
+    return mx.array(wire.reshape(n, (k // wpb) * bpb))
+
+
+def _equal(a, b):
+    return np.array_equal(
+        np.array(a.astype(mx.float32)), np.array(b.astype(mx.float32))
+    )
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -102,6 +119,21 @@ def test_matches_per_weight_bits(codec, dtype, splits, exact_levers):
             assert np.array_equal(
                 np.array(g.astype(mx.float32)), np.array(w.astype(mx.float32))
             ), f"{codec} M={m} N={w.shape[-1]}"
+
+
+@pytest.mark.parametrize("codec", ["pq2_0", "q2_0"])
+@pytest.mark.parametrize("splits", [1, 2, 4])
+def test_synth_codecs_match_per_weight_bits(codec, splits, exact_levers):
+    exact_levers(splits)
+    ws = [_synth(codec, n, 1024, i) for i, n in enumerate(NS)]
+    for dtype in DTYPES:
+        for m in range(1, 9):
+            x = _x(m, 1024, dtype)
+            got = kq.quantized_matmul_multi(x, ws, codec)
+            want = _per_weight(x, ws, codec)
+            mx.eval(got, want)
+            for g, w in zip(got, want, strict=True):
+                assert _equal(g, w), f"{codec} M={m} N={w.shape[-1]}"
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -181,17 +213,23 @@ def test_empty_weight(exact_levers):
     )
 
 
-def test_lever_off(monkeypatch):
-    monkeypatch.setenv("KQ_MATMUL_MULTI", "0")
-    ws = [w for w, _ in _weights("q4_0", NS, 512)]
+def test_misaligned_base_falls_back(exact_levers):
+    # verify_nax reads q4_0 in 4-byte words: a weight 2 bytes past a 4-byte
+    # boundary sends the whole group per weight, off verify_nax.
+    exact_levers(1)
+    w = _weight("q4_0", 64, 512, 3)[0]
+    flat = mx.concatenate([mx.zeros((2,), mx.uint8), w.reshape(-1)])
+    mx.eval(flat)
+    wv = flat[2:].reshape(w.shape)
+    mx.eval(wv)
+    ws = [_weight("q4_0", 128, 512, 4)[0], wv]
     x = _x(6, 512, mx.bfloat16)
     got = kq.quantized_matmul_multi(x, ws, "q4_0")
     want = _per_weight(x, ws, "q4_0")
     mx.eval(got, want)
     for g, w in zip(got, want, strict=True):
-        assert np.array_equal(
-            np.array(g.astype(mx.float32)), np.array(w.astype(mx.float32))
-        )
+        assert np.isfinite(np.array(g.astype(mx.float32))).all()
+        assert _equal(g, w)
 
 
 def test_grad_matches_per_weight():
@@ -231,28 +269,146 @@ def test_argument_errors():
 
 
 _LOG_CHILD = r"""
-import os, sys
+import json, os, sys
 import mlx.core as mx
 import mlx_kquant as kq
-ns = (4096, 640, 48, 48)
-w = [kq.quantize(mx.random.normal((n, 512)) * 0.1, "q4_0")[0] for n in ns]
-x = mx.random.normal((6, 512)).astype(mx.bfloat16)
-mx.eval(kq.quantized_matmul_multi(x, w, "q4_0"))
+codec, m, k, ns, steps = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), \
+    json.loads(sys.argv[4]), json.loads(sys.argv[5])
+w = [kq.quantize(mx.random.normal((n, k), key=mx.random.key(i)) * 0.1, codec)[0]
+     for i, n in enumerate(ns)]
+x = mx.random.normal((m, k), key=mx.random.key(9)).astype(mx.bfloat16)
+sc = mx.zeros((1,), mx.uint8)
+mx.eval(w, x)
+for i, (op, env) in enumerate(steps):
+    for name, value in env.items():
+        os.environ[name] = value
+    sys.stderr.write(f"=== {i}\n")
+    sys.stderr.flush()
+    if op == "multi":
+        out = kq.quantized_matmul_multi(x, w, codec)
+    else:
+        out = [kq.quantized_matmul(x, wi, sc, codec, transpose=True) for wi in w]
+    mx.eval(out)
 """
 
 
-@pytest.mark.skipif(force_cpu() or not kq.nax_available(), reason="NAX GPU route")
-def test_one_dispatch_on_nax():
-    env = {k: v for k, v in os.environ.items() if not k.startswith("KQ_")}
-    env["KQ_QMM_LOG"] = "1"
-    env["KQ_VERIFY_NAX_SPLITS"] = "1"
+def _census(steps, codec="q4_0", m=6, k=512, ns=(4096, 640, 48, 48), env=None):
+    """KQ_QMM_LOG kernel names per step of a child process. Each step is
+    (op, env): the env is set before the step's call, which is
+    quantized_matmul_multi ("multi") or quantized_matmul per weight."""
+    child = {kk: v for kk, v in os.environ.items() if not kk.startswith("KQ_")}
+    child["KQ_QMM_LOG"] = "1"
+    child.update(env or {})
     r = subprocess.run(
-        [sys.executable, "-c", _LOG_CHILD],
-        env=env,
+        [
+            sys.executable,
+            "-c",
+            _LOG_CHILD,
+            codec,
+            str(m),
+            str(k),
+            json.dumps(list(ns)),
+            json.dumps(steps),
+        ],
+        env=child,
         capture_output=True,
         text=True,
         timeout=300,
     )
     assert r.returncode == 0, r.stderr
-    lines = [ln for ln in r.stderr.splitlines() if ln.startswith("[kq qmm]")]
-    assert len(lines) == 1 and "verify_nax_multi" in lines[0], r.stderr
+    out = []
+    for part in r.stderr.split("=== ")[1:]:
+        lines = part.splitlines()[1:]
+        out.append([ln.split()[2] for ln in lines if ln.startswith("[kq qmm]")])
+    return out
+
+
+NAX_ONLY = pytest.mark.skipif(
+    force_cpu() or not kq.nax_available(), reason="NAX GPU route"
+)
+
+
+@NAX_ONLY
+def test_one_dispatch_on_nax():
+    (names,) = _census([["multi", {}]], env={"KQ_VERIFY_NAX_SPLITS": "1"})
+    assert len(names) == 1 and "verify_nax_multi" in names[0], names
+
+
+@NAX_ONLY
+@pytest.mark.parametrize(
+    "lever",
+    [
+        {"KQ_VERIFY_MMA": "2"},
+        {"KQ_QMM_SPLITK_NAX": "1"},
+        {"KQ_QMM_ROUTE": "qmv"},
+        {"KQ_QMM_ROUTE": "verify_mma"},
+        {"KQ_FORCE_QMM_MIN_M": "2"},
+        {"KQ_VERIFY_NAX": "0"},
+        {"KQ_NAX_QMV": "8"},
+    ],
+    ids=lambda e: ",".join(f"{k}={v}" for k, v in e.items()),
+)
+def test_route_levers_are_followed(lever):
+    # A lever that sends quantized_matmul off verify_nax sends the op to
+    # quantized_matmul per weight, which then runs the same kernels.
+    ns = (4096, 4096)
+    per, multi = _census([["per", {}], ["multi", {}]], ns=ns, env=lever)
+    assert not any("verify_nax" in n for n in per), per
+    assert multi == per
+
+
+@NAX_ONLY
+def test_forced_verify_nax_fuses_narrow_weights():
+    # KQ_VERIFY_NAX=2 alone takes quantized_matmul to verify_nax at widths
+    # whose default is per-row qmv; the op follows and joins the weights.
+    ns = (512, 256)
+    per, multi = _census(
+        [["per", {}], ["multi", {}]], m=4, ns=ns, env={"KQ_VERIFY_NAX": "2"}
+    )
+    assert len(per) == 2 and all("_verify_nax_" in n for n in per), per
+    assert len(multi) == 1 and "verify_nax_multi" in multi[0], multi
+
+
+@NAX_ONLY
+def test_lever_read_once_per_process():
+    # KQ_MATMUL_MULTI keeps its first read, as KQ_GLU, unless KQ_TUNE_LIVE=1.
+    steps = [["multi", {}], ["multi", {"KQ_MATMUL_MULTI": "0"}]]
+    first, second = _census(steps)
+    assert first == second and "verify_nax_multi" in first[0], (first, second)
+    first, second = _census(steps, env={"KQ_TUNE_LIVE": "1"})
+    assert "verify_nax_multi" in first[0], first
+    assert not any("verify_nax_multi" in n for n in second), second
+
+
+def test_lever_off():
+    # KQ_MATMUL_MULTI=0 builds quantized_matmul per weight: the same bits.
+    r = subprocess.run(
+        [sys.executable, "-c", _LEVER_OFF_CHILD],
+        env={**os.environ, "KQ_MATMUL_MULTI": "0"},
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split()[-1] == "EQUAL", r.stdout
+
+
+_LEVER_OFF_CHILD = r"""
+import os
+import mlx.core as mx
+import numpy as np
+if os.environ.get("KQUANT_FORCE_CPU"):
+    mx.set_default_device(mx.cpu)
+import mlx_kquant as kq
+ns = (48, 160, 1000, 300)
+w = [kq.quantize(mx.random.normal((n, 512), key=mx.random.key(n)) * 0.1, "q4_0")[0]
+     for n in ns]
+x = mx.random.normal((6, 512), key=mx.random.key(1)).astype(mx.bfloat16)
+sc = mx.zeros((1,), mx.uint8)
+got = kq.quantized_matmul_multi(x, w, "q4_0")
+want = [kq.quantized_matmul(x, wi, sc, "q4_0", transpose=True) for wi in w]
+mx.eval(got, want)
+f32 = [np.array(a.astype(mx.float32)) for a in got + want]
+same = all(np.array_equal(a, b) for a, b in zip(f32[: len(w)], f32[len(w) :]))
+print("EQUAL" if same else "DIFFER")
+"""

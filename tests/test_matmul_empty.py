@@ -1,4 +1,5 @@
-"""quantized_matmul and quantized_matmul_glu on empty inputs.
+"""quantized_matmul, quantized_matmul_glu and quantized_matmul_multi on
+empty inputs.
 
 No rows or no output columns give an empty array of the product's shape,
 and an inner dim of 0 gives zeros. The cases run on the default device, so
@@ -27,11 +28,19 @@ def _ops(codec):
     return {
         "matmul": lambda x, w: kq.quantized_matmul(x, w, SCALES, codec, True),
         "glu": lambda x, w: kq.quantized_matmul_glu(x, w, w, codec),
+        "multi": lambda x, w: _multi(x, w, codec),
     }
 
 
+def _multi(x, w, codec):
+    # Two weights through one call; both outputs are the same product.
+    a, b = kq.quantized_matmul_multi(x, [w, w], codec)
+    assert a.shape == b.shape and a.dtype == b.dtype
+    return mx.concatenate([a[None], b[None]]).max(axis=0)
+
+
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=["bf16", "f16"])
-@pytest.mark.parametrize("op", ["matmul", "glu"])
+@pytest.mark.parametrize("op", ["matmul", "glu", "multi"])
 @pytest.mark.parametrize("codec", ["q4_k", "q8_0", "q3_k"])
 def test_empty_inputs(codec, op, dtype):
     f = _ops(codec)[op]

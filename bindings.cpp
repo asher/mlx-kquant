@@ -683,8 +683,11 @@ NB_MODULE(_ext, m) {
         weights computes the products. Each weight is read from its own
         buffer and each product is written to its own output, so the
         weights need no joining copy. One split-K count covers the joint
-        grid. Every other case runs quantized_matmul per weight.
-        KQ_MATMUL_MULTI=0 runs quantized_matmul per weight on every call.
+        grid. The narrower weights take the widest weight's route, so
+        their outputs can differ from quantized_matmul in the last bits.
+        Every other case runs quantized_matmul per weight.
+        KQ_MATMUL_MULTI=0 runs quantized_matmul per weight on every call
+        (read once per process unless KQ_TUNE_LIVE=1).
         mx.grad gives the gradient with respect to x; the weights are
         frozen, as in quantized_matmul.
 

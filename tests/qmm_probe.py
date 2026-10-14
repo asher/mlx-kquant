@@ -6,6 +6,8 @@ a clean ``KQ_*`` environment, runs a list of ``quantized_matmul`` calls,
 and returns per call the ``KQ_QMM_LOG`` lines it printed (kernel name and
 grid), its error if it raised, and its relative Frobenius error against a
 float64 reference built from ``kq.dequantize`` weights. A call with
+``"multi": [n, ...]`` runs ``quantized_matmul_multi`` over its weight and
+one more of each listed N, and gets the largest error over the outputs. A call with
 ``"r2": true`` also gets ``rel2`` against those weights rounded to the
 activation dtype, and ``floor1``/``floor2``, the error of rounding each
 reference to the output dtype. A call with ``"ulp_vs": i`` gets ``ulp``,
@@ -244,6 +246,28 @@ for i, c in enumerate(spec["calls"]):
     )
     os.write(2, f"[probe] {i}\n".encode())
     res = {"i": i, "error": None, "rel": None, "ulp": None}
+    if c.get("multi"):
+        # quantized_matmul_multi over weights of N n and each of "multi";
+        # rel is the largest over the outputs.
+        ns = [c["n"], *c["multi"]]
+        wl = [weights(c["codec"], n, c["shape"][-1], design)[0] for n in ns]
+        try:
+            ys = kq.quantized_matmul_multi(x, wl, c["codec"])
+            mx.eval(ys)
+        except Exception as e:
+            res["error"] = f"{type(e).__name__}: {e}"
+            outs.append(None)
+            results.append(res)
+            continue
+        xn = as64(x)
+        res["rel"] = max(
+            rel(as64(y), xn @ dequantized(c["codec"], n, c["shape"][-1], design).T)
+            for y, n in zip(ys, ns, strict=True)
+        )
+        outs.append(None)
+        results.append(res)
+        mx.clear_cache()
+        continue
     try:
         y = kq.quantized_matmul(x, w, s, c["codec"], transpose=True)
         mx.eval(y)

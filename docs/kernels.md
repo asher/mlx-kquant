@@ -223,7 +223,7 @@ Tuning levers (defaults are right for normal use):
   the weights; `benchmarks/bench_dit_shapes.py` runs its tile arms this way. It reads the
   environment on every dispatch, so it is for single-threaded A/B runs that set these variables
   between calls. The `quantized_matmul_glu` levers (`KQ_GLU`, `KQ_GLU_MIN_ROWS`), the
-  `quantized_matmul_lora` levers (`KQ_QMM_LORA`, `KQ_QMM_LORA_MIN_ROWS`), the
+  `quantized_matmul_multi` lever (`KQ_MATMUL_MULTI`), the `quantized_matmul_lora` levers (`KQ_QMM_LORA`, `KQ_QMM_LORA_MIN_ROWS`), the
   `quantized_matmul_residual` lever (`KQ_QMM_RESID`), the dequantize route lever
   (`KQ_DEQUANT_ROUTE`) and the `conv2d_3x3` lever (`KQ_CONV_NAX`) are
   read when the op is called and builds its graph, not when a kernel is dispatched, so a compiled
@@ -641,6 +641,45 @@ On float16 activations the mat-vec routes run faster and the kernel the same, so
 entries the kernel ran up to 1.10x slower at K 4096 and 1.21x slower at N 12288, K 2560, and each
 entry under M 5 sits one row higher. At M 8 the kernel runs 1.05-1.39x faster than NAX split-K
 on the shapes of N 2048 and wider.
+
+## Quantized matmuls that share an input
+
+- `quantized_matmul_multi` - `[x @ W^T for W in weights]` for packed weights of one codec and one
+  inner dim that read the same x, such as the q, k and v projections or the gate and up projections
+  of a transformer block. It returns one output per weight, as `quantized_matmul` would.
+
+  On a NAX GPU (M5), at 2 to 8 activation rows, where `quantized_matmul` would take its verify_nax
+  route on the widest weight, one dispatch computes the products of up to four weights. The row
+  tiles of the weights lie end to end in one grid, each threadgroup owns 128 rows of one weight,
+  and the split-K partials of all of them share one temporary and one fold dispatch. More than four
+  weights run one dispatch per four. The split count is chosen for the joint grid. The call saves
+  the dispatch, the wait and the tail of every weight but the first, which counts most for narrow
+  weights next to a wide one.
+
+  The narrower weights take the route of the widest. A weight that `quantized_matmul` alone would
+  run on per-row qmv or on another kernel runs on verify_nax here, so its output can differ from
+  `quantized_matmul` in the last bits, inside the same bound against a float64 reference. This
+  holds for every codec with a verify_nax kernel, including those whose verify_nax entry starts at
+  a width that the narrow weight does not reach. Where every weight would take verify_nax at one
+  split count, the outputs equal `quantized_matmul` bit for bit.
+
+  Every other case runs `quantized_matmul` per weight: one row or more than 8, a single weight,
+  codecs without a verify_nax kernel, an inner dim that kernel does not step over, a weight whose
+  start it cannot read, CPU streams and GPUs without NAX. x is float16 or bfloat16, float32 x runs
+  in bfloat16 as in `quantized_matmul`, and leading batch dims fold into rows.
+
+  The route levers of `quantized_matmul` decide the route on the widest weight the same way:
+  `KQ_NAX_QMV`, `KQ_VERIFY_NAX`, `KQ_VERIFY_MMA`, `KQ_QMM_SPLITK_NAX`, `KQ_QMM_SPLITK`,
+  `KQ_VERIFY_EXT` and `KQ_DISABLE_NAX`. A set `KQ_QMM_ROUTE` or `KQ_FORCE_QMM_MIN_M` runs
+  `quantized_matmul` per weight, so a forced route times the route it names.
+
+  Lever, read when the op builds its graph, once per process unless `KQ_TUNE_LIVE=1`:
+
+  - `KQ_MATMUL_MULTI` - `0` builds `quantized_matmul` per weight on every call. Unset (on) by
+    default.
+
+  `mx.grad` gives the gradient with respect to x through `quantized_matmul` per weight. The weights
+  are frozen, as in `quantized_matmul`.
 
 ## GLU product of two quantized matmuls
 

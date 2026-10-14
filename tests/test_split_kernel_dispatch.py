@@ -4,11 +4,12 @@ For each codec with split-K kernels, the calls below force each split
 route at the row counts that select each of its tiles, on both activation
 dtypes, on an N that is and is not a multiple of the column tile, with
 partials in the activation dtype and in float (KQ_SPLITK_F32), and with the
-half verify_mma kernels (KQ_VERIFY_MMA_HALF). KQ_QMM_LOG names the kernel
-each call ran. Together the calls must run every name the host enumerator
-lists for the codec, and each result must meet the R1 bound against float64
-with exact kq.dequantize weights, so a kernel that compiles to nothing, or
-that no call reaches, fails here.
+half verify_mma kernels (KQ_VERIFY_MMA_HALF), and run quantized_matmul_multi
+for its joined verify_nax kernels. KQ_QMM_LOG names the kernel each call
+ran. Together the calls must run every name the host enumerator lists for
+the codec, and each result must meet the R1 bound against float64 with exact
+kq.dequantize weights, so a kernel that compiles to nothing, or that no
+call reaches, fails here.
 """
 
 from __future__ import annotations
@@ -48,6 +49,9 @@ CLEAR = {
     "KQ_QMM_ROUTE": None,
     "KQ_QMM_ROUTE_STRICT": None,
     "KQ_VERIFY_MMA_HALF": None,
+    "KQ_NAX_QMV": None,
+    "KQ_VERIFY_NAX": None,
+    "KQ_VERIFY_NAX_SPLITS": None,
 }
 # (family the arm may be declined for, rows, K, env). The split-K tile is
 # BM=8 through M 8, BM=16 through M 16 and the plain tile above; the NAX
@@ -70,6 +74,11 @@ ARMS = [
 # K off the 256 step, for the codecs whose block divides it: q4_0 runs its
 # 64-step verify_nax kernel there.
 OFF_STEP = ("_verify_nax_", 8, K + 64, {"KQ_QMM_ROUTE": "verify_nax", **STRICT})
+# quantized_matmul_multi runs the verify_nax_multi kernels: verify_nax from
+# M 2 and more than one split, so the partials dtype shows in the name. The
+# split count divides the K steps: 16 of 256 at K, 65 of 64 at K + 64.
+MULTI = {"KQ_NAX_QMV": "0", "KQ_VERIFY_NAX": "2"}
+MULTI_ARMS = [(8, K, "2"), (8, K + 64, "5")]
 
 
 def _host_names():
@@ -119,6 +128,26 @@ def test_every_split_kernel_runs(codec):
                         }
                     )
                     families.append(family)
+                for m, k, splits in MULTI_ARMS:
+                    if k % CODEC_GEOMETRY[codec][3]:
+                        continue
+                    calls.append(
+                        {
+                            "codec": codec,
+                            "shape": [m, k],
+                            "n": n,
+                            "multi": [n + 64],
+                            "dtype": dtype,
+                            "seed": 1,
+                            "env": {
+                                **CLEAR,
+                                **MULTI,
+                                "KQ_VERIFY_NAX_SPLITS": splits,
+                                "KQ_SPLITK_F32": f32,
+                            },
+                        }
+                    )
+                    families.append(None)
     res = run_probe(calls, env={"KQ_TUNE_LIVE": "1", "KQ_QMM_LOG": "1"})
     ran = set()
     for c, family, r in zip(calls, families, res, strict=True):

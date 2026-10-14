@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project aims to
 adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `kq.quantized_matmul_multi` computes the products of several packed weights
+  with one input, such as the q, k and v projections, in one dispatch on NAX
+  GPUs (M5) at speculative-verify widths of 2 to 8 rows.
+
 ## [0.5.0]
 
 ### Added

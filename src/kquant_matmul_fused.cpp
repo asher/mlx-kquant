@@ -467,10 +467,11 @@ namespace {
 
 const char* kMultiOp = "[mlx_kquant.quantized_matmul_multi]";
 
-// KQ_MATMUL_MULTI=0 runs quantized_matmul per weight on every call. Read
-// live so an A/B can flip arms in one process.
+// KQ_MATMUL_MULTI=0 builds quantized_matmul per weight on every call. Read
+// once per process, or on every call under KQ_TUNE_LIVE=1, as KQ_GLU.
 bool multi_on() {
-  return kq_env_flag("KQ_MATMUL_MULTI", 1) != 0;
+  static const bool cached = kq_env_flag("KQ_MATMUL_MULTI", 1) != 0;
+  return glu_tune_live() ? kq_env_flag("KQ_MATMUL_MULTI", 1) != 0 : cached;
 }
 
 std::vector<mx::array> multi_composed(
