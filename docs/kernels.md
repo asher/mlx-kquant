@@ -217,18 +217,19 @@ the two kernels are within 3% of each other on every shape measured.
 Tuning levers (defaults are right for normal use):
 
 - `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
-  `KQ_NAX_BM128_ODD_M`, `KQ_NAX_DB64`, the `_BK128` levers, `KQ_NAX_SWIZZLE`, `KQ_VNAX_X16`), the
-  tile overrides (`KQ_NAX_TILE`, `KQ_QMM_TILE`, `KQ_CONV_TILE`), `KQ_SPLITK_F32` and `KQ_QMM_LOG`
-  read their variables on every dispatch, so one process can switch tiles between calls on one
-  resident copy of the weights; `benchmarks/bench_dit_shapes.py` runs its tile arms this way. It
-  reads the environment on every dispatch, so it is for single-threaded A/B runs that set these
-  variables between calls. The `quantized_matmul_glu` levers (`KQ_GLU`, `KQ_GLU_MIN_ROWS`), the
-  `quantized_matmul_multi` lever (`KQ_MATMUL_MULTI`), the `quantized_matmul_lora` levers
-  (`KQ_QMM_LORA`, `KQ_QMM_LORA_MIN_ROWS`), the `quantized_matmul_residual` lever (`KQ_QMM_RESID`),
-  the dequantize route lever (`KQ_DEQUANT_ROUTE`) and the `conv2d_3x3` lever (`KQ_CONV_NAX`) are
-  read when the op is called and builds its graph, not when a kernel is dispatched, so a compiled
-  function keeps the kernel choice of its trace. Unset (off) by default, and then each of them keeps
-  its first read for the life of the process. Read once per process.
+  `KQ_NAX_BM128_ODD_M`, `KQ_NAX_DB64`, the `_BK128` levers, `KQ_NAX_SWIZZLE`), the `verify_nax` load
+  lever (`KQ_VNAX_X16`), the tile overrides (`KQ_NAX_TILE`, `KQ_QMM_TILE`, `KQ_CONV_TILE`),
+  `KQ_SPLITK_F32` and `KQ_QMM_LOG` read their variables on every dispatch, so one process can switch
+  tiles between calls on one resident copy of the weights; `benchmarks/bench_dit_shapes.py` runs its
+  tile arms this way. It reads the environment on every dispatch, so it is for single-threaded A/B
+  runs that set these variables between calls. The `quantized_matmul_glu` levers (`KQ_GLU`,
+  `KQ_GLU_MIN_ROWS`), the `quantized_matmul_multi` lever (`KQ_MATMUL_MULTI`), the
+  `quantized_matmul_lora` levers (`KQ_QMM_LORA`, `KQ_QMM_LORA_MIN_ROWS`), the
+  `quantized_matmul_residual` lever (`KQ_QMM_RESID`), the dequantize route lever
+  (`KQ_DEQUANT_ROUTE`) and the `conv2d_3x3` lever (`KQ_CONV_NAX`) are read when the op is called and
+  builds its graph, not when a kernel is dispatched, so a compiled function keeps the kernel choice
+  of its trace. Unset (off) by default, and then each of them keeps its first read for the life of
+  the process. Read once per process.
 - `KQ_NAX_TILE` - `bm,bn,wm,wn` pins the NAX `qmm_t` tile of every transpose call that reaches it,
   in place of the BM=32, BM=64 and BM=128 policy. BK stays 64, except where a `_BK128` lever sets
   it. The `_db` variant still follows `KQ_NAX_DB64` on the bm64 bn64 wm2 wn2 tile. A tile the
@@ -399,8 +400,8 @@ Tuning levers (defaults are right for normal use):
   a K that is a multiple of 256, where the eight-block kernel runs by default. Read live per call.
 - `KQ_VNAX_X16` - probe lever: `0` keeps the `verify_nax` kernels that load their activations per
   NAX op on one 8-byte load per op where the activations start on a 16-byte boundary, in place of
-  one 16-byte load per two ops. The output is the same. Read once per process unless
-  `KQ_TUNE_LIVE=1`.
+  one 16-byte load per two ops. The output is the same. In `KQ_QMM_LOG` the kernel name
+  carries the variant, `_x16` or `_x8`. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_MV_EXT_SB` / `KQ_MV_EXT_NX` / `KQ_MV_EXT_HD` - `mv_ext` activation-traffic experiments:
   shuffle-broadcast (`1`), wide nxpsg (`16`/`32`), half-precision chunk dots (`1`). q6_k M 4-12
   only. `HD` measured +4-5% at M 8; the rest flat to negative on M5 Max. Kept as probes. Default

@@ -24,6 +24,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -1324,9 +1325,17 @@ def test_verify_nax_disable_nax(codec, monkeypatch):
 # The verify_nax codecs that read one activation step at a time read two
 # steps in one 16-byte load where x starts on a 16-byte boundary. Each arm
 # multiplies the same values in the same order: x at offset 0 (the paired
-# load), at offset 0 with KQ_VNAX_X16=0 and at 8 bytes (one load per
-# step), and at 16 bytes (the paired load off the buffer start).
-X16_ARMS = [(0, None), (0, "0"), (4, None), (8, None)]
+# load), at offset 0 with KQ_VNAX_X16=0, at every 2-byte offset from 2 to
+# 14 bytes (one load per step) and at 16 bytes (the paired load off the
+# buffer start).
+X16_ARMS = [(0, None), (0, "0"), *[(e, None) for e in range(1, 9)]]
+
+
+def x16_variant(off, lever):
+    # The KQ_QMM_LOG name end of the pipeline an arm takes.
+    return "_x16(_pf32)?$" if lever is None and off % 8 == 0 else "_x8(_pf32)?$"
+
+
 X16_SPLITS = [None, "3"]
 X16_DTYPES = ["bfloat16", "float16"]
 
@@ -1375,6 +1384,7 @@ def test_verify_nax_x16_bits(codec):
             assert r["error"] is None, (tag, off, lever, r["error"])
             ((name, _),) = r["kernels"]
             assert "_verify_nax_" in name, (tag, name)
+            assert re.search(x16_variant(off, lever), name), (tag, off, lever, name)
             assert r["digest"] == arms[0]["digest"], (tag, off, lever)
 
 

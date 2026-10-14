@@ -247,8 +247,10 @@ for i, c in enumerate(spec["calls"]):
     )
     if c.get("x_offset"):
         # The same values as a row-contiguous view x_offset elements into
-        # its buffer.
+        # its buffer. An empty cache keeps the buffer from carrying the
+        # slack that makes the op copy the view to a fresh one.
         off = c["x_offset"]
+        mx.clear_cache()
         flat = mx.concatenate([mx.zeros((off,), dtype), x.reshape(-1)])
         mx.eval(flat)
         x = flat[off:].reshape(x.shape)

@@ -1499,19 +1499,27 @@ kq_verify_nax_fits(const array& w, int K, int kstep, const std::string& t) {
 // KQ_VNAX_X16=0 keeps verify_nax on one 8-byte activation load per step.
 // Read once per process unless KQ_TUNE_LIVE=1.
 static bool kq_vnax_x16_enabled() {
-  static const bool cached = kq_env_int("KQ_VNAX_X16", 1) != 0;
-  return kq_tune_live() ? kq_env_int("KQ_VNAX_X16", 1) != 0 : cached;
+  static const bool cached = kq_env_flag("KQ_VNAX_X16", 1) != 0;
+  return kq_tune_live() ? kq_env_flag("KQ_VNAX_X16", 1) != 0 : cached;
 }
 
 // verify_nax pipeline: the kernels that load one activation step at a
 // time load two in one 16-byte load where x starts on a 16-byte boundary
-// (function constant 40, kq_vnax_x16).
-static MTL::ComputePipelineState*
-kq_verify_nax_pipeline(Device& d, const std::string& kname, const array& x) {
+// (function constant 40, kq_vnax_x16). vname, kname with the variant
+// (_x16 or _x8) ahead of its partials suffix, names the pipeline and the
+// KQ_QMM_LOG line.
+static MTL::ComputePipelineState* kq_verify_nax_pipeline(
+    Device& d,
+    const std::string& kname,
+    const std::string& suffix,
+    const array& x,
+    std::string& vname) {
   bool x16 = reinterpret_cast<uintptr_t>(x.data<char>()) % 16 == 0 &&
       kq_vnax_x16_enabled();
   mx::metal::MTLFCList fc = {{&x16, MTL::DataType::DataTypeBool, 40}};
-  return kq_get_kernel(d, kname, kname + (x16 ? "_x16" : "_x8"), fc);
+  vname = kname.substr(0, kname.size() - suffix.size()) +
+      (x16 ? "_x16" : "_x8") + suffix;
+  return kq_get_kernel(d, kname, vname, fc);
 }
 
 void verify_nax(
@@ -1545,7 +1553,8 @@ void verify_nax(
   const std::string kname = kq_verify_nax_kname(
       kquant_type, type_string, group_size, bits, kstep, pp.suffix);
 
-  auto kernel = kq_verify_nax_pipeline(d, kname, x);
+  std::string vname;
+  auto kernel = kq_verify_nax_pipeline(d, kname, pp.suffix, x, vname);
   ce.set_compute_pipeline_state(kernel);
 
   int c = 0;
@@ -1560,7 +1569,7 @@ void verify_nax(
   ce.set_bytes(part_stride, c++);
   MTL::Size group_dims(128, 1, 1);
   MTL::Size grid_dims((N + 127) / 128, 1, splits);
-  kq_log_qmm(kname, M, N, K, grid_dims);
+  kq_log_qmm(vname, M, N, K, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
   if (splits == 1) {
     return;
@@ -1632,7 +1641,8 @@ void verify_nax_multi(
   const std::string type_string = kq_type_string(x.dtype());
   const std::string kname = kq_verify_nax_multi_kname(
       kquant_type, type_string, group_size, bits, kstep, pp.suffix);
-  auto kernel = kq_verify_nax_pipeline(d, kname, x);
+  std::string vname;
+  auto kernel = kq_verify_nax_pipeline(d, kname, pp.suffix, x, vname);
   ce.set_compute_pipeline_state(kernel);
 
   int c = 0;
@@ -1657,7 +1667,7 @@ void verify_nax_multi(
   ce.set_bytes(part_stride.data(), 4, c++);
   MTL::Size group_dims(128, 1, 1);
   MTL::Size grid_dims(tgs, 1, splits);
-  kq_log_qmm(kname, M, static_cast<int>(rows), K, grid_dims);
+  kq_log_qmm(vname, M, static_cast<int>(rows), K, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
   if (splits == 1) {
     return;

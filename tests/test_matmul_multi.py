@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -370,12 +371,14 @@ def test_forced_verify_nax_fuses_narrow_weights():
 
 
 @NAX_ONLY
-@pytest.mark.parametrize("codec", ["q4_0", "q4_k", "q6_k", "iq4_xs"])
-def test_x16_load_bits(codec):
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+@pytest.mark.parametrize("codec", [*CODECS, "pq2_0", "q2_0"])
+def test_x16_load_bits(codec, dtype):
     # x at offset 0 (paired 16-byte activation loads), at offset 0 with
-    # KQ_VNAX_X16=0 and at 8 bytes (one load per step), and at 16 bytes:
-    # the same bits from one verify_nax_multi dispatch.
-    arms = [(0, None), (0, "0"), (4, None), (8, None)]
+    # KQ_VNAX_X16=0, at every 2-byte offset from 2 to 14 bytes (one load
+    # per step) and at 16 bytes: the same bits from one verify_nax_multi
+    # dispatch.
+    arms = [(0, None), (0, "0"), *[(e, None) for e in range(1, 9)]]
     cases = [(m, sp) for m in range(2, 9) for sp in ("1", "2")]
     calls = [
         {
@@ -383,6 +386,7 @@ def test_x16_load_bits(codec):
             "shape": [m, 1024],
             "n": 1000,
             "multi": [48, 300],
+            "dtype": dtype,
             "seed": m,
             "x_offset": off,
             "env": {"KQ_VNAX_X16": lever, "KQ_VERIFY_NAX_SPLITS": sp},
@@ -397,9 +401,11 @@ def test_x16_load_bits(codec):
         for (off, lever), r in zip(arms, group, strict=True):
             tag = (codec, m, sp, off, lever)
             assert r["error"] is None, (tag, r["error"])
-            assert [n for n, _ in r["kernels"]] and all(
-                "verify_nax_multi" in n for n, _ in r["kernels"]
-            ), (tag, r["kernels"])
+            end = "_x16(_pf32)?$" if lever is None and off % 8 == 0 else "_x8(_pf32)?$"
+            names = [n for n, _ in r["kernels"]]
+            assert names and all(
+                "verify_nax_multi" in n and re.search(end, n) for n in names
+            ), (tag, names)
             assert r["digest"] == group[0]["digest"], tag
 
 
@@ -429,6 +435,7 @@ def test_lever_off():
 
 _LEVER_OFF_CHILD = r"""
 import os
+import re
 import mlx.core as mx
 import numpy as np
 if os.environ.get("KQUANT_FORCE_CPU"):

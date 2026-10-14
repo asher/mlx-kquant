@@ -14,9 +14,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - `kq.sdpa_fa_verify` runs its key pass on the NAX tensor-op units (M5) at head
   dims 128 and 256, so verify attention over a deep cache takes less time.
-- The `verify_nax` matmul kernels of `q4_0`, `q8_0`, the k-quants and `iq4_*`
-  read two steps of activations per load, so speculative verify at 2 to 8 rows
-  takes less time.
+- On NAX GPUs (M5), the `verify_nax` matmul kernels of `q4_0` at a K that is a
+  multiple of 256, `q8_0`, the k-quants and `iq4_*` read two steps of activations
+  per load, so speculative verify at 2 to 8 rows takes less time.
 
 ## [0.5.0]
 
