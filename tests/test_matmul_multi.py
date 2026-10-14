@@ -22,7 +22,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from kqref import synth_wire
-from qmm_probe import force_cpu
+from qmm_probe import force_cpu, run_probe
 
 import mlx_kquant as kq
 from mlx_kquant.codec_geometry import CODEC_GEOMETRY
@@ -367,6 +367,40 @@ def test_forced_verify_nax_fuses_narrow_weights():
     )
     assert len(per) == 2 and all("_verify_nax_" in n for n in per), per
     assert len(multi) == 1 and "verify_nax_multi" in multi[0], multi
+
+
+@NAX_ONLY
+@pytest.mark.parametrize("codec", ["q4_0", "q4_k", "q6_k", "iq4_xs"])
+def test_x16_load_bits(codec):
+    # x at offset 0 (paired 16-byte activation loads), at offset 0 with
+    # KQ_VNAX_X16=0 and at 8 bytes (one load per step), and at 16 bytes:
+    # the same bits from one verify_nax_multi dispatch.
+    arms = [(0, None), (0, "0"), (4, None), (8, None)]
+    cases = [(m, sp) for m in range(2, 9) for sp in ("1", "2")]
+    calls = [
+        {
+            "codec": codec,
+            "shape": [m, 1024],
+            "n": 1000,
+            "multi": [48, 300],
+            "seed": m,
+            "x_offset": off,
+            "env": {"KQ_VNAX_X16": lever, "KQ_VERIFY_NAX_SPLITS": sp},
+        }
+        for m, sp in cases
+        for off, lever in arms
+    ]
+    env = {"KQ_QMM_LOG": "1", "KQ_TUNE_LIVE": "1", "KQ_VERIFY_NAX": "2"}
+    res = run_probe(calls, env=env, check=False)
+    for i, (m, sp) in enumerate(cases):
+        group = res[len(arms) * i : len(arms) * (i + 1)]
+        for (off, lever), r in zip(arms, group, strict=True):
+            tag = (codec, m, sp, off, lever)
+            assert r["error"] is None, (tag, r["error"])
+            assert [n for n, _ in r["kernels"]] and all(
+                "verify_nax_multi" in n for n, _ in r["kernels"]
+            ), (tag, r["kernels"])
+            assert r["digest"] == group[0]["digest"], tag
 
 
 @NAX_ONLY

@@ -1321,6 +1321,63 @@ def test_verify_nax_disable_nax(codec, monkeypatch):
     _sweep(codec, w, s, ref_w, 1000, ms=[3, 5, 8])
 
 
+# The verify_nax codecs that read one activation step at a time read two
+# steps in one 16-byte load where x starts on a 16-byte boundary. Each arm
+# multiplies the same values in the same order: x at offset 0 (the paired
+# load), at offset 0 with KQ_VNAX_X16=0 and at 8 bytes (one load per
+# step), and at 16 bytes (the paired load off the buffer start).
+X16_ARMS = [(0, None), (0, "0"), (4, None), (8, None)]
+X16_SPLITS = [None, "3"]
+X16_DTYPES = ["bfloat16", "float16"]
+
+
+@functools.cache
+def _x16_digests():
+    cases = [
+        (codec, m, dtype, splits)
+        for codec in VNAX_CODECS + VNAX_IQ4
+        for m in range(2, 9)
+        for dtype in X16_DTYPES
+        for splits in X16_SPLITS
+    ]
+    calls = [
+        {
+            "codec": codec,
+            "shape": [m, K],
+            "n": 1000,
+            "dtype": dtype,
+            "seed": m,
+            "x_offset": off,
+            "env": {"KQ_VNAX_X16": lever, "KQ_VERIFY_NAX_SPLITS": splits},
+        }
+        for codec, m, dtype, splits in cases
+        for off, lever in X16_ARMS
+    ]
+    env = {
+        "KQ_QMM_LOG": "1",
+        "KQ_TUNE_LIVE": "1",
+        "KQ_QMM_ROUTE": "verify_nax",
+        "KQ_QMM_ROUTE_STRICT": "1",
+    }
+    res = run_probe(calls, env=env, check=False)
+    n = len(X16_ARMS)
+    return {c: res[n * i : n * i + n] for i, c in enumerate(cases)}
+
+
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+@pytest.mark.parametrize("codec", VNAX_CODECS + VNAX_IQ4)
+def test_verify_nax_x16_bits(codec):
+    for (c, m, dtype, splits), arms in _x16_digests().items():
+        if c != codec:
+            continue
+        tag = f"{codec} M{m} {dtype} splits {splits}"
+        for (off, lever), r in zip(X16_ARMS, arms, strict=True):
+            assert r["error"] is None, (tag, off, lever, r["error"])
+            ((name, _),) = r["kernels"]
+            assert "_verify_nax_" in name, (tag, name)
+            assert r["digest"] == arms[0]["digest"], (tag, off, lever)
+
+
 # verify_nax folds the block scale into half weights and accumulates in
 # float32, so one activation channel near the top of the half range stays
 # finite and within the contract.

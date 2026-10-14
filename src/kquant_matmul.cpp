@@ -1496,6 +1496,24 @@ kq_verify_nax_fits(const array& w, int K, int kstep, const std::string& t) {
 // device memory per block and nothing staged. Same partial/fold shape as
 // verify_mma. Non-batched transpose shapes, bf16 or f16 activations, NAX
 // GPUs.
+// KQ_VNAX_X16=0 keeps verify_nax on one 8-byte activation load per step.
+// Read once per process unless KQ_TUNE_LIVE=1.
+static bool kq_vnax_x16_enabled() {
+  static const bool cached = kq_env_int("KQ_VNAX_X16", 1) != 0;
+  return kq_tune_live() ? kq_env_int("KQ_VNAX_X16", 1) != 0 : cached;
+}
+
+// verify_nax pipeline: the kernels that load one activation step at a
+// time load two in one 16-byte load where x starts on a 16-byte boundary
+// (function constant 40, kq_vnax_x16).
+static MTL::ComputePipelineState*
+kq_verify_nax_pipeline(Device& d, const std::string& kname, const array& x) {
+  bool x16 = reinterpret_cast<uintptr_t>(x.data<char>()) % 16 == 0 &&
+      kq_vnax_x16_enabled();
+  mx::metal::MTLFCList fc = {{&x16, MTL::DataType::DataTypeBool, 40}};
+  return kq_get_kernel(d, kname, kname + (x16 ? "_x16" : "_x8"), fc);
+}
+
 void verify_nax(
     const array& x,
     const array& w,
@@ -1527,7 +1545,7 @@ void verify_nax(
   const std::string kname = kq_verify_nax_kname(
       kquant_type, type_string, group_size, bits, kstep, pp.suffix);
 
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_verify_nax_pipeline(d, kname, x);
   ce.set_compute_pipeline_state(kernel);
 
   int c = 0;
@@ -1614,7 +1632,7 @@ void verify_nax_multi(
   const std::string type_string = kq_type_string(x.dtype());
   const std::string kname = kq_verify_nax_multi_kname(
       kquant_type, type_string, group_size, bits, kstep, pp.suffix);
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_verify_nax_pipeline(d, kname, x);
   ce.set_compute_pipeline_state(kernel);
 
   int c = 0;

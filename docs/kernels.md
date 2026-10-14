@@ -217,12 +217,12 @@ the two kernels are within 3% of each other on every shape measured.
 Tuning levers (defaults are right for normal use):
 
 - `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
-  `KQ_NAX_BM128_ODD_M`, `KQ_NAX_DB64`, the `_BK128` levers, `KQ_NAX_SWIZZLE`), the tile overrides
-  (`KQ_NAX_TILE`, `KQ_QMM_TILE`, `KQ_CONV_TILE`), `KQ_SPLITK_F32` and `KQ_QMM_LOG` read their
-  variables on every dispatch, so one process can switch tiles between calls on one resident copy of
-  the weights; `benchmarks/bench_dit_shapes.py` runs its tile arms this way. It reads the
-  environment on every dispatch, so it is for single-threaded A/B runs that set these variables
-  between calls. The `quantized_matmul_glu` levers (`KQ_GLU`, `KQ_GLU_MIN_ROWS`), the
+  `KQ_NAX_BM128_ODD_M`, `KQ_NAX_DB64`, the `_BK128` levers, `KQ_NAX_SWIZZLE`, `KQ_VNAX_X16`), the
+  tile overrides (`KQ_NAX_TILE`, `KQ_QMM_TILE`, `KQ_CONV_TILE`), `KQ_SPLITK_F32` and `KQ_QMM_LOG`
+  read their variables on every dispatch, so one process can switch tiles between calls on one
+  resident copy of the weights; `benchmarks/bench_dit_shapes.py` runs its tile arms this way. It
+  reads the environment on every dispatch, so it is for single-threaded A/B runs that set these
+  variables between calls. The `quantized_matmul_glu` levers (`KQ_GLU`, `KQ_GLU_MIN_ROWS`), the
   `quantized_matmul_multi` lever (`KQ_MATMUL_MULTI`), the `quantized_matmul_lora` levers
   (`KQ_QMM_LORA`, `KQ_QMM_LORA_MIN_ROWS`), the `quantized_matmul_residual` lever (`KQ_QMM_RESID`),
   the dequantize route lever (`KQ_DEQUANT_ROUTE`) and the `conv2d_3x3` lever (`KQ_CONV_NAX`) are
@@ -397,6 +397,10 @@ Tuning levers (defaults are right for normal use):
   float kernels only. Unset (off) by default. Read live per call.
 - `KQ_VERIFY_NAX_Q4_0_SB` - probe lever: `0` keeps `q4_0` on the two-block `verify_nax` kernel at
   a K that is a multiple of 256, where the eight-block kernel runs by default. Read live per call.
+- `KQ_VNAX_X16` - probe lever: `0` keeps the `verify_nax` kernels that load their activations per
+  NAX op on one 8-byte load per op where the activations start on a 16-byte boundary, in place of
+  one 16-byte load per two ops. The output is the same. Read once per process unless
+  `KQ_TUNE_LIVE=1`.
 - `KQ_MV_EXT_SB` / `KQ_MV_EXT_NX` / `KQ_MV_EXT_HD` - `mv_ext` activation-traffic experiments:
   shuffle-broadcast (`1`), wide nxpsg (`16`/`32`), half-precision chunk dots (`1`). q6_k M 4-12
   only. `HD` measured +4-5% at M 8; the rest flat to negative on M5 Max. Kept as probes. Default
@@ -554,7 +558,10 @@ eight-block kernel at a K that is a multiple of 256 and the two-block kernel els
 kernels fold each 16- or 32-weight sub-block's scale, and its min where the codec has one, into the
 half weights. Loading a whole K step of activations ahead measured faster for `pq2_0` and the
 two-block `q4_0` kernel, while the kernels with larger decoded words load them one NAX op at a time,
-since loading ahead ran `q4_k` 1.6-2x slower.
+since loading ahead ran `q4_k` 1.6-2x slower. Two consecutive NAX ops read 8 contiguous activations
+of a row, so where the activations start on a 16-byte boundary these kernels read them in one
+16-byte load per two NAX ops, and elsewhere in one 8-byte load per op. The fewer loads take less
+time in a chain of dependent calls, and both forms give the same bits.
 
 Split counts for `pq2_0`, `q8_0` and the two-block `q4_0` kernel are the largest divisor of the K
 steps at or under their target, at most 16. The two-block kernel's K walk of 640 per simdgroup

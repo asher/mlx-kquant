@@ -18,8 +18,9 @@ root mean square. ``"check_block": B`` runs the check and the ulp
 comparison over every row of x's flattened leading dims, B rows at a
 time, so a call with many rows holds float64 copies of B rows; it reports
 ``checked``, the number of rows it read. Every call gets
-``digest``, a hash of its output bits, to compare calls across probe
-processes.
+``digest``, a hash of its output bits (of every output on a ``"multi"``
+call), to compare calls across probe processes. ``"x_offset": E`` passes
+x as a row-contiguous view E elements into its buffer.
 
 ``"design": "lead"`` draws nonnegative weights and activations whose first
 K column is 1024. ``"design": "big"`` draws small weights and dense
@@ -244,6 +245,13 @@ for i, c in enumerate(spec["calls"]):
     x = activations(
         list(c["shape"]), dtype, c.get("layout", "dense"), c.get("seed", i), design
     )
+    if c.get("x_offset"):
+        # The same values as a row-contiguous view x_offset elements into
+        # its buffer.
+        off = c["x_offset"]
+        flat = mx.concatenate([mx.zeros((off,), dtype), x.reshape(-1)])
+        mx.eval(flat)
+        x = flat[off:].reshape(x.shape)
     os.write(2, f"[probe] {i}\n".encode())
     res = {"i": i, "error": None, "rel": None, "ulp": None}
     if c.get("multi"):
@@ -258,6 +266,16 @@ for i, c in enumerate(spec["calls"]):
             res["error"] = f"{type(e).__name__}: {e}"
             outs.append(None)
             results.append(res)
+            continue
+        bits = [y.view(mx.uint16) if y.dtype in DT.values() else y for y in ys]
+        h = hashlib.sha1()
+        for b in bits:
+            h.update(memoryview(np.array(b)))
+        res["digest"] = h.hexdigest()
+        if not spec.get("check", True):
+            outs.append(None)
+            results.append(res)
+            mx.clear_cache()
             continue
         xn = as64(x)
         res["rel"] = max(
