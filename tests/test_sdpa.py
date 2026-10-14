@@ -997,10 +997,22 @@ def _check_fa(D, qL, kL, dtype, Hkv=4, G=6, strided=False, splits=0):
     assert got.shape == q.shape
 
 
+# At head_dim 128 and 256 with up to 64 folded rows, sdpa_fa_verify runs
+# pass 1 on the tensor-op units on NAX GPUs, and KQ_FA_VERIFY_NAX=0 keeps
+# the simdgroup-matrix kernel. The op reads the variable at each call, so
+# these cases run both kernels against the reference.
+@pytest.fixture(params=["0", "1"], ids=["simdgroup", "nax"])
+def fa_pass1(request, monkeypatch):
+    if request.param == "1" and not kq.nax_available():
+        pytest.skip("the tensor-op pass 1 needs NAX")
+    monkeypatch.setenv("KQ_FA_VERIFY_NAX", request.param)
+    return request.param
+
+
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("D", [64, 128, 256, 512])
-@pytest.mark.parametrize("qL", [2, 3, 4, 5, 6])
-def test_sdpa_fa_verify(D, qL, dtype):
+@pytest.mark.parametrize("qL", [2, 3, 4, 5, 6, 7, 8])
+def test_sdpa_fa_verify(D, qL, dtype, fa_pass1):
     _check_fa(D, qL, kL=4096, dtype=dtype, G=4)
 
 
@@ -1011,7 +1023,7 @@ def test_sdpa_fa_verify_qwen_geometry():
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("D", [64, 128, 256, 512])
-def test_sdpa_fa_verify_decode(D, dtype):
+def test_sdpa_fa_verify_decode(D, dtype, fa_pass1):
     # q_len == 1: plain GQA decode on the matrix units (every folded row
     # attends the full KV). 122b shape: G16 x qL1 at hd256, 2 kv heads;
     # same fold on the hd512 d-split kernel.
@@ -1024,39 +1036,39 @@ def test_sdpa_fa_verify_gemma_geometry():
 
 
 @pytest.mark.parametrize("D", [64, 128, 256, 512])
-def test_sdpa_fa_verify_full_tile(D):
+def test_sdpa_fa_verify_full_tile(D, fa_pass1):
     # n_rows == 32 fills the tile exactly (no padding rows), qL at the cap
     _check_fa(D, 8, kL=4096, dtype=mx.bfloat16, Hkv=2, G=4)
 
 
 @pytest.mark.parametrize("D", [64, 128, 256, 512])
-def test_sdpa_fa_verify_partial_warp(D):
+def test_sdpa_fa_verify_partial_warp(D, fa_pass1):
     # n_rows == 18: the third row strip covers rows 16..17 plus padding
     _check_fa(D, 6, kL=2048, dtype=mx.bfloat16, G=3)
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("D", [64, 128, 256, 512])
-def test_sdpa_fa_verify_strided_unaligned(D, dtype):
+def test_sdpa_fa_verify_strided_unaligned(D, dtype, fa_pass1):
     # strided KV-cache prefix + a key length off every tile/split boundary
     _check_fa(D, 4, kL=3071, dtype=dtype, strided=True, splits=16)
 
 
 @pytest.mark.parametrize("D", [64, 128, 256, 512])
-def test_sdpa_fa_verify_short_kv(D):
+def test_sdpa_fa_verify_short_kv(D, fa_pass1):
     # kL small enough that most splits stage zero keys: their empty partials
     # (max = finite_min, sum = 0) must merge as weight zero
     _check_fa(D, 4, kL=17, dtype=mx.bfloat16, splits=16, G=6)
 
 
 @pytest.mark.parametrize("D", [64, 128, 256, 512])
-def test_sdpa_fa_verify_min_kv(D):
+def test_sdpa_fa_verify_min_kv(D, fa_pass1):
     # kL == qL floor: row 0 attends exactly one key, every row masked hard
     _check_fa(D, 4, kL=4, dtype=mx.bfloat16, G=6)
 
 
 @pytest.mark.parametrize("D", [64, 128, 256, 512])
-def test_sdpa_fa_verify_causal_split_straddle(D):
+def test_sdpa_fa_verify_causal_split_straddle(D, fa_pass1):
     # the last qL keys straddle a split boundary (splits=128, kL=4098 puts
     # keys 4096..4097 alone in the final split): that split is entirely past
     # the low rows' causal limits, exercising the dead-row guard in a
@@ -1065,38 +1077,38 @@ def test_sdpa_fa_verify_causal_split_straddle(D):
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-def test_sdpa_fa_verify_bq64_full_tile(dtype):
+def test_sdpa_fa_verify_bq64_full_tile(dtype, fa_pass1):
     # gqa16 x qL4 = 64 rows (qwen3.5-122b-a10b verify fold): fills the BQ=64
     # tile exactly
     _check_fa(256, 4, kL=4096, dtype=dtype, Hkv=2, G=16)
 
 
 @pytest.mark.parametrize("G,qL", [(10, 6), (7, 7), (14, 4)])
-def test_sdpa_fa_verify_bq64_padded(G, qL):
+def test_sdpa_fa_verify_bq64_padded(G, qL, fa_pass1):
     # 49..63 rows: BQ=64 with padding rows in the upper simdgroups
     _check_fa(256, qL, kL=2048, dtype=mx.bfloat16, Hkv=2, G=G)
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("D", [64, 128, 256])
-def test_sdpa_fa_verify_bq48_full_tile(D, dtype):
+def test_sdpa_fa_verify_bq48_full_tile(D, dtype, fa_pass1):
     # gqa6 x qL8 = 48 rows (qwen3.x full attention at a DFlash 2 block of
     # 8): fills the BQ=48 tile exactly
     _check_fa(D, 8, kL=4096, dtype=dtype, Hkv=4, G=6)
 
 
 @pytest.mark.parametrize("G,qL", [(8, 5), (6, 6), (6, 7), (12, 4)])
-def test_sdpa_fa_verify_bq48_padded(G, qL):
+def test_sdpa_fa_verify_bq48_padded(G, qL, fa_pass1):
     # 33..48 rows: BQ=48, padding rows in the top simdgroup below 48
     _check_fa(256, qL, kL=2048, dtype=mx.bfloat16, Hkv=2, G=G)
 
 
-def test_sdpa_fa_verify_bq48_strided_split_straddle():
+def test_sdpa_fa_verify_bq48_strided_split_straddle(fa_pass1):
     # the last qL keys alone in the final split, over a strided cache view
     _check_fa(256, 8, kL=4098, dtype=mx.bfloat16, Hkv=4, G=6, strided=True, splits=128)
 
 
-def test_sdpa_fa_verify_bq64_strided_kv():
+def test_sdpa_fa_verify_bq64_strided_kv(fa_pass1):
     _check_fa(256, 4, kL=3071, dtype=mx.bfloat16, Hkv=2, G=16, strided=True, splits=16)
 
 
@@ -1112,11 +1124,17 @@ def test_sdpa_fa_verify_bq64_strided_kv():
         (64, 8, 4, 8, 8192, 32),  # 1024 simdgroups at head_dim <= 128
     ],
 )
-def test_sdpa_fa_verify_default_splits(D, Hkv, G, qL, kL, want):
+def test_sdpa_fa_verify_default_splits(D, Hkv, G, qL, kL, want, monkeypatch):
     # On the large GPU classes splits=0 raises the count past the decode
-    # bucket to fill the GPU; elsewhere it keeps the bucket.
+    # bucket to fill the GPU; elsewhere it keeps the bucket. Counts of the
+    # simdgroup-matrix pass 1.
+    monkeypatch.setenv("KQ_FA_VERIFY_NAX", "0")
     if mx.device_info()["architecture"][-1] not in "scd":
         want = 16 if kL <= 8192 else 32
+    _check_default_splits(D, Hkv, G, qL, kL, want)
+
+
+def _check_default_splits(D, Hkv, G, qL, kL, want):
     q, k, v = _make(1, Hkv, Hkv, G * qL, kL, D, mx.bfloat16, seed=kL + D, strided=False)
     scale = 1.0 / (D**0.5)
     got = kq.sdpa_fa_verify(q, k, v, scale, q_len=qL)
@@ -1127,9 +1145,78 @@ def test_sdpa_fa_verify_default_splits(D, Hkv, G, qL, kL, want):
     assert _rel(got, ref) < REL_BOUND[mx.bfloat16]
 
 
+@pytest.mark.parametrize(
+    "D,Hkv,G,qL,kL,want",
+    [
+        (256, 1, 8, 4, 8192, 64),  # 64 threadgroups on one kv head
+        (256, 2, 12, 2, 4096, 32),
+        (256, 4, 6, 8, 16385, 16),  # no rise past 16k keys
+        (128, 8, 4, 4, 4096, 8),
+        (128, 16, 2, 4, 4096, 4),  # never under 4
+        (128, 32, 1, 8, 4096, 4),
+        (256, 4, 6, 4, 1023, 8),  # at least 64 keys per split
+        (256, 2, 12, 2, 700, 8),
+        (256, 4, 6, 6, 17, 4),
+        (128, 3, 8, 2, 4096, 16),  # 3 kv heads count as 4
+    ],
+)
+def test_sdpa_fa_verify_nax_default_splits(D, Hkv, G, qL, kL, want):
+    # splits=0 on the tensor-op pass 1 aims at about 64 threadgroups.
+    if not kq.nax_available():
+        pytest.skip("the tensor-op pass 1 needs NAX")
+    _check_default_splits(D, Hkv, G, qL, kL, want)
+
+
+# KQ_FA_VERIFY_NAX_WN sets the simdgroups across the head dim of the
+# tensor-op pass 1: every value it takes, over row strips 1 to 4, partial
+# strips, split counts that leave splits without keys, and a strided cache
+# view with a key count off every tile.
+@pytest.mark.parametrize(
+    "D,wn", [(128, "1"), (128, "2"), (256, "2"), (256, "4")], ids=str
+)
+@pytest.mark.parametrize(
+    "G,qL,kL,splits,strided",
+    [
+        (6, 1, 3071, 0, True),
+        (6, 4, 3071, 16, True),
+        (6, 6, 4098, 128, False),
+        (6, 8, 300, 1, False),
+        (16, 4, 2048, 2, True),
+        (3, 7, 17, 16, False),
+        (1, 5, 5, 0, False),
+        (64, 1, 4300, 0, True),
+    ],
+)
+def test_sdpa_fa_verify_nax_wn(D, wn, G, qL, kL, splits, strided, monkeypatch):
+    if not kq.nax_available():
+        pytest.skip("the tensor-op pass 1 needs NAX")
+    monkeypatch.setenv("KQ_FA_VERIFY_NAX", "1")
+    monkeypatch.setenv("KQ_FA_VERIFY_NAX_WN", wn)
+    for dtype in (mx.bfloat16, mx.float16):
+        _check_fa(D, qL, kL=kL, dtype=dtype, Hkv=2, G=G, strided=strided, splits=splits)
+
+
+@pytest.mark.parametrize("D", [128, 256])
+@pytest.mark.parametrize("qL", [1, 2, 3, 4, 5, 6, 7, 8])
+def test_sdpa_fa_verify_nax_matches_simdgroup(D, qL, monkeypatch):
+    # Both pass 1 kernels write the same partials layout to the same merge:
+    # at one split count they agree to bfloat16 rounding of the output.
+    if not kq.nax_available():
+        pytest.skip("the tensor-op pass 1 needs NAX")
+    G = 6
+    q, k, v = _make(1, 4, 4, G * qL, 4300, D, mx.bfloat16, seed=qL + D, strided=True)
+    scale = 1.0 / (D**0.5)
+    out = {}
+    for lever in ("0", "1"):
+        monkeypatch.setenv("KQ_FA_VERIFY_NAX", lever)
+        out[lever] = kq.sdpa_fa_verify(q, k, v, scale, q_len=qL, splits=16)
+        _eval_or_skip(out[lever])
+    assert _rel(out["1"], out["0"]) < REL_BOUND[mx.bfloat16]
+
+
 @pytest.mark.parametrize("D", [64, 128])
 @pytest.mark.parametrize("G", [32, 64])
-def test_sdpa_fa_verify_cascade_fold(D, G):
+def test_sdpa_fa_verify_cascade_fold(D, G, fa_pass1):
     # shared-prefix cascade: B batch rows folded kv-head-major into the row
     # axis at q_len 1 (every row attends the full prefix); G=64 fills the
     # BQ=64 tile at the register-resident head dims

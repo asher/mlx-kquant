@@ -1058,7 +1058,15 @@ into a packed layout first.
   blocks instead of the full key axis and no `[L, S]` mask is materialized. Causality inside the
   diagonal page is enforced in-kernel.
 - **`sdpa_fa_verify`** - speculative-verify attention on the matrix units for a GQA-folded query tile.
-  Head dims 64 through 512; `return_lse` as above.
+  Head dims 64 through 512; `return_lse` as above. On NAX GPUs, at head dims 128 and 256 with up to
+  64 folded rows on plain K and V, the key pass runs on the tensor-op units: each 16-row strip of
+  the fold is one row of simdgroups, and the head dim splits over 2 simdgroups (4 at head dim 256
+  for folds of up to 32 rows), which add their partial scores in threadgroup memory. It writes the
+  partials of the simdgroup-matrix kernel to the same merge pass. Its automatic split count aims at
+  about 64 threadgroups over the KV heads, between 4 and 64, and halves while a split would hold
+  fewer than 64 keys. The two kernels round differently, so their outputs are not bit-identical.
+  `KQ_FA_VERIFY_NAX=0` keeps the simdgroup-matrix kernel, and `KQ_FA_VERIFY_NAX_WN` sets the head
+  dim split (2 or 4 at 256, 1 or 2 at 128); both are read at each call.
 - **`sdpa_fa_indexed`** - index-gathered attention over one shared K/V latent at head dim 512, the
   absorbed-MLA sparse decode step: query j of `q [1, Hq, Q, 512]` attends the rows of `kv [1, 1, N,
   512]` that `idx[j]` (int32, -1 pads) lists, so the selected rows are read once from the latent

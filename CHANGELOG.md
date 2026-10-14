@@ -11,6 +11,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with one input, such as the q, k and v projections, in one dispatch on NAX
   GPUs (M5) at speculative-verify widths of 2 to 8 rows.
 
+### Changed
+- `kq.sdpa_fa_verify` runs its key pass on the NAX tensor-op units (M5) at head
+  dims 128 and 256, so verify attention over a deep cache takes less time.
+
 ## [0.5.0]
 
 ### Added

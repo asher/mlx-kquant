@@ -191,6 +191,23 @@ int kq_fa_verify_splits(
   return std::min({splits, cap, 128});
 }
 
+// Split count for sdpa_fa_verify on the tensor-op pass 1 when the caller
+// passes 0. That kernel runs a split in a fraction of the time of the
+// simdgroup-matrix kernel, so the float32 partials and their merge weigh
+// more: the count aims at about 64 threadgroups over the kv heads, at least
+// 4 and at most 64, and drops while a split would hold under 64 keys. Tuned
+// on M5 Max at 1 to 32 kv heads.
+int kq_fa_verify_nax_splits(int n_heads, int kL) {
+  int splits = 64;
+  for (int h = 1; h < n_heads && splits > 4; h *= 2) {
+    splits /= 2;
+  }
+  while (splits > 4 && kL < 64 * splits) {
+    splits /= 2;
+  }
+  return splits;
+}
+
 // Split count for sdpa_fa_indexed when the caller passes 0: the decode
 // bucket over the M listed keys. The NAX kernel on the s, c and d classes
 // writes 32 heads by 512 float32 partials per split, so once about 512
@@ -689,9 +706,19 @@ void KQuantSDPAFAVerify::eval_gpu(
   int D = q.shape(3);
   int kL = kvarn ? (kvarn_n_attend_ ? kvarn_n_attend_ : kvarn_n_) : k.shape(2);
   int q_len = q_len_;
+  // Pass 1 on the tensor-op units (kq_sdpa_fa_verify_2pass_1_nax) at
+  // head_dim 128 and 256 on plain K/V: a 16-row strip of the fold per
+  // simdgroup row group, the head dim split over WN simdgroups. It writes
+  // the partials of the simdgroup-matrix kernel below. WN is 2 at 128, and
+  // at 256 it is 4 for folds of up to 32 rows and 2 above.
+  // KQ_FA_VERIFY_NAX=0 keeps that kernel, and KQ_FA_VERIFY_NAX_WN sets WN
+  // (2 or 4 at 256, 1 or 2 at 128). Both are read per call.
+  const bool nax_pass1 = !kvarn && (D == 256 || D == 128) && n_rows <= 64 &&
+      kq_env_flag("KQ_FA_VERIFY_NAX", 1) != 0 && kq_is_nax_available();
   int splits = splits_;
   if (splits == 0) {
-    splits = kq_fa_verify_splits(B, n_kv_heads, n_rows, D, kL, d);
+    splits = nax_pass1 ? kq_fa_verify_nax_splits(B * n_kv_heads, kL)
+                       : kq_fa_verify_splits(B, n_kv_heads, n_rows, D, kL, d);
   }
 
   size_t k_head_stride =
@@ -743,7 +770,40 @@ void KQuantSDPAFAVerify::eval_gpu(
   // per 8 tile rows ((BQ/8)*32 threads, BQ the smallest of 32, 48, 64 that
   // holds the fold); 512 runs the 256-thread d-split variant (BQ 32 only,
   // capped at the op).
-  {
+  // Pass 1 on the tensor-op units, set up above.
+  if (nax_pass1) {
+    const int wm = (n_rows + 15) / 16;
+    int wn = D == 128 ? 2 : wm <= 2 ? 4 : 2;
+    const int wn_env = kq_env_lever("KQ_FA_VERIFY_NAX_WN", 0);
+    if ((D == 256 && (wn_env == 2 || wn_env == 4)) ||
+        (D == 128 && (wn_env == 1 || wn_env == 2))) {
+      wn = wn_env;
+    }
+    std::string kname = "kq_sdpa_fa_verify_2pass_1_nax_" + ts + "_" +
+        std::to_string(D) + "_wm" + std::to_string(wm) + "_wn" +
+        std::to_string(wn);
+    std::string hash = kname + "_s" + std::to_string(splits);
+    auto kernel = kq_get_kernel(d, kname, hash, fc);
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(q, 0);
+    ce.set_input_array(k, 1);
+    ce.set_input_array(v, 2);
+    ce.set_output_array(partials, 3);
+    ce.set_output_array(sums, 4);
+    ce.set_output_array(maxs, 5);
+    ce.set_bytes(kL, 6);
+    ce.set_bytes(k_head_stride, 7);
+    ce.set_bytes(k_seq_stride, 8);
+    ce.set_bytes(v_head_stride, 9);
+    ce.set_bytes(v_seq_stride, 10);
+    ce.set_bytes(scale, 11);
+    ce.set_bytes(q_len, 12);
+    ce.set_bytes(n_rows, 13);
+    MTL::Size group_dims(32, wm * wn, 1);
+    MTL::Size grid_dims(n_kv_heads, B, splits);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+  }
+  if (!nax_pass1) {
     const int bq = n_rows <= 32 ? 32 : n_rows <= 48 ? 48 : 64;
     std::string kname = "kq_sdpa_fa_verify_2pass_1_" + ts + "_" +
         std::to_string(D) + "_bq" + std::to_string(bq);
