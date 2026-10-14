@@ -667,6 +667,39 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "quantized_matmul_multi",
+      &mlx_kquant::quantized_matmul_multi,
+      "x"_a,
+      "weights"_a,
+      "kquant_type"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Quantized matmuls of several weights that share x:
+        [x @ W_i^T for W_i in weights].
+
+        On a NAX GPU, at 2 to 8 rows of x where quantized_matmul would run
+        its verify_nax route on the widest weight, one dispatch per four
+        weights computes the products. Each weight is read from its own
+        buffer and each product is written to its own output, so the
+        weights need no joining copy. One split-K count covers the joint
+        grid. Every other case runs quantized_matmul per weight.
+        KQ_MATMUL_MULTI=0 runs quantized_matmul per weight on every call.
+        mx.grad gives the gradient with respect to x; the weights are
+        frozen, as in quantized_matmul.
+
+        Args:
+            x (array): [..., K], float16/bfloat16. float32 runs in bfloat16.
+            weights (list[array]): 2-D uint8 wire bytes [N_i, K bytes] of
+                one codec.
+            kquant_type (str): the codec of every weight.
+
+        Returns:
+            list[array]: [..., N_i] per weight, in the dtype
+            quantized_matmul gives for x.
+      )");
+
+  m.def(
       "quantized_matmul_glu",
       &mlx_kquant::quantized_matmul_glu,
       "x"_a,

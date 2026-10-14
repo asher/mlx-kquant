@@ -800,10 +800,10 @@ METAL_FUNC void kq_verify_nax_impl(
     const device uint8_t* w,
     const device T* x,
     device U* y,
-    const constant int& K,
-    const constant int& N,
-    const constant int& M,
-    const constant int& k_partition_size,
+    const int K,
+    const int N,
+    const int M,
+    const int k_partition_size,
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
@@ -944,6 +944,54 @@ METAL_FUNC void kq_verify_nax_impl(
         simd_lid);                                                     \
   }
 
+// Several weights that share x in one dispatch: weight i owns the
+// threadgroups [tg_end[i - 1], tg_end[i]) of grid x, each weight from its
+// own buffer and into its own output, with one split count over grid z.
+// part_stride[i] is output i's partial stride. Unused weight slots repeat
+// slot 0 and own no threadgroup.
+#define KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(CODEC, TRAITS)                    \
+  template <typename T, int group_size, int bits, typename U = T>           \
+  [[kernel]] void kq_##CODEC##_verify_nax_multi(                            \
+      const device uint8_t* w0,                                             \
+      const device uint8_t* w1,                                             \
+      const device uint8_t* w2,                                             \
+      const device uint8_t* w3,                                             \
+      const device T* x,                                                    \
+      device U* y0,                                                         \
+      device U* y1,                                                         \
+      device U* y2,                                                         \
+      device U* y3,                                                         \
+      const constant int& K,                                                \
+      const constant int& M,                                                \
+      const constant int& k_partition_size,                                 \
+      const constant int4& n_rows,                                          \
+      const constant int4& tg_end,                                          \
+      const constant int4& part_stride,                                     \
+      uint3 tid [[threadgroup_position_in_grid]],                           \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                     \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                        \
+    static_assert(group_size == TRAITS::group, #CODEC " block width");      \
+    const int t = int(tid.x);                                               \
+    const short i = t < tg_end[0] ? 0                                       \
+        : t < tg_end[1]           ? 1                                       \
+        : t < tg_end[2]           ? 2                                       \
+                                  : 3;                                                \
+    const int t0 = i == 0 ? 0 : tg_end[i - 1];                              \
+    const device uint8_t* w = i == 0 ? w0 : i == 1 ? w1 : i == 2 ? w2 : w3; \
+    device U* y = i == 0 ? y0 : i == 1 ? y1 : i == 2 ? y2 : y3;             \
+    kq_verify_nax_impl<T, TRAITS, U>(                                       \
+        w,                                                                  \
+        x,                                                                  \
+        y + tid.z * static_cast<int64_t>(part_stride[i]),                   \
+        K,                                                                  \
+        n_rows[i],                                                          \
+        M,                                                                  \
+        k_partition_size,                                                   \
+        uint3(uint(t - t0), tid.y, tid.z),                                  \
+        simd_gid,                                                           \
+        simd_lid);                                                          \
+  }
+
 KQ_DEFINE_VERIFY_NAX_KERNEL(pq2_0, KqPq2_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q2_0, KqQ2_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_0, KqQ4_0Nax)
@@ -956,3 +1004,16 @@ KQ_DEFINE_VERIFY_NAX_KERNEL(q5_k, KqQ5_KNax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q6_k, KqQ6_KNax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q3_k, KqQ3_KNax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q2_k, KqQ2_KNax)
+
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(pq2_0, KqPq2_0Nax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q2_0, KqQ2_0Nax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_0, KqQ4_0Nax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_0_sb, KqQ4_0SbNax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q8_0, KqQ8_0Nax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_k, KqQ4_KNax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(iq4_xs, KqIq4XsNax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(iq4_nl, KqIq4NlNax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q5_k, KqQ5_KNax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q6_k, KqQ6_KNax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q3_k, KqQ3_KNax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q2_k, KqQ2_KNax)

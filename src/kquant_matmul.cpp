@@ -10,6 +10,7 @@
 // decode-latency-critical path); the decode-only bias-fused fast path lives in
 // the KQuantQmvBias primitive below (qmv_bias), which reuses this file's qmv
 // dispatch helpers.
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -1432,6 +1433,29 @@ void verify_mma(
   ce.dispatch_threads(agrid, agroup);
 }
 
+// The several-weight form of kq_verify_nax_kname.
+static std::string kq_verify_nax_multi_kname(
+    const std::string& t,
+    const std::string& ts,
+    int gs,
+    int bits,
+    int kstep,
+    const std::string& suffix) {
+  std::string kname;
+  kname.reserve(72);
+  mx::concatenate(
+      kname,
+      (t == "q4_0" && kstep == 256 ? "kquant_q4_0_sb_" : kq_kname_prefix(t)) +
+          "verify_nax_multi_",
+      ts,
+      "_gs_",
+      gs,
+      "_b_",
+      bits,
+      suffix);
+  return kname;
+}
+
 // K per verify_nax iteration for this call. q4_0 runs its eight-block
 // kernel (q4_0_sb, 256 weights per step) where K is a multiple of 256,
 // and its two-block kernel (64) elsewhere. KQ_VERIFY_NAX_Q4_0_SB=0 keeps
@@ -1537,6 +1561,106 @@ void verify_nax(
   MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
   MTL::Size agroup(256, 1, 1);
   ce.dispatch_threads(agrid, agroup);
+}
+
+static int kq_verify_nax_splits(int N, int K, int kstep, const std::string& t);
+
+// verify_nax over up to four weights that share x, in one dispatch
+// (kq_verify_nax_multi): weight i takes ceil(N_i / 128) threadgroups of
+// grid x after those of the weights before it, and reads its own buffer.
+// The split count is the one verify_nax takes for the joint grid. Split
+// partials of weight i sit in one temporary at splits * M * (rows of the
+// weights before it), and one fold per weight writes its output.
+void verify_nax_multi(
+    const array& x,
+    const std::vector<array>& ws,
+    std::vector<array>& outs,
+    int group_size,
+    int bits,
+    int M,
+    int K,
+    int kstep,
+    Device& d,
+    const Stream& s,
+    const std::string& kquant_type) {
+  const int n = static_cast<int>(ws.size());
+  std::array<int, 4> n_rows{0, 0, 0, 0};
+  std::array<int, 4> tg_end{0, 0, 0, 0};
+  std::array<int, 4> part_stride{0, 0, 0, 0};
+  std::array<int64_t, 4> row_off{0, 0, 0, 0};
+  int tgs = 0;
+  int64_t rows = 0;
+  for (int i = 0; i < 4; ++i) {
+    const int N = i < n ? ws[i].shape(0) : 0;
+    n_rows[i] = N;
+    row_off[i] = rows;
+    rows += N;
+    tgs += (N + 127) / 128;
+    tg_end[i] = tgs;
+    part_stride[i] = M * N;
+  }
+  const int splits = kq_verify_nax_splits(tgs * 128, K, kstep, kquant_type);
+  const int k_partition = (K / kstep / splits) * kstep;
+
+  auto& ce = mx::metal::get_command_encoder(s);
+  const KqSplitkPartials pp = splits > 1 ? kq_splitk_partials(x.dtype())
+                                         : KqSplitkPartials{x.dtype(), ""};
+  array partials({splits, M, static_cast<int>(rows)}, pp.dtype, nullptr, {});
+  if (splits > 1) {
+    partials.set_data(mx::allocator::malloc(partials.nbytes()));
+    ce.add_temporary(partials);
+  }
+
+  const std::string type_string = kq_type_string(x.dtype());
+  const std::string kname = kq_verify_nax_multi_kname(
+      kquant_type, type_string, group_size, bits, kstep, pp.suffix);
+  auto kernel = kq_get_kernel(d, kname);
+  ce.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  for (int i = 0; i < 4; ++i) {
+    ce.set_input_array(ws[i < n ? i : 0], c++);
+  }
+  ce.set_input_array(x, c++);
+  for (int i = 0; i < 4; ++i) {
+    const int j = i < n ? i : 0;
+    if (splits > 1) {
+      ce.set_output_array(
+          partials, c++, splits * M * row_off[j] * partials.itemsize());
+    } else {
+      ce.set_output_array(outs[j], c++);
+    }
+  }
+  ce.set_bytes(K, c++);
+  ce.set_bytes(M, c++);
+  ce.set_bytes(k_partition, c++);
+  ce.set_bytes(n_rows.data(), 4, c++);
+  ce.set_bytes(tg_end.data(), 4, c++);
+  ce.set_bytes(part_stride.data(), 4, c++);
+  MTL::Size group_dims(128, 1, 1);
+  MTL::Size grid_dims(tgs, 1, splits);
+  kq_log_qmm(kname, M, static_cast<int>(rows), K, grid_dims);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+  if (splits == 1) {
+    return;
+  }
+
+  const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
+  auto accum = kq_get_kernel(d, aname);
+  for (int i = 0; i < n; ++i) {
+    ce.set_compute_pipeline_state(accum);
+    const int n_elems = M * n_rows[i];
+    c = 0;
+    ce.set_input_array(
+        partials, c++, splits * M * row_off[i] * partials.itemsize());
+    ce.set_output_array(outs[i], c++);
+    ce.set_bytes(n_elems, c++);
+    ce.set_bytes(splits, c++);
+    ce.set_bytes(part_stride[i], c++);
+    MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
+    MTL::Size agroup(256, 1, 1);
+    ce.dispatch_threads(agrid, agroup);
+  }
 }
 
 // Split-K qmm_t on the NAX BM=32 or BM=64 tile (KQ_QMM_SPLITK_NAX). Same
@@ -2596,6 +2720,79 @@ std::vector<mx::array> KQuantMatmul::vjp(
 
 #ifdef _METAL_
 
+// One verify_nax dispatch per four weights where the widest weight would
+// take the verify_nax route at this M, and quantized_matmul per weight
+// otherwise. The route levers of quantized_matmul apply: KQ_NAX_QMV,
+// KQ_VERIFY_NAX and KQ_DISABLE_NAX through kq_is_nax_available.
+void KQuantMatmulMulti::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  const auto& x = inputs[0];
+  const auto& scales = inputs[1];
+  const int n = static_cast<int>(outputs.size());
+  std::vector<array> ws;
+  ws.reserve(n);
+  for (int i = 0; i < n; ++i) {
+    ws.push_back(kq_matrix_dense_gpu(inputs[2 + i], s));
+    kq_check_weight_base(ws.back(), kquant_type_, "quantized_matmul_multi");
+  }
+  const int K = x.shape(-1);
+  const int M = K > 0 ? static_cast<int>(x.size() / K) : 0;
+  int n_max = 0;
+  for (const auto& w : ws) {
+    n_max = std::max(n_max, w.shape(0));
+  }
+  const int kstep = kq_verify_nax_call_kstep(K, kquant_type_);
+  bool multi = M >= 2 && M <= 8 && n_max > 0 && x.flags().row_contiguous &&
+      x.dtype() != mx::float32 && kq_is_nax_available() &&
+      codec_has_nax(kquant_type_) && kstep > 0;
+  if (multi) {
+    int qmv_max_m = kq_env_int("KQ_NAX_QMV", -1);
+    if (qmv_max_m == -1) {
+      qmv_max_m = kq_nax_qmv_max_m(kquant_type_, n_max);
+    }
+    int vnax_min_m = kq_env_int("KQ_VERIFY_NAX", -1);
+    if (vnax_min_m == -1) {
+      vnax_min_m =
+          kq_verify_nax_min_m(kquant_type_, n_max, K, x.dtype() == mx::float16);
+    }
+    multi = M > qmv_max_m && vnax_min_m > 0 && M >= vnax_min_m;
+    for (const auto& w : ws) {
+      multi = multi && kq_verify_nax_fits(w, K, kstep, kquant_type_);
+    }
+  }
+  if (!multi) {
+    KQuantMatmul one(s, kquant_type_, group_size_, bits_, true);
+    for (int i = 0; i < n; ++i) {
+      std::vector<array> o{outputs[i]};
+      one.eval_gpu({x, ws[i], scales}, o);
+    }
+    return;
+  }
+  std::vector<array> gw;
+  std::vector<array> go;
+  for (int i = 0; i < n; ++i) {
+    outputs[i].set_data(mx::allocator::malloc(outputs[i].nbytes()));
+    if (outputs[i].size() == 0) {
+      continue;
+    }
+    gw.push_back(ws[i]);
+    go.push_back(outputs[i]);
+    if (gw.size() == 4 || i == n - 1) {
+      verify_nax_multi(
+          x, gw, go, group_size_, bits_, M, K, kstep, d, s, kquant_type_);
+      gw.clear();
+      go.clear();
+    }
+  }
+  if (!gw.empty()) {
+    verify_nax_multi(
+        x, gw, go, group_size_, bits_, M, K, kstep, d, s, kquant_type_);
+  }
+}
+
 void KQuantMatmul::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
@@ -3126,6 +3323,13 @@ void KQuantMatmul::eval_gpu(
       "[mlx_kquant] quantized_matmul has no GPU implementation.");
 }
 
+void KQuantMatmulMulti::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant] quantized_matmul_multi has no GPU implementation.");
+}
+
 #endif // _METAL_
 
 std::vector<mx::Shape> KQuantQmvBias::output_shapes(
@@ -3328,6 +3532,7 @@ std::vector<std::string> split_kernel_names() {
         for (int k : ksteps) {
           each_suffix(dt, [&](const std::string& sfx) {
             out.push_back(kq_verify_nax_kname(t, ts, gs, bits, k, sfx));
+            out.push_back(kq_verify_nax_multi_kname(t, ts, gs, bits, k, sfx));
           });
         }
       }

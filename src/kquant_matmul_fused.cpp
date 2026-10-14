@@ -461,4 +461,181 @@ mx::array quantized_matmul_glu(
       {std::move(x_c), std::move(w_gate), std::move(w_up)});
 }
 
+// ----------------------------- several weights, one x -----------------
+
+namespace {
+
+const char* kMultiOp = "[mlx_kquant.quantized_matmul_multi]";
+
+// KQ_MATMUL_MULTI=0 runs quantized_matmul per weight on every call. Read
+// live so an A/B can flip arms in one process.
+bool multi_on() {
+  return kq_env_flag("KQ_MATMUL_MULTI", 1) != 0;
+}
+
+std::vector<mx::array> multi_composed(
+    const mx::array& x,
+    const std::vector<mx::array>& weights,
+    const std::string& kquant_type,
+    mx::Stream s) {
+  auto scales = mx::zeros({1}, mx::uint8, s);
+  std::vector<mx::array> out;
+  out.reserve(weights.size());
+  for (const auto& w : weights) {
+    out.push_back(quantized_matmul(
+        x,
+        w,
+        scales,
+        kquant_type,
+        true,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        s));
+  }
+  return out;
+}
+
+} // namespace
+
+void KQuantMatmulMulti::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      std::string(kMultiOp) + " CPU streams build the per-weight ops.");
+}
+
+std::vector<mx::array> KQuantMatmulMulti::vjp(
+    const std::vector<mx::array>& primals,
+    const std::vector<mx::array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<mx::array>&) {
+  for (auto arg : argnums) {
+    if (arg != 0) {
+      throw std::invalid_argument(
+          "[mlx_kquant] quantized_matmul_multi vjp: no gradient wrt the "
+          "quantized weights (the kquant base is frozen).");
+    }
+  }
+  std::vector<mx::array> ws(primals.begin() + 2, primals.end());
+  auto fun = [&](const std::vector<mx::array>& in) {
+    return multi_composed(in[0], ws, kquant_type_, stream());
+  };
+  auto vjps =
+      mx::vjp(fun, std::vector<mx::array>{primals[0]}, cotangents).second;
+  return std::vector<mx::array>(argnums.size(), vjps[0]);
+}
+
+std::vector<mx::array> KQuantMatmulMulti::jvp(
+    const std::vector<mx::array>& primals,
+    const std::vector<mx::array>& tangents,
+    const std::vector<int>& argnums) {
+  for (auto arg : argnums) {
+    if (arg != 0) {
+      throw std::invalid_argument(
+          "[mlx_kquant] quantized_matmul_multi jvp: no derivative wrt the "
+          "quantized weights (the kquant base is frozen).");
+    }
+  }
+  std::vector<mx::array> ws(primals.begin() + 2, primals.end());
+  auto fun = [&](const std::vector<mx::array>& in) {
+    return multi_composed(in[0], ws, kquant_type_, stream());
+  };
+  return mx::jvp(
+             fun,
+             std::vector<mx::array>{primals[0]},
+             std::vector<mx::array>{tangents[0]})
+      .second;
+}
+
+bool KQuantMatmulMulti::is_equivalent(const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQuantMatmulMulti&>(other);
+  return kquant_type_ == o.kquant_type_;
+}
+
+std::vector<mx::Shape> KQuantMatmulMulti::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  std::vector<mx::Shape> out;
+  for (size_t i = 2; i < inputs.size(); ++i) {
+    auto shape = inputs[0].shape();
+    shape.back() = inputs[i].shape(0);
+    out.push_back(std::move(shape));
+  }
+  return out;
+}
+
+std::vector<mx::array> quantized_matmul_multi(
+    mx::array x,
+    std::vector<mx::array> weights,
+    const std::string& kquant_type,
+    mx::StreamOrDevice s_) {
+  const std::string op = kMultiOp;
+  const KQuantCodec* codec = codec_by_name(kquant_type);
+  if (codec == nullptr) {
+    throw std::invalid_argument(
+        op + " Unknown kquant_type: '" + kquant_type + "'.");
+  }
+  if (weights.empty()) {
+    throw std::invalid_argument(op + " weights must hold at least one weight.");
+  }
+  for (const auto& w : weights) {
+    if (w.dtype() != mx::uint8 || w.ndim() != 2) {
+      throw std::invalid_argument(
+          op + " weights must be 2-D uint8 (raw GGUF wire bytes).");
+    }
+    if (w.shape(-1) != weights[0].shape(-1)) {
+      throw std::invalid_argument(
+          op + " weights must have one row length in bytes.");
+    }
+  }
+  if (weights[0].shape(-1) % codec->bytes_per_block != 0) {
+    throw std::invalid_argument(
+        op + " weight last dim (" + std::to_string(weights[0].shape(-1)) +
+        " bytes) is not a whole number of " +
+        std::to_string(codec->bytes_per_block) + "-byte " + codec->name +
+        " blocks.");
+  }
+  const int K = (weights[0].shape(-1) / codec->bytes_per_block) *
+      codec->weights_per_block;
+  if (x.ndim() < 1 || x.shape(-1) != K) {
+    throw std::invalid_argument(
+        op + " x last dim does not match the weight inner dim (" +
+        std::to_string(K) + ").");
+  }
+  if (!mx::issubdtype(x.dtype(), mx::floating)) {
+    throw std::invalid_argument(
+        op + " Only real floating x dtypes are supported.");
+  }
+  auto s = mx::to_stream(s_);
+  const mx::Dtype out_type =
+      x.dtype() == mx::float32 ? mx::bfloat16 : x.dtype();
+  const int64_t rows = K > 0 ? static_cast<int64_t>(x.size()) / K : 0;
+  const bool fused = s.device == mx::Device::gpu && nax_available() &&
+      codec->has_matmul_kernel && multi_on() && weights.size() >= 2 &&
+      rows >= 2 && rows <= 8;
+  if (!fused) {
+    return multi_composed(x, weights, kquant_type, s);
+  }
+  std::vector<mx::array> inputs;
+  inputs.reserve(weights.size() + 2);
+  inputs.push_back(mx::contiguous(mx::astype(x, out_type, s), false, s));
+  inputs.push_back(mx::zeros({1}, mx::uint8, s));
+  std::vector<mx::Shape> shapes;
+  std::vector<mx::Dtype> dtypes;
+  for (auto& w : weights) {
+    kq_check_weight_base_at_build(w, kquant_type, s, "quantized_matmul_multi");
+    auto shape = x.shape();
+    shape.back() = w.shape(0);
+    shapes.push_back(std::move(shape));
+    dtypes.push_back(out_type);
+    inputs.push_back(kq_matrix_dense(w, s));
+  }
+  return mx::array::make_arrays(
+      std::move(shapes),
+      dtypes,
+      std::make_shared<KQuantMatmulMulti>(
+          s, kquant_type, codec->weights_per_block, codec->bits),
+      std::move(inputs));
+}
+
 } // namespace mlx_kquant
