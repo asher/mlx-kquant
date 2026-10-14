@@ -223,9 +223,9 @@ Tuning levers (defaults are right for normal use):
   the weights; `benchmarks/bench_dit_shapes.py` runs its tile arms this way. It reads the
   environment on every dispatch, so it is for single-threaded A/B runs that set these variables
   between calls. The `quantized_matmul_glu` levers (`KQ_GLU`, `KQ_GLU_MIN_ROWS`), the
-  `quantized_matmul_multi` lever (`KQ_MATMUL_MULTI`), the `quantized_matmul_lora` levers (`KQ_QMM_LORA`, `KQ_QMM_LORA_MIN_ROWS`), the
-  `quantized_matmul_residual` lever (`KQ_QMM_RESID`), the dequantize route lever
-  (`KQ_DEQUANT_ROUTE`) and the `conv2d_3x3` lever (`KQ_CONV_NAX`) are
+  `quantized_matmul_multi` lever (`KQ_MATMUL_MULTI`), the `quantized_matmul_lora` levers
+  (`KQ_QMM_LORA`, `KQ_QMM_LORA_MIN_ROWS`), the `quantized_matmul_residual` lever (`KQ_QMM_RESID`),
+  the dequantize route lever (`KQ_DEQUANT_ROUTE`) and the `conv2d_3x3` lever (`KQ_CONV_NAX`) are
   read when the op is called and builds its graph, not when a kernel is dispatched, so a compiled
   function keeps the kernel choice of its trace. Unset (off) by default, and then each of them keeps
   its first read for the life of the process. Read once per process.
@@ -1066,7 +1066,8 @@ into a packed layout first.
   about 64 threadgroups over the KV heads, between 4 and 64, and halves while a split would hold
   fewer than 64 keys. The two kernels round differently, so their outputs are not bit-identical.
   `KQ_FA_VERIFY_NAX=0` keeps the simdgroup-matrix kernel, and `KQ_FA_VERIFY_NAX_WN` sets the head
-  dim split (2 or 4 at 256, 1 or 2 at 128); both are read at each call.
+  dim split (2 or 4 at 256, 1 or 2 at 128; another value warns once on stderr and keeps the
+  default); both are read at each call.
 - **`sdpa_fa_indexed`** - index-gathered attention over one shared K/V latent at head dim 512, the
   absorbed-MLA sparse decode step: query j of `q [1, Hq, Q, 512]` attends the rows of `kv [1, 1, N,
   512]` that `idx[j]` (int32, -1 pads) lists, so the selected rows are read once from the latent
@@ -1096,8 +1097,11 @@ their cache layout.
   row's region map follows its own end and `tail_rows` is the per-row form of `n_attend`, so a
   ragged batch merges per-row tails the same way. Head dims 128, 256 and 512, q_len 1 to 4.
 - **`sdpa_fa_verify_kvarn`** - the same matrix-unit verify pass over a KVarN cache: sealed records
-  dequantize at tile stage through the loaders `sdpa_decode_gqa_kvarn` uses, so the result matches
-  `sdpa_fa_verify` over the materialized cache bit for bit. The verify-width route (q_len 2 to 8):
+  dequantize at tile stage through the loaders `sdpa_decode_gqa_kvarn` uses, and its key pass runs
+  on the simdgroup-matrix kernel at every head dim. The result matches `sdpa_fa_verify` over the
+  materialized cache bit for bit where that call runs the same kernel (`KQ_FA_VERIFY_NAX=0`). Where
+  `sdpa_fa_verify` takes its NAX key pass (head dims 128 and 256 on NAX GPUs), the two agree to
+  rounding. The verify-width route (q_len 2 to 8):
   the vector kernel's cost climbs steeply past two queries, the matrix tile prices extra rows at
   nearly zero. Head dims 128, 256 and 512; `n_attend` / `full_visibility` / `return_lse` as the
   decode op.

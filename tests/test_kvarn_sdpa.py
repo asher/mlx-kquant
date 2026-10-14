@@ -773,7 +773,8 @@ def test_dwide_rejects_wrong_tile_c_and_stale_shapes(d):
 # sdpa_fa_verify_kvarn stages the same values as the decode kernel through
 # the shared kvarn loaders, and everything downstream is sdpa_fa_verify
 # unchanged, so it must match sdpa_fa_verify over the materialized twin bit
-# for bit, lse included.
+# for bit, lse included, where that call runs the simdgroup pass 1 (the
+# autouse fixture above).
 
 
 def fold(q, hkv, ql):
@@ -855,6 +856,28 @@ def test_fa_verify_explicit_splits():
     q = make_q(1, 8, 4)
     out, ref = run_fa_pair(st, q, 1000, 6, 6, 4, splits=7, return_lse=True)
     assert_bit_equal(out, ref)
+
+
+@pytest.mark.parametrize("d", [128, 256])
+def test_fa_verify_default_lever_keeps_kvarn_kernel(d, monkeypatch):
+    # At the default KQ_FA_VERIFY_NAX, plain sdpa_fa_verify takes the NAX
+    # pass 1 at these head dims, which reads plain K/V. The kvarn op keeps
+    # the simdgroup kernel and its split rule, so it gives the bits it gives
+    # with the lever off, and those of the simdgroup reference. The lever
+    # is read when the kernel is dispatched, so each arm is evaluated
+    # before the lever changes.
+    st = build_state(1, 2, 1000, 6, 6, seed=123 + d, d=d)
+    q = make_q(1, 8, 4, d=d)
+    monkeypatch.delenv("KQ_FA_VERIFY_NAX")
+    out_default, ref_nax = run_fa_pair(st, q, 1000, 6, 6, 4, return_lse=True)
+    mx.eval(out_default, ref_nax)
+    monkeypatch.setenv("KQ_FA_VERIFY_NAX", "0")
+    out_off, ref = run_fa_pair(st, q, 1000, 6, 6, 4, return_lse=True)
+    mx.eval(out_off, ref)
+    # The plain op did take the NAX pass at the default.
+    assert not np.array_equal(np.array(ref_nax[0]), np.array(ref[0]))
+    assert_bit_equal(out_default, out_off)
+    assert_bit_equal(out_default, ref)
 
 
 def test_fa_verify_n_attend_full_visibility():

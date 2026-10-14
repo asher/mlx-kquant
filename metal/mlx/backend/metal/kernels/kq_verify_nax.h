@@ -947,8 +947,9 @@ METAL_FUNC void kq_verify_nax_impl(
 // Several weights that share x in one dispatch: weight i owns the
 // threadgroups [tg_end[i - 1], tg_end[i]) of grid x, each weight from its
 // own buffer and into its own output, with one split count over grid z.
-// part_stride[i] is output i's partial stride. Unused weight slots repeat
-// slot 0 and own no threadgroup.
+// part_stride[i] is output i's partial stride. Unused weight slots bind
+// slot 0's buffers, and their tg_end is the grid end, so they own no
+// threadgroup.
 #define KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(CODEC, TRAITS)                       \
   template <typename T, int group_size, int bits, typename U = T>              \
   [[kernel]] void kq_##CODEC##_verify_nax_multi(                               \

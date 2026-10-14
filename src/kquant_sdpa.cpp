@@ -774,10 +774,13 @@ void KQuantSDPAFAVerify::eval_gpu(
   if (nax_pass1) {
     const int wm = (n_rows + 15) / 16;
     int wn = D == 128 ? 2 : wm <= 2 ? 4 : 2;
-    const int wn_env = kq_env_lever("KQ_FA_VERIFY_NAX_WN", 0);
-    if ((D == 256 && (wn_env == 2 || wn_env == 4)) ||
-        (D == 128 && (wn_env == 1 || wn_env == 2))) {
-      wn = wn_env;
+    // Another value warns once and keeps the default.
+    static const std::vector<std::string> wn_128 = {"1", "2"};
+    static const std::vector<std::string> wn_256 = {"2", "4"};
+    const auto& wn_set = D == 128 ? wn_128 : wn_256;
+    const int wn_env = kq_env_choice("KQ_FA_VERIFY_NAX_WN", wn_set, -1);
+    if (wn_env >= 0) {
+      wn = std::stoi(wn_set[wn_env]);
     }
     std::string kname = "kq_sdpa_fa_verify_2pass_1_nax_" + ts + "_" +
         std::to_string(D) + "_wm" + std::to_string(wm) + "_wn" +

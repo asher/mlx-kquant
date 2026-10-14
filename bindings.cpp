@@ -1866,9 +1866,13 @@ NB_MODULE(_ext, m) {
         GQA fold as sdpa_fa_verify (q [1, Hkv, G*q_len, D], kv-major heads,
         original q_len; G*q_len <= 64, or 32 at head_dim 512) in the
         rotated domain, and the sealed records dequantize at tile stage
-        exactly as in sdpa_decode_gqa_kvarn, so the output matches
-        sdpa_fa_verify over the materialized cache bit for bit. Operands,
-        n, n_attend and full_visibility follow sdpa_decode_gqa_kvarn; the
+        exactly as in sdpa_decode_gqa_kvarn. The key pass runs on the
+        simdgroup-matrix kernel at every head dim, so the output matches
+        sdpa_fa_verify over the materialized cache bit for bit where that
+        call runs the same kernel (KQ_FA_VERIFY_NAX=0). Where
+        sdpa_fa_verify takes its NAX key pass (head_dim 128 and 256 on NAX
+        GPUs), the two agree to rounding. Operands, n, n_attend and
+        full_visibility follow sdpa_decode_gqa_kvarn; the
         result is rotated-domain like the query (un-rotate it). This is the
         verify-width route: the vector kernel's cost climbs steeply past
         two queries, while the matrix tile prices extra rows at nearly

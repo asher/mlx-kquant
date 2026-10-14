@@ -1196,6 +1196,28 @@ def test_sdpa_fa_verify_nax_wn(D, wn, G, qL, kL, splits, strided, monkeypatch):
         _check_fa(D, qL, kL=kL, dtype=dtype, Hkv=2, G=G, strided=strided, splits=splits)
 
 
+# A KQ_FA_VERIFY_NAX_WN value outside the head dim's set warns once on
+# stderr and keeps the default split: the same bits as the lever unset.
+@pytest.mark.parametrize("D,bad", [(128, "4"), (256, "1"), (256, "3"), (128, "x")])
+def test_sdpa_fa_verify_nax_wn_out_of_set(D, bad, monkeypatch, capfd):
+    if not kq.nax_available():
+        pytest.skip("the tensor-op pass 1 needs NAX")
+    monkeypatch.setenv("KQ_FA_VERIFY_NAX", "1")
+    q, k, v = _make(1, 2, 2, 6 * 4, 1000, D, mx.bfloat16, seed=D, strided=False)
+    scale = 1.0 / (D**0.5)
+    out = {}
+    for value in (None, bad):
+        if value is None:
+            monkeypatch.delenv("KQ_FA_VERIFY_NAX_WN", raising=False)
+        else:
+            monkeypatch.setenv("KQ_FA_VERIFY_NAX_WN", value)
+        out[value] = kq.sdpa_fa_verify(q, k, v, scale, q_len=4, splits=8)
+        _eval_or_skip(out[value])
+    assert mx.array_equal(out[None], out[bad]).item()
+    err = capfd.readouterr().err
+    assert f"KQ_FA_VERIFY_NAX_WN={bad} is not" in err, err
+
+
 @pytest.mark.parametrize("D", [128, 256])
 @pytest.mark.parametrize("qL", [1, 2, 3, 4, 5, 6, 7, 8])
 def test_sdpa_fa_verify_nax_matches_simdgroup(D, qL, monkeypatch):
