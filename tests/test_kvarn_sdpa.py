@@ -861,11 +861,11 @@ def test_fa_verify_explicit_splits():
 @pytest.mark.parametrize("d", [128, 256])
 def test_fa_verify_default_lever_keeps_kvarn_kernel(d, monkeypatch):
     # At the default KQ_FA_VERIFY_NAX, plain sdpa_fa_verify takes the NAX
-    # pass 1 at these head dims, which reads plain K/V. The kvarn op keeps
-    # the simdgroup kernel and its split rule, so it gives the bits it gives
-    # with the lever off, and those of the simdgroup reference. The lever
-    # is read when the kernel is dispatched, so each arm is evaluated
-    # before the lever changes.
+    # pass 1 at these head dims on NAX GPUs, which reads plain K/V. The
+    # kvarn op keeps the simdgroup kernel and its split rule, so it gives
+    # the bits it gives with the lever off, and those of the simdgroup
+    # reference. The lever is read when the kernel is dispatched, so each
+    # arm is evaluated before the lever changes.
     st = build_state(1, 2, 1000, 6, 6, seed=123 + d, d=d)
     q = make_q(1, 8, 4, d=d)
     monkeypatch.delenv("KQ_FA_VERIFY_NAX")
@@ -874,8 +874,9 @@ def test_fa_verify_default_lever_keeps_kvarn_kernel(d, monkeypatch):
     monkeypatch.setenv("KQ_FA_VERIFY_NAX", "0")
     out_off, ref = run_fa_pair(st, q, 1000, 6, 6, 4, return_lse=True)
     mx.eval(out_off, ref)
-    # The plain op did take the NAX pass at the default.
-    assert not np.array_equal(np.array(ref_nax[0]), np.array(ref[0]))
+    # The plain op takes the NAX pass at the default on NAX GPUs only.
+    took_nax = not np.array_equal(np.array(ref_nax[0]), np.array(ref[0]))
+    assert took_nax == kq.nax_available()
     assert_bit_equal(out_default, out_off)
     assert_bit_equal(out_default, ref)
 

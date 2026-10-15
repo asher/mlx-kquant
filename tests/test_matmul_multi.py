@@ -414,7 +414,7 @@ def test_x16_load_bits(codec, dtype):
             assert r["digest"] == group[0]["digest"], tag
 
 
-@pytest.mark.skipif(force_cpu(), reason="GPU copies")
+@NAX_ONLY
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 @pytest.mark.parametrize(
     "lever",
@@ -422,9 +422,9 @@ def test_x16_load_bits(codec, dtype):
     ids=lambda e: ",".join(f"{k}={v}" for k, v in e.items()),
 )
 def test_per_weight_copies_x_once(lever, dtype):
-    # Off verify_nax, the op runs quantized_matmul per weight on one aligned
-    # copy of x: one copy for the three weights, every kernel reads x on a
-    # 16-byte boundary, and the bits match x at offset 0.
+    # Off verify_nax on a NAX GPU, the op runs quantized_matmul per weight
+    # on one aligned copy of x: one copy for the three weights, every kernel
+    # reads x on a 16-byte boundary, and the bits match x at offset 0.
     calls = [
         {
             "codec": "q4_k",
