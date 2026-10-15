@@ -6,6 +6,8 @@ a clean ``KQ_*`` environment, runs a list of ``quantized_matmul`` calls,
 and returns per call the ``KQ_QMM_LOG`` lines it printed (kernel name and
 grid), its error if it raised, and its relative Frobenius error against a
 float64 reference built from ``kq.dequantize`` weights. A call with
+``"multi": [n, ...]`` runs ``quantized_matmul_multi`` over its weight and
+one more of each listed N, and gets the largest error over the outputs. A call with
 ``"r2": true`` also gets ``rel2`` against those weights rounded to the
 activation dtype, and ``floor1``/``floor2``, the error of rounding each
 reference to the output dtype. A call with ``"ulp_vs": i`` gets ``ulp``,
@@ -16,8 +18,11 @@ root mean square. ``"check_block": B`` runs the check and the ulp
 comparison over every row of x's flattened leading dims, B rows at a
 time, so a call with many rows holds float64 copies of B rows; it reports
 ``checked``, the number of rows it read. Every call gets
-``digest``, a hash of its output bits, to compare calls across probe
-processes.
+``digest``, a hash of its output bits (of every output on a ``"multi"``
+call), to compare calls across probe processes. ``"x_offset": E`` passes
+x as a row-contiguous view E elements into its buffer, and ``copies``
+lists the ``[kq align]`` lines of the call, (operand, xin) for each
+operand an op copied to an aligned buffer.
 
 ``"design": "lead"`` draws nonnegative weights and activations whose first
 K column is 1024. ``"design": "big"`` draws small weights and dense
@@ -242,8 +247,54 @@ for i, c in enumerate(spec["calls"]):
     x = activations(
         list(c["shape"]), dtype, c.get("layout", "dense"), c.get("seed", i), design
     )
+    if c.get("x_offset"):
+        # The same values as a row-contiguous view x_offset elements into
+        # its buffer. The buffer is allocated with the cache off: a reused
+        # one can carry the slack that makes the op copy the view to a
+        # fresh one, and buffers freed late can refill an emptied cache.
+        off = c["x_offset"]
+        limit = mx.set_cache_limit(0)
+        try:
+            mx.clear_cache()
+            flat = mx.concatenate([mx.zeros((off,), dtype), x.reshape(-1)])
+            mx.eval(flat)
+        finally:
+            mx.set_cache_limit(limit)
+        x = flat[off:].reshape(x.shape)
     os.write(2, f"[probe] {i}\n".encode())
     res = {"i": i, "error": None, "rel": None, "ulp": None}
+    if c.get("multi"):
+        # quantized_matmul_multi over weights of N n and each of "multi";
+        # rel is the largest over the outputs.
+        ns = [c["n"], *c["multi"]]
+        wl = [weights(c["codec"], n, c["shape"][-1], design)[0] for n in ns]
+        try:
+            ys = kq.quantized_matmul_multi(x, wl, c["codec"])
+            mx.eval(ys)
+        except Exception as e:
+            res["error"] = f"{type(e).__name__}: {e}"
+            outs.append(None)
+            results.append(res)
+            continue
+        bits = [y.view(mx.uint16) if y.dtype in DT.values() else y for y in ys]
+        h = hashlib.sha1()
+        for b in bits:
+            h.update(memoryview(np.array(b)))
+        res["digest"] = h.hexdigest()
+        if not spec.get("check", True):
+            outs.append(None)
+            results.append(res)
+            mx.clear_cache()
+            continue
+        xn = as64(x)
+        res["rel"] = max(
+            rel(as64(y), xn @ dequantized(c["codec"], n, c["shape"][-1], design).T)
+            for y, n in zip(ys, ns, strict=True)
+        )
+        outs.append(None)
+        results.append(res)
+        mx.clear_cache()
+        continue
     try:
         y = kq.quantized_matmul(x, w, s, c["codec"], transpose=True)
         mx.eval(y)
@@ -314,14 +365,19 @@ for i, c in enumerate(spec["calls"]):
 print(json.dumps(results))
 """
 
-_LOG = re.compile(r"^\[kq qmm\] (\S+) M=(\d+) N=(\d+) K=(\d+) grid=(\d+),(\d+),(\d+)$")
+_LOG = re.compile(
+    r"^\[kq qmm\] (\S+) M=(\d+) N=(\d+) K=(\d+) grid=(\d+),(\d+),(\d+) xa=(\d+)$"
+)
+_ALIGN = re.compile(r"^\[kq align\] (.+) xin=(\d+)$")
 
 
 def run_probe(calls, env=None, check=True, timeout=900):
     """Run ``calls`` in a fresh interpreter whose environment keeps no
     ``KQ_*`` variable but those in ``env``. Returns one dict per call with
-    ``kernels`` (list of (name, grid) from KQ_QMM_LOG), ``stderr`` (its
-    other stderr lines), ``error``, ``rel`` and ``ulp``."""
+    ``kernels`` (list of (name, grid) from KQ_QMM_LOG), ``xa`` (the logged
+    byte offset of x modulo 16 per kernel), ``copies`` (the operands copied
+    to an aligned buffer, with the byte offset they came at), ``stderr``
+    (its other stderr lines), ``error``, ``rel`` and ``ulp``."""
     child_env = {k: v for k, v in os.environ.items() if not k.startswith("KQ_")}
     child_env.update(env or {})
     spec = {"tests_dir": TESTS_DIR, "calls": calls, "check": check}
@@ -335,12 +391,16 @@ def run_probe(calls, env=None, check=True, timeout=900):
     assert r.returncode == 0, r.stderr[-6000:]
     results = json.loads(r.stdout.strip().splitlines()[-1])
     logs = {}
+    aligns = {}
+    copies = {}
     other = {}
     cur = None
     for line in r.stderr.splitlines():
         if line.startswith("[probe] "):
             cur = int(line.split()[1])
             logs[cur] = []
+            aligns[cur] = []
+            copies[cur] = []
             other[cur] = []
             continue
         if cur is None:
@@ -349,10 +409,17 @@ def run_probe(calls, env=None, check=True, timeout=900):
         if m:
             grid = tuple(int(g) for g in m.group(5, 6, 7))
             logs[cur].append((m.group(1), grid))
+            aligns[cur].append(int(m.group(8)))
+            continue
+        m = _ALIGN.match(line)
+        if m:
+            copies[cur].append((m.group(1), int(m.group(2))))
         else:
             other[cur].append(line)
     for res in results:
         res["kernels"] = logs.get(res["i"], [])
+        res["xa"] = aligns.get(res["i"], [])
+        res["copies"] = copies.get(res["i"], [])
         res["stderr"] = other.get(res["i"], [])
     return results
 

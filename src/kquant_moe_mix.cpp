@@ -92,7 +92,8 @@ void KQuantGatherMix::eval_gpu(
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
-  const auto& y = inputs[0];
+  // y is the activation, bound from a 16-byte boundary.
+  const mx::array y = kq_x_aligned_gpu(inputs[0], s, "gather_mix y");
   const int N = y.shape(1);
   const int Tn = inputs[2].shape(0);
   const int K = inputs[2].shape(1);
@@ -100,7 +101,7 @@ void KQuantGatherMix::eval_gpu(
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
-  ce.set_input_array(inputs[0], 0);
+  ce.set_input_array(y, 0);
   ce.set_input_array(inputs[1], 1);
   ce.set_input_array(inputs[2], 2);
   ce.set_output_array(out, 3);
@@ -113,6 +114,7 @@ void KQuantGatherMix::eval_gpu(
   }
   MTL::Size group_dims(threads, 1, 1);
   MTL::Size grid_dims(Tn, 1, 1);
+  kq_log_dispatch(kname, y, out, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 

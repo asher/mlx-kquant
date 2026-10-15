@@ -24,6 +24,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -681,8 +682,9 @@ def _depth(entry):
     return _one_kernel(entry)[1][2]
 
 
-# Kernel name fragment of each route that logs. The mat-vec routes (qmv,
-# mv_ext, verify_qmv) log nothing.
+# Kernel name fragment of each route but the mat-vec routes (qmv, mv_ext,
+# verify_qmv), whose kernels hold one of MATVEC_KERNEL.
+MATVEC_KERNEL = ("_qmv_", "_mv_ext_")
 ROUTE_KERNEL = {
     "verify_nax": "_verify_nax_",
     "verify_mma": "_verify_mma_",
@@ -692,14 +694,14 @@ ROUTE_KERNEL = {
 
 
 def _route_of(entry):
-    """The route an entry of _logged ran: a ROUTE_KERNEL key, "tile" for
-    another logged kernel, or "matvec" when nothing logged."""
+    """The route an entry of _logged ran: "matvec" for a mat-vec kernel, a
+    ROUTE_KERNEL key, or "tile" for another kernel."""
     error, kernels = entry
     assert error is None, error
-    if not kernels:
-        return "matvec"
     assert len(kernels) == 1, kernels
     name = kernels[0][0]
+    if any(frag in name for frag in MATVEC_KERNEL):
+        return "matvec"
     return next((r for r, frag in ROUTE_KERNEL.items() if frag in name), "tile")
 
 
@@ -1319,6 +1321,83 @@ def test_verify_nax_disable_nax(codec, monkeypatch):
     monkeypatch.delenv("KQ_QMM_ROUTE")
     monkeypatch.delenv("KQ_QMM_ROUTE_STRICT")
     _sweep(codec, w, s, ref_w, 1000, ms=[3, 5, 8])
+
+
+# The verify_nax codecs that read one activation step at a time read two
+# steps in one 16-byte load where x starts on a 16-byte boundary, one step
+# per 8-byte load where it starts 8 bytes past one, and x from an aligned
+# copy elsewhere. Each arm multiplies the same values in the same order: x
+# at offset 0 (the paired load), at offset 0 with KQ_VNAX_X16=0, at every
+# 2-byte offset from 2 to 14 bytes (8 bytes: one load per step; the others:
+# the copy, paired) and at 16 bytes (the paired load off the buffer start).
+X16_ARMS = [(0, None), (0, "0"), *[(e, None) for e in range(1, 9)]]
+
+
+def x16_variant(off, lever):
+    # The KQ_QMM_LOG name end of the pipeline an arm takes.
+    x8 = lever is not None or (2 * off) % 16 == 8
+    return "_x8(_pf32)?$" if x8 else "_x16(_pf32)?$"
+
+
+def x16_reads(off, what):
+    # (copies, xa): the copy an arm makes of x and the x offset its kernel
+    # logs. x off an 8-byte boundary is copied; x8 reads x 8 bytes in.
+    b = 2 * off
+    return ([(what, b % 8)], [0]) if b % 8 else ([], [b % 16])
+
+
+X16_SPLITS = [None, "3"]
+X16_DTYPES = ["bfloat16", "float16"]
+
+
+@functools.cache
+def _x16_digests():
+    cases = [
+        (codec, m, dtype, splits)
+        for codec in VNAX_CODECS + VNAX_IQ4
+        for m in range(2, 9)
+        for dtype in X16_DTYPES
+        for splits in X16_SPLITS
+    ]
+    calls = [
+        {
+            "codec": codec,
+            "shape": [m, K],
+            "n": 1000,
+            "dtype": dtype,
+            "seed": m,
+            "x_offset": off,
+            "env": {"KQ_VNAX_X16": lever, "KQ_VERIFY_NAX_SPLITS": splits},
+        }
+        for codec, m, dtype, splits in cases
+        for off, lever in X16_ARMS
+    ]
+    env = {
+        "KQ_QMM_LOG": "1",
+        "KQ_TUNE_LIVE": "1",
+        "KQ_QMM_ROUTE": "verify_nax",
+        "KQ_QMM_ROUTE_STRICT": "1",
+    }
+    res = run_probe(calls, env=env, check=False)
+    n = len(X16_ARMS)
+    return {c: res[n * i : n * i + n] for i, c in enumerate(cases)}
+
+
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+@pytest.mark.parametrize("codec", VNAX_CODECS + VNAX_IQ4)
+def test_verify_nax_x16_bits(codec):
+    for (c, m, dtype, splits), arms in _x16_digests().items():
+        if c != codec:
+            continue
+        tag = f"{codec} M{m} {dtype} splits {splits}"
+        for (off, lever), r in zip(X16_ARMS, arms, strict=True):
+            assert r["error"] is None, (tag, off, lever, r["error"])
+            ((name, _),) = r["kernels"]
+            assert "_verify_nax_" in name, (tag, name)
+            assert re.search(x16_variant(off, lever), name), (tag, off, lever, name)
+            copies, xa = x16_reads(off, "quantized_matmul x")
+            assert (r["copies"], r["xa"]) == (copies, xa), (tag, off, lever)
+            assert r["digest"] == arms[0]["digest"], (tag, off, lever)
 
 
 # verify_nax folds the block scale into half weights and accumulates in

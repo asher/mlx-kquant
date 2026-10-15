@@ -10,6 +10,7 @@
 // decode-latency-critical path); the decode-only bias-fused fast path lives in
 // the KQuantQmvBias primitive below (qmv_bias), which reuses this file's qmv
 // dispatch helpers.
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -748,8 +749,8 @@ static KqSplitkPartials kq_splitk_partials(mx::Dtype dt) {
   return kq_splitk_partials(dt, mode < 0 ? dt == mx::float16 : mode != 0);
 }
 
-// KQ_QMM_LOG set (any value): the qmm tiles log the kernel name and shape
-// of each dispatch to stderr.
+// KQ_QMM_LOG set (any value): the quantized matmul and mat-vec kernels log
+// the kernel name and shape of each dispatch to stderr.
 static bool kq_qmm_log() {
   static const bool cached = std::getenv("KQ_QMM_LOG") != nullptr;
   return kq_tune_live() ? std::getenv("KQ_QMM_LOG") != nullptr : cached;
@@ -813,24 +814,27 @@ static void kq_require_tile_kernel(
   kq_require_kernel(d, std::string(lever) + "=" + kq_tile_string(t), kname);
 }
 
-// One KQ_QMM_LOG line: kernel name, shape and grid of a qmm tile dispatch.
+// One KQ_QMM_LOG line: kernel name, shape and grid of a dispatch, and xa,
+// the byte offset of x's start modulo 16.
 static void kq_log_qmm(
     const std::string& kname,
     int M,
     int N,
     int K,
-    const MTL::Size& grid) {
+    const MTL::Size& grid,
+    const array& x) {
   if (kq_qmm_log()) {
     std::fprintf(
         stderr,
-        "[kq qmm] %s M=%d N=%d K=%d grid=%lu,%lu,%lu\n",
+        "[kq qmm] %s M=%d N=%d K=%d grid=%lu,%lu,%lu xa=%d\n",
         kname.c_str(),
         M,
         N,
         K,
         static_cast<unsigned long>(grid.width),
         static_cast<unsigned long>(grid.height),
-        static_cast<unsigned long>(grid.depth));
+        static_cast<unsigned long>(grid.depth),
+        kq_x_align(x));
   }
 }
 
@@ -1012,7 +1016,7 @@ void qmm_nax(
   if (tile) {
     kq_require_tile_kernel(d, "KQ_NAX_TILE", *tile, kname);
   }
-  kq_log_qmm(kname, M, N, K, grid_dims);
+  kq_log_qmm(kname, M, N, K, grid_dims, x);
 
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -1110,7 +1114,7 @@ void qmm(
   if (tile) {
     kq_require_tile_kernel(d, "KQ_QMM_TILE", *tile, kname);
   }
-  kq_log_qmm(kname, M, N, K, grid_dims);
+  kq_log_qmm(kname, M, N, K, grid_dims, x);
 
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -1331,7 +1335,7 @@ void qmm_splitk(
   ce.set_bytes(part_stride, c++);
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, splits);
-  kq_log_qmm(kname, M, N, K, grid_dims);
+  kq_log_qmm(kname, M, N, K, grid_dims, x);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 
   const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
@@ -1411,7 +1415,7 @@ void verify_mma(
   ce.set_bytes(part_stride, c++);
   MTL::Size group_dims(256, 1, 1);
   MTL::Size grid_dims((N + rows - 1) / rows, 1, splits);
-  kq_log_qmm(kname, M, N, K, grid_dims);
+  kq_log_qmm(kname, M, N, K, grid_dims, x);
   ce.dispatch_threadgroups(grid_dims, group_dims);
   if (splits == 1) {
     return;
@@ -1430,6 +1434,29 @@ void verify_mma(
   MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
   MTL::Size agroup(256, 1, 1);
   ce.dispatch_threads(agrid, agroup);
+}
+
+// The several-weight form of kq_verify_nax_kname.
+static std::string kq_verify_nax_multi_kname(
+    const std::string& t,
+    const std::string& ts,
+    int gs,
+    int bits,
+    int kstep,
+    const std::string& suffix) {
+  std::string kname;
+  kname.reserve(72);
+  mx::concatenate(
+      kname,
+      (t == "q4_0" && kstep == 256 ? "kquant_q4_0_sb_" : kq_kname_prefix(t)) +
+          "verify_nax_multi_",
+      ts,
+      "_gs_",
+      gs,
+      "_b_",
+      bits,
+      suffix);
+  return kname;
 }
 
 // K per verify_nax iteration for this call. q4_0 runs its eight-block
@@ -1472,6 +1499,32 @@ kq_verify_nax_fits(const array& w, int K, int kstep, const std::string& t) {
 // device memory per block and nothing staged. Same partial/fold shape as
 // verify_mma. Non-batched transpose shapes, bf16 or f16 activations, NAX
 // GPUs.
+// KQ_VNAX_X16=0 keeps verify_nax on one 8-byte activation load per step.
+// Read once per process unless KQ_TUNE_LIVE=1.
+static bool kq_vnax_x16_enabled() {
+  static const bool cached = kq_env_flag("KQ_VNAX_X16", 1) != 0;
+  return kq_tune_live() ? kq_env_flag("KQ_VNAX_X16", 1) != 0 : cached;
+}
+
+// verify_nax pipeline: the kernels that load one activation step at a
+// time load two in one 16-byte load where x starts on a 16-byte boundary
+// (function constant 40, kq_vnax_x16). vname, kname with the variant
+// (_x16 or _x8) ahead of its partials suffix, names the pipeline and the
+// KQ_QMM_LOG line.
+static MTL::ComputePipelineState* kq_verify_nax_pipeline(
+    Device& d,
+    const std::string& kname,
+    const std::string& suffix,
+    const array& x,
+    std::string& vname) {
+  bool x16 = reinterpret_cast<uintptr_t>(x.data<char>()) % 16 == 0 &&
+      kq_vnax_x16_enabled();
+  mx::metal::MTLFCList fc = {{&x16, MTL::DataType::DataTypeBool, 40}};
+  vname = kname.substr(0, kname.size() - suffix.size()) +
+      (x16 ? "_x16" : "_x8") + suffix;
+  return kq_get_kernel(d, kname, vname, fc);
+}
+
 void verify_nax(
     const array& x,
     const array& w,
@@ -1503,7 +1556,8 @@ void verify_nax(
   const std::string kname = kq_verify_nax_kname(
       kquant_type, type_string, group_size, bits, kstep, pp.suffix);
 
-  auto kernel = kq_get_kernel(d, kname);
+  std::string vname;
+  auto kernel = kq_verify_nax_pipeline(d, kname, pp.suffix, x, vname);
   ce.set_compute_pipeline_state(kernel);
 
   int c = 0;
@@ -1518,7 +1572,7 @@ void verify_nax(
   ce.set_bytes(part_stride, c++);
   MTL::Size group_dims(128, 1, 1);
   MTL::Size grid_dims((N + 127) / 128, 1, splits);
-  kq_log_qmm(kname, M, N, K, grid_dims);
+  kq_log_qmm(vname, M, N, K, grid_dims, x);
   ce.dispatch_threadgroups(grid_dims, group_dims);
   if (splits == 1) {
     return;
@@ -1537,6 +1591,107 @@ void verify_nax(
   MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
   MTL::Size agroup(256, 1, 1);
   ce.dispatch_threads(agrid, agroup);
+}
+
+static int kq_verify_nax_splits(int N, int K, int kstep, const std::string& t);
+
+// verify_nax over up to four weights that share x, in one dispatch
+// (kq_verify_nax_multi): weight i takes ceil(N_i / 128) threadgroups of
+// grid x after those of the weights before it, and reads its own buffer.
+// The split count is the one verify_nax takes for the joint grid. Split
+// partials of weight i sit in one temporary at splits * M * (rows of the
+// weights before it), and one fold per weight writes its output.
+void verify_nax_multi(
+    const array& x,
+    const std::vector<array>& ws,
+    std::vector<array>& outs,
+    int group_size,
+    int bits,
+    int M,
+    int K,
+    int kstep,
+    Device& d,
+    const Stream& s,
+    const std::string& kquant_type) {
+  const int n = static_cast<int>(ws.size());
+  std::array<int, 4> n_rows{0, 0, 0, 0};
+  std::array<int, 4> tg_end{0, 0, 0, 0};
+  std::array<int, 4> part_stride{0, 0, 0, 0};
+  std::array<int64_t, 4> row_off{0, 0, 0, 0};
+  int tgs = 0;
+  int64_t rows = 0;
+  for (int i = 0; i < 4; ++i) {
+    const int N = i < n ? ws[i].shape(0) : 0;
+    n_rows[i] = N;
+    row_off[i] = rows;
+    rows += N;
+    tgs += (N + 127) / 128;
+    tg_end[i] = tgs;
+    part_stride[i] = M * N;
+  }
+  const int splits = kq_verify_nax_splits(tgs * 128, K, kstep, kquant_type);
+  const int k_partition = (K / kstep / splits) * kstep;
+
+  auto& ce = mx::metal::get_command_encoder(s);
+  const KqSplitkPartials pp = splits > 1 ? kq_splitk_partials(x.dtype())
+                                         : KqSplitkPartials{x.dtype(), ""};
+  array partials({splits, M, static_cast<int>(rows)}, pp.dtype, nullptr, {});
+  if (splits > 1) {
+    partials.set_data(mx::allocator::malloc(partials.nbytes()));
+    ce.add_temporary(partials);
+  }
+
+  const std::string type_string = kq_type_string(x.dtype());
+  const std::string kname = kq_verify_nax_multi_kname(
+      kquant_type, type_string, group_size, bits, kstep, pp.suffix);
+  std::string vname;
+  auto kernel = kq_verify_nax_pipeline(d, kname, pp.suffix, x, vname);
+  ce.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  for (int i = 0; i < 4; ++i) {
+    ce.set_input_array(ws[i < n ? i : 0], c++);
+  }
+  ce.set_input_array(x, c++);
+  for (int i = 0; i < 4; ++i) {
+    const int j = i < n ? i : 0;
+    if (splits > 1) {
+      ce.set_output_array(
+          partials, c++, splits * M * row_off[j] * partials.itemsize());
+    } else {
+      ce.set_output_array(outs[j], c++);
+    }
+  }
+  ce.set_bytes(K, c++);
+  ce.set_bytes(M, c++);
+  ce.set_bytes(k_partition, c++);
+  ce.set_bytes(n_rows.data(), 4, c++);
+  ce.set_bytes(tg_end.data(), 4, c++);
+  ce.set_bytes(part_stride.data(), 4, c++);
+  MTL::Size group_dims(128, 1, 1);
+  MTL::Size grid_dims(tgs, 1, splits);
+  kq_log_qmm(vname, M, static_cast<int>(rows), K, grid_dims, x);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+  if (splits == 1) {
+    return;
+  }
+
+  const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
+  auto accum = kq_get_kernel(d, aname);
+  for (int i = 0; i < n; ++i) {
+    ce.set_compute_pipeline_state(accum);
+    const int n_elems = M * n_rows[i];
+    c = 0;
+    ce.set_input_array(
+        partials, c++, splits * M * row_off[i] * partials.itemsize());
+    ce.set_output_array(outs[i], c++);
+    ce.set_bytes(n_elems, c++);
+    ce.set_bytes(splits, c++);
+    ce.set_bytes(part_stride[i], c++);
+    MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
+    MTL::Size agroup(256, 1, 1);
+    ce.dispatch_threads(agrid, agroup);
+  }
 }
 
 // Split-K qmm_t on the NAX BM=32 or BM=64 tile (KQ_QMM_SPLITK_NAX). Same
@@ -1593,7 +1748,7 @@ void qmm_nax_splitk(
   ce.set_bytes(part_stride, c++);
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, splits);
-  kq_log_qmm(kname, M, N, K, grid_dims);
+  kq_log_qmm(kname, M, N, K, grid_dims, x);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 
   const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
@@ -1645,6 +1800,7 @@ void qvm(
       bits,
       B > 1 ? "_batch_1" : "_batch_0");
 
+  kq_log_qmm(kname, M, N, K, grid_dims, x);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -1702,6 +1858,7 @@ static bool qmv_splitk(
   if (int(kernel->maxTotalThreadsPerThreadgroup()) < 32 * nsg) {
     return false;
   }
+  kq_log_qmm(kname, 1, N, K, MTL::Size(1, N / rps, 1), x);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   int c = 0;
@@ -1778,6 +1935,7 @@ void qmv(
       bits,
       B > 1 ? "_batch_1" : "_batch_0");
 
+  kq_log_qmm(kname, M, N, K, grid_dims, x);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -1842,6 +2000,7 @@ void qmv_bias(
       bits,
       "_batch_0");
 
+  kq_log_qmm(kname, 1, N, K, grid_dims, x);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -1921,6 +2080,7 @@ void verify_qmv(
       bits,
       "_batch_0");
 
+  kq_log_qmm(kname, M, N, K, grid_dims, x);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -2019,6 +2179,7 @@ void verify_mv_ext(
                         : (use_nx ? (mv_ext_nx == 16 ? "_x16" : "_x32")
                                   : (use_hd ? "_hd" : ""))));
 
+  kq_log_qmm(kname, M, N, K, grid_dims, x);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -2339,7 +2500,7 @@ static int kq_verify_nax_splits(int N, int K, int kstep, const std::string& t) {
 // non-f32 shapes with M <= 32 only (the caller checks).
 bool kq_forced_route(
     const char* route,
-    const array& x,
+    const array& x_in,
     const array& w,
     const array& scales,
     array& out,
@@ -2352,23 +2513,25 @@ bool kq_forced_route(
     const Stream& s,
     const std::string& t) {
   const std::string r(route);
+  // x is bound once the route serves the call, as in eval_gpu_base.
+  auto x16 = [&] { return kq_x_aligned_gpu(x_in, s, "quantized_matmul x"); };
   const KQuantCodec* codec = codec_by_name(t);
   const int wpb = codec ? codec->weights_per_block : 256;
   if (r == "qmv") {
-    dispatch_qmv(x, w, scales, out, group_size, bits, M, N, K, d, s, t);
+    dispatch_qmv(x16(), w, scales, out, group_size, bits, M, N, K, d, s, t);
     return true;
   }
   if (r == "verify_qmv") {
     if (M >= 2 && M <= verify_qmv_max_rows() && N % kquant_qmv_bn(t) == 0 &&
         K % qmv_fast_k_align() == 0 && codec_has_verify_qmv(t)) {
-      verify_qmv(x, w, scales, out, group_size, bits, M, N, K, d, s, t);
+      verify_qmv(x16(), w, scales, out, group_size, bits, M, N, K, d, s, t);
       return true;
     }
     return false;
   }
   if (r == "mv_ext") {
     if (kq_codec_has_mv_ext(t) && M >= 2 && M <= 12 && K % wpb == 0) {
-      verify_mv_ext(x, w, scales, out, group_size, bits, M, N, K, d, s, t);
+      verify_mv_ext(x16(), w, scales, out, group_size, bits, M, N, K, d, s, t);
       return true;
     }
     return false;
@@ -2377,7 +2540,7 @@ bool kq_forced_route(
     const int rows = codec_verify_mma_rows(t);
     if (rows > 0 && M <= 8) {
       const int sp = kq_verify_mma_splits(N, K, group_size, rows);
-      verify_mma(x, w, scales, out, group_size, bits, M, N, K, sp, d, s, t);
+      verify_mma(x16(), w, scales, out, group_size, bits, M, N, K, sp, d, s, t);
       return true;
     }
     return false;
@@ -2388,7 +2551,20 @@ bool kq_forced_route(
         kq_verify_nax_fits(w, K, kstep, t)) {
       const int sp = kq_verify_nax_splits(N, K, kstep, t);
       verify_nax(
-          x, w, scales, out, group_size, bits, M, N, K, kstep, sp, d, s, t);
+          kq_x_aligned_gpu(x_in, s, "quantized_matmul x", 8),
+          w,
+          scales,
+          out,
+          group_size,
+          bits,
+          M,
+          N,
+          K,
+          kstep,
+          sp,
+          d,
+          s,
+          t);
       return true;
     }
     return false;
@@ -2398,7 +2574,7 @@ bool kq_forced_route(
     const int target = (e != nullptr && std::atoi(e) > 1) ? std::atoi(e) : 16;
     const int sp = kq_split_count(target, K / group_size);
     if (kq_splitk_codec(t) && sp > 1) {
-      qmm_splitk(x, w, scales, out, group_size, bits, M, N, K, sp, d, s, t);
+      qmm_splitk(x16(), w, scales, out, group_size, bits, M, N, K, sp, d, s, t);
       return true;
     }
     return false;
@@ -2407,7 +2583,7 @@ bool kq_forced_route(
       kq_is_nax_available() && codec_has_nax(t) && (K % 64 == 0);
   if (r == "nax") {
     if (nax_ok) {
-      qmm(x, w, scales, out, true, group_size, bits, M, N, K, d, s, t);
+      qmm(x16(), w, scales, out, true, group_size, bits, M, N, K, d, s, t);
       return true;
     }
     return false;
@@ -2422,7 +2598,20 @@ bool kq_forced_route(
     const int sp = kq_nax_split(target, K / q, per);
     if (nax_ok && sp > 1) {
       qmm_nax_splitk(
-          x, w, scales, out, group_size, bits, M, N, K, sp, d, s, t, per * q);
+          x16(),
+          w,
+          scales,
+          out,
+          group_size,
+          bits,
+          M,
+          N,
+          K,
+          sp,
+          d,
+          s,
+          t,
+          per * q);
       return true;
     }
     return false;
@@ -2451,6 +2640,18 @@ int kq_dequant_route_mode() {
 
 bool kq_qmm_log_on() {
   return kq_qmm_log();
+}
+
+void kq_log_dispatch(
+    const std::string& kname,
+    const array& x,
+    const array& out,
+    const MTL::Size& grid) {
+  if (kq_qmm_log()) {
+    const int N = out.ndim() > 0 ? out.shape(-1) : 1;
+    const int M = N > 0 ? static_cast<int>(out.size() / N) : 0;
+    kq_log_qmm(kname, M, N, x.ndim() > 0 ? x.shape(-1) : 1, grid, x);
+  }
 }
 
 #endif // _METAL_
@@ -2596,6 +2797,160 @@ std::vector<mx::array> KQuantMatmul::vjp(
 
 #ifdef _METAL_
 
+// Probe lever: KQ_FORCE_QMM_MIN_M=<m> routes transpose shapes with M >= m
+// straight to qmm (-> NAX), bypassing the mv_ext/verify_qmv claims, for
+// qmm-vs-mv_ext crossover measurement below M=13. Read once per process.
+static int kq_force_qmm_min_m() {
+  static const int m = []() {
+    const char* e = std::getenv("KQ_FORCE_QMM_MIN_M");
+    return e != nullptr ? std::atoi(e) : 0;
+  }();
+  return m;
+}
+
+// KQ_QMM_ROUTE=<route> is set (see eval_gpu_base).
+static bool kq_qmm_route_forced() {
+  const char* e = std::getenv("KQ_QMM_ROUTE");
+  return e != nullptr && e[0] != '\0';
+}
+
+enum class KqSmallMRoute { other, qmv, verify_nax };
+
+// The NAX small-M route quantized_matmul takes for a transposed,
+// non-batched call on a float16 or bfloat16 x of M rows, once the forced
+// KQ_FORCE_QMM_MIN_M and KQ_QMM_ROUTE routes are out of the way: per-row
+// qmv, verify_nax (still subject to kq_verify_nax_fits), or a later route.
+// quantized_matmul_multi joins weights into one verify_nax dispatch only
+// where this returns verify_nax for the widest weight.
+//
+// Per-row qmv on NAX GPUs, M 2 through kq_nax_qmv_max_m for the call's
+// N. KQ_NAX_QMV=<m> sets the limit to m at every N, and 0 disables the
+// route. The default yields to a forced KQ_VERIFY_NAX or KQ_VERIFY_MMA
+// on a codec they serve, a forced KQ_QMM_SPLITK_NAX or KQ_QMM_SPLITK,
+// and a set KQ_VERIFY_EXT, so their arms time the route they name.
+// KQ_DISABLE_NAX turns it off, since the limits are measured against
+// the NAX routes. KQ_NAX_QMV is read live so an A/B can flip arms on
+// one generator.
+//
+// Register-fed NAX verify, from kq_verify_nax_min_m through M8; see
+// verify_nax. KQ_VERIFY_NAX=<m> forces the entry at M >= m, and 0
+// disables it. Read live so an A/B can flip arms on one generator.
+// KQ_DISABLE_NAX turns it off with the other NAX routes. Decided ahead
+// of verify_mma and NAX split-K, but the default entry yields to a
+// forced KQ_VERIFY_MMA on a codec verify_mma serves, or a forced
+// KQ_QMM_SPLITK_NAX, so their arms time the route they name.
+static KqSmallMRoute
+kq_nax_small_m_route(const std::string& t, int M, int N, int K, bool f16) {
+  if (M < 1 || M > 32 || !kq_is_nax_available() || !codec_has_nax(t)) {
+    return KqSmallMRoute::other;
+  }
+  const int vnax_env = kq_env_int("KQ_VERIFY_NAX", -1);
+  const int vmma_force = kq_env_int("KQ_VERIFY_MMA", -1);
+  const int sk_force = kq_env_int("KQ_QMM_SPLITK_NAX", -1);
+  if (M >= 2) {
+    int qmv_max_m = kq_env_int("KQ_NAX_QMV", -1);
+    if (qmv_max_m == -1) {
+      const int ext = kq_verify_ext_env();
+      const bool forced =
+          (vnax_env >= 1 && M >= vnax_env && codec_verify_nax_kstep(t) > 0) ||
+          (vmma_force >= 2 && M >= vmma_force &&
+           codec_verify_mma_rows(t) > 0) ||
+          sk_force >= 1 || kq_qmm_splitk_env() > 1 || ext == 0 || ext == 1;
+      qmv_max_m = forced ? 0 : kq_nax_qmv_max_m(t, N);
+    }
+    if (M <= qmv_max_m) {
+      return KqSmallMRoute::qmv;
+    }
+  }
+  if (M <= 8) {
+    const bool other_forced =
+        (vmma_force >= 2 && M >= vmma_force && codec_verify_mma_rows(t) > 0) ||
+        sk_force >= 1;
+    int vnax_min_m = vnax_env;
+    if (vnax_env == -1) {
+      vnax_min_m = other_forced ? 0 : kq_verify_nax_min_m(t, N, K, f16);
+    }
+    if (vnax_min_m > 0 && M >= vnax_min_m) {
+      return KqSmallMRoute::verify_nax;
+    }
+  }
+  return KqSmallMRoute::other;
+}
+
+// One verify_nax dispatch per four weights where quantized_matmul would
+// take the verify_nax route on the widest weight at this M, and
+// quantized_matmul per weight otherwise. The narrower weights ride along on
+// that route. Every route lever of quantized_matmul applies, through
+// kq_nax_small_m_route, and a forced KQ_QMM_ROUTE or KQ_FORCE_QMM_MIN_M
+// runs quantized_matmul per weight.
+void KQuantMatmulMulti::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  const auto& x = inputs[0];
+  const auto& scales = inputs[1];
+  const int n = static_cast<int>(outputs.size());
+  std::vector<array> ws;
+  ws.reserve(n);
+  for (int i = 0; i < n; ++i) {
+    ws.push_back(kq_matrix_dense_gpu(inputs[2 + i], s));
+    kq_check_weight_base(ws.back(), kquant_type_, "quantized_matmul_multi");
+  }
+  const int K = x.shape(-1);
+  const int M = K > 0 ? static_cast<int>(x.size() / K) : 0;
+  int n_max = 0;
+  for (const auto& w : ws) {
+    n_max = std::max(n_max, w.shape(0));
+  }
+  const int kstep = kq_verify_nax_call_kstep(K, kquant_type_);
+  const int force_min_m = kq_force_qmm_min_m();
+  bool multi = n_max > 0 && kstep > 0 && x.flags().row_contiguous &&
+      x.dtype() != mx::float32 && !kq_qmm_route_forced() &&
+      !(force_min_m > 0 && M >= force_min_m) &&
+      kq_nax_small_m_route(
+          kquant_type_, M, n_max, K, x.dtype() == mx::float16) ==
+          KqSmallMRoute::verify_nax;
+  if (multi) {
+    for (const auto& w : ws) {
+      multi = multi && kq_verify_nax_fits(w, K, kstep, kquant_type_);
+    }
+  }
+  if (!multi) {
+    // x is bound once, so that each per-weight call reads it in place.
+    const array x16 = kq_x_aligned_gpu(x, s, "quantized_matmul_multi x");
+    KQuantMatmul one(s, kquant_type_, group_size_, bits_, true);
+    for (int i = 0; i < n; ++i) {
+      std::vector<array> o{outputs[i]};
+      one.eval_gpu({x16, ws[i], scales}, o);
+    }
+    return;
+  }
+  // verify_nax reads x where it lands on an 8-byte boundary and from the
+  // aligned copy otherwise, as in KQuantMatmul::eval_gpu_base.
+  const array xv = kq_x_aligned_gpu(x, s, "quantized_matmul_multi x", 8);
+  std::vector<array> gw;
+  std::vector<array> go;
+  for (int i = 0; i < n; ++i) {
+    outputs[i].set_data(mx::allocator::malloc(outputs[i].nbytes()));
+    if (outputs[i].size() == 0) {
+      continue;
+    }
+    gw.push_back(ws[i]);
+    go.push_back(outputs[i]);
+    if (gw.size() == 4 || i == n - 1) {
+      verify_nax_multi(
+          xv, gw, go, group_size_, bits_, M, K, kstep, d, s, kquant_type_);
+      gw.clear();
+      go.clear();
+    }
+  }
+  if (!gw.empty()) {
+    verify_nax_multi(
+        xv, gw, go, group_size_, bits_, M, K, kstep, d, s, kquant_type_);
+  }
+}
+
 void KQuantMatmul::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
@@ -2621,7 +2976,14 @@ void KQuantMatmul::eval_gpu_base(
   auto& out = outputs[0];
 
   // inputs are row-contiguous (ensured by the op): x, w (uint8), scales.
-  const auto& x = inputs[0];
+  // x is bound once the route is chosen, from a 16-byte boundary
+  // (kq_x_aligned_gpu), except by verify_nax: it reads x where it lands on
+  // an 8-byte boundary, picking its x16 or x8 load pipeline by the start of
+  // x (kq_verify_nax_pipeline), and from the aligned copy otherwise.
+  const auto& x_in = inputs[0];
+  auto bind_x = [&](int align) {
+    return kq_x_aligned_gpu(x_in, s, "quantized_matmul x", align);
+  };
   const auto& w = inputs[1];
   const auto& scales = inputs[2];
   kq_check_weight_base(w, kquant_type_, "quantized_matmul");
@@ -2630,16 +2992,16 @@ void KQuantMatmul::eval_gpu_base(
     return;
   }
 
-  bool non_batched = w.ndim() == 2 && x.flags().row_contiguous;
-  int K = x.shape(-1);
-  int M = non_batched ? static_cast<int>(x.size()) / K : x.shape(-2);
+  bool non_batched = w.ndim() == 2 && x_in.flags().row_contiguous;
+  int K = x_in.shape(-1);
+  int M = non_batched ? static_cast<int>(x_in.size()) / K : x_in.shape(-2);
   int N = out.shape(-1);
 
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
 
   // KQuant special cases.
   if (!transpose_ && M < vector_limit) {
-    qmm(x,
+    qmm(bind_x(16),
         w,
         scales,
         out,
@@ -2661,15 +3023,10 @@ void KQuantMatmul::eval_gpu_base(
   // through to dispatch_qmv below rather than throw; a qmv_quad kernel would be
   // a perf-only path for an essentially-dead case.
 
-  // Probe lever: KQ_FORCE_QMM_MIN_M=<m> routes transpose shapes with M >= m
-  // straight to qmm (-> NAX), bypassing the mv_ext/verify_qmv claims, for
-  // qmm-vs-mv_ext crossover measurement below M=13.
-  static const int force_qmm_min_m = []() {
-    const char* e = std::getenv("KQ_FORCE_QMM_MIN_M");
-    return e != nullptr ? std::atoi(e) : 0;
-  }();
+  // Probe lever KQ_FORCE_QMM_MIN_M (kq_force_qmm_min_m).
+  const int force_qmm_min_m = kq_force_qmm_min_m();
   if (force_qmm_min_m > 0 && transpose_ && M >= force_qmm_min_m) {
-    qmm(x,
+    qmm(bind_x(16),
         w,
         scales,
         out,
@@ -2695,10 +3052,10 @@ void KQuantMatmul::eval_gpu_base(
   if (transpose_) {
     const char* route_e = std::getenv("KQ_QMM_ROUTE");
     if (route_e != nullptr && route_e[0] != '\0') {
-      if (non_batched && M <= 32 && x.dtype() != mx::float32 &&
+      if (non_batched && M <= 32 && x_in.dtype() != mx::float32 &&
           kq_forced_route(
               route_e,
-              x,
+              x_in,
               w,
               scales,
               out,
@@ -2722,64 +3079,32 @@ void KQuantMatmul::eval_gpu_base(
     }
   }
 
-  // Per-row qmv on NAX GPUs, M 2 through kq_nax_qmv_max_m for the call's
-  // N. KQ_NAX_QMV=<m> sets the limit to m at every N, and 0 disables the
-  // route. The default yields to a forced KQ_VERIFY_NAX or KQ_VERIFY_MMA
-  // on a codec they serve, a forced KQ_QMM_SPLITK_NAX or KQ_QMM_SPLITK,
-  // and a set KQ_VERIFY_EXT, so their arms time the route they name.
-  // KQ_DISABLE_NAX turns it off, since the limits are measured against
-  // the NAX routes. KQ_NAX_QMV is read live so an A/B can flip arms on
-  // one generator.
-  if (transpose_ && non_batched && M >= 2 && M <= 32 &&
-      x.dtype() != mx::float32 && kq_is_nax_available() &&
-      codec_has_nax(kquant_type_)) {
-    int qmv_max_m = kq_env_int("KQ_NAX_QMV", -1);
-    if (qmv_max_m == -1) {
-      const int vnax_force = kq_env_int("KQ_VERIFY_NAX", -1);
-      const int vmma_force = kq_env_int("KQ_VERIFY_MMA", -1);
-      const int sk_force = kq_env_int("KQ_QMM_SPLITK_NAX", -1);
-      const int ext = kq_verify_ext_env();
-      const bool forced = (vnax_force >= 1 && M >= vnax_force &&
-                           codec_verify_nax_kstep(kquant_type_) > 0) ||
-          (vmma_force >= 2 && M >= vmma_force &&
-           codec_verify_mma_rows(kquant_type_) > 0) ||
-          sk_force >= 1 || kq_qmm_splitk_env() > 1 || ext == 0 || ext == 1;
-      qmv_max_m = forced ? 0 : kq_nax_qmv_max_m(kquant_type_, N);
-    }
-    if (M <= qmv_max_m) {
+  // Per-row qmv and verify_nax on NAX GPUs: kq_nax_small_m_route.
+  if (transpose_ && non_batched && x_in.dtype() != mx::float32) {
+    const KqSmallMRoute route = kq_nax_small_m_route(
+        kquant_type_, M, N, K, x_in.dtype() == mx::float16);
+    if (route == KqSmallMRoute::qmv) {
       dispatch_qmv(
-          x, w, scales, out, group_size_, bits_, M, N, K, d, s, kquant_type_);
+          bind_x(16),
+          w,
+          scales,
+          out,
+          group_size_,
+          bits_,
+          M,
+          N,
+          K,
+          d,
+          s,
+          kquant_type_);
       return;
     }
-  }
-
-  // Register-fed NAX verify, from kq_verify_nax_min_m through M8; see
-  // verify_nax. KQ_VERIFY_NAX=<m> forces the entry at M >= m, and 0
-  // disables it. Read live so an A/B can flip arms on one generator.
-  // KQ_DISABLE_NAX turns it off with the other NAX routes. Decided ahead
-  // of verify_mma and NAX split-K, but the default entry yields to a
-  // forced KQ_VERIFY_MMA on a codec verify_mma serves, or a forced
-  // KQ_QMM_SPLITK_NAX, so their arms time the route they name.
-  if (transpose_ && non_batched && M <= 8 && x.dtype() != mx::float32 &&
-      kq_is_nax_available() && codec_has_nax(kquant_type_)) {
     const int kstep = kq_verify_nax_call_kstep(K, kquant_type_);
-    const int vnax_env = kq_env_int("KQ_VERIFY_NAX", -1);
-    const int vmma_force = kq_env_int("KQ_VERIFY_MMA", -1);
-    const int sk_force = kq_env_int("KQ_QMM_SPLITK_NAX", -1);
-    const bool other_forced = (vmma_force >= 2 && M >= vmma_force &&
-                               codec_verify_mma_rows(kquant_type_) > 0) ||
-        sk_force >= 1;
-    int vnax_min_m = vnax_env;
-    if (vnax_env == -1) {
-      vnax_min_m = other_forced
-          ? 0
-          : kq_verify_nax_min_m(kquant_type_, N, K, x.dtype() == mx::float16);
-    }
-    if (vnax_min_m > 0 && M >= vnax_min_m &&
+    if (route == KqSmallMRoute::verify_nax &&
         kq_verify_nax_fits(w, K, kstep, kquant_type_)) {
       const int sp = kq_verify_nax_splits(N, K, kstep, kquant_type_);
       verify_nax(
-          x,
+          bind_x(8),
           w,
           scales,
           out,
@@ -2796,6 +3121,9 @@ void KQuantMatmul::eval_gpu_base(
       return;
     }
   }
+
+  // Every other route reads x from a 16-byte boundary.
+  const mx::array x = bind_x(16);
 
   // Register-resident MMA verify, from the per-device entry
   // (kq_verify_mma_min_m, kq_verify_mma_min_m_nax) through M8.
@@ -3126,6 +3454,13 @@ void KQuantMatmul::eval_gpu(
       "[mlx_kquant] quantized_matmul has no GPU implementation.");
 }
 
+void KQuantMatmulMulti::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant] quantized_matmul_multi has no GPU implementation.");
+}
+
 #endif // _METAL_
 
 std::vector<mx::Shape> KQuantQmvBias::output_shapes(
@@ -3217,7 +3552,8 @@ void KQuantQmvBias::eval_gpu(
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
 
-  const auto& x = inputs[0];
+  const mx::array x =
+      kq_x_aligned_gpu(inputs[0], s, "quantized_matmul_qmv_bias x");
   const auto& w = inputs[1];
   const auto& scales = inputs[2];
   const auto& bias = inputs[3];
@@ -3328,6 +3664,7 @@ std::vector<std::string> split_kernel_names() {
         for (int k : ksteps) {
           each_suffix(dt, [&](const std::string& sfx) {
             out.push_back(kq_verify_nax_kname(t, ts, gs, bits, k, sfx));
+            out.push_back(kq_verify_nax_multi_kname(t, ts, gs, bits, k, sfx));
           });
         }
       }

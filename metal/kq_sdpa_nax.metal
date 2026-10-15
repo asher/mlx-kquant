@@ -20,3 +20,24 @@ instantiate_kq_sdpa_fa_indexed_nax(float16_t)
 
 instantiate_kq_sdpa_gqa_nax(bfloat16_t)
 instantiate_kq_sdpa_gqa_nax(float16_t)
+
+#define instantiate_kq_sdpa_fa_verify_nax(type, D, WM, WN)             \
+  instantiate_kernel(                                                  \
+      "kq_sdpa_fa_verify_2pass_1_nax_" #type "_" #D "_wm" #WM "_wn" #WN, \
+      kq_sdpa_fa_verify_2pass_1_nax,                                   \
+      type, D, WM, WN)
+
+#define instantiate_kq_sdpa_fa_verify_nax_rows(type, D, WN)            \
+  instantiate_kq_sdpa_fa_verify_nax(type, D, 1, WN)                    \
+  instantiate_kq_sdpa_fa_verify_nax(type, D, 2, WN)                    \
+  instantiate_kq_sdpa_fa_verify_nax(type, D, 3, WN)                    \
+  instantiate_kq_sdpa_fa_verify_nax(type, D, 4, WN)
+
+instantiate_kq_sdpa_fa_verify_nax_rows(bfloat16_t, 256, 2)
+instantiate_kq_sdpa_fa_verify_nax_rows(float16_t, 256, 2)
+instantiate_kq_sdpa_fa_verify_nax_rows(bfloat16_t, 256, 4)
+instantiate_kq_sdpa_fa_verify_nax_rows(float16_t, 256, 4)
+instantiate_kq_sdpa_fa_verify_nax_rows(bfloat16_t, 128, 1)
+instantiate_kq_sdpa_fa_verify_nax_rows(float16_t, 128, 1)
+instantiate_kq_sdpa_fa_verify_nax_rows(bfloat16_t, 128, 2)
+instantiate_kq_sdpa_fa_verify_nax_rows(float16_t, 128, 2)

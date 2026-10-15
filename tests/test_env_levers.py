@@ -9,6 +9,8 @@ The kernel names of KQ_QMM_LOG show which value each call read.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from qmm_probe import force_cpu, run_probe
 
@@ -86,3 +88,29 @@ def test_verify_nax_q4_0_sb_values():
         ((name, _),) = r["kernels"]
         assert name.startswith("kquant_q4_0_sb_verify_nax_") == sb, (v, name)
     assert _warnings(res[2], "KQ_VERIFY_NAX_Q4_0_SB", "typo"), res[2]["stderr"]
+
+
+# KQ_VNAX_X16 is on unless 0, read live under KQ_TUNE_LIVE: x at a 16-byte
+# boundary takes the _x16 pipeline unless it is off. Values outside 0 and 1
+# warn and keep it on.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+def test_vnax_x16_values():
+    values = [
+        (None, True, False),
+        ("", True, False),
+        ("on", True, False),
+        ("1", True, False),
+        ("off", False, False),
+        ("0", False, False),
+        ("2", True, True),
+        ("x", True, True),
+    ]
+    call = {"codec": "q4_k", "shape": [8, 3840], "n": 1000, "dtype": "bfloat16"}
+    calls = [dict(call, env={"KQ_VNAX_X16": v}) for v, _, _ in values]
+    res = run_probe(calls, env={**LOG, "KQ_QMM_ROUTE": "verify_nax"})
+    for (v, x16, warns), r in zip(values, res, strict=True):
+        assert r["error"] is None, (v, r["error"])
+        ((name, _),) = r["kernels"]
+        assert "_verify_nax_" in name, (v, name)
+        assert re.search("_x16(_pf32)?$" if x16 else "_x8(_pf32)?$", name), (v, name)
+        assert bool(_warnings(r, "KQ_VNAX_X16", v)) == warns, (v, r["stderr"])

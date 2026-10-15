@@ -265,6 +265,7 @@ inline void kq_gather_qmv_pair_gpu(
   const int fsg = kq_moe_fit_sg(kernel, sg);
   MTL::Size group_dims(32, fsg, 1);
   MTL::Size grid_dims(N / (fsg * 32 / nx), 1, (T + 1) / 2);
+  kq_log_dispatch(kname, x, out, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 #endif // _METAL_
@@ -392,8 +393,9 @@ void KQuantMoEGLU::eval_gpu(
   const auto& indices = inputs[7];
   moe_check_stack("moe_glu_gather", gw, gs);
   moe_check_stack("moe_glu_gather", uw, us);
-  // x is read as dense rows: a view with other strides is copied first.
-  const mx::array x = kq_row_major_gpu(inputs[6], s);
+  // x is read as dense rows from a 16-byte boundary: any other view is
+  // copied first (kq_x_aligned_gpu).
+  const mx::array x = kq_x_aligned_gpu(inputs[6], s, "moe_glu_gather x");
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = indices.shape(0);
@@ -423,6 +425,7 @@ void KQuantMoEGLU::eval_gpu(
   ce.set_bytes(limit, 12);
   MTL::Size group_dims(32, 2, 1);
   MTL::Size grid_dims(N / 8, R, T);
+  kq_log_dispatch(kname, x, out, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -438,7 +441,7 @@ void KQuantGatherQMVBias::eval_gpu(
   const auto& b = inputs[2];
   const auto& indices = inputs[4];
   moe_check_stack("gather_qmv_bias", w, sc);
-  const mx::array x = kq_row_major_gpu(inputs[3], s);
+  const mx::array x = kq_x_aligned_gpu(inputs[3], s, "gather_qmv_bias x");
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = indices.shape(0);
@@ -463,6 +466,7 @@ void KQuantGatherQMVBias::eval_gpu(
   ce.set_bytes(N, 7);
   MTL::Size group_dims(32, 2, 1);
   MTL::Size grid_dims(N / (fine ? 2 : 8), R, T);
+  kq_log_dispatch(kname, x, out, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -479,7 +483,7 @@ void KQuantGatherQMVMixBias::eval_gpu(
   const auto& indices = inputs[4];
   const auto& scores = inputs[5];
   moe_check_stack("gather_qmv_mix_bias", w, sc);
-  const mx::array x = kq_row_major_gpu(inputs[3], s);
+  const mx::array x = kq_x_aligned_gpu(inputs[3], s, "gather_qmv_mix_bias x");
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = indices.shape(0);
@@ -506,6 +510,7 @@ void KQuantGatherQMVMixBias::eval_gpu(
   ce.set_bytes(S, 9);
   MTL::Size group_dims(32, 2, 1);
   MTL::Size grid_dims(N / (fine ? 2 : 8), 1, T);
+  kq_log_dispatch(kname, x, out, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -525,7 +530,8 @@ void KQuantMoEGLUKQ::eval_gpu(
   moe_check_stack("moe_glu_gather_kq", uw);
   kq_check_weight_base(gw, kquant_type_, "moe_glu_gather_kq");
   kq_check_weight_base(uw, kquant_type_, "moe_glu_gather_kq");
-  const mx::array x = kq_row_major_gpu(inputs[biased ? 4 : 2], s);
+  const mx::array x =
+      kq_x_aligned_gpu(inputs[biased ? 4 : 2], s, "moe_glu_gather_kq x");
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = indices.shape(0);
@@ -580,6 +586,7 @@ void KQuantMoEGLUKQ::eval_gpu(
                : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx)));
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / (sg * 32 / nx), R, T);
+  kq_log_dispatch(kname, x, out, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -597,7 +604,8 @@ void KQuantGatherQMVKQ::eval_gpu(
   const auto& indices = inputs[n_base - 1];
   moe_check_stack("gather_qmv_kq", w);
   kq_check_weight_base(w, kquant_type_, "gather_qmv_kq");
-  const mx::array x = kq_row_major_gpu(inputs[biased ? 2 : 1], s);
+  const mx::array x =
+      kq_x_aligned_gpu(inputs[biased ? 2 : 1], s, "gather_qmv_kq x");
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = indices.shape(0);
@@ -645,6 +653,7 @@ void KQuantGatherQMVKQ::eval_gpu(
                : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx)));
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / (fine ? 2 : (sg * 32 / nx)), R, T);
+  kq_log_dispatch(kname, x, out, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
   if (lora_flags_ & KQ_LORA_PRESENT) {
     kq_lora_epilogue_rows_gpu(
@@ -679,7 +688,8 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   kq_check_weight_base(uw, kquant_type_, "moe_glu_gather_shexp_kq");
   kq_check_weight_base(sgw, shexp_type_, "moe_glu_gather_shexp_kq");
   kq_check_weight_base(suw, shexp_up_type_, "moe_glu_gather_shexp_kq");
-  const mx::array x = kq_row_major_gpu(inputs[4], s);
+  const mx::array x =
+      kq_x_aligned_gpu(inputs[4], s, "moe_glu_gather_shexp_kq x");
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = indices.shape(0);
@@ -714,6 +724,7 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
     const int sg = kq_moe_fit_sg(kernel, kq_moe_pick_sg(kquant_type_, N, nx));
     MTL::Size group_dims(32, sg, 1);
     MTL::Size grid_dims(N / (sg * 32 / nx), R + 1, T);
+    kq_log_dispatch(kname, x, out, grid_dims);
     ce.dispatch_threadgroups(grid_dims, group_dims);
     return;
   }
@@ -762,6 +773,7 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
                : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx)));
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / (sg * 32 / nx), R + 1, T);
+  kq_log_dispatch(kname, x, out, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -780,7 +792,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   moe_check_shexp("gather_qmv_mix_kq", sw);
   kq_check_weight_base(w, kquant_type_, "gather_qmv_mix_kq");
   kq_check_weight_base(sw, shexp_type_, "gather_qmv_mix_kq");
-  const mx::array x = kq_row_major_gpu(inputs[2], s);
+  const mx::array x = kq_x_aligned_gpu(inputs[2], s, "gather_qmv_mix_kq x");
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = x.shape(0);
@@ -826,6 +838,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
       ce.set_bytes(SC, 9);
       MTL::Size group_dims(32, 2 * S, 1);
       MTL::Size grid_dims(N / 8, 1, T);
+      kq_log_dispatch(kname, x, out, grid_dims);
       ce.dispatch_threadgroups(grid_dims, group_dims);
       return;
     }
@@ -898,6 +911,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
                : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx)));
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / (fine ? 2 : (sg * 32 / nx)), 1, T);
+  kq_log_dispatch(kname, x, out, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -913,7 +927,7 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   const auto& scores = inputs[3];
   moe_check_stack("gather_qmv_mix_ns_kq", w);
   kq_check_weight_base(w, kquant_type_, "gather_qmv_mix_ns_kq");
-  const mx::array x = kq_row_major_gpu(inputs[1], s);
+  const mx::array x = kq_x_aligned_gpu(inputs[1], s, "gather_qmv_mix_ns_kq x");
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int T = x.shape(0);
@@ -992,6 +1006,7 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
         sp ? 2 * S : kq_moe_fit_sg(kernel, kq_moe_pick_sg(kquant_type_, N, nx));
     MTL::Size group_dims(32, sg, 1);
     MTL::Size grid_dims(N / (sp ? 8 : (sg * 32 / nx)), 1, T);
+    kq_log_dispatch(kname, x, out, grid_dims);
     ce.dispatch_threadgroups(grid_dims, group_dims);
   }
   if (lora_z) {

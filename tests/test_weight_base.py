@@ -197,6 +197,47 @@ def test_gpu_weight_base_glu(codec):
 
 
 @GPU
+@pytest.mark.parametrize("codec", ["q4_k", "q6_k", "q8_0", "q4_0"])
+def test_gpu_weight_base_multi(codec):
+    """quantized_matmul_multi checks the start of every weight, at the rows
+    that join them in one verify kernel and at those that do not."""
+    a = _align(codec)
+    ws = [_wire(codec, (N, K), seed=j)[0] for j in range(3)]
+    # verify_nax declines these starts, so the group runs another route.
+    vnax = VNAX_BASE.get(codec, 1)
+    for m in (1, 6):
+        x = (mx.random.normal((m, K), key=mx.random.key(m)) * 0.5).astype(mx.bfloat16)
+        # One row builds quantized_matmul per weight, which names itself.
+        op = (
+            "quantized_matmul_multi"
+            if m > 1 and kq.nax_available()
+            else ("quantized_matmul")
+        )
+        ref = kq.quantized_matmul_multi(x, ws, codec)
+        mx.eval(ref)
+        for j in range(3):
+            for off in sorted({a, 16}):
+                moved = [_shift(w, off) if i == j else w for i, w in enumerate(ws)]
+                got = kq.quantized_matmul_multi(x, moved, codec)
+                same = _close if m > 1 and off % vnax else _equal
+                for g, r in zip(got, ref, strict=True):
+                    assert same(g, r), (m, j, off)
+            moved = [_shift(w, a // 2) if i == j else w for i, w in enumerate(ws)]
+            msg = _msg(op, codec, a // 2)
+            with pytest.raises(ValueError, match=msg):
+                kq.quantized_matmul_multi(x, moved, codec)
+        # A weight that is not yet evaluated raises from the eval instead.
+        lazy = [ws[0], _shift(ws[1], a // 2, evaluate=False), ws[2]]
+        ys = kq.quantized_matmul_multi(x, lazy, codec)
+        with pytest.raises(ValueError, match=_msg(op, codec, a // 2)):
+            mx.eval(ys)
+        # The stream keeps working.
+        got = kq.quantized_matmul_multi(x, ws, codec)
+        for g, r in zip(got, ref, strict=True):
+            assert _equal(g, r)
+
+
+@GPU
 def test_gpu_weight_base_qmv_bias():
     codec = "q8_0"
     w, s = _wire(codec, (N, K))

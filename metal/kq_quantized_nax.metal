@@ -443,4 +443,41 @@ instantiate_kquant_verify_nax(bfloat16_t, 256, 3, q3_k)
 instantiate_kquant_verify_nax(float16_t, 256, 3, q3_k)
 instantiate_kquant_verify_nax(bfloat16_t, 256, 2, q2_k)
 instantiate_kquant_verify_nax(float16_t, 256, 2, q2_k)
+
+// Several weights that share x in one dispatch (kq_verify_nax.h).
+#define instantiate_kquant_verify_nax_multi(type, gs, bits, codec)    \
+  instantiate_kernel(                                                 \
+      "kquant_" #codec "_verify_nax_multi_" #type "_gs_" #gs "_b_"    \
+          #bits,                                                      \
+      kq_ ## codec ## _verify_nax_multi,                              \
+      type, gs, bits)                                                 \
+  instantiate_kernel(                                                 \
+      "kquant_" #codec "_verify_nax_multi_" #type "_gs_" #gs "_b_"    \
+          #bits "_pf32",                                              \
+      kq_ ## codec ## _verify_nax_multi,                              \
+      type, gs, bits, float)
+instantiate_kquant_verify_nax_multi(bfloat16_t, 128, 2, pq2_0)
+instantiate_kquant_verify_nax_multi(bfloat16_t, 64, 2, q2_0)
+instantiate_kquant_verify_nax_multi(float16_t, 128, 2, pq2_0)
+instantiate_kquant_verify_nax_multi(float16_t, 64, 2, q2_0)
+instantiate_kquant_verify_nax_multi(bfloat16_t, 32, 4, q4_0)
+instantiate_kquant_verify_nax_multi(float16_t, 32, 4, q4_0)
+instantiate_kquant_verify_nax_multi(bfloat16_t, 32, 4, q4_0_sb)
+instantiate_kquant_verify_nax_multi(float16_t, 32, 4, q4_0_sb)
+instantiate_kquant_verify_nax_multi(bfloat16_t, 32, 8, q8_0)
+instantiate_kquant_verify_nax_multi(float16_t, 32, 8, q8_0)
+instantiate_kquant_verify_nax_multi(bfloat16_t, 256, 4, q4_k)
+instantiate_kquant_verify_nax_multi(float16_t, 256, 4, q4_k)
+instantiate_kquant_verify_nax_multi(bfloat16_t, 256, 4, iq4_xs)
+instantiate_kquant_verify_nax_multi(float16_t, 256, 4, iq4_xs)
+instantiate_kquant_verify_nax_multi(bfloat16_t, 32, 4, iq4_nl)
+instantiate_kquant_verify_nax_multi(float16_t, 32, 4, iq4_nl)
+instantiate_kquant_verify_nax_multi(bfloat16_t, 256, 5, q5_k)
+instantiate_kquant_verify_nax_multi(float16_t, 256, 5, q5_k)
+instantiate_kquant_verify_nax_multi(bfloat16_t, 256, 6, q6_k)
+instantiate_kquant_verify_nax_multi(float16_t, 256, 6, q6_k)
+instantiate_kquant_verify_nax_multi(bfloat16_t, 256, 3, q3_k)
+instantiate_kquant_verify_nax_multi(float16_t, 256, 3, q3_k)
+instantiate_kquant_verify_nax_multi(bfloat16_t, 256, 2, q2_k)
+instantiate_kquant_verify_nax_multi(float16_t, 256, 2, q2_k)
     // clang-format on

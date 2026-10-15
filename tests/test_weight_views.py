@@ -108,6 +108,27 @@ def test_quantized_matmul_weight_views(codec, state):
 
 @pytest.mark.parametrize("state", ["lazy", "evaluated"])
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=["bf16", "f16"])
+@pytest.mark.parametrize("codec", ["q4_k", "q8_0", "q4_0"])
+def test_multi_weight_views(codec, dtype, state):
+    """1 row runs quantized_matmul per weight, 4 and 6 rows the joined
+    verify kernel where there is one."""
+    views = _views(codec)
+    for m in (1, 4, 6):
+        x = _x(m, K, dtype)
+        for pair in (("even_rows", "odd_rows"), ("row_band", "left_cols")):
+            makes = [views[name] for name in pair] + [views["whole"]]
+            ref = kq.quantized_matmul_multi(x, [_dense(f()) for f in makes], codec)
+            ws = [f() for f in makes]
+            if state == "evaluated":
+                mx.eval(ws)
+            ys = kq.quantized_matmul_multi(x, ws, codec)
+            mx.eval(ys, ref)
+            for y, r in zip(ys, ref, strict=True):
+                assert mx.array_equal(y, r).item(), (codec, m, pair, state)
+
+
+@pytest.mark.parametrize("state", ["lazy", "evaluated"])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=["bf16", "f16"])
 @pytest.mark.parametrize("m", [64, 1100])
 @pytest.mark.parametrize("codec", ["q4_k", "q8_0"])
 def test_glu_weight_views(codec, m, dtype, state):

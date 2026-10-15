@@ -217,18 +217,19 @@ the two kernels are within 3% of each other on every shape measured.
 Tuning levers (defaults are right for normal use):
 
 - `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
-  `KQ_NAX_BM128_ODD_M`, `KQ_NAX_DB64`, the `_BK128` levers, `KQ_NAX_SWIZZLE`), the tile overrides
-  (`KQ_NAX_TILE`, `KQ_QMM_TILE`, `KQ_CONV_TILE`), `KQ_SPLITK_F32` and `KQ_QMM_LOG` read their
-  variables on every dispatch, so one process can switch tiles between calls on one resident copy of
-  the weights; `benchmarks/bench_dit_shapes.py` runs its tile arms this way. It reads the
-  environment on every dispatch, so it is for single-threaded A/B runs that set these variables
-  between calls. The `quantized_matmul_glu` levers (`KQ_GLU`, `KQ_GLU_MIN_ROWS`), the
+  `KQ_NAX_BM128_ODD_M`, `KQ_NAX_DB64`, the `_BK128` levers, `KQ_NAX_SWIZZLE`), the `verify_nax` load
+  lever (`KQ_VNAX_X16`), the tile overrides (`KQ_NAX_TILE`, `KQ_QMM_TILE`, `KQ_CONV_TILE`),
+  `KQ_SPLITK_F32` and `KQ_QMM_LOG` read their variables on every dispatch, so one process can switch
+  tiles between calls on one resident copy of the weights; `benchmarks/bench_dit_shapes.py` runs its
+  tile arms this way. It reads the environment on every dispatch, so it is for single-threaded A/B
+  runs that set these variables between calls. The `quantized_matmul_glu` levers (`KQ_GLU`,
+  `KQ_GLU_MIN_ROWS`), the `quantized_matmul_multi` lever (`KQ_MATMUL_MULTI`), the
   `quantized_matmul_lora` levers (`KQ_QMM_LORA`, `KQ_QMM_LORA_MIN_ROWS`), the
   `quantized_matmul_residual` lever (`KQ_QMM_RESID`), the dequantize route lever
-  (`KQ_DEQUANT_ROUTE`) and the `conv2d_3x3` lever (`KQ_CONV_NAX`) are
-  read when the op is called and builds its graph, not when a kernel is dispatched, so a compiled
-  function keeps the kernel choice of its trace. Unset (off) by default, and then each of them keeps
-  its first read for the life of the process. Read once per process.
+  (`KQ_DEQUANT_ROUTE`) and the `conv2d_3x3` lever (`KQ_CONV_NAX`) are read when the op is called and
+  builds its graph, not when a kernel is dispatched, so a compiled function keeps the kernel choice
+  of its trace. Unset (off) by default, and then each of them keeps its first read for the life of
+  the process. Read once per process.
 - `KQ_NAX_TILE` - `bm,bn,wm,wn` pins the NAX `qmm_t` tile of every transpose call that reaches it,
   in place of the BM=32, BM=64 and BM=128 policy. BK stays 64, except where a `_BK128` lever sets
   it. The `_db` variant still follows `KQ_NAX_DB64` on the bm64 bn64 wm2 wn2 tile. A tile the
@@ -248,14 +249,19 @@ Tuning levers (defaults are right for normal use):
   included, for the codecs, rows and range of its table, so that tests run its code on any
   machine. Any other value warns once and reads as `auto`. `auto` by default. Read when the op
   builds its graph, once per process unless `KQ_TUNE_LIVE=1`.
-- `KQ_QMM_LOG` - set to any value, logs the kernel name, shape and grid of every NAX and ALU qmm
-  tile dispatch, every split-K dispatch, every `verify_mma` and `verify_nax` dispatch, split or not,
-  and every fused `quantized_matmul_glu`, `quantized_matmul_lora` and `quantized_matmul_residual`
-  dispatch, and every `conv2d_3x3` dispatch to stderr, one `[kq qmm]` line each. The grid depth is
-  the K slice count. A call that takes the dequantize route logs one
-  `[kq dequant] <codec> M=<rows> N=<n> K=<k>` line when the op builds its graph. The mat-vec
-  routes (`qmv`, `verify_qmv`, `mv_ext`) do not log. Unset (off) by default. Read once per process
-  unless `KQ_TUNE_LIVE=1`.
+- `KQ_QMM_LOG` - set to any value, logs every quantized matmul dispatch to stderr, one
+  `[kq qmm] <kernel> M=<m> N=<n> K=<k> grid=<x>,<y>,<z> xa=<a>` line each: the NAX and ALU qmm
+  tiles, the mat-vec routes (`qmv`, `qvm`, `verify_qmv`, `mv_ext`), split-K, `verify_mma` and
+  `verify_nax`, split or not, the fused `quantized_matmul_glu`, `quantized_matmul_lora` and
+  `quantized_matmul_residual` kernels, `skinny_matmul`, the `gather_qmm` and `gather_qmm_seg`
+  routes, the fused MoE gathers, `gather_mix` and `conv2d_3x3`. The grid depth is the K slice
+  count. `xa` is the byte offset of the activation's start modulo 16, as the kernel reads it. A
+  gather or MoE line gives the rows and last dim of the output as M and N. Any GPU op that copies
+  an operand to an aligned buffer, because the operand starts or steps off the boundary of its
+  kernel's vector loads, logs one `[kq align] <op> <operand> xin=<n>` line, where `n` is the
+  operand's byte offset modulo that boundary. A call that takes the dequantize route logs one
+  `[kq dequant] <codec> M=<rows> N=<n> K=<k>` line when the op builds its graph. Unset (off) by
+  default. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_SPLITK_F32` - partial dtype of the split-K routes (`splitk`, `nax_splitk`, the
   `KQ_QMM_MIDM` band, and `verify_mma` and `verify_nax` when they split K). Float partials let the
   fold round the result once, as the unsplit kernels do. Partials in the activation dtype round
@@ -397,6 +403,10 @@ Tuning levers (defaults are right for normal use):
   float kernels only. Unset (off) by default. Read live per call.
 - `KQ_VERIFY_NAX_Q4_0_SB` - probe lever: `0` keeps `q4_0` on the two-block `verify_nax` kernel at
   a K that is a multiple of 256, where the eight-block kernel runs by default. Read live per call.
+- `KQ_VNAX_X16` - probe lever: `0` keeps the `verify_nax` kernels that load their activations per
+  NAX op on one 8-byte load per op where the activations start on a 16-byte boundary, in place of
+  one 16-byte load per two ops. The output is the same. In `KQ_QMM_LOG` the kernel name
+  carries the variant, `_x16` or `_x8`. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_MV_EXT_SB` / `KQ_MV_EXT_NX` / `KQ_MV_EXT_HD` - `mv_ext` activation-traffic experiments:
   shuffle-broadcast (`1`), wide nxpsg (`16`/`32`), half-precision chunk dots (`1`). q6_k M 4-12
   only. `HD` measured +4-5% at M 8; the rest flat to negative on M5 Max. Kept as probes. Default
@@ -554,7 +564,11 @@ eight-block kernel at a K that is a multiple of 256 and the two-block kernel els
 kernels fold each 16- or 32-weight sub-block's scale, and its min where the codec has one, into the
 half weights. Loading a whole K step of activations ahead measured faster for `pq2_0` and the
 two-block `q4_0` kernel, while the kernels with larger decoded words load them one NAX op at a time,
-since loading ahead ran `q4_k` 1.6-2x slower.
+since loading ahead ran `q4_k` 1.6-2x slower. Two consecutive NAX ops read 8 contiguous activations
+of a row, so where the activations start on a 16-byte boundary these kernels read them in one
+16-byte load per two NAX ops, and where they start on an 8-byte boundary in one 8-byte load per op.
+Activations that start elsewhere are read from a copy on a 16-byte boundary. The fewer loads take
+less time in a chain of dependent calls, and both forms give the same bits.
 
 Split counts for `pq2_0`, `q8_0` and the two-block `q4_0` kernel are the largest divisor of the K
 steps at or under their target, at most 16. The two-block kernel's K walk of 640 per simdgroup
@@ -641,6 +655,45 @@ On float16 activations the mat-vec routes run faster and the kernel the same, so
 entries the kernel ran up to 1.10x slower at K 4096 and 1.21x slower at N 12288, K 2560, and each
 entry under M 5 sits one row higher. At M 8 the kernel runs 1.05-1.39x faster than NAX split-K
 on the shapes of N 2048 and wider.
+
+## Quantized matmuls that share an input
+
+- `quantized_matmul_multi` - `[x @ W^T for W in weights]` for packed weights of one codec and one
+  inner dim that read the same x, such as the q, k and v projections or the gate and up projections
+  of a transformer block. It returns one output per weight, as `quantized_matmul` would.
+
+  On a NAX GPU (M5), at 2 to 8 activation rows, where `quantized_matmul` would take its verify_nax
+  route on the widest weight, one dispatch computes the products of up to four weights. The row
+  tiles of the weights lie end to end in one grid, each threadgroup owns 128 rows of one weight,
+  and the split-K partials of all of them share one temporary and one fold dispatch. More than four
+  weights run one dispatch per four. The split count is chosen for the joint grid. The call saves
+  the dispatch, the wait and the tail of every weight but the first, which counts most for narrow
+  weights next to a wide one.
+
+  The narrower weights take the route of the widest. A weight that `quantized_matmul` alone would
+  run on per-row qmv or on another kernel runs on verify_nax here, so its output can differ from
+  `quantized_matmul` in the last bits, inside the same bound against a float64 reference. This
+  holds for every codec with a verify_nax kernel, including those whose verify_nax entry starts at
+  a width that the narrow weight does not reach. Where every weight would take verify_nax at one
+  split count, the outputs equal `quantized_matmul` bit for bit.
+
+  Every other case runs `quantized_matmul` per weight: one row or more than 8, a single weight,
+  codecs without a verify_nax kernel, an inner dim that kernel does not step over, a weight whose
+  start it cannot read, CPU streams and GPUs without NAX. x is float16 or bfloat16, float32 x runs
+  in bfloat16 as in `quantized_matmul`, and leading batch dims fold into rows.
+
+  The route levers of `quantized_matmul` decide the route on the widest weight the same way:
+  `KQ_NAX_QMV`, `KQ_VERIFY_NAX`, `KQ_VERIFY_MMA`, `KQ_QMM_SPLITK_NAX`, `KQ_QMM_SPLITK`,
+  `KQ_VERIFY_EXT` and `KQ_DISABLE_NAX`. A set `KQ_QMM_ROUTE` or `KQ_FORCE_QMM_MIN_M` runs
+  `quantized_matmul` per weight, so a forced route times the route it names.
+
+  Lever, read when the op builds its graph, once per process unless `KQ_TUNE_LIVE=1`:
+
+  - `KQ_MATMUL_MULTI` - `0` builds `quantized_matmul` per weight on every call. Unset (on) by
+    default.
+
+  `mx.grad` gives the gradient with respect to x through `quantized_matmul` per weight. The weights
+  are frozen, as in `quantized_matmul`.
 
 ## GLU product of two quantized matmuls
 
@@ -1019,7 +1072,16 @@ into a packed layout first.
   blocks instead of the full key axis and no `[L, S]` mask is materialized. Causality inside the
   diagonal page is enforced in-kernel.
 - **`sdpa_fa_verify`** - speculative-verify attention on the matrix units for a GQA-folded query tile.
-  Head dims 64 through 512; `return_lse` as above.
+  Head dims 64 through 512; `return_lse` as above. On NAX GPUs, at head dims 128 and 256 with up to
+  64 folded rows on plain K and V, the key pass runs on the tensor-op units: each 16-row strip of
+  the fold is one row of simdgroups, and the head dim splits over 2 simdgroups (4 at head dim 256
+  for folds of up to 32 rows), which add their partial scores in threadgroup memory. It writes the
+  partials of the simdgroup-matrix kernel to the same merge pass. Its automatic split count aims at
+  about 64 threadgroups over the KV heads, between 4 and 64, and halves while a split would hold
+  fewer than 64 keys. The two kernels round differently, so their outputs are not bit-identical.
+  `KQ_FA_VERIFY_NAX=0` keeps the simdgroup-matrix kernel, and `KQ_FA_VERIFY_NAX_WN` sets the head
+  dim split (2 or 4 at 256, 1 or 2 at 128; another value warns once on stderr and keeps the
+  default); both are read at each call.
 - **`sdpa_fa_indexed`** - index-gathered attention over one shared K/V latent at head dim 512, the
   absorbed-MLA sparse decode step: query j of `q [1, Hq, Q, 512]` attends the rows of `kv [1, 1, N,
   512]` that `idx[j]` (int32, -1 pads) lists, so the selected rows are read once from the latent
@@ -1049,8 +1111,11 @@ their cache layout.
   row's region map follows its own end and `tail_rows` is the per-row form of `n_attend`, so a
   ragged batch merges per-row tails the same way. Head dims 128, 256 and 512, q_len 1 to 4.
 - **`sdpa_fa_verify_kvarn`** - the same matrix-unit verify pass over a KVarN cache: sealed records
-  dequantize at tile stage through the loaders `sdpa_decode_gqa_kvarn` uses, so the result matches
-  `sdpa_fa_verify` over the materialized cache bit for bit. The verify-width route (q_len 2 to 8):
+  dequantize at tile stage through the loaders `sdpa_decode_gqa_kvarn` uses, and its key pass runs
+  on the simdgroup-matrix kernel at every head dim. The result matches `sdpa_fa_verify` over the
+  materialized cache bit for bit where that call runs the same kernel (`KQ_FA_VERIFY_NAX=0`). Where
+  `sdpa_fa_verify` takes its NAX key pass (head dims 128 and 256 on NAX GPUs), the two agree to
+  rounding. The verify-width route (q_len 2 to 8):
   the vector kernel's cost climbs steeply past two queries, the matrix tile prices extra rows at
   nearly zero. Head dims 128, 256 and 512; `n_attend` / `full_visibility` / `return_lse` as the
   decode op.

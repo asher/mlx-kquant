@@ -134,7 +134,7 @@ class KernelLog:
     while a block runs, by pointing fd 2 at a temporary file."""
 
     LINE = re.compile(
-        r"^\[kq qmm\] (\S+) M=(\d+) N=(\d+) K=(\d+) grid=(\d+),(\d+),(\d+)$"
+        r"^\[kq qmm\] (\S+) M=(\d+) N=(\d+) K=(\d+) grid=(\d+),(\d+),(\d+) xa=\d+$"
     )
 
     def __enter__(self):

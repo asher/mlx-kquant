@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project aims to
 adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `kq.quantized_matmul_multi` computes the products of several packed weights
+  with one input, such as the q, k and v projections, in one dispatch on NAX
+  GPUs (M5) at speculative-verify widths of 2 to 8 rows.
+
+### Changed
+- `kq.sdpa_fa_verify` runs its key pass on the NAX tensor-op units (M5) at head
+  dims 128 and 256, so verify attention over a deep cache takes less time.
+- On NAX GPUs (M5), the `verify_nax` matmul kernels of `q4_0` at a K that is a
+  multiple of 256, `q8_0`, the k-quants and `iq4_*` read two steps of activations
+  per load, so speculative verify at 2 to 8 rows takes less time.
+
 ## [0.5.0]
 
 ### Added
@@ -30,6 +44,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fewer rows by GPU core count, for A/B runs on wide ones such as a vocab head.
 - `KQ_DEQUANT_ROUTE` turns the dequantize route off or forces it on any GPU,
   and `KQ_QMM_LOG` logs each call that takes it.
+- `KQ_QMM_LOG` also logs the mat-vec, gather and MoE dispatches with `xa`, the
+  activation's byte offset modulo 16, and each operand an op copies to align it.
 - `KQ_SPLITK_F32=1` makes bfloat16 split-K matmuls, MTP verify among them,
   round once instead of once per K slice. `0` stores float16 partials again,
   which can return inf.
@@ -99,6 +115,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - After `patch_mlx_lm_load()`, `mlx_lm.utils.load_model` builds a kquant
   checkpoint with the caller's `get_model_classes` instead of the stock class.
   `mlx_kquant.loader.load` takes it too.
+- float16 and bfloat16 inputs that start off a 16-byte boundary, such as a row
+  slice, no longer give wrong output from matmul, norm, attention and DSA ops.
 
 ## [0.4.18]
 

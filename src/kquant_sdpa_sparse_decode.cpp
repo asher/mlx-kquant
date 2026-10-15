@@ -52,7 +52,8 @@ mx::array rows_flat(const mx::array& a, const char* op, mx::StreamOrDevice s) {
 // The window, pool and pool scales as the kernels read them. A reshape to
 // [B, rows * D] keeps a view whenever the dims of its input fold into the
 // two of its output, so a row can come out with an element stride other
-// than 1, which is copied here. The kernels step the batches of a packed
+// than 1, which is copied here, as is a window or pool that starts or
+// steps off a 16-byte boundary. The kernels step the batches of a packed
 // pool by the stride of its codes and take an eighth of it for the scales,
 // so codes and scales that step differently are copied too.
 struct SparseRows {
@@ -65,10 +66,19 @@ SparseRows sparse_rows(
     const mx::array& win,
     const mx::array& pool,
     const mx::array* scales,
-    const mx::Stream& s) {
+    const mx::Stream& s,
+    bool prefill) {
+  // The kernels read window and pool rows as 16-byte vectors (4-byte words
+  // for packed codes), so the rows start on 16-byte boundaries too.
   SparseRows r{
-      kq_unit_stride_gpu(win, s),
-      kq_unit_stride_gpu(pool, s),
+      kq_strides_aligned_gpu(
+          win,
+          s,
+          prefill ? "sdpa_sparse_prefill win" : "sdpa_sparse_decode win"),
+      kq_strides_aligned_gpu(
+          pool,
+          s,
+          prefill ? "sdpa_sparse_prefill pool" : "sdpa_sparse_decode pool"),
       scales ? kq_unit_stride_gpu(*scales, s) : pool};
   if (scales && r.pool.size() > 0 && r.pool.shape(0) != 1 &&
       r.pool.strides(0) != 8 * r.scales.strides(0)) {
@@ -89,11 +99,13 @@ void KQSdpaSparseDecode::eval_gpu(
   auto& d = mx::metal::device(s.device);
   auto& ce = mx::metal::get_command_encoder(s);
 
-  const auto& q = inputs[0];
+  // q is read as 16-byte vectors through its strides.
+  const mx::array q =
+      kq_strides_aligned_gpu(inputs[0], s, "sdpa_sparse_decode q");
   const auto& idx = inputs[3];
   size_t next = 4;
-  const SparseRows rows =
-      sparse_rows(inputs[1], inputs[2], packed_ ? &inputs[next++] : nullptr, s);
+  const SparseRows rows = sparse_rows(
+      inputs[1], inputs[2], packed_ ? &inputs[next++] : nullptr, s, false);
   const auto& win = rows.win; // [B|1, W * D], rows D apart
   const auto& pool = rows.pool; // [B|1, P * D] (packed: [B|1, P * D / 2] codes)
   const mx::array* pscales = packed_ ? &rows.scales : nullptr;
@@ -481,11 +493,12 @@ void KQSdpaSparsePrefill::eval_gpu(
   auto& d = mx::metal::device(s.device);
   auto& ce = mx::metal::get_command_encoder(s);
 
-  const auto& q = inputs[0];
+  const mx::array q =
+      kq_strides_aligned_gpu(inputs[0], s, "sdpa_sparse_prefill q");
   const auto& idx = inputs[3];
   size_t next = 4;
-  const SparseRows rows =
-      sparse_rows(inputs[1], inputs[2], packed_ ? &inputs[next++] : nullptr, s);
+  const SparseRows rows = sparse_rows(
+      inputs[1], inputs[2], packed_ ? &inputs[next++] : nullptr, s, true);
   const auto& win = rows.win; // [B|1, S * D], rows D apart
   const auto& pool = rows.pool; // [B|1, P * D] (packed: [B|1, P * D / 2] codes)
   const mx::array* pscales = packed_ ? &rows.scales : nullptr;

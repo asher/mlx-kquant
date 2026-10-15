@@ -271,7 +271,7 @@ void KQuantMatmulLora::eval_gpu(
     std::vector<mx::array>& outputs) {
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
-  const auto& x = inputs[0];
+  const mx::array x = kq_x_aligned_gpu(inputs[0], s, "quantized_matmul_lora x");
   // A weight whose rows are dense binds as it is, at its own offset. Any
   // other view is copied to dense rows first. z and B bind as they are
   // when they are row-major.
@@ -312,7 +312,7 @@ void KQuantMatmulLora::eval_gpu(
   if (lora_log()) {
     std::fprintf(
         stderr,
-        "[kq qmm] %s M=%d N=%d K=%d R=%d bands=%d grid=%lu,%lu,%lu\n",
+        "[kq qmm] %s M=%d N=%d K=%d R=%d bands=%d grid=%lu,%lu,%lu xa=%d\n",
         kname.c_str(),
         M,
         N,
@@ -321,7 +321,8 @@ void KQuantMatmulLora::eval_gpu(
         n_bands,
         static_cast<unsigned long>(grid_dims.width),
         static_cast<unsigned long>(grid_dims.height),
-        static_cast<unsigned long>(grid_dims.depth));
+        static_cast<unsigned long>(grid_dims.depth),
+        kq_x_align(x));
   }
 
   auto kernel = kq_get_kernel(d, kname);

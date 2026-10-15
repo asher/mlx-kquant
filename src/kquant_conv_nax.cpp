@@ -138,14 +138,15 @@ void KQuantConv3x3::eval_gpu(
   if (conv_log()) {
     std::fprintf(
         stderr,
-        "[kq qmm] %s M=%d N=%d K=%d grid=%lu,%lu,%lu\n",
+        "[kq qmm] %s M=%d N=%d K=%d grid=%lu,%lu,%lu xa=%d\n",
         kname.c_str(),
         M,
         O,
         9 * C,
         static_cast<unsigned long>(grid_dims.width),
         static_cast<unsigned long>(grid_dims.height),
-        static_cast<unsigned long>(grid_dims.depth));
+        static_cast<unsigned long>(grid_dims.depth),
+        kq_x_align(x));
   }
 
   auto kernel = kq_get_kernel(d, kname);

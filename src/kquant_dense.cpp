@@ -17,6 +17,7 @@
 // reads and a row-major copy otherwise. An op uses them for an operand that
 // is unevaluated on most calls, such as an activation, which then costs no
 // node when it is dense.
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -152,6 +153,56 @@ mx::array kq_row_major_gpu(const mx::array& a, const mx::Stream& s) {
   return kq_dense_copy_gpu(a, s);
 }
 
+namespace {
+
+// The copy of an operand that does not start on its kernels' alignment,
+// logged under KQ_QMM_LOG with the byte offset it came at.
+mx::array aligned_copy(
+    const mx::array& a,
+    const mx::Stream& s,
+    const char* what,
+    int align) {
+  if (kq_qmm_log_on()) {
+    std::fprintf(
+        stderr,
+        "[kq align] %s xin=%d\n",
+        what,
+        static_cast<int>(a.offset() % align));
+  }
+  return kq_dense_copy_gpu(a, s);
+}
+
+} // namespace
+
+mx::array kq_x_aligned_gpu(
+    const mx::array& a,
+    const mx::Stream& s,
+    const char* what,
+    int align) {
+  if (a.size() == 0 || (a.flags().row_contiguous && a.offset() % align == 0)) {
+    return a;
+  }
+  return aligned_copy(a, s, what, align);
+}
+
+mx::array kq_strides_aligned_gpu(
+    const mx::array& a,
+    const mx::Stream& s,
+    const char* what,
+    int align) {
+  if (a.size() == 0) {
+    return a;
+  }
+  const int nd = static_cast<int>(a.ndim());
+  bool ok = a.offset() % align == 0 &&
+      (nd == 0 || a.shape(nd - 1) == 1 || a.strides()[nd - 1] == 1);
+  for (int i = 0; ok && i + 1 < nd; i++) {
+    ok = a.shape(i) == 1 ||
+        (a.strides()[i] * static_cast<int64_t>(a.itemsize())) % align == 0;
+  }
+  return ok ? a : aligned_copy(a, s, what, align);
+}
+
 mx::array kq_unit_stride_gpu(const mx::array& a, const mx::Stream& s) {
   if (a.size() == 0 || a.ndim() == 0 || a.strides().back() == 1) {
     return a;
@@ -183,6 +234,16 @@ mx::array kq_dense_copy_gpu(const mx::array&, const mx::Stream&) {
 }
 
 mx::array kq_row_major_gpu(const mx::array&, const mx::Stream&) {
+  throw std::runtime_error("[mlx_kquant] GPU eval requires a Metal build.");
+}
+
+mx::array
+kq_x_aligned_gpu(const mx::array&, const mx::Stream&, const char*, int) {
+  throw std::runtime_error("[mlx_kquant] GPU eval requires a Metal build.");
+}
+
+mx::array
+kq_strides_aligned_gpu(const mx::array&, const mx::Stream&, const char*, int) {
   throw std::runtime_error("[mlx_kquant] GPU eval requires a Metal build.");
 }
 

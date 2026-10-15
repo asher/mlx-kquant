@@ -56,6 +56,18 @@ void kq_sdpa_check_layout(
   }
 }
 
+// The kernels read q, k, v and the KVarN stages as vectors of four
+// elements (four uint32 words of a q8 cache), so each is bound from a
+// boundary of four of its elements, k, v and the stages with their strides
+// on such boundaries too.
+array sdpa_q(const array& a, const Stream& s, const char* what) {
+  return kq_x_aligned_gpu(a, s, what, 4 * static_cast<int>(a.itemsize()));
+}
+
+array sdpa_rows(const array& a, const Stream& s, const char* what) {
+  return kq_strides_aligned_gpu(a, s, what, 4 * static_cast<int>(a.itemsize()));
+}
+
 // Mirror of the Metal-side KQKvarnMeta (kq_sdpa.h, buffer 28); the layouts
 // must match field for field.
 struct KQKvarnMeta {
@@ -191,6 +203,23 @@ int kq_fa_verify_splits(
   return std::min({splits, cap, 128});
 }
 
+// Split count for sdpa_fa_verify on the tensor-op pass 1 when the caller
+// passes 0. That kernel runs a split in a fraction of the time of the
+// simdgroup-matrix kernel, so the float32 partials and their merge weigh
+// more: the count aims at about 64 threadgroups over the kv heads, at least
+// 4 and at most 64, and drops while a split would hold under 64 keys. Tuned
+// on M5 Max at 1 to 32 kv heads.
+int kq_fa_verify_nax_splits(int n_heads, int kL) {
+  int splits = 64;
+  for (int h = 1; h < n_heads && splits > 4; h *= 2) {
+    splits /= 2;
+  }
+  while (splits > 4 && kL < 64 * splits) {
+    splits /= 2;
+  }
+  return splits;
+}
+
 // Split count for sdpa_fa_indexed when the caller passes 0: the decode
 // bucket over the M listed keys. The NAX kernel on the s, c and d classes
 // writes 32 heads by 512 float32 partials per split, so once about 512
@@ -254,10 +283,12 @@ void KQuantSDPA::eval_gpu(
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   // q row-contiguous [B, Hq, qL, D]; k/v [B, Hkv, kL, D], D contiguous.
-  const auto& q = inputs[0];
-  const auto& k = inputs[1];
-  const auto& v = inputs[2];
-  kq_sdpa_check_layout("sdpa_vector", q, k, v);
+  kq_sdpa_check_layout("sdpa_vector", inputs[0], inputs[1], inputs[2]);
+  // q, k and v are bound from vector boundaries (sdpa_q, sdpa_rows), here
+  // and in the evals below.
+  const mx::array q = sdpa_q(inputs[0], s, "sdpa_vector q");
+  const mx::array k = sdpa_rows(inputs[1], s, "sdpa_vector k");
+  const mx::array v = sdpa_rows(inputs[2], s, "sdpa_vector v");
 
   int B = q.shape(0);
   int n_q_heads = q.shape(1);
@@ -368,9 +399,10 @@ void KQuantSDPAGQA::eval_gpu(
     outputs[1].set_data(mx::allocator::malloc(outputs[1].nbytes()));
   }
 
-  const auto& q = inputs[0];
-  const auto& k = inputs[1];
-  const auto& v = inputs[2];
+  kq_sdpa_check_layout("sdpa_decode_gqa", inputs[0], inputs[1], inputs[2]);
+  const mx::array q = sdpa_q(inputs[0], s, "sdpa_decode_gqa q");
+  const mx::array k = sdpa_rows(inputs[1], s, "sdpa_decode_gqa k");
+  const mx::array v = sdpa_rows(inputs[2], s, "sdpa_decode_gqa v");
   const bool sinks = has_sinks_;
   const bool starts = has_starts_;
   const bool kv_q8 = has_kv_q8_;
@@ -380,7 +412,12 @@ void KQuantSDPAGQA::eval_gpu(
   const size_t starts_idx = 3 + (sinks ? 1 : 0);
   const size_t ends_idx = starts_idx + (starts ? 1 : 0);
   const size_t qkv_idx = ends_idx + (ends ? 1 : 0);
-  kq_sdpa_check_layout("sdpa_decode_gqa", q, k, v);
+  // The KVarN stages are key and value rows too. A copy dispatches on the
+  // encoder, so each operand is bound before the first kernel is set up.
+  const mx::array stk =
+      kvarn ? sdpa_rows(inputs[qkv_idx + 2], s, "sdpa_decode_gqa stage_k") : q;
+  const mx::array stv =
+      kvarn ? sdpa_rows(inputs[qkv_idx + 3], s, "sdpa_decode_gqa stage_v") : q;
   if (kv_q8 || kvarn) {
     for (int i = 0; i < 4; i++) {
       kq_sdpa_check_batch_heads("sdpa_decode_gqa", inputs[qkv_idx + i]);
@@ -595,8 +632,6 @@ void KQuantSDPAGQA::eval_gpu(
     // KVarN axes/stage operands and region map (dummies when compiled out).
     KQKvarnMeta kvm = {};
     if (kvarn) {
-      const auto& stk = inputs[qkv_idx + 2];
-      const auto& stv = inputs[qkv_idx + 3];
       const int sink_cap = stk.shape(2) - KQ_KVARN_GROUP;
       kvm.sink_rows = std::min(kvarn_n_, sink_cap);
       kvm.n_rec_keys =
@@ -674,24 +709,38 @@ void KQuantSDPAFAVerify::eval_gpu(
 
   // q is the GQA-folded query tile [B, Hkv, n_rows, D], row-contiguous;
   // k/v [B, Hkv, kL, D] are read in place via their head/seq strides.
-  const auto& q = inputs[0];
-  const auto& k = inputs[1];
-  const auto& v = inputs[2];
-  kq_sdpa_check_layout("sdpa_fa_verify", q, k, v);
+  kq_sdpa_check_layout("sdpa_fa_verify", inputs[0], inputs[1], inputs[2]);
+  const mx::array q = sdpa_q(inputs[0], s, "sdpa_fa_verify q");
+  const mx::array k = sdpa_rows(inputs[1], s, "sdpa_fa_verify k");
+  const mx::array v = sdpa_rows(inputs[2], s, "sdpa_fa_verify v");
 
   // With kvarn, k/v are the code slabs and the key count comes from the
   // op; a tail-merge body walks only the first n_attend keys while the
   // region map stays on the full layout (as sdpa_decode_gqa).
   const bool kvarn = has_kvarn_;
+  const mx::array stk =
+      kvarn ? sdpa_rows(inputs[5], s, "sdpa_fa_verify stage_k") : q;
+  const mx::array stv =
+      kvarn ? sdpa_rows(inputs[6], s, "sdpa_fa_verify stage_v") : q;
   int B = q.shape(0);
   int n_kv_heads = k.shape(1);
   int n_rows = q.shape(2);
   int D = q.shape(3);
   int kL = kvarn ? (kvarn_n_attend_ ? kvarn_n_attend_ : kvarn_n_) : k.shape(2);
   int q_len = q_len_;
+  // Pass 1 on the tensor-op units (kq_sdpa_fa_verify_2pass_1_nax) at
+  // head_dim 128 and 256 on plain K/V: a 16-row strip of the fold per
+  // simdgroup row group, the head dim split over WN simdgroups. It writes
+  // the partials of the simdgroup-matrix kernel below. WN is 2 at 128, and
+  // at 256 it is 4 for folds of up to 32 rows and 2 above.
+  // KQ_FA_VERIFY_NAX=0 keeps that kernel, and KQ_FA_VERIFY_NAX_WN sets WN
+  // (2 or 4 at 256, 1 or 2 at 128). Both are read per call.
+  const bool nax_pass1 = !kvarn && (D == 256 || D == 128) && n_rows <= 64 &&
+      kq_env_flag("KQ_FA_VERIFY_NAX", 1) != 0 && kq_is_nax_available();
   int splits = splits_;
   if (splits == 0) {
-    splits = kq_fa_verify_splits(B, n_kv_heads, n_rows, D, kL, d);
+    splits = nax_pass1 ? kq_fa_verify_nax_splits(B * n_kv_heads, kL)
+                       : kq_fa_verify_splits(B, n_kv_heads, n_rows, D, kL, d);
   }
 
   size_t k_head_stride =
@@ -743,7 +792,43 @@ void KQuantSDPAFAVerify::eval_gpu(
   // per 8 tile rows ((BQ/8)*32 threads, BQ the smallest of 32, 48, 64 that
   // holds the fold); 512 runs the 256-thread d-split variant (BQ 32 only,
   // capped at the op).
-  {
+  // Pass 1 on the tensor-op units, set up above.
+  if (nax_pass1) {
+    const int wm = (n_rows + 15) / 16;
+    int wn = D == 128 ? 2 : wm <= 2 ? 4 : 2;
+    // Another value warns once and keeps the default.
+    static const std::vector<std::string> wn_128 = {"1", "2"};
+    static const std::vector<std::string> wn_256 = {"2", "4"};
+    const auto& wn_set = D == 128 ? wn_128 : wn_256;
+    const int wn_env = kq_env_choice("KQ_FA_VERIFY_NAX_WN", wn_set, -1);
+    if (wn_env >= 0) {
+      wn = std::stoi(wn_set[wn_env]);
+    }
+    std::string kname = "kq_sdpa_fa_verify_2pass_1_nax_" + ts + "_" +
+        std::to_string(D) + "_wm" + std::to_string(wm) + "_wn" +
+        std::to_string(wn);
+    std::string hash = kname + "_s" + std::to_string(splits);
+    auto kernel = kq_get_kernel(d, kname, hash, fc);
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(q, 0);
+    ce.set_input_array(k, 1);
+    ce.set_input_array(v, 2);
+    ce.set_output_array(partials, 3);
+    ce.set_output_array(sums, 4);
+    ce.set_output_array(maxs, 5);
+    ce.set_bytes(kL, 6);
+    ce.set_bytes(k_head_stride, 7);
+    ce.set_bytes(k_seq_stride, 8);
+    ce.set_bytes(v_head_stride, 9);
+    ce.set_bytes(v_seq_stride, 10);
+    ce.set_bytes(scale, 11);
+    ce.set_bytes(q_len, 12);
+    ce.set_bytes(n_rows, 13);
+    MTL::Size group_dims(32, wm * wn, 1);
+    MTL::Size grid_dims(n_kv_heads, B, splits);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+  }
+  if (!nax_pass1) {
     const int bq = n_rows <= 32 ? 32 : n_rows <= 48 ? 48 : 64;
     std::string kname = "kq_sdpa_fa_verify_2pass_1_" + ts + "_" +
         std::to_string(D) + "_bq" + std::to_string(bq);
@@ -800,8 +885,6 @@ void KQuantSDPAFAVerify::eval_gpu(
     // KVarN axes/stage operands and region map (dummies when compiled out).
     KQKvarnMeta kvm = {};
     if (kvarn) {
-      const auto& stk = inputs[5];
-      const auto& stv = inputs[6];
       const int sink_cap = stk.shape(2) - KQ_KVARN_GROUP;
       kvm.sink_rows = std::min(kvarn_n_, sink_cap);
       kvm.n_rec_keys =
@@ -870,10 +953,10 @@ void KQuantSDPAFAIndexed::eval_gpu(
 
   // q [1, Hq, Q, D] row-contiguous; kv [1, 1, N, D] read in place through
   // its seq stride; idx [Q, M] int32 row-contiguous.
-  const auto& q = inputs[0];
-  const auto& kv = inputs[1];
+  kq_sdpa_check_layout("sdpa_fa_indexed", inputs[0], inputs[1], inputs[1]);
+  const mx::array q = sdpa_q(inputs[0], s, "sdpa_fa_indexed q");
+  const mx::array kv = sdpa_rows(inputs[1], s, "sdpa_fa_indexed kv");
   const auto& idx = inputs[2];
-  kq_sdpa_check_layout("sdpa_fa_indexed", q, kv, kv);
 
   int n_heads = q.shape(1);
   int n_queries = q.shape(2);
@@ -1005,19 +1088,23 @@ void KQuantSDPACascade::eval_gpu(
     outputs[1].set_data(mx::allocator::malloc(outputs[1].nbytes()));
   }
 
-  const auto& q = inputs[0];
-  const auto& qf = inputs[1];
-  const auto& k_sh = inputs[2];
-  const auto& v_sh = inputs[3];
-  const auto& k_pr = inputs[4];
-  const auto& v_pr = inputs[5];
+  kq_sdpa_check_layout(
+      "sdpa_decode_gqa_cascade", inputs[0], inputs[4], inputs[5]);
+  kq_sdpa_check_layout(
+      "sdpa_decode_gqa_cascade", inputs[1], inputs[2], inputs[3]);
+  const mx::array q = sdpa_q(inputs[0], s, "sdpa_decode_gqa_cascade q");
+  const mx::array qf = sdpa_q(inputs[1], s, "sdpa_decode_gqa_cascade q_folded");
+  const mx::array k_sh =
+      sdpa_rows(inputs[2], s, "sdpa_decode_gqa_cascade k_shared");
+  const mx::array v_sh =
+      sdpa_rows(inputs[3], s, "sdpa_decode_gqa_cascade v_shared");
+  const mx::array k_pr = sdpa_rows(inputs[4], s, "sdpa_decode_gqa_cascade k");
+  const mx::array v_pr = sdpa_rows(inputs[5], s, "sdpa_decode_gqa_cascade v");
   const bool starts = has_starts_;
   const bool kv_q8 = has_kv_q8_;
   // Optional trailing inputs: [starts], then the eight q8 scale/bias
   // arrays (shared k/v pairs first, then private).
   const int q8_base = 6 + int(starts);
-  kq_sdpa_check_layout("sdpa_decode_gqa_cascade", q, k_pr, v_pr);
-  kq_sdpa_check_layout("sdpa_decode_gqa_cascade", qf, k_sh, v_sh);
   if (kv_q8) {
     for (int i = 4; i < 8; i++) {
       kq_sdpa_check_batch_heads("sdpa_decode_gqa_cascade", inputs[q8_base + i]);
@@ -1283,14 +1370,16 @@ void KQuantSDPABSPrefill::eval_gpu(
     std::vector<mx::array>& outputs) {
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
-  const auto& q = inputs[0]; // folded [1, Hkv, n_qt, 48, D]
-  const auto& k = inputs[1];
-  const auto& v = inputs[2];
+  kq_sdpa_check_layout(
+      "sdpa_prefill_block_sparse", inputs[0], inputs[1], inputs[2]);
+  // q folded [1, Hkv, n_qt, 48, D].
+  const mx::array q = sdpa_q(inputs[0], s, "sdpa_prefill_block_sparse q");
+  const mx::array k = sdpa_rows(inputs[1], s, "sdpa_prefill_block_sparse k");
+  const mx::array v = sdpa_rows(inputs[2], s, "sdpa_prefill_block_sparse v");
   const auto& pages = inputs[3];
   const auto& pmask = inputs[4];
   const auto& counts = inputs[5];
   auto& out = outputs[0];
-  kq_sdpa_check_layout("sdpa_prefill_block_sparse", q, k, v);
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   int n_kv_heads = q.shape(1);

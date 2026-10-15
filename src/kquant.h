@@ -1706,6 +1706,67 @@ class KQuantMatmulFused : public mx::Primitive {
   int act_; // 0 = silu, 1 = gelu (tanh form)
 };
 
+// Quantized matmuls of several weights that share x: y_i = x @ W_i^T.
+// x [..., K] (float16/bfloat16; float32 runs in bfloat16), weights 2-D
+// uint8 wire bytes of one codec, [N_i, K bytes] each, in separate buffers.
+// Returns one [..., N_i] array per weight, in the dtype quantized_matmul
+// gives for x. On a NAX GPU, at 2 to 8 rows of x where quantized_matmul
+// would run its verify_nax route on the widest weight, one dispatch per
+// four weights computes the products: each weight is read in place, each
+// output is written in its own buffer, and one split-K count covers the
+// joint grid. Every other case runs quantized_matmul per weight.
+std::vector<mx::array> quantized_matmul_multi(
+    mx::array x,
+    std::vector<mx::array> weights,
+    const std::string& kquant_type,
+    mx::StreamOrDevice s = {});
+
+// Primitive of quantized_matmul_multi: inputs {x, scales, w_0, ...},
+// one output per weight. vjp and jvp are those of the per-weight
+// matmuls, wrt x only.
+class KQuantMatmulMulti : public mx::Primitive {
+ public:
+  KQuantMatmulMulti(
+      mx::Stream stream,
+      std::string kquant_type,
+      int group_size,
+      int bits)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        group_size_(group_size),
+        bits_(bits) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantMatmulMulti";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+  std::vector<mx::array> vjp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<mx::array>& outputs) override;
+  std::vector<mx::array> jvp(
+      const std::vector<mx::array>& primals,
+      const std::vector<mx::array>& tangents,
+      const std::vector<int>& argnums) override;
+
+ private:
+  std::string kquant_type_;
+  int group_size_;
+  int bits_;
+};
+
 // Quantized matmul with a low-rank term:
 //   y = x @ W^T + (strength * (x @ A)) @ B
 // x [..., K] (float16/bfloat16; float32 runs in bfloat16), w 2-D uint8 wire

@@ -667,6 +667,42 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "quantized_matmul_multi",
+      &mlx_kquant::quantized_matmul_multi,
+      "x"_a,
+      "weights"_a,
+      "kquant_type"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Quantized matmuls of several weights that share x:
+        [x @ W_i^T for W_i in weights].
+
+        On a NAX GPU, at 2 to 8 rows of x where quantized_matmul would run
+        its verify_nax route on the widest weight, one dispatch per four
+        weights computes the products. Each weight is read from its own
+        buffer and each product is written to its own output, so the
+        weights need no joining copy. One split-K count covers the joint
+        grid. The narrower weights take the widest weight's route, so
+        their outputs can differ from quantized_matmul in the last bits.
+        Every other case runs quantized_matmul per weight.
+        KQ_MATMUL_MULTI=0 runs quantized_matmul per weight on every call
+        (read once per process unless KQ_TUNE_LIVE=1).
+        mx.grad gives the gradient with respect to x; the weights are
+        frozen, as in quantized_matmul.
+
+        Args:
+            x (array): [..., K], float16/bfloat16. float32 runs in bfloat16.
+            weights (list[array]): 2-D uint8 wire bytes [N_i, K bytes] of
+                one codec.
+            kquant_type (str): the codec of every weight.
+
+        Returns:
+            list[array]: [..., N_i] per weight, in the dtype
+            quantized_matmul gives for x.
+      )");
+
+  m.def(
       "quantized_matmul_glu",
       &mlx_kquant::quantized_matmul_glu,
       "x"_a,
@@ -1830,9 +1866,13 @@ NB_MODULE(_ext, m) {
         GQA fold as sdpa_fa_verify (q [1, Hkv, G*q_len, D], kv-major heads,
         original q_len; G*q_len <= 64, or 32 at head_dim 512) in the
         rotated domain, and the sealed records dequantize at tile stage
-        exactly as in sdpa_decode_gqa_kvarn, so the output matches
-        sdpa_fa_verify over the materialized cache bit for bit. Operands,
-        n, n_attend and full_visibility follow sdpa_decode_gqa_kvarn; the
+        exactly as in sdpa_decode_gqa_kvarn. The key pass runs on the
+        simdgroup-matrix kernel at every head dim, so the output matches
+        sdpa_fa_verify over the materialized cache bit for bit where that
+        call runs the same kernel (KQ_FA_VERIFY_NAX=0). Where
+        sdpa_fa_verify takes its NAX key pass (head_dim 128 and 256 on NAX
+        GPUs), the two agree to rounding. Operands, n, n_attend and
+        full_visibility follow sdpa_decode_gqa_kvarn; the
         result is rotated-domain like the query (un-rotate it). This is the
         verify-width route: the vector kernel's cost climbs steeply past
         two queries, while the matrix tile prices extra rows at nearly

@@ -42,8 +42,33 @@
 //   pair(words, f): fragment f's element pair, block scale applied
 //   xstep<T>(xb, q, s): left elements 0..3 of step s, xb the unit's
 //     first activation of the lane's row
+//   xoff(q, s): where xstep reads, in elements from xb. A codec that loads
+//     one step at a time reads steps s and s + 1 (s even) from 8
+//     contiguous elements at a 16-byte boundary of the row, so where x
+//     starts on one (kq_vnax_x16) it loads both in one 16-byte load.
+
+// Function constant: x starts on a 16-byte boundary. Unset keeps the
+// 8-byte load per step.
+constant bool kq_vnax_x16_fc [[function_constant(40)]];
+constant bool kq_vnax_x16 =
+    is_function_constant_defined(kq_vnax_x16_fc) && kq_vnax_x16_fc;
 
 MLX_MTL_CONST int KQ_VNAX_NSG = 4;
+
+// The 16-byte load's geometry: for every lane-quad q and even step s,
+// steps s and s + 1 sit in 8 contiguous elements at an 8-element boundary.
+template <typename Codec, int SPB>
+constexpr bool kq_vnax_x16_pairs() {
+  for (short q = 0; q < 8; ++q) {
+    for (short s = 0; s < SPB; s += 2) {
+      if (Codec::xoff(q, s) % 8 != 0 ||
+          Codec::xoff(q, s + 1) != Codec::xoff(q, s) + 4) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
 
 // PQ2_0: lane-quad q owns the two 16-code words at qs bytes 8q..8q+7.
 // Pair f is code f % 8 of word f / 8 in each half (KqPq2_0Mma).
@@ -53,6 +78,10 @@ struct KqPq2_0Nax {
   static constant constexpr int block_bytes = KQ_PQ2_0_BLOCK_BYTES;
   static constant constexpr int ub = 1;
   static constant constexpr bool x_ahead = true;
+  // Unused: x_ahead codecs load their steps through xstep.
+  static constexpr METAL_FUNC int xoff(short, short) {
+    return 0;
+  }
   struct Words {
     uint w[2];
     half d;
@@ -98,6 +127,10 @@ struct KqQ2_0Nax {
   static constant constexpr int block_bytes = KQ_Q2_0_BLOCK_BYTES;
   static constant constexpr int ub = 2;
   static constant constexpr bool x_ahead = true;
+  // Unused: x_ahead codecs load their steps through xstep.
+  static constexpr METAL_FUNC int xoff(short, short) {
+    return 0;
+  }
   struct Words {
     uint w;
     half d;
@@ -163,9 +196,12 @@ struct KqQ4_0Nax {
             half2(1032.0h)) *
         o.d;
   }
+  static constexpr METAL_FUNC int xoff(short q, short s) {
+    return 16 * s + 4 * q;
+  }
   template <typename T>
   static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
-    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + 16 * s + 4 * q);
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + xoff(q, s));
     return vec<T, 4>(p[0], p[2], p[1], p[3]);
   }
 };
@@ -216,9 +252,12 @@ struct KqQ4_0SbNax {
             half2(1032.0h)) *
         o.d[b];
   }
+  static constexpr METAL_FUNC int xoff(short q, short s) {
+    return 64 * q + 4 * s;
+  }
   template <typename T>
   static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
-    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + 64 * q + 4 * s);
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + xoff(q, s));
     return vec<T, 4>(p[0], p[2], p[1], p[3]);
   }
 };
@@ -266,10 +305,12 @@ struct KqQ8_0Nax {
             half2(1152.0h)) *
         o.d;
   }
+  static constexpr METAL_FUNC int xoff(short q, short s) {
+    return KQ_Q8_0_GROUP * q + 4 * s;
+  }
   template <typename T>
   static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
-    const vec<T, 4> p =
-        *(const device vec<T, 4>*)(xb + KQ_Q8_0_GROUP * q + 4 * s);
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + xoff(q, s));
     return vec<T, 4>(p[0], p[2], p[1], p[3]);
   }
 };
@@ -346,10 +387,12 @@ struct KqQ4_KNax {
     const uint wv = (hi ? (o.w[s & 7] >> 4) : o.w[s & 7]) & 0x0F0F0F0Fu;
     return kq_vnax_kpair(wv >> (8 * (f & 1)), o.ds, o.dm, hi);
   }
+  static constexpr METAL_FUNC int xoff(short q, short s) {
+    return 64 * q + 32 * (s >> 3) + 4 * (s & 7);
+  }
   template <typename T>
   static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
-    const vec<T, 4> p =
-        *(const device vec<T, 4>*)(xb + 64 * q + 32 * (s >> 3) + 4 * (s & 7));
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + xoff(q, s));
     return vec<T, 4>(p[0], p[2], p[1], p[3]);
   }
 };
@@ -409,11 +452,12 @@ struct KqQ5_KNax {
         lo4 | (((o.hb >> (2 * i + (hi ? 1 : 0))) & 0x01010101u) << 4);
     return kq_vnax_kpair(q5 >> (8 * (f & 1)), o.ds, o.dm, hi);
   }
+  static constexpr METAL_FUNC int xoff(short q, short s) {
+    return 64 * (q >> 1) + 16 * (q & 1) + 32 * (s >> 2) + 4 * (s & 3);
+  }
   template <typename T>
   static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
-    const vec<T, 4> p =
-        *(const device vec<T, 4>*)(xb + 64 * (q >> 1) + 16 * (q & 1) +
-                                   32 * (s >> 2) + 4 * (s & 3));
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + xoff(q, s));
     return vec<T, 4>(p[0], p[2], p[1], p[3]);
   }
 };
@@ -485,11 +529,12 @@ struct KqQ6_KNax {
         half2(1056.0h);
     return v * (hi ? o.sc.y : o.sc.x);
   }
+  static constexpr METAL_FUNC int xoff(short q, short s) {
+    return 32 * (q & 1) + 16 * (q >> 1) + 64 * (s >> 2) + 4 * (s & 3);
+  }
   template <typename T>
   static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
-    const vec<T, 4> p =
-        *(const device vec<T, 4>*)(xb + 32 * (q & 1) + 16 * (q >> 1) +
-                                   64 * (s >> 2) + 4 * (s & 3));
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + xoff(q, s));
     return vec<T, 4>(p[0], p[2], p[1], p[3]);
   }
 };
@@ -561,10 +606,12 @@ struct KqQ3_KNax {
     const half2 sc = o.sc[j >> 1];
     return v * ((j & 1) ? sc.y : sc.x);
   }
+  static constexpr METAL_FUNC int xoff(short q, short s) {
+    return 32 * (s >> 1) + 8 * q + 4 * (s & 1);
+  }
   template <typename T>
   static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
-    const vec<T, 4> p =
-        *(const device vec<T, 4>*)(xb + 32 * (s >> 1) + 8 * q + 4 * (s & 1));
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + xoff(q, s));
     return vec<T, 4>(p[0], p[2], p[1], p[3]);
   }
 };
@@ -624,10 +671,12 @@ struct KqQ2_KNax {
     const half m = (j & 1) ? o.dm[k].y : o.dm[k].x;
     return fma(v, half2(d), -half2(m));
   }
+  static constexpr METAL_FUNC int xoff(short q, short s) {
+    return 32 * (s >> 1) + 8 * q + 4 * (s & 1);
+  }
   template <typename T>
   static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
-    const vec<T, 4> p =
-        *(const device vec<T, 4>*)(xb + 32 * (s >> 1) + 8 * q + 4 * (s & 1));
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + xoff(q, s));
     return vec<T, 4>(p[0], p[2], p[1], p[3]);
   }
 };
@@ -742,9 +791,12 @@ struct KqIq4XsNax {
     const uint src = (((s >> 2) & 1) ? (w >> 4) : w) >> (8 * (f & 1));
     return kq_vnax_iq4pair(src, o.dl[b]);
   }
+  static constexpr METAL_FUNC int xoff(short q, short s) {
+    return 64 * q + 4 * s;
+  }
   template <typename T>
   static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
-    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + 64 * q + 4 * s);
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + xoff(q, s));
     return vec<T, 4>(p[0], p[2], p[1], p[3]);
   }
 };
@@ -788,9 +840,12 @@ struct KqIq4NlNax {
     const uint src = (((s >> 2) & 1) ? (w >> 4) : w) >> (8 * (f & 1));
     return kq_vnax_iq4pair(src, o.d[b]);
   }
+  static constexpr METAL_FUNC int xoff(short q, short s) {
+    return 64 * q + 4 * s;
+  }
   template <typename T>
   static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
-    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + 64 * q + 4 * s);
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + xoff(q, s));
     return vec<T, 4>(p[0], p[2], p[1], p[3]);
   }
 };
@@ -800,10 +855,10 @@ METAL_FUNC void kq_verify_nax_impl(
     const device uint8_t* w,
     const device T* x,
     device U* y,
-    const constant int& K,
-    const constant int& N,
-    const constant int& M,
-    const constant int& k_partition_size,
+    const int K,
+    const int N,
+    const int M,
+    const int k_partition_size,
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
@@ -811,6 +866,9 @@ METAL_FUNC void kq_verify_nax_impl(
   constexpr int BK = Codec::block_k;
   constexpr int UB = Codec::ub;
   constexpr int SPB = BK / 16;
+  static_assert(
+      Codec::x_ahead || (SPB % 2 == 0 && kq_vnax_x16_pairs<Codec, SPB>()),
+      "x16 loads step pairs");
   const int n0 = (tid.x * KQ_VNAX_NSG + simd_gid) * 32;
   if (n0 >= N) {
     return;
@@ -874,13 +932,28 @@ METAL_FUNC void kq_verify_nax_impl(
         }
       }
     }
+    uint4 xu = uint4(0);
 #pragma unroll
     for (short u = 0; u < UB; ++u) {
 #pragma unroll
       for (short s = 0; s < SPB; ++s) {
-        const vec<T, 4> xv = Codec::x_ahead ? xa[u][s]
-            : xrow ? Codec::template xstep<T>(xr + kb + u * BK, q, s)
-                   : vec<T, 4>(0);
+        vec<T, 4> xv;
+        if (Codec::x_ahead) {
+          xv = xa[u][s];
+        } else if (kq_vnax_x16) {
+          // Steps s and s + 1 from one 16-byte load, in xstep's order.
+          if ((s & 1) == 0) {
+            xu = xrow
+                ? *(const device uint4*)(xr + kb + u * BK + Codec::xoff(q, s))
+                : uint4(0);
+          }
+          const vec<T, 2> a = as_type<vec<T, 2>>((s & 1) ? xu.z : xu.x);
+          const vec<T, 2> c = as_type<vec<T, 2>>((s & 1) ? xu.w : xu.y);
+          xv = vec<T, 4>(a[0], c[0], a[1], c[1]);
+        } else {
+          xv = xrow ? Codec::template xstep<T>(xr + kb + u * BK, q, s)
+                    : vec<T, 4>(0);
+        }
         ca[0] = xv[0];
         ca[1] = xv[1];
         ca[2] = xv[2];
@@ -944,6 +1017,54 @@ METAL_FUNC void kq_verify_nax_impl(
         simd_lid);                                                     \
   }
 
+// Several weights that share x in one dispatch: weight i owns the
+// threadgroups [tg_end[i - 1], tg_end[i]) of grid x, each weight from its
+// own buffer and into its own output, with one split count over grid z.
+// part_stride[i] is output i's partial stride. Unused weight slots bind
+// slot 0's buffers, and their tg_end is the grid end, so they own no
+// threadgroup.
+#define KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(CODEC, TRAITS)                       \
+  template <typename T, int group_size, int bits, typename U = T>              \
+  [[kernel]] void kq_##CODEC##_verify_nax_multi(                               \
+      const device uint8_t* w0,                                                \
+      const device uint8_t* w1,                                                \
+      const device uint8_t* w2,                                                \
+      const device uint8_t* w3,                                                \
+      const device T* x,                                                       \
+      device U* y0,                                                            \
+      device U* y1,                                                            \
+      device U* y2,                                                            \
+      device U* y3,                                                            \
+      const constant int& K,                                                   \
+      const constant int& M,                                                   \
+      const constant int& k_partition_size,                                    \
+      const constant int4& n_rows,                                             \
+      const constant int4& tg_end,                                             \
+      const constant int4& part_stride,                                        \
+      uint3 tid [[threadgroup_position_in_grid]],                              \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                        \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                           \
+    static_assert(group_size == TRAITS::group, #CODEC " block width");         \
+    const int t = int(tid.x);                                                  \
+    /* tg_end is cumulative, so the weight is the ends passed. */              \
+    const short i =                                                            \
+        short(t >= tg_end[0]) + short(t >= tg_end[1]) + short(t >= tg_end[2]); \
+    const int t0 = i == 0 ? 0 : tg_end[i - 1];                                 \
+    const device uint8_t* w = i == 0 ? w0 : i == 1 ? w1 : i == 2 ? w2 : w3;    \
+    device U* y = i == 0 ? y0 : i == 1 ? y1 : i == 2 ? y2 : y3;                \
+    kq_verify_nax_impl<T, TRAITS, U>(                                          \
+        w,                                                                     \
+        x,                                                                     \
+        y + tid.z * static_cast<int64_t>(part_stride[i]),                      \
+        K,                                                                     \
+        n_rows[i],                                                             \
+        M,                                                                     \
+        k_partition_size,                                                      \
+        uint3(uint(t - t0), tid.y, tid.z),                                     \
+        simd_gid,                                                              \
+        simd_lid);                                                             \
+  }
+
 KQ_DEFINE_VERIFY_NAX_KERNEL(pq2_0, KqPq2_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q2_0, KqQ2_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_0, KqQ4_0Nax)
@@ -956,3 +1077,16 @@ KQ_DEFINE_VERIFY_NAX_KERNEL(q5_k, KqQ5_KNax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q6_k, KqQ6_KNax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q3_k, KqQ3_KNax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q2_k, KqQ2_KNax)
+
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(pq2_0, KqPq2_0Nax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q2_0, KqQ2_0Nax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_0, KqQ4_0Nax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_0_sb, KqQ4_0SbNax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q8_0, KqQ8_0Nax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_k, KqQ4_KNax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(iq4_xs, KqIq4XsNax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(iq4_nl, KqIq4NlNax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q5_k, KqQ5_KNax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q6_k, KqQ6_KNax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q3_k, KqQ3_KNax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q2_k, KqQ2_KNax)

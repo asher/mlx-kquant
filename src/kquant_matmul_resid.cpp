@@ -118,7 +118,8 @@ void KQuantMatmulResid::eval_gpu(
     std::vector<mx::array>& outputs) {
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
-  const mx::array x = kq_row_major_gpu(inputs[0], s);
+  const mx::array x =
+      kq_x_aligned_gpu(inputs[0], s, "quantized_matmul_residual x");
   // A weight whose rows are dense binds as it is, at its own offset. Any
   // other view is copied to dense rows first. The residual and the gate
   // bind as they are when they are row-major.
@@ -160,7 +161,7 @@ void KQuantMatmulResid::eval_gpu(
   if (resid_log()) {
     std::fprintf(
         stderr,
-        "[kq qmm] %s M=%d N=%d K=%d B=%d grid=%lu,%lu,%lu\n",
+        "[kq qmm] %s M=%d N=%d K=%d B=%d grid=%lu,%lu,%lu xa=%d\n",
         kname.c_str(),
         M,
         N,
@@ -168,7 +169,8 @@ void KQuantMatmulResid::eval_gpu(
         B,
         static_cast<unsigned long>(grid_dims.width),
         static_cast<unsigned long>(grid_dims.height),
-        static_cast<unsigned long>(grid_dims.depth));
+        static_cast<unsigned long>(grid_dims.depth),
+        kq_x_align(x));
   }
 
   auto kernel = kq_get_kernel(d, kname);
