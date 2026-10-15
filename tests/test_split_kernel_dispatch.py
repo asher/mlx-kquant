@@ -5,11 +5,14 @@ route at the row counts that select each of its tiles, on both activation
 dtypes, on an N that is and is not a multiple of the column tile, with
 partials in the activation dtype and in float (KQ_SPLITK_F32), and with the
 half verify_mma kernels (KQ_VERIFY_MMA_HALF), and run quantized_matmul_multi
-for its joined verify_nax kernels. KQ_QMM_LOG names the kernel each call
-ran. Together the calls must run every name the host enumerator lists for
-the codec, and each result must meet the R1 bound against float64 with exact
-kq.dequantize weights, so a kernel that compiles to nothing, or that no
-call reaches, fails here.
+for its joined verify_nax kernels. Every verify_nax call also runs with x
+2 bytes into its buffer, so each verify_nax kernel runs both its 16-byte
+(_x16) and 8-byte (_x8) x load pipelines. KQ_QMM_LOG names the pipeline
+each call ran. Together the calls must run every name the host enumerator
+lists for the codec, each verify_nax name in both pipelines, and each
+result must meet the R1 bound against float64 with exact kq.dequantize
+weights, so a kernel that compiles to nothing, or that no call reaches,
+fails here.
 """
 
 from __future__ import annotations
@@ -52,6 +55,7 @@ CLEAR = {
     "KQ_NAX_QMV": None,
     "KQ_VERIFY_NAX": None,
     "KQ_VERIFY_NAX_SPLITS": None,
+    "KQ_VNAX_X16": None,
 }
 # (family the arm may be declined for, rows, K, env). The split-K tile is
 # BM=8 through M 8, BM=16 through M 16 and the plain tile above; the NAX
@@ -91,6 +95,16 @@ def _host_names():
     return out
 
 
+def _pipelines(name):
+    """The pipeline names KQ_QMM_LOG gives a host kernel name: a verify_nax
+    kernel has an _x16 and an _x8 pipeline, named ahead of its partials
+    suffix."""
+    if "_verify_nax_" not in name:
+        return {name}
+    base, suffix = (name[:-5], "_pf32") if name.endswith("_pf32") else (name, "")
+    return {base + "_x16" + suffix, base + "_x8" + suffix}
+
+
 HOST = {} if _no_nax() else _host_names()
 
 
@@ -117,37 +131,41 @@ def test_every_split_kernel_runs(codec):
         for f32 in ("0", "1"):
             for n in (256, 250):
                 for family, m, k, env in arms:
-                    calls.append(
-                        {
-                            "codec": codec,
-                            "shape": [m, k],
-                            "n": n,
-                            "dtype": dtype,
-                            "seed": 1,
-                            "env": {**CLEAR, **env, "KQ_SPLITK_F32": f32},
-                        }
-                    )
-                    families.append(family)
+                    for off in (0, 1) if family == "_verify_nax_" else (0,):
+                        calls.append(
+                            {
+                                "codec": codec,
+                                "shape": [m, k],
+                                "n": n,
+                                "dtype": dtype,
+                                "seed": 1,
+                                "x_offset": off,
+                                "env": {**CLEAR, **env, "KQ_SPLITK_F32": f32},
+                            }
+                        )
+                        families.append(family)
                 for m, k, splits in MULTI_ARMS:
                     if k % CODEC_GEOMETRY[codec][3]:
                         continue
-                    calls.append(
-                        {
-                            "codec": codec,
-                            "shape": [m, k],
-                            "n": n,
-                            "multi": [n + 64],
-                            "dtype": dtype,
-                            "seed": 1,
-                            "env": {
-                                **CLEAR,
-                                **MULTI,
-                                "KQ_VERIFY_NAX_SPLITS": splits,
-                                "KQ_SPLITK_F32": f32,
-                            },
-                        }
-                    )
-                    families.append(None)
+                    for off in (0, 1):
+                        calls.append(
+                            {
+                                "codec": codec,
+                                "shape": [m, k],
+                                "n": n,
+                                "multi": [n + 64],
+                                "dtype": dtype,
+                                "seed": 1,
+                                "x_offset": off,
+                                "env": {
+                                    **CLEAR,
+                                    **MULTI,
+                                    "KQ_VERIFY_NAX_SPLITS": splits,
+                                    "KQ_SPLITK_F32": f32,
+                                },
+                            }
+                        )
+                        families.append(None)
     res = run_probe(calls, env={"KQ_TUNE_LIVE": "1", "KQ_QMM_LOG": "1"})
     ran = set()
     for c, family, r in zip(calls, families, res, strict=True):
@@ -159,4 +177,5 @@ def test_every_split_kernel_runs(codec):
         half = c["env"].get("KQ_VERIFY_MMA_HALF") == "1"
         assert r["rel"] < (HALF if half else R1[c["dtype"]]), (c, r["rel"])
         ran |= {name for name, _ in r["kernels"]}
-    assert sorted(host - ran) == []
+    want = set().union(*(_pipelines(n) for n in host))
+    assert sorted(want - ran) == []
