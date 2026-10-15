@@ -38,7 +38,8 @@ boundary. It raises from the call when the weight is evaluated and row-contiguou
 `mx.eval` otherwise. Arrays that MLX allocates and tensors from `kq.load_gguf` always meet the
 boundary, as do slices of them that start on a block boundary. A view that starts inside a block can
 miss it, and a copy in a new buffer, such as `mx.array(np.array(w))`, runs. The CPU kernels accept
-any start.
+any start. Activations, KV caches and the other float operands can start anywhere: a GPU op copies
+one that starts off the boundary of its kernel's vector loads to a new buffer first.
 
 ## Codecs
 

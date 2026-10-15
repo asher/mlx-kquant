@@ -9,8 +9,7 @@ per-row qmv under KQ_VERIFY_EXT=0. verify_qmv serves M 8 at most, so it
 is no fallthrough here. Each capped call must match the call with the
 split route off bit for bit, and float64 within the R1 bound. A partial
 cap cuts the slice count, a forced target is not capped, and 0 keeps the
-fixed target. The mat-vec routes do not log, so the output digest shows
-which of them ran.
+fixed target. The logged kernel shows which route ran.
 
 Unset, the cap keeps the fixed target on the ALU route, and the NAX route
 takes its default: one slice at a grid of 16 threadgroups per core or more
@@ -107,10 +106,10 @@ def test_nax_cap_falls_through(codec, m):
     _split(default, "_qmm_t_nax_splitk_")
     assert default["rel"] < R1, default["rel"]
     _same(capped, off)
+    ((name, grid),) = capped["kernels"]
     if (codec, m) in MV_EXT:
-        assert capped["kernels"] == [], capped["kernels"]
+        assert "_mv_ext_" in name, name
     else:
-        ((name, grid),) = capped["kernels"]
         assert tile_of(name)[0] == 32 and grid[2] == 1, (name, grid)
 
 
@@ -139,7 +138,8 @@ def test_nax_cap_falls_through_to_qmv(m):
     forced, capped, off = _nax_qmv_fallthrough()[m]
     _split(forced, "_qmm_t_nax_splitk_")
     _same(capped, off)
-    assert capped["kernels"] == []
+    ((name, _),) = capped["kernels"]
+    assert "_qmv_" in name, name
 
 
 # N 1024 at M 16 is 16 BM=32 tiles, and K 5120 is 20 units of 256 weights,

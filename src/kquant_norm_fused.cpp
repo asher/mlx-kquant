@@ -756,7 +756,12 @@ void KQuantRMSNormGate::eval_gpu(
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
-  const auto& x = inputs[0];
+  // x, w and gate are read as vectors of up to four elements.
+  const int align = 4 * static_cast<int>(inputs[0].itemsize());
+  const mx::array x = kq_x_aligned_gpu(inputs[0], s, "rmsnorm_gate x", align);
+  const mx::array w = kq_x_aligned_gpu(inputs[1], s, "rmsnorm_gate w", align);
+  const mx::array gate =
+      kq_x_aligned_gpu(inputs[2], s, "rmsnorm_gate gate", align);
   const int D = x.shape(-1);
   const int nrows = int(x.size() / D);
   std::string kname = "kq_rmsnorm_gate_" + kq_type_string(x.dtype()) + "_" +
@@ -764,9 +769,9 @@ void KQuantRMSNormGate::eval_gpu(
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
-  ce.set_input_array(inputs[0], 0);
-  ce.set_input_array(inputs[1], 1);
-  ce.set_input_array(inputs[2], 2);
+  ce.set_input_array(x, 0);
+  ce.set_input_array(w, 1);
+  ce.set_input_array(gate, 2);
   ce.set_output_array(out, 3);
   ce.set_bytes(eps_, 4);
   ce.set_bytes(nrows, 5);

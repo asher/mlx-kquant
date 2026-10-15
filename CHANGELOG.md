@@ -44,6 +44,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fewer rows by GPU core count, for A/B runs on wide ones such as a vocab head.
 - `KQ_DEQUANT_ROUTE` turns the dequantize route off or forces it on any GPU,
   and `KQ_QMM_LOG` logs each call that takes it.
+- `KQ_QMM_LOG` also logs the mat-vec, gather and MoE dispatches with `xa`, the
+  activation's byte offset modulo 16, and each operand an op copies to align it.
 - `KQ_SPLITK_F32=1` makes bfloat16 split-K matmuls, MTP verify among them,
   round once instead of once per K slice. `0` stores float16 partials again,
   which can return inf.
@@ -113,6 +115,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - After `patch_mlx_lm_load()`, `mlx_lm.utils.load_model` builds a kquant
   checkpoint with the caller's `get_model_classes` instead of the stock class.
   `mlx_kquant.loader.load` takes it too.
+- float16 and bfloat16 inputs that start off a 16-byte boundary, such as a row
+  slice, no longer give wrong output from matmul, norm, attention and DSA ops.
 
 ## [0.4.18]
 

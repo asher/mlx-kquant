@@ -20,7 +20,9 @@ time, so a call with many rows holds float64 copies of B rows; it reports
 ``checked``, the number of rows it read. Every call gets
 ``digest``, a hash of its output bits (of every output on a ``"multi"``
 call), to compare calls across probe processes. ``"x_offset": E`` passes
-x as a row-contiguous view E elements into its buffer.
+x as a row-contiguous view E elements into its buffer, and ``copies``
+lists the ``[kq align]`` lines of the call, (operand, xin) for each
+operand an op copied to an aligned buffer.
 
 ``"design": "lead"`` draws nonnegative weights and activations whose first
 K column is 1024. ``"design": "big"`` draws small weights and dense
@@ -247,12 +249,17 @@ for i, c in enumerate(spec["calls"]):
     )
     if c.get("x_offset"):
         # The same values as a row-contiguous view x_offset elements into
-        # its buffer. An empty cache keeps the buffer from carrying the
-        # slack that makes the op copy the view to a fresh one.
+        # its buffer. The buffer is allocated with the cache off: a reused
+        # one can carry the slack that makes the op copy the view to a
+        # fresh one, and buffers freed late can refill an emptied cache.
         off = c["x_offset"]
-        mx.clear_cache()
-        flat = mx.concatenate([mx.zeros((off,), dtype), x.reshape(-1)])
-        mx.eval(flat)
+        limit = mx.set_cache_limit(0)
+        try:
+            mx.clear_cache()
+            flat = mx.concatenate([mx.zeros((off,), dtype), x.reshape(-1)])
+            mx.eval(flat)
+        finally:
+            mx.set_cache_limit(limit)
         x = flat[off:].reshape(x.shape)
     os.write(2, f"[probe] {i}\n".encode())
     res = {"i": i, "error": None, "rel": None, "ulp": None}
@@ -358,14 +365,19 @@ for i, c in enumerate(spec["calls"]):
 print(json.dumps(results))
 """
 
-_LOG = re.compile(r"^\[kq qmm\] (\S+) M=(\d+) N=(\d+) K=(\d+) grid=(\d+),(\d+),(\d+)$")
+_LOG = re.compile(
+    r"^\[kq qmm\] (\S+) M=(\d+) N=(\d+) K=(\d+) grid=(\d+),(\d+),(\d+) xa=(\d+)$"
+)
+_ALIGN = re.compile(r"^\[kq align\] (.+) xin=(\d+)$")
 
 
 def run_probe(calls, env=None, check=True, timeout=900):
     """Run ``calls`` in a fresh interpreter whose environment keeps no
     ``KQ_*`` variable but those in ``env``. Returns one dict per call with
-    ``kernels`` (list of (name, grid) from KQ_QMM_LOG), ``stderr`` (its
-    other stderr lines), ``error``, ``rel`` and ``ulp``."""
+    ``kernels`` (list of (name, grid) from KQ_QMM_LOG), ``xa`` (the logged
+    byte offset of x modulo 16 per kernel), ``copies`` (the operands copied
+    to an aligned buffer, with the byte offset they came at), ``stderr``
+    (its other stderr lines), ``error``, ``rel`` and ``ulp``."""
     child_env = {k: v for k, v in os.environ.items() if not k.startswith("KQ_")}
     child_env.update(env or {})
     spec = {"tests_dir": TESTS_DIR, "calls": calls, "check": check}
@@ -379,12 +391,16 @@ def run_probe(calls, env=None, check=True, timeout=900):
     assert r.returncode == 0, r.stderr[-6000:]
     results = json.loads(r.stdout.strip().splitlines()[-1])
     logs = {}
+    aligns = {}
+    copies = {}
     other = {}
     cur = None
     for line in r.stderr.splitlines():
         if line.startswith("[probe] "):
             cur = int(line.split()[1])
             logs[cur] = []
+            aligns[cur] = []
+            copies[cur] = []
             other[cur] = []
             continue
         if cur is None:
@@ -393,10 +409,17 @@ def run_probe(calls, env=None, check=True, timeout=900):
         if m:
             grid = tuple(int(g) for g in m.group(5, 6, 7))
             logs[cur].append((m.group(1), grid))
+            aligns[cur].append(int(m.group(8)))
+            continue
+        m = _ALIGN.match(line)
+        if m:
+            copies[cur].append((m.group(1), int(m.group(2))))
         else:
             other[cur].append(line)
     for res in results:
         res["kernels"] = logs.get(res["i"], [])
+        res["xa"] = aligns.get(res["i"], [])
+        res["copies"] = copies.get(res["i"], [])
         res["stderr"] = other.get(res["i"], [])
     return results
 

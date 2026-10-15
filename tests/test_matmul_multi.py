@@ -375,9 +375,9 @@ def test_forced_verify_nax_fuses_narrow_weights():
 @pytest.mark.parametrize("codec", [*CODECS, "pq2_0", "q2_0"])
 def test_x16_load_bits(codec, dtype):
     # x at offset 0 (paired 16-byte activation loads), at offset 0 with
-    # KQ_VNAX_X16=0, at every 2-byte offset from 2 to 14 bytes (one load
-    # per step) and at 16 bytes: the same bits from one verify_nax_multi
-    # dispatch.
+    # KQ_VNAX_X16=0, at every 2-byte offset from 2 to 14 bytes (8 bytes: one
+    # load per step; the others: an aligned copy, paired) and at 16 bytes:
+    # the same bits from one verify_nax_multi dispatch.
     arms = [(0, None), (0, "0"), *[(e, None) for e in range(1, 9)]]
     cases = [(m, sp) for m in range(2, 9) for sp in ("1", "2")]
     calls = [
@@ -401,12 +401,52 @@ def test_x16_load_bits(codec, dtype):
         for (off, lever), r in zip(arms, group, strict=True):
             tag = (codec, m, sp, off, lever)
             assert r["error"] is None, (tag, r["error"])
-            end = "_x16(_pf32)?$" if lever is None and off % 8 == 0 else "_x8(_pf32)?$"
+            b = 2 * off
+            x8 = lever is not None or b % 16 == 8
+            end = "_x8(_pf32)?$" if x8 else "_x16(_pf32)?$"
             names = [n for n, _ in r["kernels"]]
             assert names and all(
                 "verify_nax_multi" in n and re.search(end, n) for n in names
             ), (tag, names)
+            copied = [("quantized_matmul_multi x", b % 8)] if b % 8 else []
+            assert r["copies"] == copied, (tag, r["copies"])
+            assert set(r["xa"]) == {0 if b % 8 else b % 16}, (tag, r["xa"])
             assert r["digest"] == group[0]["digest"], tag
+
+
+@pytest.mark.skipif(force_cpu(), reason="GPU copies")
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+@pytest.mark.parametrize(
+    "lever",
+    [{"KQ_VERIFY_NAX": "0"}, {"KQ_QMM_ROUTE": "qmv"}],
+    ids=lambda e: ",".join(f"{k}={v}" for k, v in e.items()),
+)
+def test_per_weight_copies_x_once(lever, dtype):
+    # Off verify_nax, the op runs quantized_matmul per weight on one aligned
+    # copy of x: one copy for the three weights, every kernel reads x on a
+    # 16-byte boundary, and the bits match x at offset 0.
+    calls = [
+        {
+            "codec": "q4_k",
+            "shape": [4, 1024],
+            "n": 1024,
+            "multi": [256, 512],
+            "dtype": dtype,
+            "seed": 4,
+            "x_offset": off,
+        }
+        for off in range(9)
+    ]
+    res = run_probe(calls, env={"KQ_QMM_LOG": "1", **lever}, check=False)
+    for off, r in enumerate(res):
+        b = 2 * off
+        assert r["error"] is None, (off, r["error"])
+        names = [n for n, _ in r["kernels"]]
+        assert names and not any("multi" in n for n in names), (off, names)
+        copied = [("quantized_matmul_multi x", b % 16)] if b % 16 else []
+        assert r["copies"] == copied, (off, r["copies"])
+        assert set(r["xa"]) == {0}, (off, r["xa"])
+        assert r["digest"] == res[0]["digest"], off
 
 
 @NAX_ONLY

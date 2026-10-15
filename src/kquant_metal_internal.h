@@ -388,6 +388,14 @@ inline int add_gather_strides_and_shapes(
   return offset;
 }
 
+// One KQ_QMM_LOG line for a gather or MoE dispatch: the kernel name, M and
+// N of out's rows, K of x's last dim, the grid and xa.
+void kq_log_dispatch(
+    const std::string& kname,
+    const array& x,
+    const array& out,
+    const MTL::Size& grid);
+
 // Fetch a kq kernel from the bundled metallib.
 //
 // The library handle is resolved exactly once and cached in a function-local

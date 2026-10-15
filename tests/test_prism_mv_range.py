@@ -75,7 +75,8 @@ def test_q2_0_mv_range(design, dtype, m, route):
 
 def _check(r, dtype):
     assert r["error"] is None, r["error"]
-    # The mat-vec routes log no tile kernel.
-    assert r["kernels"] == [], r["kernels"]
+    # One mat-vec kernel, no tile.
+    ((name, _),) = r["kernels"]
+    assert "_qmv_" in name, name
     assert r["nonfinite"] == 0, r["nonfinite"]
     assert _excess(r["rel"], r["floor1"]) < EXCESS[dtype], (r["rel"], r["floor1"])

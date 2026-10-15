@@ -6,7 +6,7 @@ dtypes, on an N that is and is not a multiple of the column tile, with
 partials in the activation dtype and in float (KQ_SPLITK_F32), and with the
 half verify_mma kernels (KQ_VERIFY_MMA_HALF), and run quantized_matmul_multi
 for its joined verify_nax kernels. Every verify_nax call also runs with x
-2 bytes into its buffer, so each verify_nax kernel runs both its 16-byte
+8 bytes into its buffer, so each verify_nax kernel runs both its 16-byte
 (_x16) and 8-byte (_x8) x load pipelines. KQ_QMM_LOG names the pipeline
 each call ran. Together the calls must run every name the host enumerator
 lists for the codec, each verify_nax name in both pipelines, and each
@@ -131,7 +131,7 @@ def test_every_split_kernel_runs(codec):
         for f32 in ("0", "1"):
             for n in (256, 250):
                 for family, m, k, env in arms:
-                    for off in (0, 1) if family == "_verify_nax_" else (0,):
+                    for off in (0, 4) if family == "_verify_nax_" else (0,):
                         calls.append(
                             {
                                 "codec": codec,
@@ -147,7 +147,7 @@ def test_every_split_kernel_runs(codec):
                 for m, k, splits in MULTI_ARMS:
                     if k % CODEC_GEOMETRY[codec][3]:
                         continue
-                    for off in (0, 1):
+                    for off in (0, 4):
                         calls.append(
                             {
                                 "codec": codec,

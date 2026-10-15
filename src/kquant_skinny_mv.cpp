@@ -35,8 +35,8 @@ void KQuantSkinnyMV::eval_gpu(
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
-  const auto& x = inputs[0];
-  const auto& w = inputs[1];
+  const mx::array x = kq_x_aligned_gpu(inputs[0], s, "skinny_matmul x");
+  const mx::array w = kq_x_aligned_gpu(inputs[1], s, "skinny_matmul w");
   int K = x.shape(-1);
   int M = x.shape(-2);
   int N = w.shape(0);
@@ -55,6 +55,7 @@ void KQuantSkinnyMV::eval_gpu(
   ce.set_bytes(K, 5);
   MTL::Size group_dims(32 * 8, 1, 1);
   MTL::Size grid_dims((N + 7) / 8, T, 1);
+  kq_log_dispatch(kname, x, out, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 

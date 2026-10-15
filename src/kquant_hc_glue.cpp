@@ -89,6 +89,12 @@ void check_fn(const mx::array& fn, int D, const char* op) {
 
 namespace {
 
+// The kernels read the stream, residual and collapsed rows, fn, the mixes
+// and the base biases as vectors of four elements.
+mx::array hc_vec(const mx::array& a, const mx::Stream& s, const char* what) {
+  return kq_x_aligned_gpu(a, s, what, 4 * static_cast<int>(a.itemsize()));
+}
+
 // Threads per threadgroup for one launch: the smaller of the count the
 // kernel prefers and what this pipeline supports, rounded down to a whole
 // simdgroup. Register pressure puts the pipeline limit below the preferred
@@ -175,7 +181,10 @@ void KQuantHcFrontReduce::eval_gpu(
   for (auto& out : outputs) {
     out.set_data(mx::allocator::malloc(out.nbytes()));
   }
-  const auto& x = inputs[0];
+  // The operands the kernels read as vectors are bound from boundaries of
+  // four of their elements (hc_vec), here and in the evals below.
+  const mx::array x = hc_vec(inputs[0], s, "hc_front_reduce x");
+  const mx::array fn = hc_vec(inputs[1], s, "hc_front_reduce fn");
   int D = x.shape(-1);
   int rows = int(x.size() / (HC * D));
 
@@ -184,7 +193,7 @@ void KQuantHcFrontReduce::eval_gpu(
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   ce.set_input_array(x, 0);
-  ce.set_input_array(inputs[1], 1);
+  ce.set_input_array(fn, 1);
   ce.set_output_array(outputs[0], 2);
   ce.set_output_array(outputs[1], 3);
   ce.set_bytes(D, 4);
@@ -201,7 +210,9 @@ void KQuantHcFrontExpandReduce::eval_gpu(
   for (auto& out : outputs) {
     out.set_data(mx::allocator::malloc(out.nbytes()));
   }
-  const auto& resid = inputs[1];
+  const mx::array x_sub = hc_vec(inputs[0], s, "hc_front_expand_reduce x_sub");
+  const mx::array resid = hc_vec(inputs[1], s, "hc_front_expand_reduce resid");
+  const mx::array fn = hc_vec(inputs[4], s, "hc_front_expand_reduce fn");
   int D = resid.shape(-1);
   int rows = int(resid.size() / (HC * D));
 
@@ -210,11 +221,11 @@ void KQuantHcFrontExpandReduce::eval_gpu(
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
-  ce.set_input_array(inputs[0], 0);
+  ce.set_input_array(x_sub, 0);
   ce.set_input_array(resid, 1);
   ce.set_input_array(inputs[2], 2);
   ce.set_input_array(inputs[3], 3);
-  ce.set_input_array(inputs[4], 4);
+  ce.set_input_array(fn, 4);
   ce.set_output_array(outputs[0], 5);
   ce.set_output_array(outputs[1], 6);
   ce.set_output_array(outputs[2], 7);
@@ -232,7 +243,9 @@ void KQuantHcSinkhornCollapse::eval_gpu(
   for (auto& out : outputs) {
     out.set_data(mx::allocator::malloc(out.nbytes()));
   }
-  const auto& x = inputs[0];
+  const mx::array x = hc_vec(inputs[0], s, "hc_sinkhorn_collapse x");
+  const mx::array mixes = hc_vec(inputs[1], s, "hc_sinkhorn_collapse mixes");
+  const mx::array base = hc_vec(inputs[4], s, "hc_sinkhorn_collapse base");
   int D = x.shape(-1);
   int rows = int(x.size() / (HC * D));
 
@@ -241,10 +254,10 @@ void KQuantHcSinkhornCollapse::eval_gpu(
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   ce.set_input_array(x, 0);
-  ce.set_input_array(inputs[1], 1);
+  ce.set_input_array(mixes, 1);
   ce.set_input_array(inputs[2], 2);
   ce.set_input_array(inputs[3], 3);
-  ce.set_input_array(inputs[4], 4);
+  ce.set_input_array(base, 4);
   ce.set_input_array(inputs[5], 5);
   ce.set_output_array(outputs[0], 6);
   ce.set_output_array(outputs[1], 7);
@@ -265,7 +278,12 @@ void KQuantHcFrontExpandCollapse::eval_gpu(
   for (auto& out : outputs) {
     out.set_data(mx::allocator::malloc(out.nbytes()));
   }
-  const auto& resid = inputs[1];
+  const mx::array x_sub =
+      hc_vec(inputs[0], s, "hc_front_expand_collapse x_sub");
+  const mx::array resid =
+      hc_vec(inputs[1], s, "hc_front_expand_collapse resid");
+  const mx::array fn = hc_vec(inputs[4], s, "hc_front_expand_collapse fn");
+  const mx::array base = hc_vec(inputs[6], s, "hc_front_expand_collapse base");
   int D = resid.shape(-1);
   int rows = int(resid.size() / (HC * D));
 
@@ -293,13 +311,13 @@ void KQuantHcFrontExpandCollapse::eval_gpu(
       "kq_hc_front_expand_collapse_" + kq_type_string(resid.dtype());
   auto kernel = kq_get_kernel(d, kname);
   ce.set_compute_pipeline_state(kernel);
-  ce.set_input_array(inputs[0], 0);
+  ce.set_input_array(x_sub, 0);
   ce.set_input_array(resid, 1);
   ce.set_input_array(inputs[2], 2);
   ce.set_input_array(inputs[3], 3);
-  ce.set_input_array(inputs[4], 4);
+  ce.set_input_array(fn, 4);
   ce.set_input_array(inputs[5], 5);
-  ce.set_input_array(inputs[6], 6);
+  ce.set_input_array(base, 6);
   ce.set_input_array(inputs[7], 7);
   ce.set_output_array(outputs[0], 8);
   ce.set_output_array(mixes_raw, 9);
@@ -324,7 +342,8 @@ void KQuantHcExpand::eval_gpu(
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
-  const auto& resid = inputs[1];
+  const mx::array x = hc_vec(inputs[0], s, "hc_expand x");
+  const mx::array resid = hc_vec(inputs[1], s, "hc_expand resid");
   int D = resid.shape(-1);
   int rows = int(resid.size() / (HC * D));
 
@@ -332,7 +351,7 @@ void KQuantHcExpand::eval_gpu(
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
-  ce.set_input_array(inputs[0], 0);
+  ce.set_input_array(x, 0);
   ce.set_input_array(resid, 1);
   ce.set_input_array(inputs[2], 2);
   ce.set_input_array(inputs[3], 3);

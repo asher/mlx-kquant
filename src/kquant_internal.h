@@ -61,6 +61,12 @@ int kq_dequant_route_mode();
 // only.
 bool kq_qmm_log_on();
 
+// Byte offset of x's start modulo 16, for KQ_QMM_LOG. A buffer starts on a
+// 16-byte boundary, so this is the alignment the kernels see.
+inline int kq_x_align(const mx::array& x) {
+  return static_cast<int>(x.offset() % 16);
+}
+
 // KVarN key/value widths the record codec supports.
 inline bool kq_kvarn_bits_ok(int bits) {
   return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
@@ -178,6 +184,32 @@ mx::array kq_dense_copy_gpu(const mx::array& a, const mx::Stream& s);
 // unevaluated on most calls, such as an activation, binds the result of
 // this in its eval and adds no node for the operand.
 mx::array kq_row_major_gpu(const mx::array& a, const mx::Stream& s);
+
+// An operand as kernels that read it as vectors need it: a itself when it
+// is row-major and starts on an align-byte boundary, else the row-major
+// copy, whose buffer starts on a 256-byte boundary. Metal defines a vector
+// load only at an address aligned to the vector's size, and a row-major
+// view can start at any element of its buffer. The ops bind activations
+// and float operands they read as vectors through this, with align the
+// widest load (16 bytes unless noted at the call). what names the op and
+// operand for KQ_QMM_LOG, which prints "[kq align] <what> xin=<n>" for
+// each copy, n being the byte offset of a's start modulo align.
+mx::array kq_x_aligned_gpu(
+    const mx::array& a,
+    const mx::Stream& s,
+    const char* what,
+    int align = 16);
+
+// The same for an operand a kernel reads with a unit stride in its last
+// dim and the operand's own strides in the dims before it, such as a KV
+// cache: a itself when its last stride is 1 and its start and the stride
+// of each dim longer than 1 fall on align-byte boundaries, else the
+// row-major copy.
+mx::array kq_strides_aligned_gpu(
+    const mx::array& a,
+    const mx::Stream& s,
+    const char* what,
+    int align = 16);
 
 // The same for an operand a kernel reads with a unit stride in its last
 // dim and the operand's own strides in the dims before it: a itself when

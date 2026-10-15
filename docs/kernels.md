@@ -249,14 +249,19 @@ Tuning levers (defaults are right for normal use):
   included, for the codecs, rows and range of its table, so that tests run its code on any
   machine. Any other value warns once and reads as `auto`. `auto` by default. Read when the op
   builds its graph, once per process unless `KQ_TUNE_LIVE=1`.
-- `KQ_QMM_LOG` - set to any value, logs the kernel name, shape and grid of every NAX and ALU qmm
-  tile dispatch, every split-K dispatch, every `verify_mma` and `verify_nax` dispatch, split or not,
-  and every fused `quantized_matmul_glu`, `quantized_matmul_lora` and `quantized_matmul_residual`
-  dispatch, and every `conv2d_3x3` dispatch to stderr, one `[kq qmm]` line each. The grid depth is
-  the K slice count. A call that takes the dequantize route logs one
-  `[kq dequant] <codec> M=<rows> N=<n> K=<k>` line when the op builds its graph. The mat-vec
-  routes (`qmv`, `verify_qmv`, `mv_ext`) do not log. Unset (off) by default. Read once per process
-  unless `KQ_TUNE_LIVE=1`.
+- `KQ_QMM_LOG` - set to any value, logs every quantized matmul dispatch to stderr, one
+  `[kq qmm] <kernel> M=<m> N=<n> K=<k> grid=<x>,<y>,<z> xa=<a>` line each: the NAX and ALU qmm
+  tiles, the mat-vec routes (`qmv`, `qvm`, `verify_qmv`, `mv_ext`), split-K, `verify_mma` and
+  `verify_nax`, split or not, the fused `quantized_matmul_glu`, `quantized_matmul_lora` and
+  `quantized_matmul_residual` kernels, `skinny_matmul`, the `gather_qmm` and `gather_qmm_seg`
+  routes, the fused MoE gathers, `gather_mix` and `conv2d_3x3`. The grid depth is the K slice
+  count. `xa` is the byte offset of the activation's start modulo 16, as the kernel reads it. A
+  gather or MoE line gives the rows and last dim of the output as M and N. Any GPU op that copies
+  an operand to an aligned buffer, because the operand starts or steps off the boundary of its
+  kernel's vector loads, logs one `[kq align] <op> <operand> xin=<n>` line, where `n` is the
+  operand's byte offset modulo that boundary. A call that takes the dequantize route logs one
+  `[kq dequant] <codec> M=<rows> N=<n> K=<k>` line when the op builds its graph. Unset (off) by
+  default. Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_SPLITK_F32` - partial dtype of the split-K routes (`splitk`, `nax_splitk`, the
   `KQ_QMM_MIDM` band, and `verify_mma` and `verify_nax` when they split K). Float partials let the
   fold round the result once, as the unsplit kernels do. Partials in the activation dtype round
@@ -561,8 +566,9 @@ half weights. Loading a whole K step of activations ahead measured faster for `p
 two-block `q4_0` kernel, while the kernels with larger decoded words load them one NAX op at a time,
 since loading ahead ran `q4_k` 1.6-2x slower. Two consecutive NAX ops read 8 contiguous activations
 of a row, so where the activations start on a 16-byte boundary these kernels read them in one
-16-byte load per two NAX ops, and elsewhere in one 8-byte load per op. The fewer loads take less
-time in a chain of dependent calls, and both forms give the same bits.
+16-byte load per two NAX ops, and where they start on an 8-byte boundary in one 8-byte load per op.
+Activations that start elsewhere are read from a copy on a 16-byte boundary. The fewer loads take
+less time in a chain of dependent calls, and both forms give the same bits.
 
 Split counts for `pq2_0`, `q8_0` and the two-block `q4_0` kernel are the largest divisor of the K
 steps at or under their target, at most 16. The two-block kernel's K walk of 640 per simdgroup

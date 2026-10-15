@@ -36,9 +36,13 @@ void KQDsaSparseAttention::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
 
-  const auto& q = inputs[0];
-  const auto& local_kv = inputs[1];
-  const auto& pooled = inputs[2];
+  // q and the key rows are read as 16-byte vectors through their strides.
+  const mx::array q =
+      kq_strides_aligned_gpu(inputs[0], s, "dsa_sparse_attention q");
+  const mx::array local_kv =
+      kq_strides_aligned_gpu(inputs[1], s, "dsa_sparse_attention local_kv");
+  const mx::array pooled =
+      kq_strides_aligned_gpu(inputs[2], s, "dsa_sparse_attention pooled");
   const auto& topk = inputs[3];
   const auto& sinks = inputs[4];
   auto& o = outputs[0];

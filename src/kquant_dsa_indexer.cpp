@@ -230,11 +230,16 @@ void KQDsaIndexerScoreDecode::eval_gpu(
   auto& d = mx::metal::device(s.device);
   auto& ce = mx::metal::get_command_encoder(s);
 
-  const auto& q = inputs[0];
+  // q and k are read as 8-wide vectors.
+  const int align = 8 * static_cast<int>(inputs[0].itemsize());
+  const mx::array q =
+      kq_x_aligned_gpu(inputs[0], s, "dsa_indexer_score_decode q", align);
   // [B, P * D], the row-major key block. A batch is row-major from the
   // builder. One sequence comes through a reshape that can keep a view
-  // with an element stride other than 1, which is copied here.
-  const mx::array k = kq_unit_stride_gpu(inputs[1], s);
+  // with an element stride other than 1, which is copied here, as is a
+  // view whose start or batch stride is off the vector alignment.
+  const mx::array k =
+      kq_strides_aligned_gpu(inputs[1], s, "dsa_indexer_score_decode k", align);
   const auto& weights = inputs[2];
   auto& out = outputs[0];
 

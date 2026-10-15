@@ -29,7 +29,12 @@ void KQLatentFp4Pack::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
 
-  const auto& x = inputs[0];
+  // The kernel reads each group of 16 as two 8-wide vectors.
+  const mx::array x = kq_x_aligned_gpu(
+      inputs[0],
+      s,
+      "latent_fp4_pack x",
+      8 * static_cast<int>(inputs[0].itemsize()));
   auto& codes = outputs[0];
   auto& scales = outputs[1];
   codes.set_data(mx::allocator::malloc(codes.nbytes()));
