@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.1]
+
 ### Added
 - `kq.quantized_matmul_multi` computes the products of several packed weights
   with one input, such as the q, k and v projections, in one dispatch on NAX
