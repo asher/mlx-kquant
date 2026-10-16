@@ -135,14 +135,16 @@ def test_matmul_synth_tail(codec):
         )
 
 
-# q6_k at M 1 runs the split-K mat-vec when 4 divides N, and the per-row
-# kernels otherwise or under KQ_QMV_SPLITK=0. K 256 leaves seven of the
-# eight simdgroups without a superblock, and K 5376 splits 21 superblocks
-# unevenly. Both arms meet the oracle in every dtype and agree bit for bit
-# where N rules the split out. The op promotes float32 x to bfloat16. The
-# tolerance scales with the output because the CPU path quantizes x to 8
-# bits, which costs it about 1% of the largest output at these K.
-SPLITK_SHAPES = ((256, 256), (260, 5376), (1024, 4096), (258, 512))
+# q6_k and q8_0 at M 1 run the split-K mat-vec when the tile's row count
+# divides N (4 for q6_k, 2 for q8_0), and the per-row kernels otherwise or
+# under KQ_QMV_SPLITK=0. K 256 leaves most simdgroups without a step, K 5376
+# splits 21 steps unevenly, and N 255 rules the split out. Both arms meet the
+# oracle in every dtype and agree bit for bit where N rules the split out.
+# The op promotes float32 x to bfloat16. The tolerance scales with the
+# output because the CPU path quantizes x to 8 bits, which costs it about 1%
+# of the largest output at these K.
+SPLITK_SHAPES = ((256, 256), (260, 5376), (1024, 4096), (258, 512), (255, 512))
+SPLITK_RPS = {"q6_k": 4, "q8_0": 2}
 # Levers that move an M=1 call off the qmv route or change its tiling.
 # KQ_VERIFY_EXT and KQ_QMM_SPLITK are read once per process, so a set one
 # skips the tests.
@@ -171,30 +173,31 @@ def _clear_qmv_levers(monkeypatch):
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("n, k", SPLITK_SHAPES)
-def test_q6_k_qmv_splitk(n, k, dtype, monkeypatch):
+@pytest.mark.parametrize("codec", list(SPLITK_RPS))
+def test_qmv_splitk(codec, n, k, dtype, monkeypatch):
     _clear_qmv_levers(monkeypatch)
     rng = np.random.default_rng(1)
     w_np = (rng.standard_normal((n, k)) * 0.1).astype(np.float32)
-    wq, _ = kq.quantize(mx.array(w_np), "q6_k")
+    wq, _ = kq.quantize(mx.array(w_np), codec)
     mx.eval(wq)
     packed = np.ascontiguousarray(np.array(wq).astype(np.uint8))
     w = mx.array(packed)
     scales = mx.zeros((1,), dtype=mx.uint8)
-    deq = quants.dequantize(packed, GT.Q6_K).astype(np.float32)
+    deq = quants.dequantize(packed, CODECS[codec]).astype(np.float32)
     x_np = (rng.standard_normal((1, k)) * 0.1).astype(np.float32)
     x = mx.array(x_np).astype(dtype)
     r = np.array(x.astype(mx.float32)) @ deq.T
     outs = {}
     for lever in ("1", "0"):
         monkeypatch.setenv("KQ_QMV_SPLITK", lever)
-        got = kq.quantized_matmul(x, w, scales, "q6_k", transpose=True)
+        got = kq.quantized_matmul(x, w, scales, codec, transpose=True)
         mx.eval(got)
         outs[lever] = got
         err = float(np.abs(np.array(got.astype(mx.float32)) - r).max())
         assert err < 2e-2 * float(np.abs(r).max()), (
-            f"N={n} K={k} KQ_QMV_SPLITK={lever}: max_abs={err:.3e}"
+            f"{codec} N={n} K={k} KQ_QMV_SPLITK={lever}: max_abs={err:.3e}"
         )
-    if n % 4:
+    if n % SPLITK_RPS[codec]:
         assert bool(mx.array_equal(outs["1"], outs["0"]).item())
     # The two kernels differ only in float32 summation order, so their
     # outputs agree to one unit in the last place.
@@ -254,3 +257,48 @@ def test_q6_k_qmv_splitk_routing(dtype, monkeypatch):
     assert run(4, fine="1") == [256.0] * 4
     assert run(4, fine="0") == [256.0] * 4
     assert run(6) == [256.0] * 6
+
+
+def _q8_0_block(q, d):
+    d16 = np.array([d], np.float16).view(np.uint8)
+    return np.concatenate([d16, np.asarray(q, np.int8).view(np.uint8)])
+
+
+# The reduction order shows which q8_0 kernel ran. With x all ones, lane 0
+# of the first 256-weight step contributes +B (B = 32768 * 1016, exact in
+# float32), lane 1 of the second step -B, and lane 0 of the third step 0.5.
+# The per-row kernels add 0.5 to +B inside lane 0, where it is below half a
+# unit of B, and return 0. The split-K kernel gives each step its own
+# simdgroup and returns 0.5.
+@pytest.mark.skipif(
+    bool(os.environ.get("KQUANT_FORCE_CPU")) or mx.default_device() != mx.gpu,
+    reason="Metal kernel routing",
+)
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_q8_0_qmv_splitk_routing(dtype, monkeypatch):
+    _clear_qmv_levers(monkeypatch)
+    zero = _q8_0_block(np.zeros(32), 0.0)
+    blocks = [zero] * 24
+    blocks[0] = _q8_0_block([127] * 8 + [0] * 24, 32768.0)
+    blocks[8] = _q8_0_block([0] * 8 + [-127] * 8 + [0] * 16, 32768.0)
+    blocks[16] = _q8_0_block([1] + [0] * 31, 0.5)
+    row = np.concatenate(blocks)
+    scales = mx.zeros((1,), dtype=mx.uint8)
+    x = mx.ones((1, 768), dtype=dtype)
+
+    def run(n, lever=None, fine=None):
+        for name, v in (("KQ_QMV_SPLITK", lever), ("KQ_QMV_FINE", fine)):
+            if v is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, v)
+        w = mx.array(np.tile(row, (n, 1)))
+        y = kq.quantized_matmul(x, w, scales, "q8_0", transpose=True)
+        return np.array(y.astype(mx.float32)).ravel().tolist()
+
+    assert run(8) == [0.5] * 8
+    assert run(8, lever="1") == [0.5] * 8
+    assert run(8, lever="0") == [0.0] * 8
+    assert run(8, fine="1") == [0.0] * 8
+    assert run(8, fine="0") == [0.0] * 8
+    assert run(3) == [0.0] * 3

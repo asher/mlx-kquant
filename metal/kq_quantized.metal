@@ -158,6 +158,7 @@
   instantiate_kquant_batched(qmv_fast, type, 32, 8, 0, q8_0)            \
   instantiate_kquant_batched(qmv_fast, type, 32, 8, 1, q8_0)            \
   instantiate_kquant_batched(qmv_fast_fine, type, 32, 8, 0, q8_0)       \
+  instantiate_kquant_batched(qmv_splitk, type, 32, 8, 0, q8_0)          \
   instantiate_kquant_batched(qmv_fine, type, 32, 8, 0, q8_0)            \
   instantiate_kquant_batched(qmv,      type, 32, 8, 0, q8_0)            \
   instantiate_kquant_batched(qmv,      type, 32, 8, 1, q8_0)            \

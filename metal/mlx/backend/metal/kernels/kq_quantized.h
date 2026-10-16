@@ -1711,6 +1711,104 @@ template <typename T, int group_size, int bits, bool batched>
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
+// Split-K M=1 mat-vec. The nsg simdgroups of a threadgroup share rps rows
+// and stride the 256-weight steps by nsg, so the grid keeps N / rps
+// threadgroups while each simdgroup walks only K / nsg of a row. Lane l
+// owns 8 weights (block l / 4, quarter l % 4) of every 8-block step, the
+// lane mapping of kq_q8_0_qmv_fast_impl. The quarter sits 2 bytes past a
+// 2-byte boundary, so it loads as four ushorts. Partial sums reduce through
+// `red` (nsg * rps floats). Needs N % rps == 0 and K % 256 == 0.
+template <typename T, int rps, int nsg>
+METAL_FUNC void kq_q8_0_qmv_splitk_impl(
+    const device uint8_t* w,
+    const device T* x,
+    device T* y,
+    const int in_vec_size,
+    threadgroup float* red,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  typedef float U;
+  constexpr int step = 8 * KQ_Q8_0_GROUP;
+  thread U result[rps] = {0};
+
+  const int row_bytes = in_vec_size * KQ_Q8_0_BLOCK_BYTES / KQ_Q8_0_GROUP;
+  const int out_row = tid.y * rps;
+  const int lane_k = simd_lid * 8;
+  const int quarter = simd_lid % 4;
+  const device uint8_t* w0 = w + static_cast<int64_t>(out_row) * row_bytes +
+      (simd_lid / 4) * KQ_Q8_0_BLOCK_BYTES;
+
+  for (int k = int(simd_gid) * step; k < in_vec_size; k += nsg * step) {
+    const vec<T, 4> xa = *(const device vec<T, 4>*)(x + k + lane_k);
+    const vec<T, 4> xb = *(const device vec<T, 4>*)(x + k + lane_k + 4);
+    const U x0 = U(xa[0]), x1 = U(xa[1]), x2 = U(xa[2]), x3 = U(xa[3]);
+    const U x4 = U(xb[0]), x5 = U(xb[1]), x6 = U(xb[2]), x7 = U(xb[3]);
+    const int boff = (k / KQ_Q8_0_GROUP) * KQ_Q8_0_BLOCK_BYTES;
+#pragma unroll
+    for (int row = 0; row < rps; row++) {
+      const device uint8_t* b = w0 + row * row_bytes + boff;
+      const U d = U(*(const device half*)b);
+      const device ushort* q =
+          (const device ushort*)(b + KQ_Q8_0_Q_OFFSET + quarter * 8);
+      const float2 q0 = float2(as_type<char2>(q[0]));
+      const float2 q1 = float2(as_type<char2>(q[1]));
+      const float2 q2 = float2(as_type<char2>(q[2]));
+      const float2 q3 = float2(as_type<char2>(q[3]));
+      const U p = q0.x * x0 + q0.y * x1 + q1.x * x2 + q1.y * x3 + q2.x * x4 +
+          q2.y * x5 + q3.x * x6 + q3.y * x7;
+      result[row] += d * p;
+    }
+  }
+
+#pragma unroll
+  for (int row = 0; row < rps; row++) {
+    const U s = simd_sum(result[row]);
+    if (simd_lid == 0) {
+      red[simd_gid * rps + row] = s;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0 && simd_lid < uint(rps)) {
+    U t = U(0);
+    for (int g = 0; g < nsg; g++) {
+      t += red[g * rps + simd_lid];
+    }
+    y[out_row + simd_lid] = static_cast<T>(t);
+  }
+}
+
+#define KQ_Q8_0_DEFINE_QMV_SPLITK(name, RPS, NSG)                           \
+  template <typename T, int group_size, int bits, bool batched>             \
+  [[kernel, max_total_threads_per_threadgroup(32 * NSG)]] void name(        \
+      const device uint8_t* w,                                              \
+      const device uint8_t* /* scales */,                                   \
+      const device T* x,                                                    \
+      device T* y,                                                          \
+      const constant int& in_vec_size,                                      \
+      const constant int& /* out_vec_size */,                               \
+      const constant int& /* x_batch_ndims */,                              \
+      const constant int* /* x_shape */,                                    \
+      const constant int64_t* /* x_strides */,                              \
+      const constant int& /* w_batch_ndims */,                              \
+      const constant int* /* w_shape */,                                    \
+      const constant int64_t* /* w_strides */,                              \
+      const constant int64_t* /* s_strides */,                              \
+      uint3 tid [[threadgroup_position_in_grid]],                           \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                     \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                        \
+    static_assert(                                                          \
+        group_size == KQ_Q8_0_GROUP, "Q8_0 kernel requires group_size=32"); \
+    static_assert(bits == 8, "Q8_0 kernel requires bits=8");                \
+    threadgroup float red[NSG * RPS];                                       \
+    kq_q8_0_qmv_splitk_impl<T, RPS, NSG>(                                   \
+        w, x, y, in_vec_size, red, tid, simd_gid, simd_lid);                \
+  }
+
+// Split-K M=1 q8_0 mat-vec. The host copy of the tile is
+// kq_q8_0_splitk_rps/nsg in src/kquant_metal_internal.h.
+KQ_Q8_0_DEFINE_QMV_SPLITK(kq_q8_0_qmv_splitk, 2, 8)
+
 // Bias-fused variant of kq_q8_0_qmv_fast: decode-only (B=1) fast path for a
 // KQuantLinear whose GGUF weight carries a real linear bias (e.g. gpt-oss
 // attention QKVO). Fuses the post-matmul add into this kernel's own output
