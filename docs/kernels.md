@@ -1035,6 +1035,14 @@ The GLU activation is selected per model: plain SwiGLU/GELU, the clamped `silu_l
 `swiglu_clamp` (gpt-oss clamped SwiGLU: biases added, sigmoid slope `alpha`, and a `(u + 1)` linear
 term; requires the expert biases and is instantiated for `mxfp4`/`nvfp4` only).
 
+At one activation row the iq2_s gate/up and down gathers decode 32 weights per lane step, one
+32-weight group of a block, where the other codecs decode 16. The block scale, the high-bit byte
+and the scale byte then load once per 32 weights, and the grid indices and sign bytes load as
+16-bit pairs. Each lane covers one 32-weight group per step at 8 K-lanes per output row, or 16
+under `KQ_MOE_NX=16`. Outputs differ from the 16-weight kernels only in summation order.
+`KQ_MOE_C32=0` restores the 16-weight kernels; `KQ_MOE_C32=1` also runs the 32-weight kernels at
+wider rows where the dedupe kernels do not apply.
+
 ## Attention
 
 Scaled-dot-product variants for shapes stock MLX's fused allowlist excludes, plus the sparse

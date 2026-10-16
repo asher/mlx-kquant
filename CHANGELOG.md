@@ -6,6 +6,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- At one activation row, `q8_0` `quantized_matmul` runs a split-K mat-vec on
+  every GPU, so latent and dense `q8_0` projections at decode take less time.
+- At one activation row, the iq2_s fused MoE gate/up and down gathers decode
+  32 weights per lane step on every GPU, so iq2_s expert decode takes less
+  time.
+
 ## [0.5.1]
 
 ### Added

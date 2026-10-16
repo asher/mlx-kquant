@@ -303,6 +303,11 @@ All optional; the defaults are right for normal use.
   shared-expert slots stay on the float path). Read per call. Default off: the outputs differ from
   the float kernels at half rounding level, and an activation past 65504 in magnitude turns to inf.
   A/B lever.
+- `KQ_MOE_C32` - on Metal, the 32-weight decode step of the iq2_s fused MoE gate/up and down
+  gathers. By default it runs at one activation row on every GPU. `0` restores the 16-weight
+  kernels, and `1` also runs it at wider rows where the dedupe kernels do not apply. `KQ_MOE_NX=16`
+  selects its 16-lane form. Read per call. The outputs differ from the 16-weight kernels only in
+  summation order. A/B lever.
 
 - `KQ_SDPA_IDX_NAX=0` - run `sdpa_fa_indexed` on its simdgroup kernel even where the NAX tile
   kernel is available. Read once per process. The simdgroup kernel matches `sdpa_fa_verify` over
