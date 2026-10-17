@@ -780,10 +780,8 @@ template <typename T, int results_per_simdgroup = 4>
 
 #define KQ_EXT_NXPSG 8
 
-// Partial dot of x (one activation row) against wire-byte weight row `row`,
-// this thread's K-stripe only (chunks tx, tx + NX, ...). `luts` is the
-// codec's threadgroup-staged table block (KqTgLuts; unused for table-free
-// codecs).
+// Dot of a 32-weight group (l0, l1 unscaled, sc their two scales) with
+// x[0..31].
 template <typename T>
 METAL_FUNC float kq_ext_dot32(
     const thread float4x4& l0,
@@ -802,7 +800,11 @@ METAL_FUNC float kq_ext_dot32(
        dot(l1[3], float4(*(const device vec<T, 4>*)(xp + 28))));
 }
 
-// C32: step 32 weights per lane through KqExtC32 (the "_c32" kernels).
+// Partial dot of x (one activation row) against wire-byte weight row `row`,
+// this thread's K-stripe only (chunks tx, tx + NX, ...). `luts` is the
+// codec's threadgroup-staged table block (KqTgLuts; unused for table-free
+// codecs). With C32 a lane steps one 32-weight group at a time through
+// KqExtC32 (the "_c32" kernels).
 template <typename T, typename Codec, int NX, bool C32 = false>
 METAL_FUNC float kq_ext_row_partial(
     const device uint8_t* w,

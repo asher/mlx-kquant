@@ -555,9 +555,9 @@ def _c32_run(T, dtype, env, tmp_path, arm):
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_c32_dispatch(dtype, tmp_path):
     """iq2_s gate/up and down gathers take the 32-weight-step kernels at one
-    row by default, at NX = 8 or a forced 16; KQ_MOE_C32=0 keeps the
-    16-weight kernels; two rows keep the current dispatch unless forced.
-    The forms differ only in summation order."""
+    row by default, at NX = 8 or a forced 16. KQ_MOE_C32=0 and a forced
+    KQ_MOE_NX=32 keep the 16-weight kernels. Two rows keep them too unless
+    KQ_MOE_C32=1. The forms differ only in summation order."""
     want_glu = f"kq_iq2_s_moe_glu_gather_silu_c32_{dtype}_t"
     want_qmv = f"kq_iq2_s_gather_qmv_c32_{dtype}_t"
     new, names = _c32_run(1, dtype, {}, tmp_path, "default")
@@ -572,12 +572,46 @@ def test_c32_dispatch(dtype, tmp_path):
         for got in (new, wide):
             rel = np.abs(got[key] - old[key]).max() / scale
             assert rel < 2e-3, (key, rel)
+    _, names = _c32_run(1, dtype, {"KQ_MOE_NX": "32"}, tmp_path, "nx32")
+    assert "_c32" not in names, names
+    assert "kq_iq2_s_moe_glu_gather_silu_nx32_" in names, names
+    assert "kq_iq2_s_gather_qmv_nx32_" in names, names
     _, names = _c32_run(2, dtype, {}, tmp_path, "t2")
     assert "_c32" not in names, names
     _, names = _c32_run(
         2, dtype, {"KQ_MOE_C32": "1", "KQ_MOE_DEDUP": "0"}, tmp_path, "t2c32"
     )
     assert want_glu in names and want_qmv in names, names
+
+
+_C32_LIVE_SNIPPET = r"""
+import os
+import numpy as np
+import mlx.core as mx
+import mlx_kquant as kq
+
+rng = np.random.default_rng(5)
+w = mx.array((rng.standard_normal((4, 256, 256)) * 0.1).astype(np.float32))
+wq, _ = kq.quantize(w, "iq2_s", mx.ones((256,), dtype=mx.float32))
+x = mx.ones((1, 1, 256), dtype=mx.bfloat16)
+inds = mx.array(np.array([[1]], np.uint32))
+os.environ.pop("KQ_MOE_C32", None)
+mx.eval(kq.gather_qmv_kq(x, wq, "iq2_s", inds))
+os.environ["KQ_MOE_C32"] = "0"
+mx.eval(kq.gather_qmv_kq(x, wq, "iq2_s", inds))
+"""
+
+
+def test_c32_reads_live():
+    """KQ_MOE_C32 takes effect on the next call, also when the process
+    started without it."""
+    r = _run_child(
+        [sys.executable, "-c", _C32_LIVE_SNIPPET],
+        {"KQ_MOE_NX_LOG": "1"},
+        "c32 live read",
+    )
+    assert "kq_iq2_s_gather_qmv_bfloat16_t" in r.stderr, r.stderr
+    assert "kq_iq2_s_gather_qmv_c32_bfloat16_t" in r.stderr, r.stderr
 
 
 _C32_REF_SNIPPET = r"""

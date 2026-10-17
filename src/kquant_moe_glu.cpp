@@ -58,9 +58,10 @@ inline std::string kq_gather_stem(const std::string& t, int K) {
 // geometry (E=512 top-10, K=2560 N=640, iq3_xxs/iq4_xs + q8_0 shexp) nx16
 // beats nx8 by 3.6-9.8% at every t in 2..8, still positive at the 7040-tg
 // t=8 point, so the cap sits at 8192 tgs; true prefill grids stay NX = 8.
-inline int kq_moe_pick_nx(int64_t rows, int K, bool wide_ok) {
-  // Re-read per call only when the variable exists at all (interleaved A/B
-  // flips it in-process); unset costs one static check.
+// The width KQ_MOE_NX forces, or 0. Re-read per call only when the variable
+// exists at all (interleaved A/B flips it in-process); unset costs one
+// static check.
+inline int kq_moe_nx_env() {
   static const bool has_env = std::getenv("KQ_MOE_NX") != nullptr;
   if (has_env) {
     const char* e = std::getenv("KQ_MOE_NX");
@@ -68,6 +69,13 @@ inline int kq_moe_pick_nx(int64_t rows, int K, bool wide_ok) {
     if (v == 8 || v == 16 || v == 32) {
       return v;
     }
+  }
+  return 0;
+}
+
+inline int kq_moe_pick_nx(int64_t rows, int K, bool wide_ok) {
+  if (const int v = kq_moe_nx_env()) {
+    return v;
   }
   if (wide_ok && K / 16 >= 32 && (rows * 8) / 64 < 8192) {
     return 16;
@@ -337,31 +345,21 @@ inline int kq_moe_pick_sg_h(int N, int nx) {
   return sg;
 }
 
-// 32-weight decode step ("_c32" kernels, KqExtC32): the uniform Ext
-// gathers decode one 32-weight group per lane step, so the block scale, qh
-// and scale bytes load once per 32 weights and qs and signs load as ushort
-// pairs. iq2_s only. On every GPU at t = 1, NX = 8 unless KQ_MOE_NX forces
-// 16; wider t keeps the current dispatch. KQ_MOE_C32=0 forces the 16-weight
-// kernels, =1 the c32 kernels at any t where the uniform kernel runs; read live
-// once set.
+// 32-weight decode step ("_c32" kernels, KqExtC32) for the iq2_s uniform
+// gathers: by default at t = 1 only. KQ_MOE_C32=0 forces the 16-weight
+// kernels and =1 the c32 kernels at every t. Read per call. The c32 kernels
+// have NX 8 and 16 forms, so a forced KQ_MOE_NX=32 keeps the 16-weight
+// kernels.
 inline bool kq_moe_c32(const std::string& codec, int T) {
-  if (codec != "iq2_s") {
+  if (codec != "iq2_s" || kq_moe_nx_env() == 32) {
     return false;
   }
-  static const bool has_env = std::getenv("KQ_MOE_C32") != nullptr;
-  const int v = has_env ? kq_env_flag("KQ_MOE_C32", -1) : -1;
+  const int v = kq_env_flag("KQ_MOE_C32", -1);
   return v == -1 ? T == 1 : v != 0;
 }
 
 inline int kq_moe_c32_nx() {
-  static const bool has_env = std::getenv("KQ_MOE_NX") != nullptr;
-  if (has_env) {
-    const char* e = std::getenv("KQ_MOE_NX");
-    if (e != nullptr && std::atoi(e) == 16) {
-      return 16;
-    }
-  }
-  return 8;
+  return kq_moe_nx_env() == 16 ? 16 : 8;
 }
 
 inline bool kq_gather_fine(int64_t coarse_tgs) {
