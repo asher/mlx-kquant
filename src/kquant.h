@@ -84,6 +84,11 @@ bool dequantize_route_takes(
     int N,
     int K);
 
+// The K-lanes per output row (8 or 16) of the iq2_s c32 MoE gathers on a GPU
+// with this architecture string (as get_architecture gives it), when
+// KQ_MOE_NX does not force one.
+int moe_c32_nx(const std::string& arch);
+
 // Every kernel name the split-K dispatchers can build (qmm_splitk,
 // qmm_nax_splitk, verify_mma, verify_nax and their fold), for the kernel
 // name tests; empty on non-Metal builds.

@@ -5,6 +5,7 @@
 //   K-quant wire bytes: moe_glu_gather_kq (gate + up + GLU epilogue;
 //     optional biases with act "swiglu_clamp", mxfp4/nvfp4 only) and
 //     gather_qmv_kq, per-codec kernels (full codec matrix).
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <set>
@@ -358,8 +359,19 @@ inline bool kq_moe_c32(const std::string& codec, int T) {
   return v == -1 ? T == 1 : v != 0;
 }
 
+// A forced KQ_MOE_NX of 8 or 16, else this GPU's class width (moe_c32_nx).
 inline int kq_moe_c32_nx() {
-  return kq_moe_nx_env() == 16 ? 16 : 8;
+  const int v = kq_moe_nx_env();
+  if (v == 8 || v == 16) {
+    return v;
+  }
+#ifdef _METAL_
+  static const int here =
+      moe_c32_nx(mx::metal::device(mx::Device::gpu).get_architecture());
+  return here;
+#else
+  return 8;
+#endif
 }
 
 inline bool kq_gather_fine(int64_t coarse_tgs) {
@@ -1315,6 +1327,26 @@ std::vector<mx::Shape> KQuantGatherQMVBias::output_shapes(
 std::vector<mx::Shape> KQuantGatherQMVMixBias::output_shapes(
     const std::vector<mx::array>& inputs) {
   return {{inputs[4].shape(0), inputs[0].shape(1)}};
+}
+
+// applegpu_g<gen><suffix>, two digit gen, a lower case suffix other than p:
+// NX 16 from gen 17 (M5), where it beat NX 8 by 2 to 6% on a Muse Spark MoE
+// block (M5 Max, E=256, top 8, N=K=4096). NX 8 elsewhere.
+int moe_c32_nx(const std::string& arch) {
+  const std::string head = "applegpu_g";
+  if (arch.size() != head.size() + 3 || arch.compare(0, head.size(), head)) {
+    return 8;
+  }
+  const char d0 = arch[head.size()];
+  const char d1 = arch[head.size() + 1];
+  const char suffix = arch[head.size() + 2];
+  if (!std::isdigit(static_cast<unsigned char>(d0)) ||
+      !std::isdigit(static_cast<unsigned char>(d1)) ||
+      !std::islower(static_cast<unsigned char>(suffix)) || suffix == 'p') {
+    return 8;
+  }
+  const int gen = (d0 - '0') * 10 + (d1 - '0');
+  return gen >= 17 ? 16 : 8;
 }
 
 // Codecs with the fused kq GLU/gather kernels wired (kq_moe_glu_kq.h):

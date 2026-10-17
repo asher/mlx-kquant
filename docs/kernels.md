@@ -1041,8 +1041,9 @@ term; requires the expert biases and is instantiated for `mxfp4`/`nvfp4` only).
 At one activation row the iq2_s gate/up and down gathers decode 32 weights per lane step, one
 32-weight group of a block, where the other codecs decode 16. The block scale, the high-bit byte
 and the scale byte then load once per 32 weights, and the grid indices and sign bytes load as
-16-bit pairs. Each lane covers one 32-weight group per step at 8 K-lanes per output row, or 16
-under `KQ_MOE_NX=16`. Outputs differ from the 16-weight kernels only in summation order.
+16-bit pairs. Each lane covers one 32-weight group per step, with 16 K-lanes per output row on
+M5 and later GPUs and 8 on earlier ones. `KQ_MOE_NX=8` or `16` forces a width. Outputs differ from
+the 16-weight kernels only in summation order.
 `KQ_MOE_C32=0` restores the 16-weight kernels. `KQ_MOE_C32=1` also runs the 32-weight kernels at
 wider rows where the dedupe kernels do not apply. A forced `KQ_MOE_NX=32` keeps the 16-weight
 kernels.
@@ -1051,6 +1052,9 @@ On M3 Max at E=256, N=K=4096 and top 8, back to back, the gate/up gather took 0.
 0.340 ms (-11.1%), and the down gather took 0.166 ms against 0.191 ms (-12.5%). In a synced decode
 step of eight Muse Spark UD-IQ2_S layers, the MoE blocks took 8.3% less time. With the `q8_0`
 split-K kernel, the step went from 1.414 to 1.335 ms per layer (-5.6%).
+
+On M5 Max the 16-lane form is faster. Back to back at the same shapes, a MoE block replica with
+both gathers at 16 K-lanes took 2.3% to 5.2% less time than at 8, in both arm orders.
 
 The grid lookup is the next lever. With the grid read removed (wrong output), the 32-weight
 gathers took about 25% less time, and 37% less than the 16-weight gathers. That bounds the gain of

@@ -11,6 +11,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `KQ_QMV_SPLITK=0` restores the previous kernels.
 - The iq2_s fused MoE gate/up and down gathers at one activation row take less
   time on every GPU. `KQ_MOE_C32=0` restores the previous kernels.
+- On M5 GPUs the iq2_s MoE gathers at one activation row take a few percent
+  less time again. `KQ_MOE_NX=8` restores the earlier width.
 
 ## [0.5.1]
 
