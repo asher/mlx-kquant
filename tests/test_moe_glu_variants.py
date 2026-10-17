@@ -134,8 +134,10 @@ np.save(out_path, np.array(mix.astype(mx.float32)))
 def test_mix_ns_wide_pick(codec, T, tmp_path):
     """The codec-keyed nx16 mix_ns pick (T <= 2, K >= 2048) dispatches the
     _nx16 kernel for the listed codecs, the slot-parallel kernel otherwise,
-    and matches the forced-nx8 launch to summation-order noise."""
-    wide = codec != "q6_k" and T <= 2
+    and matches the forced-nx8 launch to summation-order noise. A c32 codec
+    at T = 1 takes the c32 slot-parallel kernel instead where c32 is on."""
+    c32 = T == 1 and _c32_class(codec)[0]
+    wide = codec != "q6_k" and T <= 2 and not c32
     outs, names = {}, {}
     for arm, env in (("auto", {}), ("nx8", {"KQ_MOE_NX": "8"})):
         f = tmp_path / f"{arm}.npy"
@@ -148,6 +150,7 @@ def test_mix_ns_wide_pick(codec, T, tmp_path):
         outs[arm] = np.load(f)
         names[arm] = r.stdout + r.stderr
     assert ("_nx16_" in names["auto"]) == wide, names["auto"]
+    assert ("_mix_ns_sp_c32_" in names["auto"]) == c32, names["auto"]
     assert "_sp_" in names["nx8"], names["nx8"]
     a, b = outs["auto"], outs["nx8"]
     scale = np.abs(b).max() + 1e-6

@@ -94,7 +94,9 @@ inline int kq_moe_pick_nx(int64_t rows, int K, bool wide_ok) {
 // q2_k / q3_k (scale unpack heavy) lose 8-14%, q6_k / q8_0 are flat, the
 // iq2 grid codecs and q5_k lose in the chained regime, and every codec is
 // flat-to-negative at t >= 4 or K < 2048, so those keep the slot-parallel
-// form. KQ_MOE_NX still forces a width.
+// form. Where c32 is on, iq3_xxs at t = 1 takes the c32 slot-parallel
+// kernel instead (M5 Max: 7-9% less time than this pick). KQ_MOE_NX still
+// forces a width.
 inline bool kq_moe_mix_ns_wide(const std::string& codec, int T, int K) {
   if (T > 2 || K < 2048) {
     return false;
