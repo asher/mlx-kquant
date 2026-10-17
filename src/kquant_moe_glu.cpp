@@ -346,13 +346,20 @@ inline int kq_moe_pick_sg_h(int N, int nx) {
   return sg;
 }
 
-// 32-weight decode step ("_c32" kernels, KqExtC32) for the iq2_s uniform
-// gathers: by default at t = 1 only. KQ_MOE_C32=0 forces the 16-weight
-// kernels and =1 the c32 kernels at every t. Read per call. The c32 kernels
-// have NX 8 and 16 forms, so a forced KQ_MOE_NX=32 keeps the 16-weight
-// kernels.
+// Codecs with a 32-weight decode step (KqExtC32): the grid codecs.
+inline bool kq_moe_has_c32(const std::string& codec) {
+  return codec == "iq2_s" || codec == "iq2_xxs" || codec == "iq2_xs" ||
+      codec == "iq3_xxs" || codec == "iq3_s" || codec == "iq1_s" ||
+      codec == "iq1_m";
+}
+
+// 32-weight decode step ("_c32" kernels, KqExtC32) for the grid-codec
+// uniform gathers: by default at t = 1 only. KQ_MOE_C32=0 forces the
+// 16-weight kernels and =1 the c32 kernels at every t. Read per call. The
+// c32 kernels have NX 8 and 16 forms, so a forced KQ_MOE_NX=32 keeps the
+// 16-weight kernels.
 inline bool kq_moe_c32(const std::string& codec, int T) {
-  if (codec != "iq2_s" || kq_moe_nx_env() == 32) {
+  if (!kq_moe_has_c32(codec) || kq_moe_nx_env() == 32) {
     return false;
   }
   const int v = kq_env_flag("KQ_MOE_C32", -1);

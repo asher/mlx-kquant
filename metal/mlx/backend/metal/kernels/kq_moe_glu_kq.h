@@ -825,7 +825,8 @@ METAL_FUNC float kq_ext_row_partial(
           w_row + (int64_t)(ig / gpb) * Codec::block_bytes,
           short(ig % gpb),
           l0,
-          l1);
+          l1,
+          luts);
       acc += kq_ext_dot32(l0, l1, sc, x + ig * 32);
     }
     return acc;
@@ -874,14 +875,14 @@ METAL_FUNC float2 kq_ext_glu_row_partial(
         a[i] = float4(*(const device vec<T, 4>*)(xp + 4 * i));
       }
       float4x4 l0, l1;
-      float2 sc = KqExtC32<Codec>::deq_group32s(g_row + boff, g8, l0, l1);
+      float2 sc = KqExtC32<Codec>::deq_group32s(g_row + boff, g8, l0, l1, luts);
       acc.x += sc.x *
               (dot(l0[0], a[0]) + dot(l0[1], a[1]) + dot(l0[2], a[2]) +
                dot(l0[3], a[3])) +
           sc.y *
               (dot(l1[0], a[4]) + dot(l1[1], a[5]) + dot(l1[2], a[6]) +
                dot(l1[3], a[7]));
-      sc = KqExtC32<Codec>::deq_group32s(u_row + boff, g8, l0, l1);
+      sc = KqExtC32<Codec>::deq_group32s(u_row + boff, g8, l0, l1, luts);
       acc.y += sc.x *
               (dot(l0[0], a[0]) + dot(l0[1], a[1]) + dot(l0[2], a[2]) +
                dot(l0[3], a[3])) +

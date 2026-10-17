@@ -336,6 +336,12 @@ instantiate_kq_ext_sx_mix(q2_0, KqQ2_0Ext, iq4_nl, KqIq4_nlExt, float16_t)
   instantiate_kq_ext_c32_nx(codec, traits, float16_t, 16, "_nx16")
 
 instantiate_kq_ext_c32(iq2_s, KqIq2_sExt)
+instantiate_kq_ext_c32(iq2_xxs, KqIq2_xxsExt)
+instantiate_kq_ext_c32(iq2_xs, KqIq2_xsExt)
+instantiate_kq_ext_c32(iq3_xxs, KqIq3_xxsExt)
+instantiate_kq_ext_c32(iq3_s, KqIq3_sExt)
+instantiate_kq_ext_c32(iq1_s, KqIq1_sExt)
+instantiate_kq_ext_c32(iq1_m, KqIq1_mExt)
 
 // q6_k/q8_0 mix_ns (generic; no tuned ns kernels exist).
 instantiate_kq_ext_mix_ns(q6_k, KqQ6_KExt)
