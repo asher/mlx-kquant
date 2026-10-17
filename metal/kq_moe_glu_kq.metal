@@ -314,6 +314,29 @@ instantiate_kq_ext_sx2_lowbit(iq1_m, KqIq1_mExt)
 instantiate_kq_ext_sx_mix(q2_0, KqQ2_0Ext, iq4_nl, KqIq4_nlExt, bfloat16_t)
 instantiate_kq_ext_sx_mix(q2_0, KqQ2_0Ext, iq4_nl, KqIq4_nlExt, float16_t)
 
+// 32-weight decode step (KqExtC32) for the uniform gathers at decode.
+#define instantiate_kq_ext_c32_nx(codec, traits, type, nx, sfx)               \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_silu_c32" sfx "_" #type,                  \
+      kq_ext_moe_glu_gather, type, traits, KQ_GLU_ACT_SILU, nx, true)          \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_gelu_c32" sfx "_" #type,                  \
+      kq_ext_moe_glu_gather, type, traits, KQ_GLU_ACT_GELU, nx, true)          \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_silu_limit_c32" sfx "_" #type,            \
+      kq_ext_moe_glu_gather, type, traits, KQ_GLU_ACT_SILU_LIMIT, nx, true)    \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_c32" sfx "_" #type,                           \
+      kq_ext_gather_qmv, type, traits, nx, true)
+
+#define instantiate_kq_ext_c32(codec, traits)                                 \
+  instantiate_kq_ext_c32_nx(codec, traits, bfloat16_t, 8, "")                  \
+  instantiate_kq_ext_c32_nx(codec, traits, bfloat16_t, 16, "_nx16")            \
+  instantiate_kq_ext_c32_nx(codec, traits, float16_t, 8, "")                   \
+  instantiate_kq_ext_c32_nx(codec, traits, float16_t, 16, "_nx16")
+
+instantiate_kq_ext_c32(iq2_s, KqIq2_sExt)
+
 // q6_k/q8_0 mix_ns (generic; no tuned ns kernels exist).
 instantiate_kq_ext_mix_ns(q6_k, KqQ6_KExt)
 instantiate_kq_ext_mix_ns(q8_0, KqQ8_0Ext)

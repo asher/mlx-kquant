@@ -5257,6 +5257,55 @@ struct KqTgLuts<KqIq2_sExt> {
   }
 };
 
+// 32-weight decode step for the Ext gathers (the "_c32" kernels): one call
+// decodes a whole 32-weight group, so the block scale, the qh byte and the
+// scale byte load once per 32 weights and qs and signs load as ushort
+// pairs. r0 holds weights 0..15 and r1 weights 16..31, sign-applied and
+// unscaled; the return value holds their two scales. Codecs without a
+// 32-weight decode keep ok = false and never reach these kernels.
+template <typename Codec>
+struct KqExtC32 {
+  MLX_MTL_CONST bool ok = false;
+  static METAL_FUNC float2 deq_group32s(
+      const device uint8_t*,
+      short,
+      thread float4x4&,
+      thread float4x4&) {
+    return float2(0.0f);
+  }
+};
+
+template <>
+struct KqExtC32<KqIq2_sExt> {
+  MLX_MTL_CONST bool ok = true;
+  static METAL_FUNC float2 deq_group32s(
+      const device uint8_t* block,
+      short ib32,
+      thread float4x4& r0,
+      thread float4x4& r1) {
+    const float d = float(*(const device half*)block);
+    const uint sc = block[KQ_IQ2_S_SCALES_OFFSET + ib32];
+    const uint qhb = block[KQ_IQ2_S_QH_OFFSET + ib32];
+    const device ushort* qp =
+        (const device ushort*)(block + KQ_IQ2_S_QS_OFFSET + ib32 * 4);
+    const device ushort* sp =
+        (const device ushort*)(block + KQ_IQ2_S_SIGNS_OFFSET + ib32 * 4);
+    const uint q01 = qp[0];
+    const uint q23 = qp[1];
+    const uint s01 = sp[0];
+    const uint s23 = sp[1];
+    kq_grid_u64_signed(
+        iq2s_grid[(q01 & 0xFF) | ((qhb << 8) & 0x300)], s01, r0[0], r0[1]);
+    kq_grid_u64_signed(
+        iq2s_grid[(q01 >> 8) | ((qhb << 6) & 0x300)], s01 >> 8, r0[2], r0[3]);
+    kq_grid_u64_signed(
+        iq2s_grid[(q23 & 0xFF) | ((qhb << 4) & 0x300)], s23, r1[0], r1[1]);
+    kq_grid_u64_signed(
+        iq2s_grid[(q23 >> 8) | ((qhb << 2) & 0x300)], s23 >> 8, r1[2], r1[3]);
+    return d * (0.5f + float2(float(sc & 0xf), float(sc >> 4))) * 0.25f;
+  }
+};
+
 // ---------------------------------------------------------------------------
 // Half-dot decode tables (KQ_MOE_HALF): the grid codecs' 8-bit magnitude
 // entries pre-expanded to half4 pairs in threadgroup memory, so the chunk

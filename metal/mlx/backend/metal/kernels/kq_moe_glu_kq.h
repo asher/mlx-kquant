@@ -780,11 +780,32 @@ template <typename T, int results_per_simdgroup = 4>
 
 #define KQ_EXT_NXPSG 8
 
+// Dot of a 32-weight group (l0, l1 unscaled, sc their two scales) with
+// x[0..31].
+template <typename T>
+METAL_FUNC float kq_ext_dot32(
+    const thread float4x4& l0,
+    const thread float4x4& l1,
+    float2 sc,
+    const device T* xp) {
+  return sc.x *
+      (dot(l0[0], float4(*(const device vec<T, 4>*)(xp + 0))) +
+       dot(l0[1], float4(*(const device vec<T, 4>*)(xp + 4))) +
+       dot(l0[2], float4(*(const device vec<T, 4>*)(xp + 8))) +
+       dot(l0[3], float4(*(const device vec<T, 4>*)(xp + 12)))) +
+      sc.y *
+      (dot(l1[0], float4(*(const device vec<T, 4>*)(xp + 16))) +
+       dot(l1[1], float4(*(const device vec<T, 4>*)(xp + 20))) +
+       dot(l1[2], float4(*(const device vec<T, 4>*)(xp + 24))) +
+       dot(l1[3], float4(*(const device vec<T, 4>*)(xp + 28))));
+}
+
 // Partial dot of x (one activation row) against wire-byte weight row `row`,
 // this thread's K-stripe only (chunks tx, tx + NX, ...). `luts` is the
 // codec's threadgroup-staged table block (KqTgLuts; unused for table-free
-// codecs).
-template <typename T, typename Codec, int NX>
+// codecs). With C32 a lane steps one 32-weight group at a time through
+// KqExtC32 (the "_c32" kernels).
+template <typename T, typename Codec, int NX, bool C32 = false>
 METAL_FUNC float kq_ext_row_partial(
     const device uint8_t* w,
     const device T* x,
@@ -796,6 +817,19 @@ METAL_FUNC float kq_ext_row_partial(
   const int nb = K / Codec::superblock;
   const device uint8_t* w_row = w + row * (int64_t)nb * Codec::block_bytes;
   float acc = 0.0f;
+  if (C32 && KqExtC32<Codec>::ok) {
+    constexpr short gpb = Codec::superblock / 32;
+    for (int ig = tx; 32 * ig < K; ig += NX) {
+      float4x4 l0, l1;
+      const float2 sc = KqExtC32<Codec>::deq_group32s(
+          w_row + (int64_t)(ig / gpb) * Codec::block_bytes,
+          short(ig % gpb),
+          l0,
+          l1);
+      acc += kq_ext_dot32(l0, l1, sc, x + ig * 32);
+    }
+    return acc;
+  }
   for (int ich = tx; 16 * ich < K; ich += NX) {
     const device uint8_t* block =
         w_row + (int64_t)(ich / chpb) * Codec::block_bytes;
@@ -813,7 +847,7 @@ METAL_FUNC float kq_ext_row_partial(
 }
 
 // GLU pair variant: gate and up rows share each activation chunk load.
-template <typename T, typename Codec, int NX>
+template <typename T, typename Codec, int NX, bool C32 = false>
 METAL_FUNC float2 kq_ext_glu_row_partial(
     const device uint8_t* gw,
     const device uint8_t* uw,
@@ -828,6 +862,35 @@ METAL_FUNC float2 kq_ext_glu_row_partial(
   const device uint8_t* g_row = gw + row_off;
   const device uint8_t* u_row = uw + row_off;
   float2 acc = float2(0.0f);
+  if (C32 && KqExtC32<Codec>::ok) {
+    constexpr short gpb = Codec::superblock / 32;
+    for (int ig = tx; 32 * ig < K; ig += NX) {
+      const int64_t boff = (int64_t)(ig / gpb) * Codec::block_bytes;
+      const short g8 = short(ig % gpb);
+      const device T* xp = x + ig * 32;
+      float4 a[8];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        a[i] = float4(*(const device vec<T, 4>*)(xp + 4 * i));
+      }
+      float4x4 l0, l1;
+      float2 sc = KqExtC32<Codec>::deq_group32s(g_row + boff, g8, l0, l1);
+      acc.x += sc.x *
+              (dot(l0[0], a[0]) + dot(l0[1], a[1]) + dot(l0[2], a[2]) +
+               dot(l0[3], a[3])) +
+          sc.y *
+              (dot(l1[0], a[4]) + dot(l1[1], a[5]) + dot(l1[2], a[6]) +
+               dot(l1[3], a[7]));
+      sc = KqExtC32<Codec>::deq_group32s(u_row + boff, g8, l0, l1);
+      acc.y += sc.x *
+              (dot(l0[0], a[0]) + dot(l0[1], a[1]) + dot(l0[2], a[2]) +
+               dot(l0[3], a[3])) +
+          sc.y *
+              (dot(l1[0], a[4]) + dot(l1[1], a[5]) + dot(l1[2], a[6]) +
+               dot(l1[3], a[7]));
+    }
+    return acc;
+  }
   for (int ich = tx; 16 * ich < K; ich += NX) {
     const int64_t boff = (int64_t)(ich / chpb) * Codec::block_bytes;
     const short cch = short(ich % chpb);
@@ -873,7 +936,12 @@ METAL_FUNC float kq_ext_reduce(float v) {
   return v;
 }
 
-template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
+template <
+    typename T,
+    typename Codec,
+    int ACT,
+    int NX = KQ_EXT_NXPSG,
+    bool C32 = false>
 [[kernel]] void kq_ext_moe_glu_gather(
     const device uint8_t* gw [[buffer(0)]],
     const device uint8_t* uw [[buffer(1)]],
@@ -899,7 +967,7 @@ template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
   out += ((int64_t)tid.z * R + tid.y) * N;
 
   KQ_EXT_STAGE_LUTS(Codec, kq_luts)
-  const float2 gu = kq_ext_glu_row_partial<T, Codec, NX>(
+  const float2 gu = kq_ext_glu_row_partial<T, Codec, NX, C32>(
       gw, uw, x, (int64_t)expert * N + out_row, K, tx, kq_luts);
   const float g = kq_ext_reduce<NX>(gu.x);
   const float u = kq_ext_reduce<NX>(gu.y);
@@ -997,7 +1065,7 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
   }
 }
 
-template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
+template <typename T, typename Codec, int NX = KQ_EXT_NXPSG, bool C32 = false>
 [[kernel]] void kq_ext_gather_qmv(
     const device uint8_t* w [[buffer(0)]],
     const device T* x [[buffer(1)]],
@@ -1022,7 +1090,7 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
   out += row_idx * N;
 
   KQ_EXT_STAGE_LUTS(Codec, kq_luts)
-  const float r = kq_ext_reduce<NX>(kq_ext_row_partial<T, Codec, NX>(
+  const float r = kq_ext_reduce<NX>(kq_ext_row_partial<T, Codec, NX, C32>(
       w, x, (int64_t)expert * N + out_row, K, tx, kq_luts));
   if (tx == 0) {
     out[out_row] = static_cast<T>(r);

@@ -58,9 +58,10 @@ inline std::string kq_gather_stem(const std::string& t, int K) {
 // geometry (E=512 top-10, K=2560 N=640, iq3_xxs/iq4_xs + q8_0 shexp) nx16
 // beats nx8 by 3.6-9.8% at every t in 2..8, still positive at the 7040-tg
 // t=8 point, so the cap sits at 8192 tgs; true prefill grids stay NX = 8.
-inline int kq_moe_pick_nx(int64_t rows, int K, bool wide_ok) {
-  // Re-read per call only when the variable exists at all (interleaved A/B
-  // flips it in-process); unset costs one static check.
+// The width KQ_MOE_NX forces, or 0. Re-read per call only when the variable
+// exists at all (interleaved A/B flips it in-process); unset costs one
+// static check.
+inline int kq_moe_nx_env() {
   static const bool has_env = std::getenv("KQ_MOE_NX") != nullptr;
   if (has_env) {
     const char* e = std::getenv("KQ_MOE_NX");
@@ -68,6 +69,13 @@ inline int kq_moe_pick_nx(int64_t rows, int K, bool wide_ok) {
     if (v == 8 || v == 16 || v == 32) {
       return v;
     }
+  }
+  return 0;
+}
+
+inline int kq_moe_pick_nx(int64_t rows, int K, bool wide_ok) {
+  if (const int v = kq_moe_nx_env()) {
+    return v;
   }
   if (wide_ok && K / 16 >= 32 && (rows * 8) / 64 < 8192) {
     return 16;
@@ -337,6 +345,23 @@ inline int kq_moe_pick_sg_h(int N, int nx) {
   return sg;
 }
 
+// 32-weight decode step ("_c32" kernels, KqExtC32) for the iq2_s uniform
+// gathers: by default at t = 1 only. KQ_MOE_C32=0 forces the 16-weight
+// kernels and =1 the c32 kernels at every t. Read per call. The c32 kernels
+// have NX 8 and 16 forms, so a forced KQ_MOE_NX=32 keeps the 16-weight
+// kernels.
+inline bool kq_moe_c32(const std::string& codec, int T) {
+  if (codec != "iq2_s" || kq_moe_nx_env() == 32) {
+    return false;
+  }
+  const int v = kq_env_flag("KQ_MOE_C32", -1);
+  return v == -1 ? T == 1 : v != 0;
+}
+
+inline int kq_moe_c32_nx() {
+  return kq_moe_nx_env() == 16 ? 16 : 8;
+}
+
 inline bool kq_gather_fine(int64_t coarse_tgs) {
   static const bool has_env = std::getenv("KQ_GATHER_FINE") != nullptr;
   const int v = has_env ? kq_env_flag("KQ_GATHER_FINE", -1) : -1;
@@ -543,14 +568,18 @@ void KQuantMoEGLUKQ::eval_gpu(
   // staged activation row and half grid (nx 16 measured 10% slower).
   const bool use_half = !biased && kq_moe_half(kquant_type_, K);
   const bool dd = !biased && !use_half && kq_moe_dedup(T, KQ_DD_MAX_T);
-  const int nx = use_half ? 8 : kq_moe_pick_nx((int64_t)N * R * T, K, true);
+  const bool c32 = !biased && !use_half && !dd && kq_moe_c32(kquant_type_, T);
+  const int nx = use_half ? 8
+      : c32               ? kq_moe_c32_nx()
+                          : kq_moe_pick_nx((int64_t)N * R * T, K, true);
   std::string stem = kq_gather_stem_nx(kquant_type_, K, nx);
   if (dd && (stem == "q6_k" || stem == "q8_0")) {
     stem += "_ext"; // the dedupe kernels are Ext-only
   }
   std::string kname = "kq_" + stem + "_moe_glu_gather_" +
       (biased ? "bias_" : "") + (use_half ? "h_" : "") + (dd ? "dd_" : "") +
-      act_ + kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
+      act_ + (c32 ? "_c32" : "") + kq_nx_suffix(nx) + "_" +
+      kq_type_string(x.dtype());
   auto kernel = kq_get_kernel(d, kname);
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
@@ -614,7 +643,10 @@ void KQuantGatherQMVKQ::eval_gpu(
   int K = x.shape(-1);
 
   const bool use_half = !biased && kq_moe_half(kquant_type_, K);
-  const int nx = use_half ? 8 : kq_moe_pick_nx((int64_t)N * R * T, K, false);
+  const bool c32 = !biased && !use_half && kq_moe_c32(kquant_type_, T);
+  const int nx = use_half ? 8
+      : c32               ? kq_moe_c32_nx()
+                          : kq_moe_pick_nx((int64_t)N * R * T, K, false);
   const std::string stem = kq_gather_stem_nx(kquant_type_, K, nx);
   // Fine tiling is instantiated only on the tuned q6_k/q8_0 kernels; the Ext
   // equivalents (2x and 4x threadgroup variants) measured E2E-neutral and
@@ -623,8 +655,8 @@ void KQuantGatherQMVKQ::eval_gpu(
   const bool fine =
       tuned && !biased && nx == 8 && kq_gather_fine((int64_t)(N / 8) * R * T);
   std::string kname = "kq_" + stem + "_gather_qmv" + (biased ? "_bias" : "") +
-      (use_half ? "_h" : "") + (fine ? "_fine" : kq_nx_suffix(nx)) + "_" +
-      kq_type_string(x.dtype());
+      (use_half ? "_h" : "") + (c32 ? "_c32" : "") +
+      (fine ? "_fine" : kq_nx_suffix(nx)) + "_" + kq_type_string(x.dtype());
   auto kernel = kq_get_kernel(d, kname);
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);

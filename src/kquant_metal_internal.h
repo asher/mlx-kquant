@@ -81,6 +81,11 @@ inline int kquant_qmv_fast_bn(const std::string& kquant_type) {
 constexpr int kq_q6_k_splitk_rps = 4;
 constexpr int kq_q6_k_splitk_nsg = 8;
 
+// Output rows and simdgroups per threadgroup of the split-K M=1 q8_0 qmv,
+// kq_q8_0_qmv_splitk in kq_quantized.h.
+constexpr int kq_q8_0_splitk_rps = 2;
+constexpr int kq_q8_0_splitk_nsg = 8;
+
 // quantized.cpp:63-65 (kquant branch). KQuant blocks are 32 or 256 weights.
 inline int qmv_fast_k_align() {
   return 256;

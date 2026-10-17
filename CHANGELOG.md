@@ -6,6 +6,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- `q8_0` `quantized_matmul` at one activation row takes less time on every GPU.
+  `KQ_QMV_SPLITK=0` restores the previous kernels.
+- The iq2_s fused MoE gate/up and down gathers at one activation row take less
+  time on every GPU. `KQ_MOE_C32=0` restores the previous kernels.
+
 ## [0.5.1]
 
 ### Added

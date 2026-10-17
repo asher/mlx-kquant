@@ -1816,11 +1816,13 @@ void qvm(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// Dispatches the split-K M=1 q6_k mat-vec, kq_q6_k_qmv_splitk. The
-// simdgroups of a threadgroup split each row along K, which keeps the kernel
-// on memory bandwidth at the lower GPU clocks of sustained decode, where the
-// per-row kernels turn ALU-bound. Returns false, dispatching nothing, when
-// the shape or pipeline does not fit.
+// Dispatches the split-K M=1 mat-vec of q6_k (kq_q6_k_qmv_splitk) or q8_0
+// (kq_q8_0_qmv_splitk). The simdgroups of a threadgroup split each row along
+// K. For q6_k this keeps the kernel on memory bandwidth at the lower GPU
+// clocks of sustained decode, where the per-row kernels turn ALU-bound. For
+// q8_0 it puts more simdgroups in flight on layer-size N, where the per-row
+// grid leaves the GPU short of loads in flight. Returns false, dispatching
+// nothing, when the shape or pipeline does not fit.
 static bool qmv_splitk(
     const array& x,
     const array& w,
@@ -1833,9 +1835,13 @@ static bool qmv_splitk(
     Device& d,
     const Stream& s,
     const std::string& kquant_type) {
-  constexpr int rps = kq_q6_k_splitk_rps;
-  constexpr int nsg = kq_q6_k_splitk_nsg;
-  if (kquant_type != "q6_k" || N % rps != 0 || K % qmv_fast_k_align() != 0) {
+  const bool q6 = kquant_type == "q6_k";
+  if (!q6 && kquant_type != "q8_0") {
+    return false;
+  }
+  const int rps = q6 ? kq_q6_k_splitk_rps : kq_q8_0_splitk_rps;
+  const int nsg = q6 ? kq_q6_k_splitk_nsg : kq_q8_0_splitk_nsg;
+  if (N % rps != 0 || K % qmv_fast_k_align() != 0) {
     return false;
   }
   std::string kname;
@@ -1849,12 +1855,17 @@ static bool qmv_splitk(
       "_b_",
       bits,
       "_batch_0");
-  // K is function constant 340, so the pipeline is keyed by row width too.
-  int k_const = K;
-  mx::metal::MTLFCList func_consts = {
-      {&k_const, MTL::DataType::DataTypeInt, 340}};
-  auto kernel =
-      kq_get_kernel(d, kname, kname + "_k" + std::to_string(K), func_consts);
+  MTL::ComputePipelineState* kernel = nullptr;
+  if (q6) {
+    // K is function constant 340, so the pipeline is keyed by row width too.
+    int k_const = K;
+    mx::metal::MTLFCList func_consts = {
+        {&k_const, MTL::DataType::DataTypeInt, 340}};
+    kernel =
+        kq_get_kernel(d, kname, kname + "_k" + std::to_string(K), func_consts);
+  } else {
+    kernel = kq_get_kernel(d, kname);
+  }
   if (int(kernel->maxTotalThreadsPerThreadgroup()) < 32 * nsg) {
     return false;
   }
