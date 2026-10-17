@@ -5261,8 +5261,40 @@ struct KqTgLuts<KqIq2_sExt> {
 // decodes a whole 32-weight group, so the block scale, the qh byte and the
 // scale byte load once per 32 weights and qs and signs load as ushort
 // pairs. r0 holds weights 0..15 and r1 weights 16..31, sign-applied and
-// unscaled; the return value holds their two scales. Codecs without a
-// 32-weight decode keep ok = false and never reach these kernels.
+// unscaled; the return value holds their two scales. `luts` is the codec's
+// KqTgLuts block. Codecs without a 32-weight decode keep ok = false and
+// never reach these kernels.
+// Two u32 grid entries (8 weights) from a ushort of two 8-bit indices.
+METAL_FUNC void kq_c32_u32_pair(
+    const threadgroup uint32_t* grid,
+    uint q,
+    uint s,
+    thread float4& lo,
+    thread float4& hi) {
+  lo = kq_grid_sign4(kq_grid_u8x4(grid[q & 0xFF]), s);
+  hi = kq_grid_sign4(kq_grid_u8x4(grid[(q >> 8) & 0xFF]), s >> 4);
+}
+// Two u32 grid entries (8 weights) at indices i0 and i1.
+METAL_FUNC void kq_c32_u32_idx(
+    const threadgroup uint32_t* grid,
+    uint i0,
+    uint i1,
+    uint s,
+    thread float4& lo,
+    thread float4& hi) {
+  lo = kq_grid_sign4(kq_grid_u8x4(grid[i0]), s);
+  hi = kq_grid_sign4(kq_grid_u8x4(grid[i1]), s >> 4);
+}
+// One signed u64 grid entry (8 weights) plus delta, unscaled.
+METAL_FUNC void kq_c32_i8_delta(
+    uint64_t ge,
+    float delta,
+    thread float4& lo,
+    thread float4& hi) {
+  lo = kq_grid_i8x4(uint32_t(ge)) + delta;
+  hi = kq_grid_i8x4(uint32_t(ge >> 32)) + delta;
+}
+
 template <typename Codec>
 struct KqExtC32 {
   MLX_MTL_CONST bool ok = false;
@@ -5270,7 +5302,8 @@ struct KqExtC32 {
       const device uint8_t*,
       short,
       thread float4x4&,
-      thread float4x4&) {
+      thread float4x4&,
+      const threadgroup uint8_t*) {
     return float2(0.0f);
   }
 };
@@ -5282,7 +5315,8 @@ struct KqExtC32<KqIq2_sExt> {
       const device uint8_t* block,
       short ib32,
       thread float4x4& r0,
-      thread float4x4& r1) {
+      thread float4x4& r1,
+      const threadgroup uint8_t*) {
     const float d = float(*(const device half*)block);
     const uint sc = block[KQ_IQ2_S_SCALES_OFFSET + ib32];
     const uint qhb = block[KQ_IQ2_S_QH_OFFSET + ib32];
@@ -5303,6 +5337,223 @@ struct KqExtC32<KqIq2_sExt> {
     kq_grid_u64_signed(
         iq2s_grid[(q23 >> 8) | ((qhb << 2) & 0x300)], s23 >> 8, r1[2], r1[3]);
     return d * (0.5f + float2(float(sc & 0xf), float(sc >> 4))) * 0.25f;
+  }
+};
+
+template <>
+struct KqExtC32<KqIq2_xxsExt> {
+  MLX_MTL_CONST bool ok = true;
+  static METAL_FUNC float2 deq_group32s(
+      const device uint8_t* block,
+      short ib32,
+      thread float4x4& r0,
+      thread float4x4& r1,
+      const threadgroup uint8_t* luts) {
+    const threadgroup uint64_t* grid =
+        reinterpret_cast<const threadgroup uint64_t*>(luts);
+    const threadgroup uint8_t* ksigns = luts + 2048;
+    const float d = float(*(const device half*)block);
+    const device ushort* qp =
+        (const device ushort*)(block + KQ_IQ2_XXS_QS_OFFSET + ib32 * 8);
+    const uint q01 = qp[0];
+    const uint q23 = qp[1];
+    const uint sb = uint(qp[2]) | (uint(qp[3]) << 16);
+    kq_grid_u64_signed(grid[q01 & 0xFF], ksigns[sb & 127], r0[0], r0[1]);
+    kq_grid_u64_signed(grid[q01 >> 8], ksigns[(sb >> 7) & 127], r0[2], r0[3]);
+    kq_grid_u64_signed(
+        grid[q23 & 0xFF], ksigns[(sb >> 14) & 127], r1[0], r1[1]);
+    kq_grid_u64_signed(grid[q23 >> 8], ksigns[(sb >> 21) & 127], r1[2], r1[3]);
+    return float2(d * (0.5f + float(sb >> 28)) * 0.25f);
+  }
+};
+
+template <>
+struct KqExtC32<KqIq2_xsExt> {
+  MLX_MTL_CONST bool ok = true;
+  static METAL_FUNC float2 deq_group32s(
+      const device uint8_t* block,
+      short ib32,
+      thread float4x4& r0,
+      thread float4x4& r1,
+      const threadgroup uint8_t* luts) {
+    const threadgroup uint64_t* grid =
+        reinterpret_cast<const threadgroup uint64_t*>(luts);
+    const threadgroup uint8_t* ksigns = luts + 4096;
+    const float d = float(*(const device half*)block);
+    const uint sc = block[KQ_IQ2_XS_SCALES_OFFSET + ib32];
+    const device ushort* qp =
+        (const device ushort*)(block + KQ_IQ2_XS_QS_OFFSET + ib32 * 8);
+    const uint q0 = qp[0];
+    const uint q1 = qp[1];
+    const uint q2 = qp[2];
+    const uint q3 = qp[3];
+    kq_grid_u64_signed(grid[q0 & 511], ksigns[q0 >> 9], r0[0], r0[1]);
+    kq_grid_u64_signed(grid[q1 & 511], ksigns[q1 >> 9], r0[2], r0[3]);
+    kq_grid_u64_signed(grid[q2 & 511], ksigns[q2 >> 9], r1[0], r1[1]);
+    kq_grid_u64_signed(grid[q3 & 511], ksigns[q3 >> 9], r1[2], r1[3]);
+    return d * (0.5f + float2(float(sc & 0xf), float(sc >> 4))) * 0.25f;
+  }
+};
+
+template <>
+struct KqExtC32<KqIq3_xxsExt> {
+  MLX_MTL_CONST bool ok = true;
+  static METAL_FUNC float2 deq_group32s(
+      const device uint8_t* block,
+      short ib32,
+      thread float4x4& r0,
+      thread float4x4& r1,
+      const threadgroup uint8_t* luts) {
+    const threadgroup uint32_t* grid =
+        reinterpret_cast<const threadgroup uint32_t*>(luts);
+    const threadgroup uint8_t* ksigns = luts + 1024;
+    const float d = float(*(const device half*)block);
+    const device ushort* qp =
+        (const device ushort*)(block + KQ_IQ3_XXS_QS_OFFSET + ib32 * 8);
+    const device ushort* gas =
+        (const device ushort*)(block + KQ_IQ3_XXS_GAS_OFFSET + ib32 * 4);
+    const uint aux = uint(gas[0]) | (uint(gas[1]) << 16);
+    kq_c32_u32_pair(grid, qp[0], ksigns[aux & 127], r0[0], r0[1]);
+    kq_c32_u32_pair(grid, qp[1], ksigns[(aux >> 7) & 127], r0[2], r0[3]);
+    kq_c32_u32_pair(grid, qp[2], ksigns[(aux >> 14) & 127], r1[0], r1[1]);
+    kq_c32_u32_pair(grid, qp[3], ksigns[(aux >> 21) & 127], r1[2], r1[3]);
+    return float2(d * (0.5f + float(aux >> 28)) * 0.5f);
+  }
+};
+
+template <>
+struct KqExtC32<KqIq3_sExt> {
+  MLX_MTL_CONST bool ok = true;
+  static METAL_FUNC float2 deq_group32s(
+      const device uint8_t* block,
+      short ib32,
+      thread float4x4& r0,
+      thread float4x4& r1,
+      const threadgroup uint8_t* luts) {
+    const threadgroup uint32_t* grid =
+        reinterpret_cast<const threadgroup uint32_t*>(luts);
+    const float d = float(*(const device half*)block);
+    const device ushort* qp =
+        (const device ushort*)(block + KQ_IQ3_S_QS_OFFSET + ib32 * 8);
+    const device ushort* sp =
+        (const device ushort*)(block + KQ_IQ3_S_SIGNS_OFFSET + ib32 * 4);
+    const uint qhb = block[KQ_IQ3_S_QH_OFFSET + ib32];
+    const uint sc =
+        (block[KQ_IQ3_S_SCALES_OFFSET + ib32 / 2] >> (4 * (ib32 & 1))) & 0xf;
+    const uint s01 = sp[0];
+    const uint s23 = sp[1];
+    const uint q01 = qp[0];
+    const uint q23 = qp[1];
+    const uint q45 = qp[2];
+    const uint q67 = qp[3];
+    // bit i of qh is bit 8 of grid index i
+    kq_c32_u32_idx(
+        grid,
+        (q01 & 0xFF) | ((qhb << 8) & 256),
+        (q01 >> 8) | ((qhb << 7) & 256),
+        s01,
+        r0[0],
+        r0[1]);
+    kq_c32_u32_idx(
+        grid,
+        (q23 & 0xFF) | ((qhb << 6) & 256),
+        (q23 >> 8) | ((qhb << 5) & 256),
+        s01 >> 8,
+        r0[2],
+        r0[3]);
+    kq_c32_u32_idx(
+        grid,
+        (q45 & 0xFF) | ((qhb << 4) & 256),
+        (q45 >> 8) | ((qhb << 3) & 256),
+        s23,
+        r1[0],
+        r1[1]);
+    kq_c32_u32_idx(
+        grid,
+        (q67 & 0xFF) | ((qhb << 2) & 256),
+        (q67 >> 8) | ((qhb << 1) & 256),
+        s23 >> 8,
+        r1[2],
+        r1[3]);
+    return float2(d * float(1 + 2 * sc));
+  }
+};
+
+// iq1_s and iq1_m return grid + delta, unscaled.
+template <>
+struct KqExtC32<KqIq1_sExt> {
+  MLX_MTL_CONST bool ok = true;
+  static METAL_FUNC float2 deq_group32s(
+      const device uint8_t* block,
+      short ib,
+      thread float4x4& r0,
+      thread float4x4& r1,
+      const threadgroup uint8_t*) {
+    const float d = float(*(const device half*)block);
+    const uint qh =
+        *(const device ushort*)(block + KQ_IQ1_S_QH_OFFSET + ib * 2);
+    const device ushort* qp =
+        (const device ushort*)(block + KQ_IQ1_S_QS_OFFSET + ib * 4);
+    const uint q01 = qp[0];
+    const uint q23 = qp[1];
+    const float delta = (qh & 0x8000) ? -0.125f : 0.125f;
+    kq_c32_i8_delta(
+        iq1s_grid[(q01 & 0xFF) | ((qh << 8) & 0x700)], delta, r0[0], r0[1]);
+    kq_c32_i8_delta(
+        iq1s_grid[(q01 >> 8) | ((qh << 5) & 0x700)], delta, r0[2], r0[3]);
+    kq_c32_i8_delta(
+        iq1s_grid[(q23 & 0xFF) | ((qh << 2) & 0x700)], delta, r1[0], r1[1]);
+    kq_c32_i8_delta(
+        iq1s_grid[(q23 >> 8) | ((qh >> 1) & 0x700)], delta, r1[2], r1[3]);
+    return float2(d * float(2 * int((qh >> 12) & 7) + 1));
+  }
+};
+
+template <>
+struct KqExtC32<KqIq1_mExt> {
+  MLX_MTL_CONST bool ok = true;
+  static METAL_FUNC float2 deq_group32s(
+      const device uint8_t* block,
+      short ib,
+      thread float4x4& r0,
+      thread float4x4& r1,
+      const threadgroup uint8_t*) {
+    const device ushort* scw =
+        (const device ushort*)(block + KQ_IQ1_M_SCALES_OFFSET);
+    const ushort su = (scw[0] >> 12) | ((scw[1] >> 8) & 0x00f0) |
+        ((scw[2] >> 4) & 0x0f00) | (scw[3] & 0xf000);
+    const float d = float(as_type<half>(su));
+    const uint w = scw[ib / 2];
+    const int sh = 6 * (ib & 1);
+    const device ushort* qp =
+        (const device ushort*)(block + KQ_IQ1_M_QS_OFFSET + ib * 4);
+    const uint q01 = qp[0];
+    const uint q23 = qp[1];
+    const uint qh =
+        *(const device ushort*)(block + KQ_IQ1_M_QH_OFFSET + ib * 2);
+    kq_c32_i8_delta(
+        iq1s_grid[(q01 & 0xFF) | ((qh << 8) & 0x700)],
+        (qh & 0x08) ? -0.125f : 0.125f,
+        r0[0],
+        r0[1]);
+    kq_c32_i8_delta(
+        iq1s_grid[(q01 >> 8) | ((qh << 4) & 0x700)],
+        (qh & 0x80) ? -0.125f : 0.125f,
+        r0[2],
+        r0[3]);
+    kq_c32_i8_delta(
+        iq1s_grid[(q23 & 0xFF) | (qh & 0x700)],
+        (qh & 0x0800) ? -0.125f : 0.125f,
+        r1[0],
+        r1[1]);
+    kq_c32_i8_delta(
+        iq1s_grid[(q23 >> 8) | ((qh >> 4) & 0x700)],
+        (qh & 0x8000) ? -0.125f : 0.125f,
+        r1[2],
+        r1[3]);
+    return d *
+        float2(float(2 * int((w >> sh) & 7) + 1),
+               float(2 * int((w >> (sh + 3)) & 7) + 1));
   }
 };
 

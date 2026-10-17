@@ -1884,6 +1884,53 @@ static bool qmv_splitk(
   return true;
 }
 
+// Dispatches the M = 1 mat-vec of a grid codec through the c32 row step of
+// the MoE gathers (kq_<codec>_qmv_c32). KQ_QMV_C32, read per call: 0 keeps
+// the qmv kernels, 1 takes c32 at this GPU's width, 8 or 16 at that width;
+// unset follows qmv_c32_on. Returns false, dispatching nothing, when the
+// codec, shape or pipeline does not fit.
+static bool qmv_c32(
+    const array& x,
+    const array& w,
+    array& out,
+    int N,
+    int K,
+    Device& d,
+    const Stream& s,
+    const std::string& kquant_type) {
+  const int env = kq_env_int("KQ_QMV_C32", -1);
+  static const std::string arch = d.get_architecture();
+  if (env == 0 || (env == -1 && !qmv_c32_on(arch, kquant_type)) ||
+      !codec_has_c32(kquant_type)) {
+    return false;
+  }
+  const int nx = env == 8 || env == 16 ? env : moe_c32_nx(arch);
+  const int rps = 32 / nx;
+  int sg = kquant_type == "iq2_xs" ? 8 : 2;
+  while (sg > 1 && N % (sg * rps) != 0) {
+    sg /= 2;
+  }
+  if (N % (sg * rps) != 0 || K % 256 != 0) {
+    return false;
+  }
+  const std::string kname = "kq_" + kquant_type + "_qmv_c32" +
+      (nx == 16 ? "_nx16_" : "_") + kq_type_string(x.dtype());
+  auto kernel = kq_get_kernel(d, kname);
+  if (int(kernel->maxTotalThreadsPerThreadgroup()) < 32 * sg) {
+    return false;
+  }
+  const MTL::Size grid_dims(N / (sg * rps), 1, 1);
+  kq_log_qmm(kname, 1, N, K, grid_dims, x);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(w, 0);
+  ce.set_input_array(x, 1);
+  ce.set_output_array(out, 2);
+  ce.set_bytes(K, 3);
+  ce.dispatch_threadgroups(grid_dims, MTL::Size(32, sg, 1));
+  return true;
+}
+
 // Matrix-times-vector quantized kernel dispatch (no biases).
 void qmv(
     const array& x,
@@ -1918,6 +1965,10 @@ void qmv(
   if (M == 1 && B == 1 && splitk_on && qmv_fine_env == -1 &&
       qmv_splitk(
           x, w, scales, out, group_size, bits, N, K, d, s, kquant_type)) {
+    return;
+  }
+  if (M == 1 && B == 1 && qmv_fine_env == -1 &&
+      qmv_c32(x, w, out, N, K, d, s, kquant_type)) {
     return;
   }
   const bool fine_ok = B == 1 && codec_has_qmv_fine(kquant_type);

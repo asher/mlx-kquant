@@ -94,7 +94,9 @@ inline int kq_moe_pick_nx(int64_t rows, int K, bool wide_ok) {
 // q2_k / q3_k (scale unpack heavy) lose 8-14%, q6_k / q8_0 are flat, the
 // iq2 grid codecs and q5_k lose in the chained regime, and every codec is
 // flat-to-negative at t >= 4 or K < 2048, so those keep the slot-parallel
-// form. KQ_MOE_NX still forces a width.
+// form. Where c32 is on, iq3_xxs at t = 1 takes the c32 slot-parallel
+// kernel instead (M5 Max: 7-9% less time than this pick). KQ_MOE_NX still
+// forces a width.
 inline bool kq_moe_mix_ns_wide(const std::string& codec, int T, int K) {
   if (T > 2 || K < 2048) {
     return false;
@@ -346,20 +348,47 @@ inline int kq_moe_pick_sg_h(int N, int nx) {
   return sg;
 }
 
-// 32-weight decode step ("_c32" kernels, KqExtC32) for the iq2_s uniform
-// gathers: by default at t = 1 only. KQ_MOE_C32=0 forces the 16-weight
-// kernels and =1 the c32 kernels at every t. Read per call. The c32 kernels
-// have NX 8 and 16 forms, so a forced KQ_MOE_NX=32 keeps the 16-weight
-// kernels.
+// Codecs with a 32-weight decode step (KqExtC32): the grid codecs.
+inline bool kq_moe_has_c32(const std::string& codec) {
+  return codec == "iq2_s" || codec == "iq2_xxs" || codec == "iq2_xs" ||
+      codec == "iq3_xxs" || codec == "iq3_s" || codec == "iq1_s" ||
+      codec == "iq1_m";
+}
+
+// 32-weight decode step ("_c32" kernels, KqExtC32) for the grid-codec
+// gathers: by default at t = 1, where this GPU's class takes it for the
+// codec (moe_c32_on). KQ_MOE_C32=0 forces the 16-weight kernels and =1 the
+// c32 kernels at every t. Read per call. The c32 kernels have NX 8 and 16
+// forms, so a forced KQ_MOE_NX=32 keeps the 16-weight kernels. The dedupe
+// and half-dot forms have no c32 kernels and keep the 16-weight step.
 inline bool kq_moe_c32(const std::string& codec, int T) {
-  if (codec != "iq2_s" || kq_moe_nx_env() == 32) {
+  if (!kq_moe_has_c32(codec) || kq_moe_nx_env() == 32) {
     return false;
   }
   const int v = kq_env_flag("KQ_MOE_C32", -1);
-  return v == -1 ? T == 1 : v != 0;
+  if (v != -1) {
+    return v != 0;
+  }
+#ifdef _METAL_
+  static const std::string arch =
+      mx::metal::device(mx::Device::gpu).get_architecture();
+  return T == 1 && moe_c32_on(arch, codec);
+#else
+  return false;
+#endif
 }
 
-// A forced KQ_MOE_NX of 8 or 16, else this GPU's class width (moe_c32_nx).
+// A shared expert in the routed codec or an upcast q5_k, q6_k or q8_0: the
+// pairs with c32 shexp and mix kernels.
+inline bool kq_moe_c32_shexp_ok(
+    const std::string& codec,
+    const std::string& shexp) {
+  return shexp == codec || shexp == "q5_k" || shexp == "q6_k" ||
+      shexp == "q8_0";
+}
+
+// K-lanes per row of the c32 GLU gathers: a forced KQ_MOE_NX of 8 or 16,
+// else this GPU's class width (moe_c32_nx).
 inline int kq_moe_c32_nx() {
   const int v = kq_moe_nx_env();
   if (v == 8 || v == 16) {
@@ -372,6 +401,15 @@ inline int kq_moe_c32_nx() {
 #else
   return 8;
 #endif
+}
+
+// K-lanes per row of the c32 down gathers (plain, mix and mix_ns): a forced
+// KQ_MOE_NX of 8 or 16, else 8. On an M5 Max the c32 down gathers of the
+// grid codecs took 0 to 9% less time at 8 than at 16 (E=32..64, top 8,
+// K=1536 and 4096).
+inline int kq_moe_c32_down_nx() {
+  const int v = kq_moe_nx_env();
+  return v == 16 ? 16 : 8;
 }
 
 inline bool kq_gather_fine(int64_t coarse_tgs) {
@@ -657,7 +695,7 @@ void KQuantGatherQMVKQ::eval_gpu(
   const bool use_half = !biased && kq_moe_half(kquant_type_, K);
   const bool c32 = !biased && !use_half && kq_moe_c32(kquant_type_, T);
   const int nx = use_half ? 8
-      : c32               ? kq_moe_c32_nx()
+      : c32               ? kq_moe_c32_down_nx()
                           : kq_moe_pick_nx((int64_t)N * R * T, K, false);
   const std::string stem = kq_gather_stem_nx(kquant_type_, K, nx);
   // Fine tiling is instantiated only on the tuned q6_k/q8_0 kernels; the Ext
@@ -779,8 +817,10 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
       (shexp_type_ == kquant_type_ || shexp_type_ == "q5_k" ||
        shexp_type_ == "q6_k" || shexp_type_ == "q8_0");
   const bool dd = !use_half && kq_moe_dedup(T, KQ_DD_MAX_T);
-  const int nx =
-      use_half ? 8 : kq_moe_pick_nx((int64_t)N * (R + 1) * T, K, true);
+  const bool c32 = !use_half && !dd && kq_moe_c32(kquant_type_, T);
+  const int nx = use_half ? 8
+      : c32               ? kq_moe_c32_nx()
+                          : kq_moe_pick_nx((int64_t)N * (R + 1) * T, K, true);
   std::string stem = shexp_type_ == kquant_type_
       ? kq_gather_stem_nx(kquant_type_, K, nx)
       : kquant_type_ + "_sx_" + shexp_type_;
@@ -791,8 +831,8 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   // time when the limit is positive (kq_glu_epilogue).
   const std::string act = act_ == "silu_limit" ? "silu" : act_;
   std::string kname = "kq_" + stem + "_moe_glu_gather_shexp_" +
-      (use_half ? "h_" : "") + (dd ? "dd_" : "") + act + kq_nx_suffix(nx) +
-      "_" + kq_type_string(x.dtype());
+      (use_half ? "h_" : "") + (dd ? "dd_" : "") + act + (c32 ? "_c32" : "") +
+      kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
   auto kernel = kq_get_kernel(d, kname);
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
@@ -854,14 +894,20 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   const std::string sp_stem = shexp_type_ == kquant_type_
       ? kq_gather_stem(kquant_type_, K)
       : kquant_type_ + "_sx_" + shexp_type_;
+  // c32 serves the loop and slot-parallel forms; the dedupe form keeps the
+  // 16-weight step.
+  const bool c32 = !use_half && kq_moe_c32(kquant_type_, T) &&
+      kq_moe_c32_shexp_ok(kquant_type_, shexp_type_);
+  const int nx_one = c32
+      ? kq_moe_c32_down_nx()
+      : kq_moe_pick_nx(
+            (int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, T, K));
   const bool sp_ok = !use_half && sp_stem != "q6_k" && sp_stem != "q8_0" &&
-      kq_moe_pick_nx(
-          (int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, T, K)) == 8 &&
-      kq_moe_sp((int64_t)T * (N / 8), S);
+      nx_one == 8 && kq_moe_sp((int64_t)T * (N / 8), S);
   const int form = kq_moe_mix_form(sp_ok, dd_ok);
   if (form == KQ_MIX_SP) {
-    const std::string kname =
-        "kq_" + sp_stem + "_gather_qmv_mix_sp_" + kq_type_string(x.dtype());
+    const std::string kname = "kq_" + sp_stem + "_gather_qmv_mix_sp_" +
+        (c32 ? "c32_" : "") + kq_type_string(x.dtype());
     auto kernel = kq_get_kernel(d, kname);
     // 64 * S threads must fit the pipeline; the loop kernel serves the
     // call when they do not.
@@ -917,8 +963,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
         kq_moe_pick_sg(kquant_type_, N, nx));
     return;
   }
-  int nx =
-      kq_moe_pick_nx((int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, T, K));
+  int nx = nx_one;
   if (use_half && nx > 16) {
     nx = 16;
   }
@@ -929,8 +974,8 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   const bool tuned = stem == "q6_k" || stem == "q8_0";
   const bool fine = tuned && nx == 8 && kq_gather_fine((int64_t)(N / 8) * T);
   std::string kname = "kq_" + stem + "_gather_qmv_mix" +
-      (use_half ? "_h" : "") + (fine ? "_fine" : kq_nx_suffix(nx)) + "_" +
-      kq_type_string(x.dtype());
+      (use_half ? "_h" : "") + (c32 ? "_c32" : "") +
+      (fine ? "_fine" : kq_nx_suffix(nx)) + "_" + kq_type_string(x.dtype());
   auto kernel = kq_get_kernel(d, kname);
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
@@ -992,13 +1037,21 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   // dropped. Decode-scale launches route to the slot-parallel variant
   // unless the codec widens (kq_moe_mix_ns_wide).
   const bool dd_ok = S <= 16 && kq_moe_dedup(T, KQ_DD_MAX_T);
+  const bool c32_ok = kq_moe_c32(kquant_type_, T);
   const bool sp_ok =
-      kq_moe_pick_nx(
-          (int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, T, K)) == 8 &&
+      (c32_ok
+           ? kq_moe_c32_down_nx()
+           : kq_moe_pick_nx(
+                 (int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, T, K))) ==
+          8 &&
       kq_moe_sp((int64_t)T * (N / 8), S);
   const bool dd = kq_moe_mix_form(sp_ok, dd_ok) == KQ_MIX_DD;
-  const int nx = kq_moe_pick_nx(
-      (int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, dd ? 2 : T, K));
+  // c32 serves the loop and slot-parallel forms, not the dedupe form.
+  const bool c32 = c32_ok && !dd;
+  const int nx = c32
+      ? kq_moe_c32_down_nx()
+      : kq_moe_pick_nx(
+            (int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, dd ? 2 : T, K));
   if (dd) {
     kq_gather_qmv_pair_gpu(
         d,
@@ -1022,7 +1075,8 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
         kq_moe_mix_form(true, false) == KQ_MIX_SP;
     auto ns_name = [&](bool slot_parallel) {
       return "kq_" + kquant_type_ + "_gather_qmv_mix_ns" +
-          (slot_parallel ? "_sp" : kq_nx_suffix(nx)) + "_" +
+          (slot_parallel ? "_sp" : "") + (c32 ? "_c32" : "") +
+          (slot_parallel ? "" : kq_nx_suffix(nx)) + "_" +
           kq_type_string(x.dtype());
     };
     std::string kname = ns_name(sp);
@@ -1329,13 +1383,12 @@ std::vector<mx::Shape> KQuantGatherQMVMixBias::output_shapes(
   return {{inputs[4].shape(0), inputs[0].shape(1)}};
 }
 
-// applegpu_g<gen><suffix>, two digit gen, a lower case suffix other than p:
-// NX 16 from gen 17 (M5), where it beat NX 8 by 2 to 6% on a Muse Spark MoE
-// block (M5 Max, E=256, top 8, N=K=4096). NX 8 elsewhere.
-int moe_c32_nx(const std::string& arch) {
+// The generation of a Mac GPU, from applegpu_g<gen><suffix> with a two digit
+// gen and a lower case suffix other than p; 0 for a phone or anything else.
+static int moe_mac_gpu_gen(const std::string& arch) {
   const std::string head = "applegpu_g";
   if (arch.size() != head.size() + 3 || arch.compare(0, head.size(), head)) {
-    return 8;
+    return 0;
   }
   const char d0 = arch[head.size()];
   const char d1 = arch[head.size() + 1];
@@ -1343,10 +1396,35 @@ int moe_c32_nx(const std::string& arch) {
   if (!std::isdigit(static_cast<unsigned char>(d0)) ||
       !std::isdigit(static_cast<unsigned char>(d1)) ||
       !std::islower(static_cast<unsigned char>(suffix)) || suffix == 'p') {
-    return 8;
+    return 0;
   }
-  const int gen = (d0 - '0') * 10 + (d1 - '0');
-  return gen >= 17 ? 16 : 8;
+  return (d0 - '0') * 10 + (d1 - '0');
+}
+
+// K-lanes per row of the c32 GLU gathers: 16 from gen 17 (M5), where it
+// beat 8 by 2 to 6% on a Muse Spark MoE block (M5 Max, E=256, top 8,
+// N=K=4096). 8 elsewhere.
+int moe_c32_nx(const std::string& arch) {
+  return moe_mac_gpu_gen(arch) >= 17 ? 16 : 8;
+}
+
+// iq2_s on every GPU (M3 Max and M5 Max measured). The other grid codecs
+// from gen 17 (M5), measured on an M5 Max only: at E=32, top 8, N=K=4096
+// the 16-weight gathers took 1 to 23% longer (iq1_s most, iq3_xxs least).
+bool moe_c32_on(const std::string& arch, const std::string& codec) {
+  return codec == "iq2_s" ||
+      (kq_moe_has_c32(codec) && moe_mac_gpu_gen(arch) >= 17);
+}
+
+bool codec_has_c32(const std::string& codec) {
+  return kq_moe_has_c32(codec);
+}
+
+// The M = 1 quantized_matmul of a grid codec through the c32 row step: from
+// gen 17 (M5), measured on an M5 Max only. At K=4096, N=14336 the qmv
+// kernels took 2 to 21% longer (iq2_s and iq3_s most, iq2_xxs least).
+bool qmv_c32_on(const std::string& arch, const std::string& codec) {
+  return moe_mac_gpu_gen(arch) >= 17 && kq_moe_has_c32(codec);
 }
 
 // Codecs with the fused kq GLU/gather kernels wired (kq_moe_glu_kq.h):

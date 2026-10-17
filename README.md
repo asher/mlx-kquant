@@ -303,12 +303,16 @@ All optional; the defaults are right for normal use.
   shared-expert slots stay on the float path). Read per call. Default off: the outputs differ from
   the float kernels at half rounding level, and an activation past 65504 in magnitude turns to inf.
   A/B lever.
-- `KQ_MOE_C32` - on Metal, the 32-weight decode step of the iq2_s fused MoE gate/up and down
-  gathers. By default it runs at one activation row on every GPU. `0` restores the 16-weight
-  kernels, and `1` also runs it at wider rows where the dedupe kernels do not apply. It runs 16
-  K-lanes per row on M5 and later GPUs and 8 on earlier ones. `KQ_MOE_NX=8` or `16` forces a
-  width, and `KQ_MOE_NX=32` keeps the 16-weight kernels. Read per call. The
-  outputs differ from the 16-weight kernels only in summation order. A/B lever.
+- `KQ_MOE_C32` - on Metal, the 32-weight decode step of the grid-codec (iq1, iq2 and iq3) fused
+  MoE gathers at one activation row. By default it runs for every grid codec on M5 and later GPUs
+  and for iq2_s on earlier ones. `0` restores the 16-weight kernels, and `1` runs it for every grid
+  codec on any GPU, also at wider rows where the dedupe kernels do not apply. The gate/up gathers
+  run 16 K-lanes per row on M5 and later GPUs and 8 on earlier ones, and the down gathers run 8.
+  `KQ_MOE_NX=8` or `16` forces a width, and `KQ_MOE_NX=32` keeps the 16-weight kernels. Read per
+  call. The outputs differ from the 16-weight kernels only in summation order. A/B lever.
+- `KQ_QMV_C32` - on Metal, the same 32-weight step for the one-row `quantized_matmul` of a grid
+  codec, on by default on M5 and later GPUs. `0` restores the per-row kernels, `1` runs it on any
+  GPU, and `8` or `16` sets the K-lanes per row. Read per call. A/B lever.
 
 - `KQ_SDPA_IDX_NAX=0` - run `sdpa_fa_indexed` on its simdgroup kernel even where the NAX tile
   kernel is available. Read once per process. The simdgroup kernel matches `sdpa_fa_verify` over

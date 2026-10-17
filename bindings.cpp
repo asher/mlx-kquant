@@ -131,8 +131,24 @@ NB_MODULE(_ext, m) {
       "_moe_c32_nx",
       &mlx_kquant::moe_c32_nx,
       "arch"_a,
-      "The K-lanes per output row (8 or 16) of the iq2_s c32 MoE gathers "
+      "The K-lanes per output row (8 or 16) of the c32 MoE GLU gathers "
       "for an architecture string, unless KQ_MOE_NX forces one.");
+
+  m.def(
+      "_moe_c32_on",
+      &mlx_kquant::moe_c32_on,
+      "arch"_a,
+      "codec"_a,
+      "Whether the MoE gathers of a codec take the c32 kernels at t = 1 by "
+      "default for an architecture string, unless KQ_MOE_C32 forces it.");
+
+  m.def(
+      "_qmv_c32_on",
+      &mlx_kquant::qmv_c32_on,
+      "arch"_a,
+      "codec"_a,
+      "Whether the one-row quantized_matmul of a codec takes the c32 kernel "
+      "by default for an architecture string, unless KQ_QMV_C32 forces it.");
 
   m.def(
       "_dequantize_route_takes",

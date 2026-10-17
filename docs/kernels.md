@@ -348,6 +348,10 @@ Tuning levers (defaults are right for normal use):
 - `KQ_QMV_FINE` - tiling of the per-row mat-vec. `1` forces two output rows per threadgroup, `0`
   forces the coarse tiling, and unset takes the fine tiling at one activation row up to the
   per-codec N ceiling that `kq.qmv_fine_max_n(codec)` reports. Read live per call.
+- `KQ_QMV_C32` - the c32 mat-vec of the grid codecs at one activation row (see the fused MoE
+  section). `0` restores the per-row kernels and `1` runs c32 on any GPU. `8` or `16` runs it at
+  that many K-lanes per row. Unset takes it on M5 and later GPUs. A set `KQ_QMV_FINE` keeps the
+  per-row kernels. Read live per call.
 - `KQ_QMV_SPLITK` - the `q6_k` and `q8_0` split-K kernels for one activation row. `0` restores
   the per-row kernels, as does a set `KQ_QMV_FINE`, so a tiling A/B keeps measuring the tiling it
   names. A lever that forces another route at one row, such as `KQ_VERIFY_NAX=1`, takes
@@ -1038,23 +1042,53 @@ The GLU activation is selected per model: plain SwiGLU/GELU, the clamped `silu_l
 `swiglu_clamp` (gpt-oss clamped SwiGLU: biases added, sigmoid slope `alpha`, and a `(u + 1)` linear
 term; requires the expert biases and is instantiated for `mxfp4`/`nvfp4` only).
 
-At one activation row the iq2_s gate/up and down gathers decode 32 weights per lane step, one
-32-weight group of a block, where the other codecs decode 16. The block scale, the high-bit byte
-and the scale byte then load once per 32 weights, and the grid indices and sign bytes load as
-16-bit pairs. Each lane covers one 32-weight group per step, with 16 K-lanes per output row on
-M5 and later GPUs and 8 on earlier ones. `KQ_MOE_NX=8` or `16` forces a width. Outputs differ from
-the 16-weight kernels only in summation order.
-`KQ_MOE_C32=0` restores the 16-weight kernels. `KQ_MOE_C32=1` also runs the 32-weight kernels at
-wider rows where the dedupe kernels do not apply. A forced `KQ_MOE_NX=32` keeps the 16-weight
+At one activation row the grid codecs (iq1_s, iq1_m, iq2_xxs, iq2_xs, iq2_s, iq3_xxs and iq3_s)
+decode 32 weights per lane step, one 32-weight group of a block, where the other codecs decode 16.
+The block scale, the high-bit bytes and the scale bytes then load once per 32 weights, and the grid
+indices and sign bytes load as 16-bit pairs. Every gather takes this step: gate/up, the shared-expert
+GLU, the plain down and both score-mixed downs (`gather_qmv_mix_kq` with the shared expert in the
+routed codec or in q5_k, q6_k or q8_0, and `gather_qmv_mix_ns_kq`). The dedupe and half-dot forms
+keep the 16-weight step. Outputs differ from the 16-weight kernels only in summation order.
+
+| GPU | Codecs on by default | GLU K-lanes per row | Down K-lanes per row |
+|---|---|---|---|
+| M5 and later | all seven | 16 | 8 |
+| Earlier | iq2_s | 8 | 8 |
+
+`kq._ext._moe_c32_on(arch, codec)` and `kq._ext._moe_c32_nx(arch)` give the defaults for an
+architecture string. `KQ_MOE_C32=0` restores the 16-weight kernels, and `KQ_MOE_C32=1` runs the
+32-weight kernels for every grid codec, on any GPU and at wider rows where the dedupe kernels do not
+apply. `KQ_MOE_NX=8` or `16` forces a width, and a forced `KQ_MOE_NX=32` keeps the 16-weight
 kernels.
+
+The one-row `quantized_matmul` of a grid codec runs the same row step (`kq_<codec>_qmv_c32`), on
+M5 and later GPUs by default, at the GLU width. `KQ_QMV_C32` controls it (see the mat-vec levers).
 
 On M3 Max at E=256, N=K=4096 and top 8, back to back, the gate/up gather took 0.303 ms against
 0.340 ms (-11.1%), and the down gather took 0.166 ms against 0.191 ms (-12.5%). In a synced decode
 step of eight Muse Spark UD-IQ2_S layers, the MoE blocks took 8.3% less time. With the `q8_0`
 split-K kernel, the step went from 1.414 to 1.335 ms per layer (-5.6%).
 
-On M5 Max the 16-lane form is faster. Back to back at the same shapes, a MoE block replica with
-both gathers at 16 K-lanes took 2.3% to 5.2% less time than at 8, in both arm orders.
+On M5 Max the GLU gathers are faster at 16 lanes. Back to back at the same shapes, a MoE block
+replica with both gathers at 16 K-lanes took 2.3% to 5.2% less time than at 8, in both arm orders. Alone, the
+down gathers took up to 9% less time at 8 lanes than at 16.
+
+On M5 Max at E=32 and 64, top 8, N=4096 and 7168, expert widths 1536 to 4096, the 16-weight gathers
+took longer than the 32-weight ones, in every family:
+
+| Codec | Longer with the 16-weight step |
+|---|---|
+| iq1_s | 15 to 23% |
+| iq1_m | 12 to 19% |
+| iq3_s | 10 to 19% |
+| iq2_s | 6 to 13% |
+| iq2_xxs | 2 to 8% |
+| iq2_xs | 0 to 4% |
+| iq3_xxs | 0 to 13% (gate/up even) |
+
+The one-row `quantized_matmul` per-row kernels took 2 to 14% longer than `qmv_c32` at K=2048 and
+N=512, 9 to 31% longer at K=4096 and N=14336, and 15 to 35% longer at K=14336 and N=4096.
+
 
 The grid lookup is the next lever. With the grid read removed (wrong output), the 32-weight
 gathers took about 25% less time, and 37% less than the 16-weight gathers. That bounds the gain of

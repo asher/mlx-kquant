@@ -84,10 +84,22 @@ bool dequantize_route_takes(
     int N,
     int K);
 
-// The K-lanes per output row (8 or 16) of the iq2_s c32 MoE gathers on a GPU
+// The K-lanes per output row (8 or 16) of the c32 MoE GLU gathers on a GPU
 // with this architecture string (as get_architecture gives it), when
 // KQ_MOE_NX does not force one.
 int moe_c32_nx(const std::string& arch);
+
+// Whether this codec has the 32-weight decode step of the c32 kernels (the
+// grid codecs).
+bool codec_has_c32(const std::string& codec);
+
+// Whether the MoE gathers of this codec take the c32 kernels at t = 1 by
+// default on a GPU with this architecture string.
+bool moe_c32_on(const std::string& arch, const std::string& codec);
+
+// Whether the one-row quantized_matmul of this codec takes the c32 kernel by
+// default on a GPU with this architecture string.
+bool qmv_c32_on(const std::string& arch, const std::string& codec);
 
 // Every kernel name the split-K dispatchers can build (qmm_splitk,
 // qmm_nax_splitk, verify_mma, verify_nax and their fold), for the kernel
