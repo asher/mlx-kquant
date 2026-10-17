@@ -1098,12 +1098,39 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG, bool C32 = false>
   }
 }
 
+// Dense one-row mat-vec through the c32 row step: the M = 1 quantized_matmul
+// of the grid codecs. w is (N, row bytes), x one row of K. Dispatch: group
+// (32, sg, 1), grid (N / (sg * 32 / NX), 1, 1).
+template <typename T, typename Codec, int NX>
+[[kernel]] void kq_ext_qmv_c32(
+    const device uint8_t* w [[buffer(0)]],
+    const device T* x [[buffer(1)]],
+    device T* out [[buffer(2)]],
+    const constant int& K [[buffer(3)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int RPS = 32 / NX;
+  const short tx = short(simd_lid % NX);
+  const short ty = short(simd_lid / NX);
+  const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
+
+  KQ_EXT_STAGE_LUTS(Codec, kq_luts)
+  const float r = kq_ext_reduce<NX>(kq_ext_row_partial<T, Codec, NX, true>(
+      w, x, (int64_t)out_row, K, tx, kq_luts));
+  if (tx == 0) {
+    out[out_row] = static_cast<T>(r);
+  }
+}
+
 template <
     typename T,
     typename Codec,
     typename SCodec,
     int ACT,
-    int NX = KQ_EXT_NXPSG>
+    int NX = KQ_EXT_NXPSG,
+    bool C32 = false>
 [[kernel]] void kq_ext_moe_glu_gather_shexp(
     const device uint8_t* gw [[buffer(0)]],
     const device uint8_t* uw [[buffer(1)]],
@@ -1134,11 +1161,11 @@ template <
   KQ_EXT_STAGE_LUTS(SCodec, kq_sluts)
   float2 gu;
   if (shared_slot) {
-    gu = kq_ext_glu_row_partial<T, SCodec, NX>(
+    gu = kq_ext_glu_row_partial<T, SCodec, NX, C32>(
         sgw, suw, x, (int64_t)out_row, K, tx, kq_sluts);
   } else {
     const int expert = int(indices[tid.z * n_route + tid.y]);
-    gu = kq_ext_glu_row_partial<T, Codec, NX>(
+    gu = kq_ext_glu_row_partial<T, Codec, NX, C32>(
         gw, uw, x, (int64_t)expert * N + out_row, K, tx, kq_luts);
   }
   const float g = kq_ext_reduce<NX>(gu.x);
@@ -1208,7 +1235,7 @@ template <
 // No-shared-expert mix (gemma-style MoE: plain score-weighted sum over the
 // routed slots): indices and scores are both [T, S], every slot gathers from
 // the expert stack.
-template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
+template <typename T, typename Codec, int NX = KQ_EXT_NXPSG, bool C32 = false>
 [[kernel]] void kq_ext_gather_qmv_mix_ns(
     const device uint8_t* w [[buffer(0)]],
     const device T* h [[buffer(1)]],
@@ -1233,7 +1260,7 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
     const int expert = int(indices[tid.z * S + slot]);
     const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
     result += scores[tid.z * S + slot] *
-        kq_ext_row_partial<T, Codec, NX>(
+        kq_ext_row_partial<T, Codec, NX, C32>(
                   w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
   }
   result = kq_ext_reduce<NX>(result);
@@ -1258,7 +1285,7 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
 // S <= KQ_MOE_SP_MAX_S.
 #define KQ_MOE_SP_MAX_S 16
 
-template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
+template <typename T, typename Codec, int NX = KQ_EXT_NXPSG, bool C32 = false>
 [[kernel]] void kq_ext_gather_qmv_mix_ns_sp(
     const device uint8_t* w [[buffer(0)]],
     const device T* h [[buffer(1)]],
@@ -1292,7 +1319,7 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
 
   const int expert = int(indices[tid.z * S + slot]);
   const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
-  parts[lrow][tx][slot] = kq_ext_row_partial<T, Codec, NX>(
+  parts[lrow][tx][slot] = kq_ext_row_partial<T, Codec, NX, C32>(
       w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1308,7 +1335,12 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
   }
 }
 
-template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
+template <
+    typename T,
+    typename Codec,
+    typename SCodec,
+    int NX = KQ_EXT_NXPSG,
+    bool C32 = false>
 [[kernel]] void kq_ext_gather_qmv_mix(
     const device uint8_t* w [[buffer(0)]],
     const device uint8_t* sw [[buffer(1)]],
@@ -1336,14 +1368,14 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
     const int expert = int(indices[tid.z * (S - 1) + slot]);
     const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
     result += scores[tid.z * SC + slot] *
-        kq_ext_row_partial<T, Codec, NX>(
+        kq_ext_row_partial<T, Codec, NX, C32>(
                   w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
   }
   {
     // SC == S - 1: the shared slot's weight is an implicit 1
     const device T* xs = h + ((int64_t)tid.z * S + (S - 1)) * K;
     result += (SC == S ? scores[tid.z * SC + (S - 1)] : 1.0f) *
-        kq_ext_row_partial<T, SCodec, NX>(
+        kq_ext_row_partial<T, SCodec, NX, C32>(
                   sw, xs, (int64_t)out_row, K, tx, kq_sluts);
   }
   result = kq_ext_reduce<NX>(result);
@@ -1358,7 +1390,12 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
 // score chain, so outputs are bit-identical to it. Dispatch: group
 // (32, 2 * S, 1), grid (N / (2 * RPS), 1, T); host gates
 // S <= KQ_MOE_SP_MAX_S.
-template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
+template <
+    typename T,
+    typename Codec,
+    typename SCodec,
+    int NX = KQ_EXT_NXPSG,
+    bool C32 = false>
 [[kernel]] void kq_ext_gather_qmv_mix_sp(
     const device uint8_t* w [[buffer(0)]],
     const device uint8_t* sw [[buffer(1)]],
@@ -1389,10 +1426,10 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
   const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
   if (slot < S - 1) {
     const int expert = int(indices[tid.z * (S - 1) + slot]);
-    parts[lrow][tx][slot] = kq_ext_row_partial<T, Codec, NX>(
+    parts[lrow][tx][slot] = kq_ext_row_partial<T, Codec, NX, C32>(
         w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
   } else {
-    parts[lrow][tx][slot] = kq_ext_row_partial<T, SCodec, NX>(
+    parts[lrow][tx][slot] = kq_ext_row_partial<T, SCodec, NX, C32>(
         sw, xs, (int64_t)out_row, K, tx, kq_sluts);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);

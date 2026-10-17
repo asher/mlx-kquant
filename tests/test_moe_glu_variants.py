@@ -516,85 +516,154 @@ def test_shexp_mix_slot_parallel_matches_dispatch():
         assert (name in r.stderr) == (listed == "1"), (codec, scodec, listed)
 
 
+C32_CODECS = ["iq2_s", "iq2_xxs", "iq2_xs", "iq3_xxs", "iq3_s", "iq1_s", "iq1_m"]
+
 _C32_SNIPPET = r"""
 import sys
 import numpy as np
 import mlx.core as mx
 import mlx_kquant as kq
 
-T, dtype, out_path = int(sys.argv[1]), getattr(mx, sys.argv[2]), sys.argv[3]
+codec, T, dtype = sys.argv[1], int(sys.argv[2]), getattr(mx, sys.argv[3])
+out_path = sys.argv[4]
 rng = np.random.default_rng(31)
 E, N, K, S = 8, 256, 1024, 4
-def wire(e, n, k):
-    w = mx.array((rng.standard_normal((e, n, k)) * 0.1).astype(np.float32))
-    wq, _ = kq.quantize(w, "iq2_s", mx.ones((k,), dtype=mx.float32))
+def wire(shape, c=codec):
+    w = mx.array((rng.standard_normal(shape) * 0.1).astype(np.float32))
+    wq, _ = kq.quantize(w, c, mx.ones((shape[-1],), dtype=mx.float32))
     mx.eval(wq)
     return wq
-gw, uw, dw = wire(E, N, K), wire(E, N, K), wire(E, K, N)
-x = mx.array((rng.standard_normal((T, K)) * 0.05).astype(np.float32)).astype(dtype)
-h = mx.array((rng.standard_normal((T, S, N)) * 0.05).astype(np.float32)).astype(dtype)
+gw, uw, dw = wire((E, N, K)), wire((E, N, K)), wire((E, K, N))
+sg, su, sd = wire((N, K)), wire((N, K)), wire((K, N))
+qg, qu, qd = wire((N, K), "q6_k"), wire((N, K), "q6_k"), wire((K, N), "q6_k")
+def act(shape):
+    a = (rng.standard_normal(shape) * 0.05).astype(np.float32)
+    return mx.array(a).astype(dtype)
+x, h, hs = act((T, K)), act((T, S, N)), act((T, S + 1, N))
 inds = mx.array(rng.integers(0, E, size=(T, S)).astype(np.uint32))
-glu = kq.moe_glu_gather_kq(x, gw, uw, "iq2_s", inds, act="silu")
-qmv = kq.gather_qmv_kq(h, dw, "iq2_s", inds)
-mx.eval(glu, qmv)
-np.savez(out_path, glu=np.array(glu.astype(mx.float32)),
-         qmv=np.array(qmv.astype(mx.float32)))
+sc = mx.array(rng.uniform(0.05, 0.9, size=(T, S)).astype(np.float32))
+sx = {"shexp_kquant_type": "q6_k"}
+out = {
+    "glu": kq.moe_glu_gather_kq(x, gw, uw, codec, inds, act="silu"),
+    "qmv": kq.gather_qmv_kq(h, dw, codec, inds),
+    "mix_ns": kq.gather_qmv_mix_ns_kq(h, dw, codec, inds, sc),
+    "shexp": kq.moe_glu_gather_shexp_kq(x, gw, uw, sg, su, codec, inds),
+    "shexp_sx": kq.moe_glu_gather_shexp_kq(x, gw, uw, qg, qu, codec, inds, **sx),
+    "mix": kq.gather_qmv_mix_kq(hs, dw, sd, codec, inds, sc),
+    "mix_sx": kq.gather_qmv_mix_kq(hs, dw, qd, codec, inds, sc, **sx),
+    "dense": kq.quantized_matmul(
+        x[:1], gw[0], mx.zeros((1,), mx.uint8), codec, transpose=True),
+}
+mx.eval(out)
+np.savez(out_path, **{k: np.array(v.astype(mx.float32)) for k, v in out.items()})
 """
 
 
-def _c32_run(T, dtype, env, tmp_path, arm):
-    f = tmp_path / f"{arm}.npz"
+def _c32_run(codec, T, dtype, env, tmp_path, arm):
+    f = tmp_path / f"{codec}-{arm}.npz"
     r = _run_child(
-        [sys.executable, "-c", _C32_SNIPPET, str(T), dtype, str(f)],
-        {**env, "KQ_MOE_NX_LOG": "1"},
-        f"c32 {arm} T={T} {dtype}",
+        [sys.executable, "-c", _C32_SNIPPET, codec, str(T), dtype, str(f)],
+        {**env, "KQ_MOE_NX_LOG": "1", "KQ_QMM_LOG": "1"},
+        f"c32 {codec} {arm} T={T} {dtype}",
     )
     return np.load(f), r.stderr
 
 
-def _c32_class_suffix():
+def _c32_class(codec):
+    """This GPU's c32 defaults for codec: (MoE on, dense on, GLU suffix)."""
     import mlx.core as mx
-    from mlx_kquant._ext import _moe_c32_nx
+    from mlx_kquant._ext import _moe_c32_nx, _moe_c32_on, _qmv_c32_on
 
-    nx = _moe_c32_nx(mx.device_info().get("architecture", ""))
-    return "" if nx == 8 else f"_nx{nx}"
-
-
-@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-def test_c32_dispatch(dtype, tmp_path):
-    """iq2_s gate/up and down gathers take the 32-weight-step kernels at one
-    row by default, at this GPU class's NX (8, or 16 from M5), or a forced 8
-    or 16. KQ_MOE_C32=0 and a forced KQ_MOE_NX=32 keep the 16-weight kernels.
-    Two rows keep them too unless KQ_MOE_C32=1. The forms differ only in
-    summation order."""
-    sfx = _c32_class_suffix()
-    want_glu = f"kq_iq2_s_moe_glu_gather_silu_c32{sfx}_{dtype}_t"
-    want_qmv = f"kq_iq2_s_gather_qmv_c32{sfx}_{dtype}_t"
-    new, names = _c32_run(1, dtype, {}, tmp_path, "default")
-    assert want_glu in names and want_qmv in names, names
-    old, names = _c32_run(1, dtype, {"KQ_MOE_C32": "0"}, tmp_path, "old")
-    assert "_c32" not in names, names
-    narrow, names = _c32_run(1, dtype, {"KQ_MOE_NX": "8"}, tmp_path, "nx8")
-    assert f"kq_iq2_s_moe_glu_gather_silu_c32_{dtype}_t" in names, names
-    assert f"kq_iq2_s_gather_qmv_c32_{dtype}_t" in names, names
-    wide, names = _c32_run(1, dtype, {"KQ_MOE_NX": "16"}, tmp_path, "nx16")
-    assert "kq_iq2_s_moe_glu_gather_silu_c32_nx16_" in names, names
-    assert "kq_iq2_s_gather_qmv_c32_nx16_" in names, names
-    for key in ("glu", "qmv"):
-        scale = np.abs(old[key]).max()
-        for got in (new, narrow, wide):
-            rel = np.abs(got[key] - old[key]).max() / scale
-            assert rel < 2e-3, (key, rel)
-    _, names = _c32_run(1, dtype, {"KQ_MOE_NX": "32"}, tmp_path, "nx32")
-    assert "_c32" not in names, names
-    assert "kq_iq2_s_moe_glu_gather_silu_nx32_" in names, names
-    assert "kq_iq2_s_gather_qmv_nx32_" in names, names
-    _, names = _c32_run(2, dtype, {}, tmp_path, "t2")
-    assert "_c32" not in names, names
-    _, names = _c32_run(
-        2, dtype, {"KQ_MOE_C32": "1", "KQ_MOE_DEDUP": "0"}, tmp_path, "t2c32"
+    arch = mx.device_info().get("architecture", "")
+    nx = _moe_c32_nx(arch)
+    return (
+        _moe_c32_on(arch, codec),
+        _qmv_c32_on(arch, codec),
+        "" if nx == 8 else f"_nx{nx}",
     )
-    assert want_glu in names and want_qmv in names, names
+
+
+def _c32_names(codec, dtype, glu, down):
+    """The c32 kernel names of the snippet's seven gathers at one row, with
+    GLU suffix glu and down suffix down ("" or "_nx16"); the score-mixed
+    downs take the slot-parallel form at 8 lanes."""
+    t = f"_{dtype}_t"
+    sx = f"{codec}_sx_q6_k"
+    mix = "_sp_c32" + t if down == "" else "_c32" + down + t
+    return [
+        f"kq_{codec}_moe_glu_gather_silu_c32{glu}{t}",
+        f"kq_{codec}_gather_qmv_c32{down}{t}",
+        f"kq_{codec}_gather_qmv_mix_ns{mix}",
+        f"kq_{codec}_moe_glu_gather_shexp_silu_c32{glu}{t}",
+        f"kq_{sx}_moe_glu_gather_shexp_silu_c32{glu}{t}",
+        f"kq_{codec}_gather_qmv_mix{mix}",
+        f"kq_{sx}_gather_qmv_mix{mix}",
+    ]
+
+
+def _assert_close(got, ref):
+    for key in ref.files:
+        rel = np.abs(got[key] - ref[key]).max() / np.abs(ref[key]).max()
+        assert rel < 2e-3, (key, rel)
+
+
+@pytest.mark.parametrize("codec", C32_CODECS)
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_c32_dispatch(codec, dtype, tmp_path):
+    """At one row the grid codecs' gathers (gate/up, down, both score-mixed
+    downs, the shared-expert GLU) and the one-row quantized_matmul take the
+    c32 kernels where this GPU's class does (_moe_c32_on, _qmv_c32_on): the
+    GLU gathers at the class width, the downs at 8 lanes, the dense mat-vec
+    at the class width. KQ_MOE_C32 and KQ_QMV_C32 force either way, and
+    KQ_MOE_NX or KQ_QMV_C32 of 8 or 16 force a width. The forms differ only
+    in summation order."""
+    moe_on, qmv_on, gsfx = _c32_class(codec)
+    t = f"_{dtype}_t"
+    dense = f"kq_{codec}_qmv_c32"
+    old, names = _c32_run(
+        codec, 1, dtype, {"KQ_MOE_C32": "0", "KQ_QMV_C32": "0"}, tmp_path, "old"
+    )
+    assert "_c32" not in names, names
+
+    new, names = _c32_run(codec, 1, dtype, {}, tmp_path, "default")
+    for name in _c32_names(codec, dtype, gsfx, ""):
+        assert (name in names) == moe_on, (name, names)
+    assert (f"{dense}{gsfx}{t}" in names) == qmv_on, names
+    _assert_close(new, old)
+
+    on = {"KQ_MOE_C32": "1", "KQ_QMV_C32": "1"}
+    forced, names = _c32_run(codec, 1, dtype, on, tmp_path, "forced")
+    for name in _c32_names(codec, dtype, gsfx, "") + [f"{dense}{gsfx}{t}"]:
+        assert name in names, (name, names)
+    _assert_close(forced, old)
+
+    for nx, sfx in (("8", ""), ("16", "_nx16")):
+        env = {"KQ_MOE_C32": "1", "KQ_MOE_NX": nx, "KQ_QMV_C32": nx}
+        got, names = _c32_run(codec, 1, dtype, env, tmp_path, f"nx{nx}")
+        for name in _c32_names(codec, dtype, sfx, sfx) + [f"{dense}{sfx}{t}"]:
+            assert name in names, (name, names)
+        _assert_close(got, old)
+
+
+@pytest.mark.parametrize("codec", C32_CODECS)
+def test_c32_stands_down(codec, tmp_path):
+    """A forced KQ_MOE_NX=32 keeps the 16-weight gathers, as do two rows
+    unless KQ_MOE_C32=1 forces c32 there (the dedupe forms, which have no
+    c32 kernels, then stand down)."""
+    on = {"KQ_MOE_C32": "1"}
+    _, names = _c32_run(
+        codec, 1, "bfloat16", {**on, "KQ_MOE_NX": "32"}, tmp_path, "nx32"
+    )
+    assert "gather_qmv_c32" not in names and "gather_silu_c32" not in names
+    assert f"kq_{codec}_moe_glu_gather_silu_nx32_" in names, names
+    _, names = _c32_run(codec, 2, "bfloat16", {}, tmp_path, "t2")
+    assert "gather_silu_c32" not in names and "gather_qmv_c32" not in names
+    _, names = _c32_run(
+        codec, 2, "bfloat16", {**on, "KQ_MOE_DEDUP": "0"}, tmp_path, "t2c32"
+    )
+    _, _, gsfx = _c32_class(codec)
+    for name in _c32_names(codec, "bfloat16", gsfx, "")[:2]:
+        assert name in names, (name, names)
 
 
 _C32_LIVE_SNIPPET = r"""
@@ -623,9 +692,8 @@ def test_c32_reads_live():
         {"KQ_MOE_NX_LOG": "1"},
         "c32 live read",
     )
-    sfx = _c32_class_suffix()
     assert "kq_iq2_s_gather_qmv_bfloat16_t" in r.stderr, r.stderr
-    assert f"kq_iq2_s_gather_qmv_c32{sfx}_bfloat16_t" in r.stderr, r.stderr
+    assert "kq_iq2_s_gather_qmv_c32_bfloat16_t" in r.stderr, r.stderr
 
 
 _C32_REF_SNIPPET = r"""
@@ -635,30 +703,37 @@ sys.path.insert(0, sys.argv[1])
 import mlx.core as mx
 import test_moe_glu as tm
 
-res = tm._check_codec("iq2_s", dtype=getattr(mx, sys.argv[2]))
+res = tm._check_codec(sys.argv[3], dtype=getattr(mx, sys.argv[2]))
 print("RESULT " + json.dumps(
     None if res is None else [(n, float(r), bool(o)) for n, r, o in res]))
 """
 
 
+@pytest.mark.parametrize("codec", C32_CODECS)
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-def test_c32_accuracy(dtype):
+def test_c32_accuracy(codec, dtype):
     """The 32-weight-step kernels, forced at the reference test's three rows,
-    stay inside the gather bound of the f32 dequantized reference."""
+    stay inside the gather bound of the f32 dequantized reference for the
+    gate/up, down, shared-expert GLU and shared-expert mix gathers."""
     tests_dir = os.path.dirname(os.path.abspath(__file__))
     r = _run_child(
-        [sys.executable, "-c", _C32_REF_SNIPPET, tests_dir, dtype],
+        [sys.executable, "-c", _C32_REF_SNIPPET, tests_dir, dtype, codec],
         {"KQ_MOE_C32": "1", "KQ_MOE_DEDUP": "0", "KQ_MOE_NX_LOG": "1"},
-        f"c32 reference {dtype}",
+        f"c32 reference {codec} {dtype}",
     )
-    assert "kq_iq2_s_moe_glu_gather_silu_c32_" in r.stderr, r.stderr
-    assert "kq_iq2_s_gather_qmv_c32_" in r.stderr, r.stderr
+    for op in (
+        "moe_glu_gather_silu_c32",
+        "gather_qmv_c32",
+        "moe_glu_gather_shexp_silu_c32",
+        "gather_qmv_mix_sp_c32",
+    ):
+        assert f"kq_{codec}_{op}" in r.stderr, (op, r.stderr)
     line = [ln for ln in r.stdout.splitlines() if ln.startswith("RESULT ")]
     assert line, r.stdout + r.stderr
     import json
 
     res = json.loads(line[-1][len("RESULT ") :])
     if res is None:
-        pytest.skip("iq2_s reference unavailable")
+        pytest.skip(f"{codec} reference unavailable")
     for name, rel, ok in res:
         assert ok, (name, rel)

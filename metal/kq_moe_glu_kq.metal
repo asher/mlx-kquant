@@ -329,11 +329,53 @@ instantiate_kq_ext_sx_mix(q2_0, KqQ2_0Ext, iq4_nl, KqIq4_nlExt, float16_t)
       "kq_" #codec "_gather_qmv_c32" sfx "_" #type,                           \
       kq_ext_gather_qmv, type, traits, nx, true)
 
+// Shared-expert GLU and shared-expert mix with the shexp in scodec (the
+// codec itself or an upcast q5_k, q6_k or q8_0); stem is "codec" or
+// "codec_sx_scodec".
+#define instantiate_kq_ext_c32_sx_nx(stem, traits, straits, type, nx, sfx)    \
+  instantiate_kernel(                                                         \
+      "kq_" stem "_moe_glu_gather_shexp_silu_c32" sfx "_" #type,              \
+      kq_ext_moe_glu_gather_shexp, type, traits, straits, KQ_GLU_ACT_SILU, nx, \
+      true)                                                                    \
+  instantiate_kernel(                                                         \
+      "kq_" stem "_moe_glu_gather_shexp_gelu_c32" sfx "_" #type,              \
+      kq_ext_moe_glu_gather_shexp, type, traits, straits, KQ_GLU_ACT_GELU, nx, \
+      true)                                                                    \
+  instantiate_kernel(                                                         \
+      "kq_" stem "_gather_qmv_mix_c32" sfx "_" #type,                         \
+      kq_ext_gather_qmv_mix, type, traits, straits, nx, true)
+
+#define instantiate_kq_ext_c32_sx(stem, traits, straits, type)                \
+  instantiate_kq_ext_c32_sx_nx(stem, traits, straits, type, 8, "")            \
+  instantiate_kq_ext_c32_sx_nx(stem, traits, straits, type, 16, "_nx16")      \
+  instantiate_kernel(                                                         \
+      "kq_" stem "_gather_qmv_mix_sp_c32_" #type,                             \
+      kq_ext_gather_qmv_mix_sp, type, traits, straits, 8, true)
+
+#define instantiate_kq_ext_c32_type(codec, traits, type)                      \
+  instantiate_kq_ext_c32_nx(codec, traits, type, 8, "")                        \
+  instantiate_kq_ext_c32_nx(codec, traits, type, 16, "_nx16")                  \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_qmv_c32_" #type, kq_ext_qmv_c32, type, traits, 8)         \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_qmv_c32_nx16_" #type, kq_ext_qmv_c32, type, traits, 16)   \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_ns_c32_" #type,                           \
+      kq_ext_gather_qmv_mix_ns, type, traits, 8, true)                         \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_ns_c32_nx16_" #type,                      \
+      kq_ext_gather_qmv_mix_ns, type, traits, 16, true)                        \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_ns_sp_c32_" #type,                        \
+      kq_ext_gather_qmv_mix_ns_sp, type, traits, 8, true)                      \
+  instantiate_kq_ext_c32_sx(#codec, traits, traits, type)                      \
+  instantiate_kq_ext_c32_sx(#codec "_sx_q5_k", traits, KqQ5_KExt, type)        \
+  instantiate_kq_ext_c32_sx(#codec "_sx_q6_k", traits, KqQ6_KExt, type)        \
+  instantiate_kq_ext_c32_sx(#codec "_sx_q8_0", traits, KqQ8_0Ext, type)
+
 #define instantiate_kq_ext_c32(codec, traits)                                 \
-  instantiate_kq_ext_c32_nx(codec, traits, bfloat16_t, 8, "")                  \
-  instantiate_kq_ext_c32_nx(codec, traits, bfloat16_t, 16, "_nx16")            \
-  instantiate_kq_ext_c32_nx(codec, traits, float16_t, 8, "")                   \
-  instantiate_kq_ext_c32_nx(codec, traits, float16_t, 16, "_nx16")
+  instantiate_kq_ext_c32_type(codec, traits, bfloat16_t)                       \
+  instantiate_kq_ext_c32_type(codec, traits, float16_t)
 
 instantiate_kq_ext_c32(iq2_s, KqIq2_sExt)
 instantiate_kq_ext_c32(iq2_xxs, KqIq2_xxsExt)

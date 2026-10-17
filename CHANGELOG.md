@@ -13,6 +13,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   time on every GPU. `KQ_MOE_C32=0` restores the previous kernels.
 - On M5 GPUs the iq2_s MoE gathers at one activation row take a few percent
   less time again. `KQ_MOE_NX=8` restores the earlier width.
+- On M5 GPUs the iq1, iq2 and iq3 fused MoE gathers at one activation row take
+  up to 19% less time, shared-expert and score-mixed gathers included.
+  `KQ_MOE_C32=0` restores the previous kernels.
+- On M5 GPUs `quantized_matmul` at one activation row takes up to 26% less
+  time for the iq1, iq2 and iq3 codecs. `KQ_QMV_C32=0` restores the previous
+  kernels.
 
 ## [0.5.1]
 
