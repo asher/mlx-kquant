@@ -208,10 +208,13 @@ the superblock count and row stride folded. Under sustained load that ran about 
 reading the width at run time.
 
 A `q8_0` `quantized_matmul` with one activation row and no batch dimensions runs a split-K kernel
-too, when the tile's row count divides N and 256 divides K. The simdgroups of a threadgroup share
-its output rows, stride the 256-weight steps between them and add their partial sums in
-threadgroup memory. A lane keeps the per-row kernels' share of a step, eight weights of one block,
-and reads them as four 16-bit words, since a quarter block sits 2 bytes past a 2-byte boundary.
+too, when N is even and 256 divides K. The eight simdgroups of a threadgroup share two output rows.
+They stride the 256-weight steps between them and add their partial sums in threadgroup memory. A
+lane keeps the per-row kernels' share of a step, eight weights of one block. It reads them as four
+16-bit words, since a quarter block sits 2 bytes past a 2-byte boundary. The split puts more
+simdgroups in flight at layer-size N. On M3 Max, back to back over ten shapes, it took 1.6% to 6.6%
+less time than the per-row kernels: 2.7% less at K 8192 and N 4096, and 3.2% less at K 4096 and N
+8192. In a synced decode step of eight Muse Spark UD-IQ2_S layers, it saved 1.1% per layer.
 
 Under sustained decode the GPU runs below its top clock, where the per-row kernels turn ALU-bound.
 Measured on M5 Max over 90 seconds of back-to-back mat-vecs at the gemma-4 31B MLP shapes, the
@@ -1040,8 +1043,20 @@ At one activation row the iq2_s gate/up and down gathers decode 32 weights per l
 and the scale byte then load once per 32 weights, and the grid indices and sign bytes load as
 16-bit pairs. Each lane covers one 32-weight group per step at 8 K-lanes per output row, or 16
 under `KQ_MOE_NX=16`. Outputs differ from the 16-weight kernels only in summation order.
-`KQ_MOE_C32=0` restores the 16-weight kernels; `KQ_MOE_C32=1` also runs the 32-weight kernels at
-wider rows where the dedupe kernels do not apply.
+`KQ_MOE_C32=0` restores the 16-weight kernels. `KQ_MOE_C32=1` also runs the 32-weight kernels at
+wider rows where the dedupe kernels do not apply. A forced `KQ_MOE_NX=32` keeps the 16-weight
+kernels.
+
+On M3 Max at E=256, N=K=4096 and top 8, back to back, the gate/up gather took 0.303 ms against
+0.340 ms (-11.1%), and the down gather took 0.166 ms against 0.191 ms (-12.5%). In a synced decode
+step of eight Muse Spark UD-IQ2_S layers, the MoE blocks took 8.3% less time. With the `q8_0`
+split-K kernel, the step went from 1.414 to 1.335 ms per layer (-5.6%).
+
+The grid lookup is the next lever. With the grid read removed (wrong output), the 32-weight
+gathers took about 25% less time, and 37% less than the 16-weight gathers. That bounds the gain of
+a cheaper lookup. Two other grid sources gave no gain. A 64-bit grid in a device buffer matched the
+constant table. A 2-bit code table, in threadgroup memory or in a device buffer, was about 20%
+slower.
 
 ## Attention
 
