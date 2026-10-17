@@ -552,24 +552,37 @@ def _c32_run(T, dtype, env, tmp_path, arm):
     return np.load(f), r.stderr
 
 
+def _c32_class_suffix():
+    import mlx.core as mx
+    from mlx_kquant._ext import _moe_c32_nx
+
+    nx = _moe_c32_nx(mx.device_info().get("architecture", ""))
+    return "" if nx == 8 else f"_nx{nx}"
+
+
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_c32_dispatch(dtype, tmp_path):
     """iq2_s gate/up and down gathers take the 32-weight-step kernels at one
-    row by default, at NX = 8 or a forced 16. KQ_MOE_C32=0 and a forced
-    KQ_MOE_NX=32 keep the 16-weight kernels. Two rows keep them too unless
-    KQ_MOE_C32=1. The forms differ only in summation order."""
-    want_glu = f"kq_iq2_s_moe_glu_gather_silu_c32_{dtype}_t"
-    want_qmv = f"kq_iq2_s_gather_qmv_c32_{dtype}_t"
+    row by default, at this GPU class's NX (8, or 16 from M5), or a forced 8
+    or 16. KQ_MOE_C32=0 and a forced KQ_MOE_NX=32 keep the 16-weight kernels.
+    Two rows keep them too unless KQ_MOE_C32=1. The forms differ only in
+    summation order."""
+    sfx = _c32_class_suffix()
+    want_glu = f"kq_iq2_s_moe_glu_gather_silu_c32{sfx}_{dtype}_t"
+    want_qmv = f"kq_iq2_s_gather_qmv_c32{sfx}_{dtype}_t"
     new, names = _c32_run(1, dtype, {}, tmp_path, "default")
     assert want_glu in names and want_qmv in names, names
     old, names = _c32_run(1, dtype, {"KQ_MOE_C32": "0"}, tmp_path, "old")
     assert "_c32" not in names, names
+    narrow, names = _c32_run(1, dtype, {"KQ_MOE_NX": "8"}, tmp_path, "nx8")
+    assert f"kq_iq2_s_moe_glu_gather_silu_c32_{dtype}_t" in names, names
+    assert f"kq_iq2_s_gather_qmv_c32_{dtype}_t" in names, names
     wide, names = _c32_run(1, dtype, {"KQ_MOE_NX": "16"}, tmp_path, "nx16")
     assert "kq_iq2_s_moe_glu_gather_silu_c32_nx16_" in names, names
     assert "kq_iq2_s_gather_qmv_c32_nx16_" in names, names
     for key in ("glu", "qmv"):
         scale = np.abs(old[key]).max()
-        for got in (new, wide):
+        for got in (new, narrow, wide):
             rel = np.abs(got[key] - old[key]).max() / scale
             assert rel < 2e-3, (key, rel)
     _, names = _c32_run(1, dtype, {"KQ_MOE_NX": "32"}, tmp_path, "nx32")
@@ -610,8 +623,9 @@ def test_c32_reads_live():
         {"KQ_MOE_NX_LOG": "1"},
         "c32 live read",
     )
+    sfx = _c32_class_suffix()
     assert "kq_iq2_s_gather_qmv_bfloat16_t" in r.stderr, r.stderr
-    assert "kq_iq2_s_gather_qmv_c32_bfloat16_t" in r.stderr, r.stderr
+    assert f"kq_iq2_s_gather_qmv_c32{sfx}_bfloat16_t" in r.stderr, r.stderr
 
 
 _C32_REF_SNIPPET = r"""

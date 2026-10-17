@@ -305,8 +305,9 @@ All optional; the defaults are right for normal use.
   A/B lever.
 - `KQ_MOE_C32` - on Metal, the 32-weight decode step of the iq2_s fused MoE gate/up and down
   gathers. By default it runs at one activation row on every GPU. `0` restores the 16-weight
-  kernels, and `1` also runs it at wider rows where the dedupe kernels do not apply. `KQ_MOE_NX=16`
-  selects its 16-lane form, and `KQ_MOE_NX=32` keeps the 16-weight kernels. Read per call. The
+  kernels, and `1` also runs it at wider rows where the dedupe kernels do not apply. It runs 16
+  K-lanes per row on M5 and later GPUs and 8 on earlier ones. `KQ_MOE_NX=8` or `16` forces a
+  width, and `KQ_MOE_NX=32` keeps the 16-weight kernels. Read per call. The
   outputs differ from the 16-weight kernels only in summation order. A/B lever.
 
 - `KQ_SDPA_IDX_NAX=0` - run `sdpa_fa_indexed` on its simdgroup kernel even where the NAX tile

@@ -128,6 +128,13 @@ NB_MODULE(_ext, m) {
       "empty where the qmm_t kernel runs.");
 
   m.def(
+      "_moe_c32_nx",
+      &mlx_kquant::moe_c32_nx,
+      "arch"_a,
+      "The K-lanes per output row (8 or 16) of the iq2_s c32 MoE gathers "
+      "for an architecture string, unless KQ_MOE_NX forces one.");
+
+  m.def(
       "_dequantize_route_takes",
       &mlx_kquant::dequantize_route_takes,
       "arch"_a,
