@@ -24,8 +24,7 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   about half the time at 8 rows. An `nvfp4` weight must now start on a 4-byte
   boundary, as GGUF tensors do.
 - `nvfp4` runs on the NAX tensor units of M5 GPUs, for matmuls, MoE gathers
-  and speculative verify. Its routing thresholds follow `q2_0` and are not yet
-  tuned on M5.
+  and speculative verify, with small-batch routing tuned for M5.
 
 ## [0.5.1]
 

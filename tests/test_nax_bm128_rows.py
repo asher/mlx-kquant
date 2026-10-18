@@ -132,11 +132,8 @@ def test_odd_rows_lever_keeps_first_read():
 
 # K ceilings of the large-M rows (kq_largem_max_k): above it, from M 4096,
 # the BM=64 tile runs at either parity.
-# q2_0 and nvfp4 take the pq2_0 ceiling.
-MAX_K = {
-    "q2_k": 4096, "q2_0": 4096, "nvfp4": 4096, "q8_0": 10240, "q4_0": 10240,
-    "stq1_0": 12288,
-}  # fmt: skip
+# q2_0 takes the pq2_0 ceiling.
+MAX_K = {"q2_k": 4096, "q2_0": 4096, "q8_0": 10240, "q4_0": 10240, "stq1_0": 12288}
 
 
 @pytest.mark.parametrize("codec", sorted(MAX_K))
@@ -166,7 +163,7 @@ def test_large_rows_k_ceiling(codec):
 
 
 # Codecs whose large-M row has no K ceiling, on BK=64 and on BK=128 tiles.
-NO_MAX_K = ["q6_k", "iq2_s", "iq2_xs", "iq3_s", "iq3_xxs", "iq4_xs"]
+NO_MAX_K = ["q6_k", "iq2_s", "iq2_xs", "iq3_s", "iq3_xxs", "iq4_xs", "nvfp4"]
 
 
 @pytest.mark.parametrize("codec", NO_MAX_K)

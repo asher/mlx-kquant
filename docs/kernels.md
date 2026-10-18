@@ -67,7 +67,7 @@ ceil(M/64) is even. The k-quants `q3_k` to `q6_k`, the flat block codecs `q4_0`,
 and `iq4_nl`, `iq3_xxs`, `iq3_s`, `iq2_xs` and `iq2_s` run the BM=64 and BM=128 tiles on a K tile
 of 128 (the `_BK128` levers). Above
 the qmv limit, the verify kernels take the widths through M 8 on the codecs that have them. The
-NAX verify kernel serves `pq2_0`, `q4_0`, `q8_0` and `q2_k` to `q6_k` from a per-codec entry,
+NAX verify kernel serves `pq2_0`, `q4_0`, `q8_0`, `q2_k` to `q6_k` and `nvfp4` from a per-codec entry,
 and the register-resident MMA verify kernel serves `ptq1_0`, as described at the end of this
 section. Every limit and floor is a measured per-codec policy (`kq_nax_small_m` and
 `kq_smallbm_policy` in `src/kquant_matmul.cpp`).
@@ -443,7 +443,8 @@ it is the largest K before the first K (of 10240, 12288 and 16384) where BM=128 
 K 3840 and 4096. On the K tile of 128, `q3_k`, `q5_k`, `q6_k`, `iq3_xxs`, `iq3_s`, `iq2_xs` and
 `iq2_s` win at every K measured (`iq3_s` 0.91-0.94x, the other IQ codecs 0.93-1.00x), while the
 flat block codecs lose at K 12288 and 16384: `q4_0` and `q4_1` 1.02-1.06x on the K tile of 128,
-`q5_1` and `q8_0` 1.04-1.11x on 64. A ceiling moves only where the new tile takes at most the old
+`q5_1` and `q8_0` 1.04-1.11x on 64. `nvfp4` on the K tile of 64 takes 0.89-0.96x over the three M at
+every K, the median of three runs. A ceiling moves only where the new tile takes at most the old
 time at every M measured: on the K tile of 128 at K 12288, `q4_k` and `q5_0` take 1.00-1.02x over
 the three M and 1.02-1.03x at M 4128, so they keep K 10240.
 
@@ -457,10 +458,9 @@ the three M and 1.02-1.03x at M 4128, so they keep K 10240.
 | `iq4_nl` | 128, 64, 2, 2 | 0 | 4096 | 0 | 12288 | inherited, flat class |
 | `pq2_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 4096 | inherited, grid class |
 | `q2_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 4096 | inherited, grid class; the K ceiling is that of `pq2_0`, not measured |
-| `nvfp4` | 128, 64, 2, 2 | 0 | 4096 | 0 | 4096 | inherited, grid class; the K ceiling is that of `pq2_0`, not measured |
 | `stq1_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 12288 | inherited, grid class |
 | `iq2_s`, `iq2_xs`, `iq3_s`, `iq3_xxs` | 128, 64, 2, 2 | 0 | 4096 | 0 | none | inherited, grid class |
-| `iq1_s`, `iq1_m`, `iq2_xxs`, `iq4_xs`, `ptq1_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | none | inherited, grid class |
+| `iq1_s`, `iq1_m`, `iq2_xxs`, `iq4_xs`, `ptq1_0`, `nvfp4` | 128, 64, 2, 2 | 0 | 4096 | 0 | none | inherited, grid class |
 
 `stq1_0` (structured-sparse ternary, llama.cpp PR #22836) ships the full ALU and NAX kernel set. Its
 pre-NAX floors are measured (M3 Max: plain split-K entry M 5), and so are its NAX small-M routes in
@@ -478,11 +478,7 @@ with the float kernels by default and the half kernels under `KQ_VERIFY_MMA_HALF
 `quantized_matmul_glu` and `quantized_matmul_lora` have no `q2_0` or `pq2_0` kernel and build the
 product from `quantized_matmul` and stock ops, and like every codec `q2_0` has no kernel on float
 activations (float32 runs the bfloat16 kernels). Their NAX split-K entry is M 9, where the verify kernels hand off.
-`nvfp4` (64-wide blocks of four 16-weight groups) runs its NAX tiles through the same loader as the
-Prism codecs and has a `verify_nax` kernel shaped like that of `q2_0`. It takes the `q2_0` route
-entries, large-M row and K ceiling, none of them measured for it on M5, and it has no `verify_mma`
-kernel. The
-`bm128_min_m` and db64 floors are still inherited from `iq1_s`. The `ptq1_0` M=1 kernel gives each
+The `bm128_min_m` and db64 floors are still inherited from `iq1_s`. The `ptq1_0` M=1 kernel gives each
 28-byte block four lanes. Each lane reads its six trit bytes in two loads plus the word that holds
 the high-trit bytes and the scale, and decodes the trits with the exact-float base-3 coefficient
 collapse, in which floors of the scaled byte value multiply precomputed activation coefficients
@@ -497,6 +493,14 @@ fmas, since a bfloat16 value past 65504 does not fit in half.
 Both codecs have a `verify_qmv` sibling that decodes each row's block once and dots it against every
 activation row. It serves M 2 below the `verify_mma` entry on GPUs without NAX, where the `mv_ext`
 re-decode per row costs `ptq1_0` 3x. On NAX GPUs per-row qmv serves M 2.
+
+`nvfp4` (64-wide blocks of four 16-weight groups) runs its NAX tiles through the same loader as the
+Prism codecs and takes the grid class large-M row. It has a `verify_nax` kernel and no `verify_mma`
+kernel. Its NAX routes are measured on M5 Max. Per-row qmv keeps only M 2 at N 1025 to 2048, NAX
+split-K enters at M 2 for N 1024 and below and at M 6 above, and `verify_nax` enters by shape, as
+described with the other `verify_nax` entries. Its `bm128_min_m` floor is 449: BM=128 takes
+1.13-1.16x the BM=64 time at M 224, 0.95-0.98x at M 256 and 0.86-0.90x at M 1024. Its large-M row
+has no K ceiling, and it has no db64 band.
 
 The register-resident MMA verify kernels (`verify_mma`) serve `pq2_0`, `ptq1_0`, `q2_0`, `q4_0` and
 `q8_0` through M 8. Each simdgroup decodes a block of its weight rows straight into 8x8 simdgroup-matrix
@@ -549,7 +553,7 @@ The `q8_0` kernel has no default entry on either class of GPU, so it runs only w
 `KQ_VERIFY_MMA` or `KQ_QMM_ROUTE=verify_mma` forces it.
 
 On NAX GPUs, the register-fed NAX verify kernels (`verify_nax`) serve `pq2_0`, `q4_0`, `q8_0`,
-`q2_k` to `q6_k`, `iq4_xs` and `iq4_nl` from a per-codec entry through M 8, above the per-row qmv limit where that limit is
+`q2_k` to `q6_k`, `iq4_xs`, `iq4_nl` and `nvfp4` from a per-codec entry through M 8, above the per-row qmv limit where that limit is
 wider. Each simdgroup owns 32 weight rows and decodes every block of them straight into the
 right operand of a 16x32x16 NAX matmul, with the block scale folded into the half weights. The left
 operand holds the activation rows padded to 16, read from device memory in the k order of the
@@ -574,6 +578,7 @@ split rule, as the table lists.
 | `q2_k` | 128 | 8 bytes of codes and 8 bytes of scales and mins | per NAX op | waves, partial charge 2560 | 4-byte |
 | `iq4_xs` | 256 | the 8-byte header and a 32-byte quarter of one row's codes, as 8-byte words | per NAX op | waves, partial charge 640 | 8-byte |
 | `iq4_nl` | 256 | two whole blocks of one row, as nine 4-byte words | per NAX op | waves, partial charge 640 | 4-byte |
+| `nvfp4` | 128 | the scale byte and 8 code bytes of one 16-weight group of one row | a K step ahead | waves, partial charge 1280 | 4-byte |
 
 The `pq2_0` and two-block `q4_0` kernels decode each block in the permuted k order of `verify_mma`.
 The other kernels keep each lane's loads on one row, which measured faster. Spreading a `q8_0`
@@ -581,10 +586,11 @@ block across 8 rows ran 1.04-1.24x slower at every Qwen3.8-27B shape except N 10
 eight-block kernel at a K that is a multiple of 256 and the two-block kernel elsewhere. The K-quant
 kernels fold each 16- or 32-weight sub-block's scale, and its min where the codec has one, into the
 half weights. Loading a whole K step of activations ahead measured faster for `pq2_0` and the
-two-block `q4_0` kernel, while the kernels with larger decoded words load them one NAX op at a time,
-since loading ahead ran `q4_k` 1.6-2x slower. Two consecutive NAX ops read 8 contiguous activations
-of a row, so where the activations start on a 16-byte boundary these kernels read them in one
-16-byte load per two NAX ops, and where they start on an 8-byte boundary in one 8-byte load per op.
+two-block `q4_0` kernel, and `nvfp4` loads them the same way, while the kernels with larger decoded
+words load them one NAX op at a time, since loading ahead ran `q4_k` 1.6-2x slower. Two consecutive
+NAX ops read 8 contiguous activations of a row, so where the activations start on a 16-byte boundary
+these kernels read them in one 16-byte load per two NAX ops, and where they start on an 8-byte
+boundary in one 8-byte load per op.
 Activations that start elsewhere are read from a copy on a 16-byte boundary. The fewer loads take
 less time in a chain of dependent calls, and both forms give the same bits.
 
@@ -598,13 +604,16 @@ and the `q6_k` head ran 1.06-1.07x slower on one split than on two.
 The other kernels take their count from a model of GPU waves of 640 simdgroups. A count costs its
 waves times the K steps each simdgroup walks, plus the simdgroups of all its splits divided by the
 codec's partial charge. The charge is 640 for `q4_k`, the eight-block `q4_0` kernel, `iq4_xs` and
-`iq4_nl`, and 2560 for `q2_k`, `q3_k` and `q5_k`. The cheapest power of two that divides the K steps wins, unless another divisor costs
+`iq4_nl`, 1280 for `nvfp4`, and 2560 for `q2_k`, `q3_k` and `q5_k`. The cheapest power of two that divides the K steps wins, unless another divisor costs
 at most 3/4 as much, and the count has no cap. N 1024, K 5120 therefore takes 20 splits, which ran
 1.13-1.23x faster than 8 on `q3_k` and `q2_k`. The `q5_k` vocab head takes 4 splits and runs
 1.14-1.32x faster than on 1. Across the Qwen3.8-27B projection and head shapes and N 1024 to 14336
 at K 2048 to 14336, timed on M5 Max with bfloat16 activations, the count ran within 1.03x of the
 best measured count on 164 of 200 cells and 1.13x slower at worst. The sweep ran at M 3 for `q4_0`,
-`q4_k` and `q5_k`, M 4 for `q2_k` and `q3_k`, and M 8.
+`q4_k` and `q5_k`, M 4 for `q2_k` and `q3_k`, and M 8. On `nvfp4`, at M 3, 5 and 8 over 14 shapes of
+N 512 to 248320 and K 2048 to 17408, the count runs at 1.01x the best measured count on average and
+1.07x at worst. A target of about 600 simdgroups ran its vocab head on one split, 1.14-1.17x slower
+than on 5 to 10.
 
 A K that is not a whole number of K steps declines the route, and the K-quant kernels also need K in
 whole 256-weight superblocks. A two-block `q4_0` K with an odd count of blocks therefore runs on the
@@ -673,6 +682,20 @@ On float16 activations the mat-vec routes run faster and the kernel the same, so
 entries the kernel ran up to 1.10x slower at K 4096 and 1.21x slower at N 12288, K 2560, and each
 entry under M 5 sits one row higher. At M 8 the kernel runs 1.05-1.39x faster than NAX split-K
 on the shapes of N 2048 and wider.
+
+The `nvfp4` entry also moves with the shape, fitted on both activation types over 24 shapes of N 256
+to 248320 and K 2048 to 17408, 8 of them held out:
+
+| shape | entry, bfloat16 | entry, float16 | time against the default route at the entry |
+|---|---|---|---|
+| N >= 100000 | M 3 | M 3 | 0.89x on bfloat16, 1.01x on float16 |
+| N 512 and under | none | none | NAX split-K ran 1.07-1.42x faster through M 8 |
+| K >= 6144, or N 513 to 1024 from K 4096 | M 2 | M 2 | 0.83-1.04x |
+| N 1025 to 2048 from K 4096 | M 3 | M 3 | 0.85x on bfloat16, 0.90x on float16 |
+| N 513 to 2048 under K 4096 | M 5 | M 5 | 0.99-1.02x |
+| N over 2048 under K 6144 | M 4 | M 5 | 0.84-1.05x |
+
+At M 8 the kernel runs 1.04-1.29x faster than NAX split-K from N 2048, and 1.5x on a vocab head.
 
 ## Quantized matmuls that share an input
 

@@ -528,11 +528,12 @@ def test_qmm_route_probe(codec, route, monkeypatch):
 
 VMMA_CODECS = ["pq2_0", "ptq1_0", "q2_0", "q4_0", "q8_0"]
 # verify_nax entries on NAX GPUs below N 100000 (kq_verify_nax_min_m).
-# q2_k enters one row earlier above N 4096.
+# q2_k enters one row earlier above N 4096. The nvfp4 entry moves with the
+# shape (_nvfp4_vnax_entry); listed here at N 1000, K 1024.
 VNAX_ENTRY = {
     "pq2_0": 3,
     "q2_0": 3,
-    "nvfp4": 3,
+    "nvfp4": 5,
     "q4_0": 3,
     "q8_0": 6,
     "q4_k": 3,
@@ -547,7 +548,22 @@ VNAX_CODECS = list(VNAX_ENTRY)
 VNAX_IQ4 = ["iq4_xs", "iq4_nl"]
 
 
-def _vnax_entry(codec, n):
+def _nvfp4_vnax_entry(n, k, f16):
+    """kq_verify_nax_min_m for nvfp4; 9 = no entry."""
+    if n >= 100000:
+        return 3
+    if n <= 512:
+        return 9
+    if k >= 6144 or (n <= 1024 and k >= 4096):
+        return 2
+    if n <= 2048:
+        return 3 if k >= 4096 else 5
+    return 5 if f16 else 4
+
+
+def _vnax_entry(codec, n, k=K, f16=False):
+    if codec == "nvfp4":
+        return _nvfp4_vnax_entry(n, k, f16)
     e = VNAX_ENTRY.get(codec, 9)
     return e - 1 if n > VNAX_WIDE_N.get(codec, n) else e
 
@@ -1308,6 +1324,56 @@ def test_verify_nax_iq4_entry(codec, n_out, k, entry, dtype, monkeypatch):
             assert _bits_equal(y_def, y_nax), tag
 
 
+# The nvfp4 entry by shape (kq_verify_nax_min_m): M 3 on a vocab head,
+# none at N 512 and below, M 2 at K 6144 and wider and at N 1024 and below
+# from K 4096, M 3 up to N 2048 from K 4096 and M 5 below it, and M 4 on
+# bfloat16 and M 5 on float16 at wider N. Checked as the iq4 entry is, with
+# per-row qmv off, which takes M 2 at N 1025 to 2048 by default.
+VNAX_NVFP4_SHAPES = [
+    (100000, 256),
+    (100000, 6144),
+    (99999, 256),
+    (512, 8192),
+    (513, 8192),
+    (2560, 6144),
+    (2560, 6016),
+    (1024, 4096),
+    (1025, 4096),
+    (1024, 3968),
+    (2048, 4096),
+    (2049, 4096),
+    (2048, 3968),
+]
+
+
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("n_out, k", VNAX_NVFP4_SHAPES)
+def test_verify_nax_nvfp4_entry(n_out, k, dtype, monkeypatch):
+    _clear_levers(monkeypatch)
+    monkeypatch.setenv("KQ_NAX_QMV", "0")
+    f16 = dtype == mx.float16
+    entry = _nvfp4_vnax_entry(n_out, k, f16)
+    rng = np.random.default_rng(3)
+    seed = synth_wire(rng, "nvfp4", 36, 64 * (k // 64), nvfp4_scales=(0x08, 0x11))
+    seed = seed.reshape(64, -1)
+    w = mx.contiguous(mx.tile(mx.array(seed), (n_out // 64 + 1, 1))[:n_out])
+    s = mx.zeros((1,), dtype=mx.uint8)
+    mx.eval(w)
+    ms = (2, 3, 4, 5, 8)
+    name = "float16" if f16 else "bfloat16"
+    calls = [{"codec": "nvfp4", "shape": [m, k], "n": n_out, "dtype": name} for m in ms]
+    routes = [_route_of(e) for e in _logged(calls, {"KQ_NAX_QMV": "0"})]
+    for m, route in zip(ms, routes, strict=True):
+        tag = f"nvfp4 N{n_out} K{k} M{m} entry {entry}"
+        assert (route == "verify_nax") == (entry <= m), (tag, route)
+        if entry <= m:
+            x = (mx.random.normal((m, k)) * 0.5).astype(dtype)
+            y_def = _run_route(monkeypatch, x, w, s, "nvfp4")
+            y_nax = _run_route(monkeypatch, x, w, s, "nvfp4", "verify_nax")
+            assert _bits_equal(y_def, y_nax), tag
+
+
 # KQ_DISABLE_NAX turns the route off with the other NAX routes.
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
 @pytest.mark.parametrize("codec", VNAX_CODECS + VNAX_IQ4)
@@ -1585,7 +1651,7 @@ NAX_SMALL_M = {
     "q2_k": ((8, 5, 3, 2), 2, 5),
     "pq2_0": ((8, 5, 3, 2), 9, 9),
     "q2_0": ((8, 5, 3, 2), 9, 9),
-    "nvfp4": ((8, 5, 3, 2), 9, 9),
+    "nvfp4": ((1, 1, 2, 1), 2, 6),
     "ptq1_0": ((8, 5, 3, 2), 9, 9),
     "q4_0": ((8, 6, 3, 2), 8, 8),
     "q4_k": ((8, 5, 4, 2), 2, 5),
