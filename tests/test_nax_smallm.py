@@ -105,12 +105,12 @@ def _encodable_setup(codec, n_out):
     return w, s, ref_w
 
 
-def _iq_setup(codec, n_out):
+def _iq_setup(codec, n_out, **synth):
     from kqref import quants
 
     gtype, wpb, bpb, _, _ = CODECS[codec]
     rng = np.random.default_rng(7)
-    wire = synth_wire(rng, codec, bpb, n_out * (K // wpb))
+    wire = synth_wire(rng, codec, bpb, n_out * (K // wpb), **synth)
     wire = wire.reshape(n_out, (K // wpb) * bpb)
     ref = quants.dequantize(np.ascontiguousarray(wire), gtype)
     ref_w = mx.array(ref.astype(np.float32)).T
@@ -552,10 +552,10 @@ def _vnax_entry(codec, n):
     return e - 1 if n > VNAX_WIDE_N.get(codec, n) else e
 
 
-def _setup(codec, n_out):
+def _setup(codec, n_out, **synth):
     if codec in ENCODABLE:
         return _encodable_setup(codec, n_out)
-    return _iq_setup(codec, n_out)
+    return _iq_setup(codec, n_out, **synth)
 
 
 def _route_serves(route, codec, m):
@@ -1408,7 +1408,9 @@ def test_verify_nax_x16_bits(codec):
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("codec", VNAX_CODECS)
 def test_verify_nax_outlier_channel(codec, dtype, monkeypatch):
-    w, s, ref_w = _setup(codec, 1000)
+    # nvfp4's default synthetic scales (0.5 to 2) put the exact outputs past
+    # the float16 range; 1/64 to 1/32 matches the other codecs' weights.
+    w, s, ref_w = _setup(codec, 1000, nvfp4_scales=(0x08, 0x11))
     monkeypatch.setenv("KQ_QMM_ROUTE", "verify_nax")
     monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
     for m in (1, 5, 8):
