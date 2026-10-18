@@ -756,15 +756,36 @@ struct KqNvfp4BlockLoader {
 
   void load_unsafe() const thread {
     const short sb = (reduction_dim == 0) ? fixed_sub_block_idx : sub_block_idx;
-#pragma unroll
-    for (short i = 0; i < n_reads; i++) {
-      const short t = sb * sub_block_size + bj + i; // weight in superblock
-      const short g = t / 16;
-      const short j = t % 16;
+    if constexpr (reduction_dim == 1 && (n_reads == 16 || n_reads == 8)) {
+      // The thread's run is one group (16) or one nibble half of it (8):
+      // one scale and the group's two qs words.
+      const short t0 = sb * sub_block_size + bj;
+      const short g = t0 / 16;
       const float d = kq_fp_ue4m3_scale(src[g]);
-      const uint8_t b = src[KQ_NVFP4_QS_OFFSET + 8 * g + (j % 8)];
-      const int nib = (j < 8) ? (b & 0x0F) : (b >> 4);
-      dst[i] = T(d * kq_fp_e2m1_lut[nib]);
+      const uint2 q = kq_nvfp4_group_qs(src, g);
+      const uint shift = (n_reads == 8 && (t0 % 16) != 0) ? 4 : 0;
+      float4 v[n_reads / 4];
+      v[0] = d * kq_nvfp4_nibbles4(q.x, shift);
+      v[1] = d * kq_nvfp4_nibbles4(q.y, shift);
+      if constexpr (n_reads == 16) {
+        v[2] = d * kq_nvfp4_nibbles4(q.x, 4);
+        v[3] = d * kq_nvfp4_nibbles4(q.y, 4);
+      }
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(v[i / 4][i % 4]);
+      }
+    } else {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        const short t = sb * sub_block_size + bj + i; // weight in superblock
+        const short g = t / 16;
+        const short j = t % 16;
+        const float d = kq_fp_ue4m3_scale(src[g]);
+        const uint8_t b = src[KQ_NVFP4_QS_OFFSET + 8 * g + (j % 8)];
+        const int nib = (j < 8) ? (b & 0x0F) : (b >> 4);
+        dst[i] = T(d * kq_fp_e2m1_lut[nib]);
+      }
     }
   }
 
@@ -845,6 +866,58 @@ template <
       KqNvfp4BlockLoader<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
   kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
+}
+
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    int small_bm = 0,
+    typename U = T>
+[[kernel]] void kq_nvfp4_qmm_t_splitk(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device U* y,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    const constant int& k_partition_size,
+    const constant int& split_k_partition_stride,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(group_size == KQ_NVFP4_SUPERBLOCK, "NVFP4 requires gs=64");
+  static_assert(bits == 4, "NVFP4 requires bits=4");
+  constexpr int BM = small_bm ? small_bm : 32;
+  constexpr int BK = 32, BN = small_bm ? 64 : 32;
+  constexpr int WM = BM == 8 ? 1 : 2, WN = 4 / WM;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+  using LoaderW =
+      KqNvfp4BlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
+  const int k_start = tid.z * k_partition_size;
+  x += k_start;
+  auto wl = w;
+  wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
+  y += tid.z * static_cast<int64_t>(split_k_partition_stride);
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, U>(
+      wl,
+      x,
+      y,
+      Xs,
+      Ws,
+      K,
+      N,
+      M,
+      k_partition_size,
+      tid,
+      lid,
+      simd_gid,
+      simd_lid);
 }
 
 template <typename T, int group_size, int bits, bool batched>

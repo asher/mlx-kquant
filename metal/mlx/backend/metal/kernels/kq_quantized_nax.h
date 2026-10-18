@@ -3893,7 +3893,7 @@ struct KqNaxStq1_0BlockLoader {
   }
 };
 
-// Prism codecs (128-weight blocks) and q2_0 (64): a 32-weight k-tile is
+// Prism codecs (128-weight blocks), q2_0 and nvfp4 (64): a 32-weight k-tile is
 // chunks 2s and 2s+1 of deq_chunk16; four or two k-tiles per block, two per
 // 64-wide BCOLS step.
 template <
@@ -4042,6 +4042,22 @@ using KqNaxPtq1_0BlockLoader = KqNaxPrismBlockLoader<
     reduction_dim,
     tgp_size>;
 
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+using KqNaxNvfp4BlockLoader = KqNaxPrismBlockLoader<
+    KqNvfp4Ext,
+    T,
+    BROWS,
+    BCOLS,
+    dst_ld,
+    reduction_dim,
+    tgp_size>;
+
 KQ_NAX_DEFINE_KERNELS(iq4_nl, 32, 4, KqNaxIq4_nlBlockLoader)
 KQ_NAX_DEFINE_KERNELS(iq4_xs, 256, 4, KqNaxIq4_xsBlockLoader)
 KQ_NAX_DEFINE_KERNELS(iq3_xxs, 256, 3, KqNaxIq3_xxsBlockLoader)
@@ -4054,6 +4070,7 @@ KQ_NAX_DEFINE_KERNELS(iq1_m, 256, 1, KqNaxIq1_mBlockLoader)
 KQ_NAX_DEFINE_KERNELS(stq1_0, 256, 1, KqNaxStq1_0BlockLoader)
 KQ_NAX_DEFINE_KERNELS(pq2_0, 128, 2, KqNaxPq2_0BlockLoader)
 KQ_NAX_DEFINE_KERNELS(q2_0, 64, 2, KqNaxQ2_0BlockLoader)
+KQ_NAX_DEFINE_KERNELS(nvfp4, 64, 4, KqNaxNvfp4BlockLoader)
 KQ_NAX_DEFINE_KERNELS(ptq1_0, 128, 1, KqNaxPtq1_0BlockLoader)
 KQ_NAX_DEFINE_KERNELS(q4_0, 32, 4, KqNaxQ4_0BlockLoader)
 KQ_NAX_DEFINE_KERNELS(q4_1, 32, 4, KqNaxQ4_1BlockLoader)
@@ -4314,6 +4331,7 @@ KQ_NAX_DEFINE_SPLITK_KERNEL(iq1_m, 256, 1, KqNaxIq1_mBlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(stq1_0, 256, 1, KqNaxStq1_0BlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(pq2_0, 128, 2, KqNaxPq2_0BlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(q2_0, 64, 2, KqNaxQ2_0BlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(nvfp4, 64, 4, KqNaxNvfp4BlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(ptq1_0, 128, 1, KqNaxPtq1_0BlockLoader)
 
 template <
@@ -4608,6 +4626,7 @@ KQ_NAX_DEFINE_GATHER_RHS(iq1_m, 256, 1, KqNaxIq1_mBlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(stq1_0, 256, 1, KqNaxStq1_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(pq2_0, 128, 2, KqNaxPq2_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(q2_0, 64, 2, KqNaxQ2_0BlockLoader)
+KQ_NAX_DEFINE_GATHER_RHS(nvfp4, 64, 4, KqNaxNvfp4BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(ptq1_0, 128, 1, KqNaxPtq1_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(q4_0, 32, 4, KqNaxQ4_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(q4_1, 32, 4, KqNaxQ4_1BlockLoader)
@@ -4861,6 +4880,7 @@ KQ_NAX_DEFINE_GATHER_SEG(iq1_m, 256, 1, KqNaxIq1_mBlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(stq1_0, 256, 1, KqNaxStq1_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(pq2_0, 128, 2, KqNaxPq2_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(q2_0, 64, 2, KqNaxQ2_0BlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(nvfp4, 64, 4, KqNaxNvfp4BlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(ptq1_0, 128, 1, KqNaxPtq1_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(q4_0, 32, 4, KqNaxQ4_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(q4_1, 32, 4, KqNaxQ4_1BlockLoader)

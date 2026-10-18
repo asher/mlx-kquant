@@ -20,8 +20,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   time for the iq1, iq2 and iq3 codecs. `KQ_QMV_C32=0` restores the previous
   kernels.
 - `nvfp4` `quantized_matmul` at one activation row takes about a third of the
-  time. An `nvfp4` weight must now start on a 4-byte boundary, as GGUF tensors
-  do.
+  time, and from 4 to 32 rows on GPUs without NAX it runs on split-K tiles,
+  about half the time at 8 rows. An `nvfp4` weight must now start on a 4-byte
+  boundary, as GGUF tensors do.
+- `nvfp4` runs on the NAX tensor units of M5 GPUs, for matmuls, MoE gathers
+  and speculative verify. Its routing thresholds follow `q2_0` and are not yet
+  tuned on M5.
 
 ## [0.5.1]
 

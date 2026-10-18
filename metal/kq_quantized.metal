@@ -708,6 +708,12 @@ instantiate_kquant_mxfp4_for_type(float16_t)
   instantiate_kquant_qmm_t(type, 64, 4, true, 1, nvfp4)              \
   instantiate_kquant_qmm_t(type, 64, 4, false, 0, nvfp4)             \
   instantiate_kquant_qmm_t(type, 64, 4, false, 1, nvfp4)             \
+  instantiate_kquant_qmm_t_splitk(type, 64, 4, true, nvfp4)          \
+  instantiate_kquant_qmm_t_splitk(type, 64, 4, false, nvfp4)         \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 64, 4, true, nvfp4)     \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 64, 4, false, nvfp4)    \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 64, 4, true, nvfp4)      \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 64, 4, false, nvfp4)     \
   instantiate_kquant_qmm_n(type, 64, 4, 0, nvfp4)                    \
   instantiate_kquant_qmm_n(type, 64, 4, 1, nvfp4)                    \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 64, 4, nvfp4) \

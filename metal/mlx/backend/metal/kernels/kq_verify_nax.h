@@ -164,6 +164,50 @@ struct KqQ2_0Nax {
   }
 };
 
+// NVFP4: lane-quad q owns 16-weight group q, its UE4M3 scale byte q and qs
+// bytes 8q..8q+7. Pair f is byte f's low and high nibbles, weights f and
+// f + 8 of the group, so step s reads Q2_0's activation order. An E2M1 code
+// e1 e0 m in half bits 11..9 is its value times 2^-14; every product with
+// the scale is exact in half. Two 64-weight blocks per iteration.
+struct KqNvfp4Nax {
+  static constant constexpr int group = KQ_NVFP4_SUPERBLOCK;
+  static constant constexpr int block_k = KQ_NVFP4_SUPERBLOCK;
+  static constant constexpr int block_bytes = KQ_NVFP4_BLOCK_BYTES;
+  static constant constexpr int ub = 2;
+  static constant constexpr bool x_ahead = true;
+  // Unused: x_ahead codecs load their steps through xstep.
+  static constexpr METAL_FUNC int xoff(short, short) {
+    return 0;
+  }
+  struct Words {
+    uint w[2];
+    half d;
+  };
+  static METAL_FUNC Words load(const device uint8_t* row, int u, short q) {
+    const device uint8_t* bp = row + u * block_bytes;
+    Words o;
+    o.d = half(kq_fp_ue4m3_scale(bp[q]));
+    const device uint* qs =
+        (const device uint*)(bp + KQ_NVFP4_QS_OFFSET + 8 * q);
+    o.w[0] = qs[0];
+    o.w[1] = qs[1];
+    return o;
+  }
+  static METAL_FUNC half2 pair(thread const Words& o, short f) {
+    const uint b = (o.w[f >> 2] >> (8 * (f & 3))) & 0xFFu;
+    const uint n = (b & 0x0Fu) | ((b & 0xF0u) << 12);
+    const uint bits = ((n & 0x00070007u) << 9) | ((n & 0x00080008u) << 12);
+    return as_type<half2>(bits) * half2(16384.0h) * o.d;
+  }
+  template <typename T>
+  static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
+    const int o = 16 * q + 2 * s;
+    const vec<T, 2> p0 = *(const device vec<T, 2>*)(xb + o);
+    const vec<T, 2> p1 = *(const device vec<T, 2>*)(xb + o + 8);
+    return vec<T, 4>(p0.x, p1.x, p0.y, p1.y);
+  }
+};
+
 // Q4_0: lane-quad q owns qs bytes 4q..4q+3. Pairs (n0, n2), (n1, n3),
 // (h0, h2), (h1, h3) of its low and high nibbles (KqQ4_0Mma), as
 // 1024 + code in the half mantissa, minus 1032, times d. Two 32-weight
@@ -1067,6 +1111,7 @@ METAL_FUNC void kq_verify_nax_impl(
 
 KQ_DEFINE_VERIFY_NAX_KERNEL(pq2_0, KqPq2_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q2_0, KqQ2_0Nax)
+KQ_DEFINE_VERIFY_NAX_KERNEL(nvfp4, KqNvfp4Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_0, KqQ4_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_0_sb, KqQ4_0SbNax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q8_0, KqQ8_0Nax)
@@ -1080,6 +1125,7 @@ KQ_DEFINE_VERIFY_NAX_KERNEL(q2_k, KqQ2_KNax)
 
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(pq2_0, KqPq2_0Nax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q2_0, KqQ2_0Nax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(nvfp4, KqNvfp4Nax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_0, KqQ4_0Nax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_0_sb, KqQ4_0SbNax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q8_0, KqQ8_0Nax)

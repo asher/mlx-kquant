@@ -163,9 +163,9 @@ static KqSmallBmPolicy kq_smallbm_base(const std::string& t) {
     return {true, 7, 8192, 961};
   }
   if (t == "iq1_s" || t == "stq1_0" || t == "pq2_0" || t == "q2_0" ||
-      t == "ptq1_0") {
-    // stq1_0 and the Prism codecs start on the iq1_s policy; re-tune with
-    // bench_qmm_bm128_ab.
+      t == "ptq1_0" || t == "nvfp4") {
+    // stq1_0, the Prism codecs and nvfp4 start on the iq1_s policy; re-tune
+    // with bench_qmm_bm128_ab.
     return {true, 0, 0, 449};
   }
   return {false, 0, 0, 193}; // iq2_xs, iq2_s, iq1_m
@@ -192,10 +192,10 @@ static KqLoaderClass kq_loader_class(const std::string& t) {
 // 4096 win for every codec). 0: no loss up to K 16384. On the BK=128 tiles
 // q3_k, q5_k, q6_k, iq2_s, iq2_xs, iq3_s and iq3_xxs win at every K, and so
 // do iq1_s, iq1_m, iq2_xxs, iq4_xs and ptq1_0 on BK=64. A ceiling holds for
-// the codec's default K tile. q2_0 takes the pq2_0 ceiling; it is not
-// measured.
+// the codec's default K tile. q2_0 and nvfp4 take the pq2_0 ceiling; they
+// are not measured.
 static int kq_largem_max_k(const std::string& t) {
-  if (t == "q2_k" || t == "pq2_0" || t == "q2_0") {
+  if (t == "q2_k" || t == "pq2_0" || t == "q2_0" || t == "nvfp4") {
     return 4096;
   }
   if (t == "q4_k" || t == "q8_0" || t == "q4_0" || t == "q4_1" || t == "q5_0" ||
@@ -294,7 +294,7 @@ static bool kq_splitk_codec(const std::string& t) {
       t == "iq3_xxs" || t == "iq3_s" || t == "iq2_xxs" || t == "iq2_xs" ||
       t == "iq2_s" || t == "iq1_s" || t == "iq1_m" || t == "stq1_0" ||
       t == "pq2_0" || t == "q2_0" || t == "ptq1_0" || t == "q4_0" ||
-      t == "q4_1" || t == "q5_0" || t == "q5_1";
+      t == "q4_1" || t == "q5_0" || t == "q5_1" || t == "nvfp4";
 }
 
 // Non-NAX default split-K entry M per codec (0 = env lever only).
@@ -455,6 +455,11 @@ static int kq_verify_nax_min_m(const std::string& t, int N, int K, bool f16) {
       t == "q5_k") {
     return 3;
   }
+  if (t == "nvfp4") {
+    // Inherited from q2_0, whose kernel shape it shares; not measured on
+    // NAX silicon.
+    return 3;
+  }
   if (t == "q8_0") {
     return 6;
   }
@@ -475,7 +480,7 @@ static int kq_splitk_min_m(const std::string& t) {
     return kq_splitk_min_m_nax_alu(t);
   }
   if (t == "q4_k" || t == "q6_k" || t == "q2_k" || t == "iq2_xxs" ||
-      t == "q4_1" || t == "q5_1") {
+      t == "q4_1" || t == "q5_1" || t == "nvfp4") {
     return 4;
   }
   if (t == "q5_k" || t == "q8_0" || t == "iq4_nl" || t == "iq3_xxs" ||
@@ -594,6 +599,10 @@ static KqNaxSmallM kq_nax_small_m(const std::string& t) {
     return {{3, 1, 1, 1}, 2, 3};
   }
   if (t == "pq2_0" || t == "q2_0" || t == "ptq1_0") {
+    return {{8, 5, 3, 2}, 9, 9};
+  }
+  if (t == "nvfp4") {
+    // Inherited from q2_0; not measured on NAX silicon.
     return {{8, 5, 3, 2}, 9, 9};
   }
   return {{1, 1, 1, 1}, 0, 0};

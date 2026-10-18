@@ -225,7 +225,7 @@ inline int codec_verify_mma_rows(const std::string& kquant_type) {
 // where K is a multiple of 256 (kq_verify_nax_call_kstep).
 inline int codec_verify_nax_kstep(const std::string& kquant_type) {
   if (kquant_type == "pq2_0" || kquant_type == "q2_0" ||
-      kquant_type == "q8_0") {
+      kquant_type == "q8_0" || kquant_type == "nvfp4") {
     return 128;
   }
   if (kquant_type == "q4_0") {

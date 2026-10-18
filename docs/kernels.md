@@ -457,6 +457,7 @@ the three M and 1.02-1.03x at M 4128, so they keep K 10240.
 | `iq4_nl` | 128, 64, 2, 2 | 0 | 4096 | 0 | 12288 | inherited, flat class |
 | `pq2_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 4096 | inherited, grid class |
 | `q2_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 4096 | inherited, grid class; the K ceiling is that of `pq2_0`, not measured |
+| `nvfp4` | 128, 64, 2, 2 | 0 | 4096 | 0 | 4096 | inherited, grid class; the K ceiling is that of `pq2_0`, not measured |
 | `stq1_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 12288 | inherited, grid class |
 | `iq2_s`, `iq2_xs`, `iq3_s`, `iq3_xxs` | 128, 64, 2, 2 | 0 | 4096 | 0 | none | inherited, grid class |
 | `iq1_s`, `iq1_m`, `iq2_xxs`, `iq4_xs`, `ptq1_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | none | inherited, grid class |
@@ -476,7 +477,11 @@ with the float kernels by default and the half kernels under `KQ_VERIFY_MMA_HALF
 `KQ_QMM_TILE` and the tile levers under `KQ_TUNE_LIVE` apply to it as to every NAX codec. Left out:
 `quantized_matmul_glu` and `quantized_matmul_lora` have no `q2_0` or `pq2_0` kernel and build the
 product from `quantized_matmul` and stock ops, and like every codec `q2_0` has no kernel on float
-activations (float32 runs the bfloat16 kernels). Their NAX split-K entry is M 9, where the verify kernels hand off. The
+activations (float32 runs the bfloat16 kernels). Their NAX split-K entry is M 9, where the verify kernels hand off.
+`nvfp4` (64-wide blocks of four 16-weight groups) runs its NAX tiles through the same loader as the
+Prism codecs and has a `verify_nax` kernel shaped like that of `q2_0`. It takes the `q2_0` route
+entries, large-M row and K ceiling, none of them measured for it on M5, and it has no `verify_mma`
+kernel. The
 `bm128_min_m` and db64 floors are still inherited from `iq1_s`. The `ptq1_0` M=1 kernel gives each
 28-byte block four lanes. Each lane reads its six trit bytes in two loads plus the word that holds
 the high-trit bytes and the scale, and decodes the trits with the exact-float base-3 coefficient
