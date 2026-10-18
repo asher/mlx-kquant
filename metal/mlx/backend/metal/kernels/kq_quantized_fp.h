@@ -565,19 +565,34 @@ template <typename T, int group_size, int bits>
   kq_nvfp4_dequantize_impl<T>(w, out, num_weights, gid);
 }
 
+// A group's 8 qs bytes as two words: the 36-byte superblock keeps them
+// 4-byte aligned.
+METAL_FUNC uint2 kq_nvfp4_group_qs(const device uint8_t* block, int g) {
+  const device uint32_t* q =
+      (const device uint32_t*)(block + KQ_NVFP4_QS_OFFSET + 8 * g);
+  return uint2(q[0], q[1]);
+}
+
+// E2M1 values of nibble `shift` (0 low, 4 high) of each byte of `q`.
+METAL_FUNC float4 kq_nvfp4_nibbles4(uint32_t q, uint shift) {
+  return float4(
+      kq_fp_e2m1_lut[(q >> shift) & 0x0F],
+      kq_fp_e2m1_lut[(q >> (8 + shift)) & 0x0F],
+      kq_fp_e2m1_lut[(q >> (16 + shift)) & 0x0F],
+      kq_fp_e2m1_lut[(q >> (24 + shift)) & 0x0F]);
+}
+
 // Natural-order chunk [il*16, il*16+16) == sub-scale group il; il in [0,4).
 METAL_FUNC void kq_nvfp4_deq_chunk16(
     const device uint8_t* block,
     short il,
     thread float4x4& reg) {
   const float d = kq_fp_ue4m3_scale(block[il]);
-  const device uint8_t* qs = block + KQ_NVFP4_QS_OFFSET + 8 * il;
-#pragma unroll
-  for (int i = 0; i < 16; ++i) {
-    const uint8_t b = qs[i % 8];
-    const int nib = (i < 8) ? (b & 0x0F) : (b >> 4);
-    reg[i / 4][i % 4] = d * kq_fp_e2m1_lut[nib];
-  }
+  const uint2 q = kq_nvfp4_group_qs(block, il);
+  reg[0] = d * kq_nvfp4_nibbles4(q.x, 0);
+  reg[1] = d * kq_nvfp4_nibbles4(q.y, 0);
+  reg[2] = d * kq_nvfp4_nibbles4(q.x, 4);
+  reg[3] = d * kq_nvfp4_nibbles4(q.y, 4);
 }
 
 struct KqNvfp4Ext {
@@ -605,8 +620,9 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
       w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
 }
 
-// NVFP4 mat-vec: lane `simd_lid` owns weights `lane` and `lane+32` of every
-// 64-superblock (groups 0-1 and 2-3 respectively); simd_sum reduces.
+// NVFP4 mat-vec on the MXFP4 lane layout: lane `simd_lid` owns sub-scale
+// group simd_lid % 4 of superblock simd_lid / 4, 8 superblocks per pass; x is
+// read once into four float4 and reused across the unrolled rows.
 template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
 METAL_FUNC void kq_nvfp4_qmv_impl(
     const device uint8_t* w,
@@ -620,6 +636,7 @@ METAL_FUNC void kq_nvfp4_qmv_impl(
   static_assert(group_size == KQ_NVFP4_SUPERBLOCK, "NVFP4 requires gs=64");
   static_assert(bits == 4, "NVFP4 requires bits=4");
   constexpr int num_simdgroups = 2;
+  constexpr int blocks_per_pass = 8;
   typedef float U;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
@@ -632,14 +649,15 @@ METAL_FUNC void kq_nvfp4_qmv_impl(
   const int nb = in_vec_size / KQ_NVFP4_SUPERBLOCK;
   x += tid.x * in_vec_size;
   y += tid.x * out_vec_size;
-  const int g0 = int(simd_lid) / 16; // 0 or 1
-  const int j = int(simd_lid) % 16;
-  const bool is_high = j >= 8;
-  const int byteidx = 8 * g0 + (j % 8);
+  const int ix = simd_lid / 4;
+  const int g = simd_lid % 4;
   U result[results_per_simdgroup] = {0};
-  for (int ib = 0; ib < nb; ib++) {
-    const U xv0 = U(x[ib * KQ_NVFP4_SUPERBLOCK + simd_lid]);
-    const U xv1 = U(x[ib * KQ_NVFP4_SUPERBLOCK + 32 + simd_lid]);
+  for (int ib = ix; ib < nb; ib += blocks_per_pass) {
+    const device T* xb = x + ib * KQ_NVFP4_SUPERBLOCK + 16 * g;
+    const float4 yl0(xb[0], xb[1], xb[2], xb[3]);
+    const float4 yl1(xb[4], xb[5], xb[6], xb[7]);
+    const float4 yl2(xb[8], xb[9], xb[10], xb[11]);
+    const float4 yl3(xb[12], xb[13], xb[14], xb[15]);
     // static trip count; the clamped tail row is dropped at the store
 #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
@@ -647,14 +665,13 @@ METAL_FUNC void kq_nvfp4_qmv_impl(
           static_cast<int64_t>(min(out_row + row, out_vec_size - 1)) *
               row_bytes +
           ib * KQ_NVFP4_BLOCK_BYTES;
-      const U d0 = U(kq_fp_ue4m3_scale(blk[g0]));
-      const U d1 = U(kq_fp_ue4m3_scale(blk[g0 + 2]));
-      const uint8_t b0 = blk[KQ_NVFP4_QS_OFFSET + byteidx];
-      const uint8_t b1 = blk[KQ_NVFP4_QS_OFFSET + 16 + byteidx];
-      const int nib0 = is_high ? (b0 >> 4) : (b0 & 0x0F);
-      const int nib1 = is_high ? (b1 >> 4) : (b1 & 0x0F);
-      result[row] += d0 * U(kq_fp_e2m1_lut[nib0]) * xv0 +
-          d1 * U(kq_fp_e2m1_lut[nib1]) * xv1;
+      const U d = U(kq_fp_ue4m3_scale(blk[g]));
+      const uint2 q = kq_nvfp4_group_qs(blk, g);
+      float4 acc = yl0 * kq_nvfp4_nibbles4(q.x, 0);
+      acc += yl1 * kq_nvfp4_nibbles4(q.y, 0);
+      acc += yl2 * kq_nvfp4_nibbles4(q.x, 4);
+      acc += yl3 * kq_nvfp4_nibbles4(q.y, 4);
+      result[row] += d * ((acc.x + acc.y) + (acc.z + acc.w));
     }
   }
   for (int row = 0; row < results_per_simdgroup; row++) {

@@ -19,6 +19,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - On M5 GPUs `quantized_matmul` at one activation row takes up to 26% less
   time for the iq1, iq2 and iq3 codecs. `KQ_QMV_C32=0` restores the previous
   kernels.
+- `nvfp4` `quantized_matmul` at one activation row takes about a third of the
+  time. An `nvfp4` weight must now start on a 4-byte boundary, as GGUF tensors
+  do.
 
 ## [0.5.1]
 
