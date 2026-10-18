@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.2]
+
 ### Changed
 - `q8_0` `quantized_matmul` at one activation row takes less time on every GPU.
   `KQ_QMV_SPLITK=0` restores the previous kernels.
