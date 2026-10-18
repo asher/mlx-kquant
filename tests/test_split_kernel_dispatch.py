@@ -109,7 +109,7 @@ HOST = {} if _no_nax() else _host_names()
 
 
 def test_split_codecs_found():
-    assert {"q4_k", "q8_0", "q2_0", "pq2_0", "iq4_xs", "iq4_nl"} <= set(HOST)
+    assert {"q4_k", "q8_0", "q2_0", "pq2_0", "iq4_xs", "iq4_nl", "nvfp4"} <= set(HOST)
     # Every codec has the three split-K tiles and both NAX split-K tiles.
     for codec, names in HOST.items():
         for frag in (

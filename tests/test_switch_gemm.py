@@ -292,6 +292,17 @@ def test_expert_tile_map_matches_host(counts):
     np.testing.assert_array_equal(order(g), order(r))
 
 
+def _nvfp4_wire(rng, experts, n_rows):
+    """nvfp4 wire with group scales of 1/64 to 1/32, the range of real
+    weights."""
+    from kqref import synth_wire
+
+    wire = synth_wire(
+        rng, "nvfp4", 36, experts * n_rows * (K // 64), nvfp4_scales=(0x08, 0x11)
+    )
+    return wire.reshape(experts, n_rows, (K // 64) * 36)
+
+
 def _nax_ok():
     import mlx_kquant as kq
 
@@ -302,7 +313,7 @@ def _nax_ok():
     bool(os.environ.get("KQUANT_FORCE_CPU")),
     reason="gather_qmm_seg is Metal-only.",
 )
-@pytest.mark.parametrize("codec", ["iq2_xs", "iq3_xxs", "q4_k", "q8_0"])
+@pytest.mark.parametrize("codec", ["iq2_xs", "iq3_xxs", "q4_k", "q8_0", "nvfp4"])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_gather_qmm_seg_nax_matches_loop(codec, dtype, monkeypatch):
     """The NAX seg kernel (taken by default on NAX GPUs) matches the
@@ -345,6 +356,11 @@ def test_gather_qmm_seg_nax_matches_loop(codec, dtype, monkeypatch):
             num_experts=E, output_dims=N, input_dims=K, bias=False, codec=codec
         )
         sw.weight = mx.array(wire)
+    elif codec == "nvfp4":
+        sw = KQuantSwitchLinear(
+            num_experts=E, output_dims=N, input_dims=K, bias=False, codec=codec
+        )
+        sw.weight = mx.array(_nvfp4_wire(np.random.default_rng(12), E, N))
     else:
         sw = _make_switch(codec)
     w, s = sw["weight"], sw["scales"]
@@ -421,13 +437,14 @@ def test_gather_qmm_seg_nax_unaligned_n(monkeypatch):
     bool(os.environ.get("KQUANT_FORCE_CPU")),
     reason="gather_qmm_seg is Metal-only.",
 )
-@pytest.mark.parametrize("codec", ["iq2_xs", "iq3_xxs"])
+@pytest.mark.parametrize("codec", ["iq2_xs", "iq3_xxs", "nvfp4"])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_gather_qmm_seg_nax_grid_codec_unaligned_n(codec, dtype, monkeypatch):
-    """The IQ grid codecs of the prefill gathers on an N tail past the last
-    32-column simdgroup band, with tiles of 1, 33 and 65 rows (one live
-    16-row sub-band, a partial second band, a second map tile) and a full
-    tile, all match the per-expert loop."""
+    """The IQ grid codecs of the prefill gathers and nvfp4, which runs the
+    same NAX loader, on an N tail past the last 32-column simdgroup band,
+    with tiles of 1, 33 and 65 rows (one live 16-row sub-band, a partial
+    second band, a second map tile) and a full tile, all match the
+    per-expert loop."""
     import mlx_kquant as kq
 
     # Loop reference on the BM=64 NAX tile, as in the test above.
@@ -438,11 +455,14 @@ def test_gather_qmm_seg_nax_grid_codec_unaligned_n(codec, dtype, monkeypatch):
 
     rng = np.random.default_rng(41)
     n_odd = 72
-    bpb = CODEC_GEOMETRY[codec][2]
-    wire = rng.integers(0, 256, (4, n_odd, bytes_per_row(codec, K)), dtype=np.uint8)
-    d = np.frombuffer(np.float16(0.01).tobytes(), dtype=np.uint8)
-    for b in range(0, wire.shape[-1], bpb):
-        wire[..., b : b + 2] = d
+    if codec == "nvfp4":
+        wire = _nvfp4_wire(rng, 4, n_odd)
+    else:
+        bpb = CODEC_GEOMETRY[codec][2]
+        wire = rng.integers(0, 256, (4, n_odd, bytes_per_row(codec, K)), dtype=np.uint8)
+        d = np.frombuffer(np.float16(0.01).tobytes(), dtype=np.uint8)
+        for b in range(0, wire.shape[-1], bpb):
+            wire[..., b : b + 2] = d
     w = mx.array(wire)
     s = mx.zeros((1,), dtype=mx.uint8)
     counts = np.array([1, 33, 65, 64], dtype=np.int64)

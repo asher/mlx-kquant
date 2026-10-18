@@ -168,6 +168,14 @@ static KqSmallBmPolicy kq_smallbm_base(const std::string& t) {
     // bench_qmm_bm128_ab.
     return {true, 0, 0, 449};
   }
+  if (t == "nvfp4") {
+    // Measured (median of three ABBA runs): BM=128 takes 1.13-1.16x the
+    // BM=64 time at M224, 0.95-0.98x at M256, 0.90-1.01x at M512 and
+    // 0.86-0.90x at M1024. bm32 keeps the vocab head at M 13-32 on the
+    // un-split BM=32 tile, 1.12-1.19x faster than NAX split-K there. The
+    // other routes beat the un-split tile through M 12, so no route_min.
+    return {true, 0, 0, 449};
+  }
   return {false, 0, 0, 193}; // iq2_xs, iq2_s, iq1_m
 }
 
@@ -191,8 +199,10 @@ static KqLoaderClass kq_loader_class(const std::string& t) {
 // 4128, 8256 and 16384 at N 4096, K 10240, 12288 and 16384; K 3840 and
 // 4096 win for every codec). 0: no loss up to K 16384. On the BK=128 tiles
 // q3_k, q5_k, q6_k, iq2_s, iq2_xs, iq3_s and iq3_xxs win at every K, and so
-// do iq1_s, iq1_m, iq2_xxs, iq4_xs and ptq1_0 on BK=64. A ceiling holds for
-// the codec's default K tile. q2_0 takes the pq2_0 ceiling; it is not
+// do iq1_s, iq1_m, iq2_xxs, iq4_xs, ptq1_0 and nvfp4 on BK=64 (nvfp4
+// 0.89-0.96x at every K from 4096 to 16384, median of three runs, with
+// benchmarks/bench_qmm_bm128_ab.py --tile-ab). A ceiling holds for the
+// codec's default K tile. q2_0 takes the pq2_0 ceiling; it is not
 // measured.
 static int kq_largem_max_k(const std::string& t) {
   if (t == "q2_k" || t == "pq2_0" || t == "q2_0") {
@@ -294,7 +304,7 @@ static bool kq_splitk_codec(const std::string& t) {
       t == "iq3_xxs" || t == "iq3_s" || t == "iq2_xxs" || t == "iq2_xs" ||
       t == "iq2_s" || t == "iq1_s" || t == "iq1_m" || t == "stq1_0" ||
       t == "pq2_0" || t == "q2_0" || t == "ptq1_0" || t == "q4_0" ||
-      t == "q4_1" || t == "q5_0" || t == "q5_1";
+      t == "q4_1" || t == "q5_0" || t == "q5_1" || t == "nvfp4";
 }
 
 // Non-NAX default split-K entry M per codec (0 = env lever only).
@@ -440,6 +450,19 @@ static int kq_verify_mma_min_m_nax(const std::string& t) {
 // up one row: at the bf16 entries the kernel ran up to 1.10x slower on K
 // 4096 and 1.21x at N 12288, K 2560. A vocab head keeps M 3 on both types
 // (0.97x).
+//
+// nvfp4 was fitted the same way on bf16 and f16 over 24 shapes of N 256 to
+// 248320 and K 2048 to 17408, against the routes of its kq_nax_small_m row.
+// Times below are of the kernel against the default route it displaces at
+// the entry. A vocab head enters at M 3 (0.89x on bf16, 1.01x on f16). N
+// 512 and below has no entry: NAX split-K runs 1.07-1.42x faster there
+// through M 8. K 6144 and wider, and N 1024 from K 4096, enter at M 2
+// (0.83-1.04x; N 4096, K 8192 runs 1.04x slower at M 2 on f16). N 1025 to
+// 2048 enters at M 3 from K 4096 (0.85-0.90x), and N 513 to 2048 at M 5
+// below K 4096 (0.99-1.02x). Wider N under K 6144 enters at M 4 on bf16
+// and M 5 on f16 (0.84-1.05x; N 6144, K 5120 runs 1.05x slower at M 4 on
+// bf16). At M 8 the kernel takes 0.78-0.96x the time of NAX split-K from N
+// 2048, and 0.67x on a vocab head.
 static int kq_verify_nax_min_m(const std::string& t, int N, int K, bool f16) {
   if (t == "iq4_xs" || t == "iq4_nl") {
     if (N >= 100000) {
@@ -454,6 +477,21 @@ static int kq_verify_nax_min_m(const std::string& t, int N, int K, bool f16) {
   if (t == "pq2_0" || t == "q2_0" || t == "q4_0" || t == "q4_k" ||
       t == "q5_k") {
     return 3;
+  }
+  if (t == "nvfp4") {
+    if (N >= 100000) {
+      return 3;
+    }
+    if (N <= 512) {
+      return 0;
+    }
+    if (K >= 6144 || (N <= 1024 && K >= 4096)) {
+      return 2;
+    }
+    if (N <= 2048) {
+      return K >= 4096 ? 3 : 5;
+    }
+    return f16 ? 5 : 4;
   }
   if (t == "q8_0") {
     return 6;
@@ -475,7 +513,7 @@ static int kq_splitk_min_m(const std::string& t) {
     return kq_splitk_min_m_nax_alu(t);
   }
   if (t == "q4_k" || t == "q6_k" || t == "q2_k" || t == "iq2_xxs" ||
-      t == "q4_1" || t == "q5_1") {
+      t == "q4_1" || t == "q5_1" || t == "nvfp4") {
     return 4;
   }
   if (t == "q5_k" || t == "q8_0" || t == "iq4_nl" || t == "iq3_xxs" ||
@@ -508,7 +546,7 @@ static int kq_splitk_min_m(const std::string& t) {
 // env lever only). The un-split BM=32 grid is ceil(N/64) threadgroups
 // with a serial in-tile K walk, and split-K multiplies the threadgroup
 // count. Between qmv and split-K, the verify routes (verify_nax for
-// pq2_0, q4_0, q8_0 and q2_k to q6_k, verify_mma for ptq1_0) keep
+// pq2_0, q4_0, q8_0, q2_k to q6_k and nvfp4, verify_mma for ptq1_0) keep
 // their own entries through M 8, so those codecs' split-K entries take
 // only the widths above M 8 and the calls verify_nax declines. Other
 // codecs run the mat-vec kernels (mv_ext, verify_qmv) there, or the BM=32
@@ -528,7 +566,11 @@ static int kq_splitk_min_m(const std::string& t) {
 // (1.1-3x). Above N 1024, iq2_xxs keeps the mat-vec kernels through
 // M 12, where its split-K tile runs 1.2-3.6x slower. These figures cover
 // the table's own routes. verify_nax takes its band from them where it
-// measured faster.
+// measured faster. The nvfp4 row was fitted the same way on bf16 and f16
+// over 16 shapes (N 256 to 248320, K 2048 to 17408) and held out on 8 (N
+// 512 to 14336, K 2048 to 14336), with its verify_nax entries. It
+// runs at 1.006x the fastest route on the fitted cells and 1.002x on the
+// held-out ones, against 1.065x and 1.109x for the q2_0 row it replaces.
 struct KqNaxSmallM {
   int qmv_m[4];
   int splitk_small;
@@ -595,6 +637,13 @@ static KqNaxSmallM kq_nax_small_m(const std::string& t) {
   }
   if (t == "pq2_0" || t == "q2_0" || t == "ptq1_0") {
     return {{8, 5, 3, 2}, 9, 9};
+  }
+  if (t == "nvfp4") {
+    // Per-row qmv keeps M 2 only for N 1025 to 2048. At N 1024 it runs
+    // 1.14-1.26x faster than the table's route at K 2048, M 2 to 4, but
+    // 1.1-1.4x slower than verify_nax from K 4096, so that bucket keeps it
+    // at M 1.
+    return {{1, 1, 2, 1}, 2, 6};
   }
   return {{1, 1, 1, 1}, 0, 0};
 }
@@ -2503,11 +2552,20 @@ static int kq_verify_nax_wave_splits(int sgs, int steps, double partial_c) {
 // and 1.65x. It cut the verify_nax matmul time of one Qwen3.8-27B forward
 // by 2.4-2.8% on q5_k and 0.05-0.4% on q4_0 and q4_k. q6_k and q8_0 keep
 // their simdgroup targets, which beat the wave count on that matmul time
-// by 0.3-0.9%, the largest share at N 17408, K 5120.
+// by 0.3-0.9%, the largest share at N 17408, K 5120. nvfp4 fits best at
+// 1280 (M5 Max, bfloat16, M 3, 5 and 8 over 14 shapes of N 512 to 248320
+// and K 2048 to 17408): 1.01x the best measured count on average and 1.07x
+// at worst, against 1.04x and 1.20x for the simdgroup target, which left
+// the vocab head unsplit at 1.14-1.17x the time of 5 to 10 splits. 640
+// takes N 17408, K 5120 unsplit (1.08x) and 2560 takes N 4096, K 8192 at
+// 32 splits (1.08-1.10x).
 static double kq_verify_nax_partial_c(const std::string& t, int kstep) {
   if (t == "q4_k" || (t == "q4_0" && kstep == 256) || t == "iq4_xs" ||
       t == "iq4_nl") {
     return 640.0;
+  }
+  if (t == "nvfp4") {
+    return 1280.0;
   }
   if (t == "q2_k" || t == "q3_k" || t == "q5_k") {
     return 2560.0;

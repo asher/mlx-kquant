@@ -20,7 +20,10 @@ subtract it. Arm order rotates by one slot every round and reverses on
 odd rounds.
 
 Weights are real codec output: --seed-rows float rows are quantized with
-kq.quantize and tiled to N. The chain cycles through enough distinct
+kq.quantize and tiled to N. The decode-only codecs (mxfp4, nvfp4), which
+kq.quantize cannot encode, take --seed-rows rows of synthetic wire from
+tests/kqref.py synth_wire instead, with nvfp4 group scales of 1/64 to
+1/32, the range of real weights. The chain cycles through enough distinct
 copies of the weights to exceed --stream-mb, so each call streams its
 weights from DRAM the way a forward does instead of reading them from the
 system cache. Before timing, every arm's output is checked against an f32
@@ -84,8 +87,9 @@ VERIFY_NAX = {
     "q6_k": 128,
     "q3_k": 128,
     "q2_k": 128,
+    "nvfp4": 128,
 }
-NO_NAX = {"mxfp4", "nvfp4"}
+NO_NAX = {"mxfp4"}
 
 
 def applies(route, codec, M, K, nax):
@@ -107,13 +111,43 @@ def applies(route, codec, M, K, nax):
     return False
 
 
+def synth_weights(codec, rows, K):
+    """Synthetic wire for a codec kq.quantize cannot encode."""
+    import sys
+
+    import mlx.core as mx
+    import numpy as np
+
+    from mlx_kquant.codec_geometry import geometry
+
+    tests = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tests")
+    sys.path.insert(0, os.path.abspath(tests))
+    from kqref import synth_wire
+
+    _, _, bpb, wpb = geometry(codec)
+    wire = synth_wire(
+        np.random.default_rng(K),
+        codec,
+        bpb,
+        rows * (K // wpb),
+        nvfp4_scales=(0x08, 0x11),
+    )
+    return mx.array(wire.reshape(rows, (K // wpb) * bpb)), mx.zeros((1,), mx.uint8)
+
+
 def make_weights(codec, N, K, seed_rows):
     import mlx.core as mx
 
     import mlx_kquant as kq
+    from mlx_kquant.codec_geometry import DECODE_ONLY_CODECS
 
-    wf = mx.random.normal((seed_rows, K), key=mx.random.key(K)).astype(mx.float32)
-    w, s = kq.quantize(wf, codec)
+    if codec in DECODE_ONLY_CODECS:
+        wf = None
+        w, s = synth_weights(codec, seed_rows, K)
+    else:
+        wf = mx.random.normal((seed_rows, K), key=mx.random.key(K))
+        wf = wf.astype(mx.float32)
+        w, s = kq.quantize(wf, codec)
     mx.eval(w, s)
     reps = (N + seed_rows - 1) // seed_rows
     wt = mx.tile(w, (reps, 1))[:N] if w.ndim == 2 else w

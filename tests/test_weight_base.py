@@ -2,7 +2,7 @@
 
 The GPU kernels need a packed weight to start on a 2-, 4-, 8- or 16-byte
 boundary, by codec, and the ops raise ValueError on a start off it instead
-of returning wrong values. mxfp4 and nvfp4 run from any start, as do the
+of returning wrong values. mxfp4 runs from any start, as do the
 CPU kernels of every codec. A weight is moved off its boundary by copying
 its bytes into a larger buffer at an offset and passing a view of them.
 
@@ -31,8 +31,8 @@ BASE_ALIGN = {
     "q4_1": 4,
     "q5_1": 4,
     "ptq1_0": 4,
+    "nvfp4": 4,
     "mxfp4": 1,
-    "nvfp4": 1,
 }
 # verify_nax's own start check, stricter than BASE_ALIGN for these codecs.
 VNAX_BASE = {"pq2_0": 4, "q2_0": 4, "q4_0": 4, "q8_0": 4}

@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.2]
+
 ### Changed
 - `q8_0` `quantized_matmul` at one activation row takes less time on every GPU.
   `KQ_QMV_SPLITK=0` restores the previous kernels.
@@ -19,6 +21,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - On M5 GPUs `quantized_matmul` at one activation row takes up to 26% less
   time for the iq1, iq2 and iq3 codecs. `KQ_QMV_C32=0` restores the previous
   kernels.
+- `nvfp4` `quantized_matmul` at one activation row takes about a third of the
+  time, and from 4 to 32 rows on GPUs without NAX it runs on split-K tiles,
+  about half the time at 8 rows. An `nvfp4` weight must now start on a 4-byte
+  boundary, as GGUF tensors do.
+- `nvfp4` runs on the NAX tensor units of M5 GPUs, for matmuls, MoE gathers
+  and speculative verify, with small-batch routing tuned for M5.
 
 ## [0.5.1]
 

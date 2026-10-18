@@ -40,7 +40,7 @@ NAX_CODECS = sorted(
         "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "q8_0",
         "q4_0", "q4_1", "q5_0", "q5_1",
         "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s",
-        "iq4_nl", "iq4_xs", "stq1_0", "pq2_0", "ptq1_0", "q2_0",
+        "iq4_nl", "iq4_xs", "stq1_0", "pq2_0", "ptq1_0", "q2_0", "nvfp4",
     ]
 )  # fmt: skip
 
@@ -163,7 +163,7 @@ def test_large_rows_k_ceiling(codec):
 
 
 # Codecs whose large-M row has no K ceiling, on BK=64 and on BK=128 tiles.
-NO_MAX_K = ["q6_k", "iq2_s", "iq2_xs", "iq3_s", "iq3_xxs", "iq4_xs"]
+NO_MAX_K = ["q6_k", "iq2_s", "iq2_xs", "iq3_s", "iq3_xxs", "iq4_xs", "nvfp4"]
 
 
 @pytest.mark.parametrize("codec", NO_MAX_K)
