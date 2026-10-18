@@ -17,6 +17,11 @@ a shared .npz cache.
 
 Cells: codec x (N,K) shape x M, all M chosen inside the even-ceil(M/64)
 dispatch window. GB/s = weight-bytes / call. Markdown + JSON out.
+
+--tile-ab is the source of the large-M K ceilings (`kq_largem_max_k`): the
+arms force KQ_NAX_TILE to 128,64,2,2 and 64,64,2,2, which bypasses the
+current ceiling and the parity rule, so M may sit at either parity. Run it
+at N 4096 and M 4128, 8256 and 16384 over K 4096, 10240, 12288 and 16384.
 """
 
 import argparse
@@ -102,23 +107,26 @@ def child_main():
 
 
 def probe_layout(codec, N, K):
-    """Synthesize (w, scales) in the codec's quantized layout: IQ codecs
-    via the tests' synthetic-wire helper (their encoder demands an
-    imatrix), encodable codecs by random-filling the shape of a probe
-    quantize."""
+    """Synthesize (w, scales) in the codec's quantized layout: the IQ
+    codecs, stq1_0 and the decode-only codecs via the tests' synthetic-wire
+    helper (the IQ encoders demand an imatrix, and nvfp4 has no encoder;
+    its group scales are 1/64 to 1/32), encodable codecs by random-filling
+    the shape of a probe quantize."""
     import numpy as np
 
-    if codec.startswith("iq") or codec == "stq1_0":
+    from mlx_kquant.codec_geometry import DECODE_ONLY_CODECS, geometry
+
+    if codec.startswith("iq") or codec == "stq1_0" or codec in DECODE_ONLY_CODECS:
         tests_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "tests",
         )
         sys.path.insert(0, tests_dir)
-        from test_codecs import CODECS, _synth_iq_wire
+        from kqref import synth_wire
 
-        _, wpb, bpb, _, _ = CODECS[codec]
+        _, _, bpb, wpb = geometry(codec)
         rng = np.random.default_rng(N + K)
-        wire = _synth_iq_wire(rng, bpb, N * (K // wpb))
+        wire = synth_wire(rng, codec, bpb, N * (K // wpb), nvfp4_scales=(0x08, 0x11))
         return (
             wire.reshape(N, (K // wpb) * bpb),
             np.zeros((1,), dtype=np.uint8),
@@ -159,18 +167,28 @@ def main():
         help="on-arm runs with KQ_NAX_BM128 unset (per-codec "
         "policy) instead of 1 (force floor 193)",
     )
+    ap.add_argument(
+        "--tile-ab",
+        action="store_true",
+        help="arms force KQ_NAX_TILE=128,64,2,2 and 64,64,2,2 (K ceiling "
+        "sweep; M at either parity)",
+    )
     ap.add_argument("--json-out")
     args = ap.parse_args()
     shapes = [tuple(int(v) for v in s.split("x")) for s in args.shapes.split(",")]
     for m in args.ms:
-        assert ((m + 63) // 64) % 2 == 0, f"M={m} outside even-ceil window"
+        assert args.tile_ab or ((m + 63) // 64) % 2 == 0, (
+            f"M={m} outside even-ceil window"
+        )
 
     tmp = tempfile.mkdtemp(prefix="bm128ab-")
     env_base = dict(os.environ)
 
     def spawn(bm128):
         env = dict(env_base)
-        if bm128 is None:  # policy mode: leave the tri-state env unset
+        if args.tile_ab:
+            env["KQ_NAX_TILE"] = "128,64,2,2" if bm128 != "0" else "64,64,2,2"
+        elif bm128 is None:  # policy mode: leave the tri-state env unset
             env.pop("KQ_NAX_BM128", None)
         else:
             env["KQ_NAX_BM128"] = bm128
