@@ -4,13 +4,17 @@ The feeder's staging memory (docs/feeder/DESIGN.md): one allocation seen as a
 writable memoryview by the CPU feeder and as a uint8 array by kernels. Tests
 cover both sides observing the same bytes, disk reads landing directly in the
 buffer via os.preadv, a kquant kernel consuming arena-backed wire bytes
-identically to a normal array, and the full staged handoff ordered by the
-shared-event pair.
+identically to a normal array, the full staged handoff ordered by the
+shared-event pair, a residency commit on a worker thread leaving the other
+threads running, residency calls from two threads at once, and residency
+calls refusing an array that was never evaluated.
 """
 
 import os
+import sys
 import tempfile
 import threading
+import time
 
 import mlx.core as mx
 import numpy as np
@@ -99,3 +103,89 @@ def test_alloc_validation():
         kq.arena_alloc([0, 4])
     with pytest.raises(ValueError):
         kq.arena_alloc([-1])
+
+
+def _commit_stall():
+    # A worker wires a fresh arena while this thread keeps running Python.
+    # Returns this thread's longest pause and the commit's length.
+    arr, _ = kq.arena_alloc([1 << 30])
+    took = {}
+
+    def worker():
+        kq.residency_insert(arr)
+        t0 = time.perf_counter()
+        kq.residency_commit()
+        took["commit"] = time.perf_counter() - t0
+        kq.residency_erase(arr)
+        kq.residency_commit()
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-4)
+    try:
+        th = threading.Thread(target=worker)
+        gap, last = 0.0, time.perf_counter()
+        th.start()
+        while th.is_alive():
+            now = time.perf_counter()
+            gap = max(gap, now - last)
+            last = now
+        th.join()
+    finally:
+        sys.setswitchinterval(interval)
+    return gap, took["commit"]
+
+
+@metal
+def test_residency_commit_lets_other_threads_run():
+    # A commit that held the GIL would stall this thread for its whole length.
+    # Up to five tries keep a scheduler hiccup from failing it.
+    if not kq.residency_commit():
+        pytest.skip("no Metal residency set (needs macOS 15)")
+    tries = []
+    for _ in range(5):
+        gap, commit = _commit_stall()
+        tries.append((gap, commit))
+        if commit >= 0.005 and gap < commit / 2:
+            return
+    if all(commit < 0.005 for _, commit in tries):
+        pytest.skip("commits too short to tell")
+    pytest.fail(f"other threads stalled for the commit: {tries}")
+
+
+@metal
+def test_residency_calls_from_two_threads():
+    # Metal's residency set is not thread-safe. Without the lock, two threads
+    # staging the same buffer crash in addAllocation.
+    if not kq.residency_commit():
+        pytest.skip("no Metal residency set (needs macOS 15)")
+    arr, _ = kq.arena_alloc([1 << 16])
+    go = threading.Barrier(2)
+
+    def churn():
+        go.wait()
+        # A loaded machine hands the GIL over slowly. Stop after 2 s there.
+        end = time.perf_counter() + 2.0
+        for i in range(100_000):
+            kq.residency_insert(arr)
+            kq.residency_erase(arr)
+            if not i & 1023 and time.perf_counter() > end:
+                break
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        threads = [threading.Thread(target=churn) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        sys.setswitchinterval(interval)
+    assert kq.residency_erase(arr)
+    assert kq.residency_commit()
+
+
+def test_residency_calls_refuse_an_unevaluated_array():
+    a = mx.arange(4) + 1
+    assert not kq.residency_insert(a)
+    assert not kq.residency_erase(a)

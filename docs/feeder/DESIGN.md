@@ -149,6 +149,9 @@ Two findings from benchmarking the pair inside real MLX graphs:
 page-aligned host memory wrapped no-copy in a Metal shared buffer, returned
 as a uint8 array plus a writable memoryview over the same bytes, so
 `os.preadv` reads disk straight into kernel-visible memory.
+`arena_alloc` and the residency calls (`residency_insert`,
+`residency_commit`, `residency_erase`) release the GIL, so a feeder thread
+can allocate and wire a slot while Python runs on the other threads.
 
 The prefill feeder itself lives in gguf-mlx (`gguf_mlx/feeder.py`,
 `KQ_FEEDER_PREFILL=1`): a two-slot ring of arena buffers, one slot per layer
