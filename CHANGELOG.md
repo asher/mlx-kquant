@@ -7,9 +7,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Changed
-- `arena_alloc`, `residency_insert`, `residency_commit` and `residency_erase`
-  release the GIL, so a residency commit on a worker thread no longer pauses
-  the other Python threads.
+- A residency commit or `arena_alloc` on a worker thread no longer pauses the
+  other Python threads.
+
+### Fixed
+- `residency_insert` and `residency_erase` return False for an array that was
+  never evaluated, where they crashed.
 
 ## [0.5.2]
 

@@ -5,8 +5,8 @@ writable memoryview by the CPU feeder and as a uint8 array by kernels. Tests
 cover both sides observing the same bytes, disk reads landing directly in the
 buffer via os.preadv, a kquant kernel consuming arena-backed wire bytes
 identically to a normal array, the full staged handoff ordered by the
-shared-event pair, and a residency commit on a worker thread leaving the
-other threads running.
+shared-event pair, a residency commit on a worker thread leaving the other
+threads running, and residency calls from two threads at once.
 """
 
 import os
@@ -136,12 +136,51 @@ def _commit_stall():
 
 @metal
 def test_residency_commit_lets_other_threads_run():
-    # A commit that held the GIL would stall this thread for its length on
-    # every try; three tries keep a scheduler hiccup from failing it.
+    # A commit that held the GIL would stall this thread for its whole length.
+    # Up to five tries keep a scheduler hiccup from failing it.
     if not kq.residency_commit():
         pytest.skip("no Metal residency set (needs macOS 15)")
-    tries = [_commit_stall() for _ in range(3)]
-    timed = [(gap, commit) for gap, commit in tries if commit >= 0.005]
-    if not timed:
+    tries = []
+    for _ in range(5):
+        gap, commit = _commit_stall()
+        tries.append((gap, commit))
+        if commit >= 0.005 and gap < commit / 2:
+            return
+    if all(commit < 0.005 for _, commit in tries):
         pytest.skip("commits too short to tell")
-    assert any(gap < commit / 2 for gap, commit in timed), tries
+    pytest.fail(f"other threads stalled for the commit: {tries}")
+
+
+@metal
+def test_residency_calls_from_two_threads():
+    # Metal's residency set is not thread-safe. Without the lock, two threads
+    # staging the same buffer crash in addAllocation.
+    if not kq.residency_commit():
+        pytest.skip("no Metal residency set (needs macOS 15)")
+    arr, _ = kq.arena_alloc([1 << 16])
+    go = threading.Barrier(2)
+
+    def churn():
+        go.wait()
+        for _ in range(100_000):
+            kq.residency_insert(arr)
+            kq.residency_erase(arr)
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        threads = [threading.Thread(target=churn) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        sys.setswitchinterval(interval)
+    assert kq.residency_erase(arr)
+    assert kq.residency_commit()
+
+
+def test_residency_calls_refuse_an_unevaluated_array():
+    a = mx.arange(4) + 1
+    assert not kq.residency_insert(a)
+    assert not kq.residency_erase(a)

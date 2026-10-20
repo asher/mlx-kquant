@@ -106,11 +106,14 @@ static MTL::ResidencySet* kq_residency_set() {
   return rs;
 }
 
-// The bindings release the GIL around insert, commit and erase, so threads
-// can reach the set at once; this lock serializes them.
+// Metal's residency set is not thread-safe, and the bindings release the GIL.
+// One lock serializes every call on the set.
 static std::mutex kq_residency_mu;
 
 bool residency_insert(const mx::array& a) {
+  if (a.data_shared_ptr() == nullptr) {
+    return false;
+  }
   const void* ptr = a.buffer().ptr();
   if (ptr == nullptr) {
     return false;
@@ -136,6 +139,9 @@ bool residency_commit() {
 }
 
 bool residency_erase(const mx::array& a) {
+  if (a.data_shared_ptr() == nullptr) {
+    return false;
+  }
   const void* ptr = a.buffer().ptr();
   if (ptr == nullptr) {
     return false;

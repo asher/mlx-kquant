@@ -3020,7 +3020,7 @@ NB_MODULE(_ext, m) {
             throw std::invalid_argument(
                 "[mlx_kquant.arena_alloc] itemsize must be 1, 2, 4 or 8.");
         }
-        // A large map and buffer wrap take a while; let other threads run.
+        // With a wired limit set, MLX wires the new buffer here.
         auto [arr, addr] = [&] {
           nb::gil_scoped_release nogil;
           return mlx_kquant::arena_alloc(
@@ -3041,6 +3041,7 @@ NB_MODULE(_ext, m) {
         Allocate a page-aligned host buffer wrapped zero-copy as a Metal
         shared-storage unsigned-integer array (dtype uint8/16/32/64 per
         ``itemsize``; wider itemsizes let a >2 GiB slot fit int32 shape dims).
+        Releases the GIL while it allocates.
 
         Returns (array, memoryview): the same bytes seen from both sides,
         the memoryview always byte-addressed over the full allocation.
@@ -3054,9 +3055,11 @@ NB_MODULE(_ext, m) {
 
   m.def(
       "residency_insert",
-      &mlx_kquant::residency_insert,
+      [](mlx::core::array a) {
+        nb::gil_scoped_release nogil;
+        return mlx_kquant::residency_insert(a);
+      },
       "a"_a,
-      nb::call_guard<nb::gil_scoped_release>(),
       "Stage ``a``'s underlying Metal buffer for the device residency set "
       "(wired for the buffer's lifetime once residency_commit runs), so "
       "command buffers stop re-wiring its pages on every use. The array "
@@ -3073,9 +3076,11 @@ NB_MODULE(_ext, m) {
 
   m.def(
       "residency_erase",
-      &mlx_kquant::residency_erase,
+      [](mlx::core::array a) {
+        nb::gil_scoped_release nogil;
+        return mlx_kquant::residency_erase(a);
+      },
       "a"_a,
-      nb::call_guard<nb::gil_scoped_release>(),
       "Stage removal of ``a``'s buffer from the residency set (call before "
       "dropping a member buffer; takes effect at the next commit). "
       "Releases the GIL. False on non-Metal builds or missing data.");
