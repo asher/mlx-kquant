@@ -3445,6 +3445,7 @@ std::pair<mx::array, uintptr_t> arena_alloc(
 // decode once weights are host-pinned). Membership lasts for the buffer's
 // lifetime. Both return false on non-Metal builds; insert also returns
 // false for an array with no materialized data.
+// Safe to call from any thread: one lock serializes the three calls.
 bool residency_insert(const mx::array& a);
 bool residency_commit();
 // Remove before freeing a set member (a freed buffer must not stay in the

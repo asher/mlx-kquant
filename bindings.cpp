@@ -3020,8 +3020,12 @@ NB_MODULE(_ext, m) {
             throw std::invalid_argument(
                 "[mlx_kquant.arena_alloc] itemsize must be 1, 2, 4 or 8.");
         }
-        auto [arr, addr] = mlx_kquant::arena_alloc(
-            mlx::core::Shape(shape.begin(), shape.end()), dt);
+        // A large map and buffer wrap take a while; let other threads run.
+        auto [arr, addr] = [&] {
+          nb::gil_scoped_release nogil;
+          return mlx_kquant::arena_alloc(
+              mlx::core::Shape(shape.begin(), shape.end()), dt);
+        }();
         PyObject* mv = PyMemoryView_FromMemory(
             reinterpret_cast<char*>(addr),
             static_cast<Py_ssize_t>(arr.nbytes()),
@@ -3052,25 +3056,29 @@ NB_MODULE(_ext, m) {
       "residency_insert",
       &mlx_kquant::residency_insert,
       "a"_a,
+      nb::call_guard<nb::gil_scoped_release>(),
       "Stage ``a``'s underlying Metal buffer for the device residency set "
       "(wired for the buffer's lifetime once residency_commit runs), so "
       "command buffers stop re-wiring its pages on every use. The array "
-      "must have materialized data (evaluate first). False on non-Metal "
-      "builds or missing data.");
+      "must have materialized data (evaluate first). Releases the GIL. "
+      "False on non-Metal builds or missing data.");
 
   m.def(
       "residency_commit",
       &mlx_kquant::residency_commit,
+      nb::call_guard<nb::gil_scoped_release>(),
       "Commit staged residency_insert additions and request residency. "
-      "False on non-Metal builds.");
+      "Releases the GIL, so other Python threads run while new pages are "
+      "wired. False on non-Metal builds.");
 
   m.def(
       "residency_erase",
       &mlx_kquant::residency_erase,
       "a"_a,
+      nb::call_guard<nb::gil_scoped_release>(),
       "Stage removal of ``a``'s buffer from the residency set (call before "
-      "dropping a member buffer; takes effect at the next commit). False "
-      "on non-Metal builds or missing data.");
+      "dropping a member buffer; takes effect at the next commit). "
+      "Releases the GIL. False on non-Metal builds or missing data.");
 
   // --- shared-event stream primitives (feeder loop) ---
 

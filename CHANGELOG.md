@@ -6,6 +6,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- `arena_alloc`, `residency_insert`, `residency_commit` and `residency_erase`
+  release the GIL, so a residency commit on a worker thread no longer pauses
+  the other Python threads.
+
 ## [0.5.2]
 
 ### Changed

@@ -4,13 +4,16 @@ The feeder's staging memory (docs/feeder/DESIGN.md): one allocation seen as a
 writable memoryview by the CPU feeder and as a uint8 array by kernels. Tests
 cover both sides observing the same bytes, disk reads landing directly in the
 buffer via os.preadv, a kquant kernel consuming arena-backed wire bytes
-identically to a normal array, and the full staged handoff ordered by the
-shared-event pair.
+identically to a normal array, the full staged handoff ordered by the
+shared-event pair, and a residency commit on a worker thread leaving the
+other threads running.
 """
 
 import os
+import sys
 import tempfile
 import threading
+import time
 
 import mlx.core as mx
 import numpy as np
@@ -99,3 +102,46 @@ def test_alloc_validation():
         kq.arena_alloc([0, 4])
     with pytest.raises(ValueError):
         kq.arena_alloc([-1])
+
+
+def _commit_stall():
+    # A worker wires a fresh arena while this thread keeps running Python.
+    # Returns this thread's longest pause and the commit's length.
+    arr, _ = kq.arena_alloc([1 << 30])
+    took = {}
+
+    def worker():
+        kq.residency_insert(arr)
+        t0 = time.perf_counter()
+        kq.residency_commit()
+        took["commit"] = time.perf_counter() - t0
+        kq.residency_erase(arr)
+        kq.residency_commit()
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-4)
+    try:
+        th = threading.Thread(target=worker)
+        gap, last = 0.0, time.perf_counter()
+        th.start()
+        while th.is_alive():
+            now = time.perf_counter()
+            gap = max(gap, now - last)
+            last = now
+        th.join()
+    finally:
+        sys.setswitchinterval(interval)
+    return gap, took["commit"]
+
+
+@metal
+def test_residency_commit_lets_other_threads_run():
+    # A commit that held the GIL would stall this thread for its length on
+    # every try; three tries keep a scheduler hiccup from failing it.
+    if not kq.residency_commit():
+        pytest.skip("no Metal residency set (needs macOS 15)")
+    tries = [_commit_stall() for _ in range(3)]
+    timed = [(gap, commit) for gap, commit in tries if commit >= 0.005]
+    if not timed:
+        pytest.skip("commits too short to tell")
+    assert any(gap < commit / 2 for gap, commit in timed), tries

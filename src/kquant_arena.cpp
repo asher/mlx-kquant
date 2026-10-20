@@ -11,6 +11,7 @@
 // synchronizes on its own.
 
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -105,6 +106,10 @@ static MTL::ResidencySet* kq_residency_set() {
   return rs;
 }
 
+// The bindings release the GIL around insert, commit and erase, so threads
+// can reach the set at once; this lock serializes them.
+static std::mutex kq_residency_mu;
+
 bool residency_insert(const mx::array& a) {
   const void* ptr = a.buffer().ptr();
   if (ptr == nullptr) {
@@ -114,6 +119,7 @@ bool residency_insert(const mx::array& a) {
   if (rs == nullptr) {
     return false;
   }
+  std::lock_guard<std::mutex> lk(kq_residency_mu);
   rs->addAllocation(static_cast<MTL::Buffer*>(const_cast<void*>(ptr)));
   return true;
 }
@@ -123,6 +129,7 @@ bool residency_commit() {
   if (rs == nullptr) {
     return false;
   }
+  std::lock_guard<std::mutex> lk(kq_residency_mu);
   rs->commit();
   rs->requestResidency();
   return true;
@@ -137,6 +144,7 @@ bool residency_erase(const mx::array& a) {
   if (rs == nullptr) {
     return false;
   }
+  std::lock_guard<std::mutex> lk(kq_residency_mu);
   rs->removeAllocation(static_cast<MTL::Buffer*>(const_cast<void*>(ptr)));
   return true;
 }
