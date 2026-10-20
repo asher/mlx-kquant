@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.3]
+
 ### Changed
 - A residency commit or `arena_alloc` on a worker thread no longer pauses the
   other Python threads.
