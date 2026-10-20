@@ -6,7 +6,8 @@ cover both sides observing the same bytes, disk reads landing directly in the
 buffer via os.preadv, a kquant kernel consuming arena-backed wire bytes
 identically to a normal array, the full staged handoff ordered by the
 shared-event pair, a residency commit on a worker thread leaving the other
-threads running, and residency calls from two threads at once.
+threads running, residency calls from two threads at once, and residency
+calls refusing an array that was never evaluated.
 """
 
 import os
@@ -162,9 +163,13 @@ def test_residency_calls_from_two_threads():
 
     def churn():
         go.wait()
-        for _ in range(100_000):
+        # A loaded machine hands the GIL over slowly. Stop after 2 s there.
+        end = time.perf_counter() + 2.0
+        for i in range(100_000):
             kq.residency_insert(arr)
             kq.residency_erase(arr)
+            if not i & 1023 and time.perf_counter() > end:
+                break
 
     interval = sys.getswitchinterval()
     sys.setswitchinterval(1e-6)

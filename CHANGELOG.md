@@ -12,7 +12,7 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 - `residency_insert` and `residency_erase` return False for an array that was
-  never evaluated, where they crashed.
+  never evaluated instead of crashing.
 
 ## [0.5.2]
 
