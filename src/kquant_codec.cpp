@@ -1,5 +1,7 @@
 #include "kquant_codec.h"
 
+#include <stdexcept>
+
 namespace mlx_kquant {
 
 // Per-codec block geometry:
@@ -8,7 +10,9 @@ namespace mlx_kquant {
 // All integer codecs carry NAX prefill kernels. IQ encode lands incrementally
 // (iq4_nl, iq4_xs so far); requires_imatrix marks the ggml imatrix-required IQ
 // codecs. The native-fp codecs (mxfp4, nvfp4) are decode-only wire codecs
-// (no encode) with full CPU + Metal ALU matmul families; no NAX yet.
+// (no encode) with full CPU + Metal ALU matmul families; no NAX yet. mxfp8 is
+// decode-only and gather-only: lookup tables read by row, so it has a CPU +
+// Metal dequantize and no matmul kernel on any device.
 static const std::vector<KQuantCodec>& registry() {
   static const std::vector<KQuantCodec> codecs = {
       {"q2_k", 256, 84, 2, true, true, true, false},
@@ -36,6 +40,7 @@ static const std::vector<KQuantCodec>& registry() {
       {"q2_0", 64, 18, 2, true, true, true, false},
       {"mxfp4", 32, 17, 4, true, false, false, false},
       {"nvfp4", 64, 36, 4, true, false, true, false},
+      {"mxfp8", 32, 33, 8, false, false, false, false},
   };
   return codecs;
 }
@@ -47,6 +52,15 @@ const KQuantCodec* codec_by_name(const std::string& name) {
     }
   }
   return nullptr;
+}
+
+void require_matmul_codec(const KQuantCodec& codec, const std::string& op) {
+  if (!codec.has_matmul_kernel) {
+    throw std::invalid_argument(
+        op + " codec '" + codec.name +
+        "' is gather-only and has no matmul: gather its rows and "
+        "dequantize them (KQuantEmbedding does both).");
+  }
 }
 
 std::vector<std::string> codec_names() {

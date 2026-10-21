@@ -12,6 +12,10 @@ Runs under pytest; skipped automatically when the extension is unavailable.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+
 import numpy as np
 import pytest
 
@@ -102,6 +106,269 @@ def test_load_gguf_codecs_newer_than_gguf_py(tmp_path, name):
         # a build without Metal has no zero-copy view: every load is a copy
         assert bool(aliases) == (zero_copy and mx.metal.is_available())
         del arrays, got
+
+
+def _write_gguf(path, tensors, alignment=None):
+    w = GGUFWriter(str(path), "smoke")
+    if alignment is not None:
+        w.add_custom_alignment(alignment)
+    for name, arr, dtype in tensors:
+        w.add_tensor(name, arr, raw_dtype=dtype)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
+def _type_43_tensors(stq_rows=6, mx8_rows=12):
+    """An STQ1_0 weight (rows of 1024) and an MXFP8 table (rows of 256), the
+    two formats that share ggml type 43, as (name, wire, sentinel, codec)."""
+    from kqref import MXFP8, STQ1_0, synth_wire
+
+    rng = np.random.default_rng(2)
+    stq = synth_wire(rng, "stq1_0", 42, stq_rows * 4).reshape(stq_rows, 4 * 42)
+    mx8 = synth_wire(rng, "mxfp8", 33, mx8_rows * 8).reshape(mx8_rows, 8 * 33)
+    return {
+        "blk.0.ffn_up.weight": (stq, STQ1_0, "stq1_0", 1024),
+        "per_layer_token_embd.weight": (mx8, MXFP8, "mxfp8", 256),
+    }
+
+
+def _check_type_43_load(path, want):
+    from kqref import quants
+
+    for zero_copy in (True, False):
+        arrays, codecs, _, shapes = kq.load_gguf(str(path), zero_copy=zero_copy)
+        for name, (wire, sent, codec, k) in want.items():
+            assert codecs[name] == codec, name
+            assert list(shapes[name]) == [k, wire.shape[0]]
+            got = arrays[name]
+            assert got.dtype == mx.uint8 and np.array_equal(np.array(got), wire)
+            scales = arrays[name.removesuffix(".weight") + ".scales"]
+            out = kq.dequantize(got, scales, codec, dtype=mx.float32)
+            assert np.array_equal(np.array(out), quants.dequantize(wire, sent.name))
+        del arrays, got, out
+
+
+@pytest.mark.parametrize("layout", ["stq1_0_first", "mxfp8_first", "mxfp8_only"])
+def test_load_gguf_type_43_resolves_by_span(tmp_path, layout):
+    """Type 43 is STQ1_0 in ternary QAT GGUFs and MXFP8 in DeepSeek-V4.1
+    engram tables, and one file can hold both. Each tensor resolves to its
+    format by the bytes it spans, up to the next tensor or, for the last
+    one, the end of the file (a standalone table file holds the table only).
+    A skipped tensor reports its codec too: the caller reads it itself."""
+    t = _type_43_tensors()
+    stq, mx8 = "blk.0.ffn_up.weight", "per_layer_token_embd.weight"
+    pad = ("pad.f32", np.arange(5, dtype=np.float32), GT.F32)
+    order = {
+        "stq1_0_first": [stq, "pad.f32", mx8],
+        "mxfp8_first": [mx8, "pad.f32", stq],
+        "mxfp8_only": [mx8],
+    }[layout]
+    tensors = [pad if n == "pad.f32" else (n, t[n][0], t[n][1]) for n in order]
+    path = tmp_path / "type43.gguf"
+    _write_gguf(path, tensors)
+
+    _check_type_43_load(path, {n: t[n] for n in order if n in t})
+
+    arrays, codecs, _, _ = kq.load_gguf(str(path), True, [mx8])
+    assert mx8 not in arrays and codecs[mx8] == "mxfp8"
+
+
+def test_load_gguf_type_43_span_uses_file_alignment(tmp_path):
+    """At general.alignment 64 a tensor carries up to 63 bytes of padding.
+    Both tensors here carry more than 32, the default alignment."""
+    t = _type_43_tensors(stq_rows=2, mx8_rows=3)
+    stq, mx8 = "blk.0.ffn_up.weight", "per_layer_token_embd.weight"
+    assert -t[stq][0].nbytes % 64 > 32 and -t[mx8][0].nbytes % 64 > 32
+    path = tmp_path / "align64.gguf"
+    _write_gguf(
+        path,
+        [
+            (stq, t[stq][0], t[stq][1]),
+            (mx8, t[mx8][0], t[mx8][1]),
+            ("pad.f32", np.arange(5, dtype=np.float32), GT.F32),
+        ],
+        alignment=64,
+    )
+    _check_type_43_load(path, t)
+
+
+def test_load_gguf_type_43_stq1_0_with_trailing_bytes(tmp_path):
+    """Bytes after the last tensor (here 32 zeros) leave an STQ1_0 tensor
+    STQ1_0: its span holds its size and is far short of the MXFP8 size."""
+    t = _type_43_tensors()
+    stq = "blk.0.ffn_up.weight"
+    path = tmp_path / "stq_tail.gguf"
+    _write_gguf(path, [(stq, t[stq][0], t[stq][1])])
+    with open(path, "ab") as f:
+        f.write(bytes(32))
+
+    _check_type_43_load(path, {stq: t[stq]})
+    arrays, codecs, _, _ = kq.load_gguf(str(path), True, [stq])
+    assert stq not in arrays and codecs[stq] == "stq1_0"
+
+
+def test_load_gguf_type_43_small_mxfp8_at_page_alignment(tmp_path):
+    """At a page-sized alignment a one-row table's padding has room for
+    either format's size. It is MXFP8, the larger size that fits."""
+    from kqref import MXFP8, synth_wire
+
+    wire = synth_wire(np.random.default_rng(4), "mxfp8", 33, 8).reshape(1, 8 * 33)
+    pad = ("pad.f32", np.arange(5, dtype=np.float32), GT.F32)
+    path = tmp_path / "small43.gguf"
+    _write_gguf(path, [("small.weight", wire, MXFP8), pad], alignment=4096)
+    _check_type_43_load(path, {"small.weight": (wire, MXFP8, "mxfp8", 256)})
+
+
+@pytest.mark.parametrize(
+    "rows, cols, cut",
+    [
+        # 2^21 values: the span lands between the STQ1_0 size plus 1 MiB and
+        # the MXFP8 size, where an STQ1_0 reading would load silently.
+        pytest.param(8192, 256, 2**21 // 32 * 33 // 4, id="past-stq1_0-slack"),
+        # 288 values are not whole STQ1_0 blocks: any short span is cut.
+        pytest.param(3, 96, 100, id="not-stq1_0-blocks"),
+    ],
+)
+def test_load_gguf_type_43_cut_short_mxfp8_raises(tmp_path, rows, cols, cut):
+    """A file cut inside its last tensor, an MXFP8 table, fails the load,
+    skipped or not, rather than read the table as STQ1_0 weights."""
+    from kqref import MXFP8
+
+    wire = np.zeros((rows, cols // 32 * 33), dtype=np.uint8)
+    pad = ("pad.f32", np.arange(5, dtype=np.float32), GT.F32)
+    path = tmp_path / "cut43.gguf"
+    _write_gguf(path, [pad, ("table.weight", wire, MXFP8)])
+    size = path.stat().st_size
+    os.truncate(path, size - cut)
+
+    n, mx8 = rows * cols, wire.nbytes
+    span = -(-mx8 // 32) * 32 - cut
+    assert span < mx8
+    if n % 256 == 0:
+        assert span >= n // 256 * 42 + 2**20
+    msg = (
+        rf"table\.weight has type 43 and is the last tensor in the file\. It "
+        rf"reads as mxfp8, which needs {mx8} bytes for its {n} elements, but "
+        rf"its byte span to the end of the file is {span}: the file looks cut"
+    )
+    with pytest.raises(RuntimeError, match=msg):
+        kq.load_gguf(str(path))
+    with pytest.raises(RuntimeError, match=msg):
+        kq.load_gguf(str(path), True, ["table.weight"])
+
+
+@pytest.mark.parametrize(
+    "block, rows, cols, span, last",
+    [
+        pytest.param((256, 32), 4, 1024, 512, False, id="short"),
+        pytest.param((256, 32), 4, 1024, 512, True, id="short-last"),
+        pytest.param((16, 40), 3, 48, 384, False, id="partial-block"),
+        pytest.param((32, 20), 3, 96, 192, False, id="short-not-stq1_0-blocks"),
+    ],
+)
+def test_load_gguf_type_43_fitting_neither_raises(
+    tmp_path, monkeypatch, block, rows, cols, span, last
+):
+    """A type-43 tensor that is neither format fails the load, skipped or
+    not, naming the tensor, its span and both sizes: a span short of the
+    STQ1_0 size (32-byte blocks of 256 weights), a count that is not whole
+    blocks of either (40-byte blocks of 16 weights), or, before the last
+    tensor, a span short of the MXFP8 size on a count that is not whole
+    STQ1_0 blocks (20-byte blocks of 32 weights)."""
+    from gguf.constants import GGML_QUANT_SIZES
+    from kqref import MXFP8
+
+    odd = type(MXFP8)("TYPE43_ODD", 43)
+    monkeypatch.setitem(GGML_QUANT_SIZES, odd, block)
+    wpb, bpb = block
+    shape = (rows, cols // wpb * bpb)
+    wire = np.random.default_rng(3).integers(0, 256, shape, dtype=np.uint8)
+    tensors = [("odd.weight", wire, odd)]
+    pad = ("pad.f32", np.arange(5, dtype=np.float32), GT.F32)
+    tensors = [pad, *tensors] if last else [*tensors, pad]
+    path = tmp_path / "odd43.gguf"
+    _write_gguf(path, tensors)
+
+    n = rows * cols
+    msg = (
+        rf"odd\.weight has type 43.* fits neither: its {n} elements span "
+        rf"{span} bytes, where stq1_0 needs whole 256-element blocks "
+        rf"\({-(-n // 256) * 42} bytes\) and mxfp8 whole 32-element blocks "
+        rf"\({-(-n // 32) * 33} bytes\)"
+    )
+    with pytest.raises(RuntimeError, match=msg):
+        kq.load_gguf(str(path))
+    with pytest.raises(RuntimeError, match=msg):
+        kq.load_gguf(str(path), True, ["odd.weight"])
+
+
+_LOAD_CUT_FILE = """
+import sys
+import mlx_kquant as kq
+path, skip = sys.argv[1], sys.argv[2:]
+for zero_copy in (True, False):
+    try:
+        kq.load_gguf(path, zero_copy, skip)
+    except RuntimeError as e:
+        print("raised", e)
+    else:
+        print("loaded")
+"""
+
+
+def _pad32(n):
+    return -(-n // 32) * 32
+
+
+@pytest.mark.parametrize(
+    "layout, skip",
+    [
+        pytest.param("table-then-f32", [], id="table-then-f32"),
+        pytest.param("table-then-f32", ["table.weight"], id="table-then-f32-skip"),
+        pytest.param("f32-last", [], id="f32-last"),
+    ],
+)
+def test_load_gguf_cut_inside_a_tensor_raises(tmp_path, layout, skip):
+    """A file cut inside a tensor fails the load in both zero_copy modes,
+    rather than read past the end of the file (a crash, or garbage values).
+    Here an MXFP8 table followed by an f32 tensor is cut 600 KB into the
+    table, whose span in the header still holds the full table, or an f32
+    last tensor loses its final 1000 bytes. The loads run in a child
+    process, so a read past the end fails the test rather than the run."""
+    from kqref import MXFP8
+
+    rng = np.random.default_rng(8)
+    table = np.zeros((4096, 8 * 33), dtype=np.uint8)
+    f32 = rng.standard_normal(16384).astype(np.float32)
+    if layout == "table-then-f32":
+        tensors = [("table.weight", table, MXFP8), ("after.f32", f32, GT.F32)]
+        name, nbytes, cut = "table.weight", table.nbytes, 600_000
+        tail = _pad32(table.nbytes) + _pad32(f32.nbytes)
+    else:
+        tensors = [("pad.f32", np.arange(5, dtype=np.float32), GT.F32)]
+        tensors.append(("last.f32", f32, GT.F32))
+        name, nbytes, cut = "last.f32", f32.nbytes, 1000
+        tail = _pad32(f32.nbytes)
+    path = tmp_path / "cut.gguf"
+    _write_gguf(path, tensors)
+    size = path.stat().st_size
+    os.truncate(path, size - cut)
+
+    r = subprocess.run(
+        [sys.executable, "-c", _LOAD_CUT_FILE, str(path), *skip],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert r.returncode == 0, r.stderr[-4000:]
+    end = size - tail + nbytes
+    msg = (
+        f"raised [load_gguf] tensor {name} ends at byte {end}, past the end of "
+        f"the file at byte {size - cut}: the file looks cut short."
+    )
+    assert r.stdout.splitlines() == [msg, msg]
 
 
 def test_zero_copy_matches_copy(tmp_path):

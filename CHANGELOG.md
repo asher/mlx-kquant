@@ -6,6 +6,14 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `kq.load_gguf` loads the `mxfp8` lookup tables of DeepSeek-V4.1 GGUFs, which
+  share ggml type 43 with `stq1_0`, and `kq.dequantize` decodes their rows.
+
+### Fixed
+- `kq.load_gguf` on a GGUF cut short inside a tensor raises an error naming the
+  tensor, instead of crashing or loading bytes from past the end of the file.
+
 ## [0.5.3]
 
 ### Changed

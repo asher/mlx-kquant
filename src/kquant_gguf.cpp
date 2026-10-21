@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 
 #include <unistd.h> // getpagesize
 
@@ -312,16 +313,15 @@ const KQuantCodec* gguf_type_to_kquant_codec(uint32_t t) {
       return codec_by_name("iq1_s");
     case GGUF_TYPE_IQ1_M:
       return codec_by_name("iq1_m");
-    // Bare literals (MXFP4=39, NVFP4=40, Q2_0=42, STQ1_0=43, PQ2_0=142,
-    // PTQ1_0=143): gguflib's enum may predate these types.
+    // Bare literals (MXFP4=39, NVFP4=40, Q2_0=42, PQ2_0=142, PTQ1_0=143):
+    // gguflib's enum may predate these types. Type 43 is not here: two
+    // formats claim it (see resolve_type_43).
     case 39:
       return codec_by_name("mxfp4");
     case 40:
       return codec_by_name("nvfp4");
     case 42:
       return codec_by_name("q2_0");
-    case 43:
-      return codec_by_name("stq1_0");
     case 142:
       return codec_by_name("pq2_0");
     case 143:
@@ -329,6 +329,63 @@ const KQuantCodec* gguf_type_to_kquant_codec(uint32_t t) {
     default:
       return nullptr;
   }
+}
+
+// Wire bytes of n weights in whole blocks of the codec (gguflib's sizing).
+uint64_t codec_wire_bytes(const KQuantCodec& c, uint64_t n) {
+  const uint64_t wpb = static_cast<uint64_t>(c.weights_per_block);
+  return (n + wpb - 1) / wpb * static_cast<uint64_t>(c.bytes_per_block);
+}
+
+// GGML type 43 is claimed by two formats: STQ1_0 (256 weights in 42 bytes)
+// and MXFP8 (32 weights in 33 bytes). The type id cannot tell them apart,
+// but the bytes the tensor spans can: the distance to the next tensor's data,
+// or to the end of the file for the last one, holds at least its size. MXFP8
+// is 6.3x larger, so the tensor is MXFP8 when its span holds that size and
+// STQ1_0 when it holds only the STQ1_0 size. A count that is not whole blocks
+// of a format rules that format out. The last tensor in a file can be cut
+// short: when its span is under the MXFP8 size but at least the STQ1_0 size
+// plus max(alignment, 1 MiB), or STQ1_0 is ruled out, it is an MXFP8 table
+// that the file does not hold, and the load fails instead of reading it as
+// STQ1_0.
+const KQuantCodec* resolve_type_43(
+    const gguf_tensor& tensor,
+    const std::string& name,
+    uint64_t span,
+    bool last,
+    uint64_t alignment) {
+  const KQuantCodec* stq = codec_by_name("stq1_0");
+  const KQuantCodec* mx8 = codec_by_name("mxfp8");
+  const uint64_t n = tensor.num_weights;
+  const uint64_t stq_size = codec_wire_bytes(*stq, n);
+  const uint64_t mx8_size = codec_wire_bytes(*mx8, n);
+  const bool stq_fits_count =
+      n % static_cast<uint64_t>(stq->weights_per_block) == 0;
+  const bool mx8_fits_count =
+      n % static_cast<uint64_t>(mx8->weights_per_block) == 0;
+  if (mx8_fits_count && span >= mx8_size) {
+    return mx8;
+  }
+  const uint64_t slack = std::max<uint64_t>(alignment, uint64_t(1) << 20);
+  if (last && mx8_fits_count && (!stq_fits_count || span >= stq_size + slack)) {
+    std::ostringstream msg;
+    msg << "[load_gguf] tensor " << name << " has type 43 and is the last "
+        << "tensor in the file. It reads as mxfp8, which needs " << mx8_size
+        << " bytes for its " << n << " elements, but its byte span to the "
+        << "end of the file is " << span << ": the file looks cut short.";
+    throw std::runtime_error(msg.str());
+  }
+  if (stq_fits_count && span >= stq_size) {
+    return stq;
+  }
+  std::ostringstream msg;
+  msg << "[load_gguf] tensor " << name << " has type 43, which both "
+      << "stq1_0 and mxfp8 use, and fits neither: its " << n
+      << " elements span " << span << " bytes, where stq1_0 needs whole "
+      << "256-element blocks (" << stq_size
+      << " bytes) and mxfp8 whole 32-element blocks (" << mx8_size
+      << " bytes).";
+  throw std::runtime_error(msg.str());
 }
 
 // Non-quantized GGUF tensor types we pass through with their native dtype. BF16
@@ -703,10 +760,51 @@ GgufLoadResult load_gguf(
     res.metadata.emplace_back(std::move(key_name), std::move(mv));
   }
 
-  // 2. tensors.
-  gguf_tensor tensor;
-  while (gguf_get_tensor(ctx.get(), &tensor)) {
+  // 2. tensor infos, all of them first: a type-43 tensor resolves by its
+  //    byte span, which the next tensor's data offset bounds.
+  std::vector<gguf_tensor> infos;
+  {
+    gguf_tensor t;
+    while (gguf_get_tensor(ctx.get(), &t)) {
+      infos.push_back(t);
+    }
+  }
+  std::vector<uint64_t> starts;
+  starts.reserve(infos.size());
+  for (const auto& t : infos) {
+    starts.push_back(t.offset);
+  }
+  std::sort(starts.begin(), starts.end());
+  // The bytes from a tensor's data to the next tensor's, or to the end of
+  // the file for the last tensor (second: true).
+  auto span_of = [&](uint64_t offset) -> std::pair<uint64_t, bool> {
+    auto next = std::upper_bound(starts.begin(), starts.end(), offset);
+    const bool last = next == starts.end();
+    const uint64_t end = last ? ctx->size : *next;
+    return {end > offset ? end - offset : 0, last};
+  };
+
+  // 3. tensors.
+  for (gguf_tensor tensor : infos) {
     std::string name(tensor.name, tensor.namelen);
+    const KQuantCodec* codec = nullptr;
+    if (tensor.type == 43) {
+      const auto [span, last] = span_of(tensor.offset);
+      codec = resolve_type_43(tensor, name, span, last, ctx->alignment);
+      // gguflib's type table sizes every type-43 tensor as stq1_0.
+      tensor.bsize = codec_wire_bytes(*codec, tensor.num_weights);
+    } else {
+      codec = gguf_type_to_kquant_codec(tensor.type);
+    }
+    // The header places every tensor; a file cut short ends before some of
+    // them, and reading one would run past the mapping.
+    if (tensor.offset > ctx->size || tensor.bsize > ctx->size - tensor.offset) {
+      std::ostringstream msg;
+      msg << "[load_gguf] tensor " << name << " ends at byte "
+          << tensor.offset + tensor.bsize << ", past the end of the file at "
+          << "byte " << ctx->size << ": the file looks cut short.";
+      throw std::runtime_error(msg.str());
+    }
 
     // Logical shape in GGUF native order (matches gguf-py ReaderTensor.shape).
     std::vector<int64_t> native_shape;
@@ -717,13 +815,13 @@ GgufLoadResult load_gguf(
     res.tensor_shapes.emplace_back(name, std::move(native_shape));
 
     if (!skip_set.empty() && skip_set.count(name)) {
-      if (const KQuantCodec* codec = gguf_type_to_kquant_codec(tensor.type)) {
+      if (codec != nullptr) {
         res.codecs.emplace_back(name, codec->name);
       }
       continue;
     }
 
-    if (const KQuantCodec* codec = gguf_type_to_kquant_codec(tensor.type)) {
+    if (codec != nullptr) {
       load_block_tensor(
           res,
           tensor,
@@ -741,7 +839,7 @@ GgufLoadResult load_gguf(
       std::ostringstream msg;
       msg << "[load_gguf] tensor " << name << " has unsupported type "
           << tensor.type
-          << " (not a K-quant / MXFP4 / NVFP4 codec or a "
+          << " (not a K-quant / MXFP4 / NVFP4 / MXFP8 codec or a "
              "F32/F16/BF16/I8/I16/I32 dtype)";
       throw std::runtime_error(msg.str());
     }

@@ -400,6 +400,7 @@ mx::array quantized_matmul_glu(
     throw std::invalid_argument(
         op + " Unknown kquant_type: '" + kquant_type + "'.");
   }
+  require_matmul_codec(*codec, op);
   for (const auto* w : {&w_gate, &w_up}) {
     if (w->dtype() != mx::uint8 || w->ndim() != 2) {
       throw std::invalid_argument(
@@ -577,6 +578,7 @@ std::vector<mx::array> quantized_matmul_multi(
     throw std::invalid_argument(
         op + " Unknown kquant_type: '" + kquant_type + "'.");
   }
+  require_matmul_codec(*codec, op);
   if (weights.empty()) {
     throw std::invalid_argument(op + " weights must hold at least one weight.");
   }

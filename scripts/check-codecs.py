@@ -42,9 +42,9 @@ def _parse_readme_table() -> dict[str, tuple[int, int, int]]:
     out: dict[str, tuple[int, int, int]] = {}
     # Rows look like: | q2_k  | 256 | 2 |  84 | K-quant superblock |
     # (iq*, stq*, the Prism pq*/ptq* pair, and the native-fp codecs
-    # mxfp4/nvfp4 included).
+    # mxfp4/nvfp4/mxfp8 included).
     row = re.compile(
-        r"^\|\s*((?:st|pt|p)?i?q\d[\w]*|mxfp4|nvfp4)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|",
+        r"^\|\s*((?:st|pt|p)?i?q\d[\w]*|mxfp4|nvfp4|mxfp8)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|",
         re.MULTILINE,
     )
     for m in row.finditer(text):

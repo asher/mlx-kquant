@@ -81,7 +81,7 @@ inline std::string kq_kname_prefix(const std::string& kquant_type) {
 // Byte alignment the GPU kernels need at the start of a packed weight: the
 // widest load any kernel of the codec makes through the weight pointer.
 // q4_k and q5_k read 16-byte words, iq4_xs and iq1_m 8-byte words, and the
-// codecs at 4 read 4-byte words. mxfp4 reads bytes. A start off
+// codecs at 4 read 4-byte words. mxfp4 and mxfp8 read bytes. A start off
 // the value is undefined for Metal loads, and on M5 Max the kernels return
 // wrong values or NaN from every odd start, and from starts 2 mod 4 on the
 // codecs at 4 or more. The CPU kernels accept any start. Each value divides
@@ -99,7 +99,7 @@ inline int kq_weight_base_align(const std::string& kquant_type) {
       t == "nvfp4") {
     return 4;
   }
-  if (t == "mxfp4") {
+  if (t == "mxfp4" || t == "mxfp8") {
     return 1;
   }
   return 2;

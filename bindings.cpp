@@ -222,9 +222,9 @@ NB_MODULE(_ext, m) {
         return codec != nullptr && codec->has_matmul_kernel;
       },
       "kquant_type"_a,
-      "True when this codec ships Metal matmul kernels (qmv/qmm/gather). "
-      "CPU-only wire codecs return False; their matmuls must stay on the "
-      "CPU stream.");
+      "True when this codec has matmul kernels (qmv/qmm/gather). A "
+      "gather-only lookup-table codec (mxfp8) returns False: it has no "
+      "matmul on any device, and the matmul ops reject it.");
 
   // --- ops ---
   m.def(
@@ -246,6 +246,8 @@ NB_MODULE(_ext, m) {
                 ``w``); ignored by the kernel.
             kquant_type (str): codec name, e.g. ``"q4_k"``, ``"q8_0"``.
             dtype (Dtype, optional): output float dtype. Default ``float16``.
+                ``mxfp8`` values can pass the float16 range (its e8m0 scales
+                reach 2^127), so decode it to ``bfloat16`` or ``float32``.
 
         Returns:
             array: the dequantized weights.

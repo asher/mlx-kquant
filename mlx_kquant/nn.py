@@ -24,7 +24,7 @@ import numpy as np
 
 import mlx_kquant as kq
 
-from .codec_geometry import CODEC_GEOMETRY, bytes_per_row
+from .codec_geometry import CODEC_GEOMETRY, GATHER_ONLY_CODECS, bytes_per_row
 
 # gather_qmm_seg tile height (the kernel's BM).
 _SEG_TILE_ROWS = 64
@@ -80,10 +80,19 @@ class KQuantEmbedding(nn.Module):
         self.scales = mx.zeros((1,), dtype=mx.uint8)
         self.freeze()
 
+    def decode_dtype(self):
+        """The ``kq.dequantize`` dtype for this table's rows. A gather-only
+        codec's values can sit past the float16 range (e8m0 scales reach
+        2^127), so it decodes straight to ``out_dtype``; the others decode at
+        the float16 default."""
+        return self.out_dtype if self.kquant_type in GATHER_ONLY_CODECS else None
+
     def __call__(self, x):
         gathered = self["weight"][x]  # [*, bytes_per_row]
         flat = gathered.reshape(-1, gathered.shape[-1])
-        deq = kq.dequantize(flat, self["scales"], self.kquant_type)
+        deq = kq.dequantize(
+            flat, self["scales"], self.kquant_type, dtype=self.decode_dtype()
+        )
         # emit compute dtype (bf16) so a bf16 stream isn't promoted to f32
         return deq.reshape(*gathered.shape[:-1], self.dims).astype(self.out_dtype)
 

@@ -5,6 +5,8 @@
 //   nibbles: w[j] = d * E2M1[qs[j] & 0xF], w[j+16] = d * E2M1[qs[j] >> 4].
 // NVFP4: 36 bytes/64 weights. [uint8 UE4M3 sd[4]][uint8 qs[32]], four
 //   16-value groups; group g = sd[g] scaling qs[8g..8g+8) two-halves.
+// MXFP8: 33 bytes/32 weights. [uint8 E8M0 e][uint8 E4M3 qs[32]],
+//   w[j] = e4m3(qs[j]) * 2^(e - 127). Gather-only: dequantize kernels only.
 //
 // Real-value E2M1 LUT + full scales (the Metal convention; the CPU kernels
 // use ggml's doubled-int8 LUT + half scales - same products, never mixed
@@ -17,6 +19,10 @@ MLX_MTL_CONST int KQ_MXFP4_QS_OFFSET = 1;
 MLX_MTL_CONST int KQ_NVFP4_SUPERBLOCK = 64;
 MLX_MTL_CONST int KQ_NVFP4_BLOCK_BYTES = 36;
 MLX_MTL_CONST int KQ_NVFP4_QS_OFFSET = 4;
+
+MLX_MTL_CONST int KQ_MXFP8_GROUP = 32;
+MLX_MTL_CONST int KQ_MXFP8_BLOCK_BYTES = 33;
+MLX_MTL_CONST int KQ_MXFP8_QS_OFFSET = 1;
 
 constant float kq_fp_e2m1_lut[16] = {
     0.0f,
@@ -1086,4 +1092,68 @@ template <typename T, int group_size, int bits, bool batched>
     uint simd_lid [[thread_index_in_simdgroup]]) {
   kq_nvfp4_qmv_impl<T, group_size, bits, 1>(
       w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+// ---------------------------------------------------------------------------
+// MXFP8 (OCP MX, E4M3 "fn" codes): a lookup-table codec, read by row
+// ---------------------------------------------------------------------------
+
+// e4m3(q) * 2^(e - 127) assembled as f32 bits. The code is a 4-bit
+// significand times a power of two, so the product is a normal, an exact
+// subnormal (the smallest is 2^-136) or an overflow to inf, and integer ops
+// give it without relying on the float unit's denormal handling. E4M3 has
+// no infinity: codes 0x7F and 0xFF are NaN, and so is the scale e == 0xFF.
+inline float kq_fp_mxfp8_value(uint8_t e, uint8_t q) {
+  const uint sign = uint(q & 0x80) << 24;
+  if (e == 0xFF || (q & 0x7F) == 0x7F) {
+    return as_type<float>(sign | 0x7FC00000u);
+  }
+  const uint ex = (q >> 3) & 0xF;
+  const uint man = q & 0x7;
+  // Normal codes are (8 + man) * 2^(ex - 10), subnormal codes man * 2^-9.
+  const uint sig = ex == 0 ? man : 8 + man;
+  if (sig == 0) {
+    return as_type<float>(sign);
+  }
+  const int k = (ex == 0 ? -9 : int(ex) - 10) + int(e) - 127;
+  const int p = 31 - int(clz(sig)); // leading significand bit, 0..3
+  const int b = p + k + 127; // biased f32 exponent
+  uint bits;
+  if (b >= 255) {
+    bits = 0x7F800000u;
+  } else if (b >= 1) {
+    bits = uint(b) << 23 | ((sig << (23 - p)) & 0x7FFFFFu);
+  } else {
+    bits = sig << (k + 149);
+  }
+  return as_type<float>(sign | bits);
+}
+
+template <typename T>
+METAL_FUNC void kq_mxfp8_dequantize_impl(
+    const device uint8_t* w,
+    device T* out,
+    const constant uint& num_weights,
+    uint gid) {
+  if (gid >= num_weights) {
+    return;
+  }
+  const int block_id = gid / KQ_MXFP8_GROUP;
+  const int within = gid % KQ_MXFP8_GROUP;
+  const device uint8_t* block_addr =
+      w + static_cast<int64_t>(block_id) * KQ_MXFP8_BLOCK_BYTES;
+  out[gid] = T(kq_fp_mxfp8_value(
+      block_addr[0], block_addr[KQ_MXFP8_QS_OFFSET + within]));
+}
+
+template <typename T, int group_size, int bits>
+[[kernel]] void kq_mxfp8_dequantize(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    device T* out,
+    const constant uint& num_weights,
+    uint gid [[thread_position_in_grid]]) {
+  static_assert(group_size == KQ_MXFP8_GROUP, "MXFP8 requires gs=32");
+  static_assert(bits == 8, "MXFP8 requires bits=8");
+  kq_mxfp8_dequantize_impl<T>(w, out, num_weights, gid);
 }

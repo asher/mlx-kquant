@@ -33,6 +33,7 @@ BASE_ALIGN = {
     "ptq1_0": 4,
     "nvfp4": 4,
     "mxfp4": 1,
+    "mxfp8": 1,
 }
 # verify_nax's own start check, stricter than BASE_ALIGN for these codecs.
 VNAX_BASE = {"pq2_0": 4, "q2_0": 4, "q4_0": 4, "q8_0": 4}
@@ -61,7 +62,7 @@ def _wire(codec, shape, seed=3):
         _, _, bpb, wpb = CODEC_GEOMETRY[codec]
         nb = shape[-1] // wpb
         wire = rng.integers(0, 256, size=(*shape[:-1], nb, bpb), dtype=np.uint8)
-        if codec == "mxfp4":
+        if codec in ("mxfp4", "mxfp8"):
             wire[..., 0] = rng.integers(120, 128, size=wire.shape[:-1])
         w = mx.array(wire.reshape(*shape[:-1], nb * bpb))
         s = mx.zeros((1,), dtype=mx.float32)
@@ -128,7 +129,8 @@ def test_gpu_weight_base(codec):
     w, s = _wire(codec, (N, K))
     a = _align(codec)
     good = sorted({a, 2 * a, 16, 32} if a > 1 else {1, 3, 16})
-    for m in (1, 4, 8, 64):
+    # A gather-only codec has no matmul to run.
+    for m in (1, 4, 8, 64) if kq.codec_has_matmul(codec) else ():
         x = (mx.random.normal((m, K), key=mx.random.key(m)) * 0.5).astype(mx.bfloat16)
         ref = kq.quantized_matmul(x, w, s, codec, transpose=True)
         mx.eval(ref)

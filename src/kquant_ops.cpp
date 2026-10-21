@@ -240,11 +240,6 @@ mx::array dequantize(
   }
 
   auto s = mx::to_stream(s_);
-  // Codecs without Metal kernels (native-fp until their leaves land) force
-  // the op onto the CPU stream so eval_cpu runs even under a GPU default.
-  if (!codec->has_matmul_kernel) {
-    s = mx::default_stream(mx::Device::cpu);
-  }
 
   auto out_shape = w.shape();
   out_shape.back() =
@@ -284,6 +279,7 @@ mx::array quantized_matmul(
         "[mlx_kquant.quantized_matmul] Unknown kquant_type: '" + kquant_type +
         "'.");
   }
+  require_matmul_codec(*codec, "[mlx_kquant.quantized_matmul]");
   if (x.ndim() > 2 && w.ndim() > 2) {
     throw std::invalid_argument(
         "[mlx_kquant.quantized_matmul] batched (>2D) weights are not supported; "
@@ -672,6 +668,7 @@ mx::array gather_qmm(
     throw std::invalid_argument(
         "[mlx_kquant.gather_qmm] Unknown kquant_type: '" + kquant_type + "'.");
   }
+  require_matmul_codec(*codec, "[mlx_kquant.gather_qmm]");
   if (x.ndim() < 2) {
     std::ostringstream msg;
     msg << "[mlx_kquant.gather_qmm] x must have at least two dimensions but got "
@@ -836,6 +833,7 @@ mx::array gather_qmm_seg(
         "[mlx_kquant.gather_qmm_seg] Unknown kquant_type: '" + kquant_type +
         "'.");
   }
+  require_matmul_codec(*codec, "[mlx_kquant.gather_qmm_seg]");
   if (x.ndim() != 2) {
     std::ostringstream msg;
     msg << "[mlx_kquant.gather_qmm_seg] x must be [rows, K] but got shape "

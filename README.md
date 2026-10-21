@@ -20,7 +20,9 @@ Two layers:
   twenty-three decode, matmul (incl. tensor-core prefill), and encode (IQ, stq1_0, Prism and q2_0
   encode is CPU-only) - plus the native-fp wire
   codecs `mxfp4, nvfp4` (decode, CPU NEON + Metal matmul, and the fused MoE family incl. biased
-  gpt-oss experts; no encoder - GGUFs ship these tensors pre-quantized). On top of these four core
+  gpt-oss experts; no encoder - GGUFs ship these tensors pre-quantized) - plus `mxfp8`, a
+  gather-only codec for lookup tables (CPU and Metal dequantize of gathered rows, no matmul; see
+  [GGML type 43](#ggml-type-43)). On top of these four core
   ops the namespace also carries fused decode/prefill kernels (MoE GLU and router, attention, norm
   fusions) and a set of DeepSeek/GLM sparse-attention kernels - see
   [docs/kernels.md](docs/kernels.md).
@@ -384,6 +386,22 @@ are informed by our analysis of the mixed-precision quants that [Unsloth][unslot
 | q2_0    |  64 | 2 |  18 | four-level 2-bit, fp16 scale per 64 (ggml type 42) |
 | mxfp4   |  32 | 4 |  17 | e8m0 scale, E2M1 values (decode-only) |
 | nvfp4   |  64 | 4 |  36 | 4x ue4m3-scaled 16-value groups (decode-only) |
+| mxfp8   |  32 | 8 |  33 | e8m0 scale, E4M3 values (gather-only: dequantize, no matmul) |
+
+### GGML type 43
+
+Two unmerged llama.cpp formats use GGML type 43: `stq1_0` (llama.cpp PR #22836) and `mxfp8`
+(llama.cpp PR #30817, which stores DeepSeek-V4.1 engram tables in it). `kq.load_gguf` tells them
+apart by the bytes the tensor spans in the file, up to the next tensor's data or, for the last
+tensor, to the end of the file. An `mxfp8` tensor is 6.3 times the size of an `stq1_0` one with the
+same element count. The tensor is `mxfp8` when its span holds the `mxfp8` size and `stq1_0` when it
+holds only the `stq1_0` size, and a format whose block size does not divide the element count is
+ruled out. The load fails, naming the tensor, its span and both sizes, when the span holds
+neither. The last tensor in the file has one more case. When its element count is whole 32-value
+blocks and its span is short of the `mxfp8` size, the load fails if the count rules out `stq1_0` or
+the span runs at least 1 MiB (or the file alignment, if larger) past the `stq1_0` size: the file
+then holds an `mxfp8` table cut short. A count that is not whole 32-value blocks fails as "fits
+neither".
 
 ## Version pinning
 

@@ -132,6 +132,7 @@ jobs:
           tests/test_gather.py
           tests/test_nn.py
           tests/test_gguf.py
+          tests/test_mxfp8.py
           tests/test_vjp.py
           tests/test_encode.py
           tests/test_loader.py

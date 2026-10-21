@@ -697,6 +697,11 @@ instantiate_kquant_dequantize(float, 32, 4, mxfp4)
 instantiate_kquant_mxfp4_for_type(bfloat16_t)
 instantiate_kquant_mxfp4_for_type(float16_t)
 
+// mxfp8 is gather-only: dequantize kernels, no matmul family.
+instantiate_kquant_dequantize(float, 32, 8, mxfp8)
+instantiate_kquant_dequantize(bfloat16_t, 32, 8, mxfp8)
+instantiate_kquant_dequantize(float16_t, 32, 8, mxfp8)
+
 #define instantiate_kquant_nvfp4_for_type(type)                      \
   instantiate_kquant_batched(qmv_fast, type, 64, 4, 0, nvfp4)        \
   instantiate_kquant_batched(qmv_fast, type, 64, 4, 1, nvfp4)        \

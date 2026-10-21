@@ -469,6 +469,7 @@ mx::array quantized_matmul_lora(
     throw std::invalid_argument(
         op + " Unknown kquant_type: '" + kquant_type + "'.");
   }
+  require_matmul_codec(*codec, op);
   if (w.dtype() != mx::uint8 || w.ndim() != 2) {
     throw std::invalid_argument(
         op + " w must be 2-D uint8 (raw GGUF wire bytes).");

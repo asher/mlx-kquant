@@ -51,11 +51,18 @@ CODEC_GEOMETRY: dict[str, tuple[int, int, int, int]] = {
     # 64-weight block, so group_size (16) != weights_per_block (64).
     "mxfp4": (32, 4, 17, 32),
     "nvfp4": (16, 4, 36, 64),
+    # mxfp8: one e8m0 scale byte then 32 E4M3 bytes. A lookup-table codec:
+    # it dequantizes gathered rows and has no matmul (GATHER_ONLY_CODECS).
+    "mxfp8": (32, 8, 33, 32),
 }
 
 # Codecs that load but cannot be produced by kq.quantize: the native-fp codecs
 # are decode-only wire codecs. Every other codec has a CPU or CPU/Metal encoder.
-DECODE_ONLY_CODECS: frozenset[str] = frozenset({"mxfp4", "nvfp4"})
+DECODE_ONLY_CODECS: frozenset[str] = frozenset({"mxfp4", "nvfp4", "mxfp8"})
+
+# Codecs with no matmul on any device: kq.dequantize decodes their gathered
+# rows (KQuantEmbedding), and the matmul ops reject them.
+GATHER_ONLY_CODECS: frozenset[str] = frozenset({"mxfp8"})
 
 # Every codec the ``kq.quantize`` encoder can produce: the ten K-quant/legacy
 # codecs on CPU or Metal (the four legacy block codecs + q8_0 ignore an imatrix).
