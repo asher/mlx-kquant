@@ -418,6 +418,23 @@ void dequantize_mxfp4(const uint8_t* w, T* out, std::size_t num_weights) {
 }
 
 template <typename T>
+void dequantize_mxfp8(const uint8_t* w, T* out, std::size_t num_weights) {
+  constexpr int block_weights = 32;
+  constexpr int block_bytes = 33;
+  const std::array<float, 256>& e4m3 = kq_e4m3fn_lut();
+  std::size_t num_blocks = num_weights / block_weights;
+  for (std::size_t b = 0; b < num_blocks; b++) {
+    const uint8_t* block = w + b * block_bytes;
+    const float d = kq_e8m0_mxfp8(block[0]);
+    const uint8_t* qs = block + 1;
+    T* dst = out + b * block_weights;
+    for (int j = 0; j < block_weights; j++) {
+      dst[j] = static_cast<T>(e4m3[qs[j]] * d);
+    }
+  }
+}
+
+template <typename T>
 void dequantize_nvfp4(const uint8_t* w, T* out, std::size_t num_weights) {
   constexpr int block_weights = 64; // four 16-value groups, one scale each
   constexpr int block_bytes = 36;
@@ -1302,6 +1319,8 @@ void kquant_dequantize_dispatch(
     dequantize_mxfp4(w, out, num_weights);
   } else if (kquant_type == "nvfp4") {
     dequantize_nvfp4(w, out, num_weights);
+  } else if (kquant_type == "mxfp8") {
+    dequantize_mxfp8(w, out, num_weights);
   } else {
     throw std::runtime_error(
         "[mlx_kquant] dequantize: unsupported codec: " + kquant_type);
@@ -1358,6 +1377,10 @@ void kquant_qmm_cpu(
       (static_cast<std::size_t>(w_cols) / codec->weights_per_block) *
       codec->bytes_per_block;
   DequantFnF32 fn = dequant_fn_f32(kquant_type);
+  if (fn == nullptr) {
+    throw std::runtime_error(
+        "[mlx_kquant] quantized_matmul: unsupported codec: " + kquant_type);
+  }
 
   // Stage activations (and, for half outputs, the result) in float32. The
   // accumulation dtype is float either way; this just hoists the per-element

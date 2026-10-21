@@ -1,11 +1,13 @@
 """gguf.quants-compatible oracle shim for the codecs gguf-py lacks.
 
-gguf-py has no STQ1_0, PQ2_0, PTQ1_0 or Q2_0 codec. Each gets a sentinel type
-(the single Python-side type-id constant), registered into ``GGML_QUANT_SIZES`` so
-GGUFWriter can synthesize files and into the enum's value map so GGUFReader
-opens real files. ``GT`` proxies GGMLQuantizationType with the sentinels
-added; ``quants`` proxies gguf.quants with quantize/dequantize routed to the
-NumPy reference codecs below for the sentinels and delegated otherwise.
+gguf-py has no STQ1_0, PQ2_0, PTQ1_0, Q2_0 or MXFP8 codec. Each gets a sentinel
+type (the single Python-side type-id constant), registered into
+``GGML_QUANT_SIZES`` so GGUFWriter can synthesize files and into the enum's
+value map so GGUFReader opens real files. STQ1_0 and MXFP8 share type id 43;
+the value map keeps STQ1_0, so GGUFReader reads a type-43 tensor as STQ1_0.
+``GT`` proxies GGMLQuantizationType with the sentinels added; ``quants``
+proxies gguf.quants with quantize/dequantize routed to the NumPy reference
+codecs below for the sentinels and delegated otherwise.
 
 STQ1_0: any random qs/sign wire is valid, and quantize(dequantize(wire)) ==
 wire whenever d > 0. PQ2_0: any wire is valid; codes 0..3 decode to -1..+2
@@ -25,6 +27,7 @@ STQ1_0_TYPE_ID = 43  # llama.cpp PR #22836 (unmerged -- may shift)
 PQ2_0_TYPE_ID = 142  # PrismML/llama.cpp 8bbb28b76 (Prism-private)
 PTQ1_0_TYPE_ID = 143  # PrismML/llama.cpp e19819227 (Prism-private)
 Q2_0_TYPE_ID = 42  # llama.cpp GGML_TYPE_Q2_0
+MXFP8_TYPE_ID = 43  # llama.cpp PR #30817 (unmerged), the STQ1_0 id too
 
 
 class _SentinelType:
@@ -46,6 +49,7 @@ STQ1_0 = _SentinelType("STQ1_0", STQ1_0_TYPE_ID)
 PQ2_0 = _SentinelType("PQ2_0", PQ2_0_TYPE_ID)
 PTQ1_0 = _SentinelType("PTQ1_0", PTQ1_0_TYPE_ID)
 Q2_0 = _SentinelType("Q2_0", Q2_0_TYPE_ID)
+MXFP8 = _SentinelType("MXFP8", MXFP8_TYPE_ID)
 
 
 def _f16_bytes(d: np.ndarray) -> np.ndarray:
@@ -266,15 +270,82 @@ def _quantize_ptq1_0(data: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# MXFP8 (OCP MX): [E8M0 e][32 x E4M3 qs], value = e4m3(q) * 2^(e - 127).
+# E4M3 "fn" has no infinity: 0x7F and 0xFF are NaN, and so is e == 0xFF.
+# A transcription of the reference's gguf-py MXFP8 class.
+# ---------------------------------------------------------------------------
+
+
+def mxfp8_e4m3_table() -> np.ndarray:
+    """float32 value of each of the 256 E4M3 codes."""
+    x = np.arange(256, dtype=np.uint32)
+    exp = ((x >> 3) & 0xF).astype(np.int32)
+    man = (x & 0x7).astype(np.float64)
+    v = np.where(exp == 0, man * 2.0**-9, (8.0 + man) * np.exp2(exp - 10.0))
+    v = np.where((x & 0x7F) == 0x7F, np.nan, v)
+    return np.where(x & 0x80, -v, v).astype(np.float32)
+
+
+def mxfp8_e8m0_to_fp32(x: np.ndarray) -> np.ndarray:
+    """2^(e - 127) as float32; e == 0 is the subnormal 2^-127, 0xFF NaN."""
+    x = np.asarray(x).astype(np.uint32)
+    bits = np.where(x == 0, np.uint32(0x00400000), x << np.uint32(23))
+    return np.where(x == 0xFF, np.float32(np.nan), bits.view(np.float32))
+
+
+def _fp32_to_e4m3(x: np.ndarray) -> np.ndarray:
+    # Round to nearest even, saturating to +-448; NaN -> 0x7F.
+    sign = np.where(np.signbit(x), np.uint8(0x80), np.uint8(0))
+    a = np.abs(x).astype(np.float32)
+    sub = np.rint(a * np.float32(512)).astype(np.int32)
+    f, e = np.frexp(a)
+    m = np.rint((f * 2 - 1) * 8).astype(np.int32)
+    E = e - 1 + 7
+    E = np.where(m == 8, E + 1, E)
+    m = np.where(m == 8, 0, m)
+    norm = (E << 3) | m
+    norm = np.where((E > 15) | ((E == 15) & (m == 7)), 0x7E, norm)
+    code = np.where(a < 2.0**-6, sub, norm)
+    code = np.where(a >= 448.0, 0x7E, code)
+    code = np.where(np.isnan(x), 0x7F, code | sign)
+    return code.astype(np.uint8)
+
+
+def _dequantize_mxfp8(data: np.ndarray) -> np.ndarray:
+    data = np.ascontiguousarray(data, dtype=np.uint8)
+    shape = data.shape
+    blocks = data.reshape(-1, 33)
+    d = mxfp8_e8m0_to_fp32(blocks[:, :1])
+    with np.errstate(over="ignore", invalid="ignore"):
+        w = d * mxfp8_e4m3_table()[blocks[:, 1:]]
+    return w.reshape(shape[:-1] + (shape[-1] // 33 * 32,))
+
+
+def _quantize_mxfp8(data: np.ndarray) -> np.ndarray:
+    x = np.ascontiguousarray(data, dtype=np.float32)
+    shape = x.shape
+    blocks = x.reshape(-1, 32)
+    amax = np.abs(blocks).max(axis=-1, keepdims=True)
+    with np.errstate(divide="ignore"):
+        e = np.where(amax > 0, np.ceil(np.log2(amax / np.float32(448))) + 127, 0)
+    e = np.clip(e, 0, 254).astype(np.uint8)
+    qs = _fp32_to_e4m3(blocks * (np.float32(1) / mxfp8_e8m0_to_fp32(e)))
+    out = np.concatenate([e, qs], axis=-1)
+    return out.reshape(shape[:-1] + (shape[-1] // 32 * 33,))
+
+
+# ---------------------------------------------------------------------------
 # Registry and the gguf-py proxies
 # ---------------------------------------------------------------------------
 
-# sentinel -> (weights_per_block, bytes_per_block, dequantize, quantize)
+# sentinel -> (weights_per_block, bytes_per_block, dequantize, quantize).
+# STQ1_0 comes before MXFP8, so the enum value map keeps STQ1_0 for id 43.
 SENTINELS = {
     STQ1_0: (256, 42, _dequantize_stq1_0, _quantize_stq1_0),
     PQ2_0: (128, 34, _dequantize_pq2_0, _quantize_pq2_0),
     PTQ1_0: (128, 28, _dequantize_ptq1_0, _quantize_ptq1_0),
     Q2_0: (64, 18, _dequantize_q2_0, _quantize_q2_0),
+    MXFP8: (32, 33, _dequantize_mxfp8, _quantize_mxfp8),
 }
 _BY_NAME = {s.name: s for s in SENTINELS}
 
@@ -291,6 +362,7 @@ class _GTProxy:
     PQ2_0 = PQ2_0
     PTQ1_0 = PTQ1_0
     Q2_0 = Q2_0
+    MXFP8 = MXFP8
 
     def __getattr__(self, name: str):
         return getattr(GGMLQuantizationType, name)
@@ -349,6 +421,7 @@ def is_synth(codec: str) -> bool:
         "pq2_0",
         "ptq1_0",
         "q2_0",
+        "mxfp8",
     )
 
 
@@ -363,9 +436,9 @@ def synth_wire(
 ):
     """Random wire with a sane scale so dequant cannot hit Inf/NaN: fp16 d in
     ``d_range`` at the codec's d offset; nvfp4's four ue4m3 group scales at
-    bytes 0..3 drawn from ``nvfp4_scales``; mxfp4's e8m0 scale near 1; IQ1_M's
-    fp16 scale in the top nibble of each of the four uint16 scale words at
-    offset 48."""
+    bytes 0..3 drawn from ``nvfp4_scales``; mxfp4's and mxfp8's e8m0 scale
+    near 1, with mxfp8's two NaN codes redrawn; IQ1_M's fp16 scale in the top
+    nibble of each of the four uint16 scale words at offset 48."""
     wire = rng.integers(0, 256, size=(n_blocks, bpb), dtype=np.uint8)
     if codec == "nvfp4":
         lo, hi = nvfp4_scales
@@ -373,6 +446,11 @@ def synth_wire(
         return wire
     if codec == "mxfp4":
         wire[:, 0] = rng.integers(121, 132, n_blocks, dtype=np.uint8)
+        return wire
+    if codec == "mxfp8":
+        wire[:, 0] = rng.integers(121, 132, n_blocks, dtype=np.uint8)
+        qs = wire[:, 1:]
+        qs[(qs & 0x7F) == 0x7F] &= 0xFE  # 0x7F -> 0x7E, 0xFF -> 0xFE
         return wire
     d = rng.uniform(*d_range, n_blocks).astype(np.float16)
     if codec == "iq1_m":

@@ -12,7 +12,7 @@ struct KQuantCodec {
   int weights_per_block; // 32 or 256
   int bytes_per_block; // packed wire bytes per block
   int bits; // nominal bit width
-  bool has_matmul_kernel; // fused qmm/gather kernels exist
+  bool has_matmul_kernel; // qmm/gather kernels exist (false: gather-only)
   bool has_encode; // encode (quantize) kernel exists
   bool has_nax_kernel; // NAX (tensor-core) qmm/gather kernels exist
   bool requires_imatrix; // encode rejects a missing imatrix (ggml-required IQ)
@@ -20,6 +20,10 @@ struct KQuantCodec {
 
 // Returns nullptr if `name` is not a known codec.
 const KQuantCodec* codec_by_name(const std::string& name);
+
+// Throws std::invalid_argument, prefixed with `op`, when `codec` has no
+// matmul on any device (a gather-only lookup-table codec such as mxfp8).
+void require_matmul_codec(const KQuantCodec& codec, const std::string& op);
 
 // Canonical ordered list of supported codec names.
 std::vector<std::string> codec_names();

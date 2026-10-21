@@ -20,7 +20,9 @@ Two layers:
   twenty-three decode, matmul (incl. tensor-core prefill), and encode (IQ, stq1_0, Prism and q2_0
   encode is CPU-only) - plus the native-fp wire
   codecs `mxfp4, nvfp4` (decode, CPU NEON + Metal matmul, and the fused MoE family incl. biased
-  gpt-oss experts; no encoder - GGUFs ship these tensors pre-quantized). On top of these four core
+  gpt-oss experts; no encoder - GGUFs ship these tensors pre-quantized) - plus `mxfp8`, a
+  gather-only codec for lookup tables (CPU and Metal dequantize of gathered rows, no matmul; see
+  [GGML type 43](#ggml-type-43)). On top of these four core
   ops the namespace also carries fused decode/prefill kernels (MoE GLU and router, attention, norm
   fusions) and a set of DeepSeek/GLM sparse-attention kernels - see
   [docs/kernels.md](docs/kernels.md).
@@ -384,6 +386,16 @@ are informed by our analysis of the mixed-precision quants that [Unsloth][unslot
 | q2_0    |  64 | 2 |  18 | four-level 2-bit, fp16 scale per 64 (ggml type 42) |
 | mxfp4   |  32 | 4 |  17 | e8m0 scale, E2M1 values (decode-only) |
 | nvfp4   |  64 | 4 |  36 | 4x ue4m3-scaled 16-value groups (decode-only) |
+| mxfp8   |  32 | 8 |  33 | e8m0 scale, E4M3 values (gather-only: dequantize, no matmul) |
+
+### GGML type 43
+
+Two unmerged llama.cpp formats use GGML type 43: `stq1_0` (llama.cpp PR #22836) and `mxfp8`
+(llama.cpp PR #30817, which stores DeepSeek-V4.1 engram tables in it). `kq.load_gguf` tells them
+apart by the bytes the tensor occupies in the file: its span to the next tensor's data, or to the
+end of the file for the last tensor, is its size padded to `general.alignment`. A type-43 tensor
+whose span fits neither size, or both, fails the load with an error naming the tensor and both
+sizes.
 
 ## Version pinning
 
