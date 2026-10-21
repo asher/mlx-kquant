@@ -104,6 +104,133 @@ def test_load_gguf_codecs_newer_than_gguf_py(tmp_path, name):
         del arrays, got
 
 
+def _write_gguf(path, tensors, alignment=None):
+    w = GGUFWriter(str(path), "smoke")
+    if alignment is not None:
+        w.add_custom_alignment(alignment)
+    for name, arr, dtype in tensors:
+        w.add_tensor(name, arr, raw_dtype=dtype)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
+def _type_43_tensors(stq_rows=6, mx8_rows=12):
+    """An STQ1_0 weight (rows of 1024) and an MXFP8 table (rows of 256), the
+    two formats that share ggml type 43, as (name, wire, sentinel, codec)."""
+    from kqref import MXFP8, STQ1_0, synth_wire
+
+    rng = np.random.default_rng(2)
+    stq = synth_wire(rng, "stq1_0", 42, stq_rows * 4).reshape(stq_rows, 4 * 42)
+    mx8 = synth_wire(rng, "mxfp8", 33, mx8_rows * 8).reshape(mx8_rows, 8 * 33)
+    return {
+        "blk.0.ffn_up.weight": (stq, STQ1_0, "stq1_0", 1024),
+        "per_layer_token_embd.weight": (mx8, MXFP8, "mxfp8", 256),
+    }
+
+
+def _check_type_43_load(path, want):
+    from kqref import quants
+
+    for zero_copy in (True, False):
+        arrays, codecs, _, shapes = kq.load_gguf(str(path), zero_copy=zero_copy)
+        for name, (wire, sent, codec, k) in want.items():
+            assert codecs[name] == codec, name
+            assert list(shapes[name]) == [k, wire.shape[0]]
+            got = arrays[name]
+            assert got.dtype == mx.uint8 and np.array_equal(np.array(got), wire)
+            scales = arrays[name.removesuffix(".weight") + ".scales"]
+            out = kq.dequantize(got, scales, codec, dtype=mx.float32)
+            assert np.array_equal(np.array(out), quants.dequantize(wire, sent.name))
+        del arrays, got, out
+
+
+@pytest.mark.parametrize("layout", ["stq1_0_first", "mxfp8_first", "mxfp8_only"])
+def test_load_gguf_type_43_resolves_by_span(tmp_path, layout):
+    """Type 43 is STQ1_0 in ternary QAT GGUFs and MXFP8 in DeepSeek-V4.1
+    engram tables, and one file can hold both. Each tensor resolves to its
+    format by the bytes it spans, up to the next tensor or, for the last
+    one, the end of the file (a standalone table file holds the table only).
+    A skipped tensor reports its codec too: the caller reads it itself."""
+    t = _type_43_tensors()
+    stq, mx8 = "blk.0.ffn_up.weight", "per_layer_token_embd.weight"
+    pad = ("pad.f32", np.arange(5, dtype=np.float32), GT.F32)
+    order = {
+        "stq1_0_first": [stq, "pad.f32", mx8],
+        "mxfp8_first": [mx8, "pad.f32", stq],
+        "mxfp8_only": [mx8],
+    }[layout]
+    tensors = [pad if n == "pad.f32" else (n, t[n][0], t[n][1]) for n in order]
+    path = tmp_path / "type43.gguf"
+    _write_gguf(path, tensors)
+
+    _check_type_43_load(path, {n: t[n] for n in order if n in t})
+
+    arrays, codecs, _, _ = kq.load_gguf(str(path), True, [mx8])
+    assert mx8 not in arrays and codecs[mx8] == "mxfp8"
+
+
+def test_load_gguf_type_43_span_uses_file_alignment(tmp_path):
+    """At general.alignment 64 a tensor carries up to 63 bytes of padding.
+    Both tensors here carry more than 32, the default alignment."""
+    t = _type_43_tensors(stq_rows=2, mx8_rows=3)
+    stq, mx8 = "blk.0.ffn_up.weight", "per_layer_token_embd.weight"
+    assert -t[stq][0].nbytes % 64 > 32 and -t[mx8][0].nbytes % 64 > 32
+    path = tmp_path / "align64.gguf"
+    _write_gguf(
+        path,
+        [
+            (stq, t[stq][0], t[stq][1]),
+            (mx8, t[mx8][0], t[mx8][1]),
+            ("pad.f32", np.arange(5, dtype=np.float32), GT.F32),
+        ],
+        alignment=64,
+    )
+    _check_type_43_load(path, t)
+
+
+@pytest.mark.parametrize("last", [False, True])
+def test_load_gguf_type_43_span_fitting_neither_raises(tmp_path, monkeypatch, last):
+    """A type-43 tensor sized as neither format (here 34-byte blocks of 32
+    weights) fails the load, skipped or not, naming the tensor, its span and
+    both sizes."""
+    from gguf.constants import GGML_QUANT_SIZES
+    from kqref import MXFP8
+
+    odd = type(MXFP8)("TYPE43_34B", 43)
+    monkeypatch.setitem(GGML_QUANT_SIZES, odd, (32, 34))
+    wire = np.random.default_rng(3).integers(0, 256, (4, 32 * 34), dtype=np.uint8)
+    tensors = [("odd.weight", wire, odd)]
+    pad = ("pad.f32", np.arange(5, dtype=np.float32), GT.F32)
+    tensors = [pad, *tensors] if last else [*tensors, pad]
+    path = tmp_path / "odd43.gguf"
+    _write_gguf(path, tensors)
+
+    n = 4 * 1024
+    msg = (
+        rf"odd\.weight has type 43.* span {wire.nbytes} fits neither: "
+        rf"stq1_0 needs {n // 256 * 42} bytes and mxfp8 {n // 32 * 33} bytes"
+    )
+    with pytest.raises(RuntimeError, match=msg):
+        kq.load_gguf(str(path))
+    with pytest.raises(RuntimeError, match=msg):
+        kq.load_gguf(str(path), True, ["odd.weight"])
+
+
+def test_load_gguf_type_43_span_fitting_both_raises(tmp_path):
+    """At a page-sized alignment a small tensor's padding has room for either
+    format's size. The load fails rather than pick one."""
+    from kqref import MXFP8, synth_wire
+
+    wire = synth_wire(np.random.default_rng(4), "mxfp8", 33, 8).reshape(1, 8 * 33)
+    pad = ("pad.f32", np.arange(5, dtype=np.float32), GT.F32)
+    path = tmp_path / "both43.gguf"
+    _write_gguf(path, [("small.weight", wire, MXFP8), pad], alignment=4096)
+    with pytest.raises(RuntimeError, match=r"small\.weight has type 43.* fits both"):
+        kq.load_gguf(str(path))
+
+
 def test_zero_copy_matches_copy(tmp_path):
     """zero_copy=True (no-copy mmap views) must be byte-identical to zero_copy=
     False (eager memcpy). Mints its own GGUF, compares kq-vs-kq.
