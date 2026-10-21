@@ -13,6 +13,8 @@ Runs under pytest; skipped automatically when the extension is unavailable.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -300,6 +302,73 @@ def test_load_gguf_type_43_fitting_neither_raises(
         kq.load_gguf(str(path))
     with pytest.raises(RuntimeError, match=msg):
         kq.load_gguf(str(path), True, ["odd.weight"])
+
+
+_LOAD_CUT_FILE = """
+import sys
+import mlx_kquant as kq
+path, skip = sys.argv[1], sys.argv[2:]
+for zero_copy in (True, False):
+    try:
+        kq.load_gguf(path, zero_copy, skip)
+    except RuntimeError as e:
+        print("raised", e)
+    else:
+        print("loaded")
+"""
+
+
+def _pad32(n):
+    return -(-n // 32) * 32
+
+
+@pytest.mark.parametrize(
+    "layout, skip",
+    [
+        pytest.param("table-then-f32", [], id="table-then-f32"),
+        pytest.param("table-then-f32", ["table.weight"], id="table-then-f32-skip"),
+        pytest.param("f32-last", [], id="f32-last"),
+    ],
+)
+def test_load_gguf_cut_inside_a_tensor_raises(tmp_path, layout, skip):
+    """A file cut inside a tensor fails the load in both zero_copy modes,
+    rather than read past the end of the file (a crash, or garbage values).
+    Here an MXFP8 table followed by an f32 tensor is cut 600 KB into the
+    table, whose span in the header still holds the full table, or an f32
+    last tensor loses its final 1000 bytes. The loads run in a child
+    process, so a read past the end fails the test rather than the run."""
+    from kqref import MXFP8
+
+    rng = np.random.default_rng(8)
+    table = np.zeros((4096, 8 * 33), dtype=np.uint8)
+    f32 = rng.standard_normal(16384).astype(np.float32)
+    if layout == "table-then-f32":
+        tensors = [("table.weight", table, MXFP8), ("after.f32", f32, GT.F32)]
+        name, nbytes, cut = "table.weight", table.nbytes, 600_000
+        tail = _pad32(table.nbytes) + _pad32(f32.nbytes)
+    else:
+        tensors = [("pad.f32", np.arange(5, dtype=np.float32), GT.F32)]
+        tensors.append(("last.f32", f32, GT.F32))
+        name, nbytes, cut = "last.f32", f32.nbytes, 1000
+        tail = _pad32(f32.nbytes)
+    path = tmp_path / "cut.gguf"
+    _write_gguf(path, tensors)
+    size = path.stat().st_size
+    os.truncate(path, size - cut)
+
+    r = subprocess.run(
+        [sys.executable, "-c", _LOAD_CUT_FILE, str(path), *skip],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert r.returncode == 0, r.stderr[-4000:]
+    end = size - tail + nbytes
+    msg = (
+        f"raised [load_gguf] tensor {name} ends at byte {end}, past the end of "
+        f"the file at byte {size - cut}: the file looks cut short."
+    )
+    assert r.stdout.splitlines() == [msg, msg]
 
 
 def test_zero_copy_matches_copy(tmp_path):

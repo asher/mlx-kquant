@@ -344,9 +344,10 @@ uint64_t codec_wire_bytes(const KQuantCodec& c, uint64_t n) {
 // is 6.3x larger, so the tensor is MXFP8 when its span holds that size and
 // STQ1_0 when it holds only the STQ1_0 size. A count that is not whole blocks
 // of a format rules that format out. The last tensor in a file can be cut
-// short: when its span is under the MXFP8 size but over the STQ1_0 size plus
-// max(alignment, 1 MiB), or STQ1_0 is ruled out, it is an MXFP8 table that
-// the file does not hold, and the load fails instead of reading it as STQ1_0.
+// short: when its span is under the MXFP8 size but at least the STQ1_0 size
+// plus max(alignment, 1 MiB), or STQ1_0 is ruled out, it is an MXFP8 table
+// that the file does not hold, and the load fails instead of reading it as
+// STQ1_0.
 const KQuantCodec* resolve_type_43(
     const gguf_tensor& tensor,
     const std::string& name,
@@ -794,6 +795,15 @@ GgufLoadResult load_gguf(
       tensor.bsize = codec_wire_bytes(*codec, tensor.num_weights);
     } else {
       codec = gguf_type_to_kquant_codec(tensor.type);
+    }
+    // The header places every tensor; a file cut short ends before some of
+    // them, and reading one would run past the mapping.
+    if (tensor.offset > ctx->size || tensor.bsize > ctx->size - tensor.offset) {
+      std::ostringstream msg;
+      msg << "[load_gguf] tensor " << name << " ends at byte "
+          << tensor.offset + tensor.bsize << ", past the end of the file at "
+          << "byte " << ctx->size << ": the file looks cut short.";
+      throw std::runtime_error(msg.str());
     }
 
     // Logical shape in GGUF native order (matches gguf-py ReaderTensor.shape).
