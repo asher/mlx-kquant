@@ -397,9 +397,11 @@ tensor, to the end of the file. An `mxfp8` tensor is 6.3 times the size of an `s
 same element count. The tensor is `mxfp8` when its span holds the `mxfp8` size and `stq1_0` when it
 holds only the `stq1_0` size, and a format whose block size does not divide the element count is
 ruled out. The load fails, naming the tensor, its span and both sizes, when the span holds
-neither. It also fails when the last tensor's span is short of the `mxfp8` size and either its
-element count rules out `stq1_0` or its span runs at least 1 MiB (or the file alignment, if
-larger) past the `stq1_0` size: the file then holds an `mxfp8` table cut short.
+neither. The last tensor in the file has one more case. When its element count is whole 32-value
+blocks and its span is short of the `mxfp8` size, the load fails if the count rules out `stq1_0` or
+the span runs at least 1 MiB (or the file alignment, if larger) past the `stq1_0` size: the file
+then holds an `mxfp8` table cut short. A count that is not whole 32-value blocks fails as "fits
+neither".
 
 ## Version pinning
 
