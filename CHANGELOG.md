@@ -6,6 +6,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `kq.load_gguf` loads the `mxfp8` lookup tables of DeepSeek-V4.1 GGUFs, which
+  share ggml type 43 with `stq1_0`, and `kq.dequantize` decodes their rows.
+
 ## [0.5.3]
 
 ### Changed

@@ -32,9 +32,9 @@ y = kq.quantized_matmul(x, wq, scales, "q4_k", transpose=True)   # x @ dequant(w
 ```
 
 On the GPU, a `q4_k` or `q5_k` weight must start on a 16-byte boundary and an `iq4_xs` or `iq1_m`
-weight on an 8-byte one. `q2_k`, `q4_1`, `q5_1` and `ptq1_0` need 4 bytes, `mxfp4` and `nvfp4` can
-start anywhere, and every other codec needs 2. An op raises `ValueError` on a weight that misses its
-boundary. It raises from the call when the weight is evaluated and row-contiguous, and from
+weight on an 8-byte one. `q2_k`, `q4_1`, `q5_1` and `ptq1_0` need 4 bytes, `mxfp4`, `nvfp4` and
+`mxfp8` can start anywhere, and every other codec needs 2. An op raises `ValueError` on a weight
+that misses its boundary. It raises from the call when the weight is evaluated and row-contiguous, and from
 `mx.eval` otherwise. Arrays that MLX allocates and tensors from `kq.load_gguf` always meet the
 boundary, as do slices of them that start on a block boundary. A view that starts inside a block can
 miss it, and a copy in a new buffer, such as `mx.array(np.array(w))`, runs. The CPU kernels accept
@@ -43,9 +43,9 @@ one that starts off the boundary of its kernel's vector loads to a new buffer fi
 
 ## Codecs
 
-Twenty-five codecs (the ten K-quant/legacy encodable on either stream, the nine IQ plus
-`stq1_0`, `pq2_0`, `ptq1_0` and `q2_0` CPU-encodable, and the two fp wire codecs decode-only), all defined in
-`mlx_kquant.codec_geometry.CODEC_GEOMETRY` as
+Twenty-six codecs (the ten K-quant/legacy encodable on either stream, the nine IQ plus
+`stq1_0`, `pq2_0`, `ptq1_0` and `q2_0` CPU-encodable, the two fp4 wire codecs decode-only, and
+`mxfp8` decode-only and gather-only), all defined in `mlx_kquant.codec_geometry.CODEC_GEOMETRY` as
 `(group_size, bits, bytes_per_block, weights_per_block)`:
 
 | codec | bits | weights/block | bytes/block | family |
@@ -75,6 +75,7 @@ Twenty-five codecs (the ten K-quant/legacy encodable on either stream, the nine 
 | `q2_0` | 2 | 64 | 18 | four-level 2-bit, fp16 scale per block, ggml type 42 (CPU encode) |
 | `mxfp4` | 4 | 32 | 17 | micro-scaling fp4, E8M0 block scale (decode-only) |
 | `nvfp4` | 4 | 64 | 36 | micro-scaling fp4, UE4M3 sub-scales (decode-only) |
+| `mxfp8` | 8 | 32 | 33 | micro-scaling fp8, E8M0 block scale, E4M3 values (gather-only) |
 
 `weights_per_block` (`wpb`) is the granularity that matters for layout: K-quants pack 256 weights per
 superblock, the block codecs 32, `q2_0` 64 and the Prism codecs 128. The duck-typed `group_size` attribute on a `KQuant*` module
@@ -82,11 +83,13 @@ equals `wpb`. The ten K-quant/legacy codecs encode on CPU or Metal; the nine IQ 
 `pq2_0`, `ptq1_0` and `q2_0` encode CPU-only (the IQ encoders are importance-weighted and ggml's
 imatrix-required trio rejects a missing **imatrix**; the ternary and Prism codecs ignore it, since
 QAT fixes their rounding); `mxfp4`/`nvfp4` have no encoder (GGUFs ship those tensors
-pre-quantized). The K-quant **imatrix** steers only the five superblock K-quants (`wpb == 256`) and
-is a no-op on the `wpb == 32` legacy codecs. The two Prism codecs are private to the PrismML
-llama.cpp fork (its Ternary Bonsai GGUFs), so their ggml type ids may change; `pq2_0` decodes code
-3 as +2 although the reference encoder never emits it. `q2_0` is the `pq2_0` code layout on a
-64-weight block, runs the same kernels and takes the same routes.
+pre-quantized). `mxfp8` holds lookup tables: `kq.dequantize` decodes rows gathered from it, on CPU
+or Metal, and the matmul ops raise `ValueError` on it. Its e8m0 scales reach 2^127, past the float16
+range, so decode it to `bfloat16` or `float32`. The K-quant **imatrix** steers only the five
+superblock K-quants (`wpb == 256`) and is a no-op on the `wpb == 32` legacy codecs. The two Prism
+codecs are private to the PrismML llama.cpp fork (its Ternary Bonsai GGUFs), so their ggml type ids
+may change; `pq2_0` decodes code 3 as +2 although the reference encoder never emits it. `q2_0` is
+the `pq2_0` code layout on a 64-weight block, runs the same kernels and takes the same routes.
 
 Presets (`mlx_kquant.recipes`) are **purely codec-name-based** - there is no affine "4-bit / 8-bit"
 abstraction that resolves to a codec. A preset (`q4_k_s/m/xl/moe`, `q5_k_s/m/xl/moe`, `q3_k_m`,
