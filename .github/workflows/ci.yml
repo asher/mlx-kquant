@@ -118,7 +118,19 @@ jobs:
       # (encode/load). Asset-gated KQUANT_TEST_* tests skip without their assets.
       - name: Op + model tests (GPU)
         if: env.FULL == 'true' && steps.gpu.outputs.available == '1'
-        run: pytest -q --continue-on-collection-errors tests/
+        run: pytest -q --continue-on-collection-errors --junitxml=junit.xml tests/
+
+      # The slowest test files and tests in the job summary, and the raw
+      # report as an artifact, to see where the GPU suite spends its time.
+      - name: Test timing
+        if: always() && env.FULL == 'true' && steps.gpu.outputs.available == '1'
+        run: python scripts/test-timing.py junit.xml >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always() && env.FULL == 'true' && steps.gpu.outputs.available == '1'
+        with:
+          name: junit-py${{ matrix.python }}
+          path: junit.xml
+          if-no-files-found: ignore
 
       - name: No-GPU note
         if: env.FULL == 'true' && steps.gpu.outputs.available != '1'
