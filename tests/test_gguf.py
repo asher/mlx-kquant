@@ -190,45 +190,73 @@ def test_load_gguf_type_43_span_uses_file_alignment(tmp_path):
     _check_type_43_load(path, t)
 
 
-@pytest.mark.parametrize("last", [False, True])
-def test_load_gguf_type_43_span_fitting_neither_raises(tmp_path, monkeypatch, last):
-    """A type-43 tensor sized as neither format (here 34-byte blocks of 32
-    weights) fails the load, skipped or not, naming the tensor, its span and
-    both sizes."""
+def test_load_gguf_type_43_stq1_0_with_trailing_bytes(tmp_path):
+    """Bytes after the last tensor (here 32 zeros) leave an STQ1_0 tensor
+    STQ1_0: its span holds its size and is far short of the MXFP8 size."""
+    t = _type_43_tensors()
+    stq = "blk.0.ffn_up.weight"
+    path = tmp_path / "stq_tail.gguf"
+    _write_gguf(path, [(stq, t[stq][0], t[stq][1])])
+    with open(path, "ab") as f:
+        f.write(bytes(32))
+
+    _check_type_43_load(path, {stq: t[stq]})
+    arrays, codecs, _, _ = kq.load_gguf(str(path), True, [stq])
+    assert stq not in arrays and codecs[stq] == "stq1_0"
+
+
+def test_load_gguf_type_43_small_mxfp8_at_page_alignment(tmp_path):
+    """At a page-sized alignment a one-row table's padding has room for
+    either format's size. It is MXFP8, the larger size that fits."""
+    from kqref import MXFP8, synth_wire
+
+    wire = synth_wire(np.random.default_rng(4), "mxfp8", 33, 8).reshape(1, 8 * 33)
+    pad = ("pad.f32", np.arange(5, dtype=np.float32), GT.F32)
+    path = tmp_path / "small43.gguf"
+    _write_gguf(path, [("small.weight", wire, MXFP8), pad], alignment=4096)
+    _check_type_43_load(path, {"small.weight": (wire, MXFP8, "mxfp8", 256)})
+
+
+@pytest.mark.parametrize(
+    "block, rows, cols, span, last",
+    [
+        pytest.param((256, 32), 4, 1024, 512, False, id="short"),
+        pytest.param((256, 32), 4, 1024, 512, True, id="short-last"),
+        pytest.param((16, 40), 3, 48, 384, False, id="partial-block"),
+    ],
+)
+def test_load_gguf_type_43_fitting_neither_raises(
+    tmp_path, monkeypatch, block, rows, cols, span, last
+):
+    """A type-43 tensor that is neither format fails the load, skipped or
+    not, naming the tensor, its span and both sizes: a span short of the
+    STQ1_0 size (32-byte blocks of 256 weights), or a count that is not
+    whole blocks of either (40-byte blocks of 16 weights)."""
     from gguf.constants import GGML_QUANT_SIZES
     from kqref import MXFP8
 
-    odd = type(MXFP8)("TYPE43_34B", 43)
-    monkeypatch.setitem(GGML_QUANT_SIZES, odd, (32, 34))
-    wire = np.random.default_rng(3).integers(0, 256, (4, 32 * 34), dtype=np.uint8)
+    odd = type(MXFP8)("TYPE43_ODD", 43)
+    monkeypatch.setitem(GGML_QUANT_SIZES, odd, block)
+    wpb, bpb = block
+    shape = (rows, cols // wpb * bpb)
+    wire = np.random.default_rng(3).integers(0, 256, shape, dtype=np.uint8)
     tensors = [("odd.weight", wire, odd)]
     pad = ("pad.f32", np.arange(5, dtype=np.float32), GT.F32)
     tensors = [pad, *tensors] if last else [*tensors, pad]
     path = tmp_path / "odd43.gguf"
     _write_gguf(path, tensors)
 
-    n = 4 * 1024
+    n = rows * cols
     msg = (
-        rf"odd\.weight has type 43.* span {wire.nbytes} fits neither: "
-        rf"stq1_0 needs {n // 256 * 42} bytes and mxfp8 {n // 32 * 33} bytes"
+        rf"odd\.weight has type 43.* fits neither: its {n} elements span "
+        rf"{span} bytes, where stq1_0 needs whole 256-element blocks "
+        rf"\({-(-n // 256) * 42} bytes\) and mxfp8 whole 32-element blocks "
+        rf"\({-(-n // 32) * 33} bytes\)"
     )
     with pytest.raises(RuntimeError, match=msg):
         kq.load_gguf(str(path))
     with pytest.raises(RuntimeError, match=msg):
         kq.load_gguf(str(path), True, ["odd.weight"])
-
-
-def test_load_gguf_type_43_span_fitting_both_raises(tmp_path):
-    """At a page-sized alignment a small tensor's padding has room for either
-    format's size. The load fails rather than pick one."""
-    from kqref import MXFP8, synth_wire
-
-    wire = synth_wire(np.random.default_rng(4), "mxfp8", 33, 8).reshape(1, 8 * 33)
-    pad = ("pad.f32", np.arange(5, dtype=np.float32), GT.F32)
-    path = tmp_path / "both43.gguf"
-    _write_gguf(path, [("small.weight", wire, MXFP8), pad], alignment=4096)
-    with pytest.raises(RuntimeError, match=r"small\.weight has type 43.* fits both"):
-        kq.load_gguf(str(path))
 
 
 def test_zero_copy_matches_copy(tmp_path):

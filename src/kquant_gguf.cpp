@@ -338,37 +338,33 @@ uint64_t codec_wire_bytes(const KQuantCodec& c, uint64_t n) {
 
 // GGML type 43 is claimed by two formats: STQ1_0 (256 weights in 42 bytes)
 // and MXFP8 (32 weights in 33 bytes). The type id cannot tell them apart,
-// but the bytes the tensor occupies can: a tensor's span (the distance to
-// the next tensor's data, or to the end of the file for the last one) is its
-// size padded to the file alignment. The sizes differ 6.3x, so at most one
-// fits unless the tensor is smaller than about the alignment; a span that
-// fits neither or both is an error, never a guess.
+// but the bytes the tensor spans can: the distance to the next tensor's data,
+// or to the end of the file for the last one, holds at least its size. MXFP8
+// is 6.3x larger, so the tensor is MXFP8 when its span holds that size and
+// STQ1_0 when it holds only the STQ1_0 size. A complete MXFP8 tensor is never
+// read as STQ1_0, and an STQ1_0 tensor is read as MXFP8 only when slack of
+// about 5.3 times its size follows it. A count that is not whole blocks of a
+// format rules that format out.
 const KQuantCodec* resolve_type_43(
     const gguf_tensor& tensor,
     const std::string& name,
-    uint64_t span,
-    uint64_t alignment) {
+    uint64_t span) {
   const KQuantCodec* stq = codec_by_name("stq1_0");
   const KQuantCodec* mx8 = codec_by_name("mxfp8");
-  const KQuantCodec* match = nullptr;
-  int matches = 0;
-  for (const KQuantCodec* c : {stq, mx8}) {
-    const uint64_t size = codec_wire_bytes(*c, tensor.num_weights);
-    if (size <= span && span - size < alignment) {
-      match = c;
-      ++matches;
+  const uint64_t n = tensor.num_weights;
+  for (const KQuantCodec* c : {mx8, stq}) {
+    const uint64_t wpb = static_cast<uint64_t>(c->weights_per_block);
+    if (n % wpb == 0 && span >= codec_wire_bytes(*c, n)) {
+      return c;
     }
-  }
-  if (matches == 1) {
-    return match;
   }
   std::ostringstream msg;
   msg << "[load_gguf] tensor " << name << " has type 43, which both "
-      << "stq1_0 and mxfp8 use, and its byte span " << span << " fits "
-      << (matches == 0 ? "neither" : "both") << ": stq1_0 needs "
-      << codec_wire_bytes(*stq, tensor.num_weights) << " bytes and mxfp8 "
-      << codec_wire_bytes(*mx8, tensor.num_weights)
-      << " bytes, each padded to the file alignment " << alignment << ".";
+      << "stq1_0 and mxfp8 use, and fits neither: its " << n
+      << " elements span " << span << " bytes, where stq1_0 needs whole "
+      << "256-element blocks (" << codec_wire_bytes(*stq, n)
+      << " bytes) and mxfp8 whole 32-element blocks ("
+      << codec_wire_bytes(*mx8, n) << " bytes).";
   throw std::runtime_error(msg.str());
 }
 
@@ -770,8 +766,7 @@ GgufLoadResult load_gguf(
     std::string name(tensor.name, tensor.namelen);
     const KQuantCodec* codec = nullptr;
     if (tensor.type == 43) {
-      codec =
-          resolve_type_43(tensor, name, span_of(tensor.offset), ctx->alignment);
+      codec = resolve_type_43(tensor, name, span_of(tensor.offset));
       // gguflib's type table sizes every type-43 tensor as stq1_0.
       tensor.bsize = codec_wire_bytes(*codec, tensor.num_weights);
     } else {
