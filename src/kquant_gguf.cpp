@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 
 #include <unistd.h> // getpagesize
 
@@ -341,30 +342,48 @@ uint64_t codec_wire_bytes(const KQuantCodec& c, uint64_t n) {
 // but the bytes the tensor spans can: the distance to the next tensor's data,
 // or to the end of the file for the last one, holds at least its size. MXFP8
 // is 6.3x larger, so the tensor is MXFP8 when its span holds that size and
-// STQ1_0 when it holds only the STQ1_0 size. A complete MXFP8 tensor is never
-// read as STQ1_0, and an STQ1_0 tensor is read as MXFP8 only when slack of
-// about 5.3 times its size follows it. A count that is not whole blocks of a
-// format rules that format out.
+// STQ1_0 when it holds only the STQ1_0 size. A count that is not whole blocks
+// of a format rules that format out. The last tensor in a file can be cut
+// short: when its span is under the MXFP8 size but over the STQ1_0 size plus
+// max(alignment, 1 MiB), or STQ1_0 is ruled out, it is an MXFP8 table that
+// the file does not hold, and the load fails instead of reading it as STQ1_0.
 const KQuantCodec* resolve_type_43(
     const gguf_tensor& tensor,
     const std::string& name,
-    uint64_t span) {
+    uint64_t span,
+    bool last,
+    uint64_t alignment) {
   const KQuantCodec* stq = codec_by_name("stq1_0");
   const KQuantCodec* mx8 = codec_by_name("mxfp8");
   const uint64_t n = tensor.num_weights;
-  for (const KQuantCodec* c : {mx8, stq}) {
-    const uint64_t wpb = static_cast<uint64_t>(c->weights_per_block);
-    if (n % wpb == 0 && span >= codec_wire_bytes(*c, n)) {
-      return c;
-    }
+  const uint64_t stq_size = codec_wire_bytes(*stq, n);
+  const uint64_t mx8_size = codec_wire_bytes(*mx8, n);
+  const bool stq_fits_count =
+      n % static_cast<uint64_t>(stq->weights_per_block) == 0;
+  const bool mx8_fits_count =
+      n % static_cast<uint64_t>(mx8->weights_per_block) == 0;
+  if (mx8_fits_count && span >= mx8_size) {
+    return mx8;
+  }
+  const uint64_t slack = std::max<uint64_t>(alignment, uint64_t(1) << 20);
+  if (last && mx8_fits_count && (!stq_fits_count || span >= stq_size + slack)) {
+    std::ostringstream msg;
+    msg << "[load_gguf] tensor " << name << " has type 43 and is the last "
+        << "tensor in the file. It reads as mxfp8, which needs " << mx8_size
+        << " bytes for its " << n << " elements, but its byte span to the "
+        << "end of the file is " << span << ": the file looks cut short.";
+    throw std::runtime_error(msg.str());
+  }
+  if (stq_fits_count && span >= stq_size) {
+    return stq;
   }
   std::ostringstream msg;
   msg << "[load_gguf] tensor " << name << " has type 43, which both "
       << "stq1_0 and mxfp8 use, and fits neither: its " << n
       << " elements span " << span << " bytes, where stq1_0 needs whole "
-      << "256-element blocks (" << codec_wire_bytes(*stq, n)
-      << " bytes) and mxfp8 whole 32-element blocks ("
-      << codec_wire_bytes(*mx8, n) << " bytes).";
+      << "256-element blocks (" << stq_size
+      << " bytes) and mxfp8 whole 32-element blocks (" << mx8_size
+      << " bytes).";
   throw std::runtime_error(msg.str());
 }
 
@@ -755,10 +774,13 @@ GgufLoadResult load_gguf(
     starts.push_back(t.offset);
   }
   std::sort(starts.begin(), starts.end());
-  auto span_of = [&](uint64_t offset) -> uint64_t {
+  // The bytes from a tensor's data to the next tensor's, or to the end of
+  // the file for the last tensor (second: true).
+  auto span_of = [&](uint64_t offset) -> std::pair<uint64_t, bool> {
     auto next = std::upper_bound(starts.begin(), starts.end(), offset);
-    const uint64_t end = next == starts.end() ? ctx->size : *next;
-    return end > offset ? end - offset : 0;
+    const bool last = next == starts.end();
+    const uint64_t end = last ? ctx->size : *next;
+    return {end > offset ? end - offset : 0, last};
   };
 
   // 3. tensors.
@@ -766,7 +788,8 @@ GgufLoadResult load_gguf(
     std::string name(tensor.name, tensor.namelen);
     const KQuantCodec* codec = nullptr;
     if (tensor.type == 43) {
-      codec = resolve_type_43(tensor, name, span_of(tensor.offset));
+      const auto [span, last] = span_of(tensor.offset);
+      codec = resolve_type_43(tensor, name, span, last, ctx->alignment);
       // gguflib's type table sizes every type-43 tensor as stq1_0.
       tensor.bsize = codec_wire_bytes(*codec, tensor.num_weights);
     } else {

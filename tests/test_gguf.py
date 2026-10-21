@@ -12,6 +12,8 @@ Runs under pytest; skipped automatically when the extension is unavailable.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 
@@ -218,11 +220,50 @@ def test_load_gguf_type_43_small_mxfp8_at_page_alignment(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "rows, cols, cut",
+    [
+        # 2^21 values: the span lands between the STQ1_0 size plus 1 MiB and
+        # the MXFP8 size, where an STQ1_0 reading would load silently.
+        pytest.param(8192, 256, 2**21 // 32 * 33 // 4, id="past-stq1_0-slack"),
+        # 288 values are not whole STQ1_0 blocks: any short span is cut.
+        pytest.param(3, 96, 100, id="not-stq1_0-blocks"),
+    ],
+)
+def test_load_gguf_type_43_cut_short_mxfp8_raises(tmp_path, rows, cols, cut):
+    """A file cut inside its last tensor, an MXFP8 table, fails the load,
+    skipped or not, rather than read the table as STQ1_0 weights."""
+    from kqref import MXFP8
+
+    wire = np.zeros((rows, cols // 32 * 33), dtype=np.uint8)
+    pad = ("pad.f32", np.arange(5, dtype=np.float32), GT.F32)
+    path = tmp_path / "cut43.gguf"
+    _write_gguf(path, [pad, ("table.weight", wire, MXFP8)])
+    size = path.stat().st_size
+    os.truncate(path, size - cut)
+
+    n, mx8 = rows * cols, wire.nbytes
+    span = -(-mx8 // 32) * 32 - cut
+    assert span < mx8
+    if n % 256 == 0:
+        assert span >= n // 256 * 42 + 2**20
+    msg = (
+        rf"table\.weight has type 43 and is the last tensor in the file\. It "
+        rf"reads as mxfp8, which needs {mx8} bytes for its {n} elements, but "
+        rf"its byte span to the end of the file is {span}: the file looks cut"
+    )
+    with pytest.raises(RuntimeError, match=msg):
+        kq.load_gguf(str(path))
+    with pytest.raises(RuntimeError, match=msg):
+        kq.load_gguf(str(path), True, ["table.weight"])
+
+
+@pytest.mark.parametrize(
     "block, rows, cols, span, last",
     [
         pytest.param((256, 32), 4, 1024, 512, False, id="short"),
         pytest.param((256, 32), 4, 1024, 512, True, id="short-last"),
         pytest.param((16, 40), 3, 48, 384, False, id="partial-block"),
+        pytest.param((32, 20), 3, 96, 192, False, id="short-not-stq1_0-blocks"),
     ],
 )
 def test_load_gguf_type_43_fitting_neither_raises(
@@ -230,8 +271,10 @@ def test_load_gguf_type_43_fitting_neither_raises(
 ):
     """A type-43 tensor that is neither format fails the load, skipped or
     not, naming the tensor, its span and both sizes: a span short of the
-    STQ1_0 size (32-byte blocks of 256 weights), or a count that is not
-    whole blocks of either (40-byte blocks of 16 weights)."""
+    STQ1_0 size (32-byte blocks of 256 weights), a count that is not whole
+    blocks of either (40-byte blocks of 16 weights), or, before the last
+    tensor, a span short of the MXFP8 size on a count that is not whole
+    STQ1_0 blocks (20-byte blocks of 32 weights)."""
     from gguf.constants import GGML_QUANT_SIZES
     from kqref import MXFP8
 
