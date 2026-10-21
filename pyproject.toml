@@ -14,7 +14,7 @@ name = "mlx-kquant"
 dynamic = ["version"]
 description = "GGUF K-quant dequantize / quantized-matmul / gather-qmm / quantize ops for MLX, via custom Metal kernels."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Asher Feldman" }]
@@ -31,7 +31,6 @@ classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
   "Intended Audience :: Science/Research",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
@@ -87,7 +86,7 @@ filterwarnings = [
 
 [tool.ruff]
 line-length = 88
-target-version = "py310"
+target-version = "py311"
 extend-exclude = ["build", "tests/fixtures"]
 
 [tool.ruff.lint]
@@ -108,7 +107,7 @@ ignore = ["E741"]  # ambiguous var names (l/I) appear in math-y kernel glue
 # One wheel per CPython minor. Not abi3: nanobind tags stable-ABI builds into a
 # separate internals domain, so an abi3 _ext would stop sharing the `mlx` domain
 # with mlx.core and every mx.array argument would fail.
-build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+build = "cp311-* cp312-* cp313-* cp314-*"
 build-frontend = "build"
 # check-codecs imports the installed wheel (pulling in the mlx dependency) and
 # exercises kq.codecs() - GPU-free, so it validates the libmlx rpath resolves.

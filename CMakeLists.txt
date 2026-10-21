@@ -27,7 +27,7 @@ endif()
 set(Python_FIND_VIRTUALENV FIRST)
 
 find_package(
-  Python 3.9
+  Python 3.11
   COMPONENTS Interpreter Development.Module
   REQUIRED)
 

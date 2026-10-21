@@ -6,6 +6,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+- Python 3.10 support. On Python 3.10, pip installs 0.5.4, the last release
+  that supports it.
+
 ## [0.5.4]
 
 ### Added

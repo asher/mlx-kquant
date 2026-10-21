@@ -47,7 +47,7 @@ on a stock `mlx` wheel.
 
 ## Install
 
-**macOS 26.2 (Tahoe) or later on Apple Silicon.** Prebuilt wheels (CPython 3.10-3.14):
+**macOS 26.2 (Tahoe) or later on Apple Silicon.** Prebuilt wheels (CPython 3.11-3.14):
 
 ```sh
 pip install mlx-kquant            # the K-quant ops + precompiled metallib
@@ -421,7 +421,7 @@ python -m pytest tests/
   toolchain (`xcrun metal`).
 - **Linux** (x86_64 or aarch64) is supported CPU-only. Build against `mlx[cpu]==0.32.3`, no Metal
   toolchain required. See [Install](#install) and [Limitations](#limitations).
-- **Python >= 3.10** (the pinned `mlx==0.32.3` ships no cp39 wheel).
+- **Python >= 3.11**.
 - **`mlx==0.32.3`** exactly - the kernels include MLX's steel headers and the extension links
   `libmlx`, so the ABI is version-locked (see [Version pinning](#version-pinning)).
 
