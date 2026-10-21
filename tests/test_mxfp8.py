@@ -12,11 +12,13 @@ from __future__ import annotations
 import os
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import pytest
 from kqref import mxfp8_e4m3_table, mxfp8_e8m0_to_fp32, quants, synth_wire
 
 import mlx_kquant as kq
+from mlx_kquant.codec_geometry import GATHER_ONLY_CODECS
 from mlx_kquant.nn import KQuantEmbedding, KQuantLinear
 
 GPU = (
@@ -170,10 +172,49 @@ def test_embedding_keeps_values_past_float16_range():
     _assert_bits_equal(np.array(emb(mx.array(ids))), want)
 
 
+def test_float_fuse_keeps_values_past_float16_range():
+    """The fuse paths that decode a table to a float embedding (the fuse
+    CLI's --dequantize and a LoRA embedding's fuse(dequantize=True)) keep
+    values past the float16 range, as the module's own lookup does."""
+    pytest.importorskip("mlx_lm")
+    from mlx_kquant.cli.fuse import _dequantize_remaining
+    from mlx_kquant.mlx_lm_patch import patch_mlx_lm_lora
+
+    rows, dims = 8, 256
+    wire = _table(np.random.default_rng(7), rows, dims, (150, 200, 240))
+    want = quants.dequantize(wire, "MXFP8")
+    assert np.abs(want).max() > 65504.0
+
+    def table():
+        emb = KQuantEmbedding(num_embeddings=rows, dims=dims, codec="mxfp8")
+        emb.weight = mx.array(wire)
+        return emb
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = table()
+
+    model = Model()
+    assert _dequantize_remaining(model) == 1
+    assert isinstance(model.embed, nn.Embedding)
+    _assert_bits_equal(np.array(model.embed.weight.astype(mx.float32)), want)
+
+    patch_mlx_lm_lora()
+    lora = table().to_lora(r=4, scale=1.0, dropout=0.0)  # lora_b is zero
+    fused = lora.fuse(dequantize=True)
+    assert isinstance(fused, nn.Embedding)
+    # Equal values: adding the zero delta turns -0.0 into +0.0.
+    assert np.array_equal(np.array(fused.weight.astype(mx.float32)), want)
+
+
 def test_codec_registry():
     assert "mxfp8" in kq.codecs()
     assert not kq.codec_has_matmul("mxfp8")
     assert not kq.codec_has_moe_glu("mxfp8")
+    assert {c for c in kq.codecs() if not kq.codec_has_matmul(c)} == set(
+        GATHER_ONLY_CODECS
+    )
 
 
 def _matmul_calls():

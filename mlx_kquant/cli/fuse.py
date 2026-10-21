@@ -178,7 +178,9 @@ def _dequantize_remaining(model) -> int:
     for name, m in model.named_modules():
         bias = "bias" in m
         if isinstance(m, KQuantEmbedding):
-            weight = kq.dequantize(m["weight"], m["scales"], m.kquant_type)
+            weight = kq.dequantize(
+                m["weight"], m["scales"], m.kquant_type, dtype=m.decode_dtype()
+            )
             num_emb, dims = weight.shape
             repl = nn.Embedding(num_emb, dims)
             repl.weight = weight

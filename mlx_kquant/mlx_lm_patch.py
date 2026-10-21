@@ -271,7 +271,9 @@ def _embedding_fuse(self, dequantize: bool = False, imatrix=None):
         return _orig_fuse["embedding"](self, dequantize=dequantize)
 
     num_embeddings, dims = base.num_embeddings, base.dims
-    weight = kq.dequantize(base["weight"], base["scales"], base.kquant_type)
+    weight = kq.dequantize(
+        base["weight"], base["scales"], base.kquant_type, dtype=base.decode_dtype()
+    )
     merged = (weight + (self.scale * self.lora_a) @ self.lora_b).astype(weight.dtype)
 
     if dequantize:
