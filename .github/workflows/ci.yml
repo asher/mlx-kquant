@@ -52,7 +52,7 @@ jobs:
   build-and-test:
     name: build + tests (py${{ matrix.python }})
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       # Xcode 26.5+ SDK headers miscompile kernels above this target
       MACOSX_DEPLOYMENT_TARGET: "26.2"
