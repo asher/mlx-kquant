@@ -392,10 +392,14 @@ are informed by our analysis of the mixed-precision quants that [Unsloth][unslot
 
 Two unmerged llama.cpp formats use GGML type 43: `stq1_0` (llama.cpp PR #22836) and `mxfp8`
 (llama.cpp PR #30817, which stores DeepSeek-V4.1 engram tables in it). `kq.load_gguf` tells them
-apart by the bytes the tensor occupies in the file: its span to the next tensor's data, or to the
-end of the file for the last tensor, is its size padded to `general.alignment`. A type-43 tensor
-whose span fits neither size, or both, fails the load with an error naming the tensor and both
-sizes.
+apart by the bytes the tensor spans in the file, up to the next tensor's data or, for the last
+tensor, to the end of the file. An `mxfp8` tensor is 6.3 times the size of an `stq1_0` one with the
+same element count. The tensor is `mxfp8` when its span holds the `mxfp8` size and `stq1_0` when it
+holds only the `stq1_0` size, and a format whose block size does not divide the element count is
+ruled out. The load fails, naming the tensor, its span and both sizes, when the span holds
+neither. It also fails when the last tensor's span is short of the `mxfp8` size and either its
+element count rules out `stq1_0` or its span runs at least 1 MiB (or the file alignment, if
+larger) past the `stq1_0` size: the file then holds an `mxfp8` table cut short.
 
 ## Version pinning
 
