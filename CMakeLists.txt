@@ -249,17 +249,11 @@ if(MLX_BUILD_METAL)
     list(APPEND KQ_PROBE_METAL_SOURCES
          ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax_epi_probe.metal)
   endif()
-  # The metallib has no depfile; header edits retrigger it only through DEPS.
+  # The .air files have no depfile; header edits retrigger them only through
+  # this list.
   file(GLOB KQ_METAL_KERNEL_HEADERS CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_LIST_DIR}/metal/mlx/backend/metal/kernels/*.h)
-  mlx_build_metallib(
-    TARGET
-    mlx_kquant_metallib
-    TITLE
-    mlx_kquant
-    DEPS
-    ${KQ_METAL_KERNEL_HEADERS}
-    SOURCES
+  set(KQ_METAL_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax_epi.metal
@@ -289,12 +283,44 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_hc_lowrank.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_route_shed.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_skinny_mv.metal
-    ${KQ_PROBE_METAL_SOURCES}
-    INCLUDE_DIRS
-    ${CMAKE_CURRENT_LIST_DIR}/metal
-    ${MLX_INCLUDE_DIRS}
-    OUTPUT_DIRECTORY
-    ${CMAKE_LIBRARY_OUTPUT_DIRECTORY})
+    ${KQ_PROBE_METAL_SOURCES})
+
+  # The flags of mlx_build_metallib. That macro compiles every source in one
+  # metal call, on one core. Here each source compiles to its own .air, so the
+  # build runs them in parallel, and one metal call links them in list order.
+  set(KQ_METAL_FLAGS "")
+  foreach(dir ${CMAKE_CURRENT_LIST_DIR}/metal ${MLX_INCLUDE_DIRS})
+    list(APPEND KQ_METAL_FLAGS -I${dir})
+  endforeach()
+  list(APPEND KQ_METAL_FLAGS -Wall -Wextra -fno-fast-math
+       -Wno-c++17-extensions -Wmetal-addr-spaces)
+  if(MLX_METAL_DEBUG)
+    list(APPEND KQ_METAL_FLAGS -gline-tables-only -frecord-sources)
+  endif()
+
+  set(KQ_AIR_DIR ${CMAKE_CURRENT_BINARY_DIR}/kq_air)
+  file(MAKE_DIRECTORY ${KQ_AIR_DIR})
+  set(KQ_AIR_FILES "")
+  foreach(src ${KQ_METAL_SOURCES})
+    get_filename_component(name ${src} NAME_WE)
+    set(air ${KQ_AIR_DIR}/${name}.air)
+    add_custom_command(
+      OUTPUT ${air}
+      COMMAND xcrun -sdk macosx metal ${KQ_METAL_FLAGS} -c ${src} -o ${air}
+      DEPENDS ${src} ${KQ_METAL_KERNEL_HEADERS}
+      COMMENT "Compiling ${name}.metal"
+      VERBATIM)
+    list(APPEND KQ_AIR_FILES ${air})
+  endforeach()
+
+  set(KQ_METALLIB ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/mlx_kquant.metallib)
+  add_custom_command(
+    OUTPUT ${KQ_METALLIB}
+    COMMAND xcrun -sdk macosx metal ${KQ_AIR_FILES} -o ${KQ_METALLIB}
+    DEPENDS ${KQ_AIR_FILES}
+    COMMENT "Linking mlx_kquant.metallib"
+    VERBATIM)
+  add_custom_target(mlx_kquant_metallib DEPENDS ${KQ_METALLIB})
 
   add_dependencies(mlx_kquant_ext mlx_kquant_metallib)
 endif()
