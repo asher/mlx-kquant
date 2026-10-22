@@ -176,15 +176,19 @@ METAL_FUNC void kq_verify_mma_impl(
       }
       Codec::template block<NT>(rows, boff, L, fm, xb, acc);
       for (short t = 0; t < NT; ++t) {
-        const float d = Codec::d_scale *
-            float(*(const device half*)(rows.p[t] + boff + Codec::d_offset));
-        c[t] += d *
-            float2(reinterpret_cast<thread vec<A, 2>&>(
-                acc[t].thread_elements()));
+        const float2 sum = float2(
+            reinterpret_cast<thread vec<A, 2>&>(acc[t].thread_elements()));
         if constexpr (MIN) {
-          const float mn =
-              float(*(const device half*)(rows.p[t] + boff + Codec::m_offset));
-          c[t] += mn * *(const threadgroup float2*)(Xsum + (kb / 32) * 8 + fn);
+          static_assert(Codec::m_offset == Codec::d_offset + 2, "m follows d");
+          // d and m are adjacent halves: one 32-bit load.
+          const float2 dm = float2(
+              *(const device half2*)(rows.p[t] + boff + Codec::d_offset));
+          c[t] += Codec::d_scale * dm.x * sum +
+              dm.y * *(const threadgroup float2*)(Xsum + (kb / 32) * 8 + fn);
+        } else {
+          const float d = Codec::d_scale *
+              float(*(const device half*)(rows.p[t] + boff + Codec::d_offset));
+          c[t] += d * sum;
         }
       }
     }
