@@ -199,7 +199,7 @@ def test_gpu_weight_base_glu(codec):
 
 
 @GPU
-@pytest.mark.parametrize("codec", ["q4_k", "q6_k", "q8_0", "q4_0"])
+@pytest.mark.parametrize("codec", ["q4_k", "q6_k", "q8_0", "q4_0", "q4_1"])
 def test_gpu_weight_base_multi(codec):
     """quantized_matmul_multi checks the start of every weight, at the rows
     that join them in one verify kernel and at those that do not."""

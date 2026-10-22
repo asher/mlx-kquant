@@ -35,6 +35,7 @@ CPU_REL = 5e-2
 # Codecs with a verify_nax kernel, and an inner dim each serves.
 CODECS = {
     "q4_0": 512,
+    "q4_1": 512,
     "q8_0": 512,
     "iq4_nl": 512,
     "q4_k": 512,
@@ -138,7 +139,7 @@ def test_synth_codecs_match_per_weight_bits(codec, splits, exact_levers):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("codec", ["q4_0", "q4_k", "q6_k"])
+@pytest.mark.parametrize("codec", ["q4_0", "q4_1", "q4_k", "q6_k"])
 def test_reference_default_levers(codec, dtype):
     k = CODECS[codec]
     pairs = _weights(codec, NS, k)
@@ -155,14 +156,15 @@ def test_reference_default_levers(codec, dtype):
             assert err <= rel * np.linalg.norm(ref), f"{codec} M={m}"
 
 
-def test_q4_0_two_block_inner_dim(exact_levers):
-    # K not a multiple of 256 runs the two-block q4_0 kernel.
+@pytest.mark.parametrize("codec", ["q4_0", "q4_1"])
+def test_two_block_inner_dim(codec, exact_levers):
+    # K not a multiple of 256 runs the two-block q4_0 or q4_1 kernel.
     exact_levers(1)
-    ws = [w for w, _ in _weights("q4_0", [64, 200], 320)]
+    ws = [w for w, _ in _weights(codec, [64, 200], 320)]
     for m in (3, 5, 8):
         x = _x(m, 320, mx.bfloat16)
-        got = kq.quantized_matmul_multi(x, ws, "q4_0")
-        want = _per_weight(x, ws, "q4_0")
+        got = kq.quantized_matmul_multi(x, ws, codec)
+        want = _per_weight(x, ws, codec)
         mx.eval(got, want)
         for g, w in zip(got, want, strict=True):
             assert np.array_equal(

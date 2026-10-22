@@ -2,8 +2,8 @@
 """Smoke test for kq.load_gguf - the only coverage of kquant_gguf.cpp (gguflib
 mmap + KV-metadata decode + tensor packing + shape reversal).
 
-Mint a tiny GGUF with gguf-py (which can ENCODE the flat codecs q8_0/q4_0 and
-F32 - all we need to exercise the loader's quantized and native-dtype paths),
+Mint a tiny GGUF with gguf-py (which can ENCODE the flat codecs q8_0/q4_0/q4_1
+and F32 - all we need to exercise the loader's quantized and native-dtype paths),
 load it through the C++ loader, and verify tensors, codecs, shapes and metadata
 round-trip.
 
@@ -26,7 +26,7 @@ from gguf import GGUFWriter, quants  # noqa: E402
 
 
 def _mint(path) -> tuple:
-    """Write plain.f32 + two flat-codec tensors + scalar metadata; return refs."""
+    """Write plain.f32 + three flat-codec tensors + scalar metadata; return refs."""
     rng = np.random.default_rng(0)
     w = GGUFWriter(str(path), "smoke")
     w.add_uint32("smoke.answer", 42)
@@ -34,7 +34,11 @@ def _mint(path) -> tuple:
     f32 = np.arange(64, dtype=np.float32).reshape(4, 16) * 0.01
     w.add_tensor("plain.f32", f32, raw_dtype=GT.F32)
     src = {}
-    for name, gt in (("layer.q8", GT.Q8_0), ("layer.q4", GT.Q4_0)):
+    for name, gt in (
+        ("layer.q8", GT.Q8_0),
+        ("layer.q4", GT.Q4_0),
+        ("layer.q41", GT.Q4_1),
+    ):
         s = rng.standard_normal((8, 64)).astype(np.float32) * 0.1
         w.add_tensor(name, quants.quantize(s, gt), raw_dtype=gt)
         src[name] = (gt, s)
@@ -603,6 +607,8 @@ def test_load_gguf_skip(tmp_path):
     # Everything else loads as usual.
     assert arrays["layer.q4"].shape == (8, 64 // 2 + 2 * 2)
     assert codecs["layer.q4"] == "q4_0"
+    assert arrays["layer.q41"].shape == (8, 64 // 32 * 20)
+    assert codecs["layer.q41"] == "q4_1"
 
     # Default: nothing skipped.
     arrays, _c, _m, _s = kq.load_gguf(str(tmp_path / "smoke.gguf"))

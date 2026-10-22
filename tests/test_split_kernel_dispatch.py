@@ -75,8 +75,8 @@ ARMS = [
     ),
     ("_verify_nax_", 8, K, {"KQ_QMM_ROUTE": "verify_nax", **STRICT}),
 ]
-# K off the 256 step, for the codecs whose block divides it: q4_0 runs its
-# 64-step verify_nax kernel there.
+# K off the 256 step, for the codecs whose block divides it: q4_0 and q4_1
+# run their 64-step verify_nax kernels there.
 OFF_STEP = ("_verify_nax_", 8, K + 64, {"KQ_QMM_ROUTE": "verify_nax", **STRICT})
 # quantized_matmul_multi runs the verify_nax_multi kernels: verify_nax from
 # M 2 and more than one split, so the partials dtype shows in the name. The

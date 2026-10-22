@@ -75,19 +75,22 @@ def test_splitk_bm8_values(value, bm8):
     assert ("_qmm_t_splitk_bm8_" in name) == bm8, (value, name)
 
 
-# KQ_VERIFY_NAX_Q4_0_SB is on unless 0 and read live: q4_0 at a K that is a
-# multiple of 256 takes the eight-block kernel unless it is off.
+# KQ_VERIFY_NAX_Q4_0_SB and KQ_VERIFY_NAX_Q4_1_SB are on unless 0 and read
+# live: q4_0 and q4_1 at a K that is a multiple of 256 take the eight-block
+# kernel unless the codec's lever is off.
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
-def test_verify_nax_q4_0_sb_values():
+@pytest.mark.parametrize("codec", ["q4_0", "q4_1"])
+def test_verify_nax_sb_values(codec):
+    lever = f"KQ_VERIFY_NAX_{codec.upper()}_SB"
     values = [(None, True), ("", True), ("typo", True), ("no", False)]
-    call = {"codec": "q4_0", "shape": [8, 3840], "n": 1000, "dtype": "bfloat16"}
-    calls = [dict(call, env={"KQ_VERIFY_NAX_Q4_0_SB": v}) for v, _ in values]
+    call = {"codec": codec, "shape": [8, 3840], "n": 1000, "dtype": "bfloat16"}
+    calls = [dict(call, env={lever: v}) for v, _ in values]
     res = run_probe(calls, env={**LOG, "KQ_QMM_ROUTE": "verify_nax"})
     for (v, sb), r in zip(values, res, strict=True):
         assert r["error"] is None, (v, r["error"])
         ((name, _),) = r["kernels"]
-        assert name.startswith("kquant_q4_0_sb_verify_nax_") == sb, (v, name)
-    assert _warnings(res[2], "KQ_VERIFY_NAX_Q4_0_SB", "typo"), res[2]["stderr"]
+        assert name.startswith(f"kquant_{codec}_sb_verify_nax_") == sb, (v, name)
+    assert _warnings(res[2], lever, "typo"), res[2]["stderr"]
 
 
 # KQ_VNAX_X16 is on unless 0, read live under KQ_TUNE_LIVE: x at a 16-byte
