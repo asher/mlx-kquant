@@ -55,7 +55,7 @@ void KQuantSkinnyMV::eval_gpu(
   ce.set_bytes(K, 5);
   MTL::Size group_dims(32 * 8, 1, 1);
   MTL::Size grid_dims((N + 7) / 8, T, 1);
-  kq_log_dispatch(kname, x, out, grid_dims);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 

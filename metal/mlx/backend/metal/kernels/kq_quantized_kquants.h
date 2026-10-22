@@ -2201,8 +2201,10 @@ inline uint kq_q6_k_ld32(const device uint8_t* p) {
 // AND, one convert and one FMA. The -32 offset folds into one FMA per scale
 // group. Partial sums reduce through `red` (nsg * rps floats). Below 15
 // superblocks the simdgroups past the last pair hold no work: the host
-// dispatches only the first (nb + 1) / 2, and the sum reads only those, so
-// the output does not depend on the count dispatched. Needs N % rps == 0.
+// dispatches only the first (nb + 1) / 2. The sum reads the partials of the
+// simdgroups that launched and hold a pair, so it never reads an unwritten
+// slot and the output does not depend on the count dispatched. Needs
+// N % rps == 0.
 template <typename T, int rps, int nsg>
 METAL_FUNC void kq_q6_k_qmv_splitk_impl(
     const device uint8_t* w,
@@ -2212,7 +2214,8 @@ METAL_FUNC void kq_q6_k_qmv_splitk_impl(
     threadgroup float* red,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    uint sgs) {
   typedef float U;
   thread U ys[16];
   thread U ysum[4];
@@ -2286,10 +2289,20 @@ METAL_FUNC void kq_q6_k_qmv_splitk_impl(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (simd_gid == 0 && simd_lid < uint(rps)) {
+    // K is a function constant, so the pair count folds and the sum over it
+    // unrolls. A sum bounded by sgs at run time took 1-2% longer, so sgs
+    // only selects the shorter sum when fewer simdgroups launched than hold
+    // pairs.
     const int used = min(nsg, (nb + 1) / 2);
     U t = U(0);
-    for (int g = 0; g < used; g++) {
-      t += red[g * rps + simd_lid];
+    if (int(sgs) >= used) {
+      for (int g = 0; g < used; g++) {
+        t += red[g * rps + simd_lid];
+      }
+    } else {
+      for (int g = 0; g < int(sgs); g++) {
+        t += red[g * rps + simd_lid];
+      }
     }
     y[out_row + simd_lid] = static_cast<T>(t);
   }
@@ -2954,13 +2967,14 @@ template <typename T, int group_size, int bits, bool batched>
     const constant int64_t* /* s_strides */,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint sgs [[simdgroups_per_threadgroup]]) {
   static_assert(
       group_size == KQ_Q6_K_SUPERBLOCK, "Q6_K kernel requires group_size=256");
   static_assert(bits == 6, "Q6_K kernel requires bits=6");
   threadgroup float red[KQ_Q6_K_SPLITK_NSG * KQ_Q6_K_SPLITK_RPS];
   kq_q6_k_qmv_splitk_impl<T, KQ_Q6_K_SPLITK_RPS, KQ_Q6_K_SPLITK_NSG>(
-      w, x, y, kq_q6_k_splitk_k, red, tid, simd_gid, simd_lid);
+      w, x, y, kq_q6_k_splitk_k, red, tid, simd_gid, simd_lid, sgs);
 }
 
 // `batched` is carried only so this reuses the instantiate_kquant_batched

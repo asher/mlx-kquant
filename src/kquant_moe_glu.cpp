@@ -297,7 +297,7 @@ inline void kq_gather_qmv_pair_gpu(
   const int fsg = kq_moe_fit_sg(kernel, sg);
   MTL::Size group_dims(32, fsg, 1);
   MTL::Size grid_dims(N / (fsg * 32 / nx), 1, (T + 1) / 2);
-  kq_log_dispatch(kname, x, out, grid_dims);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 #endif // _METAL_
@@ -521,7 +521,7 @@ void KQuantMoEGLU::eval_gpu(
   ce.set_bytes(limit, 12);
   MTL::Size group_dims(32, 2, 1);
   MTL::Size grid_dims(N / 8, R, T);
-  kq_log_dispatch(kname, x, out, grid_dims);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -562,7 +562,7 @@ void KQuantGatherQMVBias::eval_gpu(
   ce.set_bytes(N, 7);
   MTL::Size group_dims(32, 2, 1);
   MTL::Size grid_dims(N / (fine ? 2 : 8), R, T);
-  kq_log_dispatch(kname, x, out, grid_dims);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -606,7 +606,7 @@ void KQuantGatherQMVMixBias::eval_gpu(
   ce.set_bytes(S, 9);
   MTL::Size group_dims(32, 2, 1);
   MTL::Size grid_dims(N / (fine ? 2 : 8), 1, T);
-  kq_log_dispatch(kname, x, out, grid_dims);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -686,7 +686,7 @@ void KQuantMoEGLUKQ::eval_gpu(
                : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx)));
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / (sg * 32 / nx), R, T);
-  kq_log_dispatch(kname, x, out, grid_dims);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -756,7 +756,7 @@ void KQuantGatherQMVKQ::eval_gpu(
                : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx)));
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / (fine ? 2 : (sg * 32 / nx)), R, T);
-  kq_log_dispatch(kname, x, out, grid_dims);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
   if (lora_flags_ & KQ_LORA_PRESENT) {
     kq_lora_epilogue_rows_gpu(
@@ -830,7 +830,7 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
     const int sg = kq_moe_fit_sg(kernel, kq_moe_pick_sg(kquant_type_, N, nx));
     MTL::Size group_dims(32, sg, 1);
     MTL::Size grid_dims(N / (sg * 32 / nx), R + NS, T);
-    kq_log_dispatch(kname, x, out, grid_dims);
+    kq_log_dispatch(kname, x, out, grid_dims, group_dims);
     ce.dispatch_threadgroups(grid_dims, group_dims);
     return;
   }
@@ -882,7 +882,7 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
                : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx)));
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / (sg * 32 / nx), R + NS, T);
-  kq_log_dispatch(kname, x, out, grid_dims);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -956,7 +956,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
       ce.set_bytes(NS, 10);
       MTL::Size group_dims(32, 2 * S, 1);
       MTL::Size grid_dims(N / 8, 1, T);
-      kq_log_dispatch(kname, x, out, grid_dims);
+      kq_log_dispatch(kname, x, out, grid_dims, group_dims);
       ce.dispatch_threadgroups(grid_dims, group_dims);
       return;
     }
@@ -1030,7 +1030,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
                : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx)));
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / (fine ? 2 : (sg * 32 / nx)), 1, T);
-  kq_log_dispatch(kname, x, out, grid_dims);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -1135,7 +1135,7 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
         sp ? 2 * S : kq_moe_fit_sg(kernel, kq_moe_pick_sg(kquant_type_, N, nx));
     MTL::Size group_dims(32, sg, 1);
     MTL::Size grid_dims(N / (sp ? 8 : (sg * 32 / nx)), 1, T);
-    kq_log_dispatch(kname, x, out, grid_dims);
+    kq_log_dispatch(kname, x, out, grid_dims, group_dims);
     ce.dispatch_threadgroups(grid_dims, group_dims);
   }
   if (lora_z) {

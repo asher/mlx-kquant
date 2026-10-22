@@ -5,14 +5,19 @@ split-K mat-vec of its expert when the codec is q8_0 or q6_k, the tile's row
 count divides N (2 for q8_0, 4 for q6_k), 256 divides K, K is 2048 or more
 (1024 or more for q6_k) and the call has fewer than 16384 output rows.
 KQ_GATHER_SPLITK=1 takes it at any K and row count that fit, and 0 keeps
-gather_qmv. An entry then matches kq.quantized_matmul on its expert bit for
-bit. Against gather_qmv the outputs differ only in float32 summation order:
-by one unit in the last place, or near zero where the sum cancels.
+gather_qmv. Under the default levers an entry then matches
+kq.quantized_matmul on its expert bit for bit. Against gather_qmv the
+outputs differ only in float32 summation order: by one unit in the last
+place, or near zero where the sum cancels.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import subprocess
+import sys
 
 import mlx.core as mx
 import numpy as np
@@ -231,6 +236,69 @@ def test_trimmed_tile_matches_full(codec, k, monkeypatch):
     monkeypatch.setenv(TRIM, "0")
     b = _gather(x, w, codec, lhs, rhs, lever="1")
     assert bool(mx.array_equal(a, b).item()), f"{codec} K={k}"
+
+
+_SGS_CHILD = r"""
+import json, os, sys
+import mlx.core as mx
+import mlx_kquant as kq
+for i, (codec, k, trim) in enumerate(json.loads(sys.argv[1])):
+    os.environ.pop("KQ_QMV_SPLITK_TRIM", None)
+    if trim is not None:
+        os.environ["KQ_QMV_SPLITK_TRIM"] = trim
+    wf = mx.random.normal((2, 16, k), key=mx.random.key(k)) * 0.1
+    w = mx.stack([kq.quantize(wf[e], codec)[0] for e in range(2)])
+    x = mx.random.normal((1, 2, 1, k), key=mx.random.key(1)).astype(mx.bfloat16)
+    idx = mx.array([[0, 1]], dtype=mx.uint32)
+    mx.eval(w, x)
+    print(f"[case] {i}", file=sys.stderr, flush=True)
+    y = kq.gather_qmm(x, w, mx.zeros((1,), dtype=mx.uint8), codec,
+                      lhs_indices=idx, rhs_indices=idx, transpose=True)
+    mx.eval(y)
+"""
+_TG = re.compile(r"^\[kq qmm\] (\S+) .* tg=(\d+),(\d+),(\d+) xa=\d+$")
+SGS = {
+    "q8_0": ((256, 1), (1792, 7), (2048, 8)),
+    "q6_k": ((768, 2), (1280, 3), (3584, 7), (3840, 8)),
+}
+
+
+# The gathered tile launches the dense tile's simdgroup count: one per
+# 256-weight step or superblock pair up to eight, eight at every K under
+# KQ_QMV_SPLITK_TRIM=0. The output does not show the count, so the test
+# reads the threadgroup size from KQ_QMM_LOG in a child process.
+def test_trimmed_tile_simdgroups():
+    cases = [
+        (c, k, trim, sgs if trim is None else 8)
+        for c, edges in SGS.items()
+        for k, sgs in edges
+        for trim in (None, "0")
+    ]
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KQ_")}
+    env.update({"KQ_QMM_LOG": "1", LEVER: "1"})
+    spec = json.dumps([[c, k, trim] for c, k, trim, _ in cases])
+    r = subprocess.run(
+        [sys.executable, "-c", _SGS_CHILD, spec],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert r.returncode == 0, r.stderr[-4000:]
+    got = {}
+    cur = None
+    for line in r.stderr.splitlines():
+        if line.startswith("[case] "):
+            cur = int(line.split()[1])
+            got[cur] = []
+        elif cur is not None and (m := _TG.match(line)):
+            got[cur].append((m.group(1), tuple(int(g) for g in m.group(2, 3, 4))))
+    for i, (c, k, trim, n_sg) in enumerate(cases):
+        logged = got.get(i, [])
+        assert len(logged) == 1, (c, k, trim, logged)
+        ((name, tg),) = logged
+        assert "_gather_qmv_splitk_" in name, (c, k, name)
+        assert tg == (32, n_sg, 1), (c, k, trim, tg)
 
 
 # Codecs without a split-K mat-vec, and the transpose=False gather, keep

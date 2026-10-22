@@ -31,9 +31,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `q8_0` `gather_qmm` at one activation row and K of 2048 or more, and `q6_k`
   from K 1024, take up to 38% less time, most at one to four entries.
   `KQ_GATHER_SPLITK=0` restores the previous kernels.
-- `q6_k` matmuls with one activation row and K under 3840 take less time under
-  sustained load, 9-13% less at K 1280 and 1536. `KQ_QMV_SPLITK_TRIM=0` restores
-  the previous launch.
+- `q6_k` matmuls with one activation row and K under 3840, and `q8_0` ones with K
+  under 2048, take up to 13% less time under sustained load.
+  `KQ_QMV_SPLITK_TRIM=0` restores the previous launch.
+- `KQ_QMM_LOG` lines give the threadgroup size as `tg=<x>,<y>,<z>` after the
+  grid.
 
 ### Removed
 - Python 3.10 support. On Python 3.10, pip installs 0.5.4, the last release

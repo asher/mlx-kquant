@@ -122,7 +122,7 @@ void gather_qmm_nax(
   c = add_strides_and_shapes(ce, false, x, w, scales, c);
   add_gather_strides_and_shapes(ce, lhs_indices, rhs_indices, c);
 
-  kq_log_dispatch(kname, x, out, grid_dims);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -201,7 +201,7 @@ void gather_qmm(
   c = add_strides_and_shapes(ce, false, x, w, scales, c);
   add_gather_strides_and_shapes(ce, lhs_indices, rhs_indices, c);
 
-  kq_log_dispatch(kname, x, out, grid_dims);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -258,7 +258,7 @@ void gather_qmv(
   c = add_strides_and_shapes(ce, false, x, w, scales, c);
   add_gather_strides_and_shapes(ce, lhs_indices, rhs_indices, c);
 
-  kq_log_dispatch(kname, x, out, grid_dims);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -337,6 +337,7 @@ bool gather_qmv_splitk(
     return false;
   }
   const MTL::Size grid_dims(1, N / rps, B);
+  const MTL::Size group_dims(32, kq_qmv_splitk_sgs(q6, K), 1);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   int c = 0;
@@ -350,9 +351,8 @@ bool gather_qmv_splitk(
   ce.set_bytes(N, c++);
   c = add_strides_and_shapes(ce, false, x, w, scales, c);
   add_gather_strides_and_shapes(ce, lhs_indices, rhs_indices, c);
-  kq_log_dispatch(kname, x, out, grid_dims);
-  ce.dispatch_threadgroups(
-      grid_dims, MTL::Size(32, kq_qmv_splitk_sgs(q6, K), 1));
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
   return true;
 }
 
@@ -456,7 +456,7 @@ void gather_qmm_rhs_nax(
   ce.set_bytes(N, c++);
   ce.set_bytes(K, c++);
 
-  kq_log_dispatch(kname, x, out, grid_dims);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -537,7 +537,7 @@ void gather_qmm_rhs(
   ce.set_bytes(N, c++);
   ce.set_bytes(K, c++);
 
-  kq_log_dispatch(kname, x, out, grid_dims);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -1226,7 +1226,7 @@ void KQuantGatherQMMSeg::eval_gpu(
     ce.set_bytes(K, c++);
     MTL::Size group_dims(32, 2, 2);
     MTL::Size grid_dims((N + bn - 1) / bn, map.shape(0), 1);
-    kq_log_dispatch(nname, x, out, grid_dims);
+    kq_log_dispatch(nname, x, out, grid_dims, group_dims);
     ce.dispatch_threadgroups(grid_dims, group_dims);
     return;
   }
@@ -1255,7 +1255,7 @@ void KQuantGatherQMMSeg::eval_gpu(
   ce.set_bytes(N, c++);
   MTL::Size group_dims(32, 2, 2);
   MTL::Size grid_dims((N + bn - 1) / bn, map.shape(0), 1);
-  kq_log_dispatch(kname, x, out, grid_dims);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 

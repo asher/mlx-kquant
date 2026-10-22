@@ -1718,9 +1718,10 @@ template <typename T, int group_size, int bits, bool batched>
 // lane mapping of kq_q8_0_qmv_fast_impl. The quarter sits 2 bytes past a
 // 2-byte boundary, so it loads as four ushorts. Partial sums reduce through
 // `red` (nsg * rps floats). Below nsg steps the simdgroups past the last
-// step hold no work: the host dispatches only K / 256 of them, and the sum
-// reads only those, so the output does not depend on the count dispatched.
-// Needs N % rps == 0 and K % 256 == 0.
+// step hold no work: the host dispatches only K / 256 of them. The sum reads
+// the partials of the simdgroups that launched and hold a step, so it never
+// reads an unwritten slot and the output does not depend on the count
+// dispatched. Needs N % rps == 0 and K % 256 == 0.
 template <typename T, int rps, int nsg>
 METAL_FUNC void kq_q8_0_qmv_splitk_impl(
     const device uint8_t* w,
@@ -1730,7 +1731,8 @@ METAL_FUNC void kq_q8_0_qmv_splitk_impl(
     threadgroup float* red,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    uint sgs) {
   typedef float U;
   constexpr int step = 8 * KQ_Q8_0_GROUP;
   thread U result[rps] = {0};
@@ -1773,7 +1775,7 @@ METAL_FUNC void kq_q8_0_qmv_splitk_impl(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (simd_gid == 0 && simd_lid < uint(rps)) {
-    const int used = min(nsg, in_vec_size / step);
+    const int used = min(int(sgs), in_vec_size / step);
     U t = U(0);
     for (int g = 0; g < used; g++) {
       t += red[g * rps + simd_lid];
@@ -1800,13 +1802,14 @@ METAL_FUNC void kq_q8_0_qmv_splitk_impl(
       const constant int64_t* /* s_strides */,                              \
       uint3 tid [[threadgroup_position_in_grid]],                           \
       uint simd_gid [[simdgroup_index_in_threadgroup]],                     \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                        \
+      uint simd_lid [[thread_index_in_simdgroup]],                          \
+      uint sgs [[simdgroups_per_threadgroup]]) {                            \
     static_assert(                                                          \
         group_size == KQ_Q8_0_GROUP, "Q8_0 kernel requires group_size=32"); \
     static_assert(bits == 8, "Q8_0 kernel requires bits=8");                \
     threadgroup float red[NSG * RPS];                                       \
     kq_q8_0_qmv_splitk_impl<T, RPS, NSG>(                                   \
-        w, x, y, in_vec_size, red, tid, simd_gid, simd_lid);                \
+        w, x, y, in_vec_size, red, tid, simd_gid, simd_lid, sgs);           \
   }
 
 // Split-K M=1 q8_0 mat-vec. The host copy of the tile is
@@ -3317,7 +3320,8 @@ KQUANT_DEFINE_GATHER_KERNELS(nvfp4, KqNvfp4BlockLoader)
           const constant int64_t* rhs_strides,                 \
           uint3 tid [[threadgroup_position_in_grid]],          \
           uint simd_gid [[simdgroup_index_in_threadgroup]],    \
-          uint simd_lid [[thread_index_in_simdgroup]]) {       \
+          uint simd_lid [[thread_index_in_simdgroup]],         \
+          uint sgs [[simdgroups_per_threadgroup]]) {           \
     (void)in_vec_size;                                         \
     kq_adjust_matrix_offsets<T>(                               \
         x,                                                     \
@@ -3339,7 +3343,7 @@ KQUANT_DEFINE_GATHER_KERNELS(nvfp4, KqNvfp4BlockLoader)
         tid);                                                  \
     threadgroup float red[NSG * RPS];                          \
     kq_##CODEC##_qmv_splitk_impl<T, RPS, NSG>(                 \
-        w, x, y, KARG, red, tid, simd_gid, simd_lid);          \
+        w, x, y, KARG, red, tid, simd_gid, simd_lid, sgs);     \
   }
 
 KQUANT_DEFINE_GATHER_QMV_SPLITK(q8_0, 2, 8, in_vec_size)

@@ -237,8 +237,9 @@ two, and took 4.1% less at N 3072 and K 1024.
 `gather_qmm` with one activation row runs the same two split-K kernels per batch entry, for grouped
 projections such as the DeepSeek-V4 attention output and for SwitchGLU decode steps, when the row
 count of the tile divides N, K is 2048 or more (1024 or more for `q6_k`) and the call has fewer
-than 16384 output rows (N times the entries). Each entry then matches `quantized_matmul` on its
-expert bit for bit. On M5 Max at 0.85-1.6 GHz it ran as fast as `gather_qmv` or faster on every
+than 16384 output rows (N times the entries). Under the default levers each entry then matches
+`quantized_matmul` on its expert bit for bit. `KQ_GATHER_SPLITK` does not read `KQ_QMV_SPLITK=0`
+or `KQ_QMV_FINE`, which move `quantized_matmul` to the per-row kernels. On M5 Max at 0.85-1.6 GHz it ran as fast as `gather_qmv` or faster on every
 such shape measured: from K 2048 over 1 to 128 entries and N of 128 to 7168, and for `q6_k` at K
 1024 to 1792 over 1 to 16 entries. It took 6-7% less time for `q8_0` and 4-6% less for `q6_k` at
 the DeepSeek-V4 shape of 8 groups of 1024 x 4096, and up to 38% less at one entry. From 16384 rows
@@ -282,12 +283,13 @@ Tuning levers (defaults are right for normal use):
   machine. Any other value warns once and reads as `auto`. `auto` by default. Read when the op
   builds its graph, once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_QMM_LOG` - set to any value, logs every quantized matmul dispatch to stderr, one
-  `[kq qmm] <kernel> M=<m> N=<n> K=<k> grid=<x>,<y>,<z> xa=<a>` line each: the NAX and ALU qmm
-  tiles, the mat-vec routes (`qmv`, `qvm`, `verify_qmv`, `mv_ext`), split-K, `verify_mma` and
-  `verify_nax`, split or not, the fused `quantized_matmul_glu`, `quantized_matmul_lora` and
-  `quantized_matmul_residual` kernels, `skinny_matmul`, the `gather_qmm` and `gather_qmm_seg`
-  routes, the fused MoE gathers, `gather_mix` and `conv2d_3x3`. The grid depth is the K slice
-  count. `xa` is the byte offset of the activation's start modulo 16, as the kernel reads it. A
+  `[kq qmm] <kernel> M=<m> N=<n> K=<k> grid=<x>,<y>,<z> tg=<x>,<y>,<z> xa=<a>` line each: the
+  NAX and ALU qmm tiles, the mat-vec routes (`qmv`, `qvm`, `verify_qmv`, `mv_ext`), split-K,
+  `verify_mma` and `verify_nax`, split or not, the fused `quantized_matmul_glu`,
+  `quantized_matmul_lora` and `quantized_matmul_residual` kernels, `skinny_matmul`, the
+  `gather_qmm` and `gather_qmm_seg` routes, the fused MoE gathers, `gather_mix` and `conv2d_3x3`.
+  The grid depth is the K slice count, and `tg` is the threadgroup size in threads. `xa` is the
+  byte offset of the activation's start modulo 16, as the kernel reads it. A
   gather or MoE line gives the rows and last dim of the output as M and N. Any GPU op that copies
   an operand to an aligned buffer, because the operand starts or steps off the boundary of its
   kernel's vector loads, logs one `[kq align] <op> <operand> xin=<n>` line, where `n` is the
@@ -377,7 +379,8 @@ Tuning levers (defaults are right for normal use):
   per-row kernels. Read live per call.
 - `KQ_GATHER_SPLITK` - the `q6_k` and `q8_0` split-K kernels for `gather_qmm` at one activation
   row. `0` restores `gather_qmv`, `1` takes split-K at any K that 256 divides, and unset follows
-  the K and row-count rule above. Read live per call.
+  the K and row-count rule above. `KQ_QMV_SPLITK` and `KQ_QMV_FINE` do not change it. Read live
+  per call.
 - `KQ_QMV_SPLITK` - the `q6_k` and `q8_0` split-K kernels for one activation row. `0` restores
   the per-row kernels, as does a set `KQ_QMV_FINE`, so a tiling A/B keeps measuring the tiling it
   names. A lever that forces another route at one row, such as `KQ_VERIFY_NAX=1`, takes

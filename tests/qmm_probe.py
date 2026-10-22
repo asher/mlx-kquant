@@ -3,9 +3,10 @@
 The tile levers are read once per process unless ``KQ_TUNE_LIVE=1``, so a
 test that sets them needs a fresh interpreter. ``run_probe`` starts one with
 a clean ``KQ_*`` environment, runs a list of ``quantized_matmul`` calls,
-and returns per call the ``KQ_QMM_LOG`` lines it printed (kernel name and
-grid), its error if it raised, and its relative Frobenius error against a
-float64 reference built from ``kq.dequantize`` weights. A call with
+and returns per call the ``KQ_QMM_LOG`` lines it printed (kernel name,
+grid and threadgroup size), its error if it raised, and its relative
+Frobenius error against a float64 reference built from ``kq.dequantize``
+weights. A call with
 ``"multi": [n, ...]`` runs ``quantized_matmul_multi`` over its weight and
 one more of each listed N, and gets the largest error over the outputs. A call with
 ``"r2": true`` also gets ``rel2`` against those weights rounded to the
@@ -388,7 +389,8 @@ print(json.dumps(results))
 """
 
 _LOG = re.compile(
-    r"^\[kq qmm\] (\S+) M=(\d+) N=(\d+) K=(\d+) grid=(\d+),(\d+),(\d+) xa=(\d+)$"
+    r"^\[kq qmm\] (\S+) M=(\d+) N=(\d+) K=(\d+) grid=(\d+),(\d+),(\d+)"
+    r" tg=(\d+),(\d+),(\d+) xa=(\d+)$"
 )
 _ALIGN = re.compile(r"^\[kq align\] (.+) xin=(\d+)$")
 
@@ -396,8 +398,9 @@ _ALIGN = re.compile(r"^\[kq align\] (.+) xin=(\d+)$")
 def run_probe(calls, env=None, check=True, timeout=900):
     """Run ``calls`` in a fresh interpreter whose environment keeps no
     ``KQ_*`` variable but those in ``env``. Returns one dict per call with
-    ``kernels`` (list of (name, grid) from KQ_QMM_LOG), ``xa`` (the logged
-    byte offset of x modulo 16 per kernel), ``copies`` (the operands copied
+    ``kernels`` (list of (name, grid) from KQ_QMM_LOG), ``tg`` (the logged
+    threadgroup size per kernel), ``xa`` (the logged byte offset of x
+    modulo 16 per kernel), ``copies`` (the operands copied
     to an aligned buffer, with the byte offset they came at), ``stderr``
     (its other stderr lines), ``error``, ``rel`` and ``ulp``."""
     child_env = {k: v for k, v in os.environ.items() if not k.startswith("KQ_")}
@@ -413,6 +416,7 @@ def run_probe(calls, env=None, check=True, timeout=900):
     assert r.returncode == 0, r.stderr[-6000:]
     results = json.loads(r.stdout.strip().splitlines()[-1])
     logs = {}
+    groups = {}
     aligns = {}
     copies = {}
     other = {}
@@ -421,6 +425,7 @@ def run_probe(calls, env=None, check=True, timeout=900):
         if line.startswith("[probe] "):
             cur = int(line.split()[1])
             logs[cur] = []
+            groups[cur] = []
             aligns[cur] = []
             copies[cur] = []
             other[cur] = []
@@ -431,7 +436,8 @@ def run_probe(calls, env=None, check=True, timeout=900):
         if m:
             grid = tuple(int(g) for g in m.group(5, 6, 7))
             logs[cur].append((m.group(1), grid))
-            aligns[cur].append(int(m.group(8)))
+            groups[cur].append(tuple(int(g) for g in m.group(8, 9, 10)))
+            aligns[cur].append(int(m.group(11)))
             continue
         m = _ALIGN.match(line)
         if m:
@@ -440,6 +446,7 @@ def run_probe(calls, env=None, check=True, timeout=900):
             other[cur].append(line)
     for res in results:
         res["kernels"] = logs.get(res["i"], [])
+        res["tg"] = groups.get(res["i"], [])
         res["xa"] = aligns.get(res["i"], [])
         res["copies"] = copies.get(res["i"], [])
         res["stderr"] = other.get(res["i"], [])

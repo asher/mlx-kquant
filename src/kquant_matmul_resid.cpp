@@ -161,7 +161,7 @@ void KQuantMatmulResid::eval_gpu(
   if (resid_log()) {
     std::fprintf(
         stderr,
-        "[kq qmm] %s M=%d N=%d K=%d B=%d grid=%lu,%lu,%lu xa=%d\n",
+        "[kq qmm] %s M=%d N=%d K=%d B=%d grid=%lu,%lu,%lu tg=%lu,%lu,%lu xa=%d\n",
         kname.c_str(),
         M,
         N,
@@ -170,6 +170,9 @@ void KQuantMatmulResid::eval_gpu(
         static_cast<unsigned long>(grid_dims.width),
         static_cast<unsigned long>(grid_dims.height),
         static_cast<unsigned long>(grid_dims.depth),
+        static_cast<unsigned long>(group_dims.width),
+        static_cast<unsigned long>(group_dims.height),
+        static_cast<unsigned long>(group_dims.depth),
         kq_x_align(x));
   }
 
