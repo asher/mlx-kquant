@@ -385,7 +385,12 @@ static int kq_prism_verify_max_m() {
 // M3 141 vs 179 us at gate), which moves the pq2_0 entry to M4 there
 // (0.93-1.02x at M3, 1.17-1.21x at M4); ptq1_0 holds M3 on f16
 // (1.05-1.12x) and q4_0 M2 (1.09-1.23x). Below the entry the mat-vec
-// kernels hold.
+// kernels hold. q4_1 was measured on M3 Max over the Flint projection and
+// head shapes (N 512 to 150144, K 1024 to 6144) and the Qwen3.8-27B ones,
+// against its old route, process-paired, on both activation types. At M2
+// and M3 verify_qmv runs faster at K 2048 and below (0.57-0.99x at M2,
+// 0.61-0.91x at M3). From M4, where the old route is the bm8 split-K tile,
+// the kernel runs 1.00-1.4x faster (geometric mean 1.10-1.25x per M).
 static int kq_verify_mma_min_m(const std::string& t, bool f16) {
   if (t == "pq2_0" || t == "q2_0") {
     return f16 ? 4 : 3;
@@ -393,8 +398,11 @@ static int kq_verify_mma_min_m(const std::string& t, bool f16) {
   if (t == "ptq1_0") {
     return 3;
   }
-  if (t == "q4_0" || t == "q4_1") {
+  if (t == "q4_0") {
     return 2;
+  }
+  if (t == "q4_1") {
+    return 4;
   }
   return 0;
 }

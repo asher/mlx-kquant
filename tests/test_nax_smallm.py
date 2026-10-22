@@ -34,7 +34,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 import mlx.core as mx  # noqa: E402
 from kqref import synth_wire  # noqa: E402
-from qmm_probe import run_probe  # noqa: E402
+from qmm_probe import force_cpu, run_probe  # noqa: E402
 from test_codecs import CODECS  # noqa: E402
 
 import mlx_kquant as kq  # noqa: E402
@@ -507,6 +507,36 @@ def test_verify_mma_default_matches_forced(codec, monkeypatch):
         / (mx.abs(y_off.astype(mx.float32)).max() + 1e-6)
     )
     assert err < 2e-2, f"{codec}: forced vs off rel err {err:.3e}"
+
+
+# verify_mma entries on GPUs without NAX (kq_verify_mma_min_m), per
+# activation dtype. The default route runs verify_mma from the entry
+# through M 8 and another route below it and at M 9. q8_0 has no default
+# entry.
+VMMA_ALU_ENTRY = {
+    "pq2_0": {"bfloat16": 3, "float16": 4},
+    "q2_0": {"bfloat16": 3, "float16": 4},
+    "ptq1_0": {"bfloat16": 3, "float16": 3},
+    "q4_0": {"bfloat16": 2, "float16": 2},
+    "q4_1": {"bfloat16": 4, "float16": 4},
+    "q8_0": {"bfloat16": 9, "float16": 9},
+}
+
+
+@pytest.mark.skipif(kq.nax_available() or force_cpu(), reason="GPUs without NAX")
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+@pytest.mark.parametrize("codec", list(VMMA_ALU_ENTRY))
+def test_verify_mma_default_entry(codec, dtype):
+    ms = list(range(1, 10))
+    calls = [{"codec": codec, "shape": [m, K], "n": 1024, "dtype": dtype} for m in ms]
+    entries = _logged(calls, {})
+    for error, _ in entries:
+        assert error is None, error
+    names = [[n for n, _ in kernels] for _, kernels in entries]
+    entry = VMMA_ALU_ENTRY[codec][dtype]
+    want = [entry <= m <= 8 for m in ms]
+    got = [any("_verify_mma_" in n for n in k) for k in names]
+    assert got == want, (codec, dtype, names)
 
 
 # KQ_QMM_ROUTE forces one small-M route per call (the probe behind
