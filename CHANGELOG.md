@@ -9,6 +9,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - `KQ_VERIFY_NAX_Q4_1_SB=0` keeps `q4_1` on its two-block `verify_nax` kernel,
   as `KQ_VERIFY_NAX_Q4_0_SB` does for `q4_0`.
+- `moe_glu_gather_shexp_kq` and `gather_qmv_mix_kq` take a shared expert k
+  routed experts wide as k shared slots, so models that merge their shared
+  experts (Flint) keep the fused MoE path. `shexp_glu_combo_has_kernel` and
+  `shexp_mix_combo_has_kernel` take `shared_slots` (and the mix probe
+  `slot_width`) and return False for a shape that does not run.
+  `KQ_MOE_SHEXP_MULTI=0` declines a wider shared expert.
 
 ### Changed
 - `q4_1` `quantized_matmul` at 4 to 8 activation rows takes less time on GPUs

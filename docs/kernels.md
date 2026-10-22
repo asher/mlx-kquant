@@ -29,7 +29,7 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
   (`mxfp4`/`nvfp4`, gpt-oss experts).
 - **`gather_qmv_mix_kq`** / **`gather_qmv_mix_ns_kq`** - the down projection with the routing mix
   folded in - every slot accumulated in f32 weighted by its score, and (in the `mix` variant) a shared
-  expert as the last slot - replacing a gather plus a weighted sum plus the shared-expert add. Shaped
+  expert as the last slots - replacing a gather plus a weighted sum plus the shared-expert add. Shaped
   for DeepSeek-V3/V4-style shared-expert MoE.
 - **`gather_qmv_bias`** - gathered matvec with a fused expert bias on MLX's packed mxfp4 layout (the
   counterpart to the K-quant gathers above for that codec).
@@ -1084,7 +1084,8 @@ load feeds both projections.
 - **`moe_glu_gather_kq`** - fused MoE GLU gather for K-quant expert stacks: `act(gate) * up` in one
   decode-shaped dispatch. Bias-free for most codecs; the fp4 wire codecs (`mxfp4`/`nvfp4`) also take
   per-expert gate/up biases with the `swiglu_clamp` activation (gpt-oss experts).
-- **`moe_glu_gather_shexp_kq`** - the same with the block's shared expert folded in as an extra slot.
+- **`moe_glu_gather_shexp_kq`** - the same with the block's shared expert folded in as extra slots
+  (see [Shared experts wider than a routed expert](#shared-experts-wider-than-a-routed-expert)).
 - **`moe_glu_gather`** - the MLX packed-mxfp4 counterpart.
 - **`moe_router_topk`** - the router in one dispatch: f32 scoring (`softmax`, or `sqrtsoftplus` for
   DeepSeek-V4), top-k with a min-index tie-break, optional bias-ranked selection, optional
@@ -1149,6 +1150,38 @@ gathers took about 25% less time, and 37% less than the 16-weight gathers. That 
 a cheaper lookup. Two other grid sources gave no gain. A 64-bit grid in a device buffer matched the
 constant table. A 2-bit code table, in threadgroup memory or in a device buffer, was about 20%
 slower.
+
+### Shared experts wider than a routed expert
+
+Some models merge several shared experts into one, so the shared expert is k routed experts wide
+(Flint: routed experts of width 512 and one shared expert of width 1024). The fused shared-expert
+gathers run it as k shared slots after the routed slots. k comes from the shapes, and no weight is
+copied, so GGUF views and streamed experts work as they are.
+
+| Op | Shared-expert tensor | Shared slot j reads |
+|---|---|---|
+| `moe_glu_gather_shexp_kq` | gate and up `[k * N, bytes_per_row(K)]` | rows `[j N, (j + 1) N)` |
+| `gather_qmv_mix_kq` | down `[hidden, bytes_per_row(k * N)]` | columns `[j N, (j + 1) N)` of each row |
+
+The GLU returns `[T, R + k, N]`. The mix takes `x` `[T, R + k, N]`, `indices` `[T, R]` and
+`scores` `[T, R + k]`, or `[T, R]`, which gives each shared slot a weight of 1. At k = 1 the
+outputs are the same bits as before.
+
+Each shared slot of the down tensor must start on a whole block of its codec, so N must be a
+multiple of that codec's block size: 32 weights for q4_0, q4_1, q5_0, q5_1, q8_0 and iq4_nl, and
+256 for q2_k to q6_k. A 640-wide expert with a q6_k shared down does not meet this, and the op
+raises an error. Ask first with
+`kq.shexp_glu_combo_has_kernel(codec, gate_codec, up_codec, shared_slots=k)` and
+`kq.shexp_mix_combo_has_kernel(codec, down_codec, shared_slots=k, slot_width=N)`. Both return False
+for a shape the kernels decline. With `shared_slots` above 1, the mix probe needs `slot_width`.
+
+The slot-parallel down runs 64 threads per slot, so 512 threads at Flint's 8 slots (6 routed, 2
+shared). When the pipeline takes fewer threads, the call runs on the loop kernel.
+
+- `KQ_MOE_SHEXP_MULTI=0` declines a shared expert wider than one routed expert: the probes return
+  False for k above 1, and the ops raise an error. Read per call.
+- `KQ_MOE_SP_THREAD_CAP=<n>` lowers the thread limit of the slot-parallel downs (both score-mixed
+  gathers) to n, so a launch of more than n threads runs the loop kernel. Read per call. Test lever.
 
 ## Attention
 
