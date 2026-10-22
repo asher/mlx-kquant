@@ -5,6 +5,15 @@
 // Q4_K: 144 bytes/256 weights. [fp16 d][fp16 dmin][scales[12]][qs[128]].
 // w[i] = d * sub_scale * q4 - dmin * sub_min. Nibble-packed, low=even sb.
 
+// Chunk decode of the q2_k, q4_k and q5_k Ext traits (the
+// kq_q*_k_deq_chunk16 helpers): true forms four codes per 32-bit word,
+// false keeps the per-byte loop. Both give the same weights. The host
+// specializes every pipeline whose kernel name carries one of these
+// codecs with it (kq_get_kernel).
+constant bool kq_kquant_word_fc [[function_constant(370)]];
+constant bool kq_kquant_word =
+    !is_function_constant_defined(kq_kquant_word_fc) || kq_kquant_word_fc;
+
 MLX_MTL_CONST int KQ_Q4_K_SUPERBLOCK = 256;
 MLX_MTL_CONST int KQ_Q4_K_BLOCK_BYTES = 144;
 MLX_MTL_CONST int KQ_Q4_K_D_OFFSET = 0;
@@ -900,6 +909,22 @@ inline void kq_q4_k_deq_chunk16(
     const device uint8_t* block,
     short il,
     thread float4x4& reg) {
+  if (kq_kquant_word) {
+    // One 16-byte load. The byte loop scales the high nibble as
+    // (d / 16) * (16 * q4); d * q4 is the same product.
+    const uint4 qs = *(const device uint4*)(kq_q4_k_qs_ptr(block) +
+                                            32 * (il / 4) + 16 * (il & 1));
+    const uchar2 sc = kq_get_scale_min_k4_just2(
+        (il / 4) * 2, (il & 3) / 2, kq_q4_k_scales12_ptr(block));
+    const float dl = kq_q4_k_d(block) * float(sc[0]);
+    const float ml = kq_q4_k_dmin(block) * float(sc[1]);
+    const uint4 c = (qs >> ((il & 2) ? 4u : 0u)) & 0x0F0F0F0Fu;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      reg[i] = dl * float4(as_type<uchar4>(c[i])) - ml;
+    }
+    return;
+  }
   const device uint8_t* q = kq_q4_k_qs_ptr(block);
   const short is = (il / 4) * 2;
   q = q + (il / 4) * 32 + 16 * (il & 1);
@@ -1982,6 +2007,26 @@ inline void kq_q5_k_deq_chunk16(
     const device uint8_t* block,
     short il,
     thread float4x4& reg) {
+  if (kq_kquant_word) {
+    // One 16-byte load each for qs and qh; nibble il & 2 and qh bit il / 2
+    // form the 5-bit code. The byte loop scales the high nibble as
+    // (d / 16) * (16 * q5); d * q5 is the same product.
+    const uint4 qs = *(const device uint4*)(kq_q5_k_qs_ptr(block) +
+                                            32 * (il / 4) + 16 * (il & 1));
+    const uint4 qh =
+        *(const device uint4*)(kq_q5_k_qh_ptr(block) + 16 * (il & 1));
+    const uchar2 sc = kq_get_scale_min_k4_just2(
+        (il / 4) * 2, (il & 3) / 2, kq_q5_k_scales12_ptr(block));
+    const float dl = kq_q5_k_d(block) * float(sc[0]);
+    const float ml = kq_q5_k_dmin(block) * float(sc[1]);
+    const uint4 c = ((qs >> ((il & 2) ? 4u : 0u)) & 0x0F0F0F0Fu) |
+        (((qh >> uint(il / 2)) & 0x01010101u) << 4);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      reg[i] = dl * float4(as_type<uchar4>(c[i])) - ml;
+    }
+    return;
+  }
   const device uint8_t* q = kq_q5_k_qs_ptr(block);
   const device uint8_t* qh = kq_q5_k_qh_ptr(block);
   const short is = (il / 4) * 2;
@@ -5102,6 +5147,19 @@ inline void kq_q2_k_deq_chunk16(
   const device uint8_t* q = kq_q2_k_qs_ptr(block);
   const uint8_t sc = kq_q2_k_scales_ptr(block)[il];
   q = q + 32 * (il / 8) + 16 * (il & 1);
+  if (kq_kquant_word) {
+    // 84-byte blocks: 4-byte loads. The byte loop scales the masked code
+    // by coef = 4^-shift; d * scale * code is the same product.
+    const device uint* qw = (const device uint*)q;
+    const uint sh = 2 * ((il / 2) % 4);
+    const float dl = d * float(sc & 0xF);
+    const float ml = dmin * float(sc >> 4);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      reg[i] = dl * float4(as_type<uchar4>((qw[i] >> sh) & 0x03030303u)) - ml;
+    }
+    return;
+  }
   il = (il / 2) % 4;
   const float coef = il > 1 ? (il > 2 ? 1.0f / 64.0f : 1.0f / 16.0f)
                             : (il > 0 ? 1.0f / 4.0f : 1.0f);

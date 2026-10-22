@@ -2790,6 +2790,11 @@ bool kq_qmm_log_on() {
   return kq_qmm_log();
 }
 
+bool kq_kquant_word_on() {
+  static const bool cached = kq_env_flag("KQ_KQUANT_WORD", 1) != 0;
+  return kq_tune_live() ? kq_env_flag("KQ_KQUANT_WORD", 1) != 0 : cached;
+}
+
 int kq_qmv_splitk_sgs(bool q6, int K) {
   const int nsg = q6 ? kq_q6_k_splitk_nsg : kq_q8_0_splitk_nsg;
   if (kq_env_flag("KQ_QMV_SPLITK_TRIM", 1) == 0) {

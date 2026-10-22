@@ -10,6 +10,7 @@
 
 #ifdef _METAL_
 
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -19,6 +20,7 @@
 
 #include "kquant.h" // metallib_dir
 #include "kquant_codec.h" // codec_by_name
+#include "kquant_internal.h" // kq_qmm_log_on
 
 #include "mlx/array.h" // Shape, Strides
 #include "mlx/backend/metal/device.h"
@@ -409,21 +411,6 @@ void kq_log_dispatch(
     const MTL::Size& grid,
     const MTL::Size& group);
 
-// Fetch a kq kernel from the bundled metallib.
-//
-// The library handle is resolved exactly once and cached in a function-local
-// static: get_library() is a locked map lookup keyed by name, and
-// metallib_dir() returns a fresh std::string copy of the .so directory. The GPU
-// Device is a process singleton and the handle it owns lives for the process,
-// so caching the raw pointer is safe. Only the per-kname get_kernel() lookup
-// remains per call.
-inline MTL::ComputePipelineState* kq_get_kernel(
-    Device& d,
-    const std::string& kname) {
-  static MTL::Library* lib = d.get_library("mlx_kquant", metallib_dir());
-  return d.get_kernel(kname, lib);
-}
-
 // True when the bundled metallib carries a function named kname. Looks the
 // name up without building a pipeline, so a tile override can raise with
 // the kernel name before any dispatch.
@@ -448,16 +435,70 @@ inline void kq_require_kernel(
   }
 }
 
-// Func-constant variant for kernels specialized via an MTLFCList.
+// Function constant 370 (kq_kquant_word in kq_quantized_kquants.h): the
+// q2_k, q4_k and q5_k chunk decodes form four codes per 32-bit word.
+// KQ_KQUANT_WORD=0 restores the per-byte loop (read once per process unless
+// KQ_TUNE_LIVE=1, since every dispatch asks). A function that declares the
+// constant builds only with a value for it, so kq_get_kernel specializes
+// every pipeline whose kernel name carries one of these codecs, the kernels
+// that can inline the decode. A function that does not declare it ignores
+// the value.
+constexpr int kq_fc_kquant_word = 370;
+bool kq_kquant_word_on();
+
+// True when kname carries q2_k, q4_k or q5_k.
+inline bool kq_kquant_decode_kernel(const std::string& kname) {
+  for (const char* c : {"q2_k", "q4_k", "q5_k"}) {
+    if (kname.find(c) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Fetch a kq kernel from the bundled metallib, specialized via an MTLFCList.
 // hash_name must encode the func-const values so each specialization gets a
 // distinct pipeline-state cache entry (d.get_kernel(name, lib, hash, consts)).
+// For a kernel that can inline the k-quant decode, the decode constant is
+// appended here and the "_kw0" suffix keys its off value; KQ_QMM_LOG prints
+// "[kq decode] byte <key>" for each such fetch with it off.
+//
+// The library handle is resolved exactly once and cached in a function-local
+// static: get_library() is a locked map lookup keyed by name, and
+// metallib_dir() returns a fresh std::string copy of the .so directory. The GPU
+// Device is a process singleton and the handle it owns lives for the process,
+// so caching the raw pointer is safe. Only the per-kname get_kernel() lookup
+// remains per call.
 inline MTL::ComputePipelineState* kq_get_kernel(
     Device& d,
     const std::string& kname,
     const std::string& hash_name,
     const mx::metal::MTLFCList& func_consts) {
   static MTL::Library* lib = d.get_library("mlx_kquant", metallib_dir());
-  return d.get_kernel(kname, lib, hash_name, func_consts);
+  if (!kq_kquant_decode_kernel(kname)) {
+    return d.get_kernel(kname, lib, hash_name, func_consts);
+  }
+  static const bool word_values[2] = {false, true};
+  // The key and the log read the value the constant points at.
+  const bool* word = &word_values[kq_kquant_word_on() ? 1 : 0];
+  mx::metal::MTLFCList fc = func_consts;
+  fc.emplace_back(word, MTL::DataType::DataTypeBool, kq_fc_kquant_word);
+  const std::string& key = hash_name.empty() ? kname : hash_name;
+  if (*word) {
+    return d.get_kernel(kname, lib, key, fc);
+  }
+  const std::string key0 = key + "_kw0";
+  if (kq_qmm_log_on()) {
+    std::fprintf(stderr, "[kq decode] byte %s\n", key0.c_str());
+  }
+  return d.get_kernel(kname, lib, key0, fc);
+}
+
+// Fetch a kq kernel with no function constants of its own.
+inline MTL::ComputePipelineState* kq_get_kernel(
+    Device& d,
+    const std::string& kname) {
+  return kq_get_kernel(d, kname, kname, {});
 }
 
 } // namespace mlx_kquant

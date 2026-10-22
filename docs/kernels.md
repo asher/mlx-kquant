@@ -219,6 +219,9 @@ simdgroups in flight at layer-size N. On M3 Max, back to back over ten shapes, i
 less time than the per-row kernels: 2.7% less at K 8192 and N 4096, and 3.2% less at K 4096 and N
 8192. In a synced decode step of eight Muse Spark UD-IQ2_S layers, it saved 1.1% per layer.
 
+The split-K mat-vec covers `q6_k` and `q8_0`. The other codecs run one activation row through
+their per-row kernels, and the grid codecs through `qmv_c32` on M5 and later GPUs.
+
 Under sustained decode the GPU runs below its top clock, where the per-row kernels turn ALU-bound.
 Measured on M5 Max over 90 seconds of back-to-back mat-vecs at the gemma-4 31B MLP shapes, the
 split-K kernel read 450-465 GB/s at the lowest clock, against 385-395 GB/s for the per-row kernels
@@ -239,23 +242,26 @@ projections such as the DeepSeek-V4 attention output and for SwitchGLU decode st
 count of the tile divides N, K is 2048 or more (1024 or more for `q6_k`) and the call has fewer
 than 16384 output rows (N times the entries). Under the default levers each entry then matches
 `quantized_matmul` on its expert bit for bit. `KQ_GATHER_SPLITK` does not read `KQ_QMV_SPLITK=0`
-or `KQ_QMV_FINE`, which move `quantized_matmul` to the per-row kernels. On M5 Max at 0.85-1.6 GHz it ran as fast as `gather_qmv` or faster on every
-such shape measured: from K 2048 over 1 to 128 entries and N of 128 to 7168, and for `q6_k` at K
-1024 to 1792 over 1 to 16 entries. It took 6-7% less time for `q8_0` and 4-6% less for `q6_k` at
-the DeepSeek-V4 shape of 8 groups of 1024 x 4096, and up to 38% less at one entry. From 16384 rows
-the `gather_qmv` grid fills the GPU, and at sustained clocks split-K ran up to 23% slower there.
-Across runs, `q8_0` below K 2048 measured from 4% faster to 4% slower than `gather_qmv`, and `q6_k`
-at K 768 from 12% faster to 13% slower, so both keep `gather_qmv`.
+or `KQ_QMV_FINE`, which move `quantized_matmul` to the per-row kernels. On M5 Max at 0.85-1.6 GHz
+it ran as fast as `gather_qmv` or faster on every such shape measured: from K 2048 over 1 to 128
+entries and N of 128 to 7168, and for `q6_k` at K 1024 to 1792 over 1 to 16 entries. It took 6-7%
+less time for `q8_0` and 4-6% less for `q6_k` at the DeepSeek-V4 shape of 8 groups of 1024 x 4096,
+and up to 38% less at one entry. From 16384 rows the `gather_qmv` grid fills the GPU, and at
+sustained clocks split-K ran up to 23% slower there. Below K 2048, `q8_0` measured from 4% faster
+to 4% slower than `gather_qmv`, with the sign changing from run to run. At K 768, `q6_k` took 7-14%
+longer at one and two entries in every run, and up to 13% less time at 4 to 16. Both keep
+`gather_qmv` there.
 
 Tuning levers (defaults are right for normal use):
 
 - `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
   `KQ_NAX_BM128_ODD_M`, `KQ_NAX_DB64`, the `_BK128` levers, `KQ_NAX_SWIZZLE`), the `verify_nax` load
   lever (`KQ_VNAX_X16`), the tile overrides (`KQ_NAX_TILE`, `KQ_QMM_TILE`, `KQ_CONV_TILE`),
-  `KQ_SPLITK_F32` and `KQ_QMM_LOG` read their variables on every dispatch, so one process can switch
-  tiles between calls on one resident copy of the weights; `benchmarks/bench_dit_shapes.py` runs its
-  tile arms this way. It reads the environment on every dispatch, so it is for single-threaded A/B
-  runs that set these variables between calls. The `quantized_matmul_glu` levers (`KQ_GLU`,
+  `KQ_SPLITK_F32`, `KQ_KQUANT_WORD` and `KQ_QMM_LOG` read their variables on every dispatch, so
+  one process can switch tiles between calls on one resident copy of the weights;
+  `benchmarks/bench_dit_shapes.py` runs its tile arms this way. It reads the environment on every
+  dispatch, so it is for single-threaded A/B runs that set these variables between calls. The
+  `quantized_matmul_glu` levers (`KQ_GLU`,
   `KQ_GLU_MIN_ROWS`), the `quantized_matmul_multi` lever (`KQ_MATMUL_MULTI`), the
   `quantized_matmul_lora` levers (`KQ_QMM_LORA`, `KQ_QMM_LORA_MIN_ROWS`), the
   `quantized_matmul_residual` lever (`KQ_QMM_RESID`), the dequantize route lever
@@ -294,8 +300,10 @@ Tuning levers (defaults are right for normal use):
   an operand to an aligned buffer, because the operand starts or steps off the boundary of its
   kernel's vector loads, logs one `[kq align] <op> <operand> xin=<n>` line, where `n` is the
   operand's byte offset modulo that boundary. A call that takes the dequantize route logs one
-  `[kq dequant] <codec> M=<rows> N=<n> K=<k>` line when the op builds its graph. Unset (off) by
-  default. Read once per process unless `KQ_TUNE_LIVE=1`.
+  `[kq dequant] <codec> M=<rows> N=<n> K=<k>` line when the op builds its graph. Under
+  `KQ_KQUANT_WORD=0`, each fetch of a kernel on the per-byte k-quant decode logs one
+  `[kq decode] byte <key>` line, where the pipeline key ends in `_kw0`. Unset (off) by default.
+  Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_SPLITK_F32` - partial dtype of the split-K routes (`splitk`, `nax_splitk`, the
   `KQ_QMM_MIDM` band, and `verify_mma` and `verify_nax` when they split K). Float partials let the
   fold round the result once, as the unsplit kernels do. Partials in the activation dtype round
@@ -1178,6 +1186,37 @@ gathers took about 25% less time, and 37% less than the 16-weight gathers. That 
 a cheaper lookup. Two other grid sources gave no gain. A 64-bit grid in a device buffer matched the
 constant table. A 2-bit code table, in threadgroup memory or in a device buffer, was about 20%
 slower.
+
+### K-quant chunk decode
+
+The `q2_k`, `q4_k` and `q5_k` gathers, and the `mv_ext` mat-vec of these codecs at 2 to 12 rows,
+decode each 16-weight chunk four codes at a time from 32-bit words. A lane reads the codes of a
+`q4_k` chunk in one 16-byte load, those of `q5_k` in one load for the low four bits and one for
+the fifth bits, and those of `q2_k` in four 4-byte loads. One shift and one AND per word bring four
+codes down to the low bits of their bytes (`q5_k` ORs in the fifth bits the same way), and one
+vector convert turns them into floats. The per-byte loop masks each code in place and divides the
+scale by the matching power of two, so both forms compute the same product and the outputs are bit
+for bit the same.
+
+On M5 Max at 0.87-1.27 GHz, back to back over 24 rounds, the word form took less time than the
+per-byte loop on every path, by these medians:
+
+| Codec | Gate/up gather | Score-mixed down | `mv_ext`, 4 rows |
+|---|---|---|---|
+| q5_k | 13.7% | 17.5% | 15.2% |
+| q4_k | 5.2% | 8.1% | 8.0% |
+| q2_k | 6.5% | 5.0% | 5.3% |
+
+The gathers ran at Qwen3-30B-A3B shapes (hidden 2048, expert width 768, top 8 of 128) and
+`mv_ext` at 4096 x 4096. At DeepSeek-V4.1 shapes, the shared-expert GLU over `iq2_s` experts with a
+`q5_k` shared expert took 6.3% less time, and the score-mixed down took 9.9% less over `iq3_xxs`
+experts with a `q5_k` shared expert and 2.2% less over `q2_k` experts with a `q8_0` one.
+
+`q3_k` keeps the per-byte loop. Its 110-byte blocks sit 2 bytes apart, so each word takes two
+2-byte loads, and in that form the gate/up gather took 4.1% longer, in all 24 rounds.
+
+- `KQ_KQUANT_WORD=0` restores the per-byte loop, with the same output. Read once per process unless
+  `KQ_TUNE_LIVE=1`.
 
 ### Shared experts wider than a routed expert
 

@@ -270,9 +270,10 @@ void gather_qmv(
 // -38%. From 16384 rows the gather_qmv grid fills the GPU, and at sustained
 // clocks split-K ran up to 23% slower there.
 // With the trimmed launch (kq_qmv_splitk_sgs), q6_k at K 1024 to 3584 and B
-// 1 to 16 ran -38% to +1% at 1.1 to 1.4 GHz. Across runs q8_0 below K 2048
-// moved between -4% and +4%, and q6_k at K 768 between -12% and +13%, so
-// both keep gather_qmv.
+// 1 to 16 ran -38% to +1% at 1.1 to 1.4 GHz. q8_0 below K 2048 moved
+// between -4% and +4%, the sign changing from run to run. q6_k at K 768 ran
+// 7-14% slower at B 1 and 2 in every run (up to 13% faster at B 4 to 16).
+// Both keep gather_qmv there.
 bool gather_qmv_splitk_on(bool q6, int K, size_t rows) {
   return K >= (q6 ? 1024 : 2048) && rows < 16384;
 }

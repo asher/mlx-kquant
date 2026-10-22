@@ -1775,7 +1775,7 @@ METAL_FUNC void kq_q8_0_qmv_splitk_impl(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (simd_gid == 0 && simd_lid < uint(rps)) {
-    const int used = min(int(sgs), in_vec_size / step);
+    const int used = min(min(int(sgs), nsg), in_vec_size / step);
     U t = U(0);
     for (int g = 0; g < used; g++) {
       t += red[g * rps + simd_lid];
