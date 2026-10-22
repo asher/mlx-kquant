@@ -1717,7 +1717,10 @@ template <typename T, int group_size, int bits, bool batched>
 // owns 8 weights (block l / 4, quarter l % 4) of every 8-block step, the
 // lane mapping of kq_q8_0_qmv_fast_impl. The quarter sits 2 bytes past a
 // 2-byte boundary, so it loads as four ushorts. Partial sums reduce through
-// `red` (nsg * rps floats). Needs N % rps == 0 and K % 256 == 0.
+// `red` (nsg * rps floats). Below nsg steps the simdgroups past the last
+// step hold no work: the host dispatches only K / 256 of them, and the sum
+// reads only those, so the output does not depend on the count dispatched.
+// Needs N % rps == 0 and K % 256 == 0.
 template <typename T, int rps, int nsg>
 METAL_FUNC void kq_q8_0_qmv_splitk_impl(
     const device uint8_t* w,
@@ -1770,8 +1773,9 @@ METAL_FUNC void kq_q8_0_qmv_splitk_impl(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (simd_gid == 0 && simd_lid < uint(rps)) {
+    const int used = min(nsg, in_vec_size / step);
     U t = U(0);
-    for (int g = 0; g < nsg; g++) {
+    for (int g = 0; g < used; g++) {
       t += red[g * rps + simd_lid];
     }
     y[out_row + simd_lid] = static_cast<T>(t);

@@ -226,6 +226,14 @@ and about 530 GB/s for bf16 GEMV. Once the clock dropped it read 1.12-1.14x the 
 inner dimensions of 4096 and 5120, and matched it at 2048 and below. In short runs at a high clock
 the two kernels are within 3% of each other on every shape measured.
 
+A `q6_k` row under 3840 weights has fewer superblock pairs than the threadgroup has simdgroups, and
+a `q8_0` row under 2048 weights has fewer 256-weight steps. The threadgroup then runs one
+simdgroup per pair or step, so none waits idle, and the sum reads only their partials, so the
+output is bit for bit the same. On M5 Max at 0.76-0.92 GHz, `q6_k` took 12.6% less time at N 32768
+and K 1280, the DeepSeek-V4.1 query up-projection, 9.0% less at N 24576 and K 1536 and 8.5% less at
+N 3072 and K 1024. `q8_0` already reads near the memory rate there and was within 0.5% at the first
+two, and took 4.1% less at N 3072 and K 1024.
+
 `gather_qmm` with one activation row runs the same two split-K kernels per batch entry, for grouped
 projections such as the DeepSeek-V4 attention output and for SwitchGLU decode steps, when the row
 count of the tile divides N, K is 2048 or more and the call has fewer than 16384 output rows (N
@@ -234,8 +242,7 @@ Max at 0.85-1.6 GHz, over 1 to 128 entries and N of 128 to 7168, it ran as fast 
 faster on every such shape but one, `q6_k` at K 2048 and 15360 rows, 3% slower. It took 6-7% less
 time for `q8_0` and 4-6% less for `q6_k` at the DeepSeek-V4 shape of 8 groups of 1024 x 4096, and
 up to 38% less at one entry. From 16384 rows the `gather_qmv` grid fills the GPU, and at sustained
-clocks split-K ran up to 23% slower there. Below K 2048 the split leaves simdgroups idle and ran up
-to 2x slower. Those calls keep `gather_qmv`.
+clocks split-K ran up to 23% slower there. Below K 2048 calls keep `gather_qmv`.
 
 Tuning levers (defaults are right for normal use):
 
@@ -373,6 +380,8 @@ Tuning levers (defaults are right for normal use):
   the per-row kernels, as does a set `KQ_QMV_FINE`, so a tiling A/B keeps measuring the tiling it
   names. A lever that forces another route at one row, such as `KQ_VERIFY_NAX=1`, takes
   precedence. Read live per call.
+- `KQ_QMV_SPLITK_TRIM` - `0` launches the `q6_k` and `q8_0` split-K kernels with all eight
+  simdgroups at every K, as before, with the same output. Read live per call.
 - `KQ_VERIFY_EXT` - the mat-vec route on the M 2-12 band. `1` forces `mv_ext` for every codec with
   the kernel, `0` forces `verify_qmv` where the codec has it and per-row qmv elsewhere, and unset
   takes the per-codec default. On NAX GPUs a set value also keeps per-row qmv and NAX split-K off

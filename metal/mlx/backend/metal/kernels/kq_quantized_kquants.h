@@ -2199,8 +2199,10 @@ inline uint kq_q6_k_ld32(const device uint8_t* p) {
 // thread assembles four codes at a time from 32-bit words and pre-scales
 // the activation for byte b of a word by 2^(-8 * b), so a weight costs one
 // AND, one convert and one FMA. The -32 offset folds into one FMA per scale
-// group. Partial sums reduce through `red` (nsg * rps floats). Needs
-// N % rps == 0.
+// group. Partial sums reduce through `red` (nsg * rps floats). Below 15
+// superblocks the simdgroups past the last pair hold no work: the host
+// dispatches only the first (nb + 1) / 2, and the sum reads only those, so
+// the output does not depend on the count dispatched. Needs N % rps == 0.
 template <typename T, int rps, int nsg>
 METAL_FUNC void kq_q6_k_qmv_splitk_impl(
     const device uint8_t* w,
@@ -2284,8 +2286,9 @@ METAL_FUNC void kq_q6_k_qmv_splitk_impl(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (simd_gid == 0 && simd_lid < uint(rps)) {
+    const int used = min(nsg, (nb + 1) / 2);
     U t = U(0);
-    for (int g = 0; g < nsg; g++) {
+    for (int g = 0; g < used; g++) {
       t += red[g * rps + simd_lid];
     }
     y[out_row + simd_lid] = static_cast<T>(t);

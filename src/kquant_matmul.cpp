@@ -1937,6 +1937,7 @@ static bool qmv_splitk(
   if (int(kernel->maxTotalThreadsPerThreadgroup()) < 32 * nsg) {
     return false;
   }
+  const int sgs = kq_qmv_splitk_sgs(q6, K);
   kq_log_qmm(kname, 1, N, K, MTL::Size(1, N / rps, 1), x);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -1948,7 +1949,7 @@ static bool qmv_splitk(
   ce.set_bytes(K, c++);
   ce.set_bytes(N, c++);
   add_strides_and_shapes(ce, true, x, w, scales, c);
-  ce.dispatch_threadgroups(MTL::Size(1, N / rps, 1), MTL::Size(32, nsg, 1));
+  ce.dispatch_threadgroups(MTL::Size(1, N / rps, 1), MTL::Size(32, sgs, 1));
   return true;
 }
 
@@ -2781,6 +2782,15 @@ int kq_dequant_route_mode() {
 
 bool kq_qmm_log_on() {
   return kq_qmm_log();
+}
+
+int kq_qmv_splitk_sgs(bool q6, int K) {
+  const int nsg = q6 ? kq_q6_k_splitk_nsg : kq_q8_0_splitk_nsg;
+  if (kq_env_flag("KQ_QMV_SPLITK_TRIM", 1) == 0) {
+    return nsg;
+  }
+  const int steps = K / qmv_fast_k_align();
+  return std::max(1, std::min(nsg, q6 ? (steps + 1) / 2 : steps));
 }
 
 void kq_log_dispatch(

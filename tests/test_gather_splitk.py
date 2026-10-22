@@ -26,6 +26,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 LEVER = "KQ_GATHER_SPLITK"
+TRIM = "KQ_QMV_SPLITK_TRIM"
 RPS = {"q8_0": 2, "q6_k": 4}
 MANTISSA = {mx.float32: 7, mx.float16: 10, mx.bfloat16: 7}
 # Each case: N, K, x shape, lhs (None takes the default), rhs, experts. The
@@ -85,6 +86,7 @@ def _gather(x, w, codec, lhs, rhs, lever=None, transpose=True):
 @pytest.fixture(autouse=True)
 def _lever(monkeypatch):
     monkeypatch.delenv(LEVER, raising=False)
+    monkeypatch.delenv(TRIM, raising=False)
     yield
     os.environ.pop(LEVER, None)
 
@@ -207,6 +209,25 @@ def test_q8_0_k_tail_keeps_gather_qmv():
     a = _gather(x, w, "q8_0", lhs, rhs, lever="1")
     b = _gather(x, w, "q8_0", lhs, rhs, lever="0")
     assert bool(mx.array_equal(a, b).item())
+
+
+# Below eight 256-weight steps (q8_0) or superblock pairs (q6_k) the tile
+# dispatches one simdgroup per step or pair, as the dense mat-vec does, and
+# the output matches the full threadgroup (KQ_QMV_SPLITK_TRIM=0) bit for bit.
+@pytest.mark.parametrize("k", [1280, 1792, 2048])
+@pytest.mark.parametrize("codec", list(RPS))
+def test_trimmed_tile_matches_full(codec, k, monkeypatch):
+    rng = np.random.default_rng(8)
+    w = _experts(codec, 4, 64, k)
+    x = mx.array(rng.standard_normal((1, 6, 1, k)).astype(np.float32)).astype(
+        mx.bfloat16
+    )
+    lhs = mx.array(np.arange(6, dtype=np.uint32).reshape(1, 6))
+    rhs = mx.array(np.array([[2, 0, 3, 3, 1, 0]], np.uint32))
+    a = _gather(x, w, codec, lhs, rhs, lever="1")
+    monkeypatch.setenv(TRIM, "0")
+    b = _gather(x, w, codec, lhs, rhs, lever="1")
+    assert bool(mx.array_equal(a, b).item()), f"{codec} K={k}"
 
 
 # Codecs without a split-K mat-vec, and the transpose=False gather, keep

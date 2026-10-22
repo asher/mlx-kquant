@@ -86,6 +86,13 @@ constexpr int kq_q6_k_splitk_nsg = 8;
 constexpr int kq_q8_0_splitk_rps = 2;
 constexpr int kq_q8_0_splitk_nsg = 8;
 
+// Simdgroups per threadgroup of the split-K M=1 qmv at row width K: one per
+// 256-weight step (q8_0) or superblock pair (q6_k), at most the tile's nsg.
+// The kernels sum only the partials of the simdgroups that hold work, so
+// the count does not change the output. KQ_QMV_SPLITK_TRIM=0 (read live)
+// dispatches the full nsg at every K.
+int kq_qmv_splitk_sgs(bool q6, int K);
+
 // quantized.cpp:63-65 (kquant branch). KQuant blocks are 32 or 256 weights.
 inline int qmv_fast_k_align() {
   return 256;

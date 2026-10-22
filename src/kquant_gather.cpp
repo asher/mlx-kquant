@@ -348,7 +348,8 @@ bool gather_qmv_splitk(
   c = add_strides_and_shapes(ce, false, x, w, scales, c);
   add_gather_strides_and_shapes(ce, lhs_indices, rhs_indices, c);
   kq_log_dispatch(kname, x, out, grid_dims);
-  ce.dispatch_threadgroups(grid_dims, MTL::Size(32, nsg, 1));
+  ce.dispatch_threadgroups(
+      grid_dims, MTL::Size(32, kq_qmv_splitk_sgs(q6, K), 1));
   return true;
 }
 

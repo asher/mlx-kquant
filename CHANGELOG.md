@@ -31,6 +31,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `q8_0` and `q6_k` `gather_qmm` at one activation row and K of 2048 or more take
   2-7% less time, up to 38% less at one entry. `KQ_GATHER_SPLITK=0` restores the
   previous kernels.
+- `q6_k` matmuls with one activation row and K under 3840 take less time under
+  sustained load, 9-13% less at K 1280 and 1536. `KQ_QMV_SPLITK_TRIM=0` restores
+  the previous launch.
 
 ### Removed
 - Python 3.10 support. On Python 3.10, pip installs 0.5.4, the last release
