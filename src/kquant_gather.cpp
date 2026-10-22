@@ -262,16 +262,19 @@ void gather_qmv(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// Entry rule of the split-K gathered mat-vec at one activation row, from K
-// and the output row count N * B. Measured on M5 Max at 0.85 to 1.6 GHz over
-// B 1 to 128 and N 128 to 7168: from K 2048 and under 16384 rows split-K
-// matched or beat gather_qmv but at q6_k K 2048 and 15360 rows (+3%). o_a,
-// 8 x 1024 x 4096: q8_0 -6 to -7%, q6_k -4 to -6%; one entry up to -38%.
-// From 16384 rows the gather_qmv grid fills the GPU, and at sustained clocks
-// split-K ran up to 23% slower there. Below K 2048, at two or more entries,
-// the idle simdgroups made split-K up to 2x slower.
-bool gather_qmv_splitk_on(int K, size_t rows) {
-  return K >= 2048 && rows < 16384;
+// Entry rule of the split-K gathered mat-vec at one activation row, from the
+// codec, K and the output row count N * B. Measured on M5 Max at 0.85 to 1.6
+// GHz over B 1 to 128 and N 128 to 7168: from K 2048 and under 16384 rows
+// split-K matched or beat gather_qmv. A grouped attention output projection,
+// 8 groups of 1024 x 4096: q8_0 -6 to -7%, q6_k -4 to -6%; one entry up to
+// -38%. From 16384 rows the gather_qmv grid fills the GPU, and at sustained
+// clocks split-K ran up to 23% slower there.
+// With the trimmed launch (kq_qmv_splitk_sgs), q6_k at K 1024 to 3584 and B
+// 1 to 16 ran -38% to +1% at 1.1 to 1.4 GHz. Across runs q8_0 below K 2048
+// moved between -4% and +4%, and q6_k at K 768 between -12% and +13%, so
+// both keep gather_qmv.
+bool gather_qmv_splitk_on(bool q6, int K, size_t rows) {
+  return K >= (q6 ? 1024 : 2048) && rows < 16384;
 }
 
 // Gathered M=1 mat-vec through the split-K tile of q6_k or q8_0
@@ -305,7 +308,7 @@ bool gather_qmv_splitk(
     return false;
   }
   const int lever = kq_env_flag("KQ_GATHER_SPLITK", -1);
-  if (lever == 0 || (lever == -1 && !gather_qmv_splitk_on(K, out.size()))) {
+  if (lever == 0 || (lever == -1 && !gather_qmv_splitk_on(q6, K, out.size()))) {
     return false;
   }
   const int B = out.size() / N;

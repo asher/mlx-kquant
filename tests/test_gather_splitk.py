@@ -3,11 +3,11 @@
 kq.gather_qmm with transpose at M 1 runs each batch entry through the dense
 split-K mat-vec of its expert when the codec is q8_0 or q6_k, the tile's row
 count divides N (2 for q8_0, 4 for q6_k), 256 divides K, K is 2048 or more
-and the call has fewer than 16384 output rows. KQ_GATHER_SPLITK=1 takes it
-at any K and row count that fit, and 0 keeps gather_qmv. An entry then
-matches kq.quantized_matmul on its expert bit for bit. Against gather_qmv the
-outputs differ only in float32 summation order: by one unit in the last
-place, or near zero where the sum cancels.
+(1024 or more for q6_k) and the call has fewer than 16384 output rows.
+KQ_GATHER_SPLITK=1 takes it at any K and row count that fit, and 0 keeps
+gather_qmv. An entry then matches kq.quantized_matmul on its expert bit for
+bit. Against gather_qmv the outputs differ only in float32 summation order:
+by one unit in the last place, or near zero where the sum cancels.
 """
 
 from __future__ import annotations
@@ -167,6 +167,8 @@ def _row(codec, k):
 
 SPLIT = {"q8_0": 0.5, "q6_k": 0.0}
 PER_ROW = {"q8_0": 0.0, "q6_k": 256.0}
+# The smallest K that takes split-K unforced.
+ENTRY_K = {"q8_0": 2048, "q6_k": 1024}
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
@@ -182,10 +184,11 @@ def test_routing(codec, dtype):
 
     n = 2 * RPS[codec]
     split, per_row = [SPLIT[codec]], [PER_ROW[codec]]
-    assert run(n, 2048) == split
-    assert run(n, 1792) == per_row
-    assert run(n, 2048, lever="0") == per_row
-    assert run(n, 1024, lever="1") == split
+    entry = ENTRY_K[codec]
+    assert run(n, entry) == split
+    assert run(n, entry - 256) == per_row
+    assert run(n, entry, lever="0") == per_row
+    assert run(n, 768, lever="1") == split
     # 15360 and 16384 output rows.
     assert run(1024, 2048, b=15) == split
     assert run(1024, 2048, b=16) == per_row

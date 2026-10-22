@@ -236,13 +236,15 @@ two, and took 4.1% less at N 3072 and K 1024.
 
 `gather_qmm` with one activation row runs the same two split-K kernels per batch entry, for grouped
 projections such as the DeepSeek-V4 attention output and for SwitchGLU decode steps, when the row
-count of the tile divides N, K is 2048 or more and the call has fewer than 16384 output rows (N
-times the entries). Each entry then matches `quantized_matmul` on its expert bit for bit. On M5
-Max at 0.85-1.6 GHz, over 1 to 128 entries and N of 128 to 7168, it ran as fast as `gather_qmv` or
-faster on every such shape but one, `q6_k` at K 2048 and 15360 rows, 3% slower. It took 6-7% less
-time for `q8_0` and 4-6% less for `q6_k` at the DeepSeek-V4 shape of 8 groups of 1024 x 4096, and
-up to 38% less at one entry. From 16384 rows the `gather_qmv` grid fills the GPU, and at sustained
-clocks split-K ran up to 23% slower there. Below K 2048 calls keep `gather_qmv`.
+count of the tile divides N, K is 2048 or more (1024 or more for `q6_k`) and the call has fewer
+than 16384 output rows (N times the entries). Each entry then matches `quantized_matmul` on its
+expert bit for bit. On M5 Max at 0.85-1.6 GHz it ran as fast as `gather_qmv` or faster on every
+such shape measured: from K 2048 over 1 to 128 entries and N of 128 to 7168, and for `q6_k` at K
+1024 to 1792 over 1 to 16 entries. It took 6-7% less time for `q8_0` and 4-6% less for `q6_k` at
+the DeepSeek-V4 shape of 8 groups of 1024 x 4096, and up to 38% less at one entry. From 16384 rows
+the `gather_qmv` grid fills the GPU, and at sustained clocks split-K ran up to 23% slower there.
+Across runs, `q8_0` below K 2048 measured from 4% faster to 4% slower than `gather_qmv`, and `q6_k`
+at K 768 from 12% faster to 13% slower, so both keep `gather_qmv`.
 
 Tuning levers (defaults are right for normal use):
 
