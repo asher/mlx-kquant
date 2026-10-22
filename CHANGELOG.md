@@ -6,7 +6,26 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `KQ_VERIFY_NAX_Q4_1_SB=0` keeps `q4_1` on its two-block `verify_nax` kernel,
+  as `KQ_VERIFY_NAX_Q4_0_SB` does for `q4_0`.
+- `moe_glu_gather_shexp_kq` and `gather_qmv_mix_kq` take a shared expert k
+  routed experts wide as k shared slots, so models that merge their shared
+  experts (Flint) keep the fused MoE path. `shexp_glu_combo_has_kernel` and
+  `shexp_mix_combo_has_kernel` take `shared_slots` (and the mix probe
+  `slot_width`) and return False for a shape that does not run.
+  `KQ_MOE_SHEXP_MULTI=0` declines a wider shared expert.
+
 ### Changed
+- `q4_1` `quantized_matmul` at 4 to 8 activation rows takes less time on GPUs
+  without NAX, about 1.1-1.2x faster on M3 Max: it now runs the
+  register-resident `verify_mma` kernel that `q4_0` runs.
+- On NAX GPUs (M5), `q4_1` `quantized_matmul` and `quantized_matmul_multi` at 2
+  to 8 activation rows run the `verify_nax` kernels and follow the `q4_0`
+  routing rows. These kernels and rows are not yet measured on `q4_1`.
+- The score-mixed MoE down gathers on `q4_1` expert stacks at one or two rows
+  and K of 2048 or more run 16 K-lanes per row, as `q4_0` does. At two rows
+  on an M3 Max they take 8 to 34% less time.
 - Source builds compile the Metal kernels in parallel, so `pip install` from
   source and rebuilds after a kernel edit finish sooner.
 

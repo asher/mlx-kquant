@@ -51,19 +51,20 @@ import sys
 import numpy as np
 import mlx.core as mx
 import mlx_kquant as kq
+from mlx_kquant.codec_geometry import CODEC_GEOMETRY
 
 
 codec, out_path = sys.argv[1], sys.argv[2]
 rng = np.random.default_rng(11)
 E, N, K, T, S = 32, 64, 512, 2, 6
-bpb = {"q2_k": 84, "q4_k": 144, "q8_0": 34, "iq2_xxs": 66, "iq2_xs": 74}[codec]
-wpb = 32 if codec == "q8_0" else 256
+bpb, wpb = CODEC_GEOMETRY[codec][2:]
 nb = E * N * (K // wpb)
 wire = rng.integers(0, 256, size=(nb, bpb), dtype=np.uint8)
 d = rng.uniform(0.004, 0.01, nb).astype(np.float16)
 off = 80 if codec == "q2_k" else 0
 wire[:, off:off + 2] = d.view(np.uint8).reshape(nb, 2)
-dmin_off = {"q2_k": 82, "q4_k": 2}.get(codec)
+# the block min (q4_1) or super-block min scale (q2_k, q4_k)
+dmin_off = {"q2_k": 82, "q4_k": 2, "q4_1": 2}.get(codec)
 if dmin_off is not None:
     dm = rng.uniform(0.001, 0.004, nb).astype(np.float16)
     wire[:, dmin_off:dmin_off + 2] = dm.view(np.uint8).reshape(nb, 2)
@@ -80,7 +81,7 @@ np.savez(out_path, mix=np.array(mix.astype(mx.float32)),
 """
 
 
-@pytest.mark.parametrize("codec", ["q2_k", "q4_k", "q8_0", "iq2_xxs"])
+@pytest.mark.parametrize("codec", ["q2_k", "q4_k", "q8_0", "q4_1", "iq2_xxs"])
 def test_sp_bit_identical(codec, tmp_path):
     outs = {}
     for arm, env in (
@@ -104,19 +105,18 @@ import sys
 import numpy as np
 import mlx.core as mx
 import mlx_kquant as kq
-from mlx_kquant.nn import bytes_per_row
+from mlx_kquant.codec_geometry import CODEC_GEOMETRY
 
 codec, out_path, T = sys.argv[1], sys.argv[2], int(sys.argv[3])
 rng = np.random.default_rng(5)
 E, N, K, S = 8, 64, 2048, 4
-wpb = 32 if codec in ("q4_0", "q5_0") else 256
-bpb = bytes_per_row(codec, K) // (K // wpb)
+bpb, wpb = CODEC_GEOMETRY[codec][2:]
 nb = E * N * (K // wpb)
 wire = rng.integers(0, 256, size=(nb, bpb), dtype=np.uint8)
 d = rng.uniform(0.004, 0.01, nb).astype(np.float16)
 d_off = {"q6_k": 208}.get(codec, 0)
 wire[:, d_off:d_off + 2] = d.view(np.uint8).reshape(nb, 2)
-if codec == "q4_k":
+if codec in ("q4_k", "q4_1"):
     dm = rng.uniform(0.001, 0.004, nb).astype(np.float16)
     wire[:, 2:4] = dm.view(np.uint8).reshape(nb, 2)
 w = mx.array(wire.reshape(E, N, (K // wpb) * bpb))
@@ -129,7 +129,7 @@ np.save(out_path, np.array(mix.astype(mx.float32)))
 """
 
 
-@pytest.mark.parametrize("codec", ["q4_k", "q4_0", "q5_0", "iq3_xxs", "q6_k"])
+@pytest.mark.parametrize("codec", ["q4_k", "q4_0", "q4_1", "q5_0", "iq3_xxs", "q6_k"])
 @pytest.mark.parametrize("T", [1, 2, 3])
 def test_mix_ns_wide_pick(codec, T, tmp_path):
     """The codec-keyed nx16 mix_ns pick (T <= 2, K >= 2048) dispatches the

@@ -1061,7 +1061,7 @@ instantiate_kquant_prism_for_type(ptq1_0, 128, 1, float16_t)
 // Register-resident MMA verify kernels (kq_verify_mma.h), M <= 8. The
 // activations stay in bf16 or f16 and each block sums in float. The _h
 // twins stage half activations and sum in half (KQ_VERIFY_MMA_HALF);
-// ptq1_0 has none.
+// ptq1_0 and q4_1 have none.
 #define instantiate_kquant_verify_mma(type, gs, bits, codec)          \
   instantiate_kernel(                                                 \
       "kquant_" #codec "_verify_mma_" #type "_gs_" #gs "_b_" #bits,   \
@@ -1104,6 +1104,8 @@ instantiate_kquant_verify_mma(bfloat16_t, 128, 1, ptq1_0)
 instantiate_kquant_verify_mma(float16_t, 128, 1, ptq1_0)
 instantiate_kquant_verify_mma(bfloat16_t, 32, 4, q4_0)
 instantiate_kquant_verify_mma(float16_t, 32, 4, q4_0)
+instantiate_kquant_verify_mma(bfloat16_t, 32, 4, q4_1)
+instantiate_kquant_verify_mma(float16_t, 32, 4, q4_1)
 instantiate_kquant_verify_mma(bfloat16_t, 32, 8, q8_0)
 instantiate_kquant_verify_mma(float16_t, 32, 8, q8_0)
 instantiate_kquant_verify_mma_h(bfloat16_t, 128, 2, pq2_0)

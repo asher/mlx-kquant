@@ -300,6 +300,13 @@ All optional; the defaults are right for normal use.
   slot in one thread, `sp` gives each slot its own simdgroup pair, `dd` is the dedupe row-pair
   kernel. By default `sp` serves launches under 2048 threadgroups and `dd` serves wider ones at 2
   to 8 rows. Read per call. `loop` and `sp` give identical bytes. A/B lever.
+- `KQ_MOE_SHEXP_MULTI=0` - on Metal, decline a shared expert wider than one routed expert in the
+  fused shared-expert MoE gathers: `kq.shexp_glu_combo_has_kernel` and
+  `kq.shexp_mix_combo_has_kernel` return False for `shared_slots` above 1, and the ops raise an
+  error. Read per call. A/B lever.
+- `KQ_MOE_SP_THREAD_CAP=<n>` - on Metal, lower the thread limit of the slot-parallel score-mixed
+  MoE down gathers to n, so a launch of more threads runs the loop kernel. Read per call. Test
+  lever.
 - `KQ_MOE_HALF=1` - on Metal, run the iq2_xs, iq2_xxs and iq3_xxs fused MoE decode gathers on the
   half-dot kernels (half grid tables and half-staged activations, with each chunk dotted in float;
   shared-expert slots stay on the float path). Read per call. Default off: the outputs differ from

@@ -1591,6 +1591,52 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
       w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
 }
 
+// Register-resident MMA verify (kq_verify_mma.h). Lane L owns qs bytes
+// 4L..4L+3, read as one aligned word (the weight base is 4-byte aligned
+// and blocks are 20 bytes), with KqQ4_0Mma's fragments and order. Each
+// code pair is masked into the mantissas of a half2 (1024 + q) and mapped
+// to q, exact in half. The min uses the contract's per-block activation
+// sums. There are no half kernels: a block sum of unscaled codes up to 15
+// leaves half range at activations of about 136.
+struct KqQ4_1Mma {
+  static constant constexpr int block_k = KQ_Q4_1_GROUP;
+  static constant constexpr int block_bytes = KQ_Q4_1_BLOCK_BYTES;
+  static constant constexpr int d_offset = KQ_Q4_1_D_OFFSET;
+  static constant constexpr float d_scale = 1.0f;
+  static constant constexpr bool has_min = true;
+  static constant constexpr int m_offset = KQ_Q4_1_M_OFFSET;
+  static METAL_FUNC int perm(int f, int col) {
+    return KqQ4_0Mma::perm(f, col);
+  }
+  template <int NT, typename X, typename A>
+  static METAL_FUNC void block(
+      thread const KqVmmaRows<NT>& rows,
+      int boff,
+      short L,
+      short fm,
+      const threadgroup X* xb,
+      thread simdgroup_matrix<A, 8, 8> (&acc)[NT]) {
+    uint lo[NT], hi[NT];
+    for (short t = 0; t < NT; ++t) {
+      const uint wv =
+          *(const device uint*)(rows.p[t] + boff + KQ_Q4_1_QS_OFFSET + 4 * L);
+      lo[t] = wv & 0x0F0F0F0Fu;
+      hi[t] = (wv >> 4) & 0x0F0F0F0Fu;
+    }
+    for (short f = 0; f < 4; ++f) {
+      half2 a[NT];
+      for (short t = 0; t < NT; ++t) {
+        const uint src = (f < 2 ? lo[t] : hi[t]) >> (8 * (f & 1));
+        a[t] =
+            as_type<half2>((src & 0x000F000Fu) | 0x64006400u) - half2(1024.0h);
+      }
+      kq_vmma_step<NT>(xb + 8 * perm(f, fm), a, acc);
+    }
+  }
+};
+
+KQ_DEFINE_VERIFY_MMA_KERNEL(q4_1, KqQ4_1Mma, 2)
+
 // Q5_0: 22 bytes/32 weights. [fp16 d][uint8 qh[4]][uint8 qs[16]]. w[i] = d *
 // (q5 - 16).
 

@@ -24,7 +24,7 @@ import pytest
 import mlx_kquant as kq
 
 N, K = 96, 512
-CODECS = ["q4_k", "q6_k", "q8_0", "q4_0"]
+CODECS = ["q4_k", "q6_k", "q8_0", "q4_0", "q4_1"]
 # 1 row takes qmv, 4 the verify kernel, 64 and 1100 the matmul tiles.
 ROWS = [1, 4, 64, 1100]
 SCALES = mx.zeros((1,), dtype=mx.uint8)
@@ -108,7 +108,7 @@ def test_quantized_matmul_weight_views(codec, state):
 
 @pytest.mark.parametrize("state", ["lazy", "evaluated"])
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=["bf16", "f16"])
-@pytest.mark.parametrize("codec", ["q4_k", "q8_0", "q4_0"])
+@pytest.mark.parametrize("codec", ["q4_k", "q8_0", "q4_0", "q4_1"])
 def test_multi_weight_views(codec, dtype, state):
     """1 row runs quantized_matmul per weight, 4 and 6 rows the joined
     verify kernel where there is one."""

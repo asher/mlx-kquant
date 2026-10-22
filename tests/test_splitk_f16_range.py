@@ -25,7 +25,7 @@ import mlx_kquant as kq
 pytestmark = pytest.mark.skipif(force_cpu(), reason="GPU split-K routes")
 
 K, N = 4096, 512
-CODECS = ["q4_0", "q8_0", "q4_k"]
+CODECS = ["q4_0", "q4_1", "q8_0", "q4_k"]
 STRICT = {"KQ_QMM_ROUTE_STRICT": "1"}
 CLEAR = {"KQ_QMM_ROUTE": None, "KQ_QMM_MIDM": None, "KQ_DISABLE_NAX": None}
 

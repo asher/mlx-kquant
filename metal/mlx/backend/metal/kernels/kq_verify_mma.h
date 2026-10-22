@@ -31,6 +31,11 @@
 //     and accumulate its block_k/8 fragments through kq_vmma_step; L =
 //     fn / 2 is the lane's column pair, xb the staged B base of this block
 //     (fragment f at xb + 8 * perm(f, fm)).
+//   has_min, m_offset (optional, block_k 32, float kernels only): the
+//     block also has a half min m at m_offset, and w = d * code + m. The
+//     staging pass then sums each block's activations per column in float
+//     into threadgroup memory, and each block adds m times that sum to its
+//     scaled float sum. Codecs without has_min compile without the sums.
 
 MLX_MTL_CONST int KQ_VMMA_THREADS = 256;
 MLX_MTL_CONST int KQ_VMMA_NSG = KQ_VMMA_THREADS / 32;
@@ -48,6 +53,34 @@ struct KqVmmaTypes {
   using X = metal::conditional_t<HALF, half, T>;
   using A = metal::conditional_t<HALF, half, float>;
 };
+
+// Codec::has_min, false when the codec does not declare it.
+template <typename>
+struct KqVmmaVoid {
+  using type = void;
+};
+template <typename Codec, typename = void>
+struct KqVmmaHasMin {
+  static constant constexpr bool value = false;
+};
+template <typename Codec>
+struct KqVmmaHasMin<
+    Codec,
+    typename KqVmmaVoid<decltype(Codec::has_min)>::type> {
+  static constant constexpr bool value = Codec::has_min;
+};
+
+// Staged activation elements per threadgroup: the K chunk, and for a codec
+// with a min the per-block column sums (KC / 32 blocks of 8 floats) after
+// it.
+template <typename T, typename Codec, bool HALF>
+constexpr int kq_vmma_stage_elems() {
+  using X = typename KqVmmaTypes<T, HALF>::X;
+  return KQ_VMMA_KC * 8 +
+      (KqVmmaHasMin<Codec>::value
+           ? KQ_VMMA_KC / 32 * 8 * int(sizeof(float) / sizeof(X))
+           : 0);
+}
 
 // One fragment step: the lane's two staged activations at bsrc and its
 // decoded code pair a[t] of each row tile, widened to A.
@@ -86,6 +119,10 @@ METAL_FUNC void kq_verify_mma_impl(
   using A = typename KqVmmaTypes<T, HALF>::A;
   constexpr int KC = KQ_VMMA_KC;
   constexpr int BK = Codec::block_k;
+  constexpr bool MIN = KqVmmaHasMin<Codec>::value;
+  static_assert(!MIN || (BK == 32 && !HALF), "min codecs: float, 32-wide");
+  // Column sums of each staged block, after the chunk.
+  threadgroup float* Xsum = (threadgroup float*)(XsT + KC * 8);
   const int row_bytes = (K / BK) * Codec::block_bytes;
   const short qid = simd_lid / 4;
   const short fm = (qid & 4) + ((simd_lid / 2) % 4);
@@ -116,6 +153,18 @@ METAL_FUNC void kq_verify_mma_impl(
         }
       }
       *(threadgroup vec<X, 8>*)(XsT + kk * 8) = v;
+      if constexpr (MIN) {
+        // A simdgroup stages 32 consecutive k, one whole block, since kn
+        // and the chunk start are multiples of 32.
+        float4 s0 = float4(float(v[0]), float(v[1]), float(v[2]), float(v[3]));
+        float4 s1 = float4(float(v[4]), float(v[5]), float(v[6]), float(v[7]));
+        s0 = simd_sum(s0);
+        s1 = simd_sum(s1);
+        if (simd_lid == 0) {
+          *(threadgroup float4*)(Xsum + (kk / 32) * 8) = s0;
+          *(threadgroup float4*)(Xsum + (kk / 32) * 8 + 4) = s1;
+        }
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int kb = 0; kb < kn; kb += BK) {
@@ -127,11 +176,20 @@ METAL_FUNC void kq_verify_mma_impl(
       }
       Codec::template block<NT>(rows, boff, L, fm, xb, acc);
       for (short t = 0; t < NT; ++t) {
-        const float d = Codec::d_scale *
-            float(*(const device half*)(rows.p[t] + boff + Codec::d_offset));
-        c[t] += d *
-            float2(reinterpret_cast<thread vec<A, 2>&>(
-                acc[t].thread_elements()));
+        const float2 sum = float2(
+            reinterpret_cast<thread vec<A, 2>&>(acc[t].thread_elements()));
+        if constexpr (MIN) {
+          static_assert(Codec::m_offset == Codec::d_offset + 2, "m follows d");
+          // d and m are adjacent halves: one 32-bit load.
+          const float2 dm = float2(
+              *(const device half2*)(rows.p[t] + boff + Codec::d_offset));
+          c[t] += Codec::d_scale * dm.x * sum +
+              dm.y * *(const threadgroup float2*)(Xsum + (kb / 32) * 8 + fn);
+        } else {
+          const float d = Codec::d_scale *
+              float(*(const device half*)(rows.p[t] + boff + Codec::d_offset));
+          c[t] += d * sum;
+        }
       }
     }
   }
@@ -172,7 +230,8 @@ METAL_FUNC void kq_verify_mma_impl(
       uint simd_gid [[simdgroup_index_in_threadgroup]],                  \
       uint simd_lid [[thread_index_in_simdgroup]]) {                     \
     static_assert(group_size == TRAITS::block_k, #CODEC " block width"); \
-    threadgroup typename KqVmmaTypes<T, HALF>::X XsT[KQ_VMMA_KC * 8];    \
+    threadgroup typename KqVmmaTypes<T, HALF>::X                         \
+        XsT[kq_vmma_stage_elems<T, TRAITS, HALF>()];                     \
     kq_verify_mma_impl<T, TRAITS, NT, U, HALF>(                          \
         w,                                                               \
         x,                                                               \

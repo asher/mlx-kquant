@@ -12,8 +12,8 @@ within two output roundings of each other. With partials in the
 activation dtype (KQ_SPLITK_F32=0) each K slice rounds once more, which
 adds about one output rounding: the result stays finite and within one and
 a half output roundings of the R1 model. KQ_VERIFY_MMA_HALF=1 selects the
-half kernels, whose range stops at 65504, on every codec but ptq1_0, which
-has none. With the same partials on ordinary float16 activations, their
+half kernels, whose range stops at 65504, on every codec but ptq1_0 and
+q4_1, which have none. With the same partials on ordinary float16 activations, their
 error beyond the R1 model is at least three times that of the float
 kernels.
 """
@@ -32,7 +32,7 @@ import mlx_kquant as kq
 
 pytestmark = pytest.mark.skipif(force_cpu(), reason="GPU verify route")
 
-CODECS = ["pq2_0", "ptq1_0", "q2_0", "q4_0", "q8_0"]
+CODECS = ["pq2_0", "ptq1_0", "q2_0", "q4_0", "q4_1", "q8_0"]
 DTYPES = ["bfloat16", "float16"]
 # design: (K, N)
 DESIGNS = {"normal": (4096, 512), "big": (1024, 256)}
@@ -110,7 +110,8 @@ def test_verify_mma_range(design, codec, dtype, m):
 
 
 # The half kernels behind KQ_VERIFY_MMA_HALF=1, on ordinary activations.
-# ptq1_0 has none, so the lever leaves it on its float kernels.
+# ptq1_0 and q4_1 have none, so the lever leaves them on their float
+# kernels.
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("codec", CODECS)
 def test_verify_mma_half_lever(codec, dtype):
@@ -118,7 +119,7 @@ def test_verify_mma_half_lever(codec, dtype):
         _, _, verify_t, half = _probe()[("normal", codec, dtype, m)]
         assert half["error"] is None, half["error"]
         ((name, _),) = half["kernels"]
-        if codec == "ptq1_0":
+        if codec in ("ptq1_0", "q4_1"):
             assert "_verify_mma_" in name and not _half(name), name
             assert half["digest"] == verify_t["digest"]
             continue

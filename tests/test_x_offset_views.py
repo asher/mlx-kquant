@@ -168,7 +168,7 @@ ENVS = {
     "lora2": {"KQ_QMM_LORA": "2"},
 }
 K, N = 768, 256
-OP_CODECS = ("q4_0", "q4_k", "q6_k", "q8_0", "iq4_nl", "iq2_xxs")
+OP_CODECS = ("q4_0", "q4_1", "q4_k", "q6_k", "q8_0", "iq4_nl", "iq2_xxs")
 MOE_CODECS = ("q4_k", "q8_0", "iq4_nl", "iq2_xxs")
 MX_DT = {"float16": mx.float16, "bfloat16": mx.bfloat16, "float32": mx.float32}
 HALF = ("float16", "bfloat16")

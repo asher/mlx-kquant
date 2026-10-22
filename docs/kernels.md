@@ -29,7 +29,7 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
   (`mxfp4`/`nvfp4`, gpt-oss experts).
 - **`gather_qmv_mix_kq`** / **`gather_qmv_mix_ns_kq`** - the down projection with the routing mix
   folded in - every slot accumulated in f32 weighted by its score, and (in the `mix` variant) a shared
-  expert as the last slot - replacing a gather plus a weighted sum plus the shared-expert add. Shaped
+  expert as the last slots - replacing a gather plus a weighted sum plus the shared-expert add. Shaped
   for DeepSeek-V3/V4-style shared-expert MoE.
 - **`gather_qmv_bias`** - gathered matvec with a fused expert bias on MLX's packed mxfp4 layout (the
   counterpart to the K-quant gathers above for that codec).
@@ -60,17 +60,16 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
 On NAX GPUs, `quantized_matmul` transpose (decode-orientation) shapes route by row count M and
 output width N. Per-row qmv serves M 2 up to a per-codec limit, the mat-vec paths (`mv_ext`,
 `verify_qmv`) serve the widths above it, and split-K on a BM=32 double-buffered NAX tile takes over
-from a per-codec entry through M 32. From M 33 to 128, split-K also takes the calls where the
-BM=64 grid wastes the GPU, as described below. Elsewhere above M 32 the BM=64 tile runs, with a
+from a per-codec entry through M 32. From M 33 to 128, split-K also takes the calls where the BM=64
+grid wastes the GPU, as described below. Elsewhere above M 32 the BM=64 tile runs, with a
 double-buffered `_db` variant on the M 33-64 band at large N, and a BM=128 tile from M 193 when
 ceil(M/64) is even. The k-quants `q3_k` to `q6_k`, the flat block codecs `q4_0`, `q4_1` and `q5_0`,
-and `iq4_nl`, `iq3_xxs`, `iq3_s`, `iq2_xs` and `iq2_s` run the BM=64 and BM=128 tiles on a K tile
-of 128 (the `_BK128` levers). Above
-the qmv limit, the verify kernels take the widths through M 8 on the codecs that have them. The
-NAX verify kernel serves `pq2_0`, `q4_0`, `q8_0`, `q2_k` to `q6_k` and `nvfp4` from a per-codec entry,
-and the register-resident MMA verify kernel serves `ptq1_0`, as described at the end of this
-section. Every limit and floor is a measured per-codec policy (`kq_nax_small_m` and
-`kq_smallbm_policy` in `src/kquant_matmul.cpp`).
+and `iq4_nl`, `iq3_xxs`, `iq3_s`, `iq2_xs` and `iq2_s` run the BM=64 and BM=128 tiles on a K tile of
+128 (the `_BK128` levers). Above the qmv limit, the verify kernels take the widths through M 8 on
+the codecs that have them. The NAX verify kernel serves `pq2_0`, `q4_0`, `q4_1`, `q8_0`, `q2_k` to
+`q6_k` and `nvfp4` from a per-codec entry, and the register-resident MMA verify kernel serves
+`ptq1_0`, as described at the end of this section. Every limit and floor is a measured per-codec
+policy (`kq_nax_small_m` and `kq_smallbm_policy` in `src/kquant_matmul.cpp`).
 
 On GPUs without NAX, the `qmm_t` kernel decodes each weight tile inside its K loop, once for every
 64-row tile of the activations. From a floor in rows it is faster to decode the whole weight once
@@ -135,6 +134,8 @@ DRAM (`benchmarks/bench_verify_routes.py`). Its route runs at 1.01x the fastest 
 1.02x on 10 shapes held out of the fit (geometric means), against 1.24x on both for the entries it
 replaced. The largest gains are `q4_k` and `q4_1` at M 7 (1.7-1.9x at the projection shapes),
 `iq2_xs` and `iq2_s` at M 8 to 12 (2.1-2.2x), and qmv at M 2 on N 1024 and below (1.1-3x).
+`q4_1` was fitted before it had verify kernels. It now takes the `q4_0` row, which was fitted with
+them, and is not measured on it.
 
 A NAX tile runs two rows of simdgroups. When the whole matmul has no more rows than one of them
 covers, 16 on the BM=32 tile and 32 on the BM=64 tile, the second row would multiply only padding.
@@ -159,18 +160,19 @@ than the BM=64 tile when each shape is weighted by its calls in a forward of a 2
 and no cell runs more than 2% slower. Whole forwards of that model run 19-22% faster at 33 to 64
 rows and 17% faster at 80 and 96. `KQ_QMM_MIDM=0` keeps the BM=64 tile.
 
-With float partials (the float16 default, and `KQ_SPLITK_F32=1`), `q4_0` and `q8_0` target 10 slices
-from M 33 to 64, and from M 65 to 96 they target 5 up to K 5120 and 8 above. They cut K in units of
-64 weights, so at K 5120 the targets of 16 and 8 write 16 or 8 partials where the 256-weight codecs
-write 10 or 5, and a float partial is twice the size of a bfloat16 one. On M5 Max over the eight
-projection shapes on float16 activations, each cell of shape and M takes 0.79-1.01x the time of a
-target of 16 from M 33 to 64, and 0.67-1.02x the time of 16 or 8 from M 65 to 96 at K 5120. Above
-K 5120 a target of 5 leaves 4 slices of the 96 or 272 units, so the target there stays 8. Those
-cells take 0.88-0.97x the time of 4 slices, and 0.99-1.02x at K 6144 and M 96. Weighted by calls per
-forward, M 65 to 96 run 0.96-0.99x the time of a target of 5 at every K. The K threshold was
-measured at K 5120, 6144 and 17408 only.
-The rule keys on the partials, so bfloat16 with `KQ_SPLITK_F32=1` takes these targets too, though
-they were not measured there. bfloat16 on its default bfloat16 partials keeps 16 and 8.
+With float partials (the float16 default, and `KQ_SPLITK_F32=1`), `q4_0`, `q4_1` and `q8_0` target
+10 slices from M 33 to 64, and from M 65 to 96 they target 5 up to K 5120 and 8 above. They cut K in
+units of 64 weights, so at K 5120 the targets of 16 and 8 write 16 or 8 partials where the
+256-weight codecs write 10 or 5, and a float partial is twice the size of a bfloat16 one. On M5 Max
+over the eight projection shapes on float16 activations, each cell of shape and M takes 0.79-1.01x
+the time of a target of 16 from M 33 to 64, and 0.67-1.02x the time of 16 or 8 from M 65 to 96 at K
+5120. Above K 5120 a target of 5 leaves 4 slices of the 96 or 272 units, so the target there stays
+8. Those cells take 0.88-0.97x the time of 4 slices, and 0.99-1.02x at K 6144 and M 96. Weighted by
+calls per forward, M 65 to 96 run 0.96-0.99x the time of a target of 5 at every K. The K threshold
+was measured at K 5120, 6144 and 17408 only. The rule keys on the partials, so bfloat16 with
+`KQ_SPLITK_F32=1` takes these targets too, though they were not measured there. bfloat16 on its
+default bfloat16 partials keeps 16 and 8. `q4_1` also cuts K in units of 64 weights and takes the
+`q4_0` targets, which are not measured for it.
 
 The NAX split-K route cuts K into units of max(block, 64) weights and targets 16 slices of whole
 units. It takes the largest count at or under the target that divides the units evenly, unless
@@ -180,12 +182,13 @@ whose unit count has no divisor near 16, such as 11008, 17408 and 18944 on the 2
 
 At M 32 and below, a call whose BM=32 grid already holds 16 threadgroups per GPU core, such as a
 vocab head, takes one slice where the call without the split runs the same BM=32 tile. `q6_k` and
-`iq2_xxs` below M 32 and `q8_0` below M 13 keep the target of 16 there, as do calls that would
-leave the BM=32 tile for an mv route or the BM=64 tile. Below a full grid, `q4_0` and `q8_0` on
-float partials hold the split grid to 16 threadgroups per core, except `q8_0` below M 13. On
-M5 Max, against a target of 16 at N 49152, 151936 and 248320 and M 9 to 32, the single slice runs
-0.68-1.05x the time, and summed over a forward pass, weighted by the calls per shape, no codec
-runs slower. The float-partial cap runs 0.75-1.02x at N 5120 to 17408.
+`iq2_xxs` below M 32 and `q8_0` below M 13 keep the target of 16 there, as do calls that would leave
+the BM=32 tile for an mv route or the BM=64 tile. Below a full grid, `q4_0`, `q4_1` and `q8_0` on
+float partials hold the split grid to 16 threadgroups per core, except `q8_0` below M 13 (`q4_1`
+takes the `q4_0` rule, not measured). On M5 Max, against a target of 16 at N 49152, 151936 and
+248320 and M 9 to 32, the single slice runs 0.68-1.05x the time, and summed over a forward pass,
+weighted by the calls per shape, no codec runs slower. The float-partial cap runs 0.75-1.02x at N
+5120 to 17408.
 
 Measured on M5 Max at M 8 to 24 with the weights streamed from DRAM, the shorter last slice runs
 `q4_k` 1.1x faster at 5120x17408, 1.5x at 3584x18944, 2x at 4096x11008 and 4-5x at 896x4864. The
@@ -373,8 +376,8 @@ Tuning levers (defaults are right for normal use):
   the band. Unset takes split-K where the qmm grid, ceil(N/64) x ceil(M/64) threadgroups, is under
   three per GPU core (`KQ_GPU_CORES` sets the count), such as the narrow projections of a short
   prompt. On NAX GPUs it also takes M 65-96 up to 16 threadgroups per core and runs the NAX split-K
-  tile on every codec with NAX kernels, and there `q4_0` and `q8_0` on float partials target 10
-  slices through M 64, and from M 65 to 96 5 up to K 5120 and 8 above. When NAX is absent or
+  tile on every codec with NAX kernels, and there `q4_0`, `q4_1` and `q8_0` on float partials target
+  10 slices through M 64, and from M 65 to 96 5 up to K 5120 and 8 above. When NAX is absent or
   disabled it runs the BM=32 tile on the codecs of `KQ_QMM_SPLITK`. Read live per call.
 - `KQ_SPLITK_RAGGED` - slice count of the NAX split-K route. `0` keeps equal slices, the largest
   count at or under the target that divides the slice units, and `2` takes the ragged count
@@ -412,9 +415,11 @@ Tuning levers (defaults are right for normal use):
   pq2_0, q2_0, q4_0 and q8_0, which stage the activations as half and sum each block in half, so an
   activation or a block sum past 65504 turns to inf. On pq2_0 the codes enter that sum unscaled, so
   a 128-weight block can pass 65504 with activations of magnitude 256 when the codes and activations
-  agree in sign. ptq1_0 has no half kernels and stays on its float kernels. For timing against the
-  float kernels only. Unset (off) by default. Read live per call.
+  agree in sign. ptq1_0 and q4_1 have no half kernels and stay on their float kernels. For timing
+  against the float kernels only. Unset (off) by default. Read live per call.
 - `KQ_VERIFY_NAX_Q4_0_SB` - probe lever: `0` keeps `q4_0` on the two-block `verify_nax` kernel at
+  a K that is a multiple of 256, where the eight-block kernel runs by default. Read live per call.
+- `KQ_VERIFY_NAX_Q4_1_SB` - probe lever: `0` keeps `q4_1` on the two-block `verify_nax` kernel at
   a K that is a multiple of 256, where the eight-block kernel runs by default. Read live per call.
 - `KQ_VNAX_X16` - probe lever: `0` keeps the `verify_nax` kernels that load their activations per
   NAX op on one 8-byte load per op where the activations start on a 16-byte boundary, in place of
@@ -502,15 +507,16 @@ described with the other `verify_nax` entries. Its `bm128_min_m` floor is 449: B
 1.13-1.16x the BM=64 time at M 224, 0.95-0.98x at M 256 and 0.86-0.90x at M 1024. Its large-M row
 has no K ceiling, and it has no db64 band.
 
-The register-resident MMA verify kernels (`verify_mma`) serve `pq2_0`, `ptq1_0`, `q2_0`, `q4_0` and
-`q8_0` through M 8. Each simdgroup decodes a block of its weight rows straight into 8x8 simdgroup-matrix
-fragments, with the k order inside the block permuted so every lane extracts the code pairs it holds
-cheapest, and multiplies them against the activations staged once per K chunk, so the weight bytes
-are read once for all M rows and the tile's threadgroup staging of the weights disappears. Split-K
-over the wire blocks feeds the same partial fold as `qmm_splitk` on the projection shapes; a
-head-sized N already fills the GPU with one split and writes the output directly.
+The register-resident MMA verify kernels (`verify_mma`) serve `pq2_0`, `ptq1_0`, `q2_0`, `q4_0`,
+`q4_1` and `q8_0` through M 8. Each simdgroup decodes a block of its weight rows straight into 8x8
+simdgroup-matrix fragments, with the k order inside the block permuted so every lane extracts the
+code pairs it holds cheapest, and multiplies them against the activations staged once per K chunk,
+so the weight bytes are read once for all M rows and the tile's threadgroup staging of the weights
+disappears. Split-K over the wire blocks feeds the same partial fold as `qmm_splitk` on the
+projection shapes; a head-sized N already fills the GPU with one split and writes the output
+directly.
 
-A threadgroup is 8 simdgroups, and each owns two 8-row tiles on `q4_0` and `q8_0` and one on
+A threadgroup is 8 simdgroups, and each owns two 8-row tiles on `q4_0`, `q4_1` and `q8_0` and one on
 `pq2_0`, `q2_0` and `ptq1_0` (`q2_0` runs the `pq2_0` chain at 8 fragment MMAs per 64-weight block
 and takes its one-tile layout, which is not measured for it). A `pq2_0` block runs its 16 fragment
 MMAs into one accumulator per row tile, so the MMAs form a dependent chain whose latency, longer in
@@ -538,27 +544,42 @@ both. Against the half kernels over the same shapes and M on the M5 Max, the flo
 and 1.00-1.05x for `q4_0` on float16. `ptq1_0` has no half kernels, since in float it runs in
 0.90-1.03x the time of a half build.
 
-The entry M depends on the device. Without NAX, `pq2_0` and `ptq1_0` enter at M 3 (`pq2_0` at M 4
-on float16 activations, where `verify_qmv` holds M 3) and `q4_0` at M 2. Measured on M3 Max at the
-Bonsai gate and down shapes against the routes they displace: `pq2_0` 1.15x at M 3 and 1.7x at
-M 8, `ptq1_0` 1.2x at M 3 and 2.0x at M 8, `q4_0` 1.2x at M 2 and 1.5x at M 8. Split-K enters at
-M 9 for these three codecs. On NAX GPUs the mat-vec kernels hold longer, so above the per-row qmv
-limit `ptq1_0` enters at M 3, `pq2_0` and `q4_0` enter at M 5 on the calls that `verify_nax`
+A codec with a block min, `q4_1` (w = d * code + m), uses the same fragments with the codes
+unscaled. While the activations of a K chunk are staged, each simdgroup also sums the 32
+activations of each block per activation row in float, into threadgroup memory beside the chunk.
+After the block's float sum is scaled by d, the kernel adds m times that column sum. The codecs
+without a min compile without the sums and run unchanged. `q4_1` has no half kernels: its block
+sum of codes up to 15 would leave half range at activations of about 136.
+
+The entry M depends on the device. Without NAX, `pq2_0` and `ptq1_0` enter at M 3 (`pq2_0` at M 4 on
+float16 activations, where `verify_qmv` holds M 3), `q4_0` at M 2 and `q4_1` at M 4. Measured on M3
+Max at the Bonsai gate and down shapes against the routes they displace: `pq2_0` 1.15x at M 3 and
+1.7x at M 8, `ptq1_0` 1.2x at M 3 and 2.0x at M 8, `q4_0` 1.2x at M 2 and 1.5x at M 8. Split-K
+enters at M 9 for these three codecs. `q4_1` was measured on M3 Max over the Flint projection and
+head shapes (N 512 to 150144, K 1024 to 6144) and the Qwen3.8-27B ones, process-paired against its
+old route. At M 2 and 3 its `verify_qmv` kernel runs faster on the shapes of K 2048 and below (the
+kernel takes 1.04-1.45x its time). From M 4, where the old route is the bm8 split-K tile, the kernel
+runs 1.00-1.45x faster, a geometric mean of 1.11-1.14x per M over the Flint shapes and 1.16-1.20x
+over the 27B ones on bfloat16 activations, and 1.11-1.13x and 1.07-1.14x on float16. Its speedup
+sits below that of `q4_0` (1.19-1.21x and 1.31-1.36x from M 5) because its old route is faster per
+weight byte, while the two kernels run at about the same rate per weight byte. On NAX GPUs the
+mat-vec kernels hold longer, so above the per-row qmv limit `ptq1_0` enters at M 3, `pq2_0`, `q4_0`
+and `q4_1` (the `q4_0` entry, not measured for it) enter at M 5 on the calls that `verify_nax`
 declines, and NAX split-K takes M 9 and up. Measured on M5 Max over the eight Ternary Bonsai 2 27B
 projection and head shapes with the weights streamed from DRAM
 (`benchmarks/bench_verify_routes.py`), against the mat-vec route each displaces, on bfloat16
-activations: `pq2_0` 1.1-1.3x at M 5 and 1.6-2.1x at M 8, `ptq1_0` 1.0-1.2x at M 3 and 2.5-3.1x
-at M 8, `q4_0` 1.0-1.4x at M 5 and 1.1-1.4x at M 8. Float16 activations give the same entries.
-The `q8_0` kernel has no default entry on either class of GPU, so it runs only where
-`KQ_VERIFY_MMA` or `KQ_QMM_ROUTE=verify_mma` forces it.
+activations: `pq2_0` 1.1-1.3x at M 5 and 1.6-2.1x at M 8, `ptq1_0` 1.0-1.2x at M 3 and 2.5-3.1x at M
+8, `q4_0` 1.0-1.4x at M 5 and 1.1-1.4x at M 8. Float16 activations give the same entries. The `q8_0`
+kernel has no default entry on either class of GPU, so it runs only where `KQ_VERIFY_MMA` or
+`KQ_QMM_ROUTE=verify_mma` forces it.
 
-On NAX GPUs, the register-fed NAX verify kernels (`verify_nax`) serve `pq2_0`, `q4_0`, `q8_0`,
-`q2_k` to `q6_k`, `iq4_xs`, `iq4_nl` and `nvfp4` from a per-codec entry through M 8, above the per-row qmv limit where that limit is
-wider. Each simdgroup owns 32 weight rows and decodes every block of them straight into the
-right operand of a 16x32x16 NAX matmul, with the block scale folded into the half weights. The left
-operand holds the activation rows padded to 16, read from device memory in the k order of the
-decoded weights, so nothing is staged in threadgroup memory and the loop has no barriers. The
-accumulator is float32.
+On NAX GPUs, the register-fed NAX verify kernels (`verify_nax`) serve `pq2_0`, `q4_0`, `q4_1`,
+`q8_0`, `q2_k` to `q6_k`, `iq4_xs`, `iq4_nl` and `nvfp4` from a per-codec entry through M 8, above
+the per-row qmv limit where that limit is wider. Each simdgroup owns 32 weight rows and decodes
+every block of them straight into the right operand of a 16x32x16 NAX matmul, with the block scale,
+and the min where the codec has one, folded into the half weights. The left operand holds the
+activation rows padded to 16, read from device memory in the k order of the decoded weights, so
+nothing is staged in threadgroup memory and the loop has no barriers. The accumulator is float32.
 
 A simdgroup's device loads and NAX ops do not overlap, so the kernel hides its loads through the
 simdgroups resident beside it, and the host sizes the split count for that. The kernels differ in
@@ -570,6 +591,8 @@ split rule, as the table lists.
 | `pq2_0` | 128 | a piece of one block from each of 8 rows | a K step ahead | about 600 simdgroups | 4-byte |
 | `q4_0`, two-block | 64 | a piece of one block from each of 8 rows | a K step ahead | about 600 simdgroups, K walk 640 | 4-byte |
 | `q4_0`, eight-block | 256 | two whole blocks of one row, as nine 4-byte words | per NAX op | waves, partial charge 640 | 4-byte |
+| `q4_1`, two-block | 64 | a piece of one block from each of 8 rows | a K step ahead | about 600 simdgroups, K walk 640 | 4-byte |
+| `q4_1`, eight-block | 256 | two whole blocks of one row, as ten 4-byte words | per NAX op | waves, partial charge 640 | 4-byte |
 | `q8_0` | 128 | one whole block of one row | per NAX op | about 600 simdgroups | 4-byte |
 | `q4_k` | 256 | the 16-byte header and a 32-byte quarter of one row's codes | per NAX op | waves, partial charge 640 | 16-byte |
 | `q5_k` | 128 | the header, 16 bytes of codes and their 16 bytes of high bits | per NAX op | waves, partial charge 2560 | 16-byte |
@@ -580,48 +603,50 @@ split rule, as the table lists.
 | `iq4_nl` | 256 | two whole blocks of one row, as nine 4-byte words | per NAX op | waves, partial charge 640 | 4-byte |
 | `nvfp4` | 128 | the scale byte and 8 code bytes of one 16-weight group of one row | a K step ahead | waves, partial charge 1280 | 4-byte |
 
-The `pq2_0` and two-block `q4_0` kernels decode each block in the permuted k order of `verify_mma`.
-The other kernels keep each lane's loads on one row, which measured faster. Spreading a `q8_0`
-block across 8 rows ran 1.04-1.24x slower at every Qwen3.8-27B shape except N 1024. `q4_0` runs the
-eight-block kernel at a K that is a multiple of 256 and the two-block kernel elsewhere. The K-quant
-kernels fold each 16- or 32-weight sub-block's scale, and its min where the codec has one, into the
-half weights. Loading a whole K step of activations ahead measured faster for `pq2_0` and the
-two-block `q4_0` kernel, and `nvfp4` loads them the same way, while the kernels with larger decoded
-words load them one NAX op at a time, since loading ahead ran `q4_k` 1.6-2x slower. Two consecutive
-NAX ops read 8 contiguous activations of a row, so where the activations start on a 16-byte boundary
-these kernels read them in one 16-byte load per two NAX ops, and where they start on an 8-byte
-boundary in one 8-byte load per op.
-Activations that start elsewhere are read from a copy on a 16-byte boundary. The fewer loads take
-less time in a chain of dependent calls, and both forms give the same bits.
+The `pq2_0` and two-block `q4_0` and `q4_1` kernels decode each block in the permuted k order of
+`verify_mma`. The other kernels keep each lane's loads on one row, which measured faster. Spreading
+a `q8_0` block across 8 rows ran 1.04-1.24x slower at every Qwen3.8-27B shape except N 1024. `q4_0`
+and `q4_1` run the eight-block kernel at a K that is a multiple of 256 and the two-block kernel
+elsewhere. The `q4_1` kernels are the `q4_0` kernels with the min folded in as code * d + m, one
+half rounding per weight. Its 20-byte blocks keep each row 4-byte aligned, so the eight-block kernel
+reads whole words with no shift. The K-quant kernels fold each 16- or 32-weight sub-block's scale,
+and its min where the codec has one, into the half weights. Loading a whole K step of activations
+ahead measured faster for `pq2_0` and the two-block `q4_0` kernel, and `nvfp4` loads them the same
+way, while the kernels with larger decoded words load them one NAX op at a time, since loading ahead
+ran `q4_k` 1.6-2x slower. Two consecutive NAX ops read 8 contiguous activations of a row, so where
+the activations start on a 16-byte boundary these kernels read them in one 16-byte load per two NAX
+ops, and where they start on an 8-byte boundary in one 8-byte load per op. Activations that start
+elsewhere are read from a copy on a 16-byte boundary. The fewer loads take less time in a chain of
+dependent calls, and both forms give the same bits.
 
-Split counts for `pq2_0`, `q8_0` and the two-block `q4_0` kernel are the largest divisor of the K
-steps at or under their target, at most 16. The two-block kernel's K walk of 640 per simdgroup
-measured faster even at the vocab head, where the grid is full without splits. For `q6_k` the count
-is the smallest divisor at or above the target, or the largest under it when no divisor up to 16
-reaches it. `q6_k` grids of about 768 simdgroups ran 1.10-1.15x slower than grids of 1280 to 1536,
-and the `q6_k` head ran 1.06-1.07x slower on one split than on two.
+Split counts for `pq2_0`, `q8_0` and the two-block `q4_0` and `q4_1` kernels are the largest divisor
+of the K steps at or under their target, at most 16. The two-block kernel's K walk of 640 per
+simdgroup measured faster even at the vocab head, where the grid is full without splits. For `q6_k`
+the count is the smallest divisor at or above the target, or the largest under it when no divisor up
+to 16 reaches it. `q6_k` grids of about 768 simdgroups ran 1.10-1.15x slower than grids of 1280 to
+1536, and the `q6_k` head ran 1.06-1.07x slower on one split than on two.
 
 The other kernels take their count from a model of GPU waves of 640 simdgroups. A count costs its
 waves times the K steps each simdgroup walks, plus the simdgroups of all its splits divided by the
-codec's partial charge. The charge is 640 for `q4_k`, the eight-block `q4_0` kernel, `iq4_xs` and
-`iq4_nl`, 1280 for `nvfp4`, and 2560 for `q2_k`, `q3_k` and `q5_k`. The cheapest power of two that divides the K steps wins, unless another divisor costs
-at most 3/4 as much, and the count has no cap. N 1024, K 5120 therefore takes 20 splits, which ran
-1.13-1.23x faster than 8 on `q3_k` and `q2_k`. The `q5_k` vocab head takes 4 splits and runs
-1.14-1.32x faster than on 1. Across the Qwen3.8-27B projection and head shapes and N 1024 to 14336
-at K 2048 to 14336, timed on M5 Max with bfloat16 activations, the count ran within 1.03x of the
-best measured count on 164 of 200 cells and 1.13x slower at worst. The sweep ran at M 3 for `q4_0`,
-`q4_k` and `q5_k`, M 4 for `q2_k` and `q3_k`, and M 8. On `nvfp4`, at M 3, 5 and 8 over 14 shapes of
-N 512 to 248320 and K 2048 to 17408, the count runs at 1.01x the best measured count on average and
-1.07x at worst. A target of about 600 simdgroups ran its vocab head on one split, 1.14-1.17x slower
-than on 5 to 10.
+codec's partial charge. The charge is 640 for `q4_k`, the eight-block `q4_0` and `q4_1` kernels,
+`iq4_xs` and `iq4_nl`, 1280 for `nvfp4`, and 2560 for `q2_k`, `q3_k` and `q5_k`. The cheapest power
+of two that divides the K steps wins, unless another divisor costs at most 3/4 as much, and the
+count has no cap. N 1024, K 5120 therefore takes 20 splits, which ran 1.13-1.23x faster than 8 on
+`q3_k` and `q2_k`. The `q5_k` vocab head takes 4 splits and runs 1.14-1.32x faster than on 1. Across
+the Qwen3.8-27B projection and head shapes and N 1024 to 14336 at K 2048 to 14336, timed on M5 Max
+with bfloat16 activations, the count ran within 1.03x of the best measured count on 164 of 200 cells
+and 1.13x slower at worst. The sweep ran at M 3 for `q4_0`, `q4_k` and `q5_k`, M 4 for `q2_k` and
+`q3_k`, and M 8. On `nvfp4`, at M 3, 5 and 8 over 14 shapes of N 512 to 248320 and K 2048 to 17408,
+the count runs at 1.01x the best measured count on average and 1.07x at worst. A target of about 600
+simdgroups ran its vocab head on one split, 1.14-1.17x slower than on 5 to 10.
 
 A K that is not a whole number of K steps declines the route, and the K-quant kernels also need K in
-whole 256-weight superblocks. A two-block `q4_0` K with an odd count of blocks therefore runs on the
-mat-vec kernels at M 3 and 4 and on `verify_mma` from M 5. An `iq4_nl` K that is not a multiple of
-256 declines as well. A `pq2_0`, `q4_0`, `q8_0` or `iq4_nl` weight view that starts 2 bytes past a
-4-byte boundary declines too, and the other routes serve it. For the K-quant codecs and `iq4_xs`
-the table's weight base is the alignment every GPU kernel of the codec needs, so a
-start off it raises, as [the wire-byte contract](integration.md#the-wire-byte-contract) describes.
+whole 256-weight superblocks. A two-block `q4_0` or `q4_1` K with an odd count of blocks therefore
+runs on the mat-vec kernels at M 3 and 4 and on `verify_mma` from M 5. An `iq4_nl` K that is not a
+multiple of 256 declines as well. A `pq2_0`, `q4_0`, `q8_0` or `iq4_nl` weight view that starts 2
+bytes past a 4-byte boundary declines too, and the other routes serve it. For the K-quant codecs,
+`q4_1` and `iq4_xs` the table's weight base is the alignment every GPU kernel of the codec needs, so
+a start off it raises, as [the wire-byte contract](integration.md#the-wire-byte-contract) describes.
 `ptq1_0` has no NAX verify kernel, because its base-3 decode does not hide under the NAX ops and
 measured slower than `verify_mma`.
 
@@ -635,6 +660,7 @@ with every weight in the codec. Float16 activations give the same entries.
 |---|---|---|---|---|---|
 | `pq2_0` | M 3 | `verify_qmv` at M 3 and 4, `verify_mma` from M 5 | 1.09-1.50x | 1.32-1.70x | 38.0 to 24.6 ms |
 | `q4_0` | M 3 | `mv_ext` at M 3 and 4, `verify_mma` from M 5 | 1.03-1.30x | 1.09-1.36x | 43.4 to 33.6 ms |
+| `q4_1` | M 3, the `q4_0` entry | `mv_ext` at M 3 and 4, `verify_mma` from M 5 | not measured | not measured | not measured |
 | `q8_0` | M 6 | per-row qmv or `mv_ext` at M 6, NAX split-K at M 7 and 8 | 1.02-1.35x | 1.10-1.25x | 65 to 56 ms |
 | `q4_k` | M 3 | `mv_ext` at M 3 and 4, NAX split-K from M 5 | 1.03-1.32x | 1.18-1.39x | 45.6 to 34.2 ms |
 | `q5_k` | M 3 | `mv_ext` at M 3 and 4, NAX split-K from M 5 | 1.10-1.17x | 1.30-1.51x | 61.6 to 44.7 ms |
@@ -642,13 +668,13 @@ with every weight in the codec. Float16 activations give the same entries.
 | `q3_k` | M 4, M 3 at N >= 100000 | the fastest other route per call | 1.08-1.24x | 1.18-1.44x | 55.7 to 41.3 ms |
 | `q2_k` | M 4 above N 4096, M 5 up to it, M 3 at N >= 100000 | the fastest other route per call | 1.06-1.23x | 1.07-1.27x | 44.4 to 37.6 ms |
 
-Per-row qmv keeps N 1024 at M 3 to 6 for `q4_0`, M 3 to 5 for `q4_k` and M 3 for `q5_k`. The
-`q8_0` qmv limit for N <= 1024 stops at M 5, since the kernel runs 1.2x faster than qmv there at
+Per-row qmv keeps N 1024 at M 3 to 6 for `q4_0` and `q4_1`, M 3 to 5 for `q4_k` and M 3 for `q5_k`.
+The `q8_0` qmv limit for N <= 1024 stops at M 5, since the kernel runs 1.2x faster than qmv there at
 M 6. `q8_0` enters at M 6 because N 6144, K 5120 runs 1.05x slower at M 5, although the forward is
 faster there. `q6_k` runs up to 1.04x slower than `mv_ext` at M 4 on bfloat16 activations and up to
 1.08x on float16, so it enters at M 5, except on a vocab head, where `mv_ext` slows with N. There
-the kernel runs 1.09-1.16x faster from M 3, and the head boundary is the N >= 100000 that the
-`q6_k` tile route uses.
+the kernel runs 1.09-1.16x faster from M 3, and the head boundary is the N >= 100000 that the `q6_k`
+tile route uses.
 
 `q3_k` and `q2_k` enter at M 4, because at M 3 they ran up to 1.04x and 1.12x slower than the
 fastest other route at N 6144, K 5120 on bfloat16 activations, and `q2_k` up to 1.17x on float16.
@@ -1058,7 +1084,8 @@ load feeds both projections.
 - **`moe_glu_gather_kq`** - fused MoE GLU gather for K-quant expert stacks: `act(gate) * up` in one
   decode-shaped dispatch. Bias-free for most codecs; the fp4 wire codecs (`mxfp4`/`nvfp4`) also take
   per-expert gate/up biases with the `swiglu_clamp` activation (gpt-oss experts).
-- **`moe_glu_gather_shexp_kq`** - the same with the block's shared expert folded in as an extra slot.
+- **`moe_glu_gather_shexp_kq`** - the same with the block's shared expert folded in as extra slots
+  (see [Shared experts wider than a routed expert](#shared-experts-wider-than-a-routed-expert)).
 - **`moe_glu_gather`** - the MLX packed-mxfp4 counterpart.
 - **`moe_router_topk`** - the router in one dispatch: f32 scoring (`softmax`, or `sqrtsoftplus` for
   DeepSeek-V4), top-k with a min-index tie-break, optional bias-ranked selection, optional
@@ -1123,6 +1150,38 @@ gathers took about 25% less time, and 37% less than the 16-weight gathers. That 
 a cheaper lookup. Two other grid sources gave no gain. A 64-bit grid in a device buffer matched the
 constant table. A 2-bit code table, in threadgroup memory or in a device buffer, was about 20%
 slower.
+
+### Shared experts wider than a routed expert
+
+Some models merge several shared experts into one, so the shared expert is k routed experts wide
+(Flint: routed experts of width 512 and one shared expert of width 1024). The fused shared-expert
+gathers run it as k shared slots after the routed slots. k comes from the shapes, and no weight is
+copied, so GGUF views and streamed experts work as they are.
+
+| Op | Shared-expert tensor | Shared slot j reads |
+|---|---|---|
+| `moe_glu_gather_shexp_kq` | gate and up `[k * N, bytes_per_row(K)]` | rows `[j N, (j + 1) N)` |
+| `gather_qmv_mix_kq` | down `[hidden, bytes_per_row(k * N)]` | columns `[j N, (j + 1) N)` of each row |
+
+The GLU returns `[T, R + k, N]`. The mix takes `x` `[T, R + k, N]`, `indices` `[T, R]` and
+`scores` `[T, R + k]`, or `[T, R]`, which gives each shared slot a weight of 1. At k = 1 the
+outputs are the same bits as before.
+
+Each shared slot of the down tensor must start on a whole block of its codec, so N must be a
+multiple of that codec's block size: 32 weights for q4_0, q4_1, q5_0, q5_1, q8_0 and iq4_nl, and
+256 for q2_k to q6_k. A 640-wide expert with a q6_k shared down does not meet this, and the op
+raises an error. Ask first with
+`kq.shexp_glu_combo_has_kernel(codec, gate_codec, up_codec, shared_slots=k)` and
+`kq.shexp_mix_combo_has_kernel(codec, down_codec, shared_slots=k, slot_width=N)`. Both return False
+for a shape the kernels decline. With `shared_slots` above 1, the mix probe needs `slot_width`.
+
+The slot-parallel down runs 64 threads per slot, so 512 threads at Flint's 8 slots (6 routed, 2
+shared). When the pipeline takes fewer threads, the call runs on the loop kernel.
+
+- `KQ_MOE_SHEXP_MULTI=0` declines a shared expert wider than one routed expert: the probes return
+  False for k above 1, and the ops raise an error. Read per call.
+- `KQ_MOE_SP_THREAD_CAP=<n>` lowers the thread limit of the slot-parallel downs (both score-mixed
+  gathers) to n, so a launch of more than n threads runs the loop kernel. Read per call. Test lever.
 
 ## Attention
 

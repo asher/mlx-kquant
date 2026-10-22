@@ -111,6 +111,8 @@ def test_host_split_names_exist():
         "_verify_mma_",
         "_verify_nax_",
         "kquant_q4_0_sb_verify_nax_",
+        "kquant_q4_1_sb_verify_nax_",
+        "kquant_q4_1_verify_mma_",
         "kquant_qmm_splitk_accum_",
     ):
         assert any(frag in n for n in host), frag
@@ -123,7 +125,9 @@ def test_host_names_follow_the_dispatch_levers():
     # The enumerator takes its tiles and verify_nax steps from the dispatch
     # helpers, so the levers that retire a tile or a step retire its names.
     env = {k: v for k, v in os.environ.items() if not k.startswith("KQ_")}
-    env.update(KQ_QMM_SPLITK_BM8="0", KQ_VERIFY_NAX_Q4_0_SB="0")
+    env.update(
+        KQ_QMM_SPLITK_BM8="0", KQ_VERIFY_NAX_Q4_0_SB="0", KQ_VERIFY_NAX_Q4_1_SB="0"
+    )
     code = (
         "import json; from mlx_kquant._ext import _split_kernel_names as f; "
         "print(json.dumps(f()))"
@@ -139,6 +143,9 @@ def test_host_names_follow_the_dispatch_levers():
     host = set(_split_kernel_names())
     assert names < host
     retired = {
-        n for n in host if "_splitk_bm8_" in n or n.startswith("kquant_q4_0_sb_")
+        n
+        for n in host
+        if "_splitk_bm8_" in n or n.startswith(("kquant_q4_0_sb_", "kquant_q4_1_sb_"))
     }
     assert retired and host - names == retired
+    assert any(n.startswith("kquant_q4_1_sb_") for n in retired)
