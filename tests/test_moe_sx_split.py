@@ -8,9 +8,12 @@ forces n pieces at any row count (read per call). Each case checks, for
 each forced count, every kernel form against a float reference, the forms
 against each other bit for bit, the default pick against the count the
 rule gives at its row count, and the slot-parallel launch: one simdgroup
-pair per routed slot and per piece. A forced count past the shared row's
-block count, or past 16 simdgroup pairs, runs as the bound. A shared
-expert in the routed codec keeps one piece.
+pair per routed slot and per piece, wherever the pipeline takes that many
+threads, and the loop kernel elsewhere. A forced count past the shared
+row's block count, or past 16 simdgroup pairs, runs as the bound. A shared
+expert in the routed codec keeps one piece. Under a lower thread limit
+(KQ_MOE_SP_THREAD_CAP) that fits one piece but not two, the default pick
+at one row runs its two pieces on the loop kernel.
 
 Pieces reorder a sum, which a 16-bit output seldom shows, so one case
 makes the order visible: a shared row whose second half repeats its first
@@ -118,20 +121,37 @@ def wires(tmp_path_factory):
     return path
 
 
+# The thread limit of the capped call: 64 threads for each of the 6 routed
+# slots and one shared piece, so two pieces (512 threads) do not fit.
+CAP_THREADS = 64 * (R + 1)
+
+
 def _calls():
-    """(key, prefix, down codec, shared codec, row count, form, count) for
-    every call the child makes; form "" with count None is the default."""
+    """(key, prefix, down codec, shared codec, row count, form, count, env)
+    for every call the child makes; form "" with count None is the default,
+    and env holds the call's other levers."""
     out = []
     for name, cd, sd, _k, _n, forced, _b in CASES:
         for t in ROWS:
-            out.append((f"{name}/default/{t}", name, cd, sd, t, "", None))
+            out.append((f"{name}/default/{t}", name, cd, sd, t, "", None, {}))
             for f in FORMS:
                 for sp in (1, *forced):
-                    out.append((f"{name}/{f}{sp}/{t}", name, cd, sd, t, f, sp))
+                    out.append((f"{name}/{f}{sp}/{t}", name, cd, sd, t, f, sp, {}))
+    cap = {"KQ_MOE_SP_THREAD_CAP": str(CAP_THREADS)}
+    out.append(("iq2_s_q8_0/capped/1", "iq2_s_q8_0", "iq2_s", "q8_0", 1, "", None, cap))
     for name, cd, sd, _n in CANCEL:
         for t in ROWS[:2]:
             out.append(
-                (f"cancel/{name}/default/{t}", f"cancel/{name}", cd, sd, t, "", None)
+                (
+                    f"cancel/{name}/default/{t}",
+                    f"cancel/{name}",
+                    cd,
+                    sd,
+                    t,
+                    "",
+                    None,
+                    {},
+                )
             )
             for f in FORMS:
                 for sp in (1, 2):
@@ -144,6 +164,7 @@ def _calls():
                             t,
                             f,
                             sp,
+                            {},
                         )
                     )
     return out
@@ -163,11 +184,13 @@ def child(wire_path, out_path):
 
     z = np.load(wire_path)
     res = {}
-    for key, pre, cd, sd, t, form, sp in _calls():
+    for key, pre, cd, sd, t, form, sp, env in _calls():
         os.environ["KQ_MOE_MIX_FORM"] = form
         os.environ.pop("KQ_MOE_SX_SPLIT", None)
+        os.environ.pop("KQ_MOE_SP_THREAD_CAP", None)
         if sp is not None:
             os.environ["KQ_MOE_SX_SPLIT"] = str(sp)
+        os.environ.update(env)
         sys.stderr.write(f"== {key}\n")
         sys.stderr.flush()
         y = kq.gather_qmv_mix_kq(
@@ -193,14 +216,20 @@ m.child(sys.argv[2], sys.argv[3])
 
 
 def _launches(log):
-    """Threadgroup height of the slot-parallel launch per call key."""
-    out, key = {}, None
+    """Per call key, the slot-parallel kernel it launched and the
+    threadgroup height; and the thread limit the log gives for each kernel
+    (KQ_MOE_NX_LOG names a kernel once, at its first launch)."""
+    out, caps, key = {}, {}, None
     for ln in log.splitlines():
+        m = re.match(r"\[kq_moe\] (\S+) \(pipeline max (\d+)\)", ln)
         if ln.startswith("== "):
             key = ln[3:]
+        elif m:
+            caps[m.group(1)] = int(m.group(2))
         elif key is not None and "_gather_qmv_mix_sp_" in ln and "tg=" in ln:
-            out[key] = int(re.search(r"tg=\d+,(\d+),", ln).group(1))
-    return out
+            height = int(re.search(r"tg=\d+,(\d+),", ln).group(1))
+            out[key] = (ln.split()[2], height)
+    return out, caps
 
 
 @pytest.fixture(scope="module", params=["c32", "c32off"])
@@ -276,13 +305,17 @@ def test_sx_split_forms_bit_identical(runs):
 def test_sx_split_slot_parallel_launch(runs):
     """The slot-parallel launch holds one simdgroup pair per routed slot and
     per piece of each shared slot, at the bound past it, and one piece for
-    a shared expert in the routed codec. A pipeline that takes fewer than
-    64 threads per pair hands the call to the loop kernel, which only a
-    launch of 512 threads or more may meet."""
+    a shared expert in the routed codec. Every count whose pairs fit the
+    pipeline's thread limit runs the slot-parallel kernel, so a clamped
+    count shows its bound, and a count past the limit runs the loop kernel.
+    The limit is the one the log gives for the kernel the one-piece call
+    launched; when that call ran the loop kernel, no count fits."""
     _, log = runs
-    tg = _launches(log)
+    tg, caps = _launches(log)
     for name, _cd, _sd, k, _n, forced, bound in CASES:
         for t in ROWS:
+            first = tg.get(f"{name}/sp1/{t}")
+            cap = caps[first[0]] if first else 64 * (R + k) - 1
             arms = (
                 ("sp1", 1),
                 *((f"sp{f}", b) for f, b in zip(forced, bound, strict=True)),
@@ -290,10 +323,23 @@ def test_sx_split_slot_parallel_launch(runs):
             for arm, b in (*arms, ("default", _rule(name, t))):
                 pairs = R + k * b
                 key = f"{name}/{arm}/{t}"
-                if key in tg:
-                    assert tg[key] == 2 * pairs, (key, tg[key], pairs)
+                if 64 * pairs <= cap:
+                    assert key in tg, (key, pairs, cap)
+                    assert tg[key][1] == 2 * pairs, (key, tg[key], pairs)
                 else:
-                    assert 64 * pairs >= 512, (key, pairs)
+                    assert key not in tg, (key, pairs, cap)
+
+
+def test_sx_split_thread_cap_takes_loop(runs):
+    """Under a thread limit that fits one shared piece but not two, the
+    default call at one row launches no slot-parallel kernel, and the loop
+    kernel gives the bytes of two forced pieces."""
+    outs, log = runs
+    tg, _ = _launches(log)
+    assert "iq2_s_q8_0/capped/1" not in tg, tg.get("iq2_s_q8_0/capped/1")
+    assert "iq2_s_q8_0/default/1" in tg, sorted(tg)
+    a, b = outs["iq2_s_q8_0/capped/1"], outs["iq2_s_q8_0/loop2/1"]
+    assert np.array_equal(a, b), np.abs(a - b).max()
 
 
 def test_sx_split_order_visible(runs):
