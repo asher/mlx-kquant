@@ -30,7 +30,8 @@ from .codec_geometry import CODEC_GEOMETRY
 # ---------------------------------------------------------------------------
 
 
-class TensorRole(str, Enum):
+# A str Enum, not StrEnum: StrEnum changes what str() of a member returns.
+class TensorRole(str, Enum):  # noqa: UP042
     LINEAR_ATTN = "linear_attn"
     ATTENTION_OUTPUT = "attention_output"
     ATTENTION_QKVO = "attention_qkvo"
