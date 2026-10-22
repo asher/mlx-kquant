@@ -6,7 +6,17 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `KQ_VERIFY_NAX_Q4_1_SB=0` keeps `q4_1` on its two-block `verify_nax` kernel,
+  as `KQ_VERIFY_NAX_Q4_0_SB` does for `q4_0`.
+
 ### Changed
+- `q4_1` `quantized_matmul` at 4 to 8 activation rows takes less time on GPUs
+  without NAX, about 1.1-1.2x faster on M3 Max: it now runs the
+  register-resident `verify_mma` kernel that `q4_0` runs.
+- On NAX GPUs (M5), `q4_1` `quantized_matmul` and `quantized_matmul_multi` at 2
+  to 8 activation rows run the `verify_nax` kernels and follow the `q4_0`
+  routing rows. These kernels and rows are not yet measured on `q4_1`.
 - Source builds compile the Metal kernels in parallel, so `pip install` from
   source and rebuilds after a kernel edit finish sooner.
 
