@@ -74,6 +74,22 @@ inline int kq_moe_nx_env() {
   return 0;
 }
 
+// The KQ_MOE_NX setting that forces a width, or nullptr. A kernel family
+// without the forced width (the q5_k shared-expert kernels stop at nx 16)
+// then raises naming the setting, not a bare load error (kq_get_kernel).
+inline const char* kq_moe_nx_setting() {
+  switch (kq_moe_nx_env()) {
+    case 8:
+      return "KQ_MOE_NX=8";
+    case 16:
+      return "KQ_MOE_NX=16";
+    case 32:
+      return "KQ_MOE_NX=32";
+    default:
+      return nullptr;
+  }
+}
+
 inline int kq_moe_pick_nx(int64_t rows, int K, bool wide_ok) {
   if (const int v = kq_moe_nx_env()) {
     return v;
@@ -277,7 +293,7 @@ inline void kq_gather_qmv_pair_gpu(
     int nx,
     int sg,
     int NS) {
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel(d, kname, kq_moe_nx_setting());
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -651,7 +667,7 @@ void KQuantMoEGLUKQ::eval_gpu(
       (biased ? "bias_" : "") + (use_half ? "h_" : "") + (dd ? "dd_" : "") +
       act_ + (c32 ? "_c32" : "") + kq_nx_suffix(nx) + "_" +
       kq_type_string(x.dtype());
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel(d, kname, kq_moe_nx_setting());
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -728,7 +744,7 @@ void KQuantGatherQMVKQ::eval_gpu(
   std::string kname = "kq_" + stem + "_gather_qmv" + (biased ? "_bias" : "") +
       (use_half ? "_h" : "") + (c32 ? "_c32" : "") +
       (fine ? "_fine" : kq_nx_suffix(nx)) + "_" + kq_type_string(x.dtype());
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel(d, kname, fine ? nullptr : kq_moe_nx_setting());
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -812,7 +828,7 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
     const std::string kname = "kq_" + kquant_type_ + "_sx2_" + shexp_type_ +
         "_" + shexp_up_type_ + "_moe_glu_gather_shexp_silu" + kq_nx_suffix(nx) +
         "_" + kq_type_string(x.dtype());
-    auto kernel = kq_get_kernel(d, kname);
+    auto kernel = kq_get_kernel(d, kname, kq_moe_nx_setting());
     kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
     auto& ce = mx::metal::get_command_encoder(s);
     ce.set_compute_pipeline_state(kernel);
@@ -857,7 +873,7 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   std::string kname = "kq_" + stem + "_moe_glu_gather_shexp_" +
       (use_half ? "h_" : "") + (dd ? "dd_" : "") + act + (c32 ? "_c32" : "") +
       kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel(d, kname, kq_moe_nx_setting());
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -1005,7 +1021,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   std::string kname = "kq_" + stem + "_gather_qmv_mix" +
       (use_half ? "_h" : "") + (c32 ? "_c32" : "") +
       (fine ? "_fine" : kq_nx_suffix(nx)) + "_" + kq_type_string(x.dtype());
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel(d, kname, fine ? nullptr : kq_moe_nx_setting());
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -1111,14 +1127,14 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
           kq_type_string(x.dtype());
     };
     std::string kname = ns_name(sp);
-    auto kernel = kq_get_kernel(d, kname);
+    auto kernel = kq_get_kernel(d, kname, kq_moe_nx_setting());
     // The slot-parallel kernel gives each slot its own simdgroup pair, so
     // its 64 * S threads cannot be halved the way the sg kernels can. When
     // the pipeline will not take that many, drop to the general kernel.
     if (sp && 64 * S > kq_moe_sp_cap(kernel)) {
       sp = false;
       kname = ns_name(sp);
-      kernel = kq_get_kernel(d, kname);
+      kernel = kq_get_kernel(d, kname, kq_moe_nx_setting());
     }
     kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
     auto& ce = mx::metal::get_command_encoder(s);

@@ -17,7 +17,7 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `KQ_MOE_SHEXP_MULTI=0` declines a wider shared expert.
 
 ### Changed
-- The `q2_k`, `q4_k` and `q5_k` MoE gathers and `mv_ext` mat-vecs take 5-18% less
+- The `q2_k`, `q4_k` and `q5_k` MoE gathers and `mv_ext` mat-vecs take 2-18% less
   time on M5 Max, with the same output. `KQ_KQUANT_WORD=0` restores the old decode.
 - `q4_1` `quantized_matmul` at 4 to 8 activation rows takes less time on GPUs
   without NAX, about 1.1-1.2x faster on M3 Max: it now runs the
@@ -42,6 +42,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Removed
 - Python 3.10 support. On Python 3.10, pip installs 0.5.4, the last release
   that supports it.
+
+### Fixed
+- `KQ_MOE_NX=32` on the shared-expert gathers with a `q5_k` shared expert
+  raises an error that names the setting, in place of a bare kernel load error.
 
 ## [0.5.4]
 

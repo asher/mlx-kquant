@@ -7,12 +7,11 @@
 
 // Chunk decode of the q2_k, q4_k and q5_k Ext traits (the
 // kq_q*_k_deq_chunk16 helpers): true forms four codes per 32-bit word,
-// false keeps the per-byte loop. Both give the same weights. The host
-// specializes every pipeline whose kernel name carries one of these
-// codecs with it (kq_get_kernel).
-constant bool kq_kquant_word_fc [[function_constant(370)]];
-constant bool kq_kquant_word =
-    !is_function_constant_defined(kq_kquant_word_fc) || kq_kquant_word_fc;
+// false keeps the per-byte loop. Both give the same weights. The constant
+// has no default, so a function that inlines the decode builds only with a
+// value: the host reads which functions declare it and specializes those
+// (kq_get_kernel).
+constant bool kq_kquant_word [[function_constant(370)]];
 
 MLX_MTL_CONST int KQ_Q4_K_SUPERBLOCK = 256;
 MLX_MTL_CONST int KQ_Q4_K_BLOCK_BYTES = 144;

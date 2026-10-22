@@ -9,8 +9,11 @@ iq2_xxs experts, both on the 32-weight kernels (the M5 default) and with
 KQ_MOE_C32=0. The weight bytes are random, so every nibble, high bit and
 scale code occurs. Each arm runs in a subprocess, since the lever is read
 once per process, and with the lever off KQ_QMM_LOG must show that every
-kernel whose name carries one of these codecs was fetched with the byte
-loop. q3_k keeps the per-byte loop, so its kernels are not specialized.
+kernel that inlines the chunk decode was fetched with the byte loop, and
+no other: the q4_k per-row mat-vec (KQ_QMM_ROUTE=qmv) has its own decode,
+and q3_k keeps the per-byte loop, so neither is specialized. Under
+KQ_TUNE_LIVE=1 a flip of the lever after the first fetch switches the
+pipeline, and a flip back returns to the word form.
 """
 
 import os
@@ -72,6 +75,11 @@ for c in codecs:
         outs[f"{c}/mv_ext{m}"] = kq.quantized_matmul(
             act((m, K)), w2, scales, c, transpose=True)
         mx.eval(outs[f"{c}/mv_ext{m}"])
+    if c == "q4_k":
+        os.environ["KQ_QMM_ROUTE"] = "qmv"
+        outs[f"{c}/qmv4"] = kq.quantized_matmul(
+            act((4, K)), w2, scales, c, transpose=True)
+        mx.eval(outs[f"{c}/qmv4"])
     del os.environ["KQ_QMM_ROUTE"]
     gw, uw = wire(c, (E, N)), wire(c, (E, N))
     for T, R in ((1, 6), (3, 6)):
@@ -136,12 +144,80 @@ def test_word_decode_bit_identical(tmp_path, c32):
         assert any(c in n and "mv_ext" in n for n in names), (c, sorted(names))
     assert any("_sx_q5_k" in n for n in names), sorted(names)
     assert keys and all(k.endswith("_kw0") for k in keys), sorted(keys)
-    missing = [
-        n
-        for n in names
-        if any(c in n for c in CODECS) and not any(k.startswith(n) for k in keys)
-    ]
+    ours = [n for n in names if any(c in n for c in CODECS)]
+    decode = [n for n in ours if "mv_ext" in n or "gather" in n]
+    missing = [n for n in decode if not any(k.startswith(n) for k in keys)]
     assert not missing, f"dispatched without a byte-loop fetch: {missing}"
+    plain = [n for n in ours if n not in decode]
+    assert any("q4_k_qmv" in n for n in plain), sorted(names)
+    extra = [k for k in keys if not any(k.startswith(n) for n in decode)]
+    assert not extra, f"fetched with the byte loop, without the decode: {extra}"
     assert any("q3_k" in n and "mv_ext" in n for n in names), sorted(names)
     q3 = [k for k in keys if "q3_k" in k and not any(c in k for c in CODECS)]
     assert not q3, f"q3_k fetched with the decode constant: {q3}"
+
+
+_FLIP_SNIPPET = r"""
+import os
+import sys
+import numpy as np
+import mlx.core as mx
+import mlx_kquant as kq
+from mlx_kquant.codec_geometry import CODEC_GEOMETRY
+
+out_path = sys.argv[1]
+rng = np.random.default_rng(11)
+E, N, K, T, R = 8, 64, 1024, 1, 6
+def wire(c, lead):
+    bpb, wpb = CODEC_GEOMETRY[c][2:]
+    nb = int(np.prod(lead)) * (K // wpb)
+    w = rng.integers(0, 256, size=(nb, bpb), dtype=np.uint8)
+    w[:, 0:2] = rng.uniform(0.004, 0.01, (nb, 1)).astype(np.float16).view(np.uint8)
+    w[:, 2:4] = rng.uniform(0.001, 0.004, (nb, 1)).astype(np.float16).view(np.uint8)
+    return mx.array(w.reshape(*lead, (K // wpb) * bpb))
+w2, gw, uw = wire("q5_k", (N,)), wire("q5_k", (E, N)), wire("q5_k", (E, N))
+x4 = mx.array((rng.standard_normal((4, K)) * 0.05).astype(np.float16))
+x1 = mx.array((rng.standard_normal((T, K)) * 0.05).astype(np.float16))
+inds = mx.array(rng.integers(0, E, size=(T, R)).astype(np.uint32))
+scales = mx.zeros((1,), dtype=mx.uint8)
+outs = {}
+for arm, word in (("word", "1"), ("byte", "0"), ("back", "1")):
+    os.environ["KQ_KQUANT_WORD"] = word
+    sys.stderr.write(f"== {arm}\n")
+    sys.stderr.flush()
+    os.environ["KQ_QMM_ROUTE"] = "mv_ext"
+    outs[f"{arm}/mv_ext"] = kq.quantized_matmul(x4, w2, scales, "q5_k", transpose=True)
+    mx.eval(outs[f"{arm}/mv_ext"])
+    del os.environ["KQ_QMM_ROUTE"]
+    outs[f"{arm}/glu"] = kq.moe_glu_gather_kq(x1, gw, uw, "q5_k", inds)
+    mx.eval(outs[f"{arm}/glu"])
+    sys.stderr.flush()
+np.savez(out_path, **{k: np.array(v.astype(mx.float32)) for k, v in outs.items()})
+"""
+
+
+def test_word_lever_flip_live(tmp_path):
+    """Under KQ_TUNE_LIVE=1 the lever picks the pipeline on every fetch: a
+    flip to the byte loop after the first fetch dispatches the byte form,
+    and a flip back the word form, with the same output each time."""
+    f = tmp_path / "flip.npz"
+    base = {k: v for k, v in os.environ.items() if not k.startswith("KQ_")}
+    r = subprocess.run(
+        [sys.executable, "-c", _FLIP_SNIPPET, str(f)],
+        capture_output=True,
+        text=True,
+        env={**base, "KQ_QMM_LOG": "1", "KQ_TUNE_LIVE": "1"},
+    )
+    assert r.returncode == 0, f"flip exited {r.returncode}\n{r.stderr[-4000:]}"
+    arms = dict(re.findall(r"^== (\w+)\n(.*?)(?=^== |\Z)", r.stderr, re.M | re.S))
+    assert sorted(arms) == ["back", "byte", "word"], r.stderr[-4000:]
+    byte = re.findall(r"^\[kq decode\] byte (\S+)", arms["byte"], re.M)
+    assert any("q5_k_mv_ext" in k for k in byte), arms["byte"]
+    assert any("q5_k_moe_glu_gather" in k for k in byte), arms["byte"]
+    assert "[kq decode]" not in arms["word"] + arms["back"], r.stderr[-4000:]
+    out = np.load(f)
+    for op in ("mv_ext", "glu"):
+        w = out[f"word/{op}"]
+        assert np.isfinite(w).all() and np.abs(w).max() > 0, op
+        assert np.array_equal(w, out[f"byte/{op}"]), op
+        assert np.array_equal(w, out[f"back/{op}"]), op

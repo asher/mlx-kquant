@@ -782,3 +782,65 @@ def test_c32_accuracy(codec, dtype):
         pytest.skip(f"{codec} reference unavailable")
     for name, rel, ok in res:
         assert ok, (name, rel)
+
+
+_NX_FORCED_SNIPPET = r"""
+import numpy as np
+import mlx.core as mx
+import mlx_kquant as kq
+from mlx_kquant.codec_geometry import CODEC_GEOMETRY
+
+rng = np.random.default_rng(5)
+E, N, K, R = 8, 64, 512, 6
+def wire(c, lead):
+    bpb, wpb = CODEC_GEOMETRY[c][2:]
+    size = (*lead, N, (K // wpb) * bpb)
+    return mx.array(rng.integers(0, 256, size=size, dtype=np.uint8))
+def act(shape):
+    return mx.array((rng.standard_normal(shape) * 0.05).astype(np.float16))
+rg, ru = wire("iq2_xxs", (E,)), wire("iq2_xxs", (E,))
+for sc in ("q5_k", "q8_0"):
+    sg, su = wire(sc, ()), wire(sc, ())
+    for T in (1, 4):
+        inds = mx.array(rng.integers(0, E, size=(T, R)).astype(np.uint32))
+        ops = {
+            "glu": lambda: kq.moe_glu_gather_shexp_kq(
+                act((T, K)), rg, ru, sg, su, "iq2_xxs", inds,
+                shexp_kquant_type=sc),
+            "mix": lambda: kq.gather_qmv_mix_kq(
+                act((T, R + 1, K)), rg, sg, "iq2_xxs", inds,
+                mx.ones((T, R + 1)), shexp_kquant_type=sc),
+        }
+        for op, f in ops.items():
+            try:
+                mx.eval(f())
+                print("OK", sc, T, op)
+            except ValueError as e:
+                print("ERR", sc, T, op, str(e).replace(chr(10), " "))
+"""
+
+
+@pytest.mark.parametrize("nx", ["16", "32"])
+def test_forced_nx_names_setting(nx):
+    """The shared-expert gathers with a q5_k shared expert stop at 16
+    K-lanes per row. A forced KQ_MOE_NX=32 on them raises an error that
+    names the setting and the kernel; 16 runs, and so does 32 on a q8_0
+    shared expert, at one row (loop form) and four (dedupe form)."""
+    r = _run_child(
+        [sys.executable, "-c", _NX_FORCED_SNIPPET],
+        {"KQ_MOE_NX": nx, "KQ_MOE_NX_LOG": "1"},
+        f"forced nx {nx}",
+    )
+    lines = [
+        ln.split(" ", 4) for ln in r.stdout.splitlines() if ln[:3] in ("OK ", "ERR")
+    ]
+    assert len(lines) == 8, r.stdout
+    head = "[mlx_kquant] KQ_MOE_NX=32 selects kernel kq_iq2_xxs_sx_q5_k_"
+    tail = "_nx32_float16_t, which is not instantiated."
+    for status, sc, T, op, *msg in lines:
+        if nx == "32" and sc == "q5_k":
+            assert status == "ERR", (sc, T, op)
+            assert msg[0].startswith(head) and msg[0].endswith(tail), msg
+        else:
+            assert status == "OK", (sc, T, op, msg)
+            assert f"_sx_{sc}_" in r.stderr and (nx == "16") == ("_nx16_" in r.stderr)

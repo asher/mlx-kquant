@@ -301,7 +301,7 @@ Tuning levers (defaults are right for normal use):
   kernel's vector loads, logs one `[kq align] <op> <operand> xin=<n>` line, where `n` is the
   operand's byte offset modulo that boundary. A call that takes the dequantize route logs one
   `[kq dequant] <codec> M=<rows> N=<n> K=<k>` line when the op builds its graph. Under
-  `KQ_KQUANT_WORD=0`, each fetch of a kernel on the per-byte k-quant decode logs one
+  `KQ_KQUANT_WORD=0`, each fetch of a kernel that inlines the k-quant chunk decode logs one
   `[kq decode] byte <key>` line, where the pipeline key ends in `_kw0`. Unset (off) by default.
   Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_SPLITK_F32` - partial dtype of the split-K routes (`splitk`, `nax_splitk`, the
@@ -1150,7 +1150,8 @@ keep the 16-weight step. Outputs differ from the 16-weight kernels only in summa
 architecture string. `KQ_MOE_C32=0` restores the 16-weight kernels, and `KQ_MOE_C32=1` runs the
 32-weight kernels for every grid codec, on any GPU and at wider rows where the dedupe kernels do not
 apply. `KQ_MOE_NX=8` or `16` forces a width, and a forced `KQ_MOE_NX=32` keeps the 16-weight
-kernels.
+kernels. The shared-expert gathers with a `q5_k` shared expert stop at 16, and `KQ_MOE_NX=32` on
+them raises an error that names the setting.
 
 The one-row `quantized_matmul` of a grid codec runs the same row step (`kq_<codec>_qmv_c32`), on
 M5 and later GPUs by default, at the GLU width. `KQ_QMV_C32` controls it (see the mat-vec levers).
@@ -1196,7 +1197,11 @@ the fifth bits, and those of `q2_k` in four 4-byte loads. One shift and one AND 
 codes down to the low bits of their bytes (`q5_k` ORs in the fifth bits the same way), and one
 vector convert turns them into floats. The per-byte loop masks each code in place and divides the
 scale by the matching power of two, so both forms compute the same product and the outputs are bit
-for bit the same.
+for bit the same. The form is a function constant with no default, which only the kernels that
+inline this decode declare. The host reads that from each library function once and specializes
+those kernels alone, so the lever changes no other pipeline. Code that vendors the kernel headers
+and builds its own pipelines must give function constant 370 a value for every function that
+declares it: true for the word form, false for the per-byte loop.
 
 On M5 Max at 0.87-1.27 GHz, back to back over 24 rounds, the word form took less time than the
 per-byte loop on every path, by these medians:
@@ -1212,8 +1217,8 @@ The gathers ran at Qwen3-30B-A3B shapes (hidden 2048, expert width 768, top 8 of
 `q5_k` shared expert took 6.3% less time, and the score-mixed down took 9.9% less over `iq3_xxs`
 experts with a `q5_k` shared expert and 2.2% less over `q2_k` experts with a `q8_0` one.
 
-`q3_k` keeps the per-byte loop. Its 110-byte blocks sit 2 bytes apart, so each word takes two
-2-byte loads, and in that form the gate/up gather took 4.1% longer, in all 24 rounds.
+`q3_k` keeps the per-byte loop. Its 110-byte blocks are only 2-byte aligned, so each word takes
+two 2-byte loads, and in that form the gate/up gather took 4.1% longer, in all 24 rounds.
 
 - `KQ_KQUANT_WORD=0` restores the per-byte loop, with the same output. Read once per process unless
   `KQ_TUNE_LIVE=1`.
