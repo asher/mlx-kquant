@@ -823,16 +823,13 @@ METAL_FUNC float kq_ext_dot32(
 // codecs). With C32 a lane steps one 32-weight group at a time through
 // KqExtC32 (the "_c32" kernels).
 template <typename T, typename Codec, int NX, bool C32 = false>
-METAL_FUNC float kq_ext_row_partial(
-    const device uint8_t* w,
+METAL_FUNC float kq_ext_span_partial(
+    const device uint8_t* w_row,
     const device T* x,
-    int64_t row,
     int K,
     short tx,
     const threadgroup uint8_t* luts) {
   constexpr short chpb = Codec::superblock / 16;
-  const int nb = K / Codec::superblock;
-  const device uint8_t* w_row = w + row * (int64_t)nb * Codec::block_bytes;
   float acc = 0.0f;
   if (C32 && KqExtC32<Codec>::ok) {
     constexpr short gpb = Codec::superblock / 32;
@@ -862,6 +859,43 @@ METAL_FUNC float kq_ext_row_partial(
          dot(lw[3], float4(*(const device vec<T, 4>*)(xp + 12))));
   }
   return acc;
+}
+
+// kq_ext_span_partial over weight row `row`, K weights wide.
+template <typename T, typename Codec, int NX, bool C32 = false>
+METAL_FUNC float kq_ext_row_partial(
+    const device uint8_t* w,
+    const device T* x,
+    int64_t row,
+    int K,
+    short tx,
+    const threadgroup uint8_t* luts) {
+  const int nb = K / Codec::superblock;
+  return kq_ext_span_partial<T, Codec, NX, C32>(
+      w + row * (int64_t)nb * Codec::block_bytes, x, K, tx, luts);
+}
+
+// Piece q of SP of weight row `row`: its blocks [q nb / SP, (q + 1) nb / SP).
+// At SP 1 the one piece is kq_ext_row_partial.
+template <typename T, typename Codec, int NX, bool C32 = false>
+METAL_FUNC float kq_ext_piece_partial(
+    const device uint8_t* w,
+    const device T* x,
+    int64_t row,
+    int K,
+    int q,
+    int SP,
+    short tx,
+    const threadgroup uint8_t* luts) {
+  const int nb = K / Codec::superblock;
+  const int b0 = q * nb / SP;
+  const int b1 = (q + 1) * nb / SP;
+  return kq_ext_span_partial<T, Codec, NX, C32>(
+      w + (row * nb + b0) * Codec::block_bytes,
+      x + b0 * Codec::superblock,
+      (b1 - b0) * Codec::superblock,
+      tx,
+      luts);
 }
 
 // GLU pair variant: gate and up rows share each activation chunk load.
@@ -1378,6 +1412,7 @@ template <
     const constant int& S [[buffer(8)]],
     const constant int& SC [[buffer(9)]],
     const constant int& NS [[buffer(10)]],
+    const constant int& SP [[buffer(11)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -1400,12 +1435,18 @@ template <
   }
   // Shared slot j reads columns [j K, (j + 1) K) of each shared row, the
   // K-wide row out_row * NS + j. SC == S - NS: an implicit weight of 1.
+  // Each shared row runs in SP pieces, summed in piece order as the
+  // slot-parallel kernel sums them.
   for (int slot = n_route; slot < S; slot++) {
     const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
-    result +=
-        (SC == S ? scores[tid.z * SC + slot] : 1.0f) *
-        kq_ext_row_partial<T, SCodec, NX, C32>(
-            sw, xs, (int64_t)out_row * NS + (slot - n_route), K, tx, kq_sluts);
+    const int64_t srow = (int64_t)out_row * NS + (slot - n_route);
+    float sp = kq_ext_piece_partial<T, SCodec, NX, C32>(
+        sw, xs, srow, K, 0, SP, tx, kq_sluts);
+    for (int q = 1; q < SP; q++) {
+      sp += kq_ext_piece_partial<T, SCodec, NX, C32>(
+          sw, xs, srow, K, q, SP, tx, kq_sluts);
+    }
+    result += (SC == S ? scores[tid.z * SC + slot] : 1.0f) * sp;
   }
   result = kq_ext_reduce<NX>(result);
   if (tx == 0) {
@@ -1413,12 +1454,12 @@ template <
   }
 }
 
-// Slot-parallel kq_ext_gather_qmv_mix: each simdgroup pair owns one slot,
-// the shared expert's NS slots included, as in
+// Slot-parallel kq_ext_gather_qmv_mix: each simdgroup pair owns one routed
+// slot or one of the SP pieces of a shared slot, as in
 // kq_ext_gather_qmv_mix_ns_sp. The slot-0 pair replays the loop kernel's
-// score chain, so outputs are bit-identical to it. Dispatch: group
-// (32, 2 * S, 1), grid (N / (2 * RPS), 1, T); host gates
-// S <= KQ_MOE_SP_MAX_S.
+// score chain and piece sums, so outputs are bit-identical to it.
+// Dispatch: group (32, 2 * (S - NS + NS * SP), 1), grid (N / (2 * RPS), 1,
+// T); host gates S - NS + NS * SP <= KQ_MOE_SP_MAX_S.
 template <
     typename T,
     typename Codec,
@@ -1437,6 +1478,7 @@ template <
     const constant int& S [[buffer(8)]],
     const constant int& SC [[buffer(9)]],
     const constant int& NS [[buffer(10)]],
+    const constant int& SP [[buffer(11)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -1444,7 +1486,7 @@ template <
   constexpr int RPS = 32 / NX;
   const short tx = short(simd_lid % NX);
   const short ty = short(simd_lid / NX);
-  const int slot = int(simd_gid >> 1);
+  const int pair = int(simd_gid >> 1);
   const short lrow = short((simd_gid & 1) * RPS) + ty;
   const int out_row = tid.x * (2 * RPS) + lrow;
 
@@ -1454,25 +1496,39 @@ template <
   threadgroup float parts[2 * RPS][NX][KQ_MOE_SP_MAX_S];
 
   const int n_route = S - NS;
-  const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
-  if (slot < n_route) {
-    const int expert = int(indices[tid.z * n_route + slot]);
-    parts[lrow][tx][slot] = kq_ext_row_partial<T, Codec, NX, C32>(
+  if (pair < n_route) {
+    const int expert = int(indices[tid.z * n_route + pair]);
+    const device T* xs = h + ((int64_t)tid.z * S + pair) * K;
+    parts[lrow][tx][pair] = kq_ext_row_partial<T, Codec, NX, C32>(
         w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
   } else {
-    parts[lrow][tx][slot] = kq_ext_row_partial<T, SCodec, NX, C32>(
-        sw, xs, (int64_t)out_row * NS + (slot - n_route), K, tx, kq_sluts);
+    const int j = (pair - n_route) / SP;
+    const device T* xs = h + ((int64_t)tid.z * S + n_route + j) * K;
+    parts[lrow][tx][pair] = kq_ext_piece_partial<T, SCodec, NX, C32>(
+        sw,
+        xs,
+        (int64_t)out_row * NS + j,
+        K,
+        pair - n_route - j * SP,
+        SP,
+        tx,
+        kq_sluts);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  if (slot == 0) {
+  if (pair == 0) {
     float result = 0.0f;
     for (int s = 0; s < n_route; s++) {
       result += scores[tid.z * SC + s] * parts[lrow][tx][s];
     }
     // SC == S - NS: the shared slots' weight is an implicit 1
-    for (int s = n_route; s < S; s++) {
-      result += (SC == S ? scores[tid.z * SC + s] : 1.0f) * parts[lrow][tx][s];
+    for (int j = 0; j < NS; j++) {
+      const int p0 = n_route + j * SP;
+      float sp = parts[lrow][tx][p0];
+      for (int q = 1; q < SP; q++) {
+        sp += parts[lrow][tx][p0 + q];
+      }
+      result += (SC == S ? scores[tid.z * SC + n_route + j] : 1.0f) * sp;
     }
     result = kq_ext_reduce<NX>(result);
     if (tx == 0) {
@@ -1540,17 +1596,14 @@ kq_dd_partner(const device uint32_t* indices, int p, int P, uint32_t e) {
 }
 
 template <typename T, typename Codec, int NX>
-METAL_FUNC float2 kq_ext_row_partial_pair(
-    const device uint8_t* w,
+METAL_FUNC float2 kq_ext_span_partial_pair(
+    const device uint8_t* w_row,
     const device T* x0,
     const device T* x1,
-    int64_t row,
     int K,
     short tx,
     const threadgroup uint8_t* luts) {
   constexpr short chpb = Codec::superblock / 16;
-  const int nb = K / Codec::superblock;
-  const device uint8_t* w_row = w + row * (int64_t)nb * Codec::block_bytes;
   float2 acc = float2(0.0f);
   for (int ich = tx; 16 * ich < K; ich += NX) {
     const device uint8_t* block =
@@ -1572,6 +1625,44 @@ METAL_FUNC float2 kq_ext_row_partial_pair(
          dot(lw[3], float4(*(const device vec<T, 4>*)(xp + 12))));
   }
   return acc;
+}
+
+template <typename T, typename Codec, int NX>
+METAL_FUNC float2 kq_ext_row_partial_pair(
+    const device uint8_t* w,
+    const device T* x0,
+    const device T* x1,
+    int64_t row,
+    int K,
+    short tx,
+    const threadgroup uint8_t* luts) {
+  const int nb = K / Codec::superblock;
+  return kq_ext_span_partial_pair<T, Codec, NX>(
+      w + row * (int64_t)nb * Codec::block_bytes, x0, x1, K, tx, luts);
+}
+
+// kq_ext_piece_partial for two activation rows.
+template <typename T, typename Codec, int NX>
+METAL_FUNC float2 kq_ext_piece_partial_pair(
+    const device uint8_t* w,
+    const device T* x0,
+    const device T* x1,
+    int64_t row,
+    int K,
+    int q,
+    int SP,
+    short tx,
+    const threadgroup uint8_t* luts) {
+  const int nb = K / Codec::superblock;
+  const int b0 = q * nb / SP;
+  const int b1 = (q + 1) * nb / SP;
+  return kq_ext_span_partial_pair<T, Codec, NX>(
+      w + (row * nb + b0) * Codec::block_bytes,
+      x0 + b0 * Codec::superblock,
+      x1 + b0 * Codec::superblock,
+      (b1 - b0) * Codec::superblock,
+      tx,
+      luts);
 }
 
 // GLU pair form: (gate, up) for row x0 in .xy and for row x1 in .zw.
@@ -1799,6 +1890,7 @@ template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
     const constant int& SC [[buffer(9)]],
     const constant int& T_ [[buffer(10)]],
     const constant int& NS [[buffer(11)]],
+    const constant int& SP [[buffer(12)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -1863,15 +1955,26 @@ template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
     const device T* xa = h + ((int64_t)ra * S + slot) * K;
     const float wa = SC == S ? scores[ra * SC + slot] : 1.0f;
     const int64_t srow = (int64_t)out_row * NS + (slot - n_route);
+    // The shared row in SP pieces, summed in piece order as the loop
+    // kernel sums them.
     if (has_b) {
       const device T* xb = h + ((int64_t)rb * S + slot) * K;
-      const float2 p = kq_ext_row_partial_pair<T, SCodec, NX>(
-          sw, xa, xb, srow, K, tx, kq_sluts);
+      float2 p = kq_ext_piece_partial_pair<T, SCodec, NX>(
+          sw, xa, xb, srow, K, 0, SP, tx, kq_sluts);
+      for (int q = 1; q < SP; q++) {
+        p += kq_ext_piece_partial_pair<T, SCodec, NX>(
+            sw, xa, xb, srow, K, q, SP, tx, kq_sluts);
+      }
       result += wa * p.x;
       pb[slot] = p.y;
     } else {
-      result +=
-          wa * kq_ext_row_partial<T, SCodec, NX>(sw, xa, srow, K, tx, kq_sluts);
+      float p = kq_ext_piece_partial<T, SCodec, NX>(
+          sw, xa, srow, K, 0, SP, tx, kq_sluts);
+      for (int q = 1; q < SP; q++) {
+        p += kq_ext_piece_partial<T, SCodec, NX>(
+            sw, xa, srow, K, q, SP, tx, kq_sluts);
+      }
+      result += wa * p;
     }
   }
   result = kq_ext_reduce<NX>(result);

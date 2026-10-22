@@ -28,6 +28,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from kqref import GT, quants
+from qmm_probe import run_probe
 
 import mlx_kquant as kq
 
@@ -151,6 +152,7 @@ SPLITK_RPS = {"q6_k": 4, "q8_0": 2}
 QMV_LEVERS = (
     "KQ_QMV_FINE",
     "KQ_QMV_SPLITK",
+    "KQ_QMV_SPLITK_TRIM",
     "KQ_NAX_QMV",
     "KQ_VERIFY_NAX",
     "KQ_VERIFY_MMA",
@@ -302,3 +304,76 @@ def test_q8_0_qmv_splitk_routing(dtype, monkeypatch):
     assert run(8, fine="1") == [0.0] * 8
     assert run(8, fine="0") == [0.0] * 8
     assert run(3) == [0.0] * 3
+
+
+# Below eight 256-weight steps (q8_0) or eight superblock pairs (q6_k) the
+# split-K mat-vec dispatches one simdgroup per step or pair instead of eight,
+# and the kernel sums only those partials, so the output matches the full
+# threadgroup (KQ_QMV_SPLITK_TRIM=0) bit for bit. K 1792 (q8_0) and 3584
+# (q6_k) are the last trimmed widths, K 2048 and 3840 the first full ones.
+# K 1280 and 3840 leave the last q6_k pair half full.
+SPLITK_TRIM_K = {
+    "q8_0": (256, 768, 1280, 1792, 2048, 2304),
+    "q6_k": (256, 768, 1280, 2048, 3584, 3840, 4096),
+}
+
+
+@pytest.mark.skipif(
+    bool(os.environ.get("KQUANT_FORCE_CPU")) or mx.default_device() != mx.gpu,
+    reason="Metal kernel routing",
+)
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "codec, k", [(c, k) for c, ks in SPLITK_TRIM_K.items() for k in ks]
+)
+def test_qmv_splitk_trim(codec, k, dtype, monkeypatch):
+    _clear_qmv_levers(monkeypatch)
+    rng = np.random.default_rng(k)
+    w_np = (rng.standard_normal((64, k)) * 0.1).astype(np.float32)
+    w, _ = kq.quantize(mx.array(w_np), codec)
+    x = mx.array((rng.standard_normal((1, k)) * 0.5).astype(np.float32)).astype(dtype)
+    scales = mx.zeros((1,), dtype=mx.uint8)
+    outs = []
+    for trim in (None, "0"):
+        if trim is None:
+            monkeypatch.delenv("KQ_QMV_SPLITK_TRIM", raising=False)
+        else:
+            monkeypatch.setenv("KQ_QMV_SPLITK_TRIM", trim)
+        y = kq.quantized_matmul(x, w, scales, codec, transpose=True)
+        mx.eval(y)
+        outs.append(y)
+    assert bool(mx.array_equal(outs[0], outs[1]).item()), f"{codec} K={k} {dtype}"
+    deq = np.array(kq.dequantize(w, scales, codec).astype(mx.float32))
+    r = np.array(x.astype(mx.float32)) @ deq.T
+    err = float(np.abs(np.array(outs[0].astype(mx.float32)) - r).max())
+    assert err < 1e-2 * float(np.abs(r).max()), f"{codec} K={k}: {err:.3e}"
+
+
+# Simdgroups per threadgroup of the split-K mat-vec at the edges of the trim:
+# one per 256-weight step (q8_0) or superblock pair (q6_k) up to eight, and
+# eight at every K under KQ_QMV_SPLITK_TRIM=0. The output does not show the
+# count, so the test reads the threadgroup size from KQ_QMM_LOG.
+SPLITK_SGS = {
+    "q8_0": ((256, 1), (1792, 7), (2048, 8)),
+    "q6_k": ((768, 2), (1280, 3), (3584, 7), (3840, 8)),
+}
+
+
+@pytest.mark.skipif(
+    bool(os.environ.get("KQUANT_FORCE_CPU")) or mx.default_device() != mx.gpu,
+    reason="Metal kernel routing",
+)
+def test_qmv_splitk_simdgroups():
+    calls, want = [], []
+    for codec, edges in SPLITK_SGS.items():
+        for k, sgs in edges:
+            for trim, n_sg in ((None, sgs), ("0", 8)):
+                env = {"KQ_QMV_SPLITK_TRIM": trim}
+                calls.append({"codec": codec, "shape": [1, k], "n": 64, "env": env})
+                want.append((codec, k, trim, n_sg))
+    res = run_probe(calls, env={"KQ_QMM_LOG": "1"}, check=False)
+    for (codec, k, trim, n_sg), r in zip(want, res, strict=True):
+        assert r["error"] is None, (codec, k, r["error"])
+        ((name, _),) = r["kernels"]
+        assert "_qmv_splitk_" in name, (codec, k, name)
+        assert r["tg"] == [(32, n_sg, 1)], (codec, k, trim, r["tg"])

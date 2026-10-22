@@ -114,7 +114,7 @@ void KQuantGatherMix::eval_gpu(
   }
   MTL::Size group_dims(threads, 1, 1);
   MTL::Size grid_dims(Tn, 1, 1);
-  kq_log_dispatch(kname, y, out, grid_dims);
+  kq_log_dispatch(kname, y, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 

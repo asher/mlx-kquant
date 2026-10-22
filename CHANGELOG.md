@@ -17,6 +17,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `KQ_MOE_SHEXP_MULTI=0` declines a wider shared expert.
 
 ### Changed
+- The `q2_k`, `q4_k` and `q5_k` MoE gathers and `mv_ext` mat-vecs take 2-18% less
+  time on M5 Max, with the same output. `KQ_KQUANT_WORD=0` restores the old decode.
+- At one activation row, `gather_qmv_mix_kq` with a shared expert in another
+  codec than the routed experts takes 2-10% less time on M5 Max: each shared row
+  runs as two pieces. `KQ_MOE_SX_SPLIT=1` restores one piece.
 - `q4_1` `quantized_matmul` at 4 to 8 activation rows takes less time on GPUs
   without NAX, about 1.1-1.2x faster on M3 Max: it now runs the
   register-resident `verify_mma` kernel that `q4_0` runs.
@@ -28,10 +33,22 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on an M3 Max they take 8 to 34% less time.
 - Source builds compile the Metal kernels in parallel, so `pip install` from
   source and rebuilds after a kernel edit finish sooner.
+- `q8_0` `gather_qmm` at one activation row and K of 2048 or more, and `q6_k`
+  from K 1024, take up to 38% less time, most at one to four entries.
+  `KQ_GATHER_SPLITK=0` restores the previous kernels.
+- `q6_k` matmuls with one activation row and K under 3840, and `q8_0` ones with K
+  under 2048, take up to 13% less time under sustained load.
+  `KQ_QMV_SPLITK_TRIM=0` restores the previous launch.
+- `KQ_QMM_LOG` lines give the threadgroup size as `tg=<x>,<y>,<z>` after the
+  grid.
 
 ### Removed
 - Python 3.10 support. On Python 3.10, pip installs 0.5.4, the last release
   that supports it.
+
+### Fixed
+- `KQ_MOE_NX=32` on the shared-expert gathers with a `q5_k` shared expert
+  raises an error that names the setting, in place of a bare kernel load error.
 
 ## [0.5.4]
 

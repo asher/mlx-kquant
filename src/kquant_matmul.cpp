@@ -872,19 +872,20 @@ static void kq_require_tile_kernel(
   kq_require_kernel(d, std::string(lever) + "=" + kq_tile_string(t), kname);
 }
 
-// One KQ_QMM_LOG line: kernel name, shape and grid of a dispatch, and xa,
-// the byte offset of x's start modulo 16.
+// One KQ_QMM_LOG line: kernel name, shape, grid and threadgroup size of a
+// dispatch, and xa, the byte offset of x's start modulo 16.
 static void kq_log_qmm(
     const std::string& kname,
     int M,
     int N,
     int K,
     const MTL::Size& grid,
+    const MTL::Size& group,
     const array& x) {
   if (kq_qmm_log()) {
     std::fprintf(
         stderr,
-        "[kq qmm] %s M=%d N=%d K=%d grid=%lu,%lu,%lu xa=%d\n",
+        "[kq qmm] %s M=%d N=%d K=%d grid=%lu,%lu,%lu tg=%lu,%lu,%lu xa=%d\n",
         kname.c_str(),
         M,
         N,
@@ -892,6 +893,9 @@ static void kq_log_qmm(
         static_cast<unsigned long>(grid.width),
         static_cast<unsigned long>(grid.height),
         static_cast<unsigned long>(grid.depth),
+        static_cast<unsigned long>(group.width),
+        static_cast<unsigned long>(group.height),
+        static_cast<unsigned long>(group.depth),
         kq_x_align(x));
   }
 }
@@ -1074,7 +1078,7 @@ void qmm_nax(
   if (tile) {
     kq_require_tile_kernel(d, "KQ_NAX_TILE", *tile, kname);
   }
-  kq_log_qmm(kname, M, N, K, grid_dims, x);
+  kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
 
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -1172,7 +1176,7 @@ void qmm(
   if (tile) {
     kq_require_tile_kernel(d, "KQ_QMM_TILE", *tile, kname);
   }
-  kq_log_qmm(kname, M, N, K, grid_dims, x);
+  kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
 
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -1400,7 +1404,7 @@ void qmm_splitk(
   ce.set_bytes(part_stride, c++);
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, splits);
-  kq_log_qmm(kname, M, N, K, grid_dims, x);
+  kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 
   const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
@@ -1480,7 +1484,7 @@ void verify_mma(
   ce.set_bytes(part_stride, c++);
   MTL::Size group_dims(256, 1, 1);
   MTL::Size grid_dims((N + rows - 1) / rows, 1, splits);
-  kq_log_qmm(kname, M, N, K, grid_dims, x);
+  kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
   ce.dispatch_threadgroups(grid_dims, group_dims);
   if (splits == 1) {
     return;
@@ -1640,7 +1644,7 @@ void verify_nax(
   ce.set_bytes(part_stride, c++);
   MTL::Size group_dims(128, 1, 1);
   MTL::Size grid_dims((N + 127) / 128, 1, splits);
-  kq_log_qmm(vname, M, N, K, grid_dims, x);
+  kq_log_qmm(vname, M, N, K, grid_dims, group_dims, x);
   ce.dispatch_threadgroups(grid_dims, group_dims);
   if (splits == 1) {
     return;
@@ -1738,7 +1742,7 @@ void verify_nax_multi(
   ce.set_bytes(part_stride.data(), 4, c++);
   MTL::Size group_dims(128, 1, 1);
   MTL::Size grid_dims(tgs, 1, splits);
-  kq_log_qmm(vname, M, static_cast<int>(rows), K, grid_dims, x);
+  kq_log_qmm(vname, M, static_cast<int>(rows), K, grid_dims, group_dims, x);
   ce.dispatch_threadgroups(grid_dims, group_dims);
   if (splits == 1) {
     return;
@@ -1816,7 +1820,7 @@ void qmm_nax_splitk(
   ce.set_bytes(part_stride, c++);
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, splits);
-  kq_log_qmm(kname, M, N, K, grid_dims, x);
+  kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 
   const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
@@ -1868,7 +1872,7 @@ void qvm(
       bits,
       B > 1 ? "_batch_1" : "_batch_0");
 
-  kq_log_qmm(kname, M, N, K, grid_dims, x);
+  kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -1937,7 +1941,9 @@ static bool qmv_splitk(
   if (int(kernel->maxTotalThreadsPerThreadgroup()) < 32 * nsg) {
     return false;
   }
-  kq_log_qmm(kname, 1, N, K, MTL::Size(1, N / rps, 1), x);
+  const MTL::Size grid_dims(1, N / rps, 1);
+  const MTL::Size group_dims(32, kq_qmv_splitk_sgs(q6, K), 1);
+  kq_log_qmm(kname, 1, N, K, grid_dims, group_dims, x);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   int c = 0;
@@ -1948,7 +1954,7 @@ static bool qmv_splitk(
   ce.set_bytes(K, c++);
   ce.set_bytes(N, c++);
   add_strides_and_shapes(ce, true, x, w, scales, c);
-  ce.dispatch_threadgroups(MTL::Size(1, N / rps, 1), MTL::Size(32, nsg, 1));
+  ce.dispatch_threadgroups(grid_dims, group_dims);
   return true;
 }
 
@@ -1988,14 +1994,15 @@ static bool qmv_c32(
     return false;
   }
   const MTL::Size grid_dims(N / (sg * rps), 1, 1);
-  kq_log_qmm(kname, 1, N, K, grid_dims, x);
+  const MTL::Size group_dims(32, sg, 1);
+  kq_log_qmm(kname, 1, N, K, grid_dims, group_dims, x);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   ce.set_input_array(w, 0);
   ce.set_input_array(x, 1);
   ce.set_output_array(out, 2);
   ce.set_bytes(K, 3);
-  ce.dispatch_threadgroups(grid_dims, MTL::Size(32, sg, 1));
+  ce.dispatch_threadgroups(grid_dims, group_dims);
   return true;
 }
 
@@ -2065,7 +2072,7 @@ void qmv(
       bits,
       B > 1 ? "_batch_1" : "_batch_0");
 
-  kq_log_qmm(kname, M, N, K, grid_dims, x);
+  kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -2130,7 +2137,7 @@ void qmv_bias(
       bits,
       "_batch_0");
 
-  kq_log_qmm(kname, 1, N, K, grid_dims, x);
+  kq_log_qmm(kname, 1, N, K, grid_dims, group_dims, x);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -2210,7 +2217,7 @@ void verify_qmv(
       bits,
       "_batch_0");
 
-  kq_log_qmm(kname, M, N, K, grid_dims, x);
+  kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -2309,7 +2316,7 @@ void verify_mv_ext(
                         : (use_nx ? (mv_ext_nx == 16 ? "_x16" : "_x32")
                                   : (use_hd ? "_hd" : ""))));
 
-  kq_log_qmm(kname, M, N, K, grid_dims, x);
+  kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -2783,15 +2790,30 @@ bool kq_qmm_log_on() {
   return kq_qmm_log();
 }
 
+bool kq_kquant_word_on() {
+  static const bool cached = kq_env_flag("KQ_KQUANT_WORD", 1) != 0;
+  return kq_tune_live() ? kq_env_flag("KQ_KQUANT_WORD", 1) != 0 : cached;
+}
+
+int kq_qmv_splitk_sgs(bool q6, int K) {
+  const int nsg = q6 ? kq_q6_k_splitk_nsg : kq_q8_0_splitk_nsg;
+  if (kq_env_flag("KQ_QMV_SPLITK_TRIM", 1) == 0) {
+    return nsg;
+  }
+  const int steps = K / qmv_fast_k_align();
+  return std::max(1, std::min(nsg, q6 ? (steps + 1) / 2 : steps));
+}
+
 void kq_log_dispatch(
     const std::string& kname,
     const array& x,
     const array& out,
-    const MTL::Size& grid) {
+    const MTL::Size& grid,
+    const MTL::Size& group) {
   if (kq_qmm_log()) {
     const int N = out.ndim() > 0 ? out.shape(-1) : 1;
     const int M = N > 0 ? static_cast<int>(out.size() / N) : 0;
-    kq_log_qmm(kname, M, N, x.ndim() > 0 ? x.shape(-1) : 1, grid, x);
+    kq_log_qmm(kname, M, N, x.ndim() > 0 ? x.shape(-1) : 1, grid, group, x);
   }
 }
 

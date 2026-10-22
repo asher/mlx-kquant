@@ -5,6 +5,14 @@
 // Q4_K: 144 bytes/256 weights. [fp16 d][fp16 dmin][scales[12]][qs[128]].
 // w[i] = d * sub_scale * q4 - dmin * sub_min. Nibble-packed, low=even sb.
 
+// Chunk decode of the q2_k, q4_k and q5_k Ext traits (the
+// kq_q*_k_deq_chunk16 helpers): true forms four codes per 32-bit word,
+// false keeps the per-byte loop. Both give the same weights. The constant
+// has no default, so a function that inlines the decode builds only with a
+// value: the host reads which functions declare it and specializes those
+// (kq_get_kernel).
+constant bool kq_kquant_word [[function_constant(370)]];
+
 MLX_MTL_CONST int KQ_Q4_K_SUPERBLOCK = 256;
 MLX_MTL_CONST int KQ_Q4_K_BLOCK_BYTES = 144;
 MLX_MTL_CONST int KQ_Q4_K_D_OFFSET = 0;
@@ -900,6 +908,22 @@ inline void kq_q4_k_deq_chunk16(
     const device uint8_t* block,
     short il,
     thread float4x4& reg) {
+  if (kq_kquant_word) {
+    // One 16-byte load. The byte loop scales the high nibble as
+    // (d / 16) * (16 * q4); d * q4 is the same product.
+    const uint4 qs = *(const device uint4*)(kq_q4_k_qs_ptr(block) +
+                                            32 * (il / 4) + 16 * (il & 1));
+    const uchar2 sc = kq_get_scale_min_k4_just2(
+        (il / 4) * 2, (il & 3) / 2, kq_q4_k_scales12_ptr(block));
+    const float dl = kq_q4_k_d(block) * float(sc[0]);
+    const float ml = kq_q4_k_dmin(block) * float(sc[1]);
+    const uint4 c = (qs >> ((il & 2) ? 4u : 0u)) & 0x0F0F0F0Fu;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      reg[i] = dl * float4(as_type<uchar4>(c[i])) - ml;
+    }
+    return;
+  }
   const device uint8_t* q = kq_q4_k_qs_ptr(block);
   const short is = (il / 4) * 2;
   q = q + (il / 4) * 32 + 16 * (il & 1);
@@ -1982,6 +2006,26 @@ inline void kq_q5_k_deq_chunk16(
     const device uint8_t* block,
     short il,
     thread float4x4& reg) {
+  if (kq_kquant_word) {
+    // One 16-byte load each for qs and qh; nibble il & 2 and qh bit il / 2
+    // form the 5-bit code. The byte loop scales the high nibble as
+    // (d / 16) * (16 * q5); d * q5 is the same product.
+    const uint4 qs = *(const device uint4*)(kq_q5_k_qs_ptr(block) +
+                                            32 * (il / 4) + 16 * (il & 1));
+    const uint4 qh =
+        *(const device uint4*)(kq_q5_k_qh_ptr(block) + 16 * (il & 1));
+    const uchar2 sc = kq_get_scale_min_k4_just2(
+        (il / 4) * 2, (il & 3) / 2, kq_q5_k_scales12_ptr(block));
+    const float dl = kq_q5_k_d(block) * float(sc[0]);
+    const float ml = kq_q5_k_dmin(block) * float(sc[1]);
+    const uint4 c = ((qs >> ((il & 2) ? 4u : 0u)) & 0x0F0F0F0Fu) |
+        (((qh >> uint(il / 2)) & 0x01010101u) << 4);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      reg[i] = dl * float4(as_type<uchar4>(c[i])) - ml;
+    }
+    return;
+  }
   const device uint8_t* q = kq_q5_k_qs_ptr(block);
   const device uint8_t* qh = kq_q5_k_qh_ptr(block);
   const short is = (il / 4) * 2;
@@ -2199,7 +2243,11 @@ inline uint kq_q6_k_ld32(const device uint8_t* p) {
 // thread assembles four codes at a time from 32-bit words and pre-scales
 // the activation for byte b of a word by 2^(-8 * b), so a weight costs one
 // AND, one convert and one FMA. The -32 offset folds into one FMA per scale
-// group. Partial sums reduce through `red` (nsg * rps floats). Needs
+// group. Partial sums reduce through `red` (nsg * rps floats). Below 15
+// superblocks the simdgroups past the last pair hold no work: the host
+// dispatches only the first (nb + 1) / 2. The sum reads the partials of the
+// simdgroups that launched and hold a pair, so it never reads an unwritten
+// slot and the output does not depend on the count dispatched. Needs
 // N % rps == 0.
 template <typename T, int rps, int nsg>
 METAL_FUNC void kq_q6_k_qmv_splitk_impl(
@@ -2210,7 +2258,8 @@ METAL_FUNC void kq_q6_k_qmv_splitk_impl(
     threadgroup float* red,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    uint sgs) {
   typedef float U;
   thread U ys[16];
   thread U ysum[4];
@@ -2284,9 +2333,20 @@ METAL_FUNC void kq_q6_k_qmv_splitk_impl(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (simd_gid == 0 && simd_lid < uint(rps)) {
+    // K is a function constant, so the pair count folds and the sum over it
+    // unrolls. A sum bounded by sgs at run time took 1-2% longer, so sgs
+    // only selects the shorter sum when fewer simdgroups launched than hold
+    // pairs.
+    const int used = min(nsg, (nb + 1) / 2);
     U t = U(0);
-    for (int g = 0; g < nsg; g++) {
-      t += red[g * rps + simd_lid];
+    if (int(sgs) >= used) {
+      for (int g = 0; g < used; g++) {
+        t += red[g * rps + simd_lid];
+      }
+    } else {
+      for (int g = 0; g < int(sgs); g++) {
+        t += red[g * rps + simd_lid];
+      }
     }
     y[out_row + simd_lid] = static_cast<T>(t);
   }
@@ -2951,13 +3011,14 @@ template <typename T, int group_size, int bits, bool batched>
     const constant int64_t* /* s_strides */,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint sgs [[simdgroups_per_threadgroup]]) {
   static_assert(
       group_size == KQ_Q6_K_SUPERBLOCK, "Q6_K kernel requires group_size=256");
   static_assert(bits == 6, "Q6_K kernel requires bits=6");
   threadgroup float red[KQ_Q6_K_SPLITK_NSG * KQ_Q6_K_SPLITK_RPS];
   kq_q6_k_qmv_splitk_impl<T, KQ_Q6_K_SPLITK_RPS, KQ_Q6_K_SPLITK_NSG>(
-      w, x, y, kq_q6_k_splitk_k, red, tid, simd_gid, simd_lid);
+      w, x, y, kq_q6_k_splitk_k, red, tid, simd_gid, simd_lid, sgs);
 }
 
 // `batched` is carried only so this reuses the instantiate_kquant_batched
@@ -5085,6 +5146,19 @@ inline void kq_q2_k_deq_chunk16(
   const device uint8_t* q = kq_q2_k_qs_ptr(block);
   const uint8_t sc = kq_q2_k_scales_ptr(block)[il];
   q = q + 32 * (il / 8) + 16 * (il & 1);
+  if (kq_kquant_word) {
+    // 84-byte blocks: 4-byte loads. The byte loop scales the masked code
+    // by coef = 4^-shift; d * scale * code is the same product.
+    const device uint* qw = (const device uint*)q;
+    const uint sh = 2 * ((il / 2) % 4);
+    const float dl = d * float(sc & 0xF);
+    const float ml = dmin * float(sc >> 4);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      reg[i] = dl * float4(as_type<uchar4>((qw[i] >> sh) & 0x03030303u)) - ml;
+    }
+    return;
+  }
   il = (il / 2) % 4;
   const float coef = il > 1 ? (il > 2 ? 1.0f / 64.0f : 1.0f / 16.0f)
                             : (il > 0 ? 1.0f / 4.0f : 1.0f);

@@ -1717,7 +1717,11 @@ template <typename T, int group_size, int bits, bool batched>
 // owns 8 weights (block l / 4, quarter l % 4) of every 8-block step, the
 // lane mapping of kq_q8_0_qmv_fast_impl. The quarter sits 2 bytes past a
 // 2-byte boundary, so it loads as four ushorts. Partial sums reduce through
-// `red` (nsg * rps floats). Needs N % rps == 0 and K % 256 == 0.
+// `red` (nsg * rps floats). Below nsg steps the simdgroups past the last
+// step hold no work: the host dispatches only K / 256 of them. The sum reads
+// the partials of the simdgroups that launched and hold a step, so it never
+// reads an unwritten slot and the output does not depend on the count
+// dispatched. Needs N % rps == 0 and K % 256 == 0.
 template <typename T, int rps, int nsg>
 METAL_FUNC void kq_q8_0_qmv_splitk_impl(
     const device uint8_t* w,
@@ -1727,7 +1731,8 @@ METAL_FUNC void kq_q8_0_qmv_splitk_impl(
     threadgroup float* red,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    uint sgs) {
   typedef float U;
   constexpr int step = 8 * KQ_Q8_0_GROUP;
   thread U result[rps] = {0};
@@ -1770,8 +1775,9 @@ METAL_FUNC void kq_q8_0_qmv_splitk_impl(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (simd_gid == 0 && simd_lid < uint(rps)) {
+    const int used = min(min(int(sgs), nsg), in_vec_size / step);
     U t = U(0);
-    for (int g = 0; g < nsg; g++) {
+    for (int g = 0; g < used; g++) {
       t += red[g * rps + simd_lid];
     }
     y[out_row + simd_lid] = static_cast<T>(t);
@@ -1796,13 +1802,14 @@ METAL_FUNC void kq_q8_0_qmv_splitk_impl(
       const constant int64_t* /* s_strides */,                              \
       uint3 tid [[threadgroup_position_in_grid]],                           \
       uint simd_gid [[simdgroup_index_in_threadgroup]],                     \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                        \
+      uint simd_lid [[thread_index_in_simdgroup]],                          \
+      uint sgs [[simdgroups_per_threadgroup]]) {                            \
     static_assert(                                                          \
         group_size == KQ_Q8_0_GROUP, "Q8_0 kernel requires group_size=32"); \
     static_assert(bits == 8, "Q8_0 kernel requires bits=8");                \
     threadgroup float red[NSG * RPS];                                       \
     kq_q8_0_qmv_splitk_impl<T, RPS, NSG>(                                   \
-        w, x, y, in_vec_size, red, tid, simd_gid, simd_lid);                \
+        w, x, y, in_vec_size, red, tid, simd_gid, simd_lid, sgs);           \
   }
 
 // Split-K M=1 q8_0 mat-vec. The host copy of the tile is
@@ -3282,6 +3289,71 @@ KQUANT_DEFINE_GATHER_KERNELS(mxfp4, KqMxfp4BlockLoader)
 KQUANT_DEFINE_GATHER_KERNELS(nvfp4, KqNvfp4BlockLoader)
 
 #undef KQUANT_DEFINE_GATHER_KERNELS
+
+// Split-K gathered M=1 mat-vec: the dense split-K mat-vec of the codec run
+// on batch entry tid.z after the gather offsets. KARG is the row width the
+// impl reads (q6_k folds it as function constant 340). The host copies of
+// the tiles are kq_<codec>_splitk_rps/nsg in src/kquant_metal_internal.h,
+// and the host dispatches M == 1 only.
+#define KQUANT_DEFINE_GATHER_QMV_SPLITK(CODEC, RPS, NSG, KARG) \
+  template <typename T, int group_size, int bits>              \
+  [[kernel, max_total_threads_per_threadgroup(32 * NSG)]] void \
+      kq_##CODEC##_gather_qmv_splitk(                          \
+          const device uint8_t* w,                             \
+          const device uint8_t* /* scales */,                  \
+          const device T* x,                                   \
+          const device uint32_t* lhs_indices,                  \
+          const device uint32_t* rhs_indices,                  \
+          device T* y,                                         \
+          const constant int& in_vec_size,                     \
+          const constant int& out_vec_size,                    \
+          const constant int& x_batch_ndims,                   \
+          const constant int* x_shape,                         \
+          const constant int64_t* x_strides,                   \
+          const constant int& w_batch_ndims,                   \
+          const constant int* w_shape,                         \
+          const constant int64_t* w_strides,                   \
+          const constant int64_t* /* s_strides */,             \
+          const constant int& batch_ndims,                     \
+          const constant int* batch_shape,                     \
+          const constant int64_t* lhs_strides,                 \
+          const constant int64_t* rhs_strides,                 \
+          uint3 tid [[threadgroup_position_in_grid]],          \
+          uint simd_gid [[simdgroup_index_in_threadgroup]],    \
+          uint simd_lid [[thread_index_in_simdgroup]],         \
+          uint sgs [[simdgroups_per_threadgroup]]) {           \
+    (void)in_vec_size;                                         \
+    kq_adjust_matrix_offsets<T>(                               \
+        x,                                                     \
+        w,                                                     \
+        lhs_indices,                                           \
+        rhs_indices,                                           \
+        y,                                                     \
+        out_vec_size,                                          \
+        batch_ndims,                                           \
+        batch_shape,                                           \
+        lhs_strides,                                           \
+        rhs_strides,                                           \
+        x_batch_ndims,                                         \
+        x_shape,                                               \
+        x_strides,                                             \
+        w_batch_ndims,                                         \
+        w_shape,                                               \
+        w_strides,                                             \
+        tid);                                                  \
+    threadgroup float red[NSG * RPS];                          \
+    kq_##CODEC##_qmv_splitk_impl<T, RPS, NSG>(                 \
+        w, x, y, KARG, red, tid, simd_gid, simd_lid, sgs);     \
+  }
+
+KQUANT_DEFINE_GATHER_QMV_SPLITK(q8_0, 2, 8, in_vec_size)
+KQUANT_DEFINE_GATHER_QMV_SPLITK(
+    q6_k,
+    KQ_Q6_K_SPLITK_RPS,
+    KQ_Q6_K_SPLITK_NSG,
+    kq_q6_k_splitk_k)
+
+#undef KQUANT_DEFINE_GATHER_QMV_SPLITK
 
 // Sorted-rhs gather GEMM (ALU/steel path), the non-NAX counterpart of
 // kq_gather_qmm_rhs_nax_tgp_impl. x rows arrive sorted by expert (the

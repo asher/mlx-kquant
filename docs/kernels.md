@@ -202,9 +202,9 @@ last row and drops it at the store. `q2_k` and `q3_k` keep the runtime bound: th
 faster for them.
 
 A `q6_k` `quantized_matmul` with one activation row and no batch dimensions runs a split-K kernel
-when 4 divides N. The MoE gathers keep their own kernels. The eight simdgroups of a threadgroup
-share four output rows, divide the superblocks between them and add their partial sums in
-threadgroup memory. Each thread assembles four 6-bit codes at a time from 32-bit words and
+when 4 divides N. The fused MoE gathers keep their own kernels. The eight simdgroups of a
+threadgroup share four output rows, divide the superblocks between them and add their partial sums
+in threadgroup memory. Each thread assembles four 6-bit codes at a time from 32-bit words and
 pre-scales the activation for byte b of a word by 2^(-8b), so a weight costs one AND, one convert
 and one FMA. The row width is a Metal function constant, so each width gets its own pipeline with
 the superblock count and row stride folded. Under sustained load that ran about 1% faster than
@@ -219,6 +219,9 @@ simdgroups in flight at layer-size N. On M3 Max, back to back over ten shapes, i
 less time than the per-row kernels: 2.7% less at K 8192 and N 4096, and 3.2% less at K 4096 and N
 8192. In a synced decode step of eight Muse Spark UD-IQ2_S layers, it saved 1.1% per layer.
 
+The split-K mat-vec covers `q6_k` and `q8_0`. The other codecs run one activation row through
+their per-row kernels, and the grid codecs through `qmv_c32` on M5 and later GPUs.
+
 Under sustained decode the GPU runs below its top clock, where the per-row kernels turn ALU-bound.
 Measured on M5 Max over 90 seconds of back-to-back mat-vecs at the gemma-4 31B MLP shapes, the
 split-K kernel read 450-465 GB/s at the lowest clock, against 385-395 GB/s for the per-row kernels
@@ -226,15 +229,39 @@ and about 530 GB/s for bf16 GEMV. Once the clock dropped it read 1.12-1.14x the 
 inner dimensions of 4096 and 5120, and matched it at 2048 and below. In short runs at a high clock
 the two kernels are within 3% of each other on every shape measured.
 
+A `q6_k` row under 3840 weights has fewer superblock pairs than the threadgroup has simdgroups, and
+a `q8_0` row under 2048 weights has fewer 256-weight steps. The threadgroup then runs one
+simdgroup per pair or step, so none waits idle, and the sum reads only their partials, so the
+output is bit for bit the same. On M5 Max at 0.76-0.92 GHz, `q6_k` took 12.6% less time at N 32768
+and K 1280, the DeepSeek-V4.1 query up-projection, 9.0% less at N 24576 and K 1536 and 8.5% less at
+N 3072 and K 1024. `q8_0` already reads near the memory rate there and was within 0.5% at the first
+two, and took 4.1% less at N 3072 and K 1024.
+
+`gather_qmm` with one activation row runs the same two split-K kernels per batch entry, for grouped
+projections such as the DeepSeek-V4 attention output and for SwitchGLU decode steps, when the row
+count of the tile divides N, K is 2048 or more (1024 or more for `q6_k`) and the call has fewer
+than 16384 output rows (N times the entries). Under the default levers each entry then matches
+`quantized_matmul` on its expert bit for bit. `KQ_GATHER_SPLITK` does not read `KQ_QMV_SPLITK=0`
+or `KQ_QMV_FINE`, which move `quantized_matmul` to the per-row kernels. On M5 Max at 0.85-1.6 GHz
+it ran as fast as `gather_qmv` or faster on every such shape measured: from K 2048 over 1 to 128
+entries and N of 128 to 7168, and for `q6_k` at K 1024 to 1792 over 1 to 16 entries. It took 6-7%
+less time for `q8_0` and 4-6% less for `q6_k` at the DeepSeek-V4 shape of 8 groups of 1024 x 4096,
+and up to 38% less at one entry. From 16384 rows the `gather_qmv` grid fills the GPU, and at
+sustained clocks split-K ran up to 23% slower there. Below K 2048, `q8_0` measured from 4% faster
+to 4% slower than `gather_qmv`, with the sign changing from run to run. At K 768, `q6_k` took 7-14%
+longer at one and two entries in every run, and up to 13% less time at 4 to 16. Both keep
+`gather_qmv` there.
+
 Tuning levers (defaults are right for normal use):
 
 - `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
   `KQ_NAX_BM128_ODD_M`, `KQ_NAX_DB64`, the `_BK128` levers, `KQ_NAX_SWIZZLE`), the `verify_nax` load
   lever (`KQ_VNAX_X16`), the tile overrides (`KQ_NAX_TILE`, `KQ_QMM_TILE`, `KQ_CONV_TILE`),
-  `KQ_SPLITK_F32` and `KQ_QMM_LOG` read their variables on every dispatch, so one process can switch
-  tiles between calls on one resident copy of the weights; `benchmarks/bench_dit_shapes.py` runs its
-  tile arms this way. It reads the environment on every dispatch, so it is for single-threaded A/B
-  runs that set these variables between calls. The `quantized_matmul_glu` levers (`KQ_GLU`,
+  `KQ_SPLITK_F32`, `KQ_KQUANT_WORD` and `KQ_QMM_LOG` read their variables on every dispatch, so
+  one process can switch tiles between calls on one resident copy of the weights;
+  `benchmarks/bench_dit_shapes.py` runs its tile arms this way. It reads the environment on every
+  dispatch, so it is for single-threaded A/B runs that set these variables between calls. The
+  `quantized_matmul_glu` levers (`KQ_GLU`,
   `KQ_GLU_MIN_ROWS`), the `quantized_matmul_multi` lever (`KQ_MATMUL_MULTI`), the
   `quantized_matmul_lora` levers (`KQ_QMM_LORA`, `KQ_QMM_LORA_MIN_ROWS`), the
   `quantized_matmul_residual` lever (`KQ_QMM_RESID`), the dequantize route lever
@@ -262,18 +289,21 @@ Tuning levers (defaults are right for normal use):
   machine. Any other value warns once and reads as `auto`. `auto` by default. Read when the op
   builds its graph, once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_QMM_LOG` - set to any value, logs every quantized matmul dispatch to stderr, one
-  `[kq qmm] <kernel> M=<m> N=<n> K=<k> grid=<x>,<y>,<z> xa=<a>` line each: the NAX and ALU qmm
-  tiles, the mat-vec routes (`qmv`, `qvm`, `verify_qmv`, `mv_ext`), split-K, `verify_mma` and
-  `verify_nax`, split or not, the fused `quantized_matmul_glu`, `quantized_matmul_lora` and
-  `quantized_matmul_residual` kernels, `skinny_matmul`, the `gather_qmm` and `gather_qmm_seg`
-  routes, the fused MoE gathers, `gather_mix` and `conv2d_3x3`. The grid depth is the K slice
-  count. `xa` is the byte offset of the activation's start modulo 16, as the kernel reads it. A
+  `[kq qmm] <kernel> M=<m> N=<n> K=<k> grid=<x>,<y>,<z> tg=<x>,<y>,<z> xa=<a>` line each: the
+  NAX and ALU qmm tiles, the mat-vec routes (`qmv`, `qvm`, `verify_qmv`, `mv_ext`), split-K,
+  `verify_mma` and `verify_nax`, split or not, the fused `quantized_matmul_glu`,
+  `quantized_matmul_lora` and `quantized_matmul_residual` kernels, `skinny_matmul`, the
+  `gather_qmm` and `gather_qmm_seg` routes, the fused MoE gathers, `gather_mix` and `conv2d_3x3`.
+  The grid depth is the K slice count, and `tg` is the threadgroup size in threads. `xa` is the
+  byte offset of the activation's start modulo 16, as the kernel reads it. A
   gather or MoE line gives the rows and last dim of the output as M and N. Any GPU op that copies
   an operand to an aligned buffer, because the operand starts or steps off the boundary of its
   kernel's vector loads, logs one `[kq align] <op> <operand> xin=<n>` line, where `n` is the
   operand's byte offset modulo that boundary. A call that takes the dequantize route logs one
-  `[kq dequant] <codec> M=<rows> N=<n> K=<k>` line when the op builds its graph. Unset (off) by
-  default. Read once per process unless `KQ_TUNE_LIVE=1`.
+  `[kq dequant] <codec> M=<rows> N=<n> K=<k>` line when the op builds its graph. Under
+  `KQ_KQUANT_WORD=0`, each fetch of a kernel that inlines the k-quant chunk decode logs one
+  `[kq decode] byte <key>` line, where the pipeline key ends in `_kw0`. Unset (off) by default.
+  Read once per process unless `KQ_TUNE_LIVE=1`.
 - `KQ_SPLITK_F32` - partial dtype of the split-K routes (`splitk`, `nax_splitk`, the
   `KQ_QMM_MIDM` band, and `verify_mma` and `verify_nax` when they split K). Float partials let the
   fold round the result once, as the unsplit kernels do. Partials in the activation dtype round
@@ -355,10 +385,16 @@ Tuning levers (defaults are right for normal use):
   section). `0` restores the per-row kernels and `1` runs c32 on any GPU. `8` or `16` runs it at
   that many K-lanes per row. Unset takes it on M5 and later GPUs. A set `KQ_QMV_FINE` keeps the
   per-row kernels. Read live per call.
+- `KQ_GATHER_SPLITK` - the `q6_k` and `q8_0` split-K kernels for `gather_qmm` at one activation
+  row. `0` restores `gather_qmv`, `1` takes split-K at any K that 256 divides, and unset follows
+  the K and row-count rule above. `KQ_QMV_SPLITK` and `KQ_QMV_FINE` do not change it. Read live
+  per call.
 - `KQ_QMV_SPLITK` - the `q6_k` and `q8_0` split-K kernels for one activation row. `0` restores
   the per-row kernels, as does a set `KQ_QMV_FINE`, so a tiling A/B keeps measuring the tiling it
   names. A lever that forces another route at one row, such as `KQ_VERIFY_NAX=1`, takes
   precedence. Read live per call.
+- `KQ_QMV_SPLITK_TRIM` - `0` launches the `q6_k` and `q8_0` split-K kernels with all eight
+  simdgroups at every K, as before, with the same output. Read live per call.
 - `KQ_VERIFY_EXT` - the mat-vec route on the M 2-12 band. `1` forces `mv_ext` for every codec with
   the kernel, `0` forces `verify_qmv` where the codec has it and per-row qmv elsewhere, and unset
   takes the per-codec default. On NAX GPUs a set value also keeps per-row qmv and NAX split-K off
@@ -1114,7 +1150,8 @@ keep the 16-weight step. Outputs differ from the 16-weight kernels only in summa
 architecture string. `KQ_MOE_C32=0` restores the 16-weight kernels, and `KQ_MOE_C32=1` runs the
 32-weight kernels for every grid codec, on any GPU and at wider rows where the dedupe kernels do not
 apply. `KQ_MOE_NX=8` or `16` forces a width, and a forced `KQ_MOE_NX=32` keeps the 16-weight
-kernels.
+kernels. The shared-expert gathers with a `q5_k` shared expert stop at 16, and `KQ_MOE_NX=32` on
+them raises an error that names the setting.
 
 The one-row `quantized_matmul` of a grid codec runs the same row step (`kq_<codec>_qmv_c32`), on
 M5 and later GPUs by default, at the GLU width. `KQ_QMV_C32` controls it (see the mat-vec levers).
@@ -1151,6 +1188,41 @@ a cheaper lookup. Two other grid sources gave no gain. A 64-bit grid in a device
 constant table. A 2-bit code table, in threadgroup memory or in a device buffer, was about 20%
 slower.
 
+### K-quant chunk decode
+
+The `q2_k`, `q4_k` and `q5_k` gathers, and the `mv_ext` mat-vec of these codecs at 2 to 12 rows,
+decode each 16-weight chunk four codes at a time from 32-bit words. A lane reads the codes of a
+`q4_k` chunk in one 16-byte load, those of `q5_k` in one load for the low four bits and one for
+the fifth bits, and those of `q2_k` in four 4-byte loads. One shift and one AND per word bring four
+codes down to the low bits of their bytes (`q5_k` ORs in the fifth bits the same way), and one
+vector convert turns them into floats. The per-byte loop masks each code in place and divides the
+scale by the matching power of two, so both forms compute the same product and the outputs are bit
+for bit the same. The form is a function constant with no default, which only the kernels that
+inline this decode declare. The host reads that from each library function once and specializes
+those kernels alone, so the lever changes no other pipeline. Code that vendors the kernel headers
+and builds its own pipelines must give function constant 370 a value for every function that
+declares it: true for the word form, false for the per-byte loop.
+
+On M5 Max at 0.87-1.27 GHz, back to back over 24 rounds, the word form took less time than the
+per-byte loop on every path, by these medians:
+
+| Codec | Gate/up gather | Score-mixed down | `mv_ext`, 4 rows |
+|---|---|---|---|
+| q5_k | 13.7% | 17.5% | 15.2% |
+| q4_k | 5.2% | 8.1% | 8.0% |
+| q2_k | 6.5% | 5.0% | 5.3% |
+
+The gathers ran at Qwen3-30B-A3B shapes (hidden 2048, expert width 768, top 8 of 128) and
+`mv_ext` at 4096 x 4096. At DeepSeek-V4.1 shapes, the shared-expert GLU over `iq2_s` experts with a
+`q5_k` shared expert took 6.3% less time, and the score-mixed down took 9.9% less over `iq3_xxs`
+experts with a `q5_k` shared expert and 2.2% less over `q2_k` experts with a `q8_0` one.
+
+`q3_k` keeps the per-byte loop. Its 110-byte blocks are only 2-byte aligned, so each word takes
+two 2-byte loads, and in that form the gate/up gather took 4.1% longer, in all 24 rounds.
+
+- `KQ_KQUANT_WORD=0` restores the per-byte loop, with the same output. Read once per process unless
+  `KQ_TUNE_LIVE=1`.
+
 ### Shared experts wider than a routed expert
 
 Some models merge several shared experts into one, so the shared expert is k routed experts wide
@@ -1182,6 +1254,30 @@ shared). When the pipeline takes fewer threads, the call runs on the loop kernel
   False for k above 1, and the ops raise an error. Read per call.
 - `KQ_MOE_SP_THREAD_CAP=<n>` lowers the thread limit of the slot-parallel downs (both score-mixed
   gathers) to n, so a launch of more than n threads runs the loop kernel. Read per call. Test lever.
+
+### Shared rows in pieces
+
+A shared expert is often stored in a wider codec than the routed experts (`q8_0` or `q5_k` over
+`iq2` and `iq3` experts), so in the score-mixed down its row holds several times the bytes of a
+routed row. At one activation row the grid has few threadgroups, and each one waits on its shared
+slot. There `gather_qmv_mix_kq` runs each shared row as two pieces of whole blocks, and the
+slot-parallel kernel gives each piece its own simdgroup pair. The loop and dedupe kernels sum the
+same pieces in the same order, so every form gives the same bits at a given piece count. A shared
+expert in the routed codec, and the half-dot kernels, keep one piece. The count is at most the
+shared row's block count, and at most what keeps the launch within 16 simdgroup pairs.
+
+On M5 Max at about 1.05 GHz, back to back over 16 rounds with 96 experts, two pieces took 3.5-9.8%
+less time than one at one row over the seven down codec pairs of DeepSeek-V4.1 (hidden 5120,
+expert width 2304, top 6), and 2.1-2.6% less at DeepSeek-V3 shapes (hidden 7168, expert width
+2048, top 8). Three and four pieces gained less. At 2 to 8 rows two pieces took up to 4.2% longer,
+so wider calls keep one piece.
+
+In the fused MoE gathers, a one-row call and a multi-row call of the same weights may sum in a
+different order, so their outputs can differ in the last bits. By default the 32-weight step and
+the shared row pieces both serve one row only.
+
+- `KQ_MOE_SX_SPLIT=<n>` runs each shared row as n pieces at any row count, within the same bounds.
+  `1` restores one piece. Read per call. A/B lever.
 
 ## Attention
 
