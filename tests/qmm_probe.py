@@ -17,7 +17,9 @@ largest ulp distance on the elements whose reference is above 1% of its
 root mean square. ``"check_block": B`` runs the check and the ulp
 comparison over every row of x's flattened leading dims, B rows at a
 time, so a call with many rows holds float64 copies of B rows; it reports
-``checked``, the number of rows it read. Every call gets
+``checked``, the number of rows it read. A blocked call that a later
+blocked call compares against on the same reference is checked in that
+call's pass, so each reference block is computed once. Every call gets
 ``digest``, a hash of its output bits (of every output on a ``"multi"``
 call), to compare calls across probe processes. ``"x_offset": E`` passes
 x as a row-contiguous view E elements into its buffer, and ``copies``
@@ -184,32 +186,25 @@ def as64(a):
     return np.array(a.astype(mx.float32)).astype(np.float64)
 
 
-def blocked_check(c, x, y, other, wd, refs, res):
+def blocked_check(c, x, y, other, wd, res, base_res=None):
     # The check and the ulp comparison to other over every row, check_block
-    # rows at a time. Norms add up over the blocks; ulp counts take the max.
-    # ulp_big needs the root mean square of the whole reference first: the
-    # first call of a reference keeps its sum of squares.
+    # rows at a time, one float64 reference block at a time. Norms add up
+    # over the blocks; ulp counts take the max. base_res gets the check of
+    # other against the same reference. ulp_big needs the root mean square
+    # of the whole reference, so the blocks keep the largest reference
+    # magnitude at each ulp distance, and the threshold applies at the end.
     blk = c["check_block"]
     xf = x.reshape(-1, x.shape[-1])
     yf = y.reshape(-1, y.shape[-1])
     of = other.reshape(-1, other.shape[-1]) if other is not None else None
     mx.eval(xf, yf)
-    rows = xf.shape[0]
-    starts = range(0, rows, blk)
-
-    def ref_of(lo):
-        return as64(xf[lo : lo + blk]) @ wd.T
-
-    thr = 0.0
     if of is not None:
         mx.eval(of)
-        if "sumsq" not in refs:
-            refs["sumsq"] = sum(float((ref_of(lo) ** 2).sum()) for lo in starts)
-        thr = 1e-2 * np.sqrt(refs["sumsq"] / (rows * yf.shape[-1]))
-    d2 = r2 = dd = b2 = 0.0
-    ulp = ulp_big = checked = 0
-    for lo in starts:
-        ref = ref_of(lo)
+    top = np.zeros(1 << 16)
+    d2 = r2 = dd = b2 = bd2 = 0.0
+    ulp = checked = 0
+    for lo in range(0, xf.shape[0], blk):
+        ref = as64(xf[lo : lo + blk]) @ wd.T
         got = as64(yf[lo : lo + blk])
         d2 += float(((got - ref) ** 2).sum())
         r2 += float((ref * ref).sum())
@@ -219,23 +214,52 @@ def blocked_check(c, x, y, other, wd, refs, res):
             b = ordered(np.array(of[lo : lo + blk].view(mx.uint16)))
             d = np.abs(a - b)
             ulp = max(ulp, int(d.max()))
-            big = np.abs(ref) > thr
-            if big.any():
-                ulp_big = max(ulp_big, int(d[big].max()))
+            np.maximum.at(top, d.ravel(), np.abs(ref).ravel())
             yb = as64(of[lo : lo + blk])
             dd += float(((got - yb) ** 2).sum())
             b2 += float((yb * yb).sum())
-    refs["sumsq"] = r2
+            if base_res is not None:
+                bd2 += float(((yb - ref) ** 2).sum())
     res["rel"] = float(np.sqrt(d2) / (np.sqrt(r2) + 1e-30))
     res["checked"] = checked
+    if base_res is not None:
+        base_res["rel"] = float(np.sqrt(bd2) / (np.sqrt(r2) + 1e-30))
+        base_res["checked"] = checked
     if of is not None:
+        thr = 1e-2 * np.sqrt(r2 / (checked * yf.shape[-1]))
+        big = np.flatnonzero(top > thr)
         res["ulp"] = ulp
-        res["ulp_big"] = ulp_big
+        res["ulp_big"] = int(big[-1]) if big.size else 0
         res["rdiff"] = float(np.sqrt(dd) / (np.sqrt(b2) + 1e-30))
 
 
-_ulp_bases = {c["ulp_vs"] for c in spec["calls"] if c.get("ulp_vs") is not None}
-for i, c in enumerate(spec["calls"]):
+def ref_key(i, c):
+    # Calls that differ only in env share their references.
+    return (
+        c["codec"], c["n"], tuple(c["shape"]), c.get("dtype", "bfloat16"),
+        c.get("layout", "dense"), c.get("seed", i), c.get("design", "normal"),
+        c.get("check_block"),
+    )
+
+
+_calls = spec["calls"]
+_ulp_bases = {c["ulp_vs"] for c in _calls if c.get("ulp_vs") is not None}
+# A blocked call that a later blocked call compares against on the same
+# reference gets its check in that call's pass: base -> later call.
+_deferred = {}
+if spec.get("check", True):
+    for j, c in enumerate(_calls):
+        b = c.get("ulp_vs")
+        if (
+            b is not None
+            and b not in _deferred
+            and c.get("check_block")
+            and _calls[b].get("check_block")
+            and _calls[b].get("ulp_vs") is None
+            and ref_key(j, c) == ref_key(b, _calls[b])
+        ):
+            _deferred[b] = j
+for i, c in enumerate(_calls):
     for name, value in c.get("env", {}).items():
         if value is None:
             os.environ.pop(name, None)
@@ -310,17 +334,15 @@ for i, c in enumerate(spec["calls"]):
     res["digest"] = hashlib.sha1(memoryview(np.array(bits))).hexdigest()
     base = c.get("ulp_vs")
     blocked = spec.get("check", True) and c.get("check_block")
-    # Calls that differ only in env share their references.
-    rkey = (
-        c["codec"], c["n"], tuple(c["shape"]), str(dtype),
-        c.get("layout", "dense"), c.get("seed", i), design,
-        c.get("check_block"),
-    )
+    rkey = ref_key(i, c)
     if blocked:
         assert not c.get("r2"), "r2 takes no check_block"
-        wd = dequantized(c["codec"], c["n"], c["shape"][-1], design)
-        other = outs[base] if base is not None else None
-        blocked_check(c, x, y, other, wd, _refs.setdefault(rkey, {}), res)
+        if i not in _deferred:
+            wd = dequantized(c["codec"], c["n"], c["shape"][-1], design)
+            other = outs[base] if base is not None else None
+            deferred = other is not None and _deferred.get(base) == i
+            base_res = results[base] if deferred else None
+            blocked_check(c, x, y, other, wd, res, base_res)
         res["nonfinite"] = int((~mx.isfinite(y)).sum().item())
     elif spec.get("check", True):
         if rkey not in _refs:
