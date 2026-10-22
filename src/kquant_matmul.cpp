@@ -393,7 +393,7 @@ static int kq_verify_mma_min_m(const std::string& t, bool f16) {
   if (t == "ptq1_0") {
     return 3;
   }
-  if (t == "q4_0") {
+  if (t == "q4_0" || t == "q4_1") {
     return 2;
   }
   return 0;
