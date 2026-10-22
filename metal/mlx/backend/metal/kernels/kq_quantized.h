@@ -3283,6 +3283,70 @@ KQUANT_DEFINE_GATHER_KERNELS(nvfp4, KqNvfp4BlockLoader)
 
 #undef KQUANT_DEFINE_GATHER_KERNELS
 
+// Split-K gathered M=1 mat-vec: the dense split-K mat-vec of the codec run
+// on batch entry tid.z after the gather offsets. KARG is the row width the
+// impl reads (q6_k folds it as function constant 340). The host copies of
+// the tiles are kq_<codec>_splitk_rps/nsg in src/kquant_metal_internal.h,
+// and the host dispatches M == 1 only.
+#define KQUANT_DEFINE_GATHER_QMV_SPLITK(CODEC, RPS, NSG, KARG) \
+  template <typename T, int group_size, int bits>              \
+  [[kernel, max_total_threads_per_threadgroup(32 * NSG)]] void \
+      kq_##CODEC##_gather_qmv_splitk(                          \
+          const device uint8_t* w,                             \
+          const device uint8_t* /* scales */,                  \
+          const device T* x,                                   \
+          const device uint32_t* lhs_indices,                  \
+          const device uint32_t* rhs_indices,                  \
+          device T* y,                                         \
+          const constant int& in_vec_size,                     \
+          const constant int& out_vec_size,                    \
+          const constant int& x_batch_ndims,                   \
+          const constant int* x_shape,                         \
+          const constant int64_t* x_strides,                   \
+          const constant int& w_batch_ndims,                   \
+          const constant int* w_shape,                         \
+          const constant int64_t* w_strides,                   \
+          const constant int64_t* /* s_strides */,             \
+          const constant int& batch_ndims,                     \
+          const constant int* batch_shape,                     \
+          const constant int64_t* lhs_strides,                 \
+          const constant int64_t* rhs_strides,                 \
+          uint3 tid [[threadgroup_position_in_grid]],          \
+          uint simd_gid [[simdgroup_index_in_threadgroup]],    \
+          uint simd_lid [[thread_index_in_simdgroup]]) {       \
+    (void)in_vec_size;                                         \
+    kq_adjust_matrix_offsets<T>(                               \
+        x,                                                     \
+        w,                                                     \
+        lhs_indices,                                           \
+        rhs_indices,                                           \
+        y,                                                     \
+        out_vec_size,                                          \
+        batch_ndims,                                           \
+        batch_shape,                                           \
+        lhs_strides,                                           \
+        rhs_strides,                                           \
+        x_batch_ndims,                                         \
+        x_shape,                                               \
+        x_strides,                                             \
+        w_batch_ndims,                                         \
+        w_shape,                                               \
+        w_strides,                                             \
+        tid);                                                  \
+    threadgroup float red[NSG * RPS];                          \
+    kq_##CODEC##_qmv_splitk_impl<T, RPS, NSG>(                 \
+        w, x, y, KARG, red, tid, simd_gid, simd_lid);          \
+  }
+
+KQUANT_DEFINE_GATHER_QMV_SPLITK(q8_0, 2, 8, in_vec_size)
+KQUANT_DEFINE_GATHER_QMV_SPLITK(
+    q6_k,
+    KQ_Q6_K_SPLITK_RPS,
+    KQ_Q6_K_SPLITK_NSG,
+    kq_q6_k_splitk_k)
+
+#undef KQUANT_DEFINE_GATHER_QMV_SPLITK
+
 // Sorted-rhs gather GEMM (ALU/steel path), the non-NAX counterpart of
 // kq_gather_qmm_rhs_nax_tgp_impl. x rows arrive sorted by expert (the
 // SwitchGLU prefill layout): each BM output tile walks its row segments of

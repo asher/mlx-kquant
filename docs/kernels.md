@@ -202,9 +202,9 @@ last row and drops it at the store. `q2_k` and `q3_k` keep the runtime bound: th
 faster for them.
 
 A `q6_k` `quantized_matmul` with one activation row and no batch dimensions runs a split-K kernel
-when 4 divides N. The MoE gathers keep their own kernels. The eight simdgroups of a threadgroup
-share four output rows, divide the superblocks between them and add their partial sums in
-threadgroup memory. Each thread assembles four 6-bit codes at a time from 32-bit words and
+when 4 divides N. The fused MoE gathers keep their own kernels. The eight simdgroups of a
+threadgroup share four output rows, divide the superblocks between them and add their partial sums
+in threadgroup memory. Each thread assembles four 6-bit codes at a time from 32-bit words and
 pre-scales the activation for byte b of a word by 2^(-8b), so a weight costs one AND, one convert
 and one FMA. The row width is a Metal function constant, so each width gets its own pipeline with
 the superblock count and row stride folded. Under sustained load that ran about 1% faster than
@@ -225,6 +225,17 @@ split-K kernel read 450-465 GB/s at the lowest clock, against 385-395 GB/s for t
 and about 530 GB/s for bf16 GEMV. Once the clock dropped it read 1.12-1.14x the per-row rate at
 inner dimensions of 4096 and 5120, and matched it at 2048 and below. In short runs at a high clock
 the two kernels are within 3% of each other on every shape measured.
+
+`gather_qmm` with one activation row runs the same two split-K kernels per batch entry, for grouped
+projections such as the DeepSeek-V4 attention output and for SwitchGLU decode steps, when the row
+count of the tile divides N, K is 2048 or more and the call has fewer than 16384 output rows (N
+times the entries). Each entry then matches `quantized_matmul` on its expert bit for bit. On M5
+Max at 0.85-1.6 GHz, over 1 to 128 entries and N of 128 to 7168, it ran as fast as `gather_qmv` or
+faster on every such shape but one, `q6_k` at K 2048 and 15360 rows, 3% slower. It took 6-7% less
+time for `q8_0` and 4-6% less for `q6_k` at the DeepSeek-V4 shape of 8 groups of 1024 x 4096, and
+up to 38% less at one entry. From 16384 rows the `gather_qmv` grid fills the GPU, and at sustained
+clocks split-K ran up to 23% slower there. Below K 2048 the split leaves simdgroups idle and ran up
+to 2x slower. Those calls keep `gather_qmv`.
 
 Tuning levers (defaults are right for normal use):
 
@@ -355,6 +366,9 @@ Tuning levers (defaults are right for normal use):
   section). `0` restores the per-row kernels and `1` runs c32 on any GPU. `8` or `16` runs it at
   that many K-lanes per row. Unset takes it on M5 and later GPUs. A set `KQ_QMV_FINE` keeps the
   per-row kernels. Read live per call.
+- `KQ_GATHER_SPLITK` - the `q6_k` and `q8_0` split-K kernels for `gather_qmm` at one activation
+  row. `0` restores `gather_qmv`, `1` takes split-K at any K that 256 divides, and unset follows
+  the K and row-count rule above. Read live per call.
 - `KQ_QMV_SPLITK` - the `q6_k` and `q8_0` split-K kernels for one activation row. `0` restores
   the per-row kernels, as does a set `KQ_QMV_FINE`, so a tiling A/B keeps measuring the tiling it
   names. A lever that forces another route at one row, such as `KQ_VERIFY_NAX=1`, takes

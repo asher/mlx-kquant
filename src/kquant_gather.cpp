@@ -15,11 +15,12 @@
 // (~=6-8x faster than B separate gather_qmv vector-matmuls), while decode
 // (top_k<64 -> no sort -> B<16) falls through to gather_qmv.
 //
-// No split-K here, unlike the dense path: this grid already spans the
-// active experts, and verify cost grows with M because more experts get
-// touched, not from starvation. At [E=256, N=2048, K=7168, top_k=8] it
-// holds 78-83% of roofline across M8-M32, so a split has nothing to
-// recover.
+// At M 1, q8_0 and q6_k gathers whose K fills the split-K tile run the dense
+// split-K mat-vec per batch entry (gather_qmv_splitk). Above M 1 there is no
+// split-K: this grid already spans the active experts, and verify cost grows
+// with M because more experts get touched, not from starvation. At [E=256,
+// N=2048, K=7168, top_k=8] it holds 78-83% of roofline across M8-M32, so a
+// split has nothing to recover.
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
@@ -259,6 +260,96 @@ void gather_qmv(
 
   kq_log_dispatch(kname, x, out, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+// Entry rule of the split-K gathered mat-vec at one activation row, from K
+// and the output row count N * B. Measured on M5 Max at 0.85 to 1.6 GHz over
+// B 1 to 128 and N 128 to 7168: from K 2048 and under 16384 rows split-K
+// matched or beat gather_qmv but at q6_k K 2048 and 15360 rows (+3%). o_a,
+// 8 x 1024 x 4096: q8_0 -6 to -7%, q6_k -4 to -6%; one entry up to -38%.
+// From 16384 rows the gather_qmv grid fills the GPU, and at sustained clocks
+// split-K ran up to 23% slower there. Below K 2048, at two or more entries,
+// the idle simdgroups made split-K up to 2x slower.
+bool gather_qmv_splitk_on(int K, size_t rows) {
+  return K >= 2048 && rows < 16384;
+}
+
+// Gathered M=1 mat-vec through the split-K tile of q6_k or q8_0
+// (kq_<codec>_gather_qmv_splitk): each batch entry runs the dense split-K
+// mat-vec of its expert, so an entry's output matches quantized_matmul on
+// that expert bit for bit. KQ_GATHER_SPLITK, read per call: 0 keeps
+// gather_qmv, 1 takes split-K wherever the shape fits, unset follows
+// gather_qmv_splitk_on. Returns false, dispatching nothing, when the codec,
+// shape or pipeline does not fit.
+bool gather_qmv_splitk(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    array& out,
+    int group_size,
+    int bits,
+    int N,
+    int K,
+    Device& d,
+    const Stream& s,
+    const std::string& kquant_type) {
+  const bool q6 = kquant_type == "q6_k";
+  if (!q6 && kquant_type != "q8_0") {
+    return false;
+  }
+  const int rps = q6 ? kq_q6_k_splitk_rps : kq_q8_0_splitk_rps;
+  const int nsg = q6 ? kq_q6_k_splitk_nsg : kq_q8_0_splitk_nsg;
+  if (N % rps != 0 || K % qmv_fast_k_align() != 0) {
+    return false;
+  }
+  const int lever = kq_env_flag("KQ_GATHER_SPLITK", -1);
+  if (lever == 0 || (lever == -1 && !gather_qmv_splitk_on(K, out.size()))) {
+    return false;
+  }
+  const int B = out.size() / N;
+  std::string kname;
+  kname.reserve(64);
+  mx::concatenate(
+      kname,
+      kq_kname_prefix(kquant_type) + "gather_qmv_splitk_",
+      kq_type_string(x.dtype()),
+      "_gs_",
+      group_size,
+      "_b_",
+      bits);
+  MTL::ComputePipelineState* kernel = nullptr;
+  if (q6) {
+    // K is function constant 340, so the pipeline is keyed by row width too.
+    int k_const = K;
+    mx::metal::MTLFCList func_consts = {
+        {&k_const, MTL::DataType::DataTypeInt, 340}};
+    kernel =
+        kq_get_kernel(d, kname, kname + "_k" + std::to_string(K), func_consts);
+  } else {
+    kernel = kq_get_kernel(d, kname);
+  }
+  if (int(kernel->maxTotalThreadsPerThreadgroup()) < 32 * nsg) {
+    return false;
+  }
+  const MTL::Size grid_dims(1, N / rps, B);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  int c = 0;
+  ce.set_input_array(w, c++);
+  ce.set_input_array(scales, c++);
+  ce.set_input_array(x, c++);
+  ce.set_input_array(lhs_indices, c++);
+  ce.set_input_array(rhs_indices, c++);
+  ce.set_output_array(out, c++);
+  ce.set_bytes(K, c++);
+  ce.set_bytes(N, c++);
+  c = add_strides_and_shapes(ce, false, x, w, scales, c);
+  add_gather_strides_and_shapes(ce, lhs_indices, rhs_indices, c);
+  kq_log_dispatch(kname, x, out, grid_dims);
+  ce.dispatch_threadgroups(grid_dims, MTL::Size(32, nsg, 1));
+  return true;
 }
 
 // Sorted-rhs fast path (NAX variant, no biases): x rows are pre-sorted by
@@ -925,6 +1016,23 @@ void KQuantGatherQMM::eval_gpu(
   }
 
   if (transpose_) {
+    if (M == 1 &&
+        gather_qmv_splitk(
+            x,
+            w,
+            scales,
+            lhs_indices,
+            rhs_indices,
+            out,
+            group_size_,
+            bits_,
+            N,
+            K,
+            d,
+            s,
+            kquant_type_)) {
+      return;
+    }
     gather_qmv(
         x,
         w,

@@ -180,6 +180,7 @@
   instantiate_kquant_qmm_n(type, 32, 8, 1, q8_0)                        \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 32, 8, q8_0)     \
   instantiate_kquant_gather_qmv(gather_qmv,      type, 32, 8, q8_0)     \
+  instantiate_kquant_gather_qmv(gather_qmv_splitk, type, 32, 8, q8_0)  \
   instantiate_kquant_gather_qmm_t(type, 32, 8, true, q8_0)              \
   instantiate_kquant_gather_qmm_t(type, 32, 8, false, q8_0)             \
   instantiate_kquant_gather_qmm_seg_t(type, 32, 8, true, q8_0) \
@@ -413,6 +414,7 @@ instantiate_kquant_q5_k_for_type(float16_t)
   instantiate_kquant_qmm_n(type, 256, 6, 1, q6_k)                        \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 256, 6, q6_k)     \
   instantiate_kquant_gather_qmv(gather_qmv,      type, 256, 6, q6_k)     \
+  instantiate_kquant_gather_qmv(gather_qmv_splitk, type, 256, 6, q6_k)  \
   instantiate_kquant_gather_qmm_t(type, 256, 6, true, q6_k)              \
   instantiate_kquant_gather_qmm_t(type, 256, 6, false, q6_k)             \
   instantiate_kquant_gather_qmm_seg_t(type, 256, 6, true, q6_k) \

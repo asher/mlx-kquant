@@ -28,6 +28,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on an M3 Max they take 8 to 34% less time.
 - Source builds compile the Metal kernels in parallel, so `pip install` from
   source and rebuilds after a kernel edit finish sooner.
+- `q8_0` and `q6_k` `gather_qmm` at one activation row and K of 2048 or more take
+  2-7% less time, up to 38% less at one entry. `KQ_GATHER_SPLITK=0` restores the
+  previous kernels.
 
 ### Removed
 - Python 3.10 support. On Python 3.10, pip installs 0.5.4, the last release
