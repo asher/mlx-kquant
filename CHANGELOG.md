@@ -23,6 +23,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - On NAX GPUs (M5), `q4_1` `quantized_matmul` and `quantized_matmul_multi` at 2
   to 8 activation rows run the `verify_nax` kernels and follow the `q4_0`
   routing rows. These kernels and rows are not yet measured on `q4_1`.
+- The score-mixed MoE down gathers on `q4_1` expert stacks at one or two rows
+  and K of 2048 or more run 16 K-lanes per row, as `q4_0` does. At two rows
+  on an M3 Max they take 8 to 34% less time.
 - Source builds compile the Metal kernels in parallel, so `pip install` from
   source and rebuilds after a kernel edit finish sooner.
 

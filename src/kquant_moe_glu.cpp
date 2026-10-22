@@ -95,14 +95,16 @@ inline int kq_moe_pick_nx(int64_t rows, int K, bool wide_ok) {
 // iq2 grid codecs and q5_k lose in the chained regime, and every codec is
 // flat-to-negative at t >= 4 or K < 2048, so those keep the slot-parallel
 // form. Where c32 is on, iq3_xxs at t = 1 takes the c32 slot-parallel
-// kernel instead (M5 Max: 7-9% less time than this pick). KQ_MOE_NX still
-// forces a width.
+// kernel instead (M5 Max: 7-9% less time than this pick). q4_1 tracks q4_0
+// on an M3 Max (E=256 top-8, K=2048 and 4096, N=4096, chained, four runs):
+// 8-34% less time at t = 2 for both, and flat to mixed at t = 1 for both.
+// KQ_MOE_NX still forces a width.
 inline bool kq_moe_mix_ns_wide(const std::string& codec, int T, int K) {
   if (T > 2 || K < 2048) {
     return false;
   }
-  return codec == "q4_k" || codec == "q4_0" || codec == "q5_0" ||
-      codec == "iq3_xxs";
+  return codec == "q4_k" || codec == "q4_0" || codec == "q4_1" ||
+      codec == "q5_0" || codec == "iq3_xxs";
 }
 
 // Dedupe gathers for the MTP verify widths (KQ_MOE_DEDUP, default on; 0
