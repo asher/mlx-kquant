@@ -18,19 +18,19 @@
 // kquant_qmm_splitk_accum folds.
 //
 // A unit is one or more wire blocks, or half of one, and step s of a unit
-// is its s-th 16-wide NAX op. For pq2_0 and q4_0, step s consumes the
-// codec's verify_mma fragments 2s and 2s + 1 (kq_verify_mma.h), and left
-// element 2 jp + e is the activation at that codec's perm(2s + jp,
-// 2q + e). The q8_0 unit is four wire blocks, the q4_0_sb unit eight, the
-// q4_k unit a superblock and the q5_k, q6_k, q3_k and q2_k units half a
-// superblock, each with its own order. Block scales and mins are folded
-// into the half weights. Device loads and NAX ops of one simdgroup do not
-// overlap, so occupancy hides the loads and the host sizes the split count
-// for it (kq_verify_nax_splits). pq2_0 and q4_0 load a unit's activation
-// steps ahead of its NAX ops. The other codecs, whose Words are larger,
-// load one step at a time. Each order measured faster for its codecs on M5
-// Max. The right operand is written in element order, which ran 1.6x
-// faster than a strided order.
+// is its s-th 16-wide NAX op. For pq2_0, q4_0 and q4_1, step s consumes
+// the codec's verify_mma fragments 2s and 2s + 1 (kq_verify_mma.h), and
+// left element 2 jp + e is the activation at that codec's perm(2s + jp,
+// 2q + e). The q8_0 unit is four wire blocks, the q4_0_sb and q4_1_sb
+// units eight, the q4_k unit a superblock and the q5_k, q6_k, q3_k and
+// q2_k units half a superblock, each with its own order. Block scales and
+// mins are folded into the half weights. Device loads and NAX ops of one
+// simdgroup do not overlap, so occupancy hides the loads and the host
+// sizes the split count for it (kq_verify_nax_splits). pq2_0, q4_0 and
+// q4_1 load a unit's activation steps ahead of its NAX ops. The other
+// codecs, whose Words are larger, load one step at a time. Each order
+// measured faster for its codecs on M5 Max. The right operand is written
+// in element order, which ran 1.6x faster than a strided order.
 //
 // Codec contract (KqXxxNax):
 //   group: the wire block's weights, the kernel's group_size
@@ -295,6 +295,102 @@ struct KqQ4_0SbNax {
     return (as_type<half2>((src & 0x000F000Fu) | 0x64006400u) -
             half2(1032.0h)) *
         o.d[b];
+  }
+  static constexpr METAL_FUNC int xoff(short q, short s) {
+    return 64 * q + 4 * s;
+  }
+  template <typename T>
+  static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + xoff(q, s));
+    return vec<T, 4>(p[0], p[2], p[1], p[3]);
+  }
+};
+
+// Q4_1: KqQ4_0Nax's pairs and activation order, with the qs 2 bytes later
+// and the min folded in: code * d + m. A 20-byte block keeps the 4-byte
+// alignment of the row, so d and m are one word and the qs words load
+// whole. Two 32-weight blocks per iteration.
+struct KqQ4_1Nax {
+  static constant constexpr int group = KQ_Q4_1_GROUP;
+  static constant constexpr int block_k = KQ_Q4_1_GROUP;
+  static constant constexpr int block_bytes = KQ_Q4_1_BLOCK_BYTES;
+  static constant constexpr int ub = 2;
+  static constant constexpr bool x_ahead = true;
+  struct Words {
+    uint lo;
+    uint hi;
+    half2 dm;
+  };
+  static METAL_FUNC Words load(const device uint8_t* row, int u, short q) {
+    const device uint* bp = (const device uint*)(row + u * block_bytes);
+    Words o;
+    o.dm = as_type<half2>(bp[0]);
+    const uint wv = bp[1 + q];
+    o.lo = wv & 0x0F0F0F0Fu;
+    o.hi = (wv >> 4) & 0x0F0F0F0Fu;
+    return o;
+  }
+  static METAL_FUNC half2 pair(thread const Words& o, short f) {
+    const uint src = (f < 2 ? o.lo : o.hi) >> (8 * (f & 1));
+    const half2 qv =
+        as_type<half2>((src & 0x000F000Fu) | 0x64006400u) - half2(1024.0h);
+    return fma(qv, half2(o.dm.x), half2(o.dm.y));
+  }
+  static constexpr METAL_FUNC int xoff(short q, short s) {
+    return 16 * s + 4 * q;
+  }
+  template <typename T>
+  static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + xoff(q, s));
+    return vec<T, 4>(p[0], p[2], p[1], p[3]);
+  }
+};
+
+// Q4_1, eight-block unit: KqQ4_0SbNax's order over eight 20-byte blocks
+// (256 weights, 160 bytes). Lane-quad q owns blocks 2q and 2q + 1, the 40
+// bytes at 40q, read as ten aligned words with no funnel shift: word 0 is
+// block 2q's d and m and words 1 to 4 its qs, word 5 and words 6 to 9 the
+// same of block 2q + 1. Rows of a K that is a multiple of 256 start 4-byte
+// aligned from a weight base the host checks.
+struct KqQ4_1SbNax {
+  static constant constexpr int group = KQ_Q4_1_GROUP;
+  static constant constexpr int block_k = 8 * KQ_Q4_1_GROUP;
+  static constant constexpr int block_bytes = 8 * KQ_Q4_1_BLOCK_BYTES;
+  static constant constexpr int ub = 1;
+  static constant constexpr bool x_ahead = false;
+  struct Words {
+    uint w[8];
+    half2 d;
+    half2 m;
+  };
+  static METAL_FUNC Words load(const device uint8_t* row, int u, short q) {
+    const device uint* wp = (const device uint*)(row + u * block_bytes +
+                                                 2 * KQ_Q4_1_BLOCK_BYTES * q);
+    uint t[10];
+#pragma unroll
+    for (short i = 0; i < 10; ++i) {
+      t[i] = wp[i];
+    }
+    Words o;
+    const half2 a = as_type<half2>(t[0]);
+    const half2 b = as_type<half2>(t[5]);
+    o.d = half2(a.x, b.x);
+    o.m = half2(a.y, b.y);
+#pragma unroll
+    for (short i = 0; i < 4; ++i) {
+      o.w[i] = t[1 + i];
+      o.w[4 + i] = t[6 + i];
+    }
+    return o;
+  }
+  static METAL_FUNC half2 pair(thread const Words& o, short f) {
+    const short s = f >> 1;
+    const short b = s >> 3;
+    const uint w = o.w[4 * b + (s & 3)];
+    const uint src = (((s >> 2) & 1) ? (w >> 4) : w) >> (8 * (f & 1));
+    const half2 qv =
+        as_type<half2>((src & 0x000F000Fu) | 0x64006400u) - half2(1024.0h);
+    return fma(qv, half2(o.d[b]), half2(o.m[b]));
   }
   static constexpr METAL_FUNC int xoff(short q, short s) {
     return 64 * q + 4 * s;
@@ -1114,6 +1210,8 @@ KQ_DEFINE_VERIFY_NAX_KERNEL(q2_0, KqQ2_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(nvfp4, KqNvfp4Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_0, KqQ4_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_0_sb, KqQ4_0SbNax)
+KQ_DEFINE_VERIFY_NAX_KERNEL(q4_1, KqQ4_1Nax)
+KQ_DEFINE_VERIFY_NAX_KERNEL(q4_1_sb, KqQ4_1SbNax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q8_0, KqQ8_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_k, KqQ4_KNax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(iq4_xs, KqIq4XsNax)
@@ -1128,6 +1226,8 @@ KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q2_0, KqQ2_0Nax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(nvfp4, KqNvfp4Nax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_0, KqQ4_0Nax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_0_sb, KqQ4_0SbNax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_1, KqQ4_1Nax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_1_sb, KqQ4_1SbNax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q8_0, KqQ8_0Nax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_k, KqQ4_KNax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(iq4_xs, KqIq4XsNax)
