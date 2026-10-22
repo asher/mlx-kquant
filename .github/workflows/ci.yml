@@ -76,7 +76,7 @@ jobs:
       - name: Build extension + test deps
         run: |
           python -m pip install --upgrade pip
-          pip install "setuptools>=77" wheel "mlx==0.32.3" "nanobind==3.0.1" "cmake>=3.27" gguf numpy pytest "mlx-lm>=0.27" "transformers!=5.13.0"
+          pip install "setuptools>=77" wheel "mlx==0.32.3" "nanobind==3.0.1" "cmake>=3.27" gguf numpy pytest pytest-xdist "mlx-lm>=0.27" "transformers!=5.13.0"
           pip install -e . --no-build-isolation
 
       - name: Codec lint (incl. runtime kq.codecs() leg)
@@ -116,9 +116,11 @@ jobs:
 
       # Full suite when a GPU is present: op tests + the model-level round-trips
       # (encode/load). Asset-gated KQUANT_TEST_* tests skip without their assets.
+      # Two workers on the runner's three cores; an xdist_group keeps a file of
+      # large tests on one worker, so they never overlap.
       - name: Op + model tests (GPU)
         if: env.FULL == 'true' && steps.gpu.outputs.available == '1'
-        run: pytest -q --continue-on-collection-errors --junitxml=junit.xml tests/
+        run: pytest -q -n 2 --dist loadgroup --continue-on-collection-errors --junitxml=junit.xml tests/
 
       # The slowest test files and tests in the job summary, and the raw
       # report as an artifact, to see where the GPU suite spends its time.

@@ -70,6 +70,10 @@ NO_ROW_CLASS = [f"applegpu_g{g}p" for g in (13, 14, 15, 16, 17, 18)] + [
 
 MATMUL_CODECS = sorted(c for c in CODEC_GEOMETRY if kq.codec_has_matmul(c))
 
+# The numeric cases hold several GiB each, so under xdist they run on one
+# worker, one at a time.
+pytestmark = pytest.mark.xdist_group("dequant_rows")
+
 
 def _metal():
     if force_cpu():

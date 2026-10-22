@@ -76,6 +76,7 @@ testpaths = ["tests"]
 markers = [
   "integration: end-to-end test needing a real GGUF (and, for parity, a llama.cpp binary); skipped unless KQUANT_TEST_GGUF_DIR is set",
   "slow: long-running (large prompts / long generation)",
+  "xdist_group: tests that share one pytest-xdist worker under --dist loadgroup",
 ]
 # sentencepiece (a SWIG extension pulled in transitively via mlx-lm/transformers)
 # emits these DeprecationWarnings on import under Python 3.12+. They are upstream
