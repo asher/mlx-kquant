@@ -211,13 +211,46 @@ inline bool kq_moe_sp(int64_t coarse_tgs, int S) {
 }
 
 // Threads a slot-parallel launch may use: the pipeline's limit, or a lower
-// KQ_MOE_SP_THREAD_CAP (test lever, read per call). A launch of 64 * S
-// threads past it takes the loop kernel.
+// KQ_MOE_SP_THREAD_CAP (test lever, read per call). A slot-parallel launch
+// past it (64 threads per simdgroup pair) takes the loop kernel.
 template <typename K>
 inline int kq_moe_sp_cap(K kernel) {
   const int cap = int(kernel->maxTotalThreadsPerThreadgroup());
   const int v = kq_env_lever_from("KQ_MOE_SP_THREAD_CAP", cap, 32);
   return v < cap ? v : cap;
+}
+
+// Pieces of each shared row in the score-mixed down with a shared expert
+// (kq_ext_gather_qmv_mix_sp gives each piece a simdgroup pair). The loop
+// and pair kernels sum the same pieces in the same order, so the forms
+// stay bit-identical to each other. Two pieces at one row, where the shared
+// row is the longest slot of a grid with few threadgroups; one at two rows
+// and more, where the grid fills the GPU and pieces only add work. One on
+// the half-dot kernels and where the shared codec is the routed one (rows
+// of equal work, and the tuned q6_k and q8_0 loop kernels take no pieces).
+// At most the shared row's block count, and the count that keeps the
+// slot-parallel launch within 16 simdgroup pairs. KQ_MOE_SX_SPLIT=<n>
+// forces n pieces at any row count, within the same bounds (read per
+// call).
+inline int kq_moe_sx_split(
+    const std::string& t,
+    const std::string& st,
+    int K,
+    int n_route,
+    int NS,
+    bool use_half,
+    int T) {
+  const KQuantCodec* sc = codec_by_name(st);
+  if (use_half || NS < 1 || sc == nullptr || st == t) {
+    return 1;
+  }
+  const int cap = std::min(K / sc->weights_per_block, (16 - n_route) / NS);
+  if (cap <= 1) {
+    return 1;
+  }
+  const int forced = kq_env_lever_from("KQ_MOE_SX_SPLIT", 0, 1);
+  const int sp = forced > 0 ? forced : (T == 1 ? 2 : 1);
+  return std::max(1, std::min(sp, cap));
 }
 
 // A shared expert k times as wide as a routed expert runs as k shared
@@ -292,7 +325,8 @@ inline void kq_gather_qmv_pair_gpu(
     int K,
     int nx,
     int sg,
-    int NS) {
+    int NS,
+    int SP) {
   auto kernel = kq_get_kernel(d, kname, kq_moe_nx_setting());
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
@@ -310,6 +344,7 @@ inline void kq_gather_qmv_pair_gpu(
   ce.set_bytes(SC, 9);
   ce.set_bytes(T, 10);
   ce.set_bytes(NS, 11);
+  ce.set_bytes(SP, 12);
   const int fsg = kq_moe_fit_sg(kernel, sg);
   MTL::Size group_dims(32, fsg, 1);
   MTL::Size grid_dims(N / (fsg * 32 / nx), 1, (T + 1) / 2);
@@ -934,6 +969,8 @@ void KQuantGatherQMVMixKQ::eval_gpu(
       (shexp_type_ == kquant_type_ || shexp_type_ == "q5_k" ||
        shexp_type_ == "q6_k" || shexp_type_ == "q8_0");
   const bool dd_ok = !use_half && S <= 16 && kq_moe_dedup(T, KQ_DD_MAX_T);
+  const int SP =
+      kq_moe_sx_split(kquant_type_, shexp_type_, K, S - NS, NS, use_half, T);
   const std::string sp_stem = shexp_type_ == kquant_type_
       ? kq_gather_stem(kquant_type_, K)
       : kquant_type_ + "_sx_" + shexp_type_;
@@ -952,9 +989,10 @@ void KQuantGatherQMVMixKQ::eval_gpu(
     const std::string kname = "kq_" + sp_stem + "_gather_qmv_mix_sp_" +
         (c32 ? "c32_" : "") + kq_type_string(x.dtype());
     auto kernel = kq_get_kernel(d, kname);
-    // 64 * S threads must fit the pipeline; the loop kernel serves the
-    // call when they do not.
-    if (64 * S <= kq_moe_sp_cap(kernel)) {
+    // 64 threads per simdgroup pair must fit the pipeline; the loop kernel
+    // serves the call when they do not.
+    const int pairs = S - NS + NS * SP;
+    if (64 * pairs <= kq_moe_sp_cap(kernel)) {
       kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
       auto& ce = mx::metal::get_command_encoder(s);
       ce.set_compute_pipeline_state(kernel);
@@ -970,7 +1008,8 @@ void KQuantGatherQMVMixKQ::eval_gpu(
       const int SC = scores.shape(1);
       ce.set_bytes(SC, 9);
       ce.set_bytes(NS, 10);
-      MTL::Size group_dims(32, 2 * S, 1);
+      ce.set_bytes(SP, 11);
+      MTL::Size group_dims(32, 2 * pairs, 1);
       MTL::Size grid_dims(N / 8, 1, T);
       kq_log_dispatch(kname, x, out, grid_dims, group_dims);
       ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -1005,7 +1044,8 @@ void KQuantGatherQMVMixKQ::eval_gpu(
         K,
         nx,
         kq_moe_pick_sg(kquant_type_, N, nx),
-        NS);
+        NS,
+        SP);
     return;
   }
   int nx = nx_one;
@@ -1040,6 +1080,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   const int SC = scores.shape(1);
   ce.set_bytes(SC, 9);
   ce.set_bytes(NS, 10);
+  ce.set_bytes(SP, 11);
   const int sg = kq_moe_fit_sg(
       kernel,
       use_half ? kq_moe_pick_sg_h(N, nx)
@@ -1116,7 +1157,8 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
         K,
         nx,
         kq_moe_pick_sg(kquant_type_, N, nx),
-        0);
+        0,
+        1);
   } else {
     bool sp = nx == 8 && kq_moe_sp((int64_t)T * (N / 8), S) &&
         kq_moe_mix_form(true, false) == KQ_MIX_SP;

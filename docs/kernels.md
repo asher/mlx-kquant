@@ -1255,6 +1255,30 @@ shared). When the pipeline takes fewer threads, the call runs on the loop kernel
 - `KQ_MOE_SP_THREAD_CAP=<n>` lowers the thread limit of the slot-parallel downs (both score-mixed
   gathers) to n, so a launch of more than n threads runs the loop kernel. Read per call. Test lever.
 
+### Shared rows in pieces
+
+A shared expert is often stored in a wider codec than the routed experts (`q8_0` or `q5_k` over
+`iq2` and `iq3` experts), so in the score-mixed down its row holds several times the bytes of a
+routed row. At one activation row the grid has few threadgroups, and each one waits on its shared
+slot. There `gather_qmv_mix_kq` runs each shared row as two pieces of whole blocks, and the
+slot-parallel kernel gives each piece its own simdgroup pair. The loop and dedupe kernels sum the
+same pieces in the same order, so every form gives the same bits at a given piece count. A shared
+expert in the routed codec, and the half-dot kernels, keep one piece. The count is at most the
+shared row's block count, and at most what keeps the launch within 16 simdgroup pairs.
+
+On M5 Max at about 1.05 GHz, back to back over 16 rounds with 96 experts, two pieces took 3.5-9.8%
+less time than one at one row over the seven down codec pairs of DeepSeek-V4.1 (hidden 5120,
+expert width 2304, top 6), and 2.1-2.6% less at DeepSeek-V3 shapes (hidden 7168, expert width
+2048, top 8). Three and four pieces gained less. At 2 to 8 rows two pieces took up to 4.2% longer,
+so wider calls keep one piece.
+
+In the fused MoE gathers, a one-row call and a multi-row call of the same weights may sum in a
+different order, so their outputs can differ in the last bits. By default the 32-weight step and
+the shared row pieces both serve one row only.
+
+- `KQ_MOE_SX_SPLIT=<n>` runs each shared row as n pieces at any row count, within the same bounds.
+  `1` restores one piece. Read per call. A/B lever.
+
 ## Attention
 
 Scaled-dot-product variants for shapes stock MLX's fused allowlist excludes, plus the sparse
