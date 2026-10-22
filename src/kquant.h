@@ -613,23 +613,32 @@ bool codec_has_moe_glu(const std::string& kquant_type);
 
 // True when moe_glu_gather_shexp_kq has a kernel for expert stacks in
 // kquant_type with the shared expert's gate in shexp_gate_type and its up
-// in shexp_up_type ("silu" only when the three are not one upcast pair).
+// in shexp_up_type ("silu" only when the three are not one upcast pair),
+// for a shared expert shared_slots routed experts wide.
 bool shexp_glu_combo_has_kernel(
     const std::string& kquant_type,
     const std::string& shexp_gate_type,
-    const std::string& shexp_up_type);
+    const std::string& shexp_up_type,
+    int shared_slots = 1);
 
 // True when gather_qmv_mix_kq has a kernel for expert stacks in kquant_type
-// with the shared expert's down tensor in shexp_type.
+// with the shared expert's down tensor in shexp_type, for a shared expert
+// shared_slots routed experts wide. slot_width is the routed expert width
+// (the down input width); each shared slot must start on a whole
+// shexp_type block, so shared_slots > 1 needs it.
 bool shexp_mix_combo_has_kernel(
     const std::string& kquant_type,
-    const std::string& shexp_type);
+    const std::string& shexp_type,
+    int shared_slots = 1,
+    int slot_width = 0);
 
 // True when gather_qmv_mix_kq runs that combination on its slot-parallel
 // kernel at decode and verify widths.
 bool shexp_mix_slot_parallel(
     const std::string& kquant_type,
-    const std::string& shexp_type);
+    const std::string& shexp_type,
+    int shared_slots = 1,
+    int slot_width = 0);
 
 // DeepSeek-V4-Flash sparse attention: sliding local window + gathered
 // indexer-selected pooled rows + per-head sinks in one dispatch (flash
@@ -847,14 +856,15 @@ mx::array gather_qmv_kq(
     const std::optional<mx::array>& lora_rows = std::nullopt,
     mx::StreamOrDevice s = {});
 
-// moe_glu_gather_kq with the block's shared expert folded in as one extra
-// slot: shexp_gate_w / shexp_up_w are single-expert 2-D wire-byte tensors
-// [N, bytes_per_row(shexp codec)] shape-matched to one expert stack row.
+// moe_glu_gather_kq with the block's shared expert folded in as k extra
+// slots: shexp_gate_w / shexp_up_w are 2-D wire-byte tensors
+// [k * N, bytes_per_row(shexp codec)], N the expert stack width; shared
+// slot j holds rows [j N, (j + 1) N).
 // shexp_kquant_type defaults to kquant_type; a different codec (mixed-codec
 // blocks, UD-style upcast shexp) must be q5_k, q6_k or q8_0. act
 // "silu_limit" (deepseek-v4 LimitedSwiGLU) needs limit > 0 and clamps the
 // routed and the shared slots alike.
-// Returns [T, R + 1, N]; the last slot is the shared expert.
+// Returns [T, R + k, N]; the last k slots are the shared expert.
 mx::array moe_glu_gather_shexp_kq(
     mx::array x,
     mx::array gate_w,
@@ -869,10 +879,13 @@ mx::array moe_glu_gather_shexp_kq(
     const std::string& shexp_up_kquant_type = "",
     mx::StreamOrDevice s = {});
 
-// Down projection with the routing mix folded in: x [T, S, K] (slot S-1 =
-// shared expert), indices [T, S-1], scores [T, S] (routed weights then the
-// sigmoid shared-expert gate). Accumulates all S slots in f32 and returns
-// [T, N] -- replaces gather + (y * scores).sum + shared add. Metal-only.
+// Down projection with the routing mix folded in: x [T, S, K] (the last k
+// slots = shared expert), shexp_w [N, bytes_per_row(k * K)], indices
+// [T, S - k], scores [T, S] (routed weights then the shared-expert gate),
+// or [T, S - k] with the shared slots at weight 1. Shared slot j reads
+// columns [j K, (j + 1) K), so K must be whole shexp codec blocks.
+// Accumulates all S slots in f32 and returns [T, N] -- replaces gather +
+// (y * scores).sum + shared add. Metal-only.
 mx::array gather_qmv_mix_kq(
     mx::array x,
     mx::array w,

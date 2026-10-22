@@ -195,23 +195,31 @@ NB_MODULE(_ext, m) {
       "kquant_type"_a,
       "shexp_gate_type"_a,
       "shexp_up_type"_a,
+      "shared_slots"_a = 1,
       "True when moe_glu_gather_shexp_kq has a kernel for expert stacks in "
       "kquant_type with the shared expert's gate and up tensors in these "
-      "two codecs.");
+      "two codecs, the shared expert shared_slots routed experts wide.");
 
   m.def(
       "shexp_mix_combo_has_kernel",
       &mlx_kquant::shexp_mix_combo_has_kernel,
       "kquant_type"_a,
       "shexp_type"_a,
+      "shared_slots"_a = 1,
+      "slot_width"_a = 0,
       "True when gather_qmv_mix_kq has a kernel for expert stacks in "
-      "kquant_type with the shared expert's down tensor in shexp_type.");
+      "kquant_type with the shared expert's down tensor in shexp_type, the "
+      "shared expert shared_slots routed experts wide. slot_width is the "
+      "routed expert width; shared_slots > 1 needs it, and each shared slot "
+      "must start on a whole shexp_type block.");
 
   m.def(
       "shexp_mix_slot_parallel",
       &mlx_kquant::shexp_mix_slot_parallel,
       "kquant_type"_a,
       "shexp_type"_a,
+      "shared_slots"_a = 1,
+      "slot_width"_a = 0,
       "True when gather_qmv_mix_kq runs that codec combination on its "
       "slot-parallel kernel at decode and verify widths.");
 
@@ -2158,16 +2166,18 @@ NB_MODULE(_ext, m) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
-        moe_glu_gather_kq with the block's shared expert folded in as one
-        extra slot (the last), fed by single-expert 2-D wire-byte tensors
-        row-shape-matched to the expert stack.
+        moe_glu_gather_kq with the block's shared expert folded in as k
+        extra slots (the last k), fed by 2-D wire-byte tensors k expert
+        widths tall. A shared expert of width k * N runs as k slots; slot j
+        holds rows [j N, (j + 1) N).
 
         Args:
             x (array): activations [T, K], float16/bfloat16. K % 256 == 0.
             gate_w (array): uint8 wire bytes (n_experts, N, bytes_per_row).
             up_w (array): uint8 wire bytes, same shape as gate_w.
-            shexp_gate_w (array): uint8 wire bytes (N, bytes_per_row).
-            shexp_up_w (array): uint8 wire bytes (N, bytes_per_row).
+            shexp_gate_w (array): uint8 wire bytes (k * N, bytes_per_row).
+            shexp_up_w (array): uint8 wire bytes, same shape as
+                shexp_gate_w.
             kquant_type (str): expert codec with a fused kernel.
             indices (array): expert indices [T, R].
             act (str): 'silu' (default), 'gelu' (tanh approx) or
@@ -2182,7 +2192,7 @@ NB_MODULE(_ext, m) {
                 combos run act 'silu' only.
 
         Returns:
-            array: activated hidden states [T, R + 1, N] in x.dtype.
+            array: activated hidden states [T, R + k, N] in x.dtype.
       )");
 
   m.def(
@@ -2199,17 +2209,19 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         Gathered down projection with the routing mix folded in: every slot
-        (the last being the shared expert) is accumulated in f32 weighted by
-        its score, replacing gather + (y * scores).sum + shared add.
+        (the last k being the shared expert) is accumulated in f32 weighted
+        by its score, replacing gather + (y * scores).sum + shared add.
+        Shared slot j reads columns [j K, (j + 1) K) of shexp_w, so K must
+        be whole blocks of the shared codec.
 
         Args:
             x (array): activations [T, S, K], float16/bfloat16. K % 256 == 0.
             w (array): uint8 wire bytes (n_experts, N, bytes_per_row).
-            shexp_w (array): uint8 wire bytes (N, bytes_per_row).
+            shexp_w (array): uint8 wire bytes (N, bytes_per_row(k * K)).
             kquant_type (str): expert codec with a fused kernel.
-            indices (array): expert indices [T, S - 1].
-            scores (array): mix weights [T, S], or [T, S - 1] with the
-                shared slot at an implicit weight of 1; cast to float32.
+            indices (array): expert indices [T, S - k].
+            scores (array): mix weights [T, S], or [T, S - k] with the
+                shared slots at an implicit weight of 1; cast to float32.
             shexp_kquant_type (str): shared-expert codec; '' (default) =
                 kquant_type. Mixed combos must be q5_k, q6_k or q8_0, or
                 pass shexp_mix_combo_has_kernel.

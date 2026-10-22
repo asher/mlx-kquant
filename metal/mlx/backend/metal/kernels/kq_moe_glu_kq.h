@@ -8,12 +8,15 @@
 //   kq_<codec>_gather_qmv:  a gathered matvec (the down projection), one
 //     activation row per (token, expert-slot).
 //   kq_<codec>_moe_glu_gather_shexp:  moe_glu_gather with the shared expert
-//     folded in as one extra grid row (tid.y == R reads the 2-D shexp gate/up
-//     tensors instead of the expert stack); out is [T, R+1, N].
+//     folded in as NS extra grid rows (tid.y == R + j reads rows
+//     [j N, (j + 1) N) of the 2-D shexp gate/up tensors [NS N, row bytes]
+//     instead of the expert stack); out is [T, R + NS, N].
 //   kq_<codec>_gather_qmv_mix:  down projection with the routing mix folded
-//     in: one threadgroup accumulates all S slots (last slot = shared expert)
-//     weighted by scores[t, s] in f32, writing [T, N] directly -- no
-//     [T, R, N] intermediate and no mul/sum/add glue kernels.
+//     in: one threadgroup accumulates all S slots (the last NS = shared
+//     expert, slot R + j reading columns [j K, (j + 1) K) of the shared down
+//     tensor [N, row bytes of NS K]) weighted by scores[t, s] in f32,
+//     writing [T, N] directly -- no [T, R, N] intermediate and no
+//     mul/sum/add glue kernels.
 //
 // Weights are GGUF wire bytes (n_experts, out_dims, bytes_per_row), the same
 // layout KQuantSwitchLinear stores and kq.gather_qmm reads. Inner loops mirror
@@ -275,6 +278,7 @@ template <typename T, int ACT>
     const constant int& K [[buffer(7)]],
     const constant int& N [[buffer(8)]],
     const constant float& limit [[buffer(9)]],
+    const constant int& NS [[buffer(10)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -293,9 +297,10 @@ template <typename T, int ACT>
   const int l0 = 4 * il;
   const int is = 8 * ip + l0 / 16;
 
-  const int n_route = tpg.y - 1;
-  const bool shared_slot = int(tid.y) == n_route;
-  const int expert = shared_slot ? 0 : int(indices[tid.z * n_route + tid.y]);
+  const int n_route = tpg.y - NS;
+  const bool shared_slot = int(tid.y) >= n_route;
+  const int expert = shared_slot ? int(tid.y) - n_route
+                                 : int(indices[tid.z * n_route + tid.y]);
   const device uint8_t* gsrc = shared_slot ? sgw : gw;
   const device uint8_t* usrc = shared_slot ? suw : uw;
   const int out_row = tid.x * 8 + simd_gid * results_per_simdgroup;
@@ -377,6 +382,7 @@ template <typename T, int results_per_simdgroup = 4>
     const constant int& N [[buffer(7)]],
     const constant int& S [[buffer(8)]],
     const constant int& SC [[buffer(9)]],
+    const constant int& NS [[buffer(10)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -397,11 +403,15 @@ template <typename T, int results_per_simdgroup = 4>
   const int row_bytes = K * KQ_Q6_K_BLOCK_BYTES / KQ_Q6_K_SUPERBLOCK;
   const int nb = K / KQ_Q6_K_SUPERBLOCK;
 
+  const int n_route = S - NS;
   for (int slot = 0; slot < S; slot++) {
-    const bool shared_slot = slot == S - 1;
-    const device uint8_t* src = shared_slot ? sw : w;
-    const int expert = shared_slot ? 0 : int(indices[tid.z * (S - 1) + slot]);
-    // SC == S - 1: the shared slot's weight is an implicit 1
+    // Shared slot j reads columns [j K, (j + 1) K) of each shared row.
+    const bool shared_slot = slot >= n_route;
+    const device uint8_t* src =
+        shared_slot ? sw + (int64_t)(slot - n_route) * row_bytes : w;
+    const int64_t rstride = (int64_t)(shared_slot ? NS : 1) * row_bytes;
+    const int expert = shared_slot ? 0 : int(indices[tid.z * n_route + slot]);
+    // SC == S - NS: the shared slots' weight is an implicit 1
     const U score = slot < SC ? U(scores[tid.z * SC + slot]) : U(1);
     const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
     const int64_t row0 = (int64_t)expert * N + out_row;
@@ -418,7 +428,7 @@ template <typename T, int results_per_simdgroup = 4>
       }
       for (int row = 0; row < results_per_simdgroup; row++) {
         const device uint8_t* sb_addr =
-            src + (row0 + row) * row_bytes + ib * KQ_Q6_K_BLOCK_BYTES;
+            src + (row0 + row) * rstride + ib * KQ_Q6_K_BLOCK_BYTES;
         const device uint8_t* q1 = kq_q6_k_ql_ptr(sb_addr) + 64 * ip + l0;
         const device uint8_t* q2 = q1 + 32;
         const device uint8_t* qh = kq_q6_k_qh_ptr(sb_addr) + 32 * ip + l0;
@@ -612,6 +622,7 @@ template <typename T, int ACT>
     const constant int& K [[buffer(7)]],
     const constant int& N [[buffer(8)]],
     const constant float& limit [[buffer(9)]],
+    const constant int& NS [[buffer(10)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -625,9 +636,10 @@ template <typename T, int ACT>
   thread U rg[results_per_simdgroup] = {0};
   thread U ru[results_per_simdgroup] = {0};
 
-  const int n_route = tpg.y - 1;
-  const bool shared_slot = int(tid.y) == n_route;
-  const int expert = shared_slot ? 0 : int(indices[tid.z * n_route + tid.y]);
+  const int n_route = tpg.y - NS;
+  const bool shared_slot = int(tid.y) >= n_route;
+  const int expert = shared_slot ? int(tid.y) - n_route
+                                 : int(indices[tid.z * n_route + tid.y]);
   const device uint8_t* gsrc = shared_slot ? sgw : gw;
   const device uint8_t* usrc = shared_slot ? suw : uw;
   const int out_row = tid.x * 8 + simd_gid * results_per_simdgroup;
@@ -688,6 +700,7 @@ template <typename T, int results_per_simdgroup = 4>
     const constant int& N [[buffer(7)]],
     const constant int& S [[buffer(8)]],
     const constant int& SC [[buffer(9)]],
+    const constant int& NS [[buffer(10)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -703,11 +716,15 @@ template <typename T, int results_per_simdgroup = 4>
   const int row_bytes = K * KQ_Q8_0_BLOCK_BYTES / KQ_Q8_0_GROUP;
   const int lane_k_offset = simd_lid * values_per_thread;
 
+  const int n_route = S - NS;
   for (int slot = 0; slot < S; slot++) {
-    const bool shared_slot = slot == S - 1;
-    const device uint8_t* src = shared_slot ? sw : w;
-    const int expert = shared_slot ? 0 : int(indices[tid.z * (S - 1) + slot]);
-    // SC == S - 1: the shared slot's weight is an implicit 1
+    // Shared slot j reads columns [j K, (j + 1) K) of each shared row.
+    const bool shared_slot = slot >= n_route;
+    const device uint8_t* src =
+        shared_slot ? sw + (int64_t)(slot - n_route) * row_bytes : w;
+    const int64_t rstride = (int64_t)(shared_slot ? NS : 1) * row_bytes;
+    const int expert = shared_slot ? 0 : int(indices[tid.z * n_route + slot]);
+    // SC == S - NS: the shared slots' weight is an implicit 1
     const U score = slot < SC ? U(scores[tid.z * SC + slot]) : U(1);
     const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
     const int64_t row0 = (int64_t)expert * N + out_row;
@@ -724,7 +741,7 @@ template <typename T, int results_per_simdgroup = 4>
 
       for (int row = 0; row < results_per_simdgroup; row++) {
         const device uint8_t* block_addr =
-            src + (row0 + row) * row_bytes + block_id * KQ_Q8_0_BLOCK_BYTES;
+            src + (row0 + row) * rstride + block_id * KQ_Q8_0_BLOCK_BYTES;
         const U d = U(kq_q8_0_d(block_addr));
         const device int8_t* q_ptr = kq_q8_0_q_ptr(block_addr) + within;
         U partial = 0;
@@ -1142,6 +1159,7 @@ template <
     const constant int& K [[buffer(7)]],
     const constant int& N [[buffer(8)]],
     const constant float& limit [[buffer(9)]],
+    const constant int& NS [[buffer(10)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint3 tptg [[threads_per_threadgroup]],
@@ -1150,8 +1168,8 @@ template <
   constexpr int RPS = 32 / NX;
   const short tx = short(simd_lid % NX);
   const short ty = short(simd_lid / NX);
-  const int n_route = tpg.y - 1;
-  const bool shared_slot = int(tid.y) == n_route;
+  const int n_route = tpg.y - NS;
+  const bool shared_slot = int(tid.y) >= n_route;
   const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
 
   x += (int64_t)tid.z * K;
@@ -1161,8 +1179,15 @@ template <
   KQ_EXT_STAGE_LUTS(SCodec, kq_sluts)
   float2 gu;
   if (shared_slot) {
+    // Shared slot j reads shared rows [j N, (j + 1) N).
     gu = kq_ext_glu_row_partial<T, SCodec, NX, C32>(
-        sgw, suw, x, (int64_t)out_row, K, tx, kq_sluts);
+        sgw,
+        suw,
+        x,
+        (int64_t)(int(tid.y) - n_route) * N + out_row,
+        K,
+        tx,
+        kq_sluts);
   } else {
     const int expert = int(indices[tid.z * n_route + tid.y]);
     gu = kq_ext_glu_row_partial<T, Codec, NX, C32>(
@@ -1196,6 +1221,7 @@ template <
     const constant int& K [[buffer(7)]],
     const constant int& N [[buffer(8)]],
     const constant float& limit [[buffer(9)]],
+    const constant int& NS [[buffer(10)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint3 tptg [[threads_per_threadgroup]],
@@ -1204,8 +1230,8 @@ template <
   constexpr int RPS = 32 / NX;
   const short tx = short(simd_lid % NX);
   const short ty = short(simd_lid / NX);
-  const int n_route = tpg.y - 1;
-  const bool shared_slot = int(tid.y) == n_route;
+  const int n_route = tpg.y - NS;
+  const bool shared_slot = int(tid.y) >= n_route;
   const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
 
   x += (int64_t)tid.z * K;
@@ -1216,10 +1242,9 @@ template <
   KQ_EXT_STAGE_LUTS(SUCodec, kq_suluts)
   float2 gu;
   if (shared_slot) {
-    gu.x = kq_ext_row_partial<T, SGCodec, NX>(
-        sgw, x, (int64_t)out_row, K, tx, kq_sgluts);
-    gu.y = kq_ext_row_partial<T, SUCodec, NX>(
-        suw, x, (int64_t)out_row, K, tx, kq_suluts);
+    const int64_t srow = (int64_t)(int(tid.y) - n_route) * N + out_row;
+    gu.x = kq_ext_row_partial<T, SGCodec, NX>(sgw, x, srow, K, tx, kq_sgluts);
+    gu.y = kq_ext_row_partial<T, SUCodec, NX>(suw, x, srow, K, tx, kq_suluts);
   } else {
     const int expert = int(indices[tid.z * n_route + tid.y]);
     gu = kq_ext_glu_row_partial<T, Codec, NX>(
@@ -1352,6 +1377,7 @@ template <
     const constant int& N [[buffer(7)]],
     const constant int& S [[buffer(8)]],
     const constant int& SC [[buffer(9)]],
+    const constant int& NS [[buffer(10)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -1363,20 +1389,23 @@ template <
 
   KQ_EXT_STAGE_LUTS(Codec, kq_luts)
   KQ_EXT_STAGE_LUTS(SCodec, kq_sluts)
+  const int n_route = S - NS;
   float result = 0.0f;
-  for (int slot = 0; slot < S - 1; slot++) {
-    const int expert = int(indices[tid.z * (S - 1) + slot]);
+  for (int slot = 0; slot < n_route; slot++) {
+    const int expert = int(indices[tid.z * n_route + slot]);
     const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
     result += scores[tid.z * SC + slot] *
         kq_ext_row_partial<T, Codec, NX, C32>(
                   w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
   }
-  {
-    // SC == S - 1: the shared slot's weight is an implicit 1
-    const device T* xs = h + ((int64_t)tid.z * S + (S - 1)) * K;
-    result += (SC == S ? scores[tid.z * SC + (S - 1)] : 1.0f) *
+  // Shared slot j reads columns [j K, (j + 1) K) of each shared row, the
+  // K-wide row out_row * NS + j. SC == S - NS: an implicit weight of 1.
+  for (int slot = n_route; slot < S; slot++) {
+    const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
+    result +=
+        (SC == S ? scores[tid.z * SC + slot] : 1.0f) *
         kq_ext_row_partial<T, SCodec, NX, C32>(
-                  sw, xs, (int64_t)out_row, K, tx, kq_sluts);
+            sw, xs, (int64_t)out_row * NS + (slot - n_route), K, tx, kq_sluts);
   }
   result = kq_ext_reduce<NX>(result);
   if (tx == 0) {
@@ -1385,7 +1414,7 @@ template <
 }
 
 // Slot-parallel kq_ext_gather_qmv_mix: each simdgroup pair owns one slot,
-// the shared expert's slot S - 1 included, as in
+// the shared expert's NS slots included, as in
 // kq_ext_gather_qmv_mix_ns_sp. The slot-0 pair replays the loop kernel's
 // score chain, so outputs are bit-identical to it. Dispatch: group
 // (32, 2 * S, 1), grid (N / (2 * RPS), 1, T); host gates
@@ -1407,6 +1436,7 @@ template <
     const constant int& N [[buffer(7)]],
     const constant int& S [[buffer(8)]],
     const constant int& SC [[buffer(9)]],
+    const constant int& NS [[buffer(10)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -1423,25 +1453,27 @@ template <
 
   threadgroup float parts[2 * RPS][NX][KQ_MOE_SP_MAX_S];
 
+  const int n_route = S - NS;
   const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
-  if (slot < S - 1) {
-    const int expert = int(indices[tid.z * (S - 1) + slot]);
+  if (slot < n_route) {
+    const int expert = int(indices[tid.z * n_route + slot]);
     parts[lrow][tx][slot] = kq_ext_row_partial<T, Codec, NX, C32>(
         w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
   } else {
     parts[lrow][tx][slot] = kq_ext_row_partial<T, SCodec, NX, C32>(
-        sw, xs, (int64_t)out_row, K, tx, kq_sluts);
+        sw, xs, (int64_t)out_row * NS + (slot - n_route), K, tx, kq_sluts);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   if (slot == 0) {
     float result = 0.0f;
-    for (int s = 0; s < S - 1; s++) {
+    for (int s = 0; s < n_route; s++) {
       result += scores[tid.z * SC + s] * parts[lrow][tx][s];
     }
-    // SC == S - 1: the shared slot's weight is an implicit 1
-    result += (SC == S ? scores[tid.z * SC + (S - 1)] : 1.0f) *
-        parts[lrow][tx][S - 1];
+    // SC == S - NS: the shared slots' weight is an implicit 1
+    for (int s = n_route; s < S; s++) {
+      result += (SC == S ? scores[tid.z * SC + s] : 1.0f) * parts[lrow][tx][s];
+    }
     result = kq_ext_reduce<NX>(result);
     if (tx == 0) {
       out[(int64_t)tid.z * N + out_row] = static_cast<T>(result);
@@ -1663,6 +1695,7 @@ template <
     const constant int& K [[buffer(7)]],
     const constant int& N [[buffer(8)]],
     const constant float& limit [[buffer(9)]],
+    const constant int& NS [[buffer(10)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint3 tptg [[threads_per_threadgroup]],
@@ -1671,9 +1704,9 @@ template <
   constexpr int RPS = 32 / NX;
   const short tx = short(simd_lid % NX);
   const short ty = short(simd_lid / NX);
-  const int n_route = tpg.y - 1;
+  const int n_route = tpg.y - NS;
   const int T_ = int(tpg.z);
-  const bool shared_slot = int(tid.y) == n_route;
+  const bool shared_slot = int(tid.y) >= n_route;
   // Output rows are (row, slot) over tpg.y slots; partner q is the other
   // output row served by this threadgroup (-1: none, -2: served elsewhere).
   const int p = int(tid.z) * int(tpg.y) + int(tid.y);
@@ -1686,7 +1719,7 @@ template <
     }
     if (int(tid.z) + 1 < T_) {
       q_row = int(tid.z) + 1;
-      q = q_row * int(tpg.y) + n_route;
+      q = q_row * int(tpg.y) + int(tid.y);
     }
   } else {
     const int pr = int(tid.z) * n_route + int(tid.y);
@@ -1708,12 +1741,13 @@ template <
   KQ_EXT_DECL_LUTS2(Codec, SCodec, kq_luts)
   if (shared_slot) {
     KQ_EXT_STAGE_INTO(SCodec, kq_luts)
+    const int64_t srow = (int64_t)(int(tid.y) - n_route) * N + out_row;
     if (q < 0) {
       gu.xy = kq_ext_glu_row_partial<T, SCodec, NX>(
-          sgw, suw, x, (int64_t)out_row, K, tx, kq_luts);
+          sgw, suw, x, srow, K, tx, kq_luts);
     } else {
       gu = kq_ext_glu_row_partial_pair<T, SCodec, NX>(
-          sgw, suw, x, x1, (int64_t)out_row, K, tx, kq_luts);
+          sgw, suw, x, x1, srow, K, tx, kq_luts);
     }
   } else {
     KQ_EXT_STAGE_INTO(Codec, kq_luts)
@@ -1764,6 +1798,7 @@ template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
     const constant int& S [[buffer(8)]],
     const constant int& SC [[buffer(9)]],
     const constant int& T_ [[buffer(10)]],
+    const constant int& NS [[buffer(11)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -1775,7 +1810,7 @@ template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
   const int ra = 2 * int(tid.z);
   const int rb = ra + 1;
   const bool has_b = rb < T_;
-  const int n_route = SHEXP ? S - 1 : S;
+  const int n_route = SHEXP ? S - NS : S;
 
   KQ_EXT_STAGE_LUTS(Codec, kq_luts)
   threadgroup uint4
@@ -1823,20 +1858,20 @@ template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
           kq_ext_row_partial<T, Codec, NX>(w, xa, wrow, K, tx, kq_luts);
     }
   }
-  if (SHEXP) {
-    // SC == S - 1: the shared slot's weight is an implicit 1
-    const device T* xa = h + ((int64_t)ra * S + n_route) * K;
-    const float wa = SC == S ? scores[ra * SC + n_route] : 1.0f;
+  for (int slot = n_route; SHEXP && slot < S; slot++) {
+    // SC == S - NS: the shared slots' weight is an implicit 1
+    const device T* xa = h + ((int64_t)ra * S + slot) * K;
+    const float wa = SC == S ? scores[ra * SC + slot] : 1.0f;
+    const int64_t srow = (int64_t)out_row * NS + (slot - n_route);
     if (has_b) {
-      const device T* xb = h + ((int64_t)rb * S + n_route) * K;
+      const device T* xb = h + ((int64_t)rb * S + slot) * K;
       const float2 p = kq_ext_row_partial_pair<T, SCodec, NX>(
-          sw, xa, xb, (int64_t)out_row, K, tx, kq_sluts);
+          sw, xa, xb, srow, K, tx, kq_sluts);
       result += wa * p.x;
-      pb[n_route] = p.y;
+      pb[slot] = p.y;
     } else {
-      result += wa *
-          kq_ext_row_partial<T, SCodec, NX>(
-                    sw, xa, (int64_t)out_row, K, tx, kq_sluts);
+      result +=
+          wa * kq_ext_row_partial<T, SCodec, NX>(sw, xa, srow, K, tx, kq_sluts);
     }
   }
   result = kq_ext_reduce<NX>(result);
@@ -1859,8 +1894,8 @@ template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
   for (int slot = 0; slot < n_route; slot++) {
     result += scores[rb * SC + slot] * pb[slot];
   }
-  if (SHEXP) {
-    result += (SC == S ? scores[rb * SC + n_route] : 1.0f) * pb[n_route];
+  for (int slot = n_route; SHEXP && slot < S; slot++) {
+    result += (SC == S ? scores[rb * SC + slot] : 1.0f) * pb[slot];
   }
   result = kq_ext_reduce<NX>(result);
   if (tx == 0) {
@@ -2287,6 +2322,7 @@ template <
     const constant int& K [[buffer(7)]],
     const constant int& N [[buffer(8)]],
     const constant float& limit [[buffer(9)]],
+    const constant int& NS [[buffer(10)]],
     threadgroup half4* xs [[threadgroup(0)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
@@ -2296,8 +2332,8 @@ template <
   constexpr int RPS = 32 / NX;
   const short tx = short(simd_lid % NX);
   const short ty = short(simd_lid / NX);
-  const int n_route = tpg.y - 1;
-  const bool shared_slot = int(tid.y) == n_route;
+  const int n_route = tpg.y - NS;
+  const bool shared_slot = int(tid.y) >= n_route;
   const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
   const ushort lin = ushort(simd_gid * 32 + simd_lid);
   const ushort nth = ushort(32 * tptg.y);
@@ -2311,7 +2347,13 @@ template <
   if (shared_slot) {
     // Shared expert: float path, device activations (numerics unchanged).
     gu = kq_ext_glu_row_partial<T, SCodec, NX>(
-        sgw, suw, x, (int64_t)out_row, K, tx, kq_sluts);
+        sgw,
+        suw,
+        x,
+        (int64_t)(int(tid.y) - n_route) * N + out_row,
+        K,
+        tx,
+        kq_sluts);
   } else {
     kq_ext_stage_xh<T>(xs, x, K, lin, nth);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2341,6 +2383,7 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
     const constant int& N [[buffer(7)]],
     const constant int& S [[buffer(8)]],
     const constant int& SC [[buffer(9)]],
+    const constant int& NS [[buffer(10)]],
     threadgroup half4* xs [[threadgroup(0)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tptg [[threads_per_threadgroup]],
@@ -2355,9 +2398,10 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
 
   KQ_EXT_STAGE_LUTS_H(Codec, kq_luts)
   KQ_EXT_STAGE_LUTS(SCodec, kq_sluts)
+  const int n_route = S - NS;
   float result = 0.0f;
-  for (int slot = 0; slot < S - 1; slot++) {
-    const int expert = int(indices[tid.z * (S - 1) + slot]);
+  for (int slot = 0; slot < n_route; slot++) {
+    const int expert = int(indices[tid.z * n_route + slot]);
     const device T* hs = h + ((int64_t)tid.z * S + slot) * K;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     kq_ext_stage_xh<T>(xs, hs, K, lin, nth);
@@ -2366,11 +2410,12 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
         kq_ext_row_partial_h<Codec, NX>(
                   w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
   }
-  {
-    const device T* hs = h + ((int64_t)tid.z * S + (S - 1)) * K;
-    result += (SC == S ? scores[tid.z * SC + (S - 1)] : 1.0f) *
+  for (int slot = n_route; slot < S; slot++) {
+    const device T* hs = h + ((int64_t)tid.z * S + slot) * K;
+    result +=
+        (SC == S ? scores[tid.z * SC + slot] : 1.0f) *
         kq_ext_row_partial<T, SCodec, NX>(
-                  sw, hs, (int64_t)out_row, K, tx, kq_sluts);
+            sw, hs, (int64_t)out_row * NS + (slot - n_route), K, tx, kq_sluts);
   }
   result = kq_ext_reduce<NX>(result);
   if (tx == 0) {

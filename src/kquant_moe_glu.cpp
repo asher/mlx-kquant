@@ -192,6 +192,22 @@ inline bool kq_moe_sp(int64_t coarse_tgs, int S) {
   return v == -1 ? coarse_tgs < 2048 : v != 0;
 }
 
+// Threads a slot-parallel launch may use: the pipeline's limit, or a lower
+// KQ_MOE_SP_THREAD_CAP (test lever, read per call). A launch of 64 * S
+// threads past it takes the loop kernel.
+template <typename K>
+inline int kq_moe_sp_cap(K kernel) {
+  const int cap = int(kernel->maxTotalThreadsPerThreadgroup());
+  const int v = kq_env_lever_from("KQ_MOE_SP_THREAD_CAP", cap, 32);
+  return v < cap ? v : cap;
+}
+
+// A shared expert k times as wide as a routed expert runs as k shared
+// slots. KQ_MOE_SHEXP_MULTI=0 declines k > 1 (read per call).
+inline bool kq_moe_shexp_multi() {
+  return kq_env_flag("KQ_MOE_SHEXP_MULTI", 1) != 0;
+}
+
 // Form of a score-mixed down gather (mix and mix_ns) where more than one
 // applies: the loop kernel, the slot-parallel kernel or the dedupe row-pair
 // kernel. The pair kernel runs the loop launch over half the rows, so on a
@@ -241,6 +257,7 @@ inline void kq_moe_log_kname(const std::string& kname, int cap = 0) {
 #ifdef _METAL_
 // Row-pair dedupe down projection (mix_ns and the shexp-slot mix): the
 // loop kernel's launch over row pairs; S is capped by the partial store.
+// NS is the shared slot count (unused by mix_ns).
 inline void kq_gather_qmv_pair_gpu(
     mx::metal::Device& d,
     const mx::Stream& s,
@@ -256,7 +273,8 @@ inline void kq_gather_qmv_pair_gpu(
     int N,
     int K,
     int nx,
-    int sg) {
+    int sg,
+    int NS) {
   auto kernel = kq_get_kernel(d, kname);
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
@@ -273,6 +291,7 @@ inline void kq_gather_qmv_pair_gpu(
   const int SC = scores.shape(1);
   ce.set_bytes(SC, 9);
   ce.set_bytes(T, 10);
+  ce.set_bytes(NS, 11);
   const int fsg = kq_moe_fit_sg(kernel, sg);
   MTL::Size group_dims(32, fsg, 1);
   MTL::Size grid_dims(N / (fsg * 32 / nx), 1, (T + 1) / 2);
@@ -778,6 +797,8 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   int R = indices.shape(1);
   int N = gw.shape(1);
   int K = x.shape(-1);
+  // Shared slots: the shared expert is NS routed experts wide.
+  const int NS = sgw.shape(0) / N;
 
   const bool upcast_pair = shexp_up_type_ == shexp_type_ &&
       (shexp_type_ == kquant_type_ || shexp_type_ == "q5_k" ||
@@ -785,7 +806,7 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   if (!upcast_pair) {
     // Gate and up of the shared expert each in its own codec: the "_sx2_"
     // instantiations, generic float path, one launch shape for any T.
-    const int nx = kq_moe_pick_nx((int64_t)N * (R + 1) * T, K, true);
+    const int nx = kq_moe_pick_nx((int64_t)N * (R + NS) * T, K, true);
     const std::string kname = "kq_" + kquant_type_ + "_sx2_" + shexp_type_ +
         "_" + shexp_up_type_ + "_moe_glu_gather_shexp_silu" + kq_nx_suffix(nx) +
         "_" + kq_type_string(x.dtype());
@@ -803,9 +824,10 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
     ce.set_bytes(K, 7);
     ce.set_bytes(N, 8);
     ce.set_bytes(limit_, 9);
+    ce.set_bytes(NS, 10);
     const int sg = kq_moe_fit_sg(kernel, kq_moe_pick_sg(kquant_type_, N, nx));
     MTL::Size group_dims(32, sg, 1);
-    MTL::Size grid_dims(N / (sg * 32 / nx), R + 1, T);
+    MTL::Size grid_dims(N / (sg * 32 / nx), R + NS, T);
     kq_log_dispatch(kname, x, out, grid_dims);
     ce.dispatch_threadgroups(grid_dims, group_dims);
     return;
@@ -820,7 +842,7 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   const bool c32 = !use_half && !dd && kq_moe_c32(kquant_type_, T);
   const int nx = use_half ? 8
       : c32               ? kq_moe_c32_nx()
-                          : kq_moe_pick_nx((int64_t)N * (R + 1) * T, K, true);
+                          : kq_moe_pick_nx((int64_t)N * (R + NS) * T, K, true);
   std::string stem = shexp_type_ == kquant_type_
       ? kq_gather_stem_nx(kquant_type_, K, nx)
       : kquant_type_ + "_sx_" + shexp_type_;
@@ -850,13 +872,14 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   ce.set_bytes(K, 7);
   ce.set_bytes(N, 8);
   ce.set_bytes(limit_, 9);
+  ce.set_bytes(NS, 10);
   const bool tuned = stem == "q6_k" || stem == "q8_0";
   const int sg = kq_moe_fit_sg(
       kernel,
       use_half ? kq_moe_pick_sg_h(N, nx)
                : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx)));
   MTL::Size group_dims(32, sg, 1);
-  MTL::Size grid_dims(N / (sg * 32 / nx), R + 1, T);
+  MTL::Size grid_dims(N / (sg * 32 / nx), R + NS, T);
   kq_log_dispatch(kname, x, out, grid_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
@@ -883,6 +906,8 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   int S = x.shape(1);
   int N = w.shape(1);
   int K = x.shape(-1);
+  // Shared slots: the last NS of the S slots.
+  const int NS = S - indices.shape(1);
 
   // Same codec-keyed widening as mix_ns. The slot-parallel form serves the
   // generic kernels at nx 8; the tuned q6_k and q8_0 kernels keep their
@@ -911,7 +936,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
     auto kernel = kq_get_kernel(d, kname);
     // 64 * S threads must fit the pipeline; the loop kernel serves the
     // call when they do not.
-    if (64 * S <= int(kernel->maxTotalThreadsPerThreadgroup())) {
+    if (64 * S <= kq_moe_sp_cap(kernel)) {
       kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
       auto& ce = mx::metal::get_command_encoder(s);
       ce.set_compute_pipeline_state(kernel);
@@ -926,6 +951,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
       ce.set_bytes(S, 8);
       const int SC = scores.shape(1);
       ce.set_bytes(SC, 9);
+      ce.set_bytes(NS, 10);
       MTL::Size group_dims(32, 2 * S, 1);
       MTL::Size grid_dims(N / 8, 1, T);
       kq_log_dispatch(kname, x, out, grid_dims);
@@ -960,7 +986,8 @@ void KQuantGatherQMVMixKQ::eval_gpu(
         N,
         K,
         nx,
-        kq_moe_pick_sg(kquant_type_, N, nx));
+        kq_moe_pick_sg(kquant_type_, N, nx),
+        NS);
     return;
   }
   int nx = nx_one;
@@ -994,6 +1021,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   ce.set_bytes(S, 8);
   const int SC = scores.shape(1);
   ce.set_bytes(SC, 9);
+  ce.set_bytes(NS, 10);
   const int sg = kq_moe_fit_sg(
       kernel,
       use_half ? kq_moe_pick_sg_h(N, nx)
@@ -1069,7 +1097,8 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
         N,
         K,
         nx,
-        kq_moe_pick_sg(kquant_type_, N, nx));
+        kq_moe_pick_sg(kquant_type_, N, nx),
+        0);
   } else {
     bool sp = nx == 8 && kq_moe_sp((int64_t)T * (N / 8), S) &&
         kq_moe_mix_form(true, false) == KQ_MIX_SP;
@@ -1084,7 +1113,7 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
     // The slot-parallel kernel gives each slot its own simdgroup pair, so
     // its 64 * S threads cannot be halved the way the sg kernels can. When
     // the pipeline will not take that many, drop to the general kernel.
-    if (sp && 64 * S > int(kernel->maxTotalThreadsPerThreadgroup())) {
+    if (sp && 64 * S > kq_moe_sp_cap(kernel)) {
       sp = false;
       kname = ns_name(sp);
       kernel = kq_get_kernel(d, kname);
@@ -1314,7 +1343,9 @@ bool KQuantGatherQMVMixKQ::is_equivalent(const mx::Primitive& other) const {
 
 std::vector<mx::Shape> KQuantMoEGLUShexpKQ::output_shapes(
     const std::vector<mx::array>& inputs) {
-  return {{inputs[5].shape(0), inputs[5].shape(1) + 1, inputs[0].shape(1)}};
+  // R routed slots, then one shared slot per routed width of the shexp.
+  const int NS = inputs[2].shape(0) / inputs[0].shape(1);
+  return {{inputs[5].shape(0), inputs[5].shape(1) + NS, inputs[0].shape(1)}};
 }
 
 std::vector<mx::Shape> KQuantGatherQMVMixKQ::output_shapes(
@@ -1456,12 +1487,22 @@ bool lowbit_shexp_codec(const std::string& t) {
   return t == "iq4_xs" || t == "iq3_s" || t == "q6_k";
 }
 
+// A shared down slot of `width` weights starts on a whole block of `codec`.
+bool shexp_slot_on_block(const std::string& codec, int64_t width) {
+  const KQuantCodec* c = codec_by_name(codec);
+  return c != nullptr && width > 0 && width % c->weights_per_block == 0;
+}
+
 } // namespace
 
 bool shexp_glu_combo_has_kernel(
     const std::string& kquant_type,
     const std::string& shexp_gate_type,
-    const std::string& shexp_up_type) {
+    const std::string& shexp_up_type,
+    int shared_slots) {
+  if (shared_slots < 1 || (shared_slots > 1 && !kq_moe_shexp_multi())) {
+    return false;
+  }
   if (shexp_gate_type == shexp_up_type &&
       shexp_upcast_pair(kquant_type, shexp_gate_type)) {
     return true;
@@ -1475,18 +1516,35 @@ bool shexp_glu_combo_has_kernel(
 
 bool shexp_mix_combo_has_kernel(
     const std::string& kquant_type,
-    const std::string& shexp_type) {
-  return shexp_upcast_pair(kquant_type, shexp_type) ||
-      (kquant_type == "q2_0" && shexp_type == "iq4_nl");
+    const std::string& shexp_type,
+    int shared_slots,
+    int slot_width) {
+  if (shared_slots < 1 || (shared_slots > 1 && !kq_moe_shexp_multi())) {
+    return false;
+  }
+  if (!shexp_upcast_pair(kquant_type, shexp_type) &&
+      !(kquant_type == "q2_0" && shexp_type == "iq4_nl")) {
+    return false;
+  }
+  // Each shared slot starts on a whole block of the shared codec, so a
+  // multi-slot probe needs the slot width.
+  if (shared_slots > 1 && slot_width <= 0) {
+    return false;
+  }
+  return slot_width <= 0 || shexp_slot_on_block(shexp_type, slot_width);
 }
 
 bool shexp_mix_slot_parallel(
     const std::string& kquant_type,
-    const std::string& shexp_type) {
+    const std::string& shexp_type,
+    int shared_slots,
+    int slot_width) {
   // The tuned q6_k and q8_0 kernels keep their fine tier.
   const bool tuned = shexp_type == kquant_type &&
       (kquant_type == "q6_k" || kquant_type == "q8_0");
-  return !tuned && shexp_mix_combo_has_kernel(kquant_type, shexp_type);
+  return !tuned &&
+      shexp_mix_combo_has_kernel(
+          kquant_type, shexp_type, shared_slots, slot_width);
 }
 
 namespace {
@@ -1591,9 +1649,50 @@ void check_kq_expert_stack(
   }
 }
 
-// Shared validation for one single-expert (2-D) K-quant wire-byte tensor;
-// must match the expert stack's row shape (in its OWN codec's wire bytes).
-void check_kq_shexp_row(
+// The shared expert's gate or up tensor [k N, bytes_per_row(K)]: k shared
+// slots of N rows each. Returns k.
+int check_kq_shexp_rows(
+    const char* op,
+    const mx::array& w,
+    const std::string& kquant_type,
+    int K,
+    int N) {
+  const KQuantCodec* codec = codec_by_name(kquant_type);
+  if (codec == nullptr) {
+    throw std::invalid_argument(
+        std::string(op) + " unknown shared-expert codec '" + kquant_type +
+        "'.");
+  }
+  if (w.ndim() != 2 || w.dtype() != mx::uint8) {
+    throw std::invalid_argument(
+        std::string(op) +
+        " shared-expert weights must be uint8 [k * N, bytes_per_row].");
+  }
+  const int64_t bpr =
+      (int64_t)K / codec->weights_per_block * codec->bytes_per_block;
+  if (w.shape(1) != bpr || w.shape(0) < N || w.shape(0) % N != 0) {
+    throw std::invalid_argument(
+        std::string(op) +
+        " shared-expert weights must be [k * N, bytes_per_row(K)] for a "
+        "whole k, N the expert stack width.");
+  }
+  const int k = w.shape(0) / N;
+  if (k > 1 && !kq_moe_shexp_multi()) {
+    throw std::invalid_argument(
+        std::string(op) +
+        " a shared expert wider than one routed expert is off "
+        "(KQ_MOE_SHEXP_MULTI=0).");
+  }
+  if (kq_has_layout(w)) {
+    kq_check_row_major(w, std::string(op) + " shared-expert weights");
+  }
+  return k;
+}
+
+// The shared expert's down tensor [N, bytes_per_row(k K)]: shared slot j
+// reads columns [j K, (j + 1) K) of each row, so K must be whole blocks of
+// the shared codec. Returns k.
+int check_kq_shexp_down(
     const char* op,
     const mx::array& w,
     const std::string& kquant_type,
@@ -1610,17 +1709,31 @@ void check_kq_shexp_row(
         std::string(op) +
         " shared-expert weights must be uint8 [N, bytes_per_row].");
   }
+  if (!shexp_slot_on_block(kquant_type, K)) {
+    throw std::invalid_argument(
+        std::string(op) + " a shared-expert slot of " + std::to_string(K) +
+        " weights is not a whole number of '" + kquant_type + "' blocks (" +
+        std::to_string(codec->weights_per_block) + " weights).");
+  }
   const int64_t bpr =
       (int64_t)K / codec->weights_per_block * codec->bytes_per_block;
-  if (w.shape(0) != N || w.shape(1) != bpr) {
+  if (w.shape(0) != N || w.shape(1) < bpr || w.shape(1) % bpr != 0) {
     throw std::invalid_argument(
         std::string(op) +
-        " shared-expert weights must match the expert stack row shape.");
+        " shared-expert weights must be [N, bytes_per_row(k * K)] for a "
+        "whole k, K the expert stack's input width.");
   }
-  // A tensor without memory is checked at eval.
+  const int k = int(w.shape(1) / bpr);
+  if (k > 1 && !kq_moe_shexp_multi()) {
+    throw std::invalid_argument(
+        std::string(op) +
+        " a shared expert wider than one routed expert is off "
+        "(KQ_MOE_SHEXP_MULTI=0).");
+  }
   if (kq_has_layout(w)) {
     kq_check_row_major(w, std::string(op) + " shared-expert weights");
   }
+  return k;
 }
 
 mx::array prep_scores(const mx::array& sc, mx::StreamOrDevice s) {
@@ -1995,11 +2108,14 @@ mx::array moe_glu_gather_shexp_kq(
         std::string(op) + " gate/up expert shapes must match.");
   }
   int N = gate_w.shape(1);
-  check_kq_shexp_row(op, shexp_gate_w, shexp_type, K, N);
-  check_kq_shexp_row(op, shexp_up_w, shexp_up_type, K, N);
+  const int ns = check_kq_shexp_rows(op, shexp_gate_w, shexp_type, K, N);
+  if (check_kq_shexp_rows(op, shexp_up_w, shexp_up_type, K, N) != ns) {
+    throw std::invalid_argument(
+        std::string(op) + " shared-expert gate/up widths must match.");
+  }
 
   auto x_c = moe_dense_x(x, s);
-  mx::Shape out_shape = {x.shape(0), indices.shape(1) + 1, N};
+  mx::Shape out_shape = {x.shape(0), indices.shape(1) + ns, N};
   kq_check_weight_base_at_build(
       gate_w, kquant_type, s, "moe_glu_gather_shexp_kq");
   kq_check_weight_base_at_build(
@@ -2048,16 +2164,6 @@ mx::array gather_qmv_mix_kq(
     throw std::invalid_argument(std::string(op) + " x must be 3-D [T, S, K].");
   }
   int S = x.shape(1);
-  if (indices.ndim() != 2 || indices.shape(0) != x.shape(0) ||
-      indices.shape(1) != S - 1) {
-    throw std::invalid_argument(
-        std::string(op) + " indices must be [T, S - 1].");
-  }
-  if (scores.ndim() != 2 || scores.shape(0) != x.shape(0) ||
-      (scores.shape(1) != S && scores.shape(1) != S - 1)) {
-    throw std::invalid_argument(
-        std::string(op) + " scores must be [T, S] or [T, S - 1].");
-  }
   auto dt = x.dtype();
   if (dt != mx::float16 && dt != mx::bfloat16) {
     throw std::invalid_argument(
@@ -2065,7 +2171,20 @@ mx::array gather_qmv_mix_kq(
   }
   int K = x.shape(2);
   check_kq_expert_stack(op, w, kquant_type, K);
-  check_kq_shexp_row(op, shexp_w, shexp_type, K, w.shape(1));
+  // k shared slots, the last k of the S slots.
+  const int ns = check_kq_shexp_down(op, shexp_w, shexp_type, K, w.shape(1));
+  if (S <= ns || indices.ndim() != 2 || indices.shape(0) != x.shape(0) ||
+      indices.shape(1) != S - ns) {
+    throw std::invalid_argument(
+        std::string(op) +
+        " indices must be [T, S - k] for a shared expert k routed experts "
+        "wide.");
+  }
+  if (scores.ndim() != 2 || scores.shape(0) != x.shape(0) ||
+      (scores.shape(1) != S && scores.shape(1) != S - ns)) {
+    throw std::invalid_argument(
+        std::string(op) + " scores must be [T, S] or [T, S - k].");
+  }
 
   auto x_c = moe_dense_x(x, s);
   mx::Shape out_shape = {x.shape(0), w.shape(1)};
