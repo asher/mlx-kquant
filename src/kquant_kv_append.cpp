@@ -152,9 +152,13 @@ kv_append(mx::array buf, mx::array x, int64_t offset, mx::StreamOrDevice s_) {
     throw std::invalid_argument(
         op + " x must have at most 4294967295 elements.");
   }
+  // Read before the move: argument evaluation order is unspecified, and GCC
+  // moves buf first.
+  auto shape = buf.shape();
+  auto dtype = buf.dtype();
   return mx::array(
-      buf.shape(),
-      buf.dtype(),
+      std::move(shape),
+      dtype,
       std::make_shared<KQuantKVAppend>(s, offset),
       {std::move(buf), std::move(x)});
 }
