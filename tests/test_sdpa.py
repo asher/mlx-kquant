@@ -2134,10 +2134,11 @@ def test_sdpa_bs_prefill_validation():
         kq.sdpa_prefill_block_sparse(q, k, v, sc, pages, pmask, counts, 4090)
 
 
-def _ref_sdpa_window(q, k, v, scale, window, sinks):
+def _ref_sdpa_window(q, k, v, scale, window, sinks, starts=None):
     """f32 reference for sliding-window prefill: query row i sits at key
-    position p = kL - qL + i and attends keys c with p - window < c <= p,
-    plus an optional sink column with no value row."""
+    position p = kL - qL + i and attends keys c with p - window < c <= p
+    (and c >= starts[b] in batch row b), plus an optional sink column with
+    no value row."""
     g = q.shape[1] // k.shape[1]
     kr = mx.repeat(k, g, axis=1).astype(mx.float32)
     vr = mx.repeat(v, g, axis=1).astype(mx.float32)
@@ -2145,7 +2146,10 @@ def _ref_sdpa_window(q, k, v, scale, window, sinks):
     qL, kL = q.shape[2], k.shape[2]
     rows = mx.arange(kL - qL, kL).reshape(qL, 1)
     cols = mx.arange(kL).reshape(1, kL)
-    s = mx.where((cols <= rows) & (cols > rows - window), s, float("-inf"))
+    keep = (cols <= rows) & (cols > rows - window)
+    if starts is not None:
+        keep = keep & (cols >= starts.reshape(-1, 1, 1, 1))
+    s = mx.where(keep, s, float("-inf"))
     if sinks is not None:
         col = mx.broadcast_to(sinks.reshape(1, -1, 1, 1), (*s.shape[:3], 1))
         s = mx.concatenate([s, col.astype(mx.float32)], axis=-1)
@@ -2188,6 +2192,32 @@ def test_sdpa_prefill_window(case):
     assert rel < REL_BOUND[dtype], f"{case}: rel {rel:.3e}"
 
 
+@pytest.mark.parametrize("with_sinks", [True, False], ids=["sinks", "no_sinks"])
+def test_sdpa_prefill_window_starts(with_sinks):
+    # A left-padded batch: rows start at 0, inside the window, past a whole
+    # query block, and past every query of the chunk. Valid query rows match
+    # the reference; rows below their start read zeros.
+    if not kq.nax_available():
+        pytest.skip("sdpa_prefill_window needs NAX")
+    B, Hq, Hkv, qL, kL, D, window = 4, 16, 4, 300, 811, 128, 513
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(B, Hq, Hkv, qL, kL, D, mx.bfloat16, seed=21, strided=False)
+    starts = mx.array([0, 37, 600, 900], dtype=mx.int32)
+    sk = mx.random.normal((Hq,), key=mx.random.key(4)) if with_sinks else None
+    got = kq.sdpa_prefill_window(q, k, v, scale, window, sinks=sk, starts=starts)
+    ref = _ref_sdpa_window(q, k, v, scale, window, sk, starts=starts)
+    _eval_or_skip(got, ref)
+    pos = mx.arange(kL - qL, kL).reshape(1, 1, qL, 1)
+    valid = pos >= mx.minimum(starts, kL).reshape(-1, 1, 1, 1)
+    assert mx.isfinite(got.astype(mx.float32)).all().item()
+    assert not mx.where(valid, 0, got).any().item(), "rows below their start"
+    for b in range(B):
+        n = int(mx.sum(valid[b]).item())
+        if n:
+            rel = _rel(got[b, :, qL - n :], ref[b, :, qL - n :])
+            assert rel < REL_BOUND[mx.bfloat16], f"row {b}: rel {rel:.3e}"
+
+
 def test_sdpa_prefill_window_model_layout():
     # Queries as the transpose of [B, L, H, D] projections and keys and
     # values as the prefix of a longer cache are read in place.
@@ -2224,6 +2254,8 @@ def test_sdpa_prefill_window_validation():
         kq.sdpa_prefill_window(q, k.astype(mx.float16), v, sc, 513)
     with pytest.raises(ValueError):  # one sink per query head
         kq.sdpa_prefill_window(q, k, v, sc, 513, sinks=mx.zeros((4,)))
+    with pytest.raises(ValueError):  # one int32 start per batch row
+        kq.sdpa_prefill_window(q, k, v, sc, 513, starts=mx.zeros((2,), mx.int32))
 
 
 def test_sdpa_paged_validation():

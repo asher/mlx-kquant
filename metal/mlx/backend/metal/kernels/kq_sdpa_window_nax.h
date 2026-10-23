@@ -7,7 +7,9 @@
 //
 // The queries are the last qL of the kL key positions. Query row r, in key
 // positions r = row + kL - qL, sees keys c with r - window < c <= r, plus an
-// optional per-head sink logit in the softmax denominator. One threadgroup of
+// optional per-head sink logit in the softmax denominator. With starts, batch
+// row b also skips the keys below starts[b] (a left-padded batch), and a query
+// row below its start writes zeros. One threadgroup of
 // four simdgroups per 64 query rows, query head and batch row; each simdgroup
 // owns 16 rows. Q, K, V and O are read and written through their batch, head
 // and row strides with a unit head_dim stride, as stock reads them.
@@ -30,6 +32,8 @@ template <typename T, int D>
     const constant int& window [[buffer(9)]],
     const constant int& has_sinks [[buffer(10)]],
     const constant float& scale [[buffer(11)]],
+    const device int* starts [[buffer(12)]],
+    const constant int& has_starts [[buffer(13)]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]]) {
   using namespace kq_sdpa_nax;
@@ -77,16 +81,19 @@ template <typename T, int D>
   // The threadgroup's rows in key positions are [r_lo, r_hi]. Key blocks run
   // from the first one the top row sees to the diagonal of the bottom row.
   // Blocks from kb_causal on hold keys past some row's diagonal; blocks up to
-  // kb_window hold keys below some row's window.
+  // kb_window hold keys below some row's window, and up to kb_start keys
+  // below the row's start.
   const int qL_off = kL - qL;
+  const int s0 = has_starts ? clamp(starts[tid.z], 0, kL) : 0;
   const int NK_aligned = kL / BK;
   const int kL_rem = kL - NK_aligned * BK;
   const int r_lo = int(tid.x) * BQ + qL_off;
   const int r_hi = min(int(tid.x + 1) * BQ, qL) - 1 + qL_off;
-  const int kb_lo = max(0, r_lo - window + 1) / BK;
+  const int kb_lo = max(s0, r_lo - window + 1) / BK;
   const int kb_lim = r_hi / BK + 1;
   const int kb_causal = r_lo / BK;
   const int kb_window = r_hi - window + 1 > 0 ? (r_hi - window + 1) / BK : -1;
+  const int kb_start = s0 > 0 ? s0 / BK : -1;
   const short lim_rows_q = short(min(qL - row0, int(kU)));
   const bool short_q = lim_rows_q < kU;
   constexpr auto neg_inf = Limits<float>::finite_min;
@@ -148,7 +155,7 @@ template <typename T, int D>
       }
     }
 
-    if (kb >= kb_causal || kb <= kb_window) {
+    if (kb >= kb_causal || kb <= kb_window || kb <= kb_start) {
       const int base_row = row0 + qL_off;
       const int base_col = kb * BK;
       STEEL_PRAGMA_UNROLL
@@ -161,7 +168,7 @@ template <typename T, int D>
             const int r = base_row + ii * stile_t::kFragRowsJump + sm;
             const int c = base_col + ik * kU + jj + sn;
             const auto loc = ii * stile_t::kFragThrCols + jj;
-            fg[loc] = (r < c || c <= r - window) ? neg_inf : fg[loc];
+            fg[loc] = (r < c || c <= r - window || c < s0) ? neg_inf : fg[loc];
           }
         }
       }
@@ -221,10 +228,12 @@ template <typename T, int D>
   if (lim_rows_q <= 0) {
     return;
   }
+  // A row below its start saw no key: zero, not the masked average.
   metal::vec<float, kRowsPT> rcp;
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < kRowsPT; ++i) {
-    rcp[i] = 1.f / sum_score[i];
+    const int r = row0 + qL_off + i * otile_t::kFragRowsJump + sm;
+    rcp[i] = r >= s0 ? 1.f / sum_score[i] : 0.f;
   }
   Otile.template row_bin_op<MulOp>(rcp);
   if (short_q) {

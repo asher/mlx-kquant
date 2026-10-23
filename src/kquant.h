@@ -489,6 +489,8 @@ mx::array sdpa_prefill_block_sparse(
 // denominator. Only the key blocks inside each query block's window are
 // read. D 64, 128 or 256, float16 or bfloat16, Hq a multiple of Hkv. Output
 // [B, Hq, qL, D] laid out as [B, qL, Hq, D], as mx.fast SDPA lays it out.
+// starts (optional, int32 [B]) skips the keys below starts[b] in batch row b
+// (a left-padded batch); a query row below its start reads zeros.
 // Requires the tensor-op units (nax_available()).
 mx::array sdpa_prefill_window(
     mx::array q,
@@ -497,6 +499,7 @@ mx::array sdpa_prefill_window(
     float scale,
     int window,
     std::optional<mx::array> sinks = std::nullopt,
+    std::optional<mx::array> starts = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // sdpa_fa_verify returning {out, lse}: lse [B, Hkv, n_rows] float32 is the
@@ -2129,11 +2132,13 @@ class KQuantSDPAWindow : public mx::Primitive {
       mx::Stream stream,
       float scale,
       int window,
-      bool has_sinks)
+      bool has_sinks,
+      bool has_starts)
       : mx::Primitive(stream),
         scale_(scale),
         window_(window),
-        has_sinks_(has_sinks) {}
+        has_sinks_(has_sinks),
+        has_starts_(has_starts) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -2154,6 +2159,7 @@ class KQuantSDPAWindow : public mx::Primitive {
   float scale_;
   int window_;
   bool has_sinks_;
+  bool has_starts_;
 };
 
 // Fused shared-prefix cascade attention (see sdpa_decode_gqa_cascade).

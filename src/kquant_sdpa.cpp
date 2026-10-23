@@ -1519,6 +1519,7 @@ void KQuantSDPAWindow::eval_gpu(
   int gqa = H / k.shape(1);
   int window = window_;
   int has_sinks = has_sinks_ ? 1 : 0;
+  int has_starts = has_starts_ ? 1 : 0;
   float scale = scale_;
 
   // [B, H, qL, D] stored as [B, qL, H, D], so the caller's transpose to
@@ -1568,6 +1569,9 @@ void KQuantSDPAWindow::eval_gpu(
   ce.set_bytes(window, 9);
   ce.set_bytes(has_sinks, 10);
   ce.set_bytes(scale, 11);
+  // starts follows sinks in the inputs; q stands in when absent.
+  ce.set_input_array(has_starts_ ? inputs[3 + int(has_sinks_)] : q, 12);
+  ce.set_bytes(has_starts, 13);
   MTL::Size group_dims(128, 1, 1);
   MTL::Size grid_dims((qL + 63) / 64, H, B);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -2823,7 +2827,7 @@ std::vector<mx::Shape> KQuantSDPAWindow::output_shapes(
 bool KQuantSDPAWindow::is_equivalent(const mx::Primitive& other) const {
   auto& o = static_cast<const KQuantSDPAWindow&>(other);
   return scale_ == o.scale_ && window_ == o.window_ &&
-      has_sinks_ == o.has_sinks_;
+      has_sinks_ == o.has_sinks_ && has_starts_ == o.has_starts_;
 }
 
 mx::array sdpa_prefill_window(
@@ -2833,6 +2837,7 @@ mx::array sdpa_prefill_window(
     float scale,
     int window,
     std::optional<mx::array> sinks,
+    std::optional<mx::array> starts,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const std::string op = "[mlx_kquant.sdpa_prefill_window] ";
@@ -2888,12 +2893,19 @@ mx::array sdpa_prefill_window(
         false,
         s));
   }
+  if (starts.has_value()) {
+    if (starts->dtype() != mx::int32 || starts->ndim() != 1 ||
+        starts->shape(0) != B) {
+      throw std::invalid_argument(op + "starts must be int32 [B].");
+    }
+    inputs.push_back(mx::contiguous(*starts, false, s));
+  }
   if (!nax_available()) {
     throw std::runtime_error(
         op + "requires a GPU with tensor-op units; check nax_available().");
   }
-  auto prim =
-      std::make_shared<KQuantSDPAWindow>(s, scale, window, sinks.has_value());
+  auto prim = std::make_shared<KQuantSDPAWindow>(
+      s, scale, window, sinks.has_value(), starts.has_value());
   return mx::array(
       {B, n_q_heads, qL, D}, dt, std::move(prim), std::move(inputs));
 }

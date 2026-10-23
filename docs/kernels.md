@@ -1330,7 +1330,8 @@ into a packed layout first.
 - **`sdpa_prefill_window`** - sliding-window causal prefill on the tensor-op units for M5 and later
   GPUs. Each 64-row query block reads only the key blocks inside its window, so the cost of a
   chunk follows the window, not the key length a dense masked attention walks. Head dims 64, 128
-  and 256, GQA, optional per-head sinks, strided operands with a contiguous head dim.
+  and 256, GQA, optional per-head sinks, per-row `starts` for a left-padded batch, strided operands
+  with a contiguous head dim.
 - **`sdpa_fa_verify`** - speculative-verify attention on the matrix units for a GQA-folded query tile.
   Head dims 64 through 512; `return_lse` as above. On NAX GPUs, at head dims 128 and 256 with up to
   64 folded rows on plain K and V, the key pass runs on the tensor-op units: each 16-row strip of

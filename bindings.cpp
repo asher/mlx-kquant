@@ -527,6 +527,7 @@ NB_MODULE(_ext, m) {
       "scale"_a,
       "window"_a,
       "sinks"_a = nb::none(),
+      "starts"_a = nb::none(),
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
@@ -548,6 +549,9 @@ NB_MODULE(_ext, m) {
             window (int): keys each query sees, itself included; >= 1.
             sinks (array, optional): per-q-head attention sinks, shape
                 [n_q_heads]; an extra softmax logit with no value row.
+            starts (array, optional): int32 [B]; batch row b skips the keys
+                below starts[b] (a left-padded batch), clamped to [0, kL].
+                A query row below its start reads zeros.
 
         Returns:
             array: attention output [B, n_q_heads, qL, D].
