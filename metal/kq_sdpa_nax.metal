@@ -53,3 +53,19 @@ instantiate_kq_sdpa_fa_verify_nax_rows(float16_t, 128, 2)
 
 instantiate_kq_sdpa_gqa_nax_128(bfloat16_t)
 instantiate_kq_sdpa_gqa_nax_128(float16_t)
+
+// Sliding-window prefill attention; see kq_sdpa_window_nax.h.
+#include "mlx/backend/metal/kernels/kq_sdpa_window_nax.h"
+
+#define instantiate_kq_sdpa_window_nax(type, D)                        \
+  instantiate_kernel(                                                  \
+      "kq_sdpa_window_nax_" #type "_" #D,                              \
+      kq_sdpa_window_nax,                                              \
+      type, D)
+
+instantiate_kq_sdpa_window_nax(bfloat16_t, 64)
+instantiate_kq_sdpa_window_nax(float16_t, 64)
+instantiate_kq_sdpa_window_nax(bfloat16_t, 128)
+instantiate_kq_sdpa_window_nax(float16_t, 128)
+instantiate_kq_sdpa_window_nax(bfloat16_t, 256)
+instantiate_kq_sdpa_window_nax(float16_t, 256)

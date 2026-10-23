@@ -6,6 +6,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `sdpa_prefill_window` runs sliding-window prefill attention on M5 and later GPUs,
+  reading only the keys inside each query block's window.
+
 ## [0.5.5]
 
 ### Added

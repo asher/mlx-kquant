@@ -2134,6 +2134,98 @@ def test_sdpa_bs_prefill_validation():
         kq.sdpa_prefill_block_sparse(q, k, v, sc, pages, pmask, counts, 4090)
 
 
+def _ref_sdpa_window(q, k, v, scale, window, sinks):
+    """f32 reference for sliding-window prefill: query row i sits at key
+    position p = kL - qL + i and attends keys c with p - window < c <= p,
+    plus an optional sink column with no value row."""
+    g = q.shape[1] // k.shape[1]
+    kr = mx.repeat(k, g, axis=1).astype(mx.float32)
+    vr = mx.repeat(v, g, axis=1).astype(mx.float32)
+    s = (q.astype(mx.float32) @ kr.swapaxes(-1, -2)) * scale
+    qL, kL = q.shape[2], k.shape[2]
+    rows = mx.arange(kL - qL, kL).reshape(qL, 1)
+    cols = mx.arange(kL).reshape(1, kL)
+    s = mx.where((cols <= rows) & (cols > rows - window), s, float("-inf"))
+    if sinks is not None:
+        col = mx.broadcast_to(sinks.reshape(1, -1, 1, 1), (*s.shape[:3], 1))
+        s = mx.concatenate([s, col.astype(mx.float32)], axis=-1)
+    w = mx.softmax(s, axis=-1)
+    if sinks is not None:
+        w = w[..., :-1]
+    return (w @ vr).astype(q.dtype)
+
+
+# (B, Hq, Hkv, qL, kL, D, window, dtype, sinks)
+_WINDOW_CASES = {
+    # Flint sliding layer: a 2048 chunk over a rotating cache of 512 keys
+    "flint_chunk": (1, 32, 4, 2048, 2560, 128, 513, mx.bfloat16, True),
+    "flint_first_chunk": (1, 32, 4, 2048, 2048, 128, 513, mx.bfloat16, True),
+    "prompt_inside_window": (1, 32, 4, 100, 100, 128, 513, mx.bfloat16, True),
+    "partial_blocks": (1, 32, 4, 1000, 1512, 128, 513, mx.float16, False),
+    "window_under_block": (1, 16, 2, 300, 350, 128, 20, mx.bfloat16, True),
+    "few_rows": (1, 32, 4, 3, 515, 128, 513, mx.bfloat16, True),
+    "hd64_gqa8": (1, 64, 8, 777, 1800, 64, 1024, mx.float16, True),
+    "hd256_gqa2": (1, 8, 4, 640, 1151, 256, 512, mx.bfloat16, False),
+    "batch2": (2, 16, 4, 513, 1025, 128, 513, mx.bfloat16, True),
+}
+
+
+@pytest.mark.parametrize("case", list(_WINDOW_CASES), ids=list(_WINDOW_CASES))
+def test_sdpa_prefill_window(case):
+    if not kq.nax_available():
+        pytest.skip("sdpa_prefill_window needs NAX")
+    B, Hq, Hkv, qL, kL, D, window, dtype, with_sinks = _WINDOW_CASES[case]
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(B, Hq, Hkv, qL, kL, D, dtype, seed=qL + kL + D, strided=False)
+    sk = None
+    if with_sinks:
+        sk = mx.random.normal((Hq,), key=mx.random.key(D)).astype(mx.float32)
+    got = kq.sdpa_prefill_window(q, k, v, scale, window, sinks=sk)
+    ref = _ref_sdpa_window(q, k, v, scale, window, sk)
+    _eval_or_skip(got, ref)
+    rel = _rel(got, ref)
+    assert got.shape == q.shape
+    assert rel < REL_BOUND[dtype], f"{case}: rel {rel:.3e}"
+
+
+def test_sdpa_prefill_window_model_layout():
+    # Queries as the transpose of [B, L, H, D] projections and keys and
+    # values as the prefix of a longer cache are read in place.
+    if not kq.nax_available():
+        pytest.skip("sdpa_prefill_window needs NAX")
+    B, Hq, Hkv, qL, kL, D, window = 1, 32, 4, 1000, 1512, 128, 513
+    scale = 1.0 / (D**0.5)
+    _, k, v = _make(B, Hq, Hkv, 1, kL, D, mx.bfloat16, seed=5, strided=True)
+    q = mx.random.normal((B, qL, Hq, D), key=mx.random.key(6)).astype(mx.bfloat16)
+    mx.eval(q)
+    q = q.transpose(0, 2, 1, 3)
+    sk = mx.random.normal((Hq,), key=mx.random.key(7))
+    got = kq.sdpa_prefill_window(q, k, v, scale, window, sinks=sk)
+    want = kq.sdpa_prefill_window(
+        mx.contiguous(q), mx.contiguous(k), mx.contiguous(v), scale, window, sinks=sk
+    )
+    _eval_or_skip(got, want)
+    assert mx.array_equal(got, want).item()
+    assert _rel(got, _ref_sdpa_window(q, k, v, scale, window, sk)) < 5e-3
+
+
+def test_sdpa_prefill_window_validation():
+    q, k, v = _make(1, 32, 4, 64, 600, 128, mx.bfloat16, seed=3, strided=False)
+    sc = 128**-0.5
+    with pytest.raises(ValueError):  # head dim
+        kq.sdpa_prefill_window(q[..., :96], k[..., :96], v[..., :96], sc, 513)
+    with pytest.raises(ValueError):  # window
+        kq.sdpa_prefill_window(q, k, v, sc, 0)
+    with pytest.raises(ValueError):  # more queries than keys
+        kq.sdpa_prefill_window(q, k[:, :, :32], v[:, :, :32], sc, 513)
+    with pytest.raises(ValueError):  # kv heads do not divide q heads
+        kq.sdpa_prefill_window(q, k[:, :3], v[:, :3], sc, 513)
+    with pytest.raises(ValueError):  # dtype mismatch
+        kq.sdpa_prefill_window(q, k.astype(mx.float16), v, sc, 513)
+    with pytest.raises(ValueError):  # one sink per query head
+        kq.sdpa_prefill_window(q, k, v, sc, 513, sinks=mx.zeros((4,)))
+
+
 def test_sdpa_paged_validation():
     B, Hq, Hkv, D, S = 2, 16, 8, 128, 1024
     scale = 1.0 / (D**0.5)

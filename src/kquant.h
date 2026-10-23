@@ -483,6 +483,22 @@ mx::array sdpa_prefill_block_sparse(
     int offset,
     mx::StreamOrDevice s = {});
 
+// Sliding-window causal prefill attention: q [B, Hq, qL, D] are the last qL
+// of the kL positions of k, v [B, Hkv, kL, D]; query row r (r = row + kL - qL)
+// sees keys r - window < c <= r, plus sinks [Hq] (optional) in the softmax
+// denominator. Only the key blocks inside each query block's window are
+// read. D 64, 128 or 256, float16 or bfloat16, Hq a multiple of Hkv. Output
+// [B, Hq, qL, D] laid out as [B, qL, Hq, D], as mx.fast SDPA lays it out.
+// Requires the tensor-op units (nax_available()).
+mx::array sdpa_prefill_window(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    int window,
+    std::optional<mx::array> sinks = std::nullopt,
+    mx::StreamOrDevice s = {});
+
 // sdpa_fa_verify returning {out, lse}: lse [B, Hkv, n_rows] float32 is the
 // natural-log softmax normalizer per folded row (cascade merge weight).
 std::vector<mx::array> sdpa_fa_verify_lse(
@@ -2103,6 +2119,41 @@ class KQuantSDPABSPrefill : public mx::Primitive {
  private:
   float scale_;
   int offset_;
+};
+
+// Sliding-window prefill attention (see sdpa_prefill_window).
+// Inference-only.
+class KQuantSDPAWindow : public mx::Primitive {
+ public:
+  explicit KQuantSDPAWindow(
+      mx::Stream stream,
+      float scale,
+      int window,
+      bool has_sinks)
+      : mx::Primitive(stream),
+        scale_(scale),
+        window_(window),
+        has_sinks_(has_sinks) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSDPAWindow";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int window_;
+  bool has_sinks_;
 };
 
 // Fused shared-prefix cascade attention (see sdpa_decode_gqa_cascade).

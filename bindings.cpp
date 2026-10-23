@@ -519,6 +519,41 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_prefill_window",
+      &mlx_kquant::sdpa_prefill_window,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "scale"_a,
+      "window"_a,
+      "sinks"_a = nb::none(),
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Sliding-window causal prefill attention on the tensor-op units.
+        The queries are the last qL of the kL key positions; query row i
+        sees the keys at positions p with p <= i + kL - qL and
+        p > i + kL - qL - window. Only the key blocks inside each query
+        block's window are read, where a dense masked attention reads every
+        block up to the diagonal. Needs a NAX GPU (M5 and later).
+
+        Args:
+            q (array): queries [B, n_q_heads, qL, D], float16/bfloat16,
+                D in {64, 128, 256}. Batch, head and row strided is fine;
+                the head_dim must be contiguous.
+            k (array): keys [B, n_kv_heads, kL, D] in position order, kL
+                >= qL; n_kv_heads must divide n_q_heads.
+            v (array): values [B, n_kv_heads, kL, D].
+            scale (float): query scale (typically 1/sqrt(D)).
+            window (int): keys each query sees, itself included; >= 1.
+            sinks (array, optional): per-q-head attention sinks, shape
+                [n_q_heads]; an extra softmax logit with no value row.
+
+        Returns:
+            array: attention output [B, n_q_heads, qL, D].
+      )");
+
+  m.def(
       "sdpa_fa_verify",
       [](mx::array q,
          mx::array k,

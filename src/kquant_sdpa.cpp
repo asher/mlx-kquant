@@ -1500,7 +1500,87 @@ void KQuantSDPABSPrefill::eval_gpu(
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+void KQuantSDPAWindow::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  // q, k and v are read through their strides with a unit head_dim stride.
+  const mx::array q = sdpa_rows(inputs[0], s, "sdpa_prefill_window q");
+  const mx::array k = sdpa_rows(inputs[1], s, "sdpa_prefill_window k");
+  const mx::array v = sdpa_rows(inputs[2], s, "sdpa_prefill_window v");
+  auto& out = outputs[0];
+
+  int B = q.shape(0);
+  int H = q.shape(1);
+  int qL = q.shape(2);
+  int D = q.shape(3);
+  int kL = k.shape(2);
+  int gqa = H / k.shape(1);
+  int window = window_;
+  int has_sinks = has_sinks_ ? 1 : 0;
+  float scale = scale_;
+
+  // [B, H, qL, D] stored as [B, qL, H, D], so the caller's transpose to
+  // [B, qL, H * D] is a view.
+  const int64_t str_h = D;
+  const int64_t str_l = static_cast<int64_t>(H) * D;
+  const int64_t str_b = static_cast<int64_t>(qL) * str_l;
+  mx::array::Flags flags{
+      /* bool contiguous = */ 1,
+      /* bool row_contiguous = */ 0,
+      /* bool col_contiguous = */ 0,
+  };
+  out.set_data(
+      mx::allocator::malloc(out.nbytes()),
+      out.size(),
+      {str_b, str_h, str_l, 1},
+      flags);
+
+  std::vector<int64_t> strides = {
+      q.strides(0),
+      q.strides(1),
+      q.strides(2),
+      k.strides(0),
+      k.strides(1),
+      k.strides(2),
+      v.strides(0),
+      v.strides(1),
+      v.strides(2),
+      str_b,
+      str_h,
+      str_l};
+
+  std::string kname = "kq_sdpa_window_nax_" + kq_type_string(q.dtype()) + "_" +
+      std::to_string(D);
+  auto kernel = kq_get_kernel(d, kname, kname, {});
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(q, 0);
+  ce.set_input_array(k, 1);
+  ce.set_input_array(v, 2);
+  ce.set_output_array(out, 3);
+  ce.set_input_array(has_sinks_ ? inputs[3] : q, 4);
+  ce.set_vector_bytes(strides, 5);
+  ce.set_bytes(qL, 6);
+  ce.set_bytes(kL, 7);
+  ce.set_bytes(gqa, 8);
+  ce.set_bytes(window, 9);
+  ce.set_bytes(has_sinks, 10);
+  ce.set_bytes(scale, 11);
+  MTL::Size group_dims(128, 1, 1);
+  MTL::Size grid_dims((qL + 63) / 64, H, B);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 #else // !_METAL_
+
+void KQuantSDPAWindow::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.sdpa_prefill_window] requires a Metal build.");
+}
 
 void KQuantSDPA::eval_gpu(
     const std::vector<mx::array>&,
@@ -2418,6 +2498,13 @@ void KQuantSDPAFAVerify::eval_cpu(
       "[mlx_kquant.sdpa_fa_verify] has no CPU implementation.");
 }
 
+void KQuantSDPAWindow::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.sdpa_prefill_window] has no CPU implementation.");
+}
+
 void KQuantSDPABSPrefill::eval_cpu(
     const std::vector<mx::array>&,
     std::vector<mx::array>&) {
@@ -2726,6 +2813,89 @@ std::vector<mx::Shape> KQuantSDPABSPrefill::output_shapes(
 bool KQuantSDPABSPrefill::is_equivalent(const mx::Primitive& other) const {
   auto& o = static_cast<const KQuantSDPABSPrefill&>(other);
   return scale_ == o.scale_ && offset_ == o.offset_;
+}
+
+std::vector<mx::Shape> KQuantSDPAWindow::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  return {inputs[0].shape()};
+}
+
+bool KQuantSDPAWindow::is_equivalent(const mx::Primitive& other) const {
+  auto& o = static_cast<const KQuantSDPAWindow&>(other);
+  return scale_ == o.scale_ && window_ == o.window_ &&
+      has_sinks_ == o.has_sinks_;
+}
+
+mx::array sdpa_prefill_window(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    int window,
+    std::optional<mx::array> sinks,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const std::string op = "[mlx_kquant.sdpa_prefill_window] ";
+  if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4) {
+    throw std::invalid_argument(op + "q, k, v must be 4-D [B, heads, L, D].");
+  }
+  int B = q.shape(0);
+  int n_q_heads = q.shape(1);
+  int qL = q.shape(2);
+  int D = q.shape(3);
+  int n_kv_heads = k.shape(1);
+  int kL = k.shape(2);
+  if (D != 64 && D != 128 && D != 256) {
+    throw std::invalid_argument(
+        op + "only head_dim 64, 128 or 256 is instantiated.");
+  }
+  if (k.shape(3) != D || v.shape(3) != D) {
+    throw std::invalid_argument(op + "q, k, v must share head_dim.");
+  }
+  auto dt = q.dtype();
+  if (dt != mx::float16 && dt != mx::bfloat16) {
+    throw std::invalid_argument(op + "q must be float16 or bfloat16.");
+  }
+  if (k.dtype() != dt || v.dtype() != dt) {
+    throw std::invalid_argument(op + "q, k, v must share a dtype.");
+  }
+  if (k.shape(0) != B || v.shape(0) != B) {
+    throw std::invalid_argument(op + "q, k, v must share a batch size.");
+  }
+  if (n_kv_heads < 1 || v.shape(1) != n_kv_heads ||
+      n_q_heads % n_kv_heads != 0) {
+    throw std::invalid_argument(
+        op + "k and v must share a head count that divides q's.");
+  }
+  if (v.shape(2) != kL) {
+    throw std::invalid_argument(op + "k and v must share a key length.");
+  }
+  if (qL < 1 || qL > kL) {
+    throw std::invalid_argument(
+        op + "query length must be in [1, key length].");
+  }
+  if (window < 1) {
+    throw std::invalid_argument(op + "window must be >= 1.");
+  }
+  std::vector<mx::array> inputs = {std::move(q), std::move(k), std::move(v)};
+  if (sinks.has_value()) {
+    if (sinks->size() != static_cast<size_t>(n_q_heads)) {
+      throw std::invalid_argument(
+          op + "sinks must hold one logit per query head.");
+    }
+    inputs.push_back(mx::contiguous(
+        mx::astype(mx::reshape(*sinks, {n_q_heads}, s), mx::float32, s),
+        false,
+        s));
+  }
+  if (!nax_available()) {
+    throw std::runtime_error(
+        op + "requires a GPU with tensor-op units; check nax_available().");
+  }
+  auto prim =
+      std::make_shared<KQuantSDPAWindow>(s, scale, window, sinks.has_value());
+  return mx::array(
+      {B, n_q_heads, qL, D}, dt, std::move(prim), std::move(inputs));
 }
 
 mx::array sdpa_prefill_block_sparse(
