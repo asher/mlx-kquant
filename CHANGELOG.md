@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.5]
+
 ### Added
 - `KQ_GQA_NAX_SPLIT_P=1` gives head-dim-128 decode on the matrix units the error of the
   older kernel, at up to 10% more time.
