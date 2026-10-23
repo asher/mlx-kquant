@@ -2763,6 +2763,35 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "kv_append",
+      &mlx_kquant::kv_append,
+      "buf"_a,
+      "x"_a,
+      "offset"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Append rows to a KV cache buffer without copying the buffer.
+
+        Writes x into rows [offset, offset + x.shape[2]) of axis 2 of buf
+        and returns an array that shares buf's data. Every array that
+        shares that buffer sees the new rows, including ones built before
+        the call, while a view of the rows below offset still reads its
+        old rows. The caller must make sure no other holder reads or
+        writes the rows it appends. A buf that is not row-contiguous is
+        copied first. Inference only.
+
+        Args:
+            buf (array): cache buffer [B, H, capacity, D]; a 1-, 2- or
+                4-byte dtype.
+            x (array): rows [B, H, n, D] in the dtype of buf; any strides.
+            offset (int): first row to write; offset + n <= capacity.
+
+        Returns:
+            array: buf's shape and dtype, sharing buf's data.
+      )");
+
+  m.def(
       "route_shed",
       &mlx_kquant::route_shed,
       "indices"_a,

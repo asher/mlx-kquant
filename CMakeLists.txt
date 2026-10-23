@@ -166,6 +166,7 @@ target_sources(
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_hc_lowrank.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_cb_caps.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_route_shed.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_kv_append.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_skinny_mv.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gather.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_encode.cpp
@@ -282,6 +283,7 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_hc_glue.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_hc_lowrank.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_route_shed.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_kv_append.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_skinny_mv.metal
     ${KQ_PROBE_METAL_SOURCES})
 

@@ -7,6 +7,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `kv_append` writes new rows into a KV cache buffer without copying the buffer,
+  so a pipelined decode step no longer copies the whole cache to append one token.
 - `KQ_VERIFY_NAX_Q4_1_SB=0` keeps `q4_1` on its two-block `verify_nax` kernel,
   as `KQ_VERIFY_NAX_Q4_0_SB` does for `q4_0`.
 - `moe_glu_gather_shexp_kq` and `gather_qmv_mix_kq` take a shared expert k
