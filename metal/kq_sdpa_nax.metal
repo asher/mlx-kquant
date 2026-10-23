@@ -41,3 +41,15 @@ instantiate_kq_sdpa_fa_verify_nax_rows(bfloat16_t, 128, 1)
 instantiate_kq_sdpa_fa_verify_nax_rows(float16_t, 128, 1)
 instantiate_kq_sdpa_fa_verify_nax_rows(bfloat16_t, 128, 2)
 instantiate_kq_sdpa_fa_verify_nax_rows(float16_t, 128, 2)
+
+// sdpa_decode_gqa pass 1 at head_dim 128 under KQ_GQA_NAX_SPLIT_P=1: the
+// fa_verify kernel, one row group, two d groups, P @ V on split P. The
+// default runs the fa_verify instantiation itself.
+#define instantiate_kq_sdpa_gqa_nax_128(type)                          \
+  instantiate_kernel(                                                  \
+      "kq_sdpa_gqa_nax_2pass_1_" #type "_128",                         \
+      kq_sdpa_fa_verify_2pass_1_nax,                                   \
+      type, 128, 1, 2, true)
+
+instantiate_kq_sdpa_gqa_nax_128(bfloat16_t)
+instantiate_kq_sdpa_gqa_nax_128(float16_t)

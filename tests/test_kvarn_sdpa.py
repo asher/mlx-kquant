@@ -206,6 +206,10 @@ def kvarn_args(st):
 def run_pair(st, q, N, k_bits, v_bits, dtype=mx.float16, **kw):
     qm = mx.array(q).astype(dtype)
     scale = st["d"] ** -0.5
+    # Both kernels at kvarn's default tile: the plain kernel's one-row decode
+    # default at head_dim 128 is 16.
+    d = st["d"]
+    kw.setdefault("tile_c", 32 if d == 128 else 16 if d == 256 else 8)
     out = kq.sdpa_decode_gqa_kvarn(
         qm,
         st["codes_k"],
@@ -452,6 +456,13 @@ def test_tile_c_16_and_explicit_splits():
     assert_bit_equal(out, ref)
 
 
+def test_verify_width_needs_the_default_tile():
+    st = build_state(1, 2, 300, 6, 6, seed=9)
+    q = make_q(1, 8, 2)
+    with pytest.raises(ValueError, match="query length > 1 needs tile_c"):
+        run_pair(st, q, 300, 6, 6, tile_c=16)
+
+
 def test_multi_group_sink():
     # quantized_kv_start extension: sink capacity of two groups.
     st = build_state(1, 2, 700, 6, 6, sink_cap=256, seed=8)
@@ -479,7 +490,7 @@ def test_n_attend_matches_truncated_reference():
         q, *args, 1000, SCALE, 6, 6, n_attend=800, full_visibility=True
     )
     k_ref, v_ref = materialize(st, mx.float16)
-    ref = kq.sdpa_decode_gqa(q, k_ref[:, :, :800], v_ref[:, :, :800], SCALE)
+    ref = kq.sdpa_decode_gqa(q, k_ref[:, :, :800], v_ref[:, :, :800], SCALE, tile_c=32)
     assert_bit_equal(out, ref)
     assert_bit_equal(out_fv, ref)
 

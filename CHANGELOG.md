@@ -7,6 +7,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `KQ_GQA_NAX_SPLIT_P=1` gives head-dim-128 decode on the matrix units the error of the
+  older kernel, at up to 10% more time.
+- `kv_append` writes new rows into a KV cache buffer without copying the buffer,
+  so a pipelined decode step no longer copies the whole cache to append one token.
 - `KQ_VERIFY_NAX_Q4_1_SB=0` keeps `q4_1` on its two-block `verify_nax` kernel,
   as `KQ_VERIFY_NAX_Q4_0_SB` does for `q4_0`.
 - `moe_glu_gather_shexp_kq` and `gather_qmv_mix_kq` take a shared expert k
@@ -17,6 +21,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `KQ_MOE_SHEXP_MULTI=0` declines a wider shared expert.
 
 ### Changed
+- On M5 and later GPUs, `sdpa_decode_gqa` decodes one query at head dim 128 on the
+  matrix units, 1.04 to 2.4x faster than before. `KQ_GQA_NAX=0` restores the old kernel.
+- Without the matrix units, `sdpa_decode_gqa` stages 16 keys by default for one query
+  of one row at head dim 128, which decodes 4 to 10% faster at 4 KV heads from 17k keys.
 - The `q2_k`, `q4_k` and `q5_k` MoE gathers and `mv_ext` mat-vecs take 2-18% less
   time on M5 Max, with the same output. `KQ_KQUANT_WORD=0` restores the old decode.
 - At one activation row, `gather_qmv_mix_kq` with a shared expert in another
@@ -47,6 +55,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that supports it.
 
 ### Fixed
+- `sdpa_decode_gqa` and `sdpa_decode_gqa_kvarn` raise a ValueError for a
+  `tile_c` with no verify-width kernel at query length 2 to 4, where the
+  process aborted.
 - `KQ_MOE_NX=32` on the shared-expert gathers with a `q5_k` shared expert
   raises an error that names the setting, in place of a bare kernel load error.
 

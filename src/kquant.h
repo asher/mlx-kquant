@@ -1113,6 +1113,20 @@ std::vector<mx::array> route_shed(
     mx::array slot_table,
     mx::StreamOrDevice s = {});
 
+// Append x [B, H, n, D] into rows [offset, offset + n) of axis 2 of the KV
+// cache buffer buf [B, H, cap, D], without copying buf. The output has
+// buf's shape and dtype and shares buf's data, so every array sharing that
+// buffer sees the new rows; a view of rows below offset reads its old rows.
+// The caller must make sure no other holder reads or writes rows
+// [offset, offset + n). A buf that is not row-contiguous is copied first.
+// x must match buf in dtype and in axes 0, 1 and 3; 1-, 2- and 4-byte
+// dtypes. Inference-only.
+mx::array kv_append(
+    mx::array buf,
+    mx::array x,
+    int64_t offset,
+    mx::StreamOrDevice s = {});
+
 // ----------------------------- primitives -----------------------------
 
 // Dequantize a single uint8 K-quant wire-byte tensor. Inference-only:
@@ -3238,6 +3252,31 @@ class KQuantSkinnyMV : public mx::Primitive {
     return "KQuantSkinnyMV";
   }
   bool is_equivalent(const mx::Primitive& other) const override;
+};
+
+// KV cache append (see kv_append). The output shares the cache buffer, so
+// two appends are never equivalent. Inference-only.
+class KQuantKVAppend : public mx::Primitive {
+ public:
+  KQuantKVAppend(mx::Stream stream, int64_t offset)
+      : mx::Primitive(stream), offset_(offset) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantKVAppend";
+  }
+  bool is_equivalent(const mx::Primitive&) const override {
+    return false;
+  }
+
+ private:
+  int64_t offset_;
 };
 
 // Routed-expert slot remap + residency shed (see route_shed).
