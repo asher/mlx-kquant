@@ -27,7 +27,8 @@ N, K = 96, 512
 CODECS = ["q4_k", "q6_k", "q8_0", "q4_0", "q4_1"]
 # 1 row takes qmv, 4 the verify kernel, 64 and 1100 the matmul tiles.
 ROWS = [1, 4, 64, 1100]
-SCALES = mx.zeros((1,), dtype=mx.uint8)
+# A literal has memory at import, so the node tests see no graph for it.
+SCALES = mx.array([0], dtype=mx.uint8)
 _W = {}
 
 
