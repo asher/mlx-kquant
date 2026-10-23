@@ -1692,7 +1692,9 @@ static std::vector<mx::array> sdpa_decode_gqa_impl(
   // The verify-width (_p2) kernels exist at one tile per head dim.
   const int p2_tile = D <= 128 ? 32 : D == 256 ? 16 : 8;
   if (tile_c == 0) {
-    tile_c = p2_tile;
+    // One query of one row at head_dim 128 stages 16 keys: measured on M5
+    // Max 4-10% faster than 32 from 17k keys at 4 KV heads, even at 8.
+    tile_c = D == 128 && qL == 1 && q.shape(0) == 1 && !kv_q8 ? 16 : p2_tile;
   }
   // Instantiated (D, C) pairs: threadgroup K+V tiles cap at 16 KB so two
   // threadgroups co-reside per core (D=64/128: C 32/16; 256: 16/8; 512: 8).

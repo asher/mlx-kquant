@@ -235,6 +235,34 @@ def test_sdpa_decode_gqa_verify_width_needs_the_default_tile(D, tile_c):
         kq.sdpa_decode_gqa(q, k, v, D**-0.5, tile_c=tile_c)
 
 
+@pytest.mark.parametrize(
+    "B,qL,D,q8,want",
+    [
+        (1, 1, 128, False, 16),
+        (2, 1, 128, False, 32),
+        (1, 2, 128, False, 32),
+        (1, 1, 128, True, 32),
+        (1, 1, 256, False, 16),
+    ],
+)
+def test_sdpa_decode_gqa_default_tile(B, qL, D, q8, want):
+    # The default tile at each side of the head-dim-128 decode bucket. The
+    # two tiles round differently at D=128, so the bits name the tile there.
+    q, k, v = _make(B, 32, 4, qL, 16384, D, mx.float16, seed=7, strided=False)
+    kw = {}
+    if q8:
+        (k, ks, kb), (v, vs, vb) = mx.quantize(k, 64, 8), mx.quantize(v, 64, 8)
+        kw = dict(k_scales=ks, k_biases=kb, v_scales=vs, v_biases=vb)
+    scale = D**-0.5
+    got = kq.sdpa_decode_gqa(q, k, v, scale, **kw)
+    pinned = kq.sdpa_decode_gqa(q, k, v, scale, tile_c=want, **kw)
+    assert mx.array_equal(got, pinned).item()
+    if qL == 1 and D == 128:
+        other = 32 if want == 16 else 16
+        moved = kq.sdpa_decode_gqa(q, k, v, scale, tile_c=other, **kw)
+        assert not mx.array_equal(got, moved).item()
+
+
 @pytest.mark.parametrize("Hq,Hkv", [(24, 4), (16, 4), (32, 8), (8, 8)])
 def test_sdpa_decode_gqa_factors(Hq, Hkv):
     _check_gqa(256, kL=2048, dtype=mx.bfloat16, Hq=Hq, Hkv=Hkv)

@@ -19,6 +19,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `KQ_MOE_SHEXP_MULTI=0` declines a wider shared expert.
 
 ### Changed
+- `sdpa_decode_gqa` stages 16 keys by default for one query of one row at
+  head dim 128, which decodes 4 to 10% faster at 4 KV heads from 17k keys.
 - The `q2_k`, `q4_k` and `q5_k` MoE gathers and `mv_ext` mat-vecs take 2-18% less
   time on M5 Max, with the same output. `KQ_KQUANT_WORD=0` restores the old decode.
 - At one activation row, `gather_qmv_mix_kq` with a shared expert in another

@@ -457,7 +457,8 @@ NB_MODULE(_ext, m) {
                 [n_q_heads] -- an extra softmax logit with no value row.
             splits (int): key-axis split count; 0 picks the default.
             tile_c (int): staged tile height, 8/16/32; 0 (default) picks by
-                head_dim (32 up to D=128, 16 at D=256, 8 at D=512).
+                head_dim (32 up to D=128, 16 at D=256, 8 at D=512), and 16
+                for one query of one row of unquantized KV at D=128.
             starts (array, optional): per-batch-row key start offsets,
                 int32 [B], each in [0, kL - qL]; row b attends [starts[b],
                 kL). Out-of-range values read as an empty row (zero output).
