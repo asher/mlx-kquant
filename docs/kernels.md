@@ -1306,6 +1306,12 @@ into a packed layout first.
   splits at 32 or under, and 1 once KV heads x batch passes 32. It ignores the depth, so it falls
   as the batch grows. The two kernels round differently, so the same rows are not bit-identical
   between this pass, the simdgroup kernel (`ends`, q8) and another batch size.
+  At head dim 128 the same holds from 64 rows of KV heads x batch x keys, on the `sdpa_fa_verify`
+  tensor-op kernel with the GQA group as its query rows: two simdgroups per 32-key tile, each on half
+  the head dim. Its split count keeps KV heads x batch x splits at 256 or under up to 2048 keys and
+  128 above, at most 32 and at least 4 from 16384 keys. The tensor op takes the float P of `P @ V`
+  at reduced precision. `KQ_GQA_NAX_SPLIT_P=1` splits P into two parts in the input type, so the
+  fp16 error matches the simdgroup kernel's.
   `KQ_GQA_NAX=0` forces the simdgroup kernel.
 - **`sdpa_decode_gqa_cascade`** - shared-prefix batched decode: every row attends one common prefix
   plus its own private suffix. The prefix is walked once for all rows on the matrix-unit tile, private

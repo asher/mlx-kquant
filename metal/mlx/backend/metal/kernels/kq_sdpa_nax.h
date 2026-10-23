@@ -614,7 +614,10 @@ template <typename T>
 // kq_sdpa_fa_verify_2pass_1 (kq_sdpa.h), so kq_sdpa_gqa_2pass_2 merges
 // either. The caller folds the GQA group into the query rows: q is
 // [B, Hkv, n_rows, D], and folded row r attends keys up to
-// N - q_len + (r % q_len).
+// N - q_len + (r % q_len). sdpa_decode_gqa runs it at head_dim 128 with
+// q_len 1 and the group as the rows. With starts, batch row b
+// attends keys [starts[b], N): its tiles begin at the start, so pad rows
+// are never read.
 //
 // One threadgroup per (kv head, batch row, key split), WM x WN simdgroups.
 // Simdgroup (row group, d group) owns query rows 16 * row group onward and
@@ -625,7 +628,7 @@ template <typename T>
 // d group runs the same row softmax on the sum. A tile past a row's limit
 // leaves the row's running max at finite_min and its P row at zero; an
 // empty split writes O = 0, sum = 0 and max = finite_min.
-template <typename T, int D, int WM, int WN>
+template <typename T, int D, int WM, int WN, bool PV_SPLIT = false>
 [[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void
 kq_sdpa_fa_verify_2pass_1_nax(
     const device T* queries [[buffer(0)]],
@@ -642,6 +645,9 @@ kq_sdpa_fa_verify_2pass_1_nax(
     const constant float& scale [[buffer(11)]],
     const constant int& q_len [[buffer(12)]],
     const constant int& n_rows [[buffer(13)]],
+    const constant size_t& k_batch_stride [[buffer(14)]],
+    const constant size_t& v_batch_stride [[buffer(15)]],
+    const device int* starts [[buffer(16)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -669,15 +675,16 @@ kq_sdpa_fa_verify_2pass_1_nax(
   const int tm = kU * row_group;
 
   const int chunk = ((N + gqa_splits * BK - 1) / (gqa_splits * BK)) * BK;
-  const int k0 = split_idx * chunk;
-  const int k1 = min(k0 + chunk, N);
+  const int k1 = min(split_idx * chunk + chunk, N);
+  const int k0 =
+      max(split_idx * chunk, gqa_has_starts ? max(0, starts[tid.y]) : 0);
 
   const int k_ld = int(k_seq_stride);
   const int v_ld = int(v_seq_stride);
-  const device T* K =
-      keys + qbh * k_head_stride + (size_t)k0 * k_seq_stride + d_group * BDh;
-  const device T* V =
-      values + qbh * v_head_stride + (size_t)k0 * v_seq_stride + d_group * BDh;
+  const device T* K = keys + tid.y * k_batch_stride + tid.x * k_head_stride +
+      (size_t)k0 * k_seq_stride + d_group * BDh;
+  const device T* V = values + tid.y * v_batch_stride + tid.x * v_head_stride +
+      (size_t)k0 * v_seq_stride + d_group * BDh;
 
   const short2 sc = otile_t::NAXFrag_t::get_coord();
   const short sm = sc.y;
@@ -817,7 +824,22 @@ kq_sdpa_fa_verify_2pass_1_nax(
 
     simdgroup_barrier(mem_flags::mem_none);
 
-    // O += P @ V over this simdgroup's columns.
+    // O += P @ V over this simdgroup's columns. The tensor op takes a float
+    // P at reduced precision; with PV_SPLIT, P runs as two T parts, hi and
+    // lo, which keeps the simdgroup kernel's rounding at a second matmul.
+    using pfrag_t = typename BaseNAXFrag::dtype_frag_t<T>;
+    pfrag_t p_hi[TK], p_lo[TK];
+    if (PV_SPLIT) {
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < kEPF; i++) {
+          const float x = Stile.frag_at(0, ik)[i];
+          p_hi[ik][i] = T(x);
+          p_lo[ik][i] = T(x - float(p_hi[ik][i]));
+        }
+      }
+    }
     STEEL_PRAGMA_UNROLL
     for (short id = 0; id < TDh; id += 2) {
       STEEL_PRAGMA_UNROLL
@@ -829,14 +851,28 @@ kq_sdpa_fa_verify_2pass_1_nax(
         } else {
           Vtile.load_rows(vp, v_ld, short(krem - ik * kU));
         }
-        otile_t::NAXFrag_t::mma(
-            Otile.frag_at(0, id),
-            Otile.frag_at(0, id + 1),
-            Stile.frag_at(0, ik),
-            metal::false_type{},
-            Vtile.frag_at(0, 0),
-            Vtile.frag_at(0, 1),
-            metal::false_type{});
+        if (PV_SPLIT) {
+          STEEL_PRAGMA_UNROLL
+          for (short h = 0; h < 2; h++) {
+            otile_t::NAXFrag_t::mma(
+                Otile.frag_at(0, id),
+                Otile.frag_at(0, id + 1),
+                h == 0 ? p_hi[ik] : p_lo[ik],
+                metal::false_type{},
+                Vtile.frag_at(0, 0),
+                Vtile.frag_at(0, 1),
+                metal::false_type{});
+          }
+        } else {
+          otile_t::NAXFrag_t::mma(
+              Otile.frag_at(0, id),
+              Otile.frag_at(0, id + 1),
+              Stile.frag_at(0, ik),
+              metal::false_type{},
+              Vtile.frag_at(0, 0),
+              Vtile.frag_at(0, 1),
+              metal::false_type{});
+        }
       }
     }
 
