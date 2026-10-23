@@ -1689,8 +1689,10 @@ static std::vector<mx::array> sdpa_decode_gqa_impl(
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa] splits must be in [0, 128].");
   }
+  // The verify-width (_p2) kernels exist at one tile per head dim.
+  const int p2_tile = D <= 128 ? 32 : D == 256 ? 16 : 8;
   if (tile_c == 0) {
-    tile_c = D <= 128 ? 32 : D == 256 ? 16 : 8;
+    tile_c = p2_tile;
   }
   // Instantiated (D, C) pairs: threadgroup K+V tiles cap at 16 KB so two
   // threadgroups co-reside per core (D=64/128: C 32/16; 256: 16/8; 512: 8).
@@ -1701,6 +1703,12 @@ static std::vector<mx::array> sdpa_decode_gqa_impl(
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa] tile_c not instantiated for this "
         "head_dim (0 picks the default).");
+  }
+  if (qL > 1 && tile_c != p2_tile) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa] query length > 1 needs tile_c " +
+        std::to_string(p2_tile) + " at head_dim " + std::to_string(D) +
+        " (0 picks it).");
   }
   if (k.shape(2) < qL) {
     throw std::invalid_argument(
@@ -2145,6 +2153,13 @@ static std::vector<mx::array> sdpa_decode_gqa_kvarn_impl(
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_gqa_kvarn] tile_c must be 32 or 16 at "
         "head_dim 128, 16 or 8 at 256, and 8 at 512 (0 picks the default).");
+  }
+  const int p2_tile = D == 128 ? 32 : D == 256 ? 16 : 8;
+  if (qL > 1 && tile_c != p2_tile) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_decode_gqa_kvarn] query length > 1 needs tile_c " +
+        std::to_string(p2_tile) + " at head_dim " + std::to_string(D) +
+        " (0 picks it).");
   }
 
   // Unconditional: layout flags are undefined on unevaluated inputs, and

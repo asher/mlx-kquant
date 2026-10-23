@@ -49,6 +49,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that supports it.
 
 ### Fixed
+- `sdpa_decode_gqa` and `sdpa_decode_gqa_kvarn` raise a ValueError for a
+  `tile_c` with no verify-width kernel at query length 2 to 4, where the
+  process aborted.
 - `KQ_MOE_NX=32` on the shared-expert gathers with a `q5_k` shared expert
   raises an error that names the setting, in place of a bare kernel load error.
 

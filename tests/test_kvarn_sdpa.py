@@ -452,6 +452,13 @@ def test_tile_c_16_and_explicit_splits():
     assert_bit_equal(out, ref)
 
 
+def test_verify_width_needs_the_default_tile():
+    st = build_state(1, 2, 300, 6, 6, seed=9)
+    q = make_q(1, 8, 2)
+    with pytest.raises(ValueError, match="query length > 1 needs tile_c"):
+        run_pair(st, q, 300, 6, 6, tile_c=16)
+
+
 def test_multi_group_sink():
     # quantized_kv_start extension: sink capacity of two groups.
     st = build_state(1, 2, 700, 6, 6, sink_cap=256, seed=8)

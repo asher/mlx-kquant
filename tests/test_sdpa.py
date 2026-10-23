@@ -226,6 +226,15 @@ def test_sdpa_decode_gqa(D, tile_c, dtype):
     _check_gqa(D, kL=4096, dtype=dtype, tile_c=tile_c)
 
 
+@pytest.mark.parametrize("D,tile_c", [(64, 16), (128, 16), (256, 8), (256, 4)])
+def test_sdpa_decode_gqa_verify_width_needs_the_default_tile(D, tile_c):
+    # Only the default tile has a verify-width kernel. Another tile raises
+    # at the call, not at the kernel load.
+    q, k, v = _make(1, 8, 2, 2, 256, D, mx.bfloat16, seed=D, strided=False)
+    with pytest.raises(ValueError, match="query length > 1 needs tile_c"):
+        kq.sdpa_decode_gqa(q, k, v, D**-0.5, tile_c=tile_c)
+
+
 @pytest.mark.parametrize("Hq,Hkv", [(24, 4), (16, 4), (32, 8), (8, 8)])
 def test_sdpa_decode_gqa_factors(Hq, Hkv):
     _check_gqa(256, kL=2048, dtype=mx.bfloat16, Hq=Hq, Hkv=Hkv)
