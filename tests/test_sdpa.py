@@ -2192,14 +2192,18 @@ def test_sdpa_prefill_window(case):
     assert rel < REL_BOUND[dtype], f"{case}: rel {rel:.3e}"
 
 
-@pytest.mark.parametrize("with_sinks", [True, False], ids=["sinks", "no_sinks"])
-def test_sdpa_prefill_window_starts(with_sinks):
+@pytest.mark.parametrize(
+    "D, with_sinks",
+    [(128, True), (128, False), (256, False)],
+    ids=["hd128_sinks", "hd128", "hd256"],
+)
+def test_sdpa_prefill_window_starts(D, with_sinks):
     # A left-padded batch: rows start at 0, inside the window, past a whole
     # query block, and past every query of the chunk. Valid query rows match
     # the reference; rows below their start read zeros.
     if not kq.nax_available():
         pytest.skip("sdpa_prefill_window needs NAX")
-    B, Hq, Hkv, qL, kL, D, window = 4, 16, 4, 300, 811, 128, 513
+    B, Hq, Hkv, qL, kL, window = 4, 16, 4, 300, 811, 513
     scale = 1.0 / (D**0.5)
     q, k, v = _make(B, Hq, Hkv, qL, kL, D, mx.bfloat16, seed=21, strided=False)
     starts = mx.array([0, 37, 600, 900], dtype=mx.int32)
