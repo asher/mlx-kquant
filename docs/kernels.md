@@ -548,11 +548,12 @@ has no K ceiling, and it has no db64 band.
 the E2M1 table in place of the `iq4_nl` codebook, and takes the flat class large-M row. Every other
 block puts its codes at an odd address, so the loader reads that block's codes as aligned pairs
 from the block start. It has no `verify_nax` kernel: that kernel decodes in half, and an E8M0
-scale reaches past the half range. Below M 13 it keeps the mat-vec routes, and its split-K tiles
-run only under `KQ_QMM_SPLITK` and `KQ_QMM_SPLITK_NAX`. Its `bm128_min_m` floor, 449, and its
-BK=128 tile, on by default (`KQ_NAX_MXFP4_BK128=0` keeps BK=64), are those of `iq4_nl`, not
-measured. On the expert gather of a gpt-oss 20B prefill chunk (32 experts, 2048 tokens at top 4,
-K and N 2880), `gather_qmm_seg` takes 2.94 ms on M5 Max, against 9.5-12.4 ms on the ALU kernel.
+scale reaches past the half range. Below M 13 it keeps the mat-vec routes. From M 33 it takes the
+mid-M split-K band as the other codecs do: the NAX split-K tile, and on GPUs without NAX the ALU
+split-K tile. Its `bm128_min_m` floor, 449, and its BK=128 tile, on by default
+(`KQ_NAX_MXFP4_BK128=0` keeps BK=64), are those of `iq4_nl`, not measured. On the expert gather
+of a gpt-oss 20B prefill chunk (32 experts, 2048 tokens at top 4, K and N 2880), `gather_qmm_seg`
+takes 2.94 ms on M5 Max, against 9.5-12.4 ms on the ALU kernel.
 
 The register-resident MMA verify kernels (`verify_mma`) serve `pq2_0`, `ptq1_0`, `q2_0`, `q4_0`,
 `q4_1` and `q8_0` through M 8. Each simdgroup decodes a block of its weight rows straight into 8x8

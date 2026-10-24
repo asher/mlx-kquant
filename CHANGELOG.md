@@ -13,6 +13,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - On M5 and later GPUs, `mxfp4` prefill matmuls and MoE gathers run on the matrix units. A
   gpt-oss 20B expert gather of a 2048-token chunk takes 3.2 to 4.2x less time.
+- On GPUs without NAX, `mxfp4` matmuls of 33 to 128 rows take the split-K tile where the other
+  codecs do.
 
 ## [0.5.5]
 

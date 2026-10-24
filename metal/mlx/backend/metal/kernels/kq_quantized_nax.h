@@ -2912,8 +2912,9 @@ struct KqNaxIq4_nlBlockLoader {
 
 // mxfp4 (32-weight block): KqNaxIq4_nlBlockLoader with the E8M0 scale byte
 // for the fp16 d and the E2M1 table for kvalues_iq4nl. qs sits at +1 of a
-// 17-byte block, so the whole-block path reads bytes, each one weight j and
-// weight j + 16.
+// 17-byte block, so the whole-block path reads eight aligned ushorts: from qs
+// when it is even, else from the block start (the scale and codes 0-14) and
+// code 15 as a byte. Code byte j holds weight j and weight j + 16.
 template <
     typename T,
     short BROWS,

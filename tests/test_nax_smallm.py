@@ -1727,8 +1727,9 @@ def test_verify_nax_head_entry(codec, monkeypatch):
 
 # kq_nax_small_m for the codecs the dispatch tests pin: the per-row qmv
 # limit per N bucket (N <= 512, 1024, 2048, larger), then the split-K
-# entries for N <= 1024 and above.
+# entries for N <= 1024 and above (99: none, which the table writes as 0).
 NAX_SMALL_M = {
+    "mxfp4": ((1, 1, 1, 1), 99, 99),
     "q3_k": ((7, 3, 1, 1), 5, 5),
     "q2_k": ((8, 5, 3, 2), 2, 5),
     "pq2_0": ((8, 5, 3, 2), 9, 9),
