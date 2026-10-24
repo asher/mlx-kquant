@@ -14,6 +14,9 @@ constant bool align_K [[function_constant(202)]];
 // gather_qmm_seg grid layout: 0 = (column, tile); GX > 0 = tile t on grid x
 // t % GX and (t / GX, column) on y.
 constant int kq_seg_gx [[function_constant(203)]];
+// gather_qmm_seg row map: x is the unsorted activations and sorted row r
+// reads x row x_rows[r].
+constant bool kq_seg_xmap [[function_constant(204)]];
 
 template <
     typename T,
@@ -4788,6 +4791,29 @@ KQ_NAX_DEFINE_GATHER_RHS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
 // asserts.
 constexpr constant int kSegLoadSimdgroups = 4;
 
+// The 16 x (16 * TK) A tile of one sub-band through the row map: lane
+// fragment rows fm and fm + 8 come from r0 and r1 (BaseNAXFrag::get_coord),
+// from column k0 on. Columns at or past cols read zero.
+template <typename T, short TK>
+METAL_FUNC void kq_seg_load_rows(
+    thread NAXTile<T, 1, TK>& At,
+    const device T* r0,
+    const device T* r1,
+    const int k0,
+    const short cols) {
+  const short fn = BaseNAXFrag::get_coord().x;
+#pragma unroll
+  for (short j = 0; j < TK; j++) {
+    thread auto& f = At.frag_at(0, j);
+#pragma unroll
+    for (short jj = 0; jj < 4; jj++) {
+      const short c = j * 16 + fn + jj;
+      f[jj] = c < cols ? r0[k0 + c] : T(0);
+      f[4 + jj] = c < cols ? r1[k0 + c] : T(0);
+    }
+  }
+}
+
 template <
     typename T,
     typename LoaderW,
@@ -4798,6 +4824,7 @@ template <
     int WN = 2>
 METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
     const device T* x,
+    const device uint32_t* x_rows,
     const device uint8_t* w,
     const device uint32_t* seg_map,
     device T* y,
@@ -4828,7 +4855,9 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
   const int k_remain = K - K_it * BK;
   const short2 tile_w = short2(k_remain, tgp_bn);
 
-  x += row0 * static_cast<size_t>(K);
+  if (!kq_seg_xmap) {
+    x += row0 * static_cast<size_t>(K);
+  }
   y += row0 * static_cast<size_t>(N) + y_col_long;
   const device uint8_t* wl = w + size_t(expert) * stride_w + y_col_long * K_w;
 
@@ -4867,6 +4896,23 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
   }
 
   const device T* xn = x + tm * K;
+  // Row map: each lane's two fragment rows of each sub-band, read in place.
+  // A row past num_rows reads the tile's first row; its output is not
+  // stored.
+  const device T* xr[TM][2];
+  int xk = 0;
+  if (kq_seg_xmap) {
+    const short fm = BaseNAXFrag::get_coord().y;
+#pragma unroll
+    for (short mi = 0; mi < TM; mi++) {
+#pragma unroll
+      for (short i = 0; i < 2; i++) {
+        const int r = int(tm) + mi * 16 + fm + i * 8;
+        const int rr = r < num_rows ? r : 0;
+        xr[mi][i] = x + size_t(x_rows[row0 + rr]) * size_t(K);
+      }
+    }
+  }
 
   thread LoaderW loader_w(wl, K, Ws, simd_group_id, simd_lane_id);
   const bool sg_loads = int(simd_group_id) < kSegLoadSimdgroups;
@@ -4890,7 +4936,9 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
         if (mi * 16 < sgp_sm) {
           NAXTile<T, 1, TK> At;
           const short rows = min(short(16), short(sgp_sm - mi * 16));
-          if (rows == 16 && cols == SK) {
+          if (kq_seg_xmap) {
+            kq_seg_load_rows(At, xr[mi][0], xr[mi][1], xk + kk1, cols);
+          } else if (rows == 16 && cols == SK) {
             At.load(xn + mi * 16 * K + kk1, K);
           } else {
             At.load_safe(xn + mi * 16 * K + kk1, K, short2(cols, rows));
@@ -4926,6 +4974,7 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
       }
 
       xn += BK;
+      xk += BK;
       loader_w.next();
     }
 
@@ -4984,6 +5033,8 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
       device T* y [[buffer(5)]],                                               \
       const constant int& N [[buffer(6)]],                                     \
       const constant int& K [[buffer(7)]],                                     \
+      const device uint32_t* x_rows                                            \
+      [[buffer(8), function_constant(kq_seg_xmap)]],                           \
       uint3 tid [[threadgroup_position_in_grid]],                              \
       uint simd_group_id [[simdgroup_index_in_threadgroup]],                   \
       uint simd_lane_id [[thread_index_in_simdgroup]]) {                       \
@@ -5015,7 +5066,17 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
         /*tgp_size=*/kSegLoadSimdgroups * SIMD_SIZE>;                          \
     static_assert(WM * WN >= kSegLoadSimdgroups, "seg loader needs 4 SGs");    \
     kq_gather_qmm_seg_nax_tgp_impl<T, LoaderW, BM, BN, BK, WM, WN>(            \
-        x, w, seg_map, y, N, K, Ws, tid, simd_group_id, simd_lane_id);         \
+        x,                                                                     \
+        kq_seg_xmap ? x_rows : nullptr,                                        \
+        w,                                                                     \
+        seg_map,                                                               \
+        y,                                                                     \
+        N,                                                                     \
+        K,                                                                     \
+        Ws,                                                                    \
+        tid,                                                                   \
+        simd_group_id,                                                         \
+        simd_lane_id);                                                         \
   }
 
 #define KQ_NAX_DEFINE_GATHER_SEG(codec, GROUP_CONST, bits_val, LOADER) \

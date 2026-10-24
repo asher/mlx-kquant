@@ -208,7 +208,10 @@ std::vector<mx::array> expert_tile_map(
 // at tiled-GEMM throughput; partial tiles skip dead row fragments in the MMA
 // so ragged segments cost ~ceil(num_rows / 8) row fragments. Rows not
 // covered by the valid tiles are left unwritten (the caller's map must cover
-// every row exactly once). Output dtype follows quantized_matmul. Metal-only.
+// every row exactly once). Output dtype follows quantized_matmul. With
+// x_rows (1-D integers, one per sorted row), x is the unsorted rows and
+// sorted row r is x[x_rows[r]]; the NAX kernel reads them in place, and on
+// any other path the op gathers them first. Metal-only.
 mx::array gather_qmm_seg(
     mx::array x,
     mx::array w,
@@ -217,6 +220,7 @@ mx::array gather_qmm_seg(
     mx::array map,
     mx::array counts,
     int tile_rows = 64,
+    std::optional<mx::array> x_rows = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // gather_qmm_seg tile height for `rows` expert-sorted rows over n_experts

@@ -64,6 +64,10 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
   On M5 Max a `q6_k` expert gather runs 7-23% faster and a `q4_k` one up to 10% faster; other
   codecs run between 5% slower and 7% faster, depending on the shape.
 
+  With `x_rows`, `x` is the unsorted activations and sorted row r reads row `x_rows[r]`, so the
+  caller passes the sort order instead of building the sorted copy. The NAX kernel reads the rows
+  in place; the other paths gather them first. `KQuantSwitchLinear` takes `x_rows` the same way.
+
 On NAX GPUs, `quantized_matmul` transpose (decode-orientation) shapes route by row count M and
 output width N. Per-row qmv serves M 2 up to a per-codec limit, the mat-vec paths (`mv_ext`,
 `verify_qmv`) serve the widths above it, and split-K on a BM=32 double-buffered NAX tile takes over

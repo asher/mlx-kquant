@@ -844,6 +844,7 @@ mx::array gather_qmm_seg(
     mx::array map,
     mx::array counts,
     int tile_rows,
+    std::optional<mx::array> x_rows,
     mx::StreamOrDevice s_) {
   if (w.dtype() != mx::uint8) {
     throw std::invalid_argument(
@@ -864,6 +865,15 @@ mx::array gather_qmm_seg(
     std::ostringstream msg;
     msg << "[mlx_kquant.gather_qmm_seg] x must be [rows, K] but got shape "
         << x.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (x_rows &&
+      (x_rows->ndim() != 1 || x_rows->size() < 1 ||
+       !mx::issubdtype(x_rows->dtype(), mx::integer))) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_seg] x_rows must be a non-empty 1-D "
+        << "integer array but got shape " << x_rows->shape() << " dtype "
+        << x_rows->dtype() << ".";
     throw std::invalid_argument(msg.str());
   }
   if (w.ndim() != 3) {
@@ -908,6 +918,22 @@ mx::array gather_qmm_seg(
 
   auto s = mx::to_stream(s_);
   kq_check_weight_base_at_build(w, kquant_type, s, "gather_qmm_seg");
+  // The NAX kernel reads the rows x_rows names in place; elsewhere the op
+  // gathers them first.
+  std::optional<mx::array> rows_c;
+  if (x_rows) {
+    auto r = mx::astype(*x_rows, mx::uint32, s);
+    bool in_place = false;
+#ifdef _METAL_
+    in_place =
+        s.device == mx::Device::gpu && kq_seg_nax_ok(kquant_type, x.shape(-1));
+#endif
+    if (in_place) {
+      rows_c = mx::contiguous(r, false, s);
+    } else {
+      x = mx::take(x, r, 0, s);
+    }
+  }
   auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
   // The kernel computes each expert's base pointer as expert * N * K_w, so w
   // must be fully row-contiguous (no strided expert dim).
@@ -916,13 +942,18 @@ mx::array gather_qmm_seg(
   auto map_c = mx::contiguous(map, false, s);
   auto cnt_c = mx::contiguous(counts, false, s);
 
-  mx::Shape out_shape{x.shape(0), w.shape(1)};
+  const int rows = rows_c ? rows_c->shape(0) : x.shape(0);
+  std::vector<mx::array> inputs = {
+      x_c, w_c, scales_c, std::move(map_c), std::move(cnt_c)};
+  if (rows_c) {
+    inputs.push_back(*rows_c);
+  }
   return mx::array(
-      std::move(out_shape),
+      mx::Shape{rows, w.shape(1)},
       out_type,
       std::make_shared<KQuantGatherQMMSeg>(
           s, kquant_type, codec->weights_per_block, codec->bits, tile_rows),
-      {x_c, w_c, scales_c, std::move(map_c), std::move(cnt_c)});
+      std::move(inputs));
 }
 
 std::vector<mx::array> quantize(

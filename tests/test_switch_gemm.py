@@ -622,6 +622,108 @@ def test_gather_qmm_seg_tile128_matches_tile64(codec, k, n, dtype, monkeypatch):
         mx.set_cache_limit(limit)
 
 
+@pytest.mark.skipif(
+    bool(os.environ.get("KQUANT_FORCE_CPU")),
+    reason="gather_qmm_seg is Metal-only.",
+)
+@pytest.mark.parametrize(
+    "codec,k,n",
+    [
+        ("q4_1", 1024, N),
+        ("q6_k", 1024, N),
+        ("q4_k", 1024, 72),
+        ("mxfp4", 1024, N),
+        ("q8_0", 96, N),
+    ],
+    ids=["q4_1", "q6_k", "q4_k_n72", "mxfp4", "q8_0_alu"],
+)
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_gather_qmm_seg_reads_rows_through_the_map(codec, k, n, dtype, monkeypatch):
+    """With x_rows, the seg gather over the unsorted rows writes the bits of
+    the call on the gathered copy, for both tile heights, K tiles and grid
+    layouts. Rows repeat, as top-k routing repeats each token. On k=96, off
+    the NAX kernel, the op gathers the rows itself."""
+    import mlx_kquant as kq
+
+    w = _seg_experts(codec, k, 43, n)
+    s = mx.zeros((1,), dtype=mx.uint8)
+    counts = np.array([1, 0, 96, 127, 128, 129, 257, 64], dtype=np.int64)
+    idx = _counts_to_indices(counts)
+    rows = int(counts.sum())
+    rng = np.random.default_rng(53)
+    tokens = rows // 3 + 5
+    x = mx.array((rng.standard_normal((tokens, k)) * 0.1).astype(np.float32)).astype(
+        dtype
+    )
+    x_rows = mx.array(rng.integers(0, tokens, rows).astype(np.uint32))
+    xs = x[x_rows]
+    mx.eval(x, x_rows, xs)
+    limit = mx.set_cache_limit(0)
+    mx.clear_cache()
+    try:
+        for gx, bk in (("0", "0"), ("32", "1")):
+            monkeypatch.setenv("KQ_SEG_GX", gx)
+            monkeypatch.setenv("KQ_SEG_BK128", bk)
+            for tile_rows in (64, 128):
+                maps = kq.expert_tile_map(idx, E, tile_rows=tile_rows)
+                want = kq.gather_qmm_seg(xs, w, s, codec, *maps, tile_rows=tile_rows)
+                got = kq.gather_qmm_seg(
+                    x, w, s, codec, *maps, tile_rows=tile_rows, x_rows=x_rows
+                )
+                mx.eval(want, got)
+                assert got.shape == (rows, n)
+                assert mx.array_equal(got, want).item(), (
+                    f"{codec} k={k} n={n} {dtype} tile {tile_rows} gx {gx} bk128 {bk}"
+                )
+                del want, got
+    finally:
+        mx.set_cache_limit(limit)
+
+
+def test_gather_qmm_seg_rejects_a_bad_row_map():
+    import mlx_kquant as kq
+
+    w = _seg_experts("q8_0", 256, 3)
+    s = mx.zeros((1,), dtype=mx.uint8)
+    x = mx.zeros((4, 256), dtype=mx.bfloat16)
+    maps = (mx.zeros((1, 3), dtype=mx.uint32), mx.zeros((1,), dtype=mx.uint32))
+    for bad in (
+        mx.zeros((2, 4), dtype=mx.uint32),
+        mx.zeros((8,), dtype=mx.float32),
+        mx.zeros((0,), dtype=mx.uint32),
+    ):
+        with pytest.raises(ValueError, match="x_rows"):
+            kq.gather_qmm_seg(x, w, s, "q8_0", *maps, x_rows=bad)
+
+
+@pytest.mark.parametrize("rows", [24, 600])
+def test_switch_linear_reads_rows_through_the_map(rows, monkeypatch):
+    """KQuantSwitchLinear with x_rows gives the bits of the call on the
+    sorted copy, on the segment GEMM (600 rows) and on the gather_qmm path
+    below KQ_SWITCH_GEMM_MIN_ROWS (24 rows), on the GPU and the CPU."""
+    import mlx_kquant as kq
+    from mlx_kquant.nn import KQuantSwitchLinear
+
+    assert KQuantSwitchLinear.takes_x_rows
+    monkeypatch.setenv("KQ_SWITCH_GEMM_MIN_ROWS", "512")
+    lin = KQuantSwitchLinear(E, N, K, False, "q4_k")
+    rng = np.random.default_rng(59)
+    wf = mx.array(rng.standard_normal((E * N, K)).astype(np.float32) * 0.1)
+    lin.weight = kq.quantize(wf, "q4_k")[0].reshape(E, N, -1)
+    tokens = rows // 4 + 3
+    x = mx.array(rng.standard_normal((1, tokens, K)).astype(np.float32)).astype(
+        mx.bfloat16
+    )
+    idx = mx.array(np.sort(rng.integers(0, E, rows)).astype(np.uint32))
+    x_rows = mx.array(rng.integers(0, tokens, rows).astype(np.uint32))
+    xs = x.reshape(-1, K)[x_rows][:, None, :]
+    want = lin(xs, idx, sorted_indices=True)
+    got = lin(x, idx, sorted_indices=True, x_rows=x_rows)
+    mx.eval(want, got)
+    assert got.shape == want.shape
+    assert mx.array_equal(got, want).item()
+
+
 def test_seg_tile_rows_policy(monkeypatch):
     """128-row tiles from 96 rows per expert where the NAX kernel runs
     (120 at k < 1024 when the codec's K tile stays 64), 64 elsewhere;

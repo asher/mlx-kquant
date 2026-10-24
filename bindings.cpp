@@ -2933,6 +2933,7 @@ NB_MODULE(_ext, m) {
       "counts"_a,
       nb::kw_only(),
       "tile_rows"_a = 64,
+      "x_rows"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Segment-walking gather GEMM for expert-sorted MoE prefill.
@@ -2953,6 +2954,10 @@ NB_MODULE(_ext, m) {
                 expert_tile_map to build both.
             tile_rows (int): the map's tile height, 64 or 128. Pass the
                 value the map was built with; seg_tile_rows picks one.
+            x_rows (array, optional): integer [rows], the x row of each
+                sorted row. x is then the unsorted activations, and the
+                sorted copy of x is never built where the matrix-unit
+                kernel runs.
 
         Returns:
             array: [rows, out_dims] (x.dtype, float32 -> bfloat16). Metal-only.

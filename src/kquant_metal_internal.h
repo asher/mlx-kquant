@@ -122,6 +122,15 @@ inline bool codec_has_nax(const std::string& kquant_type) {
   return codec != nullptr && codec->has_nax_kernel;
 }
 
+// gather_qmm_seg takes its NAX kernel: a NAX GPU, a NAX codec and
+// K % 64 == 0. KQ_DISABLE_GATHER_SEG_NAX (read once) forces the ALU kernel.
+inline bool kq_seg_nax_ok(const std::string& kquant_type, int K) {
+  static const bool disabled =
+      std::getenv("KQ_DISABLE_GATHER_SEG_NAX") != nullptr;
+  return !disabled && kq_is_nax_available() && K % 64 == 0 &&
+      codec_has_nax(kquant_type);
+}
+
 // Codecs with qmv_fast_fine/qmv_fine instantiations (2 output rows per
 // threadgroup vs kquant_qmv_bn rows, multiplying the threadgroup count for
 // the same N). Explicit allow-list like codec_has_verify_qmv below: the

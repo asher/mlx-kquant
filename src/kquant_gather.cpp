@@ -1109,7 +1109,8 @@ void KQuantExpertTileMap::eval_cpu(
 
 std::vector<mx::Shape> KQuantGatherQMMSeg::output_shapes(
     const std::vector<mx::array>& inputs) {
-  return {{inputs[0].shape(0), inputs[1].shape(1)}};
+  const int rows = inputs.size() == 6 ? inputs[5].shape(0) : inputs[0].shape(0);
+  return {{rows, inputs[1].shape(1)}};
 }
 
 bool KQuantGatherQMMSeg::is_equivalent(const mx::Primitive& other) const {
@@ -1208,8 +1209,9 @@ void KQuantGatherQMMSeg::eval_gpu(
   auto& out = outputs[0];
 
   // inputs are row-contiguous (ensured by the op): x [R, K] (float),
-  // w [E, N, bpr] (uint8), scales, map [T, 3] (uint32), counts [1]. x is
-  // bound from a 16-byte boundary (kq_x_aligned_gpu).
+  // w [E, N, bpr] (uint8), scales, map [T, 3] (uint32), counts [1], and
+  // with a row map x_rows [R'] (uint32), x then being the unsorted rows.
+  // x is bound from a 16-byte boundary (kq_x_aligned_gpu).
   const mx::array x = kq_x_aligned_gpu(inputs[0], s, "gather_qmm_seg x");
   const auto& w = inputs[1];
   const auto& scales = inputs[2];
@@ -1226,12 +1228,10 @@ void KQuantGatherQMMSeg::eval_gpu(
   auto& ce = mx::metal::get_command_encoder(s);
 
   // NAX variant: one dequant + one MMA pass per expert-major tile (the
-  // steel simdgroup-MMA kernel below is the pre-NAX fallback).
-  // KQ_DISABLE_GATHER_SEG_NAX=1 forces the ALU kernel (A/B lever).
-  static const bool seg_nax_disabled =
-      std::getenv("KQ_DISABLE_GATHER_SEG_NAX") != nullptr;
-  if (!seg_nax_disabled && kq_is_nax_available() && (K % 64 == 0) &&
-      (x.dtype() != mx::float32) && codec_has_nax(kquant_type_)) {
+  // steel simdgroup-MMA kernel below is the pre-NAX fallback). The op only
+  // passes a row map where kq_seg_nax_ok held.
+  const bool xmap = inputs.size() == 6;
+  if (xmap || (kq_seg_nax_ok(kquant_type_, K) && x.dtype() != mx::float32)) {
     const bool align_N = aligned;
     const bool align_K = true;
     // A 128-row tile runs 4 x 2 simdgroups of 32 x 32, the 64-row tile 2 x 2.
@@ -1259,6 +1259,7 @@ void KQuantGatherQMMSeg::eval_gpu(
         {&align_N, MTL::DataType::DataTypeBool, 201},
         {&align_K, MTL::DataType::DataTypeBool, 202},
         {&gx, MTL::DataType::DataTypeInt, 203},
+        {&xmap, MTL::DataType::DataTypeBool, 204},
     };
     std::string hash_name;
     hash_name.reserve(128);
@@ -1268,7 +1269,8 @@ void KQuantGatherQMMSeg::eval_gpu(
         "_align_N_",
         align_N ? 't' : 'n',
         "_align_K_t_gx_",
-        gx);
+        gx,
+        xmap ? "_xm" : "");
     auto kernel = kq_get_kernel(d, nname, hash_name, func_consts);
     ce.set_compute_pipeline_state(kernel);
     int c = 0;
@@ -1280,6 +1282,9 @@ void KQuantGatherQMMSeg::eval_gpu(
     ce.set_output_array(out, c++);
     ce.set_bytes(N, c++);
     ce.set_bytes(K, c++);
+    if (xmap) {
+      ce.set_input_array(inputs[5], c++);
+    }
     MTL::Size group_dims(32, 2, wm);
     const int n_cols = (N + bn - 1) / bn;
     const int cap = map.shape(0);

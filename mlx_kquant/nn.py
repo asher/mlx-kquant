@@ -197,13 +197,33 @@ class KQuantSwitchLinear(nn.Module):
             self.bias = mx.zeros((num_experts, output_dims))
         self.freeze()
 
-    def __call__(self, x, indices, sorted_indices=False):
+    # __call__ takes x_rows: x unsorted, row i of the sorted call is
+    # x[x_rows[i]].
+    takes_x_rows = True
+
+    def __call__(self, x, indices, sorted_indices=False, x_rows=None):
         # Prefill-shaped sorted calls (mlx-lm SwitchGLU's _gather_sort layout:
         # x [B,1,K], indices [B] ascending) run one GEMM per expert segment
         # instead of gather_qmm's per-row matvec fallback, which is much faster
         # where the sorted rhs GEMM kernel is unavailable. Costs one host sync
         # on the routing indices per MoE layer. KQ_SWITCH_GEMM_MIN_ROWS=0
-        # disables; read live for A/B.
+        # disables; read live for A/B. With x_rows ([B] integers), x is the
+        # unsorted rows (any leading shape, last dim K); the segment GEMM
+        # reads them through the map, and every other path gathers them.
+        if x_rows is not None:
+            xf = x.reshape(-1, x.shape[-1])
+            if sorted_indices and indices.ndim == 1 and x_rows.size == indices.size:
+                min_rows = int(os.environ.get("KQ_SWITCH_GEMM_MIN_ROWS", "512"))
+                if (
+                    min_rows > 0
+                    and indices.size >= min_rows
+                    and not self._nax_gather_preferred(indices.size, xf.shape[-1])
+                ):
+                    y = self._sorted_expert_gemm(xf, indices, x_rows)
+                    if "bias" in self:
+                        y = y + mx.expand_dims(self["bias"][indices], -2)
+                    return y
+            x = mx.take(xf, x_rows.reshape(-1), axis=0)[:, None, :]
         if (
             sorted_indices
             and indices.ndim == 1
@@ -250,8 +270,8 @@ class KQuantSwitchLinear(nn.Module):
             return False
         return k % 64 == 0 and rows >= 16 and rows >= 4 * self.weight.shape[0]
 
-    def _sorted_expert_gemm(self, x, indices):
-        xf = x.reshape(indices.size, -1)
+    def _sorted_expert_gemm(self, x, indices, x_rows=None):
+        xf = x.reshape(indices.size if x_rows is None else -1, x.shape[-1])
         w, s, codec = self["weight"], self["scales"], self.kquant_type
         if (
             hasattr(kq, "gather_qmm_seg")
@@ -266,7 +286,10 @@ class KQuantSwitchLinear(nn.Module):
                 indices = indices.astype(mx.uint32)
             tr = kq.seg_tile_rows(indices.size, w.shape[0], xf.shape[-1], codec)
             maps = kq.expert_tile_map(indices, w.shape[0], tile_rows=tr)
-            return kq.gather_qmm_seg(xf, w, s, codec, *maps, tile_rows=tr)[:, None, :]
+            y = kq.gather_qmm_seg(xf, w, s, codec, *maps, tile_rows=tr, x_rows=x_rows)
+            return y[:, None, :]
+        if x_rows is not None:
+            xf = mx.take(xf, x_rows, axis=0)
         counts = np.bincount(np.array(indices), minlength=self.weight.shape[0])
         outs = []
         start = 0
