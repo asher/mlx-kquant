@@ -571,6 +571,7 @@ def run(name, fn, want):
     try:
         y = fn()
         mx.eval(y)
+        assert y.shape == want.shape, (y.shape, want.shape)
         out[name] = {"rel": rel(y, want), "error": None}
     except Exception as e:
         out[name] = {"rel": None, "error": f"{type(e).__name__}: {e}"}
@@ -603,11 +604,14 @@ run(
     lambda: kq.quantized_matmul(x, wt, st, codec, transpose=False),
     xf @ wtd,
 )
-# A 3-D w, from quantized_matmul and from gather_qmm without indices.
-w3 = mx.stack([w, w])
-s3 = s if s.size == 1 else mx.stack([s, s])
-mx.eval(w3, s3)
-ref3 = mx.stack([ref, ref])
+# A 3-D w of two matrices. gather_qmm without indices runs each one;
+# quantized_matmul refuses the stack, which it would run as w[0].
+w2, s2 = weights(codec, n, k, seed=2)
+w2d = kq.dequantize(w2, s2, codec, dtype=mx.float32)
+w3 = mx.stack([w, w2])
+s3 = s if s.size == 1 else mx.stack([s, s2])
+mx.eval(w3, s3, w2d)
+ref3 = mx.stack([ref, xf @ w2d.T])
 run("w3d", lambda: kq.quantized_matmul(x, w3, s3, codec, transpose=True), ref3)
 run("gather_w3d", lambda: kq.gather_qmm(x, w3, s3, codec, transpose=True), ref3)
 # gather_qmm without indices on a 2-D w is the plain call.
@@ -740,9 +744,10 @@ def test_route_jvp_vmap_refuse_as_kernel(fused_ops):
 @pytest.mark.parametrize("codec", ["nvfp4", "q6_k"])
 def test_route_exclusions(codec):
     # Under the route's env the plain call routes; LoRA arguments, a CPU
-    # stream under the GPU default device, transpose=False and a 3-D w
-    # (quantized_matmul or gather_qmm) keep the kernel. gather_qmm without
-    # indices on a 2-D w is the plain call and routes.
+    # stream under the GPU default device, transpose=False and gather_qmm
+    # on a 3-D w, which runs each matrix, keep the kernel. quantized_matmul
+    # refuses a 3-D w.
+    # gather_qmm without indices on a 2-D w is the plain call and routes.
     _metal()
     spec = {"codec": codec, "m": ROWS[codec], "n": MIN_N, "k": MIN_K}
     spec["env"] = _route_env(codec)
@@ -752,10 +757,10 @@ def test_route_exclusions(codec):
         "lora": False,
         "cpu_stream": False,
         "no_transpose": False,
-        "w3d": False,
         "gather_w3d": False,
         "gather_w2d": True,
     }
+    assert "batched (>2D) weights" in (out["w3d"]["error"] or ""), out["w3d"]
     for name, routed in want.items():
         assert out[name]["error"] is None, (name, out[name])
         assert out[name]["rel"] < R1["bfloat16"], (name, out[name])

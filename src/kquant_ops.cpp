@@ -280,10 +280,19 @@ mx::array quantized_matmul(
         "'.");
   }
   require_matmul_codec(*codec, "[mlx_kquant.quantized_matmul]");
-  if (x.ndim() > 2 && w.ndim() > 2) {
-    throw std::invalid_argument(
-        "[mlx_kquant.quantized_matmul] batched (>2D) weights are not supported; "
-        "use gather_qmm for mixture-of-experts.");
+  // A stack of one matrix is that matrix; a stack of more would run only
+  // w[0].
+  if (w.ndim() > 2) {
+    int64_t mats = 1;
+    for (int i = 0; i < w.ndim() - 2; i++) {
+      mats *= w.shape(i);
+    }
+    if (mats != 1) {
+      throw std::invalid_argument(
+          "[mlx_kquant.quantized_matmul] batched (>2D) weights are not "
+          "supported; use gather_qmm for mixture-of-experts.");
+    }
+    w = mx::reshape(w, {w.shape(-2), w.shape(-1)}, s_);
   }
 
   // Expand w's quantized geometry from the codec block layout.
@@ -645,8 +654,13 @@ mx::array gather_qmm(
     bool transpose,
     bool sorted_indices,
     mx::StreamOrDevice s_) {
-  // No indices at all -> a plain (non-gathered) quantized matmul.
-  if (!lhs_indices_ && !rhs_indices_) {
+  // No indices on one matrix -> a plain quantized matmul. A stack of
+  // matrices takes the gathered path below, which runs each one.
+  int64_t w_mats = 1;
+  for (int i = 0; i < w.ndim() - 2; i++) {
+    w_mats *= w.shape(i);
+  }
+  if (!lhs_indices_ && !rhs_indices_ && w_mats == 1) {
     return quantized_matmul(
         std::move(x),
         std::move(w),

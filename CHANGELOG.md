@@ -16,6 +16,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - On GPUs without NAX, `mxfp4` matmuls of 33 to 128 rows take the split-K tile where the other
   codecs do.
 
+### Fixed
+- `quantized_matmul` raises a ValueError for a stack of more than one weight matrix with
+  a 2-D `x`, where it ran only the first matrix. A stack of one runs as that matrix.
+- `gather_qmm` without indices on a stack of weight matrices returns one product per matrix,
+  where it returned the first matrix's product alone.
+
 ## [0.5.5]
 
 ### Added

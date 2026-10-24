@@ -377,3 +377,26 @@ def test_qmv_splitk_simdgroups():
         ((name, _),) = r["kernels"]
         assert "_qmv_splitk_" in name, (codec, k, name)
         assert r["tg"] == [(32, n_sg, 1)], (codec, k, trim, r["tg"])
+
+
+def test_weight_stack_is_refused():
+    """A stack of weight matrices is refused whatever x's rank: a 2-D x
+    would otherwise run only w[0]. gather_qmm without indices runs each
+    matrix of the stack. A stack of one is that matrix, on the same route."""
+    w, _ = kq.quantize(mx.random.normal((64, 256), key=mx.random.key(3)) * 0.1, "q8_0")
+    s = mx.zeros((1,), dtype=mx.uint8)
+    x = mx.random.normal((12, 256), key=mx.random.key(4)).astype(mx.bfloat16)
+    stack = mx.stack([w, w + 1])
+    for xs in (x, x[None]):
+        with pytest.raises(ValueError, match="batched"):
+            kq.quantized_matmul(xs, stack, s, "q8_0", transpose=True)
+    got = kq.gather_qmm(x, stack, s, "q8_0", transpose=True)
+    want = mx.stack(
+        [kq.quantized_matmul(x, m, s, "q8_0", transpose=True) for m in (w, w + 1)]
+    )
+    assert got.shape == want.shape
+    err = (got - want).astype(mx.float32).abs().max() / want.abs().max()
+    assert err.item() < 1e-2
+    one = kq.quantized_matmul(x, w[None], s, "q8_0", transpose=True)
+    ref = kq.quantized_matmul(x, w, s, "q8_0", transpose=True)
+    assert one.shape == ref.shape and mx.array_equal(one, ref).item()
