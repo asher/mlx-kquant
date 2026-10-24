@@ -187,18 +187,23 @@ mx::array gather_qmm(
 
 // Build the gather_qmm_seg tile map from expert-sorted routing indices, on
 // GPU (no host sync). Returns {map, counts}: map uint32 [cap, 3] rows of
-// (expert, row_start, num_rows) tiling each segment into 64-row tiles where
-// only the last tile of a segment can be partial; counts uint32 [1] = the
-// number of valid tiles. The cap is a shape-only upper bound; slots past
-// counts are uninitialized and tile order is unspecified. Metal-only.
-std::vector<mx::array>
-expert_tile_map(mx::array indices, int n_experts, mx::StreamOrDevice s = {});
+// (expert, row_start, num_rows) tiling each segment into tile_rows-row tiles
+// (64 or 128) where only the last tile of a segment can be partial; counts
+// uint32 [1] = the number of valid tiles. The cap is a shape-only upper
+// bound; slots past counts are uninitialized and tile order is unspecified.
+// Metal-only.
+std::vector<mx::array> expert_tile_map(
+    mx::array indices,
+    int n_experts,
+    int tile_rows = 64,
+    mx::StreamOrDevice s = {});
 
 // Segment-walking gather GEMM for expert-sorted MoE prefill. x is [R, K] rows
 // pre-sorted by expert; w is uint8 wire bytes (n_experts, N, bytes_per_row);
 // map / counts are the expert_tile_map outputs (or host-built equivalents):
-// uint32 [*, 3] tile rows of (expert, row_start, num_rows <= 64), tiles
-// never spanning experts. One dispatch computes
+// uint32 [*, 3] tile rows of (expert, row_start, num_rows <= tile_rows),
+// tiles never spanning experts. tile_rows is the map's tile height, 64 or
+// 128 (seg_tile_rows picks it). One dispatch computes
 // y[row_start : row_start + num_rows] = x_seg @ dequant(w[expert]).T per tile
 // at tiled-GEMM throughput; partial tiles skip dead row fragments in the MMA
 // so ragged segments cost ~ceil(num_rows / 8) row fragments. Rows not
@@ -211,7 +216,19 @@ mx::array gather_qmm_seg(
     const std::string& kquant_type,
     mx::array map,
     mx::array counts,
+    int tile_rows = 64,
     mx::StreamOrDevice s = {});
+
+// gather_qmm_seg tile height for `rows` expert-sorted rows over n_experts
+// experts at reduction size K: 128 where the NAX kernel runs and the mean
+// rows per expert reach 96 (120 when K < 1024 and the codec's K tile stays
+// 64), else 64. KQ_SEG_TILE_ROWS=64|128 (read live) pins it. 64 on
+// non-Metal builds.
+int seg_tile_rows(
+    int rows,
+    int n_experts,
+    int K,
+    const std::string& kquant_type);
 
 // Quantize (encode) a float weight tensor `w` into GGUF K-quant wire bytes.
 // Returns {wq (uint8), scales_placeholder (uint8, shape [1])}: K-quant scales
@@ -3424,8 +3441,8 @@ class KQuantGatherQMM : public mx::Primitive {
 // Inference-only, Metal-only.
 class KQuantExpertTileMap : public mx::Primitive {
  public:
-  explicit KQuantExpertTileMap(mx::Stream stream, int n_experts)
-      : mx::Primitive(stream), n_experts_(n_experts) {}
+  explicit KQuantExpertTileMap(mx::Stream stream, int n_experts, int tile_rows)
+      : mx::Primitive(stream), n_experts_(n_experts), tile_rows_(tile_rows) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -3444,6 +3461,7 @@ class KQuantExpertTileMap : public mx::Primitive {
 
  private:
   int n_experts_;
+  int tile_rows_;
 };
 
 // Segment-walking gather GEMM (see gather_qmm_seg). Inference-only, Metal-only:
@@ -3454,11 +3472,13 @@ class KQuantGatherQMMSeg : public mx::Primitive {
       mx::Stream stream,
       std::string kquant_type,
       int group_size,
-      int bits)
+      int bits,
+      int tile_rows)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         group_size_(group_size),
-        bits_(bits) {}
+        bits_(bits),
+        tile_rows_(tile_rows) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -3479,6 +3499,7 @@ class KQuantGatherQMMSeg : public mx::Primitive {
   std::string kquant_type_;
   int group_size_;
   int bits_;
+  int tile_rows_;
 };
 
 // Encode a float weight tensor into K-quant wire bytes. Multi-output primitive:

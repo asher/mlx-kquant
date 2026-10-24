@@ -272,13 +272,16 @@ def test_gather_qmm_seg_unaligned_n():
     ],
     ids=["ragged", "single", "tiny", "uniform64", "uniform65", "sub_frag"],
 )
-def test_expert_tile_map_matches_host(counts):
+@pytest.mark.parametrize("tile_rows", [64, 128])
+def test_expert_tile_map_matches_host(counts, tile_rows):
     import mlx_kquant as kq
     from mlx_kquant.nn import _host_tile_maps
 
     counts = np.asarray(counts, dtype=np.int64)
-    mh, cnth = _host_tile_maps(counts)
-    m, cnt = kq.expert_tile_map(_counts_to_indices(counts), len(counts))
+    mh, cnth = _host_tile_maps(counts, tile_rows)
+    m, cnt = kq.expert_tile_map(
+        _counts_to_indices(counts), len(counts), tile_rows=tile_rows
+    )
     mx.eval(m, cnt, mh, cnth)
     cnt, cnth = np.array(cnt), np.array(cnth)
     np.testing.assert_array_equal(cnt, cnth)
@@ -519,6 +522,97 @@ def test_gather_qmm_seg_rejects_bad_inputs():
         )
     with pytest.raises(ValueError):  # expert_tile_map: non-uint32 indices
         kq.expert_tile_map(mx.zeros((8,), dtype=mx.int32), 4)
+    with pytest.raises(ValueError):  # tile height other than 64 or 128
+        kq.expert_tile_map(mx.zeros((8,), dtype=mx.uint32), 4, tile_rows=96)
+    with pytest.raises(ValueError):
+        kq.gather_qmm_seg(x_ok, w, s, "iq2_xxs", good, cnt, tile_rows=96)
+
+
+def _seg_experts(codec, k, seed):
+    """(E, N, bytes_per_row) wire of real-range weights: kq.quantize where
+    the codec encodes, else synth_wire's sane scales."""
+    from kqref import synth_wire
+
+    import mlx_kquant as kq
+    from mlx_kquant.codec_geometry import CODEC_GEOMETRY
+
+    rng = np.random.default_rng(seed)
+    _, _, bpb, wpb = CODEC_GEOMETRY[codec]
+    if codec == "mxfp4":
+        wire = synth_wire(rng, codec, bpb, E * N * (k // wpb))
+        return mx.array(wire.reshape(E, N, (k // wpb) * bpb))
+    wf = mx.array(rng.standard_normal((E * N, k)).astype(np.float32) * 0.1)
+    wq, _ = kq.quantize(wf, codec)
+    return wq.reshape(E, N, -1)
+
+
+@pytest.mark.skipif(
+    bool(os.environ.get("KQUANT_FORCE_CPU")),
+    reason="gather_qmm_seg is Metal-only.",
+)
+@pytest.mark.parametrize(
+    "codec,k",
+    [("q4_k", 1024), ("q4_1", 1024), ("q8_0", 1024), ("mxfp4", 1024), ("q8_0", 96)],
+    ids=["q4_k", "q4_1", "q8_0", "mxfp4", "q8_0_alu"],
+)
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_gather_qmm_seg_tile128_matches_tile64(codec, k, dtype, monkeypatch):
+    """The 128-row tile writes the bits of the 64-row tile under every K
+    tile and grid layout: the NAX kernel's four row bands, its 128-deep K
+    walk and tile-on-x grid, and on k=96 (off the NAX kernel) the ALU
+    kernel's two 64-row halves. Segments sit on both sides of every 64-
+    and 128-row boundary."""
+    import mlx_kquant as kq
+
+    w = _seg_experts(codec, k, 43)
+    s = mx.zeros((1,), dtype=mx.uint8)
+    counts = np.array([1, 0, 96, 127, 128, 129, 257, 64], dtype=np.int64)
+    idx = _counts_to_indices(counts)
+    rng = np.random.default_rng(47)
+    x = mx.array(
+        (rng.standard_normal((int(counts.sum()), k)) * 0.1).astype(np.float32)
+    ).astype(dtype)
+
+    def seg(tile_rows):
+        maps = kq.expert_tile_map(idx, E, tile_rows=tile_rows)
+        y = kq.gather_qmm_seg(x, w, s, codec, *maps, tile_rows=tile_rows)
+        mx.eval(y)
+        return y
+
+    monkeypatch.setenv("KQ_SEG_GX", "0")
+    monkeypatch.setenv("KQ_SEG_BK128", "0")
+    ref = seg(64)
+    assert np.isfinite(np.array(ref.astype(mx.float32))).all()
+    for gx, bk in (("0", "0"), ("32", "0"), ("32", "1"), ("7", "1")):
+        monkeypatch.setenv("KQ_SEG_GX", gx)
+        monkeypatch.setenv("KQ_SEG_BK128", bk)
+        for tile_rows in (64, 128):
+            got = seg(tile_rows)
+            assert mx.array_equal(got, ref).item(), (
+                f"{codec} k={k} {dtype} tile {tile_rows} gx {gx} bk128 {bk}"
+            )
+
+
+def test_seg_tile_rows_policy(monkeypatch):
+    """128-row tiles from 96 rows per expert where the NAX kernel runs
+    (120 at k < 1024 when the codec's K tile stays 64), 64 elsewhere;
+    KQ_SEG_TILE_ROWS pins it."""
+    import mlx_kquant as kq
+
+    monkeypatch.delenv("KQ_SEG_TILE_ROWS", raising=False)
+    monkeypatch.delenv("KQ_SEG_BK128", raising=False)
+    nax = kq.nax_gather_enabled("q4_1")
+    assert kq.seg_tile_rows(95 * 32, 32, 2048, "q4_1") == 64
+    assert kq.seg_tile_rows(96 * 32, 32, 2048, "q4_1") == (128 if nax else 64)
+    assert kq.seg_tile_rows(119 * 32, 32, 512, "q4_1") == 64
+    assert kq.seg_tile_rows(120 * 32, 32, 512, "q4_1") == (128 if nax else 64)
+    # q4_k runs 128-deep K tiles, so k=512 keeps the 96-row floor.
+    assert kq.seg_tile_rows(96 * 32, 32, 512, "q4_k") == (128 if nax else 64)
+    assert kq.seg_tile_rows(4096, 32, 2848, "q4_1") == 64  # k % 64 != 0
+    monkeypatch.setenv("KQ_SEG_TILE_ROWS", "128")
+    assert kq.seg_tile_rows(64, 32, 2048, "q4_1") == 128
+    monkeypatch.setenv("KQ_SEG_TILE_ROWS", "64")
+    assert kq.seg_tile_rows(96 * 32, 32, 2048, "q4_1") == 64
 
 
 def test_seg_arm_defers_to_nax_gather(monkeypatch):

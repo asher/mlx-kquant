@@ -2901,6 +2901,7 @@ NB_MODULE(_ext, m) {
       "indices"_a,
       "n_experts"_a,
       nb::kw_only(),
+      "tile_rows"_a = 64,
       "stream"_a = nb::none(),
       R"(
         Build the gather_qmm_seg tile map from expert-sorted routing indices,
@@ -2909,11 +2910,14 @@ NB_MODULE(_ext, m) {
         Args:
             indices (array): 1-D uint32 expert ids, sorted ascending.
             n_experts (int): total expert count (sizes the map bound).
+            tile_rows (int): tile height, 64 or 128. Pass the same value
+                to gather_qmm_seg.
 
         Returns:
             tuple: (map, counts) -- uint32 [cap, 3] tile table of
-            (expert, row_start, num_rows) tiling each segment into 64-row
-            tiles where only the last tile of a segment can be partial, plus
+            (expert, row_start, num_rows) tiling each segment into
+            tile_rows-row tiles where only the last tile of a segment can be
+            partial, plus
             uint32 [1] valid-tile count. Slots past the count are
             uninitialized; tile order is unspecified. Metal-only.
       )");
@@ -2928,6 +2932,7 @@ NB_MODULE(_ext, m) {
       "map"_a,
       "counts"_a,
       nb::kw_only(),
+      "tile_rows"_a = 64,
       "stream"_a = nb::none(),
       R"(
         Segment-walking gather GEMM for expert-sorted MoE prefill.
@@ -2939,16 +2944,42 @@ NB_MODULE(_ext, m) {
             scales (array): vestigial placeholder; ignored by the kernel.
             kquant_type (str): codec name, e.g. ``"iq2_xxs"``.
             map (array): uint32 [n_tiles, 3] rows of
-                (expert, row_start, num_rows), num_rows <= 64. Only the last
+                (expert, row_start, num_rows), num_rows <= tile_rows. Only the last
                 tile of a segment may be partial; its dead row fragments are
                 skipped in the MMA.
             counts (array): uint32 [1] valid-tile count. Valid tiles never
                 span experts and must cover every x row exactly once
                 (uncovered output rows are left unwritten). Use
                 expert_tile_map to build both.
+            tile_rows (int): the map's tile height, 64 or 128. Pass the
+                value the map was built with; seg_tile_rows picks one.
 
         Returns:
             array: [rows, out_dims] (x.dtype, float32 -> bfloat16). Metal-only.
+      )");
+
+  m.def(
+      "seg_tile_rows",
+      &mlx_kquant::seg_tile_rows,
+      "rows"_a,
+      "n_experts"_a,
+      "k"_a,
+      "kquant_type"_a,
+      R"(
+        Tile height for expert_tile_map and gather_qmm_seg.
+
+        128 where the codec runs on the matrix units and the mean rows per
+        expert reach 96 (120 when k < 1024 and the codec's K tile stays
+        64), else 64. KQ_SEG_TILE_ROWS=64 or 128 (read live) pins it.
+
+        Args:
+            rows (int): expert-sorted rows (tokens times top-k).
+            n_experts (int): experts in the weight stack.
+            k (int): reduction size (input features).
+            kquant_type (str): codec name.
+
+        Returns:
+            int: 64 or 128.
       )");
 
   m.def(

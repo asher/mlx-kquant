@@ -9,8 +9,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - `sdpa_prefill_window` runs sliding-window prefill attention on M5 and later GPUs,
   reading only the keys inside each query block's window. `starts` takes a left-padded batch.
+- `expert_tile_map` and `gather_qmm_seg` take `tile_rows` (64 or 128), and `seg_tile_rows`
+  picks one for a sorted MoE prefill gather.
 
 ### Changed
+- On M5 and later GPUs, sorted MoE prefill gathers run 7-23% faster on `q6_k` experts and up to
+  10% on `q4_k`, with the same output. `KQ_SEG_TILE_ROWS=64`, `KQ_SEG_BK128=0` and
+  `KQ_SEG_GX=0` restore the old kernel.
 - On M5 and later GPUs, `mxfp4` prefill matmuls and MoE gathers run on the matrix units. A
   gpt-oss 20B expert gather of a 2048-token chunk takes 3.2 to 4.2x less time.
 - On GPUs without NAX, `mxfp4` matmuls of 33 to 128 rows take the split-K tile where the other

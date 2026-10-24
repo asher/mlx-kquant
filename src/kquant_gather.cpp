@@ -1089,15 +1089,15 @@ void KQuantGatherQMM::eval_gpu(
 std::vector<mx::Shape> KQuantExpertTileMap::output_shapes(
     const std::vector<mx::array>& inputs) {
   int rows = inputs[0].shape(0);
-  // Per expert: ceil(len / 64) tiles = at most rows / 64 full tiles overall
-  // plus one partial tile per present expert.
-  int cap = std::max(rows / 64 + std::min(n_experts_, rows), 1);
+  // Per expert: ceil(len / tile_rows) tiles = at most rows / tile_rows full
+  // tiles overall plus one partial tile per present expert.
+  int cap = std::max(rows / tile_rows_ + std::min(n_experts_, rows), 1);
   return {{cap, 3}, {1}};
 }
 
 bool KQuantExpertTileMap::is_equivalent(const mx::Primitive& other) const {
-  return n_experts_ ==
-      static_cast<const KQuantExpertTileMap&>(other).n_experts_;
+  const auto& o = static_cast<const KQuantExpertTileMap&>(other);
+  return n_experts_ == o.n_experts_ && tile_rows_ == o.tile_rows_;
 }
 
 void KQuantExpertTileMap::eval_cpu(
@@ -1115,7 +1115,7 @@ std::vector<mx::Shape> KQuantGatherQMMSeg::output_shapes(
 bool KQuantGatherQMMSeg::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantGatherQMMSeg&>(other);
   return kquant_type_ == o.kquant_type_ && group_size_ == o.group_size_ &&
-      bits_ == o.bits_;
+      bits_ == o.bits_ && tile_rows_ == o.tile_rows_;
 }
 
 void KQuantGatherQMMSeg::eval_cpu(
@@ -1155,10 +1155,49 @@ void KQuantExpertTileMap::eval_gpu(
     ce.set_output_array(map, c++);
     ce.set_output_array(counts, c++);
     ce.set_bytes(rows, c++);
+    const uint32_t tile_rows = static_cast<uint32_t>(tile_rows_);
+    ce.set_bytes(tile_rows, c++);
     int tg = 256;
     MTL::Size grid((rows + tg - 1) / tg, 1, 1);
     ce.dispatch_threadgroups(grid, MTL::Size(tg, 1, 1));
   }
+}
+
+// KQ_SEG_BK128: K tile of the NAX seg kernel, 128 where the codec has a
+// pair or half-super-block loader and K % 128 == 0. Unset = q3_k, q4_k,
+// q5_k and q6_k (the half loaders, which measured faster on BK=128 at
+// every tile and row count), 1 = every codec with the kernel, 0 = off.
+// KQ_SEG_GX: row tiles per grid-x group, 0 = the (column, tile) grid,
+// unset = 32. Both read on every call.
+static int kq_seg_bk(const std::string& t, int K) {
+  if (K % 128 != 0 || !kq_nax_has_bk128(t)) {
+    return 64;
+  }
+  const int lever = kq_env_flag("KQ_SEG_BK128", -1);
+  if (lever >= 0) {
+    return lever ? 128 : 64;
+  }
+  return (t == "q3_k" || t == "q4_k" || t == "q5_k" || t == "q6_k") ? 128 : 64;
+}
+
+static int kq_seg_gx() {
+  return kq_env_lever_from("KQ_SEG_GX", 32, 0);
+}
+
+int seg_tile_rows(
+    int rows,
+    int n_experts,
+    int K,
+    const std::string& kquant_type) {
+  const int pinned = kq_env_choice("KQ_SEG_TILE_ROWS", {"64", "128"}, -1);
+  if (pinned >= 0) {
+    return pinned ? 128 : 64;
+  }
+  if (n_experts <= 0 || K % 64 != 0 || !nax_gather_enabled(kquant_type)) {
+    return 64;
+  }
+  const int floor = (K >= 1024 || kq_seg_bk(kquant_type, K) == 128) ? 96 : 120;
+  return int64_t(rows) >= int64_t(floor) * n_experts ? 128 : 64;
 }
 
 void KQuantGatherQMMSeg::eval_gpu(
@@ -1195,6 +1234,10 @@ void KQuantGatherQMMSeg::eval_gpu(
       (x.dtype() != mx::float32) && codec_has_nax(kquant_type_)) {
     const bool align_N = aligned;
     const bool align_K = true;
+    // A 128-row tile runs 4 x 2 simdgroups of 32 x 32, the 64-row tile 2 x 2.
+    const int wm = tile_rows_ / 32;
+    const int bk = kq_seg_bk(kquant_type_, K);
+    const int gx = kq_seg_gx();
     std::string nname;
     nname.reserve(96);
     mx::concatenate(
@@ -1205,15 +1248,27 @@ void KQuantGatherQMMSeg::eval_gpu(
         group_size_,
         "_b_",
         bits_,
-        "_bm_64_bn_64_bk_64_wm_2_wn_2");
+        "_bm_",
+        tile_rows_,
+        "_bn_64_bk_",
+        bk,
+        "_wm_",
+        wm,
+        "_wn_2");
     mx::metal::MTLFCList func_consts = {
         {&align_N, MTL::DataType::DataTypeBool, 201},
         {&align_K, MTL::DataType::DataTypeBool, 202},
+        {&gx, MTL::DataType::DataTypeInt, 203},
     };
     std::string hash_name;
     hash_name.reserve(128);
     mx::concatenate(
-        hash_name, nname, "_align_N_", align_N ? 't' : 'n', "_align_K_t");
+        hash_name,
+        nname,
+        "_align_N_",
+        align_N ? 't' : 'n',
+        "_align_K_t_gx_",
+        gx);
     auto kernel = kq_get_kernel(d, nname, hash_name, func_consts);
     ce.set_compute_pipeline_state(kernel);
     int c = 0;
@@ -1225,8 +1280,12 @@ void KQuantGatherQMMSeg::eval_gpu(
     ce.set_output_array(out, c++);
     ce.set_bytes(N, c++);
     ce.set_bytes(K, c++);
-    MTL::Size group_dims(32, 2, 2);
-    MTL::Size grid_dims((N + bn - 1) / bn, map.shape(0), 1);
+    MTL::Size group_dims(32, 2, wm);
+    const int n_cols = (N + bn - 1) / bn;
+    const int cap = map.shape(0);
+    MTL::Size grid_dims = gx > 0
+        ? MTL::Size(gx, ((cap + gx - 1) / gx) * n_cols, 1)
+        : MTL::Size(n_cols, cap, 1);
     kq_log_dispatch(nname, x, out, grid_dims, group_dims);
     ce.dispatch_threadgroups(grid_dims, group_dims);
     return;
@@ -1254,13 +1313,18 @@ void KQuantGatherQMMSeg::eval_gpu(
   ce.set_output_array(out, c++);
   ce.set_bytes(K, c++);
   ce.set_bytes(N, c++);
+  // A 128-row map tile runs as two 64-row halves on grid z.
   MTL::Size group_dims(32, 2, 2);
-  MTL::Size grid_dims((N + bn - 1) / bn, map.shape(0), 1);
+  MTL::Size grid_dims((N + bn - 1) / bn, map.shape(0), tile_rows_ / 64);
   kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
 #else
+
+int seg_tile_rows(int, int, int, const std::string&) {
+  return 64;
+}
 
 void KQuantExpertTileMap::eval_gpu(
     const std::vector<mx::array>&,

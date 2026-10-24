@@ -26,21 +26,18 @@ import mlx_kquant as kq
 
 from .codec_geometry import CODEC_GEOMETRY, GATHER_ONLY_CODECS, bytes_per_row
 
-# gather_qmm_seg tile height (the kernel's BM).
-_SEG_TILE_ROWS = 64
 
-
-def _host_tile_maps(counts):
+def _host_tile_maps(counts, tile_rows=64):
     """Host-built equivalent of kq.expert_tile_map from per-expert counts:
-    (map, counts) uint32 arrays. Segments tile into 64-row tiles; only the
-    last tile of a segment can be partial (the kernel skips its dead row
-    fragments)."""
+    (map, counts) uint32 arrays. Segments tile into tile_rows-row tiles;
+    only the last tile of a segment can be partial (the kernel skips its
+    dead row fragments)."""
     tiles = []
     row = 0
     for e in np.flatnonzero(counts):
         c = int(counts[e])
-        for off in range(0, c, _SEG_TILE_ROWS):
-            tiles.append((e, row + off, min(_SEG_TILE_ROWS, c - off)))
+        for off in range(0, c, tile_rows):
+            tiles.append((e, row + off, min(tile_rows, c - off)))
         row += c
     m = np.asarray(tiles or [(0, 0, 0)], dtype=np.uint32)
     cnt = np.asarray([len(tiles)], dtype=np.uint32)
@@ -267,8 +264,9 @@ class KQuantSwitchLinear(nn.Module):
             # the Metal backend exists.
             if indices.dtype != mx.uint32:
                 indices = indices.astype(mx.uint32)
-            maps = kq.expert_tile_map(indices, w.shape[0])
-            return kq.gather_qmm_seg(xf, w, s, codec, *maps)[:, None, :]
+            tr = kq.seg_tile_rows(indices.size, w.shape[0], xf.shape[-1], codec)
+            maps = kq.expert_tile_map(indices, w.shape[0], tile_rows=tr)
+            return kq.gather_qmm_seg(xf, w, s, codec, *maps, tile_rows=tr)[:, None, :]
         counts = np.bincount(np.array(indices), minlength=self.weight.shape[0])
         outs = []
         start = 0

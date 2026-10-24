@@ -48,14 +48,21 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
   `mx.repeat` of one value evaluates to a stride-0 broadcast) are copied into a dense temporary
   by a small `kq_lora_densify` dispatch at eval, on the primitive's own stream.
 - **`gather_qmm_seg`** + **`expert_tile_map`** - expert-sorted MoE prefill as one GEMM per expert
-  segment instead of per-row gathers. `expert_tile_map` builds the 64-row tile map on the GPU from the
+  segment instead of per-row gathers. `expert_tile_map` builds the tile map on the GPU from the
   sorted routing indices (no host sync); `gather_qmm_seg` walks it. On NAX GPUs the walk is a NAX
-  tile kernel: each threadgroup owns one 64-row tile of one expert, dequantizes its weight slab once
+  tile kernel: each threadgroup owns one tile of one expert, dequantizes its weight slab once
   and runs one MMA pass per 16-row sub-band a partial tile fills, skipping the rest. The fixed-tile
   `gather_qmm_rhs_nax` leaf pays that dequant and MMA walk once per expert segment a tile touches,
   which at ~60 rows per expert (a 2048-token chunk over 288 experts) is ~2x; the seg kernel runs
   1.5-1.7x faster there. `KQ_DISABLE_GATHER_SEG_NAX=1` forces the steel simdgroup-mma walk. Gated by
   `KQ_SWITCH_GEMM_MIN_ROWS` (see [README](../README.md#environment-variables)).
+
+  Tiles are 64 or 128 rows; pass the same `tile_rows` to both ops. `seg_tile_rows` picks 128 on a
+  NAX codec from 96 rows per expert on average (120 when K < 1024 and the codec's K tile stays 64),
+  and `KQuantSwitchLinear` uses it. The 128-row tile runs eight 32-row simdgroups that share one
+  weight slab, and the `q3_k` to `q6_k` slabs are 128 deep. Every layout writes the same output.
+  On M5 Max a `q6_k` expert gather runs 7-23% faster and a `q4_k` one up to 10% faster; most other
+  codecs gain 0-6%.
 
 On NAX GPUs, `quantized_matmul` transpose (decode-orientation) shapes route by row count M and
 output width N. Per-row qmv serves M 2 up to a per-codec limit, the mat-vec paths (`mv_ext`,

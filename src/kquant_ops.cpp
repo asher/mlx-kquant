@@ -783,8 +783,11 @@ mx::array gather_qmm(
       {x_c, w_c, scales_c, std::move(lhs_indices), std::move(rhs_indices)});
 }
 
-std::vector<mx::array>
-expert_tile_map(mx::array indices, int n_experts, mx::StreamOrDevice s_) {
+std::vector<mx::array> expert_tile_map(
+    mx::array indices,
+    int n_experts,
+    int tile_rows,
+    mx::StreamOrDevice s_) {
   if (indices.ndim() != 1 || indices.dtype() != mx::uint32) {
     std::ostringstream msg;
     msg << "[mlx_kquant.expert_tile_map] indices must be 1-D uint32 but got "
@@ -797,17 +800,21 @@ expert_tile_map(mx::array indices, int n_experts, mx::StreamOrDevice s_) {
         "[mlx_kquant.expert_tile_map] indices must be non-empty and "
         "n_experts positive.");
   }
+  if (tile_rows != 64 && tile_rows != 128) {
+    throw std::invalid_argument(
+        "[mlx_kquant.expert_tile_map] tile_rows must be 64 or 128.");
+  }
 
   auto s = mx::to_stream(s_);
   auto idx_c = mx::contiguous(indices, false, s);
 
-  int cap = std::max(rows / 64 + std::min(n_experts, rows), 1);
+  int cap = std::max(rows / tile_rows + std::min(n_experts, rows), 1);
   std::vector<mx::Shape> shapes = {{cap, 3}, {1}};
   std::vector<mx::Dtype> dtypes = {mx::uint32, mx::uint32};
   return mx::array::make_arrays(
       std::move(shapes),
       dtypes,
-      std::make_shared<KQuantExpertTileMap>(s, n_experts),
+      std::make_shared<KQuantExpertTileMap>(s, n_experts, tile_rows),
       {idx_c});
 }
 
@@ -836,10 +843,15 @@ mx::array gather_qmm_seg(
     const std::string& kquant_type,
     mx::array map,
     mx::array counts,
+    int tile_rows,
     mx::StreamOrDevice s_) {
   if (w.dtype() != mx::uint8) {
     throw std::invalid_argument(
         "[mlx_kquant.gather_qmm_seg] w must be uint8 (raw GGUF wire bytes).");
+  }
+  if (tile_rows != 64 && tile_rows != 128) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_seg] tile_rows must be 64 or 128.");
   }
   const KQuantCodec* codec = codec_by_name(kquant_type);
   if (codec == nullptr) {
@@ -909,7 +921,7 @@ mx::array gather_qmm_seg(
       std::move(out_shape),
       out_type,
       std::make_shared<KQuantGatherQMMSeg>(
-          s, kquant_type, codec->weights_per_block, codec->bits),
+          s, kquant_type, codec->weights_per_block, codec->bits, tile_rows),
       {x_c, w_c, scales_c, std::move(map_c), std::move(cnt_c)});
 }
 

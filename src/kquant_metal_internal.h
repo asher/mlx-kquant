@@ -455,6 +455,9 @@ inline void kq_require_kernel(
 constexpr int kq_fc_kquant_word = 370;
 bool kq_kquant_word_on();
 
+// Whether the codec has BK=128 NAX kernels (a pair or half loader).
+bool kq_nax_has_bk128(const std::string& t);
+
 // Whether the library function kname exists, and whether it declares the
 // constant named `fc`. Reads the unspecialized function once.
 struct KqFunctionInfo {

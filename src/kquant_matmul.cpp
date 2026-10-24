@@ -2775,6 +2775,10 @@ bool kq_forced_route(
 
 } // namespace
 
+bool kq_nax_has_bk128(const std::string& t) {
+  return kq_nax_bk128_slot(t) >= 0;
+}
+
 int kq_nax_large_max_k(const std::string& kquant_type) {
   return kq_largem_max_k(kquant_type);
 }

@@ -382,15 +382,20 @@ instantiate_kquant_nax_codec(q2_0, 64, 2)
 instantiate_kquant_nax_codec(nvfp4, 64, 4)
 instantiate_kquant_nax_codec(ptq1_0, 128, 1)
 
-// Expert-major sorted gather GEMM (gather_qmm_seg on NAX): BM=64 matches
-// the 64-row tiles expert_tile_map builds. No float x variant, same
-// reachability argument as the gather rhs macros.
+// Expert-major sorted gather GEMM (gather_qmm_seg on NAX): BM=64 and BM=128
+// match the 64- and 128-row tiles expert_tile_map builds. No float x
+// variant, same reachability argument as the gather rhs macros.
 #define instantiate_kquant_nax_gather_seg(type, gs, bits, codec)             \
   instantiate_kernel(                                                        \
       "kquant_" #codec "_gather_qmm_seg_nax_" #type "_gs_" #gs "_b_" #bits  \
           "_bm_64_bn_64_bk_64_wm_2_wn_2",                                    \
       kq_ ## codec ## _gather_qmm_seg_nax,                                   \
-      type, gs, bits, 64, 64, 64, 2, 2)
+      type, gs, bits, 64, 64, 64, 2, 2)                                      \
+  instantiate_kernel(                                                        \
+      "kquant_" #codec "_gather_qmm_seg_nax_" #type "_gs_" #gs "_b_" #bits  \
+          "_bm_128_bn_64_bk_64_wm_4_wn_2",                                   \
+      kq_ ## codec ## _gather_qmm_seg_nax,                                   \
+      type, gs, bits, 128, 64, 64, 4, 2)
 #define instantiate_kquant_nax_gather_seg_codec(codec, gs, bits)             \
   instantiate_kquant_nax_gather_seg(float16_t,  gs, bits, codec)            \
   instantiate_kquant_nax_gather_seg(bfloat16_t, gs, bits, codec)
@@ -418,6 +423,35 @@ instantiate_kquant_nax_gather_seg_codec(stq1_0, 256, 1)
 instantiate_kquant_nax_gather_seg_codec(pq2_0, 128, 2)
 instantiate_kquant_nax_gather_seg_codec(q2_0, 64, 2)
 instantiate_kquant_nax_gather_seg_codec(nvfp4, 64, 4)
+
+// BK=128 slabs of the gather seg for the codecs with a pair or half loader.
+#define instantiate_kquant_nax_gather_seg_bk128(type, gs, bits, codec)       \
+  instantiate_kernel(                                                        \
+      "kquant_" #codec "_gather_qmm_seg_nax_" #type "_gs_" #gs "_b_" #bits  \
+          "_bm_64_bn_64_bk_128_wm_2_wn_2",                                   \
+      kq_ ## codec ## _gather_qmm_seg_nax_bk128,                             \
+      type, gs, bits, 64, 64, 128, 2, 2)                                     \
+  instantiate_kernel(                                                        \
+      "kquant_" #codec "_gather_qmm_seg_nax_" #type "_gs_" #gs "_b_" #bits  \
+          "_bm_128_bn_64_bk_128_wm_4_wn_2",                                  \
+      kq_ ## codec ## _gather_qmm_seg_nax_bk128,                             \
+      type, gs, bits, 128, 64, 128, 4, 2)
+#define instantiate_kquant_nax_gather_seg_bk128_codec(codec, gs, bits)       \
+  instantiate_kquant_nax_gather_seg_bk128(float16_t,  gs, bits, codec)      \
+  instantiate_kquant_nax_gather_seg_bk128(bfloat16_t, gs, bits, codec)
+instantiate_kquant_nax_gather_seg_bk128_codec(q6_k, 256, 6)
+instantiate_kquant_nax_gather_seg_bk128_codec(q5_k, 256, 5)
+instantiate_kquant_nax_gather_seg_bk128_codec(q3_k, 256, 3)
+instantiate_kquant_nax_gather_seg_bk128_codec(q4_k, 256, 4)
+instantiate_kquant_nax_gather_seg_bk128_codec(q4_0, 32, 4)
+instantiate_kquant_nax_gather_seg_bk128_codec(q4_1, 32, 4)
+instantiate_kquant_nax_gather_seg_bk128_codec(q5_0, 32, 5)
+instantiate_kquant_nax_gather_seg_bk128_codec(iq4_nl, 32, 4)
+instantiate_kquant_nax_gather_seg_bk128_codec(mxfp4, 32, 4)
+instantiate_kquant_nax_gather_seg_bk128_codec(iq3_xxs, 256, 3)
+instantiate_kquant_nax_gather_seg_bk128_codec(iq3_s, 256, 3)
+instantiate_kquant_nax_gather_seg_bk128_codec(iq2_xs, 256, 2)
+instantiate_kquant_nax_gather_seg_bk128_codec(iq2_s, 256, 2)
 instantiate_kquant_nax_gather_seg_codec(ptq1_0, 128, 1)
 
 // Register-fed NAX verify kernels (kq_verify_nax.h), M <= 8, half and
