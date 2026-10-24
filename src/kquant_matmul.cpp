@@ -168,6 +168,11 @@ static KqSmallBmPolicy kq_smallbm_base(const std::string& t) {
     // bench_qmm_bm128_ab.
     return {true, 0, 0, 449};
   }
+  if (t == "mxfp4") {
+    // The iq4_nl tiles without its sub-13 route, whose crossovers were
+    // measured against iq4_nl's mat-vec kernels; not measured.
+    return {true, 0, 0, 449};
+  }
   if (t == "nvfp4") {
     // Measured (median of three ABBA runs): BM=128 takes 1.13-1.16x the
     // BM=64 time at M224, 0.95-0.98x at M256, 0.90-1.01x at M512 and
@@ -188,7 +193,7 @@ static KqLoaderClass kq_loader_class(const std::string& t) {
     return KqLoaderClass::kquant;
   }
   if (t == "q4_0" || t == "q4_1" || t == "q5_0" || t == "q5_1" || t == "q8_0" ||
-      t == "iq4_nl") {
+      t == "iq4_nl" || t == "mxfp4") {
     return KqLoaderClass::flat;
   }
   return KqLoaderClass::grid;
@@ -202,8 +207,8 @@ static KqLoaderClass kq_loader_class(const std::string& t) {
 // do iq1_s, iq1_m, iq2_xxs, iq4_xs, ptq1_0 and nvfp4 on BK=64 (nvfp4
 // 0.89-0.96x at every K from 4096 to 16384, median of three runs, with
 // benchmarks/bench_qmm_bm128_ab.py --tile-ab). A ceiling holds for the
-// codec's default K tile. q2_0 takes the pq2_0 ceiling; it is not
-// measured.
+// codec's default K tile. q2_0 takes the pq2_0 ceiling and mxfp4 the
+// iq4_nl one; they are not measured.
 static int kq_largem_max_k(const std::string& t) {
   if (t == "q2_k" || t == "pq2_0" || t == "q2_0") {
     return 4096;
@@ -212,7 +217,7 @@ static int kq_largem_max_k(const std::string& t) {
       t == "q5_1") {
     return 10240;
   }
-  if (t == "iq4_nl" || t == "stq1_0") {
+  if (t == "iq4_nl" || t == "mxfp4" || t == "stq1_0") {
     return 12288;
   }
   return 0;
@@ -304,7 +309,7 @@ static bool kq_splitk_codec(const std::string& t) {
       t == "iq3_xxs" || t == "iq3_s" || t == "iq2_xxs" || t == "iq2_xs" ||
       t == "iq2_s" || t == "iq1_s" || t == "iq1_m" || t == "stq1_0" ||
       t == "pq2_0" || t == "q2_0" || t == "ptq1_0" || t == "q4_0" ||
-      t == "q4_1" || t == "q5_0" || t == "q5_1" || t == "nvfp4";
+      t == "q4_1" || t == "q5_0" || t == "q5_1" || t == "nvfp4" || t == "mxfp4";
 }
 
 // Non-NAX default split-K entry M per codec (0 = env lever only).
@@ -728,6 +733,7 @@ static constexpr KqBk128Lever kq_nax_bk128_levers[] = {
     {"q4_1", "KQ_NAX_Q4_1_BK128", 1},
     {"q5_0", "KQ_NAX_Q5_0_BK128", 1},
     {"iq4_nl", "KQ_NAX_IQ4_NL_BK128", 1},
+    {"mxfp4", "KQ_NAX_MXFP4_BK128", 1},
     {"iq3_xxs", "KQ_NAX_IQ3_XXS_BK128", 1},
     {"iq3_s", "KQ_NAX_IQ3_S_BK128", 1},
     {"iq2_xs", "KQ_NAX_IQ2_XS_BK128", 1},

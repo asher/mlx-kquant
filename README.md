@@ -19,8 +19,9 @@ Two layers:
   four-level 2-bit codec `q2_0` - all
   twenty-three decode, matmul (incl. tensor-core prefill), and encode (IQ, stq1_0, Prism and q2_0
   encode is CPU-only) - plus the native-fp wire
-  codecs `mxfp4, nvfp4` (decode, CPU NEON + Metal matmul, and the fused MoE family incl. biased
-  gpt-oss experts; no encoder - GGUFs ship these tensors pre-quantized) - plus `mxfp8`, a
+  codecs `mxfp4, nvfp4` (decode, CPU NEON + Metal matmul incl. tensor-core prefill, and the fused
+  MoE family incl. biased gpt-oss experts; no encoder - GGUFs ship these tensors pre-quantized) -
+  plus `mxfp8`, a
   gather-only codec for lookup tables (CPU and Metal dequantize of gathered rows, no matmul; see
   [GGML type 43](#ggml-type-43)). On top of these four core
   ops the namespace also carries fused decode/prefill kernels (MoE GLU and router, attention, norm

@@ -17,6 +17,7 @@ from kqref import is_synth
 from qmm_probe import force_cpu, run_probe, tile_of
 
 import mlx_kquant as kq
+from mlx_kquant.codec_geometry import DECODE_ONLY_CODECS
 
 R1 = {"bfloat16": 6e-3, "float16": 1e-3}
 LIVE = {"KQ_TUNE_LIVE": "1", "KQ_QMM_LOG": "1"}
@@ -33,6 +34,7 @@ CODECS = {
     "q4_1": (32, 4),
     "q5_0": (32, 5),
     "iq4_nl": (32, 4),
+    "mxfp4": (32, 4),
     "iq3_xxs": (256, 3),
     "iq3_s": (256, 3),
     "iq2_xs": (256, 2),
@@ -52,8 +54,11 @@ def _lever(codec):
 
 
 def _designs(codec):
-    # "lead" quantizes real values, which the synthetic-wire codecs skip.
-    return ("normal",) if is_synth(codec) else ("normal", "lead")
+    # "lead" quantizes real values, which the synthetic-wire and decode-only
+    # codecs skip.
+    if is_synth(codec) or codec in DECODE_ONLY_CODECS:
+        return ("normal",)
+    return ("normal", "lead")
 
 
 def _nax_gpu():

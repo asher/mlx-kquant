@@ -497,6 +497,7 @@ the three M and 1.02-1.03x at M 4128, so they keep K 10240.
 | `q3_k` | 128, 64, 2, 2 | 0 | 4096 | 0 | none | inherited, k-quant class |
 | `q4_0`, `q4_1`, `q5_0`, `q5_1` | 128, 64, 2, 2 | 0 | 4096 | 0 | 10240 | inherited, flat class |
 | `iq4_nl` | 128, 64, 2, 2 | 0 | 4096 | 0 | 12288 | inherited, flat class |
+| `mxfp4` | 128, 64, 2, 2 | 0 | 4096 | 0 | 12288 | inherited, flat class; the K ceiling is that of `iq4_nl`, not measured |
 | `pq2_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 4096 | inherited, grid class |
 | `q2_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 4096 | inherited, grid class; the K ceiling is that of `pq2_0`, not measured |
 | `stq1_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 12288 | inherited, grid class |
@@ -542,6 +543,16 @@ split-K enters at M 2 for N 1024 and below and at M 6 above, and `verify_nax` en
 described with the other `verify_nax` entries. Its `bm128_min_m` floor is 449: BM=128 takes
 1.13-1.16x the BM=64 time at M 224, 0.95-0.98x at M 256 and 0.86-0.90x at M 1024. Its large-M row
 has no K ceiling, and it has no db64 band.
+
+`mxfp4` (32-wide blocks with one E8M0 scale) runs its NAX tiles through the `iq4_nl` loader, with
+the E2M1 table in place of the `iq4_nl` codebook, and takes the flat class large-M row. Every other
+block puts its codes at an odd address, so the loader reads that block's codes as aligned pairs
+from the block start. It has no `verify_nax` kernel: that kernel decodes in half, and an E8M0
+scale reaches past the half range. Below M 13 it keeps the mat-vec routes, and its split-K tiles
+run only under `KQ_QMM_SPLITK` and `KQ_QMM_SPLITK_NAX`. Its `bm128_min_m` floor, 449, and its
+BK=128 tile, on by default (`KQ_NAX_MXFP4_BK128=0` keeps BK=64), are those of `iq4_nl`, not
+measured. On the expert gather of a gpt-oss 20B prefill chunk (32 experts, 2048 tokens at top 4,
+K and N 2880), `gather_qmm_seg` takes 2.94 ms on M5 Max, against 9.5-12.4 ms on the ALU kernel.
 
 The register-resident MMA verify kernels (`verify_mma`) serve `pq2_0`, `ptq1_0`, `q2_0`, `q4_0`,
 `q4_1` and `q8_0` through M 8. Each simdgroup decodes a block of its weight rows straight into 8x8

@@ -10,7 +10,7 @@ namespace mlx_kquant {
 // All integer codecs carry NAX prefill kernels. IQ encode lands incrementally
 // (iq4_nl, iq4_xs so far); requires_imatrix marks the ggml imatrix-required IQ
 // codecs. The native-fp codecs (mxfp4, nvfp4) are decode-only wire codecs
-// (no encode) with full CPU + Metal ALU matmul families; no NAX yet. mxfp8 is
+// (no encode) with full CPU, Metal ALU and NAX matmul families. mxfp8 is
 // decode-only and gather-only: lookup tables read by row, so it has a CPU +
 // Metal dequantize and no matmul kernel on any device.
 static const std::vector<KQuantCodec>& registry() {
@@ -38,7 +38,7 @@ static const std::vector<KQuantCodec>& registry() {
       {"pq2_0", 128, 34, 2, true, true, true, false},
       {"ptq1_0", 128, 28, 1, true, true, true, false},
       {"q2_0", 64, 18, 2, true, true, true, false},
-      {"mxfp4", 32, 17, 4, true, false, false, false},
+      {"mxfp4", 32, 17, 4, true, false, true, false},
       {"nvfp4", 64, 36, 4, true, false, true, false},
       {"mxfp8", 32, 33, 8, false, false, false, false},
   };

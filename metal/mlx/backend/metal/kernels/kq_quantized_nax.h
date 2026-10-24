@@ -2910,6 +2910,131 @@ struct KqNaxIq4_nlBlockLoader {
   }
 };
 
+// mxfp4 (32-weight block): KqNaxIq4_nlBlockLoader with the E8M0 scale byte
+// for the fp16 d and the E2M1 table for kvalues_iq4nl. qs sits at +1 of a
+// 17-byte block, so the whole-block path reads bytes, each one weight j and
+// weight j + 16.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct KqNaxMxfp4BlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
+  MLX_MTL_CONST int weights_per_block = KQ_MXFP4_GROUP;
+  MLX_MTL_CONST int bytes_per_block = KQ_MXFP4_BLOCK_BYTES;
+
+  static_assert(
+      BCOLS % weights_per_block == 0,
+      "MXFP4 NAX loader requires BCOLS to be a multiple of 32.");
+  static_assert(
+      (BCOLS * BROWS) % tgp_size == 0,
+      "tgp_size must evenly divide BCOLS * BROWS.");
+
+  MLX_MTL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
+  static_assert(
+      n_reads <= weights_per_block,
+      "MXFP4 NAX loader: n_reads must not exceed 32 (one block per thread).");
+
+  const int src_ld;
+  const int row_bytes;
+  const int tile_stride;
+
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+
+  KqNaxMxfp4BlockLoader(
+      const device uint8_t* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      int /* col_in_block */ = 0) thread
+      : src_ld(src_ld_),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
+        tile_stride(
+            reduction_dim
+                ? (BCOLS / weights_per_block) * bytes_per_block
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj((thread_idx % TCOLS) * n_reads),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)) {}
+
+  void load_unsafe() const thread {
+    const short block_idx = bj / weights_per_block;
+    const short within = bj % weights_per_block;
+    const device uint8_t* block_addr = src + block_idx * bytes_per_block;
+    const device uint8_t* qs = block_addr + KQ_MXFP4_QS_OFFSET;
+    if constexpr (n_reads == weights_per_block) {
+      // Every other 17-byte block has qs at an even address: there qs is 8
+      // aligned ushorts. Elsewhere the block's first 16 bytes are, and qs
+      // byte 15 is read alone.
+      uint8_t q[16];
+      uint8_t e;
+      if ((reinterpret_cast<uintptr_t>(qs) & 1) == 0) {
+        const device ushort* p = (const device ushort*)qs;
+        e = block_addr[0];
+#pragma unroll
+        for (short s = 0; s < 8; s++) {
+          const ushort v = p[s];
+          q[2 * s] = uint8_t(v);
+          q[2 * s + 1] = uint8_t(v >> 8);
+        }
+      } else {
+        const device ushort* p = (const device ushort*)block_addr;
+        const ushort v0 = p[0];
+        e = uint8_t(v0);
+        q[0] = uint8_t(v0 >> 8);
+#pragma unroll
+        for (short s = 1; s < 8; s++) {
+          const ushort v = p[s];
+          q[2 * s - 1] = uint8_t(v);
+          q[2 * s] = uint8_t(v >> 8);
+        }
+        q[15] = qs[15];
+      }
+      const float d = kq_fp_e8m0_scale(e);
+#pragma unroll
+      for (short j = 0; j < 16; j++) {
+        dst[j] = T(d * kq_fp_e2m1_lut[q[j] & 0x0Fu]);
+        dst[j + 16] = T(d * kq_fp_e2m1_lut[q[j] >> 4]);
+      }
+    } else {
+      const float d = kq_fp_e8m0_scale(block_addr[0]);
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        const int j = within + i;
+        const int x = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
+        dst[i] = T(d * kq_fp_e2m1_lut[x]);
+      }
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const thread {
+    if (bi >= src_tile_dim.y) {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() thread {
+    src += tile_stride;
+  }
+};
+
 // Superblock IQ NAX loaders. All eight model on KqNaxQ6_KBlockLoader: a 64-wide
 // K-tile spans two 32-weight sub-blocks (BCOLS==64, n_reads==32, bj in {0,32}),
 // the thread owns one whole sub-block selected by sb = base + bj/32, and next()
@@ -4059,6 +4184,7 @@ using KqNaxNvfp4BlockLoader = KqNaxPrismBlockLoader<
     tgp_size>;
 
 KQ_NAX_DEFINE_KERNELS(iq4_nl, 32, 4, KqNaxIq4_nlBlockLoader)
+KQ_NAX_DEFINE_KERNELS(mxfp4, 32, 4, KqNaxMxfp4BlockLoader)
 KQ_NAX_DEFINE_KERNELS(iq4_xs, 256, 4, KqNaxIq4_xsBlockLoader)
 KQ_NAX_DEFINE_KERNELS(iq3_xxs, 256, 3, KqNaxIq3_xxsBlockLoader)
 KQ_NAX_DEFINE_KERNELS(iq3_s, 256, 3, KqNaxIq3_sBlockLoader)
@@ -4146,6 +4272,7 @@ KQ_NAX_DEFINE_PAIR_LOADER(KqNaxQ4_0PairLoader, KqNaxQ4_0BlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxQ4_1PairLoader, KqNaxQ4_1BlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxQ5_0PairLoader, KqNaxQ5_0BlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq4_nlPairLoader, KqNaxIq4_nlBlockLoader)
+KQ_NAX_DEFINE_PAIR_LOADER(KqNaxMxfp4PairLoader, KqNaxMxfp4BlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq3_xxsPairLoader, KqNaxIq3_xxsBlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq3_sPairLoader, KqNaxIq3_sBlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq2_xsPairLoader, KqNaxIq2_xsBlockLoader)
@@ -4229,6 +4356,7 @@ KQ_NAX_DEFINE_BK128_KERNEL(q4_0, 32, 4, KqNaxQ4_0PairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q4_1, 32, 4, KqNaxQ4_1PairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q5_0, 32, 5, KqNaxQ5_0PairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(iq4_nl, 32, 4, KqNaxIq4_nlPairLoader)
+KQ_NAX_DEFINE_BK128_KERNEL(mxfp4, 32, 4, KqNaxMxfp4PairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(iq3_xxs, 256, 3, KqNaxIq3_xxsPairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(iq3_s, 256, 3, KqNaxIq3_sPairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(iq2_xs, 256, 2, KqNaxIq2_xsPairLoader)
@@ -4320,6 +4448,7 @@ KQ_NAX_DEFINE_SPLITK_KERNEL(q4_1, 32, 4, KqNaxQ4_1BlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(q5_0, 32, 5, KqNaxQ5_0BlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(q5_1, 32, 5, KqNaxQ5_1BlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(iq4_nl, 32, 4, KqNaxIq4_nlBlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(mxfp4, 32, 4, KqNaxMxfp4BlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(iq4_xs, 256, 4, KqNaxIq4_xsBlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(iq3_xxs, 256, 3, KqNaxIq3_xxsBlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(iq3_s, 256, 3, KqNaxIq3_sBlockLoader)
@@ -4615,6 +4744,7 @@ METAL_FUNC void kq_gather_qmm_rhs_nax_tgp_impl(
 KQ_NAX_DEFINE_GATHER_RHS(q8_0, 32, 8, KqNaxQ8_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(q5_1, 32, 5, KqNaxQ5_1BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(iq4_nl, 32, 4, KqNaxIq4_nlBlockLoader)
+KQ_NAX_DEFINE_GATHER_RHS(mxfp4, 32, 4, KqNaxMxfp4BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(iq4_xs, 256, 4, KqNaxIq4_xsBlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(iq3_xxs, 256, 3, KqNaxIq3_xxsBlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(iq3_s, 256, 3, KqNaxIq3_sBlockLoader)
@@ -4869,6 +4999,7 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
 KQ_NAX_DEFINE_GATHER_SEG(q8_0, 32, 8, KqNaxQ8_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(q5_1, 32, 5, KqNaxQ5_1BlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(iq4_nl, 32, 4, KqNaxIq4_nlBlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(mxfp4, 32, 4, KqNaxMxfp4BlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(iq4_xs, 256, 4, KqNaxIq4_xsBlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(iq3_xxs, 256, 3, KqNaxIq3_xxsBlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(iq3_s, 256, 3, KqNaxIq3_sBlockLoader)

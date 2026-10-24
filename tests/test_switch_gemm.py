@@ -313,7 +313,9 @@ def _nax_ok():
     bool(os.environ.get("KQUANT_FORCE_CPU")),
     reason="gather_qmm_seg is Metal-only.",
 )
-@pytest.mark.parametrize("codec", ["iq2_xs", "iq3_xxs", "q4_k", "q8_0", "nvfp4"])
+@pytest.mark.parametrize(
+    "codec", ["iq2_xs", "iq3_xxs", "q4_k", "q8_0", "mxfp4", "nvfp4"]
+)
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_gather_qmm_seg_nax_matches_loop(codec, dtype, monkeypatch):
     """The NAX seg kernel (taken by default on NAX GPUs) matches the

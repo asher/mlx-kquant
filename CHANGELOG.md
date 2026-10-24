@@ -10,6 +10,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `sdpa_prefill_window` runs sliding-window prefill attention on M5 and later GPUs,
   reading only the keys inside each query block's window. `starts` takes a left-padded batch.
 
+### Changed
+- On M5 and later GPUs, `mxfp4` prefill matmuls and MoE gathers run on the matrix units. A
+  gpt-oss 20B expert gather of a 2048-token chunk takes 3.2 to 4.2x less time.
+
 ## [0.5.5]
 
 ### Added
