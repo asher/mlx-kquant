@@ -19,8 +19,9 @@ Two layers:
   four-level 2-bit codec `q2_0` - all
   twenty-three decode, matmul (incl. tensor-core prefill), and encode (IQ, stq1_0, Prism and q2_0
   encode is CPU-only) - plus the native-fp wire
-  codecs `mxfp4, nvfp4` (decode, CPU NEON + Metal matmul, and the fused MoE family incl. biased
-  gpt-oss experts; no encoder - GGUFs ship these tensors pre-quantized) - plus `mxfp8`, a
+  codecs `mxfp4, nvfp4` (decode, CPU NEON + Metal matmul incl. tensor-core prefill, and the fused
+  MoE family incl. biased gpt-oss experts; no encoder - GGUFs ship these tensors pre-quantized) -
+  plus `mxfp8`, a
   gather-only codec for lookup tables (CPU and Metal dequantize of gathered rows, no matmul; see
   [GGML type 43](#ggml-type-43)). On top of these four core
   ops the namespace also carries fused decode/prefill kernels (MoE GLU and router, attention, norm
@@ -291,6 +292,12 @@ All optional; the defaults are right for normal use.
   call. A/B lever.
 - `KQ_DISABLE_GATHER_SEG_NAX=1` - run `gather_qmm_seg` on its steel simdgroup-mma kernel even where
   the NAX tile kernel is available. Read once per process. A/B lever.
+- `KQ_SEG_TILE_ROWS=64|128` - pin the tile height `seg_tile_rows` returns, and so the one
+  `KQuantSwitchLinear` uses. Read per call. A/B lever.
+- `KQ_SEG_BK128=0|1` - K tile of the NAX `gather_qmm_seg` kernel: `1` takes 128 for every codec
+  with the kernel, `0` keeps 64. Unset takes 128 for `q3_k` to `q6_k`. Read per call. A/B lever.
+- `KQ_SEG_GX` - row tiles per grid-x group of the NAX `gather_qmm_seg` kernel (default `32`; `0`
+  lays the grid out by column, then tile). Read per call. A/B lever.
 - `KQ_MOE_DEDUP=0` - on Metal, run the fused MoE gathers at verify widths (2 to 8 rows per
   step) as one dispatch per (row, expert) pair instead of the default dedupe kernels, which
   dequantize an expert once per pair of rows that select it. Read per call. Outputs are

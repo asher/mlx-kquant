@@ -48,14 +48,26 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
   `mx.repeat` of one value evaluates to a stride-0 broadcast) are copied into a dense temporary
   by a small `kq_lora_densify` dispatch at eval, on the primitive's own stream.
 - **`gather_qmm_seg`** + **`expert_tile_map`** - expert-sorted MoE prefill as one GEMM per expert
-  segment instead of per-row gathers. `expert_tile_map` builds the 64-row tile map on the GPU from the
+  segment instead of per-row gathers. `expert_tile_map` builds the tile map on the GPU from the
   sorted routing indices (no host sync); `gather_qmm_seg` walks it. On NAX GPUs the walk is a NAX
-  tile kernel: each threadgroup owns one 64-row tile of one expert, dequantizes its weight slab once
+  tile kernel: each threadgroup owns one tile of one expert, dequantizes its weight slab once
   and runs one MMA pass per 16-row sub-band a partial tile fills, skipping the rest. The fixed-tile
   `gather_qmm_rhs_nax` leaf pays that dequant and MMA walk once per expert segment a tile touches,
   which at ~60 rows per expert (a 2048-token chunk over 288 experts) is ~2x; the seg kernel runs
   1.5-1.7x faster there. `KQ_DISABLE_GATHER_SEG_NAX=1` forces the steel simdgroup-mma walk. Gated by
   `KQ_SWITCH_GEMM_MIN_ROWS` (see [README](../README.md#environment-variables)).
+
+  Tiles are 64 or 128 rows; pass the same `tile_rows` to both ops. `seg_tile_rows` picks 128 on a
+  NAX codec from 96 rows per expert on average (120 when K < 1024 and the codec's K tile stays 64),
+  and `KQuantSwitchLinear` uses it. The 128-row tile runs eight 32-row simdgroups that share one
+  weight slab, and the `q3_k` to `q6_k` slabs are 128 deep. Every layout writes the same output.
+  On M5 Max a `q6_k` expert gather runs 7-23% faster and a `q4_k` one up to 10% faster; other
+  codecs run between 5% slower and 7% faster, depending on the shape.
+
+  With `x_rows`, `x` is the unsorted activations and sorted row r reads row `x_rows[r]`, so the
+  caller passes each sorted row's source row instead of building the sorted copy. The NAX kernel
+  reads the rows in place; the other paths gather them first. `KQuantSwitchLinear` takes `x_rows`
+  the same way.
 
 On NAX GPUs, `quantized_matmul` transpose (decode-orientation) shapes route by row count M and
 output width N. Per-row qmv serves M 2 up to a per-codec limit, the mat-vec paths (`mv_ext`,
@@ -497,6 +509,7 @@ the three M and 1.02-1.03x at M 4128, so they keep K 10240.
 | `q3_k` | 128, 64, 2, 2 | 0 | 4096 | 0 | none | inherited, k-quant class |
 | `q4_0`, `q4_1`, `q5_0`, `q5_1` | 128, 64, 2, 2 | 0 | 4096 | 0 | 10240 | inherited, flat class |
 | `iq4_nl` | 128, 64, 2, 2 | 0 | 4096 | 0 | 12288 | inherited, flat class |
+| `mxfp4` | 128, 64, 2, 2 | 0 | 4096 | 0 | 12288 | inherited, flat class; the K ceiling is that of `iq4_nl`, not measured |
 | `pq2_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 4096 | inherited, grid class |
 | `q2_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 4096 | inherited, grid class; the K ceiling is that of `pq2_0`, not measured |
 | `stq1_0` | 128, 64, 2, 2 | 0 | 4096 | 0 | 12288 | inherited, grid class |
@@ -542,6 +555,17 @@ split-K enters at M 2 for N 1024 and below and at M 6 above, and `verify_nax` en
 described with the other `verify_nax` entries. Its `bm128_min_m` floor is 449: BM=128 takes
 1.13-1.16x the BM=64 time at M 224, 0.95-0.98x at M 256 and 0.86-0.90x at M 1024. Its large-M row
 has no K ceiling, and it has no db64 band.
+
+`mxfp4` (32-wide blocks with one E8M0 scale) runs its NAX tiles through the `iq4_nl` loader, with
+the E2M1 table in place of the `iq4_nl` codebook, and takes the flat class large-M row. Every other
+block puts its codes at an odd address, so the loader reads that block's codes as aligned pairs
+from the block start. It has no `verify_nax` kernel: that kernel decodes in half, and an E8M0
+scale reaches past the half range. Below M 13 it keeps the mat-vec routes. From M 33 it takes the
+mid-M split-K band as the other codecs do: the NAX split-K tile, and on GPUs without NAX the ALU
+split-K tile. Its `bm128_min_m` floor, 449, and its BK=128 tile, on by default
+(`KQ_NAX_MXFP4_BK128=0` keeps BK=64), are those of `iq4_nl`, not measured. On the expert gather
+of a gpt-oss 20B prefill chunk (32 experts, 2048 tokens at top 4, K and N 2880), `gather_qmm_seg`
+takes 2.94 ms on M5 Max, against 9.5-12.4 ms on the ALU kernel.
 
 The register-resident MMA verify kernels (`verify_mma`) serve `pq2_0`, `ptq1_0`, `q2_0`, `q4_0`,
 `q4_1` and `q8_0` through M 8. Each simdgroup decodes a block of its weight rows straight into 8x8
@@ -1327,6 +1351,11 @@ into a packed layout first.
   its own page list with per-page membership bitmasks, so a prefill chunk pays for the selected
   blocks instead of the full key axis and no `[L, S]` mask is materialized. Causality inside the
   diagonal page is enforced in-kernel.
+- **`sdpa_prefill_window`** - sliding-window causal prefill on the tensor-op units for M5 and later
+  GPUs. Each 64-row query block reads only the key blocks inside its window, so the cost of a
+  chunk follows the window, not the key length a dense masked attention walks. Head dims 64, 128
+  and 256, GQA, optional per-head sinks, per-row `starts` for a left-padded batch, strided operands
+  with a contiguous head dim.
 - **`sdpa_fa_verify`** - speculative-verify attention on the matrix units for a GQA-folded query tile.
   Head dims 64 through 512; `return_lse` as above. On NAX GPUs, at head dims 128 and 256 with up to
   64 folded rows on plain K and V, the key pass runs on the tensor-op units: each 16-row strip of

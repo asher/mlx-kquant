@@ -41,6 +41,7 @@ NAX_CODECS = sorted(
         "q4_0", "q4_1", "q5_0", "q5_1",
         "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s",
         "iq4_nl", "iq4_xs", "stq1_0", "pq2_0", "ptq1_0", "q2_0", "nvfp4",
+        "mxfp4",
     ]
 )  # fmt: skip
 

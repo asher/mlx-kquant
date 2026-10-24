@@ -11,6 +11,12 @@ using namespace mlx::steel;
 constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
 constant bool align_K [[function_constant(202)]];
+// gather_qmm_seg grid layout: 0 = (column, tile); GX > 0 = tile t on grid x
+// t % GX and (t / GX, column) on y.
+constant int kq_seg_gx [[function_constant(203)]];
+// gather_qmm_seg row map: x is the unsorted activations and sorted row r
+// reads x row x_rows[r].
+constant bool kq_seg_xmap [[function_constant(204)]];
 
 template <
     typename T,
@@ -2910,6 +2916,132 @@ struct KqNaxIq4_nlBlockLoader {
   }
 };
 
+// mxfp4 (32-weight block): KqNaxIq4_nlBlockLoader with the E8M0 scale byte
+// for the fp16 d and the E2M1 table for kvalues_iq4nl. qs sits at +1 of a
+// 17-byte block, so the whole-block path reads eight aligned ushorts: from qs
+// when it is even, else from the block start (the scale and codes 0-14) and
+// code 15 as a byte. Code byte j holds weight j and weight j + 16.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct KqNaxMxfp4BlockLoader {
+  MLX_MTL_CONST bool db_safe = true;
+  MLX_MTL_CONST int weights_per_block = KQ_MXFP4_GROUP;
+  MLX_MTL_CONST int bytes_per_block = KQ_MXFP4_BLOCK_BYTES;
+
+  static_assert(
+      BCOLS % weights_per_block == 0,
+      "MXFP4 NAX loader requires BCOLS to be a multiple of 32.");
+  static_assert(
+      (BCOLS * BROWS) % tgp_size == 0,
+      "tgp_size must evenly divide BCOLS * BROWS.");
+
+  MLX_MTL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  MLX_MTL_CONST short TCOLS = BCOLS / n_reads;
+  static_assert(
+      n_reads <= weights_per_block,
+      "MXFP4 NAX loader: n_reads must not exceed 32 (one block per thread).");
+
+  const int src_ld;
+  const int row_bytes;
+  const int tile_stride;
+
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+
+  KqNaxMxfp4BlockLoader(
+      const device uint8_t* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      int /* col_in_block */ = 0) thread
+      : src_ld(src_ld_),
+        row_bytes(src_ld_* bytes_per_block / weights_per_block),
+        tile_stride(
+            reduction_dim
+                ? (BCOLS / weights_per_block) * bytes_per_block
+                : BROWS*(src_ld_* bytes_per_block / weights_per_block)),
+        thread_idx(simd_group_id* SIMD_SIZE + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj((thread_idx % TCOLS) * n_reads),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)) {}
+
+  void load_unsafe() const thread {
+    const short block_idx = bj / weights_per_block;
+    const short within = bj % weights_per_block;
+    const device uint8_t* block_addr = src + block_idx * bytes_per_block;
+    const device uint8_t* qs = block_addr + KQ_MXFP4_QS_OFFSET;
+    if constexpr (n_reads == weights_per_block) {
+      // Every other 17-byte block has qs at an even address: there qs is 8
+      // aligned ushorts. Elsewhere the block's first 16 bytes are, and qs
+      // byte 15 is read alone.
+      uint8_t q[16];
+      uint8_t e;
+      if ((reinterpret_cast<uintptr_t>(qs) & 1) == 0) {
+        const device ushort* p = (const device ushort*)qs;
+        e = block_addr[0];
+#pragma unroll
+        for (short s = 0; s < 8; s++) {
+          const ushort v = p[s];
+          q[2 * s] = uint8_t(v);
+          q[2 * s + 1] = uint8_t(v >> 8);
+        }
+      } else {
+        const device ushort* p = (const device ushort*)block_addr;
+        const ushort v0 = p[0];
+        e = uint8_t(v0);
+        q[0] = uint8_t(v0 >> 8);
+#pragma unroll
+        for (short s = 1; s < 8; s++) {
+          const ushort v = p[s];
+          q[2 * s - 1] = uint8_t(v);
+          q[2 * s] = uint8_t(v >> 8);
+        }
+        q[15] = qs[15];
+      }
+      const float d = kq_fp_e8m0_scale(e);
+#pragma unroll
+      for (short j = 0; j < 16; j++) {
+        dst[j] = T(d * kq_fp_e2m1_lut[q[j] & 0x0Fu]);
+        dst[j + 16] = T(d * kq_fp_e2m1_lut[q[j] >> 4]);
+      }
+    } else {
+      const float d = kq_fp_e8m0_scale(block_addr[0]);
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        const int j = within + i;
+        const int x = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
+        dst[i] = T(d * kq_fp_e2m1_lut[x]);
+      }
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const thread {
+    if (bi >= src_tile_dim.y) {
+#pragma unroll
+      for (short i = 0; i < n_reads; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() thread {
+    src += tile_stride;
+  }
+};
+
 // Superblock IQ NAX loaders. All eight model on KqNaxQ6_KBlockLoader: a 64-wide
 // K-tile spans two 32-weight sub-blocks (BCOLS==64, n_reads==32, bj in {0,32}),
 // the thread owns one whole sub-block selected by sb = base + bj/32, and next()
@@ -4059,6 +4191,7 @@ using KqNaxNvfp4BlockLoader = KqNaxPrismBlockLoader<
     tgp_size>;
 
 KQ_NAX_DEFINE_KERNELS(iq4_nl, 32, 4, KqNaxIq4_nlBlockLoader)
+KQ_NAX_DEFINE_KERNELS(mxfp4, 32, 4, KqNaxMxfp4BlockLoader)
 KQ_NAX_DEFINE_KERNELS(iq4_xs, 256, 4, KqNaxIq4_xsBlockLoader)
 KQ_NAX_DEFINE_KERNELS(iq3_xxs, 256, 3, KqNaxIq3_xxsBlockLoader)
 KQ_NAX_DEFINE_KERNELS(iq3_s, 256, 3, KqNaxIq3_sBlockLoader)
@@ -4146,6 +4279,7 @@ KQ_NAX_DEFINE_PAIR_LOADER(KqNaxQ4_0PairLoader, KqNaxQ4_0BlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxQ4_1PairLoader, KqNaxQ4_1BlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxQ5_0PairLoader, KqNaxQ5_0BlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq4_nlPairLoader, KqNaxIq4_nlBlockLoader)
+KQ_NAX_DEFINE_PAIR_LOADER(KqNaxMxfp4PairLoader, KqNaxMxfp4BlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq3_xxsPairLoader, KqNaxIq3_xxsBlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq3_sPairLoader, KqNaxIq3_sBlockLoader)
 KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq2_xsPairLoader, KqNaxIq2_xsBlockLoader)
@@ -4229,6 +4363,7 @@ KQ_NAX_DEFINE_BK128_KERNEL(q4_0, 32, 4, KqNaxQ4_0PairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q4_1, 32, 4, KqNaxQ4_1PairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q5_0, 32, 5, KqNaxQ5_0PairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(iq4_nl, 32, 4, KqNaxIq4_nlPairLoader)
+KQ_NAX_DEFINE_BK128_KERNEL(mxfp4, 32, 4, KqNaxMxfp4PairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(iq3_xxs, 256, 3, KqNaxIq3_xxsPairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(iq3_s, 256, 3, KqNaxIq3_sPairLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(iq2_xs, 256, 2, KqNaxIq2_xsPairLoader)
@@ -4320,6 +4455,7 @@ KQ_NAX_DEFINE_SPLITK_KERNEL(q4_1, 32, 4, KqNaxQ4_1BlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(q5_0, 32, 5, KqNaxQ5_0BlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(q5_1, 32, 5, KqNaxQ5_1BlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(iq4_nl, 32, 4, KqNaxIq4_nlBlockLoader)
+KQ_NAX_DEFINE_SPLITK_KERNEL(mxfp4, 32, 4, KqNaxMxfp4BlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(iq4_xs, 256, 4, KqNaxIq4_xsBlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(iq3_xxs, 256, 3, KqNaxIq3_xxsBlockLoader)
 KQ_NAX_DEFINE_SPLITK_KERNEL(iq3_s, 256, 3, KqNaxIq3_sBlockLoader)
@@ -4615,6 +4751,7 @@ METAL_FUNC void kq_gather_qmm_rhs_nax_tgp_impl(
 KQ_NAX_DEFINE_GATHER_RHS(q8_0, 32, 8, KqNaxQ8_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(q5_1, 32, 5, KqNaxQ5_1BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(iq4_nl, 32, 4, KqNaxIq4_nlBlockLoader)
+KQ_NAX_DEFINE_GATHER_RHS(mxfp4, 32, 4, KqNaxMxfp4BlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(iq4_xs, 256, 4, KqNaxIq4_xsBlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(iq3_xxs, 256, 3, KqNaxIq3_xxsBlockLoader)
 KQ_NAX_DEFINE_GATHER_RHS(iq3_s, 256, 3, KqNaxIq3_sBlockLoader)
@@ -4648,7 +4785,35 @@ KQ_NAX_DEFINE_GATHER_RHS(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
 // sub-band matmads instead of whole bands (real routing leaves most
 // experts under 32 rows per tile). x rows and y rows are the sorted layout
 // (row_start offsets), w is indexed by expert. Transpose-only, K % BK == 0
-// or the align_K tail path, N tail via align_N.
+// or the align_K tail path, N tail via align_N. Only the first
+// kSegLoadSimdgroups simdgroups dequantize the slab, so a 128-row tile
+// (WM = 4) keeps the 128-thread loader geometry every codec loader
+// asserts.
+constexpr constant int kSegLoadSimdgroups = 4;
+
+// The 16 x (16 * TK) A tile of one sub-band through the row map: lane
+// fragment rows fm and fm + 8 come from r0 and r1 (BaseNAXFrag::get_coord),
+// from column k0 on. Columns at or past cols read zero.
+template <typename T, short TK>
+METAL_FUNC void kq_seg_load_rows(
+    thread NAXTile<T, 1, TK>& At,
+    const device T* r0,
+    const device T* r1,
+    const int k0,
+    const short cols) {
+  const short fn = BaseNAXFrag::get_coord().x;
+#pragma unroll
+  for (short j = 0; j < TK; j++) {
+    thread auto& f = At.frag_at(0, j);
+#pragma unroll
+    for (short jj = 0; jj < 4; jj++) {
+      const short c = j * 16 + fn + jj;
+      f[jj] = c < cols ? r0[k0 + c] : T(0);
+      f[4 + jj] = c < cols ? r1[k0 + c] : T(0);
+    }
+  }
+}
+
 template <
     typename T,
     typename LoaderW,
@@ -4659,6 +4824,7 @@ template <
     int WN = 2>
 METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
     const device T* x,
+    const device uint32_t* x_rows,
     const device uint8_t* w,
     const device uint32_t* seg_map,
     device T* y,
@@ -4689,7 +4855,9 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
   const int k_remain = K - K_it * BK;
   const short2 tile_w = short2(k_remain, tgp_bn);
 
-  x += row0 * static_cast<size_t>(K);
+  if (!kq_seg_xmap) {
+    x += row0 * static_cast<size_t>(K);
+  }
   y += row0 * static_cast<size_t>(N) + y_col_long;
   const device uint8_t* wl = w + size_t(expert) * stride_w + y_col_long * K_w;
 
@@ -4728,8 +4896,26 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
   }
 
   const device T* xn = x + tm * K;
+  // Row map: each lane's two fragment rows of each sub-band, read in place.
+  // A row past num_rows reads the tile's first row; its output is not
+  // stored.
+  const device T* xr[TM][2];
+  int xk = 0;
+  if (kq_seg_xmap) {
+    const short fm = BaseNAXFrag::get_coord().y;
+#pragma unroll
+    for (short mi = 0; mi < TM; mi++) {
+#pragma unroll
+      for (short i = 0; i < 2; i++) {
+        const int r = int(tm) + mi * 16 + fm + i * 8;
+        const int rr = r < num_rows ? r : 0;
+        xr[mi][i] = x + size_t(x_rows[row0 + rr]) * size_t(K);
+      }
+    }
+  }
 
-  thread LoaderW loader_w(wl, K, Ws, simd_group_id, simd_lane_id, 0);
+  thread LoaderW loader_w(wl, K, Ws, simd_group_id, simd_lane_id);
+  const bool sg_loads = int(simd_group_id) < kSegLoadSimdgroups;
 
   // MMA of the live sub-bands against the slab in Ws; k_valid < BK only on
   // the align_K tail, where the slab past k_valid is zero-filled and the x
@@ -4750,7 +4936,9 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
         if (mi * 16 < sgp_sm) {
           NAXTile<T, 1, TK> At;
           const short rows = min(short(16), short(sgp_sm - mi * 16));
-          if (rows == 16 && cols == SK) {
+          if (kq_seg_xmap) {
+            kq_seg_load_rows(At, xr[mi][0], xr[mi][1], xk + kk1, cols);
+          } else if (rows == 16 && cols == SK) {
             At.load(xn + mi * 16 * K + kk1, K);
           } else {
             At.load_safe(xn + mi * 16 * K + kk1, K, short2(cols, rows));
@@ -4771,10 +4959,12 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
   dispatch_bool(align_N || !is_unaligned_bn, [&](auto kAlignedN) {
     for (int k = 0; k < K_it; k++) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      if constexpr (kAlignedN.value) {
-        loader_w.load_unsafe();
-      } else {
-        loader_w.load_safe(short2(BK, tgp_bn));
+      if (sg_loads) {
+        if constexpr (kAlignedN.value) {
+          loader_w.load_unsafe();
+        } else {
+          loader_w.load_safe(short2(BK, tgp_bn));
+        }
       }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -4784,12 +4974,15 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
       }
 
       xn += BK;
+      xk += BK;
       loader_w.next();
     }
 
     if (!align_K) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      loader_w.load_safe(tile_w);
+      if (sg_loads) {
+        loader_w.load_safe(tile_w);
+      }
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
       if (sg_active) {
@@ -4820,7 +5013,8 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
   });
 }
 
-#define KQ_NAX_DEFINE_GATHER_SEG(codec, GROUP_CONST, bits_val, LOADER)         \
+#define KQ_NAX_DEFINE_GATHER_SEG_AS(                                           \
+    codec, kname, GROUP_CONST, bits_val, LOADER)                               \
   template <                                                                   \
       typename T,                                                              \
       int group_size,                                                          \
@@ -4830,7 +5024,7 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
       int BK,                                                                  \
       int WM,                                                                  \
       int WN>                                                                  \
-  [[kernel]] void kq_##codec##_gather_qmm_seg_nax(                             \
+  [[kernel]] void kq_##codec##_##kname(                                        \
       const device T* x [[buffer(0)]],                                         \
       const device uint8_t* w [[buffer(1)]],                                   \
       const device uint8_t* scales [[buffer(2)]],                              \
@@ -4839,6 +5033,8 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
       device T* y [[buffer(5)]],                                               \
       const constant int& N [[buffer(6)]],                                     \
       const constant int& K [[buffer(7)]],                                     \
+      const device uint32_t* x_rows                                            \
+      [[buffer(8), function_constant(kq_seg_xmap)]],                           \
       uint3 tid [[threadgroup_position_in_grid]],                              \
       uint simd_group_id [[simdgroup_index_in_threadgroup]],                   \
       uint simd_lane_id [[thread_index_in_simdgroup]]) {                       \
@@ -4848,6 +5044,12 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
         #codec " NAX kernel requires group_size=" #GROUP_CONST);               \
     static_assert(                                                             \
         bits == bits_val, #codec " NAX kernel requires bits=" #bits_val);      \
+    if (kq_seg_gx > 0) {                                                       \
+      const uint n_cols = uint((N + BN - 1) / BN);                             \
+      const uint t = (tid.y / n_cols) * uint(kq_seg_gx) + tid.x;               \
+      tid.x = tid.y % n_cols;                                                  \
+      tid.y = t;                                                               \
+    }                                                                          \
     /* Shape-only upper bound on the map: tiles past the count exit as a       \
        whole threadgroup before any barrier. */                                \
     if (tid.y >= tile_count[0]) {                                              \
@@ -4861,14 +5063,34 @@ METAL_FUNC void kq_gather_qmm_seg_nax_tgp_impl(
         BK,                                                                    \
         BK_padded,                                                             \
         /*reduction_dim=*/1,                                                   \
-        /*tgp_size=*/WM * WN * SIMD_SIZE>;                                     \
+        /*tgp_size=*/kSegLoadSimdgroups * SIMD_SIZE>;                          \
+    static_assert(WM * WN >= kSegLoadSimdgroups, "seg loader needs 4 SGs");    \
     kq_gather_qmm_seg_nax_tgp_impl<T, LoaderW, BM, BN, BK, WM, WN>(            \
-        x, w, seg_map, y, N, K, Ws, tid, simd_group_id, simd_lane_id);         \
+        x,                                                                     \
+        kq_seg_xmap ? x_rows : nullptr,                                        \
+        w,                                                                     \
+        seg_map,                                                               \
+        y,                                                                     \
+        N,                                                                     \
+        K,                                                                     \
+        Ws,                                                                    \
+        tid,                                                                   \
+        simd_group_id,                                                         \
+        simd_lane_id);                                                         \
   }
+
+#define KQ_NAX_DEFINE_GATHER_SEG(codec, GROUP_CONST, bits_val, LOADER) \
+  KQ_NAX_DEFINE_GATHER_SEG_AS(                                         \
+      codec, gather_qmm_seg_nax, GROUP_CONST, bits_val, LOADER)
+// BK=128 slab: the pair and half-super-block loaders of the BK=128 qmm.
+#define KQ_NAX_DEFINE_GATHER_SEG_BK128(codec, GROUP_CONST, bits_val, LOADER) \
+  KQ_NAX_DEFINE_GATHER_SEG_AS(                                               \
+      codec, gather_qmm_seg_nax_bk128, GROUP_CONST, bits_val, LOADER)
 
 KQ_NAX_DEFINE_GATHER_SEG(q8_0, 32, 8, KqNaxQ8_0BlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(q5_1, 32, 5, KqNaxQ5_1BlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(iq4_nl, 32, 4, KqNaxIq4_nlBlockLoader)
+KQ_NAX_DEFINE_GATHER_SEG(mxfp4, 32, 4, KqNaxMxfp4BlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(iq4_xs, 256, 4, KqNaxIq4_xsBlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(iq3_xxs, 256, 3, KqNaxIq3_xxsBlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(iq3_s, 256, 3, KqNaxIq3_sBlockLoader)
@@ -4891,7 +5113,23 @@ KQ_NAX_DEFINE_GATHER_SEG(q6_k, 256, 6, KqNaxQ6_KBlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(q3_k, 256, 3, KqNaxQ3_KBlockLoader)
 KQ_NAX_DEFINE_GATHER_SEG(q2_k, 256, 2, KqNaxQ2_KBlockLoader)
 
+KQ_NAX_DEFINE_GATHER_SEG_BK128(q6_k, 256, 6, KqNaxQ6_KHalfLoader)
+KQ_NAX_DEFINE_GATHER_SEG_BK128(q5_k, 256, 5, KqNaxQ5_KHalfLoader)
+KQ_NAX_DEFINE_GATHER_SEG_BK128(q3_k, 256, 3, KqNaxQ3_KHalfLoader)
+KQ_NAX_DEFINE_GATHER_SEG_BK128(q4_k, 256, 4, KqNaxQ4_KHalfLoader)
+KQ_NAX_DEFINE_GATHER_SEG_BK128(q4_0, 32, 4, KqNaxQ4_0PairLoader)
+KQ_NAX_DEFINE_GATHER_SEG_BK128(q4_1, 32, 4, KqNaxQ4_1PairLoader)
+KQ_NAX_DEFINE_GATHER_SEG_BK128(q5_0, 32, 5, KqNaxQ5_0PairLoader)
+KQ_NAX_DEFINE_GATHER_SEG_BK128(iq4_nl, 32, 4, KqNaxIq4_nlPairLoader)
+KQ_NAX_DEFINE_GATHER_SEG_BK128(mxfp4, 32, 4, KqNaxMxfp4PairLoader)
+KQ_NAX_DEFINE_GATHER_SEG_BK128(iq3_xxs, 256, 3, KqNaxIq3_xxsPairLoader)
+KQ_NAX_DEFINE_GATHER_SEG_BK128(iq3_s, 256, 3, KqNaxIq3_sPairLoader)
+KQ_NAX_DEFINE_GATHER_SEG_BK128(iq2_xs, 256, 2, KqNaxIq2_xsPairLoader)
+KQ_NAX_DEFINE_GATHER_SEG_BK128(iq2_s, 256, 2, KqNaxIq2_sPairLoader)
+
+#undef KQ_NAX_DEFINE_GATHER_SEG_BK128
 #undef KQ_NAX_DEFINE_GATHER_SEG
+#undef KQ_NAX_DEFINE_GATHER_SEG_AS
 
 #undef KQ_NAX_DEFINE_KERNELS
 #undef KQ_NAX_DEFINE_GATHER_RHS

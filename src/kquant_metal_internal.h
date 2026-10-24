@@ -122,6 +122,15 @@ inline bool codec_has_nax(const std::string& kquant_type) {
   return codec != nullptr && codec->has_nax_kernel;
 }
 
+// gather_qmm_seg takes its NAX kernel: a NAX GPU, a NAX codec and
+// K % 64 == 0. KQ_DISABLE_GATHER_SEG_NAX (read once) forces the ALU kernel.
+inline bool kq_seg_nax_ok(const std::string& kquant_type, int K) {
+  static const bool disabled =
+      std::getenv("KQ_DISABLE_GATHER_SEG_NAX") != nullptr;
+  return !disabled && kq_is_nax_available() && K % 64 == 0 &&
+      codec_has_nax(kquant_type);
+}
+
 // Codecs with qmv_fast_fine/qmv_fine instantiations (2 output rows per
 // threadgroup vs kquant_qmv_bn rows, multiplying the threadgroup count for
 // the same N). Explicit allow-list like codec_has_verify_qmv below: the
@@ -454,6 +463,9 @@ inline void kq_require_kernel(
 // says whether it declares it. Functions without the chunk decode do not.
 constexpr int kq_fc_kquant_word = 370;
 bool kq_kquant_word_on();
+
+// Whether the codec has BK=128 NAX kernels (a pair or half loader).
+bool kq_nax_has_bk128(const std::string& t);
 
 // Whether the library function kname exists, and whether it declares the
 // constant named `fc`. Reads the unspecialized function once.

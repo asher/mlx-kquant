@@ -280,10 +280,19 @@ mx::array quantized_matmul(
         "'.");
   }
   require_matmul_codec(*codec, "[mlx_kquant.quantized_matmul]");
-  if (x.ndim() > 2 && w.ndim() > 2) {
-    throw std::invalid_argument(
-        "[mlx_kquant.quantized_matmul] batched (>2D) weights are not supported; "
-        "use gather_qmm for mixture-of-experts.");
+  // A stack of one matrix is that matrix; a stack of more would run only
+  // w[0].
+  if (w.ndim() > 2) {
+    int64_t mats = 1;
+    for (int i = 0; i < w.ndim() - 2; i++) {
+      mats *= w.shape(i);
+    }
+    if (mats != 1) {
+      throw std::invalid_argument(
+          "[mlx_kquant.quantized_matmul] batched (>2D) weights are not "
+          "supported; use gather_qmm for mixture-of-experts.");
+    }
+    w = mx::reshape(w, {w.shape(-2), w.shape(-1)}, s_);
   }
 
   // Expand w's quantized geometry from the codec block layout.
@@ -645,8 +654,13 @@ mx::array gather_qmm(
     bool transpose,
     bool sorted_indices,
     mx::StreamOrDevice s_) {
-  // No indices at all -> a plain (non-gathered) quantized matmul.
-  if (!lhs_indices_ && !rhs_indices_) {
+  // No indices on one matrix -> a plain quantized matmul. A stack of
+  // matrices takes the gathered path below, which runs each one.
+  int64_t w_mats = 1;
+  for (int i = 0; i < w.ndim() - 2; i++) {
+    w_mats *= w.shape(i);
+  }
+  if (!lhs_indices_ && !rhs_indices_ && w_mats == 1) {
     return quantized_matmul(
         std::move(x),
         std::move(w),
@@ -769,8 +783,11 @@ mx::array gather_qmm(
       {x_c, w_c, scales_c, std::move(lhs_indices), std::move(rhs_indices)});
 }
 
-std::vector<mx::array>
-expert_tile_map(mx::array indices, int n_experts, mx::StreamOrDevice s_) {
+std::vector<mx::array> expert_tile_map(
+    mx::array indices,
+    int n_experts,
+    int tile_rows,
+    mx::StreamOrDevice s_) {
   if (indices.ndim() != 1 || indices.dtype() != mx::uint32) {
     std::ostringstream msg;
     msg << "[mlx_kquant.expert_tile_map] indices must be 1-D uint32 but got "
@@ -783,17 +800,21 @@ expert_tile_map(mx::array indices, int n_experts, mx::StreamOrDevice s_) {
         "[mlx_kquant.expert_tile_map] indices must be non-empty and "
         "n_experts positive.");
   }
+  if (tile_rows != 64 && tile_rows != 128) {
+    throw std::invalid_argument(
+        "[mlx_kquant.expert_tile_map] tile_rows must be 64 or 128.");
+  }
 
   auto s = mx::to_stream(s_);
   auto idx_c = mx::contiguous(indices, false, s);
 
-  int cap = std::max(rows / 64 + std::min(n_experts, rows), 1);
+  int cap = std::max(rows / tile_rows + std::min(n_experts, rows), 1);
   std::vector<mx::Shape> shapes = {{cap, 3}, {1}};
   std::vector<mx::Dtype> dtypes = {mx::uint32, mx::uint32};
   return mx::array::make_arrays(
       std::move(shapes),
       dtypes,
-      std::make_shared<KQuantExpertTileMap>(s, n_experts),
+      std::make_shared<KQuantExpertTileMap>(s, n_experts, tile_rows),
       {idx_c});
 }
 
@@ -822,10 +843,16 @@ mx::array gather_qmm_seg(
     const std::string& kquant_type,
     mx::array map,
     mx::array counts,
+    int tile_rows,
+    std::optional<mx::array> x_rows,
     mx::StreamOrDevice s_) {
   if (w.dtype() != mx::uint8) {
     throw std::invalid_argument(
         "[mlx_kquant.gather_qmm_seg] w must be uint8 (raw GGUF wire bytes).");
+  }
+  if (tile_rows != 64 && tile_rows != 128) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_seg] tile_rows must be 64 or 128.");
   }
   const KQuantCodec* codec = codec_by_name(kquant_type);
   if (codec == nullptr) {
@@ -838,6 +865,15 @@ mx::array gather_qmm_seg(
     std::ostringstream msg;
     msg << "[mlx_kquant.gather_qmm_seg] x must be [rows, K] but got shape "
         << x.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (x_rows &&
+      (x_rows->ndim() != 1 || x_rows->size() < 1 ||
+       !mx::issubdtype(x_rows->dtype(), mx::integer))) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_seg] x_rows must be a non-empty 1-D "
+        << "integer array but got shape " << x_rows->shape() << " dtype "
+        << x_rows->dtype() << ".";
     throw std::invalid_argument(msg.str());
   }
   if (w.ndim() != 3) {
@@ -882,6 +918,22 @@ mx::array gather_qmm_seg(
 
   auto s = mx::to_stream(s_);
   kq_check_weight_base_at_build(w, kquant_type, s, "gather_qmm_seg");
+  // The NAX kernel reads the rows x_rows names in place; elsewhere the op
+  // gathers them first.
+  std::optional<mx::array> rows_c;
+  if (x_rows) {
+    auto r = mx::astype(*x_rows, mx::uint32, s);
+    bool in_place = false;
+#ifdef _METAL_
+    in_place =
+        s.device == mx::Device::gpu && kq_seg_nax_ok(kquant_type, x.shape(-1));
+#endif
+    if (in_place) {
+      rows_c = mx::contiguous(r, false, s);
+    } else {
+      x = mx::take(x, r, 0, s);
+    }
+  }
   auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
   // The kernel computes each expert's base pointer as expert * N * K_w, so w
   // must be fully row-contiguous (no strided expert dim).
@@ -890,13 +942,18 @@ mx::array gather_qmm_seg(
   auto map_c = mx::contiguous(map, false, s);
   auto cnt_c = mx::contiguous(counts, false, s);
 
-  mx::Shape out_shape{x.shape(0), w.shape(1)};
+  const int rows = rows_c ? rows_c->shape(0) : x.shape(0);
+  std::vector<mx::array> inputs = {
+      x_c, w_c, scales_c, std::move(map_c), std::move(cnt_c)};
+  if (rows_c) {
+    inputs.push_back(*rows_c);
+  }
   return mx::array(
-      std::move(out_shape),
+      mx::Shape{rows, w.shape(1)},
       out_type,
       std::make_shared<KQuantGatherQMMSeg>(
-          s, kquant_type, codec->weights_per_block, codec->bits),
-      {x_c, w_c, scales_c, std::move(map_c), std::move(cnt_c)});
+          s, kquant_type, codec->weights_per_block, codec->bits, tile_rows),
+      std::move(inputs));
 }
 
 std::vector<mx::array> quantize(

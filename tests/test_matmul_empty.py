@@ -121,7 +121,8 @@ def test_inner_dim_of_zero_checks_the_lora_arguments(dtype):
     ):
         with pytest.raises(ValueError):
             call(**bad)
-    with pytest.raises(ValueError, match="2-D w"):
+    # A stack of two weights is refused before the LoRA arguments are read.
+    with pytest.raises(ValueError, match="batched"):
         kq.quantized_matmul(
             x,
             mx.zeros((2, N, 0), dtype=mx.uint8),

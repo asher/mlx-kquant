@@ -519,6 +519,45 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_prefill_window",
+      &mlx_kquant::sdpa_prefill_window,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "scale"_a,
+      "window"_a,
+      "sinks"_a = nb::none(),
+      "starts"_a = nb::none(),
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Sliding-window causal prefill attention on the tensor-op units.
+        The queries are the last qL of the kL key positions; query row i
+        sees the keys at positions p with p <= i + kL - qL and
+        p > i + kL - qL - window. Only the key blocks inside each query
+        block's window are read, where a dense masked attention reads every
+        block up to the diagonal. Needs a NAX GPU (M5 and later).
+
+        Args:
+            q (array): queries [B, n_q_heads, qL, D], float16/bfloat16,
+                D in {64, 128, 256}. Batch, head and row strided is fine;
+                the head_dim must be contiguous.
+            k (array): keys [B, n_kv_heads, kL, D] in position order, kL
+                >= qL; n_kv_heads must divide n_q_heads.
+            v (array): values [B, n_kv_heads, kL, D].
+            scale (float): query scale (typically 1/sqrt(D)).
+            window (int): keys each query sees, itself included; >= 1.
+            sinks (array, optional): per-q-head attention sinks, shape
+                [n_q_heads]; an extra softmax logit with no value row.
+            starts (array, optional): int32 [B]; batch row b skips the keys
+                below starts[b] (a left-padded batch), clamped to [0, kL].
+                A query row below its start reads zeros.
+
+        Returns:
+            array: attention output [B, n_q_heads, qL, D].
+      )");
+
+  m.def(
       "sdpa_fa_verify",
       [](mx::array q,
          mx::array k,
@@ -2862,6 +2901,7 @@ NB_MODULE(_ext, m) {
       "indices"_a,
       "n_experts"_a,
       nb::kw_only(),
+      "tile_rows"_a = 64,
       "stream"_a = nb::none(),
       R"(
         Build the gather_qmm_seg tile map from expert-sorted routing indices,
@@ -2870,11 +2910,14 @@ NB_MODULE(_ext, m) {
         Args:
             indices (array): 1-D uint32 expert ids, sorted ascending.
             n_experts (int): total expert count (sizes the map bound).
+            tile_rows (int): tile height, 64 or 128. Pass the same value
+                to gather_qmm_seg.
 
         Returns:
             tuple: (map, counts) -- uint32 [cap, 3] tile table of
-            (expert, row_start, num_rows) tiling each segment into 64-row
-            tiles where only the last tile of a segment can be partial, plus
+            (expert, row_start, num_rows) tiling each segment into
+            tile_rows-row tiles where only the last tile of a segment can be
+            partial, plus
             uint32 [1] valid-tile count. Slots past the count are
             uninitialized; tile order is unspecified. Metal-only.
       )");
@@ -2889,27 +2932,61 @@ NB_MODULE(_ext, m) {
       "map"_a,
       "counts"_a,
       nb::kw_only(),
+      "tile_rows"_a = 64,
+      "x_rows"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Segment-walking gather GEMM for expert-sorted MoE prefill.
 
         Args:
-            x (array): float activations [rows, K], rows pre-sorted by expert.
+            x (array): float activations [rows, K], rows pre-sorted by
+                expert, or with x_rows the unsorted activations [n, K].
             w (array): uint8 K-quant wire bytes shaped
                 (n_experts, out_dims, bytes_per_row).
             scales (array): vestigial placeholder; ignored by the kernel.
             kquant_type (str): codec name, e.g. ``"iq2_xxs"``.
             map (array): uint32 [n_tiles, 3] rows of
-                (expert, row_start, num_rows), num_rows <= 64. Only the last
+                (expert, row_start, num_rows), num_rows <= tile_rows. Only the last
                 tile of a segment may be partial; its dead row fragments are
                 skipped in the MMA.
             counts (array): uint32 [1] valid-tile count. Valid tiles never
-                span experts and must cover every x row exactly once
+                span experts and must cover every sorted row exactly once
                 (uncovered output rows are left unwritten). Use
                 expert_tile_map to build both.
+            tile_rows (int): the map's tile height, 64 or 128. Pass the
+                value the map was built with; seg_tile_rows picks one.
+            x_rows (array, optional): integer [rows], the x row each sorted
+                row reads, each in [0, n) (not checked). An x row may be read
+                by several sorted rows or by none. The matrix-unit kernel
+                reads the rows in place; the other paths gather them first.
 
         Returns:
-            array: [rows, out_dims] (x.dtype, float32 -> bfloat16). Metal-only.
+            array: [rows, out_dims], one row per sorted row (x.dtype,
+            float32 -> bfloat16). Metal-only.
+      )");
+
+  m.def(
+      "seg_tile_rows",
+      &mlx_kquant::seg_tile_rows,
+      "rows"_a,
+      "n_experts"_a,
+      "k"_a,
+      "kquant_type"_a,
+      R"(
+        Tile height for expert_tile_map and gather_qmm_seg.
+
+        128 where the codec runs on the matrix units and the mean rows per
+        expert reach 96 (120 when k < 1024 and the codec's K tile stays
+        64), else 64. KQ_SEG_TILE_ROWS=64 or 128 (read live) pins it.
+
+        Args:
+            rows (int): expert-sorted rows (tokens times top-k).
+            n_experts (int): experts in the weight stack.
+            k (int): reduction size (input features).
+            kquant_type (str): codec name.
+
+        Returns:
+            int: 64 or 128.
       )");
 
   m.def(

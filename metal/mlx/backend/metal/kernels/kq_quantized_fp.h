@@ -361,6 +361,58 @@ template <
       w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool aligned_N,
+    int small_bm = 0,
+    typename U = T>
+[[kernel]] void kq_mxfp4_qmm_t_splitk(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    device U* y,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    const constant int& k_partition_size,
+    const constant int& split_k_partition_stride,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(group_size == KQ_MXFP4_GROUP, "MXFP4 requires gs=32");
+  static_assert(bits == 4, "MXFP4 requires bits=4");
+  constexpr int BM = small_bm ? small_bm : 32;
+  constexpr int BK = 32, BN = small_bm ? 64 : 32;
+  constexpr int WM = BM == 8 ? 1 : 2, WN = 4 / WM;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+  using LoaderW =
+      KqMxfp4BlockLoader<T, BN, BK, BK_padded, 1, 2 * 2 * SIMD_SIZE>;
+  const int k_start = tid.z * k_partition_size;
+  x += k_start;
+  auto wl = w;
+  wl += (k_start / LoaderW::weights_per_block) * LoaderW::bytes_per_block;
+  y += tid.z * static_cast<int64_t>(split_k_partition_stride);
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, U>(
+      wl,
+      x,
+      y,
+      Xs,
+      Ws,
+      K,
+      N,
+      M,
+      k_partition_size,
+      tid,
+      lid,
+      simd_gid,
+      simd_lid);
+}
+
 template <typename T, int group_size, int bits, bool batched>
 [[kernel]] void kq_mxfp4_qmm_n(
     const device uint8_t* w,

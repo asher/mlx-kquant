@@ -684,6 +684,12 @@ instantiate_kquant_iq4_nl_for_type(float16_t)
   instantiate_kquant_qmm_t(type, 32, 4, true, 1, mxfp4)              \
   instantiate_kquant_qmm_t(type, 32, 4, false, 0, mxfp4)             \
   instantiate_kquant_qmm_t(type, 32, 4, false, 1, mxfp4)             \
+  instantiate_kquant_qmm_t_splitk(type, 32, 4, true, mxfp4)          \
+  instantiate_kquant_qmm_t_splitk(type, 32, 4, false, mxfp4)         \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 32, 4, true, mxfp4)     \
+  instantiate_kquant_qmm_t_splitk_bm16(type, 32, 4, false, mxfp4)    \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 32, 4, true, mxfp4)      \
+  instantiate_kquant_qmm_t_splitk_bm8(type, 32, 4, false, mxfp4)     \
   instantiate_kquant_qmm_n(type, 32, 4, 0, mxfp4)                    \
   instantiate_kquant_qmm_n(type, 32, 4, 1, mxfp4)                    \
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 32, 4, mxfp4) \
@@ -1171,8 +1177,9 @@ instantiate_kquant_gather_qmm_rhs_codec(64, 2, q2_0)
 instantiate_kquant_gather_qmm_rhs_codec(128, 1, ptq1_0)
 
 // Tile-map builder for gather_qmm_seg. One thread per expert-sorted row; the
-// thread whose row starts a 64-row tile appends (expert, row_start, num_rows)
-// with num_rows = min(64, rows left in the segment): only the last tile of a
+// thread whose row starts a tile_rows-row tile (64 or 128) appends (expert,
+// row_start, num_rows) with num_rows = min(tile_rows, rows left in the
+// segment): only the last tile of a
 // segment can be partial, and the GEMM kernels skip the dead row fragments
 // (16-row sub-bands on the NAX kernel). counts[0] receives the appended
 // tile count and must be zeroed first (kq_seg_zero_counts). Tile order is
@@ -1188,6 +1195,7 @@ instantiate_kquant_gather_qmm_rhs_codec(128, 1, ptq1_0)
     device uint32_t* map [[buffer(1)]],
     device atomic_uint* counts [[buffer(2)]],
     const constant int& n_rows [[buffer(3)]],
+    const constant uint& tile_rows [[buffer(4)]],
     uint r [[thread_position_in_grid]]) {
   if (r >= static_cast<uint>(n_rows)) {
     return;
@@ -1204,7 +1212,7 @@ instantiate_kquant_gather_qmm_rhs_codec(128, 1, ptq1_0)
     }
   }
   const uint rank = r - lo;
-  if ((rank & 63u) != 0u) {
+  if ((rank & (tile_rows - 1u)) != 0u) {
     return;
   }
   // first row past the segment (only tile-start threads pay this search)
@@ -1221,7 +1229,7 @@ instantiate_kquant_gather_qmm_rhs_codec(128, 1, ptq1_0)
   uint slot = atomic_fetch_add_explicit(&counts[0], 1u, memory_order_relaxed);
   map[3u * slot] = e;
   map[3u * slot + 1u] = r;
-  map[3u * slot + 2u] = min(64u, seg_len - rank);
+  map[3u * slot + 2u] = min(tile_rows, seg_len - rank);
 }
 
 // Split-K partial fold for qmm_t_splitk: y[i] = (T)(f32 sum over the

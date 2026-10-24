@@ -3158,12 +3158,12 @@ inline uchar2 kq_get_scale_min_k4_just2(int j, int k, const device uint8_t* q) {
                                                                       \
   /* Segment-walking gather GEMM: x holds rows pre-sorted by expert;  \
      seg_map is [n_tiles, 3] uint32 rows of (expert, row_start,       \
-     num_rows) with num_rows <= 64; only the last tile of a segment   \
-     may be partial and its dead row fragments are skipped in the     \
-     MMA. One threadgroup per (N-tile, map tile); grid.y indexes      \
-     seg_map, clamped by tile_count[0] so a shape-only upper bound    \
-     can be dispatched. Rows not covered by the map are left          \
-     unwritten. */                                                    \
+     num_rows) with num_rows <= 64 * grid.z; only the last tile of a  \
+     segment may be partial and its dead row fragments are skipped in \
+     the MMA. One threadgroup per (N-tile, map tile, 64-row half);    \
+     grid.y indexes seg_map, clamped by tile_count[0] so a shape-only \
+     upper bound can be dispatched. Rows not covered by the map are   \
+     left unwritten. */                                               \
   template <typename T, int group_size, int bits, bool aligned_N>     \
   [[kernel]] void kq_##CODEC##_gather_qmm_seg_t(                      \
       const device uint8_t* w,                                        \
@@ -3192,12 +3192,16 @@ inline uchar2 kq_get_scale_min_k4_just2(int j, int k, const device uint8_t* q) {
         /*reduction_dim=*/1,                                          \
         /*tgp_size=*/2 * 2 * SIMD_SIZE>;                              \
     const device uint32_t* seg = seg_map + 3 * tid.y;                 \
+    const int num_rows = static_cast<int>(seg[2]) - BM * int(tid.z);  \
+    if (num_rows <= 0) {                                              \
+      return;                                                         \
+    }                                                                 \
     const int K_w =                                                   \
         (K / LoaderW::weights_per_block) * LoaderW::bytes_per_block;  \
+    const int64_t row0 = int64_t(seg[1]) + BM * int64_t(tid.z);       \
     w += static_cast<int64_t>(seg[0]) * N * K_w;                      \
-    x += static_cast<int64_t>(seg[1]) * K;                            \
-    y += static_cast<int64_t>(seg[1]) * N;                            \
-    const int num_rows = static_cast<int>(seg[2]);                    \
+    x += row0 * K;                                                    \
+    y += row0 * N;                                                    \
     kq_qmm_t_seg_impl<T, LoaderW, aligned_N, BM, BK, BN>(             \
         w, x, y, Xs, Ws, K, N, num_rows, tid, simd_gid, simd_lid);    \
   }                                                                   \

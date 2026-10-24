@@ -45,7 +45,7 @@ CODEC = re.compile(
 )
 BASE = "kquant_q4_k_qmm_t_splitk_bm8_bfloat16_t_gs_256_b_4_alN_true"
 FLOAT = "kquant_q4_k_qmm_t_splitk_bm8_float_gs_256_b_4_alN_true"
-FP4 = "kquant_mxfp4_qmm_t_splitk_bfloat16_t_gs_32_b_4_alN_true"
+FP8 = "kquant_mxfp8_qmm_t_splitk_bfloat16_t_gs_32_b_8_alN_true"
 
 
 def _split_codecs():
@@ -88,15 +88,15 @@ def test_split_kernels_pair():
 def test_pairing_check_flags_breaks():
     names = set(kq.metallib_kernels())
     codecs = _split_codecs()
-    assert "q4_k" in codecs and "mxfp4" not in codecs, sorted(codecs)
+    assert "q4_k" in codecs and "mxfp8" not in codecs, sorted(codecs)
     twin = BASE + "_pf32"
-    assert {BASE, twin} <= names and not {FLOAT, FP4} & names
+    assert {BASE, twin} <= names and not {FLOAT, FP8} & names
     assert _pairing_errors(names - {BASE}, codecs) == [("no base", twin)]
     assert _pairing_errors(names - {twin}, codecs) == [("no twin", BASE)]
     assert _pairing_errors(names | {FLOAT}, codecs) == [("float", FLOAT)]
     bad = FLOAT + "_pf32"
     assert _pairing_errors(names | {bad}, codecs) == [("float", bad)]
-    assert _pairing_errors(names | {FP4}, codecs) == [("codec", FP4)]
+    assert _pairing_errors(names | {FP8}, codecs) == [("codec", FP8)]
 
 
 def test_host_split_names_exist():
