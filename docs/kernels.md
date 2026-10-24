@@ -61,8 +61,8 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
   NAX codec from 96 rows per expert on average (120 when K < 1024 and the codec's K tile stays 64),
   and `KQuantSwitchLinear` uses it. The 128-row tile runs eight 32-row simdgroups that share one
   weight slab, and the `q3_k` to `q6_k` slabs are 128 deep. Every layout writes the same output.
-  On M5 Max a `q6_k` expert gather runs 7-23% faster and a `q4_k` one up to 10% faster; most other
-  codecs gain 0-6%.
+  On M5 Max a `q6_k` expert gather runs 7-23% faster and a `q4_k` one up to 10% faster; other
+  codecs run between 5% slower and 7% faster, depending on the shape.
 
 On NAX GPUs, `quantized_matmul` transpose (decode-orientation) shapes route by row count M and
 output width N. Per-row qmv serves M 2 up to a per-codec limit, the mat-vec paths (`mv_ext`,

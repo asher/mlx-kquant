@@ -528,8 +528,8 @@ def test_gather_qmm_seg_rejects_bad_inputs():
         kq.gather_qmm_seg(x_ok, w, s, "iq2_xxs", good, cnt, tile_rows=96)
 
 
-def _seg_experts(codec, k, seed):
-    """(E, N, bytes_per_row) wire of real-range weights: kq.quantize where
+def _seg_experts(codec, k, seed, n=N):
+    """(E, n, bytes_per_row) wire of real-range weights: kq.quantize where
     the codec encodes, else synth_wire's sane scales."""
     from kqref import synth_wire
 
@@ -539,11 +539,11 @@ def _seg_experts(codec, k, seed):
     rng = np.random.default_rng(seed)
     _, _, bpb, wpb = CODEC_GEOMETRY[codec]
     if codec == "mxfp4":
-        wire = synth_wire(rng, codec, bpb, E * N * (k // wpb))
-        return mx.array(wire.reshape(E, N, (k // wpb) * bpb))
-    wf = mx.array(rng.standard_normal((E * N, k)).astype(np.float32) * 0.1)
+        wire = synth_wire(rng, codec, bpb, E * n * (k // wpb))
+        return mx.array(wire.reshape(E, n, (k // wpb) * bpb))
+    wf = mx.array(rng.standard_normal((E * n, k)).astype(np.float32) * 0.1)
     wq, _ = kq.quantize(wf, codec)
-    return wq.reshape(E, N, -1)
+    return wq.reshape(E, n, -1)
 
 
 @pytest.mark.skipif(
@@ -551,20 +551,42 @@ def _seg_experts(codec, k, seed):
     reason="gather_qmm_seg is Metal-only.",
 )
 @pytest.mark.parametrize(
-    "codec,k",
-    [("q4_k", 1024), ("q4_1", 1024), ("q8_0", 1024), ("mxfp4", 1024), ("q8_0", 96)],
-    ids=["q4_k", "q4_1", "q8_0", "mxfp4", "q8_0_alu"],
+    "codec,k,n",
+    [
+        ("q4_k", 1024, N),
+        ("q6_k", 1024, N),
+        ("q3_k", 1024, N),
+        ("q4_1", 1024, N),
+        ("q8_0", 1024, N),
+        ("mxfp4", 1024, N),
+        ("q6_k", 1024, 72),
+        ("q4_1", 1024, 72),
+        ("q8_0", 96, N),
+    ],
+    ids=[
+        "q4_k",
+        "q6_k",
+        "q3_k",
+        "q4_1",
+        "q8_0",
+        "mxfp4",
+        "q6_k_n72",
+        "q4_1_n72",
+        "q8_0_alu",
+    ],
 )
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-def test_gather_qmm_seg_tile128_matches_tile64(codec, k, dtype, monkeypatch):
+def test_gather_qmm_seg_tile128_matches_tile64(codec, k, n, dtype, monkeypatch):
     """The 128-row tile writes the bits of the 64-row tile under every K
     tile and grid layout: the NAX kernel's four row bands, its 128-deep K
-    walk and tile-on-x grid, and on k=96 (off the NAX kernel) the ALU
-    kernel's two 64-row halves. Segments sit on both sides of every 64-
-    and 128-row boundary."""
+    walk and tile-on-x grid, a partial last column tile at n=72, and on
+    k=96 (off the NAX kernel) the ALU kernel's two 64-row halves. Segments
+    sit on both sides of every 64- and 128-row boundary. The buffer cache
+    is off, so an arm that skips rows cannot read them from a freed
+    output of an earlier arm."""
     import mlx_kquant as kq
 
-    w = _seg_experts(codec, k, 43)
+    w = _seg_experts(codec, k, 43, n)
     s = mx.zeros((1,), dtype=mx.uint8)
     counts = np.array([1, 0, 96, 127, 128, 129, 257, 64], dtype=np.int64)
     idx = _counts_to_indices(counts)
@@ -579,18 +601,25 @@ def test_gather_qmm_seg_tile128_matches_tile64(codec, k, dtype, monkeypatch):
         mx.eval(y)
         return y
 
-    monkeypatch.setenv("KQ_SEG_GX", "0")
-    monkeypatch.setenv("KQ_SEG_BK128", "0")
-    ref = seg(64)
-    assert np.isfinite(np.array(ref.astype(mx.float32))).all()
-    for gx, bk in (("0", "0"), ("32", "0"), ("32", "1"), ("7", "1")):
-        monkeypatch.setenv("KQ_SEG_GX", gx)
-        monkeypatch.setenv("KQ_SEG_BK128", bk)
-        for tile_rows in (64, 128):
-            got = seg(tile_rows)
-            assert mx.array_equal(got, ref).item(), (
-                f"{codec} k={k} {dtype} tile {tile_rows} gx {gx} bk128 {bk}"
-            )
+    mx.eval(x)
+    limit = mx.set_cache_limit(0)
+    mx.clear_cache()
+    try:
+        monkeypatch.setenv("KQ_SEG_GX", "0")
+        monkeypatch.setenv("KQ_SEG_BK128", "0")
+        ref = seg(64)
+        assert np.isfinite(np.array(ref.astype(mx.float32))).all()
+        for gx, bk in (("0", "0"), ("32", "0"), ("32", "1"), ("7", "1")):
+            monkeypatch.setenv("KQ_SEG_GX", gx)
+            monkeypatch.setenv("KQ_SEG_BK128", bk)
+            for tile_rows in (64, 128):
+                got = seg(tile_rows)
+                assert mx.array_equal(got, ref).item(), (
+                    f"{codec} k={k} n={n} {dtype} tile {tile_rows} gx {gx} bk128 {bk}"
+                )
+                del got
+    finally:
+        mx.set_cache_limit(limit)
 
 
 def test_seg_tile_rows_policy(monkeypatch):
