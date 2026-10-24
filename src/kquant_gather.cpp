@@ -1328,7 +1328,9 @@ void KQuantGatherQMMSeg::eval_gpu(
 #else
 
 int seg_tile_rows(int, int, int, const std::string&) {
-  return 64;
+  // No seg kernel runs here, so only the pin picks 128.
+  const int pinned = kq_env_choice("KQ_SEG_TILE_ROWS", {"64", "128"}, -1);
+  return pinned > 0 ? 128 : 64;
 }
 
 void KQuantExpertTileMap::eval_gpu(
