@@ -65,8 +65,9 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
   codecs run between 5% slower and 7% faster, depending on the shape.
 
   With `x_rows`, `x` is the unsorted activations and sorted row r reads row `x_rows[r]`, so the
-  caller passes the sort order instead of building the sorted copy. The NAX kernel reads the rows
-  in place; the other paths gather them first. `KQuantSwitchLinear` takes `x_rows` the same way.
+  caller passes each sorted row's source row instead of building the sorted copy. The NAX kernel
+  reads the rows in place; the other paths gather them first. `KQuantSwitchLinear` takes `x_rows`
+  the same way.
 
 On NAX GPUs, `quantized_matmul` transpose (decode-orientation) shapes route by row count M and
 output width N. Per-row qmv serves M 2 up to a per-codec limit, the mat-vec paths (`mv_ext`,

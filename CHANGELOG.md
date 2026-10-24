@@ -11,8 +11,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reading only the keys inside each query block's window. `starts` takes a left-padded batch.
 - `expert_tile_map` and `gather_qmm_seg` take `tile_rows` (64 or 128), and `seg_tile_rows`
   picks one for a sorted MoE prefill gather.
-- `gather_qmm_seg` and `KQuantSwitchLinear` take `x_rows`, the sort order of the rows, so a
-  sorted MoE prefill reads the activations in place instead of copying them into expert order.
+- `gather_qmm_seg` and `KQuantSwitchLinear` take `x_rows`, the activation row each sorted row
+  reads, so a sorted MoE prefill reads the activations in place instead of copying them into
+  expert order.
 
 ### Changed
 - On M5 and later GPUs, sorted MoE prefill gathers run 7-23% faster on `q6_k` experts and up to

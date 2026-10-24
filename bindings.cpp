@@ -2939,7 +2939,8 @@ NB_MODULE(_ext, m) {
         Segment-walking gather GEMM for expert-sorted MoE prefill.
 
         Args:
-            x (array): float activations [rows, K], rows pre-sorted by expert.
+            x (array): float activations [rows, K], rows pre-sorted by
+                expert, or with x_rows the unsorted activations [n, K].
             w (array): uint8 K-quant wire bytes shaped
                 (n_experts, out_dims, bytes_per_row).
             scales (array): vestigial placeholder; ignored by the kernel.
@@ -2949,18 +2950,19 @@ NB_MODULE(_ext, m) {
                 tile of a segment may be partial; its dead row fragments are
                 skipped in the MMA.
             counts (array): uint32 [1] valid-tile count. Valid tiles never
-                span experts and must cover every x row exactly once
+                span experts and must cover every sorted row exactly once
                 (uncovered output rows are left unwritten). Use
                 expert_tile_map to build both.
             tile_rows (int): the map's tile height, 64 or 128. Pass the
                 value the map was built with; seg_tile_rows picks one.
-            x_rows (array, optional): integer [rows], the x row of each
-                sorted row. x is then the unsorted activations, and the
-                sorted copy of x is never built where the matrix-unit
-                kernel runs.
+            x_rows (array, optional): integer [rows], the x row each sorted
+                row reads, each in [0, n) (not checked). An x row may be read
+                by several sorted rows or by none. The matrix-unit kernel
+                reads the rows in place; the other paths gather them first.
 
         Returns:
-            array: [rows, out_dims] (x.dtype, float32 -> bfloat16). Metal-only.
+            array: [rows, out_dims], one row per sorted row (x.dtype,
+            float32 -> bfloat16). Metal-only.
       )");
 
   m.def(
