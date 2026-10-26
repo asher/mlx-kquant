@@ -163,6 +163,7 @@ mx::array kq_dequantize_matmul(
     const mx::array& scales,
     const std::string& kquant_type,
     mx::Dtype out_type,
+    const std::optional<mx::array>& out_scale,
     mx::Stream s);
 
 } // namespace
@@ -302,6 +303,7 @@ mx::array quantized_matmul(
     const std::optional<mx::array>& lora_rows,
     const std::optional<mx::array>& lora_ids,
     const std::optional<mx::array>& lora_table,
+    const std::optional<mx::array>& out_scale,
     mx::StreamOrDevice s_) {
   if (w.dtype() != mx::uint8) {
     throw std::invalid_argument(
@@ -349,6 +351,30 @@ mx::array quantized_matmul(
         << w_inner_dims << ") for codec '" << codec->name
         << "' with transpose=" << std::boolalpha << transpose << ".";
     throw std::invalid_argument(msg.str());
+  }
+
+  // The output scale: mode 1 for one value, 2 for one per column.
+  int out_scale_mode = 0;
+  if (out_scale.has_value()) {
+    if (kquant_type != "nvfp4") {
+      throw std::invalid_argument(
+          "[mlx_kquant.quantized_matmul] out_scale is for nvfp4 weights, got "
+          "kquant_type '" +
+          kquant_type + "'.");
+    }
+    if (!transpose) {
+      throw std::invalid_argument(
+          "[mlx_kquant.quantized_matmul] out_scale needs transpose=True.");
+    }
+    if (out_scale->dtype() != mx::float32 || out_scale->ndim() != 1 ||
+        (out_scale->size() != 1 &&
+         out_scale->size() != static_cast<size_t>(w_outer_dims))) {
+      std::ostringstream msg;
+      msg << "[mlx_kquant.quantized_matmul] out_scale must be float32 of "
+          << "shape (1,) or (" << w_outer_dims << ",).";
+      throw std::invalid_argument(msg.str());
+    }
+    out_scale_mode = out_scale->size() == 1 ? 1 : 2;
   }
 
   // Output dtype: x.dtype(), with float32 promoted to bfloat16 (the NAX matmul
@@ -422,7 +448,8 @@ mx::array quantized_matmul(
             w_outer_dims,
             w_inner_dims);
       }
-      return kq_dequantize_matmul(x, w, scales, kquant_type, out_type, s);
+      return kq_dequantize_matmul(
+          x, w, scales, kquant_type, out_type, out_scale, s);
     }
   }
 #endif
@@ -457,6 +484,11 @@ mx::array quantized_matmul(
         s,
         op_inputs);
   }
+  // The scale goes last, after the LoRA inputs. A scale with memory and a
+  // dense layout, as a module parameter is, adds no node.
+  if (out_scale_mode != 0) {
+    op_inputs.push_back(kq_row_major(*out_scale, s));
+  }
   return mx::array(
       std::move(out_shape),
       out_type,
@@ -466,7 +498,8 @@ mx::array quantized_matmul(
           codec->weights_per_block,
           codec->bits,
           transpose,
-          lora_flags),
+          lora_flags,
+          out_scale_mode),
       std::move(op_inputs));
 }
 
@@ -478,16 +511,32 @@ mx::array kq_dequantize_matmul(
     const mx::array& scales,
     const std::string& kquant_type,
     mx::Dtype out_type,
+    const std::optional<mx::array>& out_scale,
     mx::Stream s) {
-  auto w_f = dequantize(w, scales, kquant_type, out_type, s);
-  auto y = mx::stop_gradient(
-      mx::matmul(mx::astype(x, out_type, s), mx::transpose(w_f, s), s), s);
+  if (!out_scale.has_value()) {
+    auto w_f = dequantize(w, scales, kquant_type, out_type, s);
+    auto y = mx::stop_gradient(
+        mx::matmul(mx::astype(x, out_type, s), mx::transpose(w_f, s), s), s);
+    auto shape = y.shape();
+    return mx::array(
+        std::move(shape),
+        out_type,
+        std::make_shared<KQuantDequantRoute>(s, kquant_type),
+        {y, x, w, scales});
+  }
+  // The unscaled product can pass the float16 range, so a float16 call
+  // multiplies in bfloat16, scales in float32 and rounds to float16 once.
+  const mx::Dtype mt = out_type == mx::float16 ? mx::bfloat16 : out_type;
+  auto w_f = dequantize(w, scales, kquant_type, mt, s);
+  auto y = mx::matmul(mx::astype(x, mt, s), mx::transpose(w_f, s), s);
+  y = mx::stop_gradient(
+      mx::astype(mx::multiply(y, *out_scale, s), out_type, s), s);
   auto shape = y.shape();
   return mx::array(
       std::move(shape),
       out_type,
       std::make_shared<KQuantDequantRoute>(s, kquant_type),
-      {y, x, w, scales});
+      {y, x, w, scales, *out_scale});
 }
 
 } // namespace
@@ -509,19 +558,27 @@ std::vector<mx::array> KQuantDequantRoute::vjp(
     const std::vector<mx::array>& cotangents,
     const std::vector<int>& argnums,
     const std::vector<mx::array>&) {
-  // primals = {y (stop_gradient), x, w, scales}, as KQuantMatmul::vjp: x
-  // gets the quantized matmul the other way, w and scales throw.
+  // primals = {y (stop_gradient), x, w, scales[, out_scale]}, as
+  // KQuantMatmul::vjp: x gets the quantized matmul the other way on the
+  // cotangent times the scale, w, scales and out_scale throw.
+  const bool scaled = primals.size() > 4;
   std::vector<mx::array> vjps;
   for (auto arg : argnums) {
     if (arg == 0) {
       vjps.push_back(cotangents[0]);
     } else if (arg == 1) {
+      mx::array cot = cotangents[0];
+      if (scaled) {
+        cot = mx::astype(
+            mx::multiply(cot, primals[4], stream()), cot.dtype(), stream());
+      }
       auto dx = quantized_matmul(
-          cotangents[0],
+          cot,
           primals[2],
           primals[3],
           kquant_type_,
           false,
+          std::nullopt,
           std::nullopt,
           std::nullopt,
           std::nullopt,
@@ -533,6 +590,9 @@ std::vector<mx::array> KQuantDequantRoute::vjp(
       throw std::invalid_argument(
           "[mlx_kquant] quantized_matmul vjp: no gradient wrt the quantized "
           "weights (the kquant base is frozen).");
+    } else if (arg == 4) {
+      throw std::invalid_argument(
+          "[mlx_kquant] quantized_matmul vjp: no gradient wrt out_scale.");
     } else {
       throw std::invalid_argument(
           "[mlx_kquant] quantized_matmul vjp: no gradient wrt scales.");
@@ -711,6 +771,7 @@ mx::array gather_qmm(
         std::move(scales),
         kquant_type,
         transpose,
+        std::nullopt,
         std::nullopt,
         std::nullopt,
         std::nullopt,

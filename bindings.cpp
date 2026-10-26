@@ -275,6 +275,7 @@ NB_MODULE(_ext, m) {
       "lora_rows"_a = nb::none(),
       "lora_ids"_a = nb::none(),
       "lora_table"_a = nb::none(),
+      "out_scale"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Quantized matmul: ``x @ dequant(w)`` for GGUF K-quant weights.
@@ -302,6 +303,11 @@ NB_MODULE(_ext, m) {
             lora_table (array, optional): int32 1-D remap applied to
                 ``lora_ids``: ``e = lora_table[lora_ids[i]]``, and an entry
                 below 0 skips the row. Needs ``lora_ids``.
+            out_scale (array, optional): float32 scale of the product, shape
+                (1,) or (N,): the result is ``out_scale * (x @ dequant(w).T)``,
+                with the LoRA delta added after it. nvfp4 with
+                ``transpose=True`` only (the per-tensor ``.scale`` of an
+                NVFP4 GGUF).
 
         Returns:
             array: the matmul result (x.dtype, float32 promoted to bfloat16).

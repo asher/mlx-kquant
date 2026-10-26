@@ -676,15 +676,22 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
     const constant int& /* vm */, // == r1ptg
     uint3 tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
-    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-  kq_mv_ext_impl<T, KqNvfp4Ext, r1ptg, nsg, nxpsg>(
-      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    KQ_OUT_SCALE_ARG) {
+  kq_mv_ext_impl<T, KqNvfp4Ext, r1ptg, nsg, nxpsg, true>(
+      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg, out_scale);
 }
 
 // NVFP4 mat-vec on the MXFP4 lane layout: lane `simd_lid` owns sub-scale
 // group simd_lid % 4 of superblock simd_lid / 4, 8 superblocks per pass; x is
 // read once into four float4 and reused across the unrolled rows.
-template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
+// kOutScale entries take the output scale (kq_out_scale.h).
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int results_per_simdgroup = 4,
+    bool kOutScale = false>
 METAL_FUNC void kq_nvfp4_qmv_impl(
     const device uint8_t* w,
     const device T* x,
@@ -693,7 +700,8 @@ METAL_FUNC void kq_nvfp4_qmv_impl(
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    const device float* out_scale = nullptr) {
   static_assert(group_size == KQ_NVFP4_SUPERBLOCK, "NVFP4 requires gs=64");
   static_assert(bits == 4, "NVFP4 requires bits=4");
   constexpr int num_simdgroups = 2;
@@ -738,12 +746,22 @@ METAL_FUNC void kq_nvfp4_qmv_impl(
   for (int row = 0; row < results_per_simdgroup; row++) {
     U r = simd_sum(result[row]);
     if (simd_lid == 0 && row < active_rows) {
+      if constexpr (kOutScale) {
+        if (kq_has_out_scale) {
+          r *= kq_out_scale_col(out_scale, out_row + row);
+        }
+      }
       y[out_row + row] = static_cast<T>(r);
     }
   }
 }
 
-template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int results_per_simdgroup = 4,
+    bool kOutScale = false>
 METAL_FUNC void kq_nvfp4_qmv_fast_impl(
     const device uint8_t* w,
     const device T* x,
@@ -752,9 +770,10 @@ METAL_FUNC void kq_nvfp4_qmv_fast_impl(
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
-  kq_nvfp4_qmv_impl<T, group_size, bits, results_per_simdgroup>(
-      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    uint simd_lid,
+    const device float* out_scale = nullptr) {
+  kq_nvfp4_qmv_impl<T, group_size, bits, results_per_simdgroup, kOutScale>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, out_scale);
 }
 
 // Sub-block loader (q4_k pattern): BCOLS==32 K-tiles walk the two 32-weight
@@ -902,7 +921,8 @@ template <
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    KQ_OUT_SCALE_ARG) {
   if constexpr (batched) {
     kq_adjust_matrix_offsets<T>(
         x,
@@ -925,8 +945,8 @@ template <
   threadgroup T Ws[BN * BK_padded];
   using LoaderW =
       KqNvfp4BlockLoader<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
-      w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, T, true>(
+      w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid, out_scale);
 }
 
 template <
@@ -1045,7 +1065,8 @@ template <typename T, int group_size, int bits, bool batched>
     const constant int64_t* /* s_strides */,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    KQ_OUT_SCALE_ARG) {
   if constexpr (batched) {
     int batch_M = x_shape[x_batch_ndims];
     kq_adjust_matrix_offsets<T>(
@@ -1061,8 +1082,8 @@ template <typename T, int group_size, int bits, bool batched>
         w_strides,
         tid);
   }
-  kq_nvfp4_qmv_fast_impl<T, group_size, bits>(
-      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+  kq_nvfp4_qmv_fast_impl<T, group_size, bits, 4, true>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, out_scale);
 }
 
 // Finer-tiled qmv_fast (see kq_mxfp4_qmv_fast_fine): 2 output rows per
@@ -1084,9 +1105,10 @@ template <typename T, int group_size, int bits, bool batched>
     const constant int64_t* /* s_strides */,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  kq_nvfp4_qmv_fast_impl<T, group_size, bits, 1>(
-      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    uint simd_lid [[thread_index_in_simdgroup]],
+    KQ_OUT_SCALE_ARG) {
+  kq_nvfp4_qmv_fast_impl<T, group_size, bits, 1, true>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, out_scale);
 }
 
 template <typename T, int group_size, int bits, bool batched>
@@ -1106,7 +1128,8 @@ template <typename T, int group_size, int bits, bool batched>
     const constant int64_t* /* s_strides */,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    KQ_OUT_SCALE_ARG) {
   if constexpr (batched) {
     int batch_M = x_shape[x_batch_ndims];
     kq_adjust_matrix_offsets<T>(
@@ -1122,8 +1145,8 @@ template <typename T, int group_size, int bits, bool batched>
         w_strides,
         tid);
   }
-  kq_nvfp4_qmv_impl<T, group_size, bits>(
-      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+  kq_nvfp4_qmv_impl<T, group_size, bits, 4, true>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, out_scale);
 }
 
 // Finer-tiled qmv (see kq_nvfp4_qmv_fast_fine): 2 output rows per threadgroup.
@@ -1144,9 +1167,10 @@ template <typename T, int group_size, int bits, bool batched>
     const constant int64_t* /* s_strides */,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  kq_nvfp4_qmv_impl<T, group_size, bits, 1>(
-      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    uint simd_lid [[thread_index_in_simdgroup]],
+    KQ_OUT_SCALE_ARG) {
+  kq_nvfp4_qmv_impl<T, group_size, bits, 1, true>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, out_scale);
 }
 
 // ---------------------------------------------------------------------------

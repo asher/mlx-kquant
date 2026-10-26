@@ -1237,7 +1237,8 @@ instantiate_kquant_gather_qmm_rhs_codec(128, 1, ptq1_0)
 // and rounds once. Float partials (P = float, the _pf32 kernels) keep the
 // result at that one output rounding; T partials add one T rounding per
 // slice. One thread per output element; cost is noise next to the GEMM
-// pass.
+// pass. With an output scale (kq_out_scale.h) the sum is scaled before the
+// rounding; n_cols is N, for mode 2.
 template <typename T, typename P = T>
 [[kernel]] void kq_qmm_splitk_accum(
     const device P* partials [[buffer(0)]],
@@ -1245,6 +1246,9 @@ template <typename T, typename P = T>
     const constant int& n_elems [[buffer(2)]],
     const constant int& splits [[buffer(3)]],
     const constant int& stride [[buffer(4)]],
+    const constant int& n_cols
+    [[buffer(5), function_constant(kq_has_out_scale)]],
+    KQ_OUT_SCALE_ARG,
     uint gid [[thread_position_in_grid]]) {
   if (gid >= static_cast<uint>(n_elems)) {
     return;
@@ -1253,6 +1257,9 @@ template <typename T, typename P = T>
   for (int z = 0; z < splits; ++z) {
     acc += static_cast<float>(
         partials[static_cast<int64_t>(z) * stride + gid]);
+  }
+  if (kq_has_out_scale) {
+    acc *= kq_out_scale_col(out_scale, gid % static_cast<uint>(n_cols));
   }
   y[gid] = static_cast<T>(acc);
 }
@@ -1274,4 +1281,5 @@ instantiate_kq_qmm_splitk_accum(bfloat16_t)
 instantiate_kq_qmm_splitk_accum(float16_t)
 instantiate_kq_qmm_splitk_accum_pf32(bfloat16_t)
 instantiate_kq_qmm_splitk_accum_pf32(float16_t)
+
     // clang-format on

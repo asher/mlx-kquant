@@ -55,7 +55,9 @@ void kquant_dequantize_parallel(
 
 // result[M, N] = x[M, K] @ dequant(w), accumulating in float. transpose_w=true
 // means `w` decodes to [N, K] (the row-major weight convention); otherwise
-// [K, N]. `w` is contiguous wire bytes for the full matrix.
+// [K, N]. `w` is contiguous wire bytes for the full matrix. out_scale, in
+// out_scale_mode 1 (out_scale[0]) or 2 (out_scale[n]), multiplies the float
+// result before the cast to T.
 template <typename T>
 void kquant_qmm_cpu(
     T* result,
@@ -65,7 +67,9 @@ void kquant_qmm_cpu(
     int N,
     int K,
     bool transpose_w,
-    const std::string& kquant_type);
+    const std::string& kquant_type,
+    const float* out_scale = nullptr,
+    int out_scale_mode = 0);
 
 // Small-M ceiling for the fused decode-then-dot GEMV path inside
 // kquant_qmm_cpu; larger M dequantizes once and runs a GEMM instead.

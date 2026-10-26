@@ -139,6 +139,9 @@ mx::array dequantize(
 // Stacked adapters: lora_a [S, K, r] and lora_b [S, r, N] with lora_ids
 // uint32 [rows], the stack entry of each row, remapped through lora_table
 // (1-D, entries < 0 skip the row) when given.
+// Optional out_scale (float32, [1] or [N], nvfp4 with transpose=true only):
+// the product is out_scale * (x @ dequant(w)^T), scaled in the kernel
+// before its one store and before the LoRA delta is added.
 mx::array quantized_matmul(
     mx::array x,
     mx::array w,
@@ -150,6 +153,7 @@ mx::array quantized_matmul(
     const std::optional<mx::array>& lora_rows = std::nullopt,
     const std::optional<mx::array>& lora_ids = std::nullopt,
     const std::optional<mx::array>& lora_table = std::nullopt,
+    const std::optional<mx::array>& out_scale = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // Bias-fused quantized matmul: x (float) @ dequant(w) + bias, fusing the add
@@ -1262,13 +1266,15 @@ class KQuantMatmul : public mx::Primitive {
       int group_size,
       int bits,
       bool transpose,
-      int lora_flags = 0)
+      int lora_flags = 0,
+      int out_scale_mode = 0)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         group_size_(group_size),
         bits_(bits),
         transpose_(transpose),
-        lora_flags_(lora_flags) {}
+        lora_flags_(lora_flags),
+        out_scale_mode_(out_scale_mode) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -1299,6 +1305,9 @@ class KQuantMatmul : public mx::Primitive {
   int bits_;
   bool transpose_;
   int lora_flags_; // kq_lora_prep flags; 0 = no LoRA epilogue
+  // kq_out_scale.h mode: 0 none, 1 one value, 2 one per column. The scale
+  // is the last input.
+  int out_scale_mode_;
 
   // The base route dispatch (Metal); eval_gpu runs it, then the epilogue.
   void eval_gpu_base(
@@ -1307,7 +1316,8 @@ class KQuantMatmul : public mx::Primitive {
 };
 
 // The output of a matmul that runs as dequantize then the stock matmul,
-// with the vjp of KQuantMatmul. inputs = {y, x, w, scales}, where y is the
+// with the vjp of KQuantMatmul. inputs = {y, x, w, scales[, out_scale]},
+// where y is the
 // product under stop_gradient; the output shares y's buffer. The gradient
 // wrt x runs the quantized matmul the other way, so no backward pass keeps
 // the dense copy, and the gradient wrt w or scales throws, as on the kernel.

@@ -106,7 +106,10 @@ class KQuantLinear(nn.Module):
     """Linear layer backed by GGUF kquant wire bytes.
 
     Stores ``weight`` as uint8 wire bytes shaped ``(output_dims, bytes_per_row)``
-    and dispatches via ``kq.quantized_matmul(..., transpose=True)``.
+    and dispatches via ``kq.quantized_matmul(..., transpose=True)``. An
+    ``out_scale`` set on an nvfp4 layer (float32, shape ``(1,)`` or
+    ``(output_dims,)``) scales the product before the bias:
+    ``out_scale * (x @ W.T) + bias``.
     """
 
     def __init__(self, in_dims: int, out_dims: int, bias: bool, codec: str):
@@ -154,6 +157,8 @@ class KQuantLinear(nn.Module):
             return kq.quantized_matmul_qmv_bias(
                 x, self["weight"], self["scales"], self["bias"], self.kquant_type, **lkw
             )
+        if "out_scale" in self:
+            lkw["out_scale"] = self["out_scale"]
         y = kq.quantized_matmul(
             x, self["weight"], self["scales"], self.kquant_type, transpose=True, **lkw
         )

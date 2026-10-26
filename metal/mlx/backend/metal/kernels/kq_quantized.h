@@ -4,6 +4,7 @@
 #include <metal_simdgroup>
 #include <metal_stdlib>
 
+#include "mlx/backend/metal/kernels/kq_out_scale.h"
 #include "mlx/backend/metal/kernels/kq_quantized_iq_tables.h"
 
 // Byte -> packed float bit patterns of (low-nibble value, high-nibble
@@ -109,7 +110,8 @@ struct kq_empty {};
 
 // U is the type of y: T for a whole matmul and for the split-K partials
 // of the plain kernels, float for the _pf32 kernels (float16 by default,
-// bfloat16 under KQ_SPLITK_F32=1).
+// bfloat16 under KQ_SPLITK_F32=1). kOutScale entries take the output scale
+// (kq_out_scale.h).
 template <
     typename T,
     typename LoaderW,
@@ -119,7 +121,8 @@ template <
     const int BN = 32,
     const int WM = 2,
     const int WN = 2,
-    typename U = T>
+    typename U = T,
+    const bool kOutScale = false>
 METAL_FUNC void kq_qmm_t_impl(
     const device uint8_t* w,
     const device T* x,
@@ -133,7 +136,8 @@ METAL_FUNC void kq_qmm_t_impl(
     uint3 tid,
     uint lid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    const device float* out_scale = nullptr) {
   static_assert(BK >= SIMD_SIZE, "BK should be >= SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be a multiple of SIMD_SIZE");
 
@@ -214,6 +218,25 @@ METAL_FUNC void kq_qmm_t_impl(
         mma_op.mma(Xs, Ws);
         loader_x.next();
         loader_w.next();
+      }
+    }
+  }
+
+  if constexpr (kOutScale) {
+    if (kq_has_out_scale) {
+      constexpr short NE = decltype(mma_op.Ctile)::kElemsPerFrag;
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < mma_t::TM; i++) {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < mma_t::TN; j++) {
+          thread auto& acc = mma_op.Ctile.frag_at(i, j);
+          STEEL_PRAGMA_UNROLL
+          for (short k = 0; k < NE; k++) {
+            const int n = mma_op.sn + j * mma_t::TN_stride + k;
+            acc[k] *=
+                n < num_outs ? kq_out_scale_col(out_scale, y_col + n) : 1.0f;
+          }
+        }
       }
     }
   }
@@ -700,7 +723,13 @@ struct KqExtDeq {
 // contiguous activation read below pairs each weight with its activation.
 // Non-batched (B == 1) only; x is row-contiguous [vm, K], y is [vm, N].
 // Derived from llama.cpp ggml-metal.metal (MIT); attribution in licenses/.
-template <typename T, typename Codec, short r1ptg, short nsg, short nxpsg>
+template <
+    typename T,
+    typename Codec,
+    short r1ptg,
+    short nsg,
+    short nxpsg,
+    bool kOutScale = false>
 METAL_FUNC void kq_mv_ext_impl(
     const device uint8_t* w,
     const device T* x,
@@ -709,7 +738,8 @@ METAL_FUNC void kq_mv_ext_impl(
     const constant int& out_vec_size, // N
     uint3 tgpig,
     ushort tiisg,
-    ushort sgitg) {
+    ushort sgitg,
+    const device float* out_scale = nullptr) {
   constexpr short nypsg = 32 / nxpsg; // output rows per simdgroup
   constexpr short chpb = Codec::superblock / 16; // 16-weight chunks per block
   const short tx = tiisg % nxpsg; // K position within the row group
@@ -777,6 +807,15 @@ METAL_FUNC void kq_mv_ext_impl(
   }
 
   if (tx == 0 && i01 < out_vec_size) {
+    if constexpr (kOutScale) {
+      if (kq_has_out_scale) {
+        const float sc = kq_out_scale_col(out_scale, i01);
+#pragma unroll
+        for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+          sumf[ir1] *= sc;
+        }
+      }
+    }
 #pragma unroll
     for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
       y[static_cast<int64_t>(i11 + ir1) * out_vec_size + i01] =

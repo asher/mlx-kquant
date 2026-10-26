@@ -813,6 +813,44 @@ static KqSplitkPartials kq_splitk_partials(mx::Dtype dt) {
   return kq_splitk_partials(dt, mode < 0 ? dt == mx::float16 : mode != 0);
 }
 
+// The output scale of a call (kq_out_scale.h): the float32 buffer and the
+// kernel mode, 1 for one value and 2 for one per column. Mode 0 is no scale.
+struct KqOutScale {
+  const array* buf = nullptr;
+  int mode = 0;
+  explicit operator bool() const {
+    return mode != 0;
+  }
+};
+
+// The partials of a split-K call with an output scale are float for
+// float16 activations whatever KQ_SPLITK_F32 says, since an unscaled
+// float16 partial can pass 65504.
+static KqSplitkPartials kq_splitk_partials(mx::Dtype dt, const KqOutScale& os) {
+  if (os && dt == mx::float16) {
+    return kq_splitk_partials(dt, true);
+  }
+  return kq_splitk_partials(dt);
+}
+
+// kname's pipeline. With an output scale, the mode is function constant
+// kq_fc_out_scale and the pipeline is keyed "<kname>_os<mode>".
+static MTL::ComputePipelineState*
+kq_get_kernel_os(Device& d, const std::string& kname, const KqOutScale& os) {
+  if (!os) {
+    return kq_get_kernel(d, kname);
+  }
+  mx::metal::MTLFCList fc = {
+      {&os.mode, MTL::DataType::DataTypeInt, kq_fc_out_scale}};
+  return kq_get_kernel(d, kname, kname + "_os" + std::to_string(os.mode), fc);
+}
+
+static void kq_bind_out_scale(CommandEncoder& ce, const KqOutScale& os) {
+  if (os) {
+    ce.set_input_array(*os.buf, kq_out_scale_slot);
+  }
+}
+
 // KQ_QMM_LOG set (any value): the quantized matmul and mat-vec kernels log
 // the kernel name and shape of each dispatch to stderr.
 static bool kq_qmm_log() {
@@ -941,7 +979,8 @@ void qmm_nax(
     int K,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os = {}) {
   int B = out.size() / M / N;
   int wm = 2, wn = 2, bm = 64, bn = 64, bk = 64;
   // Small-BM tile for small M: BM=64 wastes up to 75% of MMA issues on row
@@ -1086,7 +1125,7 @@ void qmm_nax(
   }
   kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
 
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel_os(d, kname, os);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
 
@@ -1099,6 +1138,7 @@ void qmm_nax(
   ce.set_bytes(N, c++);
   ce.set_bytes(M, c++);
   add_strides_and_shapes(ce, B <= 1, x, w, scales, c);
+  kq_bind_out_scale(ce, os);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -1117,7 +1157,8 @@ void qmm(
     int K,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os = {}) {
   // The op promotes float32 x to bfloat16 before constructing this primitive,
   // so x.dtype() is never float32 here and the NAX path stays eligible on the
   // dtype axis with no tf32 gate.
@@ -1136,7 +1177,8 @@ void qmm(
         K,
         d,
         s,
-        kquant_type);
+        kquant_type,
+        os);
   }
 
   int B = out.size() / M / N;
@@ -1184,7 +1226,7 @@ void qmm(
   }
   kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
 
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel_os(d, kname, os);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
 
@@ -1197,6 +1239,7 @@ void qmm(
   ce.set_bytes(N, c++);
   ce.set_bytes(M, c++);
   add_strides_and_shapes(ce, B <= 1, x, w, scales, c);
+  kq_bind_out_scale(ce, os);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -1353,6 +1396,37 @@ static std::string kq_splitk_accum_kname(
   return "kquant_qmm_splitk_accum_" + ts + suffix;
 }
 
+// Folds the [splits, M, N] partials into out in float32 with one rounding.
+// With an output scale the fold multiplies each sum by it first.
+static void kq_splitk_fold(
+    CommandEncoder& ce,
+    Device& d,
+    const array& partials,
+    array& out,
+    const std::string& ts,
+    const KqSplitkPartials& pp,
+    int splits,
+    int M,
+    int N,
+    const KqOutScale& os) {
+  ce.set_compute_pipeline_state(
+      kq_get_kernel_os(d, kq_splitk_accum_kname(ts, pp.suffix), os));
+  const int n_elems = M * N;
+  int c = 0;
+  ce.set_input_array(partials, c++);
+  ce.set_output_array(out, c++);
+  ce.set_bytes(n_elems, c++);
+  ce.set_bytes(splits, c++);
+  ce.set_bytes(n_elems, c++); // partial stride
+  if (os) {
+    ce.set_bytes(N, c++);
+    kq_bind_out_scale(ce, os);
+  }
+  MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
+  MTL::Size agroup(256, 1, 1);
+  ce.dispatch_threads(agrid, agroup);
+}
+
 // Split-K qmm_t for the small-M decode band and the mid-M band on non-NAX
 // GPUs (see kq_midm_splitk). The plain tile grid is only
 // ceil(N/64) x 1 threadgroups at decode shapes with M <= 32 (84 at
@@ -1376,14 +1450,15 @@ void qmm_splitk(
     int splits,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os = {}) {
   constexpr int wm = 2, wn = 2;
   const KqSplitkTile tile = kq_splitk_tile(M, kquant_type);
   const int bm = tile.bm;
   const int bn = tile.bn;
   const int k_partition = (K / group_size / splits) * group_size;
   const int part_stride = M * N;
-  const KqSplitkPartials pp = kq_splitk_partials(x.dtype());
+  const KqSplitkPartials pp = kq_splitk_partials(x.dtype(), os);
 
   array partials({splits, M, N}, pp.dtype, nullptr, {});
   partials.set_data(mx::allocator::malloc(partials.nbytes()));
@@ -1413,19 +1488,7 @@ void qmm_splitk(
   kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 
-  const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
-  auto accum = kq_get_kernel(d, aname);
-  ce.set_compute_pipeline_state(accum);
-  const int n_elems = M * N;
-  c = 0;
-  ce.set_input_array(partials, c++);
-  ce.set_output_array(out, c++);
-  ce.set_bytes(n_elems, c++);
-  ce.set_bytes(splits, c++);
-  ce.set_bytes(part_stride, c++);
-  MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
-  MTL::Size agroup(256, 1, 1);
-  ce.dispatch_threads(agrid, agroup);
+  kq_splitk_fold(ce, d, partials, out, type_string, pp, splits, M, N, os);
 }
 
 // Register-resident MMA verify for M <= 8 (kq_verify_mma.h): each
@@ -1594,12 +1657,17 @@ static MTL::ComputePipelineState* kq_verify_nax_pipeline(
     const std::string& kname,
     const std::string& suffix,
     const array& x,
-    std::string& vname) {
+    std::string& vname,
+    const KqOutScale& os = {}) {
   bool x16 = reinterpret_cast<uintptr_t>(x.data<char>()) % 16 == 0 &&
       kq_vnax_x16_enabled();
   mx::metal::MTLFCList fc = {{&x16, MTL::DataType::DataTypeBool, 40}};
   vname = kname.substr(0, kname.size() - suffix.size()) +
       (x16 ? "_x16" : "_x8") + suffix;
+  if (os) {
+    fc.emplace_back(&os.mode, MTL::DataType::DataTypeInt, kq_fc_out_scale);
+    vname += "_os" + std::to_string(os.mode);
+  }
   return kq_get_kernel(d, kname, vname, fc);
 }
 
@@ -1617,13 +1685,16 @@ void verify_nax(
     int splits,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os = {}) {
   const int k_partition = (K / kstep / splits) * kstep;
   const int part_stride = M * N;
 
   auto& ce = mx::metal::get_command_encoder(s);
-  const KqSplitkPartials pp = splits > 1 ? kq_splitk_partials(x.dtype())
+  const KqSplitkPartials pp = splits > 1 ? kq_splitk_partials(x.dtype(), os)
                                          : KqSplitkPartials{x.dtype(), ""};
+  // One split scales in the kernel, more in the fold.
+  const KqOutScale kos = splits > 1 ? KqOutScale{} : os;
   array partials({splits, M, N}, pp.dtype, nullptr, {});
   if (splits > 1) {
     partials.set_data(mx::allocator::malloc(partials.nbytes()));
@@ -1635,7 +1706,7 @@ void verify_nax(
       kquant_type, type_string, group_size, bits, kstep, pp.suffix);
 
   std::string vname;
-  auto kernel = kq_verify_nax_pipeline(d, kname, pp.suffix, x, vname);
+  auto kernel = kq_verify_nax_pipeline(d, kname, pp.suffix, x, vname, kos);
   ce.set_compute_pipeline_state(kernel);
 
   int c = 0;
@@ -1648,6 +1719,7 @@ void verify_nax(
   ce.set_bytes(M, c++);
   ce.set_bytes(k_partition, c++);
   ce.set_bytes(part_stride, c++);
+  kq_bind_out_scale(ce, kos);
   MTL::Size group_dims(128, 1, 1);
   MTL::Size grid_dims((N + 127) / 128, 1, splits);
   kq_log_qmm(vname, M, N, K, grid_dims, group_dims, x);
@@ -1656,19 +1728,7 @@ void verify_nax(
     return;
   }
 
-  const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
-  auto accum = kq_get_kernel(d, aname);
-  ce.set_compute_pipeline_state(accum);
-  const int n_elems = M * N;
-  c = 0;
-  ce.set_input_array(partials, c++);
-  ce.set_output_array(out, c++);
-  ce.set_bytes(n_elems, c++);
-  ce.set_bytes(splits, c++);
-  ce.set_bytes(part_stride, c++);
-  MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
-  MTL::Size agroup(256, 1, 1);
-  ce.dispatch_threads(agrid, agroup);
+  kq_splitk_fold(ce, d, partials, out, type_string, pp, splits, M, N, os);
 }
 
 static int kq_verify_nax_splits(int N, int K, int kstep, const std::string& t);
@@ -1794,12 +1854,13 @@ void qmm_nax_splitk(
     Device& d,
     const Stream& s,
     const std::string& kquant_type,
-    int k_partition) {
+    int k_partition,
+    const KqOutScale& os = {}) {
   const int bm = kq_nax_splitk_bm(M);
   constexpr int bn = 64;
   constexpr int wm = 2, wn = 2;
   const int part_stride = M * N;
-  const KqSplitkPartials pp = kq_splitk_partials(x.dtype());
+  const KqSplitkPartials pp = kq_splitk_partials(x.dtype(), os);
 
   array partials({splits, M, N}, pp.dtype, nullptr, {});
   partials.set_data(mx::allocator::malloc(partials.nbytes()));
@@ -1829,19 +1890,7 @@ void qmm_nax_splitk(
   kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 
-  const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
-  auto accum = kq_get_kernel(d, aname);
-  ce.set_compute_pipeline_state(accum);
-  const int n_elems = M * N;
-  c = 0;
-  ce.set_input_array(partials, c++);
-  ce.set_output_array(out, c++);
-  ce.set_bytes(n_elems, c++);
-  ce.set_bytes(splits, c++);
-  ce.set_bytes(part_stride, c++);
-  MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
-  MTL::Size agroup(256, 1, 1);
-  ce.dispatch_threads(agrid, agroup);
+  kq_splitk_fold(ce, d, partials, out, type_string, pp, splits, M, N, os);
 }
 
 // Vector-times-matrix quantized kernel dispatch (no biases).
@@ -2025,7 +2074,8 @@ void qmv(
     int K,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os = {}) {
   int B = out.size() / M / N;
   int bn = kquant_qmv_bn(kquant_type);
   int bk = 32;
@@ -2043,12 +2093,12 @@ void qmv(
   // The split-K kernel takes M == 1, B == 1 unless KQ_QMV_SPLITK=0 or
   // KQ_QMV_FINE names a per-row tiling. Read live like KQ_QMV_FINE.
   const bool splitk_on = kq_env_int("KQ_QMV_SPLITK", 1) != 0;
-  if (M == 1 && B == 1 && splitk_on && qmv_fine_env == -1 &&
+  if (!os && M == 1 && B == 1 && splitk_on && qmv_fine_env == -1 &&
       qmv_splitk(
           x, w, scales, out, group_size, bits, N, K, d, s, kquant_type)) {
     return;
   }
-  if (M == 1 && B == 1 && qmv_fine_env == -1 &&
+  if (!os && M == 1 && B == 1 && qmv_fine_env == -1 &&
       qmv_c32(x, w, out, N, K, d, s, kquant_type)) {
     return;
   }
@@ -2079,7 +2129,7 @@ void qmv(
       B > 1 ? "_batch_1" : "_batch_0");
 
   kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel_os(d, kname, os);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
 
@@ -2091,6 +2141,7 @@ void qmv(
   ce.set_bytes(K, c++);
   ce.set_bytes(N, c++);
   add_strides_and_shapes(ce, B <= 1, x, w, scales, c);
+  kq_bind_out_scale(ce, os);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -2257,7 +2308,8 @@ void verify_mv_ext(
     int K,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os = {}) {
   constexpr int nsg = 2;
   constexpr int nxpsg = 8;
   // Wide-M rows-per-thread experiment (KQ_MV_EXT_NR=2): each thread owns two
@@ -2323,7 +2375,7 @@ void verify_mv_ext(
                                   : (use_hd ? "_hd" : ""))));
 
   kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel_os(d, kname, os);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
 
@@ -2335,6 +2387,7 @@ void verify_mv_ext(
   ce.set_bytes(K, c++); // in_vec_size
   ce.set_bytes(N, c++); // out_vec_size
   ce.set_bytes(M, c++); // vm (== r1ptg)
+  kq_bind_out_scale(ce, os);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -2352,8 +2405,9 @@ void dispatch_qmv(
     int K,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
-  qmv(x, w, scales, out, group_size, bits, M, N, K, d, s, kquant_type);
+    const std::string& kquant_type,
+    const KqOutScale& os = {}) {
+  qmv(x, w, scales, out, group_size, bits, M, N, K, d, s, kquant_type, os);
 }
 
 // Every wired codec has an mv_ext kernel: q8_0, the five K-quants, the
@@ -2665,19 +2719,22 @@ bool kq_forced_route(
     int K,
     Device& d,
     const Stream& s,
-    const std::string& t) {
+    const std::string& t,
+    const KqOutScale& os = {}) {
   const std::string r(route);
   // x is bound once the route serves the call, as in eval_gpu_base.
   auto x16 = [&] { return kq_x_aligned_gpu(x_in, s, "quantized_matmul x"); };
   const KQuantCodec* codec = codec_by_name(t);
   const int wpb = codec ? codec->weights_per_block : 256;
   if (r == "qmv") {
-    dispatch_qmv(x16(), w, scales, out, group_size, bits, M, N, K, d, s, t);
+    dispatch_qmv(x16(), w, scales, out, group_size, bits, M, N, K, d, s, t, os);
     return true;
   }
   if (r == "verify_qmv") {
-    if (M >= 2 && M <= verify_qmv_max_rows() && N % kquant_qmv_bn(t) == 0 &&
-        K % qmv_fast_k_align() == 0 && codec_has_verify_qmv(t)) {
+    // verify_qmv and verify_mma have no output scale epilogue.
+    if (!os && M >= 2 && M <= verify_qmv_max_rows() &&
+        N % kquant_qmv_bn(t) == 0 && K % qmv_fast_k_align() == 0 &&
+        codec_has_verify_qmv(t)) {
       verify_qmv(x16(), w, scales, out, group_size, bits, M, N, K, d, s, t);
       return true;
     }
@@ -2685,14 +2742,15 @@ bool kq_forced_route(
   }
   if (r == "mv_ext") {
     if (kq_codec_has_mv_ext(t) && M >= 2 && M <= 12 && K % wpb == 0) {
-      verify_mv_ext(x16(), w, scales, out, group_size, bits, M, N, K, d, s, t);
+      verify_mv_ext(
+          x16(), w, scales, out, group_size, bits, M, N, K, d, s, t, os);
       return true;
     }
     return false;
   }
   if (r == "verify_mma") {
     const int rows = codec_verify_mma_rows(t);
-    if (rows > 0 && M <= 8) {
+    if (!os && rows > 0 && M <= 8) {
       const int sp = kq_verify_mma_splits(N, K, group_size, rows);
       verify_mma(x16(), w, scales, out, group_size, bits, M, N, K, sp, d, s, t);
       return true;
@@ -2718,7 +2776,8 @@ bool kq_forced_route(
           sp,
           d,
           s,
-          t);
+          t,
+          os);
       return true;
     }
     return false;
@@ -2728,7 +2787,8 @@ bool kq_forced_route(
     const int target = (e != nullptr && std::atoi(e) > 1) ? std::atoi(e) : 16;
     const int sp = kq_split_count(target, K / group_size);
     if (kq_splitk_codec(t) && sp > 1) {
-      qmm_splitk(x16(), w, scales, out, group_size, bits, M, N, K, sp, d, s, t);
+      qmm_splitk(
+          x16(), w, scales, out, group_size, bits, M, N, K, sp, d, s, t, os);
       return true;
     }
     return false;
@@ -2737,7 +2797,7 @@ bool kq_forced_route(
       kq_is_nax_available() && codec_has_nax(t) && (K % 64 == 0);
   if (r == "nax") {
     if (nax_ok) {
-      qmm(x16(), w, scales, out, true, group_size, bits, M, N, K, d, s, t);
+      qmm(x16(), w, scales, out, true, group_size, bits, M, N, K, d, s, t, os);
       return true;
     }
     return false;
@@ -2765,7 +2825,8 @@ bool kq_forced_route(
           d,
           s,
           t,
-          per * q);
+          per * q,
+          os);
       return true;
     }
     return false;
@@ -2846,7 +2907,7 @@ bool KQuantMatmul::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMatmul&>(other);
   return kquant_type_ == o.kquant_type_ && group_size_ == o.group_size_ &&
       bits_ == o.bits_ && transpose_ == o.transpose_ &&
-      lora_flags_ == o.lora_flags_;
+      lora_flags_ == o.lora_flags_ && out_scale_mode_ == o.out_scale_mode_;
 }
 
 void KQuantMatmul::eval_cpu(
@@ -2871,11 +2932,19 @@ void KQuantMatmul::eval_cpu(
   encoder.set_output_array(out);
   std::vector<mx::array> lora =
       kq_lora_capture_cpu(inputs, 3, lora_flags_, encoder, stream());
+  // The output scale, when the call has one, is the last input.
+  std::optional<mx::array> os;
+  if (out_scale_mode_ != 0) {
+    os = mx::array::unsafe_weak_copy(inputs.back());
+    encoder.set_input_array(*os);
+  }
   encoder.dispatch([out = mx::array::unsafe_weak_copy(out),
                     x = mx::array::unsafe_weak_copy(x),
                     w = mx::array::unsafe_weak_copy(w),
                     lora = std::move(lora),
                     lora_flags = lora_flags_,
+                    os = std::move(os),
+                    os_mode = out_scale_mode_,
                     transpose_ = transpose_,
                     kquant_type = kquant_type_]() mutable {
     int K = x.shape(-1);
@@ -2902,7 +2971,9 @@ void KQuantMatmul::eval_cpu(
             N,
             K,
             transpose_,
-            kquant_type);
+            kquant_type,
+            os ? os->data<float>() : nullptr,
+            os_mode);
       }
       if (lora_flags & KQ_LORA_PRESENT) {
         kq_lora_epilogue_rows_cpu<T>(
@@ -2934,20 +3005,30 @@ std::vector<mx::array> KQuantMatmul::vjp(
     const std::vector<mx::array>& cotangents,
     const std::vector<int>& argnums,
     const std::vector<mx::array>&) {
-  // primals = {x, w (wire bytes), scales placeholder}. Only the gradient wrt x
-  // is defined: dL/dx = cotan @ dequant(w) with the transpose flipped, i.e. the
-  // same quantized matmul run the other way. The quantized base is frozen (the
-  // LoRA use case), so the weight/scale branches throw.
+  // primals = {x, w (wire bytes), scales placeholder[, out_scale]}. Only the
+  // gradient wrt x is defined: dL/dx = cotan @ dequant(w) with the transpose
+  // flipped, i.e. the same quantized matmul run the other way, on the
+  // cotangent times the output scale. The quantized base is frozen (the LoRA
+  // use case), so the weight/scale branches throw.
   if (lora_flags_ & KQ_LORA_PRESENT) {
     throw std::invalid_argument(
         "[mlx_kquant] quantized_matmul vjp: the LoRA epilogue is "
         "inference-only.");
   }
+  const int os_arg =
+      out_scale_mode_ != 0 ? static_cast<int>(primals.size()) - 1 : -1;
   std::vector<mx::array> vjps;
   for (auto arg : argnums) {
     if (arg == 0) {
+      mx::array cot = cotangents[0];
+      if (os_arg >= 0) {
+        cot = mx::astype(
+            mx::multiply(cot, primals[os_arg], stream()),
+            cot.dtype(),
+            stream());
+      }
       vjps.push_back(quantized_matmul(
-          cotangents[0],
+          cot,
           primals[1],
           primals[2],
           kquant_type_,
@@ -2957,7 +3038,11 @@ std::vector<mx::array> KQuantMatmul::vjp(
           std::nullopt,
           std::nullopt,
           std::nullopt,
+          std::nullopt,
           stream()));
+    } else if (arg == os_arg) {
+      throw std::invalid_argument(
+          "[mlx_kquant] quantized_matmul vjp: no gradient wrt out_scale.");
     } else if (arg == 1) {
       throw std::invalid_argument(
           "[mlx_kquant] quantized_matmul vjp: no gradient wrt the quantized "
@@ -3166,6 +3251,11 @@ void KQuantMatmul::eval_gpu_base(
   };
   const auto& w = inputs[1];
   const auto& scales = inputs[2];
+  // The output scale, when the call has one, is the last input.
+  KqOutScale os;
+  if (out_scale_mode_ != 0) {
+    os = {&inputs.back(), out_scale_mode_};
+  }
   kq_check_weight_base(w, kquant_type_, "quantized_matmul");
   out.set_data(mx::allocator::malloc(out.nbytes()));
   if (out.size() == 0) {
@@ -3218,7 +3308,8 @@ void KQuantMatmul::eval_gpu_base(
         K,
         d,
         s,
-        kquant_type_);
+        kquant_type_,
+        os);
     return;
   }
 
@@ -3246,7 +3337,8 @@ void KQuantMatmul::eval_gpu_base(
               K,
               d,
               s,
-              kquant_type_)) {
+              kquant_type_,
+              os)) {
         return;
       }
       const char* strict_e = std::getenv("KQ_QMM_ROUTE_STRICT");
@@ -3276,7 +3368,8 @@ void KQuantMatmul::eval_gpu_base(
           K,
           d,
           s,
-          kquant_type_);
+          kquant_type_,
+          os);
       return;
     }
     const int kstep = kq_verify_nax_call_kstep(K, kquant_type_);
@@ -3297,7 +3390,8 @@ void KQuantMatmul::eval_gpu_base(
           sp,
           d,
           s,
-          kquant_type_);
+          kquant_type_,
+          os);
       return;
     }
   }
@@ -3320,8 +3414,10 @@ void KQuantMatmul::eval_gpu_base(
         ? kq_verify_mma_min_m_nax(kquant_type_)
         : kq_verify_mma_min_m(kquant_type_, x.dtype() == mx::float16);
   }
-  const bool vmma_route = vmma_rows > 0 && vmma_min_m > 0 && M >= vmma_min_m &&
-      M <= 8 && transpose_ && non_batched && x.dtype() != mx::float32;
+  // verify_mma and verify_qmv have no output scale epilogue.
+  const bool vmma_route = !os && vmma_rows > 0 && vmma_min_m > 0 &&
+      M >= vmma_min_m && M <= 8 && transpose_ && non_batched &&
+      x.dtype() != mx::float32;
 
   // NAX split-K, entering at kq_splitk_nax_min_m through M32; see
   // qmm_nax_splitk. Slice unit max(block, BK) keeps every slice starting
@@ -3372,7 +3468,8 @@ void KQuantMatmul::eval_gpu_base(
           d,
           s,
           kquant_type_,
-          per * q);
+          per * q,
+          os);
       return;
     }
   }
@@ -3422,7 +3519,8 @@ void KQuantMatmul::eval_gpu_base(
           sp,
           d,
           s,
-          kquant_type_);
+          kquant_type_,
+          os);
       return;
     }
   }
@@ -3450,7 +3548,8 @@ void KQuantMatmul::eval_gpu_base(
         K,
         d,
         s,
-        kquant_type_);
+        kquant_type_,
+        os);
     return;
   }
 
@@ -3479,7 +3578,8 @@ void KQuantMatmul::eval_gpu_base(
             sp,
             d,
             s,
-            kquant_type_);
+            kquant_type_,
+            os);
         return;
       }
     }
@@ -3521,7 +3621,8 @@ void KQuantMatmul::eval_gpu_base(
             d,
             s,
             kquant_type_,
-            per * q);
+            per * q,
+            os);
         return;
       }
     }
@@ -3545,7 +3646,8 @@ void KQuantMatmul::eval_gpu_base(
           K,
           d,
           s,
-          kquant_type_);
+          kquant_type_,
+          os);
       return;
     }
   }
@@ -3596,7 +3698,19 @@ void KQuantMatmul::eval_gpu_base(
         (verify_ext == 1 ||
          (verify_ext != 0 && mv_ext_default_on && mv_ext_width_ok))) {
       verify_mv_ext(
-          x, w, scales, out, group_size_, bits_, M, N, K, d, s, kquant_type_);
+          x,
+          w,
+          scales,
+          out,
+          group_size_,
+          bits_,
+          M,
+          N,
+          K,
+          d,
+          s,
+          kquant_type_,
+          os);
       return;
     }
     // Verify / small-batch regime: amortize the weight read across the M rows
@@ -3608,7 +3722,7 @@ void KQuantMatmul::eval_gpu_base(
       return e != nullptr && e[0] == '1';
     }();
     int bn = kquant_qmv_bn(kquant_type_);
-    bool verify_ok = !verify_disabled && non_batched && M >= 2 &&
+    bool verify_ok = !os && !verify_disabled && non_batched && M >= 2 &&
         M <= verify_qmv_max_rows() && (N % bn == 0) &&
         (K % qmv_fast_k_align() == 0) && codec_has_verify_qmv(kquant_type_);
     if (verify_ok) {
@@ -3617,7 +3731,7 @@ void KQuantMatmul::eval_gpu_base(
       return;
     }
     dispatch_qmv(
-        x, w, scales, out, group_size_, bits_, M, N, K, d, s, kquant_type_);
+        x, w, scales, out, group_size_, bits_, M, N, K, d, s, kquant_type_, os);
     return;
   }
 

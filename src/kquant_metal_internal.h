@@ -10,6 +10,7 @@
 
 #ifdef _METAL_
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -464,17 +465,27 @@ inline void kq_require_kernel(
 constexpr int kq_fc_kquant_word = 370;
 bool kq_kquant_word_on();
 
+// Function constant 380 (kq_out_scale.h): the output scale mode of the
+// kernels that take one, with the scale buffer at kq_out_scale_slot.
+// kq_get_kernel gives mode 0 to a function that declares the constant when
+// the caller passes none.
+constexpr int kq_fc_out_scale = 380;
+constexpr int kq_out_scale_slot = 30;
+
 // Whether the codec has BK=128 NAX kernels (a pair or half loader).
 bool kq_nax_has_bk128(const std::string& t);
 
 // Whether the library function kname exists, and whether it declares the
-// constant named `fc`. Reads the unspecialized function once.
+// decode constant and the output scale constant. Reads the unspecialized
+// function once.
 struct KqFunctionInfo {
   bool exists = false;
   bool word = false;
+  bool out_scale = false;
 };
-inline KqFunctionInfo
-kq_function_info(MTL::Library* lib, const std::string& kname, const char* fc) {
+inline KqFunctionInfo kq_function_info(
+    MTL::Library* lib,
+    const std::string& kname) {
   auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
   auto fn = NS::TransferPtr(lib->newFunction(
       NS::String::string(kname.c_str(), NS::UTF8StringEncoding)));
@@ -484,16 +495,22 @@ kq_function_info(MTL::Library* lib, const std::string& kname, const char* fc) {
   }
   info.exists = true;
   NS::Dictionary* fcs = fn->functionConstantsDictionary();
-  info.word = fcs != nullptr &&
-      fcs->object(NS::String::string(fc, NS::UTF8StringEncoding)) != nullptr;
+  auto declares = [&](const char* fc) {
+    return fcs != nullptr &&
+        fcs->object(NS::String::string(fc, NS::UTF8StringEncoding)) != nullptr;
+  };
+  info.word = declares("kq_kquant_word");
+  info.out_scale = declares("kq_out_scale_fc");
   return info;
 }
 
 // The pipelines of one kq_get_kernel key: whether the function declares
-// the decode constant, and its pipeline for each value of the constant (a
-// function without it has one pipeline, in slot 1).
+// the decode constant and the output scale constant, and its pipeline for
+// each value of the decode constant (a function without it has one
+// pipeline, in slot 1).
 struct KqPipelines {
   bool word = false;
+  bool out_scale = false;
   MTL::ComputePipelineState* ps[2] = {nullptr, nullptr};
 };
 
@@ -539,8 +556,7 @@ inline MTL::ComputePipelineState* kq_get_kernel(
     std::unique_lock<std::shared_mutex> lock(mu);
     auto it = cache.find(key);
     if (it == cache.end()) {
-      const KqFunctionInfo info =
-          kq_function_info(lib, kname, "kq_kquant_word");
+      const KqFunctionInfo info = kq_function_info(lib, kname);
       if (!info.exists) {
         if (setting != nullptr) {
           throw kq_missing_kernel(setting, kname);
@@ -548,19 +564,29 @@ inline MTL::ComputePipelineState* kq_get_kernel(
         // The device raises its load error; nothing is cached.
         return d.get_kernel(kname, lib, key, func_consts);
       }
-      it = cache.emplace(key, KqPipelines{info.word, {nullptr, nullptr}}).first;
+      it = cache
+               .emplace(
+                   key,
+                   KqPipelines{info.word, info.out_scale, {nullptr, nullptr}})
+               .first;
     }
     KqPipelines& p = it->second;
     const int i = p.word ? on : 1;
     if (p.ps[i] == nullptr) {
+      mx::metal::MTLFCList fc = func_consts;
+      if (p.out_scale && std::none_of(fc.begin(), fc.end(), [](const auto& c) {
+            return std::get<2>(c) == kq_fc_out_scale;
+          })) {
+        static const int off = 0;
+        fc.emplace_back(&off, MTL::DataType::DataTypeInt, kq_fc_out_scale);
+      }
       if (p.word) {
         static const bool values[2] = {false, true};
-        mx::metal::MTLFCList fc = func_consts;
         fc.emplace_back(
             &values[i], MTL::DataType::DataTypeBool, kq_fc_kquant_word);
         p.ps[i] = d.get_kernel(kname, lib, i ? key : key + "_kw0", fc);
       } else {
-        p.ps[i] = d.get_kernel(kname, lib, key, func_consts);
+        p.ps[i] = d.get_kernel(kname, lib, key, fc);
       }
     }
     ps = p.ps[i];

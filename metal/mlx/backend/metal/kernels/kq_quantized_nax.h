@@ -29,7 +29,8 @@ template <
     const int WN = 2,
     const bool use_db = false,
     const bool tail_ksplit = false,
-    typename U = T>
+    typename U = T,
+    const bool kOutScale = false>
 METAL_FUNC void kq_qmm_t_nax_tgp_impl(
     const device uint8_t* w,
     const device T* x,
@@ -42,7 +43,8 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
-    const int k_len = -1) {
+    const int k_len = -1,
+    const device float* out_scale = nullptr) {
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
 
@@ -276,6 +278,40 @@ METAL_FUNC void kq_qmm_t_nax_tgp_impl(
             STEEL_PRAGMA_UNROLL
             for (short e = 0; e < NE; ++e) {
               Dtile.val_frags[f][e] += red[(f * NE + e) * SIMD_SIZE];
+            }
+          }
+        }
+      }
+
+      if constexpr (kOutScale) {
+        if (kq_has_out_scale) {
+          constexpr short NE = decltype(Dtile)::kElemsPerFrag;
+          constexpr short NF = decltype(Dtile)::kNumFrags;
+          if (kq_out_scale_mode == 2) {
+            // The column scales as a tile whose rows all read the same
+            // columns (a row stride of 0).
+            NAXTile<float, TM, TN> Stile;
+            const device float* sp = out_scale + y_col + tn;
+            if (sgp_sn == SN) {
+              Stile.load(sp, 0);
+            } else {
+              Stile.load_safe(sp, 0, short2(sgp_sn, SM));
+            }
+            STEEL_PRAGMA_UNROLL
+            for (short f = 0; f < NF; ++f) {
+              STEEL_PRAGMA_UNROLL
+              for (short e = 0; e < NE; ++e) {
+                Dtile.val_frags[f][e] *= Stile.val_frags[f][e];
+              }
+            }
+          } else {
+            const float sc = out_scale[0];
+            STEEL_PRAGMA_UNROLL
+            for (short f = 0; f < NF; ++f) {
+              STEEL_PRAGMA_UNROLL
+              for (short e = 0; e < NE; ++e) {
+                Dtile.val_frags[f][e] *= sc;
+              }
             }
           }
         }
@@ -2535,7 +2571,11 @@ struct KqNaxQ2_KBlockLoader {
   }
 };
 
-#define KQ_NAX_DEFINE_KERNELS(codec, GROUP_CONST, bits_val, LOADER)        \
+// OS 1 gives qmm_t_nax the output scale (kq_out_scale.h).
+#define KQ_NAX_DEFINE_KERNELS(codec, GROUP_CONST, bits_val, LOADER) \
+  KQ_NAX_DEFINE_KERNELS_OS(codec, GROUP_CONST, bits_val, LOADER, 0)
+
+#define KQ_NAX_DEFINE_KERNELS_OS(codec, GROUP_CONST, bits_val, LOADER, OS) \
   template <                                                               \
       typename T,                                                          \
       int group_size,                                                      \
@@ -2566,7 +2606,7 @@ struct KqNaxQ2_KBlockLoader {
       uint3 tgp_grid [[threadgroups_per_grid]],                            \
       uint lid [[thread_index_in_threadgroup]],                            \
       uint simd_gid [[simdgroup_index_in_threadgroup]],                    \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                       \
+      uint simd_lid [[thread_index_in_simdgroup]] KQ_OS_ARG_##OS) {        \
     static_assert(                                                         \
         group_size == GROUP_CONST,                                         \
         #codec " NAX kernel requires group_size=" #GROUP_CONST);           \
@@ -2613,7 +2653,22 @@ struct KqNaxQ2_KBlockLoader {
         BN,                                                                \
         WM,                                                                \
         WN,                                                                \
-        kWsBufs == 2>(w, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid); \
+        kWsBufs == 2,                                                      \
+        false,                                                             \
+        T,                                                                 \
+        OS>(                                                               \
+        w,                                                                 \
+        x,                                                                 \
+        y,                                                                 \
+        Ws,                                                                \
+        K,                                                                 \
+        N,                                                                 \
+        M,                                                                 \
+        tid,                                                               \
+        lid,                                                               \
+        simd_gid,                                                          \
+        simd_lid,                                                          \
+        -1 KQ_OS_PTR_##OS);                                                \
   }                                                                        \
                                                                            \
   template <typename T, int group_size, int bits, bool batched>            \
@@ -4208,7 +4263,7 @@ KQ_NAX_DEFINE_KERNELS(iq1_m, 256, 1, KqNaxIq1_mBlockLoader)
 KQ_NAX_DEFINE_KERNELS(stq1_0, 256, 1, KqNaxStq1_0BlockLoader)
 KQ_NAX_DEFINE_KERNELS(pq2_0, 128, 2, KqNaxPq2_0BlockLoader)
 KQ_NAX_DEFINE_KERNELS(q2_0, 64, 2, KqNaxQ2_0BlockLoader)
-KQ_NAX_DEFINE_KERNELS(nvfp4, 64, 4, KqNaxNvfp4BlockLoader)
+KQ_NAX_DEFINE_KERNELS_OS(nvfp4, 64, 4, KqNaxNvfp4BlockLoader, 1)
 KQ_NAX_DEFINE_KERNELS(ptq1_0, 128, 1, KqNaxPtq1_0BlockLoader)
 KQ_NAX_DEFINE_KERNELS(q4_0, 32, 4, KqNaxQ4_0BlockLoader)
 KQ_NAX_DEFINE_KERNELS(q4_1, 32, 4, KqNaxQ4_1BlockLoader)
