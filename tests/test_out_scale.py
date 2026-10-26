@@ -5,8 +5,8 @@ applied to the float32 sum before the one store, or in the split-K fold.
 So on every route:
 
 - a scale of ones gives the bits of no scale;
-- a power-of-two scale gives the unscaled bits times the scale wherever
-  the result is a normal number;
+- a power-of-two scale (per column, 2^-10 to 2^-13 at random) gives the
+  unscaled bits times the scale wherever the result is a normal number;
 - real scales (5e-5 to 4.4e-4, the range of an Nvidia NVFP4 file) keep the
   float64 bound of test_fp4_scale_range, times the scale;
 - float16 activations whose unscaled product passes 65504 give finite,
@@ -15,7 +15,8 @@ So on every route:
 The LoRA delta is added after the scale, the gradient wrt x is
 W^T (s * dy), KQuantLinear adds its bias after the scale, and the
 dequantize route of GPUs before M5 scales in float32 after a bfloat16
-GEMM. N 200 puts a partial tile at the end of every route.
+GEMM. N 200 puts a partial tile at the end of every route, and N 2048
+at K 4096 takes the default per-row qmv and verify_nax of NAX GPUs.
 """
 
 from __future__ import annotations
@@ -42,16 +43,21 @@ MS = (1, 4, 8, 16, 64, 256)
 Z = mx.zeros((1,), mx.uint8)
 
 
-def _arms(bound):
+def _arms(bound, forced=True):
     """(name, env) per route arm. The CPU stream has one route; its NEON
     GEMV rounds activations to int8 by design, so only the bit checks run
-    it."""
+    it. verify_nax_1 runs verify_nax in one split, which scales in the
+    kernel; the default route does so at N 17408, K 5120."""
     if FORCE_CPU:
         neon = [] if bound else [("cpu_neon", {})]
         return [("cpu", {"KQ_CPU_NEON": "0"})] + neon
     strict = {"KQ_QMM_ROUTE_STRICT": "1"}
     arms = [("default", {}), ("alu", {"KQ_DISABLE_NAX": "1"})]
-    return arms + [(r, {"KQ_QMM_ROUTE": r, **strict}) for r in ROUTES]
+    if not forced:
+        return arms
+    arms += [(r, {"KQ_QMM_ROUTE": r, **strict}) for r in ROUTES]
+    one = {"KQ_QMM_ROUTE": "verify_nax", "KQ_VERIFY_NAX_SPLITS": "1", **strict}
+    return arms + [("verify_nax_1", one)]
 
 
 @contextlib.contextmanager
@@ -68,11 +74,11 @@ def _env(env):
                 os.environ[k] = v
 
 
-def _wire(n, lo, hi, seed=7):
+def _wire(n, lo, hi, seed=7, k=K):
     """nvfp4 rows of random codes with scale bytes lo to hi - 1."""
     rng = np.random.default_rng(seed)
-    w = rng.integers(0, 256, (n, K // 64, 36), dtype=np.uint8)
-    w[:, :, :4] = rng.integers(lo, hi, (n, K // 64, 4), dtype=np.uint8)
+    w = rng.integers(0, 256, (n, k // 64, 36), dtype=np.uint8)
+    w[:, :, :4] = rng.integers(lo, hi, (n, k // 64, 4), dtype=np.uint8)
     return w.reshape(n, -1)
 
 
@@ -81,8 +87,8 @@ def _w64(wire):
     return np.asarray(w).astype(np.float64)
 
 
-def _x(M, dtn, mult=1.0):
-    x = mx.random.normal((M, K), key=mx.random.key(M)) * mult
+def _x(M, dtn, mult=1.0, k=K):
+    x = mx.random.normal((M, k), key=mx.random.key(M)) * mult
     x = x.astype(getattr(mx, dtn))
     mx.eval(x)
     return x, np.asarray(x.astype(mx.float32)).astype(np.float64)
@@ -107,12 +113,12 @@ def _f64(a):
     return np.asarray(a.astype(mx.float32)).astype(np.float64)
 
 
-def _routes(x, w, scales, check, bound=False):
+def _routes(x, w, scales, check, bound=False, forced=True):
     """Runs each arm unscaled, then with each scale, and calls
     check(name, unscaled, [scaled...]). An arm that does not serve the
     unscaled call is skipped; one that serves it must serve the scaled ones."""
     ran = []
-    for name, env in _arms(bound):
+    for name, env in _arms(bound, forced):
         with _env(env):
             try:
                 y0 = _mm(x, w)
@@ -124,13 +130,11 @@ def _routes(x, w, scales, check, bound=False):
     return ran
 
 
-@pytest.mark.parametrize("dtn", ("bfloat16", "float16"))
-@pytest.mark.parametrize("N", (256, 200))
-@pytest.mark.parametrize("M", MS)
-def test_ones_and_powers_of_two(dtn, N, M):
-    w = mx.array(_wire(N, 0x08, 0x48))
-    x, _ = _x(M, dtn)
-    pow2_col = np.where(np.arange(N) % 2 == 0, 2.0**-11, 2.0**-13)
+def _ones_and_powers(dtn, N, M, k=K, forced=True):
+    w = mx.array(_wire(N, 0x08, 0x48, k=k))
+    x, _ = _x(M, dtn, k=k)
+    # Random exponents, so an index off by a tile width reads a wrong value.
+    pow2_col = np.exp2(-np.random.default_rng(5).integers(10, 14, N))
     scales = [
         np.ones(1, np.float32),
         np.ones(N, np.float32),
@@ -148,10 +152,24 @@ def test_ones_and_powers_of_two(dtn, N, M):
             got, exp = _bits(y), _bits(want)
             assert np.array_equal(got[normal], exp[normal]), name
 
-    ran = _routes(x, w, scales, check)
+    return _routes(x, w, scales, check, forced=forced)
+
+
+@pytest.mark.parametrize("dtn", ("bfloat16", "float16"))
+@pytest.mark.parametrize("N", (256, 200))
+@pytest.mark.parametrize("M", MS)
+def test_ones_and_powers_of_two(dtn, N, M):
+    ran = _ones_and_powers(dtn, N, M)
     assert "default" in ran or "cpu" in ran
     # The forced routes are the small-M band.
     assert FORCE_CPU or M > 32 or len(ran) > 2, ran
+
+
+@pytest.mark.parametrize("dtn", ("bfloat16", "float16"))
+@pytest.mark.parametrize("M", (2, 4, 8))
+def test_default_routes_on_wide_rows(dtn, M):
+    ran = _ones_and_powers(dtn, 2048, M, k=4096, forced=False)
+    assert "default" in ran or "cpu" in ran
 
 
 @pytest.mark.parametrize("M", (1, 8, 256))
