@@ -15,6 +15,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so float16 activations do not overflow.
 - `gather_qmm`, `gather_qmm_seg` and `KQuantSwitchLinear` take `out_scale` for `nvfp4` experts:
   one scale for all experts, per column, per expert, or per expert and column.
+- The fused MoE gathers and `quantized_matmul_multi` take the `.scale` of `nvfp4` weights,
+  including an `nvfp4` shared expert's, and apply it before the bias and the GLU activation.
 
 ### Changed
 - Up to 32 rows, a live LoRA adapter on `quantized_matmul`, `quantized_matmul_qmv_bias` and

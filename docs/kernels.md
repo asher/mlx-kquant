@@ -797,7 +797,9 @@ At M 8 the kernel runs 1.04-1.29x faster than NAX split-K from N 2048, and 1.5x 
 
 - `quantized_matmul_multi` - `[x @ W^T for W in weights]` for packed weights of one codec and one
   inner dim that read the same x, such as the q, k and v projections or the gate and up projections
-  of a transformer block. It returns one output per weight, as `quantized_matmul` would.
+  of a transformer block. It returns one output per weight, as `quantized_matmul` would. For
+  `nvfp4` weights, `out_scales` takes each weight's `.scale`, or None, as `out_scale` does on
+  `quantized_matmul`.
 
   On a NAX GPU (M5), at 2 to 8 activation rows, where `quantized_matmul` would take its verify_nax
   route on the widest weight, one dispatch computes the products of up to four weights. The row
@@ -1166,6 +1168,12 @@ The GLU activation is selected per model: plain SwiGLU/GELU, the clamped `silu_l
 (`silu(min(g, limit)) * clip(u, -limit, limit)`) that DeepSeek-V4's `LimitedSwiGLU` needs, or
 `swiglu_clamp` (gpt-oss clamped SwiGLU: biases added, sigmoid slope `alpha`, and a `(u + 1)` linear
 term; requires the expert biases and is instantiated for `mxfp4`/`nvfp4` only).
+
+`nvfp4` experts from an NVFP4 GGUF can carry a `.scale`. Pass it to the GLU gathers as
+`gate_scale` and `up_scale`, and to the down gathers as `out_scale`: one value, one per column, one
+per expert, or one per expert and column. An `nvfp4` shared expert takes its own one-value scale
+(`shexp_gate_scale` and `shexp_up_scale`, or `shexp_scale` on `gather_qmv_mix_kq`). Each scale
+multiplies its product inside the kernel, before the bias and the activation.
 
 At one activation row the grid codecs (iq1_s, iq1_m, iq2_xxs, iq2_xs, iq2_s, iq3_xxs and iq3_s)
 decode 32 weights per lane step, one 32-weight group of a block, where the other codecs decode 16.
