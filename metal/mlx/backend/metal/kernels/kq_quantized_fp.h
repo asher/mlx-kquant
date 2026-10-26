@@ -66,7 +66,7 @@ inline float kq_fp_ue4m3_scale(uint8_t v) {
 
 // ---------------------------------------------------------------------------
 // MXFP4 (structure cloned from IQ4_NL: same two-halves 16-byte qs, the fp16
-// scale replaced by the E8M0 byte and the int LUT by the E2M1 float LUT)
+// scale replaced by the E8M0 byte and the int LUT by the E2M1 decode)
 // ---------------------------------------------------------------------------
 
 template <typename T>
@@ -248,6 +248,7 @@ struct KqMxfp4BlockLoader {
   MLX_MTL_CONST short bytes_per_thread = n_reads / 2;
   MLX_MTL_CONST short half_block = weights_per_block / 2;
   static_assert(n_reads >= 2 && n_reads % 2 == 0, "MXFP4 needs even n_reads.");
+  static_assert(n_reads % 4 == 0, "MXFP4 decodes byte pairs.");
 
   const int src_ld;
   const int row_bytes;
@@ -289,12 +290,6 @@ struct KqMxfp4BlockLoader {
       dst[i + 1] = T(d * lo.y);
       dst[half_block + i] = T(d * hi.x);
       dst[half_block + i + 1] = T(d * hi.y);
-    }
-    if (bytes_per_thread % 2) {
-      const short i = bytes_per_thread - 1;
-      const uint8_t b = qs[i];
-      dst[i] = T(d * kq_fp_e2m1_value(uint(b & 0x0F)));
-      dst[half_block + i] = T(d * kq_fp_e2m1_value(uint(b >> 4)));
     }
   }
 

@@ -29,15 +29,9 @@
 // shims, and the decode must stay bit-identical to MLX's mode="mxfp4" path
 // (OCP E2M1 values, one E8M0 scale per 32 values).
 
-// E2M1 code c to its value without a table (the construction of
-// kq_fp_e2m1_value in kq_quantized_fp.h, kept local so this header stays
-// self-contained): code bits to half bits 11..9, sign to 15, times 2^14.
-inline float kq_fp4_e2m1_value(uint c) {
-  const half h = as_type<half>(ushort(((c & 7u) << 9) | ((c & 8u) << 12)));
-  return float(h * 16384.0h);
-}
-
-// Two codes at bits 0..3 and 16..19 of n to their values through one half2.
+// Two E2M1 codes at bits 0..3 and 16..19 of n to their values through one
+// half2, as kq_fp_e2m1_pair in kq_quantized_fp.h (kept local so this header
+// stays self-contained): code bits to half bits 11..9, sign to 15, times 2^14.
 inline float2 kq_fp4_e2m1_pair(uint n) {
   const half2 h =
       as_type<half2>(((n & 0x00070007u) << 9) | ((n & 0x00080008u) << 12));
