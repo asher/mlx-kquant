@@ -25,6 +25,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `nvfp4` and `mxfp4` matmuls decode fp4 values without a lookup table, with the same output.
   On M5 Max, `nvfp4` matmuls of 1 to 16 rows take 8 to 10% less time.
 
+### Fixed
+- A MoE layer whose shared expert uses another codec than its routed experts no longer prints
+  a `KQ_MOE_SX_SPLIT` warning when the lever is unset.
+
 ## [0.5.6]
 
 ### Added
