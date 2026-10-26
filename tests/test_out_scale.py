@@ -565,17 +565,24 @@ def test_gather_real_scales_against_float64(dtn):
 @pytest.mark.parametrize("dtn", ("bfloat16", "float16"))
 @pytest.mark.parametrize("sort", (False, True))
 def test_gather_gradient_wrt_x(dtn, sort):
-    N, B = 256, 64 if sort else 8
+    # Unsorted takes the mlx-lm decode layout, x [T, 1, 1, K] with top-2
+    # indices [T, 2]: the per-entry scale has two index dims and the
+    # gradient of each token sums its two entries.
+    N = 256
     wire = _stack(N, 0x30, 0x48)
     w = mx.array(wire.reshape(E, N, -1))
     w64 = np.stack([_w64(wire[e]) for e in range(E)])
     rng = np.random.default_rng(2)
-    eidx = rng.integers(0, E, B).astype(np.uint32)
     if sort:
-        eidx = np.sort(eidx)
-    x = mx.random.normal((B, 1, K), key=mx.random.key(3)).astype(getattr(mx, dtn))
+        eidx = np.sort(rng.integers(0, E, 64)).astype(np.uint32)
+        xshape = (64, 1, K)
+    else:
+        eidx = rng.integers(0, E, (4, 2)).astype(np.uint32)
+        xshape = (4, 1, 1, K)
+    x = mx.random.normal(xshape, key=mx.random.key(3)).astype(getattr(mx, dtn))
     s = _col_scales(E * N).reshape(E, N)
-    c = (mx.random.normal((B, 1, N), key=mx.random.key(5)) * 1e-3).astype(x.dtype)
+    c = mx.random.normal(eidx.shape + (1, N), key=mx.random.key(5)) * 1e-3
+    c = c.astype(x.dtype)
 
     def f(x, s):
         return kq.gather_qmm(
@@ -589,10 +596,15 @@ def test_gather_gradient_wrt_x(dtn, sort):
         )
 
     _, (g,) = mx.vjp(lambda x: f(x, mx.array(s)), [x], [c])
-    assert g.dtype == x.dtype
-    cs = _f64(c) * s[eidx][:, None, :]
-    ref = np.stack([cs[b] @ w64[e] for b, e in enumerate(eidx)])
-    bound = np.stack([np.abs(cs[b]) @ np.abs(w64[e]) for b, e in enumerate(eidx)])
+    assert g.dtype == x.dtype and g.shape == x.shape
+    cs = (_f64(c) * s[eidx][..., None, :]).reshape(-1, 1, N)
+    tok = np.arange(eidx.size) // (1 if sort else eidx.shape[-1])
+    ref = np.zeros((tok[-1] + 1, 1, K))
+    bound = np.zeros_like(ref)
+    for i, e in enumerate(eidx.ravel()):
+        ref[tok[i]] += cs[i] @ w64[e]
+        bound[tok[i]] += np.abs(cs[i]) @ np.abs(w64[e])
+    ref, bound = ref.reshape(x.shape), bound.reshape(x.shape)
     _bound_check(g, ref, bound, "bfloat16", tol=2.0**-6)
     with pytest.raises(ValueError, match="out_scale"):
         mx.vjp(lambda s: f(x, s), [mx.array(s)], [c])
