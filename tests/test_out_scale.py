@@ -47,7 +47,7 @@ def _arms(bound, forced=True):
     """(name, env) per route arm. The CPU stream has one route; its NEON
     GEMV rounds activations to int8 by design, so only the bit checks run
     it. verify_nax_1 runs verify_nax in one split, which scales in the
-    kernel; the default route does so at N 17408, K 5120."""
+    kernel; the default route does so at N 18944, K 3584."""
     if FORCE_CPU:
         neon = [] if bound else [("cpu_neon", {})]
         return [("cpu", {"KQ_CPU_NEON": "0"})] + neon
