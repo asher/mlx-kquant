@@ -108,6 +108,30 @@ MLX_MTL_CONST int SIMD_SIZE = 32;
 
 struct kq_empty {};
 
+// Multiplies the accumulators of a steel MMA tile by the output scale
+// (kq_out_scale.h) before the store. col0 is the output column of the
+// tile's first column, and n_valid columns from it are valid.
+template <typename MMA>
+METAL_FUNC void kq_mma_out_scale(
+    thread MMA& op,
+    const device float* s,
+    int col0,
+    short n_valid) {
+  constexpr short NE = decltype(op.Ctile)::kElemsPerFrag;
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < MMA::TM; i++) {
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < MMA::TN; j++) {
+      thread auto& acc = op.Ctile.frag_at(i, j);
+      STEEL_PRAGMA_UNROLL
+      for (short k = 0; k < NE; k++) {
+        const int n = op.sn + j * MMA::TN_stride + k;
+        acc[k] *= n < n_valid ? kq_out_scale_col(s, col0 + n) : 1.0f;
+      }
+    }
+  }
+}
+
 // U is the type of y: T for a whole matmul and for the split-K partials
 // of the plain kernels, float for the _pf32 kernels (float16 by default,
 // bfloat16 under KQ_SPLITK_F32=1). kOutScale entries take the output scale
@@ -224,20 +248,7 @@ METAL_FUNC void kq_qmm_t_impl(
 
   if constexpr (kOutScale) {
     if (kq_has_out_scale) {
-      constexpr short NE = decltype(mma_op.Ctile)::kElemsPerFrag;
-      STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < mma_t::TM; i++) {
-        STEEL_PRAGMA_UNROLL
-        for (short j = 0; j < mma_t::TN; j++) {
-          thread auto& acc = mma_op.Ctile.frag_at(i, j);
-          STEEL_PRAGMA_UNROLL
-          for (short k = 0; k < NE; k++) {
-            const int n = mma_op.sn + j * mma_t::TN_stride + k;
-            acc[k] *=
-                n < num_outs ? kq_out_scale_col(out_scale, y_col + n) : 1.0f;
-          }
-        }
-      }
+      kq_mma_out_scale(mma_op, out_scale, y_col, num_outs);
     }
   }
 
@@ -392,14 +403,16 @@ struct KqSegBlockMMA {
 
 // kq_qmm_t_impl specialization for one gather_qmm_seg tile: single M-tile at
 // x (grid.y indexes the tile map instead of rows), valid rows M <= BM, dead
-// row fragments skipped in the MMA.
+// row fragments skipped in the MMA. kOutScale entries take the output scale
+// of the tile's expert.
 template <
     typename T,
     typename LoaderW,
     const bool aligned_N,
     const int BM,
     const int BK,
-    const int BN>
+    const int BN,
+    const bool kOutScale = false>
 METAL_FUNC void kq_qmm_t_seg_impl(
     const device uint8_t* w,
     const device T* x,
@@ -411,7 +424,8 @@ METAL_FUNC void kq_qmm_t_seg_impl(
     const int M,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    const device float* out_scale = nullptr) {
   static_assert(BK >= SIMD_SIZE, "BK should be >= SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be a multiple of SIMD_SIZE");
 
@@ -479,6 +493,12 @@ METAL_FUNC void kq_qmm_t_seg_impl(
         loader_x.next();
         loader_w.next();
       }
+    }
+  }
+
+  if constexpr (kOutScale) {
+    if (kq_has_out_scale) {
+      kq_mma_out_scale(mma_op, out_scale, y_col, num_outs);
     }
   }
 
@@ -644,8 +664,9 @@ METAL_FUNC void kq_adjust_matrix_offsets(
   y += tid.z * output_stride;
 }
 
+// Returns the weight matrix index (the expert).
 template <typename T>
-METAL_FUNC void kq_adjust_matrix_offsets(
+METAL_FUNC uint32_t kq_adjust_matrix_offsets(
     const device T*& x,
     const device uint8_t*& w,
     const device uint32_t* lhs_indices,
@@ -685,6 +706,7 @@ METAL_FUNC void kq_adjust_matrix_offsets(
     w += elem_to_loc(w_idx, w_shape, w_strides, w_batch_ndims);
   }
   y += tid.z * output_stride;
+  return w_idx;
 }
 
 // Scaled chunk dequant for the ext mat-vec loops, reading constant-space
@@ -3041,268 +3063,324 @@ inline uchar2 kq_get_scale_min_k4_just2(int j, int k, const device uint8_t* q) {
 
 #include "mlx/backend/metal/kernels/kq_quantized_prism.h"
 
-#define KQUANT_DEFINE_GATHER_KERNELS(CODEC, LOADER)                   \
-  template <typename T, int group_size, int bits>                     \
-  [[kernel]] void kq_##CODEC##_gather_qmv_fast(                       \
-      const device uint8_t* w,                                        \
-      const device uint8_t* /* scales */,                             \
-      const device T* x,                                              \
-      const device uint32_t* lhs_indices,                             \
-      const device uint32_t* rhs_indices,                             \
-      device T* y,                                                    \
-      const constant int& in_vec_size,                                \
-      const constant int& out_vec_size,                               \
-      const constant int& x_batch_ndims,                              \
-      const constant int* x_shape,                                    \
-      const constant int64_t* x_strides,                              \
-      const constant int& w_batch_ndims,                              \
-      const constant int* w_shape,                                    \
-      const constant int64_t* w_strides,                              \
-      const constant int64_t* /* s_strides */,                        \
-      const constant int& batch_ndims,                                \
-      const constant int* batch_shape,                                \
-      const constant int64_t* lhs_strides,                            \
-      const constant int64_t* rhs_strides,                            \
-      uint3 tid [[threadgroup_position_in_grid]],                     \
-      uint simd_gid [[simdgroup_index_in_threadgroup]],               \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                  \
-    int M = x_shape[x_batch_ndims];                                   \
-    kq_adjust_matrix_offsets<T>(                                      \
-        x,                                                            \
-        w,                                                            \
-        lhs_indices,                                                  \
-        rhs_indices,                                                  \
-        y,                                                            \
-        out_vec_size * M,                                             \
-        batch_ndims,                                                  \
-        batch_shape,                                                  \
-        lhs_strides,                                                  \
-        rhs_strides,                                                  \
-        x_batch_ndims,                                                \
-        x_shape,                                                      \
-        x_strides,                                                    \
-        w_batch_ndims,                                                \
-        w_shape,                                                      \
-        w_strides,                                                    \
-        tid);                                                         \
-    kq_##CODEC##_qmv_fast_impl<T, group_size, bits>(                  \
-        w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid); \
-  }                                                                   \
-                                                                      \
-  template <typename T, int group_size, int bits>                     \
-  [[kernel]] void kq_##CODEC##_gather_qmv(                            \
-      const device uint8_t* w,                                        \
-      const device uint8_t* /* scales */,                             \
-      const device T* x,                                              \
-      const device uint32_t* lhs_indices,                             \
-      const device uint32_t* rhs_indices,                             \
-      device T* y,                                                    \
-      const constant int& in_vec_size,                                \
-      const constant int& out_vec_size,                               \
-      const constant int& x_batch_ndims,                              \
-      const constant int* x_shape,                                    \
-      const constant int64_t* x_strides,                              \
-      const constant int& w_batch_ndims,                              \
-      const constant int* w_shape,                                    \
-      const constant int64_t* w_strides,                              \
-      const constant int64_t* /* s_strides */,                        \
-      const constant int& batch_ndims,                                \
-      const constant int* batch_shape,                                \
-      const constant int64_t* lhs_strides,                            \
-      const constant int64_t* rhs_strides,                            \
-      uint3 tid [[threadgroup_position_in_grid]],                     \
-      uint simd_gid [[simdgroup_index_in_threadgroup]],               \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                  \
-    int M = x_shape[x_batch_ndims];                                   \
-    kq_adjust_matrix_offsets<T>(                                      \
-        x,                                                            \
-        w,                                                            \
-        lhs_indices,                                                  \
-        rhs_indices,                                                  \
-        y,                                                            \
-        out_vec_size * M,                                             \
-        batch_ndims,                                                  \
-        batch_shape,                                                  \
-        lhs_strides,                                                  \
-        rhs_strides,                                                  \
-        x_batch_ndims,                                                \
-        x_shape,                                                      \
-        x_strides,                                                    \
-        w_batch_ndims,                                                \
-        w_shape,                                                      \
-        w_strides,                                                    \
-        tid);                                                         \
-    kq_##CODEC##_qmv_impl<T, group_size, bits>(                       \
-        w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid); \
-  }                                                                   \
-                                                                      \
-  template <typename T, int group_size, int bits, bool aligned_N>     \
-  [[kernel]] void kq_##CODEC##_gather_qmm_t(                          \
-      const device uint8_t* w,                                        \
-      const device uint8_t* /* scales */,                             \
-      const device T* x,                                              \
-      const device uint32_t* lhs_indices,                             \
-      const device uint32_t* rhs_indices,                             \
-      device T* y,                                                    \
-      const constant int& K,                                          \
-      const constant int& N,                                          \
-      const constant int& M,                                          \
-      const constant int& x_batch_ndims,                              \
-      const constant int* x_shape,                                    \
-      const constant int64_t* x_strides,                              \
-      const constant int& w_batch_ndims,                              \
-      const constant int* w_shape,                                    \
-      const constant int64_t* w_strides,                              \
-      const constant int64_t* /* s_strides */,                        \
-      const constant int& batch_ndims,                                \
-      const constant int* batch_shape,                                \
-      const constant int64_t* lhs_strides,                            \
-      const constant int64_t* rhs_strides,                            \
-      uint3 tid [[threadgroup_position_in_grid]],                     \
-      uint lid [[thread_index_in_threadgroup]],                       \
-      uint simd_gid [[simdgroup_index_in_threadgroup]],               \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                  \
-    kq_adjust_matrix_offsets<T>(                                      \
-        x,                                                            \
-        w,                                                            \
-        lhs_indices,                                                  \
-        rhs_indices,                                                  \
-        y,                                                            \
-        M * N,                                                        \
-        batch_ndims,                                                  \
-        batch_shape,                                                  \
-        lhs_strides,                                                  \
-        rhs_strides,                                                  \
-        x_batch_ndims,                                                \
-        x_shape,                                                      \
-        x_strides,                                                    \
-        w_batch_ndims,                                                \
-        w_shape,                                                      \
-        w_strides,                                                    \
-        tid);                                                         \
-    constexpr int BM = 32, BK = 32, BN = 32;                          \
-    constexpr int BK_padded = (BK + 16 / sizeof(T));                  \
-    threadgroup T Xs[BM * BK_padded];                                 \
-    threadgroup T Ws[BN * BK_padded];                                 \
-    using LoaderW = LOADER<                                           \
-        T,                                                            \
-        BN,                                                           \
-        BK,                                                           \
-        BK_padded,                                                    \
-        /*reduction_dim=*/1,                                          \
-        /*tgp_size=*/2 * 2 * SIMD_SIZE>;                              \
-    kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN>(                 \
-        w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);   \
-  }                                                                   \
-                                                                      \
-  /* Segment-walking gather GEMM: x holds rows pre-sorted by expert;  \
-     seg_map is [n_tiles, 3] uint32 rows of (expert, row_start,       \
-     num_rows) with num_rows <= 64 * grid.z; only the last tile of a  \
-     segment may be partial and its dead row fragments are skipped in \
-     the MMA. One threadgroup per (N-tile, map tile, 64-row half);    \
-     grid.y indexes seg_map, clamped by tile_count[0] so a shape-only \
-     upper bound can be dispatched. Rows not covered by the map are   \
-     left unwritten. */                                               \
-  template <typename T, int group_size, int bits, bool aligned_N>     \
-  [[kernel]] void kq_##CODEC##_gather_qmm_seg_t(                      \
-      const device uint8_t* w,                                        \
-      const device uint8_t* /* scales */,                             \
-      const device T* x,                                              \
-      const device uint32_t* seg_map,                                 \
-      const device uint32_t* tile_count,                              \
-      device T* y,                                                    \
-      const constant int& K,                                          \
-      const constant int& N,                                          \
-      uint3 tid [[threadgroup_position_in_grid]],                     \
-      uint simd_gid [[simdgroup_index_in_threadgroup]],               \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                  \
-    if (tid.y >= tile_count[0]) {                                     \
-      return;                                                         \
-    }                                                                 \
-    constexpr int BM = 64, BK = 32, BN = 64;                          \
-    constexpr int BK_padded = (BK + 16 / sizeof(T));                  \
-    threadgroup T Xs[BM * BK_padded];                                 \
-    threadgroup T Ws[BN * BK_padded];                                 \
-    using LoaderW = LOADER<                                           \
-        T,                                                            \
-        BN,                                                           \
-        BK,                                                           \
-        BK_padded,                                                    \
-        /*reduction_dim=*/1,                                          \
-        /*tgp_size=*/2 * 2 * SIMD_SIZE>;                              \
-    const device uint32_t* seg = seg_map + 3 * tid.y;                 \
-    const int num_rows = static_cast<int>(seg[2]) - BM * int(tid.z);  \
-    if (num_rows <= 0) {                                              \
-      return;                                                         \
-    }                                                                 \
-    const int K_w =                                                   \
-        (K / LoaderW::weights_per_block) * LoaderW::bytes_per_block;  \
-    const int64_t row0 = int64_t(seg[1]) + BM * int64_t(tid.z);       \
-    w += static_cast<int64_t>(seg[0]) * N * K_w;                      \
-    x += row0 * K;                                                    \
-    y += row0 * N;                                                    \
-    kq_qmm_t_seg_impl<T, LoaderW, aligned_N, BM, BK, BN>(             \
-        w, x, y, Xs, Ws, K, N, num_rows, tid, simd_gid, simd_lid);    \
-  }                                                                   \
-                                                                      \
-  template <typename T, int group_size, int bits>                     \
-  [[kernel]] void kq_##CODEC##_gather_qmm_n(                          \
-      const device uint8_t* w,                                        \
-      const device uint8_t* /* scales */,                             \
-      const device T* x,                                              \
-      const device uint32_t* lhs_indices,                             \
-      const device uint32_t* rhs_indices,                             \
-      device T* y,                                                    \
-      const constant int& K,                                          \
-      const constant int& N,                                          \
-      const constant int& M,                                          \
-      const constant int& x_batch_ndims,                              \
-      const constant int* x_shape,                                    \
-      const constant int64_t* x_strides,                              \
-      const constant int& w_batch_ndims,                              \
-      const constant int* w_shape,                                    \
-      const constant int64_t* w_strides,                              \
-      const constant int64_t* /* s_strides */,                        \
-      const constant int& batch_ndims,                                \
-      const constant int* batch_shape,                                \
-      const constant int64_t* lhs_strides,                            \
-      const constant int64_t* rhs_strides,                            \
-      uint3 tid [[threadgroup_position_in_grid]],                     \
-      uint lid [[thread_index_in_threadgroup]],                       \
-      uint simd_gid [[simdgroup_index_in_threadgroup]],               \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                  \
-    kq_adjust_matrix_offsets<T>(                                      \
-        x,                                                            \
-        w,                                                            \
-        lhs_indices,                                                  \
-        rhs_indices,                                                  \
-        y,                                                            \
-        M * N,                                                        \
-        batch_ndims,                                                  \
-        batch_shape,                                                  \
-        lhs_strides,                                                  \
-        rhs_strides,                                                  \
-        x_batch_ndims,                                                \
-        x_shape,                                                      \
-        x_strides,                                                    \
-        w_batch_ndims,                                                \
-        w_shape,                                                      \
-        w_strides,                                                    \
-        tid);                                                         \
-    constexpr int BM = 32, BK = 32, BN = 32;                          \
-    constexpr int BK_padded = (BK + 16 / sizeof(T));                  \
-    constexpr int BN_padded = (BN + 16 / sizeof(T));                  \
-    threadgroup T Xs[BM * BK_padded];                                 \
-    threadgroup T Ws[BK * BN_padded];                                 \
-    using LoaderW = LOADER<                                           \
-        T,                                                            \
-        BK,                                                           \
-        BN,                                                           \
-        BN_padded,                                                    \
-        /*reduction_dim=*/0,                                          \
-        /*tgp_size=*/2 * 2 * SIMD_SIZE>;                              \
-    kq_qmm_n_impl<T, LoaderW, BM, BK, BN>(                            \
-        w, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);      \
+// OS 1 gives gather_qmv, gather_qmm_t and gather_qmm_seg_t the output scale
+// (kq_out_scale.h) of each entry's expert.
+#define KQ_GATHER_QMV_TPL_0
+#define KQ_GATHER_QMV_TPL_1 , 4, true
+#define KQ_GATHER_QMM_TPL_0
+#define KQ_GATHER_QMM_TPL_1 , 2, 2, T, true
+#define KQ_GATHER_SEG_TPL_0
+#define KQ_GATHER_SEG_TPL_1 , true
+#define KQUANT_DEFINE_GATHER_KERNELS(CODEC, LOADER) \
+  KQUANT_DEFINE_GATHER_KERNELS_OS(CODEC, LOADER, 0)
+
+#define KQUANT_DEFINE_GATHER_KERNELS_OS(CODEC, LOADER, OS)                   \
+  template <typename T, int group_size, int bits>                            \
+  [[kernel]] void kq_##CODEC##_gather_qmv_fast(                              \
+      const device uint8_t* w,                                               \
+      const device uint8_t* /* scales */,                                    \
+      const device T* x,                                                     \
+      const device uint32_t* lhs_indices,                                    \
+      const device uint32_t* rhs_indices,                                    \
+      device T* y,                                                           \
+      const constant int& in_vec_size,                                       \
+      const constant int& out_vec_size,                                      \
+      const constant int& x_batch_ndims,                                     \
+      const constant int* x_shape,                                           \
+      const constant int64_t* x_strides,                                     \
+      const constant int& w_batch_ndims,                                     \
+      const constant int* w_shape,                                           \
+      const constant int64_t* w_strides,                                     \
+      const constant int64_t* /* s_strides */,                               \
+      const constant int& batch_ndims,                                       \
+      const constant int* batch_shape,                                       \
+      const constant int64_t* lhs_strides,                                   \
+      const constant int64_t* rhs_strides,                                   \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]] KQ_OS_ARG_##OS) {          \
+    int M = x_shape[x_batch_ndims];                                          \
+    const uint32_t kq_e = kq_adjust_matrix_offsets<T>(                       \
+        x,                                                                   \
+        w,                                                                   \
+        lhs_indices,                                                         \
+        rhs_indices,                                                         \
+        y,                                                                   \
+        out_vec_size * M,                                                    \
+        batch_ndims,                                                         \
+        batch_shape,                                                         \
+        lhs_strides,                                                         \
+        rhs_strides,                                                         \
+        x_batch_ndims,                                                       \
+        x_shape,                                                             \
+        x_strides,                                                           \
+        w_batch_ndims,                                                       \
+        w_shape,                                                             \
+        w_strides,                                                           \
+        tid);                                                                \
+    (void)kq_e;                                                              \
+    kq_##CODEC##_qmv_fast_impl<T, group_size, bits KQ_GATHER_QMV_TPL_##OS>(  \
+        w,                                                                   \
+        x,                                                                   \
+        y,                                                                   \
+        in_vec_size,                                                         \
+        out_vec_size,                                                        \
+        tid,                                                                 \
+        simd_gid,                                                            \
+        simd_lid KQ_OS_AT_##OS(kq_e, out_vec_size));                         \
+  }                                                                          \
+                                                                             \
+  template <typename T, int group_size, int bits>                            \
+  [[kernel]] void kq_##CODEC##_gather_qmv(                                   \
+      const device uint8_t* w,                                               \
+      const device uint8_t* /* scales */,                                    \
+      const device T* x,                                                     \
+      const device uint32_t* lhs_indices,                                    \
+      const device uint32_t* rhs_indices,                                    \
+      device T* y,                                                           \
+      const constant int& in_vec_size,                                       \
+      const constant int& out_vec_size,                                      \
+      const constant int& x_batch_ndims,                                     \
+      const constant int* x_shape,                                           \
+      const constant int64_t* x_strides,                                     \
+      const constant int& w_batch_ndims,                                     \
+      const constant int* w_shape,                                           \
+      const constant int64_t* w_strides,                                     \
+      const constant int64_t* /* s_strides */,                               \
+      const constant int& batch_ndims,                                       \
+      const constant int* batch_shape,                                       \
+      const constant int64_t* lhs_strides,                                   \
+      const constant int64_t* rhs_strides,                                   \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]] KQ_OS_ARG_##OS) {          \
+    int M = x_shape[x_batch_ndims];                                          \
+    const uint32_t kq_e = kq_adjust_matrix_offsets<T>(                       \
+        x,                                                                   \
+        w,                                                                   \
+        lhs_indices,                                                         \
+        rhs_indices,                                                         \
+        y,                                                                   \
+        out_vec_size * M,                                                    \
+        batch_ndims,                                                         \
+        batch_shape,                                                         \
+        lhs_strides,                                                         \
+        rhs_strides,                                                         \
+        x_batch_ndims,                                                       \
+        x_shape,                                                             \
+        x_strides,                                                           \
+        w_batch_ndims,                                                       \
+        w_shape,                                                             \
+        w_strides,                                                           \
+        tid);                                                                \
+    (void)kq_e;                                                              \
+    kq_##CODEC##_qmv_impl<T, group_size, bits KQ_GATHER_QMV_TPL_##OS>(       \
+        w,                                                                   \
+        x,                                                                   \
+        y,                                                                   \
+        in_vec_size,                                                         \
+        out_vec_size,                                                        \
+        tid,                                                                 \
+        simd_gid,                                                            \
+        simd_lid KQ_OS_AT_##OS(kq_e, out_vec_size));                         \
+  }                                                                          \
+                                                                             \
+  template <typename T, int group_size, int bits, bool aligned_N>            \
+  [[kernel]] void kq_##CODEC##_gather_qmm_t(                                 \
+      const device uint8_t* w,                                               \
+      const device uint8_t* /* scales */,                                    \
+      const device T* x,                                                     \
+      const device uint32_t* lhs_indices,                                    \
+      const device uint32_t* rhs_indices,                                    \
+      device T* y,                                                           \
+      const constant int& K,                                                 \
+      const constant int& N,                                                 \
+      const constant int& M,                                                 \
+      const constant int& x_batch_ndims,                                     \
+      const constant int* x_shape,                                           \
+      const constant int64_t* x_strides,                                     \
+      const constant int& w_batch_ndims,                                     \
+      const constant int* w_shape,                                           \
+      const constant int64_t* w_strides,                                     \
+      const constant int64_t* /* s_strides */,                               \
+      const constant int& batch_ndims,                                       \
+      const constant int* batch_shape,                                       \
+      const constant int64_t* lhs_strides,                                   \
+      const constant int64_t* rhs_strides,                                   \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint lid [[thread_index_in_threadgroup]],                              \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]] KQ_OS_ARG_##OS) {          \
+    const uint32_t kq_e = kq_adjust_matrix_offsets<T>(                       \
+        x,                                                                   \
+        w,                                                                   \
+        lhs_indices,                                                         \
+        rhs_indices,                                                         \
+        y,                                                                   \
+        M * N,                                                               \
+        batch_ndims,                                                         \
+        batch_shape,                                                         \
+        lhs_strides,                                                         \
+        rhs_strides,                                                         \
+        x_batch_ndims,                                                       \
+        x_shape,                                                             \
+        x_strides,                                                           \
+        w_batch_ndims,                                                       \
+        w_shape,                                                             \
+        w_strides,                                                           \
+        tid);                                                                \
+    (void)kq_e;                                                              \
+    constexpr int BM = 32, BK = 32, BN = 32;                                 \
+    constexpr int BK_padded = (BK + 16 / sizeof(T));                         \
+    threadgroup T Xs[BM * BK_padded];                                        \
+    threadgroup T Ws[BN * BK_padded];                                        \
+    using LoaderW = LOADER<                                                  \
+        T,                                                                   \
+        BN,                                                                  \
+        BK,                                                                  \
+        BK_padded,                                                           \
+        /*reduction_dim=*/1,                                                 \
+        /*tgp_size=*/2 * 2 * SIMD_SIZE>;                                     \
+    kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN KQ_GATHER_QMM_TPL_##OS>( \
+        w,                                                                   \
+        x,                                                                   \
+        y,                                                                   \
+        Xs,                                                                  \
+        Ws,                                                                  \
+        K,                                                                   \
+        N,                                                                   \
+        M,                                                                   \
+        K,                                                                   \
+        tid,                                                                 \
+        lid,                                                                 \
+        simd_gid,                                                            \
+        simd_lid KQ_OS_AT_##OS(kq_e, N));                                    \
+  }                                                                          \
+                                                                             \
+  /* Segment-walking gather GEMM: x holds rows pre-sorted by expert;         \
+     seg_map is [n_tiles, 3] uint32 rows of (expert, row_start,              \
+     num_rows) with num_rows <= 64 * grid.z; only the last tile of a         \
+     segment may be partial and its dead row fragments are skipped in        \
+     the MMA. One threadgroup per (N-tile, map tile, 64-row half);           \
+     grid.y indexes seg_map, clamped by tile_count[0] so a shape-only        \
+     upper bound can be dispatched. Rows not covered by the map are          \
+     left unwritten. */                                                      \
+  template <typename T, int group_size, int bits, bool aligned_N>            \
+  [[kernel]] void kq_##CODEC##_gather_qmm_seg_t(                             \
+      const device uint8_t* w,                                               \
+      const device uint8_t* /* scales */,                                    \
+      const device T* x,                                                     \
+      const device uint32_t* seg_map,                                        \
+      const device uint32_t* tile_count,                                     \
+      device T* y,                                                           \
+      const constant int& K,                                                 \
+      const constant int& N,                                                 \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]] KQ_OS_ARG_##OS) {          \
+    if (tid.y >= tile_count[0]) {                                            \
+      return;                                                                \
+    }                                                                        \
+    constexpr int BM = 64, BK = 32, BN = 64;                                 \
+    constexpr int BK_padded = (BK + 16 / sizeof(T));                         \
+    threadgroup T Xs[BM * BK_padded];                                        \
+    threadgroup T Ws[BN * BK_padded];                                        \
+    using LoaderW = LOADER<                                                  \
+        T,                                                                   \
+        BN,                                                                  \
+        BK,                                                                  \
+        BK_padded,                                                           \
+        /*reduction_dim=*/1,                                                 \
+        /*tgp_size=*/2 * 2 * SIMD_SIZE>;                                     \
+    const device uint32_t* seg = seg_map + 3 * tid.y;                        \
+    const int num_rows = static_cast<int>(seg[2]) - BM * int(tid.z);         \
+    if (num_rows <= 0) {                                                     \
+      return;                                                                \
+    }                                                                        \
+    const int K_w =                                                          \
+        (K / LoaderW::weights_per_block) * LoaderW::bytes_per_block;         \
+    const int64_t row0 = int64_t(seg[1]) + BM * int64_t(tid.z);              \
+    w += static_cast<int64_t>(seg[0]) * N * K_w;                             \
+    x += row0 * K;                                                           \
+    y += row0 * N;                                                           \
+    kq_qmm_t_seg_impl<                                                       \
+        T,                                                                   \
+        LoaderW,                                                             \
+        aligned_N,                                                           \
+        BM,                                                                  \
+        BK,                                                                  \
+        BN KQ_GATHER_SEG_TPL_##OS>(                                          \
+        w,                                                                   \
+        x,                                                                   \
+        y,                                                                   \
+        Xs,                                                                  \
+        Ws,                                                                  \
+        K,                                                                   \
+        N,                                                                   \
+        num_rows,                                                            \
+        tid,                                                                 \
+        simd_gid,                                                            \
+        simd_lid KQ_OS_AT_##OS(seg[0], N));                                  \
+  }                                                                          \
+                                                                             \
+  template <typename T, int group_size, int bits>                            \
+  [[kernel]] void kq_##CODEC##_gather_qmm_n(                                 \
+      const device uint8_t* w,                                               \
+      const device uint8_t* /* scales */,                                    \
+      const device T* x,                                                     \
+      const device uint32_t* lhs_indices,                                    \
+      const device uint32_t* rhs_indices,                                    \
+      device T* y,                                                           \
+      const constant int& K,                                                 \
+      const constant int& N,                                                 \
+      const constant int& M,                                                 \
+      const constant int& x_batch_ndims,                                     \
+      const constant int* x_shape,                                           \
+      const constant int64_t* x_strides,                                     \
+      const constant int& w_batch_ndims,                                     \
+      const constant int* w_shape,                                           \
+      const constant int64_t* w_strides,                                     \
+      const constant int64_t* /* s_strides */,                               \
+      const constant int& batch_ndims,                                       \
+      const constant int* batch_shape,                                       \
+      const constant int64_t* lhs_strides,                                   \
+      const constant int64_t* rhs_strides,                                   \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint lid [[thread_index_in_threadgroup]],                              \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    kq_adjust_matrix_offsets<T>(                                             \
+        x,                                                                   \
+        w,                                                                   \
+        lhs_indices,                                                         \
+        rhs_indices,                                                         \
+        y,                                                                   \
+        M * N,                                                               \
+        batch_ndims,                                                         \
+        batch_shape,                                                         \
+        lhs_strides,                                                         \
+        rhs_strides,                                                         \
+        x_batch_ndims,                                                       \
+        x_shape,                                                             \
+        x_strides,                                                           \
+        w_batch_ndims,                                                       \
+        w_shape,                                                             \
+        w_strides,                                                           \
+        tid);                                                                \
+    constexpr int BM = 32, BK = 32, BN = 32;                                 \
+    constexpr int BK_padded = (BK + 16 / sizeof(T));                         \
+    constexpr int BN_padded = (BN + 16 / sizeof(T));                         \
+    threadgroup T Xs[BM * BK_padded];                                        \
+    threadgroup T Ws[BK * BN_padded];                                        \
+    using LoaderW = LOADER<                                                  \
+        T,                                                                   \
+        BK,                                                                  \
+        BN,                                                                  \
+        BN_padded,                                                           \
+        /*reduction_dim=*/0,                                                 \
+        /*tgp_size=*/2 * 2 * SIMD_SIZE>;                                     \
+    kq_qmm_n_impl<T, LoaderW, BM, BK, BN>(                                   \
+        w, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);             \
   }
 
 KQUANT_DEFINE_GATHER_KERNELS(q8_0, KqQ8_0BlockLoader)
@@ -3329,9 +3407,16 @@ KQUANT_DEFINE_GATHER_KERNELS(pq2_0, KqPq2_0BlockLoader)
 KQUANT_DEFINE_GATHER_KERNELS(q2_0, KqQ2_0BlockLoader)
 KQUANT_DEFINE_GATHER_KERNELS(ptq1_0, KqPtq1_0BlockLoader)
 KQUANT_DEFINE_GATHER_KERNELS(mxfp4, KqMxfp4BlockLoader)
-KQUANT_DEFINE_GATHER_KERNELS(nvfp4, KqNvfp4BlockLoader)
+KQUANT_DEFINE_GATHER_KERNELS_OS(nvfp4, KqNvfp4BlockLoader, 1)
 
 #undef KQUANT_DEFINE_GATHER_KERNELS
+#undef KQUANT_DEFINE_GATHER_KERNELS_OS
+#undef KQ_GATHER_QMV_TPL_0
+#undef KQ_GATHER_QMV_TPL_1
+#undef KQ_GATHER_QMM_TPL_0
+#undef KQ_GATHER_QMM_TPL_1
+#undef KQ_GATHER_SEG_TPL_0
+#undef KQ_GATHER_SEG_TPL_1
 
 // Split-K gathered M=1 mat-vec: the dense split-K mat-vec of the codec run
 // on batch entry tid.z after the gather offsets. KARG is the row width the
@@ -3412,7 +3497,8 @@ template <
     const bool aligned_N,
     const int BM = 64,
     const int BK = 32,
-    const int BN = 64>
+    const int BN = 64,
+    const bool kOutScale = false>
 METAL_FUNC void kq_gather_qmm_rhs_impl(
     const device T* x,
     const device uint8_t* w,
@@ -3425,7 +3511,8 @@ METAL_FUNC void kq_gather_qmm_rhs_impl(
     const constant int& K,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    const device float* out_scale = nullptr) {
   static_assert(BK >= SIMD_SIZE, "BK should be >= SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be a multiple of SIMD_SIZE");
 
@@ -3527,6 +3614,13 @@ METAL_FUNC void kq_gather_qmm_rhs_impl(
       }
     }
 
+    if constexpr (kOutScale) {
+      if (kq_has_out_scale) {
+        kq_mma_out_scale(
+            mma_op, kq_out_scale_at(out_scale, index, N), y_col, num_outs);
+      }
+    }
+
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (offset == 0 && offset_next == BM && (aligned_N || num_outs == BN)) {
       mma_op.store_result(y, N);
@@ -3541,7 +3635,14 @@ METAL_FUNC void kq_gather_qmm_rhs_impl(
 // rows per expert fragment each row tile into per-expert segments that each
 // pay a full-tile mma K-loop, so utilization is ~1/segments-per-tile. The
 // dispatch picks the largest BM not much above the batch's rows-per-expert.
-#define KQ_DEFINE_GATHER_QMM_RHS(CODEC, LOADER)                                \
+// OS 1 gives the kernel the output scale (kq_out_scale.h) of each
+// segment's expert.
+#define KQ_GATHER_RHS_TPL_0
+#define KQ_GATHER_RHS_TPL_1 , true
+#define KQ_DEFINE_GATHER_QMM_RHS(CODEC, LOADER) \
+  KQ_DEFINE_GATHER_QMM_RHS_OS(CODEC, LOADER, 0)
+
+#define KQ_DEFINE_GATHER_QMM_RHS_OS(CODEC, LOADER, OS)                         \
   template <typename T, int group_size, int bits, bool aligned_N, int BM>      \
   [[kernel]] void kq_##CODEC##_gather_qmm_rhs(                                 \
       const device T* x [[buffer(0)]],                                         \
@@ -3554,7 +3655,7 @@ METAL_FUNC void kq_gather_qmm_rhs_impl(
       const constant int& K [[buffer(7)]],                                     \
       uint3 tid [[threadgroup_position_in_grid]],                              \
       uint simd_gid [[simdgroup_index_in_threadgroup]],                        \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                           \
+      uint simd_lid [[thread_index_in_simdgroup]] KQ_OS_ARG_##OS) {            \
     (void)scales; /* wire-format blocks are self-scaled; no separate scales */ \
     constexpr int BK = 32, BN = 64;                                            \
     constexpr int BK_padded = (BK + 16 / sizeof(T));                           \
@@ -3570,8 +3671,25 @@ METAL_FUNC void kq_gather_qmm_rhs_impl(
         #CODEC " gather_qmm_rhs requires group_size == block size");           \
     threadgroup T Xs[BM * BK_padded];                                          \
     threadgroup T Ws[BN * BK_padded];                                          \
-    kq_gather_qmm_rhs_impl<T, LoaderW, aligned_N, BM, BK, BN>(                 \
-        x, w, indices, y, Xs, Ws, M, N, K, tid, simd_gid, simd_lid);           \
+    kq_gather_qmm_rhs_impl<                                                    \
+        T,                                                                     \
+        LoaderW,                                                               \
+        aligned_N,                                                             \
+        BM,                                                                    \
+        BK,                                                                    \
+        BN KQ_GATHER_RHS_TPL_##OS>(                                            \
+        x,                                                                     \
+        w,                                                                     \
+        indices,                                                               \
+        y,                                                                     \
+        Xs,                                                                    \
+        Ws,                                                                    \
+        M,                                                                     \
+        N,                                                                     \
+        K,                                                                     \
+        tid,                                                                   \
+        simd_gid,                                                              \
+        simd_lid KQ_OS_PTR_##OS);                                              \
   }
 
 KQ_DEFINE_GATHER_QMM_RHS(q8_0, KqQ8_0BlockLoader)
@@ -3598,6 +3716,9 @@ KQ_DEFINE_GATHER_QMM_RHS(pq2_0, KqPq2_0BlockLoader)
 KQ_DEFINE_GATHER_QMM_RHS(q2_0, KqQ2_0BlockLoader)
 KQ_DEFINE_GATHER_QMM_RHS(ptq1_0, KqPtq1_0BlockLoader)
 KQ_DEFINE_GATHER_QMM_RHS(mxfp4, KqMxfp4BlockLoader)
-KQ_DEFINE_GATHER_QMM_RHS(nvfp4, KqNvfp4BlockLoader)
+KQ_DEFINE_GATHER_QMM_RHS_OS(nvfp4, KqNvfp4BlockLoader, 1)
 
 #undef KQ_DEFINE_GATHER_QMM_RHS
+#undef KQ_DEFINE_GATHER_QMM_RHS_OS
+#undef KQ_GATHER_RHS_TPL_0
+#undef KQ_GATHER_RHS_TPL_1

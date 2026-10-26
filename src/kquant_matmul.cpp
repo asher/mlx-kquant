@@ -813,16 +813,6 @@ static KqSplitkPartials kq_splitk_partials(mx::Dtype dt) {
   return kq_splitk_partials(dt, mode < 0 ? dt == mx::float16 : mode != 0);
 }
 
-// The output scale of a call (kq_out_scale.h): the float32 buffer and the
-// kernel mode, 1 for one value and 2 for one per column. Mode 0 is no scale.
-struct KqOutScale {
-  const array* buf = nullptr;
-  int mode = 0;
-  explicit operator bool() const {
-    return mode != 0;
-  }
-};
-
 // The partials of a split-K call with an output scale are float for
 // float16 activations whatever KQ_SPLITK_F32 says, since an unscaled
 // float16 partial can pass 65504.
@@ -831,24 +821,6 @@ static KqSplitkPartials kq_splitk_partials(mx::Dtype dt, const KqOutScale& os) {
     return kq_splitk_partials(dt, true);
   }
   return kq_splitk_partials(dt);
-}
-
-// kname's pipeline. With an output scale, the mode is function constant
-// kq_fc_out_scale and the pipeline is keyed "<kname>_os<mode>".
-static MTL::ComputePipelineState*
-kq_get_kernel_os(Device& d, const std::string& kname, const KqOutScale& os) {
-  if (!os) {
-    return kq_get_kernel(d, kname);
-  }
-  mx::metal::MTLFCList fc = {
-      {&os.mode, MTL::DataType::DataTypeInt, kq_fc_out_scale}};
-  return kq_get_kernel(d, kname, kname + "_os" + std::to_string(os.mode), fc);
-}
-
-static void kq_bind_out_scale(CommandEncoder& ce, const KqOutScale& os) {
-  if (os) {
-    ce.set_input_array(*os.buf, kq_out_scale_slot);
-  }
 }
 
 // KQ_QMM_LOG set (any value): the quantized matmul and mat-vec kernels log

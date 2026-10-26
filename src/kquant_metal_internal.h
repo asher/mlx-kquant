@@ -612,6 +612,44 @@ kq_get_kernel(Device& d, const std::string& kname, const char* setting) {
   return kq_get_kernel(d, kname, kname, {}, setting);
 }
 
+// The output scale of a call (kq_out_scale.h): the float32 buffer and the
+// kernel mode, 1 one value, 2 one per column, 3 one per expert, 4 one per
+// expert and column. Mode 0 is no scale.
+struct KqOutScale {
+  const array* buf = nullptr;
+  int mode = 0;
+  explicit operator bool() const {
+    return mode != 0;
+  }
+};
+
+// kname's pipeline under the function constants fc and hash. With an output
+// scale, the mode is function constant kq_fc_out_scale and the hash gains
+// "_os<mode>".
+inline MTL::ComputePipelineState* kq_get_kernel_os(
+    Device& d,
+    const std::string& kname,
+    const std::string& hash,
+    mx::metal::MTLFCList fc,
+    const KqOutScale& os) {
+  if (!os) {
+    return kq_get_kernel(d, kname, hash, fc);
+  }
+  fc.emplace_back(&os.mode, MTL::DataType::DataTypeInt, kq_fc_out_scale);
+  return kq_get_kernel(d, kname, hash + "_os" + std::to_string(os.mode), fc);
+}
+
+inline MTL::ComputePipelineState*
+kq_get_kernel_os(Device& d, const std::string& kname, const KqOutScale& os) {
+  return kq_get_kernel_os(d, kname, kname, {}, os);
+}
+
+inline void kq_bind_out_scale(CommandEncoder& ce, const KqOutScale& os) {
+  if (os) {
+    ce.set_input_array(*os.buf, kq_out_scale_slot);
+  }
+}
+
 } // namespace mlx_kquant
 
 #endif // _METAL_

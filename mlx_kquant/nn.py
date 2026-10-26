@@ -180,7 +180,10 @@ class KQuantSwitchLinear(nn.Module):
     Counterpart to mlx_lm's QuantizedSwitchLinear (mode="affine"), but for kquant
     codecs. Stores ``weight`` as uint8 wire bytes shaped
     ``(n_experts, output_dims, bytes_per_row)`` and dispatches via
-    ``kq.gather_qmm(..., transpose=True)``.
+    ``kq.gather_qmm(..., transpose=True)``. An ``out_scale`` set on an nvfp4
+    layer (float32, shape ``(1,)``, ``(output_dims,)``, ``(n_experts, 1)`` or
+    ``(n_experts, output_dims)``) scales each expert's product before the
+    bias.
     """
 
     def __init__(
@@ -257,6 +260,7 @@ class KQuantSwitchLinear(nn.Module):
             rhs_indices=indices,
             transpose=True,
             sorted_indices=sorted_indices,
+            out_scale=self.get("out_scale"),
         )
         if "bias" in self:
             x = x + mx.expand_dims(self["bias"][indices], -2)
@@ -281,6 +285,7 @@ class KQuantSwitchLinear(nn.Module):
     def _sorted_expert_gemm(self, x, indices, x_rows=None):
         xf = x.reshape(indices.size if x_rows is None else -1, x.shape[-1])
         w, s, codec = self["weight"], self["scales"], self.kquant_type
+        os_ = self.get("out_scale")
         if (
             hasattr(kq, "gather_qmm_seg")
             and mx.metal.is_available()
@@ -294,7 +299,9 @@ class KQuantSwitchLinear(nn.Module):
                 indices = indices.astype(mx.uint32)
             tr = kq.seg_tile_rows(indices.size, w.shape[0], xf.shape[-1], codec)
             maps = kq.expert_tile_map(indices, w.shape[0], tile_rows=tr)
-            y = kq.gather_qmm_seg(xf, w, s, codec, *maps, tile_rows=tr, x_rows=x_rows)
+            y = kq.gather_qmm_seg(
+                xf, w, s, codec, *maps, tile_rows=tr, x_rows=x_rows, out_scale=os_
+            )
             return y[:, None, :]
         if x_rows is not None:
             xf = mx.take(xf, x_rows, axis=0)
@@ -303,9 +310,15 @@ class KQuantSwitchLinear(nn.Module):
         start = 0
         for e in np.flatnonzero(counts):
             c = int(counts[e])
+            os_e = None if os_ is None else (os_ if os_.ndim == 1 else os_[int(e)])
             outs.append(
                 kq.quantized_matmul(
-                    xf[start : start + c], w[e], s, codec, transpose=True
+                    xf[start : start + c],
+                    w[e],
+                    s,
+                    codec,
+                    transpose=True,
+                    out_scale=os_e,
                 )
             )
             start += c

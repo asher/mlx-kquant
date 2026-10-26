@@ -2899,6 +2899,7 @@ NB_MODULE(_ext, m) {
       "transpose"_a = true,
       "sorted_indices"_a = false,
       nb::kw_only(),
+      "out_scale"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Gather (mixture-of-experts) quantized matmul for GGUF K-quant weights.
@@ -2916,6 +2917,11 @@ NB_MODULE(_ext, m) {
             transpose (bool): whether each expert ``w`` is transposed
                 ([out, in]). Default True.
             sorted_indices (bool): hint that the defaulted indices are sorted.
+            out_scale (array, optional): float32 scale of each product, shape
+                (1,), (out_dims,), (n_experts, 1) or (n_experts, out_dims):
+                a row is the scale of the expert it is indexed by. nvfp4
+                with ``transpose=True`` only (the ``.scale`` of an NVFP4
+                GGUF).
 
         Returns:
             array: the gathered matmul result (x.dtype, float32 -> bfloat16).
@@ -2960,6 +2966,7 @@ NB_MODULE(_ext, m) {
       nb::kw_only(),
       "tile_rows"_a = 64,
       "x_rows"_a = nb::none(),
+      "out_scale"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Segment-walking gather GEMM for expert-sorted MoE prefill.
@@ -2985,6 +2992,8 @@ NB_MODULE(_ext, m) {
                 row reads, each in [0, n) (not checked). An x row may be read
                 by several sorted rows or by none. The matrix-unit kernel
                 reads the rows in place; the other paths gather them first.
+            out_scale (array, optional): as for gather_qmm, the row of
+                each tile's expert.
 
         Returns:
             array: [rows, out_dims], one row per sorted row (x.dtype,

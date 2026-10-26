@@ -420,3 +420,234 @@ def test_dequantize_route():
     for c, r in zip(calls, res, strict=True):
         assert r["grad_dtype"] == c["dtype"], r["grad_dtype"]
         assert r["grad_err"] <= 2.0**-6, r["grad_err"]
+
+
+# Gathers: gather_qmm and gather_qmm_seg over E expert matrices. A scale of
+# shape (E, 1) or (E, N) gives each entry the row of its expert.
+E = 4
+
+
+def _stack(n, lo, hi, k=K):
+    return np.stack([_wire(n, lo, hi, seed=7 + e, k=k) for e in range(E)])
+
+
+def _gather_cases(dtn, k=K):
+    """(name, f(x, w, s), x, expert of each output row block). gather_qmm
+    takes the mat-vec at M 1 and 3 (the slow form at K 320), the GEMM at M
+    40 and the sorted-rhs GEMM at B 64; seg runs both tile heights and the
+    row map. seg is Metal-only."""
+    dt = getattr(mx, dtn)
+    rng = np.random.default_rng(1)
+    idx = rng.integers(0, E, 8).astype(np.uint32)
+    sidx = np.sort(rng.integers(0, E, 64)).astype(np.uint32)
+    ridx = np.sort(rng.integers(0, E, 300)).astype(np.uint32)
+
+    def xs(*shape):
+        return mx.random.normal(shape, key=mx.random.key(shape[-2])).astype(dt)
+
+    def gq(rhs, sort=False):
+        def f(x, w, s):
+            r = mx.array(rhs)
+            return kq.gather_qmm(
+                x, w, Z, "nvfp4", rhs_indices=r, sorted_indices=sort, out_scale=s
+            )
+
+        return f
+
+    cases = [
+        ("qmv", gq(idx), xs(8, 1, k), idx),
+        ("qmv_m3", gq(idx), xs(8, 3, k), idx),
+        ("qmm", gq(idx), xs(8, 40, k), idx),
+        ("rhs", gq(sidx, True), xs(64, 1, k), sidx),
+    ]
+    if FORCE_CPU:
+        return cases
+    x = xs(300, k)
+    perm = rng.permutation(300).astype(np.uint32)
+    xu = mx.take(x, mx.array(np.argsort(perm).astype(np.uint32)), axis=0)
+    for tr in (64, 128):
+
+        def seg(x, w, s, tr=tr, rows=None):
+            m, c = kq.expert_tile_map(mx.array(ridx), E, tile_rows=tr)
+            return kq.gather_qmm_seg(
+                x, w, Z, "nvfp4", m, c, tile_rows=tr, x_rows=rows, out_scale=s
+            )
+
+        cases.append((f"seg{tr}", seg, x, ridx))
+    rows = mx.array(perm)
+    cases.append(("seg_rows", lambda x, w, s: seg(xu, w, s, 64, rows), x, ridx))
+    return cases
+
+
+def _gather_arms(bound):
+    if FORCE_CPU:
+        neon = [] if bound else [("cpu_neon", {})]
+        return [("cpu", {"KQ_CPU_NEON": "0"})] + neon
+    return [("default", {}), ("alu", {"KQ_DISABLE_NAX": "1"})]
+
+
+def _per_expert(s, eidx, ndim):
+    """s as it multiplies an output of ndim dims whose leading dim is the
+    entry with expert eidx."""
+    if s.ndim == 1:
+        return s
+    return s[eidx].reshape((len(eidx),) + (1,) * (ndim - 2) + (s.shape[1],))
+
+
+def _gather_scales(N, rng):
+    def p2(*shape):
+        return np.exp2(-rng.integers(10, 14, shape)).astype(np.float32)
+
+    return [p2(1), p2(N), p2(E, 1), p2(E, N)]
+
+
+@pytest.mark.parametrize("dtn", ("bfloat16", "float16"))
+@pytest.mark.parametrize("N,k", ((256, K), (196, 320)))
+def test_gather_ones_and_powers_of_two(dtn, N, k):
+    w = mx.array(_stack(N, 0x08, 0x48, k=k).reshape(E, N, -1))
+    scales = _gather_scales(N, np.random.default_rng(5))
+    for name, f, x, eidx in _gather_cases(dtn, k):
+        for arm, env in _gather_arms(bound=False):
+            with _env(env):
+                y0 = f(x, w, None)
+                mx.eval(y0)
+                u = np.asarray(y0.astype(mx.float32))
+                for s in scales:
+                    y1 = f(x, w, mx.ones(s.shape))
+                    assert np.array_equal(_bits(y1), _bits(y0)), (name, arm, s.shape)
+                    y = f(x, w, mx.array(s))
+                    sv = _per_expert(s, eidx, u.ndim)
+                    want = mx.array(u * sv).astype(getattr(mx, dtn))
+                    wf = np.asarray(want.astype(mx.float32))
+                    normal = np.abs(wf) >= 2 * FLOOR[dtn]
+                    got, exp = _bits(y), _bits(want)
+                    assert np.array_equal(got[normal], exp[normal]), (
+                        name,
+                        arm,
+                        s.shape,
+                    )
+
+
+def _gather_ref(x64, w64, eidx):
+    """x64 [B, ..., K] against expert eidx[b]: ref and |x| @ |w|^T."""
+    ref = np.stack([x64[b] @ w64[e].T for b, e in enumerate(eidx)])
+    bound = np.stack([np.abs(x64[b]) @ np.abs(w64[e]).T for b, e in enumerate(eidx)])
+    return ref, bound
+
+
+@pytest.mark.parametrize("dtn", ("bfloat16", "float16"))
+def test_gather_real_scales_against_float64(dtn):
+    # As test_real_scales_against_float64: in float16 most unscaled sums
+    # pass 65504 and the scaled ones stay near 100.
+    N = 256
+    f16 = dtn == "float16"
+    wire = _stack(N, 0x60, 0x7F) if f16 else _stack(N, 0, 256)
+    w = mx.array(wire.reshape(E, N, -1))
+    w64 = np.stack([_w64(wire[e]) for e in range(E)])
+    col = _col_scales(E * N)
+    scales = [col[:E].reshape(E, 1).copy(), col.reshape(E, N)]
+    for name, f, x, eidx in _gather_cases(dtn):
+        if f16:
+            x = x * 32
+        x64 = _f64(x)
+        if name == "seg_rows":
+            continue  # its x is the permuted copy; seg64 covers the kernel
+        ref, bound = _gather_ref(x64, w64, eidx)
+        for arm, env in _gather_arms(bound=True):
+            with _env(env):
+                if f16:
+                    assert np.isinf(_f64(f(x, w, None))).any(), (name, arm)
+                for s in scales:
+                    sv = _per_expert(s, eidx, ref.ndim)
+                    _bound_check(f(x, w, mx.array(s)), ref * sv, bound * sv, dtn)
+
+
+@pytest.mark.parametrize("dtn", ("bfloat16", "float16"))
+@pytest.mark.parametrize("sort", (False, True))
+def test_gather_gradient_wrt_x(dtn, sort):
+    N, B = 256, 64 if sort else 8
+    wire = _stack(N, 0x30, 0x48)
+    w = mx.array(wire.reshape(E, N, -1))
+    w64 = np.stack([_w64(wire[e]) for e in range(E)])
+    rng = np.random.default_rng(2)
+    eidx = rng.integers(0, E, B).astype(np.uint32)
+    if sort:
+        eidx = np.sort(eidx)
+    x = mx.random.normal((B, 1, K), key=mx.random.key(3)).astype(getattr(mx, dtn))
+    s = _col_scales(E * N).reshape(E, N)
+    c = (mx.random.normal((B, 1, N), key=mx.random.key(5)) * 1e-3).astype(x.dtype)
+
+    def f(x, s):
+        return kq.gather_qmm(
+            x,
+            w,
+            Z,
+            "nvfp4",
+            rhs_indices=mx.array(eidx),
+            sorted_indices=sort,
+            out_scale=s,
+        )
+
+    _, (g,) = mx.vjp(lambda x: f(x, mx.array(s)), [x], [c])
+    assert g.dtype == x.dtype
+    cs = _f64(c) * s[eidx][:, None, :]
+    ref = np.stack([cs[b] @ w64[e] for b, e in enumerate(eidx)])
+    bound = np.stack([np.abs(cs[b]) @ np.abs(w64[e]) for b, e in enumerate(eidx)])
+    _bound_check(g, ref, bound, "bfloat16", tol=2.0**-6)
+    with pytest.raises(ValueError, match="out_scale"):
+        mx.vjp(lambda s: f(x, s), [mx.array(s)], [c])
+
+
+@pytest.mark.parametrize("B", (8, 64))
+def test_switch_linear_scales_before_the_bias(B):
+    # B 64 sorted takes the expert-segment GEMM with the row floor lowered.
+    from mlx_kquant.nn import KQuantSwitchLinear
+
+    N = 256
+    wire = _stack(N, 0x30, 0x48)
+    w64 = np.stack([_w64(wire[e]) for e in range(E)])
+    lin = KQuantSwitchLinear(E, N, K, bias=True, codec="nvfp4")
+    lin.weight = mx.array(wire.reshape(E, N, -1))
+    lin.bias = mx.random.normal((E, N), key=mx.random.key(9)).astype(mx.bfloat16)
+    s = _col_scales(E).reshape(E, 1)
+    lin.out_scale = mx.array(s)
+    eidx = np.sort(np.random.default_rng(4).integers(0, E, B)).astype(np.uint32)
+    x = mx.random.normal((B, 1, K), key=mx.random.key(6)).astype(mx.bfloat16)
+    x64, b64 = _f64(x), _f64(lin.bias)
+    ref, bound = _gather_ref(x64, w64, eidx)
+    sv = s[eidx][:, :, None]
+    ref = ref * sv + b64[eidx][:, None, :]
+    bound = bound * sv + np.abs(b64[eidx][:, None, :])
+    with _env({"KQ_CPU_NEON": "0", "KQ_SWITCH_GEMM_MIN_ROWS": "16"}):
+        y = lin(x, mx.array(eidx), sorted_indices=B == 64)
+    _bound_check(y, ref, bound, "bfloat16")
+
+
+def test_gather_rejects():
+    N = 256
+    w = mx.array(_stack(N, 0x30, 0x48).reshape(E, N, -1))
+    x, _ = _x(2, "bfloat16")
+    x = x[:, None]
+    idx = mx.array(np.array([0, 3], np.uint32))
+    for bad in (mx.ones((E + 1, 1)), mx.ones((E, N + 1)), mx.ones((E, 1), mx.bfloat16)):
+        with pytest.raises(ValueError, match="out_scale must be float32"):
+            kq.gather_qmm(x, w, Z, "nvfp4", rhs_indices=idx, out_scale=bad)
+    with pytest.raises(ValueError, match="transpose"):
+        kq.gather_qmm(
+            mx.zeros((2, 1, N), mx.bfloat16),
+            w,
+            Z,
+            "nvfp4",
+            rhs_indices=idx,
+            transpose=False,
+            out_scale=mx.ones((1,)),
+        )
+    if not FORCE_CPU:
+        m, c = kq.expert_tile_map(idx, E)
+        with pytest.raises(ValueError, match="out_scale must be float32"):
+            kq.gather_qmm_seg(x[:, 0], w, Z, "nvfp4", m, c, out_scale=mx.ones((E, 2)))
+    # One matrix without indices is quantized_matmul, with its row of the scale.
+    s = _col_scales(N)
+    one = kq.gather_qmm(x[:, 0], w[:1], Z, "nvfp4", out_scale=mx.array(s[None]))
+    want = _mm(x[:, 0], w[0], mx.array(s))
+    assert np.array_equal(_bits(one.reshape(want.shape)), _bits(want))

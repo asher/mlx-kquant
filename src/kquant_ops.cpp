@@ -290,6 +290,56 @@ int kq_dense_lora_stack(
   return stacked ? lora_a->shape(0) : 0;
 }
 
+// The kernel mode of an out_scale argument (kq_out_scale.h), 0 for none: 1
+// for shape (1,), 2 for (N,), and for a gather over n_mats > 0 weight
+// matrices, 3 for (n_mats, 1) and 4 for (n_mats, N).
+int kq_out_scale_mode(
+    const std::optional<mx::array>& os,
+    const std::string& kquant_type,
+    bool transpose,
+    int N,
+    int64_t n_mats,
+    const char* op) {
+  if (!os.has_value()) {
+    return 0;
+  }
+  const std::string at = std::string("[mlx_kquant.") + op + "] ";
+  if (kquant_type != "nvfp4") {
+    throw std::invalid_argument(
+        at + "out_scale is for nvfp4 weights, got kquant_type '" + kquant_type +
+        "'.");
+  }
+  if (!transpose) {
+    throw std::invalid_argument(at + "out_scale needs transpose=True.");
+  }
+  if (os->dtype() == mx::float32) {
+    if (os->ndim() == 1 && os->shape(0) == 1) {
+      return 1;
+    }
+    if (os->ndim() == 1 && os->shape(0) == N) {
+      return 2;
+    }
+    if (n_mats > 0 && os->ndim() == 2 && os->shape(0) == n_mats) {
+      if (os->shape(1) == 1) {
+        return 3;
+      }
+      if (os->shape(1) == N) {
+        return 4;
+      }
+    }
+  }
+  std::ostringstream msg;
+  msg << at << "out_scale must be float32 of shape (1,)";
+  if (n_mats > 0) {
+    msg << ", (" << N << ",), (" << n_mats << ", 1) or (" << n_mats << ", " << N
+        << ")";
+  } else {
+    msg << " or (" << N << ",)";
+  }
+  msg << ", got " << os->dtype() << " " << os->shape() << ".";
+  throw std::invalid_argument(msg.str());
+}
+
 } // namespace
 
 mx::array quantized_matmul(
@@ -353,29 +403,8 @@ mx::array quantized_matmul(
     throw std::invalid_argument(msg.str());
   }
 
-  // The output scale: mode 1 for one value, 2 for one per column.
-  int out_scale_mode = 0;
-  if (out_scale.has_value()) {
-    if (kquant_type != "nvfp4") {
-      throw std::invalid_argument(
-          "[mlx_kquant.quantized_matmul] out_scale is for nvfp4 weights, got "
-          "kquant_type '" +
-          kquant_type + "'.");
-    }
-    if (!transpose) {
-      throw std::invalid_argument(
-          "[mlx_kquant.quantized_matmul] out_scale needs transpose=True.");
-    }
-    if (out_scale->dtype() != mx::float32 || out_scale->ndim() != 1 ||
-        (out_scale->size() != 1 &&
-         out_scale->size() != static_cast<size_t>(w_outer_dims))) {
-      std::ostringstream msg;
-      msg << "[mlx_kquant.quantized_matmul] out_scale must be float32 of "
-          << "shape (1,) or (" << w_outer_dims << ",).";
-      throw std::invalid_argument(msg.str());
-    }
-    out_scale_mode = out_scale->size() == 1 ? 1 : 2;
-  }
+  const int out_scale_mode = kq_out_scale_mode(
+      out_scale, kquant_type, transpose, w_outer_dims, 0, "quantized_matmul");
 
   // Output dtype: x.dtype(), with float32 promoted to bfloat16 (the NAX matmul
   // path emits bf16 accumulation).
@@ -764,6 +793,7 @@ mx::array gather_qmm(
     std::optional<mx::array> rhs_indices_,
     bool transpose,
     bool sorted_indices,
+    std::optional<mx::array> out_scale,
     mx::StreamOrDevice s_) {
   // No indices on one matrix -> a plain quantized matmul. A stack of
   // matrices takes the gathered path below, which runs each one.
@@ -772,6 +802,10 @@ mx::array gather_qmm(
     w_mats *= w.shape(i);
   }
   if (!lhs_indices_ && !rhs_indices_ && w_mats == 1) {
+    // The one matrix's row of a (1, 1) or (1, N) scale.
+    if (out_scale && out_scale->ndim() == 2 && out_scale->shape(0) == 1) {
+      out_scale = mx::reshape(*out_scale, {-1}, s_);
+    }
     return quantized_matmul(
         std::move(x),
         std::move(w),
@@ -783,7 +817,7 @@ mx::array gather_qmm(
         std::nullopt,
         std::nullopt,
         std::nullopt,
-        std::nullopt,
+        out_scale,
         s_);
   }
 
@@ -826,6 +860,8 @@ mx::array gather_qmm(
         << "' with transpose=" << std::boolalpha << transpose << ".";
     throw std::invalid_argument(msg.str());
   }
+  const int out_scale_mode = kq_out_scale_mode(
+      out_scale, kquant_type, transpose, w_outer_dims, w_mats, "gather_qmm");
 
   // Output dtype: x.dtype(), with float32 promoted to bfloat16.
   mx::Dtype out_type = (x.dtype() == mx::float32) ? mx::bfloat16 : x.dtype();
@@ -882,6 +918,11 @@ mx::array gather_qmm(
   auto w_c =
       rhs_reachable ? mx::contiguous(w, false, s) : kq_matrix_dense(w, s);
   auto scales_c = kq_matrix_dense(scales, s);
+  std::vector<mx::array> inputs = {
+      x_c, w_c, scales_c, std::move(lhs_indices), std::move(rhs_indices)};
+  if (out_scale_mode != 0) {
+    inputs.push_back(kq_row_major(*out_scale, s));
+  }
 
   return mx::array(
       std::move(out_shape),
@@ -893,8 +934,9 @@ mx::array gather_qmm(
           codec->bits,
           transpose,
           left_sorted,
-          right_sorted),
-      {x_c, w_c, scales_c, std::move(lhs_indices), std::move(rhs_indices)});
+          right_sorted,
+          out_scale_mode),
+      std::move(inputs));
 }
 
 std::vector<mx::array> expert_tile_map(
@@ -959,6 +1001,7 @@ mx::array gather_qmm_seg(
     mx::array counts,
     int tile_rows,
     std::optional<mx::array> x_rows,
+    std::optional<mx::array> out_scale,
     mx::StreamOrDevice s_) {
   if (w.dtype() != mx::uint8) {
     throw std::invalid_argument(
@@ -1022,6 +1065,8 @@ mx::array gather_qmm_seg(
         << weights_per_row << ") for codec '" << codec->name << "'.";
     throw std::invalid_argument(msg.str());
   }
+  const int out_scale_mode = kq_out_scale_mode(
+      out_scale, kquant_type, true, w.shape(1), w.shape(0), "gather_qmm_seg");
 
   mx::Dtype out_type = (x.dtype() == mx::float32) ? mx::bfloat16 : x.dtype();
   if (!mx::issubdtype(out_type, mx::floating)) {
@@ -1062,11 +1107,19 @@ mx::array gather_qmm_seg(
   if (rows_c) {
     inputs.push_back(*rows_c);
   }
+  if (out_scale_mode != 0) {
+    inputs.push_back(kq_row_major(*out_scale, s));
+  }
   return mx::array(
       mx::Shape{rows, w.shape(1)},
       out_type,
       std::make_shared<KQuantGatherQMMSeg>(
-          s, kquant_type, codec->weights_per_block, codec->bits, tile_rows),
+          s,
+          kquant_type,
+          codec->weights_per_block,
+          codec->bits,
+          tile_rows,
+          out_scale_mode),
       std::move(inputs));
 }
 

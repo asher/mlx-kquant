@@ -1509,11 +1509,8 @@ void kquant_qmm_cpu(
 #endif
   }
 
-  if (out_scale != nullptr && out_scale_mode != 0) {
-    for (std::size_t i = 0; i < out_els; i++) {
-      of[i] *= out_scale[out_scale_mode == 2 ? i % N : 0];
-    }
-  }
+  kq_out_scale_rows_cpu(
+      of, static_cast<std::size_t>(M), N, out_scale, out_scale_mode);
   if constexpr (!std::is_same_v<T, float>) {
     convert_from_f32(of, result, out_els);
   }
@@ -1677,6 +1674,9 @@ void kquant_qmm_cpu_batch(
         }
       });
 
+  for (int t = 0; t < n_tasks; t++) {
+    kq_out_scale_rows_cpu(ofs[t], tasks[t].m, N, tasks[t].os, tasks[t].os_mode);
+  }
   if constexpr (!std::is_same_v<T, float>) {
     for (int t = 0; t < n_tasks; t++) {
       const std::size_t els = static_cast<std::size_t>(tasks[t].m) * N;

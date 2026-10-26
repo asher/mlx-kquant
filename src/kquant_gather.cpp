@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -74,7 +75,8 @@ void gather_qmm_nax(
     int K,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os) {
   int B = out.size() / M / N;
   int wm = 2, wn = 2, bm = 64, bn = 64, bk = 64;
   MTL::Size group_dims(32, wn, wm);
@@ -105,7 +107,7 @@ void gather_qmm_nax(
       wn,
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "");
 
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel_os(d, kname, os);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
 
@@ -121,6 +123,7 @@ void gather_qmm_nax(
   ce.set_bytes(M, c++);
   c = add_strides_and_shapes(ce, false, x, w, scales, c);
   add_gather_strides_and_shapes(ce, lhs_indices, rhs_indices, c);
+  kq_bind_out_scale(ce, os);
 
   kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -142,7 +145,8 @@ void gather_qmm(
     int K,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os) {
   // enable_tf32 dropped (always short-circuited; op promotes f32 x -> bf16).
   if (kq_is_nax_available() && transpose && (K % 64 == 0) &&
       (x.dtype() != mx::float32) && codec_has_nax(kquant_type)) {
@@ -161,7 +165,8 @@ void gather_qmm(
         K,
         d,
         s,
-        kquant_type);
+        kquant_type,
+        os);
   }
 
   int B = out.size() / M / N;
@@ -184,7 +189,7 @@ void gather_qmm(
       bits,
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "");
 
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel_os(d, kname, os);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
 
@@ -200,6 +205,7 @@ void gather_qmm(
   ce.set_bytes(M, c++);
   c = add_strides_and_shapes(ce, false, x, w, scales, c);
   add_gather_strides_and_shapes(ce, lhs_indices, rhs_indices, c);
+  kq_bind_out_scale(ce, os);
 
   kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -220,7 +226,8 @@ void gather_qmv(
     int K,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os) {
   int B = out.size() / M / N;
   int bn = kquant_qmv_bn(kquant_type);
   int bk = 32;
@@ -242,7 +249,7 @@ void gather_qmv(
       "_b_",
       bits);
 
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel_os(d, kname, os);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
 
@@ -257,6 +264,7 @@ void gather_qmv(
   ce.set_bytes(N, c++);
   c = add_strides_and_shapes(ce, false, x, w, scales, c);
   add_gather_strides_and_shapes(ce, lhs_indices, rhs_indices, c);
+  kq_bind_out_scale(ce, os);
 
   kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -379,7 +387,8 @@ void gather_qmm_rhs_nax(
     int E,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os) {
   int bn = 64, bk = 64, wm = 2, wn = 2;
   // Each expert segment in a row tile pays a full-tile MMA K-loop (the
   // in-kernel simdgroup skip trims bands the segment misses), so at few
@@ -440,7 +449,7 @@ void gather_qmm_rhs_nax(
       "_align_K_",
       align_K ? 't' : 'n');
 
-  auto kernel = kq_get_kernel(d, kname, hash_name, func_consts);
+  auto kernel = kq_get_kernel_os(d, kname, hash_name, func_consts, os);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
 
@@ -456,6 +465,7 @@ void gather_qmm_rhs_nax(
   ce.set_bytes(M, c++);
   ce.set_bytes(N, c++);
   ce.set_bytes(K, c++);
+  kq_bind_out_scale(ce, os);
 
   kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -484,7 +494,8 @@ void gather_qmm_rhs(
     int E,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os) {
   int bn = 64, bk = 32, wm = 2, wn = 2;
   const int rows_per_expert = M / std::max(E, 1);
   int bm = rows_per_expert >= 384 ? 64 : (rows_per_expert >= 40 ? 32 : 16);
@@ -521,7 +532,7 @@ void gather_qmm_rhs(
       wn,
       aligned ? "_alN_true" : "_alN_false");
 
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel_os(d, kname, os);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
 
@@ -537,6 +548,7 @@ void gather_qmm_rhs(
   ce.set_bytes(M, c++);
   ce.set_bytes(N, c++);
   ce.set_bytes(K, c++);
+  kq_bind_out_scale(ce, os);
 
   kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -565,15 +577,17 @@ bool KQuantGatherQMM::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantGatherQMM&>(other);
   return kquant_type_ == o.kquant_type_ && group_size_ == o.group_size_ &&
       bits_ == o.bits_ && transpose_ == o.transpose_ &&
-      left_sorted_ == o.left_sorted_ && right_sorted_ == o.right_sorted_;
+      left_sorted_ == o.left_sorted_ && right_sorted_ == o.right_sorted_ &&
+      out_scale_mode_ == o.out_scale_mode_;
 }
 
 void KQuantGatherQMM::eval_cpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
   // inputs: x, w (uint8), scales placeholder (ignored), lhs_indices,
-  // rhs_indices. x / w matrix-contiguous by the op; indices walked via
-  // elem_to_loc. One output row [M, N] per lhs_indices element.
+  // rhs_indices, and with an output scale, the scale. x / w
+  // matrix-contiguous by the op; indices walked via elem_to_loc. One output
+  // row [M, N] per lhs_indices element.
   const auto& x = inputs[0];
   const auto& w = inputs[1];
   const auto& lhs_indices = inputs[3];
@@ -587,11 +601,18 @@ void KQuantGatherQMM::eval_cpu(
   encoder.set_input_array(lhs_indices);
   encoder.set_input_array(rhs_indices);
   encoder.set_output_array(out);
+  std::optional<mx::array> os;
+  if (out_scale_mode_ != 0) {
+    os = mx::array::unsafe_weak_copy(inputs.back());
+    encoder.set_input_array(*os);
+  }
   encoder.dispatch([out = mx::array::unsafe_weak_copy(out),
                     x = mx::array::unsafe_weak_copy(x),
                     w = mx::array::unsafe_weak_copy(w),
                     lhs_indices = mx::array::unsafe_weak_copy(lhs_indices),
                     rhs_indices = mx::array::unsafe_weak_copy(rhs_indices),
+                    os = std::move(os),
+                    os_mode = out_scale_mode_,
                     transpose_ = transpose_,
                     kquant_type = kquant_type_]() mutable {
     int K = x.shape(-1);
@@ -646,6 +667,12 @@ void KQuantGatherQMM::eval_cpu(
           ga = gb;
         }
       }
+      // The output scale of a group's expert.
+      auto group_os = [&](std::size_t first) -> const float* {
+        return os ? kq_out_scale_at_cpu(
+                        os->data<float>(), os_mode, entries[first].w_idx, N)
+                  : nullptr;
+      };
       auto group_w = [&](std::size_t first) {
         // 64-bit expert offset. A stacked expert tensor can exceed 2^31 bytes
         // (a 256-expert q5_k down_proj is ~2.2 GB), and mx::elem_to_loc takes
@@ -721,6 +748,8 @@ void KQuantGatherQMM::eval_cpu(
           const std::size_t ru = plans[gi].uniq.size();
           KQmvTask<T>& task = tasks[gi];
           task.w = group_w(ga);
+          task.os = group_os(ga);
+          task.os_mode = os_mode;
           task.m = static_cast<int>(ru) * M;
           if (rg == 1) {
             task.out =
@@ -798,7 +827,9 @@ void KQuantGatherQMM::eval_cpu(
               N,
               K,
               transpose_,
-              kquant_type);
+              kquant_type,
+              group_os(a),
+              os_mode);
         } else {
           xg.resize(rg * row_els);
           og.resize(rg * out_row_els);
@@ -820,7 +851,9 @@ void KQuantGatherQMM::eval_cpu(
               N,
               K,
               transpose_,
-              kquant_type);
+              kquant_type,
+              group_os(a),
+              os_mode);
           for (std::size_t r = 0; r < rg; r++) {
             std::memcpy(
                 out.data<T>() +
@@ -852,8 +885,9 @@ std::vector<mx::array> KQuantGatherQMM::vjp(
     const std::vector<int>& argnums,
     const std::vector<mx::array>&) {
   // primals = {x, w (wire bytes), scales placeholder, lhs_indices,
-  // rhs_indices}. Only the gradient wrt x is defined: gather the cotangent
-  // against the experts with the transpose flipped, then scatter-add each
+  // rhs_indices[, out_scale]}. Only the gradient wrt x is defined: gather the
+  // cotangent, times the output scale of each entry's expert, against the
+  // experts with the transpose flipped, then scatter-add each
   // output row's gradient back onto its source x row via lhs_indices. When the
   // indices are sorted and there is one x row per output row, the gather alone
   // already lands the gradient in place. The quantized base is frozen (the LoRA
@@ -876,8 +910,17 @@ std::vector<mx::array> KQuantGatherQMM::vjp(
 
   for (auto arg : argnums) {
     if (arg == 0) {
+      mx::array cot = cotan;
+      if (out_scale_mode_ != 0) {
+        mx::array sc = primals.back();
+        if (out_scale_mode_ >= 3) {
+          // One row of (E, 1) or (E, N) per entry, against its [M, N].
+          sc = mx::expand_dims(mx::take(sc, rhs_indices, 0, stream()), -2);
+        }
+        cot = kq_out_scaled_cotangent(cot, sc, stream());
+      }
       auto g = gather_qmm(
-          cotan,
+          cot,
           w,
           scales,
           kquant_type_,
@@ -885,7 +928,12 @@ std::vector<mx::array> KQuantGatherQMM::vjp(
           rhs_indices,
           !transpose_,
           sorted,
+          std::nullopt,
           stream());
+      if (out_scale_mode_ != 0) {
+        // A float16 x gets a bfloat16 cotangent, and its gradient back.
+        g = mx::astype(g, x.dtype(), stream());
+      }
       if (sorted && no_broadcast) {
         vjps.push_back(g);
       } else {
@@ -906,6 +954,9 @@ std::vector<mx::array> KQuantGatherQMM::vjp(
     } else if (arg == 2) {
       throw std::invalid_argument(
           "[mlx_kquant] gather_qmm vjp: no gradient wrt scales.");
+    } else if (arg == 5) {
+      throw std::invalid_argument(
+          "[mlx_kquant] gather_qmm vjp: no gradient wrt out_scale.");
     } else {
       throw std::invalid_argument(
           "[mlx_kquant] gather_qmm vjp: cannot compute the gradient wrt the "
@@ -925,7 +976,8 @@ void KQuantGatherQMM::eval_gpu(
   auto& out = outputs[0];
 
   // inputs are row-contiguous (ensured by the op):
-  //   x (float), w (uint8), scales, lhs_indices (uint32), rhs_indices (uint32).
+  //   x (float), w (uint8), scales, lhs_indices (uint32), rhs_indices (uint32),
+  //   and with an output scale, the scale last.
   // x is bound from a 16-byte boundary (kq_x_aligned_gpu).
   const mx::array x = kq_x_aligned_gpu(inputs[0], s, "gather_qmm x");
   const auto& w = inputs[1];
@@ -934,6 +986,10 @@ void KQuantGatherQMM::eval_gpu(
   const auto& rhs_indices = inputs[4];
   kq_check_weight_base(w, kquant_type_, "gather_qmm");
   out.set_data(mx::allocator::malloc(out.nbytes()));
+  KqOutScale os;
+  if (out_scale_mode_ != 0) {
+    os = {&inputs.back(), out_scale_mode_};
+  }
 
   int K = x.shape(-1);
   int M = x.shape(-2);
@@ -979,7 +1035,8 @@ void KQuantGatherQMM::eval_gpu(
           E,
           d,
           s,
-          kquant_type_);
+          kquant_type_,
+          os);
     } else {
       gather_qmm_rhs(
           x,
@@ -995,7 +1052,8 @@ void KQuantGatherQMM::eval_gpu(
           E,
           d,
           s,
-          kquant_type_);
+          kquant_type_,
+          os);
     }
     return;
   }
@@ -1016,12 +1074,13 @@ void KQuantGatherQMM::eval_gpu(
         K,
         d,
         s,
-        kquant_type_);
+        kquant_type_,
+        os);
     return;
   }
 
   if (transpose_) {
-    if (M == 1 &&
+    if (M == 1 && !os &&
         gather_qmv_splitk(
             x,
             w,
@@ -1052,7 +1111,8 @@ void KQuantGatherQMM::eval_gpu(
         K,
         d,
         s,
-        kquant_type_);
+        kquant_type_,
+        os);
     return;
   }
 
@@ -1072,7 +1132,8 @@ void KQuantGatherQMM::eval_gpu(
       K,
       d,
       s,
-      kquant_type_);
+      kquant_type_,
+      os);
 }
 
 #else
@@ -1116,7 +1177,8 @@ std::vector<mx::Shape> KQuantGatherQMMSeg::output_shapes(
 bool KQuantGatherQMMSeg::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantGatherQMMSeg&>(other);
   return kquant_type_ == o.kquant_type_ && group_size_ == o.group_size_ &&
-      bits_ == o.bits_ && tile_rows_ == o.tile_rows_;
+      bits_ == o.bits_ && tile_rows_ == o.tile_rows_ &&
+      out_scale_mode_ == o.out_scale_mode_;
 }
 
 void KQuantGatherQMMSeg::eval_cpu(
@@ -1209,9 +1271,10 @@ void KQuantGatherQMMSeg::eval_gpu(
   auto& out = outputs[0];
 
   // inputs are row-contiguous (ensured by the op): x [R, K] (float),
-  // w [E, N, bpr] (uint8), scales, map [T, 3] (uint32), counts [1], and
-  // with a row map x_rows [R'] (uint32), x then being the unsorted rows.
-  // x is bound from a 16-byte boundary (kq_x_aligned_gpu).
+  // w [E, N, bpr] (uint8), scales, map [T, 3] (uint32), counts [1], with
+  // a row map x_rows [R'] (uint32), x then being the unsorted rows, and
+  // with an output scale, the scale last. x is bound from a 16-byte
+  // boundary (kq_x_aligned_gpu).
   const mx::array x = kq_x_aligned_gpu(inputs[0], s, "gather_qmm_seg x");
   const auto& w = inputs[1];
   const auto& scales = inputs[2];
@@ -1219,6 +1282,10 @@ void KQuantGatherQMMSeg::eval_gpu(
   const auto& counts = inputs[4];
   kq_check_weight_base(w, kquant_type_, "gather_qmm_seg");
   out.set_data(mx::allocator::malloc(out.nbytes()));
+  KqOutScale os;
+  if (out_scale_mode_ != 0) {
+    os = {&inputs.back(), out_scale_mode_};
+  }
 
   int K = x.shape(-1);
   int N = w.shape(1);
@@ -1230,7 +1297,7 @@ void KQuantGatherQMMSeg::eval_gpu(
   // NAX variant: one dequant + one MMA pass per expert-major tile (the
   // steel simdgroup-MMA kernel below is the pre-NAX fallback). The op only
   // passes a row map where kq_seg_nax_ok held.
-  const bool xmap = inputs.size() == 6;
+  const bool xmap = inputs.size() - (os ? 1 : 0) == 6;
   if (xmap || (kq_seg_nax_ok(kquant_type_, K) && x.dtype() != mx::float32)) {
     const bool align_N = aligned;
     const bool align_K = true;
@@ -1271,7 +1338,7 @@ void KQuantGatherQMMSeg::eval_gpu(
         "_align_K_t_gx_",
         gx,
         xmap ? "_xm" : "");
-    auto kernel = kq_get_kernel(d, nname, hash_name, func_consts);
+    auto kernel = kq_get_kernel_os(d, nname, hash_name, func_consts, os);
     ce.set_compute_pipeline_state(kernel);
     int c = 0;
     ce.set_input_array(x, c++);
@@ -1285,6 +1352,7 @@ void KQuantGatherQMMSeg::eval_gpu(
     if (xmap) {
       ce.set_input_array(inputs[5], c++);
     }
+    kq_bind_out_scale(ce, os);
     MTL::Size group_dims(32, 2, wm);
     const int n_cols = (N + bn - 1) / bn;
     const int cap = map.shape(0);
@@ -1307,7 +1375,7 @@ void KQuantGatherQMMSeg::eval_gpu(
       "_b_",
       bits_,
       aligned ? "_alN_true" : "_alN_false");
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel_os(d, kname, os);
   ce.set_compute_pipeline_state(kernel);
   int c = 0;
   ce.set_input_array(w, c++);
@@ -1318,6 +1386,7 @@ void KQuantGatherQMMSeg::eval_gpu(
   ce.set_output_array(out, c++);
   ce.set_bytes(K, c++);
   ce.set_bytes(N, c++);
+  kq_bind_out_scale(ce, os);
   // A 128-row map tile runs as two 64-row halves on grid z.
   MTL::Size group_dims(32, 2, 2);
   MTL::Size grid_dims((N + bn - 1) / bn, map.shape(0), tile_rows_ / 64);

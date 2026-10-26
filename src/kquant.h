@@ -184,7 +184,10 @@ mx::array quantized_matmul_qmv_bias(
 // `scales` a vestigial placeholder (see dequantize). Either index defaults to a
 // plain arange when omitted. `sorted_indices` enables an optimized path when
 // the (defaulted) indices are sorted. Output dtype follows quantized_matmul.
-// group_size/bits are derived from `kquant_type`.
+// group_size/bits are derived from `kquant_type`. out_scale (nvfp4,
+// transpose only) is float32 (1,), (N,), (E, 1) or (E, N) for E weight
+// matrices: the result of an entry on matrix e is its product times
+// out_scale, at row e for the last two shapes.
 mx::array gather_qmm(
     mx::array x,
     mx::array w,
@@ -194,6 +197,7 @@ mx::array gather_qmm(
     std::optional<mx::array> rhs_indices = std::nullopt,
     bool transpose = true,
     bool sorted_indices = false,
+    std::optional<mx::array> out_scale = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // Build the gather_qmm_seg tile map from expert-sorted routing indices, on
@@ -222,7 +226,8 @@ std::vector<mx::array> expert_tile_map(
 // every row exactly once). Output dtype follows quantized_matmul. With
 // x_rows (1-D integers, one per sorted row), x is the unsorted rows and
 // sorted row r is x[x_rows[r]]; the NAX kernel reads them in place, and on
-// any other path the op gathers them first. Metal-only.
+// any other path the op gathers them first. out_scale as gather_qmm's,
+// with the tile's expert. Metal-only.
 mx::array gather_qmm_seg(
     mx::array x,
     mx::array w,
@@ -232,6 +237,7 @@ mx::array gather_qmm_seg(
     mx::array counts,
     int tile_rows = 64,
     std::optional<mx::array> x_rows = std::nullopt,
+    std::optional<mx::array> out_scale = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // gather_qmm_seg tile height for `rows` expert-sorted rows over n_experts
@@ -3416,14 +3422,16 @@ class KQuantGatherQMM : public mx::Primitive {
       int bits,
       bool transpose,
       bool left_sorted,
-      bool right_sorted)
+      bool right_sorted,
+      int out_scale_mode = 0)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         group_size_(group_size),
         bits_(bits),
         transpose_(transpose),
         left_sorted_(left_sorted),
-        right_sorted_(right_sorted) {}
+        right_sorted_(right_sorted),
+        out_scale_mode_(out_scale_mode) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -3456,6 +3464,8 @@ class KQuantGatherQMM : public mx::Primitive {
   bool transpose_;
   bool left_sorted_;
   bool right_sorted_;
+  // The output scale (kq_out_scale.h), the last input when not 0.
+  int out_scale_mode_;
 };
 
 // Tile-map builder (see expert_tile_map). Multi-output: {map, counts}.
@@ -3494,12 +3504,14 @@ class KQuantGatherQMMSeg : public mx::Primitive {
       std::string kquant_type,
       int group_size,
       int bits,
-      int tile_rows)
+      int tile_rows,
+      int out_scale_mode = 0)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         group_size_(group_size),
         bits_(bits),
-        tile_rows_(tile_rows) {}
+        tile_rows_(tile_rows),
+        out_scale_mode_(out_scale_mode) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -3521,6 +3533,8 @@ class KQuantGatherQMMSeg : public mx::Primitive {
   int group_size_;
   int bits_;
   int tile_rows_;
+  // The output scale (kq_out_scale.h), the last input when not 0.
+  int out_scale_mode_;
 };
 
 // Encode a float weight tensor into K-quant wire bytes. Multi-output primitive:
