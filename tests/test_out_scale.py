@@ -221,14 +221,18 @@ def test_lora_delta_is_not_scaled(M):
     _bound_check(y, ref, bound, "bfloat16", tol=2.0**-5)
 
 
-def test_gradient_wrt_x():
+@pytest.mark.parametrize("dtn", ("bfloat16", "float16"))
+def test_gradient_wrt_x(dtn):
+    # A cotangent of a training step's size: s * dy is about 1e-7, below the
+    # float16 normal range, so a float16 vjp forms it in bfloat16.
     M, N = 4, 256
     wire = _wire(N, 0x30, 0x48)
     w, w64 = mx.array(wire), _w64(wire)
-    x, _ = _x(M, "bfloat16")
+    x, _ = _x(M, dtn)
     s = _col_scales(N)
-    c = mx.random.normal((M, N), key=mx.random.key(5)).astype(mx.bfloat16)
+    c = (mx.random.normal((M, N), key=mx.random.key(5)) * 1e-3).astype(x.dtype)
     _, (g,) = mx.vjp(lambda x: _mm(x, w, mx.array(s)), [x], [c])
+    assert g.dtype == x.dtype
     cs = _f64(c) * s
     _bound_check(g, cs @ w64, np.abs(cs) @ np.abs(w64), "bfloat16", tol=2.0**-6)
     with pytest.raises(ValueError, match="out_scale"):
@@ -307,7 +311,7 @@ for i, c in enumerate(spec["calls"]):
     r = {"finite": bool(np.isfinite(got).all()), "err": float(np.nanmax(err)),
          "unscaled_finite": bool(np.isfinite(np.asarray(y0.astype(mx.float32))).all())}
     if c.get("grad"):
-        cot = mx.random.normal(y.shape, key=mx.random.key(5)).astype(dt)
+        cot = (mx.random.normal(y.shape, key=mx.random.key(5)) * 1e-4).astype(dt)
         f = lambda x: kq.quantized_matmul(x, w, Z, "nvfp4", out_scale=mx.array(s))
         _, (g,) = mx.vjp(f, [x], [cot])
         cs = np.asarray(cot.astype(mx.float32)).astype(np.float64) * s
@@ -385,7 +389,7 @@ def test_dequantize_route():
     # The route's floor for nvfp4: M 2048, K and N 3840.
     calls = [
         {"M": 2048, "dtype": "bfloat16", "env": {}, "grad": True},
-        {"M": 2048, "dtype": "float16", "env": {}},
+        {"M": 2048, "dtype": "float16", "env": {}, "grad": True},
     ]
     res = _child({"N": 3840, "K": 3840, "calls": calls}, {"KQ_DEQUANT_ROUTE": "force"})
     for c, r in zip(calls, res, strict=True):
@@ -394,4 +398,5 @@ def test_dequantize_route():
         tol = TOL["bfloat16"] + (TOL["float16"] if c["dtype"] == "float16" else 0)
         assert r["finite"] and r["err"] <= tol, (c["dtype"], r["err"])
     assert not res[1]["unscaled_finite"]
-    assert res[0]["grad_err"] <= 2.0**-6, res[0]["grad_err"]
+    for r in res:
+        assert r["grad_err"] <= 2.0**-6, r["grad_err"]

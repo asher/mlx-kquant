@@ -553,6 +553,14 @@ void KQuantDequantRoute::eval_gpu(
   outputs[0].copy_shared_buffer(inputs[0]);
 }
 
+mx::array kq_out_scaled_cotangent(
+    const mx::array& cot,
+    const mx::array& s,
+    const mx::Stream& st) {
+  const mx::Dtype dt = cot.dtype() == mx::float16 ? mx::bfloat16 : cot.dtype();
+  return mx::astype(mx::multiply(cot, s, st), dt, st);
+}
+
 std::vector<mx::array> KQuantDequantRoute::vjp(
     const std::vector<mx::array>& primals,
     const std::vector<mx::array>& cotangents,
@@ -569,8 +577,7 @@ std::vector<mx::array> KQuantDequantRoute::vjp(
     } else if (arg == 1) {
       mx::array cot = cotangents[0];
       if (scaled) {
-        cot = mx::astype(
-            mx::multiply(cot, primals[4], stream()), cot.dtype(), stream());
+        cot = kq_out_scaled_cotangent(cot, primals[4], stream());
       }
       auto dx = quantized_matmul(
           cot,

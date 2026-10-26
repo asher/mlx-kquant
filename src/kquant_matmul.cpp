@@ -3022,12 +3022,9 @@ std::vector<mx::array> KQuantMatmul::vjp(
     if (arg == 0) {
       mx::array cot = cotangents[0];
       if (os_arg >= 0) {
-        cot = mx::astype(
-            mx::multiply(cot, primals[os_arg], stream()),
-            cot.dtype(),
-            stream());
+        cot = kq_out_scaled_cotangent(cot, primals[os_arg], stream());
       }
-      vjps.push_back(quantized_matmul(
+      auto dx = quantized_matmul(
           cot,
           primals[1],
           primals[2],
@@ -3039,7 +3036,8 @@ std::vector<mx::array> KQuantMatmul::vjp(
           std::nullopt,
           std::nullopt,
           std::nullopt,
-          stream()));
+          stream());
+      vjps.push_back(mx::astype(dx, primals[0].dtype(), stream()));
     } else if (arg == os_arg) {
       throw std::invalid_argument(
           "[mlx_kquant] quantized_matmul vjp: no gradient wrt out_scale.");
