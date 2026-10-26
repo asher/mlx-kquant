@@ -264,14 +264,19 @@ def _real_scale(rng, n):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("splits", [1, 2])
-def test_out_scales_match_per_weight(dtype, splits, exact_levers):
+@pytest.mark.parametrize("splits", [1, 2, 0])
+def test_out_scales_match_per_weight(dtype, splits, exact_levers, monkeypatch):
     """out_scales, the .scale of an NVFP4 GGUF per weight: each output is
     that weight's quantized_matmul with its out_scale, bit for bit. One call
     holds no scale, (1,) scales and (N_i,) scales over five weights, so it
     runs two dispatches, and at x times 3000 the float16 sums pass 65504
-    before the scale."""
-    exact_levers(splits)
+    before the scale. Splits 0 forces the qmv route, where the op runs
+    quantized_matmul per weight, the path it takes wherever the widest
+    weight's route is not verify_nax."""
+    if splits:
+        exact_levers(splits)
+    else:
+        monkeypatch.setenv("KQ_QMM_ROUTE", "qmv")
     k = 512
     ns = NS + [96]
     ws = [_synth("nvfp4", n, k, i) for i, n in enumerate(ns)]
