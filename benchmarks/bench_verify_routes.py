@@ -37,7 +37,7 @@ rounds, with all codecs' weights resident: the arms are (codec, route)
 pairs, arm order rotates by one slot every round and reverses on the
 Thue-Morse bit of the round. Over all arm pairs each codec leads about as
 often as the other, but one given pair of routes can lead 2 to 6 times in
-8 rounds, and with more than 8 arms the later ones never open a round.
+8 rounds, and some arms never open a round.
 The Markdown then adds a parity table, the fastest route of each codec
 over the fastest route of the first codec, per shape and M. Without the
 flag codecs run one after another as before.

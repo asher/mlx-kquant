@@ -1,18 +1,20 @@
-"""Every fp4 decode path on wires that cover the whole scale byte range.
+"""fp4 decode in the matmul, gather and MoE kernels over every scale byte.
 
 synth_wire draws nvfp4 scales from a narrow band, so nothing else in the
 suite reaches scale 0x00, the UE4M3 subnormals 0x01 to 0x07, the NaN code
 0x7F or a byte with bit 7 set, or an mxfp4 exponent far from 127. Here each
-weight row has one scale exponent, and its sub-blocks cycle the mantissa
-(nvfp4) or the exponent's low bit (mxfp4). Together the rows carry every
-scale byte and every E2M1 code, and each output is checked against its own
-row's magnitude:
+weight row has one scale exponent, and its sub-blocks draw the mantissa
+(nvfp4) or the exponent's low bit (mxfp4) at random. Together the rows carry
+every scale byte and every E2M1 code, and each output is checked against its
+own row's magnitude:
 
-    |got - ref| <= TOL * (|x| @ |w|^T)
+    |got - ref| <= TOL * (|x| @ |w|^T) + the dtype's smallest normal
 
-per element, the rounding bound of a float32 sum stored once in the
-activation dtype, with split-K partials rounded at most once more. One bound
-on max |ref| over the whole output cannot see rows far below the top ones.
+per element. A float32 sum rounded once at the store and once per split-K
+partial (bf16 partials by default, fp16 ones under KQ_SPLITK_F32=0) is off
+by at most two unit roundoffs of |x| @ |w|^T; the floor admits a GPU that
+flushes subnormal outputs. One bound on max |ref| over the whole output
+cannot see rows far below the top ones. Only transpose=True runs here.
 
 float32 dequantize must match the gguf reference exactly (a four-bit scale
 times a two-bit code is exact in float32; only the sign of zero may differ).
@@ -42,8 +44,9 @@ import mlx_kquant as kq
 
 N, K, E = 256, 512, 4
 FORCE_CPU = bool(os.environ.get("KQUANT_FORCE_CPU"))
-# 2^-8 and 2^-10 of |x| @ |w|^T: one output rounding plus one partial rounding.
-TOL = {"bfloat16": 4e-3, "float16": 1e-3}
+# Two unit roundoffs: 2 * 2^-8 for bfloat16, 2 * 2^-11 for float16.
+TOL = {"bfloat16": 2.0**-7, "float16": 2.0**-10}
+FLOOR = {"bfloat16": 2.0**-126, "float16": 2.0**-14}
 ROUTES = ("qmv", "mv_ext", "verify_nax", "splitk", "nax", "nax_splitk")
 WIRES = ("nvfp4_all", "nvfp4_low", "nvfp4_mid", "mxfp4_all", "mxfp4_mid")
 
@@ -53,15 +56,13 @@ def _wire(name):
     n = np.arange(N)[:, None]
     if name.startswith("nvfp4"):
         base = {"nvfp4_all": n, "nvfp4_low": n % 0x18, "nvfp4_mid": 0x08 + n % 0x40}
-        sub = np.arange(K // 16)[None, :]
-        sc = (base[name] & 0xF8) | ((n + sub) & 7)
         w = rng.integers(0, 256, (N, K // 64, 36), dtype=np.uint8)
+        sc = (base[name] & 0xF8) | rng.integers(0, 8, (N, K // 16))
         w[:, :, :4] = sc.reshape(N, K // 64, 4).astype(np.uint8)
         return "nvfp4", GT.NVFP4, w.reshape(N, -1)
     lo, span = {"mxfp4_all": (8, 231), "mxfp4_mid": (64, 116)}[name]
-    blk = np.arange(K // 32)[None, :]
     w = rng.integers(0, 256, (N, K // 32, 17), dtype=np.uint8)
-    w[:, :, 0] = (lo + n % span + ((n + blk) & 1)).astype(np.uint8)
+    w[:, :, 0] = (lo + n % span + rng.integers(0, 2, (N, K // 32))).astype(np.uint8)
     return "mxfp4", GT.MXFP4, w.reshape(N, -1)
 
 
@@ -96,7 +97,7 @@ def test_dequantize_matches_reference_bit_for_bit(name):
 def _check(out, ref, bound, dtn):
     got = np.asarray(out.astype(mx.float32)).astype(np.float64).reshape(ref.shape)
     assert np.isfinite(got).all()
-    bad = np.abs(got - ref) > TOL[dtn] * bound
+    bad = np.abs(got - ref) > TOL[dtn] * bound + FLOOR[dtn]
     assert not bad.any(), f"{int(bad.sum())} outputs past the bound"
 
 

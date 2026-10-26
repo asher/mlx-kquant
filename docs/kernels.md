@@ -567,7 +567,7 @@ described with the other `verify_nax` entries. Its `bm128_min_m` floor is 449: B
 has no K ceiling, and it has no db64 band.
 
 `mxfp4` (32-wide blocks with one E8M0 scale) runs its NAX tiles through the `iq4_nl` loader, with
-the E2M1 table in place of the `iq4_nl` codebook, and takes the flat class large-M row. Every other
+the E2M1 decode in place of the `iq4_nl` codebook, and takes the flat class large-M row. Every other
 block puts its codes at an odd address, so the loader reads that block's codes as aligned pairs
 from the block start. It has no `verify_nax` kernel: that kernel decodes in half, and an E8M0
 scale reaches past the half range. Below M 13 it keeps the mat-vec routes. From M 33 it takes the
