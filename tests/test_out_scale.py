@@ -336,6 +336,7 @@ for i, c in enumerate(spec["calls"]):
         gg = np.asarray(g.astype(mx.float32)).astype(np.float64)
         bound = np.abs(cs) @ np.abs(w64) + 1e-30
         r["grad_err"] = float(np.max(np.abs(gg - cs @ w64) / bound))
+        r["grad_dtype"] = str(g.dtype).split(".")[-1]
     out.append(r)
     for k in c["env"]:
         os.environ.pop(k, None)
@@ -416,5 +417,6 @@ def test_dequantize_route():
         tol = TOL["bfloat16"] + (TOL["float16"] if c["dtype"] == "float16" else 0)
         assert r["finite"] and r["err"] <= tol, (c["dtype"], r["err"])
     assert not res[1]["unscaled_finite"]
-    for r in res:
+    for c, r in zip(calls, res, strict=True):
+        assert r["grad_dtype"] == c["dtype"], r["grad_dtype"]
         assert r["grad_err"] <= 2.0**-6, r["grad_err"]
