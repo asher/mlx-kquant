@@ -40,7 +40,7 @@ import sys
 import mlx.core as mx
 import numpy as np
 import pytest
-from kqref import GT, is_synth, quants, synth_wire
+from kqref import GT, is_synth, mxfp4_deinterleave, quants, synth_wire
 
 import mlx_kquant as kq
 
@@ -327,22 +327,6 @@ def _check_codec(
     return out
 
 
-def _mxfp4_deinterleave_np(wire):
-    """ggml mxfp4 wire [E, N, nblk*17] -> MLX packed layout (packed uint32
-    [E, N, K/8], scales uint8 [E, N, K/32]): two-halves nibbles resequenced,
-    scale bytes split out. Mirrors gguf-mlx's mxfp4_deinterleave."""
-    e, n, last = wire.shape
-    blocks = wire.reshape(e, n, last // 17, 17)
-    scales = np.ascontiguousarray(blocks[..., 0])
-    data = blocks[..., 1:]
-    lo = data & 0x0F
-    hi = data >> 4
-    v = np.concatenate([lo, hi], axis=-1)  # (..., nblk, 32) sequential codes
-    out = (v[..., 0::2] | (v[..., 1::2] << 4)).astype(np.uint8)
-    packed = np.ascontiguousarray(out).reshape(e, n, -1).view(np.uint32)
-    return packed, scales
-
-
 def _check_bias(codec, dtype=mx.float16, limit=0.05, alpha=1.702):
     """Biased fused ops (gpt-oss swiglu_clamp shape): moe_glu_gather_kq with
     gate/up biases and gather_qmv_kq with bias vs the numpy reference. mxfp4
@@ -424,8 +408,8 @@ def _check_bias(codec, dtype=mx.float16, limit=0.05, alpha=1.702):
     out.append(("qmv", rel, rel < REL_BOUND))
 
     if codec == "mxfp4":
-        pgw, pgs = _mxfp4_deinterleave_np(wire)
-        puw, pus = _mxfp4_deinterleave_np(up_np)
+        pgw, pgs = mxfp4_deinterleave(wire)
+        puw, pus = mxfp4_deinterleave(up_np)
         pg = kq.moe_glu_gather(
             x,
             mx.array(pgw),
@@ -859,8 +843,8 @@ def test_limited_glu_passes_a_nan(dtype):
     bad_np = ub_np.copy()
     bad_np[1, row] = np.nan
     gb, ub, ub_bad = mx.array(gb_np), mx.array(ub_np), mx.array(bad_np)
-    pgw, pgs = (mx.array(a) for a in _mxfp4_deinterleave_np(wire))
-    puw, pus = (mx.array(a) for a in _mxfp4_deinterleave_np(up_np))
+    pgw, pgs = (mx.array(a) for a in mxfp4_deinterleave(wire))
+    puw, pus = (mx.array(a) for a in mxfp4_deinterleave(up_np))
     calls = {
         "wire": lambda xx, b: kq.moe_glu_gather_kq(
             xx,

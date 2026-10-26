@@ -1,19 +1,26 @@
 """Every fp4 decode path on wires that cover the whole scale byte range.
 
-synth_wire draws nvfp4 scales from a narrow band, so nothing in the suite
-reaches scale 0x00, the UE4M3 subnormals 0x01 to 0x07, the NaN code 0x7F or
-a byte with bit 7 set, and nothing drives the mxfp4 exponent far from 127.
-These wires cycle every scale byte and carry every E2M1 code. float32
-dequantize must match the gguf reference exactly (a four-bit scale times
-a two-bit code is exact in float32; only the sign of zero may differ).
-The matmul families are held against float64 on the same exact weights
-with a tolerance for their accumulation order.
+synth_wire draws nvfp4 scales from a narrow band, so nothing else in the
+suite reaches scale 0x00, the UE4M3 subnormals 0x01 to 0x07, the NaN code
+0x7F or a byte with bit 7 set, or an mxfp4 exponent far from 127. Here each
+weight row has one scale exponent, and its sub-blocks cycle the mantissa
+(nvfp4) or the exponent's low bit (mxfp4). Together the rows carry every
+scale byte and every E2M1 code, and each output is checked against its own
+row's magnitude:
 
-mxfp4 runs e8m0 bytes 8 to 200: a scale under 2^-119 times a code lands in
-the float32 subnormal range, where the GPU may flush, and above 2^73 a row
-sum passes the float32 range.
-The float16 arms use the nvfp4 wire whose scales stay under 0x48, since the
-large scales overflow a float16 output.
+    |got - ref| <= TOL * (|x| @ |w|^T)
+
+per element, the rounding bound of a float32 sum stored once in the
+activation dtype, with split-K partials rounded at most once more. One bound
+on max |ref| over the whole output cannot see rows far below the top ones.
+
+float32 dequantize must match the gguf reference exactly (a four-bit scale
+times a two-bit code is exact in float32; only the sign of zero may differ).
+
+mxfp4 exponents run 8 to 239: below that a weight times an activation can be
+a float32 subnormal, which the GPU may flush, and above it a row sum leaves
+the float32 range. The GLU arms square the range and use 64 to 180. The
+float16 arms use nvfp4 scales 0x08 to 0x47.
 
 Under KQUANT_FORCE_CPU only dequantize and the default matmul route run,
 with KQ_CPU_NEON=0: the NEON GEMV rounds activations to int8 by design
@@ -29,40 +36,37 @@ import numpy as np
 import pytest
 from gguf import GGMLQuantizationType as GT
 from gguf import quants
+from kqref import mxfp4_deinterleave
 
 import mlx_kquant as kq
 
 N, K, E = 256, 512, 4
 FORCE_CPU = bool(os.environ.get("KQUANT_FORCE_CPU"))
-# Largest |err| / max |ref| by activation dtype (test_alu_dequantize_rows R1).
-REL = {"bfloat16": 6e-3, "float16": 1e-3}
+# 2^-8 and 2^-10 of |x| @ |w|^T: one output rounding plus one partial rounding.
+TOL = {"bfloat16": 4e-3, "float16": 1e-3}
 ROUTES = ("qmv", "mv_ext", "verify_nax", "splitk", "nax", "nax_splitk")
+WIRES = ("nvfp4_all", "nvfp4_low", "nvfp4_mid", "mxfp4_all", "mxfp4_mid")
 
 
 def _wire(name):
     rng = np.random.default_rng(7)
+    n = np.arange(N)[:, None]
     if name.startswith("nvfp4"):
-        nb = N * (K // 64)
-        w = rng.integers(0, 256, (nb, 36), dtype=np.uint8)
-        if name == "nvfp4_all":
-            sc = np.arange(nb * 4) % 256
-        elif name == "nvfp4_low":  # 0x00, the subnormals and small normals
-            sc = np.arange(nb * 4) % 0x18
-        else:  # nvfp4_mid: the band real files use, float16 safe
-            sc = 0x08 + np.arange(nb * 4) % 0x40
-        w[:, :4] = sc.reshape(nb, 4).astype(np.uint8)
+        base = {"nvfp4_all": n, "nvfp4_low": n % 0x18, "nvfp4_mid": 0x08 + n % 0x40}
+        sub = np.arange(K // 16)[None, :]
+        sc = (base[name] & 0xF8) | ((n + sub) & 7)
+        w = rng.integers(0, 256, (N, K // 64, 36), dtype=np.uint8)
+        w[:, :, :4] = sc.reshape(N, K // 64, 4).astype(np.uint8)
         return "nvfp4", GT.NVFP4, w.reshape(N, -1)
-    nb = N * (K // 32)
-    w = rng.integers(0, 256, (nb, 17), dtype=np.uint8)
-    w[:, 0] = (8 + np.arange(nb) % 193).astype(np.uint8)
+    lo, span = {"mxfp4_all": (8, 231), "mxfp4_mid": (64, 116)}[name]
+    blk = np.arange(K // 32)[None, :]
+    w = rng.integers(0, 256, (N, K // 32, 17), dtype=np.uint8)
+    w[:, :, 0] = (lo + n % span + ((n + blk) & 1)).astype(np.uint8)
     return "mxfp4", GT.MXFP4, w.reshape(N, -1)
 
 
 def _ref(wire, gtype):
     return quants.dequantize(np.ascontiguousarray(wire), gtype).astype(np.float32)
-
-
-WIRES = ("nvfp4_all", "nvfp4_low", "nvfp4_mid", "mxfp4_all")
 
 
 @pytest.mark.parametrize("name", WIRES)
@@ -89,13 +93,17 @@ def test_dequantize_matches_reference_bit_for_bit(name):
     assert len(np.unique(blocks[:, off:] & 0xF)) == 16
 
 
-def _check(out, x64, w64, dtn):
-    ref = x64 @ w64.T
-    got = np.asarray(out.astype(mx.float32)).astype(np.float64)
-    assert got.shape == ref.shape
+def _check(out, ref, bound, dtn):
+    got = np.asarray(out.astype(mx.float32)).astype(np.float64).reshape(ref.shape)
     assert np.isfinite(got).all()
-    err = np.abs(got - ref).max()
-    assert err <= REL[dtn] * np.abs(ref).max(), (err, np.abs(ref).max())
+    bad = np.abs(got - ref) > TOL[dtn] * bound
+    assert not bad.any(), f"{int(bad.sum())} outputs past the bound"
+
+
+def _x(M, dtn):
+    x = mx.random.normal((M, K), key=mx.random.key(M)).astype(getattr(mx, dtn))
+    mx.eval(x)
+    return x, np.asarray(x.astype(mx.float32)).astype(np.float64)
 
 
 def _arms(name):
@@ -110,9 +118,8 @@ def test_matmul_routes(name, dtn, M):
     w64 = _ref(wire, gtype).astype(np.float64)
     w = mx.array(wire)
     s = mx.zeros((1,), mx.uint8)
-    x = mx.random.normal((M, K), key=mx.random.key(M)).astype(getattr(mx, dtn))
-    mx.eval(x)
-    x64 = np.asarray(x.astype(mx.float32)).astype(np.float64)
+    x, x64 = _x(M, dtn)
+    ref, bound = x64 @ w64.T, np.abs(x64) @ np.abs(w64).T
     if FORCE_CPU:
         prev = os.environ.get("KQ_CPU_NEON")
         os.environ["KQ_CPU_NEON"] = "0"
@@ -124,9 +131,9 @@ def test_matmul_routes(name, dtn, M):
                 os.environ.pop("KQ_CPU_NEON", None)
             else:
                 os.environ["KQ_CPU_NEON"] = prev
-        _check(out, x64, w64, dtn)
+        _check(out, ref, bound, dtn)
         return
-    _check(kq.quantized_matmul(x, w, s, codec, transpose=True), x64, w64, dtn)
+    _check(kq.quantized_matmul(x, w, s, codec, transpose=True), ref, bound, dtn)
     ran = []
     old = os.environ.get("KQ_QMM_ROUTE")
     os.environ["KQ_QMM_ROUTE_STRICT"] = "1"
@@ -138,7 +145,7 @@ def test_matmul_routes(name, dtn, M):
                 mx.eval(out)
             except (RuntimeError, ValueError):
                 continue  # strict mode: the route does not serve this cell
-            _check(out, x64, w64, dtn)
+            _check(out, ref, bound, dtn)
             ran.append(r)
     finally:
         os.environ.pop("KQ_QMM_ROUTE_STRICT", None)
@@ -151,54 +158,91 @@ def test_matmul_routes(name, dtn, M):
     assert ran or M >= 256, "no forced route served the cell"
 
 
+def _experts(name):
+    codec, gtype, wire = _wire(name)
+    stack = np.stack([np.roll(wire, i, axis=0) for i in range(E)])
+    w64 = np.stack([_ref(stack[e], gtype) for e in range(E)]).astype(np.float64)
+    return codec, stack, w64
+
+
+def _per_row(x64, w64, ind):
+    """ref and bound for token i against expert ind[i]."""
+    ref = np.stack([x64[i] @ w64[e].T for i, e in enumerate(ind)])
+    bound = np.stack([np.abs(x64[i]) @ np.abs(w64[e]).T for i, e in enumerate(ind)])
+    return ref, bound
+
+
+def _silu_glu(g):
+    with np.errstate(over="ignore"):
+        return g / (1 + np.exp(-g)) * g
+
+
 @pytest.mark.skipif(FORCE_CPU, reason="gather and MoE kernels are Metal paths")
 @pytest.mark.parametrize("name,dtn", [a for n in WIRES for a in _arms(n)])
 @pytest.mark.parametrize("M", (8, 256))
 def test_gather_and_moe_families(name, dtn, M):
-    codec, gtype, wire = _wire(name)
-    dt = getattr(mx, dtn)
-    stack = np.stack([np.roll(wire, i, axis=0) for i in range(E)])
-    w64 = np.stack([_ref(stack[e], gtype) for e in range(E)]).astype(np.float64)
+    codec, stack, w64 = _experts(name)
     we = mx.array(stack)
     s = mx.zeros((1,), mx.uint8)
-    x = mx.random.normal((M, K), key=mx.random.key(M)).astype(dt)
-    mx.eval(x)
-    x64 = np.asarray(x.astype(mx.float32)).astype(np.float64)
+    x, x64 = _x(M, dtn)
     ind = np.sort(np.arange(M) % E).astype(np.uint32)
-    ref = np.stack([x64[i] @ w64[ind[i]].T for i in range(M)])
-
-    def check(out):
-        got = np.asarray(out.astype(mx.float32)).astype(np.float64).reshape(ref.shape)
-        assert np.isfinite(got).all()
-        assert np.abs(got - ref).max() <= REL[dtn] * np.abs(ref).max()
-
-    check(
-        kq.gather_qmm(
-            x.reshape(M, 1, K),
-            we,
-            s,
-            codec,
-            rhs_indices=mx.array(ind),
-            transpose=True,
-            sorted_indices=True,
-        )
+    ref, bound = _per_row(x64, w64, ind)
+    out = kq.gather_qmm(
+        x.reshape(M, 1, K),
+        we,
+        s,
+        codec,
+        rhs_indices=mx.array(ind),
+        transpose=True,
+        sorted_indices=True,
     )
+    _check(out, ref, bound, dtn)
     tmap, counts = kq.expert_tile_map(mx.array(ind), E)
-    check(kq.gather_qmm_seg(x, we, s, codec, tmap, counts))
-    # The GLU product squares the weight range: mxfp4's 2^73 scales pass
-    # float32, and the float16 arm scales x by 2^-5 to stay in range.
-    if M <= 16 and name != "mxfp4_all":
-        if dtn == "float16":
-            x = x * 0.03125
-            x64 = x64 * 0.03125
-        ind2 = mx.array((np.arange(M * 2) % E).astype(np.uint32)).reshape(M, 2)
-        out = kq.moe_glu_gather_kq(x, we, we, codec, ind2, act="silu")
-        got = np.asarray(out.astype(mx.float32)).astype(np.float64)
-        i2 = np.asarray(ind2).reshape(-1)
-        g = np.stack([x64[t // 2] @ w64[i2[t]].T for t in range(M * 2)])
-        want = (g / (1 + np.exp(-g))) * g
-        assert np.isfinite(got).all()
-        assert (
-            np.abs(got.reshape(want.shape) - want).max()
-            <= 4 * REL[dtn] * np.abs(want).max()
-        )
+    _check(kq.gather_qmm_seg(x, we, s, codec, tmap, counts), ref, bound, dtn)
+    if M > 16:
+        return
+    # Decode: two expert slots per token.
+    ind2 = (np.arange(M * 2) % E).astype(np.uint32)
+    x2 = np.repeat(x64, 2, axis=0)
+    ref, bound = _per_row(x2, w64, ind2)
+    h = mx.repeat(x[:, None], 2, axis=1)
+    out = kq.gather_qmv_kq(h, we, codec, mx.array(ind2).reshape(M, 2))
+    _check(out, ref, bound, dtn)
+    if name == "mxfp4_all":
+        return  # the GLU squares the range past float32
+    if dtn == "float16":  # keep the float16 product in range
+        x = x * 0.03125
+        x64 = np.asarray(x.astype(mx.float32)).astype(np.float64)
+        ref, bound = _per_row(np.repeat(x64, 2, axis=0), w64, ind2)
+    out = kq.moe_glu_gather_kq(
+        x, we, we, codec, mx.array(ind2).reshape(M, 2), act="silu"
+    )
+    _check(out, _silu_glu(ref), bound * np.abs(ref), dtn)
+
+
+@pytest.mark.skipif(FORCE_CPU, reason="gather and MoE kernels are Metal paths")
+@pytest.mark.parametrize("name", ("mxfp4_all", "mxfp4_mid"))
+def test_packed_mxfp4_moe(name):
+    """The MLX-layout mxfp4 MoE kernels (the gpt-oss path) on the same wires."""
+    M, dtn = 8, "bfloat16"
+    _, stack, w64 = _experts(name)
+    pw, ps = (mx.array(a) for a in mxfp4_deinterleave(stack))
+    zb = mx.zeros((E, N), mx.float32)
+    x, x64 = _x(M, dtn)
+    ind2 = (np.arange(M * 2) % E).astype(np.uint32)
+    inds = mx.array(ind2).reshape(M, 2)
+    ref, bound = _per_row(np.repeat(x64, 2, axis=0), w64, ind2)
+    h = mx.repeat(x[:, None], 2, axis=1)
+    _check(kq.gather_qmv_bias(h, pw, ps, zb, inds), ref, bound, dtn)
+    sc = np.linspace(0.25, 1.0, M * 2).astype(np.float32)
+    mix = (sc[:, None] * ref).reshape(M, 2, N).sum(1)
+    mix_bound = (sc[:, None] * bound).reshape(M, 2, N).sum(1)
+    out = kq.gather_qmv_mix_bias(h, pw, ps, zb, inds, mx.array(sc.reshape(M, 2)))
+    _check(out, mix, mix_bound, dtn)
+    if name == "mxfp4_all":
+        return  # the GLU squares the range past float32
+    # gpt-oss clamped SwiGLU with the clamp out of reach: g sig(1.702 g) (u + 1).
+    out = kq.moe_glu_gather(x, pw, ps, zb, pw, ps, zb, inds, 1.702, 1e30)
+    with np.errstate(over="ignore"):
+        want = ref / (1 + np.exp(-1.702 * ref)) * (ref + 1)
+    _check(out, want, bound * (np.abs(ref) + 1), dtn)
