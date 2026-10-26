@@ -15,7 +15,9 @@ sum passes the float32 range.
 The float16 arms use the nvfp4 wire whose scales stay under 0x48, since the
 large scales overflow a float16 output.
 
-Under KQUANT_FORCE_CPU only dequantize and the default matmul route run.
+Under KQUANT_FORCE_CPU only dequantize and the default matmul route run,
+with KQ_CPU_NEON=0: the NEON GEMV rounds activations to int8 by design
+(test_cpu_neon.py covers it), and this file tests the decode.
 """
 
 from __future__ import annotations
@@ -111,9 +113,20 @@ def test_matmul_routes(name, dtn, M):
     x = mx.random.normal((M, K), key=mx.random.key(M)).astype(getattr(mx, dtn))
     mx.eval(x)
     x64 = np.asarray(x.astype(mx.float32)).astype(np.float64)
-    _check(kq.quantized_matmul(x, w, s, codec, transpose=True), x64, w64, dtn)
     if FORCE_CPU:
+        prev = os.environ.get("KQ_CPU_NEON")
+        os.environ["KQ_CPU_NEON"] = "0"
+        try:
+            out = kq.quantized_matmul(x, w, s, codec, transpose=True)
+            mx.eval(out)
+        finally:
+            if prev is None:
+                os.environ.pop("KQ_CPU_NEON", None)
+            else:
+                os.environ["KQ_CPU_NEON"] = prev
+        _check(out, x64, w64, dtn)
         return
+    _check(kq.quantized_matmul(x, w, s, codec, transpose=True), x64, w64, dtn)
     ran = []
     old = os.environ.get("KQ_QMM_ROUTE")
     os.environ["KQ_QMM_ROUTE_STRICT"] = "1"
