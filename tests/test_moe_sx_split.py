@@ -358,8 +358,10 @@ def test_sx_split_order_visible(runs):
 def test_sx_split_default_rule(runs):
     """The default pick runs two pieces at one row and one at two rows, so
     the cancelling shared row sums to zero at one row and leaves a residue
-    at two."""
-    outs, _ = runs
+    at two. With the lever unset the pick warns nothing."""
+    outs, log = runs
+    warned = [ln for ln in log.splitlines() if ln.startswith("[mlx_kquant] ")]
+    assert not warned, warned[:3]
     for name, *_ in CANCEL:
         one_row = outs[f"cancel/{name}/default/1"]
         two_rows = outs[f"cancel/{name}/default/2"]

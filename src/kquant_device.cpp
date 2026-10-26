@@ -112,13 +112,16 @@ int kq_env_flag(const char* name, int unset) {
 }
 
 int kq_env_lever_from(const char* name, int unset, int lowest) {
+  const char* e = std::getenv(name);
+  if (e == nullptr || e[0] == '\0') {
+    return unset;
+  }
   const int v = parse_env_lever(name, unset, false);
   if (v >= lowest) {
     return v;
   }
-  const char* e = std::getenv(name);
   const std::string takes = "an integer of at least " + std::to_string(lowest);
-  warn_env_lever(name, e != nullptr ? e : "", takes.c_str());
+  warn_env_lever(name, e, takes.c_str());
   return unset;
 }
 
