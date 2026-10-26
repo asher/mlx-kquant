@@ -3012,8 +3012,8 @@ struct KqNaxMxfp4BlockLoader {
       const float d = kq_fp_e8m0_scale(e);
 #pragma unroll
       for (short j = 0; j < 16; j++) {
-        dst[j] = T(d * kq_fp_e2m1_lut[q[j] & 0x0Fu]);
-        dst[j + 16] = T(d * kq_fp_e2m1_lut[q[j] >> 4]);
+        dst[j] = T(d * kq_fp_e2m1_value(uint(q[j] & 0x0Fu)));
+        dst[j + 16] = T(d * kq_fp_e2m1_value(uint(q[j] >> 4)));
       }
     } else {
       const float d = kq_fp_e8m0_scale(block_addr[0]);
@@ -3021,7 +3021,7 @@ struct KqNaxMxfp4BlockLoader {
       for (short i = 0; i < n_reads; i++) {
         const int j = within + i;
         const int x = (j < 16) ? (qs[j] & 0x0Fu) : (qs[j - 16] >> 4);
-        dst[i] = T(d * kq_fp_e2m1_lut[x]);
+        dst[i] = T(d * kq_fp_e2m1_value(uint(x)));
       }
     }
   }

@@ -27,25 +27,17 @@
 // The load / E8M0-scale / fp4-dot primitives are self-contained (kq_ prefix):
 // the stock fp_quantized.h copies collide with this repo's quantized_utils.h
 // shims, and the decode must stay bit-identical to MLX's mode="mxfp4" path
-// (OCP E2M1 value table, one E8M0 scale per 32 values).
+// (OCP E2M1 values, one E8M0 scale per 32 values).
 
-constant float kq_fp4_e2m1_lut[16] = {
-    0.0f,
-    0.5f,
-    1.0f,
-    1.5f,
-    2.0f,
-    3.0f,
-    4.0f,
-    6.0f,
-    -0.0f,
-    -0.5f,
-    -1.0f,
-    -1.5f,
-    -2.0f,
-    -3.0f,
-    -4.0f,
-    -6.0f};
+// E2M1 code c = s e1 e0 m to its value without a table (same construction
+// as kq_fp_e2m1_value in kq_quantized_fp.h, kept local so this header stays
+// self-contained): exponent field e + 126 with mantissa bit 22 = m for
+// e > 0, m/2 for e = 0, sign to bit 31. Exact, no memory read.
+inline float kq_fp4_e2m1_value(uint c) {
+  const float n = as_type<float>(((c & 7u) << 22) + 0x3F000000u);
+  const float mag = (c & 6u) ? n : float(c & 1u) * 0.5f;
+  return as_type<float>(as_type<uint>(mag) | ((c & 8u) << 28));
+}
 
 // 2^(e-127) built from bits, matching MLX's fp8_e8m0 float conversion:
 // metal::exp2 is fast-math and lands ulps off on some compiler versions.
@@ -66,10 +58,10 @@ inline U kq_fp4_qdot(const device uint8_t* w, const thread U* xt, U scale) {
   U accum = 0;
   const device uint16_t* ws = (const device uint16_t*)w;
   for (int i = 0; i < VPT / 4; i++) {
-    accum += xt[4 * i + 0] * kq_fp4_e2m1_lut[(ws[i] >> 0) & 0xF] +
-        xt[4 * i + 1] * kq_fp4_e2m1_lut[(ws[i] >> 4) & 0xF] +
-        xt[4 * i + 2] * kq_fp4_e2m1_lut[(ws[i] >> 8) & 0xF] +
-        xt[4 * i + 3] * kq_fp4_e2m1_lut[(ws[i] >> 12) & 0xF];
+    accum += xt[4 * i + 0] * kq_fp4_e2m1_value(uint((ws[i] >> 0) & 0xF)) +
+        xt[4 * i + 1] * kq_fp4_e2m1_value(uint((ws[i] >> 4) & 0xF)) +
+        xt[4 * i + 2] * kq_fp4_e2m1_value(uint((ws[i] >> 8) & 0xF)) +
+        xt[4 * i + 3] * kq_fp4_e2m1_value(uint((ws[i] >> 12) & 0xF));
   }
   return scale * accum;
 }

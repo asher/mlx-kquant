@@ -8,9 +8,9 @@
 // MXFP8: 33 bytes/32 weights. [uint8 E8M0 e][uint8 E4M3 qs[32]],
 //   w[j] = e4m3(qs[j]) * 2^(e - 127). Gather-only: dequantize kernels only.
 //
-// Real-value E2M1 LUT + full scales (the Metal convention; the CPU kernels
-// use ggml's doubled-int8 LUT + half scales - same products, never mixed
-// within one kernel).
+// Real-value E2M1 codes + full scales (the Metal convention; the CPU
+// kernels use ggml's doubled-int8 LUT + half scales - same products, never
+// mixed within one kernel).
 
 MLX_MTL_CONST int KQ_MXFP4_GROUP = 32;
 MLX_MTL_CONST int KQ_MXFP4_BLOCK_BYTES = 17;
@@ -24,23 +24,15 @@ MLX_MTL_CONST int KQ_MXFP8_GROUP = 32;
 MLX_MTL_CONST int KQ_MXFP8_BLOCK_BYTES = 33;
 MLX_MTL_CONST int KQ_MXFP8_QS_OFFSET = 1;
 
-constant float kq_fp_e2m1_lut[16] = {
-    0.0f,
-    0.5f,
-    1.0f,
-    1.5f,
-    2.0f,
-    3.0f,
-    4.0f,
-    6.0f,
-    -0.0f,
-    -0.5f,
-    -1.0f,
-    -1.5f,
-    -2.0f,
-    -3.0f,
-    -4.0f,
-    -6.0f};
+// E2M1 code c = s e1 e0 m to its value without a table. For e > 0 the value
+// is 2^(e-1) * (1 + m/2): the float whose exponent field is e + 126 and whose
+// mantissa bit 22 is m. For e = 0 it is m/2. The sign bit moves to bit 31,
+// so code 8 is -0.0 like the table it replaces. Selects, no memory, exact.
+inline float kq_fp_e2m1_value(uint c) {
+  const float n = as_type<float>(((c & 7u) << 22) + 0x3F000000u);
+  const float mag = (c & 6u) ? n : float(c & 1u) * 0.5f;
+  return as_type<float>(as_type<uint>(mag) | ((c & 8u) << 28));
+}
 
 // 2^(e-127) built from bits: metal::exp2 is fast-math and lands ulps off on
 // some compiler versions. e == 0 is the f32 subnormal 2^-127.
@@ -50,15 +42,17 @@ inline float kq_fp_e8m0_scale(uint8_t e) {
 
 // Unsigned E4M3 (bias 7); 0x00 and 0x7F (the NaN encoding) decode to 0.
 // Normals assembled from bits (biased f32 exponent e + 120, mantissa m << 20)
-// for the same fast-math reason; the subnormal product is exact as written.
+// because metal::exp2 is fast-math; the subnormal product is exact as
+// written. Two selects, no branch: e == 0 picks the subnormal (0 for v == 0),
+// then the NaN code is zeroed. Bit 7 is ignored, so 0xFF decodes like 0x7F
+// would without the NaN rule, as ggml does.
 inline float kq_fp_ue4m3_scale(uint8_t v) {
-  if (v == 0 || v == 0x7F) {
-    return 0.0f;
-  }
   const uint e = (v >> 3) & 0xF;
   const uint m = v & 0x7;
-  return e == 0 ? float(m) * 0.001953125f /* 2^-9 */
-                : as_type<float>((e + 120u) << 23 | m << 20);
+  const float norm = as_type<float>((e + 120u) << 23 | m << 20);
+  const float sub = float(m) * 0.001953125f; /* 2^-9 */
+  const float r = e ? norm : sub;
+  return (v == 0x7F) ? 0.0f : r;
 }
 
 // ---------------------------------------------------------------------------
@@ -83,7 +77,7 @@ METAL_FUNC void kq_mxfp4_dequantize_impl(
   const device uint8_t* qs = block_addr + KQ_MXFP4_QS_OFFSET;
   const int nib =
       (within < 16) ? (int(qs[within]) & 0x0F) : (int(qs[within - 16]) >> 4);
-  out[gid] = T(d * kq_fp_e2m1_lut[nib]);
+  out[gid] = T(d * kq_fp_e2m1_value(uint(nib)));
 }
 
 template <typename T, int group_size, int bits>
@@ -109,7 +103,7 @@ METAL_FUNC void kq_mxfp4_deq_chunk16(
 #pragma unroll
   for (int i = 0; i < 16; ++i) {
     const int nib = (int(qs[i]) >> shift) & 0x0F;
-    reg[i / 4][i % 4] = d * kq_fp_e2m1_lut[nib];
+    reg[i / 4][i % 4] = d * kq_fp_e2m1_value(uint(nib));
   }
 }
 
@@ -186,25 +180,25 @@ METAL_FUNC void kq_mxfp4_qmv_impl(
       const U d = U(kq_fp_e8m0_scale(blk[0]));
       const device uint8_t* q = blk + KQ_MXFP4_QS_OFFSET + 8 * it;
       float4 acc = yl0 *
-          float4(kq_fp_e2m1_lut[q[0] & 0x0F],
-                 kq_fp_e2m1_lut[q[1] & 0x0F],
-                 kq_fp_e2m1_lut[q[2] & 0x0F],
-                 kq_fp_e2m1_lut[q[3] & 0x0F]);
+          float4(kq_fp_e2m1_value(uint(q[0] & 0x0F)),
+                 kq_fp_e2m1_value(uint(q[1] & 0x0F)),
+                 kq_fp_e2m1_value(uint(q[2] & 0x0F)),
+                 kq_fp_e2m1_value(uint(q[3] & 0x0F)));
       acc += yl1 *
-          float4(kq_fp_e2m1_lut[q[0] >> 4],
-                 kq_fp_e2m1_lut[q[1] >> 4],
-                 kq_fp_e2m1_lut[q[2] >> 4],
-                 kq_fp_e2m1_lut[q[3] >> 4]);
+          float4(kq_fp_e2m1_value(uint(q[0] >> 4)),
+                 kq_fp_e2m1_value(uint(q[1] >> 4)),
+                 kq_fp_e2m1_value(uint(q[2] >> 4)),
+                 kq_fp_e2m1_value(uint(q[3] >> 4)));
       acc += yl2 *
-          float4(kq_fp_e2m1_lut[q[4] & 0x0F],
-                 kq_fp_e2m1_lut[q[5] & 0x0F],
-                 kq_fp_e2m1_lut[q[6] & 0x0F],
-                 kq_fp_e2m1_lut[q[7] & 0x0F]);
+          float4(kq_fp_e2m1_value(uint(q[4] & 0x0F)),
+                 kq_fp_e2m1_value(uint(q[5] & 0x0F)),
+                 kq_fp_e2m1_value(uint(q[6] & 0x0F)),
+                 kq_fp_e2m1_value(uint(q[7] & 0x0F)));
       acc += yl3 *
-          float4(kq_fp_e2m1_lut[q[4] >> 4],
-                 kq_fp_e2m1_lut[q[5] >> 4],
-                 kq_fp_e2m1_lut[q[6] >> 4],
-                 kq_fp_e2m1_lut[q[7] >> 4]);
+          float4(kq_fp_e2m1_value(uint(q[4] >> 4)),
+                 kq_fp_e2m1_value(uint(q[5] >> 4)),
+                 kq_fp_e2m1_value(uint(q[6] >> 4)),
+                 kq_fp_e2m1_value(uint(q[7] >> 4)));
       result[row] += d * ((acc.x + acc.y) + (acc.z + acc.w));
     }
   }
@@ -284,8 +278,8 @@ struct KqMxfp4BlockLoader {
 #pragma unroll
     for (short i = 0; i < bytes_per_thread; i++) {
       const uint8_t b = qs[i];
-      dst[i] = T(d * kq_fp_e2m1_lut[b & 0x0F]);
-      dst[half_block + i] = T(d * kq_fp_e2m1_lut[b >> 4]);
+      dst[i] = T(d * kq_fp_e2m1_value(uint(b & 0x0F)));
+      dst[half_block + i] = T(d * kq_fp_e2m1_value(uint(b >> 4)));
     }
   }
 
@@ -608,7 +602,7 @@ METAL_FUNC void kq_nvfp4_dequantize_impl(
   const float d = kq_fp_ue4m3_scale(block_addr[g]);
   const uint8_t b = block_addr[KQ_NVFP4_QS_OFFSET + 8 * g + (j % 8)];
   const int nib = (j < 8) ? (b & 0x0F) : (b >> 4);
-  out[gid] = T(d * kq_fp_e2m1_lut[nib]);
+  out[gid] = T(d * kq_fp_e2m1_value(uint(nib)));
 }
 
 template <typename T, int group_size, int bits>
@@ -634,10 +628,10 @@ METAL_FUNC uint2 kq_nvfp4_group_qs(const device uint8_t* block, int g) {
 // E2M1 values of nibble `shift` (0 low, 4 high) of each byte of `q`.
 METAL_FUNC float4 kq_nvfp4_nibbles4(uint32_t q, uint shift) {
   return float4(
-      kq_fp_e2m1_lut[(q >> shift) & 0x0F],
-      kq_fp_e2m1_lut[(q >> (8 + shift)) & 0x0F],
-      kq_fp_e2m1_lut[(q >> (16 + shift)) & 0x0F],
-      kq_fp_e2m1_lut[(q >> (24 + shift)) & 0x0F]);
+      kq_fp_e2m1_value(uint((q >> shift) & 0x0F)),
+      kq_fp_e2m1_value(uint((q >> (8 + shift)) & 0x0F)),
+      kq_fp_e2m1_value(uint((q >> (16 + shift)) & 0x0F)),
+      kq_fp_e2m1_value(uint((q >> (24 + shift)) & 0x0F)));
 }
 
 // Natural-order chunk [il*16, il*16+16) == sub-scale group il; il in [0,4).
@@ -842,7 +836,7 @@ struct KqNvfp4BlockLoader {
         const float d = kq_fp_ue4m3_scale(src[g]);
         const uint8_t b = src[KQ_NVFP4_QS_OFFSET + 8 * g + (j % 8)];
         const int nib = (j < 8) ? (b & 0x0F) : (b >> 4);
-        dst[i] = T(d * kq_fp_e2m1_lut[nib]);
+        dst[i] = T(d * kq_fp_e2m1_value(uint(nib)));
       }
     }
   }
