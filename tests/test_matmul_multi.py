@@ -258,6 +258,77 @@ def test_grad_matches_per_weight():
     assert np.allclose(np.array(g1), np.array(g2), rtol=2e-2, atol=2e-2)
 
 
+def _real_scale(rng, n):
+    s = np.exp2(rng.uniform(np.log2(5e-5), np.log2(4.4e-4), n))
+    return mx.array(s.astype(np.float32))
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("splits", [1, 2])
+def test_out_scales_match_per_weight(dtype, splits, exact_levers):
+    """out_scales, the .scale of an NVFP4 GGUF per weight: each output is
+    that weight's quantized_matmul with its out_scale, bit for bit. One call
+    holds no scale, (1,) scales and (N_i,) scales over five weights, so it
+    runs two dispatches, and at x times 3000 the float16 sums pass 65504
+    before the scale."""
+    exact_levers(splits)
+    k = 512
+    ns = NS + [96]
+    ws = [_synth("nvfp4", n, k, i) for i, n in enumerate(ns)]
+    rng = np.random.default_rng(5)
+    scales = [
+        None,
+        _real_scale(rng, 1),
+        _real_scale(rng, ns[2]),
+        _real_scale(rng, 1),
+        _real_scale(rng, ns[4]),
+    ]
+    sc = mx.zeros((1,), mx.uint8)
+    for m, mult in ((1, 1.0), (2, 1.0), (8, 1.0), (4, 3000.0)):
+        x = (_x(m, k, mx.float32) * mult).astype(dtype)
+        got = kq.quantized_matmul_multi(x, ws, "nvfp4", out_scales=scales)
+        want = [
+            kq.quantized_matmul(x, w, sc, "nvfp4", transpose=True, out_scale=s)
+            for w, s in zip(ws, scales, strict=True)
+        ]
+        mx.eval(got, want)
+        for i, (g, w) in enumerate(zip(got, want, strict=True)):
+            assert _equal(g, w), (m, i)
+            if scales[i] is not None:
+                assert np.isfinite(np.array(g.astype(mx.float32))).all(), (m, i)
+
+
+def test_out_scales_grad_matches_per_weight():
+    ws = [_synth("nvfp4", n, 512, i) for i, n in enumerate(NS)]
+    rng = np.random.default_rng(6)
+    scales = [_real_scale(rng, 1), None, _real_scale(rng, NS[2]), _real_scale(rng, 1)]
+    x = _x(6, 512, mx.float32)
+    cot = [mx.random.normal((6, n), key=mx.random.key(n)) for n in NS]
+    sc = mx.zeros((1,), mx.uint8)
+
+    def f_multi(x):
+        ys = kq.quantized_matmul_multi(x, ws, "nvfp4", out_scales=scales)
+        return sum(
+            (y.astype(mx.float32) * c).sum() for y, c in zip(ys, cot, strict=True)
+        )
+
+    def f_each(x):
+        ys = [
+            kq.quantized_matmul(x, w, sc, "nvfp4", transpose=True, out_scale=s)
+            for w, s in zip(ws, scales, strict=True)
+        ]
+        return sum(
+            (y.astype(mx.float32) * c).sum() for y, c in zip(ys, cot, strict=True)
+        )
+
+    g1 = mx.grad(f_multi)(x)
+    g2 = mx.grad(f_each)(x)
+    mx.eval(g1, g2)
+    # As test_grad_matches_per_weight: the op sums the weights' gradients
+    # in bfloat16.
+    assert np.allclose(np.array(g1), np.array(g2), rtol=2e-2, atol=2e-2)
+
+
 def test_argument_errors():
     w, _ = _weight("q4_0", 64, 512, 0)
     x = _x(4, 512, mx.bfloat16)
@@ -269,6 +340,14 @@ def test_argument_errors():
         kq.quantized_matmul_multi(_x(4, 256, mx.bfloat16), [w], "q4_0")
     with pytest.raises(ValueError):
         kq.quantized_matmul_multi(x, [w], "no_such_codec")
+    one = mx.ones((1,))
+    with pytest.raises(ValueError, match="for nvfp4"):
+        kq.quantized_matmul_multi(x, [w], "q4_0", out_scales=[one])
+    nv = _synth("nvfp4", 64, 512, 0)
+    with pytest.raises(ValueError, match="one entry per weight"):
+        kq.quantized_matmul_multi(x, [nv, nv], "nvfp4", out_scales=[one])
+    with pytest.raises(ValueError, match="float32"):
+        kq.quantized_matmul_multi(x, [nv], "nvfp4", out_scales=[mx.ones((64, 1))])
 
 
 _LOG_CHILD = r"""
@@ -277,8 +356,19 @@ import mlx.core as mx
 import mlx_kquant as kq
 codec, m, k, ns, steps = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), \
     json.loads(sys.argv[4]), json.loads(sys.argv[5])
-w = [kq.quantize(mx.random.normal((n, k), key=mx.random.key(i)) * 0.1, codec)[0]
-     for i, n in enumerate(ns)]
+import numpy as np
+
+
+def weight(i, n):
+    if codec == "nvfp4":  # random codes, sane group scales
+        rng = np.random.default_rng(i)
+        b = rng.integers(0, 256, (n, k // 64, 36), dtype=np.uint8)
+        b[:, :, :4] = rng.integers(0x30, 0x41, (n, k // 64, 4))
+        return mx.array(b.reshape(n, -1))
+    return kq.quantize(mx.random.normal((n, k), key=mx.random.key(i)) * 0.1, codec)[0]
+
+
+w = [weight(i, n) for i, n in enumerate(ns)]
 x = mx.random.normal((m, k), key=mx.random.key(9)).astype(mx.bfloat16)
 sc = mx.zeros((1,), mx.uint8)
 mx.eval(w, x)
@@ -289,6 +379,9 @@ for i, (op, env) in enumerate(steps):
     sys.stderr.flush()
     if op == "multi":
         out = kq.quantized_matmul_multi(x, w, codec)
+    elif op == "multi_os":
+        out = kq.quantized_matmul_multi(
+            x, w, codec, out_scales=[mx.ones((1,))] * len(w))
     else:
         out = [kq.quantized_matmul(x, wi, sc, codec, transpose=True) for wi in w]
     mx.eval(out)
@@ -335,6 +428,23 @@ NAX_ONLY = pytest.mark.skipif(
 def test_one_dispatch_on_nax():
     (names,) = _census([["multi", {}]], env={"KQ_VERIFY_NAX_SPLITS": "1"})
     assert len(names) == 1 and "verify_nax_multi" in names[0], names
+
+
+@NAX_ONLY
+def test_out_scales_one_dispatch_on_nax():
+    # One split scales in the kernel; two scale in a fold per weight.
+    env = {"KQ_VERIFY_NAX": "2"}
+    one, two = _census(
+        [
+            ["multi_os", {"KQ_VERIFY_NAX_SPLITS": "1"}],
+            ["multi_os", {"KQ_VERIFY_NAX_SPLITS": "2"}],
+        ],
+        codec="nvfp4",
+        env=env,
+    )
+    assert len(one) == 1 and "verify_nax_multi" in one[0], one
+    assert one[0].endswith("_os1"), one
+    assert len(two) == 1 and "verify_nax_multi" in two[0], two
 
 
 @NAX_ONLY

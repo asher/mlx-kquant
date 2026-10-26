@@ -772,6 +772,7 @@ NB_MODULE(_ext, m) {
       "weights"_a,
       "kquant_type"_a,
       nb::kw_only(),
+      "out_scales"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Quantized matmuls of several weights that share x:
@@ -795,6 +796,9 @@ NB_MODULE(_ext, m) {
             weights (list[array]): 2-D uint8 wire bytes [N_i, K bytes] of
                 one codec.
             kquant_type (str): the codec of every weight.
+            out_scales (list, optional): one entry per weight, None or
+                that weight's float32 scale of shape (1,) or (N_i,), as
+                out_scale of quantized_matmul. nvfp4 only.
 
         Returns:
             list[array]: [..., N_i] per weight, in the dtype
@@ -2145,6 +2149,8 @@ NB_MODULE(_ext, m) {
       "up_bias"_a = nb::none(),
       "alpha"_a = 0.0f,
       nb::kw_only(),
+      "gate_scale"_a = nb::none(),
+      "up_scale"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Fused MoE GLU gather for K-quant expert stacks: gate and up expert
@@ -2169,6 +2175,12 @@ NB_MODULE(_ext, m) {
                 'swiglu_clamp' only.
             up_bias (array, optional): same shape, 'swiglu_clamp' only.
             alpha (float): sigmoid slope for 'swiglu_clamp'.
+            gate_scale (array, optional): float32 scale of the gate
+                product, shape (1,), (N,), (n_experts, 1) or
+                (n_experts, N), applied before the bias and the
+                activation. nvfp4 only (the ``.scale`` of an NVFP4 GGUF).
+            up_scale (array, optional): the same for up. Pass both or
+                neither, with one shape.
 
         Returns:
             array: activated hidden states [T, R, N] in x.dtype.
@@ -2188,6 +2200,7 @@ NB_MODULE(_ext, m) {
       "lora_ids"_a = nb::none(),
       "lora_table"_a = nb::none(),
       "lora_rows"_a = nb::none(),
+      "out_scale"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Gathered matvec for K-quant expert stacks (the MoE down projection).
@@ -2210,6 +2223,10 @@ NB_MODULE(_ext, m) {
                 (arena slot -> expert); entries < 0 skip the row.
             lora_rows (array, optional): float32 per-row scale shaped like
                 ``indices``; 0 skips a row.
+            out_scale (array, optional): float32 scale of each product,
+                shape (1,), (N,), (n_experts, 1) or (n_experts, N), applied
+                before the bias, with the LoRA delta added after it. nvfp4
+                only (the ``.scale`` of an NVFP4 GGUF).
 
         Returns:
             array: output [T, R, N] in x.dtype.
@@ -2230,6 +2247,10 @@ NB_MODULE(_ext, m) {
       "limit"_a = 0.0f,
       "shexp_up_kquant_type"_a = "",
       nb::kw_only(),
+      "gate_scale"_a = nb::none(),
+      "up_scale"_a = nb::none(),
+      "shexp_gate_scale"_a = nb::none(),
+      "shexp_up_scale"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         moe_glu_gather_kq with the block's shared expert folded in as k
@@ -2256,6 +2277,13 @@ NB_MODULE(_ext, m) {
             shexp_up_kquant_type (str): codec of shexp_up_w when it differs
                 from shexp_gate_w's; '' (default) = shexp_kquant_type. Split
                 combos run act 'silu' only.
+            gate_scale (array, optional): as for moe_glu_gather_kq, on the
+                expert stacks.
+            up_scale (array, optional): as for moe_glu_gather_kq.
+            shexp_gate_scale (array, optional): float32 scale of the shared
+                gate product, shape (1,), for an nvfp4 shared expert.
+            shexp_up_scale (array, optional): the same for the shared up.
+                Pass both or neither.
 
         Returns:
             array: activated hidden states [T, R + k, N] in x.dtype.
@@ -2272,6 +2300,8 @@ NB_MODULE(_ext, m) {
       "scores"_a,
       "shexp_kquant_type"_a = "",
       nb::kw_only(),
+      "out_scale"_a = nb::none(),
+      "shexp_scale"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Gathered down projection with the routing mix folded in: every slot
@@ -2291,6 +2321,12 @@ NB_MODULE(_ext, m) {
             shexp_kquant_type (str): shared-expert codec; '' (default) =
                 kquant_type. Mixed combos must be q5_k, q6_k or q8_0, or
                 pass shexp_mix_combo_has_kernel.
+            out_scale (array, optional): float32 scale of each routed
+                product, shape (1,), (N,), (n_experts, 1) or
+                (n_experts, N). nvfp4 only (the ``.scale`` of an NVFP4
+                GGUF).
+            shexp_scale (array, optional): float32 scale of the shared
+                product, shape (1,), for an nvfp4 shared expert.
 
         Returns:
             array: mixed output [T, N] in x.dtype.
@@ -2310,6 +2346,7 @@ NB_MODULE(_ext, m) {
       "lora_ids"_a = nb::none(),
       "lora_table"_a = nb::none(),
       "lora_rows"_a = nb::none(),
+      "out_scale"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Gathered down projection with the routing mix folded in, no shared
@@ -2332,6 +2369,8 @@ NB_MODULE(_ext, m) {
                 (arena slot -> expert); entries < 0 skip the row.
             lora_rows (array, optional): float32 per-row scale shaped like
                 ``indices``; 0 skips a row.
+            out_scale (array, optional): as for gather_qmv_kq, the scale of
+                each routed product before the mix.
 
         Returns:
             array: mixed output [T, N] in x.dtype.

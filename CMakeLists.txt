@@ -276,6 +276,7 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_kvarn.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_glu.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_glu_kq.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_glu_kq_os.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_norm_fused.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_qk_norm_rope.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_hadamard.metal

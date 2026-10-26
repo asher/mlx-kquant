@@ -988,13 +988,73 @@ METAL_FUNC float kq_ext_reduce(float v) {
   return v;
 }
 
+// nvfp4 output scales (kq_out_scale.h). kq_moe_glu_kq_os.metal includes this
+// header with KQ_MOE_OS 1 and instantiates the nvfp4 kernels from it, under
+// the "_os" names of KQ_MOE_KERNEL. There each ext kernel below takes the
+// scales of its call: the routed experts' at KQ_OUT_SCALE_SLOT (a GLU's
+// gate) and a GLU's up at KQ_UP_SCALE_SLOT, in the mode of function constant
+// 380, and with its shared bit one value for the shared expert at
+// KQ_SHEXP_SCALE_SLOT (a GLU's gate, a mix's down) and a GLU's up at
+// KQ_SHEXP_UP_SCALE_SLOT. A GLU scales gate and up before its biases and the
+// activation; a mix scales each slot's weight. With KQ_MOE_OS 0 every hook
+// is empty, so the other codecs' kernels compile from the source they had.
+#ifndef KQ_MOE_OS
+#define KQ_MOE_OS 0
+#endif
+
+#define KQ_UP_SCALE_SLOT 29
+#define KQ_SHEXP_SCALE_SLOT 28
+#define KQ_SHEXP_UP_SCALE_SLOT 27
+
+#if KQ_MOE_OS
+#define KQ_MOE_KERNEL(name) name##_os
+#define KQ_MOE_DO(...) __VA_ARGS__
+#define KQ_MOE_MUL(v, s) ((v) * (s))
+
+#define KQ_UP_SCALE_ARG        \
+  const device float* up_scale \
+      [[buffer(KQ_UP_SCALE_SLOT), function_constant(kq_has_out_scale)]]
+#define KQ_SHEXP_SCALE_ARG        \
+  const device float* shexp_scale \
+      [[buffer(KQ_SHEXP_SCALE_SLOT), function_constant(kq_has_shexp_scale)]]
+#define KQ_SHEXP_UP_SCALE_ARG           \
+  const device float* shexp_up_scale    \
+      [[buffer(KQ_SHEXP_UP_SCALE_SLOT), \
+        function_constant(kq_has_shexp_scale)]]
+#define KQ_MOE_ARGS_ROUTED , KQ_OUT_SCALE_ARG
+#define KQ_MOE_ARGS_GLU , KQ_OUT_SCALE_ARG, KQ_UP_SCALE_ARG
+#define KQ_MOE_ARGS_SHEXP_GLU \
+  , KQ_OUT_SCALE_ARG, KQ_UP_SCALE_ARG, KQ_SHEXP_SCALE_ARG, KQ_SHEXP_UP_SCALE_ARG
+#define KQ_MOE_ARGS_MIX , KQ_OUT_SCALE_ARG, KQ_SHEXP_SCALE_ARG
+
+// Scale of output row n of expert e, 1 when the call scales only its shared
+// expert.
+METAL_FUNC float kq_moe_row_scale(const device float* s, uint e, int N, int n) {
+  return kq_has_out_scale ? kq_out_scale_col(kq_out_scale_at(s, e, N), n)
+                          : 1.0f;
+}
+
+// The shared expert's scale, 1 when the call has none.
+METAL_FUNC float kq_moe_shexp_scale(const device float* s) {
+  return kq_has_shexp_scale ? s[0] : 1.0f;
+}
+#else
+#define KQ_MOE_KERNEL(name) name
+#define KQ_MOE_DO(...)
+#define KQ_MOE_MUL(v, s) (v)
+#define KQ_MOE_ARGS_ROUTED
+#define KQ_MOE_ARGS_GLU
+#define KQ_MOE_ARGS_SHEXP_GLU
+#define KQ_MOE_ARGS_MIX
+#endif
+
 template <
     typename T,
     typename Codec,
     int ACT,
     int NX = KQ_EXT_NXPSG,
     bool C32 = false>
-[[kernel]] void kq_ext_moe_glu_gather(
+[[kernel]] void KQ_MOE_KERNEL(kq_ext_moe_glu_gather)(
     const device uint8_t* gw [[buffer(0)]],
     const device uint8_t* uw [[buffer(1)]],
     const device T* x [[buffer(2)]],
@@ -1007,13 +1067,16 @@ template <
     uint3 tpg [[threadgroups_per_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]] KQ_MOE_ARGS_GLU) {
   constexpr int RPS = 32 / NX; // rows per simdgroup (tptg.y simdgroups per tg)
   const short tx = short(simd_lid % NX);
   const short ty = short(simd_lid / NX);
   const int R = tpg.y;
   const int expert = indices[tid.z * R + tid.y];
   const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
+  KQ_MOE_DO(const float2 kq_s = float2(
+                kq_moe_row_scale(out_scale, expert, N, out_row),
+                kq_moe_row_scale(up_scale, expert, N, out_row));)
 
   x += (int64_t)tid.z * K;
   out += ((int64_t)tid.z * R + tid.y) * N;
@@ -1024,7 +1087,8 @@ template <
   const float g = kq_ext_reduce<NX>(gu.x);
   const float u = kq_ext_reduce<NX>(gu.y);
   if (tx == 0) {
-    out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
+    out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(
+        KQ_MOE_MUL(g, kq_s.x), KQ_MOE_MUL(u, kq_s.y), limit));
   }
 }
 
@@ -1032,7 +1096,7 @@ template <
 // to the accumulated dots before the epilogue / store. Only the uniform
 // family carries biases; shexp/mix stay bias-free (no such checkpoints).
 template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
-[[kernel]] void kq_ext_moe_glu_gather_bias(
+[[kernel]] void KQ_MOE_KERNEL(kq_ext_moe_glu_gather_bias)(
     const device uint8_t* gw [[buffer(0)]],
     const device uint8_t* uw [[buffer(1)]],
     const device float* gb [[buffer(2)]],
@@ -1048,7 +1112,7 @@ template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
     uint3 tpg [[threadgroups_per_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]] KQ_MOE_ARGS_GLU) {
   constexpr int RPS = 32 / NX;
   const short tx = short(simd_lid % NX);
   const short ty = short(simd_lid / NX);
@@ -1061,6 +1125,9 @@ template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
 
   KQ_EXT_STAGE_LUTS(Codec, kq_luts)
   const int64_t row = (int64_t)expert * N + out_row;
+  KQ_MOE_DO(const float2 kq_s = float2(
+                kq_moe_row_scale(out_scale, expert, N, out_row),
+                kq_moe_row_scale(up_scale, expert, N, out_row));)
   // Bias loads issued before the dot-product loop so their DRAM latency
   // hides behind it instead of stalling the epilogue store.
   float gbv = 0.0f;
@@ -1074,13 +1141,16 @@ template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
   const float g = kq_ext_reduce<NX>(gu.x);
   const float u = kq_ext_reduce<NX>(gu.y);
   if (tx == 0) {
-    out[out_row] =
-        static_cast<T>(kq_glu_epilogue<ACT>(g + gbv, u + ubv, limit, alpha));
+    out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(
+        KQ_MOE_MUL(g, kq_s.x) + gbv,
+        KQ_MOE_MUL(u, kq_s.y) + ubv,
+        limit,
+        alpha));
   }
 }
 
 template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
-[[kernel]] void kq_ext_gather_qmv_bias(
+[[kernel]] void KQ_MOE_KERNEL(kq_ext_gather_qmv_bias)(
     const device uint8_t* w [[buffer(0)]],
     const device float* b [[buffer(1)]],
     const device T* x [[buffer(2)]],
@@ -1092,7 +1162,7 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
     uint3 tpg [[threadgroups_per_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]] KQ_MOE_ARGS_ROUTED) {
   constexpr int RPS = 32 / NX;
   const short tx = short(simd_lid % NX);
   const short ty = short(simd_lid / NX);
@@ -1106,6 +1176,7 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
 
   KQ_EXT_STAGE_LUTS(Codec, kq_luts)
   const int64_t row = (int64_t)expert * N + out_row;
+  KQ_MOE_DO(const float kq_s = kq_moe_row_scale(out_scale, expert, N, out_row);)
   float bv = 0.0f;
   if (tx == 0) {
     bv = b[row];
@@ -1113,12 +1184,12 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG>
   const float r = kq_ext_reduce<NX>(
       kq_ext_row_partial<T, Codec, NX>(w, x, row, K, tx, kq_luts));
   if (tx == 0) {
-    out[out_row] = static_cast<T>(r + bv);
+    out[out_row] = static_cast<T>(KQ_MOE_MUL(r, kq_s) + bv);
   }
 }
 
 template <typename T, typename Codec, int NX = KQ_EXT_NXPSG, bool C32 = false>
-[[kernel]] void kq_ext_gather_qmv(
+[[kernel]] void KQ_MOE_KERNEL(kq_ext_gather_qmv)(
     const device uint8_t* w [[buffer(0)]],
     const device T* x [[buffer(1)]],
     const device uint32_t* indices [[buffer(2)]],
@@ -1129,7 +1200,7 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG, bool C32 = false>
     uint3 tpg [[threadgroups_per_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]] KQ_MOE_ARGS_ROUTED) {
   constexpr int RPS = 32 / NX;
   const short tx = short(simd_lid % NX);
   const short ty = short(simd_lid / NX);
@@ -1137,6 +1208,7 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG, bool C32 = false>
   const int64_t row_idx = (int64_t)tid.z * R + tid.y;
   const int expert = indices[row_idx];
   const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
+  KQ_MOE_DO(const float kq_s = kq_moe_row_scale(out_scale, expert, N, out_row);)
 
   x += row_idx * K;
   out += row_idx * N;
@@ -1145,7 +1217,7 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG, bool C32 = false>
   const float r = kq_ext_reduce<NX>(kq_ext_row_partial<T, Codec, NX, C32>(
       w, x, (int64_t)expert * N + out_row, K, tx, kq_luts));
   if (tx == 0) {
-    out[out_row] = static_cast<T>(r);
+    out[out_row] = static_cast<T>(KQ_MOE_MUL(r, kq_s));
   }
 }
 
@@ -1182,7 +1254,7 @@ template <
     int ACT,
     int NX = KQ_EXT_NXPSG,
     bool C32 = false>
-[[kernel]] void kq_ext_moe_glu_gather_shexp(
+[[kernel]] void KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp)(
     const device uint8_t* gw [[buffer(0)]],
     const device uint8_t* uw [[buffer(1)]],
     const device uint8_t* sgw [[buffer(2)]],
@@ -1198,7 +1270,7 @@ template <
     uint3 tpg [[threadgroups_per_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]] KQ_MOE_ARGS_SHEXP_GLU) {
   constexpr int RPS = 32 / NX;
   const short tx = short(simd_lid % NX);
   const short ty = short(simd_lid / NX);
@@ -1212,7 +1284,11 @@ template <
   KQ_EXT_STAGE_LUTS(Codec, kq_luts)
   KQ_EXT_STAGE_LUTS(SCodec, kq_sluts)
   float2 gu;
+  KQ_MOE_DO(float2 kq_s;)
   if (shared_slot) {
+    KQ_MOE_DO(kq_s = float2(
+                  kq_moe_shexp_scale(shexp_scale),
+                  kq_moe_shexp_scale(shexp_up_scale));)
     // Shared slot j reads shared rows [j N, (j + 1) N).
     gu = kq_ext_glu_row_partial<T, SCodec, NX, C32>(
         sgw,
@@ -1224,13 +1300,17 @@ template <
         kq_sluts);
   } else {
     const int expert = int(indices[tid.z * n_route + tid.y]);
+    KQ_MOE_DO(kq_s = float2(
+                  kq_moe_row_scale(out_scale, expert, N, out_row),
+                  kq_moe_row_scale(up_scale, expert, N, out_row));)
     gu = kq_ext_glu_row_partial<T, Codec, NX, C32>(
         gw, uw, x, (int64_t)expert * N + out_row, K, tx, kq_luts);
   }
   const float g = kq_ext_reduce<NX>(gu.x);
   const float u = kq_ext_reduce<NX>(gu.y);
   if (tx == 0) {
-    out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
+    out[out_row] = static_cast<T>(kq_glu_epilogue<ACT>(
+        KQ_MOE_MUL(g, kq_s.x), KQ_MOE_MUL(u, kq_s.y), limit));
   }
 }
 
@@ -1295,7 +1375,7 @@ template <
 // routed slots): indices and scores are both [T, S], every slot gathers from
 // the expert stack.
 template <typename T, typename Codec, int NX = KQ_EXT_NXPSG, bool C32 = false>
-[[kernel]] void kq_ext_gather_qmv_mix_ns(
+[[kernel]] void KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_ns)(
     const device uint8_t* w [[buffer(0)]],
     const device T* h [[buffer(1)]],
     const device uint32_t* indices [[buffer(2)]],
@@ -1307,7 +1387,7 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG, bool C32 = false>
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]] KQ_MOE_ARGS_ROUTED) {
   constexpr int RPS = 32 / NX;
   const short tx = short(simd_lid % NX);
   const short ty = short(simd_lid / NX);
@@ -1318,7 +1398,9 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG, bool C32 = false>
   for (int slot = 0; slot < S; slot++) {
     const int expert = int(indices[tid.z * S + slot]);
     const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
-    result += scores[tid.z * S + slot] *
+    result += KQ_MOE_MUL(
+                  scores[tid.z * S + slot],
+                  kq_moe_row_scale(out_scale, expert, N, out_row)) *
         kq_ext_row_partial<T, Codec, NX, C32>(
                   w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
   }
@@ -1345,7 +1427,7 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG, bool C32 = false>
 #define KQ_MOE_SP_MAX_S 16
 
 template <typename T, typename Codec, int NX = KQ_EXT_NXPSG, bool C32 = false>
-[[kernel]] void kq_ext_gather_qmv_mix_ns_sp(
+[[kernel]] void KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_ns_sp)(
     const device uint8_t* w [[buffer(0)]],
     const device T* h [[buffer(1)]],
     const device uint32_t* indices [[buffer(2)]],
@@ -1357,7 +1439,7 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG, bool C32 = false>
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]] KQ_MOE_ARGS_ROUTED) {
   constexpr int RPS = 32 / NX;
   const short tx = short(simd_lid % NX);
   const short ty = short(simd_lid / NX);
@@ -1385,7 +1467,11 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG, bool C32 = false>
   if (slot == 0) {
     float result = 0.0f;
     for (int s = 0; s < S; s++) {
-      result += scores[tid.z * S + s] * parts[lrow][tx][s];
+      result +=
+          KQ_MOE_MUL(
+              scores[tid.z * S + s],
+              kq_moe_row_scale(out_scale, indices[tid.z * S + s], N, out_row)) *
+          parts[lrow][tx][s];
     }
     result = kq_ext_reduce<NX>(result);
     if (tx == 0) {
@@ -1400,7 +1486,7 @@ template <
     typename SCodec,
     int NX = KQ_EXT_NXPSG,
     bool C32 = false>
-[[kernel]] void kq_ext_gather_qmv_mix(
+[[kernel]] void KQ_MOE_KERNEL(kq_ext_gather_qmv_mix)(
     const device uint8_t* w [[buffer(0)]],
     const device uint8_t* sw [[buffer(1)]],
     const device T* h [[buffer(2)]],
@@ -1416,7 +1502,7 @@ template <
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]] KQ_MOE_ARGS_MIX) {
   constexpr int RPS = 32 / NX;
   const short tx = short(simd_lid % NX);
   const short ty = short(simd_lid / NX);
@@ -1429,7 +1515,9 @@ template <
   for (int slot = 0; slot < n_route; slot++) {
     const int expert = int(indices[tid.z * n_route + slot]);
     const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
-    result += scores[tid.z * SC + slot] *
+    result += KQ_MOE_MUL(
+                  scores[tid.z * SC + slot],
+                  kq_moe_row_scale(out_scale, expert, N, out_row)) *
         kq_ext_row_partial<T, Codec, NX, C32>(
                   w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
   }
@@ -1446,7 +1534,10 @@ template <
       sp += kq_ext_piece_partial<T, SCodec, NX, C32>(
           sw, xs, srow, K, q, SP, tx, kq_sluts);
     }
-    result += (SC == S ? scores[tid.z * SC + slot] : 1.0f) * sp;
+    result += KQ_MOE_MUL(
+                  (SC == S ? scores[tid.z * SC + slot] : 1.0f),
+                  kq_moe_shexp_scale(shexp_scale)) *
+        sp;
   }
   result = kq_ext_reduce<NX>(result);
   if (tx == 0) {
@@ -1466,7 +1557,7 @@ template <
     typename SCodec,
     int NX = KQ_EXT_NXPSG,
     bool C32 = false>
-[[kernel]] void kq_ext_gather_qmv_mix_sp(
+[[kernel]] void KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_sp)(
     const device uint8_t* w [[buffer(0)]],
     const device uint8_t* sw [[buffer(1)]],
     const device T* h [[buffer(2)]],
@@ -1482,7 +1573,7 @@ template <
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]] KQ_MOE_ARGS_MIX) {
   constexpr int RPS = 32 / NX;
   const short tx = short(simd_lid % NX);
   const short ty = short(simd_lid / NX);
@@ -1519,7 +1610,11 @@ template <
   if (pair == 0) {
     float result = 0.0f;
     for (int s = 0; s < n_route; s++) {
-      result += scores[tid.z * SC + s] * parts[lrow][tx][s];
+      result += KQ_MOE_MUL(
+                    scores[tid.z * SC + s],
+                    kq_moe_row_scale(
+                        out_scale, indices[tid.z * n_route + s], N, out_row)) *
+          parts[lrow][tx][s];
     }
     // SC == S - NS: the shared slots' weight is an implicit 1
     for (int j = 0; j < NS; j++) {
@@ -1528,7 +1623,10 @@ template <
       for (int q = 1; q < SP; q++) {
         sp += parts[lrow][tx][p0 + q];
       }
-      result += (SC == S ? scores[tid.z * SC + n_route + j] : 1.0f) * sp;
+      result += KQ_MOE_MUL(
+                    (SC == S ? scores[tid.z * SC + n_route + j] : 1.0f),
+                    kq_moe_shexp_scale(shexp_scale)) *
+          sp;
     }
     result = kq_ext_reduce<NX>(result);
     if (tx == 0) {
@@ -1714,7 +1812,7 @@ METAL_FUNC float4 kq_ext_glu_row_partial_pair(
 }
 
 template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
-[[kernel]] void kq_ext_moe_glu_gather_dd(
+[[kernel]] void KQ_MOE_KERNEL(kq_ext_moe_glu_gather_dd)(
     const device uint8_t* gw [[buffer(0)]],
     const device uint8_t* uw [[buffer(1)]],
     const device T* x [[buffer(2)]],
@@ -1727,7 +1825,7 @@ template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
     uint3 tpg [[threadgroups_per_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]] KQ_MOE_ARGS_GLU) {
   constexpr int RPS = 32 / NX;
   const short tx = short(simd_lid % NX);
   const short ty = short(simd_lid / NX);
@@ -1740,6 +1838,9 @@ template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
   }
   const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
   const int64_t wrow = (int64_t)expert * N + out_row;
+  KQ_MOE_DO(const float2 kq_s = float2(
+                kq_moe_row_scale(out_scale, expert, N, out_row),
+                kq_moe_row_scale(up_scale, expert, N, out_row));)
   x += (int64_t)tid.z * K;
 
   KQ_EXT_STAGE_LUTS(Codec, kq_luts)
@@ -1749,8 +1850,8 @@ template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
     const float g = kq_ext_reduce<NX>(gu.x);
     const float u = kq_ext_reduce<NX>(gu.y);
     if (tx == 0) {
-      out[(int64_t)p * N + out_row] =
-          static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit));
+      out[(int64_t)p * N + out_row] = static_cast<T>(kq_glu_epilogue<ACT>(
+          KQ_MOE_MUL(g, kq_s.x), KQ_MOE_MUL(u, kq_s.y), limit));
     }
     return;
   }
@@ -1762,10 +1863,10 @@ template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
   const float g1 = kq_ext_reduce<NX>(gu.z);
   const float u1 = kq_ext_reduce<NX>(gu.w);
   if (tx == 0) {
-    out[(int64_t)p * N + out_row] =
-        static_cast<T>(kq_glu_epilogue<ACT>(g0, u0, limit));
-    out[(int64_t)q * N + out_row] =
-        static_cast<T>(kq_glu_epilogue<ACT>(g1, u1, limit));
+    out[(int64_t)p * N + out_row] = static_cast<T>(kq_glu_epilogue<ACT>(
+        KQ_MOE_MUL(g0, kq_s.x), KQ_MOE_MUL(u0, kq_s.y), limit));
+    out[(int64_t)q * N + out_row] = static_cast<T>(kq_glu_epilogue<ACT>(
+        KQ_MOE_MUL(g1, kq_s.x), KQ_MOE_MUL(u1, kq_s.y), limit));
   }
 }
 
@@ -1775,7 +1876,7 @@ template <
     typename SCodec,
     int ACT,
     int NX = KQ_EXT_NXPSG>
-[[kernel]] void kq_ext_moe_glu_gather_shexp_dd(
+[[kernel]] void KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp_dd)(
     const device uint8_t* gw [[buffer(0)]],
     const device uint8_t* uw [[buffer(1)]],
     const device uint8_t* sgw [[buffer(2)]],
@@ -1791,7 +1892,7 @@ template <
     uint3 tpg [[threadgroups_per_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]] KQ_MOE_ARGS_SHEXP_GLU) {
   constexpr int RPS = 32 / NX;
   const short tx = short(simd_lid % NX);
   const short ty = short(simd_lid / NX);
@@ -1830,8 +1931,12 @@ template <
   const device T* x1 = q < 0 ? x : x + (int64_t)(q_row - int(tid.z)) * K;
   float4 gu = float4(0.0f);
   KQ_EXT_DECL_LUTS2(Codec, SCodec, kq_luts)
+  KQ_MOE_DO(float2 kq_s;)
   if (shared_slot) {
     KQ_EXT_STAGE_INTO(SCodec, kq_luts)
+    KQ_MOE_DO(kq_s = float2(
+                  kq_moe_shexp_scale(shexp_scale),
+                  kq_moe_shexp_scale(shexp_up_scale));)
     const int64_t srow = (int64_t)(int(tid.y) - n_route) * N + out_row;
     if (q < 0) {
       gu.xy = kq_ext_glu_row_partial<T, SCodec, NX>(
@@ -1843,6 +1948,9 @@ template <
   } else {
     KQ_EXT_STAGE_INTO(Codec, kq_luts)
     const int64_t wrow = (int64_t)expert * N + out_row;
+    KQ_MOE_DO(kq_s = float2(
+                  kq_moe_row_scale(out_scale, expert, N, out_row),
+                  kq_moe_row_scale(up_scale, expert, N, out_row));)
     if (q < 0) {
       gu.xy =
           kq_ext_glu_row_partial<T, Codec, NX>(gw, uw, x, wrow, K, tx, kq_luts);
@@ -1856,11 +1964,11 @@ template <
   const float g1 = kq_ext_reduce<NX>(gu.z);
   const float u1 = kq_ext_reduce<NX>(gu.w);
   if (tx == 0) {
-    out[(int64_t)p * N + out_row] =
-        static_cast<T>(kq_glu_epilogue<ACT>(g0, u0, limit));
+    out[(int64_t)p * N + out_row] = static_cast<T>(kq_glu_epilogue<ACT>(
+        KQ_MOE_MUL(g0, kq_s.x), KQ_MOE_MUL(u0, kq_s.y), limit));
     if (q >= 0) {
-      out[(int64_t)q * N + out_row] =
-          static_cast<T>(kq_glu_epilogue<ACT>(g1, u1, limit));
+      out[(int64_t)q * N + out_row] = static_cast<T>(kq_glu_epilogue<ACT>(
+          KQ_MOE_MUL(g1, kq_s.x), KQ_MOE_MUL(u1, kq_s.y), limit));
     }
   }
 }
@@ -1877,7 +1985,7 @@ template <
 // Dispatch: the loop kernel's group and grid with z = ceil(T / 2); host
 // gates S <= KQ_MOE_SP_MAX_S.
 template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
-[[kernel]] void kq_ext_gather_qmv_mix_pair(
+[[kernel]] void KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_pair)(
     const device uint8_t* w [[buffer(0)]],
     const device uint8_t* sw [[buffer(1)]],
     const device T* h [[buffer(2)]],
@@ -1894,7 +2002,7 @@ template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]] KQ_MOE_ARGS_MIX) {
   constexpr int RPS = 32 / NX;
   const short tx = short(simd_lid % NX);
   const short ty = short(simd_lid / NX);
@@ -1942,18 +2050,25 @@ template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
       const device T* xb = h + ((int64_t)rb * S + sb) * K;
       const float2 p = kq_ext_row_partial_pair<T, Codec, NX>(
           w, xa, xb, wrow, K, tx, kq_luts);
-      result += scores[ra * SC + slot] * p.x;
+      result += KQ_MOE_MUL(
+                    scores[ra * SC + slot],
+                    kq_moe_row_scale(out_scale, expert, N, out_row)) *
+          p.x;
       pb[sb] = p.y;
       claimed |= 1u << sb;
     } else {
-      result += scores[ra * SC + slot] *
+      result += KQ_MOE_MUL(
+                    scores[ra * SC + slot],
+                    kq_moe_row_scale(out_scale, expert, N, out_row)) *
           kq_ext_row_partial<T, Codec, NX>(w, xa, wrow, K, tx, kq_luts);
     }
   }
   for (int slot = n_route; SHEXP && slot < S; slot++) {
     // SC == S - NS: the shared slots' weight is an implicit 1
     const device T* xa = h + ((int64_t)ra * S + slot) * K;
-    const float wa = SC == S ? scores[ra * SC + slot] : 1.0f;
+    const float wa = KQ_MOE_MUL(
+        SC == S ? scores[ra * SC + slot] : 1.0f,
+        kq_moe_shexp_scale(shexp_scale));
     const int64_t srow = (int64_t)out_row * NS + (slot - n_route);
     // The shared row in SP pieces, summed in piece order as the loop
     // kernel sums them.
@@ -1995,10 +2110,17 @@ template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
   }
   result = 0.0f;
   for (int slot = 0; slot < n_route; slot++) {
-    result += scores[rb * SC + slot] * pb[slot];
+    result += KQ_MOE_MUL(
+                  scores[rb * SC + slot],
+                  kq_moe_row_scale(
+                      out_scale, indices[rb * n_route + slot], N, out_row)) *
+        pb[slot];
   }
   for (int slot = n_route; SHEXP && slot < S; slot++) {
-    result += (SC == S ? scores[rb * SC + slot] : 1.0f) * pb[slot];
+    result += KQ_MOE_MUL(
+                  (SC == S ? scores[rb * SC + slot] : 1.0f),
+                  kq_moe_shexp_scale(shexp_scale)) *
+        pb[slot];
   }
   result = kq_ext_reduce<NX>(result);
   if (tx == 0) {
@@ -2525,3 +2647,158 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
     out[(int64_t)tid.z * N + out_row] = static_cast<T>(result);
   }
 }
+
+// clang-format off
+// Instantiation macros of the generic Ext-trait kernels, shared by
+// kq_moe_glu_kq.metal (the other codecs) and kq_moe_glu_kq_os.metal (nvfp4,
+// KQ_MOE_OS 1).
+// Codec matrix (generic Ext-trait kernels; q6_k/q8_0 uniform stay on the
+// tuned kernels above). Names match the tuned scheme so dispatch is uniform.
+// Every op is emitted at NX = 8 (plain name, tuned-equivalent grid), 16
+// ("_nx16"), and 32 ("_nx32"); the wide K-lane variants trade rows per
+// threadgroup for threadgroup count so decode-scale launches fill the GPU.
+#define instantiate_kq_ext_uniform_nx(codec, traits, type, nx, sfx)           \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_silu" sfx "_" #type,                      \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather), type, traits, KQ_GLU_ACT_SILU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_gelu" sfx "_" #type,                      \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather), type, traits, KQ_GLU_ACT_GELU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_silu_limit" sfx "_" #type,                \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather), type, traits, KQ_GLU_ACT_SILU_LIMIT, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv" sfx "_" #type,                               \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv), type, traits, nx)                     \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_shexp_silu" sfx "_" #type,                \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp), type, traits, traits, KQ_GLU_ACT_SILU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_shexp_gelu" sfx "_" #type,                \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp), type, traits, traits, KQ_GLU_ACT_GELU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix" sfx "_" #type,                           \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix), type, traits, traits, nx)         \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_dd_silu" sfx "_" #type,                   \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_dd), type, traits, KQ_GLU_ACT_SILU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_dd_gelu" sfx "_" #type,                   \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_dd), type, traits, KQ_GLU_ACT_GELU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_dd_silu_limit" sfx "_" #type,             \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_dd), type, traits, KQ_GLU_ACT_SILU_LIMIT, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_shexp_dd_silu" sfx "_" #type,             \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp_dd), type, traits, traits, KQ_GLU_ACT_SILU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_shexp_dd_gelu" sfx "_" #type,             \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp_dd), type, traits, traits, KQ_GLU_ACT_GELU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_dd" sfx "_" #type,                        \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_pair), type, traits, traits, true, nx) \
+
+// Slot-parallel shared-expert mix, NX = 8 only as for mix_ns.
+#define instantiate_kq_ext_mix_sp(stem, traits, straits, type)                \
+  instantiate_kernel(                                                         \
+      "kq_" stem "_gather_qmv_mix_sp_" #type,                                 \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_sp), type, traits, straits, 8)
+
+#define instantiate_kq_ext_uniform(codec, traits, type)                       \
+  instantiate_kq_ext_uniform_nx(codec, traits, type, 8, "")                   \
+  instantiate_kq_ext_uniform_nx(codec, traits, type, 16, "_nx16")             \
+  instantiate_kq_ext_uniform_nx(codec, traits, type, 32, "_nx32")             \
+  instantiate_kq_ext_mix_sp(#codec, traits, traits, type)
+
+// Mixed-codec shared expert: shexp tensors in scodec over codec expert
+// stacks (UD-style upcast shexp). Dispatch key "kq_<codec>_sx_<scodec>_...".
+#define instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, nx, sfx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_silu" sfx "_" #type, \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp), type, traits, straits, KQ_GLU_ACT_SILU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_gelu" sfx "_" #type, \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp), type, traits, straits, KQ_GLU_ACT_GELU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_sx_" #scodec "_gather_qmv_mix" sfx "_" #type,            \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix), type, traits, straits, nx)        \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_dd_silu" sfx "_" #type, \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp_dd), type, traits, straits, KQ_GLU_ACT_SILU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_dd_gelu" sfx "_" #type, \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp_dd), type, traits, straits, KQ_GLU_ACT_GELU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_sx_" #scodec "_gather_qmv_mix_dd" sfx "_" #type,         \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_pair), type, traits, straits, true, nx) \
+
+#define instantiate_kq_ext_sx(codec, traits, scodec, straits, type)           \
+  instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 8, "")       \
+  instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 16, "_nx16") \
+  instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 32, "_nx32") \
+  instantiate_kq_ext_mix_sp(#codec "_sx_" #scodec, traits, straits, type)
+
+// No-shared-expert mix (gemma-style weighted sum; always the generic kernel,
+// q6_k/q8_0 included).
+#define instantiate_kq_ext_mix_ns_nx(codec, traits, nx, sfx)                  \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_ns" sfx "_bfloat16_t",                    \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_ns), bfloat16_t, traits, nx)        \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_ns" sfx "_float16_t",                     \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_ns), float16_t, traits, nx)         \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_ns_dd" sfx "_bfloat16_t",                 \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_pair), bfloat16_t, traits, traits, false, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_ns_dd" sfx "_float16_t",                  \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_pair), float16_t, traits, traits, false, nx)
+
+
+// The slot-parallel variant is NX = 8 only (wide K-lanes measured
+// flat-to-negative; sp multiplies threads without shortening K-chains).
+#define instantiate_kq_ext_mix_ns(codec, traits)                              \
+  instantiate_kq_ext_mix_ns_nx(codec, traits, 8, "")                          \
+  instantiate_kq_ext_mix_ns_nx(codec, traits, 16, "_nx16")                    \
+  instantiate_kq_ext_mix_ns_nx(codec, traits, 32, "_nx32")                    \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_ns_sp_bfloat16_t",                        \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_ns_sp), bfloat16_t, traits, 8)      \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_mix_ns_sp_float16_t",                         \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_ns_sp), float16_t, traits, 8)
+
+// Biased experts (gpt-oss): per-(expert, out_dim) f32 biases fused into the
+// GLU epilogue / qmv store. Only the clamped-SwiGLU epilogue is emitted --
+// biased expert checkpoints all use it.
+#define instantiate_kq_ext_bias_nx(codec, traits, type, nx, sfx)              \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_moe_glu_gather_bias_swiglu_clamp" sfx "_" #type,         \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_bias), type, traits, KQ_GLU_ACT_SWIGLU_CLAMP, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_gather_qmv_bias" sfx "_" #type,                          \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_bias), type, traits, nx)
+
+#define instantiate_kq_ext_bias(codec, traits, type)                          \
+  instantiate_kq_ext_bias_nx(codec, traits, type, 8, "")                      \
+  instantiate_kq_ext_bias_nx(codec, traits, type, 16, "_nx16")                \
+  instantiate_kq_ext_bias_nx(codec, traits, type, 32, "_nx32")
+
+// q5_k shexp over any expert codec (UD-style upcast where the shexp lands
+// one tier below q6_k): nx 8 and 16 only, the auto pick caps at 16.
+#define instantiate_kq_ext_sx_q5k(codec, traits, type)                        \
+  instantiate_kq_ext_sx_nx(codec, traits, q5_k, KqQ5_KExt, type, 8, "")       \
+  instantiate_kq_ext_sx_nx(codec, traits, q5_k, KqQ5_KExt, type, 16, "_nx16") \
+  instantiate_kq_ext_mix_sp(#codec "_sx_q5_k", traits, KqQ5_KExt, type)
+
+#define instantiate_kq_ext_all(codec, traits)                                 \
+  instantiate_kq_ext_uniform(codec, traits, bfloat16_t)                       \
+  instantiate_kq_ext_uniform(codec, traits, float16_t)                        \
+  instantiate_kq_ext_mix_ns(codec, traits)                                    \
+  instantiate_kq_ext_sx(codec, traits, q6_k, KqQ6_KExt, bfloat16_t)           \
+  instantiate_kq_ext_sx(codec, traits, q6_k, KqQ6_KExt, float16_t)            \
+  instantiate_kq_ext_sx(codec, traits, q8_0, KqQ8_0Ext, bfloat16_t)           \
+  instantiate_kq_ext_sx(codec, traits, q8_0, KqQ8_0Ext, float16_t)            \
+  instantiate_kq_ext_sx_q5k(codec, traits, bfloat16_t)                        \
+  instantiate_kq_ext_sx_q5k(codec, traits, float16_t)
+// clang-format on

@@ -471,6 +471,11 @@ bool kq_kquant_word_on();
 // the caller passes none.
 constexpr int kq_fc_out_scale = 380;
 constexpr int kq_out_scale_slot = 30;
+// The fused MoE ops (kq_moe_glu_kq.h) also bind a GLU's up scale and a
+// shared expert's scales.
+constexpr int kq_up_scale_slot = 29;
+constexpr int kq_shexp_scale_slot = 28;
+constexpr int kq_shexp_up_scale_slot = 27;
 
 // Whether the codec has BK=128 NAX kernels (a pair or half loader).
 bool kq_nax_has_bk128(const std::string& t);
@@ -648,6 +653,22 @@ inline void kq_bind_out_scale(CommandEncoder& ce, const KqOutScale& os) {
   if (os) {
     ce.set_input_array(*os.buf, kq_out_scale_slot);
   }
+}
+
+// kname's pipeline under the output scale bits of a fused MoE op (0 for
+// none), for a kernel a lever setting may select.
+inline MTL::ComputePipelineState* kq_get_kernel_os(
+    Device& d,
+    const std::string& kname,
+    int bits,
+    const char* setting) {
+  if (bits == 0) {
+    return kq_get_kernel(d, kname, kname, {}, setting);
+  }
+  mx::metal::MTLFCList fc;
+  fc.emplace_back(&bits, MTL::DataType::DataTypeInt, kq_fc_out_scale);
+  return kq_get_kernel(
+      d, kname, kname + "_os" + std::to_string(bits), fc, setting);
 }
 
 } // namespace mlx_kquant

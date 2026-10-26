@@ -290,27 +290,27 @@ int kq_dense_lora_stack(
   return stacked ? lora_a->shape(0) : 0;
 }
 
-// The kernel mode of an out_scale argument (kq_out_scale.h), 0 for none: 1
-// for shape (1,), 2 for (N,), and for a gather over n_mats > 0 weight
-// matrices, 3 for (n_mats, 1) and 4 for (n_mats, N).
+} // namespace
+
 int kq_out_scale_mode(
     const std::optional<mx::array>& os,
     const std::string& kquant_type,
     bool transpose,
     int N,
     int64_t n_mats,
-    const char* op) {
+    const char* op,
+    const char* what) {
   if (!os.has_value()) {
     return 0;
   }
   const std::string at = std::string("[mlx_kquant.") + op + "] ";
   if (kquant_type != "nvfp4") {
     throw std::invalid_argument(
-        at + "out_scale is for nvfp4 weights, got kquant_type '" + kquant_type +
+        at + what + " is for nvfp4 weights, got kquant_type '" + kquant_type +
         "'.");
   }
   if (!transpose) {
-    throw std::invalid_argument(at + "out_scale needs transpose=True.");
+    throw std::invalid_argument(at + what + " needs transpose=True.");
   }
   if (os->dtype() == mx::float32) {
     if (os->ndim() == 1 && os->shape(0) == 1) {
@@ -329,7 +329,7 @@ int kq_out_scale_mode(
     }
   }
   std::ostringstream msg;
-  msg << at << "out_scale must be float32 of shape (1,)";
+  msg << at << what << " must be float32 of shape (1,)";
   if (n_mats > 0) {
     msg << ", (" << N << ",), (" << n_mats << ", 1) or (" << n_mats << ", " << N
         << ")";
@@ -339,8 +339,6 @@ int kq_out_scale_mode(
   msg << ", got " << os->dtype() << " " << os->shape() << ".";
   throw std::invalid_argument(msg.str());
 }
-
-} // namespace
 
 mx::array quantized_matmul(
     mx::array x,

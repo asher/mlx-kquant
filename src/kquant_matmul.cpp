@@ -1710,7 +1710,8 @@ static int kq_verify_nax_splits(int N, int K, int kstep, const std::string& t);
 // grid x after those of the weights before it, and reads its own buffer.
 // The split count is the one verify_nax takes for the joint grid. Split
 // partials of weight i sit in one temporary at splits * M * (rows of the
-// weights before it), and one fold per weight writes its output.
+// weights before it), and one fold per weight writes its output. oss is
+// empty or holds each weight's output scale, all in one mode.
 void verify_nax_multi(
     const array& x,
     const std::vector<array>& ws,
@@ -1722,7 +1723,8 @@ void verify_nax_multi(
     int kstep,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const std::vector<KqOutScale>& oss) {
   const int n = static_cast<int>(ws.size());
   std::array<int, 4> n_rows{0, 0, 0, 0};
   std::array<int, 4> tg_end{0, 0, 0, 0};
@@ -1743,8 +1745,11 @@ void verify_nax_multi(
   const int k_partition = (K / kstep / splits) * kstep;
 
   auto& ce = mx::metal::get_command_encoder(s);
-  const KqSplitkPartials pp = splits > 1 ? kq_splitk_partials(x.dtype())
+  const KqOutScale os0 = oss.empty() ? KqOutScale{} : oss[0];
+  const KqSplitkPartials pp = splits > 1 ? kq_splitk_partials(x.dtype(), os0)
                                          : KqSplitkPartials{x.dtype(), ""};
+  // One split scales in the kernel, more in the folds.
+  const KqOutScale kos = splits > 1 ? KqOutScale{} : os0;
   array partials({splits, M, static_cast<int>(rows)}, pp.dtype, nullptr, {});
   if (splits > 1) {
     partials.set_data(mx::allocator::malloc(partials.nbytes()));
@@ -1755,12 +1760,15 @@ void verify_nax_multi(
   const std::string kname = kq_verify_nax_multi_kname(
       kquant_type, type_string, group_size, bits, kstep, pp.suffix);
   std::string vname;
-  auto kernel = kq_verify_nax_pipeline(d, kname, pp.suffix, x, vname);
+  auto kernel = kq_verify_nax_pipeline(d, kname, pp.suffix, x, vname, kos);
   ce.set_compute_pipeline_state(kernel);
 
   int c = 0;
   for (int i = 0; i < 4; ++i) {
     ce.set_input_array(ws[i < n ? i : 0], c++);
+    if (kos) {
+      ce.set_input_array(*oss[i < n ? i : 0].buf, kq_out_scale_slot - i);
+    }
   }
   ce.set_input_array(x, c++);
   for (int i = 0; i < 4; ++i) {
@@ -1787,9 +1795,9 @@ void verify_nax_multi(
   }
 
   const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
-  auto accum = kq_get_kernel(d, aname);
   for (int i = 0; i < n; ++i) {
-    ce.set_compute_pipeline_state(accum);
+    const KqOutScale os = oss.empty() ? KqOutScale{} : oss[i];
+    ce.set_compute_pipeline_state(kq_get_kernel_os(d, aname, os));
     const int n_elems = M * n_rows[i];
     c = 0;
     ce.set_input_array(
@@ -1798,6 +1806,10 @@ void verify_nax_multi(
     ce.set_bytes(n_elems, c++);
     ce.set_bytes(splits, c++);
     ce.set_bytes(part_stride[i], c++);
+    if (os) {
+      ce.set_bytes(n_rows[i], c++);
+      kq_bind_out_scale(ce, os);
+    }
     MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
     MTL::Size agroup(256, 1, 1);
     ce.dispatch_threads(agrid, agroup);
@@ -3122,10 +3134,14 @@ void KQuantMatmulMulti::eval_gpu(
   const auto& scales = inputs[1];
   const int n = static_cast<int>(outputs.size());
   std::vector<array> ws;
+  std::vector<KqOutScale> oss;
   ws.reserve(n);
   for (int i = 0; i < n; ++i) {
     ws.push_back(kq_matrix_dense_gpu(inputs[2 + i], s));
     kq_check_weight_base(ws.back(), kquant_type_, "quantized_matmul_multi");
+    if (out_scale_mode_ != 0) {
+      oss.push_back({&inputs[2 + n + i], out_scale_mode_});
+    }
   }
   const int K = x.shape(-1);
   const int M = K > 0 ? static_cast<int>(x.size() / K) : 0;
@@ -3149,10 +3165,15 @@ void KQuantMatmulMulti::eval_gpu(
   if (!multi) {
     // x is bound once, so that each per-weight call reads it in place.
     const array x16 = kq_x_aligned_gpu(x, s, "quantized_matmul_multi x");
-    KQuantMatmul one(s, kquant_type_, group_size_, bits_, true);
+    KQuantMatmul one(
+        s, kquant_type_, group_size_, bits_, true, 0, out_scale_mode_);
     for (int i = 0; i < n; ++i) {
       std::vector<array> o{outputs[i]};
-      one.eval_gpu({x16, ws[i], scales}, o);
+      std::vector<array> in{x16, ws[i], scales};
+      if (out_scale_mode_ != 0) {
+        in.push_back(inputs[2 + n + i]);
+      }
+      one.eval_gpu(in, o);
     }
     return;
   }
@@ -3161,6 +3182,14 @@ void KQuantMatmulMulti::eval_gpu(
   const array xv = kq_x_aligned_gpu(x, s, "quantized_matmul_multi x", 8);
   std::vector<array> gw;
   std::vector<array> go;
+  std::vector<KqOutScale> gs;
+  auto run = [&]() {
+    verify_nax_multi(
+        xv, gw, go, group_size_, bits_, M, K, kstep, d, s, kquant_type_, gs);
+    gw.clear();
+    go.clear();
+    gs.clear();
+  };
   for (int i = 0; i < n; ++i) {
     outputs[i].set_data(mx::allocator::malloc(outputs[i].nbytes()));
     if (outputs[i].size() == 0) {
@@ -3168,16 +3197,15 @@ void KQuantMatmulMulti::eval_gpu(
     }
     gw.push_back(ws[i]);
     go.push_back(outputs[i]);
+    if (!oss.empty()) {
+      gs.push_back(oss[i]);
+    }
     if (gw.size() == 4 || i == n - 1) {
-      verify_nax_multi(
-          xv, gw, go, group_size_, bits_, M, K, kstep, d, s, kquant_type_);
-      gw.clear();
-      go.clear();
+      run();
     }
   }
   if (!gw.empty()) {
-    verify_nax_multi(
-        xv, gw, go, group_size_, bits_, M, K, kstep, d, s, kquant_type_);
+    run();
   }
 }
 

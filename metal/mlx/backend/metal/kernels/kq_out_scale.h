@@ -12,15 +12,18 @@
 //   4  per expert and column    s[e * N + n]
 // A gather entry resolves the expert with kq_out_scale_at, after which modes
 // 3 and 4 read as 1 and 2. The buffer is bound at KQ_OUT_SCALE_SLOT in every
-// family.
+// family. Bit 3 of the constant (kq_has_shexp_scale) says that the shared
+// expert of an MoE op has its own scale; bits 0 to 2 are the mode.
 #pragma once
 
 #include <metal_stdlib>
 
 constant int kq_out_scale_fc [[function_constant(380)]];
-constant int kq_out_scale_mode =
+constant int kq_out_scale_bits =
     is_function_constant_defined(kq_out_scale_fc) ? kq_out_scale_fc : 0;
+constant int kq_out_scale_mode = kq_out_scale_bits & 7;
 constant bool kq_has_out_scale = kq_out_scale_mode != 0;
+constant bool kq_has_shexp_scale = (kq_out_scale_bits & 8) != 0;
 constant bool kq_out_scale_cols =
     kq_out_scale_mode == 2 || kq_out_scale_mode == 4;
 

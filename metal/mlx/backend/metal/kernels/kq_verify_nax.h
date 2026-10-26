@@ -1178,8 +1178,22 @@ METAL_FUNC void kq_verify_nax_impl(
 // own buffer and into its own output, with one split count over grid z.
 // part_stride[i] is output i's partial stride. Unused weight slots bind
 // slot 0's buffers, and their tg_end is the grid end, so they own no
-// threadgroup.
-#define KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(CODEC, TRAITS)                       \
+// threadgroup. OS 1 gives weight i the output scale at slot
+// KQ_OUT_SCALE_SLOT - i, all four in one mode.
+#define KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(CODEC, TRAITS) \
+  KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL_OS(CODEC, TRAITS, 0)
+
+#define KQ_OS_MULTI_SCALE(i) \
+  const device float* os##i  \
+      [[buffer(KQ_OUT_SCALE_SLOT - i), function_constant(kq_has_out_scale)]]
+#define KQ_OS_MULTI_ARG_1                                             \
+  , KQ_OS_MULTI_SCALE(0), KQ_OS_MULTI_SCALE(1), KQ_OS_MULTI_SCALE(2), \
+      KQ_OS_MULTI_SCALE(3)
+#define KQ_OS_MULTI_ARG_0
+#define KQ_OS_MULTI_PTR_1 , i == 0 ? os0 : i == 1 ? os1 : i == 2 ? os2 : os3
+#define KQ_OS_MULTI_PTR_0
+
+#define KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL_OS(CODEC, TRAITS, OS)                \
   template <typename T, int group_size, int bits, typename U = T>              \
   [[kernel]] void kq_##CODEC##_verify_nax_multi(                               \
       const device uint8_t* w0,                                                \
@@ -1199,7 +1213,7 @@ METAL_FUNC void kq_verify_nax_impl(
       const constant int4& part_stride,                                        \
       uint3 tid [[threadgroup_position_in_grid]],                              \
       uint simd_gid [[simdgroup_index_in_threadgroup]],                        \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                           \
+      uint simd_lid [[thread_index_in_simdgroup]] KQ_OS_MULTI_ARG_##OS) {      \
     static_assert(group_size == TRAITS::group, #CODEC " block width");         \
     const int t = int(tid.x);                                                  \
     /* tg_end is cumulative, so the weight is the ends passed. */              \
@@ -1208,7 +1222,7 @@ METAL_FUNC void kq_verify_nax_impl(
     const int t0 = i == 0 ? 0 : tg_end[i - 1];                                 \
     const device uint8_t* w = i == 0 ? w0 : i == 1 ? w1 : i == 2 ? w2 : w3;    \
     device U* y = i == 0 ? y0 : i == 1 ? y1 : i == 2 ? y2 : y3;                \
-    kq_verify_nax_impl<T, TRAITS, U>(                                          \
+    kq_verify_nax_impl<T, TRAITS, U, OS>(                                      \
         w,                                                                     \
         x,                                                                     \
         y + tid.z * static_cast<int64_t>(part_stride[i]),                      \
@@ -1218,7 +1232,7 @@ METAL_FUNC void kq_verify_nax_impl(
         k_partition_size,                                                      \
         uint3(uint(t - t0), tid.y, tid.z),                                     \
         simd_gid,                                                              \
-        simd_lid);                                                             \
+        simd_lid KQ_OS_MULTI_PTR_##OS);                                        \
   }
 
 KQ_DEFINE_VERIFY_NAX_KERNEL(pq2_0, KqPq2_0Nax)
@@ -1239,7 +1253,7 @@ KQ_DEFINE_VERIFY_NAX_KERNEL(q2_k, KqQ2_KNax)
 
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(pq2_0, KqPq2_0Nax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q2_0, KqQ2_0Nax)
-KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(nvfp4, KqNvfp4Nax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL_OS(nvfp4, KqNvfp4Nax, 1)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_0, KqQ4_0Nax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_0_sb, KqQ4_0SbNax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_1, KqQ4_1Nax)
