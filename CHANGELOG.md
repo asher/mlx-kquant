@@ -11,14 +11,14 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stacked LoRA factors, so each row of a dense matmul adds its own adapter inside the same
   dispatch. `HAS_LORA_STACK` marks the build.
 - `quantized_matmul` and `KQuantLinear` take `out_scale` for `nvfp4` weights: the per-tensor
-  or per-column scale of an NVFP4 GGUF, applied in the kernel before the output is stored.
+  or per-column scale of an NVFP4 GGUF, applied in float32 before a float16 output is rounded.
 
 ### Changed
 - Up to 32 rows, a live LoRA adapter on `quantized_matmul`, `quantized_matmul_qmv_bias` and
   `gather_qmv_kq` forms `x @ A` beside the base matvec and reads each adapter's factors once per
   block of rows, which removes most of the adapter's cost at decode widths.
 - `nvfp4` and `mxfp4` matmuls decode fp4 values without a lookup table, with the same output.
-  On M5 Max, matmuls of 2 to 16 rows take up to 31% less time.
+  On M5 Max, `nvfp4` matmuls of 1 to 16 rows take 8 to 10% less time.
 
 ## [0.5.6]
 
