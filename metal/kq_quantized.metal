@@ -1281,5 +1281,4 @@ instantiate_kq_qmm_splitk_accum(bfloat16_t)
 instantiate_kq_qmm_splitk_accum(float16_t)
 instantiate_kq_qmm_splitk_accum_pf32(bfloat16_t)
 instantiate_kq_qmm_splitk_accum_pf32(float16_t)
-
     // clang-format on

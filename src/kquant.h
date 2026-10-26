@@ -1317,10 +1317,10 @@ class KQuantMatmul : public mx::Primitive {
 
 // The output of a matmul that runs as dequantize then the stock matmul,
 // with the vjp of KQuantMatmul. inputs = {y, x, w, scales[, out_scale]},
-// where y is the
-// product under stop_gradient; the output shares y's buffer. The gradient
-// wrt x runs the quantized matmul the other way, so no backward pass keeps
-// the dense copy, and the gradient wrt w or scales throws, as on the kernel.
+// where y is the product under stop_gradient; the output shares y's buffer.
+// The gradient wrt x runs the quantized matmul the other way, so no backward
+// pass keeps the dense copy, and the gradient wrt w, scales or out_scale
+// throws, as on the kernel.
 // jvp and vmap throw the base-class text with the name KQuantMatmul.
 class KQuantDequantRoute : public mx::Primitive {
  public:
