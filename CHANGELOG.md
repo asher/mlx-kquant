@@ -11,7 +11,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stacked LoRA factors, so each row of a dense matmul adds its own adapter inside the same
   dispatch. `HAS_LORA_STACK` marks the build.
 - `quantized_matmul` and `KQuantLinear` take `out_scale` for `nvfp4` weights: the per-tensor
-  or per-column scale of an NVFP4 GGUF, applied in float32 before a float16 output is rounded.
+  or per-column scale of an NVFP4 GGUF. The unscaled product never passes through float16,
+  so float16 activations do not overflow.
 
 ### Changed
 - Up to 32 rows, a live LoRA adapter on `quantized_matmul`, `quantized_matmul_qmv_bias` and
