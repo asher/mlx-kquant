@@ -498,7 +498,9 @@ def _gather_scales(N, rng):
     def p2(*shape):
         return np.exp2(-rng.integers(10, 14, shape)).astype(np.float32)
 
-    return [p2(1), p2(N), p2(E, 1), p2(E, N)]
+    # Mode 3 takes each exponent once, so a wrong expert changes the bits.
+    per_expert = np.exp2(-10.0 - rng.permutation(E)).astype(np.float32)
+    return [p2(1), p2(N), per_expert[:, None], p2(E, N)]
 
 
 @pytest.mark.parametrize("dtn", ("bfloat16", "float16"))
