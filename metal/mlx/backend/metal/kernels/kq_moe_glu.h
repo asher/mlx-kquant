@@ -29,14 +29,19 @@
 // shims, and the decode must stay bit-identical to MLX's mode="mxfp4" path
 // (OCP E2M1 values, one E8M0 scale per 32 values).
 
-// E2M1 code c = s e1 e0 m to its value without a table (same construction
-// as kq_fp_e2m1_value in kq_quantized_fp.h, kept local so this header stays
-// self-contained): exponent field e + 126 with mantissa bit 22 = m for
-// e > 0, m/2 for e = 0, sign to bit 31. Exact, no memory read.
+// E2M1 code c to its value without a table (the construction of
+// kq_fp_e2m1_value in kq_quantized_fp.h, kept local so this header stays
+// self-contained): code bits to half bits 11..9, sign to 15, times 2^14.
 inline float kq_fp4_e2m1_value(uint c) {
-  const float n = as_type<float>(((c & 7u) << 22) + 0x3F000000u);
-  const float mag = (c & 6u) ? n : float(c & 1u) * 0.5f;
-  return as_type<float>(as_type<uint>(mag) | ((c & 8u) << 28));
+  const half h = as_type<half>(ushort(((c & 7u) << 9) | ((c & 8u) << 12)));
+  return float(h * 16384.0h);
+}
+
+// Two codes at bits 0..3 and 16..19 of n to their values through one half2.
+inline float2 kq_fp4_e2m1_pair(uint n) {
+  const half2 h =
+      as_type<half2>(((n & 0x00070007u) << 9) | ((n & 0x00080008u) << 12));
+  return float2(h * half2(16384.0h));
 }
 
 // 2^(e-127) built from bits, matching MLX's fp8_e8m0 float conversion:
@@ -58,10 +63,12 @@ inline U kq_fp4_qdot(const device uint8_t* w, const thread U* xt, U scale) {
   U accum = 0;
   const device uint16_t* ws = (const device uint16_t*)w;
   for (int i = 0; i < VPT / 4; i++) {
-    accum += xt[4 * i + 0] * kq_fp4_e2m1_value(uint((ws[i] >> 0) & 0xF)) +
-        xt[4 * i + 1] * kq_fp4_e2m1_value(uint((ws[i] >> 4) & 0xF)) +
-        xt[4 * i + 2] * kq_fp4_e2m1_value(uint((ws[i] >> 8) & 0xF)) +
-        xt[4 * i + 3] * kq_fp4_e2m1_value(uint((ws[i] >> 12) & 0xF));
+    // codes 0 and 2 at bits 0 and 16, codes 1 and 3 after the shift by 4
+    const uint u = uint(ws[i]) | (uint(ws[i]) << 8);
+    const float2 v02 = kq_fp4_e2m1_pair(u);
+    const float2 v13 = kq_fp4_e2m1_pair(u >> 4);
+    accum += xt[4 * i + 0] * v02.x + xt[4 * i + 1] * v13.x +
+        xt[4 * i + 2] * v02.y + xt[4 * i + 3] * v13.y;
   }
   return scale * accum;
 }

@@ -24,14 +24,23 @@ MLX_MTL_CONST int KQ_MXFP8_GROUP = 32;
 MLX_MTL_CONST int KQ_MXFP8_BLOCK_BYTES = 33;
 MLX_MTL_CONST int KQ_MXFP8_QS_OFFSET = 1;
 
-// E2M1 code c = s e1 e0 m to its value without a table. For e > 0 the value
-// is 2^(e-1) * (1 + m/2): the float whose exponent field is e + 126 and whose
-// mantissa bit 22 is m. For e = 0 it is m/2. The sign bit moves to bit 31,
-// so code 8 is -0.0 like the table it replaces. Selects, no memory, exact.
+// E2M1 code c = s e1 e0 m to its value without a table, as verify_nax
+// builds it: e1 e0 m in half bits 11..9 is the value times 2^-14 (a half
+// subnormal for e = 0), the sign goes to bit 15, and the product with 2^14
+// is exact in half. Code 8 is -0.0 like the table it replaces.
 inline float kq_fp_e2m1_value(uint c) {
-  const float n = as_type<float>(((c & 7u) << 22) + 0x3F000000u);
-  const float mag = (c & 6u) ? n : float(c & 1u) * 0.5f;
-  return as_type<float>(as_type<uint>(mag) | ((c & 8u) << 28));
+  const half h = as_type<half>(ushort(((c & 7u) << 9) | ((c & 8u) << 12)));
+  return float(h * 16384.0h);
+}
+
+// Two E2M1 codes, at bits 0..3 and 16..19 of n, to their values through one
+// half2. The masks select the two codes, so callers pass a word holding a
+// byte at bits 0..7 and one at 16..23, shifted right by 4 for the high
+// nibbles.
+inline float2 kq_fp_e2m1_pair(uint n) {
+  const half2 h =
+      as_type<half2>(((n & 0x00070007u) << 9) | ((n & 0x00080008u) << 12));
+  return float2(h * half2(16384.0h));
 }
 
 // 2^(e-127) built from bits: metal::exp2 is fast-math and lands ulps off on
@@ -101,9 +110,11 @@ METAL_FUNC void kq_mxfp4_deq_chunk16(
   const device uint8_t* qs = block + KQ_MXFP4_QS_OFFSET;
   const int shift = (il & 1) ? 4 : 0;
 #pragma unroll
-  for (int i = 0; i < 16; ++i) {
-    const int nib = (int(qs[i]) >> shift) & 0x0F;
-    reg[i / 4][i % 4] = d * kq_fp_e2m1_value(uint(nib));
+  for (int i = 0; i < 16; i += 2) {
+    const float2 v =
+        kq_fp_e2m1_pair((uint(qs[i]) | (uint(qs[i + 1]) << 16)) >> shift);
+    reg[i / 4][i % 4] = d * v.x;
+    reg[i / 4][i % 4 + 1] = d * v.y;
   }
 }
 
@@ -179,26 +190,20 @@ METAL_FUNC void kq_mxfp4_qmv_impl(
           ib * KQ_MXFP4_BLOCK_BYTES;
       const U d = U(kq_fp_e8m0_scale(blk[0]));
       const device uint8_t* q = blk + KQ_MXFP4_QS_OFFSET + 8 * it;
-      float4 acc = yl0 *
-          float4(kq_fp_e2m1_value(uint(q[0] & 0x0F)),
-                 kq_fp_e2m1_value(uint(q[1] & 0x0F)),
-                 kq_fp_e2m1_value(uint(q[2] & 0x0F)),
-                 kq_fp_e2m1_value(uint(q[3] & 0x0F)));
-      acc += yl1 *
-          float4(kq_fp_e2m1_value(uint(q[0] >> 4)),
-                 kq_fp_e2m1_value(uint(q[1] >> 4)),
-                 kq_fp_e2m1_value(uint(q[2] >> 4)),
-                 kq_fp_e2m1_value(uint(q[3] >> 4)));
-      acc += yl2 *
-          float4(kq_fp_e2m1_value(uint(q[4] & 0x0F)),
-                 kq_fp_e2m1_value(uint(q[5] & 0x0F)),
-                 kq_fp_e2m1_value(uint(q[6] & 0x0F)),
-                 kq_fp_e2m1_value(uint(q[7] & 0x0F)));
-      acc += yl3 *
-          float4(kq_fp_e2m1_value(uint(q[4] >> 4)),
-                 kq_fp_e2m1_value(uint(q[5] >> 4)),
-                 kq_fp_e2m1_value(uint(q[6] >> 4)),
-                 kq_fp_e2m1_value(uint(q[7] >> 4)));
+      const uint w02 = uint(q[0]) | (uint(q[2]) << 16);
+      const uint w13 = uint(q[1]) | (uint(q[3]) << 16);
+      const uint w46 = uint(q[4]) | (uint(q[6]) << 16);
+      const uint w57 = uint(q[5]) | (uint(q[7]) << 16);
+      const float2 l02 = kq_fp_e2m1_pair(w02), l13 = kq_fp_e2m1_pair(w13);
+      const float2 h02 = kq_fp_e2m1_pair(w02 >> 4);
+      const float2 h13 = kq_fp_e2m1_pair(w13 >> 4);
+      const float2 l46 = kq_fp_e2m1_pair(w46), l57 = kq_fp_e2m1_pair(w57);
+      const float2 h46 = kq_fp_e2m1_pair(w46 >> 4);
+      const float2 h57 = kq_fp_e2m1_pair(w57 >> 4);
+      float4 acc = yl0 * float4(l02.x, l13.x, l02.y, l13.y);
+      acc += yl1 * float4(h02.x, h13.x, h02.y, h13.y);
+      acc += yl2 * float4(l46.x, l57.x, l46.y, l57.y);
+      acc += yl3 * float4(h46.x, h57.x, h46.y, h57.y);
       result[row] += d * ((acc.x + acc.y) + (acc.z + acc.w));
     }
   }
@@ -276,7 +281,17 @@ struct KqMxfp4BlockLoader {
     const float d = kq_fp_e8m0_scale(src[0]);
     const device uint8_t* qs = src + KQ_MXFP4_QS_OFFSET + bj_byte;
 #pragma unroll
-    for (short i = 0; i < bytes_per_thread; i++) {
+    for (short i = 0; i + 1 < bytes_per_thread; i += 2) {
+      const uint w = uint(qs[i]) | (uint(qs[i + 1]) << 16);
+      const float2 lo = kq_fp_e2m1_pair(w);
+      const float2 hi = kq_fp_e2m1_pair(w >> 4);
+      dst[i] = T(d * lo.x);
+      dst[i + 1] = T(d * lo.y);
+      dst[half_block + i] = T(d * hi.x);
+      dst[half_block + i + 1] = T(d * hi.y);
+    }
+    if (bytes_per_thread % 2) {
+      const short i = bytes_per_thread - 1;
       const uint8_t b = qs[i];
       dst[i] = T(d * kq_fp_e2m1_value(uint(b & 0x0F)));
       dst[half_block + i] = T(d * kq_fp_e2m1_value(uint(b >> 4)));
@@ -625,13 +640,12 @@ METAL_FUNC uint2 kq_nvfp4_group_qs(const device uint8_t* block, int g) {
   return uint2(q[0], q[1]);
 }
 
-// E2M1 values of nibble `shift` (0 low, 4 high) of each byte of `q`.
+// E2M1 values of nibble `shift` (0 low, 4 high) of each byte of `q`: bytes
+// 0 and 2 through one half2, 1 and 3 through the other.
 METAL_FUNC float4 kq_nvfp4_nibbles4(uint32_t q, uint shift) {
-  return float4(
-      kq_fp_e2m1_value(uint((q >> shift) & 0x0F)),
-      kq_fp_e2m1_value(uint((q >> (8 + shift)) & 0x0F)),
-      kq_fp_e2m1_value(uint((q >> (16 + shift)) & 0x0F)),
-      kq_fp_e2m1_value(uint((q >> (24 + shift)) & 0x0F)));
+  const float2 a = kq_fp_e2m1_pair(q >> shift);
+  const float2 b = kq_fp_e2m1_pair(q >> (8 + shift));
+  return float4(a.x, b.x, a.y, b.y);
 }
 
 // Natural-order chunk [il*16, il*16+16) == sub-scale group il; il in [0,4).
