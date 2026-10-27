@@ -1005,6 +1005,10 @@ VNAX_NVFP4_CHOICE = [
     (5120, 17408, None, True, 4),
     (10240, 5120, None, True, 2),
     (18560, 4096, None, True, 1),
+    (17920, 4096, None, True, 1),  # 560 simdgroups at one split
+    (17888, 4096, None, False, None),  # 559
+    (10240, 4096, None, True, 2),  # walk 2048, as the Qwen3 vocab head
+    (10240, 3584, None, False, None),  # walk 1792 at 2 splits, full grid
     (1000, 3840, None, False, None),
     (1000, 3840, "1", True, None),
     (5120, 17408, "0", False, None),
@@ -1792,6 +1796,17 @@ def test_nax_qmv_nvfp4_head(monkeypatch):
     calls = [{"codec": "nvfp4", "shape": [2, 256], "n": n} for n in (100000, 99999)]
     names = [_one_kernel(e)[0] for e in _logged(calls, {})]
     assert "_mv_ext_" in names[0] and "_qmv_" in names[1], names
+
+
+# nvfp4's qmv limit where mv_ext runs one row above it: M 2 at N 1025 to
+# 2048 (verify_nax enters at M 4 there at K 1024) and above N 2048.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX routing only")
+def test_nax_qmv_nvfp4_limits(monkeypatch):
+    _clear_levers(monkeypatch)
+    cases = [(2048, 2, "_qmv_"), (2048, 3, "_mv_ext_"), (2049, 2, "_qmv_")]
+    calls = [{"codec": "nvfp4", "shape": [m, 1024], "n": n} for n, m, _ in cases]
+    for (n, m, frag), e in zip(cases, _logged(calls, {}), strict=True):
+        assert frag in _one_kernel(e)[0], (n, m, frag)
 
 
 # kq_nax_small_m for the codecs the dispatch tests pin: the per-row qmv

@@ -47,7 +47,8 @@ def _arms(bound, forced=True):
     """(name, env) per route arm. The CPU stream has one route; its NEON
     GEMV rounds activations to int8 by design, so only the bit checks run
     it. verify_nax_1 runs verify_nax in one split, which scales in the
-    kernel; the default route does so at N 18944, K 3584."""
+    kernel; the default route does so at N 18944, K 3584. The verify_nax_sb
+    arms run nvfp4's four-block kernel."""
     if FORCE_CPU:
         neon = [] if bound else [("cpu_neon", {})]
         return [("cpu", {"KQ_CPU_NEON": "0"})] + neon
@@ -57,7 +58,13 @@ def _arms(bound, forced=True):
         return arms
     arms += [(r, {"KQ_QMM_ROUTE": r, **strict}) for r in ROUTES]
     one = {"KQ_QMM_ROUTE": "verify_nax", "KQ_VERIFY_NAX_SPLITS": "1", **strict}
-    return arms + [("verify_nax_1", one)]
+    sb = {"KQ_QMM_ROUTE": "verify_nax", "KQ_VERIFY_NAX_NVFP4_SB": "1", **strict}
+    sb_1 = {**sb, "KQ_VERIFY_NAX_SPLITS": "1"}
+    return arms + [
+        ("verify_nax_1", one),
+        ("verify_nax_sb", sb),
+        ("verify_nax_sb_1", sb_1),
+    ]
 
 
 @contextlib.contextmanager

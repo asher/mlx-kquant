@@ -22,7 +22,8 @@ times a two-bit code is exact in float32; only the sign of zero may differ).
 mxfp4 exponents run 8 to 239: below that a weight times an activation can be
 a float32 subnormal, which the GPU may flush, and above it a row sum leaves
 the float32 range. The GLU arms square the range and use 64 to 180. The
-float16 arms use nvfp4 scales 0x08 to 0x47.
+float16 arms use nvfp4 scales 0x08 to 0x47, except the one-hot test, which
+reads every nvfp4 weight back exactly in float16 on all 256 scale bytes.
 
 Under KQUANT_FORCE_CPU only dequantize and the default matmul route run,
 with KQ_CPU_NEON=0: the NEON GEMV rounds activations to int8 by design
@@ -107,8 +108,9 @@ def _x(M, dtn):
     return x, np.asarray(x.astype(mx.float32)).astype(np.float64)
 
 
-def _arms(name):
-    dts = ("bfloat16", "float16") if name == "nvfp4_mid" else ("bfloat16",)
+def _arms(name, one_hot=False):
+    both = name == "nvfp4_mid" or (one_hot and name == "nvfp4_all")
+    dts = ("bfloat16", "float16") if both else ("bfloat16",)
     return [(name, dtn) for dtn in dts]
 
 
@@ -165,7 +167,7 @@ def test_matmul_routes(name, dtn, M):
 # verify_nax kernels (KQ_VERIFY_NAX_NVFP4_SB=0 and 1), and every wire runs
 # each forced route that serves M 8.
 @pytest.mark.skipif(FORCE_CPU, reason="the forced routes are Metal paths")
-@pytest.mark.parametrize("name,dtn", [a for n in WIRES for a in _arms(n)])
+@pytest.mark.parametrize("name,dtn", [a for n in WIRES for a in _arms(n, one_hot=True)])
 def test_one_hot_rows_reproduce_every_weight(name, dtn):
     codec, gtype, wire = _wire(name)
     ref = _ref(wire, gtype).T

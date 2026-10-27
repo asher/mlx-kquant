@@ -476,6 +476,24 @@ def test_route_levers_are_followed(lever):
 
 
 @NAX_ONLY
+def test_nvfp4_kernel_by_dispatch_grid():
+    # nvfp4 picks its kernel from the joint grid of each dispatch of up to
+    # four weights. Three 6144-row weights at K 4096 make a grid of 576
+    # simdgroups at one split, which takes the four-block kernel; one alone
+    # takes the two-block kernel. Five 4096-row weights at K 8192 run as two
+    # dispatches, both on the two-block kernel.
+    multi, per = _census(
+        [["multi", {}], ["per", {}]], codec="nvfp4", m=4, k=4096, ns=(6144,) * 3
+    )
+    assert len(multi) == 1, multi
+    assert multi[0].startswith("kquant_nvfp4_sb_verify_nax_multi_"), multi
+    assert all(n.startswith("kquant_nvfp4_verify_nax_") for n in per), per
+    (five,) = _census([["multi", {}]], codec="nvfp4", m=4, k=8192, ns=(4096,) * 5)
+    assert len(five) == 2, five
+    assert all(n.startswith("kquant_nvfp4_verify_nax_multi_") for n in five), five
+
+
+@NAX_ONLY
 def test_forced_verify_nax_fuses_narrow_weights():
     # KQ_VERIFY_NAX=2 alone takes quantized_matmul to verify_nax at widths
     # whose default is per-row qmv; the op follows and joins the weights.
