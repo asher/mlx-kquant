@@ -692,6 +692,44 @@ def test_switch_linear_scales_before_the_bias(B):
     _bound_check(y, ref, bound, "bfloat16")
 
 
+@pytest.mark.skipif(FORCE_CPU, reason="gather_qmm_seg is Metal-only")
+@pytest.mark.usefixtures("compile_on")
+@pytest.mark.parametrize("by_rows", (False, True), ids=("sorted_x", "x_rows"))
+def test_seg_shapeless_compile_keeps_the_row_count(by_rows):
+    """gather_qmm_seg with per-expert scales, compiled with shapeless=True,
+    gives each call its own row count and the bits of the eager op. With
+    x_rows, x holds T tokens routed top-2 and the 2T sorted rows each name
+    one."""
+    N = 256
+    w = mx.array(_stack(N, 0x30, 0x48).reshape(E, N, -1))
+    s = mx.array(_col_scales(E).reshape(E, 1))
+    rng = np.random.default_rng(8)
+
+    def seg(x, eids, rows, s):
+        m, c = kq.expert_tile_map(eids, E, tile_rows=64)
+        return kq.gather_qmm_seg(
+            x, w, Z, "nvfp4", m, c, tile_rows=64, x_rows=rows, out_scale=s
+        )
+
+    if by_rows:
+        f = mx.compile(seg, shapeless=True)
+    else:
+        f = mx.compile(lambda x, eids, s: seg(x, eids, None, s), shapeless=True)
+    for T in (100, 40, 160):
+        x = mx.random.normal((T, K), key=mx.random.key(T)).astype(mx.bfloat16)
+        if by_rows:
+            pick = np.argsort(rng.random((T, E)), axis=1)[:, :2].ravel()
+            order = np.argsort(pick, kind="stable")
+            eids = mx.array(pick[order].astype(np.uint32))
+            rows = mx.array((order // 2).astype(np.uint32))
+            y, want = f(x, eids, rows, s), seg(x, eids, rows, s)
+        else:
+            eids = mx.array(np.sort(rng.integers(0, E, T)).astype(np.uint32))
+            y, want = f(x, eids, s), seg(x, eids, None, s)
+        assert y.shape == want.shape == (eids.size, N), (T, y.shape)
+        assert np.array_equal(_bits(y), _bits(want)), T
+
+
 def test_gather_rejects():
     N = 256
     w = mx.array(_stack(N, 0x30, 0x48).reshape(E, N, -1))

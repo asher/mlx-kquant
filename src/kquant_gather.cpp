@@ -1170,7 +1170,8 @@ void KQuantExpertTileMap::eval_cpu(
 
 std::vector<mx::Shape> KQuantGatherQMMSeg::output_shapes(
     const std::vector<mx::array>& inputs) {
-  const int rows = inputs.size() == 6 ? inputs[5].shape(0) : inputs[0].shape(0);
+  const bool xmap = inputs.size() - (out_scale_mode_ != 0 ? 1 : 0) == 6;
+  const int rows = xmap ? inputs[5].shape(0) : inputs[0].shape(0);
   return {{rows, inputs[1].shape(1)}};
 }
 
