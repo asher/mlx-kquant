@@ -12,11 +12,12 @@ So on every route:
 - float16 activations whose unscaled product passes 65504 give finite,
   in-bound results, split-K included under KQ_SPLITK_F32=0.
 
-The LoRA delta is added after the scale, the gradient wrt x is
-W^T (s * dy), KQuantLinear adds its bias after the scale, and the
-dequantize route of GPUs before M5 scales in float32 after a bfloat16
-GEMM. N 200 puts a partial tile at the end of every route, and N 2048
-at K 4096 takes the default per-row qmv and verify_nax of NAX GPUs.
+The LoRA delta, of one adapter or of a stack picked per row, is added
+after the scale, the gradient wrt x is W^T (s * dy), KQuantLinear adds
+its bias after the scale, and the dequantize route of GPUs before M5
+scales in float32 after a bfloat16 GEMM. N 200 puts a partial tile at
+the end of every route, and N 2048 at K 4096 takes the default per-row
+qmv and verify_nax of NAX GPUs.
 """
 
 from __future__ import annotations
@@ -235,21 +236,40 @@ def test_real_scales_against_float64(dtn, N, M):
         assert want <= set(ran), ran
 
 
+@pytest.mark.parametrize("stacked", (False, True))
 @pytest.mark.parametrize("M", (1, 8, 256))
-def test_lora_delta_is_not_scaled(M):
-    N, r = 256, 8
+def test_lora_delta_is_not_scaled(M, stacked):
+    # Stacked: three adapters picked per row by lora_ids, and a table that
+    # maps the third to -1, so its rows take the scaled base alone.
+    N, r, S = 256, 8, 3
     wire = _wire(N, 0x30, 0x48)
     w64 = _w64(wire)
     x, x64 = _x(M, "bfloat16")
-    a = (mx.random.normal((K, r), key=mx.random.key(11)) * 0.1).astype(mx.bfloat16)
-    b = (mx.random.normal((r, N), key=mx.random.key(12)) * 0.1).astype(mx.bfloat16)
-    s = 2.0**-12
-    y = _mm(x, mx.array(wire), mx.full((1,), s), lora_a=a, lora_b=b)
+    sa, sb = ((S, K, r), (S, r, N)) if stacked else ((K, r), (r, N))
+    a = (mx.random.normal(sa, key=mx.random.key(11)) * 0.1).astype(mx.bfloat16)
+    b = (mx.random.normal(sb, key=mx.random.key(12)) * 0.1).astype(mx.bfloat16)
+    kw = {"lora_a": a, "lora_b": b}
     a64, b64 = _f64(a), _f64(b)
-    ref = s * (x64 @ w64.T) + (x64 @ a64) @ b64
-    bound = s * (np.abs(x64) @ np.abs(w64).T) + (np.abs(x64) @ np.abs(a64)) @ np.abs(
-        b64
-    )
+    if stacked:
+        ids = np.arange(M) % S
+        table = np.array([1, 0, -1])
+        kw["lora_ids"] = mx.array(ids.astype(np.uint32))
+        kw["lora_table"] = mx.array(table.astype(np.int32))
+        e = table[ids]
+        a64, b64 = a64[np.maximum(e, 0)], b64[np.maximum(e, 0)]
+        live = (e >= 0)[:, None]
+        delta = np.einsum("mr,mrn->mn", np.einsum("mk,mkr->mr", x64, a64), b64)
+        dbound = np.einsum(
+            "mr,mrn->mn", np.einsum("mk,mkr->mr", np.abs(x64), np.abs(a64)), np.abs(b64)
+        )
+        delta, dbound = delta * live, dbound * live
+    else:
+        delta = (x64 @ a64) @ b64
+        dbound = (np.abs(x64) @ np.abs(a64)) @ np.abs(b64)
+    s = 2.0**-12
+    y = _mm(x, mx.array(wire), mx.full((1,), s), **kw)
+    ref = s * (x64 @ w64.T) + delta
+    bound = s * (np.abs(x64) @ np.abs(w64).T) + dbound
     # A scaled delta would be 4096 times too small, an unscaled base 4096
     # times too large.
     _bound_check(y, ref, bound, "bfloat16", tol=2.0**-5)
