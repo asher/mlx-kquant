@@ -3457,8 +3457,8 @@ void KQuantMatmul::eval_gpu_base(
         ? kq_verify_mma_min_m_nax(kquant_type_)
         : kq_verify_mma_min_m(kquant_type_, x.dtype() == mx::float16);
   }
-  // verify_qmv has no output scale epilogue, and verify_mma has one on
-  // the codecs of kq_verify_mma_has_os.
+  // verify_mma takes the output scale on the codecs of
+  // kq_verify_mma_has_os.
   const bool vmma_route = (!os || kq_verify_mma_has_os(kquant_type_)) &&
       vmma_rows > 0 && vmma_min_m > 0 && M >= vmma_min_m && M <= 8 &&
       transpose_ && non_batched && x.dtype() != mx::float32;

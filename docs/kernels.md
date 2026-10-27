@@ -605,21 +605,22 @@ The kernels decode the codes exactly in half and keep the activations in their o
 threadgroup memory. Both widen to float in the fragment, so each block sums in float and the block
 scale applies in float. Unsplit, or split with float partials (the float16 default, and
 `KQ_SPLITK_F32=1`), the result rounds once, as the mat-vec kernels do with the exact weights, at any
-activation magnitude. `nvfp4` folds each group scale into its codes, which stay exact in half at
-2^-14 of each weight, and multiplies the sum by 2^14 at the store, together with the `out_scale`
-of the call. `KQ_VERIFY_MMA_HALF=1` runs the half kernels of `pq2_0`, `q2_0`, `q4_0` and
-`q8_0`, which stage the activations as half and sum each block in half. There an activation beyond the half
-range (magnitude 65504), such as a bfloat16 outlier, turns to inf, and so does a block sum past it.
-On ordinary activations with float partials, the error of the half kernels runs 0.4 to 0.9 output
-roundings beyond the rounding of the float64 result on bfloat16, and 4 to 7 on float16, and the
-float kernels run within 0.01. Partials in the activation dtype (the bfloat16 default, and
-`KQ_SPLITK_F32=0`) add about one output rounding to a split call of either kernel, which puts the
-half kernels at 1.1 to 1.4 on bfloat16 and 4 to 7.5 on float16, and the float kernels at about 1 on
-both. Against the half kernels over the same shapes and M on the M5 Max, the float kernels take
-0.90-1.00x the time for `pq2_0` and 0.94-1.02x for `q4_0` on bfloat16, and 0.99-1.01x for `pq2_0`
-and 1.00-1.05x for `q4_0` on float16. `ptq1_0` has no half kernels, since in float it runs in
-0.90-1.03x the time of a half build. `nvfp4` has none either: at 2^-14 of their value many of its
-weight products fall below the half normal range.
+activation magnitude. `nvfp4` folds each group scale times 2^7 into its codes, which stay exact in
+half at 2^-7 of each weight, and multiplies the sum by 2^7 at the store, together with the
+`out_scale` of the call. Its products sit 2^7 below their value, so on bfloat16 activations below
+about 2^-105 its float sums lose bits that the mat-vec kernels keep. `KQ_VERIFY_MMA_HALF=1` runs the
+half kernels of `pq2_0`, `q2_0`, `q4_0` and `q8_0`, which stage the activations as half and sum each
+block in half. There an activation beyond the half range (magnitude 65504), such as a bfloat16
+outlier, turns to inf, and so does a block sum past it. On ordinary activations with float partials,
+the error of the half kernels runs 0.4 to 0.9 output roundings beyond the rounding of the float64
+result on bfloat16, and 4 to 7 on float16, and the float kernels run within 0.01. Partials in the
+activation dtype (the bfloat16 default, and `KQ_SPLITK_F32=0`) add about one output rounding to a
+split call of either kernel, which puts the half kernels at 1.1 to 1.4 on bfloat16 and 4 to 7.5 on
+float16, and the float kernels at about 1 on both. Against the half kernels over the same shapes and
+M on the M5 Max, the float kernels take 0.90-1.00x the time for `pq2_0` and 0.94-1.02x for `q4_0` on
+bfloat16, and 0.99-1.01x for `pq2_0` and 1.00-1.05x for `q4_0` on float16. `ptq1_0` has no half
+kernels, since in float it runs in 0.90-1.03x the time of a half build. `nvfp4` has none either: at
+2^-7 of their value many of its weights fall below the half normal range.
 
 A codec with a block min, `q4_1` (w = d * code + m), uses the same fragments with the codes
 unscaled. While the activations of a K chunk are staged, each simdgroup also sums the 32
@@ -687,7 +688,7 @@ a `q8_0` block across 8 rows ran 1.04-1.24x slower at every Qwen3.8-27B shape ex
 and `q4_1` run the eight-block kernel at a K that is a multiple of 256 and the two-block kernel
 elsewhere. `nvfp4` runs the four-block kernel at a K that is a multiple of 256 where a grid of about
 one wave of simdgroups walks 2048 or more of K, as on a vocab head, and the two-block kernel
-elsewhere. Both hold the `nvfp4` weights 2^14 smaller in half, which keeps every weight exact, and
+elsewhere. Both hold the `nvfp4` weights 2^7 smaller in half, which keeps every weight exact, and
 multiply the float32 sums back at the store. The `q4_1` kernels are the `q4_0` kernels with the min
 folded in as code * d + m, one half rounding per weight. Its 20-byte blocks keep each row 4-byte
 aligned, so the eight-block kernel reads whole words with no shift. The K-quant kernels fold each
