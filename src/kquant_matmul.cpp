@@ -2955,6 +2955,8 @@ std::vector<mx::array> KQuantMatmul::vjp(
           std::nullopt,
           std::nullopt,
           std::nullopt,
+          std::nullopt,
+          std::nullopt,
           stream()));
     } else if (arg == 1) {
       throw std::invalid_argument(
@@ -3127,17 +3129,22 @@ void KQuantMatmulMulti::eval_gpu(
 void KQuantMatmul::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
+  if (!(lora_flags_ & KQ_LORA_PRESENT)) {
+    eval_gpu_base(inputs, outputs);
+    return;
+  }
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  const auto& x = inputs[0];
+  auto& out = outputs[0];
+  const int K = x.shape(-1);
+  const int N = out.shape(-1);
+  const int rows = K > 0 ? static_cast<int>(x.size() / K) : 0;
+  const KqLoraRows pre =
+      kq_lora_rows_pre_gpu(d, s, x, inputs, 3, lora_flags_, rows, K);
   eval_gpu_base(inputs, outputs);
-  if (lora_flags_ & KQ_LORA_PRESENT) {
-    auto& s = stream();
-    auto& d = mx::metal::device(s.device);
-    const auto& x = inputs[0];
-    auto& out = outputs[0];
-    const int K = x.shape(-1);
-    const int N = out.shape(-1);
-    const int rows = static_cast<int>(x.size() / K);
-    kq_lora_epilogue_rows_gpu(
-        d, s, x, kq_lora_view_gpu(inputs, 3, lora_flags_, s), out, rows, K, N);
+  if (out.size() > 0) {
+    kq_lora_rows_post_gpu(d, s, x, pre, out, rows, K, N);
   }
 }
 
@@ -3736,11 +3743,14 @@ void KQuantQmvBias::eval_gpu(
   int K = x.shape(-1);
   int N = out.shape(-1);
 
+  std::optional<KqLoraRows> pre;
+  if (lora_flags_ & KQ_LORA_PRESENT) {
+    pre = kq_lora_rows_pre_gpu(d, s, x, inputs, 4, lora_flags_, 1, K);
+  }
   qmv_bias(
       x, w, scales, bias, out, group_size_, bits_, N, K, d, s, kquant_type_);
-  if (lora_flags_ & KQ_LORA_PRESENT) {
-    kq_lora_epilogue_rows_gpu(
-        d, s, x, kq_lora_view_gpu(inputs, 4, lora_flags_, s), out, 1, K, N);
+  if (pre) {
+    kq_lora_rows_post_gpu(d, s, x, *pre, out, 1, K, N);
   }
 }
 

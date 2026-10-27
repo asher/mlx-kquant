@@ -259,6 +259,38 @@ mx::array dequantize(
       {w_c, scales});
 }
 
+namespace {
+
+// The stack size of a dense op's LoRA factors: 0 for one adapter (lora_a
+// [K, r]), S for a stack (lora_a [S, K, r]) whose entry each row takes from
+// lora_ids. kq_lora_prep validates the rest against that count.
+int kq_dense_lora_stack(
+    const char* op,
+    const std::optional<mx::array>& lora_a,
+    const std::optional<mx::array>& lora_ids,
+    const std::optional<mx::array>& lora_table) {
+  if (lora_table.has_value() && !lora_ids.has_value()) {
+    throw std::invalid_argument(
+        std::string(op) + " lora_table needs lora_ids.");
+  }
+  const bool stacked = lora_a.has_value() && lora_a->ndim() == 3;
+  if (stacked && !lora_ids.has_value()) {
+    throw std::invalid_argument(
+        std::string(op) +
+        " stacked LoRA factors (lora_a [S, K, r]) need "
+        "lora_ids.");
+  }
+  if (lora_ids.has_value() && lora_a.has_value() && !stacked) {
+    throw std::invalid_argument(
+        std::string(op) +
+        " lora_ids need stacked LoRA factors: lora_a "
+        "[S, K, r] and lora_b [S, r, N].");
+  }
+  return stacked ? lora_a->shape(0) : 0;
+}
+
+} // namespace
+
 mx::array quantized_matmul(
     mx::array x,
     mx::array w,
@@ -268,6 +300,8 @@ mx::array quantized_matmul(
     const std::optional<mx::array>& lora_a,
     const std::optional<mx::array>& lora_b,
     const std::optional<mx::array>& lora_rows,
+    const std::optional<mx::array>& lora_ids,
+    const std::optional<mx::array>& lora_table,
     mx::StreamOrDevice s_) {
   if (w.dtype() != mx::uint8) {
     throw std::invalid_argument(
@@ -327,8 +361,10 @@ mx::array quantized_matmul(
   }
 
   auto s = mx::to_stream(s_);
-  const bool lora =
-      lora_a.has_value() || lora_b.has_value() || lora_rows.has_value();
+  const bool lora = lora_a.has_value() || lora_b.has_value() ||
+      lora_rows.has_value() || lora_ids.has_value() || lora_table.has_value();
+  const int lora_stack = kq_dense_lora_stack(
+      "[mlx_kquant.quantized_matmul]", lora_a, lora_ids, lora_table);
   if (lora && w.ndim() != 2) {
     throw std::invalid_argument(
         "[mlx_kquant.quantized_matmul] the LoRA epilogue needs a 2-D w.");
@@ -348,13 +384,13 @@ mx::array quantized_matmul(
           "[mlx_kquant.quantized_matmul]",
           lora_a,
           lora_b,
-          std::nullopt,
-          std::nullopt,
+          lora_ids,
+          lora_table,
           lora_rows,
           out_type,
           w_inner_dims,
           w_outer_dims,
-          0,
+          lora_stack,
           {rows},
           1,
           s,
@@ -409,13 +445,13 @@ mx::array quantized_matmul(
         "[mlx_kquant.quantized_matmul]",
         lora_a,
         lora_b,
-        std::nullopt,
-        std::nullopt,
+        lora_ids,
+        lora_table,
         lora_rows,
         out_type,
         w_inner_dims,
         w_outer_dims,
-        0,
+        lora_stack,
         {rows},
         1,
         s,
@@ -489,6 +525,8 @@ std::vector<mx::array> KQuantDequantRoute::vjp(
           std::nullopt,
           std::nullopt,
           std::nullopt,
+          std::nullopt,
+          std::nullopt,
           stream());
       vjps.push_back(mx::astype(dx, primals[1].dtype(), stream()));
     } else if (arg == 2) {
@@ -527,6 +565,8 @@ mx::array quantized_matmul_qmv_bias(
     const std::optional<mx::array>& lora_a,
     const std::optional<mx::array>& lora_b,
     const std::optional<mx::array>& lora_rows,
+    const std::optional<mx::array>& lora_ids,
+    const std::optional<mx::array>& lora_table,
     mx::StreamOrDevice s_) {
   if (kquant_type != "q8_0") {
     throw std::invalid_argument(
@@ -604,13 +644,17 @@ mx::array quantized_matmul_qmv_bias(
       "[mlx_kquant.quantized_matmul_qmv_bias]",
       lora_a,
       lora_b,
-      std::nullopt,
-      std::nullopt,
+      lora_ids,
+      lora_table,
       lora_rows,
       out_type,
       weights_per_row,
       N,
-      0,
+      kq_dense_lora_stack(
+          "[mlx_kquant.quantized_matmul_qmv_bias]",
+          lora_a,
+          lora_ids,
+          lora_table),
       {1},
       1,
       s,
@@ -667,6 +711,8 @@ mx::array gather_qmm(
         std::move(scales),
         kquant_type,
         transpose,
+        std::nullopt,
+        std::nullopt,
         std::nullopt,
         std::nullopt,
         std::nullopt,

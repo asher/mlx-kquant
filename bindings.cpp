@@ -273,6 +273,8 @@ NB_MODULE(_ext, m) {
       "lora_a"_a = nb::none(),
       "lora_b"_a = nb::none(),
       "lora_rows"_a = nb::none(),
+      "lora_ids"_a = nb::none(),
+      "lora_table"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Quantized matmul: ``x @ dequant(w)`` for GGUF K-quant weights.
@@ -292,6 +294,14 @@ NB_MODULE(_ext, m) {
                 scale in here).
             lora_rows (array, optional): float32 per-row scale [rows] over
                 the flattened leading dims of ``x``; 0 skips a row.
+            lora_ids (array, optional): uint32 [rows], the adapter of each
+                row from a stack: ``lora_a`` [S, K, r] and ``lora_b`` [S, r,
+                N]. Row i adds ``(x_i @ lora_a[e]) @ lora_b[e]`` with ``e =
+                lora_ids[i]``. Every id must index the stack (or
+                ``lora_table``); the kernel does not check.
+            lora_table (array, optional): int32 1-D remap applied to
+                ``lora_ids``: ``e = lora_table[lora_ids[i]]``, and an entry
+                below 0 skips the row. Needs ``lora_ids``.
 
         Returns:
             array: the matmul result (x.dtype, float32 promoted to bfloat16).
@@ -309,6 +319,8 @@ NB_MODULE(_ext, m) {
       "lora_a"_a = nb::none(),
       "lora_b"_a = nb::none(),
       "lora_rows"_a = nb::none(),
+      "lora_ids"_a = nb::none(),
+      "lora_table"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Bias-fused quantized matmul: ``x @ dequant(w) + bias`` for GGUF
@@ -334,6 +346,14 @@ NB_MODULE(_ext, m) {
                 scale in here).
             lora_rows (array, optional): float32 per-row scale [rows] over
                 the flattened leading dims of ``x``; 0 skips a row.
+            lora_ids (array, optional): uint32 [rows], the adapter of each
+                row from a stack: ``lora_a`` [S, K, r] and ``lora_b`` [S, r,
+                N]. Row i adds ``(x_i @ lora_a[e]) @ lora_b[e]`` with ``e =
+                lora_ids[i]``. Every id must index the stack (or
+                ``lora_table``); the kernel does not check.
+            lora_table (array, optional): int32 1-D remap applied to
+                ``lora_ids``: ``e = lora_table[lora_ids[i]]``, and an entry
+                below 0 skips the row. Needs ``lora_ids``.
 
         Returns:
             array: the matmul-plus-bias result (x.dtype, float32 promoted to

@@ -763,6 +763,10 @@ void KQuantGatherQMVKQ::eval_gpu(
   int R = indices.shape(1);
   int N = w.shape(1);
   int K = x.shape(-1);
+  std::optional<KqLoraRows> lora;
+  if (lora_flags_ & KQ_LORA_PRESENT) {
+    lora = kq_lora_rows_pre_gpu(d, s, x, inputs, n_base, lora_flags_, T * R, K);
+  }
 
   const bool use_half = !biased && kq_moe_half(kquant_type_, K);
   const bool c32 = !biased && !use_half && kq_moe_c32(kquant_type_, T);
@@ -809,16 +813,8 @@ void KQuantGatherQMVKQ::eval_gpu(
   MTL::Size grid_dims(N / (fine ? 2 : (sg * 32 / nx)), R, T);
   kq_log_dispatch(kname, x, out, grid_dims, group_dims);
   ce.dispatch_threadgroups(grid_dims, group_dims);
-  if (lora_flags_ & KQ_LORA_PRESENT) {
-    kq_lora_epilogue_rows_gpu(
-        d,
-        s,
-        x,
-        kq_lora_view_gpu(inputs, n_base, lora_flags_, s),
-        out,
-        T * R,
-        K,
-        N);
+  if (lora) {
+    kq_lora_rows_post_gpu(d, s, x, *lora, out, T * R, K, N);
   }
 }
 

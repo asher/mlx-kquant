@@ -6,6 +6,16 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `quantized_matmul` and `quantized_matmul_qmv_bias` take `lora_ids` and `lora_table` with
+  stacked LoRA factors, so each row of a dense matmul adds its own adapter inside the same
+  dispatch. `HAS_LORA_STACK` marks the build.
+
+### Changed
+- Up to 32 rows, a live LoRA adapter on `quantized_matmul`, `quantized_matmul_qmv_bias` and
+  `gather_qmv_kq` forms `x @ A` beside the base matvec and reads each adapter's factors once per
+  block of rows, which removes most of the adapter's cost at decode widths.
+
 ## [0.5.6]
 
 ### Added

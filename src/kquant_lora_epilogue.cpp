@@ -7,6 +7,7 @@
 #include "kquant_internal.h" // kq_type_string
 #include "kquant_lora_epilogue.h"
 
+#include <algorithm>
 #include <cstring>
 
 #ifdef _METAL_
@@ -317,6 +318,135 @@ void kq_lora_epilogue_rows_gpu(
   ce.set_bytes(flags, 10);
   MTL::Size group_dims(kq_lora_tg, 1, 1);
   MTL::Size grid_dims((N + kq_lora_tile - 1) / kq_lora_tile, R, 1);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+namespace {
+constexpr int kq_lora_split_tg = 256; // KQ_LORA_SPLIT_TG
+constexpr int kq_lora_split_rb = 4; // rows per threadgroup, both kernels
+constexpr int kq_lora_apply_tile = 32 * 4; // 32 * CPT columns
+
+// K chunks of the z grid, 0 for the one-dispatch epilogue. KQ_LORA_SPLIT=0
+// (probe lever, read live) keeps that epilogue at every row count.
+int kq_lora_split_chunks(int R, int K) {
+  if (R > KQ_LORA_SPLIT_MAX_ROWS || kq_env_lever("KQ_LORA_SPLIT", -1) == 0) {
+    return 0;
+  }
+  return std::max(1, std::min(R <= 8 ? 8 : 4, K));
+}
+
+// Ranks per z thread: 8 or 4 from vector loads of an A row, else 1.
+int kq_lora_z_width(const mx::array& a, int rank) {
+  if (a.offset() % (4 * a.itemsize()) != 0) {
+    return 1;
+  }
+  return rank % 8 == 0 ? 8 : (rank % 4 == 0 ? 4 : 1);
+}
+} // namespace
+
+namespace {
+void kq_lora_rows_z_gpu(
+    mx::metal::Device& d,
+    const mx::Stream& s,
+    const mx::array& x,
+    const KqLoraRows& pre,
+    mx::array& z,
+    int R,
+    int K) {
+  const KqLoraView& v = pre.v;
+  const int rank = v.rank;
+  auto& ce = mx::metal::get_command_encoder(s);
+  std::string kname = "kq_lora_rows_z_" + kq_type_string(x.dtype()) + "_v" +
+      std::to_string(kq_lora_z_width(*v.a, rank));
+  auto kernel = kq_get_kernel(d, kname);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(x, 0);
+  ce.set_input_array(*v.a, 1);
+  ce.set_output_array(z, 2);
+  ce.set_input_array(v.ids ? *v.ids : x, 3);
+  ce.set_input_array(v.table ? *v.table : x, 4);
+  ce.set_input_array(v.fac ? *v.fac : x, 5);
+  const int kflags = v.flags & KQ_LORA_KERNEL_FLAGS;
+  ce.set_bytes(K, 6);
+  ce.set_bytes(rank, 7);
+  ce.set_bytes(kflags, 8);
+  ce.set_bytes(pre.kc, 9);
+  ce.set_bytes(R, 10);
+  MTL::Size group_dims(kq_lora_split_tg, 1, 1);
+  MTL::Size grid_dims(
+      pre.chunks, (R + kq_lora_split_rb - 1) / kq_lora_split_rb, 1);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+} // namespace
+
+KqLoraRows kq_lora_rows_pre_gpu(
+    mx::metal::Device& d,
+    const mx::Stream& s,
+    const mx::array& x,
+    const std::vector<mx::array>& inputs,
+    size_t base,
+    int flags,
+    int R,
+    int K) {
+  KqLoraRows pre;
+  pre.v = kq_lora_view_gpu(inputs, base, flags, s);
+  const int C = kq_lora_split_chunks(R, K);
+  if (C == 0 || R == 0) {
+    return pre;
+  }
+  pre.kc = (K + C - 1) / C;
+  pre.chunks = (K + pre.kc - 1) / pre.kc;
+  mx::array z({R * pre.chunks * pre.v.rank}, mx::float32, nullptr, {});
+  z.set_data(mx::allocator::malloc(z.nbytes()));
+  mx::metal::get_command_encoder(s).add_temporary(z);
+  pre.zpart = z;
+  kq_lora_rows_z_gpu(d, s, x, pre, z, R, K);
+  return pre;
+}
+
+void kq_lora_rows_post_gpu(
+    mx::metal::Device& d,
+    const mx::Stream& s,
+    const mx::array& x,
+    const KqLoraRows& pre,
+    mx::array& out,
+    int R,
+    int K,
+    int N) {
+  if (!pre.zpart) {
+    kq_lora_epilogue_rows_gpu(d, s, x, pre.v, out, R, K, N);
+    return;
+  }
+  if (R == 0 || N == 0) {
+    return;
+  }
+  const KqLoraView& v = pre.v;
+  const bool v4 = N % 4 == 0 && v.b->offset() % (4 * v.b->itemsize()) == 0;
+  std::string kname = "kq_lora_rows_apply_" + kq_type_string(out.dtype()) +
+      (v4 ? "_v4" : "_v1");
+  auto kernel = kq_get_kernel(d, kname);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(*pre.zpart, 0);
+  ce.set_input_array(*v.b, 1);
+  // Re-binding out as an output after the base dispatch inserts the
+  // encoder barrier that orders the apply behind it (and behind z).
+  ce.set_output_array(out, 2);
+  ce.set_input_array(v.ids ? *v.ids : *pre.zpart, 3);
+  ce.set_input_array(v.table ? *v.table : *pre.zpart, 4);
+  ce.set_input_array(v.fac ? *v.fac : *pre.zpart, 5);
+  const int rank = v.rank;
+  const int kflags = v.flags & KQ_LORA_KERNEL_FLAGS;
+  ce.set_bytes(N, 6);
+  ce.set_bytes(rank, 7);
+  ce.set_bytes(kflags, 8);
+  ce.set_bytes(pre.chunks, 9);
+  ce.set_bytes(R, 10);
+  MTL::Size group_dims(kq_lora_split_tg, 1, 1);
+  MTL::Size grid_dims(
+      (N + kq_lora_apply_tile - 1) / kq_lora_apply_tile,
+      (R + kq_lora_split_rb - 1) / kq_lora_split_rb,
+      1);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 

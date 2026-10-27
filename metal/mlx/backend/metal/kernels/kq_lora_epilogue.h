@@ -10,6 +10,10 @@
 //     ids [R] (HAS_IDS) remapped through table (HAS_TABLE; entries < 0 skip
 //     the row: a dead arena slot), else e = 0 (dense). fac [R] (HAS_FAC)
 //     scales the row's delta (the per-row adapter scale; 0 skips).
+//     Row counts above KQ_LORA_SPLIT_MAX_ROWS (host side) take this kernel.
+//   kq_lora_rows_z + kq_lora_rows_apply: the same rows semantics split
+//     around the base dispatch for up to KQ_LORA_SPLIT_MAX_ROWS rows (see
+//     below).
 //   kq_lora_mix_z + kq_lora_mix_apply: the score-mixed down gather, split
 //     around the base dispatch (see below).
 //
@@ -196,6 +200,349 @@ kq_lora_epilogue_rows(
       acc += z[j] * float(Be[(int64_t)j * N + n]);
     }
     orow[n] = static_cast<T>(float(orow[n]) + f * acc);
+  }
+}
+
+// Split rows LoRA, two kernels around the base route of a dense op:
+//   kq_lora_rows_z runs BEFORE the base dispatch. It reads only x and A, so
+//     the encoder overlaps it with the base matvec. One threadgroup per
+//     (K chunk, block of RB rows) writes the partial
+//     zpart[row, chunk, :] = x[row, chunk] @ A[e][chunk, :] in f32.
+//   kq_lora_rows_apply runs after the base route. One threadgroup per
+//     (N tile of 32 * CPT columns, block of RB rows) sums the chunk
+//     partials into z and adds fac * z . B[e][:, n] to each live row of out.
+// In a row block, the first live row of each entry loads that entry's A or
+// B values and every row of the entry reuses them, so a block reads each
+// entry once. Skipped rows write no partial, are never read by the apply
+// and keep the base output. Skips are uniform per threadgroup, so every
+// barrier is reached by all threads.
+#define KQ_LORA_SPLIT_TG 256
+#define KQ_LORA_UNROLL_FULL _Pragma("clang loop unroll(full)")
+#define KQ_LORA_Z_UNROLL 8
+#define KQ_LORA_APPLY_NSG (KQ_LORA_SPLIT_TG / 32)
+
+inline int kq_lora_row_entry(
+    int row,
+    const device uint32_t* ids,
+    const device int32_t* table,
+    const device float* fac,
+    int FLAGS,
+    thread float& f) {
+  int e = (FLAGS & KQ_LORA_HAS_IDS) ? int(ids[row]) : 0;
+  if (FLAGS & KQ_LORA_HAS_TABLE) {
+    e = table[e];
+  }
+  f = (FLAGS & KQ_LORA_HAS_FAC) ? fac[row] : 1.0f;
+  return (e < 0 || f == 0.0f) ? -1 : e;
+}
+
+// Entries of a block of RB rows starting at r0 (-1 = skip) and whether each
+// row is the first live row of its entry. Returns whether any row is live.
+template <int RB>
+inline bool kq_lora_block_entries(
+    int r0,
+    int R,
+    const device uint32_t* ids,
+    const device int32_t* table,
+    const device float* fac,
+    int FLAGS,
+    thread int* es,
+    thread float* fs,
+    thread bool* lead) {
+  bool any = false;
+  KQ_LORA_UNROLL_FULL
+  for (int i = 0; i < RB; i++) {
+    fs[i] = 0.0f;
+    es[i] = (r0 + i < R)
+        ? kq_lora_row_entry(r0 + i, ids, table, fac, FLAGS, fs[i])
+        : -1;
+    any = any || es[i] >= 0;
+  }
+  KQ_LORA_UNROLL_FULL
+  for (int i = 0; i < RB; i++) {
+    lead[i] = es[i] >= 0;
+    for (int q = 0; q < i; q++) {
+      lead[i] = lead[i] && es[q] != es[i];
+    }
+  }
+  return any;
+}
+
+// Each thread takes VW adjacent ranks of an A row (RANK % VW == 0; vector
+// loads when VW is 4 or 8) and every lanes-th k of the chunk, issuing
+// KQ_LORA_Z_UNROLL rows of loads per round; the k lanes meet in
+// threadgroup memory.
+template <typename T, int VW, int RB>
+[[kernel, max_total_threads_per_threadgroup(KQ_LORA_SPLIT_TG)]] void
+kq_lora_rows_z(
+    const device T* x [[buffer(0)]],
+    const device T* A [[buffer(1)]],
+    device float* zpart [[buffer(2)]],
+    const device uint32_t* ids [[buffer(3)]],
+    const device int32_t* table [[buffer(4)]],
+    const device float* fac [[buffer(5)]],
+    const constant int& K [[buffer(6)]],
+    const constant int& RANK [[buffer(7)]],
+    const constant int& FLAGS [[buffer(8)]],
+    const constant int& KC [[buffer(9)]],
+    const constant int& R [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tgs [[threadgroups_per_grid]],
+    uint3 lid3 [[thread_position_in_threadgroup]]) {
+  constexpr int U = KQ_LORA_Z_UNROLL;
+  threadgroup float red[KQ_LORA_SPLIT_TG * VW];
+  const int lid = int(lid3.x);
+  const int chunk = int(tid.x);
+  const int C = int(tgs.x);
+  const int r0 = int(tid.y) * RB;
+  int es[RB];
+  float fs[RB];
+  bool lead[RB];
+  if (!kq_lora_block_entries<RB>(r0, R, ids, table, fac, FLAGS, es, fs, lead)) {
+    return;
+  }
+  const int k0 = chunk * KC;
+  const int k1 = min(K, k0 + KC);
+  const int JW = RANK / VW;
+  const int JS = min(JW, KQ_LORA_SPLIT_TG);
+  const int lanes = KQ_LORA_SPLIT_TG / JS;
+  const int kl = lid / JS;
+  const bool active = kl < lanes;
+  for (int jb = 0; jb < JW; jb += JS) {
+    const int jg = jb + lid % JS;
+    const bool on = active && jg < JW;
+    float acc[RB][VW];
+    KQ_LORA_UNROLL_FULL
+    for (int i = 0; i < RB; i++) {
+      KQ_LORA_UNROLL_FULL
+      for (int v = 0; v < VW; v++) {
+        acc[i][v] = 0.0f;
+      }
+    }
+    auto step = [&](int k, int nk) {
+      // nk <= U consecutive lanes' k values: k, k + lanes, ...
+      float xv[RB][U];
+      KQ_LORA_UNROLL_FULL
+      for (int i = 0; i < RB; i++) {
+        KQ_LORA_UNROLL_FULL
+        for (int u = 0; u < U; u++) {
+          xv[i][u] = (es[i] >= 0 && u < nk)
+              ? float(x[(int64_t)(r0 + i) * K + k + u * lanes])
+              : 0.0f;
+        }
+      }
+      KQ_LORA_UNROLL_FULL
+      for (int i = 0; i < RB; i++) {
+        if (!lead[i]) {
+          continue;
+        }
+        float a[U][VW];
+        KQ_LORA_UNROLL_FULL
+        for (int u = 0; u < U; u++) {
+          const device T* arow =
+              A + ((int64_t)es[i] * K + k + u * lanes) * RANK + jg * VW;
+          if (u >= nk) {
+            KQ_LORA_UNROLL_FULL
+            for (int v = 0; v < VW; v++) {
+              a[u][v] = 0.0f;
+            }
+          } else if (VW % 4 == 0) {
+            KQ_LORA_UNROLL_FULL
+            for (int v = 0; v < VW; v += 4) {
+              const vec<T, 4> a4 = *(const device vec<T, 4>*)(arow + v);
+              KQ_LORA_UNROLL_FULL
+              for (int q = 0; q < 4; q++) {
+                a[u][v + q] = float(a4[q]);
+              }
+            }
+          } else {
+            KQ_LORA_UNROLL_FULL
+            for (int v = 0; v < VW; v++) {
+              a[u][v] = float(arow[v]);
+            }
+          }
+        }
+        KQ_LORA_UNROLL_FULL
+        for (int q = i; q < RB; q++) {
+          if (es[q] != es[i]) {
+            continue;
+          }
+          KQ_LORA_UNROLL_FULL
+          for (int u = 0; u < U; u++) {
+            KQ_LORA_UNROLL_FULL
+            for (int v = 0; v < VW; v++) {
+              acc[q][v] += xv[q][u] * a[u][v];
+            }
+          }
+        }
+      }
+    };
+    if (on) {
+      int k = k0 + kl;
+      for (; k + (U - 1) * lanes < k1; k += U * lanes) {
+        step(k, U);
+      }
+      if (k < k1) {
+        step(k, (k1 - k + lanes - 1) / lanes);
+      }
+    }
+    const int nj = min(JS, JW - jb) * VW;
+    KQ_LORA_UNROLL_FULL
+    for (int i = 0; i < RB; i++) {
+      if (es[i] < 0) {
+        continue;
+      }
+      KQ_LORA_UNROLL_FULL
+      for (int v = 0; v < VW; v++) {
+        red[lid * VW + v] = acc[i][v];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int t = lid; t < nj; t += KQ_LORA_SPLIT_TG) {
+        const int g = t / VW;
+        const int v = t % VW;
+        float sum = 0.0f;
+        for (int l = 0; l < lanes; l++) {
+          sum += red[(l * JS + g) * VW + v];
+        }
+        zpart[((int64_t)(r0 + i) * C + chunk) * RANK + jb * VW + t] = sum;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+}
+
+// Each simdgroup of the apply takes every NSG-th rank and each lane CPT
+// adjacent columns (vector loads when V4), so a tile is 32 * CPT columns.
+// A round covers 8 ranks per simdgroup: lane l sums every fourth chunk
+// partial of rank l % 8, two xor shuffles finish the sums and a broadcast
+// shuffle hands each rank's z to every lane, so z needs no threadgroup
+// memory and its loads fly with the B loads. The simdgroups' column sums
+// meet in threadgroup memory.
+template <typename T, bool V4, int RB, int CPT>
+[[kernel, max_total_threads_per_threadgroup(KQ_LORA_SPLIT_TG)]] void
+kq_lora_rows_apply(
+    const device float* zpart [[buffer(0)]],
+    const device T* B [[buffer(1)]],
+    device T* out [[buffer(2)]],
+    const device uint32_t* ids [[buffer(3)]],
+    const device int32_t* table [[buffer(4)]],
+    const device float* fac [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& RANK [[buffer(7)]],
+    const constant int& FLAGS [[buffer(8)]],
+    const constant int& C [[buffer(9)]],
+    const constant int& R [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 lid3 [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int NSG = KQ_LORA_APPLY_NSG;
+  constexpr int TN = 32 * CPT;
+  constexpr int U = 8;
+  threadgroup float red[NSG * TN];
+  const int lid = int(lid3.x);
+  const int r0 = int(tid.y) * RB;
+  int es[RB];
+  float fs[RB];
+  bool lead[RB];
+  if (!kq_lora_block_entries<RB>(r0, R, ids, table, fac, FLAGS, es, fs, lead)) {
+    return;
+  }
+  // The final pass: thread t < TN owns column t of every row.
+  const int nf = int(tid.x) * TN + lid;
+  float of[RB];
+  KQ_LORA_UNROLL_FULL
+  for (int i = 0; i < RB; i++) {
+    of[i] = (lid < TN && nf < N && es[i] >= 0)
+        ? float(out[(int64_t)(r0 + i) * N + nf])
+        : 0.0f;
+  }
+  const int n0 = int(tid.x) * TN + int(lane) * CPT;
+  const int ju = int(lane) % U;
+  const int cg = int(lane) / U;
+  float acc[RB][CPT];
+  KQ_LORA_UNROLL_FULL
+  for (int i = 0; i < RB; i++) {
+    KQ_LORA_UNROLL_FULL
+    for (int c = 0; c < CPT; c++) {
+      acc[i][c] = 0.0f;
+    }
+  }
+  for (int jb = int(sg); jb < RANK; jb += U * NSG) {
+    const int jz = jb + ju * NSG;
+    KQ_LORA_UNROLL_FULL
+    for (int i = 0; i < RB; i++) {
+      if (!lead[i]) {
+        continue;
+      }
+      float b[U][CPT];
+      KQ_LORA_UNROLL_FULL
+      for (int u = 0; u < U; u++) {
+        const int j = jb + u * NSG;
+        const device T* p = B + ((int64_t)es[i] * RANK + j) * N + n0;
+        if (V4) {
+          KQ_LORA_UNROLL_FULL
+          for (int c = 0; c < CPT; c += 4) {
+            const vec<T, 4> v = (j < RANK && n0 < N)
+                ? *(const device vec<T, 4>*)(p + c)
+                : vec<T, 4>(0);
+            KQ_LORA_UNROLL_FULL
+            for (int q = 0; q < 4; q++) {
+              b[u][c + q] = float(v[q]);
+            }
+          }
+        } else {
+          KQ_LORA_UNROLL_FULL
+          for (int c = 0; c < CPT; c++) {
+            b[u][c] = (j < RANK && n0 + c < N) ? float(p[c]) : 0.0f;
+          }
+        }
+      }
+      KQ_LORA_UNROLL_FULL
+      for (int q = i; q < RB; q++) {
+        if (es[q] != es[i]) {
+          continue;
+        }
+        float zp = 0.0f;
+        if (jz < RANK) {
+          const device float* src = zpart + (int64_t)(r0 + q) * C * RANK + jz;
+          for (int c = cg; c < C; c += 32 / U) {
+            zp += src[c * RANK];
+          }
+        }
+        zp += simd_shuffle_xor(zp, U);
+        zp += simd_shuffle_xor(zp, 2 * U);
+        zp *= fs[q];
+        KQ_LORA_UNROLL_FULL
+        for (int u = 0; u < U; u++) {
+          const float z = simd_shuffle(zp, ushort(u));
+          KQ_LORA_UNROLL_FULL
+          for (int c = 0; c < CPT; c++) {
+            acc[q][c] += z * b[u][c];
+          }
+        }
+      }
+    }
+  }
+  KQ_LORA_UNROLL_FULL
+  for (int i = 0; i < RB; i++) {
+    if (es[i] < 0) {
+      continue;
+    }
+    KQ_LORA_UNROLL_FULL
+    for (int c = 0; c < CPT; c++) {
+      red[int(sg) * TN + int(lane) * CPT + c] = acc[i][c];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < TN && nf < N) {
+      float g = of[i];
+      KQ_LORA_UNROLL_FULL
+      for (int q = 0; q < NSG; q++) {
+        g += red[q * TN + lid];
+      }
+      out[(int64_t)(r0 + i) * N + nf] = static_cast<T>(g);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 }
 

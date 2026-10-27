@@ -258,6 +258,8 @@ mx::array lora_composed(
       std::nullopt,
       std::nullopt,
       std::nullopt,
+      std::nullopt,
+      std::nullopt,
       s);
   return lora_add(base, z, b, bands, s);
 }
@@ -575,6 +577,8 @@ mx::array quantized_matmul_lora(
         scales,
         kquant_type,
         true,
+        std::nullopt,
+        std::nullopt,
         std::nullopt,
         std::nullopt,
         std::nullopt,

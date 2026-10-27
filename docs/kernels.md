@@ -34,15 +34,22 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
 - **`gather_qmv_bias`** - gathered matvec with a fused expert bias on MLX's packed mxfp4 layout (the
   counterpart to the K-quant gathers above for that codec).
 - **LoRA epilogue** - `quantized_matmul`, `quantized_matmul_qmv_bias`, `gather_qmv_kq` and
-  `gather_qmv_mix_ns_kq` accept `lora_a` / `lora_b` (plus `lora_rows`, and `lora_ids` / `lora_table`
-  on the gathers) and add `rows * (x @ A) @ B` on their own output inside the primitive. Rows
-  routes run one epilogue dispatch after the base route; the score-mixed gather forms `z = x @ A`
+  `gather_qmv_mix_ns_kq` accept `lora_a` / `lora_b` (plus `lora_rows`, `lora_ids` and `lora_table`)
+  and add `rows * (x @ A) @ B` on their own output inside the primitive. On the dense ops,
+  `lora_ids` with stacked factors (`lora_a` [S, K, r], `lora_b` [S, r, N]) gives each row its own
+  adapter, so several adapters share one base matmul in a batch. Up to 32 rows, the rows
+  routes (`quantized_matmul`, `quantized_matmul_qmv_bias`, `gather_qmv_kq`) split the delta in two
+  kernels: one forms `z = x @ A` in K chunks over the whole GPU, dispatched before the base route
+  so the encoder overlaps the two, and one applies `z @ B` after it. In a block of rows, each
+  adapter's A and B are read once, and skipped rows keep the base output. Above 32 rows they run
+  one epilogue dispatch after the base route. The score-mixed gather forms `z = x @ A`
   in a kernel dispatched before the base gather (it reads only x and A, so the encoder overlaps the
   two) and applies `z @ B` in a barrier-free kernel after it, so the serialized cost behind the
   gather is one tiny dependent kernel. Codec independent, so a live adapter adds no graph ops at
   decode on any codec; `lora_table` remaps gathered ids (arena slot to expert, negative skips) and
   `lora_rows` scales rows (0 skips). f16/bf16 activations, rank x slots <= 512, inference only.
-  `mlx_kquant.HAS_LORA_EPILOGUE` marks the build; `KQuantLinear(x, lora=(a_t, b_t, rows))` forwards.
+  `mlx_kquant.HAS_LORA_EPILOGUE` marks the build and `HAS_LORA_STACK` the dense stack;
+  `KQuantLinear(x, lora=(a_t, b_t, rows, ids, table))` forwards.
   The epilogue kernels walk every LoRA operand as dense row-major memory; operands that evaluate
   to a strided view (an unevaluated array reports the default dense layout at op build, and
   `mx.repeat` of one value evaluates to a stride-0 broadcast) are copied into a dense temporary
@@ -407,6 +414,9 @@ Tuning levers (defaults are right for normal use):
   precedence. Read live per call.
 - `KQ_QMV_SPLITK_TRIM` - `0` launches the `q6_k` and `q8_0` split-K kernels with all eight
   simdgroups at every K, as before, with the same output. Read live per call.
+- `KQ_LORA_SPLIT` - `0` runs the LoRA epilogue of the rows routes as one dispatch after the base
+  route at every row count, instead of the split `z` and apply kernels up to 32 rows. Read live per
+  call.
 - `KQ_VERIFY_EXT` - the mat-vec route on the M 2-12 band. `1` forces `mv_ext` for every codec with
   the kernel, `0` forces `verify_qmv` where the codec has it and per-row qmv elsewhere, and unset
   takes the per-codec default. On NAX GPUs a set value also keeps per-row qmv and NAX split-K off
