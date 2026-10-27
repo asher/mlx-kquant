@@ -566,9 +566,9 @@ Prism codecs and takes the grid class large-M row. It has a `verify_nax` kernel 
 kernel. Its NAX routes are measured on M5 Max. Per-row qmv keeps M 6 at N 512 and below, M 3 at N
 1024 and M 2 above, except on a vocab head, where `mv_ext` takes M 2. NAX split-K enters at M 2 for
 N 1024 and below and at M 6 above, and `verify_nax` enters by shape, as described with the other
-`verify_nax` entries. Its `bm128_min_m` floor is 449: BM=128 takes
-1.13-1.16x the BM=64 time at M 224, 0.95-0.98x at M 256 and 0.86-0.90x at M 1024. Its large-M row
-has no K ceiling, and it has no db64 band.
+`verify_nax` entries. Its `bm128_min_m` floor is 449: BM=128 takes 1.13-1.16x the BM=64 time at M
+224, 0.95-0.98x at M 256 and 0.86-0.90x at M 1024. Its large-M row has no K ceiling, and it has no
+db64 band.
 
 `mxfp4` (32-wide blocks with one E8M0 scale) runs its NAX tiles through the `iq4_nl` loader, with
 the E2M1 decode in place of the `iq4_nl` codebook, and takes the flat class large-M row. Every other
@@ -688,17 +688,18 @@ and `q4_1` run the eight-block kernel at a K that is a multiple of 256 and the t
 elsewhere. `nvfp4` runs the four-block kernel at a K that is a multiple of 256 where a grid of about
 one wave of simdgroups walks 2048 or more of K, as on a vocab head, and the two-block kernel
 elsewhere. Both hold the `nvfp4` weights 2^14 smaller in half, which keeps every weight exact, and
-multiply the float32 sums back at the store. The `q4_1` kernels are the `q4_0` kernels with the min folded in as code * d + m, one
-half rounding per weight. Its 20-byte blocks keep each row 4-byte aligned, so the eight-block kernel
-reads whole words with no shift. The K-quant kernels fold each 16- or 32-weight sub-block's scale,
-and its min where the codec has one, into the half weights. Loading a whole K step of activations
-ahead measured faster for `pq2_0` and the two-block `q4_0` kernel, and `nvfp4` loads them the same
-way, while the kernels with larger decoded words load them one NAX op at a time, since loading ahead
-ran `q4_k` 1.6-2x slower. Two consecutive NAX ops read 8 contiguous activations of a row, so where
-the activations start on a 16-byte boundary these kernels read them in one 16-byte load per two NAX
-ops, and where they start on an 8-byte boundary in one 8-byte load per op. Activations that start
-elsewhere are read from a copy on a 16-byte boundary. The fewer loads take less time in a chain of
-dependent calls, and both forms give the same bits.
+multiply the float32 sums back at the store. The `q4_1` kernels are the `q4_0` kernels with the min
+folded in as code * d + m, one half rounding per weight. Its 20-byte blocks keep each row 4-byte
+aligned, so the eight-block kernel reads whole words with no shift. The K-quant kernels fold each
+16- or 32-weight sub-block's scale, and its min where the codec has one, into the half weights.
+Loading a whole K step of activations ahead measured faster for `pq2_0` and the two-block `q4_0`
+kernel, and the two-block `nvfp4` kernel loads them the same way, while the kernels with larger
+decoded words load them one NAX op at a time, since loading ahead ran `q4_k` 1.6-2x slower. Two
+consecutive NAX ops read 8 contiguous activations of a row, so where the activations start on a
+16-byte boundary these kernels read them in one 16-byte load per two NAX ops, and where they start
+on an 8-byte boundary in one 8-byte load per op. Activations that start elsewhere are read from a
+copy on a 16-byte boundary. The fewer loads take less time in a chain of dependent calls, and both
+forms give the same bits.
 
 Split counts for `pq2_0`, `q8_0` and the two-block `q4_0` and `q4_1` kernels are the largest divisor
 of the K steps at or under their target, at most 16. The two-block kernel's K walk of 640 per
@@ -792,7 +793,7 @@ on the shapes of N 2048 and wider.
 
 The `nvfp4` entry also moves with the shape, fitted on both activation types over 24 shapes of N 256
 to 248320 and K 2048 to 17408, 8 of them held out, with per-row qmv off. By default qmv runs ahead
-of it, through M 3 at N 513 to 1024 and M 2 above.
+of it, through M 3 at N 513 to 1024 and M 2 above, or M 1 on a vocab head.
 
 | shape | entry, bfloat16 | entry, float16 | time against the route it displaces at the entry |
 |---|---|---|---|
