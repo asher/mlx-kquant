@@ -2105,7 +2105,7 @@ void qmv(
   // threadgroup count for the same N. Recovers occupancy for mid-size decode
   // dispatches where N/bn threadgroups underfill the GPU; loses at
   // embedding-size N (already saturated). Bit-exact vs the default tiling.
-  // Default per codec via kquant_qmv_fine_default_max_n; KQ_QMV_FINE=1
+  // Default per codec via kquant_qmv_fine_default; KQ_QMV_FINE=1
   // forces fine, =0 forces coarse (A/B lever). Read live (KQ_DISABLE_NAX
   // precedent) so one process can interleave coarse/fine for
   // thermally-paired A/Bs; getenv cost is noise per dispatch.
@@ -2127,7 +2127,7 @@ void qmv(
   const bool use_fine = fine_ok &&
       (qmv_fine_env == 1 ||
        (qmv_fine_env != 0 && M == 1 &&
-        N <= kquant_qmv_fine_max_n(kquant_type)));
+        kquant_qmv_fine_default(kquant_type, N, K)));
   const int fast_bn = kquant_qmv_fast_bn(kquant_type);
   bool fast = (N % fast_bn == 0) && (K % qmv_fast_k_align() == 0);
   const int rows_per_tg = use_fine ? 2 : (fast ? fast_bn : bn);
@@ -2190,11 +2190,11 @@ void qmv_bias(
   int bk = 32;
 
   // Same fine-tiling policy as qmv() above; M == 1 is the shape contract
-  // here, so only the codec ceiling gates the default.
+  // here, so only the codec's default rule gates it.
   const int qmv_fine_env = kq_env_int("KQ_QMV_FINE", -1);
   const bool use_fine = codec_has_qmv_fine(kquant_type) &&
       (qmv_fine_env == 1 ||
-       (qmv_fine_env != 0 && N <= kquant_qmv_fine_max_n(kquant_type)));
+       (qmv_fine_env != 0 && kquant_qmv_fine_default(kquant_type, N, K)));
   const int rows_per_tg = use_fine ? 2 : bn;
   MTL::Size group_dims(bk, 2, 1);
   MTL::Size grid_dims(1, (N + rows_per_tg - 1) / rows_per_tg, 1);

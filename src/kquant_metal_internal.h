@@ -175,9 +175,9 @@ inline int kquant_qmv_fine_default_max_n(const std::string& kquant_type) {
   if (kquant_type == "q5_1") {
     return 4096;
   }
-  // nvfp4: fine ran 0.76-0.95x the coarse time at N 1024 to 3072 and
-  // 0.94-1.02x from N 4096 to 32768 (M5 Max, bfloat16 and float16), and
-  // 1.09-1.10x at N 2048, K 8192, as q4_0 does there.
+  // nvfp4: fine ran 0.66-1.00x the coarse time at N 512 to 1536 and
+  // 0.88-1.07x from N 2816 to 32768 (M5 Max, bfloat16 and float16), with a
+  // coarse band between (kquant_qmv_fine_default).
   if (kquant_type == "nvfp4") {
     return 32768;
   }
@@ -198,18 +198,36 @@ inline int kquant_qmv_fine_default_max_n(const std::string& kquant_type) {
 // Unset, the calibrated value applies on every part (the scaling is not
 // yet measured on a smaller GPU).
 constexpr int kq_fine_reference_cores = 40;
-inline int kquant_qmv_fine_max_n(const std::string& kquant_type) {
-  const int base = kquant_qmv_fine_default_max_n(kquant_type);
-  if (base == 0 || std::getenv("KQ_GPU_CORES") == nullptr) {
-    return base;
+inline int kq_fine_cores_scaled(int n) {
+  if (n == 0 || std::getenv("KQ_GPU_CORES") == nullptr) {
+    return n;
   }
   const int cores = gpu_core_count();
   if (cores <= 0 || cores == kq_fine_reference_cores) {
-    return base;
+    return n;
   }
-  const long scaled = static_cast<long>(base) * cores / kq_fine_reference_cores;
-  const int rounded = static_cast<int>(scaled / 256 * 256);
-  return std::min(std::max(rounded, 512), 32768);
+  const long scaled = static_cast<long>(n) * cores / kq_fine_reference_cores;
+  return static_cast<int>(scaled / 256 * 256);
+}
+inline int kquant_qmv_fine_max_n(const std::string& kquant_type) {
+  const int base = kquant_qmv_fine_default_max_n(kquant_type);
+  const int scaled = kq_fine_cores_scaled(base);
+  return scaled == base ? base : std::min(std::max(scaled, 512), 32768);
+}
+
+// Whether a one-row matmul takes the fine tiling by default. nvfp4 keeps
+// the coarse tiling at N 2049 to 2560, and at N 1537 to 2048 from K 5120,
+// where fine ran 0.98-1.09x the coarse time (M5 Max, both activation
+// types). The band scales with KQ_GPU_CORES as the ceiling does.
+inline bool kquant_qmv_fine_default(const std::string& t, int N, int K) {
+  if (N > kquant_qmv_fine_max_n(t)) {
+    return false;
+  }
+  if (t == "nvfp4") {
+    return N <= kq_fine_cores_scaled(K >= 5120 ? 1536 : 2048) ||
+        N > kq_fine_cores_scaled(2560);
+  }
+  return true;
 }
 
 // Codecs with a verify_qmv kernel (the small-M weight-read-amortizing leaf).

@@ -399,7 +399,8 @@ Tuning levers (defaults are right for normal use):
   `KQ_DISABLE_NAX=1` turns it off. Read live per call.
 - `KQ_QMV_FINE` - tiling of the per-row mat-vec. `1` forces two output rows per threadgroup, `0`
   forces the coarse tiling, and unset takes the fine tiling at one activation row up to the
-  per-codec N ceiling that `kq.qmv_fine_max_n(codec)` reports. Read live per call.
+  per-codec N ceiling that `kq.qmv_fine_max_n(codec)` reports, except that `nvfp4` keeps the
+  coarse tiling at N 2049 to 2560, and at N 1537 to 2048 from K 5120. Read live per call.
 - `KQ_QMV_C32` - the c32 mat-vec of the grid codecs at one activation row (see the fused MoE
   section). `0` restores the per-row kernels and `1` runs c32 on any GPU. `8` or `16` runs it at
   that many K-lanes per row. Unset takes it on M5 and later GPUs. A set `KQ_QMV_FINE` keeps the
