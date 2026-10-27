@@ -1589,7 +1589,7 @@ static int kq_verify_nax_splits(int N, int K, int kstep, const std::string& t);
 // two-block kernel, which loads its activations ahead, runs up to 1.28x
 // faster. Over 18 shapes of N 512 to 248320 and K 2048 to 17408 at M 1, 4
 // and 8 (M5 Max, two sessions), the choice runs at 1.003-1.008x the time of
-// the faster kernel per cell on bf16 and 1.004-1.013x on f16, and at most
+// the faster kernel per cell on bf16 and 1.004-1.012x on f16, and at most
 // 1.08x.
 static bool kq_verify_nax_nvfp4_sb(int N, int K) {
   const int sp = kq_verify_nax_splits(N, K, 256, "nvfp4");

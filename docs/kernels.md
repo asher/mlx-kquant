@@ -690,7 +690,8 @@ and `q4_1` run the eight-block kernel at a K that is a multiple of 256 and the t
 elsewhere. `nvfp4` runs the four-block kernel at a K that is a multiple of 256 where a grid of about
 one wave of simdgroups walks 2048 or more of K, as on a vocab head, and the two-block kernel
 elsewhere. Both hold the `nvfp4` weights 2^7 smaller in half, which keeps every weight exact, and
-multiply the float32 sums back at the store. The `q4_1` kernels are the `q4_0` kernels with the min
+multiply the float32 sums back at the store. On bfloat16 activations below about 2^-109 their float
+sums lose bits that the mat-vec kernels keep. The `q4_1` kernels are the `q4_0` kernels with the min
 folded in as code * d + m, one half rounding per weight. Its 20-byte blocks keep each row 4-byte
 aligned, so the eight-block kernel reads whole words with no shift. The K-quant kernels fold each
 16- or 32-weight sub-block's scale, and its min where the codec has one, into the half weights.
