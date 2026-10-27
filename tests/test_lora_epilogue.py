@@ -229,6 +229,94 @@ def test_dense_stacked_epilogue_picks_each_rows_adapter(codec, m, dtype):
         assert _rel(dt[~skipped], want_tab[~skipped]) < DELTA_TOL
 
 
+SPLIT_CODECS = {
+    **CODECS,
+    "q4_1": (GT.Q4_1, False),
+    "q5_0": (GT.Q5_0, False),
+    "q3_k": (GT.Q3_K, True),
+    "q5_k": (GT.Q5_K, True),
+}
+
+
+@pytest.mark.parametrize("codec", list(SPLIT_CODECS))
+@pytest.mark.parametrize("m", [1, 4, 5, 32, 33])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("rank", [64, 192])
+def test_dense_stacked_split_route_mixed_rows(codec, m, dtype, rank, monkeypatch):
+    """Up to 32 rows run the split route (z before the base dispatch, the
+    apply after it), 33 rows the one-dispatch epilogue. Mixed batches of
+    skipped and live rows on every base route: skipped rows keep the base
+    output bit for bit, live rows match the f32 delta and the one-dispatch
+    epilogue."""
+    gtype, is_kq = SPLIT_CODECS[codec]
+    wire, ref = _lin_wire_ref(codec, gtype, is_kq)
+    rows_n, kk = ref.shape
+    lin = KQuantLinear(in_dims=kk, out_dims=rows_n, bias=False, codec=codec)
+    lin.weight = mx.array(wire)
+    rng = np.random.default_rng(29 + m)
+    s = 3
+    x = mx.array((rng.standard_normal((m, kk)) * 0.1).astype(np.float32)).astype(dtype)
+    a, b, a32, b32 = _lora(rng, (s, kk, rank), (s, rank, rows_n), dtype)
+    a, b = a * 0.5, b * 0.5
+    a32, b32 = _f32(a), _f32(b)
+    table = np.array([-1, 0, 1, 2], dtype=np.int32)
+    ids = rng.integers(0, 4, m).astype(np.uint32)
+    if m > 1:
+        ids[0], ids[1] = 0, 3  # one skipped and one live row at least
+    fac = rng.uniform(0.25, 1.0, m).astype(np.float32)
+    if m > 2:
+        fac[2] = 0.0
+    lora = (a, b, mx.array(fac), mx.array(ids), mx.array(table))
+    base = lin(x)
+    got = lin(x, lora=lora)
+    mx.eval(base, got)
+    monkeypatch.setenv("KQ_LORA_SPLIT", "0")
+    one = lin(x, lora=lora)
+    mx.eval(one)
+    monkeypatch.delenv("KQ_LORA_SPLIT")
+    x32 = _f32(x)
+    ent = table[ids]
+    live = (ent >= 0) & (fac != 0)
+    assert np.array_equal(_f32(got)[~live], _f32(base)[~live])
+    if live.any():
+        want = np.stack(
+            [
+                fac[i] * ((x32[i] @ a32[ent[i]]) @ b32[ent[i]])
+                for i in np.flatnonzero(live)
+            ]
+        )
+        dt = (_f32(got) - _f32(base))[live]
+        assert _rel(dt, want) < DELTA_TOL
+        assert _rel(dt, (_f32(one) - _f32(base))[live]) < DELTA_TOL
+
+
+@pytest.mark.parametrize("rank", [1, 5, 320])
+def test_dense_split_route_odd_ranks_and_widths(rank):
+    """Ranks off the 4- and 8-wide vector loads, a rank past 256 and an
+    output width off the 4-wide vector loads."""
+    rng = np.random.default_rng(31)
+    rows_n, kk, m, s, dtype = 100, 512, 6, 2, mx.float16
+    w = (rng.standard_normal((rows_n, kk)) * 0.1).astype(np.float32)
+    wire = quants.quantize(w, GT.Q8_0).astype(np.uint8)
+    lin = KQuantLinear(in_dims=kk, out_dims=rows_n, bias=False, codec="q8_0")
+    lin.weight = mx.array(wire)
+    x = mx.array((rng.standard_normal((m, kk)) * 0.1).astype(np.float32)).astype(dtype)
+    a, b, a32, b32 = _lora(rng, (s, kk, rank), (s, rank, rows_n), dtype)
+    ids = np.array([0, 1, 2, 1, 0, 2], dtype=np.uint32)
+    table = np.array([1, -1, 0], dtype=np.int32)
+    base = lin(x)
+    got = lin(x, lora=(a, b, None, mx.array(ids), mx.array(table)))
+    mx.eval(base, got)
+    x32 = _f32(x)
+    ent = table[ids]
+    live = ent >= 0
+    assert np.array_equal(_f32(got)[~live], _f32(base)[~live])
+    want = np.stack(
+        [(x32[i] @ a32[ent[i]]) @ b32[ent[i]] for i in np.flatnonzero(live)]
+    )
+    assert _rel((_f32(got) - _f32(base))[live], want) < DELTA_TOL
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_qmv_bias_route_carries_the_stacked_epilogue(dtype):
     wire, ref = _lin_wire_ref("q8_0", GT.Q8_0, False)

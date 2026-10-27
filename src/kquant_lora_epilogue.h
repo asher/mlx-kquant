@@ -173,6 +173,39 @@ void kq_lora_epilogue_rows_gpu(
     int K,
     int N);
 
+// Split rows LoRA for row counts up to KQ_LORA_SPLIT_MAX_ROWS: z = x @ A[e]
+// spread over a K-chunked grid dispatched BEFORE the base route (it reads
+// only x and A, so the encoder overlaps it with the base dispatch), then a
+// light apply of z @ B[e] after it. Larger row counts take the one-dispatch
+// epilogue (kq_lora_epilogue_rows_gpu). x [R, K] row-contiguous.
+struct KqLoraRows {
+  KqLoraView v;
+  std::optional<mx::array> zpart;
+  int chunks = 0;
+  int kc = 0;
+};
+constexpr int KQ_LORA_SPLIT_MAX_ROWS = 32;
+
+KqLoraRows kq_lora_rows_pre_gpu(
+    mx::metal::Device& d,
+    const mx::Stream& s,
+    const mx::array& x,
+    const std::vector<mx::array>& inputs,
+    size_t base,
+    int flags,
+    int R,
+    int K);
+
+void kq_lora_rows_post_gpu(
+    mx::metal::Device& d,
+    const mx::Stream& s,
+    const mx::array& x,
+    const KqLoraRows& pre,
+    mx::array& out,
+    int R,
+    int K,
+    int N);
+
 // Mix LoRA in two dispatches around the base gather. kq_lora_mix_z_gpu goes
 // BEFORE the base dispatch (its inputs are x and A only, so it overlaps the
 // gather) and returns the float32 z scratch [T*S, rank] (a command-encoder
