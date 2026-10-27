@@ -142,8 +142,8 @@ at 4128 rows, slower on 51 of 56 cells of the two closest, against an A versus A
 Per-row qmv reads the weight once per activation row, the later rows from the cache, and its grid
 grows with M. It holds widest where the mat-vec grids are too small to fill the GPU, so its limit
 falls with N. At N 512 and below, 13 of the 22 NAX codecs keep it through M 7 or 8. At N 1024 most
-keep it through M 2 to 5, and above N 2048 only `pq2_0`, `ptq1_0`, `q4_0`, `q4_1`, `q4_k` and
-`q2_k` keep it, at M 2. Split-K enters at M 2 to 9 for N 1024 and below and at M 3 to 9 above.
+keep it through M 2 to 5, and above N 2048 only `pq2_0`, `ptq1_0`, `q4_0`, `q4_1`, `q4_k`, `q2_k`
+and `nvfp4` keep it, at M 2. Split-K enters at M 2 to 9 for N 1024 and below and at M 3 to 9 above.
 Above N 1024, `iq2_xxs` keeps `mv_ext` through M 12, where its split-K tile runs slower, and `q6_k`
 at vocab-head widths runs the un-split BM=32 tile at M 8 on the calls `verify_nax` declines.
 
@@ -479,6 +479,9 @@ Tuning levers (defaults are right for normal use):
   a K that is a multiple of 256, where the eight-block kernel runs by default. Read live per call.
 - `KQ_VERIFY_NAX_Q4_1_SB` - probe lever: `0` keeps `q4_1` on the two-block `verify_nax` kernel at
   a K that is a multiple of 256, where the eight-block kernel runs by default. Read live per call.
+- `KQ_VERIFY_NAX_NVFP4_SB` - probe lever: `1` runs `nvfp4` on the four-block `verify_nax` kernel and
+  `0` on the two-block kernel at every K that is a multiple of 256, in place of the choice by shape.
+  Read live per call.
 - `KQ_VNAX_X16` - probe lever: `0` keeps the `verify_nax` kernels that load their activations per
   NAX op on one 8-byte load per op where the activations start on a 16-byte boundary, in place of
   one 16-byte load per two ops. The output is the same. In `KQ_QMM_LOG` the kernel name
@@ -560,9 +563,10 @@ re-decode per row costs `ptq1_0` 3x. On NAX GPUs per-row qmv serves M 2.
 
 `nvfp4` (64-wide blocks of four 16-weight groups) runs its NAX tiles through the same loader as the
 Prism codecs and takes the grid class large-M row. It has a `verify_nax` kernel and no `verify_mma`
-kernel. Its NAX routes are measured on M5 Max. Per-row qmv keeps only M 2 at N 1025 to 2048, NAX
-split-K enters at M 2 for N 1024 and below and at M 6 above, and `verify_nax` enters by shape, as
-described with the other `verify_nax` entries. Its `bm128_min_m` floor is 449: BM=128 takes
+kernel. Its NAX routes are measured on M5 Max. Per-row qmv keeps M 6 at N 512 and below, M 3 at N
+1024 and M 2 above, except on a vocab head, where `mv_ext` takes M 2. NAX split-K enters at M 2 for
+N 1024 and below and at M 6 above, and `verify_nax` enters by shape, as described with the other
+`verify_nax` entries. Its `bm128_min_m` floor is 449: BM=128 takes
 1.13-1.16x the BM=64 time at M 224, 0.95-0.98x at M 256 and 0.86-0.90x at M 1024. Its large-M row
 has no K ceiling, and it has no db64 band.
 
@@ -671,13 +675,17 @@ split rule, as the table lists.
 | `q2_k` | 128 | 8 bytes of codes and 8 bytes of scales and mins | per NAX op | waves, partial charge 2560 | 4-byte |
 | `iq4_xs` | 256 | the 8-byte header and a 32-byte quarter of one row's codes, as 8-byte words | per NAX op | waves, partial charge 640 | 8-byte |
 | `iq4_nl` | 256 | two whole blocks of one row, as nine 4-byte words | per NAX op | waves, partial charge 640 | 4-byte |
-| `nvfp4` | 128 | the scale byte and 8 code bytes of one 16-weight group of one row | a K step ahead | waves, partial charge 1280 | 4-byte |
+| `nvfp4`, two-block | 128 | the scale byte and 8 code bytes of one 16-weight group of one row | a K step ahead | waves, partial charge 1280 | 4-byte |
+| `nvfp4`, four-block | 256 | one whole block of one row, as nine 4-byte words | per NAX op | waves, partial charge 1280 | 4-byte |
 
 The `pq2_0` and two-block `q4_0` and `q4_1` kernels decode each block in the permuted k order of
 `verify_mma`. The other kernels keep each lane's loads on one row, which measured faster. Spreading
 a `q8_0` block across 8 rows ran 1.04-1.24x slower at every Qwen3.8-27B shape except N 1024. `q4_0`
 and `q4_1` run the eight-block kernel at a K that is a multiple of 256 and the two-block kernel
-elsewhere. The `q4_1` kernels are the `q4_0` kernels with the min folded in as code * d + m, one
+elsewhere. `nvfp4` runs the four-block kernel at a K that is a multiple of 256 where a grid of about
+one wave of simdgroups walks 2048 or more of K, as on a vocab head, and the two-block kernel
+elsewhere. Both hold the `nvfp4` weights 2^14 smaller in half, which keeps every weight exact, and
+multiply the float32 sums back at the store. The `q4_1` kernels are the `q4_0` kernels with the min folded in as code * d + m, one
 half rounding per weight. Its 20-byte blocks keep each row 4-byte aligned, so the eight-block kernel
 reads whole words with no shift. The K-quant kernels fold each 16- or 32-weight sub-block's scale,
 and its min where the codec has one, into the half weights. Loading a whole K step of activations
@@ -780,18 +788,21 @@ entry under M 5 sits one row higher. At M 8 the kernel runs 1.05-1.39x faster th
 on the shapes of N 2048 and wider.
 
 The `nvfp4` entry also moves with the shape, fitted on both activation types over 24 shapes of N 256
-to 248320 and K 2048 to 17408, 8 of them held out:
+to 248320 and K 2048 to 17408, 8 of them held out, with per-row qmv off. By default qmv runs ahead
+of it, through M 3 at N 513 to 1024 and M 2 above.
 
-| shape | entry, bfloat16 | entry, float16 | time against the default route at the entry |
+| shape | entry, bfloat16 | entry, float16 | time against the route it displaces at the entry |
 |---|---|---|---|
-| N >= 100000 | M 3 | M 3 | 0.89x on bfloat16, 1.01x on float16 |
-| N 512 and under | none | none | NAX split-K ran 1.07-1.42x faster through M 8 |
-| K >= 6144, or N 513 to 1024 from K 4096 | M 2 | M 2 | 0.83-1.04x |
-| N 1025 to 2048 from K 4096 | M 3 | M 3 | 0.85x on bfloat16, 0.90x on float16 |
-| N 513 to 2048 under K 4096 | M 5 | M 5 | 0.99-1.02x |
-| N over 2048 under K 6144 | M 4 | M 5 | 0.84-1.05x |
+| N >= 100000 | M 3 | M 3 | 0.91x on bfloat16, 0.96x on float16 |
+| N 512 and under | none | none | past the qmv limit, 0.92x of NAX split-K at K 2048 and 1.01-1.06x from K 4096 |
+| N 513 to 1024 | M 2 | M 2 | 0.75-0.86x |
+| N 1025 to 2048 from K 4096 | M 3 | M 3 | 0.68-0.85x |
+| N 1025 to 2048 under K 4096 | M 4 | M 4 | 0.95-1.00x |
+| N over 2048 from K 6144 | M 2 | M 2 | 0.91-1.01x |
+| N over 2048 under K 6144 | M 3 | M 4 | 0.94-1.02x on bfloat16 (1.09x at N 18560, K 4096), 0.77-0.95x on float16 |
 
-At M 8 the kernel runs 1.04-1.29x faster than NAX split-K from N 2048, and 1.5x on a vocab head.
+At M 8 the kernel runs 1.10-1.56x faster than NAX split-K from N 2048, and 1.43-1.52x on a vocab
+head.
 
 ## Quantized matmuls that share an input
 

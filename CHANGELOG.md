@@ -24,6 +24,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   block of rows, which removes most of the adapter's cost at decode widths.
 - `nvfp4` and `mxfp4` matmuls decode fp4 values without a lookup table, with the same output.
   On M5 Max, `nvfp4` matmuls of 1 to 16 rows take 8 to 10% less time.
+- On M5, `nvfp4` matmuls of 2 to 8 rows take a further 12% less time, and up to half on weights
+  of 2048 rows or fewer. Their outputs differ from 0.5.6 by rounding.
 
 ### Fixed
 - A MoE layer whose shared expert uses another codec than its routed experts no longer prints
