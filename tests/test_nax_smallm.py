@@ -1042,6 +1042,27 @@ def test_verify_nax_nvfp4_kernel_choice():
             assert grid[2] == slices, (case, grid)
 
 
+# The default route takes the kernel the forced route takes, from N (not
+# the grid rounded to 128 rows): 560 simdgroups at N 17920, 559 at N 17888.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+def test_verify_nax_nvfp4_default_kernel_choice(monkeypatch):
+    _clear_levers(monkeypatch)
+    cases = [
+        (17920, 4096, True),
+        (17888, 4096, False),
+        (10240, 4096, True),
+        (10240, 3584, False),
+    ]
+    calls = [
+        {"codec": "nvfp4", "shape": [8, k], "n": n, "dtype": "bfloat16"}
+        for n, k, _ in cases
+    ]
+    for (n, k, four), e in zip(cases, _logged(calls, {}), strict=True):
+        name = _one_kernel(e)[0]
+        prefix = "kquant_nvfp4_sb_" if four else "kquant_nvfp4_verify_nax_"
+        assert name.startswith(prefix), (n, k, name)
+
+
 # The q4_k and q5_k kernels read their weights as 16-byte words. A base
 # 16 bytes in runs the route bit for bit like the aligned tensor, and a
 # base 4 or 8 bytes in raises before any route runs
@@ -1814,26 +1835,48 @@ def test_nax_qmv_nvfp4_limits(monkeypatch):
 
 
 # nvfp4's one-row tiling: fine up to N 32768, except a coarse band at N 2049
-# to 2560, and at N 1537 to 2048 from K 5120.
+# to 2560, and at N 1537 to 2048 from K 5120. KQ_GPU_CORES 20 halves the
+# band edges, and KQ_QMV_FINE forces either tiling.
 @pytest.mark.skipif(force_cpu(), reason="GPU tiling")
-def test_nvfp4_fine_tiling_band(monkeypatch):
+@pytest.mark.parametrize(
+    "env, cases",
+    [
+        (
+            {},
+            [
+                (2048, 4096, True),
+                (2049, 4096, False),
+                (2560, 2048, False),
+                (2561, 4096, True),
+                (1536, 8192, True),
+                (1537, 8192, False),
+                (1792, 5056, True),
+                (1792, 5120, False),
+            ],
+        ),
+        (
+            {"KQ_GPU_CORES": "20"},
+            [
+                (1024, 4096, True),
+                (1025, 4096, False),
+                (1280, 4096, False),
+                (1281, 4096, True),
+                (768, 8192, True),
+                (769, 8192, False),
+            ],
+        ),
+        ({"KQ_QMV_FINE": "1"}, [(2304, 4096, True), (1792, 8192, True)]),
+        ({"KQ_QMV_FINE": "0"}, [(1024, 4096, False), (4096, 4096, False)]),
+    ],
+)
+def test_nvfp4_fine_tiling_band(env, cases, monkeypatch):
     _clear_levers(monkeypatch)
     for k in ("KQ_QMV_FINE", "KQ_GPU_CORES"):
         monkeypatch.delenv(k, raising=False)
-    cases = [
-        (2048, 4096, True),
-        (2056, 4096, False),
-        (2560, 2048, False),
-        (2568, 4096, True),
-        (1536, 8192, True),
-        (1544, 8192, False),
-        (1792, 5056, True),
-        (1792, 5120, False),
-    ]
     calls = [{"codec": "nvfp4", "shape": [1, k], "n": n} for n, k, _ in cases]
-    for (n, k, fine), e in zip(cases, _logged(calls, {}), strict=True):
+    for (n, k, fine), e in zip(cases, _logged(calls, env), strict=True):
         name = _one_kernel(e)[0]
-        assert ("_fine_" in name) == fine, (n, k, name)
+        assert ("_fine_" in name) == fine, (env, n, k, name)
 
 
 # kq_nax_small_m for the codecs the dispatch tests pin: the per-row qmv

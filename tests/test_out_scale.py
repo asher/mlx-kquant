@@ -231,6 +231,7 @@ def test_real_scales_against_float64(dtn, N, M):
         want = {"verify_mma", "verify_mma_1"}
         if kq.nax_available():
             want |= {"verify_nax", "verify_nax_1"}
+            want |= {"verify_nax_sb", "verify_nax_sb_1"}
         assert want <= set(ran), ran
 
 

@@ -263,16 +263,20 @@ def _real_scale(rng, n):
     return mx.array(s.astype(np.float32))
 
 
+@pytest.mark.parametrize("sb", [None, "1"])
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("splits", [1, 2, 0])
-def test_out_scales_match_per_weight(dtype, splits, exact_levers, monkeypatch):
+def test_out_scales_match_per_weight(dtype, splits, sb, exact_levers, monkeypatch):
     """out_scales, the .scale of an NVFP4 GGUF per weight: each output is
     that weight's quantized_matmul with its out_scale, bit for bit. One call
     holds no scale, (1,) scales and (N_i,) scales over five weights, so it
     runs two dispatches, and at x times 3000 the float16 sums pass 65504
     before the scale. Splits 0 forces the qmv route, where the op runs
     quantized_matmul per weight, the path it takes wherever the widest
-    weight's route is not verify_nax."""
+    weight's route is not verify_nax. KQ_VERIFY_NAX_NVFP4_SB=1 runs the
+    four-block kernels, which K 512 does not pick by default."""
+    if sb:
+        monkeypatch.setenv("KQ_VERIFY_NAX_NVFP4_SB", sb)
     if splits:
         exact_levers(splits)
     else:
