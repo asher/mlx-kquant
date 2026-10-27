@@ -93,6 +93,33 @@ def test_verify_nax_sb_values(codec):
     assert _warnings(res[2], lever, "typo"), res[2]["stderr"]
 
 
+# KQ_VERIFY_NAX_NVFP4_SB is a flag read live: unset, nvfp4 at a K that is
+# a multiple of 256 takes its kernel by shape (the two-block one at N 1000,
+# K 3840), 1 takes the four-block kernel and 0 the two-block one. Other
+# values warn and keep the choice by shape.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+def test_verify_nax_nvfp4_sb_values():
+    lever = "KQ_VERIFY_NAX_NVFP4_SB"
+    values = [
+        (None, False),
+        ("", False),
+        ("1", True),
+        ("on", True),
+        ("0", False),
+        ("2", False),
+        ("typo", False),
+    ]
+    call = {"codec": "nvfp4", "shape": [8, 3840], "n": 1000, "dtype": "bfloat16"}
+    calls = [dict(call, env={lever: v}) for v, _ in values]
+    res = run_probe(calls, env={**LOG, "KQ_QMM_ROUTE": "verify_nax"})
+    for (v, sb), r in zip(values, res, strict=True):
+        assert r["error"] is None, (v, r["error"])
+        ((name, _),) = r["kernels"]
+        assert name.startswith("kquant_nvfp4_sb_verify_nax_") == sb, (v, name)
+    assert _warnings(res[5], lever, "2"), res[5]["stderr"]
+    assert _warnings(res[6], lever, "typo"), res[6]["stderr"]
+
+
 # KQ_VNAX_X16 is on unless 0, read live under KQ_TUNE_LIVE: x at a 16-byte
 # boundary takes the _x16 pipeline unless it is off. Values outside 0 and 1
 # warn and keep it on.

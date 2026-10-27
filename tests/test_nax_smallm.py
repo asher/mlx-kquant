@@ -585,8 +585,13 @@ VNAX_ENTRY = {
 }
 VNAX_WIDE_N = {"q2_k": 4096}
 VNAX_CODECS = list(VNAX_ENTRY)
-# Lever that keeps a codec with an eight-block kernel on its two-block one.
-VNAX_SB_LEVER = {"q4_0": "KQ_VERIFY_NAX_Q4_0_SB", "q4_1": "KQ_VERIFY_NAX_Q4_1_SB"}
+# Lever that picks between a codec's two-block kernel and its eight-block
+# (q4_0, q4_1) or four-block (nvfp4) one.
+VNAX_SB_LEVER = {
+    "q4_0": "KQ_VERIFY_NAX_Q4_0_SB",
+    "q4_1": "KQ_VERIFY_NAX_Q4_1_SB",
+    "nvfp4": "KQ_VERIFY_NAX_NVFP4_SB",
+}
 # The iq4 entry moves with N and K (test_verify_nax_iq4_entry).
 VNAX_IQ4 = ["iq4_xs", "iq4_nl"]
 
@@ -827,13 +832,16 @@ def test_verify_mma_outlier_channel(codec, dtype, monkeypatch):
 # serves, both activation dtypes, aligned and ragged N (the row clamp in
 # the last simdgroup's 32 rows). q4_0 and q4_1 run their eight-block
 # kernels at K 1024, and the "0" arms (KQ_VERIFY_NAX_Q4_0_SB=0,
-# KQ_VERIFY_NAX_Q4_1_SB=0) their two-block kernels.
+# KQ_VERIFY_NAX_Q4_1_SB=0) their two-block kernels. nvfp4 runs its
+# two-block kernel at these N, and the "1" arm (KQ_VERIFY_NAX_NVFP4_SB=1)
+# its four-block kernel.
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("n_out", [1024, 1000, 40, 20])
 @pytest.mark.parametrize(
     "codec, sb",
-    [(c, None) for c in VNAX_CODECS + VNAX_IQ4] + [("q4_0", "0"), ("q4_1", "0")],
+    [(c, None) for c in VNAX_CODECS + VNAX_IQ4]
+    + [("q4_0", "0"), ("q4_1", "0"), ("nvfp4", "1")],
 )
 def test_verify_nax_band(codec, sb, n_out, dtype, monkeypatch):
     w, s, ref_w = _setup(codec, n_out)
@@ -850,8 +858,10 @@ def test_verify_nax_band(codec, sb, n_out, dtype, monkeypatch):
 # of 128 for the others), K 3840 (15 and 30) and K 4096. q4_0 and q4_1 run
 # their two-block kernels at K 2176 and 1920 (34 and 30 steps of 64) and
 # their eight-block kernels at K 4096, 3840 and 4352 (16, 15 and 17 steps
-# of 256). The forced
-# counts cover the partial fold wherever they divide the steps.
+# of 256). nvfp4 runs its two-block kernel at K 2176, 1920 and 4096, and
+# its four-block kernel (KQ_VERIFY_NAX_NVFP4_SB=1) at K 4352, 3840 and
+# 4096. The forced counts cover the partial fold wherever they divide the
+# steps.
 VNAX_SB = ("q4_k", "q5_k", "q6_k", "q3_k", "q2_k")
 VNAX_SPLIT_K = {
     c: [4352, 3840, 4096] if c in VNAX_SB else [2176, 1920, 4096] for c in VNAX_CODECS
@@ -860,16 +870,19 @@ VNAX_SPLIT_K["q4_0"] += [3840, 4352]
 VNAX_SPLIT_K["q4_1"] += [3840, 4352]
 for _c in VNAX_IQ4:
     VNAX_SPLIT_K[_c] = [4352, 3840, 4096]
+VNAX_SPLIT_CASES = [
+    (c, k, None) for c in VNAX_CODECS + VNAX_IQ4 for k in VNAX_SPLIT_K[c]
+] + [("nvfp4", k, "1") for k in (4352, 3840, 4096)]
 
 
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("splits", ["", "2", "3", "4", "5", "8"])
-@pytest.mark.parametrize(
-    "codec, k", [(c, k) for c in VNAX_CODECS + VNAX_IQ4 for k in VNAX_SPLIT_K[c]]
-)
-def test_verify_nax_splits(codec, k, splits, dtype, monkeypatch):
+@pytest.mark.parametrize("codec, k, sb", VNAX_SPLIT_CASES)
+def test_verify_nax_splits(codec, k, sb, splits, dtype, monkeypatch):
     w, s, ref_w = _verify_mma_setup(codec, 1000, k=k)
+    if sb is not None:
+        monkeypatch.setenv(VNAX_SB_LEVER[codec], sb)
     monkeypatch.setenv("KQ_QMM_ROUTE", "verify_nax")
     monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
     monkeypatch.setenv("KQ_VERIFY_NAX_SPLITS", splits)
@@ -972,6 +985,51 @@ def test_verify_nax_two_block_lever(codec, dtype, monkeypatch):
     _sweep(codec, w, s, ref_w, 1000, ms=[1, 3, 8], dtype=mdt, k=k)
     monkeypatch.setenv(lever, "0")
     _sweep(codec, w, s, ref_w, 1000, ms=[1, 3, 8], dtype=mdt, k=k)
+
+
+# nvfp4 runs its four-block kernel where K is a multiple of 256 and a grid
+# of about a wave of simdgroups walks 2048 or more of K, and its two-block
+# kernel elsewhere (kq_verify_nax_nvfp4_sb). Of the Qwen3.8-27B shapes the
+# gate projection (N 17408, K 5120, a grid just under a wave) takes the
+# two-block kernel, and the down projection (N 5120, K 17408) and N 10240,
+# K 5120 (2 splits, walks of 2560) the four-block one, as does N 18560, K
+# 4096 (one split, a grid just over a wave). KQ_VERIFY_NAX_NVFP4_SB=0 or 1
+# forces either kernel at K 3840, and a K that is a multiple of 128 only
+# keeps the two-block kernel under 1. KQ_QMM_LOG names the kernel and its
+# slice count.
+VNAX_NVFP4_CHOICE = [
+    # n, k, lever, four-block, slices
+    (17408, 5120, None, False, 8),
+    (5120, 17408, None, True, 4),
+    (10240, 5120, None, True, 2),
+    (18560, 4096, None, True, 1),
+    (1000, 3840, None, False, None),
+    (1000, 3840, "1", True, None),
+    (5120, 17408, "0", False, None),
+    (1000, 3968, "1", False, None),
+]
+
+
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+def test_verify_nax_nvfp4_kernel_choice():
+    calls = [
+        {
+            "codec": "nvfp4",
+            "shape": [8, k],
+            "n": n,
+            "dtype": "bfloat16",
+            "env": {"KQ_VERIFY_NAX_NVFP4_SB": lever},
+        }
+        for n, k, lever, _, _ in VNAX_NVFP4_CHOICE
+    ]
+    env = {"KQ_QMM_ROUTE": "verify_nax", "KQ_QMM_ROUTE_STRICT": "1"}
+    for case, entry in zip(VNAX_NVFP4_CHOICE, _logged(calls, env), strict=True):
+        n, k, lever, four, slices = case
+        name, grid = _one_kernel(entry)
+        prefix = "kquant_nvfp4_sb_" if four else "kquant_nvfp4_verify_nax_"
+        assert name.startswith(prefix), (case, name)
+        if slices is not None:
+            assert grid[2] == slices, (case, grid)
 
 
 # The q4_k and q5_k kernels read their weights as 16-byte words. A base

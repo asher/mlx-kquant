@@ -112,6 +112,7 @@ def test_host_split_names_exist():
         "_verify_nax_",
         "kquant_q4_0_sb_verify_nax_",
         "kquant_q4_1_sb_verify_nax_",
+        "kquant_nvfp4_sb_verify_nax_",
         "kquant_q4_1_verify_mma_",
         "kquant_qmm_splitk_accum_",
     ):
@@ -126,7 +127,10 @@ def test_host_names_follow_the_dispatch_levers():
     # helpers, so the levers that retire a tile or a step retire its names.
     env = {k: v for k, v in os.environ.items() if not k.startswith("KQ_")}
     env.update(
-        KQ_QMM_SPLITK_BM8="0", KQ_VERIFY_NAX_Q4_0_SB="0", KQ_VERIFY_NAX_Q4_1_SB="0"
+        KQ_QMM_SPLITK_BM8="0",
+        KQ_VERIFY_NAX_Q4_0_SB="0",
+        KQ_VERIFY_NAX_Q4_1_SB="0",
+        KQ_VERIFY_NAX_NVFP4_SB="0",
     )
     code = (
         "import json; from mlx_kquant._ext import _split_kernel_names as f; "
@@ -142,10 +146,8 @@ def test_host_names_follow_the_dispatch_levers():
     names = set(json.loads(out.stdout.strip().splitlines()[-1]))
     host = set(_split_kernel_names())
     assert names < host
-    retired = {
-        n
-        for n in host
-        if "_splitk_bm8_" in n or n.startswith(("kquant_q4_0_sb_", "kquant_q4_1_sb_"))
-    }
+    sb = ("kquant_q4_0_sb_", "kquant_q4_1_sb_", "kquant_nvfp4_sb_")
+    retired = {n for n in host if "_splitk_bm8_" in n or n.startswith(sb)}
     assert retired and host - names == retired
-    assert any(n.startswith("kquant_q4_1_sb_") for n in retired)
+    for prefix in sb[1:]:
+        assert any(n.startswith(prefix) for n in retired), prefix

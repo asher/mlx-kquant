@@ -159,6 +159,60 @@ def test_matmul_routes(name, dtn, M):
     assert ran or M >= 256, "no forced route served the cell"
 
 
+# One-hot activations make each output one weight times 1, so every
+# kernel must reproduce every weight of the wire exactly, whatever its sum
+# order. Row m of x is one-hot at column M j + m. nvfp4 runs both
+# verify_nax kernels (KQ_VERIFY_NAX_NVFP4_SB=0 and 1), and every wire runs
+# each forced route that serves M 8.
+@pytest.mark.skipif(FORCE_CPU, reason="the forced routes are Metal paths")
+@pytest.mark.parametrize("name,dtn", [a for n in WIRES for a in _arms(n)])
+def test_one_hot_rows_reproduce_every_weight(name, dtn):
+    codec, gtype, wire = _wire(name)
+    ref = _ref(wire, gtype).T
+    want = np.asarray(mx.array(ref).astype(getattr(mx, dtn)).astype(mx.float32))
+    w = mx.array(wire)
+    s = mx.zeros((1,), mx.uint8)
+    M = 8
+    xs = []
+    for j in range(K // M):
+        x = np.zeros((M, K), np.float32)
+        x[np.arange(M), M * j + np.arange(M)] = 1.0
+        xs.append(mx.array(x).astype(getattr(mx, dtn)))
+    arms = [(r, None) for r in ROUTES]
+    if codec == "nvfp4":
+        arms += [("verify_nax", "0"), ("verify_nax", "1")]
+    keys = ("KQ_QMM_ROUTE", "KQ_QMM_ROUTE_STRICT", "KQ_VERIFY_NAX_NVFP4_SB")
+    old = {k: os.environ.get(k) for k in keys}
+    ran = []
+    try:
+        os.environ["KQ_QMM_ROUTE_STRICT"] = "1"
+        for route, sb in arms:
+            os.environ["KQ_QMM_ROUTE"] = route
+            os.environ.pop("KQ_VERIFY_NAX_NVFP4_SB", None)
+            if sb is not None:
+                os.environ["KQ_VERIFY_NAX_NVFP4_SB"] = sb
+            try:
+                ys = [kq.quantized_matmul(x, w, s, codec, transpose=True) for x in xs]
+                mx.eval(ys)
+            except (RuntimeError, ValueError):
+                continue  # strict mode: the route does not serve this cell
+            got = np.concatenate([np.asarray(y.astype(mx.float32)) for y in ys])
+            nz = want != 0
+            assert np.array_equal(got, want), (route, sb)
+            assert np.array_equal(got.view(np.uint32)[nz], want.view(np.uint32)[nz])
+            ran.append((route, sb))
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    assert ran, "no forced route served the cell"
+    if codec == "nvfp4":
+        vnax = {("verify_nax", None), ("verify_nax", "0"), ("verify_nax", "1")}
+        assert vnax <= set(ran), ran
+
+
 def _experts(name):
     codec, gtype, wire = _wire(name)
     stack = np.stack([np.roll(wire, i, axis=0) for i in range(E)])

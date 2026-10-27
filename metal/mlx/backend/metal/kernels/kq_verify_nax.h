@@ -28,8 +28,8 @@
 // q2_k units half a superblock, each with its own order. Block scales and
 // mins are folded into the half weights. Device loads and NAX ops of one
 // simdgroup do not overlap, so occupancy hides the loads and the host
-// sizes the split count for it (kq_verify_nax_splits). pq2_0, q4_0 and
-// q4_1 load a unit's activation steps ahead of its NAX ops. The other
+// sizes the split count for it (kq_verify_nax_splits). pq2_0, q4_0, q4_1
+// and nvfp4 load a unit's activation steps ahead of its NAX ops. The other
 // codecs, whose Words are larger, load one step at a time. Each order
 // measured faster for its codecs on M5 Max. The right operand is written
 // in element order, which ran 1.6x faster than a strided order.
@@ -48,6 +48,8 @@
 //     one step at a time reads steps s and s + 1 (s even) from 8
 //     contiguous elements at a 16-byte boundary of the row, so where x
 //     starts on one (kq_vnax_x16) it loads both in one 16-byte load.
+//   out_mul (optional): a power of two the store multiplies the sums by,
+//     for half weights kept that much smaller
 
 // Function constant: x starts on a 16-byte boundary. Unset keeps the
 // 8-byte load per step.
@@ -166,21 +168,32 @@ struct KqQ2_0Nax {
   }
 };
 
+// NVFP4 codes to half, four at a time. kq_nvfp4_nibs keeps the low
+// nibble of each byte of w, or the high one, with its sign moved to bit 6
+// and e1 e0 m left in bits 0..2. kq_nvfp4_pair moves bytes 0 and 2, or 1
+// and 3, to half bits 15 and 11..9, which is the E2M1 value times 2^-14.
+// Times a UE4M3 scale the value stays exact in half.
+METAL_FUNC uint kq_nvfp4_nibs(uint w, bool hi) {
+  return hi ? (((w >> 4) & 0x07070707u) | ((w >> 1) & 0x40404040u))
+            : ((w & 0x07070707u) | ((w << 3) & 0x40404040u));
+}
+METAL_FUNC half2 kq_nvfp4_pair(uint l, bool odd) {
+  return as_type<half2>(
+      odd ? ((l & 0xFF00FF00u) << 1) : ((l & 0x00FF00FFu) << 9));
+}
+
 // NVFP4: lane-quad q owns 16-weight group q, its UE4M3 scale byte q and qs
-// bytes 8q..8q+7. Pair f is byte f's low and high nibbles, weights f and
-// f + 8 of the group, so step s reads Q2_0's activation order. An E2M1 code
-// e1 e0 m in half bits 11..9 is its value times 2^-14; every product with
-// the scale is exact in half. Two 64-weight blocks per iteration.
+// bytes 8q..8q+7. Step s takes the low nibbles of word s & 1 for s < 2 and
+// the high nibbles after, weights 4s to 4s + 3 of the group, and pair f is
+// bytes f & 1 and (f & 1) + 2 of the word. The weights are kept 2^14
+// smaller (out_mul). Two 64-weight blocks per iteration.
 struct KqNvfp4Nax {
   static constant constexpr int group = KQ_NVFP4_SUPERBLOCK;
   static constant constexpr int block_k = KQ_NVFP4_SUPERBLOCK;
   static constant constexpr int block_bytes = KQ_NVFP4_BLOCK_BYTES;
   static constant constexpr int ub = 2;
   static constant constexpr bool x_ahead = true;
-  // Unused: x_ahead codecs load their steps through xstep.
-  static constexpr METAL_FUNC int xoff(short, short) {
-    return 0;
-  }
+  static constant constexpr float out_mul = 16384.0f;
   struct Words {
     uint w[2];
     half d;
@@ -196,18 +209,84 @@ struct KqNvfp4Nax {
     return o;
   }
   static METAL_FUNC half2 pair(thread const Words& o, short f) {
-    const uint b = (o.w[f >> 2] >> (8 * (f & 3))) & 0xFFu;
-    const uint n = (b & 0x0Fu) | ((b & 0xF0u) << 12);
-    const uint bits = ((n & 0x00070007u) << 9) | ((n & 0x00080008u) << 12);
-    return as_type<half2>(bits) * half2(16384.0h) * o.d;
+    const short s = f >> 1;
+    return kq_nvfp4_pair(kq_nvfp4_nibs(o.w[s & 1], s >> 1), f & 1) * o.d;
+  }
+  static constexpr METAL_FUNC int xoff(short q, short s) {
+    return 16 * q + 4 * s;
   }
   template <typename T>
   static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
-    const int o = 16 * q + 2 * s;
-    const vec<T, 2> p0 = *(const device vec<T, 2>*)(xb + o);
-    const vec<T, 2> p1 = *(const device vec<T, 2>*)(xb + o + 8);
-    return vec<T, 4>(p0.x, p1.x, p0.y, p1.y);
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + xoff(q, s));
+    return vec<T, 4>(p[0], p[2], p[1], p[3]);
   }
+};
+
+// NVFP4, four-block unit: four wire blocks (256 weights, 144 bytes), and
+// lane-quad q owns block q, the 36 bytes at 36q, read as nine aligned
+// words: the four group scales, then the qs, two words per group. Step s
+// takes group s >> 2 and within it KqNvfp4Nax's step s & 3. Rows of a K
+// that is a multiple of 256 start 4-byte aligned from a weight base the
+// host checks.
+struct KqNvfp4SbNax {
+  static constant constexpr int group = KQ_NVFP4_SUPERBLOCK;
+  static constant constexpr int block_k = 4 * KQ_NVFP4_SUPERBLOCK;
+  static constant constexpr int block_bytes = 4 * KQ_NVFP4_BLOCK_BYTES;
+  static constant constexpr int ub = 1;
+  static constant constexpr bool x_ahead = false;
+  static constant constexpr float out_mul = 16384.0f;
+  struct Words {
+    uint w[8];
+    half4 d;
+  };
+  static METAL_FUNC Words load(const device uint8_t* row, int u, short q) {
+    const device uint* wp =
+        (const device uint*)(row + u * block_bytes + KQ_NVFP4_BLOCK_BYTES * q);
+    uint t[9];
+    for (short i = 0; i < 9; ++i) {
+      t[i] = wp[i];
+    }
+    Words o;
+    o.d = half4(
+        half(kq_fp_ue4m3_scale(uint8_t(t[0]))),
+        half(kq_fp_ue4m3_scale(uint8_t(t[0] >> 8))),
+        half(kq_fp_ue4m3_scale(uint8_t(t[0] >> 16))),
+        half(kq_fp_ue4m3_scale(uint8_t(t[0] >> 24))));
+    for (short i = 0; i < 8; ++i) {
+      o.w[i] = t[1 + i];
+    }
+    return o;
+  }
+  static METAL_FUNC half2 pair(thread const Words& o, short f) {
+    const short s = f >> 1;
+    const short g = s >> 2;
+    const uint l = kq_nvfp4_nibs(o.w[2 * g + (s & 1)], (s >> 1) & 1);
+    return kq_nvfp4_pair(l, f & 1) * o.d[g];
+  }
+  static constexpr METAL_FUNC int xoff(short q, short s) {
+    return 64 * q + 4 * s;
+  }
+  template <typename T>
+  static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + xoff(q, s));
+    return vec<T, 4>(p[0], p[2], p[1], p[3]);
+  }
+};
+
+// Codec::out_mul, 1 when the codec does not declare it.
+template <typename>
+struct KqVnaxVoid {
+  using type = void;
+};
+template <typename Codec, typename = void>
+struct KqVnaxOutMul {
+  static constant constexpr float value = 1.0f;
+};
+template <typename Codec>
+struct KqVnaxOutMul<
+    Codec,
+    typename KqVnaxVoid<decltype(Codec::out_mul)>::type> {
+  static constant constexpr float value = Codec::out_mul;
 };
 
 // Q4_0: lane-quad q owns qs bytes 4q..4q+3. Pairs (n0, n2), (n1, n3),
@@ -1127,6 +1206,9 @@ METAL_FUNC void kq_verify_nax_impl(
       const int n = n0 + 16 * f + fn + j;
       if (n < N) {
         float v = cc[f * 8 + j];
+        if constexpr (KqVnaxOutMul<Codec>::value != 1.0f) {
+          v *= KqVnaxOutMul<Codec>::value;
+        }
         if constexpr (kOutScale) {
           if (kq_has_out_scale) {
             v *= kq_out_scale_col(out_scale, n);
@@ -1238,6 +1320,7 @@ METAL_FUNC void kq_verify_nax_impl(
 KQ_DEFINE_VERIFY_NAX_KERNEL(pq2_0, KqPq2_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q2_0, KqQ2_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL_OS(nvfp4, KqNvfp4Nax, 1)
+KQ_DEFINE_VERIFY_NAX_KERNEL_OS(nvfp4_sb, KqNvfp4SbNax, 1)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_0, KqQ4_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_0_sb, KqQ4_0SbNax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_1, KqQ4_1Nax)
@@ -1254,6 +1337,7 @@ KQ_DEFINE_VERIFY_NAX_KERNEL(q2_k, KqQ2_KNax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(pq2_0, KqPq2_0Nax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q2_0, KqQ2_0Nax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL_OS(nvfp4, KqNvfp4Nax, 1)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL_OS(nvfp4_sb, KqNvfp4SbNax, 1)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_0, KqQ4_0Nax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_0_sb, KqQ4_0SbNax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_1, KqQ4_1Nax)

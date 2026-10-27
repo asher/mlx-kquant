@@ -1332,10 +1332,11 @@ static std::string kq_verify_mma_kname(
   return kname;
 }
 
-// Kernel-name prefix of a verify_nax call: kstep 256 on q4_0 or q4_1
-// selects the codec's eight-block kernel (q4_0_sb, q4_1_sb).
+// Kernel-name prefix of a verify_nax call: kstep 256 on q4_0, q4_1 or
+// nvfp4 selects the codec's eight- or four-block kernel (q4_0_sb, q4_1_sb,
+// nvfp4_sb).
 static std::string kq_verify_nax_prefix(const std::string& t, int kstep) {
-  if ((t == "q4_0" || t == "q4_1") && kstep == 256) {
+  if ((t == "q4_0" || t == "q4_1" || t == "nvfp4") && kstep == 256) {
     return "kquant_" + t + "_sb_";
   }
   return kq_kname_prefix(t);
@@ -1568,18 +1569,45 @@ static std::string kq_verify_nax_multi_kname(
   return kname;
 }
 
-// K per verify_nax iteration for this call. q4_0 and q4_1 run their
-// eight-block kernels (q4_0_sb, q4_1_sb, 256 weights per step) where K is
-// a multiple of 256, and their two-block kernels (64) elsewhere.
-// KQ_VERIFY_NAX_Q4_0_SB=0 and KQ_VERIFY_NAX_Q4_1_SB=0 keep the two-block
-// kernel (probe levers, read live per call).
-static int kq_verify_nax_call_kstep(int K, const std::string& t) {
+static int kq_verify_nax_splits(int N, int K, int kstep, const std::string& t);
+
+// nvfp4's four-block kernel reads 144 bytes of a row per iteration where
+// the two-block kernel reads 72, and runs faster where a grid of about a
+// wave of simdgroups (7/8 of 640) walks 2048 or more of K: 1.12-1.17x on
+// the vocab heads (N 151936 and 248320), 1.07-1.12x at N 5120, K 17408 and
+// 1.03-1.06x at N 18560, K 4096. With shorter walks or a smaller grid the
+// two-block kernel, which loads its activations ahead, runs up to 1.28x
+// faster. Over 18 shapes of N 512 to 248320 and K 2048 to 17408 at M 1, 4
+// and 8 (M5 Max), the choice runs at 1.003x the time of the faster kernel
+// per cell on bf16 and 1.004x on f16, and at most 1.08x, at N 512, K 4096
+// (0.5 us).
+static bool kq_verify_nax_nvfp4_sb(int N, int K) {
+  const int sp = kq_verify_nax_splits(N, K, 256, "nvfp4");
+  return (N + 31) / 32 * sp >= 560 && K / sp >= 2048;
+}
+
+// K per verify_nax iteration for this call, N the rows of its grid. q4_0
+// and q4_1 run their eight-block kernels (q4_0_sb, q4_1_sb, 256 weights
+// per step) where K is a multiple of 256, and their two-block kernels (64)
+// elsewhere. KQ_VERIFY_NAX_Q4_0_SB=0 and KQ_VERIFY_NAX_Q4_1_SB=0 keep the
+// two-block kernel. nvfp4 runs its four-block kernel (nvfp4_sb, 256) where
+// K is a multiple of 256 and kq_verify_nax_nvfp4_sb picks it, and its
+// two-block kernel (128) elsewhere. KQ_VERIFY_NAX_NVFP4_SB=0 or 1 runs the
+// two-block or the four-block kernel at every K that is a multiple of 256.
+// Probe levers, read live per call.
+static int kq_verify_nax_call_kstep(int N, int K, const std::string& t) {
   if (K % 256 == 0) {
     if (t == "q4_0" && kq_env_int("KQ_VERIFY_NAX_Q4_0_SB", 1) != 0) {
       return 256;
     }
     if (t == "q4_1" && kq_env_int("KQ_VERIFY_NAX_Q4_1_SB", 1) != 0) {
       return 256;
+    }
+    if (t == "nvfp4") {
+      const int sb = kq_env_flag("KQ_VERIFY_NAX_NVFP4_SB", -1);
+      if (sb < 0 ? kq_verify_nax_nvfp4_sb(N, K) : sb != 0) {
+        return 256;
+      }
     }
   }
   return codec_verify_nax_kstep(t);
@@ -1702,8 +1730,6 @@ void verify_nax(
 
   kq_splitk_fold(ce, d, partials, out, type_string, pp, splits, M, N, os);
 }
-
-static int kq_verify_nax_splits(int N, int K, int kstep, const std::string& t);
 
 // verify_nax over up to four weights that share x, in one dispatch
 // (kq_verify_nax_multi): weight i takes ceil(N_i / 128) threadgroups of
@@ -2631,7 +2657,9 @@ static int kq_verify_nax_wave_splits(int sgs, int steps, double partial_c) {
 // and 1.07x at worst, against 1.04x and 1.20x for the simdgroup target, which
 // left the vocab head unsplit at 1.14-1.17x the time of 5 to 10 splits. 640
 // takes N 17408, K 5120 unsplit (1.08x) and 2560 takes N 4096, K 8192 at
-// 32 splits (1.08-1.10x).
+// 32 splits (1.08-1.10x). nvfp4's two-block and four-block kernels keep
+// 1280: on the seven Qwen3.8-27B shapes, the count of the kernel each one
+// runs ran within 1.03x of the best forced count (2 to 5 per shape).
 static double kq_verify_nax_partial_c(const std::string& t, int kstep) {
   if (t == "q4_k" || ((t == "q4_0" || t == "q4_1") && kstep == 256) ||
       t == "iq4_xs" || t == "iq4_nl") {
@@ -2742,7 +2770,7 @@ bool kq_forced_route(
     return false;
   }
   if (r == "verify_nax") {
-    const int kstep = kq_verify_nax_call_kstep(K, t);
+    const int kstep = kq_verify_nax_call_kstep(N, K, t);
     if (kq_is_nax_available() && codec_has_nax(t) && M <= 8 &&
         kq_verify_nax_fits(w, K, kstep, t)) {
       const int sp = kq_verify_nax_splits(N, K, kstep, t);
@@ -3146,10 +3174,12 @@ void KQuantMatmulMulti::eval_gpu(
   const int K = x.shape(-1);
   const int M = K > 0 ? static_cast<int>(x.size() / K) : 0;
   int n_max = 0;
+  int grid_rows = 0;
   for (const auto& w : ws) {
     n_max = std::max(n_max, w.shape(0));
+    grid_rows += (w.shape(0) + 127) / 128 * 128;
   }
-  const int kstep = kq_verify_nax_call_kstep(K, kquant_type_);
+  const int kstep = kq_verify_nax_call_kstep(grid_rows, K, kquant_type_);
   const int force_min_m = kq_force_qmm_min_m();
   bool multi = n_max > 0 && kstep > 0 && x.flags().row_contiguous &&
       x.dtype() != mx::float32 && !kq_qmm_route_forced() &&
@@ -3370,7 +3400,7 @@ void KQuantMatmul::eval_gpu_base(
           os);
       return;
     }
-    const int kstep = kq_verify_nax_call_kstep(K, kquant_type_);
+    const int kstep = kq_verify_nax_call_kstep(N, K, kquant_type_);
     if (route == KqSmallMRoute::verify_nax &&
         kq_verify_nax_fits(w, K, kstep, kquant_type_)) {
       const int sp = kq_verify_nax_splits(N, K, kstep, kquant_type_);
@@ -3915,12 +3945,15 @@ std::vector<std::string> split_kernel_names() {
       tiles.insert({tile.bm, tile.bn});
       nax_bms.insert(kq_nax_splitk_bm(M));
     }
-    // K of whole codec steps, and a multiple of 256 steps, which covers
-    // every step kq_verify_nax_call_kstep picks.
+    // K of whole codec steps, and a multiple of 256 steps on a small and
+    // a vocab-head grid, which covers every step kq_verify_nax_call_kstep
+    // picks.
     const int kstep = codec_verify_nax_kstep(t);
     std::set<int> ksteps;
     for (int K : {kstep, 256 * kstep}) {
-      ksteps.insert(kq_verify_nax_call_kstep(K, t));
+      for (int N : {128, 262144}) {
+        ksteps.insert(kq_verify_nax_call_kstep(N, K, t));
+      }
     }
     for (mx::Dtype dt : {mx::bfloat16, mx::float16}) {
       const std::string ts = kq_type_string(dt);
