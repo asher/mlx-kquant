@@ -1813,6 +1813,29 @@ def test_nax_qmv_nvfp4_limits(monkeypatch):
         assert frag in _one_kernel(e)[0], (n, m, frag)
 
 
+# nvfp4's one-row tiling: fine up to N 32768, except a coarse band at N 2049
+# to 2560, and at N 1537 to 2048 from K 5120.
+@pytest.mark.skipif(force_cpu(), reason="GPU tiling")
+def test_nvfp4_fine_tiling_band(monkeypatch):
+    _clear_levers(monkeypatch)
+    for k in ("KQ_QMV_FINE", "KQ_GPU_CORES"):
+        monkeypatch.delenv(k, raising=False)
+    cases = [
+        (2048, 4096, True),
+        (2056, 4096, False),
+        (2560, 2048, False),
+        (2568, 4096, True),
+        (1536, 8192, True),
+        (1544, 8192, False),
+        (1792, 5056, True),
+        (1792, 5120, False),
+    ]
+    calls = [{"codec": "nvfp4", "shape": [1, k], "n": n} for n, k, _ in cases]
+    for (n, k, fine), e in zip(cases, _logged(calls, {}), strict=True):
+        name = _one_kernel(e)[0]
+        assert ("_fine_" in name) == fine, (n, k, name)
+
+
 # kq_nax_small_m for the codecs the dispatch tests pin: the per-row qmv
 # limit per N bucket (N <= 512, 1024, 2048, larger), then the split-K
 # entries for N <= 1024 and above (99: none, which the table writes as 0).
