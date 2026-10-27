@@ -175,12 +175,18 @@ inline int kquant_qmv_fine_default_max_n(const std::string& kquant_type) {
   if (kquant_type == "q5_1") {
     return 4096;
   }
+  // nvfp4: fine ran 0.76-0.95x the coarse time at N 1024 to 3072 and
+  // 0.94-1.02x from N 4096 to 32768 (M5 Max, bfloat16 and float16), and
+  // 1.09-1.10x at N 2048, K 8192, as q4_0 does there.
+  if (kquant_type == "nvfp4") {
+    return 32768;
+  }
   // Only kv-size dispatches reproducibly win.
   if (kquant_type == "q8_0" || kquant_type == "q2_k" || kquant_type == "q4_0" ||
       kquant_type == "q4_1") {
     return 2048;
   }
-  // mxfp4/nvfp4/iq2_xxs/iq2_xs/iq1_s: no synthetic encoder, so no paired
+  // mxfp4/iq2_xxs/iq2_xs/iq1_s: no synthetic encoder, so no paired
   // A/B yet -- coarse by default until calibrated on real wire data.
   // stq1_0 is encodable but unmeasured; coarse for now.
   return 0;
