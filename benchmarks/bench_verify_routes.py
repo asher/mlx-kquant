@@ -31,6 +31,16 @@ reference on the first --check-rows output columns; an arm over 2e-2
 relative error is reported and left out of the best-route pick.
 
 Cells: codec x (N,K) shape x M x route. Markdown + JSON out.
+
+--interleave-codecs times every codec of one (N,K) shape and M in the same
+rounds, with all codecs' weights resident: the arms are (codec, route)
+pairs, arm order rotates by one slot every round and reverses on the
+Thue-Morse bit of the round. Over all arm pairs each codec leads about as
+often as the other, but one given pair of routes can lead 2 to 6 times in
+8 rounds, and some arms never open a round.
+The Markdown then adds a parity table, the fastest route of each codec
+over the fastest route of the first codec, per shape and M. Without the
+flag codecs run one after another as before.
 """
 
 import argparse
@@ -218,6 +228,12 @@ def main():
         choices=["bfloat16", "float16"],
         help="activation dtype",
     )
+    ap.add_argument(
+        "--interleave-codecs",
+        action="store_true",
+        help="time all codecs of a shape and M in the same rounds (Thue-Morse "
+        "order) and add a codec parity table",
+    )
     ap.add_argument("--json-out", help="write every cell as JSON here")
     ap.add_argument("--md-out", help="write the Markdown tables here, not stdout")
     args = ap.parse_args()
@@ -254,88 +270,131 @@ def main():
         mx.eval(x)
         return (time.perf_counter() - t0) * 1e3 / n
 
+    def tm_bit(n):
+        return bin(n).count("1") & 1
+
+    def build(codec, N, K):
+        w, s, wf = make_weights(codec, N, K, args.seed_rows)
+        wbytes = w.nbytes
+        ncopy = max(1, -(-args.stream_mb * 2**20 // wbytes))
+        ws = [w] + [mx.array(w) + 0 for _ in range(ncopy - 1)]
+        mx.eval(ws)
+        nchk = min(args.check_rows, args.seed_rows, N)
+        wdeq = kq.dequantize(w[:nchk], s if s.size <= 1 else s[:nchk], codec)
+        wdeq = wdeq.astype(mx.float32)
+        mx.eval(wdeq)
+        return (codec, w, s, ws, wdeq, nchk, wbytes)
+
+    def time_cells(N, K, M, cells, thue_morse):
+        """One (N, K, M) for every codec in cells, all arms in shared rounds.
+        A glue arm per distinct chain length. Returns one row per codec."""
+        x0 = mx.random.normal((M, K), key=mx.random.key(M)).astype(dt)
+        mx.eval(x0)
+        by_codec = {c[0]: c for c in cells}
+        arms = []
+        errs = {}
+        for codec, w, s, _ws, wdeq, nchk, _wbytes in cells:
+            ref = x0.astype(mx.float32) @ wdeq.T
+            for r in routes:
+                if not applies(r, codec, M, K, nax):
+                    continue
+                set_route(r)
+                try:
+                    o = kq.quantized_matmul(x0, w, s, codec, transpose=True)
+                    d = (o[:, :nchk].astype(mx.float32) - ref).abs().max()
+                    errs[(codec, r)] = (d / (ref.abs().max() + 1e-6)).item()
+                    arms.append((codec, r))
+                except RuntimeError:
+                    pass
+        glue_of = {}
+        for codec, _w, s, ws, _wdeq, _nchk, _wbytes in cells:
+            n = max(args.chain, len(ws))
+            if n not in glue_of:
+                glue_of[n] = (ws, s, codec)
+                arms.append(("glue", n))
+
+        def run(arm):
+            codec, r = arm
+            if codec == "glue":
+                ws, s, c = glue_of[r]
+                return sample("glue", x0, ws, s, c)
+            _, w, s, ws, _, _, _ = by_codec[codec]
+            return sample(r, x0, ws, s, codec)
+
+        for _ in range(args.warmup):
+            for a in arms:
+                run(a)
+        times = {a: [] for a in arms}
+        for rnd in range(args.rounds):
+            k = rnd % len(arms)
+            order = arms[k:] + arms[:k]
+            flip = tm_bit(rnd) if thue_morse else rnd % 2
+            if flip:
+                order = order[::-1]
+            for a in order:
+                times[a].append(run(a))
+        rows = []
+        for codec, _w, _s, ws, _wdeq, _nchk, wbytes in cells:
+            glue = statistics.median(times[("glue", max(args.chain, len(ws)))])
+            base = statistics.median(times[(codec, "default")]) - glue
+            row = {
+                "codec": codec,
+                "N": N,
+                "K": K,
+                "M": M,
+                "glue_ms": glue,
+                "routes": {},
+            }
+            for c, r in arms:
+                if c != codec:
+                    continue
+                ms = statistics.median(times[(c, r)]) - glue
+                row["routes"][r] = {
+                    "ms": ms,
+                    "vs_default": base / ms if ms > 0 else float("nan"),
+                    "gbs": wbytes / (ms * 1e-3) / 1e9 if ms > 0 else float("nan"),
+                    "rel_err": errs[(c, r)],
+                }
+            rows.append(row)
+            ok = {r: v for r, v in row["routes"].items() if v["rel_err"] <= MAX_REL_ERR}
+            best = min(ok.items() or row["routes"].items(), key=lambda kv: kv[1]["ms"])
+            cells_s = " ".join(
+                f"{r}={v['ms'] * 1e3:.0f}"
+                + ("" if r in ok else f"(err {v['rel_err']:.1e})")
+                for r, v in row["routes"].items()
+            )
+            print(
+                f"{codec:7s} [{N}x{K}] M{M:<3d} us: {cells_s} | best={best[0]}",
+                flush=True,
+            )
+        return rows
+
     results = []
-    for codec in args.codecs:
+    if args.interleave_codecs:
         for N, K in shapes:
-            w, s, wf = make_weights(codec, N, K, args.seed_rows)
-            wbytes = w.nbytes
-            ncopy = max(1, -(-args.stream_mb * 2**20 // wbytes))
-            ws = [w] + [mx.array(w) + 0 for _ in range(ncopy - 1)]
-            mx.eval(ws)
-            nchk = min(args.check_rows, args.seed_rows, N)
-            wdeq = kq.dequantize(w[:nchk], s if s.size <= 1 else s[:nchk], codec)
-            wdeq = wdeq.astype(mx.float32)
-            mx.eval(wdeq)
+            cells = [build(codec, N, K) for codec in args.codecs]
             for M in args.ms:
-                x0 = mx.random.normal((M, K), key=mx.random.key(M)).astype(dt)
-                mx.eval(x0)
-                ref = x0.astype(mx.float32) @ wdeq.T
-                errs = {}
-                for r in routes:
-                    if not applies(r, codec, M, K, nax):
-                        continue
-                    set_route(r)
-                    try:
-                        o = kq.quantized_matmul(x0, w, s, codec, transpose=True)
-                        d = (o[:, :nchk].astype(mx.float32) - ref).abs().max()
-                        errs[r] = (d / (ref.abs().max() + 1e-6)).item()
-                    except RuntimeError:
-                        pass
-                arms = list(errs) + ["glue"]
-                for _ in range(args.warmup):
-                    for r in arms:
-                        sample(r, x0, ws, s, codec)
-                times = {r: [] for r in arms}
-                for rnd in range(args.rounds):
-                    k = rnd % len(arms)
-                    order = arms[k:] + arms[:k]
-                    if rnd % 2:
-                        order = order[::-1]
-                    for r in order:
-                        times[r].append(sample(r, x0, ws, s, codec))
-                glue = statistics.median(times["glue"])
-                base = statistics.median(times["default"]) - glue
-                row = {
-                    "codec": codec,
-                    "N": N,
-                    "K": K,
-                    "M": M,
-                    "glue_ms": glue,
-                    "routes": {},
-                }
-                for r in arms:
-                    if r == "glue":
-                        continue
-                    ms = statistics.median(times[r]) - glue
-                    row["routes"][r] = {
-                        "ms": ms,
-                        "vs_default": base / ms if ms > 0 else float("nan"),
-                        "gbs": wbytes / (ms * 1e-3) / 1e9 if ms > 0 else float("nan"),
-                        "rel_err": errs[r],
-                    }
-                results.append(row)
-                ok = {
-                    r: v
-                    for r, v in row["routes"].items()
-                    if v["rel_err"] <= MAX_REL_ERR
-                }
-                best = min(
-                    ok.items() or row["routes"].items(), key=lambda kv: kv[1]["ms"]
-                )
-                cells = " ".join(
-                    f"{r}={v['ms'] * 1e3:.0f}"
-                    + ("" if r in ok else f"(err {v['rel_err']:.1e})")
-                    for r, v in row["routes"].items()
-                )
-                print(
-                    f"{codec:7s} [{N}x{K}] M{M:<3d} us: {cells} | best={best[0]}",
-                    flush=True,
-                )
-            del w, ws, s, wf, wdeq
+                results.extend(time_cells(N, K, M, cells, True))
+            del cells
+    else:
+        for codec in args.codecs:
+            for N, K in shapes:
+                cell = build(codec, N, K)
+                for M in args.ms:
+                    results.extend(time_cells(N, K, M, [cell], False))
+                del cell
 
     if args.json_out:
         with open(args.json_out, "w") as f:
-            json.dump({"device": dev, "dtype": args.dtype, "rows": results}, f)
+            json.dump(
+                {
+                    "device": dev,
+                    "dtype": args.dtype,
+                    "interleaved": bool(args.interleave_codecs),
+                    "rows": results,
+                },
+                f,
+            )
 
     lines = ["# Small-M route sweep", ""]
     lines.append(
@@ -376,6 +435,42 @@ def main():
                         cells.append(f"{v['ms'] * 1e3:.0f}{mark}")
                 lines.append(f"| {x['M']} | " + " | ".join(cells) + " |")
             lines.append("")
+    if args.interleave_codecs and len(args.codecs) > 1:
+        base_c = args.codecs[0]
+
+        def best_ms(codec, N, K, M):
+            for x in results:
+                if (x["codec"], x["N"], x["K"], x["M"]) == (codec, N, K, M):
+                    ok = [
+                        v["ms"]
+                        for v in x["routes"].values()
+                        if v["rel_err"] <= MAX_REL_ERR
+                    ]
+                    return min(ok) if ok else None
+            return None
+
+        lines.append(f"## Parity: fastest route over fastest {base_c} route")
+        lines.append("")
+        others = args.codecs[1:]
+        lines.append(
+            f"| Shape | M | {base_c} us | "
+            + " | ".join(f"{c} us | {c} / {base_c}" for c in others)
+            + " |"
+        )
+        lines.append("|---|---|---|" + "---|---|" * len(others))
+        for N, K in shapes:
+            for M in args.ms:
+                b = best_ms(base_c, N, K, M)
+                cells = []
+                for c in others:
+                    o = best_ms(c, N, K, M)
+                    if b and o:
+                        cells.append(f"{o * 1e3:.0f} | {o / b:.2f}")
+                    else:
+                        cells.append("- | -")
+                bs = f"{b * 1e3:.0f}" if b else "-"
+                lines.append(f"| {N}x{K} | {M} | {bs} | " + " | ".join(cells) + " |")
+        lines.append("")
     md = "\n".join(lines)
     if args.md_out:
         with open(args.md_out, "w") as f:

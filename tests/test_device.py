@@ -44,6 +44,7 @@ def test_fine_ceiling_calibrated_unless_opted_in(monkeypatch):
     monkeypatch.delenv("KQ_GPU_CORES", raising=False)
     assert kq.qmv_fine_max_n("q6_k") == 16384
     assert kq.qmv_fine_max_n("q8_0") == 2048
+    assert kq.qmv_fine_max_n("nvfp4") == 32768
 
 
 def test_fine_ceiling_scales_with_cores(monkeypatch):
@@ -59,7 +60,7 @@ def test_fine_ceiling_scales_with_cores(monkeypatch):
     assert kq.qmv_fine_max_n("q6_k") == 3072
     monkeypatch.setenv("KQ_GPU_CORES", "80")
     assert kq.qmv_fine_max_n("q6_k") == 32768
-    assert kq.qmv_fine_max_n("nvfp4") == 0
+    assert kq.qmv_fine_max_n("mxfp4") == 0
 
 
 def test_max_threadgroup_memory():

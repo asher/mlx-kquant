@@ -10,6 +10,7 @@
 
 #ifdef _METAL_
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -174,12 +175,18 @@ inline int kquant_qmv_fine_default_max_n(const std::string& kquant_type) {
   if (kquant_type == "q5_1") {
     return 4096;
   }
+  // nvfp4: fine ran 0.66-1.00x the coarse time at N 512 to 1536 and
+  // 0.88-1.07x from N 2816 to 32768 (M5 Max, bfloat16 and float16), with a
+  // coarse band between (kquant_qmv_fine_default).
+  if (kquant_type == "nvfp4") {
+    return 32768;
+  }
   // Only kv-size dispatches reproducibly win.
   if (kquant_type == "q8_0" || kquant_type == "q2_k" || kquant_type == "q4_0" ||
       kquant_type == "q4_1") {
     return 2048;
   }
-  // mxfp4/nvfp4/iq2_xxs/iq2_xs/iq1_s: no synthetic encoder, so no paired
+  // mxfp4/iq2_xxs/iq2_xs/iq1_s: no synthetic encoder, so no paired
   // A/B yet -- coarse by default until calibrated on real wire data.
   // stq1_0 is encodable but unmeasured; coarse for now.
   return 0;
@@ -191,18 +198,36 @@ inline int kquant_qmv_fine_default_max_n(const std::string& kquant_type) {
 // Unset, the calibrated value applies on every part (the scaling is not
 // yet measured on a smaller GPU).
 constexpr int kq_fine_reference_cores = 40;
-inline int kquant_qmv_fine_max_n(const std::string& kquant_type) {
-  const int base = kquant_qmv_fine_default_max_n(kquant_type);
-  if (base == 0 || std::getenv("KQ_GPU_CORES") == nullptr) {
-    return base;
+inline int kq_fine_cores_scaled(int n) {
+  if (n == 0 || std::getenv("KQ_GPU_CORES") == nullptr) {
+    return n;
   }
   const int cores = gpu_core_count();
   if (cores <= 0 || cores == kq_fine_reference_cores) {
-    return base;
+    return n;
   }
-  const long scaled = static_cast<long>(base) * cores / kq_fine_reference_cores;
-  const int rounded = static_cast<int>(scaled / 256 * 256);
-  return std::min(std::max(rounded, 512), 32768);
+  const long scaled = static_cast<long>(n) * cores / kq_fine_reference_cores;
+  return static_cast<int>(scaled / 256 * 256);
+}
+inline int kquant_qmv_fine_max_n(const std::string& kquant_type) {
+  const int base = kquant_qmv_fine_default_max_n(kquant_type);
+  const int scaled = kq_fine_cores_scaled(base);
+  return scaled == base ? base : std::min(std::max(scaled, 512), 32768);
+}
+
+// Whether a one-row matmul takes the fine tiling by default. nvfp4 keeps
+// the coarse tiling at N 2049 to 2560, and at N 1537 to 2048 from K 5120,
+// where fine ran 0.98-1.09x the coarse time (M5 Max, both activation
+// types). The band scales with KQ_GPU_CORES as the ceiling does.
+inline bool kquant_qmv_fine_default(const std::string& t, int N, int K) {
+  if (N > kquant_qmv_fine_max_n(t)) {
+    return false;
+  }
+  if (t == "nvfp4") {
+    return N <= kq_fine_cores_scaled(K >= 5120 ? 1536 : 2048) ||
+        N > kq_fine_cores_scaled(2560);
+  }
+  return true;
 }
 
 // Codecs with a verify_qmv kernel (the small-M weight-read-amortizing leaf).
@@ -226,10 +251,11 @@ inline int verify_qmv_max_rows() {
 
 // Codecs with a register-resident MMA verify kernel (kq_verify_mma.h) and
 // the output rows one of its threadgroups covers: 8 simdgroups of 8-row
-// tiles, two tiles each for q4_0, q4_1 and q8_0 and one for pq2_0, q2_0
-// and ptq1_0; 0 for codecs without the kernel. M <= 8 only.
+// tiles, two tiles each for q4_0, q4_1, q8_0 and nvfp4 and one for pq2_0,
+// q2_0 and ptq1_0; 0 for codecs without the kernel. M <= 8 only.
 inline int codec_verify_mma_rows(const std::string& kquant_type) {
-  if (kquant_type == "q4_0" || kquant_type == "q4_1" || kquant_type == "q8_0") {
+  if (kquant_type == "q4_0" || kquant_type == "q4_1" || kquant_type == "q8_0" ||
+      kquant_type == "nvfp4") {
     return 128;
   }
   if (kquant_type == "pq2_0" || kquant_type == "q2_0" ||
@@ -464,17 +490,32 @@ inline void kq_require_kernel(
 constexpr int kq_fc_kquant_word = 370;
 bool kq_kquant_word_on();
 
+// Function constant 380 (kq_out_scale.h): the output scale mode of the
+// kernels that take one, with the scale buffer at kq_out_scale_slot.
+// kq_get_kernel gives mode 0 to a function that declares the constant when
+// the caller passes none.
+constexpr int kq_fc_out_scale = 380;
+constexpr int kq_out_scale_slot = 30;
+// The fused MoE ops (kq_moe_glu_kq.h) also bind a GLU's up scale and a
+// shared expert's scales.
+constexpr int kq_up_scale_slot = 29;
+constexpr int kq_shexp_scale_slot = 28;
+constexpr int kq_shexp_up_scale_slot = 27;
+
 // Whether the codec has BK=128 NAX kernels (a pair or half loader).
 bool kq_nax_has_bk128(const std::string& t);
 
 // Whether the library function kname exists, and whether it declares the
-// constant named `fc`. Reads the unspecialized function once.
+// decode constant and the output scale constant. Reads the unspecialized
+// function once.
 struct KqFunctionInfo {
   bool exists = false;
   bool word = false;
+  bool out_scale = false;
 };
-inline KqFunctionInfo
-kq_function_info(MTL::Library* lib, const std::string& kname, const char* fc) {
+inline KqFunctionInfo kq_function_info(
+    MTL::Library* lib,
+    const std::string& kname) {
   auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
   auto fn = NS::TransferPtr(lib->newFunction(
       NS::String::string(kname.c_str(), NS::UTF8StringEncoding)));
@@ -484,16 +525,22 @@ kq_function_info(MTL::Library* lib, const std::string& kname, const char* fc) {
   }
   info.exists = true;
   NS::Dictionary* fcs = fn->functionConstantsDictionary();
-  info.word = fcs != nullptr &&
-      fcs->object(NS::String::string(fc, NS::UTF8StringEncoding)) != nullptr;
+  auto declares = [&](const char* fc) {
+    return fcs != nullptr &&
+        fcs->object(NS::String::string(fc, NS::UTF8StringEncoding)) != nullptr;
+  };
+  info.word = declares("kq_kquant_word");
+  info.out_scale = declares("kq_out_scale_fc");
   return info;
 }
 
 // The pipelines of one kq_get_kernel key: whether the function declares
-// the decode constant, and its pipeline for each value of the constant (a
-// function without it has one pipeline, in slot 1).
+// the decode constant and the output scale constant, and its pipeline for
+// each value of the decode constant (a function without it has one
+// pipeline, in slot 1).
 struct KqPipelines {
   bool word = false;
+  bool out_scale = false;
   MTL::ComputePipelineState* ps[2] = {nullptr, nullptr};
 };
 
@@ -539,8 +586,7 @@ inline MTL::ComputePipelineState* kq_get_kernel(
     std::unique_lock<std::shared_mutex> lock(mu);
     auto it = cache.find(key);
     if (it == cache.end()) {
-      const KqFunctionInfo info =
-          kq_function_info(lib, kname, "kq_kquant_word");
+      const KqFunctionInfo info = kq_function_info(lib, kname);
       if (!info.exists) {
         if (setting != nullptr) {
           throw kq_missing_kernel(setting, kname);
@@ -548,19 +594,29 @@ inline MTL::ComputePipelineState* kq_get_kernel(
         // The device raises its load error; nothing is cached.
         return d.get_kernel(kname, lib, key, func_consts);
       }
-      it = cache.emplace(key, KqPipelines{info.word, {nullptr, nullptr}}).first;
+      it = cache
+               .emplace(
+                   key,
+                   KqPipelines{info.word, info.out_scale, {nullptr, nullptr}})
+               .first;
     }
     KqPipelines& p = it->second;
     const int i = p.word ? on : 1;
     if (p.ps[i] == nullptr) {
+      mx::metal::MTLFCList fc = func_consts;
+      if (p.out_scale && std::none_of(fc.begin(), fc.end(), [](const auto& c) {
+            return std::get<2>(c) == kq_fc_out_scale;
+          })) {
+        static const int off = 0;
+        fc.emplace_back(&off, MTL::DataType::DataTypeInt, kq_fc_out_scale);
+      }
       if (p.word) {
         static const bool values[2] = {false, true};
-        mx::metal::MTLFCList fc = func_consts;
         fc.emplace_back(
             &values[i], MTL::DataType::DataTypeBool, kq_fc_kquant_word);
         p.ps[i] = d.get_kernel(kname, lib, i ? key : key + "_kw0", fc);
       } else {
-        p.ps[i] = d.get_kernel(kname, lib, key, func_consts);
+        p.ps[i] = d.get_kernel(kname, lib, key, fc);
       }
     }
     ps = p.ps[i];
@@ -584,6 +640,60 @@ inline MTL::ComputePipelineState* kq_get_kernel(
 inline MTL::ComputePipelineState*
 kq_get_kernel(Device& d, const std::string& kname, const char* setting) {
   return kq_get_kernel(d, kname, kname, {}, setting);
+}
+
+// The output scale of a call (kq_out_scale.h): the float32 buffer and the
+// kernel mode, 1 one value, 2 one per column, 3 one per expert, 4 one per
+// expert and column. Mode 0 is no scale.
+struct KqOutScale {
+  const array* buf = nullptr;
+  int mode = 0;
+  explicit operator bool() const {
+    return mode != 0;
+  }
+};
+
+// kname's pipeline under the function constants fc and hash. With an output
+// scale, the mode is function constant kq_fc_out_scale and the hash gains
+// "_os<mode>".
+inline MTL::ComputePipelineState* kq_get_kernel_os(
+    Device& d,
+    const std::string& kname,
+    const std::string& hash,
+    mx::metal::MTLFCList fc,
+    const KqOutScale& os) {
+  if (!os) {
+    return kq_get_kernel(d, kname, hash, fc);
+  }
+  fc.emplace_back(&os.mode, MTL::DataType::DataTypeInt, kq_fc_out_scale);
+  return kq_get_kernel(d, kname, hash + "_os" + std::to_string(os.mode), fc);
+}
+
+inline MTL::ComputePipelineState*
+kq_get_kernel_os(Device& d, const std::string& kname, const KqOutScale& os) {
+  return kq_get_kernel_os(d, kname, kname, {}, os);
+}
+
+inline void kq_bind_out_scale(CommandEncoder& ce, const KqOutScale& os) {
+  if (os) {
+    ce.set_input_array(*os.buf, kq_out_scale_slot);
+  }
+}
+
+// kname's pipeline under the output scale bits of a fused MoE op (0 for
+// none), for a kernel a lever setting may select.
+inline MTL::ComputePipelineState* kq_get_kernel_os(
+    Device& d,
+    const std::string& kname,
+    int bits,
+    const char* setting) {
+  if (bits == 0) {
+    return kq_get_kernel(d, kname, kname, {}, setting);
+  }
+  mx::metal::MTLFCList fc;
+  fc.emplace_back(&bits, MTL::DataType::DataTypeInt, kq_fc_out_scale);
+  return kq_get_kernel(
+      d, kname, kname + "_os" + std::to_string(bits), fc, setting);
 }
 
 } // namespace mlx_kquant

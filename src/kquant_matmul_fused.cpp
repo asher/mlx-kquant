@@ -7,10 +7,12 @@
 // one dispatch computes the product with y as its only output buffer.
 // Every other case builds the same product from quantized_matmul and stock
 // ops.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -195,6 +197,7 @@ mx::array glu_composed(
       std::nullopt,
       std::nullopt,
       std::nullopt,
+      std::nullopt,
       s);
   auto u = quantized_matmul(
       x,
@@ -202,6 +205,7 @@ mx::array glu_composed(
       scales,
       kquant_type,
       true,
+      std::nullopt,
       std::nullopt,
       std::nullopt,
       std::nullopt,
@@ -487,14 +491,15 @@ std::vector<mx::array> multi_composed(
     const mx::array& x,
     const std::vector<mx::array>& weights,
     const std::string& kquant_type,
+    const std::vector<std::optional<mx::array>>& out_scales,
     mx::Stream s) {
   auto scales = mx::zeros({1}, mx::uint8, s);
   std::vector<mx::array> out;
   out.reserve(weights.size());
-  for (const auto& w : weights) {
+  for (size_t i = 0; i < weights.size(); ++i) {
     out.push_back(quantized_matmul(
         x,
-        w,
+        weights[i],
         scales,
         kquant_type,
         true,
@@ -503,9 +508,23 @@ std::vector<mx::array> multi_composed(
         std::nullopt,
         std::nullopt,
         std::nullopt,
+        i < out_scales.size() ? out_scales[i] : std::nullopt,
         s));
   }
   return out;
+}
+
+// The weights and the scales of a KQuantMatmulMulti's primals.
+void multi_split(
+    const std::vector<mx::array>& primals,
+    int n,
+    std::vector<mx::array>& ws,
+    std::vector<std::optional<mx::array>>& oss) {
+  ws.assign(primals.begin() + 2, primals.begin() + 2 + n);
+  oss.clear();
+  for (size_t i = 2 + n; i < primals.size(); ++i) {
+    oss.emplace_back(primals[i]);
+  }
 }
 
 } // namespace
@@ -526,12 +545,14 @@ std::vector<mx::array> KQuantMatmulMulti::vjp(
     if (arg != 0) {
       throw std::invalid_argument(
           "[mlx_kquant] quantized_matmul_multi vjp: no gradient wrt the "
-          "quantized weights (the kquant base is frozen).");
+          "quantized weights or their scales (the kquant base is frozen).");
     }
   }
-  std::vector<mx::array> ws(primals.begin() + 2, primals.end());
+  std::vector<mx::array> ws;
+  std::vector<std::optional<mx::array>> oss;
+  multi_split(primals, n_weights(primals.size()), ws, oss);
   auto fun = [&](const std::vector<mx::array>& in) {
-    return multi_composed(in[0], ws, kquant_type_, stream());
+    return multi_composed(in[0], ws, kquant_type_, oss, stream());
   };
   auto vjps =
       mx::vjp(fun, std::vector<mx::array>{primals[0]}, cotangents).second;
@@ -546,12 +567,14 @@ std::vector<mx::array> KQuantMatmulMulti::jvp(
     if (arg != 0) {
       throw std::invalid_argument(
           "[mlx_kquant] quantized_matmul_multi jvp: no derivative wrt the "
-          "quantized weights (the kquant base is frozen).");
+          "quantized weights or their scales (the kquant base is frozen).");
     }
   }
-  std::vector<mx::array> ws(primals.begin() + 2, primals.end());
+  std::vector<mx::array> ws;
+  std::vector<std::optional<mx::array>> oss;
+  multi_split(primals, n_weights(primals.size()), ws, oss);
   auto fun = [&](const std::vector<mx::array>& in) {
-    return multi_composed(in[0], ws, kquant_type_, stream());
+    return multi_composed(in[0], ws, kquant_type_, oss, stream());
   };
   return mx::jvp(
              fun,
@@ -562,13 +585,14 @@ std::vector<mx::array> KQuantMatmulMulti::jvp(
 
 bool KQuantMatmulMulti::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMatmulMulti&>(other);
-  return kquant_type_ == o.kquant_type_;
+  return kquant_type_ == o.kquant_type_ && out_scale_mode_ == o.out_scale_mode_;
 }
 
 std::vector<mx::Shape> KQuantMatmulMulti::output_shapes(
     const std::vector<mx::array>& inputs) {
   std::vector<mx::Shape> out;
-  for (size_t i = 2; i < inputs.size(); ++i) {
+  const size_t end = 2 + n_weights(inputs.size());
+  for (size_t i = 2; i < end; ++i) {
     auto shape = inputs[0].shape();
     shape.back() = inputs[i].shape(0);
     out.push_back(std::move(shape));
@@ -580,6 +604,7 @@ std::vector<mx::array> quantized_matmul_multi(
     mx::array x,
     std::vector<mx::array> weights,
     const std::string& kquant_type,
+    const std::optional<std::vector<std::optional<mx::array>>>& out_scales,
     mx::StreamOrDevice s_) {
   const std::string op = kMultiOp;
   const KQuantCodec* codec = codec_by_name(kquant_type);
@@ -619,6 +644,26 @@ std::vector<mx::array> quantized_matmul_multi(
     throw std::invalid_argument(
         op + " Only real floating x dtypes are supported.");
   }
+  const std::vector<std::optional<mx::array>> oss =
+      out_scales.value_or(std::vector<std::optional<mx::array>>{});
+  if (out_scales.has_value() && oss.size() != weights.size()) {
+    throw std::invalid_argument(
+        op + " out_scales must hold one entry per weight.");
+  }
+  // One kernel mode covers every weight: 1 when each scale is (1,), 2
+  // otherwise, with the (1,) scales broadcast to their weight's rows.
+  int mode = 0;
+  for (size_t i = 0; i < oss.size(); ++i) {
+    mode = std::max(
+        mode,
+        kq_out_scale_mode(
+            oss[i],
+            kquant_type,
+            true,
+            weights[i].shape(0),
+            0,
+            "quantized_matmul_multi"));
+  }
   auto s = mx::to_stream(s_);
   const mx::Dtype out_type =
       x.dtype() == mx::float32 ? mx::bfloat16 : x.dtype();
@@ -627,7 +672,7 @@ std::vector<mx::array> quantized_matmul_multi(
       codec->has_matmul_kernel && multi_on() && weights.size() >= 2 &&
       rows >= 2 && rows <= 8;
   if (!fused) {
-    return multi_composed(x, weights, kquant_type, s);
+    return multi_composed(x, weights, kquant_type, oss, s);
   }
   std::vector<mx::array> inputs;
   inputs.reserve(weights.size() + 2);
@@ -643,11 +688,24 @@ std::vector<mx::array> quantized_matmul_multi(
     dtypes.push_back(out_type);
     inputs.push_back(kq_matrix_dense(w, s));
   }
+  // A weight without a scale gets ones.
+  for (size_t i = 0; mode != 0 && i < weights.size(); ++i) {
+    const int n = weights[i].shape(0);
+    const mx::Shape shape = mode == 1 ? mx::Shape{1} : mx::Shape{n};
+    if (!oss[i].has_value()) {
+      inputs.push_back(mx::ones(shape, mx::float32, s));
+    } else if (oss[i]->size() != static_cast<size_t>(shape[0])) {
+      inputs.push_back(
+          mx::contiguous(mx::broadcast_to(*oss[i], shape, s), false, s));
+    } else {
+      inputs.push_back(kq_row_major(*oss[i], s));
+    }
+  }
   return mx::array::make_arrays(
       std::move(shapes),
       dtypes,
       std::make_shared<KQuantMatmulMulti>(
-          s, kquant_type, codec->weights_per_block, codec->bits),
+          s, kquant_type, codec->weights_per_block, codec->bits, mode),
       std::move(inputs));
 }
 

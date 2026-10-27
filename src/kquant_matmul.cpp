@@ -396,6 +396,7 @@ static int kq_prism_verify_max_m() {
 // and M3 verify_qmv runs faster at K 2048 and below (0.57-0.99x at M2,
 // 0.61-0.91x at M3). From M4, where the old route is the bm8 split-K tile,
 // the kernel runs 1.00-1.4x faster (geometric mean 1.10-1.25x per M).
+// nvfp4 has no entry until it is measured on a GPU without NAX.
 static int kq_verify_mma_min_m(const std::string& t, bool f16) {
   if (t == "pq2_0" || t == "q2_0") {
     return f16 ? 4 : 3;
@@ -466,17 +467,19 @@ static int kq_verify_mma_min_m_nax(const std::string& t) {
 // (0.97x).
 //
 // nvfp4 was fitted the same way on bf16 and f16 over 24 shapes of N 256 to
-// 248320 and K 2048 to 17408, against the routes of its kq_nax_small_m row.
-// Times below are of the kernel against the default route it displaces at
-// the entry. A vocab head enters at M 3 (0.89x on bf16, 1.01x on f16). N
-// 512 and below has no entry: NAX split-K runs 1.07-1.42x faster there
-// through M 8. K 6144 and wider, and N 1024 from K 4096, enter at M 2
-// (0.83-1.04x; N 4096, K 8192 runs 1.04x slower at M 2 on f16). N 1025 to
-// 2048 enters at M 3 from K 4096 (0.85-0.90x), and N 513 to 2048 at M 5
-// below K 4096 (0.99-1.02x). Wider N under K 6144 enters at M 4 on bf16
-// and M 5 on f16 (0.84-1.05x; N 6144, K 5120 runs 1.05x slower at M 4 on
-// bf16). At M 8 the kernel takes 0.78-0.96x the time of NAX split-K from N
-// 2048, and 0.67x on a vocab head.
+// 248320 and K 2048 to 17408, against the routes of its kq_nax_small_m row
+// with per-row qmv off. Times below are of the kernel against the route it
+// displaces at the entry. Per-row qmv runs ahead of the entry, through M 2
+// above N 1024 (M 1 on a vocab head) and M 3 at N 513 to 1024. A vocab
+// head enters at M 3 (0.91x
+// on bf16, 0.96x on f16). N 512 and below has no entry: past its qmv limit
+// the kernel ran 0.92x the time of NAX split-K at K 2048 but 1.01-1.06x from
+// K 4096. N 513 to 1024 enters at M 2 (0.75-0.86x). N 1025 to 2048 enters
+// at M 3 from K 4096 (0.68-0.85x) and at M 4 below it (0.95-1.00x). Wider N
+// enters at M 2 from K 6144 (0.91-1.01x). Under K 6144 it enters at M 3 on
+// bf16 (0.94-1.02x, but 1.09x at N 18560, K 4096, where mv_ext holds M 3)
+// and at M 4 on f16 (0.77-0.95x). At M 8 the kernel takes 0.64-0.91x the
+// time of NAX split-K from N 2048, and 0.66-0.70x on a vocab head.
 static int kq_verify_nax_min_m(const std::string& t, int N, int K, bool f16) {
   if (t == "iq4_xs" || t == "iq4_nl") {
     if (N >= 100000) {
@@ -499,13 +502,16 @@ static int kq_verify_nax_min_m(const std::string& t, int N, int K, bool f16) {
     if (N <= 512) {
       return 0;
     }
-    if (K >= 6144 || (N <= 1024 && K >= 4096)) {
+    if (N <= 1024) {
       return 2;
     }
     if (N <= 2048) {
-      return K >= 4096 ? 3 : 5;
+      return K >= 4096 ? 3 : 4;
     }
-    return f16 ? 5 : 4;
+    if (K >= 6144) {
+      return 2;
+    }
+    return f16 ? 4 : 3;
   }
   if (t == "q8_0") {
     return 6;
@@ -584,8 +590,9 @@ static int kq_splitk_min_m(const std::string& t) {
 // measured faster. The nvfp4 row was fitted the same way on bf16 and f16
 // over 16 shapes (N 256 to 248320, K 2048 to 17408) and held out on 8 (N
 // 512 to 14336, K 2048 to 14336), with its verify_nax entries. It
-// runs at 1.006x the fastest route on the fitted cells and 1.002x on the
-// held-out ones, against 1.065x and 1.109x for the q2_0 row it replaces.
+// runs at 1.012-1.014x the fastest route on the fitted cells and
+// 1.009-1.013x on the held-out ones, against 1.051-1.061x and 1.020-1.027x
+// for its previous row, fitted before the mat-vec decode got faster.
 // q4_1 was fitted without its verify routes; it now takes the q4_0 row,
 // which was fitted with them, and is not measured on it.
 struct KqNaxSmallM {
@@ -653,17 +660,23 @@ static KqNaxSmallM kq_nax_small_m(const std::string& t) {
     return {{8, 5, 3, 2}, 9, 9};
   }
   if (t == "nvfp4") {
-    // Per-row qmv keeps M 2 only for N 1025 to 2048. At N 1024 it runs
-    // 1.14-1.26x faster than the table's route at K 2048, M 2 to 4, but
-    // 1.1-1.4x slower than verify_nax from K 4096, so that bucket keeps it
-    // at M 1.
-    return {{1, 1, 2, 1}, 2, 6};
+    // At N 512 and below the qmv limit moves with K: per-row qmv ran fastest
+    // through M 8 at K 2048 to 4096 and through M 4 at K 8192, so the row
+    // takes M 6, 1.00-1.07x the fastest route per shape over M 2 to 12. At
+    // N 1024 it takes M 3, where qmv ran 1.08-1.5x faster than verify_nax
+    // at K 2048 to 5120 and 1.05x slower at K 8192. Above N 1024 it takes M
+    // 2 (1.00-1.10x the fastest route), except on a vocab head, where
+    // mv_ext ran 1.17-1.29x faster (kq_nax_qmv_max_m).
+    return {{6, 3, 2, 2}, 2, 6};
   }
   return {{1, 1, 1, 1}, 0, 0};
 }
 
 // Widest M per-row qmv serves by default on NAX GPUs.
 static int kq_nax_qmv_max_m(const std::string& t, int N) {
+  if (t == "nvfp4" && N >= 100000) {
+    return 1;
+  }
   const int b = N <= 512 ? 0 : N <= 1024 ? 1 : N <= 2048 ? 2 : 3;
   return kq_nax_small_m(t).qmv_m[b];
 }
@@ -813,6 +826,16 @@ static KqSplitkPartials kq_splitk_partials(mx::Dtype dt) {
   return kq_splitk_partials(dt, mode < 0 ? dt == mx::float16 : mode != 0);
 }
 
+// The partials of a split-K call with an output scale are float for
+// float16 activations whatever KQ_SPLITK_F32 says, since an unscaled
+// float16 partial can pass 65504.
+static KqSplitkPartials kq_splitk_partials(mx::Dtype dt, const KqOutScale& os) {
+  if (os && dt == mx::float16) {
+    return kq_splitk_partials(dt, true);
+  }
+  return kq_splitk_partials(dt);
+}
+
 // KQ_QMM_LOG set (any value): the quantized matmul and mat-vec kernels log
 // the kernel name and shape of each dispatch to stderr.
 static bool kq_qmm_log() {
@@ -941,7 +964,8 @@ void qmm_nax(
     int K,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os = {}) {
   int B = out.size() / M / N;
   int wm = 2, wn = 2, bm = 64, bn = 64, bk = 64;
   // Small-BM tile for small M: BM=64 wastes up to 75% of MMA issues on row
@@ -1086,7 +1110,7 @@ void qmm_nax(
   }
   kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
 
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel_os(d, kname, os);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
 
@@ -1099,6 +1123,7 @@ void qmm_nax(
   ce.set_bytes(N, c++);
   ce.set_bytes(M, c++);
   add_strides_and_shapes(ce, B <= 1, x, w, scales, c);
+  kq_bind_out_scale(ce, os);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -1117,7 +1142,8 @@ void qmm(
     int K,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os = {}) {
   // The op promotes float32 x to bfloat16 before constructing this primitive,
   // so x.dtype() is never float32 here and the NAX path stays eligible on the
   // dtype axis with no tf32 gate.
@@ -1136,7 +1162,8 @@ void qmm(
         K,
         d,
         s,
-        kquant_type);
+        kquant_type,
+        os);
   }
 
   int B = out.size() / M / N;
@@ -1184,7 +1211,7 @@ void qmm(
   }
   kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
 
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel_os(d, kname, os);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
 
@@ -1197,6 +1224,7 @@ void qmm(
   ce.set_bytes(N, c++);
   ce.set_bytes(M, c++);
   add_strides_and_shapes(ce, B <= 1, x, w, scales, c);
+  kq_bind_out_scale(ce, os);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -1285,6 +1313,11 @@ static bool kq_verify_mma_has_half(const std::string& t) {
   return t == "pq2_0" || t == "q2_0" || t == "q4_0" || t == "q8_0";
 }
 
+// verify_mma codecs whose kernel takes the output scale.
+static bool kq_verify_mma_has_os(const std::string& t) {
+  return t == "nvfp4";
+}
+
 // KQ_VERIFY_MMA_HALF=1 (probe lever, read live) runs the half kernels on
 // the codecs that have them, for timing against the float kernels. They
 // stage the activations as half and sum each block in half, so their range
@@ -1317,10 +1350,11 @@ static std::string kq_verify_mma_kname(
   return kname;
 }
 
-// Kernel-name prefix of a verify_nax call: kstep 256 on q4_0 or q4_1
-// selects the codec's eight-block kernel (q4_0_sb, q4_1_sb).
+// Kernel-name prefix of a verify_nax call: kstep 256 on q4_0, q4_1 or
+// nvfp4 selects the codec's eight- or four-block kernel (q4_0_sb, q4_1_sb,
+// nvfp4_sb).
 static std::string kq_verify_nax_prefix(const std::string& t, int kstep) {
-  if ((t == "q4_0" || t == "q4_1") && kstep == 256) {
+  if ((t == "q4_0" || t == "q4_1" || t == "nvfp4") && kstep == 256) {
     return "kquant_" + t + "_sb_";
   }
   return kq_kname_prefix(t);
@@ -1353,6 +1387,37 @@ static std::string kq_splitk_accum_kname(
   return "kquant_qmm_splitk_accum_" + ts + suffix;
 }
 
+// Folds the [splits, M, N] partials into out in float32 with one rounding.
+// With an output scale the fold multiplies each sum by it first.
+static void kq_splitk_fold(
+    CommandEncoder& ce,
+    Device& d,
+    const array& partials,
+    array& out,
+    const std::string& ts,
+    const KqSplitkPartials& pp,
+    int splits,
+    int M,
+    int N,
+    const KqOutScale& os) {
+  ce.set_compute_pipeline_state(
+      kq_get_kernel_os(d, kq_splitk_accum_kname(ts, pp.suffix), os));
+  const int n_elems = M * N;
+  int c = 0;
+  ce.set_input_array(partials, c++);
+  ce.set_output_array(out, c++);
+  ce.set_bytes(n_elems, c++);
+  ce.set_bytes(splits, c++);
+  ce.set_bytes(n_elems, c++); // partial stride
+  if (os) {
+    ce.set_bytes(N, c++);
+    kq_bind_out_scale(ce, os);
+  }
+  MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
+  MTL::Size agroup(256, 1, 1);
+  ce.dispatch_threads(agrid, agroup);
+}
+
 // Split-K qmm_t for the small-M decode band and the mid-M band on non-NAX
 // GPUs (see kq_midm_splitk). The plain tile grid is only
 // ceil(N/64) x 1 threadgroups at decode shapes with M <= 32 (84 at
@@ -1376,14 +1441,15 @@ void qmm_splitk(
     int splits,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os = {}) {
   constexpr int wm = 2, wn = 2;
   const KqSplitkTile tile = kq_splitk_tile(M, kquant_type);
   const int bm = tile.bm;
   const int bn = tile.bn;
   const int k_partition = (K / group_size / splits) * group_size;
   const int part_stride = M * N;
-  const KqSplitkPartials pp = kq_splitk_partials(x.dtype());
+  const KqSplitkPartials pp = kq_splitk_partials(x.dtype(), os);
 
   array partials({splits, M, N}, pp.dtype, nullptr, {});
   partials.set_data(mx::allocator::malloc(partials.nbytes()));
@@ -1413,19 +1479,7 @@ void qmm_splitk(
   kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 
-  const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
-  auto accum = kq_get_kernel(d, aname);
-  ce.set_compute_pipeline_state(accum);
-  const int n_elems = M * N;
-  c = 0;
-  ce.set_input_array(partials, c++);
-  ce.set_output_array(out, c++);
-  ce.set_bytes(n_elems, c++);
-  ce.set_bytes(splits, c++);
-  ce.set_bytes(part_stride, c++);
-  MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
-  MTL::Size agroup(256, 1, 1);
-  ce.dispatch_threads(agrid, agroup);
+  kq_splitk_fold(ce, d, partials, out, type_string, pp, splits, M, N, os);
 }
 
 // Register-resident MMA verify for M <= 8 (kq_verify_mma.h): each
@@ -1436,7 +1490,7 @@ void qmm_splitk(
 // grid z with qmm_splitk's partial/fold shape; slices are whole wire
 // blocks. Non-batched transpose shapes, bf16 or f16 activations, which
 // stay in their dtype while each block sums in float. kq_verify_mma_half
-// selects the half kernels.
+// selects the half kernels. os needs kq_verify_mma_has_os.
 void verify_mma(
     const array& x,
     const array& w,
@@ -1450,7 +1504,8 @@ void verify_mma(
     int splits,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os = {}) {
   const int rows = codec_verify_mma_rows(kquant_type);
   const int k_partition = (K / group_size / splits) * group_size;
   const int part_stride = M * N;
@@ -1458,8 +1513,10 @@ void verify_mma(
   auto& ce = mx::metal::get_command_encoder(s);
   // One split writes out directly; the partials and the fold exist only
   // for splits > 1.
-  const KqSplitkPartials pp = splits > 1 ? kq_splitk_partials(x.dtype())
+  const KqSplitkPartials pp = splits > 1 ? kq_splitk_partials(x.dtype(), os)
                                          : KqSplitkPartials{x.dtype(), ""};
+  // One split scales in the kernel, more in the fold.
+  const KqOutScale kos = splits > 1 ? KqOutScale{} : os;
   array partials({splits, M, N}, pp.dtype, nullptr, {});
   if (splits > 1) {
     partials.set_data(mx::allocator::malloc(partials.nbytes()));
@@ -1475,7 +1532,7 @@ void verify_mma(
       kq_verify_mma_half(kquant_type),
       pp.suffix);
 
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel_os(d, kname, kos);
   ce.set_compute_pipeline_state(kernel);
 
   int c = 0;
@@ -1488,6 +1545,7 @@ void verify_mma(
   ce.set_bytes(M, c++);
   ce.set_bytes(k_partition, c++);
   ce.set_bytes(part_stride, c++);
+  kq_bind_out_scale(ce, kos);
   MTL::Size group_dims(256, 1, 1);
   MTL::Size grid_dims((N + rows - 1) / rows, 1, splits);
   kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
@@ -1496,19 +1554,7 @@ void verify_mma(
     return;
   }
 
-  const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
-  auto accum = kq_get_kernel(d, aname);
-  ce.set_compute_pipeline_state(accum);
-  const int n_elems = M * N;
-  c = 0;
-  ce.set_input_array(partials, c++);
-  ce.set_output_array(out, c++);
-  ce.set_bytes(n_elems, c++);
-  ce.set_bytes(splits, c++);
-  ce.set_bytes(part_stride, c++);
-  MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
-  MTL::Size agroup(256, 1, 1);
-  ce.dispatch_threads(agrid, agroup);
+  kq_splitk_fold(ce, d, partials, out, type_string, pp, splits, M, N, os);
 }
 
 // The several-weight form of kq_verify_nax_kname.
@@ -1533,18 +1579,45 @@ static std::string kq_verify_nax_multi_kname(
   return kname;
 }
 
-// K per verify_nax iteration for this call. q4_0 and q4_1 run their
-// eight-block kernels (q4_0_sb, q4_1_sb, 256 weights per step) where K is
-// a multiple of 256, and their two-block kernels (64) elsewhere.
-// KQ_VERIFY_NAX_Q4_0_SB=0 and KQ_VERIFY_NAX_Q4_1_SB=0 keep the two-block
-// kernel (probe levers, read live per call).
-static int kq_verify_nax_call_kstep(int K, const std::string& t) {
+static int kq_verify_nax_splits(int N, int K, int kstep, const std::string& t);
+
+// nvfp4's four-block kernel reads 144 bytes of a row per iteration where
+// the two-block kernel reads 72, and runs faster where a grid of about a
+// wave of simdgroups (7/8 of 640) walks 2048 or more of K: 1.12-1.17x on
+// the vocab heads (N 151936 and 248320), 1.07-1.12x at N 5120, K 17408 and
+// 1.03-1.06x at N 18560, K 4096. With shorter walks or a smaller grid the
+// two-block kernel, which loads its activations ahead, runs up to 1.28x
+// faster. Over 18 shapes of N 512 to 248320 and K 2048 to 17408 at M 1, 4
+// and 8 (M5 Max, two sessions), the choice runs at 1.003-1.008x the time of
+// the faster kernel per cell on bf16 and 1.004-1.012x on f16, and at most
+// 1.08x.
+static bool kq_verify_nax_nvfp4_sb(int N, int K) {
+  const int sp = kq_verify_nax_splits(N, K, 256, "nvfp4");
+  return (N + 31) / 32 * sp >= 560 && K / sp >= 2048;
+}
+
+// K per verify_nax iteration for this call, N the rows of its grid. q4_0
+// and q4_1 run their eight-block kernels (q4_0_sb, q4_1_sb, 256 weights
+// per step) where K is a multiple of 256, and their two-block kernels (64)
+// elsewhere. KQ_VERIFY_NAX_Q4_0_SB=0 and KQ_VERIFY_NAX_Q4_1_SB=0 keep the
+// two-block kernel. nvfp4 runs its four-block kernel (nvfp4_sb, 256) where
+// K is a multiple of 256 and kq_verify_nax_nvfp4_sb picks it, and its
+// two-block kernel (128) elsewhere. KQ_VERIFY_NAX_NVFP4_SB=0 or 1 runs the
+// two-block or the four-block kernel at every K that is a multiple of 256.
+// Probe levers, read live per call.
+static int kq_verify_nax_call_kstep(int N, int K, const std::string& t) {
   if (K % 256 == 0) {
     if (t == "q4_0" && kq_env_int("KQ_VERIFY_NAX_Q4_0_SB", 1) != 0) {
       return 256;
     }
     if (t == "q4_1" && kq_env_int("KQ_VERIFY_NAX_Q4_1_SB", 1) != 0) {
       return 256;
+    }
+    if (t == "nvfp4") {
+      const int sb = kq_env_flag("KQ_VERIFY_NAX_NVFP4_SB", -1);
+      if (sb < 0 ? kq_verify_nax_nvfp4_sb(N, K) : sb != 0) {
+        return 256;
+      }
     }
   }
   return codec_verify_nax_kstep(t);
@@ -1594,12 +1667,17 @@ static MTL::ComputePipelineState* kq_verify_nax_pipeline(
     const std::string& kname,
     const std::string& suffix,
     const array& x,
-    std::string& vname) {
+    std::string& vname,
+    const KqOutScale& os = {}) {
   bool x16 = reinterpret_cast<uintptr_t>(x.data<char>()) % 16 == 0 &&
       kq_vnax_x16_enabled();
   mx::metal::MTLFCList fc = {{&x16, MTL::DataType::DataTypeBool, 40}};
   vname = kname.substr(0, kname.size() - suffix.size()) +
       (x16 ? "_x16" : "_x8") + suffix;
+  if (os) {
+    fc.emplace_back(&os.mode, MTL::DataType::DataTypeInt, kq_fc_out_scale);
+    vname += "_os" + std::to_string(os.mode);
+  }
   return kq_get_kernel(d, kname, vname, fc);
 }
 
@@ -1617,13 +1695,16 @@ void verify_nax(
     int splits,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os = {}) {
   const int k_partition = (K / kstep / splits) * kstep;
   const int part_stride = M * N;
 
   auto& ce = mx::metal::get_command_encoder(s);
-  const KqSplitkPartials pp = splits > 1 ? kq_splitk_partials(x.dtype())
+  const KqSplitkPartials pp = splits > 1 ? kq_splitk_partials(x.dtype(), os)
                                          : KqSplitkPartials{x.dtype(), ""};
+  // One split scales in the kernel, more in the fold.
+  const KqOutScale kos = splits > 1 ? KqOutScale{} : os;
   array partials({splits, M, N}, pp.dtype, nullptr, {});
   if (splits > 1) {
     partials.set_data(mx::allocator::malloc(partials.nbytes()));
@@ -1635,7 +1716,7 @@ void verify_nax(
       kquant_type, type_string, group_size, bits, kstep, pp.suffix);
 
   std::string vname;
-  auto kernel = kq_verify_nax_pipeline(d, kname, pp.suffix, x, vname);
+  auto kernel = kq_verify_nax_pipeline(d, kname, pp.suffix, x, vname, kos);
   ce.set_compute_pipeline_state(kernel);
 
   int c = 0;
@@ -1648,6 +1729,7 @@ void verify_nax(
   ce.set_bytes(M, c++);
   ce.set_bytes(k_partition, c++);
   ce.set_bytes(part_stride, c++);
+  kq_bind_out_scale(ce, kos);
   MTL::Size group_dims(128, 1, 1);
   MTL::Size grid_dims((N + 127) / 128, 1, splits);
   kq_log_qmm(vname, M, N, K, grid_dims, group_dims, x);
@@ -1656,29 +1738,17 @@ void verify_nax(
     return;
   }
 
-  const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
-  auto accum = kq_get_kernel(d, aname);
-  ce.set_compute_pipeline_state(accum);
-  const int n_elems = M * N;
-  c = 0;
-  ce.set_input_array(partials, c++);
-  ce.set_output_array(out, c++);
-  ce.set_bytes(n_elems, c++);
-  ce.set_bytes(splits, c++);
-  ce.set_bytes(part_stride, c++);
-  MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
-  MTL::Size agroup(256, 1, 1);
-  ce.dispatch_threads(agrid, agroup);
+  kq_splitk_fold(ce, d, partials, out, type_string, pp, splits, M, N, os);
 }
-
-static int kq_verify_nax_splits(int N, int K, int kstep, const std::string& t);
 
 // verify_nax over up to four weights that share x, in one dispatch
 // (kq_verify_nax_multi): weight i takes ceil(N_i / 128) threadgroups of
 // grid x after those of the weights before it, and reads its own buffer.
-// The split count is the one verify_nax takes for the joint grid. Split
+// The kstep (and with it the nvfp4 kernel) and the split count are the
+// ones verify_nax takes for the joint grid of the dispatch. Split
 // partials of weight i sit in one temporary at splits * M * (rows of the
-// weights before it), and one fold per weight writes its output.
+// weights before it), and one fold per weight writes its output. oss is
+// empty or holds each weight's output scale, all in one mode.
 void verify_nax_multi(
     const array& x,
     const std::vector<array>& ws,
@@ -1687,10 +1757,10 @@ void verify_nax_multi(
     int bits,
     int M,
     int K,
-    int kstep,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const std::vector<KqOutScale>& oss) {
   const int n = static_cast<int>(ws.size());
   std::array<int, 4> n_rows{0, 0, 0, 0};
   std::array<int, 4> tg_end{0, 0, 0, 0};
@@ -1707,12 +1777,16 @@ void verify_nax_multi(
     tg_end[i] = tgs;
     part_stride[i] = M * N;
   }
+  const int kstep = kq_verify_nax_call_kstep(tgs * 128, K, kquant_type);
   const int splits = kq_verify_nax_splits(tgs * 128, K, kstep, kquant_type);
   const int k_partition = (K / kstep / splits) * kstep;
 
   auto& ce = mx::metal::get_command_encoder(s);
-  const KqSplitkPartials pp = splits > 1 ? kq_splitk_partials(x.dtype())
+  const KqOutScale os0 = oss.empty() ? KqOutScale{} : oss[0];
+  const KqSplitkPartials pp = splits > 1 ? kq_splitk_partials(x.dtype(), os0)
                                          : KqSplitkPartials{x.dtype(), ""};
+  // One split scales in the kernel, more in the folds.
+  const KqOutScale kos = splits > 1 ? KqOutScale{} : os0;
   array partials({splits, M, static_cast<int>(rows)}, pp.dtype, nullptr, {});
   if (splits > 1) {
     partials.set_data(mx::allocator::malloc(partials.nbytes()));
@@ -1723,12 +1797,15 @@ void verify_nax_multi(
   const std::string kname = kq_verify_nax_multi_kname(
       kquant_type, type_string, group_size, bits, kstep, pp.suffix);
   std::string vname;
-  auto kernel = kq_verify_nax_pipeline(d, kname, pp.suffix, x, vname);
+  auto kernel = kq_verify_nax_pipeline(d, kname, pp.suffix, x, vname, kos);
   ce.set_compute_pipeline_state(kernel);
 
   int c = 0;
   for (int i = 0; i < 4; ++i) {
     ce.set_input_array(ws[i < n ? i : 0], c++);
+    if (kos) {
+      ce.set_input_array(*oss[i < n ? i : 0].buf, kq_out_scale_slot - i);
+    }
   }
   ce.set_input_array(x, c++);
   for (int i = 0; i < 4; ++i) {
@@ -1755,9 +1832,9 @@ void verify_nax_multi(
   }
 
   const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
-  auto accum = kq_get_kernel(d, aname);
   for (int i = 0; i < n; ++i) {
-    ce.set_compute_pipeline_state(accum);
+    const KqOutScale os = oss.empty() ? KqOutScale{} : oss[i];
+    ce.set_compute_pipeline_state(kq_get_kernel_os(d, aname, os));
     const int n_elems = M * n_rows[i];
     c = 0;
     ce.set_input_array(
@@ -1766,6 +1843,10 @@ void verify_nax_multi(
     ce.set_bytes(n_elems, c++);
     ce.set_bytes(splits, c++);
     ce.set_bytes(part_stride[i], c++);
+    if (os) {
+      ce.set_bytes(n_rows[i], c++);
+      kq_bind_out_scale(ce, os);
+    }
     MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
     MTL::Size agroup(256, 1, 1);
     ce.dispatch_threads(agrid, agroup);
@@ -1794,12 +1875,13 @@ void qmm_nax_splitk(
     Device& d,
     const Stream& s,
     const std::string& kquant_type,
-    int k_partition) {
+    int k_partition,
+    const KqOutScale& os = {}) {
   const int bm = kq_nax_splitk_bm(M);
   constexpr int bn = 64;
   constexpr int wm = 2, wn = 2;
   const int part_stride = M * N;
-  const KqSplitkPartials pp = kq_splitk_partials(x.dtype());
+  const KqSplitkPartials pp = kq_splitk_partials(x.dtype(), os);
 
   array partials({splits, M, N}, pp.dtype, nullptr, {});
   partials.set_data(mx::allocator::malloc(partials.nbytes()));
@@ -1829,19 +1911,7 @@ void qmm_nax_splitk(
   kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 
-  const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
-  auto accum = kq_get_kernel(d, aname);
-  ce.set_compute_pipeline_state(accum);
-  const int n_elems = M * N;
-  c = 0;
-  ce.set_input_array(partials, c++);
-  ce.set_output_array(out, c++);
-  ce.set_bytes(n_elems, c++);
-  ce.set_bytes(splits, c++);
-  ce.set_bytes(part_stride, c++);
-  MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
-  MTL::Size agroup(256, 1, 1);
-  ce.dispatch_threads(agrid, agroup);
+  kq_splitk_fold(ce, d, partials, out, type_string, pp, splits, M, N, os);
 }
 
 // Vector-times-matrix quantized kernel dispatch (no biases).
@@ -2025,7 +2095,8 @@ void qmv(
     int K,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os = {}) {
   int B = out.size() / M / N;
   int bn = kquant_qmv_bn(kquant_type);
   int bk = 32;
@@ -2034,7 +2105,7 @@ void qmv(
   // threadgroup count for the same N. Recovers occupancy for mid-size decode
   // dispatches where N/bn threadgroups underfill the GPU; loses at
   // embedding-size N (already saturated). Bit-exact vs the default tiling.
-  // Default per codec via kquant_qmv_fine_default_max_n; KQ_QMV_FINE=1
+  // Default per codec via kquant_qmv_fine_default; KQ_QMV_FINE=1
   // forces fine, =0 forces coarse (A/B lever). Read live (KQ_DISABLE_NAX
   // precedent) so one process can interleave coarse/fine for
   // thermally-paired A/Bs; getenv cost is noise per dispatch.
@@ -2043,12 +2114,12 @@ void qmv(
   // The split-K kernel takes M == 1, B == 1 unless KQ_QMV_SPLITK=0 or
   // KQ_QMV_FINE names a per-row tiling. Read live like KQ_QMV_FINE.
   const bool splitk_on = kq_env_int("KQ_QMV_SPLITK", 1) != 0;
-  if (M == 1 && B == 1 && splitk_on && qmv_fine_env == -1 &&
+  if (!os && M == 1 && B == 1 && splitk_on && qmv_fine_env == -1 &&
       qmv_splitk(
           x, w, scales, out, group_size, bits, N, K, d, s, kquant_type)) {
     return;
   }
-  if (M == 1 && B == 1 && qmv_fine_env == -1 &&
+  if (!os && M == 1 && B == 1 && qmv_fine_env == -1 &&
       qmv_c32(x, w, out, N, K, d, s, kquant_type)) {
     return;
   }
@@ -2056,7 +2127,7 @@ void qmv(
   const bool use_fine = fine_ok &&
       (qmv_fine_env == 1 ||
        (qmv_fine_env != 0 && M == 1 &&
-        N <= kquant_qmv_fine_max_n(kquant_type)));
+        kquant_qmv_fine_default(kquant_type, N, K)));
   const int fast_bn = kquant_qmv_fast_bn(kquant_type);
   bool fast = (N % fast_bn == 0) && (K % qmv_fast_k_align() == 0);
   const int rows_per_tg = use_fine ? 2 : (fast ? fast_bn : bn);
@@ -2079,7 +2150,7 @@ void qmv(
       B > 1 ? "_batch_1" : "_batch_0");
 
   kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel_os(d, kname, os);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
 
@@ -2091,6 +2162,7 @@ void qmv(
   ce.set_bytes(K, c++);
   ce.set_bytes(N, c++);
   add_strides_and_shapes(ce, B <= 1, x, w, scales, c);
+  kq_bind_out_scale(ce, os);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -2118,11 +2190,11 @@ void qmv_bias(
   int bk = 32;
 
   // Same fine-tiling policy as qmv() above; M == 1 is the shape contract
-  // here, so only the codec ceiling gates the default.
+  // here, so only the codec's default rule gates it.
   const int qmv_fine_env = kq_env_int("KQ_QMV_FINE", -1);
   const bool use_fine = codec_has_qmv_fine(kquant_type) &&
       (qmv_fine_env == 1 ||
-       (qmv_fine_env != 0 && N <= kquant_qmv_fine_max_n(kquant_type)));
+       (qmv_fine_env != 0 && kquant_qmv_fine_default(kquant_type, N, K)));
   const int rows_per_tg = use_fine ? 2 : bn;
   MTL::Size group_dims(bk, 2, 1);
   MTL::Size grid_dims(1, (N + rows_per_tg - 1) / rows_per_tg, 1);
@@ -2257,7 +2329,8 @@ void verify_mv_ext(
     int K,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os = {}) {
   constexpr int nsg = 2;
   constexpr int nxpsg = 8;
   // Wide-M rows-per-thread experiment (KQ_MV_EXT_NR=2): each thread owns two
@@ -2323,7 +2396,7 @@ void verify_mv_ext(
                                   : (use_hd ? "_hd" : ""))));
 
   kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel_os(d, kname, os);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
 
@@ -2335,6 +2408,7 @@ void verify_mv_ext(
   ce.set_bytes(K, c++); // in_vec_size
   ce.set_bytes(N, c++); // out_vec_size
   ce.set_bytes(M, c++); // vm (== r1ptg)
+  kq_bind_out_scale(ce, os);
   ce.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -2352,8 +2426,9 @@ void dispatch_qmv(
     int K,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
-  qmv(x, w, scales, out, group_size, bits, M, N, K, d, s, kquant_type);
+    const std::string& kquant_type,
+    const KqOutScale& os = {}) {
+  qmv(x, w, scales, out, group_size, bits, M, N, K, d, s, kquant_type, os);
 }
 
 // Every wired codec has an mv_ext kernel: q8_0, the five K-quants, the
@@ -2593,7 +2668,9 @@ static int kq_verify_nax_wave_splits(int sgs, int steps, double partial_c) {
 // and 1.07x at worst, against 1.04x and 1.20x for the simdgroup target, which
 // left the vocab head unsplit at 1.14-1.17x the time of 5 to 10 splits. 640
 // takes N 17408, K 5120 unsplit (1.08x) and 2560 takes N 4096, K 8192 at
-// 32 splits (1.08-1.10x).
+// 32 splits (1.08-1.10x). nvfp4's two-block and four-block kernels keep
+// 1280: on the seven Qwen3.8-27B shapes, the count of the kernel each one
+// runs ran within 1.03x of the best forced count (2 to 5 per shape).
 static double kq_verify_nax_partial_c(const std::string& t, int kstep) {
   if (t == "q4_k" || ((t == "q4_0" || t == "q4_1") && kstep == 256) ||
       t == "iq4_xs" || t == "iq4_nl") {
@@ -2665,19 +2742,22 @@ bool kq_forced_route(
     int K,
     Device& d,
     const Stream& s,
-    const std::string& t) {
+    const std::string& t,
+    const KqOutScale& os = {}) {
   const std::string r(route);
   // x is bound once the route serves the call, as in eval_gpu_base.
   auto x16 = [&] { return kq_x_aligned_gpu(x_in, s, "quantized_matmul x"); };
   const KQuantCodec* codec = codec_by_name(t);
   const int wpb = codec ? codec->weights_per_block : 256;
   if (r == "qmv") {
-    dispatch_qmv(x16(), w, scales, out, group_size, bits, M, N, K, d, s, t);
+    dispatch_qmv(x16(), w, scales, out, group_size, bits, M, N, K, d, s, t, os);
     return true;
   }
   if (r == "verify_qmv") {
-    if (M >= 2 && M <= verify_qmv_max_rows() && N % kquant_qmv_bn(t) == 0 &&
-        K % qmv_fast_k_align() == 0 && codec_has_verify_qmv(t)) {
+    // verify_qmv has no output scale epilogue.
+    if (!os && M >= 2 && M <= verify_qmv_max_rows() &&
+        N % kquant_qmv_bn(t) == 0 && K % qmv_fast_k_align() == 0 &&
+        codec_has_verify_qmv(t)) {
       verify_qmv(x16(), w, scales, out, group_size, bits, M, N, K, d, s, t);
       return true;
     }
@@ -2685,22 +2765,24 @@ bool kq_forced_route(
   }
   if (r == "mv_ext") {
     if (kq_codec_has_mv_ext(t) && M >= 2 && M <= 12 && K % wpb == 0) {
-      verify_mv_ext(x16(), w, scales, out, group_size, bits, M, N, K, d, s, t);
+      verify_mv_ext(
+          x16(), w, scales, out, group_size, bits, M, N, K, d, s, t, os);
       return true;
     }
     return false;
   }
   if (r == "verify_mma") {
     const int rows = codec_verify_mma_rows(t);
-    if (rows > 0 && M <= 8) {
+    if ((!os || kq_verify_mma_has_os(t)) && rows > 0 && M <= 8) {
       const int sp = kq_verify_mma_splits(N, K, group_size, rows);
-      verify_mma(x16(), w, scales, out, group_size, bits, M, N, K, sp, d, s, t);
+      verify_mma(
+          x16(), w, scales, out, group_size, bits, M, N, K, sp, d, s, t, os);
       return true;
     }
     return false;
   }
   if (r == "verify_nax") {
-    const int kstep = kq_verify_nax_call_kstep(K, t);
+    const int kstep = kq_verify_nax_call_kstep(N, K, t);
     if (kq_is_nax_available() && codec_has_nax(t) && M <= 8 &&
         kq_verify_nax_fits(w, K, kstep, t)) {
       const int sp = kq_verify_nax_splits(N, K, kstep, t);
@@ -2718,7 +2800,8 @@ bool kq_forced_route(
           sp,
           d,
           s,
-          t);
+          t,
+          os);
       return true;
     }
     return false;
@@ -2728,7 +2811,8 @@ bool kq_forced_route(
     const int target = (e != nullptr && std::atoi(e) > 1) ? std::atoi(e) : 16;
     const int sp = kq_split_count(target, K / group_size);
     if (kq_splitk_codec(t) && sp > 1) {
-      qmm_splitk(x16(), w, scales, out, group_size, bits, M, N, K, sp, d, s, t);
+      qmm_splitk(
+          x16(), w, scales, out, group_size, bits, M, N, K, sp, d, s, t, os);
       return true;
     }
     return false;
@@ -2737,7 +2821,7 @@ bool kq_forced_route(
       kq_is_nax_available() && codec_has_nax(t) && (K % 64 == 0);
   if (r == "nax") {
     if (nax_ok) {
-      qmm(x16(), w, scales, out, true, group_size, bits, M, N, K, d, s, t);
+      qmm(x16(), w, scales, out, true, group_size, bits, M, N, K, d, s, t, os);
       return true;
     }
     return false;
@@ -2765,7 +2849,8 @@ bool kq_forced_route(
           d,
           s,
           t,
-          per * q);
+          per * q,
+          os);
       return true;
     }
     return false;
@@ -2846,7 +2931,7 @@ bool KQuantMatmul::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMatmul&>(other);
   return kquant_type_ == o.kquant_type_ && group_size_ == o.group_size_ &&
       bits_ == o.bits_ && transpose_ == o.transpose_ &&
-      lora_flags_ == o.lora_flags_;
+      lora_flags_ == o.lora_flags_ && out_scale_mode_ == o.out_scale_mode_;
 }
 
 void KQuantMatmul::eval_cpu(
@@ -2871,11 +2956,19 @@ void KQuantMatmul::eval_cpu(
   encoder.set_output_array(out);
   std::vector<mx::array> lora =
       kq_lora_capture_cpu(inputs, 3, lora_flags_, encoder, stream());
+  // The output scale, when the call has one, is the last input.
+  std::optional<mx::array> os;
+  if (out_scale_mode_ != 0) {
+    os = mx::array::unsafe_weak_copy(inputs.back());
+    encoder.set_input_array(*os);
+  }
   encoder.dispatch([out = mx::array::unsafe_weak_copy(out),
                     x = mx::array::unsafe_weak_copy(x),
                     w = mx::array::unsafe_weak_copy(w),
                     lora = std::move(lora),
                     lora_flags = lora_flags_,
+                    os = std::move(os),
+                    os_mode = out_scale_mode_,
                     transpose_ = transpose_,
                     kquant_type = kquant_type_]() mutable {
     int K = x.shape(-1);
@@ -2902,7 +2995,9 @@ void KQuantMatmul::eval_cpu(
             N,
             K,
             transpose_,
-            kquant_type);
+            kquant_type,
+            os ? os->data<float>() : nullptr,
+            os_mode);
       }
       if (lora_flags & KQ_LORA_PRESENT) {
         kq_lora_epilogue_rows_cpu<T>(
@@ -2934,20 +3029,27 @@ std::vector<mx::array> KQuantMatmul::vjp(
     const std::vector<mx::array>& cotangents,
     const std::vector<int>& argnums,
     const std::vector<mx::array>&) {
-  // primals = {x, w (wire bytes), scales placeholder}. Only the gradient wrt x
-  // is defined: dL/dx = cotan @ dequant(w) with the transpose flipped, i.e. the
-  // same quantized matmul run the other way. The quantized base is frozen (the
-  // LoRA use case), so the weight/scale branches throw.
+  // primals = {x, w (wire bytes), scales placeholder[, out_scale]}. Only the
+  // gradient wrt x is defined: dL/dx = cotan @ dequant(w) with the transpose
+  // flipped, i.e. the same quantized matmul run the other way, on the
+  // cotangent times the output scale. The quantized base is frozen (the LoRA
+  // use case), so the weight/scale branches throw.
   if (lora_flags_ & KQ_LORA_PRESENT) {
     throw std::invalid_argument(
         "[mlx_kquant] quantized_matmul vjp: the LoRA epilogue is "
         "inference-only.");
   }
+  const int os_arg =
+      out_scale_mode_ != 0 ? static_cast<int>(primals.size()) - 1 : -1;
   std::vector<mx::array> vjps;
   for (auto arg : argnums) {
     if (arg == 0) {
-      vjps.push_back(quantized_matmul(
-          cotangents[0],
+      mx::array cot = cotangents[0];
+      if (os_arg >= 0) {
+        cot = kq_out_scaled_cotangent(cot, primals[os_arg], stream());
+      }
+      auto dx = quantized_matmul(
+          cot,
           primals[1],
           primals[2],
           kquant_type_,
@@ -2957,7 +3059,12 @@ std::vector<mx::array> KQuantMatmul::vjp(
           std::nullopt,
           std::nullopt,
           std::nullopt,
-          stream()));
+          std::nullopt,
+          stream());
+      vjps.push_back(mx::astype(dx, primals[0].dtype(), stream()));
+    } else if (arg == os_arg) {
+      throw std::invalid_argument(
+          "[mlx_kquant] quantized_matmul vjp: no gradient wrt out_scale.");
     } else if (arg == 1) {
       throw std::invalid_argument(
           "[mlx_kquant] quantized_matmul vjp: no gradient wrt the quantized "
@@ -3067,18 +3174,26 @@ void KQuantMatmulMulti::eval_gpu(
   const auto& scales = inputs[1];
   const int n = static_cast<int>(outputs.size());
   std::vector<array> ws;
+  std::vector<KqOutScale> oss;
   ws.reserve(n);
   for (int i = 0; i < n; ++i) {
     ws.push_back(kq_matrix_dense_gpu(inputs[2 + i], s));
     kq_check_weight_base(ws.back(), kquant_type_, "quantized_matmul_multi");
+    if (out_scale_mode_ != 0) {
+      oss.push_back({&inputs[2 + n + i], out_scale_mode_});
+    }
   }
   const int K = x.shape(-1);
   const int M = K > 0 ? static_cast<int>(x.size() / K) : 0;
   int n_max = 0;
+  int grid_rows = 0;
   for (const auto& w : ws) {
     n_max = std::max(n_max, w.shape(0));
+    grid_rows += (w.shape(0) + 127) / 128 * 128;
   }
-  const int kstep = kq_verify_nax_call_kstep(K, kquant_type_);
+  // verify_nax_multi picks each dispatch's kstep from its own grid. Where
+  // that can differ from this one (K a multiple of 256) both fit alike.
+  const int kstep = kq_verify_nax_call_kstep(grid_rows, K, kquant_type_);
   const int force_min_m = kq_force_qmm_min_m();
   bool multi = n_max > 0 && kstep > 0 && x.flags().row_contiguous &&
       x.dtype() != mx::float32 && !kq_qmm_route_forced() &&
@@ -3094,10 +3209,15 @@ void KQuantMatmulMulti::eval_gpu(
   if (!multi) {
     // x is bound once, so that each per-weight call reads it in place.
     const array x16 = kq_x_aligned_gpu(x, s, "quantized_matmul_multi x");
-    KQuantMatmul one(s, kquant_type_, group_size_, bits_, true);
+    KQuantMatmul one(
+        s, kquant_type_, group_size_, bits_, true, 0, out_scale_mode_);
     for (int i = 0; i < n; ++i) {
       std::vector<array> o{outputs[i]};
-      one.eval_gpu({x16, ws[i], scales}, o);
+      std::vector<array> in{x16, ws[i], scales};
+      if (out_scale_mode_ != 0) {
+        in.push_back(inputs[2 + n + i]);
+      }
+      one.eval_gpu(in, o);
     }
     return;
   }
@@ -3106,6 +3226,14 @@ void KQuantMatmulMulti::eval_gpu(
   const array xv = kq_x_aligned_gpu(x, s, "quantized_matmul_multi x", 8);
   std::vector<array> gw;
   std::vector<array> go;
+  std::vector<KqOutScale> gs;
+  auto run = [&]() {
+    verify_nax_multi(
+        xv, gw, go, group_size_, bits_, M, K, d, s, kquant_type_, gs);
+    gw.clear();
+    go.clear();
+    gs.clear();
+  };
   for (int i = 0; i < n; ++i) {
     outputs[i].set_data(mx::allocator::malloc(outputs[i].nbytes()));
     if (outputs[i].size() == 0) {
@@ -3113,16 +3241,15 @@ void KQuantMatmulMulti::eval_gpu(
     }
     gw.push_back(ws[i]);
     go.push_back(outputs[i]);
+    if (!oss.empty()) {
+      gs.push_back(oss[i]);
+    }
     if (gw.size() == 4 || i == n - 1) {
-      verify_nax_multi(
-          xv, gw, go, group_size_, bits_, M, K, kstep, d, s, kquant_type_);
-      gw.clear();
-      go.clear();
+      run();
     }
   }
   if (!gw.empty()) {
-    verify_nax_multi(
-        xv, gw, go, group_size_, bits_, M, K, kstep, d, s, kquant_type_);
+    run();
   }
 }
 
@@ -3166,6 +3293,11 @@ void KQuantMatmul::eval_gpu_base(
   };
   const auto& w = inputs[1];
   const auto& scales = inputs[2];
+  // The output scale, when the call has one, is the last input.
+  KqOutScale os;
+  if (out_scale_mode_ != 0) {
+    os = {&inputs.back(), out_scale_mode_};
+  }
   kq_check_weight_base(w, kquant_type_, "quantized_matmul");
   out.set_data(mx::allocator::malloc(out.nbytes()));
   if (out.size() == 0) {
@@ -3218,7 +3350,8 @@ void KQuantMatmul::eval_gpu_base(
         K,
         d,
         s,
-        kquant_type_);
+        kquant_type_,
+        os);
     return;
   }
 
@@ -3246,7 +3379,8 @@ void KQuantMatmul::eval_gpu_base(
               K,
               d,
               s,
-              kquant_type_)) {
+              kquant_type_,
+              os)) {
         return;
       }
       const char* strict_e = std::getenv("KQ_QMM_ROUTE_STRICT");
@@ -3276,12 +3410,14 @@ void KQuantMatmul::eval_gpu_base(
           K,
           d,
           s,
-          kquant_type_);
+          kquant_type_,
+          os);
       return;
     }
-    const int kstep = kq_verify_nax_call_kstep(K, kquant_type_);
-    if (route == KqSmallMRoute::verify_nax &&
-        kq_verify_nax_fits(w, K, kstep, kquant_type_)) {
+    const int kstep = route == KqSmallMRoute::verify_nax
+        ? kq_verify_nax_call_kstep(N, K, kquant_type_)
+        : 0;
+    if (kq_verify_nax_fits(w, K, kstep, kquant_type_)) {
       const int sp = kq_verify_nax_splits(N, K, kstep, kquant_type_);
       verify_nax(
           bind_x(8),
@@ -3297,7 +3433,8 @@ void KQuantMatmul::eval_gpu_base(
           sp,
           d,
           s,
-          kquant_type_);
+          kquant_type_,
+          os);
       return;
     }
   }
@@ -3320,8 +3457,11 @@ void KQuantMatmul::eval_gpu_base(
         ? kq_verify_mma_min_m_nax(kquant_type_)
         : kq_verify_mma_min_m(kquant_type_, x.dtype() == mx::float16);
   }
-  const bool vmma_route = vmma_rows > 0 && vmma_min_m > 0 && M >= vmma_min_m &&
-      M <= 8 && transpose_ && non_batched && x.dtype() != mx::float32;
+  // verify_mma takes the output scale on the codecs of
+  // kq_verify_mma_has_os.
+  const bool vmma_route = (!os || kq_verify_mma_has_os(kquant_type_)) &&
+      vmma_rows > 0 && vmma_min_m > 0 && M >= vmma_min_m && M <= 8 &&
+      transpose_ && non_batched && x.dtype() != mx::float32;
 
   // NAX split-K, entering at kq_splitk_nax_min_m through M32; see
   // qmm_nax_splitk. Slice unit max(block, BK) keeps every slice starting
@@ -3372,7 +3512,8 @@ void KQuantMatmul::eval_gpu_base(
           d,
           s,
           kquant_type_,
-          per * q);
+          per * q,
+          os);
       return;
     }
   }
@@ -3380,7 +3521,20 @@ void KQuantMatmul::eval_gpu_base(
   if (vmma_route) {
     const int sp = kq_verify_mma_splits(N, K, group_size_, vmma_rows);
     verify_mma(
-        x, w, scales, out, group_size_, bits_, M, N, K, sp, d, s, kquant_type_);
+        x,
+        w,
+        scales,
+        out,
+        group_size_,
+        bits_,
+        M,
+        N,
+        K,
+        sp,
+        d,
+        s,
+        kquant_type_,
+        os);
     return;
   }
 
@@ -3422,7 +3576,8 @@ void KQuantMatmul::eval_gpu_base(
           sp,
           d,
           s,
-          kquant_type_);
+          kquant_type_,
+          os);
       return;
     }
   }
@@ -3450,7 +3605,8 @@ void KQuantMatmul::eval_gpu_base(
         K,
         d,
         s,
-        kquant_type_);
+        kquant_type_,
+        os);
     return;
   }
 
@@ -3479,7 +3635,8 @@ void KQuantMatmul::eval_gpu_base(
             sp,
             d,
             s,
-            kquant_type_);
+            kquant_type_,
+            os);
         return;
       }
     }
@@ -3521,7 +3678,8 @@ void KQuantMatmul::eval_gpu_base(
             d,
             s,
             kquant_type_,
-            per * q);
+            per * q,
+            os);
         return;
       }
     }
@@ -3545,7 +3703,8 @@ void KQuantMatmul::eval_gpu_base(
           K,
           d,
           s,
-          kquant_type_);
+          kquant_type_,
+          os);
       return;
     }
   }
@@ -3596,7 +3755,19 @@ void KQuantMatmul::eval_gpu_base(
         (verify_ext == 1 ||
          (verify_ext != 0 && mv_ext_default_on && mv_ext_width_ok))) {
       verify_mv_ext(
-          x, w, scales, out, group_size_, bits_, M, N, K, d, s, kquant_type_);
+          x,
+          w,
+          scales,
+          out,
+          group_size_,
+          bits_,
+          M,
+          N,
+          K,
+          d,
+          s,
+          kquant_type_,
+          os);
       return;
     }
     // Verify / small-batch regime: amortize the weight read across the M rows
@@ -3608,7 +3779,7 @@ void KQuantMatmul::eval_gpu_base(
       return e != nullptr && e[0] == '1';
     }();
     int bn = kquant_qmv_bn(kquant_type_);
-    bool verify_ok = !verify_disabled && non_batched && M >= 2 &&
+    bool verify_ok = !os && !verify_disabled && non_batched && M >= 2 &&
         M <= verify_qmv_max_rows() && (N % bn == 0) &&
         (K % qmv_fast_k_align() == 0) && codec_has_verify_qmv(kquant_type_);
     if (verify_ok) {
@@ -3617,7 +3788,7 @@ void KQuantMatmul::eval_gpu_base(
       return;
     }
     dispatch_qmv(
-        x, w, scales, out, group_size_, bits_, M, N, K, d, s, kquant_type_);
+        x, w, scales, out, group_size_, bits_, M, N, K, d, s, kquant_type_, os);
     return;
   }
 
@@ -3803,12 +3974,15 @@ std::vector<std::string> split_kernel_names() {
       tiles.insert({tile.bm, tile.bn});
       nax_bms.insert(kq_nax_splitk_bm(M));
     }
-    // K of whole codec steps, and a multiple of 256 steps, which covers
-    // every step kq_verify_nax_call_kstep picks.
+    // K of whole codec steps, and a multiple of 256 steps on a small and
+    // a vocab-head grid, which covers every step kq_verify_nax_call_kstep
+    // picks.
     const int kstep = codec_verify_nax_kstep(t);
     std::set<int> ksteps;
     for (int K : {kstep, 256 * kstep}) {
-      ksteps.insert(kq_verify_nax_call_kstep(K, t));
+      for (int N : {128, 262144}) {
+        ksteps.insert(kq_verify_nax_call_kstep(N, K, t));
+      }
     }
     for (mx::Dtype dt : {mx::bfloat16, mx::float16}) {
       const std::string ts = kq_type_string(dt);

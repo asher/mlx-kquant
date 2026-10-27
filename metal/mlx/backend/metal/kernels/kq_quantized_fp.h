@@ -8,9 +8,9 @@
 // MXFP8: 33 bytes/32 weights. [uint8 E8M0 e][uint8 E4M3 qs[32]],
 //   w[j] = e4m3(qs[j]) * 2^(e - 127). Gather-only: dequantize kernels only.
 //
-// Real-value E2M1 LUT + full scales (the Metal convention; the CPU kernels
-// use ggml's doubled-int8 LUT + half scales - same products, never mixed
-// within one kernel).
+// Real-value E2M1 codes + full scales (the Metal convention; the CPU
+// kernels use ggml's doubled-int8 LUT + half scales - same products, never
+// mixed within one kernel).
 
 MLX_MTL_CONST int KQ_MXFP4_GROUP = 32;
 MLX_MTL_CONST int KQ_MXFP4_BLOCK_BYTES = 17;
@@ -24,23 +24,24 @@ MLX_MTL_CONST int KQ_MXFP8_GROUP = 32;
 MLX_MTL_CONST int KQ_MXFP8_BLOCK_BYTES = 33;
 MLX_MTL_CONST int KQ_MXFP8_QS_OFFSET = 1;
 
-constant float kq_fp_e2m1_lut[16] = {
-    0.0f,
-    0.5f,
-    1.0f,
-    1.5f,
-    2.0f,
-    3.0f,
-    4.0f,
-    6.0f,
-    -0.0f,
-    -0.5f,
-    -1.0f,
-    -1.5f,
-    -2.0f,
-    -3.0f,
-    -4.0f,
-    -6.0f};
+// E2M1 code c = s e1 e0 m to its value without a table, as verify_nax
+// builds it: e1 e0 m in half bits 11..9 is the value times 2^-14 (a half
+// subnormal for e = 0), the sign goes to bit 15, and the product with 2^14
+// is exact in half. Code 8 is -0.0 like the table it replaces.
+inline float kq_fp_e2m1_value(uint c) {
+  const half h = as_type<half>(ushort(((c & 7u) << 9) | ((c & 8u) << 12)));
+  return float(h * 16384.0h);
+}
+
+// Two E2M1 codes, at bits 0..3 and 16..19 of n, to their values through one
+// half2. The masks select the two codes, so callers pass a word holding a
+// byte at bits 0..7 and one at 16..23, shifted right by 4 for the high
+// nibbles.
+inline float2 kq_fp_e2m1_pair(uint n) {
+  const half2 h =
+      as_type<half2>(((n & 0x00070007u) << 9) | ((n & 0x00080008u) << 12));
+  return float2(h * half2(16384.0h));
+}
 
 // 2^(e-127) built from bits: metal::exp2 is fast-math and lands ulps off on
 // some compiler versions. e == 0 is the f32 subnormal 2^-127.
@@ -50,20 +51,24 @@ inline float kq_fp_e8m0_scale(uint8_t e) {
 
 // Unsigned E4M3 (bias 7); 0x00 and 0x7F (the NaN encoding) decode to 0.
 // Normals assembled from bits (biased f32 exponent e + 120, mantissa m << 20)
-// for the same fast-math reason; the subnormal product is exact as written.
+// because metal::exp2 is fast-math; the subnormal product is exact as
+// written. Two selects, no branch: e == 0 picks the subnormal (0 for v == 0),
+// then the NaN code is zeroed. Bit 7 is ignored, so 0xFF decodes like 0x7F
+// would without the NaN rule, as ggml does. S returns the scale times 2^S
+// at the same cost.
+template <int S = 0>
 inline float kq_fp_ue4m3_scale(uint8_t v) {
-  if (v == 0 || v == 0x7F) {
-    return 0.0f;
-  }
   const uint e = (v >> 3) & 0xF;
   const uint m = v & 0x7;
-  return e == 0 ? float(m) * 0.001953125f /* 2^-9 */
-                : as_type<float>((e + 120u) << 23 | m << 20);
+  const float norm = as_type<float>((e + 120u + S) << 23 | m << 20);
+  const float sub = float(m) * (0.001953125f * float(1 << S)); /* 2^(S-9) */
+  const float r = e ? norm : sub;
+  return (v == 0x7F) ? 0.0f : r;
 }
 
 // ---------------------------------------------------------------------------
 // MXFP4 (structure cloned from IQ4_NL: same two-halves 16-byte qs, the fp16
-// scale replaced by the E8M0 byte and the int LUT by the E2M1 float LUT)
+// scale replaced by the E8M0 byte and the int LUT by the E2M1 decode)
 // ---------------------------------------------------------------------------
 
 template <typename T>
@@ -83,7 +88,7 @@ METAL_FUNC void kq_mxfp4_dequantize_impl(
   const device uint8_t* qs = block_addr + KQ_MXFP4_QS_OFFSET;
   const int nib =
       (within < 16) ? (int(qs[within]) & 0x0F) : (int(qs[within - 16]) >> 4);
-  out[gid] = T(d * kq_fp_e2m1_lut[nib]);
+  out[gid] = T(d * kq_fp_e2m1_value(uint(nib)));
 }
 
 template <typename T, int group_size, int bits>
@@ -107,9 +112,11 @@ METAL_FUNC void kq_mxfp4_deq_chunk16(
   const device uint8_t* qs = block + KQ_MXFP4_QS_OFFSET;
   const int shift = (il & 1) ? 4 : 0;
 #pragma unroll
-  for (int i = 0; i < 16; ++i) {
-    const int nib = (int(qs[i]) >> shift) & 0x0F;
-    reg[i / 4][i % 4] = d * kq_fp_e2m1_lut[nib];
+  for (int i = 0; i < 16; i += 2) {
+    const float2 v =
+        kq_fp_e2m1_pair((uint(qs[i]) | (uint(qs[i + 1]) << 16)) >> shift);
+    reg[i / 4][i % 4] = d * v.x;
+    reg[i / 4][i % 4 + 1] = d * v.y;
   }
 }
 
@@ -185,26 +192,20 @@ METAL_FUNC void kq_mxfp4_qmv_impl(
           ib * KQ_MXFP4_BLOCK_BYTES;
       const U d = U(kq_fp_e8m0_scale(blk[0]));
       const device uint8_t* q = blk + KQ_MXFP4_QS_OFFSET + 8 * it;
-      float4 acc = yl0 *
-          float4(kq_fp_e2m1_lut[q[0] & 0x0F],
-                 kq_fp_e2m1_lut[q[1] & 0x0F],
-                 kq_fp_e2m1_lut[q[2] & 0x0F],
-                 kq_fp_e2m1_lut[q[3] & 0x0F]);
-      acc += yl1 *
-          float4(kq_fp_e2m1_lut[q[0] >> 4],
-                 kq_fp_e2m1_lut[q[1] >> 4],
-                 kq_fp_e2m1_lut[q[2] >> 4],
-                 kq_fp_e2m1_lut[q[3] >> 4]);
-      acc += yl2 *
-          float4(kq_fp_e2m1_lut[q[4] & 0x0F],
-                 kq_fp_e2m1_lut[q[5] & 0x0F],
-                 kq_fp_e2m1_lut[q[6] & 0x0F],
-                 kq_fp_e2m1_lut[q[7] & 0x0F]);
-      acc += yl3 *
-          float4(kq_fp_e2m1_lut[q[4] >> 4],
-                 kq_fp_e2m1_lut[q[5] >> 4],
-                 kq_fp_e2m1_lut[q[6] >> 4],
-                 kq_fp_e2m1_lut[q[7] >> 4]);
+      const uint w02 = uint(q[0]) | (uint(q[2]) << 16);
+      const uint w13 = uint(q[1]) | (uint(q[3]) << 16);
+      const uint w46 = uint(q[4]) | (uint(q[6]) << 16);
+      const uint w57 = uint(q[5]) | (uint(q[7]) << 16);
+      const float2 l02 = kq_fp_e2m1_pair(w02), l13 = kq_fp_e2m1_pair(w13);
+      const float2 h02 = kq_fp_e2m1_pair(w02 >> 4);
+      const float2 h13 = kq_fp_e2m1_pair(w13 >> 4);
+      const float2 l46 = kq_fp_e2m1_pair(w46), l57 = kq_fp_e2m1_pair(w57);
+      const float2 h46 = kq_fp_e2m1_pair(w46 >> 4);
+      const float2 h57 = kq_fp_e2m1_pair(w57 >> 4);
+      float4 acc = yl0 * float4(l02.x, l13.x, l02.y, l13.y);
+      acc += yl1 * float4(h02.x, h13.x, h02.y, h13.y);
+      acc += yl2 * float4(l46.x, l57.x, l46.y, l57.y);
+      acc += yl3 * float4(h46.x, h57.x, h46.y, h57.y);
       result[row] += d * ((acc.x + acc.y) + (acc.z + acc.w));
     }
   }
@@ -249,6 +250,7 @@ struct KqMxfp4BlockLoader {
   MLX_MTL_CONST short bytes_per_thread = n_reads / 2;
   MLX_MTL_CONST short half_block = weights_per_block / 2;
   static_assert(n_reads >= 2 && n_reads % 2 == 0, "MXFP4 needs even n_reads.");
+  static_assert(n_reads % 4 == 0, "MXFP4 decodes byte pairs.");
 
   const int src_ld;
   const int row_bytes;
@@ -282,10 +284,14 @@ struct KqMxfp4BlockLoader {
     const float d = kq_fp_e8m0_scale(src[0]);
     const device uint8_t* qs = src + KQ_MXFP4_QS_OFFSET + bj_byte;
 #pragma unroll
-    for (short i = 0; i < bytes_per_thread; i++) {
-      const uint8_t b = qs[i];
-      dst[i] = T(d * kq_fp_e2m1_lut[b & 0x0F]);
-      dst[half_block + i] = T(d * kq_fp_e2m1_lut[b >> 4]);
+    for (short i = 0; i + 1 < bytes_per_thread; i += 2) {
+      const uint w = uint(qs[i]) | (uint(qs[i + 1]) << 16);
+      const float2 lo = kq_fp_e2m1_pair(w);
+      const float2 hi = kq_fp_e2m1_pair(w >> 4);
+      dst[i] = T(d * lo.x);
+      dst[i + 1] = T(d * lo.y);
+      dst[half_block + i] = T(d * hi.x);
+      dst[half_block + i + 1] = T(d * hi.y);
     }
   }
 
@@ -608,7 +614,7 @@ METAL_FUNC void kq_nvfp4_dequantize_impl(
   const float d = kq_fp_ue4m3_scale(block_addr[g]);
   const uint8_t b = block_addr[KQ_NVFP4_QS_OFFSET + 8 * g + (j % 8)];
   const int nib = (j < 8) ? (b & 0x0F) : (b >> 4);
-  out[gid] = T(d * kq_fp_e2m1_lut[nib]);
+  out[gid] = T(d * kq_fp_e2m1_value(uint(nib)));
 }
 
 template <typename T, int group_size, int bits>
@@ -631,13 +637,12 @@ METAL_FUNC uint2 kq_nvfp4_group_qs(const device uint8_t* block, int g) {
   return uint2(q[0], q[1]);
 }
 
-// E2M1 values of nibble `shift` (0 low, 4 high) of each byte of `q`.
+// E2M1 values of nibble `shift` (0 low, 4 high) of each byte of `q`: bytes
+// 0 and 2 through one half2, 1 and 3 through the other.
 METAL_FUNC float4 kq_nvfp4_nibbles4(uint32_t q, uint shift) {
-  return float4(
-      kq_fp_e2m1_lut[(q >> shift) & 0x0F],
-      kq_fp_e2m1_lut[(q >> (8 + shift)) & 0x0F],
-      kq_fp_e2m1_lut[(q >> (16 + shift)) & 0x0F],
-      kq_fp_e2m1_lut[(q >> (24 + shift)) & 0x0F]);
+  const float2 a = kq_fp_e2m1_pair(q >> shift);
+  const float2 b = kq_fp_e2m1_pair(q >> (8 + shift));
+  return float4(a.x, b.x, a.y, b.y);
 }
 
 // Natural-order chunk [il*16, il*16+16) == sub-scale group il; il in [0,4).
@@ -662,6 +667,64 @@ struct KqNvfp4Ext {
   }
 };
 
+// NVFP4 codes to half, four at a time. kq_nvfp4_nibs keeps the low
+// nibble of each byte of w, or the high one, with its sign moved to bit 6
+// and e1 e0 m left in bits 0..2. kq_nvfp4_pair moves bytes 0 and 2, or 1
+// and 3, to half bits 15 and 11..9, which is the E2M1 value times 2^-14.
+// Times a UE4M3 scale times 2^7 (61440 at most) the value stays exact in
+// half, at 2^-7 of the weight.
+METAL_FUNC uint kq_nvfp4_nibs(uint w, bool hi) {
+  return hi ? (((w >> 4) & 0x07070707u) | ((w >> 1) & 0x40404040u))
+            : ((w & 0x07070707u) | ((w << 3) & 0x40404040u));
+}
+METAL_FUNC half2 kq_nvfp4_pair(uint l, bool odd) {
+  return as_type<half2>(
+      odd ? ((l & 0xFF00FF00u) << 1) : ((l & 0x00FF00FFu) << 9));
+}
+
+// Register-resident MMA verify (kq_verify_mma.h). Lane pair L owns
+// 16-weight group L: its scale byte and qs bytes 8L..8L+7 as two words.
+// Fragment f takes word (f >> 1) & 1, its low nibbles for f < 4 and its
+// high ones after, and pair f & 1 of kq_nvfp4_pair: weights 4 (f >> 1) +
+// (f & 1) and that plus 2 of the group, times the group scale times 2^7.
+// Each weight is exact in half at 2^-7 of its value, and out_mul restores
+// the factor at the store.
+struct KqNvfp4Mma {
+  static constant constexpr int block_k = KQ_NVFP4_SUPERBLOCK;
+  static constant constexpr int block_bytes = KQ_NVFP4_BLOCK_BYTES;
+  static constant constexpr bool codes_scaled = true;
+  static constant constexpr float out_mul = 128.0f;
+  static METAL_FUNC int perm(int f, int col) {
+    return 16 * (col / 2) + 4 * (f >> 1) + (f & 1) + 2 * (col & 1);
+  }
+  template <int NT, typename X, typename A>
+  static METAL_FUNC void block(
+      thread const KqVmmaRows<NT>& rows,
+      int boff,
+      short L,
+      short fm,
+      const threadgroup X* xb,
+      thread simdgroup_matrix<A, 8, 8> (&acc)[NT]) {
+    uint2 q[NT];
+    half d[NT];
+    for (short t = 0; t < NT; ++t) {
+      const device uint8_t* bp = rows.p[t] + boff;
+      d[t] = half(kq_fp_ue4m3_scale<7>(bp[L]));
+      q[t] = kq_nvfp4_group_qs(bp, L);
+    }
+    for (short f = 0; f < 8; ++f) {
+      half2 a[NT];
+      for (short t = 0; t < NT; ++t) {
+        const uint wv = (f & 2) ? q[t].y : q[t].x;
+        a[t] = kq_nvfp4_pair(kq_nvfp4_nibs(wv, f >= 4), f & 1) * d[t];
+      }
+      kq_vmma_step<NT>(xb + 8 * perm(f, fm), a, acc);
+    }
+  }
+};
+
+KQ_DEFINE_VERIFY_MMA_KERNEL_OS(nvfp4, KqNvfp4Mma, 2, 1)
+
 template <typename T, short r1ptg, short nsg, short nxpsg>
 [[kernel]] void kq_nvfp4_mv_ext(
     const device uint8_t* w,
@@ -673,15 +736,22 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
     const constant int& /* vm */, // == r1ptg
     uint3 tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
-    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-  kq_mv_ext_impl<T, KqNvfp4Ext, r1ptg, nsg, nxpsg>(
-      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    KQ_OUT_SCALE_ARG) {
+  kq_mv_ext_impl<T, KqNvfp4Ext, r1ptg, nsg, nxpsg, true>(
+      w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg, out_scale);
 }
 
 // NVFP4 mat-vec on the MXFP4 lane layout: lane `simd_lid` owns sub-scale
 // group simd_lid % 4 of superblock simd_lid / 4, 8 superblocks per pass; x is
 // read once into four float4 and reused across the unrolled rows.
-template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
+// kOutScale entries take the output scale (kq_out_scale.h).
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int results_per_simdgroup = 4,
+    bool kOutScale = false>
 METAL_FUNC void kq_nvfp4_qmv_impl(
     const device uint8_t* w,
     const device T* x,
@@ -690,7 +760,8 @@ METAL_FUNC void kq_nvfp4_qmv_impl(
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    const device float* out_scale = nullptr) {
   static_assert(group_size == KQ_NVFP4_SUPERBLOCK, "NVFP4 requires gs=64");
   static_assert(bits == 4, "NVFP4 requires bits=4");
   constexpr int num_simdgroups = 2;
@@ -735,12 +806,22 @@ METAL_FUNC void kq_nvfp4_qmv_impl(
   for (int row = 0; row < results_per_simdgroup; row++) {
     U r = simd_sum(result[row]);
     if (simd_lid == 0 && row < active_rows) {
+      if constexpr (kOutScale) {
+        if (kq_has_out_scale) {
+          r *= kq_out_scale_col(out_scale, out_row + row);
+        }
+      }
       y[out_row + row] = static_cast<T>(r);
     }
   }
 }
 
-template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int results_per_simdgroup = 4,
+    bool kOutScale = false>
 METAL_FUNC void kq_nvfp4_qmv_fast_impl(
     const device uint8_t* w,
     const device T* x,
@@ -749,9 +830,10 @@ METAL_FUNC void kq_nvfp4_qmv_fast_impl(
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
-  kq_nvfp4_qmv_impl<T, group_size, bits, results_per_simdgroup>(
-      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    uint simd_lid,
+    const device float* out_scale = nullptr) {
+  kq_nvfp4_qmv_impl<T, group_size, bits, results_per_simdgroup, kOutScale>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, out_scale);
 }
 
 // Sub-block loader (q4_k pattern): BCOLS==32 K-tiles walk the two 32-weight
@@ -842,7 +924,7 @@ struct KqNvfp4BlockLoader {
         const float d = kq_fp_ue4m3_scale(src[g]);
         const uint8_t b = src[KQ_NVFP4_QS_OFFSET + 8 * g + (j % 8)];
         const int nib = (j < 8) ? (b & 0x0F) : (b >> 4);
-        dst[i] = T(d * kq_fp_e2m1_lut[nib]);
+        dst[i] = T(d * kq_fp_e2m1_value(uint(nib)));
       }
     }
   }
@@ -899,7 +981,8 @@ template <
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    KQ_OUT_SCALE_ARG) {
   if constexpr (batched) {
     kq_adjust_matrix_offsets<T>(
         x,
@@ -922,8 +1005,8 @@ template <
   threadgroup T Ws[BN * BK_padded];
   using LoaderW =
       KqNvfp4BlockLoader<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
-  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN>(
-      w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
+  kq_qmm_t_impl<T, LoaderW, aligned_N, BM, BK, BN, WM, WN, T, true>(
+      w, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid, out_scale);
 }
 
 template <
@@ -1042,7 +1125,8 @@ template <typename T, int group_size, int bits, bool batched>
     const constant int64_t* /* s_strides */,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    KQ_OUT_SCALE_ARG) {
   if constexpr (batched) {
     int batch_M = x_shape[x_batch_ndims];
     kq_adjust_matrix_offsets<T>(
@@ -1058,8 +1142,8 @@ template <typename T, int group_size, int bits, bool batched>
         w_strides,
         tid);
   }
-  kq_nvfp4_qmv_fast_impl<T, group_size, bits>(
-      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+  kq_nvfp4_qmv_fast_impl<T, group_size, bits, 4, true>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, out_scale);
 }
 
 // Finer-tiled qmv_fast (see kq_mxfp4_qmv_fast_fine): 2 output rows per
@@ -1081,9 +1165,10 @@ template <typename T, int group_size, int bits, bool batched>
     const constant int64_t* /* s_strides */,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  kq_nvfp4_qmv_fast_impl<T, group_size, bits, 1>(
-      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    uint simd_lid [[thread_index_in_simdgroup]],
+    KQ_OUT_SCALE_ARG) {
+  kq_nvfp4_qmv_fast_impl<T, group_size, bits, 1, true>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, out_scale);
 }
 
 template <typename T, int group_size, int bits, bool batched>
@@ -1103,7 +1188,8 @@ template <typename T, int group_size, int bits, bool batched>
     const constant int64_t* /* s_strides */,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    KQ_OUT_SCALE_ARG) {
   if constexpr (batched) {
     int batch_M = x_shape[x_batch_ndims];
     kq_adjust_matrix_offsets<T>(
@@ -1119,8 +1205,8 @@ template <typename T, int group_size, int bits, bool batched>
         w_strides,
         tid);
   }
-  kq_nvfp4_qmv_impl<T, group_size, bits>(
-      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+  kq_nvfp4_qmv_impl<T, group_size, bits, 4, true>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, out_scale);
 }
 
 // Finer-tiled qmv (see kq_nvfp4_qmv_fast_fine): 2 output rows per threadgroup.
@@ -1141,9 +1227,10 @@ template <typename T, int group_size, int bits, bool batched>
     const constant int64_t* /* s_strides */,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  kq_nvfp4_qmv_impl<T, group_size, bits, 1>(
-      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    uint simd_lid [[thread_index_in_simdgroup]],
+    KQ_OUT_SCALE_ARG) {
+  kq_nvfp4_qmv_impl<T, group_size, bits, 1, true>(
+      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid, out_scale);
 }
 
 // ---------------------------------------------------------------------------

@@ -139,6 +139,9 @@ mx::array dequantize(
 // Stacked adapters: lora_a [S, K, r] and lora_b [S, r, N] with lora_ids
 // uint32 [rows], the stack entry of each row, remapped through lora_table
 // (1-D, entries < 0 skip the row) when given.
+// Optional out_scale (float32, [1] or [N], nvfp4 with transpose=true only):
+// the product is out_scale * (x @ dequant(w)^T), scaled in the kernel
+// before its one store and before the LoRA delta is added.
 mx::array quantized_matmul(
     mx::array x,
     mx::array w,
@@ -150,6 +153,7 @@ mx::array quantized_matmul(
     const std::optional<mx::array>& lora_rows = std::nullopt,
     const std::optional<mx::array>& lora_ids = std::nullopt,
     const std::optional<mx::array>& lora_table = std::nullopt,
+    const std::optional<mx::array>& out_scale = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // Bias-fused quantized matmul: x (float) @ dequant(w) + bias, fusing the add
@@ -180,7 +184,10 @@ mx::array quantized_matmul_qmv_bias(
 // `scales` a vestigial placeholder (see dequantize). Either index defaults to a
 // plain arange when omitted. `sorted_indices` enables an optimized path when
 // the (defaulted) indices are sorted. Output dtype follows quantized_matmul.
-// group_size/bits are derived from `kquant_type`.
+// group_size/bits are derived from `kquant_type`. out_scale (nvfp4,
+// transpose only) is float32 (1,), (N,), (E, 1) or (E, N) for E weight
+// matrices: the result of an entry on matrix e is its product times
+// out_scale, at row e for the last two shapes.
 mx::array gather_qmm(
     mx::array x,
     mx::array w,
@@ -190,6 +197,7 @@ mx::array gather_qmm(
     std::optional<mx::array> rhs_indices = std::nullopt,
     bool transpose = true,
     bool sorted_indices = false,
+    std::optional<mx::array> out_scale = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // Build the gather_qmm_seg tile map from expert-sorted routing indices, on
@@ -218,7 +226,8 @@ std::vector<mx::array> expert_tile_map(
 // every row exactly once). Output dtype follows quantized_matmul. With
 // x_rows (1-D integers, one per sorted row), x is the unsorted rows and
 // sorted row r is x[x_rows[r]]; the NAX kernel reads them in place, and on
-// any other path the op gathers them first. Metal-only.
+// any other path the op gathers them first. out_scale as gather_qmm's,
+// with the tile's expert. Metal-only.
 mx::array gather_qmm_seg(
     mx::array x,
     mx::array w,
@@ -228,6 +237,7 @@ mx::array gather_qmm_seg(
     mx::array counts,
     int tile_rows = 64,
     std::optional<mx::array> x_rows = std::nullopt,
+    std::optional<mx::array> out_scale = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // gather_qmm_seg tile height for `rows` expert-sorted rows over n_experts
@@ -642,6 +652,9 @@ mx::array gather_qmv_mix_bias(
 // accepted only with act "swiglu_clamp". x [T, K], indices [T, R]. Returns
 // [T, R, N]. Metal-only; requires K % 256 == 0 and a codec with the fused
 // kernel wired (full GGUF matrix).
+// Optional nvfp4 output scales gate_scale and up_scale, given together with
+// one shape: float32 (1,), (N,), (E, 1) or (E, N). Each multiplies its
+// projection's float32 sum before the biases and the activation.
 mx::array moe_glu_gather_kq(
     mx::array x,
     mx::array gate_w,
@@ -653,6 +666,8 @@ mx::array moe_glu_gather_kq(
     const std::optional<mx::array>& gate_bias = std::nullopt,
     const std::optional<mx::array>& up_bias = std::nullopt,
     float alpha = 0.0f,
+    const std::optional<mx::array>& gate_scale = std::nullopt,
+    const std::optional<mx::array>& up_scale = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // True when the codec has the fused MoE GLU/gather kernel family above.
@@ -890,6 +905,8 @@ mx::array kvarn_dequant(
 // lora_ids [T, R] the adapter's expert per row, default `indices`;
 // lora_table 1-D slot -> expert remap, entries < 0 skip the row; lora_rows
 // f32 [T, R] per-row scale) added on the gathered output, zero extra ops.
+// Optional nvfp4 out_scale, float32 (1,), (N,), (E, 1) or (E, N), multiplies
+// the float32 sum before the bias; the LoRA delta is not scaled.
 mx::array gather_qmv_kq(
     mx::array x,
     mx::array w,
@@ -901,6 +918,7 @@ mx::array gather_qmv_kq(
     const std::optional<mx::array>& lora_ids = std::nullopt,
     const std::optional<mx::array>& lora_table = std::nullopt,
     const std::optional<mx::array>& lora_rows = std::nullopt,
+    const std::optional<mx::array>& out_scale = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // moe_glu_gather_kq with the block's shared expert folded in as k extra
@@ -912,6 +930,9 @@ mx::array gather_qmv_kq(
 // "silu_limit" (deepseek-v4 LimitedSwiGLU) needs limit > 0 and clamps the
 // routed and the shared slots alike.
 // Returns [T, R + k, N]; the last k slots are the shared expert.
+// Optional nvfp4 output scales: gate_scale and up_scale for the expert
+// stacks as in moe_glu_gather_kq, and shexp_gate_scale and shexp_up_scale,
+// float32 (1,), for an nvfp4 shared expert. Each pair goes together.
 mx::array moe_glu_gather_shexp_kq(
     mx::array x,
     mx::array gate_w,
@@ -924,6 +945,10 @@ mx::array moe_glu_gather_shexp_kq(
     const std::string& shexp_kquant_type = "",
     float limit = 0.0f,
     const std::string& shexp_up_kquant_type = "",
+    const std::optional<mx::array>& gate_scale = std::nullopt,
+    const std::optional<mx::array>& up_scale = std::nullopt,
+    const std::optional<mx::array>& shexp_gate_scale = std::nullopt,
+    const std::optional<mx::array>& shexp_up_scale = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // Down projection with the routing mix folded in: x [T, S, K] (the last k
@@ -933,6 +958,9 @@ mx::array moe_glu_gather_shexp_kq(
 // columns [j K, (j + 1) K), so K must be whole shexp codec blocks.
 // Accumulates all S slots in f32 and returns [T, N] -- replaces gather +
 // (y * scores).sum + shared add. Metal-only.
+// Optional nvfp4 output scales: out_scale for the expert stack, float32
+// (1,), (N,), (E, 1) or (E, N), and shexp_scale, float32 (1,), for an nvfp4
+// shared expert. Each multiplies its slots' weights.
 mx::array gather_qmv_mix_kq(
     mx::array x,
     mx::array w,
@@ -941,6 +969,8 @@ mx::array gather_qmv_mix_kq(
     mx::array indices,
     mx::array scores,
     const std::string& shexp_kquant_type = "",
+    const std::optional<mx::array>& out_scale = std::nullopt,
+    const std::optional<mx::array>& shexp_scale = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // No-shared-expert routing mix (gemma-style MoE): x [T, S, K], indices
@@ -948,6 +978,8 @@ mx::array gather_qmv_mix_kq(
 // score-weighted sum accumulates in f32. Returns [T, N]. Metal-only.
 // Optional per-expert LoRA epilogue as in gather_qmv_kq, score-mixed into
 // the [T, N] output (lora_ids/lora_rows shaped [T, S]).
+// Optional nvfp4 out_scale as in gather_qmv_kq; the LoRA delta is not
+// scaled.
 mx::array gather_qmv_mix_ns_kq(
     mx::array x,
     mx::array w,
@@ -959,6 +991,7 @@ mx::array gather_qmv_mix_ns_kq(
     const std::optional<mx::array>& lora_ids = std::nullopt,
     const std::optional<mx::array>& lora_table = std::nullopt,
     const std::optional<mx::array>& lora_rows = std::nullopt,
+    const std::optional<mx::array>& out_scale = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // Router top-k in one dispatch: score E logit columns in f32 ("softmax" or
@@ -1262,13 +1295,15 @@ class KQuantMatmul : public mx::Primitive {
       int group_size,
       int bits,
       bool transpose,
-      int lora_flags = 0)
+      int lora_flags = 0,
+      int out_scale_mode = 0)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         group_size_(group_size),
         bits_(bits),
         transpose_(transpose),
-        lora_flags_(lora_flags) {}
+        lora_flags_(lora_flags),
+        out_scale_mode_(out_scale_mode) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -1299,6 +1334,9 @@ class KQuantMatmul : public mx::Primitive {
   int bits_;
   bool transpose_;
   int lora_flags_; // kq_lora_prep flags; 0 = no LoRA epilogue
+  // kq_out_scale.h mode: 0 none, 1 one value, 2 one per column. The scale
+  // is the last input.
+  int out_scale_mode_;
 
   // The base route dispatch (Metal); eval_gpu runs it, then the epilogue.
   void eval_gpu_base(
@@ -1307,10 +1345,11 @@ class KQuantMatmul : public mx::Primitive {
 };
 
 // The output of a matmul that runs as dequantize then the stock matmul,
-// with the vjp of KQuantMatmul. inputs = {y, x, w, scales}, where y is the
-// product under stop_gradient; the output shares y's buffer. The gradient
-// wrt x runs the quantized matmul the other way, so no backward pass keeps
-// the dense copy, and the gradient wrt w or scales throws, as on the kernel.
+// with the vjp of KQuantMatmul. inputs = {y, x, w, scales[, out_scale]},
+// where y is the product under stop_gradient; the output shares y's buffer.
+// The gradient wrt x runs the quantized matmul the other way, so no backward
+// pass keeps the dense copy, and the gradient wrt w, scales or out_scale
+// throws, as on the kernel.
 // jvp and vmap throw the base-class text with the name KQuantMatmul.
 class KQuantDequantRoute : public mx::Primitive {
  public:
@@ -1806,26 +1845,32 @@ class KQuantMatmulFused : public mx::Primitive {
 // four weights computes the products: each weight is read in place, each
 // output is written in its own buffer, and one split-K count covers the
 // joint grid. Every other case runs quantized_matmul per weight.
+// out_scales, when given, holds one entry per weight: nothing, or that
+// weight's quantized_matmul out_scale.
 std::vector<mx::array> quantized_matmul_multi(
     mx::array x,
     std::vector<mx::array> weights,
     const std::string& kquant_type,
+    const std::optional<std::vector<std::optional<mx::array>>>& out_scales =
+        std::nullopt,
     mx::StreamOrDevice s = {});
 
-// Primitive of quantized_matmul_multi: inputs {x, scales, w_0, ...},
-// one output per weight. vjp and jvp are those of the per-weight
-// matmuls, wrt x only.
+// Primitive of quantized_matmul_multi: inputs {x, scales, w_0, ...}, then
+// {s_0, ...} with output scales, one output per weight. vjp and jvp are
+// those of the per-weight matmuls, wrt x only.
 class KQuantMatmulMulti : public mx::Primitive {
  public:
   KQuantMatmulMulti(
       mx::Stream stream,
       std::string kquant_type,
       int group_size,
-      int bits)
+      int bits,
+      int out_scale_mode = 0)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         group_size_(group_size),
-        bits_(bits) {}
+        bits_(bits),
+        out_scale_mode_(out_scale_mode) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -1856,6 +1901,10 @@ class KQuantMatmulMulti : public mx::Primitive {
   std::string kquant_type_;
   int group_size_;
   int bits_;
+  int out_scale_mode_; // one mode for every weight's scale
+  int n_weights(size_t n_inputs) const {
+    return static_cast<int>(n_inputs - 2) / (out_scale_mode_ != 0 ? 2 : 1);
+  }
 };
 
 // Quantized matmul with a low-rank term:
@@ -2712,12 +2761,14 @@ class KQuantMoEGLUKQ : public mx::Primitive {
       std::string kquant_type,
       std::string act,
       float limit = 0.0f,
-      float alpha = 0.0f)
+      float alpha = 0.0f,
+      int out_scale_bits = 0)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         act_(std::move(act)),
         limit_(limit),
-        alpha_(alpha) {}
+        alpha_(alpha),
+        out_scale_bits_(out_scale_bits) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -2739,6 +2790,7 @@ class KQuantMoEGLUKQ : public mx::Primitive {
   std::string act_;
   float limit_;
   float alpha_;
+  int out_scale_bits_; // kq_out_scale.h; the scales are the last inputs
 };
 
 // K-quant gathered matvec (see gather_qmv_kq). Inference-only.
@@ -2747,10 +2799,12 @@ class KQuantGatherQMVKQ : public mx::Primitive {
   explicit KQuantGatherQMVKQ(
       mx::Stream stream,
       std::string kquant_type,
-      int lora_flags = 0)
+      int lora_flags = 0,
+      int out_scale_bits = 0)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
-        lora_flags_(lora_flags) {}
+        lora_flags_(lora_flags),
+        out_scale_bits_(out_scale_bits) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -2770,6 +2824,7 @@ class KQuantGatherQMVKQ : public mx::Primitive {
  private:
   std::string kquant_type_;
   int lora_flags_;
+  int out_scale_bits_;
 };
 
 // K-quant fused MoE GLU gather with shared-expert slot (see
@@ -2782,14 +2837,16 @@ class KQuantMoEGLUShexpKQ : public mx::Primitive {
       std::string act,
       std::string shexp_type,
       float limit = 0.0f,
-      std::string shexp_up_type = "")
+      std::string shexp_up_type = "",
+      int out_scale_bits = 0)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         act_(std::move(act)),
         shexp_type_(std::move(shexp_type)),
         shexp_up_type_(
             shexp_up_type.empty() ? shexp_type_ : std::move(shexp_up_type)),
-        limit_(limit) {}
+        limit_(limit),
+        out_scale_bits_(out_scale_bits) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -2812,6 +2869,7 @@ class KQuantMoEGLUShexpKQ : public mx::Primitive {
   std::string shexp_type_; // the shared expert's gate codec
   std::string shexp_up_type_;
   float limit_;
+  int out_scale_bits_;
 };
 
 // K-quant gathered matvec with routing mix folded in (see gather_qmv_mix_kq).
@@ -2821,10 +2879,12 @@ class KQuantGatherQMVMixKQ : public mx::Primitive {
   explicit KQuantGatherQMVMixKQ(
       mx::Stream stream,
       std::string kquant_type,
-      std::string shexp_type)
+      std::string shexp_type,
+      int out_scale_bits = 0)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
-        shexp_type_(std::move(shexp_type)) {}
+        shexp_type_(std::move(shexp_type)),
+        out_scale_bits_(out_scale_bits) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -2844,6 +2904,7 @@ class KQuantGatherQMVMixKQ : public mx::Primitive {
  private:
   std::string kquant_type_;
   std::string shexp_type_;
+  int out_scale_bits_;
 };
 
 // No-shared-expert routing mix (see gather_qmv_mix_ns_kq). Inference-only.
@@ -2852,10 +2913,12 @@ class KQuantGatherQMVMixNSKQ : public mx::Primitive {
   explicit KQuantGatherQMVMixNSKQ(
       mx::Stream stream,
       std::string kquant_type,
-      int lora_flags = 0)
+      int lora_flags = 0,
+      int out_scale_bits = 0)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
-        lora_flags_(lora_flags) {}
+        lora_flags_(lora_flags),
+        out_scale_bits_(out_scale_bits) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -2875,6 +2938,7 @@ class KQuantGatherQMVMixNSKQ : public mx::Primitive {
  private:
   std::string kquant_type_;
   int lora_flags_;
+  int out_scale_bits_;
 };
 
 // Router scoring + top-k + score epilogue (see moe_router_topk). Two
@@ -3406,14 +3470,16 @@ class KQuantGatherQMM : public mx::Primitive {
       int bits,
       bool transpose,
       bool left_sorted,
-      bool right_sorted)
+      bool right_sorted,
+      int out_scale_mode = 0)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         group_size_(group_size),
         bits_(bits),
         transpose_(transpose),
         left_sorted_(left_sorted),
-        right_sorted_(right_sorted) {}
+        right_sorted_(right_sorted),
+        out_scale_mode_(out_scale_mode) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -3446,6 +3512,8 @@ class KQuantGatherQMM : public mx::Primitive {
   bool transpose_;
   bool left_sorted_;
   bool right_sorted_;
+  // The output scale (kq_out_scale.h), the last input when not 0.
+  int out_scale_mode_;
 };
 
 // Tile-map builder (see expert_tile_map). Multi-output: {map, counts}.
@@ -3484,12 +3552,14 @@ class KQuantGatherQMMSeg : public mx::Primitive {
       std::string kquant_type,
       int group_size,
       int bits,
-      int tile_rows)
+      int tile_rows,
+      int out_scale_mode = 0)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         group_size_(group_size),
         bits_(bits),
-        tile_rows_(tile_rows) {}
+        tile_rows_(tile_rows),
+        out_scale_mode_(out_scale_mode) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -3511,6 +3581,8 @@ class KQuantGatherQMMSeg : public mx::Primitive {
   int group_size_;
   int bits_;
   int tile_rows_;
+  // The output scale (kq_out_scale.h), the last input when not 0.
+  int out_scale_mode_;
 };
 
 // Encode a float weight tensor into K-quant wire bytes. Multi-output primitive:

@@ -165,6 +165,28 @@ inline bool kq_matrix_rows_dense(const mx::array& a) {
 // decides at eval.
 mx::array kq_matrix_dense(const mx::array& x, const mx::Stream& s);
 
+// The kernel mode of an out_scale argument (kq_out_scale.h), 0 for none: 1
+// for shape (1,), 2 for (N,), and for a gather over n_mats > 0 weight
+// matrices, 3 for (n_mats, 1) and 4 for (n_mats, N). what names the
+// argument in the errors.
+int kq_out_scale_mode(
+    const std::optional<mx::array>& os,
+    const std::string& kquant_type,
+    bool transpose,
+    int N,
+    int64_t n_mats,
+    const char* op,
+    const char* what = "out_scale");
+
+// The cotangent of a quantized_matmul with out_scale s, times s, for the
+// transposed matmul of its vjp. An NVFP4 scale (5e-5 to 4.4e-4) puts s * dy
+// of a training step below the float16 normal range, so a float16 cotangent
+// gives a bfloat16 product.
+mx::array kq_out_scaled_cotangent(
+    const mx::array& cot,
+    const mx::array& s,
+    const mx::Stream& st);
+
 // Op-builder form for an operand a kernel reads as one row-major run: an x
 // with memory comes back as it is when it is row-major, and as a row-major
 // copy otherwise. An x without memory gets a KQuantMatrixDense node that

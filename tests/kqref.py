@@ -462,3 +462,19 @@ def synth_wire(
     off = _D_OFFSET.get(codec, 0)
     wire[:, off : off + 2] = d.view(np.uint8).reshape(n_blocks, 2)
     return wire
+
+
+def mxfp4_deinterleave(wire):
+    """ggml mxfp4 wire [E, N, nblk*17] -> MLX packed layout (packed uint32
+    [E, N, K/8], scales uint8 [E, N, K/32]): two-halves nibbles resequenced,
+    scale bytes split out. Mirrors gguf-mlx's mxfp4_deinterleave."""
+    e, n, last = wire.shape
+    blocks = wire.reshape(e, n, last // 17, 17)
+    scales = np.ascontiguousarray(blocks[..., 0])
+    data = blocks[..., 1:]
+    lo = data & 0x0F
+    hi = data >> 4
+    v = np.concatenate([lo, hi], axis=-1)  # (..., nblk, 32) sequential codes
+    out = (v[..., 0::2] | (v[..., 1::2] << 4)).astype(np.uint8)
+    packed = np.ascontiguousarray(out).reshape(e, n, -1).view(np.uint32)
+    return packed, scales

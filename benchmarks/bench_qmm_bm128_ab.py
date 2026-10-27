@@ -18,6 +18,16 @@ a shared .npz cache.
 Cells: codec x (N,K) shape x M, all M chosen inside the even-ceil(M/64)
 dispatch window. GB/s = weight-bytes / call. Markdown + JSON out.
 
+--codec-pair times two codecs against each other instead of one lever:
+one child with the per-codec policy, the cell runs codec A, B, B, A (min
+of the two), --rounds repeats every cell and reports each round beside
+the min, and --cool-gate waits before each round until a bf16 4096^3
+matmul in the child reaches that many TFLOPS (retry every 15 s, up to
+--cool-wait s). A codec spelled mlx:<mode> is the stock MLX kernel on
+mx.quantize(mode=<mode>) weights, for a reference ceiling. MLX picks its
+tile by shape and does not expose the kernel name, so the cell records
+the mlx version and the mode.
+
 --tile-ab is the source of the large-M K ceilings (`kq_largem_max_k`): the
 arms force KQ_NAX_TILE to 128,64,2,2 and 64,64,2,2, which bypasses the
 current ceiling and the parity rule, so M may sit at either parity. Run it
@@ -79,17 +89,53 @@ def child_main():
             cache[key] = (w, s)
         return cache[key]
 
+    def mlx_weights(mode, N, K):
+        key = ("mlx:" + mode, N, K)
+        if key not in cache:
+            if len(cache) >= 2:
+                cache.pop(next(iter(cache)))
+            wf = mx.random.normal((N, K), key=mx.random.key(N + K)).astype(mx.bfloat16)
+            q = mx.quantize(wf, mode=mode)
+            mx.eval(*q)
+            cache[key] = tuple(q)
+        return cache[key]
+
+    def probe_tflops(seconds=1.0):
+        n = 4096
+        a = mx.random.normal((n, n)).astype(mx.bfloat16)
+        b = mx.random.normal((n, n)).astype(mx.bfloat16)
+        mx.eval(a, b)
+        for _ in range(3):
+            mx.eval(a @ b)
+        t0 = time.perf_counter()
+        k = 0
+        while time.perf_counter() - t0 < seconds:
+            mx.eval([a @ b for _ in range(8)])
+            k += 8
+        return 2 * n**3 * k / (time.perf_counter() - t0) / 1e12
+
     for line in sys.stdin:
         req = json.loads(line)
         if req.get("cmd") == "quit":
             break
+        if req.get("cmd") == "probe":
+            print(json.dumps({"tflops": probe_tflops()}), flush=True)
+            continue
         codec, N, K, M = req["codec"], req["N"], req["K"], req["M"]
-        w, s = get_weights(codec, N, K, req["npz"])
         x = mx.random.normal((M, K), key=mx.random.key(M)).astype(mx.bfloat16)
         mx.eval(x)
+        if codec.startswith("mlx:"):
+            mode = codec[4:]
+            q = mlx_weights(mode, N, K)
 
-        def call(xx, w=w, s=s, codec=codec):
-            return kq.quantized_matmul(xx, w, s, codec, transpose=True)
+            def call(xx, q=q, mode=mode):
+                return mx.quantized_matmul(xx, *q, transpose=True, mode=mode)
+
+        else:
+            w, s = get_weights(codec, N, K, req["npz"])
+
+            def call(xx, w=w, s=s, codec=codec):
+                return kq.quantized_matmul(xx, w, s, codec, transpose=True)
 
         for _ in range(req["warmup"]):
             mx.eval(call(x))
@@ -154,6 +200,123 @@ def probe_layout(codec, N, K):
     return full(w8), full(s8)
 
 
+def codec_pair_main(args, shapes):
+    import mlx.core as mx
+
+    tmp = tempfile.mkdtemp(prefix="bm128ab-")
+    env = dict(os.environ)
+    env.pop("KQ_NAX_BM128", None)
+    child = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), CHILD],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+
+    def ask(req):
+        child.stdin.write(json.dumps(req) + "\n")
+        child.stdin.flush()
+        return json.loads(child.stdout.readline())
+
+    def gate():
+        if args.cool_gate <= 0:
+            return None
+        waited = 0.0
+        while True:
+            t = ask({"cmd": "probe"})["tflops"]
+            if t >= args.cool_gate or waited >= args.cool_wait:
+                return t
+            print(f"[cool] {t:.1f} TFLOPS < {args.cool_gate:.1f}; waiting", flush=True)
+            time.sleep(15)
+            waited += 15
+
+    a_c, b_c = args.codecs
+    results = {"mlx_version": mx.__version__, "codecs": args.codecs, "cells": {}}
+    try:
+        for N, K in shapes:
+            npz = {}
+            wbytes = {}
+            for codec in args.codecs:
+                if codec.startswith("mlx:"):
+                    npz[codec] = None
+                    wbytes[codec] = None
+                    continue
+                import numpy as np
+
+                path = os.path.join(tmp, f"{codec}-{N}x{K}.npz")
+                if not os.path.exists(path):
+                    w, s = probe_layout(codec, N, K)
+                    np.savez(path, w=w, s=s)
+                npz[codec] = path
+                wbytes[codec] = np.load(path)["w"].nbytes
+            for M in args.ms:
+
+                def req(codec, N=N, K=K, M=M, npz=npz):
+                    return {
+                        "cmd": "cell",
+                        "codec": codec,
+                        "N": N,
+                        "K": K,
+                        "M": M,
+                        "npz": npz[codec],
+                        "iters": args.iters,
+                        "warmup": args.warmup,
+                    }
+
+                ra, rb, gates = [], [], []
+                for _ in range(args.rounds):
+                    gates.append(gate())
+                    a1 = ask(req(a_c))["us"]
+                    b1 = ask(req(b_c))["us"]
+                    b2 = ask(req(b_c))["us"]
+                    a2 = ask(req(a_c))["us"]
+                    ra.append(min(a1, a2))
+                    rb.append(min(b1, b2))
+                ua, ub = min(ra), min(rb)
+                cell = {
+                    "us_a": ua,
+                    "us_b": ub,
+                    "ratio_b_over_a": ub / ua,
+                    "rounds_a": ra,
+                    "rounds_b": rb,
+                    "gate_tflops": gates,
+                    "bytes_a": wbytes[a_c],
+                    "bytes_b": wbytes[b_c],
+                }
+                results["cells"][f"{N}x{K}|M{M}"] = cell
+                spread = ""
+                if args.rounds > 1:
+                    spread = (
+                        f"  rounds a {min(ra):.0f}-{max(ra):.0f} "
+                        f"b {min(rb):.0f}-{max(rb):.0f}"
+                    )
+                print(
+                    f"{N}x{K} M{M:<5d} {a_c} {ua:8.1f}us  {b_c} {ub:8.1f}us  "
+                    f"{b_c}/{a_c} {ub / ua:.3f}{spread}",
+                    flush=True,
+                )
+    finally:
+        try:
+            child.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
+            child.stdin.flush()
+        except Exception:
+            pass
+        child.wait(timeout=30)
+
+    print(f"\n| shape | M | {a_c} us | {b_c} us | {b_c} / {a_c} |")
+    print("|---|---|---|---|---|")
+    for key, c in results["cells"].items():
+        shape, m = key.split("|")
+        print(
+            f"| {shape} | {m[1:]} | {c['us_a']:.0f} | {c['us_b']:.0f} | "
+            f"{c['ratio_b_over_a']:.3f} |"
+        )
+    if args.json_out:
+        with open(args.json_out, "w") as f:
+            json.dump(results, f, indent=1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--codecs", nargs="+", default=DEFAULT_CODECS)
@@ -173,13 +336,31 @@ def main():
         help="arms force KQ_NAX_TILE=128,64,2,2 and 64,64,2,2 (K ceiling "
         "sweep; M at either parity)",
     )
+    ap.add_argument(
+        "--codec-pair",
+        action="store_true",
+        help="time --codecs A B against each other in one policy child, "
+        "A B B A per cell; mlx:<mode> is the stock MLX kernel",
+    )
+    ap.add_argument("--rounds", type=int, default=1, help="repeats per cell")
+    ap.add_argument(
+        "--cool-gate",
+        type=float,
+        default=0.0,
+        help="TFLOPS a bf16 4096^3 matmul must reach before each round; 0 = off",
+    )
+    ap.add_argument("--cool-wait", type=float, default=600.0, help="max gate wait, s")
     ap.add_argument("--json-out")
     args = ap.parse_args()
     shapes = [tuple(int(v) for v in s.split("x")) for s in args.shapes.split(",")]
     for m in args.ms:
-        assert args.tile_ab or ((m + 63) // 64) % 2 == 0, (
+        assert args.tile_ab or args.codec_pair or ((m + 63) // 64) % 2 == 0, (
             f"M={m} outside even-ceil window"
         )
+    if args.codec_pair:
+        assert len(args.codecs) == 2, "--codec-pair takes exactly two --codecs"
+        codec_pair_main(args, shapes)
+        return
 
     tmp = tempfile.mkdtemp(prefix="bm128ab-")
     env_base = dict(os.environ)

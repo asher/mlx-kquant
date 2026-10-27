@@ -1356,7 +1356,9 @@ void kquant_qmm_cpu(
     int N,
     int K,
     bool transpose_w,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const float* out_scale,
+    int out_scale_mode) {
   const KQuantCodec* codec = codec_by_name(kquant_type);
   if (codec == nullptr) {
     throw std::runtime_error(
@@ -1507,6 +1509,8 @@ void kquant_qmm_cpu(
 #endif
   }
 
+  kq_out_scale_rows_cpu(
+      of, static_cast<std::size_t>(M), N, out_scale, out_scale_mode);
   if constexpr (!std::is_same_v<T, float>) {
     convert_from_f32(of, result, out_els);
   }
@@ -1670,6 +1674,9 @@ void kquant_qmm_cpu_batch(
         }
       });
 
+  for (int t = 0; t < n_tasks; t++) {
+    kq_out_scale_rows_cpu(ofs[t], tasks[t].m, N, tasks[t].os, tasks[t].os_mode);
+  }
   if constexpr (!std::is_same_v<T, float>) {
     for (int t = 0; t < n_tasks; t++) {
       const std::size_t els = static_cast<std::size_t>(tasks[t].m) * N;
@@ -1721,7 +1728,9 @@ template void kquant_qmm_cpu<float>(
     int,
     int,
     bool,
-    const std::string&);
+    const std::string&,
+    const float*,
+    int);
 template void kquant_qmm_cpu<mx::float16_t>(
     mx::float16_t*,
     const mx::float16_t*,
@@ -1730,7 +1739,9 @@ template void kquant_qmm_cpu<mx::float16_t>(
     int,
     int,
     bool,
-    const std::string&);
+    const std::string&,
+    const float*,
+    int);
 template void kquant_qmm_cpu<mx::bfloat16_t>(
     mx::bfloat16_t*,
     const mx::bfloat16_t*,
@@ -1739,7 +1750,9 @@ template void kquant_qmm_cpu<mx::bfloat16_t>(
     int,
     int,
     bool,
-    const std::string&);
+    const std::string&,
+    const float*,
+    int);
 
 template void kquant_qmm_cpu_batch<float>(
     const KQmvTask<float>*,

@@ -399,7 +399,7 @@ def test_nax_midm_targets(codec, dtype, f32_env):
 # at every row count and both activation dtypes it is instantiated for,
 # on an aligned and a ragged N (the row clamp past N). K=1000 blocks the
 # route (the codecs need a whole number of wire blocks), so K stays 1024.
-VERIFY_MMA_CODECS = ["pq2_0", "ptq1_0", "q2_0", "q4_0", "q4_1", "q8_0"]
+VERIFY_MMA_CODECS = ["pq2_0", "ptq1_0", "q2_0", "q4_0", "q4_1", "q8_0", "nvfp4"]
 VERIFY_MMA_MS = [2, 3, 4, 5, 6, 7, 8]
 
 
@@ -441,7 +441,7 @@ def test_verify_mma_band(codec, n_out, dtype, verify_mma_forced):
 
 
 # Output rows per verify_mma threadgroup: 8 simdgroups of 8-row tiles, one
-# tile each on pq2_0, ptq1_0 and q2_0 and two on q4_0, q4_1 and q8_0.
+# tile each on pq2_0, ptq1_0 and q2_0 and two on q4_0, q4_1, q8_0 and nvfp4.
 VERIFY_MMA_ROWS = {
     "pq2_0": 64,
     "ptq1_0": 64,
@@ -449,6 +449,7 @@ VERIFY_MMA_ROWS = {
     "q4_0": 128,
     "q4_1": 128,
     "q8_0": 128,
+    "nvfp4": 128,
 }
 
 
@@ -472,9 +473,9 @@ def test_verify_mma_grid(codec, dtype):
 @pytest.mark.parametrize("codec", VERIFY_MMA_CODECS)
 def test_verify_mma_ragged_chunk(codec, verify_mma_forced):
     # 2176 = 17 blocks of 128: one split of 4 full 512-wide chunks plus a
-    # 128-wide tail for the Prism codecs, and 4 splits of 512 + 32 for
-    # q4_0, q4_1 and q8_0, so the partial-chunk path runs on both block
-    # widths.
+    # 128-wide tail for pq2_0 and ptq1_0, 2 splits of 512 + 512 + 64 for
+    # q2_0 and nvfp4, and 4 splits of 512 + 32 for q4_0, q4_1 and q8_0, so
+    # the partial-chunk path runs on every block width.
     k = 2176
     w, s, ref_w = _verify_mma_setup(codec, 1000, k=k)
     _sweep(codec, w, s, ref_w, 1000, ms=[2, 8], k=k)
@@ -511,8 +512,8 @@ def test_verify_mma_default_matches_forced(codec, monkeypatch):
 
 # verify_mma entries on GPUs without NAX (kq_verify_mma_min_m), per
 # activation dtype. The default route runs verify_mma from the entry
-# through M 8 and another route below it and at M 9. q8_0 has no default
-# entry.
+# through M 8 and another route below it and at M 9. q8_0 and nvfp4 have
+# no default entry.
 VMMA_ALU_ENTRY = {
     "pq2_0": {"bfloat16": 3, "float16": 4},
     "q2_0": {"bfloat16": 3, "float16": 4},
@@ -520,6 +521,7 @@ VMMA_ALU_ENTRY = {
     "q4_0": {"bfloat16": 2, "float16": 2},
     "q4_1": {"bfloat16": 4, "float16": 4},
     "q8_0": {"bfloat16": 9, "float16": 9},
+    "nvfp4": {"bfloat16": 9, "float16": 9},
 }
 
 
@@ -566,14 +568,14 @@ def test_qmm_route_probe(codec, route, monkeypatch):
     _sweep(codec, w, s, ref_w, 1000, ms=[1, 2, 5, 8, 12, 16, 33])
 
 
-VMMA_CODECS = ["pq2_0", "ptq1_0", "q2_0", "q4_0", "q4_1", "q8_0"]
+VMMA_CODECS = ["pq2_0", "ptq1_0", "q2_0", "q4_0", "q4_1", "q8_0", "nvfp4"]
 # verify_nax entries on NAX GPUs below N 100000 (kq_verify_nax_min_m).
 # q2_k enters one row earlier above N 4096. The nvfp4 entry moves with the
 # shape (_nvfp4_vnax_entry); listed here at N 1000, K 1024.
 VNAX_ENTRY = {
     "pq2_0": 3,
     "q2_0": 3,
-    "nvfp4": 5,
+    "nvfp4": 2,
     "q4_0": 3,
     "q4_1": 3,
     "q8_0": 6,
@@ -585,8 +587,13 @@ VNAX_ENTRY = {
 }
 VNAX_WIDE_N = {"q2_k": 4096}
 VNAX_CODECS = list(VNAX_ENTRY)
-# Lever that keeps a codec with an eight-block kernel on its two-block one.
-VNAX_SB_LEVER = {"q4_0": "KQ_VERIFY_NAX_Q4_0_SB", "q4_1": "KQ_VERIFY_NAX_Q4_1_SB"}
+# Lever that picks between a codec's two-block kernel and its eight-block
+# (q4_0, q4_1) or four-block (nvfp4) one.
+VNAX_SB_LEVER = {
+    "q4_0": "KQ_VERIFY_NAX_Q4_0_SB",
+    "q4_1": "KQ_VERIFY_NAX_Q4_1_SB",
+    "nvfp4": "KQ_VERIFY_NAX_NVFP4_SB",
+}
 # The iq4 entry moves with N and K (test_verify_nax_iq4_entry).
 VNAX_IQ4 = ["iq4_xs", "iq4_nl"]
 
@@ -597,11 +604,13 @@ def _nvfp4_vnax_entry(n, k, f16):
         return 3
     if n <= 512:
         return 9
-    if k >= 6144 or (n <= 1024 and k >= 4096):
+    if n <= 1024:
         return 2
     if n <= 2048:
-        return 3 if k >= 4096 else 5
-    return 5 if f16 else 4
+        return 3 if k >= 4096 else 4
+    if k >= 6144:
+        return 2
+    return 4 if f16 else 3
 
 
 def _vnax_entry(codec, n, k=K, f16=False):
@@ -803,11 +812,13 @@ def test_verify_mma_entries_f16(codec, monkeypatch):
 
 # verify_mma sums each block in float, so one activation channel near the
 # top of the half range stays finite and within the contract
-# (tests/test_verify_mma_range.py goes past that range).
+# (tests/test_verify_mma_range.py goes past that range). nvfp4 takes group
+# scales of 2^-6 to 2^-5, so the output stays inside the float16 range.
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("codec", VMMA_CODECS)
 def test_verify_mma_outlier_channel(codec, dtype, monkeypatch):
-    w, s, ref_w = _setup(codec, 1000)
+    synth = {"nvfp4_scales": (0x08, 0x11)} if codec == "nvfp4" else {}
+    w, s, ref_w = _setup(codec, 1000, **synth)
     monkeypatch.setenv("KQ_QMM_ROUTE", "verify_mma")
     monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
     for m in (2, 5, 8):
@@ -827,13 +838,16 @@ def test_verify_mma_outlier_channel(codec, dtype, monkeypatch):
 # serves, both activation dtypes, aligned and ragged N (the row clamp in
 # the last simdgroup's 32 rows). q4_0 and q4_1 run their eight-block
 # kernels at K 1024, and the "0" arms (KQ_VERIFY_NAX_Q4_0_SB=0,
-# KQ_VERIFY_NAX_Q4_1_SB=0) their two-block kernels.
+# KQ_VERIFY_NAX_Q4_1_SB=0) their two-block kernels. nvfp4 runs its
+# two-block kernel at these N, and the "1" arm (KQ_VERIFY_NAX_NVFP4_SB=1)
+# its four-block kernel.
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("n_out", [1024, 1000, 40, 20])
 @pytest.mark.parametrize(
     "codec, sb",
-    [(c, None) for c in VNAX_CODECS + VNAX_IQ4] + [("q4_0", "0"), ("q4_1", "0")],
+    [(c, None) for c in VNAX_CODECS + VNAX_IQ4]
+    + [("q4_0", "0"), ("q4_1", "0"), ("nvfp4", "1")],
 )
 def test_verify_nax_band(codec, sb, n_out, dtype, monkeypatch):
     w, s, ref_w = _setup(codec, n_out)
@@ -850,8 +864,10 @@ def test_verify_nax_band(codec, sb, n_out, dtype, monkeypatch):
 # of 128 for the others), K 3840 (15 and 30) and K 4096. q4_0 and q4_1 run
 # their two-block kernels at K 2176 and 1920 (34 and 30 steps of 64) and
 # their eight-block kernels at K 4096, 3840 and 4352 (16, 15 and 17 steps
-# of 256). The forced
-# counts cover the partial fold wherever they divide the steps.
+# of 256). nvfp4 runs its two-block kernel at K 2176, 1920 and 4096, and
+# its four-block kernel (KQ_VERIFY_NAX_NVFP4_SB=1) at K 4352, 3840 and
+# 4096. The forced counts cover the partial fold wherever they divide the
+# steps.
 VNAX_SB = ("q4_k", "q5_k", "q6_k", "q3_k", "q2_k")
 VNAX_SPLIT_K = {
     c: [4352, 3840, 4096] if c in VNAX_SB else [2176, 1920, 4096] for c in VNAX_CODECS
@@ -860,16 +876,19 @@ VNAX_SPLIT_K["q4_0"] += [3840, 4352]
 VNAX_SPLIT_K["q4_1"] += [3840, 4352]
 for _c in VNAX_IQ4:
     VNAX_SPLIT_K[_c] = [4352, 3840, 4096]
+VNAX_SPLIT_CASES = [
+    (c, k, None) for c in VNAX_CODECS + VNAX_IQ4 for k in VNAX_SPLIT_K[c]
+] + [("nvfp4", k, "1") for k in (4352, 3840, 4096)]
 
 
 @pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("splits", ["", "2", "3", "4", "5", "8"])
-@pytest.mark.parametrize(
-    "codec, k", [(c, k) for c in VNAX_CODECS + VNAX_IQ4 for k in VNAX_SPLIT_K[c]]
-)
-def test_verify_nax_splits(codec, k, splits, dtype, monkeypatch):
+@pytest.mark.parametrize("codec, k, sb", VNAX_SPLIT_CASES)
+def test_verify_nax_splits(codec, k, sb, splits, dtype, monkeypatch):
     w, s, ref_w = _verify_mma_setup(codec, 1000, k=k)
+    if sb is not None:
+        monkeypatch.setenv(VNAX_SB_LEVER[codec], sb)
     monkeypatch.setenv("KQ_QMM_ROUTE", "verify_nax")
     monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
     monkeypatch.setenv("KQ_VERIFY_NAX_SPLITS", splits)
@@ -972,6 +991,76 @@ def test_verify_nax_two_block_lever(codec, dtype, monkeypatch):
     _sweep(codec, w, s, ref_w, 1000, ms=[1, 3, 8], dtype=mdt, k=k)
     monkeypatch.setenv(lever, "0")
     _sweep(codec, w, s, ref_w, 1000, ms=[1, 3, 8], dtype=mdt, k=k)
+
+
+# nvfp4 runs its four-block kernel where K is a multiple of 256 and a grid
+# of about a wave of simdgroups walks 2048 or more of K, and its two-block
+# kernel elsewhere (kq_verify_nax_nvfp4_sb). Of the Qwen3.8-27B shapes the
+# gate projection (N 17408, K 5120, a grid just under a wave) takes the
+# two-block kernel, and the down projection (N 5120, K 17408) and N 10240,
+# K 5120 (2 splits, walks of 2560) the four-block one, as does N 18560, K
+# 4096 (one split, a grid just over a wave). KQ_VERIFY_NAX_NVFP4_SB=0 or 1
+# forces either kernel at K 3840, and a K that is a multiple of 128 only
+# keeps the two-block kernel under 1. KQ_QMM_LOG names the kernel and its
+# slice count.
+VNAX_NVFP4_CHOICE = [
+    # n, k, lever, four-block, slices
+    (17408, 5120, None, False, 8),
+    (5120, 17408, None, True, 4),
+    (10240, 5120, None, True, 2),
+    (18560, 4096, None, True, 1),
+    (17920, 4096, None, True, 1),  # 560 simdgroups at one split
+    (17888, 4096, None, False, None),  # 559
+    (10240, 4096, None, True, 2),  # walk 2048, as the Qwen3 vocab head
+    (10240, 3584, None, False, None),  # walk 1792 at 2 splits, full grid
+    (1000, 3840, None, False, None),
+    (1000, 3840, "1", True, None),
+    (5120, 17408, "0", False, None),
+    (1000, 3968, "1", False, None),
+]
+
+
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+def test_verify_nax_nvfp4_kernel_choice():
+    calls = [
+        {
+            "codec": "nvfp4",
+            "shape": [8, k],
+            "n": n,
+            "dtype": "bfloat16",
+            "env": {"KQ_VERIFY_NAX_NVFP4_SB": lever},
+        }
+        for n, k, lever, _, _ in VNAX_NVFP4_CHOICE
+    ]
+    env = {"KQ_QMM_ROUTE": "verify_nax", "KQ_QMM_ROUTE_STRICT": "1"}
+    for case, entry in zip(VNAX_NVFP4_CHOICE, _logged(calls, env), strict=True):
+        n, k, lever, four, slices = case
+        name, grid = _one_kernel(entry)
+        prefix = "kquant_nvfp4_sb_" if four else "kquant_nvfp4_verify_nax_"
+        assert name.startswith(prefix), (case, name)
+        if slices is not None:
+            assert grid[2] == slices, (case, grid)
+
+
+# The default route takes the kernel the forced route takes, from N (not
+# the grid rounded to 128 rows): 560 simdgroups at N 17920, 559 at N 17888.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX verify only")
+def test_verify_nax_nvfp4_default_kernel_choice(monkeypatch):
+    _clear_levers(monkeypatch)
+    cases = [
+        (17920, 4096, True),
+        (17888, 4096, False),
+        (10240, 4096, True),
+        (10240, 3584, False),
+    ]
+    calls = [
+        {"codec": "nvfp4", "shape": [8, k], "n": n, "dtype": "bfloat16"}
+        for n, k, _ in cases
+    ]
+    for (n, k, four), e in zip(cases, _logged(calls, {}), strict=True):
+        name = _one_kernel(e)[0]
+        prefix = "kquant_nvfp4_sb_" if four else "kquant_nvfp4_verify_nax_"
+        assert name.startswith(prefix), (n, k, name)
 
 
 # The q4_k and q5_k kernels read their weights as 16-byte words. A base
@@ -1407,10 +1496,10 @@ def test_verify_nax_iq4_entry(codec, n_out, k, entry, dtype, monkeypatch):
 
 
 # The nvfp4 entry by shape (kq_verify_nax_min_m): M 3 on a vocab head,
-# none at N 512 and below, M 2 at K 6144 and wider and at N 1024 and below
-# from K 4096, M 3 up to N 2048 from K 4096 and M 5 below it, and M 4 on
-# bfloat16 and M 5 on float16 at wider N. Checked as the iq4 entry is, with
-# per-row qmv off, which takes M 2 at N 1025 to 2048 by default.
+# none at N 512 and below, M 2 at N 513 to 1024, M 3 up to N 2048 from K
+# 4096 and M 4 below it, and at wider N M 2 from K 6144 and below it M 3
+# on bfloat16 and M 4 on float16. Checked as the iq4 entry is, with per-row
+# qmv off, which runs ahead of the entry by default.
 VNAX_NVFP4_SHAPES = [
     (100000, 256),
     (100000, 6144),
@@ -1419,9 +1508,8 @@ VNAX_NVFP4_SHAPES = [
     (513, 8192),
     (2560, 6144),
     (2560, 6016),
-    (1024, 4096),
+    (1024, 2048),
     (1025, 4096),
-    (1024, 3968),
     (2048, 4096),
     (2049, 4096),
     (2048, 3968),
@@ -1725,6 +1813,72 @@ def test_verify_nax_head_entry(codec, monkeypatch):
             assert not _bits_equal(y_def, y_oth), tag
 
 
+# nvfp4's per-row qmv stops at M 1 on a vocab head (N >= 100000), where
+# mv_ext runs faster at M 2, and takes M 2 one row below it.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX routing only")
+def test_nax_qmv_nvfp4_head(monkeypatch):
+    _clear_levers(monkeypatch)
+    calls = [{"codec": "nvfp4", "shape": [2, 256], "n": n} for n in (100000, 99999)]
+    names = [_one_kernel(e)[0] for e in _logged(calls, {})]
+    assert "_mv_ext_" in names[0] and "_qmv_" in names[1], names
+
+
+# nvfp4's qmv limit where mv_ext runs one row above it: M 2 at N 1025 to
+# 2048 (verify_nax enters at M 4 there at K 1024) and above N 2048.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX routing only")
+def test_nax_qmv_nvfp4_limits(monkeypatch):
+    _clear_levers(monkeypatch)
+    cases = [(2048, 2, "_qmv_"), (2048, 3, "_mv_ext_"), (2049, 2, "_qmv_")]
+    calls = [{"codec": "nvfp4", "shape": [m, 1024], "n": n} for n, m, _ in cases]
+    for (n, m, frag), e in zip(cases, _logged(calls, {}), strict=True):
+        assert frag in _one_kernel(e)[0], (n, m, frag)
+
+
+# nvfp4's one-row tiling: fine up to N 32768, except a coarse band at N 2049
+# to 2560, and at N 1537 to 2048 from K 5120. KQ_GPU_CORES 20 halves the
+# band edges, and KQ_QMV_FINE forces either tiling.
+@pytest.mark.skipif(force_cpu(), reason="GPU tiling")
+@pytest.mark.parametrize(
+    "env, cases",
+    [
+        (
+            {},
+            [
+                (2048, 4096, True),
+                (2049, 4096, False),
+                (2560, 2048, False),
+                (2561, 4096, True),
+                (1536, 8192, True),
+                (1537, 8192, False),
+                (1792, 5056, True),
+                (1792, 5120, False),
+            ],
+        ),
+        (
+            {"KQ_GPU_CORES": "20"},
+            [
+                (1024, 4096, True),
+                (1025, 4096, False),
+                (1280, 4096, False),
+                (1281, 4096, True),
+                (768, 8192, True),
+                (769, 8192, False),
+            ],
+        ),
+        ({"KQ_QMV_FINE": "1"}, [(2304, 4096, True), (1792, 8192, True)]),
+        ({"KQ_QMV_FINE": "0"}, [(1024, 4096, False), (4096, 4096, False)]),
+    ],
+)
+def test_nvfp4_fine_tiling_band(env, cases, monkeypatch):
+    _clear_levers(monkeypatch)
+    for k in ("KQ_QMV_FINE", "KQ_GPU_CORES"):
+        monkeypatch.delenv(k, raising=False)
+    calls = [{"codec": "nvfp4", "shape": [1, k], "n": n} for n, k, _ in cases]
+    for (n, k, fine), e in zip(cases, _logged(calls, env), strict=True):
+        name = _one_kernel(e)[0]
+        assert ("_fine_" in name) == fine, (env, n, k, name)
+
+
 # kq_nax_small_m for the codecs the dispatch tests pin: the per-row qmv
 # limit per N bucket (N <= 512, 1024, 2048, larger), then the split-K
 # entries for N <= 1024 and above (99: none, which the table writes as 0).
@@ -1734,7 +1888,7 @@ NAX_SMALL_M = {
     "q2_k": ((8, 5, 3, 2), 2, 5),
     "pq2_0": ((8, 5, 3, 2), 9, 9),
     "q2_0": ((8, 5, 3, 2), 9, 9),
-    "nvfp4": ((1, 1, 2, 1), 2, 6),
+    "nvfp4": ((6, 3, 2, 2), 2, 6),
     "ptq1_0": ((8, 5, 3, 2), 9, 9),
     "q4_0": ((8, 6, 3, 2), 8, 8),
     "q4_1": ((8, 6, 3, 2), 8, 8),

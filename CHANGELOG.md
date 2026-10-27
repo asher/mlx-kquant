@@ -10,11 +10,28 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `quantized_matmul` and `quantized_matmul_qmv_bias` take `lora_ids` and `lora_table` with
   stacked LoRA factors, so each row of a dense matmul adds its own adapter inside the same
   dispatch. `HAS_LORA_STACK` marks the build.
+- `quantized_matmul` and `KQuantLinear` take `out_scale` for `nvfp4` weights: the per-tensor
+  or per-column scale of an NVFP4 GGUF. The unscaled product never passes through float16,
+  so float16 activations do not overflow.
+- `gather_qmm`, `gather_qmm_seg` and `KQuantSwitchLinear` take `out_scale` for `nvfp4` experts:
+  one scale for all experts, per column, per expert, or per expert and column.
+- The fused MoE gathers and `quantized_matmul_multi` take the `.scale` of `nvfp4` weights,
+  including an `nvfp4` shared expert's, and apply it before the bias and the GLU activation.
 
 ### Changed
 - Up to 32 rows, a live LoRA adapter on `quantized_matmul`, `quantized_matmul_qmv_bias` and
   `gather_qmv_kq` forms `x @ A` beside the base matvec and reads each adapter's factors once per
   block of rows, which removes most of the adapter's cost at decode widths.
+- `nvfp4` and `mxfp4` matmuls decode fp4 values without a lookup table, with the same output.
+  On M5 Max, `nvfp4` matmuls of 1 to 16 rows take 8 to 10% less time.
+- On M5, `nvfp4` matmuls of 2 to 8 rows take a further 12% less time, and up to half on weights
+  of 2048 rows or fewer. Their outputs differ from 0.5.6 by rounding.
+- One-row `nvfp4` matmuls take up to 34% less time on M5 Max on weights of up to 1536 rows, and up
+  to 12% less on most wider ones, with the same output.
+
+### Fixed
+- A MoE layer whose shared expert uses another codec than its routed experts no longer prints
+  a `KQ_MOE_SX_SPLIT` warning when the lever is unset.
 
 ## [0.5.6]
 

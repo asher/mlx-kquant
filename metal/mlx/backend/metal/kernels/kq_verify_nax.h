@@ -5,6 +5,8 @@
 
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 
+#include "mlx/backend/metal/kernels/kq_out_scale.h"
+
 // Register-fed NAX verify kernels for the M <= 8 band (NAX GPUs).
 //
 // Each of the 4 simdgroups owns 32 weight rows. Lane (fm, q) of the
@@ -26,11 +28,12 @@
 // q2_k units half a superblock, each with its own order. Block scales and
 // mins are folded into the half weights. Device loads and NAX ops of one
 // simdgroup do not overlap, so occupancy hides the loads and the host
-// sizes the split count for it (kq_verify_nax_splits). pq2_0, q4_0 and
-// q4_1 load a unit's activation steps ahead of its NAX ops. The other
-// codecs, whose Words are larger, load one step at a time. Each order
-// measured faster for its codecs on M5 Max. The right operand is written
-// in element order, which ran 1.6x faster than a strided order.
+// sizes the split count for it (kq_verify_nax_splits). The pq2_0 and q2_0
+// kernels and the two-block q4_0, q4_1 and nvfp4 kernels load a unit's
+// activation steps ahead of its NAX ops. The other kernels, whose Words are
+// larger, load one step at a time. Each order measured faster for its
+// codecs on M5 Max. The right operand is written in element order, which
+// ran 1.6x faster than a strided order.
 //
 // Codec contract (KqXxxNax):
 //   group: the wire block's weights, the kernel's group_size
@@ -46,6 +49,8 @@
 //     one step at a time reads steps s and s + 1 (s even) from 8
 //     contiguous elements at a 16-byte boundary of the row, so where x
 //     starts on one (kq_vnax_x16) it loads both in one 16-byte load.
+//   out_mul (optional): a power of two the store multiplies the sums by,
+//     for half weights kept that much smaller
 
 // Function constant: x starts on a 16-byte boundary. Unset keeps the
 // 8-byte load per step.
@@ -164,21 +169,21 @@ struct KqQ2_0Nax {
   }
 };
 
+// kq_nvfp4_nibs and kq_nvfp4_pair: kq_quantized_fp.h.
+
 // NVFP4: lane-quad q owns 16-weight group q, its UE4M3 scale byte q and qs
-// bytes 8q..8q+7. Pair f is byte f's low and high nibbles, weights f and
-// f + 8 of the group, so step s reads Q2_0's activation order. An E2M1 code
-// e1 e0 m in half bits 11..9 is its value times 2^-14; every product with
-// the scale is exact in half. Two 64-weight blocks per iteration.
+// bytes 8q..8q+7. Step s takes the low nibbles of word s & 1 for s < 2 and
+// the high nibbles after, weights 4s to 4s + 3 of the group, and pair f is
+// bytes f & 1 and (f & 1) + 2 of the word. The group scale carries 2^7
+// and the weights are kept 2^7 smaller (out_mul). Two 64-weight blocks per
+// iteration.
 struct KqNvfp4Nax {
   static constant constexpr int group = KQ_NVFP4_SUPERBLOCK;
   static constant constexpr int block_k = KQ_NVFP4_SUPERBLOCK;
   static constant constexpr int block_bytes = KQ_NVFP4_BLOCK_BYTES;
   static constant constexpr int ub = 2;
   static constant constexpr bool x_ahead = true;
-  // Unused: x_ahead codecs load their steps through xstep.
-  static constexpr METAL_FUNC int xoff(short, short) {
-    return 0;
-  }
+  static constant constexpr float out_mul = 128.0f;
   struct Words {
     uint w[2];
     half d;
@@ -186,7 +191,7 @@ struct KqNvfp4Nax {
   static METAL_FUNC Words load(const device uint8_t* row, int u, short q) {
     const device uint8_t* bp = row + u * block_bytes;
     Words o;
-    o.d = half(kq_fp_ue4m3_scale(bp[q]));
+    o.d = half(kq_fp_ue4m3_scale<7>(bp[q]));
     const device uint* qs =
         (const device uint*)(bp + KQ_NVFP4_QS_OFFSET + 8 * q);
     o.w[0] = qs[0];
@@ -194,18 +199,84 @@ struct KqNvfp4Nax {
     return o;
   }
   static METAL_FUNC half2 pair(thread const Words& o, short f) {
-    const uint b = (o.w[f >> 2] >> (8 * (f & 3))) & 0xFFu;
-    const uint n = (b & 0x0Fu) | ((b & 0xF0u) << 12);
-    const uint bits = ((n & 0x00070007u) << 9) | ((n & 0x00080008u) << 12);
-    return as_type<half2>(bits) * half2(16384.0h) * o.d;
+    const short s = f >> 1;
+    return kq_nvfp4_pair(kq_nvfp4_nibs(o.w[s & 1], s >> 1), f & 1) * o.d;
+  }
+  static constexpr METAL_FUNC int xoff(short q, short s) {
+    return 16 * q + 4 * s;
   }
   template <typename T>
   static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
-    const int o = 16 * q + 2 * s;
-    const vec<T, 2> p0 = *(const device vec<T, 2>*)(xb + o);
-    const vec<T, 2> p1 = *(const device vec<T, 2>*)(xb + o + 8);
-    return vec<T, 4>(p0.x, p1.x, p0.y, p1.y);
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + xoff(q, s));
+    return vec<T, 4>(p[0], p[2], p[1], p[3]);
   }
+};
+
+// NVFP4, four-block unit: four wire blocks (256 weights, 144 bytes), and
+// lane-quad q owns block q, the 36 bytes at 36q, read as nine aligned
+// words: the four group scales, then the qs, two words per group. Step s
+// takes group s >> 2 and within it KqNvfp4Nax's step s & 3. A 36-byte
+// block keeps the rows of any K that is a multiple of 64 4-byte aligned
+// from a weight base the host checks.
+struct KqNvfp4SbNax {
+  static constant constexpr int group = KQ_NVFP4_SUPERBLOCK;
+  static constant constexpr int block_k = 4 * KQ_NVFP4_SUPERBLOCK;
+  static constant constexpr int block_bytes = 4 * KQ_NVFP4_BLOCK_BYTES;
+  static constant constexpr int ub = 1;
+  static constant constexpr bool x_ahead = false;
+  static constant constexpr float out_mul = 128.0f;
+  struct Words {
+    uint w[8];
+    half4 d;
+  };
+  static METAL_FUNC Words load(const device uint8_t* row, int u, short q) {
+    const device uint* wp =
+        (const device uint*)(row + u * block_bytes + KQ_NVFP4_BLOCK_BYTES * q);
+    uint t[9];
+    for (short i = 0; i < 9; ++i) {
+      t[i] = wp[i];
+    }
+    Words o;
+    o.d = half4(
+        half(kq_fp_ue4m3_scale<7>(uint8_t(t[0]))),
+        half(kq_fp_ue4m3_scale<7>(uint8_t(t[0] >> 8))),
+        half(kq_fp_ue4m3_scale<7>(uint8_t(t[0] >> 16))),
+        half(kq_fp_ue4m3_scale<7>(uint8_t(t[0] >> 24))));
+    for (short i = 0; i < 8; ++i) {
+      o.w[i] = t[1 + i];
+    }
+    return o;
+  }
+  static METAL_FUNC half2 pair(thread const Words& o, short f) {
+    const short s = f >> 1;
+    const short g = s >> 2;
+    const uint l = kq_nvfp4_nibs(o.w[2 * g + (s & 1)], (s >> 1) & 1);
+    return kq_nvfp4_pair(l, f & 1) * o.d[g];
+  }
+  static constexpr METAL_FUNC int xoff(short q, short s) {
+    return 64 * q + 4 * s;
+  }
+  template <typename T>
+  static METAL_FUNC vec<T, 4> xstep(const device T* xb, short q, short s) {
+    const vec<T, 4> p = *(const device vec<T, 4>*)(xb + xoff(q, s));
+    return vec<T, 4>(p[0], p[2], p[1], p[3]);
+  }
+};
+
+// Codec::out_mul, 1 when the codec does not declare it.
+template <typename>
+struct KqVnaxVoid {
+  using type = void;
+};
+template <typename Codec, typename = void>
+struct KqVnaxOutMul {
+  static constant constexpr float value = 1.0f;
+};
+template <typename Codec>
+struct KqVnaxOutMul<
+    Codec,
+    typename KqVnaxVoid<decltype(Codec::out_mul)>::type> {
+  static constant constexpr float value = Codec::out_mul;
 };
 
 // Q4_0: lane-quad q owns qs bytes 4q..4q+3. Pairs (n0, n2), (n1, n3),
@@ -990,7 +1061,10 @@ struct KqIq4NlNax {
   }
 };
 
-template <typename T, typename Codec, typename U = T>
+// kOutScale entries take the output scale (kq_out_scale.h). The host sets
+// it only on a pipeline that writes the output in one split; split
+// partials stay unscaled and the fold scales them.
+template <typename T, typename Codec, typename U = T, bool kOutScale = false>
 METAL_FUNC void kq_verify_nax_impl(
     const device uint8_t* w,
     const device T* x,
@@ -1001,7 +1075,8 @@ METAL_FUNC void kq_verify_nax_impl(
     const int k_partition_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    const device float* out_scale = nullptr) {
   namespace to = mpp::tensor_ops;
   constexpr int BK = Codec::block_k;
   constexpr int UB = Codec::ub;
@@ -1120,7 +1195,16 @@ METAL_FUNC void kq_verify_nax_impl(
     for (short j = 0; j < 4; ++j) {
       const int n = n0 + 16 * f + fn + j;
       if (n < N) {
-        y[static_cast<int64_t>(fm) * N + n] = static_cast<U>(cc[f * 8 + j]);
+        float v = cc[f * 8 + j];
+        if constexpr (KqVnaxOutMul<Codec>::value != 1.0f) {
+          v *= KqVnaxOutMul<Codec>::value;
+        }
+        if constexpr (kOutScale) {
+          if (kq_has_out_scale) {
+            v *= kq_out_scale_col(out_scale, n);
+          }
+        }
+        y[static_cast<int64_t>(fm) * N + n] = static_cast<U>(v);
       }
     }
   }
@@ -1128,7 +1212,11 @@ METAL_FUNC void kq_verify_nax_impl(
 
 // Entry point: qmm_t_splitk's buffer layout, grid (ceil(N / 128), 1,
 // splits), 128 threads.
-#define KQ_DEFINE_VERIFY_NAX_KERNEL(CODEC, TRAITS)                     \
+// OS 1 gives the kernel the output scale (kq_out_scale.h).
+#define KQ_DEFINE_VERIFY_NAX_KERNEL(CODEC, TRAITS) \
+  KQ_DEFINE_VERIFY_NAX_KERNEL_OS(CODEC, TRAITS, 0)
+
+#define KQ_DEFINE_VERIFY_NAX_KERNEL_OS(CODEC, TRAITS, OS)              \
   template <typename T, int group_size, int bits, typename U = T>      \
   [[kernel]] void kq_##CODEC##_verify_nax(                             \
       const device uint8_t* w,                                         \
@@ -1142,9 +1230,9 @@ METAL_FUNC void kq_verify_nax_impl(
       const constant int& split_k_partition_stride,                    \
       uint3 tid [[threadgroup_position_in_grid]],                      \
       uint simd_gid [[simdgroup_index_in_threadgroup]],                \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                   \
+      uint simd_lid [[thread_index_in_simdgroup]] KQ_OS_ARG_##OS) {    \
     static_assert(group_size == TRAITS::group, #CODEC " block width"); \
-    kq_verify_nax_impl<T, TRAITS, U>(                                  \
+    kq_verify_nax_impl<T, TRAITS, U, OS>(                              \
         w,                                                             \
         x,                                                             \
         y + tid.z * static_cast<int64_t>(split_k_partition_stride),    \
@@ -1154,7 +1242,7 @@ METAL_FUNC void kq_verify_nax_impl(
         k_partition_size,                                              \
         tid,                                                           \
         simd_gid,                                                      \
-        simd_lid);                                                     \
+        simd_lid KQ_OS_PTR_##OS);                                      \
   }
 
 // Several weights that share x in one dispatch: weight i owns the
@@ -1162,8 +1250,22 @@ METAL_FUNC void kq_verify_nax_impl(
 // own buffer and into its own output, with one split count over grid z.
 // part_stride[i] is output i's partial stride. Unused weight slots bind
 // slot 0's buffers, and their tg_end is the grid end, so they own no
-// threadgroup.
-#define KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(CODEC, TRAITS)                       \
+// threadgroup. OS 1 gives weight i the output scale at slot
+// KQ_OUT_SCALE_SLOT - i, all four in one mode.
+#define KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(CODEC, TRAITS) \
+  KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL_OS(CODEC, TRAITS, 0)
+
+#define KQ_OS_MULTI_SCALE(i) \
+  const device float* os##i  \
+      [[buffer(KQ_OUT_SCALE_SLOT - i), function_constant(kq_has_out_scale)]]
+#define KQ_OS_MULTI_ARG_1                                             \
+  , KQ_OS_MULTI_SCALE(0), KQ_OS_MULTI_SCALE(1), KQ_OS_MULTI_SCALE(2), \
+      KQ_OS_MULTI_SCALE(3)
+#define KQ_OS_MULTI_ARG_0
+#define KQ_OS_MULTI_PTR_1 , i == 0 ? os0 : i == 1 ? os1 : i == 2 ? os2 : os3
+#define KQ_OS_MULTI_PTR_0
+
+#define KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL_OS(CODEC, TRAITS, OS)                \
   template <typename T, int group_size, int bits, typename U = T>              \
   [[kernel]] void kq_##CODEC##_verify_nax_multi(                               \
       const device uint8_t* w0,                                                \
@@ -1183,7 +1285,7 @@ METAL_FUNC void kq_verify_nax_impl(
       const constant int4& part_stride,                                        \
       uint3 tid [[threadgroup_position_in_grid]],                              \
       uint simd_gid [[simdgroup_index_in_threadgroup]],                        \
-      uint simd_lid [[thread_index_in_simdgroup]]) {                           \
+      uint simd_lid [[thread_index_in_simdgroup]] KQ_OS_MULTI_ARG_##OS) {      \
     static_assert(group_size == TRAITS::group, #CODEC " block width");         \
     const int t = int(tid.x);                                                  \
     /* tg_end is cumulative, so the weight is the ends passed. */              \
@@ -1192,7 +1294,7 @@ METAL_FUNC void kq_verify_nax_impl(
     const int t0 = i == 0 ? 0 : tg_end[i - 1];                                 \
     const device uint8_t* w = i == 0 ? w0 : i == 1 ? w1 : i == 2 ? w2 : w3;    \
     device U* y = i == 0 ? y0 : i == 1 ? y1 : i == 2 ? y2 : y3;                \
-    kq_verify_nax_impl<T, TRAITS, U>(                                          \
+    kq_verify_nax_impl<T, TRAITS, U, OS>(                                      \
         w,                                                                     \
         x,                                                                     \
         y + tid.z * static_cast<int64_t>(part_stride[i]),                      \
@@ -1202,12 +1304,13 @@ METAL_FUNC void kq_verify_nax_impl(
         k_partition_size,                                                      \
         uint3(uint(t - t0), tid.y, tid.z),                                     \
         simd_gid,                                                              \
-        simd_lid);                                                             \
+        simd_lid KQ_OS_MULTI_PTR_##OS);                                        \
   }
 
 KQ_DEFINE_VERIFY_NAX_KERNEL(pq2_0, KqPq2_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q2_0, KqQ2_0Nax)
-KQ_DEFINE_VERIFY_NAX_KERNEL(nvfp4, KqNvfp4Nax)
+KQ_DEFINE_VERIFY_NAX_KERNEL_OS(nvfp4, KqNvfp4Nax, 1)
+KQ_DEFINE_VERIFY_NAX_KERNEL_OS(nvfp4_sb, KqNvfp4SbNax, 1)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_0, KqQ4_0Nax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_0_sb, KqQ4_0SbNax)
 KQ_DEFINE_VERIFY_NAX_KERNEL(q4_1, KqQ4_1Nax)
@@ -1223,7 +1326,8 @@ KQ_DEFINE_VERIFY_NAX_KERNEL(q2_k, KqQ2_KNax)
 
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(pq2_0, KqPq2_0Nax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q2_0, KqQ2_0Nax)
-KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(nvfp4, KqNvfp4Nax)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL_OS(nvfp4, KqNvfp4Nax, 1)
+KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL_OS(nvfp4_sb, KqNvfp4SbNax, 1)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_0, KqQ4_0Nax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_0_sb, KqQ4_0SbNax)
 KQ_DEFINE_VERIFY_NAX_MULTI_KERNEL(q4_1, KqQ4_1Nax)

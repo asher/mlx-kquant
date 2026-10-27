@@ -53,9 +53,37 @@ void kquant_dequantize_parallel(
     std::size_t num_weights,
     const std::string& kquant_type);
 
+// The output scale of expert e of a stack of N-column matrices
+// (kq_out_scale.h): modes 3 and 4 move to the expert's values and then read
+// as modes 1 and 2.
+inline const float*
+kq_out_scale_at_cpu(const float* s, int mode, int64_t e, int N) {
+  return mode == 3 ? s + e : mode == 4 ? s + e * N : s;
+}
+
+// Scales the float result [rows, N] in place.
+inline void kq_out_scale_rows_cpu(
+    float* y,
+    std::size_t rows,
+    int N,
+    const float* s,
+    int mode) {
+  if (s == nullptr || mode == 0) {
+    return;
+  }
+  const bool cols = mode == 2 || mode == 4;
+  const std::size_t els = rows * static_cast<std::size_t>(N);
+  for (std::size_t i = 0; i < els; i++) {
+    y[i] *= s[cols ? i % N : 0];
+  }
+}
+
 // result[M, N] = x[M, K] @ dequant(w), accumulating in float. transpose_w=true
 // means `w` decodes to [N, K] (the row-major weight convention); otherwise
-// [K, N]. `w` is contiguous wire bytes for the full matrix.
+// [K, N]. `w` is contiguous wire bytes for the full matrix. out_scale, in
+// out_scale_mode 1 or 3 (out_scale[0]) or 2 or 4 (out_scale[n]), multiplies
+// the float result before the cast to T; kq_out_scale_at_cpu gives the
+// pointer of an expert.
 template <typename T>
 void kquant_qmm_cpu(
     T* result,
@@ -65,7 +93,9 @@ void kquant_qmm_cpu(
     int N,
     int K,
     bool transpose_w,
-    const std::string& kquant_type);
+    const std::string& kquant_type,
+    const float* out_scale = nullptr,
+    int out_scale_mode = 0);
 
 // Small-M ceiling for the fused decode-then-dot GEMV path inside
 // kquant_qmm_cpu; larger M dequantizes once and runs a GEMM instead.
@@ -79,6 +109,8 @@ struct KQmvTask {
   const T* x; // [m, K]
   const uint8_t* w; // wire bytes for one [N, K] weight matrix
   int m;
+  const float* os = nullptr; // output scale, as kquant_qmm_cpu takes it
+  int os_mode = 0;
 };
 
 // Run a batch of same-codec, same-[N, K], transpose_w=true fused GEMVs as ONE

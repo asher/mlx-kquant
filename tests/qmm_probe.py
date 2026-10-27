@@ -80,7 +80,15 @@ def weights(codec, n, k, design):
             w, s = kq.quantize(wf, codec)
         elif design == "big" and is_synth(codec):
             rng = np.random.default_rng(n * 131 + k)
-            wire = synth_wire(rng, codec, bpb, n * (k // wpb), d_range=(1e-4, 4e-4))
+            # nvfp4 takes subnormal group scales, 2^-9 and 2^-8.
+            wire = synth_wire(
+                rng,
+                codec,
+                bpb,
+                n * (k // wpb),
+                d_range=(1e-4, 4e-4),
+                nvfp4_scales=(0x01, 0x03),
+            )
             w = mx.array(wire.reshape(n, (k // wpb) * bpb))
             s = mx.zeros((1,), dtype=mx.uint8)
         elif design == "big":

@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -305,7 +306,38 @@ inline void kq_moe_log_kname(const std::string& kname, int cap = 0) {
   }
 }
 
+// Output scales of the fused MoE ops (kq_out_scale.h): bits 0 to 2 are the
+// mode of the expert stacks' scales, bit 3 says the shared expert has one.
+// The scales are the op's last inputs, the routed ones first, gate before
+// up in a GLU.
+constexpr int KQ_MOE_SHEXP_SCALE = 8;
+
+inline int kq_moe_scale_inputs(int bits, bool glu) {
+  const int per = glu ? 2 : 1;
+  return ((bits & 7) ? per : 0) + ((bits & KQ_MOE_SHEXP_SCALE) ? per : 0);
+}
+
 #ifdef _METAL_
+inline void kq_moe_bind_scales(
+    mx::metal::CommandEncoder& ce,
+    const std::vector<mx::array>& inputs,
+    int bits,
+    bool glu) {
+  size_t i = inputs.size() - kq_moe_scale_inputs(bits, glu);
+  if (bits & 7) {
+    ce.set_input_array(inputs[i++], kq_out_scale_slot);
+    if (glu) {
+      ce.set_input_array(inputs[i++], kq_up_scale_slot);
+    }
+  }
+  if (bits & KQ_MOE_SHEXP_SCALE) {
+    ce.set_input_array(inputs[i++], kq_shexp_scale_slot);
+    if (glu) {
+      ce.set_input_array(inputs[i++], kq_shexp_up_scale_slot);
+    }
+  }
+}
+
 // Row-pair dedupe down projection (mix_ns and the shexp-slot mix): the
 // loop kernel's launch over row pairs; S is capped by the partial store.
 // NS is the shared slot count (unused by mix_ns).
@@ -326,8 +358,10 @@ inline void kq_gather_qmv_pair_gpu(
     int nx,
     int sg,
     int NS,
-    int SP) {
-  auto kernel = kq_get_kernel(d, kname, kq_moe_nx_setting());
+    int SP,
+    const std::vector<mx::array>& inputs,
+    int os_bits) {
+  auto kernel = kq_get_kernel_os(d, kname, os_bits, kq_moe_nx_setting());
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -345,6 +379,7 @@ inline void kq_gather_qmv_pair_gpu(
   ce.set_bytes(T, 10);
   ce.set_bytes(NS, 11);
   ce.set_bytes(SP, 12);
+  kq_moe_bind_scales(ce, inputs, os_bits, false);
   const int fsg = kq_moe_fit_sg(kernel, sg);
   MTL::Size group_dims(32, fsg, 1);
   MTL::Size grid_dims(N / (fsg * 32 / nx), 1, (T + 1) / 2);
@@ -668,11 +703,14 @@ void KQuantMoEGLUKQ::eval_gpu(
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
 
-  // Biased (swiglu_clamp) layout: gw, uw, gb, ub, x, indices.
-  const bool biased = inputs.size() == 6;
+  // Biased (swiglu_clamp) layout: gw, uw, gb, ub, x, indices. The scales
+  // follow.
+  const size_t n_base =
+      inputs.size() - kq_moe_scale_inputs(out_scale_bits_, true);
+  const bool biased = n_base == 6;
   const auto& gw = inputs[0];
   const auto& uw = inputs[1];
-  const auto& indices = inputs.back();
+  const auto& indices = inputs[n_base - 1];
   moe_check_stack("moe_glu_gather_kq", gw);
   moe_check_stack("moe_glu_gather_kq", uw);
   kq_check_weight_base(gw, kquant_type_, "moe_glu_gather_kq");
@@ -702,7 +740,8 @@ void KQuantMoEGLUKQ::eval_gpu(
       (biased ? "bias_" : "") + (use_half ? "h_" : "") + (dd ? "dd_" : "") +
       act_ + (c32 ? "_c32" : "") + kq_nx_suffix(nx) + "_" +
       kq_type_string(x.dtype());
-  auto kernel = kq_get_kernel(d, kname, kq_moe_nx_setting());
+  auto kernel =
+      kq_get_kernel_os(d, kname, out_scale_bits_, kq_moe_nx_setting());
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -729,6 +768,7 @@ void KQuantMoEGLUKQ::eval_gpu(
     ce.set_bytes(N, 6);
     ce.set_bytes(limit_, 7);
   }
+  kq_moe_bind_scales(ce, inputs, out_scale_bits_, true);
   // Tuned q6_k/q8_0 kernels (nx 8) are fixed at 2 simdgroups.
   const bool tuned = stem == "q6_k" || stem == "q8_0";
   const int sg = kq_moe_fit_sg(
@@ -748,8 +788,10 @@ void KQuantGatherQMVKQ::eval_gpu(
   auto& d = mx::metal::device(s.device);
   auto& out = outputs[0];
 
-  // Biased layout: w, b, x, indices (then the LoRA operands, if any).
-  const size_t n_base = inputs.size() - kq_lora_input_count(lora_flags_);
+  // Biased layout: w, b, x, indices (then the LoRA operands and the scale,
+  // if any).
+  const size_t n_base = inputs.size() - kq_lora_input_count(lora_flags_) -
+      kq_moe_scale_inputs(out_scale_bits_, false);
   const bool biased = n_base == 4;
   const auto& w = inputs[0];
   const auto& indices = inputs[n_base - 1];
@@ -783,13 +825,15 @@ void KQuantGatherQMVKQ::eval_gpu(
   std::string kname = "kq_" + stem + "_gather_qmv" + (biased ? "_bias" : "") +
       (use_half ? "_h" : "") + (c32 ? "_c32" : "") +
       (fine ? "_fine" : kq_nx_suffix(nx)) + "_" + kq_type_string(x.dtype());
-  auto kernel = kq_get_kernel(d, kname, fine ? nullptr : kq_moe_nx_setting());
+  auto kernel = kq_get_kernel_os(
+      d, kname, out_scale_bits_, fine ? nullptr : kq_moe_nx_setting());
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   if (use_half) {
     ce.set_threadgroup_memory_length((size_t)K * sizeof(uint16_t), 0);
   }
+  kq_moe_bind_scales(ce, inputs, out_scale_bits_, false);
   ce.set_input_array(w, 0);
   if (biased) {
     ce.set_input_array(inputs[1], 1);
@@ -904,7 +948,8 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   std::string kname = "kq_" + stem + "_moe_glu_gather_shexp_" +
       (use_half ? "h_" : "") + (dd ? "dd_" : "") + act + (c32 ? "_c32" : "") +
       kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
-  auto kernel = kq_get_kernel(d, kname, kq_moe_nx_setting());
+  auto kernel =
+      kq_get_kernel_os(d, kname, out_scale_bits_, kq_moe_nx_setting());
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -922,6 +967,7 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   ce.set_bytes(N, 8);
   ce.set_bytes(limit_, 9);
   ce.set_bytes(NS, 10);
+  kq_moe_bind_scales(ce, inputs, out_scale_bits_, true);
   const bool tuned = stem == "q6_k" || stem == "q8_0";
   const int sg = kq_moe_fit_sg(
       kernel,
@@ -984,7 +1030,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   if (form == KQ_MIX_SP) {
     const std::string kname = "kq_" + sp_stem + "_gather_qmv_mix_sp_" +
         (c32 ? "c32_" : "") + kq_type_string(x.dtype());
-    auto kernel = kq_get_kernel(d, kname);
+    auto kernel = kq_get_kernel_os(d, kname, out_scale_bits_, nullptr);
     // 64 threads per simdgroup pair must fit the pipeline; the loop kernel
     // serves the call when they do not.
     const int pairs = S - NS + NS * SP;
@@ -1005,6 +1051,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
       ce.set_bytes(SC, 9);
       ce.set_bytes(NS, 10);
       ce.set_bytes(SP, 11);
+      kq_moe_bind_scales(ce, inputs, out_scale_bits_, false);
       MTL::Size group_dims(32, 2 * pairs, 1);
       MTL::Size grid_dims(N / 8, 1, T);
       kq_log_dispatch(kname, x, out, grid_dims, group_dims);
@@ -1041,7 +1088,9 @@ void KQuantGatherQMVMixKQ::eval_gpu(
         nx,
         kq_moe_pick_sg(kquant_type_, N, nx),
         NS,
-        SP);
+        SP,
+        inputs,
+        out_scale_bits_);
     return;
   }
   int nx = nx_one;
@@ -1057,7 +1106,8 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   std::string kname = "kq_" + stem + "_gather_qmv_mix" +
       (use_half ? "_h" : "") + (c32 ? "_c32" : "") +
       (fine ? "_fine" : kq_nx_suffix(nx)) + "_" + kq_type_string(x.dtype());
-  auto kernel = kq_get_kernel(d, kname, fine ? nullptr : kq_moe_nx_setting());
+  auto kernel = kq_get_kernel_os(
+      d, kname, out_scale_bits_, fine ? nullptr : kq_moe_nx_setting());
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -1077,6 +1127,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   ce.set_bytes(SC, 9);
   ce.set_bytes(NS, 10);
   ce.set_bytes(SP, 11);
+  kq_moe_bind_scales(ce, inputs, out_scale_bits_, false);
   const int sg = kq_moe_fit_sg(
       kernel,
       use_half ? kq_moe_pick_sg_h(N, nx)
@@ -1154,7 +1205,9 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
         nx,
         kq_moe_pick_sg(kquant_type_, N, nx),
         0,
-        1);
+        1,
+        inputs,
+        out_scale_bits_);
   } else {
     bool sp = nx == 8 && kq_moe_sp((int64_t)T * (N / 8), S) &&
         kq_moe_mix_form(true, false) == KQ_MIX_SP;
@@ -1165,14 +1218,15 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
           kq_type_string(x.dtype());
     };
     std::string kname = ns_name(sp);
-    auto kernel = kq_get_kernel(d, kname, kq_moe_nx_setting());
+    auto kernel =
+        kq_get_kernel_os(d, kname, out_scale_bits_, kq_moe_nx_setting());
     // The slot-parallel kernel gives each slot its own simdgroup pair, so
     // its 64 * S threads cannot be halved the way the sg kernels can. When
     // the pipeline will not take that many, drop to the general kernel.
     if (sp && 64 * S > kq_moe_sp_cap(kernel)) {
       sp = false;
       kname = ns_name(sp);
-      kernel = kq_get_kernel(d, kname, kq_moe_nx_setting());
+      kernel = kq_get_kernel_os(d, kname, out_scale_bits_, kq_moe_nx_setting());
     }
     kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
     auto& ce = mx::metal::get_command_encoder(s);
@@ -1185,6 +1239,7 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
     ce.set_bytes(K, 5);
     ce.set_bytes(N, 6);
     ce.set_bytes(S, 7);
+    kq_moe_bind_scales(ce, inputs, out_scale_bits_, false);
     const int sg =
         sp ? 2 * S : kq_moe_fit_sg(kernel, kq_moe_pick_sg(kquant_type_, N, nx));
     MTL::Size group_dims(32, sg, 1);
@@ -1356,18 +1411,22 @@ void KQuantGatherQMVKQ::eval_cpu(
 bool KQuantMoEGLUKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMoEGLUKQ&>(other);
   return kquant_type_ == o.kquant_type_ && act_ == o.act_ &&
-      limit_ == o.limit_ && alpha_ == o.alpha_;
+      limit_ == o.limit_ && alpha_ == o.alpha_ &&
+      out_scale_bits_ == o.out_scale_bits_;
 }
 
 bool KQuantGatherQMVKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantGatherQMVKQ&>(other);
-  return kquant_type_ == o.kquant_type_ && lora_flags_ == o.lora_flags_;
+  return kquant_type_ == o.kquant_type_ && lora_flags_ == o.lora_flags_ &&
+      out_scale_bits_ == o.out_scale_bits_;
 }
 
 std::vector<mx::Shape> KQuantMoEGLUKQ::output_shapes(
     const std::vector<mx::array>& inputs) {
-  // Indices are the last input in both the unbiased and biased layouts.
-  const auto& idx = inputs.back();
+  // Indices are the last input before the scales in both the unbiased and
+  // biased layouts.
+  const auto& idx =
+      inputs[inputs.size() - 1 - kq_moe_scale_inputs(out_scale_bits_, true)];
   return {{idx.shape(0), idx.shape(1), inputs[0].shape(1)}};
 }
 
@@ -1389,12 +1448,13 @@ bool KQuantMoEGLUShexpKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMoEGLUShexpKQ&>(other);
   return kquant_type_ == o.kquant_type_ && act_ == o.act_ &&
       shexp_type_ == o.shexp_type_ && shexp_up_type_ == o.shexp_up_type_ &&
-      limit_ == o.limit_;
+      limit_ == o.limit_ && out_scale_bits_ == o.out_scale_bits_;
 }
 
 bool KQuantGatherQMVMixKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantGatherQMVMixKQ&>(other);
-  return kquant_type_ == o.kquant_type_ && shexp_type_ == o.shexp_type_;
+  return kquant_type_ == o.kquant_type_ && shexp_type_ == o.shexp_type_ &&
+      out_scale_bits_ == o.out_scale_bits_;
 }
 
 std::vector<mx::Shape> KQuantMoEGLUShexpKQ::output_shapes(
@@ -1418,7 +1478,8 @@ void KQuantGatherQMVMixNSKQ::eval_cpu(
 
 bool KQuantGatherQMVMixNSKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantGatherQMVMixNSKQ&>(other);
-  return kquant_type_ == o.kquant_type_ && lora_flags_ == o.lora_flags_;
+  return kquant_type_ == o.kquant_type_ && lora_flags_ == o.lora_flags_ &&
+      out_scale_bits_ == o.out_scale_bits_;
 }
 
 std::vector<mx::Shape> KQuantGatherQMVMixNSKQ::output_shapes(
@@ -1449,9 +1510,10 @@ std::vector<mx::Shape> KQuantMoERouterTopK::output_shapes(
 std::vector<mx::Shape> KQuantGatherQMVKQ::output_shapes(
     const std::vector<mx::array>& inputs) {
   // Indices are the last op input in both the unbiased and biased layouts
-  // (the LoRA operands, when present, trail them).
-  const auto& idx =
-      inputs[inputs.size() - 1 - kq_lora_input_count(lora_flags_)];
+  // (the LoRA operands and the scale, when present, trail them).
+  const auto& idx = inputs
+      [inputs.size() - 1 - kq_lora_input_count(lora_flags_) -
+       kq_moe_scale_inputs(out_scale_bits_, false)];
   return {{idx.shape(0), idx.shape(1), inputs[0].shape(1)}};
 }
 
@@ -1796,6 +1858,76 @@ mx::array prep_scores(const mx::array& sc, mx::StreamOrDevice s) {
   return mx::contiguous(mx::astype(sc, mx::float32, s), false, s);
 }
 
+// The scale mode of a fused MoE op's expert stacks (N columns, E experts),
+// and for a GLU the up scale's, which must match it.
+int moe_scale_bits(
+    const char* name,
+    const std::string& kquant_type,
+    int N,
+    int64_t E,
+    const std::optional<mx::array>& scale,
+    const char* what,
+    const std::optional<mx::array>* up = nullptr,
+    const char* up_what = nullptr) {
+  const int mode =
+      kq_out_scale_mode(scale, kquant_type, true, N, E, name, what);
+  if (up != nullptr &&
+      kq_out_scale_mode(*up, kquant_type, true, N, E, name, up_what) != mode) {
+    throw std::invalid_argument(
+        moe_op(name) + " " + what + " and " + up_what +
+        " go together, with one shape.");
+  }
+  return mode;
+}
+
+// The shared-expert scale bit of a fused MoE op: float32 (1,) on an nvfp4
+// shared expert, and for a GLU with an up scale beside it.
+int moe_shexp_scale_bit(
+    const char* name,
+    const std::string& shexp_type,
+    const std::optional<mx::array>& scale,
+    const char* what,
+    const std::optional<mx::array>* up = nullptr,
+    const char* up_what = nullptr) {
+  auto check = [&](const std::optional<mx::array>& v, const char* w) {
+    if (!v.has_value()) {
+      return;
+    }
+    if (shexp_type != "nvfp4") {
+      throw std::invalid_argument(
+          moe_op(name) + " " + w + " is for nvfp4 shared-expert weights, " +
+          "got '" + shexp_type + "'.");
+    }
+    if (v->dtype() != mx::float32 || v->ndim() != 1 || v->shape(0) != 1) {
+      std::ostringstream msg;
+      msg << moe_op(name) << " " << w << " must be float32 of shape (1,), got "
+          << v->dtype() << " " << v->shape() << ".";
+      throw std::invalid_argument(msg.str());
+    }
+  };
+  check(scale, what);
+  if (up != nullptr) {
+    check(*up, up_what);
+    if (up->has_value() != scale.has_value()) {
+      throw std::invalid_argument(
+          moe_op(name) + " " + what + " and " + up_what + " go together.");
+    }
+  }
+  return scale.has_value() ? KQ_MOE_SHEXP_SCALE : 0;
+}
+
+// Appends the given scales, last, in the order the kernels bind them.
+void moe_push_scales(
+    std::vector<mx::array>& inputs,
+    const mx::Stream& s,
+    std::initializer_list<const std::optional<mx::array>*> scales) {
+  for (const auto* v : scales) {
+    if (v->has_value()) {
+      inputs.push_back(kq_row_major(**v, s));
+    }
+  }
+}
+
 } // namespace
 
 mx::array moe_glu_gather(
@@ -1943,6 +2075,8 @@ mx::array moe_glu_gather_kq(
     const std::optional<mx::array>& gate_bias,
     const std::optional<mx::array>& up_bias,
     float alpha,
+    const std::optional<mx::array>& gate_scale,
+    const std::optional<mx::array>& up_scale,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   if (x.ndim() != 2) {
@@ -2006,6 +2140,15 @@ mx::array moe_glu_gather_kq(
       }
     }
   }
+  const int os_bits = moe_scale_bits(
+      "moe_glu_gather_kq",
+      kquant_type,
+      gate_w.shape(1),
+      gate_w.shape(0),
+      gate_scale,
+      "gate_scale",
+      &up_scale,
+      "up_scale");
 
   auto x_c = moe_dense_x(x, s);
   mx::Shape out_shape = {x.shape(0), indices.shape(1), gate_w.shape(1)};
@@ -2016,6 +2159,7 @@ mx::array moe_glu_gather_kq(
   }
   op_inputs.push_back(std::move(x_c));
   op_inputs.push_back(prep_indices(indices, s));
+  moe_push_scales(op_inputs, s, {&gate_scale, &up_scale});
   return mx::array(
       std::move(out_shape),
       dt,
@@ -2024,7 +2168,8 @@ mx::array moe_glu_gather_kq(
           kquant_type,
           act,
           (act == "silu_limit" || act == "swiglu_clamp") ? limit : 0.0f,
-          alpha),
+          alpha,
+          os_bits),
       std::move(op_inputs));
 }
 
@@ -2039,6 +2184,7 @@ mx::array gather_qmv_kq(
     const std::optional<mx::array>& lora_ids,
     const std::optional<mx::array>& lora_table,
     const std::optional<mx::array>& lora_rows,
+    const std::optional<mx::array>& out_scale,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   if (x.ndim() != 3) {
@@ -2071,6 +2217,13 @@ mx::array gather_qmv_kq(
           "expert stack.");
     }
   }
+  const int os_bits = moe_scale_bits(
+      "gather_qmv_kq",
+      kquant_type,
+      w.shape(1),
+      w.shape(0),
+      out_scale,
+      "out_scale");
 
   auto x_c = moe_dense_x(x, s);
   const int E = w.shape(0);
@@ -2102,10 +2255,11 @@ mx::array gather_qmv_kq(
       1,
       s,
       op_inputs);
+  moe_push_scales(op_inputs, s, {&out_scale});
   return mx::array(
       std::move(out_shape),
       dt,
-      std::make_shared<KQuantGatherQMVKQ>(s, kquant_type, lora_flags),
+      std::make_shared<KQuantGatherQMVKQ>(s, kquant_type, lora_flags, os_bits),
       std::move(op_inputs));
 }
 
@@ -2121,6 +2275,10 @@ mx::array moe_glu_gather_shexp_kq(
     const std::string& shexp_kquant_type,
     float limit,
     const std::string& shexp_up_kquant_type,
+    const std::optional<mx::array>& gate_scale,
+    const std::optional<mx::array>& up_scale,
+    const std::optional<mx::array>& shexp_gate_scale,
+    const std::optional<mx::array>& shexp_up_scale,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.moe_glu_gather_shexp_kq]";
@@ -2169,6 +2327,21 @@ mx::array moe_glu_gather_shexp_kq(
     throw std::invalid_argument(
         std::string(op) + " shared-expert gate/up widths must match.");
   }
+  const int os_bits = moe_scale_bits(
+                          "moe_glu_gather_shexp_kq",
+                          kquant_type,
+                          N,
+                          gate_w.shape(0),
+                          gate_scale,
+                          "gate_scale",
+                          &up_scale,
+                          "up_scale") |
+      moe_shexp_scale_bit("moe_glu_gather_shexp_kq",
+                          shexp_type,
+                          shexp_gate_scale,
+                          "shexp_gate_scale",
+                          &shexp_up_scale,
+                          "shexp_up_scale");
 
   auto x_c = moe_dense_x(x, s);
   mx::Shape out_shape = {x.shape(0), indices.shape(1) + ns, N};
@@ -2180,6 +2353,17 @@ mx::array moe_glu_gather_shexp_kq(
       shexp_gate_w, shexp_type, s, "moe_glu_gather_shexp_kq");
   kq_check_weight_base_at_build(
       shexp_up_w, shexp_up_type, s, "moe_glu_gather_shexp_kq");
+  std::vector<mx::array> op_inputs = {
+      std::move(gate_w),
+      std::move(up_w),
+      std::move(shexp_gate_w),
+      std::move(shexp_up_w),
+      std::move(x_c),
+      prep_indices(indices, s)};
+  moe_push_scales(
+      op_inputs,
+      s,
+      {&gate_scale, &up_scale, &shexp_gate_scale, &shexp_up_scale});
   return mx::array(
       std::move(out_shape),
       dt,
@@ -2189,13 +2373,9 @@ mx::array moe_glu_gather_shexp_kq(
           act,
           shexp_type,
           act == "silu_limit" ? limit : 0.0f,
-          shexp_up_type),
-      {std::move(gate_w),
-       std::move(up_w),
-       std::move(shexp_gate_w),
-       std::move(shexp_up_w),
-       std::move(x_c),
-       prep_indices(indices, s)});
+          shexp_up_type,
+          os_bits),
+      std::move(op_inputs));
 }
 
 mx::array gather_qmv_mix_kq(
@@ -2206,6 +2386,8 @@ mx::array gather_qmv_mix_kq(
     mx::array indices,
     mx::array scores,
     const std::string& shexp_kquant_type,
+    const std::optional<mx::array>& out_scale,
+    const std::optional<mx::array>& shexp_scale,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.gather_qmv_mix_kq]";
@@ -2241,20 +2423,34 @@ mx::array gather_qmv_mix_kq(
     throw std::invalid_argument(
         std::string(op) + " scores must be [T, S] or [T, S - k].");
   }
+  const int os_bits =
+      moe_scale_bits(
+          "gather_qmv_mix_kq",
+          kquant_type,
+          w.shape(1),
+          w.shape(0),
+          out_scale,
+          "out_scale") |
+      moe_shexp_scale_bit(
+          "gather_qmv_mix_kq", shexp_type, shexp_scale, "shexp_scale");
 
   auto x_c = moe_dense_x(x, s);
   mx::Shape out_shape = {x.shape(0), w.shape(1)};
   kq_check_weight_base_at_build(w, kquant_type, s, "gather_qmv_mix_kq");
   kq_check_weight_base_at_build(shexp_w, shexp_type, s, "gather_qmv_mix_kq");
+  std::vector<mx::array> op_inputs = {
+      std::move(w),
+      std::move(shexp_w),
+      std::move(x_c),
+      prep_indices(indices, s),
+      prep_scores(scores, s)};
+  moe_push_scales(op_inputs, s, {&out_scale, &shexp_scale});
   return mx::array(
       std::move(out_shape),
       dt,
-      std::make_shared<KQuantGatherQMVMixKQ>(s, kquant_type, shexp_type),
-      {std::move(w),
-       std::move(shexp_w),
-       std::move(x_c),
-       prep_indices(indices, s),
-       prep_scores(scores, s)});
+      std::make_shared<KQuantGatherQMVMixKQ>(
+          s, kquant_type, shexp_type, os_bits),
+      std::move(op_inputs));
 }
 
 mx::array gather_qmv_mix_ns_kq(
@@ -2268,6 +2464,7 @@ mx::array gather_qmv_mix_ns_kq(
     const std::optional<mx::array>& lora_ids,
     const std::optional<mx::array>& lora_table,
     const std::optional<mx::array>& lora_rows,
+    const std::optional<mx::array>& out_scale,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.gather_qmv_mix_ns_kq]";
@@ -2291,6 +2488,13 @@ mx::array gather_qmv_mix_ns_kq(
   int K = x.shape(2);
   check_kq_expert_stack(op, w, kquant_type, K);
   kq_check_weight_base_at_build(w, kquant_type, s, "gather_qmv_mix_ns_kq");
+  const int os_bits = moe_scale_bits(
+      "gather_qmv_mix_ns_kq",
+      kquant_type,
+      w.shape(1),
+      w.shape(0),
+      out_scale,
+      "out_scale");
 
   auto x_c = moe_dense_x(x, s);
   const int E = w.shape(0);
@@ -2320,10 +2524,12 @@ mx::array gather_qmv_mix_ns_kq(
       S,
       s,
       op_inputs);
+  moe_push_scales(op_inputs, s, {&out_scale});
   return mx::array(
       std::move(out_shape),
       dt,
-      std::make_shared<KQuantGatherQMVMixNSKQ>(s, kquant_type, lora_flags),
+      std::make_shared<KQuantGatherQMVMixNSKQ>(
+          s, kquant_type, lora_flags, os_bits),
       std::move(op_inputs));
 }
 

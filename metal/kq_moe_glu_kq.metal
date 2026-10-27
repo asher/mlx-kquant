@@ -68,155 +68,8 @@ instantiate_kq_moe_glu_kq_fine(q6_k, float16_t)
 instantiate_kq_moe_glu_kq_fine(q8_0, bfloat16_t)
 instantiate_kq_moe_glu_kq_fine(q8_0, float16_t)
 
-// Codec matrix (generic Ext-trait kernels; q6_k/q8_0 uniform stay on the
-// tuned kernels above). Names match the tuned scheme so dispatch is uniform.
-// Every op is emitted at NX = 8 (plain name, tuned-equivalent grid), 16
-// ("_nx16"), and 32 ("_nx32"); the wide K-lane variants trade rows per
-// threadgroup for threadgroup count so decode-scale launches fill the GPU.
-#define instantiate_kq_ext_uniform_nx(codec, traits, type, nx, sfx)           \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_silu" sfx "_" #type,                      \
-      kq_ext_moe_glu_gather, type, traits, KQ_GLU_ACT_SILU, nx)                \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_gelu" sfx "_" #type,                      \
-      kq_ext_moe_glu_gather, type, traits, KQ_GLU_ACT_GELU, nx)                \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_silu_limit" sfx "_" #type,                \
-      kq_ext_moe_glu_gather, type, traits, KQ_GLU_ACT_SILU_LIMIT, nx)          \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_gather_qmv" sfx "_" #type,                               \
-      kq_ext_gather_qmv, type, traits, nx)                                     \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_shexp_silu" sfx "_" #type,                \
-      kq_ext_moe_glu_gather_shexp, type, traits, traits, KQ_GLU_ACT_SILU, nx)  \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_shexp_gelu" sfx "_" #type,                \
-      kq_ext_moe_glu_gather_shexp, type, traits, traits, KQ_GLU_ACT_GELU, nx)  \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_gather_qmv_mix" sfx "_" #type,                           \
-      kq_ext_gather_qmv_mix, type, traits, traits, nx)                         \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_dd_silu" sfx "_" #type,                   \
-      kq_ext_moe_glu_gather_dd, type, traits, KQ_GLU_ACT_SILU, nx)             \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_dd_gelu" sfx "_" #type,                   \
-      kq_ext_moe_glu_gather_dd, type, traits, KQ_GLU_ACT_GELU, nx)             \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_dd_silu_limit" sfx "_" #type,             \
-      kq_ext_moe_glu_gather_dd, type, traits, KQ_GLU_ACT_SILU_LIMIT, nx)       \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_shexp_dd_silu" sfx "_" #type,             \
-      kq_ext_moe_glu_gather_shexp_dd, type, traits, traits, KQ_GLU_ACT_SILU, nx) \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_shexp_dd_gelu" sfx "_" #type,             \
-      kq_ext_moe_glu_gather_shexp_dd, type, traits, traits, KQ_GLU_ACT_GELU, nx) \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_gather_qmv_mix_dd" sfx "_" #type,                        \
-      kq_ext_gather_qmv_mix_pair, type, traits, traits, true, nx)              \
-
-// Slot-parallel shared-expert mix, NX = 8 only as for mix_ns.
-#define instantiate_kq_ext_mix_sp(stem, traits, straits, type)                \
-  instantiate_kernel(                                                         \
-      "kq_" stem "_gather_qmv_mix_sp_" #type,                                 \
-      kq_ext_gather_qmv_mix_sp, type, traits, straits, 8)
-
-#define instantiate_kq_ext_uniform(codec, traits, type)                       \
-  instantiate_kq_ext_uniform_nx(codec, traits, type, 8, "")                    \
-  instantiate_kq_ext_uniform_nx(codec, traits, type, 16, "_nx16")              \
-  instantiate_kq_ext_uniform_nx(codec, traits, type, 32, "_nx32")              \
-  instantiate_kq_ext_mix_sp(#codec, traits, traits, type)
-
-// Mixed-codec shared expert: shexp tensors in scodec over codec expert
-// stacks (UD-style upcast shexp). Dispatch key "kq_<codec>_sx_<scodec>_...".
-#define instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, nx, sfx) \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_silu" sfx "_" #type, \
-      kq_ext_moe_glu_gather_shexp, type, traits, straits, KQ_GLU_ACT_SILU, nx) \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_gelu" sfx "_" #type, \
-      kq_ext_moe_glu_gather_shexp, type, traits, straits, KQ_GLU_ACT_GELU, nx) \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_sx_" #scodec "_gather_qmv_mix" sfx "_" #type,            \
-      kq_ext_gather_qmv_mix, type, traits, straits, nx)                        \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_dd_silu" sfx "_" #type, \
-      kq_ext_moe_glu_gather_shexp_dd, type, traits, straits, KQ_GLU_ACT_SILU, nx) \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_dd_gelu" sfx "_" #type, \
-      kq_ext_moe_glu_gather_shexp_dd, type, traits, straits, KQ_GLU_ACT_GELU, nx) \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_sx_" #scodec "_gather_qmv_mix_dd" sfx "_" #type,         \
-      kq_ext_gather_qmv_mix_pair, type, traits, straits, true, nx)             \
-
-#define instantiate_kq_ext_sx(codec, traits, scodec, straits, type)           \
-  instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 8, "")        \
-  instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 16, "_nx16")  \
-  instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 32, "_nx32")  \
-  instantiate_kq_ext_mix_sp(#codec "_sx_" #scodec, traits, straits, type)
-
-// No-shared-expert mix (gemma-style weighted sum; always the generic kernel,
-// q6_k/q8_0 included).
-#define instantiate_kq_ext_mix_ns_nx(codec, traits, nx, sfx)                  \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_gather_qmv_mix_ns" sfx "_bfloat16_t",                    \
-      kq_ext_gather_qmv_mix_ns, bfloat16_t, traits, nx)                        \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_gather_qmv_mix_ns" sfx "_float16_t",                     \
-      kq_ext_gather_qmv_mix_ns, float16_t, traits, nx)                         \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_gather_qmv_mix_ns_dd" sfx "_bfloat16_t",                 \
-      kq_ext_gather_qmv_mix_pair, bfloat16_t, traits, traits, false, nx)       \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_gather_qmv_mix_ns_dd" sfx "_float16_t",                  \
-      kq_ext_gather_qmv_mix_pair, float16_t, traits, traits, false, nx)
-
-
-// The slot-parallel variant is NX = 8 only (wide K-lanes measured
-// flat-to-negative; sp multiplies threads without shortening K-chains).
-#define instantiate_kq_ext_mix_ns(codec, traits)                              \
-  instantiate_kq_ext_mix_ns_nx(codec, traits, 8, "")                           \
-  instantiate_kq_ext_mix_ns_nx(codec, traits, 16, "_nx16")                     \
-  instantiate_kq_ext_mix_ns_nx(codec, traits, 32, "_nx32")                     \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_gather_qmv_mix_ns_sp_bfloat16_t",                        \
-      kq_ext_gather_qmv_mix_ns_sp, bfloat16_t, traits, 8)                      \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_gather_qmv_mix_ns_sp_float16_t",                         \
-      kq_ext_gather_qmv_mix_ns_sp, float16_t, traits, 8)
-
-// Biased experts (gpt-oss): per-(expert, out_dim) f32 biases fused into the
-// GLU epilogue / qmv store. Only the clamped-SwiGLU epilogue is emitted --
-// biased expert checkpoints all use it.
-#define instantiate_kq_ext_bias_nx(codec, traits, type, nx, sfx)               \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_bias_swiglu_clamp" sfx "_" #type,         \
-      kq_ext_moe_glu_gather_bias, type, traits, KQ_GLU_ACT_SWIGLU_CLAMP, nx)   \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_gather_qmv_bias" sfx "_" #type,                          \
-      kq_ext_gather_qmv_bias, type, traits, nx)
-
-#define instantiate_kq_ext_bias(codec, traits, type)                           \
-  instantiate_kq_ext_bias_nx(codec, traits, type, 8, "")                       \
-  instantiate_kq_ext_bias_nx(codec, traits, type, 16, "_nx16")                 \
-  instantiate_kq_ext_bias_nx(codec, traits, type, 32, "_nx32")
-
-// q5_k shexp over any expert codec (UD-style upcast where the shexp lands
-// one tier below q6_k): nx 8 and 16 only, the auto pick caps at 16.
-#define instantiate_kq_ext_sx_q5k(codec, traits, type)                        \
-  instantiate_kq_ext_sx_nx(codec, traits, q5_k, KqQ5_KExt, type, 8, "")        \
-  instantiate_kq_ext_sx_nx(codec, traits, q5_k, KqQ5_KExt, type, 16, "_nx16")  \
-  instantiate_kq_ext_mix_sp(#codec "_sx_q5_k", traits, KqQ5_KExt, type)
-
-#define instantiate_kq_ext_all(codec, traits)                                 \
-  instantiate_kq_ext_uniform(codec, traits, bfloat16_t)                        \
-  instantiate_kq_ext_uniform(codec, traits, float16_t)                         \
-  instantiate_kq_ext_mix_ns(codec, traits)                                     \
-  instantiate_kq_ext_sx(codec, traits, q6_k, KqQ6_KExt, bfloat16_t)            \
-  instantiate_kq_ext_sx(codec, traits, q6_k, KqQ6_KExt, float16_t)             \
-  instantiate_kq_ext_sx(codec, traits, q8_0, KqQ8_0Ext, bfloat16_t)            \
-  instantiate_kq_ext_sx(codec, traits, q8_0, KqQ8_0Ext, float16_t)             \
-  instantiate_kq_ext_sx_q5k(codec, traits, bfloat16_t)                         \
-  instantiate_kq_ext_sx_q5k(codec, traits, float16_t)
+// The generic Ext-trait instantiation macros are in kq_moe_glu_kq.h, which
+// kq_moe_glu_kq_os.metal shares for the nvfp4 kernels.
 
 instantiate_kq_ext_all(q2_k, KqQ2_KExt)
 instantiate_kq_ext_all(q3_k, KqQ3_KExt)
@@ -246,11 +99,8 @@ instantiate_kq_ext_all(pq2_0, KqPq2_0Ext)
 instantiate_kq_ext_all(q2_0, KqQ2_0Ext)
 instantiate_kq_ext_all(ptq1_0, KqPtq1_0Ext)
 instantiate_kq_ext_all(mxfp4, KqMxfp4Ext)
-instantiate_kq_ext_all(nvfp4, KqNvfp4Ext)
 instantiate_kq_ext_bias(mxfp4, KqMxfp4Ext, bfloat16_t)
 instantiate_kq_ext_bias(mxfp4, KqMxfp4Ext, float16_t)
-instantiate_kq_ext_bias(nvfp4, KqNvfp4Ext, bfloat16_t)
-instantiate_kq_ext_bias(nvfp4, KqNvfp4Ext, float16_t)
 
 // q6_k/q8_0 experts with the OTHER upcast shexp codec (diagonals covered by
 // the tuned kernels).

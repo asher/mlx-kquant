@@ -1069,7 +1069,7 @@ instantiate_kquant_prism_for_type(ptq1_0, 128, 1, float16_t)
 // Register-resident MMA verify kernels (kq_verify_mma.h), M <= 8. The
 // activations stay in bf16 or f16 and each block sums in float. The _h
 // twins stage half activations and sum in half (KQ_VERIFY_MMA_HALF);
-// ptq1_0 and q4_1 have none.
+// ptq1_0, q4_1 and nvfp4 have none.
 #define instantiate_kquant_verify_mma(type, gs, bits, codec)          \
   instantiate_kernel(                                                 \
       "kquant_" #codec "_verify_mma_" #type "_gs_" #gs "_b_" #bits,   \
@@ -1116,6 +1116,8 @@ instantiate_kquant_verify_mma(bfloat16_t, 32, 4, q4_1)
 instantiate_kquant_verify_mma(float16_t, 32, 4, q4_1)
 instantiate_kquant_verify_mma(bfloat16_t, 32, 8, q8_0)
 instantiate_kquant_verify_mma(float16_t, 32, 8, q8_0)
+instantiate_kquant_verify_mma(bfloat16_t, 64, 4, nvfp4)
+instantiate_kquant_verify_mma(float16_t, 64, 4, nvfp4)
 instantiate_kquant_verify_mma_h(bfloat16_t, 128, 2, pq2_0)
 instantiate_kquant_verify_mma_h(float16_t, 128, 2, pq2_0)
 instantiate_kquant_verify_mma_h(bfloat16_t, 64, 2, q2_0)
@@ -1237,7 +1239,8 @@ instantiate_kquant_gather_qmm_rhs_codec(128, 1, ptq1_0)
 // and rounds once. Float partials (P = float, the _pf32 kernels) keep the
 // result at that one output rounding; T partials add one T rounding per
 // slice. One thread per output element; cost is noise next to the GEMM
-// pass.
+// pass. With an output scale (kq_out_scale.h) the sum is scaled before the
+// rounding; n_cols is N, for mode 2.
 template <typename T, typename P = T>
 [[kernel]] void kq_qmm_splitk_accum(
     const device P* partials [[buffer(0)]],
@@ -1245,6 +1248,9 @@ template <typename T, typename P = T>
     const constant int& n_elems [[buffer(2)]],
     const constant int& splits [[buffer(3)]],
     const constant int& stride [[buffer(4)]],
+    const constant int& n_cols
+    [[buffer(5), function_constant(kq_has_out_scale)]],
+    KQ_OUT_SCALE_ARG,
     uint gid [[thread_position_in_grid]]) {
   if (gid >= static_cast<uint>(n_elems)) {
     return;
@@ -1253,6 +1259,9 @@ template <typename T, typename P = T>
   for (int z = 0; z < splits; ++z) {
     acc += static_cast<float>(
         partials[static_cast<int64_t>(z) * stride + gid]);
+  }
+  if (kq_has_out_scale) {
+    acc *= kq_out_scale_col(out_scale, gid % static_cast<uint>(n_cols));
   }
   y[gid] = static_cast<T>(acc);
 }

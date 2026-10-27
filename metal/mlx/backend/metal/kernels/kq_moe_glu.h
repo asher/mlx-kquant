@@ -27,25 +27,16 @@
 // The load / E8M0-scale / fp4-dot primitives are self-contained (kq_ prefix):
 // the stock fp_quantized.h copies collide with this repo's quantized_utils.h
 // shims, and the decode must stay bit-identical to MLX's mode="mxfp4" path
-// (OCP E2M1 value table, one E8M0 scale per 32 values).
+// (OCP E2M1 values, one E8M0 scale per 32 values).
 
-constant float kq_fp4_e2m1_lut[16] = {
-    0.0f,
-    0.5f,
-    1.0f,
-    1.5f,
-    2.0f,
-    3.0f,
-    4.0f,
-    6.0f,
-    -0.0f,
-    -0.5f,
-    -1.0f,
-    -1.5f,
-    -2.0f,
-    -3.0f,
-    -4.0f,
-    -6.0f};
+// Two E2M1 codes at bits 0..3 and 16..19 of n to their values through one
+// half2, as kq_fp_e2m1_pair in kq_quantized_fp.h (kept local so this header
+// stays self-contained): code bits to half bits 11..9, sign to 15, times 2^14.
+inline float2 kq_fp4_e2m1_pair(uint n) {
+  const half2 h =
+      as_type<half2>(((n & 0x00070007u) << 9) | ((n & 0x00080008u) << 12));
+  return float2(h * half2(16384.0h));
+}
 
 // 2^(e-127) built from bits, matching MLX's fp8_e8m0 float conversion:
 // metal::exp2 is fast-math and lands ulps off on some compiler versions.
@@ -66,10 +57,12 @@ inline U kq_fp4_qdot(const device uint8_t* w, const thread U* xt, U scale) {
   U accum = 0;
   const device uint16_t* ws = (const device uint16_t*)w;
   for (int i = 0; i < VPT / 4; i++) {
-    accum += xt[4 * i + 0] * kq_fp4_e2m1_lut[(ws[i] >> 0) & 0xF] +
-        xt[4 * i + 1] * kq_fp4_e2m1_lut[(ws[i] >> 4) & 0xF] +
-        xt[4 * i + 2] * kq_fp4_e2m1_lut[(ws[i] >> 8) & 0xF] +
-        xt[4 * i + 3] * kq_fp4_e2m1_lut[(ws[i] >> 12) & 0xF];
+    // codes 0 and 2 at bits 0 and 16, codes 1 and 3 after the shift by 4
+    const uint u = uint(ws[i]) | (uint(ws[i]) << 8);
+    const float2 v02 = kq_fp4_e2m1_pair(u);
+    const float2 v13 = kq_fp4_e2m1_pair(u >> 4);
+    accum += xt[4 * i + 0] * v02.x + xt[4 * i + 1] * v13.x +
+        xt[4 * i + 2] * v02.y + xt[4 * i + 3] * v13.y;
   }
   return scale * accum;
 }

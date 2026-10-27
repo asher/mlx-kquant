@@ -56,6 +56,7 @@ CLEAR = {
     "KQ_VERIFY_NAX": None,
     "KQ_VERIFY_NAX_SPLITS": None,
     "KQ_VNAX_X16": None,
+    "KQ_VERIFY_NAX_NVFP4_SB": None,
 }
 # (family the arm may be declined for, rows, K, env). The split-K tile is
 # BM=8 through M 8, BM=16 through M 16 and the plain tile above; the NAX
@@ -83,6 +84,9 @@ OFF_STEP = ("_verify_nax_", 8, K + 64, {"KQ_QMM_ROUTE": "verify_nax", **STRICT})
 # split count divides the K steps: 16 of 256 at K, 65 of 64 at K + 64.
 MULTI = {"KQ_NAX_QMV": "0", "KQ_VERIFY_NAX": "2"}
 MULTI_ARMS = [(8, K, "2"), (8, K + 64, "5")]
+# nvfp4 picks its four-block verify_nax kernel by shape, which these N do
+# not reach, so its verify_nax and multi calls also run it forced.
+SB_FORCE = {"nvfp4": {"KQ_VERIFY_NAX_NVFP4_SB": "1"}}
 
 
 def _host_names():
@@ -126,12 +130,16 @@ def test_every_split_kernel_runs(codec):
     arms = list(ARMS)
     if (K + 64) % CODEC_GEOMETRY[codec][3] == 0:
         arms.append(OFF_STEP)
+    sb = [{}] + ([SB_FORCE[codec]] if codec in SB_FORCE else [])
     calls, families = [], []
     for dtype in ("bfloat16", "float16"):
         for f32 in ("0", "1"):
             for n in (256, 250):
                 for family, m, k, env in arms:
-                    for off in (0, 4) if family == "_verify_nax_" else (0,):
+                    vnax = family == "_verify_nax_"
+                    for off, extra in (
+                        [(o, e) for o in (0, 4) for e in sb] if vnax else [(0, {})]
+                    ):
                         calls.append(
                             {
                                 "codec": codec,
@@ -140,14 +148,14 @@ def test_every_split_kernel_runs(codec):
                                 "dtype": dtype,
                                 "seed": 1,
                                 "x_offset": off,
-                                "env": {**CLEAR, **env, "KQ_SPLITK_F32": f32},
+                                "env": {**CLEAR, **env, **extra, "KQ_SPLITK_F32": f32},
                             }
                         )
                         families.append(family)
                 for m, k, splits in MULTI_ARMS:
                     if k % CODEC_GEOMETRY[codec][3]:
                         continue
-                    for off in (0, 4):
+                    for off, extra in [(o, e) for o in (0, 4) for e in sb]:
                         calls.append(
                             {
                                 "codec": codec,
@@ -160,6 +168,7 @@ def test_every_split_kernel_runs(codec):
                                 "env": {
                                     **CLEAR,
                                     **MULTI,
+                                    **extra,
                                     "KQ_VERIFY_NAX_SPLITS": splits,
                                     "KQ_SPLITK_F32": f32,
                                 },
