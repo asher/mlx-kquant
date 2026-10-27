@@ -396,6 +396,7 @@ static int kq_prism_verify_max_m() {
 // and M3 verify_qmv runs faster at K 2048 and below (0.57-0.99x at M2,
 // 0.61-0.91x at M3). From M4, where the old route is the bm8 split-K tile,
 // the kernel runs 1.00-1.4x faster (geometric mean 1.10-1.25x per M).
+// nvfp4 has no entry until it is measured on a GPU without NAX.
 static int kq_verify_mma_min_m(const std::string& t, bool f16) {
   if (t == "pq2_0" || t == "q2_0") {
     return f16 ? 4 : 3;
@@ -1312,6 +1313,11 @@ static bool kq_verify_mma_has_half(const std::string& t) {
   return t == "pq2_0" || t == "q2_0" || t == "q4_0" || t == "q8_0";
 }
 
+// verify_mma codecs whose kernel takes the output scale.
+static bool kq_verify_mma_has_os(const std::string& t) {
+  return t == "nvfp4";
+}
+
 // KQ_VERIFY_MMA_HALF=1 (probe lever, read live) runs the half kernels on
 // the codecs that have them, for timing against the float kernels. They
 // stage the activations as half and sum each block in half, so their range
@@ -1484,7 +1490,7 @@ void qmm_splitk(
 // grid z with qmm_splitk's partial/fold shape; slices are whole wire
 // blocks. Non-batched transpose shapes, bf16 or f16 activations, which
 // stay in their dtype while each block sums in float. kq_verify_mma_half
-// selects the half kernels.
+// selects the half kernels. os needs kq_verify_mma_has_os.
 void verify_mma(
     const array& x,
     const array& w,
@@ -1498,7 +1504,8 @@ void verify_mma(
     int splits,
     Device& d,
     const Stream& s,
-    const std::string& kquant_type) {
+    const std::string& kquant_type,
+    const KqOutScale& os = {}) {
   const int rows = codec_verify_mma_rows(kquant_type);
   const int k_partition = (K / group_size / splits) * group_size;
   const int part_stride = M * N;
@@ -1506,8 +1513,10 @@ void verify_mma(
   auto& ce = mx::metal::get_command_encoder(s);
   // One split writes out directly; the partials and the fold exist only
   // for splits > 1.
-  const KqSplitkPartials pp = splits > 1 ? kq_splitk_partials(x.dtype())
+  const KqSplitkPartials pp = splits > 1 ? kq_splitk_partials(x.dtype(), os)
                                          : KqSplitkPartials{x.dtype(), ""};
+  // One split scales in the kernel, more in the fold.
+  const KqOutScale kos = splits > 1 ? KqOutScale{} : os;
   array partials({splits, M, N}, pp.dtype, nullptr, {});
   if (splits > 1) {
     partials.set_data(mx::allocator::malloc(partials.nbytes()));
@@ -1523,7 +1532,7 @@ void verify_mma(
       kq_verify_mma_half(kquant_type),
       pp.suffix);
 
-  auto kernel = kq_get_kernel(d, kname);
+  auto kernel = kq_get_kernel_os(d, kname, kos);
   ce.set_compute_pipeline_state(kernel);
 
   int c = 0;
@@ -1536,6 +1545,7 @@ void verify_mma(
   ce.set_bytes(M, c++);
   ce.set_bytes(k_partition, c++);
   ce.set_bytes(part_stride, c++);
+  kq_bind_out_scale(ce, kos);
   MTL::Size group_dims(256, 1, 1);
   MTL::Size grid_dims((N + rows - 1) / rows, 1, splits);
   kq_log_qmm(kname, M, N, K, grid_dims, group_dims, x);
@@ -1544,19 +1554,7 @@ void verify_mma(
     return;
   }
 
-  const std::string aname = kq_splitk_accum_kname(type_string, pp.suffix);
-  auto accum = kq_get_kernel(d, aname);
-  ce.set_compute_pipeline_state(accum);
-  const int n_elems = M * N;
-  c = 0;
-  ce.set_input_array(partials, c++);
-  ce.set_output_array(out, c++);
-  ce.set_bytes(n_elems, c++);
-  ce.set_bytes(splits, c++);
-  ce.set_bytes(part_stride, c++);
-  MTL::Size agrid(static_cast<size_t>(n_elems), 1, 1);
-  MTL::Size agroup(256, 1, 1);
-  ce.dispatch_threads(agrid, agroup);
+  kq_splitk_fold(ce, d, partials, out, type_string, pp, splits, M, N, os);
 }
 
 // The several-weight form of kq_verify_nax_kname.
@@ -2756,7 +2754,7 @@ bool kq_forced_route(
     return true;
   }
   if (r == "verify_qmv") {
-    // verify_qmv and verify_mma have no output scale epilogue.
+    // verify_qmv has no output scale epilogue.
     if (!os && M >= 2 && M <= verify_qmv_max_rows() &&
         N % kquant_qmv_bn(t) == 0 && K % qmv_fast_k_align() == 0 &&
         codec_has_verify_qmv(t)) {
@@ -2775,9 +2773,10 @@ bool kq_forced_route(
   }
   if (r == "verify_mma") {
     const int rows = codec_verify_mma_rows(t);
-    if (!os && rows > 0 && M <= 8) {
+    if ((!os || kq_verify_mma_has_os(t)) && rows > 0 && M <= 8) {
       const int sp = kq_verify_mma_splits(N, K, group_size, rows);
-      verify_mma(x16(), w, scales, out, group_size, bits, M, N, K, sp, d, s, t);
+      verify_mma(
+          x16(), w, scales, out, group_size, bits, M, N, K, sp, d, s, t, os);
       return true;
     }
     return false;
@@ -3458,10 +3457,11 @@ void KQuantMatmul::eval_gpu_base(
         ? kq_verify_mma_min_m_nax(kquant_type_)
         : kq_verify_mma_min_m(kquant_type_, x.dtype() == mx::float16);
   }
-  // verify_mma and verify_qmv have no output scale epilogue.
-  const bool vmma_route = !os && vmma_rows > 0 && vmma_min_m > 0 &&
-      M >= vmma_min_m && M <= 8 && transpose_ && non_batched &&
-      x.dtype() != mx::float32;
+  // verify_qmv has no output scale epilogue, and verify_mma has one on
+  // the codecs of kq_verify_mma_has_os.
+  const bool vmma_route = (!os || kq_verify_mma_has_os(kquant_type_)) &&
+      vmma_rows > 0 && vmma_min_m > 0 && M >= vmma_min_m && M <= 8 &&
+      transpose_ && non_batched && x.dtype() != mx::float32;
 
   // NAX split-K, entering at kq_splitk_nax_min_m through M32; see
   // qmm_nax_splitk. Slice unit max(block, BK) keeps every slice starting
@@ -3521,7 +3521,20 @@ void KQuantMatmul::eval_gpu_base(
   if (vmma_route) {
     const int sp = kq_verify_mma_splits(N, K, group_size_, vmma_rows);
     verify_mma(
-        x, w, scales, out, group_size_, bits_, M, N, K, sp, d, s, kquant_type_);
+        x,
+        w,
+        scales,
+        out,
+        group_size_,
+        bits_,
+        M,
+        N,
+        K,
+        sp,
+        d,
+        s,
+        kquant_type_,
+        os);
     return;
   }
 

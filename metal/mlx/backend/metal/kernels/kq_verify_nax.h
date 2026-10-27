@@ -169,19 +169,7 @@ struct KqQ2_0Nax {
   }
 };
 
-// NVFP4 codes to half, four at a time. kq_nvfp4_nibs keeps the low
-// nibble of each byte of w, or the high one, with its sign moved to bit 6
-// and e1 e0 m left in bits 0..2. kq_nvfp4_pair moves bytes 0 and 2, or 1
-// and 3, to half bits 15 and 11..9, which is the E2M1 value times 2^-14.
-// Times a UE4M3 scale the value stays exact in half.
-METAL_FUNC uint kq_nvfp4_nibs(uint w, bool hi) {
-  return hi ? (((w >> 4) & 0x07070707u) | ((w >> 1) & 0x40404040u))
-            : ((w & 0x07070707u) | ((w << 3) & 0x40404040u));
-}
-METAL_FUNC half2 kq_nvfp4_pair(uint l, bool odd) {
-  return as_type<half2>(
-      odd ? ((l & 0xFF00FF00u) << 1) : ((l & 0x00FF00FFu) << 9));
-}
+// kq_nvfp4_nibs and kq_nvfp4_pair: kq_quantized_fp.h.
 
 // NVFP4: lane-quad q owns 16-weight group q, its UE4M3 scale byte q and qs
 // bytes 8q..8q+7. Step s takes the low nibbles of word s & 1 for s < 2 and

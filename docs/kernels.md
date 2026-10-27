@@ -562,7 +562,7 @@ activation row. It serves M 2 below the `verify_mma` entry on GPUs without NAX, 
 re-decode per row costs `ptq1_0` 3x. On NAX GPUs per-row qmv serves M 2.
 
 `nvfp4` (64-wide blocks of four 16-weight groups) runs its NAX tiles through the same loader as the
-Prism codecs and takes the grid class large-M row. It has a `verify_nax` kernel and no `verify_mma`
+Prism codecs and takes the grid class large-M row. It has a `verify_nax` kernel and a `verify_mma`
 kernel. Its NAX routes are measured on M5 Max. Per-row qmv keeps M 6 at N 512 and below, M 3 at N
 1024 and M 2 above, except on a vocab head, where `mv_ext` takes M 2. NAX split-K enters at M 2 for
 N 1024 and below and at M 6 above, and `verify_nax` enters by shape, as described with the other
@@ -582,30 +582,32 @@ of a gpt-oss 20B prefill chunk (32 experts, 2048 tokens at top 4, K and N 2880),
 takes 2.94 ms on M5 Max, against 9.5-12.4 ms on the ALU kernel.
 
 The register-resident MMA verify kernels (`verify_mma`) serve `pq2_0`, `ptq1_0`, `q2_0`, `q4_0`,
-`q4_1` and `q8_0` through M 8. Each simdgroup decodes a block of its weight rows straight into 8x8
-simdgroup-matrix fragments, with the k order inside the block permuted so every lane extracts the
-code pairs it holds cheapest, and multiplies them against the activations staged once per K chunk,
-so the weight bytes are read once for all M rows and the tile's threadgroup staging of the weights
-disappears. Split-K over the wire blocks feeds the same partial fold as `qmm_splitk` on the
-projection shapes; a head-sized N already fills the GPU with one split and writes the output
+`q4_1`, `q8_0` and `nvfp4` through M 8. Each simdgroup decodes a block of its weight rows straight
+into 8x8 simdgroup-matrix fragments, with the k order inside the block permuted so every lane
+extracts the code pairs it holds cheapest, and multiplies them against the activations staged once
+per K chunk, so the weight bytes are read once for all M rows and the tile's threadgroup staging of
+the weights disappears. Split-K over the wire blocks feeds the same partial fold as `qmm_splitk` on
+the projection shapes; a head-sized N already fills the GPU with one split and writes the output
 directly.
 
-A threadgroup is 8 simdgroups, and each owns two 8-row tiles on `q4_0`, `q4_1` and `q8_0` and one on
-`pq2_0`, `q2_0` and `ptq1_0` (`q2_0` runs the `pq2_0` chain at 8 fragment MMAs per 64-weight block
-and takes its one-tile layout, which is not measured for it). A `pq2_0` block runs its 16 fragment
-MMAs into one accumulator per row tile, so the MMAs form a dependent chain whose latency, longer in
-float than in half, bounds the kernel. At two row tiles per simdgroup the float kernel took about
-twice the time of the half kernel on the M5 Max. One row tile doubles the threadgroups that hide the
-latency, and the float kernel then runs in 0.45-0.52x of its two-tile time over the Qwen3.8-27B
-projection and head shapes at M 2 to 8. Splitting each chain over two or four accumulators recovered
-most of that too, and staging the activations as half with float accumulators did not. `q4_0` and
-`ptq1_0` gained nothing from either change.
+A threadgroup is 8 simdgroups, and each owns two 8-row tiles on `q4_0`, `q4_1`, `q8_0` and `nvfp4`
+and one on `pq2_0`, `q2_0` and `ptq1_0` (`q2_0` runs the `pq2_0` chain at 8 fragment MMAs per
+64-weight block and takes its one-tile layout, which is not measured for it). A `pq2_0` block runs
+its 16 fragment MMAs into one accumulator per row tile, so the MMAs form a dependent chain whose
+latency, longer in float than in half, bounds the kernel. At two row tiles per simdgroup the float
+kernel took about twice the time of the half kernel on the M5 Max. One row tile doubles the
+threadgroups that hide the latency, and the float kernel then runs in 0.45-0.52x of its two-tile
+time over the Qwen3.8-27B projection and head shapes at M 2 to 8. Splitting each chain over two or
+four accumulators recovered most of that too, and staging the activations as half with float
+accumulators did not. `q4_0` and `ptq1_0` gained nothing from either change.
 
 The kernels decode the codes exactly in half and keep the activations in their own dtype in
 threadgroup memory. Both widen to float in the fragment, so each block sums in float and the block
 scale applies in float. Unsplit, or split with float partials (the float16 default, and
 `KQ_SPLITK_F32=1`), the result rounds once, as the mat-vec kernels do with the exact weights, at any
-activation magnitude. `KQ_VERIFY_MMA_HALF=1` runs the half kernels of `pq2_0`, `q2_0`, `q4_0` and
+activation magnitude. `nvfp4` folds each group scale into its codes, which stay exact in half at
+2^-14 of each weight, and multiplies the sum by 2^14 at the store, together with the `out_scale`
+of the call. `KQ_VERIFY_MMA_HALF=1` runs the half kernels of `pq2_0`, `q2_0`, `q4_0` and
 `q8_0`, which stage the activations as half and sum each block in half. There an activation beyond the half
 range (magnitude 65504), such as a bfloat16 outlier, turns to inf, and so does a block sum past it.
 On ordinary activations with float partials, the error of the half kernels runs 0.4 to 0.9 output
@@ -616,7 +618,8 @@ half kernels at 1.1 to 1.4 on bfloat16 and 4 to 7.5 on float16, and the float ke
 both. Against the half kernels over the same shapes and M on the M5 Max, the float kernels take
 0.90-1.00x the time for `pq2_0` and 0.94-1.02x for `q4_0` on bfloat16, and 0.99-1.01x for `pq2_0`
 and 1.00-1.05x for `q4_0` on float16. `ptq1_0` has no half kernels, since in float it runs in
-0.90-1.03x the time of a half build.
+0.90-1.03x the time of a half build. `nvfp4` has none either: at 2^-14 of their value many of its
+weight products fall below the half normal range.
 
 A codec with a block min, `q4_1` (w = d * code + m), uses the same fragments with the codes
 unscaled. While the activations of a K chunk are staged, each simdgroup also sums the 32
@@ -644,8 +647,8 @@ projection and head shapes with the weights streamed from DRAM
 (`benchmarks/bench_verify_routes.py`), against the mat-vec route each displaces, on bfloat16
 activations: `pq2_0` 1.1-1.3x at M 5 and 1.6-2.1x at M 8, `ptq1_0` 1.0-1.2x at M 3 and 2.5-3.1x at M
 8, `q4_0` 1.0-1.4x at M 5 and 1.1-1.4x at M 8. Float16 activations give the same entries. The `q8_0`
-kernel has no default entry on either class of GPU, so it runs only where `KQ_VERIFY_MMA` or
-`KQ_QMM_ROUTE=verify_mma` forces it.
+and `nvfp4` kernels have no default entry on either class of GPU, so they run only where
+`KQ_VERIFY_MMA` or `KQ_QMM_ROUTE=verify_mma` forces them.
 
 On NAX GPUs, the register-fed NAX verify kernels (`verify_nax`) serve `pq2_0`, `q4_0`, `q4_1`,
 `q8_0`, `q2_k` to `q6_k`, `iq4_xs`, `iq4_nl` and `nvfp4` from a per-codec entry through M 8, above

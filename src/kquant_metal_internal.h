@@ -233,10 +233,11 @@ inline int verify_qmv_max_rows() {
 
 // Codecs with a register-resident MMA verify kernel (kq_verify_mma.h) and
 // the output rows one of its threadgroups covers: 8 simdgroups of 8-row
-// tiles, two tiles each for q4_0, q4_1 and q8_0 and one for pq2_0, q2_0
-// and ptq1_0; 0 for codecs without the kernel. M <= 8 only.
+// tiles, two tiles each for q4_0, q4_1, q8_0 and nvfp4 and one for pq2_0,
+// q2_0 and ptq1_0; 0 for codecs without the kernel. M <= 8 only.
 inline int codec_verify_mma_rows(const std::string& kquant_type) {
-  if (kquant_type == "q4_0" || kquant_type == "q4_1" || kquant_type == "q8_0") {
+  if (kquant_type == "q4_0" || kquant_type == "q4_1" || kquant_type == "q8_0" ||
+      kquant_type == "nvfp4") {
     return 128;
   }
   if (kquant_type == "pq2_0" || kquant_type == "q2_0" ||

@@ -665,6 +665,63 @@ struct KqNvfp4Ext {
   }
 };
 
+// NVFP4 codes to half, four at a time. kq_nvfp4_nibs keeps the low
+// nibble of each byte of w, or the high one, with its sign moved to bit 6
+// and e1 e0 m left in bits 0..2. kq_nvfp4_pair moves bytes 0 and 2, or 1
+// and 3, to half bits 15 and 11..9, which is the E2M1 value times 2^-14.
+// Times a UE4M3 scale the value stays exact in half.
+METAL_FUNC uint kq_nvfp4_nibs(uint w, bool hi) {
+  return hi ? (((w >> 4) & 0x07070707u) | ((w >> 1) & 0x40404040u))
+            : ((w & 0x07070707u) | ((w << 3) & 0x40404040u));
+}
+METAL_FUNC half2 kq_nvfp4_pair(uint l, bool odd) {
+  return as_type<half2>(
+      odd ? ((l & 0xFF00FF00u) << 1) : ((l & 0x00FF00FFu) << 9));
+}
+
+// Register-resident MMA verify (kq_verify_mma.h). Lane pair L owns
+// 16-weight group L: its scale byte and qs bytes 8L..8L+7 as two words.
+// Fragment f takes word (f >> 1) & 1, its low nibbles for f < 4 and its
+// high ones after, and pair f & 1 of kq_nvfp4_pair: weights 4 (f >> 1) +
+// (f & 1) and that plus 2 of the group, times the group scale. Each weight
+// is exact in half at 2^-14 of its value, and d_scale restores the factor
+// at the store.
+struct KqNvfp4Mma {
+  static constant constexpr int block_k = KQ_NVFP4_SUPERBLOCK;
+  static constant constexpr int block_bytes = KQ_NVFP4_BLOCK_BYTES;
+  static constant constexpr bool codes_scaled = true;
+  static constant constexpr float d_scale = 16384.0f;
+  static METAL_FUNC int perm(int f, int col) {
+    return 16 * (col / 2) + 4 * (f >> 1) + (f & 1) + 2 * (col & 1);
+  }
+  template <int NT, typename X, typename A>
+  static METAL_FUNC void block(
+      thread const KqVmmaRows<NT>& rows,
+      int boff,
+      short L,
+      short fm,
+      const threadgroup X* xb,
+      thread simdgroup_matrix<A, 8, 8> (&acc)[NT]) {
+    uint2 q[NT];
+    half d[NT];
+    for (short t = 0; t < NT; ++t) {
+      const device uint8_t* bp = rows.p[t] + boff;
+      d[t] = half(kq_fp_ue4m3_scale(bp[L]));
+      q[t] = kq_nvfp4_group_qs(bp, L);
+    }
+    for (short f = 0; f < 8; ++f) {
+      half2 a[NT];
+      for (short t = 0; t < NT; ++t) {
+        const uint wv = (f & 2) ? q[t].y : q[t].x;
+        a[t] = kq_nvfp4_pair(kq_nvfp4_nibs(wv, f >= 4), f & 1) * d[t];
+      }
+      kq_vmma_step<NT>(xb + 8 * perm(f, fm), a, acc);
+    }
+  }
+};
+
+KQ_DEFINE_VERIFY_MMA_KERNEL_OS(nvfp4, KqNvfp4Mma, 2, 1)
+
 template <typename T, short r1ptg, short nsg, short nxpsg>
 [[kernel]] void kq_nvfp4_mv_ext(
     const device uint8_t* w,

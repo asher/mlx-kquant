@@ -48,7 +48,7 @@ FORCE_CPU = bool(os.environ.get("KQUANT_FORCE_CPU"))
 # Two unit roundoffs: 2 * 2^-8 for bfloat16, 2 * 2^-11 for float16.
 TOL = {"bfloat16": 2.0**-7, "float16": 2.0**-10}
 FLOOR = {"bfloat16": 2.0**-126, "float16": 2.0**-14}
-ROUTES = ("qmv", "mv_ext", "verify_nax", "splitk", "nax", "nax_splitk")
+ROUTES = ("qmv", "mv_ext", "verify_mma", "verify_nax", "splitk", "nax", "nax_splitk")
 WIRES = ("nvfp4_all", "nvfp4_low", "nvfp4_mid", "mxfp4_all", "mxfp4_mid")
 
 
@@ -163,9 +163,9 @@ def test_matmul_routes(name, dtn, M):
 
 # One-hot activations make each output one weight times 1, so every
 # kernel must reproduce every weight of the wire exactly, whatever its sum
-# order. Row m of x is one-hot at column M j + m. nvfp4 runs both
-# verify_nax kernels (KQ_VERIFY_NAX_NVFP4_SB=0 and 1), and every wire runs
-# each forced route that serves M 8.
+# order. Row m of x is one-hot at column M j + m. nvfp4 runs verify_mma
+# and both verify_nax kernels (KQ_VERIFY_NAX_NVFP4_SB=0 and 1), and every
+# wire runs each forced route that serves M 8.
 @pytest.mark.skipif(FORCE_CPU, reason="the forced routes are Metal paths")
 @pytest.mark.parametrize("name,dtn", [a for n in WIRES for a in _arms(n, one_hot=True)])
 def test_one_hot_rows_reproduce_every_weight(name, dtn):
@@ -211,8 +211,10 @@ def test_one_hot_rows_reproduce_every_weight(name, dtn):
                 os.environ[k] = v
     assert ran, "no forced route served the cell"
     if codec == "nvfp4":
-        vnax = {("verify_nax", None), ("verify_nax", "0"), ("verify_nax", "1")}
-        assert vnax <= set(ran), ran
+        want_ran = {("verify_mma", None)}
+        if kq.nax_available():
+            want_ran |= {("verify_nax", None), ("verify_nax", "0"), ("verify_nax", "1")}
+        assert want_ran <= set(ran), ran
 
 
 def _experts(name):

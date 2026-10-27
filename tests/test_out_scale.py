@@ -38,7 +38,7 @@ K = 512
 FORCE_CPU = bool(os.environ.get("KQUANT_FORCE_CPU"))
 TOL = {"bfloat16": 2.0**-7, "float16": 2.0**-10}
 FLOOR = {"bfloat16": 2.0**-126, "float16": 2.0**-14}
-ROUTES = ("qmv", "mv_ext", "verify_nax", "splitk", "nax", "nax_splitk")
+ROUTES = ("qmv", "mv_ext", "verify_mma", "verify_nax", "splitk", "nax", "nax_splitk")
 MS = (1, 4, 8, 16, 64, 256)
 Z = mx.zeros((1,), mx.uint8)
 
@@ -46,9 +46,9 @@ Z = mx.zeros((1,), mx.uint8)
 def _arms(bound, forced=True):
     """(name, env) per route arm. The CPU stream has one route; its NEON
     GEMV rounds activations to int8 by design, so only the bit checks run
-    it. verify_nax_1 runs verify_nax in one split, which scales in the
-    kernel; the default route does so at N 18944, K 3584. The verify_nax_sb
-    arms run nvfp4's four-block kernel."""
+    it. verify_nax_1 and verify_mma_1 run those kernels in one split, which
+    scales in the kernel; the default route does so at N 18944, K 3584. The
+    verify_nax_sb arms run nvfp4's four-block kernel."""
     if FORCE_CPU:
         neon = [] if bound else [("cpu_neon", {})]
         return [("cpu", {"KQ_CPU_NEON": "0"})] + neon
@@ -60,10 +60,12 @@ def _arms(bound, forced=True):
     one = {"KQ_QMM_ROUTE": "verify_nax", "KQ_VERIFY_NAX_SPLITS": "1", **strict}
     sb = {"KQ_QMM_ROUTE": "verify_nax", "KQ_VERIFY_NAX_NVFP4_SB": "1", **strict}
     sb_1 = {**sb, "KQ_VERIFY_NAX_SPLITS": "1"}
+    mma = {"KQ_QMM_ROUTE": "verify_mma", "KQ_VERIFY_MMA_SPLITS": "1", **strict}
     return arms + [
         ("verify_nax_1", one),
         ("verify_nax_sb", sb),
         ("verify_nax_sb_1", sb_1),
+        ("verify_mma_1", mma),
     ]
 
 
@@ -223,7 +225,13 @@ def test_real_scales_against_float64(dtn, N, M):
         for s, y in zip(scales, ys, strict=True):
             _bound_check(y, ref * s, bound * s, dtn)
 
-    _routes(x, w, scales, check, bound=True)
+    ran = _routes(x, w, scales, check, bound=True)
+    # The verify kernels serve the band split and in one split.
+    if not FORCE_CPU and M <= 8:
+        want = {"verify_mma", "verify_mma_1"}
+        if kq.nax_available():
+            want |= {"verify_nax", "verify_nax_1"}
+        assert want <= set(ran), ran
 
 
 @pytest.mark.parametrize("M", (1, 8, 256))
@@ -387,6 +395,7 @@ def test_float16_split_partials_ignore_the_lever():
     for route, ms in (
         ("splitk", (4, 16)),
         ("nax_splitk", (4, 16)),
+        ("verify_mma", (2, 8)),
         ("verify_nax", (2, 8)),
     ):
         for m in ms:

@@ -399,7 +399,7 @@ def test_nax_midm_targets(codec, dtype, f32_env):
 # at every row count and both activation dtypes it is instantiated for,
 # on an aligned and a ragged N (the row clamp past N). K=1000 blocks the
 # route (the codecs need a whole number of wire blocks), so K stays 1024.
-VERIFY_MMA_CODECS = ["pq2_0", "ptq1_0", "q2_0", "q4_0", "q4_1", "q8_0"]
+VERIFY_MMA_CODECS = ["pq2_0", "ptq1_0", "q2_0", "q4_0", "q4_1", "q8_0", "nvfp4"]
 VERIFY_MMA_MS = [2, 3, 4, 5, 6, 7, 8]
 
 
@@ -441,7 +441,7 @@ def test_verify_mma_band(codec, n_out, dtype, verify_mma_forced):
 
 
 # Output rows per verify_mma threadgroup: 8 simdgroups of 8-row tiles, one
-# tile each on pq2_0, ptq1_0 and q2_0 and two on q4_0, q4_1 and q8_0.
+# tile each on pq2_0, ptq1_0 and q2_0 and two on q4_0, q4_1, q8_0 and nvfp4.
 VERIFY_MMA_ROWS = {
     "pq2_0": 64,
     "ptq1_0": 64,
@@ -449,6 +449,7 @@ VERIFY_MMA_ROWS = {
     "q4_0": 128,
     "q4_1": 128,
     "q8_0": 128,
+    "nvfp4": 128,
 }
 
 
@@ -511,8 +512,8 @@ def test_verify_mma_default_matches_forced(codec, monkeypatch):
 
 # verify_mma entries on GPUs without NAX (kq_verify_mma_min_m), per
 # activation dtype. The default route runs verify_mma from the entry
-# through M 8 and another route below it and at M 9. q8_0 has no default
-# entry.
+# through M 8 and another route below it and at M 9. q8_0 and nvfp4 have
+# no default entry.
 VMMA_ALU_ENTRY = {
     "pq2_0": {"bfloat16": 3, "float16": 4},
     "q2_0": {"bfloat16": 3, "float16": 4},
@@ -520,6 +521,7 @@ VMMA_ALU_ENTRY = {
     "q4_0": {"bfloat16": 2, "float16": 2},
     "q4_1": {"bfloat16": 4, "float16": 4},
     "q8_0": {"bfloat16": 9, "float16": 9},
+    "nvfp4": {"bfloat16": 9, "float16": 9},
 }
 
 
@@ -566,7 +568,7 @@ def test_qmm_route_probe(codec, route, monkeypatch):
     _sweep(codec, w, s, ref_w, 1000, ms=[1, 2, 5, 8, 12, 16, 33])
 
 
-VMMA_CODECS = ["pq2_0", "ptq1_0", "q2_0", "q4_0", "q4_1", "q8_0"]
+VMMA_CODECS = ["pq2_0", "ptq1_0", "q2_0", "q4_0", "q4_1", "q8_0", "nvfp4"]
 # verify_nax entries on NAX GPUs below N 100000 (kq_verify_nax_min_m).
 # q2_k enters one row earlier above N 4096. The nvfp4 entry moves with the
 # shape (_nvfp4_vnax_entry); listed here at N 1000, K 1024.
@@ -810,11 +812,13 @@ def test_verify_mma_entries_f16(codec, monkeypatch):
 
 # verify_mma sums each block in float, so one activation channel near the
 # top of the half range stays finite and within the contract
-# (tests/test_verify_mma_range.py goes past that range).
+# (tests/test_verify_mma_range.py goes past that range). nvfp4 takes group
+# scales of 2^-6 to 2^-5, so the output stays inside the float16 range.
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("codec", VMMA_CODECS)
 def test_verify_mma_outlier_channel(codec, dtype, monkeypatch):
-    w, s, ref_w = _setup(codec, 1000)
+    synth = {"nvfp4_scales": (0x08, 0x11)} if codec == "nvfp4" else {}
+    w, s, ref_w = _setup(codec, 1000, **synth)
     monkeypatch.setenv("KQ_QMM_ROUTE", "verify_mma")
     monkeypatch.setenv("KQ_QMM_ROUTE_STRICT", "1")
     for m in (2, 5, 8):
