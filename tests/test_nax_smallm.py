@@ -473,9 +473,9 @@ def test_verify_mma_grid(codec, dtype):
 @pytest.mark.parametrize("codec", VERIFY_MMA_CODECS)
 def test_verify_mma_ragged_chunk(codec, verify_mma_forced):
     # 2176 = 17 blocks of 128: one split of 4 full 512-wide chunks plus a
-    # 128-wide tail for the Prism codecs, and 4 splits of 512 + 32 for
-    # q4_0, q4_1 and q8_0, so the partial-chunk path runs on both block
-    # widths.
+    # 128-wide tail for pq2_0 and ptq1_0, 2 splits of 512 + 512 + 64 for
+    # q2_0 and nvfp4, and 4 splits of 512 + 32 for q4_0, q4_1 and q8_0, so
+    # the partial-chunk path runs on every block width.
     k = 2176
     w, s, ref_w = _verify_mma_setup(codec, 1000, k=k)
     _sweep(codec, w, s, ref_w, 1000, ms=[2, 8], k=k)

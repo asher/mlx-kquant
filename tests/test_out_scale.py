@@ -420,6 +420,24 @@ def test_float16_split_partials_ignore_the_lever():
 
 
 @pytest.mark.skipif(FORCE_CPU, reason="GPU route")
+def test_verify_mma_lever_takes_the_scale():
+    # KQ_VERIFY_MMA=2 runs verify_mma on the default route, and a call with
+    # a scale takes it too, split (the fold scales) and in one split.
+    calls = [
+        {"M": m, "dtype": dt, "env": {"KQ_VERIFY_MMA": "2", **sp}}
+        for m in (2, 8)
+        for dt in ("bfloat16", "float16")
+        for sp in ({}, {"KQ_VERIFY_MMA_SPLITS": "1"})
+    ]
+    res = _child({"N": 256, "K": 4096, "calls": calls}, {})
+    for c, r in zip(calls, res, strict=True):
+        names = [x.split()[2] for x in r["log"] if x.startswith("[kq qmm]")]
+        # The unscaled call, then the scaled one.
+        assert len(names) == 2 and all("_verify_mma_" in n for n in names), (c, names)
+        assert r["finite"] and r["err"] <= TOL[c["dtype"]], (c, r["err"])
+
+
+@pytest.mark.skipif(FORCE_CPU, reason="GPU route")
 def test_dequantize_route():
     # The route's floor for nvfp4: M 2048, K and N 3840.
     calls = [
