@@ -410,15 +410,14 @@ def _child(spec, env):
 def test_float16_split_partials_ignore_the_lever():
     # KQ_SPLITK_F32=0 stores float16 partials, which the unscaled sums
     # overflow to inf or, where the fold meets both signs, NaN. A call with
-    # a scale stores float partials anyway.
+    # a scale stores float partials anyway. The NAX routes run only on a GPU
+    # that has NAX.
     strict = {"KQ_QMM_ROUTE_STRICT": "1"}
+    routes = [("splitk", (4, 16)), ("verify_mma", (2, 8))]
+    if kq.nax_available():
+        routes += [("nax_splitk", (4, 16)), ("verify_nax", (2, 8))]
     calls = []
-    for route, ms in (
-        ("splitk", (4, 16)),
-        ("nax_splitk", (4, 16)),
-        ("verify_mma", (2, 8)),
-        ("verify_nax", (2, 8)),
-    ):
+    for route, ms in routes:
         for m in ms:
             calls.append(
                 {"M": m, "dtype": "float16", "env": {"KQ_QMM_ROUTE": route, **strict}}
@@ -428,16 +427,12 @@ def test_float16_split_partials_ignore_the_lever():
         what = (c["env"]["KQ_QMM_ROUTE"], c["M"])
         assert not r["unscaled_finite"], what
         assert r["finite"] and r["err"] <= TOL["float16"], (what, r["err"])
-        splits = [
-            x
-            for x in r["log"]
-            if "grid=" in x and not x.split("grid=")[1].endswith(",1")
-        ]
         names = [x.split()[2] for x in r["log"] if x.startswith("[kq qmm]")]
-        # The unscaled call, then the scaled one.
-        assert len(names) == 2, r["log"]
+        grids = [x.split("grid=")[1].split()[0] for x in r["log"] if "grid=" in x]
+        # The unscaled call, then the scaled one, each split along grid z.
+        assert len(names) == len(grids) == 2, r["log"]
         assert not names[0].endswith("_pf32") and names[1].endswith("_pf32"), names
-        assert splits, r["log"]
+        assert all(g.split(",")[2] != "1" for g in grids), grids
 
 
 @pytest.mark.skipif(FORCE_CPU, reason="GPU route")
