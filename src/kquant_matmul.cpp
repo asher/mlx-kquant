@@ -2955,6 +2955,8 @@ std::vector<mx::array> KQuantMatmul::vjp(
           std::nullopt,
           std::nullopt,
           std::nullopt,
+          std::nullopt,
+          std::nullopt,
           stream()));
     } else if (arg == 1) {
       throw std::invalid_argument(

@@ -126,15 +126,18 @@ class KQuantLinear(nn.Module):
         self.freeze()
 
     def __call__(self, x, lora=None):
-        # ``lora``: ``(a_t, b_t)`` or ``(a_t, b_t, rows)`` for the in-op LoRA
-        # epilogue (quantized_matmul's lora_a / lora_b / lora_rows): the
-        # adapter delta rides the base matmul's own primitive, so a live GGUF
-        # LoRA adds no graph ops at decode. Tables in the activation dtype.
+        # ``lora``: ``(a_t, b_t)``, ``(a_t, b_t, rows)`` or ``(a_t, b_t, rows,
+        # ids[, table])`` for the in-op LoRA epilogue (quantized_matmul's
+        # lora_a / lora_b / lora_rows / lora_ids / lora_table): the adapter
+        # delta rides the base matmul's own primitive, so a live GGUF LoRA
+        # adds no graph ops at decode. Tables in the activation dtype; with
+        # ids they are stacks, [S, K, r] and [S, r, N].
         lkw = {}
         if lora is not None:
             lkw = {"lora_a": lora[0], "lora_b": lora[1]}
-            if len(lora) > 2 and lora[2] is not None:
-                lkw["lora_rows"] = lora[2]
+            for i, key in ((2, "lora_rows"), (3, "lora_ids"), (4, "lora_table")):
+                if len(lora) > i and lora[i] is not None:
+                    lkw[key] = lora[i]
         # Decode (M=1) with a real bias: fuse the add into the qmv/qmv_fast
         # dispatch instead of a separate elementwise op -- see
         # quantized_matmul_qmv_bias's docstring for the exact shape contract.

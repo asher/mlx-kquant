@@ -102,6 +102,8 @@ mx::array resid_composed(
       std::nullopt,
       std::nullopt,
       std::nullopt,
+      std::nullopt,
+      std::nullopt,
       s);
   if (gate.has_value()) {
     y = mx::multiply(*gate, y, s);

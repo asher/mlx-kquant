@@ -193,6 +193,8 @@ mx::array glu_composed(
       std::nullopt,
       std::nullopt,
       std::nullopt,
+      std::nullopt,
+      std::nullopt,
       s);
   auto u = quantized_matmul(
       x,
@@ -200,6 +202,8 @@ mx::array glu_composed(
       scales,
       kquant_type,
       true,
+      std::nullopt,
+      std::nullopt,
       std::nullopt,
       std::nullopt,
       std::nullopt,
@@ -494,6 +498,8 @@ std::vector<mx::array> multi_composed(
         scales,
         kquant_type,
         true,
+        std::nullopt,
+        std::nullopt,
         std::nullopt,
         std::nullopt,
         std::nullopt,

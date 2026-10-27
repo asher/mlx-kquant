@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""LoRA epilogue validation: the optional lora_a / lora_b / lora_rows (and
-lora_ids / lora_table on the gathered ops) operands of quantized_matmul,
+"""LoRA epilogue validation: the optional lora_a / lora_b / lora_rows and
+lora_ids / lora_table operands of quantized_matmul,
 quantized_matmul_qmv_bias, gather_qmv_kq and gather_qmv_mix_ns_kq, checked
 against an independent f32 reference (gguf-py dequant + numpy) across the
 codec matrix, the base routes (M=1 qmv, M in [2, 8] verify, M=64 qmm) and
@@ -185,6 +185,105 @@ def test_dense_operand_validation():
             "q8_0",
             lora_a=mx.zeros((kk, 600), dtype=mx.float16),
             lora_b=mx.zeros((600, rows_n), dtype=mx.float16),
+        )
+
+
+@pytest.mark.parametrize("codec", ["q4_k", "q6_k", "q8_0"])
+@pytest.mark.parametrize("m", [1, 2, 8, 64])
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_dense_stacked_epilogue_picks_each_rows_adapter(codec, m, dtype):
+    """A stack of adapters on one dense op: lora_ids picks each row's
+    entry, lora_table remaps it (below 0 skips the row) and lora_rows
+    scales it, on every base route."""
+    gtype, is_kq = CODECS[codec]
+    wire, ref = _lin_wire_ref(codec, gtype, is_kq)
+    rows_n, kk = ref.shape
+    lin = KQuantLinear(in_dims=kk, out_dims=rows_n, bias=False, codec=codec)
+    lin.weight = mx.array(wire)
+    rng = np.random.default_rng(13)
+    s = 3
+    x = mx.array((rng.standard_normal((m, kk)) * 0.1).astype(np.float32)).astype(dtype)
+    a, b, a32, b32 = _lora(rng, (s, kk, RANK), (s, RANK, rows_n), dtype)
+    ids = rng.integers(0, s, m).astype(np.uint32)
+    table = np.array([-1, 2, 0], dtype=np.int32)  # entry 0 skips its rows
+    fac = rng.uniform(0.25, 1.0, m).astype(np.float32)
+    base = lin(x)
+    got = lin(x, lora=(a, b, None, mx.array(ids)))
+    got_tab = lin(x, lora=(a, b, mx.array(fac), mx.array(ids), mx.array(table)))
+    mx.eval(base, got, got_tab)
+    x32 = _f32(x)
+    want = np.stack([(x32[i] @ a32[e]) @ b32[e] for i, e in enumerate(ids)])
+    assert _rel(_f32(got) - _f32(base), want) < DELTA_TOL
+    want_tab = np.stack(
+        [
+            np.zeros(rows_n, np.float32)
+            if table[e] < 0
+            else fac[i] * ((x32[i] @ a32[table[e]]) @ b32[table[e]])
+            for i, e in enumerate(ids)
+        ]
+    )
+    dt = _f32(got_tab) - _f32(base)
+    skipped = table[ids] < 0
+    assert np.array_equal(_f32(got_tab)[skipped], _f32(base)[skipped])
+    if (~skipped).any():
+        assert _rel(dt[~skipped], want_tab[~skipped]) < DELTA_TOL
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_qmv_bias_route_carries_the_stacked_epilogue(dtype):
+    wire, ref = _lin_wire_ref("q8_0", GT.Q8_0, False)
+    rows_n, kk = ref.shape
+    lin = KQuantLinear(in_dims=kk, out_dims=rows_n, bias=True, codec="q8_0")
+    lin.weight = mx.array(wire)
+    rng = np.random.default_rng(17)
+    lin.bias = mx.array((rng.standard_normal(rows_n) * 0.1).astype(np.float32))
+    x = mx.array((rng.standard_normal((1, kk)) * 0.1).astype(np.float32)).astype(dtype)
+    a, b, a32, b32 = _lora(rng, (2, kk, RANK), (2, RANK, rows_n), dtype)
+    got = lin(x, lora=(a, b, None, mx.array([1], dtype=mx.uint32)))
+    base = lin(x)
+    mx.eval(got, base)
+    x32 = _f32(x)
+    assert _rel(_f32(got) - _f32(base), (x32 @ a32[1]) @ b32[1]) < DELTA_TOL
+
+
+def test_dense_stacked_operand_validation():
+    wire, ref = _lin_wire_ref("q8_0", GT.Q8_0, False)
+    rows_n, kk = ref.shape
+    w = mx.array(wire)
+    scales = mx.zeros((1,), dtype=mx.float16)
+    x = mx.zeros((2, kk), dtype=mx.float16)
+    a3 = mx.zeros((2, kk, RANK), dtype=mx.float16)
+    b3 = mx.zeros((2, RANK, rows_n), dtype=mx.float16)
+    ids = mx.zeros((2,), dtype=mx.uint32)
+    with pytest.raises(ValueError, match="need lora_ids"):
+        kq.quantized_matmul(x, w, scales, "q8_0", lora_a=a3, lora_b=b3)
+    with pytest.raises(ValueError, match="need stacked"):
+        kq.quantized_matmul(
+            x, w, scales, "q8_0", lora_a=a3[0], lora_b=b3[0], lora_ids=ids
+        )
+    with pytest.raises(ValueError, match="lora_table needs lora_ids"):
+        kq.quantized_matmul(
+            x,
+            w,
+            scales,
+            "q8_0",
+            lora_a=a3,
+            lora_b=b3,
+            lora_table=mx.zeros((2,), dtype=mx.int32),
+        )
+    with pytest.raises(ValueError, match="lora_ids must match"):
+        kq.quantized_matmul(
+            x,
+            w,
+            scales,
+            "q8_0",
+            lora_a=a3,
+            lora_b=b3,
+            lora_ids=mx.zeros((3,), dtype=mx.uint32),
+        )
+    with pytest.raises(ValueError, match="leading dim"):
+        kq.quantized_matmul(
+            x, w, scales, "q8_0", lora_a=a3, lora_b=b3[:1], lora_ids=ids
         )
 
 

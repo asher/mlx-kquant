@@ -34,15 +34,18 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
 - **`gather_qmv_bias`** - gathered matvec with a fused expert bias on MLX's packed mxfp4 layout (the
   counterpart to the K-quant gathers above for that codec).
 - **LoRA epilogue** - `quantized_matmul`, `quantized_matmul_qmv_bias`, `gather_qmv_kq` and
-  `gather_qmv_mix_ns_kq` accept `lora_a` / `lora_b` (plus `lora_rows`, and `lora_ids` / `lora_table`
-  on the gathers) and add `rows * (x @ A) @ B` on their own output inside the primitive. Rows
+  `gather_qmv_mix_ns_kq` accept `lora_a` / `lora_b` (plus `lora_rows`, `lora_ids` and `lora_table`)
+  and add `rows * (x @ A) @ B` on their own output inside the primitive. On the dense ops,
+  `lora_ids` with stacked factors (`lora_a` [S, K, r], `lora_b` [S, r, N]) gives each row its own
+  adapter, so several adapters share one base matmul in a batch at one dispatch. Rows
   routes run one epilogue dispatch after the base route; the score-mixed gather forms `z = x @ A`
   in a kernel dispatched before the base gather (it reads only x and A, so the encoder overlaps the
   two) and applies `z @ B` in a barrier-free kernel after it, so the serialized cost behind the
   gather is one tiny dependent kernel. Codec independent, so a live adapter adds no graph ops at
   decode on any codec; `lora_table` remaps gathered ids (arena slot to expert, negative skips) and
   `lora_rows` scales rows (0 skips). f16/bf16 activations, rank x slots <= 512, inference only.
-  `mlx_kquant.HAS_LORA_EPILOGUE` marks the build; `KQuantLinear(x, lora=(a_t, b_t, rows))` forwards.
+  `mlx_kquant.HAS_LORA_EPILOGUE` marks the build and `HAS_LORA_STACK` the dense stack;
+  `KQuantLinear(x, lora=(a_t, b_t, rows, ids, table))` forwards.
   The epilogue kernels walk every LoRA operand as dense row-major memory; operands that evaluate
   to a strided view (an unevaluated array reports the default dense layout at op build, and
   `mx.repeat` of one value evaluates to a stride-0 broadcast) are copied into a dense temporary

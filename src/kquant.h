@@ -136,6 +136,9 @@ mx::array dequantize(
 // dtype, lora_rows f32 [rows] per-row scale): out += lora_rows * (x @
 // lora_a) @ lora_b as a second dispatch on the same output, any codec and
 // route, zero extra graph ops. Inference-only (vjp throws with it set).
+// Stacked adapters: lora_a [S, K, r] and lora_b [S, r, N] with lora_ids
+// uint32 [rows], the stack entry of each row, remapped through lora_table
+// (1-D, entries < 0 skip the row) when given.
 mx::array quantized_matmul(
     mx::array x,
     mx::array w,
@@ -145,6 +148,8 @@ mx::array quantized_matmul(
     const std::optional<mx::array>& lora_a = std::nullopt,
     const std::optional<mx::array>& lora_b = std::nullopt,
     const std::optional<mx::array>& lora_rows = std::nullopt,
+    const std::optional<mx::array>& lora_ids = std::nullopt,
+    const std::optional<mx::array>& lora_table = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // Bias-fused quantized matmul: x (float) @ dequant(w) + bias, fusing the add
@@ -165,6 +170,8 @@ mx::array quantized_matmul_qmv_bias(
     const std::optional<mx::array>& lora_a = std::nullopt,
     const std::optional<mx::array>& lora_b = std::nullopt,
     const std::optional<mx::array>& lora_rows = std::nullopt,
+    const std::optional<mx::array>& lora_ids = std::nullopt,
+    const std::optional<mx::array>& lora_table = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // Gather (mixture-of-experts) quantized matmul: for each output row, select an

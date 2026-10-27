@@ -132,10 +132,15 @@ from .kvarn import KVARN_RECORD_VERSION, kvarn_rotate  # noqa: F401
 # gather_qmv_kq and gather_qmv_mix_ns_kq: the delta is applied by an
 # epilogue dispatch inside those ops, on every codec and route.
 HAS_LORA_EPILOGUE = True
+# quantized_matmul and quantized_matmul_qmv_bias take lora_ids / lora_table
+# with stacked factors (lora_a [S, K, r], lora_b [S, r, N]): one adapter of
+# the stack per row.
+HAS_LORA_STACK = True
 
 __all__ = [
     "__version__",
     "HAS_LORA_EPILOGUE",
+    "HAS_LORA_STACK",
     "KVARN_RECORD_VERSION",
     "add_rmsnorm",
     "add_rmsnorm_norm",
