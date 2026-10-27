@@ -469,7 +469,8 @@ static int kq_verify_mma_min_m_nax(const std::string& t) {
 // 248320 and K 2048 to 17408, against the routes of its kq_nax_small_m row
 // with per-row qmv off. Times below are of the kernel against the route it
 // displaces at the entry. Per-row qmv runs ahead of the entry, through M 2
-// above N 1024 and M 3 at N 513 to 1024. A vocab head enters at M 3 (0.91x
+// above N 1024 (M 1 on a vocab head) and M 3 at N 513 to 1024. A vocab
+// head enters at M 3 (0.91x
 // on bf16, 0.96x on f16). N 512 and below has no entry: past its qmv limit
 // the kernel ran 0.92x the time of NAX split-K at K 2048 but 1.01-1.06x from
 // K 4096. N 513 to 1024 enters at M 2 (0.75-0.86x). N 1025 to 2048 enters
@@ -662,7 +663,7 @@ static KqNaxSmallM kq_nax_small_m(const std::string& t) {
     // through M 8 at K 2048 to 4096 and through M 4 at K 8192, so the row
     // takes M 6, 1.00-1.07x the fastest route per shape over M 2 to 12. At
     // N 1024 it takes M 3, where qmv ran 1.08-1.5x faster than verify_nax
-    // at K 2048 to 5120 and 1.05x slower at K 8192. Above N 2048 it takes M
+    // at K 2048 to 5120 and 1.05x slower at K 8192. Above N 1024 it takes M
     // 2 (1.00-1.10x the fastest route), except on a vocab head, where
     // mv_ext ran 1.17-1.29x faster (kq_nax_qmv_max_m).
     return {{6, 3, 2, 2}, 2, 6};
@@ -1745,7 +1746,8 @@ void verify_nax(
 // verify_nax over up to four weights that share x, in one dispatch
 // (kq_verify_nax_multi): weight i takes ceil(N_i / 128) threadgroups of
 // grid x after those of the weights before it, and reads its own buffer.
-// The split count is the one verify_nax takes for the joint grid. Split
+// The kstep (and with it the nvfp4 kernel) and the split count are the
+// ones verify_nax takes for the joint grid of the dispatch. Split
 // partials of weight i sit in one temporary at splits * M * (rows of the
 // weights before it), and one fold per weight writes its output. oss is
 // empty or holds each weight's output scale, all in one mode.
@@ -1757,7 +1759,6 @@ void verify_nax_multi(
     int bits,
     int M,
     int K,
-    int kstep,
     Device& d,
     const Stream& s,
     const std::string& kquant_type,
@@ -1778,6 +1779,7 @@ void verify_nax_multi(
     tg_end[i] = tgs;
     part_stride[i] = M * N;
   }
+  const int kstep = kq_verify_nax_call_kstep(tgs * 128, K, kquant_type);
   const int splits = kq_verify_nax_splits(tgs * 128, K, kstep, kquant_type);
   const int k_partition = (K / kstep / splits) * kstep;
 
@@ -3190,6 +3192,8 @@ void KQuantMatmulMulti::eval_gpu(
     n_max = std::max(n_max, w.shape(0));
     grid_rows += (w.shape(0) + 127) / 128 * 128;
   }
+  // verify_nax_multi picks each dispatch's kstep from its own grid. Where
+  // that can differ from this one (K a multiple of 256) both fit alike.
   const int kstep = kq_verify_nax_call_kstep(grid_rows, K, kquant_type_);
   const int force_min_m = kq_force_qmm_min_m();
   bool multi = n_max > 0 && kstep > 0 && x.flags().row_contiguous &&
@@ -3226,7 +3230,7 @@ void KQuantMatmulMulti::eval_gpu(
   std::vector<KqOutScale> gs;
   auto run = [&]() {
     verify_nax_multi(
-        xv, gw, go, group_size_, bits_, M, K, kstep, d, s, kquant_type_, gs);
+        xv, gw, go, group_size_, bits_, M, K, d, s, kquant_type_, gs);
     gw.clear();
     go.clear();
     gs.clear();
@@ -3411,9 +3415,10 @@ void KQuantMatmul::eval_gpu_base(
           os);
       return;
     }
-    const int kstep = kq_verify_nax_call_kstep(N, K, kquant_type_);
-    if (route == KqSmallMRoute::verify_nax &&
-        kq_verify_nax_fits(w, K, kstep, kquant_type_)) {
+    const int kstep = route == KqSmallMRoute::verify_nax
+        ? kq_verify_nax_call_kstep(N, K, kquant_type_)
+        : 0;
+    if (kq_verify_nax_fits(w, K, kstep, kquant_type_)) {
       const int sp = kq_verify_nax_splits(N, K, kstep, kquant_type_);
       verify_nax(
           bind_x(8),
