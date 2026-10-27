@@ -573,7 +573,7 @@ VMMA_CODECS = ["pq2_0", "ptq1_0", "q2_0", "q4_0", "q4_1", "q8_0"]
 VNAX_ENTRY = {
     "pq2_0": 3,
     "q2_0": 3,
-    "nvfp4": 5,
+    "nvfp4": 2,
     "q4_0": 3,
     "q4_1": 3,
     "q8_0": 6,
@@ -602,11 +602,13 @@ def _nvfp4_vnax_entry(n, k, f16):
         return 3
     if n <= 512:
         return 9
-    if k >= 6144 or (n <= 1024 and k >= 4096):
+    if n <= 1024:
         return 2
     if n <= 2048:
-        return 3 if k >= 4096 else 5
-    return 5 if f16 else 4
+        return 3 if k >= 4096 else 4
+    if k >= 6144:
+        return 2
+    return 4 if f16 else 3
 
 
 def _vnax_entry(codec, n, k=K, f16=False):
@@ -1465,10 +1467,10 @@ def test_verify_nax_iq4_entry(codec, n_out, k, entry, dtype, monkeypatch):
 
 
 # The nvfp4 entry by shape (kq_verify_nax_min_m): M 3 on a vocab head,
-# none at N 512 and below, M 2 at K 6144 and wider and at N 1024 and below
-# from K 4096, M 3 up to N 2048 from K 4096 and M 5 below it, and M 4 on
-# bfloat16 and M 5 on float16 at wider N. Checked as the iq4 entry is, with
-# per-row qmv off, which takes M 2 at N 1025 to 2048 by default.
+# none at N 512 and below, M 2 at N 513 to 1024, M 3 up to N 2048 from K
+# 4096 and M 4 below it, and at wider N M 2 from K 6144 and below it M 3
+# on bfloat16 and M 4 on float16. Checked as the iq4 entry is, with per-row
+# qmv off, which runs ahead of the entry by default.
 VNAX_NVFP4_SHAPES = [
     (100000, 256),
     (100000, 6144),
@@ -1477,9 +1479,8 @@ VNAX_NVFP4_SHAPES = [
     (513, 8192),
     (2560, 6144),
     (2560, 6016),
-    (1024, 4096),
+    (1024, 2048),
     (1025, 4096),
-    (1024, 3968),
     (2048, 4096),
     (2049, 4096),
     (2048, 3968),
@@ -1783,6 +1784,16 @@ def test_verify_nax_head_entry(codec, monkeypatch):
             assert not _bits_equal(y_def, y_oth), tag
 
 
+# nvfp4's per-row qmv stops at M 1 on a vocab head (N >= 100000), where
+# mv_ext runs faster at M 2, and takes M 2 one row below it.
+@pytest.mark.skipif(not kq.nax_available(), reason="NAX routing only")
+def test_nax_qmv_nvfp4_head(monkeypatch):
+    _clear_levers(monkeypatch)
+    calls = [{"codec": "nvfp4", "shape": [2, 256], "n": n} for n in (100000, 99999)]
+    names = [_one_kernel(e)[0] for e in _logged(calls, {})]
+    assert "_mv_ext_" in names[0] and "_qmv_" in names[1], names
+
+
 # kq_nax_small_m for the codecs the dispatch tests pin: the per-row qmv
 # limit per N bucket (N <= 512, 1024, 2048, larger), then the split-K
 # entries for N <= 1024 and above (99: none, which the table writes as 0).
@@ -1792,7 +1803,7 @@ NAX_SMALL_M = {
     "q2_k": ((8, 5, 3, 2), 2, 5),
     "pq2_0": ((8, 5, 3, 2), 9, 9),
     "q2_0": ((8, 5, 3, 2), 9, 9),
-    "nvfp4": ((1, 1, 2, 1), 2, 6),
+    "nvfp4": ((6, 3, 2, 2), 2, 6),
     "ptq1_0": ((8, 5, 3, 2), 9, 9),
     "q4_0": ((8, 6, 3, 2), 8, 8),
     "q4_1": ((8, 6, 3, 2), 8, 8),

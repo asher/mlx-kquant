@@ -466,17 +466,18 @@ static int kq_verify_mma_min_m_nax(const std::string& t) {
 // (0.97x).
 //
 // nvfp4 was fitted the same way on bf16 and f16 over 24 shapes of N 256 to
-// 248320 and K 2048 to 17408, against the routes of its kq_nax_small_m row.
-// Times below are of the kernel against the default route it displaces at
-// the entry. A vocab head enters at M 3 (0.89x on bf16, 1.01x on f16). N
-// 512 and below has no entry: NAX split-K runs 1.07-1.42x faster there
-// through M 8. K 6144 and wider, and N 1024 from K 4096, enter at M 2
-// (0.83-1.04x; N 4096, K 8192 runs 1.04x slower at M 2 on f16). N 1025 to
-// 2048 enters at M 3 from K 4096 (0.85-0.90x), and N 513 to 2048 at M 5
-// below K 4096 (0.99-1.02x). Wider N under K 6144 enters at M 4 on bf16
-// and M 5 on f16 (0.84-1.05x; N 6144, K 5120 runs 1.05x slower at M 4 on
-// bf16). At M 8 the kernel takes 0.78-0.96x the time of NAX split-K from N
-// 2048, and 0.67x on a vocab head.
+// 248320 and K 2048 to 17408, against the routes of its kq_nax_small_m row
+// with per-row qmv off. Times below are of the kernel against the route it
+// displaces at the entry. Per-row qmv runs ahead of the entry, through M 2
+// above N 1024 and M 3 at N 513 to 1024. A vocab head enters at M 3 (0.91x
+// on bf16, 0.96x on f16). N 512 and below has no entry: past its qmv limit
+// the kernel ran 0.92x the time of NAX split-K at K 2048 but 1.01-1.06x from
+// K 4096. N 513 to 1024 enters at M 2 (0.75-0.86x). N 1025 to 2048 enters
+// at M 3 from K 4096 (0.68-0.85x) and at M 4 below it (0.95-1.00x). Wider N
+// enters at M 2 from K 6144 (0.91-1.01x). Under K 6144 it enters at M 3 on
+// bf16 (0.94-1.02x, but 1.09x at N 18560, K 4096, where mv_ext holds M 3)
+// and at M 4 on f16 (0.77-0.95x). At M 8 the kernel takes 0.64-0.91x the
+// time of NAX split-K from N 2048, and 0.66-0.70x on a vocab head.
 static int kq_verify_nax_min_m(const std::string& t, int N, int K, bool f16) {
   if (t == "iq4_xs" || t == "iq4_nl") {
     if (N >= 100000) {
@@ -499,13 +500,16 @@ static int kq_verify_nax_min_m(const std::string& t, int N, int K, bool f16) {
     if (N <= 512) {
       return 0;
     }
-    if (K >= 6144 || (N <= 1024 && K >= 4096)) {
+    if (N <= 1024) {
       return 2;
     }
     if (N <= 2048) {
-      return K >= 4096 ? 3 : 5;
+      return K >= 4096 ? 3 : 4;
     }
-    return f16 ? 5 : 4;
+    if (K >= 6144) {
+      return 2;
+    }
+    return f16 ? 4 : 3;
   }
   if (t == "q8_0") {
     return 6;
@@ -584,8 +588,9 @@ static int kq_splitk_min_m(const std::string& t) {
 // measured faster. The nvfp4 row was fitted the same way on bf16 and f16
 // over 16 shapes (N 256 to 248320, K 2048 to 17408) and held out on 8 (N
 // 512 to 14336, K 2048 to 14336), with its verify_nax entries. It
-// runs at 1.006x the fastest route on the fitted cells and 1.002x on the
-// held-out ones, against 1.065x and 1.109x for the q2_0 row it replaces.
+// runs at 1.012-1.014x the fastest route on the fitted cells and
+// 1.009-1.013x on the held-out ones, against 1.051-1.061x and 1.020-1.027x
+// for its previous row, fitted before the mat-vec decode got faster.
 // q4_1 was fitted without its verify routes; it now takes the q4_0 row,
 // which was fitted with them, and is not measured on it.
 struct KqNaxSmallM {
@@ -653,17 +658,23 @@ static KqNaxSmallM kq_nax_small_m(const std::string& t) {
     return {{8, 5, 3, 2}, 9, 9};
   }
   if (t == "nvfp4") {
-    // Per-row qmv keeps M 2 only for N 1025 to 2048. At N 1024 it runs
-    // 1.14-1.26x faster than the table's route at K 2048, M 2 to 4, but
-    // 1.1-1.4x slower than verify_nax from K 4096, so that bucket keeps it
-    // at M 1.
-    return {{1, 1, 2, 1}, 2, 6};
+    // At N 512 and below the qmv limit moves with K: per-row qmv ran fastest
+    // through M 8 at K 2048 to 4096 and through M 4 at K 8192, so the row
+    // takes M 6, 1.00-1.07x the fastest route per shape over M 2 to 12. At
+    // N 1024 it takes M 3, where qmv ran 1.08-1.5x faster than verify_nax
+    // at K 2048 to 5120 and 1.05x slower at K 8192. Above N 2048 it takes M
+    // 2 (1.00-1.10x the fastest route), except on a vocab head, where
+    // mv_ext ran 1.17-1.29x faster (kq_nax_qmv_max_m).
+    return {{6, 3, 2, 2}, 2, 6};
   }
   return {{1, 1, 1, 1}, 0, 0};
 }
 
 // Widest M per-row qmv serves by default on NAX GPUs.
 static int kq_nax_qmv_max_m(const std::string& t, int N) {
+  if (t == "nvfp4" && N >= 100000) {
+    return 1;
+  }
   const int b = N <= 512 ? 0 : N <= 1024 ? 1 : N <= 2048 ? 2 : 3;
   return kq_nax_small_m(t).qmv_m[b];
 }
