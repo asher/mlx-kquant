@@ -28,11 +28,12 @@
 // q2_k units half a superblock, each with its own order. Block scales and
 // mins are folded into the half weights. Device loads and NAX ops of one
 // simdgroup do not overlap, so occupancy hides the loads and the host
-// sizes the split count for it (kq_verify_nax_splits). pq2_0, q4_0, q4_1
-// and nvfp4 load a unit's activation steps ahead of its NAX ops. The other
-// codecs, whose Words are larger, load one step at a time. Each order
-// measured faster for its codecs on M5 Max. The right operand is written
-// in element order, which ran 1.6x faster than a strided order.
+// sizes the split count for it (kq_verify_nax_splits). The pq2_0 and q2_0
+// kernels and the two-block q4_0, q4_1 and nvfp4 kernels load a unit's
+// activation steps ahead of its NAX ops. The other kernels, whose Words are
+// larger, load one step at a time. Each order measured faster for its
+// codecs on M5 Max. The right operand is written in element order, which
+// ran 1.6x faster than a strided order.
 //
 // Codec contract (KqXxxNax):
 //   group: the wire block's weights, the kernel's group_size
@@ -225,9 +226,9 @@ struct KqNvfp4Nax {
 // NVFP4, four-block unit: four wire blocks (256 weights, 144 bytes), and
 // lane-quad q owns block q, the 36 bytes at 36q, read as nine aligned
 // words: the four group scales, then the qs, two words per group. Step s
-// takes group s >> 2 and within it KqNvfp4Nax's step s & 3. Rows of a K
-// that is a multiple of 256 start 4-byte aligned from a weight base the
-// host checks.
+// takes group s >> 2 and within it KqNvfp4Nax's step s & 3. A 36-byte
+// block keeps the rows of any K that is a multiple of 64 4-byte aligned
+// from a weight base the host checks.
 struct KqNvfp4SbNax {
   static constant constexpr int group = KQ_NVFP4_SUPERBLOCK;
   static constant constexpr int block_k = 4 * KQ_NVFP4_SUPERBLOCK;
