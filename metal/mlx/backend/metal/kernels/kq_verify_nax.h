@@ -174,15 +174,16 @@ struct KqQ2_0Nax {
 // NVFP4: lane-quad q owns 16-weight group q, its UE4M3 scale byte q and qs
 // bytes 8q..8q+7. Step s takes the low nibbles of word s & 1 for s < 2 and
 // the high nibbles after, weights 4s to 4s + 3 of the group, and pair f is
-// bytes f & 1 and (f & 1) + 2 of the word. The weights are kept 2^14
-// smaller (out_mul). Two 64-weight blocks per iteration.
+// bytes f & 1 and (f & 1) + 2 of the word. The group scale carries 2^7
+// and the weights are kept 2^7 smaller (out_mul). Two 64-weight blocks per
+// iteration.
 struct KqNvfp4Nax {
   static constant constexpr int group = KQ_NVFP4_SUPERBLOCK;
   static constant constexpr int block_k = KQ_NVFP4_SUPERBLOCK;
   static constant constexpr int block_bytes = KQ_NVFP4_BLOCK_BYTES;
   static constant constexpr int ub = 2;
   static constant constexpr bool x_ahead = true;
-  static constant constexpr float out_mul = 16384.0f;
+  static constant constexpr float out_mul = 128.0f;
   struct Words {
     uint w[2];
     half d;
@@ -190,7 +191,7 @@ struct KqNvfp4Nax {
   static METAL_FUNC Words load(const device uint8_t* row, int u, short q) {
     const device uint8_t* bp = row + u * block_bytes;
     Words o;
-    o.d = half(kq_fp_ue4m3_scale(bp[q]));
+    o.d = half(kq_fp_ue4m3_scale<7>(bp[q]));
     const device uint* qs =
         (const device uint*)(bp + KQ_NVFP4_QS_OFFSET + 8 * q);
     o.w[0] = qs[0];
@@ -223,7 +224,7 @@ struct KqNvfp4SbNax {
   static constant constexpr int block_bytes = 4 * KQ_NVFP4_BLOCK_BYTES;
   static constant constexpr int ub = 1;
   static constant constexpr bool x_ahead = false;
-  static constant constexpr float out_mul = 16384.0f;
+  static constant constexpr float out_mul = 128.0f;
   struct Words {
     uint w[8];
     half4 d;
@@ -237,10 +238,10 @@ struct KqNvfp4SbNax {
     }
     Words o;
     o.d = half4(
-        half(kq_fp_ue4m3_scale(uint8_t(t[0]))),
-        half(kq_fp_ue4m3_scale(uint8_t(t[0] >> 8))),
-        half(kq_fp_ue4m3_scale(uint8_t(t[0] >> 16))),
-        half(kq_fp_ue4m3_scale(uint8_t(t[0] >> 24))));
+        half(kq_fp_ue4m3_scale<7>(uint8_t(t[0]))),
+        half(kq_fp_ue4m3_scale<7>(uint8_t(t[0] >> 8))),
+        half(kq_fp_ue4m3_scale<7>(uint8_t(t[0] >> 16))),
+        half(kq_fp_ue4m3_scale<7>(uint8_t(t[0] >> 24))));
     for (short i = 0; i < 8; ++i) {
       o.w[i] = t[1 + i];
     }

@@ -54,12 +54,14 @@ inline float kq_fp_e8m0_scale(uint8_t e) {
 // because metal::exp2 is fast-math; the subnormal product is exact as
 // written. Two selects, no branch: e == 0 picks the subnormal (0 for v == 0),
 // then the NaN code is zeroed. Bit 7 is ignored, so 0xFF decodes like 0x7F
-// would without the NaN rule, as ggml does.
+// would without the NaN rule, as ggml does. S returns the scale times 2^S
+// at the same cost.
+template <int S = 0>
 inline float kq_fp_ue4m3_scale(uint8_t v) {
   const uint e = (v >> 3) & 0xF;
   const uint m = v & 0x7;
-  const float norm = as_type<float>((e + 120u) << 23 | m << 20);
-  const float sub = float(m) * 0.001953125f; /* 2^-9 */
+  const float norm = as_type<float>((e + 120u + S) << 23 | m << 20);
+  const float sub = float(m) * (0.001953125f * float(1 << S)); /* 2^(S-9) */
   const float r = e ? norm : sub;
   return (v == 0x7F) ? 0.0f : r;
 }
@@ -669,7 +671,8 @@ struct KqNvfp4Ext {
 // nibble of each byte of w, or the high one, with its sign moved to bit 6
 // and e1 e0 m left in bits 0..2. kq_nvfp4_pair moves bytes 0 and 2, or 1
 // and 3, to half bits 15 and 11..9, which is the E2M1 value times 2^-14.
-// Times a UE4M3 scale the value stays exact in half.
+// Times a UE4M3 scale times 2^7 (61440 at most) the value stays exact in
+// half, at 2^-7 of the weight.
 METAL_FUNC uint kq_nvfp4_nibs(uint w, bool hi) {
   return hi ? (((w >> 4) & 0x07070707u) | ((w >> 1) & 0x40404040u))
             : ((w & 0x07070707u) | ((w << 3) & 0x40404040u));
@@ -683,14 +686,14 @@ METAL_FUNC half2 kq_nvfp4_pair(uint l, bool odd) {
 // 16-weight group L: its scale byte and qs bytes 8L..8L+7 as two words.
 // Fragment f takes word (f >> 1) & 1, its low nibbles for f < 4 and its
 // high ones after, and pair f & 1 of kq_nvfp4_pair: weights 4 (f >> 1) +
-// (f & 1) and that plus 2 of the group, times the group scale. Each weight
-// is exact in half at 2^-14 of its value, and d_scale restores the factor
-// at the store.
+// (f & 1) and that plus 2 of the group, times the group scale times 2^7.
+// Each weight is exact in half at 2^-7 of its value, and out_mul restores
+// the factor at the store.
 struct KqNvfp4Mma {
   static constant constexpr int block_k = KQ_NVFP4_SUPERBLOCK;
   static constant constexpr int block_bytes = KQ_NVFP4_BLOCK_BYTES;
   static constant constexpr bool codes_scaled = true;
-  static constant constexpr float d_scale = 16384.0f;
+  static constant constexpr float out_mul = 128.0f;
   static METAL_FUNC int perm(int f, int col) {
     return 16 * (col / 2) + 4 * (f >> 1) + (f & 1) + 2 * (col & 1);
   }
@@ -706,7 +709,7 @@ struct KqNvfp4Mma {
     half d[NT];
     for (short t = 0; t < NT; ++t) {
       const device uint8_t* bp = rows.p[t] + boff;
-      d[t] = half(kq_fp_ue4m3_scale(bp[L]));
+      d[t] = half(kq_fp_ue4m3_scale<7>(bp[L]));
       q[t] = kq_nvfp4_group_qs(bp, L);
     }
     for (short f = 0; f < 8; ++f) {

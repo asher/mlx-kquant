@@ -36,9 +36,9 @@
 //     staging pass then sums each block's activations per column in float
 //     into threadgroup memory, and each block adds m times that sum to its
 //     scaled float sum. Codecs without has_min compile without the sums.
-//   codes_scaled (optional, float kernels only, no d_offset): the codes
-//     carry every scale of the block and a fixed factor 1 / d_scale, so
-//     the block sums add up as they are and d_scale multiplies the total
+//   codes_scaled, out_mul (optional, float kernels only, no d_offset): the
+//     codes carry every scale of the block and a fixed factor 1 / out_mul,
+//     so the block sums add up as they are and out_mul multiplies the total
 //     at the store.
 // An OS 1 entry takes the output scale (kq_out_scale.h) at the store. The
 // host sets it only on a pipeline that writes the output in one split;
@@ -228,7 +228,7 @@ METAL_FUNC void kq_verify_mma_impl(
     if (nt < N) {
       float2 v = c[t];
       if constexpr (SCALED) {
-        v *= Codec::d_scale;
+        v *= Codec::out_mul;
       }
       if constexpr (kOutScale) {
         if (kq_has_out_scale) {
