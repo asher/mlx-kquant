@@ -2871,7 +2871,8 @@ NB_MODULE(_ext, m) {
         Args:
             x (array): [..., M, K], 1 <= M <= 16, K a multiple of 4;
                 float16/bfloat16/float32.
-            w (array): [N, K] weight, dtype matching x or float32.
+            w (array): [N, K] weight, dtype matching x or float32;
+                float16 or bfloat16 also with float32 x.
 
         Returns:
             array: [..., M, N]; float32 when either operand is, else the

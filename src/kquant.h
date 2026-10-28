@@ -1172,8 +1172,9 @@ mx::array hc_lowrank_epilogue(
 
 // y = x @ w.T for token widths 1..16 against a small-N, large-K weight in
 // nn.Linear layout ([N, K]). x is [..., M, K] with 1 <= M <= 16 and
-// K % 4 == 0; x float16/bfloat16/float32, w matching x or float32; output
-// float32 when either operand is, else x dtype. f32 accumulate. Fills the
+// K % 4 == 0; x float16/bfloat16/float32, w matching x or float32, or
+// float16/bfloat16 with float32 x; output float32 when either operand is,
+// else x dtype. f32 accumulate. Fills the
 // GEMV-to-GEMM cliff MLX's steel path hits at M >= 2 on these shapes
 // (router gates, indexer weight projections, hyper-connection mixes at
 // speculative verify widths).

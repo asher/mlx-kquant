@@ -78,8 +78,10 @@ void skinny_cpu_dispatch(mx::Dtype xt, mx::Dtype wt, F&& run) {
     using XT = std::remove_pointer_t<decltype(xtag)>;
     if (wt == mx::float32) {
       run(static_cast<XT*>(nullptr), static_cast<float*>(nullptr));
+    } else if (wt == mx::float16) {
+      run(static_cast<XT*>(nullptr), static_cast<mx::float16_t*>(nullptr));
     } else {
-      run(static_cast<XT*>(nullptr), static_cast<XT*>(nullptr));
+      run(static_cast<XT*>(nullptr), static_cast<mx::bfloat16_t*>(nullptr));
     }
   };
   if (xt == mx::float16) {
@@ -179,9 +181,15 @@ mx::array skinny_matmul(mx::array x, mx::array w, mx::StreamOrDevice s_) {
     throw std::invalid_argument(
         std::string(op) + " x must be float16, bfloat16, or float32.");
   }
-  if (wt != xt && wt != mx::float32) {
+  if (wt != xt && wt != mx::float32 && xt != mx::float32) {
     throw std::invalid_argument(
-        std::string(op) + " w dtype must match x or be float32.");
+        std::string(op) +
+        " w dtype must match x or be float32; float32 x also takes float16"
+        " or bfloat16 w.");
+  }
+  if (wt != mx::float16 && wt != mx::bfloat16 && wt != mx::float32) {
+    throw std::invalid_argument(
+        std::string(op) + " w must be float16, bfloat16, or float32.");
   }
   auto out_dtype = (xt == mx::float32 || wt == mx::float32) ? mx::float32 : xt;
   // Unconditional: flags() on a lazy array are not yet valid, so a

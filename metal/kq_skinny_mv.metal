@@ -8,4 +8,6 @@ instantiate_kernel("kq_skinny_mv_bfloat16_t_bfloat16_t", kq_skinny_mv, bfloat16_
 instantiate_kernel("kq_skinny_mv_float_float", kq_skinny_mv, float, float, float)
 instantiate_kernel("kq_skinny_mv_float16_t_float", kq_skinny_mv, float16_t, float, float)
 instantiate_kernel("kq_skinny_mv_bfloat16_t_float", kq_skinny_mv, bfloat16_t, float, float)
+instantiate_kernel("kq_skinny_mv_float_float16_t", kq_skinny_mv, float, float16_t, float)
+instantiate_kernel("kq_skinny_mv_float_bfloat16_t", kq_skinny_mv, float, bfloat16_t, float)
     // clang-format on
