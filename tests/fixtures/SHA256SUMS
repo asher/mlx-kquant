@@ -1,3 +1,4 @@
+76c21a08045593eda944c0578ad40f9f5efdcd2525c3776e88736effd08b236c  tests/fixtures/moe_act_ref.npz
 dbfc4e6b7801806b3ff25f62d0427c288eb2054ad92e06d89a169b6afc958560  tests/fixtures/q2_k.npz
 d4b9562cffd16ee7fc04e4119233a5908d3ad8a773ae64b3bd5d5fb2b425217c  tests/fixtures/q2_k_moe.npz
 3c70eca2a741948cde2390c54173c051acb35ed946fed774d2fb9f72c2d89ecc  tests/fixtures/q3_k.npz
