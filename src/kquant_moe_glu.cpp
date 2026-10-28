@@ -3,7 +3,8 @@
 //   mxfp4 packed layout: moe_glu_gather (gate + up + biases + clamped-SwiGLU
 //     in one dispatch) and gather_qmv_bias.
 //   K-quant wire bytes: moe_glu_gather_kq (gate + up + GLU epilogue;
-//     optional biases with act "swiglu_clamp", mxfp4/nvfp4 only) and
+//     optional biases with act "swiglu_clamp", mxfp4/nvfp4 only; act
+//     "swiglu_oai" rides the silu kernels under out-scale bit 4) and
 //     gather_qmv_kq, per-codec kernels (full codec matrix).
 #include <cctype>
 #include <cstdio>
@@ -309,8 +310,10 @@ inline void kq_moe_log_kname(const std::string& kname, int cap = 0) {
 // Output scales of the fused MoE ops (kq_out_scale.h): bits 0 to 2 are the
 // mode of the expert stacks' scales, bit 3 says the shared expert has one.
 // The scales are the op's last inputs, the routed ones first, gate before
-// up in a GLU.
+// up in a GLU. Bit 4 is act swiglu_oai on a GLU, which takes no input: its
+// alpha is bound as bytes.
 constexpr int KQ_MOE_SHEXP_SCALE = 8;
+constexpr int KQ_MOE_SWIGLU_OAI = 16;
 
 inline int kq_moe_scale_inputs(int bits, bool glu) {
   const int per = glu ? 2 : 1;
@@ -736,10 +739,13 @@ void KQuantMoEGLUKQ::eval_gpu(
   if (dd && (stem == "q6_k" || stem == "q8_0")) {
     stem += "_ext"; // the dedupe kernels are Ext-only
   }
+  // swiglu_oai rides the silu kernels under its out-scale bit
+  // (kq_glu_epilogue), with the clamp from the run-time limit.
+  const bool oai = (out_scale_bits_ & KQ_MOE_SWIGLU_OAI) != 0;
   std::string kname = "kq_" + stem + "_moe_glu_gather_" +
       (biased ? "bias_" : "") + (use_half ? "h_" : "") + (dd ? "dd_" : "") +
-      act_ + (c32 ? "_c32" : "") + kq_nx_suffix(nx) + "_" +
-      kq_type_string(x.dtype());
+      (oai ? std::string("silu") : act_) + (c32 ? "_c32" : "") +
+      kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
   auto kernel =
       kq_get_kernel_os(d, kname, out_scale_bits_, kq_moe_nx_setting());
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
@@ -767,6 +773,9 @@ void KQuantMoEGLUKQ::eval_gpu(
     ce.set_bytes(K, 5);
     ce.set_bytes(N, 6);
     ce.set_bytes(limit_, 7);
+    if (oai) {
+      ce.set_bytes(alpha_, kq_glu_alpha_slot);
+    }
   }
   kq_moe_bind_scales(ce, inputs, out_scale_bits_, true);
   // Tuned q6_k/q8_0 kernels (nx 8) are fixed at 2 simdgroups.
@@ -903,7 +912,8 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
     const std::string kname = "kq_" + kquant_type_ + "_sx2_" + shexp_type_ +
         "_" + shexp_up_type_ + "_moe_glu_gather_shexp_silu" + kq_nx_suffix(nx) +
         "_" + kq_type_string(x.dtype());
-    auto kernel = kq_get_kernel(d, kname, kq_moe_nx_setting());
+    auto kernel =
+        kq_get_kernel_os(d, kname, out_scale_bits_, kq_moe_nx_setting());
     kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
     auto& ce = mx::metal::get_command_encoder(s);
     ce.set_compute_pipeline_state(kernel);
@@ -918,6 +928,9 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
     ce.set_bytes(N, 8);
     ce.set_bytes(limit_, 9);
     ce.set_bytes(NS, 10);
+    if (out_scale_bits_ & KQ_MOE_SWIGLU_OAI) {
+      ce.set_bytes(alpha_, kq_glu_alpha_slot);
+    }
     const int sg = kq_moe_fit_sg(kernel, kq_moe_pick_sg(kquant_type_, N, nx));
     MTL::Size group_dims(32, sg, 1);
     MTL::Size grid_dims(N / (sg * 32 / nx), R + NS, T);
@@ -942,9 +955,11 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   if (dd && (stem == "q6_k" || stem == "q8_0")) {
     stem += "_ext";
   }
-  // silu_limit rides the silu instantiations: the epilogue clamps at run
-  // time when the limit is positive (kq_glu_epilogue).
-  const std::string act = act_ == "silu_limit" ? "silu" : act_;
+  // silu_limit and swiglu_oai ride the silu instantiations: the epilogue
+  // clamps at run time when the limit is positive, and swiglu_oai sets its
+  // out-scale bit (kq_glu_epilogue).
+  const std::string act =
+      act_ == "silu_limit" || act_ == "swiglu_oai" ? "silu" : act_;
   std::string kname = "kq_" + stem + "_moe_glu_gather_shexp_" +
       (use_half ? "h_" : "") + (dd ? "dd_" : "") + act + (c32 ? "_c32" : "") +
       kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
@@ -967,6 +982,9 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   ce.set_bytes(N, 8);
   ce.set_bytes(limit_, 9);
   ce.set_bytes(NS, 10);
+  if (out_scale_bits_ & KQ_MOE_SWIGLU_OAI) {
+    ce.set_bytes(alpha_, kq_glu_alpha_slot);
+  }
   kq_moe_bind_scales(ce, inputs, out_scale_bits_, true);
   const bool tuned = stem == "q6_k" || stem == "q8_0";
   const int sg = kq_moe_fit_sg(
@@ -1448,7 +1466,8 @@ bool KQuantMoEGLUShexpKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMoEGLUShexpKQ&>(other);
   return kquant_type_ == o.kquant_type_ && act_ == o.act_ &&
       shexp_type_ == o.shexp_type_ && shexp_up_type_ == o.shexp_up_type_ &&
-      limit_ == o.limit_ && out_scale_bits_ == o.out_scale_bits_;
+      limit_ == o.limit_ && alpha_ == o.alpha_ &&
+      out_scale_bits_ == o.out_scale_bits_;
 }
 
 bool KQuantGatherQMVMixKQ::is_equivalent(const mx::Primitive& other) const {
@@ -2093,14 +2112,19 @@ mx::array moe_glu_gather_kq(
         "[mlx_kquant.moe_glu_gather_kq] x must be float16 or bfloat16.");
   }
   if (act != "silu" && act != "gelu" && act != "silu_limit" &&
-      act != "swiglu_clamp") {
+      act != "swiglu_clamp" && act != "swiglu_oai") {
     throw std::invalid_argument(
         "[mlx_kquant.moe_glu_gather_kq] act must be 'silu', 'gelu', "
-        "'silu_limit' or 'swiglu_clamp'.");
+        "'silu_limit', 'swiglu_clamp' or 'swiglu_oai'.");
   }
   if (act == "silu_limit" && !(limit > 0.0f)) {
     throw std::invalid_argument(
         "[mlx_kquant.moe_glu_gather_kq] act 'silu_limit' requires limit > 0.");
+  }
+  if (act == "swiglu_oai" && (!(limit > 0.0f) || !(alpha > 0.0f))) {
+    throw std::invalid_argument(
+        "[mlx_kquant.moe_glu_gather_kq] act 'swiglu_oai' requires limit > 0 "
+        "and alpha > 0.");
   }
   const bool biased = gate_bias.has_value() || up_bias.has_value();
   if (act == "swiglu_clamp") {
@@ -2141,14 +2165,15 @@ mx::array moe_glu_gather_kq(
     }
   }
   const int os_bits = moe_scale_bits(
-      "moe_glu_gather_kq",
-      kquant_type,
-      gate_w.shape(1),
-      gate_w.shape(0),
-      gate_scale,
-      "gate_scale",
-      &up_scale,
-      "up_scale");
+                          "moe_glu_gather_kq",
+                          kquant_type,
+                          gate_w.shape(1),
+                          gate_w.shape(0),
+                          gate_scale,
+                          "gate_scale",
+                          &up_scale,
+                          "up_scale") |
+      (act == "swiglu_oai" ? KQ_MOE_SWIGLU_OAI : 0);
 
   auto x_c = moe_dense_x(x, s);
   mx::Shape out_shape = {x.shape(0), indices.shape(1), gate_w.shape(1)};
@@ -2167,8 +2192,10 @@ mx::array moe_glu_gather_kq(
           s,
           kquant_type,
           act,
-          (act == "silu_limit" || act == "swiglu_clamp") ? limit : 0.0f,
-          alpha,
+          (act == "silu_limit" || act == "swiglu_clamp" || act == "swiglu_oai")
+              ? limit
+              : 0.0f,
+          (act == "swiglu_clamp" || act == "swiglu_oai") ? alpha : 0.0f,
           os_bits),
       std::move(op_inputs));
 }
@@ -2279,6 +2306,7 @@ mx::array moe_glu_gather_shexp_kq(
     const std::optional<mx::array>& up_scale,
     const std::optional<mx::array>& shexp_gate_scale,
     const std::optional<mx::array>& shexp_up_scale,
+    float alpha,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.moe_glu_gather_shexp_kq]";
@@ -2289,7 +2317,7 @@ mx::array moe_glu_gather_shexp_kq(
   const bool upcast_pair =
       shexp_up_type == shexp_type && shexp_upcast_pair(kquant_type, shexp_type);
   if (!shexp_glu_combo_has_kernel(kquant_type, shexp_type, shexp_up_type) ||
-      (!upcast_pair && act != "silu")) {
+      (!upcast_pair && act != "silu" && act != "swiglu_oai")) {
     throw std::invalid_argument(
         std::string(op) + " no fused kernel for expert codec '" + kquant_type +
         "' with shared-expert codecs '" + shexp_type + "' (gate) and '" +
@@ -2306,13 +2334,20 @@ mx::array moe_glu_gather_shexp_kq(
     throw std::invalid_argument(
         std::string(op) + " x must be float16 or bfloat16.");
   }
-  if (act != "silu" && act != "gelu" && act != "silu_limit") {
+  if (act != "silu" && act != "gelu" && act != "silu_limit" &&
+      act != "swiglu_oai") {
     throw std::invalid_argument(
-        std::string(op) + " act must be 'silu', 'gelu' or 'silu_limit'.");
+        std::string(op) +
+        " act must be 'silu', 'gelu', 'silu_limit' or 'swiglu_oai'.");
   }
   if (act == "silu_limit" && !(limit > 0.0f)) {
     throw std::invalid_argument(
         std::string(op) + " act 'silu_limit' requires limit > 0.");
+  }
+  if (act == "swiglu_oai" && (!(limit > 0.0f) || !(alpha > 0.0f))) {
+    throw std::invalid_argument(
+        std::string(op) +
+        " act 'swiglu_oai' requires limit > 0 and alpha > 0.");
   }
   int K = x.shape(1);
   check_kq_expert_stack(op, gate_w, kquant_type, K);
@@ -2341,7 +2376,8 @@ mx::array moe_glu_gather_shexp_kq(
                           shexp_gate_scale,
                           "shexp_gate_scale",
                           &shexp_up_scale,
-                          "shexp_up_scale");
+                          "shexp_up_scale") |
+      (act == "swiglu_oai" ? KQ_MOE_SWIGLU_OAI : 0);
 
   auto x_c = moe_dense_x(x, s);
   mx::Shape out_shape = {x.shape(0), indices.shape(1) + ns, N};
@@ -2372,9 +2408,10 @@ mx::array moe_glu_gather_shexp_kq(
           kquant_type,
           act,
           shexp_type,
-          act == "silu_limit" ? limit : 0.0f,
+          act == "silu_limit" || act == "swiglu_oai" ? limit : 0.0f,
           shexp_up_type,
-          os_bits),
+          os_bits,
+          act == "swiglu_oai" ? alpha : 0.0f),
       std::move(op_inputs));
 }
 

@@ -1185,7 +1185,10 @@ load feeds both projections.
 The GLU activation is selected per model: plain SwiGLU/GELU, the clamped `silu_limit`
 (`silu(min(g, limit)) * clip(u, -limit, limit)`) that DeepSeek-V4's `LimitedSwiGLU` needs, or
 `swiglu_clamp` (gpt-oss clamped SwiGLU: biases added, sigmoid slope `alpha`, and a `(u + 1)` linear
-term; requires the expert biases and is instantiated for `mxfp4`/`nvfp4` only).
+term; requires the expert biases and is instantiated for `mxfp4`/`nvfp4` only), or `swiglu_oai` (the
+same clamped SwiGLU without biases, as MiniMax-M3 uses it; every codec, shared expert included). The
+`swiglu_oai` epilogue runs in the `silu` kernels: bit 4 of the output-scale function constant switches
+it on and binds `alpha`, so its pipelines are cached apart from the `silu` ones.
 
 `nvfp4` experts from an NVFP4 GGUF can carry a `.scale`. Pass it to the GLU gathers as
 `gate_scale` and `up_scale`, and to the down gathers as `out_scale`: one value, one per column, one

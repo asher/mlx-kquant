@@ -13,7 +13,9 @@
 // A gather entry resolves the expert with kq_out_scale_at, after which modes
 // 3 and 4 read as 1 and 2. The buffer is bound at KQ_OUT_SCALE_SLOT in every
 // family. Bit 3 of the constant (kq_has_shexp_scale) says that the shared
-// expert of an MoE op has its own scale; bits 0 to 2 are the mode.
+// expert of an MoE op has its own scale; bits 0 to 2 are the mode. Bit 4
+// (kq_swiglu_oai) switches the silu GLU epilogue of the fused MoE ops to
+// act swiglu_oai (kq_moe_glu_kq.h); it binds no scale buffer.
 #pragma once
 
 #include <metal_stdlib>
@@ -24,6 +26,7 @@ constant int kq_out_scale_bits =
 constant int kq_out_scale_mode = kq_out_scale_bits & 7;
 constant bool kq_has_out_scale = kq_out_scale_mode != 0;
 constant bool kq_has_shexp_scale = (kq_out_scale_bits & 8) != 0;
+constant bool kq_swiglu_oai = (kq_out_scale_bits & 16) != 0;
 constant bool kq_out_scale_cols =
     kq_out_scale_mode == 2 || kq_out_scale_mode == 4;
 

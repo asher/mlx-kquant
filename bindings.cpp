@@ -2165,16 +2165,22 @@ NB_MODULE(_ext, m) {
             indices (array): expert indices [T, R].
             act (str): 'silu' (default), 'gelu' (tanh approx), 'silu_limit'
                 (silu(min(g, limit)) * clip(u, -limit, limit) -- deepseek-v4
-                LimitedSwiGLU; requires limit > 0) or 'swiglu_clamp'
+                LimitedSwiGLU; requires limit > 0), 'swiglu_clamp'
                 (gpt-oss clamped SwiGLU: biases added, g clamped from above,
                 u clamped both sides, sigmoid slope alpha and a (u + 1)
                 linear term; requires gate_bias/up_bias, limit > 0 and
-                alpha > 0; mxfp4/nvfp4 only).
-            limit (float): clamp bound for 'silu_limit'/'swiglu_clamp'.
+                alpha > 0; mxfp4/nvfp4 only) or 'swiglu_oai' (the same
+                clamped SwiGLU without biases, MiniMax-M3:
+                min(g, limit) * sigmoid(alpha * min(g, limit)) *
+                (clip(u, -limit, limit) + 1); requires limit > 0 and
+                alpha > 0; every codec).
+            limit (float): clamp bound for 'silu_limit', 'swiglu_clamp'
+                and 'swiglu_oai'.
             gate_bias (array, optional): per-(expert, out_dim) bias [E, N],
                 'swiglu_clamp' only.
             up_bias (array, optional): same shape, 'swiglu_clamp' only.
-            alpha (float): sigmoid slope for 'swiglu_clamp'.
+            alpha (float): sigmoid slope for 'swiglu_clamp' and
+                'swiglu_oai'.
             gate_scale (array, optional): float32 scale of the gate
                 product, shape (1,), (N,), (n_experts, 1) or
                 (n_experts, N), applied before the bias and the
@@ -2251,6 +2257,7 @@ NB_MODULE(_ext, m) {
       "up_scale"_a = nb::none(),
       "shexp_gate_scale"_a = nb::none(),
       "shexp_up_scale"_a = nb::none(),
+      "alpha"_a = 0.0f,
       "stream"_a = nb::none(),
       R"(
         moe_glu_gather_kq with the block's shared expert folded in as k
@@ -2267,16 +2274,19 @@ NB_MODULE(_ext, m) {
                 shexp_gate_w.
             kquant_type (str): expert codec with a fused kernel.
             indices (array): expert indices [T, R].
-            act (str): 'silu' (default), 'gelu' (tanh approx) or
+            act (str): 'silu' (default), 'gelu' (tanh approx),
                 'silu_limit' (deepseek-v4 LimitedSwiGLU: gate clamped from
-                above, up clamped both sides, routed and shared slots alike).
+                above, up clamped both sides, routed and shared slots alike)
+                or 'swiglu_oai' (MiniMax-M3 clamped SwiGLU, as for
+                moe_glu_gather_kq; requires limit > 0 and alpha > 0).
             shexp_kquant_type (str): shared-expert codec; '' (default) =
                 kquant_type. Mixed combos must be q5_k, q6_k or q8_0, or
                 pass shexp_glu_combo_has_kernel.
-            limit (float): the 'silu_limit' clamp; must be > 0 for that act.
+            limit (float): the 'silu_limit' and 'swiglu_oai' clamp; must be
+                > 0 for those acts.
             shexp_up_kquant_type (str): codec of shexp_up_w when it differs
                 from shexp_gate_w's; '' (default) = shexp_kquant_type. Split
-                combos run act 'silu' only.
+                combos run act 'silu' and 'swiglu_oai' only.
             gate_scale (array, optional): as for moe_glu_gather_kq, on the
                 expert stacks.
             up_scale (array, optional): as for moe_glu_gather_kq.
@@ -2284,6 +2294,7 @@ NB_MODULE(_ext, m) {
                 gate product, shape (1,), for an nvfp4 shared expert.
             shexp_up_scale (array, optional): the same for the shared up.
                 Pass both or neither.
+            alpha (float): sigmoid slope for 'swiglu_oai'.
 
         Returns:
             array: activated hidden states [T, R + k, N] in x.dtype.
