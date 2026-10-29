@@ -112,6 +112,12 @@ std::vector<std::string> split_kernel_names();
 // gather_qmm_seg switch arm) defer to gather_qmm when this holds.
 bool nax_gather_enabled(const std::string& kquant_type);
 
+// True when gather_qmm_seg runs its NAX kernel for `kquant_type` at input
+// width `k`: nax_gather_enabled holds, k % 64 == 0, and
+// KQ_DISABLE_GATHER_SEG_NAX is unset (read once; any value sets it).
+// KQuantSwitchLinear's sorted arm takes its rows-per-expert rule here.
+bool seg_nax_enabled(const std::string& kquant_type, int k);
+
 // ----------------------------- ops -----------------------------
 
 // Dequantize GGUF K-quant wire bytes `w` (uint8, last dim a multiple of the

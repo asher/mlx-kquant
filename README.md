@@ -286,10 +286,12 @@ All optional; the defaults are right for normal use.
 - `KQ_GATHER_RHS_BM` - pin the `gather_qmm_rhs` row tile height (`16`/`32`/`64`) instead of the
   rows-per-expert-adaptive choice. Retuning lever for other GPU generations.
 - `KQ_SWITCH_GEMM_MIN_ROWS` - minimum routed rows before `KQuantSwitchLinear` takes the sorted
-  per-expert GEMM arm on a prefill batch (default `512`; `0` disables it and keeps the plain gather).
+  per-expert GEMM arm on a prefill batch. Unset, the arm starts at 1.75 rows per expert where
+  `gather_qmm_seg` runs its NAX kernel and at `512` rows elsewhere; set, it replaces both (`0`
+  disables the arm and keeps the plain gather). Read per call.
 - `KQ_GATHER_SEG_NAX=0` - on NAX GPUs, send `KQuantSwitchLinear`'s sorted prefill arm to the
-  fixed-tile `gather_qmm_rhs_nax` leaf instead of the expert-major `gather_qmm_seg` walk. Read per
-  call. A/B lever.
+  fixed-tile `gather_qmm_rhs_nax` leaf instead of the expert-major `gather_qmm_seg` walk, from 4
+  rows per expert where `gather_qmm` takes that leaf. Read per call. A/B lever.
 - `KQ_DISABLE_GATHER_SEG_NAX=1` - run `gather_qmm_seg` on its steel simdgroup-mma kernel even where
   the NAX tile kernel is available. Read once per process. A/B lever.
 - `KQ_SEG_TILE_ROWS=64|128` - pin the tile height `seg_tile_rows` returns, and so the one

@@ -12,14 +12,18 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `skinny_matmul` takes a `float32` x with a `float16` or `bfloat16` weight and returns `float32`.
 - `moe_qf_kernels(kquant_type)` reports whether a codec's fused MoE gathers run on its own
   matrix-vector loop, where a row's routed experts give the same output at every call width.
+- `seg_nax_enabled(kquant_type, k)` reports whether `gather_qmm_seg` runs its NAX kernel for a codec
+  at input width k.
 
 ### Changed
 - The fused MoE gathers of q2_k to q4_k, iq4_xs, iq4_nl, q4_0 to q5_1, mxfp4, nvfp4 and q2_0 run
   faster on M5 Max, except at 3 to 8 rows on mostly repeated experts; `KQ_MOE_QF=0` restores them.
 - From 4 tokens, the fused MoE ops read a shared expert's weights once per call, up to 15% faster
   at 8 tokens on M5 Max; `KQ_MOE_SHEXP_DENSE=0` restores the per-token form.
-- Outputs of the fused MoE ops differ from 0.5.7 by rounding; `KQ_MOE_QF=0` and
-  `KQ_MOE_SHEXP_DENSE=0` restore the 0.5.7 kernels.
+- Outputs of the fused MoE ops and of some sorted MoE expert calls differ from 0.5.7 by rounding;
+  `KQ_MOE_QF=0`, `KQ_MOE_SHEXP_DENSE=0` and `KQ_SWITCH_GEMM_MIN_ROWS=512` restore the 0.5.7 kernels.
+- A sorted MoE expert call under 512 rows runs a median 1.4x faster on M5 Max with 8 or 32 experts
+  and 1.2x with 128; `KQ_SWITCH_GEMM_MIN_ROWS=512` restores the 0.5.7 choice.
 
 ## [0.5.7]
 

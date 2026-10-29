@@ -183,6 +183,16 @@ NB_MODULE(_ext, m) {
       "gather_qmm when this holds.");
 
   m.def(
+      "seg_nax_enabled",
+      &mlx_kquant::seg_nax_enabled,
+      "kquant_type"_a,
+      "k"_a,
+      "True when gather_qmm_seg runs its NAX kernel for this codec at input "
+      "width k: nax_gather_enabled holds, k is a multiple of 64, and "
+      "KQ_DISABLE_GATHER_SEG_NAX is unset (read once; any value sets it). "
+      "KQuantSwitchLinear's sorted arm takes its rows-per-expert rule here.");
+
+  m.def(
       "codec_has_moe_glu",
       &mlx_kquant::codec_has_moe_glu,
       "kquant_type"_a,

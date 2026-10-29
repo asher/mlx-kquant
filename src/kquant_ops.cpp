@@ -1280,4 +1280,14 @@ bool nax_gather_enabled(const std::string& kquant_type) {
 #endif
 }
 
+bool seg_nax_enabled(const std::string& kquant_type, int k) {
+#ifdef _METAL_
+  return kq_seg_nax_ok(kquant_type, k);
+#else
+  (void)kquant_type;
+  (void)k;
+  return false;
+#endif
+}
+
 } // namespace mlx_kquant

@@ -1,6 +1,6 @@
 """Native-fp MoE A/B: stock packed-layout kernels vs kq wire-layout kernels.
 
-Decode unit is the fused-path decomposition gguf-mlx actually runs:
+Decode unit is the fused-path decomposition gmlx actually runs:
   gate+up   two gather matmuls + SiLU*mul (stock / wire), or one
             kq.moe_glu_gather dispatch (packed fused, mxfp4 only)
   down      one gathered matvec (stock / wire), or kq.gather_qmv_bias
@@ -11,7 +11,13 @@ matching SwitchGLU's >=64-token sorted path.
 Arms:
   gpu-packed        mx.gather_qmm(mode=<codec>) on the MLX packed layout
   gpu-packed-fused  kq.moe_glu_gather / kq.gather_qmv_bias (decode, mxfp4)
-  gpu-wire          kq.gather_qmm(<codec>) on GGUF wire bytes
+  gpu-wire          kq.gather_qmm(<codec>) on GGUF wire bytes (sorted prefill:
+                    the rhs GEMM, or the per-row matvec under 4 rows/expert)
+  gpu-wire-switch   prefill through mlx_kquant.nn.KQuantSwitchLinear on the
+                    sorted copy, the form of gmlx's down projection (its
+                    gate and up calls pass the x_rows row map instead):
+                    gather_qmm_seg from the width its dispatch rule sets,
+                    gather_qmm below
   gpu-wire-fused    kq.moe_glu_gather_kq / kq.gather_qmv_kq on wire bytes
                     (-bias rows: swiglu_clamp + expert biases, the gpt-oss
                     decode unit; needs a kq build with codec_has_moe_glu)
@@ -35,6 +41,7 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_kquant import _ext as kq
+from mlx_kquant.nn import KQuantSwitchLinear
 
 GPTOSS_GGUF = os.environ.get(
     "KQUANT_BENCH_GPTOSS_GGUF",
@@ -44,7 +51,7 @@ GPTOSS_GGUF = os.environ.get(
 )
 
 DECODE_M = (1, 2, 4)
-PREFILL_M = (512, 2048, 8192)
+PREFILL_M = (64, 512, 2048, 8192)
 CPU_PREFILL_CAP = 512
 WARMUP = 3
 DECODE_REPS = 50
@@ -426,6 +433,11 @@ def bench_shape(tag, codec, e, n_gateup, k, topk, ref_codec):
                     rows * down_bytes_wire,
                 )
 
+    switch = None
+    if wire_gpu:
+        switch = KQuantSwitchLinear(e, n_gateup, k, False, codec)
+        switch.weight = arms["gate"]["wire"]
+
     for m in PREFILL_M:
         print(f"-- prefill M={m} (sorted gate proj) --")
         rows = m * topk
@@ -468,6 +480,17 @@ def bench_shape(tag, codec, e, n_gateup, k, topk, ref_codec):
             report(
                 "gpu-wire prefill",
                 timed(wire_pre, PREFILL_REPS),
+                rows * gu_bytes_wire // 2,
+            )
+
+            xs3, ids1 = xs.reshape(rows, 1, k), ids_s.reshape(rows)
+
+            def switch_pre(xs3=xs3, ids1=ids1):
+                return switch(xs3, ids1, sorted_indices=True)
+
+            report(
+                "gpu-wire-switch prefill",
+                timed(switch_pre, PREFILL_REPS),
                 rows * gu_bytes_wire // 2,
             )
         if wire_cpu and m <= CPU_PREFILL_CAP:

@@ -61,8 +61,14 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
   and runs one MMA pass per 16-row sub-band a partial tile fills, skipping the rest. The fixed-tile
   `gather_qmm_rhs_nax` leaf pays that dequant and MMA walk once per expert segment a tile touches,
   which at ~60 rows per expert (a 2048-token chunk over 288 experts) is ~2x; the seg kernel runs
-  1.5-1.7x faster there. `KQ_DISABLE_GATHER_SEG_NAX=1` forces the steel simdgroup-mma walk. Gated by
-  `KQ_SWITCH_GEMM_MIN_ROWS` (see [README](../README.md#environment-variables)).
+  1.5-1.7x faster there. `KQ_DISABLE_GATHER_SEG_NAX=1` forces the steel simdgroup-mma walk.
+
+  `KQuantSwitchLinear` takes this arm from 1.75 routed rows per expert where the NAX kernel runs
+  (`seg_nax_enabled`).
+  Under that, `gather_qmm`'s per-row matvec is faster; above it, the seg walk also beats the rhs
+  leaf. Measured on M5 Max over 25 codecs and 8 to 512 experts. Elsewhere (the steel walk, the CPU
+  loop) the arm starts at 512 rows. `KQ_SWITCH_GEMM_MIN_ROWS` pins the row floor on every route
+  (see [README](../README.md#environment-variables)).
 
   Tiles are 64 or 128 rows; pass the same `tile_rows` to both ops. `seg_tile_rows` picks 128 on a
   NAX codec from 96 rows per expert on average (120 when K < 1024 and the codec's K tile stays 64),
@@ -1543,6 +1549,8 @@ Tuning levers (defaults are right for normal use):
 - **`nax_available`** / **`nax_gather_enabled`** - whether the GPU exposes NAX tensor units, and
   whether the sorted-gather NAX GEMM kernels (`gather_qmm_rhs_nax`, the `gather_qmm_seg` NAX walk)
   are reachable for a codec.
+- `seg_nax_enabled` - whether `gather_qmm_seg` runs its NAX walk for a codec at an input width K:
+  `nax_gather_enabled`, K a multiple of 64, and `KQ_DISABLE_GATHER_SEG_NAX` unset (read once).
 - **`cpu_neon_available`** - whether the arm64 NEON int8 GEMV path is compiled in.
 - `gpu_core_count` / `max_threadgroup_memory` - the GPU core count from IOKit (`KQ_GPU_CORES`
   overrides it) and the threadgroup memory limit in bytes, both 0 when unknown.
