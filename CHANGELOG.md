@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.8]
+
 ### Added
 - `moe_glu_gather_kq` and `moe_glu_gather_shexp_kq` take `act="swiglu_oai"` with `limit` and
   `alpha`, the clamped SwiGLU of MiniMax-M3, on every GLU codec. The shared-expert op gains `alpha`.
