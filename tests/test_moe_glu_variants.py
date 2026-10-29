@@ -8,7 +8,8 @@ simdgroup pairs; more rows share one staged LUT; one owner per expert
 dots the pair of rows that share it) and must be bit-identical to the
 base launch. Each arm runs in a subprocess so the live-read env latches
 (KQ_MOE_SP, KQ_MOE_SG, KQ_MOE_DEDUP, KQ_MOE_MIX_FORM) see the variable from
-the first dispatch.
+the first dispatch. The arms run the Ext kernels (KQ_MOE_QF=0);
+test_moe_qf covers the forms of the qf kernels.
 """
 
 import os
@@ -22,6 +23,7 @@ pytestmark = pytest.mark.skipif(
     bool(os.environ.get("KQUANT_FORCE_CPU")),
     reason="fused MoE gathers are Metal-only kernels; no CPU path.",
 )
+EXT = {"KQ_MOE_QF": "0"}
 
 
 def _run_child(argv, env, what):
@@ -36,7 +38,7 @@ def _run_child(argv, env, what):
         argv,
         capture_output=True,
         text=True,
-        env={**os.environ, **env},
+        env={**os.environ, **EXT, **env},
     )
     assert r.returncode == 0, (
         f"{what} exited {r.returncode}\n"
@@ -92,7 +94,7 @@ def test_sp_bit_identical(codec, tmp_path):
         subprocess.run(
             [sys.executable, "-c", _SNIPPET, codec, str(f)],
             check=True,
-            env={**os.environ, **env},
+            env={**os.environ, **EXT, **env},
         )
         outs[arm] = np.load(f)
     for key in ("mix", "glu"):
@@ -169,7 +171,7 @@ def test_sg_bit_identical(codec, sg, tmp_path):
         subprocess.run(
             [sys.executable, "-c", _SNIPPET, codec, str(f)],
             check=True,
-            env={**os.environ, **env},
+            env={**os.environ, **EXT, **env},
         )
         outs[arm] = np.load(f)
     for key in ("mix", "glu"):
@@ -501,12 +503,14 @@ for c in kq.codecs():
 """
 
 
-def test_shexp_mix_slot_parallel_matches_dispatch():
+@pytest.mark.parametrize("qf", ["0", "1"])
+def test_shexp_mix_slot_parallel_matches_dispatch(qf):
     """Every codec combination shexp_mix_slot_parallel lists dispatches its
-    slot-parallel kernel at one row, and the others do not."""
+    slot-parallel kernel at one row, and the others do not, with the qf
+    kernels off and on."""
     r = _run_child(
         [sys.executable, "-c", _SP_COVER_SNIPPET],
-        {"KQ_MOE_NX_LOG": "1"},
+        {"KQ_MOE_NX_LOG": "1", "KQ_MOE_QF": qf},
         "slot-parallel cover",
     )
     pairs = [ln.split()[1:] for ln in r.stdout.splitlines() if ln.startswith("PAIR")]
@@ -515,8 +519,12 @@ def test_shexp_mix_slot_parallel_matches_dispatch():
     assert ["q6_k", "q6_k", "0"] in pairs and ["q8_0", "q8_0", "0"] in pairs
     for codec, scodec, listed in pairs:
         stem = codec if scodec == codec else f"{codec}_sx_{scodec}"
-        name = f"kq_{stem}_gather_qmv_mix_sp_"
-        assert (name in r.stderr) == (listed == "1"), (codec, scodec, listed)
+        names = (
+            f"kq_{stem}_gather_qmv_mix_sp_",
+            f"kq_{codec}_qf_sx_{scodec}_gather_qmv_mix_sp_",
+        )
+        ran = any(n in r.stderr for n in names)
+        assert ran == (listed == "1"), (codec, scodec, listed)
 
 
 C32_CODECS = ["iq2_s", "iq2_xxs", "iq2_xs", "iq3_xxs", "iq3_s", "iq1_s", "iq1_m"]

@@ -190,6 +190,15 @@ NB_MODULE(_ext, m) {
       "(kq.moe_glu_gather_kq and friends).");
 
   m.def(
+      "moe_qf_kernels",
+      &mlx_kquant::moe_qf_kernels,
+      "kquant_type"_a,
+      "True when the fused MoE gathers on this codec run its tuned mat-vec "
+      "loops (the qf kernels) instead of the generic kernels. KQ_MOE_QF=0 "
+      "or a forced KQ_MOE_NX keeps the generic kernels; both are read live "
+      "once set. False on a build without Metal.");
+
+  m.def(
       "shexp_glu_combo_has_kernel",
       &mlx_kquant::shexp_glu_combo_has_kernel,
       "kquant_type"_a,
@@ -2320,6 +2329,12 @@ NB_MODULE(_ext, m) {
         by its score, replacing gather + (y * scores).sum + shared add.
         Shared slot j reads columns [j K, (j + 1) K) of shexp_w, so K must
         be whole blocks of the shared codec.
+
+        From KQ_MOE_SHEXP_DENSE tokens (default 4), a call with one shared
+        slot, or no scores for its shared slots, takes the shared product
+        from quantized_matmul_multi. A function compiled with
+        shapeless=True cannot hold such a call: it raises ValueError.
+        KQ_MOE_SHEXP_DENSE=0 keeps the shared expert in the fused kernel.
 
         Args:
             x (array): activations [T, S, K], float16/bfloat16. K % 256 == 0.

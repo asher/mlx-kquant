@@ -59,6 +59,14 @@ inline float kq_glu_clip(float u, float limit) {
       [[buffer(KQ_GLU_ALPHA_SLOT), function_constant(kq_swiglu_oai)]]
 #define KQ_GLU_ALPHA (kq_swiglu_oai ? alpha : 1.0f)
 
+// With kq_shexp_pre a mix kernel reads its shared slots' rows from
+// shexp_pre [T, N], the dense route's product of the shared slots' h
+// with the shared down weights.
+#define KQ_SHEXP_PRE_SLOT 25
+#define KQ_SHEXP_PRE_ARG    \
+  const device T* shexp_pre \
+      [[buffer(KQ_SHEXP_PRE_SLOT), function_constant(kq_shexp_pre)]]
+
 template <int ACT>
 inline float
 kq_glu_epilogue(float g, float u, float limit, float alpha = 1.0f) {
@@ -314,6 +322,10 @@ template <typename T, int ACT>
 
   const int n_route = tpg.y - NS;
   const bool shared_slot = int(tid.y) >= n_route;
+  // The dense route computed the shared slots (kq_moe_shexp_glu_pre).
+  if (kq_shexp_pre && shared_slot) {
+    return;
+  }
   const int expert = shared_slot ? int(tid.y) - n_route
                                  : int(indices[tid.z * n_route + tid.y]);
   const device uint8_t* gsrc = shared_slot ? sgw : gw;
@@ -399,6 +411,7 @@ template <typename T, int results_per_simdgroup = 4>
     const constant int& S [[buffer(8)]],
     const constant int& SC [[buffer(9)]],
     const constant int& NS [[buffer(10)]],
+    KQ_SHEXP_PRE_ARG,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -420,7 +433,7 @@ template <typename T, int results_per_simdgroup = 4>
   const int nb = K / KQ_Q6_K_SUPERBLOCK;
 
   const int n_route = S - NS;
-  for (int slot = 0; slot < S; slot++) {
+  for (int slot = 0; slot < (kq_shexp_pre ? n_route : S); slot++) {
     // Shared slot j reads columns [j K, (j + 1) K) of each shared row.
     const bool shared_slot = slot >= n_route;
     const device uint8_t* src =
@@ -483,6 +496,11 @@ template <typename T, int results_per_simdgroup = 4>
   out += (int64_t)tid.z * N + out_row;
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
+    if (kq_shexp_pre) {
+      // NS == 1, or SC == S - NS (host)
+      result[row] += (SC == S ? U(scores[tid.z * SC + n_route]) : U(1)) *
+          U(shexp_pre[(int64_t)tid.z * N + out_row + row]);
+    }
     if (simd_lid == 0) {
       out[row] = static_cast<T>(result[row]);
     }
@@ -657,6 +675,10 @@ template <typename T, int ACT>
 
   const int n_route = tpg.y - NS;
   const bool shared_slot = int(tid.y) >= n_route;
+  // The dense route computed the shared slots (kq_moe_shexp_glu_pre).
+  if (kq_shexp_pre && shared_slot) {
+    return;
+  }
   const int expert = shared_slot ? int(tid.y) - n_route
                                  : int(indices[tid.z * n_route + tid.y]);
   const device uint8_t* gsrc = shared_slot ? sgw : gw;
@@ -721,6 +743,7 @@ template <typename T, int results_per_simdgroup = 4>
     const constant int& S [[buffer(8)]],
     const constant int& SC [[buffer(9)]],
     const constant int& NS [[buffer(10)]],
+    KQ_SHEXP_PRE_ARG,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -737,7 +760,7 @@ template <typename T, int results_per_simdgroup = 4>
   const int lane_k_offset = simd_lid * values_per_thread;
 
   const int n_route = S - NS;
-  for (int slot = 0; slot < S; slot++) {
+  for (int slot = 0; slot < (kq_shexp_pre ? n_route : S); slot++) {
     // Shared slot j reads columns [j K, (j + 1) K) of each shared row.
     const bool shared_slot = slot >= n_route;
     const device uint8_t* src =
@@ -780,6 +803,11 @@ template <typename T, int results_per_simdgroup = 4>
   out += (int64_t)tid.z * N + out_row;
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
+    if (kq_shexp_pre) {
+      // NS == 1, or SC == S - NS (host)
+      result[row] += (SC == S ? U(scores[tid.z * SC + n_route]) : U(1)) *
+          U(shexp_pre[(int64_t)tid.z * N + out_row + row]);
+    }
     if (simd_lid == 0) {
       out[row] = static_cast<T>(result[row]);
     }
@@ -1068,6 +1096,36 @@ METAL_FUNC float kq_moe_shexp_scale(const device float* s) {
 #define KQ_MOE_ARGS_MIX
 #endif
 
+// The shared slots of a fused GLU whose shared expert ran on the dense
+// route (kq_shexp_pre): out[t, R + j] = act(g[t, j], u[t, j]), g and u
+// the gate and up products [T, NS * N], shared scales applied. Grid
+// (N, NS, T) threads.
+template <typename T, int ACT>
+[[kernel]] void kq_moe_shexp_glu_pre(
+    const device T* g [[buffer(0)]],
+    const device T* u [[buffer(1)]],
+    device T* out [[buffer(2)]],
+    const constant int& N [[buffer(3)]],
+    const constant int& R [[buffer(4)]],
+    const constant float& limit [[buffer(5)]],
+    KQ_GLU_ALPHA_ARG,
+    uint3 gid [[thread_position_in_grid]],
+    uint3 gsz [[threads_per_grid]]) {
+  const int NS = int(gsz.y);
+  const int64_t src = ((int64_t)gid.z * NS + gid.y) * N + gid.x;
+  const int64_t dst = ((int64_t)gid.z * (R + NS) + R + gid.y) * N + gid.x;
+  out[dst] = static_cast<T>(
+      kq_glu_epilogue<ACT>(float(g[src]), float(u[src]), limit, KQ_GLU_ALPHA));
+}
+
+// clang-format off
+#define instantiate_kq_moe_shexp_glu_pre(type)                         \
+  instantiate_kernel("kq_moe_shexp_glu_pre_silu_" #type,               \
+      kq_moe_shexp_glu_pre, type, KQ_GLU_ACT_SILU)                     \
+  instantiate_kernel("kq_moe_shexp_glu_pre_gelu_" #type,               \
+      kq_moe_shexp_glu_pre, type, KQ_GLU_ACT_GELU)
+// clang-format on
+
 template <
     typename T,
     typename Codec,
@@ -1298,6 +1356,10 @@ template <
   const short ty = short(simd_lid / NX);
   const int n_route = tpg.y - NS;
   const bool shared_slot = int(tid.y) >= n_route;
+  // The dense route computed the shared slots (kq_moe_shexp_glu_pre).
+  if (kq_shexp_pre && shared_slot) {
+    return;
+  }
   const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
 
   x += (int64_t)tid.z * K;
@@ -1523,6 +1585,7 @@ template <
     const constant int& SC [[buffer(9)]],
     const constant int& NS [[buffer(10)]],
     const constant int& SP [[buffer(11)]],
+    KQ_SHEXP_PRE_ARG,
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -1549,7 +1612,7 @@ template <
   // K-wide row out_row * NS + j. SC == S - NS: an implicit weight of 1.
   // Each shared row runs in SP pieces, summed in piece order as the
   // slot-parallel kernel sums them.
-  for (int slot = n_route; slot < S; slot++) {
+  for (int slot = n_route; !kq_shexp_pre && slot < S; slot++) {
     const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
     const int64_t srow = (int64_t)out_row * NS + (slot - n_route);
     float sp = kq_ext_piece_partial<T, SCodec, NX, C32>(
@@ -1565,6 +1628,12 @@ template <
   }
   result = kq_ext_reduce<NX>(result);
   if (tx == 0) {
+    if (kq_shexp_pre) {
+      result += KQ_MOE_MUL(
+                    (SC == S ? scores[tid.z * SC + n_route] : 1.0f),
+                    kq_moe_shexp_scale(shexp_scale)) *
+          float(shexp_pre[(int64_t)tid.z * N + out_row]);
+    }
     out[(int64_t)tid.z * N + out_row] = static_cast<T>(result);
   }
 }
@@ -1573,8 +1642,9 @@ template <
 // slot or one of the SP pieces of a shared slot, as in
 // kq_ext_gather_qmv_mix_ns_sp. The slot-0 pair replays the loop kernel's
 // score chain and piece sums, so outputs are bit-identical to it.
-// Dispatch: group (32, 2 * (S - NS + NS * SP), 1), grid (N / (2 * RPS), 1,
-// T); host gates S - NS + NS * SP <= KQ_MOE_SP_MAX_S.
+// Dispatch: group (32, 2 * (S - NS + NS * SP), 1), or (32, 2 * (S - NS), 1)
+// with kq_shexp_pre, grid (N / (2 * RPS), 1, T); host gates the pairs <=
+// KQ_MOE_SP_MAX_S.
 template <
     typename T,
     typename Codec,
@@ -1594,6 +1664,7 @@ template <
     const constant int& SC [[buffer(9)]],
     const constant int& NS [[buffer(10)]],
     const constant int& SP [[buffer(11)]],
+    KQ_SHEXP_PRE_ARG,
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -1640,8 +1711,9 @@ template <
                         out_scale, indices[tid.z * n_route + s], N, out_row)) *
           parts[lrow][tx][s];
     }
-    // SC == S - NS: the shared slots' weight is an implicit 1
-    for (int j = 0; j < NS; j++) {
+    // SC == S - NS: the shared slots' weight is an implicit 1. The dense
+    // route leaves the shared parts unwritten.
+    for (int j = 0; !kq_shexp_pre && j < NS; j++) {
       const int p0 = n_route + j * SP;
       float sp = parts[lrow][tx][p0];
       for (int q = 1; q < SP; q++) {
@@ -1654,6 +1726,12 @@ template <
     }
     result = kq_ext_reduce<NX>(result);
     if (tx == 0) {
+      if (kq_shexp_pre) {
+        result += KQ_MOE_MUL(
+                      (SC == S ? scores[tid.z * SC + n_route] : 1.0f),
+                      kq_moe_shexp_scale(shexp_scale)) *
+            float(shexp_pre[(int64_t)tid.z * N + out_row]);
+      }
       out[(int64_t)tid.z * N + out_row] = static_cast<T>(result);
     }
   }
@@ -1925,6 +2003,10 @@ template <
   const int n_route = tpg.y - NS;
   const int T_ = int(tpg.z);
   const bool shared_slot = int(tid.y) >= n_route;
+  // The dense route computed the shared slots (kq_moe_shexp_glu_pre).
+  if (kq_shexp_pre && shared_slot) {
+    return;
+  }
   // Output rows are (row, slot) over tpg.y slots; partner q is the other
   // output row served by this threadgroup (-1: none, -2: served elsewhere).
   const int p = int(tid.z) * int(tpg.y) + int(tid.y);
@@ -2025,6 +2107,7 @@ template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
     const constant int& T_ [[buffer(10)]],
     const constant int& NS [[buffer(11)]],
     const constant int& SP [[buffer(12)]],
+    KQ_SHEXP_PRE_ARG,
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -2089,7 +2172,7 @@ template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
           kq_ext_row_partial<T, Codec, NX>(w, xa, wrow, K, tx, kq_luts);
     }
   }
-  for (int slot = n_route; SHEXP && slot < S; slot++) {
+  for (int slot = n_route; SHEXP && !kq_shexp_pre && slot < S; slot++) {
     // SC == S - NS: the shared slots' weight is an implicit 1
     const device T* xa = h + ((int64_t)ra * S + slot) * K;
     const float wa = KQ_MOE_MUL(
@@ -2120,6 +2203,12 @@ template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
   }
   result = kq_ext_reduce<NX>(result);
   if (tx == 0) {
+    if (SHEXP && kq_shexp_pre) {
+      result += KQ_MOE_MUL(
+                    (SC == S ? scores[ra * SC + n_route] : 1.0f),
+                    kq_moe_shexp_scale(shexp_scale)) *
+          float(shexp_pre[(int64_t)ra * N + out_row]);
+    }
     out[(int64_t)ra * N + out_row] = static_cast<T>(result);
   }
   if (!has_b) {
@@ -2142,7 +2231,8 @@ template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
                       out_scale, indices[rb * n_route + slot], N, out_row)) *
         pb[slot];
   }
-  for (int slot = n_route; SHEXP && slot < S; slot++) {
+  // the dense route leaves the shared pb unwritten
+  for (int slot = n_route; SHEXP && !kq_shexp_pre && slot < S; slot++) {
     result += KQ_MOE_MUL(
                   (SC == S ? scores[rb * SC + slot] : 1.0f),
                   kq_moe_shexp_scale(shexp_scale)) *
@@ -2150,6 +2240,12 @@ template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
   }
   result = kq_ext_reduce<NX>(result);
   if (tx == 0) {
+    if (SHEXP && kq_shexp_pre) {
+      result += KQ_MOE_MUL(
+                    (SC == S ? scores[rb * SC + n_route] : 1.0f),
+                    kq_moe_shexp_scale(shexp_scale)) *
+          float(shexp_pre[(int64_t)rb * N + out_row]);
+    }
     out[(int64_t)rb * N + out_row] = static_cast<T>(result);
   }
 }
@@ -2588,6 +2684,10 @@ template <
   const short ty = short(simd_lid / NX);
   const int n_route = tpg.y - NS;
   const bool shared_slot = int(tid.y) >= n_route;
+  // The dense route computed the shared slots (kq_moe_shexp_glu_pre).
+  if (kq_shexp_pre && shared_slot) {
+    return;
+  }
   const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
   const ushort lin = ushort(simd_gid * 32 + simd_lid);
   const ushort nth = ushort(32 * tptg.y);
@@ -2639,6 +2739,7 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
     const constant int& S [[buffer(8)]],
     const constant int& SC [[buffer(9)]],
     const constant int& NS [[buffer(10)]],
+    KQ_SHEXP_PRE_ARG,
     threadgroup half4* xs [[threadgroup(0)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tptg [[threads_per_threadgroup]],
@@ -2665,7 +2766,7 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
         kq_ext_row_partial_h<Codec, NX>(
                   w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
   }
-  for (int slot = n_route; slot < S; slot++) {
+  for (int slot = n_route; !kq_shexp_pre && slot < S; slot++) {
     const device T* hs = h + ((int64_t)tid.z * S + slot) * K;
     result +=
         (SC == S ? scores[tid.z * SC + slot] : 1.0f) *
@@ -2674,6 +2775,10 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
   }
   result = kq_ext_reduce<NX>(result);
   if (tx == 0) {
+    if (kq_shexp_pre) {
+      result += (SC == S ? scores[tid.z * SC + n_route] : 1.0f) *
+          float(shexp_pre[(int64_t)tid.z * N + out_row]);
+    }
     out[(int64_t)tid.z * N + out_row] = static_cast<T>(result);
   }
 }

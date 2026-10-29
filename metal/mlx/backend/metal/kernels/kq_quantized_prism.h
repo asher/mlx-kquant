@@ -139,7 +139,15 @@ METAL_FUNC void kq_pq2_0_decode_pairs(uint wv, thread half2* h) {
 // as half2 pairs. For float16 activations, two half MACs per instruction
 // against the activation pair (y_j, y_j+8) keep the decode near the
 // load-only rate.
-template <typename T, int SB, int BB, int results_per_simdgroup>
+// kVM == 2 (kRows only) dots a second activation row kq_x1 against the same
+// weights, decoding each weight once; each row's sums are the one-row form's.
+template <
+    typename T,
+    int SB,
+    int BB,
+    int results_per_simdgroup,
+    bool kRows = false,
+    int kVM = 1>
 METAL_FUNC void kq_pq2_0_qmv_sb_impl(
     const device uint8_t* w,
     const device T* x,
@@ -148,7 +156,10 @@ METAL_FUNC void kq_pq2_0_qmv_sb_impl(
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    thread float* kq_rows = nullptr,
+    const device T* kq_x1 = nullptr) {
+  static_assert(kVM == 1 || (kVM == 2 && kRows), "two rows need kRows");
   constexpr int num_simdgroups = 2;
   constexpr int lanes = SB / 16;
   constexpr int blocks_per_pass = 32 / lanes;
@@ -168,15 +179,25 @@ METAL_FUNC void kq_pq2_0_qmv_sb_impl(
   y += tid.x * out_vec_size;
   const short ix = simd_lid / lanes;
   const short it = simd_lid % lanes;
-  U result[results_per_simdgroup] = {0};
-  for (int ib = ix; ib < nb; ib += blocks_per_pass) {
-    const device T* xb = x + ib * SB + it * 16;
-    const vec<T, 8> lo = *(const device vec<T, 8>*)(xb);
-    const vec<T, 8> hi = *(const device vec<T, 8>*)(xb + 8);
-    A2 y2[8];
+  U result[kVM][results_per_simdgroup];
 #pragma unroll
-    for (short j = 0; j < 8; ++j) {
-      y2[j] = A2(float(lo[j]), float(hi[j]));
+  for (int v = 0; v < kVM; v++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[v][row] = U(0);
+    }
+  }
+  for (int ib = ix; ib < nb; ib += blocks_per_pass) {
+    A2 y2[kVM][8];
+#pragma unroll
+    for (int v = 0; v < kVM; v++) {
+      const device T* xb = (v == 0 ? x : kq_x1) + ib * SB + it * 16;
+      const vec<T, 8> lo = *(const device vec<T, 8>*)(xb);
+      const vec<T, 8> hi = *(const device vec<T, 8>*)(xb + 8);
+#pragma unroll
+      for (short j = 0; j < 8; ++j) {
+        y2[v][j] = A2(float(lo[j]), float(hi[j]));
+      }
     }
     // A static row loop lets the compiler interleave the rows' loads; the
     // tail threadgroup recomputes its last row and drops it at the store.
@@ -191,18 +212,26 @@ METAL_FUNC void kq_pq2_0_qmv_sb_impl(
           (const device ushort*)(sb + KQ_PQ2_0_QS_OFFSET + 4 * it);
       half2 h[8];
       kq_pq2_0_decode_pairs(uint(qs[0]) | (uint(qs[1]) << 16), h);
-      A2 acc = A2(0, 0);
 #pragma unroll
-      for (short j = 0; j < 8; ++j) {
-        acc = fma(A2(h[j]), y2[j], acc);
+      for (int v = 0; v < kVM; v++) {
+        A2 acc = A2(0, 0);
+#pragma unroll
+        for (short j = 0; j < 8; ++j) {
+          acc = fma(A2(h[j]), y2[v][j], acc);
+        }
+        result[v][row] += d16 * (float(acc.x) + float(acc.y));
       }
-      result[row] += d16 * (float(acc.x) + float(acc.y));
     }
   }
   for (int row = 0; row < results_per_simdgroup; row++) {
-    U r = simd_sum(result[row]);
-    if (simd_lid == 0 && row < active_rows) {
-      y[out_row + row] = static_cast<T>(r);
+#pragma unroll
+    for (int v = 0; v < kVM; v++) {
+      U r = simd_sum(result[v][row]);
+      if constexpr (kRows) {
+        kq_rows[v * results_per_simdgroup + row] = r;
+      } else if (simd_lid == 0 && row < active_rows) {
+        y[out_row + row] = static_cast<T>(r);
+      }
     }
   }
 }
@@ -331,7 +360,13 @@ METAL_FUNC void kq_pq2_0_verify_qmv_impl(
       w, x, y, in_vec_size, out_vec_size, vm, tid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int results_per_simdgroup = 2,
+    bool kRows = false,
+    int kVM = 1>
 METAL_FUNC void kq_q2_0_qmv_impl(
     const device uint8_t* w,
     const device T* x,
@@ -340,15 +375,28 @@ METAL_FUNC void kq_q2_0_qmv_impl(
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    thread float* kq_rows = nullptr,
+    const device T* kq_x1 = nullptr) {
   static_assert(group_size == KQ_Q2_0_SUPERBLOCK, "Q2_0 requires gs=64");
   static_assert(bits == 2, "Q2_0 requires bits=2");
   kq_pq2_0_qmv_sb_impl<
       T,
       KQ_Q2_0_SUPERBLOCK,
       KQ_Q2_0_BLOCK_BYTES,
-      results_per_simdgroup>(
-      w, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      results_per_simdgroup,
+      kRows,
+      kVM>(
+      w,
+      x,
+      y,
+      in_vec_size,
+      out_vec_size,
+      tid,
+      simd_gid,
+      simd_lid,
+      kq_rows,
+      kq_x1);
 }
 
 template <typename T, int group_size, int bits, int results_per_simdgroup = 2>

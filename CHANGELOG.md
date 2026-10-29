@@ -10,6 +10,16 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `moe_glu_gather_kq` and `moe_glu_gather_shexp_kq` take `act="swiglu_oai"` with `limit` and
   `alpha`, the clamped SwiGLU of MiniMax-M3, on every GLU codec. The shared-expert op gains `alpha`.
 - `skinny_matmul` takes a `float32` x with a `float16` or `bfloat16` weight and returns `float32`.
+- `moe_qf_kernels(kquant_type)` reports whether a codec's fused MoE gathers run on its own
+  matrix-vector loop, where a row's routed experts give the same output at every call width.
+
+### Changed
+- The fused MoE gathers of q2_k to q4_k, iq4_xs, iq4_nl, q4_0 to q5_1, mxfp4, nvfp4 and q2_0 run
+  faster on M5 Max, except at 3 to 8 rows on mostly repeated experts; `KQ_MOE_QF=0` restores them.
+- From 4 tokens, the fused MoE ops read a shared expert's weights once per call, up to 15% faster
+  at 8 tokens on M5 Max; `KQ_MOE_SHEXP_DENSE=0` restores the per-token form.
+- Outputs of the fused MoE ops differ from 0.5.7 by rounding; `KQ_MOE_QF=0` and
+  `KQ_MOE_SHEXP_DENSE=0` restore the 0.5.7 kernels.
 
 ## [0.5.7]
 

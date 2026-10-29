@@ -91,14 +91,37 @@ BF16_CODECS = ("iq2_xs", "iq3_xxs", "q4_k", "q6_k", "nvfp4")
 
 # The lever settings every arm names; the child sets all of them before its
 # first dispatch, so the latched levers read live.
-LEVERS = ("KQ_MOE_NX", "KQ_MOE_HALF", "KQ_MOE_C32", "KQ_MOE_DEDUP", "KQ_MOE_MIX_FORM")
+LEVERS = (
+    "KQ_MOE_NX",
+    "KQ_MOE_HALF",
+    "KQ_MOE_C32",
+    "KQ_MOE_DEDUP",
+    "KQ_MOE_MIX_FORM",
+    "KQ_MOE_QF",
+)
 BASE_ENV = {
     "KQ_MOE_NX": "",
     "KQ_MOE_HALF": "0",
     "KQ_MOE_C32": "0",
     "KQ_MOE_DEDUP": "1",
     "KQ_MOE_MIX_FORM": "",
+    "KQ_MOE_QF": "0",
 }
+QF_CODECS = (
+    "q2_k",
+    "q3_k",
+    "q4_k",
+    "iq4_xs",
+    "q4_0",
+    "q4_1",
+    "q5_0",
+    "q5_1",
+    "iq4_nl",
+    "q2_0",
+    "mxfp4",
+    "nvfp4",
+)
+QF_PAIRS = ("q5_0", "q5_1", "iq4_nl", "iq4_xs", "mxfp4", "nvfp4", "q2_0")
 
 
 def _arm(
@@ -340,6 +363,7 @@ def arms():
                     expect=rf"^kq_{c}{pat}",
                 )
             )
+    out += _qf_arms()
     for a in out:
         lev = "".join(
             f"-{k[3:].lower()}{v}" for k, v in a["env"].items() if v != BASE_ENV[k]
@@ -349,6 +373,123 @@ def arms():
             f"{a['dtype']}{lev}{'-scaled' if a['scales'] else ''}"
         )
     assert len({a["id"] for a in out}) == len(out)
+    return out
+
+
+def _qf_arms():
+    """The qf kernels (KQ_MOE_QF=1) at every site: each qf codec's GLU
+    gathers, the upcast shared codecs, bfloat16, out-scales and the downs."""
+    qf = {"KQ_MOE_QF": "1"}
+    out = []
+    for c in QF_CODECS:
+        dd = "dd_" if c in QF_PAIRS else ""
+        shexp = rf"^kq_{c}_qf_sx_{c}_moe_glu_gather_shexp_silu_float16_t$"
+        out += [
+            _arm(
+                "glu",
+                c,
+                1,
+                env=qf,
+                expect=rf"^kq_{c}_qf_moe_glu_gather_{{act}}_float16_t$",
+            ),
+            _arm(
+                "glu",
+                c,
+                3,
+                env=qf,
+                expect=rf"^kq_{c}_qf_moe_glu_gather_{dd}{{act}}_float16_t$",
+            ),
+            _arm("shexp", c, 1, env=qf, expect=shexp),
+            _arm("shexp", c, 3, env=qf, expect=shexp),
+        ]
+    for c, s in (
+        ("q4_k", "q5_k"),
+        ("q2_k", "q6_k"),
+        ("iq4_xs", "q8_0"),
+        ("nvfp4", "q5_k"),
+    ):
+        for T in (1, 3):
+            out.append(
+                _arm(
+                    "shexp",
+                    c,
+                    T,
+                    sx=s,
+                    env=qf,
+                    expect=rf"^kq_{c}_qf_sx_{s}_moe_glu_gather_shexp_silu_float16_t$",
+                )
+            )
+    for c in ("q4_k", "nvfp4"):
+        out += [
+            _arm(
+                "glu",
+                c,
+                1,
+                env=qf,
+                dtype="bfloat16",
+                expect=rf"^kq_{c}_qf_moe_glu_gather_{{act}}_bfloat16_t$",
+            ),
+            _arm(
+                "shexp",
+                c,
+                3,
+                env=qf,
+                dtype="bfloat16",
+                expect=rf"^kq_{c}_qf_sx_{c}_moe_glu_gather_shexp_silu_bfloat16_t$",
+            ),
+        ]
+        for T in (1, 3):
+            out.append(
+                _arm("qmv", c, T, env=qf, expect=rf"^kq_{c}_qf_gather_qmv_float16_t$")
+            )
+    for T in (1, 3):
+        out += [
+            _arm(
+                "glu",
+                "nvfp4",
+                T,
+                env=qf,
+                scales=True,
+                expect=r"^kq_nvfp4_qf_moe_glu_gather_(dd_)?{act}_float16_t$",
+            ),
+            _arm(
+                "shexp",
+                "nvfp4",
+                T,
+                env=qf,
+                scales=True,
+                expect=r"^kq_nvfp4_qf_sx_nvfp4_moe_glu_gather_shexp_silu_float16_t$",
+            ),
+        ]
+    for c, s in (("q4_k", "q8_0"), ("q5_0", None)):
+        for form, T, pat in (
+            ("sp", 1, "_gather_qmv_mix_sp_"),
+            ("loop", 3, "_gather_qmv_mix_float16_t$"),
+        ):
+            out.append(
+                _arm(
+                    "mix",
+                    c,
+                    T,
+                    sx=s,
+                    env={**qf, "KQ_MOE_MIX_FORM": form},
+                    expect=rf"^kq_{c}_qf_sx_{s or c}{pat}",
+                )
+            )
+    for c in ("q4_k", "q5_0"):
+        for form, T, pat in (
+            ("sp", 1, "_gather_qmv_mix_ns_sp_"),
+            ("loop", 3, "_gather_qmv_mix_ns_float16_t$"),
+        ):
+            out.append(
+                _arm(
+                    "mix_ns",
+                    c,
+                    T,
+                    env={**qf, "KQ_MOE_MIX_FORM": form},
+                    expect=rf"^kq_{c}_qf{pat}",
+                )
+            )
     return out
 
 
@@ -632,6 +773,9 @@ def test_launch_sites_covered():
         ("sx2", "_sx2_"),
     ):
         assert need in fams, need
+    # sx2 (split shared gate and up codecs) has no qf kernels
+    qf = {a["site"] for a in arms() if "_qf_" in a["expect"]}
+    assert qf == sites - {"sx2"}, sites - qf
 
 
 @gpu_only
@@ -647,7 +791,8 @@ def test_swiglu_oai_matches_reference(runs, order):
 @gpu_only
 @pytest.mark.parametrize("order", ["old_first", "oai_first"])
 def test_older_forms_match_the_release(runs, order):
-    """silu, silu_limit and the down gathers give the 0.5.7 values."""
+    """silu, silu_limit and the down gathers give the 0.5.7 values. The qf
+    arms sum in another order, so only swiglu_oai is checked on them."""
     if not os.path.exists(REF):
         pytest.skip("reference outputs missing")
     ref = np.load(REF)
@@ -667,7 +812,9 @@ def test_older_forms_match_the_release(runs, order):
             rel = np.linalg.norm(got - want) / (np.linalg.norm(want) + 1e-6)
             assert rel < REL_BOUND, (key, rel)
         n += 1
-    assert n == sum(len(OLD_ACTS[a["site"]]) for a in arms())
+    assert n == sum(
+        len(OLD_ACTS[a["site"]]) for a in arms() if a["env"]["KQ_MOE_QF"] == "0"
+    )
 
 
 @gpu_only

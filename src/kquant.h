@@ -675,6 +675,12 @@ mx::array moe_glu_gather_kq(
 // True when the codec has the fused MoE GLU/gather kernel family above.
 bool codec_has_moe_glu(const std::string& kquant_type);
 
+// True when the fused MoE gathers on kquant_type run the qf kernels (the
+// codec's tuned qmv_fast loops) instead of the Ext kernels. KQ_MOE_QF=0 or a
+// forced KQ_MOE_NX keeps the Ext kernels; both are read live once set.
+// False on a build without Metal.
+bool moe_qf_kernels(const std::string& kquant_type);
+
 // True when moe_glu_gather_shexp_kq has a kernel for expert stacks in
 // kquant_type with the shared expert's gate in shexp_gate_type and its up
 // in shexp_up_type ("silu" and "swiglu_oai" only when the three are not one

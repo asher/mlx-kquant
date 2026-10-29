@@ -336,7 +336,7 @@ def _child(spec):
 
 def _run(T, env):
     cenv = {k: v for k, v in os.environ.items() if not k.startswith("KQ_")}
-    cenv.update(env, KQ_MOE_NX_LOG="1")
+    cenv.update({"KQ_MOE_QF": "0", **env}, KQ_MOE_NX_LOG="1")
     r = subprocess.run(
         [sys.executable, __file__, json.dumps({"T": T})],
         env=cenv,
@@ -354,7 +354,9 @@ def _run(T, env):
 
 # (T, levers, kernel name parts that must have run). Each part names a form:
 # the GLU gathers at NX 8, 16 and 32 and their dedupe form, the down gather,
-# the slot-parallel, dedupe pair and loop mixes, and the shared q8_0 stems.
+# the slot-parallel, dedupe pair and loop mixes, the shared q8_0 stems, and
+# the shared-expert epilogue of the dense route (parts starting kq_moe_).
+# The arms run the Ext kernels unless they set KQ_MOE_QF=1.
 ARMS = {
     "t1": (
         1,
@@ -368,7 +370,21 @@ ARMS = {
             "nvfp4_sx_q8_0_moe_glu_gather_shexp_",
         ),
     ),
-    "t4": (4, {}, ("_moe_glu_gather_dd_silu", "_moe_glu_gather_shexp_dd_silu")),
+    "t3": (3, {}, ("_moe_glu_gather_dd_silu", "_moe_glu_gather_shexp_dd_silu")),
+    "t4": (
+        4,
+        {},
+        (
+            "_moe_glu_gather_dd_silu",
+            "_moe_glu_gather_shexp_dd_silu",
+            "kq_moe_shexp_glu_pre_silu_",
+        ),
+    ),
+    "t4_fold": (
+        4,
+        {"KQ_MOE_SHEXP_DENSE": "0"},
+        ("_moe_glu_gather_shexp_dd_silu", "nvfp4_sx_q8_0_moe_glu_gather_shexp_"),
+    ),
     "t64": (64, {}, ("_moe_glu_gather_silu_nx16_", "_moe_glu_gather_shexp_silu_nx16_")),
     "nx8": (
         1,
@@ -390,6 +406,37 @@ ARMS = {
             "_moe_glu_gather_silu_nx16_",
         ),
     ),
+    "qf1": (
+        1,
+        {"KQ_MOE_QF": "1"},
+        (
+            "_qf_moe_glu_gather_silu_float16_t",
+            "_qf_moe_glu_gather_bias_swiglu_clamp",
+            "_qf_sx_nvfp4_gather_qmv_mix_sp_",
+            "_qf_sx_q8_0_gather_qmv_mix_sp_",
+            "_qf_sx_q8_0_moe_glu_gather_shexp_",
+        ),
+    ),
+    "qf4": (
+        4,
+        {"KQ_MOE_QF": "1"},
+        (
+            "_qf_moe_glu_gather_dd_silu",
+            "_qf_gather_qmv_float16_t",
+            "_qf_gather_qmv_bias_",
+            "_qf_gather_qmv_mix_ns_sp_",
+            "_qf_sx_nvfp4_moe_glu_gather_shexp_silu",
+        ),
+    ),
+    "qf_loop": (
+        4,
+        {"KQ_MOE_QF": "1", "KQ_MOE_MIX_FORM": "loop", "KQ_MOE_DEDUP": "0"},
+        (
+            "_qf_sx_nvfp4_gather_qmv_mix_bfloat16_t",
+            "_qf_gather_qmv_mix_ns_bfloat16_t",
+            "_qf_moe_glu_gather_silu_bfloat16_t",
+        ),
+    ),
 }
 
 
@@ -402,7 +449,11 @@ def test_scaled_forms(arm):
     assert not res["skipped"], res["skipped"]
     nv = [k for k in res["kernels"] if k.startswith("kq_nvfp4")]
     for p in parts:
-        assert any(p in k for k in nv), (p, nv)
+        pool = res["kernels"] if p.startswith("kq_moe_") else nv
+        assert any(p in k for k in pool), (p, pool)
+    # the dense shared-expert route runs from 4 rows by default
+    if env.get("KQ_MOE_SHEXP_DENSE") == "0" or T < 4:
+        assert not any("shexp_glu_pre" in k for k in res["kernels"]), res["kernels"]
 
 
 def test_rejects():

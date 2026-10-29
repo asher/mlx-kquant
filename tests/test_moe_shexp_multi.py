@@ -9,7 +9,8 @@ block against the dense shared expert (one matmul of width k N per
 projection), over k = 1, 2 and 4, T = 1, 2 and 33, and each kernel form:
 the default pick, the forced loop, slot-parallel and dedupe forms
 (KQ_MOE_MIX_FORM), the per-row gathers (KQ_MOE_DEDUP=0), the wide GLU
-gathers (KQ_MOE_NX=16) and the half-dot gathers (KQ_MOE_HALF=1). The forms
+gathers (KQ_MOE_NX=16) and the half-dot gathers (KQ_MOE_HALF=1), all on
+the Ext kernels (KQ_MOE_QF=0), and the qf kernels (KQ_MOE_QF=1). The forms
 latch their levers once per process, so each runs in a child.
 
 The slot-parallel down runs 64 * S threads per threadgroup. When the
@@ -77,6 +78,7 @@ ARMS = {
     "nodedup": {"KQ_MOE_DEDUP": "0"},
     "nx16": {"KQ_MOE_NX": "16"},
     "half": {"KQ_MOE_HALF": "1"},
+    "qf": {"KQ_MOE_QF": "1"},
 }
 
 
@@ -195,7 +197,7 @@ def _run(wire_path, out_path, names, env):
         ],
         capture_output=True,
         text=True,
-        env={**os.environ, "KQ_MOE_NX_LOG": "1", **env},
+        env={**os.environ, "KQ_MOE_NX_LOG": "1", "KQ_MOE_QF": "0", **env},
     )
     assert r.returncode == 0, f"child exited {r.returncode}\n{r.stdout}\n{r.stderr}"
     return np.load(out_path), r.stderr
@@ -336,11 +338,17 @@ ind_ns = mx.array(rng.integers(0, E, size=(1, S)).astype(np.uint32))
 sc = mx.array(rng.uniform(0.05, 0.9, size=(1, S)).astype(np.float32))
 mix = kq.gather_qmv_mix_kq(h, dw, sdw, "q4_1", ind, sc)
 ns = kq.gather_qmv_mix_ns_kq(h, nsw, "q4_1", ind_ns, sc)
-mx.eval(mix, ns)
+# one shared slot, the width the qf mix takes
+sdw1 = q((H, N))
+ind1 = mx.array(rng.integers(0, E, size=(1, S - 1)).astype(np.uint32))
+mix1 = kq.gather_qmv_mix_kq(h, dw, sdw1, "q4_1", ind1, sc)
+mx.eval(mix, ns, mix1)
 np.savez(sys.argv[1], mix=np.array(mix.astype(mx.float32)),
          ns=np.array(ns.astype(mx.float32)), h=np.array(h.astype(mx.float32)),
          dw=np.array(dw), sdw=np.array(sdw), nsw=np.array(nsw),
-         ind=np.array(ind), ind_ns=np.array(ind_ns), sc=np.array(sc))
+         ind=np.array(ind), ind_ns=np.array(ind_ns), sc=np.array(sc),
+         mix1=np.array(mix1.astype(mx.float32)), sdw1=np.array(sdw1),
+         ind1=np.array(ind1))
 """
 
 
@@ -362,31 +370,51 @@ def _guard_run(tmp_path, env, arm):
         sc[R + j] * (h[R + j] @ sdw[:, j * n : (j + 1) * n].T) for j in range(k)
     )
     ref_ns = sum(sc[s] * (h[s] @ nsw[ind_ns[s]].T) for s in range(R + k))
+    sdw1, ind1, last = _deq(z["sdw1"], "q4_1"), z["ind1"][0], R + k - 1
+    ref1 = sum(sc[s] * (h[s] @ dw[ind1[s]].T) for s in range(last))
+    ref1 = ref1 + sc[last] * (h[last] @ sdw1.T)
     assert _rel(z["mix"][0], ref) < REL_BOUND
     assert _rel(z["ns"][0], ref_ns) < REL_BOUND
+    assert _rel(z["mix1"][0], ref1) < REL_BOUND
     return r.stderr
 
 
-def test_slot_parallel_guard_declines_under_thread_cap(tmp_path):
+def _qf_stems(qf):
+    """The one-slot mix and the mix_ns stems; the two-slot mix stays on the
+    Ext kernel, since the qf kernels take one shared slot."""
+    if qf == "1":
+        return "kq_q4_1_qf_sx_q4_1_gather_qmv_mix", "kq_q4_1_qf_gather_qmv_mix_ns"
+    return "kq_q4_1_gather_qmv_mix", "kq_q4_1_gather_qmv_mix_ns"
+
+
+@pytest.mark.parametrize("qf", ["0", "1"])
+def test_slot_parallel_guard_declines_under_thread_cap(tmp_path, qf):
     """At S = 8 the slot-parallel downs need 512 threads. Under a cap of 256
     both guards decline, and the loop kernels serve the calls."""
-    log = _guard_run(tmp_path, {"KQ_MOE_SP_THREAD_CAP": "256"}, "cap")
+    log = _guard_run(
+        tmp_path, {"KQ_MOE_SP_THREAD_CAP": "256", "KQ_MOE_QF": qf}, f"cap{qf}"
+    )
+    mix1, ns = _qf_stems(qf)
     assert "kq_q4_1_gather_qmv_mix_float16_t" in log, log
-    assert "kq_q4_1_gather_qmv_mix_ns_float16_t" in log, log
+    assert mix1 + "_float16_t" in log, log
+    assert ns + "_float16_t" in log, log
     assert "_sp_" not in log, log
 
 
-def test_slot_parallel_at_eight_slots(tmp_path):
+@pytest.mark.parametrize("qf", ["0", "1"])
+def test_slot_parallel_at_eight_slots(tmp_path, qf):
     """Without the cap, S = 8 runs the slot-parallel downs where the
     pipeline takes 512 threads, and the loop kernels where it does not."""
-    log = _guard_run(tmp_path, {}, "nocap")
+    log = _guard_run(tmp_path, {"KQ_MOE_QF": qf}, f"nocap{qf}")
     sp_lines = [ln for ln in log.splitlines() if "_sp_" in ln]
     loop = "kq_q4_1_gather_qmv_mix_float16_t" in log
     if sp_lines:
         for ln in sp_lines:
             assert int(ln.rsplit("max ", 1)[1].rstrip(")")) >= 512, ln
         assert "kq_q4_1_gather_qmv_mix_sp_float16_t" in log, log
-        assert "kq_q4_1_gather_qmv_mix_ns_sp_float16_t" in log, log
+        mix1, ns = _qf_stems(qf)
+        assert mix1 + "_sp_float16_t" in log, log
+        assert ns + "_sp_float16_t" in log, log
     else:
         assert loop, log
 
