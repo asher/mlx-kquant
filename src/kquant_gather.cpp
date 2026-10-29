@@ -1257,7 +1257,7 @@ int seg_tile_rows(
   if (pinned >= 0) {
     return pinned ? 128 : 64;
   }
-  if (n_experts <= 0 || K % 64 != 0 || !nax_gather_enabled(kquant_type)) {
+  if (n_experts <= 0 || !kq_seg_nax_ok(kquant_type, K)) {
     return 64;
   }
   const int floor = (K >= 1024 || kq_seg_bk(kquant_type, K) == 128) ? 96 : 120;

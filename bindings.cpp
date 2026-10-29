@@ -3086,9 +3086,10 @@ NB_MODULE(_ext, m) {
       R"(
         Tile height for expert_tile_map and gather_qmm_seg.
 
-        128 where the codec runs on the matrix units and the mean rows per
-        expert reach 96 (120 when k < 1024 and the codec's K tile stays
-        64), else 64. KQ_SEG_TILE_ROWS=64 or 128 (read live) pins it.
+        128 where gather_qmm_seg runs its NAX kernel (seg_nax_enabled) and
+        the mean rows per expert reach 96 (120 when k < 1024 and the
+        codec's K tile stays 64), else 64. KQ_SEG_TILE_ROWS=64 or 128 (read
+        live) pins it.
 
         Args:
             rows (int): expert-sorted rows (tokens times top-k).

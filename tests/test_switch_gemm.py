@@ -733,7 +733,7 @@ def test_seg_tile_rows_policy(monkeypatch):
 
     monkeypatch.delenv("KQ_SEG_TILE_ROWS", raising=False)
     monkeypatch.delenv("KQ_SEG_BK128", raising=False)
-    nax = kq.nax_gather_enabled("q4_1")
+    nax = kq.seg_nax_enabled("q4_1", 2048)
     assert kq.seg_tile_rows(95 * 32, 32, 2048, "q4_1") == 64
     assert kq.seg_tile_rows(96 * 32, 32, 2048, "q4_1") == (128 if nax else 64)
     assert kq.seg_tile_rows(119 * 32, 32, 512, "q4_1") == 64
@@ -953,21 +953,26 @@ for rows in (112, 511, 512):
     idx = mx.sort((mx.arange(rows) % 64).astype(mx.uint32))
     mx.eval(sw(x[:rows], idx, sorted_indices=True))
     print(rows, len(calls))
+print("tiles", kq.seg_tile_rows(8192, 64, 512, "q4_k"))
 """
 
 
 @_METAL_RULE
 @pytest.mark.parametrize("value", ("1", "0"))
-def test_disable_gather_seg_nax_keeps_512_rows(value):
+def test_disable_gather_seg_nax_keeps_512_rows(value, monkeypatch):
     """With KQ_DISABLE_GATHER_SEG_NAX set (read once, any value, as in C++),
     gather_qmm_seg runs its steel kernel, and the sorted arm keeps the
-    512-row floor over 64 experts: 112 and 511 rows keep gather_qmm."""
+    512-row floor over 64 experts: 112 and 511 rows keep gather_qmm.
+    seg_tile_rows keeps 64-row tiles at 128 rows per expert, where the NAX
+    kernel takes 128."""
     import mlx_kquant as kq
 
-    if not kq.nax_gather_enabled("q4_k"):
-        pytest.skip("needs NAX")
+    if not kq.seg_nax_enabled("q4_k", 512):
+        pytest.skip("needs the NAX seg kernel")
+    monkeypatch.delenv("KQ_SEG_TILE_ROWS", raising=False)
+    assert kq.seg_tile_rows(8192, 64, 512, "q4_k") == 128
     env = {**os.environ, "KQ_DISABLE_GATHER_SEG_NAX": value}
-    for name in ("KQ_SWITCH_GEMM_MIN_ROWS", "KQ_GATHER_SEG_NAX"):
+    for name in ("KQ_SWITCH_GEMM_MIN_ROWS", "KQ_GATHER_SEG_NAX", "KQ_SEG_TILE_ROWS"):
         env.pop(name, None)
     r = subprocess.run(
         [sys.executable, "-c", _SEG_NAX_OFF_CHILD],
@@ -977,7 +982,7 @@ def test_disable_gather_seg_nax_keeps_512_rows(value):
         timeout=300,
     )
     assert r.returncode == 0, r.stderr
-    assert r.stdout.split("\n")[:3] == ["112 0", "511 0", "512 1"], r.stdout
+    assert r.stdout.split("\n")[:4] == ["112 0", "511 0", "512 1", "tiles 64"], r.stdout
 
 
 def main() -> int:

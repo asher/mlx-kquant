@@ -247,10 +247,10 @@ mx::array gather_qmm_seg(
     mx::StreamOrDevice s = {});
 
 // gather_qmm_seg tile height for `rows` expert-sorted rows over n_experts
-// experts at reduction size K: 128 where the NAX kernel runs and the mean
-// rows per expert reach 96 (120 when K < 1024 and the codec's K tile stays
-// 64), else 64. KQ_SEG_TILE_ROWS=64|128 (read live) pins it. 64 on
-// non-Metal builds.
+// experts at reduction size K: 128 where the NAX kernel runs
+// (seg_nax_enabled) and the mean rows per expert reach 96 (120 when
+// K < 1024 and the codec's K tile stays 64), else 64.
+// KQ_SEG_TILE_ROWS=64|128 (read live) pins it. 64 on non-Metal builds.
 int seg_tile_rows(
     int rows,
     int n_experts,
