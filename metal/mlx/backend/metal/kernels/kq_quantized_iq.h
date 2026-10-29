@@ -1065,7 +1065,15 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
 
 // Lane `simd_lid` owns one 8-weight group (sub-block lid/4, half lid%4) of
 // every superblock; simd_sum reduces the 32 lanes. bn=4 -> 2 rows/simdgroup.
-template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
+// kVM == 2 (kRows only) dots a second activation row kq_x1 against the same
+// weights, decoding each weight once; each row's sums are the one-row form's.
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int results_per_simdgroup = 2,
+    bool kRows = false,
+    int kVM = 1>
 METAL_FUNC void kq_iq4_xs_qmv_impl(
     const device uint8_t* w,
     const device T* x,
@@ -1074,9 +1082,12 @@ METAL_FUNC void kq_iq4_xs_qmv_impl(
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    thread float* kq_rows = nullptr,
+    const device T* kq_x1 = nullptr) {
   static_assert(group_size == KQ_IQ4_XS_SUPERBLOCK, "IQ4_XS requires gs=256");
   static_assert(bits == 4, "IQ4_XS requires bits=4");
+  static_assert(kVM == 1 || (kVM == 2 && kRows), "two rows need kRows");
   constexpr int num_simdgroups = 2;
   constexpr int vpt = 8;
   typedef float U;
@@ -1102,15 +1113,26 @@ METAL_FUNC void kq_iq4_xs_qmv_impl(
   constexpr int bytes_per_lane = vpt / 2;
   const int s = simd_lid / 4; // sub-block
   const int q0 = int(simd_lid % 4) * bytes_per_lane; // first byte of the lane
-  U result[results_per_simdgroup] = {0};
-  for (int ib = 0; ib < nb; ib++) {
-    U xlo[bytes_per_lane];
-    U xhi[bytes_per_lane];
-    const device T* xb = x + ib * KQ_IQ4_XS_SUPERBLOCK + s * 32 + q0;
+  U result[kVM][results_per_simdgroup];
 #pragma unroll
-    for (int i = 0; i < bytes_per_lane; i++) {
-      xlo[i] = U(xb[i]);
-      xhi[i] = U(xb[16 + i]);
+  for (int v = 0; v < kVM; v++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[v][row] = U(0);
+    }
+  }
+  for (int ib = 0; ib < nb; ib++) {
+    U xlo[kVM][bytes_per_lane];
+    U xhi[kVM][bytes_per_lane];
+#pragma unroll
+    for (int v = 0; v < kVM; v++) {
+      const device T* xb =
+          (v == 0 ? x : kq_x1) + ib * KQ_IQ4_XS_SUPERBLOCK + s * 32 + q0;
+#pragma unroll
+      for (int i = 0; i < bytes_per_lane; i++) {
+        xlo[v][i] = U(xb[i]);
+        xhi[v][i] = U(xb[16 + i]);
+      }
     }
     // static trip count; the clamped tail row is dropped at the store
 #pragma unroll
@@ -1127,21 +1149,36 @@ METAL_FUNC void kq_iq4_xs_qmv_impl(
       const U dl = d * U(ls - 32);
       const uint qb = *reinterpret_cast<const device uint*>(
           sb + KQ_IQ4_XS_QS_OFFSET + s * 16 + q0);
-      U partial = 0;
+      U partial[kVM];
+#pragma unroll
+      for (int v = 0; v < kVM; v++) {
+        partial[v] = 0;
+      }
 #pragma unroll
       for (int i = 0; i < bytes_per_lane; i++) {
         const float2 kv =
             as_type<float2>(kq_iq4nl_pairs[(qb >> (8 * i)) & 0xFF]);
-        partial += xlo[i] * U(kv.x);
-        partial += xhi[i] * U(kv.y);
+#pragma unroll
+        for (int v = 0; v < kVM; v++) {
+          partial[v] += xlo[v][i] * U(kv.x);
+          partial[v] += xhi[v][i] * U(kv.y);
+        }
       }
-      result[row] += dl * partial;
+#pragma unroll
+      for (int v = 0; v < kVM; v++) {
+        result[v][row] += dl * partial[v];
+      }
     }
   }
   for (int row = 0; row < results_per_simdgroup; row++) {
-    U r = simd_sum(result[row]);
-    if (simd_lid == 0 && row < active_rows) {
-      y[out_row + row] = static_cast<T>(r);
+#pragma unroll
+    for (int v = 0; v < kVM; v++) {
+      U r = simd_sum(result[v][row]);
+      if constexpr (kRows) {
+        kq_rows[v * results_per_simdgroup + row] = r;
+      } else if (simd_lid == 0 && row < active_rows) {
+        y[out_row + row] = static_cast<T>(r);
+      }
     }
   }
 }

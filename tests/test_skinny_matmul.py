@@ -26,6 +26,8 @@ COMBOS = [
     (mx.float32, mx.float32),
     (mx.float16, mx.float32),
     (mx.bfloat16, mx.float32),
+    (mx.float32, mx.float16),
+    (mx.float32, mx.bfloat16),
 ]
 
 
@@ -52,6 +54,24 @@ def test_skinny_matmul_parity(xt, wt, M, K, N):
     assert _rel(got, ref) < tol
 
 
+@pytest.mark.parametrize("wt", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("M", [1, 4, 16])
+def test_skinny_matmul_f32_x_half_w_wide_n(wt, M):
+    """float32 x against a float16 or bfloat16 weight at a vocab-wide N
+    (an f32 residual against a half-precision head): float32 out."""
+    K, N = 128, 131072
+    mx.random.seed(11)
+    x = mx.random.normal((M, K)) * 0.5
+    w = (mx.random.normal((N, K)) * 0.5).astype(wt)
+    got = kq.skinny_matmul(x, w)
+    with mx.stream(mx.cpu):
+        ref = x @ w.astype(mx.float32).T
+    mx.eval(got, ref)
+    assert got.dtype == mx.float32
+    assert got.shape == (M, N)
+    assert _rel(got, ref) < 3e-5
+
+
 def test_skinny_matmul_noncontiguous_inputs():
     x = mx.random.normal((4, 4096)).astype(mx.float16).T.swapaxes(0, 1)
     w = mx.random.normal((4096, 64)).astype(mx.float16).T
@@ -74,6 +94,16 @@ def test_skinny_matmul_rejects():
         )  # K % 4
     with pytest.raises(ValueError):
         kq.skinny_matmul(
-            mx.zeros((2, 4096), dtype=mx.float32),
+            mx.zeros((2, 4096), dtype=mx.float16),
+            mx.zeros((8, 4096), dtype=mx.bfloat16),
+        )  # f16 x with bf16 w
+    with pytest.raises(ValueError):
+        kq.skinny_matmul(
+            mx.zeros((2, 4096), dtype=mx.bfloat16),
             mx.zeros((8, 4096), dtype=mx.float16),
-        )  # f32 x with f16 w
+        )  # bf16 x with f16 w
+    with pytest.raises(ValueError):
+        kq.skinny_matmul(
+            mx.zeros((2, 4096), dtype=mx.float32),
+            mx.zeros((8, 4096), dtype=mx.int32),
+        )  # f32 x with an integer w

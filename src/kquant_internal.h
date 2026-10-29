@@ -193,6 +193,14 @@ mx::array kq_out_scaled_cotangent(
 // decides at eval, and passes a row-major x through with its buffer.
 mx::array kq_row_major(const mx::array& x, const mx::Stream& s);
 
+// kq_row_major for a weight a kernel reads as one row-major run, in place
+// of a Contiguous node. MLX's Contiguous copies a row-major input whose
+// buffer is larger than the input, such as a leading-axis slice of an
+// expert stack or a dense prefix of a larger buffer; this passes such an
+// input through. An unevaluated weight of more than 2^32 elements keeps
+// the Contiguous node, since the eval-time copy indexes 32-bit elements.
+mx::array kq_row_major_weight(const mx::array& w, const mx::Stream& s);
+
 // Eval form for a GPU primitive: a itself when its matrix rows are dense,
 // else a row-major copy made by one dispatch on s, which the command buffer
 // keeps alive. a has a 1-, 2- or 4-byte dtype and at most 8 dims.

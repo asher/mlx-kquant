@@ -149,7 +149,15 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
 // covers 16 blocks, two lanes per block; a lane owns 8 qs bytes, so its 16
 // weights are the low and the high nibbles of those bytes, and its x values
 // come in as four float4 reused across the row loop.
-template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
+// kVM == 2 (kRows only) dots a second activation row kq_x1 against the same
+// weights, decoding each weight once; each row's sums are the one-row form's.
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int results_per_simdgroup = 4,
+    bool kRows = false,
+    int kVM = 1>
 METAL_FUNC void kq_mxfp4_qmv_impl(
     const device uint8_t* w,
     const device T* x,
@@ -158,9 +166,12 @@ METAL_FUNC void kq_mxfp4_qmv_impl(
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    thread float* kq_rows = nullptr,
+    const device T* kq_x1 = nullptr) {
   static_assert(group_size == KQ_MXFP4_GROUP, "MXFP4 requires gs=32");
   static_assert(bits == 4, "MXFP4 requires bits=4");
+  static_assert(kVM == 1 || (kVM == 2 && kRows), "two rows need kRows");
   constexpr int num_simdgroups = 2;
   constexpr int blocks_per_pass = 16;
   typedef float U;
@@ -176,13 +187,24 @@ METAL_FUNC void kq_mxfp4_qmv_impl(
   y += tid.x * out_vec_size;
   const int ix = simd_lid / 2;
   const int it = simd_lid % 2;
-  U result[results_per_simdgroup] = {0};
+  U result[kVM][results_per_simdgroup];
+#pragma unroll
+  for (int v = 0; v < kVM; v++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[v][row] = U(0);
+    }
+  }
   for (int ib = ix; ib < nb; ib += blocks_per_pass) {
-    const device T* xb = x + ib * KQ_MXFP4_GROUP + it * 8;
-    const float4 yl0(xb[0], xb[1], xb[2], xb[3]);
-    const float4 yl1(xb[16], xb[17], xb[18], xb[19]);
-    const float4 yl2(xb[4], xb[5], xb[6], xb[7]);
-    const float4 yl3(xb[20], xb[21], xb[22], xb[23]);
+    float4 yl[kVM][4];
+#pragma unroll
+    for (int v = 0; v < kVM; v++) {
+      const device T* xb = (v == 0 ? x : kq_x1) + ib * KQ_MXFP4_GROUP + it * 8;
+      yl[v][0] = float4(xb[0], xb[1], xb[2], xb[3]);
+      yl[v][1] = float4(xb[16], xb[17], xb[18], xb[19]);
+      yl[v][2] = float4(xb[4], xb[5], xb[6], xb[7]);
+      yl[v][3] = float4(xb[20], xb[21], xb[22], xb[23]);
+    }
     // static trip count; the clamped tail row is dropped at the store
 #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
@@ -202,17 +224,29 @@ METAL_FUNC void kq_mxfp4_qmv_impl(
       const float2 l46 = kq_fp_e2m1_pair(w46), l57 = kq_fp_e2m1_pair(w57);
       const float2 h46 = kq_fp_e2m1_pair(w46 >> 4);
       const float2 h57 = kq_fp_e2m1_pair(w57 >> 4);
-      float4 acc = yl0 * float4(l02.x, l13.x, l02.y, l13.y);
-      acc += yl1 * float4(h02.x, h13.x, h02.y, h13.y);
-      acc += yl2 * float4(l46.x, l57.x, l46.y, l57.y);
-      acc += yl3 * float4(h46.x, h57.x, h46.y, h57.y);
-      result[row] += d * ((acc.x + acc.y) + (acc.z + acc.w));
+      const float4 f0 = float4(l02.x, l13.x, l02.y, l13.y);
+      const float4 f1 = float4(h02.x, h13.x, h02.y, h13.y);
+      const float4 f2 = float4(l46.x, l57.x, l46.y, l57.y);
+      const float4 f3 = float4(h46.x, h57.x, h46.y, h57.y);
+#pragma unroll
+      for (int v = 0; v < kVM; v++) {
+        float4 acc = yl[v][0] * f0;
+        acc += yl[v][1] * f1;
+        acc += yl[v][2] * f2;
+        acc += yl[v][3] * f3;
+        result[v][row] += d * ((acc.x + acc.y) + (acc.z + acc.w));
+      }
     }
   }
   for (int row = 0; row < results_per_simdgroup; row++) {
-    U r = simd_sum(result[row]);
-    if (simd_lid == 0 && row < active_rows) {
-      y[out_row + row] = static_cast<T>(r);
+#pragma unroll
+    for (int v = 0; v < kVM; v++) {
+      U r = simd_sum(result[v][row]);
+      if constexpr (kRows) {
+        kq_rows[v * results_per_simdgroup + row] = r;
+      } else if (simd_lid == 0 && row < active_rows) {
+        y[out_row + row] = static_cast<T>(r);
+      }
     }
   }
 }
@@ -746,12 +780,16 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
 // group simd_lid % 4 of superblock simd_lid / 4, 8 superblocks per pass; x is
 // read once into four float4 and reused across the unrolled rows.
 // kOutScale entries take the output scale (kq_out_scale.h).
+// kVM == 2 (kRows only) dots a second activation row kq_x1 against the same
+// weights, decoding each weight once; each row's sums are the one-row form's.
 template <
     typename T,
     int group_size,
     int bits,
     int results_per_simdgroup = 4,
-    bool kOutScale = false>
+    bool kOutScale = false,
+    bool kRows = false,
+    int kVM = 1>
 METAL_FUNC void kq_nvfp4_qmv_impl(
     const device uint8_t* w,
     const device T* x,
@@ -761,9 +799,12 @@ METAL_FUNC void kq_nvfp4_qmv_impl(
     uint3 tid,
     uint simd_gid,
     uint simd_lid,
-    const device float* out_scale = nullptr) {
+    const device float* out_scale = nullptr,
+    thread float* kq_rows = nullptr,
+    const device T* kq_x1 = nullptr) {
   static_assert(group_size == KQ_NVFP4_SUPERBLOCK, "NVFP4 requires gs=64");
   static_assert(bits == 4, "NVFP4 requires bits=4");
+  static_assert(kVM == 1 || (kVM == 2 && kRows), "two rows need kRows");
   constexpr int num_simdgroups = 2;
   constexpr int blocks_per_pass = 8;
   typedef float U;
@@ -780,13 +821,25 @@ METAL_FUNC void kq_nvfp4_qmv_impl(
   y += tid.x * out_vec_size;
   const int ix = simd_lid / 4;
   const int g = simd_lid % 4;
-  U result[results_per_simdgroup] = {0};
+  U result[kVM][results_per_simdgroup];
+#pragma unroll
+  for (int v = 0; v < kVM; v++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[v][row] = U(0);
+    }
+  }
   for (int ib = ix; ib < nb; ib += blocks_per_pass) {
-    const device T* xb = x + ib * KQ_NVFP4_SUPERBLOCK + 16 * g;
-    const float4 yl0(xb[0], xb[1], xb[2], xb[3]);
-    const float4 yl1(xb[4], xb[5], xb[6], xb[7]);
-    const float4 yl2(xb[8], xb[9], xb[10], xb[11]);
-    const float4 yl3(xb[12], xb[13], xb[14], xb[15]);
+    float4 yl[kVM][4];
+#pragma unroll
+    for (int v = 0; v < kVM; v++) {
+      const device T* xb =
+          (v == 0 ? x : kq_x1) + ib * KQ_NVFP4_SUPERBLOCK + 16 * g;
+      yl[v][0] = float4(xb[0], xb[1], xb[2], xb[3]);
+      yl[v][1] = float4(xb[4], xb[5], xb[6], xb[7]);
+      yl[v][2] = float4(xb[8], xb[9], xb[10], xb[11]);
+      yl[v][3] = float4(xb[12], xb[13], xb[14], xb[15]);
+    }
     // static trip count; the clamped tail row is dropped at the store
 #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
@@ -796,22 +849,34 @@ METAL_FUNC void kq_nvfp4_qmv_impl(
           ib * KQ_NVFP4_BLOCK_BYTES;
       const U d = U(kq_fp_ue4m3_scale(blk[g]));
       const uint2 q = kq_nvfp4_group_qs(blk, g);
-      float4 acc = yl0 * kq_nvfp4_nibbles4(q.x, 0);
-      acc += yl1 * kq_nvfp4_nibbles4(q.y, 0);
-      acc += yl2 * kq_nvfp4_nibbles4(q.x, 4);
-      acc += yl3 * kq_nvfp4_nibbles4(q.y, 4);
-      result[row] += d * ((acc.x + acc.y) + (acc.z + acc.w));
+      const float4 f0 = kq_nvfp4_nibbles4(q.x, 0);
+      const float4 f1 = kq_nvfp4_nibbles4(q.y, 0);
+      const float4 f2 = kq_nvfp4_nibbles4(q.x, 4);
+      const float4 f3 = kq_nvfp4_nibbles4(q.y, 4);
+#pragma unroll
+      for (int v = 0; v < kVM; v++) {
+        float4 acc = yl[v][0] * f0;
+        acc += yl[v][1] * f1;
+        acc += yl[v][2] * f2;
+        acc += yl[v][3] * f3;
+        result[v][row] += d * ((acc.x + acc.y) + (acc.z + acc.w));
+      }
     }
   }
   for (int row = 0; row < results_per_simdgroup; row++) {
-    U r = simd_sum(result[row]);
-    if (simd_lid == 0 && row < active_rows) {
-      if constexpr (kOutScale) {
-        if (kq_has_out_scale) {
-          r *= kq_out_scale_col(out_scale, out_row + row);
+#pragma unroll
+    for (int v = 0; v < kVM; v++) {
+      U r = simd_sum(result[v][row]);
+      if constexpr (kRows) {
+        kq_rows[v * results_per_simdgroup + row] = r;
+      } else if (simd_lid == 0 && row < active_rows) {
+        if constexpr (kOutScale) {
+          if (kq_has_out_scale) {
+            r *= kq_out_scale_col(out_scale, out_row + row);
+          }
         }
+        y[out_row + row] = static_cast<T>(r);
       }
-      y[out_row + row] = static_cast<T>(r);
     }
   }
 }

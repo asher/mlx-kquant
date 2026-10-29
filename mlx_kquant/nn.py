@@ -215,20 +215,16 @@ class KQuantSwitchLinear(nn.Module):
     def __call__(self, x, indices, sorted_indices=False, x_rows=None):
         # Prefill-shaped sorted calls (mlx-lm SwitchGLU's _gather_sort layout:
         # x [B,1,K], indices [B] ascending) run one GEMM per expert segment
-        # instead of gather_qmm's per-row matvec fallback, which is much faster
-        # where the sorted rhs GEMM kernel is unavailable. Costs one host sync
-        # on the routing indices per MoE layer. KQ_SWITCH_GEMM_MIN_ROWS=0
-        # disables; read live for A/B. With x_rows ([B] integers), x is the
-        # unsorted rows (any leading shape, last dim K); the segment GEMM
-        # reads them through the map, and every other path gathers them.
+        # instead of gather_qmm (its rhs GEMM, or its per-row matvec under 4
+        # rows per expert) from the width _seg_arm sets. With x_rows ([B]
+        # integers), x is the unsorted rows (any leading shape, last dim K);
+        # the segment GEMM reads them through the map, and every other path
+        # gathers them.
         if x_rows is not None:
             xf = x.reshape(-1, x.shape[-1])
             if sorted_indices and indices.ndim == 1 and x_rows.size == indices.size:
-                min_rows = int(os.environ.get("KQ_SWITCH_GEMM_MIN_ROWS", "512"))
-                if (
-                    min_rows > 0
-                    and indices.size >= min_rows
-                    and not self._nax_gather_preferred(indices.size, xf.shape[-1])
+                if self._seg_arm(indices.size, xf.shape[-1]) and not (
+                    self._nax_gather_preferred(indices.size, xf.shape[-1])
                 ):
                     y = self._sorted_expert_gemm(xf, indices, x_rows)
                     if "bias" in self:
@@ -242,11 +238,8 @@ class KQuantSwitchLinear(nn.Module):
             and x.shape[0] == indices.size
             and x.shape[1] == 1
         ):
-            min_rows = int(os.environ.get("KQ_SWITCH_GEMM_MIN_ROWS", "512"))
-            if (
-                min_rows > 0
-                and indices.size >= min_rows
-                and not self._nax_gather_preferred(indices.size, x.shape[-1])
+            if self._seg_arm(indices.size, x.shape[-1]) and not (
+                self._nax_gather_preferred(indices.size, x.shape[-1])
             ):
                 y = self._sorted_expert_gemm(x, indices)
                 if "bias" in self:
@@ -265,6 +258,24 @@ class KQuantSwitchLinear(nn.Module):
         if "bias" in self:
             x = x + mx.expand_dims(self["bias"][indices], -2)
         return x
+
+    def _seg_arm(self, rows, k):
+        """Whether a sorted call of ``rows`` routed rows takes the segment
+        GEMM. Where gather_qmm_seg runs its NAX kernel (kq.seg_nax_enabled
+        on a GPU default device), from 1.75 rows per expert: under that
+        gather_qmm's per-row matvec is faster, and above it the segment GEMM
+        also beats the rhs GEMM. Elsewhere (the steel kernel, the CPU loop),
+        from 512 rows. KQ_SWITCH_GEMM_MIN_ROWS, when set (read live), is the
+        row floor on every route; 0 keeps gather_qmm."""
+        pinned = os.environ.get("KQ_SWITCH_GEMM_MIN_ROWS")
+        if pinned:
+            floor = int(pinned)
+            return floor > 0 and rows >= floor
+        if mx.default_device() == mx.Device(mx.gpu) and kq.seg_nax_enabled(
+            self.kquant_type, k
+        ):
+            return 4 * rows >= 7 * self.weight.shape[0]
+        return rows >= 512
 
     def _nax_gather_preferred(self, rows, k):
         """Mirror gather_qmm's sorted-rhs NAX GEMM gate. On NAX GPUs the

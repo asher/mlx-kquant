@@ -12,6 +12,7 @@ Usage: test_switch_gemm.py
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 
 import mlx.core as mx
@@ -732,7 +733,7 @@ def test_seg_tile_rows_policy(monkeypatch):
 
     monkeypatch.delenv("KQ_SEG_TILE_ROWS", raising=False)
     monkeypatch.delenv("KQ_SEG_BK128", raising=False)
-    nax = kq.nax_gather_enabled("q4_1")
+    nax = kq.seg_nax_enabled("q4_1", 2048)
     assert kq.seg_tile_rows(95 * 32, 32, 2048, "q4_1") == 64
     assert kq.seg_tile_rows(96 * 32, 32, 2048, "q4_1") == (128 if nax else 64)
     assert kq.seg_tile_rows(119 * 32, 32, 512, "q4_1") == 64
@@ -775,6 +776,213 @@ def test_seg_arm_defers_to_nax_gather(monkeypatch):
     r = np.array(nax_out.astype(mx.float32))
     rel = np.linalg.norm(g - r) / (np.linalg.norm(r) + 1e-6)
     assert rel < 5e-3, f"rel {rel:.3e}"
+
+
+# ---------------------------------------------- sorted-arm dispatch rule
+
+
+def _switch_e(n_experts, codec="q4_k", k=K):
+    """An n_experts KQuantSwitchLinear: the q4_k fixture tiled, or q8_0
+    encoded here at any K a multiple of 32."""
+    if codec == "q4_k":
+        w = _make_switch("q4_k")["weight"]
+        sw = KQuantSwitchLinear(n_experts, N, K, False, "q4_k")
+        sw.weight = mx.concatenate([w] * (n_experts // E))
+        return sw
+    import mlx_kquant as kq
+
+    rng = np.random.default_rng(13)
+    wf = mx.array((rng.standard_normal((n_experts * N, k)) * 0.1).astype(np.float32))
+    sw = KQuantSwitchLinear(n_experts, N, k, False, codec)
+    sw.weight = kq.quantize(wf, codec)[0].reshape(n_experts, N, -1)
+    return sw
+
+
+def _seg_spy(sw, monkeypatch):
+    calls = []
+    orig = sw._sorted_expert_gemm
+    monkeypatch.setattr(
+        sw, "_sorted_expert_gemm", lambda *a: calls.append(1) or orig(*a)
+    )
+    return calls
+
+
+def _sorted_call(sw, rows, by_rows=False, seed=0):
+    from mlx_kquant.codec_geometry import in_features
+
+    rng = np.random.default_rng(seed)
+    k = in_features(sw.kquant_type, sw.weight.shape[-1])
+    ne = sw.weight.shape[0]
+    idx = mx.array(np.sort(rng.integers(0, ne, rows)).astype(np.uint32))
+    x = mx.array((rng.standard_normal((rows, k)) * 0.1).astype(np.float16))
+    if by_rows:
+        x_rows = mx.array(rng.permutation(rows).astype(np.uint32))
+        return sw(x, idx, sorted_indices=True, x_rows=x_rows)
+    return sw(x[:, None, :], idx, sorted_indices=True)
+
+
+@pytest.fixture
+def rule_env(monkeypatch):
+    monkeypatch.delenv("KQ_SWITCH_GEMM_MIN_ROWS", raising=False)
+    monkeypatch.delenv("KQ_GATHER_SEG_NAX", raising=False)
+    return monkeypatch
+
+
+def _nax(monkeypatch, on):
+    # Both NAX answers the switch reads: the seg kernel and the rhs leaf.
+    import mlx_kquant.nn as kqnn
+
+    monkeypatch.setattr(kqnn.kq, "seg_nax_enabled", lambda codec, k: on)
+    monkeypatch.setattr(kqnn.kq, "nax_gather_enabled", lambda codec: on)
+
+
+_METAL_RULE = pytest.mark.skipif(
+    bool(os.environ.get("KQUANT_FORCE_CPU")),
+    reason="the rows-per-expert rule is for the Metal seg kernel",
+)
+
+
+@_METAL_RULE
+@pytest.mark.parametrize("by_rows", (False, True), ids=("sorted_x", "x_rows"))
+def test_seg_from_1_75_rows_per_expert_on_nax(by_rows, rule_env):
+    """Where gather_qmm_seg runs its NAX kernel, a sorted call over 64
+    experts takes the segment GEMM from 112 rows, not from 512, with the
+    gather's output; at 111 rows it keeps gather_qmm."""
+    _nax(rule_env, True)
+    sw = _switch_e(64)
+    calls = _seg_spy(sw, rule_env)
+    mx.eval(_sorted_call(sw, 111, by_rows))
+    assert not calls
+    got = _sorted_call(sw, 112, by_rows)
+    mx.eval(got)
+    assert len(calls) == 1
+    rule_env.setenv("KQ_SWITCH_GEMM_MIN_ROWS", "0")
+    ref = _sorted_call(sw, 112, by_rows)
+    g = np.array(got.astype(mx.float32))
+    r = np.array(ref.astype(mx.float32))
+    rel = np.linalg.norm(g - r) / (np.linalg.norm(r) + 1e-6)
+    assert rel < 5e-3, f"rel {rel:.3e}"
+
+
+@_METAL_RULE
+def test_seg_waits_past_512_rows_over_512_experts_on_nax(rule_env):
+    """Over 512 experts the NAX rule is later than the 512-row floor it
+    replaces: 512 and 895 rows keep gather_qmm, 896 takes the segment
+    GEMM."""
+    _nax(rule_env, True)
+    sw = _switch_e(512)
+    calls = _seg_spy(sw, rule_env)
+    mx.eval(_sorted_call(sw, 512), _sorted_call(sw, 895))
+    assert not calls
+    mx.eval(_sorted_call(sw, 896))
+    assert len(calls) == 1
+
+
+@_METAL_RULE
+def test_gather_seg_nax_0_defers_from_4_rows_per_expert(rule_env):
+    """KQ_GATHER_SEG_NAX=0 sends a call to the rhs leaf only where
+    gather_qmm takes it, from 4 rows per expert: over 64 experts, 112 and
+    255 rows keep the segment GEMM, 256 rows go to gather_qmm."""
+    _nax(rule_env, True)
+    rule_env.setenv("KQ_GATHER_SEG_NAX", "0")
+    sw = _switch_e(64)
+    calls = _seg_spy(sw, rule_env)
+    mx.eval(_sorted_call(sw, 112), _sorted_call(sw, 255))
+    assert len(calls) == 2
+    mx.eval(_sorted_call(sw, 256))
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("by_rows", (False, True), ids=("sorted_x", "x_rows"))
+def test_min_rows_env_overrides_the_rule(by_rows, rule_env):
+    """KQ_SWITCH_GEMM_MIN_ROWS, when set, is the row floor on every route:
+    0 and 512 keep gather_qmm at 4 rows per expert, where the NAX rule
+    takes the segment GEMM; 32 takes it at 1 row per expert."""
+    _nax(rule_env, True)
+    sw = _switch_e(32)
+    calls = _seg_spy(sw, rule_env)
+    for floor in ("0", "512"):
+        rule_env.setenv("KQ_SWITCH_GEMM_MIN_ROWS", floor)
+        mx.eval(_sorted_call(sw, 128, by_rows))
+    assert not calls
+    rule_env.setenv("KQ_SWITCH_GEMM_MIN_ROWS", "32")
+    mx.eval(_sorted_call(sw, 32, by_rows))
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("case", ("no_nax", "k_544", "cpu_device"))
+def test_rule_keeps_512_rows_off_the_nax_seg_kernel(case, rule_env):
+    """Off the NAX seg kernel the sorted arm starts at 512 rows: without
+    NAX, at K % 64 != 0 (q8_0, K 544, as kq.seg_nax_enabled reports), and
+    on a CPU default device. 128 rows over 32 experts keep gather_qmm."""
+    import mlx_kquant as kq
+
+    if case == "k_544":
+        if os.environ.get("KQUANT_FORCE_CPU") or not kq.seg_nax_enabled("q8_0", 512):
+            pytest.skip("needs the NAX seg kernel")
+        assert not kq.seg_nax_enabled("q8_0", 544)
+        sw = _switch_e(32, "q8_0", k=544)
+    else:
+        _nax(rule_env, case == "cpu_device")
+        sw = _switch_e(32)
+    calls = _seg_spy(sw, rule_env)
+    dev = mx.default_device()
+    if case == "cpu_device":
+        mx.set_default_device(mx.cpu)
+    try:
+        mx.eval(_sorted_call(sw, 128))
+        assert not calls
+        mx.eval(_sorted_call(sw, 512))
+        assert len(calls) == 1
+    finally:
+        mx.set_default_device(dev)
+
+
+_SEG_NAX_OFF_CHILD = r"""
+import mlx.core as mx
+import mlx_kquant as kq
+from mlx_kquant.nn import KQuantSwitchLinear
+
+assert kq.nax_gather_enabled("q4_k") and not kq.seg_nax_enabled("q4_k", 512)
+sw = KQuantSwitchLinear(64, 128, 512, False, "q4_k")
+calls = []
+orig = sw._sorted_expert_gemm
+sw._sorted_expert_gemm = lambda *a: calls.append(1) or orig(*a)
+x = mx.zeros((512, 1, 512), mx.float16)
+for rows in (112, 511, 512):
+    idx = mx.sort((mx.arange(rows) % 64).astype(mx.uint32))
+    mx.eval(sw(x[:rows], idx, sorted_indices=True))
+    print(rows, len(calls))
+print("tiles", kq.seg_tile_rows(8192, 64, 512, "q4_k"))
+"""
+
+
+@_METAL_RULE
+@pytest.mark.parametrize("value", ("1", "0"))
+def test_disable_gather_seg_nax_keeps_512_rows(value, monkeypatch):
+    """With KQ_DISABLE_GATHER_SEG_NAX set (read once, any value, as in C++),
+    gather_qmm_seg runs its steel kernel, and the sorted arm keeps the
+    512-row floor over 64 experts: 112 and 511 rows keep gather_qmm.
+    seg_tile_rows keeps 64-row tiles at 128 rows per expert, where the NAX
+    kernel takes 128."""
+    import mlx_kquant as kq
+
+    if not kq.seg_nax_enabled("q4_k", 512):
+        pytest.skip("needs the NAX seg kernel")
+    monkeypatch.delenv("KQ_SEG_TILE_ROWS", raising=False)
+    assert kq.seg_tile_rows(8192, 64, 512, "q4_k") == 128
+    env = {**os.environ, "KQ_DISABLE_GATHER_SEG_NAX": value}
+    for name in ("KQ_SWITCH_GEMM_MIN_ROWS", "KQ_GATHER_SEG_NAX", "KQ_SEG_TILE_ROWS"):
+        env.pop(name, None)
+    r = subprocess.run(
+        [sys.executable, "-c", _SEG_NAX_OFF_CHILD],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split("\n")[:4] == ["112 0", "511 0", "512 1", "tiles 64"], r.stdout
 
 
 def main() -> int:

@@ -286,12 +286,15 @@ All optional; the defaults are right for normal use.
 - `KQ_GATHER_RHS_BM` - pin the `gather_qmm_rhs` row tile height (`16`/`32`/`64`) instead of the
   rows-per-expert-adaptive choice. Retuning lever for other GPU generations.
 - `KQ_SWITCH_GEMM_MIN_ROWS` - minimum routed rows before `KQuantSwitchLinear` takes the sorted
-  per-expert GEMM arm on a prefill batch (default `512`; `0` disables it and keeps the plain gather).
+  per-expert GEMM arm on a prefill batch. Unset, the arm starts at 1.75 rows per expert where
+  `gather_qmm_seg` runs its NAX kernel and at `512` rows elsewhere; set, it replaces both (`0`
+  disables the arm and keeps the plain gather). Read per call.
 - `KQ_GATHER_SEG_NAX=0` - on NAX GPUs, send `KQuantSwitchLinear`'s sorted prefill arm to the
-  fixed-tile `gather_qmm_rhs_nax` leaf instead of the expert-major `gather_qmm_seg` walk. Read per
-  call. A/B lever.
-- `KQ_DISABLE_GATHER_SEG_NAX=1` - run `gather_qmm_seg` on its steel simdgroup-mma kernel even where
-  the NAX tile kernel is available. Read once per process. A/B lever.
+  fixed-tile `gather_qmm_rhs_nax` leaf instead of the expert-major `gather_qmm_seg` walk, from 4
+  rows per expert where `gather_qmm` takes that leaf. Read per call. A/B lever.
+- `KQ_DISABLE_GATHER_SEG_NAX` - when set, to any value, run `gather_qmm_seg` on its steel
+  simdgroup-mma kernel even where the NAX tile kernel is available. Read once per process.
+  A/B lever.
 - `KQ_SEG_TILE_ROWS=64|128` - pin the tile height `seg_tile_rows` returns, and so the one
   `KQuantSwitchLinear` uses. Read per call. A/B lever.
 - `KQ_SEG_BK128=0|1` - K tile of the NAX `gather_qmm_seg` kernel: `1` takes 128 for every codec
@@ -302,6 +305,17 @@ All optional; the defaults are right for normal use.
   step) as one dispatch per (row, expert) pair instead of the default dedupe kernels, which
   dequantize an expert once per pair of rows that select it. Read per call. Outputs are
   bit-identical either way; `KQ_MOE_HALF=1` keeps its own kernels at every width. A/B lever.
+- `KQ_MOE_QF=0` - on Metal, run the fused MoE gathers of q2_k, q3_k, q4_k, iq4_xs, q4_0, q4_1,
+  q5_0, q5_1, iq4_nl, mxfp4, nvfp4 and q2_0 on the generic kernels instead of the kernels built
+  on each codec's matrix-vector loop, which give each row's routed experts the same output at
+  every call width. A forced `KQ_MOE_NX` also keeps the generic kernels, and a forced `KQ_MOE_SG`
+  does not apply to the qf kernels. Read live once set. A/B lever.
+- `KQ_MOE_SHEXP_DENSE=<t>` - on Metal, the fewest tokens (default 4) at which
+  `moe_glu_gather_shexp_kq` and `gather_qmv_mix_kq` compute the shared expert with
+  `quantized_matmul_multi`, reading its weights once per call; `0` keeps it in the fused kernels at
+  every width. The GLU takes this route when the shared gate and up use one codec that is the
+  routed codec, q5_k, q6_k or q8_0, the mix when it has one shared slot or no scores for its shared
+  slots. Read per call. A/B lever.
 - `KQ_MOE_MIX_FORM=loop|sp|dd` - on Metal, force the kernel form of the score-mixed MoE down
   gathers (`gather_qmv_mix_kq`, `gather_qmv_mix_ns_kq`) where it applies: `loop` runs every expert
   slot in one thread, `sp` gives each slot its own simdgroup pair, `dd` is the dedupe row-pair

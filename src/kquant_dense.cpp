@@ -78,6 +78,13 @@ mx::array kq_row_major(const mx::array& x, const mx::Stream& s) {
       x.shape(), x.dtype(), std::make_shared<KQuantMatrixDense>(s, true), {x});
 }
 
+mx::array kq_row_major_weight(const mx::array& w, const mx::Stream& s) {
+  if (w.status() == mx::array::Status::unscheduled && w.size() > UINT32_MAX) {
+    return mx::contiguous(w, false, s);
+  }
+  return kq_row_major(w, s);
+}
+
 bool KQuantMatrixDense::passes(const mx::array& in) const {
   if (in.size() == 0) {
     return true;

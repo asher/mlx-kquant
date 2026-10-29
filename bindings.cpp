@@ -183,11 +183,30 @@ NB_MODULE(_ext, m) {
       "gather_qmm when this holds.");
 
   m.def(
+      "seg_nax_enabled",
+      &mlx_kquant::seg_nax_enabled,
+      "kquant_type"_a,
+      "k"_a,
+      "True when gather_qmm_seg runs its NAX kernel for this codec at input "
+      "width k: nax_gather_enabled holds, k is a multiple of 64, and "
+      "KQ_DISABLE_GATHER_SEG_NAX is unset (read once; any value sets it). "
+      "KQuantSwitchLinear's sorted arm takes its rows-per-expert rule here.");
+
+  m.def(
       "codec_has_moe_glu",
       &mlx_kquant::codec_has_moe_glu,
       "kquant_type"_a,
       "True when this codec has the fused MoE GLU/gather kernel family "
       "(kq.moe_glu_gather_kq and friends).");
+
+  m.def(
+      "moe_qf_kernels",
+      &mlx_kquant::moe_qf_kernels,
+      "kquant_type"_a,
+      "True when the fused MoE gathers on this codec run its tuned mat-vec "
+      "loops (the qf kernels) instead of the generic kernels. KQ_MOE_QF=0 "
+      "or a forced KQ_MOE_NX keeps the generic kernels; both are read live "
+      "once set. False on a build without Metal.");
 
   m.def(
       "shexp_glu_combo_has_kernel",
@@ -2165,16 +2184,22 @@ NB_MODULE(_ext, m) {
             indices (array): expert indices [T, R].
             act (str): 'silu' (default), 'gelu' (tanh approx), 'silu_limit'
                 (silu(min(g, limit)) * clip(u, -limit, limit) -- deepseek-v4
-                LimitedSwiGLU; requires limit > 0) or 'swiglu_clamp'
+                LimitedSwiGLU; requires limit > 0), 'swiglu_clamp'
                 (gpt-oss clamped SwiGLU: biases added, g clamped from above,
                 u clamped both sides, sigmoid slope alpha and a (u + 1)
                 linear term; requires gate_bias/up_bias, limit > 0 and
-                alpha > 0; mxfp4/nvfp4 only).
-            limit (float): clamp bound for 'silu_limit'/'swiglu_clamp'.
+                alpha > 0; mxfp4/nvfp4 only) or 'swiglu_oai' (the same
+                clamped SwiGLU without biases, MiniMax-M3:
+                min(g, limit) * sigmoid(alpha * min(g, limit)) *
+                (clip(u, -limit, limit) + 1); requires limit > 0 and
+                alpha > 0; every codec).
+            limit (float): clamp bound for 'silu_limit', 'swiglu_clamp'
+                and 'swiglu_oai'.
             gate_bias (array, optional): per-(expert, out_dim) bias [E, N],
                 'swiglu_clamp' only.
             up_bias (array, optional): same shape, 'swiglu_clamp' only.
-            alpha (float): sigmoid slope for 'swiglu_clamp'.
+            alpha (float): sigmoid slope for 'swiglu_clamp' and
+                'swiglu_oai'.
             gate_scale (array, optional): float32 scale of the gate
                 product, shape (1,), (N,), (n_experts, 1) or
                 (n_experts, N), applied before the bias and the
@@ -2251,6 +2276,7 @@ NB_MODULE(_ext, m) {
       "up_scale"_a = nb::none(),
       "shexp_gate_scale"_a = nb::none(),
       "shexp_up_scale"_a = nb::none(),
+      "alpha"_a = 0.0f,
       "stream"_a = nb::none(),
       R"(
         moe_glu_gather_kq with the block's shared expert folded in as k
@@ -2267,16 +2293,19 @@ NB_MODULE(_ext, m) {
                 shexp_gate_w.
             kquant_type (str): expert codec with a fused kernel.
             indices (array): expert indices [T, R].
-            act (str): 'silu' (default), 'gelu' (tanh approx) or
+            act (str): 'silu' (default), 'gelu' (tanh approx),
                 'silu_limit' (deepseek-v4 LimitedSwiGLU: gate clamped from
-                above, up clamped both sides, routed and shared slots alike).
+                above, up clamped both sides, routed and shared slots alike)
+                or 'swiglu_oai' (MiniMax-M3 clamped SwiGLU, as for
+                moe_glu_gather_kq; requires limit > 0 and alpha > 0).
             shexp_kquant_type (str): shared-expert codec; '' (default) =
                 kquant_type. Mixed combos must be q5_k, q6_k or q8_0, or
                 pass shexp_glu_combo_has_kernel.
-            limit (float): the 'silu_limit' clamp; must be > 0 for that act.
+            limit (float): the 'silu_limit' and 'swiglu_oai' clamp; must be
+                > 0 for those acts.
             shexp_up_kquant_type (str): codec of shexp_up_w when it differs
                 from shexp_gate_w's; '' (default) = shexp_kquant_type. Split
-                combos run act 'silu' only.
+                combos run act 'silu' and 'swiglu_oai' only.
             gate_scale (array, optional): as for moe_glu_gather_kq, on the
                 expert stacks.
             up_scale (array, optional): as for moe_glu_gather_kq.
@@ -2284,6 +2313,7 @@ NB_MODULE(_ext, m) {
                 gate product, shape (1,), for an nvfp4 shared expert.
             shexp_up_scale (array, optional): the same for the shared up.
                 Pass both or neither.
+            alpha (float): sigmoid slope for 'swiglu_oai'.
 
         Returns:
             array: activated hidden states [T, R + k, N] in x.dtype.
@@ -2309,6 +2339,12 @@ NB_MODULE(_ext, m) {
         by its score, replacing gather + (y * scores).sum + shared add.
         Shared slot j reads columns [j K, (j + 1) K) of shexp_w, so K must
         be whole blocks of the shared codec.
+
+        From KQ_MOE_SHEXP_DENSE tokens (default 4), a call with one shared
+        slot, or no scores for its shared slots, takes the shared product
+        from quantized_matmul_multi. A function compiled with
+        shapeless=True cannot hold such a call: it raises ValueError.
+        KQ_MOE_SHEXP_DENSE=0 keeps the shared expert in the fused kernel.
 
         Args:
             x (array): activations [T, S, K], float16/bfloat16. K % 256 == 0.
@@ -2860,7 +2896,8 @@ NB_MODULE(_ext, m) {
         Args:
             x (array): [..., M, K], 1 <= M <= 16, K a multiple of 4;
                 float16/bfloat16/float32.
-            w (array): [N, K] weight, dtype matching x or float32.
+            w (array): [N, K] weight, dtype matching x or float32;
+                float16 or bfloat16 also with float32 x.
 
         Returns:
             array: [..., M, N]; float32 when either operand is, else the
@@ -3049,9 +3086,10 @@ NB_MODULE(_ext, m) {
       R"(
         Tile height for expert_tile_map and gather_qmm_seg.
 
-        128 where the codec runs on the matrix units and the mean rows per
-        expert reach 96 (120 when k < 1024 and the codec's K tile stays
-        64), else 64. KQ_SEG_TILE_ROWS=64 or 128 (read live) pins it.
+        128 where gather_qmm_seg runs its NAX kernel (seg_nax_enabled) and
+        the mean rows per expert reach 96 (120 when k < 1024 and the
+        codec's K tile stays 64), else 64. KQ_SEG_TILE_ROWS=64 or 128 (read
+        live) pins it.
 
         Args:
             rows (int): expert-sorted rows (tokens times top-k).

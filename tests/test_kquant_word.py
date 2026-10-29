@@ -7,8 +7,10 @@ across them: the verify mat-vec (mv_ext), the gate/up and score-mixed down
 gathers of each codec's expert stacks, and the q5_k shared expert over
 iq2_xxs experts, both on the 32-weight kernels (the M5 default) and with
 KQ_MOE_C32=0. The weight bytes are random, so every nibble, high bit and
-scale code occurs. Each arm runs in a subprocess, since the lever is read
-once per process, and with the lever off KQ_QMM_LOG must show that every
+scale code occurs. The gathers run with KQ_MOE_QF=0: the qf kernels of
+q2_k and q4_k decode on the per-row mat-vec loops, which the lever does not
+change. Each arm runs in a subprocess, since the lever is read once per
+process, and with the lever off KQ_QMM_LOG must show that every
 kernel that inlines the chunk decode was fetched with the byte loop, and
 no other: the q4_k per-row mat-vec (KQ_QMM_ROUTE=qmv) has its own decode,
 and q3_k keeps the per-byte loop, so neither is specialized. Under
@@ -112,7 +114,7 @@ def _run(tmp_path, arm, env):
         [sys.executable, "-c", _SNIPPET, str(f), ",".join(CODECS + ["q3_k"])],
         capture_output=True,
         text=True,
-        env={**base, "KQ_QMM_LOG": "1", "KQ_MOE_NX_LOG": "1", **env},
+        env={**base, "KQ_QMM_LOG": "1", "KQ_MOE_NX_LOG": "1", "KQ_MOE_QF": "0", **env},
     )
     assert r.returncode == 0, f"{arm} exited {r.returncode}\n{r.stderr[-4000:]}"
     return np.load(f), r.stderr

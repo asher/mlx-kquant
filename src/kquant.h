@@ -112,6 +112,12 @@ std::vector<std::string> split_kernel_names();
 // gather_qmm_seg switch arm) defer to gather_qmm when this holds.
 bool nax_gather_enabled(const std::string& kquant_type);
 
+// True when gather_qmm_seg runs its NAX kernel for `kquant_type` at input
+// width `k`: nax_gather_enabled holds, k % 64 == 0, and
+// KQ_DISABLE_GATHER_SEG_NAX is unset (read once; any value sets it).
+// KQuantSwitchLinear's sorted arm takes its rows-per-expert rule here.
+bool seg_nax_enabled(const std::string& kquant_type, int k);
+
 // ----------------------------- ops -----------------------------
 
 // Dequantize GGUF K-quant wire bytes `w` (uint8, last dim a multiple of the
@@ -241,10 +247,10 @@ mx::array gather_qmm_seg(
     mx::StreamOrDevice s = {});
 
 // gather_qmm_seg tile height for `rows` expert-sorted rows over n_experts
-// experts at reduction size K: 128 where the NAX kernel runs and the mean
-// rows per expert reach 96 (120 when K < 1024 and the codec's K tile stays
-// 64), else 64. KQ_SEG_TILE_ROWS=64|128 (read live) pins it. 64 on
-// non-Metal builds.
+// experts at reduction size K: 128 where the NAX kernel runs
+// (seg_nax_enabled) and the mean rows per expert reach 96 (120 when
+// K < 1024 and the codec's K tile stays 64), else 64.
+// KQ_SEG_TILE_ROWS=64|128 (read live) pins it. 64 on non-Metal builds.
 int seg_tile_rows(
     int rows,
     int n_experts,
@@ -648,8 +654,10 @@ mx::array gather_qmv_mix_bias(
 // deepseek-v4 LimitedSwiGLU semantics, requires limit > 0 -- or
 // "swiglu_clamp" -- gpt-oss clamped SwiGLU with per-(expert, out_dim) f32
 // gate/up biases, sigmoid slope alpha and a (u + 1) linear term; requires
-// both biases [E, N], limit > 0 and alpha > 0; mxfp4/nvfp4 only). Biases are
-// accepted only with act "swiglu_clamp". x [T, K], indices [T, R]. Returns
+// both biases [E, N], limit > 0 and alpha > 0; mxfp4/nvfp4 only -- or
+// "swiglu_oai" -- the same clamped SwiGLU without biases, MiniMax-M3;
+// requires limit > 0 and alpha > 0, every codec). Biases are accepted only
+// with act "swiglu_clamp". x [T, K], indices [T, R]. Returns
 // [T, R, N]. Metal-only; requires K % 256 == 0 and a codec with the fused
 // kernel wired (full GGUF matrix).
 // Optional nvfp4 output scales gate_scale and up_scale, given together with
@@ -673,10 +681,16 @@ mx::array moe_glu_gather_kq(
 // True when the codec has the fused MoE GLU/gather kernel family above.
 bool codec_has_moe_glu(const std::string& kquant_type);
 
+// True when the fused MoE gathers on kquant_type run the qf kernels (the
+// codec's tuned qmv_fast loops) instead of the Ext kernels. KQ_MOE_QF=0 or a
+// forced KQ_MOE_NX keeps the Ext kernels; both are read live once set.
+// False on a build without Metal.
+bool moe_qf_kernels(const std::string& kquant_type);
+
 // True when moe_glu_gather_shexp_kq has a kernel for expert stacks in
 // kquant_type with the shared expert's gate in shexp_gate_type and its up
-// in shexp_up_type ("silu" only when the three are not one upcast pair),
-// for a shared expert shared_slots routed experts wide.
+// in shexp_up_type ("silu" and "swiglu_oai" only when the three are not one
+// upcast pair), for a shared expert shared_slots routed experts wide.
 bool shexp_glu_combo_has_kernel(
     const std::string& kquant_type,
     const std::string& shexp_gate_type,
@@ -928,7 +942,8 @@ mx::array gather_qmv_kq(
 // shexp_kquant_type defaults to kquant_type; a different codec (mixed-codec
 // blocks, UD-style upcast shexp) must be q5_k, q6_k or q8_0. act
 // "silu_limit" (deepseek-v4 LimitedSwiGLU) needs limit > 0 and clamps the
-// routed and the shared slots alike.
+// routed and the shared slots alike; act "swiglu_oai" (MiniMax-M3) needs
+// limit > 0 and alpha > 0 and runs every slot the same way too.
 // Returns [T, R + k, N]; the last k slots are the shared expert.
 // Optional nvfp4 output scales: gate_scale and up_scale for the expert
 // stacks as in moe_glu_gather_kq, and shexp_gate_scale and shexp_up_scale,
@@ -949,6 +964,7 @@ mx::array moe_glu_gather_shexp_kq(
     const std::optional<mx::array>& up_scale = std::nullopt,
     const std::optional<mx::array>& shexp_gate_scale = std::nullopt,
     const std::optional<mx::array>& shexp_up_scale = std::nullopt,
+    float alpha = 0.0f,
     mx::StreamOrDevice s = {});
 
 // Down projection with the routing mix folded in: x [T, S, K] (the last k
@@ -1168,8 +1184,9 @@ mx::array hc_lowrank_epilogue(
 
 // y = x @ w.T for token widths 1..16 against a small-N, large-K weight in
 // nn.Linear layout ([N, K]). x is [..., M, K] with 1 <= M <= 16 and
-// K % 4 == 0; x float16/bfloat16/float32, w matching x or float32; output
-// float32 when either operand is, else x dtype. f32 accumulate. Fills the
+// K % 4 == 0; x float16/bfloat16/float32, w matching x or float32, or
+// float16/bfloat16 with float32 x; output float32 when either operand is,
+// else x dtype. f32 accumulate. Fills the
 // GEMV-to-GEMM cliff MLX's steel path hits at M >= 2 on these shapes
 // (router gates, indexer weight projections, hyper-connection mixes at
 // speculative verify widths).
@@ -2838,7 +2855,8 @@ class KQuantMoEGLUShexpKQ : public mx::Primitive {
       std::string shexp_type,
       float limit = 0.0f,
       std::string shexp_up_type = "",
-      int out_scale_bits = 0)
+      int out_scale_bits = 0,
+      float alpha = 0.0f)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         act_(std::move(act)),
@@ -2846,6 +2864,7 @@ class KQuantMoEGLUShexpKQ : public mx::Primitive {
         shexp_up_type_(
             shexp_up_type.empty() ? shexp_type_ : std::move(shexp_up_type)),
         limit_(limit),
+        alpha_(alpha),
         out_scale_bits_(out_scale_bits) {}
 
   void eval_cpu(
@@ -2869,6 +2888,7 @@ class KQuantMoEGLUShexpKQ : public mx::Primitive {
   std::string shexp_type_; // the shared expert's gate codec
   std::string shexp_up_type_;
   float limit_;
+  float alpha_;
   int out_scale_bits_;
 };
 

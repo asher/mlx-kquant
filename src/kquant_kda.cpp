@@ -604,7 +604,7 @@ std::vector<mx::array> kda_conv(
   }
   auto x_c = mx::contiguous(x, false, s);
   auto st_c = mx::contiguous(mx::astype(state, dt, s), false, s);
-  auto w_c = mx::contiguous(mx::astype(w, dt, s), false, s);
+  auto w_c = kq_row_major_weight(mx::astype(w, dt, s), s);
   auto prim = std::make_shared<KQuantKdaConv>(s, head_dim, scale, eps);
   return mx::array::make_arrays(
       {x_c.shape(), st_c.shape()}, {dt, dt}, prim, {x_c, st_c, w_c});

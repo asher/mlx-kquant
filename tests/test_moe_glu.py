@@ -927,9 +927,12 @@ _LOWBIT_SHEXP = ("iq4_xs", "iq3_s", "q6_k")
 @pytest.mark.parametrize("codec", ["iq2_s", "iq2_xxs", "iq1_m"])
 @pytest.mark.parametrize("sg", _LOWBIT_SHEXP)
 @pytest.mark.parametrize("su", _LOWBIT_SHEXP)
-def test_shexp_gate_and_up_in_two_codecs(codec, sg, su):
+def test_shexp_gate_and_up_in_two_codecs(codec, sg, su, monkeypatch):
     """moe_glu_gather_shexp_kq with the shared expert's gate and up tensors
-    each in its own codec, against the f32 reference."""
+    each in its own codec, against the f32 reference. The shared expert
+    stays in the fused kernels (test_moe_shexp_dense covers the dense
+    route)."""
+    monkeypatch.setenv("KQ_MOE_SHEXP_DENSE", "0")
     assert kq.shexp_glu_combo_has_kernel(codec, sg, su)
     wire, ref = _wire_and_ref(codec)
     gwire, gref = _wire_and_ref(sg, seed=13)
@@ -1057,9 +1060,10 @@ def test_shexp_split_codec_rejects_what_has_no_kernel():
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("t,r", [(1, 2), (4, 3), (3, 10)])
-def test_mix_q2_0_experts_with_iq4_nl_shared_expert(dtype, t, r):
+def test_mix_q2_0_experts_with_iq4_nl_shared_expert(dtype, t, r, monkeypatch):
     """gather_qmv_mix_kq for q2_0 expert stacks with an iq4_nl shared
-    expert, against the f32 reference."""
+    expert in the fused kernels, against the f32 reference."""
+    monkeypatch.setenv("KQ_MOE_SHEXP_DENSE", "0")
     assert kq.shexp_mix_combo_has_kernel("q2_0", "iq4_nl")
     wire, ref = _wire_and_ref("q2_0")
     swire, sref = _wire_and_ref("iq4_nl", seed=13)

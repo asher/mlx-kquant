@@ -61,7 +61,7 @@ mx::array prep_norm_weight(
     throw std::invalid_argument(
         std::string(op) + " " + what + " dtype must match the activations.");
   }
-  return mx::contiguous(w, false, s);
+  return kq_row_major_weight(w, s);
 }
 
 // Threadgroup width and 4096-element chunk count for add_rmsnorm_norm, in

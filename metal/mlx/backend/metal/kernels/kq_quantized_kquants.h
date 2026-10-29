@@ -65,7 +65,12 @@ METAL_FUNC void kq_q4_k_dequantize_impl(
 
 // results_per_simdgroup default 2 (vs 4 for flat codecs): super-block scale
 // unpacking needs more registers.
-template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int results_per_simdgroup = 2,
+    bool kRows = false>
 METAL_FUNC void kq_q4_k_qmv_fast_impl(
     const device uint8_t* w,
     const device T* x,
@@ -74,7 +79,8 @@ METAL_FUNC void kq_q4_k_qmv_fast_impl(
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    thread float* kq_rows = nullptr) {
   static_assert(
       group_size == KQ_Q4_K_SUPERBLOCK, "Q4_K kernel requires group_size=256");
   static_assert(bits == 4, "Q4_K kernel requires bits=4");
@@ -173,7 +179,9 @@ METAL_FUNC void kq_q4_k_qmv_fast_impl(
 
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
-    if (simd_lid == 0) {
+    if constexpr (kRows) {
+      kq_rows[row] = result[row];
+    } else if (simd_lid == 0) {
       y[out_row + row] = static_cast<T>(result[row]);
     }
   }
@@ -1027,7 +1035,12 @@ METAL_FUNC void kq_q5_k_dequantize_impl(
   out[gid] = T(d * float(sc6) * float(q5) - dmin * float(mn6));
 }
 
-template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int results_per_simdgroup = 2,
+    bool kRows = false>
 METAL_FUNC void kq_q5_k_qmv_fast_impl(
     const device uint8_t* w,
     const device T* x,
@@ -1036,7 +1049,8 @@ METAL_FUNC void kq_q5_k_qmv_fast_impl(
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    thread float* kq_rows = nullptr) {
   static_assert(
       group_size == KQ_Q5_K_SUPERBLOCK, "Q5_K kernel requires group_size=256");
   static_assert(bits == 5, "Q5_K kernel requires bits=5");
@@ -1156,7 +1170,9 @@ METAL_FUNC void kq_q5_k_qmv_fast_impl(
 
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
-    if (simd_lid == 0) {
+    if constexpr (kRows) {
+      kq_rows[row] = result[row];
+    } else if (simd_lid == 0) {
       y[out_row + row] = static_cast<T>(result[row]);
     }
   }
@@ -2132,7 +2148,12 @@ METAL_FUNC void kq_q6_k_dequantize_impl(
   out[gid] = T(d * float(scale_i8) * float(q6));
 }
 
-template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int results_per_simdgroup = 4,
+    bool kRows = false>
 METAL_FUNC void kq_q6_k_qmv_fast_impl(
     const device uint8_t* w,
     const device T* x,
@@ -2141,7 +2162,8 @@ METAL_FUNC void kq_q6_k_qmv_fast_impl(
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    thread float* kq_rows = nullptr) {
   static_assert(
       group_size == KQ_Q6_K_SUPERBLOCK, "Q6_K kernel requires group_size=256");
   static_assert(bits == 6, "Q6_K kernel requires bits=6");
@@ -2216,7 +2238,9 @@ METAL_FUNC void kq_q6_k_qmv_fast_impl(
 
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
-    if (simd_lid == 0) {
+    if constexpr (kRows) {
+      kq_rows[row] = result[row];
+    } else if (simd_lid == 0) {
       y[out_row + row] = static_cast<T>(result[row]);
     }
   }
@@ -3320,7 +3344,12 @@ METAL_FUNC void kq_q3_k_dequantize_impl(
   out[gid] = T(eff_scale * float(q3));
 }
 
-template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int results_per_simdgroup = 2,
+    bool kRows = false>
 METAL_FUNC void kq_q3_k_qmv_fast_impl(
     const device uint8_t* w,
     const device T* x,
@@ -3329,7 +3358,8 @@ METAL_FUNC void kq_q3_k_qmv_fast_impl(
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    thread float* kq_rows = nullptr) {
   static_assert(
       group_size == KQ_Q3_K_SUPERBLOCK, "Q3_K kernel requires group_size=256");
   static_assert(bits == 3, "Q3_K kernel requires bits=3");
@@ -3458,7 +3488,9 @@ METAL_FUNC void kq_q3_k_qmv_fast_impl(
   for (int row = 0; row < results_per_simdgroup; row++) {
     const U combined = (sumf1[row] + U(0.25) * sumf2[row]) * shift_div;
     const U reduced = simd_sum(combined);
-    if (simd_lid == 0) {
+    if constexpr (kRows) {
+      kq_rows[row] = reduced;
+    } else if (simd_lid == 0) {
       y[out_row + row] = static_cast<T>(reduced);
     }
   }
@@ -4344,7 +4376,12 @@ METAL_FUNC void kq_q2_k_dequantize_impl(
   out[gid] = T(eff_scale * float(q2) - eff_min);
 }
 
-template <typename T, int group_size, int bits, int results_per_simdgroup = 2>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int results_per_simdgroup = 2,
+    bool kRows = false>
 METAL_FUNC void kq_q2_k_qmv_fast_impl(
     const device uint8_t* w,
     const device T* x,
@@ -4353,7 +4390,8 @@ METAL_FUNC void kq_q2_k_qmv_fast_impl(
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    thread float* kq_rows = nullptr) {
   static_assert(
       group_size == KQ_Q2_K_SUPERBLOCK, "Q2_K kernel requires group_size=256");
   static_assert(bits == 2, "Q2_K kernel requires bits=2");
@@ -4438,7 +4476,9 @@ METAL_FUNC void kq_q2_k_qmv_fast_impl(
 
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
-    if (simd_lid == 0) {
+    if constexpr (kRows) {
+      kq_rows[row] = result[row];
+    } else if (simd_lid == 0) {
       y[out_row + row] = static_cast<T>(result[row]);
     }
   }

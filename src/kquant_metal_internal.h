@@ -501,6 +501,12 @@ constexpr int kq_out_scale_slot = 30;
 constexpr int kq_up_scale_slot = 29;
 constexpr int kq_shexp_scale_slot = 28;
 constexpr int kq_shexp_up_scale_slot = 27;
+// With act swiglu_oai (bit 4 of the constant) a fused MoE GLU also binds
+// its sigmoid slope.
+constexpr int kq_glu_alpha_slot = 26;
+// A fused MoE mix whose shared expert ran on the dense route binds the
+// shared down product.
+constexpr int kq_shexp_pre_slot = 25;
 
 // Whether the codec has BK=128 NAX kernels (a pair or half loader).
 bool kq_nax_has_bk128(const std::string& t);

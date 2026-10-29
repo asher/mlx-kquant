@@ -550,7 +550,7 @@ std::vector<mx::array> hc_sinkhorn_collapse(
   auto q_c = prep_hc_f32(sumsq, op, "sumsq", s);
   auto sc_c = prep_hc_f32(scale, op, "scale", s);
   auto b_c = prep_hc_f32(base, op, "base", s);
-  auto w_c = mx::contiguous(w, false, s);
+  auto w_c = kq_row_major_weight(w, s);
 
   auto lead = x.shape();
   lead.pop_back();
@@ -623,7 +623,7 @@ std::vector<mx::array> hc_front_expand_collapse(
   auto fn_c = prep_hc_f32(fn, op, "fn", s);
   auto sc_c = prep_hc_f32(scale, op, "scale", s);
   auto b_c = prep_hc_f32(base, op, "base", s);
-  auto w_c = mx::contiguous(w, false, s);
+  auto w_c = kq_row_major_weight(w, s);
 
   auto lead = resid.shape();
   lead.pop_back();

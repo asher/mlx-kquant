@@ -43,6 +43,8 @@
       kq_ ## codec ## _gather_qmv_mix,                                \
       type)
 
+instantiate_kq_moe_shexp_glu_pre(bfloat16_t)
+instantiate_kq_moe_shexp_glu_pre(float16_t)
 instantiate_kq_moe_glu_kq(q6_k, bfloat16_t)
 instantiate_kq_moe_glu_kq(q6_k, float16_t)
 instantiate_kq_moe_glu_kq(q8_0, bfloat16_t)
