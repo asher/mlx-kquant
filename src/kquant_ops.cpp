@@ -907,14 +907,12 @@ mx::array gather_qmm(
   // placeholder.
   bool rhs_reachable = right_sorted && transpose && codec->has_matmul_kernel;
   auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
-  // Always insert the Contiguous node when the rhs leaf is reachable: flags
-  // of an UNEVALUATED array (e.g. a fresh gate/up slice view) are not
-  // meaningful at op-build time, so a `w.flags().row_contiguous ? w : ...`
-  // short-circuit here skipped the compaction on the slice's first eval and
-  // handed the stride-less rhs kernels an expert stride they mis-walk.
-  // Contiguous::eval aliases zero-copy when w turns out packed anyway.
-  auto w_c =
-      rhs_reachable ? mx::contiguous(w, false, s) : kq_matrix_dense(w, s);
+  // Where the rhs leaf is reachable, w is made row-major at eval: flags of
+  // an unevaluated array (e.g. a fresh gate/up slice view) mean nothing at
+  // op-build time, and the stride-less rhs kernels mis-walk an expert
+  // stride. kq_row_major_weight passes a row-major w through, a dense slice
+  // of a larger buffer included, and copies a strided one.
+  auto w_c = rhs_reachable ? kq_row_major_weight(w, s) : kq_matrix_dense(w, s);
   auto scales_c = kq_matrix_dense(scales, s);
   std::vector<mx::array> inputs = {
       x_c, w_c, scales_c, std::move(lhs_indices), std::move(rhs_indices)};
@@ -1093,8 +1091,9 @@ mx::array gather_qmm_seg(
   }
   auto x_c = kq_dense_x(mx::astype(x, out_type, s), s);
   // The kernel computes each expert's base pointer as expert * N * K_w, so w
-  // must be fully row-contiguous (no strided expert dim).
-  auto w_c = mx::contiguous(w, false, s);
+  // must be fully row-contiguous (no strided expert dim). A row-major w, a
+  // dense slice of a larger buffer included, is read in place.
+  auto w_c = kq_row_major_weight(w, s);
   auto scales_c = kq_matrix_dense(scales, s);
   auto map_c = mx::contiguous(map, false, s);
   auto cnt_c = mx::contiguous(counts, false, s);

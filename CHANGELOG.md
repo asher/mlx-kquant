@@ -25,6 +25,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A sorted MoE expert call under 512 rows runs a median 1.4x faster on M5 Max with 8 or 32 experts
   and 1.2x with 128; `KQ_SWITCH_GEMM_MIN_ROWS=512` restores the 0.5.7 choice.
 
+### Fixed
+- Sorted MoE expert calls and `skinny_matmul` read a weight that is a dense slice of a larger buffer
+  in place instead of copying it on every call, 3.7x faster at 64 rows on M5 Max.
+
 ## [0.5.7]
 
 ### Added

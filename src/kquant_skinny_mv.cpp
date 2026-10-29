@@ -193,10 +193,11 @@ mx::array skinny_matmul(mx::array x, mx::array w, mx::StreamOrDevice s_) {
   }
   auto out_dtype = (xt == mx::float32 || wt == mx::float32) ? mx::float32 : xt;
   // Unconditional: flags() on a lazy array are not yet valid, so a
-  // build-time row_contiguous check can skip a needed copy. Contiguous is
-  // a zero-copy passthrough at eval when the input already is.
+  // build-time row_contiguous check can skip a needed copy. w also passes
+  // through when it is a dense slice of a larger buffer, which Contiguous
+  // would copy.
   auto x_c = mx::contiguous(x, false, s);
-  auto w_c = mx::contiguous(w, false, s);
+  auto w_c = kq_row_major_weight(w, s);
 
   auto shape = x.shape();
   shape.back() = w.shape(0);
