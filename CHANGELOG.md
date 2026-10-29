@@ -25,11 +25,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A sorted MoE expert call under 512 rows runs a median 1.4x faster on M5 Max with 8 or 32 experts
   and 1.2x with 128; `KQ_SWITCH_GEMM_MIN_ROWS=512` restores the 0.5.7 choice.
 - On NAX GPUs a sorted MoE call over 384 or 512 experts starts the segment GEMM at 672 or 896 rows
-  instead of 512, where the per-row gather is faster; `KQ_SWITCH_GEMM_MIN_ROWS=512` restores 512.
+  instead of 512; `KQ_SWITCH_GEMM_MIN_ROWS=512` restores 512.
 
 ### Fixed
-- Sorted MoE expert calls and `skinny_matmul` read a weight that is a dense slice of a larger buffer
-  in place instead of copying it on every call, 3.7x faster at 64 rows on M5 Max.
+- Sorted `gather_qmm` calls, `gather_qmm_seg` and `skinny_matmul` read a dense slice of a larger
+  buffer as their weight in place instead of copying it per call, 3.7x faster at 64 rows on M5 Max.
+- `kda_conv`, `hc_sinkhorn_collapse`, `hc_front_expand_collapse`, `add_rmsnorm`, `add_rmsnorm_norm`,
+  `rmsnorm2_add`, `rmsnorm_multi3` and `rmsnorm_gate` read such a weight in place too.
 
 ## [0.5.7]
 
