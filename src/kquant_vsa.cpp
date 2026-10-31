@@ -31,6 +31,10 @@ namespace {
 const std::string kVsaOp = "[mlx_kquant.vsa_block_sparse] ";
 constexpr int kVsaHeadDim = 128;
 constexpr int kVsaTile = 64;
+// Default query rows: 32 below this many video tiles, 64 from it. On M5 Max
+// 32 is faster at 32 video tiles, 64 ties at 108 and wins at 660, and 70
+// is the midpoint.
+constexpr int kVsaRows64MinVideoTiles = 70;
 
 bool vsa_int_dtype(mx::Dtype dt) {
   return mx::issubdtype(dt, mx::integer);
@@ -126,7 +130,7 @@ mx::array vsa_block_sparse(
     int num_prefix_tiles,
     float scale,
     int tile_size,
-    int query_rows,
+    std::optional<int> query_rows,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   if (s.device != mx::Device::gpu) {
@@ -151,7 +155,8 @@ mx::array vsa_block_sparse(
   if (tile_size != kVsaTile) {
     throw std::invalid_argument(kVsaOp + "only tile size 64 is supported.");
   }
-  if (query_rows != 16 && query_rows != 32 && query_rows != 64) {
+  if (query_rows && *query_rows != 16 && *query_rows != 32 &&
+      *query_rows != 64) {
     throw std::invalid_argument(kVsaOp + "query_rows must be 16, 32 or 64.");
   }
   if (!std::isfinite(scale)) {
@@ -226,6 +231,8 @@ mx::array vsa_block_sparse(
     return as_i32(a);
   };
   const int k_max = block_idx.shape(2);
+  const int rows =
+      query_rows.value_or(n_video < kVsaRows64MinVideoTiles ? 32 : 64);
   std::vector<mx::array> inputs = {
       mx::contiguous(q, false, s),
       mx::contiguous(k, false, s),
@@ -235,7 +242,7 @@ mx::array vsa_block_sparse(
       as_i32(variable_block_sizes)};
   auto shape = q.shape();
   auto prim = std::make_shared<KQuantVSABlockSparse>(
-      s, num_prefix_tiles, tile_size, query_rows, scale);
+      s, num_prefix_tiles, tile_size, rows, scale);
   return mx::array(
       std::move(shape), mx::bfloat16, std::move(prim), std::move(inputs));
 }

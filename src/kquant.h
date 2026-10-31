@@ -3888,6 +3888,7 @@ class KQSdpaSparsePrefill : public mx::Primitive {
 // block_idx[h, j], skipping an index outside [0, tiles). Returns
 // [S_pad, heads, 128] with the live video query rows filled and every other
 // row zero. Tile size 64. GPU only, on NAX hardware (nax_available()).
+// query_rows (16, 32 or 64) defaults by the number of video tiles.
 mx::array vsa_block_sparse(
     mx::array q,
     mx::array k,
@@ -3898,7 +3899,7 @@ mx::array vsa_block_sparse(
     int num_prefix_tiles,
     float scale,
     int tile_size = 64,
-    int query_rows = 32,
+    std::optional<int> query_rows = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // VSA block-sparse attention primitive (see vsa_block_sparse).

@@ -615,7 +615,7 @@ NB_MODULE(_ext, m) {
       "scale"_a,
       nb::kw_only(),
       "tile_size"_a = 64,
-      "query_rows"_a = 32,
+      "query_rows"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Block-sparse attention of MiniMax-H3 video sparse attention (VSA)
@@ -643,7 +643,9 @@ NB_MODULE(_ext, m) {
                 prefix. Their query rows are not computed here.
             scale (float): query scale (typically 1/sqrt(128)).
             tile_size (int): rows per tile, 64.
-            query_rows (int): query rows per threadgroup, 16, 32 or 64.
+            query_rows (int, optional): query rows per threadgroup, 16,
+                32 or 64. By default 32 below 70 video tiles and 64 from
+                70, the faster of the two on M5 Max.
 
         Returns:
             array: [S_pad, heads, 128] bfloat16. The live rows of the video
