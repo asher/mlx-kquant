@@ -217,7 +217,9 @@ mx::array vsa_block_sparse(
     return mx::contiguous(mx::astype(a, mx::int32, s), false, s);
   };
   // Integers wider than int32 are clipped to [lo, hi] before the cast, so a
-  // value out of range stays out of range instead of wrapping into it.
+  // value out of range stays out of range instead of wrapping into it. The
+  // routing bounds do not depend on the shapes: the kernel skips tile indices
+  // past the last tile and caps block_num at k.
   auto clip_i32 = [&](mx::array a, int lo, int hi) {
     if (a.dtype() == mx::int64) {
       a = mx::clip(
@@ -230,15 +232,15 @@ mx::array vsa_block_sparse(
     }
     return as_i32(a);
   };
-  const int k_max = block_idx.shape(2);
+  constexpr int kInt32Max = std::numeric_limits<int>::max();
   const int rows =
       query_rows.value_or(n_video < kVsaRows64MinVideoTiles ? 32 : 64);
   std::vector<mx::array> inputs = {
       mx::contiguous(q, false, s),
       mx::contiguous(k, false, s),
       mx::contiguous(v, false, s),
-      clip_i32(block_idx, -1, n_tiles),
-      clip_i32(block_num, 0, k_max),
+      clip_i32(block_idx, -1, kInt32Max),
+      clip_i32(block_num, 0, kInt32Max),
       clip_i32(variable_block_sizes, 0, tile_size)};
   auto shape = q.shape();
   auto prim = std::make_shared<KQuantVSABlockSparse>(
