@@ -71,16 +71,16 @@ class VSAGeometry:
     and for a tile size other than 64. Build it outside a compiled function.
 
     Attributes:
-        variable_block_sizes (array): int32 [tiles], the live rows of each
-            tile, the prefix tiles first.
+        variable_block_sizes (array): integer [tiles], the live rows of
+            each tile, the prefix tiles first.
         num_prefix_tiles (int): the tiles that hold the prefix rows.
         prefix_length (int): the prefix rows, the first packed rows.
-        tile_gather_index (array): int32 [tiles * tile_size], the packed row
-            of each tile slot, or S for a pad slot.
-        prefix_gather_index (array): int32 [num_prefix_tiles * tile_size],
-            the prefix row of each prefix tile slot, or prefix_length for a
-            pad slot.
-        untile_index (array): int32 [S], the tile slot of each packed row.
+        tile_gather_index (array): integer [tiles * tile_size], the packed
+            row of each tile slot, or S for a pad slot.
+        prefix_gather_index (array): integer
+            [num_prefix_tiles * tile_size], the prefix row of each prefix
+            tile slot, or prefix_length for a pad slot.
+        untile_index (array): integer [S], the tile slot of each packed row.
         video_tile_spans (tuple): the [start, end) tiles of each video
             region: empty, or the one region ((num_prefix_tiles, tiles),).
         tile_size (int): rows per tile, 64.
