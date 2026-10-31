@@ -74,6 +74,10 @@ void KQuantVSABlockSparse::eval_gpu(
   ce.set_bytes(n16, 1);
   ce.dispatch_threads(
       MTL::Size(n16, 1, 1), MTL::Size(n16 < 1024 ? n16 : 1024, 1, 1));
+  // With no video tile or no key tile, every row stays zero.
+  if (n_video == 0 || k_max == 0) {
+    return;
+  }
 
   std::string kname = "kq_vsa_nax_" + kq_type_string(q.dtype()) + "_" +
       std::to_string(tile_) + "_bq" + std::to_string(query_rows_);
@@ -222,9 +226,8 @@ mx::array vsa_block_sparse(
         "requires a GPU with tensor-op (NAX) units, M5 or later; check "
         "nax_available().");
   }
-  if (n_video == 0 || block_idx.shape(2) == 0) {
-    return mx::zeros(q.shape(), q.dtype(), s);
-  }
+  // A call with no video tile or no key tile also builds the primitive, so
+  // a shapeless compile traced on it refuses other shapes.
   auto as_i32 = [&](const mx::array& a) {
     return mx::contiguous(mx::astype(a, mx::int32, s), false, s);
   };

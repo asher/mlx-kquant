@@ -625,6 +625,9 @@ NB_MODULE(_ext, m) {
         from FastVideo's NAX VSA kernel and returns the bits of MLX's fused
         attention over the gathered key tiles with the dead rows masked.
         Needs a NAX GPU (M5 and later). A CPU stream or another GPU raises.
+        A function compiled with shapeless=True raises ValueError when it
+        is called at input shapes other than those of its trace. Compile
+        such a function with fixed shapes.
 
         Args:
             q (array): tiled queries [S_pad, heads, 128], bfloat16, with

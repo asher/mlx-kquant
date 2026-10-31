@@ -418,6 +418,30 @@ def test_guard_refuses_a_shapeless_compile_at_a_new_shape():
         compiled(big, big, big, idx, num, vbs)
 
 
+# A call with no video tile or no key tile builds the same op, so a trace of
+# it refuses a new shape too: here k from 0 to 2, or 2 video tiles past an
+# all-prefix trace.
+@requires_nax
+@pytest.mark.parametrize("empty", ["key_tiles", "video_tiles"])
+def test_guard_refuses_a_shapeless_compile_traced_on_an_empty_call(empty):
+    q, _, _, idx, num, vbs, n_prefix = _small()
+    if empty == "key_tiles":
+        traced = (q, idx[..., :0], num, vbs)
+    else:
+        n_prefix = len(vbs)
+        traced = (q, idx[:, :0], num[:, :0], vbs)
+        q = mx.concatenate([q, mx.zeros((2 * TILE,) + q.shape[1:], q.dtype)])
+        vbs = mx.concatenate([vbs, mx.array([TILE, TILE], dtype=mx.int32)])
+
+    def attend(q, idx, num, vbs):
+        return kq.vsa_block_sparse(q, q, q, idx, num, vbs, n_prefix, SCALE)
+
+    compiled = mx.compile(attend, shapeless=True)
+    compiled(*traced)
+    with pytest.raises(ValueError, match="shapeless"):
+        compiled(q, idx, num, vbs)
+
+
 # On an M5 this runs with MLX_METAL_GPU_ARCH=applegpu_g15s, which names an
 # M3-class GPU to MLX.
 @pytest.mark.skipif(NAX, reason="covers GPUs without tensor-op units")
