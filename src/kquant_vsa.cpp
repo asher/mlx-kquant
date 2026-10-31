@@ -109,8 +109,20 @@ void KQuantVSABlockSparse::eval_cpu(
   throw std::runtime_error(kVsaOp + "has no CPU implementation.");
 }
 
+// Called when a shapeless compile replays the graph at new input shapes,
+// which skips the checks in vsa_block_sparse, so other shapes are refused.
 std::vector<mx::Shape> KQuantVSABlockSparse::output_shapes(
     const std::vector<mx::array>& inputs) {
+  bool same = inputs.size() == input_shapes_.size();
+  for (size_t i = 0; same && i < inputs.size(); ++i) {
+    same = inputs[i].shape() == input_shapes_[i];
+  }
+  if (!same) {
+    throw std::invalid_argument(
+        kVsaOp +
+        "got input shapes it was not built for, as in a shapeless compile. "
+        "Compile without shapeless=True.");
+  }
   return {inputs[0].shape()};
 }
 
@@ -242,9 +254,13 @@ mx::array vsa_block_sparse(
       clip_i32(block_idx, -1, kInt32Max),
       clip_i32(block_num, 0, kInt32Max),
       clip_i32(variable_block_sizes, 0, tile_size)};
+  std::vector<mx::Shape> input_shapes;
+  for (const auto& in : inputs) {
+    input_shapes.push_back(in.shape());
+  }
   auto shape = q.shape();
   auto prim = std::make_shared<KQuantVSABlockSparse>(
-      s, num_prefix_tiles, tile_size, rows, scale);
+      s, num_prefix_tiles, tile_size, rows, scale, std::move(input_shapes));
   return mx::array(
       std::move(shape), mx::bfloat16, std::move(prim), std::move(inputs));
 }

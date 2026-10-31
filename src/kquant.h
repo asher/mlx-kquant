@@ -3911,12 +3911,14 @@ class KQuantVSABlockSparse : public mx::Primitive {
       int n_prefix,
       int tile,
       int query_rows,
-      float scale)
+      float scale,
+      std::vector<mx::Shape> input_shapes)
       : mx::Primitive(stream),
         n_prefix_(n_prefix),
         tile_(tile),
         query_rows_(query_rows),
-        scale_(scale) {}
+        scale_(scale),
+        input_shapes_(std::move(input_shapes)) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -3938,6 +3940,8 @@ class KQuantVSABlockSparse : public mx::Primitive {
   int tile_;
   int query_rows_;
   float scale_;
+  // The shapes the call was built and checked for.
+  std::vector<mx::Shape> input_shapes_;
 };
 
 } // namespace mlx_kquant

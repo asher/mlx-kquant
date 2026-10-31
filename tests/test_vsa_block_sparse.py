@@ -396,6 +396,28 @@ def test_guard_refuses_rows_past_32_bits(n_tiles, heads):
         kq.vsa_block_sparse(big, big, big, idx, num, vbs, 0, SCALE)
 
 
+# A shapeless compile replays the call at a new shape without the guards
+# above, so the op refuses shapes other than the traced ones. Tracing needs
+# NAX. Neither call is evaluated.
+@requires_nax
+def test_guard_refuses_a_shapeless_compile_at_a_new_shape():
+    q, k, v, idx, num, vbs, n_prefix = _small()
+
+    def attend(q, k, v, idx, num, vbs):
+        return kq.vsa_block_sparse(q, k, v, idx, num, vbs, n_prefix, SCALE)
+
+    compiled = mx.compile(attend, shapeless=True)
+    compiled(q, k, v, idx, num, vbs)
+    # The same call with one more full video tile.
+    heads, ksel = idx.shape[0], idx.shape[2]
+    big = mx.zeros((q.shape[0] + TILE, heads, D), dtype=mx.bfloat16)
+    idx = mx.zeros((heads, 3, ksel), dtype=mx.int32)
+    num = mx.full((heads, 3), ksel, dtype=mx.int32)
+    vbs = mx.concatenate([vbs, mx.array([TILE], dtype=mx.int32)])
+    with pytest.raises(ValueError, match="shapeless"):
+        compiled(big, big, big, idx, num, vbs)
+
+
 # On an M5 this runs with MLX_METAL_GPU_ARCH=applegpu_g15s, which names an
 # M3-class GPU to MLX.
 @pytest.mark.skipif(NAX, reason="covers GPUs without tensor-op units")
