@@ -3888,7 +3888,10 @@ class KQSdpaSparsePrefill : public mx::Primitive {
 // block_idx[h, j], skipping an index outside [0, tiles). Returns
 // [S_pad, heads, 128] with the live video query rows filled and every other
 // row zero. Tile size 64. GPU only, on NAX hardware (nax_available()).
-// query_rows (16, 32 or 64) defaults by the number of video tiles.
+// query_rows (16, 32 or 64) defaults by the number of video tiles. With
+// coarse (float32 [heads, tiles, 128]) and gate (q's shape and dtype), each
+// written row adds bf16(coarse[h, tile] * gate[row]) to its bfloat16 output,
+// and a video tile with no key tile holds that term alone.
 mx::array vsa_block_sparse(
     mx::array q,
     mx::array k,
@@ -3900,6 +3903,8 @@ mx::array vsa_block_sparse(
     float scale,
     int tile_size = 64,
     std::optional<int> query_rows = std::nullopt,
+    std::optional<mx::array> coarse = std::nullopt,
+    std::optional<mx::array> gate = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // VSA block-sparse attention primitive (see vsa_block_sparse).
@@ -3912,12 +3917,14 @@ class KQuantVSABlockSparse : public mx::Primitive {
       int tile,
       int query_rows,
       float scale,
+      bool gated,
       std::vector<mx::Shape> input_shapes)
       : mx::Primitive(stream),
         n_prefix_(n_prefix),
         tile_(tile),
         query_rows_(query_rows),
         scale_(scale),
+        gated_(gated),
         input_shapes_(std::move(input_shapes)) {}
 
   void eval_cpu(
@@ -3940,6 +3947,8 @@ class KQuantVSABlockSparse : public mx::Primitive {
   int tile_;
   int query_rows_;
   float scale_;
+  // coarse and gate follow the six attention inputs.
+  bool gated_;
   // The shapes the call was built and checked for.
   std::vector<mx::Shape> input_shapes_;
 };

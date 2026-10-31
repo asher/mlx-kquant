@@ -9,7 +9,11 @@
   instantiate_kernel(                                                  \
       "kq_vsa_nax_" #type "_" #tile "_bq" #bq,                         \
       kq_vsa_nax,                                                      \
-      type, tile, bq)
+      type, tile, bq, false)                                           \
+  instantiate_kernel(                                                  \
+      "kq_vsa_nax_gated_" #type "_" #tile "_bq" #bq,                   \
+      kq_vsa_nax,                                                      \
+      type, tile, bq, true)
 
 instantiate_kq_vsa_nax(bfloat16_t, 64, 16)
 instantiate_kq_vsa_nax(bfloat16_t, 64, 32)

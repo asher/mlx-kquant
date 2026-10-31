@@ -257,6 +257,32 @@ def test_strided_view_and_query_rows_give_the_same_bits():
     np.testing.assert_array_equal(_bits(a), _bits(b))
 
 
+# The gate term against MLX's unfused ops in FastVideo's order: the coarse
+# output of each tile times the tiled gate in float32, rounded to bfloat16,
+# then added to the bfloat16 attention output.
+@requires_nax
+@pytest.mark.parametrize("query_rows", [16, 32, 64])
+def test_gate_term_matches_the_unfused_ops(query_rows):
+    rng = np.random.default_rng(15)
+    vbs, n_prefix = _sizes((56, 74), VIDEO)
+    heads, n = 3, len(vbs)
+    q, k, v, gate = (_tiled(rng, vbs, heads) for _ in range(4))
+    idx = _routing(rng, heads, n_prefix, len(VIDEO), 3)
+    num = np.full(idx.shape[:2], idx.shape[2], dtype=np.int32)
+    coarse = mx.array(rng.standard_normal((heads, n, D)).astype(np.float32))
+    kw = {"query_rows": query_rows}
+    out = _call(q, k, v, idx, num, vbs, n_prefix, coarse=coarse, gate=gate, **kw)
+    plain = _call(q, k, v, idx, num, vbs, n_prefix, **kw)
+    gate_view = gate.reshape(n, TILE, heads, D)
+    term = coarse.transpose(1, 0, 2)[:, None, :, :] * gate_view
+    ref = plain + term.reshape(-1, heads, D).astype(mx.bfloat16)
+    rows = _live(vbs)
+    rows[: n_prefix * TILE] = False
+    out = _bits(out)
+    np.testing.assert_array_equal(out[rows], _bits(ref)[rows])
+    assert not out[~rows].any(), "prefix and pad rows must be zero"
+
+
 # Host guards. Each input fails only the named guard, so with that guard
 # removed the call is built and the test fails. The calls are never
 # evaluated: no kernel is compiled or run, and the tests run on any GPU.
@@ -324,6 +350,10 @@ def _routing_over_all_tiles(q, idx, num, vbs):
     return {"block_idx": mx.zeros(shape, dtype=mx.int32)}
 
 
+def _coarse(q, vbs, tiles=0, dtype=mx.float32):
+    return mx.zeros((q.shape[1], vbs.shape[0] + tiles, D), dtype=dtype)
+
+
 GUARDS = {
     "kv_shape": ("share one shape", lambda q, idx, num, vbs: {"k": _heads(q, 3)}),
     "head_dim": (
@@ -357,6 +387,32 @@ GUARDS = {
     "routing_dtype": (
         "must be integer arrays",
         lambda q, idx, num, vbs: {"block_idx": idx.astype(mx.float32)},
+    ),
+    "coarse_without_gate": (
+        "given together",
+        lambda q, idx, num, vbs: {"coarse": _coarse(q, vbs)},
+    ),
+    "gate_shape": (
+        "gate must be",
+        lambda q, idx, num, vbs: {"coarse": _coarse(q, vbs), "gate": _heads(q, 3)},
+    ),
+    "gate_dtype": (
+        "gate must be",
+        lambda q, idx, num, vbs: {
+            "coarse": _coarse(q, vbs),
+            "gate": q.astype(mx.float16),
+        },
+    ),
+    "coarse_shape": (
+        "coarse must be",
+        lambda q, idx, num, vbs: {"coarse": _coarse(q, vbs, tiles=-1), "gate": q},
+    ),
+    "coarse_dtype": (
+        "coarse must be",
+        lambda q, idx, num, vbs: {
+            "coarse": _coarse(q, vbs, dtype=mx.bfloat16),
+            "gate": q,
+        },
     ),
 }
 

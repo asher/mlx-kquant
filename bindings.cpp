@@ -616,6 +616,8 @@ NB_MODULE(_ext, m) {
       nb::kw_only(),
       "tile_size"_a = 64,
       "query_rows"_a = nb::none(),
+      "coarse"_a = nb::none(),
+      "gate"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         Block-sparse attention of MiniMax-H3 video sparse attention (VSA)
@@ -649,11 +651,19 @@ NB_MODULE(_ext, m) {
             query_rows (int, optional): query rows per threadgroup, 16,
                 32 or 64. By default 32 below 70 video tiles and 64 from
                 70, the faster of the two on M5 Max.
+            coarse (array, optional): float32 [heads, tiles, 128], the
+                pooled-compression output of each tile, given with gate.
+            gate (array, optional): the tiled gate, the shape and dtype of
+                q. Each live video query row adds
+                bf16(coarse[h, tile] * gate[row]) to its bfloat16 output:
+                the attention output and the product are each rounded to
+                bfloat16, then summed, as the unfused MLX ops round them.
 
         Returns:
             array: [S_pad, heads, 128] bfloat16. The live rows of the video
-            query tiles hold the attention output. Prefix rows, pad rows
-            and the rows of a tile with no live key tile are zero.
+            query tiles hold the attention output, plus the gate term when
+            gate is given. Prefix rows and pad rows are zero, and so are
+            the rows of a tile with no live key tile when no gate is given.
       )");
 
   m.def(

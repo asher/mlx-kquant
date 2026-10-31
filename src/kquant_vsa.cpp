@@ -74,17 +74,24 @@ void KQuantVSABlockSparse::eval_gpu(
   ce.set_bytes(n16, 1);
   ce.dispatch_threads(
       MTL::Size(n16, 1, 1), MTL::Size(n16 < 1024 ? n16 : 1024, 1, 1));
-  // With no video tile or no key tile, every row stays zero.
-  if (n_video == 0 || k_max == 0) {
+  // With no video tile every row stays zero.
+  if (n_video == 0) {
     return;
   }
 
-  std::string kname = "kq_vsa_nax_" + kq_type_string(q.dtype()) + "_" +
-      std::to_string(tile_) + "_bq" + std::to_string(query_rows_);
+  std::string kname =
+      std::string(gated_ ? "kq_vsa_nax_gated_" : "kq_vsa_nax_") +
+      kq_type_string(q.dtype()) + "_" + std::to_string(tile_) + "_bq" +
+      std::to_string(query_rows_);
   auto kernel = kq_get_kernel(d, kname);
   ce.set_compute_pipeline_state(kernel);
   for (int i = 0; i < 6; ++i) {
-    ce.set_input_array(inputs[i], i);
+    // With k 0, block_idx is empty and never read: block_num takes its slot.
+    ce.set_input_array(i == 3 && k_max == 0 ? inputs[4] : inputs[i], i);
+  }
+  if (gated_) {
+    ce.set_input_array(inputs[6], 12);
+    ce.set_input_array(inputs[7], 13);
   }
   ce.set_output_array(out, 6);
   ce.set_bytes(k_max, 7);
@@ -133,7 +140,7 @@ std::vector<mx::Shape> KQuantVSABlockSparse::output_shapes(
 bool KQuantVSABlockSparse::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantVSABlockSparse&>(other);
   return n_prefix_ == o.n_prefix_ && tile_ == o.tile_ &&
-      query_rows_ == o.query_rows_ && scale_ == o.scale_;
+      query_rows_ == o.query_rows_ && scale_ == o.scale_ && gated_ == o.gated_;
 }
 
 mx::array vsa_block_sparse(
@@ -147,6 +154,8 @@ mx::array vsa_block_sparse(
     float scale,
     int tile_size,
     std::optional<int> query_rows,
+    std::optional<mx::array> coarse,
+    std::optional<mx::array> gate,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   if (s.device != mx::Device::gpu) {
@@ -210,6 +219,20 @@ mx::array vsa_block_sparse(
     throw std::invalid_argument(
         kVsaOp + "block_idx and block_num must be integer arrays.");
   }
+  if (coarse.has_value() != gate.has_value()) {
+    throw std::invalid_argument(
+        kVsaOp + "coarse and gate are given together or not at all.");
+  }
+  if (gate && (gate->shape() != q.shape() || gate->dtype() != mx::bfloat16)) {
+    throw std::invalid_argument(
+        kVsaOp + "gate must be bfloat16 with the shape of q.");
+  }
+  if (coarse &&
+      (coarse->shape() != mx::Shape{heads, n_tiles, kVsaHeadDim} ||
+       coarse->dtype() != mx::float32)) {
+    throw std::invalid_argument(
+        kVsaOp + "coarse must be float32 [heads, tiles, 128].");
+  }
   // The kernel computes routing indices and the row offsets inside a 32-row
   // key block (up to 32 * heads * 128 elements) in 32 bits, and the zero fill
   // counts 16-byte words in 32 bits.
@@ -257,13 +280,23 @@ mx::array vsa_block_sparse(
       clip_i32(block_idx, -1, kInt32Max),
       clip_i32(block_num, 0, kInt32Max),
       clip_i32(variable_block_sizes, 0, tile_size)};
+  if (gate) {
+    inputs.push_back(mx::contiguous(*coarse, false, s));
+    inputs.push_back(mx::contiguous(*gate, false, s));
+  }
   std::vector<mx::Shape> input_shapes;
   for (const auto& in : inputs) {
     input_shapes.push_back(in.shape());
   }
   auto shape = q.shape();
   auto prim = std::make_shared<KQuantVSABlockSparse>(
-      s, num_prefix_tiles, tile_size, rows, scale, std::move(input_shapes));
+      s,
+      num_prefix_tiles,
+      tile_size,
+      rows,
+      scale,
+      gate.has_value(),
+      std::move(input_shapes));
   return mx::array(
       std::move(shape), mx::bfloat16, std::move(prim), std::move(inputs));
 }

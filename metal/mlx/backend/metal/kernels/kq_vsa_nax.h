@@ -5,7 +5,9 @@
 // t holds vbs[t] live rows, then pad slots. Tiles [0, n_prefix) are the dense
 // prefix. Video query tile j of head h reads the first block_num[h, j] key
 // tiles of block_idx[h, j], and of each only its live rows. Only the live
-// rows of the video query tiles are written.
+// rows of the video query tiles are written. With GATED, each written row
+// also adds the pooled-compression term bf16(coarse[h, tile] * gate[row]) to
+// its bfloat16 output, rounded as MLX's unfused ops round it.
 //
 // One threadgroup per BQ query rows, video tile and head, 16 query rows per
 // simdgroup and keys in blocks of 32. The fragment math, the online softmax
@@ -19,7 +21,9 @@
 // mlx_kquant/licenses/FastVideo-LICENSE). Changes for mlx-kquant: a
 // compiled kernel with buffer arguments in place of an mx.fast.metal_kernel
 // source, block_num clamped to [0, k_max], a key tile index outside
-// [0, n_tiles) skipped and vbs clamped to [0, TILE]. The math is unchanged.
+// [0, n_tiles) skipped, vbs clamped to [0, TILE], and the gate term of
+// FastVideo's h3_vsa_attention added in the epilogue (GATED). The attention
+// math is unchanged.
 //
 // FastVideo's kernel is adapted from MLX (steel_attention_nax.h, Copyright
 // 2024-26 Apple Inc.). Its MIT notice follows.
@@ -85,7 +89,7 @@ struct ExpSubOp {
 
 } // namespace kq_vsa
 
-template <typename T, int TILE, int BQ>
+template <typename T, int TILE, int BQ, bool GATED>
 [[kernel, max_total_threads_per_threadgroup(BQ / 16 * 32)]] void kq_vsa_nax(
     const device T* q [[buffer(0)]],
     const device T* k [[buffer(1)]],
@@ -99,6 +103,8 @@ template <typename T, int TILE, int BQ>
     const constant int& n_video [[buffer(9)]],
     const constant int& heads [[buffer(10)]],
     const constant float& scale [[buffer(11)]],
+    const device float* coarse [[buffer(12)]],
+    const device T* gate [[buffer(13)]],
     uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {
   using namespace kq_vsa;
@@ -120,8 +126,9 @@ template <typename T, int TILE, int BQ>
   const int nsel = clamp(block_num[head * n_video + query_tile], 0, k_max);
 
   // Uniform across the threadgroup: later barriers cannot be skipped by only
-  // some simdgroups. Inactive simdgroups use guarded loads and stores.
-  if (row_base >= q_valid || nsel <= 0) {
+  // some simdgroups. Inactive simdgroups use guarded loads and stores. A tile
+  // with no key tile writes zero, or the gate term alone.
+  if (row_base >= q_valid) {
     return;
   }
 
@@ -260,12 +267,38 @@ template <typename T, int TILE, int BQ>
     rcp[i] = sum_score[i] > 0.f ? 1.f / sum_score[i] : 0.f;
   }
   Otile.template row_bin_op<MulOp>(rcp);
-  if (q_remaining > 0) {
-    if (q_remaining < 16) {
-      Otile.store_rows(O, row_stride, q_remaining);
-    } else {
-      Otile.store(O, row_stride);
+  if (q_remaining <= 0) {
+    return;
+  }
+  if constexpr (GATED) {
+    // out = bf16(o) + bf16(coarse * float(gate)): the attention output and
+    // the product each rounded to T, then their sum, as MLX's Multiply,
+    // AsType and Add kernels compute it.
+    const short2 sc = otile_t::NAXFrag_t::get_coord();
+    const device float* C = coarse + (long(head) * n_tiles + qt) * D;
+    const device T* G = gate + (long(qt * TILE + qrow) * heads + head) * D;
+    STEEL_PRAGMA_UNROLL
+    for (short id = 0; id < TD; ++id) {
+      const thread auto& frag = Otile.frag_at(0, id);
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < otile_t::kFragThrRows; ++i) {
+        const short r = sc.y + i * otile_t::kFragRowsJump;
+        if (r < q_remaining) {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < otile_t::kFragThrCols; ++j) {
+            const int c = id * 16 + sc.x + j;
+            const T o = static_cast<T>(frag[i * otile_t::kFragThrCols + j]);
+            const T g = static_cast<T>(
+                C[c] * static_cast<float>(G[r * row_stride + c]));
+            O[r * row_stride + c] = static_cast<T>(o + g);
+          }
+        }
+      }
     }
+  } else if (q_remaining < 16) {
+    Otile.store_rows(O, row_stride, q_remaining);
+  } else {
+    Otile.store(O, row_stride);
   }
 }
 

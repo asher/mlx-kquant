@@ -1406,12 +1406,14 @@ into a packed layout first.
 - `vsa_block_sparse`: the block-sparse attention of MiniMax-H3 video sparse attention (VSA) on the
   tensor-op units of M5 and later GPUs, ported from FastVideo. q, k and v are the tiled sequence
   `[tiles * 64, heads, 128]` in bfloat16, each tile its live rows then pad slots. Each video query
-  tile attends only the key tiles its routing lists (`block_idx`, `block_num`), and of each only
-  the live rows, with no gathered copy of K and V and no dense mask. The live rows match MLX's
-  fused attention over the gathered key tiles with the dead rows masked, bit for bit. Prefix and
-  pad rows of the output are zero. A function compiled with `shapeless=True` raises a `ValueError`
-  that names `vsa_block_sparse` when it is called at input shapes other than those of its trace.
-  Compile such a function with fixed shapes.
+  tile attends only the key tiles its routing lists (`block_idx`, `block_num`), and of each only the
+  live rows, with no gathered copy of K and V and no dense mask. The live rows match MLX's fused
+  attention over the gathered key tiles with the dead rows masked, bit for bit. With `coarse` and
+  `gate`, each live video query row also adds MiniMax-H3's pooled-compression term in the epilogue:
+  the coarse output of its tile times its gate row, rounded to bfloat16 as MLX's unfused ops round
+  it. Prefix and pad rows of the output are zero. A function compiled with `shapeless=True` raises a
+  `ValueError` that names `vsa_block_sparse` when it is called at input shapes other than those of
+  its trace. Compile such a function with fixed shapes.
 - **`sdpa_fa_verify`** - speculative-verify attention on the matrix units for a GQA-folded query tile.
   Head dims 64 through 512; `return_lse` as above. On NAX GPUs, at head dims 128 and 256 with up to
   64 folded rows on plain K and V, the key pass runs on the tensor-op units: each 16-row strip of
