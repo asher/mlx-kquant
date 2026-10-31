@@ -40,7 +40,44 @@ bool vsa_int_dtype(mx::Dtype dt) {
   return mx::issubdtype(dt, mx::integer);
 }
 
+// The identity, on the buffer of its input. A shapeless replay calls
+// output_shapes, which refuses, so a shapeless compiled function cannot hold
+// a graph that passes through this node.
+class KQuantVSAFixedShapes : public mx::UnaryPrimitive {
+ public:
+  explicit KQuantVSAFixedShapes(mx::Stream stream)
+      : mx::UnaryPrimitive(stream) {}
+
+  void eval_cpu(const std::vector<mx::array>& inputs, mx::array& out) override {
+    out.copy_shared_buffer(inputs[0]);
+  }
+  void eval_gpu(const std::vector<mx::array>& inputs, mx::array& out) override {
+    out.copy_shared_buffer(inputs[0]);
+  }
+
+  const char* name() const override {
+    return "KQuantVSAFixedShapes";
+  }
+  bool is_equivalent(const mx::Primitive&) const override {
+    return true;
+  }
+
+  std::vector<mx::Shape> output_shapes(const std::vector<mx::array>&) override {
+    throw std::invalid_argument(
+        "[mlx_kquant.vsa_attention] A shapeless compiled function cannot hold "
+        "this call. Compile it with fixed shapes.");
+  }
+};
+
 } // namespace
+
+mx::array vsa_fixed_shapes(const mx::array& x, mx::StreamOrDevice s) {
+  return mx::array(
+      x.shape(),
+      x.dtype(),
+      std::make_shared<KQuantVSAFixedShapes>(mx::to_stream(s)),
+      {x});
+}
 
 #ifdef _METAL_
 

@@ -603,6 +603,15 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "_vsa_fixed_shapes",
+      &mlx_kquant::vsa_fixed_shapes,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "The identity on x, refusing any shapeless compiled replay (for "
+      "vsa_attention).");
+
+  m.def(
       "vsa_block_sparse",
       &mlx_kquant::vsa_block_sparse,
       "q"_a,

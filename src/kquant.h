@@ -3907,6 +3907,11 @@ mx::array vsa_block_sparse(
     std::optional<mx::array> gate = std::nullopt,
     mx::StreamOrDevice s = {});
 
+// The identity on x, refusing any shapeless compiled replay. vsa_attention
+// passes q through it first: its graph holds index arrays and shapes built
+// for one packed sequence.
+mx::array vsa_fixed_shapes(const mx::array& x, mx::StreamOrDevice s = {});
+
 // VSA block-sparse attention primitive (see vsa_block_sparse).
 // Inference-only.
 class KQuantVSABlockSparse : public mx::Primitive {

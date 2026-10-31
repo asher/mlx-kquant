@@ -8,9 +8,14 @@ fastvideo/mlx_runtime/minimax_h3_vsa_nax.py):
   from the kernel source of that file
 - the dispatch geometry of src/kquant_vsa.cpp from its Python wrapper
 
-The changes are listed at the top of kq_vsa_nax.h. FastVideo's kernel is
-itself adapted from MLX's steel_attention_nax.h; that file carries MLX's MIT
-notice, kept on kq_vsa_nax.h (see also mlx-LICENSE). FastVideo is
+The whole attention call (vsa_attention, mlx_kquant/vsa.py) follows
+h3_vsa_attention in fastvideo/mlx_runtime/minimax_h3_vsa.py, and its routing
+(compute_topk, region_sparsities, _region_plan and
+_block_indices_from_scores) is copied from that file and reformatted.
+
+The changes to the kernel are listed at the top of kq_vsa_nax.h. FastVideo's
+kernel is itself adapted from MLX's steel_attention_nax.h; that file carries
+MLX's MIT notice, kept on kq_vsa_nax.h (see also mlx-LICENSE). FastVideo is
 distributed under the Apache License, Version 2.0, reproduced below.
 
 ---------------------------------------------------------------------------

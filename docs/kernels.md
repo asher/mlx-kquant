@@ -1414,6 +1414,15 @@ into a packed layout first.
   it. Prefix and pad rows of the output are zero. A function compiled with `shapeless=True` raises a
   `ValueError` that names `vsa_block_sparse` when it is called at input shapes other than those of
   its trace. Compile such a function with fixed shapes.
+- `vsa_attention`: MiniMax-H3 video sparse attention over one packed sequence, from the packed q, k,
+  v and gate to the packed output, equal bit for bit to FastVideo's `h3_vsa_attention` with
+  `impl="nax"` in exempt mode. The prefix query rows attend every key through MLX's fused attention.
+  The video query tiles attend the prefix tiles and their top-k video tiles by pooled score through
+  `vsa_block_sparse`, which adds the gate term in its epilogue. The pooling, the scores, the routing
+  and the gate term of the prefix tiles are MLX ops in FastVideo's order. The caller builds the tile
+  map (`VSAGeometry`) and projects the gate. More than one video region (Ref2VA) and compete mode
+  raise. A function compiled with `shapeless=True` cannot hold the call: it raises a `ValueError`
+  that names `vsa_attention`. Compile such a function with fixed shapes.
 - **`sdpa_fa_verify`** - speculative-verify attention on the matrix units for a GQA-folded query tile.
   Head dims 64 through 512; `return_lse` as above. On NAX GPUs, at head dims 128 and 256 with up to
   64 folded rows on plain K and V, the key pass runs on the tensor-op units: each 16-row strip of
