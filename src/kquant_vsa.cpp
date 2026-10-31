@@ -1,6 +1,7 @@
 // MiniMax-H3 VSA block-sparse attention (see kq_vsa_nax.h for the kernel,
 // ported from FastVideo). GPU only, on tensor-op (NAX) hardware; the op
 // refuses a CPU stream and any other GPU when the call is built.
+// FastVideo is Apache-2.0: see mlx_kquant/licenses/FastVideo-LICENSE.
 #include <cmath>
 #include <cstdint>
 #include <limits>
