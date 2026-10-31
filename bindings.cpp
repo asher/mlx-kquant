@@ -603,6 +603,55 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "vsa_block_sparse",
+      &mlx_kquant::vsa_block_sparse,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "block_idx"_a,
+      "block_num"_a,
+      "variable_block_sizes"_a,
+      "num_prefix_tiles"_a,
+      "scale"_a,
+      nb::kw_only(),
+      "tile_size"_a = 64,
+      "query_rows"_a = 32,
+      "stream"_a = nb::none(),
+      R"(
+        Block-sparse attention of MiniMax-H3 video sparse attention (VSA)
+        on the tensor-op units. Each video query tile attends only the key
+        tiles its routing lists, and of each only the live rows, with no
+        gathered copy of K and V and no dense mask. The kernel is ported
+        from FastVideo's NAX VSA kernel and returns the bits of MLX's fused
+        attention over the gathered key tiles with the dead rows masked.
+        Needs a NAX GPU (M5 and later). A CPU stream or another GPU raises.
+
+        Args:
+            q (array): tiled queries [S_pad, heads, 128], bfloat16, with
+                S_pad = len(variable_block_sizes) * tile_size.
+            k (array): tiled keys, the shape and dtype of q.
+            v (array): tiled values, the shape and dtype of q.
+            block_idx (array): integer [heads, video tiles, k], the key
+                tile indices each video query tile reads, prefix tiles
+                included. An index outside [0, tiles) is skipped.
+            block_num (array): integer [heads, video tiles], how many
+                entries of each block_idx list are live (clamped to k).
+            variable_block_sizes (array): integer [tiles], the live rows
+                of each tile, at most tile_size. The pad slots after them
+                are never read.
+            num_prefix_tiles (int): the leading tiles that are the dense
+                prefix. Their query rows are not computed here.
+            scale (float): query scale (typically 1/sqrt(128)).
+            tile_size (int): rows per tile, 64.
+            query_rows (int): query rows per threadgroup, 16, 32 or 64.
+
+        Returns:
+            array: [S_pad, heads, 128] bfloat16. The live rows of the video
+            query tiles hold the attention output. Prefix rows, pad rows
+            and the rows of a tile with no live key tile are zero.
+      )");
+
+  m.def(
       "sdpa_fa_verify",
       [](mx::array q,
          mx::array k,

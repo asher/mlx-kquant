@@ -124,6 +124,7 @@ from ._ext import (  # noqa: F401
     shexp_mix_slot_parallel,
     skinny_matmul,
     verify_zero_copy_views,
+    vsa_block_sparse,
     zero_copy_view_count,
 )
 from ._version import __version__
@@ -247,5 +248,6 @@ __all__ = [
     "shared_event_set",
     "shared_event_wait",
     "verify_zero_copy_views",
+    "vsa_block_sparse",
     "zero_copy_view_count",
 ]

@@ -496,6 +496,9 @@ mlx-kquant builds on the following projects; their license texts ship in the whe
 - **[omlx](https://github.com/jundot/omlx)** (Apache-2.0) - the DeepSeek-V4-Flash DSA kernels
   (`dsa_sparse_attention`, `dsa_indexer_scores`, `dsa_topk_indices`) are ported, with modifications,
   from omlx's `glm_moe_dsa` custom kernels (Copyright OpenAI / Apple Inc., per file).
+- [FastVideo](https://github.com/hao-ai-lab/FastVideo) (Apache-2.0): the MiniMax-H3 video sparse
+  attention kernel (`vsa_block_sparse`) is ported, with modifications, from FastVideo's NAX VSA
+  kernel, which adapts MLX's NAX attention kernel.
 - **[beellama.cpp](https://github.com/Anbeeld/beellama.cpp)** (MIT) - the KVarN KV-cache quantizer
   (`kvarn_quantize` / `kvarn_dequant`, `kvarn_rotate`) and the record layout the `*_kvarn` attention
   kernels read are ported to Metal from its `kvarn` implementation, and the parity fixtures are

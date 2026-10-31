@@ -3879,4 +3879,64 @@ class KQSdpaSparsePrefill : public mx::Primitive {
   bool packed_;
 };
 
+// MiniMax-H3 video sparse attention (VSA), the block-sparse part. q, k, v
+// [S_pad, heads, 128] bfloat16 are the tiled sequence, S_pad =
+// len(variable_block_sizes) * tile_size. Tile t holds
+// variable_block_sizes[t] live rows, then pad slots, and the first
+// num_prefix_tiles tiles are the dense prefix. Video query tile j of head h
+// attends the live rows of the first block_num[h, j] key tiles listed in
+// block_idx[h, j], skipping an index outside [0, tiles). Returns
+// [S_pad, heads, 128] with the live video query rows filled and every other
+// row zero. Tile size 64. GPU only, on NAX hardware (nax_available()).
+mx::array vsa_block_sparse(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    mx::array block_idx,
+    mx::array block_num,
+    mx::array variable_block_sizes,
+    int num_prefix_tiles,
+    float scale,
+    int tile_size = 64,
+    int query_rows = 32,
+    mx::StreamOrDevice s = {});
+
+// VSA block-sparse attention primitive (see vsa_block_sparse).
+// Inference-only.
+class KQuantVSABlockSparse : public mx::Primitive {
+ public:
+  KQuantVSABlockSparse(
+      mx::Stream stream,
+      int n_prefix,
+      int tile,
+      int query_rows,
+      float scale)
+      : mx::Primitive(stream),
+        n_prefix_(n_prefix),
+        tile_(tile),
+        query_rows_(query_rows),
+        scale_(scale) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantVSABlockSparse";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int n_prefix_;
+  int tile_;
+  int query_rows_;
+  float scale_;
+};
+
 } // namespace mlx_kquant
