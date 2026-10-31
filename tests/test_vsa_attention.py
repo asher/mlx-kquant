@@ -45,7 +45,7 @@ PREFIX = (56, 74)
 GRID = (5, 8, 10)
 
 
-def _geometry(*segments):
+def _fields(*segments):
     """The tile map of a packed sequence, as FastVideo builds it from its
     segments in packed order: the rows of the dense segments (ints) in
     64-row tiles, the last tile of each segment short, then the 4x4x4 tiles
@@ -77,7 +77,7 @@ def _geometry(*segments):
     prefix_length = len(dense_rows)
     prefix_gather = np.full(n_prefix * TILE, prefix_length, dtype=np.int32)
     prefix_gather[untile[dense_rows]] = np.arange(prefix_length)
-    return kq.VSAGeometry(
+    return dict(
         variable_block_sizes=mx.array([len(r) for r in rows_of], dtype=mx.int32),
         num_prefix_tiles=n_prefix,
         prefix_length=prefix_length,
@@ -85,6 +85,10 @@ def _geometry(*segments):
         prefix_gather_index=mx.array(prefix_gather),
         untile_index=mx.array(untile),
     )
+
+
+def _geometry(*segments):
+    return kq.VSAGeometry(**_fields(*segments))
 
 
 def _packed(rng, seq, heads, n=4):
@@ -218,11 +222,10 @@ def test_guard_refuses(name):
     _guard(match, **change)
 
 
-# Geometry guards, checked when the geometry is built. Each input fails only
-# the named check: a builder that cuts one empty tile too many or counts a
-# full tile as 65 rows, an index map one tile off, the pad values of the two
-# gathers swapped, the prefix fields off, and dense rows that follow the
-# video region.
+# Geometry guards, checked when the geometry is built, in the order of the
+# checks. Each input fails only the named check, so with that check removed
+# the geometry builds. The tile input, a 64-row map relabelled as 128-row
+# tiles, cannot avoid failing the map checks after it as well.
 
 
 def _swap_pad(index, old, new):
@@ -240,19 +243,49 @@ def _append(index, value, n):
     return mx.concatenate([index, mx.full((n,), value, dtype=index.dtype)])
 
 
+def _row_in_a_pad_slot(g):
+    """The last live row of the first short video tile moved into that
+    tile's first pad slot, tile_gather_index moved with it."""
+    vbs = np.array(g.variable_block_sizes)
+    untile, gather = np.array(g.untile_index), np.array(g.tile_gather_index)
+    t = g.num_prefix_tiles + int(np.argmax(vbs[g.num_prefix_tiles :] < TILE))
+    live, pad = t * TILE + vbs[t] - 1, t * TILE + vbs[t]
+    row = gather[live]
+    untile[row], gather[pad], gather[live] = pad, row, untile.shape[0]
+    return dataclasses.replace(
+        g, untile_index=mx.array(untile), tile_gather_index=mx.array(gather)
+    )
+
+
+def _dense_after_video(g):
+    """Dense rows after the video region, each prefix tile slot holding its
+    packed row."""
+    f = _fields(20, (4, 8, 8), 13)
+    head = f["tile_gather_index"][: f["num_prefix_tiles"] * TILE]
+    rows = f["untile_index"].shape[0]
+    f["prefix_gather_index"] = _swap_pad(head, rows, f["prefix_length"])
+    return kq.VSAGeometry(**f)
+
+
+def _seq(g):
+    return g.untile_index.shape[0]
+
+
 GEOMETRY_GUARDS = {
     "tile": ("tile size 64", _replace(tile_size=lambda g: 128)),
     "regions": (
         "more than one video region",
         _replace(video_tile_spans=lambda g: ((3, 9), (9, 15))),
     ),
+    "span": (
+        "video_tile_spans must be",
+        _replace(video_tile_spans=lambda g: ((0, g.variable_block_sizes.shape[0]),)),
+    ),
     "empty_tile": (
         "variable_block_sizes must be",
         _replace(
             variable_block_sizes=lambda g: _append(g.variable_block_sizes, 0, 1),
-            tile_gather_index=lambda g: _append(
-                g.tile_gather_index, g.untile_index.shape[0], TILE
-            ),
+            tile_gather_index=lambda g: _append(g.tile_gather_index, _seq(g), TILE),
         ),
     ),
     "oversized_tile": (
@@ -263,15 +296,12 @@ GEOMETRY_GUARDS = {
             )
         ),
     ),
-    "untile": (
-        "untile_index must",
-        _replace(untile_index=lambda g: g.untile_index + TILE),
-    ),
+    "untile": ("untile_index must", _row_in_a_pad_slot),
     "tile_gather_pad": (
         "tile_gather_index must",
         _replace(
             tile_gather_index=lambda g: _swap_pad(
-                g.tile_gather_index, g.untile_index.shape[0], g.prefix_length
+                g.tile_gather_index, _seq(g), g.prefix_length
             )
         ),
     ),
@@ -279,23 +309,32 @@ GEOMETRY_GUARDS = {
         "tile_gather_index must",
         _replace(tile_gather_index=lambda g: g.tile_gather_index[:-TILE]),
     ),
-    "dense_after_video": (
-        "dense rows must come before",
-        lambda g: _geometry(20, (4, 8, 8), 13),
-    ),
+    "dense_after_video": ("dense rows must come before", _dense_after_video),
     "prefix_tiles": (
         "disagree",
-        _replace(num_prefix_tiles=lambda g: g.num_prefix_tiles - 1),
+        _replace(
+            num_prefix_tiles=lambda g: g.num_prefix_tiles - 1,
+            prefix_gather_index=lambda g: _swap_pad(
+                g.tile_gather_index[: (g.num_prefix_tiles - 1) * TILE],
+                _seq(g),
+                g.prefix_length,
+            ),
+        ),
     ),
     "prefix_length": (
         "disagree",
-        _replace(prefix_length=lambda g: g.prefix_length - 10),
+        _replace(
+            prefix_length=lambda g: g.prefix_length - 10,
+            prefix_gather_index=lambda g: _swap_pad(
+                g.prefix_gather_index, g.prefix_length, g.prefix_length - 10
+            ),
+        ),
     ),
     "prefix_gather_pad": (
         "prefix_gather_index must",
         _replace(
             prefix_gather_index=lambda g: _swap_pad(
-                g.prefix_gather_index, g.prefix_length, g.untile_index.shape[0]
+                g.prefix_gather_index, g.prefix_length, _seq(g)
             )
         ),
     ),
@@ -312,6 +351,21 @@ def test_geometry_guard_refuses(name):
     g = _geometry(*PREFIX, GRID)
     with pytest.raises(ValueError, match=match):
         build(g)
+
+
+# A caller can build the untile map with argsort, which returns uint32: the
+# geometry takes it and the call gives the bits of the int32 map.
+@pytest.mark.parametrize("sparsity", [0.0, pytest.param(0.8, marks=requires_nax)])
+def test_untile_index_from_argsort_gives_the_same_bits(sparsity):
+    rng = np.random.default_rng(29)
+    g = _geometry(*PREFIX, GRID)
+    sorted_slots = mx.argsort(g.tile_gather_index)[: _seq(g)]
+    assert sorted_slots.dtype == mx.uint32
+    g_sorted = dataclasses.replace(g, untile_index=sorted_slots)
+    q, k, v, gate = _packed(rng, _seq(g), 2)
+    out = kq.vsa_attention(q, k, v, g_sorted, sparsity, gate=gate)
+    ref = kq.vsa_attention(q, k, v, g, sparsity, gate=gate)
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
 
 
 # A compiled function holds the geometry it traced. A fixed-shape compile
