@@ -6,6 +6,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `vsa_block_sparse`, the block-sparse attention of MiniMax-H3 video sparse attention on M5 and later
+  GPUs, ported from FastVideo. At sparsity 0.8 it runs 2.7x to 4.5x faster than dense attention.
+
 ## [0.5.8]
 
 ### Added
