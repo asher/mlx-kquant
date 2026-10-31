@@ -259,7 +259,8 @@ def test_strided_view_and_query_rows_give_the_same_bits():
 
 # The gate term against MLX's unfused ops in FastVideo's order: the coarse
 # output of each tile times the tiled gate in float32, rounded to bfloat16,
-# then added to the bfloat16 attention output.
+# then added to the bfloat16 attention output. One video tile of one head
+# has no key tile, so it holds the gate term alone.
 @requires_nax
 @pytest.mark.parametrize("query_rows", [16, 32, 64])
 def test_gate_term_matches_the_unfused_ops(query_rows):
@@ -269,6 +270,7 @@ def test_gate_term_matches_the_unfused_ops(query_rows):
     q, k, v, gate = (_tiled(rng, vbs, heads) for _ in range(4))
     idx = _routing(rng, heads, n_prefix, len(VIDEO), 3)
     num = np.full(idx.shape[:2], idx.shape[2], dtype=np.int32)
+    num[1, 4] = 0
     coarse = mx.array(rng.standard_normal((heads, n, D)).astype(np.float32))
     kw = {"query_rows": query_rows}
     out = _call(q, k, v, idx, num, vbs, n_prefix, coarse=coarse, gate=gate, **kw)
