@@ -132,12 +132,6 @@ mx::array vsa_block_sparse(
     throw std::invalid_argument(
         kVsaOp + "runs on the GPU only; the stream is on the CPU.");
   }
-  if (!nax_available()) {
-    throw std::runtime_error(
-        kVsaOp +
-        "requires a GPU with tensor-op (NAX) units, M5 or later; check "
-        "nax_available().");
-  }
   if (q.ndim() != 3 || q.shape(1) < 1 || k.shape() != q.shape() ||
       v.shape() != q.shape()) {
     throw std::invalid_argument(
@@ -201,6 +195,14 @@ mx::array vsa_block_sparse(
       heads > std::numeric_limits<int>::max() / (32 * kVsaHeadDim) ||
       q.nbytes() / 16 > std::numeric_limits<uint32_t>::max()) {
     throw std::invalid_argument(kVsaOp + "q or block_idx is too large.");
+  }
+  // Checked after the arguments, so the argument checks also run on GPUs
+  // without NAX.
+  if (!nax_available()) {
+    throw std::runtime_error(
+        kVsaOp +
+        "requires a GPU with tensor-op (NAX) units, M5 or later; check "
+        "nax_available().");
   }
   if (n_video == 0 || block_idx.shape(2) == 0) {
     return mx::zeros(q.shape(), q.dtype(), s);

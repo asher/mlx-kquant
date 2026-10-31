@@ -327,7 +327,6 @@ GUARDS = {
 }
 
 
-@requires_nax
 @pytest.mark.parametrize("name", sorted(GUARDS))
 def test_guard_refuses(name):
     match, change = GUARDS[name]
@@ -335,13 +334,11 @@ def test_guard_refuses(name):
     _guard(match, **change(q, idx, num, vbs))
 
 
-@requires_nax
 def test_guard_refuses_a_cpu_stream():
     with mx.stream(mx.cpu):
         _guard("runs on the GPU only")
 
 
-@requires_nax
 def test_guard_refuses_routing_past_32_bits():
     # Lazy inputs: the guard refuses at build time, nothing is evaluated.
     q, k, v, _, _, vbs, n_prefix = _small()
@@ -353,7 +350,6 @@ def test_guard_refuses_routing_past_32_bits():
 
 # 2**16 tiles of 512 heads pass 2**32 zero-fill words, and 2**19 heads pass
 # 32-bit row offsets inside a key block.
-@requires_nax
 @pytest.mark.parametrize(
     "n_tiles,heads", [(2**16, 512), (1, 2**19)], ids=["fill_words", "row_offsets"]
 )
