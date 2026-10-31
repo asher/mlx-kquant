@@ -216,9 +216,9 @@ mx::array vsa_block_sparse(
   auto as_i32 = [&](const mx::array& a) {
     return mx::contiguous(mx::astype(a, mx::int32, s), false, s);
   };
-  // Routing wider than int32 is clipped to [lo, hi] before the cast, so a
+  // Integers wider than int32 are clipped to [lo, hi] before the cast, so a
   // value out of range stays out of range instead of wrapping into it.
-  auto routing_i32 = [&](mx::array a, int lo, int hi) {
+  auto clip_i32 = [&](mx::array a, int lo, int hi) {
     if (a.dtype() == mx::int64) {
       a = mx::clip(
           a,
@@ -237,9 +237,9 @@ mx::array vsa_block_sparse(
       mx::contiguous(q, false, s),
       mx::contiguous(k, false, s),
       mx::contiguous(v, false, s),
-      routing_i32(block_idx, -1, n_tiles),
-      routing_i32(block_num, 0, k_max),
-      as_i32(variable_block_sizes)};
+      clip_i32(block_idx, -1, n_tiles),
+      clip_i32(block_num, 0, k_max),
+      clip_i32(variable_block_sizes, 0, tile_size)};
   auto shape = q.shape();
   auto prim = std::make_shared<KQuantVSABlockSparse>(
       s, num_prefix_tiles, tile_size, rows, scale);

@@ -198,8 +198,9 @@ def test_entries_past_block_num_are_not_read():
             assert not got[~live[j]].any()
 
 
-# int64 routing holds values that wrap to live tiles 7 and 3, and a count
-# that wraps to 1, when cast to int32 without the clip.
+# The int64 case holds routing values that wrap to live tiles 7 and 3, a
+# count that wraps to 1 and a full tile's size that wraps to 5, if cast to
+# int32 without the clip.
 @requires_nax
 @pytest.mark.parametrize("dtype", [np.int32, np.int64])
 def test_out_of_range_tile_indices_are_skipped(dtype):
@@ -215,7 +216,11 @@ def test_out_of_range_tile_indices_are_skipped(dtype):
     idx = np.concatenate([good[..., :4].astype(dtype), bad, good[..., 4:]], axis=-1)
     count = 2**32 + 1 if wide else idx.shape[2]
     num = np.full(idx.shape[:2], count, dtype=dtype)
-    out = _call(q, k, v, idx, num, vbs, n_prefix)
+    sizes = vbs.astype(dtype)
+    if wide:
+        assert sizes[n_prefix] == TILE
+        sizes[n_prefix] = 2**32 + 5
+    out = _call(q, k, v, idx, num, sizes, n_prefix)
     _check(out, _reference(q, k, v, good, vbs, n_prefix), vbs, n_prefix)
 
 
