@@ -30,6 +30,28 @@ _TILE = 64
 _HEAD_DIM = 128
 
 
+def _maps_rows_onto_live_slots(untile, live):
+    """untile_index sends each packed row to its own live tile slot, and
+    every live slot gets one row. An entry out of range counts in one of two
+    end bins, so no write leaves the counts."""
+    n = live.shape[0]
+    hits = mx.zeros((n + 2,), dtype=mx.int32).at[mx.clip(untile, -1, n) + 1].add(1)
+    end = mx.zeros((1,), dtype=mx.int32)
+    return mx.array_equal(
+        hits, mx.concatenate([end, live.astype(mx.int32), end])
+    ).item()
+
+
+def _inverts(gather, untile, n_slots):
+    """tile_gather_index holds the packed row of each live slot and S in
+    each pad slot. An entry of untile_index out of range writes one of two
+    end slots, so no write leaves the expected map."""
+    rows = untile.shape[0]
+    want = mx.full((n_slots + 2,), rows, dtype=mx.int32)
+    want[mx.clip(untile, -1, n_slots) + 1] = mx.arange(rows, dtype=mx.int32)
+    return mx.array_equal(gather, want[1:-1]).item()
+
+
 @dataclass(frozen=True, eq=False)
 class VSAGeometry:
     """The tile map of one packed sequence of S rows: the dense prefix rows
@@ -38,6 +60,11 @@ class VSAGeometry:
     The prefix rows are cut into tiles of at most tile_size rows, and the
     video rows into their 3D tiles. Each tile holds its live rows, then pad
     slots.
+
+    Building one checks the index maps against each other on the host, which
+    evaluates them once. It raises ValueError when they disagree, when the
+    dense rows do not come first, for more than one video region (Ref2VA)
+    and for a tile size other than 64. Build it outside a compiled function.
 
     Attributes:
         variable_block_sizes (array): int32 [tiles], the live rows of each
@@ -64,11 +91,51 @@ class VSAGeometry:
     video_tile_spans: tuple[tuple[int, int], ...] = ()
     tile_size: int = _TILE
 
+    def __post_init__(self):
+        tile, n_prefix = self.tile_size, self.num_prefix_tiles
+        if tile != _TILE:
+            raise ValueError(_OP + "only tile size 64 is supported.")
+        if len(self.video_tile_spans) > 1:
+            raise ValueError(
+                _OP + "more than one video region (Ref2VA) is not supported."
+            )
+        vbs, untile = self.variable_block_sizes, self.untile_index
+        if mx.any((vbs < 1) | (vbs > tile)).item():
+            raise ValueError(_OP + "variable_block_sizes must be in [1, 64].")
+        rows = untile.shape[0]
+        live = (mx.arange(tile)[None, :] < vbs[:, None]).reshape(-1)
+        if not _maps_rows_onto_live_slots(untile, live):
+            raise ValueError(
+                _OP + "untile_index must map the packed rows one to one onto the "
+                "live tile slots of variable_block_sizes."
+            )
+        if not _inverts(self.tile_gather_index, untile, live.shape[0]):
+            raise ValueError(
+                _OP + "tile_gather_index must hold the packed row of each live "
+                "slot and S in each pad slot."
+            )
+        in_prefix = (untile // tile < n_prefix).astype(mx.int32)
+        if mx.any(in_prefix[1:] > in_prefix[:-1]).item():
+            raise ValueError(_OP + "the dense rows must come before the video region.")
+        held = mx.sum(in_prefix).item()
+        if held != self.prefix_length:
+            raise ValueError(
+                _OP + f"num_prefix_tiles and prefix_length disagree: the first "
+                f"{n_prefix} tiles hold {held} rows, not {self.prefix_length}."
+            )
+        head = self.tile_gather_index[: n_prefix * tile]
+        want = mx.where(head == rows, self.prefix_length, head)
+        if not mx.array_equal(self.prefix_gather_index, want).item():
+            raise ValueError(
+                _OP + "prefix_gather_index must hold the packed row of each "
+                "prefix tile slot and prefix_length in each pad slot."
+            )
+
 
 # Copied from FastVideo, fastvideo/mlx_runtime/minimax_h3_vsa.py
 # (Apache-2.0): compute_topk, region_sparsities, _region_plan and
-# _block_indices_from_scores, reformatted. vsa_attention refuses compete mode
-# and more than one region before it routes.
+# _block_indices_from_scores, reformatted. VSAGeometry refuses more than one
+# region and vsa_attention refuses compete mode before it routes.
 
 
 def compute_topk(sparsity: float, num_blocks: int) -> int:
@@ -268,10 +335,18 @@ def vsa_attention(
     Returns:
         array: packed [S, heads, 128] bfloat16.
 
-    More than one video region (Ref2VA), compete mode, a tile size other
-    than 64 and a head dim other than 128 raise ValueError. A sparse call
-    needs a NAX GPU (M5 and later), as ``vsa_block_sparse`` does. A function
-    compiled with shapeless=True cannot hold the call: it raises ValueError.
+    Compete mode and a head dim other than 128 raise ValueError. Building
+    the geometry refuses more than one video region (Ref2VA) and a tile size
+    other than 64. A sparse call needs a NAX GPU (M5 and later), as
+    ``vsa_block_sparse`` does. A dense call runs on any Metal GPU.
+
+    The call is for inference only: mx.grad through it raises. A compiled
+    function holds the geometry it traced, and MLX reuses a trace for every
+    call at the same input shapes, so two geometries of one length, such as
+    a landscape and a portrait grid, would share a trace. Compile one
+    function per geometry. A function compiled with shapeless=True would
+    replay the traced geometry at other shapes too, so it cannot hold the
+    call: it raises ValueError.
     """
     arrays = (q, k, v) if gate is None else (q, k, v, gate)
     if (
@@ -283,8 +358,6 @@ def vsa_attention(
             _OP + "q, k, v and gate must be bfloat16 [S, heads, 128] of one shape."
         )
     tile = geometry.tile_size
-    if tile != _TILE:
-        raise ValueError(_OP + "only tile size 64 is supported.")
     rows = geometry.untile_index.shape[0]
     if q.shape[0] != rows:
         raise ValueError(
@@ -292,8 +365,6 @@ def vsa_attention(
         )
     if not exempt:
         raise ValueError(_OP + "compete mode (exempt=False) is not supported.")
-    if len(geometry.video_tile_spans) > 1:
-        raise ValueError(_OP + "more than one video region (Ref2VA) is not supported.")
     q = _vsa_fixed_shapes(q)
     heads, dim = q.shape[1:]
     scale = dim**-0.5
