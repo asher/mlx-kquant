@@ -345,9 +345,13 @@ def test_guard_refuses_routing_past_32_bits():
         kq.vsa_block_sparse(q, k, v, idx, num, vbs, n_prefix, SCALE)
 
 
+# 2**16 tiles of 512 heads pass 2**32 zero-fill words, and 2**19 heads pass
+# 32-bit row offsets inside a key block.
 @requires_nax
-def test_guard_refuses_rows_past_32_bit_words():
-    n_tiles, heads = 2**16, 512
+@pytest.mark.parametrize(
+    "n_tiles,heads", [(2**16, 512), (1, 2**19)], ids=["fill_words", "row_offsets"]
+)
+def test_guard_refuses_rows_past_32_bits(n_tiles, heads):
     big = mx.zeros((n_tiles * TILE, heads, D), dtype=mx.bfloat16)
     vbs = mx.full((n_tiles,), TILE, dtype=mx.int32)
     idx = mx.zeros((heads, n_tiles, 1), dtype=mx.int32)

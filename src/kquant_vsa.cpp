@@ -138,9 +138,11 @@ mx::array vsa_block_sparse(
         "requires a GPU with tensor-op (NAX) units, M5 or later; check "
         "nax_available().");
   }
-  if (q.ndim() != 3 || k.shape() != q.shape() || v.shape() != q.shape()) {
+  if (q.ndim() != 3 || q.shape(1) < 1 || k.shape() != q.shape() ||
+      v.shape() != q.shape()) {
     throw std::invalid_argument(
-        kVsaOp + "q, k and v must share one shape [S_pad, heads, D].");
+        kVsaOp +
+        "q, k and v must share one shape [S_pad, heads, D] with heads >= 1.");
   }
   const int padded = q.shape(0);
   const int heads = q.shape(1);
@@ -192,9 +194,11 @@ mx::array vsa_block_sparse(
     throw std::invalid_argument(
         kVsaOp + "block_idx and block_num must be integer arrays.");
   }
-  // The kernel indexes the routing and the rows with 32 bits, and the zero
-  // fill counts 16-byte words with 32 bits.
+  // The kernel computes routing indices and the row offsets inside a 32-row
+  // key block (up to 32 * heads * 128 elements) in 32 bits, and the zero fill
+  // counts 16-byte words in 32 bits.
   if (block_idx.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+      heads > std::numeric_limits<int>::max() / (32 * kVsaHeadDim) ||
       q.nbytes() / 16 > std::numeric_limits<uint32_t>::max()) {
     throw std::invalid_argument(kVsaOp + "q or block_idx is too large.");
   }
