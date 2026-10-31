@@ -1418,11 +1418,17 @@ into a packed layout first.
   v and gate to the packed output, equal bit for bit to FastVideo's `h3_vsa_attention` with
   `impl="nax"` in exempt mode. The prefix query rows attend every key through MLX's fused attention.
   The video query tiles attend the prefix tiles and their top-k video tiles by pooled score through
-  `vsa_block_sparse`, which adds the gate term in its epilogue. The pooling, the scores, the routing
-  and the gate term of the prefix tiles are MLX ops in FastVideo's order. The caller builds the tile
-  map (`VSAGeometry`) and projects the gate. More than one video region (Ref2VA) and compete mode
-  raise. A function compiled with `shapeless=True` cannot hold the call: it raises a `ValueError`
-  that names `vsa_attention`. Compile such a function with fixed shapes.
+  `vsa_block_sparse`, which adds the gate term in its epilogue, so a sparse call needs the tensor-op
+  units of M5 and later GPUs. A dense call (sparsity 0) runs on any Metal GPU. The pooling, the
+  scores, the routing and the gate term of the prefix tiles are MLX ops in FastVideo's order. The
+  caller builds the tile map (`VSAGeometry`) and projects the gate. Building a `VSAGeometry` checks
+  its index maps against each other on the host, and refuses dense rows after the video region,
+  more than one video region (Ref2VA) and a tile size other than 64. Compete mode raises. The call
+  is for inference only: `mx.grad` through it raises. A compiled function holds the geometry it
+  traced, and MLX reuses a trace for every call at the same input shapes, so two geometries of one
+  length, such as a landscape and a portrait grid, would share a trace. Compile one function per
+  geometry. A function compiled with `shapeless=True` would replay the traced geometry at other
+  shapes too, so it cannot hold the call: it raises a `ValueError` that names `vsa_attention`.
 - **`sdpa_fa_verify`** - speculative-verify attention on the matrix units for a GQA-folded query tile.
   Head dims 64 through 512; `return_lse` as above. On NAX GPUs, at head dims 128 and 256 with up to
   64 folded rows on plain K and V, the key pass runs on the tensor-op units: each 16-row strip of

@@ -42,7 +42,8 @@ bool vsa_int_dtype(mx::Dtype dt) {
 
 // The identity, on the buffer of its input. A shapeless replay calls
 // output_shapes, which refuses, so a shapeless compiled function cannot hold
-// a graph that passes through this node.
+// a graph that passes through this node: it would replay the traced geometry
+// at other shapes.
 class KQuantVSAFixedShapes : public mx::UnaryPrimitive {
  public:
   explicit KQuantVSAFixedShapes(mx::Stream stream)
@@ -65,7 +66,8 @@ class KQuantVSAFixedShapes : public mx::UnaryPrimitive {
   std::vector<mx::Shape> output_shapes(const std::vector<mx::array>&) override {
     throw std::invalid_argument(
         "[mlx_kquant.vsa_attention] A shapeless compiled function cannot hold "
-        "this call. Compile it with fixed shapes.");
+        "this call: it would replay the traced geometry at other shapes. "
+        "Compile one function per geometry, with fixed shapes.");
   }
 };
 

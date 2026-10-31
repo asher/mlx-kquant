@@ -3908,8 +3908,8 @@ mx::array vsa_block_sparse(
     mx::StreamOrDevice s = {});
 
 // The identity on x, refusing any shapeless compiled replay. vsa_attention
-// passes q through it first: its graph holds index arrays and shapes built
-// for one packed sequence.
+// passes q through it first: its graph holds the index arrays of one
+// geometry, which a shapeless replay would reuse at other shapes.
 mx::array vsa_fixed_shapes(const mx::array& x, mx::StreamOrDevice s = {});
 
 // VSA block-sparse attention primitive (see vsa_block_sparse).
