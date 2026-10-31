@@ -197,17 +197,23 @@ def test_entries_past_block_num_are_not_read():
             assert not got[~live[j]].any()
 
 
+# int64 routing holds values that wrap to live tiles 7 and 3, and a count
+# that wraps to 1, when cast to int32 without the clip.
 @requires_nax
-def test_out_of_range_tile_indices_are_skipped():
+@pytest.mark.parametrize("dtype", [np.int32, np.int64])
+def test_out_of_range_tile_indices_are_skipped(dtype):
     rng = np.random.default_rng(7)
     vbs, n_prefix = _sizes((56, 74), VIDEO)
     heads = 3
     q, k, v = (_tiled(rng, vbs, heads) for _ in range(3))
     good = _routing(rng, heads, n_prefix, len(VIDEO), 3)
-    bad = np.full(good.shape[:2] + (2,), [-1, len(vbs)], dtype=np.int32)
+    wide = dtype == np.int64
+    bad = [2**32 + 7, 3 - 2**32] if wide else [-1, len(vbs)]
+    bad = np.full(good.shape[:2] + (2,), bad, dtype=dtype)
     # The bad entries sit inside the live count, between the good ones.
-    idx = np.concatenate([good[..., :4], bad, good[..., 4:]], axis=-1)
-    num = np.full(idx.shape[:2], idx.shape[2], dtype=np.int32)
+    idx = np.concatenate([good[..., :4].astype(dtype), bad, good[..., 4:]], axis=-1)
+    count = 2**32 + 1 if wide else idx.shape[2]
+    num = np.full(idx.shape[:2], count, dtype=dtype)
     out = _call(q, k, v, idx, num, vbs, n_prefix)
     _check(out, _reference(q, k, v, good, vbs, n_prefix), vbs, n_prefix)
 
