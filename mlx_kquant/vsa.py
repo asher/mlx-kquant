@@ -33,9 +33,11 @@ _HEAD_DIM = 128
 def _maps_rows_onto_live_slots(untile, live):
     """untile_index sends each packed row to its own live tile slot, and
     every live slot gets one row. An entry out of range counts in one of two
-    end bins, so no write leaves the counts."""
+    end bins, so no write leaves the counts. The map is read as int64, so an
+    unsigned one clips as its values do."""
     n = live.shape[0]
-    hits = mx.zeros((n + 2,), dtype=mx.int32).at[mx.clip(untile, -1, n) + 1].add(1)
+    bins = mx.clip(untile.astype(mx.int64), -1, n) + 1
+    hits = mx.zeros((n + 2,), dtype=mx.int32).at[bins].add(1)
     end = mx.zeros((1,), dtype=mx.int32)
     return mx.array_equal(
         hits, mx.concatenate([end, live.astype(mx.int32), end])
@@ -48,7 +50,9 @@ def _inverts(gather, untile, n_slots):
     end slots, so no write leaves the expected map."""
     rows = untile.shape[0]
     want = mx.full((n_slots + 2,), rows, dtype=mx.int32)
-    want[mx.clip(untile, -1, n_slots) + 1] = mx.arange(rows, dtype=mx.int32)
+    want[mx.clip(untile.astype(mx.int64), -1, n_slots) + 1] = mx.arange(
+        rows, dtype=mx.int32
+    )
     return mx.array_equal(gather, want[1:-1]).item()
 
 
@@ -78,7 +82,7 @@ class VSAGeometry:
             pad slot.
         untile_index (array): int32 [S], the tile slot of each packed row.
         video_tile_spans (tuple): the [start, end) tiles of each video
-            region. Empty means one region over every video tile.
+            region: empty, or the one region ((num_prefix_tiles, tiles),).
         tile_size (int): rows per tile, 64.
     """
 
@@ -100,6 +104,11 @@ class VSAGeometry:
                 _OP + "more than one video region (Ref2VA) is not supported."
             )
         vbs, untile = self.variable_block_sizes, self.untile_index
+        spans = tuple(tuple(span) for span in self.video_tile_spans)
+        if len(spans) == 1 and spans[0] != (n_prefix, vbs.shape[0]):
+            raise ValueError(
+                _OP + "video_tile_spans must be empty or ((num_prefix_tiles, tiles),)."
+            )
         if mx.any((vbs < 1) | (vbs > tile)).item():
             raise ValueError(_OP + "variable_block_sizes must be in [1, 64].")
         rows = untile.shape[0]
@@ -336,9 +345,11 @@ def vsa_attention(
         array: packed [S, heads, 128] bfloat16.
 
     Compete mode and a head dim other than 128 raise ValueError. Building
-    the geometry refuses more than one video region (Ref2VA) and a tile size
-    other than 64. A sparse call needs a NAX GPU (M5 and later), as
-    ``vsa_block_sparse`` does. A dense call runs on any Metal GPU.
+    the geometry refuses dense rows after the video region, more than one
+    video region (Ref2VA) and a tile size other than 64. Build the geometry
+    outside a compiled function. A sparse call needs a NAX GPU (M5 and
+    later), as ``vsa_block_sparse`` does. A dense call runs on any Metal
+    GPU.
 
     The call is for inference only: mx.grad through it raises. A compiled
     function holds the geometry it traced, and MLX reuses a trace for every
