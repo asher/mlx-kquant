@@ -167,14 +167,15 @@ def test_pad_slots_are_never_read():
 
 @requires_nax
 def test_entries_past_block_num_are_not_read():
-    # Per (head, tile) counts below k with out-of-range garbage after them;
-    # a count of 0 leaves the tile's rows zero.
+    # Per (head, tile) counts below k with out-of-range garbage after them.
+    # A count of 0 leaves the tile's rows zero, and a count past k reads k.
     rng = np.random.default_rng(5)
     vbs, n_prefix = _sizes((56, 74), VIDEO)
     heads, nv = 2, len(VIDEO)
     full = _routing(rng, heads, n_prefix, nv, nv)
     num = rng.integers(1, full.shape[2] + 1, size=full.shape[:2]).astype(np.int32)
     num[1, 4] = 0
+    num[0, 2] = full.shape[2] + 3
     idx = full.copy()
     for h in range(heads):
         for j in range(nv):
@@ -251,8 +252,9 @@ def test_strided_view_and_query_rows_give_the_same_bits():
     np.testing.assert_array_equal(_bits(a), _bits(b))
 
 
-# Host guards. Each input fails one guard, and the match names that guard,
-# so a test stays green only while its own guard refuses the call.
+# Host guards. Each input fails only the named guard, so with that guard
+# removed the call is built and the test fails. The calls are never
+# evaluated: no kernel is compiled or run, and the tests run on any GPU.
 
 
 def _small():
@@ -285,6 +287,38 @@ def _heads(x, n):
     return mx.zeros((x.shape[0], n, x.shape[2]), dtype=x.dtype)
 
 
+def _tile_128(q, idx, num, vbs):
+    # q, k and v hold 128-row tiles, so only the tile size is refused.
+    shape = (vbs.shape[0] * 128, q.shape[1], D)
+    big = {name: mx.zeros(shape, dtype=mx.bfloat16) for name in "qkv"}
+    return {"tile_size": 128, **big}
+
+
+def _one_tile_more(q, idx, num, vbs):
+    # The sizes and the routing agree on one tile more than q holds.
+    return {
+        "variable_block_sizes": mx.concatenate([vbs, vbs[-1:]]),
+        "block_idx": mx.concatenate([idx, idx[:, -1:]], axis=1),
+        "block_num": mx.concatenate([num, num[:, -1:]], axis=1),
+    }
+
+
+def _prefix_minus_one(q, idx, num, vbs):
+    # Routing for the tiles + 1 video tiles that -1 prefix tiles implies.
+    heads, n_video = idx.shape[0], vbs.shape[0] + 1
+    return {
+        "num_prefix_tiles": -1,
+        "block_idx": mx.zeros((heads, n_video, idx.shape[2]), dtype=mx.int32),
+        "block_num": mx.zeros((heads, n_video), dtype=mx.int32),
+    }
+
+
+def _routing_over_all_tiles(q, idx, num, vbs):
+    # block_idx built over every tile instead of the video tiles.
+    shape = (idx.shape[0], vbs.shape[0], idx.shape[2])
+    return {"block_idx": mx.zeros(shape, dtype=mx.int32)}
+
+
 GUARDS = {
     "kv_shape": ("share one shape", lambda q, idx, num, vbs: {"k": _heads(q, 3)}),
     "head_dim": (
@@ -297,25 +331,20 @@ GUARDS = {
         "must be bfloat16",
         lambda q, idx, num, vbs: {name: q.astype(mx.float16) for name in "qkv"},
     ),
-    "tile": ("tile size 64", lambda q, idx, num, vbs: {"tile_size": 128}),
+    "tile": ("tile size 64", _tile_128),
     "query_rows": ("query_rows must be", lambda q, idx, num, vbs: {"query_rows": 8}),
     "scale": ("scale must be finite", lambda q, idx, num, vbs: {"scale": float("inf")}),
     "sizes_dtype": (
         "1-D integer array",
         lambda q, idx, num, vbs: {"variable_block_sizes": vbs.astype(mx.float32)},
     ),
-    "rows": (
-        "tile_size rows",
-        lambda q, idx, num, vbs: {"variable_block_sizes": vbs[1:]},
-    ),
-    "prefix": (
-        "num_prefix_tiles must be",
-        lambda q, idx, num, vbs: {"num_prefix_tiles": -1},
-    ),
+    "rows": ("tile_size rows", _one_tile_more),
+    "prefix": ("num_prefix_tiles must be", _prefix_minus_one),
     "block_idx_shape": (
         "block_idx must be",
         lambda q, idx, num, vbs: {"block_idx": mx.concatenate([idx, idx])},
     ),
+    "block_idx_tiles": ("block_idx must be", _routing_over_all_tiles),
     "block_num_shape": (
         "block_num must be",
         lambda q, idx, num, vbs: {"block_num": mx.concatenate([num, num], axis=1)},
