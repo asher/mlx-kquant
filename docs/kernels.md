@@ -1422,13 +1422,14 @@ into a packed layout first.
   units of M5 and later GPUs. A dense call (sparsity 0) runs on any Metal GPU. The pooling, the
   scores, the routing and the gate term of the prefix tiles are MLX ops in FastVideo's order. The
   caller builds the tile map (`VSAGeometry`) and projects the gate. Building a `VSAGeometry` checks
-  its index maps against each other on the host, and refuses dense rows after the video region,
-  more than one video region (Ref2VA) and a tile size other than 64. Compete mode raises. The call
-  is for inference only: `mx.grad` through it raises. A compiled function holds the geometry it
-  traced, and MLX reuses a trace for every call at the same input shapes, so two geometries of one
-  length, such as a landscape and a portrait grid, would share a trace. Compile one function per
-  geometry. A function compiled with `shapeless=True` would replay the traced geometry at other
-  shapes too, so it cannot hold the call: it raises a `ValueError` that names `vsa_attention`.
+  its index maps against each other on the host, and refuses dense rows after the video region, more
+  than one video region (Ref2VA) and a tile size other than 64. Build the geometry outside a
+  compiled function. Compete mode raises. The call is for inference only: `mx.grad` through it
+  raises. A compiled function holds the geometry it traced, and MLX reuses a trace for every call at
+  the same input shapes, so two geometries of one length, such as a landscape and a portrait grid,
+  would share a trace. Compile one function per geometry. A function compiled with `shapeless=True`
+  would replay the traced geometry at other shapes too, so it cannot hold the call: it raises a
+  `ValueError` that names `vsa_attention`.
 - **`sdpa_fa_verify`** - speculative-verify attention on the matrix units for a GQA-folded query tile.
   Head dims 64 through 512; `return_lse` as above. On NAX GPUs, at head dims 128 and 256 with up to
   64 folded rows on plain K and V, the key pass runs on the tensor-op units: each 16-row strip of
