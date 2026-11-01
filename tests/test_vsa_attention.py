@@ -508,6 +508,7 @@ def test_guard_refuses_a_shapeless_compile():
 # MLX reads MLX_ENABLE_TF32 once a process, so these run in a child process.
 _CHILD = r"""
 import json
+import os
 import sys
 
 spec = json.loads(sys.argv[1])
@@ -533,7 +534,11 @@ def same(a, b):
 
 
 out = {}
-if spec["mode"] == "compiled_first":
+if spec["mode"] == "geometry_then_off":
+    os.environ["MLX_ENABLE_TF32"] = "0"
+    out["exact"] = not t._tf32_device()
+elif spec["mode"] == "compiled_first":
+    out["measured"] = sorted(vsa._F32_EXACT)
     for s in calls:
         got = mx.compile(lambda *a, s=s: attend(*a, s))(q, k, v, gate)
         out[str(s)] = same(got, attend(q, k, v, gate, s))
@@ -567,8 +572,17 @@ def test_tf32_off_keeps_the_direct_product():
     assert out == {"0.0": True, **({"0.8": True} if NAX else {})}
 
 
-# A process whose first call is compiled: building the geometry measured the
-# devices on the host, so the traced call only reads the result.
-def test_a_compiled_first_call_reads_the_device_measured_on_the_host():
+# Building a geometry runs no product, so MLX reads MLX_ENABLE_TF32 at a
+# later product, and a caller can still turn TF32 off after it.
+def test_building_a_geometry_leaves_the_tf32_switch_unread():
+    if not _tf32_device():
+        pytest.skip("the GPU multiplies float32 at float32.")
+    assert _child("geometry_then_off") == {"exact": True}
+
+
+# A process whose first call is compiled measures the device inside the
+# trace: the probe reads only constants, which MLX evaluates there.
+def test_a_compiled_first_call_measures_the_device_inside_the_trace():
     out = _child("compiled_first")
+    assert out.pop("measured") == []
     assert out == {"0.0": True, **({"0.8": True} if NAX else {})}

@@ -74,8 +74,9 @@ def _f32_products_exact(device=None):
     """Whether device (the default device) multiplies float32 matrices at
     float32 precision. MLX multiplies them at TF32 on M5 and later GPUs
     unless MLX_ENABLE_TF32=0 is set before the first product of the process,
-    and it reads the switch once. Each device is measured once, one 64x64
-    product against the CPU's."""
+    and it reads the switch once. Each device is measured at its first use,
+    once, one 64x64 product against the CPU's. The product reads only
+    constants, so a first use inside an mx.compile trace evaluates it there."""
     device = mx.default_device() if device is None else device
     key = str(device)
     hit = _F32_EXACT.get(key)
@@ -85,14 +86,6 @@ def _f32_products_exact(device=None):
         gap = mx.abs(mx.matmul(a, b, stream=device) - mx.matmul(a, b, stream=mx.cpu))
         hit = _F32_EXACT[key] = mx.max(gap).item() < 1e-3
     return hit
-
-
-def _measure_devices():
-    """Measure each device for _f32_products_exact on the host, so a call
-    traced by mx.compile only reads the result."""
-    _f32_products_exact(mx.Device(mx.cpu))
-    if mx.metal.is_available():
-        _f32_products_exact(mx.Device(mx.gpu))
 
 
 def _split(a):
@@ -128,9 +121,7 @@ class VSAGeometry:
     Building one checks the index maps against each other on the host, which
     evaluates them once. It raises ValueError when they disagree, when the
     dense rows do not come first, for more than one video region (Ref2VA)
-    and for a tile size other than 64. It also measures, once a process,
-    whether each device multiplies float32 at TF32, which picks the score
-    product of vsa_attention. Build it outside a compiled function.
+    and for a tile size other than 64. Build it outside a compiled function.
 
     Attributes:
         variable_block_sizes (array): integer [tiles], the live rows of
@@ -201,7 +192,6 @@ class VSAGeometry:
                 _OP + "prefix_gather_index must hold the packed row of each "
                 "prefix tile slot and prefix_length in each pad slot."
             )
-        _measure_devices()
 
 
 # Copied from FastVideo, fastvideo/mlx_runtime/minimax_h3_vsa.py
