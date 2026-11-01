@@ -2,12 +2,21 @@
 """MiniMax-H3 video sparse attention (VSA), the whole attention call.
 
 ``vsa_attention`` computes FastVideo's ``h3_vsa_attention`` with
-``impl="nax"``, in exempt mode over one video region, bit for bit: the
-packed q, k, v and gate in, the packed output out. The prefix query rows
-attend every key through MLX's fused attention. The video query tiles attend
-their routed key tiles through ``vsa_block_sparse``, which adds the gate term
-in its epilogue. The pooling, the scores, the routing and the gate term of
-the prefix tiles are MLX ops in FastVideo's order.
+``impl="nax"``, in exempt mode over one video region: the packed q, k, v and
+gate in, the packed output out. The prefix query rows attend every key
+through MLX's fused attention. The video query tiles attend their routed key
+tiles through ``vsa_block_sparse``, which adds the gate term in its
+epilogue. The pooling, the scores, the routing and the gate term of the
+prefix tiles are MLX ops in FastVideo's order.
+
+The routing scores, pooled q against pooled k, are float32 products, as in
+FastVideo's PyTorch backend, which defines the trained routing. MLX
+multiplies float32 at TF32 on M5 and later GPUs unless MLX_ENABLE_TF32=0.
+There each operand is split into the part a TF32 product reads exactly and
+the rest, and the scores are the sum of three products of the parts. Where
+the GPU multiplies float32 at float32, the call equals FastVideo's MLX call
+bit for bit. Where it multiplies at TF32, FastVideo's MLX call scores at
+TF32 and can route a few rows differently.
 
 Ported from FastVideo (https://github.com/hao-ai-lab/FastVideo),
 fastvideo/mlx_runtime/minimax_h3_vsa.py, licensed under the Apache License,
@@ -56,6 +65,57 @@ def _inverts(gather, untile, n_slots):
     return mx.array_equal(gather, want[1:-1]).item()
 
 
+# A TF32 operand keeps the high 10 of the 23 mantissa bits of a float32.
+_TF32_HIGH = 0xFFFFE000
+_F32_EXACT: dict[str, bool] = {}
+
+
+def _f32_products_exact(device=None):
+    """Whether device (the default device) multiplies float32 matrices at
+    float32 precision. MLX multiplies them at TF32 on M5 and later GPUs
+    unless MLX_ENABLE_TF32=0 is set before the first product of the process,
+    and it reads the switch once. Each device is measured once, one 64x64
+    product against the CPU's."""
+    device = mx.default_device() if device is None else device
+    key = str(device)
+    hit = _F32_EXACT.get(key)
+    if hit is None:
+        a = mx.random.normal((64, 64), key=mx.random.key(0))
+        b = mx.random.normal((64, 64), key=mx.random.key(1))
+        gap = mx.abs(mx.matmul(a, b, stream=device) - mx.matmul(a, b, stream=mx.cpu))
+        hit = _F32_EXACT[key] = mx.max(gap).item() < 1e-3
+    return hit
+
+
+def _measure_devices():
+    """Measure each device for _f32_products_exact on the host, so a call
+    traced by mx.compile only reads the result."""
+    _f32_products_exact(mx.Device(mx.cpu))
+    if mx.metal.is_available():
+        _f32_products_exact(mx.Device(mx.gpu))
+
+
+def _split(a):
+    """float32 a as the part a TF32 product reads exactly, the low 13
+    mantissa bits cleared, and the rest, which float32 holds exactly."""
+    high = mx.bitwise_and(mx.view(a, mx.uint32), mx.array(_TF32_HIGH, mx.uint32))
+    high = mx.view(high, mx.float32)
+    return high, a - high
+
+
+def _scores(q_pooled, k_pooled):
+    """The routing scores, pooled q against pooled k over the square root of
+    the head dim, at float32 precision. Where the device multiplies float32
+    at TF32, the product is qh @ kh.T + (qh @ kl.T + ql @ kh.T) of the split
+    operands, k transposed after its split, in that order."""
+    scale = q_pooled.shape[-1] ** 0.5
+    if _f32_products_exact():
+        return (q_pooled @ k_pooled.transpose(0, 2, 1)) / scale
+    qh, ql = _split(q_pooled)
+    kh, kl = (x.transpose(0, 2, 1) for x in _split(k_pooled))
+    return (qh @ kh + (qh @ kl + ql @ kh)) / scale
+
+
 @dataclass(frozen=True, eq=False)
 class VSAGeometry:
     """The tile map of one packed sequence of S rows: the dense prefix rows
@@ -68,7 +128,9 @@ class VSAGeometry:
     Building one checks the index maps against each other on the host, which
     evaluates them once. It raises ValueError when they disagree, when the
     dense rows do not come first, for more than one video region (Ref2VA)
-    and for a tile size other than 64. Build it outside a compiled function.
+    and for a tile size other than 64. It also measures, once a process,
+    whether each device multiplies float32 at TF32, which picks the score
+    product of vsa_attention. Build it outside a compiled function.
 
     Attributes:
         variable_block_sizes (array): integer [tiles], the live rows of
@@ -139,6 +201,7 @@ class VSAGeometry:
                 _OP + "prefix_gather_index must hold the packed row of each "
                 "prefix tile slot and prefix_length in each pad slot."
             )
+        _measure_devices()
 
 
 # Copied from FastVideo, fastvideo/mlx_runtime/minimax_h3_vsa.py
@@ -321,8 +384,10 @@ def vsa_attention(
 ) -> mx.array:
     """MiniMax-H3 video sparse attention over one packed sequence.
 
-    The result equals FastVideo's ``h3_vsa_attention`` with ``impl="nax"``
-    in exempt mode, bit for bit. Each video query tile attends every prefix
+    The result is FastVideo's ``h3_vsa_attention`` with ``impl="nax"`` in
+    exempt mode, with the routing scores at float32 precision on every
+    device. Where the GPU multiplies float32 at float32 it equals
+    FastVideo's call bit for bit. Each video query tile attends every prefix
     tile and its top-k video tiles by pooled score, through
     ``vsa_block_sparse``. The prefix query rows attend every key. With a
     gate, each row also adds the pooled-compression term. At sparsity 0 the
@@ -388,7 +453,7 @@ def vsa_attention(
     q_tiled, k_tiled, v_tiled = (_tile(x, geometry) for x in (q, k, v))
     q_pooled = _pool(q_tiled, vbs, tile)
     k_pooled = _pool(k_tiled, vbs, tile)
-    scores = (q_pooled @ k_pooled.transpose(0, 2, 1)) / (dim**0.5)
+    scores = _scores(q_pooled, k_pooled)
     coarse = gate_tiled = None
     if gate is not None:
         gate_tiled = _tile(gate, geometry)

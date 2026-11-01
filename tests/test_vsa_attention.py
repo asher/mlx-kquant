@@ -2,7 +2,9 @@
 against its parts in FastVideo's order: MLX's fused attention for the prefix
 query rows (every row at sparsity 0), vsa_block_sparse for the video query
 rows, then the gate term per row, the coarse output of the row's tile times
-the gate in float32, rounded to bfloat16 and added.
+the gate in float32, rounded to bfloat16 and added. The routing scores, pooled
+q against pooled k, are float32 products on every device: where the GPU
+multiplies float32 at TF32, the sum of three products of TF32-exact parts.
 
 The module skips under KQUANT_FORCE_CPU and without Metal. The sparse calls
 need tensor-op (NAX) hardware, and the dense call and the guards run on any
@@ -12,7 +14,10 @@ Metal GPU.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
+import subprocess
+import sys
 
 import mlx.core as mx
 import numpy as np
@@ -110,8 +115,44 @@ def _dense(q, k, v):
     return out[0].transpose(1, 0, 2)
 
 
-def _parts(q, k, v, gate, g, sparsity):
-    """The packed output from its parts, and the routing of a sparse call."""
+_TF32_HIGH = np.uint32(0xFFFFE000)
+_TF32 = []
+
+
+def _tf32_device():
+    """Whether the GPU multiplies float32 matrices at TF32: one 64x64
+    product against the CPU's."""
+    if not _TF32:
+        rng = np.random.default_rng(31)
+        a, b = (mx.array(rng.standard_normal((64, 64)), mx.float32) for _ in "ab")
+        gap = mx.abs(mx.matmul(a, b, stream=mx.gpu) - mx.matmul(a, b, stream=mx.cpu))
+        _TF32.append(mx.max(gap).item() >= 1e-3)
+    return _TF32[0]
+
+
+def _split_np(x):
+    """float32 x as its TF32-exact part, the low 13 mantissa bits cleared,
+    and the rest."""
+    x = np.asarray(x, dtype=np.float32)
+    high = (x.view(np.uint32) & _TF32_HIGH).view(np.float32)
+    return high, x - high
+
+
+def _routing_scores(q_pooled, k_pooled, split):
+    """Pooled q against pooled k over sqrt(D). With split, as on a GPU that
+    multiplies float32 at TF32: qh @ kh.T + (qh @ kl.T + ql @ kh.T)."""
+    if not split:
+        return (q_pooled @ k_pooled.transpose(0, 2, 1)) / D**0.5
+    qh, ql = (mx.array(x) for x in _split_np(q_pooled))
+    kh, kl = (mx.array(x).transpose(0, 2, 1) for x in _split_np(k_pooled))
+    return (qh @ kh + (qh @ kl + ql @ kh)) / D**0.5
+
+
+def _parts(q, k, v, gate, g, sparsity, split=None):
+    """The packed output from its parts, and the routing of a sparse call.
+    The scores are split where the GPU multiplies float32 at TF32, unless
+    split says otherwise."""
+    split = _tf32_device() if split is None else split
     heads = q.shape[1]
     n_tiles, n_prefix = g.variable_block_sizes.shape[0], g.num_prefix_tiles
     untile = np.array(g.untile_index)
@@ -126,7 +167,7 @@ def _parts(q, k, v, gate, g, sparsity):
         return x.transpose(1, 0, 2)
 
     qt, kt, vt = (tiled(x) for x in (q, k, v))
-    scores = (pooled(qt) @ pooled(kt).transpose(0, 2, 1)) / D**0.5
+    scores = _routing_scores(pooled(qt), pooled(kt), split)
     idx = None
     if sparsity <= 0:
         out = _dense(q, k, v)
@@ -177,6 +218,72 @@ def test_dense_call_matches_its_parts():
     out = kq.vsa_attention(q, k, v, g, 0.0, gate=gate)
     ref, _, _ = _parts(q, k, v, gate, g, 0.0)
     np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
+# Routing scores. FastVideo's PyTorch backend, the trained definition, scores
+# pooled q against pooled k in float32, and so does vsa_attention on every
+# device.
+
+
+def _pooled(rng, heads, tiles):
+    """Random pooled q or k: the mean of a 64-row tile of unit normal rows
+    has standard deviation 1/8."""
+    x = rng.standard_normal((heads, tiles, D)) / 8
+    return mx.array(x.astype(np.float32))
+
+
+def test_split_high_part_is_tf32_exact_and_the_parts_sum_to_the_input():
+    rng = np.random.default_rng(33)
+    x = np.concatenate(
+        [
+            rng.standard_normal(4096) / 8,
+            rng.standard_normal(4096) * 10.0 ** rng.integers(-4, 5, 4096),
+            [0.0],
+        ]
+    ).astype(np.float32)
+    with mx.stream(mx.cpu):
+        high, low = (np.array(a) for a in vsa._split(mx.array(x)))
+    assert not (high.view(np.uint32) & 0x1FFF).any()
+    np.testing.assert_array_equal(high + low, x)
+
+
+# The bits a caller that mirrors the routing reproduces, at the 512x512x22
+# tile counts.
+def test_routing_scores_follow_the_documented_product():
+    rng = np.random.default_rng(35)
+    q_pooled, k_pooled = _pooled(rng, 56, 35), _pooled(rng, 56, 35)
+    got = np.array(vsa._scores(q_pooled, k_pooled))
+    want = np.array(_routing_scores(q_pooled, k_pooled, _tf32_device()))
+    np.testing.assert_array_equal(got.view(np.uint32), want.view(np.uint32))
+
+
+# The routing against a top-k of the CPU's float32 scores, at the 768x768x39
+# tile counts. A row whose k-th to next video score gap is under twice the
+# largest score difference can flip with no bug behind it, and is not
+# counted.
+def test_routing_matches_a_cpu_fp32_top_k():
+    rng = np.random.default_rng(37)
+    heads, n_prefix, n_video = 56, 4, 108
+    n_tiles = n_prefix + n_video
+    q_pooled, k_pooled = _pooled(rng, heads, n_tiles), _pooled(rng, heads, n_tiles)
+    got = vsa._scores(q_pooled, k_pooled)
+    cpu = mx.matmul(q_pooled, k_pooled.transpose(0, 2, 1), stream=mx.cpu) / D**0.5
+    noise = mx.max(mx.abs(got - cpu)).item()
+    # float32 rounding of a 128-term product, far under TF32's.
+    assert noise <= 1e-5 * mx.max(mx.abs(cpu)).item()
+
+    def routed(scores):
+        idx, _ = vsa._block_indices_from_scores(
+            scores, n_prefix, n_video, 0.8, True, ((n_prefix, n_tiles),), (0.8,)
+        )
+        return np.sort(np.array(idx), axis=-1)
+
+    differ = (routed(got) != routed(cpu)).any(axis=-1)
+    video = -np.sort(-np.array(cpu)[:, n_prefix:, n_prefix:], axis=-1)
+    top = vsa.compute_topk(0.8, n_video)
+    near_tie = video[..., top - 1] - video[..., top] < 2 * noise
+    assert near_tie.mean() < 0.01
+    assert not (differ & ~near_tie).any()
 
 
 # Guards. Each input fails only the named guard, on a dense call, so the
@@ -396,3 +503,72 @@ def test_guard_refuses_a_shapeless_compile():
     q, k, v, gate = _packed(rng, g.untile_index.shape[0], 2)
     with pytest.raises(ValueError, match="cannot hold this call"):
         mx.compile(_attend_dense(g), shapeless=True)(q, k, v, gate)
+
+
+# MLX reads MLX_ENABLE_TF32 once a process, so these run in a child process.
+_CHILD = r"""
+import json
+import sys
+
+spec = json.loads(sys.argv[1])
+sys.path.insert(0, spec["tests_dir"])
+import mlx.core as mx
+import numpy as np
+import test_vsa_attention as t
+
+import mlx_kquant as kq
+from mlx_kquant import vsa
+
+g = t._geometry(*t.PREFIX, t.GRID)
+q, k, v, gate = t._packed(np.random.default_rng(39), t._seq(g), 2)
+calls = [0.0] + ([0.8] if t.NAX else [])
+
+
+def attend(q, k, v, gate, s):
+    return kq.vsa_attention(q, k, v, g, s, gate=gate)
+
+
+def same(a, b):
+    return bool((t._bits(a) == t._bits(b)).all())
+
+
+out = {}
+if spec["mode"] == "compiled_first":
+    for s in calls:
+        got = mx.compile(lambda *a, s=s: attend(*a, s))(q, k, v, gate)
+        out[str(s)] = same(got, attend(q, k, v, gate, s))
+else:
+    out["exact"] = vsa._f32_products_exact()
+    for s in calls:
+        ref = t._parts(q, k, v, gate, g, s, split=False)[0]
+        out[str(s)] = same(attend(q, k, v, gate, s), ref)
+print(json.dumps(out))
+"""
+
+
+def _child(mode, env=None):
+    spec = {"mode": mode, "tests_dir": os.path.dirname(os.path.abspath(__file__))}
+    r = subprocess.run(
+        [sys.executable, "-c", _CHILD, json.dumps(spec)],
+        env={**os.environ, **(env or {})},
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert r.returncode == 0, r.stderr[-4000:]
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+# With TF32 off the GPU multiplies float32 at float32, and each call gives
+# the bits of the direct product.
+def test_tf32_off_keeps_the_direct_product():
+    out = _child("tf32_off", {"MLX_ENABLE_TF32": "0"})
+    assert out.pop("exact")
+    assert out == {"0.0": True, **({"0.8": True} if NAX else {})}
+
+
+# A process whose first call is compiled: building the geometry measured the
+# devices on the host, so the traced call only reads the result.
+def test_a_compiled_first_call_reads_the_device_measured_on_the_host():
+    out = _child("compiled_first")
+    assert out == {"0.0": True, **({"0.8": True} if NAX else {})}
