@@ -12,8 +12,14 @@ prefix tiles are MLX ops in FastVideo's order.
 The routing scores, pooled q against pooled k, are float32 products, as in
 FastVideo's PyTorch backend, which defines the trained routing. MLX
 multiplies float32 at TF32 on M5 and later GPUs unless MLX_ENABLE_TF32=0.
-There each operand is split into the part a TF32 product reads exactly and
-the rest, and the scores are the sum of three products of the parts. Where
+A device counts as TF32 where a 64x64 float32 product differs from the
+CPU's by 1e-3 or more. Each device is measured once a process, at the first
+call that scores on it. On a TF32 device each pooled operand x is split
+into h, the bits of x AND 0xFFFFE000, which a TF32 product reads exactly,
+and l = x - h. The scores are then (qh @ kh.T + (qh @ kl.T + ql @ kh.T)) /
+sqrt(D), D the head dim: the two cross products are summed first, that sum
+is added to the high product, and the total is divided once by sqrt(D).
+ql @ kl.T is left out. Elsewhere the scores are (q @ k.T) / sqrt(D). Where
 the GPU multiplies float32 at float32, the call equals FastVideo's MLX call
 bit for bit. Where it multiplies at TF32, FastVideo's MLX call scores at
 TF32 and can route a few rows differently.
@@ -99,8 +105,9 @@ def _split(a):
 def _scores(q_pooled, k_pooled):
     """The routing scores, pooled q against pooled k over the square root of
     the head dim, at float32 precision. Where the device multiplies float32
-    at TF32, the product is qh @ kh.T + (qh @ kl.T + ql @ kh.T) of the split
-    operands, k transposed after its split, in that order."""
+    at TF32, the scores are (qh @ kh.T + (qh @ kl.T + ql @ kh.T)) / sqrt(D)
+    of the split operands, k transposed after its split, in that order and
+    divided once after the sum."""
     scale = q_pooled.shape[-1] ** 0.5
     if _f32_products_exact():
         return (q_pooled @ k_pooled.transpose(0, 2, 1)) / scale
@@ -376,12 +383,20 @@ def vsa_attention(
 
     The result is FastVideo's ``h3_vsa_attention`` with ``impl="nax"`` in
     exempt mode, with the routing scores at float32 precision on every
-    device. Where the GPU multiplies float32 at float32 it equals
-    FastVideo's call bit for bit. Each video query tile attends every prefix
-    tile and its top-k video tiles by pooled score, through
-    ``vsa_block_sparse``. The prefix query rows attend every key. With a
-    gate, each row also adds the pooled-compression term. At sparsity 0 the
-    call is dense attention, plus the gate term when a gate is given.
+    device. Each video query tile attends every prefix tile and its top-k
+    video tiles by pooled score, through ``vsa_block_sparse``. The prefix
+    query rows attend every key. With a gate, each row also adds the
+    pooled-compression term. At sparsity 0 the call is dense attention, plus
+    the gate term when a gate is given.
+
+    A device whose 64x64 float32 product differs from the CPU's by 1e-3 or
+    more multiplies at TF32. Each device is measured once a process, at the
+    first call that scores on it. On a TF32 device each pooled operand x is
+    split into h, its bits AND 0xFFFFE000, and l = x - h. The scores are
+    (qh @ kh.T + (qh @ kl.T + ql @ kh.T)) / sqrt(128), divided once after
+    the sum, without ql @ kl.T. Elsewhere they are (q @ k.T) / sqrt(128).
+    Where the GPU multiplies float32 at float32, the call equals FastVideo's
+    call bit for bit.
 
     Args:
         q (array): packed queries [S, heads, 128], bfloat16.

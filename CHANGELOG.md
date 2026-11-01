@@ -9,8 +9,7 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - `vsa_block_sparse`, MiniMax-H3's block-sparse video attention on M5 and later GPUs, ported from
   FastVideo. On M5 Max at sparsity 0.8, 2.7x (512x512) to 4.5x (768x768) faster than dense attention.
-- `vsa_attention`, MiniMax-H3's whole video sparse attention call, with float32 routing scores on
-  every Mac, as FastVideo's PyTorch backend computes them.
+- `vsa_attention`, MiniMax-H3's whole video sparse attention call, with float32 routing scores.
   `vsa_block_sparse` takes `coarse` and `gate` and adds MiniMax-H3's gate term in its epilogue.
 
 ## [0.5.8]
