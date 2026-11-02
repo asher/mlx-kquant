@@ -1649,6 +1649,12 @@ std::vector<mx::array> kda_chunk_gated(
     float lb,
     mx::StreamOrDevice s = {});
 
+// x [B, T, ...] with axis 1 zero-padded to whole 32-token chunks, as
+// kda_chunk and kda_chunk_gated pad their inputs; x itself when T is a
+// whole number of chunks. Right past INT32_MAX elements, where mx::pad is
+// not (docs/upstream-defects.md).
+mx::array kda_pad_chunks(const mx::array& x, mx::StreamOrDevice s = {});
+
 // Chunked KDA prefill primitive (see kda_chunk, kda_chunk_gated).
 // Inference-only. t_real is the unpadded length; lb applies when gated.
 class KQuantKdaChunk : public mx::Primitive {

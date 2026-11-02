@@ -1170,6 +1170,15 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "_kda_pad_chunks",
+      &mlx_kquant::kda_pad_chunks,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "x [B, T, ...] with axis 1 zero-padded to whole 32-token chunks, as "
+      "kda_chunk pads its inputs.");
+
+  m.def(
       "kda_chunk_gated",
       &mlx_kquant::kda_chunk_gated,
       "q"_a,
