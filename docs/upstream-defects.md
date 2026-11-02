@@ -88,7 +88,8 @@ print((got != want).sum())  # 0
 - Affected: `mx.pad`, and `mx.concatenate` on any axis but the first, when an input holds at most
   INT32_MAX elements and its place in the output reaches past element INT32_MAX: a padded or
   joined axis inside an output of more than INT32_MAX elements, such as [B, T, H, D] padded on T
-  with B of 2 or more. Any dtype.
+  with B of 2 or more, or a band of columns joined to the columns around it in an [M, N] output.
+  Any dtype.
 - What goes wrong: `pad_gpu` and `concatenate_gpu` copy each input into a view of the output that
   keeps the output's strides but records the input's element count, and `copy_gpu_inplace` picks
   32-bit offsets from that count. The input elements whose output offset passes INT32_MAX are
@@ -127,3 +128,58 @@ print((out[:, 0] != want).sum())  # 0
   needs `KQUANT_BIG_TESTS=1` (two 4.3 GB arrays). It pads [2, 2796202, 3, 128], where `mx.pad`
   misplaces the last 21 tokens of row 1, through the op's padding step: the op itself would hold
   about 36 GB at that shape.
+- Guard: `lora_add` in `src/kquant_matmul_lora.cpp`. Where `quantized_matmul_lora` composes a call
+  with bands, it writes each band that takes ranks into the base product by a slice update. Joined
+  to the columns around it by `mx.concatenate` on the last axis, a band was misplaced once its
+  place in the output passed element INT32_MAX, in a composed call with bands whose M x N output
+  holds more than INT32_MAX elements. The kernel never builds the sum this way; the composition
+  runs where the kernel does not (other shapes, devices or band edges) and in every vjp, jvp and
+  vmap of the op.
+- Test: `test_lora_band_past_int32_max_output_elements_keeps_every_row` in
+  `tests/test_matmul_lora.py`, which needs `KQUANT_BIG_TESTS=1` (two 4.3 GB arrays). It runs the
+  op on 32,769 rows of 65,536 columns with a band off the column tile, where `mx.concatenate`
+  writes the 64 band elements of the last row over row 1.
+
+## A reduction on the CPU misreads past INT32_MAX element offsets
+
+- Dependency: mlx 0.32.3, CPU streams, measured. The GPU stream is right.
+- Affected: `mx.sum`, `mx.prod`, `mx.max`, `mx.min`, `mx.any`, `mx.all` and the ops built on them,
+  on a CPU stream, in two cases. One: an input that is a strided view, is dense in another axis
+  order, or is reduced over axes that do not merge into one run, when an element offset passes
+  INT32_MAX. Two: a reduction over every axis of more than INT32_MAX elements. Any dtype.
+- What goes wrong: `reduction_op` in `mlx/backend/cpu/reduce.cpp` holds the offset of each
+  output's first input element in an `int`, and `nd_loop` adds strides in `int`. An offset past
+  INT32_MAX wraps, and the reduction reads other memory: a wrong value, or SIGBUS where the address
+  is not mapped. The reduction over every axis passes the element count to `contiguous_reduce` as
+  an `int`, so past INT32_MAX elements it returns the initial value. No error is raised.
+- Not affected: a row-major input reduced over its last axis or over one other axis, which steps
+  through memory by pointer, at any size.
+
+Smallest repro (a 2 GiB buffer):
+
+```python
+import mlx.core as mx
+
+rows, width = 65600, 32768
+x = (mx.arange(rows) % 251).astype(mx.uint8)[:, None] + mx.zeros((1, width), mx.uint8)
+want = (mx.arange(rows) % 251).astype(mx.uint8)
+got = mx.max(x[:, 16:], axis=1, stream=mx.cpu)  # a view, rows 32768 apart
+print((got != want).sum())  # 64, the rows from 65536
+got = mx.max(x[:, 16:], axis=1)  # GPU
+print((got != want).sum())  # 0
+got = mx.max(mx.contiguous(x[:, 16:]), axis=1, stream=mx.cpu)
+print((got != want).sum())  # 0
+print(mx.sum(mx.ones((rows, width), mx.uint8), stream=mx.cpu))  # 0, not 2149580800
+```
+
+With bfloat16 at the same shape, `mx.any` over such a view read unmapped memory and the process
+died of SIGBUS.
+
+- Guard: none. Not reached by mlx-kquant. The reductions it builds on a CPU stream are the CPU
+  branches of `qk_norm_rope` (the mean over D of a float32 square) and of the VSA tile sums (the
+  sum over the 64 rows of a tile of a float32 copy), `mx.fast.rms_norm` in the add-RMSNorm
+  fallback, and checks in `vsa.py` over per-tile counts. Each reduces a fresh array over its last
+  axis or one other axis. The copy is row-major unless its input is dense in another axis order,
+  and then it would need more than INT32_MAX elements in one q, k or tile-sum call to misread.
+  The per-tile counts are far below the limit.
+- Test: none, as no mlx-kquant path reaches it.
