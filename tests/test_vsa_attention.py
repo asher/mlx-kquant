@@ -220,20 +220,39 @@ def test_dense_call_matches_its_parts():
     np.testing.assert_array_equal(_bits(out), _bits(ref))
 
 
-# More tiles than vsa_attention pools at a time, with short edge tiles on every
-# axis: 3 prefix tiles and 168 video tiles, pooled in three chunks.
+# Many tiles, with short edge tiles on every axis: 3 prefix tiles and 168
+# video tiles.
 GRID_WIDE = (13, 22, 26)
 
 
 @pytest.mark.parametrize("sparsity", [0.0, pytest.param(0.8, marks=requires_nax)])
-def test_call_pooled_in_chunks_matches_its_parts(sparsity):
+def test_call_with_many_tiles_matches_its_parts(sparsity):
     rng = np.random.default_rng(27)
     g = _geometry(*PREFIX, GRID_WIDE)
-    assert g.variable_block_sizes.shape[0] > 2 * vsa._POOL_TILES
     q, k, v, gate = _packed(rng, g.untile_index.shape[0], 3)
     out = kq.vsa_attention(q, k, v, g, sparsity, gate=gate)
     ref, _, _ = _parts(q, k, v, gate, g, sparsity)
     np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
+# The pools divide MLX's float32 sum of each tile, read from the bfloat16
+# tiles: the bits of the float32 sum of the upcast tiles, at FastH3's 56 heads
+# (columns 56 x 128 apart) and at 3, with +0.0 pad rows, -0.0 and subnormal
+# values among the rows.
+@pytest.mark.parametrize("heads", [56, 3])
+def test_tile_sums_have_the_bits_of_mlx_float32_sums(heads):
+    rng = np.random.default_rng(31)
+    n = 21
+    x = rng.standard_normal((n * TILE, heads, D)).astype(np.float32)
+    x[5 * TILE + 40 : 6 * TILE] = 0.0
+    x[7 * TILE : 7 * TILE + 3, :, :8] = -0.0
+    x[9 * TILE + 3, :, 8:16] = 1e-40
+    x = mx.array(x).astype(mx.bfloat16)
+    sums = vsa._vsa_tile_sums(x)
+    ref = x.astype(mx.float32).reshape(n, TILE, heads, D).sum(axis=1)
+    np.testing.assert_array_equal(
+        np.array(sums.view(mx.uint32)), np.array(ref.view(mx.uint32))
+    )
 
 
 # Routing scores. FastVideo's PyTorch backend, the trained definition, scores
