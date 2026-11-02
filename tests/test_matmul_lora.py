@@ -1184,6 +1184,20 @@ def test_lora_band_past_int32_max_output_elements_keeps_every_row():
     assert off == 0
 
 
+# Off the kernel, each band's sum goes into the base product by a slice
+# update, which the test above checks past INT32_MAX output elements, and
+# the call builds no concatenate.
+def test_lora_unfused_bands_build_slice_updates_and_no_concatenate():
+    n, r = 256, 8
+    w, _ = _weight("q8_0", n, K)
+    a, b = _ab(K, n, r, mx.bfloat16)
+    x = _x([64, K], mx.bfloat16, 163)
+    bands = [(32, 96, 0, r), (128, n, 0, 4)]
+    assert not _fused(64, r, n, "q8_0", mx.bfloat16, bands)
+    nodes = _nodes(kq.quantized_matmul_lora(x, w, "q8_0", a, b, bands=bands))
+    assert "SliceUpdate" in nodes and "Concatenate" not in nodes, nodes
+
+
 def test_lora_kernels_in_metallib():
     if force_cpu():
         pytest.skip("Metal kernel names only")

@@ -22,6 +22,8 @@ import sys
 import mlx.core as mx
 import numpy as np
 import pytest
+from mlx_kquant._ext import _vsa_gather_source
+from test_operand_views import _nodes
 
 import mlx_kquant as kq
 from mlx_kquant import vsa
@@ -319,10 +321,37 @@ def test_call_on_a_view_past_32_bit_offsets_matches_a_contiguous_call(sparsity):
     out = kq.vsa_attention(q, k, view, g, sparsity, gate=gate)
     ref = kq.vsa_attention(q, k, v, g, sparsity, gate=gate)
     rows_off = int((_bits(out) != _bits(ref)).any(axis=(1, 2)).sum())
-    # Free the buffer before the assert: a failed test's frame outlives it.
+    # The guard's copy is its own output, so a gather in a later command
+    # buffer reads all of it. Eager and compiled calls at cache limit 0.
+    idx = mx.arange(rows)
+    take = mx.compile(lambda x, i: mx.take(_vsa_gather_source(x), i, axis=0))
+    limit = mx.set_cache_limit(0)
+    calls_off = []
+    try:
+        for call in (lambda x, i: mx.take(_vsa_gather_source(x), i, axis=0), take):
+            for _ in range(6):
+                y = call(view, idx)
+                mx.eval(y)
+                calls_off.append(int((y.view(mx.uint16) != v.view(mx.uint16)).sum()))
+                del y
+    finally:
+        mx.set_cache_limit(limit)
+    # Free the buffer before the asserts: a failed test's frame outlives it.
     del buf, view, out
     mx.clear_cache()
     assert rows_off == 0
+    assert calls_off == [0] * 12
+
+
+# The call reads each tiled operand through the gather guard: q, k, v and the
+# gate, and at sparsity 0 the dense output. The test above checks the guard's
+# bits on a view past 32-bit offsets.
+@pytest.mark.parametrize("sparsity", [0.0, pytest.param(0.8, marks=requires_nax)])
+def test_call_tiles_its_operands_through_the_gather_guard(sparsity):
+    g = _geometry(*PREFIX, GRID)
+    q, k, v, gate = _packed(np.random.default_rng(21), g.untile_index.shape[0], 3)
+    nodes = _nodes(kq.vsa_attention(q, k, v, g, sparsity, gate=gate))
+    assert nodes.count("KQuantVSAGatherSource") == (5 if sparsity == 0.0 else 4), nodes
 
 
 # Past INT32_MAX elements the tile sums take 64-bit offsets, as MLX does:
