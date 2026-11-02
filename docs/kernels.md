@@ -1440,8 +1440,8 @@ into a packed layout first.
   trace. Compile one function per geometry. A function compiled with `shapeless=True` would replay
   the traced geometry at other shapes too, so it cannot hold the call: it raises a `ValueError` that
   names `vsa_attention`. The call gathers its tiles straight from q, k, v and gate, strided or not,
-  and pools 64 tiles at a time, so it makes no contiguous copy of its inputs and no float32 copy of
-  a whole tiled array.
+  and sums each tile from the bfloat16 tiles with MLX's own column-sum kernel, so it makes no
+  contiguous copy of its inputs and no float32 copy of a tiled array.
 - **`sdpa_fa_verify`** - speculative-verify attention on the matrix units for a GQA-folded query tile.
   Head dims 64 through 512; `return_lse` as above. On NAX GPUs, at head dims 128 and 256 with up to
   64 folded rows on plain K and V, the key pass runs on the tensor-op units: each 16-row strip of
