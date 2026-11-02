@@ -199,6 +199,19 @@ class VSAGeometry:
                 _OP + "prefix_gather_index must hold the packed row of each "
                 "prefix tile slot and prefix_length in each pad slot."
             )
+        # Tiling reads packed row 0 into each pad slot, then the tiles the
+        # pools sum get +0.0 in their pad slots. A sort by liveness puts the
+        # pad slots first.
+        pad = self.tile_gather_index == rows
+        n_pad = mx.sum(pad).item()
+        tile_rows = mx.where(pad, 0, self.tile_gather_index)
+        pad_slots = None
+        if n_pad:
+            pad_slots = mx.argsort(mx.logical_not(pad).astype(mx.int32))[:n_pad]
+            mx.eval(pad_slots)
+        mx.eval(tile_rows)
+        object.__setattr__(self, "_tile_rows", tile_rows)
+        object.__setattr__(self, "_pad_slots", pad_slots)
 
 
 # Copied from FastVideo, fastvideo/mlx_runtime/minimax_h3_vsa.py
@@ -335,28 +348,51 @@ def _block_indices_from_scores(
     return idx, counts
 
 
-def _tile(x, geometry):
-    """Packed [S, heads, D] rows into tiles, every pad slot reading one zero
-    row."""
-    zero = mx.zeros((1,) + x.shape[1:], dtype=x.dtype)
-    return mx.concatenate([x, zero])[geometry.tile_gather_index]
+def _tile(x, geometry, zero_pads=True):
+    """Packed [S, heads, D] rows into tiles, gathered straight from x,
+    strided or not. Each pad slot holds a copy of row 0, or with zero_pads
+    +0.0, the zero row the pools add. Nothing else reads a pad slot into a
+    live row: vsa_block_sparse loads only live rows, and the untile gather
+    reads only live slots."""
+    tiled = mx.take(x, geometry._tile_rows, axis=0)
+    if zero_pads and geometry._pad_slots is not None:
+        tiled[geometry._pad_slots] = 0
+    return tiled
+
+
+# Tiles one pool sum takes at a time, so the call makes no float32 copy of a
+# whole tiled array. MLX sums each 64-row tile in the same order whatever the
+# number of tiles in the array.
+_POOL_TILES = 64
 
 
 def _pool(x, variable_block_sizes, tile):
     """float32 mean of each tile: [tiles * tile, heads, D] -> [heads, tiles, D]."""
     n_tiles = x.shape[0] // tile
-    pooled = x.astype(mx.float32).reshape(n_tiles, tile, *x.shape[1:]).sum(axis=1)
+    sums = [
+        x[start * tile : min(start + _POOL_TILES, n_tiles) * tile]
+        .astype(mx.float32)
+        .reshape(-1, tile, *x.shape[1:])
+        .sum(axis=1)
+        for start in range(0, n_tiles, _POOL_TILES)
+    ]
+    pooled = sums[0] if len(sums) == 1 else mx.concatenate(sums)
     pooled = pooled / variable_block_sizes.astype(mx.float32)[:, None, None]
     return pooled.transpose(1, 0, 2)
 
 
 def _dense(q, k, v, scale):
-    return mx.fast.scaled_dot_product_attention(
-        q.transpose(1, 0, 2)[None],
-        k.transpose(1, 0, 2)[None],
-        v.transpose(1, 0, 2)[None],
-        scale=scale,
-    )[0].transpose(1, 0, 2)
+    # squeeze, not [0]: an integer index is a gather, a copy of the output.
+    return (
+        mx.fast.scaled_dot_product_attention(
+            q.transpose(1, 0, 2)[None],
+            k.transpose(1, 0, 2)[None],
+            v.transpose(1, 0, 2)[None],
+            scale=scale,
+        )
+        .squeeze(0)
+        .transpose(1, 0, 2)
+    )
 
 
 def _gate_term(coarse, gate_tiled, tiles, tile):
@@ -461,10 +497,10 @@ def vsa_attention(
     scores = _scores(q_pooled, k_pooled)
     coarse = gate_tiled = None
     if gate is not None:
-        gate_tiled = _tile(gate, geometry)
+        gate_tiled = _tile(gate, geometry, zero_pads=False)
         coarse = mx.softmax(scores, axis=-1) @ _pool(v_tiled, vbs, tile)
     if sparsity <= 0.0:
-        out = _tile(_dense(q, k, v, scale), geometry)
+        out = _tile(_dense(q, k, v, scale), geometry, zero_pads=False)
         out = out + _gate_term(coarse, gate_tiled, n_tiles, tile)
         return out[geometry.untile_index]
 
@@ -475,7 +511,7 @@ def vsa_attention(
     )
     prefix_rows = geometry.prefix_length
     prefix_out = _dense(q[:prefix_rows], k, v, scale) if prefix_rows else q[:0]
-    video = vsa_block_sparse(
+    out = vsa_block_sparse(
         q_tiled,
         k_tiled,
         v_tiled,
@@ -488,9 +524,12 @@ def vsa_attention(
         query_rows=query_rows,
         coarse=coarse,
         gate=gate_tiled,
-    )[n_prefix * tile :]
-    zero = mx.zeros((1, heads, dim), dtype=q.dtype)
-    prefix = mx.concatenate([prefix_out, zero])[geometry.prefix_gather_index]
-    if gate is not None:
-        prefix = prefix + _gate_term(coarse, gate_tiled, n_prefix, tile)
-    return mx.concatenate([prefix, video], axis=0)[geometry.untile_index]
+    )
+    if n_prefix:
+        # The prefix tiles go into the kernel output's prefix slots in place.
+        zero = mx.zeros((1, heads, dim), dtype=q.dtype)
+        prefix = mx.concatenate([prefix_out, zero])[geometry.prefix_gather_index]
+        if gate is not None:
+            prefix = prefix + _gate_term(coarse, gate_tiled, n_prefix, tile)
+        out[: n_prefix * tile] = prefix
+    return out[geometry.untile_index]
