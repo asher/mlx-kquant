@@ -612,6 +612,15 @@ NB_MODULE(_ext, m) {
       "vsa_attention).");
 
   m.def(
+      "_vsa_tile_sums",
+      &mlx_kquant::vsa_tile_sums,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "The float32 sum of each 64-row tile of bfloat16 x, with the bits of "
+      "MLX's float32 sum and no float32 copy of x (for vsa_attention).");
+
+  m.def(
       "vsa_block_sparse",
       &mlx_kquant::vsa_block_sparse,
       "q"_a,

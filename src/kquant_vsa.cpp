@@ -29,6 +29,7 @@ namespace mlx_kquant {
 namespace {
 
 const std::string kVsaOp = "[mlx_kquant.vsa_block_sparse] ";
+const std::string kVsaTileSumsOp = "[mlx_kquant.vsa_attention] tile sums: ";
 constexpr int kVsaHeadDim = 128;
 constexpr int kVsaTile = 64;
 // Default query rows: 32 below this many video tiles, 64 from it. On M5 Max
@@ -71,6 +72,82 @@ class KQuantVSAFixedShapes : public mx::UnaryPrimitive {
   }
 };
 
+// The float32 sum of each 64-row tile of a tiled bfloat16 array, [tiles * 64,
+// H, D] to [tiles, H, D], through MLX's col_reduce_looped with a bfloat16
+// input (kq_vsa_pool.metal). For x.astype(float32).reshape(tiles, 64, H,
+// D).sum(1) MLX runs that template at float32 with the arguments eval_gpu
+// encodes, so the sums have MLX's bits.
+class KQuantVSATileSums : public mx::UnaryPrimitive {
+ public:
+  explicit KQuantVSATileSums(mx::Stream stream) : mx::UnaryPrimitive(stream) {}
+
+  void eval_cpu(const std::vector<mx::array>&, mx::array&) override {
+    throw std::runtime_error(kVsaTileSumsOp + "has no CPU kernel.");
+  }
+  void eval_gpu(const std::vector<mx::array>& inputs, mx::array& out) override;
+
+  const char* name() const override {
+    return "KQuantVSATileSums";
+  }
+  bool is_equivalent(const mx::Primitive&) const override {
+    return true;
+  }
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override {
+    const auto& x = inputs[0];
+    return {{x.shape(0) / kVsaTile, x.shape(1), x.shape(2)}};
+  }
+};
+
+#ifdef _METAL_
+
+void KQuantVSATileSums::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    mx::array& out) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  const auto& x = inputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  // strided_reduce_looped's arguments for this column reduce: the 64 rows of
+  // a tile, H * D apart, summed for each of the tiles, one grid row a tile.
+  const size_t reduction_size = kVsaTile;
+  const int64_t reduction_stride = int64_t{x.shape(1)} * x.shape(2);
+  const int n_tiles = x.shape(0) / kVsaTile;
+  const mx::Shape shape = {n_tiles};
+  const mx::Strides strides = {kVsaTile * reduction_stride};
+  const int ndim = 1;
+  const mx::Shape reduce_shape = {kVsaTile};
+  const mx::Strides reduce_strides = {reduction_stride};
+  const int reduce_ndim = 1;
+  const size_t non_col_reductions = 1;
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kq_get_kernel(d, "kq_vsa_tile_sums_bfloat16"));
+  ce.set_input_array(x, 0);
+  ce.set_output_array(out, 1);
+  ce.set_bytes(reduction_size, 2);
+  ce.set_bytes(reduction_stride, 3);
+  ce.set_vector_bytes(shape, 4);
+  ce.set_vector_bytes(strides, 5);
+  ce.set_bytes(ndim, 6);
+  ce.set_vector_bytes(reduce_shape, 7);
+  ce.set_vector_bytes(reduce_strides, 8);
+  ce.set_bytes(reduce_ndim, 9);
+  ce.set_bytes(non_col_reductions, 10);
+  // 256 threads per 32 columns (BN), as MLX dispatches col_reduce_looped.
+  constexpr int64_t kBN = 32;
+  MTL::Size grid_dims(256 * ((reduction_stride + kBN - 1) / kBN), n_tiles, 1);
+  ce.dispatch_threads(grid_dims, MTL::Size(256, 1, 1));
+}
+
+#else // !_METAL_
+
+void KQuantVSATileSums::eval_gpu(const std::vector<mx::array>&, mx::array&) {
+  throw std::runtime_error(kVsaTileSumsOp + "requires a Metal build.");
+}
+
+#endif
+
 } // namespace
 
 mx::array vsa_fixed_shapes(const mx::array& x, mx::StreamOrDevice s) {
@@ -79,6 +156,31 @@ mx::array vsa_fixed_shapes(const mx::array& x, mx::StreamOrDevice s) {
       x.dtype(),
       std::make_shared<KQuantVSAFixedShapes>(mx::to_stream(s)),
       {x});
+}
+
+mx::array vsa_tile_sums(const mx::array& x, mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  if (x.ndim() != 3 || x.dtype() != mx::bfloat16 ||
+      x.shape(0) % kVsaTile != 0) {
+    throw std::invalid_argument(
+        kVsaTileSumsOp + "x must be bfloat16 [tiles * 64, heads, D].");
+  }
+  const int n_tiles = x.shape(0) / kVsaTile;
+  // MLX's own ops on a CPU stream, for an empty x, and past 32-bit indices,
+  // where MLX takes the 64-bit variant of the kernel: the same bits.
+  if (s.device != mx::Device::gpu || x.size() == 0 ||
+      x.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    auto wide = mx::reshape(
+        mx::astype(x, mx::float32, s),
+        {n_tiles, kVsaTile, x.shape(1), x.shape(2)},
+        s);
+    return mx::sum(wide, 1, false, s);
+  }
+  return mx::array(
+      {n_tiles, x.shape(1), x.shape(2)},
+      mx::float32,
+      std::make_shared<KQuantVSATileSums>(s),
+      {mx::contiguous(x, false, s)});
 }
 
 #ifdef _METAL_

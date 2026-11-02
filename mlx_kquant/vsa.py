@@ -38,7 +38,7 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
-from ._ext import _vsa_fixed_shapes, vsa_block_sparse
+from ._ext import _vsa_fixed_shapes, _vsa_tile_sums, vsa_block_sparse
 
 _OP = "[mlx_kquant.vsa_attention] "
 _TILE = 64
@@ -360,24 +360,11 @@ def _tile(x, geometry, zero_pads=True):
     return tiled
 
 
-# Tiles one pool sum takes at a time, so the call makes no float32 copy of a
-# whole tiled array. MLX sums each 64-row tile in the same order whatever the
-# number of tiles in the array.
-_POOL_TILES = 64
-
-
-def _pool(x, variable_block_sizes, tile):
-    """float32 mean of each tile: [tiles * tile, heads, D] -> [heads, tiles, D]."""
-    n_tiles = x.shape[0] // tile
-    sums = [
-        x[start * tile : min(start + _POOL_TILES, n_tiles) * tile]
-        .astype(mx.float32)
-        .reshape(-1, tile, *x.shape[1:])
-        .sum(axis=1)
-        for start in range(0, n_tiles, _POOL_TILES)
-    ]
-    pooled = sums[0] if len(sums) == 1 else mx.concatenate(sums)
-    pooled = pooled / variable_block_sizes.astype(mx.float32)[:, None, None]
+def _pool(x, variable_block_sizes):
+    """float32 mean of each tile: [tiles * 64, heads, D] -> [heads, tiles, D].
+    The tile sums are MLX's float32 sums of x.astype(float32) reshaped to
+    tiles, read from the bfloat16 tiles without a float32 copy."""
+    pooled = _vsa_tile_sums(x) / variable_block_sizes.astype(mx.float32)[:, None, None]
     return pooled.transpose(1, 0, 2)
 
 
@@ -492,13 +479,13 @@ def vsa_attention(
     n_tiles = vbs.shape[0]
     n_prefix = geometry.num_prefix_tiles
     q_tiled, k_tiled, v_tiled = (_tile(x, geometry) for x in (q, k, v))
-    q_pooled = _pool(q_tiled, vbs, tile)
-    k_pooled = _pool(k_tiled, vbs, tile)
+    q_pooled = _pool(q_tiled, vbs)
+    k_pooled = _pool(k_tiled, vbs)
     scores = _scores(q_pooled, k_pooled)
     coarse = gate_tiled = None
     if gate is not None:
         gate_tiled = _tile(gate, geometry, zero_pads=False)
-        coarse = mx.softmax(scores, axis=-1) @ _pool(v_tiled, vbs, tile)
+        coarse = mx.softmax(scores, axis=-1) @ _pool(v_tiled, vbs)
     if sparsity <= 0.0:
         out = _tile(_dense(q, k, v, scale), geometry, zero_pads=False)
         out = out + _gate_term(coarse, gate_tiled, n_tiles, tile)

@@ -3912,6 +3912,12 @@ mx::array vsa_block_sparse(
 // geometry, which a shapeless replay would reuse at other shapes.
 mx::array vsa_fixed_shapes(const mx::array& x, mx::StreamOrDevice s = {});
 
+// The float32 sum of each 64-row tile of bfloat16 x [tiles * 64, heads, D],
+// [tiles, heads, D], with the bits of MLX's
+// x.astype(float32).reshape(tiles, 64, heads, D).sum(1) and no float32 copy
+// of x (vsa_attention's pools).
+mx::array vsa_tile_sums(const mx::array& x, mx::StreamOrDevice s = {});
+
 // VSA block-sparse attention primitive (see vsa_block_sparse).
 // Inference-only.
 class KQuantVSABlockSparse : public mx::Primitive {
