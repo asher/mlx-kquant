@@ -14,11 +14,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 - Later GPU ops read the right values from `kv_append` on a cache that is not row-contiguous, such
-  as a slice of a larger buffer, where past about 50 MB they could read wrong values.
+  as a slice of a larger buffer. They could read wrong values, most often past about 50 MB.
 - `kda_chunk` and `kda_chunk_gated` keep every token of a batch of 2 or more rows padded past 2^31
   elements, where on the GPU they returned wrong values for the last tokens with no error.
 - `quantized_matmul_lora` with `bands` keeps the band columns of rows past output element 2^31 on
-  the GPU, which it wrote over earlier rows when the call ran without its fused kernel.
+  the GPU, which on some shapes it wrote over earlier rows.
 
 ## [0.5.8]
 
