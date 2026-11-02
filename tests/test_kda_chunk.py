@@ -199,8 +199,9 @@ def test_padding_past_int32_max_elements_keeps_every_row():
 
 
 # The op pads T to whole chunks with slice updates, which the test above
-# checks past INT32_MAX elements, and builds no mx.pad.
+# checks past INT32_MAX elements, and builds no mx.pad or concatenate.
 def test_padding_builds_slice_updates_and_no_pad():
     q, k, v, log_g, beta, state = _make(2, 33, 1, mx.bfloat16, -0.5, 3)
     nodes = _nodes(*kq.kda_chunk(q, k, v, log_g, beta, state))
-    assert "SliceUpdate" in nodes and "Pad" not in nodes, nodes
+    assert "SliceUpdate" in nodes, nodes
+    assert "Pad" not in nodes and "Concatenate" not in nodes, nodes

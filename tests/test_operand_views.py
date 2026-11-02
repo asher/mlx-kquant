@@ -60,13 +60,14 @@ def _dense(view):
 
 
 def _nodes(*outputs):
-    """Names of the primitives in the graph of the outputs."""
+    """Names of the primitives in the graph of the outputs. A label such as
+    "View uint32" gives its name up to the first space."""
     import tempfile
 
     with tempfile.NamedTemporaryFile("r", suffix=".dot") as f:
         mx.export_to_dot(f.name, *outputs)
         text = f.read()
-    return sorted(re.findall(r'label ="([A-Za-z0-9_]+)"', text))
+    return sorted(re.findall(r'label ="([A-Za-z0-9_]+)[^"]*"', text))
 
 
 def _same(got, want):
