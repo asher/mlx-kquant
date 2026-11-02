@@ -41,6 +41,11 @@ requires_nax = pytest.mark.skipif(
     not NAX, reason="a sparse call needs tensor-op (NAX) hardware."
 )
 
+big = pytest.mark.skipif(
+    not os.environ.get("KQUANT_BIG_TESTS"),
+    reason="holds a 4.3 GB array; set KQUANT_BIG_TESTS=1 to run",
+)
+
 TILE = 64
 D = 128
 SCALE = D**-0.5
@@ -103,6 +108,21 @@ def _packed(rng, seq, heads, n=4):
         )
         for _ in range(n)
     ]
+
+
+def _views(q, k, v):
+    """q, k and v cut as a FastH3 forward passes them, the same values: q
+    and k through the [1, heads, S, D] transpose of a row-major [1, S, heads,
+    D] buffer (qk_norm_rope's output), v as the third part of a split of the
+    fused [S, 3 heads D] qkv product, rows 3 heads D apart."""
+    seq, heads, dim = q.shape
+
+    def roped(x):
+        return x[None].transpose(0, 2, 1, 3).squeeze(0).transpose(1, 0, 2)
+
+    fused = mx.concatenate([x.reshape(seq, heads * dim) for x in (q, k, v)], axis=1)
+    mx.eval(fused)
+    return roped(q), roped(k), mx.split(fused, 3, axis=1)[2].reshape(seq, heads, dim)
 
 
 def _dense(q, k, v):
@@ -195,12 +215,14 @@ def _bits(x):
 # One video query tile keeps ceil(0.2 * 12) = 3 video tiles.
 @requires_nax
 @pytest.mark.parametrize("gated", [True, False], ids=["gate", "no_gate"])
-def test_sparse_call_matches_its_parts(gated):
+@pytest.mark.parametrize("views", [False, True], ids=["rows", "views"])
+def test_sparse_call_matches_its_parts(gated, views):
     rng = np.random.default_rng(21)
     g = _geometry(*PREFIX, GRID)
     q, k, v, gate = _packed(rng, g.untile_index.shape[0], 3)
     gate = gate if gated else None
-    out = kq.vsa_attention(q, k, v, g, 0.8, gate=gate)
+    args = _views(q, k, v) if views else (q, k, v)
+    out = kq.vsa_attention(*args, g, 0.8, gate=gate)
     ref, idx, scores = _parts(q, k, v, gate, g, 0.8)
     np.testing.assert_array_equal(_bits(out), _bits(ref))
     # Every prefix tile, then the top 3 video tiles by pooled score.
@@ -211,11 +233,13 @@ def test_sparse_call_matches_its_parts(gated):
     np.testing.assert_array_equal(np.sort(idx[..., n_prefix:], axis=-1), top)
 
 
-def test_dense_call_matches_its_parts():
+@pytest.mark.parametrize("views", [False, True], ids=["rows", "views"])
+def test_dense_call_matches_its_parts(views):
     rng = np.random.default_rng(23)
     g = _geometry(*PREFIX, GRID)
     q, k, v, gate = _packed(rng, g.untile_index.shape[0], 3)
-    out = kq.vsa_attention(q, k, v, g, 0.0, gate=gate)
+    args = _views(q, k, v) if views else (q, k, v)
+    out = kq.vsa_attention(*args, g, 0.0, gate=gate)
     ref, _, _ = _parts(q, k, v, gate, g, 0.0)
     np.testing.assert_array_equal(_bits(out), _bits(ref))
 
@@ -226,11 +250,13 @@ GRID_WIDE = (13, 22, 26)
 
 
 @pytest.mark.parametrize("sparsity", [0.0, pytest.param(0.8, marks=requires_nax)])
-def test_call_with_many_tiles_matches_its_parts(sparsity):
+@pytest.mark.parametrize("views", [False, True], ids=["rows", "views"])
+def test_call_with_many_tiles_matches_its_parts(sparsity, views):
     rng = np.random.default_rng(27)
     g = _geometry(*PREFIX, GRID_WIDE)
     q, k, v, gate = _packed(rng, g.untile_index.shape[0], 3)
-    out = kq.vsa_attention(q, k, v, g, sparsity, gate=gate)
+    args = _views(q, k, v) if views else (q, k, v)
+    out = kq.vsa_attention(*args, g, sparsity, gate=gate)
     ref, _, _ = _parts(q, k, v, gate, g, sparsity)
     np.testing.assert_array_equal(_bits(out), _bits(ref))
 
@@ -253,6 +279,68 @@ def test_tile_sums_have_the_bits_of_mlx_float32_sums(heads):
     np.testing.assert_array_equal(
         np.array(sums.view(mx.uint32)), np.array(ref.view(mx.uint32))
     )
+
+
+# The pools read the bfloat16 tiles in place: a pool of 64 tiles at 56 heads
+# holds less than a float32 copy of its tiles (117 MB) at any point.
+def test_pool_holds_no_float32_copy_of_its_tiles():
+    n, heads = 64, 56
+    x = mx.random.normal((n * TILE, heads, D), key=mx.random.key(47))
+    x = x.astype(mx.bfloat16)
+    vbs = mx.full((n,), TILE, dtype=mx.int32)
+    mx.eval(x, vbs)
+    limit = mx.set_cache_limit(0)
+    try:
+        mx.clear_cache()
+        base = mx.get_active_memory()
+        mx.reset_peak_memory()
+        mx.eval(vsa._pool(x, vbs))
+        grown = mx.get_peak_memory() - base
+    finally:
+        mx.set_cache_limit(limit)
+    assert grown < 4 * x.size
+
+
+# v as 2 heads of a [S, 32768] bfloat16 buffer, rows 32768 apart, so its
+# 65670 rows span 2.15e9 elements. MLX's gather reads such a view with 32-bit
+# offsets (docs/upstream-defects.md), so the call copies it first.
+@big
+@pytest.mark.parametrize("sparsity", [0.0, pytest.param(0.8, marks=requires_nax)])
+def test_call_on_a_view_past_32_bit_offsets_matches_a_contiguous_call(sparsity):
+    heads, width = 2, 32768
+    g = _geometry(*PREFIX, (5, 113, 116))
+    rows = g.untile_index.shape[0]
+    assert rows * width > 2**31 - 1
+    q, k, v, gate = _packed(np.random.default_rng(41), rows, heads)
+    buf = mx.zeros((rows, width), dtype=mx.bfloat16)
+    buf[:, : heads * D] = v.reshape(rows, heads * D)
+    view = buf[:, : heads * D].reshape(rows, heads, D)
+    out = kq.vsa_attention(q, k, view, g, sparsity, gate=gate)
+    ref = kq.vsa_attention(q, k, v, g, sparsity, gate=gate)
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
+    del buf, view
+    mx.clear_cache()
+
+
+# Past INT32_MAX elements the tile sums take 64-bit offsets, as MLX does:
+# 4688 tiles of 56 heads, 2.15e9 elements. The first tiles, middle tiles and
+# the last 8, past the 32-bit limit, against MLX's float32 sums of each part.
+@big
+def test_tile_sums_past_int32_max_elements_have_the_bits_of_mlx_float32_sums():
+    heads, n = 56, 4688
+    assert n * TILE * heads * D > 2**31 - 1
+    rows = (mx.arange(n * TILE) % 1009).astype(mx.bfloat16) * 2.0**-7
+    cols = mx.random.normal((heads, D), key=mx.random.key(43)).astype(mx.bfloat16)
+    x = rows[:, None, None] + cols
+    sums = vsa._vsa_tile_sums(x)
+    for a in (0, n // 2, n - 8):
+        part = x[a * TILE : (a + 8) * TILE].astype(mx.float32)
+        ref = part.reshape(8, TILE, heads, D).sum(axis=1)
+        np.testing.assert_array_equal(
+            np.array(sums[a : a + 8].view(mx.uint32)), np.array(ref.view(mx.uint32))
+        )
+    del x, sums
+    mx.clear_cache()
 
 
 # Routing scores. FastVideo's PyTorch backend, the trained definition, scores
