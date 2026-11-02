@@ -208,7 +208,17 @@ mx::array kq_matrix_dense_gpu(const mx::array& a, const mx::Stream& s);
 
 // A row-major copy of a in a buffer the command buffer keeps alive,
 // whatever the layout of a. The dtype and dim limits are those above.
+// The copy is for kernels of the same primitive to read: MLX registers no
+// fence for an encoder's temporaries, so an output that shared the buffer
+// would be read in a later command buffer without waiting for the copy.
 mx::array kq_dense_copy_gpu(const mx::array& a, const mx::Stream& s);
+
+// The same copy into out, allocated here, for a primitive whose output is
+// the copy. out has the shape and dtype of a.
+void kq_dense_copy_into_gpu(
+    const mx::array& a,
+    mx::array& out,
+    const mx::Stream& s);
 
 // The same for an operand a kernel reads as one row-major run: a itself
 // when it is row-major, else the row-major copy. An op whose operand is

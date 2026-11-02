@@ -122,7 +122,7 @@ void KQuantVSAGatherSource::eval_gpu(
     mx::array& out) {
   const auto& x = inputs[0];
   if (vsa_gather_needs_copy(x)) {
-    out.copy_shared_buffer(kq_dense_copy_gpu(x, stream()));
+    kq_dense_copy_into_gpu(x, out, stream());
   } else {
     out.copy_shared_buffer(x);
   }
