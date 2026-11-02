@@ -3914,9 +3914,15 @@ mx::array vsa_fixed_shapes(const mx::array& x, mx::StreamOrDevice s = {});
 
 // The float32 sum of each 64-row tile of bfloat16 x [tiles * 64, heads, D],
 // [tiles, heads, D], with the bits of MLX's
-// x.astype(float32).reshape(tiles, 64, heads, D).sum(1) and no float32 copy
-// of x (vsa_attention's pools).
+// x.astype(float32).reshape(tiles, 64, heads, D).sum(1), and on the GPU no
+// float32 copy of x (vsa_attention's pools).
 mx::array vsa_tile_sums(const mx::array& x, mx::StreamOrDevice s = {});
+
+// x as itself, or at eval a row-major copy of x when x is a strided view of
+// at most INT32_MAX elements that spans more than INT32_MAX elements of its
+// buffer, which MLX's GPU gather would read with 32-bit offsets
+// (vsa_attention's tile gathers; docs/upstream-defects.md).
+mx::array vsa_gather_source(const mx::array& x, mx::StreamOrDevice s = {});
 
 // VSA block-sparse attention primitive (see vsa_block_sparse).
 // Inference-only.

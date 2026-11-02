@@ -38,7 +38,12 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
-from ._ext import _vsa_fixed_shapes, _vsa_tile_sums, vsa_block_sparse
+from ._ext import (
+    _vsa_fixed_shapes,
+    _vsa_gather_source,
+    _vsa_tile_sums,
+    vsa_block_sparse,
+)
 
 _OP = "[mlx_kquant.vsa_attention] "
 _TILE = 64
@@ -350,11 +355,13 @@ def _block_indices_from_scores(
 
 def _tile(x, geometry, zero_pads=True):
     """Packed [S, heads, D] rows into tiles, gathered straight from x,
-    strided or not. Each pad slot holds a copy of row 0, or with zero_pads
-    +0.0, the zero row the pools add. Nothing else reads a pad slot into a
-    live row: vsa_block_sparse loads only live rows, and the untile gather
-    reads only live slots."""
-    tiled = mx.take(x, geometry._tile_rows, axis=0)
+    strided or not. A strided x that spans more than INT32_MAX elements of
+    its buffer is copied first: MLX's gather reads it with 32-bit offsets.
+    Each pad slot holds a copy of row 0, or with zero_pads +0.0, the zero
+    row the pools add. Nothing else reads a pad slot into a live row:
+    vsa_block_sparse loads only live rows, and the untile gather reads only
+    live slots."""
+    tiled = mx.take(_vsa_gather_source(x), geometry._tile_rows, axis=0)
     if zero_pads and geometry._pad_slots is not None:
         tiled[geometry._pad_slots] = 0
     return tiled
@@ -363,7 +370,7 @@ def _tile(x, geometry, zero_pads=True):
 def _pool(x, variable_block_sizes):
     """float32 mean of each tile: [tiles * 64, heads, D] -> [heads, tiles, D].
     The tile sums are MLX's float32 sums of x.astype(float32) reshaped to
-    tiles, read from the bfloat16 tiles without a float32 copy."""
+    tiles, read on the GPU from the bfloat16 tiles without a float32 copy."""
     pooled = _vsa_tile_sums(x) / variable_block_sizes.astype(mx.float32)[:, None, None]
     return pooled.transpose(1, 0, 2)
 

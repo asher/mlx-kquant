@@ -4,6 +4,7 @@
 // FastVideo is Apache-2.0: see mlx_kquant/licenses/FastVideo-LICENSE.
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -71,6 +72,72 @@ class KQuantVSAFixedShapes : public mx::UnaryPrimitive {
         "Compile one function per geometry, with fixed shapes.");
   }
 };
+
+constexpr int64_t kInt32Max = std::numeric_limits<int32_t>::max();
+
+// MLX's GPU gather (mx.take) reads its source with 32-bit offsets while the
+// source has at most INT32_MAX elements, whatever the span of a strided view
+// in its buffer (docs/upstream-defects.md). True when x is such a view: at
+// most INT32_MAX elements that span more than INT32_MAX elements of memory.
+bool vsa_gather_needs_copy(const mx::array& x) {
+  if (x.size() == 0 || static_cast<int64_t>(x.size()) > kInt32Max) {
+    return false;
+  }
+  int64_t span = 1;
+  for (int i = 0; i < static_cast<int>(x.ndim()); i++) {
+    span += int64_t{x.shape(i) - 1} * std::abs(int64_t{x.strides()[i]});
+  }
+  return span > kInt32Max;
+}
+
+// The source of vsa_attention's tile gathers: x as itself, in its own
+// strides, or a row-major copy of x when the gather would misread it. The
+// CPU gather reads with 64-bit offsets, so the CPU passes x as itself.
+class KQuantVSAGatherSource : public mx::UnaryPrimitive {
+ public:
+  explicit KQuantVSAGatherSource(mx::Stream stream)
+      : mx::UnaryPrimitive(stream) {}
+
+  void eval_cpu(const std::vector<mx::array>& inputs, mx::array& out) override {
+    out.copy_shared_buffer(inputs[0]);
+  }
+  void eval_gpu(const std::vector<mx::array>& inputs, mx::array& out) override;
+
+  const char* name() const override {
+    return "KQuantVSAGatherSource";
+  }
+  bool is_equivalent(const mx::Primitive&) const override {
+    return true;
+  }
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override {
+    return {inputs[0].shape()};
+  }
+};
+
+#ifdef _METAL_
+
+void KQuantVSAGatherSource::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    mx::array& out) {
+  const auto& x = inputs[0];
+  if (vsa_gather_needs_copy(x)) {
+    out.copy_shared_buffer(kq_dense_copy_gpu(x, stream()));
+  } else {
+    out.copy_shared_buffer(x);
+  }
+}
+
+#else // !_METAL_
+
+void KQuantVSAGatherSource::eval_gpu(
+    const std::vector<mx::array>&,
+    mx::array&) {
+  throw std::runtime_error(
+      "[mlx_kquant.vsa_attention] requires a Metal build.");
+}
+
+#endif
 
 // The float32 sum of each 64-row tile of a tiled bfloat16 array, [tiles * 64,
 // H, D] to [tiles, H, D], through MLX's col_reduce_looped with a bfloat16
@@ -181,6 +248,14 @@ mx::array vsa_tile_sums(const mx::array& x, mx::StreamOrDevice s_) {
       mx::float32,
       std::make_shared<KQuantVSATileSums>(s),
       {mx::contiguous(x, false, s)});
+}
+
+mx::array vsa_gather_source(const mx::array& x, mx::StreamOrDevice s) {
+  return mx::array(
+      x.shape(),
+      x.dtype(),
+      std::make_shared<KQuantVSAGatherSource>(mx::to_stream(s)),
+      {x});
 }
 
 #ifdef _METAL_

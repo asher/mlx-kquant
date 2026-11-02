@@ -618,7 +618,17 @@ NB_MODULE(_ext, m) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       "The float32 sum of each 64-row tile of bfloat16 x, with the bits of "
-      "MLX's float32 sum and no float32 copy of x (for vsa_attention).");
+      "MLX's float32 sum, and on the GPU no float32 copy of x (for "
+      "vsa_attention).");
+
+  m.def(
+      "_vsa_gather_source",
+      &mlx_kquant::vsa_gather_source,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "x, or a row-major copy of a strided x that MLX's GPU gather would read "
+      "with 32-bit offsets (for vsa_attention).");
 
   m.def(
       "vsa_block_sparse",
