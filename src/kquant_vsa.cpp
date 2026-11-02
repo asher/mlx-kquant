@@ -141,7 +141,8 @@ void KQuantVSAGatherSource::eval_gpu(
 
 // The float32 sum of each 64-row tile of a tiled bfloat16 array, [tiles * 64,
 // H, D] to [tiles, H, D], through MLX's col_reduce_looped with a bfloat16
-// input (kq_vsa_pool.metal). For x.astype(float32).reshape(tiles, 64, H,
+// input (kq_vsa_pool.metal), with 64-bit offsets past INT32_MAX elements as
+// MLX takes them. For x.astype(float32).reshape(tiles, 64, H,
 // D).sum(1) MLX runs that template at float32 with the arguments eval_gpu
 // encodes, so the sums have MLX's bits.
 class KQuantVSATileSums : public mx::UnaryPrimitive {
@@ -189,7 +190,10 @@ void KQuantVSATileSums::eval_gpu(
   const int reduce_ndim = 1;
   const size_t non_col_reductions = 1;
   auto& ce = mx::metal::get_command_encoder(s);
-  ce.set_compute_pipeline_state(kq_get_kernel(d, "kq_vsa_tile_sums_bfloat16"));
+  const bool large = static_cast<int64_t>(x.size()) > kInt32Max;
+  ce.set_compute_pipeline_state(kq_get_kernel(
+      d,
+      large ? "kq_vsa_tile_sums_large_bfloat16" : "kq_vsa_tile_sums_bfloat16"));
   ce.set_input_array(x, 0);
   ce.set_output_array(out, 1);
   ce.set_bytes(reduction_size, 2);
@@ -233,10 +237,8 @@ mx::array vsa_tile_sums(const mx::array& x, mx::StreamOrDevice s_) {
         kVsaTileSumsOp + "x must be bfloat16 [tiles * 64, heads, D].");
   }
   const int n_tiles = x.shape(0) / kVsaTile;
-  // MLX's own ops on a CPU stream, for an empty x, and past 32-bit indices,
-  // where MLX takes the 64-bit variant of the kernel: the same bits.
-  if (s.device != mx::Device::gpu || x.size() == 0 ||
-      x.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+  // MLX's own ops on a CPU stream and for an empty x: the same bits.
+  if (s.device != mx::Device::gpu || x.size() == 0) {
     auto wide = mx::reshape(
         mx::astype(x, mx::float32, s),
         {n_tiles, kVsaTile, x.shape(1), x.shape(2)},

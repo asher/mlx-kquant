@@ -5,7 +5,8 @@
 // float32 sum. MLX runs the same template at float32 for
 // x.astype(float32).reshape(tiles, 64, H, D).sum(1); the bfloat16 to float32
 // widening on load is exact, so each tile adds the same values in the same
-// order. kquant_vsa.cpp encodes MLX's arguments for that reduce.
+// order. kquant_vsa.cpp encodes MLX's arguments for that reduce, and takes
+// the 64-bit offset variant past INT32_MAX input elements, as MLX does.
 #include <metal_atomic>
 #include <metal_simdgroup>
 
@@ -19,3 +20,7 @@ instantiate_kernel(
     "kq_vsa_tile_sums_bfloat16",
     col_reduce_looped,
     bfloat16_t, float, Sum<float>, int, 1, 32, 32)
+instantiate_kernel(
+    "kq_vsa_tile_sums_large_bfloat16",
+    col_reduce_looped,
+    bfloat16_t, float, Sum<float>, int64_t, 1, 32, 32)
