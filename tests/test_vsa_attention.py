@@ -220,6 +220,22 @@ def test_dense_call_matches_its_parts():
     np.testing.assert_array_equal(_bits(out), _bits(ref))
 
 
+# More tiles than vsa_attention pools at a time, with short edge tiles on every
+# axis: 3 prefix tiles and 168 video tiles, pooled in three chunks.
+GRID_WIDE = (13, 22, 26)
+
+
+@pytest.mark.parametrize("sparsity", [0.0, pytest.param(0.8, marks=requires_nax)])
+def test_call_pooled_in_chunks_matches_its_parts(sparsity):
+    rng = np.random.default_rng(27)
+    g = _geometry(*PREFIX, GRID_WIDE)
+    assert g.variable_block_sizes.shape[0] > 2 * vsa._POOL_TILES
+    q, k, v, gate = _packed(rng, g.untile_index.shape[0], 3)
+    out = kq.vsa_attention(q, k, v, g, sparsity, gate=gate)
+    ref, _, _ = _parts(q, k, v, gate, g, sparsity)
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
 # Routing scores. FastVideo's PyTorch backend, the trained definition, scores
 # pooled q against pooled k in float32, and so does vsa_attention on every
 # device.
