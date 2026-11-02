@@ -53,7 +53,7 @@ print(mx.addmm(mx.contiguous(c), a, b).reshape(-1))  # GPU: [3, 10, 17]
   x, not from the span of its strides. Each element past the 32-bit limit is read at a wrapped
   offset. No error is raised.
 - Not affected: a view of more than INT32_MAX elements, which gets 64-bit offsets; a row-major x
-  at any offset into its buffer; copies, `mx.concatenate` and
+  at any offset into its buffer; copies, a first-axis `mx.concatenate` and
   `mx.fast.scaled_dot_product_attention` on the same view.
 
 Smallest repro (a 2 GiB buffer):
@@ -76,11 +76,15 @@ print((got != want).sum())  # 0
 - Guard: `vsa_gather_source` in `src/kquant_vsa.cpp`. `vsa_attention` gathers its tiles from q,
   k, v and gate through it. At eval it passes a view as itself unless the view has at most
   INT32_MAX elements and spans more than INT32_MAX, and copies such a view to row-major first.
+  The copy is the guard's own output, so a gather in a later command buffer waits for it.
   A FastH3 forward that passes v as the third part of its fused qkv product, rows 3 x 56 x 128
   apart, spans past the limit from about 99,900 packed rows.
 - Test: `test_call_on_a_view_past_32_bit_offsets_matches_a_contiguous_call` in
   `tests/test_vsa_attention.py`, which needs `KQUANT_BIG_TESTS=1` (a 4.3 GB buffer). It holds the
-  call on v as a view of a wide buffer against the call on a contiguous copy of v.
+  call on v as a view of a wide buffer against the call on a contiguous copy of v, and gathers
+  through the guard six times eagerly and six times compiled at cache limit 0, each against the
+  copy. `test_call_tiles_its_operands_through_the_gather_guard`, in the default suite, checks
+  that the call builds the guard for each operand it tiles.
 
 ## `mx.pad` and `mx.concatenate` misplace an input past INT32_MAX output elements on the GPU
 
@@ -127,7 +131,8 @@ print((out[:, 0] != want).sum())  # 0
 - Test: `test_padding_past_int32_max_elements_keeps_every_row` in `tests/test_kda_chunk.py`, which
   needs `KQUANT_BIG_TESTS=1` (two 4.3 GB arrays). It pads [2, 2796202, 3, 128], where `mx.pad`
   misplaces the last 21 tokens of row 1, through the op's padding step: the op itself would hold
-  about 36 GB at that shape.
+  about 36 GB at that shape. `test_padding_builds_slice_updates_and_no_pad`, in the default
+  suite, checks that `kda_chunk` pads with slice updates and builds no `mx.pad`.
 - Guard: `lora_add` in `src/kquant_matmul_lora.cpp`. Where `quantized_matmul_lora` composes a call
   with bands, it writes each band that takes ranks into the base product by a slice update. Joined
   to the columns around it by `mx.concatenate` on the last axis, a band was misplaced once its
@@ -139,6 +144,8 @@ print((out[:, 0] != want).sum())  # 0
   `tests/test_matmul_lora.py`, which needs `KQUANT_BIG_TESTS=1` (two 4.3 GB arrays). It runs the
   op on 32,769 rows of 65,536 columns with a band off the column tile, where `mx.concatenate`
   writes the 64 band elements of the last row over row 1.
+  `test_lora_unfused_bands_build_slice_updates_and_no_concatenate`, in the default suite, checks
+  that a composed call with bands builds slice updates and no `mx.concatenate`.
 
 ## A reduction on the CPU misreads past INT32_MAX element offsets
 
