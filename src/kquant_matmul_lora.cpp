@@ -195,7 +195,11 @@ class LoraBandedInput : public mx::UnaryPrimitive {
 
 // base + z @ B over the bands. With no band table every column takes
 // every rank. With one, a band's columns take its ranks and its block of
-// B, and a column outside every band takes none.
+// B, and a column outside every band takes none. Each band with ranks is
+// written into the base product by a slice update, not joined to the
+// columns around it by mx::concatenate: on the GPU MLX's concatenate puts
+// a part at wrapped 32-bit offsets once the output passes INT32_MAX
+// elements (docs/upstream-defects.md).
 mx::array lora_add(
     const mx::array& base_,
     const mx::array& z_,
@@ -212,29 +216,33 @@ mx::array lora_add(
   const mx::array base = banded_input(base_);
   const mx::array z = banded_input(z_);
   const int N = base.shape(-1);
-  std::vector<mx::array> parts;
-  int col = 0;
+  mx::array out = base;
   for (size_t i = 0; i < bands.size(); i += 4) {
     const int cs = bands[i];
     const int ce = bands[i + 1];
     const int z0 = bands[i + 2];
     const int rb = bands[i + 3];
-    if (cs > col) {
-      parts.push_back(last_axis_slice(base, col, cs, s));
+    if (rb == 0) {
+      continue;
     }
-    auto y = last_axis_slice(base, cs, ce, s);
-    if (rb > 0) {
-      auto bb = mx::slice(b, {z0, cs}, {z0 + rb, ce}, s);
-      y = lora_addmm(std::move(y), last_axis_slice(z, z0, z0 + rb, s), bb, s);
+    auto bb = mx::slice(b, {z0, cs}, {z0 + rb, ce}, s);
+    auto y = lora_addmm(
+        last_axis_slice(base, cs, ce, s),
+        last_axis_slice(z, z0, z0 + rb, s),
+        bb,
+        s);
+    if (cs == 0 && ce == N) {
+      // The band holds every column: y is the sum.
+      out = std::move(y);
+      continue;
     }
-    parts.push_back(std::move(y));
-    col = ce;
+    mx::Shape start(out.ndim(), 0);
+    mx::Shape stop = out.shape();
+    start.back() = cs;
+    stop.back() = ce;
+    out = mx::slice_update(out, y, std::move(start), std::move(stop), s);
   }
-  if (col < N) {
-    parts.push_back(last_axis_slice(base, col, N, s));
-  }
-  return parts.size() == 1 ? parts[0]
-                           : mx::concatenate(std::move(parts), -1, s);
+  return out;
 }
 
 // The sum from quantized_matmul and stock ops, given z. The op builds this
