@@ -81,3 +81,49 @@ print((got != want).sum())  # 0
 - Test: `test_call_on_a_view_past_32_bit_offsets_matches_a_contiguous_call` in
   `tests/test_vsa_attention.py`, which needs `KQUANT_BIG_TESTS=1` (a 4.3 GB buffer). It holds the
   call on v as a view of a wide buffer against the call on a contiguous copy of v.
+
+## `mx.pad` and `mx.concatenate` misplace an input past INT32_MAX output elements on the GPU
+
+- Dependency: mlx 0.32.3, GPU streams, measured. The CPU stream is right.
+- Affected: `mx.pad`, and `mx.concatenate` on any axis but the first, when an input holds at most
+  INT32_MAX elements and its place in the output reaches past element INT32_MAX: a padded or
+  joined axis inside an output of more than INT32_MAX elements, such as [B, T, H, D] padded on T
+  with B of 2 or more. Any dtype.
+- What goes wrong: `pad_gpu` and `concatenate_gpu` copy each input into a view of the output that
+  keeps the output's strides but records the input's element count, and `copy_gpu_inplace` picks
+  32-bit offsets from that count. The input elements whose output offset passes INT32_MAX are
+  written at wrapped offsets, over other elements of the output, and their own places keep the
+  fill. No error is raised.
+- Not affected: an input of more than INT32_MAX elements, which gets 64-bit offsets; a pad or
+  concatenate on the first axis of a row-major output, where each input lands in one contiguous
+  block; a slice update into the output (`out[:, :16] = x`), which indexes the whole output.
+
+Smallest repro (a 2 GiB output):
+
+```python
+import mlx.core as mx
+
+rows, width = 65600, 32768
+x = (mx.arange(rows) % 251).astype(mx.uint8)[:, None] + mx.zeros((1, 16), mx.uint8)
+want = (mx.arange(rows) % 251).astype(mx.uint8)
+out = mx.pad(x, [(0, 0), (0, width - 16)])  # [65600, 32768], 2.1e9 elements
+print((out[:, 0] != want).sum())  # GPU: 64, the rows from 65536
+out = mx.concatenate([x, mx.zeros((rows, width - 16), mx.uint8)], axis=1)
+print((out[:, 0] != want).sum())  # GPU: 64
+out = mx.zeros((rows, width), mx.uint8)
+out[:, :16] = x  # a slice update
+print((out[:, 0] != want).sum())  # 0
+out = mx.pad(x, [(0, 0), (0, width - 16)], stream=mx.cpu)
+print((out[:, 0] != want).sum())  # 0
+```
+
+- Guard: `kda_pad_chunks` in `src/kquant_kda.cpp`. `kda_chunk` and `kda_chunk_gated` pad T to
+  whole 32-token chunks through it, a slice update into zeros. With `mx.pad` the op misplaced
+  inputs when B is 2 or more and B x T x H x 128 is at most INT32_MAX but within
+  (B - 1) x (Tp - T) x H x 128 of it, Tp being T padded. One row never misplaces. At 64 heads the
+  fewest rows are 3, of 87,361 to 87,381 tokens; at 2,048 tokens a row or fewer it takes 129 rows,
+  and at 9,216 or fewer 29 rows, in one call.
+- Test: `test_padding_past_int32_max_elements_keeps_every_row` in `tests/test_kda_chunk.py`, which
+  needs `KQUANT_BIG_TESTS=1` (two 4.3 GB arrays). It pads [2, 2796202, 3, 128], where `mx.pad`
+  misplaces the last 21 tokens of row 1, through the op's padding step: the op itself would hold
+  about 36 GB at that shape.
