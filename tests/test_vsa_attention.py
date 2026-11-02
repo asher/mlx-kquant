@@ -285,12 +285,13 @@ def test_tile_sums_have_the_bits_of_mlx_float32_sums(heads):
 # holds less than a float32 copy of its tiles (117 MB) at any point.
 def test_pool_holds_no_float32_copy_of_its_tiles():
     n, heads = 64, 56
-    x = mx.random.normal((n * TILE, heads, D), key=mx.random.key(47))
-    x = x.astype(mx.bfloat16)
+    x = mx.random.normal((n * TILE, heads, D), mx.bfloat16, key=mx.random.key(47))
     vbs = mx.full((n,), TILE, dtype=mx.int32)
     mx.eval(x, vbs)
     limit = mx.set_cache_limit(0)
     try:
+        # Buffers free when their command buffer completes.
+        mx.synchronize()
         mx.clear_cache()
         base = mx.get_active_memory()
         mx.reset_peak_memory()
@@ -317,9 +318,11 @@ def test_call_on_a_view_past_32_bit_offsets_matches_a_contiguous_call(sparsity):
     view = buf[:, : heads * D].reshape(rows, heads, D)
     out = kq.vsa_attention(q, k, view, g, sparsity, gate=gate)
     ref = kq.vsa_attention(q, k, v, g, sparsity, gate=gate)
-    np.testing.assert_array_equal(_bits(out), _bits(ref))
-    del buf, view
+    rows_off = int((_bits(out) != _bits(ref)).any(axis=(1, 2)).sum())
+    # Free the buffer before the assert: a failed test's frame outlives it.
+    del buf, view, out
     mx.clear_cache()
+    assert rows_off == 0
 
 
 # Past INT32_MAX elements the tile sums take 64-bit offsets, as MLX does:
@@ -333,14 +336,15 @@ def test_tile_sums_past_int32_max_elements_have_the_bits_of_mlx_float32_sums():
     cols = mx.random.normal((heads, D), key=mx.random.key(43)).astype(mx.bfloat16)
     x = rows[:, None, None] + cols
     sums = vsa._vsa_tile_sums(x)
+    off = {}
     for a in (0, n // 2, n - 8):
         part = x[a * TILE : (a + 8) * TILE].astype(mx.float32)
         ref = part.reshape(8, TILE, heads, D).sum(axis=1)
-        np.testing.assert_array_equal(
-            np.array(sums[a : a + 8].view(mx.uint32)), np.array(ref.view(mx.uint32))
-        )
-    del x, sums
+        off[a] = int((sums[a : a + 8].view(mx.uint32) != ref.view(mx.uint32)).sum())
+    # Free x before the assert: a failed test's frame outlives it.
+    del x, sums, part
     mx.clear_cache()
+    assert off == {0: 0, n // 2: 0, n - 8: 0}
 
 
 # Routing scores. FastVideo's PyTorch backend, the trained definition, scores
