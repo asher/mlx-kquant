@@ -12,6 +12,14 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `vsa_attention`, MiniMax-H3's whole video sparse attention call, with float32 routing scores.
   `vsa_block_sparse` takes `coarse` and `gate` and adds MiniMax-H3's gate term in its epilogue.
 
+### Fixed
+- Later GPU ops read the right values from `kv_append` on a cache that is not row-contiguous, such
+  as a slice of a larger buffer, where past about 50 MB they could read wrong values.
+- `kda_chunk` and `kda_chunk_gated` keep every token of a batch of 2 or more rows padded past 2^31
+  elements, where on the GPU they returned wrong values for the last tokens with no error.
+- `quantized_matmul_lora` with `bands` keeps the band columns of rows past output element 2^31 on
+  the GPU, which it wrote over earlier rows when the call ran without its fused kernel.
+
 ## [0.5.8]
 
 ### Added
