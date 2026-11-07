@@ -603,6 +603,98 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "_vsa_fixed_shapes",
+      &mlx_kquant::vsa_fixed_shapes,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "The identity on x, refusing any shapeless compiled replay (for "
+      "vsa_attention).");
+
+  m.def(
+      "_vsa_tile_sums",
+      &mlx_kquant::vsa_tile_sums,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "The float32 sum of each 64-row tile of bfloat16 x, with the bits of "
+      "MLX's float32 sum, and on the GPU no float32 copy of x (for "
+      "vsa_attention).");
+
+  m.def(
+      "_vsa_gather_source",
+      &mlx_kquant::vsa_gather_source,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "x, or a row-major copy of a strided x that MLX's GPU gather would read "
+      "with 32-bit offsets (for vsa_attention).");
+
+  m.def(
+      "vsa_block_sparse",
+      &mlx_kquant::vsa_block_sparse,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "block_idx"_a,
+      "block_num"_a,
+      "variable_block_sizes"_a,
+      "num_prefix_tiles"_a,
+      "scale"_a,
+      nb::kw_only(),
+      "tile_size"_a = 64,
+      "query_rows"_a = nb::none(),
+      "coarse"_a = nb::none(),
+      "gate"_a = nb::none(),
+      "stream"_a = nb::none(),
+      R"(
+        Block-sparse attention of MiniMax-H3 video sparse attention (VSA)
+        on the tensor-op units. Each video query tile attends only the key
+        tiles its routing lists, and of each only the live rows, with no
+        gathered copy of K and V and no dense mask. The kernel is ported
+        from FastVideo's NAX VSA kernel and returns the bits of MLX's fused
+        attention over the gathered key tiles with the dead rows masked.
+        Needs a NAX GPU (M5 and later). A CPU stream or another GPU raises.
+        A function compiled with shapeless=True raises ValueError when it
+        is called at input shapes other than those of its trace. Compile
+        such a function with fixed shapes.
+
+        Args:
+            q (array): tiled queries [S_pad, heads, 128], bfloat16, with
+                S_pad = len(variable_block_sizes) * tile_size.
+            k (array): tiled keys, the shape and dtype of q.
+            v (array): tiled values, the shape and dtype of q.
+            block_idx (array): integer [heads, video tiles, k], the key
+                tile indices each video query tile reads, prefix tiles
+                included. An index outside [0, tiles) is skipped.
+            block_num (array): integer [heads, video tiles], how many
+                entries of each block_idx list are live (clamped to k).
+            variable_block_sizes (array): integer [tiles], the live rows
+                of each tile, at most tile_size. The pad slots after them
+                are never read.
+            num_prefix_tiles (int): the leading tiles that are the dense
+                prefix. Their query rows are not computed here.
+            scale (float): query scale (typically 1/sqrt(128)).
+            tile_size (int): rows per tile, 64.
+            query_rows (int, optional): query rows per threadgroup, 16,
+                32 or 64. By default 32 below 70 video tiles and 64 from
+                70, the faster of the two on M5 Max.
+            coarse (array, optional): float32 [heads, tiles, 128], the
+                pooled-compression output of each tile, given with gate.
+            gate (array, optional): the tiled gate, the shape and dtype of
+                q. Each live video query row adds
+                bf16(coarse[h, tile] * gate[row]) to its bfloat16 output:
+                the attention output and the product are each rounded to
+                bfloat16, then summed, as the unfused MLX ops round them.
+
+        Returns:
+            array: [S_pad, heads, 128] bfloat16. The live rows of the video
+            query tiles hold the attention output, plus the gate term when
+            gate is given. Prefix rows and pad rows are zero, and so are
+            the rows of a tile with no live key tile when no gate is given.
+      )");
+
+  m.def(
       "sdpa_fa_verify",
       [](mx::array q,
          mx::array k,
@@ -1076,6 +1168,15 @@ NB_MODULE(_ext, m) {
             tuple: (y [B, T, C], state_out [B, K - 1, C]), the last K - 1
             rows of [state; x] for the next call.
       )");
+
+  m.def(
+      "_kda_pad_chunks",
+      &mlx_kquant::kda_pad_chunks,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "x [B, T, ...] with axis 1 zero-padded to whole 32-token chunks, as "
+      "kda_chunk pads its inputs.");
 
   m.def(
       "kda_chunk_gated",

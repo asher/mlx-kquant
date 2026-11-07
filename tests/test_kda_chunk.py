@@ -9,10 +9,17 @@ import os
 
 import mlx.core as mx
 import pytest
+from mlx_kquant._ext import _kda_pad_chunks
+from test_operand_views import _nodes
 
 import mlx_kquant as kq
 
 FORCE_CPU = bool(os.environ.get("KQUANT_FORCE_CPU"))
+
+big = pytest.mark.skipif(
+    not os.environ.get("KQUANT_BIG_TESTS"),
+    reason="holds two 4.3 GB arrays; set KQUANT_BIG_TESTS=1 to run",
+)
 
 requires_nax_or_cpu = pytest.mark.skipif(
     not FORCE_CPU and not kq.nax_available(),
@@ -159,3 +166,42 @@ def test_kda_chunk_rejects_bad_shapes():
         kq.kda_chunk(q, k, v[..., :64], log_g, beta, state)
     with pytest.raises(ValueError):
         kq.kda_chunk(q, k, v, log_g, beta, state[:, :, :64])
+
+
+# kda_chunk pads T to whole chunks. At B = 2, T = 2796202, H = 3 the input
+# holds 2147483136 elements, under INT32_MAX, and the padded rows put the
+# last 21 tokens of row 1 past it, where mx.pad writes them with 32-bit
+# offsets (docs/upstream-defects.md). The op would hold about 36 GB at this
+# shape, so the test calls its padding step. Windows at the start, middle
+# and end of each row, and the pad rows.
+@big
+def test_padding_past_int32_max_elements_keeps_every_row():
+    B, T, H, Tp, w = 2, 2796202, 3, 2796224, 256
+    p = (
+        mx.arange(B)[:, None, None] * 40503
+        + mx.arange(T)[None, :, None] * 31
+        + mx.arange(H)[None, None, :] * 7
+    ) % 65536
+    x = p.astype(mx.uint16)[..., None] + (mx.arange(D) * 257).astype(mx.uint16)
+    del p
+    out = _kda_pad_chunks(x.view(mx.bfloat16)).view(mx.uint16)
+    mx.eval(x, out)
+    assert out.shape == (B, Tp, H, D)
+    off = {}
+    for b in range(B):
+        for a in (0, T // 2, T - w):
+            off[b, a] = int((out[b, a : a + w] != x[b, a : a + w]).sum())
+        off[b, "pad"] = int((out[b, T:] != 0).sum())
+    # Free both before the assert: a failed test's frame outlives them.
+    del x, out
+    mx.clear_cache()
+    assert off == dict.fromkeys(off, 0)
+
+
+# The op pads T to whole chunks with slice updates, which the test above
+# checks past INT32_MAX elements, and builds no mx.pad or concatenate.
+def test_padding_builds_slice_updates_and_no_pad():
+    q, k, v, log_g, beta, state = _make(2, 33, 1, mx.bfloat16, -0.5, 3)
+    nodes = _nodes(*kq.kda_chunk(q, k, v, log_g, beta, state))
+    assert "SliceUpdate" in nodes, nodes
+    assert "Pad" not in nodes and "Concatenate" not in nodes, nodes

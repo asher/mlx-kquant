@@ -146,6 +146,14 @@ mx::array kq_dense_copy_gpu(const mx::array& a, const mx::Stream& s) {
   return t;
 }
 
+void kq_dense_copy_into_gpu(
+    const mx::array& a,
+    mx::array& out,
+    const mx::Stream& s) {
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+  dense_copy_gpu(a, out, s);
+}
+
 mx::array kq_matrix_dense_gpu(const mx::array& a, const mx::Stream& s) {
   if (a.size() == 0 || kq_matrix_rows_dense(a)) {
     return a;
@@ -237,6 +245,10 @@ mx::array kq_matrix_dense_gpu(const mx::array&, const mx::Stream&) {
 }
 
 mx::array kq_dense_copy_gpu(const mx::array&, const mx::Stream&) {
+  throw std::runtime_error("[mlx_kquant] GPU eval requires a Metal build.");
+}
+
+void kq_dense_copy_into_gpu(const mx::array&, mx::array&, const mx::Stream&) {
   throw std::runtime_error("[mlx_kquant] GPU eval requires a Metal build.");
 }
 

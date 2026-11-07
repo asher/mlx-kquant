@@ -1649,6 +1649,12 @@ std::vector<mx::array> kda_chunk_gated(
     float lb,
     mx::StreamOrDevice s = {});
 
+// x [B, T, ...] with axis 1 zero-padded to whole 32-token chunks, as
+// kda_chunk and kda_chunk_gated pad their inputs; x itself when T is a
+// whole number of chunks. Right past INT32_MAX elements, where mx::pad is
+// not (docs/upstream-defects.md).
+mx::array kda_pad_chunks(const mx::array& x, mx::StreamOrDevice s = {});
+
 // Chunked KDA prefill primitive (see kda_chunk, kda_chunk_gated).
 // Inference-only. t_real is the unpadded length; lb applies when gated.
 class KQuantKdaChunk : public mx::Primitive {
@@ -3877,6 +3883,97 @@ class KQSdpaSparsePrefill : public mx::Primitive {
   bool has_sinks_;
   bool has_sel_mask_;
   bool packed_;
+};
+
+// MiniMax-H3 video sparse attention (VSA), the block-sparse part. q, k, v
+// [S_pad, heads, 128] bfloat16 are the tiled sequence, S_pad =
+// len(variable_block_sizes) * tile_size. Tile t holds
+// variable_block_sizes[t] live rows, then pad slots, and the first
+// num_prefix_tiles tiles are the dense prefix. Video query tile j of head h
+// attends the live rows of the first block_num[h, j] key tiles listed in
+// block_idx[h, j], skipping an index outside [0, tiles). Returns
+// [S_pad, heads, 128] with the live video query rows filled and every other
+// row zero. Tile size 64. GPU only, on NAX hardware (nax_available()).
+// query_rows (16, 32 or 64) defaults by the number of video tiles. With
+// coarse (float32 [heads, tiles, 128]) and gate (q's shape and dtype), each
+// written row adds bf16(coarse[h, tile] * gate[row]) to its bfloat16 output,
+// and a video tile with no key tile holds that term alone.
+mx::array vsa_block_sparse(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    mx::array block_idx,
+    mx::array block_num,
+    mx::array variable_block_sizes,
+    int num_prefix_tiles,
+    float scale,
+    int tile_size = 64,
+    std::optional<int> query_rows = std::nullopt,
+    std::optional<mx::array> coarse = std::nullopt,
+    std::optional<mx::array> gate = std::nullopt,
+    mx::StreamOrDevice s = {});
+
+// The identity on x, refusing any shapeless compiled replay. vsa_attention
+// passes q through it first: its graph holds the index arrays of one
+// geometry, which a shapeless replay would reuse at other shapes.
+mx::array vsa_fixed_shapes(const mx::array& x, mx::StreamOrDevice s = {});
+
+// The float32 sum of each 64-row tile of bfloat16 x [tiles * 64, heads, D],
+// [tiles, heads, D], with the bits of MLX's
+// x.astype(float32).reshape(tiles, 64, heads, D).sum(1), and on the GPU no
+// float32 copy of x (vsa_attention's pools).
+mx::array vsa_tile_sums(const mx::array& x, mx::StreamOrDevice s = {});
+
+// x as itself, or at eval a row-major copy of x when x is a strided view of
+// at most INT32_MAX elements that spans more than INT32_MAX elements of its
+// buffer, which MLX's GPU gather would read with 32-bit offsets
+// (vsa_attention's tile gathers; docs/upstream-defects.md).
+mx::array vsa_gather_source(const mx::array& x, mx::StreamOrDevice s = {});
+
+// VSA block-sparse attention primitive (see vsa_block_sparse).
+// Inference-only.
+class KQuantVSABlockSparse : public mx::Primitive {
+ public:
+  KQuantVSABlockSparse(
+      mx::Stream stream,
+      int n_prefix,
+      int tile,
+      int query_rows,
+      float scale,
+      bool gated,
+      std::vector<mx::Shape> input_shapes)
+      : mx::Primitive(stream),
+        n_prefix_(n_prefix),
+        tile_(tile),
+        query_rows_(query_rows),
+        scale_(scale),
+        gated_(gated),
+        input_shapes_(std::move(input_shapes)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantVSABlockSparse";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int n_prefix_;
+  int tile_;
+  int query_rows_;
+  float scale_;
+  // coarse and gate follow the six attention inputs.
+  bool gated_;
+  // The shapes the call was built and checked for.
+  std::vector<mx::Shape> input_shapes_;
 };
 
 } // namespace mlx_kquant

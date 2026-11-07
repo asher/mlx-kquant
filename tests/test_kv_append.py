@@ -158,6 +158,34 @@ def test_view_is_copied_first(view):
     np.testing.assert_array_equal(_bits(base), before)
 
 
+# The copy of a buf that is not row-contiguous is the op's own output, so a
+# reader in a later command buffer waits for it. A 128 MiB buffer passes
+# MLX's command buffer size limit, and the reader below runs in the next
+# command buffer. Eager and compiled calls at cache limit 0.
+@metal
+def test_copied_view_is_read_right_in_a_later_command_buffer():
+    b, h, cap, d, offset = 4, 8, 8192, 128, 4096
+    base = _rand((b, h, 2 * cap, d), mx.bfloat16)
+    mx.eval(base)
+    buf = base[:, :, :cap, :]
+    compiled = mx.compile(lambda c, x: kq.kv_append(c, x, offset) + 0)
+    limit = mx.set_cache_limit(0)
+    off = []
+    try:
+        for call in (lambda c, x: kq.kv_append(c, x, offset) + 0, compiled):
+            for _ in range(6):
+                x = _rand((b, h, 16, d), mx.bfloat16)
+                ref = mx.slice_update(buf, x, mx.array([0, 0, offset, 0]), (0, 1, 2, 3))
+                mx.eval(ref)
+                y = call(buf, x)
+                mx.eval(y)
+                off.append(int((y.view(mx.uint16) != ref.view(mx.uint16)).sum()))
+                del y, ref
+    finally:
+        mx.set_cache_limit(limit)
+    assert off == [0] * 12
+
+
 @pytest.mark.parametrize(
     "x_shape, x_dtype, offset, match",
     [

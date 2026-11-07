@@ -78,6 +78,11 @@ PAIRS = [(c, mx.bfloat16) for c in CODECS] + [("q4_k", mx.float16)]
 PAIR_IDS = [f"{c}-bf16" for c in CODECS] + ["q4_k-f16"]
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
+big = pytest.mark.skipif(
+    not os.environ.get("KQUANT_BIG_TESTS"),
+    reason="holds two 4.3 GB arrays; set KQUANT_BIG_TESTS=1 to run",
+)
+
 _W = {}
 
 
@@ -1140,6 +1145,57 @@ def test_lora_size_limits():
         lazy(k, dtype=f16), w8(1, k), "q8_0", lazy(k, 1), lazy(1, 1)
     )
     assert y.shape == (1,)
+
+
+# 32769 rows of 65536 columns: the band of the last row lies past INT32_MAX
+# output elements. On the GPU MLX's concatenate puts such a part at wrapped
+# 32-bit offsets (docs/upstream-defects.md), so the composition writes each
+# band into the base product by a slice update. The band starts off the
+# column tile, so the op composes on every device. The q8_0 weight holds
+# integers with a 127 in every block, so each scale is 1, and x is one-hot:
+# each element of y is a small integer, exact in bfloat16, held against its
+# formula.
+@big
+def test_lora_band_past_int32_max_output_elements_keeps_every_row():
+    m, n, k, r, cs, ce = 32769, 65536, 256, 8, 32, 96
+    bands = [(cs, ce, 0, r)]
+    assert (m - 1) * n + cs > 2**31 - 1
+    assert not _fused(m, r, n, "q8_0", mx.bfloat16, bands, k)
+    cols, ks = mx.arange(n)[:, None], mx.arange(k)[None, :]
+    wf = mx.where(ks % 32 == 0, 127, (5 * cols + 3 * ks) % 61 - 30)
+    w, _ = kq.quantize(wf.astype(mx.float32), "q8_0")
+    wt = wf.T.astype(mx.bfloat16)
+    hot = mx.arange(m) % k
+    x = (ks == hot[:, None]).astype(mx.bfloat16)
+    a = ((mx.arange(k)[:, None] + mx.arange(r)[None, :]) % 3 == 0).astype(mx.bfloat16)
+    b = ((cols.T + 2 * mx.arange(r)[:, None]) % 5 - 2).astype(mx.bfloat16)
+    y = kq.quantized_matmul_lora(x, w, "q8_0", a, b, bands=bands)
+    mx.eval(y)
+    del x
+    off = 0
+    for r0 in range(0, m, 512):
+        hk = hot[r0 : r0 + 512]
+        want = mx.take(wt, hk, axis=0)
+        want[:, cs:ce] = want[:, cs:ce] + mx.take(a, hk, axis=0) @ b[:, cs:ce]
+        off += int((y[r0 : r0 + 512] != want).sum())
+    # Free y before the assert: a failed test's frame outlives it.
+    del y, want
+    mx.clear_cache()
+    assert off == 0
+
+
+# Off the kernel, each band's sum goes into the base product by a slice
+# update, which the test above checks past INT32_MAX output elements, and
+# the call builds no concatenate.
+def test_lora_unfused_bands_build_slice_updates_and_no_concatenate():
+    n, r = 256, 8
+    w, _ = _weight("q8_0", n, K)
+    a, b = _ab(K, n, r, mx.bfloat16)
+    x = _x([64, K], mx.bfloat16, 163)
+    bands = [(32, 96, 0, r), (128, n, 0, 4)]
+    assert not _fused(64, r, n, "q8_0", mx.bfloat16, bands)
+    nodes = _nodes(kq.quantized_matmul_lora(x, w, "q8_0", a, b, bands=bands))
+    assert "SliceUpdate" in nodes and "Concatenate" not in nodes, nodes
 
 
 def test_lora_kernels_in_metallib():

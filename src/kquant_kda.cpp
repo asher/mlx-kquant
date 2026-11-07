@@ -318,13 +318,7 @@ std::vector<mx::array> kda_chunk_impl(
   // untouched; a zero log gate (or the gated kernel's T_real mask)
   // carries the decay through unchanged.
   const int Tp = ((T + kKdaChunk - 1) / kKdaChunk) * kKdaChunk;
-  auto padt = [&](mx::array a) {
-    if (Tp == T) {
-      return a;
-    }
-    return mx::pad(
-        a, {1}, {0}, {Tp - T}, mx::array(0, a.dtype()), "constant", s);
-  };
+  auto padt = [&](mx::array a) { return kda_pad_chunks(a, s); };
   auto q_c = mx::contiguous(padt(q), false, s);
   auto k_c = mx::contiguous(padt(k), false, s);
   auto v_c = mx::contiguous(padt(v), false, s);
@@ -355,6 +349,27 @@ std::vector<mx::array> kda_chunk_impl(
 }
 
 } // namespace
+
+mx::array kda_pad_chunks(const mx::array& x, mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  if (x.ndim() < 2) {
+    throw std::invalid_argument(
+        "[mlx_kquant.kda_pad_chunks] x must have a time axis 1.");
+  }
+  const int T = x.shape(1);
+  const int Tp = ((T + kKdaChunk - 1) / kKdaChunk) * kKdaChunk;
+  if (Tp == T) {
+    return x;
+  }
+  // A slice update into zeros, not mx::pad or a concatenate: those copy x
+  // with 32-bit offsets when x holds at most INT32_MAX elements, though with
+  // B >= 2 the padded rows put its last elements past INT32_MAX
+  // (docs/upstream-defects.md). The slice update indexes the whole output.
+  auto shape = x.shape();
+  shape[1] = Tp;
+  return mx::slice_update(
+      mx::zeros(shape, x.dtype(), s), x, mx::Shape(x.ndim(), 0), x.shape(), s);
+}
 
 std::vector<mx::array> kda_chunk(
     mx::array q,

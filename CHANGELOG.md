@@ -6,6 +6,20 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `vsa_block_sparse`, MiniMax-H3's block-sparse video attention on M5 and later GPUs, ported from
+  FastVideo. On M5 Max at sparsity 0.8, 2.7x (512x512) to 4.5x (768x768) faster than dense attention.
+- `vsa_attention`, MiniMax-H3's whole video sparse attention call, with float32 routing scores.
+  `vsa_block_sparse` takes `coarse` and `gate` and adds MiniMax-H3's gate term in its epilogue.
+
+### Fixed
+- Later GPU ops read the right values from `kv_append` on a cache that is not row-contiguous, such
+  as a slice of a larger buffer.
+- `kda_chunk` and `kda_chunk_gated` keep every token of a batch of 2 or more rows padded past 2^31
+  elements.
+- `quantized_matmul_lora` with `bands` keeps the band columns of rows past output element 2^31 on
+  the GPU.
+
 ## [0.5.8]
 
 ### Added

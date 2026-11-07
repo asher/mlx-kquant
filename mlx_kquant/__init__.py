@@ -124,10 +124,12 @@ from ._ext import (  # noqa: F401
     shexp_mix_slot_parallel,
     skinny_matmul,
     verify_zero_copy_views,
+    vsa_block_sparse,
     zero_copy_view_count,
 )
 from ._version import __version__
 from .kvarn import KVARN_RECORD_VERSION, kvarn_rotate  # noqa: F401
+from .vsa import VSAGeometry, vsa_attention  # noqa: F401
 
 # Capability flag for callers that pass the optional LoRA operands
 # (lora_a / lora_b / ...) to quantized_matmul, quantized_matmul_qmv_bias,
@@ -144,6 +146,7 @@ __all__ = [
     "HAS_LORA_EPILOGUE",
     "HAS_LORA_STACK",
     "KVARN_RECORD_VERSION",
+    "VSAGeometry",
     "add_rmsnorm",
     "add_rmsnorm_norm",
     "arena_alloc",
@@ -247,5 +250,7 @@ __all__ = [
     "shared_event_set",
     "shared_event_wait",
     "verify_zero_copy_views",
+    "vsa_attention",
+    "vsa_block_sparse",
     "zero_copy_view_count",
 ]

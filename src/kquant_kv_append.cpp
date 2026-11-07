@@ -29,8 +29,13 @@ void KQuantKVAppend::eval_gpu(
     std::vector<mx::array>& outputs) {
   auto& s = stream();
   auto& out = outputs[0];
+  const auto& buf = inputs[0];
   const auto& x = inputs[1];
-  out.copy_shared_buffer(kq_row_major_gpu(inputs[0], s));
+  if (buf.size() == 0 || buf.flags().row_contiguous) {
+    out.copy_shared_buffer(buf);
+  } else {
+    kq_dense_copy_into_gpu(buf, out, s);
+  }
   if (x.size() == 0) {
     return;
   }
