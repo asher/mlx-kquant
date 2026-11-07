@@ -291,6 +291,9 @@ mx::array sdpa_qk8(
   if (q8.dtype() != mx::int8 || k8.dtype() != mx::int8) {
     throw std::invalid_argument(kQK8Op + "q8 and k8 must be int8.");
   }
+  if (k8.shape(2) < 1) {
+    throw std::invalid_argument(kQK8Op + "k8 needs at least one key row.");
+  }
   const mx::Shape sq_shape = {q8.shape(0), q8.shape(1), q8.shape(2)};
   if (q_scale.shape() != sq_shape) {
     throw std::invalid_argument(kQK8Op + "q_scale must be [B, H, qL].");
