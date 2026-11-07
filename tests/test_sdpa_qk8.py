@@ -157,16 +157,16 @@ def test_call_matches_its_formula(name):
 @requires_nax
 def test_chunked_rows_have_the_whole_calls_bits():
     """The query rows in 4096-row chunks, the last ragged, as callers that
-    pause between chunks run them: each chunk equals its rows of the whole
-    call bit for bit."""
+    pause between chunks run them, and one slice off the 64-row blocks:
+    each equals its rows of the whole call bit for bit."""
     rows = 9000
     q, k, v = _qkv(7, 1, 4, 4, rows, rows)
     q8, qs, k8, ks = kq.sdpa_qk8_inputs(q, k, SCALE)
     whole = kq.sdpa_qk8(q8, qs, k8, ks, v)
     mx.eval(whole)
     whole = np.array(whole.view(mx.uint16))
-    for r0 in range(0, rows, 4096):
-        r1 = min(r0 + 4096, rows)
+    spans = [(r, min(r + 4096, rows)) for r in range(0, rows, 4096)]
+    for r0, r1 in spans + [(1000, 3001)]:
         part = kq.sdpa_qk8(q8[:, :, r0:r1], qs[:, :, r0:r1], k8, ks, v)
         np.testing.assert_array_equal(
             np.array(part.view(mx.uint16)), whole[:, :, r0:r1]
