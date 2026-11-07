@@ -1403,6 +1403,24 @@ into a packed layout first.
   chunk follows the window, not the key length a dense masked attention walks. Head dims 64, 128
   and 256, GQA, optional per-head sinks, per-row `starts` for a left-padded batch, strided operands
   with a contiguous head dim.
+- `sdpa_qk8`: attention with int8 Q K^T and bfloat16 P V at head dim 128 on the tensor-op units of
+  M5 and later GPUs, the scheme of SageAttention (Zhang et al., ICLR 2025): per-token int8 Q and K,
+  K smoothed by its mean over keys, 16-bit P V. `sdpa_qk8_inputs(q, k, scale)` quantizes each row
+  of `q * scale` and of `k` less its mean to 128 int8 codes and a float32 scale, `max |x| / 127`,
+  rounded to nearest. The shift of K moves every score of a query row by one constant, which the
+  softmax drops. `sdpa_qk8(q8, q_scale, k8, k_scale, v)` computes `softmax(Q K^T) V` without a
+  mask, Q and K the dequantized codes: the scores accumulate in int32 and are scaled into float32,
+  the softmax runs in base 2, and P V runs on the bfloat16 tensor ops. It is lossy: on random
+  normal inputs the output is about 1e-2 in relative L2 from MLX's attention, and within 2e-3 of
+  the same formula in float64 on the op's own codes. q, k and v are bfloat16 `[B, heads, L, 128]`
+  with the query heads a multiple of the key heads; batch, head and row strided views with a unit
+  head-dim stride are read in place, and other layouts are copied. The output is `[B, heads, qL,
+  128]` laid out as `[B, qL, heads, 128]`, as MLX's attention lays it out. Any qL and kL of 1 or
+  more: the last query block stores only its live rows, and the last key block masks its columns
+  past kL before the row maximum. A call on a slice of the query rows returns the bits of those rows
+  of the whole call, so a caller can run the rows in chunks with K quantized once. Both ops refuse
+  a CPU stream, other dtypes and head dims, and a non-finite scale with a `ValueError`;
+  `sdpa_qk8` raises a `RuntimeError` on a GPU without the tensor-op units. Inference only.
 - `vsa_block_sparse`: the block-sparse attention of MiniMax-H3 video sparse attention (VSA) on the
   tensor-op units of M5 and later GPUs, ported from FastVideo. q, k and v are the tiled sequence
   `[tiles * 64, heads, 128]` in bfloat16, each tile its live rows then pad slots. Each video query
