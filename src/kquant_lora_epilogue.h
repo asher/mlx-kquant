@@ -173,12 +173,12 @@ void kq_lora_epilogue_rows_gpu(
     int K,
     int N);
 
-// Split rows LoRA for row counts up to KQ_LORA_SPLIT_MAX_ROWS at ranks above
-// KQ_LORA_ONE_MAX_RANK: z = x @ A[e] spread over a K-chunked grid dispatched
-// BEFORE the base route (it reads only x and A, so the encoder overlaps it
-// with the base dispatch), then a light apply of z @ B[e] after it. Other
-// shapes take the one-dispatch epilogue (kq_lora_epilogue_rows_gpu). x [R, K]
-// row-contiguous.
+// Split rows LoRA for row counts up to KQ_LORA_SPLIT_MAX_ROWS: z = x @ A[e]
+// spread over a K-chunked grid dispatched BEFORE the base route (it reads
+// only x and A, so the encoder overlaps it with the base dispatch), then a
+// light apply of z @ B[e] after it. More rows, and the small shapes of
+// kq_lora_one_shape, take the one-dispatch epilogue
+// (kq_lora_epilogue_rows_gpu). x [R, K] row-contiguous.
 struct KqLoraRows {
   KqLoraView v;
   std::optional<mx::array> zpart;
@@ -186,7 +186,29 @@ struct KqLoraRows {
   int kc = 0;
 };
 constexpr int KQ_LORA_SPLIT_MAX_ROWS = 32;
-constexpr int KQ_LORA_ONE_MAX_RANK = 16;
+constexpr int KQ_LORA_ONE_MAX_K = 2048;
+constexpr int KQ_LORA_ONE_MAX_KR = 8192;
+constexpr int KQ_LORA_ONE_MAX_GROUPS = 64;
+constexpr int KQ_LORA_ONE_TILE = 1024; // KQ_LORA_TG * KQ_LORA_NPT
+
+// Whether a rows epilogue of R rows, K and rank takes one dispatch at up to
+// KQ_LORA_SPLIT_MAX_ROWS rows. That kernel runs one threadgroup per (row, N
+// tile), and each forms z over the whole K, so its cost grows with K and
+// with the threadgroup count. Its rank-1 path is much faster than its path
+// for ranks 2 and up. Measured on an M3 Max at K 512 to 29696, N 2048 to
+// 11520 and 1 to 32 rows: at rank 1, and at ranks 2 and up with K up to
+// 2048, K x rank up to 8192 and up to 64 threadgroups, one dispatch is as
+// fast as the split or within about 4 us of it. The split wins at the other
+// shapes.
+inline bool kq_lora_one_shape(int R, int K, int N, int rank) {
+  if (rank == 1) {
+    return true;
+  }
+  const int64_t groups =
+      int64_t(R) * ((N + KQ_LORA_ONE_TILE - 1) / KQ_LORA_ONE_TILE);
+  return K <= KQ_LORA_ONE_MAX_K && K * rank <= KQ_LORA_ONE_MAX_KR &&
+      groups <= KQ_LORA_ONE_MAX_GROUPS;
+}
 
 KqLoraRows kq_lora_rows_pre_gpu(
     mx::metal::Device& d,
@@ -196,7 +218,8 @@ KqLoraRows kq_lora_rows_pre_gpu(
     size_t base,
     int flags,
     int R,
-    int K);
+    int K,
+    int N);
 
 void kq_lora_rows_post_gpu(
     mx::metal::Device& d,

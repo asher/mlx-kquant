@@ -10,6 +10,9 @@ Arms, through KQ_LORA_SPLIT, which the op reads live per call:
            forced with KQ_LORA_SPLIT=1 at every rank. Rows above 32 have no
            split route.
   one      the one-dispatch epilogue after the base route, KQ_LORA_SPLIT=0.
+  plain    the base op, then the delta as plain MLX ops: x @ A and an addmm
+           with B (dense), or two gather_mm calls and an add (gather). This
+           is the path a caller takes when it leaves the epilogue off.
 Reported times are the extra microseconds per call over base.
 
 To compare with an earlier build, run the script again with that build
@@ -30,13 +33,16 @@ of --calls calls in one eval, each call's input tied to the previous output
 through one small elementwise op, so the time per call is latency, as in
 decode. The `glue` arm times the tie alone; reported times subtract base,
 which carries the same glue. Arm order reverses on odd rounds. Before timing,
-the deltas of every arm are compared with the one-dispatch arm.
+the delta of every arm, each evaluated under its own lever, is compared with
+an f32 reference, to one bf16 step of the output plus 2 percent of the
+largest delta.
 
 Cells: path x codec x rank x rows. Markdown + JSON out.
 """
 
 import argparse
 import json
+import math
 import os
 import statistics
 import time
@@ -50,7 +56,7 @@ import numpy as np  # noqa: E402
 import mlx_kquant as kq  # noqa: E402
 from mlx_kquant.codec_geometry import CODEC_GEOMETRY  # noqa: E402
 
-ARMS = ["base", "default", "split", "one"]
+ARMS = ["base", "default", "split", "one", "plain"]
 LEVER = {"default": None, "split": "1", "one": "0"}
 SPLIT_MAX_ROWS = 32
 
@@ -79,7 +85,7 @@ def layout(rows):
 
 class Cell:
     def __init__(self, path, codec, rank, rows, w, E, args, rng):
-        self.path, self.codec, self.w = path, codec, w
+        self.path, self.codec, self.w, self.rank = path, codec, w, rank
         dtype = mx.bfloat16
         K, N = args.k, args.n
         if path == "dense":
@@ -104,9 +110,40 @@ class Cell:
                 lora_b=(mx.random.normal((E, rank, N)) * 0.02).astype(dtype),
                 lora_rows=mx.ones((t, s), mx.float32),
             )
+        if path != "dense":
+            t, s = self.idx.shape
+            self.lhs = mx.arange(t * s, dtype=mx.uint32)
+            self.rhs = self.idx.reshape(-1)
         mx.eval(self.x, self.lora, *([self.idx, self.sc] if path != "dense" else []))
 
+    def plain(self, x):
+        a, b = self.lora["lora_a"], self.lora["lora_b"]
+        if self.path == "dense":
+            y = kq.quantized_matmul(x, self.w, self.scales, self.codec)
+            return mx.addmm(y, x @ a, b)
+        y = kq.gather_qmv_kq(x, self.w, self.codec, self.idx)
+        t, s, K = x.shape
+        xr = x.reshape(t * s, 1, K)
+        z = mx.gather_mm(xr, a, self.lhs, self.rhs)
+        d = mx.gather_mm(z, b, self.lhs, self.rhs)
+        return y + d.reshape(y.shape)
+
+    def ref_delta(self):
+        f = mx.float32
+        x = self.x.astype(f)
+        a, b = self.lora["lora_a"].astype(f), self.lora["lora_b"].astype(f)
+        if self.path == "dense":
+            return (x @ a) @ b
+        t, s, K = x.shape
+        z = mx.gather_mm(x.reshape(t * s, 1, K), a, self.lhs, self.rhs)
+        d = mx.gather_mm(z, b, self.lhs, self.rhs).reshape(t, s, -1)
+        if self.path == "gather":
+            return d
+        return (self.sc[..., None] * d).sum(1)
+
     def call(self, x, adapted):
+        if adapted == "plain":
+            return self.plain(x)
         kw = self.lora if adapted else {}
         if self.path == "dense":
             return kq.quantized_matmul(x, self.w, self.scales, self.codec, **kw)
@@ -119,7 +156,10 @@ class Cell:
         tie = None
         for _ in range(calls):
             xx = x if tie is None else x + (tie * 0).astype(x.dtype)
-            y = xx if arm == "glue" else self.call(xx, arm != "base")
+            if arm == "glue":
+                y = xx
+            else:
+                y = self.call(xx, "plain" if arm == "plain" else arm != "base")
             tie = y.reshape(-1)[:1]
         return tie
 
@@ -128,20 +168,25 @@ def bench_cell(cell, rows, args):
     arms = ["base", "default"]
     if cell.path != "mix":
         arms += ["split", "one"] if rows <= SPLIT_MAX_ROWS else ["one"]
+        arms += ["plain"]
     set_lever("default")
     base = cell.call(cell.x, False).astype(mx.float32)
+    mx.eval(base)
     outs = {}
     for arm in arms[1:]:
+        # The op reads the lever when the graph runs.
         set_lever(arm)
-        outs[arm] = cell.call(cell.x, True).astype(mx.float32) - base
-    mx.eval(base, outs)
-    ref = outs["one" if "one" in outs else "default"]
-    scale = mx.abs(ref).max().item() + 1e-6
+        adapted = "plain" if arm == "plain" else True
+        outs[arm] = cell.call(cell.x, adapted).astype(mx.float32) - base
+        mx.eval(outs[arm])
+    ref = cell.ref_delta().reshape(base.shape)
+    scale = mx.abs(ref).max().item()
+    step = 2.0 ** (math.floor(math.log2(mx.abs(base).max().item() + 1e-30)) - 7)
     for arm, d in outs.items():
-        err = mx.abs(d - ref).max().item() / scale
-        if err > 2e-2:
-            where = f"{cell.path} {cell.codec} rows {rows}"
-            raise SystemExit(f"{where}: {arm} off by {err}")
+        err = mx.abs(d - ref).max().item()
+        if err > step + 2e-2 * scale:
+            where = f"{cell.path} {cell.codec} rank {cell.rank} rows {rows}"
+            raise SystemExit(f"{where}: {arm} off by {err} (step {step})")
     order = ["glue", *arms]
     times = {a: [] for a in order}
     for rnd in range(args.warm + args.rounds):
@@ -189,8 +234,10 @@ def main():
     for codec in args.codecs:
         row = quantized_rows(codec, args.n, args.k, args.seed_rows, rng)
         dense_w = row
-        stack = mx.contiguous(mx.broadcast_to(row, (args.experts, *row.shape)))
-        mx.eval(dense_w, stack)
+        stack = None
+        if any(p != "dense" for p in args.paths):
+            stack = mx.contiguous(mx.broadcast_to(row, (args.experts, *row.shape)))
+        mx.eval(dense_w, *([stack] if stack is not None else []))
         for path in args.paths:
             w = dense_w if path == "dense" else stack
             for rank in args.ranks:

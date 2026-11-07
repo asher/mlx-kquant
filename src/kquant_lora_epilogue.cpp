@@ -236,6 +236,30 @@ std::vector<mx::array> kq_lora_capture_cpu(
 namespace {
 constexpr int kq_lora_tg = 1024; // KQ_LORA_TG
 constexpr int kq_lora_tile = kq_lora_tg * 1; // KQ_LORA_TG * KQ_LORA_NPT
+static_assert(kq_lora_tile == KQ_LORA_ONE_TILE);
+
+// The 1024-thread kernels declare that width, but register pressure can put
+// a pipeline's limit lower on some GPUs, and Metal turns an oversized
+// dispatch into silent garbage, not an error.
+bool kq_lora_tg_fits(MTL::ComputePipelineState* kernel) {
+  return kernel->maxTotalThreadsPerThreadgroup() >= size_t(kq_lora_tg);
+}
+
+void kq_lora_check_tg(
+    MTL::ComputePipelineState* kernel,
+    const std::string& kname) {
+  if (!kq_lora_tg_fits(kernel)) {
+    throw std::runtime_error(
+        "[mlx_kquant.lora] " + kname + ": threadgroup of " +
+        std::to_string(kq_lora_tg) +
+        " threads exceeds this GPU's pipeline limit (" +
+        std::to_string(kernel->maxTotalThreadsPerThreadgroup()) + ").");
+  }
+}
+
+std::string kq_lora_rows_kname(mx::Dtype dt) {
+  return "kq_lora_epilogue_rows_" + kq_type_string(dt);
+}
 } // namespace
 
 KqLoraView kq_lora_view_gpu(
@@ -274,7 +298,9 @@ KqLoraView kq_lora_view_gpu(
     ce.set_input_array(*o, 0);
     ce.set_output_array(t, 1);
     ce.set_bytes(args, 2);
-    const size_t tg = std::min<size_t>(1024, o->size());
+    const size_t tg = std::min<size_t>(
+        std::min<size_t>(1024, kernel->maxTotalThreadsPerThreadgroup()),
+        o->size());
     ce.dispatch_threads(MTL::Size(o->size(), 1, 1), MTL::Size(tg, 1, 1));
     ce.add_temporary(t);
     o = t;
@@ -296,8 +322,9 @@ void kq_lora_epilogue_rows_gpu(
     int R,
     int K,
     int N) {
-  std::string kname = "kq_lora_epilogue_rows_" + kq_type_string(out.dtype());
+  const std::string kname = kq_lora_rows_kname(out.dtype());
   auto kernel = kq_get_kernel(d, kname);
+  kq_lora_check_tg(kernel, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   ce.set_input_array(x, 0);
@@ -327,13 +354,24 @@ constexpr int kq_lora_split_rb = 4; // rows per threadgroup, both kernels
 constexpr int kq_lora_apply_tile = 32 * 4; // 32 * CPT columns
 
 // K chunks of the z grid, 0 for the one-dispatch epilogue. Up to
-// KQ_LORA_ONE_MAX_RANK the one-dispatch epilogue runs as fast as the split
-// or faster at every row count. KQ_LORA_SPLIT (probe lever, read live): 0
-// keeps that epilogue at every shape, 1 takes the split at every rank.
-int kq_lora_split_chunks(int R, int K, int rank) {
+// KQ_LORA_SPLIT_MAX_ROWS rows the shapes of kq_lora_one_shape take one
+// dispatch, unless this GPU's pipeline cannot hold its threadgroup.
+// KQ_LORA_SPLIT (probe lever, read live): 0 keeps the one-dispatch epilogue
+// at every shape, 1 takes the split at every shape up to
+// KQ_LORA_SPLIT_MAX_ROWS rows.
+int kq_lora_split_chunks(
+    mx::metal::Device& d,
+    mx::Dtype dt,
+    int R,
+    int K,
+    int N,
+    int rank) {
   const int lever = kq_env_flag("KQ_LORA_SPLIT", -1);
-  if (R > KQ_LORA_SPLIT_MAX_ROWS || lever == 0 ||
-      (lever == -1 && rank <= KQ_LORA_ONE_MAX_RANK)) {
+  if (R > KQ_LORA_SPLIT_MAX_ROWS || lever == 0) {
+    return 0;
+  }
+  if (lever == -1 && kq_lora_one_shape(R, K, N, rank) &&
+      kq_lora_tg_fits(kq_get_kernel(d, kq_lora_rows_kname(dt)))) {
     return 0;
   }
   return std::max(1, std::min(R <= 8 ? 8 : 4, K));
@@ -391,10 +429,11 @@ KqLoraRows kq_lora_rows_pre_gpu(
     size_t base,
     int flags,
     int R,
-    int K) {
+    int K,
+    int N) {
   KqLoraRows pre;
   pre.v = kq_lora_view_gpu(inputs, base, flags, s);
-  const int C = kq_lora_split_chunks(R, K, pre.v.rank);
+  const int C = kq_lora_split_chunks(d, x.dtype(), R, K, N, pre.v.rank);
   if (C == 0 || R == 0) {
     return pre;
   }
@@ -469,6 +508,7 @@ mx::array kq_lora_mix_z_gpu(
   ce.add_temporary(z);
   std::string kname = "kq_lora_mix_z_" + kq_type_string(x.dtype());
   auto kernel = kq_get_kernel(d, kname);
+  kq_lora_check_tg(kernel, kname);
   ce.set_compute_pipeline_state(kernel);
   ce.set_input_array(x, 0);
   ce.set_input_array(*v.a, 1);
@@ -503,6 +543,7 @@ void kq_lora_mix_apply_gpu(
   };
   const std::string hash_name = kname + "_s" + std::to_string(S);
   auto kernel = kq_get_kernel(d, kname, hash_name, func_consts);
+  kq_lora_check_tg(kernel, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
   ce.set_input_array(z, 0);
