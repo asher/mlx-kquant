@@ -291,9 +291,11 @@ def test_dense_stacked_split_route_mixed_rows(codec, m, dtype, rank, monkeypatch
 
 
 @pytest.mark.parametrize("rank", [1, 5, 320])
-def test_dense_split_route_odd_ranks_and_widths(rank):
+def test_dense_split_route_odd_ranks_and_widths(rank, monkeypatch):
     """Ranks off the 4- and 8-wide vector loads, a rank past 256 and an
-    output width off the 4-wide vector loads."""
+    output width off the 4-wide vector loads. KQ_LORA_SPLIT=1 keeps the
+    small ranks on the split route."""
+    monkeypatch.setenv("KQ_LORA_SPLIT", "1")
     rng = np.random.default_rng(31)
     rows_n, kk, m, s, dtype = 100, 512, 6, 2, mx.float16
     w = (rng.standard_normal((rows_n, kk)) * 0.1).astype(np.float32)
@@ -617,3 +619,134 @@ def test_gather_lazy_rows_and_ids_match_dense(op):
         mx.broadcast_to(mx.array(int(idx[0, 0]), dtype=mx.uint32), (4, 2)),
     )
     assert np.array_equal(got_one, want_one)
+
+
+# Small ranks on the split route, forced with KQ_LORA_SPLIT=1, against the
+# one-dispatch epilogue (KQ_LORA_SPLIT=0) and the default route. The z kernel
+# folds the k lanes of each rank group with simd shuffles up to 16 groups and
+# pads the group count to a power of two; more groups take the threadgroup
+# pass. These ranks cover one to 16 groups at every vector width, padded and
+# not, and the first ranks past the shuffle path. 33 rows run the
+# one-dispatch epilogue on every setting.
+SMALL_RANKS = [1, 2, 3, 4, 8, 12, 16, 20, 24, 32, 64, 128, 17, 68]
+SPLIT_ROWS = [1, 2, 4, 5, 8, 16, 32, 33]
+# Up to this rank the rows routes take the one-dispatch epilogue by default.
+ONE_MAX_RANK = 16
+
+
+def _split_vs_one(run, monkeypatch):
+    got = run()
+    monkeypatch.setenv("KQ_LORA_SPLIT", "1")
+    split = run()
+    monkeypatch.setenv("KQ_LORA_SPLIT", "0")
+    one = run()
+    monkeypatch.delenv("KQ_LORA_SPLIT")
+    return got, split, one
+
+
+def _assert_default_route(got, split, one, rank, m):
+    # The default route is one of the two, bit for bit.
+    one_route = rank <= ONE_MAX_RANK or m > 32
+    assert np.array_equal(got, one if one_route else split)
+
+
+@pytest.mark.parametrize("rank", SMALL_RANKS)
+@pytest.mark.parametrize("m", SPLIT_ROWS)
+def test_dense_split_route_small_ranks(rank, m, monkeypatch):
+    codec, dtype = "q6_k", mx.float16
+    gtype, is_kq = CODECS[codec]
+    wire, ref = _lin_wire_ref(codec, gtype, is_kq)
+    rows_n, kk = ref.shape
+    lin = KQuantLinear(in_dims=kk, out_dims=rows_n, bias=False, codec=codec)
+    lin.weight = mx.array(wire)
+    rng = np.random.default_rng(41 + rank * 64 + m)
+    x = mx.array((rng.standard_normal((m, kk)) * 0.1).astype(np.float32)).astype(dtype)
+    a, b, a32, b32 = _lora(rng, (kk, rank), (rank, rows_n), dtype)
+    fac = rng.uniform(0.25, 1.0, m).astype(np.float32)
+    if m > 1:
+        fac[m // 2] = 0.0
+    base = lin(x)
+
+    def run():
+        y = lin(x, lora=(a, b, mx.array(fac)))
+        mx.eval(y)
+        return _f32(y)
+
+    got, split, one = _split_vs_one(run, monkeypatch)
+    _assert_default_route(got, split, one, rank, m)
+    mx.eval(base)
+    b0 = _f32(base)
+    live = fac != 0
+    want = fac[:, None] * ((_f32(x) @ a32) @ b32)
+    for y in (got, split, one):
+        assert np.array_equal(y[~live], b0[~live])
+        assert _rel((y - b0)[live], want[live]) < DELTA_TOL
+    assert _rel((got - b0)[live], (one - b0)[live]) < DELTA_TOL
+
+
+@gathered
+@pytest.mark.parametrize("op", ["rows", "mix"])
+@pytest.mark.parametrize("rank", SMALL_RANKS)
+@pytest.mark.parametrize("m", SPLIT_ROWS)
+def test_gather_split_route_small_ranks(op, rank, m, monkeypatch):
+    """Gathered rows at the split route's ranks and row counts, with a dead
+    arena slot and a zero-factor row. The score-mixed gather runs its own
+    z and apply kernels at every row count."""
+    codec, dtype = "q6_k", mx.float16
+    gtype, is_kq = CODECS[codec]
+    wire, ref = _moe_wire_ref(codec, gtype, is_kq)
+    e, n, kk = ref.shape
+    s = min(m, 4) if m % 4 == 0 or m < 4 else 1
+    t = m // s
+    rng = np.random.default_rng(53 + rank * 64 + m)
+    h = mx.array((rng.standard_normal((t, s, kk)) * 0.1).astype(np.float32)).astype(
+        dtype
+    )
+    idx = rng.integers(0, e, size=(t, s)).astype(np.uint32)
+    a, b, a32, b32 = _lora(rng, (e, kk, rank), (e, rank, n), dtype)
+    table = np.array([2, -1, 0, 3, 1], dtype=np.int32)
+    slot = rng.integers(0, len(table), size=(t, s)).astype(np.uint32)
+    if m > 1:
+        slot.reshape(-1)[0] = 1  # a dead slot
+    fac = rng.uniform(0.25, 1.0, (t, s)).astype(np.float32)
+    if m > 2:
+        fac.reshape(-1)[2] = 0.0
+    sc = rng.random((t, s)).astype(np.float32)
+    w = mx.array(wire)
+    kw = dict(
+        lora_a=a,
+        lora_b=b,
+        lora_ids=mx.array(slot),
+        lora_table=mx.array(table),
+        lora_rows=mx.array(fac),
+    )
+    if op == "rows":
+        base = kq.gather_qmv_kq(h, w, codec, mx.array(idx))
+    else:
+        base = kq.gather_qmv_mix_ns_kq(h, w, codec, mx.array(idx), mx.array(sc))
+
+    def run():
+        if op == "rows":
+            y = kq.gather_qmv_kq(h, w, codec, mx.array(idx), **kw)
+        else:
+            y = kq.gather_qmv_mix_ns_kq(h, w, codec, mx.array(idx), mx.array(sc), **kw)
+        mx.eval(y)
+        return _f32(y)
+
+    got, split, one = _split_vs_one(run, monkeypatch)
+    mx.eval(base)
+    b0 = _f32(base)
+    eff = table[slot]
+    delta = _ref_rows_delta(_f32(h), eff, a32, b32, fac)
+    if op == "mix":
+        # The lever leaves the score-mixed gather alone.
+        assert np.array_equal(split, got) and np.array_equal(one, got)
+        delta = (sc[..., None] * delta).sum(1)
+        assert _rel(got - b0, delta) < DELTA_TOL
+        return
+    _assert_default_route(got, split, one, rank, m)
+    live = (eff >= 0) & (fac != 0)
+    for y in (got, split, one):
+        assert np.array_equal(y[~live], b0[~live])
+        assert _rel((y - b0)[live], delta[live]) < DELTA_TOL
+    assert _rel((got - b0)[live], (one - b0)[live]) < DELTA_TOL

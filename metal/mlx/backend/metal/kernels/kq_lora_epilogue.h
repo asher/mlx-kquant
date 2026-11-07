@@ -10,10 +10,10 @@
 //     ids [R] (HAS_IDS) remapped through table (HAS_TABLE; entries < 0 skip
 //     the row: a dead arena slot), else e = 0 (dense). fac [R] (HAS_FAC)
 //     scales the row's delta (the per-row adapter scale; 0 skips).
-//     Row counts above KQ_LORA_SPLIT_MAX_ROWS (host side) take this kernel.
+//     Row counts above KQ_LORA_SPLIT_MAX_ROWS and ranks up to
+//     KQ_LORA_ONE_MAX_RANK (host side) take this kernel.
 //   kq_lora_rows_z + kq_lora_rows_apply: the same rows semantics split
-//     around the base dispatch for up to KQ_LORA_SPLIT_MAX_ROWS rows (see
-//     below).
+//     around the base dispatch for the other shapes (see below).
 //   kq_lora_mix_z + kq_lora_mix_apply: the score-mixed down gather, split
 //     around the base dispatch (see below).
 //
@@ -220,6 +220,7 @@ kq_lora_epilogue_rows(
 #define KQ_LORA_UNROLL_FULL _Pragma("clang loop unroll(full)")
 #define KQ_LORA_Z_UNROLL 8
 #define KQ_LORA_APPLY_NSG (KQ_LORA_SPLIT_TG / 32)
+#define KQ_LORA_Z_SHUF 16
 
 inline int kq_lora_row_entry(
     int row,
@@ -270,8 +271,12 @@ inline bool kq_lora_block_entries(
 
 // Each thread takes VW adjacent ranks of an A row (RANK % VW == 0; vector
 // loads when VW is 4 or 8) and every lanes-th k of the chunk, issuing
-// KQ_LORA_Z_UNROLL rows of loads per round; the k lanes meet in
-// threadgroup memory.
+// KQ_LORA_Z_UNROLL rows of loads per round. Up to KQ_LORA_Z_SHUF rank
+// groups, the group count pads to a power of two, so the k lanes of a group
+// sit JS apart in each simdgroup: xor shuffles fold them and the NSG
+// simdgroup partials of every row meet in threadgroup memory behind one
+// barrier. More groups leave at most 15 k lanes, which meet in threadgroup
+// memory row by row.
 template <typename T, int VW, int RB>
 [[kernel, max_total_threads_per_threadgroup(KQ_LORA_SPLIT_TG)]] void
 kq_lora_rows_z(
@@ -288,9 +293,15 @@ kq_lora_rows_z(
     const constant int& R [[buffer(10)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tgs [[threadgroups_per_grid]],
-    uint3 lid3 [[thread_position_in_threadgroup]]) {
+    uint3 lid3 [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
   constexpr int U = KQ_LORA_Z_UNROLL;
-  threadgroup float red[KQ_LORA_SPLIT_TG * VW];
+  constexpr int NSG = KQ_LORA_SPLIT_TG / 32;
+  constexpr int RED_SHUF = RB * NSG * KQ_LORA_Z_SHUF;
+  constexpr int RED =
+      (RED_SHUF > KQ_LORA_SPLIT_TG ? RED_SHUF : KQ_LORA_SPLIT_TG) * VW;
+  threadgroup float red[RED];
   const int lid = int(lid3.x);
   const int chunk = int(tid.x);
   const int C = int(tgs.x);
@@ -304,7 +315,14 @@ kq_lora_rows_z(
   const int k0 = chunk * KC;
   const int k1 = min(K, k0 + KC);
   const int JW = RANK / VW;
-  const int JS = min(JW, KQ_LORA_SPLIT_TG);
+  const bool shuf = JW <= KQ_LORA_Z_SHUF;
+  int JS = min(JW, KQ_LORA_SPLIT_TG);
+  if (shuf) {
+    JS = 1;
+    while (JS < JW) {
+      JS <<= 1;
+    }
+  }
   const int lanes = KQ_LORA_SPLIT_TG / JS;
   const int kl = lid / JS;
   const bool active = kl < lanes;
@@ -385,6 +403,42 @@ kq_lora_rows_z(
       if (k < k1) {
         step(k, (k1 - k + lanes - 1) / lanes);
       }
+    }
+    if (shuf) {
+      // One pass (jb = 0, JS >= JW).
+      KQ_LORA_UNROLL_FULL
+      for (int i = 0; i < RB; i++) {
+        if (es[i] < 0) {
+          continue;
+        }
+        KQ_LORA_UNROLL_FULL
+        for (int v = 0; v < VW; v++) {
+          float a = acc[i][v];
+          for (int off = JS; off < 32; off <<= 1) {
+            a += simd_shuffle_xor(a, ushort(off));
+          }
+          if (int(lane) < JS) {
+            red[((i * NSG + int(sg)) * JS + int(lane)) * VW + v] = a;
+          }
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int t = lid; t < RB * RANK; t += KQ_LORA_SPLIT_TG) {
+        const int i = t / RANK;
+        const int j = t - i * RANK;
+        if (es[i] < 0) {
+          continue;
+        }
+        const int g = j / VW;
+        const int v = j - g * VW;
+        float sum = 0.0f;
+        KQ_LORA_UNROLL_FULL
+        for (int q = 0; q < NSG; q++) {
+          sum += red[((i * NSG + q) * JS + g) * VW + v];
+        }
+        zpart[((int64_t)(r0 + i) * C + chunk) * RANK + j] = sum;
+      }
+      return;
     }
     const int nj = min(JS, JW - jb) * VW;
     KQ_LORA_UNROLL_FULL

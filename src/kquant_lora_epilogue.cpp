@@ -326,10 +326,14 @@ constexpr int kq_lora_split_tg = 256; // KQ_LORA_SPLIT_TG
 constexpr int kq_lora_split_rb = 4; // rows per threadgroup, both kernels
 constexpr int kq_lora_apply_tile = 32 * 4; // 32 * CPT columns
 
-// K chunks of the z grid, 0 for the one-dispatch epilogue. KQ_LORA_SPLIT=0
-// (probe lever, read live) keeps that epilogue at every row count.
-int kq_lora_split_chunks(int R, int K) {
-  if (R > KQ_LORA_SPLIT_MAX_ROWS || kq_env_lever("KQ_LORA_SPLIT", -1) == 0) {
+// K chunks of the z grid, 0 for the one-dispatch epilogue. Up to
+// KQ_LORA_ONE_MAX_RANK the one-dispatch epilogue runs as fast as the split
+// or faster at every row count. KQ_LORA_SPLIT (probe lever, read live): 0
+// keeps that epilogue at every shape, 1 takes the split at every rank.
+int kq_lora_split_chunks(int R, int K, int rank) {
+  const int lever = kq_env_flag("KQ_LORA_SPLIT", -1);
+  if (R > KQ_LORA_SPLIT_MAX_ROWS || lever == 0 ||
+      (lever == -1 && rank <= KQ_LORA_ONE_MAX_RANK)) {
     return 0;
   }
   return std::max(1, std::min(R <= 8 ? 8 : 4, K));
@@ -390,7 +394,7 @@ KqLoraRows kq_lora_rows_pre_gpu(
     int K) {
   KqLoraRows pre;
   pre.v = kq_lora_view_gpu(inputs, base, flags, s);
-  const int C = kq_lora_split_chunks(R, K);
+  const int C = kq_lora_split_chunks(R, K, pre.v.rank);
   if (C == 0 || R == 0) {
     return pre;
   }

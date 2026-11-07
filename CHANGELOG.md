@@ -13,6 +13,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   1.15x MLX's attention at 37888 rows x 56 heads on M5 Max with the int8 conversion of Q and K
   included; lossy. `sdpa_qk8_inputs` quantizes Q and K for it.
 
+### Changed
+- The rows LoRA epilogue of `quantized_matmul`, `quantized_matmul_qmv_bias` and `gather_qmv_kq` adds
+  less time at decode widths: on M3 Max at 8 gathered rows and rank 1, about 3 us over the base op
+  instead of about 65 us. Rank 16 or less runs one epilogue dispatch, and `KQ_LORA_SPLIT=1` forces
+  the split kernels.
+
 ## [0.5.9]
 
 ### Added

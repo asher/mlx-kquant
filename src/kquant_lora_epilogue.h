@@ -173,11 +173,12 @@ void kq_lora_epilogue_rows_gpu(
     int K,
     int N);
 
-// Split rows LoRA for row counts up to KQ_LORA_SPLIT_MAX_ROWS: z = x @ A[e]
-// spread over a K-chunked grid dispatched BEFORE the base route (it reads
-// only x and A, so the encoder overlaps it with the base dispatch), then a
-// light apply of z @ B[e] after it. Larger row counts take the one-dispatch
-// epilogue (kq_lora_epilogue_rows_gpu). x [R, K] row-contiguous.
+// Split rows LoRA for row counts up to KQ_LORA_SPLIT_MAX_ROWS at ranks above
+// KQ_LORA_ONE_MAX_RANK: z = x @ A[e] spread over a K-chunked grid dispatched
+// BEFORE the base route (it reads only x and A, so the encoder overlaps it
+// with the base dispatch), then a light apply of z @ B[e] after it. Other
+// shapes take the one-dispatch epilogue (kq_lora_epilogue_rows_gpu). x [R, K]
+// row-contiguous.
 struct KqLoraRows {
   KqLoraView v;
   std::optional<mx::array> zpart;
@@ -185,6 +186,7 @@ struct KqLoraRows {
   int kc = 0;
 };
 constexpr int KQ_LORA_SPLIT_MAX_ROWS = 32;
+constexpr int KQ_LORA_ONE_MAX_RANK = 16;
 
 KqLoraRows kq_lora_rows_pre_gpu(
     mx::metal::Device& d,
