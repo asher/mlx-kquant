@@ -1413,12 +1413,14 @@ into a packed layout first.
   the softmax runs in base 2, and P V runs on the bfloat16 tensor ops. It is lossy: on random
   normal inputs the output is about 1e-2 in relative L2 from MLX's attention, and within 2e-3 of
   the same formula in float64 on the op's own codes. q, k and v are bfloat16 `[B, heads, L, 128]`
-  with the query heads a multiple of the key heads; batch, head and row strided views with a unit
-  head-dim stride are read in place, and other layouts are copied. The output is `[B, heads, qL,
+  with the query heads a multiple of the key heads. q, k, v, q8 and k8 in batch, head and row
+  strided views with a unit head-dim stride are read in place, other layouts are copied, and the
+  scales are copied when they are not row-major. The output is `[B, heads, qL,
   128]` laid out as `[B, qL, heads, 128]`, as MLX's attention lays it out. Any qL and kL of 1 or
   more: the last query block stores only its live rows, and the last key block masks its columns
-  past kL before the row maximum. A call on a slice of the query rows returns the bits of those rows
-  of the whole call, so a caller can run the rows in chunks with K quantized once. Both ops refuse
+  past kL before the row maximum. A call on a slice of the query rows, `q8[:, :, a:b]` with
+  `q_scale[:, :, a:b]`, returns the bits of those rows of the whole call, so a caller can run the
+  rows in chunks with K quantized once. Both ops refuse
   a CPU stream, other dtypes and head dims, and a non-finite scale with a `ValueError`;
   `sdpa_qk8` raises a `RuntimeError` on a GPU without the tensor-op units. Inference only.
 - `vsa_block_sparse`: the block-sparse attention of MiniMax-H3 video sparse attention (VSA) on the

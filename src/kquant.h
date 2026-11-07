@@ -560,8 +560,12 @@ std::tuple<mx::array, mx::array, mx::array, mx::array> sdpa_qk8_inputs(
 
 // Attention with int8 Q K^T and bfloat16 P V: softmax(dequant(q8) .
 // dequant(k8)^T) v without a mask, the inputs from sdpa_qk8_inputs (the
-// scale is in q8). v [B, Hk, kL, 128] bfloat16. Output [B, H, qL, 128]
-// bfloat16 laid out as [B, qL, H, 128], as mx.fast SDPA lays it out. Lossy.
+// scale is in q8). v [B, Hk, kL, 128] bfloat16. q8, k8 and v are read
+// through their batch, head and row strides; q_scale and k_scale may be
+// strided too and are copied when they are not row-major. A slice of query
+// rows, q8[:, :, a:b] with q_scale[:, :, a:b], returns the bits of those
+// rows of the whole call. Output [B, H, qL, 128] bfloat16 laid out as
+// [B, qL, H, 128], as mx.fast SDPA lays it out. Lossy.
 // Requires the tensor-op units (nax_available()).
 mx::array sdpa_qk8(
     mx::array q8,

@@ -157,8 +157,9 @@ def test_call_matches_its_formula(name):
 @requires_nax
 def test_chunked_rows_have_the_whole_calls_bits():
     """The query rows in 4096-row chunks, the last ragged, as callers that
-    pause between chunks run them, and one slice off the 64-row blocks:
-    each equals its rows of the whole call bit for bit."""
+    pause between chunks run them, and one slice off the 64-row blocks.
+    q8 and q_scale go in as the sliced views, uncopied, as callers pass
+    them. Each equals its rows of the whole call bit for bit."""
     rows = 9000
     q, k, v = _qkv(7, 1, 4, 4, rows, rows)
     q8, qs, k8, ks = kq.sdpa_qk8_inputs(q, k, SCALE)
@@ -171,6 +172,24 @@ def test_chunked_rows_have_the_whole_calls_bits():
         np.testing.assert_array_equal(
             np.array(part.view(mx.uint16)), whole[:, :, r0:r1]
         )
+
+
+@requires_nax
+def test_key_slices_off_vector_boundaries_read_as_copies():
+    """k8, k_scale and v sliced from key row 1, so k_scale starts 4 bytes
+    past a 16-byte boundary while kL stays a multiple of 32: the call
+    equals the call on contiguous copies bit for bit."""
+    q, k, v = _qkv(13, 1, 4, 1, 128, 289)  # one key head: a row-major view
+    q8, qs, k8, ks = kq.sdpa_qk8_inputs(q, k, SCALE)
+    mx.eval(q8, qs, k8, ks)
+    k8, ks, v = k8[:, :, 1:], ks[:, :, 1:], v[:, :, 1:]
+    got = kq.sdpa_qk8(q8, qs, k8, ks, v)
+    want = kq.sdpa_qk8(
+        q8, qs, mx.array(np.array(k8)), mx.array(np.array(ks)), mx.contiguous(v)
+    )
+    np.testing.assert_array_equal(
+        np.array(got.view(mx.uint16)), np.array(want.view(mx.uint16))
+    )
 
 
 @requires_nax

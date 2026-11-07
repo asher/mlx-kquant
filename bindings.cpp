@@ -644,14 +644,19 @@ NB_MODULE(_ext, m) {
         Attention with int8 Q K^T and bfloat16 P V on the tensor-op units,
         without a mask: softmax(Q K^T) V with Q and K the dequantized
         q8 and k8 (the query scale is in q8). Lossy: the error against
-        bfloat16 attention is that of the int8 rows. Needs a NAX GPU (M5
-        and later).
+        bfloat16 attention is that of the int8 rows. A call on a slice of
+        the query rows returns the bits of those rows of the whole call,
+        so the rows can run in chunks with K quantized once. Needs a NAX
+        GPU (M5 and later).
 
         Args:
-            q8 (array): int8 [B, n_q_heads, qL, 128] from sdpa_qk8_inputs.
-            q_scale (array): float32 [B, n_q_heads, qL].
-            k8 (array): int8 [B, n_kv_heads, kL, 128].
-            k_scale (array): float32 [B, n_kv_heads, kL].
+            q8 (array): int8 [B, n_q_heads, qL, 128] from sdpa_qk8_inputs,
+                or a slice of its rows such as q8[:, :, a:b]. Batch, head
+                and row strided is fine; it is read in place.
+            q_scale (array): float32 [B, n_q_heads, qL], sliced as q8.
+                Strided is fine; it is copied when not row-major.
+            k8 (array): int8 [B, n_kv_heads, kL, 128], strided as q8.
+            k_scale (array): float32 [B, n_kv_heads, kL], as q_scale.
             v (array): values [B, n_kv_heads, kL, 128], bfloat16. Batch,
                 head and row strided is fine.
 

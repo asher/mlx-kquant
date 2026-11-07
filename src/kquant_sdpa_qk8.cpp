@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "kquant.h"
-#include "kquant_internal.h" // kq_type_string, kq_unit_stride_gpu
+#include "kquant_internal.h" // kq_type_string, kq_*_gpu layout helpers
 
 #include "mlx/allocator.h"
 #include "mlx/ops.h"
@@ -125,16 +125,20 @@ void KQuantSDPAQK8::eval_gpu(
         "requires a GPU with tensor-op (NAX) units, M5 or later; check "
         "nax_available().");
   }
-  // Q, K and V are read through their batch, head and row strides with a
-  // unit head-dim stride, from boundaries of four elements.
+  // Q, K and V are read in place through their batch, head and row strides
+  // with a unit head-dim stride, from boundaries of four elements: a slice of
+  // query rows, q8[:, :, a:b], is not copied.
   const mx::array q =
       kq_strides_aligned_gpu(inputs[0], s, "sdpa_qk8 q8", 4 * 1);
   const mx::array k =
       kq_strides_aligned_gpu(inputs[1], s, "sdpa_qk8 k8", 4 * 1);
   const mx::array v = kq_strides_aligned_gpu(
       inputs[2], s, "sdpa_qk8 v", 4 * static_cast<int>(inputs[2].itemsize()));
-  const mx::array& sq = inputs[3];
-  const mx::array& sk = inputs[4];
+  // The scales are read row-major: the Q scales one at a time, the K
+  // scales of a whole key block as float4 from a 16-byte boundary. A slice
+  // of query rows, as a chunked caller passes, is copied here.
+  const mx::array sq = kq_row_major_gpu(inputs[3], s);
+  const mx::array sk = kq_x_aligned_gpu(inputs[4], s, "sdpa_qk8 k_scale", 16);
   auto& o = outputs[0];
 
   // [B, H, qL, D] stored as [B, qL, H, D], as MLX's attention stores it, so
@@ -316,9 +320,7 @@ mx::array sdpa_qk8(
         "requires a GPU with tensor-op (NAX) units, M5 or later; check "
         "nax_available().");
   }
-  auto f32 = [&](mx::array a) {
-    return mx::contiguous(mx::astype(a, mx::float32, s), false, s);
-  };
+  auto f32 = [&](mx::array a) { return mx::astype(a, mx::float32, s); };
   auto shape = q8.shape();
   return mx::array(
       std::move(shape),
