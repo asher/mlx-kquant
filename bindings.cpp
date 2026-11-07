@@ -603,6 +603,64 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_qk8_inputs",
+      &mlx_kquant::sdpa_qk8_inputs,
+      "q"_a,
+      "k"_a,
+      "scale"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Quantizes q and k to the int8 operands of sdpa_qk8. Each row of
+        q * scale becomes 128 int8 codes and a float32 scale, max |x| / 127,
+        with codes rounded to nearest. Each row of k minus k's mean over its
+        kL rows becomes codes and a scale the same way; the shift leaves the
+        softmax unchanged. Runs on any Metal GPU.
+
+        Args:
+            q (array): queries [B, n_q_heads, qL, 128], bfloat16. Batch,
+                head and row strided is fine.
+            k (array): keys [B, n_kv_heads, kL, 128], bfloat16;
+                n_kv_heads must divide n_q_heads.
+            scale (float): query scale (typically 1/sqrt(128)), finite.
+
+        Returns:
+            tuple(array, array, array, array): q8 int8 [B, n_q_heads, qL,
+            128], q_scale float32 [B, n_q_heads, qL], k8 int8 [B,
+            n_kv_heads, kL, 128] and k_scale float32 [B, n_kv_heads, kL].
+      )");
+
+  m.def(
+      "sdpa_qk8",
+      &mlx_kquant::sdpa_qk8,
+      "q8"_a,
+      "q_scale"_a,
+      "k8"_a,
+      "k_scale"_a,
+      "v"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Attention with int8 Q K^T and bfloat16 P V on the tensor-op units,
+        without a mask: softmax(Q K^T) V with Q and K the dequantized
+        q8 and k8 (the query scale is in q8). Lossy: the error against
+        bfloat16 attention is that of the int8 rows. Needs a NAX GPU (M5
+        and later).
+
+        Args:
+            q8 (array): int8 [B, n_q_heads, qL, 128] from sdpa_qk8_inputs.
+            q_scale (array): float32 [B, n_q_heads, qL].
+            k8 (array): int8 [B, n_kv_heads, kL, 128].
+            k_scale (array): float32 [B, n_kv_heads, kL].
+            v (array): values [B, n_kv_heads, kL, 128], bfloat16. Batch,
+                head and row strided is fine.
+
+        Returns:
+            array: attention output [B, n_q_heads, qL, 128], bfloat16,
+            laid out as [B, qL, n_q_heads, 128].
+      )");
+
+  m.def(
       "_vsa_fixed_shapes",
       &mlx_kquant::vsa_fixed_shapes,
       "x"_a,
