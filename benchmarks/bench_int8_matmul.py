@@ -12,7 +12,12 @@ are MiniMax-H3's four block linears; mlp.fc2 runs with one activation scale
 per row per 1024 columns.
 
 Timing: mx.synchronize() fences around every sample; the arms alternate in
-Thue-Morse order across rounds after a warm-up sample of each. Each sample
+Thue-Morse order across rounds after a warm-up sample of each. Before the
+first cell's timed rounds, its arms run untimed for --warmup-s seconds
+(default 45), so every cell is timed at the sustained clock of a loaded
+GPU rather than the higher clock of a cold one, at which the int8 arms
+gain less on some shapes. Each warm-up sample prints a "warm" line with its
+wall-clock start and end too. Each sample
 prints one line with its wall-clock start and end (time.time()), so a
 wrapper can match them to an external clock record. Reports the median,
 the spread (max - min over the median), the relative IQR and the 95
@@ -63,7 +68,7 @@ def sample(fn):
     return time.perf_counter() - p0, t0, time.time()
 
 
-def run_cell(name, rows, rounds):
+def run_cell(name, rows, rounds, warmup_s=0.0):
     K, N, gs = SHAPES[name]
     mx.clear_cache()
     wf = mx.random.normal((N, K), key=mx.random.key(1)) * 0.02
@@ -99,6 +104,15 @@ def run_cell(name, rows, rounds):
 
     for nm in ARMS:
         sample(arms[nm])
+    t_end = time.time() + warmup_s
+    while time.time() < t_end:
+        for nm in ARMS:
+            dt, t0, t1 = sample(arms[nm])
+            print(
+                f"warm {name} rows {rows} {nm} {dt * 1e3:.2f} ms "
+                f"t0 {t0:.4f} t1 {t1:.4f}",
+                flush=True,
+            )
     times = {nm: [] for nm in ARMS}
     for rnd in range(rounds):
         order = ARMS[::-1] if tm_bit(rnd) else ARMS
@@ -151,6 +165,12 @@ def main():
     ap.add_argument("--shapes", nargs="+", default=list(SHAPES), choices=list(SHAPES))
     ap.add_argument("--rounds", type=int, default=16)
     ap.add_argument("--cache-limit-gib", type=float, default=6.0)
+    ap.add_argument(
+        "--warmup-s",
+        type=float,
+        default=45.0,
+        help="untimed load before the first cell's timed rounds",
+    )
     ap.add_argument("--json-out", default=None, help="write results here")
     a = ap.parse_args()
     if not kq.nax_available():
@@ -162,11 +182,14 @@ def main():
         "kq_version": kq.__version__,
         "rounds": a.rounds,
         "cache_limit_gib": a.cache_limit_gib,
+        "warmup_s": a.warmup_s,
         "cells": [],
     }
+    warm = a.warmup_s
     for rows in a.rows:
         for name in a.shapes:
-            res["cells"].append(run_cell(name, rows, a.rounds))
+            res["cells"].append(run_cell(name, rows, a.rounds, warm))
+            warm = 0.0
             mx.clear_cache()
 
     print(
