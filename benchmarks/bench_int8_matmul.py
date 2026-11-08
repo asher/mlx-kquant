@@ -20,6 +20,11 @@ percent CI of the median per arm, and the paired per-round ratio of each
 int8 arm's time to q4k's. The relative L2 distance of int8 to q4k over the
 first 256 rows is printed as a sanity check (both are lossy).
 
+The MLX buffer cache is capped at --cache-limit-gib (default 6), enough to
+hold each arm's output and temporaries at 38010 rows, so every arm reuses
+its buffers from call to call; under a smaller cap an arm whose temporaries
+push the cache past it allocates its output afresh on each call.
+
 Protocol: idle machine; GPU microbench only (no model load). Needs a GPU
 with tensor-op (NAX) units.
 """
@@ -145,16 +150,18 @@ def main():
     ap.add_argument("--rows", type=int, nargs="+", default=[38010, 9472])
     ap.add_argument("--shapes", nargs="+", default=list(SHAPES), choices=list(SHAPES))
     ap.add_argument("--rounds", type=int, default=16)
+    ap.add_argument("--cache-limit-gib", type=float, default=6.0)
     ap.add_argument("--json-out", default=None, help="write results here")
     a = ap.parse_args()
     if not kq.nax_available():
         raise SystemExit("int8_matmul needs a GPU with tensor-op (NAX) units")
 
-    mx.set_cache_limit(2 << 30)
+    mx.set_cache_limit(int(a.cache_limit_gib * 2**30))
     res = {
         "mlx_version": mx.__version__,
         "kq_version": kq.__version__,
         "rounds": a.rounds,
+        "cache_limit_gib": a.cache_limit_gib,
         "cells": [],
     }
     for rows in a.rows:
