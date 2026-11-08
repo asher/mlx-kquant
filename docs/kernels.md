@@ -1505,37 +1505,39 @@ into a packed layout first.
   `G = ceil(K / group_size)`, 1 without a group. A weight `[N, K]` gives one scale per output
   channel, `[N, 1]`; pass it to `int8_matmul` as `[N]`. x must be finite: an inf makes its group's
   scale inf and codes itself as -127, and a NaN codes as -127 under a finite scale, so it does not
-  reach the output as NaN. At most 2^27 groups a call (rows times G); quantize more in row chunks.
-  Runs on any Metal GPU.
+  reach the output as NaN. At most 2^27 - 8 groups a call (rows times G); quantize more in row
+  chunks. Runs on any Metal GPU.
 - `int8_matmul(x8, x_scales, w8, w_scales, *, group_size=None, out_dtype=mx.bfloat16)` - an int8
   x int8 matmul on the tensor-op units of M5 and later GPUs, with the weight laid out `[N, K]` as
   in `quantized_matmul(..., transpose=True)`:
   `y[r, c] = sum over groups g of (sum over the group of x8[r, k] w8[c, k]) * x_scales[r, g]`,
   times `w_scales[c]`. Each group's sum is exact in int32 for groups of up to 133120 columns (K
   without a group), the longest for which 127 x 127 x the length stays under 2^31; longer groups
-  are refused. The sum over groups runs in float32 in group order. Without a group,
-  `y[r, c] = acc * x_scales[r, 0] * w_scales[c]`. x8 is int8 `[..., K]` with K a multiple of 32,
-  x_scales float32 `[..., G]` for the same group_size, w8 int8 `[N, K]` and w_scales float32 `[N]`.
-  The output is `[..., N]` in bfloat16, float16 or float32, row-major. It is lossy against the
-  float product: the error is that of the int8 codes, and against the float64 product of the same
-  codes and scales a bfloat16 output is about 1.7e-3 in relative L2, from its own rounding.
+  are refused. This needs codes in [-127, 127], as `int8_quantize_rows` makes them: a code of
+  -128, which int8 allows, can wrap the sum of a long group. The sum over groups runs in float32
+  in group order. Without a group, `y[r, c] = acc * x_scales[r, 0] * w_scales[c]`. x8 is int8
+  `[..., K]` with K a multiple of 32, x_scales float32 `[..., G]` for the same group_size, w8 int8
+  `[N, K]` and w_scales float32 `[N]`. The output is `[..., N]` in bfloat16, float16 or float32,
+  row-major. It is lossy against the float product: the error is that of the int8 codes, and
+  against the float64 product of the same codes and scales a bfloat16 output is about 1.7e-3 in
+  relative L2, from its own rounding.
 
   One threadgroup computes a 128 by 128 block of y with one tensor-op matmul over the block, K in
   steps of 32, into int32. With groups, the int32 sum is cleared at each group boundary and added
-  into a float32 sum with its row scale. Any M from 0 and any N from 1 to 2^29: the last row block
-  reads a copy of its rows zero padded to 128 rows, the last column block a copy of its weight rows
-  padded the same way, and stores skip the rows past M and the columns past N. A call on a slice of
-  the rows, `x8[a:b]` with `x_scales[a:b]`, returns the bits of those rows of the whole call, so a
-  caller can run the rows in chunks. Outputs past 2 GiB and 4 GiB are indexed in 64 bits. One
-  pipeline is built per K and group size. A call whose N is not a multiple of 128 checks every
-  column it stores and runs slower.
+  into a float32 sum with its row scale. Any M from 0 and any N from 0 to 2^29 - 128: the last row
+  block reads a copy of its rows zero padded to 128 rows, the last column block a copy of its
+  weight rows padded the same way, and stores skip the rows past M and the columns past N. A call
+  on a slice of the rows, `x8[a:b]` with `x_scales[a:b]`, returns the bits of those rows of the
+  whole call, so a caller can run the rows in chunks. Outputs past 2 GiB and 4 GiB are indexed in
+  64 bits. One pipeline is built per K and group size. A call whose N is not a multiple of 128
+  checks every column it stores and runs slower.
 
   Both ops refuse a CPU stream, other dtypes, a group_size that is not a multiple of 32 from 32
-  up, and mismatched shapes with a `ValueError`. `int8_quantize_rows` also refuses more than 2^27
-  groups. `int8_matmul` also refuses a K that is not a positive multiple of 32 (pad x8 and w8 with
-  zero columns), a group, or K without one, over 133120 columns, an x8 of 2^31 - 256 rows or more
-  and a w8 of more than 2^29 rows, and raises a `RuntimeError` on a GPU without the tensor-op
-  units. Inference only.
+  up, and mismatched shapes with a `ValueError`. `int8_quantize_rows` also refuses more than
+  2^27 - 8 groups. `int8_matmul` also refuses a K that is not a positive multiple of 32 (pad x8
+  and w8 with zero columns), a group, or K without one, over 133120 columns, an x8 of 2^31 - 256
+  rows or more and a w8 of more than 2^29 - 128 rows, and raises a `RuntimeError` on a GPU without
+  the tensor-op units. Inference only.
 
 ## KVarN KV cache
 
