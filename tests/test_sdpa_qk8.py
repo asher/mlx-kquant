@@ -4,7 +4,8 @@ Every numeric bound below was fixed before the kernel first ran, from a
 reference figure times a margin named in the test's docstring. The figures
 are the relative L2 distances of a reference implementation of the same
 scheme on random normal inputs at 1024 rows: 1.97e-3 against its float
-formula, 9.40e-3 against MLX's attention.
+formula, 9.40e-3 against MLX's attention. The per-row check, added later,
+reuses the float64 bound unchanged.
 """
 
 import os
@@ -63,6 +64,13 @@ def _rel(x, ref):
     x = np.asarray(x, np.float64)
     ref = np.asarray(ref, np.float64)
     return float(np.linalg.norm(x - ref) / np.linalg.norm(ref))
+
+
+def _rel_rows(x, ref):
+    """The relative L2 distance of each query row of [B, H, L, D]."""
+    x = np.asarray(x, np.float64)
+    ref = np.asarray(ref, np.float64)
+    return np.linalg.norm(x - ref, axis=-1) / np.linalg.norm(ref, axis=-1)
 
 
 def _f64(a):
@@ -130,6 +138,7 @@ ROWS = {
     "short_37": (1, 4, 4, 37, 37),
     "gqa_batch2_512": (2, 4, 2, 512, 512),
     "ragged_keys_300": (1, 4, 4, 512, 300),
+    "ragged_keys_280": (1, 4, 4, 512, 280),
 }
 
 
@@ -137,9 +146,12 @@ ROWS = {
 @pytest.mark.parametrize("name", sorted(ROWS))
 def test_call_matches_its_formula(name):
     """Relative L2 against the float64 formula on the op's own int8 inputs
-    and scales, within 2x the reference's 1.97e-3; against MLX's attention
-    on the bfloat16 inputs within 2e-2 (reference 9.40e-3, about 2.1x), and
-    at least 9.40e-3 / 2 from it, so the int8 path ran."""
+    and scales, within 2x the reference's 1.97e-3, over the whole output and
+    for each query row on its own, so a tail row cannot hide in the total;
+    against MLX's attention on the bfloat16 inputs within 2e-2 (reference
+    9.40e-3, about 2.1x), and at least 9.40e-3 / 2 from it, so the int8 path
+    ran. kL 300 and 280 leave 12 and 24 live keys in the last block, under
+    and over its first 16 rows."""
     b, h, hk, ql, kl = ROWS[name]
     q, k, v = _qkv(sum(ROWS[name]), b, h, hk, ql, kl)
     q8, qs, k8, ks = kq.sdpa_qk8_inputs(q, k, SCALE)
@@ -149,7 +161,9 @@ def test_call_matches_its_formula(name):
     assert out.shape == (b, h, ql, D) and out.dtype == mx.bfloat16
     got = _f64(out)
     assert np.isfinite(got).all()
-    assert _rel(got, _formula64(q8, qs, k8, ks, v)) < REL_FORMULA
+    want = _formula64(q8, qs, k8, ks, v)
+    assert _rel(got, want) < REL_FORMULA
+    assert _rel_rows(got, want).max() < REL_FORMULA
     rel_dense = _rel(got, _f64(dense))
     assert REL_DENSE_MIN < rel_dense < REL_DENSE_MAX
 
@@ -264,6 +278,10 @@ CALL_GUARDS = {
     "k_scale": ("k_scale must be", {"k_scale": lambda x: x[:, :1]}),
     "v_rows": ("v must have the shape of k8", {"v": lambda x: x[:, :, :-1]}),
     "v_dtype": ("v must be bfloat16", {"v": lambda x: x.astype(mx.float16)}),
+    "scale_dtype": (
+        "q_scale and k_scale must be float32",
+        {"q_scale": lambda x: x.astype(mx.bfloat16)},
+    ),
 }
 
 
