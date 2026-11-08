@@ -579,8 +579,9 @@ mx::array sdpa_qk8(
 // Int8 codes and float32 scales of the rows of x, the operands of
 // int8_matmul. x is bfloat16, float16 or float32 [..., K]; each row splits
 // into groups of group_size columns (the whole row when nullopt; the last
-// group may be short), and for each group m = max |x|, s = m / 127 (1 / 127
-// when m is 0), codes = clamp(rint(x / s), -127, 127). group_size is a
+// group may be short), and for each group m = max |x|, s = max(m / 127,
+// FLT_MIN) (1 / 127 when m is 0), codes = clamp(rint(x / s), -127, 127),
+// ties to even. The floor keeps s normal. group_size is a
 // multiple of 32. Returns (codes int8 of x's shape, scales float32 [..., G])
 // with G = ceil(K / group_size), 1 without a group. Any Metal GPU.
 std::tuple<mx::array, mx::array> int8_quantize_rows(
