@@ -576,6 +576,36 @@ mx::array sdpa_qk8(
     mx::array v,
     mx::StreamOrDevice s = {});
 
+// Int8 codes and float32 scales of the rows of x, the operands of
+// int8_matmul. x is bfloat16, float16 or float32 [..., K]; each row splits
+// into groups of group_size columns (the whole row when nullopt; the last
+// group may be short), and for each group m = max |x|, s = m / 127 (1 / 127
+// when m is 0), codes = clamp(rint(x / s), -127, 127). group_size is a
+// multiple of 32. Returns (codes int8 of x's shape, scales float32 [..., G])
+// with G = ceil(K / group_size), 1 without a group. Any Metal GPU.
+std::tuple<mx::array, mx::array> int8_quantize_rows(
+    mx::array x,
+    std::optional<int> group_size = std::nullopt,
+    mx::StreamOrDevice s = {});
+
+// y = x8 w8^T with x8 [..., K] and w8 [N, K] int8 from int8_quantize_rows,
+// K a multiple of 32: y[r, c] = sum over groups g of (int32 sum over the
+// group of x8[r, k] w8[c, k]) x_scales[r, g], times w_scales[c], each
+// group's sum exact and the sum over groups in float32 in group order.
+// Without a group (or group_size >= K), y = float(acc) * x_scales[r, 0] *
+// w_scales[c]. x_scales float32 [..., G], w_scales float32 [N]. Output
+// [..., N] in out_dtype (bfloat16, float16 or float32), row-major. Lossy
+// against the float product. Requires the tensor-op units
+// (nax_available()).
+mx::array int8_matmul(
+    mx::array x8,
+    mx::array x_scales,
+    mx::array w8,
+    mx::array w_scales,
+    std::optional<int> group_size = std::nullopt,
+    mx::Dtype out_dtype = mx::bfloat16,
+    mx::StreamOrDevice s = {});
+
 // sdpa_fa_verify returning {out, lse}: lse [B, Hkv, n_rows] float32 is the
 // natural-log softmax normalizer per folded row (cascade merge weight).
 std::vector<mx::array> sdpa_fa_verify_lse(
@@ -2341,6 +2371,68 @@ class KQuantSDPAQK8 : public mx::Primitive {
   bool is_equivalent(const mx::Primitive&) const override {
     return true;
   }
+};
+
+// Int8 codes and scales of rows (see int8_quantize_rows). Inference-only.
+class KQuantInt8QuantizeRows : public mx::Primitive {
+ public:
+  explicit KQuantInt8QuantizeRows(
+      mx::Stream stream,
+      std::optional<int> group_size)
+      : mx::Primitive(stream), group_size_(group_size) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantInt8QuantizeRows";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return group_size_ ==
+        static_cast<const KQuantInt8QuantizeRows&>(other).group_size_;
+  }
+
+ private:
+  std::optional<int> group_size_;
+};
+
+// int8 x int8 matmul (see int8_matmul). Inference-only.
+class KQuantInt8Matmul : public mx::Primitive {
+ public:
+  explicit KQuantInt8Matmul(
+      mx::Stream stream,
+      std::optional<int> group_size,
+      mx::Dtype out_dtype)
+      : mx::Primitive(stream), group_size_(group_size), out_dtype_(out_dtype) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantInt8Matmul";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    const auto& o = static_cast<const KQuantInt8Matmul&>(other);
+    return group_size_ == o.group_size_ && out_dtype_ == o.out_dtype_;
+  }
+
+ private:
+  std::optional<int> group_size_;
+  mx::Dtype out_dtype_;
 };
 
 // Fused shared-prefix cascade attention (see sdpa_decode_gqa_cascade).
