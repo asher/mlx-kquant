@@ -441,6 +441,14 @@ def test_zero_rows_give_an_empty_output():
     assert y.shape == (0, 128)
 
 
+@requires_nax
+def test_zero_columns_give_an_empty_output():
+    x8, sx, _, _ = _operands(_rng(23), 4, 128, 256)
+    y = kq.int8_matmul(x8, sx, mx.zeros((0, 256), mx.int8), mx.zeros((0,), mx.float32))
+    mx.eval(y)
+    assert y.shape == (4, 0)
+
+
 # Outputs past 2 GiB and 4 GiB.
 
 
@@ -528,6 +536,11 @@ def _mm_args():
     )
 
 
+# The grid limits: the largest group count and N whose grids stay under
+# 2^32 threads (Metal runs a grid axis's thread count mod 2^32).
+MAX_GROUPS = (1 << 27) - 8
+MAX_N = (1 << 29) - 128
+
 QUANT_GUARDS = {
     "scalar": ("at least one dim", {"x": mx.zeros((), mx.bfloat16)}),
     "empty_k": ("at least one dim", {"x": mx.zeros((4, 0), mx.bfloat16)}),
@@ -537,11 +550,12 @@ QUANT_GUARDS = {
     ),
     "group_small": ("group_size must be", {"group_size": 0}),
     "group_odd": ("group_size must be", {"group_size": 48}),
-    # Lazy inputs one past 2^27 groups; nothing is evaluated.
-    "groups_rows": ("at most 2", {"x": mx.zeros(((1 << 27) + 1, 32), mx.bfloat16)}),
+    # Lazy inputs past 2^27 - 8 groups (MAX_GROUPS + 1 rows, and 2^22 rows of
+    # 32 groups); nothing is evaluated.
+    "groups_rows": ("at most 2", {"x": mx.zeros((MAX_GROUPS + 1, 32), mx.bfloat16)}),
     "groups_grouped": (
         "at most 2",
-        {"x": mx.zeros(((1 << 22) + 1, 1024), mx.bfloat16), "group_size": 32},
+        {"x": mx.zeros((1 << 22, 1024), mx.bfloat16), "group_size": 32},
     ),
 }
 
@@ -585,8 +599,8 @@ MM_GUARDS = {
     "n_rows": (
         "at most 2",
         {
-            "w8": mx.zeros(((1 << 29) + 1, 64), mx.int8),
-            "w_scales": mx.ones(((1 << 29) + 1,), mx.float32),
+            "w8": mx.zeros((MAX_N + 1, 64), mx.int8),
+            "w_scales": mx.ones((MAX_N + 1,), mx.float32),
         },
     ),
     "group_len": (
@@ -621,11 +635,13 @@ def test_matmul_guard_refuses(name):
 
 @requires_nax
 def test_limits_accept_their_bound():
-    """Each size refusal starts one past its bound: 2^27 groups, N 2^29,
-    and a 133120-column group build without error. Nothing is evaluated."""
-    kq.int8_quantize_rows(mx.zeros((1 << 27, 32), mx.bfloat16))
-    kq.int8_quantize_rows(mx.zeros((1 << 22, 1024), mx.bfloat16), group_size=32)
-    n = 1 << 29
+    """Each size refusal starts one past its bound: 2^27 - 8 groups (rows,
+    and 2^27 - 32 as rows x 32 groups), N 2^29 - 128, and a 133120-column
+    group build without error. The grid limits are the largest values whose
+    grids stay under 2^32 threads. Nothing is evaluated."""
+    kq.int8_quantize_rows(mx.zeros((MAX_GROUPS, 32), mx.bfloat16))
+    kq.int8_quantize_rows(mx.zeros(((1 << 22) - 1, 1024), mx.bfloat16), group_size=32)
+    n = MAX_N
     kq.int8_matmul(
         **{**_mm_args(), "w8": mx.zeros((n, 64), mx.int8), "w_scales": mx.ones((n,))}
     )

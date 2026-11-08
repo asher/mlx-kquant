@@ -684,7 +684,7 @@ NB_MODULE(_ext, m) {
         codes = clamp(rint(x / s), -127, 127), ties to even. A weight
         [N, K] gives one scale per output channel, [N, 1]. x must be
         finite: an inf or NaN codes as -127 and a NaN does not reach the
-        output. At most 2^27 groups a call. Runs on any Metal GPU.
+        output. At most 2^27 - 8 groups a call. Runs on any Metal GPU.
 
         Args:
             x (array): bfloat16, float16 or float32 [..., K], K >= 1. A
@@ -724,11 +724,13 @@ NB_MODULE(_ext, m) {
 
         Args:
             x8 (array): int8 [..., K] from int8_quantize_rows, K a
-                multiple of 32, or a slice of its rows.
+                multiple of 32, or a slice of its rows. Codes of x8 and
+                w8 must lie in [-127, 127], as int8_quantize_rows makes
+                them; a -128 can wrap the int32 sum of a long group.
             x_scales (array): float32 [..., G], the scales of x8 for the
                 same group_size, sliced as x8.
             w8 (array): int8 [N, K], one output channel a row, N at most
-                2^29.
+                2^29 - 128.
             w_scales (array): float32 [N].
             group_size (int, optional): the group_size x8 was quantized
                 with, a multiple of 32; None for one scale a row.

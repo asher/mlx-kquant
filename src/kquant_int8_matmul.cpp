@@ -35,10 +35,12 @@ constexpr int kKStep = 32; // K of one tensor-op step
 constexpr int kBlock = 128; // rows and columns of an output block
 constexpr int64_t kMaxRows = (int64_t{1} << 31) - 256;
 // Grid limits: Metal counts a grid axis's threads in 32 bits and runs only
-// the remainder past 2^32. The quantizer puts 32 threads a unit on one
-// axis; int8_matmul 1024 threads a column block.
-constexpr int64_t kMaxQuantUnits = int64_t{1} << 27;
-constexpr int64_t kMaxN = int64_t{1} << 29;
+// the remainder mod 2^32, so a grid must stay under 2^32 threads. The
+// quantizer runs ceil(units / 8) threadgroups of 256 threads on one axis,
+// int8_matmul 4 threadgroups of 256 a column block; each limit is the
+// largest value whose grid is under 2^32 threads.
+constexpr int64_t kMaxQuantUnits = (int64_t{1} << 27) - 8;
+constexpr int64_t kMaxN = (int64_t{1} << 29) - 128;
 // The longest int32 sum of 127 x 127 products, a multiple of 32:
 // 127^2 x 133120 = 2147092480 < 2^31.
 constexpr int kMaxGroupLen = 133120;
@@ -305,7 +307,7 @@ std::tuple<mx::array, mx::array> int8_quantize_rows(
   if (units > kMaxQuantUnits) {
     throw std::invalid_argument(
         kQuantOp +
-        "x must have at most 2^27 groups, rows times ceil(K / group_size); "
+        "x must have at most 2^27 - 8 groups, rows times ceil(K / group_size); "
         "quantize it in row chunks.");
   }
   auto shapes = std::vector<mx::Shape>{
@@ -361,7 +363,7 @@ mx::array int8_matmul(
   }
   if (w8.shape(0) > kMaxN) {
     throw std::invalid_argument(
-        kMatmulOp + "w8 must have at most 2^29 rows (N).");
+        kMatmulOp + "w8 must have at most 2^29 - 128 rows (N).");
   }
   if (x_scales.dtype() != mx::float32 ||
       x_scales.shape() != last_dim(x8.shape(), scale_groups(K, group_size))) {
