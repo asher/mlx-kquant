@@ -1491,6 +1491,44 @@ into a packed layout first.
   eighth of the head dim (partial `K @ Q^T` per eighth summed through threadgroup memory, `P @ V`
   from the same resident fragments), elsewhere the `sdpa_fa_verify` simdgroup tile runs the list.
   The per-split partials merge as `sdpa_fa_verify`. `KQ_SDPA_IDX_NAX=0` forces the simdgroup kernel.
+## Int8 matmul
+
+- `int8_quantize_rows(x, *, group_size=None)` - int8 codes and float32 scales of the rows of x,
+  the operands of `int8_matmul`, for activations and weights alike. x is bfloat16, float16 or
+  float32 `[..., K]` in any layout (a non row-major x is copied). Each row splits into groups of
+  `group_size` columns, the whole row when it is None or at least K, and the last group may be
+  short. For each group, `m = max |x|`, `s = m / 127` (`1 / 127` when m is 0) and
+  `codes = clamp(rint(x / s), -127, 127)`, ties to even. Returns codes, int8 of x's shape, and
+  scales, float32 `[..., G]` with `G = ceil(K / group_size)`, 1 without a group. A weight `[N, K]`
+  gives one scale per output channel, `[N, 1]`; pass it to `int8_matmul` as `[N]`. Runs on any
+  Metal GPU.
+- `int8_matmul(x8, x_scales, w8, w_scales, *, group_size=None, out_dtype=mx.bfloat16)` - an int8
+  x int8 matmul on the tensor-op units of M5 and later GPUs, with the weight laid out `[N, K]` as
+  in `quantized_matmul(..., transpose=True)`:
+  `y[r, c] = sum over groups g of (sum over the group of x8[r, k] w8[c, k]) * x_scales[r, g]`,
+  times `w_scales[c]`. Each group's sum is exact in int32, and the sum over groups runs in float32
+  in group order. Without a group, `y[r, c] = acc * x_scales[r, 0] * w_scales[c]`. x8 is int8
+  `[..., K]` with K a multiple of 32, x_scales float32 `[..., G]` for the same group_size, w8 int8
+  `[N, K]` and w_scales float32 `[N]`. The output is `[..., N]` in bfloat16, float16 or float32,
+  row-major. It is lossy against the float product: the error is that of the int8 codes, and
+  against the float64 product of the same codes and scales a bfloat16 output is about 1.7e-3 in
+  relative L2, from its own rounding.
+
+  One threadgroup computes a 128 by 128 block of y with one tensor-op matmul over the block, K in
+  steps of 32, into int32. With groups, the int32 sum is cleared at each group boundary and added
+  into a float32 sum with its row scale. Any M from 0 and any N: the last row block reads a copy of
+  its rows zero padded to 128 rows, the last column block a copy of its weight rows padded the same
+  way, and stores skip the rows past M and the columns past N. A call on a slice of the rows,
+  `x8[a:b]` with `x_scales[a:b]`, returns the bits of those rows of the whole call, so a caller can
+  run the rows in chunks. Outputs past 2 GiB and 4 GiB are indexed in 64 bits. One pipeline is
+  built per K and group size. A call whose N is not a multiple of 128 checks every column it stores
+  and runs slower.
+
+  Both ops refuse a CPU stream, other dtypes, a group_size that is not a multiple of 32 from 32
+  up, and mismatched shapes with a `ValueError`, and `int8_matmul` a K that is not a positive
+  multiple of 32: pad x8 and w8 with zero columns. `int8_matmul` raises a `RuntimeError` on a GPU
+  without the tensor-op units. Inference only.
+
 ## KVarN KV cache
 
 Variance-normalized KV-cache quantization: the method of Huawei's KVarN (Muller et al.,
