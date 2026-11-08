@@ -546,6 +546,36 @@ mx::array sdpa_prefill_window(
     std::optional<mx::array> starts = std::nullopt,
     mx::StreamOrDevice s = {});
 
+// Quantizes the operands of sdpa_qk8: q [B, H, qL, 128] and k [B, Hk, kL,
+// 128], bfloat16, H a multiple of Hk. Each row of q times scale becomes int8
+// codes with a float32 scale (max |x| / 127, rounded to nearest), and each
+// row of k minus k's mean over its kL rows likewise. Returns (q8, q_scale,
+// k8, k_scale) with q8 [B, H, qL, 128], q_scale [B, H, qL], k8 [B, Hk, kL,
+// 128] and k_scale [B, Hk, kL]. Any Metal GPU.
+std::tuple<mx::array, mx::array, mx::array, mx::array> sdpa_qk8_inputs(
+    mx::array q,
+    mx::array k,
+    float scale,
+    mx::StreamOrDevice s = {});
+
+// Attention with int8 Q K^T and bfloat16 P V: softmax(dequant(q8) .
+// dequant(k8)^T) v without a mask, the inputs from sdpa_qk8_inputs (the
+// scale is in q8). v [B, Hk, kL, 128] bfloat16. q8, k8 and v are read
+// through their batch, head and row strides; q_scale and k_scale, float32
+// and positive as sdpa_qk8_inputs returns them, may be strided too and are
+// copied when they are not row-major. A slice of query
+// rows, q8[:, :, a:b] with q_scale[:, :, a:b], returns the bits of those
+// rows of the whole call. Output [B, H, qL, 128] bfloat16 laid out as
+// [B, qL, H, 128], as mx.fast SDPA lays it out. Lossy.
+// Requires the tensor-op units (nax_available()).
+mx::array sdpa_qk8(
+    mx::array q8,
+    mx::array q_scale,
+    mx::array k8,
+    mx::array k_scale,
+    mx::array v,
+    mx::StreamOrDevice s = {});
+
 // sdpa_fa_verify returning {out, lse}: lse [B, Hkv, n_rows] float32 is the
 // natural-log softmax normalizer per folded row (cascade merge weight).
 std::vector<mx::array> sdpa_fa_verify_lse(
@@ -2260,6 +2290,57 @@ class KQuantSDPAWindow : public mx::Primitive {
   int window_;
   bool has_sinks_;
   bool has_starts_;
+};
+
+// Int8 codes and scales of the operands of sdpa_qk8 (see sdpa_qk8_inputs).
+// Inference-only.
+class KQuantSDPAQK8Inputs : public mx::Primitive {
+ public:
+  explicit KQuantSDPAQK8Inputs(mx::Stream stream, float scale)
+      : mx::Primitive(stream), scale_(scale) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSDPAQK8Inputs";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    return scale_ == static_cast<const KQuantSDPAQK8Inputs&>(other).scale_;
+  }
+
+ private:
+  float scale_;
+};
+
+// Attention with int8 Q K^T (see sdpa_qk8). Inference-only.
+class KQuantSDPAQK8 : public mx::Primitive {
+ public:
+  explicit KQuantSDPAQK8(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSDPAQK8";
+  }
+  bool is_equivalent(const mx::Primitive&) const override {
+    return true;
+  }
 };
 
 // Fused shared-prefix cascade attention (see sdpa_decode_gqa_cascade).
