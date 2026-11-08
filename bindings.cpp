@@ -615,7 +615,9 @@ NB_MODULE(_ext, m) {
         q * scale becomes 128 int8 codes and a float32 scale, max |x| / 127,
         with codes rounded to nearest. Each row of k minus k's mean over its
         kL rows becomes codes and a scale the same way; the shift leaves the
-        softmax unchanged. Runs on any Metal GPU.
+        softmax unchanged. The mean is taken in bfloat16, whose rounding
+        depends on k's layout, so k8 and k_scale repeat their bits only for
+        the same layout of k. Runs on any Metal GPU.
 
         Args:
             q (array): queries [B, n_q_heads, qL, 128], bfloat16. Batch,
@@ -653,8 +655,9 @@ NB_MODULE(_ext, m) {
             q8 (array): int8 [B, n_q_heads, qL, 128] from sdpa_qk8_inputs,
                 or a slice of its rows such as q8[:, :, a:b]. Batch, head
                 and row strided is fine; it is read in place.
-            q_scale (array): float32 [B, n_q_heads, qL], sliced as q8.
-                Strided is fine; it is copied when not row-major.
+            q_scale (array): float32 [B, n_q_heads, qL], sliced as q8,
+                positive as sdpa_qk8_inputs returns it. Strided is fine;
+                it is copied when not row-major.
             k8 (array): int8 [B, n_kv_heads, kL, 128], strided as q8.
             k_scale (array): float32 [B, n_kv_heads, kL], as q_scale.
             v (array): values [B, n_kv_heads, kL, 128], bfloat16. Batch,
