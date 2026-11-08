@@ -37,12 +37,16 @@ two leave on the table (single-row decode, expert-sorted prefill, fused bias/mix
   `gather_qmv_mix_ns_kq` accept `lora_a` / `lora_b` (plus `lora_rows`, `lora_ids` and `lora_table`)
   and add `rows * (x @ A) @ B` on their own output inside the primitive. On the dense ops,
   `lora_ids` with stacked factors (`lora_a` [S, K, r], `lora_b` [S, r, N]) gives each row its own
-  adapter, so several adapters share one base matmul in a batch. Up to 32 rows, the rows
-  routes (`quantized_matmul`, `quantized_matmul_qmv_bias`, `gather_qmv_kq`) split the delta in two
+  adapter, so several adapters share one base matmul in a batch. Up to 32 rows, the rows routes
+  (`quantized_matmul`, `quantized_matmul_qmv_bias`, `gather_qmv_kq`) split the delta in two
   kernels: one forms `z = x @ A` in K chunks over the whole GPU, dispatched before the base route
   so the encoder overlaps the two, and one applies `z @ B` after it. In a block of rows, each
   adapter's A and B are read once, and skipped rows keep the base output. Above 32 rows they run
-  one epilogue dispatch after the base route. The score-mixed gather forms `z = x @ A`
+  one epilogue dispatch after the base route, which forms `z` over the whole K in each
+  threadgroup. Small shapes take that dispatch up to 32 rows too: rank 1 at any K, and ranks 2
+  and up with K up to 2048, K x rank up to 8192 and rows x ceil(N / 1024) up to 64. On M3 Max at
+  K 512 to 29696, it is as fast as the split at those shapes, or within about 4 us of it. The
+  score-mixed gather forms `z = x @ A`
   in a kernel dispatched before the base gather (it reads only x and A, so the encoder overlaps the
   two) and applies `z @ B` in a barrier-free kernel after it, so the serialized cost behind the
   gather is one tiny dependent kernel. Codec independent, so a live adapter adds no graph ops at
@@ -424,8 +428,9 @@ Tuning levers (defaults are right for normal use):
 - `KQ_QMV_SPLITK_TRIM` - `0` launches the `q6_k` and `q8_0` split-K kernels with all eight
   simdgroups at every K, as before, with the same output. Read live per call.
 - `KQ_LORA_SPLIT` - `0` runs the LoRA epilogue of the rows routes as one dispatch after the base
-  route at every row count, instead of the split `z` and apply kernels up to 32 rows. Read live per
-  call.
+  route at every shape. `1` runs the split `z` and apply kernels up to 32 rows at every shape,
+  including the small shapes that take one dispatch by default (see LoRA epilogue above). Read
+  live per call.
 - `KQ_VERIFY_EXT` - the mat-vec route on the M 2-12 band. `1` forces `mv_ext` for every codec with
   the kernel, `0` forces `verify_qmv` where the codec has it and per-row qmv elsewhere, and unset
   takes the per-codec default. On NAX GPUs a set value also keeps per-row qmv and NAX split-K off

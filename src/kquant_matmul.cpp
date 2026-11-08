@@ -3268,7 +3268,7 @@ void KQuantMatmul::eval_gpu(
   const int N = out.shape(-1);
   const int rows = K > 0 ? static_cast<int>(x.size() / K) : 0;
   const KqLoraRows pre =
-      kq_lora_rows_pre_gpu(d, s, x, inputs, 3, lora_flags_, rows, K);
+      kq_lora_rows_pre_gpu(d, s, x, inputs, 3, lora_flags_, rows, K, N);
   eval_gpu_base(inputs, outputs);
   if (out.size() > 0) {
     kq_lora_rows_post_gpu(d, s, x, pre, out, rows, K, N);
@@ -3916,7 +3916,7 @@ void KQuantQmvBias::eval_gpu(
 
   std::optional<KqLoraRows> pre;
   if (lora_flags_ & KQ_LORA_PRESENT) {
-    pre = kq_lora_rows_pre_gpu(d, s, x, inputs, 4, lora_flags_, 1, K);
+    pre = kq_lora_rows_pre_gpu(d, s, x, inputs, 4, lora_flags_, 1, K, N);
   }
   qmv_bias(
       x, w, scales, bias, out, group_size_, bits_, N, K, d, s, kquant_type_);

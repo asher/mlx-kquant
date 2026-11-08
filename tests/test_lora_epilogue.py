@@ -89,9 +89,9 @@ def _f32(a):
     return np.array(a.astype(mx.float32))
 
 
-def _lora(rng, shape_a, shape_b, dtype):
-    a = mx.array((rng.standard_normal(shape_a) * 0.2).astype(np.float32))
-    b = mx.array((rng.standard_normal(shape_b) * 0.2).astype(np.float32))
+def _lora(rng, shape_a, shape_b, dtype, gain=1.0):
+    a = mx.array((rng.standard_normal(shape_a) * 0.2 * gain).astype(np.float32))
+    b = mx.array((rng.standard_normal(shape_b) * 0.2 * gain).astype(np.float32))
     a, b = a.astype(dtype), b.astype(dtype)
     return a, b, _f32(a), _f32(b)
 
@@ -126,9 +126,23 @@ def test_dense_epilogue_matches_reference(codec, m, dtype):
     assert _rel(got, oracle) < 3e-2
 
 
+# KQ_LORA_SPLIT settings: the default route, the one-dispatch epilogue and
+# the split route.
+LEVERS = [None, "0", "1"]
+
+
+def _set_lever(monkeypatch, lever):
+    if lever is None:
+        monkeypatch.delenv("KQ_LORA_SPLIT", raising=False)
+    else:
+        monkeypatch.setenv("KQ_LORA_SPLIT", lever)
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_qmv_bias_route_carries_the_epilogue(dtype):
+@pytest.mark.parametrize("lever", LEVERS)
+def test_qmv_bias_route_carries_the_epilogue(dtype, lever, monkeypatch):
     # q8_0 + bias at M=1 routes KQuantLinear to quantized_matmul_qmv_bias.
+    _set_lever(monkeypatch, lever)
     wire, ref = _lin_wire_ref("q8_0", GT.Q8_0, False)
     rows_n, kk = ref.shape
     lin = KQuantLinear(in_dims=kk, out_dims=rows_n, bias=True, codec="q8_0")
@@ -291,9 +305,11 @@ def test_dense_stacked_split_route_mixed_rows(codec, m, dtype, rank, monkeypatch
 
 
 @pytest.mark.parametrize("rank", [1, 5, 320])
-def test_dense_split_route_odd_ranks_and_widths(rank):
+def test_dense_split_route_odd_ranks_and_widths(rank, monkeypatch):
     """Ranks off the 4- and 8-wide vector loads, a rank past 256 and an
-    output width off the 4-wide vector loads."""
+    output width off the 4-wide vector loads. KQ_LORA_SPLIT=1 keeps the
+    small ranks on the split route."""
+    monkeypatch.setenv("KQ_LORA_SPLIT", "1")
     rng = np.random.default_rng(31)
     rows_n, kk, m, s, dtype = 100, 512, 6, 2, mx.float16
     w = (rng.standard_normal((rows_n, kk)) * 0.1).astype(np.float32)
@@ -318,7 +334,9 @@ def test_dense_split_route_odd_ranks_and_widths(rank):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_qmv_bias_route_carries_the_stacked_epilogue(dtype):
+@pytest.mark.parametrize("lever", LEVERS)
+def test_qmv_bias_route_carries_the_stacked_epilogue(dtype, lever, monkeypatch):
+    _set_lever(monkeypatch, lever)
     wire, ref = _lin_wire_ref("q8_0", GT.Q8_0, False)
     rows_n, kk = ref.shape
     lin = KQuantLinear(in_dims=kk, out_dims=rows_n, bias=True, codec="q8_0")
@@ -617,3 +635,261 @@ def test_gather_lazy_rows_and_ids_match_dense(op):
         mx.broadcast_to(mx.array(int(idx[0, 0]), dtype=mx.uint32), (4, 2)),
     )
     assert np.array_equal(got_one, want_one)
+
+
+# Small ranks on the split route, forced with KQ_LORA_SPLIT=1, against the
+# one-dispatch epilogue (KQ_LORA_SPLIT=0) and the default route. The z kernel
+# folds the k lanes of each rank group with simd shuffles up to 16 groups and
+# pads the group count to a power of two; more groups take the threadgroup
+# pass. At 16 groups the rows meet in two passes. These ranks cover one to 16
+# groups at every vector width, padded and not, and the first ranks past the
+# shuffle path. 33 rows run the one-dispatch epilogue on every setting.
+SMALL_RANKS = [1, 2, 3, 4, 8, 12, 13, 16, 20, 24, 32, 64, 72, 128, 17, 68]
+SPLIT_ROWS = [1, 2, 4, 5, 8, 16, 32, 33]
+# A bf16 output rounds a small delta away, so the bf16 cases use larger
+# factors.
+GAIN = {mx.float16: 1.0, mx.bfloat16: 4.0}
+
+
+def _one_route(rank, m, kk, n):
+    """Whether the default route of m rows is the one-dispatch epilogue
+    (kq_lora_one_shape in src/kquant_lora_epilogue.h)."""
+    if m > 32 or rank == 1:
+        return True
+    groups = m * -(-n // 1024)
+    return kk <= 2048 and kk * rank <= 8192 and groups <= 64
+
+
+def _split_vs_one(run, monkeypatch):
+    got = run()
+    monkeypatch.setenv("KQ_LORA_SPLIT", "1")
+    split = run()
+    monkeypatch.setenv("KQ_LORA_SPLIT", "0")
+    one = run()
+    monkeypatch.delenv("KQ_LORA_SPLIT")
+    return got, split, one
+
+
+def _assert_default_route(got, split, one, rank, m, kk, n):
+    # The default route is one of the two, bit for bit.
+    assert np.array_equal(got, one if _one_route(rank, m, kk, n) else split)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("rank", SMALL_RANKS)
+@pytest.mark.parametrize("m", SPLIT_ROWS)
+def test_dense_split_route_small_ranks(rank, m, dtype, monkeypatch):
+    codec = "q6_k"
+    gtype, is_kq = CODECS[codec]
+    wire, ref = _lin_wire_ref(codec, gtype, is_kq)
+    rows_n, kk = ref.shape
+    lin = KQuantLinear(in_dims=kk, out_dims=rows_n, bias=False, codec=codec)
+    lin.weight = mx.array(wire)
+    rng = np.random.default_rng(41 + rank * 64 + m)
+    x = mx.array((rng.standard_normal((m, kk)) * 0.1).astype(np.float32)).astype(dtype)
+    a, b, a32, b32 = _lora(rng, (kk, rank), (rank, rows_n), dtype, GAIN[dtype])
+    fac = rng.uniform(0.25, 1.0, m).astype(np.float32)
+    if m > 1:
+        fac[m // 2] = 0.0
+    base = lin(x)
+
+    def run():
+        y = lin(x, lora=(a, b, mx.array(fac)))
+        mx.eval(y)
+        return _f32(y)
+
+    got, split, one = _split_vs_one(run, monkeypatch)
+    _assert_default_route(got, split, one, rank, m, kk, rows_n)
+    mx.eval(base)
+    b0 = _f32(base)
+    live = fac != 0
+    want = fac[:, None] * ((_f32(x) @ a32) @ b32)
+    for y in (got, split, one):
+        assert np.array_equal(y[~live], b0[~live])
+        assert _rel((y - b0)[live], want[live]) < DELTA_TOL
+    assert _rel((got - b0)[live], (one - b0)[live]) < DELTA_TOL
+
+
+@gathered
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("op", ["rows", "mix"])
+@pytest.mark.parametrize("rank", SMALL_RANKS)
+@pytest.mark.parametrize("m", SPLIT_ROWS)
+def test_gather_split_route_small_ranks(op, rank, m, dtype, monkeypatch):
+    """Gathered rows at the split route's ranks and row counts, with a dead
+    arena slot and a zero-factor row. The score-mixed gather runs its own
+    z and apply kernels at every row count."""
+    codec = "q6_k"
+    gtype, is_kq = CODECS[codec]
+    wire, ref = _moe_wire_ref(codec, gtype, is_kq)
+    e, n, kk = ref.shape
+    s = min(m, 4) if m % 4 == 0 or m < 4 else 1
+    t = m // s
+    rng = np.random.default_rng(53 + rank * 64 + m)
+    h = mx.array((rng.standard_normal((t, s, kk)) * 0.1).astype(np.float32)).astype(
+        dtype
+    )
+    idx = rng.integers(0, e, size=(t, s)).astype(np.uint32)
+    a, b, a32, b32 = _lora(rng, (e, kk, rank), (e, rank, n), dtype, GAIN[dtype])
+    table = np.array([2, -1, 0, 3, 1], dtype=np.int32)
+    slot = rng.integers(0, len(table), size=(t, s)).astype(np.uint32)
+    if m > 1:
+        slot.reshape(-1)[0] = 1  # a dead slot
+    fac = rng.uniform(0.25, 1.0, (t, s)).astype(np.float32)
+    if m > 2:
+        fac.reshape(-1)[2] = 0.0
+    sc = rng.random((t, s)).astype(np.float32)
+    w = mx.array(wire)
+    kw = dict(
+        lora_a=a,
+        lora_b=b,
+        lora_ids=mx.array(slot),
+        lora_table=mx.array(table),
+        lora_rows=mx.array(fac),
+    )
+    if op == "rows":
+        base = kq.gather_qmv_kq(h, w, codec, mx.array(idx))
+    else:
+        base = kq.gather_qmv_mix_ns_kq(h, w, codec, mx.array(idx), mx.array(sc))
+
+    def run():
+        if op == "rows":
+            y = kq.gather_qmv_kq(h, w, codec, mx.array(idx), **kw)
+        else:
+            y = kq.gather_qmv_mix_ns_kq(h, w, codec, mx.array(idx), mx.array(sc), **kw)
+        mx.eval(y)
+        return _f32(y)
+
+    got, split, one = _split_vs_one(run, monkeypatch)
+    mx.eval(base)
+    b0 = _f32(base)
+    eff = table[slot]
+    delta = _ref_rows_delta(_f32(h), eff, a32, b32, fac)
+    if op == "mix":
+        # The lever leaves the score-mixed gather alone.
+        assert np.array_equal(split, got) and np.array_equal(one, got)
+        delta = (sc[..., None] * delta).sum(1)
+        assert _rel(got - b0, delta) < DELTA_TOL
+        return
+    _assert_default_route(got, split, one, rank, m, kk, n)
+    live = (eff >= 0) & (fac != 0)
+    for y in (got, split, one):
+        assert np.array_equal(y[~live], b0[~live])
+        assert _rel((y - b0)[live], delta[live]) < DELTA_TOL
+    assert _rel((got - b0)[live], (one - b0)[live]) < DELTA_TOL
+
+
+# (K, N, rank, rows): shapes on each side of the one-dispatch bounds. Rank 1
+# takes one dispatch at any K; ranks 2 and up take it at K up to 2048, K x
+# rank up to 8192 and rows x N tiles up to 64.
+ROUTE_SHAPES = [
+    (4096, 256, 1, 8),
+    (4096, 256, 2, 1),
+    (2048, 256, 4, 8),
+    (2048, 256, 8, 8),
+    (1024, 256, 8, 4),
+    (1024, 256, 16, 4),
+    (512, 4096, 8, 16),
+    (512, 4096, 8, 17),
+]
+
+
+def _probe_cols(kk):
+    # Every eighth input carries a large value.
+    return np.arange(3, kk, 8)
+
+
+def _probe_lora(rng, kk, n, rank, e, dtype):
+    """Factors whose z the two routes round differently. At the probe
+    columns x is 2^8 and A is +-2^8, as many of each sign, so the 2^16
+    products cancel in the end, but a partial sum that holds some of them
+    rounds the small products added to it to 2^-7 or coarser. The routes
+    split K between threads and chunks and add the partial sums in different
+    orders, so they round different small products."""
+    a = rng.uniform(-1, 1, (e, kk, rank)).astype(np.float32)
+    cols = _probe_cols(kk)
+    sign = np.where(np.arange(len(cols)) % 2 == 0, 1.0, -1.0)
+    for r in range(rank):
+        a[:, cols, r] = rng.permutation(sign) * 2.0**8
+    b = (rng.standard_normal((e, rank, n)) * 0.1).astype(np.float32)
+    return mx.array(a).astype(dtype), mx.array(b).astype(dtype)
+
+
+def _probe_x(rng, shape, dtype):
+    x = rng.uniform(-1, 1, shape).astype(np.float32)
+    x[..., _probe_cols(shape[-1])] = 2.0**8
+    return mx.array(x).astype(dtype)
+
+
+def _probe_wire(rng, n, kk):
+    # Zero at the large inputs, so the base output stays small.
+    w = (rng.standard_normal((n, kk)) * 0.1).astype(np.float32)
+    w[:, _probe_cols(kk)] = 0.0
+    return quants.quantize(w, GT.Q8_0).astype(np.uint8)
+
+
+def _route_outputs(run, monkeypatch):
+    got, split, one = _split_vs_one(run, monkeypatch)
+    # The probe tells the routes apart.
+    assert not np.array_equal(split, one)
+    return got, split, one
+
+
+@pytest.mark.skipif(CPU, reason="the routes are Metal kernels")
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("kk,n,rank,m", ROUTE_SHAPES)
+def test_default_route_follows_the_shape(kk, n, rank, m, dtype, monkeypatch):
+    rng = np.random.default_rng(61 + kk + rank + m)
+    lin = KQuantLinear(in_dims=kk, out_dims=n, bias=False, codec="q8_0")
+    lin.weight = mx.array(_probe_wire(rng, n, kk))
+    x = _probe_x(rng, (m, kk), dtype)
+    a, b = _probe_lora(rng, kk, n, rank, 1, dtype)
+
+    def run():
+        y = lin(x, lora=(a[0], b[0]))
+        mx.eval(y)
+        return _f32(y)
+
+    got, split, one = _route_outputs(run, monkeypatch)
+    _assert_default_route(got, split, one, rank, m, kk, n)
+
+
+@pytest.mark.skipif(CPU, reason="the routes are Metal kernels")
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("kk,rank", [(512, 4), (4096, 2)])
+def test_qmv_bias_default_route_follows_the_shape(kk, rank, dtype, monkeypatch):
+    n = 256
+    rng = np.random.default_rng(67 + kk + rank)
+    lin = KQuantLinear(in_dims=kk, out_dims=n, bias=True, codec="q8_0")
+    lin.weight = mx.array(_probe_wire(rng, n, kk))
+    lin.bias = mx.array((rng.standard_normal(n) * 0.1).astype(np.float32))
+    x = _probe_x(rng, (1, kk), dtype)
+    a, b = _probe_lora(rng, kk, n, rank, 1, dtype)
+
+    def run():
+        y = lin(x, lora=(a[0], b[0], mx.array([0.5], dtype=mx.float32)))
+        mx.eval(y)
+        return _f32(y)
+
+    got, split, one = _route_outputs(run, monkeypatch)
+    _assert_default_route(got, split, one, rank, 1, kk, n)
+
+
+@gathered
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("kk,n,rank,m", [(512, 2048, 16, 8), (1536, 512, 8, 8)])
+def test_gather_default_route_follows_the_shape(kk, n, rank, m, dtype, monkeypatch):
+    e, s = 3, 4
+    rng = np.random.default_rng(71 + kk + rank)
+    w = mx.array(np.stack([_probe_wire(rng, n, kk) for _ in range(e)]))
+    x = _probe_x(rng, (m // s, s, kk), dtype)
+    idx = mx.array(rng.integers(0, e, (m // s, s)).astype(np.uint32))
+    a, b = _probe_lora(rng, kk, n, rank, e, dtype)
+
+    def run():
+        y = kq.gather_qmv_kq(x, w, "q8_0", idx, lora_a=a, lora_b=b)
+        mx.eval(y)
+        return _f32(y)
+
+    got, split, one = _route_outputs(run, monkeypatch)
+    _assert_default_route(got, split, one, rank, m, kk, n)
