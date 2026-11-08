@@ -903,7 +903,8 @@ void KQuantGatherQMVKQ::eval_gpu(
   int K = x.shape(-1);
   std::optional<KqLoraRows> lora;
   if (lora_flags_ & KQ_LORA_PRESENT) {
-    lora = kq_lora_rows_pre_gpu(d, s, x, inputs, n_base, lora_flags_, T * R, K);
+    lora =
+        kq_lora_rows_pre_gpu(d, s, x, inputs, n_base, lora_flags_, T * R, K, N);
   }
 
   const bool qf = kq_moe_qf(kquant_type_, N, K);
