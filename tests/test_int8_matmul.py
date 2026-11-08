@@ -453,7 +453,7 @@ QUANT_GUARDS = {
         "must be bfloat16, float16 or float32",
         {"x": mx.zeros((4, 64), mx.int8)},
     ),
-    "group_small": ("group_size must be", {"group_size": 16}),
+    "group_small": ("group_size must be", {"group_size": 0}),
     "group_odd": ("group_size must be", {"group_size": 48}),
 }
 
@@ -471,7 +471,7 @@ MM_GUARDS = {
         "multiple of 32",
         {"x8": mx.zeros((4, 0), mx.int8), "w8": mx.zeros((8, 0), mx.int8)},
     ),
-    "group_small": ("group_size must be", {"group_size": 16}),
+    "group_small": ("group_size must be", {"group_size": -32}),
     "group_odd": ("group_size must be", {"group_size": 40}),
     "w8_ndim": ("w8 must be int8", {"w8": mx.zeros((2, 8, 64), mx.int8)}),
     "w8_dtype": ("w8 must be int8", {"w8": mx.zeros((8, 64), mx.uint8)}),
