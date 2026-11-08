@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.11]
+
 ### Added
 - `int8_matmul`, an int8 x int8 matmul with per-row (or per-row per K group) activation scales and
   per-channel weight scales on M5 and later GPUs, about 1.7x faster than a Q4_K `quantized_matmul`
