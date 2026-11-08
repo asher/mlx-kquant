@@ -4,8 +4,8 @@ Every numeric bound below was fixed before the kernel first ran, from a
 reference figure times a margin named in the test's docstring. The figures
 are the relative L2 distances of a reference implementation of the same
 scheme on random normal inputs at 1024 rows: 1.97e-3 against its float
-formula, 9.40e-3 against MLX's attention. The per-row check, added later,
-reuses the float64 bound unchanged.
+formula, 9.40e-3 against MLX's attention. The per-row check uses the same
+float64 bound.
 """
 
 import os
@@ -281,6 +281,10 @@ CALL_GUARDS = {
     "scale_dtype": (
         "q_scale and k_scale must be float32",
         {"q_scale": lambda x: x.astype(mx.bfloat16)},
+    ),
+    "scale_dtype_k": (
+        "q_scale and k_scale must be float32",
+        {"k_scale": lambda x: x.astype(mx.bfloat16)},
     ),
 }
 
