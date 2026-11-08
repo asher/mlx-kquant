@@ -8,8 +8,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 - `sdpa_qk8`, attention with int8 Q K^T and bfloat16 P V at head dim 128 on M5 and later GPUs, about
-  1.2x MLX's attention at 37888 rows x 56 heads on M5 Max; lossy. `sdpa_qk8_inputs` quantizes Q
-  and K for it.
+  1.15x MLX's attention at 37888 rows x 56 heads on M5 Max with the int8 conversion of Q and K
+  included; lossy. `sdpa_qk8_inputs` quantizes Q and K for it.
 
 ## [0.5.9]
 
