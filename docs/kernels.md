@@ -1526,8 +1526,8 @@ into a packed layout first.
 
   Both ops refuse a CPU stream, other dtypes, a group_size that is not a multiple of 32 from 32
   up, and mismatched shapes with a `ValueError`, and `int8_matmul` a K that is not a positive
-  multiple of 32: pad x8 and w8 with zero columns. `int8_matmul` raises a `RuntimeError` on a GPU
-  without the tensor-op units. Inference only.
+  multiple of 32 (pad x8 and w8 with zero columns) and an x8 or w8 of 2^31 - 256 rows or more.
+  `int8_matmul` raises a `RuntimeError` on a GPU without the tensor-op units. Inference only.
 
 ## KVarN KV cache
 
