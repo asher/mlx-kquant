@@ -669,6 +669,78 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "int8_quantize_rows",
+      &mlx_kquant::int8_quantize_rows,
+      "x"_a,
+      nb::kw_only(),
+      "group_size"_a = nb::none(),
+      "stream"_a = nb::none(),
+      R"(
+        Quantizes the rows of x to int8 codes and float32 scales, the
+        operands of int8_matmul, for activations and weights alike. Each
+        row splits into groups of group_size columns (the whole row when
+        group_size is None; the last group may be short). For each group,
+        m = max |x|, s = max(m / 127, FLT_MIN) (1 / 127 when m is 0), and
+        codes = clamp(rint(x / s), -127, 127), ties to even. A weight
+        [N, K] gives one scale per output channel, [N, 1]. x must be
+        finite: an inf or NaN codes as -127 and a NaN does not reach the
+        output. At most 2^27 - 8 groups a call. Runs on any Metal GPU.
+
+        Args:
+            x (array): bfloat16, float16 or float32 [..., K], K >= 1. A
+                non row-major x is copied; a strided view of more than
+                2^32 elements is refused at eval.
+            group_size (int, optional): columns per scale, a multiple of
+                32. None, or a value of at least K, means one scale a row.
+
+        Returns:
+            tuple(array, array): codes int8 of x's shape and scales
+            float32 [..., G], G = ceil(K / group_size), 1 without a group.
+      )");
+
+  m.def(
+      "int8_matmul",
+      &mlx_kquant::int8_matmul,
+      "x8"_a,
+      "x_scales"_a,
+      "w8"_a,
+      "w_scales"_a,
+      nb::kw_only(),
+      "group_size"_a = nb::none(),
+      "out_dtype"_a = mx::bfloat16,
+      "stream"_a = nb::none(),
+      R"(
+        int8 x int8 matmul on the tensor-op units: y = x8 w8^T, with the
+        weight laid out [N, K] as in quantized_matmul(transpose=True).
+        y[r, c] = sum over groups g of (sum over the group of x8[r, k]
+        w8[c, k]) * x_scales[r, g], times w_scales[c]: each group's sum is
+        exact in int32 (groups, or K without one, of at most 133120
+        columns) and the sum over groups is float32, in group order.
+        Without a group, y[r, c] = acc * x_scales[r, 0] * w_scales[c].
+        Lossy against the float product: the error is that of the int8
+        codes. A call on a slice of the rows returns the bits of those
+        rows of the whole call. Inference only. Needs a NAX GPU (M5 and
+        later).
+
+        Args:
+            x8 (array): int8 [..., K] from int8_quantize_rows, K a
+                multiple of 32, or a slice of its rows. Codes of x8 and
+                w8 must lie in [-127, 127], as int8_quantize_rows makes
+                them; a -128 can wrap the int32 sum of a long group.
+            x_scales (array): float32 [..., G], the scales of x8 for the
+                same group_size, sliced as x8.
+            w8 (array): int8 [N, K], one output channel a row, N at most
+                2^29 - 128.
+            w_scales (array): float32 [N].
+            group_size (int, optional): the group_size x8 was quantized
+                with, a multiple of 32; None for one scale a row.
+            out_dtype (Dtype): bfloat16 (default), float16 or float32.
+
+        Returns:
+            array: [..., N] in out_dtype, row-major.
+      )");
+
+  m.def(
       "_vsa_fixed_shapes",
       &mlx_kquant::vsa_fixed_shapes,
       "x"_a,
