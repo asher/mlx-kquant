@@ -457,6 +457,9 @@ QUANT_GUARDS = {
     "group_odd": ("group_size must be", {"group_size": 48}),
 }
 
+# M and N are held in 32 bits with a block of headroom.
+BIG_ROWS = (1 << 31) - 256
+
 MM_GUARDS = {
     "x8_dtype": ("x8 must be int8", {"x8": mx.zeros((4, 64), mx.uint8)}),
     "x8_scalar": ("x8 must be int8", {"x8": mx.zeros((), mx.int8)}),
@@ -483,6 +486,21 @@ MM_GUARDS = {
     "w_scales_ndim": ("w_scales must be", {"w_scales": mx.ones((8, 1), mx.float32)}),
     "w_scales_len": ("w_scales must be", {"w_scales": mx.ones((7,), mx.float32)}),
     "out_dtype": ("out_dtype must be", {"out_dtype": mx.int32}),
+    # Lazy operands at the first refused row count; nothing is evaluated.
+    "m_rows": (
+        "fewer than 2",
+        {
+            "x8": mx.zeros((BIG_ROWS, 64), mx.int8),
+            "x_scales": mx.ones((BIG_ROWS, 1), mx.float32),
+        },
+    ),
+    "n_rows": (
+        "fewer than 2",
+        {
+            "w8": mx.zeros((BIG_ROWS, 64), mx.int8),
+            "w_scales": mx.ones((BIG_ROWS,), mx.float32),
+        },
+    ),
 }
 
 

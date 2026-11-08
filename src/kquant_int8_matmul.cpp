@@ -33,6 +33,7 @@ const std::string kQuantOp = "[mlx_kquant.int8_quantize_rows] ";
 const std::string kMatmulOp = "[mlx_kquant.int8_matmul] ";
 constexpr int kKStep = 32; // K of one tensor-op step
 constexpr int kBlock = 128; // rows and columns of an output block
+constexpr int64_t kMaxRows = (int64_t{1} << 31) - 256;
 // The grouped kernel stages its block's row scales, 128 x G floats, in
 // threadgroup memory up to this size (G <= 32), half of the 32 KiB a
 // threadgroup may hold; larger G reads them from device memory.
@@ -329,6 +330,13 @@ mx::array int8_matmul(
   if (w8.shape(1) != K) {
     throw std::invalid_argument(
         kMatmulOp + "w8's last dim must equal x8's (K).");
+  }
+  // M and N are held in 32 bits, with a block of headroom for the tile
+  // arithmetic (row0 + 128, M + 127).
+  if (static_cast<int64_t>(x8.size() / K) >= kMaxRows ||
+      w8.shape(0) >= kMaxRows) {
+    throw std::invalid_argument(
+        kMatmulOp + "x8 and w8 must each have fewer than 2^31 - 256 rows.");
   }
   if (x_scales.dtype() != mx::float32 ||
       x_scales.shape() != last_dim(x8.shape(), scale_groups(K, group_size))) {
