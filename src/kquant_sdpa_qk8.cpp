@@ -134,11 +134,11 @@ void KQuantSDPAQK8::eval_gpu(
       kq_strides_aligned_gpu(inputs[1], s, "sdpa_qk8 k8", 4 * 1);
   const mx::array v = kq_strides_aligned_gpu(
       inputs[2], s, "sdpa_qk8 v", 4 * static_cast<int>(inputs[2].itemsize()));
-  // The scales are read row-major: the Q scales one at a time, the K
-  // scales of a whole key block as float4 from a 16-byte boundary. A slice
-  // of query rows, as a chunked caller passes, is copied here.
+  // The scales are read row-major, the K scales four at a time as packed
+  // vectors. A slice of query rows, as a chunked caller passes, is copied
+  // here.
   const mx::array sq = kq_row_major_gpu(inputs[3], s);
-  const mx::array sk = kq_x_aligned_gpu(inputs[4], s, "sdpa_qk8 k_scale", 16);
+  const mx::array sk = kq_row_major_gpu(inputs[4], s);
   auto& o = outputs[0];
 
   // [B, H, qL, D] stored as [B, qL, H, D], as MLX's attention stores it, so
@@ -306,6 +306,10 @@ mx::array sdpa_qk8(
   if (k_scale.shape() != sk_shape) {
     throw std::invalid_argument(kQK8Op + "k_scale must be [B, Hk, kL].");
   }
+  if (q_scale.dtype() != mx::float32 || k_scale.dtype() != mx::float32) {
+    throw std::invalid_argument(
+        kQK8Op + "q_scale and k_scale must be float32.");
+  }
   if (v.ndim() != 4 || v.shape() != k8.shape()) {
     throw std::invalid_argument(kQK8Op + "v must have the shape of k8.");
   }
@@ -320,7 +324,6 @@ mx::array sdpa_qk8(
         "requires a GPU with tensor-op (NAX) units, M5 or later; check "
         "nax_available().");
   }
-  auto f32 = [&](mx::array a) { return mx::astype(a, mx::float32, s); };
   auto shape = q8.shape();
   return mx::array(
       std::move(shape),
@@ -329,8 +332,8 @@ mx::array sdpa_qk8(
       {std::move(q8),
        std::move(k8),
        std::move(v),
-       f32(std::move(q_scale)),
-       f32(std::move(k_scale))});
+       std::move(q_scale),
+       std::move(k_scale)});
 }
 
 } // namespace mlx_kquant

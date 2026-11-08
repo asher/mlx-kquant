@@ -270,7 +270,9 @@ template <typename T>
           ks[jj] = c < lim_rows_k ? SK[c] : 0.f;
         }
       } else {
-        ks = *(const device float4*)(SK + ik * kU + sn);
+        // A head's scales start at any float when kL is not a multiple of
+        // 4, so the four are read as a packed vector, aligned to 4 bytes.
+        ks = float4(*(const device packed_float4*)(SK + ik * kU + sn));
       }
       thread auto& fi = Si.frag_at(0, ik);
       thread auto& fs = Stile.frag_at(0, ik);
