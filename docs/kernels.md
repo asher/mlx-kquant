@@ -1405,29 +1405,31 @@ into a packed layout first.
   with a contiguous head dim.
 - `sdpa_qk8`: attention with int8 Q K^T and bfloat16 P V at head dim 128 on the tensor-op units of
   M5 and later GPUs, the scheme of SageAttention (Zhang et al., ICLR 2025): per-token int8 Q and K,
-  K smoothed by its mean over keys, 16-bit P V. `sdpa_qk8_inputs(q, k, scale)` quantizes each row
-  of `q * scale` and of `k` less its mean to 128 int8 codes and a float32 scale, `max |x| / 127`,
+  K smoothed by its mean over keys, 16-bit P V. `sdpa_qk8_inputs(q, k, scale)` quantizes each row of
+  `q * scale` and of `k` less its mean to 128 int8 codes and a float32 scale, `max |x| / 127`,
   rounded to nearest. The shift of K moves every score of a query row by one constant, which the
   softmax drops. The mean is taken in bfloat16, and MLX rounds it differently for different layouts
   of k, so k8 and k_scale have the same bits only for the same layout of K. The attention is
-  unaffected, since any shift of K cancels in the softmax.
-  `sdpa_qk8(q8, q_scale, k8, k_scale, v)` computes `softmax(Q K^T) V` without a mask, Q and K the
-  dequantized codes: the scores accumulate in int32 and are scaled into float32, the softmax runs
-  in base 2, and P V runs on the bfloat16 tensor ops. q_scale and k_scale are float32 and must be
-  positive, as `sdpa_qk8_inputs` returns them: a zero or negative query scale would let the masked
-  key columns past kL into the softmax. It is lossy: on random normal inputs the output is about
-  1e-2 in relative L2 from MLX's attention, and about 2e-3 from the same formula in float64 on the
-  op's own codes. q, k and v are bfloat16 `[B, heads, L, 128]` with the query heads a multiple of
-  the key heads. q, k, v, q8 and k8 in batch, head and row strided views with a unit head-dim
-  stride are read in place, other layouts are copied, and the scales are copied when they are not
-  row-major. The output is `[B, heads, qL, 128]` laid out as `[B, qL, heads, 128]`, as MLX's
-  attention lays it out. Any qL and kL of 1 or more: the last query block stores only its live
-  rows, and the last key block masks its columns past kL before the row maximum. A call on a slice
-  of the query rows, `q8[:, :, a:b]` with `q_scale[:, :, a:b]`, returns the bits of those rows of
-  the whole call, so a caller can run the rows in chunks with K quantized once. Both ops refuse a
-  CPU stream and other dtypes and head dims with a `ValueError`, and `sdpa_qk8_inputs` refuses a
-  non-finite scale. `sdpa_qk8` raises a `RuntimeError` on a GPU without the tensor-op units.
-  Inference only.
+  unaffected, since any shift of K cancels in the softmax. `sdpa_qk8(q8, q_scale, k8, k_scale, v)`
+  computes `softmax(Q K^T) V` without a mask, Q and K the dequantized codes: the scores accumulate
+  in int32 and are scaled into float32, the softmax runs in base 2, and P V runs on the bfloat16
+  tensor ops. q_scale and k_scale are float32 and must be positive, as `sdpa_qk8_inputs` returns
+  them: a zero or negative query scale would let the masked key columns past kL into the softmax. It
+  is lossy: on random normal inputs the output is about 1e-2 in relative L2 from MLX's attention,
+  and about 2e-3 from the same formula in float64 on the op's own codes. At large sizes its speedup
+  over MLX's attention comes mostly from a higher sustained clock under the GPU's power cap, because
+  the int8 path draws less power per cycle; per clock the kernel is about 1.04x MLX's attention, so
+  the speedup differs with the chip and its cooling. q, k and v are bfloat16 `[B, heads, L, 128]`
+  with the query heads a multiple of the key heads. q, k, v, q8 and k8 in batch, head and row
+  strided views with a unit head-dim stride are read in place, other layouts are copied, and the
+  scales are copied when they are not row-major. The output is `[B, heads, qL, 128]` laid out as
+  `[B, qL, heads, 128]`, as MLX's attention lays it out. Any qL and kL of 1 or more: the last query
+  block stores only its live rows, and the last key block masks its columns past kL before the row
+  maximum. A call on a slice of the query rows, `q8[:, :, a:b]` with `q_scale[:, :, a:b]`, returns
+  the bits of those rows of the whole call, so a caller can run the rows in chunks with K quantized
+  once. Both ops refuse a CPU stream and other dtypes and head dims with a `ValueError`, and
+  `sdpa_qk8_inputs` refuses a non-finite scale. `sdpa_qk8` raises a `RuntimeError` on a GPU without
+  the tensor-op units. Inference only.
 - `vsa_block_sparse`: the block-sparse attention of MiniMax-H3 video sparse attention (VSA) on the
   tensor-op units of M5 and later GPUs, ported from FastVideo. q, k and v are the tiled sequence
   `[tiles * 64, heads, 128]` in bfloat16, each tile its live rows then pad slots. Each video query
