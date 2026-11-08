@@ -2,12 +2,13 @@
 //
 // One simdgroup quantizes one group of one row: gs columns from column
 // g gs, the last group of a row K - g gs. m = max |float(x)| over the
-// group; s = m / 127, or 1 / 127 when m is 0; codes = clamp(rint(float(x)
-// / s), -127, 127), ties to even. x [rows, K] and q [rows, K] row-major,
-// s [rows, G] row-major. Unit u = (row, g) = (u / G, u % G); a threadgroup
-// of 8 simdgroups takes 8 consecutive units, and the grid covers all of
-// them. VEC reads and writes four columns at a time, for K and gs
-// multiples of 4 and x on a boundary of four elements.
+// group; s = max(m / 127, FLT_MIN), or 1 / 127 when m is 0; codes =
+// clamp(rint(float(x) / s), -127, 127), ties to even. The FLT_MIN floor
+// keeps s normal: the GPU flushes a subnormal m / 127 to 0. x [rows, K]
+// and q [rows, K] row-major, s [rows, G] row-major. Unit u = (row, g) =
+// (u / G, u % G); a threadgroup of 8 simdgroups takes 8 consecutive units,
+// and the grid covers all of them. VEC reads and writes four columns at a
+// time, for K and gs multiples of 4 and x on a boundary of four elements.
 
 #include <metal_stdlib>
 
@@ -55,7 +56,7 @@ template <typename T, bool VEC>
     }
   }
   m = simd_max(m);
-  const float sc = m > 0.f ? m / 127.f : 1.f / 127.f;
+  const float sc = m > 0.f ? metal::max(m / 127.f, FLT_MIN) : 1.f / 127.f;
 
   if (VEC) {
     for (int i = int(lane) * 4; i < len; i += 128) {

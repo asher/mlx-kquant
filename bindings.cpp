@@ -680,13 +680,16 @@ NB_MODULE(_ext, m) {
         operands of int8_matmul, for activations and weights alike. Each
         row splits into groups of group_size columns (the whole row when
         group_size is None; the last group may be short). For each group,
-        m = max |x|, s = m / 127 (1 / 127 when m is 0), and codes =
-        clamp(rint(x / s), -127, 127), ties to even. A weight [N, K] gives
-        one scale per output channel. Runs on any Metal GPU.
+        m = max |x|, s = max(m / 127, FLT_MIN) (1 / 127 when m is 0), and
+        codes = clamp(rint(x / s), -127, 127), ties to even. A weight
+        [N, K] gives one scale per output channel, [N, 1]. x must be
+        finite: an inf or NaN codes as -127 and a NaN does not reach the
+        output. At most 2^27 groups a call. Runs on any Metal GPU.
 
         Args:
-            x (array): bfloat16, float16 or float32 [..., K], K >= 1. Any
-                layout; a non row-major x is copied.
+            x (array): bfloat16, float16 or float32 [..., K], K >= 1. A
+                non row-major x is copied; a strided view of more than
+                2^32 elements is refused at eval.
             group_size (int, optional): columns per scale, a multiple of
                 32. None, or a value of at least K, means one scale a row.
 
@@ -711,7 +714,8 @@ NB_MODULE(_ext, m) {
         weight laid out [N, K] as in quantized_matmul(transpose=True).
         y[r, c] = sum over groups g of (sum over the group of x8[r, k]
         w8[c, k]) * x_scales[r, g], times w_scales[c]: each group's sum is
-        exact in int32 and the sum over groups is float32, in group order.
+        exact in int32 (groups, or K without one, of at most 133120
+        columns) and the sum over groups is float32, in group order.
         Without a group, y[r, c] = acc * x_scales[r, 0] * w_scales[c].
         Lossy against the float product: the error is that of the int8
         codes. A call on a slice of the rows returns the bits of those
@@ -723,7 +727,8 @@ NB_MODULE(_ext, m) {
                 multiple of 32, or a slice of its rows.
             x_scales (array): float32 [..., G], the scales of x8 for the
                 same group_size, sliced as x8.
-            w8 (array): int8 [N, K], one output channel a row.
+            w8 (array): int8 [N, K], one output channel a row, N at most
+                2^29.
             w_scales (array): float32 [N].
             group_size (int, optional): the group_size x8 was quantized
                 with, a multiple of 32; None for one scale a row.

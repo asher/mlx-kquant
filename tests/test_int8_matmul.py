@@ -52,6 +52,8 @@ REL_F32_GROUPED = 1e-6
 # differing (sdpa_qk8_inputs' margin; the reference quantizer differed in
 # none against its own rule).
 CODE_DIFF_SHARE = 0.002
+# The quantizer's floor on a scale, the smallest normal float32.
+FLT_MIN = float(np.finfo(np.float32).tiny)
 
 
 def _rng(seed):
@@ -76,7 +78,9 @@ def _quant_ref(x, group_size=None):
     for c0 in range(0, k, gs):
         blk = xf[..., c0 : c0 + gs]
         m = mx.max(mx.abs(blk), axis=-1, keepdims=True)
-        s = mx.where(m > 0, m / 127.0, mx.array(1.0 / 127.0, mx.float32))
+        s = mx.where(
+            m > 0, mx.maximum(m / 127.0, FLT_MIN), mx.array(1.0 / 127.0, mx.float32)
+        )
         codes.append(mx.clip(mx.round(blk / s), -127, 127))
         scales.append(s)
     return mx.concatenate(codes, axis=-1), mx.concatenate(scales, axis=-1)
@@ -193,6 +197,39 @@ def test_quantizer_reads_a_strided_input_as_its_copy():
         np.testing.assert_array_equal(np.array(u), np.array(v))
 
 
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float32"])
+@pytest.mark.parametrize("group_size", [None, 32])
+def test_quantizer_scalar_path(dtype, group_size):
+    """K 1001, not a multiple of 4, runs the scalar kernel: the formula
+    test's bars (codes within 1 and at most 0.2 percent differing, scales
+    within 1e-6), with a short last group of 9 columns under groups of 32."""
+    x = _x(_rng(31), (37, 1001), getattr(mx, dtype))
+    codes, scales = kq.int8_quantize_rows(x, group_size=group_size)
+    c_ref, s_ref = _quant_ref(x, group_size)
+    diff = np.abs(np.array(codes).astype(np.int32) - np.array(c_ref).astype(np.int32))
+    assert diff.max() <= 1
+    assert (diff != 0).mean() <= CODE_DIFF_SHARE
+    np.testing.assert_allclose(np.array(scales), np.array(s_ref), rtol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
+def test_tiny_rows_take_the_floor_scale(dtype):
+    """A row whose max |x| is under 127 x FLT_MIN gets scale FLT_MIN, not a
+    subnormal flushed to 0, and its zeros code as 0: codes rint(x / FLT_MIN),
+    here 9 (8 in bfloat16, which rounds 1e-37 down), -4 and zeros."""
+    xn = np.zeros((2, 64), np.float32)
+    xn[0, 0], xn[0, 1] = 1e-37, -5e-38
+    x = mx.array(xn).astype(getattr(mx, dtype))
+    codes, scales = kq.int8_quantize_rows(x)
+    xf = np.array(x.astype(mx.float32))
+    want = np.rint(xf[0] / np.float32(FLT_MIN)).astype(np.int32)
+    assert want[0] == (9 if dtype == "float32" else 8) and want[1] == -4
+    assert not want[2:].any()
+    assert np.array(scales)[0, 0] == np.float32(FLT_MIN)
+    np.testing.assert_array_equal(np.array(codes)[0].astype(np.int32), want)
+    assert not np.array(codes)[1].any()
+
+
 # The matmul.
 
 
@@ -226,6 +263,49 @@ def test_exact_sums(m, n, k, lim, group_size):
     )
     want = a.astype(np.int64) @ b.astype(np.int64).T
     np.testing.assert_array_equal(np.array(y), want.astype(np.float32))
+
+
+@requires_nax
+@pytest.mark.parametrize("group_size", [None, 133120])
+def test_exact_sum_at_the_longest_group(group_size):
+    """K 133120 of codes 127 against codes 127 (and -127 on row 1): float32
+    output with scales 1 is 127 x 127 x 133120 = 2147092480 exactly, the
+    largest int32 sum the op accepts, which float32 holds. With
+    group_size 133120 the K 266240 call sums two such groups."""
+    k = 133120 if group_size is None else 266240
+    a = np.full((2, k), 127, np.int8)
+    a[1] = -127
+    g = 1 if group_size is None else 2
+    y = kq.int8_matmul(
+        mx.array(a),
+        mx.ones((2, g), mx.float32),
+        mx.full((3, k), 127, mx.int8),
+        mx.ones((3,), mx.float32),
+        group_size=group_size,
+        out_dtype=mx.float32,
+    )
+    want = np.float32(2147092480.0 * g)
+    np.testing.assert_array_equal(np.array(y)[0], np.full(3, want))
+    np.testing.assert_array_equal(np.array(y)[1], np.full(3, -want))
+
+
+@requires_nax
+def test_copied_operands_give_the_row_major_bits():
+    """x8 at a byte offset off a 16-byte boundary and a transposed w8 are
+    copied before the kernel: the bits of the row-major call."""
+    m, n, k = 130, 136, 256
+    x8, sx, w8, sw = _operands(_rng(37), m, n, k)
+    flat = mx.concatenate([mx.zeros((8,), mx.int8), x8.reshape(-1)])
+    mx.eval(flat)
+    x8_off = flat[8:].reshape(m, k)
+    w8_t = mx.contiguous(w8.T).T
+    mx.eval(w8_t)
+    want = kq.int8_matmul(x8, sx, w8, sw)
+    got = kq.int8_matmul(x8_off, sx, w8_t, sw)
+    mx.eval(want, got)
+    np.testing.assert_array_equal(
+        np.array(got.view(mx.uint16)), np.array(want.view(mx.uint16))
+    )
 
 
 PLAIN = {"qkv_proj": (5376, 21504), "out_proj": (7168, 5376), "mlp.fc1": (5376, 28672)}
@@ -298,9 +378,11 @@ TAILS = {
 def test_tails(name):
     """Ragged M and N, K off a multiple of 128, a short last group, and a
     group count whose row scales do not fit in threadgroup memory (64
-    groups): the plain call's bar each. Sentinel buffers allocated before
-    and after the output keep their bytes across a second call, which
-    gives the first call's bits."""
+    groups): the plain call's bar each, and a second call gives the first
+    call's bits. Sentinel buffers allocated before and after the output
+    keep their bytes. They are separate allocations, so they see a stray
+    store only if it reaches one: the stores' row bound (r < M) is not
+    observable in-process and is checked by reading the kernel."""
     m, n, k, gs = TAILS[name]
     x8, sx, w8, sw = _operands(_rng(m * 7 + n + k), m, n, k, gs)
     before = mx.full((1 << 16,), -7, mx.int32)
@@ -367,7 +449,7 @@ def big_case(rows, k=5376, n=28672, chunk=8192, seed=29):
     after the first is freed. Checks the first 256 rows, the last 200 and
     256 seeded random rows against the reference with the plain call's bar,
     that the whole call equals its `chunk`-row chunks on those rows bit for
-    bit, and that a sentinel allocated after each output keeps its bytes.
+    bit, and that a sentinel allocated before each call keeps its bytes.
     Returns the peak memory in bytes."""
     rng = _rng(seed)
     x8, sx, w8, sw = _operands(rng, rows, n, k)
@@ -383,10 +465,10 @@ def big_case(rows, k=5376, n=28672, chunk=8192, seed=29):
     idx = mx.array(pick.astype(np.int32))
     ref = _reference64(x8[idx], sx[idx], w8, sw)
     for dt in (mx.bfloat16, mx.float32):
-        y = kq.int8_matmul(x8, sx, w8, sw, out_dtype=dt)
-        mx.eval(y)
         sentinel = mx.full((1 << 20,), -7, mx.int32)
         mx.eval(sentinel)
+        y = kq.int8_matmul(x8, sx, w8, sw, out_dtype=dt)
+        mx.eval(y)
         rows_got = y[idx]
         mx.eval(rows_got)
         got = _f64(rows_got)
@@ -455,9 +537,15 @@ QUANT_GUARDS = {
     ),
     "group_small": ("group_size must be", {"group_size": 0}),
     "group_odd": ("group_size must be", {"group_size": 48}),
+    # Lazy inputs one past 2^27 groups; nothing is evaluated.
+    "groups_rows": ("at most 2", {"x": mx.zeros(((1 << 27) + 1, 32), mx.bfloat16)}),
+    "groups_grouped": (
+        "at most 2",
+        {"x": mx.zeros(((1 << 22) + 1, 1024), mx.bfloat16), "group_size": 32},
+    ),
 }
 
-# M and N are held in 32 bits with a block of headroom.
+# M is held in 32 bits with a block of headroom.
 BIG_ROWS = (1 << 31) - 256
 
 MM_GUARDS = {
@@ -495,10 +583,23 @@ MM_GUARDS = {
         },
     ),
     "n_rows": (
-        "fewer than 2",
+        "at most 2",
         {
-            "w8": mx.zeros((BIG_ROWS, 64), mx.int8),
-            "w_scales": mx.ones((BIG_ROWS,), mx.float32),
+            "w8": mx.zeros(((1 << 29) + 1, 64), mx.int8),
+            "w_scales": mx.ones(((1 << 29) + 1,), mx.float32),
+        },
+    ),
+    "group_len": (
+        "at most 133120",
+        {"x8": mx.zeros((4, 133152), mx.int8), "w8": mx.zeros((8, 133152), mx.int8)},
+    ),
+    "group_len_grouped": (
+        "at most 133120",
+        {
+            "x8": mx.zeros((4, 266304), mx.int8),
+            "x_scales": mx.ones((4, 2), mx.float32),
+            "w8": mx.zeros((8, 266304), mx.int8),
+            "group_size": 133152,
         },
     ),
 }
@@ -516,6 +617,26 @@ def test_matmul_guard_refuses(name):
     match, change = MM_GUARDS[name]
     with pytest.raises(ValueError, match=match):
         kq.int8_matmul(**{**_mm_args(), **change})
+
+
+@requires_nax
+def test_limits_accept_their_bound():
+    """Each size refusal starts one past its bound: 2^27 groups, N 2^29,
+    and a 133120-column group build without error. Nothing is evaluated."""
+    kq.int8_quantize_rows(mx.zeros((1 << 27, 32), mx.bfloat16))
+    kq.int8_quantize_rows(mx.zeros((1 << 22, 1024), mx.bfloat16), group_size=32)
+    n = 1 << 29
+    kq.int8_matmul(
+        **{**_mm_args(), "w8": mx.zeros((n, 64), mx.int8), "w_scales": mx.ones((n,))}
+    )
+    k = 133120
+    kq.int8_matmul(
+        **{
+            **_mm_args(),
+            "x8": mx.zeros((4, k), mx.int8),
+            "w8": mx.zeros((8, k), mx.int8),
+        }
+    )
 
 
 # On an M5 this runs with MLX_METAL_GPU_ARCH=applegpu_g15s, which names an

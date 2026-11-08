@@ -34,6 +34,14 @@ const std::string kMatmulOp = "[mlx_kquant.int8_matmul] ";
 constexpr int kKStep = 32; // K of one tensor-op step
 constexpr int kBlock = 128; // rows and columns of an output block
 constexpr int64_t kMaxRows = (int64_t{1} << 31) - 256;
+// Grid limits: Metal counts a grid axis's threads in 32 bits and runs only
+// the remainder past 2^32. The quantizer puts 32 threads a unit on one
+// axis; int8_matmul 1024 threads a column block.
+constexpr int64_t kMaxQuantUnits = int64_t{1} << 27;
+constexpr int64_t kMaxN = int64_t{1} << 29;
+// The longest int32 sum of 127 x 127 products, a multiple of 32:
+// 127^2 x 133120 = 2147092480 < 2^31.
+constexpr int kMaxGroupLen = 133120;
 // The grouped kernel stages its block's row scales, 128 x G floats, in
 // threadgroup memory up to this size (G <= 32), half of the 32 KiB a
 // threadgroup may hold; larger G reads them from device memory.
@@ -292,6 +300,14 @@ std::tuple<mx::array, mx::array> int8_quantize_rows(
         kQuantOp + "x must be bfloat16, float16 or float32.");
   }
   check_group_size(group_size, kQuantOp);
+  const int64_t units = static_cast<int64_t>(x.size() / x.shape(-1)) *
+      scale_groups(x.shape(-1), group_size);
+  if (units > kMaxQuantUnits) {
+    throw std::invalid_argument(
+        kQuantOp +
+        "x must have at most 2^27 groups, rows times ceil(K / group_size); "
+        "quantize it in row chunks.");
+  }
   auto shapes = std::vector<mx::Shape>{
       x.shape(), last_dim(x.shape(), scale_groups(x.shape(-1), group_size))};
   auto outs = mx::array::make_arrays(
@@ -324,6 +340,12 @@ mx::array int8_matmul(
         "pad both with zero columns to the next multiple of 32.");
   }
   check_group_size(group_size, kMatmulOp);
+  if ((group_size && *group_size < K ? *group_size : K) > kMaxGroupLen) {
+    throw std::invalid_argument(
+        kMatmulOp +
+        "a group, or K without one, must be at most 133120 columns, so its "
+        "int32 sum cannot wrap; pass a smaller group_size.");
+  }
   if (w8.ndim() != 2 || w8.dtype() != mx::int8) {
     throw std::invalid_argument(kMatmulOp + "w8 must be int8 [N, K].");
   }
@@ -331,12 +353,15 @@ mx::array int8_matmul(
     throw std::invalid_argument(
         kMatmulOp + "w8's last dim must equal x8's (K).");
   }
-  // M and N are held in 32 bits, with a block of headroom for the tile
-  // arithmetic (row0 + 128, M + 127).
-  if (static_cast<int64_t>(x8.size() / K) >= kMaxRows ||
-      w8.shape(0) >= kMaxRows) {
+  // M is held in 32 bits, with a block of headroom for the tile arithmetic
+  // (row0 + 128, M + 127); N is capped by the grid (kMaxN).
+  if (static_cast<int64_t>(x8.size() / K) >= kMaxRows) {
     throw std::invalid_argument(
-        kMatmulOp + "x8 and w8 must each have fewer than 2^31 - 256 rows.");
+        kMatmulOp + "x8 must have fewer than 2^31 - 256 rows.");
+  }
+  if (w8.shape(0) > kMaxN) {
+    throw std::invalid_argument(
+        kMatmulOp + "w8 must have at most 2^29 rows (N).");
   }
   if (x_scales.dtype() != mx::float32 ||
       x_scales.shape() != last_dim(x8.shape(), scale_groups(K, group_size))) {

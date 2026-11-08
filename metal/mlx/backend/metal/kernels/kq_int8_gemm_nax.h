@@ -32,13 +32,11 @@
 
 #include "mlx/backend/metal/kernels/steel/defines.h"
 
-// K of the call, fixed when the pipeline is built: a runtime K loop ran 13
-// percent slower.
+// K of the call, fixed when the pipeline is built.
 constant int kq_i8_k [[function_constant(310)]];
 // Columns a group (grouped kernel), likewise.
 constant int kq_i8_gs [[function_constant(311)]];
-// N a multiple of 128: the stores skip their column check, which on every
-// block of a call ran 20 percent slower.
+// N a multiple of 128: the stores skip their column check.
 constant bool kq_i8_align_n [[function_constant(312)]];
 // The grouped kernel's row scales, 128 x G floats, staged in threadgroup
 // memory; device reads otherwise.
@@ -204,6 +202,11 @@ template <typename OutT>
       decltype(a0),
       decltype(b0),
       int>();
+  // acc holds a thread's elements of the block, 128 x 128 over 256 threads.
+  // The loops below stop at the smaller of CAP and the tensor's capacity
+  // (a runtime value) and skip invalid elements; a capacity above CAP
+  // would leave elements unstored, never overrun acc.
+  const uint16_t cap = metal::min(uint16_t(CAP), cT.get_capacity());
 
   // Row scales of the block, [BM, G]; rows past M read as 0 and are never
   // stored.
@@ -244,7 +247,10 @@ template <typename OutT>
       }
     }
     STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < CAP; ++i) {
+    for (uint16_t i = 0; i < cap; ++i) {
+      if (!cT.is_valid_element(i)) {
+        continue;
+      }
       const int r = int(cT.get_multidimensional_index(i)[1]);
       float s;
       if (kq_i8_tg_scales) {
@@ -257,7 +263,10 @@ template <typename OutT>
   }
 
   STEEL_PRAGMA_UNROLL
-  for (short i = 0; i < CAP; ++i) {
+  for (uint16_t i = 0; i < cap; ++i) {
+    if (!cT.is_valid_element(i)) {
+      continue;
+    }
     auto idx = cT.get_multidimensional_index(i);
     const int c = col0 + int(idx[0]);
     const int r = row0 + int(idx[1]);
