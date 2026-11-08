@@ -12,18 +12,18 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   at 38010 rows on M5 Max with the activation quantize included; lossy. `int8_quantize_rows` makes
   its codes and scales, for activations and weights.
 
+### Changed
+- The rows LoRA epilogue of `quantized_matmul`, `quantized_matmul_qmv_bias` and `gather_qmv_kq` adds
+  less time at decode widths. In `benchmarks/bench_lora_epilogue.py` on M3 Max (K 512, N 2048, 8
+  gathered rows, rank 1) it adds about 4 us over the base op instead of about 68 us. Rank 1, and
+  small ranks at K up to 2048, run one epilogue dispatch; `KQ_LORA_SPLIT=1` forces the split kernels.
+
 ## [0.5.10]
 
 ### Added
 - `sdpa_qk8`, attention with int8 Q K^T and bfloat16 P V at head dim 128 on M5 and later GPUs, about
   1.15x MLX's attention at 37888 rows x 56 heads on M5 Max with the int8 conversion of Q and K
   included; lossy. `sdpa_qk8_inputs` quantizes Q and K for it.
-
-### Changed
-- The rows LoRA epilogue of `quantized_matmul`, `quantized_matmul_qmv_bias` and `gather_qmv_kq` adds
-  less time at decode widths. In `benchmarks/bench_lora_epilogue.py` on M3 Max (K 512, N 2048, 8
-  gathered rows, rank 1) it adds about 4 us over the base op instead of about 68 us. Rank 1, and
-  small ranks at K up to 2048, run one epilogue dispatch; `KQ_LORA_SPLIT=1` forces the split kernels.
 
 ## [0.5.9]
 
