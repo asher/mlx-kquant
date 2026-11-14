@@ -31,6 +31,10 @@
 #include "mlx/ops.h"
 #include "mlx/types/half_types.h"
 
+#ifdef _METAL_
+#include "mlx/backend/metal/device.h"
+#endif
+
 extern "C" {
 #include <gguflib.h>
 }
@@ -102,6 +106,57 @@ const char* zc_dtype_name(mx::Dtype d) {
   return "unknown";
 }
 
+// A no-copy Metal buffer over [ptr, ptr + size) that MLX's allocator never
+// sees. allocator::make_buffer makes the same buffer but also adds it to MLX's
+// residency sets, its active-memory count and its resource count; MLX wires
+// everything in its residency sets up to the wired limit, with no per-buffer
+// opt-out. The options match the allocator's (shared storage, untracked
+// hazards), so MLX's encoders bind it like one of their own. It must be freed
+// with release_untracked_buffer, never allocator::release, which would
+// subtract from the active-memory count it never added to. Returns a null
+// buffer when the wrap is rejected or there is no Metal backend.
+mx::allocator::Buffer make_untracked_buffer(void* ptr, size_t size) {
+#ifdef _METAL_
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  auto* dev = mx::metal::device(mx::Device(mx::Device::gpu)).mtl_device();
+  // The four-argument form is newBufferWithBytesNoCopy; the three-argument
+  // one copies.
+  MTL::Buffer* buf = dev->newBuffer(
+      ptr,
+      size,
+      MTL::ResourceStorageModeShared | MTL::ResourceHazardTrackingModeUntracked,
+      nullptr);
+  return mx::allocator::Buffer{static_cast<void*>(buf)};
+#else
+  (void)ptr;
+  (void)size;
+  return mx::allocator::Buffer{nullptr};
+#endif
+}
+
+// Drops the reference make_untracked_buffer took. Deleters run on whichever
+// thread frees the last array, a Metal completion thread included, so the
+// release gets its own autorelease pool, as MLX's own buffer releases do.
+void release_untracked_buffer(mx::allocator::Buffer b) {
+#ifdef _METAL_
+  auto* buf = static_cast<MTL::Buffer*>(b.ptr());
+  if (buf != nullptr) {
+    auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+    buf->release();
+  }
+#else
+  (void)b;
+#endif
+}
+
+[[noreturn]] void throw_untracked_unavailable(const std::string& name) {
+  throw std::runtime_error(
+      "[load_gguf] tensor " + name +
+      " is listed in untracked but cannot get an untracked no-copy view "
+      "(this needs the Metal backend and a tensor the loader can view "
+      "without a copy); a copy would be a buffer MLX tracks.");
+}
+
 // Build a no-copy mx.array viewing `nbytes` of `dtype`/`shape` starting at `wd`
 // (a pointer into gguflib's mmap). Wraps a page-aligned window enclosing the
 // tensor in a Metal shared-storage buffer via allocator::make_buffer (=
@@ -119,7 +174,9 @@ const char* zc_dtype_name(mx::Dtype d) {
 // dimension, and the tensor becomes a whole-row slice of it. That needs the
 // window to start a whole number of rows before the tensor, so the window base
 // walks back page by page until it does, bounded by the mmap base. Returns
-// nullopt when no wrap is possible; the caller then memcpy's.
+// nullopt when no wrap is possible; the caller then memcpy's. With
+// `untracked` the window buffer comes from make_untracked_buffer instead of
+// allocator::make_buffer, and its deleter never calls into the allocator.
 //
 // Alignment reasoning: gguflib mmaps at a page-aligned base and GGUF tensor
 // data sits at a file offset aligned to general.alignment, 32 by default and
@@ -132,7 +189,8 @@ std::optional<mx::array> try_zero_copy_array(
     size_t nbytes,
     mx::Dtype dtype,
     const mx::Shape& shape,
-    const std::shared_ptr<gguf_ctx>& ctx_holder) {
+    const std::shared_ptr<gguf_ctx>& ctx_holder,
+    bool untracked) {
   if (wd == nullptr || nbytes == 0) {
     return std::nullopt;
   }
@@ -237,16 +295,24 @@ std::optional<mx::array> try_zero_copy_array(
   const uintptr_t buf_base = win_base - win_back_pages * page;
   const size_t buf_off = win_off + win_back_pages * page;
   const size_t buf_bytes = win_row_bytes != 0 ? buf_off + nbytes : win_bytes;
-  mx::allocator::Buffer buf =
-      mx::allocator::make_buffer(reinterpret_cast<void*>(buf_base), buf_bytes);
+  void* const buf_ptr = reinterpret_cast<void*>(buf_base);
+  mx::allocator::Buffer buf = untracked
+      ? make_untracked_buffer(buf_ptr, buf_bytes)
+      : mx::allocator::make_buffer(buf_ptr, buf_bytes);
   if (buf.ptr() == nullptr) {
     return std::nullopt; // no-copy wrap rejected (e.g. alignment).
   }
 
   zc_register(addr, nbytes, dtype);
-  mx::Deleter del = [ctx_holder, addr](mx::allocator::Buffer b) {
+  // The captured ctx_holder is the mapping hold: it drops when MLX destroys
+  // this deleter, right after the call below releases the buffer.
+  mx::Deleter del = [ctx_holder, addr, untracked](mx::allocator::Buffer b) {
     zc_unregister(addr);
-    mx::allocator::release(b);
+    if (untracked) {
+      release_untracked_buffer(b);
+    } else {
+      mx::allocator::release(b);
+    }
   };
   if (win_row_bytes != 0) {
     const auto row_elems = static_cast<int>(win_row_bytes / isz);
@@ -429,11 +495,13 @@ std::string strip_weight_suffix(const std::string& name) {
 
 // Build a native-dtype array from a tensor's wire bytes: a no-copy mmap view
 // when zero_copy is set and the wrap succeeds, else the copying constructor.
+// An untracked tensor has no copy fallback.
 mx::array make_direct_array(
     const gguf_tensor& tensor,
     mx::Dtype dtype,
     const mx::Shape& shape,
     bool zero_copy,
+    bool untracked,
     const std::shared_ptr<gguf_ctx>& ctx_holder) {
   const void* wd = tensor.weights_data;
   if (wd == nullptr) {
@@ -442,10 +510,13 @@ mx::array make_direct_array(
         std::string(tensor.name, tensor.namelen));
   }
   if (zero_copy) {
-    if (auto a =
-            try_zero_copy_array(wd, tensor.bsize, dtype, shape, ctx_holder)) {
+    if (auto a = try_zero_copy_array(
+            wd, tensor.bsize, dtype, shape, ctx_holder, untracked)) {
       return *a;
     }
+  }
+  if (untracked) {
+    throw_untracked_unavailable(std::string(tensor.name, tensor.namelen));
   }
   if (dtype == mx::float32) {
     return mx::array(static_cast<const float*>(wd), shape, mx::float32);
@@ -482,6 +553,7 @@ void load_block_tensor(
     const std::string& codec_name,
     const std::string& name,
     bool zero_copy,
+    bool untracked,
     const std::shared_ptr<gguf_ctx>& ctx_holder) {
   mx::Shape logical = mlx_shape(tensor);
   if (logical.empty()) {
@@ -519,7 +591,8 @@ void load_block_tensor(
 
   // A GGUF with a general.alignment under 16 can place a tensor off the
   // start alignment the codec's GPU kernels need. Such a tensor is copied
-  // into a new buffer instead of viewed, so the ops accept it.
+  // into a new buffer instead of viewed, so the ops accept it. An untracked
+  // tensor has no copy fallback.
   const bool base_ok = reinterpret_cast<uintptr_t>(tensor.weights_data) %
           kq_weight_base_align(codec_name) ==
       0;
@@ -530,9 +603,13 @@ void load_block_tensor(
               tensor.bsize,
               mx::uint8,
               packed,
-              ctx_holder)) {
+              ctx_holder,
+              untracked)) {
         return *a;
       }
+    }
+    if (untracked) {
+      throw_untracked_unavailable(name);
     }
     return mx::array(
         static_cast<const uint8_t*>(tensor.weights_data), packed, mx::uint8);
@@ -727,7 +804,13 @@ void read_metadata_value(
 GgufLoadResult load_gguf(
     const std::string& path,
     bool zero_copy /* = true */,
-    const std::vector<std::string>& skip /* = {} */) {
+    const std::vector<std::string>& skip /* = {} */,
+    const std::vector<std::string>& untracked /* = {} */) {
+  if (!zero_copy && !untracked.empty()) {
+    throw std::invalid_argument(
+        "[load_gguf] untracked tensors are no-copy views, so untracked "
+        "needs zero_copy=True.");
+  }
   {
     std::ifstream f(path.c_str());
     if (!f.good()) {
@@ -749,6 +832,8 @@ GgufLoadResult load_gguf(
 
   GgufLoadResult res;
   const std::unordered_set<std::string> skip_set(skip.begin(), skip.end());
+  const std::unordered_set<std::string> untracked_set(
+      untracked.begin(), untracked.end());
 
   // 1. metadata KVs (must be fully consumed before tensor infos so gguflib
   //    positions ctx->off at the tensor-info section).
@@ -821,6 +906,8 @@ GgufLoadResult load_gguf(
       continue;
     }
 
+    const bool want_untracked =
+        !untracked_set.empty() && untracked_set.count(name) > 0;
     if (codec != nullptr) {
       load_block_tensor(
           res,
@@ -830,11 +917,18 @@ GgufLoadResult load_gguf(
           codec->name,
           name,
           zero_copy,
+          want_untracked,
           ctx);
     } else if (auto dtype = gguf_type_to_dtype(tensor.type)) {
       res.arrays.emplace(
           name,
-          make_direct_array(tensor, *dtype, mlx_shape(tensor), zero_copy, ctx));
+          make_direct_array(
+              tensor,
+              *dtype,
+              mlx_shape(tensor),
+              zero_copy,
+              want_untracked,
+              ctx));
     } else {
       std::ostringstream msg;
       msg << "[load_gguf] tensor " << name << " has unsupported type "

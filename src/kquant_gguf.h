@@ -65,10 +65,20 @@ struct GgufLoadResult {
 // reported, so a caller that reads such a tensor itself (a lookup table past
 // the device max buffer length, which no MTLBuffer can hold) keeps the
 // geometry it needs. A skipped tensor may also have an unsupported type.
+//
+// Tensors named in `untracked` load as no-copy views whose Metal buffer MLX's
+// allocator never sees: it is in none of MLX's residency sets, so a raised
+// wired limit does not wire it, and it is not counted in active memory. It is
+// for a large table read a few rows at a time, whose pages should stay
+// pageable. A listed tensor that cannot get such a view (no Metal backend, or
+// a tensor the loader would copy) fails the load, since a copy would be a
+// tracked buffer. Needs zero_copy. Names the file lacks are ignored, and a
+// name in both lists is skipped.
 GgufLoadResult load_gguf(
     const std::string& path,
     bool zero_copy = true,
-    const std::vector<std::string>& skip = {});
+    const std::vector<std::string>& skip = {},
+    const std::vector<std::string>& untracked = {});
 
 // Number of live zero-copy tensor views (registered mmap tensor ranges).
 size_t zero_copy_view_count();
