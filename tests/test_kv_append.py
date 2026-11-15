@@ -3,8 +3,8 @@
 The op shares the cache buffer, so the tests pin both sides of that: the
 rows land where a slice update puts them, nothing is allocated while another
 array holds the buffer, and a view of the rows below the write still reads
-its old rows. The memory tests need the Metal device and skip under
-KQUANT_FORCE_CPU.
+its old rows. buffer_id tells which arrays share that buffer. The memory
+tests need the Metal device and skip under KQUANT_FORCE_CPU.
 """
 
 import os
@@ -184,6 +184,60 @@ def test_copied_view_is_read_right_in_a_later_command_buffer():
     finally:
         mx.set_cache_limit(limit)
     assert off == [0] * 12
+
+
+def test_buffer_id_none_until_evaluated():
+    a = mx.zeros((B, H, CAP, D), mx.float16) + 1
+    assert kq.buffer_id(a) is None
+    mx.eval(a)
+    assert isinstance(kq.buffer_id(a), int)
+
+
+def test_buffer_id_view_shares_and_copy_does_not():
+    buf = _rand((B, H, CAP, D), mx.float16)
+    mx.eval(buf)
+    view = buf[..., :20, :]
+    copy = buf + 0
+    mx.eval(view, copy)
+    assert kq.buffer_id(view) == kq.buffer_id(buf)
+    assert kq.buffer_id(copy) != kq.buffer_id(buf)
+
+
+def test_buffer_id_follows_kv_append():
+    # A view taken before the append still shares the buffer the append
+    # wrote into, so a holder of both counts that memory once.
+    buf = _rand((B, H, CAP, D), mx.float16)
+    x = _rand((B, H, 2, D), mx.float16)
+    mx.eval(buf, x)
+    view = buf[..., :20, :]
+    mx.eval(view)
+    out = kq.kv_append(buf, x, 20)
+    mx.eval(out)
+    assert kq.buffer_id(out) == kq.buffer_id(buf) == kq.buffer_id(view)
+
+
+def test_buffer_id_parts_at_a_copied_view():
+    # A buf that is not row-contiguous is copied first, so the output is
+    # new memory and views of the old buffer no longer share it.
+    base = _rand((B, H, 2 * CAP, D), mx.float16)
+    mx.eval(base)
+    buf = base[:, :, ::2, :]
+    x = _rand((B, H, 2, D), mx.float16)
+    mx.eval(buf, x)
+    out = kq.kv_append(buf, x, 11)
+    mx.eval(out)
+    assert kq.buffer_id(buf) == kq.buffer_id(base)
+    assert kq.buffer_id(out) != kq.buffer_id(buf)
+
+
+def test_buffer_id_of_work_in_flight():
+    buf = _rand((B, H, CAP, D), mx.float16)
+    x = _rand((B, H, 1, D), mx.float16)
+    mx.eval(buf, x)
+    out = kq.kv_append(buf, x, 3)
+    mx.async_eval(out)
+    assert kq.buffer_id(out) == kq.buffer_id(buf)
+    mx.eval(out)
 
 
 @pytest.mark.parametrize(

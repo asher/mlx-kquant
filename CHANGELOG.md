@@ -9,6 +9,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - `load_gguf(untracked=[...])` loads the named tensors as no-copy views MLX never wires or counts in
   active memory, so a large table read a few rows at a time stays pageable at any wired limit.
+- `buffer_id` names the memory behind an array without evaluating it or waiting on it, so a caller
+  can tell which arrays share one buffer, such as a KV cache and the views of it.
 
 ## [0.5.11]
 
