@@ -168,4 +168,17 @@ kv_append(mx::array buf, mx::array x, int64_t offset, mx::StreamOrDevice s_) {
       {std::move(buf), std::move(x)});
 }
 
+std::optional<uintptr_t> buffer_id(const mx::array& a) {
+  // An evaluated array has its memory even while its kernel is in flight.
+  if (a.status() == mx::array::Status::unscheduled ||
+      a.data_shared_ptr() == nullptr) {
+    return std::nullopt;
+  }
+  const void* ptr = a.buffer().ptr();
+  if (ptr == nullptr) {
+    return std::nullopt;
+  }
+  return reinterpret_cast<uintptr_t>(ptr);
+}
+
 } // namespace mlx_kquant

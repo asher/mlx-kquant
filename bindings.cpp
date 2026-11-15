@@ -3173,6 +3173,27 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "buffer_id",
+      [](mlx::core::array a) { return mlx_kquant::buffer_id(a); },
+      "a"_a,
+      R"(
+        An id for the memory that holds an array's data.
+
+        Two arrays alive at the same time share memory exactly when their
+        ids are equal: a view and the array it views, or kv_append's
+        output and the buffer it wrote into. Reads the array's bookkeeping
+        only, so it never evaluates the array or waits on work in flight.
+        Call it from the thread that evaluates the array.
+
+        Args:
+            a (array): any array.
+
+        Returns:
+            int | None: the id, or None while the array has no memory
+            yet (built but not evaluated).
+      )");
+
+  m.def(
       "route_shed",
       &mlx_kquant::route_shed,
       "indices"_a,
