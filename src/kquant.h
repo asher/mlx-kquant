@@ -1285,12 +1285,12 @@ mx::array kv_append(
     int64_t offset,
     mx::StreamOrDevice s = {});
 
-// An id for the memory that holds a's data, or nullopt while a has none
-// yet (built but not evaluated). Two arrays alive at the same time share
-// memory exactly when their ids are equal: a view and the array it views,
-// or kv_append's output and the buffer it wrote into. Reads a's bookkeeping
-// only, so it never evaluates a or waits on work in flight. Call it on the
-// thread that evaluates a.
+// An id for the MLX allocation that holds a's data, or nullopt while a has
+// none (not yet evaluated, or empty). Two arrays alive at the same time
+// get the same id exactly when they hold the same allocation: a view and
+// the array it views, or kv_append's output and the buffer it wrote into. Reads
+// a's bookkeeping only, so it never evaluates a or waits on work in flight.
+// Call it on the thread that evaluates a.
 std::optional<uintptr_t> buffer_id(const mx::array& a);
 
 // ----------------------------- primitives -----------------------------
