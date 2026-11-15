@@ -3369,12 +3369,13 @@ NB_MODULE(_ext, m) {
       "load_gguf",
       [](const std::string& path,
          bool zero_copy,
-         const std::vector<std::string>& skip) {
+         const std::vector<std::string>& skip,
+         const std::vector<std::string>& untracked) {
         // Parse + mmap wrap can take seconds per shard; without the GIL
         // released a background load freezes the interpreter's UI threads.
         mlx_kquant::GgufLoadResult res = [&] {
           nb::gil_scoped_release nogil;
-          return mlx_kquant::load_gguf(path, zero_copy, skip);
+          return mlx_kquant::load_gguf(path, zero_copy, skip, untracked);
         }();
 
         nb::dict arrays;
@@ -3398,6 +3399,8 @@ NB_MODULE(_ext, m) {
       "path"_a,
       "zero_copy"_a = true,
       "skip"_a = std::vector<std::string>{},
+      nb::kw_only(),
+      "untracked"_a = std::vector<std::string>{},
       R"(
         Load a GGUF file's tensors and metadata directly from gguflib's mmap.
 
@@ -3416,6 +3419,16 @@ NB_MODULE(_ext, m) {
                 and codec are still reported. Use it for a tensor the caller
                 reads itself, such as a lookup table past the device max
                 buffer length, which no MTLBuffer can hold.
+            untracked (list[str]): tensor names to load as no-copy views
+                whose Metal buffer MLX's allocator never tracks. The buffer
+                is in none of MLX's residency sets, so a raised wired limit
+                does not wire it, and ``mx.get_active_memory()`` does not
+                count it. Use it for a large table read a few rows at a
+                time, whose pages should stay pageable. A listed tensor that
+                cannot get such a view (no Metal backend, or a tensor the
+                loader would copy) raises ``RuntimeError`` rather than load
+                as a tracked copy. Needs ``zero_copy=True``. Names the file
+                lacks are ignored, and a name also in ``skip`` is skipped.
 
         Returns:
             tuple[dict, dict, dict, dict]: ``(arrays, codecs, metadata, shapes)``:

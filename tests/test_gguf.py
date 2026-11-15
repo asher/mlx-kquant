@@ -12,9 +12,11 @@ Runs under pytest; skipped automatically when the extension is unavailable.
 
 from __future__ import annotations
 
+import gc
 import os
 import subprocess
 import sys
+import time
 
 import numpy as np
 import pytest
@@ -613,3 +615,131 @@ def test_load_gguf_skip(tmp_path):
     # Default: nothing skipped.
     arrays, _c, _m, _s = kq.load_gguf(str(tmp_path / "smoke.gguf"))
     assert "layer.q8" in arrays and "plain.f32" in arrays
+
+
+_TABLE = "per_layer_token_embd.weight"
+
+
+def _write_table(path):
+    """An iq4_nl table of 4096 rows of 512 weights (288 bytes a row, 1.2 MB),
+    alone in its file. Returns its wire bytes."""
+    from kqref import synth_wire
+
+    rows, blocks = 4096, 512 // 32
+    wire = synth_wire(np.random.default_rng(9), "iq4_nl", 18, rows * blocks)
+    wire = wire.reshape(rows, blocks * 18)
+    _write_gguf(path, [(_TABLE, wire, GT.IQ4_NL)])
+    return wire
+
+
+def _until(check):
+    # The last reference to a freed array can sit in a stream's completion
+    # callback for a moment after mx.eval or mx.synchronize returns.
+    for _ in range(100):
+        gc.collect()
+        if check():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_load_gguf_untracked_view(tmp_path):
+    """A tensor named in untracked loads as a no-copy view over the mapping
+    whose Metal buffer MLX's allocator never tracks. MLX adds a no-copy
+    buffer to its residency sets and to its active-memory count in one step,
+    so a load that leaves the count flat left the residency sets alone too;
+    the tracked load first shows the count sees a wrap of this size. Rows
+    gathered from the view on a CPU stream, as a streamed table reads them,
+    and on the GPU match a copy of the same bytes. Freeing the view, after
+    its gathers or while they are queued, gives back nothing it did not
+    take, and work after the mapping is gone still runs."""
+    path = str(tmp_path / "table.gguf")
+    wire = _write_table(path)
+    if not mx.metal.is_available():
+        # No Metal, no no-copy view: the load fails rather than copy the
+        # table into a buffer the allocator tracks.
+        with pytest.raises(RuntimeError, match="untracked"):
+            kq.load_gguf(path, untracked=[_TABLE])
+        pytest.skip("untracked views need the Metal backend")
+    if os.environ.get("KQUANT_FORCE_CPU"):
+        pytest.skip("runs GPU gathers; skipped under KQUANT_FORCE_CPU")
+
+    mx.default_stream(mx.cpu)  # a new stream made first would be the default
+    cpu = mx.new_stream(mx.cpu)
+    idx = mx.array([0, 1, 7, 2048, 4095, 7], dtype=mx.int32)
+    want = wire[np.array(idx)]
+    copy, _, _, _ = kq.load_gguf(path, zero_copy=False)
+    ref, scales = copy[_TABLE], copy["per_layer_token_embd.scales"]
+    mx.eval(idx, ref, scales)
+    views = kq.zero_copy_view_count()
+    slack = wire.nbytes // 16
+
+    def settled():
+        assert _until(lambda: kq.zero_copy_view_count() == views)
+        mx.synchronize(cpu)
+        mx.synchronize(mx.default_stream(mx.gpu))
+        return mx.get_active_memory()
+
+    # Control: the tracked view of the same tensor adds its window to the
+    # active-memory count.
+    m0 = settled()
+    tracked = kq.load_gguf(path)[0][_TABLE]
+    mx.eval(tracked)
+    assert mx.get_active_memory() - m0 >= wire.nbytes
+    del tracked
+    m0 = settled()
+
+    arrays, codecs, _, _ = kq.load_gguf(path, untracked=[_TABLE])
+    table = arrays[_TABLE]
+    mx.eval(table)
+    assert codecs[_TABLE] == "iq4_nl" and table.shape == wire.shape
+    assert mx.get_active_memory() - m0 < slack
+    # A view over the mapped bytes, not a copy of them.
+    assert kq.zero_copy_view_count() == views + 1
+    (prob,) = kq.verify_zero_copy_views([(_TABLE, table)], no_alias=[_TABLE])
+    assert "aliases" in prob
+
+    got = [mx.take(table, idx, axis=0, stream=s) for s in (cpu, mx.gpu)]
+    rows = mx.take(ref, idx, axis=0, stream=cpu)
+    mx.eval(*got, rows)
+    for g in got:
+        assert np.array_equal(np.array(g), want)
+    # A streamed table's decode: rows gathered on the CPU stream, then
+    # dequantized on the default stream.
+    deq = kq.dequantize(got[0], scales, "iq4_nl", dtype=mx.float32)
+    deq_ref = kq.dequantize(rows, scales, "iq4_nl", dtype=mx.float32)
+    assert np.array_equal(np.array(deq), np.array(deq_ref))
+
+    # A release through the allocator would drop the count by the window, or
+    # wrap it past zero.
+    del table, arrays, got, rows, deq, deq_ref
+    assert m0 - 16384 <= settled() < m0 + slack
+
+    # Freed while its gathers are queued: the last reference drops on
+    # whichever thread finishes with the view last.
+    arrays, _, _, _ = kq.load_gguf(path, untracked=[_TABLE])
+    table = arrays.pop(_TABLE)
+    del arrays
+    got = [mx.take(table, idx, axis=0, stream=s) for s in (cpu, mx.gpu)]
+    del table
+    mx.eval(*got)
+    for g in got:
+        assert np.array_equal(np.array(g), want)
+    del got
+    assert m0 - 16384 <= settled() < m0 + slack
+
+    for s in (cpu, mx.gpu):
+        assert np.array_equal(np.array(mx.take(ref, idx, axis=0, stream=s)), want)
+
+
+def test_load_gguf_untracked_names(tmp_path):
+    """untracked needs zero_copy. A name the file lacks is ignored, since
+    every shard of a split GGUF gets the same list, and skip wins over it."""
+    path = str(tmp_path / "table.gguf")
+    wire = _write_table(path)
+    with pytest.raises(ValueError, match="untracked"):
+        kq.load_gguf(path, False, untracked=[_TABLE])
+    arrays, _, _, _ = kq.load_gguf(path, untracked=["blk.0.missing.weight"])
+    assert np.array_equal(np.array(arrays[_TABLE]), wire)
+    arrays, codecs, _, _ = kq.load_gguf(path, True, [_TABLE], untracked=[_TABLE])
+    assert _TABLE not in arrays and codecs[_TABLE] == "iq4_nl"

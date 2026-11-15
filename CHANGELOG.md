@@ -6,6 +6,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `load_gguf(untracked=[...])` loads the named tensors as no-copy views MLX never wires or counts in
+  active memory, so a large table read a few rows at a time stays pageable at any wired limit.
+
 ## [0.5.11]
 
 ### Added
