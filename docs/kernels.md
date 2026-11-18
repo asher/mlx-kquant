@@ -283,6 +283,13 @@ to 4% slower than `gather_qmv`, with the sign changing from run to run. At K 768
 longer at one and two entries in every run, and up to 13% less time at 4 to 16. Both keep
 `gather_qmv` there.
 
+A `q8_0` row under 256 weights fills only some of the 32 lanes of the `gather_qmv` tile, which
+gives each lane eight weights of a row. For a K under 256 that 32 divides, `gather_qmm` with one
+activation row runs a kernel that gives every output row its own thread instead: the per-head
+projections of an absorbed MLA, 128 wide. On M5 Max a call of 64 heads by 512 rows took 11.7 us
+against 20.2 us, and 8.0 us against 12.6 us at 32 heads. The outputs differ from `gather_qmv` only
+in float32 summation order.
+
 Tuning levers (defaults are right for normal use):
 
 - `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
@@ -421,6 +428,8 @@ Tuning levers (defaults are right for normal use):
   row. `0` restores `gather_qmv`, `1` takes split-K at any K that 256 divides, and unset follows
   the K and row-count rule above. `KQ_QMV_SPLITK` and `KQ_QMV_FINE` do not change it. Read live
   per call.
+- `KQ_GATHER_ROWS` - the row-per-thread `q8_0` kernel for `gather_qmm` at one activation row and
+  a K under 256. `0` restores `gather_qmv`. Read live per call.
 - `KQ_QMV_SPLITK` - the `q6_k` and `q8_0` split-K kernels for one activation row. `0` restores
   the per-row kernels, as does a set `KQ_QMV_FINE`, so a tiling A/B keeps measuring the tiling it
   names. A lever that forces another route at one row, such as `KQ_VERIFY_NAX=1`, takes

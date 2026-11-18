@@ -19,6 +19,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `dsa_indexer_score_decode` accepts 16 indexer heads and `dsa_topk_indices` a width of 511, the
   pools a 2048-key budget holds at ratio 4 beside the query's own group.
 
+### Changed
+- `gather_qmm` at one activation row runs `q8_0` rows under 256 weights about 1.7x faster (64 heads
+  by 512 rows of 128 on M5 Max), the per-head projections of an absorbed MLA. `KQ_GATHER_ROWS=0`
+  restores the previous kernel.
+
 ## [0.5.11]
 
 ### Added
