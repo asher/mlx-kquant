@@ -4040,7 +4040,8 @@ class KQSdpaSparseDecode : public mx::Primitive {
       bool has_win_mask,
       bool has_sel_mask,
       bool packed,
-      int score_tail)
+      int score_tail,
+      int band = 0)
       : mx::Primitive(stream),
         scale_(scale),
         splits_(splits),
@@ -4048,7 +4049,8 @@ class KQSdpaSparseDecode : public mx::Primitive {
         has_win_mask_(has_win_mask),
         has_sel_mask_(has_sel_mask),
         packed_(packed),
-        score_tail_(score_tail) {}
+        score_tail_(score_tail),
+        band_(band) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -4073,6 +4075,9 @@ class KQSdpaSparseDecode : public mx::Primitive {
   bool has_sel_mask_;
   bool packed_;
   int score_tail_;
+  // Above 0 the node is sdpa_sparse_prefill on the NAX split kernel: the
+  // window input holds S rows and query l reads its band of them.
+  int band_;
 };
 
 // Prefill form of sdpa_sparse_decode: query l of window [B, 1, S, D]

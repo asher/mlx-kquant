@@ -1509,12 +1509,21 @@ into a packed layout first.
   names, K == V, with per-head sinks and key masks: query l of `q [B, H, L, D]` attends `window [B,
   1, W, D]` and the rows of `pool [B, P, D]` that `idx [B, L, N]` lists, read in place with no
   gathered copy. `score_tail=64` on rows 576 wide counts the last 64 values in the score only, the
-  rope half of an absorbed MLA key. The keys fan out over splits whose f32 partials one merge pass
-  renormalizes. On tensor-op GPUs a 512 latent, with or without the tail, runs a NAX tile kernel:
+  rope half of an absorbed MLA key. The keys of a lone query fan out over splits whose f32 partials
+  one merge pass renormalizes; queries enough to fill the GPU take one split each, which writes the
+  output itself. On tensor-op GPUs a 512 latent, with or without the tail, runs a NAX tile kernel:
   32-head strips over 16-key tiles, eight simdgroups that each hold a 64-column eighth of the latent
-  and a ninth that adds the tail's share of the score. A packed pool and head dims 128 and 256 run
-  the simdgroup kernel, one simdgroup per head. The two kernels round differently.
+  and 8 columns of the tail, one key tile in registers at a time. A packed pool and head dims 128
+  and 256 run the simdgroup kernel, two simdgroups per eight heads. The two kernels round
+  differently. The NAX kernel reads a masked or padded slot as zeros; the simdgroup kernel reads
+  the row at weight zero, so a masked row must hold finite values there.
   `KQ_SDPA_SPARSE_NAX=0` keeps the simdgroup kernel.
+- **`sdpa_sparse_prefill`** - the prefill form: query l sits at window row `S - L + l`, reads the
+  `band` rows that end at its own, then its listed pool rows; no window mask, the band is the mask.
+  On tensor-op GPUs a 512 latent runs the NAX kernel of `sdpa_sparse_decode` with the band in place
+  of its window, 3.2x faster at 32 heads by 2048 queries by 2052 keys on M5 Max. Elsewhere one
+  threadgroup per query and head group stages the rows through a table. `KQ_SDPA_SPARSE_NAX=0`
+  keeps that kernel.
 
 ## Int8 matmul
 

@@ -35,6 +35,7 @@ TOL = {mx.float16: 3e-3, mx.bfloat16: 2e-2}
 
 def _run(args, lever, **extra):
     q, win, pool, idx, scale, kw = args
+    before = os.environ.get(LEVER)
     if lever is None:
         os.environ.pop(LEVER, None)
     else:
@@ -43,7 +44,10 @@ def _run(args, lever, **extra):
         got = kq.sdpa_sparse_decode(q, win, pool, idx, scale, **kw, **extra)
         mx.eval(got)
     finally:
-        os.environ.pop(LEVER, None)
+        if before is None:
+            os.environ.pop(LEVER, None)
+        else:
+            os.environ[LEVER] = before
     return np.array(got.astype(mx.float32))
 
 
@@ -57,6 +61,11 @@ SHAPES = {
     "one_split": (1, 32, 2, 512, 96, 700, 300, False, True, True, 1),
     "most_splits": (2, 64, 1, 576, 33, 500, 200, True, False, True, 32),
     "no_window": (1, 16, 1, 512, 0, 64, 40, True, False, True, 0),
+    "batch_tail": (2, 32, 3, 576, 40, 96, 24, True, True, True, 0),
+    # Queries enough to fill the GPU: one split, which writes the output.
+    "direct_block": (1, 32, 40, 576, 50, 300, 70, True, True, True, 0),
+    "direct_short_strip": (1, 40, 20, 576, 33, 500, 200, True, False, True, 1),
+    "direct_no_sinks": (2, 64, 2, 512, 96, 700, 300, False, True, True, 1),
 }
 
 
@@ -111,9 +120,85 @@ def test_a_split_with_every_slot_masked(lever):
     assert float(np.abs(got - ref).max()) < TOL[mx.float16]
 
 
+@pytest.mark.parametrize("splits", [1, 2, 5])
+@pytest.mark.parametrize("lever", [None, "0"])
+def test_a_masked_tile_between_live_tiles(lever, splits):
+    # Whole 16-key tiles drop out inside a split: the first tile of one
+    # query, a middle tile of another, a run of listed rows of both.
+    B, H, L, D, W, P, N = 1, 32, 2, 576, 64, 400, 96
+    args, _ = _case(B, H, L, D, W, P, N, mx.float16, np.int32, True, True, False)
+    q, win, pool, idx, scale, kw = args
+    wm = np.ones((L, W), bool)
+    wm[0, :16] = False
+    wm[1, 16:48] = False
+    sm = np.ones((B, L, N), bool)
+    sm[:, 0, 32:64] = False
+    sm[:, 1, :16] = False
+    kw = dict(kw, win_mask=mx.array(wm), sel_mask=mx.array(sm))
+    got = _run((q, win, pool, idx, scale, kw), lever, splits=splits, score_tail=64)
+    f32 = [np.array(a.astype(mx.float32)) for a in (q, win, pool, kw["sinks"])]
+    ref = _ref(f32[0], f32[1], f32[2], np.array(idx), scale, f32[3], wm[None], sm)
+    assert float(np.abs(got - ref[..., :512]).max()) < TOL[mx.float16]
+
+
+@pytest.mark.parametrize("splits", [0, 1])
+def test_a_dead_row_that_is_not_finite_never_counts(splits):
+    # Window row 0 is masked for every query and holds inf and nan, and it
+    # is the row a padded slot loads; a listed pool row is masked and nan.
+    # The NAX kernel reads a dead row as zeros. The simdgroup kernel reads
+    # its values at weight zero, so there they must be finite.
+    if not kq.nax_available():
+        pytest.skip("no tensor-op units on this GPU")
+    lever = None
+    B, H, L, D, W, P, N = 1, 32, 2, 512, 40, 96, 24
+    args, _ = _case(B, H, L, D, W, P, N, mx.float16, np.int32, True, True, True)
+    q, win, pool, idx, scale, kw = args
+    wm = np.array(kw["win_mask"])
+    wm[:, 0] = False
+    idn = np.array(idx)
+    bad = int(idn[0, 0, 5])
+    sm = np.array(kw["sel_mask"]) & (idn != bad)
+    winf = np.array(win.astype(mx.float32))
+    poolf = np.array(pool.astype(mx.float32))
+    win_bad, pool_bad = winf.copy(), poolf.copy()
+    win_bad[:, :, 0, ::2] = np.inf
+    win_bad[:, :, 0, 1::2] = np.nan
+    pool_bad[:, bad] = np.nan
+    kw = dict(kw, win_mask=mx.array(wm), sel_mask=mx.array(sm))
+    got = _run(
+        (
+            q,
+            mx.array(win_bad).astype(mx.float16),
+            mx.array(pool_bad).astype(mx.float16),
+            idx,
+            scale,
+            kw,
+        ),
+        lever,
+        splits=splits,
+    )
+    f32 = [np.array(a.astype(mx.float32)) for a in (q, kw["sinks"])]
+    ref = _ref(f32[0], winf, poolf, idn, scale, f32[1], wm[None], sm)
+    assert np.isfinite(got).all()
+    assert float(np.abs(got - ref).max()) < TOL[mx.float16]
+
+
+def test_no_window_row_and_no_pool_row_is_refused():
+    q = mx.zeros((1, 32, 1, 512), mx.float16)
+    with pytest.raises(ValueError):
+        kq.sdpa_sparse_decode(
+            q,
+            mx.zeros((1, 1, 0, 512), mx.float16),
+            mx.zeros((1, 0, 512), mx.float16),
+            mx.full((1, 1, 4), -1, dtype=mx.int32),
+            0.05,
+        )
+
+
 @pytest.mark.parametrize("B", [1, 2])
 def test_strided_query_window_and_pool(B):
-    # Views with head, row and batch strides the kernel reads in place.
+    # Views of larger buffers: the window and pool pass by stride and
+    # offset, the query is made dense before the kernel reads it.
     rng = np.random.default_rng(5)
     H, L, D, W, P, N = 32, 2, 576, 48, 128, 64
     qw = mx.array(rng.standard_normal((B, L, 2 * H, D)), dtype=mx.float16)

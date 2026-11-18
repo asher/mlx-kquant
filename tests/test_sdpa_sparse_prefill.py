@@ -9,12 +9,20 @@ dtypes, both index dtypes, head dims 128/256/512, a band the early queries
 cannot fill, a batch with broadcast window and pool, a key count past one
 row-table pass, and every instantiated configuration.
 
+A 512 latent, with or without the 64-wide score-only tail, has two kernels:
+the NAX tile kernel on a tensor-op GPU and the simdgroup kernel under
+KQ_SDPA_SPARSE_NAX=0. The tests that reach a 512 latent run both.
+
 Metal-only kernel (eval_cpu throws): skipped under KQUANT_FORCE_CPU.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import subprocess
+import sys
 
 import mlx.core as mx
 import numpy as np
@@ -28,6 +36,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 CFGS = ["16,4,8", "32,4,8", "16,2,8"]
+LEVER = "KQ_SDPA_SPARSE_NAX"
+
+
+@pytest.fixture(params=["nax", "simd"])
+def kernel(request, monkeypatch):
+    """Each kernel of a 512 latent in turn."""
+    if request.param == "simd":
+        monkeypatch.setenv(LEVER, "0")
+    elif not kq.nax_available():
+        pytest.skip("no tensor-op units on this GPU")
+    else:
+        monkeypatch.delenv(LEVER, raising=False)
+    return request.param
 
 
 def _ref(q, win, pool, idx, scale, band, sinks, smask):
@@ -103,6 +124,10 @@ def _case(
 
 def _check(args, ref, tol):
     q, win, pool, idx, scale, band, kw = args
+    if q.shape[-1] == 576:
+        # Rows 576 wide: all of a row scores, the first 512 values come out.
+        kw = dict(kw, score_tail=64)
+        ref = ref[..., :512]
     got = kq.sdpa_sparse_prefill(q, win, pool, idx, scale, band, **kw)
     mx.eval(got)
     g = np.array(got.astype(mx.float32))
@@ -114,7 +139,7 @@ def _check(args, ref, tol):
 @pytest.mark.parametrize("dtype,tol", [(mx.float16, 3e-3), (mx.bfloat16, 2e-2)])
 @pytest.mark.parametrize("idtype", [np.int32, np.uint32])
 @pytest.mark.parametrize("D", [128, 256, 512])
-def test_prefill_matches_reference(dtype, tol, idtype, D):
+def test_prefill_matches_reference(dtype, tol, idtype, D, kernel):
     # 40 history rows, band 128: the first queries read fewer window rows
     # than the band; the last read the full band.
     args, ref = _case(
@@ -137,6 +162,8 @@ def test_prefill_matches_reference(dtype, tol, idtype, D):
 
 @pytest.mark.parametrize("cfg", CFGS)
 def test_every_configuration(monkeypatch, cfg):
+    # The configurations are the simdgroup kernel's.
+    monkeypatch.setenv(LEVER, "0")
     monkeypatch.setenv("KQ_SDPA_SPARSE_PREFILL_CFG", cfg)
     args, ref = _case(
         1,
@@ -266,9 +293,12 @@ def test_validation():
 
 @pytest.mark.parametrize("D", [128, 512])
 @pytest.mark.parametrize("B,bcast", [(1, False), (2, True)])
-def test_packed_pool_matches_fp16_pool(D, B, bcast):
+def test_packed_pool_matches_fp16_pool(D, B, bcast, monkeypatch):
     from test_sdpa_sparse_decode import _on_grid_pool
 
+    # A packed pool runs the simdgroup kernel, so the fp16 pool it is held
+    # to bit for bit runs it too.
+    monkeypatch.setenv(LEVER, "0")
     args, _ = _case(
         B,
         16,
@@ -304,15 +334,16 @@ def test_packed_pool_matches_fp16_pool(D, B, bcast):
     assert mx.array_equal(got, want).item()
 
 
+@pytest.mark.parametrize("D", [128, 576])
 @pytest.mark.parametrize("B", [1, 2])
-def test_strided_window_and_pool_match_contiguous(B):
+def test_strided_window_and_pool_match_contiguous(B, D):
     """Prefix slices of larger buffers pass by stride; a transposed view
     with a non-unit feature stride is copied at eval. All match exactly."""
     args, _ = _case(
         B,
         64,
         100,
-        128,
+        D,
         140,
         700,
         512,
@@ -324,8 +355,10 @@ def test_strided_window_and_pool_match_contiguous(B):
         pad=True,
     )
     q, win, pool, idx, scale, band, kw = args
+    if D == 576:
+        kw = dict(kw, score_tail=64)
     want = kq.sdpa_sparse_prefill(q, win, pool, idx, scale, band, **kw)
-    _, _, S, D = win.shape
+    S = win.shape[2]
     P = pool.shape[1]
 
     def z(*s):
@@ -343,8 +376,7 @@ def test_strided_window_and_pool_match_contiguous(B):
 
 
 @pytest.mark.parametrize("dtype,tol", [(mx.float16, 3e-3), (mx.bfloat16, 2e-2)])
-def test_score_tail_counts_in_the_score_and_has_no_output(dtype, tol):
-    # Rows 576 wide: all of a row scores, the first 512 values come out.
+def test_score_tail_counts_in_the_score_and_has_no_output(dtype, tol, kernel):
     args, ref = _case(
         2,
         32,
@@ -360,13 +392,167 @@ def test_score_tail_counts_in_the_score_and_has_no_output(dtype, tol):
         mask=True,
         pad=True,
     )
+    _check(args, ref, tol)
+
+
+# B, H, L, D, S, P, N, band, sinks, mask, pad, bcast. D 576 carries the tail.
+LATENT_512 = {
+    # A sparse layer's block: the query's own row and 2051 listed rows.
+    "sparse_block": (1, 32, 70, 576, 110, 4096, 2051, 1, True, False, True, False),
+    # Heads short of a strip in the second strip, keys short of a tile.
+    "short_strip": (1, 40, 9, 512, 30, 200, 37, 8, True, True, True, False),
+    "window_only": (1, 32, 5, 512, 5, 16, 0, 3, False, False, False, False),
+    # One query: the keys fan out over splits, as at decode.
+    "one_query": (1, 64, 1, 576, 600, 700, 300, 512, True, True, False, False),
+    "batch_broadcast": (2, 32, 20, 512, 50, 300, 100, 16, True, True, True, True),
+    # Queries enough to fill the GPU: one split, the early ones short of
+    # the band.
+    "long_block": (1, 32, 200, 576, 200, 900, 130, 4, True, True, True, False),
+}
+
+
+@pytest.mark.parametrize("dtype,tol", [(mx.float16, 3e-3), (mx.bfloat16, 2e-2)])
+@pytest.mark.parametrize("name", list(LATENT_512))
+def test_a_512_latent_on_both_kernels(name, dtype, tol, kernel):
+    B, H, L, D, S, P, N, band, sinks, mask, pad, bcast = LATENT_512[name]
+    args, ref = _case(
+        B,
+        H,
+        L,
+        D,
+        S,
+        P,
+        N,
+        band,
+        dtype,
+        np.int32,
+        sinks=sinks,
+        mask=mask,
+        pad=pad,
+        bcast=bcast,
+        seed=len(name),
+    )
+    _check(args, ref, tol)
+
+
+def test_a_dead_row_that_is_not_finite_never_counts(kernel):
+    # Window row 0 lies outside every query's band, holds inf and nan, and
+    # is the row a padded slot loads; a pool row every query masks is nan.
+    B, H, L, D, S, P, N, band = 1, 32, 6, 512, 40, 96, 24, 4
+    args, _ = _case(
+        B,
+        H,
+        L,
+        D,
+        S,
+        P,
+        N,
+        band,
+        mx.float16,
+        np.int32,
+        sinks=True,
+        mask=True,
+        pad=True,
+    )
     q, win, pool, idx, scale, band, kw = args
-    got = kq.sdpa_sparse_prefill(q, win, pool, idx, scale, band, score_tail=64, **kw)
-    mx.eval(got)
+    idn = np.array(idx)
+    sm = np.array(kw["sel_mask"])
+    bad = int(idn[0, 0, 5])
+    sm &= idn != bad
+    winf = np.array(win.astype(mx.float32))
+    poolf = np.array(pool.astype(mx.float32))
+    win_bad, pool_bad = winf.copy(), poolf.copy()
+    win_bad[:, :, 0, ::2] = np.inf
+    win_bad[:, :, 0, 1::2] = np.nan
+    pool_bad[:, bad] = np.nan
+    got = kq.sdpa_sparse_prefill(
+        q,
+        mx.array(win_bad).astype(mx.float16),
+        mx.array(pool_bad).astype(mx.float16),
+        idx,
+        scale,
+        band,
+        sinks=kw["sinks"],
+        sel_mask=mx.array(sm),
+    )
     g = np.array(got.astype(mx.float32))
-    assert g.shape == ref[..., :512].shape
-    err = float(np.abs(g - ref[..., :512]).max())
-    assert err < tol, err
+    ref = _ref(
+        np.array(q.astype(mx.float32)),
+        winf,
+        poolf,
+        idn,
+        scale,
+        band,
+        np.array(kw["sinks"].astype(mx.float32)),
+        sm,
+    )
+    assert np.isfinite(g).all()
+    assert float(np.abs(g - ref).max()) < 3e-3
+
+
+_CHILD = r"""
+import json, os, sys
+import mlx.core as mx
+import mlx_kquant as kq
+for i, (d, tail, packed, lever) in enumerate(json.loads(sys.argv[1])):
+    if lever is None:
+        os.environ.pop("KQ_SDPA_SPARSE_NAX", None)
+    else:
+        os.environ["KQ_SDPA_SPARSE_NAX"] = lever
+    mx.random.seed(i)
+    q = mx.random.normal((1, 32, 8, d)).astype(mx.float16)
+    win = mx.random.normal((1, 1, 40, d)).astype(mx.float16)
+    pool = mx.random.normal((1, 64, d)).astype(mx.float16)
+    idx = mx.broadcast_to(mx.arange(48, dtype=mx.int32), (1, 8, 48))
+    kw = {"score_tail": tail} if tail else {}
+    if packed:
+        codes, scales = kq.latent_fp4_pack(pool)
+        pool, kw = codes, {"pool_scales": scales}
+    sys.stderr.write(f"[case] {i}\n")
+    sys.stderr.flush()
+    mx.eval(kq.sdpa_sparse_prefill(q, win, pool, idx, 0.05, 4, **kw))
+"""
+_LOG = re.compile(r"^\[kq qmm\] (\S+)")
+# D, score_tail, packed pool, lever, takes the NAX kernel on a tensor-op GPU.
+ROUTES = [
+    (576, 64, False, None, True),
+    (512, 0, False, None, True),
+    (576, 64, False, "0", False),
+    (512, 0, False, "0", False),
+    (256, 0, False, None, False),
+    (128, 0, False, None, False),
+    (512, 0, True, None, False),
+]
+
+
+def test_routing():
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KQ_")}
+    env["KQ_QMM_LOG"] = "1"
+    spec = json.dumps([list(r[:4]) for r in ROUTES])
+    r = subprocess.run(
+        [sys.executable, "-c", _CHILD, spec],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert r.returncode == 0, r.stderr[-4000:]
+    got, cur = {}, None
+    for line in r.stderr.splitlines():
+        if line.startswith("[case] "):
+            cur = int(line.split()[1])
+            got[cur] = []
+            continue
+        m = _LOG.match(line)
+        if m and cur is not None:
+            got[cur].append(m.group(1))
+    assert len(got) == len(ROUTES), r.stderr[-4000:]
+    nax = kq.nax_available()
+    for i, route in enumerate(ROUTES):
+        took = any("sparse_decode_nax" in n for n in got[i])
+        assert took == (route[4] and nax), f"{route}: {got[i]}"
+        if route[0] == 576 and took:
+            assert any(n.endswith("_t64") for n in got[i]), got[i]
 
 
 def test_score_tail_is_refused_at_other_widths():

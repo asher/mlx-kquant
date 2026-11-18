@@ -18,6 +18,9 @@ struct KQSdpaSparseDecodeParams {
   int has_sel_mask;
   int direct; ///< One split: the split kernel normalizes and writes O
   int Do; ///< Output width: D less the score-only tail of each row
+  int band; ///< 0, or the prefill form: query l reads window rows
+  ///< [pos - band + 1, pos], pos = koff + l (NAX split kernel only)
+  int koff; ///< Window row of query 0 under a band
   float scale_log2; ///< softmax scale times log2(e)
 
   int64_t q_strides[3]; ///< B, H, L (D contiguous)

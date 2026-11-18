@@ -23,9 +23,17 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `gather_qmm` at one activation row runs `q8_0` rows under 256 weights about 1.7x faster (64 heads
   by 512 rows of 128 on M5 Max), the per-head projections of an absorbed MLA. `KQ_GATHER_ROWS=0`
   restores the previous kernel.
-- `sdpa_sparse_decode` at a 512 latent, with or without `score_tail=64`, runs 2.1x to 2.6x faster on
+- `sdpa_sparse_decode` at a 512 latent, with or without `score_tail=64`, runs 2.2x to 2.8x faster on
   M5 and later GPUs (64 heads over 512 window rows, 32 heads over 2048 listed rows, M5 Max). Outputs
   differ at rounding level. `KQ_SDPA_SPARSE_NAX=0` restores the previous kernel.
+- `sdpa_sparse_prefill` at a 512 latent, with or without `score_tail=64`, runs 3.2x faster on M5 and
+  later GPUs (32 heads, 2048 queries, 2052 keys each, M5 Max). Outputs differ at rounding level.
+  `KQ_SDPA_SPARSE_NAX=0` restores the previous kernel.
+
+### Fixed
+- `sdpa_sparse_prefill` no longer returns NaN when window row 0 holds a non-finite value that no
+  query attends and a query has a padded or masked slot.
+- `sdpa_sparse_decode` refuses an empty window with an empty pool, which read past a buffer.
 
 ## [0.5.11]
 

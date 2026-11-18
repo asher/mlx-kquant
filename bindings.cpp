@@ -1637,15 +1637,16 @@ NB_MODULE(_ext, m) {
         Attention over two key sources with K == V: a window read whole
         and a pool read through a per-query index list, as in the
         DeepSeek-V4 sparse attention step. The keys fan out over splits
-        of threadgroups (one simdgroup per head and split) that write
-        unnormalized f32 partials, and a merge renormalizes them with the
-        per-head sink counted once. Replaces the gather, the two score
+        of threadgroups that write unnormalized f32 partials, and a merge
+        renormalizes them with the per-head sink counted once; a lone
+        split writes the output itself. Replaces the gather, the two score
         matmuls, the split softmax and the two value matmuls. Queries are
         a batch dimension: a decode step, or a prefill block whose queries
         share the window rows and keep their own index lists. On
         tensor-op GPUs a 512 latent with an unpacked pool runs a NAX tile
         kernel that rounds differently; KQ_SDPA_SPARSE_NAX=0 keeps the
-        simdgroup kernel.
+        simdgroup kernel. A masked row counts for nothing, but outside
+        the NAX kernel its values are still read and must be finite.
 
         Args:
             q (array): queries [B, H, L, D], float16/bfloat16; D in
@@ -1697,7 +1698,11 @@ NB_MODULE(_ext, m) {
         sliding window, itself included) plus the pool rows its index list
         names. The kernel derives the window band from the position, so
         no window mask is read; the row addresses of a query resolve once
-        into a threadgroup table before the key blocks stream through.
+        into a threadgroup table before the key blocks stream through. On
+        tensor-op GPUs a 512 latent with an unpacked pool runs the NAX
+        tile kernel of sdpa_sparse_decode with the band in place of its
+        window, which rounds differently; KQ_SDPA_SPARSE_NAX=0 keeps the
+        simdgroup kernel.
 
         Args:
             q (array): queries [B, H, L, D], float16/bfloat16; D in

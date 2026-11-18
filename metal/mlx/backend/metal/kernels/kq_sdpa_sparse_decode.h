@@ -133,6 +133,9 @@ kq_sdpa_sparse_decode_split(
           size_t(l) * p->sel_mask_strides[1]
       : nullptr;
   // Dead slots stage a row that exists so every load stays unconditional.
+  // Its weight is zero, so its values count for nothing as long as they
+  // are finite: a masked row must not hold inf or nan here. (Zeroing the
+  // staged row instead costs a query block that fills the GPU 7%.)
   const bool safe_pk = PK && W == 0;
   const device T* safe_row = W > 0 ? win_b
       : PK                         ? reinterpret_cast<const device T*>(pool_c)
@@ -502,8 +505,11 @@ kq_sdpa_sparse_prefill(
   const float sl2 = p->scale_log2;
 
   // Rows of block j0 into registers through the table; dead slots stage
-  // window row 0 so every load stays unconditional. A packed pool row
-  // lands as its code word in .x and scale byte in .y.
+  // the query's own window row so every load stays unconditional. That
+  // row is live for the query, so a dead slot adds no value the output
+  // does not already depend on. A packed pool row lands as its code word
+  // in .x and scale byte in .y.
+  const device T* own_row = win_b + size_t(pos) * p->win_strides[1];
   uint4 pre[SV];
   bool pkf[SV];
 #define KQ_SPARSE_PF_FETCH(j0)                                    \
@@ -521,7 +527,7 @@ kq_sdpa_sparse_prefill(
               pool_c + size_t(e) * (D / 2))[c];                   \
           pre[i].y = pool_s[size_t(e) * (D / 16) + c / 2];        \
         } else {                                                  \
-          const device T* row = win_b;                            \
+          const device T* row = own_row;                          \
           if (e >= 0) {                                           \
             row = pool_b + size_t(e) * p->pool_strides[1];        \
           } else if (e != DEAD) {                                 \
