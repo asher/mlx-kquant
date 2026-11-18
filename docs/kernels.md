@@ -1612,9 +1612,11 @@ modifications, from omlx's `glm_moe_dsa` custom kernels (see the
 (`qL = 2`), and prefill share them.
 
 - **`dsa_indexer_scores`** - indexer relevance scores over a prefill query tile (steel GEMM):
-  `out[b,0,m,n] = sum_h relu(q[b,h,m] . k[b,0,n]) * w[h,m]`.
+  `out[b,0,m,n] = sum_h relu(q[b,h,m] . k[b,0,n]) * w[h,m]`. 16, 32 or 64 heads; fp32 head weights
+  are read as-is. `causal_ratio` is for pooled keys, one key per `causal_ratio` positions: row `m`
+  sees the keys under `(causal_q_offset + m + 1) // causal_ratio`.
 - **`dsa_indexer_score_decode`** - the same for decode-width (`qL <= 4`) queries without materializing
-  the per-head `[H, P]` scores. 4, 32 or 64 heads; fp32 head weights are read as-is.
+  the per-head `[H, P]` scores. 4, 16, 32 or 64 heads; fp32 head weights are read as-is.
 - **`dsa_topk_indices`** - per-row top-k arg-select over the 16-bit scores (2-pass radix select). The
   selected index *set* matches a full sort; the order within a row does not.
 - **`dsa_sparse_attention`** - the sliding local window plus the indexer-selected gathered rows plus

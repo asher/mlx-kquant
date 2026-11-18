@@ -18,6 +18,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   latent and its rope half from one row.
 - `dsa_indexer_score_decode` accepts 16 indexer heads and `dsa_topk_indices` a width of 511, the
   pools a 2048-key budget holds at ratio 4 beside the query's own group.
+- `dsa_indexer_scores` accepts 16 indexer heads, fp32 head weights and `causal_ratio`, the positions
+  one pooled key stands for, so a prefill chunk over pooled keys is scored and masked in one kernel.
 
 ### Changed
 - `gather_qmm` at one activation row runs `q8_0` rows under 256 weights about 1.7x faster (64 heads

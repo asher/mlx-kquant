@@ -5,11 +5,16 @@
 #include "mlx/backend/metal/kernels/steel/gemm/gemm.h"
 #include "mlx/backend/metal/kernels/kq_dsa_indexer.h"
 
+// Head weights in the score type, and in fp32 under the _wf name.
 #define instantiate_kq_dsa_indexer_score(tname, dtype, bm, bn, bk, wm, wn) \
   instantiate_kernel(                                                      \
       "kq_dsa_indexer_score_" #tname                                       \
       "_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn,                  \
-      kq_dsa_indexer_score, dtype, bm, bn, bk, wm, wn)
+      kq_dsa_indexer_score, dtype, dtype, bm, bn, bk, wm, wn)              \
+  instantiate_kernel(                                                      \
+      "kq_dsa_indexer_score_" #tname                                       \
+      "_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn "_wf",            \
+      kq_dsa_indexer_score, dtype, float, bm, bn, bk, wm, wn)
 
 #define instantiate_kq_dsa_topk_indices(tname, dtype, topk, threads) \
   instantiate_kernel(                                                \

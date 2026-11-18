@@ -49,8 +49,9 @@ D = 128  # indexer head dim (fixed by the kernel contract)
 # ---------------------------------------------------------------- scores
 
 
-def _ref_scores(q, k, w, causal, q_offset):
-    """f32 reference on the exact (already dtype-cast) input values."""
+def _ref_scores(q, k, w, causal, q_offset, ratio=1):
+    """f32 reference on the exact (already dtype-cast) input values. A key
+    stands for ``ratio`` positions; above 1 the offset is read as given."""
     qf = np.array(q.astype(mx.float32))
     kf = np.array(k.astype(mx.float32))
     wf = np.array(w.astype(mx.float32))
@@ -58,7 +59,7 @@ def _ref_scores(q, k, w, causal, q_offset):
     N = kf.shape[2]
     if wf.ndim == 4:  # [B, H, M, 1] -> [B, M, H]
         wf = wf[..., 0].transpose(0, 2, 1)
-    off = q_offset if q_offset >= 0 else N - M
+    off = q_offset if (q_offset >= 0 or ratio > 1) else N - M
     out = np.zeros((B, 1, M, N), dtype=np.float32)
     for b in range(B):
         dots = np.einsum("hmd,nd->hmn", qf[b], kf[b, 0])
@@ -66,7 +67,7 @@ def _ref_scores(q, k, w, causal, q_offset):
         if causal:
             m_idx = np.arange(M)[:, None]
             n_idx = np.arange(N)[None, :]
-            out[b, 0][n_idx > off + m_idx] = -np.inf
+            out[b, 0][n_idx >= (off + m_idx + 1) // ratio] = -np.inf
     return out
 
 
@@ -327,12 +328,127 @@ def test_dsa_indexer_rejects_bad_shapes():
     with pytest.raises(ValueError):  # M % 64 != 0
         kq.dsa_indexer_scores(q[:, :, :63], k, w[:, :63])
     with pytest.raises(ValueError):  # bad head count
-        kq.dsa_indexer_scores(q[:, :16], k, w[:, :, :16])
+        kq.dsa_indexer_scores(q[:, :8], k, w[:, :, :8])
+    with pytest.raises(ValueError):  # a pooled key stands for 1 or more
+        kq.dsa_indexer_scores(q, k, w, causal_ratio=0)
     scores = mx.zeros((1, 1, 1, 1024), dtype=mx.float16)
     with pytest.raises(ValueError):  # unsupported topk
         kq.dsa_topk_indices(scores, 100)
     with pytest.raises(ValueError):  # K < topk
         kq.dsa_topk_indices(scores[..., :256], 512)
+
+
+# ------------------------------------- pooled keys and fp32 head weights
+
+
+@pytest.fixture(params=["tensor-op", "simdgroup"])
+def score_kernel(request, monkeypatch):
+    """Both score kernels: the tensor-op one where the GPU has it, and the
+    simdgroup one every GPU runs."""
+    if request.param == "simdgroup":
+        monkeypatch.setenv("KQ_DISABLE_INDEXER_MMA", "1")
+    else:
+        monkeypatch.delenv("KQ_DISABLE_INDEXER_MMA", raising=False)
+    return request.param
+
+
+def _pooled_qkw(M, N, dtype, seed, H=16):
+    """A chunk's queries against pooled keys, head weights in fp32."""
+    q, k, w = _make_qkw(1, H, M, N, dtype, True, seed)
+    return q, k, w.astype(mx.float32)
+
+
+def _same_scores(got, ref, dtype, where=None):
+    """Hidden entries are -inf, the rest meet the fp32 reference."""
+    g = np.array(got.astype(mx.float32))
+    if where is not None:
+        g, ref = g[where], ref[where]
+    hidden = np.isneginf(ref)
+    assert np.all(np.isneginf(g[hidden]))
+    assert np.all(np.isfinite(g[~hidden]))
+    rel = np.linalg.norm(g[~hidden] - ref[~hidden]) / (
+        np.linalg.norm(ref[~hidden]) + 1e-6
+    )
+    assert rel < REL_BOUND[dtype], f"rel {rel:.3e}"
+
+
+# Offsets of query row 0 at 4 positions a key: the first chunk (row m has
+# completed m // 4 pools), a chunk whose rows each see part of the keys, one
+# whose last rows see every key, and one far past them all.
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("q_offset", [-1, 300, 1150, 5000])
+def test_a_row_sees_the_pooled_keys_completed_before_it(score_kernel, dtype, q_offset):
+    q, k, w = _pooled_qkw(128, 320, dtype, seed=31)
+    got = kq.dsa_indexer_scores(
+        q, k, w, causal=True, causal_q_offset=q_offset, causal_ratio=4
+    )
+    assert got.dtype == dtype
+    _same_scores(got, _ref_scores(q, k, w, True, q_offset, ratio=4), dtype)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_pooled_keys_skip_the_tiles_no_consumer_reads(score_kernel, dtype):
+    """The tiles past every row's keys and the tiles of the rows that see
+    40 keys or fewer are left unwritten; the rest is the full result."""
+    q, k, w = _pooled_qkw(256, 320, dtype, seed=37)
+    got = kq.dsa_indexer_scores(
+        q,
+        k,
+        w,
+        causal=True,
+        unused_causal_prefix_topk=40,
+        skip_causal_future_store=True,
+        causal_q_offset=-1,
+        causal_ratio=4,
+    )
+    ref = _ref_scores(q, k, w, True, -1, ratio=4)
+    # Rows 128 on see more than 40 keys; a row's own keys are always
+    # written.
+    read = np.zeros(ref.shape, dtype=bool)
+    for m in range(128, 256):
+        read[0, 0, m, : m // 4] = True
+    _same_scores(got, ref, dtype, where=read)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_fp32_head_weights_are_not_rounded_to_16_bits(score_kernel, dtype):
+    """Every weight sits halfway between two 16-bit values, so a weight
+    rounded to the score type moves the sum of the scores by that half
+    step and a weight read in fp32 leaves it where it is."""
+    q, k, _ = _pooled_qkw(64, 128, dtype, seed=41)
+    step = 2.0**-11 if dtype == mx.float16 else 2.0**-8
+    w = mx.full((1, 64, 16), 1.0 + step, dtype=mx.float32)
+    ref = _ref_scores(q, k, w, False, -1).astype(np.float64).sum()
+
+    def moved(weights):
+        got = kq.dsa_indexer_scores(q, k, weights, causal=False)
+        assert got.dtype == dtype
+        g = np.array(got.astype(mx.float32)).astype(np.float64)
+        return abs(g.sum() - ref) / ref
+
+    assert moved(w) < step / 8
+    assert moved(w.astype(dtype)) > step / 2
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_pooled_scores_feed_the_511_wide_select(score_kernel, dtype):
+    """A chunk whose first rows see fewer than 511 pools and whose last
+    rows see more: a row's picks hold every pool it sees, or its 511 best."""
+    M, N, topk, q_offset = 128, 640, 511, 2000
+    q, k, w = _pooled_qkw(M, N, dtype, seed=43)
+    scores = kq.dsa_indexer_scores(
+        q, k, w, causal=True, causal_q_offset=q_offset, causal_ratio=4
+    )
+    got = kq.dsa_topk_indices(scores, topk)
+    mx.eval(got)
+    vals = np.array(scores.astype(mx.float32))
+    sel = np.array(got)
+    seen = [(q_offset + m + 1) // 4 for m in range(M)]
+    assert min(seen) < topk < max(seen)
+    for m in range(M):
+        _check_topk_row(vals[0, 0, m], sel[0, 0, m], topk, N)
+        visible = sel[0, 0, m][sel[0, 0, m] < seen[m]]
+        assert len(visible) == min(seen[m], topk)
 
 
 # --------------------------------------------------------- decode scores

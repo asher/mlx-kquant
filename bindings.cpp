@@ -1777,6 +1777,7 @@ NB_MODULE(_ext, m) {
       "unused_causal_prefix_topk"_a = 0,
       "skip_causal_future_store"_a = false,
       "causal_q_offset"_a = -1,
+      "causal_ratio"_a = 1,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
@@ -1786,12 +1787,13 @@ NB_MODULE(_ext, m) {
         pick the pooled rows dsa_sparse_attention gathers.
 
         Args:
-            queries (array): [B, H, M, 128], H 32 or 64, M % 64 == 0,
+            queries (array): [B, H, M, 128], H 16, 32 or 64, M % 64 == 0,
                 float16/bfloat16. Decode pads the single query row to 64
                 and keeps output row 0.
             keys (array): pooled indexer keys [B, 1, N, 128], N % 64 == 0.
             weights (array): per-head query weights, [B, M, H] (lh layout)
-                or [B, H, M, 1].
+                or [B, H, M, 1]. float32 weights are read as float32 and
+                the scores take the type of queries and keys.
             causal (bool): mask n > causal_q_offset + m with -inf.
             unused_causal_prefix_topk (int): skip writing tiles whose rows
                 all fall inside a causal prefix of this many keys (they are
@@ -1801,6 +1803,10 @@ NB_MODULE(_ext, m) {
                 causal_valid_prefix top-k that never reads them).
             causal_q_offset (int): absolute position of query row 0; -1
                 means N - M.
+            causal_ratio (int): positions one pooled key stands for. The
+                mask is n >= (causal_q_offset + m + 1) // causal_ratio,
+                which is the causal rule at 1. Above 1, causal_q_offset
+                is read as given, -1 included.
 
         Returns:
             array: scores [B, 1, M, N] in the input dtype.

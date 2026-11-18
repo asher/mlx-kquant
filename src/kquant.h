@@ -799,13 +799,17 @@ mx::array dsa_sparse_attention(
 
 // DeepSeek-V4-Flash lightning-indexer relevance scores (steel GEMM):
 // out[b, 0, m, n] = sum_h relu(q[b, h, m, :] . k[b, 0, n, :]) * w_h_m.
-// q [B, H, M, 128] (H 32 or 64), k [B, 1, N, 128]; weights either
-// [B, M, H] ("lh" layout) or [B, H, M, 1]. Requires M % 64 == 0 and
+// q [B, H, M, 128] (H 16, 32 or 64), k [B, 1, N, 128]; weights either
+// [B, M, H] ("lh" layout) or [B, H, M, 1]. fp32 weights are read as
+// fp32 and the scores take the type of q and k. Requires M % 64 == 0 and
 // N % 64 == 0 (pad or fall back Python-side; decode pads the single query
 // row to 64 and keeps row 0). causal masks n > causal_q_offset + m with
 // -inf (causal_q_offset -1 means N - M); with skip_causal_future_store the
 // fully-masked tiles are left unwritten instead (only valid when the
 // consumer never reads them, e.g. a causal_valid_prefix top-k).
+// causal_ratio is for pooled keys, one key per causal_ratio positions:
+// the mask is n >= (causal_q_offset + m + 1) / causal_ratio, which is the
+// rule above at 1. Above 1, causal_q_offset is read as given, -1 included.
 // Returns [B, 1, M, N]. Metal-only.
 mx::array dsa_indexer_scores(
     mx::array queries,
@@ -815,6 +819,7 @@ mx::array dsa_indexer_scores(
     int unused_causal_prefix_topk = 0,
     bool skip_causal_future_store = false,
     int causal_q_offset = -1,
+    int causal_ratio = 1,
     mx::StreamOrDevice s = {});
 
 // Per-row top-k arg-select over 16-bit float scores (2-pass radix over the
@@ -2627,13 +2632,15 @@ class KQDsaIndexerScores : public mx::Primitive {
       bool weights_lh,
       int unused_causal_prefix_topk,
       bool skip_causal_future_store,
-      int causal_q_offset)
+      int causal_q_offset,
+      int causal_ratio = 1)
       : mx::Primitive(stream),
         causal_(causal),
         weights_lh_(weights_lh),
         unused_causal_prefix_topk_(unused_causal_prefix_topk),
         skip_causal_future_store_(skip_causal_future_store),
-        causal_q_offset_(causal_q_offset) {}
+        causal_q_offset_(causal_q_offset),
+        causal_ratio_(causal_ratio) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -2656,6 +2663,7 @@ class KQDsaIndexerScores : public mx::Primitive {
   int unused_causal_prefix_topk_;
   bool skip_causal_future_store_;
   int causal_q_offset_;
+  int causal_ratio_;
 };
 
 // DeepSeek-V4-Flash indexer top-k select (see dsa_topk_indices).

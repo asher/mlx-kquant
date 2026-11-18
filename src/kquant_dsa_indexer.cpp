@@ -63,6 +63,13 @@ void KQDsaIndexerScores::eval_gpu(
 
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
+  // Head weights in fp32 take the _wf kernels.
+  const std::string wf = weights.dtype() == mx::float32 ? "_wf" : "";
+  // Row 0's causal offset: -1 stands for N - M at a ratio of 1.
+  const int q_offset = (causal_ratio_ == 1 && causal_q_offset_ < 0)
+      ? k.shape(2) - q.shape(2)
+      : causal_q_offset_;
+
   if (kq_indexer_mma_enabled()) {
     const int B = q.shape(0);
     const int H = q.shape(1);
@@ -77,7 +84,7 @@ void KQDsaIndexerScores::eval_gpu(
     };
 
     const std::string kname =
-        "kq_dsa_indexer_score_mma_" + kq_type_string(q.dtype());
+        "kq_dsa_indexer_score_mma_" + kq_type_string(q.dtype()) + wf;
     const std::string hash_name = kname + "_causal_" + (do_causal ? 't' : 'n') +
         "_wlh_" + (use_weights_lh ? 't' : 'n');
 
@@ -94,7 +101,8 @@ void KQDsaIndexerScores::eval_gpu(
     ce.set_bytes(H, 6);
     ce.set_bytes(unused_causal_prefix_topk_, 7);
     ce.set_bytes(skip_causal_future_store_, 8);
-    ce.set_bytes(causal_q_offset_, 9);
+    ce.set_bytes(q_offset, 9);
+    ce.set_bytes(causal_ratio_, 10);
 
     MTL::Size group_dims(kq_indexer_mma_threads, 1, 1);
     MTL::Size grid_dims(N / kq_indexer_mma_bn, M / kq_indexer_mma_bm, B);
@@ -140,7 +148,7 @@ void KQDsaIndexerScores::eval_gpu(
   };
 
   const std::string kname = "kq_dsa_indexer_score_" +
-      kq_type_string(q.dtype()) + "_bm64_bn64_bk16_wm2_wn2";
+      kq_type_string(q.dtype()) + "_bm64_bn64_bk16_wm2_wn2" + wf;
   const std::string hash_name = kname + "_causal_" + (do_causal ? 't' : 'n') +
       "_wlh_" + (use_weights_lh ? 't' : 'n');
 
@@ -156,7 +164,8 @@ void KQDsaIndexerScores::eval_gpu(
   ce.set_bytes(H, 5);
   ce.set_bytes(unused_causal_prefix_topk_, 6);
   ce.set_bytes(skip_causal_future_store_, 7);
-  ce.set_bytes(causal_q_offset_, 8);
+  ce.set_bytes(q_offset, 8);
+  ce.set_bytes(causal_ratio_, 9);
 
   MTL::Size group_dims(wm * wn * 32, 1, 1);
   MTL::Size grid_dims(tiles_n, tiles_m, B);
@@ -216,7 +225,7 @@ void KQDsaIndexerScoresQ::eval_gpu(
   ce.set_bytes(H, 8);
   ce.set_bytes(unused_causal_prefix_topk_, 9);
   ce.set_bytes(skip_causal_future_store_, 10);
-  ce.set_bytes(causal_q_offset_, 11);
+  ce.set_bytes(causal_q_offset_ >= 0 ? causal_q_offset_ : N - M, 11);
 
   MTL::Size group_dims(kq_indexer_mma_threads, 1, 1);
   MTL::Size grid_dims(N / kq_indexer_mma_bn, M / kq_indexer_mma_bm, B);
@@ -493,7 +502,8 @@ bool KQDsaIndexerScores::is_equivalent(const mx::Primitive& other) const {
   return causal_ == o.causal_ && weights_lh_ == o.weights_lh_ &&
       unused_causal_prefix_topk_ == o.unused_causal_prefix_topk_ &&
       skip_causal_future_store_ == o.skip_causal_future_store_ &&
-      causal_q_offset_ == o.causal_q_offset_;
+      causal_q_offset_ == o.causal_q_offset_ &&
+      causal_ratio_ == o.causal_ratio_;
 }
 
 bool KQDsaTopKIndices::is_equivalent(const mx::Primitive& other) const {
@@ -638,6 +648,7 @@ mx::array dsa_indexer_scores(
     int unused_causal_prefix_topk,
     bool skip_causal_future_store,
     int causal_q_offset,
+    int causal_ratio,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
 
@@ -667,11 +678,12 @@ mx::array dsa_indexer_scores(
         << weights.shape() << ".";
     throw std::invalid_argument(msg.str());
   }
-  if ((queries.shape(1) != 32 && queries.shape(1) != 64) ||
+  if ((queries.shape(1) != 16 && queries.shape(1) != 32 &&
+       queries.shape(1) != 64) ||
       queries.shape(3) != 128) {
     std::ostringstream msg;
-    msg << "[mlx_kquant.dsa_indexer_scores] expected 32 or 64 indexer heads "
-        << "of dim 128, got " << queries.shape() << ".";
+    msg << "[mlx_kquant.dsa_indexer_scores] expected 16, 32 or 64 indexer "
+        << "heads of dim 128, got " << queries.shape() << ".";
     throw std::invalid_argument(msg.str());
   }
   if (queries.shape(2) % 64 != 0 || keys.shape(2) % 64 != 0 ||
@@ -692,9 +704,16 @@ mx::array dsa_indexer_scores(
         "[mlx_kquant.dsa_indexer_scores] causal_q_offset must be -1 or "
         "non-negative.");
   }
+  if (causal_ratio < 1) {
+    throw std::invalid_argument(
+        "[mlx_kquant.dsa_indexer_scores] causal_ratio must be positive.");
+  }
 
-  auto final_type =
-      mx::result_type(std::vector<mx::array>{queries, keys, weights});
+  // fp32 head weights stay fp32 and the scores take the type of q and k.
+  const bool wf32 = weights.dtype() == mx::float32;
+  auto final_type = wf32
+      ? mx::result_type(std::vector<mx::array>{queries, keys})
+      : mx::result_type(std::vector<mx::array>{queries, keys, weights});
   if (final_type != mx::float16 && final_type != mx::bfloat16) {
     std::ostringstream msg;
     msg << "[mlx_kquant.dsa_indexer_scores] expected fp16 or bf16 inputs, "
@@ -707,7 +726,8 @@ mx::array dsa_indexer_scores(
   // and Contiguous no-op-donates at eval when the input already is.
   auto q = mx::contiguous(mx::astype(queries, final_type, s), false, s);
   auto k = mx::contiguous(mx::astype(keys, final_type, s), false, s);
-  auto w = mx::contiguous(mx::astype(weights, final_type, s), false, s);
+  auto w = mx::contiguous(
+      wf32 ? weights : mx::astype(weights, final_type, s), false, s);
 
   mx::Shape out_shape{q.shape(0), 1, q.shape(2), k.shape(2)};
   std::vector<mx::array> inputs = {std::move(q), std::move(k), std::move(w)};
@@ -720,7 +740,8 @@ mx::array dsa_indexer_scores(
           weights_lh,
           unused_causal_prefix_topk,
           skip_causal_future_store,
-          causal_q_offset),
+          causal_q_offset,
+          causal_ratio),
       std::move(inputs));
 }
 
