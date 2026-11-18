@@ -170,6 +170,7 @@ void KQSdpaSparseDecode::eval_gpu(
   params.has_win_mask = wmask != nullptr;
   params.has_sel_mask = smask != nullptr;
   params.direct = n_splits == 1;
+  params.Do = D - score_tail_;
   params.scale_log2 = scale_ * 1.4426950408889634f;
   params.q_strides[0] = q.strides(0);
   params.q_strides[1] = q.strides(1);
@@ -279,14 +280,17 @@ void KQSdpaSparseDecode::eval_cpu(
 
 std::vector<mx::Shape> KQSdpaSparseDecode::output_shapes(
     const std::vector<mx::array>& inputs) {
-  return {inputs[0].shape()};
+  auto shape = inputs[0].shape();
+  shape.back() -= score_tail_;
+  return {shape};
 }
 
 bool KQSdpaSparseDecode::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQSdpaSparseDecode&>(other);
   return scale_ == o.scale_ && splits_ == o.splits_ &&
       has_sinks_ == o.has_sinks_ && has_win_mask_ == o.has_win_mask_ &&
-      has_sel_mask_ == o.has_sel_mask_ && packed_ == o.packed_;
+      has_sel_mask_ == o.has_sel_mask_ && packed_ == o.packed_ &&
+      score_tail_ == o.score_tail_;
 }
 
 namespace {
@@ -333,6 +337,7 @@ mx::array sdpa_sparse_decode(
     const std::optional<mx::array>& sel_mask,
     int splits,
     const std::optional<mx::array>& pool_scales,
+    int score_tail,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.sdpa_sparse_decode]";
@@ -349,9 +354,16 @@ mx::array sdpa_sparse_decode(
   const int H = q.shape(1);
   const int L = q.shape(2);
   const int D = q.shape(3);
-  if (D != 128 && D != 256 && D != 512) {
+  if (score_tail == 0) {
+    if (D != 128 && D != 256 && D != 512) {
+      throw std::invalid_argument(
+          std::string(op) + " head_dim must be 128, 256 or 512.");
+    }
+  } else if (score_tail != 64 || D != 576 || pool_scales.has_value()) {
     throw std::invalid_argument(
-        std::string(op) + " head_dim must be 128, 256 or 512.");
+        std::string(op) +
+        " score_tail is 0, or 64 on unpacked rows 576 wide (a 512 latent"
+        " and its tail).");
   }
   check_pool(op, pool, pool_scales, D);
   if (window.shape(1) != 1 || window.shape(3) != D ||
@@ -433,8 +445,10 @@ mx::array sdpa_sparse_decode(
     inputs.push_back(mask_in(*sel_mask, idx.shape(2), "sel_mask"));
   }
 
+  auto out_shape = q.shape();
+  out_shape.back() -= score_tail;
   return mx::array(
-      q.shape(),
+      std::move(out_shape),
       dt,
       std::make_shared<KQSdpaSparseDecode>(
           s,
@@ -443,7 +457,8 @@ mx::array sdpa_sparse_decode(
           sinks.has_value(),
           win_mask.has_value(),
           sel_mask.has_value(),
-          pool_scales.has_value()),
+          pool_scales.has_value(),
+          score_tail),
       std::move(inputs));
 }
 
@@ -531,6 +546,7 @@ void KQSdpaSparsePrefill::eval_gpu(
   params.koff = S - L;
   params.has_sinks = sinks != nullptr;
   params.has_sel_mask = smask != nullptr;
+  params.Do = D - score_tail_;
   params.scale_log2 = scale_ * 1.4426950408889634f;
   params.q_strides[0] = q.strides(0);
   params.q_strides[1] = q.strides(1);
@@ -599,13 +615,16 @@ void KQSdpaSparsePrefill::eval_cpu(
 
 std::vector<mx::Shape> KQSdpaSparsePrefill::output_shapes(
     const std::vector<mx::array>& inputs) {
-  return {inputs[0].shape()};
+  auto shape = inputs[0].shape();
+  shape.back() -= score_tail_;
+  return {shape};
 }
 
 bool KQSdpaSparsePrefill::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQSdpaSparsePrefill&>(other);
   return scale_ == o.scale_ && band_ == o.band_ && has_sinks_ == o.has_sinks_ &&
-      has_sel_mask_ == o.has_sel_mask_ && packed_ == o.packed_;
+      has_sel_mask_ == o.has_sel_mask_ && packed_ == o.packed_ &&
+      score_tail_ == o.score_tail_;
 }
 
 mx::array sdpa_sparse_prefill(
@@ -618,6 +637,7 @@ mx::array sdpa_sparse_prefill(
     const std::optional<mx::array>& sinks,
     const std::optional<mx::array>& sel_mask,
     const std::optional<mx::array>& pool_scales,
+    int score_tail,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.sdpa_sparse_prefill]";
@@ -634,9 +654,16 @@ mx::array sdpa_sparse_prefill(
   const int H = q.shape(1);
   const int L = q.shape(2);
   const int D = q.shape(3);
-  if (D != 128 && D != 256 && D != 512) {
+  if (score_tail == 0) {
+    if (D != 128 && D != 256 && D != 512) {
+      throw std::invalid_argument(
+          std::string(op) + " head_dim must be 128, 256 or 512.");
+    }
+  } else if (score_tail != 64 || D != 576 || pool_scales.has_value()) {
     throw std::invalid_argument(
-        std::string(op) + " head_dim must be 128, 256 or 512.");
+        std::string(op) +
+        " score_tail is 0, or 64 on unpacked rows 576 wide (a 512 latent"
+        " and its tail).");
   }
   check_pool(op, pool, pool_scales, D);
   if (window.shape(1) != 1 || window.shape(3) != D ||
@@ -704,8 +731,10 @@ mx::array sdpa_sparse_prefill(
         mx::contiguous(mx::reshape(*sel_mask, {mb, L, N}, s), false, s));
   }
 
+  auto out_shape = q.shape();
+  out_shape.back() -= score_tail;
   return mx::array(
-      q.shape(),
+      std::move(out_shape),
       dt,
       std::make_shared<KQSdpaSparsePrefill>(
           s,
@@ -713,7 +742,8 @@ mx::array sdpa_sparse_prefill(
           band,
           sinks.has_value(),
           sel_mask.has_value(),
-          pool_scales.has_value()),
+          pool_scales.has_value(),
+          score_tail),
       std::move(inputs));
 }
 

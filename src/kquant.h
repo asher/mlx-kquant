@@ -3966,6 +3966,7 @@ mx::array sdpa_sparse_decode(
     const std::optional<mx::array>& sel_mask = std::nullopt,
     int splits = 0,
     const std::optional<mx::array>& pool_scales = std::nullopt,
+    int score_tail = 0,
     mx::StreamOrDevice s = {});
 
 class KQSdpaSparseDecode : public mx::Primitive {
@@ -3977,14 +3978,16 @@ class KQSdpaSparseDecode : public mx::Primitive {
       bool has_sinks,
       bool has_win_mask,
       bool has_sel_mask,
-      bool packed)
+      bool packed,
+      int score_tail)
       : mx::Primitive(stream),
         scale_(scale),
         splits_(splits),
         has_sinks_(has_sinks),
         has_win_mask_(has_win_mask),
         has_sel_mask_(has_sel_mask),
-        packed_(packed) {}
+        packed_(packed),
+        score_tail_(score_tail) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -4008,6 +4011,7 @@ class KQSdpaSparseDecode : public mx::Primitive {
   bool has_win_mask_;
   bool has_sel_mask_;
   bool packed_;
+  int score_tail_;
 };
 
 // Prefill form of sdpa_sparse_decode: query l of window [B, 1, S, D]
@@ -4026,6 +4030,7 @@ mx::array sdpa_sparse_prefill(
     const std::optional<mx::array>& sinks = std::nullopt,
     const std::optional<mx::array>& sel_mask = std::nullopt,
     const std::optional<mx::array>& pool_scales = std::nullopt,
+    int score_tail = 0,
     mx::StreamOrDevice s = {});
 
 class KQSdpaSparsePrefill : public mx::Primitive {
@@ -4036,13 +4041,15 @@ class KQSdpaSparsePrefill : public mx::Primitive {
       int band,
       bool has_sinks,
       bool has_sel_mask,
-      bool packed)
+      bool packed,
+      int score_tail)
       : mx::Primitive(stream),
         scale_(scale),
         band_(band),
         has_sinks_(has_sinks),
         has_sel_mask_(has_sel_mask),
-        packed_(packed) {}
+        packed_(packed),
+        score_tail_(score_tail) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -4065,6 +4072,7 @@ class KQSdpaSparsePrefill : public mx::Primitive {
   bool has_sinks_;
   bool has_sel_mask_;
   bool packed_;
+  int score_tail_;
 };
 
 // MiniMax-H3 video sparse attention (VSA), the block-sparse part. q, k, v

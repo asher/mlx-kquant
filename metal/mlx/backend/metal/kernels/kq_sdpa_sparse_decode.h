@@ -311,10 +311,13 @@ kq_sdpa_sparse_decode_split(
           size_t(h) * p->o_strides[1] + size_t(l) * p->o_strides[2] + dh * DH;
       KQ_UNROLL
       for (int t = 0; t < NT; ++t) {
-        metal::vec<T, 2> o2(
-            T(Ot[t].thread_elements()[0] * wgt),
-            T(Ot[t].thread_elements()[1] * wgt));
-        *reinterpret_cast<device metal::vec<T, 2>*>(out + t * 8 + fn) = o2;
+        // A score-only tail (p->Do < D) has no output columns.
+        if (dh * DH + t * 8 < p->Do) {
+          metal::vec<T, 2> o2(
+              T(Ot[t].thread_elements()[0] * wgt),
+              T(Ot[t].thread_elements()[1] * wgt));
+          *reinterpret_cast<device metal::vec<T, 2>*>(out + t * 8 + fn) = o2;
+        }
       }
     }
     return;
@@ -381,7 +384,9 @@ template <typename T, int D>
   }
   device T* out = O + size_t(b) * p->o_strides[0] +
       size_t(h) * p->o_strides[1] + size_t(l) * p->o_strides[2];
-  reinterpret_cast<device V4*>(out)[t] = V4(acc);
+  if (int(t) * 4 < p->Do) {
+    reinterpret_cast<device V4*>(out)[t] = V4(acc);
+  }
 }
 
 constant constexpr int kSdpaSparsePrefillPass = 1024; // row-table entries
@@ -657,10 +662,13 @@ kq_sdpa_sparse_prefill(
         size_t(h) * p->o_strides[1] + size_t(l) * p->o_strides[2] + dh * DH;
     KQ_UNROLL
     for (int t = 0; t < NT; ++t) {
-      metal::vec<T, 2> o2(
-          T(Ot[t].thread_elements()[0] * wgt),
-          T(Ot[t].thread_elements()[1] * wgt));
-      *reinterpret_cast<device metal::vec<T, 2>*>(out + t * 8 + fn) = o2;
+      // A score-only tail (p->Do < D) has no output columns.
+      if (dh * DH + t * 8 < p->Do) {
+        metal::vec<T, 2> o2(
+            T(Ot[t].thread_elements()[0] * wgt),
+            T(Ot[t].thread_elements()[1] * wgt));
+        *reinterpret_cast<device metal::vec<T, 2>*>(out + t * 8 + fn) = o2;
+      }
     }
   }
 }

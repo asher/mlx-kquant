@@ -340,3 +340,53 @@ def test_strided_window_and_pool_match_contiguous(B):
     ]:
         got = kq.sdpa_sparse_prefill(q, w, p, idx, scale, band, **kw)
         assert mx.array_equal(got, want).item()
+
+
+@pytest.mark.parametrize("dtype,tol", [(mx.float16, 3e-3), (mx.bfloat16, 2e-2)])
+def test_score_tail_counts_in_the_score_and_has_no_output(dtype, tol):
+    # Rows 576 wide: all of a row scores, the first 512 values come out.
+    args, ref = _case(
+        2,
+        32,
+        70,
+        576,
+        110,
+        600,
+        300,
+        4,
+        dtype,
+        np.int32,
+        sinks=True,
+        mask=True,
+        pad=True,
+    )
+    q, win, pool, idx, scale, band, kw = args
+    got = kq.sdpa_sparse_prefill(q, win, pool, idx, scale, band, score_tail=64, **kw)
+    mx.eval(got)
+    g = np.array(got.astype(mx.float32))
+    assert g.shape == ref[..., :512].shape
+    err = float(np.abs(g - ref[..., :512]).max())
+    assert err < tol, err
+
+
+def test_score_tail_is_refused_at_other_widths():
+    args, _ = _case(
+        1,
+        16,
+        8,
+        512,
+        16,
+        32,
+        8,
+        4,
+        mx.float16,
+        np.int32,
+        sinks=False,
+        mask=False,
+        pad=False,
+    )
+    q, win, pool, idx, scale, band, kw = args
+    with pytest.raises(ValueError):
+        kq.sdpa_sparse_prefill(q, win, pool, idx, scale, band, score_tail=64)
+    with pytest.raises(ValueError):
+        kq.sdpa_sparse_prefill(q, win, pool, idx, scale, band, score_tail=32)

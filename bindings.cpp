@@ -1631,6 +1631,7 @@ NB_MODULE(_ext, m) {
       "splits"_a = 0,
       nb::kw_only(),
       "pool_scales"_a = nb::none(),
+      "score_tail"_a = 0,
       "stream"_a = nb::none(),
       R"(
         Attention over two key sources with K == V: a window read whole
@@ -1662,9 +1663,13 @@ NB_MODULE(_ext, m) {
             pool_scales (array, optional): uint8 [B, P, D / 16]; when
                 given, ``pool`` is the uint8 [B, P, D / 2] code array of
                 latent_fp4_pack and the rows dequantize as they stage.
+            score_tail (int): 0, or 64 with D = 576: the last 64 values
+                of each query and row count in the score only, as the
+                rope half of an absorbed MLA key does beside its 512
+                latent. Not with ``pool_scales``.
 
         Returns:
-            array: [B, H, L, D] in q's dtype. Metal-only.
+            array: [B, H, L, D - score_tail] in q's dtype. Metal-only.
       )");
 
   m.def(
@@ -1680,6 +1685,7 @@ NB_MODULE(_ext, m) {
       "sel_mask"_a = nb::none(),
       nb::kw_only(),
       "pool_scales"_a = nb::none(),
+      "score_tail"_a = 0,
       "stream"_a = nb::none(),
       R"(
         Prefill form of sdpa_sparse_decode: one threadgroup per query and
@@ -1705,9 +1711,13 @@ NB_MODULE(_ext, m) {
             sel_mask (array, optional): bool [L, N] or [B, L, N]; False
                 drops the listed row.
             pool_scales (array, optional): as in sdpa_sparse_decode.
+            score_tail (int): 0, or 64 with D = 576: the last 64 values
+                of each query and row count in the score only, as the
+                rope half of an absorbed MLA key does beside its 512
+                latent. Not with ``pool_scales``.
 
         Returns:
-            array: [B, H, L, D] in q's dtype. Metal-only.
+            array: [B, H, L, D - score_tail] in q's dtype. Metal-only.
       )");
 
   m.def(

@@ -17,6 +17,7 @@ struct KQSdpaSparseDecodeParams {
   int has_win_mask;
   int has_sel_mask;
   int direct; ///< One split: the split kernel normalizes and writes O
+  int Do; ///< Output width: D less the score-only tail of each row
   float scale_log2; ///< softmax scale times log2(e)
 
   int64_t q_strides[3]; ///< B, H, L (D contiguous)
@@ -41,6 +42,7 @@ struct KQSdpaSparsePrefillParams {
   int koff; ///< S - L: window row of query 0
   int has_sinks;
   int has_sel_mask;
+  int Do; ///< Output width: D less the score-only tail of each row
   float scale_log2; ///< softmax scale times log2(e)
 
   int64_t q_strides[3]; ///< B, H, L (D contiguous)
