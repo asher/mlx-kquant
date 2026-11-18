@@ -1642,7 +1642,10 @@ NB_MODULE(_ext, m) {
         per-head sink counted once. Replaces the gather, the two score
         matmuls, the split softmax and the two value matmuls. Queries are
         a batch dimension: a decode step, or a prefill block whose queries
-        share the window rows and keep their own index lists.
+        share the window rows and keep their own index lists. On
+        tensor-op GPUs a 512 latent with an unpacked pool runs a NAX tile
+        kernel that rounds differently; KQ_SDPA_SPARSE_NAX=0 keeps the
+        simdgroup kernel.
 
         Args:
             q (array): queries [B, H, L, D], float16/bfloat16; D in

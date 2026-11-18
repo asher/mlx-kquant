@@ -30,6 +30,11 @@ namespace {
 constexpr int kHeadGroup = 8; // heads per split threadgroup
 constexpr int kKeyBlock = 8; // keys per staged block
 constexpr int kMaxSplits = 32;
+// The NAX kernel: heads per strip, keys per tile, and the threadgroups a
+// call fans out to when the caller leaves the split count to the op.
+constexpr int kNaxStrip = 32;
+constexpr int kNaxKeyBlock = 16;
+constexpr int kNaxGroups = 32;
 // Queries per call: a batch dimension of the grid, bounded by the f32
 // partials [B, L, splits, Hp, D] the merge reads back.
 constexpr int kMaxQueries = 4096;
@@ -124,6 +129,15 @@ void KQSdpaSparseDecode::eval_gpu(
   const int N = idx.shape(2);
   const int total = W + N;
 
+  // Tensor-op GPUs run a 512 latent, with or without the score-only tail,
+  // on the NAX tile kernel: 32-head strips, 16-key tiles. A packed pool
+  // and the other head dims stay on the simdgroup kernel, as does every
+  // call under KQ_SDPA_SPARSE_NAX=0 (read at each call).
+  const bool use_nax = !packed_ && D - score_tail_ == 512 &&
+      (score_tail_ == 0 || score_tail_ == 64) && kq_is_nax_available() &&
+      q.strides(1) <= std::numeric_limits<int>::max() &&
+      kq_env_flag("KQ_SDPA_SPARSE_NAX", -1) != 0;
+
   // A decode step spreads its few queries over 8-head groups; a prefill
   // block has queries to spare, so 16 heads share each staged key block.
   // KQ_SDPA_SPARSE_HG=8|16|32|64 forces one (A/B lever).
@@ -135,10 +149,14 @@ void KQSdpaSparseDecode::eval_gpu(
       hg = v;
     }
   }
+  if (use_nax) {
+    hg = kNaxStrip;
+  }
   // Enough threadgroups to cover the GPU: head groups x (B * L) x splits.
-  // Splits hold whole 8-key blocks, so the count can land under the ask.
+  // Splits hold whole key blocks, so the count can land off the ask.
   const int hgroups = (H + hg - 1) / hg;
   const int Hp = hgroups * hg;
+  const int key_block = use_nax ? kNaxKeyBlock : kKeyBlock;
   int n_splits = splits_;
   if (n_splits <= 0) {
     static const char* env = std::getenv("KQ_SDPA_SPARSE_SPLITS");
@@ -146,11 +164,24 @@ void KQSdpaSparseDecode::eval_gpu(
   }
   if (n_splits <= 0) {
     const int groups = hgroups * B * L;
-    n_splits = (160 + groups - 1) / groups;
+    n_splits = use_nax ? std::max(2, kNaxGroups / groups)
+                       : (160 + groups - 1) / groups;
   }
   n_splits = std::max(1, std::min({n_splits, kMaxSplits, std::max(1, total)}));
   int keys_per_split = (total + n_splits - 1) / n_splits;
-  keys_per_split = ((keys_per_split + kKeyBlock - 1) / kKeyBlock) * kKeyBlock;
+  if (use_nax) {
+    // The nearest whole tile: a lone padded slot past the last tile opens
+    // one short split instead of a tile in every split.
+    keys_per_split = std::max(
+        key_block,
+        (total + n_splits * key_block / 2) / (n_splits * key_block) *
+            key_block);
+    while ((total + keys_per_split - 1) / keys_per_split > kMaxSplits) {
+      keys_per_split += key_block;
+    }
+  } else {
+    keys_per_split = ((keys_per_split + key_block - 1) / key_block) * key_block;
+  }
   n_splits = std::max(1, (total + keys_per_split - 1) / keys_per_split);
 
   auto bcast = [](const mx::array& a, int axis) -> int64_t {
@@ -169,7 +200,8 @@ void KQSdpaSparseDecode::eval_gpu(
   params.has_sinks = sinks != nullptr;
   params.has_win_mask = wmask != nullptr;
   params.has_sel_mask = smask != nullptr;
-  params.direct = n_splits == 1;
+  // The NAX kernel always leaves the normalization to the merge.
+  params.direct = n_splits == 1 && !use_nax;
   params.Do = D - score_tail_;
   params.scale_log2 = scale_ * 1.4426950408889634f;
   params.q_strides[0] = q.strides(0);
@@ -198,13 +230,16 @@ void KQSdpaSparseDecode::eval_gpu(
   const std::string ts = kq_type_string(q.dtype());
   const std::string is = idx.dtype() == mx::int32 ? "i32" : "u32";
   const std::string dtag = "_d" + std::to_string(D);
-  auto split_kernel = kq_get_kernel(
-      d,
-      "kq_sdpa_sparse_decode_split_" + ts + "_" + is + dtag + "_hg" +
-          std::to_string(hg) + (packed_ ? "_pk" : ""));
+  const std::string split_name = use_nax ? "kq_sdpa_sparse_decode_nax_" + ts +
+          "_" + is + "_t" + std::to_string(score_tail_)
+                                         : "kq_sdpa_sparse_decode_split_" + ts +
+          "_" + is + dtag + "_hg" + std::to_string(hg) + (packed_ ? "_pk" : "");
+  auto split_kernel = kq_get_kernel(d, split_name);
   // Register-heavy pipeline: some GPUs cap it below the dispatch width, and
   // Metal turns an oversized dispatch into silent garbage, not an error.
-  const size_t tg = size_t(hg / 4) * 32;
+  // The NAX kernel runs eight simdgroups and one more for a tail.
+  const size_t tg =
+      use_nax ? size_t(score_tail_ ? 9 : 8) * 32 : size_t(hg / 4) * 32;
   if (tg > split_kernel->maxTotalThreadsPerThreadgroup()) {
     throw std::runtime_error(
         "[mlx_kquant.sdpa_sparse_decode] threadgroup of " + std::to_string(tg) +
@@ -230,6 +265,12 @@ void KQSdpaSparseDecode::eval_gpu(
     ce.set_input_array(q, 8);
     ce.dispatch_threadgroups(
         MTL::Size(n_splits, hgroups, B * L), MTL::Size(tg, 1, 1));
+    kq_log_dispatch(
+        split_name,
+        q,
+        o,
+        MTL::Size(n_splits, hgroups, B * L),
+        MTL::Size(tg, 1, 1));
     return;
   }
 
@@ -245,8 +286,11 @@ void KQSdpaSparseDecode::eval_gpu(
   ce.set_output_array(oacc, 6);
   ce.set_output_array(ms, 7);
   ce.set_output_array(ls, 8);
-  ce.dispatch_threadgroups(
-      MTL::Size(n_splits, hgroups, B * L), MTL::Size(tg, 1, 1));
+  const MTL::Size split_grid(n_splits, hgroups, B * L);
+  const MTL::Size split_group =
+      use_nax ? MTL::Size(32, tg / 32, 1) : MTL::Size(tg, 1, 1);
+  ce.dispatch_threadgroups(split_grid, split_group);
+  kq_log_dispatch(split_name, q, o, split_grid, split_group);
 
   auto merge_kernel =
       kq_get_kernel(d, "kq_sdpa_sparse_decode_merge_" + ts + dtag);

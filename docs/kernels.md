@@ -1505,6 +1505,16 @@ into a packed layout first.
   eighth of the head dim (partial `K @ Q^T` per eighth summed through threadgroup memory, `P @ V`
   from the same resident fragments), elsewhere the `sdpa_fa_verify` simdgroup tile runs the list.
   The per-split partials merge as `sdpa_fa_verify`. `KQ_SDPA_IDX_NAX=0` forces the simdgroup kernel.
+- **`sdpa_sparse_decode`** - attention over a window read whole plus the pool rows a per-query list
+  names, K == V, with per-head sinks and key masks: query l of `q [B, H, L, D]` attends `window [B,
+  1, W, D]` and the rows of `pool [B, P, D]` that `idx [B, L, N]` lists, read in place with no
+  gathered copy. `score_tail=64` on rows 576 wide counts the last 64 values in the score only, the
+  rope half of an absorbed MLA key. The keys fan out over splits whose f32 partials one merge pass
+  renormalizes. On tensor-op GPUs a 512 latent, with or without the tail, runs a NAX tile kernel:
+  32-head strips over 16-key tiles, eight simdgroups that each hold a 64-column eighth of the latent
+  and a ninth that adds the tail's share of the score. A packed pool and head dims 128 and 256 run
+  the simdgroup kernel, one simdgroup per head. The two kernels round differently.
+  `KQ_SDPA_SPARSE_NAX=0` keeps the simdgroup kernel.
 
 ## Int8 matmul
 

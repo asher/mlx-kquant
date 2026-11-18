@@ -23,6 +23,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `gather_qmm` at one activation row runs `q8_0` rows under 256 weights about 1.7x faster (64 heads
   by 512 rows of 128 on M5 Max), the per-head projections of an absorbed MLA. `KQ_GATHER_ROWS=0`
   restores the previous kernel.
+- `sdpa_sparse_decode` at a 512 latent, with or without `score_tail=64`, runs 2.1x to 2.6x faster on
+  M5 and later GPUs (64 heads over 512 window rows, 32 heads over 2048 listed rows, M5 Max). Outputs
+  differ at rounding level. `KQ_SDPA_SPARSE_NAX=0` restores the previous kernel.
 
 ## [0.5.11]
 

@@ -274,7 +274,10 @@ def _on_grid_pool(pool):
 
 @pytest.mark.parametrize("D", [128, 512])
 @pytest.mark.parametrize("B,L,splits", [(1, 1, 0), (2, 3, 4), (1, 40, 1)])
-def test_packed_pool_matches_fp16_pool(D, B, L, splits):
+def test_packed_pool_matches_fp16_pool(D, B, L, splits, monkeypatch):
+    # A packed pool runs the simdgroup kernel, so the fp16 pool it is held
+    # to bit for bit runs it too.
+    monkeypatch.setenv("KQ_SDPA_SPARSE_NAX", "0")
     args, _ = _case(
         B,
         16,
