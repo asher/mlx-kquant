@@ -1816,7 +1816,7 @@ NB_MODULE(_ext, m) {
 
         Args:
             scores (array): [B, 1, L, K], float16/bfloat16, K >= topk.
-            topk (int): 512 or 2048.
+            topk (int): 511, 512 or 2048.
             bucketed (bool): deterministic bucketed emission (>threshold
                 entries before ==threshold entries).
             causal_valid_prefix (bool): clamp each row's scan to its causal
@@ -1852,7 +1852,7 @@ NB_MODULE(_ext, m) {
         scores the finite min.
 
         Args:
-            queries (array): [B, H, qL, 128], H in {4, 32, 64}, qL in
+            queries (array): [B, H, qL, 128], H in {4, 16, 32, 64}, qL in
                 [1, 4], float16/bfloat16.
             keys (array): the pooled indexer key cache [B, P, 128].
             weights (array): per-head query weights [B, qL, H]. float32

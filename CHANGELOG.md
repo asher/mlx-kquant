@@ -16,6 +16,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `sdpa_sparse_prefill` and `sdpa_sparse_decode` take `score_tail=64` on rows 576 wide: the last 64
   values of a query and of each row count in the score only, so an absorbed MLA key reads its 512
   latent and its rope half from one row.
+- `dsa_indexer_score_decode` accepts 16 indexer heads and `dsa_topk_indices` a width of 511, the
+  pools a 2048-key budget holds at ratio 4 beside the query's own group.
 
 ## [0.5.11]
 

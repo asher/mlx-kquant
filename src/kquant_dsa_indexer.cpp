@@ -550,9 +550,9 @@ mx::array dsa_indexer_score_decode(
   const int B = queries.shape(0);
   const int H = queries.shape(1);
   const int QL = queries.shape(2);
-  if ((H != 64 && H != 32 && H != 4) || queries.shape(3) != 128) {
+  if ((H != 64 && H != 32 && H != 16 && H != 4) || queries.shape(3) != 128) {
     std::ostringstream msg;
-    msg << "[mlx_kquant.dsa_indexer_score_decode] expected 4, 32 or 64 "
+    msg << "[mlx_kquant.dsa_indexer_score_decode] expected 4, 16, 32 or 64 "
         << "indexer heads of dim 128, got " << queries.shape() << ".";
     throw std::invalid_argument(msg.str());
   }
@@ -849,9 +849,9 @@ mx::array dsa_topk_indices(
         << "[B, 1, L, K], got " << scores.shape() << ".";
     throw std::invalid_argument(msg.str());
   }
-  if (topk != 512 && topk != 2048) {
+  if (topk != 511 && topk != 512 && topk != 2048) {
     std::ostringstream msg;
-    msg << "[mlx_kquant.dsa_topk_indices] topk must be 512 or 2048, got "
+    msg << "[mlx_kquant.dsa_topk_indices] topk must be 511, 512 or 2048, got "
         << topk << ".";
     throw std::invalid_argument(msg.str());
   }

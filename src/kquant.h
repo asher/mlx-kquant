@@ -819,7 +819,7 @@ mx::array dsa_indexer_scores(
 
 // Per-row top-k arg-select over 16-bit float scores (2-pass radix over the
 // orderable bit transform; one threadgroup per row). scores [B, 1, L, K]
-// fp16/bf16, topk in {512, 2048}, K >= topk. The selected set matches a
+// fp16/bf16, topk in {511, 512, 2048}, K >= topk. The selected set matches a
 // full sort; intra-row order does not (threshold ties admitted in scan
 // order). bucketed emits >threshold before ==threshold deterministically.
 // causal_valid_prefix clamps each row's scan to K - L + row%L + 1 entries
@@ -835,8 +835,9 @@ mx::array dsa_topk_indices(
 
 // Decode-width lightning-indexer scores, fused: sum_h relu(q_h . k_p) * w_h
 // for qL <= 4 query rows over every pooled row without materializing the
-// [H, P] per-head scores. queries [B, 64, qL, 128], keys [B, P, 128] (the
-// pooled cache, rank 3), weights [B, qL, 64] with any positive global scale
+// [H, P] per-head scores. queries [B, H, qL, 128] with H 4, 16, 32 or 64,
+// keys [B, P, 128] (the pooled cache, rank 3), weights [B, qL, H] with any
+// positive global scale
 // folded out (top-k invariant). Pooled visibility follows
 // PoolingCache.make_mask(qL, q_offset): row i is visible to query j iff
 // i < (q_offset + j + 1) / ratio, and every row is visible when qL == 1;

@@ -222,7 +222,7 @@ def _topk_forced(monkeypatch, chunks, scores, topk, **kw):
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("topk", [511, 512, 2048])
 @pytest.mark.parametrize("extra", [0, 1, 37, 3000, 68000])
 def test_dsa_topk_indices_split_rows_emit_the_same_array(
     monkeypatch, dtype, topk, extra
@@ -412,14 +412,14 @@ def test_dsa_indexer_e2e_decode(dtype):
 
 
 @pytest.mark.parametrize("wf32", [False, True], ids=["w16", "wf32"])
-@pytest.mark.parametrize("H", [4, 32, 64])
+@pytest.mark.parametrize("H", [4, 16, 32, 64])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize(
     "case", DECODE_SCORE_CASES, ids=[c[0] for c in DECODE_SCORE_CASES]
 )
 def test_dsa_indexer_score_decode_bands(case, dtype, H, wf32):
-    """4-head (qwen4exp QSA), 32-head (glm5 pooled) and 64-head bands,
-    16-bit or fp32 head weights."""
+    """4-head (qwen4exp QSA), 16-head (hy4-flash pooled), 32-head (glm5
+    pooled) and 64-head bands, 16-bit or fp32 head weights."""
     name, QL, P, q_offset, ratio = case
     q, k, w = _make_decode_qkw(
         1, QL, P, dtype, seed=31, H=H, wdtype=mx.float32 if wf32 else None
@@ -448,8 +448,8 @@ def test_dsa_indexer_score_decode_rejects_bad_shapes():
             100,
             4,
         )
-    with pytest.raises(ValueError):  # bad head count (4, 32 and 64 only)
-        kq.dsa_indexer_score_decode(q[:, :16], k, w[:, :, :16], 100, 4)
+    with pytest.raises(ValueError):  # bad head count (4, 16, 32 and 64 only)
+        kq.dsa_indexer_score_decode(q[:, :8], k, w[:, :, :8], 100, 4)
     with pytest.raises(ValueError):  # keys rank
         kq.dsa_indexer_score_decode(q, k[:, None], w, 100, 4)
     with pytest.raises(ValueError):  # negative q_offset
@@ -457,7 +457,7 @@ def test_dsa_indexer_score_decode_rejects_bad_shapes():
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("H", [4, 32, 64])
+@pytest.mark.parametrize("H", [4, 16, 32, 64])
 @pytest.mark.parametrize("wf32", [False, True], ids=["w16", "w32"])
 def test_dsa_indexer_score_decode_rows_batched_match_rows_alone(dtype, H, wf32):
     """A query row scores the same beside other rows as alone, bit for bit,
@@ -529,6 +529,7 @@ def test_dsa_indexer_score_decode_strided_keys_match(B):
         (1, 4096, 1000, 64, False),
         (3, 1027, 517, 64, True),
         (2, 300, 64, 32, False),
+        (2, 600, 100, 16, True),
         (4, 2066, 2048, 4, False),
     ],
 )
