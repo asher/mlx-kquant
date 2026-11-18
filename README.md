@@ -355,6 +355,9 @@ All optional; the defaults are right for normal use.
 - `KQ_SDPA_SPARSE_NAX=0` - run `sdpa_sparse_decode` and `sdpa_sparse_prefill` at a 512 latent on
   their simdgroup kernels even where the NAX tile kernel is available. Read per call. The two
   kernels differ at output rounding level. A/B lever.
+- `KQ_SDPA_WINDOW_CB=0` - run `sdpa_prefill_window` at head dim 256 on its row-block kernel, which
+  serves the other head dims, GQA and `starts`. Read per call. The two kernels differ at output
+  rounding level. A/B lever.
 - `KQ_GQA_NAX=0` - run the one-query head-dim-128 and head-dim-512 pass of `sdpa_decode_gqa` on its
   simdgroup kernel even where the NAX kernel is available. Read per call. The two kernels differ at
   rounding level, and in fp16 the NAX kernel's error against a float32 reference is about twice the

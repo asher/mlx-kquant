@@ -31,6 +31,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `sdpa_sparse_prefill` at a 512 latent, with or without `score_tail=64`, runs 3.2x faster on M5 and
   later GPUs (32 heads, 2048 queries, 2052 keys each, M5 Max). Outputs differ at rounding level.
   `KQ_SDPA_SPARSE_NAX=0` restores the previous kernel.
+- `sdpa_prefill_window` at head dim 256 with a key head per query head runs 1.7x to 1.85x faster
+  (64 heads, a 2048 or 4096 row chunk over a 512 window, M5 Max). Outputs differ at rounding level.
+  `KQ_SDPA_WINDOW_CB=0` restores the previous kernel.
 
 ### Fixed
 - `sdpa_sparse_prefill` no longer returns NaN when window row 0 holds a non-finite value that no

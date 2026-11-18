@@ -1416,7 +1416,11 @@ into a packed layout first.
   GPUs. Each 64-row query block reads only the key blocks inside its window, so the cost of a
   chunk follows the window, not the key length a dense masked attention walks. Head dims 64, 128
   and 256, GQA, optional per-head sinks, per-row `starts` for a left-padded batch, strided operands
-  with a contiguous head dim.
+  with a contiguous head dim. At head dim 256 with a key head per query head and no `starts`, a
+  second kernel takes 32 query rows a threadgroup: four simdgroups each keep the queries of a
+  64-column block in registers and exchange their partial scores through threadgroup memory. On M5
+  Max a 2048-row chunk of 64 heads over a 512 window takes 2.29 ms against 4.23 ms. The two kernels
+  differ at output rounding level. `KQ_SDPA_WINDOW_CB=0` keeps the first kernel.
 - `sdpa_qk8`: attention with int8 Q K^T and bfloat16 P V at head dim 128 on the tensor-op units of
   M5 and later GPUs, the scheme of SageAttention (Zhang et al., ICLR 2025): per-token int8 Q and K,
   K smoothed by its mean over keys, 16-bit P V. `sdpa_qk8_inputs(q, k, scale)` quantizes each row of

@@ -1552,6 +1552,33 @@ void KQuantSDPAWindow::eval_gpu(
       str_h,
       str_l};
 
+  // Head dim 256 with a key head per query head and no starts takes the
+  // column-block kernel: 32 query rows a threadgroup, four simdgroups of 64
+  // columns. KQ_SDPA_WINDOW_CB, read per call: 0 keeps the kernel below.
+  if (D == 256 && gqa == 1 && !has_starts_ &&
+      kq_env_flag("KQ_SDPA_WINDOW_CB", -1) != 0) {
+    std::string cname = "kq_sdpa_window_cb_nax_" + kq_type_string(q.dtype());
+    auto ckernel = kq_get_kernel(d, cname, cname, {});
+    auto& cce = mx::metal::get_command_encoder(s);
+    cce.set_compute_pipeline_state(ckernel);
+    cce.set_input_array(q, 0);
+    cce.set_input_array(k, 1);
+    cce.set_input_array(v, 2);
+    cce.set_output_array(out, 3);
+    cce.set_input_array(has_sinks_ ? inputs[3] : q, 4);
+    cce.set_vector_bytes(strides, 5);
+    cce.set_bytes(qL, 6);
+    cce.set_bytes(kL, 7);
+    cce.set_bytes(window, 9);
+    cce.set_bytes(has_sinks, 10);
+    cce.set_bytes(scale, 11);
+    MTL::Size cgroup(32, 4, 1);
+    MTL::Size cgrid((qL + 31) / 32, H, B);
+    kq_log_dispatch(cname, q, out, cgrid, cgroup);
+    cce.dispatch_threadgroups(cgrid, cgroup);
+    return;
+  }
+
   std::string kname = "kq_sdpa_window_nax_" + kq_type_string(q.dtype()) + "_" +
       std::to_string(D);
   auto kernel = kq_get_kernel(d, kname, kname, {});
