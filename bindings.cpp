@@ -3183,6 +3183,49 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "file_rows",
+      &mlx_kquant::file_rows,
+      "ids"_a,
+      "path"_a,
+      "offset"_a,
+      "row_bytes"_a,
+      "rows"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Read rows of a table straight from a file.
+
+        The table is rows of row_bytes bytes starting at byte offset of
+        the file. The rows are read in parallel on a CPU stream, as a
+        graph node: the call returns at once and the reads start when ids
+        is ready, so a decode loop keeps building its next step. Nothing
+        of the table is mapped or wired. A row id outside [0, rows), or a
+        row the read fails on, comes back as zeros and adds to
+        file_rows_failures().
+
+        Args:
+            ids (array): integer row ids, any shape.
+            path (str): the file.
+            offset (int): byte offset of row 0.
+            row_bytes (int): bytes per row.
+            rows (int): rows in the table.
+            stream: a CPU stream; the default CPU stream when unset.
+
+        Returns:
+            array: uint8 [*ids.shape, row_bytes].
+      )");
+
+  m.def(
+      "file_rows_failures",
+      &mlx_kquant::file_rows_failures,
+      R"(
+        Rows file_rows returned as zeros since the process started.
+
+        Returns:
+            int: the count; it only grows.
+      )");
+
+  m.def(
       "buffer_id",
       [](mlx::core::array a) { return mlx_kquant::buffer_id(a); },
       "a"_a,

@@ -11,6 +11,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   active memory, so a large table read a few rows at a time stays pageable at any wired limit.
 - `buffer_id` names the memory behind an array without evaluating it or waiting on it, so a caller
   can tell which arrays share one buffer, such as a KV cache and the views of it.
+- `file_rows` reads rows of a table straight from a file, in parallel, as a lazy node on a CPU
+  stream, so a table too large to hold is looked up without holding the decode loop.
 - `sdpa_sparse_prefill` and `sdpa_sparse_decode` take `score_tail=64` on rows 576 wide: the last 64
   values of a query and of each row count in the score only, so an absorbed MLA key reads its 512
   latent and its rope half from one row.

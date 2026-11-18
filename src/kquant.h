@@ -1285,6 +1285,23 @@ mx::array kv_append(
     int64_t offset,
     mx::StreamOrDevice s = {});
 
+// Rows ids of a table stored in a file as rows of row_bytes bytes from byte
+// offset: uint8 [*ids.shape, row_bytes], read with parallel preads on a CPU
+// stream (the default CPU stream when s is unset). The read is a graph
+// node, so it starts when ids is ready and never holds the caller. Nothing
+// of the table is mapped or wired. A row past rows, or one the read fails
+// on, comes back as zeros and adds to file_rows_failures().
+mx::array file_rows(
+    mx::array ids,
+    const std::string& path,
+    int64_t offset,
+    int64_t row_bytes,
+    int64_t rows,
+    mx::StreamOrDevice s = {});
+
+// Rows file_rows returned as zeros since the process started.
+uint64_t file_rows_failures();
+
 // An id for the MLX allocation that holds a's data, or nullopt while a has
 // none (not yet evaluated, or empty). Two arrays alive at the same time
 // get the same id exactly when they hold the same allocation: a view and
@@ -3634,6 +3651,49 @@ class KQuantKVAppend : public mx::Primitive {
 
  private:
   int64_t offset_;
+};
+
+// Table rows read from a file (see file_rows). CPU streams only. Holds the
+// file open for as long as a graph holds the node.
+class KQuantFileRows : public mx::Primitive {
+ public:
+  struct Fd {
+    int fd = -1;
+    int64_t size = 0;
+    ~Fd();
+  };
+
+  KQuantFileRows(
+      mx::Stream stream,
+      std::shared_ptr<Fd> fd,
+      int64_t offset,
+      int64_t row_bytes,
+      int64_t rows)
+      : mx::Primitive(stream),
+        fd_(std::move(fd)),
+        offset_(offset),
+        row_bytes_(row_bytes),
+        rows_(rows) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantFileRows";
+  }
+  bool is_equivalent(const mx::Primitive&) const override {
+    return false;
+  }
+
+ private:
+  std::shared_ptr<Fd> fd_;
+  int64_t offset_;
+  int64_t row_bytes_;
+  int64_t rows_;
 };
 
 // Routed-expert slot remap + residency shed (see route_shed).
