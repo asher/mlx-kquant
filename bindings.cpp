@@ -1631,17 +1631,22 @@ NB_MODULE(_ext, m) {
       "splits"_a = 0,
       nb::kw_only(),
       "pool_scales"_a = nb::none(),
+      "score_tail"_a = 0,
       "stream"_a = nb::none(),
       R"(
         Attention over two key sources with K == V: a window read whole
         and a pool read through a per-query index list, as in the
         DeepSeek-V4 sparse attention step. The keys fan out over splits
-        of threadgroups (one simdgroup per head and split) that write
-        unnormalized f32 partials, and a merge renormalizes them with the
-        per-head sink counted once. Replaces the gather, the two score
+        of threadgroups that write unnormalized f32 partials, and a merge
+        renormalizes them with the per-head sink counted once; a lone
+        split writes the output itself. Replaces the gather, the two score
         matmuls, the split softmax and the two value matmuls. Queries are
         a batch dimension: a decode step, or a prefill block whose queries
-        share the window rows and keep their own index lists.
+        share the window rows and keep their own index lists. On
+        tensor-op GPUs a 512 latent with an unpacked pool runs a NAX tile
+        kernel that rounds differently; KQ_SDPA_SPARSE_NAX=0 keeps the
+        simdgroup kernel. A masked row counts for nothing, but outside
+        the NAX kernel its values are still read and must be finite.
 
         Args:
             q (array): queries [B, H, L, D], float16/bfloat16; D in
@@ -1662,9 +1667,13 @@ NB_MODULE(_ext, m) {
             pool_scales (array, optional): uint8 [B, P, D / 16]; when
                 given, ``pool`` is the uint8 [B, P, D / 2] code array of
                 latent_fp4_pack and the rows dequantize as they stage.
+            score_tail (int): 0, or 64 with D = 576: the last 64 values
+                of each query and row count in the score only, as the
+                rope half of an absorbed MLA key does beside its 512
+                latent. Not with ``pool_scales``.
 
         Returns:
-            array: [B, H, L, D] in q's dtype. Metal-only.
+            array: [B, H, L, D - score_tail] in q's dtype. Metal-only.
       )");
 
   m.def(
@@ -1680,6 +1689,7 @@ NB_MODULE(_ext, m) {
       "sel_mask"_a = nb::none(),
       nb::kw_only(),
       "pool_scales"_a = nb::none(),
+      "score_tail"_a = 0,
       "stream"_a = nb::none(),
       R"(
         Prefill form of sdpa_sparse_decode: one threadgroup per query and
@@ -1688,7 +1698,11 @@ NB_MODULE(_ext, m) {
         sliding window, itself included) plus the pool rows its index list
         names. The kernel derives the window band from the position, so
         no window mask is read; the row addresses of a query resolve once
-        into a threadgroup table before the key blocks stream through.
+        into a threadgroup table before the key blocks stream through. On
+        tensor-op GPUs a 512 latent with an unpacked pool runs the NAX
+        tile kernel of sdpa_sparse_decode with the band in place of its
+        window, which rounds differently; KQ_SDPA_SPARSE_NAX=0 keeps the
+        simdgroup kernel.
 
         Args:
             q (array): queries [B, H, L, D], float16/bfloat16; D in
@@ -1705,9 +1719,13 @@ NB_MODULE(_ext, m) {
             sel_mask (array, optional): bool [L, N] or [B, L, N]; False
                 drops the listed row.
             pool_scales (array, optional): as in sdpa_sparse_decode.
+            score_tail (int): 0, or 64 with D = 576: the last 64 values
+                of each query and row count in the score only, as the
+                rope half of an absorbed MLA key does beside its 512
+                latent. Not with ``pool_scales``.
 
         Returns:
-            array: [B, H, L, D] in q's dtype. Metal-only.
+            array: [B, H, L, D - score_tail] in q's dtype. Metal-only.
       )");
 
   m.def(
@@ -1759,6 +1777,7 @@ NB_MODULE(_ext, m) {
       "unused_causal_prefix_topk"_a = 0,
       "skip_causal_future_store"_a = false,
       "causal_q_offset"_a = -1,
+      "causal_ratio"_a = 1,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
@@ -1768,12 +1787,13 @@ NB_MODULE(_ext, m) {
         pick the pooled rows dsa_sparse_attention gathers.
 
         Args:
-            queries (array): [B, H, M, 128], H 32 or 64, M % 64 == 0,
+            queries (array): [B, H, M, 128], H 16, 32 or 64, M % 64 == 0,
                 float16/bfloat16. Decode pads the single query row to 64
                 and keeps output row 0.
             keys (array): pooled indexer keys [B, 1, N, 128], N % 64 == 0.
             weights (array): per-head query weights, [B, M, H] (lh layout)
-                or [B, H, M, 1].
+                or [B, H, M, 1]. float32 weights are read as float32 and
+                the scores take the type of queries and keys.
             causal (bool): mask n > causal_q_offset + m with -inf.
             unused_causal_prefix_topk (int): skip writing tiles whose rows
                 all fall inside a causal prefix of this many keys (they are
@@ -1783,6 +1803,10 @@ NB_MODULE(_ext, m) {
                 causal_valid_prefix top-k that never reads them).
             causal_q_offset (int): absolute position of query row 0; -1
                 means N - M.
+            causal_ratio (int): positions one pooled key stands for. The
+                mask is n >= (causal_q_offset + m + 1) // causal_ratio,
+                which is the causal rule at 1. Above 1, causal_q_offset
+                is read as given, -1 included.
 
         Returns:
             array: scores [B, 1, M, N] in the input dtype.
@@ -1806,7 +1830,7 @@ NB_MODULE(_ext, m) {
 
         Args:
             scores (array): [B, 1, L, K], float16/bfloat16, K >= topk.
-            topk (int): 512 or 2048.
+            topk (int): 511, 512 or 2048.
             bucketed (bool): deterministic bucketed emission (>threshold
                 entries before ==threshold entries).
             causal_valid_prefix (bool): clamp each row's scan to its causal
@@ -1842,7 +1866,7 @@ NB_MODULE(_ext, m) {
         scores the finite min.
 
         Args:
-            queries (array): [B, H, qL, 128], H in {4, 32, 64}, qL in
+            queries (array): [B, H, qL, 128], H in {4, 16, 32, 64}, qL in
                 [1, 4], float16/bfloat16.
             keys (array): the pooled indexer key cache [B, P, 128].
             weights (array): per-head query weights [B, qL, H]. float32
@@ -3170,6 +3194,49 @@ NB_MODULE(_ext, m) {
 
         Returns:
             array: buf's shape and dtype, sharing buf's data.
+      )");
+
+  m.def(
+      "file_rows",
+      &mlx_kquant::file_rows,
+      "ids"_a,
+      "path"_a,
+      "offset"_a,
+      "row_bytes"_a,
+      "rows"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Read rows of a table straight from a file.
+
+        The table is rows of row_bytes bytes starting at byte offset of
+        the file. The rows are read in parallel on a CPU stream, as a
+        graph node: the call returns at once and the reads start when ids
+        is ready, so a decode loop keeps building its next step. Nothing
+        of the table is mapped or wired. A row id outside [0, rows), or a
+        row the read fails on, comes back as zeros and adds to
+        file_rows_failures().
+
+        Args:
+            ids (array): integer row ids, any shape.
+            path (str): the file.
+            offset (int): byte offset of row 0.
+            row_bytes (int): bytes per row.
+            rows (int): rows in the table.
+            stream: a CPU stream; the default CPU stream when unset.
+
+        Returns:
+            array: uint8 [*ids.shape, row_bytes].
+      )");
+
+  m.def(
+      "file_rows_failures",
+      &mlx_kquant::file_rows_failures,
+      R"(
+        Rows file_rows returned as zeros since the process started.
+
+        Returns:
+            int: the count; it only grows.
       )");
 
   m.def(

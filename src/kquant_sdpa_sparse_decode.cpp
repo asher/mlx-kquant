@@ -30,6 +30,11 @@ namespace {
 constexpr int kHeadGroup = 8; // heads per split threadgroup
 constexpr int kKeyBlock = 8; // keys per staged block
 constexpr int kMaxSplits = 32;
+// The NAX kernel: heads per strip, keys per tile, and the threadgroups a
+// call fans out to when the caller leaves the split count to the op.
+constexpr int kNaxStrip = 32;
+constexpr int kNaxKeyBlock = 16;
+constexpr int kNaxGroups = 32;
 // Queries per call: a batch dimension of the grid, bounded by the f32
 // partials [B, L, splits, Hp, D] the merge reads back.
 constexpr int kMaxQueries = 4096;
@@ -119,10 +124,24 @@ void KQSdpaSparseDecode::eval_gpu(
   const int H = q.shape(1);
   const int L = q.shape(2);
   const int D = q.shape(3);
-  const int W = win.shape(1) / D;
+  // Window slots a query reads: the whole window, or its band of it.
+  const int S = win.shape(1) / D;
+  const int W = band_ > 0 ? band_ : S;
   const int P = packed_ ? pool.shape(1) * 2 / D : pool.shape(1) / D;
   const int N = idx.shape(2);
   const int total = W + N;
+
+  // Tensor-op GPUs run a 512 latent, with or without the score-only tail,
+  // on the NAX tile kernel: 32-head strips, 16-key tiles. A packed pool
+  // and the other head dims stay on the simdgroup kernel, as does every
+  // call under KQ_SDPA_SPARSE_NAX=0 (read at each call).
+  // A band node exists only where sdpa_sparse_prefill found the NAX kernel
+  // fit, and has no other kernel.
+  const bool use_nax = band_ > 0 ||
+      (!packed_ && D - score_tail_ == 512 &&
+       (score_tail_ == 0 || score_tail_ == 64) && kq_is_nax_available() &&
+       q.strides(1) <= std::numeric_limits<int>::max() &&
+       kq_env_flag("KQ_SDPA_SPARSE_NAX", -1) != 0);
 
   // A decode step spreads its few queries over 8-head groups; a prefill
   // block has queries to spare, so 16 heads share each staged key block.
@@ -135,10 +154,14 @@ void KQSdpaSparseDecode::eval_gpu(
       hg = v;
     }
   }
+  if (use_nax) {
+    hg = kNaxStrip;
+  }
   // Enough threadgroups to cover the GPU: head groups x (B * L) x splits.
-  // Splits hold whole 8-key blocks, so the count can land under the ask.
+  // Splits hold whole key blocks, so the count can land off the ask.
   const int hgroups = (H + hg - 1) / hg;
   const int Hp = hgroups * hg;
+  const int key_block = use_nax ? kNaxKeyBlock : kKeyBlock;
   int n_splits = splits_;
   if (n_splits <= 0) {
     static const char* env = std::getenv("KQ_SDPA_SPARSE_SPLITS");
@@ -146,11 +169,30 @@ void KQSdpaSparseDecode::eval_gpu(
   }
   if (n_splits <= 0) {
     const int groups = hgroups * B * L;
-    n_splits = (160 + groups - 1) / groups;
+    // The NAX kernel fans a lone query out over splits; queries enough to
+    // fill the GPU take one split each and write the output themselves.
+    n_splits = use_nax ? std::max(1, kNaxGroups / groups)
+                       : (160 + groups - 1) / groups;
   }
   n_splits = std::max(1, std::min({n_splits, kMaxSplits, std::max(1, total)}));
   int keys_per_split = (total + n_splits - 1) / n_splits;
-  keys_per_split = ((keys_per_split + kKeyBlock - 1) / kKeyBlock) * kKeyBlock;
+  if (use_nax && (band_ > 0 || n_splits == 1)) {
+    // Whole tiles, rounded up: a short last tile costs less than a split
+    // of its own for every query.
+    keys_per_split = (keys_per_split + key_block - 1) / key_block * key_block;
+  } else if (use_nax) {
+    // The nearest whole tile: a lone padded slot past the last tile opens
+    // one short split instead of a tile in every split.
+    keys_per_split = std::max(
+        key_block,
+        (total + n_splits * key_block / 2) / (n_splits * key_block) *
+            key_block);
+    while ((total + keys_per_split - 1) / keys_per_split > kMaxSplits) {
+      keys_per_split += key_block;
+    }
+  } else {
+    keys_per_split = ((keys_per_split + key_block - 1) / key_block) * key_block;
+  }
   n_splits = std::max(1, (total + keys_per_split - 1) / keys_per_split);
 
   auto bcast = [](const mx::array& a, int axis) -> int64_t {
@@ -170,6 +212,9 @@ void KQSdpaSparseDecode::eval_gpu(
   params.has_win_mask = wmask != nullptr;
   params.has_sel_mask = smask != nullptr;
   params.direct = n_splits == 1;
+  params.Do = D - score_tail_;
+  params.band = band_;
+  params.koff = S - L;
   params.scale_log2 = scale_ * 1.4426950408889634f;
   params.q_strides[0] = q.strides(0);
   params.q_strides[1] = q.strides(1);
@@ -197,13 +242,15 @@ void KQSdpaSparseDecode::eval_gpu(
   const std::string ts = kq_type_string(q.dtype());
   const std::string is = idx.dtype() == mx::int32 ? "i32" : "u32";
   const std::string dtag = "_d" + std::to_string(D);
-  auto split_kernel = kq_get_kernel(
-      d,
-      "kq_sdpa_sparse_decode_split_" + ts + "_" + is + dtag + "_hg" +
-          std::to_string(hg) + (packed_ ? "_pk" : ""));
+  const std::string split_name = use_nax ? "kq_sdpa_sparse_decode_nax_" + ts +
+          "_" + is + "_t" + std::to_string(score_tail_)
+                                         : "kq_sdpa_sparse_decode_split_" + ts +
+          "_" + is + dtag + "_hg" + std::to_string(hg) + (packed_ ? "_pk" : "");
+  auto split_kernel = kq_get_kernel(d, split_name);
   // Register-heavy pipeline: some GPUs cap it below the dispatch width, and
   // Metal turns an oversized dispatch into silent garbage, not an error.
-  const size_t tg = size_t(hg / 4) * 32;
+  // The NAX kernel runs eight simdgroups.
+  const size_t tg = use_nax ? size_t(256) : size_t(hg / 4) * 32;
   if (tg > split_kernel->maxTotalThreadsPerThreadgroup()) {
     throw std::runtime_error(
         "[mlx_kquant.sdpa_sparse_decode] threadgroup of " + std::to_string(tg) +
@@ -222,13 +269,16 @@ void KQSdpaSparseDecode::eval_gpu(
   ce.set_input_array(sinks ? *sinks : q, 10);
   ce.set_output_array(o, 11);
   ce.set_input_array(pscales ? *pscales : idx, 12);
+  const MTL::Size split_grid(n_splits, hgroups, B * L);
+  const MTL::Size split_group =
+      use_nax ? MTL::Size(32, tg / 32, 1) : MTL::Size(tg, 1, 1);
   if (params.direct) {
     // No partials: the split kernel writes O and never touches 6-8.
     ce.set_input_array(q, 6);
     ce.set_input_array(q, 7);
     ce.set_input_array(q, 8);
-    ce.dispatch_threadgroups(
-        MTL::Size(n_splits, hgroups, B * L), MTL::Size(tg, 1, 1));
+    ce.dispatch_threadgroups(split_grid, split_group);
+    kq_log_dispatch(split_name, q, o, split_grid, split_group);
     return;
   }
 
@@ -244,8 +294,8 @@ void KQSdpaSparseDecode::eval_gpu(
   ce.set_output_array(oacc, 6);
   ce.set_output_array(ms, 7);
   ce.set_output_array(ls, 8);
-  ce.dispatch_threadgroups(
-      MTL::Size(n_splits, hgroups, B * L), MTL::Size(tg, 1, 1));
+  ce.dispatch_threadgroups(split_grid, split_group);
+  kq_log_dispatch(split_name, q, o, split_grid, split_group);
 
   auto merge_kernel =
       kq_get_kernel(d, "kq_sdpa_sparse_decode_merge_" + ts + dtag);
@@ -279,14 +329,17 @@ void KQSdpaSparseDecode::eval_cpu(
 
 std::vector<mx::Shape> KQSdpaSparseDecode::output_shapes(
     const std::vector<mx::array>& inputs) {
-  return {inputs[0].shape()};
+  auto shape = inputs[0].shape();
+  shape.back() -= score_tail_;
+  return {shape};
 }
 
 bool KQSdpaSparseDecode::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQSdpaSparseDecode&>(other);
   return scale_ == o.scale_ && splits_ == o.splits_ &&
       has_sinks_ == o.has_sinks_ && has_win_mask_ == o.has_win_mask_ &&
-      has_sel_mask_ == o.has_sel_mask_ && packed_ == o.packed_;
+      has_sel_mask_ == o.has_sel_mask_ && packed_ == o.packed_ &&
+      score_tail_ == o.score_tail_ && band_ == o.band_;
 }
 
 namespace {
@@ -333,6 +386,7 @@ mx::array sdpa_sparse_decode(
     const std::optional<mx::array>& sel_mask,
     int splits,
     const std::optional<mx::array>& pool_scales,
+    int score_tail,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.sdpa_sparse_decode]";
@@ -349,9 +403,16 @@ mx::array sdpa_sparse_decode(
   const int H = q.shape(1);
   const int L = q.shape(2);
   const int D = q.shape(3);
-  if (D != 128 && D != 256 && D != 512) {
+  if (score_tail == 0) {
+    if (D != 128 && D != 256 && D != 512) {
+      throw std::invalid_argument(
+          std::string(op) + " head_dim must be 128, 256 or 512.");
+    }
+  } else if (score_tail != 64 || D != 576 || pool_scales.has_value()) {
     throw std::invalid_argument(
-        std::string(op) + " head_dim must be 128, 256 or 512.");
+        std::string(op) +
+        " score_tail is 0, or 64 on unpacked rows 576 wide (a 512 latent"
+        " and its tail).");
   }
   check_pool(op, pool, pool_scales, D);
   if (window.shape(1) != 1 || window.shape(3) != D ||
@@ -374,6 +435,11 @@ mx::array sdpa_sparse_decode(
   }
   if (window.shape(2) + idx.shape(2) < 1) {
     throw std::invalid_argument(std::string(op) + " needs at least one key.");
+  }
+  if (window.shape(2) == 0 && pool.shape(1) == 0) {
+    // A padded slot reads a row that exists, and there is none.
+    throw std::invalid_argument(
+        std::string(op) + " needs a window row or a pool row.");
   }
   auto dt = q.dtype();
   if (dt != mx::float16 && dt != mx::bfloat16) {
@@ -433,8 +499,10 @@ mx::array sdpa_sparse_decode(
     inputs.push_back(mask_in(*sel_mask, idx.shape(2), "sel_mask"));
   }
 
+  auto out_shape = q.shape();
+  out_shape.back() -= score_tail;
   return mx::array(
-      q.shape(),
+      std::move(out_shape),
       dt,
       std::make_shared<KQSdpaSparseDecode>(
           s,
@@ -443,7 +511,8 @@ mx::array sdpa_sparse_decode(
           sinks.has_value(),
           win_mask.has_value(),
           sel_mask.has_value(),
-          pool_scales.has_value()),
+          pool_scales.has_value(),
+          score_tail),
       std::move(inputs));
 }
 
@@ -531,6 +600,7 @@ void KQSdpaSparsePrefill::eval_gpu(
   params.koff = S - L;
   params.has_sinks = sinks != nullptr;
   params.has_sel_mask = smask != nullptr;
+  params.Do = D - score_tail_;
   params.scale_log2 = scale_ * 1.4426950408889634f;
   params.q_strides[0] = q.strides(0);
   params.q_strides[1] = q.strides(1);
@@ -599,13 +669,16 @@ void KQSdpaSparsePrefill::eval_cpu(
 
 std::vector<mx::Shape> KQSdpaSparsePrefill::output_shapes(
     const std::vector<mx::array>& inputs) {
-  return {inputs[0].shape()};
+  auto shape = inputs[0].shape();
+  shape.back() -= score_tail_;
+  return {shape};
 }
 
 bool KQSdpaSparsePrefill::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQSdpaSparsePrefill&>(other);
   return scale_ == o.scale_ && band_ == o.band_ && has_sinks_ == o.has_sinks_ &&
-      has_sel_mask_ == o.has_sel_mask_ && packed_ == o.packed_;
+      has_sel_mask_ == o.has_sel_mask_ && packed_ == o.packed_ &&
+      score_tail_ == o.score_tail_;
 }
 
 mx::array sdpa_sparse_prefill(
@@ -618,6 +691,7 @@ mx::array sdpa_sparse_prefill(
     const std::optional<mx::array>& sinks,
     const std::optional<mx::array>& sel_mask,
     const std::optional<mx::array>& pool_scales,
+    int score_tail,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.sdpa_sparse_prefill]";
@@ -634,9 +708,16 @@ mx::array sdpa_sparse_prefill(
   const int H = q.shape(1);
   const int L = q.shape(2);
   const int D = q.shape(3);
-  if (D != 128 && D != 256 && D != 512) {
+  if (score_tail == 0) {
+    if (D != 128 && D != 256 && D != 512) {
+      throw std::invalid_argument(
+          std::string(op) + " head_dim must be 128, 256 or 512.");
+    }
+  } else if (score_tail != 64 || D != 576 || pool_scales.has_value()) {
     throw std::invalid_argument(
-        std::string(op) + " head_dim must be 128, 256 or 512.");
+        std::string(op) +
+        " score_tail is 0, or 64 on unpacked rows 576 wide (a 512 latent"
+        " and its tail).");
   }
   check_pool(op, pool, pool_scales, D);
   if (window.shape(1) != 1 || window.shape(3) != D ||
@@ -704,8 +785,32 @@ mx::array sdpa_sparse_prefill(
         mx::contiguous(mx::reshape(*sel_mask, {mb, L, N}, s), false, s));
   }
 
+  auto out_shape = q.shape();
+  out_shape.back() -= score_tail;
+  // Tensor-op GPUs run a 512 latent on the NAX split kernel of
+  // sdpa_sparse_decode, the band in place of its window, and its merge:
+  // the inputs are the ones that node reads. KQ_SDPA_SPARSE_NAX=0 keeps
+  // the simdgroup kernel.
+  if (!pool_scales.has_value() && D - score_tail == 512 && L <= kMaxQueries &&
+      s.device == mx::Device::gpu && nax_available() &&
+      kq_env_flag("KQ_SDPA_SPARSE_NAX", -1) != 0) {
+    return mx::array(
+        std::move(out_shape),
+        dt,
+        std::make_shared<KQSdpaSparseDecode>(
+            s,
+            scale,
+            0,
+            sinks.has_value(),
+            false,
+            sel_mask.has_value(),
+            false,
+            score_tail,
+            band),
+        std::move(inputs));
+  }
   return mx::array(
-      q.shape(),
+      std::move(out_shape),
       dt,
       std::make_shared<KQSdpaSparsePrefill>(
           s,
@@ -713,7 +818,8 @@ mx::array sdpa_sparse_prefill(
           band,
           sinks.has_value(),
           sel_mask.has_value(),
-          pool_scales.has_value()),
+          pool_scales.has_value(),
+          score_tail),
       std::move(inputs));
 }
 

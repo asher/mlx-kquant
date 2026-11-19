@@ -3533,6 +3533,79 @@ KQUANT_DEFINE_GATHER_QMV_SPLITK(
 
 #undef KQUANT_DEFINE_GATHER_QMV_SPLITK
 
+// Row-per-thread gathered M=1 mat-vec for q8_0: lane simd_lid of simdgroup
+// simd_gid in threadgroup tid.y folds output row tid.y * 64 + simd_gid * 32 +
+// simd_lid of batch entry tid.z, whole. The tiled kernels spread a row's K
+// over the 32 lanes, eight weights a lane, so a row under 256 weights leaves
+// lanes idle and still pays the sum across them; here every lane has a row.
+// The host takes it at M == 1 for a K under 256 that 32 divides
+// (gather_qmv_rows in src/kquant_gather.cpp).
+template <typename T, int group_size, int bits>
+[[kernel]] void kq_q8_0_gather_qmv_rows(
+    const device uint8_t* w,
+    const device uint8_t* /* scales */,
+    const device T* x,
+    const device uint32_t* lhs_indices,
+    const device uint32_t* rhs_indices,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* /* s_strides */,
+    const constant int& batch_ndims,
+    const constant int* batch_shape,
+    const constant int64_t* lhs_strides,
+    const constant int64_t* rhs_strides,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(
+      group_size == KQ_Q8_0_GROUP, "Q8_0 kernel requires group_size=32");
+  static_assert(bits == 8, "Q8_0 kernel requires bits=8");
+  kq_adjust_matrix_offsets<T>(
+      x,
+      w,
+      lhs_indices,
+      rhs_indices,
+      y,
+      out_vec_size,
+      batch_ndims,
+      batch_shape,
+      lhs_strides,
+      rhs_strides,
+      x_batch_ndims,
+      x_shape,
+      x_strides,
+      w_batch_ndims,
+      w_shape,
+      w_strides,
+      tid);
+  const int row = tid.y * 64 + simd_gid * 32 + simd_lid;
+  if (row >= out_vec_size) {
+    return;
+  }
+  const int row_bytes = in_vec_size * KQ_Q8_0_BLOCK_BYTES / KQ_Q8_0_GROUP;
+  const device uint8_t* block = w + static_cast<int64_t>(row) * row_bytes;
+  float acc = 0;
+  for (int k = 0; k < in_vec_size; k += KQ_Q8_0_GROUP) {
+    const float d = kq_q8_0_d(block);
+    const device int8_t* q = kq_q8_0_q_ptr(block);
+    float part = 0;
+#pragma unroll
+    for (int i = 0; i < KQ_Q8_0_GROUP; i++) {
+      part += float(x[k + i]) * float(q[i]);
+    }
+    acc += d * part;
+    block += KQ_Q8_0_BLOCK_BYTES;
+  }
+  y[row] = static_cast<T>(acc);
+}
+
 // Sorted-rhs gather GEMM (ALU/steel path), the non-NAX counterpart of
 // kq_gather_qmm_rhs_nax_tgp_impl. x rows arrive sorted by expert (the
 // SwitchGLU prefill layout): each BM output tile walks its row segments of

@@ -365,6 +365,66 @@ bool gather_qmv_splitk(
   return true;
 }
 
+// Gathered M=1 mat-vec with one thread a row (kq_q8_0_gather_qmv_rows): q8_0
+// at a K under 256 that 32 divides, which the fast tile cannot run and the
+// general tile runs with lanes idle. A per-head 128-wide projection (the
+// embed_q of an absorbed MLA) of 64 heads by 512 rows took 9.6 us against
+// 20.2 us on M5 Max, and 5.8 against 12.6 at 32 heads. Against gather_qmv the
+// outputs differ only in float32 summation order. KQ_GATHER_ROWS, read per
+// call: 0 keeps gather_qmv. Returns false, dispatching nothing, when the
+// codec or shape does not fit.
+bool gather_qmv_rows(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    array& out,
+    int group_size,
+    int bits,
+    int N,
+    int K,
+    Device& d,
+    const Stream& s,
+    const std::string& kquant_type) {
+  if (kquant_type != "q8_0" || K % 32 != 0 || K >= qmv_fast_k_align()) {
+    return false;
+  }
+  if (kq_env_flag("KQ_GATHER_ROWS", -1) == 0) {
+    return false;
+  }
+  const int B = out.size() / N;
+  std::string kname;
+  kname.reserve(64);
+  mx::concatenate(
+      kname,
+      kq_kname_prefix(kquant_type) + "gather_qmv_rows_",
+      kq_type_string(x.dtype()),
+      "_gs_",
+      group_size,
+      "_b_",
+      bits);
+  auto kernel = kq_get_kernel(d, kname);
+  const MTL::Size grid_dims(1, (N + 63) / 64, B);
+  const MTL::Size group_dims(32, 2, 1);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  int c = 0;
+  ce.set_input_array(w, c++);
+  ce.set_input_array(scales, c++);
+  ce.set_input_array(x, c++);
+  ce.set_input_array(lhs_indices, c++);
+  ce.set_input_array(rhs_indices, c++);
+  ce.set_output_array(out, c++);
+  ce.set_bytes(K, c++);
+  ce.set_bytes(N, c++);
+  c = add_strides_and_shapes(ce, false, x, w, scales, c);
+  add_gather_strides_and_shapes(ce, lhs_indices, rhs_indices, c);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+  return true;
+}
+
 // Sorted-rhs fast path (NAX variant, no biases): x rows are pre-sorted by
 // expert (lhs_indices defaulted), so a single batched GEMM walks contiguous
 // per-expert row blocks, switching the weight matrix per row-block from the
@@ -1081,20 +1141,34 @@ void KQuantGatherQMM::eval_gpu(
 
   if (transpose_) {
     if (M == 1 && !os &&
-        gather_qmv_splitk(
-            x,
-            w,
-            scales,
-            lhs_indices,
-            rhs_indices,
-            out,
-            group_size_,
-            bits_,
-            N,
-            K,
-            d,
-            s,
-            kquant_type_)) {
+        (gather_qmv_splitk(
+             x,
+             w,
+             scales,
+             lhs_indices,
+             rhs_indices,
+             out,
+             group_size_,
+             bits_,
+             N,
+             K,
+             d,
+             s,
+             kquant_type_) ||
+         gather_qmv_rows(
+             x,
+             w,
+             scales,
+             lhs_indices,
+             rhs_indices,
+             out,
+             group_size_,
+             bits_,
+             N,
+             K,
+             d,
+             s,
+             kquant_type_))) {
       return;
     }
     gather_qmv(

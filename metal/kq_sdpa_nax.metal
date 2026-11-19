@@ -69,3 +69,31 @@ instantiate_kq_sdpa_window_nax(bfloat16_t, 128)
 instantiate_kq_sdpa_window_nax(float16_t, 128)
 instantiate_kq_sdpa_window_nax(bfloat16_t, 256)
 instantiate_kq_sdpa_window_nax(float16_t, 256)
+
+#define instantiate_kq_sdpa_window_cb_nax(type)                        \
+  instantiate_kernel(                                                  \
+      "kq_sdpa_window_cb_nax_" #type,                                  \
+      kq_sdpa_window_cb_nax,                                           \
+      type)
+
+instantiate_kq_sdpa_window_cb_nax(bfloat16_t)
+instantiate_kq_sdpa_window_cb_nax(float16_t)
+
+// Sparse decode attention at a 512 latent, with and without the 64-wide
+// score-only tail; see kq_sdpa_sparse_decode_nax.h.
+#include "mlx/backend/metal/kernels/kq_sdpa_sparse_decode_nax.h"
+
+#define instantiate_kq_sdpa_sparse_decode_nax(type, iname, itype, tail) \
+  instantiate_kernel(                                                   \
+      "kq_sdpa_sparse_decode_nax_" #type "_" #iname "_t" #tail,         \
+      kq_sdpa_sparse_decode_nax,                                        \
+      type, itype, tail)
+
+#define instantiate_kq_sdpa_sparse_decode_nax_tail(tail)                    \
+  instantiate_kq_sdpa_sparse_decode_nax(bfloat16_t, i32, int32_t, tail)     \
+  instantiate_kq_sdpa_sparse_decode_nax(bfloat16_t, u32, uint32_t, tail)    \
+  instantiate_kq_sdpa_sparse_decode_nax(float16_t, i32, int32_t, tail)      \
+  instantiate_kq_sdpa_sparse_decode_nax(float16_t, u32, uint32_t, tail)
+
+instantiate_kq_sdpa_sparse_decode_nax_tail(0)
+instantiate_kq_sdpa_sparse_decode_nax_tail(64)

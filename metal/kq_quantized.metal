@@ -181,6 +181,7 @@
   instantiate_kquant_gather_qmv(gather_qmv_fast, type, 32, 8, q8_0)     \
   instantiate_kquant_gather_qmv(gather_qmv,      type, 32, 8, q8_0)     \
   instantiate_kquant_gather_qmv(gather_qmv_splitk, type, 32, 8, q8_0)  \
+  instantiate_kquant_gather_qmv(gather_qmv_rows, type, 32, 8, q8_0)    \
   instantiate_kquant_gather_qmm_t(type, 32, 8, true, q8_0)              \
   instantiate_kquant_gather_qmm_t(type, 32, 8, false, q8_0)             \
   instantiate_kquant_gather_qmm_seg_t(type, 32, 8, true, q8_0) \

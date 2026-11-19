@@ -2171,14 +2171,40 @@ _WINDOW_CASES = {
     "hd64_gqa8": (1, 64, 8, 777, 1800, 64, 1024, mx.float16, True),
     "hd256_gqa2": (1, 8, 4, 640, 1151, 256, 512, mx.bfloat16, False),
     "batch2": (2, 16, 4, 513, 1025, 128, 513, mx.bfloat16, True),
+    # Head dim 256 with a key head per query head: the column-block kernel.
+    # Hy4-flash window layer: a 2048 chunk and the 511 rows before it.
+    "hd256_chunk": (1, 64, 64, 2048, 2559, 256, 512, mx.bfloat16, True),
+    "hd256_first_chunk": (1, 8, 8, 700, 700, 256, 512, mx.bfloat16, True),
+    "hd256_few_rows": (1, 8, 8, 3, 515, 256, 512, mx.float16, False),
+    "hd256_window_under_tile": (1, 4, 4, 300, 350, 256, 20, mx.bfloat16, True),
+    "hd256_window_of_one": (1, 4, 4, 77, 90, 256, 1, mx.float16, True),
+    "hd256_batch2": (2, 4, 4, 513, 1025, 256, 513, mx.bfloat16, False),
 }
 
 
+def _rel_rows(a, b):
+    """Largest relative error of one output row."""
+    af = a.astype(mx.float32)
+    bf = b.astype(mx.float32)
+    err = mx.linalg.norm(af - bf, axis=-1)
+    return float((err / (mx.linalg.norm(bf, axis=-1) + 1e-9)).max())
+
+
+@pytest.fixture(params=["column blocks", "row blocks"])
+def window_kernel(request, monkeypatch):
+    """Both window kernels of head dim 256; other calls have the one."""
+    if request.param == "row blocks":
+        monkeypatch.setenv("KQ_SDPA_WINDOW_CB", "0")
+    return request.param
+
+
 @pytest.mark.parametrize("case", list(_WINDOW_CASES), ids=list(_WINDOW_CASES))
-def test_sdpa_prefill_window(case):
+def test_sdpa_prefill_window(case, window_kernel):
     if not kq.nax_available():
         pytest.skip("sdpa_prefill_window needs NAX")
     B, Hq, Hkv, qL, kL, D, window, dtype, with_sinks = _WINDOW_CASES[case]
+    if window_kernel == "row blocks" and not case.startswith("hd256_"):
+        pytest.skip("one kernel serves this call")
     scale = 1.0 / (D**0.5)
     q, k, v = _make(B, Hq, Hkv, qL, kL, D, dtype, seed=qL + kL + D, strided=False)
     sk = None
@@ -2190,6 +2216,10 @@ def test_sdpa_prefill_window(case):
     rel = _rel(got, ref)
     assert got.shape == q.shape
     assert rel < REL_BOUND[dtype], f"{case}: rel {rel:.3e}"
+    # A row at a mask edge that reads a key too many or too few is far off
+    # and still under the bound on the whole output.
+    rows = _rel_rows(got, ref)
+    assert rows < 8 * REL_BOUND[dtype], f"{case}: worst row {rows:.3e}"
 
 
 @pytest.mark.parametrize(
@@ -2222,12 +2252,15 @@ def test_sdpa_prefill_window_starts(D, with_sinks):
             assert rel < REL_BOUND[mx.bfloat16], f"row {b}: rel {rel:.3e}"
 
 
-def test_sdpa_prefill_window_model_layout():
+@pytest.mark.parametrize(
+    "Hq, Hkv, D", [(32, 4, 128), (8, 8, 256)], ids=["hd128_gqa8", "hd256"]
+)
+def test_sdpa_prefill_window_model_layout(Hq, Hkv, D):
     # Queries as the transpose of [B, L, H, D] projections and keys and
     # values as the prefix of a longer cache are read in place.
     if not kq.nax_available():
         pytest.skip("sdpa_prefill_window needs NAX")
-    B, Hq, Hkv, qL, kL, D, window = 1, 32, 4, 1000, 1512, 128, 513
+    B, qL, kL, window = 1, 1000, 1512, 513
     scale = 1.0 / (D**0.5)
     _, k, v = _make(B, Hq, Hkv, 1, kL, D, mx.bfloat16, seed=5, strided=True)
     q = mx.random.normal((B, qL, Hq, D), key=mx.random.key(6)).astype(mx.bfloat16)

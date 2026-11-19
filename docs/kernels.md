@@ -283,6 +283,13 @@ to 4% slower than `gather_qmv`, with the sign changing from run to run. At K 768
 longer at one and two entries in every run, and up to 13% less time at 4 to 16. Both keep
 `gather_qmv` there.
 
+A `q8_0` row under 256 weights fills only some of the 32 lanes of the `gather_qmv` tile, which
+gives each lane eight weights of a row. For a K under 256 that 32 divides, `gather_qmm` with one
+activation row runs a kernel that gives every output row its own thread instead: the per-head
+projections of an absorbed MLA, 128 wide. On M5 Max a call of 64 heads by 512 rows took 11.7 us
+against 20.2 us, and 8.0 us against 12.6 us at 32 heads. The outputs differ from `gather_qmv` only
+in float32 summation order.
+
 Tuning levers (defaults are right for normal use):
 
 - `KQ_TUNE_LIVE` - `1` makes the NAX tile levers (`KQ_NAX_SMALL_BM`, `KQ_NAX_BM128`,
@@ -421,6 +428,8 @@ Tuning levers (defaults are right for normal use):
   row. `0` restores `gather_qmv`, `1` takes split-K at any K that 256 divides, and unset follows
   the K and row-count rule above. `KQ_QMV_SPLITK` and `KQ_QMV_FINE` do not change it. Read live
   per call.
+- `KQ_GATHER_ROWS` - the row-per-thread `q8_0` kernel for `gather_qmm` at one activation row and
+  a K under 256. `0` restores `gather_qmv`. Read live per call.
 - `KQ_QMV_SPLITK` - the `q6_k` and `q8_0` split-K kernels for one activation row. `0` restores
   the per-row kernels, as does a set `KQ_QMV_FINE`, so a tiling A/B keeps measuring the tiling it
   names. A lever that forces another route at one row, such as `KQ_VERIFY_NAX=1`, takes
@@ -1407,7 +1416,11 @@ into a packed layout first.
   GPUs. Each 64-row query block reads only the key blocks inside its window, so the cost of a
   chunk follows the window, not the key length a dense masked attention walks. Head dims 64, 128
   and 256, GQA, optional per-head sinks, per-row `starts` for a left-padded batch, strided operands
-  with a contiguous head dim.
+  with a contiguous head dim. At head dim 256 with a key head per query head and no `starts`, a
+  second kernel takes 32 query rows a threadgroup: four simdgroups each keep the queries of a
+  64-column block in registers and exchange their partial scores through threadgroup memory. On M5
+  Max a 2048-row chunk of 64 heads over a 512 window takes 2.29 ms against 4.23 ms. The two kernels
+  differ at output rounding level. `KQ_SDPA_WINDOW_CB=0` keeps the first kernel.
 - `sdpa_qk8`: attention with int8 Q K^T and bfloat16 P V at head dim 128 on the tensor-op units of
   M5 and later GPUs, the scheme of SageAttention (Zhang et al., ICLR 2025): per-token int8 Q and K,
   K smoothed by its mean over keys, 16-bit P V. `sdpa_qk8_inputs(q, k, scale)` quantizes each row of
@@ -1496,6 +1509,25 @@ into a packed layout first.
   eighth of the head dim (partial `K @ Q^T` per eighth summed through threadgroup memory, `P @ V`
   from the same resident fragments), elsewhere the `sdpa_fa_verify` simdgroup tile runs the list.
   The per-split partials merge as `sdpa_fa_verify`. `KQ_SDPA_IDX_NAX=0` forces the simdgroup kernel.
+- **`sdpa_sparse_decode`** - attention over a window read whole plus the pool rows a per-query list
+  names, K == V, with per-head sinks and key masks: query l of `q [B, H, L, D]` attends `window [B,
+  1, W, D]` and the rows of `pool [B, P, D]` that `idx [B, L, N]` lists, read in place with no
+  gathered copy. `score_tail=64` on rows 576 wide counts the last 64 values in the score only, the
+  rope half of an absorbed MLA key. The keys of a lone query fan out over splits whose f32 partials
+  one merge pass renormalizes; queries enough to fill the GPU take one split each, which writes the
+  output itself. On tensor-op GPUs a 512 latent, with or without the tail, runs a NAX tile kernel:
+  32-head strips over 16-key tiles, eight simdgroups that each hold a 64-column eighth of the latent
+  and 8 columns of the tail, one key tile in registers at a time. A packed pool and head dims 128
+  and 256 run the simdgroup kernel, two simdgroups per eight heads. The two kernels round
+  differently. The NAX kernel reads a masked or padded slot as zeros; the simdgroup kernel reads
+  the row at weight zero, so a masked row must hold finite values there.
+  `KQ_SDPA_SPARSE_NAX=0` keeps the simdgroup kernel.
+- **`sdpa_sparse_prefill`** - the prefill form: query l sits at window row `S - L + l`, reads the
+  `band` rows that end at its own, then its listed pool rows; no window mask, the band is the mask.
+  On tensor-op GPUs a 512 latent runs the NAX kernel of `sdpa_sparse_decode` with the band in place
+  of its window, 3.2x faster at 32 heads by 2048 queries by 2052 keys on M5 Max. Elsewhere one
+  threadgroup per query and head group stages the rows through a table. `KQ_SDPA_SPARSE_NAX=0`
+  keeps that kernel.
 
 ## Int8 matmul
 
@@ -1584,9 +1616,11 @@ modifications, from omlx's `glm_moe_dsa` custom kernels (see the
 (`qL = 2`), and prefill share them.
 
 - **`dsa_indexer_scores`** - indexer relevance scores over a prefill query tile (steel GEMM):
-  `out[b,0,m,n] = sum_h relu(q[b,h,m] . k[b,0,n]) * w[h,m]`.
+  `out[b,0,m,n] = sum_h relu(q[b,h,m] . k[b,0,n]) * w[h,m]`. 16, 32 or 64 heads; fp32 head weights
+  are read as-is. `causal_ratio` is for pooled keys, one key per `causal_ratio` positions: row `m`
+  sees the keys under `(causal_q_offset + m + 1) // causal_ratio`.
 - **`dsa_indexer_score_decode`** - the same for decode-width (`qL <= 4`) queries without materializing
-  the per-head `[H, P]` scores. 4, 32 or 64 heads; fp32 head weights are read as-is.
+  the per-head `[H, P]` scores. 4, 16, 32 or 64 heads; fp32 head weights are read as-is.
 - **`dsa_topk_indices`** - per-row top-k arg-select over the 16-bit scores (2-pass radix select). The
   selected index *set* matches a full sort; the order within a row does not.
 - **`dsa_sparse_attention`** - the sliding local window plus the indexer-selected gathered rows plus

@@ -3,10 +3,14 @@
 #include "mlx/backend/metal/kernels/utils.h"
 #include "mlx/backend/metal/kernels/kq_dsa_indexer_mma.h"
 
+// Head weights in the score type, and in fp32 under the _wf name.
 #define instantiate_kq_dsa_indexer_score_mma(tname, dtype) \
   instantiate_kernel(                                      \
       "kq_dsa_indexer_score_mma_" #tname,                 \
-      kq_dsa_indexer_score_mma, dtype)
+      kq_dsa_indexer_score_mma, dtype, dtype)             \
+  instantiate_kernel(                                      \
+      "kq_dsa_indexer_score_mma_" #tname "_wf",           \
+      kq_dsa_indexer_score_mma, dtype, float)
 
 #define instantiate_kq_dsa_indexer_score_i8mx(tname, dtype) \
   instantiate_kernel(                                       \

@@ -23,10 +23,11 @@
 //    chunk arithmetic costs more than a short row's scan. The emitted array is
 //    the one-threadgroup array bit for bit.
 //
-// Score kernel body byte-identical to omlx apart from the renames. The
-// top-k emission is intentionally not: omlx compacts through atomic
-// counters, which is nondeterministic under 16-bit tie pileup; do not
-// re-take it on an omlx sync.
+// The score kernel is omlx's with the renames, a head weight type of its
+// own (WT, the score type or float) and a pool ratio in the causal rule.
+// The top-k emission is intentionally not omlx's: omlx compacts through
+// atomic counters, which is nondeterministic under 16-bit tie pileup; do
+// not re-take it on an omlx sync.
 
 #pragma once
 
@@ -437,18 +438,19 @@ template <typename T, typename O, int CHUNKS, int THREADS>
       simd_group);
 }
 
-template <typename T, int BM, int BN, int BK, int WM, int WN>
+template <typename T, typename WT, int BM, int BN, int BK, int WM, int WN>
 [[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void
 kq_dsa_indexer_score(
     const device T* Q [[buffer(0)]],
     const device T* K [[buffer(1)]],
-    const device T* W [[buffer(2)]],
+    const device WT* W [[buffer(2)]],
     device T* O [[buffer(3)]],
     const constant GEMMParams* params [[buffer(4)]],
     const constant int& H [[buffer(5)]],
     const constant int& unused_causal_prefix_topk [[buffer(6)]],
     const constant bool& skip_causal_future_store [[buffer(7)]],
-    const constant int& causal_q_offset [[buffer(8)]],
+    const constant int& q_offset [[buffer(8)]],
+    const constant int& causal_ratio [[buffer(9)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -476,13 +478,15 @@ kq_dsa_indexer_score(
   const int M = params->M;
   const int N = params->N;
   const int D = params->K;
-  const int q_offset = causal_q_offset >= 0 ? causal_q_offset : N - M;
   constexpr int THREADS = WM * WN * 32;
   const int thread_idx = int(simd_group_id) * 32 + int(simd_lane_id);
+  // A key column stands for causal_ratio positions: row m sees the
+  // columns under (q_offset + m + 1) / causal_ratio. `seen` is that
+  // count for the tile's last row.
+  const int seen = (q_offset + metal::min(c_row + BM, M)) / causal_ratio;
 
   if (kq_dsa_do_causal) {
-    const int row_limit = metal::min(c_row + BM, M);
-    if (c_col > q_offset + row_limit - 1) {
+    if (c_col >= seen) {
       if (skip_causal_future_store) {
         return;
       }
@@ -500,8 +504,7 @@ kq_dsa_indexer_score(
   }
 
   if (kq_dsa_do_causal && unused_causal_prefix_topk > 0) {
-    const int row_limit = metal::min(c_row + BM, M);
-    if (q_offset + row_limit <= unused_causal_prefix_topk) {
+    if (seen <= unused_causal_prefix_topk) {
       return;
     }
   }
@@ -568,6 +571,7 @@ kq_dsa_indexer_score(
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < decltype(mma_op.Ctile)::kTileRows; ++i) {
     const int row = c_row + mma_op.sm + i * mma_t::TM_stride;
+    const int row_seen = (q_offset + row + 1) / causal_ratio;
     STEEL_PRAGMA_UNROLL
     for (short j = 0; j < decltype(mma_op.Ctile)::kTileCols; ++j) {
       const int col_base = c_col + mma_op.sn + j * mma_t::TN_stride;
@@ -577,7 +581,7 @@ kq_dsa_indexer_score(
       STEEL_PRAGMA_UNROLL
       for (short e = 0; e < decltype(mma_op.Ctile)::kElemsPerFrag; ++e) {
         const int col = col_base + e;
-        const bool future = kq_dsa_do_causal && col > q_offset + row;
+        const bool future = kq_dsa_do_causal && col >= row_seen;
         const T value =
             future ? static_cast<T>(-INFINITY) : static_cast<T>(accum[ai]);
         Dst[out_base + e] = value;

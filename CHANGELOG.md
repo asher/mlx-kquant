@@ -11,6 +11,36 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   active memory, so a large table read a few rows at a time stays pageable at any wired limit.
 - `buffer_id` names the memory behind an array without evaluating it or waiting on it, so a caller
   can tell which arrays share one buffer, such as a KV cache and the views of it.
+- `file_rows` reads rows of a table straight from a file, in parallel, as a lazy node on a CPU
+  stream, so a table too large to hold is looked up without holding the decode loop.
+- `sdpa_sparse_prefill` and `sdpa_sparse_decode` take `score_tail=64` on rows 576 wide: the last 64
+  values of a query and of each row count in the score only, so an absorbed MLA key reads its 512
+  latent and its rope half from one row.
+- `dsa_indexer_score_decode` accepts 16 indexer heads and `dsa_topk_indices` a width of 511, the
+  pools a 2048-key budget holds at ratio 4 beside the query's own group.
+- `dsa_indexer_scores` accepts 16 indexer heads, fp32 head weights and `causal_ratio`, the positions
+  one pooled key stands for, so a prefill chunk over pooled keys is scored and masked in one kernel.
+
+### Changed
+- `q3_k` matvecs and fused MoE gathers run about 1.15x faster on rows whose width is not a
+  multiple of 1024, such as 1536-wide experts (16 experts of 1536 by 1536 on M5 Max).
+- `gather_qmm` at one activation row runs `q8_0` rows under 256 weights about 1.7x faster (64 heads
+  by 512 rows of 128 on M5 Max), the per-head projections of an absorbed MLA. `KQ_GATHER_ROWS=0`
+  restores the previous kernel.
+- `sdpa_sparse_decode` at a 512 latent, with or without `score_tail=64`, runs 2.2x to 2.8x faster on
+  M5 and later GPUs (64 heads over 512 window rows, 32 heads over 2048 listed rows, M5 Max). Outputs
+  differ at rounding level. `KQ_SDPA_SPARSE_NAX=0` restores the previous kernel.
+- `sdpa_sparse_prefill` at a 512 latent, with or without `score_tail=64`, runs 3.2x faster on M5 and
+  later GPUs (32 heads, 2048 queries, 2052 keys each, M5 Max). Outputs differ at rounding level.
+  `KQ_SDPA_SPARSE_NAX=0` restores the previous kernel.
+- `sdpa_prefill_window` at head dim 256 with a key head per query head runs 1.7x to 1.85x faster
+  (64 heads, a 2048 or 4096 row chunk over a 512 window, M5 Max). Outputs differ at rounding level.
+  `KQ_SDPA_WINDOW_CB=0` restores the previous kernel.
+
+### Fixed
+- `sdpa_sparse_prefill` no longer returns NaN when window row 0 holds a non-finite value that no
+  query attends and a query has a padded or masked slot.
+- `sdpa_sparse_decode` refuses an empty window with an empty pool, which read past a buffer.
 
 ## [0.5.11]
 

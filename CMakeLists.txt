@@ -170,6 +170,7 @@ target_sources(
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_cb_caps.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_route_shed.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_kv_append.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_file_rows.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_skinny_mv.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gather.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_encode.cpp

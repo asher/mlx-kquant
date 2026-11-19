@@ -799,13 +799,17 @@ mx::array dsa_sparse_attention(
 
 // DeepSeek-V4-Flash lightning-indexer relevance scores (steel GEMM):
 // out[b, 0, m, n] = sum_h relu(q[b, h, m, :] . k[b, 0, n, :]) * w_h_m.
-// q [B, H, M, 128] (H 32 or 64), k [B, 1, N, 128]; weights either
-// [B, M, H] ("lh" layout) or [B, H, M, 1]. Requires M % 64 == 0 and
+// q [B, H, M, 128] (H 16, 32 or 64), k [B, 1, N, 128]; weights either
+// [B, M, H] ("lh" layout) or [B, H, M, 1]. fp32 weights are read as
+// fp32 and the scores take the type of q and k. Requires M % 64 == 0 and
 // N % 64 == 0 (pad or fall back Python-side; decode pads the single query
 // row to 64 and keeps row 0). causal masks n > causal_q_offset + m with
 // -inf (causal_q_offset -1 means N - M); with skip_causal_future_store the
 // fully-masked tiles are left unwritten instead (only valid when the
 // consumer never reads them, e.g. a causal_valid_prefix top-k).
+// causal_ratio is for pooled keys, one key per causal_ratio positions:
+// the mask is n >= (causal_q_offset + m + 1) / causal_ratio, which is the
+// rule above at 1. Above 1, causal_q_offset is read as given, -1 included.
 // Returns [B, 1, M, N]. Metal-only.
 mx::array dsa_indexer_scores(
     mx::array queries,
@@ -815,11 +819,12 @@ mx::array dsa_indexer_scores(
     int unused_causal_prefix_topk = 0,
     bool skip_causal_future_store = false,
     int causal_q_offset = -1,
+    int causal_ratio = 1,
     mx::StreamOrDevice s = {});
 
 // Per-row top-k arg-select over 16-bit float scores (2-pass radix over the
 // orderable bit transform; one threadgroup per row). scores [B, 1, L, K]
-// fp16/bf16, topk in {512, 2048}, K >= topk. The selected set matches a
+// fp16/bf16, topk in {511, 512, 2048}, K >= topk. The selected set matches a
 // full sort; intra-row order does not (threshold ties admitted in scan
 // order). bucketed emits >threshold before ==threshold deterministically.
 // causal_valid_prefix clamps each row's scan to K - L + row%L + 1 entries
@@ -835,8 +840,9 @@ mx::array dsa_topk_indices(
 
 // Decode-width lightning-indexer scores, fused: sum_h relu(q_h . k_p) * w_h
 // for qL <= 4 query rows over every pooled row without materializing the
-// [H, P] per-head scores. queries [B, 64, qL, 128], keys [B, P, 128] (the
-// pooled cache, rank 3), weights [B, qL, 64] with any positive global scale
+// [H, P] per-head scores. queries [B, H, qL, 128] with H 4, 16, 32 or 64,
+// keys [B, P, 128] (the pooled cache, rank 3), weights [B, qL, H] with any
+// positive global scale
 // folded out (top-k invariant). Pooled visibility follows
 // PoolingCache.make_mask(qL, q_offset): row i is visible to query j iff
 // i < (q_offset + j + 1) / ratio, and every row is visible when qL == 1;
@@ -1284,6 +1290,23 @@ mx::array kv_append(
     mx::array x,
     int64_t offset,
     mx::StreamOrDevice s = {});
+
+// Rows ids of a table stored in a file as rows of row_bytes bytes from byte
+// offset: uint8 [*ids.shape, row_bytes], read with parallel preads on a CPU
+// stream (the default CPU stream when s is unset). The read is a graph
+// node, so it starts when ids is ready and never holds the caller. Nothing
+// of the table is mapped or wired. A row past rows, or one the read fails
+// on, comes back as zeros and adds to file_rows_failures().
+mx::array file_rows(
+    mx::array ids,
+    const std::string& path,
+    int64_t offset,
+    int64_t row_bytes,
+    int64_t rows,
+    mx::StreamOrDevice s = {});
+
+// Rows file_rows returned as zeros since the process started.
+uint64_t file_rows_failures();
 
 // An id for the MLX allocation that holds a's data, or nullopt while a has
 // none (not yet evaluated, or empty). Two arrays alive at the same time
@@ -2609,13 +2632,15 @@ class KQDsaIndexerScores : public mx::Primitive {
       bool weights_lh,
       int unused_causal_prefix_topk,
       bool skip_causal_future_store,
-      int causal_q_offset)
+      int causal_q_offset,
+      int causal_ratio = 1)
       : mx::Primitive(stream),
         causal_(causal),
         weights_lh_(weights_lh),
         unused_causal_prefix_topk_(unused_causal_prefix_topk),
         skip_causal_future_store_(skip_causal_future_store),
-        causal_q_offset_(causal_q_offset) {}
+        causal_q_offset_(causal_q_offset),
+        causal_ratio_(causal_ratio) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -2638,6 +2663,7 @@ class KQDsaIndexerScores : public mx::Primitive {
   int unused_causal_prefix_topk_;
   bool skip_causal_future_store_;
   int causal_q_offset_;
+  int causal_ratio_;
 };
 
 // DeepSeek-V4-Flash indexer top-k select (see dsa_topk_indices).
@@ -3636,6 +3662,49 @@ class KQuantKVAppend : public mx::Primitive {
   int64_t offset_;
 };
 
+// Table rows read from a file (see file_rows). CPU streams only. Holds the
+// file open for as long as a graph holds the node.
+class KQuantFileRows : public mx::Primitive {
+ public:
+  struct Fd {
+    int fd = -1;
+    int64_t size = 0;
+    ~Fd();
+  };
+
+  KQuantFileRows(
+      mx::Stream stream,
+      std::shared_ptr<Fd> fd,
+      int64_t offset,
+      int64_t row_bytes,
+      int64_t rows)
+      : mx::Primitive(stream),
+        fd_(std::move(fd)),
+        offset_(offset),
+        row_bytes_(row_bytes),
+        rows_(rows) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantFileRows";
+  }
+  bool is_equivalent(const mx::Primitive&) const override {
+    return false;
+  }
+
+ private:
+  std::shared_ptr<Fd> fd_;
+  int64_t offset_;
+  int64_t row_bytes_;
+  int64_t rows_;
+};
+
 // Routed-expert slot remap + residency shed (see route_shed).
 // Inference-only.
 class KQuantRouteShed : public mx::Primitive {
@@ -3966,6 +4035,7 @@ mx::array sdpa_sparse_decode(
     const std::optional<mx::array>& sel_mask = std::nullopt,
     int splits = 0,
     const std::optional<mx::array>& pool_scales = std::nullopt,
+    int score_tail = 0,
     mx::StreamOrDevice s = {});
 
 class KQSdpaSparseDecode : public mx::Primitive {
@@ -3977,14 +4047,18 @@ class KQSdpaSparseDecode : public mx::Primitive {
       bool has_sinks,
       bool has_win_mask,
       bool has_sel_mask,
-      bool packed)
+      bool packed,
+      int score_tail,
+      int band = 0)
       : mx::Primitive(stream),
         scale_(scale),
         splits_(splits),
         has_sinks_(has_sinks),
         has_win_mask_(has_win_mask),
         has_sel_mask_(has_sel_mask),
-        packed_(packed) {}
+        packed_(packed),
+        score_tail_(score_tail),
+        band_(band) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -4008,6 +4082,10 @@ class KQSdpaSparseDecode : public mx::Primitive {
   bool has_win_mask_;
   bool has_sel_mask_;
   bool packed_;
+  int score_tail_;
+  // Above 0 the node is sdpa_sparse_prefill on the NAX split kernel: the
+  // window input holds S rows and query l reads its band of them.
+  int band_;
 };
 
 // Prefill form of sdpa_sparse_decode: query l of window [B, 1, S, D]
@@ -4026,6 +4104,7 @@ mx::array sdpa_sparse_prefill(
     const std::optional<mx::array>& sinks = std::nullopt,
     const std::optional<mx::array>& sel_mask = std::nullopt,
     const std::optional<mx::array>& pool_scales = std::nullopt,
+    int score_tail = 0,
     mx::StreamOrDevice s = {});
 
 class KQSdpaSparsePrefill : public mx::Primitive {
@@ -4036,13 +4115,15 @@ class KQSdpaSparsePrefill : public mx::Primitive {
       int band,
       bool has_sinks,
       bool has_sel_mask,
-      bool packed)
+      bool packed,
+      int score_tail)
       : mx::Primitive(stream),
         scale_(scale),
         band_(band),
         has_sinks_(has_sinks),
         has_sel_mask_(has_sel_mask),
-        packed_(packed) {}
+        packed_(packed),
+        score_tail_(score_tail) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -4065,6 +4146,7 @@ class KQSdpaSparsePrefill : public mx::Primitive {
   bool has_sinks_;
   bool has_sel_mask_;
   bool packed_;
+  int score_tail_;
 };
 
 // MiniMax-H3 video sparse attention (VSA), the block-sparse part. q, k, v

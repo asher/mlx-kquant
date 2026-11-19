@@ -6,6 +6,7 @@
 //    column n, sum_h relu(q[h,m] . k[n]) * w[h,m], fp32 accumulation,
 //    T output, identical causal semantics (future tiles store -inf or
 //    skip, unused-causal-prefix tiles skip, per-element future -inf).
+//    WT is the type of the head weights, T or float.
 //
 //  * kq_dsa_indexer_score_i8mx -- same score math on pre-quantized
 //    operands: int8 codes (E2M1 values doubled, in [-12, 12]) with
@@ -47,7 +48,9 @@ constant constexpr int CAP_MAX = 16;
 
 // Legacy-kernel causal tile handling, shared by both kernels. Returns
 // true when the tile is fully handled (skip or -inf store) and the
-// kernel should exit. O points at the batch base.
+// kernel should exit. O points at the batch base. A key column stands for
+// `ratio` positions: row m sees the columns under (q_offset + m + 1) /
+// ratio.
 template <typename T>
 METAL_FUNC bool causal_tile_prologue(
     device T* O,
@@ -56,6 +59,7 @@ METAL_FUNC bool causal_tile_prologue(
     int M,
     int N,
     int q_offset,
+    int ratio,
     int unused_causal_prefix_topk,
     bool skip_causal_future_store,
     int thread_idx) {
@@ -63,7 +67,9 @@ METAL_FUNC bool causal_tile_prologue(
     return false;
   }
   const int row_limit = metal::min(c_row + BM, M);
-  if (c_col > q_offset + row_limit - 1) {
+  // Columns the tile's last row sees.
+  const int seen = (q_offset + row_limit) / ratio;
+  if (c_col >= seen) {
     if (!skip_causal_future_store) {
       device T* Dst = O + size_t(c_row) * N + c_col;
       for (int e = thread_idx; e < BM * BN; e += THREADS) {
@@ -76,8 +82,7 @@ METAL_FUNC bool causal_tile_prologue(
     }
     return true;
   }
-  if (unused_causal_prefix_topk > 0 &&
-      q_offset + row_limit <= unused_causal_prefix_topk) {
+  if (unused_causal_prefix_topk > 0 && seen <= unused_causal_prefix_topk) {
     return true;
   }
   return false;
@@ -85,19 +90,20 @@ METAL_FUNC bool causal_tile_prologue(
 
 } // namespace kq_dsa_mma
 
-template <typename T>
+template <typename T, typename WT>
 [[kernel, max_total_threads_per_threadgroup(kq_dsa_mma::THREADS)]] void
 kq_dsa_indexer_score_mma(
     device T* Q [[buffer(0)]],
     device T* K [[buffer(1)]],
-    device T* W [[buffer(2)]],
+    device WT* W [[buffer(2)]],
     device T* O [[buffer(3)]],
     const constant int& M [[buffer(4)]],
     const constant int& N [[buffer(5)]],
     const constant int& H [[buffer(6)]],
     const constant int& unused_causal_prefix_topk [[buffer(7)]],
     const constant bool& skip_causal_future_store [[buffer(8)]],
-    const constant int& causal_q_offset [[buffer(9)]],
+    const constant int& q_offset [[buffer(9)]],
+    const constant int& causal_ratio [[buffer(10)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]]) {
   using namespace kq_dsa_mma;
@@ -105,7 +111,6 @@ kq_dsa_indexer_score_mma(
 
   const int c_row = int(tid.y) * BM;
   const int c_col = int(tid.x) * BN;
-  const int q_offset = causal_q_offset >= 0 ? causal_q_offset : N - M;
 
   Q += size_t(tid.z) * H * M * HD;
   K += size_t(tid.z) * N * HD;
@@ -119,6 +124,7 @@ kq_dsa_indexer_score_mma(
           M,
           N,
           q_offset,
+          causal_ratio,
           unused_causal_prefix_topk,
           skip_causal_future_store,
           int(lid.x))) {
@@ -155,6 +161,7 @@ kq_dsa_indexer_score_mma(
   int rowg[CAP_MAX];
   int colg[CAP_MAX];
   bool live[CAP_MAX];
+  bool future[CAP_MAX];
   float acc[CAP_MAX];
 #pragma unroll
   for (uint16_t i = 0; i < cap; ++i) {
@@ -167,6 +174,8 @@ kq_dsa_indexer_score_mma(
       colg[i] = 0;
       rowg[i] = 0;
     }
+    future[i] = kq_dsa_mma_do_causal &&
+        colg[i] >= (q_offset + rowg[i] + 1) / causal_ratio;
     acc[i] = 0.0f;
   }
 
@@ -195,9 +204,8 @@ kq_dsa_indexer_score_mma(
 #pragma unroll
   for (uint16_t i = 0; i < cap; ++i) {
     if (live[i]) {
-      const bool future = kq_dsa_mma_do_causal && colg[i] > q_offset + rowg[i];
       O[size_t(rowg[i]) * N + colg[i]] =
-          future ? static_cast<T>(-INFINITY) : static_cast<T>(acc[i]);
+          future[i] ? static_cast<T>(-INFINITY) : static_cast<T>(acc[i]);
     }
   }
 }
@@ -216,7 +224,7 @@ kq_dsa_indexer_score_i8mx(
     const constant int& H [[buffer(8)]],
     const constant int& unused_causal_prefix_topk [[buffer(9)]],
     const constant bool& skip_causal_future_store [[buffer(10)]],
-    const constant int& causal_q_offset [[buffer(11)]],
+    const constant int& q_offset [[buffer(11)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]]) {
   using namespace kq_dsa_mma;
@@ -224,7 +232,6 @@ kq_dsa_indexer_score_i8mx(
 
   const int c_row = int(tid.y) * BM;
   const int c_col = int(tid.x) * BN;
-  const int q_offset = causal_q_offset >= 0 ? causal_q_offset : N - M;
   const int thread_idx = int(lid.x);
 
   Qc += size_t(tid.z) * H * M * HD;
@@ -241,6 +248,7 @@ kq_dsa_indexer_score_i8mx(
           M,
           N,
           q_offset,
+          1,
           unused_causal_prefix_topk,
           skip_causal_future_store,
           thread_idx)) {

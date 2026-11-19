@@ -33,6 +33,8 @@
 instantiate_kq_sdpa_sparse_decode_d(128)
 instantiate_kq_sdpa_sparse_decode_d(256)
 instantiate_kq_sdpa_sparse_decode_d(512)
+// A 512 latent with a 64-wide score-only tail (score_tail).
+instantiate_kq_sdpa_sparse_decode_d(576)
 
 // Prefill form: (head group, D slices, keys per block) configurations. The
 // host default must be instantiated at every head dim; the rest are the
@@ -56,4 +58,6 @@ instantiate_kq_sdpa_sparse_prefill_cfg(256, 16, 4, 8)
 instantiate_kq_sdpa_sparse_prefill_cfg(512, 16, 4, 8)
 instantiate_kq_sdpa_sparse_prefill_cfg(512, 32, 4, 8)
 instantiate_kq_sdpa_sparse_prefill_cfg(512, 16, 2, 8)
+// A 512 latent with a 64-wide score-only tail (score_tail).
+instantiate_kq_sdpa_sparse_prefill_cfg(576, 16, 4, 8)
     // clang-format on

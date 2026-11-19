@@ -274,7 +274,10 @@ def _on_grid_pool(pool):
 
 @pytest.mark.parametrize("D", [128, 512])
 @pytest.mark.parametrize("B,L,splits", [(1, 1, 0), (2, 3, 4), (1, 40, 1)])
-def test_packed_pool_matches_fp16_pool(D, B, L, splits):
+def test_packed_pool_matches_fp16_pool(D, B, L, splits, monkeypatch):
+    # A packed pool runs the simdgroup kernel, so the fp16 pool it is held
+    # to bit for bit runs it too.
+    monkeypatch.setenv("KQ_SDPA_SPARSE_NAX", "0")
     args, _ = _case(
         B,
         16,
@@ -365,3 +368,46 @@ def test_strided_window_and_pool_match_contiguous(B):
     for w, p in _strided_variants(win, pool):
         got = kq.sdpa_sparse_decode(q, w, p, idx, scale, **kw)
         assert mx.array_equal(got, want).item()
+
+
+@pytest.mark.parametrize("dtype,tol", [(mx.float16, 3e-3), (mx.bfloat16, 2e-2)])
+@pytest.mark.parametrize("H,L,splits", [(64, 1, 0), (32, 1, 1), (32, 3, 7)])
+def test_score_tail_counts_in_the_score_and_has_no_output(dtype, tol, H, L, splits):
+    # Rows 576 wide: all of a row scores, the first 512 values come out.
+    args, ref = _case(
+        2,
+        H,
+        L,
+        576,
+        96,
+        700,
+        300,
+        dtype,
+        np.int32,
+        sinks=True,
+        masks=True,
+        pad=True,
+    )
+    _check(args, ref[..., :512], tol, splits=splits, score_tail=64)
+
+
+def test_score_tail_is_refused_at_other_widths():
+    args, _ = _case(
+        1,
+        16,
+        1,
+        512,
+        16,
+        32,
+        8,
+        mx.float16,
+        np.int32,
+        sinks=False,
+        masks=False,
+        pad=False,
+    )
+    q, win, pool, idx, scale, kw = args
+    with pytest.raises(ValueError):
+        kq.sdpa_sparse_decode(q, win, pool, idx, scale, score_tail=64)
+    with pytest.raises(ValueError):
+        kq.sdpa_sparse_decode(q, win, pool, idx, scale, score_tail=32)

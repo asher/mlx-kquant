@@ -5,11 +5,16 @@
 #include "mlx/backend/metal/kernels/steel/gemm/gemm.h"
 #include "mlx/backend/metal/kernels/kq_dsa_indexer.h"
 
+// Head weights in the score type, and in fp32 under the _wf name.
 #define instantiate_kq_dsa_indexer_score(tname, dtype, bm, bn, bk, wm, wn) \
   instantiate_kernel(                                                      \
       "kq_dsa_indexer_score_" #tname                                       \
       "_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn,                  \
-      kq_dsa_indexer_score, dtype, bm, bn, bk, wm, wn)
+      kq_dsa_indexer_score, dtype, dtype, bm, bn, bk, wm, wn)              \
+  instantiate_kernel(                                                      \
+      "kq_dsa_indexer_score_" #tname                                       \
+      "_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn "_wf",            \
+      kq_dsa_indexer_score, dtype, float, bm, bn, bk, wm, wn)
 
 #define instantiate_kq_dsa_topk_indices(tname, dtype, topk, threads) \
   instantiate_kernel(                                                \
@@ -27,6 +32,9 @@ instantiate_kq_dsa_topk_indices(float16_t, half, 2048, 512);
 instantiate_kq_dsa_topk_indices(bfloat16_t, bfloat16_t, 2048, 512);
 instantiate_kq_dsa_topk_indices(float16_t, half, 512, 512);
 instantiate_kq_dsa_topk_indices(bfloat16_t, bfloat16_t, 512, 512);
+// 511 pools and the query's own group fill a 2048-key budget at ratio 4.
+instantiate_kq_dsa_topk_indices(float16_t, half, 511, 512);
+instantiate_kq_dsa_topk_indices(bfloat16_t, bfloat16_t, 511, 512);
 
 // Split select: any topk, one row over `chunks` threadgroups.
 #define instantiate_kq_dsa_topk_split(tname, dtype, chunks, threads)           \
@@ -49,7 +57,7 @@ instantiate_kq_dsa_topk_indices(bfloat16_t, bfloat16_t, 512, 512);
 instantiate_kq_dsa_topk_split_all(float16_t, half)
 instantiate_kq_dsa_topk_split_all(bfloat16_t, bfloat16_t)
 
-// Decode scorer: heads 4/32/64, 16-bit or fp32 head weights.
+// Decode scorer: heads 4/16/32/64, 16-bit or fp32 head weights.
 #define instantiate_kq_dsa_indexer_score_decode(tname, dtype, ql, h, hs, wt, ws) \
   instantiate_kernel(                                                               \
       "kq_dsa_indexer_score_decode_" hs ws #tname "_ql" #ql,                        \
@@ -87,9 +95,11 @@ instantiate_kq_dsa_indexer_score_decode_pair_all(bfloat16_t, bfloat16_t);
 
 instantiate_kq_dsa_indexer_score_decode_all(float16_t, half, 64, "");
 instantiate_kq_dsa_indexer_score_decode_all(float16_t, half, 32, "h32_");
+instantiate_kq_dsa_indexer_score_decode_all(float16_t, half, 16, "h16_");
 instantiate_kq_dsa_indexer_score_decode_all(float16_t, half, 4, "h4_");
 instantiate_kq_dsa_indexer_score_decode_all(bfloat16_t, bfloat16_t, 64, "");
 instantiate_kq_dsa_indexer_score_decode_all(bfloat16_t, bfloat16_t, 32, "h32_");
+instantiate_kq_dsa_indexer_score_decode_all(bfloat16_t, bfloat16_t, 16, "h16_");
 instantiate_kq_dsa_indexer_score_decode_all(bfloat16_t, bfloat16_t, 4, "h4_");
 
 // clang-format on
