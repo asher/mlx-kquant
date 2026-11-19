@@ -3344,6 +3344,81 @@ METAL_FUNC void kq_q3_k_dequantize_impl(
   out[gid] = T(eff_scale * float(q3));
 }
 
+// One superblock of one row in the Q3_K qmv_fast loop: adds the lane's
+// share of the block's dot with yl to sum1 and sum2.
+METAL_FUNC void kq_q3_k_fast_block(
+    const device uint8_t* sb_addr,
+    thread const float* yl,
+    int q_offset_bytes,
+    int l0,
+    int il,
+    uint16_t s_shift1,
+    uint16_t s_shift2,
+    ushort4 hm,
+    ushort4 qm,
+    float v1,
+    float v2,
+    thread float& sum1,
+    thread float& sum2) {
+  typedef float U;
+  const device uint16_t* q = reinterpret_cast<const device uint16_t*>(
+      kq_q3_k_qs_ptr(sb_addr) + q_offset_bytes);
+  const device uint16_t* h =
+      reinterpret_cast<const device uint16_t*>(kq_q3_k_hmask_ptr(sb_addr) + l0);
+  const device uint16_t* a =
+      reinterpret_cast<const device uint16_t*>(kq_q3_k_scales12_ptr(sb_addr));
+
+  uint32_t scales32, aux32;
+  thread uint16_t* scales16 = reinterpret_cast<thread uint16_t*>(&scales32);
+  thread const int8_t* scales =
+      reinterpret_cast<thread const int8_t*>(&scales32);
+
+  scales16[0] = a[4];
+  scales16[1] = a[5];
+  aux32 = ((scales32 >> s_shift2) << 4) & 0x30303030u;
+  scales16[0] = a[il + 0];
+  scales16[1] = a[il + 1];
+  scales32 = ((scales32 >> s_shift1) & 0x0f0f0f0fu) | aux32;
+
+  const U d_all = U(kq_q3_k_d(sb_addr));
+
+  U s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0;
+#pragma unroll
+  for (int l = 0; l < 8; l += 2) {
+    const uint16_t qs = q[l / 2];
+    s1 += yl[l + 0] * U(qs & qm[0]);
+    s2 += yl[l + 1] * U(qs & qm[1]);
+    s3 += ((h[l / 2] & hm[0]) ? U(0) : yl[l + 0]) +
+        ((h[l / 2] & hm[1]) ? U(0) : yl[l + 1]);
+    s4 += yl[l + 16] * U(qs & qm[2]);
+    s5 += yl[l + 17] * U(qs & qm[3]);
+    s6 += ((h[l / 2] & hm[2]) ? U(0) : yl[l + 16]) +
+        ((h[l / 2] & hm[3]) ? U(0) : yl[l + 17]);
+  }
+  U d1 = d_all * (s1 + s2 * (U(1) / U(256)) - s3 * v1);
+  U d2 = d_all * (s4 + s5 * (U(1) / U(256)) - s6 * v2);
+  sum1 += d1 * U(int(scales[0]) - 32);
+  sum2 += d2 * U(int(scales[2]) - 32);
+
+  s1 = s2 = s3 = s4 = s5 = s6 = U(0);
+#pragma unroll
+  for (int l = 0; l < 8; l += 2) {
+    const uint16_t qs = q[l / 2 + 8];
+    s1 += yl[l + 8] * U(qs & qm[0]);
+    s2 += yl[l + 9] * U(qs & qm[1]);
+    s3 += ((h[l / 2 + 8] & hm[0]) ? U(0) : yl[l + 8]) +
+        ((h[l / 2 + 8] & hm[1]) ? U(0) : yl[l + 9]);
+    s4 += yl[l + 24] * U(qs & qm[2]);
+    s5 += yl[l + 25] * U(qs & qm[3]);
+    s6 += ((h[l / 2 + 8] & hm[2]) ? U(0) : yl[l + 24]) +
+        ((h[l / 2 + 8] & hm[3]) ? U(0) : yl[l + 25]);
+  }
+  d1 = d_all * (s1 + s2 * (U(1) / U(256)) - s3 * v1);
+  d2 = d_all * (s4 + s5 * (U(1) / U(256)) - s6 * v2);
+  sum1 += d1 * U(int(scales[1]) - 32);
+  sum2 += d2 * U(int(scales[3]) - 32);
+}
+
 template <
     typename T,
     int group_size,
@@ -3410,77 +3485,65 @@ METAL_FUNC void kq_q3_k_qmv_fast_impl(
   x += tid.x * in_vec_size;
   y += tid.x * out_vec_size;
 
-  for (int ib = ix; ib < nb; ib += sb_stride) {
-    const int x_base = ib * KQ_Q3_K_SUPERBLOCK + y_offset;
+  // A lane takes every 4th superblock of a row. Where 4 does not divide the
+  // row's superblocks (a 1536-wide row has 6), the lanes split the
+  // simdgroup's (row, superblock) pairs instead, so no lane runs more than
+  // one pair past another.
+  if (nb % sb_stride == 0) {
+    for (int ib = ix; ib < nb; ib += sb_stride) {
+      const int x_base = ib * KQ_Q3_K_SUPERBLOCK + y_offset;
 #pragma unroll
-    for (int l = 0; l < 8; l++) {
-      yl[l + 0] = U(x[x_base + l + 0]);
-      yl[l + 8] = U(x[x_base + l + 16]);
-      yl[l + 16] = U(x[x_base + l + 32]);
-      yl[l + 24] = U(x[x_base + l + 48]);
+      for (int l = 0; l < 8; l++) {
+        yl[l + 0] = U(x[x_base + l + 0]);
+        yl[l + 8] = U(x[x_base + l + 16]);
+        yl[l + 16] = U(x[x_base + l + 32]);
+        yl[l + 24] = U(x[x_base + l + 48]);
+      }
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        kq_q3_k_fast_block(
+            w + static_cast<int64_t>(out_row + row) * row_bytes +
+                ib * KQ_Q3_K_BLOCK_BYTES,
+            yl,
+            q_offset_bytes,
+            l0,
+            il,
+            s_shift1,
+            s_shift2,
+            hm,
+            qm,
+            v1,
+            v2,
+            sumf1[row],
+            sumf2[row]);
+      }
     }
-
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      const int row_idx = out_row + row;
-      const device uint8_t* sb_addr = w +
-          static_cast<int64_t>(row_idx) * row_bytes + ib * KQ_Q3_K_BLOCK_BYTES;
-
-      const device uint16_t* q = reinterpret_cast<const device uint16_t*>(
-          kq_q3_k_qs_ptr(sb_addr) + q_offset_bytes);
-      const device uint16_t* h = reinterpret_cast<const device uint16_t*>(
-          kq_q3_k_hmask_ptr(sb_addr) + l0);
-      const device uint16_t* a = reinterpret_cast<const device uint16_t*>(
-          kq_q3_k_scales12_ptr(sb_addr));
-
-      uint32_t scales32, aux32;
-      thread uint16_t* scales16 = reinterpret_cast<thread uint16_t*>(&scales32);
-      thread const int8_t* scales =
-          reinterpret_cast<thread const int8_t*>(&scales32);
-
-      scales16[0] = a[4];
-      scales16[1] = a[5];
-      aux32 = ((scales32 >> s_shift2) << 4) & 0x30303030u;
-      scales16[0] = a[il + 0];
-      scales16[1] = a[il + 1];
-      scales32 = ((scales32 >> s_shift1) & 0x0f0f0f0fu) | aux32;
-
-      const U d_all = U(kq_q3_k_d(sb_addr));
-
-      U s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0;
+  } else {
+    for (int u = ix; u < results_per_simdgroup * nb; u += sb_stride) {
+      const int row = u / nb;
+      const int ib = u - row * nb;
+      const int x_base = ib * KQ_Q3_K_SUPERBLOCK + y_offset;
 #pragma unroll
-      for (int l = 0; l < 8; l += 2) {
-        const uint16_t qs = q[l / 2];
-        s1 += yl[l + 0] * U(qs & qm[0]);
-        s2 += yl[l + 1] * U(qs & qm[1]);
-        s3 += ((h[l / 2] & hm[0]) ? U(0) : yl[l + 0]) +
-            ((h[l / 2] & hm[1]) ? U(0) : yl[l + 1]);
-        s4 += yl[l + 16] * U(qs & qm[2]);
-        s5 += yl[l + 17] * U(qs & qm[3]);
-        s6 += ((h[l / 2] & hm[2]) ? U(0) : yl[l + 16]) +
-            ((h[l / 2] & hm[3]) ? U(0) : yl[l + 17]);
+      for (int l = 0; l < 8; l++) {
+        yl[l + 0] = U(x[x_base + l + 0]);
+        yl[l + 8] = U(x[x_base + l + 16]);
+        yl[l + 16] = U(x[x_base + l + 32]);
+        yl[l + 24] = U(x[x_base + l + 48]);
       }
-      U d1 = d_all * (s1 + s2 * (U(1) / U(256)) - s3 * v1);
-      U d2 = d_all * (s4 + s5 * (U(1) / U(256)) - s6 * v2);
-      sumf1[row] += d1 * U(int(scales[0]) - 32);
-      sumf2[row] += d2 * U(int(scales[2]) - 32);
-
-      s1 = s2 = s3 = s4 = s5 = s6 = U(0);
-#pragma unroll
-      for (int l = 0; l < 8; l += 2) {
-        const uint16_t qs = q[l / 2 + 8];
-        s1 += yl[l + 8] * U(qs & qm[0]);
-        s2 += yl[l + 9] * U(qs & qm[1]);
-        s3 += ((h[l / 2 + 8] & hm[0]) ? U(0) : yl[l + 8]) +
-            ((h[l / 2 + 8] & hm[1]) ? U(0) : yl[l + 9]);
-        s4 += yl[l + 24] * U(qs & qm[2]);
-        s5 += yl[l + 25] * U(qs & qm[3]);
-        s6 += ((h[l / 2 + 8] & hm[2]) ? U(0) : yl[l + 24]) +
-            ((h[l / 2 + 8] & hm[3]) ? U(0) : yl[l + 25]);
-      }
-      d1 = d_all * (s1 + s2 * (U(1) / U(256)) - s3 * v1);
-      d2 = d_all * (s4 + s5 * (U(1) / U(256)) - s6 * v2);
-      sumf1[row] += d1 * U(int(scales[1]) - 32);
-      sumf2[row] += d2 * U(int(scales[3]) - 32);
+      kq_q3_k_fast_block(
+          w + static_cast<int64_t>(out_row + row) * row_bytes +
+              ib * KQ_Q3_K_BLOCK_BYTES,
+          yl,
+          q_offset_bytes,
+          l0,
+          il,
+          s_shift1,
+          s_shift2,
+          hm,
+          qm,
+          v1,
+          v2,
+          sumf1[row],
+          sumf2[row]);
     }
   }
 

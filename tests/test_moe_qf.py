@@ -346,3 +346,48 @@ def test_qf_pair_widths(T, env, want):
     glu = {n for n in names if n.startswith("kq_q5_0_qf_moe_glu_gather_")}
     pick = "dd_silu" if want else "silu"
     assert glu == {f"kq_q5_0_qf_moe_glu_gather_{pick}_float16_t"}, (T, env, glu)
+
+
+@pytest.mark.parametrize("k", [1536, 1280])
+def test_q3_k_rows_whose_superblocks_four_lanes_do_not_split_evenly(k):
+    """A Q3_K row of 6 or 5 superblocks: the lanes of a simdgroup share its
+    (row, superblock) pairs, so a lane covers parts of both its rows. The
+    matvec and the fused GLU gather match the f32 reference there."""
+    import mlx.core as mx
+
+    import mlx_kquant as kq
+
+    sys.path.insert(0, HERE)
+    from kqref import GT, quants
+
+    rng = np.random.default_rng(5)
+    E, N, T, R = 4, 64, 2, 2
+    wires, refs = [], []
+    for _ in range(2 * E):
+        w, scales = kq.quantize(
+            mx.array(rng.standard_normal((N, k)).astype(np.float32) * 0.05),
+            "q3_k",
+            None,
+        )
+        wires.append((w, scales))
+        refs.append(quants.dequantize(np.array(w), GT.Q3_K).astype(np.float32))
+    x = mx.array(rng.standard_normal((T, k)).astype(np.float16) * 0.5)
+    xf = np.array(x.astype(mx.float32))
+
+    def rel(got, want):
+        return float(np.abs(got - want).max() / np.abs(want).max())
+
+    y = kq.quantized_matmul(x, *wires[0], "q3_k")
+    assert rel(np.array(y.astype(mx.float32)), xf @ refs[0].T) < 2e-3
+
+    gate = mx.stack([w for w, _ in wires[:E]])
+    up = mx.stack([w for w, _ in wires[E:]])
+    idx = np.array([[0, 3], [2, 3]], dtype=np.uint32)
+    h = kq.moe_glu_gather_kq(x, gate, up, "q3_k", mx.array(idx), act="silu")
+    want = np.empty((T, R, N), np.float32)
+    for t in range(T):
+        for r in range(R):
+            g = xf[t] @ refs[idx[t, r]].T
+            u = xf[t] @ refs[E + idx[t, r]].T
+            want[t, r] = g / (1 + np.exp(-g)) * u
+    assert rel(np.array(h.astype(mx.float32)).reshape(T, R, N), want) < 2e-3

@@ -22,6 +22,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one pooled key stands for, so a prefill chunk over pooled keys is scored and masked in one kernel.
 
 ### Changed
+- `q3_k` matvecs and fused MoE gathers run about 1.15x faster on rows whose width is not a
+  multiple of 1024, such as 1536-wide experts (16 experts of 1536 by 1536 on M5 Max).
 - `gather_qmm` at one activation row runs `q8_0` rows under 256 weights about 1.7x faster (64 heads
   by 512 rows of 128 on M5 Max), the per-head projections of an absorbed MLA. `KQ_GATHER_ROWS=0`
   restores the previous kernel.
