@@ -68,5 +68,10 @@ def test_bad_arguments_fail_at_the_call(table, tmp_path):
         kq.file_rows(ids, path, OFFSET, ROW_BYTES, ROWS + 1)
     with pytest.raises(ValueError, match="integer"):
         kq.file_rows(mx.array([0.5]), path, OFFSET, ROW_BYTES, ROWS)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="needs a GPU stream")
+def test_a_gpu_stream_fails_at_the_call(table):
+    path, _ = table
     with pytest.raises(ValueError, match="CPU stream"):
-        kq.file_rows(ids, path, OFFSET, ROW_BYTES, ROWS, stream=mx.gpu)
+        kq.file_rows(mx.array([0]), path, OFFSET, ROW_BYTES, ROWS, stream=mx.gpu)
