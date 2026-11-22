@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.13]
+
 ### Added
 - `moe_glu_gather_kq(act="situ")` runs the Kimi K3 and Inkling 2 expert activation in the fused gate and
   up gather, with `limit` as beta and `alpha` as the linear bound (0 leaves the up branch unbounded).
