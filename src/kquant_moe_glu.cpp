@@ -317,6 +317,10 @@ inline void kq_moe_log_kname(const std::string& kname, int cap = 0) {
 constexpr int KQ_MOE_SHEXP_SCALE = 8;
 constexpr int KQ_MOE_SWIGLU_OAI = 16;
 constexpr int KQ_MOE_SHEXP_PRE = 32;
+// Bit 6 is act situ on a routed GLU: it rides the silu kernels like
+// swiglu_oai, with beta as the limit and linear_beta bound as alpha.
+constexpr int KQ_MOE_SITU = 64;
+constexpr int KQ_MOE_GLU_ALPHA = KQ_MOE_SWIGLU_OAI | KQ_MOE_SITU;
 
 inline int kq_moe_scale_inputs(int bits, bool glu) {
   const int per = glu ? 2 : 1;
@@ -824,12 +828,12 @@ void KQuantMoEGLUKQ::eval_gpu(
   if (dd && (stem == "q6_k" || stem == "q8_0")) {
     stem += "_ext"; // the dedupe kernels are Ext-only
   }
-  // swiglu_oai rides the silu kernels under its out-scale bit
-  // (kq_glu_epilogue), with the clamp from the run-time limit.
-  const bool oai = (out_scale_bits_ & KQ_MOE_SWIGLU_OAI) != 0;
+  // swiglu_oai and situ ride the silu kernels under their out-scale bits
+  // (kq_glu_epilogue), with the run-time limit and alpha.
+  const bool rides_silu = (out_scale_bits_ & KQ_MOE_GLU_ALPHA) != 0;
   std::string kname = "kq_" + stem + "_moe_glu_gather_" +
       (biased ? "bias_" : "") + (use_half ? "h_" : "") + (dd ? "dd_" : "") +
-      (oai ? std::string("silu") : act_) + (c32 ? "_c32" : "") +
+      (rides_silu ? std::string("silu") : act_) + (c32 ? "_c32" : "") +
       kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
   auto kernel = kq_get_kernel_os(
       d, kname, out_scale_bits_, qf ? nullptr : kq_moe_nx_setting());
@@ -858,7 +862,7 @@ void KQuantMoEGLUKQ::eval_gpu(
     ce.set_bytes(K, 5);
     ce.set_bytes(N, 6);
     ce.set_bytes(limit_, 7);
-    if (oai) {
+    if (rides_silu) {
       ce.set_bytes(alpha_, kq_glu_alpha_slot);
     }
   }
@@ -1019,7 +1023,7 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
     ce.set_bytes(N, 8);
     ce.set_bytes(limit_, 9);
     ce.set_bytes(NS, 10);
-    if (out_scale_bits_ & KQ_MOE_SWIGLU_OAI) {
+    if (out_scale_bits_ & KQ_MOE_GLU_ALPHA) {
       ce.set_bytes(alpha_, kq_glu_alpha_slot);
     }
     const int sg = kq_moe_fit_sg(kernel, kq_moe_pick_sg(kquant_type_, N, nx));
@@ -1076,7 +1080,7 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   ce.set_bytes(N, 8);
   ce.set_bytes(limit_, 9);
   ce.set_bytes(NS, 10);
-  if (out_scale_bits_ & KQ_MOE_SWIGLU_OAI) {
+  if (out_scale_bits_ & KQ_MOE_GLU_ALPHA) {
     ce.set_bytes(alpha_, kq_glu_alpha_slot);
   }
   kq_moe_bind_scales(ce, inputs, out_scale_bits_, true);
@@ -1107,7 +1111,7 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   ce.set_bytes(N, 3);
   ce.set_bytes(R, 4);
   ce.set_bytes(limit_, 5);
-  if (out_scale_bits_ & KQ_MOE_SWIGLU_OAI) {
+  if (out_scale_bits_ & KQ_MOE_GLU_ALPHA) {
     ce.set_bytes(alpha_, kq_glu_alpha_slot);
   }
   MTL::Size egroup(std::min(N, 256), 1, 1);
@@ -2312,10 +2316,15 @@ mx::array moe_glu_gather_kq(
         "[mlx_kquant.moe_glu_gather_kq] x must be float16 or bfloat16.");
   }
   if (act != "silu" && act != "gelu" && act != "silu_limit" &&
-      act != "swiglu_clamp" && act != "swiglu_oai") {
+      act != "swiglu_clamp" && act != "swiglu_oai" && act != "situ") {
     throw std::invalid_argument(
         "[mlx_kquant.moe_glu_gather_kq] act must be 'silu', 'gelu', "
-        "'silu_limit', 'swiglu_clamp' or 'swiglu_oai'.");
+        "'silu_limit', 'swiglu_clamp', 'swiglu_oai' or 'situ'.");
+  }
+  if (act == "situ" && (!(limit > 0.0f) || !(alpha >= 0.0f))) {
+    throw std::invalid_argument(
+        "[mlx_kquant.moe_glu_gather_kq] act 'situ' requires limit (beta) "
+        "> 0 and alpha (linear_beta) >= 0.");
   }
   if (act == "silu_limit" && !(limit > 0.0f)) {
     throw std::invalid_argument(
@@ -2373,7 +2382,8 @@ mx::array moe_glu_gather_kq(
                           "gate_scale",
                           &up_scale,
                           "up_scale") |
-      (act == "swiglu_oai" ? KQ_MOE_SWIGLU_OAI : 0);
+      (act == "swiglu_oai" ? KQ_MOE_SWIGLU_OAI : 0) |
+      (act == "situ" ? KQ_MOE_SITU : 0);
 
   auto x_c = moe_dense_x(x, s);
   mx::Shape out_shape = {x.shape(0), indices.shape(1), gate_w.shape(1)};
@@ -2392,10 +2402,13 @@ mx::array moe_glu_gather_kq(
           s,
           kquant_type,
           act,
-          (act == "silu_limit" || act == "swiglu_clamp" || act == "swiglu_oai")
+          (act == "silu_limit" || act == "swiglu_clamp" ||
+           act == "swiglu_oai" || act == "situ")
               ? limit
               : 0.0f,
-          (act == "swiglu_clamp" || act == "swiglu_oai") ? alpha : 0.0f,
+          (act == "swiglu_clamp" || act == "swiglu_oai" || act == "situ")
+              ? alpha
+              : 0.0f,
           os_bits),
       std::move(op_inputs));
 }
