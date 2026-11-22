@@ -18,7 +18,9 @@
 // act swiglu_oai (kq_moe_glu_kq.h); it binds no scale buffer. Bit 5
 // (kq_shexp_pre) says the op computed its shared expert on the dense
 // route: the GLU kernels leave the shared slots to kq_moe_shexp_glu_pre
-// and the mix kernels read the shared product at KQ_SHEXP_PRE_SLOT.
+// and the mix kernels read the shared product at KQ_SHEXP_PRE_SLOT. Bit 6
+// (kq_situ) switches the silu GLU epilogue to act situ, with beta in the
+// limit slot and linear_beta in the alpha slot; it binds no scale buffer.
 #pragma once
 
 #include <metal_stdlib>
@@ -31,6 +33,9 @@ constant bool kq_has_out_scale = kq_out_scale_mode != 0;
 constant bool kq_has_shexp_scale = (kq_out_scale_bits & 8) != 0;
 constant bool kq_swiglu_oai = (kq_out_scale_bits & 16) != 0;
 constant bool kq_shexp_pre = (kq_out_scale_bits & 32) != 0;
+constant bool kq_situ = (kq_out_scale_bits & 64) != 0;
+// The GLU kernels bind alpha for swiglu_oai and situ.
+constant bool kq_glu_alpha_bound = kq_swiglu_oai || kq_situ;
 constant bool kq_out_scale_cols =
     kq_out_scale_mode == 2 || kq_out_scale_mode == 4;
 

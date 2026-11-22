@@ -16,7 +16,12 @@ shape and lever setting that selects each kernel family it dispatches:
   sx2    moe_glu_gather_shexp_kq      shared gate and up in two codecs
   qmv, mix, mix_ns                    the down gathers, which take no act
 
-swiglu_oai is checked against an f32 reference. silu and silu_limit (the
+situ (Inkling 2) is
+beta * tanh(g / beta) * sigmoid(g) * alpha * tanh(u / alpha), with limit as
+beta and alpha as the linear bound (0 leaves u unbounded). Bit 6 switches the
+silu epilogue of the routed GLU gathers to it.
+
+swiglu_oai and situ are checked against an f32 reference. silu and silu_limit (the
 DeepSeek-V4 form), and the down gathers, are checked by value against
 outputs saved from mlx-kquant 0.5.7, the release before swiglu_oai. Each
 order of the two forms runs in its own process (silu forms first, then
@@ -502,7 +507,13 @@ OLD_ACTS = {
     "mix": ("none",),
     "mix_ns": ("none",),
 }
-OAI_SITES = ("glu", "shexp", "sx2")
+# acts checked against the f32 reference, per site
+NEW_ACTS = {
+    "glu": ("swiglu_oai", "situ"),
+    "shexp": ("swiglu_oai",),
+    "sx2": ("swiglu_oai",),
+}
+OAI_SITES = tuple(NEW_ACTS)
 
 
 # child: build each arm's operands and run it
@@ -533,6 +544,17 @@ def _oai_np(g, u, limit, alpha):
         return g / (1.0 + np.exp(-alpha * g)) * (u + 1.0)
 
 
+def _situ_np(g, u, beta, alpha):
+    a = beta * np.tanh(g / beta) / (1.0 + np.exp(-g))
+    return a * (alpha * np.tanh(u / alpha) if alpha > 0 else u)
+
+
+def _act_np(act, g, u, limit):
+    if act == "swiglu_oai":
+        return _oai_np(g, u, limit, ALPHA)
+    return _situ_np(g, u, limit, 2.0 * limit)
+
+
 def _bits(a):
     mx.eval(a)
     return np.array(a.view(mx.uint16))
@@ -546,7 +568,7 @@ def _f32(bits, dtype):
 
 def _run_arm(a, get, acts):
     """{act: (bits, rel or None)} for one arm; rel is against the f32
-    reference for swiglu_oai."""
+    reference for swiglu_oai and situ."""
     dt = getattr(mx, a["dtype"])
     rng = np.random.default_rng(zlib.crc32(a["id"].encode()))
     c, T = a["codec"], a["T"]
@@ -614,6 +636,8 @@ def _run_arm(a, get, acts):
             akw["limit"] = limit
         if act == "swiglu_oai":
             akw.update(limit=limit, alpha=ALPHA)
+        if act == "situ":
+            akw.update(limit=limit, alpha=2.0 * limit)
         if site == "glu":
             y = kq.moe_glu_gather_kq(x, gw, uw, c, inds, act=act, **akw)
         else:
@@ -635,10 +659,10 @@ def _run_arm(a, get, acts):
         _mark(a["id"], act)
         bits = _bits(y)
         rel = None
-        if act == "swiglu_oai":
+        if act in ("swiglu_oai", "situ"):
             rows = [
                 [
-                    _oai_np(xf[t] @ gref[e].T, xf[t] @ uref[e].T, limit, ALPHA)
+                    _act_np(act, xf[t] @ gref[e].T, xf[t] @ uref[e].T, limit)
                     for e in inds_np[t]
                 ]
                 for t in range(T)
@@ -646,7 +670,7 @@ def _run_arm(a, get, acts):
             if sref is not None:
                 for t in range(T):
                     rows[t].append(
-                        _oai_np(xf[t] @ sref[0].T, xf[t] @ sref[1].T, limit, ALPHA)
+                        _act_np(act, xf[t] @ sref[0].T, xf[t] @ sref[1].T, limit)
                     )
             want = np.array(rows, np.float32)
             want = np.array(mx.array(want).astype(dt).astype(mx.float32))
@@ -661,8 +685,8 @@ def _mark(arm_id, act):
 
 
 def child_main(mode, order, out_path):
-    """mode ref: the 0.5.7-reference acts only; mode run: those and
-    swiglu_oai, in the given order."""
+    """mode ref: the 0.5.7-reference acts only; mode run: those and the
+    newer acts, in the given order."""
     get = _wires()
     data, rels = {}, {}
     for a in arms():
@@ -671,10 +695,9 @@ def child_main(mode, order, out_path):
         old = OLD_ACTS[a["site"]]
         if mode == "ref":
             acts = old
-        elif a["site"] in OAI_SITES:
-            acts = (
-                old + ("swiglu_oai",) if order == "old_first" else ("swiglu_oai",) + old
-            )
+        elif a["site"] in NEW_ACTS:
+            new = NEW_ACTS[a["site"]]
+            acts = old + new if order == "old_first" else new + old
         else:
             acts = old
         for act, (bits, rel) in _run_arm(a, get, acts).items():
@@ -741,7 +764,7 @@ def test_every_site_and_family_dispatches(runs):
         for key, ks in names.items():
             arm_id, act = key.split("|")
             a = by_id[arm_id]
-            inst = "silu" if act in ("swiglu_oai", "none") else act
+            inst = "silu" if act in ("swiglu_oai", "situ", "none") else act
             if a["site"] != "glu":
                 inst = "silu"
             pat = a["expect"].replace("{act}", inst)
@@ -780,10 +803,11 @@ def test_launch_sites_covered():
 
 @gpu_only
 @pytest.mark.parametrize("order", ["old_first", "oai_first"])
-def test_swiglu_oai_matches_reference(runs, order):
+def test_new_acts_match_reference(runs, order):
     _, _, rels = runs[order]
-    n_oai = sum(1 for a in arms() if a["site"] in OAI_SITES)
-    assert len(rels) == n_oai
+    n_new = sum(len(NEW_ACTS.get(a["site"], ())) for a in arms())
+    assert len(rels) == n_new
+    assert any(k.endswith("|situ") for k in rels)
     bad = {k: v for k, v in rels.items() if not v < REL_BOUND}
     assert not bad, bad
 
@@ -881,8 +905,20 @@ def test_swiglu_oai_takes_no_biases():
         )
 
 
+@pytest.mark.parametrize("limit,alpha", [(0.0, 25.0), (-4.0, 25.0), (4.0, -1.0)])
+def test_situ_requires_limit_and_alpha(limit, alpha):
+    x = mx.zeros((2, 512), dtype=mx.float16)
+    inds = mx.zeros((2, 2), dtype=mx.uint32)
+    w = _q8_wire()
+    with pytest.raises(ValueError, match="situ"):
+        kq.moe_glu_gather_kq(
+            x, w, w, "q8_0", inds, act="situ", limit=limit, alpha=alpha
+        )
+
+
 def test_swiglu_oai_named_in_docstrings():
     """Callers find the act by its name in the docstrings."""
+    assert "situ" in kq.moe_glu_gather_kq.__doc__
     assert "swiglu_oai" in kq.moe_glu_gather_kq.__doc__
     assert "swiglu_oai" in kq.moe_glu_gather_shexp_kq.__doc__
 
