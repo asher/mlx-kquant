@@ -827,6 +827,61 @@ def test_params_read_from_an_undeclared_input_are_refused(direct, lever_cache):
         kq.fuse_release(handle)
 
 
+def _host_param_reader(op, p):
+    """(an input, the output of op reading p on the host): the indexer's
+    q_offset 3 from slot 0, kv_append's offset 4 from slot 1, paged rows'
+    base_len 32 from slot 2."""
+    dtype = mx.bfloat16
+    if op == "kv_append":
+        x = mx.zeros((1, 1, 2, K), dtype)
+        mx.eval(x)
+        return x, kq.kv_append(_buf(dtype), x, 4, params=p, offset_slot=1)
+    if op == "dsa_indexer_score_decode":
+        q, keys = mx.zeros((1, 4, 2, 128), dtype), mx.zeros((1, 64, 128), dtype)
+        wts = mx.zeros((1, 2, 4), dtype)
+        mx.eval(q, keys, wts)
+        return q, kq.dsa_indexer_score_decode(
+            q, keys, wts, 3, 4, params=p, q_offset_slot=0
+        )
+    q, kb = mx.zeros((1, 4, 2, 256), dtype), mx.zeros((1, 2, 64, 256), dtype)
+    kt, pages = mx.zeros((1, 2, 16, 256), dtype), mx.zeros((1, 2, 4), mx.int32)
+    ends = mx.array([[47, 48]], mx.int32)
+    mx.eval(q, kb, kt, pages, ends)
+    return q, kq.sdpa_paged_rows(
+        q,
+        kb,
+        kb,
+        0.0625,
+        pages,
+        ends,
+        kt,
+        kt,
+        32,
+        page_rows=4,
+        params=p,
+        base_len_slot=2,
+    )
+
+
+@pytest.mark.parametrize(
+    "op", ["kv_append", "sdpa_paged_rows", "dsa_indexer_score_decode"]
+)
+@pytest.mark.parametrize("direct", [False, True], ids=["tape", "direct"])
+def test_each_host_reader_of_a_block_takes_it_from_params(op, direct):
+    # Every op that reads its block on the host: fuse_graph refuses the
+    # block as an undeclared input, or as an input params does not name.
+    # The check is on the host, before any kernel runs.
+    p, q = _p(3, 4, 32), _p(3, 4, 32)
+    x, out = _host_param_reader(op, p)
+    with pytest.raises(ValueError, match="other than params"):
+        kq.fuse_graph([x, p], [out], direct=direct)
+    with pytest.raises(ValueError, match="other than params"):
+        kq.fuse_graph([x, q, p], [out], direct=direct, params=1)
+    # The declared block, and a block the tape holds.
+    for ins, params in (([x, p], 1), ([x], -1)):
+        kq.fuse_release(kq.fuse_graph(ins, [out], direct=direct, params=params))
+
+
 @metal
 def test_param_block_under_the_check_lever(monkeypatch):
     # Two recordings at different offsets are the same record.
@@ -930,13 +985,15 @@ def _score_layer(q, keys, wts, tail, p, off):
     )
 
 
-@metal
-@pytest.mark.parametrize("L", [2, 5, 8])
-def test_param_block_offset_of_the_indexer_scores(L, lever_cache):
-    dtype, P, PT = mx.bfloat16, 640, 64
-    key = mx.random.key(3)
-    keys = mx.random.normal((1, P, 128), key=key).astype(dtype)
-    tail = mx.random.normal((1, PT, 128), key=mx.random.key(4)).astype(dtype)
+IP, IPT = 640, 64
+
+
+def _indexer_case(L):
+    """(keys, key tail, weights, q of a seed) of an indexer over IP keys
+    and an IPT-key tail at L queries."""
+    dtype = mx.bfloat16
+    keys = mx.random.normal((1, IP, 128), key=mx.random.key(3)).astype(dtype)
+    tail = mx.random.normal((1, IPT, 128), key=mx.random.key(4)).astype(dtype)
     wts = mx.ones((1, L, 4), dtype) * 0.09
     mx.eval(keys, tail, wts)
 
@@ -945,7 +1002,14 @@ def test_param_block_offset_of_the_indexer_scores(L, lever_cache):
         mx.eval(q)
         return q
 
-    off0 = 4 * P + 3
+    return keys, tail, wts, q_of
+
+
+@metal
+@pytest.mark.parametrize("L", [2, 5, 8])
+def test_param_block_offset_of_the_indexer_scores(L, lever_cache):
+    keys, tail, wts, q_of = _indexer_case(L)
+    off0 = 4 * IP + 3
     q0, p0 = q_of(0), _p(off0)
     out = _score_layer(q0, keys, wts, tail, p0, off0)
     handle = kq.fuse_graph(
@@ -953,18 +1017,53 @@ def test_param_block_offset_of_the_indexer_scores(L, lever_cache):
         [out],
         direct=True,
         params=1,
-        param_ranges=[(0, 4 * 520, 4 * (P + PT))],
+        param_ranges=[(0, 4 * 520, 4 * (IP + IPT))],
     )
     try:
         mx.eval(out)
         for seed, off in enumerate(
-            [off0 + 1, 4 * 600, 4 * 520, 4 * (P + PT) - L, 4 * P + 17, 4 * P + 18]
+            [off0 + 1, 4 * 600, 4 * 520, 4 * (IP + IPT) - L, 4 * IP + 17, 4 * IP + 18]
         ):
             q = q_of(seed + 1)
             got = kq.fused_call(handle, [q, _p(off)])[0]
             assert _same(got, _score_layer(q, keys, wts, tail, None, off)), off
         assert kq.fused_direct_info(handle)["state"] == "replay"
         assert kq.fused_direct_info(handle)["replays"] == 5
+    finally:
+        kq.fuse_release(handle)
+
+
+@metal
+@pytest.mark.parametrize(
+    "case", ["negative range", "block passed twice"], ids=["negative", "twice"]
+)
+def test_an_indexer_record_the_replay_cannot_patch_is_refused(case, lever_cache):
+    # q_offset is a position: a range that lets its slot go below 0 is past
+    # what the indexer takes. And a call that also passes the block as an
+    # earlier input has the record find the block's buffer at an input it
+    # does not declare. Either record is refused; the calls run their
+    # primitives.
+    L = 2
+    keys, tail, wts, q_of = _indexer_case(L)
+    off0 = 4 * IP + 3
+    q0, p0, a0 = q_of(0), _p(off0), _p(0)
+    out = _score_layer(q0, keys, wts, tail, p0, off0)
+    if case == "negative range":
+        ins, params, lo = [q0, p0], 1, -1
+    else:
+        ins, params, lo = [q0, a0, p0], 2, 4 * 520
+    handle = kq.fuse_graph(
+        ins, [out], direct=True, params=params, param_ranges=[(0, lo, 4 * (IP + IPT))]
+    )
+    try:
+        for seed, off in enumerate([off0 + 1, 4 * 600, 4 * IP + 17]):
+            q, p = q_of(seed + 1), _p(off)
+            got = kq.fused_call(handle, [q, p] if params == 1 else [q, p, p])[0]
+            assert _same(got, _score_layer(q, keys, wts, tail, None, off)), off
+        info = kq.fused_direct_info(handle)
+        assert info["state"] == "refused", info
+        want = "past the values" if params == 1 else "does not declare"
+        assert want in info["reason"], info
     finally:
         kq.fuse_release(handle)
 
