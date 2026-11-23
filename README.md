@@ -301,10 +301,21 @@ All optional; the defaults are right for normal use.
   with the kernel, `0` keeps 64. Unset takes 128 for `q3_k` to `q6_k`. Read per call. A/B lever.
 - `KQ_SEG_GX` - row tiles per grid-x group of the NAX `gather_qmm_seg` kernel (default `32`; `0`
   lays the grid out by column, then tile). Read per call. A/B lever.
+- `KQ_SEG_DR` - the most rows (default `16`, at most `32`, `0` off) at which a 64-row tile of
+  `moe_store_seg` or `moe_store_seg_pair` on q5_0, iq4_nl or iq4_xs decodes its weights straight
+  into the tensor-op operands instead of a threadgroup slab. Outputs are bit-identical either way.
+  Read per call. A/B lever.
+- `KQ_SEG_COL_ROWS=1..4` - run wide store tiles of at most that many rows on a per-column path
+  (q5_0, iq4_nl, iq3_xxs, iq4_xs). Outputs differ at rounding level. Read per call. A/B lever.
+- `KQ_QMM_MULTI_ROWS=0` - run `quantized_matmul_multi` at prefill rows as a dispatch per weight
+  instead of one grid. Read once per process. A/B lever.
+- `KQ_NAX_BM128_MIN_TPC` - the fewest threadgroups a GPU core the 128-row NAX tile's grid needs
+  before `quantized_matmul` takes it (default `3`, `0` no floor). Read once per process. A/B lever.
 - `KQ_MOE_DEDUP=0` - on Metal, run the fused MoE gathers at verify widths (2 to 8 rows per
   step) as one dispatch per (row, expert) pair instead of the default dedupe kernels, which
-  dequantize an expert once per pair of rows that select it. Read per call. Outputs are
-  bit-identical either way; `KQ_MOE_HALF=1` keeps its own kernels at every width. A/B lever.
+  dequantize an expert once per pair of rows that select it (2 to 4 rows where the grouped
+  gathers run, `KQ_MOE_GROUP`). Read per call. Outputs are bit-identical either way;
+  `KQ_MOE_HALF=1` keeps its own kernels at every width. A/B lever.
 - `KQ_MOE_QF=0` - on Metal, run the fused MoE gathers of q2_k, q3_k, q4_k, iq4_xs, q4_0, q4_1,
   q5_0, q5_1, iq4_nl, mxfp4, nvfp4 and q2_0 on the generic kernels instead of the kernels built
   on each codec's matrix-vector loop, which give each row's routed experts the same output at
@@ -315,12 +326,25 @@ All optional; the defaults are right for normal use.
   `quantized_matmul_multi`, reading its weights once per call; `0` keeps it in the fused kernels at
   every width. The GLU takes this route when the shared gate and up use one codec that is the
   routed codec, q5_k, q6_k or q8_0, the mix when it has one shared slot or no scores for its shared
-  slots. Read per call. A/B lever.
+  slots. Unset, the route stands down from 7 rows where the grouped GLU runs, and wherever the
+  tiled down runs; set, it holds there too. Read per call. A/B lever.
 - `KQ_MOE_MIX_FORM=loop|sp|dd` - on Metal, force the kernel form of the score-mixed MoE down
   gathers (`gather_qmv_mix_kq`, `gather_qmv_mix_ns_kq`) where it applies: `loop` runs every expert
   slot in one thread, `sp` gives each slot its own simdgroup pair, `dd` is the dedupe row-pair
   kernel. By default `sp` serves launches under 2048 threadgroups and `dd` serves wider ones at 2
-  to 8 rows. Read per call. `loop` and `sp` give identical bytes. A/B lever.
+  to 8 rows, below the grouped and tiled downs. A forced form keeps the grouped and tiled downs off.
+  Read per call. `loop` and `sp` give identical bytes. A/B lever.
+- `KQ_MOE_GROUP` - on Metal, the grouped fused MoE gathers at 5 to 16 rows, which read an expert
+  once for up to eight (row, slot) pairs that route to it. Unset, they run on GPUs with the
+  tensor-op units; `1` runs them on any GPU and `0` keeps the dedupe and per-row kernels. Codecs on
+  the qf kernels keep their bits; the others differ at rounding level. `KQ_MOE_GROUP_MIN_T` and
+  `KQ_MOE_GROUP_MIX_MIN_T` (default `5`) move the floors of the GLU and the down. Read live once
+  set. See [kernels.md](docs/kernels.md#grouped-and-tiled-gathers-at-verify-widths).
+- `KQ_MOE_TILE=0` - on GPUs with the tensor-op units, keep the grouped score-mixed down at 8 to 16
+  rows instead of the tiled one, which sorts the pairs by expert into tiles; a tiled row's bits
+  depend on the call's width. `KQ_MOE_TILE_MIN_T` (default `8`) moves its floor. Read per call.
+  A/B lever. The expert store's levers (`KQ_MOE_STORE_*`) are in
+  [kernels.md](docs/kernels.md#expert-store).
 - `KQ_MOE_SX_SPLIT=<n>` - on Metal, run each shared row of `gather_qmv_mix_kq` as n pieces of
   whole blocks, at most the row's block count and 16 simdgroup pairs in all. By default a one-row
   call runs two pieces when the shared expert is in another codec than the routed experts, and
@@ -348,6 +372,22 @@ All optional; the defaults are right for normal use.
 - `KQ_QMV_C32` - on Metal, the same 32-weight step for the one-row `quantized_matmul` of a grid
   codec, on by default on M5 and later GPUs. `0` restores the per-row kernels, `1` runs it on any
   GPU, and `8` or `16` sets the K-lanes per row. Read per call. A/B lever.
+- `KQ_DENSE_ROWS=0` - on GPUs with the tensor-op units, keep `quantized_matmul` at 2 to 16 rows
+  on its earlier routes instead of the row-class kernel, which serves each codec from the row count
+  in its entry. `KQ_DENSE_ROWS_MIN_M=<m>` serves every codec from m rows. Read per call. See
+  [kernels.md](docs/kernels.md). A/B lever.
+- `KQ_SKINNY_MMA` - the simdgroup-matrix form of `skinny_matmul` where K is a multiple of 8. Unset,
+  it runs on GPUs with the tensor-op units; `1` runs it on any GPU, `0` keeps the column kernel.
+  The two differ at rounding level; in either form a row's bits do not depend on the row count.
+  Read per call. A/B lever.
+- `KQ_SDPA_BS_SPLITS` - pieces each page list of `sdpa_prefill_block_sparse` is split into, with the
+  partial results merged: `0` picks from the grid and the lists, `1` runs one pass, n splits n
+  ways. Unset, `0` on GPUs with the tensor-op units and `1` elsewhere. Split and one-pass outputs
+  differ at rounding level. Read per call. A/B lever.
+- `KQ_HC_EPI_LPR=0|4|8|16` - lanes a `hc_lowrank_epilogue` output's up rows are split over (`0` the
+  one-lane kernel). Unset, `8` on GPUs with the tensor-op units and `0` elsewhere; the two kernels
+  differ at rounding level. `hc_lowrank_mix` folds the norm into its front only when the lanes are
+  not `0`. Read per call. A/B lever.
 
 - `KQ_SDPA_IDX_NAX=0` - run `sdpa_fa_indexed` on its simdgroup kernel even where the NAX tile
   kernel is available. Read once per process. The simdgroup kernel matches `sdpa_fa_verify` over
