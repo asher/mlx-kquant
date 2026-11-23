@@ -53,11 +53,13 @@ inline float kq_glu_clip(float u, float limit) {
 // turns their epilogue into the swiglu_clamp one, with the run-time limit
 // and the sigmoid slope alpha. A GLU kernel takes alpha as KQ_GLU_ALPHA_ARG,
 // bound only with the bit, and passes KQ_GLU_ALPHA to the epilogue.
+// Act situ rides them the same way under bit 6 (kq_situ), with beta as the
+// run-time limit and linear_beta as alpha.
 #define KQ_GLU_ALPHA_SLOT 26
 #define KQ_GLU_ALPHA_ARG      \
   const constant float& alpha \
-      [[buffer(KQ_GLU_ALPHA_SLOT), function_constant(kq_swiglu_oai)]]
-#define KQ_GLU_ALPHA (kq_swiglu_oai ? alpha : 1.0f)
+      [[buffer(KQ_GLU_ALPHA_SLOT), function_constant(kq_glu_alpha_bound)]]
+#define KQ_GLU_ALPHA (kq_glu_alpha_bound ? alpha : 1.0f)
 
 // With kq_shexp_pre a mix kernel reads its shared slots' rows from
 // shexp_pre [T, N], the dense route's product of the shared slots' h
@@ -75,6 +77,18 @@ kq_glu_epilogue(float g, float u, float limit, float alpha = 1.0f) {
     const float g3 = 0.044715f * g * g * g;
     const float t = metal::precise::tanh(0.7978845608028654f * (g + g3));
     return (0.5f * g * (1.0f + t)) * u;
+  }
+  if (ACT == KQ_GLU_ACT_SILU && kq_situ) {
+    // situ (Kimi K3, Inkling 2): beta * tanh(g / beta) * sigmoid(g) on the
+    // gate, linear_beta * tanh(u / linear_beta) on the up branch (a
+    // linear_beta of 0 leaves it as is). beta is the limit, linear_beta
+    // alpha.
+    const float sig = 1.0f / (1.0f + metal::exp(-g));
+    const float a = limit * metal::precise::tanh(g / limit) * sig;
+    if (alpha > 0.0f) {
+      u = alpha * metal::precise::tanh(u / alpha);
+    }
+    return a * u;
   }
   if (ACT == KQ_GLU_ACT_SWIGLU_CLAMP ||
       (ACT == KQ_GLU_ACT_SILU && kq_swiglu_oai)) {

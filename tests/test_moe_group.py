@@ -307,7 +307,8 @@ import mlx_kquant as kq
 
 codec, scodec, T, out_path, act = (
     sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5])
-act_kw = {"silu_limit": {"limit": 0.1}, "swiglu_oai": {"limit": 0.1, "alpha": 1.702}}
+act_kw = {"silu_limit": {"limit": 0.1}, "swiglu_oai": {"limit": 0.1, "alpha": 1.702},
+          "situ": {"limit": 0.2, "alpha": 0.05}}
 rng = np.random.default_rng(31)
 E, N, K, S = 16, 256, 512, 6
 def wire(e, n, k, c):
@@ -328,12 +329,13 @@ scs = mx.array(rng.uniform(0.05, 0.9, size=(T, S + 1)).astype(np.float32))
 outs = {
     "mix": kq.gather_qmv_mix_kq(
         hs, dw, sdw, codec, inds, scs, shexp_kquant_type=scodec),
-    "glu": kq.moe_glu_gather_shexp_kq(
-        x, gw, uw, sgw, suw, codec, inds, act=act, shexp_kquant_type=scodec,
-        **act_kw.get(act, {})),
     "glu_ns": kq.moe_glu_gather_kq(
         x, gw, uw, codec, inds, act=act, **act_kw.get(act, {})),
 }
+if act != "situ":  # the shared-expert GLU has no situ
+    outs["glu"] = kq.moe_glu_gather_shexp_kq(
+        x, gw, uw, sgw, suw, codec, inds, act=act, shexp_kquant_type=scodec,
+        **act_kw.get(act, {}))
 mx.eval(*outs.values())
 np.savez(out_path, **{k: np.array(v.astype(mx.float32)) for k, v in outs.items()})
 """
@@ -360,13 +362,14 @@ def _arm(codec, scodec, T, arm, tmp_path, env=None, act="silu"):
 
 
 @pytest.mark.parametrize("codec,scodec", [("iq3_xxs", "q6_k"), ("q5_0", "q8_0")])
-@pytest.mark.parametrize("act", ["gelu", "silu_limit", "swiglu_oai"])
+@pytest.mark.parametrize("act", ["gelu", "silu_limit", "swiglu_oai", "situ"])
 def test_group_acts_match_per_row(codec, scodec, act, tmp_path):
     """The grouped GLUs apply each activation as the per-row kernels do, on
-    the Ext loops and on the qf loops."""
+    the Ext loops and on the qf loops, with swiglu_oai's and situ's alpha
+    bound."""
     ref, _ = _arm(codec, scodec, 8, "0", tmp_path, act=act)
     got, log = _arm(codec, scodec, 8, "1", tmp_path, act=act)
-    for key in ("glu", "glu_ns"):
+    for key in ref.files:
         rel = np.abs(got[key] - ref[key]).max() / np.abs(ref[key]).max()
         assert rel < 2e-3, (act, key, rel)
     want = "grp_gelu" if act == "gelu" else "grp_silu"

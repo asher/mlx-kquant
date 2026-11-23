@@ -7,15 +7,6 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- `load_gguf(untracked=[...])` loads the named tensors as no-copy views MLX never wires or counts in
-  active memory, so a large table read a few rows at a time stays pageable at any wired limit.
-- `buffer_id` names the memory behind an array without evaluating it or waiting on it, so a caller
-  can tell which arrays share one buffer, such as a KV cache and the views of it.
-- `file_rows` reads rows of a table straight from a file, in parallel, as a lazy node on a CPU
-  stream, so a table too large to hold is looked up without holding the decode loop.
-- `sdpa_sparse_prefill` and `sdpa_sparse_decode` take `score_tail=64` on rows 576 wide: the last 64
-  values of a query and of each row count in the score only, so an absorbed MLA key reads its 512
-  latent and its rope half from one row.
 - `fuse_graph` records a lazy graph once and `fused_call` runs it as one primitive on new inputs of
   the same shapes, with the same bits and less host time per call. `direct=True` replays the recorded
   Metal calls from the second eval on; it needs `env_cache(True)`.
@@ -36,10 +27,6 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the tensor-op units, from 2 queries up, and run faster.
 - `dsa_indexer_score_decode` scores up to 8 queries in one call and takes `keys_tail`, a second key
   segment scored after `keys`, so a verify block over cached and new pooled keys is one dispatch.
-- `dsa_indexer_score_decode` accepts 16 indexer heads and `dsa_topk_indices` a width of 511, the
-  pools a 2048-key budget holds at ratio 4 beside the query's own group.
-- `dsa_indexer_scores` accepts 16 indexer heads, fp32 head weights and `causal_ratio`, the positions
-  one pooled key stands for, so a prefill chunk over pooled keys is scored and masked in one kernel.
 - Expert stores on M5 and later GPUs: `moe_store_pack` copies a MoE layer's routed experts into
   planes, and `moe_store_glu`, `moe_store_down` and `moe_store_seg` run decode, verify and prefill
   rows from them; `moe_store_supported` and `moe_store_seg_supported` say where they run.
@@ -73,6 +60,38 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one pass.
 - `quantized_matmul` at 2 to 16 activation rows on M5 and later GPUs runs faster on most codecs
   (`q6_k` 0.84x the time at 8 rows, 0.57x at 16). Outputs differ at rounding level.
+- `quantized_matmul_multi` at prefill rows runs its two to four weights in one grid, with the same
+  outputs. `KQ_QMM_MULTI_ROWS=0` keeps a dispatch per weight.
+- On M5 and later GPUs, `quantized_matmul` takes 128-row tiles only when their grid fills at least
+  3 threadgroups a core: narrow outputs at prefill rows run 10 to 35% faster, with the same outputs.
+  `KQ_NAX_BM128_MIN_TPC=0` restores the old choice.
+- `q6_k` `quantized_matmul` at prefill rows on M5 and later GPUs runs up to 5% faster, with the same
+  outputs.
+
+## [0.5.13]
+
+### Added
+- `moe_glu_gather_kq(act="situ")` runs the Kimi K3 and Inkling 2 expert activation in the fused gate and
+  up gather, with `limit` as beta and `alpha` as the linear bound (0 leaves the up branch unbounded).
+
+## [0.5.12]
+
+### Added
+- `load_gguf(untracked=[...])` loads the named tensors as no-copy views MLX never wires or counts in
+  active memory, so a large table read a few rows at a time stays pageable at any wired limit.
+- `buffer_id` names the memory behind an array without evaluating it or waiting on it, so a caller
+  can tell which arrays share one buffer, such as a KV cache and the views of it.
+- `file_rows` reads rows of a table straight from a file, in parallel, as a lazy node on a CPU
+  stream, so a table too large to hold is looked up without holding the decode loop.
+- `sdpa_sparse_prefill` and `sdpa_sparse_decode` take `score_tail=64` on rows 576 wide: the last 64
+  values of a query and of each row count in the score only, so an absorbed MLA key reads its 512
+  latent and its rope half from one row.
+- `dsa_indexer_score_decode` accepts 16 indexer heads and `dsa_topk_indices` a width of 511, the
+  pools a 2048-key budget holds at ratio 4 beside the query's own group.
+- `dsa_indexer_scores` accepts 16 indexer heads, fp32 head weights and `causal_ratio`, the positions
+  one pooled key stands for, so a prefill chunk over pooled keys is scored and masked in one kernel.
+
+### Changed
 - `q3_k` matvecs and fused MoE gathers run about 1.15x faster on rows whose width is not a
   multiple of 1024, such as 1536-wide experts (16 experts of 1536 by 1536 on M5 Max).
 - `gather_qmm` at one activation row runs `q8_0` rows under 256 weights about 1.7x faster (64 heads
@@ -87,13 +106,6 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `sdpa_prefill_window` at head dim 256 with a key head per query head runs 1.7x to 1.85x faster
   (64 heads, a 2048 or 4096 row chunk over a 512 window, M5 Max). Outputs differ at rounding level.
   `KQ_SDPA_WINDOW_CB=0` restores the previous kernel.
-- `quantized_matmul_multi` at prefill rows runs its two to four weights in one grid, with the same
-  outputs. `KQ_QMM_MULTI_ROWS=0` keeps a dispatch per weight.
-- On M5 and later GPUs, `quantized_matmul` takes 128-row tiles only when their grid fills at least
-  3 threadgroups a core: narrow outputs at prefill rows run 10 to 35% faster, with the same outputs.
-  `KQ_NAX_BM128_MIN_TPC=0` restores the old choice.
-- `q6_k` `quantized_matmul` at prefill rows on M5 and later GPUs runs up to 5% faster, with the same
-  outputs.
 
 ### Fixed
 - `sdpa_sparse_prefill` no longer returns NaN when window row 0 holds a non-finite value that no

@@ -2834,14 +2834,18 @@ NB_MODULE(_ext, m) {
                 clamped SwiGLU without biases, MiniMax-M3:
                 min(g, limit) * sigmoid(alpha * min(g, limit)) *
                 (clip(u, -limit, limit) + 1); requires limit > 0 and
-                alpha > 0; every codec).
+                alpha > 0; every codec) or 'situ' (Kimi K3 / Inkling 2:
+                beta * tanh(g / beta) * sigmoid(g) * linear_beta *
+                tanh(u / linear_beta), beta from limit and linear_beta
+                from alpha, alpha 0 leaving u as is; requires limit > 0;
+                every codec).
             limit (float): clamp bound for 'silu_limit', 'swiglu_clamp'
-                and 'swiglu_oai'.
+                and 'swiglu_oai'; beta for 'situ'.
             gate_bias (array, optional): per-(expert, out_dim) bias [E, N],
                 'swiglu_clamp' only.
             up_bias (array, optional): same shape, 'swiglu_clamp' only.
             alpha (float): sigmoid slope for 'swiglu_clamp' and
-                'swiglu_oai'.
+                'swiglu_oai'; linear_beta for 'situ'.
             gate_scale (array, optional): float32 scale of the gate
                 product, shape (1,), (N,), (n_experts, 1) or
                 (n_experts, N), applied before the bias and the
