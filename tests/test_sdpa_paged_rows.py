@@ -400,19 +400,31 @@ def _first_only(row):
 @pytest.mark.parametrize("D,page_rows", [(128, 0), (256, 4)])
 @pytest.mark.parametrize("L", [1, 3])
 @pytest.mark.parametrize("window", [0, 3])
-def test_paged_rows_count_a_repeated_page_once(D, page_rows, L, window):
+@pytest.mark.parametrize("splits", [0, 1, 2])
+@pytest.mark.parametrize("order", ["permuted", "ascending"])
+def test_paged_rows_count_a_repeated_page_once(D, page_rows, L, window, splits, order):
     # A page listed three times, and the page each query's end falls in
     # listed while tail_page adds it too: every form counts each page once.
+    # At one and two splits the lists run to several tiles a split, so the
+    # repeats land past a split's first tile, where the per-query walk
+    # searches only past the list's ascending prefix. The ascending lists
+    # hold a -1 before a repeat of their first page: a page after a -1 ends
+    # that prefix.
     rng = np.random.default_rng(D + 3 * L)
     pr = page_rows or TILE[D]
     B, Hq, Hkv = 1, 8, 2
-    base_len = 9 * pr + 1
+    base_len = 40 * pr + 1
     N = base_len + 2 * pr + 3
     q, k, v = _make(rng, B, Hq, Hkv, L, N, D, mx.bfloat16)
-    pages, ends = _verify_pages(rng, L, 6, N - L, pr, shared=3)
-    lists = np.concatenate(
-        [pages[:, :-1], pages[:, :1], pages[:, :1], pages[:, -1:]], axis=1
-    ).astype(np.int32)
+    pages, ends = _verify_pages(rng, L, 20, N - L, pr, shared=3)
+    sel = pages[:, :-1]
+    if order == "ascending":
+        sel = np.sort(sel, axis=1)
+        gap = np.full((L, 1), -1, np.int32)
+        sel = np.concatenate([sel[:, :8], gap, sel[:, :1], sel[:, 8:]], axis=1)
+    lists = np.concatenate([sel, sel[:, :1], sel[:, :1], pages[:, -1:]], axis=1).astype(
+        np.int32
+    )
     scale = 1.0 / D**0.5
     got = kq.sdpa_paged_rows(
         q,
@@ -424,6 +436,7 @@ def test_paged_rows_count_a_repeated_page_once(D, page_rows, L, window):
         k[:, :, base_len:],
         v[:, :, base_len:],
         base_len,
+        splits=splits,
         page_rows=page_rows,
         tail_page=True,
         window=window,
@@ -486,8 +499,10 @@ def test_paged_rows_params_checks():
 def test_paged_rows_ascending_lists(D, page_rows, tail_listed, pad, splits):
     # An ascending list, which may end in a run of -1 entries and may hold
     # the tail page among pages past the query's end: the per-query walk
-    # takes it as ascending and finds the tail page by a binary search. The
-    # call equals listing the tail page last, and the reference.
+    # takes it as ascending. At one split the tail page lands past the
+    # split's first tile and is found by a binary search; at the default
+    # splits each split's first tile searches by a scan. The call equals
+    # listing the tail page last, and the reference.
     rng = np.random.default_rng(D + 7 * pad + int(tail_listed))
     pr = page_rows or TILE[D]
     B, Hq, Hkv, L = 1, 8, 2, 1
