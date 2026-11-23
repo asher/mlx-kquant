@@ -88,6 +88,33 @@ struct KQKvBatch {
   uint64_t v;
 };
 
+// Mirror of the Metal-side KQPagedRowsMeta (kq_sdpa.h, buffer 10); the
+// layouts must match field for field.
+struct KQPagedRowsMeta {
+  int32_t N;
+  int32_t n_pages;
+  int32_t q_len;
+  int32_t base_len;
+  int32_t page_heads;
+  int32_t tail_page;
+  float scale;
+  int32_t win;
+  int32_t gqa;
+  int32_t pad0;
+  uint64_t k_batch;
+  uint64_t k_head;
+  uint64_t k_seq;
+  uint64_t v_batch;
+  uint64_t v_head;
+  uint64_t v_seq;
+  uint64_t kt_batch;
+  uint64_t kt_head;
+  uint64_t kt_seq;
+  uint64_t vt_batch;
+  uint64_t vt_head;
+  uint64_t vt_seq;
+};
+
 KQKvBatch kq_kv_batch(const array& k, const array& v) {
   return {
       static_cast<uint64_t>(k.strides(0)), static_cast<uint64_t>(v.strides(0))};
@@ -1436,6 +1463,265 @@ void KQuantSDPACascade::eval_gpu(
   }
 }
 
+namespace {
+
+// Queries per window of the shared-tile form, or 0 for the per-query form.
+// -1 picks by query count: the per-query form at 1 query and, on the
+// simdgroup-matrix form, at 2; past that windows of at most 4 as even as
+// the count allows (3 + 3 at 6). Fitted on M5 Max at head dim 256, 12
+// query heads a kv head and 4-row pages, where a wider window computes more
+// masked keys than it saves in loads.
+// KQ_PAGED_ROWS_WINDOW (read per dispatch) replaces the pick. A window is
+// cut to fit the 32 mask bits and a threadgroup of 256 rows (128 on the
+// tensor-op form); head dim 512 has no shared-tile kernel.
+int kq_paged_rows_window(int window, int qL, int gqa, int D, bool nax) {
+  int w = window;
+  if (w < 0) {
+    if (const char* e = kq_getenv("KQ_PAGED_ROWS_WINDOW")) {
+      w = std::max(0, std::atoi(e));
+    } else if (qL <= (nax ? 1 : 2)) {
+      w = 0;
+    } else {
+      const int n_win = (qL + 3) / 4;
+      w = (qL + n_win - 1) / n_win;
+    }
+  }
+  if (w == 0 || D == 512) {
+    return 0;
+  }
+  return std::max(1, std::min({w, qL, 32, (nax ? 128 : 256) / gqa}));
+}
+
+// Key splits of the shared-tile form: about 64 threadgroups over the
+// (batch, kv head, window) grid.
+int kq_paged_rows_union_splits(int qL, int win, int heads) {
+  const int n_win = (qL + win - 1) / win;
+  const int cells = std::max(1, heads * n_win);
+  return std::min(128, std::max(4, (64 + cells - 1) / cells));
+}
+
+} // namespace
+
+void KQuantSDPAPagedRows::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  kq_sdpa_check_layout("sdpa_paged_rows", inputs[0], inputs[1], inputs[2]);
+  const bool tails = has_tails_;
+  if (tails &&
+      (inputs[5].strides().back() != 1 || inputs[6].strides().back() != 1)) {
+    throw std::runtime_error(
+        "[mlx_kquant.sdpa_paged_rows] k_tail/v_tail head_dim must be "
+        "contiguous.");
+  }
+  // A copy dispatches on the encoder, so each operand is bound before the
+  // first kernel is set up.
+  const mx::array q = sdpa_q(inputs[0], s, "sdpa_paged_rows q");
+  const mx::array k = sdpa_rows(inputs[1], s, "sdpa_paged_rows k");
+  const mx::array v = sdpa_rows(inputs[2], s, "sdpa_paged_rows v");
+  const mx::array kt =
+      tails ? sdpa_rows(inputs[5], s, "sdpa_paged_rows k_tail") : k;
+  const mx::array vt =
+      tails ? sdpa_rows(inputs[6], s, "sdpa_paged_rows v_tail") : v;
+  const mx::array& pages = inputs[3];
+  const mx::array& ends = inputs[4];
+
+  const int B = q.shape(0);
+  const int n_q_heads = q.shape(1);
+  const int qL = q.shape(2);
+  const int D = q.shape(3);
+  const int n_kv_heads = k.shape(1);
+  const int gqa_factor = n_q_heads / n_kv_heads;
+  const int n_pages = pages.shape(-1);
+
+  const bool patched = tails && param_slot_ >= 0;
+  const int base_len =
+      patched ? kq_param_value(inputs.back(), param_slot_) : base_len_;
+  const int N = tails ? base_len + static_cast<int>(kt.shape(2))
+                      : static_cast<int>(k.shape(2));
+  // Where the parameter sits in the meta bytes of pass 1.
+  auto pm_sites = [&] {
+    if (patched) {
+      kq_param_site(
+          10,
+          offsetof(KQPagedRowsMeta, N),
+          param_slot_,
+          1,
+          static_cast<int>(kt.shape(2)));
+      kq_param_site(10, offsetof(KQPagedRowsMeta, base_len), param_slot_);
+    }
+  };
+  // The form and the split count never depend on the key capacity N: a
+  // cache read as a base and a tail with spare rows gives the bits of the
+  // same rows in one buffer.
+  // The shared-tile form runs on the tensor-op units where the GPU has
+  // them (kq_sdpa_paged_rows_u_nax); KQ_PAGED_ROWS_NAX=0, read per call,
+  // keeps the simdgroup-matrix kernel.
+  const bool nax = D <= 256 && gqa_factor <= 128 &&
+      kq_env_flag("KQ_PAGED_ROWS_NAX", 1) != 0 && kq_is_nax_available();
+  const int win = kq_paged_rows_window(window_, qL, gqa_factor, D, nax);
+  int splits = splits_;
+  if (win > 0 && splits == 0) {
+    splits = kq_paged_rows_union_splits(qL, win, B * n_kv_heads);
+  }
+  if (win == 0 && splits == 0) {
+    const int span = (n_pages + (tail_page_ ? 1 : 0)) * page_rows_;
+    splits = span <= 8192 ? 16 : span <= 24576 ? 32 : span <= 49152 ? 64 : 128;
+  }
+  const bool shared = win > 0;
+
+  KQPagedRowsMeta pm = {};
+  pm.N = N;
+  pm.n_pages = n_pages;
+  pm.q_len = qL;
+  pm.base_len = tails ? base_len : pm.N;
+  pm.page_heads = pages.ndim() == 4 ? n_kv_heads : 1;
+  pm.tail_page = tail_page_ ? 1 : 0;
+  pm.scale = scale_;
+  pm.win = shared ? win : 0;
+  pm.gqa = gqa_factor;
+  pm.k_batch = static_cast<uint64_t>(k.strides(0));
+  pm.k_head = static_cast<uint64_t>(k.strides(1));
+  pm.k_seq = static_cast<uint64_t>(k.strides(2));
+  pm.v_batch = static_cast<uint64_t>(v.strides(0));
+  pm.v_head = static_cast<uint64_t>(v.strides(1));
+  pm.v_seq = static_cast<uint64_t>(v.strides(2));
+  pm.kt_batch = static_cast<uint64_t>(kt.strides(0));
+  pm.kt_head = static_cast<uint64_t>(kt.strides(1));
+  pm.kt_seq = static_cast<uint64_t>(kt.strides(2));
+  pm.vt_batch = static_cast<uint64_t>(vt.strides(0));
+  pm.vt_head = static_cast<uint64_t>(vt.strides(1));
+  pm.vt_seq = static_cast<uint64_t>(vt.strides(2));
+
+  // Coarse per-split partials (float32) + running max/sum, merged by the
+  // decode kernel's pass 2.
+  mx::Shape part_shape = {B, n_q_heads, qL, splits, D};
+  mx::Shape red_shape = {B, n_q_heads, qL, splits};
+  array partials(part_shape, mx::float32, nullptr, {});
+  array sums(red_shape, mx::float32, nullptr, {});
+  array maxs(red_shape, mx::float32, nullptr, {});
+  partials.set_data(mx::allocator::malloc(partials.nbytes()));
+  sums.set_data(mx::allocator::malloc(sums.nbytes()));
+  maxs.set_data(mx::allocator::malloc(maxs.nbytes()));
+
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.add_temporary(partials);
+  ce.add_temporary(sums);
+  ce.add_temporary(maxs);
+
+  std::string ts = kq_type_string(q.dtype());
+  bool off = false;
+  int zero = 0;
+  mx::metal::MTLFCList fc = {
+      {&splits, MTL::DataType::DataTypeInt, 2},
+      {&off, MTL::DataType::DataTypeBool, 3},
+      {&off, MTL::DataType::DataTypeBool, 4},
+      {&off, MTL::DataType::DataTypeBool, 5},
+      {&off, MTL::DataType::DataTypeBool, 6},
+      {&off, MTL::DataType::DataTypeBool, 7},
+      {&off, MTL::DataType::DataTypeBool, 8},
+      {&off, MTL::DataType::DataTypeBool, 9},
+      {&zero, MTL::DataType::DataTypeInt, 10},
+      {&zero, MTL::DataType::DataTypeInt, 11},
+      {&off, MTL::DataType::DataTypeBool, 12},
+  };
+
+  if (shared) {
+    // Pass 1, shared tiles: one threadgroup per (kv head, window, split).
+    const int n_win = (qL + win - 1) / win;
+    // Simdgroup form: at least 8 simdgroups stage the tiles; those past the
+    // rows do no MMA. Tensor-op form: a simdgroup per 16 rows and half the
+    // head dim.
+    const int strips = nax ? 2 * ((gqa_factor * win + 15) / 16)
+                           : std::max(8, (gqa_factor * win + 7) / 8);
+    std::string kname =
+        std::string(
+            nax ? "kq_sdpa_paged_rows_u_nax_" : "kq_sdpa_paged_rows_u_") +
+        ts + "_" + std::to_string(D) + "_p" + std::to_string(page_rows_);
+    std::string hash = kname + "_s" + std::to_string(splits);
+    auto kernel = kq_get_kernel(d, kname, hash, fc);
+    const size_t tg = size_t(32) * strips;
+    if (tg > kernel->maxTotalThreadsPerThreadgroup()) {
+      throw std::runtime_error(
+          "[mlx_kquant.sdpa_paged_rows] threadgroup of " + std::to_string(tg) +
+          " threads exceeds this GPU's pipeline limit (" +
+          std::to_string(kernel->maxTotalThreadsPerThreadgroup()) + ").");
+    }
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(q, 0);
+    ce.set_input_array(k, 1);
+    ce.set_input_array(v, 2);
+    ce.set_output_array(partials, 3);
+    ce.set_output_array(sums, 4);
+    ce.set_output_array(maxs, 5);
+    ce.set_input_array(pages, 6);
+    ce.set_input_array(ends, 7);
+    ce.set_input_array(kt, 8);
+    ce.set_input_array(vt, 9);
+    ce.set_bytes(pm, 10);
+    pm_sites();
+    ce.dispatch_threadgroups(
+        MTL::Size(n_kv_heads, B * n_win, splits), MTL::Size(32, strips, 1));
+  } else {
+    // Pass 1: one threadgroup per (kv head, query, split).
+    std::string kname = "kq_sdpa_paged_rows_1_" + ts + "_" + std::to_string(D) +
+        "_p" + std::to_string(page_rows_);
+    std::string hash = kname + "_s" + std::to_string(splits);
+    auto kernel = kq_get_kernel(d, kname, hash, fc);
+    // Metal turns an oversized dispatch into silent garbage, not an error.
+    const size_t tg = size_t(32) * gqa_factor;
+    if (tg > kernel->maxTotalThreadsPerThreadgroup()) {
+      throw std::runtime_error(
+          "[mlx_kquant.sdpa_paged_rows] threadgroup of " + std::to_string(tg) +
+          " threads exceeds this GPU's pipeline limit (" +
+          std::to_string(kernel->maxTotalThreadsPerThreadgroup()) + ").");
+    }
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(q, 0);
+    ce.set_input_array(k, 1);
+    ce.set_input_array(v, 2);
+    ce.set_output_array(partials, 3);
+    ce.set_output_array(sums, 4);
+    ce.set_output_array(maxs, 5);
+    ce.set_input_array(pages, 6);
+    ce.set_input_array(ends, 7);
+    ce.set_input_array(kt, 8);
+    ce.set_input_array(vt, 9);
+    ce.set_bytes(pm, 10);
+    pm_sites();
+    MTL::Size group_dims(32, gqa_factor, 1);
+    MTL::Size grid_dims(n_kv_heads, B * qL, splits);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  // Pass 2: the decode kernel's merge; grid z is the query axis.
+  {
+    std::string kname = "kq_sdpa_gqa_2pass_2_" + ts + "_" + std::to_string(D);
+    std::string hash = kname + "_s" + std::to_string(splits) + "_k0";
+    auto kernel = kq_get_kernel(d, kname, hash, fc);
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(partials, 0);
+    ce.set_input_array(sums, 1);
+    ce.set_input_array(maxs, 2);
+    ce.set_input_array(sums, 3);
+    ce.set_output_array(out, 4);
+    ce.set_bytes(n_q_heads, 5);
+    ce.set_input_array(sums, 6);
+    for (int i = 7; i <= 9; i++) {
+      ce.set_input_array(sums, i);
+    }
+    ce.set_bytes(zero, 10);
+    ce.set_bytes(zero, 11);
+    MTL::Size group_dims(32, 1, 1);
+    MTL::Size grid_dims(n_q_heads, B, qL);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+  }
+}
+
 void KQuantSDPABSPrefill::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
@@ -1468,8 +1754,29 @@ void KQuantSDPABSPrefill::eval_gpu(
   float scale = scale_;
   int offset = offset_;
 
+  // Few windows over long page lists leave most of the GPU idle: split each
+  // list into runs of whole 32-key tiles (grid z) and merge the partials.
+  // KQ_SDPA_BS_SPLITS, read per call: 0 picks, 1 is one pass, N splits. The
+  // default picks on GPUs with the tensor-op units (the GPUs the splits were
+  // timed on) and is one pass elsewhere.
+  int splits =
+      kq_env_lever_from("KQ_SDPA_BS_SPLITS", kq_is_nax_available() ? 0 : 1, 0);
+  if (splits == 0) {
+    // Causal lists grow along the chunk: size splits by the mean list (at
+    // least 8 tiles a split), not the padded width.
+    const int tgs = n_kv_heads * n_qt;
+    const int mean_pages = std::min(max_pages, (offset_ + n_qt * 2) / 4 + 2);
+    const int tiles = (mean_pages + 7) / 8;
+    splits = tgs >= 512 ? 1 : std::min(8, (1024 + tgs - 1) / tgs);
+    splits = std::max(1, std::min(splits, tiles / 8));
+  }
+  splits = std::min(splits, 128);
+
   std::string ts = kq_type_string(q.dtype());
-  std::string kname = "kq_sdpa_bs_prefill_" + ts + "_" + std::to_string(D);
+  std::string kname =
+      std::string(
+          splits > 1 ? "kq_sdpa_bs_prefill_split_" : "kq_sdpa_bs_prefill_") +
+      ts + "_" + std::to_string(D);
   auto kernel = kq_get_kernel(d, kname, kname, {});
   const size_t tg = (48 / 8) * 32;
   if (tg > kernel->maxTotalThreadsPerThreadgroup()) {
@@ -1479,6 +1786,78 @@ void KQuantSDPABSPrefill::eval_gpu(
         std::to_string(kernel->maxTotalThreadsPerThreadgroup()) + ").");
   }
   auto& ce = mx::metal::get_command_encoder(s);
+  const int rows = n_kv_heads * n_qt * 48;
+  if (splits > 1) {
+    mx::array partials({rows, splits, D}, mx::float32, nullptr, {});
+    mx::array sums({rows, splits}, mx::float32, nullptr, {});
+    mx::array maxs({rows, splits}, mx::float32, nullptr, {});
+    partials.set_data(mx::allocator::malloc(partials.nbytes()));
+    sums.set_data(mx::allocator::malloc(sums.nbytes()));
+    maxs.set_data(mx::allocator::malloc(maxs.nbytes()));
+    ce.add_temporary(partials);
+    ce.add_temporary(sums);
+    ce.add_temporary(maxs);
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(q, 0);
+    ce.set_input_array(k, 1);
+    ce.set_input_array(v, 2);
+    ce.set_input_array(q, 3);
+    ce.set_bytes(S, 4);
+    ce.set_bytes(k_head_stride, 5);
+    ce.set_bytes(k_seq_stride, 6);
+    ce.set_bytes(v_head_stride, 7);
+    ce.set_bytes(v_seq_stride, 8);
+    ce.set_bytes(scale, 9);
+    ce.set_bytes(offset, 10);
+    ce.set_bytes(max_pages, 11);
+    ce.set_input_array(pages, 12);
+    ce.set_input_array(pmask, 13);
+    ce.set_input_array(counts, 14);
+    ce.set_output_array(partials, 15);
+    ce.set_output_array(sums, 16);
+    ce.set_output_array(maxs, 17);
+    ce.dispatch_threadgroups(
+        MTL::Size(n_kv_heads, n_qt, splits), MTL::Size(32, tg / 32, 1));
+
+    // The decode merge over the folded rows: 48 rows a window as its "heads",
+    // the windows of every kv head as its batch, so it writes the folded
+    // output in place of the single pass.
+    bool off = false;
+    int zero = 0;
+    mx::metal::MTLFCList fc = {
+        {&splits, MTL::DataType::DataTypeInt, 2},
+        {&off, MTL::DataType::DataTypeBool, 3},
+        {&off, MTL::DataType::DataTypeBool, 4},
+        {&off, MTL::DataType::DataTypeBool, 5},
+        {&off, MTL::DataType::DataTypeBool, 6},
+        {&off, MTL::DataType::DataTypeBool, 7},
+        {&off, MTL::DataType::DataTypeBool, 8},
+        {&off, MTL::DataType::DataTypeBool, 9},
+        {&zero, MTL::DataType::DataTypeInt, 10},
+        {&zero, MTL::DataType::DataTypeInt, 11},
+        {&off, MTL::DataType::DataTypeBool, 12},
+    };
+    std::string mname = "kq_sdpa_gqa_2pass_2_" + ts + "_" + std::to_string(D);
+    std::string hash = mname + "_s" + std::to_string(splits) + "_k0";
+    auto merge = kq_get_kernel(d, mname, hash, fc);
+    const int heads = 48;
+    ce.set_compute_pipeline_state(merge);
+    ce.set_input_array(partials, 0);
+    ce.set_input_array(sums, 1);
+    ce.set_input_array(maxs, 2);
+    ce.set_input_array(sums, 3);
+    ce.set_output_array(out, 4);
+    ce.set_bytes(heads, 5);
+    ce.set_input_array(sums, 6);
+    for (int i = 7; i <= 9; i++) {
+      ce.set_input_array(sums, i);
+    }
+    ce.set_bytes(zero, 10);
+    ce.set_bytes(zero, 11);
+    ce.dispatch_threadgroups(
+        MTL::Size(heads, n_kv_heads * n_qt, 1), MTL::Size(32, 1, 1));
+    return;
+  }
   ce.set_compute_pipeline_state(kernel);
   ce.set_input_array(q, 0);
   ce.set_input_array(k, 1);
@@ -1495,6 +1874,10 @@ void KQuantSDPABSPrefill::eval_gpu(
   ce.set_input_array(pages, 12);
   ce.set_input_array(pmask, 13);
   ce.set_input_array(counts, 14);
+  // The split partials' slots, unread by the single pass.
+  for (int i = 15; i <= 17; i++) {
+    ce.set_input_array(counts, i);
+  }
   MTL::Size group_dims(32, tg / 32, 1);
   MTL::Size grid_dims(n_kv_heads, n_qt, 1);
   ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -1631,6 +2014,13 @@ void KQuantSDPAFAVerify::eval_gpu(
     std::vector<mx::array>&) {
   throw std::runtime_error(
       "[mlx_kquant.sdpa_fa_verify] requires a Metal build.");
+}
+
+void KQuantSDPAPagedRows::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.sdpa_paged_rows] requires a Metal build.");
 }
 
 void KQuantSDPABSPrefill::eval_gpu(
@@ -2536,6 +2926,26 @@ void KQuantSDPAWindow::eval_cpu(
       "[mlx_kquant.sdpa_prefill_window] has no CPU implementation.");
 }
 
+void KQuantSDPAPagedRows::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.sdpa_paged_rows] has no CPU implementation.");
+}
+
+std::vector<mx::Shape> KQuantSDPAPagedRows::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  return {inputs[0].shape()};
+}
+
+bool KQuantSDPAPagedRows::is_equivalent(const mx::Primitive& other) const {
+  auto& o = static_cast<const KQuantSDPAPagedRows&>(other);
+  return scale_ == o.scale_ && splits_ == o.splits_ &&
+      page_rows_ == o.page_rows_ && base_len_ == o.base_len_ &&
+      has_tails_ == o.has_tails_ && tail_page_ == o.tail_page_ &&
+      window_ == o.window_ && param_slot_ == o.param_slot_;
+}
+
 void KQuantSDPABSPrefill::eval_cpu(
     const std::vector<mx::array>&,
     std::vector<mx::array>&) {
@@ -2935,6 +3345,152 @@ mx::array sdpa_prefill_window(
       s, scale, window, sinks.has_value(), starts.has_value());
   return mx::array(
       {B, n_q_heads, qL, D}, dt, std::move(prim), std::move(inputs));
+}
+
+mx::array sdpa_paged_rows(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    mx::array pages,
+    const std::optional<mx::array>& ends,
+    const std::optional<mx::array>& k_tail,
+    const std::optional<mx::array>& v_tail,
+    int base_len,
+    int splits,
+    int page_rows,
+    bool tail_page,
+    int window,
+    mx::StreamOrDevice s_,
+    const std::optional<mx::array>& params,
+    int base_len_slot) {
+  auto s = mx::to_stream(s_);
+  const std::string op = "[mlx_kquant.sdpa_paged_rows] ";
+  if (params &&
+      (!k_tail || params->dtype() != mx::int32 || params->ndim() != 1 ||
+       base_len_slot < 0 || base_len_slot >= params->size())) {
+    throw std::invalid_argument(
+        op +
+        "params must be an int32 vector holding base_len_slot, with "
+        "k_tail and v_tail.");
+  }
+  if (window < -1 || window > 32) {
+    throw std::invalid_argument(op + "window must be in [-1, 32].");
+  }
+  if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4) {
+    throw std::invalid_argument(op + "q/k/v must be 4-D.");
+  }
+  const int B = q.shape(0);
+  const int n_q_heads = q.shape(1);
+  const int L = q.shape(2);
+  const int D = q.shape(3);
+  const int n_kv_heads = k.shape(1);
+  if (L < 1) {
+    throw std::invalid_argument(op + "q needs at least one query.");
+  }
+  if (D != 64 && D != 128 && D != 256 && D != 512) {
+    throw std::invalid_argument(
+        op + "only head_dim 64/128/256/512 is supported.");
+  }
+  auto dt = q.dtype();
+  if (dt != mx::float16 && dt != mx::bfloat16) {
+    throw std::invalid_argument(op + "q must be float16 or bfloat16.");
+  }
+  if (k.dtype() != dt || v.dtype() != dt) {
+    throw std::invalid_argument(
+        op + "q, k, v must share a dtype (no quantized KV).");
+  }
+  if (k.shape() != v.shape() || k.shape(0) != B || k.shape(3) != D) {
+    throw std::invalid_argument(
+        op + "k and v must both be [B, n_kv_heads, S, D].");
+  }
+  if (n_kv_heads == 0 || n_q_heads % n_kv_heads != 0) {
+    throw std::invalid_argument(
+        op + "n_q_heads must be a multiple of n_kv_heads.");
+  }
+  if (n_q_heads / n_kv_heads > 16) {
+    throw std::invalid_argument(op + "gqa_factor must be <= 16.");
+  }
+  if (splits < 0 || splits > 128) {
+    throw std::invalid_argument(op + "splits must be in [0, 128].");
+  }
+  const int tile = D <= 128 ? 32 : D == 256 ? 16 : 8;
+  if (page_rows == 0) {
+    page_rows = tile;
+  }
+  if (page_rows != tile && !(D == 256 && page_rows == 4)) {
+    throw std::invalid_argument(
+        op +
+        "page_rows not instantiated for this head_dim (0 picks the default; "
+        "4 is available at head_dim 256).");
+  }
+  const bool per_head = pages.ndim() == 4;
+  if (pages.dtype() != mx::int32 || (pages.ndim() != 3 && !per_head) ||
+      pages.shape(0) != B || pages.shape(-2) != L || pages.shape(-1) < 1 ||
+      (per_head && pages.shape(1) != n_kv_heads)) {
+    throw std::invalid_argument(
+        op +
+        "pages must be int32 [B, L, n_pages] or [B, n_kv_heads, L, n_pages] "
+        "with n_pages >= 1 (page size = " +
+        std::to_string(page_rows) + " rows).");
+  }
+  const bool tails = k_tail.has_value();
+  if (tails != v_tail.has_value()) {
+    throw std::invalid_argument(
+        op + "k_tail and v_tail come together or not at all.");
+  }
+  if (tails) {
+    const auto& kt = *k_tail;
+    const auto& vt = *v_tail;
+    if (kt.ndim() != 4 || kt.shape() != vt.shape() || kt.shape(0) != B ||
+        kt.shape(1) != n_kv_heads || kt.shape(3) != D || kt.dtype() != dt ||
+        vt.dtype() != dt) {
+      throw std::invalid_argument(
+          op + "k_tail and v_tail must be [B, n_kv_heads, T, D] in q's dtype.");
+    }
+    if (base_len < 0 || base_len > k.shape(2)) {
+      throw std::invalid_argument(
+          op + "base_len must be in [0, S] with tails.");
+    }
+  } else if (base_len != 0) {
+    throw std::invalid_argument(op + "base_len needs k_tail and v_tail.");
+  }
+  const int N = tails ? base_len + static_cast<int>(k_tail->shape(2))
+                      : static_cast<int>(k.shape(2));
+  mx::array e = ends.has_value()
+      ? *ends
+      : mx::full({B, L}, mx::array(N, mx::int32), mx::int32, s);
+  if (e.dtype() != mx::int32 || e.size() != static_cast<size_t>(B) * L) {
+    throw std::invalid_argument(op + "ends must be int32 [B, L].");
+  }
+
+  auto cont = [&s](const mx::array& a) {
+    return a.strides().back() == 1 ? a : mx::contiguous(a, false, s);
+  };
+  std::vector<mx::array> inputs = {
+      mx::contiguous(q, false, s),
+      cont(k),
+      cont(v),
+      mx::contiguous(pages, false, s),
+      mx::contiguous(mx::reshape(e, {B, L}, s), false, s)};
+  if (tails) {
+    inputs.push_back(cont(*k_tail));
+    inputs.push_back(cont(*v_tail));
+  }
+  if (params) {
+    inputs.push_back(*params);
+  }
+  auto prim = std::make_shared<KQuantSDPAPagedRows>(
+      s,
+      scale,
+      splits,
+      page_rows,
+      base_len,
+      tails,
+      tail_page,
+      window,
+      params ? base_len_slot : -1);
+  return mx::array(q.shape(), dt, std::move(prim), std::move(inputs));
 }
 
 mx::array sdpa_prefill_block_sparse(

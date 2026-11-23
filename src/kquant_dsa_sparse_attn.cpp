@@ -107,7 +107,7 @@ void KQDsaSparseAttention::eval_gpu(
   // dense 512-entry lists keep the 256-wide tile (fewer per-tile softmax
   // rescales / selected[] builds). KQ_DSA_BK=128/256 overrides for tuning.
   static const char* bk_env = [] {
-    const char* e = std::getenv("KQ_DSA_BK");
+    const char* e = kq_getenv("KQ_DSA_BK");
     return e != nullptr && e[0] != '\0' ? e : nullptr;
   }();
   const std::string bk_tag = bk_env
@@ -130,7 +130,7 @@ void KQDsaSparseAttention::eval_gpu(
   const int local_tiles = (std::min(local_window_, localL) + BK - 1) / BK;
   const int pooled_tiles = (topkN + BK - 1) / BK;
   const int total_tiles = local_tiles + pooled_tiles;
-  const char* split_env = std::getenv("KQ_DSA_SPLIT");
+  const char* split_env = kq_getenv("KQ_DSA_SPLIT");
   const bool split_forced_on = split_env && std::string(split_env) == "1";
   const bool split_forced_off = split_env && std::string(split_env) == "0";
   const bool use_split = qL <= 4 &&

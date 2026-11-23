@@ -149,8 +149,9 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
 // covers 16 blocks, two lanes per block; a lane owns 8 qs bytes, so its 16
 // weights are the low and the high nibbles of those bytes, and its x values
 // come in as four float4 reused across the row loop.
-// kVM == 2 (kRows only) dots a second activation row kq_x1 against the same
-// weights, decoding each weight once; each row's sums are the one-row form's.
+// kVM of 2 to 4 (kRows only) dots the activation rows kq_x1 to kq_x3
+// against the same weights, decoding each weight once; each row's sums are
+// the one-row form's.
 template <
     typename T,
     int group_size,
@@ -168,10 +169,13 @@ METAL_FUNC void kq_mxfp4_qmv_impl(
     uint simd_gid,
     uint simd_lid,
     thread float* kq_rows = nullptr,
-    const device T* kq_x1 = nullptr) {
+    const device T* kq_x1 = nullptr,
+    const device T* kq_x2 = nullptr,
+    const device T* kq_x3 = nullptr) {
   static_assert(group_size == KQ_MXFP4_GROUP, "MXFP4 requires gs=32");
   static_assert(bits == 4, "MXFP4 requires bits=4");
-  static_assert(kVM == 1 || (kVM == 2 && kRows), "two rows need kRows");
+  static_assert(
+      kVM == 1 || (kVM >= 2 && kVM <= 4 && kRows), "more rows need kRows");
   constexpr int num_simdgroups = 2;
   constexpr int blocks_per_pass = 16;
   typedef float U;
@@ -199,7 +203,11 @@ METAL_FUNC void kq_mxfp4_qmv_impl(
     float4 yl[kVM][4];
 #pragma unroll
     for (int v = 0; v < kVM; v++) {
-      const device T* xb = (v == 0 ? x : kq_x1) + ib * KQ_MXFP4_GROUP + it * 8;
+      const device T* xb = (v == 0       ? x
+                                : v == 1 ? kq_x1
+                                : v == 2 ? kq_x2
+                                         : kq_x3) +
+          ib * KQ_MXFP4_GROUP + it * 8;
       yl[v][0] = float4(xb[0], xb[1], xb[2], xb[3]);
       yl[v][1] = float4(xb[16], xb[17], xb[18], xb[19]);
       yl[v][2] = float4(xb[4], xb[5], xb[6], xb[7]);
@@ -780,8 +788,9 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
 // group simd_lid % 4 of superblock simd_lid / 4, 8 superblocks per pass; x is
 // read once into four float4 and reused across the unrolled rows.
 // kOutScale entries take the output scale (kq_out_scale.h).
-// kVM == 2 (kRows only) dots a second activation row kq_x1 against the same
-// weights, decoding each weight once; each row's sums are the one-row form's.
+// kVM of 2 to 4 (kRows only) dots the activation rows kq_x1 to kq_x3
+// against the same weights, decoding each weight once; each row's sums are
+// the one-row form's.
 template <
     typename T,
     int group_size,
@@ -801,10 +810,13 @@ METAL_FUNC void kq_nvfp4_qmv_impl(
     uint simd_lid,
     const device float* out_scale = nullptr,
     thread float* kq_rows = nullptr,
-    const device T* kq_x1 = nullptr) {
+    const device T* kq_x1 = nullptr,
+    const device T* kq_x2 = nullptr,
+    const device T* kq_x3 = nullptr) {
   static_assert(group_size == KQ_NVFP4_SUPERBLOCK, "NVFP4 requires gs=64");
   static_assert(bits == 4, "NVFP4 requires bits=4");
-  static_assert(kVM == 1 || (kVM == 2 && kRows), "two rows need kRows");
+  static_assert(
+      kVM == 1 || (kVM >= 2 && kVM <= 4 && kRows), "more rows need kRows");
   constexpr int num_simdgroups = 2;
   constexpr int blocks_per_pass = 8;
   typedef float U;
@@ -833,8 +845,11 @@ METAL_FUNC void kq_nvfp4_qmv_impl(
     float4 yl[kVM][4];
 #pragma unroll
     for (int v = 0; v < kVM; v++) {
-      const device T* xb =
-          (v == 0 ? x : kq_x1) + ib * KQ_NVFP4_SUPERBLOCK + 16 * g;
+      const device T* xb = (v == 0       ? x
+                                : v == 1 ? kq_x1
+                                : v == 2 ? kq_x2
+                                         : kq_x3) +
+          ib * KQ_NVFP4_SUPERBLOCK + 16 * g;
       yl[v][0] = float4(xb[0], xb[1], xb[2], xb[3]);
       yl[v][1] = float4(xb[4], xb[5], xb[6], xb[7]);
       yl[v][2] = float4(xb[8], xb[9], xb[10], xb[11]);

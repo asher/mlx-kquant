@@ -124,7 +124,16 @@ instantiate_kq_ext_sx_q5k(q8_0, KqQ8_0Ext, float16_t)
       "kq_" #codec "_sx2_" #sg "_" #su "_moe_glu_gather_shexp_silu" sfx "_" #type, \
       kq_ext_moe_glu_gather_shexp2, type, traits, sgt, sut, KQ_GLU_ACT_SILU, nx)
 
+#define instantiate_kq_ext_sx2_grp_nx(codec, traits, sg, sgt, su, sut, type, nx, sfx) \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_sx2_" #sg "_" #su "_moe_glu_gather_shexp_grp_silu" sfx "_" #type, \
+      kq_ext_moe_glu_gather_shexp2_grp, type, traits, sgt, sut, KQ_GLU_ACT_SILU, nx)
+
 #define instantiate_kq_ext_sx2(codec, traits, sg, sgt, su, sut)               \
+  instantiate_kq_ext_sx2_grp_nx(codec, traits, sg, sgt, su, sut, bfloat16_t, 8, "") \
+  instantiate_kq_ext_sx2_grp_nx(codec, traits, sg, sgt, su, sut, bfloat16_t, 16, "_nx16") \
+  instantiate_kq_ext_sx2_grp_nx(codec, traits, sg, sgt, su, sut, float16_t, 8, "") \
+  instantiate_kq_ext_sx2_grp_nx(codec, traits, sg, sgt, su, sut, float16_t, 16, "_nx16") \
   instantiate_kq_ext_sx2_nx(codec, traits, sg, sgt, su, sut, bfloat16_t, 8, "") \
   instantiate_kq_ext_sx2_nx(codec, traits, sg, sgt, su, sut, bfloat16_t, 16, "_nx16") \
   instantiate_kq_ext_sx2_nx(codec, traits, sg, sgt, su, sut, bfloat16_t, 32, "_nx32") \
@@ -158,6 +167,8 @@ instantiate_kq_ext_sx2_lowbit(iq1_m, KqIq1_mExt)
       kq_ext_gather_qmv_mix_pair, type, traits, straits, true, nx)
 
 #define instantiate_kq_ext_sx_mix(codec, traits, scodec, straits, type)       \
+  instantiate_kq_ext_grp_mix_nx(#codec "_sx_" #scodec, traits, straits, type, 8, "") \
+  instantiate_kq_ext_grp_mix_nx(#codec "_sx_" #scodec, traits, straits, type, 16, "_nx16") \
   instantiate_kq_ext_sx_mix_nx(codec, traits, scodec, straits, type, 8, "")    \
   instantiate_kq_ext_sx_mix_nx(codec, traits, scodec, straits, type, 16, "_nx16") \
   instantiate_kq_ext_sx_mix_nx(codec, traits, scodec, straits, type, 32, "_nx32") \
@@ -236,6 +247,10 @@ instantiate_kq_ext_c32(iq3_xxs, KqIq3_xxsExt)
 instantiate_kq_ext_c32(iq3_s, KqIq3_sExt)
 instantiate_kq_ext_c32(iq1_s, KqIq1_sExt)
 instantiate_kq_ext_c32(iq1_m, KqIq1_mExt)
+
+// Grouped gathers (kq_moe_glu_kq.h, KQ_MOE_GROUP): the expert codecs of the
+// UD low-bit builds over a q6_k or q8_0 shared expert.
+instantiate_kq_moe_grp_common()
 
 // q6_k/q8_0 mix_ns (generic; no tuned ns kernels exist).
 instantiate_kq_ext_mix_ns(q6_k, KqQ6_KExt)

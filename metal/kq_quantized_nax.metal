@@ -289,6 +289,18 @@ instantiate_kquant_nax_bk128_codec(iq3_s, 256, 3)
 instantiate_kquant_nax_bk128_codec(iq2_xs, 256, 2)
 instantiate_kquant_nax_bk128_codec(iq2_s, 256, 2)
 
+// quantized_matmul_multi at prefill rows, one grid for up to four weights.
+#define instantiate_kquant_nax_bk128_multi(codec, type, bm)                 \
+  instantiate_kernel(                                                        \
+      "kquant_" #codec "_qmm_t_nax_bk128_multi_" #type "_bm" #bm,            \
+      kq_##codec##_qmm_t_nax_bk128_multi,                                    \
+      type,                                                                  \
+      bm)
+instantiate_kquant_nax_bk128_multi(q6_k, float16_t, 64)
+instantiate_kquant_nax_bk128_multi(q6_k, bfloat16_t, 64)
+instantiate_kquant_nax_bk128_multi(q6_k, float16_t, 128)
+instantiate_kquant_nax_bk128_multi(q6_k, bfloat16_t, 128)
+
 // Small-BM gather_qmm_rhs tile for the few-rows-per-expert prefill regime
 // (MoE top-k at chat chunk sizes: rows/E ~ 4-32). Every expert segment in
 // a tile re-runs the full-tile MMA K-loop, so segments/tile ~ BM/(rows/E)+1

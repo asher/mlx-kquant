@@ -42,6 +42,23 @@ instantiate_kq_sdpa_fa_verify_nax_rows(float16_t, 128, 1)
 instantiate_kq_sdpa_fa_verify_nax_rows(bfloat16_t, 128, 2)
 instantiate_kq_sdpa_fa_verify_nax_rows(float16_t, 128, 2)
 
+// Shared-tile pass 1 of sdpa_paged_rows; the page sizes are those of
+// kq_sdpa_paged_rows_u (kq_sdpa.metal).
+#define instantiate_kq_sdpa_paged_rows_u_nax(type, D, PR)              \
+  instantiate_kernel(                                                  \
+      "kq_sdpa_paged_rows_u_nax_" #type "_" #D "_p" #PR,               \
+      kq_sdpa_paged_rows_u_nax,                                        \
+      type, D, PR, 2)
+
+#define instantiate_kq_sdpa_paged_rows_u_nax_t(type)                   \
+  instantiate_kq_sdpa_paged_rows_u_nax(type, 64, 32)                   \
+  instantiate_kq_sdpa_paged_rows_u_nax(type, 128, 32)                  \
+  instantiate_kq_sdpa_paged_rows_u_nax(type, 256, 16)                  \
+  instantiate_kq_sdpa_paged_rows_u_nax(type, 256, 4)
+
+instantiate_kq_sdpa_paged_rows_u_nax_t(bfloat16_t)
+instantiate_kq_sdpa_paged_rows_u_nax_t(float16_t)
+
 // sdpa_decode_gqa pass 1 at head_dim 128 under KQ_GQA_NAX_SPLIT_P=1: the
 // fa_verify kernel, one row group, two d groups, P @ V on split P. The
 // default runs the fa_verify instantiation itself.

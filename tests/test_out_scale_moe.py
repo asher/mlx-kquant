@@ -356,7 +356,9 @@ def _run(T, env):
 # the GLU gathers at NX 8, 16 and 32 and their dedupe form, the down gather,
 # the slot-parallel, dedupe pair and loop mixes, the shared q8_0 stems, and
 # the shared-expert epilogue of the dense route (parts starting kq_moe_).
-# The arms run the Ext kernels unless they set KQ_MOE_QF=1.
+# The arms run the Ext kernels unless they set KQ_MOE_QF=1. The grp arms
+# run the grouped kernels of 5 and 8 rows and their sum (KQ_MOE_GROUP=1:
+# by default they run on GPUs with the tensor-op units only).
 ARMS = {
     "t1": (
         1,
@@ -426,6 +428,50 @@ ARMS = {
             "_qf_gather_qmv_bias_",
             "_qf_gather_qmv_mix_ns_sp_",
             "_qf_sx_nvfp4_moe_glu_gather_shexp_silu",
+        ),
+    ),
+    "grp5": (
+        5,
+        {"KQ_MOE_GROUP": "1"},
+        (
+            "nvfp4_sx_nvfp4_moe_glu_gather_shexp_grp_silu",
+            "nvfp4_sx_q8_0_moe_glu_gather_shexp_grp_silu",
+            "nvfp4_sx_q8_0_gather_qmv_mix_grp",
+            "kq_moe_mix_grp_sum_os_",
+            "kq_moe_shexp_glu_pre_silu_",
+        ),
+    ),
+    "grp8": (
+        8,
+        {"KQ_MOE_GROUP": "1"},
+        (
+            "nvfp4_sx_nvfp4_moe_glu_gather_shexp_grp_silu",
+            "nvfp4_sx_q8_0_moe_glu_gather_shexp_grp_silu",
+            "nvfp4_sx_nvfp4_gather_qmv_mix_grp",
+            "nvfp4_sx_q8_0_gather_qmv_mix_grp",
+            "kq_moe_mix_grp_sum_os_",
+        ),
+    ),
+    "qf_grp5": (
+        5,
+        {"KQ_MOE_QF": "1", "KQ_MOE_GROUP": "1"},
+        (
+            "_qf_sx_nvfp4_moe_glu_gather_shexp_grp_silu",
+            "_qf_sx_q8_0_moe_glu_gather_shexp_grp_silu",
+            "_qf_sx_q8_0_gather_qmv_mix_grp",
+            "kq_moe_mix_grp_sum_os_",
+            "kq_moe_shexp_glu_pre_silu_",
+        ),
+    ),
+    "qf_grp8": (
+        8,
+        {"KQ_MOE_QF": "1", "KQ_MOE_GROUP": "1"},
+        (
+            "_qf_sx_nvfp4_moe_glu_gather_shexp_grp_silu",
+            "_qf_sx_q8_0_moe_glu_gather_shexp_grp_silu",
+            "_qf_sx_nvfp4_gather_qmv_mix_grp",
+            "_qf_sx_q8_0_gather_qmv_mix_grp",
+            "kq_moe_mix_grp_sum_os_",
         ),
     ),
     "qf_loop": (

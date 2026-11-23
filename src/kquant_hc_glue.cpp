@@ -108,7 +108,7 @@ inline int
 kq_hc_threads(K kernel, const std::string& kname, int want, int least) {
   int cap = int(kernel->maxTotalThreadsPerThreadgroup());
   static const int forced = []() {
-    const char* e = std::getenv("KQ_HC_NT");
+    const char* e = kq_getenv("KQ_HC_NT");
     return e != nullptr ? std::atoi(e) : 0;
   }();
   if (forced > 0) {
@@ -121,7 +121,7 @@ kq_hc_threads(K kernel, const std::string& kname, int want, int least) {
         " threads per threadgroup, below the " + std::to_string(least) +
         " it needs.");
   }
-  static const bool log = std::getenv("KQ_HC_NT_LOG") != nullptr;
+  static const bool log = kq_getenv("KQ_HC_NT_LOG") != nullptr;
   if (log) {
     static std::set<std::string> seen;
     if (seen.insert(kname).second) {

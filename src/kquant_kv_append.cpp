@@ -52,8 +52,14 @@ void KQuantKVAppend::eval_gpu(
     args.strides[i] = x.strides()[i];
   }
   args.cap = out.shape(2);
-  args.offset = offset_;
+  args.offset =
+      param_slot_ >= 0 ? kq_param_value(inputs[2], param_slot_) : offset_;
   args.size = static_cast<int64_t>(x.size());
+  if (args.offset < 0 || args.offset + x.shape(2) > args.cap) {
+    throw std::invalid_argument(
+        "[mlx_kquant.kv_append] rows [offset, offset + x.shape[2]) must lie "
+        "within buf.");
+  }
 
   auto& d = mx::metal::device(s.device);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -62,6 +68,10 @@ void KQuantKVAppend::eval_gpu(
   ce.set_input_array(x, 0);
   ce.set_output_array(out, 1);
   ce.set_bytes(args, 2);
+  if (param_slot_ >= 0) {
+    // The low word of the 64-bit offset; the high word stays 0.
+    kq_param_site(2, 56, param_slot_);
+  }
   const size_t tg = x.size() < 256 ? x.size() : 256;
   ce.dispatch_threads(MTL::Size(x.size(), 1, 1), MTL::Size(tg, 1, 1));
 }
@@ -97,7 +107,9 @@ void KQuantKVAppend::eval_cpu(
                     x = mx::array::unsafe_weak_copy(inputs[1]),
                     out = mx::array::unsafe_weak_copy(out),
                     shared,
-                    offset = offset_]() mutable {
+                    offset = param_slot_ >= 0
+                        ? int64_t(kq_param_value(inputs[2], param_slot_))
+                        : offset_]() mutable {
     const size_t item = out.itemsize();
     char* op = out.data<char>();
     if (!shared) {
@@ -131,10 +143,21 @@ void KQuantKVAppend::eval_cpu(
   });
 }
 
-mx::array
-kv_append(mx::array buf, mx::array x, int64_t offset, mx::StreamOrDevice s_) {
+mx::array kv_append(
+    mx::array buf,
+    mx::array x,
+    int64_t offset,
+    mx::StreamOrDevice s_,
+    const std::optional<mx::array>& params,
+    int offset_slot) {
   auto s = mx::to_stream(s_);
   const std::string op = "[mlx_kquant.kv_append]";
+  if (params &&
+      (params->dtype() != mx::int32 || params->ndim() != 1 || offset_slot < 0 ||
+       offset_slot >= params->size())) {
+    throw std::invalid_argument(
+        op + " params must be an int32 vector holding offset_slot.");
+  }
   if (buf.ndim() != 4 || x.ndim() != 4) {
     throw std::invalid_argument(
         op + " buf and x must both be [B, H, rows, D].");
@@ -161,11 +184,15 @@ kv_append(mx::array buf, mx::array x, int64_t offset, mx::StreamOrDevice s_) {
   // moves buf first.
   auto shape = buf.shape();
   auto dtype = buf.dtype();
+  std::vector<mx::array> inputs = {std::move(buf), std::move(x)};
+  if (params) {
+    inputs.push_back(*params);
+  }
   return mx::array(
       std::move(shape),
       dtype,
-      std::make_shared<KQuantKVAppend>(s, offset),
-      {std::move(buf), std::move(x)});
+      std::make_shared<KQuantKVAppend>(s, offset, params ? offset_slot : -1),
+      std::move(inputs));
 }
 
 std::optional<uintptr_t> buffer_id(const mx::array& a) {

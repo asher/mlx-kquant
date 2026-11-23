@@ -72,6 +72,27 @@ def test_skinny_matmul_f32_x_half_w_wide_n(wt, M):
     assert _rel(got, ref) < 3e-5
 
 
+@pytest.mark.parametrize("mma", [None, "1", "0"])
+@pytest.mark.parametrize("xt", [mx.bfloat16, mx.float32])
+def test_skinny_matmul_rows_keep_bits(xt, mma, monkeypatch):
+    """A row's outputs do not depend on how many rows the call has, at a
+    router's shape with N not a multiple of 8, in the default form, the MMA
+    form and the column form (KQ_SKINNY_MMA)."""
+    if mma is None:
+        monkeypatch.delenv("KQ_SKINNY_MMA", raising=False)
+    else:
+        monkeypatch.setenv("KQ_SKINNY_MMA", mma)
+    K, N = 2560, 513
+    mx.random.seed(5)
+    x = (mx.random.normal((16, K)) * 0.5).astype(xt)
+    w = mx.random.normal((N, K)) * 0.02
+    wide = kq.skinny_matmul(x, w)
+    for m in range(1, 16):
+        got = kq.skinny_matmul(x[:m], w)
+        mx.eval(got, wide)
+        assert mx.array_equal(got, wide[:m]).item(), m
+
+
 def test_skinny_matmul_noncontiguous_inputs():
     x = mx.random.normal((4, 4096)).astype(mx.float16).T.swapaxes(0, 1)
     w = mx.random.normal((4096, 64)).astype(mx.float16).T

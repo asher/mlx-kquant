@@ -2267,8 +2267,9 @@ METAL_FUNC void kq_q5_1_dequantize_impl(
   out[gid] = T(d * q5 + m);
 }
 
-// kVM == 2 (kRows only) dots a second activation row kq_x1 against the same
-// weights, decoding each weight once; each row's sums are the one-row form's.
+// kVM of 2 to 4 (kRows only) dots the activation rows kq_x1 to kq_x3
+// against the same weights, decoding each weight once; each row's sums are
+// the one-row form's.
 template <
     typename T,
     int group_size,
@@ -2286,11 +2287,14 @@ METAL_FUNC void kq_q5_1_qmv_fast_impl(
     uint simd_gid,
     uint simd_lid,
     thread float* kq_rows = nullptr,
-    const device T* kq_x1 = nullptr) {
+    const device T* kq_x1 = nullptr,
+    const device T* kq_x2 = nullptr,
+    const device T* kq_x3 = nullptr) {
   static_assert(
       group_size == KQ_Q5_1_GROUP, "Q5_1 kernel requires group_size=32");
   static_assert(bits == 5, "Q5_1 kernel requires bits=5");
-  static_assert(kVM == 1 || (kVM == 2 && kRows), "two rows need kRows");
+  static_assert(
+      kVM == 1 || (kVM >= 2 && kVM <= 4 && kRows), "more rows need kRows");
 
   constexpr int num_simdgroups = 2;
   constexpr int block_stride = 16;
@@ -2323,7 +2327,11 @@ METAL_FUNC void kq_q5_1_qmv_fast_impl(
     U sumy[kVM];
 #pragma unroll
     for (int v = 0; v < kVM; v++) {
-      const device T* xv = v == 0 ? x : kq_x1;
+      const device T* xv =
+          (v == 0       ? x
+               : v == 1 ? kq_x1
+               : v == 2 ? kq_x2
+                        : kq_x3);
       sumy[v] = U(0);
 #pragma unroll
       for (int i = 0; i < 8; i += 2) {

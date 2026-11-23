@@ -6,15 +6,17 @@
 //     optional biases with act "swiglu_clamp", mxfp4/nvfp4 only; act
 //     "swiglu_oai" rides the silu kernels under out-scale bit 4) and
 //     gather_qmv_kq, per-codec kernels (full codec matrix).
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 
-#include <optional>
 #include "kquant.h"
 #include "kquant_codec.h" // codec_by_name
 #include "kquant_internal.h" // kq_type_string
@@ -65,9 +67,9 @@ inline std::string kq_gather_stem(const std::string& t, int K) {
 // exists at all (interleaved A/B flips it in-process); unset costs one
 // static check.
 inline int kq_moe_nx_env() {
-  static const bool has_env = std::getenv("KQ_MOE_NX") != nullptr;
+  static const bool has_env = kq_getenv("KQ_MOE_NX") != nullptr;
   if (has_env) {
-    const char* e = std::getenv("KQ_MOE_NX");
+    const char* e = kq_getenv("KQ_MOE_NX");
     const int v = e == nullptr ? 0 : std::atoi(e);
     if (v == 8 || v == 16 || v == 32) {
       return v;
@@ -138,10 +140,70 @@ inline bool kq_moe_dedup(int T, int max_t) {
   if (T < 2 || T > max_t) {
     return false;
   }
-  static const bool has_env = std::getenv("KQ_MOE_DEDUP") != nullptr;
+  static const bool has_env = kq_getenv("KQ_MOE_DEDUP") != nullptr;
   return !has_env || kq_env_flag("KQ_MOE_DEDUP", 1) != 0;
 }
 constexpr int KQ_DD_MAX_T = 8;
+
+// Grouped gathers (KQ_MOE_GROUP): at 2 to 16 rows the "_grp" kernels read an
+// expert once per eight (row, slot) pairs that route to it, where the pair
+// kernels read it once per two. Each kernel finds its pairs' runs from the
+// indices, so no table goes ahead of it. Every codec and shared-expert codec of
+// the fused gathers has them (kq_moe_group_form). KQ_MOE_GROUP_MIN_T and
+// KQ_MOE_GROUP_MIX_MIN_T set the fewest rows of the grouped GLU and of the
+// grouped score-mixed down (read per call). On M5 Max the grouped forms
+// lose at 3 rows, tie at 4 and win from 5 (Qwen3.8-Flash-Next verify
+// forward). They are on by default on GPUs with the tensor-op units, the
+// GPUs they were timed on; KQ_MOE_GROUP=1 turns them on elsewhere and 0 off
+// (read live once set). The kernels themselves run on any Metal GPU.
+constexpr int KQ_GRP_MAX_T = 16;
+constexpr int KQ_GRP_GLU_MIN_T = 5;
+constexpr int KQ_GRP_MIX_MIN_T = 5;
+constexpr int KQ_GRP_DENSE_OFF_MIN_T = 7;
+// Output tiles a grouped score-mixed down threadgroup takes, so that one
+// search for its run serves them (KQ_MOE_GROUP_MIX_NT); a row's bits do not
+// depend on it.
+constexpr int KQ_GRP_MIX_NT = 2;
+inline bool kq_moe_group(int T) {
+  if (T < 2 || T > KQ_GRP_MAX_T) {
+    return false;
+  }
+  static const bool has_env = kq_getenv("KQ_MOE_GROUP") != nullptr;
+  if (has_env) {
+    return kq_env_flag("KQ_MOE_GROUP", 1) != 0;
+  }
+#ifdef _METAL_
+  return kq_is_nax_available();
+#else
+  return false;
+#endif
+}
+
+inline bool kq_moe_group_glu(int T) {
+  return kq_moe_group(T) &&
+      T >= kq_env_lever_from("KQ_MOE_GROUP_MIN_T", KQ_GRP_GLU_MIN_T, 2);
+}
+
+// A forced KQ_MOE_MIX_FORM names one of the ungrouped forms, so the grouped
+// down stands aside for it.
+inline bool kq_moe_group_mix(int T) {
+  static const bool has_form = kq_getenv("KQ_MOE_MIX_FORM") != nullptr;
+  if (has_form) {
+    const char* e = kq_getenv("KQ_MOE_MIX_FORM");
+    const std::string v = e == nullptr ? "" : e;
+    if (v == "loop" || v == "sp" || v == "dd") {
+      return false;
+    }
+  }
+  return kq_moe_group(T) &&
+      T >= kq_env_lever_from("KQ_MOE_GROUP_MIX_MIN_T", KQ_GRP_MIX_MIN_T, 2);
+}
+
+// K-lanes per row of the grouped kernels, which have 8 and 16.
+inline int kq_moe_group_nx(int64_t rows, int K, bool wide_ok) {
+  const int nx = kq_moe_pick_nx(rows, K, wide_ok);
+  return nx > 16 ? 16 : nx;
+}
 
 inline const char* kq_nx_suffix(int nx) {
   return nx == 32 ? "_nx32" : (nx == 16 ? "_nx16" : "");
@@ -179,9 +241,9 @@ inline int kq_moe_fit_sg(K kernel, int sg) {
 inline int kq_moe_pick_sg(const std::string& codec, int N, int nx) {
   const int rps = 32 / nx;
   int sg = codec == "iq2_xs" ? 8 : 2;
-  static const bool has_env = std::getenv("KQ_MOE_SG") != nullptr;
+  static const bool has_env = kq_getenv("KQ_MOE_SG") != nullptr;
   if (has_env) {
-    const char* e = std::getenv("KQ_MOE_SG");
+    const char* e = kq_getenv("KQ_MOE_SG");
     const int v = e == nullptr ? 0 : std::atoi(e);
     if (v == 2 || v == 4 || v == 8) {
       sg = v;
@@ -207,7 +269,7 @@ inline bool kq_moe_sp(int64_t coarse_tgs, int S) {
   if (S < 2 || S > 16) {
     return false; // threadgroup is 64 * S threads; 1024 cap => S <= 16
   }
-  static const bool has_env = std::getenv("KQ_MOE_SP") != nullptr;
+  static const bool has_env = kq_getenv("KQ_MOE_SP") != nullptr;
   const int v = has_env ? kq_env_flag("KQ_MOE_SP", -1) : -1;
   return v == -1 ? coarse_tgs < 2048 : v != 0;
 }
@@ -273,9 +335,9 @@ inline bool kq_moe_shexp_multi() {
 enum { KQ_MIX_LOOP = 0, KQ_MIX_SP = 1, KQ_MIX_DD = 2 };
 
 inline int kq_moe_mix_form(bool sp_ok, bool dd_ok) {
-  static const bool has_env = std::getenv("KQ_MOE_MIX_FORM") != nullptr;
+  static const bool has_env = kq_getenv("KQ_MOE_MIX_FORM") != nullptr;
   if (has_env) {
-    const char* e = std::getenv("KQ_MOE_MIX_FORM");
+    const char* e = kq_getenv("KQ_MOE_MIX_FORM");
     const std::string v = e == nullptr ? "" : e;
     if (v == "loop") {
       return KQ_MIX_LOOP;
@@ -292,7 +354,7 @@ inline int kq_moe_mix_form(bool sp_ok, bool dd_ok) {
 
 // KQ_MOE_NX_LOG=1: print each fused-MoE kernel name once (dispatch audit).
 inline void kq_moe_log_kname(const std::string& kname, int cap = 0) {
-  static const bool log = std::getenv("KQ_MOE_NX_LOG") != nullptr;
+  static const bool log = kq_getenv("KQ_MOE_NX_LOG") != nullptr;
   if (!log) {
     return;
   }
@@ -438,11 +500,11 @@ inline std::string kq_gather_stem_nx(const std::string& t, int K, int nx) {
 // budget. An activation past the half range (65504) turns to inf in the
 // staged row.
 inline bool kq_moe_half(const std::string& codec, int K) {
-  static const bool has_env = std::getenv("KQ_MOE_HALF") != nullptr;
+  static const bool has_env = kq_getenv("KQ_MOE_HALF") != nullptr;
   if (!has_env) {
     return false;
   }
-  const char* e = std::getenv("KQ_MOE_HALF");
+  const char* e = kq_getenv("KQ_MOE_HALF");
   if (e == nullptr || std::atoi(e) != 1) {
     return false;
   }
@@ -458,9 +520,9 @@ inline bool kq_moe_half(const std::string& codec, int K) {
 inline int kq_moe_pick_sg_h(int N, int nx) {
   const int rps = 32 / nx;
   int sg = 8;
-  static const bool has_env = std::getenv("KQ_MOE_SG") != nullptr;
+  static const bool has_env = kq_getenv("KQ_MOE_SG") != nullptr;
   if (has_env) {
-    const char* e = std::getenv("KQ_MOE_SG");
+    const char* e = kq_getenv("KQ_MOE_SG");
     const int v = e == nullptr ? 0 : std::atoi(e);
     if (v == 2 || v == 4 || v == 8) {
       sg = v;
@@ -537,7 +599,7 @@ inline int kq_moe_c32_down_nx() {
 }
 
 inline bool kq_gather_fine(int64_t coarse_tgs) {
-  static const bool has_env = std::getenv("KQ_GATHER_FINE") != nullptr;
+  static const bool has_env = kq_getenv("KQ_GATHER_FINE") != nullptr;
   const int v = has_env ? kq_env_flag("KQ_GATHER_FINE", -1) : -1;
   return v == -1 ? coarse_tgs < 2048 : v != 0;
 }
@@ -566,7 +628,7 @@ inline bool kq_moe_qf_on(const std::string& t) {
   if (kq_qf_rps(t) == 0 || kq_moe_nx_env() != 0) {
     return false;
   }
-  static const bool has_env = std::getenv("KQ_MOE_QF") != nullptr;
+  static const bool has_env = kq_getenv("KQ_MOE_QF") != nullptr;
   return !has_env || kq_env_flag("KQ_MOE_QF", 1) != 0;
 }
 
@@ -601,6 +663,310 @@ inline bool kq_qf_shexp_ok(const std::string& t, const std::string& st, int K) {
   return st == t ||
       ((st == "q5_k" || st == "q6_k" || st == "q8_0") && K % 256 == 0);
 }
+
+// The grouped kernel family of a call on expert codec t with shared codec
+// st ("" for a call with no shared expert). qf_shape says the plain call
+// could take the qf kernels (a score-mixed down with other than one shared
+// slot cannot).
+//   KQ_GRP_QF: the plain call takes the qf kernels. The grouped qf kernels
+//     run the same loop over four rows a pass, so a row keeps the bits of the
+//     plain qf kernels at every call width.
+//   KQ_GRP_NONE: the half-dot kernels (KQ_MOE_HALF) have no grouped form.
+//   KQ_GRP_EXT: every other call, on the grouped Ext loops.
+// KQ_MOE_GROUP_QF=0 puts every qf codec on the grouped Ext loops, whose
+// rows differ from a one-row call by rounding (read per call).
+constexpr int KQ_GRP_NONE = 0;
+constexpr int KQ_GRP_EXT = 1;
+constexpr int KQ_GRP_QF = 2;
+inline int kq_moe_group_form(
+    const std::string& t,
+    const std::string& st,
+    int N,
+    int K,
+    bool qf_shape = true) {
+  if (kq_moe_half(t, K)) {
+    return KQ_GRP_NONE;
+  }
+  const bool qf = qf_shape && kq_moe_qf(t, N, K) &&
+      (st.empty() || kq_qf_shexp_ok(t, st, K));
+  if (!qf || kq_env_lever_from("KQ_MOE_GROUP_QF", 1, 0) == 0) {
+    return KQ_GRP_EXT;
+  }
+  return KQ_GRP_QF;
+}
+
+// "kq_<stem>_<op>_grp...": the shared codec is in the name also when it is
+// the routed one, and a q6_k or q8_0 pair is the "_ext" instantiation.
+inline std::string
+kq_moe_group_stem(int form, const std::string& t, const std::string& st) {
+  const std::string sx = st.empty() ? t : st;
+  if (form == KQ_GRP_QF) {
+    return t + "_qf_sx_" + sx;
+  }
+  if (sx == t && (t == "q6_k" || t == "q8_0")) {
+    return t + "_ext_sx_" + t + "_ext";
+  }
+  return t + "_sx_" + sx;
+}
+
+// KQ_MOE_SHEXP_DENSE is set: the route follows it, ahead of the tiled
+// kernels' own shared tiles.
+inline bool kq_moe_shexp_dense_forced() {
+  const char* e = kq_getenv("KQ_MOE_SHEXP_DENSE");
+  return e != nullptr && e[0] != '\0';
+}
+
+// The route for an op on expert codec t with shared codec st. The grouped
+// kernels read the shared expert once per eight rows (once per row on the
+// qf loops), and from 7 rows the route's three dispatches cost more than
+// they save beside them (Qwen3.8-Flash-Next verify forward on M5 Max), so
+// the route stands down there unless KQ_MOE_SHEXP_DENSE is set.
+inline bool kq_moe_shexp_dense(
+    int T,
+    const std::string& t,
+    const std::string& st,
+    int N,
+    int K) {
+  const char* e = kq_getenv("KQ_MOE_SHEXP_DENSE");
+  if ((e == nullptr || e[0] == '\0') && T >= KQ_GRP_DENSE_OFF_MIN_T &&
+      kq_moe_group_glu(T) && kq_moe_group_form(t, st, N, K) != KQ_GRP_NONE) {
+    return false;
+  }
+  return kq_moe_shexp_dense(T);
+}
+
+// Tiled score-mixed down (kq_moe_tile.h, KQ_MOE_TILE, default on; 0 keeps
+// the grouped kernels, read per call): at KQ_MOE_TILE_MIN_T to 16 rows on a
+// GPU with the tensor-op units the pairs are sorted by expert into tiles of
+// up to eight, and a tile reads its expert once, a lane an output column.
+// The shared slots run as tiles too, so the dense route stands down. Every
+// codec pair of the grouped Ext kernels has the kernel but nvfp4; a call
+// with output scales, the half-dot kernels, a forced KQ_MOE_MIX_FORM and
+// KQ_MOE_GROUP=0 keep their kernels. A row's bits depend on the call's
+// width. On M5 Max (Qwen3.8-Flash-Next, K 640, N 2560) the tiled down took
+// 146 to 149 us a layer against 154 to 165 for the grouped one at 8 rows
+// and 261 against 338 at 16; with the floor at 4 the MoE block tied.
+constexpr int KQ_TL_MIX_MIN_T = 8;
+inline bool kq_moe_tile_ok(
+    int T,
+    const std::string& t,
+    const std::string& st,
+    int K,
+    int bits) {
+#ifdef _METAL_
+  if (T > KQ_GRP_MAX_T || bits != 0 || K % 32 != 0) {
+    return false;
+  }
+  if (t == "nvfp4" || st == "nvfp4" || kq_moe_half(t, K)) {
+    return false;
+  }
+  return kq_moe_group(T) && kq_env_flag("KQ_MOE_TILE", 1) != 0 &&
+      kq_is_nax_available();
+#else
+  (void)T;
+  (void)t;
+  (void)st;
+  (void)K;
+  (void)bits;
+  return false;
+#endif
+}
+
+inline bool kq_moe_tile_mix(
+    int T,
+    const std::string& t,
+    const std::string& st,
+    int N,
+    int K,
+    int bits) {
+  static const bool has_form = kq_getenv("KQ_MOE_MIX_FORM") != nullptr;
+  if (has_form) {
+    const char* e = kq_getenv("KQ_MOE_MIX_FORM");
+    if (e != nullptr && e[0] != '\0') {
+      return false;
+    }
+  }
+  return N % 4 == 0 &&
+      T >= kq_env_lever_from("KQ_MOE_TILE_MIN_T", KQ_TL_MIX_MIN_T, 2) &&
+      kq_moe_tile_ok(T, t, st, K, bits);
+}
+
+#ifdef _METAL_
+// The tiled score-mixed down: kq_moe_tile_plan sorts the pairs and their
+// activation rows into tile order, the tile kernel writes every pair's row
+// sums [pairs, N], and kq_moe_tile_combine adds each row's slots under
+// their scores. NS == 0 is the call with no shared expert (sw is then w).
+inline void kq_gather_qmv_mix_tile_gpu(
+    mx::metal::Device& d,
+    const mx::Stream& s,
+    const std::string& t,
+    const std::string& st,
+    const mx::array& w,
+    const mx::array& sw,
+    const mx::array& x,
+    const mx::array& indices,
+    const mx::array& scores,
+    mx::array& out,
+    int T,
+    int S,
+    int N,
+    int K,
+    int NS) {
+  const int pairs = T * S;
+  const std::string type = kq_type_string(x.dtype());
+  // The staged tile reads eight rows from a tile's first, so the last tile
+  // may read up to seven rows past the pairs; their sums are not stored.
+  mx::array hg({pairs + 7, K}, x.dtype(), nullptr, {});
+  mx::array tiles({pairs, 4}, mx::uint32, nullptr, {});
+  mx::array place({T * (S - NS) + 1}, mx::uint32, nullptr, {});
+  mx::array y({pairs, N}, x.dtype(), nullptr, {});
+  hg.set_data(mx::allocator::malloc(hg.nbytes()));
+  tiles.set_data(mx::allocator::malloc(tiles.nbytes()));
+  place.set_data(mx::allocator::malloc(place.nbytes()));
+  y.set_data(mx::allocator::malloc(y.nbytes()));
+  auto& ce = mx::metal::get_command_encoder(s);
+
+  const std::string pname = "kq_moe_tile_plan_" + type;
+  auto pk = kq_get_kernel(d, pname);
+  kq_moe_log_kname(pname, int(pk->maxTotalThreadsPerThreadgroup()));
+  ce.set_compute_pipeline_state(pk);
+  ce.set_input_array(indices, 0);
+  ce.set_input_array(x, 1);
+  ce.set_output_array(hg, 2);
+  ce.set_output_array(tiles, 3);
+  ce.set_output_array(place, 4);
+  ce.set_bytes(K, 5);
+  ce.set_bytes(S, 6);
+  ce.set_bytes(NS, 7);
+  ce.set_bytes(T, 8);
+  MTL::Size pgroup(32, 1, 1);
+  MTL::Size pgrid(pairs, 1, 1);
+  kq_log_dispatch(pname, x, hg, pgrid, pgroup);
+  ce.dispatch_threadgroups(pgrid, pgroup);
+
+  const std::string kname = "kq_" + kq_moe_group_stem(KQ_GRP_EXT, t, st) +
+      "_gather_qmv_mix_tl_" + type;
+  auto kernel = kq_get_kernel(d, kname);
+  kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(w, 0);
+  ce.set_input_array(sw, 1);
+  ce.set_input_array(hg, 2);
+  ce.set_input_array(tiles, 3);
+  ce.set_output_array(y, 5);
+  ce.set_bytes(K, 6);
+  ce.set_bytes(N, 7);
+  ce.set_bytes(NS, 9);
+  const int COLR = kq_env_lever_from("KQ_MOE_TILE_COL_ROWS", 2, 0);
+  ce.set_bytes(COLR, 10);
+  MTL::Size group_dims(32, 2, 1);
+  MTL::Size grid_dims((N + 63) / 64, pairs, 1);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+
+  const std::string cname = "kq_moe_tile_combine_" + type;
+  auto ck = kq_get_kernel(d, cname);
+  kq_moe_log_kname(cname, int(ck->maxTotalThreadsPerThreadgroup()));
+  ce.set_compute_pipeline_state(ck);
+  ce.set_input_array(y, 0);
+  ce.set_input_array(scores, 1);
+  ce.set_output_array(out, 2);
+  ce.set_bytes(N, 3);
+  ce.set_bytes(S, 4);
+  const int SC = scores.shape(1);
+  ce.set_bytes(SC, 5);
+  ce.set_bytes(NS, 6);
+  ce.set_input_array(place, 7);
+  MTL::Size cgroup(std::min(N / 4, 256), 1, 1);
+  MTL::Size cgrid(N / 4, 1, T);
+  kq_log_dispatch(cname, x, out, cgrid, cgroup);
+  ce.dispatch_threads(cgrid, cgroup);
+  ce.add_temporary(hg);
+  ce.add_temporary(tiles);
+  ce.add_temporary(place);
+  ce.add_temporary(y);
+}
+
+// A grouped score-mixed down (form KQ_GRP_EXT or KQ_GRP_QF): the grouped
+// kernel writes every (row, slot) pair's row sums to a float32 [T, S, N]
+// temporary and kq_moe_mix_grp_sum adds each row's slots under their
+// scores. NS == 0 is the call with no shared expert (sw is then w).
+inline void kq_gather_qmv_mix_grp_gpu(
+    mx::metal::Device& d,
+    const mx::Stream& s,
+    int form,
+    const std::string& t,
+    const std::string& st,
+    const mx::array& w,
+    const mx::array& sw,
+    const mx::array& x,
+    const mx::array& indices,
+    const mx::array& scores,
+    mx::array& out,
+    int T,
+    int S,
+    int N,
+    int K,
+    int NS,
+    const std::vector<mx::array>& inputs,
+    int os_bits) {
+  const bool qf = form == KQ_GRP_QF;
+  const bool pre = (os_bits & KQ_MOE_SHEXP_PRE) != 0;
+  const int n_route = S - NS;
+  mx::array part({T, S, N}, mx::float32, nullptr, {});
+  part.set_data(mx::allocator::malloc(part.nbytes()));
+  auto& ce = mx::metal::get_command_encoder(s);
+  const int nx = !qf && kq_moe_nx_env() == 16 ? 16 : 8;
+  const int nt = kq_env_lever_from("KQ_MOE_GROUP_MIX_NT", KQ_GRP_MIX_NT, 1);
+  const std::string kname = "kq_" + kq_moe_group_stem(form, t, st) +
+      "_gather_qmv_mix_grp" + kq_nx_suffix(nx) + "_" +
+      kq_type_string(x.dtype());
+  auto kernel = kq_get_kernel_os(d, kname, os_bits, nullptr);
+  kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(w, 0);
+  ce.set_input_array(sw, 1);
+  ce.set_input_array(x, 2);
+  ce.set_input_array(indices, 3);
+  ce.set_output_array(part, 5);
+  ce.set_bytes(K, 6);
+  ce.set_bytes(N, 7);
+  ce.set_bytes(S, 8);
+  ce.set_bytes(NS, 9);
+  ce.set_bytes(nt, 10);
+  const int sg = qf ? 2 : kq_moe_fit_sg(kernel, kq_moe_pick_sg(t, N, nx));
+  const int tile = qf ? 2 * kq_qf_rps(t) : sg * 32 / nx;
+  MTL::Size group_dims(32, sg, 1);
+  MTL::Size grid_dims((N / tile + nt - 1) / nt, pre ? n_route : S, T);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+
+  // The nvfp4 kernels, which take output scales, have their own sum.
+  const bool os = t == "nvfp4";
+  const std::string sname = std::string("kq_moe_mix_grp_sum_") +
+      (os ? "os_" : "") + kq_type_string(x.dtype());
+  auto sk = kq_get_kernel_os(
+      d, sname, os ? os_bits : os_bits & KQ_MOE_SHEXP_PRE, nullptr);
+  kq_moe_log_kname(sname, int(sk->maxTotalThreadsPerThreadgroup()));
+  ce.set_compute_pipeline_state(sk);
+  ce.set_input_array(part, 0);
+  ce.set_input_array(scores, 1);
+  ce.set_output_array(out, 2);
+  ce.set_bytes(N, 3);
+  ce.set_bytes(S, 4);
+  const int SC = scores.shape(1);
+  ce.set_bytes(SC, 5);
+  ce.set_bytes(NS, 6);
+  ce.set_input_array(indices, 7);
+  kq_moe_bind_scales(ce, inputs, os_bits, false);
+  MTL::Size sgroup(std::min(N, 256), 1, 1);
+  MTL::Size sgrid(N, 1, T);
+  kq_log_dispatch(sname, x, out, sgrid, sgroup);
+  ce.dispatch_threads(sgrid, sgroup);
+  ce.add_temporary(part);
+}
+
+#endif // _METAL_
 
 // Slot-parallel or loop form of a qf score-mixed down, by the same rule as
 // the Ext forms (kq_moe_sp, KQ_MOE_MIX_FORM=loop|sp).
@@ -808,6 +1174,50 @@ void KQuantMoEGLUKQ::eval_gpu(
   int N = gw.shape(1);
   int K = x.shape(-1);
 
+  // Grouped form: the shared-expert grouped kernel with no shared slots,
+  // the expert stacks standing in for its shared operands.
+  const int gform = !biased && kq_moe_group_glu(T)
+      ? kq_moe_group_form(kquant_type_, "", N, K)
+      : KQ_GRP_NONE;
+  if (gform != KQ_GRP_NONE) {
+    const bool gqf = gform == KQ_GRP_QF;
+    const int nx = gqf ? 8 : kq_moe_group_nx((int64_t)N * R * T, K, true);
+    const bool goai = (out_scale_bits_ & KQ_MOE_SWIGLU_OAI) != 0;
+    const std::string kname = "kq_" +
+        kq_moe_group_stem(gform, kquant_type_, "") +
+        "_moe_glu_gather_shexp_grp_" +
+        (act_ == "gelu" && !goai ? "gelu" : "silu") + kq_nx_suffix(nx) + "_" +
+        kq_type_string(x.dtype());
+    auto kernel = kq_get_kernel_os(d, kname, out_scale_bits_, nullptr);
+    kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
+    auto& ce = mx::metal::get_command_encoder(s);
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(gw, 0);
+    ce.set_input_array(uw, 1);
+    ce.set_input_array(gw, 2);
+    ce.set_input_array(uw, 3);
+    ce.set_input_array(x, 4);
+    ce.set_input_array(indices, 5);
+    ce.set_output_array(out, 6);
+    ce.set_bytes(K, 7);
+    ce.set_bytes(N, 8);
+    ce.set_bytes(limit_, 9);
+    const int NS = 0;
+    ce.set_bytes(NS, 10);
+    if (goai) {
+      ce.set_bytes(alpha_, kq_glu_alpha_slot);
+    }
+    kq_moe_bind_scales(ce, inputs, out_scale_bits_, true);
+    const int sg =
+        gqf ? 2 : kq_moe_fit_sg(kernel, kq_moe_pick_sg(kquant_type_, N, nx));
+    const int tile = gqf ? 2 * kq_qf_rps(kquant_type_) : sg * 32 / nx;
+    MTL::Size group_dims(32, sg, 1);
+    MTL::Size grid_dims(N / tile, R, T);
+    kq_log_dispatch(kname, x, out, grid_dims, group_dims);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+    return;
+  }
+
   // The half kernels run at nx 8: 32 rows per threadgroup amortize the
   // staged activation row and half grid (nx 16 measured 10% slower).
   const bool qf = kq_moe_qf(kquant_type_, N, K);
@@ -999,12 +1409,15 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   if (!upcast_pair) {
     // Gate and up of the shared expert each in its own codec: the "_sx2_"
     // instantiations, generic float path, one launch shape for any T.
-    const int nx = kq_moe_pick_nx((int64_t)N * (R + NS) * T, K, true);
+    const bool grp2 = kq_moe_group_glu(T) && !kq_moe_half(kquant_type_, K);
+    const int nx = grp2 ? kq_moe_group_nx((int64_t)N * (R + NS) * T, K, true)
+                        : kq_moe_pick_nx((int64_t)N * (R + NS) * T, K, true);
     const std::string kname = "kq_" + kquant_type_ + "_sx2_" + shexp_type_ +
-        "_" + shexp_up_type_ + "_moe_glu_gather_shexp_silu" + kq_nx_suffix(nx) +
-        "_" + kq_type_string(x.dtype());
-    auto kernel =
-        kq_get_kernel_os(d, kname, out_scale_bits_, kq_moe_nx_setting());
+        "_" + shexp_up_type_ + "_moe_glu_gather_shexp_" +
+        (grp2 ? "grp_silu" : "silu") + kq_nx_suffix(nx) + "_" +
+        kq_type_string(x.dtype());
+    auto kernel = kq_get_kernel_os(
+        d, kname, out_scale_bits_, grp2 ? nullptr : kq_moe_nx_setting());
     kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
     auto& ce = mx::metal::get_command_encoder(s);
     ce.set_compute_pipeline_state(kernel);
@@ -1032,18 +1445,28 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
 
   // Mixed shexp codecs dispatch the generic "_sx_" instantiations. The
   // half-dot pick keys on the expert codec; the shared slot stays float.
-  const bool qf = kq_moe_qf(kquant_type_, N, K) &&
-      kq_qf_shexp_ok(kquant_type_, shexp_type_, K);
-  const bool use_half = !qf && kq_moe_half(kquant_type_, K) &&
+  const int gform = kq_moe_group_glu(T)
+      ? kq_moe_group_form(kquant_type_, shexp_type_, N, K)
+      : KQ_GRP_NONE;
+  const bool grp = gform != KQ_GRP_NONE;
+  const bool grp_qf = gform == KQ_GRP_QF;
+  const bool qf = grp_qf ||
+      (!grp && kq_moe_qf(kquant_type_, N, K) &&
+       kq_qf_shexp_ok(kquant_type_, shexp_type_, K));
+  const bool use_half = !grp && !qf && kq_moe_half(kquant_type_, K) &&
       (shexp_type_ == kquant_type_ || shexp_type_ == "q5_k" ||
        shexp_type_ == "q6_k" || shexp_type_ == "q8_0");
-  const bool dd = !qf && !use_half && kq_moe_dedup(T, KQ_DD_MAX_T);
-  const bool c32 = !qf && !use_half && !dd && kq_moe_c32(kquant_type_, T);
+  const bool dd = !grp && !qf && !use_half && kq_moe_dedup(T, KQ_DD_MAX_T);
+  const bool c32 =
+      !grp && !qf && !use_half && !dd && kq_moe_c32(kquant_type_, T);
   const int nx = qf || use_half ? 8
-      : c32                     ? kq_moe_c32_nx()
+      : grp ? kq_moe_group_nx((int64_t)N * (R + NS) * T, K, true)
+      : c32 ? kq_moe_c32_nx()
             : kq_moe_pick_nx((int64_t)N * (R + NS) * T, K, true);
-  // The qf kernels always carry the shared codec in the name.
-  std::string stem = qf             ? kquant_type_ + "_qf_sx_" + shexp_type_
+  // The qf kernels always carry the shared codec in the name, and so do
+  // the grouped ones.
+  std::string stem = grp ? kq_moe_group_stem(gform, kquant_type_, shexp_type_)
+      : qf               ? kquant_type_ + "_qf_sx_" + shexp_type_
       : shexp_type_ == kquant_type_ ? kq_gather_stem_nx(kquant_type_, K, nx)
                                     : kquant_type_ + "_sx_" + shexp_type_;
   if (dd && (stem == "q6_k" || stem == "q8_0")) {
@@ -1055,10 +1478,10 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   const std::string act =
       act_ == "silu_limit" || act_ == "swiglu_oai" ? "silu" : act_;
   std::string kname = "kq_" + stem + "_moe_glu_gather_shexp_" +
-      (use_half ? "h_" : "") + (dd ? "dd_" : "") + act + (c32 ? "_c32" : "") +
-      kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
+      (use_half ? "h_" : "") + (dd ? "dd_" : "") + (grp ? "grp_" : "") + act +
+      (c32 ? "_c32" : "") + kq_nx_suffix(nx) + "_" + kq_type_string(x.dtype());
   auto kernel = kq_get_kernel_os(
-      d, kname, out_scale_bits_, qf ? nullptr : kq_moe_nx_setting());
+      d, kname, out_scale_bits_, qf || grp ? nullptr : kq_moe_nx_setting());
   kq_moe_log_kname(kname, int(kernel->maxTotalThreadsPerThreadgroup()));
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -1140,6 +1563,53 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   int K = x.shape(-1);
   // Shared slots: the last NS of the S slots.
   const int NS = S - indices.shape(1);
+
+  if (kq_moe_tile_mix(T, kquant_type_, shexp_type_, N, K, out_scale_bits_)) {
+    kq_gather_qmv_mix_tile_gpu(
+        d,
+        s,
+        kquant_type_,
+        shexp_type_,
+        w,
+        sw,
+        x,
+        indices,
+        scores,
+        out,
+        T,
+        S,
+        N,
+        K,
+        NS);
+    return;
+  }
+
+  // Grouped form: a routed expert is read once per eight pairs on it.
+  const int gform = kq_moe_group_mix(T)
+      ? kq_moe_group_form(kquant_type_, shexp_type_, N, K, NS == 1)
+      : KQ_GRP_NONE;
+  if (gform != KQ_GRP_NONE) {
+    kq_gather_qmv_mix_grp_gpu(
+        d,
+        s,
+        gform,
+        kquant_type_,
+        shexp_type_,
+        w,
+        sw,
+        x,
+        indices,
+        scores,
+        out,
+        T,
+        S,
+        N,
+        K,
+        NS,
+        inputs,
+        out_scale_bits_);
+    return;
+  }
 
   // The qf kernels take one shared slot; wider shared experts keep Ext.
   if (NS == 1 && kq_moe_qf(kquant_type_, N, K) &&
@@ -1366,7 +1836,33 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
       ? kq_moe_c32_down_nx()
       : kq_moe_pick_nx(
             (int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, dd ? 2 : T, K));
-  if (qf) {
+  const int gform = kq_moe_group_mix(T)
+      ? kq_moe_group_form(kquant_type_, "", N, K)
+      : KQ_GRP_NONE;
+  if (kq_moe_tile_mix(T, kquant_type_, kquant_type_, N, K, out_scale_bits_)) {
+    kq_gather_qmv_mix_tile_gpu(
+        d, s, kquant_type_, "", w, w, x, indices, scores, out, T, S, N, K, 0);
+  } else if (gform != KQ_GRP_NONE) {
+    kq_gather_qmv_mix_grp_gpu(
+        d,
+        s,
+        gform,
+        kquant_type_,
+        "",
+        w,
+        w,
+        x,
+        indices,
+        scores,
+        out,
+        T,
+        S,
+        N,
+        K,
+        0,
+        inputs,
+        out_scale_bits_);
+  } else if (qf) {
     const int rps = kq_qf_rps(kquant_type_);
     bool sp = kq_qf_mix_sp(T, N, rps, S);
     auto qf_name = [&](bool slot_parallel) {
@@ -2564,7 +3060,6 @@ mx::array moe_glu_gather_shexp_kq(
   }
   // The dense route takes a shared expert in one codec. Its products carry
   // the shared scales, so the fused op gets neither the scales nor their bit.
-  const bool dense = upcast_pair && kq_moe_shexp_dense(x.shape(0));
   const int shexp_bit = moe_shexp_scale_bit(
       "moe_glu_gather_shexp_kq",
       shexp_type,
@@ -2572,17 +3067,21 @@ mx::array moe_glu_gather_shexp_kq(
       "shexp_gate_scale",
       &shexp_up_scale,
       "shexp_up_scale");
-  const int os_bits = moe_scale_bits(
-                          "moe_glu_gather_shexp_kq",
-                          kquant_type,
-                          N,
-                          gate_w.shape(0),
-                          gate_scale,
-                          "gate_scale",
-                          &up_scale,
-                          "up_scale") |
-      (dense ? KQ_MOE_SHEXP_PRE : shexp_bit) |
+  const int route_bits = moe_scale_bits(
+                             "moe_glu_gather_shexp_kq",
+                             kquant_type,
+                             N,
+                             gate_w.shape(0),
+                             gate_scale,
+                             "gate_scale",
+                             &up_scale,
+                             "up_scale") |
       (act == "swiglu_oai" ? KQ_MOE_SWIGLU_OAI : 0);
+  const bool dense =
+      upcast_pair &&
+      kq_moe_shexp_dense(
+          x.shape(0), kquant_type, shexp_type, gate_w.shape(1), x.shape(-1));
+  const int os_bits = route_bits | (dense ? KQ_MOE_SHEXP_PRE : shexp_bit);
 
   auto x_c = moe_dense_x(x, s);
   std::vector<mx::array> pre;
@@ -2690,16 +3189,26 @@ mx::array gather_qmv_mix_kq(
   // stock Slice has no shape rule, so a shapeless compiled function cannot
   // hold the route.
   const int T = x.shape(0);
-  const bool dense =
-      (ns == 1 || scores.shape(1) == S - ns) && kq_moe_shexp_dense(T);
-  const int os_bits = moe_scale_bits(
-                          "gather_qmv_mix_kq",
-                          kquant_type,
-                          w.shape(1),
-                          w.shape(0),
-                          out_scale,
-                          "out_scale") |
-      (dense ? KQ_MOE_SHEXP_PRE : shexp_bit);
+  const int route_bits = moe_scale_bits(
+      "gather_qmv_mix_kq",
+      kquant_type,
+      w.shape(1),
+      w.shape(0),
+      out_scale,
+      "out_scale");
+  // The tiled down runs the shared slots as tiles of its own, unless
+  // KQ_MOE_SHEXP_DENSE asks for the route.
+  const bool dense = (ns == 1 || scores.shape(1) == S - ns) &&
+      kq_moe_shexp_dense(T, kquant_type, shexp_type, w.shape(1), x.shape(-1)) &&
+      (kq_moe_shexp_dense_forced() ||
+       !kq_moe_tile_mix(
+           T,
+           kquant_type,
+           shexp_type,
+           w.shape(1),
+           x.shape(-1),
+           route_bits | shexp_bit));
+  const int os_bits = route_bits | (dense ? KQ_MOE_SHEXP_PRE : shexp_bit);
 
   auto x_c = moe_dense_x(x, s);
   std::optional<mx::array> pre;
@@ -2892,6 +3401,1224 @@ std::vector<mx::array> moe_router_topk(
           scoring_i,
           scale),
       std::move(inputs));
+}
+
+// ---------------------------------------------------------------------------
+// Expert store (kq_moe_store.h).
+// ---------------------------------------------------------------------------
+namespace {
+
+// A plane of a codec's store: R bytes a record, from byte off of a block,
+// gpb records a block.
+struct KqStorePlane {
+  int R;
+  int off;
+  int gpb;
+};
+struct KqStoreSpec {
+  int wpb; // weights a block
+  int bb; // block bytes
+  std::vector<KqStorePlane> planes;
+};
+
+const KqStoreSpec* kq_store_spec(const std::string& t) {
+  static const std::vector<std::pair<std::string, KqStoreSpec>> specs = {
+      {"q5_0", {32, 22, {{16, 6, 1}, {4, 2, 1}, {2, 0, 1}}}},
+      {"iq4_nl", {32, 18, {{16, 2, 1}, {2, 0, 1}}}},
+      {"iq3_xxs", {256, 98, {{8, 2, 8}, {4, 66, 8}, {2, 0, 1}}}},
+      {"iq4_xs", {256, 136, {{16, 8, 8}, {8, 0, 1}}}},
+  };
+  for (const auto& kv : specs) {
+    if (kv.first == t) {
+      return &kv.second;
+    }
+  }
+  // The generic format: one plane of whole blocks, for every other codec
+  // the tiled kernels read (kq_moe_store.metal lists the same names).
+  static const std::vector<std::string> generic = {
+      "iq2_s", "q2_0",  "q2_k",   "q3_k",  "q4_k",   "q5_k",    "q6_k",
+      "q8_0",  "q4_0",  "q4_1",   "q5_1",  "iq3_s",  "iq2_xxs", "iq2_xs",
+      "iq1_s", "iq1_m", "stq1_0", "pq2_0", "ptq1_0", "mxfp4"};
+  static std::vector<std::pair<std::string, KqStoreSpec>> made;
+  static std::mutex mu;
+  std::lock_guard<std::mutex> lk(mu);
+  for (const auto& kv : made) {
+    if (kv.first == t) {
+      return &kv.second;
+    }
+  }
+  if (std::find(generic.begin(), generic.end(), t) == generic.end()) {
+    return nullptr;
+  }
+  const KQuantCodec* c = codec_by_name(t);
+  if (c == nullptr || c->weights_per_block % 32 != 0) {
+    return nullptr;
+  }
+  if (made.capacity() < generic.size()) {
+    made.reserve(generic.size()); // the returned pointers stay valid
+  }
+  made.push_back(
+      {t,
+       {c->weights_per_block,
+        c->bytes_per_block,
+        {{c->bytes_per_block, 0, 1}}}});
+  return &made.back().second;
+}
+
+// Form of the store GLU and down (KQ_MOE_STORE_FORM, read per call): 1, the
+// default, the pair-grid kernels (kq_st_glu_pg, kq_st_down_pg: no plan
+// dispatch) up to KQ_MOE_STORE_PG_MAX_T rows (default 8, the widths they
+// were measured at; they search the indices per threadgroup); 0, and wider
+// calls, the tile kernels behind a plan dispatch (kq_st_glu, kq_st_down).
+// The down's bits are those of form 0 when no K split is on (the default).
+inline bool kq_store_pg(int T, const std::string& t) {
+  // The pair-grid kernels exist for the formats with a plane a block field.
+  if (!(t == "q5_0" || t == "iq4_nl" || t == "iq3_xxs" || t == "iq4_xs")) {
+    return false;
+  }
+  return kq_env_lever_from("KQ_MOE_STORE_FORM", 1, 0) != 0 &&
+      T <= kq_env_lever_from("KQ_MOE_STORE_PG_MAX_T", 8, 1);
+}
+
+// K split of the pair-grid kernels: simdgroups a routed expert's weight row
+// and the shared expert's are split over, 1 to 4 (kq_moe_store.h). Levers
+// KQ_MOE_STORE_GLU_QR, _GLU_QH, _DOWN_QR, _DOWN_QH (read per call). On M5 Max
+// (Qwen3.8-Flash-Next, 12 store layers, 2 to 8 rows): the GLU's shared expert
+// in q6_k over K 2560 sets the dispatch's time unless split.
+inline int kq_store_q(const char* name, int unset) {
+  const int v = kq_env_lever_from(name, unset, 1);
+  return v > 4 ? 4 : v;
+}
+
+// Widths the store kernels take, by default all of them: a store may be
+// the only copy of its experts. Where the GGUF bytes stay mapped, a caller
+// can narrow the range with KQ_MOE_STORE_GLU_MIN_T, KQ_MOE_STORE_DOWN_MIN_T
+// and KQ_MOE_STORE_MAX_T (read when the op is built): a call outside it is
+// built as the in-place op on the same weights (moe_glu_gather_shexp_kq,
+// gather_qmv_mix_kq). On M5 Max, Qwen3.8-Flash-Next, the in-place GLU is ahead
+// of the store below 4 rows and at 6, the in-place down at one row.
+constexpr int KQ_STORE_GLU_MIN_T = 1;
+constexpr int KQ_STORE_DOWN_MIN_T = 1;
+constexpr int KQ_STORE_MAX_T = 1 << 30;
+inline bool kq_store_width(int T, const char* min_name, int min_unset) {
+  return T >= kq_env_lever_from(min_name, min_unset, 1) &&
+      T <= kq_env_lever_from("KQ_MOE_STORE_MAX_T", KQ_STORE_MAX_T, 1);
+}
+
+// The rows a column tile of a pair-grid kernel may have (kq_moe_store.h),
+// lever KQ_MOE_STORE_COL_ROWS (1 to 4), and the kernel variant by the
+// simdgroups of a threadgroup, which size its threadgroup memory.
+inline int kq_store_col_rows() {
+  const int v = kq_env_lever_from("KQ_MOE_STORE_COL_ROWS", 2, 1);
+  return v > 4 ? 4 : v;
+}
+
+// The shared expert of a pair-grid kernel on its codec's qf row loops
+// (kq_moe_qf.h; 32 lanes share a row's walk of K, one activation row a
+// pass) up to KQ_MOE_STORE_SHEXP_QF rows; 0, the default, off: on M5 Max
+// (Qwen3.8-Flash-Next GLU, q6_k shared) the loops ran 1.2 to 2.2 times the
+// shared tile's time from 2 rows. Wider calls and the other shared codecs run
+// the shared slot as tiles. The loops need K in whole blocks of 256 and whole
+// 32-column threadgroups.
+inline bool kq_store_shqf(
+    int T,
+    const std::string& t,
+    const std::string& st,
+    int N,
+    int K) {
+  if (st == t || !(st == "q5_k" || st == "q6_k" || st == "q8_0") ||
+      K % 256 != 0 || N % 64 != 0) {
+    return false;
+  }
+  return T <= kq_env_lever_from("KQ_MOE_STORE_SHEXP_QF", 0, 0);
+}
+
+// The in-place pair form on the planes (kq_st_glu_dd_iq3, kq_moe_store.h)
+// up to KQ_MOE_STORE_GLU_DD rows (default 3; at 4 the tile form is faster
+// and the in-place op's shared slots come from its dense route; 0 off): iq3_xxs
+// experts with a shared expert in the same codec, q5_k, q6_k or q8_0, at 16
+// lanes along K and two simdgroups.
+inline bool
+kq_store_dd(int T, const std::string& t, const std::string& st, int N, int K) {
+  if (t != "iq3_xxs" ||
+      !(st == t || st == "q5_k" || st == "q6_k" || st == "q8_0") ||
+      K % 256 != 0 || K < 512 || N % 64 != 0) {
+    return false;
+  }
+  return T <= kq_env_lever_from("KQ_MOE_STORE_GLU_DD", 3, 0);
+}
+
+inline std::string kq_store_mem(int simdgroups) {
+  const int sg = simdgroups <= 2 ? 2 : (simdgroups <= 4 ? 4 : 8);
+  return "_g" + std::to_string(sg) + "_";
+}
+
+bool kq_store_shexp_ok(const std::string& t, const std::string& st) {
+  if (st == "q5_k" || st == "q6_k" || st == "q8_0") {
+    return true;
+  }
+  return st == t;
+}
+
+const KqStoreSpec& kq_store_check(
+    const char* op,
+    const mx::array& w,
+    const std::string& t,
+    int K) {
+  const KqStoreSpec* spec = kq_store_spec(t);
+  if (spec == nullptr) {
+    throw std::invalid_argument(
+        std::string(op) + " no store format for codec '" + t + "'.");
+  }
+  if (w.ndim() != 3 || w.dtype() != mx::uint8 || K % spec->wpb != 0 ||
+      K % 32 != 0 || w.shape(1) % 64 != 0 ||
+      w.shape(2) != K / spec->wpb * spec->bb) {
+    throw std::invalid_argument(
+        std::string(op) +
+        " w must be uint8 [E, N, row bytes] of the codec, N a multiple of "
+        "64.");
+  }
+  return *spec;
+}
+
+void kq_store_check_planes(
+    const char* op,
+    const KqStoreSpec& spec,
+    const std::vector<mx::array>& planes,
+    int N,
+    int K,
+    const mx::array& slots,
+    int E) {
+  if (planes.size() != spec.planes.size()) {
+    throw std::invalid_argument(
+        std::string(op) + " wrong number of planes for the codec.");
+  }
+  // A stack of one expert is a stub: every routed expert then has a slot
+  // and the stack is never read.
+  if (slots.ndim() != 1 || (slots.shape(0) != E && E != 1) ||
+      slots.dtype() != mx::uint32) {
+    throw std::invalid_argument(std::string(op) + " slots must be uint32 [E].");
+  }
+  for (size_t i = 0; i < planes.size(); ++i) {
+    const size_t per = static_cast<size_t>(N) * (K / spec.wpb) *
+        spec.planes[i].gpb * spec.planes[i].R;
+    if (planes[i].dtype() != mx::uint8 || planes[i].ndim() != 1 ||
+        planes[i].size() % per != 0 || planes[i].size() == 0) {
+      throw std::invalid_argument(
+          std::string(op) + " a plane is not whole slots of the codec.");
+    }
+  }
+}
+
+} // namespace
+
+bool moe_store_supported(
+    const std::string& kquant_type,
+    const std::string& shexp_kquant_type) {
+#ifdef _METAL_
+  const std::string st =
+      shexp_kquant_type.empty() ? kquant_type : shexp_kquant_type;
+  return mx::metal::is_available() && kq_is_nax_available() &&
+      kq_store_spec(kquant_type) != nullptr &&
+      kq_store_shexp_ok(kquant_type, st);
+#else
+  (void)kquant_type;
+  (void)shexp_kquant_type;
+  return false;
+#endif
+}
+
+bool KQuantMoeStore::is_equivalent(const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQuantMoeStore&>(other);
+  return op_ == o.op_ && kquant_type_ == o.kquant_type_ &&
+      shexp_type_ == o.shexp_type_ && K_ == o.K_ && N_ == o.N_ &&
+      tile_rows_ == o.tile_rows_;
+}
+
+void KQuantMoeStore::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error("[mlx_kquant.moe_store] requires the Metal GPU.");
+}
+
+// The codecs with a pair kernel (kq_moe_store_seg.metal).
+static bool moe_store_seg_paired(const std::string& codec) {
+  return codec == "iq3_xxs" || codec == "iq4_xs" || codec == "iq2_s";
+}
+
+#ifdef _METAL_
+
+// KQ_SEG_DR=N (default 16, up to 32, 0 off): 64-row tiles of at most N rows
+// of the wide store kernels (field-plane codecs) decode their weights into
+// the tensor-op fragments instead of a threadgroup slab. Same bits.
+// iq3_xxs stays on the slab: a lane decodes 4 weights at a time there, so
+// the sign and grid word work the slab shares over 8 runs twice.
+static int kq_seg_dr_rows(const std::string& codec) {
+  return codec == "iq3_xxs"
+      ? 0
+      : std::min(32, kq_env_lever_from("KQ_SEG_DR", 16, 0));
+}
+
+void KQuantMoeStore::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto& ce = mx::metal::get_command_encoder(s);
+  const KqStoreSpec& spec = *kq_store_spec(kquant_type_);
+  const int np = static_cast<int>(spec.planes.size());
+  if (op_ == 0) {
+    const auto& w = inputs[0];
+    const auto& experts = inputs[1];
+    const int N = w.shape(1);
+    const int count = experts.shape(0);
+    const std::string kname = "kq_moe_store_pack";
+    auto kernel = kq_get_kernel(d, kname);
+    for (int i = 0; i < np; ++i) {
+      auto& out = outputs[i];
+      out.set_data(mx::allocator::malloc(out.nbytes()));
+      const KqStorePlane& pl = spec.planes[i];
+      const int U = K_ / spec.wpb * pl.gpb;
+      ce.set_compute_pipeline_state(kernel);
+      ce.set_input_array(w, 0);
+      ce.set_output_array(out, 1);
+      ce.set_input_array(experts, 2);
+      ce.set_bytes(N, 3);
+      ce.set_bytes(U, 4);
+      ce.set_bytes(pl.R, 5);
+      ce.set_bytes(spec.bb, 6);
+      ce.set_bytes(pl.off, 7);
+      ce.set_bytes(pl.gpb, 8);
+      const int rowb = w.shape(2);
+      ce.set_bytes(rowb, 9);
+      const int s0 = 0;
+      ce.set_bytes(s0, 10);
+      MTL::Size group(64, 1, 1);
+      MTL::Size grid(N, U, count);
+      kq_log_dispatch(kname, w, out, grid, group);
+      ce.dispatch_threads(grid, group);
+    }
+    return;
+  }
+  if (op_ == 4 || op_ == 5) {
+    for (auto& o : outputs) {
+      o.set_data(mx::allocator::malloc(o.nbytes()));
+    }
+    // x, map, counts, gate planes, up planes, then the row map when the call
+    // has one.
+    const mx::array x = kq_x_aligned_gpu(inputs[0], s, "moe_store_seg_pair x");
+    const auto& map = inputs[1];
+    const auto& counts = inputs[2];
+    const bool xmap = static_cast<int>(inputs.size()) == 3 + 2 * np + 1;
+    const int K = K_;
+    const int N = N_;
+    const bool align_N = true;
+    const bool align_K = true;
+    const int gx = kq_env_lever_from("KQ_SEG_GX", 32, 0);
+    // KQ_SEG_COL_ROWS (0 off, 1 to 4): tiles of at most that many rows run
+    // the kernel's column path (split-plane codecs).
+    const int colr = std::min(4, kq_env_lever_from("KQ_SEG_COL_ROWS", 0, 0));
+    const int drows = kq_seg_dr_rows(kquant_type_);
+    const std::string kname = "kq_store_seg_pair_" + kquant_type_ + "_" +
+        kq_type_string(x.dtype()) + "_bm_" + std::to_string(tile_rows_) +
+        (op_ == 5 ? "_o1" : "_o0");
+    mx::metal::MTLFCList func_consts = {
+        {&align_N, MTL::DataType::DataTypeBool, 201},
+        {&align_K, MTL::DataType::DataTypeBool, 202},
+        {&gx, MTL::DataType::DataTypeInt, 203},
+        {&xmap, MTL::DataType::DataTypeBool, 204},
+        {&colr, MTL::DataType::DataTypeInt, 205},
+        {&drows, MTL::DataType::DataTypeInt, 206},
+    };
+    const std::string hash_name = kname + "_gx_" + std::to_string(gx) +
+        (xmap ? "_xm" : "") + (colr > 0 ? "_cr" + std::to_string(colr) : "") +
+        (drows > 0 ? "_dr" + std::to_string(drows) : "");
+    auto kernel = kq_get_kernel(d, kname, hash_name, func_consts);
+    ce.set_compute_pipeline_state(kernel);
+    const int g = 3;
+    const int up = 3 + np;
+    ce.set_input_array(x, 0);
+    ce.set_input_array(inputs[g], 1);
+    ce.set_input_array(inputs[g + std::min(1, np - 1)], 2);
+    ce.set_input_array(map, 3);
+    ce.set_input_array(counts, 4);
+    ce.set_output_array(outputs[0], 5);
+    ce.set_bytes(N, 6);
+    ce.set_bytes(K, 7);
+    if (xmap) {
+      ce.set_input_array(inputs[3 + 2 * np], 8);
+    }
+    ce.set_input_array(inputs[g + std::min(2, np - 1)], 9);
+    ce.set_input_array(inputs[up], 10);
+    ce.set_input_array(inputs[up + std::min(1, np - 1)], 11);
+    ce.set_input_array(inputs[up + std::min(2, np - 1)], 12);
+    ce.set_output_array(outputs[op_ == 4 ? 1 : 0], 13);
+    MTL::Size group_dims(32, 2, tile_rows_ / 32);
+    const int n_cols = N / 64;
+    const int cap = map.shape(0);
+    MTL::Size grid_dims = gx > 0
+        ? MTL::Size(gx, ((cap + gx - 1) / gx) * n_cols, 1)
+        : MTL::Size(n_cols, cap, 1);
+    kq_log_dispatch(kname, x, outputs[0], grid_dims, group_dims);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+    return;
+  }
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+  if (op_ == 3) {
+    // x, map, counts, planes, then the row map when the call has one.
+    const mx::array x = kq_x_aligned_gpu(inputs[0], s, "moe_store_seg x");
+    const auto& map = inputs[1];
+    const auto& counts = inputs[2];
+    const bool xmap = static_cast<int>(inputs.size()) == 3 + np + 1;
+    const int K = K_;
+    const int N = N_;
+    const bool align_N = true;
+    const bool align_K = true;
+    // KQ_SEG_GX: gather_qmm_seg's grid lever, read on every call.
+    const int gx = kq_env_lever_from("KQ_SEG_GX", 32, 0);
+    const std::string kname = "kq_store_seg_" + kquant_type_ + "_" +
+        kq_type_string(x.dtype()) + "_bm_" + std::to_string(tile_rows_);
+    // KQ_SEG_COL_ROWS (0 off, 1 to 4): tiles of at most that many rows run
+    // the kernel's column path (split-plane codecs).
+    const int colr = std::min(4, kq_env_lever_from("KQ_SEG_COL_ROWS", 0, 0));
+    const int drows = kq_seg_dr_rows(kquant_type_);
+    mx::metal::MTLFCList func_consts = {
+        {&align_N, MTL::DataType::DataTypeBool, 201},
+        {&align_K, MTL::DataType::DataTypeBool, 202},
+        {&gx, MTL::DataType::DataTypeInt, 203},
+        {&xmap, MTL::DataType::DataTypeBool, 204},
+        {&colr, MTL::DataType::DataTypeInt, 205},
+        {&drows, MTL::DataType::DataTypeInt, 206},
+    };
+    const std::string hash_name = kname + "_gx_" + std::to_string(gx) +
+        (xmap ? "_xm" : "") + (colr > 0 ? "_cr" + std::to_string(colr) : "") +
+        (drows > 0 ? "_dr" + std::to_string(drows) : "");
+    auto kernel = kq_get_kernel(d, kname, hash_name, func_consts);
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(x, 0);
+    ce.set_input_array(inputs[3], 1);
+    ce.set_input_array(inputs[3 + std::min(1, np - 1)], 2);
+    ce.set_input_array(map, 3);
+    ce.set_input_array(counts, 4);
+    ce.set_output_array(out, 5);
+    ce.set_bytes(N, 6);
+    ce.set_bytes(K, 7);
+    if (xmap) {
+      ce.set_input_array(inputs[3 + np], 8);
+    }
+    ce.set_input_array(inputs[3 + std::min(2, np - 1)], 9);
+    MTL::Size group_dims(32, 2, tile_rows_ / 32);
+    const int n_cols = N / 64;
+    const int cap = map.shape(0);
+    MTL::Size grid_dims = gx > 0
+        ? MTL::Size(gx, ((cap + gx - 1) / gx) * n_cols, 1)
+        : MTL::Size(n_cols, cap, 1);
+    kq_log_dispatch(kname, x, out, grid_dims, group_dims);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+    return;
+  }
+  const std::string st = shexp_type_;
+  const int COLR = kq_env_lever_from("KQ_MOE_TILE_COL_ROWS", 2, 0);
+  if (op_ == 1) {
+    // gw, uw, sgw, suw, x, indices, slots, gate planes, up planes.
+    const auto& gw = inputs[0];
+    kq_check_weight_base(gw, kquant_type_, "moe_store_glu");
+    kq_check_weight_base(inputs[1], kquant_type_, "moe_store_glu");
+    kq_check_weight_base(inputs[2], st, "moe_store_glu");
+    kq_check_weight_base(inputs[3], st, "moe_store_glu");
+    const mx::array x = kq_x_aligned_gpu(inputs[4], s, "moe_store_glu x");
+    const auto& indices = inputs[5];
+    const int T = x.shape(0);
+    const int K = x.shape(1);
+    const int N = gw.shape(1);
+    const int S = indices.shape(1) + 1;
+    const int NS = 1;
+    const int pairs = T * S;
+    const std::string type = kq_type_string(x.dtype());
+    if (kq_store_pg(T, kquant_type_) &&
+        kq_store_dd(T, kquant_type_, st, N, K)) {
+      // The in-place pair form on the planes (kq_st_glu_dd_iq3): the
+      // in-place op's lanes, simdgroups and sums.
+      const std::string kname = "kq_store_glu_dd_iq3_xxs_sx_" + st +
+          (kq_moe_c32(kquant_type_, T) ? "_c32_" : "_") + type;
+      auto kernel = kq_get_kernel(d, kname);
+      ce.set_compute_pipeline_state(kernel);
+      for (int i = 0; i < 4; ++i) {
+        ce.set_input_array(inputs[i], i);
+      }
+      ce.set_input_array(x, 4);
+      ce.set_input_array(indices, 5);
+      ce.set_output_array(out, 6);
+      ce.set_bytes(K, 7);
+      ce.set_bytes(N, 8);
+      ce.set_input_array(inputs[6], 11);
+      for (int i = 0; i < 3; ++i) {
+        ce.set_input_array(inputs[7 + std::min(i, np - 1)], 12 + i);
+        ce.set_input_array(inputs[7 + np + std::min(i, np - 1)], 15 + i);
+      }
+      MTL::Size group_dims(32, 2, 1);
+      MTL::Size grid_dims(N / 4, S, T);
+      kq_log_dispatch(kname, x, out, grid_dims, group_dims);
+      ce.dispatch_threadgroups(grid_dims, group_dims);
+      return;
+    }
+    if (kq_store_pg(T, kquant_type_)) {
+      const int QR = kq_store_q("KQ_MOE_STORE_GLU_QR", 2);
+      const int QH = kq_store_q("KQ_MOE_STORE_GLU_QH", 2);
+      const int SHQF = kq_store_shqf(T, kquant_type_, st, N, K) ? 1 : 0;
+      // The qf loops take whatever simdgroups the routed tiles have.
+      const int Q = SHQF != 0 ? QR : std::max(QR, QH);
+      const int PCOLR = kq_store_col_rows();
+      const std::string kname = "kq_store_glu_pg_" + kquant_type_ + "_sx_" +
+          st + kq_store_mem(2 * Q) + type;
+      auto kernel = kq_get_kernel(d, kname);
+      ce.set_compute_pipeline_state(kernel);
+      for (int i = 0; i < 4; ++i) {
+        ce.set_input_array(inputs[i], i);
+      }
+      ce.set_input_array(x, 4);
+      ce.set_input_array(indices, 5);
+      ce.set_output_array(out, 6);
+      ce.set_bytes(K, 7);
+      ce.set_bytes(N, 8);
+      ce.set_bytes(QR, 9);
+      ce.set_bytes(PCOLR, 10);
+      ce.set_input_array(inputs[6], 11);
+      for (int i = 0; i < 3; ++i) {
+        ce.set_input_array(inputs[7 + std::min(i, np - 1)], 12 + i);
+        ce.set_input_array(inputs[7 + np + std::min(i, np - 1)], 15 + i);
+      }
+      ce.set_bytes(QH, 18);
+      ce.set_bytes(S, 19);
+      ce.set_bytes(SHQF, 20);
+      MTL::Size group_dims(32, 2 * Q, 1);
+      MTL::Size grid_dims(T * S, (N + 31) / 32, 1);
+      kq_log_dispatch(kname, x, out, grid_dims, group_dims);
+      ce.dispatch_threadgroups(grid_dims, group_dims);
+      return;
+    }
+    mx::array hg({pairs + 7, K}, x.dtype(), nullptr, {});
+    mx::array tiles({pairs + 8, 4}, mx::uint32, nullptr, {});
+    mx::array place({T * (S - NS) + 1}, mx::uint32, nullptr, {});
+    hg.set_data(mx::allocator::malloc(hg.nbytes()));
+    tiles.set_data(mx::allocator::malloc(tiles.nbytes()));
+    place.set_data(mx::allocator::malloc(place.nbytes()));
+    const std::string pname = "kq_moe_store_plan_" + type;
+    auto pk = kq_get_kernel(d, pname);
+    ce.set_compute_pipeline_state(pk);
+    ce.set_input_array(indices, 0);
+    ce.set_input_array(x, 1);
+    ce.set_output_array(hg, 2);
+    ce.set_output_array(tiles, 3);
+    ce.set_output_array(place, 4);
+    ce.set_bytes(K, 5);
+    ce.set_bytes(S, 6);
+    ce.set_bytes(NS, 7);
+    ce.set_bytes(T, 8);
+    const int xr = 1;
+    ce.set_bytes(xr, 9);
+    MTL::Size pgroup(32, 1, 1);
+    MTL::Size pgrid(pairs, 1, 1);
+    kq_log_dispatch(pname, x, hg, pgrid, pgroup);
+    ce.dispatch_threadgroups(pgrid, pgroup);
+
+    const std::string kname =
+        "kq_store_glu_" + kquant_type_ + "_sx_" + st + "_" + type;
+    auto kernel = kq_get_kernel(d, kname);
+    ce.set_compute_pipeline_state(kernel);
+    for (int i = 0; i < 4; ++i) {
+      ce.set_input_array(inputs[i], i);
+    }
+    ce.set_input_array(hg, 4);
+    ce.set_input_array(tiles, 5);
+    ce.set_output_array(out, 6);
+    ce.set_bytes(K, 7);
+    ce.set_bytes(N, 8);
+    ce.set_bytes(COLR, 10);
+    ce.set_input_array(inputs[6], 11);
+    for (int i = 0; i < 3; ++i) {
+      ce.set_input_array(inputs[7 + std::min(i, np - 1)], 12 + i);
+      ce.set_input_array(inputs[7 + np + std::min(i, np - 1)], 15 + i);
+    }
+    MTL::Size group_dims(32, 2, 1);
+    MTL::Size grid_dims((N + 31) / 32, pairs, 1);
+    kq_log_dispatch(kname, x, out, grid_dims, group_dims);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+    ce.add_temporary(hg);
+    ce.add_temporary(tiles);
+    ce.add_temporary(place);
+    return;
+  }
+  // w, sw, x, indices, scores, slots, planes.
+  const auto& w = inputs[0];
+  const auto& sw = inputs[1];
+  kq_check_weight_base(w, kquant_type_, "moe_store_down");
+  kq_check_weight_base(sw, st, "moe_store_down");
+  const mx::array x = kq_x_aligned_gpu(inputs[2], s, "moe_store_down x");
+  const auto& indices = inputs[3];
+  const auto& scores = inputs[4];
+  const int T = x.shape(0);
+  const int S = x.shape(1);
+  const int K = x.shape(2);
+  const int N = w.shape(1);
+  const int NS = S - indices.shape(1);
+  const int pairs = T * S;
+  const std::string type = kq_type_string(x.dtype());
+  if (kq_store_pg(T, kquant_type_)) {
+    const int QR = kq_store_q("KQ_MOE_STORE_DOWN_QR", 1);
+    const int QH = kq_store_q("KQ_MOE_STORE_DOWN_QH", 1);
+    const int SHQF =
+        NS == 1 && kq_store_shqf(T, kquant_type_, st, N, K) ? 1 : 0;
+    const int Q = SHQF != 0 ? QR : std::max(QR, QH);
+    // 64 columns a threadgroup as the tile kernel while two column
+    // simdgroups fit beside the K split.
+    const int CW = Q <= 2 ? 2 : 1;
+    mx::array y({pairs, N}, x.dtype(), nullptr, {});
+    y.set_data(mx::allocator::malloc(y.nbytes()));
+    const int PCOLR = kq_store_col_rows();
+    const std::string kname = "kq_store_down_pg_" + kquant_type_ + "_sx_" + st +
+        kq_store_mem(CW * Q) + type;
+    auto kernel = kq_get_kernel(d, kname);
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(w, 0);
+    ce.set_input_array(sw, 1);
+    ce.set_input_array(x, 2);
+    ce.set_input_array(indices, 3);
+    ce.set_output_array(y, 5);
+    ce.set_bytes(K, 6);
+    ce.set_bytes(N, 7);
+    ce.set_bytes(QR, 8);
+    ce.set_bytes(NS, 9);
+    ce.set_bytes(PCOLR, 10);
+    ce.set_input_array(inputs[5], 11);
+    for (int i = 0; i < 3; ++i) {
+      ce.set_input_array(inputs[6 + std::min(i, np - 1)], 12 + i);
+    }
+    ce.set_bytes(QH, 18);
+    ce.set_bytes(CW, 19);
+    ce.set_bytes(SHQF, 20);
+    MTL::Size group_dims(32, CW * Q, 1);
+    ce.set_bytes(S, 4);
+    MTL::Size grid_dims(T * S, (N + 32 * CW - 1) / (32 * CW), 1);
+    kq_log_dispatch(kname, x, out, grid_dims, group_dims);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+
+    const std::string cname = "kq_moe_store_combine_" + type;
+    auto ck = kq_get_kernel(d, cname);
+    ce.set_compute_pipeline_state(ck);
+    ce.set_input_array(y, 0);
+    ce.set_input_array(scores, 1);
+    ce.set_output_array(out, 2);
+    ce.set_bytes(N, 3);
+    ce.set_bytes(S, 4);
+    const int SC = scores.shape(1);
+    ce.set_bytes(SC, 5);
+    ce.set_bytes(NS, 6);
+    MTL::Size cgroup(std::min(N / 4, 256), 1, 1);
+    MTL::Size cgrid(N / 4, 1, T);
+    kq_log_dispatch(cname, x, out, cgrid, cgroup);
+    ce.dispatch_threads(cgrid, cgroup);
+    ce.add_temporary(y);
+    return;
+  }
+  mx::array hg({pairs + 7, K}, x.dtype(), nullptr, {});
+  mx::array tiles({pairs, 4}, mx::uint32, nullptr, {});
+  mx::array place({T * (S - NS) + 1}, mx::uint32, nullptr, {});
+  mx::array y({pairs, N}, x.dtype(), nullptr, {});
+  hg.set_data(mx::allocator::malloc(hg.nbytes()));
+  tiles.set_data(mx::allocator::malloc(tiles.nbytes()));
+  place.set_data(mx::allocator::malloc(place.nbytes()));
+  y.set_data(mx::allocator::malloc(y.nbytes()));
+  const std::string pname = "kq_moe_tile_plan_" + type;
+  auto pk = kq_get_kernel(d, pname);
+  ce.set_compute_pipeline_state(pk);
+  ce.set_input_array(indices, 0);
+  ce.set_input_array(x, 1);
+  ce.set_output_array(hg, 2);
+  ce.set_output_array(tiles, 3);
+  ce.set_output_array(place, 4);
+  ce.set_bytes(K, 5);
+  ce.set_bytes(S, 6);
+  ce.set_bytes(NS, 7);
+  ce.set_bytes(T, 8);
+  MTL::Size pgroup(32, 1, 1);
+  MTL::Size pgrid(pairs, 1, 1);
+  kq_log_dispatch(pname, x, hg, pgrid, pgroup);
+  ce.dispatch_threadgroups(pgrid, pgroup);
+
+  const std::string kname =
+      "kq_store_down_" + kquant_type_ + "_sx_" + st + "_" + type;
+  auto kernel = kq_get_kernel(d, kname);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(w, 0);
+  ce.set_input_array(sw, 1);
+  ce.set_input_array(hg, 2);
+  ce.set_input_array(tiles, 3);
+  ce.set_output_array(y, 5);
+  ce.set_bytes(K, 6);
+  ce.set_bytes(N, 7);
+  ce.set_bytes(NS, 9);
+  ce.set_bytes(COLR, 10);
+  ce.set_input_array(inputs[5], 11);
+  for (int i = 0; i < 3; ++i) {
+    ce.set_input_array(inputs[6 + std::min(i, np - 1)], 12 + i);
+  }
+  MTL::Size group_dims(32, 2, 1);
+  MTL::Size grid_dims((N + 63) / 64, pairs, 1);
+  kq_log_dispatch(kname, x, out, grid_dims, group_dims);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+
+  const std::string cname = "kq_moe_tile_combine_" + type;
+  auto ck = kq_get_kernel(d, cname);
+  ce.set_compute_pipeline_state(ck);
+  ce.set_input_array(y, 0);
+  ce.set_input_array(scores, 1);
+  ce.set_output_array(out, 2);
+  ce.set_bytes(N, 3);
+  ce.set_bytes(S, 4);
+  const int SC = scores.shape(1);
+  ce.set_bytes(SC, 5);
+  ce.set_bytes(NS, 6);
+  ce.set_input_array(place, 7);
+  MTL::Size cgroup(std::min(N / 4, 256), 1, 1);
+  MTL::Size cgrid(N / 4, 1, T);
+  kq_log_dispatch(cname, x, out, cgrid, cgroup);
+  ce.dispatch_threads(cgrid, cgroup);
+  ce.add_temporary(hg);
+  ce.add_temporary(tiles);
+  ce.add_temporary(place);
+  ce.add_temporary(y);
+}
+
+#else // !_METAL_
+
+void KQuantMoeStore::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error("[mlx_kquant.moe_store] requires a Metal build.");
+}
+
+#endif
+
+std::vector<mx::array> moe_store_pack(
+    mx::array w,
+    const std::string& kquant_type,
+    int K,
+    mx::array experts,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const char* op = "[mlx_kquant.moe_store_pack]";
+  const KqStoreSpec& spec = kq_store_check(op, w, kquant_type, K);
+  if (!moe_store_supported(kquant_type, "")) {
+    throw std::invalid_argument(
+        std::string(op) + " needs the Metal GPU with tensor-op units.");
+  }
+  if (experts.ndim() != 1 || experts.shape(0) == 0) {
+    throw std::invalid_argument(std::string(op) + " experts must be [count].");
+  }
+  const int N = w.shape(1);
+  const int count = experts.shape(0);
+  std::vector<mx::Shape> shapes;
+  std::vector<mx::Dtype> dtypes;
+  for (const auto& pl : spec.planes) {
+    const int64_t n =
+        static_cast<int64_t>(count) * N * (K / spec.wpb) * pl.gpb * pl.R;
+    if (n > 0x7fffffffLL) {
+      throw std::invalid_argument(
+          std::string(op) + " a plane passes 2 GiB; pack fewer experts.");
+    }
+    shapes.push_back({static_cast<int>(n)});
+    dtypes.push_back(mx::uint8);
+  }
+  kq_check_weight_base_at_build(w, kquant_type, s, "moe_store_pack");
+  return mx::array::make_arrays(
+      std::move(shapes),
+      dtypes,
+      std::make_shared<KQuantMoeStore>(s, 0, kquant_type, "", K),
+      {std::move(w), prep_indices(experts, s)});
+}
+
+mx::array moe_store_glu(
+    mx::array x,
+    mx::array gate_w,
+    mx::array up_w,
+    mx::array shexp_gate_w,
+    mx::array shexp_up_w,
+    const std::string& kquant_type,
+    mx::array indices,
+    mx::array slots,
+    std::vector<mx::array> gate_planes,
+    std::vector<mx::array> up_planes,
+    const std::string& shexp_kquant_type,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const char* op = "[mlx_kquant.moe_store_glu]";
+  const std::string st =
+      shexp_kquant_type.empty() ? kquant_type : shexp_kquant_type;
+  if (!moe_store_supported(kquant_type, st)) {
+    throw std::invalid_argument(
+        std::string(op) + " no store kernel for '" + kquant_type +
+        "' with shared-expert codec '" + st + "' on this device.");
+  }
+  auto dt = x.dtype();
+  if (x.ndim() != 2 || (dt != mx::float16 && dt != mx::bfloat16)) {
+    throw std::invalid_argument(
+        std::string(op) + " x must be [T, K] float16 or bfloat16.");
+  }
+  const int T = x.shape(0);
+  const int K = x.shape(1);
+  const KqStoreSpec& spec = kq_store_check(op, gate_w, kquant_type, K);
+  kq_store_check(op, up_w, kquant_type, K);
+  const int N = gate_w.shape(1);
+  const int E = gate_w.shape(0);
+  if (up_w.shape(0) != E || up_w.shape(1) != N) {
+    throw std::invalid_argument(std::string(op) + " gate and up differ.");
+  }
+  const KQuantCodec* sc = codec_by_name(st);
+  if (sc == nullptr || shexp_gate_w.ndim() != 2 || shexp_up_w.ndim() != 2 ||
+      shexp_gate_w.shape(0) != N || shexp_up_w.shape(0) != N ||
+      shexp_gate_w.shape() != shexp_up_w.shape() ||
+      shexp_gate_w.dtype() != mx::uint8 || shexp_up_w.dtype() != mx::uint8) {
+    throw std::invalid_argument(
+        std::string(op) +
+        " the shared gate and up must be uint8 [N, row bytes], one slot.");
+  }
+  if (indices.ndim() != 2 || indices.shape(0) != T) {
+    throw std::invalid_argument(std::string(op) + " indices must be [T, R].");
+  }
+  kq_store_check_planes(op, spec, gate_planes, N, K, slots, E);
+  kq_store_check_planes(op, spec, up_planes, N, K, slots, E);
+  kq_check_weight_base_at_build(gate_w, kquant_type, s, "moe_store_glu");
+  kq_check_weight_base_at_build(up_w, kquant_type, s, "moe_store_glu");
+  kq_check_weight_base_at_build(shexp_gate_w, st, s, "moe_store_glu");
+  kq_check_weight_base_at_build(shexp_up_w, st, s, "moe_store_glu");
+  if (!kq_store_width(T, "KQ_MOE_STORE_GLU_MIN_T", KQ_STORE_GLU_MIN_T)) {
+    return moe_glu_gather_shexp_kq(
+        std::move(x),
+        std::move(gate_w),
+        std::move(up_w),
+        std::move(shexp_gate_w),
+        std::move(shexp_up_w),
+        kquant_type,
+        std::move(indices),
+        "silu",
+        shexp_kquant_type,
+        0.0f,
+        "",
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        0.0f,
+        s);
+  }
+  const int R = indices.shape(1);
+  std::vector<mx::array> in = {
+      std::move(gate_w),
+      std::move(up_w),
+      std::move(shexp_gate_w),
+      std::move(shexp_up_w),
+      moe_dense_x(x, s),
+      prep_indices(indices, s),
+      std::move(slots)};
+  for (auto& p : gate_planes) {
+    in.push_back(std::move(p));
+  }
+  for (auto& p : up_planes) {
+    in.push_back(std::move(p));
+  }
+  return mx::array(
+      {T, R + 1, N},
+      dt,
+      std::make_shared<KQuantMoeStore>(s, 1, kquant_type, st, K),
+      std::move(in));
+}
+
+bool moe_store_seg_supported(const std::string& kquant_type, int K) {
+#ifdef _METAL_
+  // The codecs kq_moe_store_seg.metal instantiates.
+  static const std::vector<std::string> wide = {
+      "q5_0",
+      "iq4_nl",
+      "iq3_xxs",
+      "iq4_xs",
+      "iq2_s",
+      "q2_0",
+      "iq3_s",
+      "iq2_xxs",
+      "iq2_xs",
+      "iq1_s",
+      "iq1_m",
+      "stq1_0",
+      "pq2_0",
+      "ptq1_0"};
+  const KqStoreSpec* spec = kq_store_spec(kquant_type);
+  return moe_store_supported(kquant_type, "") && spec != nullptr && K > 0 &&
+      K % 64 == 0 && K % spec->wpb == 0 &&
+      std::find(wide.begin(), wide.end(), kquant_type) != wide.end() &&
+      kq_seg_nax_ok(kquant_type, K);
+#else
+  (void)kquant_type;
+  (void)K;
+  return false;
+#endif
+}
+
+std::vector<std::string> kernel_keys() {
+#ifdef _METAL_
+  return kq_kernel_keys();
+#else
+  return {};
+#endif
+}
+
+int moe_store_warm(
+    const std::string& glu_type,
+    const std::string& glu_shexp_type,
+    const std::string& down_type,
+    const std::string& down_shexp_type,
+    const std::vector<mx::Dtype>& dtypes,
+    int K_glu,
+    int K_down) {
+#ifdef _METAL_
+  // The names and constants are those of KQuantMoeStore::eval_gpu;
+  // tests/test_moe_store_warm.py fails when the two part ways.
+  auto& d = mx::metal::device(mx::Device::gpu);
+  int n = 0;
+  auto get = [&](const std::string& kname) {
+    try {
+      kq_get_kernel(d, kname);
+      ++n;
+    } catch (const std::exception&) {
+    }
+  };
+  auto seg = [&](const std::string& codec, const std::string& type, int K) {
+    if (type == "float" || !moe_store_seg_supported(codec, K)) {
+      return;
+    }
+    const bool align_N = true;
+    const bool align_K = true;
+    const int gx = kq_env_lever_from("KQ_SEG_GX", 32, 0);
+    const int colr = std::min(4, kq_env_lever_from("KQ_SEG_COL_ROWS", 0, 0));
+    const int drows = kq_seg_dr_rows(codec);
+    // The single kernel, then the pair kernel (both outputs) of a paired
+    // codec.
+    std::vector<std::string> knames;
+    for (int tr : {64, 128}) {
+      const std::string bm = "_" + type + "_bm_" + std::to_string(tr);
+      knames.push_back("kq_store_seg_" + codec + bm);
+      if (moe_store_seg_paired(codec)) {
+        knames.push_back("kq_store_seg_pair_" + codec + bm + "_o0");
+        knames.push_back("kq_store_seg_pair_" + codec + bm + "_o1");
+      }
+    }
+    for (const std::string& kname : knames) {
+      for (bool xmap : {false, true}) {
+        mx::metal::MTLFCList fc = {
+            {&align_N, MTL::DataType::DataTypeBool, 201},
+            {&align_K, MTL::DataType::DataTypeBool, 202},
+            {&gx, MTL::DataType::DataTypeInt, 203},
+            {&xmap, MTL::DataType::DataTypeBool, 204},
+            {&colr, MTL::DataType::DataTypeInt, 205},
+            {&drows, MTL::DataType::DataTypeInt, 206},
+        };
+        const std::string hash = kname + "_gx_" + std::to_string(gx) +
+            (xmap ? "_xm" : "") +
+            (colr > 0 ? "_cr" + std::to_string(colr) : "") +
+            (drows > 0 ? "_dr" + std::to_string(drows) : "");
+        try {
+          kq_get_kernel(d, kname, hash, fc);
+          ++n;
+        } catch (const std::exception&) {
+        }
+      }
+    }
+  };
+  for (const mx::Dtype& dt : dtypes) {
+    const std::string type = kq_type_string(dt);
+    // An empty codec name skips that projection (a store of the down
+    // stacks only). The pair-grid variants are the ones today's levers
+    // pick; the pair form on the planes has a "_c32" kernel at one row.
+    if (!glu_type.empty()) {
+      if (kq_store_pg(1, glu_type)) {
+        const int QR = kq_store_q("KQ_MOE_STORE_GLU_QR", 2);
+        const int QH = kq_store_q("KQ_MOE_STORE_GLU_QH", 2);
+        get("kq_store_glu_pg_" + glu_type + "_sx_" + glu_shexp_type +
+            kq_store_mem(2 * std::max(QR, QH)) + type);
+        if (glu_type == "iq3_xxs" &&
+            kq_env_lever_from("KQ_MOE_STORE_GLU_DD", 3, 0) > 0) {
+          const std::string dd = "kq_store_glu_dd_iq3_xxs_sx_" + glu_shexp_type;
+          get(dd + "_" + type);
+          get(dd + "_c32_" + type);
+        }
+      }
+      get("kq_moe_store_plan_" + type);
+      get("kq_store_glu_" + glu_type + "_sx_" + glu_shexp_type + "_" + type);
+      seg(glu_type, type, K_glu);
+    }
+    if (!down_type.empty()) {
+      if (kq_store_pg(1, down_type)) {
+        const int QR = kq_store_q("KQ_MOE_STORE_DOWN_QR", 1);
+        const int QH = kq_store_q("KQ_MOE_STORE_DOWN_QH", 1);
+        const int Q = std::max(QR, QH);
+        get("kq_store_down_pg_" + down_type + "_sx_" + down_shexp_type +
+            kq_store_mem((Q <= 2 ? 2 : 1) * Q) + type);
+        get("kq_moe_store_combine_" + type);
+      }
+      get("kq_moe_tile_plan_" + type);
+      get("kq_store_down_" + down_type + "_sx_" + down_shexp_type + "_" + type);
+      get("kq_moe_tile_combine_" + type);
+      seg(down_type, type, K_down);
+    }
+  }
+  return n;
+#else
+  (void)glu_type;
+  (void)glu_shexp_type;
+  (void)down_type;
+  (void)down_shexp_type;
+  (void)dtypes;
+  (void)K_glu;
+  (void)K_down;
+  return 0;
+#endif
+}
+
+mx::array moe_store_seg(
+    mx::array x,
+    std::vector<mx::array> planes,
+    const std::string& kquant_type,
+    int N,
+    mx::array map,
+    mx::array counts,
+    int tile_rows,
+    std::optional<mx::array> x_rows,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const char* op = "[mlx_kquant.moe_store_seg]";
+  auto dt = x.dtype();
+  if (x.ndim() != 2 || (dt != mx::float16 && dt != mx::bfloat16)) {
+    throw std::invalid_argument(
+        std::string(op) + " x must be [rows, K] float16 or bfloat16.");
+  }
+  const int K = x.shape(1);
+  if (!moe_store_seg_supported(kquant_type, K)) {
+    throw std::invalid_argument(
+        std::string(op) + " no wide store kernel for '" + kquant_type +
+        "' at this K on this device.");
+  }
+  if (tile_rows != 64 && tile_rows != 128) {
+    throw std::invalid_argument(
+        std::string(op) + " tile_rows must be 64 or 128.");
+  }
+  if (N <= 0 || N % 64 != 0) {
+    throw std::invalid_argument(
+        std::string(op) + " N must be a positive multiple of 64.");
+  }
+  const KqStoreSpec& spec = *kq_store_spec(kquant_type);
+  if (planes.size() != spec.planes.size()) {
+    throw std::invalid_argument(
+        std::string(op) + " wrong number of planes for the codec.");
+  }
+  for (size_t i = 0; i < planes.size(); ++i) {
+    const size_t per = static_cast<size_t>(N) * (K / spec.wpb) *
+        spec.planes[i].gpb * spec.planes[i].R;
+    if (planes[i].dtype() != mx::uint8 || planes[i].ndim() != 1 ||
+        planes[i].size() % per != 0 || planes[i].size() == 0) {
+      throw std::invalid_argument(
+          std::string(op) + " a plane is not whole slots of the codec.");
+    }
+  }
+  if (map.ndim() != 2 || map.shape(1) != 3 || map.dtype() != mx::uint32 ||
+      counts.ndim() != 1 || counts.shape(0) != 1 ||
+      counts.dtype() != mx::uint32) {
+    throw std::invalid_argument(
+        std::string(op) + " map must be uint32 [tiles, 3], counts uint32 [1].");
+  }
+  if (x_rows &&
+      (x_rows->ndim() != 1 || x_rows->shape(0) == 0 ||
+       !mx::issubdtype(x_rows->dtype(), mx::integer))) {
+    throw std::invalid_argument(
+        std::string(op) + " x_rows must be a non-empty 1-D integer array.");
+  }
+  const int rows = x_rows ? x_rows->shape(0) : x.shape(0);
+  std::vector<mx::array> in = {
+      moe_dense_x(x, s),
+      mx::contiguous(map, false, s),
+      mx::contiguous(counts, false, s)};
+  for (auto& p : planes) {
+    in.push_back(std::move(p));
+  }
+  if (x_rows) {
+    in.push_back(mx::contiguous(mx::astype(*x_rows, mx::uint32, s), false, s));
+  }
+  return mx::array(
+      {rows, N},
+      dt,
+      std::make_shared<KQuantMoeStore>(s, 3, kquant_type, "", K, N, tile_rows),
+      std::move(in));
+}
+
+std::vector<mx::array> moe_store_seg_pair(
+    mx::array x,
+    std::vector<mx::array> gate_planes,
+    std::vector<mx::array> up_planes,
+    const std::string& kquant_type,
+    int N,
+    mx::array map,
+    mx::array counts,
+    int tile_rows,
+    std::optional<mx::array> x_rows,
+    bool fused,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const char* op = "[mlx_kquant.moe_store_seg_pair]";
+  auto dt = x.dtype();
+  if (x.ndim() != 2 || (dt != mx::float16 && dt != mx::bfloat16)) {
+    throw std::invalid_argument(
+        std::string(op) + " x must be [rows, K] float16 or bfloat16.");
+  }
+  const int K = x.shape(1);
+  if (!moe_store_seg_supported(kquant_type, K) ||
+      !moe_store_seg_paired(kquant_type)) {
+    throw std::invalid_argument(
+        std::string(op) + " no paired wide store kernel for '" + kquant_type +
+        "' at this K on this device.");
+  }
+  if (tile_rows != 64 && tile_rows != 128) {
+    throw std::invalid_argument(
+        std::string(op) + " tile_rows must be 64 or 128.");
+  }
+  if (N <= 0 || N % 64 != 0) {
+    throw std::invalid_argument(
+        std::string(op) + " N must be a positive multiple of 64.");
+  }
+  const KqStoreSpec& spec = *kq_store_spec(kquant_type);
+  for (const auto* planes : {&gate_planes, &up_planes}) {
+    if (planes->size() != spec.planes.size()) {
+      throw std::invalid_argument(
+          std::string(op) + " wrong number of planes for the codec.");
+    }
+    for (size_t i = 0; i < planes->size(); ++i) {
+      const auto& p = (*planes)[i];
+      const size_t per = static_cast<size_t>(N) * (K / spec.wpb) *
+          spec.planes[i].gpb * spec.planes[i].R;
+      if (p.dtype() != mx::uint8 || p.ndim() != 1 || p.size() % per != 0 ||
+          p.size() == 0) {
+        throw std::invalid_argument(
+            std::string(op) + " a plane is not whole slots of the codec.");
+      }
+    }
+  }
+  if (map.ndim() != 2 || map.shape(1) != 3 || map.dtype() != mx::uint32 ||
+      counts.ndim() != 1 || counts.shape(0) != 1 ||
+      counts.dtype() != mx::uint32) {
+    throw std::invalid_argument(
+        std::string(op) + " map must be uint32 [tiles, 3], counts uint32 [1].");
+  }
+  if (x_rows &&
+      (x_rows->ndim() != 1 || x_rows->shape(0) == 0 ||
+       !mx::issubdtype(x_rows->dtype(), mx::integer))) {
+    throw std::invalid_argument(
+        std::string(op) + " x_rows must be a non-empty 1-D integer array.");
+  }
+  const int rows = x_rows ? x_rows->shape(0) : x.shape(0);
+  std::vector<mx::array> in = {
+      moe_dense_x(x, s),
+      mx::contiguous(map, false, s),
+      mx::contiguous(counts, false, s)};
+  for (auto& p : gate_planes) {
+    in.push_back(std::move(p));
+  }
+  for (auto& p : up_planes) {
+    in.push_back(std::move(p));
+  }
+  if (x_rows) {
+    in.push_back(mx::contiguous(mx::astype(*x_rows, mx::uint32, s), false, s));
+  }
+  auto prim = std::make_shared<KQuantMoeStore>(
+      s, fused ? 5 : 4, kquant_type, "", K, N, tile_rows);
+  if (fused) {
+    return {mx::array({rows, N}, dt, std::move(prim), std::move(in))};
+  }
+  return mx::array::make_arrays(
+      {{rows, N}, {rows, N}}, {dt, dt}, std::move(prim), std::move(in));
+}
+
+mx::array moe_store_down(
+    mx::array x,
+    mx::array w,
+    mx::array shexp_w,
+    const std::string& kquant_type,
+    mx::array indices,
+    mx::array scores,
+    mx::array slots,
+    std::vector<mx::array> planes,
+    const std::string& shexp_kquant_type,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+  const char* op = "[mlx_kquant.moe_store_down]";
+  const std::string st =
+      shexp_kquant_type.empty() ? kquant_type : shexp_kquant_type;
+  if (!moe_store_supported(kquant_type, st)) {
+    throw std::invalid_argument(
+        std::string(op) + " no store kernel for '" + kquant_type +
+        "' with shared-expert codec '" + st + "' on this device.");
+  }
+  auto dt = x.dtype();
+  if (x.ndim() != 3 || (dt != mx::float16 && dt != mx::bfloat16)) {
+    throw std::invalid_argument(
+        std::string(op) + " x must be [T, S, K] float16 or bfloat16.");
+  }
+  const int T = x.shape(0);
+  const int S = x.shape(1);
+  const int K = x.shape(2);
+  const KqStoreSpec& spec = kq_store_check(op, w, kquant_type, K);
+  const int N = w.shape(1);
+  const int ns = check_kq_shexp_down(op, shexp_w, st, K, N);
+  if (S <= ns || indices.ndim() != 2 || indices.shape(0) != T ||
+      indices.shape(1) != S - ns) {
+    throw std::invalid_argument(
+        std::string(op) + " indices must be [T, S - k].");
+  }
+  if (scores.ndim() != 2 || scores.shape(0) != T ||
+      (scores.shape(1) != S && scores.shape(1) != S - ns)) {
+    throw std::invalid_argument(
+        std::string(op) + " scores must be [T, S] or [T, S - k].");
+  }
+  kq_store_check_planes(op, spec, planes, N, K, slots, w.shape(0));
+  kq_check_weight_base_at_build(w, kquant_type, s, "moe_store_down");
+  kq_check_weight_base_at_build(shexp_w, st, s, "moe_store_down");
+  if (!kq_store_width(
+          x.shape(0), "KQ_MOE_STORE_DOWN_MIN_T", KQ_STORE_DOWN_MIN_T)) {
+    return gather_qmv_mix_kq(
+        std::move(x),
+        std::move(w),
+        std::move(shexp_w),
+        kquant_type,
+        std::move(indices),
+        std::move(scores),
+        shexp_kquant_type,
+        std::nullopt,
+        std::nullopt,
+        s);
+  }
+  std::vector<mx::array> in = {
+      std::move(w),
+      std::move(shexp_w),
+      moe_dense_x(x, s),
+      prep_indices(indices, s),
+      prep_scores(scores, s),
+      std::move(slots)};
+  for (auto& p : planes) {
+    in.push_back(std::move(p));
+  }
+  return mx::array(
+      {T, N},
+      dt,
+      std::make_shared<KQuantMoeStore>(s, 2, kquant_type, st, K),
+      std::move(in));
 }
 
 } // namespace mlx_kquant

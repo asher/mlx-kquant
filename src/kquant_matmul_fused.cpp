@@ -171,8 +171,8 @@ bool glu_dual128() {
 #endif
 
 bool glu_log() {
-  static const bool cached = std::getenv("KQ_QMM_LOG") != nullptr;
-  return glu_tune_live() ? std::getenv("KQ_QMM_LOG") != nullptr : cached;
+  static const bool cached = kq_getenv("KQ_QMM_LOG") != nullptr;
+  return glu_tune_live() ? kq_getenv("KQ_QMM_LOG") != nullptr : cached;
 }
 
 // The product from quantized_matmul and stock ops. The op builds this
@@ -668,9 +668,10 @@ std::vector<mx::array> quantized_matmul_multi(
   const mx::Dtype out_type =
       x.dtype() == mx::float32 ? mx::bfloat16 : x.dtype();
   const int64_t rows = K > 0 ? static_cast<int64_t>(x.size()) / K : 0;
+  // Prefill rows join q6_k weights in one grid (qmm_nax_multi).
   const bool fused = s.device == mx::Device::gpu && nax_available() &&
       codec->has_matmul_kernel && multi_on() && weights.size() >= 2 &&
-      rows >= 2 && rows <= 8;
+      ((rows >= 2 && rows <= 16) || (rows > 128 && kquant_type == "q6_k"));
   if (!fused) {
     return multi_composed(x, weights, kquant_type, oss, s);
   }

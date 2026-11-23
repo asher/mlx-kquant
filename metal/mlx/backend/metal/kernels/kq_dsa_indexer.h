@@ -614,6 +614,9 @@ kq_dsa_indexer_score(
 // tile. Every query tile is staged at once and a key block is read once
 // for all of them. A row's scores are the scores it gets alone, bit for
 // bit: the other query's products meet zero weights.
+// KT (PT rows) continues K: key row r < P reads K, row r >= P reads row
+// r - P of KT, so a pool held as a base and a tail is scored in one call.
+// PT is 0 without a tail, and KT is then never read.
 template <
     typename T,
     int QL,
@@ -636,6 +639,8 @@ kq_dsa_indexer_score_decode(
     const constant int& keys_per_tg [[buffer(7)]],
     const device int* C [[buffer(8)]], // [B, QL, NC] key rows (CAND)
     const constant int& NC [[buffer(9)]],
+    const device T* KT [[buffer(10)]], // [B, PT, D]
+    const constant int& PT [[buffer(11)]],
     uint3 tid [[threadgroup_position_in_grid]],
     ushort simd_gid [[simdgroup_index_in_threadgroup]],
     ushort simd_lid [[thread_index_in_simdgroup]]) {
@@ -655,12 +660,15 @@ kq_dsa_indexer_score_decode(
   threadgroup T Qs[NQT * HP * LD];
   threadgroup float Wsm[NQT * NHT * 64];
   // Staged key rows: one tile per simdgroup under CAND (every block is
-  // staged), one for the whole threadgroup otherwise (only the last is).
-  constexpr int NKT = CAND ? SGS : 1;
+  // staged), two otherwise: the last block of the pool and the block across
+  // the base and tail boundary, which different simdgroups may stage at
+  // once.
+  constexpr int NKT = CAND ? SGS : 2;
   threadgroup T Ktail[NKT * KB * LD];
   threadgroup float Os[SGS * 64];
 
-  const int ncol = CAND ? NC : P;
+  const int PA = P + PT; // key rows over both segments
+  const int ncol = CAND ? NC : PA;
   const int b = int(tid.z);
   const int tg0 = int(tid.x) * keys_per_tg;
   if (tg0 >= ncol) {
@@ -669,7 +677,6 @@ kq_dsa_indexer_score_decode(
   const int tg1 = metal::min(ncol, tg0 + keys_per_tg);
   const int nblk = (tg1 - tg0 + KB - 1) / KB;
   const int tidx = int(simd_gid) * 32 + int(simd_lid);
-  threadgroup T* kt = Ktail + (CAND ? int(simd_gid) : 0) * KB * LD;
 
   if (HP > H && !PAIR) {
     for (int i = tidx; i < (HP - H) * LD; i += NTH) {
@@ -680,6 +687,7 @@ kq_dsa_indexer_score_decode(
   const device T* qb = Q + size_t(b) * H * QL * D;
   const device WT* wb = W + size_t(b) * QL * H;
   const device T* kb = K + size_t(b) * size_t(P) * D;
+  const device T* ktb = KT + size_t(b) * size_t(PT) * D;
   device T* ob = out + size_t(b) * QL * size_t(ncol);
 
   for (int pass = 0; pass < NPASS; ++pass) {
@@ -729,19 +737,26 @@ kq_dsa_indexer_score_decode(
     for (int blk = int(simd_gid); blk < nblk; blk += SGS) {
       const int key0 = tg0 + blk * KB;
       MatT Kt[NB][NDT];
-      if (!CAND && key0 + KB <= P) {
+      // A block wholly inside one segment loads straight from it.
+      const bool in_base = key0 + KB <= P;
+      const bool in_tail = key0 >= P && key0 + KB <= PA;
+      if (!CAND && (in_base || in_tail)) {
+        const device T* seg =
+            in_base ? kb + size_t(key0) * D : ktb + size_t(key0 - P) * D;
         STEEL_PRAGMA_UNROLL
         for (int nb = 0; nb < NB; ++nb) {
-          const device T* kr = kb + size_t(key0 + nb * 8) * D;
+          const device T* kr = seg + size_t(nb * 8) * D;
           STEEL_PRAGMA_UNROLL
           for (int dt = 0; dt < NDT; ++dt) {
             simdgroup_load(Kt[nb][dt], kr + dt * 8, D, ulong2(0, 0), true);
           }
         }
       } else {
-        // Candidate rows, or the last block of the pool: stage the rows
-        // with zeros where the row is out of range so the tile loads
-        // stay in bounds.
+        // Candidate rows, the block across the segment boundary, or the
+        // last block of the pool: stage the rows with zeros where the row
+        // is out of range so the tile loads stay in bounds.
+        threadgroup T* kt =
+            Ktail + (CAND ? int(simd_gid) : (key0 + KB > PA ? 0 : 1)) * KB * LD;
         for (int ch = int(simd_lid); ch < KB * CH; ch += 32) {
           const int r = ch / CH;
           const int d = (ch % CH) * 8;
@@ -750,10 +765,11 @@ kq_dsa_indexer_score_decode(
           if (CAND) {
             kr = col < NC ? cj[col] : -1;
           }
-          const bool ok = kr >= 0 && kr < P;
+          const bool ok = kr >= 0 && kr < PA;
+          const device T* src =
+              kr < P ? kb + size_t(kr) * D : ktb + size_t(kr - P) * D;
           *reinterpret_cast<threadgroup vec<T, 8>*>(kt + r * LD + d) = ok
-              ? *reinterpret_cast<const device vec<T, 8>*>(
-                    kb + size_t(kr) * D + d)
+              ? *reinterpret_cast<const device vec<T, 8>*>(src + d)
               : vec<T, 8>(0);
         }
         simdgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -816,10 +832,10 @@ kq_dsa_indexer_score_decode(
               bool ok = true;
               if (CAND) {
                 kr = cj[col];
-                ok = kr >= 0 && kr < P;
+                ok = kr >= 0 && kr < PA;
               }
               const int vlim =
-                  QL == 1 ? P : metal::min(P, (q_offset + j + 1) / ratio);
+                  QL == 1 ? PA : metal::min(PA, (q_offset + j + 1) / ratio);
               ob[size_t(j) * ncol + col] = ok && kr < vlim
                   ? static_cast<T>(os[simd_lid])
                   : Limits<T>::finite_min;

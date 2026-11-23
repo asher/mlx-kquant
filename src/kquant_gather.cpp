@@ -458,7 +458,7 @@ void gather_qmm_rhs_nax(
   int bm = rows_per_expert < 64 ? 32 : 64;
   // Tuning lever: force the NAX rhs tile height (32/64). Read live - only
   // reached on the sorted prefill path, so the getenv cost is negligible.
-  if (const char* e = std::getenv("KQ_GATHER_RHS_NAX_BM")) {
+  if (const char* e = kq_getenv("KQ_GATHER_RHS_NAX_BM")) {
     int v = std::atoi(e);
     if (v == 32 || v == 64) {
       bm = v;
@@ -561,7 +561,7 @@ void gather_qmm_rhs(
   int bm = rows_per_expert >= 384 ? 64 : (rows_per_expert >= 40 ? 32 : 16);
   // Tuning lever: force a tile height (16/32/64). Read live - only reached
   // on the sorted prefill path, so the getenv cost is negligible.
-  if (const char* e = std::getenv("KQ_GATHER_RHS_BM")) {
+  if (const char* e = kq_getenv("KQ_GATHER_RHS_BM")) {
     int v = std::atoi(e);
     if (v == 16 || v == 32 || v == 64) {
       bm = v;
@@ -1073,7 +1073,7 @@ void KQuantGatherQMM::eval_gpu(
       (K % 64 == 0) && (x.dtype() != mx::float32) &&
       codec_has_nax(kquant_type_);
   static const bool rhs_alu_disabled =
-      std::getenv("KQ_DISABLE_GATHER_RHS_ALU") != nullptr;
+      kq_getenv("KQ_DISABLE_GATHER_RHS_ALU") != nullptr;
   bool kquant_rhs_alu_ok = !rhs_alu_disabled && transpose_ && (K % 32 == 0);
   if (M == 1 && B >= 16 && right_sorted_ && (B / E >= 4) &&
       (kquant_rhs_nax_ok || kquant_rhs_alu_ok) && x.flags().row_contiguous &&

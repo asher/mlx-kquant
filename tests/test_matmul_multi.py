@@ -7,7 +7,9 @@ at M 2, quantized_matmul per weight runs the same kernel body and fold, so
 the outputs match bit for bit. At the default
 levers the joint grid can take another split count than each weight
 alone, so the outputs are checked
-against a float64 reference built from kq.dequantize weights. Every other
+against a float64 reference built from kq.dequantize weights. Past 128
+rows, q6_k weights run in one grid on quantized_matmul's BK=128 tile, which
+gives each output the bits of quantized_matmul on its weight. Every other
 case runs quantized_matmul per weight, which the CPU stream checks.
 """
 
@@ -403,6 +405,8 @@ def _census(steps, codec="q4_0", m=6, k=512, ns=(4096, 640, 48, 48), env=None):
     quantized_matmul_multi ("multi") or quantized_matmul per weight."""
     child = {kk: v for kk, v in os.environ.items() if not kk.startswith("KQ_")}
     child["KQ_QMM_LOG"] = "1"
+    # The routes before the dense row kernel (test_dense_rows.py).
+    child["KQ_DENSE_ROWS"] = "0"
     child.update(env or {})
     r = subprocess.run(
         [
@@ -632,3 +636,49 @@ f32 = [np.array(a.astype(mx.float32)) for a in got + want]
 same = all(np.array_equal(a, b) for a, b in zip(f32[: len(w)], f32[len(w) :]))
 print("EQUAL" if same else "DIFFER")
 """
+
+
+# Prefill rows: q6_k weights side by side in one grid on the BK=128 tile, or
+# a dispatch per weight where a width is not a whole number of 64-wide
+# column tiles or the call has more than four weights.
+PREFILL_NS = [[640, 1024, 128], [640, 48], [128] * 5]
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("ns", PREFILL_NS)
+@pytest.mark.parametrize("m", [129, 213, 769, 871, 4100])
+def test_prefill_rows_match_per_weight_bits(m, ns, dtype):
+    ws = [w for w, _ in _weights("q6_k", ns, 512)]
+    x = _x(m, 512, dtype)
+    got = kq.quantized_matmul_multi(x, ws, "q6_k")
+    want = _per_weight(x, ws, "q6_k")
+    mx.eval(got, want)
+    assert len(got) == len(ws)
+    for g, w in zip(got, want, strict=True):
+        assert g.shape == w.shape and _equal(g, w)
+
+
+def test_prefill_rows_kernels_in_metallib():
+    """The one-grid prefill kernels: q6_k, float16 and bfloat16, 64 and 128
+    row tiles, and no other codec."""
+    if force_cpu():
+        pytest.skip("Metal kernel names only")
+    names = kq.metallib_kernels()
+    if not names:
+        pytest.skip("no metallib loaded")
+    got = sorted(n for n in names if "_qmm_t_nax_bk128_multi_" in n)
+    want = sorted(
+        f"kquant_q6_k_qmm_t_nax_bk128_multi_{t}_bm{bm}"
+        for t in ("float16_t", "bfloat16_t")
+        for bm in (64, 128)
+    )
+    assert got == want
+
+
+@NAX_ONLY
+def test_prefill_rows_one_dispatch_on_nax():
+    kw = {"codec": "q6_k", "m": 300, "ns": (640, 1024)}
+    (joined,) = _census([["multi", {}]], **kw)
+    assert len(joined) == 1 and "bk128_multi" in joined[0], joined
+    (apart,) = _census([["multi", {}]], env={"KQ_QMM_MULTI_ROWS": "0"}, **kw)
+    assert len(apart) == 2 and not any("multi" in n for n in apart), apart

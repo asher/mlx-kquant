@@ -78,8 +78,8 @@ int resid_mode() {
 constexpr int64_t kResidMinRows = 1024;
 
 bool resid_log() {
-  static const bool cached = std::getenv("KQ_QMM_LOG") != nullptr;
-  return resid_tune_live() ? std::getenv("KQ_QMM_LOG") != nullptr : cached;
+  static const bool cached = kq_getenv("KQ_QMM_LOG") != nullptr;
+  return resid_tune_live() ? kq_getenv("KQ_QMM_LOG") != nullptr : cached;
 }
 
 // The sum from quantized_matmul and stock ops. The op builds this where it

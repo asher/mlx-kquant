@@ -17,6 +17,16 @@ constant int kq_seg_gx [[function_constant(203)]];
 // gather_qmm_seg row map: x is the unsorted activations and sorted row r
 // reads x row x_rows[r].
 constant bool kq_seg_xmap [[function_constant(204)]];
+// moe_store_seg_pair: a tile of at most this many rows (1 or 2) runs the
+// column path, each thread one column of gate or up in registers; 0 off.
+constant int kq_seg_colr_fc [[function_constant(205)]];
+constant int kq_seg_colr =
+    is_function_constant_defined(kq_seg_colr_fc) ? kq_seg_colr_fc : 0;
+// moe_store_seg and moe_store_seg_pair: a 64-row tile of at most this many
+// rows decodes its weights straight into the tensor-op fragments; 0 off.
+constant int kq_seg_dr_fc [[function_constant(206)]];
+constant int kq_seg_dr =
+    is_function_constant_defined(kq_seg_dr_fc) ? kq_seg_dr_fc : 0;
 
 // Multiplies a NAX accumulator tile by the output scale (kq_out_scale.h)
 // before the store. col0 is the output column of the tile's first column,
@@ -2161,6 +2171,23 @@ struct KqNaxQ6_KHalfLoader {
         src(src_ + bi * (src_ld_ * bytes_per_block / weights_per_block)),
         half_idx(0) {}
 
+  // Codes of four positions (bytes of c, 0..63) to (code - 32) * e in T,
+  // stored in one write. A code or-ed into the mantissa of half 1024 is
+  // 1024 + code exactly, so the float product rounds once to T as a
+  // per-byte decode would.
+  static void store4(threadgroup T* p, uint c, float e) {
+    const uint even = c & 0x00FF00FFu;
+    const uint odd = (c >> 8) & 0x00FF00FFu;
+    const float2 fe =
+        float2(as_type<half2>(even | 0x64006400u) - half2(1056.0h));
+    const float2 fo =
+        float2(as_type<half2>(odd | 0x64006400u) - half2(1056.0h));
+    *(threadgroup vec<T, 2>*)p = vec<T, 2>(T(fe.x * e), T(fo.x * e));
+    *(threadgroup vec<T, 2>*)(p + 2) = vec<T, 2>(T(fe.y * e), T(fo.y * e));
+  }
+
+  // Four positions a word: each 32-bit word of ql and qh bytes gives the
+  // 6-bit codes of four positions in each quarter.
   void load_unsafe() thread {
     const float d = float(*(const device half*)(src + KQ_Q6_K_D_OFFSET));
     // Scale 2q + (l >= 16) of the half serves weight 32q + l.
@@ -2172,26 +2199,29 @@ struct KqNaxQ6_KHalfLoader {
     for (short q = 0; q < 4; q++) {
       es[q] = d * float(scales[q * 2]);
     }
-    const device uint8_t* ql = src + KQ_Q6_K_QL_OFFSET + half_idx * 64 + lj;
-    const device uint8_t* qh = src + KQ_Q6_K_QH_OFFSET + half_idx * 32 + lj;
-    uint8_t la[n_pos], lb[n_pos], hb[n_pos];
+    const device uint8_t* qlb = src + KQ_Q6_K_QL_OFFSET + half_idx * 64 + lj;
+    const device uint8_t* qhb = src + KQ_Q6_K_QH_OFFSET + half_idx * 32 + lj;
 #pragma unroll
-    for (short j = 0; j < n_pos; j++) {
-      la[j] = ql[j];
-      lb[j] = ql[32 + j];
-      hb[j] = qh[j];
-    }
-#pragma unroll
-    for (short j = 0; j < n_pos; j++) {
-      const uint h = hb[j];
-      const int q0 = int((la[j] & 0x0F) | ((h & 0x03) << 4)) - 32;
-      const int q1 = int((lb[j] & 0x0F) | (((h >> 2) & 0x03) << 4)) - 32;
-      const int q2 = int((la[j] >> 4) | (((h >> 4) & 0x03) << 4)) - 32;
-      const int q3 = int((lb[j] >> 4) | (((h >> 6) & 0x03) << 4)) - 32;
-      dst[j] = T(es[0] * float(q0));
-      dst[32 + j] = T(es[1] * float(q1));
-      dst[64 + j] = T(es[2] * float(q2));
-      dst[96 + j] = T(es[3] * float(q3));
+    for (short v = 0; v < 4; v++) {
+      const uint la = uint(qlb[4 * v]) | (uint(qlb[4 * v + 1]) << 8) |
+          (uint(qlb[4 * v + 2]) << 16) | (uint(qlb[4 * v + 3]) << 24);
+      const uint lb = uint(qlb[32 + 4 * v]) | (uint(qlb[33 + 4 * v]) << 8) |
+          (uint(qlb[34 + 4 * v]) << 16) | (uint(qlb[35 + 4 * v]) << 24);
+      const uint h = uint(qhb[4 * v]) | (uint(qhb[4 * v + 1]) << 8) |
+          (uint(qhb[4 * v + 2]) << 16) | (uint(qhb[4 * v + 3]) << 24);
+      store4(dst + 4 * v, (la & 0x0F0F0F0Fu) | ((h << 4) & 0x30303030u), es[0]);
+      store4(
+          dst + 32 + 4 * v,
+          (lb & 0x0F0F0F0Fu) | ((h << 2) & 0x30303030u),
+          es[1]);
+      store4(
+          dst + 64 + 4 * v,
+          ((la >> 4) & 0x0F0F0F0Fu) | (h & 0x30303030u),
+          es[2]);
+      store4(
+          dst + 96 + 4 * v,
+          ((lb >> 4) & 0x0F0F0F0Fu) | ((h >> 2) & 0x30303030u),
+          es[3]);
     }
   }
 
@@ -4439,6 +4469,61 @@ KQ_NAX_DEFINE_PAIR_LOADER(KqNaxIq2_sPairLoader, KqNaxIq2_sBlockLoader)
   }
 
 KQ_NAX_DEFINE_BK128_KERNEL(q6_k, 256, 6, KqNaxQ6_KHalfLoader)
+
+// quantized_matmul_multi at prefill rows: up to four weights that share x in
+// one grid, the column tiles of weight i after those of the weights before
+// it along grid.x. A tile runs the BK=128 tile above on its own weight and
+// output, so each output holds the bits of quantized_matmul on its weight.
+#define KQ_NAX_DEFINE_BK128_MULTI_KERNEL(codec, LOADER)                     \
+  template <typename T, int BM>                                             \
+  [[kernel]] void kq_##codec##_qmm_t_nax_bk128_multi(                       \
+      const device uint8_t* w0 [[buffer(0)]],                               \
+      const device uint8_t* w1 [[buffer(1)]],                               \
+      const device uint8_t* w2 [[buffer(2)]],                               \
+      const device uint8_t* w3 [[buffer(3)]],                               \
+      const device T* x [[buffer(4)]],                                      \
+      device T* y0 [[buffer(5)]],                                           \
+      device T* y1 [[buffer(6)]],                                           \
+      device T* y2 [[buffer(7)]],                                           \
+      device T* y3 [[buffer(8)]],                                           \
+      const constant int& K [[buffer(9)]],                                  \
+      const constant int* Ns [[buffer(10)]],                                \
+      const constant int& M [[buffer(11)]],                                 \
+      uint3 tid [[threadgroup_position_in_grid]],                           \
+      uint lid [[thread_index_in_threadgroup]],                             \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                     \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                        \
+    constexpr int BN = 64;                                                  \
+    constexpr int BK = 128;                                                 \
+    constexpr int WM = 2;                                                   \
+    constexpr int WN = 2;                                                   \
+    constexpr int BK_padded = (BK + 16 / sizeof(T));                        \
+    using LoaderW = LOADER<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;   \
+    threadgroup T Ws[BN * BK_padded];                                       \
+    int tx = int(tid.x);                                                    \
+    int i = 0;                                                              \
+    while (i < 3 && tx >= Ns[i] / BN) {                                     \
+      tx -= Ns[i] / BN;                                                     \
+      i++;                                                                  \
+    }                                                                       \
+    const device uint8_t* w = i == 0 ? w0 : i == 1 ? w1 : i == 2 ? w2 : w3; \
+    device T* y = i == 0 ? y0 : i == 1 ? y1 : i == 2 ? y2 : y3;             \
+    kq_qmm_t_nax_tgp_impl<T, LoaderW, true, BM, BK, BN, WM, WN>(            \
+        w,                                                                  \
+        x,                                                                  \
+        y,                                                                  \
+        Ws,                                                                 \
+        K,                                                                  \
+        Ns[i],                                                              \
+        M,                                                                  \
+        uint3(tx, tid.y, 0),                                                \
+        lid,                                                                \
+        simd_gid,                                                           \
+        simd_lid);                                                          \
+  }
+
+KQ_NAX_DEFINE_BK128_MULTI_KERNEL(q6_k, KqNaxQ6_KHalfLoader)
+
 KQ_NAX_DEFINE_BK128_KERNEL(q5_k, 256, 5, KqNaxQ5_KHalfLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q3_k, 256, 3, KqNaxQ3_KHalfLoader)
 KQ_NAX_DEFINE_BK128_KERNEL(q4_k, 256, 4, KqNaxQ4_KHalfLoader)

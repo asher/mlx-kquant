@@ -713,6 +713,22 @@ def _sdpa_dtype(dt):
         qkv,
         _qkv("sdpa_decode_gqa"),
     )
+    # Three queries over 4-row pages, the last 24 rows in a tail segment.
+    row_pages = mx.array(np.broadcast_to(np.arange(16, dtype=np.int32), (1, 3, 16)))
+    bad += _operand_failures(
+        "sdpa_paged_rows",
+        lambda q, k, v, k_tail, v_tail: kq.sdpa_paged_rows(
+            q, k, v, 0.0625, row_pages, None, k_tail, v_tail, 40, page_rows=4
+        ),
+        {
+            "q": _rand((1, 24, 3, 256), dt, 18),
+            "k": _rand((1, 2, 40, 256), dt, 19),
+            "v": _rand((1, 2, 40, 256), dt, 20),
+            "k_tail": _rand((1, 2, 24, 256), dt, 21),
+            "v_tail": _rand((1, 2, 24, 256), dt, 22),
+        },
+        _qkv("sdpa_paged_rows", ("k", "v", "k_tail", "v_tail")),
+    )
     # Head dim 512 at the depth that runs pass 1 on NAX.
     wide = {
         "q": _rand((1, 8, 1, 512), dt, 4),

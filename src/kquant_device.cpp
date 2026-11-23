@@ -2,14 +2,17 @@
 // from the IOKit accelerator entry; KQ_GPU_CORES overrides it and is read per
 // call so one process can A/B a policy. Also the environment lever parser
 // (kq_env_lever, kq_env_flag).
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 
 #include "kquant.h"
 #include "kquant_internal.h"
@@ -74,7 +77,7 @@ void warn_env_lever(const char* name, const char* value, const char* takes) {
 }
 
 int parse_env_lever(const char* name, int unset, bool flag) {
-  const char* e = std::getenv(name);
+  const char* e = kq_getenv(name);
   if (e == nullptr || e[0] == '\0') {
     return unset;
   }
@@ -101,7 +104,55 @@ int parse_env_lever(const char* name, int unset, bool flag) {
   return static_cast<int>(n);
 }
 
+// Off until kq_env_cache(true): code that changes a lever in process (the
+// tests, tuning scripts) reads it live unless it asks for the cache.
+std::atomic<bool> g_env_cache{false};
+// Bumped by kq_env_cache: a thread's entries of an older epoch are dropped.
+std::atomic<unsigned> g_env_epoch{0};
+
+struct EnvEntry {
+  std::string name;
+  std::string value;
+  bool set;
+};
+
 } // namespace
+
+const char* kq_getenv(const char* name) {
+  if (!g_env_cache.load(std::memory_order_relaxed)) {
+    return std::getenv(name);
+  }
+  // Keyed by the name's address (the callers pass literals) and checked
+  // against the stored name, so a reused address cannot alias a lever.
+  thread_local std::unordered_map<const char*, EnvEntry> cache;
+  thread_local unsigned epoch = 0;
+  const unsigned now = g_env_epoch.load(std::memory_order_relaxed);
+  if (epoch != now) {
+    cache.clear();
+    epoch = now;
+  }
+  auto it = cache.find(name);
+  if (it == cache.end() || it->second.name != name) {
+    const char* e = std::getenv(name);
+    EnvEntry entry{name, e != nullptr ? e : "", e != nullptr};
+    it = cache.insert_or_assign(name, std::move(entry)).first;
+  }
+  return it->second.set ? it->second.value.c_str() : nullptr;
+}
+
+bool kq_env_cache_on() {
+  return g_env_cache.load(std::memory_order_relaxed);
+}
+
+unsigned kq_env_epoch() {
+  return g_env_epoch.load(std::memory_order_relaxed);
+}
+
+bool kq_env_cache(bool on) {
+  const bool was = g_env_cache.exchange(on);
+  g_env_epoch.fetch_add(1);
+  return was;
+}
 
 int kq_env_lever(const char* name, int unset) {
   return parse_env_lever(name, unset, false);
@@ -112,7 +163,7 @@ int kq_env_flag(const char* name, int unset) {
 }
 
 int kq_env_lever_from(const char* name, int unset, int lowest) {
-  const char* e = std::getenv(name);
+  const char* e = kq_getenv(name);
   if (e == nullptr || e[0] == '\0') {
     return unset;
   }
@@ -129,7 +180,7 @@ int kq_env_choice(
     const char* name,
     const std::vector<std::string>& choices,
     int unset) {
-  const char* e = std::getenv(name);
+  const char* e = kq_getenv(name);
   if (e == nullptr || e[0] == '\0') {
     return unset;
   }
@@ -149,7 +200,7 @@ int kq_env_choice(
 }
 
 int gpu_core_count() {
-  const char* e = std::getenv("KQ_GPU_CORES");
+  const char* e = kq_getenv("KQ_GPU_CORES");
   if (e != nullptr) {
     const int n = std::atoi(e);
     if (n > 0) {

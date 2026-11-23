@@ -16,14 +16,24 @@ import os
 import subprocess
 import sys
 
+import mlx.core as mx
 import numpy as np
 import pytest
+
+import mlx_kquant as kq
 
 pytestmark = pytest.mark.skipif(
     bool(os.environ.get("KQUANT_FORCE_CPU")),
     reason="fused MoE gathers are Metal-only kernels; no CPU path.",
 )
 EXT = {"KQ_MOE_QF": "0"}
+# The grouped kernels are the default from 5 rows on GPUs with the tensor-op
+# units (KQ_MOE_GROUP).
+NAX = (
+    not os.environ.get("KQUANT_FORCE_CPU")
+    and mx.metal.is_available()
+    and kq.nax_available()
+)
 
 
 def _run_child(argv, env, what):
@@ -448,21 +458,33 @@ def test_mix_sp_bit_identical(codec, scodec, T, tmp_path):
     """KQ_MOE_MIX_FORM=loop against sp on both score-mixed down gathers:
     identical bytes with one score per slot and with routed scores only,
     and the slot-parallel kernels serve the default on a grid that
-    underfills the device."""
+    underfills the device. From 5 rows on GPUs with the tensor-op units
+    the default is the grouped down, which matches the loop within
+    rounding."""
     outs, logs = _form_arms(codec, scodec, T, 256, tmp_path, ("loop", "sp", "default"))
+    grouped = T >= 5 and NAX
     for name in ("mix_ns", "mix", "mix_unit"):
         a = outs["loop"][name]
         assert np.isfinite(a).all() and np.abs(a).max() > 0, name
-        for arm in ("sp", "default"):
-            b = outs[arm][name]
-            assert np.array_equal(a, b), (name, arm, np.abs(a - b).max())
+        assert np.array_equal(a, outs["sp"][name]), name
+        b = outs["default"][name]
+        if grouped:
+            assert np.abs(a - b).max() <= 2e-3 * np.abs(a).max(), name
+        else:
+            assert np.array_equal(a, b), (name, np.abs(a - b).max())
     stem = codec if scodec == codec else f"{codec}_sx_{scodec}"
     for arm in ("sp", "default"):
+        if arm == "default" and grouped:
+            assert f"kq_{codec}_sx_{scodec}_gather_qmv_mix_grp_" in logs[arm], logs[arm]
+            assert "_sp_" not in logs[arm] and "_dd" not in logs[arm], logs[arm]
+            continue
         for want in (
             f"kq_{codec}_gather_qmv_mix_ns_sp_",
             f"kq_{stem}_gather_qmv_mix_sp_",
         ):
             assert want in logs[arm], (arm, want, logs[arm])
+    for arm in ("loop", "sp"):
+        assert "_grp" not in logs[arm], (arm, logs[arm])
     assert "_sp_" not in logs["loop"] and "_dd" not in logs["loop"], logs["loop"]
 
 

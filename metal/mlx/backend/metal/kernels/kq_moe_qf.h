@@ -42,50 +42,67 @@
   };
 
 // A core whose loop has the two-row form (kVM == 2): rows2 also dots x1.
-#define KQ_QF_CORE_PAIR(NAME, FN, GS, BITS, RPS, BB)                  \
-  struct NAME {                                                       \
-    MLX_MTL_CONST int rps = RPS;                                      \
-    static METAL_FUNC int64_t row_bytes(int K) {                      \
-      return (int64_t)(K / GS) * BB;                                  \
-    }                                                                 \
-    template <typename T, int R>                                      \
-    static METAL_FUNC void rows(                                      \
-        const device uint8_t* w,                                      \
-        const device T* x,                                            \
-        const constant int& K,                                        \
-        const constant int& N,                                        \
-        uint tile,                                                    \
-        uint sg,                                                      \
-        uint lid,                                                     \
-        thread float* res) {                                          \
-      FN<T, GS, BITS, R, true>(                                       \
-          w, x, nullptr, K, N, uint3(0, tile, 0), sg, lid, res);      \
-    }                                                                 \
-    template <typename T, int R>                                      \
-    static METAL_FUNC void rows2(                                     \
-        const device uint8_t* w,                                      \
-        const device T* x0,                                           \
-        const device T* x1,                                           \
-        const constant int& K,                                        \
-        const constant int& N,                                        \
-        uint tile,                                                    \
-        uint sg,                                                      \
-        uint lid,                                                     \
-        thread float* res) {                                          \
-      FN<T, GS, BITS, R, true, 2>(                                    \
-          w, x0, nullptr, K, N, uint3(0, tile, 0), sg, lid, res, x1); \
-    }                                                                 \
+// rows4 dots four rows (kVM == 4), for the grouped kernels below.
+#define KQ_QF_CORE_PAIR(NAME, FN, GS, BITS, RPS, BB)                          \
+  struct NAME {                                                               \
+    MLX_MTL_CONST int rps = RPS;                                              \
+    static METAL_FUNC int64_t row_bytes(int K) {                              \
+      return (int64_t)(K / GS) * BB;                                          \
+    }                                                                         \
+    template <typename T, int R>                                              \
+    static METAL_FUNC void rows(                                              \
+        const device uint8_t* w,                                              \
+        const device T* x,                                                    \
+        const constant int& K,                                                \
+        const constant int& N,                                                \
+        uint tile,                                                            \
+        uint sg,                                                              \
+        uint lid,                                                             \
+        thread float* res) {                                                  \
+      FN<T, GS, BITS, R, true>(                                               \
+          w, x, nullptr, K, N, uint3(0, tile, 0), sg, lid, res);              \
+    }                                                                         \
+    template <typename T, int R>                                              \
+    static METAL_FUNC void rows2(                                             \
+        const device uint8_t* w,                                              \
+        const device T* x0,                                                   \
+        const device T* x1,                                                   \
+        const constant int& K,                                                \
+        const constant int& N,                                                \
+        uint tile,                                                            \
+        uint sg,                                                              \
+        uint lid,                                                             \
+        thread float* res) {                                                  \
+      FN<T, GS, BITS, R, true, 2>(                                            \
+          w, x0, nullptr, K, N, uint3(0, tile, 0), sg, lid, res, x1);         \
+    }                                                                         \
+    template <typename T, int R>                                              \
+    static METAL_FUNC void rows4(                                             \
+        const device uint8_t* w,                                              \
+        const device T* x0,                                                   \
+        const device T* x1,                                                   \
+        const device T* x2,                                                   \
+        const device T* x3,                                                   \
+        const constant int& K,                                                \
+        const constant int& N,                                                \
+        uint tile,                                                            \
+        uint sg,                                                              \
+        uint lid,                                                             \
+        thread float* res) {                                                  \
+      FN<T, GS, BITS, R, true, 4>(                                            \
+          w, x0, nullptr, K, N, uint3(0, tile, 0), sg, lid, res, x1, x2, x3); \
+    }                                                                         \
   };
 
 // clang-format off
-KQ_QF_CORE(KqQfQ4_0, kq_q4_0_qmv_fast_impl, KQ_Q4_0_GROUP, 4, 4, KQ_Q4_0_BLOCK_BYTES)
-KQ_QF_CORE(KqQfQ4_1, kq_q4_1_qmv_fast_impl, KQ_Q4_1_GROUP, 4, 4, KQ_Q4_1_BLOCK_BYTES)
+KQ_QF_CORE_PAIR(KqQfQ4_0, kq_q4_0_qmv_fast_impl, KQ_Q4_0_GROUP, 4, 4, KQ_Q4_0_BLOCK_BYTES)
+KQ_QF_CORE_PAIR(KqQfQ4_1, kq_q4_1_qmv_fast_impl, KQ_Q4_1_GROUP, 4, 4, KQ_Q4_1_BLOCK_BYTES)
 KQ_QF_CORE_PAIR(KqQfQ5_0, kq_q5_0_qmv_fast_impl, KQ_Q5_0_GROUP, 5, 4, KQ_Q5_0_BLOCK_BYTES)
 KQ_QF_CORE_PAIR(KqQfQ5_1, kq_q5_1_qmv_fast_impl, KQ_Q5_1_GROUP, 5, 4, KQ_Q5_1_BLOCK_BYTES)
 KQ_QF_CORE_PAIR(KqQfIq4_nl, kq_iq4_nl_qmv_impl, KQ_IQ4_NL_GROUP, 4, 4, KQ_IQ4_NL_BLOCK_BYTES)
-KQ_QF_CORE(KqQfQ2_K, kq_q2_k_qmv_fast_impl, KQ_Q2_K_SUPERBLOCK, 2, 2, KQ_Q2_K_BLOCK_BYTES)
-KQ_QF_CORE(KqQfQ3_K, kq_q3_k_qmv_fast_impl, KQ_Q3_K_SUPERBLOCK, 3, 2, KQ_Q3_K_BLOCK_BYTES)
-KQ_QF_CORE(KqQfQ4_K, kq_q4_k_qmv_fast_impl, KQ_Q4_K_SUPERBLOCK, 4, 2, KQ_Q4_K_BLOCK_BYTES)
+KQ_QF_CORE_PAIR(KqQfQ2_K, kq_q2_k_qmv_fast_impl, KQ_Q2_K_SUPERBLOCK, 2, 2, KQ_Q2_K_BLOCK_BYTES)
+KQ_QF_CORE_PAIR(KqQfQ3_K, kq_q3_k_qmv_fast_impl, KQ_Q3_K_SUPERBLOCK, 3, 2, KQ_Q3_K_BLOCK_BYTES)
+KQ_QF_CORE_PAIR(KqQfQ4_K, kq_q4_k_qmv_fast_impl, KQ_Q4_K_SUPERBLOCK, 4, 2, KQ_Q4_K_BLOCK_BYTES)
 KQ_QF_CORE(KqQfQ5_K, kq_q5_k_qmv_fast_impl, KQ_Q5_K_SUPERBLOCK, 5, 2, KQ_Q5_K_BLOCK_BYTES)
 KQ_QF_CORE(KqQfQ6_K, kq_q6_k_qmv_fast_impl, KQ_Q6_K_SUPERBLOCK, 6, 4, KQ_Q6_K_BLOCK_BYTES)
 KQ_QF_CORE_PAIR(KqQfIq4_xs, kq_iq4_xs_qmv_impl, KQ_IQ4_XS_SUPERBLOCK, 4, 2, KQ_IQ4_XS_BLOCK_BYTES)
@@ -146,6 +163,34 @@ struct KqQfNvfp4 {
       thread float* res) {
     kq_nvfp4_qmv_impl<T, KQ_NVFP4_SUPERBLOCK, 4, R, false, true, 2>(
         w, x0, nullptr, K, N, uint3(0, tile, 0), sg, lid, nullptr, res, x1);
+  }
+  template <typename T, int R>
+  static METAL_FUNC void rows4(
+      const device uint8_t* w,
+      const device T* x0,
+      const device T* x1,
+      const device T* x2,
+      const device T* x3,
+      const constant int& K,
+      const constant int& N,
+      uint tile,
+      uint sg,
+      uint lid,
+      thread float* res) {
+    kq_nvfp4_qmv_impl<T, KQ_NVFP4_SUPERBLOCK, 4, R, false, true, 4>(
+        w,
+        x0,
+        nullptr,
+        K,
+        N,
+        uint3(0, tile, 0),
+        sg,
+        lid,
+        nullptr,
+        res,
+        x1,
+        x2,
+        x3);
   }
 };
 
@@ -667,6 +712,202 @@ template <typename T, typename C, typename SCd>
   }
 }
 
+// ---------------------------------------------------------------------------
+// Grouped qf gathers (the grouping of kq_ext_moe_glu_gather_shexp_grp, see
+// kq_moe_glu_kq.h), for the cores with rows2 and rows4: the owner of a run
+// of up to four (row, slot) pairs on one expert decodes the expert's rows
+// once for every member's activation row and the other pairs return. Each
+// row's sums are the one-row loop's, so a row has the bits of the plain qf
+// kernels at every call width. A shared slot runs once per row, as there.
+// Launch of the plain kernels, grid (N / (2 rps), slots, T).
+// ---------------------------------------------------------------------------
+
+// Rows of one expert matrix against cnt (1 to 4) activation rows at element
+// offsets xo of x, to res[member * rps + row]. A run of three passes its
+// first row again as the fourth.
+template <typename T, typename C>
+METAL_FUNC void kq_qf_rows_grp(
+    const device uint8_t* w,
+    const device T* x,
+    int4 xo,
+    int cnt,
+    const constant int& K,
+    const constant int& N,
+    uint tile,
+    uint sg,
+    uint lid,
+    thread float* res) {
+  constexpr int RPS = C::rps;
+  if (cnt == 1) {
+    C::template rows<T, RPS>(w, x + xo.x, K, N, tile, sg, lid, res);
+  } else if (cnt == 2) {
+    C::template rows2<T, RPS>(w, x + xo.x, x + xo.y, K, N, tile, sg, lid, res);
+  } else {
+    C::template rows4<T, RPS>(
+        w, x + xo.x, x + xo.y, x + xo.z, x + xo.w, K, N, tile, sg, lid, res);
+  }
+}
+
+// GLU with NS shared slots (NS == 0 serves the call with no shared expert),
+// a routed pair's threadgroup taking the run it leads (kq_grp_run).
+template <typename T, typename C, typename SC, int ACT>
+[[kernel]] void KQ_MOE_KERNEL(kq_qf_moe_glu_gather_shexp_grp)(
+    const device uint8_t* gw [[buffer(0)]],
+    const device uint8_t* uw [[buffer(1)]],
+    const device uint8_t* sgw [[buffer(2)]],
+    const device uint8_t* suw [[buffer(3)]],
+    const device T* x [[buffer(4)]],
+    const device uint32_t* indices [[buffer(5)]],
+    device T* out [[buffer(6)]],
+    const constant int& K [[buffer(7)]],
+    const constant int& N [[buffer(8)]],
+    const constant float& limit [[buffer(9)]],
+    KQ_GLU_ALPHA_ARG,
+    const constant int& NS [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]] KQ_MOE_ARGS_SHEXP_GLU) {
+  constexpr int RPS = C::rps;
+  const int slots = int(tpg.y);
+  const int n_route = slots - NS;
+  const bool shared_slot = int(tid.y) >= n_route;
+  // The dense route computed the shared slots (kq_moe_shexp_glu_pre).
+  if (kq_shexp_pre && shared_slot) {
+    return;
+  }
+  const int row0 = tid.x * 2 * RPS + simd_gid * RPS;
+  const int p = int(tid.z) * n_route + int(tid.y);
+  int cnt = 1;
+  int mem[KQ_GRP_MAX];
+  uint expert = 0;
+  if (!shared_slot) {
+    cnt = kq_grp_run(indices, int(tpg.z) * n_route, p, simd_lid, mem);
+    if (cnt == 0) {
+      return;
+    }
+    expert = indices[p];
+  }
+  // Four members a pass: member i writes output pair mo[i] of the (row,
+  // slot) grid.
+  for (int q0 = 0; q0 < cnt; q0 += 4) {
+    const int qc = min(4, cnt - q0);
+    float g[4 * RPS] = {0};
+    float u[4 * RPS] = {0};
+    int4 mo = int4(int(tid.z) * slots + int(tid.y));
+    if (shared_slot) {
+      const device T* xp = x + (int64_t)tid.z * K;
+      const int64_t off =
+          (int64_t)(int(tid.y) - n_route) * N * SC::row_bytes(K);
+      SC::template rows<T, RPS>(
+          sgw + off, xp, K, N, tid.x, simd_gid, simd_lid, g);
+      SC::template rows<T, RPS>(
+          suw + off, xp, K, N, tid.x, simd_gid, simd_lid, u);
+    } else {
+      const int4 m = int4(mem[q0], mem[q0 + 1], mem[q0 + 2], mem[q0 + 3]);
+      const int4 mr = m / n_route;
+      mo = mr * slots + (m - mr * n_route);
+      const int64_t off = (int64_t)expert * N * C::row_bytes(K);
+      kq_qf_rows_grp<T, C>(
+          gw + off, x, mr * K, qc, K, N, tid.x, simd_gid, simd_lid, g);
+      kq_qf_rows_grp<T, C>(
+          uw + off, x, mr * K, qc, K, N, tid.x, simd_gid, simd_lid, u);
+    }
+    if (simd_lid == 0) {
+      for (int m = 0; m < qc; m++) {
+        device T* o = out + (int64_t)mo[m] * N + row0;
+        for (int i = 0; i < RPS; i++) {
+          KQ_MOE_DO(const float sg_ = shared_slot
+                        ? kq_moe_shexp_scale(shexp_scale)
+                        : kq_moe_row_scale(out_scale, expert, N, row0 + i);
+                    const float su_ = shared_slot
+                        ? kq_moe_shexp_scale(shexp_up_scale)
+                        : kq_moe_row_scale(up_scale, expert, N, row0 + i);)
+          o[i] = static_cast<T>(kq_glu_epilogue<ACT>(
+              KQ_MOE_MUL(g[m * RPS + i], sg_),
+              KQ_MOE_MUL(u[m * RPS + i], su_),
+              limit,
+              KQ_GLU_ALPHA));
+        }
+      }
+    }
+  }
+}
+
+// Row sums of every (row, slot) pair of a score-mixed down with NS (0 or 1)
+// shared slots, to part [T, S, N] float32 for kq_moe_mix_grp_sum. Grid
+// (N / (2 rps), S, T), or (N / (2 rps), S - 1, T) when the dense route
+// computed the shared slot.
+template <typename T, typename C, typename SCd>
+[[kernel]] void KQ_MOE_KERNEL(kq_qf_gather_qmv_mix_grp)(
+    const device uint8_t* w [[buffer(0)]],
+    const device uint8_t* sw [[buffer(1)]],
+    const device T* h [[buffer(2)]],
+    const device uint32_t* indices [[buffer(3)]],
+    device float* part [[buffer(5)]],
+    const constant int& K [[buffer(6)]],
+    const constant int& N [[buffer(7)]],
+    const constant int& S [[buffer(8)]],
+    const constant int& NS [[buffer(9)]],
+    const constant int& NT [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int RPS = C::rps;
+  const int n_route = S - NS;
+  const int p = int(tid.z) * n_route + int(tid.y);
+  const bool shared_slot = int(tid.y) >= n_route;
+  int cnt = 1;
+  int mem[KQ_GRP_MAX];
+  if (!shared_slot) {
+    cnt = kq_grp_run(indices, int(tpg.z) * n_route, p, simd_lid, mem);
+    if (cnt == 0) {
+      return;
+    }
+  }
+  // NT tiles of 2 * RPS rows a threadgroup, so one run search serves them.
+  const int tiles = N / (2 * RPS);
+  const int tile_end = min(tiles, (int(tid.x) + 1) * NT);
+  for (int tile = int(tid.x) * NT; tile < tile_end; ++tile) {
+    const int row0 = tile * 2 * RPS + simd_gid * RPS;
+    // Four members a pass: member i is pair mp[i] of the [T, S] grid of h
+    // and part.
+    for (int q0 = 0; q0 < cnt; q0 += 4) {
+      const int qc = min(4, cnt - q0);
+      float r[4 * RPS] = {0};
+      int4 mp = int4(int(tid.z) * S + int(tid.y));
+      if (shared_slot) {
+        SCd::template rows<T, RPS>(
+            sw, h + (int64_t)mp.x * K, K, N, tile, simd_gid, simd_lid, r);
+      } else {
+        const int4 m = int4(mem[q0], mem[q0 + 1], mem[q0 + 2], mem[q0 + 3]);
+        const int4 mr = m / n_route;
+        mp = mr * S + (m - mr * n_route);
+        kq_qf_rows_grp<T, C>(
+            w + (int64_t)indices[p] * N * C::row_bytes(K),
+            h,
+            mp * K,
+            qc,
+            K,
+            N,
+            tile,
+            simd_gid,
+            simd_lid,
+            r);
+      }
+      if (simd_lid == 0) {
+        for (int m = 0; m < qc; m++) {
+          device float* o = part + (int64_t)mp[m] * N + row0;
+          for (int i = 0; i < RPS; i++) {
+            o[i] = r[m * RPS + i];
+          }
+        }
+      }
+    }
+  }
+}
+
 // Kernel names: "kq_<codec>_qf_<op>" and, with a shared expert,
 // "kq_<codec>_qf_sx_<shared codec>_<op>".
 // clang-format off
@@ -722,9 +963,34 @@ template <typename T, typename C, typename SCd>
   instantiate_kernel("kq_" #codec "_qf_moe_glu_gather_dd_silu_limit_" #type,  \
       KQ_MOE_KERNEL(kq_qf_moe_glu_gather_dd), type, core, KQ_GLU_ACT_SILU_LIMIT)
 
-#define instantiate_kq_qf_dd(codec, core)                                     \
-  instantiate_kq_qf_dd_type(codec, core, bfloat16_t)                          \
+#define instantiate_kq_qf_grp_type(codec, core, scodec, score, type)          \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_qf_sx_" #scodec "_moe_glu_gather_shexp_grp_silu_" #type, \
+      KQ_MOE_KERNEL(kq_qf_moe_glu_gather_shexp_grp), type, core, score,       \
+      KQ_GLU_ACT_SILU)                                                         \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_qf_sx_" #scodec "_moe_glu_gather_shexp_grp_gelu_" #type, \
+      KQ_MOE_KERNEL(kq_qf_moe_glu_gather_shexp_grp), type, core, score,       \
+      KQ_GLU_ACT_GELU)                                                         \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_qf_sx_" #scodec "_gather_qmv_mix_grp_" #type,            \
+      KQ_MOE_KERNEL(kq_qf_gather_qmv_mix_grp), type, core, score)
+
+#define instantiate_kq_qf_grp(codec, core, type)                              \
+  instantiate_kq_qf_grp_type(codec, core, codec, core, type)                  \
+  instantiate_kq_qf_grp_type(codec, core, q5_k, KqQfQ5_K, type)               \
+  instantiate_kq_qf_grp_type(codec, core, q6_k, KqQfQ6_K, type)               \
+  instantiate_kq_qf_grp_type(codec, core, q8_0, KqQfQ8_0, type)
+
+// The pair GLU, for the cores it pays on (kq_qf_pairs).
+#define instantiate_kq_qf_dd(codec, core)             \
+  instantiate_kq_qf_dd_type(codec, core, bfloat16_t) \
   instantiate_kq_qf_dd_type(codec, core, float16_t)
+
+// The grouped kernels, for every routed core.
+#define instantiate_kq_qf_grp_all(codec, core)   \
+  instantiate_kq_qf_grp(codec, core, bfloat16_t) \
+  instantiate_kq_qf_grp(codec, core, float16_t)
 
 #define instantiate_kq_qf(codec, core)                                        \
   instantiate_kq_qf_type_all(codec, core, bfloat16_t)                         \

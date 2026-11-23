@@ -41,7 +41,7 @@ namespace {
 // getenv cost is negligible on the prefill path).
 bool kq_indexer_mma_enabled() {
   return kq_is_nax_available() &&
-      std::getenv("KQ_DISABLE_INDEXER_MMA") == nullptr;
+      kq_getenv("KQ_DISABLE_INDEXER_MMA") == nullptr;
 }
 
 constexpr int kq_indexer_mma_bm = 64;
@@ -258,15 +258,23 @@ void KQDsaIndexerScoreDecode::eval_gpu(
   const int H = q.shape(1);
   const int QL = q.shape(2);
   const int P = k.shape(1) / q.shape(3);
+  // The tail segment continues the key rows (k again and 0 rows without).
+  const mx::array kt = tail_ ? kq_strides_aligned_gpu(
+                                   inputs[cand_ ? 4 : 3],
+                                   s,
+                                   "dsa_indexer_score_decode keys_tail",
+                                   align)
+                             : k;
+  const int PT = tail_ ? kt.shape(1) / q.shape(3) : 0;
   // Columns scored per query: the candidate list's width, else every row.
   const mx::array& cand = cand_ ? inputs[3] : q;
-  const int NC = cand_ ? cand.shape(2) : P;
+  const int NC = cand_ ? cand.shape(2) : P + PT;
 
   const bool wf = weights.dtype() == mx::float32;
   // 4 heads fill half a query tile, so 2 to 4 query rows go two to a tile
   // and share one read of the keys. KQ_DSA_SCORE_PAIR=0 keeps one row per
   // tile and one pass over the keys per row.
-  const char* pair_env = std::getenv("KQ_DSA_SCORE_PAIR");
+  const char* pair_env = kq_getenv("KQ_DSA_SCORE_PAIR");
   const bool pair =
       H == 4 && QL > 1 && !cand_ && !(pair_env && std::string(pair_env) == "0");
   const std::string kname = "kq_dsa_indexer_score_decode_" +
@@ -292,11 +300,18 @@ void KQDsaIndexerScoreDecode::eval_gpu(
   ce.set_input_array(weights, 2);
   ce.set_output_array(out, 3);
   ce.set_bytes(P, 4);
-  ce.set_bytes(q_offset_, 5);
+  if (param_slot_ >= 0) {
+    ce.set_bytes(kq_param_value(inputs.back(), param_slot_), 5);
+    kq_param_site(5, 0, param_slot_);
+  } else {
+    ce.set_bytes(q_offset_, 5);
+  }
   ce.set_bytes(ratio_, 6);
   ce.set_bytes(kpt, 7);
   ce.set_input_array(cand, 8);
   ce.set_bytes(NC, 9);
+  ce.set_input_array(kt, 10);
+  ce.set_bytes(PT, 11);
 
   MTL::Size group_dims(32, sgs, 1);
   MTL::Size grid_dims((NC + kpt - 1) / kpt, 1, B);
@@ -315,7 +330,7 @@ namespace {
 // forces a count, rounded down to a power of two.
 int kq_dsa_topk_chunks(int rows, int K) {
   constexpr int max_chunks = 16;
-  if (const char* e = std::getenv("KQ_DSA_TOPK_CHUNKS")) {
+  if (const char* e = kq_getenv("KQ_DSA_TOPK_CHUNKS")) {
     const int v = std::atoi(e);
     if (v >= 1) {
       int g = 1;
@@ -531,13 +546,18 @@ std::vector<mx::Shape> KQDsaIndexerScoreDecode::output_shapes(
     const std::vector<mx::array>& inputs) {
   const auto& q = inputs[0];
   const auto& k = inputs[1];
-  const int cols = cand_ ? inputs[3].shape(2) : k.shape(1);
+  // k and the tail come flattened to [B, rows * D].
+  const int D = q.shape(3);
+  const int cols = cand_
+      ? inputs[3].shape(2)
+      : k.shape(1) / D + (tail_ ? inputs[3].shape(1) / D : 0);
   return {mx::Shape{q.shape(0), 1, q.shape(2), cols}};
 }
 
 bool KQDsaIndexerScoreDecode::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQDsaIndexerScoreDecode&>(other);
-  return q_offset_ == o.q_offset_ && ratio_ == o.ratio_ && cand_ == o.cand_;
+  return q_offset_ == o.q_offset_ && ratio_ == o.ratio_ && cand_ == o.cand_ &&
+      tail_ == o.tail_ && param_slot_ == o.param_slot_;
 }
 
 mx::array dsa_indexer_score_decode(
@@ -547,9 +567,19 @@ mx::array dsa_indexer_score_decode(
     int q_offset,
     int ratio,
     const std::optional<mx::array>& cand,
-    mx::StreamOrDevice s_) {
+    const std::optional<mx::array>& keys_tail,
+    mx::StreamOrDevice s_,
+    const std::optional<mx::array>& params,
+    int q_offset_slot) {
   auto s = mx::to_stream(s_);
 
+  if (params &&
+      (params->dtype() != mx::int32 || params->ndim() != 1 ||
+       q_offset_slot < 0 || q_offset_slot >= params->size())) {
+    throw std::invalid_argument(
+        "[mlx_kquant.dsa_indexer_score_decode] params must be an int32 "
+        "vector holding q_offset_slot.");
+  }
   if (queries.ndim() != 4 || keys.ndim() != 3 || weights.ndim() != 3) {
     std::ostringstream msg;
     msg << "[mlx_kquant.dsa_indexer_score_decode] expected q rank 4, keys "
@@ -566,9 +596,9 @@ mx::array dsa_indexer_score_decode(
         << "indexer heads of dim 128, got " << queries.shape() << ".";
     throw std::invalid_argument(msg.str());
   }
-  if (QL < 1 || QL > 4) {
+  if (QL < 1 || QL > 8) {
     std::ostringstream msg;
-    msg << "[mlx_kquant.dsa_indexer_score_decode] qL must be in [1, 4], got "
+    msg << "[mlx_kquant.dsa_indexer_score_decode] qL must be in [1, 8], got "
         << QL << " (use dsa_indexer_scores for prefill widths).";
     throw std::invalid_argument(msg.str());
   }
@@ -594,6 +624,17 @@ mx::array dsa_indexer_score_decode(
     msg << "[mlx_kquant.dsa_indexer_score_decode] cand must be int32 or "
         << "uint32 [B, qL, NC], got " << cand->shape() << " " << cand->dtype()
         << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  if (keys_tail &&
+      (keys_tail->ndim() != 3 || keys_tail->shape(0) != B ||
+       keys_tail->shape(1) < 1 || keys_tail->shape(2) != 128 ||
+       keys_tail->dtype() != keys.dtype())) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.dsa_indexer_score_decode] keys_tail must be [B, PT, "
+        << "128] in the keys' dtype, got " << keys_tail->shape() << " "
+        << keys_tail->dtype() << ".";
     throw std::invalid_argument(msg.str());
   }
 
@@ -627,16 +668,36 @@ mx::array dsa_indexer_score_decode(
   auto w = mx::contiguous(
       mx::astype(weights, weights_f32 ? mx::float32 : final_type, s), false, s);
 
-  mx::Shape out_shape{B, 1, QL, cand ? cand->shape(2) : keys.shape(1)};
+  const int tail_rows = keys_tail ? keys_tail->shape(1) : 0;
+  mx::Shape out_shape{
+      B, 1, QL, cand ? cand->shape(2) : keys.shape(1) + tail_rows};
   std::vector<mx::array> inputs = {std::move(q), std::move(k), std::move(w)};
   if (cand) {
     inputs.push_back(mx::contiguous(mx::astype(*cand, mx::int32, s), false, s));
+  }
+  if (keys_tail) {
+    auto kt = mx::reshape(
+        mx::astype(*keys_tail, final_type, s),
+        {B, keys_tail->shape(1) * keys_tail->shape(2)},
+        s);
+    if (B > 1) {
+      kt = mx::contiguous(kt, false, s);
+    }
+    inputs.push_back(std::move(kt));
+  }
+  if (params) {
+    inputs.push_back(*params);
   }
   return mx::array(
       std::move(out_shape),
       final_type,
       std::make_shared<KQDsaIndexerScoreDecode>(
-          s, q_offset, ratio, cand.has_value()),
+          s,
+          q_offset,
+          ratio,
+          cand.has_value(),
+          keys_tail.has_value(),
+          params ? q_offset_slot : -1),
       std::move(inputs));
 }
 

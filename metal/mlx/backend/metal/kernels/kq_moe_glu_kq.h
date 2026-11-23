@@ -2251,6 +2251,605 @@ template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
 }
 
 // ---------------------------------------------------------------------------
+// Grouped gathers for the verify widths (T = 2..16 rows per step). The pair
+// kernels above read an expert once per two (row, slot) pairs that route
+// to it; these read it once per KQ_GRP_MAX. The pairs on one expert, in
+// row-major order, form runs of KQ_GRP_MAX, and the threadgroup of a run's
+// first pair (kq_grp_run) dequantizes each weight chunk once a pass and
+// dots it with up to four members' activation rows a pass; the other
+// pairs' threadgroups return before staging. The one, two and four row
+// forms keep their sums in registers, and each member's chunk accumulation
+// and reduce keep the single-row order. The shared expert runs as groups
+// of consecutive rows.
+//   moe_glu_gather_shexp_grp: grid (N-tiles, slots, T).
+//   gather_qmv_mix_grp: the same grid on the down projection; it writes each
+//     pair's row sums to a float32 [T, S, N] store, and kq_moe_mix_grp_sum
+//     adds a row's slots under their scores.
+// ---------------------------------------------------------------------------
+#define KQ_GRP_MAX 8
+
+// The run pair p of the P pairs of indices leads: its size, or 0 when p is
+// not the first pair of its run, and its pairs in m (unused entries p).
+// Each simdgroup reads the indices 32 at a time and gets the same answer,
+// so a threadgroup returns as one.
+METAL_FUNC int kq_grp_run(
+    const device uint32_t* indices,
+    int P,
+    int p,
+    uint lane,
+    thread int* m) {
+  const uint e = indices[p];
+  int rank = 0;
+  for (int q0 = 0; q0 < p; q0 += 32) {
+    const int q = q0 + int(lane);
+    rank += int(
+        popcount(static_cast<ulong>(simd_ballot(q < p && indices[q] == e))));
+  }
+  if (rank % KQ_GRP_MAX != 0) {
+    return 0;
+  }
+  for (int i = 0; i < KQ_GRP_MAX; ++i) {
+    m[i] = p;
+  }
+  int n = 1;
+  for (int q0 = p + 1; q0 < P && n < KQ_GRP_MAX; q0 += 32) {
+    const int q = q0 + int(lane);
+    ulong b = static_cast<ulong>(simd_ballot(q < P && indices[q] == e));
+    for (; b != 0 && n < KQ_GRP_MAX; ++n) {
+      m[n] = q0 + int(ctz(b));
+      b &= b - 1;
+    }
+  }
+  return n;
+}
+
+#define KQ_GRP_DOT16(lw, xp)                                \
+  (dot(lw[0], float4(*(const device vec<T, 4>*)(xp + 0))) + \
+   dot(lw[1], float4(*(const device vec<T, 4>*)(xp + 4))) + \
+   dot(lw[2], float4(*(const device vec<T, 4>*)(xp + 8))) + \
+   dot(lw[3], float4(*(const device vec<T, 4>*)(xp + 12))))
+
+// kq_ext_row_partial for four activation rows, one sum per component.
+template <typename T, typename Codec, int NX>
+METAL_FUNC float4 kq_ext_row_partial_quad(
+    const device uint8_t* w,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    const device T* x3,
+    int64_t row,
+    int K,
+    short tx,
+    const threadgroup uint8_t* luts) {
+  constexpr short chpb = Codec::superblock / 16;
+  const int nb = K / Codec::superblock;
+  const device uint8_t* w_row = w + row * (int64_t)nb * Codec::block_bytes;
+  float4 acc = float4(0.0f);
+  for (int ich = tx; 16 * ich < K; ich += NX) {
+    float4x4 lw;
+    float sc;
+    KqTgLuts<Codec>::deq_chunk16s(
+        w_row + (int64_t)(ich / chpb) * Codec::block_bytes,
+        short(ich % chpb),
+        lw,
+        luts,
+        sc);
+    const int o = ich * 16;
+    acc.x += sc * KQ_GRP_DOT16(lw, (x0 + o));
+    acc.y += sc * KQ_GRP_DOT16(lw, (x1 + o));
+    acc.z += sc * KQ_GRP_DOT16(lw, (x2 + o));
+    acc.w += sc * KQ_GRP_DOT16(lw, (x3 + o));
+  }
+  return acc;
+}
+
+// kq_ext_glu_row_partial for four activation rows: gate sums in ag, up in au.
+template <typename T, typename Codec, int NX>
+METAL_FUNC void kq_ext_glu_row_partial_quad(
+    const device uint8_t* gw,
+    const device uint8_t* uw,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    const device T* x3,
+    int64_t row,
+    int K,
+    short tx,
+    const threadgroup uint8_t* luts,
+    thread float4& ag,
+    thread float4& au) {
+  constexpr short chpb = Codec::superblock / 16;
+  const int nb = K / Codec::superblock;
+  const int64_t row_off = row * (int64_t)nb * Codec::block_bytes;
+  const device uint8_t* g_row = gw + row_off;
+  const device uint8_t* u_row = uw + row_off;
+  ag = float4(0.0f);
+  au = float4(0.0f);
+  for (int ich = tx; 16 * ich < K; ich += NX) {
+    const int64_t boff = (int64_t)(ich / chpb) * Codec::block_bytes;
+    const short cch = short(ich % chpb);
+    const int o = ich * 16;
+    float4x4 lw;
+    float sc;
+    KqTgLuts<Codec>::deq_chunk16s(g_row + boff, cch, lw, luts, sc);
+    ag.x += sc * KQ_GRP_DOT16(lw, (x0 + o));
+    ag.y += sc * KQ_GRP_DOT16(lw, (x1 + o));
+    ag.z += sc * KQ_GRP_DOT16(lw, (x2 + o));
+    ag.w += sc * KQ_GRP_DOT16(lw, (x3 + o));
+    KqTgLuts<Codec>::deq_chunk16s(u_row + boff, cch, lw, luts, sc);
+    au.x += sc * KQ_GRP_DOT16(lw, (x0 + o));
+    au.y += sc * KQ_GRP_DOT16(lw, (x1 + o));
+    au.z += sc * KQ_GRP_DOT16(lw, (x2 + o));
+    au.w += sc * KQ_GRP_DOT16(lw, (x3 + o));
+  }
+}
+
+// One, two or four activation rows against one gate and up weight row,
+// each by the form with that many sums. Rows past cnt repeat row 0.
+template <typename T, typename Codec, int NX>
+METAL_FUNC void kq_ext_glu_row_partial_grp(
+    const device uint8_t* gw,
+    const device uint8_t* uw,
+    const device T* x,
+    int4 xo,
+    int cnt,
+    int64_t row,
+    int K,
+    short tx,
+    const threadgroup uint8_t* luts,
+    thread float4& ag,
+    thread float4& au) {
+  if (cnt == 1) {
+    const float2 gu = kq_ext_glu_row_partial<T, Codec, NX>(
+        gw, uw, x + xo.x, row, K, tx, luts);
+    ag = float4(gu.x);
+    au = float4(gu.y);
+  } else if (cnt == 2) {
+    const float4 gu = kq_ext_glu_row_partial_pair<T, Codec, NX>(
+        gw, uw, x + xo.x, x + xo.y, row, K, tx, luts);
+    ag = gu.xzxx;
+    au = gu.ywyy;
+  } else {
+    kq_ext_glu_row_partial_quad<T, Codec, NX>(
+        gw,
+        uw,
+        x + xo.x,
+        x + xo.y,
+        x + xo.z,
+        x + xo.w,
+        row,
+        K,
+        tx,
+        luts,
+        ag,
+        au);
+  }
+}
+
+template <typename T, typename Codec, int NX>
+METAL_FUNC float4 kq_ext_row_partial_grp(
+    const device uint8_t* w,
+    const device T* x,
+    int4 xo,
+    int cnt,
+    int64_t row,
+    int K,
+    short tx,
+    const threadgroup uint8_t* luts) {
+  if (cnt == 1) {
+    return float4(
+        kq_ext_row_partial<T, Codec, NX>(w, x + xo.x, row, K, tx, luts));
+  }
+  if (cnt == 2) {
+    return kq_ext_row_partial_pair<T, Codec, NX>(
+               w, x + xo.x, x + xo.y, row, K, tx, luts)
+        .xyxx;
+  }
+  return kq_ext_row_partial_quad<T, Codec, NX>(
+      w, x + xo.x, x + xo.y, x + xo.z, x + xo.w, row, K, tx, luts);
+}
+
+template <
+    typename T,
+    typename Codec,
+    typename SCodec,
+    int ACT,
+    int NX = KQ_EXT_NXPSG>
+[[kernel]] void KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp_grp)(
+    const device uint8_t* gw [[buffer(0)]],
+    const device uint8_t* uw [[buffer(1)]],
+    const device uint8_t* sgw [[buffer(2)]],
+    const device uint8_t* suw [[buffer(3)]],
+    const device T* x [[buffer(4)]],
+    const device uint32_t* indices [[buffer(5)]],
+    device T* out [[buffer(6)]],
+    const constant int& K [[buffer(7)]],
+    const constant int& N [[buffer(8)]],
+    const constant float& limit [[buffer(9)]],
+    KQ_GLU_ALPHA_ARG,
+    const constant int& NS [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]] KQ_MOE_ARGS_SHEXP_GLU) {
+  constexpr int RPS = 32 / NX;
+  const short tx = short(simd_lid % NX);
+  const short ty = short(simd_lid / NX);
+  const int slots = int(tpg.y);
+  const int n_route = slots - NS;
+  const int T_ = int(tpg.z);
+  const bool shared_slot = int(tid.y) >= n_route;
+  // The dense route computed the shared slots (kq_moe_shexp_glu_pre).
+  if (kq_shexp_pre && shared_slot) {
+    return;
+  }
+  // The group: rows tid.z on of the shared slot, or the pairs of the run
+  // this pair leads.
+  int cnt;
+  int mem[KQ_GRP_MAX];
+  if (shared_slot) {
+    if (int(tid.z) % KQ_GRP_MAX != 0) {
+      return;
+    }
+    cnt = min(KQ_GRP_MAX, T_ - int(tid.z));
+  } else {
+    cnt = kq_grp_run(
+        indices,
+        T_ * n_route,
+        int(tid.z) * n_route + int(tid.y),
+        simd_lid,
+        mem);
+    if (cnt == 0) {
+      return;
+    }
+  }
+  const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
+
+  KQ_MOE_DO(float2 kq_s;)
+  KQ_EXT_DECL_LUTS2(Codec, SCodec, kq_luts)
+  int expert = 0;
+  if (shared_slot) {
+    KQ_MOE_DO(kq_s = float2(
+                  kq_moe_shexp_scale(shexp_scale),
+                  kq_moe_shexp_scale(shexp_up_scale));)
+    KQ_EXT_STAGE_INTO(SCodec, kq_luts)
+  } else {
+    KQ_EXT_STAGE_INTO(Codec, kq_luts)
+    expert = int(indices[int(tid.z) * n_route + int(tid.y)]);
+    KQ_MOE_DO(kq_s = float2(
+                  kq_moe_row_scale(out_scale, expert, N, out_row),
+                  kq_moe_row_scale(up_scale, expert, N, out_row));)
+  }
+  // Four members a pass: member i reads activation row mr[i] and writes
+  // output pair mo[i] of the (row, slot) grid.
+  for (int q0 = 0; q0 < cnt; q0 += 4) {
+    const int qc = min(4, cnt - q0);
+    int4 mr;
+    int4 mo;
+    float4 ag;
+    float4 au;
+    if (shared_slot) {
+      mr = min(int4(int(tid.z) + q0) + int4(0, 1, 2, 3), int4(T_ - 1));
+      mo = mr * slots + int(tid.y);
+      kq_ext_glu_row_partial_grp<T, SCodec, NX>(
+          sgw,
+          suw,
+          x,
+          mr * K,
+          qc,
+          (int64_t)(int(tid.y) - n_route) * N + out_row,
+          K,
+          tx,
+          kq_luts,
+          ag,
+          au);
+    } else {
+      const int4 m = int4(mem[q0], mem[q0 + 1], mem[q0 + 2], mem[q0 + 3]);
+      mr = m / n_route;
+      mo = mr * slots + (m - mr * n_route);
+      kq_ext_glu_row_partial_grp<T, Codec, NX>(
+          gw,
+          uw,
+          x,
+          mr * K,
+          qc,
+          (int64_t)expert * N + out_row,
+          K,
+          tx,
+          kq_luts,
+          ag,
+          au);
+    }
+    for (int i = 0; i < qc; ++i) {
+      const float g = kq_ext_reduce<NX>(ag[i]);
+      const float u = kq_ext_reduce<NX>(au[i]);
+      if (tx == 0) {
+        out[(int64_t)mo[i] * N + out_row] = static_cast<T>(kq_glu_epilogue<ACT>(
+            KQ_MOE_MUL(g, kq_s.x), KQ_MOE_MUL(u, kq_s.y), limit, KQ_GLU_ALPHA));
+      }
+    }
+  }
+}
+
+#if !KQ_MOE_OS
+// kq_ext_moe_glu_gather_shexp_grp with the shared expert's gate and up
+// tensors each in its own codec (kq_ext_moe_glu_gather_shexp2).
+template <
+    typename T,
+    typename Codec,
+    typename SGCodec,
+    typename SUCodec,
+    int ACT,
+    int NX = KQ_EXT_NXPSG>
+[[kernel]] void kq_ext_moe_glu_gather_shexp2_grp(
+    const device uint8_t* gw [[buffer(0)]],
+    const device uint8_t* uw [[buffer(1)]],
+    const device uint8_t* sgw [[buffer(2)]],
+    const device uint8_t* suw [[buffer(3)]],
+    const device T* x [[buffer(4)]],
+    const device uint32_t* indices [[buffer(5)]],
+    device T* out [[buffer(6)]],
+    const constant int& K [[buffer(7)]],
+    const constant int& N [[buffer(8)]],
+    const constant float& limit [[buffer(9)]],
+    KQ_GLU_ALPHA_ARG,
+    const constant int& NS [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int RPS = 32 / NX;
+  const short tx = short(simd_lid % NX);
+  const short ty = short(simd_lid / NX);
+  const int slots = int(tpg.y);
+  const int n_route = slots - NS;
+  const int T_ = int(tpg.z);
+  const bool shared_slot = int(tid.y) >= n_route;
+  int cnt;
+  int mem[KQ_GRP_MAX];
+  if (shared_slot) {
+    if (int(tid.z) % KQ_GRP_MAX != 0) {
+      return;
+    }
+    cnt = min(KQ_GRP_MAX, T_ - int(tid.z));
+  } else {
+    cnt = kq_grp_run(
+        indices,
+        T_ * n_route,
+        int(tid.z) * n_route + int(tid.y),
+        simd_lid,
+        mem);
+    if (cnt == 0) {
+      return;
+    }
+  }
+  const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
+
+  KQ_EXT_DECL_LUTS2(Codec, SGCodec, kq_luts)
+  KQ_EXT_DECL_LUTS2(SUCodec, SUCodec, kq_suluts)
+  int expert = 0;
+  if (shared_slot) {
+    KQ_EXT_STAGE_INTO(SGCodec, kq_luts)
+    KQ_EXT_STAGE_INTO(SUCodec, kq_suluts)
+  } else {
+    KQ_EXT_STAGE_INTO(Codec, kq_luts)
+    expert = int(indices[int(tid.z) * n_route + int(tid.y)]);
+  }
+  for (int q0 = 0; q0 < cnt; q0 += 4) {
+    const int qc = min(4, cnt - q0);
+    int4 mr;
+    int4 mo;
+    float4 ag;
+    float4 au;
+    if (shared_slot) {
+      mr = min(int4(int(tid.z) + q0) + int4(0, 1, 2, 3), int4(T_ - 1));
+      mo = mr * slots + int(tid.y);
+      const int64_t srow = (int64_t)(int(tid.y) - n_route) * N + out_row;
+      ag = kq_ext_row_partial_grp<T, SGCodec, NX>(
+          sgw, x, mr * K, qc, srow, K, tx, kq_luts);
+      au = kq_ext_row_partial_grp<T, SUCodec, NX>(
+          suw, x, mr * K, qc, srow, K, tx, kq_suluts);
+    } else {
+      const int4 m = int4(mem[q0], mem[q0 + 1], mem[q0 + 2], mem[q0 + 3]);
+      mr = m / n_route;
+      mo = mr * slots + (m - mr * n_route);
+      kq_ext_glu_row_partial_grp<T, Codec, NX>(
+          gw,
+          uw,
+          x,
+          mr * K,
+          qc,
+          (int64_t)expert * N + out_row,
+          K,
+          tx,
+          kq_luts,
+          ag,
+          au);
+    }
+    for (int i = 0; i < qc; ++i) {
+      const float g = kq_ext_reduce<NX>(ag[i]);
+      const float u = kq_ext_reduce<NX>(au[i]);
+      if (tx == 0) {
+        out[(int64_t)mo[i] * N + out_row] =
+            static_cast<T>(kq_glu_epilogue<ACT>(g, u, limit, KQ_GLU_ALPHA));
+      }
+    }
+  }
+}
+#endif
+
+// Row sums of every (row, slot) pair of a score-mixed down, to part
+// [T, S, N] float32. h is [T, S, K]; the shared slots are the last NS and
+// read sw as the mix kernels do. Grid (N-tiles, S, T), or (N-tiles, S - NS,
+// T) when the dense route computed the shared slots.
+template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
+[[kernel]] void KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_grp)(
+    const device uint8_t* w [[buffer(0)]],
+    const device uint8_t* sw [[buffer(1)]],
+    const device T* h [[buffer(2)]],
+    const device uint32_t* indices [[buffer(3)]],
+    device float* part [[buffer(5)]],
+    const constant int& K [[buffer(6)]],
+    const constant int& N [[buffer(7)]],
+    const constant int& S [[buffer(8)]],
+    const constant int& NS [[buffer(9)]],
+    const constant int& NT [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int RPS = 32 / NX;
+  const short tx = short(simd_lid % NX);
+  const short ty = short(simd_lid / NX);
+  const int n_route = S - NS;
+  const int T_ = int(tpg.z);
+  const bool shared_slot = int(tid.y) >= n_route;
+  int cnt;
+  int mem[KQ_GRP_MAX];
+  if (shared_slot) {
+    if (int(tid.z) % KQ_GRP_MAX != 0) {
+      return;
+    }
+    cnt = min(KQ_GRP_MAX, T_ - int(tid.z));
+  } else {
+    cnt = kq_grp_run(
+        indices,
+        T_ * n_route,
+        int(tid.z) * n_route + int(tid.y),
+        simd_lid,
+        mem);
+    if (cnt == 0) {
+      return;
+    }
+  }
+  KQ_EXT_DECL_LUTS2(Codec, SCodec, kq_luts)
+  int expert = 0;
+  if (shared_slot) {
+    KQ_EXT_STAGE_INTO(SCodec, kq_luts)
+  } else {
+    KQ_EXT_STAGE_INTO(Codec, kq_luts)
+    expert = int(indices[int(tid.z) * n_route + int(tid.y)]);
+  }
+  // NT tiles a threadgroup, so one run search and LUT stage serve them.
+  const int tile_rows = int(tptg.y) * RPS;
+  const int tile_end = min(N / tile_rows, (int(tid.x) + 1) * NT);
+  for (int tile = int(tid.x) * NT; tile < tile_end; ++tile) {
+    const int out_row = tile * tile_rows + int(simd_gid) * RPS + ty;
+    // Four members a pass: member i is pair mp[i] of the [T, S] grid of h
+    // and part.
+    for (int q0 = 0; q0 < cnt; q0 += 4) {
+      const int qc = min(4, cnt - q0);
+      int4 mp;
+      float4 acc;
+      if (shared_slot) {
+        mp = min(int4(int(tid.z) + q0) + int4(0, 1, 2, 3), int4(T_ - 1)) * S +
+            int(tid.y);
+        acc = kq_ext_row_partial_grp<T, SCodec, NX>(
+            sw,
+            h,
+            mp * K,
+            qc,
+            (int64_t)out_row * NS + (int(tid.y) - n_route),
+            K,
+            tx,
+            kq_luts);
+      } else {
+        const int4 m = int4(mem[q0], mem[q0 + 1], mem[q0 + 2], mem[q0 + 3]);
+        const int4 r = m / n_route;
+        mp = r * S + (m - r * n_route);
+        acc = kq_ext_row_partial_grp<T, Codec, NX>(
+            w, h, mp * K, qc, (int64_t)expert * N + out_row, K, tx, kq_luts);
+      }
+      for (int i = 0; i < qc; ++i) {
+        const float r = kq_ext_reduce<NX>(acc[i]);
+        if (tx == 0) {
+          part[(int64_t)mp[i] * N + out_row] = r;
+        }
+      }
+    }
+  }
+}
+
+// out[t, n] = sum over slots of score * part[t, slot, n], the shared slots
+// under their score or an implicit 1 (SC == S - NS), or from shexp_pre
+// [T, N] with kq_shexp_pre. With output scales a slot's weight carries the
+// scale of its expert's row. Grid (N, 1, T) threads.
+template <typename T>
+[[kernel]] void KQ_MOE_KERNEL(kq_moe_mix_grp_sum)(
+    const device float* part [[buffer(0)]],
+    const device float* scores [[buffer(1)]],
+    device T* out [[buffer(2)]],
+    const constant int& N [[buffer(3)]],
+    const constant int& S [[buffer(4)]],
+    const constant int& SC [[buffer(5)]],
+    const constant int& NS [[buffer(6)]],
+    const device uint32_t* indices [[buffer(7)]],
+    KQ_SHEXP_PRE_ARG,
+    uint3 gid [[thread_position_in_grid]] KQ_MOE_ARGS_MIX) {
+  (void)indices; // read only by the output scale forms
+  const int n = int(gid.x);
+  const int t = int(gid.z);
+  const int n_route = S - NS;
+  const device float* p = part + (int64_t)t * S * N + n;
+  float result = 0.0f;
+  for (int s = 0; s < n_route; ++s) {
+    result += KQ_MOE_MUL(
+                  scores[t * SC + s],
+                  kq_moe_row_scale(out_scale, indices[t * n_route + s], N, n)) *
+        p[(int64_t)s * N];
+  }
+  if (kq_shexp_pre) {
+    result += KQ_MOE_MUL(
+                  (SC == S ? scores[t * SC + n_route] : 1.0f),
+                  kq_moe_shexp_scale(shexp_scale)) *
+        float(shexp_pre[(int64_t)t * N + n]);
+  } else {
+    for (int s = n_route; s < S; ++s) {
+      result += KQ_MOE_MUL(
+                    (SC == S ? scores[t * SC + s] : 1.0f),
+                    kq_moe_shexp_scale(shexp_scale)) *
+          p[(int64_t)s * N];
+    }
+  }
+  out[(int64_t)t * N + n] = static_cast<T>(result);
+}
+
+// clang-format off
+#define instantiate_kq_ext_grp_nx(stem, traits, straits, type, nx, sfx)       \
+  instantiate_kernel(                                                         \
+      "kq_" stem "_moe_glu_gather_shexp_grp_silu" sfx "_" #type,              \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp_grp), type, traits, straits, KQ_GLU_ACT_SILU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" stem "_moe_glu_gather_shexp_grp_gelu" sfx "_" #type,              \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp_grp), type, traits, straits, KQ_GLU_ACT_GELU, nx) \
+  instantiate_kq_ext_grp_mix_nx(stem, traits, straits, type, nx, sfx)
+
+#define instantiate_kq_ext_grp_mix_nx(stem, traits, straits, type, nx, sfx)   \
+  instantiate_kernel(                                                         \
+      "kq_" stem "_gather_qmv_mix_grp" sfx "_" #type,                         \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_grp), type, traits, straits, nx)
+
+// Kernel names "kq_<codec>_sx_<shared codec>_<op>_grp...", the shared codec
+// named also when it is the routed one.
+#define instantiate_kq_ext_grp(stem, traits, straits, type)                   \
+  instantiate_kq_ext_grp_nx(stem, traits, straits, type, 8, "")               \
+  instantiate_kq_ext_grp_nx(stem, traits, straits, type, 16, "_nx16")
+
+#if KQ_MOE_OS
+#define instantiate_kq_moe_grp_common()                                       \
+  instantiate_kernel("kq_moe_mix_grp_sum_os_bfloat16_t", KQ_MOE_KERNEL(kq_moe_mix_grp_sum), bfloat16_t) \
+  instantiate_kernel("kq_moe_mix_grp_sum_os_float16_t", KQ_MOE_KERNEL(kq_moe_mix_grp_sum), float16_t)
+#else
+#define instantiate_kq_moe_grp_common()                                       \
+  instantiate_kernel("kq_moe_mix_grp_sum_bfloat16_t", KQ_MOE_KERNEL(kq_moe_mix_grp_sum), bfloat16_t) \
+  instantiate_kernel("kq_moe_mix_grp_sum_float16_t", KQ_MOE_KERNEL(kq_moe_mix_grp_sum), float16_t)
+#endif
+// clang-format on
+
+// ---------------------------------------------------------------------------
 // Router top-k (codec-independent float kernel): score E logits, pick the
 // top R (min-index tie-break), emit gather-ready indices [T, R] uint32 and
 // mix scores [T, R + SHARED] float32 in one dispatch. SCORING == 0 is f32
@@ -2843,7 +3442,8 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
   instantiate_kq_ext_uniform_nx(codec, traits, type, 8, "")                   \
   instantiate_kq_ext_uniform_nx(codec, traits, type, 16, "_nx16")             \
   instantiate_kq_ext_uniform_nx(codec, traits, type, 32, "_nx32")             \
-  instantiate_kq_ext_mix_sp(#codec, traits, traits, type)
+  instantiate_kq_ext_mix_sp(#codec, traits, traits, type)                     \
+  instantiate_kq_ext_grp(#codec "_sx_" #codec, traits, traits, type)
 
 // Mixed-codec shared expert: shexp tensors in scodec over codec expert
 // stacks (UD-style upcast shexp). Dispatch key "kq_<codec>_sx_<scodec>_...".
@@ -2871,7 +3471,8 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
   instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 8, "")       \
   instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 16, "_nx16") \
   instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 32, "_nx32") \
-  instantiate_kq_ext_mix_sp(#codec "_sx_" #scodec, traits, straits, type)
+  instantiate_kq_ext_mix_sp(#codec "_sx_" #scodec, traits, straits, type)     \
+  instantiate_kq_ext_grp(#codec "_sx_" #scodec, traits, straits, type)
 
 // No-shared-expert mix (gemma-style weighted sum; always the generic kernel,
 // q6_k/q8_0 included).
@@ -2924,7 +3525,8 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
 #define instantiate_kq_ext_sx_q5k(codec, traits, type)                        \
   instantiate_kq_ext_sx_nx(codec, traits, q5_k, KqQ5_KExt, type, 8, "")       \
   instantiate_kq_ext_sx_nx(codec, traits, q5_k, KqQ5_KExt, type, 16, "_nx16") \
-  instantiate_kq_ext_mix_sp(#codec "_sx_q5_k", traits, KqQ5_KExt, type)
+  instantiate_kq_ext_mix_sp(#codec "_sx_q5_k", traits, KqQ5_KExt, type)       \
+  instantiate_kq_ext_grp(#codec "_sx_q5_k", traits, KqQ5_KExt, type)
 
 #define instantiate_kq_ext_all(codec, traits)                                 \
   instantiate_kq_ext_uniform(codec, traits, bfloat16_t)                       \

@@ -19,6 +19,28 @@ namespace mlx_kquant {
 // Throws on other dtypes.
 std::string kq_type_string(mx::Dtype d);
 
+// std::getenv(name), through a cache once kq_env_cache(true) was called: a
+// variable is then read from the environment once per thread and name, so
+// an op's eval does not scan the environment for every lever it asks. The
+// cache is off by default, and every call reads the environment. A cached
+// pointer is valid until kq_env_cache is next called.
+const char* kq_getenv(const char* name);
+// Whether that cache is on, and a count that moves on every kq_env_cache
+// call: state derived from lever values is good for one count.
+bool kq_env_cache_on();
+unsigned kq_env_epoch();
+
+// Parameter blocks of recorded graphs (kquant_fused_graph.cpp). A primitive
+// that takes a value from slot `slot` of the block `p` reads it with
+// kq_param_value in its eval, and after each set_bytes that carries the
+// value says where it sits: the int32 at byte `field` of the bytes bound at
+// `idx` is value * mul + add. A direct replay then writes the block's
+// current value there. Every use of the value in the eval has to be such a
+// field: nothing else of the eval (a kernel name, a grid, a buffer size)
+// may depend on it.
+int kq_param_value(const mx::array& p, int slot);
+void kq_param_site(int idx, int field, int slot, int mul = 1, int add = 0);
+
 // Integer value of the environment lever `name`. Absent or empty reads as
 // `unset`; 0, false, off and no read as 0; 1, true, on and yes read as 1;
 // any other integer reads as itself. Any other value reads as `unset`, with

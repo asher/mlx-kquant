@@ -58,8 +58,8 @@ int conv_mode() {
 }
 
 bool conv_log() {
-  static const bool cached = std::getenv("KQ_QMM_LOG") != nullptr;
-  return conv_tune_live() ? std::getenv("KQ_QMM_LOG") != nullptr : cached;
+  static const bool cached = kq_getenv("KQ_QMM_LOG") != nullptr;
+  return conv_tune_live() ? kq_getenv("KQ_QMM_LOG") != nullptr : cached;
 }
 
 // The composition: MLX's convolution on the flipped kernel with flip set,
@@ -115,9 +115,9 @@ void KQuantConv3x3::eval_gpu(
     bn = 64;
     wn = 2;
   }
-  static const char* tile_cached = std::getenv("KQ_CONV_TILE");
+  static const char* tile_cached = kq_getenv("KQ_CONV_TILE");
   const char* tile_env =
-      conv_tune_live() ? std::getenv("KQ_CONV_TILE") : tile_cached;
+      conv_tune_live() ? kq_getenv("KQ_CONV_TILE") : tile_cached;
   if (tile_env != nullptr && tile_env[0] != '\0') {
     if (std::sscanf(tile_env, "%d,%d,%d,%d", &bm, &bn, &wm, &wn) != 4) {
       throw std::invalid_argument(
