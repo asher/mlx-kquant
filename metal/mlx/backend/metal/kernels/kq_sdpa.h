@@ -849,8 +849,10 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
 // page the query's end falls in, so the caller appends nothing. A page is
 // counted once however often it is listed, as in the shared-tile forms: a
 // page listed before is skipped, and the tail page is the list's last
-// entry for this, the same call as listing it. A list in ascending order
-// needs no search.
+// entry for this, the same call as listing it. The first tile of each split
+// searches each of its pages, the tail page too when it lands there. Past
+// that tile a page in the list's ascending prefix needs no search, and the
+// tail page after a list that is ascending to its end takes a binary search.
 // Partials are [B, Hq, q_len, gqa_splits, D] float32, merged by
 // kq_sdpa_gqa_2pass_2.
 template <typename T, int D, int C, int PR, int NE = 4>
@@ -949,12 +951,13 @@ template <typename T, int D, int C, int PR, int NE = 4>
   const int t1 = min(t0 + tchunk, n_tiles);
 
   // A page listed before in the list (or, for the tail page, anywhere in
-  // it) is skipped. A listed page is searched for only past the list's
-  // ascending prefix [0, fd): strictly ascending pages, then a run of
-  // negative entries that may end the list. The tail page after a list
-  // that is ascending to its end takes a binary search. The searches run
-  // over the whole threadgroup, a tile ahead, between the barriers the
-  // tile loop already has.
+  // it) is skipped. The split's first tile searches all its pages. Past it
+  // a listed page is searched for only past the list's ascending prefix
+  // [0, fd): strictly ascending pages, then a run of negative entries that
+  // may end the list (a page after a negative entry ends it). The tail
+  // page after a list that is ascending to its end takes a binary search.
+  // The searches run over the whole threadgroup, a tile ahead, between the
+  // barriers the tile loop already has.
   const int p_end = min(t1 * PPT, n_pages);
   auto raw_page = [&](int pi) {
     const int pg = pi < n_pages ? prow[pi] : pi < n_all ? tail_pg : -1;

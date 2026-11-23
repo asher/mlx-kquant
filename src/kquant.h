@@ -4388,7 +4388,12 @@ class KQuantEventWait : public mx::Primitive {
 // take any value in the range `param_ranges` gives it; a slot with no range
 // keeps the value it had at fuse_graph. fused_call and fused_patch refuse a
 // block outside that (std::invalid_argument, false): the caller then
-// records again or runs its plain path.
+// records again or runs its plain path. A primitive that reads its block on
+// the host may read it only from the `params` input or from an array the
+// tape holds (evaluated at fuse_graph): fuse_graph refuses one that reads
+// it from any other of its inputs (std::invalid_argument), since a kernel
+// of the same eval may not have written that input when the primitive is
+// encoded.
 struct FusedParamRange {
   int slot;
   int32_t lo;
