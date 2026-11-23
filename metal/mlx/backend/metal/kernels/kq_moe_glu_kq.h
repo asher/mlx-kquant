@@ -987,7 +987,8 @@ METAL_FUNC float kq_ext_dot64(
     const thread float4* a,
     const threadgroup uint8_t* luts) {
   if (KqExtC64<Codec>::ok) {
-    constexpr short cpb = Codec::superblock / 64;
+    // 1 for 32-weight blocks: their codecs compile this branch, never run it
+    constexpr short cpb = Codec::superblock >= 64 ? Codec::superblock / 64 : 1;
     const device uint8_t* block =
         w_row + (int64_t)(ic / cpb) * Codec::block_bytes;
     const short c = short(ic % cpb);
@@ -1045,7 +1046,8 @@ METAL_FUNC float4 kq_ext_dot64_rows(
   const device T* xs[4] = {x0, x1, x2, x3};
   float4 out = 0.0f;
   if (KqExtC64<Codec>::ok) {
-    constexpr short cpb = Codec::superblock / 64;
+    // 1 for 32-weight blocks: their codecs compile this branch, never run it
+    constexpr short cpb = Codec::superblock >= 64 ? Codec::superblock / 64 : 1;
     const device uint8_t* block =
         w_row + (int64_t)(ic / cpb) * Codec::block_bytes;
     const short c = short(ic % cpb);
