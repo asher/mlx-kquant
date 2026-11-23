@@ -336,8 +336,12 @@ void hclr_front_fn_gpu(
   // Up to 16 rows take the MMA form, all rows one operand
   // (kq_hc_lowrank_front_mma) under KQ_HC_FRONT_MMA=1. It ties the lane
   // form at 8 rows and loses below, so it is off. The two give different
-  // bits.
-  if (rows <= 16 && kq_env_lever_from("KQ_HC_FRONT_MMA", 0, 0) != 0) {
+  // bits. Its vector loads need h, gamma and the inject on 16-byte
+  // boundaries; a view that starts off one takes the lane form.
+  const bool aligned = h.offset() % 16 == 0 && gamma.offset() % 16 == 0 &&
+      w_inject.offset() % 16 == 0;
+  if (rows <= 16 && aligned &&
+      kq_env_lever_from("KQ_HC_FRONT_MMA", 0, 0) != 0) {
     auto kernel = kq_get_kernel(
         d,
         std::string("kq_hc_lowrank_front_mma_f") + (rows <= 8 ? "1" : "2") +
