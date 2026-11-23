@@ -51,8 +51,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on GPUs with the tensor-op units: 3 to 12% faster at 8 rows and 23% at 16 than the grouped down
   (512 experts of 2560 by 640, M5 Max); low bits change with the call's width. `KQ_MOE_TILE=0`
   turns it off.
-- `skinny_matmul` (a MoE router's logits) at 4 to 16 rows runs 1.4x to 2.4x faster on M5 and later
-  GPUs (M5 Max). Outputs differ at rounding level. `KQ_SKINNY_MMA=0` restores the previous kernel.
+- `skinny_matmul` (a MoE router's logits) at 1 to 16 rows, K a multiple of 8, runs on a
+  simdgroup-matrix kernel on M5 and later GPUs: 1.4x to 2.4x faster at 4 to 16 rows (M5 Max).
+  Outputs differ at rounding level. `KQ_SKINNY_MMA=0` restores the previous kernel.
 - `hc_lowrank_epilogue` runs 1.4x to 1.85x faster on M5 and later GPUs (2560 wide, rank 320, M5
   Max). Outputs differ at rounding level. `KQ_HC_EPI_LPR=0` restores the previous kernel.
 - `sdpa_prefill_block_sparse` splits long page lists across the GPU on M5 and later GPUs: up to 1.5x
@@ -60,8 +61,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one pass.
 - `quantized_matmul` at 2 to 16 activation rows on M5 and later GPUs runs faster on most codecs
   (`q6_k` 0.84x the time at 8 rows, 0.57x at 16). Outputs differ at rounding level.
-- `quantized_matmul_multi` at prefill rows runs its two to four weights in one grid, with the same
-  outputs. `KQ_QMM_MULTI_ROWS=0` keeps a dispatch per weight.
+  `KQ_DENSE_ROWS=0` restores the previous kernels.
+- `q6_k` `quantized_matmul_multi` at prefill rows on M5 and later GPUs runs its two to four weights
+  in one grid, with the same outputs. `KQ_QMM_MULTI_ROWS=0` keeps a dispatch per weight.
 - On M5 and later GPUs, `quantized_matmul` takes 128-row tiles only when their grid fills at least
   3 threadgroups a core: narrow outputs at prefill rows run 10 to 35% faster, with the same outputs.
   `KQ_NAX_BM128_MIN_TPC=0` restores the old choice.

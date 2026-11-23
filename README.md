@@ -388,6 +388,16 @@ All optional; the defaults are right for normal use.
   one-lane kernel). Unset, `8` on GPUs with the tensor-op units and `0` elsewhere; the two kernels
   differ at rounding level. `hc_lowrank_mix` folds the norm into its front only when the lanes are
   not `0`. Read per call. A/B lever.
+- `KQ_HC_MIX_FN=0` - run `hc_lowrank_mix` on float32 streams as its three kernels (norm, front,
+  epilogue), with the bits of the three ops, in place of the front that folds the norm in. Read per
+  call. A/B lever.
+- `KQ_HC_EPI_MMA=<rows>` - the fewest rows (default `2`, up to 16) at which the folded
+  `hc_lowrank_mix` runs its epilogue on the simdgroup-matrix kernel; `0` keeps the lane kernel. The
+  two differ at rounding level. Read per call. A/B lever.
+- `KQ_HC_FRONT_RB`, `KQ_HC_FRONT_FN_RB`, `KQ_HC_FRONT_FN_NO`, `KQ_HC_FRONT_FN_SPS`,
+  `KQ_HC_FRONT_MMA` - probe levers of the `hc_lowrank_mix` front: rows a threadgroup takes (a row's
+  bits do not depend on them), down outputs and simdgroups a stream (each count gives other bits),
+  and `1` for the simdgroup-matrix front up to 16 rows (other bits). Read per call.
 
 - `KQ_SDPA_IDX_NAX=0` - run `sdpa_fa_indexed` on its simdgroup kernel even where the NAX tile
   kernel is available. Read once per process. The simdgroup kernel matches `sdpa_fa_verify` over

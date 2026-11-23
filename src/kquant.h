@@ -1858,11 +1858,14 @@ class KQuantKdaChunk : public mx::Primitive {
 
 // Expert store of a fused MoE block (kq_moe_store.h): a copy of routed
 // expert stacks in a layout the tile kernels read faster than GGUF blocks.
-// Metal with the tensor-op units only; store formats exist for q5_0, iq4_nl,
-// iq3_xxs and iq4_xs with a shared expert in the same codec, q5_k, q6_k or
-// q8_0. The GGUF blocks stay an input of every op: an expert with no slot is
-// read in place, and so is the shared expert. When every expert has a slot
-// the stack an op takes may be a stub of one expert: it is never read.
+// Metal with the tensor-op units only. q5_0, iq4_nl, iq3_xxs and iq4_xs
+// store each block field in a plane of its own; iq2_s, q2_0, q2_k, q3_k,
+// q4_k, q5_k, q6_k, q8_0, q4_0, q4_1, q5_1, iq3_s, iq2_xxs, iq2_xs, iq1_s,
+// iq1_m, stq1_0, pq2_0, ptq1_0 and mxfp4 store whole blocks in one plane.
+// The shared expert is in the routed codec, q5_k, q6_k or q8_0. The GGUF blocks
+// stay an input of every op: an expert with no slot is read in place, and so is
+// the shared expert. When every expert has a slot the stack an op takes may be
+// a stub of one expert: it is never read.
 //
 // True when the store ops have kernels for the codec pair on this device.
 bool moe_store_supported(
@@ -1871,8 +1874,8 @@ bool moe_store_supported(
 
 // The planes of the listed experts of w [E, N, row bytes] (K inputs a row,
 // N a multiple of 64): experts[i] takes slot i. experts is uint32 [count].
-// Returns the codec's 2 or 3 planes (uint8, 1-D), in all the bytes of the
-// experts' GGUF blocks.
+// Returns the codec's planes (uint8, 1-D): 2 or 3 for the four field
+// formats, 1 for the others, in all the bytes of the experts' GGUF blocks.
 std::vector<mx::array> moe_store_pack(
     mx::array w,
     const std::string& kquant_type,
@@ -4461,9 +4464,9 @@ std::vector<bool> fused_used_inputs(
 // (kernels may read it on the GPU), so each stage in flight has its own
 // binding and block; the binding outlives every command buffer it was
 // encoded into; no mlx eval writes the bound buffers while a stage is in
-// flight. Buffers between kernels come from one pool shared by all
-// bindings, which is safe because command buffers of one queue run in
-// commit order and each replay writes what it reads from the pool.
+// flight. Each binding holds its own buffers between kernels (the
+// record's scratch_bytes), so stages in flight on separate command buffers
+// share none; they are freed with the binding.
 struct FusedBinding;
 std::shared_ptr<FusedBinding> fused_bind(
     const std::shared_ptr<const FusedTape>& tape,
@@ -4477,8 +4480,8 @@ struct FusedBindingInfo {
   size_t output_bytes{0}; // buffers allocated for the outputs
   size_t param_bytes{0};
   size_t blob_bytes{0}; // the binding's copy of the kernel arguments
-  size_t scratch_bytes{0}; // pool bytes this record uses
-  size_t pool_bytes{0}; // the shared pool of all bindings
+  size_t scratch_bytes{0}; // bytes between kernels the record uses
+  size_t pool_bytes{0}; // the binding's own buffers between kernels
 };
 FusedBindingInfo fused_binding_info(const FusedBinding& binding);
 // Test helper: encodes the bindings in order into one command buffer of

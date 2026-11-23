@@ -1521,8 +1521,9 @@ shexp_codec)` and `moe_store_seg_supported(codec, K)` say whether a device has t
   first call, without evaluating anything; it releases the GIL. `kernel_keys()` lists the
   pipelines built in the process.
 
-The GLU and down run pair-grid kernels with no plan dispatch up to 8 rows, and the tile kernels
-behind a plan dispatch above. Levers, read per call unless noted:
+On `q5_0`, `iq4_nl`, `iq3_xxs` and `iq4_xs` stores the GLU and down run pair-grid kernels with no
+plan dispatch up to 8 rows, and the tile kernels behind a plan dispatch above; the other codecs
+run the tile kernels at every width. Levers, read per call unless noted:
 
 - `KQ_MOE_STORE_FORM=0` runs the tile kernels at every width; `KQ_MOE_STORE_PG_MAX_T` (default `8`)
   is the widest call of the pair-grid kernels.
@@ -1932,6 +1933,8 @@ a producer/consumer decode loop and are a separate subsystem; see
     so a repeated row id costs no read. Unset or `0` is off.
   - `KQ_FILE_ROWS_CACHE_BYTES=B` bounds the same cache by bytes, slot ids included (8 bytes a slot),
     and wins over the slot count when both are set.
+  - Both bounds hold per table: each table read keeps a cache of its own for the life of the
+    process, so the bytes held grow with the tables a process reads.
   - `KQ_FILE_ROWS_BUFFERED=1` reads through the page cache in place of uncached reads, for a table
     the caller keeps in the page cache.
   - `KQ_FILE_ROWS_STAMPS=<file>` appends one line per read, `start end rows hits`, with the times in

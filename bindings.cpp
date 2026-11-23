@@ -570,8 +570,9 @@ NB_MODULE(_ext, m) {
             scale (float): query scale (typically 1/sqrt(D)).
             pages (array): int32 [B, L, n_pages], or
                 [B, n_kv_heads, L, n_pages] for a list per kv head. A
-                negative entry is skipped; a page is listed at most once
-                per query.
+                negative entry is skipped. A page counts once however often
+                the list holds it (or holds the tail page); a list in
+                ascending order is the fast case of the per-query walk.
             ends (array, optional): int32 [B, L]; query l attends key rows
                 below ends[b, l]. Without it every listed row counts.
             k_tail, v_tail (array, optional): [B, n_kv_heads, T, D]. Key
@@ -592,6 +593,10 @@ NB_MODULE(_ext, m) {
                 tile once for all of them; at head_dim 512 the per-query
                 walk runs. -1 picks by query count, and the
                 KQ_PAGED_ROWS_WINDOW environment variable replaces the pick.
+            params (array, optional): an evaluated int32 parameter block
+                (see fuse_graph): base_len is read from
+                params[base_len_slot] when the kernel is encoded. Needs the
+                tails and ends.
 
         Returns:
             array: attention output [B, n_q_heads, L, D].
@@ -1022,18 +1027,22 @@ NB_MODULE(_ext, m) {
       R"(
         Store planes of the listed experts of a K-quant expert stack.
 
-        A store holds the bytes of the experts' GGUF blocks unchanged, each
-        block field in a plane of its own with the 64 output columns of a
-        tile side by side at each 32-weight step. experts[i] takes slot i.
+        A store holds the bytes of the experts' GGUF blocks unchanged, with
+        the 64 output columns of a tile side by side at each step. q5_0,
+        iq4_nl, iq3_xxs and iq4_xs keep each block field in a plane of its
+        own; the other store codecs keep whole blocks in one plane.
+        moe_store_supported says which codecs have a store. experts[i]
+        takes slot i.
 
         Args:
             w (array): [E, N, row bytes] uint8, N a multiple of 64.
-            kquant_type (str): q5_0, iq4_nl, iq3_xxs or iq4_xs.
+            kquant_type (str): a store codec, such as q5_0 or q4_k.
             in_features (int): K, the inputs of a weight row.
             experts (array): [count] expert ids.
 
         Returns:
-            list[array]: the codec's 2 or 3 planes, uint8, 1-D.
+            list[array]: the codec's planes, uint8, 1-D: 2 or 3 for the
+            four field formats, 1 for the others.
       )");
   m.def(
       "moe_store_glu",
@@ -2225,8 +2234,9 @@ NB_MODULE(_ext, m) {
       "params"_a = nb::none(),
       "q_offset_slot"_a = 0,
       R"(
-        With ``params`` (an int32 parameter block, see fuse_graph) q_offset
-        is read from ``params[q_offset_slot]`` when the kernel is encoded.
+        With ``params`` (an evaluated int32 parameter block, see
+        fuse_graph) q_offset is read from ``params[q_offset_slot]`` when the
+        kernel is encoded.
 
         Decode-width lightning-indexer scores, fused:
         out[b, 0, j, p] = sum_h relu(q[b, h, j] . k[b, p]) * w[b, j, h]
@@ -3688,8 +3698,8 @@ NB_MODULE(_ext, m) {
         primitives make them and as replayed, barriers_recorded and
         barriers the memory barriers among them. scratch_bytes is what the
         record needs of the buffer pool its thread shares between records,
-        pool_bytes the size of all pools, kept_bytes what the record holds
-        itself.
+        pool_bytes the size of all pools of the process (those of bindings
+        too), kept_bytes what the record holds itself.
       )");
   m.def(
       "fused_direct_calls",
@@ -3735,7 +3745,8 @@ NB_MODULE(_ext, m) {
         replay from C++ with no eval (see kquant.h, bound replay). Returns
         (binding, outputs): the outputs are evaluated arrays over buffers
         allocated here, filled each time the binding is encoded and its
-        command buffer completes.
+        command buffer completes. The binding holds its own buffers between
+        kernels, so two stages in flight share none.
       )");
   m.def(
       "fused_patch",
@@ -3888,8 +3899,9 @@ NB_MODULE(_ext, m) {
       "offset_slot"_a = 0,
       R"(
         Append rows to a KV cache buffer without copying the buffer. With
-        ``params`` (an int32 parameter block, see fuse_graph) the offset is
-        read from ``params[offset_slot]`` when the kernel is encoded.
+        ``params`` (an evaluated int32 parameter block, see fuse_graph) the
+        offset is read from ``params[offset_slot]`` when the kernel is
+        encoded.
 
         Writes x into rows [offset, offset + x.shape[2]) of axis 2 of buf
         and returns an array that shares buf's data. Every array that
