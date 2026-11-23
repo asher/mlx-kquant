@@ -42,6 +42,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   counts the boundaries it made.
 - `file_rows` keeps a row cache when `KQ_FILE_ROWS_CACHE` is set; `file_rows_cache_stats` reports
   its hits, misses and bytes.
+- `load_gguf` reads GGML type 44 as `stq1_0`, the id Tencent's Hy4 GGUFs use for it (43 is F8_E4M3
+  in that llama.cpp tree).
 
 ### Changed
 - On M5 and later GPUs the fused MoE gathers at 5 to 16 rows read each expert once for up to eight

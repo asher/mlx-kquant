@@ -495,6 +495,9 @@ the span runs at least 1 MiB (or the file alignment, if larger) past the `stq1_0
 then holds an `mxfp8` table cut short. A count that is not whole 32-value blocks fails as "fits
 neither".
 
+The llama.cpp tree for Tencent's Hy4 GGUFs moves `stq1_0` to type 44, since its F8_E4M3 tables
+take 43 there. `kq.load_gguf` reads type 44 as `stq1_0`.
+
 ## Version pinning
 
 Pinned to `mlx==0.32.3`. The kernels include MLX's steel headers and the extension links `libmlx`,

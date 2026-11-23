@@ -28,6 +28,7 @@ PQ2_0_TYPE_ID = 142  # PrismML/llama.cpp 8bbb28b76 (Prism-private)
 PTQ1_0_TYPE_ID = 143  # PrismML/llama.cpp e19819227 (Prism-private)
 Q2_0_TYPE_ID = 42  # llama.cpp GGML_TYPE_Q2_0
 MXFP8_TYPE_ID = 43  # llama.cpp PR #30817 (unmerged), the STQ1_0 id too
+STQ1_0_44_TYPE_ID = 44  # STQ1_0 in the Hy4 llama.cpp tree (43 is F8_E4M3)
 
 
 class _SentinelType:
@@ -50,6 +51,7 @@ PQ2_0 = _SentinelType("PQ2_0", PQ2_0_TYPE_ID)
 PTQ1_0 = _SentinelType("PTQ1_0", PTQ1_0_TYPE_ID)
 Q2_0 = _SentinelType("Q2_0", Q2_0_TYPE_ID)
 MXFP8 = _SentinelType("MXFP8", MXFP8_TYPE_ID)
+STQ1_0_44 = _SentinelType("STQ1_0_44", STQ1_0_44_TYPE_ID)
 
 
 def _f16_bytes(d: np.ndarray) -> np.ndarray:
@@ -355,6 +357,10 @@ for _s, (_wpb, _bpb, _dq, _q) in SENTINELS.items():
     # real files.
     GGML_QUANT_SIZES[_s] = (_wpb, _bpb)
     GGMLQuantizationType._value2member_map_.setdefault(_s.value, _s)
+
+# STQ1_0 wire under type 44, for writing files only: not a codec of its own.
+GGML_QUANT_SIZES[STQ1_0_44] = (256, 42)
+GGMLQuantizationType._value2member_map_.setdefault(STQ1_0_44.value, STQ1_0_44)
 
 
 class _GTProxy:
