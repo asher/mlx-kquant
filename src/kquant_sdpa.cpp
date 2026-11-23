@@ -1541,8 +1541,14 @@ void KQuantSDPAPagedRows::eval_gpu(
   const bool patched = tails && param_slot_ >= 0;
   const int base_len =
       patched ? kq_param_value(inputs.back(), param_slot_) : base_len_;
-  const int N = tails ? base_len + static_cast<int>(kt.shape(2))
-                      : static_cast<int>(k.shape(2));
+  // The base holds S rows: a base_len past them reads past the buffer.
+  const int S = static_cast<int>(k.shape(2));
+  if (patched && (base_len < 0 || base_len > S)) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_paged_rows] base_len must be in [0, S] with "
+        "tails.");
+  }
+  const int N = tails ? base_len + static_cast<int>(kt.shape(2)) : S;
   // Where the parameter sits in the meta bytes of pass 1.
   auto pm_sites = [&] {
     if (patched) {
@@ -1551,8 +1557,11 @@ void KQuantSDPAPagedRows::eval_gpu(
           offsetof(KQPagedRowsMeta, N),
           param_slot_,
           1,
-          static_cast<int>(kt.shape(2)));
-      kq_param_site(10, offsetof(KQPagedRowsMeta, base_len), param_slot_);
+          static_cast<int>(kt.shape(2)),
+          0,
+          S);
+      kq_param_site(
+          10, offsetof(KQPagedRowsMeta, base_len), param_slot_, 1, 0, 0, S);
     }
   };
   // The form and the split count never depend on the key capacity N: a
@@ -1563,10 +1572,47 @@ void KQuantSDPAPagedRows::eval_gpu(
   // keeps the simdgroup-matrix kernel.
   const bool nax = D <= 256 && gqa_factor <= 128 &&
       kq_env_flag("KQ_PAGED_ROWS_NAX", 1) != 0 && kq_is_nax_available();
-  const int win = kq_paged_rows_window(window_, qL, gqa_factor, D, nax);
+  int win = kq_paged_rows_window(window_, qL, gqa_factor, D, nax);
   int splits = splits_;
   if (win > 0 && splits == 0) {
     splits = kq_paged_rows_union_splits(qL, win, B * n_kv_heads);
+  }
+  std::string ts = kq_type_string(q.dtype());
+  bool off = false;
+  int zero = 0;
+  mx::metal::MTLFCList fc = {
+      {&splits, MTL::DataType::DataTypeInt, 2},
+      {&off, MTL::DataType::DataTypeBool, 3},
+      {&off, MTL::DataType::DataTypeBool, 4},
+      {&off, MTL::DataType::DataTypeBool, 5},
+      {&off, MTL::DataType::DataTypeBool, 6},
+      {&off, MTL::DataType::DataTypeBool, 7},
+      {&off, MTL::DataType::DataTypeBool, 8},
+      {&off, MTL::DataType::DataTypeBool, 9},
+      {&zero, MTL::DataType::DataTypeInt, 10},
+      {&zero, MTL::DataType::DataTypeInt, 11},
+      {&off, MTL::DataType::DataTypeBool, 12},
+  };
+  // Simdgroups of the shared-tile form. Simdgroup form: at least 8 stage
+  // the tiles; those past the rows do no MMA. Tensor-op form: one per 16
+  // rows and half the head dim.
+  const int strips = win == 0 ? 0
+      : nax                   ? 2 * ((gqa_factor * win + 15) / 16)
+                              : std::max(8, (gqa_factor * win + 7) / 8);
+  MTL::ComputePipelineState* ukernel = nullptr;
+  if (win > 0) {
+    std::string kname =
+        std::string(
+            nax ? "kq_sdpa_paged_rows_u_nax_" : "kq_sdpa_paged_rows_u_") +
+        ts + "_" + std::to_string(D) + "_p" + std::to_string(page_rows_);
+    ukernel =
+        kq_get_kernel(d, kname, kname + "_s" + std::to_string(splits), fc);
+    if (size_t(32) * strips > ukernel->maxTotalThreadsPerThreadgroup()) {
+      // A window past this GPU's threadgroup limit: the per-query form.
+      win = 0;
+      splits = splits_;
+      ukernel = nullptr;
+    }
   }
   if (win == 0 && splits == 0) {
     const int span = (n_pages + (tail_page_ ? 1 : 0)) * page_rows_;
@@ -1613,45 +1659,10 @@ void KQuantSDPAPagedRows::eval_gpu(
   ce.add_temporary(sums);
   ce.add_temporary(maxs);
 
-  std::string ts = kq_type_string(q.dtype());
-  bool off = false;
-  int zero = 0;
-  mx::metal::MTLFCList fc = {
-      {&splits, MTL::DataType::DataTypeInt, 2},
-      {&off, MTL::DataType::DataTypeBool, 3},
-      {&off, MTL::DataType::DataTypeBool, 4},
-      {&off, MTL::DataType::DataTypeBool, 5},
-      {&off, MTL::DataType::DataTypeBool, 6},
-      {&off, MTL::DataType::DataTypeBool, 7},
-      {&off, MTL::DataType::DataTypeBool, 8},
-      {&off, MTL::DataType::DataTypeBool, 9},
-      {&zero, MTL::DataType::DataTypeInt, 10},
-      {&zero, MTL::DataType::DataTypeInt, 11},
-      {&off, MTL::DataType::DataTypeBool, 12},
-  };
-
   if (shared) {
     // Pass 1, shared tiles: one threadgroup per (kv head, window, split).
     const int n_win = (qL + win - 1) / win;
-    // Simdgroup form: at least 8 simdgroups stage the tiles; those past the
-    // rows do no MMA. Tensor-op form: a simdgroup per 16 rows and half the
-    // head dim.
-    const int strips = nax ? 2 * ((gqa_factor * win + 15) / 16)
-                           : std::max(8, (gqa_factor * win + 7) / 8);
-    std::string kname =
-        std::string(
-            nax ? "kq_sdpa_paged_rows_u_nax_" : "kq_sdpa_paged_rows_u_") +
-        ts + "_" + std::to_string(D) + "_p" + std::to_string(page_rows_);
-    std::string hash = kname + "_s" + std::to_string(splits);
-    auto kernel = kq_get_kernel(d, kname, hash, fc);
-    const size_t tg = size_t(32) * strips;
-    if (tg > kernel->maxTotalThreadsPerThreadgroup()) {
-      throw std::runtime_error(
-          "[mlx_kquant.sdpa_paged_rows] threadgroup of " + std::to_string(tg) +
-          " threads exceeds this GPU's pipeline limit (" +
-          std::to_string(kernel->maxTotalThreadsPerThreadgroup()) + ").");
-    }
-    ce.set_compute_pipeline_state(kernel);
+    ce.set_compute_pipeline_state(ukernel);
     ce.set_input_array(q, 0);
     ce.set_input_array(k, 1);
     ce.set_input_array(v, 2);
@@ -3373,6 +3384,15 @@ mx::array sdpa_paged_rows(
         op +
         "params must be an int32 vector holding base_len_slot, with "
         "k_tail and v_tail.");
+  }
+  // base_len is read on the host when the call is encoded. The default
+  // ends hold the key count of this base_len, which a block that moves it
+  // would leave behind: with params the caller passes ends.
+  if (params && !params->is_available()) {
+    throw std::invalid_argument(op + "params must be evaluated.");
+  }
+  if (params && !ends) {
+    throw std::invalid_argument(op + "params needs ends.");
   }
   if (window < -1 || window > 32) {
     throw std::invalid_argument(op + "window must be in [-1, 32].");

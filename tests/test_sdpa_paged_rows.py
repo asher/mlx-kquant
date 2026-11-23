@@ -386,3 +386,94 @@ def test_paged_rows_window_bounds():
     k = mx.zeros((1, 2, 64, 256), mx.bfloat16)
     with pytest.raises(ValueError, match="window"):
         kq.sdpa_paged_rows(q, k, k, 1.0, mx.zeros((1, 2, 3), mx.int32), window=33)
+
+
+def _first_only(row):
+    """The list with every page after its first listing skipped (-1)."""
+    seen, out = set(), []
+    for p in row:
+        out.append(-1 if p >= 0 and p in seen else p)
+        seen.add(p)
+    return out
+
+
+@pytest.mark.parametrize("D,page_rows", [(128, 0), (256, 4)])
+@pytest.mark.parametrize("L", [1, 3])
+@pytest.mark.parametrize("window", [0, 3])
+def test_paged_rows_count_a_repeated_page_once(D, page_rows, L, window):
+    # A page listed three times, and the page each query's end falls in
+    # listed while tail_page adds it too: every form counts each page once.
+    rng = np.random.default_rng(D + 3 * L)
+    pr = page_rows or TILE[D]
+    B, Hq, Hkv = 1, 8, 2
+    base_len = 9 * pr + 1
+    N = base_len + 2 * pr + 3
+    q, k, v = _make(rng, B, Hq, Hkv, L, N, D, mx.bfloat16)
+    pages, ends = _verify_pages(rng, L, 6, N - L, pr, shared=3)
+    lists = np.concatenate(
+        [pages[:, :-1], pages[:, :1], pages[:, :1], pages[:, -1:]], axis=1
+    ).astype(np.int32)
+    scale = 1.0 / D**0.5
+    got = kq.sdpa_paged_rows(
+        q,
+        k[:, :, :base_len],
+        v[:, :, :base_len],
+        scale,
+        mx.array(lists[None]),
+        mx.array(ends[None]),
+        k[:, :, base_len:],
+        v[:, :, base_len:],
+        base_len,
+        page_rows=page_rows,
+        tail_page=True,
+        window=window,
+    )
+    once = np.array([_first_only(list(lists[i]) + [ends[i] // pr]) for i in range(L)])
+    ref = _ref(_f32(q), _f32(k), _f32(v), scale, once[None], ends[None], pr)
+    rel = _rel(_f32(got), ref)
+    assert rel < REL_BOUND[mx.bfloat16], f"rel {rel:.3e}"
+
+
+def test_paged_rows_params_checks():
+    rng = np.random.default_rng(5)
+    D, pr, S, T = 256, 4, 64, 8
+    q, k, v = _make(rng, 1, 4, 2, 2, S + T, D, mx.bfloat16)
+    pages = mx.array(np.arange(4, dtype=np.int32).reshape(1, 1, 4).repeat(2, 1))
+    ends = mx.array(np.array([[S + 1, S + 2]], np.int32))
+    kb, vb, kt, vt = k[:, :, :S], v[:, :, :S], k[:, :, S:], v[:, :, S:]
+    # base_len from the block past the S rows of the base reads past it.
+    p = mx.array(np.array([0, S + 5], np.int32))
+    mx.eval(p)
+    out = kq.sdpa_paged_rows(
+        q,
+        kb,
+        vb,
+        0.0625,
+        pages,
+        ends,
+        kt,
+        vt,
+        S,
+        page_rows=pr,
+        params=p,
+        base_len_slot=1,
+    )
+    with pytest.raises(ValueError, match="base_len must be in"):
+        mx.eval(out)
+    # The default ends hold the key count of the base_len the call was
+    # built with, which a block that moves it would leave behind.
+    with pytest.raises(ValueError, match="needs ends"):
+        kq.sdpa_paged_rows(
+            q,
+            kb,
+            vb,
+            0.0625,
+            pages,
+            None,
+            kt,
+            vt,
+            S,
+            page_rows=pr,
+            params=p,
+            base_len_slot=1,
+        )

@@ -846,7 +846,11 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
 // work per query is a decode step's and the grid grows with the query
 // count. A negative page is skipped; query l attends keys below ends[l].
 // With tail_page each list has one more page, ends[l] / PR: the partial
-// page the query's end falls in, so the caller appends nothing.
+// page the query's end falls in, so the caller appends nothing. A page is
+// counted once however often it is listed, as in the shared-tile forms: a
+// page listed before is skipped, and the tail page is the list's last
+// entry for this, the same call as listing it. A list in ascending order
+// needs no search.
 // Partials are [B, Hq, q_len, gqa_splits, D] float32, merged by
 // kq_sdpa_gqa_2pass_2.
 template <typename T, int D, int C, int PR, int NE = 4>
@@ -874,6 +878,10 @@ template <typename T, int D, int C, int PR, int NE = 4>
 
   threadgroup T4 sK[C * D4];
   threadgroup T4 sV[C * D4];
+  // Page of each tile page slot, -1 where skipped, and the first list
+  // position past the list's ascending prefix.
+  threadgroup int spg[PPT];
+  threadgroup atomic_int sfd[1];
 
   const int kv_head_idx = tid.x;
   const int nq = pm.q_len;
@@ -919,6 +927,9 @@ template <typename T, int D, int C, int PR, int NE = 4>
   const int lim = min(end, N) - 1;
   const int n_all = n_pages + pm.tail_page;
   const int tail_pg = end / PR;
+  // Pages at or past NP hold no key below N (and their first row would
+  // not fit an int).
+  const int NP = (N + PR - 1) / PR;
 
   float max_score = Limits<float>::finite_min;
   float sum_exp_score = 0;
@@ -936,8 +947,54 @@ template <typename T, int D, int C, int PR, int NE = 4>
   const int t0 = split_idx * tchunk;
   const int t1 = min(t0 + tchunk, n_tiles);
 
+  // The ascending prefix of the list up to this run's last position: a
+  // page in it was listed nowhere before.
+  const int p_end = min(t1 * PPT, n_pages);
+  if (flat == 0) {
+    atomic_store_explicit(&sfd[0], p_end, memory_order_relaxed);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int i = 1 + flat; i < p_end; i += n_threads) {
+    if (prow[i] <= prow[i - 1]) {
+      atomic_fetch_min_explicit(&sfd[0], i, memory_order_relaxed);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int fd = atomic_load_explicit(&sfd[0], memory_order_relaxed);
+
   for (int t = t0; t < t1; t++) {
     const int p0 = t * PPT;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (flat < PPT) {
+      const int pi = p0 + flat;
+      int pg = pi < n_pages ? prow[pi] : pi < n_all ? tail_pg : -1;
+      if (pg >= NP) {
+        pg = -1;
+      } else if (pg >= 0 && pi >= n_pages && fd >= n_pages) {
+        // The tail page after an ascending list: a binary search.
+        int lo = 0;
+        int hi = n_pages;
+        while (lo < hi) {
+          const int m = (lo + hi) / 2;
+          if (prow[m] < pg) {
+            lo = m + 1;
+          } else {
+            hi = m;
+          }
+        }
+        if (lo < n_pages && prow[lo] == pg) {
+          pg = -1;
+        }
+      } else if (pg >= 0 && pi >= fd) {
+        for (int j = 0; j < min(pi, n_pages); j++) {
+          if (prow[j] == pg) {
+            pg = -1;
+            break;
+          }
+        }
+      }
+      spg[flat] = pg;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Cooperative tile load. A row of a skipped page, or one past the
     // query's end, zero-fills: stale threadgroup data never reaches the
@@ -946,8 +1003,7 @@ template <typename T, int D, int C, int PR, int NE = 4>
     for (int i = flat; i < C * D4; i += n_threads) {
       const int row = i / D4;
       const int col = i % D4;
-      const int pi = p0 + row / PR;
-      const int pg = pi < n_pages ? prow[pi] : pi < n_all ? tail_pg : -1;
+      const int pg = spg[row / PR];
       const int kg = pg * PR + row % PR;
       if (pg >= 0 && kg <= lim) {
         if (kg < base_len) {
@@ -979,8 +1035,7 @@ template <typename T, int D, int C, int PR, int NE = 4>
       }
       s = simd_shuffle(s, NL * ty);
       const int kr = cc * NE + ty;
-      const int pi = p0 + kr / PR;
-      const int pg = pi < n_pages ? prow[pi] : pi < n_all ? tail_pg : -1;
+      const int pg = spg[kr / PR];
       const int kg = pg * PR + kr % PR;
       const bool valid = pg >= 0 && kg <= lim;
       mqk[cc] = valid ? s : Limits<float>::finite_min;
