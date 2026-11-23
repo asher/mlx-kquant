@@ -477,3 +477,53 @@ def test_paged_rows_params_checks():
             params=p,
             base_len_slot=1,
         )
+
+
+@pytest.mark.parametrize("D,page_rows", [(128, 0), (256, 0), (256, 4)])
+@pytest.mark.parametrize("tail_listed", [False, True], ids=["apart", "listed"])
+@pytest.mark.parametrize("pad", [0, 3], ids=["no pad", "padded"])
+@pytest.mark.parametrize("splits", [1, 0])
+def test_paged_rows_ascending_lists(D, page_rows, tail_listed, pad, splits):
+    # An ascending list, which may end in a run of -1 entries and may hold
+    # the tail page among pages past the query's end: the per-query walk
+    # takes it as ascending and finds the tail page by a binary search. The
+    # call equals listing the tail page last, and the reference.
+    rng = np.random.default_rng(D + 7 * pad + int(tail_listed))
+    pr = page_rows or TILE[D]
+    B, Hq, Hkv, L = 1, 8, 2, 1
+    base_len = 9 * pr + 1
+    N = base_len + 2 * pr + 3
+    q, k, v = _make(rng, B, Hq, Hkv, L, N, D, mx.bfloat16)
+    end = N - 1
+    tail = end // pr
+    below = rng.choice(tail, size=6, replace=False)
+    row = sorted(below.tolist() + ([tail, tail + 1] if tail_listed else []))
+    row += [-1] * pad
+    lists = np.array([row], np.int32)
+    ends = np.array([end], np.int32)
+    scale = 1.0 / D**0.5
+
+    def run(pages, tail_page):
+        return kq.sdpa_paged_rows(
+            q,
+            k[:, :, :base_len],
+            v[:, :, :base_len],
+            scale,
+            mx.array(pages[None]),
+            mx.array(ends[None]),
+            k[:, :, base_len:],
+            v[:, :, base_len:],
+            base_len,
+            splits=splits,
+            page_rows=page_rows,
+            tail_page=tail_page,
+            window=0,
+        )
+
+    got = run(lists, True)
+    listed = run(np.concatenate([lists, [[tail]]], axis=1).astype(np.int32), False)
+    assert mx.array_equal(got, listed).item()
+    once = np.array([_first_only(row + [tail])])
+    ref = _ref(_f32(q), _f32(k), _f32(v), scale, once[None], ends[None], pr)
+    rel = _rel(_f32(got), ref)
+    assert rel < REL_BOUND[mx.bfloat16], f"rel {rel:.3e}"

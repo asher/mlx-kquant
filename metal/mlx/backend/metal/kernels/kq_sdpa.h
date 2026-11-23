@@ -878,9 +878,10 @@ template <typename T, int D, int C, int PR, int NE = 4>
 
   threadgroup T4 sK[C * D4];
   threadgroup T4 sV[C * D4];
-  // Page of each tile page slot, -1 where skipped, and the first list
-  // position past the list's ascending prefix.
-  threadgroup int spg[PPT];
+  // Per page slot of a tile, in two buffers by tile parity: the tile index
+  // when the slot's page was listed before (the slot is skipped). And the
+  // first list position past the list's ascending prefix.
+  threadgroup atomic_int sdup[2 * PPT];
   threadgroup atomic_int sfd[1];
 
   const int kv_head_idx = tid.x;
@@ -947,55 +948,93 @@ template <typename T, int D, int C, int PR, int NE = 4>
   const int t0 = split_idx * tchunk;
   const int t1 = min(t0 + tchunk, n_tiles);
 
-  // The ascending prefix of the list up to this run's last position: a
-  // page in it was listed nowhere before.
+  // A page listed before in the list (or, for the tail page, anywhere in
+  // it) is skipped. A listed page is searched for only past the list's
+  // ascending prefix [0, fd): strictly ascending pages, then a run of
+  // negative entries that may end the list. The tail page after a list
+  // that is ascending to its end takes a binary search. The searches run
+  // over the whole threadgroup, a tile ahead, between the barriers the
+  // tile loop already has.
   const int p_end = min(t1 * PPT, n_pages);
-  if (flat == 0) {
-    atomic_store_explicit(&sfd[0], p_end, memory_order_relaxed);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int i = 1 + flat; i < p_end; i += n_threads) {
-    if (prow[i] <= prow[i - 1]) {
-      atomic_fetch_min_explicit(&sfd[0], i, memory_order_relaxed);
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  const int fd = atomic_load_explicit(&sfd[0], memory_order_relaxed);
-
-  for (int t = t0; t < t1; t++) {
-    const int p0 = t * PPT;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (flat < PPT) {
-      const int pi = p0 + flat;
-      int pg = pi < n_pages ? prow[pi] : pi < n_all ? tail_pg : -1;
-      if (pg >= NP) {
-        pg = -1;
-      } else if (pg >= 0 && pi >= n_pages && fd >= n_pages) {
-        // The tail page after an ascending list: a binary search.
-        int lo = 0;
-        int hi = n_pages;
-        while (lo < hi) {
-          const int m = (lo + hi) / 2;
-          if (prow[m] < pg) {
-            lo = m + 1;
-          } else {
-            hi = m;
+  auto raw_page = [&](int pi) {
+    const int pg = pi < n_pages ? prow[pi] : pi < n_all ? tail_pg : -1;
+    // Pages at or past NP hold no key below N.
+    return pg < NP ? pg : -1;
+  };
+  auto mark = [&](int t, bool prefix) {
+    threadgroup atomic_int* st = sdup + (t & 1) * PPT;
+    for (short sl = 0; sl < PPT; sl++) {
+      const int pi = t * PPT + sl;
+      const int pg = raw_page(pi);
+      const int fd =
+          prefix ? atomic_load_explicit(&sfd[0], memory_order_relaxed) : 0;
+      if (pg < 0 || pi < fd) {
+        continue;
+      }
+      if (prefix && pi >= n_pages && fd >= n_pages) {
+        if (flat == 0) {
+          int lo = 0;
+          int hi = n_pages;
+          while (lo < hi) {
+            const int m = (lo + hi) / 2;
+            const int v = prow[m];
+            if (v >= 0 && v < pg) {
+              lo = m + 1;
+            } else {
+              hi = m;
+            }
+          }
+          if (lo < n_pages && prow[lo] == pg) {
+            atomic_store_explicit(&st[sl], t, memory_order_relaxed);
           }
         }
-        if (lo < n_pages && prow[lo] == pg) {
-          pg = -1;
-        }
-      } else if (pg >= 0 && pi >= fd) {
-        for (int j = 0; j < min(pi, n_pages); j++) {
-          if (prow[j] == pg) {
-            pg = -1;
-            break;
-          }
+        continue;
+      }
+      const int nj = min(pi, n_pages);
+      for (int j = flat; j < nj; j += n_threads) {
+        if (prow[j] == pg) {
+          atomic_store_explicit(&st[sl], t, memory_order_relaxed);
+          break;
         }
       }
-      spg[flat] = pg;
+    }
+  };
+  auto page_at = [&](int t, int sl) {
+    const int pg = raw_page(t * PPT + sl);
+    return atomic_load_explicit(
+               &sdup[(t & 1) * PPT + sl], memory_order_relaxed) == t
+        ? -1
+        : pg;
+  };
+  if (t0 < t1) {
+    if (flat < 2 * PPT) {
+      atomic_store_explicit(&sdup[flat], -1, memory_order_relaxed);
+    }
+    if (flat == 0) {
+      atomic_store_explicit(&sfd[0], p_end, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    int first = p_end;
+    for (int i = 1 + flat; i < p_end; i += n_threads) {
+      const int v = prow[i];
+      if (v >= 0 && (prow[i - 1] < 0 || v <= prow[i - 1])) {
+        first = i;
+        break;
+      }
+    }
+    first = simd_min(first);
+    if (lane == 0 && first < p_end) {
+      atomic_fetch_min_explicit(&sfd[0], first, memory_order_relaxed);
+    }
+    mark(t0, false);
+  }
+
+  for (int t = t0; t < t1; t++) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int spg[PPT];
+    for (short sl = 0; sl < PPT; sl++) {
+      spg[sl] = page_at(t, sl);
+    }
     // Cooperative tile load. A row of a skipped page, or one past the
     // query's end, zero-fills: stale threadgroup data never reaches the
     // accumulators, and a spare row of the buffers is never read, so where
@@ -1018,6 +1057,9 @@ template <typename T, int D, int C, int PR, int NE = 4>
         sK[i] = T4(T(0));
         sV[i] = T4(T(0));
       }
+    }
+    if (t + 1 < t1) {
+      mark(t + 1, true);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
