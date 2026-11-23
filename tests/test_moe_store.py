@@ -256,3 +256,128 @@ def test_store_ops(tmp_path, codec, shexp_same):
             assert val, key
         elif key.endswith("_err"):
             assert val < 2e-2, (key, val)
+
+
+# Operand checks, in process.
+
+E_IN, R_IN, K_IN, N_IN = 12, 5, 512, 128
+
+
+def _inproc(codec, shexp):
+    import mlx.core as mx
+    import numpy as np
+
+    import mlx_kquant as kq
+
+    if not kq.moe_store_supported(codec, shexp):
+        pytest.skip("no tensor-op units on this GPU")
+    rng = np.random.default_rng(11)
+
+    def wire(shape, c=codec):
+        w = mx.array((rng.standard_normal(shape) * 0.1).astype(np.float32))
+        wq, _ = kq.quantize(w, c)
+        mx.eval(wq)
+        return wq
+
+    T = 3
+    x = mx.array((rng.standard_normal((T, K_IN)) * 0.5).astype(np.float32))
+    x = x.astype(mx.bfloat16)
+    picks = [rng.choice(E_IN, R_IN, replace=False) for _ in range(T)]
+    inds = mx.array(np.stack(picks).astype(np.uint32))
+    hd = mx.array((rng.standard_normal((T, R_IN + 1, N_IN)) * 0.5).astype(np.float32))
+    hd = hd.astype(mx.bfloat16)
+    sc = mx.array(rng.uniform(0.05, 0.3, size=(T, R_IN + 1)).astype(np.float32))
+    mx.eval(x, inds, hd, sc)
+    return mx, np, kq, wire, x, inds, hd, sc
+
+
+def test_store_ops_read_a_slot_table_view_and_refuse_strided_stacks():
+    codec = "q5_0"
+    mx, np, kq, wire, x, inds, hd, sc = _inproc(codec, codec)
+    gw, uw = wire((E_IN, N_IN, K_IN)), wire((E_IN, N_IN, K_IN))
+    sg, su = wire((N_IN, K_IN)), wire((N_IN, K_IN))
+    dw, sd = wire((E_IN, K_IN, N_IN)), wire((K_IN, N_IN))
+    ids = mx.arange(E_IN).astype(mx.uint32)
+    gp = kq.moe_store_pack(gw, codec, K_IN, ids)
+    up = kq.moe_store_pack(uw, codec, K_IN, ids)
+    dp = kq.moe_store_pack(dw, codec, N_IN, ids)
+    mx.eval(gp, up, dp)
+    # Column 1 of a wider table is the slot table; the other columns map
+    # each expert to another expert's slot.
+    e = np.arange(E_IN, dtype=np.uint32)
+    table = mx.array(np.stack([(e + 5) % E_IN, e, (e + 7) % E_IN], axis=1))
+    mx.eval(table)
+    want_h = kq.moe_store_glu(x, gw, uw, sg, su, codec, inds, ids, gp, up)
+    want_y = kq.moe_store_down(hd, dw, sd, codec, inds, sc, ids, dp)
+    mx.eval(want_h, want_y)
+    view = table[:, 1]
+    mx.eval(view)
+    for slots in (table[:, 1], view):
+        h = kq.moe_store_glu(x, gw, uw, sg, su, codec, inds, slots, gp, up)
+        y = kq.moe_store_down(hd, dw, sd, codec, inds, sc, slots, dp)
+        assert mx.array_equal(h, want_h).item()
+        assert mx.array_equal(y, want_y).item()
+    # A stack that is a column block of a wider one: refused at the call
+    # when it has memory, at eval when it does not.
+    wide = wire((E_IN, 2 * N_IN, K_IN))
+    with pytest.raises(ValueError, match="row-contiguous"):
+        mx.eval(kq.moe_store_pack(wide[:, :N_IN], codec, K_IN, ids))
+    block = wide[:, :N_IN]
+    mx.eval(block)
+    with pytest.raises(ValueError, match="row-contiguous"):
+        kq.moe_store_pack(block, codec, K_IN, ids)
+    with pytest.raises(ValueError, match="row-contiguous"):
+        kq.moe_store_glu(x, block, uw, sg, su, codec, inds, ids, gp, up)
+
+
+def test_store_glu_checks_the_shared_rows_against_their_codec():
+    codec = "q5_0"
+    mx, np, kq, wire, x, inds, hd, sc = _inproc(codec, "q8_0")
+    gw, uw = wire((E_IN, N_IN, K_IN)), wire((E_IN, N_IN, K_IN))
+    ids = mx.arange(E_IN).astype(mx.uint32)
+    gp = kq.moe_store_pack(gw, codec, K_IN, ids)
+    up = kq.moe_store_pack(uw, codec, K_IN, ids)
+    # q6_k rows named q8_0: shorter than a q8_0 row of K weights.
+    sg, su = wire((N_IN, K_IN), "q6_k"), wire((N_IN, K_IN), "q6_k")
+    with pytest.raises(ValueError, match="K weights of 'q8_0'"):
+        kq.moe_store_glu(
+            x, gw, uw, sg, su, codec, inds, ids, gp, up, shexp_kquant_type="q8_0"
+        )
+
+
+@pytest.mark.parametrize(
+    "lever,value",
+    [("MIN_T", "99"), ("KQ_MOE_STORE_MAX_T", "1")],
+    ids=["min rows", "max rows"],
+)
+def test_a_stub_stack_has_no_in_place_fallback(monkeypatch, lever, value):
+    # A one-expert stub stands for a stack whose experts all have a slot;
+    # a row count the width levers send to the in-place op would read
+    # experts the stub does not hold.
+    codec = "q5_0"
+    mx, np, kq, wire, x, inds, hd, sc = _inproc(codec, codec)
+    gw, uw = wire((E_IN, N_IN, K_IN)), wire((E_IN, N_IN, K_IN))
+    dw = wire((E_IN, K_IN, N_IN))
+    sg, su, sd = wire((N_IN, K_IN)), wire((N_IN, K_IN)), wire((K_IN, N_IN))
+    ids = mx.arange(E_IN).astype(mx.uint32)
+    gp = kq.moe_store_pack(gw, codec, K_IN, ids)
+    up = kq.moe_store_pack(uw, codec, K_IN, ids)
+    dp = kq.moe_store_pack(dw, codec, N_IN, ids)
+    mx.eval(gp, up, dp)
+    stub_g, stub_u, stub_d = gw[:1], uw[:1], dw[:1]
+    mx.eval(stub_g, stub_u, stub_d)
+    # Inside the width range the stub reads the store alone.
+    h = kq.moe_store_glu(x, stub_g, stub_u, sg, su, codec, inds, ids, gp, up)
+    want = kq.moe_store_glu(x, gw, uw, sg, su, codec, inds, ids, gp, up)
+    assert mx.array_equal(h, want).item()
+    names = (
+        ["KQ_MOE_STORE_GLU_MIN_T", "KQ_MOE_STORE_DOWN_MIN_T"]
+        if lever == "MIN_T"
+        else [lever]
+    )
+    for name in names:
+        monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match="stub"):
+        kq.moe_store_glu(x, stub_g, stub_u, sg, su, codec, inds, ids, gp, up)
+    with pytest.raises(ValueError, match="stub"):
+        kq.moe_store_down(hd, stub_d, sd, codec, inds, sc, ids, dp)

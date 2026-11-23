@@ -12,7 +12,8 @@
 // unit is a 32-weight group, or a block for a field a block holds once; R is
 // the field's bytes. A plane holds the bytes of the GGUF field unchanged, so
 // a slot is as large as the expert's GGUF blocks. slots[expert] is the
-// expert's slot or KQ_ST_ABSENT.
+// expert's slot, or KQ_ST_ABSENT: any value with that bit set (-1 too)
+// reads the expert in place.
 //   kq_moe_store_pack: copies one plane of the listed experts.
 //   kq_moe_store_plan: kq_moe_tile_plan with the rows of x [T, K] as the
 //     activation rows (the GLU's input).
@@ -464,7 +465,7 @@ template <typename T, typename Codec, typename SCodec>
     src.row = sw + ((int64_t)c * NS + expert) * rb;
     kq_st_sums<T, KqBlockSrc<SCodec>>(
         src, x, rows, col_rows, K, simd_lid, stage, kq_luts, s);
-  } else if (slot != KQ_ST_ABSENT) {
+  } else if ((slot & KQ_ST_ABSENT) == 0) {
     if (KqStoreFmt<Codec>::LUTS) {
       KQ_EXT_STAGE_INTO(Codec, kq_luts)
     }
@@ -543,7 +544,7 @@ template <typename T, typename Codec, typename SCodec>
     src.row = (up ? suw : sgw) + (int64_t)c * rb;
     kq_st_sums<T, KqBlockSrc<SCodec>>(
         src, x, rows, col_rows, K, simd_lid, stage, kq_luts, s);
-  } else if (slot != KQ_ST_ABSENT) {
+  } else if ((slot & KQ_ST_ABSENT) == 0) {
     if (KqStoreFmt<Codec>::LUTS) {
       KQ_EXT_STAGE_INTO(Codec, kq_luts)
     }
@@ -1050,7 +1051,7 @@ template <typename T, typename Codec, typename SCodec, typename SQ, int SG>
       src.row = (up ? suw : sgw) + (int64_t)c * rb;
       KQ_ST_PG_PART(KqBlockSrc<SCodec>, src)
     }
-  } else if (slot != KQ_ST_ABSENT) {
+  } else if ((slot & KQ_ST_ABSENT) == 0) {
     if (j < q) {
       KqStoreSrc<Codec> src;
       if (up) {
@@ -1169,7 +1170,7 @@ template <typename T, typename Codec, typename SCodec, typename SQ, int SG>
       src.row = sw + ((int64_t)c * NS + expert) * rb;
       KQ_ST_PG_PART(KqBlockSrc<SCodec>, src)
     }
-  } else if (slot != KQ_ST_ABSENT) {
+  } else if ((slot & KQ_ST_ABSENT) == 0) {
     if (j < q) {
       KqStoreSrc<Codec> src;
       src.begin(p0, p1, p2, slot, c, N, K);
@@ -1454,7 +1455,7 @@ template <typename T, typename SCodec, int NX, bool C32>
   } else {
     KQ_EXT_STAGE_INTO(KqIq3_xxsExt, kq_luts)
     const uint slot = slots[expert];
-    if (slot & 0x80000000u) {
+    if ((slot & KQ_ST_ABSENT) != 0) {
       // An expert the store does not hold: its GGUF bytes in place.
       const int64_t wrow = (int64_t)expert * N + out_row;
       if (q < 0) {

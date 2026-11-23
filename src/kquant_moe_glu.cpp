@@ -3592,7 +3592,48 @@ const KqStoreSpec& kq_store_check(
         " w must be uint8 [E, N, row bytes] of the codec, N a multiple of "
         "64.");
   }
+  // The kernels index rows of the stack from its start. An array without
+  // memory is checked at eval (kq_store_rows).
+  if (kq_has_layout(w) && !w.flags().row_contiguous) {
+    throw std::invalid_argument(
+        std::string(op) + " weights must be row-contiguous.");
+  }
   return *spec;
+}
+
+// A call the width levers send to the in-place op reads the expert stack:
+// a one-expert stub in place of a stack of every expert has no fallback.
+void kq_store_stub_check(const char* op, int E, const mx::array& slots) {
+  if (E == 1 && slots.shape(0) != 1) {
+    throw std::invalid_argument(
+        std::string(op) +
+        " a one-expert stub stack has no in-place fallback, which the width "
+        "levers (KQ_MOE_STORE_GLU_MIN_T, KQ_MOE_STORE_DOWN_MIN_T, "
+        "KQ_MOE_STORE_MAX_T) pick at this row count.");
+  }
+}
+
+// Eval guard of the operands a store kernel indexes from their start and
+// that the op does not copy: expert stacks and planes.
+void kq_store_rows(
+    const char* op,
+    const std::vector<mx::array>& inputs,
+    size_t first,
+    size_t count) {
+  for (size_t i = first; i < first + count && i < inputs.size(); ++i) {
+    kq_check_row_major(
+        inputs[i], std::string("[mlx_kquant.") + op + "] weights and planes");
+  }
+}
+
+// The slot table as the kernels read it: row-major, copied when a view
+// (table[:, layer]) has other strides. Unevaluated, it goes in as it is
+// and the eval copies it (kq_row_major_gpu).
+mx::array kq_store_slots(const mx::array& slots, mx::StreamOrDevice s) {
+  if (kq_has_layout(slots) && !slots.flags().row_contiguous) {
+    return mx::contiguous(slots, false, s);
+  }
+  return slots;
 }
 
 void kq_store_check_planes(
@@ -3620,6 +3661,10 @@ void kq_store_check_planes(
         planes[i].size() % per != 0 || planes[i].size() == 0) {
       throw std::invalid_argument(
           std::string(op) + " a plane is not whole slots of the codec.");
+    }
+    if (kq_has_layout(planes[i]) && !planes[i].flags().row_contiguous) {
+      throw std::invalid_argument(
+          std::string(op) + " planes must be row-contiguous.");
     }
   }
 }
@@ -3682,6 +3727,7 @@ void KQuantMoeStore::eval_gpu(
   const KqStoreSpec& spec = *kq_store_spec(kquant_type_);
   const int np = static_cast<int>(spec.planes.size());
   if (op_ == 0) {
+    kq_store_rows("moe_store_pack", inputs, 0, 1);
     const auto& w = inputs[0];
     const auto& experts = inputs[1];
     const int N = w.shape(1);
@@ -3720,6 +3766,7 @@ void KQuantMoeStore::eval_gpu(
     }
     // x, map, counts, gate planes, up planes, then the row map when the call
     // has one.
+    kq_store_rows("moe_store_seg_pair", inputs, 3, 2 * np);
     const mx::array x = kq_x_aligned_gpu(inputs[0], s, "moe_store_seg_pair x");
     const auto& map = inputs[1];
     const auto& counts = inputs[2];
@@ -3781,6 +3828,7 @@ void KQuantMoeStore::eval_gpu(
   out.set_data(mx::allocator::malloc(out.nbytes()));
   if (op_ == 3) {
     // x, map, counts, planes, then the row map when the call has one.
+    kq_store_rows("moe_store_seg", inputs, 3, np);
     const mx::array x = kq_x_aligned_gpu(inputs[0], s, "moe_store_seg x");
     const auto& map = inputs[1];
     const auto& counts = inputs[2];
@@ -3836,6 +3884,8 @@ void KQuantMoeStore::eval_gpu(
   const int COLR = kq_env_lever_from("KQ_MOE_TILE_COL_ROWS", 2, 0);
   if (op_ == 1) {
     // gw, uw, sgw, suw, x, indices, slots, gate planes, up planes.
+    kq_store_rows("moe_store_glu", inputs, 0, 4);
+    kq_store_rows("moe_store_glu", inputs, 7, 2 * np);
     const auto& gw = inputs[0];
     kq_check_weight_base(gw, kquant_type_, "moe_store_glu");
     kq_check_weight_base(inputs[1], kquant_type_, "moe_store_glu");
@@ -3843,6 +3893,7 @@ void KQuantMoeStore::eval_gpu(
     kq_check_weight_base(inputs[3], st, "moe_store_glu");
     const mx::array x = kq_x_aligned_gpu(inputs[4], s, "moe_store_glu x");
     const auto& indices = inputs[5];
+    const mx::array slots = kq_row_major_gpu(inputs[6], s);
     const int T = x.shape(0);
     const int K = x.shape(1);
     const int N = gw.shape(1);
@@ -3866,7 +3917,7 @@ void KQuantMoeStore::eval_gpu(
       ce.set_output_array(out, 6);
       ce.set_bytes(K, 7);
       ce.set_bytes(N, 8);
-      ce.set_input_array(inputs[6], 11);
+      ce.set_input_array(slots, 11);
       for (int i = 0; i < 3; ++i) {
         ce.set_input_array(inputs[7 + std::min(i, np - 1)], 12 + i);
         ce.set_input_array(inputs[7 + np + std::min(i, np - 1)], 15 + i);
@@ -3898,7 +3949,7 @@ void KQuantMoeStore::eval_gpu(
       ce.set_bytes(N, 8);
       ce.set_bytes(QR, 9);
       ce.set_bytes(PCOLR, 10);
-      ce.set_input_array(inputs[6], 11);
+      ce.set_input_array(slots, 11);
       for (int i = 0; i < 3; ++i) {
         ce.set_input_array(inputs[7 + std::min(i, np - 1)], 12 + i);
         ce.set_input_array(inputs[7 + np + std::min(i, np - 1)], 15 + i);
@@ -3950,7 +4001,7 @@ void KQuantMoeStore::eval_gpu(
     ce.set_bytes(K, 7);
     ce.set_bytes(N, 8);
     ce.set_bytes(COLR, 10);
-    ce.set_input_array(inputs[6], 11);
+    ce.set_input_array(slots, 11);
     for (int i = 0; i < 3; ++i) {
       ce.set_input_array(inputs[7 + std::min(i, np - 1)], 12 + i);
       ce.set_input_array(inputs[7 + np + std::min(i, np - 1)], 15 + i);
@@ -3965,6 +4016,8 @@ void KQuantMoeStore::eval_gpu(
     return;
   }
   // w, sw, x, indices, scores, slots, planes.
+  kq_store_rows("moe_store_down", inputs, 0, 2);
+  kq_store_rows("moe_store_down", inputs, 6, np);
   const auto& w = inputs[0];
   const auto& sw = inputs[1];
   kq_check_weight_base(w, kquant_type_, "moe_store_down");
@@ -3972,6 +4025,7 @@ void KQuantMoeStore::eval_gpu(
   const mx::array x = kq_x_aligned_gpu(inputs[2], s, "moe_store_down x");
   const auto& indices = inputs[3];
   const auto& scores = inputs[4];
+  const mx::array slots = kq_row_major_gpu(inputs[5], s);
   const int T = x.shape(0);
   const int S = x.shape(1);
   const int K = x.shape(2);
@@ -4005,7 +4059,7 @@ void KQuantMoeStore::eval_gpu(
     ce.set_bytes(QR, 8);
     ce.set_bytes(NS, 9);
     ce.set_bytes(PCOLR, 10);
-    ce.set_input_array(inputs[5], 11);
+    ce.set_input_array(slots, 11);
     for (int i = 0; i < 3; ++i) {
       ce.set_input_array(inputs[6 + std::min(i, np - 1)], 12 + i);
     }
@@ -4074,7 +4128,7 @@ void KQuantMoeStore::eval_gpu(
   ce.set_bytes(N, 7);
   ce.set_bytes(NS, 9);
   ce.set_bytes(COLR, 10);
-  ce.set_input_array(inputs[5], 11);
+  ce.set_input_array(slots, 11);
   for (int i = 0; i < 3; ++i) {
     ce.set_input_array(inputs[6 + std::min(i, np - 1)], 12 + i);
   }
@@ -4198,6 +4252,21 @@ mx::array moe_store_glu(
         std::string(op) +
         " the shared gate and up must be uint8 [N, row bytes], one slot.");
   }
+  // One slot: a row of K weights of the shared codec, whole blocks.
+  if (!shexp_slot_on_block(st, K) ||
+      shexp_gate_w.shape(1) !=
+          static_cast<int64_t>(K) / sc->weights_per_block *
+              sc->bytes_per_block) {
+    throw std::invalid_argument(
+        std::string(op) +
+        " the shared gate and up rows must be K weights of '" + st +
+        "', whole blocks.");
+  }
+  if ((kq_has_layout(shexp_gate_w) && !shexp_gate_w.flags().row_contiguous) ||
+      (kq_has_layout(shexp_up_w) && !shexp_up_w.flags().row_contiguous)) {
+    throw std::invalid_argument(
+        std::string(op) + " weights must be row-contiguous.");
+  }
   if (indices.ndim() != 2 || indices.shape(0) != T) {
     throw std::invalid_argument(std::string(op) + " indices must be [T, R].");
   }
@@ -4208,6 +4277,7 @@ mx::array moe_store_glu(
   kq_check_weight_base_at_build(shexp_gate_w, st, s, "moe_store_glu");
   kq_check_weight_base_at_build(shexp_up_w, st, s, "moe_store_glu");
   if (!kq_store_width(T, "KQ_MOE_STORE_GLU_MIN_T", KQ_STORE_GLU_MIN_T)) {
+    kq_store_stub_check(op, E, slots);
     return moe_glu_gather_shexp_kq(
         std::move(x),
         std::move(gate_w),
@@ -4235,7 +4305,7 @@ mx::array moe_store_glu(
       std::move(shexp_up_w),
       moe_dense_x(x, s),
       prep_indices(indices, s),
-      std::move(slots)};
+      kq_store_slots(slots, s)};
   for (auto& p : gate_planes) {
     in.push_back(std::move(p));
   }
@@ -4443,6 +4513,10 @@ mx::array moe_store_seg(
       throw std::invalid_argument(
           std::string(op) + " a plane is not whole slots of the codec.");
     }
+    if (kq_has_layout(planes[i]) && !planes[i].flags().row_contiguous) {
+      throw std::invalid_argument(
+          std::string(op) + " planes must be row-contiguous.");
+    }
   }
   if (map.ndim() != 2 || map.shape(1) != 3 || map.dtype() != mx::uint32 ||
       counts.ndim() != 1 || counts.shape(0) != 1 ||
@@ -4522,6 +4596,10 @@ std::vector<mx::array> moe_store_seg_pair(
           p.size() == 0) {
         throw std::invalid_argument(
             std::string(op) + " a plane is not whole slots of the codec.");
+      }
+      if (kq_has_layout(p) && !p.flags().row_contiguous) {
+        throw std::invalid_argument(
+            std::string(op) + " planes must be row-contiguous.");
       }
     }
   }
@@ -4604,8 +4682,13 @@ mx::array moe_store_down(
   kq_store_check_planes(op, spec, planes, N, K, slots, w.shape(0));
   kq_check_weight_base_at_build(w, kquant_type, s, "moe_store_down");
   kq_check_weight_base_at_build(shexp_w, st, s, "moe_store_down");
+  if (kq_has_layout(shexp_w) && !shexp_w.flags().row_contiguous) {
+    throw std::invalid_argument(
+        std::string(op) + " weights must be row-contiguous.");
+  }
   if (!kq_store_width(
           x.shape(0), "KQ_MOE_STORE_DOWN_MIN_T", KQ_STORE_DOWN_MIN_T)) {
+    kq_store_stub_check(op, w.shape(0), slots);
     return gather_qmv_mix_kq(
         std::move(x),
         std::move(w),
@@ -4624,7 +4707,7 @@ mx::array moe_store_down(
       moe_dense_x(x, s),
       prep_indices(indices, s),
       prep_scores(scores, s),
-      std::move(slots)};
+      kq_store_slots(slots, s)};
   for (auto& p : planes) {
     in.push_back(std::move(p));
   }
