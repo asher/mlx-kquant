@@ -43,7 +43,20 @@ REL_BOUND = {mx.bfloat16: 5e-3, mx.float16: 2e-3}
 TILE = {64: 32, 128: 32, 256: 16, 512: 8}
 
 
+def _eval_or_skip(*arrays):
+    # A GPU whose pipeline caps the dispatch width raises the eval_gpu guard
+    # (as tests/test_sdpa.py): a capability skip. Raised inside numpy's
+    # buffer read instead, it aborts the process.
+    try:
+        mx.eval(*arrays)
+    except RuntimeError as e:
+        if "pipeline limit" in str(e):
+            pytest.skip(str(e))
+        raise
+
+
 def _f32(a):
+    _eval_or_skip(a)
     return np.array(a.astype(mx.float32))
 
 
@@ -159,6 +172,7 @@ def test_paged_rows_base_and_tail(D, page_rows, Hq, Hkv, L, dtype, window):
         page_rows=page_rows,
         window=window,
     )
+    _eval_or_skip(one)
     assert mx.array_equal(one, got).item()
 
 
@@ -295,6 +309,7 @@ def test_paged_rows_implied_tail_page(D, page_rows, L, window):
         tail_page=True,
         window=window,
     )
+    _eval_or_skip(listed, implied)
     assert mx.array_equal(listed, implied).item()
 
 
@@ -378,6 +393,7 @@ def test_paged_rows_cache_segments_change_no_bit(window, splits, L, spare):
     opts = dict(splits=splits, page_rows=pr, tail_page=True, window=window)
     seg = kq.sdpa_paged_rows(q, kb, vb, scale, *lists, kt, vt, base_len, **opts)
     one = kq.sdpa_paged_rows(q, k, v, scale, *lists, **opts)
+    _eval_or_skip(seg, one)
     assert mx.array_equal(seg, one).item()
 
 
@@ -537,6 +553,7 @@ def test_paged_rows_ascending_lists(D, page_rows, tail_listed, pad, splits):
 
     got = run(lists, True)
     listed = run(np.concatenate([lists, [[tail]]], axis=1).astype(np.int32), False)
+    _eval_or_skip(got, listed)
     assert mx.array_equal(got, listed).item()
     once = np.array([_first_only(row + [tail])])
     ref = _ref(_f32(q), _f32(k), _f32(v), scale, once[None], ends[None], pr)
