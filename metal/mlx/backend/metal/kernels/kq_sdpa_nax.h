@@ -22,6 +22,7 @@
 
 #include <metal_stdlib>
 
+#include "mlx/backend/metal/kernels/kq_sdpa_rows_meta.h"
 #include "mlx/backend/metal/kernels/steel/attn/nax.h"
 #include "mlx/backend/metal/kernels/steel/utils.h"
 #include "mlx/backend/metal/kernels/utils.h"
@@ -898,6 +899,405 @@ kq_sdpa_fa_verify_2pass_1_nax(
               : max_score[i] * M_LN2_F;
         }
       }
+    }
+  }
+}
+
+// Shared-tile pass 1 of sdpa_paged_rows on the tensor-op units. It walks
+// what kq_sdpa_paged_rows_u (kq_sdpa.h) walks: the same grid, the same
+// split of the key axis, the union of a window's page lists marked and
+// compacted the same way, and the same partials, so kq_sdpa_gqa_2pass_2
+// merges either. The window's gqa * win rows are folded head-major, window
+// query fastest. Simdgroup (row group, d group) owns 16 of them and D / WN
+// columns: its Q slice stays in registers, and it reads its columns of a
+// tile's 32 key rows from device memory straight into fragments through the
+// compacted page list, so K and V take no staging pass. With WN 2, d group
+// 1 parks its partial scores in threadgroup memory and d group 0 adds them
+// to its own and parks the sum for both. A key counts for a row when the
+// row's query listed its page and it lies below the query's end; rows at or
+// past the window's last end are never read.
+template <typename T, int D, int PR, int WN>
+[[kernel, max_total_threads_per_threadgroup(512)]] void
+kq_sdpa_paged_rows_u_nax(
+    const device T* queries [[buffer(0)]],
+    const device T* keys [[buffer(1)]],
+    const device T* values [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    device float* sums [[buffer(4)]],
+    device float* maxs [[buffer(5)]],
+    const device int* pages [[buffer(6)]],
+    const device int* ends [[buffer(7)]],
+    const device T* keys_tail [[buffer(8)]],
+    const device T* values_tail [[buffer(9)]],
+    const constant KQPagedRowsMeta& pm [[buffer(10)]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]]) {
+  using namespace kq_sdpa_nax;
+  constexpr short kU = 16;
+  constexpr int BK = 32; // keys per tile
+  constexpr int PPT = BK / PR; // pages per tile
+  constexpr short TK = BK / kU;
+  constexpr short TDh = D / kU / WN; // column fragments per simdgroup
+  constexpr int BDh = D / WN;
+  constexpr int WM_MAX = 8; // row groups, 128 rows
+  static_assert(WN == 1 || WN == 2, "one or two d groups");
+  static_assert(TK == 2, "a tile is one 16x32 score fragment pair");
+  static_assert(TDh % 2 == 0, "P @ V accumulates column fragments in pairs");
+  static_assert(
+      PR % 4 == 0 && BK % PR == 0, "a lane's 4 score columns share a page");
+  using T4 = metal::vec<T, 4>;
+  using otile_t = NAXTile<float, 1, TDh>;
+  using stile_t = NAXTile<float, 1, TK>;
+  using kfrag_t = typename BaseNAXFrag::dtype_frag_t<T>;
+  constexpr short kEPF = stile_t::kElemsPerFrag;
+  constexpr short kRowsPT = otile_t::kRowsPerThread;
+
+  threadgroup float s_xchg[WN > 1 ? WM_MAX : 1][TK * kEPF * 32];
+  threadgroup atomic_uint marks[KQ_PR_UNION_MAX];
+  threadgroup int ulist[KQ_PR_UNION_MAX];
+  threadgroup uint umask[KQ_PR_UNION_MAX];
+  threadgroup int ucount[1];
+
+  const int nq = pm.q_len;
+  const int W = pm.win;
+  const int G = pm.gqa;
+  const int n_win = (nq + W - 1) / W;
+  const int kv_head_idx = tid.x;
+  const int batch_idx = tid.y / n_win;
+  const int l0 = (tid.y % n_win) * W;
+  const int wl = min(W, nq - l0); // queries in this window
+  const int split_idx = tid.z;
+  const int num_q_heads = int(tpg.x) * G;
+  const int N = pm.N;
+  const int n_pages = pm.n_pages;
+  const int n_all = n_pages + pm.tail_page;
+  const int base_len = pm.base_len;
+  const int flat = int(simd_group_id) * 32 + int(simd_lane_id);
+  const int NT = int(tptg.x * tptg.y);
+  const short row_group = short(simd_group_id) / WN;
+  const short d_group = short(simd_group_id) % WN;
+  const int tm = kU * row_group;
+  const int n_rows = G * wl;
+
+  // This split's pages, as kq_sdpa_paged_rows_u takes them.
+  const int NP = (N + PR - 1) / PR;
+  const int n_gran = (NP + PPT - 1) / PPT;
+  const int nr = ((n_gran + gqa_splits - 1) / gqa_splits) * PPT;
+  const int stride = PPT * gqa_splits;
+
+  const device int* plist = pages +
+      ((size_t)(batch_idx * pm.page_heads +
+                (pm.page_heads > 1 ? kv_head_idx : 0)) *
+       nq) *
+          n_pages;
+  const device int* wends = ends + batch_idx * nq;
+  int wend = 0;
+  for (int j = 0; j < wl; j++) {
+    wend = max(wend, wends[l0 + j]);
+  }
+  const int row_end = min(wend, N);
+
+  const short2 sc = BaseNAXFrag::get_coord();
+  const short sm = sc.y;
+  const short sn = sc.x;
+
+  // This lane's rows, tm + sm and tm + sm + 8: window query lq of head g.
+  bool live[kRowsPT];
+  uint qbit[kRowsPT];
+  int lim[kRowsPT];
+  size_t qrow[kRowsPT];
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kRowsPT; i++) {
+    const int r = tm + sm + i * 8;
+    live[i] = r < n_rows;
+    const int rr = live[i] ? r : 0;
+    const int g = rr / wl;
+    const int lq = rr - g * wl;
+    qbit[i] = live[i] ? 1u << lq : 0u;
+    lim[i] = min(wends[l0 + lq], N) - 1;
+    qrow[i] =
+        (size_t)(batch_idx * num_q_heads + kv_head_idx * G + g) * nq + l0 + lq;
+  }
+
+  // Q slice in registers; rows past the window's zero.
+  kfrag_t Qf[TDh];
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kRowsPT; i++) {
+    const device T* qp = queries + qrow[i] * D + d_group * BDh + sn;
+    STEEL_PRAGMA_UNROLL
+    for (short id = 0; id < TDh; id++) {
+      const T4 v = *((const device T4*)(qp + id * kU));
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < 4; j++) {
+        Qf[id][i * 4 + j] = live[i] ? v[j] : T(0);
+      }
+    }
+  }
+
+  otile_t Otile;
+  Otile.clear();
+  metal::vec<float, kRowsPT> max_score;
+  metal::vec<float, kRowsPT> sum_score{0};
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kRowsPT; ++i) {
+    max_score[i] = Limits<float>::finite_min;
+  }
+  const float scale2 = pm.scale * M_LOG2E_F;
+
+  const size_t col0 = d_group * BDh + sn;
+  const device T* kbase =
+      keys + batch_idx * pm.k_batch + (size_t)kv_head_idx * pm.k_head + col0;
+  const device T* vbase =
+      values + batch_idx * pm.v_batch + (size_t)kv_head_idx * pm.v_head + col0;
+  const device T* ktail = keys_tail + batch_idx * pm.kt_batch +
+      (size_t)kv_head_idx * pm.kt_head + col0;
+  const device T* vtail = values_tail + batch_idx * pm.vt_batch +
+      (size_t)kv_head_idx * pm.vt_head + col0;
+
+  for (int r0 = 0; r0 < nr; r0 += KQ_PR_UNION_MAX) {
+    const int rn = min(nr - r0, KQ_PR_UNION_MAX);
+    // Mark, per page of the round, which of the window's queries listed it.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = flat; i < rn; i += NT) {
+      atomic_store_explicit(&marks[i], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = flat; i < wl * n_all; i += NT) {
+      const int mq = i / n_all;
+      const int pi = i - mq * n_all;
+      const int ml = l0 + mq;
+      const int pg =
+          pi < n_pages ? plist[(size_t)ml * n_pages + pi] : wends[ml] / PR;
+      if (pg >= 0 && pg < NP && (pg / PPT) % gqa_splits == split_idx) {
+        const int slot = (pg / stride) * PPT + pg % PPT - r0;
+        if (slot >= 0 && slot < rn) {
+          atomic_fetch_or_explicit(
+              &marks[slot], 1u << mq, memory_order_relaxed);
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Compact the marked pages, in key order.
+    if (simd_group_id == 0) {
+      int base = 0;
+      for (int j0 = 0; j0 < rn; j0 += 32) {
+        const int i = j0 + int(simd_lane_id);
+        const uint m =
+            i < rn ? atomic_load_explicit(&marks[i], memory_order_relaxed) : 0u;
+        const int hit = m != 0u ? 1 : 0;
+        const int at = base + simd_prefix_exclusive_sum(hit);
+        if (hit) {
+          const int si = r0 + i;
+          ulist[at] = (si / PPT) * stride + split_idx * PPT + si % PPT;
+          umask[at] = m;
+        }
+        base += simd_sum(hit);
+      }
+      if (simd_lane_id == 0) {
+        ucount[0] = base;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int cnt = ucount[0];
+
+    for (int t0 = 0; t0 < cnt; t0 += PPT) {
+      // This lane's K / V rows of the tile, keys kf * 16 + sm + 8 i. A row
+      // past the compacted list or the window's last end reads row 0 and
+      // selects zero, so every lane issues the same loads.
+      const device T* kp[TK][2];
+      const device T* vp[TK][2];
+      bool kok[TK][2];
+      STEEL_PRAGMA_UNROLL
+      for (short kf = 0; kf < TK; kf++) {
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < 2; i++) {
+          const int j = kf * kU + sm + i * 8;
+          const int pi = t0 + j / PR;
+          const int pg = pi < cnt ? ulist[pi] : -1;
+          const int kg = pg * PR + j % PR;
+          kok[kf][i] = pg >= 0 && kg < row_end;
+          const int kc = kok[kf][i] ? kg : 0;
+          const bool in_base = kc < base_len;
+          kp[kf][i] = in_base ? kbase + (size_t)kc * pm.k_seq
+                              : ktail + (size_t)(kc - base_len) * pm.kt_seq;
+          vp[kf][i] = in_base ? vbase + (size_t)kc * pm.v_seq
+                              : vtail + (size_t)(kc - base_len) * pm.vt_seq;
+        }
+      }
+      // This lane's score columns kf * 16 + sn + jj, all on one page: the
+      // page's first such key (-1 past the list) and its query marks.
+      int ckg[TK];
+      uint cmask[TK];
+      STEEL_PRAGMA_UNROLL
+      for (short kf = 0; kf < TK; kf++) {
+        const int j = kf * kU + sn;
+        const int pi = t0 + j / PR;
+        const int pg = pi < cnt ? ulist[pi] : -1;
+        ckg[kf] = pg >= 0 ? pg * PR + j % PR : -1;
+        cmask[kf] = pi < cnt ? umask[pi] : 0u;
+      }
+
+      // Partial S = Q K^T over this simdgroup's columns: 16 rows x 32 keys.
+      stile_t Stile;
+      Stile.clear();
+      STEEL_PRAGMA_UNROLL
+      for (short id = 0; id < TDh; id++) {
+        kfrag_t kfr[TK];
+        STEEL_PRAGMA_UNROLL
+        for (short kf = 0; kf < TK; kf++) {
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < 2; i++) {
+            const T4 v = *((const device T4*)(kp[kf][i] + id * kU));
+            STEEL_PRAGMA_UNROLL
+            for (short j = 0; j < 4; j++) {
+              kfr[kf][i * 4 + j] = kok[kf][i] ? v[j] : T(0);
+            }
+          }
+        }
+        stile_t::NAXFrag_t::mma(
+            Stile.frag_at(0, 0),
+            Stile.frag_at(0, 1),
+            Qf[id],
+            metal::false_type{},
+            kfr[0],
+            kfr[1],
+            metal::true_type{});
+      }
+
+      if (WN > 1) {
+        // d group 0's partial plus d group 1's, in that order, for both.
+        threadgroup float* slot = s_xchg[row_group];
+        const short base = short(simd_lane_id) * (TK * kEPF);
+        if (d_group == 1) {
+          STEEL_PRAGMA_UNROLL
+          for (short kf = 0; kf < TK; kf++) {
+            STEEL_PRAGMA_UNROLL
+            for (short i = 0; i < kEPF; i++) {
+              slot[base + kf * kEPF + i] = Stile.frag_at(0, kf)[i];
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (d_group == 0) {
+          STEEL_PRAGMA_UNROLL
+          for (short kf = 0; kf < TK; kf++) {
+            STEEL_PRAGMA_UNROLL
+            for (short i = 0; i < kEPF; i++) {
+              const float s =
+                  Stile.frag_at(0, kf)[i] + slot[base + kf * kEPF + i];
+              Stile.frag_at(0, kf)[i] = s;
+              slot[base + kf * kEPF + i] = s;
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (d_group == 1) {
+          STEEL_PRAGMA_UNROLL
+          for (short kf = 0; kf < TK; kf++) {
+            STEEL_PRAGMA_UNROLL
+            for (short i = 0; i < kEPF; i++) {
+              Stile.frag_at(0, kf)[i] = slot[base + kf * kEPF + i];
+            }
+          }
+        }
+      }
+
+      // Scale; a key counts for a row when the row's query listed its page
+      // and it lies at or below the query's last key.
+      STEEL_PRAGMA_UNROLL
+      for (short kf = 0; kf < TK; kf++) {
+        thread auto& fg = Stile.frag_at(0, kf);
+        STEEL_PRAGMA_UNROLL
+        for (short ii = 0; ii < kRowsPT; ii++) {
+          const bool member = ckg[kf] >= 0 && (cmask[kf] & qbit[ii]) != 0u;
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < 4; jj++) {
+            const short loc = ii * 4 + jj;
+            fg[loc] = member && ckg[kf] + jj <= lim[ii]
+                ? fg[loc] * scale2
+                : Limits<float>::finite_min;
+          }
+        }
+      }
+
+      // Online softmax (exp2 space). A row with no key yet keeps its max at
+      // finite_min and contributes a zero P row.
+      metal::vec<float, kRowsPT> new_max = max_score;
+      Stile.template row_reduce<MaxOp>(new_max);
+      Stile.template row_bin_op<ExpSubOp>(new_max);
+      metal::vec<float, kRowsPT> factor;
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kRowsPT; ++i) {
+        if (new_max[i] > Limits<float>::finite_min) {
+          factor[i] = fast::exp2(max_score[i] - new_max[i]);
+          max_score[i] = new_max[i];
+        } else {
+          factor[i] = 1.0f;
+          STEEL_PRAGMA_UNROLL
+          for (short kf = 0; kf < TK; kf++) {
+            STEEL_PRAGMA_UNROLL
+            for (short jj = 0; jj < 4; jj++) {
+              Stile.frag_at(0, kf)[i * 4 + jj] = 0.0f;
+            }
+          }
+        }
+      }
+      sum_score = sum_score * factor;
+      Stile.template row_reduce<SumOp>(sum_score);
+      Otile.template row_bin_op<MulOp>(factor);
+
+      // O += P @ V over this simdgroup's columns.
+      STEEL_PRAGMA_UNROLL
+      for (short id = 0; id < TDh; id += 2) {
+        STEEL_PRAGMA_UNROLL
+        for (short kf = 0; kf < TK; kf++) {
+          kfrag_t v0, v1;
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < 2; i++) {
+            const T4 a = *((const device T4*)(vp[kf][i] + id * kU));
+            const T4 b = *((const device T4*)(vp[kf][i] + (id + 1) * kU));
+            STEEL_PRAGMA_UNROLL
+            for (short j = 0; j < 4; j++) {
+              v0[i * 4 + j] = kok[kf][i] ? a[j] : T(0);
+              v1[i * 4 + j] = kok[kf][i] ? b[j] : T(0);
+            }
+          }
+          otile_t::NAXFrag_t::mma(
+              Otile.frag_at(0, id),
+              Otile.frag_at(0, id + 1),
+              Stile.frag_at(0, kf),
+              metal::false_type{},
+              v0,
+              v1,
+              metal::false_type{});
+        }
+      }
+    }
+  }
+
+  // Unnormalized partials [B, Hq, q_len, gqa_splits, D]; d group 0 writes
+  // the row stats, with the max in natural log for the shared merge.
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kRowsPT; i++) {
+    if (!live[i]) {
+      continue;
+    }
+    const size_t po = qrow[i] * gqa_splits + split_idx;
+    device float* orow = out + po * D + col0;
+    STEEL_PRAGMA_UNROLL
+    for (short id = 0; id < TDh; id++) {
+      const thread auto& fg = Otile.frag_at(0, id);
+      *((device float4*)(orow + id * kU)) =
+          float4(fg[i * 4], fg[i * 4 + 1], fg[i * 4 + 2], fg[i * 4 + 3]);
+    }
+    if (d_group == 0 && sn == 0) {
+      sums[po] = sum_score[i];
+      maxs[po] = max_score[i] == Limits<float>::finite_min
+          ? Limits<float>::finite_min
+          : max_score[i] * M_LN2_F;
     }
   }
 }

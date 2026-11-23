@@ -100,7 +100,9 @@ and `iq4_nl`, `iq3_xxs`, `iq3_s`, `iq2_xs` and `iq2_s` run the BM=64 and BM=128 
 the codecs that have them. The NAX verify kernel serves `pq2_0`, `q4_0`, `q4_1`, `q8_0`, `q2_k` to
 `q6_k` and `nvfp4` from a per-codec entry, and the register-resident MMA verify kernel serves
 `ptq1_0`, as described at the end of this section. Every limit and floor is a measured per-codec
-policy (`kq_nax_small_m` and `kq_smallbm_policy` in `src/kquant_matmul.cpp`).
+policy (`kq_nax_small_m` and `kq_smallbm_policy` in `src/kquant_matmul.cpp`). Ahead of all of
+these, the dense row-class kernel serves up to 16 rows from a per-codec entry, as described at
+the end of this section.
 
 On GPUs without NAX, the `qmm_t` kernel decodes each weight tile inside its K loop, once for every
 64-row tile of the activations. From a floor in rows it is faster to decode the whole weight once
@@ -509,6 +511,20 @@ Tuning levers (defaults are right for normal use):
   NAX op on one 8-byte load per op where the activations start on a 16-byte boundary, in place of
   one 16-byte load per two ops. The output is the same. In `KQ_QMM_LOG` the kernel name
   carries the variant, `_x16` or `_x8`. Read once per process unless `KQ_TUNE_LIVE=1`.
+- `KQ_DENSE_ROWS` - the dense row-class kernel (below). `0` restores the routes it displaces, with
+  their levers. Unset (on) by default. Read live per call.
+- `KQ_DENSE_ROWS_MIN_M` - the fewest rows the dense row-class kernel serves, on every codec, in
+  place of the codec's entries. `2` runs every row count from 2 to 16 through it, so a row gives
+  the same bits at any row count, and `1` adds one row. Unset takes the entries (table below).
+  Read live per call.
+- `KQ_DENSE_ROWS_FORM` - probe lever: `1` runs the dense row-class kernel only in its `verify_nax`
+  decode form and `2` only in its chunk decode form; a call the form does not serve takes the
+  other routes. Unset takes the `verify_nax` form where it fits. Read live per call.
+- `KQ_DENSE_ROWS_NSG` - probe lever: the simdgroups per threadgroup of the dense row-class kernel,
+  1 to 32, in place of the rule by N. Unset (off) by default. Read live per call.
+- `KQ_DENSE_ROWS_MULTI` - `1` runs the weights of a `quantized_matmul_multi` call that the dense
+  row-class kernel serves in one dispatch per four weights. Unset (off) by default: one dispatch
+  a weight ran faster. Read live per call.
 - `KQ_MV_EXT_SB` / `KQ_MV_EXT_NX` / `KQ_MV_EXT_HD` - `mv_ext` activation-traffic experiments:
   shuffle-broadcast (`1`), wide nxpsg (`16`/`32`), half-precision chunk dots (`1`). q6_k M 4-12
   only. `HD` measured +4-5% at M 8; the rest flat to negative on M5 Max. Kept as probes. Default
@@ -833,6 +849,71 @@ of it, through M 3 at N 513 to 1024 and M 2 above, or M 1 on a vocab head.
 At M 8 the kernel runs 1.10-1.56x faster than NAX split-K from N 2048, and 1.43-1.52x on a vocab
 head.
 
+### Dense row-class kernel
+
+On a NAX GPU, transposed non-batched `quantized_matmul` calls on bfloat16 or float16 x run one
+kernel from the codec's entry to 16 rows (`kq_dense_rows.h`, `dense_rows` in
+`src/kquant_matmul.cpp`). It reads the GGUF wire blocks in place and is one dispatch with no
+partials in device memory.
+
+A threadgroup owns 32 weight rows. Each of its simdgroups decodes every weight of those rows in
+its share of K once, straight into the right operand of a NAX `matmul2d` 16x32x16, and one NAX
+op applies the decoded weights to every row of x. Simdgroup g takes units g, g + nsg, ... of K,
+and the threadgroup sums the simdgroups' tiles in simdgroup order through threadgroup memory.
+Rows past M are zero in the left operand. The kernel, the split and the sum order depend on the
+codec, N and K only, and the class of 9 to 16 rows only adds the loads and stores of rows 8 to
+15, so a row gives the same bits at every row count the kernel serves.
+
+Two decode forms. Codecs with a `verify_nax` decode take it where it fits the weight: a unit is
+that kernel's K step. Every other codec dequantizes 16 weights at a time with its `mv_ext` chunk
+decode: a unit is whole blocks of at least 128 weights, or one block where K is whole blocks but
+not whole units. The `verify_nax` form ran faster than the chunk form on every codec that has
+both, from 2 to 16 rows, except `pq2_0` from 9 rows.
+
+The simdgroup count nsg is the divisor of the unit count nearest by ratio to 1280 / ceil(N / 32),
+at most 8 above N 1024 and at most 32 at N 1024 and under, halved until the pipelines of both
+row classes hold 32 * nsg threads.
+
+Entries, measured on M5 Max over chains of dependent calls on the Qwen3.8-Flash-Next projection
+shapes (K 2560 and 6144, N 2560 to 12288): the fewest rows from which the kernel ran at or under
+the time of the route it displaces at every row count of the class. Time of the kernel over the
+displaced route, at the entry and at the top of the class:
+
+| codec | entry, 2 to 8 rows | time | entry, 9 to 16 rows | time |
+|---|---|---|---|---|
+| `q8_0` | 2 | 0.93-0.91x | 9 | 0.79-0.76x |
+| `q5_k` | 2 | 0.91-0.87x | 9 | 0.71x |
+| `q3_k` | 2 | 0.95-0.80x | 9 | 0.66-0.63x |
+| `iq4_xs` | 2 | 0.89-0.92x | 9 | 0.79-0.75x |
+| `iq4_nl` | 2 | 0.92-0.93x | 9 | 0.92-0.86x |
+| `q6_k` | 3 | 0.985-0.84x | 9 | 0.60-0.57x |
+| `q4_k` | 3 | 0.96x | 9 | 0.77-0.76x |
+| `q2_k` | 3 | 0.96-0.80x | 9 | 0.76-0.71x |
+| `q4_0`, `q4_1` | 3 | 0.95-0.93x | 9 | 0.80-0.75x |
+| `q2_0` | 3 | 0.87-0.84x | 9 | 0.71-0.68x |
+| `nvfp4` | 3 | 0.88-0.86x | 9 | 0.77-0.73x |
+| `iq1_s` | 3 | 0.98-0.72x | 9 | 0.73-0.70x |
+| `q5_0`, `q5_1` | 4 | 0.95-0.93x | 9 | 0.95-0.90x |
+| `iq1_m` | 4 | 0.91-0.63x | 9 | 0.65-0.63x |
+| `iq2_xxs` | 5 | 0.92-0.64x | 9 | 0.59-0.41x |
+| `iq2_s` | 6 | 0.99-0.98x | 9 | 0.99-0.94x |
+| `iq3_s` | 8 | 0.99x | 9 | 0.99-0.95x |
+| `pq2_0` | 3 | 0.87-0.86x | none | 1.05-1.01x at 9 to 12 rows |
+| `iq3_xxs` | none | 1.00-1.01x from 5 rows | 12 | 0.99-0.97x |
+| `iq2_xs` | none | 1.03-1.05x from 4 rows | none | 1.00-1.05x |
+| `stq1_0` | none | 1.11-1.15x | none | 1.07-1.14x |
+| `ptq1_0` | none | 1.81-1.83x | none | 1.33-1.39x |
+| `mxfp4` | none | not timed | none | not timed |
+
+Below the entry the kernel ran slower: one row 1.1x to 3.5x the time of the mat-vec routes on
+every codec, and two rows 1.02x on `q6_k` and 1.05x to 1.33x on the codecs whose entry is above
+2. `KQ_DENSE_ROWS_MIN_M` moves the entry of every codec.
+
+`mxfp4` weights are held in the activation type, since a block scale is a power of two of any
+exponent and half would overflow or flush it. So the kernel serves `mxfp4` on bfloat16 (and
+float32, which the op casts) activations only, and only under `KQ_DENSE_ROWS_MIN_M`: the timings
+above held its weights in half, so `mxfp4` has no entry and keeps the routes before the kernel.
+
 ## Quantized matmuls that share an input
 
 - `quantized_matmul_multi` - `[x @ W^T for W in weights]` for packed weights of one codec and one
@@ -855,6 +936,15 @@ head.
   holds for every codec with a verify_nax kernel, including those whose verify_nax entry starts at
   a width that the narrow weight does not reach. Where every weight would take verify_nax at one
   split count, the outputs equal `quantized_matmul` bit for bit.
+
+  Where the dense row-class kernel (above) serves any of the weights, the op runs
+  `quantized_matmul` per weight, so its outputs equal those calls bit for bit. Under
+  `KQ_DENSE_ROWS_MULTI=1`, where the kernel serves every weight, up to four weights run in one
+  dispatch at 2 to 16 rows, with the same bits: each weight keeps the simdgroup count of its
+  own call, and a threadgroup launches the largest of the dispatch. On M5 Max the one dispatch
+  ran slower than a dispatch per weight (`q6_k`, K 2560, N 10240 and 6144, 8 rows, 36 pairs:
+  2.94 ms against 2.75, and 2.85 to 2.87 against 2.82 with both weights on one simdgroup
+  count), so it is off by default.
 
   Every other case runs `quantized_matmul` per weight: one row or more than 8, a single weight,
   codecs without a verify_nax kernel, an inner dim that kernel does not step over, a weight whose
@@ -1364,6 +1454,92 @@ the shared row pieces both serve one row only.
 - `KQ_MOE_SX_SPLIT=<n>` runs each shared row as n pieces at any row count, within the same bounds.
   `1` restores one piece. Read per call. A/B lever.
 
+### Grouped and tiled gathers at verify widths
+
+At 2 to 16 activation rows (a speculative verify block) many (row, slot) pairs route to the same
+expert. The grouped kernels (`_grp`) read an expert once per eight pairs that route to it, where the
+pair kernels read it once per two. Each kernel finds its pairs' runs from the indices, so no table
+goes ahead of it. Every codec and shared-expert codec of the fused gathers has them, on any Metal
+GPU. By default they run on GPUs with the tensor-op units (M5 and later), the GPUs they were timed
+on; `KQ_MOE_GROUP=1` runs them on others. The grouped GLU and the grouped score-mixed down run from
+5 rows: on M5 Max they lost at 3 rows, tied at 4 and won from 5 (the verify forward of a 512-expert
+model). Codecs that run the qf row loops keep the qf loop over four rows a pass, so a row has the
+bits of the one-row qf kernels at every width; the other codecs run the grouped Ext loops, whose
+rows differ from a one-row call by rounding. The half-dot kernels (`KQ_MOE_HALF`) have no grouped
+form. From 7 rows, where the grouped GLU runs, the shared expert's dense route stands down: the
+grouped kernels read the shared expert once per eight rows.
+
+From 8 rows on GPUs with the tensor-op units, `gather_qmv_mix_kq` and `gather_qmv_mix_ns_kq` sort
+their pairs by expert into tiles of up to eight (`kq_moe_tile.h`): a plan dispatch sorts the pairs
+and their activation rows, a tile kernel reads each tile's expert once and writes each pair's row
+sums, and a combine dispatch adds each row's slots under their scores. The shared slots run as
+tiles too. A tile of one or two rows keeps its sums in registers; a larger tile stages its weights
+as half in threadgroup memory and runs a matmul2d on them, so a row's bits depend on the call's
+width. `nvfp4`, calls with output scales, the half-dot kernels and a forced `KQ_MOE_MIX_FORM` keep
+their kernels. On M5 Max (512 experts of 2560 by 640) the tiled down took 146 to 149 us a layer
+against 154 to 165 for the grouped one at 8 rows and 261 against 338 at 16; at 4 rows the MoE block
+tied, so the tiles start at 8.
+
+- `KQ_MOE_GROUP` - `1` runs the grouped kernels on any GPU, `0` keeps the pair and per-row kernels
+  at every width (and the dense route of the shared expert from 4 rows). Unset, they run on GPUs
+  with the tensor-op units. Read live once set.
+- `KQ_MOE_GROUP_MIN_T`, `KQ_MOE_GROUP_MIX_MIN_T` - the fewest rows of the grouped GLU and of the
+  grouped score-mixed down (default `5` each, at least `2`). Read per call.
+- `KQ_MOE_GROUP_QF=0` puts the qf codecs on the grouped Ext loops. Read per call. A/B lever.
+- `KQ_MOE_GROUP_MIX_NT` - output tiles a grouped score-mixed down threadgroup takes (default `2`);
+  a row's bits do not depend on it. Read per call. Tuning lever.
+- `KQ_MOE_TILE=0` keeps the grouped down where the tiled one would run. Read per call.
+- `KQ_MOE_TILE_MIN_T` - the fewest rows of the tiled down (default `8`, at least `2`). Read per
+  call.
+- `KQ_MOE_TILE_COL_ROWS` - the most rows of a tile that keeps its sums in registers (default `2`,
+  `0` stages every tile). Read per call. Tuning lever.
+
+### Expert store
+
+An expert store is a copy of a routed expert stack in a layout the tile kernels read faster than
+GGUF blocks, for a caller that can hold the copy or that drops the mapped stack. The ops are
+inference-only and Metal-only, on GPUs with the tensor-op units; `moe_store_supported(codec,
+shexp_codec)` and `moe_store_seg_supported(codec, K)` say whether a device has the kernels.
+
+- **`moe_store_pack`** - the planes of the listed experts of a `[E, N, row bytes]` stack (N a
+  multiple of 64): the bytes of the experts' GGUF blocks unchanged, each block field of `q5_0`,
+  `iq4_nl`, `iq3_xxs` and `iq4_xs` in a plane of its own with the 64 output columns of a tile side
+  by side at each 32-weight step, and the other codecs as one plane of whole blocks. `experts[i]`
+  takes slot i. A store holds the same bytes as the experts it copies.
+- **`moe_store_glu`** - `silu(gate . x) * (up . x)` of the routed experts and one shared expert,
+  `[T, R + 1, N]`. An expert with a slot is read from its planes; one without
+  (`slots[e] == 0x80000000`) and the shared expert are read from their GGUF blocks in place. A weight
+  is rounded to half before its products, so the bits differ from `moe_glu_gather_shexp_kq`'s and
+  depend on the call's width.
+- **`moe_store_down`** - the score-mixed down on a store, with the bits of `gather_qmv_mix_kq`'s
+  tiled form at the same width when no K split is on.
+- **`moe_store_seg`** - `gather_qmm_seg` on store planes for sorted prefill rows, with the bits of
+  `gather_qmm_seg`'s tensor-op kernel on the GGUF blocks. `moe_store_seg_pair` runs the gate and
+  up products of one pass in one kernel (`iq3_xxs`, `iq4_xs`, `iq2_s`), and with `fused=True`
+  returns `silu(gate) * up` as MLX's SwiGLU rounds it.
+- **`moe_store_warm`** - builds the pipelines the store ops of one block reach, ahead of their
+  first call, without evaluating anything; it releases the GIL. `kernel_keys()` lists the
+  pipelines built in the process.
+
+On `q5_0`, `iq4_nl`, `iq3_xxs` and `iq4_xs` stores the GLU and down run pair-grid kernels with no
+plan dispatch up to 8 rows, and the tile kernels behind a plan dispatch above; the other codecs
+run the tile kernels at every width. Levers, read per call unless noted:
+
+- `KQ_MOE_STORE_FORM=0` runs the tile kernels at every width; `KQ_MOE_STORE_PG_MAX_T` (default `8`)
+  is the widest call of the pair-grid kernels.
+- `KQ_MOE_STORE_GLU_QR`, `KQ_MOE_STORE_GLU_QH`, `KQ_MOE_STORE_DOWN_QR`, `KQ_MOE_STORE_DOWN_QH` -
+  simdgroups a routed and a shared weight row are split over along K in the pair-grid kernels, 1 to
+  4 (defaults 2, 2, 1, 1). A down with no split has the bits of the tile form.
+- `KQ_MOE_STORE_COL_ROWS` - the most rows of a pair-grid column tile, 1 to 4 (default `2`).
+- `KQ_MOE_STORE_GLU_DD` - up to this many rows (default `3`, `0` off) an `iq3_xxs` store GLU runs
+  the in-place pair form on the planes, which keeps `moe_glu_gather_shexp_kq`'s sums.
+- `KQ_MOE_STORE_SHEXP_QF` - up to this many rows a `q5_k`, `q6_k` or `q8_0` shared expert of a
+  pair-grid kernel runs its qf row loops (default `0`, off).
+- `KQ_MOE_STORE_GLU_MIN_T`, `KQ_MOE_STORE_DOWN_MIN_T`, `KQ_MOE_STORE_MAX_T` - the widths the store
+  GLU and down take, by default all of them; a call outside the range is built as the in-place op on
+  the same weights. Read when the op is built.
+- `KQ_SEG_DR` and `KQ_SEG_COL_ROWS` (wide store tiles) are in the README's environment variables.
+
 ## Attention
 
 Scaled-dot-product variants for shapes stock MLX's fused allowlist excludes, plus the sparse
@@ -1407,6 +1583,21 @@ into a packed layout first.
   the staged tile height (32 rows at head dim 64/128, 16 at 256, 8 at 512); `tile_c` overrides it
   where instantiated (4-row pages at head dim 256, matching a 4-token block-sparse selection unit);
   takes `starts`.
+- **`sdpa_paged_rows`** - paged attention for a block of queries (a speculative verify block):
+  each query attends its own page list, `[B, L, n_pages]` or one list per kv-head, in a single
+  dispatch split across threadgroups per (kv-head, query). K and V are read in place from one
+  buffer or from a base plus a tail segment (`k_tail`, `v_tail`, `base_len`), and `ends` gives each
+  query's exclusive key bound, so a partial last page needs no mask. Rows past a query's end are
+  never read, so a tail buffer may hold spare rows and the result has the bits of one buffer.
+  Pages are 32 rows at head dim
+  64/128, 16 at 256 (or 4 with `page_rows=4`), 8 at 512; float16 and bfloat16 K/V only.
+  `tail_page=True` attends each query's partial last page, the one holding key `ends - 1`, after
+  its listed pages. `window=n` lets each window of `n` queries walk the union of their pages once,
+  staging a K/V tile once for all of them, with a per-query mask on the scores; past 2 queries the
+  default picks windows of up to 4. Head dim 512 always walks per query. On M5 and later GPUs the
+  windows run on the tensor-op units, from 2 queries up, with up to 128 query rows a window.
+  `KQ_PAGED_ROWS_NAX=0` keeps the simdgroup-matrix kernel. `KQ_PAGED_ROWS_WINDOW` replaces the
+  default pick (`0` walks per query).
 - **`sdpa_prefill_block_sparse`** - block-sparse FA prefill over 4-row K/V pages at head dim 256:
   queries fold into 4-wide windows (with the GQA group, one MMA tile), and each window walks only
   its own page list with per-page membership bitmasks, so a prefill chunk pays for the selected
@@ -1619,8 +1810,9 @@ modifications, from omlx's `glm_moe_dsa` custom kernels (see the
   `out[b,0,m,n] = sum_h relu(q[b,h,m] . k[b,0,n]) * w[h,m]`. 16, 32 or 64 heads; fp32 head weights
   are read as-is. `causal_ratio` is for pooled keys, one key per `causal_ratio` positions: row `m`
   sees the keys under `(causal_q_offset + m + 1) // causal_ratio`.
-- **`dsa_indexer_score_decode`** - the same for decode-width (`qL <= 4`) queries without materializing
-  the per-head `[H, P]` scores. 4, 16, 32 or 64 heads; fp32 head weights are read as-is.
+- **`dsa_indexer_score_decode`** - the same for decode and verify widths (`qL <= 8`) without
+  materializing the per-head `[H, P]` scores. 4, 16, 32 or 64 heads; fp32 head weights are read
+  as-is. `keys_tail` scores a second key segment after `keys`, as if the two were one buffer.
 - **`dsa_topk_indices`** - per-row top-k arg-select over the 16-bit scores (2-pass radix select). The
   selected index *set* matches a full sort; the order within a row does not.
 - **`dsa_sparse_attention`** - the sliding local window plus the indexer-selected gathered rows plus
@@ -1713,6 +1905,19 @@ Tuning levers (defaults are right for normal use):
 - `gpu_core_count` / `max_threadgroup_memory` - the GPU core count from IOKit (`KQ_GPU_CORES`
   overrides it) and the threadgroup memory limit in bytes, both 0 when unknown.
 
+## Recorded graphs
+
+`fuse_graph` records a lazy graph once and `fused_call` runs it on new inputs of the same shapes
+with the same bits. With `direct=True` and `env_cache(True)` a record whose primitives are all on
+the direct list replays its Metal calls from the second eval on; `fused_direct_info` reports its
+state. Debug levers:
+
+- `KQ_FUSED_DIRECT_CHECK=1` makes a record learn twice and compare before it replays. A record whose
+  two recordings differ refuses itself and names the primitives of the differing calls.
+- `KQ_FUSED_DIRECT_ANY=1` lets a record with primitives off the direct list learn, to probe a new
+  layer with the check on.
+- `KQ_FUSED_DIRECT_SELFTEST=1` makes consecutive recordings differ, for the test of the check.
+
 ## Feeder-loop primitives
 
 The zero-copy arena buffers and shared-event stream primitives (`arena_alloc`, `event_signal` /
@@ -1720,6 +1925,20 @@ The zero-copy arena buffers and shared-event stream primitives (`arena_alloc`, `
 a producer/consumer decode loop and are a separate subsystem; see
 [docs/feeder/DESIGN.md](feeder/DESIGN.md).
 
+- **`file_rows`** - rows of a table read straight from a file on a CPU stream, as a lazy node:
+  nothing of the table is mapped or wired. `file_rows_failures()` counts rows returned as zeros and
+  `file_rows_cache_stats()` returns the row cache's hits, misses and bytes held. Its levers are read
+  once per process:
+  - `KQ_FILE_ROWS_CACHE=N` keeps the last row read in each of N slots per table (row id modulo N),
+    so a repeated row id costs no read. Unset or `0` is off.
+  - `KQ_FILE_ROWS_CACHE_BYTES=B` bounds the same cache by bytes, slot ids included (8 bytes a slot),
+    and wins over the slot count when both are set.
+  - Both bounds hold per table: each table read keeps a cache of its own for the life of the
+    process, so the bytes held grow with the tables a process reads.
+  - `KQ_FILE_ROWS_BUFFERED=1` reads through the page cache in place of uncached reads, for a table
+    the caller keeps in the page cache.
+  - `KQ_FILE_ROWS_STAMPS=<file>` appends one line per read, `start end rows hits`, with the times in
+    seconds on the mach clock (the clock of Python's `perf_counter`). Debug only.
 - **`route_shed`** - routed-expert slot remap plus residency shed for streamed MoE decode: expert ids
   map to arena slots through a resident-slot table, non-resident experts are shed with their gate
   mass renormalized onto the kept ones, and the misses come back (ids and scores) for between-token

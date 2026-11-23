@@ -11,6 +11,7 @@
 #include "mlx/backend/metal/kernels/kq_moe_qf.h"
 
 instantiate_kq_qf(nvfp4, KqQfNvfp4)
+instantiate_kq_qf_grp_all(nvfp4, KqQfNvfp4)
 instantiate_kq_qf_dd(nvfp4, KqQfNvfp4)
 instantiate_kq_qf_bias(nvfp4, KqQfNvfp4)
     // clang-format on

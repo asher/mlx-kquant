@@ -115,8 +115,8 @@ bool lora_shape_rule(int K, int N, int64_t rows, int rank) {
 }
 
 bool lora_log() {
-  static const bool cached = std::getenv("KQ_QMM_LOG") != nullptr;
-  return lora_tune_live() ? std::getenv("KQ_QMM_LOG") != nullptr : cached;
+  static const bool cached = kq_getenv("KQ_QMM_LOG") != nullptr;
+  return lora_tune_live() ? kq_getenv("KQ_QMM_LOG") != nullptr : cached;
 }
 
 mx::array last_axis_slice(const mx::array& a, int lo, int hi, mx::Stream s) {

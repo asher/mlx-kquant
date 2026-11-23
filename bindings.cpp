@@ -46,6 +46,18 @@ bool kvarn_kind_is_v(const std::string& kind, const char* op) {
 
 } // namespace
 
+static std::vector<std::shared_ptr<const mlx_kquant::FusedTape>>&
+kq_fused_table() {
+  static std::vector<std::shared_ptr<const mlx_kquant::FusedTape>> tab;
+  return tab;
+}
+
+static std::vector<std::shared_ptr<mlx_kquant::FusedBinding>>&
+kq_binding_table() {
+  static std::vector<std::shared_ptr<mlx_kquant::FusedBinding>> tab;
+  return tab;
+}
+
 NB_MODULE(_ext, m) {
   m.doc() =
       "mlx-kquant: standalone GGUF K-quant ops for MLX (custom Metal kernels).";
@@ -524,6 +536,73 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_paged_rows",
+      &mlx_kquant::sdpa_paged_rows,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "scale"_a,
+      "pages"_a,
+      "ends"_a = nb::none(),
+      "k_tail"_a = nb::none(),
+      "v_tail"_a = nb::none(),
+      "base_len"_a = 0,
+      "splits"_a = 0,
+      "page_rows"_a = 0,
+      "tail_page"_a = false,
+      "window"_a = -1,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "params"_a = nb::none(),
+      "base_len_slot"_a = 0,
+      R"(
+        Paged attention for several queries with a page list each (the
+        verify block of a block-sparse attention model). Query l attends
+        only the key rows of the pages in pages[b, l] that lie below
+        ends[b, l]. K and V are read in place, from a base and an optional
+        tail segment.
+
+        Args:
+            q (array): queries [B, n_q_heads, L, D], float16/bfloat16; D
+                64, 128, 256 or 512.
+            k (array): keys [B, n_kv_heads, S, D].
+            v (array): values [B, n_kv_heads, S, D].
+            scale (float): query scale (typically 1/sqrt(D)).
+            pages (array): int32 [B, L, n_pages], or
+                [B, n_kv_heads, L, n_pages] for a list per kv head. A
+                negative entry is skipped. A page counts once however often
+                the list holds it (or holds the tail page); a list in
+                ascending order is the fast case of the per-query walk.
+            ends (array, optional): int32 [B, L]; query l attends key rows
+                below ends[b, l]. Without it every listed row counts.
+            k_tail, v_tail (array, optional): [B, n_kv_heads, T, D]. Key
+                row r reads k, v when r < base_len and row r - base_len of
+                the tails otherwise.
+            base_len (int): first key row of the tails.
+            splits (int): runs each query's page list is cut into; 0
+                buckets by the listed key count.
+            page_rows (int): key rows per page; 0 picks the head dim's
+                tile (32 at 64/128, 16 at 256, 8 at 512). 4 is
+                instantiated at head_dim 256 only.
+            tail_page (bool): give each query one more page,
+                ends[b, l] // page_rows: the partial page its end falls in,
+                so the caller need not append it to the list.
+            window (int): 0 walks every query's pages in its own
+                threadgroups. n > 0 (at most 32) has each window of n
+                queries walk the union of their pages once, staging a key
+                tile once for all of them; at head_dim 512 the per-query
+                walk runs. -1 picks by query count, and the
+                KQ_PAGED_ROWS_WINDOW environment variable replaces the pick.
+            params (array, optional): an evaluated int32 parameter block
+                (see fuse_graph): base_len is read from
+                params[base_len_slot] when the kernel is encoded. Needs the
+                tails and ends.
+
+        Returns:
+            array: attention output [B, n_q_heads, L, D].
+      )");
+
+  m.def(
       "sdpa_prefill_block_sparse",
       &mlx_kquant::sdpa_prefill_block_sparse,
       "q"_a,
@@ -923,6 +1002,305 @@ NB_MODULE(_ext, m) {
         default. Metal-only.
       )");
 
+  m.def(
+      "moe_store_supported",
+      &mlx_kquant::moe_store_supported,
+      "kquant_type"_a,
+      "shexp_kquant_type"_a = "",
+      R"(
+        True when the expert store ops (moe_store_pack, moe_store_glu,
+        moe_store_down) have kernels for the codec pair on this device.
+      )");
+  m.def(
+      "moe_store_pack",
+      [](mx::array w,
+         const std::string& kquant_type,
+         int in_features,
+         mx::array experts) {
+        return mlx_kquant::moe_store_pack(
+            std::move(w), kquant_type, in_features, std::move(experts));
+      },
+      "w"_a,
+      "kquant_type"_a,
+      "in_features"_a,
+      "experts"_a,
+      R"(
+        Store planes of the listed experts of a K-quant expert stack.
+
+        A store holds the bytes of the experts' GGUF blocks unchanged, with
+        the 64 output columns of a tile side by side at each step. q5_0,
+        iq4_nl, iq3_xxs and iq4_xs keep each block field in a plane of its
+        own; the other store codecs keep whole blocks in one plane.
+        moe_store_supported says which codecs have a store. experts[i]
+        takes slot i.
+
+        Args:
+            w (array): [E, N, row bytes] uint8, N a multiple of 64.
+            kquant_type (str): a store codec, such as q5_0 or q4_k.
+            in_features (int): K, the inputs of a weight row.
+            experts (array): [count] expert ids.
+
+        Returns:
+            list[array]: the codec's planes, uint8, 1-D: 2 or 3 for the
+            four field formats, 1 for the others.
+      )");
+  m.def(
+      "moe_store_glu",
+      [](mx::array x,
+         mx::array gate_w,
+         mx::array up_w,
+         mx::array shexp_gate_w,
+         mx::array shexp_up_w,
+         const std::string& kquant_type,
+         mx::array indices,
+         mx::array slots,
+         std::vector<mx::array> gate_planes,
+         std::vector<mx::array> up_planes,
+         const std::string& shexp_kquant_type) {
+        return mlx_kquant::moe_store_glu(
+            std::move(x),
+            std::move(gate_w),
+            std::move(up_w),
+            std::move(shexp_gate_w),
+            std::move(shexp_up_w),
+            kquant_type,
+            std::move(indices),
+            std::move(slots),
+            std::move(gate_planes),
+            std::move(up_planes),
+            shexp_kquant_type);
+      },
+      "x"_a,
+      "gate_w"_a,
+      "up_w"_a,
+      "shexp_gate_w"_a,
+      "shexp_up_w"_a,
+      "kquant_type"_a,
+      "indices"_a,
+      "slots"_a,
+      "gate_planes"_a,
+      "up_planes"_a,
+      nb::kw_only(),
+      "shexp_kquant_type"_a = "",
+      R"(
+        silu(gate . x) * (up . x) of the routed experts and one shared
+        expert, reading routed experts from a store.
+
+        The tile design of the fused down on the GLU: an expert with a slot
+        is read from its planes, one without (slots[e] == 0x80000000) and
+        the shared expert from their GGUF blocks in place. A weight is
+        rounded to half before its products, so the bits differ from
+        moe_glu_gather_shexp_kq's and depend on the call's width.
+
+        Args:
+            x (array): [T, K] float16 or bfloat16.
+            gate_w, up_w (array): [E, N, row bytes] uint8.
+            shexp_gate_w, shexp_up_w (array): [N, row bytes] uint8.
+            kquant_type (str): the routed codec.
+            indices (array): [T, R] expert ids.
+            slots (array): [E] uint32.
+            gate_planes, up_planes (list[array]): from moe_store_pack.
+            shexp_kquant_type (str): the shared codec when it differs.
+
+        Returns:
+            array: [T, R + 1, N] in the x dtype.
+      )");
+  m.def(
+      "kernel_keys",
+      &mlx_kquant::kernel_keys,
+      R"(
+        The keys of the compute pipelines built through the kq kernel cache
+        in this process, in build order. For tests and diagnostics.
+      )");
+  m.def(
+      "moe_store_warm",
+      [](const std::string& glu_type,
+         const std::string& glu_shexp_type,
+         const std::string& down_type,
+         const std::string& down_shexp_type,
+         const std::vector<mx::Dtype>& dtypes,
+         int k_glu,
+         int k_down) {
+        nb::gil_scoped_release nogil;
+        return mlx_kquant::moe_store_warm(
+            glu_type,
+            glu_shexp_type,
+            down_type,
+            down_shexp_type,
+            dtypes,
+            k_glu,
+            k_down);
+      },
+      "glu_type"_a,
+      "glu_shexp_type"_a,
+      "down_type"_a,
+      "down_shexp_type"_a,
+      "dtypes"_a,
+      nb::kw_only(),
+      "k_glu"_a,
+      "k_down"_a,
+      R"(
+        Build the compute pipelines the store ops of one block reach, ahead
+        of their first call: moe_store_glu and moe_store_down for the codec
+        and shared expert codec pairs, and moe_store_seg where it has a
+        kernel, for each x dtype in dtypes. Evaluates nothing and releases
+        the GIL, so it can run on a thread beside a load.
+
+        Returns:
+            int: the pipelines fetched (built now or already built).
+      )");
+  m.def(
+      "moe_store_seg_supported",
+      &mlx_kquant::moe_store_seg_supported,
+      "kquant_type"_a,
+      "in_features"_a,
+      R"(
+        True when moe_store_seg has a kernel for the codec at in_features
+        inputs a row on this device.
+      )");
+  m.def(
+      "moe_store_seg",
+      [](mx::array x,
+         std::vector<mx::array> planes,
+         const std::string& kquant_type,
+         mx::array map,
+         mx::array counts,
+         int n_out,
+         int tile_rows,
+         std::optional<mx::array> x_rows) {
+        return mlx_kquant::moe_store_seg(
+            std::move(x),
+            std::move(planes),
+            kquant_type,
+            n_out,
+            std::move(map),
+            std::move(counts),
+            tile_rows,
+            std::move(x_rows));
+      },
+      "x"_a,
+      "planes"_a,
+      "kquant_type"_a,
+      "map"_a,
+      "counts"_a,
+      nb::kw_only(),
+      "n_out"_a,
+      "tile_rows"_a = 64,
+      "x_rows"_a = nb::none(),
+      R"(
+        The wide-row expert product on a store: gather_qmm_seg with the
+        weights read from store planes. Row i of the output is
+        W[slot of row i] . x[row i], rows sorted by slot. Same bits as
+        gather_qmm_seg's tensor-op kernel on the experts' GGUF blocks.
+
+        Args:
+            x (array): [rows, K] float16 or bfloat16, sorted by slot; with
+                x_rows, the unsorted rows.
+            planes (list[array]): from moe_store_pack.
+            kquant_type (str): the codec (moe_store_seg_supported).
+            map, counts (array): expert_tile_map's of the sorted slot ids.
+            n_out (int): N, the outputs of a weight row.
+            tile_rows (int): 64 or 128, as the map was built.
+            x_rows (array): [rows] integers, row i reads x[x_rows[i]].
+
+        Returns:
+            array: [rows, N] in the x dtype.
+      )");
+  m.def(
+      "moe_store_seg_pair",
+      [](mx::array x,
+         std::vector<mx::array> gate_planes,
+         std::vector<mx::array> up_planes,
+         const std::string& kquant_type,
+         mx::array map,
+         mx::array counts,
+         int n_out,
+         int tile_rows,
+         std::optional<mx::array> x_rows,
+         bool fused) {
+        return mlx_kquant::moe_store_seg_pair(
+            std::move(x),
+            std::move(gate_planes),
+            std::move(up_planes),
+            kquant_type,
+            n_out,
+            std::move(map),
+            std::move(counts),
+            tile_rows,
+            std::move(x_rows),
+            fused);
+      },
+      "x"_a,
+      "gate_planes"_a,
+      "up_planes"_a,
+      "kquant_type"_a,
+      "map"_a,
+      "counts"_a,
+      nb::kw_only(),
+      "n_out"_a,
+      "tile_rows"_a = 64,
+      "x_rows"_a = nb::none(),
+      "fused"_a = false,
+      R"(
+        The gate and up products of one wide expert pass in one kernel:
+        moe_store_seg on the gate planes and on the up planes, each with the
+        bits of its own call, or with fused=True silu(gate) * up as MLX's
+        SwiGLU rounds it.
+
+        Returns:
+            list[array]: [gate, up], or [h] with fused=True, each [rows, N].
+      )");
+  m.def(
+      "moe_store_down",
+      [](mx::array x,
+         mx::array w,
+         mx::array shexp_w,
+         const std::string& kquant_type,
+         mx::array indices,
+         mx::array scores,
+         mx::array slots,
+         std::vector<mx::array> planes,
+         const std::string& shexp_kquant_type) {
+        return mlx_kquant::moe_store_down(
+            std::move(x),
+            std::move(w),
+            std::move(shexp_w),
+            kquant_type,
+            std::move(indices),
+            std::move(scores),
+            std::move(slots),
+            std::move(planes),
+            shexp_kquant_type);
+      },
+      "x"_a,
+      "w"_a,
+      "shexp_w"_a,
+      "kquant_type"_a,
+      "indices"_a,
+      "scores"_a,
+      "slots"_a,
+      "planes"_a,
+      nb::kw_only(),
+      "shexp_kquant_type"_a = "",
+      R"(
+        The score-mixed down of gather_qmv_mix_kq's tiled form, reading
+        routed experts from a store. Same bits as that kernel at the same
+        width.
+
+        Args:
+            x (array): [T, S, K] float16 or bfloat16.
+            w (array): [E, N, row bytes] uint8.
+            shexp_w (array): the shared down, as gather_qmv_mix_kq takes it.
+            kquant_type (str): the routed codec.
+            indices (array): [T, S - k] expert ids.
+            scores (array): [T, S] or [T, S - k] mix weights.
+            slots (array): [E] uint32.
+            planes (list[array]): from moe_store_pack.
+            shexp_kquant_type (str): the shared codec when it differs.
+
+        Returns:
+            array: [T, N] in the x dtype.
+      )");
   m.def(
       "gather_mix",
       &mlx_kquant::gather_mix,
@@ -1851,11 +2229,18 @@ NB_MODULE(_ext, m) {
       "ratio"_a,
       nb::kw_only(),
       "cand"_a = nb::none(),
+      "keys_tail"_a = nb::none(),
       "stream"_a = nb::none(),
+      "params"_a = nb::none(),
+      "q_offset_slot"_a = 0,
       R"(
+        With ``params`` (an evaluated int32 parameter block, see
+        fuse_graph) q_offset is read from ``params[q_offset_slot]`` when the
+        kernel is encoded.
+
         Decode-width lightning-indexer scores, fused:
         out[b, 0, j, p] = sum_h relu(q[b, h, j] . k[b, p]) * w[b, j, h]
-        for qL <= 4 query rows without materializing the [H, P] per-head
+        for qL <= 8 query rows without materializing the [H, P] per-head
         scores. Selection-equivalent to the inline path when any positive
         global scale is folded out. Pooled visibility follows
         PoolingCache.make_mask(qL, q_offset): row p is visible to query j
@@ -1867,7 +2252,7 @@ NB_MODULE(_ext, m) {
 
         Args:
             queries (array): [B, H, qL, 128], H in {4, 16, 32, 64}, qL in
-                [1, 4], float16/bfloat16.
+                [1, 8], float16/bfloat16.
             keys (array): the pooled indexer key cache [B, P, 128].
             weights (array): per-head query weights [B, qL, H]. float32
                 weights are read as-is (sign-free head gates stay exact);
@@ -1877,9 +2262,13 @@ NB_MODULE(_ext, m) {
             ratio (int): pooled compression ratio.
             cand (array, optional): int32/uint32 [B, qL, NC] key rows to
                 score per query (a two-level top-k's candidate list).
+            keys_tail (array, optional): [B, PT, 128] key rows that
+                continue ``keys``: row P + i is row i of the tail, so a pool
+                held as a base and a tail is scored in one call over
+                P + PT rows.
 
         Returns:
-            array: scores [B, 1, qL, P] ([B, 1, qL, NC] with ``cand``)
+            array: scores [B, 1, qL, P + PT] ([B, 1, qL, NC] with ``cand``)
             shaped for dsa_topk_indices.
       )");
 
@@ -3121,6 +3510,61 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "hc_lowrank_mix",
+      &mlx_kquant::hc_lowrank_mix,
+      "h"_a,
+      "gamma"_a,
+      "w_down"_a,
+      "w_inject"_a,
+      "w_up"_a,
+      "eps"_a,
+      nb::kw_only(),
+      "down_type"_a = "",
+      "inject_type"_a = "",
+      "up_type"_a = "",
+      "stream"_a = nb::none(),
+      R"(
+        The low-rank hyper-connection mixer (qwen4exp) as one op:
+        hc_lowrank_norm, hc_lowrank_front and hc_lowrank_epilogue, with a
+        row's bits those of the three ops at any row count. On float32
+        streams with q8_0 down and up wire and a float32 inject, where the
+        epilogue runs its simdgroup kernel (KQ_HC_EPI_LPR, by default on
+        GPUs with the tensor-op units), the norm folds into the front:
+        two dispatches, whose bits differ from the three ops' at rounding
+        level and at one row from those at more rows. KQ_HC_MIX_FN=0
+        keeps the three ops. Each weight may also be wire of any kquant
+        type of hc_lowrank_mix_codecs() or a float32, float16 or bfloat16
+        array.
+
+        Args:
+            h (array): [..., 4, D] residual streams, float32 or the gamma
+                dtype. D % 64 == 0, D <= 8192.
+            gamma (array): [4 * D] norm gain, float16/bfloat16.
+            w_down (array): [LR, 4 * D] weight. LR % 32 == 0, LR <= 512.
+            w_inject (array): [4, 4 * D] weight.
+            w_up (array): [4 * D, LR] weight; its blocks must divide LR.
+            eps (float): rms epsilon.
+            down_type (str): kquant type of uint8 w_down wire; "" reads
+                q8_0. Ignored for a float weight.
+            inject_type (str): the same for w_inject.
+            up_type (str): the same for w_up.
+
+        Returns:
+            tuple: (mixed [..., D] in the h dtype, inj [..., 4] in the
+            dtype of h @ w_inject.T: the h dtype for wire).
+      )");
+
+  m.def(
+      "hc_lowrank_mix_codecs",
+      &mlx_kquant::hc_lowrank_mix_codecs,
+      R"(
+        The weight codecs hc_lowrank_mix reads.
+
+        Returns:
+            list[str]: kquant types and f32, f16, bf16.
+      )");
+
+  m.def(
       "get_cb_caps",
       &mlx_kquant::get_cb_caps,
       R"(
@@ -3130,6 +3574,281 @@ NB_MODULE(_ext, m) {
             tuple: (max_ops_per_buffer, max_mb_per_buffer).
       )");
 
+  // Recorded graphs are held in a table and named by index, so the Python
+  // side needs no new type.
+  m.def(
+      "fuse_graph",
+      [](const std::vector<mx::array>& inputs,
+         const std::vector<mx::array>& outputs,
+         bool serial,
+         bool direct,
+         int level,
+         int params,
+         const std::vector<std::tuple<int, int, int>>& param_ranges) {
+        auto& tab = kq_fused_table();
+        std::vector<mlx_kquant::FusedParamRange> ranges;
+        for (auto& [slot, lo, hi] : param_ranges) {
+          ranges.push_back({slot, lo, hi});
+        }
+        tab.push_back(mlx_kquant::fuse_graph(
+            inputs, outputs, serial, direct, level, params, ranges));
+        return int(tab.size()) - 1;
+      },
+      "inputs"_a,
+      "outputs"_a,
+      "serial"_a = false,
+      "direct"_a = false,
+      "level"_a = 0,
+      "params"_a = -1,
+      "param_ranges"_a = std::vector<std::tuple<int, int, int>>{},
+      R"(
+        params=i: input i is the record's parameter block, an evaluated
+        int32 vector whose slots hold the values that change between
+        replays (an offset, a length). Kernel entry points that take
+        ``params`` and a slot read them from it, and a custom Metal kernel
+        takes the block as a buffer. param_ranges lists (slot, lo, hi): the
+        values a slot may take; any other slot keeps its recorded value.
+        fused_call raises ValueError for a block outside that. Those entry
+        points read the block on the host: one that reads it from an
+        input other than params raises ValueError here (a held block is
+        fine).
+
+        Record the lazy graph between inputs and outputs. Returns a handle
+        for fused_call. Evaluated arrays the graph reads (weights) are held
+        by the record, not copied.
+
+        direct=True: on a GPU stream, the first eval of the record writes
+        down the Metal calls its primitives make, and later evals replay
+        those calls without running the primitives. Bits are unchanged.
+        It needs env_cache(True) and a graph of the primitive types kq
+        lists as safe to replay; any other record keeps running its
+        primitives (see fused_direct_info). A graph built from Python
+        values (an offset, a length) holds them as recorded: make one
+        record per value.
+
+        level=True: the record runs its primitives by depth from the
+        inputs, independent ones next to each other, in place of the
+        order a walk from the outputs gives. Bits are unchanged.
+
+        level=2: the record runs its primitives in barrier groups: every
+        kernel that reads nothing written since the last memory barrier
+        first, then the next group. Bits are unchanged.
+      )");
+  m.def(
+      "fused_call",
+      [](int handle, const std::vector<mx::array>& inputs) {
+        auto& tab = kq_fused_table();
+        if (handle < 0 || handle >= int(tab.size()) || !tab[handle]) {
+          throw std::invalid_argument("[mlx_kquant.fused_call] bad handle.");
+        }
+        return mlx_kquant::fused_call(tab[handle], inputs);
+      },
+      "handle"_a,
+      "inputs"_a,
+      R"(
+        The outputs of a recorded graph for new inputs of the recorded
+        shapes and dtypes, as one primitive that runs the recorded
+        primitives in order. Bits equal the graph's.
+      )");
+  m.def(
+      "fused_info",
+      [](int handle) {
+        auto& tab = kq_fused_table();
+        if (handle < 0 || handle >= int(tab.size()) || !tab[handle]) {
+          throw std::invalid_argument("[mlx_kquant.fused_info] bad handle.");
+        }
+        return std::make_tuple(
+            mlx_kquant::fused_nodes(tab[handle]),
+            mlx_kquant::fused_constants(tab[handle]),
+            mlx_kquant::fused_used_inputs(tab[handle]));
+      },
+      "handle"_a,
+      "(primitive names in run order, count of held constants, per input "
+      "whether the graph reads it).");
+  m.def(
+      "fused_direct_info",
+      [](int handle) {
+        auto& tab = kq_fused_table();
+        if (handle < 0 || handle >= int(tab.size()) || !tab[handle]) {
+          throw std::invalid_argument(
+              "[mlx_kquant.fused_direct_info] bad handle.");
+        }
+        auto i = mlx_kquant::fused_direct_info(tab[handle]);
+        nb::dict d;
+        d["state"] = i.state;
+        d["reason"] = i.reason;
+        d["primitives"] = i.primitives;
+        d["replays"] = i.replays;
+        d["plain_runs"] = i.plain_runs;
+        d["calls_recorded"] = i.calls_recorded;
+        d["calls"] = i.calls;
+        d["dispatches"] = i.dispatches;
+        d["barriers"] = i.barriers;
+        d["barriers_recorded"] = i.barriers_recorded;
+        d["scratch_buffers"] = i.scratch_buffers;
+        d["scratch_bytes"] = i.scratch_bytes;
+        d["kept_bytes"] = i.kept_bytes;
+        d["program_bytes"] = i.program_bytes;
+        d["pool_bytes"] = i.pool_bytes;
+        return d;
+      },
+      "handle"_a,
+      R"(
+        What a direct record has learned, as a dict. state is "" (not
+        direct), "new", "replay", "refused" or "waiting" (lever cache off);
+        reason and primitives say why a record was refused.
+        calls_recorded and calls are the Metal calls per eval as the
+        primitives make them and as replayed, barriers_recorded and
+        barriers the memory barriers among them. scratch_bytes is what the
+        record needs of the buffer pool its thread shares between records,
+        pool_bytes the size of all pools of the process (those of bindings
+        too), kept_bytes what the record holds itself.
+      )");
+  m.def(
+      "fused_direct_calls",
+      [](int handle) {
+        auto& tab = kq_fused_table();
+        if (handle < 0 || handle >= int(tab.size()) || !tab[handle]) {
+          throw std::invalid_argument(
+              "[mlx_kquant.fused_direct_calls] bad handle.");
+        }
+        return mlx_kquant::fused_direct_calls(tab[handle]);
+      },
+      "handle"_a,
+      "The Metal calls a direct record replays, one string a call, with "
+      "buffers named by role; empty until the record replays. Records of "
+      "the same graph, shapes and levers give the same list.");
+  m.def(
+      "encoder_trace_begin",
+      &mlx_kquant::encoder_trace_begin,
+      "Debug: start writing down the Metal encoder calls of the default GPU "
+      "stream. Evaluate with mx.async_eval under command buffer caps that "
+      "keep one buffer, then call encoder_trace_end. Warm records only.");
+  m.def(
+      "encoder_trace_end",
+      &mlx_kquant::encoder_trace_end,
+      "Debug: stop the trace and return its calls, one string a call.");
+  m.def(
+      "fused_bind",
+      [](int handle, const std::vector<mx::array>& inputs) {
+        auto& tab = kq_fused_table();
+        if (handle < 0 || handle >= int(tab.size()) || !tab[handle]) {
+          throw std::invalid_argument("[mlx_kquant.fused_bind] bad handle.");
+        }
+        std::vector<mx::array> outputs;
+        auto b = mlx_kquant::fused_bind(tab[handle], inputs, outputs);
+        auto& bt = kq_binding_table();
+        bt.push_back(std::move(b));
+        return std::make_pair(int(bt.size()) - 1, outputs);
+      },
+      "handle"_a,
+      "inputs"_a,
+      R"(
+        Bind a direct record that has its program to evaluated inputs, for
+        replay from C++ with no eval (see kquant.h, bound replay). Returns
+        (binding, outputs): the outputs are evaluated arrays over buffers
+        allocated here, filled each time the binding is encoded and its
+        command buffer completes. The binding holds its own buffers between
+        kernels, so two stages in flight share none.
+      )");
+  m.def(
+      "fused_patch",
+      [](int binding, int slot, int value) {
+        auto& bt = kq_binding_table();
+        if (binding < 0 || binding >= int(bt.size()) || !bt[binding]) {
+          throw std::invalid_argument("[mlx_kquant.fused_patch] bad binding.");
+        }
+        return mlx_kquant::fused_patch(*bt[binding], slot, value);
+      },
+      "binding"_a,
+      "slot"_a,
+      "value"_a,
+      "Write one slot of a binding's parameter block. False, and nothing "
+      "written, when the value is outside the range the record covers.");
+  m.def(
+      "fused_commit_detached",
+      [](const std::vector<int>& bindings) {
+        auto& bt = kq_binding_table();
+        std::vector<std::shared_ptr<mlx_kquant::FusedBinding>> bs;
+        for (int b : bindings) {
+          if (b < 0 || b >= int(bt.size()) || !bt[b]) {
+            throw std::invalid_argument(
+                "[mlx_kquant.fused_commit_detached] bad binding.");
+          }
+          bs.push_back(bt[b]);
+        }
+        nb::gil_scoped_release release;
+        return mlx_kquant::fused_commit_detached(
+            bs, mx::default_stream(mx::Device::gpu));
+      },
+      "bindings"_a,
+      "Test helper: encode the bindings in order into one command buffer on "
+      "a new thread without the GIL, commit and wait. Call mx.synchronize() "
+      "first. Returns one bool a binding (False: a slot was out of range).");
+  m.def(
+      "fused_binding_info",
+      [](int binding) {
+        auto& bt = kq_binding_table();
+        if (binding < 0 || binding >= int(bt.size()) || !bt[binding]) {
+          throw std::invalid_argument(
+              "[mlx_kquant.fused_binding_info] bad binding.");
+        }
+        auto i = mlx_kquant::fused_binding_info(*bt[binding]);
+        nb::dict d;
+        d["output_bytes"] = i.output_bytes;
+        d["param_bytes"] = i.param_bytes;
+        d["blob_bytes"] = i.blob_bytes;
+        d["scratch_bytes"] = i.scratch_bytes;
+        d["pool_bytes"] = i.pool_bytes;
+        return d;
+      },
+      "binding"_a,
+      "Bytes a binding holds.");
+  m.def(
+      "fused_unbind",
+      [](int binding) {
+        auto& bt = kq_binding_table();
+        if (binding >= 0 && binding < int(bt.size())) {
+          bt[binding].reset();
+        }
+      },
+      "binding"_a,
+      "Drop a binding and the buffers it holds.");
+  m.def(
+      "fuse_release",
+      [](int handle) {
+        auto& tab = kq_fused_table();
+        if (handle >= 0 && handle < int(tab.size())) {
+          tab[handle].reset();
+        }
+      },
+      "handle"_a,
+      "Drop a recorded graph and the arrays it holds.");
+  m.def(
+      "env_cache",
+      [](bool on) { return mlx_kquant::kq_env_cache(on); },
+      "on"_a,
+      "Turn the cache of KQ_* environment reads on or off and drop what it "
+      "holds; returns the previous setting. Off by default: every lever is "
+      "read from the environment on every call. After env_cache(True) a "
+      "lever is read once per thread; call env_cache(True) again after "
+      "changing a lever to have it read again.");
+
+  m.def(
+      "cb_commit_mark",
+      [](const mx::array& x) { return mlx_kquant::cb_commit_mark(x); },
+      "x"_a,
+      R"(
+        x unchanged, as a node that is a command buffer boundary: when it
+        is evaluated on the GPU, mlx ends and commits the buffer encoded
+        so far (nothing happens on an empty buffer or on the CPU). With
+        the caps of set_cb_caps set high for an eval, the marks in its
+        graph are its only boundaries.
+      )");
+  m.def(
+      "cb_commit_marks",
+      []() { return mlx_kquant::cb_commit_marks(); },
+      "Boundaries cb_commit_mark has made in this process.");
   m.def(
       "set_cb_caps",
       &mlx_kquant::set_cb_caps,
@@ -3179,8 +3898,13 @@ NB_MODULE(_ext, m) {
       "offset"_a,
       nb::kw_only(),
       "stream"_a = nb::none(),
+      "params"_a = nb::none(),
+      "offset_slot"_a = 0,
       R"(
-        Append rows to a KV cache buffer without copying the buffer.
+        Append rows to a KV cache buffer without copying the buffer. With
+        ``params`` (an evaluated int32 parameter block, see fuse_graph) the
+        offset is read from ``params[offset_slot]`` when the kernel is
+        encoded.
 
         Writes x into rows [offset, offset + x.shape[2]) of axis 2 of buf
         and returns an array that shares buf's data. Every array that
@@ -3231,6 +3955,20 @@ NB_MODULE(_ext, m) {
 
         Returns:
             array: uint8 [*ids.shape, row_bytes].
+      )");
+
+  m.def(
+      "file_rows_cache_stats",
+      []() {
+        auto s = mlx_kquant::file_rows_cache_stats();
+        return std::make_tuple(s.hits, s.misses, s.bytes);
+      },
+      R"(
+        The row cache of file_rows (KQ_FILE_ROWS_CACHE=N slots a table).
+
+        Returns:
+            tuple: rows served from the cache, rows read from the file
+            while it was on, bytes the cache holds.
       )");
 
   m.def(

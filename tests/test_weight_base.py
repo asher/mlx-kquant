@@ -36,7 +36,7 @@ BASE_ALIGN = {
     "mxfp8": 1,
 }
 # verify_nax's own start check, stricter than BASE_ALIGN for these codecs.
-VNAX_BASE = {"pq2_0": 4, "q2_0": 4, "q4_0": 4, "q8_0": 4}
+VNAX_BASE = {"pq2_0": 4, "q2_0": 4, "q4_0": 4, "q8_0": 4, "iq4_nl": 4}
 N, K = 256, 512
 E, R = 4, 2
 
@@ -136,7 +136,8 @@ def test_gpu_weight_base(codec):
         mx.eval(ref)
         for off in good:
             y = kq.quantized_matmul(x, _shift(w, off), s, codec, transpose=True)
-            # verify_nax runs from M 3 through M 8.
+            # verify_nax, and the dense row kernel in its decode form, run
+            # from M 3 through M 8 where the weight start fits.
             routed = 3 <= m <= 8 and off % VNAX_BASE.get(codec, 1)
             same = _close if routed else _equal
             assert same(y, ref), (m, off)

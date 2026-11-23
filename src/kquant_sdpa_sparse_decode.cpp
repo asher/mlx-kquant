@@ -148,7 +148,7 @@ void KQSdpaSparseDecode::eval_gpu(
   // KQ_SDPA_SPARSE_HG=8|16|32|64 forces one (A/B lever).
   int hg = L > 1 ? 2 * kHeadGroup : kHeadGroup;
   {
-    static const char* env = std::getenv("KQ_SDPA_SPARSE_HG");
+    static const char* env = kq_getenv("KQ_SDPA_SPARSE_HG");
     const int v = env ? std::atoi(env) : 0;
     if (v == 8 || v == 16 || v == 32 || v == 64) {
       hg = v;
@@ -164,7 +164,7 @@ void KQSdpaSparseDecode::eval_gpu(
   const int key_block = use_nax ? kNaxKeyBlock : kKeyBlock;
   int n_splits = splits_;
   if (n_splits <= 0) {
-    static const char* env = std::getenv("KQ_SDPA_SPARSE_SPLITS");
+    static const char* env = kq_getenv("KQ_SDPA_SPARSE_SPLITS");
     n_splits = env ? std::atoi(env) : 0;
   }
   if (n_splits <= 0) {
@@ -536,7 +536,7 @@ constexpr PrefillCfg kPrefillCfgs[] = {
 
 PrefillCfg prefill_cfg(int D) {
   PrefillCfg cfg = kPrefillCfgs[0];
-  const char* env = std::getenv("KQ_SDPA_SPARSE_PREFILL_CFG");
+  const char* env = kq_getenv("KQ_SDPA_SPARSE_PREFILL_CFG");
   if (env == nullptr || D != 512) {
     return cfg;
   }

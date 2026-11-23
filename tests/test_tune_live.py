@@ -26,6 +26,8 @@ N = 128
 # band needs N >= 16384, which KQ_NAX_DB64=1 drops. KQ_QMM_MIDM=0 keeps
 # M 48 on the qmm tile and KQ_QMM_ROUTE=nax sends M 16 to it; both are
 # read per call.
+# The probes use N 64 and 128, whose BM=128 grids fall under the grid floor;
+# the tests of BM=128 picks set KQ_NAX_BM128_MIN_TPC=0.
 LEVER_CALLS = [
     # 0: the process starts with KQ_NAX_BM128=0.
     {"codec": "q6_k", "shape": [256, K], "n": N},
@@ -85,7 +87,12 @@ def test_levers_live_under_tune_live():
     _gpu_nax()
     res = run_probe(
         LEVER_CALLS,
-        env={"KQ_QMM_LOG": "1", "KQ_NAX_BM128": "0", "KQ_TUNE_LIVE": "1"},
+        env={
+            "KQ_QMM_LOG": "1",
+            "KQ_NAX_BM128": "0",
+            "KQ_TUNE_LIVE": "1",
+            "KQ_NAX_BM128_MIN_TPC": "0",
+        },
     )
     name, grid = _only_kernel(res[0])
     assert tile_of(name)[0] == 64 and grid == (2, 4, 1)
@@ -146,7 +153,7 @@ def test_default_tile_at_dit_rows(codec, parity):
         expect.append((rows, bm if parity else 128))
         calls.append({"codec": codec, "shape": [2, rows, K], "n": 64})
         expect.append((2 * rows, DIT_TILES_B2[rows] if parity else 128))
-    env = {"KQ_QMM_LOG": "1"}
+    env = {"KQ_QMM_LOG": "1", "KQ_NAX_BM128_MIN_TPC": "0"}
     if parity:
         env["KQ_NAX_BM128_ODD_M"] = "0"
     res = run_probe(calls, env=env, check=False)
@@ -216,7 +223,10 @@ Q2_0_CALLS = [
 
 
 def test_q2_0_levers_live():
-    res = run_probe(Q2_0_CALLS, env={"KQ_QMM_LOG": "1", "KQ_TUNE_LIVE": "1"})
+    res = run_probe(
+        Q2_0_CALLS,
+        env={"KQ_QMM_LOG": "1", "KQ_TUNE_LIVE": "1", "KQ_NAX_BM128_MIN_TPC": "0"},
+    )
     for c, r in zip(Q2_0_CALLS, res, strict=True):
         assert r["error"] is None, (c, r["error"])
         assert r["rel"] < R1["bfloat16"], (c, r["rel"])

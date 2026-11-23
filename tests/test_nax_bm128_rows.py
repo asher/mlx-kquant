@@ -7,7 +7,8 @@ skips the dead simdgroup row there. 32768 rows and a batch of two at 16896
 rows (33792) run past the int16 row span. Each case checks the result
 against float64 with exact kq.dequantize weights, on the CPU stream too,
 and on NAX GPUs checks the dispatched tile and that BM=128 agrees with the
-BM=64 tile within 1 ulp.
+BM=64 tile within 1 ulp. The grid floor keeps a BM=128 grid of under 3
+threadgroups a core on BM=64.
 """
 
 from __future__ import annotations
@@ -19,7 +20,9 @@ import mlx_kquant as kq
 
 R1 = {"bfloat16": 6e-3, "float16": 1e-3}
 K = 256
-LIVE = {"KQ_TUNE_LIVE": "1", "KQ_QMM_LOG": "1"}
+# The probes here use narrow N, whose BM=128 grids fall under the grid
+# floor; KQ_NAX_BM128_MIN_TPC=0 keeps the row rules they test in reach.
+LIVE = {"KQ_TUNE_LIVE": "1", "KQ_QMM_LOG": "1", "KQ_NAX_BM128_MIN_TPC": "0"}
 BM64 = "64,64,2,2"
 MAIN_CODECS = ["q4_k", "q5_k", "q6_k", "q8_0"]
 # (shape, rows after the batch flattens); every ceil(rows/64) here is odd
@@ -209,3 +212,26 @@ def test_bm128_rows_known_answer(codec):
         assert grid[1] == -(-c["rows"] // want), (c, grid)
         if r["ulp"] is not None:
             assert r["ulp"] <= 1, (c, r["ulp"])
+
+
+def test_grid_floor_keeps_small_grids_on_bm64():
+    """871 rows (an even ceil(M/64), in the q8_0 BM=128 band): N 320 gives
+    a BM=128 grid of 35 threadgroups and runs BM=64; N 12288 gives 1344 and
+    runs BM=128; KQ_NAX_BM128_MIN_TPC=0 drops the floor."""
+    if not _nax_gpu():
+        pytest.skip("NAX tile policy")
+    env = {"KQ_TUNE_LIVE": "1", "KQ_QMM_LOG": "1"}
+    calls = [
+        {"codec": "q8_0", "shape": [1, 871, K], "n": 320},
+        {"codec": "q8_0", "shape": [1, 871, K], "n": 12288},
+        {
+            "codec": "q8_0",
+            "shape": [1, 871, K],
+            "n": 320,
+            "env": {"KQ_NAX_BM128_MIN_TPC": "0"},
+        },
+    ]
+    res = run_probe(calls, env=env)
+    assert [tile_of(_kernel(r)[0])[0] for r in res] == [64, 128, 128]
+    for c, r in zip(calls, res, strict=True):
+        assert r["rel"] < R1["bfloat16"], (c, r["rel"])

@@ -188,11 +188,15 @@ def _rows(codec, sx, dtype, env):
 @pytest.mark.parametrize("codec", QF_CODECS)
 def test_qf_rows_match_at_every_width(codec, dtype):
     """A row's bits do not depend on the call width (1, 2, 5 and 12 rows:
-    the pair GLU at 2 and 5 on its codecs, with experts shared across rows),
-    and the loop and slot-parallel score-mixed downs give the same bits."""
+    the pair GLU at 2 on its codecs and the grouped kernels at 5 and 12,
+    with experts shared across rows), and the loop, slot-parallel and
+    grouped score-mixed downs give the same bits. KQ_MOE_TILE=0 keeps
+    the tiled down off: from 8 rows it is the default, and its bits depend
+    on the call width (test_moe_tile.py)."""
     sx = "q5_k" if codec in ("q2_k", "q3_k", "q4_k", "iq4_xs", "q2_0") else "q8_0"
-    sp, names_sp = _rows(codec, sx, dtype, {})
-    loop, names_loop = _rows(codec, sx, dtype, {"KQ_MOE_MIX_FORM": "loop"})
+    grp = {"KQ_MOE_GROUP": "1"}
+    sp, names_sp = _rows(codec, sx, dtype, {"KQ_MOE_TILE": "0", **grp})
+    loop, names_loop = _rows(codec, sx, dtype, {"KQ_MOE_MIX_FORM": "loop", **grp})
     for k in sp:
         assert np.array_equal(sp[k], loop[k]), (codec, k)
     t = "bfloat16_t" if dtype == "bfloat16" else "float16_t"
@@ -203,6 +207,15 @@ def test_qf_rows_match_at_every_width(codec, dtype):
     assert f"{qf}sx_{sx}_gather_qmv_mix_{t}" in names_loop, sorted(names_loop)
     mine = {n for n in names_sp | names_loop if n.startswith(f"kq_{codec}_")}
     assert all("_qf_" in n for n in mine), sorted(mine)
+    # the 5 and 12 row calls run the grouped kernels
+    for names in (names_sp, names_loop):
+        assert f"{qf}sx_{codec}_moe_glu_gather_shexp_grp_silu_{t}" in names, sorted(
+            names
+        )
+        assert f"{qf}sx_{sx}_moe_glu_gather_shexp_grp_silu_{t}" in names, sorted(names)
+    assert f"{qf}sx_{codec}_gather_qmv_mix_grp_{t}" in names_sp, sorted(names_sp)
+    assert f"{qf}sx_{sx}_gather_qmv_mix_grp_{t}" in names_sp, sorted(names_sp)
+    assert not [n for n in names_loop if "_mix_grp" in n], sorted(names_loop)
 
 
 _STAND_SNIPPET = r"""
@@ -328,24 +341,35 @@ print("RESULT 0")
 """
 
 
+_PLAIN = "moe_glu_gather_silu"
+_PAIR = "moe_glu_gather_dd_silu"
+_GROUPED = "sx_q5_0_moe_glu_gather_shexp_grp_silu"
+
+
 @pytest.mark.parametrize(
     "T, env, want",
     [
-        (1, {}, False),
-        (2, {}, True),
-        (8, {}, True),
-        (9, {}, False),
-        (4, {"KQ_MOE_DEDUP": "0"}, False),
+        (1, {}, _PLAIN),
+        (2, {}, _PAIR),
+        (4, {}, _PAIR),
+        (5, {"KQ_MOE_GROUP": "1"}, _GROUPED),
+        (16, {"KQ_MOE_GROUP": "1"}, _GROUPED),
+        (17, {}, _PLAIN),
+        (8, {"KQ_MOE_GROUP": "0"}, _PAIR),
+        (9, {"KQ_MOE_GROUP": "0"}, _PLAIN),
+        (4, {"KQ_MOE_DEDUP": "0"}, _PLAIN),
     ],
-    ids=["t1", "t2", "t8", "t9", "dedup_off"],
+    ids=["t1", "t2", "t4", "t5", "t16", "t17", "group_off", "t9", "dedup_off"],
 )
 def test_qf_pair_widths(T, env, want):
-    """The pair GLU serves 2 to 8 rows, and KQ_MOE_DEDUP=0 turns it off.
-    Codecs without it keep the plain qf GLU at every width."""
+    """The pair GLU serves 2 to 4 rows and the grouped GLU 5 to 16 (by
+    default on GPUs with the tensor-op units; KQ_MOE_GROUP=1 here).
+    KQ_MOE_GROUP=0 gives 5 to 8 rows back to the pair GLU and KQ_MOE_DEDUP=0
+    turns that off. Codecs with neither keep the plain qf GLU at every
+    width."""
     _, names = _child(_WIDTH_SNIPPET, [str(T)], env)
-    glu = {n for n in names if n.startswith("kq_q5_0_qf_moe_glu_gather_")}
-    pick = "dd_silu" if want else "silu"
-    assert glu == {f"kq_q5_0_qf_moe_glu_gather_{pick}_float16_t"}, (T, env, glu)
+    glu = {n for n in names if n.startswith("kq_q5_0_qf_")}
+    assert glu == {f"kq_q5_0_qf_{want}_float16_t"}, (T, env, glu)
 
 
 @pytest.mark.parametrize("k", [1536, 1280])

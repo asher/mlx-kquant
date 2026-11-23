@@ -6,6 +6,70 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `fuse_graph` records a lazy graph once and `fused_call` runs it as one primitive on new inputs of
+  the same shapes, with the same bits and less host time per call. `direct=True` replays the recorded
+  Metal calls from the second eval on; it needs `env_cache(True)`.
+- `fuse_graph(level=True)` runs a record's primitives by depth from its inputs, independent ones
+  next to each other, with the same bits.
+- `fuse_graph(level=2)` orders a record in barrier groups; `encoder_trace_begin` and
+  `encoder_trace_end` list the Metal encoder calls of an eval (debug).
+- `fuse_graph(params=i, param_ranges=[...])` lets one record serve changing offsets and lengths:
+  `kv_append`, `dsa_indexer_score_decode` and `sdpa_paged_rows` take `params` and a slot.
+- `fused_bind`, `fused_patch` and `fused_encode` (C++) replay a record into a caller's own command
+  buffer with no eval and no Python; `fused_commit_detached` does it from Python for tests.
+- `env_cache(True)` reads each `KQ_*` lever once per thread instead of on every call. Off by default.
+- `sdpa_paged_rows` attends a block of queries, each over its own page list, in one dispatch, with K
+  and V read in place from a cache base and a tail segment. A block-sparse verify block no longer
+  copies its selected keys per query. `tail_page=True` adds each query's partial last page, so the
+  page lists need no extra column. Past 2 queries, windows of up to 4 queries stage each key tile once
+  for every query that selected it; `window` picks the form. On M5 and later GPUs the windows run on
+  the tensor-op units, from 2 queries up, and run faster.
+- `dsa_indexer_score_decode` scores up to 8 queries in one call and takes `keys_tail`, a second key
+  segment scored after `keys`, so a verify block over cached and new pooled keys is one dispatch.
+- Expert stores on M5 and later GPUs: `moe_store_pack` copies a MoE layer's routed experts into
+  planes, and `moe_store_glu`, `moe_store_down` and `moe_store_seg` run decode, verify and prefill
+  rows from them; `moe_store_supported` and `moe_store_seg_supported` say where they run.
+- `moe_store_seg_pair` runs the gate and up products of an iq3_xxs, iq4_xs or iq2_s expert store in
+  one kernel; `fused=True` returns `silu(gate) * up` with the bits of MLX's own ops.
+- `moe_store_warm` builds the pipelines of a block's store ops before their first call, and
+  `kernel_keys` lists the pipelines built in the process.
+- `KQ_SEG_COL_ROWS=1` to `4` runs wide expert-store tiles of at most that many rows on a per-column
+  path (q5_0, iq4_nl, iq3_xxs, iq4_xs). Off by default; low bits change.
+- `hc_lowrank_mix` runs a low-rank hyper-connection mix (norm, front and epilogue) as one op, with
+  the norm folded into the front on float32 streams; `hc_lowrank_mix_codecs` lists its weight codecs.
+- `cb_commit_mark` ends the GPU command buffer at a chosen node of a graph, and `cb_commit_marks`
+  counts the boundaries it made.
+- `file_rows` keeps a row cache when `KQ_FILE_ROWS_CACHE` is set; `file_rows_cache_stats` reports
+  its hits, misses and bytes.
+
+### Changed
+- On M5 and later GPUs the fused MoE gathers at 5 to 16 rows read each expert once for up to eight
+  rows: a 512-expert verify forward at 8 to 16 rows takes about 10% less time (M5 Max). Low bits
+  change on most codecs; `KQ_MOE_GROUP=0` turns it off and `1` turns it on for other GPUs.
+- From 8 rows, `gather_qmv_mix_kq` and `gather_qmv_mix_ns_kq` sort their pairs by expert into tiles
+  on GPUs with the tensor-op units: 3 to 12% faster at 8 rows and 23% at 16 than the grouped down
+  (512 experts of 2560 by 640, M5 Max); low bits change with the call's width. `KQ_MOE_TILE=0`
+  turns it off.
+- `skinny_matmul` (a MoE router's logits) at 1 to 16 rows, K a multiple of 8, runs on a
+  simdgroup-matrix kernel on M5 and later GPUs: 1.4x to 2.4x faster at 4 to 16 rows (M5 Max).
+  Outputs differ at rounding level. `KQ_SKINNY_MMA=0` restores the previous kernel.
+- `hc_lowrank_epilogue` runs 1.4x to 1.85x faster on M5 and later GPUs (2560 wide, rank 320, M5
+  Max). Outputs differ at rounding level. `KQ_HC_EPI_LPR=0` restores the previous kernel.
+- `sdpa_prefill_block_sparse` splits long page lists across the GPU on M5 and later GPUs: up to 1.5x
+  faster on chunks of about 200 rows. Outputs differ at rounding level. `KQ_SDPA_BS_SPLITS=1` keeps
+  one pass.
+- `quantized_matmul` at 2 to 16 activation rows on M5 and later GPUs runs faster on most codecs
+  (`q6_k` 0.84x the time at 8 rows, 0.57x at 16). Outputs differ at rounding level.
+  `KQ_DENSE_ROWS=0` restores the previous kernels.
+- `q6_k` `quantized_matmul_multi` at prefill rows on M5 and later GPUs runs its two to four weights
+  in one grid, with the same outputs. `KQ_QMM_MULTI_ROWS=0` keeps a dispatch per weight.
+- On M5 and later GPUs, `quantized_matmul` takes 128-row tiles only when their grid fills at least
+  3 threadgroups a core: narrow outputs at prefill rows run 10 to 35% faster, with the same outputs.
+  `KQ_NAX_BM128_MIN_TPC=0` restores the old choice.
+- `q6_k` `quantized_matmul` at prefill rows on M5 and later GPUs runs up to 5% faster, with the same
+  outputs.
+
 ## [0.5.13]
 
 ### Added

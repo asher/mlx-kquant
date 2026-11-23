@@ -113,9 +113,8 @@ inline bool codec_has_matmul(const std::string& kquant_type) {
 // codec table); codecs without a NAX kernel route to the ALU kernels.
 inline bool codec_has_nax(const std::string& kquant_type) {
   // KQ_DISABLE_NAX=1 forces the ALU qmm/gather path (A/B harness lever). Read
-  // live (not cached) so a single process can toggle NAX between calls; only
-  // reached on the NAX-eligible prefill path, so the getenv cost is negligible.
-  const char* e = std::getenv("KQ_DISABLE_NAX");
+  // through kq_getenv: live, unless the process turned the lever cache on.
+  const char* e = kq_getenv("KQ_DISABLE_NAX");
   if (e != nullptr && e[0] == '1') {
     return false;
   }
@@ -127,7 +126,7 @@ inline bool codec_has_nax(const std::string& kquant_type) {
 // K % 64 == 0. KQ_DISABLE_GATHER_SEG_NAX (read once) forces the ALU kernel.
 inline bool kq_seg_nax_ok(const std::string& kquant_type, int K) {
   static const bool disabled =
-      std::getenv("KQ_DISABLE_GATHER_SEG_NAX") != nullptr;
+      kq_getenv("KQ_DISABLE_GATHER_SEG_NAX") != nullptr;
   return !disabled && kq_is_nax_available() && K % 64 == 0 &&
       codec_has_nax(kquant_type);
 }
@@ -199,7 +198,7 @@ inline int kquant_qmv_fine_default_max_n(const std::string& kquant_type) {
 // yet measured on a smaller GPU).
 constexpr int kq_fine_reference_cores = 40;
 inline int kq_fine_cores_scaled(int n) {
-  if (n == 0 || std::getenv("KQ_GPU_CORES") == nullptr) {
+  if (n == 0 || kq_getenv("KQ_GPU_CORES") == nullptr) {
     return n;
   }
   const int cores = gpu_core_count();
@@ -550,6 +549,21 @@ struct KqPipelines {
   MTL::ComputePipelineState* ps[2] = {nullptr, nullptr};
 };
 
+// The keys of the pipelines kq_get_kernel has built in this process, in
+// build order (kernel_keys in the bindings; tests read it to see what a
+// call built). With a key it appends, with none it returns a copy.
+inline std::vector<std::string> kq_kernel_keys(
+    const std::string* add = nullptr) {
+  static std::mutex mu;
+  static std::vector<std::string> keys;
+  std::lock_guard<std::mutex> lock(mu);
+  if (add != nullptr) {
+    keys.push_back(*add);
+    return {};
+  }
+  return keys;
+}
+
 // Fetch a kq kernel from the bundled metallib, specialized via an MTLFCList.
 // hash_name must encode the func-const values so each specialization gets a
 // distinct pipeline-state cache entry (d.get_kernel(name, lib, hash, consts)).
@@ -561,11 +575,11 @@ struct KqPipelines {
 //
 // The first fetch of a key reads the function's constants and builds the
 // pipeline; both are cached here by key, under a lock, since engines on
-// separate threads fetch concurrently. A later fetch costs one locked map
-// lookup, which takes the place of the device's own lookup. The lever value
-// picks the pipeline on every fetch, so a live flip switches forms. The
-// pipelines live for the process: the device keeps them, and the
-// "mlx_kquant" library is never cleared.
+// separate threads fetch concurrently (the build itself runs unlocked). A later
+// fetch costs one locked map lookup, which takes the place of the device's own
+// lookup. The lever value picks the pipeline on every fetch, so a live flip
+// switches forms. The pipelines live for the process: the device keeps them,
+// and the "mlx_kquant" library is never cleared.
 inline MTL::ComputePipelineState* kq_get_kernel(
     Device& d,
     const std::string& kname,
@@ -589,43 +603,61 @@ inline MTL::ComputePipelineState* kq_get_kernel(
     }
   }
   if (ps == nullptr) {
-    std::unique_lock<std::shared_mutex> lock(mu);
-    auto it = cache.find(key);
-    if (it == cache.end()) {
-      const KqFunctionInfo info = kq_function_info(lib, kname);
-      if (!info.exists) {
-        if (setting != nullptr) {
-          throw kq_missing_kernel(setting, kname);
+    bool word = false;
+    bool out_scale = false;
+    {
+      std::unique_lock<std::shared_mutex> lock(mu);
+      auto it = cache.find(key);
+      if (it == cache.end()) {
+        const KqFunctionInfo info = kq_function_info(lib, kname);
+        if (!info.exists) {
+          if (setting != nullptr) {
+            throw kq_missing_kernel(setting, kname);
+          }
+          // The device raises its load error; nothing is cached.
+          return d.get_kernel(kname, lib, key, func_consts);
         }
-        // The device raises its load error; nothing is cached.
-        return d.get_kernel(kname, lib, key, func_consts);
+        it = cache
+                 .emplace(
+                     key,
+                     KqPipelines{info.word, info.out_scale, {nullptr, nullptr}})
+                 .first;
       }
-      it = cache
-               .emplace(
-                   key,
-                   KqPipelines{info.word, info.out_scale, {nullptr, nullptr}})
-               .first;
+      word = it->second.word;
+      out_scale = it->second.out_scale;
+      ps = it->second.ps[word ? on : 1];
     }
-    KqPipelines& p = it->second;
-    const int i = p.word ? on : 1;
-    if (p.ps[i] == nullptr) {
+    const int i = word ? on : 1;
+    if (ps == nullptr) {
+      // The build runs outside the lock, so a thread that builds pipelines
+      // ahead of use (moe_store_warm) does not hold up fetches of built
+      // ones. The device's own cache, keyed the same and locked, makes two
+      // threads building one key end on one pipeline.
       mx::metal::MTLFCList fc = func_consts;
-      if (p.out_scale && std::none_of(fc.begin(), fc.end(), [](const auto& c) {
+      if (out_scale && std::none_of(fc.begin(), fc.end(), [](const auto& c) {
             return std::get<2>(c) == kq_fc_out_scale;
           })) {
         static const int off = 0;
         fc.emplace_back(&off, MTL::DataType::DataTypeInt, kq_fc_out_scale);
       }
-      if (p.word) {
+      MTL::ComputePipelineState* built = nullptr;
+      if (word) {
         static const bool values[2] = {false, true};
         fc.emplace_back(
             &values[i], MTL::DataType::DataTypeBool, kq_fc_kquant_word);
-        p.ps[i] = d.get_kernel(kname, lib, i ? key : key + "_kw0", fc);
+        built = d.get_kernel(kname, lib, i ? key : key + "_kw0", fc);
       } else {
-        p.ps[i] = d.get_kernel(kname, lib, key, fc);
+        built = d.get_kernel(kname, lib, key, fc);
       }
+      std::unique_lock<std::shared_mutex> lock(mu);
+      KqPipelines& p = cache.find(key)->second;
+      if (p.ps[i] == nullptr) {
+        p.ps[i] = built;
+        const std::string k = (word && i == 0) ? key + "_kw0" : key;
+        kq_kernel_keys(&k);
+      }
+      ps = p.ps[i];
     }
-    ps = p.ps[i];
     byte = i == 0;
   }
   if (byte && kq_qmm_log_on()) {

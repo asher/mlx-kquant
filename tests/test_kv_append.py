@@ -255,3 +255,29 @@ def test_guards_raise(x_shape, x_dtype, offset, match):
     buf = mx.zeros((B, H, CAP, D), mx.float16)
     with pytest.raises(ValueError, match=match):
         kq.kv_append(buf, mx.zeros(x_shape, x_dtype), offset)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "gpu",
+            marks=pytest.mark.skipif(
+                bool(os.environ.get("KQUANT_FORCE_CPU")) or not mx.metal.is_available(),
+                reason="needs the Metal device",
+            ),
+        ),
+    ],
+)
+def test_an_offset_from_params_past_the_buffer_is_refused(device):
+    # The builder checks the offset argument; one read from the parameter
+    # block is checked where it is read, before any row is written.
+    with mx.stream(getattr(mx, device)):
+        buf = _rand((B, H, CAP, D), mx.float32)
+        x = _rand((B, H, 4, D), mx.float32)
+        p = mx.array([CAP - 2], mx.int32)
+        mx.eval(buf, x, p)
+        out = kq.kv_append(buf, x, 0, params=p, offset_slot=0)
+        with pytest.raises(ValueError, match="within buf"):
+            mx.eval(out)

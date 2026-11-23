@@ -139,8 +139,9 @@ METAL_FUNC void kq_pq2_0_decode_pairs(uint wv, thread half2* h) {
 // as half2 pairs. For float16 activations, two half MACs per instruction
 // against the activation pair (y_j, y_j+8) keep the decode near the
 // load-only rate.
-// kVM == 2 (kRows only) dots a second activation row kq_x1 against the same
-// weights, decoding each weight once; each row's sums are the one-row form's.
+// kVM of 2 to 4 (kRows only) dots the activation rows kq_x1 to kq_x3
+// against the same weights, decoding each weight once; each row's sums are
+// the one-row form's.
 template <
     typename T,
     int SB,
@@ -158,8 +159,11 @@ METAL_FUNC void kq_pq2_0_qmv_sb_impl(
     uint simd_gid,
     uint simd_lid,
     thread float* kq_rows = nullptr,
-    const device T* kq_x1 = nullptr) {
-  static_assert(kVM == 1 || (kVM == 2 && kRows), "two rows need kRows");
+    const device T* kq_x1 = nullptr,
+    const device T* kq_x2 = nullptr,
+    const device T* kq_x3 = nullptr) {
+  static_assert(
+      kVM == 1 || (kVM >= 2 && kVM <= 4 && kRows), "more rows need kRows");
   constexpr int num_simdgroups = 2;
   constexpr int lanes = SB / 16;
   constexpr int blocks_per_pass = 32 / lanes;
@@ -191,7 +195,11 @@ METAL_FUNC void kq_pq2_0_qmv_sb_impl(
     A2 y2[kVM][8];
 #pragma unroll
     for (int v = 0; v < kVM; v++) {
-      const device T* xb = (v == 0 ? x : kq_x1) + ib * SB + it * 16;
+      const device T* xb = (v == 0       ? x
+                                : v == 1 ? kq_x1
+                                : v == 2 ? kq_x2
+                                         : kq_x3) +
+          ib * SB + it * 16;
       const vec<T, 8> lo = *(const device vec<T, 8>*)(xb);
       const vec<T, 8> hi = *(const device vec<T, 8>*)(xb + 8);
 #pragma unroll
@@ -377,7 +385,9 @@ METAL_FUNC void kq_q2_0_qmv_impl(
     uint simd_gid,
     uint simd_lid,
     thread float* kq_rows = nullptr,
-    const device T* kq_x1 = nullptr) {
+    const device T* kq_x1 = nullptr,
+    const device T* kq_x2 = nullptr,
+    const device T* kq_x3 = nullptr) {
   static_assert(group_size == KQ_Q2_0_SUPERBLOCK, "Q2_0 requires gs=64");
   static_assert(bits == 2, "Q2_0 requires bits=2");
   kq_pq2_0_qmv_sb_impl<
@@ -396,7 +406,9 @@ METAL_FUNC void kq_q2_0_qmv_impl(
       simd_gid,
       simd_lid,
       kq_rows,
-      kq_x1);
+      kq_x1,
+      kq_x2,
+      kq_x3);
 }
 
 template <typename T, int group_size, int bits, int results_per_simdgroup = 2>

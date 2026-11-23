@@ -8,17 +8,24 @@
 // when the file offset and the destination are both page-aligned, so each
 // row is read as the whole pages it sits in, into an aligned buffer.
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
+
+#include <time.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #ifdef __APPLE__
@@ -40,7 +47,102 @@ namespace {
 
 std::atomic<uint64_t> g_failures{0};
 
+// KQ_FILE_ROWS_STAMPS=<file>: one line a read, "start end rows hits" with
+// the times in seconds on the mach clock (the clock of Python's
+// perf_counter) and the row cache hits of the process so far.
+// Read once; unset, nothing is written.
+FILE* stamp_file() {
+  static FILE* fh = []() -> FILE* {
+    const char* path = std::getenv("KQ_FILE_ROWS_STAMPS");
+    return (path != nullptr && path[0] != 0) ? std::fopen(path, "a") : nullptr;
+  }();
+  return fh;
+}
+
+double stamp_now() {
+#ifdef __APPLE__
+  return static_cast<double>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) * 1e-9;
+#else
+  return 0.0;
+#endif
+}
+
+// KQ_FILE_ROWS_CACHE=N: each table keeps the last row read in each of N
+// slots (slot = id mod N), so a row a decode loop reads again (the rows of
+// a common token) is a copy and not a read. The file is taken as fixed for
+// the life of the process. A slot's bytes are touched only once a row
+// lands in it, so the cache holds at most N rows a table and only the
+// rows it has seen. Read once; unset or 0, no cache.
+struct RowCache {
+  int64_t slots{0};
+  int64_t row_bytes{0};
+  std::mutex mtx;
+  std::vector<int64_t> ids;
+  uint8_t* data{nullptr};
+  ~RowCache() {
+    std::free(data);
+  }
+};
+
+std::atomic<uint64_t> g_cache_hits{0};
+std::atomic<uint64_t> g_cache_misses{0};
+std::atomic<uint64_t> g_cache_bytes{0};
+
+int64_t cache_slots() {
+  static const int64_t n = []() -> int64_t {
+    const char* v = std::getenv("KQ_FILE_ROWS_CACHE");
+    return (v != nullptr && v[0] != 0) ? std::max(0LL, std::atoll(v)) : 0;
+  }();
+  return n;
+}
+
+// KQ_FILE_ROWS_CACHE_BYTES=B bounds the cache by bytes instead: as many
+// slots as fit in B with their ids (8 bytes a slot). It wins over the slot
+// count when both are set.
+int64_t cache_bytes_bound() {
+  static const int64_t n = []() -> int64_t {
+    const char* v = std::getenv("KQ_FILE_ROWS_CACHE_BYTES");
+    return (v != nullptr && v[0] != 0) ? std::max(0LL, std::atoll(v)) : 0;
+  }();
+  return n;
+}
+
+std::shared_ptr<RowCache> row_cache(int fd, int64_t offset, int64_t row_bytes) {
+  const int64_t bound = cache_bytes_bound();
+  const int64_t n = bound > 0 ? bound / (row_bytes + 8) : cache_slots();
+  struct stat st;
+  if (n <= 0 || ::fstat(fd, &st) != 0) {
+    return nullptr;
+  }
+  static std::mutex mtx;
+  static auto* tables = new std::map<
+      std::tuple<uint64_t, uint64_t, int64_t, int64_t>,
+      std::shared_ptr<RowCache>>();
+  std::lock_guard<std::mutex> lock(mtx);
+  auto& c = (*tables)[std::make_tuple(
+      static_cast<uint64_t>(st.st_dev),
+      static_cast<uint64_t>(st.st_ino),
+      offset,
+      row_bytes)];
+  if (!c) {
+    c = std::make_shared<RowCache>();
+    c->slots = n;
+    c->row_bytes = row_bytes;
+    c->ids.assign(static_cast<size_t>(n), -1);
+    // Untouched pages are not resident: the bytes held are those of the
+    // slots a row has landed in.
+    c->data = static_cast<uint8_t*>(
+        std::malloc(static_cast<size_t>(n) * static_cast<size_t>(row_bytes)));
+    if (c->data == nullptr) {
+      c.reset();
+      return nullptr;
+    }
+  }
+  return c;
+}
+
 struct RowJob {
+  RowCache* cache;
   int fd;
   const int64_t* ids;
   uint8_t* out;
@@ -69,6 +171,18 @@ void read_rows(const RowJob& j, int64_t lo, int64_t hi) {
     uint8_t* dst = j.out + i * j.row_bytes;
     const int64_t id = j.ids[i];
     bool ok = bounce != nullptr && id >= 0 && id < j.rows;
+    uint8_t* slot = nullptr;
+    if (ok && j.cache != nullptr) {
+      RowCache& c = *j.cache;
+      const size_t k = static_cast<size_t>(id % c.slots);
+      slot = c.data + k * static_cast<size_t>(j.row_bytes);
+      std::lock_guard<std::mutex> lock(c.mtx);
+      if (c.ids[k] == id) {
+        std::memcpy(dst, slot, static_cast<size_t>(j.row_bytes));
+        g_cache_hits.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+    }
     if (ok) {
       const int64_t off = j.offset + id * j.row_bytes;
       const int64_t a = off & mask;
@@ -89,6 +203,18 @@ void read_rows(const RowJob& j, int64_t lo, int64_t hi) {
       }
       if (ok) {
         std::memcpy(dst, bounce + (off - a), static_cast<size_t>(j.row_bytes));
+        if (slot != nullptr) {
+          RowCache& c = *j.cache;
+          const size_t k = static_cast<size_t>(id % c.slots);
+          std::lock_guard<std::mutex> lock(c.mtx);
+          if (c.ids[k] < 0) {
+            g_cache_bytes.fetch_add(
+                static_cast<uint64_t>(j.row_bytes), std::memory_order_relaxed);
+          }
+          c.ids[k] = id;
+          std::memcpy(slot, dst, static_cast<size_t>(j.row_bytes));
+          g_cache_misses.fetch_add(1, std::memory_order_relaxed);
+        }
       }
     }
     if (!ok) {
@@ -147,6 +273,14 @@ uint64_t file_rows_failures() {
   return g_failures.load(std::memory_order_relaxed);
 }
 
+FileRowsCacheStats file_rows_cache_stats() {
+  FileRowsCacheStats s;
+  s.hits = g_cache_hits.load(std::memory_order_relaxed);
+  s.misses = g_cache_misses.load(std::memory_order_relaxed);
+  s.bytes = g_cache_bytes.load(std::memory_order_relaxed);
+  return s;
+}
+
 mx::array file_rows(
     mx::array ids,
     const std::string& path,
@@ -178,7 +312,15 @@ mx::array file_rows(
         std::strerror(errno));
   }
 #ifdef F_NOCACHE
-  ::fcntl(fd->fd, F_NOCACHE, 1);
+  // KQ_FILE_ROWS_BUFFERED=1 reads through the page cache instead: for a
+  // table the caller holds there (read once, file backed, not wired).
+  static const bool buffered = []() {
+    const char* v = std::getenv("KQ_FILE_ROWS_BUFFERED");
+    return v != nullptr && v[0] == '1';
+  }();
+  if (!buffered) {
+    ::fcntl(fd->fd, F_NOCACHE, 1);
+  }
 #endif
   const off_t size = ::lseek(fd->fd, 0, SEEK_END);
   fd->size = static_cast<int64_t>(size);
@@ -188,6 +330,7 @@ mx::array file_rows(
         std::to_string(rows) + " of " + std::to_string(row_bytes) +
         " bytes from offset " + std::to_string(offset) + ".");
   }
+  fd->cache = row_cache(fd->fd, offset, row_bytes);
   auto shape = ids.shape();
   shape.push_back(static_cast<int>(row_bytes));
   auto flat = mx::contiguous(mx::astype(ids, mx::int64, s), false, s);
@@ -214,6 +357,7 @@ void KQuantFileRows::eval_cpu(
                     row_bytes = row_bytes_,
                     rows = rows_]() mutable {
     RowJob j{
+        static_cast<RowCache*>(fd->cache.get()),
         fd->fd,
         ids.data<int64_t>(),
         out.data<uint8_t>(),
@@ -224,8 +368,21 @@ void KQuantFileRows::eval_cpu(
         fd->size,
         static_cast<int64_t>(::sysconf(_SC_PAGESIZE)),
         0};
+    FILE* stamps = stamp_file();
+    const double t0 = stamps != nullptr ? stamp_now() : 0.0;
     if (j.n > 0) {
       read_all(j);
+    }
+    if (stamps != nullptr) {
+      std::fprintf(
+          stamps,
+          "%.6f %.6f %lld %llu\n",
+          t0,
+          stamp_now(),
+          static_cast<long long>(j.n),
+          static_cast<unsigned long long>(
+              g_cache_hits.load(std::memory_order_relaxed)));
+      std::fflush(stamps);
     }
   });
 }

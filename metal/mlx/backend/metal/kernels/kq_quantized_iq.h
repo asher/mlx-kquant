@@ -1065,8 +1065,9 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
 
 // Lane `simd_lid` owns one 8-weight group (sub-block lid/4, half lid%4) of
 // every superblock; simd_sum reduces the 32 lanes. bn=4 -> 2 rows/simdgroup.
-// kVM == 2 (kRows only) dots a second activation row kq_x1 against the same
-// weights, decoding each weight once; each row's sums are the one-row form's.
+// kVM of 2 to 4 (kRows only) dots the activation rows kq_x1 to kq_x3
+// against the same weights, decoding each weight once; each row's sums are
+// the one-row form's.
 template <
     typename T,
     int group_size,
@@ -1084,10 +1085,13 @@ METAL_FUNC void kq_iq4_xs_qmv_impl(
     uint simd_gid,
     uint simd_lid,
     thread float* kq_rows = nullptr,
-    const device T* kq_x1 = nullptr) {
+    const device T* kq_x1 = nullptr,
+    const device T* kq_x2 = nullptr,
+    const device T* kq_x3 = nullptr) {
   static_assert(group_size == KQ_IQ4_XS_SUPERBLOCK, "IQ4_XS requires gs=256");
   static_assert(bits == 4, "IQ4_XS requires bits=4");
-  static_assert(kVM == 1 || (kVM == 2 && kRows), "two rows need kRows");
+  static_assert(
+      kVM == 1 || (kVM >= 2 && kVM <= 4 && kRows), "more rows need kRows");
   constexpr int num_simdgroups = 2;
   constexpr int vpt = 8;
   typedef float U;
@@ -1126,8 +1130,11 @@ METAL_FUNC void kq_iq4_xs_qmv_impl(
     U xhi[kVM][bytes_per_lane];
 #pragma unroll
     for (int v = 0; v < kVM; v++) {
-      const device T* xb =
-          (v == 0 ? x : kq_x1) + ib * KQ_IQ4_XS_SUPERBLOCK + s * 32 + q0;
+      const device T* xb = (v == 0       ? x
+                                : v == 1 ? kq_x1
+                                : v == 2 ? kq_x2
+                                         : kq_x3) +
+          ib * KQ_IQ4_XS_SUPERBLOCK + s * 32 + q0;
 #pragma unroll
       for (int i = 0; i < bytes_per_lane; i++) {
         xlo[v][i] = U(xb[i]);

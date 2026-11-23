@@ -488,6 +488,8 @@ DECODE_SCORE_CASES = [
     ("verify_ql2_min_p", 2, 512, 2047, 4),
     ("verify_ql3_ragged", 3, 1027, 4106, 4),
     ("verify_ql4_clipped", 4, 517, 2066, 4),
+    ("verify_ql6_ragged", 6, 1027, 4106, 4),
+    ("verify_ql8_clipped", 8, 517, 2062, 4),
     ("tiny_pool", 1, 33, 131, 4),
     ("deep_pool", 2, 16384, 65535, 4),
 ]
@@ -556,11 +558,11 @@ def test_dsa_indexer_score_decode_rejects_bad_shapes():
     q = mx.zeros((1, 64, 1, 128), dtype=mx.float16)
     k = mx.zeros((1, 256, 128), dtype=mx.float16)
     w = mx.zeros((1, 1, 64), dtype=mx.float16)
-    with pytest.raises(ValueError):  # qL > 4
+    with pytest.raises(ValueError):  # qL > 8
         kq.dsa_indexer_score_decode(
-            mx.zeros((1, 64, 5, 128), dtype=mx.float16),
+            mx.zeros((1, 64, 9, 128), dtype=mx.float16),
             k,
-            mx.zeros((1, 5, 64), dtype=mx.float16),
+            mx.zeros((1, 9, 64), dtype=mx.float16),
             100,
             4,
         )
@@ -578,9 +580,9 @@ def test_dsa_indexer_score_decode_rejects_bad_shapes():
 def test_dsa_indexer_score_decode_rows_batched_match_rows_alone(dtype, H, wf32):
     """A query row scores the same beside other rows as alone, bit for bit,
     and columns past its visible pool score the finite min. With 4 heads, 2
-    to 4 rows share query tiles and one read of the keys."""
+    to 8 rows share query tiles and one read of the keys."""
     fmin = float(mx.finfo(dtype).min)
-    for QL in (2, 3, 4):
+    for QL in (2, 3, 4, 5, 8):
         for P in (517, 4099):
             q, k, w = _make_decode_qkw(
                 2, QL, P, dtype, seed=47 + QL, H=H, wdtype=mx.float32 if wf32 else None
@@ -598,7 +600,7 @@ def test_dsa_indexer_score_decode_rows_batched_match_rows_alone(dtype, H, wf32):
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("QL", [2, 3, 4])
+@pytest.mark.parametrize("QL", [2, 3, 4, 7, 8])
 def test_dsa_indexer_score_decode_pair_switch(monkeypatch, dtype, QL):
     """KQ_DSA_SCORE_PAIR=0 keeps one query row per tile; the scores do not
     change."""
@@ -647,6 +649,7 @@ def test_dsa_indexer_score_decode_strided_keys_match(B):
         (2, 300, 64, 32, False),
         (2, 600, 100, 16, True),
         (4, 2066, 2048, 4, False),
+        (6, 1027, 300, 4, True),
     ],
 )
 def test_dsa_indexer_score_decode_cand(dtype, QL, P, NC, H, wf32):
@@ -683,4 +686,42 @@ def test_dsa_indexer_score_decode_cand(dtype, QL, P, NC, H, wf32):
     with pytest.raises(ValueError, match="cand"):
         kq.dsa_indexer_score_decode(
             q, k, w, q_offset, ratio, cand=mx.zeros((2, QL, 8), mx.int64)
+        )
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("QL,H", [(1, 4), (4, 4), (5, 4), (8, 4), (3, 64), (8, 16)])
+@pytest.mark.parametrize("B", [1, 2])
+def test_dsa_indexer_score_decode_tail_matches_one_buffer(dtype, QL, H, B):
+    """A pool held as a base and a tail scores as one buffer of its rows,
+    bit for bit, whether the boundary falls inside a key block or on one,
+    with the tail a view of a larger buffer, and through cand."""
+    for P, cuts in ((1031, (1, 5, 8, 512, 1024, 1030)), (100, (90, 93, 97))):
+        _tail_case(dtype, QL, H, B, P, cuts)
+
+
+def _tail_case(dtype, QL, H, B, P, cuts):
+    # P 100 puts the block across the boundary and the last block of the
+    # pool in one threadgroup, staged by two simdgroups at once.
+    q, k, w = _make_decode_qkw(B, QL, P, dtype, seed=61 + QL, H=H)
+    q_offset = P * 4 - QL
+    want = kq.dsa_indexer_score_decode(q, k, w, q_offset, 4)
+    for nb in cuts:
+        spare = mx.zeros((B, 40, D), dtype=dtype) + 3
+        tail = mx.concatenate([k[:, nb:], spare], axis=1)[:, : P - nb]
+        got = kq.dsa_indexer_score_decode(q, k[:, :nb], w, q_offset, 4, keys_tail=tail)
+        assert got.shape == (B, 1, QL, P)
+        assert mx.array_equal(got, want).item(), nb
+    rng = np.random.default_rng(7)
+    cand = rng.integers(0, P, (B, QL, 64)).astype(np.int32)
+    cand[:, :, :2] = np.array([-1, P])
+    ref = kq.dsa_indexer_score_decode(q, k, w, q_offset, 4, cand=mx.array(cand))
+    cut = P // 2 + 3
+    got = kq.dsa_indexer_score_decode(
+        q, k[:, :cut], w, q_offset, 4, cand=mx.array(cand), keys_tail=k[:, cut:]
+    )
+    assert mx.array_equal(got, ref).item()
+    with pytest.raises(ValueError, match="keys_tail"):
+        kq.dsa_indexer_score_decode(
+            q, k, w, q_offset, 4, keys_tail=k.astype(mx.float32)
         )

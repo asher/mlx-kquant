@@ -2074,13 +2074,19 @@ def _bs_prefill_lists(sel, offset, S, r=4):
     return pages, pmask, counts
 
 
+@pytest.mark.parametrize("splits", [None, "0", "1", "3", "32"])
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("shape", [(4099, 64, 16), (4096, 64, 16), (12290, 128, 512)])
-def test_sdpa_bs_prefill_matches_masked_reference(shape, dtype):
+def test_sdpa_bs_prefill_matches_masked_reference(shape, dtype, splits, monkeypatch):
     # block-sparse prefill == f32 attention under the QSA token mask
-    # (selected block members plus the causal incomplete tail)
+    # (selected block members plus the causal incomplete tail), in one pass
+    # and split over the page lists (32 leaves some splits with no tile)
     import numpy as np
 
+    if splits is None:
+        monkeypatch.delenv("KQ_SDPA_BS_SPLITS", raising=False)
+    else:
+        monkeypatch.setenv("KQ_SDPA_BS_SPLITS", splits)
     S, L, topk = shape
     B, Hq, Hkv, D, r = 1, 24, 2, 256, 4
     offset = S - L

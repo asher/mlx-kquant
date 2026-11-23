@@ -725,6 +725,16 @@ def test_nax_splitk_ragged(codec, dtype, monkeypatch):
         mx.eval(kq.quantized_matmul(x, w, s, codec, transpose=True))
 
 
+def _rows_off(monkeypatch):
+    """Pins of the routing under the dense row kernel run with the kernel
+    off, as the _logged probe does. That routing still serves float32 x,
+    GPUs without the tensor-op units, more than 16 rows, the codecs and
+    row counts the kernel's entry table leaves out and the weight views it
+    declines. test_dense_rows.py::test_rows_dispatch pins the default
+    route where the kernel serves, and test_weight_base.py its views."""
+    monkeypatch.setenv("KQ_DENSE_ROWS", "0")
+
+
 def _logged(calls, env):
     """(error, kernels) per call from one probe process with KQ_QMM_LOG on.
     Two routes can agree in every output bit, the split routes most of all
@@ -733,7 +743,10 @@ def _logged(calls, env):
     returns its failure in every entry instead of raising, so the tests
     that share it fail on their own entries."""
     try:
-        res = run_probe(calls, env={**env, "KQ_QMM_LOG": "1"}, check=False)
+        # The routes before the dense row kernel (test_dense_rows.py).
+        res = run_probe(
+            calls, env={"KQ_DENSE_ROWS": "0", **env, "KQ_QMM_LOG": "1"}, check=False
+        )
     except (AssertionError, subprocess.TimeoutExpired) as e:
         return [(f"probe failed: {e}", [])] * len(calls)
     return [(r["error"], r["kernels"]) for r in res]
@@ -955,6 +968,7 @@ def test_verify_nax_word_weight_alignment(codec, offset, monkeypatch):
     monkeypatch.delenv("KQ_QMM_ROUTE_STRICT")
     _sweep(codec, wv, s, ref_w, 1000, ms=[3, 6, 8])
     if offset % 4:
+        _rows_off(monkeypatch)
         y_def = _run_route(monkeypatch, x, wv, s, codec)
         y_alt = _run_route(monkeypatch, x, w, s, codec, VNAX_DISPLACED_M8[codec])
         assert _bits_equal(y_def, y_alt)
@@ -1441,6 +1455,7 @@ def test_verify_nax_iq4_nl_weight_alignment(offset, monkeypatch):
     monkeypatch.delenv("KQ_QMM_ROUTE")
     monkeypatch.delenv("KQ_QMM_ROUTE_STRICT")
     _sweep("iq4_nl", wv, s, ref_w, 2048, ms=[3, 4, 8], k=k)
+    _rows_off(monkeypatch)
     y_def = _run_route(monkeypatch, x, wv, s, "iq4_nl")
     y_nax = _run_route(monkeypatch, x, w, s, "iq4_nl", "verify_nax")
     assert _bits_equal(y_def, y_nax) == (offset % 4 == 0)
@@ -1680,6 +1695,7 @@ def _bits_equal(a, b):
 @pytest.mark.parametrize("codec", VNAX_CODECS)
 def test_verify_nax_default_dispatch(codec, dtype, monkeypatch):
     monkeypatch.setenv("KQ_NAX_QMV", "0")
+    _rows_off(monkeypatch)
     w, s, _ = _setup(codec, 1000)
 
     def run(x, route=None):
@@ -1759,6 +1775,7 @@ def test_verify_nax_yields_to_forced_levers(codec, monkeypatch):
     got = [_route_of(e) for e in _logged(calls, {"KQ_NAX_QMV": "0"})]
     assert got == [r for _, r in arms], got
     monkeypatch.setenv("KQ_NAX_QMV", "0")
+    _rows_off(monkeypatch)
     w, s, _ = _setup(codec, 1000)
     x = (mx.random.normal((m, K)) * 0.5).astype(mx.bfloat16)
 
@@ -1959,6 +1976,7 @@ def _clear_levers(monkeypatch):
         "KQ_QMM_ROUTE_STRICT",
     ):
         monkeypatch.delenv(k, raising=False)
+    _rows_off(monkeypatch)
 
 
 # The default small-M routing on NAX GPUs runs the kernel the per-codec

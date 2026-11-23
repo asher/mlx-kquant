@@ -168,6 +168,8 @@ target_sources(
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_hc_glue.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_hc_lowrank.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_cb_caps.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_cb_mark.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_fused_graph.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_route_shed.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_kv_append.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_file_rows.cpp
@@ -261,6 +263,7 @@ if(MLX_BUILD_METAL)
   set(KQ_METAL_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_dense_rows.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax_epi.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax_lora.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_quantized_nax_resid.metal
@@ -271,6 +274,7 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_kda_chunk_nax.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_kda_conv.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_mix.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_hc_ext.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_dsa_sparse_attn.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_sdpa_sparse_decode.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_vsa_nax.metal
@@ -288,6 +292,9 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_glu_kq_os.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_qf.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_qf_os.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_tile.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_store.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_store_seg.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_norm_fused.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_qk_norm_rope.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_hadamard.metal

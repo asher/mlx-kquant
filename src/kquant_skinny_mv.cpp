@@ -42,8 +42,16 @@ void KQuantSkinnyMV::eval_gpu(
   int N = w.shape(0);
   int T = int(x.size() / (int64_t(M) * K));
 
-  std::string kname = "kq_skinny_mv_" + kq_type_string(x.dtype()) + "_" +
-      kq_type_string(w.dtype());
+  // The MMA form (kq_skinny_mma) where K splits into runs of 8, by default
+  // on GPUs with the tensor-op units (the GPUs it was timed on);
+  // KQ_SKINNY_MMA=1 takes it on any GPU and 0 keeps the column form (read
+  // per call).
+  const bool mma = K % 8 == 0 &&
+      kq_env_flag("KQ_SKINNY_MMA", kq_is_nax_available() ? 1 : 0) != 0;
+  const int frags = M <= 8 ? 1 : 2;
+  std::string kname = std::string(mma ? "kq_skinny_mma_" : "kq_skinny_mv_") +
+      kq_type_string(x.dtype()) + "_" + kq_type_string(w.dtype()) +
+      (mma ? "_f" + std::to_string(frags) : "");
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);
   ce.set_compute_pipeline_state(kernel);
@@ -53,6 +61,7 @@ void KQuantSkinnyMV::eval_gpu(
   ce.set_bytes(M, 3);
   ce.set_bytes(N, 4);
   ce.set_bytes(K, 5);
+  // Both forms: 8 simdgroups, 8 output columns a threadgroup.
   MTL::Size group_dims(32 * 8, 1, 1);
   MTL::Size grid_dims((N + 7) / 8, T, 1);
   kq_log_dispatch(kname, x, out, grid_dims, group_dims);

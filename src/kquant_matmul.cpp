@@ -12,15 +12,18 @@
 // dispatch helpers.
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 
 #include "kquant.h"
@@ -722,6 +725,19 @@ static int kq_nax_bm128_mode() {
 // min_m of the codec's large-M row. The row-live guard in the tile skips
 // the A loads and MMA of the dead simdgroup row of the last row tile, so
 // there the half-live tile does the loads and MMA of one BM=64 tile.
+// KQ_NAX_BM128_MIN_TPC: the fewest threadgroups a GPU core the BM=128 grid
+// needs (default 3, 0 = no floor); below it the tile stays BM=64.
+static int kq_nax_bm128_min_tpc() {
+  static const int cached = kq_env_int("KQ_NAX_BM128_MIN_TPC", 3);
+  return kq_tune_live() ? kq_env_int("KQ_NAX_BM128_MIN_TPC", 3) : cached;
+}
+
+static bool kq_nax_bm128_underfilled(int M, int N) {
+  const int tpc = kq_nax_bm128_min_tpc();
+  const long grid = static_cast<long>((M + 127) / 128) * ((N + 63) / 64);
+  return tpc > 0 && grid < static_cast<long>(tpc) * gpu_core_count();
+}
+
 static int kq_nax_bm128_odd_m() {
   static const int cached = kq_env_int("KQ_NAX_BM128_ODD_M", -1);
   return kq_tune_live() ? kq_env_int("KQ_NAX_BM128_ODD_M", -1) : cached;
@@ -839,8 +855,8 @@ static KqSplitkPartials kq_splitk_partials(mx::Dtype dt, const KqOutScale& os) {
 // KQ_QMM_LOG set (any value): the quantized matmul and mat-vec kernels log
 // the kernel name and shape of each dispatch to stderr.
 static bool kq_qmm_log() {
-  static const bool cached = std::getenv("KQ_QMM_LOG") != nullptr;
-  return kq_tune_live() ? std::getenv("KQ_QMM_LOG") != nullptr : cached;
+  static const bool cached = kq_getenv("KQ_QMM_LOG") != nullptr;
+  return kq_tune_live() ? kq_getenv("KQ_QMM_LOG") != nullptr : cached;
 }
 
 // A qmm tile: rows and columns per threadgroup, and the grid of
@@ -860,7 +876,7 @@ static std::string kq_tile_string(const KqTile& t) {
 // Reads a tile override "bm,bn,wm,wn". Unset or empty gives none, and a
 // malformed value raises with the lever name.
 static std::optional<KqTile> kq_read_tile(const char* lever) {
-  const char* e = std::getenv(lever);
+  const char* e = kq_getenv(lever);
   if (e == nullptr || e[0] == '\0') {
     return std::nullopt;
   }
@@ -1012,6 +1028,13 @@ void qmm_nax(
            : bm128_mode == 2 ? true
                              : M >= policy.bm128_min_m)) {
     bm = 128;
+  }
+  // Grid floor: below kq_nax_bm128_min_tpc threadgroups a core the BM=128
+  // grid underfills the GPU and BM=64's doubled grid runs faster (q8_0
+  // N 320 K 10240 -21 to -27% at M 871-1898, q6_k N 512-640 -10 to -25% at
+  // M 871-1345; even or worse from 3 a core up).
+  if (bm == 128 && !large_rows && kq_nax_bm128_underfilled(M, N)) {
+    bm = 64;
   }
   if (large_rows) {
     bm = large.max_k > 0 && K > large.max_k ? 64 : large.bm;
@@ -1741,6 +1764,381 @@ void verify_nax(
   kq_splitk_fold(ce, d, partials, out, type_string, pp, splits, M, N, os);
 }
 
+// Dense row-class route (kq_dense_rows.h) on NAX GPUs: 2 to 16 rows of x
+// in one dispatch that decodes each weight once and applies it to every
+// row, with split-K inside the threadgroup. A row's bits do not depend on
+// M: the kernel, the split and the sum order depend on the codec, N and K
+// only, and the row class only adds the loads and stores of rows 8 to 15.
+//
+// KQ_DENSE_ROWS, read live: 0 runs the routes below (the routing before
+// this kernel), 1 or unset runs the row-class kernel where it serves.
+static bool kq_dense_rows_on() {
+  return kq_env_int("KQ_DENSE_ROWS", 1) != 0;
+}
+
+// The rows the kernel serves by default, per codec: from lo in the class of
+// 2 to 8 rows and from hi in the class of 9 to 16, 0 where it serves none
+// of the class. Each entry is the fewest rows from which the kernel ran at
+// or under the time of the route it displaces at every row count of the
+// class, on M5 Max over chains of dependent calls on the Qwen3.8-Flash-Next
+// projection shapes (K 2560 and 6144, N 2560 to 12288; time of the kernel
+// over the displaced route at the entry and at the top of the class):
+//   q8_0 0.93-0.91 and 0.79-0.76, q5_k 0.91-0.87 and 0.71, q3_k 0.95-0.80
+//   and 0.66-0.63, iq4_xs 0.89-0.92 and 0.79-0.75, iq4_nl 0.92-0.93 and
+//   0.92-0.86 from 2 rows;
+//   q6_k 0.985-0.84 and 0.60-0.57 (1.02 at 2 rows), q4_k 0.96 and 0.77,
+//   q2_k 0.96-0.80 and 0.76-0.71, q4_0 and q4_1 0.95-0.93 and 0.80-0.75,
+//   q2_0 0.87-0.84 and 0.71-0.68, nvfp4 0.88-0.86 and 0.77-0.73 (0.98 at 2
+//   rows), iq1_s 0.98-0.72 and 0.73-0.70 from 3 rows;
+//   q5_0 and q5_1 0.95-0.93 and 0.93-0.90, iq1_m 0.91-0.63 and 0.65-0.63
+//   from 4 rows; iq2_xxs 0.92-0.64 and 0.59-0.41 from 5; iq2_s 0.99-0.98
+//   from 6; iq3_s 0.99 from 8;
+//   pq2_0 0.87-0.86 from 3 to 8 rows and none above (1.05-1.01 at 9 to 12);
+//   iq3_xxs from 12 rows (0.99-0.97, 1.00-1.01 from 5 to 10);
+//   iq2_xs (1.03-1.05 from 4 rows), stq1_0 (1.07-1.15) and ptq1_0
+//   (1.33-1.83) none. mxfp4 none: its weights are held in the activation
+//   type (see kq_dense_rows.h), a form these timings do not cover.
+// One row stays on the mat-vec routes for every codec (1.1-3.5x there).
+struct KqRowsEntry {
+  int lo;
+  int hi;
+};
+static KqRowsEntry kq_dense_rows_entry(const std::string& t) {
+  static const std::unordered_map<std::string, KqRowsEntry> entries = {
+      {"q8_0", {2, 9}},   {"q5_k", {2, 9}},    {"q3_k", {2, 9}},
+      {"iq4_xs", {2, 9}}, {"iq4_nl", {2, 9}},  {"q6_k", {3, 9}},
+      {"q4_k", {3, 9}},   {"q2_k", {3, 9}},    {"q4_0", {3, 9}},
+      {"q4_1", {3, 9}},   {"q2_0", {3, 9}},    {"nvfp4", {3, 9}},
+      {"iq1_s", {3, 9}},  {"q5_0", {4, 9}},    {"q5_1", {4, 9}},
+      {"iq1_m", {4, 9}},  {"iq2_xxs", {5, 9}}, {"iq2_s", {6, 9}},
+      {"iq3_s", {8, 9}},  {"pq2_0", {3, 0}},   {"iq3_xxs", {0, 12}}};
+  const auto it = entries.find(t);
+  return it == entries.end() ? KqRowsEntry{0, 0} : it->second;
+}
+
+// Whether the kernel serves M rows of a codec: the codec's entry of M's
+// class, or under KQ_DENSE_ROWS_MIN_M (read live) every M from its value to
+// 16 on every codec. 2 runs two rows through the kernel, and 1 one row as
+// well, so a row gives the same bits at every M from that width to 16.
+static bool kq_dense_rows_m_served(const std::string& t, int M) {
+  if (M < 1 || M > 16) {
+    return false;
+  }
+  const int forced = kq_env_int("KQ_DENSE_ROWS_MIN_M", 0);
+  if (forced >= 1) {
+    return M >= forced;
+  }
+  const KqRowsEntry e = kq_dense_rows_entry(t);
+  const int from = M <= 8 ? e.lo : e.hi;
+  return from > 0 && M >= from;
+}
+
+// The row-class kernel of a call: the kq_verify_nax.h decode form where
+// the codec has one and it fits the weight (kq_verify_nax_fits), else the
+// mat-vec chunk decode form (_gen) where K is whole blocks. unit is the
+// K step a simdgroup takes; name is empty where neither serves.
+// KQ_DENSE_ROWS_FORM (probe lever, read live): 1 takes only the first
+// form, 2 only the second.
+static bool kq_codec_has_mv_ext(const std::string& t);
+struct KqRowsKernel {
+  std::string name;
+  int unit = 0;
+};
+static KqRowsKernel
+kq_rows_kernel(const array& w, const std::string& t, int N, int K) {
+  const int form = kq_env_int("KQ_DENSE_ROWS_FORM", 0);
+  const int kstep = kq_verify_nax_call_kstep(N, K, t);
+  if (form != 2 && kstep > 0 && kq_verify_nax_fits(w, K, kstep, t)) {
+    return {kq_verify_nax_prefix(t, kstep) + "rows_", kstep};
+  }
+  const KQuantCodec* codec = codec_by_name(t);
+  if (form != 1 && codec != nullptr && kq_codec_has_mv_ext(t)) {
+    // A unit of whole blocks, at least 128 weights, else one block.
+    const int bk = codec->weights_per_block;
+    const int uk = std::max(bk, 128);
+    if (K % uk == 0) {
+      return {"kquant_" + t + "_gen_rows_", uk};
+    }
+    if (K % bk == 0) {
+      return {"kquant_" + t + "_gen1_rows_", bk};
+    }
+  }
+  return {};
+}
+
+// A lever that forces another route at the call's M takes precedence over
+// the row-class kernel, so its arms time the route it names: KQ_NAX_QMV at
+// 2 or more through its value, a forced KQ_VERIFY_NAX or KQ_VERIFY_MMA on a
+// codec they serve, a forced KQ_QMM_SPLITK_NAX or KQ_QMM_SPLITK, and a set
+// KQ_VERIFY_EXT through M 12. KQ_QMM_ROUTE and KQ_FORCE_QMM_MIN_M are
+// decided before it.
+static bool kq_dense_rows_yields(const std::string& t, int M) {
+  const int qmv = kq_env_int("KQ_NAX_QMV", -1);
+  const int vnax = kq_env_int("KQ_VERIFY_NAX", -1);
+  const int vmma = kq_env_int("KQ_VERIFY_MMA", -1);
+  const int ext = kq_verify_ext_env();
+  return (qmv >= 2 && M <= qmv) ||
+      (vnax >= 1 && M >= vnax && M <= 8 && codec_verify_nax_kstep(t) > 0) ||
+      (vmma >= 2 && M >= vmma && M <= 8 && codec_verify_mma_rows(t) > 0) ||
+      kq_env_int("KQ_QMM_SPLITK_NAX", -1) >= 1 || kq_qmm_splitk_env() > 1 ||
+      ((ext == 0 || ext == 1) && M <= 12);
+}
+
+// Whether the row-class kernel serves a call: a NAX GPU, bf16 or f16 x,
+// non-batched transpose shapes (the caller checks), a row count the codec's
+// entry takes (kq_dense_rows_m_served), no lever forcing another route
+// (kq_dense_rows_yields), and a kernel for the codec and weight.
+static bool kq_dense_rows_serves(
+    const array& w,
+    const std::string& t,
+    int M,
+    int N,
+    int K,
+    mx::Dtype xt) {
+  // mxfp4 holds its weights in x's type: bfloat16 keeps every block
+  // exponent, float16 does not, so float16 x stays on the other routes.
+  if (xt == mx::float32 || !kq_is_nax_available() ||
+      !kq_dense_rows_m_served(t, M) || (t == "mxfp4" && xt != mx::bfloat16) ||
+      !kq_dense_rows_on() || !codec_has_nax(t) || kq_dense_rows_yields(t, M)) {
+    return false;
+  }
+  return !kq_rows_kernel(w, t, N, K).name.empty();
+}
+
+// Simdgroups per threadgroup: a divisor of the units of K, so every
+// simdgroup walks as many, nearest by ratio to the count that puts about
+// 1280 simdgroups over the grid of ceil(N / 32) threadgroups (the smaller
+// on a tie). At most 8 above N 1024, where 16 ran 1.07x slower than 8 at N
+// 2560, and at most 32 at N 1024 and under, where 16 and 32 ran 0.73-0.88x
+// the time of 8 at N 320 to 640. On M5 Max a divisor ran 0.95-0.97x the
+// time of a power of two that does not divide (20 units: 5 against 8 at N
+// 6144), and 0.88-0.95x where the units are few (5 or 10 units: 5 against 8
+// at N 2560, 10 against 4 at N 10240). KQ_DENSE_ROWS_NSG pins it (probe
+// lever, read live).
+static int kq_rows_nsg(int N, int units) {
+  const int pinned = kq_env_int("KQ_DENSE_ROWS_NSG", 0);
+  if (pinned > 0) {
+    return std::max(1, std::min({pinned, units, 32}));
+  }
+  const int tgs = (N + 31) / 32;
+  const double want = 1280.0 / tgs;
+  const int cap = tgs <= 32 ? 32 : 8;
+  int best = 1;
+  double best_d = 1e30;
+  for (int d = 1; d <= std::min(cap, units); ++d) {
+    if (units % d != 0) {
+      continue;
+    }
+    const double dist = std::abs(std::log(d / want));
+    if (dist < best_d - 1e-9) {
+      best = d;
+      best_d = dist;
+    }
+  }
+  return best;
+}
+
+// The pipelines of a row-class call: kname specialized by the x load, the
+// row class, nsg (0 in a multi dispatch whose weights differ), the weight
+// count of a multi dispatch, and the output scale.
+struct KqRowsPipes {
+  Device& d;
+  std::string kname;
+  bool x16;
+  KqOutScale os;
+
+  std::pair<MTL::ComputePipelineState*, std::string>
+  get(bool rows16, int nsg, int multi = 1) const {
+    bool r = rows16;
+    bool x = x16;
+    mx::metal::MTLFCList fc = {
+        {&x, MTL::DataType::DataTypeBool, 40},
+        {&r, MTL::DataType::DataTypeBool, 41},
+        {&nsg, MTL::DataType::DataTypeInt, 43},
+        {&multi, MTL::DataType::DataTypeInt, 44}};
+    std::string name = kname + (x ? "_x16" : "_x8") + (r ? "_r16" : "_r8") +
+        "_nsg" + std::to_string(nsg);
+    if (multi > 1) {
+      name += "_multi" + std::to_string(multi);
+    }
+    if (os) {
+      fc.emplace_back(&os.mode, MTL::DataType::DataTypeInt, kq_fc_out_scale);
+      name += "_os" + std::to_string(os.mode);
+    }
+    return std::make_pair(kq_get_kernel(d, kname, name, fc), name);
+  }
+
+  // The device's thread limit bounds nsg. Both row classes take the nsg
+  // that fits both of their pipelines, so the sum order, and with it a
+  // row's bits, stays the same on either side of 8 rows. Cached per kernel
+  // and requested nsg.
+  int fit(int nsg) const {
+    static std::mutex fit_mu;
+    static std::unordered_map<std::string, int> fits;
+    const std::string key = kname + (x16 ? "_x16_" : "_x8_") +
+        std::to_string(nsg) + "_" + std::to_string(os ? os.mode : -1);
+    std::lock_guard<std::mutex> lk(fit_mu);
+    auto it = fits.find(key);
+    if (it != fits.end()) {
+      return it->second;
+    }
+    while (nsg > 1) {
+      const int lim = std::min(
+          static_cast<int>(
+              get(false, nsg).first->maxTotalThreadsPerThreadgroup()),
+          static_cast<int>(
+              get(true, nsg).first->maxTotalThreadsPerThreadgroup()));
+      if (lim >= 32 * nsg) {
+        break;
+      }
+      nsg /= 2;
+    }
+    fits.emplace(key, nsg);
+    return nsg;
+  }
+};
+
+static KqRowsPipes kq_rows_pipes(
+    Device& d,
+    const KqRowsKernel& rk,
+    const array& x,
+    const KqOutScale& os) {
+  return {
+      d,
+      rk.name + kq_type_string(x.dtype()),
+      reinterpret_cast<uintptr_t>(x.data<char>()) % 16 == 0 &&
+          kq_vnax_x16_enabled(),
+      os};
+}
+
+void dense_rows(
+    const array& x,
+    const array& w,
+    const array& scales,
+    array& out,
+    int M,
+    int N,
+    int K,
+    Device& d,
+    const Stream& s,
+    const std::string& kquant_type,
+    const KqOutScale& os = {}) {
+  const KqRowsKernel rk = kq_rows_kernel(w, kquant_type, N, K);
+  const KqRowsPipes pipes = kq_rows_pipes(d, rk, x, os);
+  const int nsg = pipes.fit(kq_rows_nsg(N, K / rk.unit));
+  auto [kernel, vname] = pipes.get(M > 8, nsg);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  int c = 0;
+  ce.set_input_array(w, c++);
+  ce.set_input_array(scales, c++);
+  ce.set_input_array(x, c++);
+  ce.set_output_array(out, c++);
+  ce.set_bytes(K, c++);
+  ce.set_bytes(N, c++);
+  ce.set_bytes(M, c++);
+  kq_bind_out_scale(ce, os);
+  ce.set_threadgroup_memory_length(
+      static_cast<size_t>(nsg) * 256 * sizeof(float), 0);
+  MTL::Size group_dims(32 * nsg, 1, 1);
+  MTL::Size grid_dims((N + 31) / 32, 1, 1);
+  kq_log_qmm(vname, M, N, K, grid_dims, group_dims, x);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+// KQ_DENSE_ROWS_MULTI, read live: 1 runs the weights of a
+// quantized_matmul_multi call the row-class kernel serves in one dispatch
+// per four weights (dense_rows_multi), 0 or unset one dispatch a weight.
+// Off by default: on M5 Max the GDN qkv and z projections of
+// Qwen3.8-Flash-Next (q6_k, K 2560, N 10240 and 6144) took 2.94 ms over 36
+// layers in one dispatch against 2.75 in two at 8 rows, and 2.85 to 2.87
+// against 2.82 with both weights on one nsg. Two dispatches overlap on the
+// GPU, and one threadgroup size has to serve both weights.
+static bool kq_dense_rows_multi_on() {
+  return kq_env_int("KQ_DENSE_ROWS_MULTI", 0) != 0;
+}
+
+// The row-class kernel over two to four weights that share x, in one
+// dispatch: weight i takes ceil(N_i / 32) threadgroups after those of the
+// weights before it, with its own N and the nsg of its single call, so
+// each output holds the bits of quantized_matmul on that weight. A
+// threadgroup launches the largest nsg of the dispatch. Returns false,
+// dispatching nothing, where the weights take different kernels or the
+// pipeline does not hold the threadgroup.
+bool dense_rows_multi(
+    const array& x,
+    const array& scales,
+    const std::vector<array>& ws,
+    std::vector<array>& outs,
+    int M,
+    int K,
+    Device& d,
+    const Stream& s,
+    const std::string& kquant_type) {
+  const int n = static_cast<int>(ws.size());
+  if (n < 2 || n > 4) {
+    return false;
+  }
+  const KqRowsKernel rk = kq_rows_kernel(ws[0], kquant_type, ws[0].shape(0), K);
+  const KqRowsPipes pipes = kq_rows_pipes(d, rk, x, {});
+  std::array<int, 4> n_rows{0, 0, 0, 0};
+  std::array<int, 4> tg_end{0, 0, 0, 0};
+  std::array<int, 4> nsgs{1, 1, 1, 1};
+  int tgs = 0;
+  int nsg_max = 1;
+  bool same = true;
+  for (int i = 0; i < 4; ++i) {
+    if (i < n) {
+      const int N = ws[i].shape(0);
+      if (kq_rows_kernel(ws[i], kquant_type, N, K).name != rk.name) {
+        return false;
+      }
+      n_rows[i] = N;
+      nsgs[i] = pipes.fit(kq_rows_nsg(N, K / rk.unit));
+      nsg_max = std::max(nsg_max, nsgs[i]);
+      same = same && nsgs[i] == nsgs[0];
+      tgs += (N + 31) / 32;
+    }
+    tg_end[i] = tgs;
+  }
+  auto [kernel, vname] = pipes.get(M > 8, same ? nsgs[0] : 0, n);
+  if (static_cast<int>(kernel->maxTotalThreadsPerThreadgroup()) <
+      32 * nsg_max) {
+    return false;
+  }
+  for (auto& o : outs) {
+    o.set_data(mx::allocator::malloc(o.nbytes()));
+  }
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  int c = 0;
+  ce.set_input_array(ws[0], c++);
+  ce.set_input_array(scales, c++);
+  ce.set_input_array(x, c++);
+  ce.set_output_array(outs[0], c++);
+  ce.set_bytes(K, c++);
+  ce.set_bytes(n_rows[0], c++);
+  ce.set_bytes(M, c++);
+  for (int i = 1; i < 4; ++i) {
+    ce.set_input_array(ws[i < n ? i : 0], 6 + i);
+    ce.set_output_array(outs[i < n ? i : 0], 9 + i);
+  }
+  ce.set_bytes(n_rows.data(), 4, 13);
+  ce.set_bytes(tg_end.data(), 4, 14);
+  ce.set_bytes(nsgs.data(), 4, 15);
+  ce.set_threadgroup_memory_length(
+      static_cast<size_t>(nsg_max) * 256 * sizeof(float), 0);
+  MTL::Size group_dims(32 * nsg_max, 1, 1);
+  MTL::Size grid_dims(tgs, 1, 1);
+  int rows = 0;
+  for (int i = 0; i < n; ++i) {
+    rows += n_rows[i];
+  }
+  kq_log_qmm(vname, M, rows, K, grid_dims, group_dims, x);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+  return true;
+}
+
 // verify_nax over up to four weights that share x, in one dispatch
 // (kq_verify_nax_multi): weight i takes ceil(N_i / 128) threadgroups of
 // grid x after those of the weights before it, and reads its own buffer.
@@ -2338,7 +2736,7 @@ void verify_mv_ext(
   // halving the M*N*K activation cache traffic that dominates past M~5.
   // q6_k-only instantiations for now; default 1 = shipped behavior.
   static const int mv_ext_nr = []() {
-    const char* e = std::getenv("KQ_MV_EXT_NR");
+    const char* e = kq_getenv("KQ_MV_EXT_NR");
     return e != nullptr ? std::atoi(e) : 1;
   }();
   const bool use_nr2 =
@@ -2347,7 +2745,7 @@ void verify_mv_ext(
   // activation quarters over simd_shuffle instead of each loading the full
   // window -- activation cache traffic / 4, same grid. q6_k M 4-12 only.
   static const bool mv_ext_sb = []() {
-    const char* e = std::getenv("KQ_MV_EXT_SB");
+    const char* e = kq_getenv("KQ_MV_EXT_SB");
     return e != nullptr && std::atoi(e) == 1;
   }();
   const bool use_sb =
@@ -2356,7 +2754,7 @@ void verify_mv_ext(
   // readers per element (nypsg*nsg drops 8 -> 4 -> 2) + more threadgroups.
   // q6_k M 4-12 only; wins here would generalize per codec.
   static const int mv_ext_nx = []() {
-    const char* e = std::getenv("KQ_MV_EXT_NX");
+    const char* e = kq_getenv("KQ_MV_EXT_NX");
     const int v = e != nullptr ? std::atoi(e) : 0;
     return (v == 16 || v == 32) ? v : 0;
   }();
@@ -2366,7 +2764,7 @@ void verify_mv_ext(
   // at 2x issue rate + no per-row activation converts, f32 fold per chunk.
   // q6_k M 4-12, half/bfloat x only.
   static const bool mv_ext_hd = []() {
-    const char* e = std::getenv("KQ_MV_EXT_HD");
+    const char* e = kq_getenv("KQ_MV_EXT_HD");
     return e != nullptr && std::atoi(e) == 1;
   }();
   const bool use_hd = !use_nr2 && !use_sb && !use_nx && mv_ext_hd && M >= 4 &&
@@ -2700,7 +3098,7 @@ static double kq_verify_nax_partial_c(const std::string& t, int kstep) {
 // to 1536 on M5 Max, and the vocab head at 1 split 1.06-1.07x slower than at 2.
 // KQ_VERIFY_NAX_SPLITS=<n> replaces the target on every codec (probe lever).
 static int kq_verify_nax_splits(int N, int K, int kstep, const std::string& t) {
-  const char* e = std::getenv("KQ_VERIFY_NAX_SPLITS");
+  const char* e = kq_getenv("KQ_VERIFY_NAX_SPLITS");
   const int env = e != nullptr ? std::atoi(e) : 0;
   const int sgs = (N + 31) / 32;
   const double partial_c = kq_verify_nax_partial_c(t, kstep);
@@ -2807,7 +3205,7 @@ bool kq_forced_route(
     return false;
   }
   if (r == "splitk") {
-    const char* e = std::getenv("KQ_QMM_SPLITK");
+    const char* e = kq_getenv("KQ_QMM_SPLITK");
     const int target = (e != nullptr && std::atoi(e) > 1) ? std::atoi(e) : 16;
     const int sp = kq_split_count(target, K / group_size);
     if (kq_splitk_codec(t) && sp > 1) {
@@ -2827,7 +3225,7 @@ bool kq_forced_route(
     return false;
   }
   if (r == "nax_splitk") {
-    const char* e = std::getenv("KQ_QMM_SPLITK_NAX");
+    const char* e = kq_getenv("KQ_QMM_SPLITK_NAX");
     const int target = (e != nullptr && std::atoi(e) > 1)
         ? std::atoi(e)
         : kq_splitk_nax_target;
@@ -3084,7 +3482,7 @@ std::vector<mx::array> KQuantMatmul::vjp(
 // qmm-vs-mv_ext crossover measurement below M=13. Read once per process.
 static int kq_force_qmm_min_m() {
   static const int m = []() {
-    const char* e = std::getenv("KQ_FORCE_QMM_MIN_M");
+    const char* e = kq_getenv("KQ_FORCE_QMM_MIN_M");
     return e != nullptr ? std::atoi(e) : 0;
   }();
   return m;
@@ -3092,7 +3490,7 @@ static int kq_force_qmm_min_m() {
 
 // KQ_QMM_ROUTE=<route> is set (see eval_gpu_base).
 static bool kq_qmm_route_forced() {
-  const char* e = std::getenv("KQ_QMM_ROUTE");
+  const char* e = kq_getenv("KQ_QMM_ROUTE");
   return e != nullptr && e[0] != '\0';
 }
 
@@ -3159,12 +3557,108 @@ kq_nax_small_m_route(const std::string& t, int M, int N, int K, bool f16) {
   return KqSmallMRoute::other;
 }
 
+// KQ_QMM_MULTI_ROWS: quantized_matmul_multi runs its weights in one grid at
+// prefill rows (default 1; 0 = a dispatch per weight).
+static bool kq_qmm_multi_rows_on() {
+  static const bool cached = kq_env_int("KQ_QMM_MULTI_ROWS", 1) != 0;
+  return kq_tune_live() ? kq_env_int("KQ_QMM_MULTI_ROWS", 1) != 0 : cached;
+}
+
+// The prefill-row form of quantized_matmul_multi: two to four weights in one
+// grid on the BK=128 NAX tile, at M past the split-K and small-M routes
+// (M > 128) where quantized_matmul runs that tile on each weight. The row
+// tile follows qmm_nax's rule on the joined width; 64- and 128-row tiles
+// give the same bits. False where the form does not apply.
+static bool qmm_nax_multi(
+    const array& x,
+    const std::vector<array>& ws,
+    std::vector<array>& outs,
+    int M,
+    int K,
+    Device& d,
+    const Stream& s,
+    const std::string& t) {
+  const int n = static_cast<int>(ws.size());
+  if (n < 2 || n > 4 || M <= 128 || t != "q6_k" || !kq_qmm_multi_rows_on() ||
+      !kq_is_nax_available() || !codec_has_nax(t) ||
+      !x.flags().row_contiguous ||
+      (x.dtype() != mx::bfloat16 && x.dtype() != mx::float16) || K % 128 != 0 ||
+      !kq_nax_bk128_on(t) || kq_qmm_route_forced() ||
+      kq_force_qmm_min_m() > 0 || kq_nax_tile() || kq_nax_swizzle_log() > 0) {
+    return false;
+  }
+  std::vector<int> ns(4, 0);
+  int ntot = 0;
+  for (int i = 0; i < n; ++i) {
+    const int N = ws[i].shape(0);
+    if (ws[i].ndim() != 2 || N <= 0 || N % 64 != 0) {
+      return false;
+    }
+    ns[i] = N;
+    ntot += N;
+  }
+  const int bm128_mode = kq_nax_bm128_mode();
+  const KqSmallBmPolicy policy = kq_smallbm_policy(t);
+  const KqLargeM& large = policy.large;
+  const int odd_m_env = kq_nax_bm128_odd_m();
+  const int odd_m = odd_m_env >= 0 ? odd_m_env : large.min_m;
+  const bool large_rows =
+      bm128_mode != 0 && odd_m > 0 && M >= odd_m && ntot >= large.min_n;
+  int bm = 64;
+  if (large_rows) {
+    if (large.bn != 64 || large.wm != 2 || large.wn != 2 ||
+        large.swizzle_log != 0) {
+      return false;
+    }
+    bm = large.max_k > 0 && K > large.max_k ? 64 : large.bm;
+  } else if (
+      bm128_mode != 0 && ((M + 63) / 64) % 2 == 0 &&
+      (bm128_mode == 1       ? M >= 193
+           : bm128_mode == 2 ? true
+                             : M >= policy.bm128_min_m) &&
+      !kq_nax_bm128_underfilled(M, ntot)) {
+    bm = 128;
+  }
+  if (bm != 64 && bm != 128) {
+    return false;
+  }
+  const array xb = kq_x_aligned_gpu(x, s, "quantized_matmul_multi x");
+  for (auto& o : outs) {
+    o.set_data(mx::allocator::malloc(o.nbytes()));
+  }
+  const std::string kname = "kquant_q6_k_qmm_t_nax_bk128_multi_" +
+      kq_type_string(x.dtype()) + "_bm" + std::to_string(bm);
+  MTL::Size group_dims(32, 2, 2);
+  MTL::Size grid_dims(ntot / 64, (M + bm - 1) / bm, 1);
+  kq_log_qmm(kname, M, ntot, K, grid_dims, group_dims, xb);
+  auto kernel = kq_get_kernel_os(d, kname, KqOutScale{});
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  for (int i = 0; i < 4; ++i) {
+    ce.set_input_array(ws[std::min(i, n - 1)], i);
+  }
+  ce.set_input_array(xb, 4);
+  for (int i = 0; i < 4; ++i) {
+    if (i < n) {
+      ce.set_output_array(outs[i], 5 + i);
+    } else {
+      ce.set_input_array(outs[n - 1], 5 + i);
+    }
+  }
+  ce.set_bytes(K, 9);
+  ce.set_vector_bytes(ns, 10);
+  ce.set_bytes(M, 11);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+  return true;
+}
+
 // One verify_nax dispatch per four weights where quantized_matmul would
 // take the verify_nax route on the widest weight at this M, and
 // quantized_matmul per weight otherwise. The narrower weights ride along on
 // that route. Every route lever of quantized_matmul applies, through
 // kq_nax_small_m_route, and a forced KQ_QMM_ROUTE or KQ_FORCE_QMM_MIN_M
-// runs quantized_matmul per weight.
+// runs quantized_matmul per weight. At prefill rows, q6_k weights on the
+// BK=128 NAX tile run in one grid (qmm_nax_multi).
 void KQuantMatmulMulti::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
@@ -3205,6 +3699,60 @@ void KQuantMatmulMulti::eval_gpu(
     for (const auto& w : ws) {
       multi = multi && kq_verify_nax_fits(w, K, kstep, kquant_type_);
     }
+  }
+  // Where the row-class kernel serves a weight, the weights run through
+  // it: up to four a dispatch where it serves them all with one kernel
+  // (dense_rows_multi), else each through quantized_matmul. Either way an
+  // output holds the bits of quantized_matmul on its weight.
+  bool rows_any = false;
+  bool rows_all = n_max > 0 && x.flags().row_contiguous &&
+      !kq_qmm_route_forced() && !(force_min_m > 0 && M >= force_min_m);
+  for (const auto& w : ws) {
+    const bool r = w.size() > 0 &&
+        kq_dense_rows_serves(w, kquant_type_, M, w.shape(0), K, x.dtype());
+    rows_any = rows_any || r;
+    rows_all = rows_all && r;
+  }
+  multi = multi && !rows_any;
+  if (rows_all && n > 1 && out_scale_mode_ == 0 && kq_dense_rows_multi_on()) {
+    const array x16 = kq_x_aligned_gpu(x, s, "quantized_matmul_multi x");
+    // A group the multi form does not take runs a dispatch per weight. The
+    // first group falls through to the per-weight calls below.
+    bool done = true;
+    for (int i = 0; i < n && done; i += 4) {
+      const int e = std::min(n, i + 4);
+      std::vector<array> gw(ws.begin() + i, ws.begin() + e);
+      std::vector<array> go(outputs.begin() + i, outputs.begin() + e);
+      if (e - i > 1 &&
+          dense_rows_multi(x16, scales, gw, go, M, K, d, s, kquant_type_)) {
+        continue;
+      }
+      if (i == 0 && e - i > 1) {
+        done = false;
+        break;
+      }
+      for (size_t j = 0; j < gw.size(); ++j) {
+        go[j].set_data(mx::allocator::malloc(go[j].nbytes()));
+        dense_rows(
+            x16,
+            gw[j],
+            scales,
+            go[j],
+            M,
+            gw[j].shape(0),
+            K,
+            d,
+            s,
+            kquant_type_);
+      }
+    }
+    if (done) {
+      return;
+    }
+  }
+  if (!multi && out_scale_mode_ == 0 &&
+      qmm_nax_multi(x, ws, outputs, M, K, d, s, kquant_type_)) {
+    return;
   }
   if (!multi) {
     // x is bound once, so that each per-weight call reads it in place.
@@ -3363,7 +3911,7 @@ void KQuantMatmul::eval_gpu_base(
   // verify_mma, verify_nax, splitk, nax, nax_splitk. Read live so a route
   // sweep shares one process (benchmarks/bench_verify_routes.py).
   if (transpose_) {
-    const char* route_e = std::getenv("KQ_QMM_ROUTE");
+    const char* route_e = kq_getenv("KQ_QMM_ROUTE");
     if (route_e != nullptr && route_e[0] != '\0') {
       if (non_batched && M <= 32 && x_in.dtype() != mx::float32 &&
           kq_forced_route(
@@ -3383,7 +3931,7 @@ void KQuantMatmul::eval_gpu_base(
               os)) {
         return;
       }
-      const char* strict_e = std::getenv("KQ_QMM_ROUTE_STRICT");
+      const char* strict_e = kq_getenv("KQ_QMM_ROUTE_STRICT");
       if (strict_e != nullptr && std::atoi(strict_e) == 1) {
         throw std::runtime_error(
             "[mlx_kquant] KQ_QMM_ROUTE=" + std::string(route_e) +
@@ -3391,6 +3939,13 @@ void KQuantMatmul::eval_gpu_base(
             ", N=" + std::to_string(N) + ", K=" + std::to_string(K) + ".");
       }
     }
+  }
+
+  // Dense row-class kernel on NAX GPUs: kq_dense_rows_serves.
+  if (transpose_ && non_batched &&
+      kq_dense_rows_serves(w, kquant_type_, M, N, K, x_in.dtype())) {
+    dense_rows(bind_x(16), w, scales, out, M, N, K, d, s, kquant_type_, os);
+    return;
   }
 
   // Per-row qmv and verify_nax on NAX GPUs: kq_nax_small_m_route.
@@ -3775,7 +4330,7 @@ void KQuantMatmul::eval_gpu_base(
     // to qmv outside the supported codec/shape/row-count envelope.
     // KQ_DISABLE_VERIFY_QMV=1 forces the per-row qmv path (A/B harness lever).
     static const bool verify_disabled = []() {
-      const char* e = std::getenv("KQ_DISABLE_VERIFY_QMV");
+      const char* e = kq_getenv("KQ_DISABLE_VERIFY_QMV");
       return e != nullptr && e[0] == '1';
     }();
     int bn = kquant_qmv_bn(kquant_type_);

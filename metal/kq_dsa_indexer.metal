@@ -66,15 +66,19 @@ instantiate_kq_dsa_topk_split_all(bfloat16_t, bfloat16_t)
       "kq_dsa_indexer_score_decode_" hs ws #tname "_ql" #ql "_cand",                \
       kq_dsa_indexer_score_decode, dtype, ql, h, 128, 4, 1, wt, true)
 
-#define instantiate_kq_dsa_indexer_score_decode_all(tname, dtype, h, hs)  \
-  instantiate_kq_dsa_indexer_score_decode(tname, dtype, 1, h, hs, dtype, ""); \
-  instantiate_kq_dsa_indexer_score_decode(tname, dtype, 2, h, hs, dtype, ""); \
-  instantiate_kq_dsa_indexer_score_decode(tname, dtype, 3, h, hs, dtype, ""); \
-  instantiate_kq_dsa_indexer_score_decode(tname, dtype, 4, h, hs, dtype, ""); \
-  instantiate_kq_dsa_indexer_score_decode(tname, dtype, 1, h, "h" #h "_", float, "wf_"); \
-  instantiate_kq_dsa_indexer_score_decode(tname, dtype, 2, h, "h" #h "_", float, "wf_"); \
-  instantiate_kq_dsa_indexer_score_decode(tname, dtype, 3, h, "h" #h "_", float, "wf_"); \
-  instantiate_kq_dsa_indexer_score_decode(tname, dtype, 4, h, "h" #h "_", float, "wf_")
+#define instantiate_kq_dsa_indexer_score_decode_ql(tname, dtype, h, hs, ql)        \
+  instantiate_kq_dsa_indexer_score_decode(tname, dtype, ql, h, hs, dtype, "");      \
+  instantiate_kq_dsa_indexer_score_decode(tname, dtype, ql, h, "h" #h "_", float, "wf_")
+
+#define instantiate_kq_dsa_indexer_score_decode_all(tname, dtype, h, hs) \
+  instantiate_kq_dsa_indexer_score_decode_ql(tname, dtype, h, hs, 1);    \
+  instantiate_kq_dsa_indexer_score_decode_ql(tname, dtype, h, hs, 2);    \
+  instantiate_kq_dsa_indexer_score_decode_ql(tname, dtype, h, hs, 3);    \
+  instantiate_kq_dsa_indexer_score_decode_ql(tname, dtype, h, hs, 4);    \
+  instantiate_kq_dsa_indexer_score_decode_ql(tname, dtype, h, hs, 5);    \
+  instantiate_kq_dsa_indexer_score_decode_ql(tname, dtype, h, hs, 6);    \
+  instantiate_kq_dsa_indexer_score_decode_ql(tname, dtype, h, hs, 7);    \
+  instantiate_kq_dsa_indexer_score_decode_ql(tname, dtype, h, hs, 8)
 
 // Two query rows per tile, 4 heads only.
 #define instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, ql, wt, ws) \
@@ -82,13 +86,18 @@ instantiate_kq_dsa_topk_split_all(bfloat16_t, bfloat16_t)
       "kq_dsa_indexer_score_decode_h4_" ws #tname "_ql" #ql "_pair",            \
       kq_dsa_indexer_score_decode, dtype, ql, 4, 128, 8, 1, wt, false, true)
 
-#define instantiate_kq_dsa_indexer_score_decode_pair_all(tname, dtype)       \
-  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 2, dtype, "");  \
-  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 3, dtype, "");  \
-  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 4, dtype, "");  \
-  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 2, float, "wf_"); \
-  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 3, float, "wf_"); \
-  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, 4, float, "wf_")
+#define instantiate_kq_dsa_indexer_score_decode_pair_ql(tname, dtype, ql) \
+  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, ql, dtype, ""); \
+  instantiate_kq_dsa_indexer_score_decode_pair(tname, dtype, ql, float, "wf_")
+
+#define instantiate_kq_dsa_indexer_score_decode_pair_all(tname, dtype) \
+  instantiate_kq_dsa_indexer_score_decode_pair_ql(tname, dtype, 2);    \
+  instantiate_kq_dsa_indexer_score_decode_pair_ql(tname, dtype, 3);    \
+  instantiate_kq_dsa_indexer_score_decode_pair_ql(tname, dtype, 4);    \
+  instantiate_kq_dsa_indexer_score_decode_pair_ql(tname, dtype, 5);    \
+  instantiate_kq_dsa_indexer_score_decode_pair_ql(tname, dtype, 6);    \
+  instantiate_kq_dsa_indexer_score_decode_pair_ql(tname, dtype, 7);    \
+  instantiate_kq_dsa_indexer_score_decode_pair_ql(tname, dtype, 8)
 
 instantiate_kq_dsa_indexer_score_decode_pair_all(float16_t, half);
 instantiate_kq_dsa_indexer_score_decode_pair_all(bfloat16_t, bfloat16_t);

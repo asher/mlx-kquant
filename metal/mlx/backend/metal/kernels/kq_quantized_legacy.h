@@ -35,12 +35,16 @@ METAL_FUNC void kq_q4_0_dequantize_impl(
   out[gid] = T(d * float(q4 - 8));
 }
 
+// kVM of 2 to 4 (kRows only) dots the activation rows kq_x1 to kq_x3
+// against the same weights, decoding each weight once; each row's sums are
+// the one-row form's.
 template <
     typename T,
     int group_size,
     int bits,
     int results_per_simdgroup = 4,
-    bool kRows = false>
+    bool kRows = false,
+    int kVM = 1>
 METAL_FUNC void kq_q4_0_qmv_fast_impl(
     const device uint8_t* w,
     const device T* x,
@@ -50,17 +54,29 @@ METAL_FUNC void kq_q4_0_qmv_fast_impl(
     uint3 tid,
     uint simd_gid,
     uint simd_lid,
-    thread float* kq_rows = nullptr) {
+    thread float* kq_rows = nullptr,
+    const device T* kq_x1 = nullptr,
+    const device T* kq_x2 = nullptr,
+    const device T* kq_x3 = nullptr) {
   static_assert(
       group_size == KQ_Q4_0_GROUP, "Q4_0 kernel requires group_size=32");
   static_assert(bits == 4, "Q4_0 kernel requires bits=4");
+  static_assert(
+      kVM == 1 || (kVM >= 2 && kVM <= 4 && kRows), "more rows need kRows");
 
   constexpr int num_simdgroups = 2;
   constexpr int block_stride = 16;
 
   typedef float U;
-  thread U yl[16];
-  thread U result[results_per_simdgroup] = {0};
+  thread U yl[kVM][16];
+  thread U result[kVM][results_per_simdgroup];
+#pragma unroll
+  for (int v = 0; v < kVM; v++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[v][row] = U(0);
+    }
+  }
 
   const int ix = simd_lid / 2;
   const int il = (simd_lid % 2) * 8;
@@ -76,18 +92,27 @@ METAL_FUNC void kq_q4_0_qmv_fast_impl(
 
   for (int ib = ix; ib < nb; ib += block_stride) {
     const int x_base = ib * KQ_Q4_0_GROUP + il;
-    U sumy = U(0);
+    U sumy[kVM];
 #pragma unroll
-    for (int i = 0; i < 8; i += 2) {
-      const U a0 = U(x[x_base + i + 0]);
-      const U a1 = U(x[x_base + i + 1]);
-      const U b0 = U(x[x_base + i + 16]);
-      const U b1 = U(x[x_base + i + 17]);
-      sumy += a0 + a1 + b0 + b1;
-      yl[i + 0] = a0;
-      yl[i + 1] = a1 * (U(1) / U(256));
-      yl[i + 8] = b0 * (U(1) / U(16));
-      yl[i + 9] = b1 * (U(1) / U(4096));
+    for (int v = 0; v < kVM; v++) {
+      const device T* xv =
+          (v == 0       ? x
+               : v == 1 ? kq_x1
+               : v == 2 ? kq_x2
+                        : kq_x3);
+      sumy[v] = U(0);
+#pragma unroll
+      for (int i = 0; i < 8; i += 2) {
+        const U a0 = U(xv[x_base + i + 0]);
+        const U a1 = U(xv[x_base + i + 1]);
+        const U b0 = U(xv[x_base + i + 16]);
+        const U b1 = U(xv[x_base + i + 17]);
+        sumy[v] += a0 + a1 + b0 + b1;
+        yl[v][i + 0] = a0;
+        yl[v][i + 1] = a1 * (U(1) / U(256));
+        yl[v][i + 8] = b0 * (U(1) / U(16));
+        yl[v][i + 9] = b1 * (U(1) / U(4096));
+      }
     }
 
     for (int row = 0; row < results_per_simdgroup; row++) {
@@ -99,25 +124,43 @@ METAL_FUNC void kq_q4_0_qmv_fast_impl(
           reinterpret_cast<const device uint16_t*>(kq_q4_0_qs_ptr(block_addr)) +
           il / 2;
 
-      U acc[4] = {U(0), U(0), U(0), U(0)};
+      U acc[kVM][4];
+#pragma unroll
+      for (int v = 0; v < kVM; v++) {
+        acc[v][0] = acc[v][1] = acc[v][2] = acc[v][3] = U(0);
+      }
 #pragma unroll
       for (int i = 0; i < 8; i += 2) {
         const uint16_t qi = qs[i / 2];
-        acc[0] += yl[i + 0] * U(qi & 0x000F);
-        acc[1] += yl[i + 1] * U(qi & 0x0F00);
-        acc[2] += yl[i + 8] * U(qi & 0x00F0);
-        acc[3] += yl[i + 9] * U(qi & 0xF000);
+        const U w0 = U(qi & 0x000F);
+        const U w1 = U(qi & 0x0F00);
+        const U w2 = U(qi & 0x00F0);
+        const U w3 = U(qi & 0xF000);
+#pragma unroll
+        for (int v = 0; v < kVM; v++) {
+          acc[v][0] += yl[v][i + 0] * w0;
+          acc[v][1] += yl[v][i + 1] * w1;
+          acc[v][2] += yl[v][i + 8] * w2;
+          acc[v][3] += yl[v][i + 9] * w3;
+        }
       }
-      result[row] += d * (acc[0] + acc[1] + acc[2] + acc[3] + sumy * U(-8));
+#pragma unroll
+      for (int v = 0; v < kVM; v++) {
+        result[v][row] += d *
+            (acc[v][0] + acc[v][1] + acc[v][2] + acc[v][3] + sumy[v] * U(-8));
+      }
     }
   }
 
   for (int row = 0; row < results_per_simdgroup; row++) {
-    result[row] = simd_sum(result[row]);
-    if constexpr (kRows) {
-      kq_rows[row] = result[row];
-    } else if (simd_lid == 0) {
-      y[out_row + row] = static_cast<T>(result[row]);
+#pragma unroll
+    for (int v = 0; v < kVM; v++) {
+      result[v][row] = simd_sum(result[v][row]);
+      if constexpr (kRows) {
+        kq_rows[v * results_per_simdgroup + row] = result[v][row];
+      } else if (simd_lid == 0) {
+        y[out_row + row] = static_cast<T>(result[v][row]);
+      }
     }
   }
 }
@@ -859,12 +902,16 @@ METAL_FUNC void kq_q4_1_dequantize_impl(
   out[gid] = T(d * float(q4) + m);
 }
 
+// kVM of 2 to 4 (kRows only) dots the activation rows kq_x1 to kq_x3
+// against the same weights, decoding each weight once; each row's sums are
+// the one-row form's.
 template <
     typename T,
     int group_size,
     int bits,
     int results_per_simdgroup = 4,
-    bool kRows = false>
+    bool kRows = false,
+    int kVM = 1>
 METAL_FUNC void kq_q4_1_qmv_fast_impl(
     const device uint8_t* w,
     const device T* x,
@@ -874,17 +921,29 @@ METAL_FUNC void kq_q4_1_qmv_fast_impl(
     uint3 tid,
     uint simd_gid,
     uint simd_lid,
-    thread float* kq_rows = nullptr) {
+    thread float* kq_rows = nullptr,
+    const device T* kq_x1 = nullptr,
+    const device T* kq_x2 = nullptr,
+    const device T* kq_x3 = nullptr) {
   static_assert(
       group_size == KQ_Q4_1_GROUP, "Q4_1 kernel requires group_size=32");
   static_assert(bits == 4, "Q4_1 kernel requires bits=4");
+  static_assert(
+      kVM == 1 || (kVM >= 2 && kVM <= 4 && kRows), "more rows need kRows");
 
   constexpr int num_simdgroups = 2;
   constexpr int block_stride = 16;
 
   typedef float U;
-  thread U yl[16];
-  thread U result[results_per_simdgroup] = {0};
+  thread U yl[kVM][16];
+  thread U result[kVM][results_per_simdgroup];
+#pragma unroll
+  for (int v = 0; v < kVM; v++) {
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[v][row] = U(0);
+    }
+  }
 
   const int ix = simd_lid / 2;
   const int il = (simd_lid % 2) * 8;
@@ -900,18 +959,27 @@ METAL_FUNC void kq_q4_1_qmv_fast_impl(
 
   for (int ib = ix; ib < nb; ib += block_stride) {
     const int x_base = ib * KQ_Q4_1_GROUP + il;
-    U sumy = U(0);
+    U sumy[kVM];
 #pragma unroll
-    for (int i = 0; i < 8; i += 2) {
-      const U a0 = U(x[x_base + i + 0]);
-      const U a1 = U(x[x_base + i + 1]);
-      const U b0 = U(x[x_base + i + 16]);
-      const U b1 = U(x[x_base + i + 17]);
-      sumy += a0 + a1 + b0 + b1;
-      yl[i + 0] = a0;
-      yl[i + 1] = a1 * (U(1) / U(256));
-      yl[i + 8] = b0 * (U(1) / U(16));
-      yl[i + 9] = b1 * (U(1) / U(4096));
+    for (int v = 0; v < kVM; v++) {
+      const device T* xv =
+          (v == 0       ? x
+               : v == 1 ? kq_x1
+               : v == 2 ? kq_x2
+                        : kq_x3);
+      sumy[v] = U(0);
+#pragma unroll
+      for (int i = 0; i < 8; i += 2) {
+        const U a0 = U(xv[x_base + i + 0]);
+        const U a1 = U(xv[x_base + i + 1]);
+        const U b0 = U(xv[x_base + i + 16]);
+        const U b1 = U(xv[x_base + i + 17]);
+        sumy[v] += a0 + a1 + b0 + b1;
+        yl[v][i + 0] = a0;
+        yl[v][i + 1] = a1 * (U(1) / U(256));
+        yl[v][i + 8] = b0 * (U(1) / U(16));
+        yl[v][i + 9] = b1 * (U(1) / U(4096));
+      }
     }
 
     for (int row = 0; row < results_per_simdgroup; row++) {
@@ -924,25 +992,43 @@ METAL_FUNC void kq_q4_1_qmv_fast_impl(
           reinterpret_cast<const device uint16_t*>(kq_q4_1_qs_ptr(block_addr)) +
           il / 2;
 
-      U acc[4] = {U(0), U(0), U(0), U(0)};
+      U acc[kVM][4];
+#pragma unroll
+      for (int v = 0; v < kVM; v++) {
+        acc[v][0] = acc[v][1] = acc[v][2] = acc[v][3] = U(0);
+      }
 #pragma unroll
       for (int i = 0; i < 8; i += 2) {
         const uint16_t qi = qs[i / 2];
-        acc[0] += yl[i + 0] * U(qi & 0x000F);
-        acc[1] += yl[i + 1] * U(qi & 0x0F00);
-        acc[2] += yl[i + 8] * U(qi & 0x00F0);
-        acc[3] += yl[i + 9] * U(qi & 0xF000);
+        const U w0 = U(qi & 0x000F);
+        const U w1 = U(qi & 0x0F00);
+        const U w2 = U(qi & 0x00F0);
+        const U w3 = U(qi & 0xF000);
+#pragma unroll
+        for (int v = 0; v < kVM; v++) {
+          acc[v][0] += yl[v][i + 0] * w0;
+          acc[v][1] += yl[v][i + 1] * w1;
+          acc[v][2] += yl[v][i + 8] * w2;
+          acc[v][3] += yl[v][i + 9] * w3;
+        }
       }
-      result[row] += d * (acc[0] + acc[1] + acc[2] + acc[3]) + sumy * m;
+#pragma unroll
+      for (int v = 0; v < kVM; v++) {
+        result[v][row] +=
+            d * (acc[v][0] + acc[v][1] + acc[v][2] + acc[v][3]) + sumy[v] * m;
+      }
     }
   }
 
   for (int row = 0; row < results_per_simdgroup; row++) {
-    result[row] = simd_sum(result[row]);
-    if constexpr (kRows) {
-      kq_rows[row] = result[row];
-    } else if (simd_lid == 0) {
-      y[out_row + row] = static_cast<T>(result[row]);
+#pragma unroll
+    for (int v = 0; v < kVM; v++) {
+      result[v][row] = simd_sum(result[v][row]);
+      if constexpr (kRows) {
+        kq_rows[v * results_per_simdgroup + row] = result[v][row];
+      } else if (simd_lid == 0) {
+        y[out_row + row] = static_cast<T>(result[v][row]);
+      }
     }
   }
 }
@@ -1698,8 +1784,9 @@ METAL_FUNC void kq_q5_0_dequantize_impl(
   out[gid] = T(d * float(q5 - 16));
 }
 
-// kVM == 2 (kRows only) dots a second activation row kq_x1 against the same
-// weights, decoding each weight once; each row's sums are the one-row form's.
+// kVM of 2 to 4 (kRows only) dots the activation rows kq_x1 to kq_x3
+// against the same weights, decoding each weight once; each row's sums are
+// the one-row form's.
 template <
     typename T,
     int group_size,
@@ -1717,11 +1804,14 @@ METAL_FUNC void kq_q5_0_qmv_fast_impl(
     uint simd_gid,
     uint simd_lid,
     thread float* kq_rows = nullptr,
-    const device T* kq_x1 = nullptr) {
+    const device T* kq_x1 = nullptr,
+    const device T* kq_x2 = nullptr,
+    const device T* kq_x3 = nullptr) {
   static_assert(
       group_size == KQ_Q5_0_GROUP, "Q5_0 kernel requires group_size=32");
   static_assert(bits == 5, "Q5_0 kernel requires bits=5");
-  static_assert(kVM == 1 || (kVM == 2 && kRows), "two rows need kRows");
+  static_assert(
+      kVM == 1 || (kVM >= 2 && kVM <= 4 && kRows), "more rows need kRows");
 
   constexpr int num_simdgroups = 2;
   constexpr int block_stride = 16;
@@ -1754,7 +1844,11 @@ METAL_FUNC void kq_q5_0_qmv_fast_impl(
     U sumy[kVM];
 #pragma unroll
     for (int v = 0; v < kVM; v++) {
-      const device T* xv = v == 0 ? x : kq_x1;
+      const device T* xv =
+          (v == 0       ? x
+               : v == 1 ? kq_x1
+               : v == 2 ? kq_x2
+                        : kq_x3);
       sumy[v] = U(0);
 #pragma unroll
       for (int i = 0; i < 8; i += 2) {
@@ -2594,8 +2688,9 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
 // multiple of 2. Therefore the lane can use ushort loads. It cannot use uint
 // loads, because an 18-byte block makes every second block address odd for a
 // 4-byte type.
-// kVM == 2 (kRows only) dots a second activation row kq_x1 against the same
-// weights, decoding each weight once; each row's sums are the one-row form's.
+// kVM of 2 to 4 (kRows only) dots the activation rows kq_x1 to kq_x3
+// against the same weights, decoding each weight once; each row's sums are
+// the one-row form's.
 template <
     typename T,
     int group_size,
@@ -2613,10 +2708,13 @@ METAL_FUNC void kq_iq4_nl_qmv_impl(
     uint simd_gid,
     uint simd_lid,
     thread float* kq_rows = nullptr,
-    const device T* kq_x1 = nullptr) {
+    const device T* kq_x1 = nullptr,
+    const device T* kq_x2 = nullptr,
+    const device T* kq_x3 = nullptr) {
   static_assert(group_size == KQ_IQ4_NL_GROUP, "IQ4_NL requires gs=32");
   static_assert(bits == 4, "IQ4_NL requires bits=4");
-  static_assert(kVM == 1 || (kVM == 2 && kRows), "two rows need kRows");
+  static_assert(
+      kVM == 1 || (kVM >= 2 && kVM <= 4 && kRows), "more rows need kRows");
   constexpr int num_simdgroups = 2;
   constexpr int lanes_per_block = 4; // four lanes cover one 32-weight block
   constexpr int blocks_per_step = 32 / lanes_per_block; // eight blocks a step
@@ -2657,7 +2755,11 @@ METAL_FUNC void kq_iq4_nl_qmv_impl(
     U xt[kVM][2 * bytes_per_lane];
 #pragma unroll
     for (int v = 0; v < kVM; v++) {
-      const device T* xb = (v == 0 ? x : kq_x1) + ib * KQ_IQ4_NL_GROUP + byte0;
+      const device T* xb = (v == 0       ? x
+                                : v == 1 ? kq_x1
+                                : v == 2 ? kq_x2
+                                         : kq_x3) +
+          ib * KQ_IQ4_NL_GROUP + byte0;
 #pragma unroll
       for (int k = 0; k < bytes_per_lane; k++) {
         xt[v][k] = U(xb[k]);

@@ -836,6 +836,313 @@ template <typename T, int D, int C = 32, int NE = 4, int QPS = 1>
   }
 }
 
+#include "mlx/backend/metal/kernels/kq_sdpa_rows_meta.h"
+
+// Pass 1 of sdpa_paged_rows. Grid (n_kv_heads, B * q_len, gqa_splits), one
+// threadgroup of (32, gqa_factor, 1) per (kv head, query, split): the
+// query's page list is cut into gqa_splits runs, and each threadgroup walks
+// its run in staged tiles of C key rows (C / PR pages of PR rows) shared by
+// the GQA group, as kq_sdpa_gqa_2pass_1 does. Queries share no tile, so the
+// work per query is a decode step's and the grid grows with the query
+// count. A negative page is skipped; query l attends keys below ends[l].
+// With tail_page each list has one more page, ends[l] / PR: the partial
+// page the query's end falls in, so the caller appends nothing. A page is
+// counted once however often it is listed, as in the shared-tile forms: a
+// page listed before is skipped, and the tail page is the list's last
+// entry for this, the same call as listing it. The first tile of each split
+// searches each of its pages, the tail page too when it lands there. Past
+// that tile a page in the list's ascending prefix needs no search, and the
+// tail page after a list that is ascending to its end takes a binary search.
+// Partials are [B, Hq, q_len, gqa_splits, D] float32, merged by
+// kq_sdpa_gqa_2pass_2.
+template <typename T, int D, int C, int PR, int NE = 4>
+[[kernel]] void kq_sdpa_paged_rows_1(
+    const device T* queries [[buffer(0)]],
+    const device T* keys [[buffer(1)]],
+    const device T* values [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    device float* sums [[buffer(4)]],
+    device float* maxs [[buffer(5)]],
+    const device int* pages [[buffer(6)]],
+    const device int* ends [[buffer(7)]],
+    const device T* keys_tail [[buffer(8)]],
+    const device T* values_tail [[buffer(9)]],
+    const constant KQPagedRowsMeta& pm [[buffer(10)]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint3 tidtg [[thread_position_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]]) {
+  constexpr int D4 = D / 4;
+  constexpr int NL = 32 / NE; // lanes per in-flight key
+  constexpr int DP4 = D4 / NL; // float4s per lane per key row
+  constexpr int PPT = C / PR; // pages per staged tile
+  using T4 = metal::vec<T, 4>;
+
+  threadgroup T4 sK[C * D4];
+  threadgroup T4 sV[C * D4];
+  // Per page slot of a tile, in two buffers by tile parity: the tile index
+  // when the slot's page was listed before (the slot is skipped). And the
+  // first list position past the list's ascending prefix.
+  threadgroup atomic_int sdup[2 * PPT];
+  threadgroup atomic_int sfd[1];
+
+  const int kv_head_idx = tid.x;
+  const int nq = pm.q_len;
+  const int batch_idx = tid.y / nq;
+  const int query_idx = tid.y % nq;
+  const int split_idx = tid.z;
+  const int gqa_factor = tptg.y;
+  const int lane = tidtg.x;
+  const int tx = lane % NL;
+  const int ty = lane / NL;
+  const int num_kv_heads = tpg.x;
+  const int num_q_heads = num_kv_heads * gqa_factor;
+  const int q_head_idx = gqa_factor * kv_head_idx + tidtg.y;
+  const size_t qrow =
+      (size_t)(batch_idx * num_q_heads + q_head_idx) * nq + query_idx;
+  const int N = pm.N;
+  const int n_pages = pm.n_pages;
+  const int base_len = pm.base_len;
+
+  const device T* kbase =
+      keys + batch_idx * pm.k_batch + (size_t)kv_head_idx * pm.k_head;
+  const device T* vbase =
+      values + batch_idx * pm.v_batch + (size_t)kv_head_idx * pm.v_head;
+  const device T* ktail =
+      keys_tail + batch_idx * pm.kt_batch + (size_t)kv_head_idx * pm.kt_head;
+  const device T* vtail =
+      values_tail + batch_idx * pm.vt_batch + (size_t)kv_head_idx * pm.vt_head;
+  const device int* prow = pages +
+      ((size_t)(batch_idx * pm.page_heads +
+                (pm.page_heads > 1 ? kv_head_idx : 0)) *
+           nq +
+       query_idx) *
+          n_pages;
+
+  // Pre-scaled query slices for this lane's key-row columns.
+  const device T4* q4 = (const device T4*)(queries + qrow * D);
+  float4 qf[DP4];
+  for (short ii = 0; ii < DP4; ii++) {
+    qf[ii] = pm.scale * float4(q4[ii * NL + tx]);
+  }
+  // Highest key the query may attend.
+  const int end = ends[batch_idx * nq + query_idx];
+  const int lim = min(end, N) - 1;
+  const int n_all = n_pages + pm.tail_page;
+  const int tail_pg = end / PR;
+  // Pages at or past NP hold no key below N (and their first row would
+  // not fit an int).
+  const int NP = (N + PR - 1) / PR;
+
+  float max_score = Limits<float>::finite_min;
+  float sum_exp_score = 0;
+  float4 lo[DP4];
+  for (short ii = 0; ii < DP4; ii++) {
+    lo[ii] = 0;
+  }
+
+  const int flat = tidtg.y * 32 + lane;
+  const int n_threads = 32 * gqa_factor;
+
+  // This threadgroup's run of the query's page list, in whole tiles.
+  const int n_tiles = (n_all + PPT - 1) / PPT;
+  const int tchunk = (n_tiles + gqa_splits - 1) / gqa_splits;
+  const int t0 = split_idx * tchunk;
+  const int t1 = min(t0 + tchunk, n_tiles);
+
+  // A page listed before in the list (or, for the tail page, anywhere in
+  // it) is skipped. The split's first tile searches all its pages. Past it
+  // a listed page is searched for only past the list's ascending prefix
+  // [0, fd): strictly ascending pages, then a run of negative entries that
+  // may end the list (a page after a negative entry ends it). The tail
+  // page after a list that is ascending to its end takes a binary search.
+  // The searches run over the whole threadgroup, a tile ahead, between the
+  // barriers the tile loop already has.
+  const int p_end = min(t1 * PPT, n_pages);
+  auto raw_page = [&](int pi) {
+    const int pg = pi < n_pages ? prow[pi] : pi < n_all ? tail_pg : -1;
+    // Pages at or past NP hold no key below N.
+    return pg < NP ? pg : -1;
+  };
+  auto mark = [&](int t, bool prefix) {
+    threadgroup atomic_int* st = sdup + (t & 1) * PPT;
+    for (short sl = 0; sl < PPT; sl++) {
+      const int pi = t * PPT + sl;
+      const int pg = raw_page(pi);
+      const int fd =
+          prefix ? atomic_load_explicit(&sfd[0], memory_order_relaxed) : 0;
+      if (pg < 0 || pi < fd) {
+        continue;
+      }
+      if (prefix && pi >= n_pages && fd >= n_pages) {
+        if (flat == 0) {
+          int lo = 0;
+          int hi = n_pages;
+          while (lo < hi) {
+            const int m = (lo + hi) / 2;
+            const int v = prow[m];
+            if (v >= 0 && v < pg) {
+              lo = m + 1;
+            } else {
+              hi = m;
+            }
+          }
+          if (lo < n_pages && prow[lo] == pg) {
+            atomic_store_explicit(&st[sl], t, memory_order_relaxed);
+          }
+        }
+        continue;
+      }
+      const int nj = min(pi, n_pages);
+      for (int j = flat; j < nj; j += n_threads) {
+        if (prow[j] == pg) {
+          atomic_store_explicit(&st[sl], t, memory_order_relaxed);
+          break;
+        }
+      }
+    }
+  };
+  auto page_at = [&](int t, int sl) {
+    const int pg = raw_page(t * PPT + sl);
+    return atomic_load_explicit(
+               &sdup[(t & 1) * PPT + sl], memory_order_relaxed) == t
+        ? -1
+        : pg;
+  };
+  if (t0 < t1) {
+    if (flat < 2 * PPT) {
+      atomic_store_explicit(&sdup[flat], -1, memory_order_relaxed);
+    }
+    if (flat == 0) {
+      atomic_store_explicit(&sfd[0], p_end, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int first = p_end;
+    for (int i = 1 + flat; i < p_end; i += n_threads) {
+      const int v = prow[i];
+      if (v >= 0 && (prow[i - 1] < 0 || v <= prow[i - 1])) {
+        first = i;
+        break;
+      }
+    }
+    first = simd_min(first);
+    if (lane == 0 && first < p_end) {
+      atomic_fetch_min_explicit(&sfd[0], first, memory_order_relaxed);
+    }
+    mark(t0, false);
+  }
+
+  for (int t = t0; t < t1; t++) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int spg[PPT];
+    for (short sl = 0; sl < PPT; sl++) {
+      spg[sl] = page_at(t, sl);
+    }
+    // Cooperative tile load. A row of a skipped page, or one past the
+    // query's end, zero-fills: stale threadgroup data never reaches the
+    // accumulators, and a spare row of the buffers is never read, so where
+    // the base ends changes no bit.
+    for (int i = flat; i < C * D4; i += n_threads) {
+      const int row = i / D4;
+      const int col = i % D4;
+      const int pg = spg[row / PR];
+      const int kg = pg * PR + row % PR;
+      if (pg >= 0 && kg <= lim) {
+        if (kg < base_len) {
+          sK[i] = ((const device T4*)(kbase + (size_t)kg * pm.k_seq))[col];
+          sV[i] = ((const device T4*)(vbase + (size_t)kg * pm.v_seq))[col];
+        } else {
+          const size_t tr = (size_t)(kg - base_len);
+          sK[i] = ((const device T4*)(ktail + tr * pm.kt_seq))[col];
+          sV[i] = ((const device T4*)(vtail + tr * pm.vt_seq))[col];
+        }
+      } else {
+        sK[i] = T4(T(0));
+        sV[i] = T4(T(0));
+      }
+    }
+    if (t + 1 < t1) {
+      mark(t + 1, true);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Scores: NE keys in flight, NL lanes per key, then reduce + broadcast.
+    float mqk[C / NE];
+    float m_tile = Limits<float>::finite_min;
+    for (short cc = 0; cc < C / NE; cc++) {
+      float s = 0;
+      for (short ii = 0; ii < DP4; ii++) {
+        const float4 kk = float4(sK[(cc * NE + ty) * D4 + ii * NL + tx]);
+        s += dot(kk, qf[ii]);
+      }
+      for (short off = NL / 2; off > 0; off >>= 1) {
+        s += simd_shuffle_down(s, off);
+      }
+      s = simd_shuffle(s, NL * ty);
+      const int kr = cc * NE + ty;
+      const int pg = spg[kr / PR];
+      const int kg = pg * PR + kr % PR;
+      const bool valid = pg >= 0 && kg <= lim;
+      mqk[cc] = valid ? s : Limits<float>::finite_min;
+      m_tile = max(m_tile, mqk[cc]);
+    }
+
+    // Online softmax; each lane sums its ty-group's keys, so the simd_sum
+    // counts every key NL times. A tile with no valid key is skipped: with
+    // the running max still finite_min, exp(finite_min - finite_min) == 1
+    // would poison the sum.
+    float vs[C / NE];
+    m_tile = simd_max(m_tile);
+    if (m_tile > Limits<float>::finite_min) {
+      const float new_max = max(max_score, m_tile);
+      const float factor = fast::exp(max_score - new_max);
+      float vsum = 0;
+      for (short cc = 0; cc < C / NE; cc++) {
+        vs[cc] = fast::exp(mqk[cc] - new_max);
+        vsum += vs[cc];
+      }
+      sum_exp_score = sum_exp_score * factor + simd_sum(vsum) * (1.0f / NL);
+      max_score = new_max;
+      for (short ii = 0; ii < DP4; ii++) {
+        lo[ii] *= factor;
+      }
+    } else {
+      for (short cc = 0; cc < C / NE; cc++) {
+        vs[cc] = 0;
+      }
+    }
+
+    for (short cc = 0; cc < C / NE; cc++) {
+      for (short ii = 0; ii < DP4; ii++) {
+        const float4 vv = float4(sV[(cc * NE + ty) * D4 + ii * NL + tx]);
+        lo[ii] += vv * vs[cc];
+      }
+    }
+  }
+
+  // Cross-ty reduction of the deferred output accumulators; the ty == 0 lane
+  // group holds the run totals.
+  for (short ii = 0; ii < DP4; ii++) {
+    for (short off = (NE / 2) * NL; off >= NL; off >>= 1) {
+      lo[ii][0] += simd_shuffle_down(lo[ii][0], off);
+      lo[ii][1] += simd_shuffle_down(lo[ii][1], off);
+      lo[ii][2] += simd_shuffle_down(lo[ii][2], off);
+      lo[ii][3] += simd_shuffle_down(lo[ii][3], off);
+    }
+  }
+  const size_t po = qrow * gqa_splits + split_idx;
+  if (ty == 0) {
+    device float4* out4 = (device float4*)(out + po * D);
+    for (short ii = 0; ii < DP4; ii++) {
+      out4[ii * NL + tx] = lo[ii];
+    }
+  }
+  if (lane == 0) {
+    sums[po] = sum_exp_score;
+    maxs[po] = max_score;
+  }
+}
+
 // Row-wise reduce/broadcast ops for the steel MMATile helpers below.
 struct KQMaxOp {
   template <typename U>
@@ -1931,7 +2238,14 @@ template <typename T, int D, int BQ>
 // page list is walked by one threadgroup, the online softmax normalizes in
 // registers and the output stores in T dtype in the folded layout. Every
 // real row attends at least its own token, so the row sum is never zero.
-template <typename T, int D, int QT = 4, int GQA = 12>
+//
+// SPLIT: grid z is a split of every window's page list (contiguous runs of
+// whole tiles, tpg.z splits, B == 1). Each threadgroup stores its rows'
+// unnormalized float partials, sum and natural-log max at
+// row * splits + split of the folded rows for kq_sdpa_gqa_2pass_2, which
+// writes the folded output. More threadgroups when a chunk has few windows
+// over a long key list.
+template <typename T, int D, int QT = 4, int GQA = 12, bool SPLIT = false>
 [[kernel]] void kq_sdpa_bs_prefill(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
@@ -1948,6 +2262,9 @@ template <typename T, int D, int QT = 4, int GQA = 12>
     const device int* pages [[buffer(12)]],
     const device ushort* pmask [[buffer(13)]],
     const device int* counts [[buffer(14)]],
+    device float* partials [[buffer(15)]],
+    device float* psums [[buffer(16)]],
+    device float* pmaxs [[buffer(17)]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -1970,7 +2287,7 @@ template <typename T, int D, int QT = 4, int GQA = 12>
 
   const int kv_head_idx = tid.x;
   const int qt = tid.y;
-  const int batch_idx = tid.z;
+  const int batch_idx = SPLIT ? 0 : int(tid.z);
   const int num_kv_heads = tpg.x;
   const int n_qt = tpg.y;
   const size_t kv_hb = (size_t)(batch_idx * num_kv_heads + kv_head_idx);
@@ -1981,6 +2298,17 @@ template <typename T, int D, int QT = 4, int GQA = 12>
   const device int* prow = pages + (size_t)qt * max_pages;
   const device ushort* pmrow = pmask + (size_t)qt * max_pages;
   const int cnt = counts[qt];
+  int t_lo = 0;
+  int t_hi = cnt;
+  if (SPLIT) {
+    // Whole tiles, so every split but the last ends on a tile edge and the
+    // page reads below keep their pi < cnt guard.
+    const int n_tiles = (cnt + PPT - 1) / PPT;
+    const int splits = int(tpg.z);
+    const int s = int(tid.z);
+    t_lo = (n_tiles * s / splits) * PPT;
+    t_hi = min(cnt, (n_tiles * (s + 1) / splits) * PPT);
+  }
 
   const short2 sc = MMAFrag_t::get_coord(simd_lid);
   const short sm = sc.y;
@@ -2008,7 +2336,7 @@ template <typename T, int D, int QT = 4, int GQA = 12>
   float max_score = Limits<float>::finite_min;
   float sum_score = 0;
 
-  for (int t0 = 0; t0 < cnt; t0 += PPT) {
+  for (int t0 = t_lo; t0 < t_hi; t0 += PPT) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Resolve this tile's staged row sources and membership masks.
     if (flat_tid < BK) {
@@ -2102,6 +2430,25 @@ template <typename T, int D, int QT = 4, int GQA = 12>
     }
   }
 
+  if (SPLIT) {
+    const size_t po = (((size_t)kv_hb * n_qt + qt) * BQ + row) * tpg.z + tid.z;
+    device float* prow_out = partials + po * D + sn;
+    STEEL_PRAGMA_UNROLL
+    for (short id = 0; id < TD; id++) {
+      STEEL_PRAGMA_UNROLL
+      for (short jj = 0; jj < MMAFrag_t::kElemCols; jj++) {
+        prow_out[id * kFragSize + jj] = Otile.frag_at(0, id)[jj];
+      }
+    }
+    if (sn == 0) {
+      psums[po] = sum_score;
+      pmaxs[po] = max_score == Limits<float>::finite_min
+          ? Limits<float>::finite_min
+          : max_score * M_LN2_F;
+    }
+    return;
+  }
+
   // Normalize in registers and store in the folded layout.
   const float inv = sum_score > 0 ? 1.0f / sum_score : 0.0f;
   device T* orow = out + (((size_t)kv_hb * n_qt + qt) * BQ + row) * D + sn;
@@ -2110,6 +2457,333 @@ template <typename T, int D, int QT = 4, int GQA = 12>
     STEEL_PRAGMA_UNROLL
     for (short jj = 0; jj < MMAFrag_t::kElemCols; jj++) {
       orow[id * kFragSize + jj] = T(Otile.frag_at(0, id)[jj] * inv);
+    }
+  }
+}
+
+// Shared-tile pass 1 of sdpa_paged_rows: a window of pm.win queries walks
+// the union of its page lists once, so a K/V tile any of them selected is
+// staged once for all of them. Grid (n_kv_heads, B * windows, gqa_splits),
+// one threadgroup of 8-row MMA strips over the window's gqa * win rows
+// (head-major, query fastest). Split z owns every gqa_splits-th run of BK /
+// PR pages of the key axis. KQ_PR_UNION_MAX of its pages at a time, it
+// marks in threadgroup memory which queries listed each page (tail_page
+// adds each query's page ends / PR), compacts the
+// marked pages, and walks them BK rows a tile through S = Q K^T and
+// O += P V on simdgroup matrices. A key counts for a row when its page is
+// marked for the row's query and it lies below the query's end. Partials
+// [B, Hq, q_len, gqa_splits, D] merge through kq_sdpa_gqa_2pass_2, as the
+// per-query form's do.
+// Stages BK key rows of the shared-tile paged rows kernel: staged row r
+// reads key row srow[r] from the base (below base_len) or the tail, and a
+// negative srow[r] zero-fills. The load is unconditional, from a clamped row,
+// so a thread's loads batch.
+template <typename T, int D, int BK, int LDS>
+METAL_FUNC void kq_pr_stage_rows(
+    threadgroup metal::vec<T, 4>* dst4,
+    const device T* base,
+    ulong base_seq,
+    const device T* tail,
+    ulong tail_seq,
+    int base_len,
+    const threadgroup int* srow,
+    int flat,
+    int NT) {
+  using T4 = metal::vec<T, 4>;
+  constexpr int D4 = D / 4;
+  constexpr int LDS4 = LDS / 4;
+#pragma unroll(4)
+  for (int i = flat; i < BK * D4; i += NT) {
+    const int r = i / D4;
+    const int c = i - r * D4;
+    const int kg = srow[r];
+    const int kc = metal::max(kg, 0);
+    const device T* src = kc < base_len
+        ? base + (size_t)kc * base_seq
+        : tail + (size_t)(kc - base_len) * tail_seq;
+    const T4 x = ((const device T4*)src)[c];
+    dst4[r * LDS4 + c] = kg >= 0 ? x : T4(T(0));
+  }
+}
+
+template <typename T, int D, int PR>
+[[kernel]] void kq_sdpa_paged_rows_u(
+    const device T* queries [[buffer(0)]],
+    const device T* keys [[buffer(1)]],
+    const device T* values [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    device float* sums [[buffer(4)]],
+    device float* maxs [[buffer(5)]],
+    const device int* pages [[buffer(6)]],
+    const device int* ends [[buffer(7)]],
+    const device T* keys_tail [[buffer(8)]],
+    const device T* values_tail [[buffer(9)]],
+    const constant KQPagedRowsMeta& pm [[buffer(10)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]]) {
+  constexpr int BK = 32;
+  constexpr int PPT = BK / PR; // pages staged per tile
+  constexpr short kFragSize = 8;
+  constexpr short TK = BK / kFragSize;
+  constexpr short TD = D / kFragSize;
+  constexpr short kPad = 16 / sizeof(T);
+  constexpr short LDS = D + kPad;
+  using T4 = metal::vec<T, 4>;
+  using MMAFrag_t = mlx::steel::BaseMMAFrag<float, kFragSize, kFragSize>;
+
+  threadgroup T KV_smem[BK * LDS];
+  threadgroup atomic_uint marks[KQ_PR_UNION_MAX];
+  threadgroup int ulist[KQ_PR_UNION_MAX];
+  threadgroup uint umask[KQ_PR_UNION_MAX];
+  threadgroup int srow[BK];
+  threadgroup uint spm[PPT];
+  threadgroup int ucount[1];
+
+  const int nq = pm.q_len;
+  const int W = pm.win;
+  const int G = pm.gqa;
+  const int n_win = (nq + W - 1) / W;
+  const int kv_head_idx = tid.x;
+  const int batch_idx = tid.y / n_win;
+  const int l0 = (tid.y % n_win) * W;
+  const int wl = min(W, nq - l0); // queries in this window
+  const int split_idx = tid.z;
+  const int num_kv_heads = tpg.x;
+  const int num_q_heads = num_kv_heads * G;
+  const int N = pm.N;
+  const int n_pages = pm.n_pages;
+  const int n_all = n_pages + pm.tail_page;
+  const int base_len = pm.base_len;
+  const int flat = int(simd_gid) * 32 + int(simd_lid);
+  const int NT = int(tptg.x * tptg.y);
+
+  // This split's pages: every gqa_splits-th run of PPT pages (a tile's
+  // worth), so a split's share of a clustered selection stays even. Slot
+  // i of the split is page (i / PPT) * PPT * gqa_splits + split * PPT +
+  // i % PPT. The split walks its slots KQ_PR_UNION_MAX at a time in key
+  // order, so its tiles, and the order it adds them in, are the same for
+  // any key capacity: where the base ends and how many spare rows the tails
+  // hold change no bit.
+  const int NP = (N + PR - 1) / PR;
+  const int n_gran = (NP + PPT - 1) / PPT;
+  const int nr = ((n_gran + gqa_splits - 1) / gqa_splits) * PPT;
+  const int stride = PPT * gqa_splits;
+
+  const device int* plist = pages +
+      ((size_t)(batch_idx * pm.page_heads +
+                (pm.page_heads > 1 ? kv_head_idx : 0)) *
+       nq) *
+          n_pages;
+  const device int* wends = ends + batch_idx * nq;
+  // Rows at or past the window's last end belong to no query of it: they
+  // zero-fill, so a spare row of the buffers is never read.
+  int wend = 0;
+  for (int j = 0; j < wl; j++) {
+    wend = max(wend, wends[l0 + j]);
+  }
+  const int row_end = min(wend, N);
+
+  // This thread's fragment row: head g of the group, window query lq.
+  const short2 sc = MMAFrag_t::get_coord(simd_lid);
+  const short sm = sc.y;
+  const short sn = sc.x;
+  const int row = int(simd_gid) * kFragSize + sm;
+  const int n_rows = G * wl;
+  const bool live = row < n_rows;
+  // Strips past the rows only stage tiles.
+  const bool strip_live = int(simd_gid) * kFragSize < n_rows;
+  const int rr = live ? row : 0;
+  const int g = rr / wl;
+  const int lq = rr - g * wl;
+  const int l = l0 + lq;
+  const uint qbit = 1u << lq;
+  const int lim = min(wends[l], N) - 1;
+  const int qh = kv_head_idx * G + g;
+  const size_t qrow_idx = (size_t)(batch_idx * num_q_heads + qh) * nq + l;
+
+  mlx::steel::MMATile<float, 1, TD, MMAFrag_t> Qtile;
+  Qtile.template load_safe<T, 1, 1>(
+      queries + qrow_idx * D + sn, D, short2(D - sn, live ? 1 : 0));
+
+  mlx::steel::MMATile<float, 1, TK, MMAFrag_t> Stile;
+  mlx::steel::MMATile<float, 1, TK, MMAFrag_t> Ktile;
+  mlx::steel::MMATile<float, 1, 1, MMAFrag_t> Vtile;
+  mlx::steel::MMATile<float, 1, TD, MMAFrag_t> Otile;
+  Otile.clear();
+
+  const device T* kbase =
+      keys + batch_idx * pm.k_batch + (size_t)kv_head_idx * pm.k_head;
+  const device T* vbase =
+      values + batch_idx * pm.v_batch + (size_t)kv_head_idx * pm.v_head;
+  const device T* ktail =
+      keys_tail + batch_idx * pm.kt_batch + (size_t)kv_head_idx * pm.kt_head;
+  const device T* vtail =
+      values_tail + batch_idx * pm.vt_batch + (size_t)kv_head_idx * pm.vt_head;
+
+  const float scale2 = pm.scale * M_LOG2E_F;
+  float max_score = Limits<float>::finite_min;
+  float sum_score = 0;
+  threadgroup T4* kv4 = (threadgroup T4*)KV_smem;
+
+  for (int r0 = 0; r0 < nr; r0 += KQ_PR_UNION_MAX) {
+    const int rn = min(nr - r0, KQ_PR_UNION_MAX);
+    // Mark, per page of the round, which of the window's queries listed it.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = flat; i < rn; i += NT) {
+      atomic_store_explicit(&marks[i], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = flat; i < wl * n_all; i += NT) {
+      const int mq = i / n_all;
+      const int pi = i - mq * n_all;
+      const int ml = l0 + mq;
+      const int pg =
+          pi < n_pages ? plist[(size_t)ml * n_pages + pi] : wends[ml] / PR;
+      if (pg >= 0 && pg < NP && (pg / PPT) % gqa_splits == split_idx) {
+        const int slot = (pg / stride) * PPT + pg % PPT - r0;
+        if (slot >= 0 && slot < rn) {
+          atomic_fetch_or_explicit(
+              &marks[slot], 1u << mq, memory_order_relaxed);
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Compact the marked pages, in key order.
+    if (simd_gid == 0) {
+      int base = 0;
+      for (int j0 = 0; j0 < rn; j0 += 32) {
+        const int i = j0 + int(simd_lid);
+        const uint m =
+            i < rn ? atomic_load_explicit(&marks[i], memory_order_relaxed) : 0u;
+        const int hit = m != 0u ? 1 : 0;
+        const int at = base + simd_prefix_exclusive_sum(hit);
+        if (hit) {
+          const int si = r0 + i;
+          ulist[at] = (si / PPT) * stride + split_idx * PPT + si % PPT;
+          umask[at] = m;
+        }
+        base += simd_sum(hit);
+      }
+      if (simd_lid == 0) {
+        ucount[0] = base;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int cnt = ucount[0];
+
+    for (int t0 = 0; t0 < cnt; t0 += PPT) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (flat < BK) {
+        const int pi = t0 + flat / PR;
+        const int pg = pi < cnt ? ulist[pi] : -1;
+        const int kg = pg * PR + flat % PR;
+        srow[flat] = (pg >= 0 && kg < row_end) ? kg : -1;
+        if (flat % PR == 0) {
+          spm[flat / PR] = pi < cnt ? umask[pi] : 0u;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      kq_pr_stage_rows<T, D, BK, LDS>(
+          kv4, kbase, pm.k_seq, ktail, pm.kt_seq, base_len, srow, flat, NT);
+      Stile.clear();
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      if (strip_live) {
+        STEEL_PRAGMA_UNROLL
+        for (short dd = 0; dd < TD; dd++) {
+          simdgroup_barrier(mem_flags::mem_none);
+          Ktile.template load<T, 1, 1, 1, LDS>(
+              &KV_smem[sn * LDS + dd * kFragSize + sm]);
+          simdgroup_barrier(mem_flags::mem_none);
+          STEEL_PRAGMA_UNROLL
+          for (short ik = 0; ik < TK; ik++) {
+            MMAFrag_t::mma(
+                Stile.frag_at(0, ik),
+                Qtile.frag_at(0, dd),
+                Ktile.frag_at(0, ik),
+                Stile.frag_at(0, ik));
+          }
+        }
+      }
+
+      STEEL_PRAGMA_UNROLL
+      for (short ii = 0; ii < decltype(Stile)::kElemsPerTile; ii++) {
+        Stile.elems()[ii] *= scale2;
+      }
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        const int c = ik * kFragSize + sn;
+        STEEL_PRAGMA_UNROLL
+        for (short jj = 0; jj < MMAFrag_t::kElemCols; jj++) {
+          const int kg = srow[c + jj];
+          const bool member = (spm[(c + jj) / PR] & qbit) != 0u;
+          if (kg < 0 || kg > lim || !member) {
+            Stile.frag_at(0, ik)[jj] = Limits<float>::finite_min;
+          }
+        }
+      }
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      kq_pr_stage_rows<T, D, BK, LDS>(
+          kv4, vbase, pm.v_seq, vtail, pm.vt_seq, base_len, srow, flat, NT);
+
+      // Online softmax in exp2 space; a tile with no key for the row zeroes
+      // its P row.
+      float new_max = max_score;
+      Stile.template row_reduce<KQMaxOp>(&new_max);
+      if (new_max > Limits<float>::finite_min) {
+        Stile.template row_bin_op<KQExpSubOp>(&new_max);
+        float factor = fast::exp2(max_score - new_max);
+        float tile_sum = 0;
+        Stile.template row_reduce<KQSumOp>(&tile_sum);
+        sum_score = sum_score * factor + tile_sum;
+        max_score = new_max;
+        Otile.template row_bin_op<KQMulOp>(&factor);
+      } else {
+        STEEL_PRAGMA_UNROLL
+        for (short ii = 0; ii < decltype(Stile)::kElemsPerTile; ii++) {
+          Stile.elems()[ii] = 0;
+        }
+      }
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (!strip_live) {
+        continue;
+      }
+      STEEL_PRAGMA_UNROLL
+      for (short id = 0; id < TD; id++) {
+        STEEL_PRAGMA_UNROLL
+        for (short ik = 0; ik < TK; ik++) {
+          Vtile.template load<T, 1, 1, LDS, 1>(
+              &KV_smem[(ik * kFragSize + sm) * LDS + id * kFragSize + sn]);
+          MMAFrag_t::mma(
+              Otile.frag_at(0, id),
+              Stile.frag_at(0, ik),
+              Vtile.frag_at(0, 0),
+              Otile.frag_at(0, id));
+        }
+      }
+    }
+  }
+
+  if (live) {
+    const size_t po = qrow_idx * gqa_splits + split_idx;
+    device float* orow = out + po * D + sn;
+    STEEL_PRAGMA_UNROLL
+    for (short id = 0; id < TD; id++) {
+      STEEL_PRAGMA_UNROLL
+      for (short jj = 0; jj < MMAFrag_t::kElemCols; jj++) {
+        orow[id * kFragSize + jj] = Otile.frag_at(0, id)[jj];
+      }
+    }
+    if (sn == 0) {
+      sums[po] = sum_score;
+      maxs[po] = max_score == Limits<float>::finite_min
+          ? Limits<float>::finite_min
+          : max_score * M_LN2_F;
     }
   }
 }

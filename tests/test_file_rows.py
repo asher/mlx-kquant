@@ -75,3 +75,69 @@ def test_a_gpu_stream_fails_at_the_call(table):
     path, _ = table
     with pytest.raises(ValueError, match="CPU stream"):
         kq.file_rows(mx.array([0]), path, OFFSET, ROW_BYTES, ROWS, stream=mx.gpu)
+
+
+_CACHE_CHILD = r"""
+import sys
+import mlx.core as mx
+import numpy as np
+import mlx_kquant as kq
+
+path = sys.argv[1]
+offset, row_bytes, rows = (int(v) for v in sys.argv[2:5])
+data = np.fromfile(path, dtype=np.uint8, offset=offset).reshape(rows, row_bytes)
+rng = np.random.default_rng(2)
+for step in range(40):
+    # Few distinct ids, so rows repeat; ids 64 apart share a slot.
+    ids = rng.integers(0, 200, (3, 8))
+    ids[0, 0], ids[0, 1] = 7, 7 + 64
+    got = kq.file_rows(mx.array(ids), path, offset, row_bytes, rows)
+    assert np.array_equal(np.array(got), data[ids]), step
+hits, misses, held = kq.file_rows_cache_stats()
+assert hits > 0 and misses > 0, (hits, misses)
+assert hits + misses == 40 * 24, (hits, misses)
+assert 0 < held <= 64 * row_bytes, held
+print("ok", hits, misses, held)
+"""
+
+
+@pytest.mark.parametrize("bound", ["slots", "bytes"])
+def test_cached_rows_are_the_file_rows(table, bound):
+    """KQ_FILE_ROWS_CACHE (slots) and KQ_FILE_ROWS_CACHE_BYTES (bytes, ids
+    included) are read once a process, so the cache runs in a child:
+    repeated ids and ids that share a slot give the file's bytes."""
+    import os
+    import subprocess
+    import sys
+
+    path, _ = table
+    env = dict(os.environ)
+    if bound == "slots":
+        env["KQ_FILE_ROWS_CACHE"] = "64"
+    else:
+        env["KQ_FILE_ROWS_CACHE_BYTES"] = str(64 * (ROW_BYTES + 8))
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _CACHE_CHILD,
+            path,
+            str(OFFSET),
+            str(ROW_BYTES),
+            str(ROWS),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert out.stdout.startswith("ok")
+
+
+def test_the_cache_is_off_by_default(table):
+    path, data = table
+    before = kq.file_rows_cache_stats()
+    ids = np.array([3, 3, 3])
+    got = kq.file_rows(mx.array(ids), path, OFFSET, ROW_BYTES, ROWS)
+    assert np.array_equal(np.array(got), data[ids])
+    assert kq.file_rows_cache_stats() == before

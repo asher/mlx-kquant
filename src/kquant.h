@@ -527,6 +527,46 @@ mx::array sdpa_prefill_block_sparse(
     int offset,
     mx::StreamOrDevice s = {});
 
+// Paged attention for several queries with a page list each: query l of
+// q [B, Hq, L, D] attends ONLY the key rows of the pages in pages[b, l]
+// (int32 [B, L, n_pages], or [B, Hkv, L, n_pages] for a list per kv head; a
+// negative entry is skipped, and a page is listed at most once per query)
+// that lie below ends[b, l] (int32 [B, L]; without it every listed row
+// counts). A page is page_rows key rows: 0 picks the head dim's tile (32 at
+// head_dim 64/128, 16 at 256, 8 at 512), and 4 is instantiated at head_dim
+// 256. k, v [B, Hkv, S, D] are read in place. With k_tail, v_tail
+// [B, Hkv, T, D], key row r reads k, v when r < base_len and row
+// r - base_len of the tails otherwise, so a cache held as a base and a
+// decode tail needs no copy. With tail_page each query's list has one more
+// page, ends[b, l] / page_rows: the partial page its end falls in.
+// window picks the form. 0: every query walks its own pages in its own
+// threadgroups, so the grid grows with the query count. n > 0: windows of n
+// queries (n <= 32) each walk the union of their pages once, and a K/V tile
+// is staged once for every query of the window that listed it; head_dim 512
+// and windows whose rows do not fit a threadgroup take the per-query form.
+// -1 picks by query count, and KQ_PAGED_ROWS_WINDOW overrides it. Returns
+// [B, Hq, L, D]. Metal-only.
+mx::array sdpa_paged_rows(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    mx::array pages,
+    const std::optional<mx::array>& ends = std::nullopt,
+    const std::optional<mx::array>& k_tail = std::nullopt,
+    const std::optional<mx::array>& v_tail = std::nullopt,
+    int base_len = 0,
+    int splits = 0,
+    int page_rows = 0,
+    bool tail_page = false,
+    int window = -1,
+    mx::StreamOrDevice s = {},
+    // With params (an int32 parameter block, see fuse_graph), base_len is
+    // read from params[base_len_slot] when the kernel is encoded; the
+    // base_len argument is then the value at graph build, for the checks.
+    const std::optional<mx::array>& params = std::nullopt,
+    int base_len_slot = 0);
+
 // Sliding-window causal prefill attention: q [B, Hq, qL, D] are the last qL
 // of the kL positions of k, v [B, Hkv, kL, D]; query row r (r = row + kL - qL)
 // sees keys r - window < c <= r, plus sinks [Hq] (optional) in the softmax
@@ -839,7 +879,7 @@ mx::array dsa_topk_indices(
     mx::StreamOrDevice s = {});
 
 // Decode-width lightning-indexer scores, fused: sum_h relu(q_h . k_p) * w_h
-// for qL <= 4 query rows over every pooled row without materializing the
+// for qL <= 8 query rows over every pooled row without materializing the
 // [H, P] per-head scores. queries [B, H, qL, 128] with H 4, 16, 32 or 64,
 // keys [B, P, 128] (the pooled cache, rank 3), weights [B, qL, H] with any
 // positive global scale
@@ -850,7 +890,9 @@ mx::array dsa_topk_indices(
 // shaped for dsa_topk_indices. With cand [B, qL, NC] (int32/uint32 key
 // rows, the candidate list of a two-level top-k) column c of query j scores
 // row cand[b, j, c] and the result is [B, 1, qL, NC]; a negative or
-// out-of-range entry scores the finite min. Metal-only.
+// out-of-range entry scores the finite min. keys_tail [B, PT, 128] continues
+// keys: row P + i is its row i, and the result covers P + PT rows.
+// Metal-only.
 mx::array dsa_indexer_score_decode(
     mx::array queries,
     mx::array keys,
@@ -858,7 +900,12 @@ mx::array dsa_indexer_score_decode(
     int q_offset,
     int ratio,
     const std::optional<mx::array>& cand = std::nullopt,
-    mx::StreamOrDevice s = {});
+    const std::optional<mx::array>& keys_tail = std::nullopt,
+    mx::StreamOrDevice s = {},
+    // With params (an int32 parameter block, see fuse_graph), q_offset is
+    // read from params[q_offset_slot] when the kernel is encoded.
+    const std::optional<mx::array>& params = std::nullopt,
+    int q_offset_slot = 0);
 
 // DeepSeek-V4-Flash indexer activation QAT round-trip, fused: 128-wide
 // Hadamard (mlx hadamard_n butterfly order and 1/sqrt(128) scale, exactly)
@@ -1249,6 +1296,26 @@ mx::array hc_lowrank_epilogue(
     mx::array xn,
     mx::StreamOrDevice s = {});
 
+// The whole low-rank hyper-connection mixer as one op: hc_lowrank_norm,
+// hc_lowrank_front and hc_lowrank_epilogue on h [..., 4, D], with a row's
+// bits those of the three ops at every row count. The operands are bound
+// as they are (a row-major operand adds no node and no copy). Returns
+// {mixed [..., D] in the h dtype, inj f32 [..., 4]}.
+std::vector<mx::array> hc_lowrank_mix(
+    mx::array h,
+    mx::array gamma,
+    mx::array w_down,
+    mx::array w_inject,
+    mx::array w_up,
+    float eps,
+    const std::string& down_type = "",
+    const std::string& inject_type = "",
+    const std::string& up_type = "",
+    mx::StreamOrDevice s = {});
+
+// The weight codecs hc_lowrank_mix reads: kquant types and f32, f16, bf16.
+std::vector<std::string> hc_lowrank_mix_codecs();
+
 // y = x @ w.T for token widths 1..16 against a small-N, large-K weight in
 // nn.Linear layout ([N, K]). x is [..., M, K] with 1 <= M <= 16 and
 // K % 4 == 0; x float16/bfloat16/float32, w matching x or float32, or
@@ -1289,7 +1356,12 @@ mx::array kv_append(
     mx::array buf,
     mx::array x,
     int64_t offset,
-    mx::StreamOrDevice s = {});
+    mx::StreamOrDevice s = {},
+    // With params (an int32 parameter block, see fuse_graph), the offset is
+    // read from params[offset_slot] when the kernel is encoded; a record
+    // must give that slot a range that keeps the rows inside buf.
+    const std::optional<mx::array>& params = std::nullopt,
+    int offset_slot = 0);
 
 // Rows ids of a table stored in a file as rows of row_bytes bytes from byte
 // offset: uint8 [*ids.shape, row_bytes], read with parallel preads on a CPU
@@ -1307,6 +1379,15 @@ mx::array file_rows(
 
 // Rows file_rows returned as zeros since the process started.
 uint64_t file_rows_failures();
+// The row cache of file_rows (KQ_FILE_ROWS_CACHE=N keeps the last row read
+// in each of N slots a table, by row id; off when unset or 0): rows served
+// from it, rows read from the file while it was on, and the bytes it holds.
+struct FileRowsCacheStats {
+  uint64_t hits{0};
+  uint64_t misses{0};
+  uint64_t bytes{0};
+};
+FileRowsCacheStats file_rows_cache_stats();
 
 // An id for the MLX allocation that holds a's data, or nullopt while a has
 // none (not yet evaluated, or empty). Two arrays alive at the same time
@@ -1773,6 +1854,175 @@ class KQuantKdaChunk : public mx::Primitive {
   int t_real_;
   bool gated_;
   float lb_;
+};
+
+// Expert store of a fused MoE block (kq_moe_store.h): a copy of routed
+// expert stacks in a layout the tile kernels read faster than GGUF blocks.
+// Metal with the tensor-op units only. q5_0, iq4_nl, iq3_xxs and iq4_xs
+// store each block field in a plane of its own; iq2_s, q2_0, q2_k, q3_k,
+// q4_k, q5_k, q6_k, q8_0, q4_0, q4_1, q5_1, iq3_s, iq2_xxs, iq2_xs, iq1_s,
+// iq1_m, stq1_0, pq2_0, ptq1_0 and mxfp4 store whole blocks in one plane.
+// The shared expert is in the routed codec, q5_k, q6_k or q8_0. The GGUF blocks
+// stay an input of every op: an expert with no slot is read in place, and so is
+// the shared expert. When every expert has a slot the stack an op takes may be
+// a stub of one expert: it is never read.
+//
+// True when the store ops have kernels for the codec pair on this device.
+bool moe_store_supported(
+    const std::string& kquant_type,
+    const std::string& shexp_kquant_type = "");
+
+// The planes of the listed experts of w [E, N, row bytes] (K inputs a row,
+// N a multiple of 64): experts[i] takes slot i. experts is uint32 [count].
+// Returns the codec's planes (uint8, 1-D): 2 or 3 for the four field
+// formats, 1 for the others, in all the bytes of the experts' GGUF blocks.
+std::vector<mx::array> moe_store_pack(
+    mx::array w,
+    const std::string& kquant_type,
+    int K,
+    mx::array experts,
+    mx::StreamOrDevice s = {});
+
+// The gated expert product on a store: out[t, s] = silu(gate . x[t]) *
+// (up . x[t]) for the routed slots and one shared slot, [T, R + 1, N] in
+// the x dtype (float16 or bfloat16). x [T, K], indices [T, R], slots [E]
+// uint32 (an expert's slot, or 0x80000000 for none), gate_planes and
+// up_planes from moe_store_pack. A weight is rounded to half before its
+// products, so the bits differ from moe_glu_gather_shexp_kq's and depend on
+// the call's width.
+mx::array moe_store_glu(
+    mx::array x,
+    mx::array gate_w,
+    mx::array up_w,
+    mx::array shexp_gate_w,
+    mx::array shexp_up_w,
+    const std::string& kquant_type,
+    mx::array indices,
+    mx::array slots,
+    std::vector<mx::array> gate_planes,
+    std::vector<mx::array> up_planes,
+    const std::string& shexp_kquant_type = "",
+    mx::StreamOrDevice s = {});
+
+// The score-mixed down on a store, as gather_qmv_mix_kq's tiled form: the
+// same bits as that kernel at the same width. x [T, S, K], scores [T, S].
+mx::array moe_store_down(
+    mx::array x,
+    mx::array w,
+    mx::array shexp_w,
+    const std::string& kquant_type,
+    mx::array indices,
+    mx::array scores,
+    mx::array slots,
+    std::vector<mx::array> planes,
+    const std::string& shexp_kquant_type = "",
+    mx::StreamOrDevice s = {});
+
+// The keys (kernel name plus its constants' suffix) of the compute
+// pipelines built through the kq kernel cache in this process, in build
+// order. For tests and diagnostics.
+std::vector<std::string> kernel_keys();
+
+// Builds the compute pipelines the store ops of one block reach
+// (moe_store_glu, moe_store_down, moe_store_seg at both tile heights, with
+// and without a row map) for each x dtype, so the first call of each does
+// not wait on a pipeline build. Evaluates nothing and may run on a thread
+// beside other work. Returns the pipelines fetched; a kernel the library
+// does not carry is skipped.
+int moe_store_warm(
+    const std::string& glu_type,
+    const std::string& glu_shexp_type,
+    const std::string& down_type,
+    const std::string& down_shexp_type,
+    const std::vector<mx::Dtype>& dtypes,
+    int K_glu,
+    int K_down);
+
+// True when moe_store_seg has a kernel for the codec at K inputs a row on
+// this device: a store codec with a wide loader (q5_0, iq4_nl, iq3_xxs,
+// iq4_xs on field planes; iq2_s, q2_0, iq3_s, iq2_xxs, iq2_xs, iq1_s, iq1_m,
+// stq1_0, pq2_0, ptq1_0 on the generic format), K a multiple of 64.
+bool moe_store_seg_supported(const std::string& kquant_type, int K);
+
+// The wide-row product on a store: gather_qmm_seg with the weights read
+// from store planes, y[i] = W[slot of row i] . x[row i] for rows sorted by
+// slot, [rows, N] in the x dtype (float16 or bfloat16). x [rows, K], or
+// with x_rows ([rows] integers) the unsorted rows, row i being
+// x[x_rows[i]]. planes from moe_store_pack; N the outputs of a weight row
+// (a multiple of 64). map and counts are expert_tile_map's of the sorted
+// slot ids, tile_rows 64 or 128 as the map was built. Same bits as
+// gather_qmm_seg's NAX kernel on the experts' GGUF blocks.
+mx::array moe_store_seg(
+    mx::array x,
+    std::vector<mx::array> planes,
+    const std::string& kquant_type,
+    int N,
+    mx::array map,
+    mx::array counts,
+    int tile_rows = 64,
+    std::optional<mx::array> x_rows = std::nullopt,
+    mx::StreamOrDevice s = {});
+
+// The gate and up wide-row products of one expert pass in one kernel:
+// moe_store_seg on the gate planes and on the up planes, each with the bits
+// of its own call ([gate, up]), or with fused silu(gate) * up as MLX's
+// SwiGLU rounds it ([h]). Codecs: iq3_xxs, iq4_xs, iq2_s.
+std::vector<mx::array> moe_store_seg_pair(
+    mx::array x,
+    std::vector<mx::array> gate_planes,
+    std::vector<mx::array> up_planes,
+    const std::string& kquant_type,
+    int N,
+    mx::array map,
+    mx::array counts,
+    int tile_rows = 64,
+    std::optional<mx::array> x_rows = std::nullopt,
+    bool fused = false,
+    mx::StreamOrDevice s = {});
+
+// Primitives of the store ops. Inference-only, Metal only. op: 0 pack,
+// 1 GLU, 2 down, 3 the wide-row product (N outputs, tile_rows a tile),
+// 4 the gate and up products in one pass, 5 their fused SwiGLU.
+class KQuantMoeStore : public mx::Primitive {
+ public:
+  explicit KQuantMoeStore(
+      mx::Stream stream,
+      int op,
+      std::string kquant_type,
+      std::string shexp_type,
+      int K,
+      int N = 0,
+      int tile_rows = 0)
+      : mx::Primitive(stream),
+        op_(op),
+        kquant_type_(std::move(kquant_type)),
+        shexp_type_(std::move(shexp_type)),
+        K_(K),
+        N_(N),
+        tile_rows_(tile_rows) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return op_ == 0
+        ? "KQuantMoeStorePack"
+        : (op_ == 1 ? "KQuantMoeStoreGLU"
+                    : (op_ == 2 ? "KQuantMoeStoreDown" : "KQuantMoeStoreSeg"));
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int op_;
+  std::string kquant_type_;
+  std::string shexp_type_;
+  int K_;
+  int N_;
+  int tile_rows_;
 };
 
 // Fused unsort and score mix for sorted-prefill MoE:
@@ -2289,6 +2539,61 @@ class KQuantSDPAFAIndexed : public mx::Primitive {
   int splits_;
 };
 
+// Paged attention with a page list per query (see sdpa_paged_rows).
+// Inference-only.
+class KQuantSDPAPagedRows : public mx::Primitive {
+ public:
+  explicit KQuantSDPAPagedRows(
+      mx::Stream stream,
+      float scale,
+      int splits,
+      int page_rows,
+      int base_len,
+      bool has_tails,
+      bool tail_page,
+      int window,
+      int param_slot = -1)
+      : mx::Primitive(stream),
+        scale_(scale),
+        splits_(splits),
+        page_rows_(page_rows),
+        base_len_(base_len),
+        has_tails_(has_tails),
+        tail_page_(tail_page),
+        window_(window),
+        param_slot_(param_slot) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSDPAPagedRows";
+  }
+  // The input holding the parameter block read on the host, or -1.
+  int param_input(int n_inputs) const {
+    return param_slot_ >= 0 ? n_inputs - 1 : -1;
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int splits_;
+  int page_rows_;
+  int base_len_;
+  bool has_tails_;
+  bool tail_page_;
+  int window_; // queries sharing one walk of their pages' union; 0: none
+  // base_len comes from this slot of the last input (a parameter block).
+  int param_slot_;
+};
+
 // Block-sparse FA prefill over QSA-selected 4-row pages (see
 // sdpa_prefill_block_sparse). Inference-only.
 class KQuantSDPABSPrefill : public mx::Primitive {
@@ -2709,11 +3014,15 @@ class KQDsaIndexerScoreDecode : public mx::Primitive {
       mx::Stream stream,
       int q_offset,
       int ratio,
-      bool cand = false)
+      bool cand = false,
+      bool tail = false,
+      int param_slot = -1)
       : mx::Primitive(stream),
         q_offset_(q_offset),
         ratio_(ratio),
-        cand_(cand) {}
+        cand_(cand),
+        tail_(tail),
+        param_slot_(param_slot) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -2728,12 +3037,19 @@ class KQDsaIndexerScoreDecode : public mx::Primitive {
   const char* name() const override {
     return "KQDsaIndexerScoreDecode";
   }
+  // The input holding the parameter block read on the host, or -1.
+  int param_input(int n_inputs) const {
+    return param_slot_ >= 0 ? n_inputs - 1 : -1;
+  }
   bool is_equivalent(const mx::Primitive& other) const override;
 
  private:
   int q_offset_;
   int ratio_;
   bool cand_;
+  bool tail_;
+  // q_offset comes from this slot of the last input (a parameter block).
+  int param_slot_;
 };
 
 // DeepSeek-V4-Flash fused indexer QAT round-trip (see dsa_indexer_qat).
@@ -3615,6 +3931,41 @@ class KQuantHcLowrankEpilogue : public mx::Primitive {
   }
 };
 
+// The mixer as one primitive (see hc_lowrank_mix): two or three
+// dispatches, with xn and lo as temporaries of the eval.
+class KQuantHcLowrankMix : public mx::Primitive {
+ public:
+  KQuantHcLowrankMix(
+      mx::Stream stream,
+      float eps,
+      std::string down_type,
+      std::string inject_type,
+      std::string up_type)
+      : mx::Primitive(stream),
+        eps_(eps),
+        down_type_(std::move(down_type)),
+        inject_type_(std::move(inject_type)),
+        up_type_(std::move(up_type)) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "KQuantHcLowrankMix";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float eps_;
+  std::string down_type_;
+  std::string inject_type_;
+  std::string up_type_;
+};
+
 // Skinny matmul y = x @ w.T at token widths 1..16 (see skinny_matmul).
 // Inference-only.
 class KQuantSkinnyMV : public mx::Primitive {
@@ -3641,8 +3992,8 @@ class KQuantSkinnyMV : public mx::Primitive {
 // two appends are never equivalent. Inference-only.
 class KQuantKVAppend : public mx::Primitive {
  public:
-  KQuantKVAppend(mx::Stream stream, int64_t offset)
-      : mx::Primitive(stream), offset_(offset) {}
+  KQuantKVAppend(mx::Stream stream, int64_t offset, int param_slot = -1)
+      : mx::Primitive(stream), offset_(offset), param_slot_(param_slot) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -3654,12 +4005,18 @@ class KQuantKVAppend : public mx::Primitive {
   const char* name() const override {
     return "KQuantKVAppend";
   }
+  // The input holding the parameter block read on the host, or -1.
+  int param_input(int n_inputs) const {
+    return param_slot_ >= 0 ? n_inputs - 1 : -1;
+  }
   bool is_equivalent(const mx::Primitive&) const override {
     return false;
   }
 
  private:
   int64_t offset_;
+  // The offset comes from this slot of input 2 (a parameter block).
+  int param_slot_;
 };
 
 // Table rows read from a file (see file_rows). CPU streams only. Holds the
@@ -3669,6 +4026,8 @@ class KQuantFileRows : public mx::Primitive {
   struct Fd {
     int fd = -1;
     int64_t size = 0;
+    // The table's row cache (KQ_FILE_ROWS_CACHE), or null.
+    std::shared_ptr<void> cache;
     ~Fd();
   };
 
@@ -4008,11 +4367,168 @@ class KQuantEventWait : public mx::Primitive {
   uint64_t value_;
 };
 
+// A lazy subgraph recorded once and run as one primitive (see
+// kquant_fused_graph.cpp). fuse_graph records the graph between `inputs`
+// and `outputs`; fused_call builds its outputs for new inputs of the same
+// shapes and dtypes as one multi-output array. `serial` runs the tape in a
+// serial compute encoder. `direct` lets a tape on a GPU stream replay the
+// Metal calls of its primitives from its second eval on; it needs the
+// lever cache on (kq_env_cache) and primitives of the listed types, and
+// runs the primitives otherwise. `level` orders the tape by depth from the
+// inputs in place of the walk's order (one branch to its end, then the
+// next): the same primitives on the same operands, with independent ones
+// next to each other.
+//
+// Parameter block. `params` names one input, an int32 vector filled on the
+// host, whose slots hold the values that change between replays of one
+// record (an offset, a length, a count). Kernels reach them two ways: a kq
+// entry point that takes the block and a slot reads the value on the host
+// when it encodes (kq_param_value, kq_param_site in kquant_internal.h), and
+// a custom Metal kernel takes the block as an ordinary buffer. A slot may
+// take any value in the range `param_ranges` gives it; a slot with no range
+// keeps the value it had at fuse_graph. fused_call and fused_patch refuse a
+// block outside that (std::invalid_argument, false): the caller then
+// records again or runs its plain path. A primitive that reads its block on
+// the host may read it only from the `params` input or from an array the
+// tape holds (evaluated at fuse_graph): fuse_graph refuses one that reads
+// it from any other of its inputs (std::invalid_argument), since a kernel
+// of the same eval may not have written that input when the primitive is
+// encoded.
+struct FusedParamRange {
+  int slot;
+  int32_t lo;
+  int32_t hi;
+};
+struct FusedTape;
+std::shared_ptr<const FusedTape> fuse_graph(
+    const std::vector<mx::array>& inputs,
+    const std::vector<mx::array>& outputs,
+    bool serial = false,
+    bool direct = false,
+    int level = 0,
+    int params = -1,
+    const std::vector<FusedParamRange>& param_ranges = {});
+std::vector<mx::array> fused_call(
+    const std::shared_ptr<const FusedTape>& tape,
+    const std::vector<mx::array>& inputs);
+std::vector<std::string> fused_nodes(
+    const std::shared_ptr<const FusedTape>& tape);
+int fused_constants(const std::shared_ptr<const FusedTape>& tape);
+// What a `direct` tape has learned. state: "" (not direct), "new",
+// "recorded" (one eval seen under KQ_FUSED_DIRECT_CHECK), "replay",
+// "refused" (runs the primitives; reason and primitives say why), "waiting"
+// (lever cache off).
+struct FusedDirectInfo {
+  std::string state;
+  std::string reason;
+  std::vector<std::string> primitives;
+  uint64_t replays{0};
+  uint64_t plain_runs{0};
+  int calls_recorded{0};
+  int calls{0};
+  int dispatches{0};
+  int barriers{0};
+  int barriers_recorded{0};
+  int scratch_buffers{0};
+  size_t scratch_bytes{0};
+  size_t kept_bytes{0};
+  size_t program_bytes{0};
+  size_t pool_bytes{0};
+};
+FusedDirectInfo fused_direct_info(const std::shared_ptr<const FusedTape>& tape);
+// The Metal calls a direct tape replays, one line a call as its primitives
+// made them, buffers by role, then one line a buffer and one an output.
+// Empty until the tape has a program. Two tapes of one key give the same
+// lines; the tests compare them.
+std::vector<std::string> fused_direct_calls(
+    const std::shared_ptr<const FusedTape>& tape);
+// Debug: every encoder call made on the default GPU stream between the two
+// calls, one line a call (kernels by name, buffers numbered by first use).
+// No recording may run in between: trace warm records only.
+void encoder_trace_begin();
+std::vector<std::string> encoder_trace_end();
+std::vector<bool> fused_used_inputs(
+    const std::shared_ptr<const FusedTape>& tape);
+
+// Bound replay: a record replayed from C++ with no Python object, no mlx
+// graph and no mlx eval, for a caller that owns its command buffers (a
+// completion-handler chain).
+//
+// fused_bind (once a layout and a stage in flight; holds the GIL if Python
+// is about) resolves the record's buffers for `inputs` and allocates its
+// outputs. `outputs` come back as evaluated arrays over those buffers: the
+// next record binds them and Python reads them with no eval. Their content
+// is that of the last command buffer the binding was encoded into, once it
+// has completed; nothing in mlx waits for that buffer, so a host reader
+// waits on the caller's own completion. An output that is a view of an
+// input (an in-place write) shares the input's buffer. The record must
+// have its program (fused_direct_info state "replay") and the inputs the
+// recorded layout; otherwise fused_bind throws. Each binding owns a pool of
+// the buffers between the record's kernels, scratch_bytes in all
+// (fused_binding_info), so stages in flight on separate command buffers
+// share none; the pool is freed with the binding.
+//
+// fused_patch writes one slot of the binding's parameter block (the buffer
+// of the block passed to fused_bind) and returns false, writing nothing,
+// when the value is outside the range the record covers. fused_params is
+// the block itself for a caller that writes several slots; fused_encode
+// then checks every slot.
+//
+// fused_encode sends the record's Metal calls to `compute_encoder` (an
+// MTLComputeCommandEncoder of a command buffer of fused_command_queue's
+// queue, concurrent dispatch type as mlx's). It takes no lock, allocates
+// nothing and touches no mlx state: any thread may call it. It returns
+// false and sends nothing when a slot is outside its range. Rules for the
+// caller: one binding is encoded by one thread at a time; the block is not
+// written between fused_encode and the completion of that command buffer
+// (kernels may read it on the GPU), so each stage in flight has its own
+// binding and block; the binding outlives every command buffer it was
+// encoded into; no mlx eval writes the bound buffers while a stage is in
+// flight. fused_encode puts a barrier ahead of the replay and none after
+// it: a dispatch the caller encodes next into the same encoder that reads
+// an output, or a buffer the record wrote in place, needs a barrier of the
+// caller's own ahead of it.
+struct FusedBinding;
+std::shared_ptr<FusedBinding> fused_bind(
+    const std::shared_ptr<const FusedTape>& tape,
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs);
+bool fused_patch(FusedBinding& binding, int slot, int32_t value) noexcept;
+int32_t* fused_params(FusedBinding& binding) noexcept;
+bool fused_encode(FusedBinding& binding, void* compute_encoder) noexcept;
+void* fused_command_queue(mx::Stream s);
+struct FusedBindingInfo {
+  size_t output_bytes{0}; // buffers allocated for the outputs
+  size_t param_bytes{0};
+  size_t blob_bytes{0}; // the binding's copy of the kernel arguments
+  size_t scratch_bytes{0}; // bytes between kernels the record uses
+  size_t pool_bytes{0}; // the binding's own buffers between kernels
+};
+FusedBindingInfo fused_binding_info(const FusedBinding& binding);
+// Test helper: encodes the bindings in order into one command buffer of
+// its own on a new thread, commits and waits. The caller has no mlx work
+// in flight on the stream (mx::synchronize first).
+std::vector<bool> fused_commit_detached(
+    const std::vector<std::shared_ptr<FusedBinding>>& bindings,
+    mx::Stream s);
+
+// Turns the cache of KQ_* environment reads on or off for the process and
+// drops what it holds; returns the previous setting. Off by default: a
+// server that sets its levers before it starts turns it on.
+bool kq_env_cache(bool on);
+
 // Runtime read/write of MLX's command-buffer split caps (ops, MB per
 // buffer). set returns the previous pair. GPU-only; see
 // kquant_cb_caps.cpp for the phase-flip rationale.
 std::pair<int, int> get_cb_caps();
 std::pair<int, int> set_cb_caps(int max_ops, int max_mb);
+
+// A commit boundary carried by the graph: an identity on x whose GPU eval
+// makes mlx end and commit the command buffer encoded so far (a no-op when
+// the buffer is empty). cb_commit_marks counts the boundaries it made. See
+// kquant_cb_mark.cpp.
+mx::array cb_commit_mark(const mx::array& x, mx::StreamOrDevice s = {});
+uint64_t cb_commit_marks();
 
 // Sparse decode attention over a window [B, 1, W, D] read whole plus pool
 // [B, P, D] rows listed per query in idx [B, L, N] (int32/uint32; a negative

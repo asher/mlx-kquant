@@ -49,7 +49,8 @@ def _probe(calls, env):
     """run_probe results, or one failure per call if the probe fails, so the
     tests that share a probe fail on their own entries."""
     try:
-        return run_probe(calls, env=env)
+        # The routes before the dense row kernel (test_dense_rows.py).
+        return run_probe(calls, env={"KQ_DENSE_ROWS": "0", **(env or {})})
     except (AssertionError, subprocess.TimeoutExpired) as e:
         return [{"error": f"probe failed: {e}", "kernels": []}] * len(calls)
 

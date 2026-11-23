@@ -85,12 +85,62 @@ instantiate_kq_sdpa_gqa_ne(float16_t, 512, 8, 2)
 
 instantiate_kq_sdpa_gqa_p2(bfloat16_t, 512, 8, 2)
 
+// Paged rows pass 1 (sdpa_paged_rows): C staged key rows a tile, PR rows a
+// page. The page sizes are the paged decode kernel's: the head dim's tile
+// and, at head dim 256, the 4-row page of block-sparse attention.
+#define instantiate_kq_sdpa_paged_rows(type, D, C, PR, NE)            \
+  instantiate_kernel(                                                 \
+      "kq_sdpa_paged_rows_1_" #type "_" #D "_p" #PR,                  \
+      kq_sdpa_paged_rows_1,                                           \
+      type,                                                           \
+      D,                                                              \
+      C,                                                              \
+      PR,                                                             \
+      NE)
+
+#define instantiate_kq_sdpa_paged_rows_t(type)                        \
+  instantiate_kq_sdpa_paged_rows(type, 64, 32, 32, 4)                 \
+  instantiate_kq_sdpa_paged_rows(type, 128, 32, 32, 4)                \
+  instantiate_kq_sdpa_paged_rows(type, 256, 16, 16, 4)                \
+  instantiate_kq_sdpa_paged_rows(type, 256, 16, 4, 4)                 \
+  instantiate_kq_sdpa_paged_rows(type, 512, 8, 8, 2)
+
+instantiate_kq_sdpa_paged_rows_t(bfloat16_t)
+instantiate_kq_sdpa_paged_rows_t(float16_t)
+
+// Shared-tile paged rows pass 1: every head dim and page size of the
+// per-query form but head dim 512, whose MMA fragments do not fit.
+#define instantiate_kq_sdpa_paged_rows_u(type, D, PR)                 \
+  instantiate_kernel(                                                 \
+      "kq_sdpa_paged_rows_u_" #type "_" #D "_p" #PR,                  \
+      kq_sdpa_paged_rows_u,                                           \
+      type,                                                           \
+      D,                                                              \
+      PR)
+
+#define instantiate_kq_sdpa_paged_rows_u_t(type)                      \
+  instantiate_kq_sdpa_paged_rows_u(type, 64, 32)                      \
+  instantiate_kq_sdpa_paged_rows_u(type, 128, 32)                     \
+  instantiate_kq_sdpa_paged_rows_u(type, 256, 16)                     \
+  instantiate_kq_sdpa_paged_rows_u(type, 256, 4)
+
+instantiate_kq_sdpa_paged_rows_u_t(bfloat16_t)
+instantiate_kq_sdpa_paged_rows_u_t(float16_t)
+
 #define instantiate_kq_sdpa_bs(type, D)                               \
   instantiate_kernel(                                                 \
       "kq_sdpa_bs_prefill_" #type "_" #D,                             \
       kq_sdpa_bs_prefill,                                             \
       type,                                                           \
-      D)
+      D)                                                              \
+  instantiate_kernel(                                                 \
+      "kq_sdpa_bs_prefill_split_" #type "_" #D,                       \
+      kq_sdpa_bs_prefill,                                             \
+      type,                                                           \
+      D,                                                              \
+      4,                                                              \
+      12,                                                             \
+      true)
 
 instantiate_kq_sdpa_bs(bfloat16_t, 256)
 instantiate_kq_sdpa_bs(float16_t, 256)
