@@ -1363,6 +1363,23 @@ a cheaper lookup. Two other grid sources gave no gain. A 64-bit grid in a device
 constant table. A 2-bit code table, in threadgroup memory or in a device buffer, was about 20%
 slower.
 
+### Gate and up in different codecs
+
+Quant recipes that pick a codec per tensor can put a layer's gate and up expert stacks in different
+codecs (Hy4: an `iq2_xxs` gate stack with an `stq1_0` up stack). `moe_glu_gather_kq` and
+`moe_glu_gather_shexp_kq` take the up codec as `up_kquant_type`; `kquant_type` stays the gate's.
+The kernels are the Ext gathers templated on the pair (`KqGluPair<gate, up>`): each projection
+decodes through its own codec and its own staged tables, in the loop a single codec runs. A pair
+takes the forms either of its codecs would take alone at each row count: the 32-weight step at one
+row where either codec has it (the other decodes two 16-weight chunks per step), the dedupe kernels
+at 2 to 8 rows, the grouped kernels at 5 to 16 rows, and the plain kernels past that, with a
+`q5_k`, `q6_k` or `q8_0` shared expert or none. Pairs have no qf or half-dot kernels.
+
+The pairs with kernels are listed in `kq_glu_pairs.h`; one line there adds a pair.
+`kq.moe_glu_pair_has_kernel(gate, up, shexp_gate="", shexp_up="", shared_slots=1)` says whether a
+call has kernels, and a call without them raises an error that names the codecs. A split pair takes
+no biases and no output scales.
+
 ### K-quant chunk decode
 
 The `q2_k`, `q4_k` and `q5_k` gathers, and the `mv_ext` mat-vec of these codecs at 2 to 12 rows,

@@ -232,6 +232,22 @@ NB_MODULE(_ext, m) {
       "two codecs, the shared expert shared_slots routed experts wide.");
 
   m.def(
+      "moe_glu_pair_has_kernel",
+      &mlx_kquant::moe_glu_pair_has_kernel,
+      "gate_type"_a,
+      "up_type"_a,
+      "shexp_gate_type"_a = "",
+      "shexp_up_type"_a = "",
+      "shared_slots"_a = 1,
+      "True when the routed GLU gathers have a kernel for a gate stack in "
+      "gate_type and an up stack in up_type (up_kquant_type): "
+      "moe_glu_gather_kq with no shared expert given, else "
+      "moe_glu_gather_shexp_kq with the shared expert's gate and up tensors "
+      "in these codecs ('' up = the gate's), shared_slots routed experts "
+      "wide. One codec for gate and up answers as codec_has_moe_glu and "
+      "shexp_glu_combo_has_kernel.");
+
+  m.def(
       "shexp_mix_combo_has_kernel",
       &mlx_kquant::shexp_mix_combo_has_kernel,
       "kquant_type"_a,
@@ -2822,6 +2838,7 @@ NB_MODULE(_ext, m) {
       nb::kw_only(),
       "gate_scale"_a = nb::none(),
       "up_scale"_a = nb::none(),
+      "up_kquant_type"_a = "",
       "stream"_a = nb::none(),
       R"(
         Fused MoE GLU gather for K-quant expert stacks: gate and up expert
@@ -2862,6 +2879,10 @@ NB_MODULE(_ext, m) {
                 activation. nvfp4 only (the ``.scale`` of an NVFP4 GGUF).
             up_scale (array, optional): the same for up. Pass both or
                 neither, with one shape.
+            up_kquant_type (str): codec of up_w when it differs from
+                gate_w's (kquant_type); '' (default) = kquant_type. The
+                pair must pass moe_glu_pair_has_kernel; a split pair takes
+                no biases or output scales.
 
         Returns:
             array: activated hidden states [T, R, N] in x.dtype.
@@ -2933,6 +2954,7 @@ NB_MODULE(_ext, m) {
       "shexp_gate_scale"_a = nb::none(),
       "shexp_up_scale"_a = nb::none(),
       "alpha"_a = 0.0f,
+      "up_kquant_type"_a = "",
       "stream"_a = nb::none(),
       R"(
         moe_glu_gather_kq with the block's shared expert folded in as k
@@ -2970,6 +2992,11 @@ NB_MODULE(_ext, m) {
             shexp_up_scale (array, optional): the same for the shared up.
                 Pass both or neither.
             alpha (float): sigmoid slope for 'swiglu_oai'.
+            up_kquant_type (str): codec of up_w when it differs from
+                gate_w's (kquant_type); '' (default) = kquant_type. The
+                pair and the shared-expert codecs must pass
+                moe_glu_pair_has_kernel; a split pair takes no gate_scale
+                or up_scale.
 
         Returns:
             array: activated hidden states [T, R + k, N] in x.dtype.

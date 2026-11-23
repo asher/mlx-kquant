@@ -777,10 +777,23 @@ mx::array moe_glu_gather_kq(
     float alpha = 0.0f,
     const std::optional<mx::array>& gate_scale = std::nullopt,
     const std::optional<mx::array>& up_scale = std::nullopt,
+    const std::string& up_kquant_type = "",
     mx::StreamOrDevice s = {});
 
 // True when the codec has the fused MoE GLU/gather kernel family above.
 bool codec_has_moe_glu(const std::string& kquant_type);
+
+// True when the routed GLU gathers have a kernel for a gate stack in
+// gate_type and an up stack in up_type: moe_glu_gather_kq with no shared
+// expert given, else moe_glu_gather_shexp_kq with the shared expert's gate
+// and up in these codecs, shared_slots routed experts wide. One codec for
+// gate and up answers as codec_has_moe_glu and shexp_glu_combo_has_kernel.
+bool moe_glu_pair_has_kernel(
+    const std::string& gate_type,
+    const std::string& up_type,
+    const std::string& shexp_gate_type = "",
+    const std::string& shexp_up_type = "",
+    int shared_slots = 1);
 
 // True when the fused MoE gathers on kquant_type run the qf kernels (the
 // codec's tuned qmv_fast loops) instead of the Ext kernels. KQ_MOE_QF=0 or a
@@ -1079,6 +1092,7 @@ mx::array moe_glu_gather_shexp_kq(
     const std::optional<mx::array>& shexp_gate_scale = std::nullopt,
     const std::optional<mx::array>& shexp_up_scale = std::nullopt,
     float alpha = 0.0f,
+    const std::string& up_kquant_type = "",
     mx::StreamOrDevice s = {});
 
 // Down projection with the routing mix folded in: x [T, S, K] (the last k
@@ -3309,13 +3323,15 @@ class KQuantMoEGLUKQ : public mx::Primitive {
       std::string act,
       float limit = 0.0f,
       float alpha = 0.0f,
-      int out_scale_bits = 0)
+      int out_scale_bits = 0,
+      std::string up_type = "")
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         act_(std::move(act)),
         limit_(limit),
         alpha_(alpha),
-        out_scale_bits_(out_scale_bits) {}
+        out_scale_bits_(out_scale_bits),
+        up_type_(up_type.empty() ? kquant_type_ : std::move(up_type)) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -3338,6 +3354,7 @@ class KQuantMoEGLUKQ : public mx::Primitive {
   float limit_;
   float alpha_;
   int out_scale_bits_; // kq_out_scale.h; the scales are the last inputs
+  std::string up_type_; // the up stack's codec (kquant_type_ when one)
 };
 
 // K-quant gathered matvec (see gather_qmv_kq). Inference-only.
@@ -3386,7 +3403,8 @@ class KQuantMoEGLUShexpKQ : public mx::Primitive {
       float limit = 0.0f,
       std::string shexp_up_type = "",
       int out_scale_bits = 0,
-      float alpha = 0.0f)
+      float alpha = 0.0f,
+      std::string up_type = "")
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         act_(std::move(act)),
@@ -3395,7 +3413,8 @@ class KQuantMoEGLUShexpKQ : public mx::Primitive {
             shexp_up_type.empty() ? shexp_type_ : std::move(shexp_up_type)),
         limit_(limit),
         alpha_(alpha),
-        out_scale_bits_(out_scale_bits) {}
+        out_scale_bits_(out_scale_bits),
+        up_type_(up_type.empty() ? kquant_type_ : std::move(up_type)) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -3420,6 +3439,7 @@ class KQuantMoEGLUShexpKQ : public mx::Primitive {
   float limit_;
   float alpha_;
   int out_scale_bits_;
+  std::string up_type_; // the routed up stack's codec
 };
 
 // K-quant gathered matvec with routing mix folded in (see gather_qmv_mix_kq).

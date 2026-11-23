@@ -859,6 +859,78 @@ template <typename T, int results_per_simdgroup = 4>
 
 #define KQ_EXT_NXPSG 8
 
+// The routed codec argument of the GLU gathers is one codec, or KqGluPair
+// for a gate stack in G and an up stack in U (quant recipes that pick a
+// codec per tensor). A pair's staged tables hold G's, then U's from
+// KqGluTraits::up_luts on; the GLU row helpers below read gate and up each
+// through its own codec. A single codec runs the same code with both roles
+// on one codec and one table, so its kernels keep their bits.
+template <typename G, typename U>
+struct KqGluPair {};
+
+template <typename Codec>
+struct KqGluTraits {
+  typedef Codec gate;
+  typedef Codec up;
+  MLX_MTL_CONST int up_luts = 0;
+};
+
+template <typename G, typename U>
+struct KqGluTraits<KqGluPair<G, U>> {
+  typedef G gate;
+  typedef U up;
+  MLX_MTL_CONST int up_luts = (KqTgLuts<G>::bytes + 15) / 16 * 16;
+};
+
+template <typename G, typename U>
+struct KqTgLuts<KqGluPair<G, U>> {
+  MLX_MTL_CONST int bytes =
+      KqGluTraits<KqGluPair<G, U>>::up_luts + KqTgLuts<U>::bytes;
+  static METAL_FUNC void
+  stage(threadgroup uint8_t* dst, ushort lin, ushort n_threads) {
+    KqTgLuts<G>::stage(dst, lin, n_threads);
+    KqTgLuts<U>::stage(
+        dst + KqGluTraits<KqGluPair<G, U>>::up_luts, lin, n_threads);
+  }
+};
+
+// A 32-weight group ig of a weight row: the c32 step where the codec has
+// it, else its two 16-weight chunks (a pair's other codec in a c32 loop).
+template <typename Codec>
+METAL_FUNC float2 kq_ext_deq32(
+    const device uint8_t* w_row,
+    int ig,
+    thread float4x4& l0,
+    thread float4x4& l1,
+    const threadgroup uint8_t* luts) {
+  if (KqExtC32<Codec>::ok) {
+    constexpr short gpb = Codec::superblock / 32;
+    return KqExtC32<Codec>::deq_group32s(
+        w_row + (int64_t)(ig / gpb) * Codec::block_bytes,
+        short(ig % gpb),
+        l0,
+        l1,
+        luts);
+  }
+  constexpr short chpb = Codec::superblock / 16;
+  const int i0 = 2 * ig;
+  const int i1 = i0 + 1;
+  float s0, s1;
+  KqTgLuts<Codec>::deq_chunk16s(
+      w_row + (int64_t)(i0 / chpb) * Codec::block_bytes,
+      short(i0 % chpb),
+      l0,
+      luts,
+      s0);
+  KqTgLuts<Codec>::deq_chunk16s(
+      w_row + (int64_t)(i1 / chpb) * Codec::block_bytes,
+      short(i1 % chpb),
+      l1,
+      luts,
+      s1);
+  return float2(s0, s1);
+}
+
 // Dot of a 32-weight group (l0, l1 unscaled, sc their two scales) with
 // x[0..31].
 template <typename T>
@@ -961,6 +1033,8 @@ METAL_FUNC float kq_ext_piece_partial(
 }
 
 // GLU pair variant: gate and up rows share each activation chunk load.
+// Codec is one codec or a KqGluPair. With C32 the loop steps 32 weights
+// where either codec has the c32 step.
 template <typename T, typename Codec, int NX, bool C32 = false>
 METAL_FUNC float2 kq_ext_glu_row_partial(
     const device uint8_t* gw,
@@ -970,17 +1044,18 @@ METAL_FUNC float2 kq_ext_glu_row_partial(
     int K,
     short tx,
     const threadgroup uint8_t* luts) {
-  constexpr short chpb = Codec::superblock / 16;
-  const int nb = K / Codec::superblock;
-  const int64_t row_off = row * (int64_t)nb * Codec::block_bytes;
-  const device uint8_t* g_row = gw + row_off;
-  const device uint8_t* u_row = uw + row_off;
+  typedef typename KqGluTraits<Codec>::gate G;
+  typedef typename KqGluTraits<Codec>::up U;
+  constexpr short gch = G::superblock / 16;
+  constexpr short uch = U::superblock / 16;
+  const device uint8_t* g_row =
+      gw + row * (int64_t)(K / G::superblock) * G::block_bytes;
+  const device uint8_t* u_row =
+      uw + row * (int64_t)(K / U::superblock) * U::block_bytes;
+  const threadgroup uint8_t* uluts = luts + KqGluTraits<Codec>::up_luts;
   float2 acc = float2(0.0f);
-  if (C32 && KqExtC32<Codec>::ok) {
-    constexpr short gpb = Codec::superblock / 32;
+  if (C32 && (KqExtC32<G>::ok || KqExtC32<U>::ok)) {
     for (int ig = tx; 32 * ig < K; ig += NX) {
-      const int64_t boff = (int64_t)(ig / gpb) * Codec::block_bytes;
-      const short g8 = short(ig % gpb);
       const device T* xp = x + ig * 32;
       float4 a[8];
 #pragma unroll
@@ -988,14 +1063,14 @@ METAL_FUNC float2 kq_ext_glu_row_partial(
         a[i] = float4(*(const device vec<T, 4>*)(xp + 4 * i));
       }
       float4x4 l0, l1;
-      float2 sc = KqExtC32<Codec>::deq_group32s(g_row + boff, g8, l0, l1, luts);
+      float2 sc = kq_ext_deq32<G>(g_row, ig, l0, l1, luts);
       acc.x += sc.x *
               (dot(l0[0], a[0]) + dot(l0[1], a[1]) + dot(l0[2], a[2]) +
                dot(l0[3], a[3])) +
           sc.y *
               (dot(l1[0], a[4]) + dot(l1[1], a[5]) + dot(l1[2], a[6]) +
                dot(l1[3], a[7]));
-      sc = KqExtC32<Codec>::deq_group32s(u_row + boff, g8, l0, l1, luts);
+      sc = kq_ext_deq32<U>(u_row, ig, l0, l1, uluts);
       acc.y += sc.x *
               (dot(l0[0], a[0]) + dot(l0[1], a[1]) + dot(l0[2], a[2]) +
                dot(l0[3], a[3])) +
@@ -1006,8 +1081,6 @@ METAL_FUNC float2 kq_ext_glu_row_partial(
     return acc;
   }
   for (int ich = tx; 16 * ich < K; ich += NX) {
-    const int64_t boff = (int64_t)(ich / chpb) * Codec::block_bytes;
-    const short cch = short(ich % chpb);
     const device T* xp = x + ich * 16;
     const float4 a0 = float4(*(const device vec<T, 4>*)(xp + 0));
     const float4 a1 = float4(*(const device vec<T, 4>*)(xp + 4));
@@ -1015,10 +1088,20 @@ METAL_FUNC float2 kq_ext_glu_row_partial(
     const float4 a3 = float4(*(const device vec<T, 4>*)(xp + 12));
     float4x4 lw;
     float sc;
-    KqTgLuts<Codec>::deq_chunk16s(g_row + boff, cch, lw, luts, sc);
+    KqTgLuts<G>::deq_chunk16s(
+        g_row + (int64_t)(ich / gch) * G::block_bytes,
+        short(ich % gch),
+        lw,
+        luts,
+        sc);
     acc.x += sc *
         (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
-    KqTgLuts<Codec>::deq_chunk16s(u_row + boff, cch, lw, luts, sc);
+    KqTgLuts<U>::deq_chunk16s(
+        u_row + (int64_t)(ich / uch) * U::block_bytes,
+        short(ich % uch),
+        lw,
+        uluts,
+        sc);
     acc.y += sc *
         (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
   }
@@ -1890,15 +1973,17 @@ METAL_FUNC float4 kq_ext_glu_row_partial_pair(
     int K,
     short tx,
     const threadgroup uint8_t* luts) {
-  constexpr short chpb = Codec::superblock / 16;
-  const int nb = K / Codec::superblock;
-  const int64_t row_off = row * (int64_t)nb * Codec::block_bytes;
-  const device uint8_t* g_row = gw + row_off;
-  const device uint8_t* u_row = uw + row_off;
+  typedef typename KqGluTraits<Codec>::gate G;
+  typedef typename KqGluTraits<Codec>::up U;
+  constexpr short gch = G::superblock / 16;
+  constexpr short uch = U::superblock / 16;
+  const device uint8_t* g_row =
+      gw + row * (int64_t)(K / G::superblock) * G::block_bytes;
+  const device uint8_t* u_row =
+      uw + row * (int64_t)(K / U::superblock) * U::block_bytes;
+  const threadgroup uint8_t* uluts = luts + KqGluTraits<Codec>::up_luts;
   float4 acc = float4(0.0f);
   for (int ich = tx; 16 * ich < K; ich += NX) {
-    const int64_t boff = (int64_t)(ich / chpb) * Codec::block_bytes;
-    const short cch = short(ich % chpb);
     const device T* xp = x0 + ich * 16;
     const float4 a0 = float4(*(const device vec<T, 4>*)(xp + 0));
     const float4 a1 = float4(*(const device vec<T, 4>*)(xp + 4));
@@ -1907,7 +1992,12 @@ METAL_FUNC float4 kq_ext_glu_row_partial_pair(
     const device T* yp = x1 + ich * 16;
     float4x4 lw;
     float sc;
-    KqTgLuts<Codec>::deq_chunk16s(g_row + boff, cch, lw, luts, sc);
+    KqTgLuts<G>::deq_chunk16s(
+        g_row + (int64_t)(ich / gch) * G::block_bytes,
+        short(ich % gch),
+        lw,
+        luts,
+        sc);
     acc.x += sc *
         (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
     acc.z += sc *
@@ -1915,7 +2005,12 @@ METAL_FUNC float4 kq_ext_glu_row_partial_pair(
          dot(lw[1], float4(*(const device vec<T, 4>*)(yp + 4))) +
          dot(lw[2], float4(*(const device vec<T, 4>*)(yp + 8))) +
          dot(lw[3], float4(*(const device vec<T, 4>*)(yp + 12))));
-    KqTgLuts<Codec>::deq_chunk16s(u_row + boff, cch, lw, luts, sc);
+    KqTgLuts<U>::deq_chunk16s(
+        u_row + (int64_t)(ich / uch) * U::block_bytes,
+        short(ich % uch),
+        lw,
+        uluts,
+        sc);
     acc.y += sc *
         (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
     acc.w += sc *
@@ -2372,25 +2467,37 @@ METAL_FUNC void kq_ext_glu_row_partial_quad(
     const threadgroup uint8_t* luts,
     thread float4& ag,
     thread float4& au) {
-  constexpr short chpb = Codec::superblock / 16;
-  const int nb = K / Codec::superblock;
-  const int64_t row_off = row * (int64_t)nb * Codec::block_bytes;
-  const device uint8_t* g_row = gw + row_off;
-  const device uint8_t* u_row = uw + row_off;
+  typedef typename KqGluTraits<Codec>::gate G;
+  typedef typename KqGluTraits<Codec>::up U;
+  constexpr short gch = G::superblock / 16;
+  constexpr short uch = U::superblock / 16;
+  const device uint8_t* g_row =
+      gw + row * (int64_t)(K / G::superblock) * G::block_bytes;
+  const device uint8_t* u_row =
+      uw + row * (int64_t)(K / U::superblock) * U::block_bytes;
+  const threadgroup uint8_t* uluts = luts + KqGluTraits<Codec>::up_luts;
   ag = float4(0.0f);
   au = float4(0.0f);
   for (int ich = tx; 16 * ich < K; ich += NX) {
-    const int64_t boff = (int64_t)(ich / chpb) * Codec::block_bytes;
-    const short cch = short(ich % chpb);
     const int o = ich * 16;
     float4x4 lw;
     float sc;
-    KqTgLuts<Codec>::deq_chunk16s(g_row + boff, cch, lw, luts, sc);
+    KqTgLuts<G>::deq_chunk16s(
+        g_row + (int64_t)(ich / gch) * G::block_bytes,
+        short(ich % gch),
+        lw,
+        luts,
+        sc);
     ag.x += sc * KQ_GRP_DOT16(lw, (x0 + o));
     ag.y += sc * KQ_GRP_DOT16(lw, (x1 + o));
     ag.z += sc * KQ_GRP_DOT16(lw, (x2 + o));
     ag.w += sc * KQ_GRP_DOT16(lw, (x3 + o));
-    KqTgLuts<Codec>::deq_chunk16s(u_row + boff, cch, lw, luts, sc);
+    KqTgLuts<U>::deq_chunk16s(
+        u_row + (int64_t)(ich / uch) * U::block_bytes,
+        short(ich % uch),
+        lw,
+        uluts,
+        sc);
     au.x += sc * KQ_GRP_DOT16(lw, (x0 + o));
     au.y += sc * KQ_GRP_DOT16(lw, (x1 + o));
     au.z += sc * KQ_GRP_DOT16(lw, (x2 + o));

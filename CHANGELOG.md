@@ -44,6 +44,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   its hits, misses and bytes.
 - `load_gguf` reads GGML type 44 as `stq1_0`, the id Tencent's Hy4 GGUFs use for it (43 is F8_E4M3
   in that llama.cpp tree).
+- The fused MoE GLU gathers take `up_kquant_type` for an up stack in another codec than the gate
+  stack (Hy4 iq2_xxs gate with stq1_0 up); `moe_glu_pair_has_kernel` lists the pairs.
 
 ### Changed
 - On M5 and later GPUs the fused MoE gathers at 5 to 16 rows read each expert once for up to eight
