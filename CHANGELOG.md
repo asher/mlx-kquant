@@ -48,8 +48,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stack (Hy4 iq2_xxs gate with stq1_0 up); `moe_glu_pair_has_kernel` lists the pairs.
 
 ### Changed
-- `stq1_0` fused MoE gathers and its one-row `quantized_matmul` run 1.9x to 3.7x faster, and split
-  pairs with `iq2_xxs` 1.3x to 2.4x (Hy4 shapes, M5 Max); outputs differ at rounding level.
+- `stq1_0` fused MoE gathers and one-row `quantized_matmul` run 1.9x to 3.7x faster, split pairs
+  with `iq2_xxs` 1.3x to 2.4x (Hy4, M5 Max); they and `hc_lowrank_mix` on `stq1_0` change low bits.
 - On M5 and later GPUs the fused MoE gathers at 5 to 16 rows read each expert once for up to eight
   rows: a 512-expert verify forward at 8 to 16 rows takes about 10% less time (M5 Max). Low bits
   change on most codecs; `KQ_MOE_GROUP=0` turns it off and `1` turns it on for other GPUs.
