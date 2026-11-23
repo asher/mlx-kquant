@@ -89,9 +89,9 @@ bool dequantize_route_takes(
 // KQ_MOE_NX does not force one.
 int moe_c32_nx(const std::string& arch);
 
-// Whether this codec has the 32-weight decode step of the c32 kernels (the
-// grid codecs).
-bool codec_has_c32(const std::string& codec);
+// Whether this codec has the one-row qmv_c32 kernel (the grid codecs and
+// stq1_0).
+bool codec_has_qmv_c32(const std::string& codec);
 
 // Whether the MoE gathers of this codec take the c32 kernels at t = 1 by
 // default on a GPU with this architecture string.

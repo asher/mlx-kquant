@@ -253,7 +253,7 @@ less time than the per-row kernels: 2.7% less at K 8192 and N 4096, and 3.2% les
 8192. In a synced decode step of eight Muse Spark UD-IQ2_S layers, it saved 1.1% per layer.
 
 The split-K mat-vec covers `q6_k` and `q8_0`. The other codecs run one activation row through
-their per-row kernels, and the grid codecs through `qmv_c32` on M5 and later GPUs.
+their per-row kernels, and the grid codecs and `stq1_0` through `qmv_c32` on M5 and later GPUs.
 
 Under sustained decode the GPU runs below its top clock, where the per-row kernels turn ALU-bound.
 Measured on M5 Max over 90 seconds of back-to-back mat-vecs at the gemma-4 31B MLP shapes, the
@@ -422,9 +422,9 @@ Tuning levers (defaults are right for normal use):
   forces the coarse tiling, and unset takes the fine tiling at one activation row up to the
   per-codec N ceiling that `kq.qmv_fine_max_n(codec)` reports, except that `nvfp4` keeps the
   coarse tiling at N 2049 to 2560, and at N 1537 to 2048 from K 5120. Read live per call.
-- `KQ_QMV_C32` - the c32 mat-vec of the grid codecs at one activation row (see the fused MoE
-  section). `0` restores the per-row kernels and `1` runs c32 on any GPU. `8` or `16` runs it at
-  that many K-lanes per row. Unset takes it on M5 and later GPUs. A set `KQ_QMV_FINE` keeps the
+- `KQ_QMV_C32` - the c32 mat-vec of the grid codecs and `stq1_0` at one activation row (see the
+  fused MoE section). `0` restores the per-row kernels and `1` runs c32 on any GPU. `8` or `16` runs
+  it at that many K-lanes per row. Unset takes it on M5 and later GPUs. A set `KQ_QMV_FINE` keeps the
   per-row kernels. Read live per call.
 - `KQ_GATHER_SPLITK` - the `q6_k` and `q8_0` split-K kernels for `gather_qmm` at one activation
   row. `0` restores `gather_qmv`, `1` takes split-K at any K that 256 divides, and unset follows
@@ -1329,7 +1329,8 @@ kernels. The shared-expert gathers with a `q5_k` shared expert stop at 16, and `
 them raises an error that names the setting.
 
 The one-row `quantized_matmul` of a grid codec runs the same row step (`kq_<codec>_qmv_c32`), on
-M5 and later GPUs by default, at the GLU width. `KQ_QMV_C32` controls it (see the mat-vec levers).
+M5 and later GPUs by default, at the GLU width. `stq1_0` runs its 64-weight step there at 8 K-lanes
+(see below). `KQ_QMV_C32` controls it (see the mat-vec levers).
 
 On M3 Max at E=256, N=K=4096 and top 8, back to back, the gate/up gather took 0.303 ms against
 0.340 ms (-11.1%), and the down gather took 0.166 ms against 0.191 ms (-12.5%). In a synced decode
@@ -1371,14 +1372,58 @@ codecs (Hy4: an `iq2_xxs` gate stack with an `stq1_0` up stack). `moe_glu_gather
 The kernels are the Ext gathers templated on the pair (`KqGluPair<gate, up>`): each projection
 decodes through its own codec and its own staged tables, in the loop a single codec runs. A pair
 takes the forms either of its codecs would take alone at each row count: the 32-weight step at one
-row where either codec has it (the other decodes two 16-weight chunks per step), the dedupe kernels
-at 2 to 8 rows, the grouped kernels at 5 to 16 rows, and the plain kernels past that, with a
-`q5_k`, `q6_k` or `q8_0` shared expert or none. Pairs have no qf or half-dot kernels.
+row where either codec has it (the other decodes two 16-weight chunks per step, or its 64-weight
+span for `stq1_0`), the dedupe kernels at 2 to 8 rows, the grouped kernels at 5 to 16 rows, and
+the plain kernels past that, with a `q5_k`, `q6_k` or `q8_0` shared expert or none. A pair with an
+`stq1_0` stack keeps the plain forms at every width, as `stq1_0` does alone (see below). Pairs have no qf or half-dot kernels.
 
 The pairs with kernels are listed in `kq_glu_pairs.h`; one line there adds a pair.
 `kq.moe_glu_pair_has_kernel(gate, up, shexp_gate="", shexp_up="", shared_slots=1)` says whether a
 call has kernels, and a call without them raises an error that names the codecs. A split pair takes
 no biases and no output scales.
+
+### stq1_0 64-weight step
+
+An `stq1_0` block holds 256 weights as 64 groups of four. Group `g` covers weights
+`64 * (g / 16) + g % 16 + 16 * p` for planes `p` 0 to 3, and its 5-bit code (a nibble of `qs` and
+one sign bit) picks one of 32 codebook bytes that pack the four ternary values. The 16-weight step
+the other codecs run decodes one plane: a codebook read per weight, which uses a quarter of the
+entry, and the shifts and masks to peel it. At one row that step was ALU-bound: on M5 Max at E=256,
+top 8, K=6144 and N=2048, the gate/up gather read about 160 GB/s of distinct expert bytes, where
+`iq2_xxs` read about 415.
+
+The gathers of `stq1_0` stacks (gate/up, the shared-expert GLU, the plain down, both score-mixed
+downs, and either side of a split pair) step 64 weights instead (`KqExtC64`). The four planes of a
+group sit in one 64-weight span, so a lane holds its 64 activations as 16 `float4`, reads each
+group's four weights as one `half4` from a codebook table staged in threadgroup memory, and
+multiplies them against the matching activation lanes with no reorder. The multi-row loops decode
+each group once for all their rows. The one-row `quantized_matmul` takes the same step through
+`qmv_c32` on M5 and later GPUs, at 8 K-lanes. The 16-weight decode, which the tiled down and the
+expert stores keep, reads one table entry per weight, with the same values. Outputs of the 64-weight
+step differ from the 16-weight kernels in summation order.
+
+With the step bound by the weight read, the extra work of the other forms no longer pays:
+`stq1_0` stems take the plain kernels at 8 K-lanes at every width, and the dense shared-expert
+route where it applies. `KQ_MOE_GROUP=1` and `KQ_MOE_DEDUP=1` set explicitly keep the grouped (and
+tiled) and dedupe forms, and `KQ_MOE_NX` forces a width. At 8 rows the plain gate/up gather took
+1129 us against 1216 grouped and 1280 at 16 K-lanes, and the score-mixed down with a `q6_k` shared
+slot 817 against 1871 tiled (M5 Max, Hy4 shapes).
+
+Hy4 shapes on M5 Max (E=256, top 8, gate/up K=6144 and N=2048, down K=2048 and N=6144, a `q6_k`
+shared expert, clamped SwiGLU), us per call at the sustained clock, mean of two processes per build:
+
+| Call | Rows | 16-weight step | 64-weight step | `iq2_xxs` |
+|---|---|---|---|---|
+| gate/up gather | 1 | 311 | 125 | 196 |
+| gate/up gather | 8 | 2321 | 894 | 1461 |
+| gate/up gather | 64 | 17883 | 6477 | 11205 |
+| shared-expert GLU | 1 | 326 | 152 | 220 |
+| shared-expert GLU | 8 | 2686 | 946 | 1672 |
+| `iq2_xxs` gate, `stq1_0` up | 1 | 215 | 154 | 196 |
+| `iq2_xxs` gate, `stq1_0` up | 8 | 1845 | 1057 | 1461 |
+| score-mixed down | 1 | 184 | 99 | 124 |
+| score-mixed down | 8 | 1217 | 629 | 1016 |
+| `quantized_matmul`, N=K=6144 | 1 | 72 | 39 | 49 |
 
 ### K-quant chunk decode
 

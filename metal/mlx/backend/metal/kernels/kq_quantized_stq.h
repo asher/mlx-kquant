@@ -108,19 +108,33 @@ template <typename T, short r1ptg, short nsg, short nxpsg>
       w, x, y, in_vec_size, out_vec_size, tgpig, tiisg, sgitg);
 }
 
+// The staged tables hold each of the 32 codes as the four plane weights
+// {-1, 0, +1} of its group, as a float4 (the 16-weight decode reads one
+// plane) and then as a half4 (the 64-weight step, KqExtC64, reads all four).
 // deq_chunk16s returns scale = d with raw {-1,0,+1} lanes; the hoisted scale
 // makes the fused path tolerance-equal to the scaled decode, not bit-equal.
 template <>
 struct KqTgLuts<KqStq1_0Ext> {
-  MLX_MTL_CONST int bytes = 32;
+  MLX_MTL_CONST int bytes = 32 * 16 + 32 * 8;
   static METAL_FUNC void
   stage(threadgroup uint8_t* dst, ushort lin, ushort n_threads) {
-    threadgroup uint32_t* d32 = reinterpret_cast<threadgroup uint32_t*>(dst);
-    const constant uint32_t* cb32 =
-        reinterpret_cast<const constant uint32_t*>(stq1_0_codebook);
-    for (int i = lin; i < 8; i += n_threads) {
-      d32[i] = cb32[i];
+    threadgroup float4* d4 = reinterpret_cast<threadgroup float4*>(dst);
+    threadgroup half4* h4 = reinterpret_cast<threadgroup half4*>(dst + 32 * 16);
+    for (int i = lin; i < 32; i += n_threads) {
+      const uint c = stq1_0_codebook[i];
+      const float4 v = float4(
+                           float(c & 3),
+                           float((c >> 2) & 3),
+                           float((c >> 4) & 3),
+                           float(c >> 6)) -
+          1.0f;
+      d4[i] = v;
+      h4[i] = half4(v);
     }
+  }
+  // Code of group 4k + j of a chunk: its slot nibble and its sign bit.
+  static METAL_FUNC uint code(uint q4, uint sg, short k, short j) {
+    return ((q4 >> (4 * j)) & 0xF) | (((sg >> (4 * k + j)) & 1) << 4);
   }
   static METAL_FUNC void deq_chunk16s(
       const device uint8_t* block,
@@ -130,24 +144,21 @@ struct KqTgLuts<KqStq1_0Ext> {
       thread float& scale) {
     const short chunk = il >> 2;
     const short p = il & 3;
+    const threadgroup float* lf =
+        reinterpret_cast<const threadgroup float*>(luts) + p;
     scale = float(*(const device half*)(block + KQ_STQ1_0_D_OFFSET));
     const device ushort* qsw =
         reinterpret_cast<const device ushort*>(block) + 4 * chunk;
-    const ushort sg = *(
+    const uint sg = *(
         reinterpret_cast<const device ushort*>(block + KQ_STQ1_0_SIGN_OFFSET) +
         chunk);
 #pragma unroll
     for (short k = 0; k < 4; ++k) {
-      const ushort q4 = qsw[k];
-      uint cbw = 0;
+      const uint q4 = qsw[k];
 #pragma unroll
       for (short j = 0; j < 4; ++j) {
-        cbw |= uint(luts
-                        [(((sg >> (4 * k + j)) & 1) << 4) |
-                         ((q4 >> (4 * j)) & 0xF)])
-            << (8 * j);
+        reg[k][j] = lf[4 * code(q4, sg, k, j)];
       }
-      reg[k] = kq_stq1_0_peel(cbw, p);
     }
   }
   static METAL_FUNC void deq_chunk16(
@@ -160,6 +171,55 @@ struct KqTgLuts<KqStq1_0Ext> {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       reg[i] *= scale;
+    }
+  }
+};
+
+// 64-weight step for the Ext gathers, for a codec whose four 16-weight
+// chunks decode from one shared read: span ic of a block (weights 64 ic ..
+// 64 ic + 63) in quarters k = 0..3. quarter writes v[j], the weights of
+// activations 4k + j, 16 + 4k + j, 32 + 4k + j and 48 + 4k + j, unscaled;
+// scale is the span's scale. `luts` is the codec's KqTgLuts block. Codecs
+// without the step keep ok = false.
+template <typename Codec>
+struct KqExtC64 {
+  MLX_MTL_CONST bool ok = false;
+  static METAL_FUNC float scale(const device uint8_t*) {
+    return 0.0f;
+  }
+  static METAL_FUNC void quarter(
+      const device uint8_t*,
+      short,
+      short,
+      thread float4*,
+      const threadgroup uint8_t*) {}
+};
+
+// STQ1_0 span ic is chunk ic: group g's code gives its weight in each of the
+// four planes, so one load from the staged half4 table (after the float4
+// one) serves four weights.
+template <>
+struct KqExtC64<KqStq1_0Ext> {
+  MLX_MTL_CONST bool ok = true;
+  static METAL_FUNC float scale(const device uint8_t* block) {
+    return float(*(const device half*)(block + KQ_STQ1_0_D_OFFSET));
+  }
+  static METAL_FUNC void quarter(
+      const device uint8_t* block,
+      short ic,
+      short k,
+      thread float4* v,
+      const threadgroup uint8_t* luts) {
+    const threadgroup half4* l4 =
+        reinterpret_cast<const threadgroup half4*>(luts + 32 * 16);
+    const uint q4 =
+        *(reinterpret_cast<const device ushort*>(block) + 4 * ic + k);
+    const uint sg = *(
+        reinterpret_cast<const device ushort*>(block + KQ_STQ1_0_SIGN_OFFSET) +
+        ic);
+#pragma unroll
+    for (short j = 0; j < 4; ++j) {
+      v[j] = float4(l4[KqTgLuts<KqStq1_0Ext>::code(q4, sg, k, j)]);
     }
   }
 };

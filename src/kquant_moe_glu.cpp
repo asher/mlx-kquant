@@ -186,6 +186,30 @@ inline bool kq_moe_group_glu(int T) {
       T >= kq_env_lever_from("KQ_MOE_GROUP_MIN_T", KQ_GRP_GLU_MIN_T, 2);
 }
 
+// Gather stems with a stq1_0 stack (the codec, or either side of a split
+// GLU pair). Their Ext loops take the 64-weight step, which is bound by
+// the weight read at nx 8; the grouped, tiled, dedupe and nx16 forms add
+// work on top of it. So these stems keep the plain forms at nx 8 at every
+// width, and with them the dense shared-expert route. On M5 Max (E=256
+// top-8, K=6144, N=2048) the plain GLU took 583 us a call against 654
+// grouped and 608 dedupe at 8 rows, and 1154 against 1455 grouped at 16; a
+// split pair with iq2_xxs took 702 against 970 grouped at 8 rows. The
+// score-mixed down (K=2048, N=6144, a q6_k shared slot) took 421 us
+// against 917 tiled at 8 rows, and 228 against 250 dedupe at 4.
+// KQ_MOE_NX still forces a width, and KQ_MOE_GROUP=1 or KQ_MOE_DEDUP=1
+// set explicitly keep the grouped (and tiled) or dedupe forms.
+inline bool kq_moe_c64(const std::string& stem) {
+  return stem.find("stq1_0") != std::string::npos;
+}
+inline bool kq_moe_c64_grp_off(const std::string& stem) {
+  static const bool set = kq_getenv("KQ_MOE_GROUP") != nullptr;
+  return kq_moe_c64(stem) && !(set && kq_env_flag("KQ_MOE_GROUP", 1) != 0);
+}
+inline bool kq_moe_c64_dd_off(const std::string& stem) {
+  static const bool set = kq_getenv("KQ_MOE_DEDUP") != nullptr;
+  return kq_moe_c64(stem) && !(set && kq_env_flag("KQ_MOE_DEDUP", 1) != 0);
+}
+
 // A forced KQ_MOE_MIX_FORM names one of the ungrouped forms, so the grouped
 // down stands aside for it.
 inline bool kq_moe_group_mix(int T) {
@@ -757,7 +781,8 @@ inline bool kq_moe_shexp_dense(
     int K) {
   const char* e = kq_getenv("KQ_MOE_SHEXP_DENSE");
   if ((e == nullptr || e[0] == '\0') && T >= KQ_GRP_DENSE_OFF_MIN_T &&
-      kq_moe_group_glu(T) && kq_moe_group_form(t, st, N, K) != KQ_GRP_NONE) {
+      !kq_moe_c64_grp_off(t) && kq_moe_group_glu(T) &&
+      kq_moe_group_form(t, st, N, K) != KQ_GRP_NONE) {
     return false;
   }
   return kq_moe_shexp_dense(T);
@@ -785,7 +810,8 @@ inline bool kq_moe_tile_ok(
   if (T > KQ_GRP_MAX_T || bits != 0 || K % 32 != 0) {
     return false;
   }
-  if (t == "nvfp4" || st == "nvfp4" || kq_moe_half(t, K)) {
+  if (t == "nvfp4" || st == "nvfp4" || kq_moe_half(t, K) ||
+      kq_moe_c64_grp_off(t)) {
     return false;
   }
   return kq_moe_group(T) && kq_env_flag("KQ_MOE_TILE", 1) != 0 &&
@@ -1206,7 +1232,8 @@ void KQuantMoEGLUKQ::eval_gpu(
 
   // Grouped form: the shared-expert grouped kernel with no shared slots,
   // the expert stacks standing in for its shared operands.
-  const int gform = !biased && kq_moe_group_glu(T)
+  const bool c64 = kq_moe_c64(kt);
+  const int gform = !biased && !kq_moe_c64_grp_off(kt) && kq_moe_group_glu(T)
       ? kq_moe_group_form(kt, "", N, K)
       : KQ_GRP_NONE;
   if (gform != KQ_GRP_NONE) {
@@ -1255,12 +1282,12 @@ void KQuantMoEGLUKQ::eval_gpu(
   const bool qf = kq_moe_qf(kt, N, K);
   const bool use_half = !qf && !biased && kq_moe_half(kt, K);
   const bool dd = (!qf || kq_qf_pairs(kt)) && !biased && !use_half &&
-      kq_moe_dedup(T, KQ_DD_MAX_T);
+      !kq_moe_c64_dd_off(kt) && kq_moe_dedup(T, KQ_DD_MAX_T);
   const bool c32 = !qf && !biased && !use_half && !dd &&
       kq_moe_c32_glu(kquant_type_, up_type_, T);
   const int nx = qf || use_half ? 8
       : c32                     ? kq_moe_c32_nx()
-                                : kq_moe_pick_nx((int64_t)N * R * T, K, true);
+                                : kq_moe_pick_nx((int64_t)N * R * T, K, !c64);
   std::string stem = qf ? kt + "_qf" : kq_gather_stem_nx(kt, K, nx);
   if (dd && (stem == "q6_k" || stem == "q8_0")) {
     stem += "_ext"; // the dedupe kernels are Ext-only
@@ -1437,15 +1464,17 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
 
   // The routed kernel stem: the codec, or a split pair's (kq_glu_stem).
   const std::string kt = kq_glu_stem(kquant_type_, up_type_);
+  const bool c64 = kq_moe_c64(kt);
   const bool upcast_pair = shexp_up_type_ == shexp_type_ &&
       (shexp_type_ == kt || shexp_type_ == "q5_k" || shexp_type_ == "q6_k" ||
        shexp_type_ == "q8_0");
   if (!upcast_pair) {
     // Gate and up of the shared expert each in its own codec: the "_sx2_"
     // instantiations, generic float path, one launch shape for any T.
-    const bool grp2 = kq_moe_group_glu(T) && !kq_moe_half(kquant_type_, K);
+    const bool grp2 = !kq_moe_c64_grp_off(kt) && kq_moe_group_glu(T) &&
+        !kq_moe_half(kquant_type_, K);
     const int nx = grp2 ? kq_moe_group_nx((int64_t)N * (R + NS) * T, K, true)
-                        : kq_moe_pick_nx((int64_t)N * (R + NS) * T, K, true);
+                        : kq_moe_pick_nx((int64_t)N * (R + NS) * T, K, !c64);
     const std::string kname = "kq_" + kquant_type_ + "_sx2_" + shexp_type_ +
         "_" + shexp_up_type_ + "_moe_glu_gather_shexp_" +
         (grp2 ? "grp_silu" : "silu") + kq_nx_suffix(nx) + "_" +
@@ -1479,7 +1508,7 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
 
   // Mixed shexp codecs dispatch the generic "_sx_" instantiations. The
   // half-dot pick keys on the expert codec; the shared slot stays float.
-  const int gform = kq_moe_group_glu(T)
+  const int gform = !kq_moe_c64_grp_off(kt) && kq_moe_group_glu(T)
       ? kq_moe_group_form(kt, shexp_type_, N, K)
       : KQ_GRP_NONE;
   const bool grp = gform != KQ_GRP_NONE;
@@ -1489,13 +1518,14 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   const bool use_half = !grp && !qf && kq_moe_half(kt, K) &&
       (shexp_type_ == kt || shexp_type_ == "q5_k" || shexp_type_ == "q6_k" ||
        shexp_type_ == "q8_0");
-  const bool dd = !grp && !qf && !use_half && kq_moe_dedup(T, KQ_DD_MAX_T);
+  const bool dd = !grp && !qf && !use_half && !kq_moe_c64_dd_off(kt) &&
+      kq_moe_dedup(T, KQ_DD_MAX_T);
   const bool c32 = !grp && !qf && !use_half && !dd &&
       kq_moe_c32_glu(kquant_type_, up_type_, T);
   const int nx = qf || use_half ? 8
       : grp ? kq_moe_group_nx((int64_t)N * (R + NS) * T, K, true)
       : c32 ? kq_moe_c32_nx()
-            : kq_moe_pick_nx((int64_t)N * (R + NS) * T, K, true);
+            : kq_moe_pick_nx((int64_t)N * (R + NS) * T, K, !c64);
   // The qf kernels always carry the shared codec in the name, and so do
   // the grouped ones.
   std::string stem = grp  ? kq_moe_group_stem(gform, kt, shexp_type_)
@@ -1619,7 +1649,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   }
 
   // Grouped form: a routed expert is read once per eight pairs on it.
-  const int gform = kq_moe_group_mix(T)
+  const int gform = !kq_moe_c64_grp_off(kquant_type_) && kq_moe_group_mix(T)
       ? kq_moe_group_form(kquant_type_, shexp_type_, N, K, NS == 1)
       : KQ_GRP_NONE;
   if (gform != KQ_GRP_NONE) {
@@ -1692,7 +1722,8 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   const bool use_half = kq_moe_half(kquant_type_, K) &&
       (shexp_type_ == kquant_type_ || shexp_type_ == "q5_k" ||
        shexp_type_ == "q6_k" || shexp_type_ == "q8_0");
-  const bool dd_ok = !use_half && S <= 16 && kq_moe_dedup(T, KQ_DD_MAX_T);
+  const bool dd_ok = !use_half && !kq_moe_c64_dd_off(kquant_type_) && S <= 16 &&
+      kq_moe_dedup(T, KQ_DD_MAX_T);
   const int SP =
       kq_moe_sx_split(kquant_type_, shexp_type_, K, S - NS, NS, use_half, T);
   const std::string sp_stem = shexp_type_ == kquant_type_
@@ -1854,7 +1885,8 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   // dropped. Decode-scale launches route to the slot-parallel variant
   // unless the codec widens (kq_moe_mix_ns_wide).
   const bool qf = kq_moe_qf(kquant_type_, N, K);
-  const bool dd_ok = !qf && S <= 16 && kq_moe_dedup(T, KQ_DD_MAX_T);
+  const bool dd_ok = !qf && !kq_moe_c64_dd_off(kquant_type_) && S <= 16 &&
+      kq_moe_dedup(T, KQ_DD_MAX_T);
   const bool c32_ok = !qf && kq_moe_c32(kquant_type_, T);
   const bool sp_ok =
       (c32_ok
@@ -1870,7 +1902,7 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
       ? kq_moe_c32_down_nx()
       : kq_moe_pick_nx(
             (int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, dd ? 2 : T, K));
-  const int gform = kq_moe_group_mix(T)
+  const int gform = !kq_moe_c64_grp_off(kquant_type_) && kq_moe_group_mix(T)
       ? kq_moe_group_form(kquant_type_, "", N, K)
       : KQ_GRP_NONE;
   if (kq_moe_tile_mix(T, kquant_type_, kquant_type_, N, K, out_scale_bits_)) {
@@ -2306,15 +2338,19 @@ bool moe_c32_on(const std::string& arch, const std::string& codec) {
       (kq_moe_has_c32(codec) && moe_mac_gpu_gen(arch) >= 17);
 }
 
-bool codec_has_c32(const std::string& codec) {
-  return kq_moe_has_c32(codec);
+// The codecs with a qmv_c32 kernel: the grid codecs and stq1_0, whose row
+// step there is its 64-weight span (KqExtC64).
+bool codec_has_qmv_c32(const std::string& codec) {
+  return kq_moe_has_c32(codec) || codec == "stq1_0";
 }
 
-// The M = 1 quantized_matmul of a grid codec through the c32 row step: from
-// gen 17 (M5), measured on an M5 Max only. At K=4096, N=14336 the qmv
-// kernels took 2 to 21% longer (iq2_s and iq3_s most, iq2_xxs least).
+// The M = 1 quantized_matmul of a grid codec or stq1_0 through the c32 row
+// step: from gen 17 (M5), measured on an M5 Max only. At K=4096, N=14336
+// the qmv kernels took 2 to 21% longer (iq2_s and iq3_s most, iq2_xxs
+// least); stq1_0 at N=K=6144 took 50 us a call on them against 28 to 30 on
+// the 64-weight span at nx 8.
 bool qmv_c32_on(const std::string& arch, const std::string& codec) {
-  return moe_mac_gpu_gen(arch) >= 17 && kq_moe_has_c32(codec);
+  return moe_mac_gpu_gen(arch) >= 17 && codec_has_qmv_c32(codec);
 }
 
 // Codecs with the fused kq GLU/gather kernels wired (kq_moe_glu_kq.h):

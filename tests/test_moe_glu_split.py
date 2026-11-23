@@ -2,11 +2,12 @@
 
 moe_glu_gather_kq and moe_glu_gather_shexp_kq take up_kquant_type for an up
 stack in another codec than the gate stack (per-tensor quant recipes give
-the two their own codecs). A split pair runs the same kernel forms a
-single-codec block of either codec runs at each row count: the c32 step at
-one row where a codec has it, the dedupe pairs at 2 to 8 rows, the grouped
-kernels at 5 to 16 rows on GPUs with tensor-op units, and the plain
-kernels past that. Each case checks every form against a float reference
+the two their own codecs). A split pair has the kernel forms a
+single-codec block has: the c32 step at one row where a codec has it, the
+dedupe pairs, the grouped kernels and the plain kernels. A pair with a
+stq1_0 stack takes the c32 step or the plain kernels by default, and the
+dedupe and grouped forms when their levers are set. Each case checks every
+form against a float reference
 built from the dequantized stacks, with the clamped SwiGLU act
 (silu_limit) and a q6_k shared expert, at the forms the default pick takes
 and at the forms the levers force. moe_glu_pair_has_kernel names the pairs
@@ -46,7 +47,7 @@ REL_BOUND = 2e-3
 # kernels forced on (every GPU runs them), and the plain kernels alone.
 RUNS = {
     "default": {},
-    "forced": {"KQ_MOE_GROUP": "1", "KQ_MOE_C32": "1"},
+    "forced": {"KQ_MOE_GROUP": "1", "KQ_MOE_DEDUP": "1", "KQ_MOE_C32": "1"},
     "plain": {"KQ_MOE_GROUP": "0", "KQ_MOE_C32": "0", "KQ_MOE_DEDUP": "0"},
 }
 
@@ -250,9 +251,8 @@ def _form(name):
 
 
 # The forms each lever set allows at each row count. The default pick runs
-# c32 at one row on GPUs that take it and the plain kernels elsewhere, and the
-# grouped kernels from 5 rows to 16 on GPUs with tensor-op units, the dedupe
-# and plain kernels without them.
+# c32 at one row on GPUs that take it and the plain kernels elsewhere: every
+# pair here has a stq1_0 stack, whose 64-weight step is fastest plain.
 ALLOWED = {
     "plain": {t: {"plain"} for t in ROWS},
     "forced": {
@@ -263,19 +263,12 @@ ALLOWED = {
         64: {"c32"},
         512: {"c32"},
     },
-    "default": {
-        1: {"c32", "plain"},
-        2: {"dd"},
-        8: {"grp", "dd"},
-        16: {"grp", "plain"},
-        64: {"plain"},
-        512: {"plain"},
-    },
+    "default": {t: {"c32", "plain"} if t == 1 else {"plain"} for t in ROWS},
 }
 NEEDED = {
     "plain": {"plain"},
     "forced": {"c32", "dd", "grp"},
-    "default": {"dd", "plain"},
+    "default": {"plain"},
 }
 
 

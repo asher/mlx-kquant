@@ -249,6 +249,17 @@ instantiate_kq_ext_c32(iq3_s, KqIq3_sExt)
 instantiate_kq_ext_c32(iq1_s, KqIq1_sExt)
 instantiate_kq_ext_c32(iq1_m, KqIq1_mExt)
 
+// The one-row quantized_matmul of stq1_0 on the row step of its gathers,
+// which for stq1_0 is the 64-weight span (KqExtC64).
+#define instantiate_kq_qmv_row(codec, traits, type)                           \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_qmv_c32_" #type, kq_ext_qmv_c32, type, traits, 8)         \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_qmv_c32_nx16_" #type, kq_ext_qmv_c32, type, traits, 16)
+
+instantiate_kq_qmv_row(stq1_0, KqStq1_0Ext, bfloat16_t)
+instantiate_kq_qmv_row(stq1_0, KqStq1_0Ext, float16_t)
+
 // Grouped gathers (kq_moe_glu_kq.h, KQ_MOE_GROUP): the expert codecs of the
 // UD low-bit builds over a q6_k or q8_0 shared expert.
 instantiate_kq_moe_grp_common()

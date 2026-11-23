@@ -951,6 +951,157 @@ METAL_FUNC float kq_ext_dot32(
        dot(l1[3], float4(*(const device vec<T, 4>*)(xp + 28))));
 }
 
+// The 64-weight loops: a codec with KqExtC64 steps whole 64-weight spans.
+// kq_ext_dot64 is the scaled dot of span ic of a weight row with a, its 64
+// activations held as float4s in natural order: the codec's quarters where
+// it has the step, else its two 32-weight groups (a pair's other codec in a
+// 64-weight loop).
+template <typename T>
+METAL_FUNC void kq_ext_x64(const device T* xp, thread float4* a) {
+#pragma unroll
+  for (short i = 0; i < 16; ++i) {
+    a[i] = float4(*(const device vec<T, 4>*)(xp + 4 * i));
+  }
+}
+
+// s plus the products of quarter v with its activations x0..x3, the float4s
+// of activations 4k, 16 + 4k, 32 + 4k and 48 + 4k of the span.
+METAL_FUNC float4 kq_ext_fma_quarter(
+    const thread float4* v,
+    float4 x0,
+    float4 x1,
+    float4 x2,
+    float4 x3,
+    float4 s) {
+#pragma unroll
+  for (short j = 0; j < 4; ++j) {
+    s += v[j] * float4(x0[j], x1[j], x2[j], x3[j]);
+  }
+  return s;
+}
+
+template <typename Codec>
+METAL_FUNC float kq_ext_dot64(
+    const device uint8_t* w_row,
+    int ic,
+    const thread float4* a,
+    const threadgroup uint8_t* luts) {
+  if (KqExtC64<Codec>::ok) {
+    constexpr short cpb = Codec::superblock / 64;
+    const device uint8_t* block =
+        w_row + (int64_t)(ic / cpb) * Codec::block_bytes;
+    const short c = short(ic % cpb);
+    float4 s = 0.0f;
+#pragma unroll
+    for (short k = 0; k < 4; ++k) {
+      float4 v[4];
+      KqExtC64<Codec>::quarter(block, c, k, v, luts);
+      s = kq_ext_fma_quarter(v, a[k], a[4 + k], a[8 + k], a[12 + k], s);
+    }
+    return KqExtC64<Codec>::scale(block) * (s.x + s.y + s.z + s.w);
+  }
+  float s = 0.0f;
+#pragma unroll
+  for (short h = 0; h < 2; ++h) {
+    float4x4 l0, l1;
+    const float2 sc = kq_ext_deq32<Codec>(w_row, 2 * ic + h, l0, l1, luts);
+    const thread float4* ah = a + 8 * h;
+    s += sc.x *
+            (dot(l0[0], ah[0]) + dot(l0[1], ah[1]) + dot(l0[2], ah[2]) +
+             dot(l0[3], ah[3])) +
+        sc.y *
+            (dot(l1[0], ah[4]) + dot(l1[1], ah[5]) + dot(l1[2], ah[6]) +
+             dot(l1[3], ah[7]));
+  }
+  return s;
+}
+
+// kq_ext_dot64 against activations read from x[0..63].
+template <typename T, typename Codec>
+METAL_FUNC float kq_ext_dot64x(
+    const device T* xp,
+    const device uint8_t* w_row,
+    int ic,
+    const threadgroup uint8_t* luts) {
+  float4 a[16];
+  kq_ext_x64(xp, a);
+  return kq_ext_dot64<Codec>(w_row, ic, a, luts);
+}
+
+// Span ic of a weight row against NR activation rows x0.. (each at the
+// span's start), the span decoded once: component r of the result is row
+// r's scaled dot. A codec with KqExtC64 decodes a quarter at a time and
+// reads each row's activations for it; another decodes its four 16-weight
+// chunks.
+template <typename T, typename Codec, int NR>
+METAL_FUNC float4 kq_ext_dot64_rows(
+    const device uint8_t* w_row,
+    int ic,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    const device T* x3,
+    const threadgroup uint8_t* luts) {
+  const device T* xs[4] = {x0, x1, x2, x3};
+  float4 out = 0.0f;
+  if (KqExtC64<Codec>::ok) {
+    constexpr short cpb = Codec::superblock / 64;
+    const device uint8_t* block =
+        w_row + (int64_t)(ic / cpb) * Codec::block_bytes;
+    const short c = short(ic % cpb);
+    float4 s[NR];
+#pragma unroll
+    for (short r = 0; r < NR; ++r) {
+      s[r] = 0.0f;
+    }
+#pragma unroll
+    for (short k = 0; k < 4; ++k) {
+      float4 v[4];
+      KqExtC64<Codec>::quarter(block, c, k, v, luts);
+#pragma unroll
+      for (short r = 0; r < NR; ++r) {
+        const device T* xp = xs[r] + 4 * k;
+        s[r] = kq_ext_fma_quarter(
+            v,
+            float4(*(const device vec<T, 4>*)(xp)),
+            float4(*(const device vec<T, 4>*)(xp + 16)),
+            float4(*(const device vec<T, 4>*)(xp + 32)),
+            float4(*(const device vec<T, 4>*)(xp + 48)),
+            s[r]);
+      }
+    }
+    const float d = KqExtC64<Codec>::scale(block);
+#pragma unroll
+    for (short r = 0; r < NR; ++r) {
+      out[r] = d * (s[r].x + s[r].y + s[r].z + s[r].w);
+    }
+    return out;
+  }
+  constexpr short chpb = Codec::superblock / 16;
+#pragma unroll
+  for (short q = 0; q < 4; ++q) {
+    const int ich = 4 * ic + q;
+    float4x4 lw;
+    float sc;
+    KqTgLuts<Codec>::deq_chunk16s(
+        w_row + (int64_t)(ich / chpb) * Codec::block_bytes,
+        short(ich % chpb),
+        lw,
+        luts,
+        sc);
+#pragma unroll
+    for (short r = 0; r < NR; ++r) {
+      const device T* xp = xs[r] + 16 * q;
+      out[r] += sc *
+          (dot(lw[0], float4(*(const device vec<T, 4>*)(xp + 0))) +
+           dot(lw[1], float4(*(const device vec<T, 4>*)(xp + 4))) +
+           dot(lw[2], float4(*(const device vec<T, 4>*)(xp + 8))) +
+           dot(lw[3], float4(*(const device vec<T, 4>*)(xp + 12))));
+    }
+  }
+  return out;
+}
+
 // Partial dot of x (one activation row) against wire-byte weight row `row`,
 // this thread's K-stripe only (chunks tx, tx + NX, ...). `luts` is the
 // codec's threadgroup-staged table block (KqTgLuts; unused for table-free
@@ -965,6 +1116,12 @@ METAL_FUNC float kq_ext_span_partial(
     const threadgroup uint8_t* luts) {
   constexpr short chpb = Codec::superblock / 16;
   float acc = 0.0f;
+  if (KqExtC64<Codec>::ok) {
+    for (int ic = tx; 64 * ic < K; ic += NX) {
+      acc += kq_ext_dot64x<T, Codec>(x + ic * 64, w_row, ic, luts);
+    }
+    return acc;
+  }
   if (C32 && KqExtC32<Codec>::ok) {
     constexpr short gpb = Codec::superblock / 32;
     for (int ig = tx; 32 * ig < K; ig += NX) {
@@ -1054,6 +1211,15 @@ METAL_FUNC float2 kq_ext_glu_row_partial(
       uw + row * (int64_t)(K / U::superblock) * U::block_bytes;
   const threadgroup uint8_t* uluts = luts + KqGluTraits<Codec>::up_luts;
   float2 acc = float2(0.0f);
+  if (KqExtC64<G>::ok || KqExtC64<U>::ok) {
+    for (int ic = tx; 64 * ic < K; ic += NX) {
+      float4 a[16];
+      kq_ext_x64(x + ic * 64, a);
+      acc.x += kq_ext_dot64<G>(g_row, ic, a, luts);
+      acc.y += kq_ext_dot64<U>(u_row, ic, a, uluts);
+    }
+    return acc;
+  }
   if (C32 && (KqExtC32<G>::ok || KqExtC32<U>::ok)) {
     for (int ig = tx; 32 * ig < K; ig += NX) {
       const device T* xp = x + ig * 32;
@@ -1902,6 +2068,15 @@ METAL_FUNC float2 kq_ext_span_partial_pair(
     const threadgroup uint8_t* luts) {
   constexpr short chpb = Codec::superblock / 16;
   float2 acc = float2(0.0f);
+  if (KqExtC64<Codec>::ok) {
+    for (int ic = tx; 64 * ic < K; ic += NX) {
+      const int o = ic * 64;
+      acc += kq_ext_dot64_rows<T, Codec, 2>(
+                 w_row, ic, x0 + o, x1 + o, x0 + o, x0 + o, luts)
+                 .xy;
+    }
+    return acc;
+  }
   for (int ich = tx; 16 * ich < K; ich += NX) {
     const device uint8_t* block =
         w_row + (int64_t)(ich / chpb) * Codec::block_bytes;
@@ -1983,6 +2158,17 @@ METAL_FUNC float4 kq_ext_glu_row_partial_pair(
       uw + row * (int64_t)(K / U::superblock) * U::block_bytes;
   const threadgroup uint8_t* uluts = luts + KqGluTraits<Codec>::up_luts;
   float4 acc = float4(0.0f);
+  if (KqExtC64<G>::ok || KqExtC64<U>::ok) {
+    for (int ic = tx; 64 * ic < K; ic += NX) {
+      const int o = ic * 64;
+      const float4 g = kq_ext_dot64_rows<T, G, 2>(
+          g_row, ic, x0 + o, x1 + o, x0 + o, x0 + o, luts);
+      const float4 u = kq_ext_dot64_rows<T, U, 2>(
+          u_row, ic, x0 + o, x1 + o, x0 + o, x0 + o, uluts);
+      acc += float4(g.x, u.x, g.y, u.y);
+    }
+    return acc;
+  }
   for (int ich = tx; 16 * ich < K; ich += NX) {
     const device T* xp = x0 + ich * 16;
     const float4 a0 = float4(*(const device vec<T, 4>*)(xp + 0));
@@ -2434,6 +2620,14 @@ METAL_FUNC float4 kq_ext_row_partial_quad(
   const int nb = K / Codec::superblock;
   const device uint8_t* w_row = w + row * (int64_t)nb * Codec::block_bytes;
   float4 acc = float4(0.0f);
+  if (KqExtC64<Codec>::ok) {
+    for (int ic = tx; 64 * ic < K; ic += NX) {
+      const int o = ic * 64;
+      acc += kq_ext_dot64_rows<T, Codec, 4>(
+          w_row, ic, x0 + o, x1 + o, x2 + o, x3 + o, luts);
+    }
+    return acc;
+  }
   for (int ich = tx; 16 * ich < K; ich += NX) {
     float4x4 lw;
     float sc;
@@ -2478,6 +2672,16 @@ METAL_FUNC void kq_ext_glu_row_partial_quad(
   const threadgroup uint8_t* uluts = luts + KqGluTraits<Codec>::up_luts;
   ag = float4(0.0f);
   au = float4(0.0f);
+  if (KqExtC64<G>::ok || KqExtC64<U>::ok) {
+    for (int ic = tx; 64 * ic < K; ic += NX) {
+      const int o = ic * 64;
+      ag += kq_ext_dot64_rows<T, G, 4>(
+          g_row, ic, x0 + o, x1 + o, x2 + o, x3 + o, luts);
+      au += kq_ext_dot64_rows<T, U, 4>(
+          u_row, ic, x0 + o, x1 + o, x2 + o, x3 + o, uluts);
+    }
+    return;
+  }
   for (int ich = tx; 16 * ich < K; ich += NX) {
     const int o = ich * 16;
     float4x4 lw;
