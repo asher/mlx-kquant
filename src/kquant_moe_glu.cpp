@@ -3621,8 +3621,10 @@ void kq_store_rows(
     size_t first,
     size_t count) {
   for (size_t i = first; i < first + count && i < inputs.size(); ++i) {
-    kq_check_row_major(
-        inputs[i], std::string("[mlx_kquant.") + op + "] weights and planes");
+    if (!inputs[i].flags().row_contiguous) {
+      kq_check_row_major(
+          inputs[i], std::string("[mlx_kquant.") + op + "] weights and planes");
+    }
   }
 }
 

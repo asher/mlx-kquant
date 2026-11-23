@@ -302,7 +302,8 @@ void KQDsaIndexerScoreDecode::eval_gpu(
   ce.set_bytes(P, 4);
   if (param_slot_ >= 0) {
     ce.set_bytes(kq_param_value(inputs.back(), param_slot_), 5);
-    kq_param_site(5, 0, param_slot_);
+    // q_offset is a position: never negative.
+    kq_param_site(5, 0, param_slot_, 1, 0, 0);
   } else {
     ce.set_bytes(q_offset_, 5);
   }
