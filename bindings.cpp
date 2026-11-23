@@ -3608,7 +3608,10 @@ NB_MODULE(_ext, m) {
         ``params`` and a slot read them from it, and a custom Metal kernel
         takes the block as a buffer. param_ranges lists (slot, lo, hi): the
         values a slot may take; any other slot keeps its recorded value.
-        fused_call raises ValueError for a block outside that.
+        fused_call raises ValueError for a block outside that. Those entry
+        points read the block on the host: one that reads it from an
+        input other than params raises ValueError here (a held block is
+        fine).
 
         Record the lazy graph between inputs and outputs. Returns a handle
         for fused_call. Evaluated arrays the graph reads (weights) are held

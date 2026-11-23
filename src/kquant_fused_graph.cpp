@@ -103,6 +103,21 @@ struct FusedTape {
 
 namespace {
 
+// The input of a primitive that holds a parameter block it reads on the
+// host (kq_param_value), or -1.
+int host_param_input(const mx::Primitive& p, int n_inputs) {
+  if (auto* a = dynamic_cast<const KQuantKVAppend*>(&p)) {
+    return a->param_input(n_inputs);
+  }
+  if (auto* a = dynamic_cast<const KQuantSDPAPagedRows*>(&p)) {
+    return a->param_input(n_inputs);
+  }
+  if (auto* a = dynamic_cast<const KQDsaIndexerScoreDecode*>(&p)) {
+    return a->param_input(n_inputs);
+  }
+  return -1;
+}
+
 // Slot values of the block `p` that the tape does not cover: -1 when all
 // are inside their ranges, else the first slot outside.
 int param_outside(const FusedTape& t, const int32_t* p) {
@@ -1652,6 +1667,17 @@ std::shared_ptr<const FusedTape> fuse_graph(
       n.prim = a.primitive_ptr();
       for (auto& in : a.inputs()) {
         n.in.push_back(ref(in));
+      }
+      // A block read on the host has to hold its values when the node is
+      // encoded. The params input is checked at each fused_call and a
+      // constant was evaluated at record; any other input may be an array
+      // a kernel of the same eval has not written yet.
+      if (const int pin = host_param_input(*n.prim, int(n.in.size()));
+          pin >= 0 && n.in[pin] >= 0 && n.in[pin] != params) {
+        throw std::invalid_argument(
+            std::string(op) + " " + n.prim->name() +
+            " reads its parameter block from an input other than params; "
+            "name that input with params.");
       }
       for (auto& out : a.outputs()) {
         node_slot.emplace(out.id(), next_node_slot);

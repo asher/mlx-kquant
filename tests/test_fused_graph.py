@@ -792,29 +792,37 @@ def test_param_block_ranges_are_checked_at_record():
 
 
 @metal
-def test_params_read_from_an_undeclared_input_keep_the_primitives(lever_cache):
-    # The block is an input the record does not name: a program would hold
-    # the first offset for good, so the record runs its primitives.
+@pytest.mark.parametrize("direct", [False, True], ids=["tape", "direct"])
+def test_params_read_from_an_undeclared_input_are_refused(direct, lever_cache):
+    # kv_append reads its block on the host as it is encoded. Only the
+    # declared params input (checked at every fused_call) and a held block
+    # (evaluated at record) hold their values then: any other input could be
+    # an array a kernel of the same eval has not written yet.
     w = _weight("q4_k", 0)
     dtype, m = mx.bfloat16, 2
-    buf, ref = _buf(dtype), _buf(dtype)
-    x0, p0 = _x(m, dtype, 0), _p(7, 0)
+    x0, p0, q0 = _x(m, dtype, 0), _p(7, 4), _p(7, 6)
+    out = _append_layer(x0, _buf(dtype), p0, 0, w, "q4_k")
+    with pytest.raises(ValueError, match="other than params"):
+        kq.fuse_graph([x0, _buf(dtype), p0], list(out), direct=direct)
+    buf = _buf(dtype)
     out = _append_layer(x0, buf, p0, 0, w, "q4_k")
-    handle = kq.fuse_graph([x0, buf, p0], list(out), direct=True)
+    with pytest.raises(ValueError, match="other than params"):
+        kq.fuse_graph([x0, buf, q0, p0], list(out), direct=direct, params=2)
+    # A held block stays fixed: every call appends at its offset.
+    buf, ref = _buf(dtype), _buf(dtype)
+    out = _append_layer(x0, buf, p0, 0, w, "q4_k")
+    handle = kq.fuse_graph([x0, buf], list(out), direct=direct)
     try:
         mx.eval(out)
         buf = out[0]
-        ref = _append_layer(x0, ref, None, 0, w, "q4_k")[0]
-        for seed, off in enumerate([2, 9, 4]):
+        ref = _append_layer(x0, ref, None, 4, w, "q4_k")[0]
+        for seed in range(3):
             x = _x(m, dtype, seed + 1)
-            got = kq.fused_call(handle, [x, buf, _p(7, off)])
-            want = _append_layer(x, ref, None, off, w, "q4_k")
+            got = kq.fused_call(handle, [x, buf])
+            want = _append_layer(x, ref, None, 4, w, "q4_k")
             assert _same(got[0], want[0])
             assert _same(got[1], want[1])
             buf, ref = got[0], want[0]
-        info = kq.fused_direct_info(handle)
-        assert info["state"] == "refused"
-        assert "parameter block" in info["reason"]
     finally:
         kq.fuse_release(handle)
 
@@ -1221,45 +1229,25 @@ def test_params_read_from_a_view_of_the_block(lever_cache):
             params=_p(5, 5)[1:],
             offset_slot=0,
         )
-    # An evaluated view passed beside the block: the append reads slot 0
-    # of the view, slot 1 of the block, so a program that patched slot 0 of
-    # the block would move the rows. The record runs its primitives.
+    # An evaluated view passed beside the block is an input other than
+    # params: the record is refused.
     w = _weight("q4_k", 0)
     dtype, m = mx.bfloat16, 2
     sc = mx.zeros((1,), mx.uint8)
-
-    def layer(x, buf, view):
-        y = kq.quantized_matmul(x, w, sc, "q4_k", transpose=True).reshape(1, 1, m, K)
-        return kq.kv_append(buf, y, 5, params=view, offset_slot=0)
-
-    def block(a, b):
-        p = _p(a, b)
-        view = p[1:]
-        mx.eval(view)
-        return p, view
-
     x0, buf0 = _x(m, dtype, 0), _buf(dtype)
-    p0, v0 = block(5, 5)
-    handle = kq.fuse_graph(
-        [x0, buf0, p0, v0],
-        [layer(x0, buf0, v0)],
-        direct=True,
-        params=2,
-        param_ranges=[(0, 0, CAP - m)],
-    )
-    try:
-        # The first call records with both slots at 5, where a site of
-        # slot 0 of the block holds the value it read.
-        for seed, off in enumerate([5, 0, 9, 3]):
-            x = _x(m, dtype, seed + 1)
-            p, view = block(off, 5)
-            got = kq.fused_call(handle, [x, _buf(dtype), p, view])[0]
-            assert _same(got, layer(x, _buf(dtype), view)), off
-        info = kq.fused_direct_info(handle)
-        assert info["state"] == "refused", info
-        assert "view of the block" in info["reason"]
-    finally:
-        kq.fuse_release(handle)
+    p0 = _p(5, 5)
+    v0 = p0[1:]
+    mx.eval(v0)
+    y = kq.quantized_matmul(x0, w, sc, "q4_k", transpose=True).reshape(1, 1, m, K)
+    out = kq.kv_append(buf0, y, 5, params=v0, offset_slot=0)
+    with pytest.raises(ValueError, match="other than params"):
+        kq.fuse_graph(
+            [x0, buf0, p0, v0],
+            [out],
+            direct=True,
+            params=2,
+            param_ranges=[(0, 0, CAP - m)],
+        )
 
 
 @metal

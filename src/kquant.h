@@ -2576,6 +2576,10 @@ class KQuantSDPAPagedRows : public mx::Primitive {
   const char* name() const override {
     return "KQuantSDPAPagedRows";
   }
+  // The input holding the parameter block read on the host, or -1.
+  int param_input(int n_inputs) const {
+    return param_slot_ >= 0 ? n_inputs - 1 : -1;
+  }
   bool is_equivalent(const mx::Primitive& other) const override;
 
  private:
@@ -3032,6 +3036,10 @@ class KQDsaIndexerScoreDecode : public mx::Primitive {
 
   const char* name() const override {
     return "KQDsaIndexerScoreDecode";
+  }
+  // The input holding the parameter block read on the host, or -1.
+  int param_input(int n_inputs) const {
+    return param_slot_ >= 0 ? n_inputs - 1 : -1;
   }
   bool is_equivalent(const mx::Primitive& other) const override;
 
@@ -3997,6 +4005,10 @@ class KQuantKVAppend : public mx::Primitive {
   const char* name() const override {
     return "KQuantKVAppend";
   }
+  // The input holding the parameter block read on the host, or -1.
+  int param_input(int n_inputs) const {
+    return param_slot_ >= 0 ? n_inputs - 1 : -1;
+  }
   bool is_equivalent(const mx::Primitive&) const override {
     return false;
   }
@@ -4446,7 +4458,10 @@ std::vector<bool> fused_used_inputs(
 // waits on the caller's own completion. An output that is a view of an
 // input (an in-place write) shares the input's buffer. The record must
 // have its program (fused_direct_info state "replay") and the inputs the
-// recorded layout; otherwise fused_bind throws.
+// recorded layout; otherwise fused_bind throws. Each binding owns a pool of
+// the buffers between the record's kernels, scratch_bytes in all
+// (fused_binding_info), so stages in flight on separate command buffers
+// share none; the pool is freed with the binding.
 //
 // fused_patch writes one slot of the binding's parameter block (the buffer
 // of the block passed to fused_bind) and returns false, writing nothing,
@@ -4464,9 +4479,10 @@ std::vector<bool> fused_used_inputs(
 // (kernels may read it on the GPU), so each stage in flight has its own
 // binding and block; the binding outlives every command buffer it was
 // encoded into; no mlx eval writes the bound buffers while a stage is in
-// flight. Each binding holds its own buffers between kernels (the
-// record's scratch_bytes), so stages in flight on separate command buffers
-// share none; they are freed with the binding.
+// flight. fused_encode puts a barrier ahead of the replay and none after
+// it: a dispatch the caller encodes next into the same encoder that reads
+// an output, or a buffer the record wrote in place, needs a barrier of the
+// caller's own ahead of it.
 struct FusedBinding;
 std::shared_ptr<FusedBinding> fused_bind(
     const std::shared_ptr<const FusedTape>& tape,
