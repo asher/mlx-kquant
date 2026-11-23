@@ -35,6 +35,7 @@
 
 #include "kquant.h"
 #include "kquant_internal.h"
+#include "mlx/backend/cpu/encoder.h"
 
 #ifdef _METAL_
 // The serial-encoder lever swaps the compute encoder mlx holds for one of
@@ -198,11 +199,19 @@ void run_tape(
   for (size_t i = 0; i < outputs.size(); ++i) {
     outputs[i].copy_shared_buffer(at(t.out_slots[i]));
   }
+  for (auto& a : made) {
+    keep.push_back(std::move(a));
+  }
+  if (!GPU) {
+    // The CPU tasks the nodes queued hold weak copies of their arrays: a
+    // task queued after them holds the arrays until they have run, as the
+    // stock CPU eval does for a primitive's inputs.
+    mx::cpu::get_command_encoder(t.stream).dispatch(
+        [keep = std::move(keep), tape]() {});
+    return;
+  }
 #ifdef _METAL_
   if (GPU) {
-    for (auto& a : made) {
-      keep.push_back(std::move(a));
-    }
     // Held by a completion handler of the command buffer, as the stock eval
     // holds a primitive's inputs. Not CommandEncoder temporaries: mlx drops
     // those from an encoder's fence bookkeeping, and some of these buffers
@@ -248,8 +257,10 @@ void run_tape(
 // and nothing else. That last part holds per primitive type, by review:
 // only a tape whose primitives are all on the list in direct_listed()
 // gets a program; any other tape runs the per-primitive loop for good.
-// tests/test_fused_graph.py records the listed types over many inputs and
-// fails when a call list moves with anything outside the key.
+// tests/test_fused_graph.py and tests/test_fused_direct_types.py record
+// each listed type, replay it against the plain graph bit for bit over
+// several inputs, and fail when a call list moves with anything outside
+// the key.
 //
 // Debug levers. KQ_FUSED_DIRECT_CHECK=1 makes a tape record twice and
 // compare before it replays, and refuse itself when the two differ, with
@@ -270,9 +281,13 @@ void run_tape(
 // replay encodes into.
 //
 // mlx bookkeeping. A replay enters its inputs and outputs in the encoder's
-// fence sets, its outputs in the barrier set, and adds the recorded
-// dispatch count and buffer size to the commit counters, so needs_commit
-// and the ordering of later ops are those of the per-primitive loop.
+// fence sets (an input or held constant a dispatch writes counts as an
+// output), asks for a barrier ahead of the next dispatch, and adds the
+// recorded dispatch count and buffer size to the commit counters, so
+// needs_commit and the ordering of later ops are those of the per-primitive
+// loop. A held constant is fixed for the record: past the first command
+// buffer only the constants the record writes itself enter the fence sets,
+// so nothing outside the record may write one.
 // ---------------------------------------------------------------------------
 
 enum : uint8_t { D_PSO, D_BUF, D_BYTES, D_TGMEM, D_BARRIER, D_DTG, D_DT };
@@ -313,6 +328,9 @@ struct DirectSite {
   int slot;
   int mul;
   int add;
+  // Values of the slot the primitive takes (kq_param_site).
+  int64_t lo;
+  int64_t hi;
 };
 
 struct DirectRef {
@@ -320,7 +338,8 @@ struct DirectRef {
   int index; // input, constant, per call output or kept buffer index
   size_t len;
   int node; // first node that bound it
-  bool written{false}; // an input buffer a dispatch of the record writes
+  // An input or held constant buffer a dispatch of the record writes.
+  bool written{false};
 };
 
 struct DirectOut {
@@ -374,6 +393,8 @@ struct DirectProgram {
   std::vector<mx::allocator::Buffer> kept;
   std::vector<DirectSite> sites;
   std::vector<const void*> const_ptrs;
+  // Held constants a dispatch of the record writes (an in-place append).
+  std::vector<const void*> const_written;
   // False until the command buffer of the recording has completed:
   // until then a held constant may still be the output of an encoder in
   // flight, and a replay enters the constants in the fence set too.
@@ -407,7 +428,11 @@ struct DirectState {
   uint64_t plain{0};
 };
 
-// Buffers between nodes, shared by the programs of one thread and stream.
+// Bytes of every pool of the process.
+std::atomic<size_t> g_direct_pool_bytes{0};
+
+// Buffers between nodes, shared by the programs of one thread and stream,
+// or held by one binding.
 struct DirectPool {
   std::vector<std::pair<size_t, mx::allocator::Buffer>> bufs;
   std::unordered_map<uint64_t, std::vector<const MTL::Buffer*>> assigned;
@@ -416,10 +441,9 @@ struct DirectPool {
     for (auto& b : bufs) {
       mx::allocator::free(b.second);
     }
+    g_direct_pool_bytes -= bytes;
   }
 };
-
-std::atomic<size_t> g_direct_pool_bytes{0};
 
 std::shared_ptr<DirectPool>& direct_pool(int stream_index) {
   thread_local std::unordered_map<int, std::shared_ptr<DirectPool>> pools;
@@ -489,9 +513,9 @@ struct DirectRecorder {
   std::vector<DirectRaw> raw;
   std::string bad;
   // Declared by the primitives (kq_param_site), and the buffers they read
-  // parameter values from (kq_param_value).
+  // parameter values from (kq_param_value), with the array's offset.
   std::vector<DirectSite> sites;
-  std::vector<const void*> param_bufs;
+  std::vector<std::pair<const void*, int64_t>> param_bufs;
 };
 
 thread_local DirectRecorder* g_recorder = nullptr;
@@ -784,7 +808,7 @@ std::unique_ptr<DirectTrace> direct_record(
     if (auto it = input_of.find(p); it != input_of.end()) {
       tr->refs.push_back({R_INPUT, it->second, 0, node, written.count(p) != 0});
     } else if (auto ic = const_of.find(p); ic != const_of.end()) {
-      tr->refs.push_back({R_CONST, ic->second, 0, node});
+      tr->refs.push_back({R_CONST, ic->second, 0, node, written.count(p) != 0});
     } else {
       const size_t len = static_cast<const MTL::Buffer*>(p)->length();
       tr->refs.push_back({R_SCRATCH, -1, len, node});
@@ -842,12 +866,21 @@ std::unique_ptr<DirectTrace> direct_record(
   // host: the program can follow them only when the block is the input the
   // tape declared, or an array the tape holds (fixed for good).
   const int32_t* pvals = nullptr;
-  for (const void* p : rec.param_bufs) {
+  for (auto [p, poff] : rec.param_bufs) {
     auto it = input_of.find(p);
     if (it != input_of.end() && it->second != t.param_in) {
       tr->refuse =
           "a primitive reads parameters from an input the record "
           "does not declare as its parameter block";
+      return tr;
+    }
+    // A slot counts from the start of the declared block: a primitive that
+    // reads a view of it at another offset would be patched from the
+    // wrong slot.
+    if (it != input_of.end() && poff != inputs[t.param_in].offset()) {
+      tr->refuse =
+          "a primitive reads parameters from a view of the block at "
+          "another offset";
       return tr;
     }
     if (it == input_of.end() && !const_of.count(p)) {
@@ -874,6 +907,13 @@ std::unique_ptr<DirectTrace> direct_record(
     std::memcpy(&have, r.bytes.data() + st.field, 4);
     if (have != int32_t(int64_t(pvals[st.slot]) * st.mul + st.add)) {
       tr->refuse = "a parameter site does not hold its value";
+      tr->refuse_node = r.node;
+      return tr;
+    }
+    // A replay writes any value of the slot's range with no eval and no
+    // check of the primitive's own: the range has to be one it takes.
+    if (t.param_lo[st.slot] < st.lo || t.param_hi[st.slot] > st.hi) {
+      tr->refuse = "a parameter range runs past the values its primitive takes";
       tr->refuse_node = r.node;
       return tr;
     }
@@ -923,10 +963,12 @@ std::unique_ptr<DirectTrace> direct_record(
     }
     tr->ops.push_back(d);
   }
-  if (kq_env_flag("KQ_FUSED_DIRECT_SELFTEST", 0) != 0 && !tr->blob.empty()) {
-    // Test lever: makes every recording differ from the one before it in
-    // its first bytes, as a primitive that passed a value of its input
-    // data to a kernel would.
+  if (kq_env_flag("KQ_FUSED_DIRECT_SELFTEST", 0) != 0 &&
+      kq_env_flag("KQ_FUSED_DIRECT_CHECK", 0) != 0 && !tr->blob.empty()) {
+    // Test lever of the check: makes every recording differ from the one
+    // before it in its first bytes, as a primitive that passed a value of
+    // its input data to a kernel would. Without the check a recording
+    // becomes a program, which must not carry the changed byte.
     static std::atomic<uint8_t> salt{0};
     tr->blob[0] ^= uint8_t(1 + (salt++ & 0x7f));
   }
@@ -1025,7 +1067,7 @@ int direct_diff(
     auto& x = a.sites[i];
     auto& y = b.sites[i];
     same = x.op == y.op && x.field == y.field && x.slot == y.slot &&
-        x.mul == y.mul && x.add == y.add;
+        x.mul == y.mul && x.add == y.add && x.lo == y.lo && x.hi == y.hi;
   }
   for (size_t i = 0; same && i < a.refs.size(); ++i) {
     auto& x = a.refs[i];
@@ -1077,6 +1119,9 @@ std::shared_ptr<const DirectProgram> direct_compile(
       p->scratch_bytes += rf.len;
     } else if (rf.cls == R_CONST) {
       p->const_ptrs.push_back(t.constants[rf.index].buffer().ptr());
+      if (rf.written) {
+        p->const_written.push_back(t.constants[rf.index].buffer().ptr());
+      }
     }
   }
   std::sort(p->fresh.begin(), p->fresh.end(), [&](auto& a, auto& b) {
@@ -1120,7 +1165,13 @@ std::shared_ptr<const DirectProgram> direct_compile(
           tr.blob.begin() + o.off + o.len);
       for (auto* st : si->second) {
         p->sites.push_back(
-            {int(d.off) + st->field, st->field, st->slot, st->mul, st->add});
+            {int(d.off) + st->field,
+             st->field,
+             st->slot,
+             st->mul,
+             st->add,
+             st->lo,
+             st->hi});
       }
       p->ops.push_back(d);
       continue;
@@ -1270,6 +1321,12 @@ void direct_replay(
       ce.all_inputs_.insert(p);
     }
   }
+  // A constant the record writes: the replay waits for an earlier writer
+  // in another encoder, and a later encoder waits for the replay.
+  for (const void* p : d.const_written) {
+    ce.all_inputs_.insert(p);
+    ce.all_outputs_.insert(p);
+  }
   void* fresh[kDirectMaxOutputs];
   for (size_t j = 0; j < d.fresh.size(); ++j) {
     fresh[j] = mx::allocator::malloc(d.fresh[j].second).ptr();
@@ -1327,14 +1384,16 @@ void direct_replay(
     ce.prev_outputs_.insert(
         static_cast<MTL::Resource*>(static_cast<MTL::Buffer*>(fresh[j])));
   }
-  // An input the record wrote in place is an output to mlx: a later reader
-  // in this encoder gets its barrier, a later encoder its fence.
+  // An input the record wrote in place is an output to mlx: a later
+  // encoder gets its fence.
   for (int i : d.in_written) {
-    void* p = const_cast<void*>(inputs[i].buffer().ptr());
-    ce.all_outputs_.insert(p);
-    ce.prev_outputs_.insert(
-        static_cast<MTL::Resource*>(static_cast<MTL::Buffer*>(p)));
+    ce.all_outputs_.insert(inputs[i].buffer().ptr());
   }
+  // The next dispatch in this encoder follows a barrier, as after a kernel
+  // whose outputs it reads: whatever it reads or writes (an output, an
+  // input or constant the record wrote, a buffer the record read), the
+  // replay is over first.
+  ce.needs_barrier_ = true;
   ce.buffer_ops_ += d.n_dispatch;
   ce.buffer_sizes_ += d.sizes;
   ce.get_command_buffer()->addCompletedHandler(
@@ -1607,6 +1666,12 @@ std::shared_ptr<const FusedTape> fuse_graph(
   if (t->nodes.empty()) {
     throw std::invalid_argument(
         std::string(op) + " no output has work to record.");
+  }
+  // An output the walk skipped (an evaluated array, not an input) is a
+  // constant too: numbered now, before the node slots start after the
+  // constants.
+  for (auto& o : outputs) {
+    ref(o);
   }
   const int nc = int(constants.size());
   // Node output slots follow the tape's order (run_tape appends what a
@@ -2105,15 +2170,29 @@ int kq_param_value(const mx::array& p, int slot) {
         "[mlx_kquant] a parameter block must be a contiguous int32 vector "
         "that holds the slot.");
   }
+  // Read on the host as the call is encoded: a block a kernel of this
+  // command buffer writes would be read before it is written.
+  if (!p.is_available()) {
+    throw std::invalid_argument(
+        "[mlx_kquant] a parameter block must be evaluated before the call "
+        "that reads it.");
+  }
 #ifdef _METAL_
   if (g_recorder != nullptr) {
-    g_recorder->param_bufs.push_back(p.buffer().ptr());
+    g_recorder->param_bufs.emplace_back(p.buffer().ptr(), p.offset());
   }
 #endif
   return p.data<int32_t>()[slot];
 }
 
-void kq_param_site(int idx, int field, int slot, int mul, int add) {
+void kq_param_site(
+    int idx,
+    int field,
+    int slot,
+    int mul,
+    int add,
+    int64_t lo,
+    int64_t hi) {
 #ifdef _METAL_
   if (g_recorder == nullptr) {
     return;
@@ -2124,7 +2203,7 @@ void kq_param_site(int idx, int field, int slot, int mul, int add) {
       break;
     }
     if (r.raw[i].kind == D_BYTES && int(r.raw[i].b) == idx) {
-      r.sites.push_back({i, field, slot, mul, add});
+      r.sites.push_back({i, field, slot, mul, add, lo, hi});
       return;
     }
   }
@@ -2140,6 +2219,8 @@ void kq_param_site(int idx, int field, int slot, int mul, int add) {
   (void)slot;
   (void)mul;
   (void)add;
+  (void)lo;
+  (void)hi;
 #endif
 }
 
@@ -2157,18 +2238,6 @@ struct FusedBinding {
   size_t output_bytes{0};
 #endif
 };
-
-#ifdef _METAL_
-namespace {
-// Buffers between nodes for every binding of the process: bound replays
-// are encoded one after another by their owner, apart from mlx's evals.
-std::mutex g_bind_mtx;
-std::shared_ptr<DirectPool>& bind_pool() {
-  static std::shared_ptr<DirectPool> pool = std::make_shared<DirectPool>();
-  return pool;
-}
-} // namespace
-#endif
 
 std::shared_ptr<FusedBinding> fused_bind(
     const std::shared_ptr<const FusedTape>& tape,
@@ -2218,11 +2287,10 @@ std::shared_ptr<FusedBinding> fused_bind(
   b->prog = prog;
   b->inputs = inputs;
   b->blob = d.blob;
-  {
-    std::lock_guard lk(g_bind_mtx);
-    b->pool = bind_pool();
-    b->cur = direct_assign(*b->pool, d, t);
-  }
+  // Buffers between nodes of the binding's own: two stages in flight on
+  // two command buffers run at the same time, so they share none.
+  b->pool = std::make_shared<DirectPool>();
+  b->cur = direct_assign(*b->pool, d, t);
   b->adj.assign(b->cur.size(), 0);
   for (auto& [r, i] : d.in_refs) {
     b->cur[r] = static_cast<const MTL::Buffer*>(inputs[i].buffer().ptr());
@@ -2322,7 +2390,7 @@ bool fused_encode(FusedBinding& b, void* compute_encoder) noexcept {
   }
   auto* enc = static_cast<MTL::ComputeCommandEncoder*>(compute_encoder);
   // Orders the replay after whatever wrote its inputs earlier in this
-  // encoder and after the bound replay before it, which used the pool.
+  // encoder.
   enc->memoryBarrier(MTL::BarrierScopeBuffers);
   direct_emit(enc, d, b.blob.data(), b.cur.data(), b.adj.data());
   d.replays.fetch_add(1, std::memory_order_relaxed);
@@ -2341,7 +2409,6 @@ FusedBindingInfo fused_binding_info(const FusedBinding& b) {
   info.param_bytes = b.params ? b.tape->param_lo.size() * 4 : 0;
   info.blob_bytes = b.blob.size();
   info.scratch_bytes = b.prog->scratch_bytes;
-  std::lock_guard lk(g_bind_mtx);
   info.pool_bytes = b.pool->bytes;
 #endif
   return info;

@@ -10,6 +10,7 @@ a dtype round trip and a residual between them, at 1 and 8 rows.
 from __future__ import annotations
 
 import mlx.core as mx
+import numpy as np
 import pytest
 from qmm_probe import force_cpu
 
@@ -1087,3 +1088,246 @@ def test_param_block_offset_of_rope(dtype, monkeypatch):
     finally:
         kq.fuse_release(handle)
         kq.env_cache(prev)
+
+
+# Outputs, keepalive, parameter checks and ordering of the records.
+
+
+@pytest.mark.parametrize("direct", [False, True])
+def test_an_evaluated_output_is_returned_as_itself(direct, lever_cache):
+    # An output the walk does not enter (an evaluated array that is not an
+    # input) is held as a constant, numbered apart from the node outputs.
+    if direct and force_cpu():
+        pytest.skip("direct replay is a Metal path")
+    held = mx.arange(7, dtype=mx.float32) * 3.0
+    x0 = _x(2, mx.bfloat16, 0)
+    mx.eval(held, x0)
+    handle = kq.fuse_graph([x0], [x0 + 1, held], direct=direct)
+    try:
+        for seed in (1, 2, 3):
+            x = _x(2, mx.bfloat16, seed)
+            got = kq.fused_call(handle, [x])
+            assert _same(got[0], x + 1)
+            assert _same(got[1], held)
+    finally:
+        kq.fuse_release(handle)
+
+
+def _chain(x):
+    a = x @ x
+    b = a * 2.0 + 1.0
+    return b - a
+
+
+def test_cpu_stream_holds_the_arrays_between_nodes_until_they_ran():
+    # The tasks a CPU eval queues read the arrays between nodes after the
+    # record's eval has returned; arrays allocated and filled on the host
+    # in the meantime must not take their memory.
+    n = 768
+    with mx.stream(mx.cpu):
+        x0 = mx.random.normal((n, n), key=mx.random.key(0))
+        mx.eval(x0)
+        handle = kq.fuse_graph([x0], [_chain(x0)])
+        try:
+            for seed in range(1, 7):
+                x = mx.random.normal((n, n), key=mx.random.key(seed))
+                mx.eval(x)
+                got = kq.fused_call(handle, [x])[0]
+                mx.async_eval(got)
+                fill = [mx.array(np.full((n, n), 7.0, np.float32)) for _ in range(6)]
+                mx.eval(got, *fill)
+                assert _same(got, _chain(x)), seed
+        finally:
+            kq.fuse_release(handle)
+
+
+@metal
+def test_a_lazy_parameter_block_is_refused_at_build():
+    # The ops read the block on the host as they encode: a block a kernel
+    # of the same command buffer writes would be read before it is written.
+    p = _p(0, 3) + 0
+    buf, y = _buf(mx.bfloat16), mx.zeros((1, 1, 2, K), mx.bfloat16)
+    with pytest.raises(ValueError, match="evaluated"):
+        kq.kv_append(buf, y, 0, params=p, offset_slot=1)
+    q = mx.zeros((1, 4, 2, 128), mx.bfloat16)
+    keys = mx.zeros((1, 64, 128), mx.bfloat16)
+    wts = mx.zeros((1, 2, 4), mx.bfloat16)
+    with pytest.raises(ValueError, match="evaluated"):
+        kq.dsa_indexer_score_decode(q, keys, wts, 3, 4, params=p, q_offset_slot=1)
+    kb = mx.zeros((1, 2, 64, 256), mx.bfloat16)
+    qp = mx.zeros((1, 4, 2, 256), mx.bfloat16)
+    pages = mx.zeros((1, 2, 4), mx.int32)
+    ends = mx.full((1, 2), 60, mx.int32)
+    with pytest.raises(ValueError, match="evaluated"):
+        kq.sdpa_paged_rows(
+            qp,
+            kb,
+            kb,
+            0.0625,
+            pages,
+            ends,
+            kb,
+            kb,
+            32,
+            page_rows=4,
+            params=p,
+            base_len_slot=1,
+        )
+
+
+@metal
+def test_a_parameter_range_past_what_the_append_takes_keeps_the_primitives(
+    lever_cache,
+):
+    # The record may take offsets up to CAP, past the last one the rows fit
+    # at: a replay would write past the buffer, so the record runs its
+    # primitives, and the append's own check refuses that offset.
+    w = _weight("q4_k", 0)
+    dtype, m = mx.bfloat16, 2
+    buf, ref = _buf(dtype), _buf(dtype)
+    x0, p0 = _x(m, dtype, 0), _p(7, 0)
+    out = _append_layer(x0, buf, p0, 0, w, "q4_k")
+    handle = kq.fuse_graph(
+        [x0, buf, p0], list(out), direct=True, params=2, param_ranges=[(1, 0, CAP)]
+    )
+    try:
+        mx.eval(out)
+        buf = out[0]
+        ref = _append_layer(x0, ref, None, 0, w, "q4_k")[0]
+        for seed, off in enumerate([3, 9, CAP - m]):
+            x = _x(m, dtype, seed + 1)
+            got = kq.fused_call(handle, [x, buf, _p(7, off)])
+            want = _append_layer(x, ref, None, off, w, "q4_k")
+            assert _same(got[0], want[0])
+            buf, ref = got[0], want[0]
+        info = kq.fused_direct_info(handle)
+        assert info["state"] == "refused", info
+        assert "past the values" in info["reason"]
+        with pytest.raises(ValueError, match="within buf"):
+            mx.eval(kq.fused_call(handle, [x0, buf, _p(7, CAP - m + 1)]))
+    finally:
+        kq.fuse_release(handle)
+
+
+@metal
+def test_params_read_from_a_view_of_the_block(lever_cache):
+    # A view of the block built lazily is refused by the op: its values
+    # would be read on the host before the view is made.
+    with pytest.raises(ValueError, match="evaluated"):
+        kq.kv_append(
+            _buf(mx.bfloat16),
+            _buf(mx.bfloat16)[:, :, :2],
+            0,
+            params=_p(5, 5)[1:],
+            offset_slot=0,
+        )
+    # An evaluated view passed beside the block: the append reads slot 0
+    # of the view, slot 1 of the block, so a program that patched slot 0 of
+    # the block would move the rows. The record runs its primitives.
+    w = _weight("q4_k", 0)
+    dtype, m = mx.bfloat16, 2
+    sc = mx.zeros((1,), mx.uint8)
+
+    def layer(x, buf, view):
+        y = kq.quantized_matmul(x, w, sc, "q4_k", transpose=True).reshape(1, 1, m, K)
+        return kq.kv_append(buf, y, 5, params=view, offset_slot=0)
+
+    def block(a, b):
+        p = _p(a, b)
+        view = p[1:]
+        mx.eval(view)
+        return p, view
+
+    x0, buf0 = _x(m, dtype, 0), _buf(dtype)
+    p0, v0 = block(5, 5)
+    handle = kq.fuse_graph(
+        [x0, buf0, p0, v0],
+        [layer(x0, buf0, v0)],
+        direct=True,
+        params=2,
+        param_ranges=[(0, 0, CAP - m)],
+    )
+    try:
+        # The first call records with both slots at 5, where a site of
+        # slot 0 of the block holds the value it read.
+        for seed, off in enumerate([5, 0, 9, 3]):
+            x = _x(m, dtype, seed + 1)
+            p, view = block(off, 5)
+            got = kq.fused_call(handle, [x, _buf(dtype), p, view])[0]
+            assert _same(got, layer(x, _buf(dtype), view)), off
+        info = kq.fused_direct_info(handle)
+        assert info["state"] == "refused", info
+        assert "view of the block" in info["reason"]
+    finally:
+        kq.fuse_release(handle)
+
+
+@metal
+def test_a_replay_that_writes_a_held_buffer_orders_the_reads_after_it(lever_cache):
+    # The cache is held by the record and the append writes it in place: the
+    # op that reads the new rows after the replay gets a barrier.
+    w = _weight("q4_k", 0)
+    dtype, m, off = mx.bfloat16, 2, 4
+    held = _buf(dtype)
+    sc = mx.zeros((1,), mx.uint8)
+
+    def rows(x):
+        return kq.quantized_matmul(x, w, sc, "q4_k", transpose=True).reshape(1, 1, m, K)
+
+    x0 = _x(m, dtype, 0)
+    handle = kq.fuse_graph([x0], [kq.kv_append(held, rows(x0), off)], direct=True)
+    try:
+        for seed in (1, 2):
+            mx.eval(kq.fused_call(handle, [_x(m, dtype, seed)])[0])
+        assert kq.fused_direct_info(handle)["state"] == "replay"
+        x = _x(m, dtype, 3)
+        mx.eval(x, sc)
+        z = kq.fused_call(handle, [x])[0][:, :, off : off + m, :] * 2.0
+        mx.synchronize()
+        kq.encoder_trace_begin()
+        mx.async_eval(z)
+        lines = kq.encoder_trace_end()
+        mx.eval(z)
+        disp = [i for i, s in enumerate(lines) if s.split()[0] in ("groups", "threads")]
+        assert len(disp) >= 2, lines
+        between = lines[disp[-2] + 1 : disp[-1]]
+        assert any(s.startswith("barrier") for s in between), lines
+        assert _same(z, rows(x) * 2.0)
+    finally:
+        kq.fuse_release(handle)
+
+
+@metal
+def test_bound_replays_hold_their_own_buffers_between_kernels(lever_cache):
+    # Two stages in flight on two command buffers run at the same time: a
+    # binding shares no buffer between kernels with another.
+    w = _weight("q4_k", 0)
+    dtype, m = mx.bfloat16, 2
+    buf = _buf(dtype)
+    x0, p0 = _x(m, dtype, 0), _p(7, 0)
+    out = _append_layer(x0, buf, p0, 0, w, "q4_k")
+    handle = kq.fuse_graph(
+        [x0, buf, p0], list(out), direct=True, params=2, param_ranges=[(1, 0, CAP - m)]
+    )
+    try:
+        mx.eval(out)
+        buf = out[0]
+        mx.eval(kq.fused_call(handle, [_x(m, dtype, 1), buf, _p(7, 2)]))
+        assert kq.fused_direct_info(handle)["state"] == "replay"
+        mx.synchronize()
+        before = kq.fused_direct_info(handle)["pool_bytes"]
+        xa, xb = _x(m, dtype, 2), _x(m, dtype, 3)
+        mx.eval(xa, xb)
+        ba, _ = kq.fused_bind(handle, [xa, buf, _p(7, 0)])
+        bb, _ = kq.fused_bind(handle, [xb, buf, _p(7, 0)])
+        ia, ib = kq.fused_binding_info(ba), kq.fused_binding_info(bb)
+        assert ia["scratch_bytes"] > 0
+        assert ia["pool_bytes"] >= ia["scratch_bytes"]
+        assert ib["pool_bytes"] >= ib["scratch_bytes"]
+        after = kq.fused_direct_info(handle)["pool_bytes"]
+        assert after == before + ia["pool_bytes"] + ib["pool_bytes"]
+        kq.fused_unbind(ba)
+        kq.fused_unbind(bb)
+        assert kq.fused_direct_info(handle)["pool_bytes"] == before
+    finally:
+        kq.fuse_release(handle)

@@ -22,6 +22,18 @@ namespace mx = mlx::core;
 
 namespace mlx_kquant {
 
+namespace {
+
+void kq_kv_append_check(int64_t offset, int64_t n, int64_t cap) {
+  if (offset < 0 || offset + n > cap) {
+    throw std::invalid_argument(
+        "[mlx_kquant.kv_append] rows [offset, offset + x.shape[2]) must lie "
+        "within buf.");
+  }
+}
+
+} // namespace
+
 #ifdef _METAL_
 
 void KQuantKVAppend::eval_gpu(
@@ -55,11 +67,7 @@ void KQuantKVAppend::eval_gpu(
   args.offset =
       param_slot_ >= 0 ? kq_param_value(inputs[2], param_slot_) : offset_;
   args.size = static_cast<int64_t>(x.size());
-  if (args.offset < 0 || args.offset + x.shape(2) > args.cap) {
-    throw std::invalid_argument(
-        "[mlx_kquant.kv_append] rows [offset, offset + x.shape[2]) must lie "
-        "within buf.");
-  }
+  kq_kv_append_check(args.offset, x.shape(2), args.cap);
 
   auto& d = mx::metal::device(s.device);
   auto& ce = mx::metal::get_command_encoder(s);
@@ -69,8 +77,9 @@ void KQuantKVAppend::eval_gpu(
   ce.set_output_array(out, 1);
   ce.set_bytes(args, 2);
   if (param_slot_ >= 0) {
-    // The low word of the 64-bit offset; the high word stays 0.
-    kq_param_site(2, 56, param_slot_);
+    // The low word of the 64-bit offset; the high word stays 0. A replay
+    // writes only offsets the rows fit at.
+    kq_param_site(2, 56, param_slot_, 1, 0, 0, args.cap - x.shape(2));
   }
   const size_t tg = x.size() < 256 ? x.size() : 256;
   ce.dispatch_threads(MTL::Size(x.size(), 1, 1), MTL::Size(tg, 1, 1));
@@ -92,6 +101,10 @@ void KQuantKVAppend::eval_cpu(
     std::vector<mx::array>& outputs) {
   const auto& buf = inputs[0];
   auto& out = outputs[0];
+  const int64_t offset = param_slot_ >= 0
+      ? int64_t(kq_param_value(inputs[2], param_slot_))
+      : offset_;
+  kq_kv_append_check(offset, inputs[1].shape(2), out.shape(2));
   const bool shared = buf.flags().row_contiguous;
   if (shared) {
     out.copy_shared_buffer(buf);
@@ -107,9 +120,7 @@ void KQuantKVAppend::eval_cpu(
                     x = mx::array::unsafe_weak_copy(inputs[1]),
                     out = mx::array::unsafe_weak_copy(out),
                     shared,
-                    offset = param_slot_ >= 0
-                        ? int64_t(kq_param_value(inputs[2], param_slot_))
-                        : offset_]() mutable {
+                    offset]() mutable {
     const size_t item = out.itemsize();
     char* op = out.data<char>();
     if (!shared) {
@@ -157,6 +168,10 @@ mx::array kv_append(
        offset_slot >= params->size())) {
     throw std::invalid_argument(
         op + " params must be an int32 vector holding offset_slot.");
+  }
+  // The offset is read on the host when the append is encoded.
+  if (params && !params->is_available()) {
+    throw std::invalid_argument(op + " params must be evaluated.");
   }
   if (buf.ndim() != 4 || x.ndim() != 4) {
     throw std::invalid_argument(

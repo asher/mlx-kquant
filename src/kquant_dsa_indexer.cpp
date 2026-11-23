@@ -580,6 +580,11 @@ mx::array dsa_indexer_score_decode(
         "[mlx_kquant.dsa_indexer_score_decode] params must be an int32 "
         "vector holding q_offset_slot.");
   }
+  // q_offset is read on the host when the call is encoded.
+  if (params && !params->is_available()) {
+    throw std::invalid_argument(
+        "[mlx_kquant.dsa_indexer_score_decode] params must be evaluated.");
+  }
   if (queries.ndim() != 4 || keys.ndim() != 3 || weights.ndim() != 3) {
     std::ostringstream msg;
     msg << "[mlx_kquant.dsa_indexer_score_decode] expected q rank 4, keys "

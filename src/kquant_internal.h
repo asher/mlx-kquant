@@ -32,14 +32,24 @@ unsigned kq_env_epoch();
 
 // Parameter blocks of recorded graphs (kquant_fused_graph.cpp). A primitive
 // that takes a value from slot `slot` of the block `p` reads it with
-// kq_param_value in its eval, and after each set_bytes that carries the
-// value says where it sits: the int32 at byte `field` of the bytes bound at
-// `idx` is value * mul + add. A direct replay then writes the block's
-// current value there. Every use of the value in the eval has to be such a
-// field: nothing else of the eval (a kernel name, a grid, a buffer size)
-// may depend on it.
+// kq_param_value in its eval (the block has to be evaluated; its builder
+// checks that too), and after each set_bytes that carries the value says
+// where it sits: the int32 at byte `field` of the bytes bound at `idx` is
+// value * mul + add. A direct replay then writes the block's current value
+// there with no eval: [lo, hi] are the values the primitive takes, the
+// checks its eval makes on the value, and a record whose range for the
+// slot runs past them is refused. Every use of the value in the eval has
+// to be such a field: nothing else of the eval (a kernel name, a grid, a
+// buffer size) may depend on it.
 int kq_param_value(const mx::array& p, int slot);
-void kq_param_site(int idx, int field, int slot, int mul = 1, int add = 0);
+void kq_param_site(
+    int idx,
+    int field,
+    int slot,
+    int mul = 1,
+    int add = 0,
+    int64_t lo = INT32_MIN,
+    int64_t hi = INT32_MAX);
 
 // Integer value of the environment lever `name`. Absent or empty reads as
 // `unset`; 0, false, off and no read as 0; 1, true, on and yes read as 1;
