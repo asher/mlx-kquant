@@ -263,7 +263,7 @@ def test_store_ops(tmp_path, codec, shexp_same):
 E_IN, R_IN, K_IN, N_IN = 12, 5, 512, 128
 
 
-def _inproc(codec, shexp):
+def _inproc(codec, shexp, T=3):
     import mlx.core as mx
     import numpy as np
 
@@ -279,7 +279,6 @@ def _inproc(codec, shexp):
         mx.eval(wq)
         return wq
 
-    T = 3
     x = mx.array((rng.standard_normal((T, K_IN)) * 0.5).astype(np.float32))
     x = x.astype(mx.bfloat16)
     picks = [rng.choice(E_IN, R_IN, replace=False) for _ in range(T)]
@@ -381,3 +380,37 @@ def test_a_stub_stack_has_no_in_place_fallback(monkeypatch, lever, value):
         kq.moe_store_glu(x, stub_g, stub_u, sg, su, codec, inds, ids, gp, up)
     with pytest.raises(ValueError, match="stub"):
         kq.moe_store_down(hd, stub_d, sd, codec, inds, sc, ids, dp)
+
+
+@pytest.mark.parametrize(
+    "codec,T", [("q5_0", 1), ("q5_0", 3), ("q5_0", 12), ("iq3_xxs", 1), ("iq3_xxs", 3)]
+)
+def test_any_slot_with_the_high_bit_set_reads_in_place(codec, T):
+    # Every kernel form reads a slot with bit 31 set as absent, not only
+    # 0x80000000: -1 (0xFFFFFFFF) and 0x80000001 read the GGUF blocks too.
+    mx, np, kq, wire, x, inds, hd, sc = _inproc(codec, codec, T)
+    gw, uw = wire((E_IN, N_IN, K_IN)), wire((E_IN, N_IN, K_IN))
+    sg, su = wire((N_IN, K_IN)), wire((N_IN, K_IN))
+    ids = np.array([1, 3, 4, 8, 9, 11], np.uint32)
+    gp = kq.moe_store_pack(gw, codec, K_IN, mx.array(ids))
+    up = kq.moe_store_pack(uw, codec, K_IN, mx.array(ids))
+    down = codec == "q5_0"
+    if down:
+        dw, sd = wire((E_IN, K_IN, N_IN)), wire((K_IN, N_IN))
+        dp = kq.moe_store_pack(dw, codec, N_IN, mx.array(ids))
+    absent = np.full((E_IN,), 0x80000000, np.uint32)
+    absent[ids] = np.arange(len(ids), dtype=np.uint32)
+    other = absent.copy()
+    gone = np.setdiff1d(np.arange(E_IN), ids)
+    other[gone[::2]] = 0xFFFFFFFF
+    other[gone[1::2]] = 0x80000001
+    outs = []
+    for table in (absent, other):
+        slots = mx.array(table)
+        res = [kq.moe_store_glu(x, gw, uw, sg, su, codec, inds, slots, gp, up)]
+        if down:
+            res.append(kq.moe_store_down(hd, dw, sd, codec, inds, sc, slots, dp))
+        mx.eval(res)
+        outs.append(res)
+    for a, b in zip(*outs, strict=True):
+        assert mx.array_equal(a, b).item()

@@ -379,6 +379,30 @@ def test_hc_lowrank_mix_operand_views(fn, monkeypatch):
     assert mx.array_equal(mixed, want) and mx.array_equal(inj, want_inj)
 
 
+@pytest.mark.parametrize("operand", ["h", "gamma", "w_inject"])
+def test_hc_lowrank_mix_mma_front_on_an_unaligned_view(operand, monkeypatch):
+    """The MMA front loads h, gamma and the inject in 16-byte vectors: an
+    operand that is a view starting one element past a boundary takes the
+    lane front, with its bits."""
+    # The folded mixer, where the front runs, on any GPU.
+    monkeypatch.setenv("KQ_HC_EPI_LPR", "8")
+    h, gamma, wd, _, wu, _, wi = _mk(37, 4, 256, 64, mx.float32, mx.bfloat16)
+    ops = {"h": h, "gamma": gamma, "w_inject": wi}
+    mx.eval(list(ops.values()))
+    monkeypatch.setenv("KQ_HC_FRONT_MMA", "0")
+    lane = kq.hc_lowrank_mix(h, gamma, wd, wi, wu, EPS)
+    mx.eval(lane)
+    monkeypatch.setenv("KQ_HC_FRONT_MMA", "1")
+    mma = kq.hc_lowrank_mix(h, gamma, wd, wi, wu, EPS)
+    # The lever is live: the MMA front gives other bits on aligned operands.
+    assert not mx.array_equal(mma[0], lane[0])
+    a = ops[operand]
+    flat = mx.concatenate([mx.zeros((1,), a.dtype), a.flatten()])
+    ops[operand] = flat[1:].reshape(a.shape)
+    got = kq.hc_lowrank_mix(ops["h"], ops["gamma"], wd, ops["w_inject"], wu, EPS)
+    assert mx.array_equal(got[0], lane[0]) and mx.array_equal(got[1], lane[1])
+
+
 def test_hc_lowrank_mix_bad_shapes():
     h, gamma, wd, _, wu, _, wi = _mk(13, 1, 256, 64, mx.float32, mx.bfloat16)
     with pytest.raises(ValueError):
