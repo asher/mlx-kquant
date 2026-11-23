@@ -1375,7 +1375,8 @@ takes the forms either of its codecs would take alone at each row count: the 32-
 row where either codec has it (the other decodes two 16-weight chunks per step, or its 64-weight
 span for `stq1_0`), the dedupe kernels at 2 to 8 rows, the grouped kernels at 5 to 16 rows, and
 the plain kernels past that, with a `q5_k`, `q6_k` or `q8_0` shared expert or none. A pair with an
-`stq1_0` stack keeps the plain forms at every width, as `stq1_0` does alone (see below). Pairs have no qf or half-dot kernels.
+`stq1_0` stack keeps the plain forms at 8 K-lanes at every width, one row included, as `stq1_0` does
+alone (see below). Pairs have no qf or half-dot kernels.
 
 The pairs with kernels are listed in `kq_glu_pairs.h`; one line there adds a pair.
 `kq.moe_glu_pair_has_kernel(gate, up, shexp_gate="", shexp_up="", shared_slots=1)` says whether a
@@ -1398,16 +1399,26 @@ group sit in one 64-weight span, so a lane holds its 64 activations as 16 `float
 group's four weights as one `half4` from a codebook table staged in threadgroup memory, and
 multiplies them against the matching activation lanes with no reorder. The multi-row loops decode
 each group once for all their rows. The one-row `quantized_matmul` takes the same step through
-`qmv_c32` on M5 and later GPUs, at 8 K-lanes. The 16-weight decode, which the tiled down and the
+`qmv_c32` on M5 and later GPUs, at 8 K-lanes, and the front and inject rows of `hc_lowrank_mix`
+take it with `stq1_0` weights. The 16-weight decode, which the tiled down and the
 expert stores keep, reads one table entry per weight, with the same values. Outputs of the 64-weight
 step differ from the 16-weight kernels in summation order.
 
 With the step bound by the weight read, the extra work of the other forms no longer pays:
 `stq1_0` stems take the plain kernels at 8 K-lanes at every width, and the dense shared-expert
-route where it applies. `KQ_MOE_GROUP=1` and `KQ_MOE_DEDUP=1` set explicitly keep the grouped (and
-tiled) and dedupe forms, and `KQ_MOE_NX` forces a width. At 8 rows the plain gate/up gather took
-1129 us against 1216 grouped and 1280 at 16 K-lanes, and the score-mixed down with a `q6_k` shared
-slot 817 against 1871 tiled (M5 Max, Hy4 shapes).
+route where it applies. A lever set to a form still forces it: `KQ_MOE_GROUP=1` the grouped (and
+tiled) forms, `KQ_MOE_DEDUP=1` the dedupe forms, `KQ_MOE_MIX_FORM=dd` the dedupe score-mixed downs,
+`KQ_MOE_C32=1` the c32 kernels of a split pair, and `KQ_MOE_NX` a width. Unset or empty, they leave
+the plain forms. At 8 rows the plain gate/up gather took 1129 us against 1216 grouped and 1280 at
+16 K-lanes, and the score-mixed down with a `q6_k` shared slot 817 against 1871 tiled (M5 Max, Hy4
+shapes).
+
+A split pair with `iq2_xxs` runs its 64-weight loop in the c32 kernels as well, so at one row they
+differ from the plain kernels only in width, 16 K-lanes against 8. Timed in one process with both
+forms rotating each round (each after 10 s of its own load, four processes, GPU clock 750 to 1020
+MHz), the c32 kernels took 0 to 4% longer at one row and 5 to 7% longer at two, on the gate/up
+gather of either order and the shared-expert GLU, so the pair takes the plain kernels there too. The
+pair's one-row entry in the table below was measured on the c32 kernels.
 
 Hy4 shapes on M5 Max (E=256, top 8, gate/up K=6144 and N=2048, down K=2048 and N=6144, a `q6_k`
 shared expert, clamped SwiGLU), us per call at the sustained clock, mean of two processes per build:

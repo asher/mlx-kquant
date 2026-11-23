@@ -5,13 +5,13 @@ stack in another codec than the gate stack (per-tensor quant recipes give
 the two their own codecs). A split pair has the kernel forms a
 single-codec block has: the c32 step at one row where a codec has it, the
 dedupe pairs, the grouped kernels and the plain kernels. A pair with a
-stq1_0 stack takes the c32 step or the plain kernels by default, and the
-dedupe and grouped forms when their levers are set. Each case checks every
-form against a float reference
-built from the dequantized stacks, with the clamped SwiGLU act
-(silu_limit) and a q6_k shared expert, at the forms the default pick takes
-and at the forms the levers force. moe_glu_pair_has_kernel names the pairs
-with kernels, and a pair without them raises at the call.
+stq1_0 stack takes the plain kernels by default, one row included, and the
+c32, dedupe and grouped forms when their levers are set. Each case checks
+every form against a float reference built from the dequantized stacks,
+with the clamped SwiGLU act (silu_limit) and a q6_k shared expert, at the
+forms the default pick takes and at the forms the levers force.
+moe_glu_pair_has_kernel names the pairs with kernels, and a pair without
+them raises at the call.
 """
 
 from __future__ import annotations
@@ -250,9 +250,8 @@ def _form(name):
     return "plain"
 
 
-# The forms each lever set allows at each row count. The default pick runs
-# c32 at one row on GPUs that take it and the plain kernels elsewhere: every
-# pair here has a stq1_0 stack, whose 64-weight step is fastest plain.
+# The forms each lever set allows at each row count. Every pair here has a
+# stq1_0 stack, whose 64-weight step is fastest plain at every row count.
 ALLOWED = {
     "plain": {t: {"plain"} for t in ROWS},
     "forced": {
@@ -263,7 +262,7 @@ ALLOWED = {
         64: {"c32"},
         512: {"c32"},
     },
-    "default": {t: {"c32", "plain"} if t == 1 else {"plain"} for t in ROWS},
+    "default": {t: {"plain"} for t in ROWS},
 }
 NEEDED = {
     "plain": {"plain"},

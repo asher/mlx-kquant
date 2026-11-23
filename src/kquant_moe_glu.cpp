@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -190,24 +191,21 @@ inline bool kq_moe_group_glu(int T) {
 // GLU pair). Their Ext loops take the 64-weight step, which is bound by
 // the weight read at nx 8; the grouped, tiled, dedupe and nx16 forms add
 // work on top of it. So these stems keep the plain forms at nx 8 at every
-// width, and with them the dense shared-expert route. On M5 Max (E=256
-// top-8, K=6144, N=2048) the plain GLU took 583 us a call against 654
-// grouped and 608 dedupe at 8 rows, and 1154 against 1455 grouped at 16; a
-// split pair with iq2_xxs took 702 against 970 grouped at 8 rows. The
-// score-mixed down (K=2048, N=6144, a q6_k shared slot) took 421 us
-// against 917 tiled at 8 rows, and 228 against 250 dedupe at 4.
-// KQ_MOE_NX still forces a width, and KQ_MOE_GROUP=1 or KQ_MOE_DEDUP=1
-// set explicitly keep the grouped (and tiled) or dedupe forms.
+// width, a split pair with a c32 codec at one row too (kq_moe_c32_glu),
+// and with them the dense shared-expert route. Timings on M5 Max at Hy4
+// shapes: docs/kernels.md, "stq1_0 64-weight step". Each lever set to
+// force a form still forces it: KQ_MOE_NX a width, KQ_MOE_GROUP=1 the
+// grouped (and tiled) forms, KQ_MOE_DEDUP=1 the dedupe forms,
+// KQ_MOE_MIX_FORM=dd the dedupe downs and KQ_MOE_C32=1 the c32 kernels.
+// Unset or empty, these levers leave the plain forms.
 inline bool kq_moe_c64(const std::string& stem) {
   return stem.find("stq1_0") != std::string::npos;
 }
 inline bool kq_moe_c64_grp_off(const std::string& stem) {
-  static const bool set = kq_getenv("KQ_MOE_GROUP") != nullptr;
-  return kq_moe_c64(stem) && !(set && kq_env_flag("KQ_MOE_GROUP", 1) != 0);
+  return kq_moe_c64(stem) && kq_env_flag("KQ_MOE_GROUP", 0) != 1;
 }
 inline bool kq_moe_c64_dd_off(const std::string& stem) {
-  static const bool set = kq_getenv("KQ_MOE_DEDUP") != nullptr;
-  return kq_moe_c64(stem) && !(set && kq_env_flag("KQ_MOE_DEDUP", 1) != 0);
+  return kq_moe_c64(stem) && kq_env_flag("KQ_MOE_DEDUP", 0) != 1;
 }
 
 // A forced KQ_MOE_MIX_FORM names one of the ungrouped forms, so the grouped
@@ -376,6 +374,17 @@ inline int kq_moe_mix_form(bool sp_ok, bool dd_ok) {
     }
   }
   return sp_ok ? KQ_MIX_SP : dd_ok ? KQ_MIX_DD : KQ_MIX_LOOP;
+}
+
+// The dedupe down is off for a stq1_0 stem by default (kq_moe_c64_dd_off);
+// KQ_MOE_MIX_FORM=dd names it, and the stem then takes it where it applies.
+inline bool kq_moe_mix_dd_off(const std::string& stem) {
+  if (!kq_moe_c64_dd_off(stem)) {
+    return false;
+  }
+  static const bool has_env = kq_getenv("KQ_MOE_MIX_FORM") != nullptr;
+  const char* e = has_env ? kq_getenv("KQ_MOE_MIX_FORM") : nullptr;
+  return e == nullptr || std::strcmp(e, "dd") != 0;
 }
 
 // KQ_MOE_NX_LOG=1: print each fused-MoE kernel name once (dispatch audit).
@@ -614,8 +623,14 @@ inline std::string kq_glu_stem(const std::string& t, const std::string& u) {
 }
 
 // The c32 GLU gathers where the gate or the up codec takes them; a codec
-// without the c32 step decodes its two 16-weight chunks in that loop.
+// without the c32 step decodes its two 16-weight chunks in that loop. A
+// pair with a stq1_0 stack runs its 64-weight loop in the c32 kernels too,
+// only at the c32 width, and is faster plain at nx 8 (docs/kernels.md),
+// so it takes them only when KQ_MOE_C32=1 is set.
 inline bool kq_moe_c32_glu(const std::string& t, const std::string& u, int T) {
+  if ((kq_moe_c64(t) || kq_moe_c64(u)) && kq_env_flag("KQ_MOE_C32", -1) != 1) {
+    return false;
+  }
   return kq_moe_c32(t, T) || (u != t && kq_moe_c32(u, T));
 }
 
@@ -1722,7 +1737,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   const bool use_half = kq_moe_half(kquant_type_, K) &&
       (shexp_type_ == kquant_type_ || shexp_type_ == "q5_k" ||
        shexp_type_ == "q6_k" || shexp_type_ == "q8_0");
-  const bool dd_ok = !use_half && !kq_moe_c64_dd_off(kquant_type_) && S <= 16 &&
+  const bool dd_ok = !use_half && !kq_moe_mix_dd_off(kquant_type_) && S <= 16 &&
       kq_moe_dedup(T, KQ_DD_MAX_T);
   const int SP =
       kq_moe_sx_split(kquant_type_, shexp_type_, K, S - NS, NS, use_half, T);
@@ -1885,7 +1900,7 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   // dropped. Decode-scale launches route to the slot-parallel variant
   // unless the codec widens (kq_moe_mix_ns_wide).
   const bool qf = kq_moe_qf(kquant_type_, N, K);
-  const bool dd_ok = !qf && !kq_moe_c64_dd_off(kquant_type_) && S <= 16 &&
+  const bool dd_ok = !qf && !kq_moe_mix_dd_off(kquant_type_) && S <= 16 &&
       kq_moe_dedup(T, KQ_DD_MAX_T);
   const bool c32_ok = !qf && kq_moe_c32(kquant_type_, T);
   const bool sp_ok =
