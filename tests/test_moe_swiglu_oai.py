@@ -29,7 +29,9 @@ swiglu_oai first), so a pipeline cache entry shared by the two forms fails
 one of them.
 
 The saved outputs are exact on the GPU they were written on and within
-rounding elsewhere. Write them with a build from before the change:
+rounding elsewhere; stq1_0, whose 64-weight step sums in another order
+than the release, is held to the bound everywhere. Write them with a build
+from before the change:
 
   python tests/test_moe_swiglu_oai.py --write-ref tests/fixtures/moe_act_ref.npz
 """
@@ -151,8 +153,10 @@ def arms():
     out = []
     for c in GLU_CODECS:
         ext = c + "_ext" if c in ("q6_k", "q8_0") else c
+        # stq1_0 keeps nx 8 where the others widen to 16
+        w = "_float16_t$" if c == "stq1_0" else "_nx16_"
         out += [
-            _arm("glu", c, 1, expect=rf"^kq_{ext}_moe_glu_gather_{{act}}_nx16_"),
+            _arm("glu", c, 1, expect=rf"^kq_{ext}_moe_glu_gather_{{act}}{w}"),
             _arm(
                 "glu",
                 c,
@@ -167,8 +171,8 @@ def arms():
                 env={"KQ_MOE_NX": "8"},
                 expect=rf"^kq_{c}_moe_glu_gather_{{act}}_float16_t$",
             ),
-            _arm("glu", c, 3, expect=rf"^kq_{ext}_moe_glu_gather_dd_{{act}}_nx16_"),
-            _arm("shexp", c, 1, expect=rf"^kq_{ext}_moe_glu_gather_shexp_silu_nx16_"),
+            _arm("glu", c, 3, expect=rf"^kq_{ext}_moe_glu_gather_dd_{{act}}{w}"),
+            _arm("shexp", c, 1, expect=rf"^kq_{ext}_moe_glu_gather_shexp_silu{w}"),
             _arm(
                 "shexp",
                 c,
@@ -176,9 +180,7 @@ def arms():
                 env={"KQ_MOE_NX": "8"},
                 expect=rf"^kq_{c}_moe_glu_gather_shexp_silu_float16_t$",
             ),
-            _arm(
-                "shexp", c, 3, expect=rf"^kq_{ext}_moe_glu_gather_shexp_dd_silu_nx16_"
-            ),
+            _arm("shexp", c, 3, expect=rf"^kq_{ext}_moe_glu_gather_shexp_dd_silu{w}"),
         ]
         if c != "q8_0":
             out.append(
@@ -187,7 +189,7 @@ def arms():
                     c,
                     1,
                     sx="q8_0",
-                    expect=rf"^kq_{c}_sx_q8_0_moe_glu_gather_shexp_silu_nx16_",
+                    expect=rf"^kq_{c}_sx_q8_0_moe_glu_gather_shexp_silu{w}",
                 )
             )
             out.append(
@@ -196,7 +198,7 @@ def arms():
                     c,
                     3,
                     sx="q8_0",
-                    expect=rf"^kq_{c}_sx_q8_0_moe_glu_gather_shexp_dd_silu_nx16_",
+                    expect=rf"^kq_{c}_sx_q8_0_moe_glu_gather_shexp_dd_silu{w}",
                 )
             )
     for c in BF16_CODECS:
@@ -830,7 +832,8 @@ def test_older_forms_match_the_release(runs, order):
         a = by_id[key.split("|")[0]]
         want = _f32(ref[key], a["dtype"])
         got = _f32(data[key], a["dtype"])
-        if exact:
+        # stq1_0 sums its 64-weight step in another order than the release
+        if exact and a["codec"] != "stq1_0":
             assert np.array_equal(got, want), key
         else:
             rel = np.linalg.norm(got - want) / (np.linalg.norm(want) + 1e-6)

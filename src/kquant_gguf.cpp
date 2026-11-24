@@ -381,13 +381,16 @@ const KQuantCodec* gguf_type_to_kquant_codec(uint32_t t) {
       return codec_by_name("iq1_m");
     // Bare literals (MXFP4=39, NVFP4=40, Q2_0=42, PQ2_0=142, PTQ1_0=143):
     // gguflib's enum may predate these types. Type 43 is not here: two
-    // formats claim it (see resolve_type_43).
+    // formats claim it (see resolve_type_43). The Hy4 llama.cpp tree moves
+    // STQ1_0 to 44, since F8_E4M3 takes 43 there.
     case 39:
       return codec_by_name("mxfp4");
     case 40:
       return codec_by_name("nvfp4");
     case 42:
       return codec_by_name("q2_0");
+    case 44:
+      return codec_by_name("stq1_0");
     case 142:
       return codec_by_name("pq2_0");
     case 143:

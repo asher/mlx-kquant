@@ -51,6 +51,12 @@ def test_earlier_keep_c32_for_iq2_s_gathers_only(arch):
 
 
 @pytest.mark.parametrize("arch", WIDE + NARROW)
+def test_stq1_0_takes_qmv_c32_from_m5_and_no_c32_gathers(arch):
+    assert _qmv_c32_on(arch, "stq1_0") == (arch in WIDE)
+    assert not _moe_c32_on(arch, "stq1_0")
+
+
+@pytest.mark.parametrize("arch", WIDE + NARROW)
 def test_other_codecs_never_take_c32(arch):
     for codec in OTHER:
         assert not _moe_c32_on(arch, codec), codec

@@ -7,6 +7,7 @@
 #include "mlx/backend/metal/kernels/quantized_utils.h"
 #include "mlx/backend/metal/kernels/kq_quantized.h"
 #include "mlx/backend/metal/kernels/kq_moe_glu_kq.h"
+#include "mlx/backend/metal/kernels/kq_glu_pairs.h"
 
 #define instantiate_kq_moe_glu_kq(codec, type)                        \
   instantiate_kernel(                                                 \
@@ -248,6 +249,17 @@ instantiate_kq_ext_c32(iq3_s, KqIq3_sExt)
 instantiate_kq_ext_c32(iq1_s, KqIq1_sExt)
 instantiate_kq_ext_c32(iq1_m, KqIq1_mExt)
 
+// The one-row quantized_matmul of stq1_0 on the row step of its gathers,
+// which for stq1_0 is the 64-weight span (KqExtC64).
+#define instantiate_kq_qmv_row(codec, traits, type)                           \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_qmv_c32_" #type, kq_ext_qmv_c32, type, traits, 8)         \
+  instantiate_kernel(                                                         \
+      "kq_" #codec "_qmv_c32_nx16_" #type, kq_ext_qmv_c32, type, traits, 16)
+
+instantiate_kq_qmv_row(stq1_0, KqStq1_0Ext, bfloat16_t)
+instantiate_kq_qmv_row(stq1_0, KqStq1_0Ext, float16_t)
+
 // Grouped gathers (kq_moe_glu_kq.h, KQ_MOE_GROUP): the expert codecs of the
 // UD low-bit builds over a q6_k or q8_0 shared expert.
 instantiate_kq_moe_grp_common()
@@ -318,6 +330,91 @@ instantiate_kq_ext_uniform(q8_0_ext, KqQ8_0Ext, float16_t)
 instantiate_kq_ext_half_all(iq2_xs, KqIq2_xsExt)
 instantiate_kq_ext_half_all(iq2_xxs, KqIq2_xxsExt)
 instantiate_kq_ext_half_all(iq3_xxs, KqIq3_xxsExt)
+
+// Split routed GLU pairs (kq_glu_pairs.h): the gate stack in g, the up
+// stack in u, stem "<g>_up_<u>". Every GLU form a single codec of the Ext
+// family has (plain, c32, dedupe, grouped), routed alone and with a q5_k,
+// q6_k or q8_0 shared expert.
+#define instantiate_kq_glu2_act(name, kern, g, gt, u, ut, type, nx, sfx)     \
+  instantiate_kernel(name "_silu" sfx "_" #type,                              \
+      kern, type, KqGluPair<gt, ut>, KQ_GLU_ACT_SILU, nx)                     \
+  instantiate_kernel(name "_gelu" sfx "_" #type,                      \
+      kern, type, KqGluPair<gt, ut>, KQ_GLU_ACT_GELU, nx)
+
+#define instantiate_kq_glu2_nx(g, gt, u, ut, type, nx, sfx)                   \
+  instantiate_kq_glu2_act("kq_" #g "_up_" #u "_moe_glu_gather",               \
+      kq_ext_moe_glu_gather, g, gt, u, ut, type, nx, sfx)                     \
+  instantiate_kernel("kq_" #g "_up_" #u "_moe_glu_gather_silu_limit" sfx "_" #type, \
+      kq_ext_moe_glu_gather, type, KqGluPair<gt, ut>, KQ_GLU_ACT_SILU_LIMIT, nx) \
+  instantiate_kq_glu2_act("kq_" #g "_up_" #u "_moe_glu_gather_dd",            \
+      kq_ext_moe_glu_gather_dd, g, gt, u, ut, type, nx, sfx)                  \
+  instantiate_kernel("kq_" #g "_up_" #u "_moe_glu_gather_dd_silu_limit" sfx "_" #type, \
+      kq_ext_moe_glu_gather_dd, type, KqGluPair<gt, ut>, KQ_GLU_ACT_SILU_LIMIT, nx)
+
+#define instantiate_kq_glu2_c32_nx(g, gt, u, ut, type, nx, sfx)               \
+  instantiate_kernel("kq_" #g "_up_" #u "_moe_glu_gather_silu_c32" sfx "_" #type, \
+      kq_ext_moe_glu_gather, type, KqGluPair<gt, ut>, KQ_GLU_ACT_SILU, nx, true) \
+  instantiate_kernel("kq_" #g "_up_" #u "_moe_glu_gather_gelu_c32" sfx "_" #type, \
+      kq_ext_moe_glu_gather, type, KqGluPair<gt, ut>, KQ_GLU_ACT_GELU, nx, true) \
+  instantiate_kernel("kq_" #g "_up_" #u "_moe_glu_gather_silu_limit_c32" sfx "_" #type, \
+      kq_ext_moe_glu_gather, type, KqGluPair<gt, ut>, KQ_GLU_ACT_SILU_LIMIT, nx, true)
+
+// The grouped routed GLU is the grouped shared-expert kernel with no shared
+// slots, named with the pair as its own shared codec.
+#define instantiate_kq_glu2_grp_nx(g, gt, u, ut, type, nx, sfx)               \
+  instantiate_kernel(                                                         \
+      "kq_" #g "_up_" #u "_sx_" #g "_up_" #u "_moe_glu_gather_shexp_grp_silu" sfx "_" #type, \
+      kq_ext_moe_glu_gather_shexp_grp, type, KqGluPair<gt, ut>, KqGluPair<gt, ut>, KQ_GLU_ACT_SILU, nx) \
+  instantiate_kernel(                                                         \
+      "kq_" #g "_up_" #u "_sx_" #g "_up_" #u "_moe_glu_gather_shexp_grp_gelu" sfx "_" #type, \
+      kq_ext_moe_glu_gather_shexp_grp, type, KqGluPair<gt, ut>, KqGluPair<gt, ut>, KQ_GLU_ACT_GELU, nx)
+
+#define instantiate_kq_glu2_sx_kern(name, kern, g, gt, u, ut, st, type, nx, sfx) \
+  instantiate_kernel(name "_silu" sfx "_" #type,                              \
+      kern, type, KqGluPair<gt, ut>, st, KQ_GLU_ACT_SILU, nx)                 \
+  instantiate_kernel(name "_gelu" sfx "_" #type,                      \
+      kern, type, KqGluPair<gt, ut>, st, KQ_GLU_ACT_GELU, nx)
+
+#define instantiate_kq_glu2_sx_nx(g, gt, u, ut, s, st, type, nx, sfx)         \
+  instantiate_kq_glu2_sx_kern("kq_" #g "_up_" #u "_sx_" #s "_moe_glu_gather_shexp", \
+      kq_ext_moe_glu_gather_shexp, g, gt, u, ut, st, type, nx, sfx)           \
+  instantiate_kq_glu2_sx_kern("kq_" #g "_up_" #u "_sx_" #s "_moe_glu_gather_shexp_dd", \
+      kq_ext_moe_glu_gather_shexp_dd, g, gt, u, ut, st, type, nx, sfx)
+
+#define instantiate_kq_glu2_sx_c32_grp_nx(g, gt, u, ut, s, st, type, nx, sfx) \
+  instantiate_kernel("kq_" #g "_up_" #u "_sx_" #s "_moe_glu_gather_shexp_silu_c32" sfx "_" #type, \
+      kq_ext_moe_glu_gather_shexp, type, KqGluPair<gt, ut>, st, KQ_GLU_ACT_SILU, nx, true) \
+  instantiate_kernel("kq_" #g "_up_" #u "_sx_" #s "_moe_glu_gather_shexp_gelu_c32" sfx "_" #type, \
+      kq_ext_moe_glu_gather_shexp, type, KqGluPair<gt, ut>, st, KQ_GLU_ACT_GELU, nx, true) \
+  instantiate_kq_glu2_sx_kern("kq_" #g "_up_" #u "_sx_" #s "_moe_glu_gather_shexp_grp", \
+      kq_ext_moe_glu_gather_shexp_grp, g, gt, u, ut, st, type, nx, sfx)
+
+// Shared expert in s: nx 8 to 32 (q5_k stops at 16, as its own family does).
+#define instantiate_kq_glu2_sx(g, gt, u, ut, s, st, type)                     \
+  instantiate_kq_glu2_sx_nx(g, gt, u, ut, s, st, type, 8, "")                 \
+  instantiate_kq_glu2_sx_nx(g, gt, u, ut, s, st, type, 16, "_nx16")           \
+  instantiate_kq_glu2_sx_c32_grp_nx(g, gt, u, ut, s, st, type, 8, "")         \
+  instantiate_kq_glu2_sx_c32_grp_nx(g, gt, u, ut, s, st, type, 16, "_nx16")
+
+#define instantiate_kq_glu2_type(g, gt, u, ut, type)                          \
+  instantiate_kq_glu2_nx(g, gt, u, ut, type, 8, "")                           \
+  instantiate_kq_glu2_nx(g, gt, u, ut, type, 16, "_nx16")                     \
+  instantiate_kq_glu2_nx(g, gt, u, ut, type, 32, "_nx32")                     \
+  instantiate_kq_glu2_c32_nx(g, gt, u, ut, type, 8, "")                       \
+  instantiate_kq_glu2_c32_nx(g, gt, u, ut, type, 16, "_nx16")                 \
+  instantiate_kq_glu2_grp_nx(g, gt, u, ut, type, 8, "")                       \
+  instantiate_kq_glu2_grp_nx(g, gt, u, ut, type, 16, "_nx16")                 \
+  instantiate_kq_glu2_sx(g, gt, u, ut, q5_k, KqQ5_KExt, type)                 \
+  instantiate_kq_glu2_sx(g, gt, u, ut, q6_k, KqQ6_KExt, type)                 \
+  instantiate_kq_glu2_sx_nx(g, gt, u, ut, q6_k, KqQ6_KExt, type, 32, "_nx32") \
+  instantiate_kq_glu2_sx(g, gt, u, ut, q8_0, KqQ8_0Ext, type)                 \
+  instantiate_kq_glu2_sx_nx(g, gt, u, ut, q8_0, KqQ8_0Ext, type, 32, "_nx32")
+
+#define instantiate_kq_glu2(g, gt, u, ut)                                     \
+  instantiate_kq_glu2_type(g, gt, u, ut, bfloat16_t)                          \
+  instantiate_kq_glu2_type(g, gt, u, ut, float16_t)
+
+KQ_GLU_SPLIT_PAIRS(instantiate_kq_glu2)
 
 instantiate_kernel("kq_moe_router_topk_float", kq_moe_router_topk, float)
 instantiate_kernel("kq_moe_router_topk_bfloat16_t", kq_moe_router_topk, bfloat16_t)

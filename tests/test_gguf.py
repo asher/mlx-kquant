@@ -114,6 +114,32 @@ def test_load_gguf_codecs_newer_than_gguf_py(tmp_path, name):
         del arrays, got
 
 
+def test_load_gguf_stq1_0_as_type_44(tmp_path):
+    """The Hy4 llama.cpp tree stores STQ1_0 as type 44 (43 is F8_E4M3
+    there): the tensor loads as stq1_0 with its wire bytes and shape."""
+    from kqref import STQ1_0_44, synth_wire
+
+    rows, k = 6, 4 * 256
+    wire = synth_wire(np.random.default_rng(2), "stq1_0", 42, rows * k // 256)
+    wire = wire.reshape(rows, k // 256 * 42)
+    path = str(tmp_path / "stq44.gguf")
+    _write_gguf(
+        path,
+        [
+            ("pad.f32", np.zeros((3,), dtype=np.float32), GT.F32),
+            ("layer.w", wire, STQ1_0_44),
+            ("tail.f32", np.ones((5,), dtype=np.float32), GT.F32),
+        ],
+    )
+    for zero_copy in (True, False):
+        arrays, codecs, _, shapes = kq.load_gguf(path, zero_copy=zero_copy)
+        assert codecs["layer.w"] == "stq1_0"
+        assert list(shapes["layer.w"]) == [k, rows]
+        assert np.array_equal(np.array(arrays["layer.w"]), wire)
+        assert np.array_equal(np.array(arrays["tail.f32"]), np.ones(5))
+        del arrays
+
+
 def _write_gguf(path, tensors, alignment=None):
     w = GGUFWriter(str(path), "smoke")
     if alignment is not None:

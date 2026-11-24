@@ -499,6 +499,39 @@ def test_mix_form_wide_grid_keeps_pair(tmp_path):
         assert np.array_equal(a, b), (name, np.abs(a - b).max())
 
 
+def test_stq1_0_plain_forms_and_forced_dedupe_down(tmp_path):
+    """At 8 rows, where other codecs take the dedupe, grouped or tiled
+    kernels, stq1_0 takes the plain ones at 8 K-lanes by default.
+    KQ_MOE_MIX_FORM=dd alone forces the dedupe downs, with the same bytes."""
+    outs, names = {}, {}
+    for arm, env in (("default", {}), ("dd", {"KQ_MOE_MIX_FORM": "dd"})):
+        out = tmp_path / f"{arm}.npz"
+        r = _run_child(
+            [sys.executable, "-c", _DD_SNIPPET, "stq1_0", "q6_k", "8", str(out)],
+            {"KQ_MOE_NX_LOG": "1", **env},
+            f"stq1_0 T=8 arm {arm}",
+        )
+        outs[arm] = np.load(out)
+        names[arm] = [
+            ln.split()[1] for ln in r.stderr.splitlines() if ln.startswith("[kq_moe] ")
+        ]
+    glu = "kq_stq1_0_moe_glu_gather_silu_float16_t"
+    shexp = "kq_stq1_0_sx_q6_k_moe_glu_gather_shexp_silu_float16_t"
+    for arm in ("default", "dd"):
+        assert glu in names[arm] and shexp in names[arm], names[arm]
+    for n in names["default"]:
+        assert not any(f in n for f in ("_dd", "_grp", "_tl_", "_tile", "_nx")), n
+    for want in (
+        "kq_stq1_0_gather_qmv_mix_ns_dd",
+        "kq_stq1_0_sx_q6_k_gather_qmv_mix_dd",
+    ):
+        assert any(n.startswith(want) for n in names["dd"]), (want, names["dd"])
+    for name in ("glu", "mix_ns", "shexp", "mix"):
+        a, b = outs["default"][name], outs["dd"][name]
+        assert np.isfinite(a).all() and np.abs(a).max() > 0, name
+        assert np.array_equal(a, b), (name, np.abs(a - b).max())
+
+
 _SP_COVER_SNIPPET = r"""
 import numpy as np
 import mlx.core as mx

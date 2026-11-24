@@ -107,6 +107,15 @@ if(NOT _C MATCHES "\"q2_0\"")
   message(STATUS "gguflib: patched gguflib.c (Q2_0 type-features)")
 endif()
 
+# STQ1_0 as type 44 (the Hy4 llama.cpp tree, where 43 is F8_E4M3): the same
+# 256 vals / 42 B, in the placeholder row the Prism patch left at slot 44.
+file(READ "${_c}" _C)
+if(NOT _C MATCHES "\"stq1_0_44\"")
+  string(REPLACE "{\"unused_44\", 0, 0}" "{\"stq1_0_44\", 256, 42}" _C "${_C}")
+  file(WRITE "${_c}" "${_C}")
+  message(STATUS "gguflib: patched gguflib.c (STQ1_0 as type 44)")
+endif()
+
 # Correct two upstream IQ block-geometry errors (antirez's table predates the
 # final ggml IQ layout): IQ1_S is 50 B / 256 (it had 110), and IQ4_NL is the
 # ONLY flat IQ codec at 18 B / 32 (it had 256/50 = IQ1_S's geometry). The IQ4_NL
@@ -179,7 +188,8 @@ endforeach()
 # _prot,_flags appears only in the mutated mmap() argument list, so it is the
 # one marker that witnesses that REPLACE specifically.
 foreach(_m "\"mxfp4\"" "\"stq1_0\"" "\"pq2_0\", 128, 34" "\"ptq1_0\", 128, 28"
-        "\"q2_0\", 64, 18" "iq4_nl\", 32, 18" "gguf_open_ro" "_prot,_flags")
+        "\"q2_0\", 64, 18" "\"stq1_0_44\", 256, 42" "iq4_nl\", 32, 18"
+        "gguf_open_ro" "_prot,_flags")
   if(NOT _C MATCHES "${_m}")
     message(FATAL_ERROR
       "gguflib patch did not land: '${_m}' missing from gguflib.c "

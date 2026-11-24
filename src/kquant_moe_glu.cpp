@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -22,6 +23,8 @@
 #include "kquant_internal.h" // kq_type_string
 
 #include "kquant_lora_epilogue.h"
+
+#include "../metal/mlx/backend/metal/kernels/kq_glu_pairs.h"
 
 #include "mlx/ops.h"
 #include "mlx/utils.h"
@@ -182,6 +185,27 @@ inline bool kq_moe_group(int T) {
 inline bool kq_moe_group_glu(int T) {
   return kq_moe_group(T) &&
       T >= kq_env_lever_from("KQ_MOE_GROUP_MIN_T", KQ_GRP_GLU_MIN_T, 2);
+}
+
+// Gather stems with a stq1_0 stack (the codec, or either side of a split
+// GLU pair). Their Ext loops take the 64-weight step, which is bound by
+// the weight read at nx 8; the grouped, tiled, dedupe and nx16 forms add
+// work on top of it. So these stems keep the plain forms at nx 8 at every
+// width, a split pair with a c32 codec at one row too (kq_moe_c32_glu),
+// and with them the dense shared-expert route. Timings on M5 Max at Hy4
+// shapes: docs/kernels.md, "stq1_0 64-weight step". Each lever set to
+// force a form still forces it: KQ_MOE_NX a width, KQ_MOE_GROUP=1 the
+// grouped (and tiled) forms, KQ_MOE_DEDUP=1 the dedupe forms,
+// KQ_MOE_MIX_FORM=dd the dedupe downs and KQ_MOE_C32=1 the c32 kernels.
+// Unset or empty, these levers leave the plain forms.
+inline bool kq_moe_c64(const std::string& stem) {
+  return stem.find("stq1_0") != std::string::npos;
+}
+inline bool kq_moe_c64_grp_off(const std::string& stem) {
+  return kq_moe_c64(stem) && kq_env_flag("KQ_MOE_GROUP", 0) != 1;
+}
+inline bool kq_moe_c64_dd_off(const std::string& stem) {
+  return kq_moe_c64(stem) && kq_env_flag("KQ_MOE_DEDUP", 0) != 1;
 }
 
 // A forced KQ_MOE_MIX_FORM names one of the ungrouped forms, so the grouped
@@ -350,6 +374,17 @@ inline int kq_moe_mix_form(bool sp_ok, bool dd_ok) {
     }
   }
   return sp_ok ? KQ_MIX_SP : dd_ok ? KQ_MIX_DD : KQ_MIX_LOOP;
+}
+
+// The dedupe down is off for a stq1_0 stem by default (kq_moe_c64_dd_off);
+// KQ_MOE_MIX_FORM=dd names it, and the stem then takes it where it applies.
+inline bool kq_moe_mix_dd_off(const std::string& stem) {
+  if (!kq_moe_c64_dd_off(stem)) {
+    return false;
+  }
+  static const bool has_env = kq_getenv("KQ_MOE_MIX_FORM") != nullptr;
+  const char* e = has_env ? kq_getenv("KQ_MOE_MIX_FORM") : nullptr;
+  return e == nullptr || std::strcmp(e, "dd") != 0;
 }
 
 // KQ_MOE_NX_LOG=1: print each fused-MoE kernel name once (dispatch audit).
@@ -577,6 +612,34 @@ inline bool kq_moe_c32_shexp_ok(
       shexp == "q8_0";
 }
 
+// The kernel stem of a routed GLU with its gate stack in t and its up stack
+// in u: t itself, or "<t>_up_<u>" for a split pair (kq_glu_pairs.h). The
+// form picks that key on the stem see no codec of their own in a pair's,
+// so a pair takes the Ext forms (it has no qf or half-dot kernels); its c32
+// step and simdgroup count come from its two codecs (kq_moe_c32_glu,
+// kq_moe_pick_sg_glu).
+inline std::string kq_glu_stem(const std::string& t, const std::string& u) {
+  return u == t ? t : t + "_up_" + u;
+}
+
+// The c32 GLU gathers where the gate or the up codec takes them; a codec
+// without the c32 step decodes its two 16-weight chunks in that loop. A
+// pair with a stq1_0 stack runs its 64-weight loop in the c32 kernels too,
+// only at the c32 width, and is faster plain at nx 8 (docs/kernels.md),
+// so it takes them only when KQ_MOE_C32=1 is set.
+inline bool kq_moe_c32_glu(const std::string& t, const std::string& u, int T) {
+  if ((kq_moe_c64(t) || kq_moe_c64(u)) && kq_env_flag("KQ_MOE_C32", -1) != 1) {
+    return false;
+  }
+  return kq_moe_c32(t, T) || (u != t && kq_moe_c32(u, T));
+}
+
+inline int
+kq_moe_pick_sg_glu(const std::string& t, const std::string& u, int N, int nx) {
+  const int sg = kq_moe_pick_sg(t, N, nx);
+  return u == t ? sg : std::max(sg, kq_moe_pick_sg(u, N, nx));
+}
+
 // K-lanes per row of the c32 GLU gathers: a forced KQ_MOE_NX of 8 or 16,
 // else this GPU's class width (moe_c32_nx).
 inline int kq_moe_c32_nx() {
@@ -733,7 +796,8 @@ inline bool kq_moe_shexp_dense(
     int K) {
   const char* e = kq_getenv("KQ_MOE_SHEXP_DENSE");
   if ((e == nullptr || e[0] == '\0') && T >= KQ_GRP_DENSE_OFF_MIN_T &&
-      kq_moe_group_glu(T) && kq_moe_group_form(t, st, N, K) != KQ_GRP_NONE) {
+      !kq_moe_c64_grp_off(t) && kq_moe_group_glu(T) &&
+      kq_moe_group_form(t, st, N, K) != KQ_GRP_NONE) {
     return false;
   }
   return kq_moe_shexp_dense(T);
@@ -761,7 +825,8 @@ inline bool kq_moe_tile_ok(
   if (T > KQ_GRP_MAX_T || bits != 0 || K % 32 != 0) {
     return false;
   }
-  if (t == "nvfp4" || st == "nvfp4" || kq_moe_half(t, K)) {
+  if (t == "nvfp4" || st == "nvfp4" || kq_moe_half(t, K) ||
+      kq_moe_c64_grp_off(t)) {
     return false;
   }
   return kq_moe_group(T) && kq_env_flag("KQ_MOE_TILE", 1) != 0 &&
@@ -1168,7 +1233,9 @@ void KQuantMoEGLUKQ::eval_gpu(
   moe_check_stack("moe_glu_gather_kq", gw);
   moe_check_stack("moe_glu_gather_kq", uw);
   kq_check_weight_base(gw, kquant_type_, "moe_glu_gather_kq");
-  kq_check_weight_base(uw, kquant_type_, "moe_glu_gather_kq");
+  kq_check_weight_base(uw, up_type_, "moe_glu_gather_kq");
+  // The kernel stem: the codec, or the split pair's (one codec when equal).
+  const std::string kt = kq_glu_stem(kquant_type_, up_type_);
   const mx::array x =
       kq_x_aligned_gpu(inputs[biased ? 4 : 2], s, "moe_glu_gather_kq x");
   out.set_data(mx::allocator::malloc(out.nbytes()));
@@ -1180,16 +1247,16 @@ void KQuantMoEGLUKQ::eval_gpu(
 
   // Grouped form: the shared-expert grouped kernel with no shared slots,
   // the expert stacks standing in for its shared operands.
-  const int gform = !biased && kq_moe_group_glu(T)
-      ? kq_moe_group_form(kquant_type_, "", N, K)
+  const bool c64 = kq_moe_c64(kt);
+  const int gform = !biased && !kq_moe_c64_grp_off(kt) && kq_moe_group_glu(T)
+      ? kq_moe_group_form(kt, "", N, K)
       : KQ_GRP_NONE;
   if (gform != KQ_GRP_NONE) {
     const bool gqf = gform == KQ_GRP_QF;
     const int nx = gqf ? 8 : kq_moe_group_nx((int64_t)N * R * T, K, true);
     // swiglu_oai and situ ride the silu kernels, with alpha bound.
     const bool galpha = (out_scale_bits_ & KQ_MOE_GLU_ALPHA) != 0;
-    const std::string kname = "kq_" +
-        kq_moe_group_stem(gform, kquant_type_, "") +
+    const std::string kname = "kq_" + kq_moe_group_stem(gform, kt, "") +
         "_moe_glu_gather_shexp_grp_" +
         (act_ == "gelu" && !galpha ? "gelu" : "silu") + kq_nx_suffix(nx) + "_" +
         kq_type_string(x.dtype());
@@ -1213,9 +1280,11 @@ void KQuantMoEGLUKQ::eval_gpu(
       ce.set_bytes(alpha_, kq_glu_alpha_slot);
     }
     kq_moe_bind_scales(ce, inputs, out_scale_bits_, true);
-    const int sg =
-        gqf ? 2 : kq_moe_fit_sg(kernel, kq_moe_pick_sg(kquant_type_, N, nx));
-    const int tile = gqf ? 2 * kq_qf_rps(kquant_type_) : sg * 32 / nx;
+    const int sg = gqf
+        ? 2
+        : kq_moe_fit_sg(
+              kernel, kq_moe_pick_sg_glu(kquant_type_, up_type_, N, nx));
+    const int tile = gqf ? 2 * kq_qf_rps(kt) : sg * 32 / nx;
     MTL::Size group_dims(32, sg, 1);
     MTL::Size grid_dims(N / tile, R, T);
     kq_log_dispatch(kname, x, out, grid_dims, group_dims);
@@ -1225,17 +1294,16 @@ void KQuantMoEGLUKQ::eval_gpu(
 
   // The half kernels run at nx 8: 32 rows per threadgroup amortize the
   // staged activation row and half grid (nx 16 measured 10% slower).
-  const bool qf = kq_moe_qf(kquant_type_, N, K);
-  const bool use_half = !qf && !biased && kq_moe_half(kquant_type_, K);
-  const bool dd = (!qf || kq_qf_pairs(kquant_type_)) && !biased && !use_half &&
-      kq_moe_dedup(T, KQ_DD_MAX_T);
-  const bool c32 =
-      !qf && !biased && !use_half && !dd && kq_moe_c32(kquant_type_, T);
+  const bool qf = kq_moe_qf(kt, N, K);
+  const bool use_half = !qf && !biased && kq_moe_half(kt, K);
+  const bool dd = (!qf || kq_qf_pairs(kt)) && !biased && !use_half &&
+      !kq_moe_c64_dd_off(kt) && kq_moe_dedup(T, KQ_DD_MAX_T);
+  const bool c32 = !qf && !biased && !use_half && !dd &&
+      kq_moe_c32_glu(kquant_type_, up_type_, T);
   const int nx = qf || use_half ? 8
       : c32                     ? kq_moe_c32_nx()
-                                : kq_moe_pick_nx((int64_t)N * R * T, K, true);
-  std::string stem =
-      qf ? kquant_type_ + "_qf" : kq_gather_stem_nx(kquant_type_, K, nx);
+                                : kq_moe_pick_nx((int64_t)N * R * T, K, !c64);
+  std::string stem = qf ? kt + "_qf" : kq_gather_stem_nx(kt, K, nx);
   if (dd && (stem == "q6_k" || stem == "q8_0")) {
     stem += "_ext"; // the dedupe kernels are Ext-only
   }
@@ -1283,9 +1351,10 @@ void KQuantMoEGLUKQ::eval_gpu(
   const bool tuned = qf || stem == "q6_k" || stem == "q8_0";
   const int sg = kq_moe_fit_sg(
       kernel,
-      use_half ? kq_moe_pick_sg_h(N, nx)
-               : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx)));
-  const int tile = qf ? 2 * kq_qf_rps(kquant_type_) : sg * 32 / nx;
+      use_half
+          ? kq_moe_pick_sg_h(N, nx)
+          : (tuned ? 2 : kq_moe_pick_sg_glu(kquant_type_, up_type_, N, nx)));
+  const int tile = qf ? 2 * kq_qf_rps(kt) : sg * 32 / nx;
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / tile, R, T);
   kq_log_dispatch(kname, x, out, grid_dims, group_dims);
@@ -1394,7 +1463,7 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   moe_check_shexp("moe_glu_gather_shexp_kq", sgw);
   moe_check_shexp("moe_glu_gather_shexp_kq", suw);
   kq_check_weight_base(gw, kquant_type_, "moe_glu_gather_shexp_kq");
-  kq_check_weight_base(uw, kquant_type_, "moe_glu_gather_shexp_kq");
+  kq_check_weight_base(uw, up_type_, "moe_glu_gather_shexp_kq");
   kq_check_weight_base(sgw, shexp_type_, "moe_glu_gather_shexp_kq");
   kq_check_weight_base(suw, shexp_up_type_, "moe_glu_gather_shexp_kq");
   const mx::array x =
@@ -1408,15 +1477,19 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   // Shared slots: the shared expert is NS routed experts wide.
   const int NS = sgw.shape(0) / N;
 
+  // The routed kernel stem: the codec, or a split pair's (kq_glu_stem).
+  const std::string kt = kq_glu_stem(kquant_type_, up_type_);
+  const bool c64 = kq_moe_c64(kt);
   const bool upcast_pair = shexp_up_type_ == shexp_type_ &&
-      (shexp_type_ == kquant_type_ || shexp_type_ == "q5_k" ||
-       shexp_type_ == "q6_k" || shexp_type_ == "q8_0");
+      (shexp_type_ == kt || shexp_type_ == "q5_k" || shexp_type_ == "q6_k" ||
+       shexp_type_ == "q8_0");
   if (!upcast_pair) {
     // Gate and up of the shared expert each in its own codec: the "_sx2_"
     // instantiations, generic float path, one launch shape for any T.
-    const bool grp2 = kq_moe_group_glu(T) && !kq_moe_half(kquant_type_, K);
+    const bool grp2 = !kq_moe_c64_grp_off(kt) && kq_moe_group_glu(T) &&
+        !kq_moe_half(kquant_type_, K);
     const int nx = grp2 ? kq_moe_group_nx((int64_t)N * (R + NS) * T, K, true)
-                        : kq_moe_pick_nx((int64_t)N * (R + NS) * T, K, true);
+                        : kq_moe_pick_nx((int64_t)N * (R + NS) * T, K, !c64);
     const std::string kname = "kq_" + kquant_type_ + "_sx2_" + shexp_type_ +
         "_" + shexp_up_type_ + "_moe_glu_gather_shexp_" +
         (grp2 ? "grp_silu" : "silu") + kq_nx_suffix(nx) + "_" +
@@ -1450,30 +1523,30 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
 
   // Mixed shexp codecs dispatch the generic "_sx_" instantiations. The
   // half-dot pick keys on the expert codec; the shared slot stays float.
-  const int gform = kq_moe_group_glu(T)
-      ? kq_moe_group_form(kquant_type_, shexp_type_, N, K)
+  const int gform = !kq_moe_c64_grp_off(kt) && kq_moe_group_glu(T)
+      ? kq_moe_group_form(kt, shexp_type_, N, K)
       : KQ_GRP_NONE;
   const bool grp = gform != KQ_GRP_NONE;
   const bool grp_qf = gform == KQ_GRP_QF;
   const bool qf = grp_qf ||
-      (!grp && kq_moe_qf(kquant_type_, N, K) &&
-       kq_qf_shexp_ok(kquant_type_, shexp_type_, K));
-  const bool use_half = !grp && !qf && kq_moe_half(kquant_type_, K) &&
-      (shexp_type_ == kquant_type_ || shexp_type_ == "q5_k" ||
-       shexp_type_ == "q6_k" || shexp_type_ == "q8_0");
-  const bool dd = !grp && !qf && !use_half && kq_moe_dedup(T, KQ_DD_MAX_T);
-  const bool c32 =
-      !grp && !qf && !use_half && !dd && kq_moe_c32(kquant_type_, T);
+      (!grp && kq_moe_qf(kt, N, K) && kq_qf_shexp_ok(kt, shexp_type_, K));
+  const bool use_half = !grp && !qf && kq_moe_half(kt, K) &&
+      (shexp_type_ == kt || shexp_type_ == "q5_k" || shexp_type_ == "q6_k" ||
+       shexp_type_ == "q8_0");
+  const bool dd = !grp && !qf && !use_half && !kq_moe_c64_dd_off(kt) &&
+      kq_moe_dedup(T, KQ_DD_MAX_T);
+  const bool c32 = !grp && !qf && !use_half && !dd &&
+      kq_moe_c32_glu(kquant_type_, up_type_, T);
   const int nx = qf || use_half ? 8
       : grp ? kq_moe_group_nx((int64_t)N * (R + NS) * T, K, true)
       : c32 ? kq_moe_c32_nx()
-            : kq_moe_pick_nx((int64_t)N * (R + NS) * T, K, true);
+            : kq_moe_pick_nx((int64_t)N * (R + NS) * T, K, !c64);
   // The qf kernels always carry the shared codec in the name, and so do
   // the grouped ones.
-  std::string stem = grp ? kq_moe_group_stem(gform, kquant_type_, shexp_type_)
-      : qf               ? kquant_type_ + "_qf_sx_" + shexp_type_
-      : shexp_type_ == kquant_type_ ? kq_gather_stem_nx(kquant_type_, K, nx)
-                                    : kquant_type_ + "_sx_" + shexp_type_;
+  std::string stem = grp  ? kq_moe_group_stem(gform, kt, shexp_type_)
+      : qf                ? kt + "_qf_sx_" + shexp_type_
+      : shexp_type_ == kt ? kq_gather_stem_nx(kt, K, nx)
+                          : kt + "_sx_" + shexp_type_;
   if (dd && (stem == "q6_k" || stem == "q8_0")) {
     stem += "_ext";
   }
@@ -1511,9 +1584,10 @@ void KQuantMoEGLUShexpKQ::eval_gpu(
   const bool tuned = qf || stem == "q6_k" || stem == "q8_0";
   const int sg = kq_moe_fit_sg(
       kernel,
-      use_half ? kq_moe_pick_sg_h(N, nx)
-               : (tuned ? 2 : kq_moe_pick_sg(kquant_type_, N, nx)));
-  const int tile = qf ? 2 * kq_qf_rps(kquant_type_) : sg * 32 / nx;
+      use_half
+          ? kq_moe_pick_sg_h(N, nx)
+          : (tuned ? 2 : kq_moe_pick_sg_glu(kquant_type_, up_type_, N, nx)));
+  const int tile = qf ? 2 * kq_qf_rps(kt) : sg * 32 / nx;
   MTL::Size group_dims(32, sg, 1);
   MTL::Size grid_dims(N / tile, R + NS, T);
   kq_log_dispatch(kname, x, out, grid_dims, group_dims);
@@ -1590,7 +1664,7 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   }
 
   // Grouped form: a routed expert is read once per eight pairs on it.
-  const int gform = kq_moe_group_mix(T)
+  const int gform = !kq_moe_c64_grp_off(kquant_type_) && kq_moe_group_mix(T)
       ? kq_moe_group_form(kquant_type_, shexp_type_, N, K, NS == 1)
       : KQ_GRP_NONE;
   if (gform != KQ_GRP_NONE) {
@@ -1663,7 +1737,8 @@ void KQuantGatherQMVMixKQ::eval_gpu(
   const bool use_half = kq_moe_half(kquant_type_, K) &&
       (shexp_type_ == kquant_type_ || shexp_type_ == "q5_k" ||
        shexp_type_ == "q6_k" || shexp_type_ == "q8_0");
-  const bool dd_ok = !use_half && S <= 16 && kq_moe_dedup(T, KQ_DD_MAX_T);
+  const bool dd_ok = !use_half && !kq_moe_mix_dd_off(kquant_type_) && S <= 16 &&
+      kq_moe_dedup(T, KQ_DD_MAX_T);
   const int SP =
       kq_moe_sx_split(kquant_type_, shexp_type_, K, S - NS, NS, use_half, T);
   const std::string sp_stem = shexp_type_ == kquant_type_
@@ -1825,7 +1900,8 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
   // dropped. Decode-scale launches route to the slot-parallel variant
   // unless the codec widens (kq_moe_mix_ns_wide).
   const bool qf = kq_moe_qf(kquant_type_, N, K);
-  const bool dd_ok = !qf && S <= 16 && kq_moe_dedup(T, KQ_DD_MAX_T);
+  const bool dd_ok = !qf && !kq_moe_mix_dd_off(kquant_type_) && S <= 16 &&
+      kq_moe_dedup(T, KQ_DD_MAX_T);
   const bool c32_ok = !qf && kq_moe_c32(kquant_type_, T);
   const bool sp_ok =
       (c32_ok
@@ -1841,7 +1917,7 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
       ? kq_moe_c32_down_nx()
       : kq_moe_pick_nx(
             (int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, dd ? 2 : T, K));
-  const int gform = kq_moe_group_mix(T)
+  const int gform = !kq_moe_c64_grp_off(kquant_type_) && kq_moe_group_mix(T)
       ? kq_moe_group_form(kquant_type_, "", N, K)
       : KQ_GRP_NONE;
   if (kq_moe_tile_mix(T, kquant_type_, kquant_type_, N, K, out_scale_bits_)) {
@@ -2121,8 +2197,8 @@ void KQuantGatherQMVKQ::eval_cpu(
 
 bool KQuantMoEGLUKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMoEGLUKQ&>(other);
-  return kquant_type_ == o.kquant_type_ && act_ == o.act_ &&
-      limit_ == o.limit_ && alpha_ == o.alpha_ &&
+  return kquant_type_ == o.kquant_type_ && up_type_ == o.up_type_ &&
+      act_ == o.act_ && limit_ == o.limit_ && alpha_ == o.alpha_ &&
       out_scale_bits_ == o.out_scale_bits_;
 }
 
@@ -2157,10 +2233,10 @@ void KQuantGatherQMVMixKQ::eval_cpu(
 
 bool KQuantMoEGLUShexpKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMoEGLUShexpKQ&>(other);
-  return kquant_type_ == o.kquant_type_ && act_ == o.act_ &&
-      shexp_type_ == o.shexp_type_ && shexp_up_type_ == o.shexp_up_type_ &&
-      limit_ == o.limit_ && alpha_ == o.alpha_ &&
-      out_scale_bits_ == o.out_scale_bits_;
+  return kquant_type_ == o.kquant_type_ && up_type_ == o.up_type_ &&
+      act_ == o.act_ && shexp_type_ == o.shexp_type_ &&
+      shexp_up_type_ == o.shexp_up_type_ && limit_ == o.limit_ &&
+      alpha_ == o.alpha_ && out_scale_bits_ == o.out_scale_bits_;
 }
 
 bool KQuantGatherQMVMixKQ::is_equivalent(const mx::Primitive& other) const {
@@ -2277,15 +2353,19 @@ bool moe_c32_on(const std::string& arch, const std::string& codec) {
       (kq_moe_has_c32(codec) && moe_mac_gpu_gen(arch) >= 17);
 }
 
-bool codec_has_c32(const std::string& codec) {
-  return kq_moe_has_c32(codec);
+// The codecs with a qmv_c32 kernel: the grid codecs and stq1_0, whose row
+// step there is its 64-weight span (KqExtC64).
+bool codec_has_qmv_c32(const std::string& codec) {
+  return kq_moe_has_c32(codec) || codec == "stq1_0";
 }
 
-// The M = 1 quantized_matmul of a grid codec through the c32 row step: from
-// gen 17 (M5), measured on an M5 Max only. At K=4096, N=14336 the qmv
-// kernels took 2 to 21% longer (iq2_s and iq3_s most, iq2_xxs least).
+// The M = 1 quantized_matmul of a grid codec or stq1_0 through the c32 row
+// step: from gen 17 (M5), measured on an M5 Max only. At K=4096, N=14336
+// the qmv kernels took 2 to 21% longer (iq2_s and iq3_s most, iq2_xxs
+// least); stq1_0 at N=K=6144 took 50 us a call on them against 28 to 30 on
+// the 64-weight span at nx 8.
 bool qmv_c32_on(const std::string& arch, const std::string& codec) {
-  return moe_mac_gpu_gen(arch) >= 17 && kq_moe_has_c32(codec);
+  return moe_mac_gpu_gen(arch) >= 17 && codec_has_qmv_c32(codec);
 }
 
 // Codecs with the fused kq GLU/gather kernels wired (kq_moe_glu_kq.h):
@@ -2350,6 +2430,47 @@ bool shexp_glu_combo_has_kernel(
   return (kquant_type == "iq2_s" || kquant_type == "iq2_xxs" ||
           kquant_type == "iq1_m") &&
       lowbit_shexp_codec(shexp_gate_type) && lowbit_shexp_codec(shexp_up_type);
+}
+
+namespace {
+
+// A split routed GLU pair of kq_glu_pairs.h: gate in g, up in u, g != u.
+bool glu_split_pair(const std::string& g, const std::string& u) {
+#define KQ_GLU_PAIR_MATCH(gc, gt, uc, ut) \
+  if (g == #gc && u == #uc) {             \
+    return true;                          \
+  }
+  KQ_GLU_SPLIT_PAIRS(KQ_GLU_PAIR_MATCH)
+#undef KQ_GLU_PAIR_MATCH
+  return false;
+}
+
+} // namespace
+
+bool moe_glu_pair_has_kernel(
+    const std::string& gate_type,
+    const std::string& up_type,
+    const std::string& shexp_gate_type,
+    const std::string& shexp_up_type,
+    int shared_slots) {
+  const std::string sg = shexp_gate_type;
+  const std::string su = shexp_up_type.empty() ? sg : shexp_up_type;
+  if (gate_type == up_type) {
+    return sg.empty()
+        ? codec_has_moe_glu(gate_type)
+        : shexp_glu_combo_has_kernel(gate_type, sg, su, shared_slots);
+  }
+  if (!glu_split_pair(gate_type, up_type)) {
+    return false;
+  }
+  if (sg.empty()) {
+    return su.empty();
+  }
+  // The split pairs' shared-expert kernels: one q5_k, q6_k or q8_0 codec.
+  if (shared_slots < 1 || (shared_slots > 1 && !kq_moe_shexp_multi())) {
+    return false;
+  }
+  return su == sg && (sg == "q5_k" || sg == "q6_k" || sg == "q8_0");
 }
 
 bool shexp_mix_combo_has_kernel(
@@ -2797,8 +2918,24 @@ mx::array moe_glu_gather_kq(
     float alpha,
     const std::optional<mx::array>& gate_scale,
     const std::optional<mx::array>& up_scale,
+    const std::string& up_kquant_type,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
+  const std::string up_type =
+      up_kquant_type.empty() ? kquant_type : up_kquant_type;
+  if (up_type != kquant_type) {
+    if (!moe_glu_pair_has_kernel(kquant_type, up_type)) {
+      throw std::invalid_argument(
+          "[mlx_kquant.moe_glu_gather_kq] no fused kernel for gate codec '" +
+          kquant_type + "' with up codec '" + up_type + "'.");
+    }
+    if (gate_bias.has_value() || up_bias.has_value() ||
+        gate_scale.has_value() || up_scale.has_value()) {
+      throw std::invalid_argument(
+          "[mlx_kquant.moe_glu_gather_kq] biases and output scales need the "
+          "gate and up stacks in one codec.");
+    }
+  }
   if (x.ndim() != 2) {
     throw std::invalid_argument(
         "[mlx_kquant.moe_glu_gather_kq] x must be 2-D [T, K].");
@@ -2853,9 +2990,9 @@ mx::array moe_glu_gather_kq(
   int K = x.shape(1);
   check_kq_expert_stack(
       "[mlx_kquant.moe_glu_gather_kq]", gate_w, kquant_type, K);
-  check_kq_expert_stack("[mlx_kquant.moe_glu_gather_kq]", up_w, kquant_type, K);
+  check_kq_expert_stack("[mlx_kquant.moe_glu_gather_kq]", up_w, up_type, K);
   kq_check_weight_base_at_build(gate_w, kquant_type, s, "moe_glu_gather_kq");
-  kq_check_weight_base_at_build(up_w, kquant_type, s, "moe_glu_gather_kq");
+  kq_check_weight_base_at_build(up_w, up_type, s, "moe_glu_gather_kq");
   if (gate_w.shape(0) != up_w.shape(0) || gate_w.shape(1) != up_w.shape(1)) {
     throw std::invalid_argument(
         "[mlx_kquant.moe_glu_gather_kq] gate/up expert shapes must match.");
@@ -2906,7 +3043,8 @@ mx::array moe_glu_gather_kq(
           (act == "swiglu_clamp" || act == "swiglu_oai" || act == "situ")
               ? alpha
               : 0.0f,
-          os_bits),
+          os_bits,
+          up_type),
       std::move(op_inputs));
 }
 
@@ -3017,16 +3155,35 @@ mx::array moe_glu_gather_shexp_kq(
     const std::optional<mx::array>& shexp_gate_scale,
     const std::optional<mx::array>& shexp_up_scale,
     float alpha,
+    const std::string& up_kquant_type,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.moe_glu_gather_shexp_kq]";
+  const std::string up_type =
+      up_kquant_type.empty() ? kquant_type : up_kquant_type;
+  const bool split = up_type != kquant_type;
   const std::string shexp_type =
       shexp_kquant_type.empty() ? kquant_type : shexp_kquant_type;
   const std::string shexp_up_type =
       shexp_up_kquant_type.empty() ? shexp_type : shexp_up_kquant_type;
-  const bool upcast_pair =
-      shexp_up_type == shexp_type && shexp_upcast_pair(kquant_type, shexp_type);
-  if (!shexp_glu_combo_has_kernel(kquant_type, shexp_type, shexp_up_type) ||
+  if (split) {
+    if (!moe_glu_pair_has_kernel(
+            kquant_type, up_type, shexp_type, shexp_up_type)) {
+      throw std::invalid_argument(
+          std::string(op) + " no fused kernel for gate codec '" + kquant_type +
+          "' with up codec '" + up_type + "' and shared-expert codecs '" +
+          shexp_type + "' (gate) and '" + shexp_up_type + "' (up).");
+    }
+    if (gate_scale.has_value() || up_scale.has_value()) {
+      throw std::invalid_argument(
+          std::string(op) +
+          " output scales need the gate and up stacks in one codec.");
+    }
+  }
+  const bool upcast_pair = shexp_up_type == shexp_type &&
+      (split || shexp_upcast_pair(kquant_type, shexp_type));
+  if ((!split &&
+       !shexp_glu_combo_has_kernel(kquant_type, shexp_type, shexp_up_type)) ||
       (!upcast_pair && act != "silu" && act != "swiglu_oai")) {
     throw std::invalid_argument(
         std::string(op) + " no fused kernel for expert codec '" + kquant_type +
@@ -3061,7 +3218,7 @@ mx::array moe_glu_gather_shexp_kq(
   }
   int K = x.shape(1);
   check_kq_expert_stack(op, gate_w, kquant_type, K);
-  check_kq_expert_stack(op, up_w, kquant_type, K);
+  check_kq_expert_stack(op, up_w, up_type, K);
   if (gate_w.shape(0) != up_w.shape(0) || gate_w.shape(1) != up_w.shape(1)) {
     throw std::invalid_argument(
         std::string(op) + " gate/up expert shapes must match.");
@@ -3091,10 +3248,12 @@ mx::array moe_glu_gather_shexp_kq(
                              &up_scale,
                              "up_scale") |
       (act == "swiglu_oai" ? KQ_MOE_SWIGLU_OAI : 0);
-  const bool dense =
-      upcast_pair &&
-      kq_moe_shexp_dense(
-          x.shape(0), kquant_type, shexp_type, gate_w.shape(1), x.shape(-1));
+  const bool dense = upcast_pair &&
+      kq_moe_shexp_dense(x.shape(0),
+                         kq_glu_stem(kquant_type, up_type),
+                         shexp_type,
+                         gate_w.shape(1),
+                         x.shape(-1));
   const int os_bits = route_bits | (dense ? KQ_MOE_SHEXP_PRE : shexp_bit);
 
   auto x_c = moe_dense_x(x, s);
@@ -3111,8 +3270,7 @@ mx::array moe_glu_gather_shexp_kq(
   mx::Shape out_shape = {x.shape(0), indices.shape(1) + ns, N};
   kq_check_weight_base_at_build(
       gate_w, kquant_type, s, "moe_glu_gather_shexp_kq");
-  kq_check_weight_base_at_build(
-      up_w, kquant_type, s, "moe_glu_gather_shexp_kq");
+  kq_check_weight_base_at_build(up_w, up_type, s, "moe_glu_gather_shexp_kq");
   kq_check_weight_base_at_build(
       shexp_gate_w, shexp_type, s, "moe_glu_gather_shexp_kq");
   kq_check_weight_base_at_build(
@@ -3146,7 +3304,8 @@ mx::array moe_glu_gather_shexp_kq(
           act == "silu_limit" || act == "swiglu_oai" ? limit : 0.0f,
           shexp_up_type,
           os_bits,
-          act == "swiglu_oai" ? alpha : 0.0f),
+          act == "swiglu_oai" ? alpha : 0.0f,
+          up_type),
       std::move(op_inputs));
 }
 
@@ -4297,6 +4456,7 @@ mx::array moe_store_glu(
         std::nullopt,
         std::nullopt,
         0.0f,
+        "",
         s);
   }
   const int R = indices.shape(1);

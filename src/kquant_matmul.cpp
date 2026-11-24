@@ -2432,11 +2432,11 @@ static bool qmv_splitk(
   return true;
 }
 
-// Dispatches the M = 1 mat-vec of a grid codec through the c32 row step of
-// the MoE gathers (kq_<codec>_qmv_c32). KQ_QMV_C32, read per call: 0 keeps
-// the qmv kernels, 1 takes c32 at this GPU's width, 8 or 16 at that width;
-// unset follows qmv_c32_on. Returns false, dispatching nothing, when the
-// codec, shape or pipeline does not fit.
+// Dispatches the M = 1 mat-vec of a grid codec or stq1_0 through the row
+// step of the MoE gathers (kq_<codec>_qmv_c32). KQ_QMV_C32, read per call: 0
+// keeps the qmv kernels, 1 takes c32 at this GPU's width (8 for stq1_0, its
+// fastest), 8 or 16 at that width; unset follows qmv_c32_on. Returns false,
+// dispatching nothing, when the codec, shape or pipeline does not fit.
 static bool qmv_c32(
     const array& x,
     const array& w,
@@ -2449,10 +2449,12 @@ static bool qmv_c32(
   const int env = kq_env_int("KQ_QMV_C32", -1);
   static const std::string arch = d.get_architecture();
   if (env == 0 || (env == -1 && !qmv_c32_on(arch, kquant_type)) ||
-      !codec_has_c32(kquant_type)) {
+      !codec_has_qmv_c32(kquant_type)) {
     return false;
   }
-  const int nx = env == 8 || env == 16 ? env : moe_c32_nx(arch);
+  const int nx = env == 8 || env == 16 ? env
+      : kquant_type == "stq1_0"        ? 8
+                                       : moe_c32_nx(arch);
   const int rps = 32 / nx;
   int sg = kquant_type == "iq2_xs" ? 8 : 2;
   while (sg > 1 && N % (sg * rps) != 0) {
