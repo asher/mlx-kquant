@@ -2839,6 +2839,7 @@ NB_MODULE(_ext, m) {
       "gate_scale"_a = nb::none(),
       "up_scale"_a = nb::none(),
       "up_kquant_type"_a = "",
+      "absent"_a = false,
       "stream"_a = nb::none(),
       R"(
         Fused MoE GLU gather for K-quant expert stacks: gate and up expert
@@ -2883,6 +2884,9 @@ NB_MODULE(_ext, m) {
                 gate_w's (kquant_type); '' (default) = kquant_type. The
                 pair must pass moe_glu_pair_has_kernel; a split pair takes
                 no biases or output scales.
+            absent (bool): an index with bit 31 set (0x80000000) names no
+                expert: its [t, r] output is zeros and no weights are read
+                for it. Takes no biases.
 
         Returns:
             array: activated hidden states [T, R, N] in x.dtype.
@@ -3066,6 +3070,7 @@ NB_MODULE(_ext, m) {
       "lora_table"_a = nb::none(),
       "lora_rows"_a = nb::none(),
       "out_scale"_a = nb::none(),
+      "absent"_a = false,
       "stream"_a = nb::none(),
       R"(
         Gathered down projection with the routing mix folded in, no shared
@@ -3090,6 +3095,9 @@ NB_MODULE(_ext, m) {
                 ``indices``; 0 skips a row.
             out_scale (array, optional): as for gather_qmv_kq, the scale of
                 each routed product before the mix.
+            absent (bool): an index with bit 31 set (0x80000000) names no
+                expert: its slot adds nothing and no weights are read for
+                it. Takes no LoRA.
 
         Returns:
             array: mixed output [T, N] in x.dtype.

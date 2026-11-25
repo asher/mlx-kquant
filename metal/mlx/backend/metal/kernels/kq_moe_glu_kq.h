@@ -28,6 +28,13 @@
 // Alignment: q6_k requires K % 256 == 0 (superblock); q8_0 uses the fast-path
 // mapping and requires K % 256 == 0 as well (validated host-side).
 
+// An expert id with this bit set names no expert (absent=True on the
+// host): the GLU writes zeros for its pair and the score-mixed down adds
+// nothing for its slot. The plain, dedupe, loop and slot-parallel GLU and
+// mix_ns kernels honor it, Ext and qf alike; the host keeps the grouped,
+// tile and half forms off.
+#define KQ_MOE_ABSENT_ID 0x80000000u
+
 // Activation selector (epilogue): out = act(g) * u.
 #define KQ_GLU_ACT_SILU 0
 #define KQ_GLU_ACT_GELU 1
@@ -156,6 +163,14 @@ template <typename T, int ACT>
 
   x += (int64_t)tid.z * K;
   out += ((int64_t)tid.z * R + tid.y) * N + out_row;
+  if (uint(expert) & KQ_MOE_ABSENT_ID) {
+    if (simd_lid == 0) {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        out[row] = static_cast<T>(0.0f);
+      }
+    }
+    return;
+  }
 
   for (int ib = ix; ib < nb; ib += 2) {
     const int x_base = ib * KQ_Q6_K_SUPERBLOCK + 128 * ip + l0;
@@ -558,6 +573,14 @@ template <typename T, int ACT>
 
   x += (int64_t)tid.z * K;
   out += ((int64_t)tid.z * R + tid.y) * N + out_row;
+  if (uint(expert) & KQ_MOE_ABSENT_ID) {
+    if (simd_lid == 0) {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        out[row] = static_cast<T>(0.0f);
+      }
+    }
+    return;
+  }
 
   for (int k = 0; k < K; k += block_size) {
     const int k_global = k + lane_k_offset;
@@ -1418,6 +1441,12 @@ template <
   const int R = tpg.y;
   const int expert = indices[tid.z * R + tid.y];
   const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
+  if (uint(expert) & KQ_MOE_ABSENT_ID) {
+    if (tx == 0) {
+      out[((int64_t)tid.z * R + tid.y) * N + out_row] = static_cast<T>(0.0f);
+    }
+    return;
+  }
   KQ_MOE_DO(const float2 kq_s = float2(
                 kq_moe_row_scale(out_scale, expert, N, out_row),
                 kq_moe_row_scale(up_scale, expert, N, out_row));)
@@ -1747,7 +1776,11 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG, bool C32 = false>
   KQ_EXT_STAGE_LUTS(Codec, kq_luts)
   float result = 0.0f;
   for (int slot = 0; slot < S; slot++) {
-    const int expert = int(indices[tid.z * S + slot]);
+    const uint e = indices[tid.z * S + slot];
+    if (e & KQ_MOE_ABSENT_ID) {
+      continue;
+    }
+    const int expert = int(e);
     const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
     result += KQ_MOE_MUL(
                   scores[tid.z * S + slot],
@@ -1809,15 +1842,20 @@ template <typename T, typename Codec, int NX = KQ_EXT_NXPSG, bool C32 = false>
 
   threadgroup float parts[2 * RPS][NX][KQ_MOE_SP_MAX_S];
 
-  const int expert = int(indices[tid.z * S + slot]);
+  const uint expert = indices[tid.z * S + slot];
   const device T* xs = h + ((int64_t)tid.z * S + slot) * K;
-  parts[lrow][tx][slot] = kq_ext_row_partial<T, Codec, NX, C32>(
-      w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
+  parts[lrow][tx][slot] = (expert & KQ_MOE_ABSENT_ID)
+      ? 0.0f
+      : kq_ext_row_partial<T, Codec, NX, C32>(
+            w, xs, (int64_t)expert * N + out_row, K, tx, kq_luts);
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   if (slot == 0) {
     float result = 0.0f;
     for (int s = 0; s < S; s++) {
+      if (indices[tid.z * S + s] & KQ_MOE_ABSENT_ID) {
+        continue;
+      }
       result +=
           KQ_MOE_MUL(
               scores[tid.z * S + s],
@@ -2232,11 +2270,17 @@ template <typename T, typename Codec, int ACT, int NX = KQ_EXT_NXPSG>
   const int R = tpg.y;
   const int p = int(tid.z) * R + int(tid.y);
   const uint32_t expert = indices[p];
+  const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
+  if (expert & KQ_MOE_ABSENT_ID) {
+    if (tx == 0) {
+      out[(int64_t)p * N + out_row] = static_cast<T>(0.0f);
+    }
+    return;
+  }
   const int q = kq_dd_partner(indices, p, R * int(tpg.z), expert);
   if (q == -2) {
     return;
   }
-  const int out_row = tid.x * int(tptg.y) * RPS + int(simd_gid) * RPS + ty;
   const int64_t wrow = (int64_t)expert * N + out_row;
   KQ_MOE_DO(const float2 kq_s = float2(
                 kq_moe_row_scale(out_scale, expert, N, out_row),
@@ -2433,7 +2477,11 @@ template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
   uint claimed = 0;
   float result = 0.0f;
   for (int slot = 0; slot < n_route; slot++) {
-    const int expert = int(indices[ra * n_route + slot]);
+    const uint ea = indices[ra * n_route + slot];
+    if (ea & KQ_MOE_ABSENT_ID) {
+      continue;
+    }
+    const int expert = int(ea);
     const device T* xa = h + ((int64_t)ra * S + slot) * K;
     const int64_t wrow = (int64_t)expert * N + out_row;
     int sb = -1;
@@ -2512,20 +2560,24 @@ template <typename T, typename Codec, typename SCodec, bool SHEXP, int NX>
     return;
   }
   for (int slot = 0; slot < n_route; slot++) {
-    if ((claimed >> slot) & 1u) {
+    const uint eb = indices[rb * n_route + slot];
+    if (((claimed >> slot) & 1u) || (eb & KQ_MOE_ABSENT_ID)) {
       continue;
     }
-    const int expert = int(indices[rb * n_route + slot]);
+    const int expert = int(eb);
     const device T* xb = h + ((int64_t)rb * S + slot) * K;
     pb[slot] = kq_ext_row_partial<T, Codec, NX>(
         w, xb, (int64_t)expert * N + out_row, K, tx, kq_luts);
   }
   result = 0.0f;
   for (int slot = 0; slot < n_route; slot++) {
+    const uint eb = indices[rb * n_route + slot];
+    if (eb & KQ_MOE_ABSENT_ID) {
+      continue;
+    }
     result += KQ_MOE_MUL(
                   scores[rb * SC + slot],
-                  kq_moe_row_scale(
-                      out_scale, indices[rb * n_route + slot], N, out_row)) *
+                  kq_moe_row_scale(out_scale, eb, N, out_row)) *
         pb[slot];
   }
   // the dense route leaves the shared pb unwritten

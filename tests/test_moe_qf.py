@@ -192,10 +192,13 @@ def test_qf_rows_match_at_every_width(codec, dtype):
     with experts shared across rows), and the loop, slot-parallel and
     grouped score-mixed downs give the same bits. KQ_MOE_TILE=0 keeps
     the tiled down off: from 8 rows it is the default, and its bits depend
-    on the call width (test_moe_tile.py)."""
+    on the call width (test_moe_tile.py). KQ_MOE_SP=1 runs the slot-parallel
+    mix_ns, which q4_0, q4_1 and nvfp4 skip by default at this K."""
     sx = "q5_k" if codec in ("q2_k", "q3_k", "q4_k", "iq4_xs", "q2_0") else "q8_0"
     grp = {"KQ_MOE_GROUP": "1"}
-    sp, names_sp = _rows(codec, sx, dtype, {"KQ_MOE_TILE": "0", **grp})
+    sp, names_sp = _rows(
+        codec, sx, dtype, {"KQ_MOE_TILE": "0", "KQ_MOE_SP": "1", **grp}
+    )
     loop, names_loop = _rows(codec, sx, dtype, {"KQ_MOE_MIX_FORM": "loop", **grp})
     for k in sp:
         assert np.array_equal(sp[k], loop[k]), (codec, k)
@@ -285,6 +288,190 @@ def test_qf_stands_down_on_shapes():
     names = _stand("q4_0", "q8_0", 512, 2, {})
     assert f"kq_q4_0_qf_sx_q8_0_moe_glu_gather_shexp_silu_{t}" in names, names
     assert not {n for n in names if "gather_qmv_mix" in n and "_qf_" in n}, names
+
+
+_MIX_NS_SNIPPET = r"""
+import json
+import sys
+import numpy as np
+import mlx.core as mx
+import mlx_kquant as kq
+
+codec, K = sys.argv[2], int(sys.argv[3])
+E, N, T, R = 16, 512, 4, 8
+rng = np.random.default_rng(5)
+w = mx.array((rng.standard_normal((E, N, K)) * 0.1).astype(np.float32))
+wq, _ = kq.quantize(w, codec)
+x = rng.standard_normal((T, R, K)) * 0.5
+x = mx.array(x.astype(np.float32)).astype(mx.float16)
+inds = mx.array(np.stack([rng.choice(E, R, False) for _ in range(T)]).astype(np.uint32))
+sc = mx.array(rng.uniform(0.05, 0.3, size=(T, R)).astype(np.float32))
+y = kq.gather_qmv_mix_ns_kq(x, wq, codec, inds, sc)
+mx.eval(y)
+print("RESULT " + json.dumps(np.array(y.astype(mx.float32)).ravel().tolist()))
+"""
+
+
+@pytest.mark.parametrize(
+    "codec, K, sp",
+    [
+        ("q4_0", 1152, False),
+        ("q4_1", 1152, False),
+        ("q4_0", 2048, True),
+        ("q2_0", 1152, True),
+        ("q4_k", 1280, True),
+    ],
+)
+def test_mix_ns_short_rows_take_the_loop(codec, K, sp):
+    """q4_0, q4_1 and nvfp4 run the loop mix_ns below K 2048, where it
+    beats the slot-parallel kernel. Other codecs and longer rows keep
+    slot-parallel, and KQ_MOE_SP=1 forces it. Both give the same bits."""
+    t = "float16_t"
+    stem = f"kq_{codec}_qf_gather_qmv_mix_ns_"
+    y, names = _child(_MIX_NS_SNIPPET, [codec, str(K)], {})
+    y_sp, names_sp = _child(_MIX_NS_SNIPPET, [codec, str(K)], {"KQ_MOE_SP": "1"})
+    assert (stem + ("sp_" if sp else "") + t) in names, sorted(names)
+    assert stem + "sp_" + t in names_sp, sorted(names_sp)
+    assert np.array_equal(np.array(y), np.array(y_sp)), codec
+
+
+_ABSENT_SNIPPET = r"""
+import json
+import os
+import sys
+sys.path.insert(0, sys.argv[1])
+import numpy as np
+import mlx.core as mx
+import mlx_kquant as kq
+from kqref import is_synth, synth_wire
+from mlx_kquant.codec_geometry import CODEC_GEOMETRY
+
+# "gate+up" names a split pair; the down takes the gate's codec.
+codec, _, up = sys.argv[2].partition("+")
+rng = np.random.default_rng(29)
+E, N, K, R = 8, 256, 512, 4
+
+def wire(lead, n, k, c=codec):
+    bpb, wpb = CODEC_GEOMETRY[c][2:]
+    if is_synth(c) or c == "mxfp4":
+        blocks = int(np.prod(lead, dtype=np.int64)) * n * (k // wpb)
+        w = synth_wire(rng, c, bpb, blocks, d_range=(0.004, 0.01),
+                       nvfp4_scales=(0x08, 0x19))
+        return mx.array(w.reshape(*lead, n, (k // wpb) * bpb))
+    w = mx.array((rng.standard_normal((*lead, n, k)) * 0.1).astype(np.float32))
+    wq, _ = kq.quantize(w, c)
+    mx.eval(wq)
+    return wq
+
+gw, uw, dw = wire((E,), N, K), wire((E,), N, K, up or codec), wire((E,), K, N)
+args = dict(up_kquant_type=up) if up else dict(act="situ", limit=4.0, alpha=25.0)
+bad = []
+for T, keep in ((1, 0), (4, 1), (6, 2), (8, 0), (12, 3)):
+    x = mx.array((rng.standard_normal((T, K)) * 0.1).astype(np.float16))
+    h = mx.array((rng.standard_normal((T, R, N)) * 0.1).astype(np.float16))
+    ids = np.stack([rng.choice(E, R, False) for _ in range(T)]).astype(np.uint32)
+    sc = rng.uniform(0.05, 0.9, size=(T, R)).astype(np.float32)
+    gone = np.zeros((T, R), bool)
+    gone[keep + 1:] = True
+    gone[0, 1] = True
+    marked = mx.array(np.where(gone, np.uint32(0x80000000), ids))
+    live_sc = mx.array(np.where(gone, 0, sc))
+    live = ~gone.all(axis=1)
+    for arm in ({}, {"KQ_MOE_NX": "8"}, {"KQ_MOE_MIX_FORM": "loop"},
+                {"KQ_MOE_MIX_FORM": "sp"}, {"KQ_MOE_MIX_FORM": "dd"}):
+        os.environ.update({"KQ_MOE_NX": "", "KQ_MOE_MIX_FORM": "", **arm})
+        ref_h = kq.moe_glu_gather_kq(x, gw, uw, codec, mx.array(ids), **args)
+        got_h = kq.moe_glu_gather_kq(x, gw, uw, codec, marked, **args, absent=True)
+        ref_y = kq.gather_qmv_mix_ns_kq(h, dw, codec, mx.array(ids), live_sc)
+        got_y = kq.gather_qmv_mix_ns_kq(h, dw, codec, marked, mx.array(sc), absent=True)
+        mx.eval(ref_h, got_h, ref_y, got_y)
+        rh, gh = np.array(ref_h.view(mx.uint16)), np.array(got_h.view(mx.uint16))
+        ry, gy = np.array(ref_y.view(mx.uint16)), np.array(got_y.view(mx.uint16))
+        if not (np.array_equal(gh[~gone], rh[~gone]) and not gh[gone].any()):
+            bad.append([T, arm, "glu"])
+        if not (np.array_equal(gy[live], ry[live]) and not gy[~live].any()):
+            bad.append([T, arm, "mix"])
+print("RESULT " + json.dumps(bad))
+"""
+
+
+# Every expert codec of the fused gathers.
+ALL_CODECS = (
+    "q2_k",
+    "q3_k",
+    "q4_k",
+    "q5_k",
+    "q6_k",
+    "q8_0",
+    "q4_0",
+    "q4_1",
+    "q5_0",
+    "q5_1",
+    "iq4_nl",
+    "iq4_xs",
+    "iq3_s",
+    "iq3_xxs",
+    "iq2_xxs",
+    "iq2_xs",
+    "iq2_s",
+    "iq1_s",
+    "iq1_m",
+    "stq1_0",
+    "pq2_0",
+    "q2_0",
+    "ptq1_0",
+    "mxfp4",
+    "nvfp4",
+    "iq2_xxs+stq1_0",
+    "stq1_0+iq2_xxs",
+)
+
+
+@pytest.mark.parametrize("codec", ALL_CODECS)
+def test_absent_ids_read_no_expert(codec):
+    """With absent=True an id with bit 31 set names no expert: the GLU gives
+    zeros for its pair and the mix adds nothing for its slot, and every
+    other output keeps the bits of the call without the marks, at widths 1
+    to 12 and in each mix form. The marked call skips the grouped and tile
+    forms, so the reference does too."""
+    env = {
+        "KQ_MOE_TILE": "0",
+        "KQ_MOE_GROUP": "0",
+        "KQ_MOE_NX": "",
+        "KQ_MOE_MIX_FORM": "",
+    }
+    bad, names = _child(_ABSENT_SNIPPET, [codec], env)
+    assert not bad, (codec, bad)
+    if codec not in QF_CODECS and "stq1_0" not in codec:
+        stem = codec + "_ext" if codec in ("q6_k", "q8_0") else codec
+        assert f"kq_{stem}_moe_glu_gather_dd_silu_float16_t" in names, sorted(names)
+        assert f"kq_{codec}_gather_qmv_mix_ns_dd_float16_t" in names, sorted(names)
+
+
+def test_absent_ids_take_no_biases():
+    """The biased GLU would read an absent id's bias row."""
+    import mlx.core as mx
+
+    import mlx_kquant as kq
+
+    x = mx.zeros((2, 512), mx.float16)
+    w = mx.zeros((4, 256, 512 // 32 * 17), mx.uint8)
+    b = mx.zeros((4, 256), mx.float16)
+    ids = mx.zeros((2, 2), mx.uint32)
+    with pytest.raises(ValueError, match="absent=True takes no biases"):
+        kq.moe_glu_gather_kq(
+            x,
+            w,
+            w,
+            "mxfp4",
+            ids,
+            act="swiglu_clamp",
+            limit=7.0,
+            gate_bias=b,
+            up_bias=b,
+            alpha=1.702,
+            absent=True,
+        )
 
 
 def test_moe_qf_kernels_query():

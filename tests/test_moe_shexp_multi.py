@@ -404,8 +404,9 @@ def test_slot_parallel_guard_declines_under_thread_cap(tmp_path, qf):
 @pytest.mark.parametrize("qf", ["0", "1"])
 def test_slot_parallel_at_eight_slots(tmp_path, qf):
     """Without the cap, S = 8 runs the slot-parallel downs where the
-    pipeline takes 512 threads, and the loop kernels where it does not."""
-    log = _guard_run(tmp_path, {"KQ_MOE_QF": qf}, f"nocap{qf}")
+    pipeline takes 512 threads, and the loop kernels where it does not.
+    KQ_MOE_SP=1: the q4_1 qf mix_ns takes the loop by default at this K."""
+    log = _guard_run(tmp_path, {"KQ_MOE_QF": qf, "KQ_MOE_SP": "1"}, f"nocap{qf}")
     sp_lines = [ln for ln in log.splitlines() if "_sp_" in ln]
     loop = "kq_q4_1_gather_qmv_mix_float16_t" in log
     if sp_lines:

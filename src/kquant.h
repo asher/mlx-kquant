@@ -764,6 +764,8 @@ mx::array gather_qmv_mix_bias(
 // Optional nvfp4 output scales gate_scale and up_scale, given together with
 // one shape: float32 (1,), (N,), (E, 1) or (E, N). Each multiplies its
 // projection's float32 sum before the biases and the activation.
+// absent: an index with bit 31 set names no expert, and its (row, slot)
+// output is zeros. Takes no biases.
 mx::array moe_glu_gather_kq(
     mx::array x,
     mx::array gate_w,
@@ -778,6 +780,7 @@ mx::array moe_glu_gather_kq(
     const std::optional<mx::array>& gate_scale = std::nullopt,
     const std::optional<mx::array>& up_scale = std::nullopt,
     const std::string& up_kquant_type = "",
+    bool absent = false,
     mx::StreamOrDevice s = {});
 
 // True when the codec has the fused MoE GLU/gather kernel family above.
@@ -1123,7 +1126,8 @@ mx::array gather_qmv_mix_kq(
 // Optional per-expert LoRA epilogue as in gather_qmv_kq, score-mixed into
 // the [T, N] output (lora_ids/lora_rows shaped [T, S]).
 // Optional nvfp4 out_scale as in gather_qmv_kq; the LoRA delta is not
-// scaled.
+// scaled. absent: an index with bit 31 set names no expert, and its slot
+// adds nothing. Takes no LoRA.
 mx::array gather_qmv_mix_ns_kq(
     mx::array x,
     mx::array w,
@@ -1136,6 +1140,7 @@ mx::array gather_qmv_mix_ns_kq(
     const std::optional<mx::array>& lora_table = std::nullopt,
     const std::optional<mx::array>& lora_rows = std::nullopt,
     const std::optional<mx::array>& out_scale = std::nullopt,
+    bool absent = false,
     mx::StreamOrDevice s = {});
 
 // Router top-k in one dispatch: score E logit columns in f32 ("softmax" or
@@ -3324,14 +3329,16 @@ class KQuantMoEGLUKQ : public mx::Primitive {
       float limit = 0.0f,
       float alpha = 0.0f,
       int out_scale_bits = 0,
-      std::string up_type = "")
+      std::string up_type = "",
+      bool absent = false)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         act_(std::move(act)),
         limit_(limit),
         alpha_(alpha),
         out_scale_bits_(out_scale_bits),
-        up_type_(up_type.empty() ? kquant_type_ : std::move(up_type)) {}
+        up_type_(up_type.empty() ? kquant_type_ : std::move(up_type)),
+        absent_(absent) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -3355,6 +3362,7 @@ class KQuantMoEGLUKQ : public mx::Primitive {
   float alpha_;
   int out_scale_bits_; // kq_out_scale.h; the scales are the last inputs
   std::string up_type_; // the up stack's codec (kquant_type_ when one)
+  bool absent_; // ids may name no expert (KQ_MOE_ABSENT_ID)
 };
 
 // K-quant gathered matvec (see gather_qmv_kq). Inference-only.
@@ -3484,11 +3492,13 @@ class KQuantGatherQMVMixNSKQ : public mx::Primitive {
       mx::Stream stream,
       std::string kquant_type,
       int lora_flags = 0,
-      int out_scale_bits = 0)
+      int out_scale_bits = 0,
+      bool absent = false)
       : mx::Primitive(stream),
         kquant_type_(std::move(kquant_type)),
         lora_flags_(lora_flags),
-        out_scale_bits_(out_scale_bits) {}
+        out_scale_bits_(out_scale_bits),
+        absent_(absent) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -3509,6 +3519,7 @@ class KQuantGatherQMVMixNSKQ : public mx::Primitive {
   std::string kquant_type_;
   int lora_flags_;
   int out_scale_bits_;
+  bool absent_; // ids may name no expert (KQ_MOE_ABSENT_ID)
 };
 
 // Router scoring + top-k + score epilogue (see moe_router_topk). Two

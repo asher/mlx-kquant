@@ -426,10 +426,12 @@ ARMS = {
             "_qf_moe_glu_gather_dd_silu",
             "_qf_gather_qmv_float16_t",
             "_qf_gather_qmv_bias_",
-            "_qf_gather_qmv_mix_ns_sp_",
+            # nvfp4 downs under 2048 columns take the loop form
+            "_qf_gather_qmv_mix_ns_bfloat16_t",
             "_qf_sx_nvfp4_moe_glu_gather_shexp_silu",
         ),
     ),
+    "qf4_sp": (4, {"KQ_MOE_QF": "1", "KQ_MOE_SP": "1"}, ("_qf_gather_qmv_mix_ns_sp_",)),
     "grp5": (
         5,
         {"KQ_MOE_GROUP": "1"},

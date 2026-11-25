@@ -46,8 +46,14 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in that llama.cpp tree).
 - The fused MoE GLU gathers take `up_kquant_type` for an up stack in another codec than the gate
   stack (Hy4 iq2_xxs gate with stq1_0 up); `moe_glu_pair_has_kernel` lists the pairs.
+- `moe_glu_gather_kq` and `gather_qmv_mix_ns_kq` take `absent=True`: an expert id with bit 31 set
+  reads no expert, so a verify can skip the rows it will not keep.
 
 ### Changed
+- A `direct=True` record that holds `moe_glu_gather_kq`, `gather_qmv_mix_ns_kq` or `stop_gradient`
+  now replays its Metal calls instead of running its primitives one by one.
+- `gather_qmv_mix_ns_kq` on `q4_0`, `q4_1` and `nvfp4` experts with rows under 2048 wide runs faster
+  at 1 to 4 rows, with the same bits.
 - `stq1_0` fused MoE gathers and one-row `quantized_matmul` run 1.9x to 3.7x faster, split pairs
   with `iq2_xxs` 1.3x to 2.4x (Hy4, M5 Max); they and `hc_lowrank_mix` on `stq1_0` change low bits.
 - On M5 and later GPUs the fused MoE gathers at 5 to 16 rows read each expert once for up to eight
