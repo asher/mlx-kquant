@@ -12,6 +12,5 @@
 
 instantiate_kq_moe_grp_common()
 instantiate_kq_ext_all(nvfp4, KqNvfp4Ext)
-instantiate_kq_ext_bias(nvfp4, KqNvfp4Ext, bfloat16_t)
-instantiate_kq_ext_bias(nvfp4, KqNvfp4Ext, float16_t)
+instantiate_kq_ext_bias(nvfp4, KqNvfp4Ext, kq_x16)
     // clang-format on

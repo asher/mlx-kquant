@@ -28,6 +28,8 @@
 // Alignment: q6_k requires K % 256 == 0 (superblock); q8_0 uses the fast-path
 // mapping and requires K % 256 == 0 as well (validated host-side).
 
+#include "mlx/backend/metal/kernels/kq_x16.h"
+
 // An expert id with this bit set names no expert (absent=True on the
 // host): the GLU writes zeros for its pair and the score-mixed down adds
 // nothing for its slot. The plain, dedupe, loop and slot-parallel GLU and
@@ -40,6 +42,23 @@
 #define KQ_GLU_ACT_GELU 1
 #define KQ_GLU_ACT_SILU_LIMIT 2
 #define KQ_GLU_ACT_SWIGLU_CLAMP 3
+// A kernel compiled once for silu, gelu and silu_limit takes KQ_GLU_ACT_FC,
+// and function constant 391 (kq_glu_act) picks the activation when the
+// pipeline is built. The host names such a kernel "act" in place of the
+// activation (kq_get_kernel).
+#define KQ_GLU_ACT_FC 4
+constant int kq_glu_act [[function_constant(391)]];
+
+// Only the KQ_GLU_ACT_FC kernels read the constant.
+template <int ACT>
+inline int kq_glu_act_of() {
+  return ACT;
+}
+
+template <>
+inline int kq_glu_act_of<KQ_GLU_ACT_FC>() {
+  return kq_glu_act;
+}
 
 // The clamps of the limited activations, as mx.minimum and mx.clip give
 // them: a NaN passes. min() and clamp() return a bound for a NaN, which
@@ -79,13 +98,14 @@ inline float kq_glu_clip(float u, float limit) {
 template <int ACT>
 inline float
 kq_glu_epilogue(float g, float u, float limit, float alpha = 1.0f) {
-  if (ACT == KQ_GLU_ACT_GELU) {
+  const int act = kq_glu_act_of<ACT>();
+  if (act == KQ_GLU_ACT_GELU) {
     // tanh-approx gelu (matches mlx nn.gelu_approx / gemma usage)
     const float g3 = 0.044715f * g * g * g;
     const float t = metal::precise::tanh(0.7978845608028654f * (g + g3));
     return (0.5f * g * (1.0f + t)) * u;
   }
-  if (ACT == KQ_GLU_ACT_SILU && kq_situ) {
+  if (act == KQ_GLU_ACT_SILU && kq_situ) {
     // situ (Kimi K3, Inkling 2): beta * tanh(g / beta) * sigmoid(g) on the
     // gate, linear_beta * tanh(u / linear_beta) on the up branch (a
     // linear_beta of 0 leaves it as is). beta is the limit, linear_beta
@@ -97,8 +117,8 @@ kq_glu_epilogue(float g, float u, float limit, float alpha = 1.0f) {
     }
     return a * u;
   }
-  if (ACT == KQ_GLU_ACT_SWIGLU_CLAMP ||
-      (ACT == KQ_GLU_ACT_SILU && kq_swiglu_oai)) {
+  if (act == KQ_GLU_ACT_SWIGLU_CLAMP ||
+      (act == KQ_GLU_ACT_SILU && kq_swiglu_oai)) {
     // gpt-oss clamped SwiGLU: gate clamped from above only, up clamped both
     // sides, sigmoid slope alpha, and a (u + 1) linear term -- matches the
     // packed kq_moe_glu_gather epilogue (kq_moe_glu.h).
@@ -107,8 +127,8 @@ kq_glu_epilogue(float g, float u, float limit, float alpha = 1.0f) {
     const float sig = 1.0f / (1.0f + metal::exp(-alpha * g));
     return (g * sig) * (u + 1.0f);
   }
-  if (ACT == KQ_GLU_ACT_SILU_LIMIT ||
-      (ACT == KQ_GLU_ACT_SILU && limit > 0.0f)) {
+  if (act == KQ_GLU_ACT_SILU_LIMIT ||
+      (act == KQ_GLU_ACT_SILU && limit > 0.0f)) {
     // deepseek-v4 LimitedSwiGLU: gate clamped from above only, up clamped
     // both sides, then plain silu(g) * u (alpha 1, no +1 -- NOT gpt-oss).
     // The silu instantiations take the same clamp from a positive run-time
@@ -963,15 +983,11 @@ METAL_FUNC float kq_ext_dot32(
     float2 sc,
     const device T* xp) {
   return sc.x *
-      (dot(l0[0], float4(*(const device vec<T, 4>*)(xp + 0))) +
-       dot(l0[1], float4(*(const device vec<T, 4>*)(xp + 4))) +
-       dot(l0[2], float4(*(const device vec<T, 4>*)(xp + 8))) +
-       dot(l0[3], float4(*(const device vec<T, 4>*)(xp + 12)))) +
+      (dot(l0[0], kq_ld4(xp + 0)) + dot(l0[1], kq_ld4(xp + 4)) +
+       dot(l0[2], kq_ld4(xp + 8)) + dot(l0[3], kq_ld4(xp + 12))) +
       sc.y *
-      (dot(l1[0], float4(*(const device vec<T, 4>*)(xp + 16))) +
-       dot(l1[1], float4(*(const device vec<T, 4>*)(xp + 20))) +
-       dot(l1[2], float4(*(const device vec<T, 4>*)(xp + 24))) +
-       dot(l1[3], float4(*(const device vec<T, 4>*)(xp + 28))));
+      (dot(l1[0], kq_ld4(xp + 16)) + dot(l1[1], kq_ld4(xp + 20)) +
+       dot(l1[2], kq_ld4(xp + 24)) + dot(l1[3], kq_ld4(xp + 28)));
 }
 
 // The 64-weight loops: a codec with KqExtC64 steps whole 64-weight spans.
@@ -983,7 +999,7 @@ template <typename T>
 METAL_FUNC void kq_ext_x64(const device T* xp, thread float4* a) {
 #pragma unroll
   for (short i = 0; i < 16; ++i) {
-    a[i] = float4(*(const device vec<T, 4>*)(xp + 4 * i));
+    a[i] = kq_ld4(xp + 4 * i);
   }
 }
 
@@ -1088,10 +1104,10 @@ METAL_FUNC float4 kq_ext_dot64_rows(
         const device T* xp = xs[r] + 4 * k;
         s[r] = kq_ext_fma_quarter(
             v,
-            float4(*(const device vec<T, 4>*)(xp)),
-            float4(*(const device vec<T, 4>*)(xp + 16)),
-            float4(*(const device vec<T, 4>*)(xp + 32)),
-            float4(*(const device vec<T, 4>*)(xp + 48)),
+            kq_ld4(xp),
+            kq_ld4(xp + 16),
+            kq_ld4(xp + 32),
+            kq_ld4(xp + 48),
             s[r]);
       }
     }
@@ -1118,10 +1134,8 @@ METAL_FUNC float4 kq_ext_dot64_rows(
     for (short r = 0; r < NR; ++r) {
       const device T* xp = xs[r] + 16 * q;
       out[r] += sc *
-          (dot(lw[0], float4(*(const device vec<T, 4>*)(xp + 0))) +
-           dot(lw[1], float4(*(const device vec<T, 4>*)(xp + 4))) +
-           dot(lw[2], float4(*(const device vec<T, 4>*)(xp + 8))) +
-           dot(lw[3], float4(*(const device vec<T, 4>*)(xp + 12))));
+          (dot(lw[0], kq_ld4(xp + 0)) + dot(lw[1], kq_ld4(xp + 4)) +
+           dot(lw[2], kq_ld4(xp + 8)) + dot(lw[3], kq_ld4(xp + 12)));
     }
   }
   return out;
@@ -1169,10 +1183,8 @@ METAL_FUNC float kq_ext_span_partial(
     KqTgLuts<Codec>::deq_chunk16s(block, short(ich % chpb), lw, luts, sc);
     const device T* xp = x + ich * 16;
     acc += sc *
-        (dot(lw[0], float4(*(const device vec<T, 4>*)(xp + 0))) +
-         dot(lw[1], float4(*(const device vec<T, 4>*)(xp + 4))) +
-         dot(lw[2], float4(*(const device vec<T, 4>*)(xp + 8))) +
-         dot(lw[3], float4(*(const device vec<T, 4>*)(xp + 12))));
+        (dot(lw[0], kq_ld4(xp + 0)) + dot(lw[1], kq_ld4(xp + 4)) +
+         dot(lw[2], kq_ld4(xp + 8)) + dot(lw[3], kq_ld4(xp + 12)));
   }
   return acc;
 }
@@ -1251,7 +1263,7 @@ METAL_FUNC float2 kq_ext_glu_row_partial(
       float4 a[8];
 #pragma unroll
       for (int i = 0; i < 8; ++i) {
-        a[i] = float4(*(const device vec<T, 4>*)(xp + 4 * i));
+        a[i] = kq_ld4(xp + 4 * i);
       }
       float4x4 l0, l1;
       float2 sc = kq_ext_deq32<G>(g_row, ig, l0, l1, luts);
@@ -1273,10 +1285,10 @@ METAL_FUNC float2 kq_ext_glu_row_partial(
   }
   for (int ich = tx; 16 * ich < K; ich += NX) {
     const device T* xp = x + ich * 16;
-    const float4 a0 = float4(*(const device vec<T, 4>*)(xp + 0));
-    const float4 a1 = float4(*(const device vec<T, 4>*)(xp + 4));
-    const float4 a2 = float4(*(const device vec<T, 4>*)(xp + 8));
-    const float4 a3 = float4(*(const device vec<T, 4>*)(xp + 12));
+    const float4 a0 = kq_ld4(xp + 0);
+    const float4 a1 = kq_ld4(xp + 4);
+    const float4 a2 = kq_ld4(xp + 8);
+    const float4 a3 = kq_ld4(xp + 12);
     float4x4 lw;
     float sc;
     KqTgLuts<G>::deq_chunk16s(
@@ -1408,10 +1420,8 @@ template <typename T, int ACT>
 
 // clang-format off
 #define instantiate_kq_moe_shexp_glu_pre(type)                         \
-  instantiate_kernel("kq_moe_shexp_glu_pre_silu_" #type,               \
-      kq_moe_shexp_glu_pre, type, KQ_GLU_ACT_SILU)                     \
-  instantiate_kernel("kq_moe_shexp_glu_pre_gelu_" #type,               \
-      kq_moe_shexp_glu_pre, type, KQ_GLU_ACT_GELU)
+  instantiate_kernel("kq_moe_shexp_glu_pre_act_" #type,               \
+      kq_moe_shexp_glu_pre, type, KQ_GLU_ACT_FC)
 // clang-format on
 
 template <
@@ -2125,16 +2135,12 @@ METAL_FUNC float2 kq_ext_span_partial_pair(
     KqTgLuts<Codec>::deq_chunk16s(block, short(ich % chpb), lw, luts, sc);
     const device T* xp = x0 + ich * 16;
     acc.x += sc *
-        (dot(lw[0], float4(*(const device vec<T, 4>*)(xp + 0))) +
-         dot(lw[1], float4(*(const device vec<T, 4>*)(xp + 4))) +
-         dot(lw[2], float4(*(const device vec<T, 4>*)(xp + 8))) +
-         dot(lw[3], float4(*(const device vec<T, 4>*)(xp + 12))));
+        (dot(lw[0], kq_ld4(xp + 0)) + dot(lw[1], kq_ld4(xp + 4)) +
+         dot(lw[2], kq_ld4(xp + 8)) + dot(lw[3], kq_ld4(xp + 12)));
     xp = x1 + ich * 16;
     acc.y += sc *
-        (dot(lw[0], float4(*(const device vec<T, 4>*)(xp + 0))) +
-         dot(lw[1], float4(*(const device vec<T, 4>*)(xp + 4))) +
-         dot(lw[2], float4(*(const device vec<T, 4>*)(xp + 8))) +
-         dot(lw[3], float4(*(const device vec<T, 4>*)(xp + 12))));
+        (dot(lw[0], kq_ld4(xp + 0)) + dot(lw[1], kq_ld4(xp + 4)) +
+         dot(lw[2], kq_ld4(xp + 8)) + dot(lw[3], kq_ld4(xp + 12)));
   }
   return acc;
 }
@@ -2211,10 +2217,10 @@ METAL_FUNC float4 kq_ext_glu_row_partial_pair(
   }
   for (int ich = tx; 16 * ich < K; ich += NX) {
     const device T* xp = x0 + ich * 16;
-    const float4 a0 = float4(*(const device vec<T, 4>*)(xp + 0));
-    const float4 a1 = float4(*(const device vec<T, 4>*)(xp + 4));
-    const float4 a2 = float4(*(const device vec<T, 4>*)(xp + 8));
-    const float4 a3 = float4(*(const device vec<T, 4>*)(xp + 12));
+    const float4 a0 = kq_ld4(xp + 0);
+    const float4 a1 = kq_ld4(xp + 4);
+    const float4 a2 = kq_ld4(xp + 8);
+    const float4 a3 = kq_ld4(xp + 12);
     const device T* yp = x1 + ich * 16;
     float4x4 lw;
     float sc;
@@ -2227,10 +2233,8 @@ METAL_FUNC float4 kq_ext_glu_row_partial_pair(
     acc.x += sc *
         (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
     acc.z += sc *
-        (dot(lw[0], float4(*(const device vec<T, 4>*)(yp + 0))) +
-         dot(lw[1], float4(*(const device vec<T, 4>*)(yp + 4))) +
-         dot(lw[2], float4(*(const device vec<T, 4>*)(yp + 8))) +
-         dot(lw[3], float4(*(const device vec<T, 4>*)(yp + 12))));
+        (dot(lw[0], kq_ld4(yp + 0)) + dot(lw[1], kq_ld4(yp + 4)) +
+         dot(lw[2], kq_ld4(yp + 8)) + dot(lw[3], kq_ld4(yp + 12)));
     KqTgLuts<U>::deq_chunk16s(
         u_row + (int64_t)(ich / uch) * U::block_bytes,
         short(ich % uch),
@@ -2240,10 +2244,8 @@ METAL_FUNC float4 kq_ext_glu_row_partial_pair(
     acc.y += sc *
         (dot(lw[0], a0) + dot(lw[1], a1) + dot(lw[2], a2) + dot(lw[3], a3));
     acc.w += sc *
-        (dot(lw[0], float4(*(const device vec<T, 4>*)(yp + 0))) +
-         dot(lw[1], float4(*(const device vec<T, 4>*)(yp + 4))) +
-         dot(lw[2], float4(*(const device vec<T, 4>*)(yp + 8))) +
-         dot(lw[3], float4(*(const device vec<T, 4>*)(yp + 12))));
+        (dot(lw[0], kq_ld4(yp + 0)) + dot(lw[1], kq_ld4(yp + 4)) +
+         dot(lw[2], kq_ld4(yp + 8)) + dot(lw[3], kq_ld4(yp + 12)));
   }
   return acc;
 }
@@ -2652,11 +2654,9 @@ METAL_FUNC int kq_grp_run(
   return n;
 }
 
-#define KQ_GRP_DOT16(lw, xp)                                \
-  (dot(lw[0], float4(*(const device vec<T, 4>*)(xp + 0))) + \
-   dot(lw[1], float4(*(const device vec<T, 4>*)(xp + 4))) + \
-   dot(lw[2], float4(*(const device vec<T, 4>*)(xp + 8))) + \
-   dot(lw[3], float4(*(const device vec<T, 4>*)(xp + 12))))
+#define KQ_GRP_DOT16(lw, xp)                                 \
+  (dot(lw[0], kq_ld4(xp + 0)) + dot(lw[1], kq_ld4(xp + 4)) + \
+   dot(lw[2], kq_ld4(xp + 8)) + dot(lw[3], kq_ld4(xp + 12)))
 
 // kq_ext_row_partial for four activation rows, one sum per component.
 template <typename T, typename Codec, int NX>
@@ -3199,11 +3199,8 @@ template <typename T>
 // clang-format off
 #define instantiate_kq_ext_grp_nx(stem, traits, straits, type, nx, sfx)       \
   instantiate_kernel(                                                         \
-      "kq_" stem "_moe_glu_gather_shexp_grp_silu" sfx "_" #type,              \
-      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp_grp), type, traits, straits, KQ_GLU_ACT_SILU, nx) \
-  instantiate_kernel(                                                         \
-      "kq_" stem "_moe_glu_gather_shexp_grp_gelu" sfx "_" #type,              \
-      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp_grp), type, traits, straits, KQ_GLU_ACT_GELU, nx) \
+      "kq_" stem "_moe_glu_gather_shexp_grp_act" sfx "_" #type,              \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp_grp), type, traits, straits, KQ_GLU_ACT_FC, nx) \
   instantiate_kq_ext_grp_mix_nx(stem, traits, straits, type, nx, sfx)
 
 #define instantiate_kq_ext_grp_mix_nx(stem, traits, straits, type, nx, sfx)   \
@@ -3219,12 +3216,10 @@ template <typename T>
 
 #if KQ_MOE_OS
 #define instantiate_kq_moe_grp_common()                                       \
-  instantiate_kernel("kq_moe_mix_grp_sum_os_bfloat16_t", KQ_MOE_KERNEL(kq_moe_mix_grp_sum), bfloat16_t) \
-  instantiate_kernel("kq_moe_mix_grp_sum_os_float16_t", KQ_MOE_KERNEL(kq_moe_mix_grp_sum), float16_t)
+  instantiate_kernel("kq_moe_mix_grp_sum_os_kq_x16", KQ_MOE_KERNEL(kq_moe_mix_grp_sum), kq_x16)
 #else
 #define instantiate_kq_moe_grp_common()                                       \
-  instantiate_kernel("kq_moe_mix_grp_sum_bfloat16_t", KQ_MOE_KERNEL(kq_moe_mix_grp_sum), bfloat16_t) \
-  instantiate_kernel("kq_moe_mix_grp_sum_float16_t", KQ_MOE_KERNEL(kq_moe_mix_grp_sum), float16_t)
+  instantiate_kernel("kq_moe_mix_grp_sum_kq_x16", KQ_MOE_KERNEL(kq_moe_mix_grp_sum), kq_x16)
 #endif
 // clang-format on
 
@@ -3484,9 +3479,8 @@ METAL_FUNC void kq_ext_stage_xh(
     int K,
     ushort lin,
     ushort n_threads) {
-  const device vec<T, 4>* x4 = reinterpret_cast<const device vec<T, 4>*>(x);
   for (int i = lin; i < K / 4; i += n_threads) {
-    xs[i] = half4(x4[i]);
+    xs[i] = half4(kq_ld4(x + 4 * i));
   }
 }
 
@@ -3772,44 +3766,26 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
 // threadgroup for threadgroup count so decode-scale launches fill the GPU.
 #define instantiate_kq_ext_uniform_nx(codec, traits, type, nx, sfx)           \
   instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_silu" sfx "_" #type,                      \
-      KQ_MOE_KERNEL(kq_ext_moe_glu_gather), type, traits, KQ_GLU_ACT_SILU, nx) \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_gelu" sfx "_" #type,                      \
-      KQ_MOE_KERNEL(kq_ext_moe_glu_gather), type, traits, KQ_GLU_ACT_GELU, nx) \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_silu_limit" sfx "_" #type,                \
-      KQ_MOE_KERNEL(kq_ext_moe_glu_gather), type, traits, KQ_GLU_ACT_SILU_LIMIT, nx) \
+      "kq_" #codec "_moe_glu_gather_act" sfx "_" #type,                      \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather), type, traits, KQ_GLU_ACT_FC, nx) \
   instantiate_kernel(                                                         \
       "kq_" #codec "_gather_qmv" sfx "_" #type,                               \
       KQ_MOE_KERNEL(kq_ext_gather_qmv), type, traits, nx)                     \
   instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_shexp_silu" sfx "_" #type,                \
-      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp), type, traits, traits, KQ_GLU_ACT_SILU, nx) \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_shexp_gelu" sfx "_" #type,                \
-      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp), type, traits, traits, KQ_GLU_ACT_GELU, nx) \
+      "kq_" #codec "_moe_glu_gather_shexp_act" sfx "_" #type,                \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp), type, traits, traits, KQ_GLU_ACT_FC, nx) \
   instantiate_kernel(                                                         \
       "kq_" #codec "_gather_qmv_mix" sfx "_" #type,                           \
       KQ_MOE_KERNEL(kq_ext_gather_qmv_mix), type, traits, traits, nx)         \
   instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_dd_silu" sfx "_" #type,                   \
-      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_dd), type, traits, KQ_GLU_ACT_SILU, nx) \
+      "kq_" #codec "_moe_glu_gather_dd_act" sfx "_" #type,                   \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_dd), type, traits, KQ_GLU_ACT_FC, nx) \
   instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_dd_gelu" sfx "_" #type,                   \
-      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_dd), type, traits, KQ_GLU_ACT_GELU, nx) \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_dd_silu_limit" sfx "_" #type,             \
-      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_dd), type, traits, KQ_GLU_ACT_SILU_LIMIT, nx) \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_shexp_dd_silu" sfx "_" #type,             \
-      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp_dd), type, traits, traits, KQ_GLU_ACT_SILU, nx) \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_moe_glu_gather_shexp_dd_gelu" sfx "_" #type,             \
-      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp_dd), type, traits, traits, KQ_GLU_ACT_GELU, nx) \
+      "kq_" #codec "_moe_glu_gather_shexp_dd_act" sfx "_" #type,             \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp_dd), type, traits, traits, KQ_GLU_ACT_FC, nx) \
   instantiate_kernel(                                                         \
       "kq_" #codec "_gather_qmv_mix_dd" sfx "_" #type,                        \
-      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_pair), type, traits, traits, true, nx) \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_pair), type, traits, traits, true, nx)
 
 // Slot-parallel shared-expert mix, NX = 8 only as for mix_ns.
 #define instantiate_kq_ext_mix_sp(stem, traits, straits, type)                \
@@ -3828,23 +3804,17 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
 // stacks (UD-style upcast shexp). Dispatch key "kq_<codec>_sx_<scodec>_...".
 #define instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, nx, sfx) \
   instantiate_kernel(                                                         \
-      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_silu" sfx "_" #type, \
-      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp), type, traits, straits, KQ_GLU_ACT_SILU, nx) \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_gelu" sfx "_" #type, \
-      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp), type, traits, straits, KQ_GLU_ACT_GELU, nx) \
+      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_act" sfx "_" #type, \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp), type, traits, straits, KQ_GLU_ACT_FC, nx) \
   instantiate_kernel(                                                         \
       "kq_" #codec "_sx_" #scodec "_gather_qmv_mix" sfx "_" #type,            \
       KQ_MOE_KERNEL(kq_ext_gather_qmv_mix), type, traits, straits, nx)        \
   instantiate_kernel(                                                         \
-      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_dd_silu" sfx "_" #type, \
-      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp_dd), type, traits, straits, KQ_GLU_ACT_SILU, nx) \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_dd_gelu" sfx "_" #type, \
-      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp_dd), type, traits, straits, KQ_GLU_ACT_GELU, nx) \
+      "kq_" #codec "_sx_" #scodec "_moe_glu_gather_shexp_dd_act" sfx "_" #type, \
+      KQ_MOE_KERNEL(kq_ext_moe_glu_gather_shexp_dd), type, traits, straits, KQ_GLU_ACT_FC, nx) \
   instantiate_kernel(                                                         \
       "kq_" #codec "_sx_" #scodec "_gather_qmv_mix_dd" sfx "_" #type,         \
-      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_pair), type, traits, straits, true, nx) \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_pair), type, traits, straits, true, nx)
 
 #define instantiate_kq_ext_sx(codec, traits, scodec, straits, type)           \
   instantiate_kq_ext_sx_nx(codec, traits, scodec, straits, type, 8, "")       \
@@ -3857,18 +3827,11 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
 // q6_k/q8_0 included).
 #define instantiate_kq_ext_mix_ns_nx(codec, traits, nx, sfx)                  \
   instantiate_kernel(                                                         \
-      "kq_" #codec "_gather_qmv_mix_ns" sfx "_bfloat16_t",                    \
-      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_ns), bfloat16_t, traits, nx)        \
+      "kq_" #codec "_gather_qmv_mix_ns" sfx "_kq_x16",                        \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_ns), kq_x16, traits, nx)            \
   instantiate_kernel(                                                         \
-      "kq_" #codec "_gather_qmv_mix_ns" sfx "_float16_t",                     \
-      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_ns), float16_t, traits, nx)         \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_gather_qmv_mix_ns_dd" sfx "_bfloat16_t",                 \
-      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_pair), bfloat16_t, traits, traits, false, nx) \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_gather_qmv_mix_ns_dd" sfx "_float16_t",                  \
-      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_pair), float16_t, traits, traits, false, nx)
-
+      "kq_" #codec "_gather_qmv_mix_ns_dd" sfx "_kq_x16",                     \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_pair), kq_x16, traits, traits, false, nx)
 
 // The slot-parallel variant is NX = 8 only (wide K-lanes measured
 // flat-to-negative; sp multiplies threads without shortening K-chains).
@@ -3877,11 +3840,8 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
   instantiate_kq_ext_mix_ns_nx(codec, traits, 16, "_nx16")                    \
   instantiate_kq_ext_mix_ns_nx(codec, traits, 32, "_nx32")                    \
   instantiate_kernel(                                                         \
-      "kq_" #codec "_gather_qmv_mix_ns_sp_bfloat16_t",                        \
-      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_ns_sp), bfloat16_t, traits, 8)      \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_gather_qmv_mix_ns_sp_float16_t",                         \
-      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_ns_sp), float16_t, traits, 8)
+      "kq_" #codec "_gather_qmv_mix_ns_sp_kq_x16",                            \
+      KQ_MOE_KERNEL(kq_ext_gather_qmv_mix_ns_sp), kq_x16, traits, 8)
 
 // Biased experts (gpt-oss): per-(expert, out_dim) f32 biases fused into the
 // GLU epilogue / qmv store. Only the clamped-SwiGLU epilogue is emitted --
@@ -3908,13 +3868,9 @@ template <typename T, typename Codec, typename SCodec, int NX = KQ_EXT_NXPSG>
   instantiate_kq_ext_grp(#codec "_sx_q5_k", traits, KqQ5_KExt, type)
 
 #define instantiate_kq_ext_all(codec, traits)                                 \
-  instantiate_kq_ext_uniform(codec, traits, bfloat16_t)                       \
-  instantiate_kq_ext_uniform(codec, traits, float16_t)                        \
+  instantiate_kq_ext_uniform(codec, traits, kq_x16)                       \
   instantiate_kq_ext_mix_ns(codec, traits)                                    \
-  instantiate_kq_ext_sx(codec, traits, q6_k, KqQ6_KExt, bfloat16_t)           \
-  instantiate_kq_ext_sx(codec, traits, q6_k, KqQ6_KExt, float16_t)            \
-  instantiate_kq_ext_sx(codec, traits, q8_0, KqQ8_0Ext, bfloat16_t)           \
-  instantiate_kq_ext_sx(codec, traits, q8_0, KqQ8_0Ext, float16_t)            \
-  instantiate_kq_ext_sx_q5k(codec, traits, bfloat16_t)                        \
-  instantiate_kq_ext_sx_q5k(codec, traits, float16_t)
+  instantiate_kq_ext_sx(codec, traits, q6_k, KqQ6_KExt, kq_x16)           \
+  instantiate_kq_ext_sx(codec, traits, q8_0, KqQ8_0Ext, kq_x16)           \
+  instantiate_kq_ext_sx_q5k(codec, traits, kq_x16)
 // clang-format on

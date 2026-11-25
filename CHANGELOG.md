@@ -6,7 +6,7 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.5.14]
+## [0.5.15]
 
 ### Added
 - `fuse_graph` records a lazy graph once and `fused_call` runs it as one primitive on new inputs of
@@ -83,6 +83,14 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `KQ_NAX_BM128_MIN_TPC=0` restores the old choice.
 - `q6_k` `quantized_matmul` at prefill rows on M5 and later GPUs runs up to 5% faster, with the same
   outputs.
+
+### Fixed
+- The macOS wheels fit under PyPI's file size limit again. The fused MoE gather kernels are built once
+  for float16 and bfloat16 activations and once for every GLU activation, with the same outputs.
+
+## [0.5.14]
+
+Not published to PyPI. Its changes ship in 0.5.15.
 
 ## [0.5.13]
 

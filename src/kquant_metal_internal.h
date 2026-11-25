@@ -448,15 +448,77 @@ void kq_log_dispatch(
     const MTL::Size& grid,
     const MTL::Size& group);
 
-// True when the bundled metallib carries a function named kname. Looks the
-// name up without building a pipeline, so a tile override can raise with
-// the kernel name before any dispatch.
+// Function constants 390 (kq_x16.h) and 391 (kq_moe_glu_kq.h). A kernel
+// compiled once for float16 and bfloat16 activations has "kq_x16" in place
+// of the type at the end of its name, and kq_x_bf16 picks the type. A GLU
+// kernel compiled once for silu, gelu and silu_limit has "act" in place of
+// the activation, and kq_glu_act picks it (0, 1 and 2). Callers name the
+// typed kernel; kq_find_function maps the name to the library function and
+// the constant values.
+constexpr int kq_fc_x_bf16 = 390;
+constexpr int kq_fc_glu_act = 391;
+
+struct KqFoundFunction {
+  NS::SharedPtr<MTL::Function> fn;
+  std::string name;
+  int x_bf16 = -1; // -1: the function does not take the constant
+  int glu_act = -1;
+};
+
+inline KqFoundFunction kq_find_function(
+    MTL::Library* lib,
+    const std::string& kname) {
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  KqFoundFunction f;
+  auto get = [&](const std::string& n) {
+    f.fn = NS::TransferPtr(lib->newFunction(
+        NS::String::string(n.c_str(), NS::UTF8StringEncoding)));
+    if (f.fn) {
+      f.name = n;
+    }
+    return f.fn.get() != nullptr;
+  };
+  if (get(kname)) {
+    return f;
+  }
+  auto ends = [&](const std::string& s) {
+    return kname.size() > s.size() &&
+        kname.compare(kname.size() - s.size(), s.size(), s) == 0;
+  };
+  std::string n;
+  if (ends("_bfloat16_t")) {
+    n = kname.substr(0, kname.size() - 11) + "_kq_x16";
+    f.x_bf16 = 1;
+  } else if (ends("_float16_t")) {
+    n = kname.substr(0, kname.size() - 10) + "_kq_x16";
+    f.x_bf16 = 0;
+  } else {
+    return {};
+  }
+  if (get(n)) {
+    return f;
+  }
+  static const std::pair<std::string, int> acts[] = {
+      {"_silu_limit_", 2}, {"_gelu_", 1}, {"_silu_", 0}};
+  for (const auto& [tok, v] : acts) {
+    const size_t p = n.find(tok);
+    if (p != std::string::npos) {
+      f.glu_act = v;
+      if (get(n.substr(0, p) + "_act_" + n.substr(p + tok.size()))) {
+        return f;
+      }
+      break;
+    }
+  }
+  return {};
+}
+
+// True when the bundled metallib carries the kernel kname. Looks the name
+// up without building a pipeline, so a tile override can raise with the
+// kernel name before any dispatch.
 inline bool kq_has_kernel(Device& d, const std::string& kname) {
   static MTL::Library* lib = d.get_library("mlx_kquant", metallib_dir());
-  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
-  auto fn = NS::TransferPtr(lib->newFunction(
-      NS::String::string(kname.c_str(), NS::UTF8StringEncoding)));
-  return fn.get() != nullptr;
+  return kq_find_function(lib, kname).fn.get() != nullptr;
 }
 
 // The error for a lever setting that selects a kernel the metallib does not
@@ -510,26 +572,31 @@ constexpr int kq_shexp_pre_slot = 25;
 // Whether the codec has BK=128 NAX kernels (a pair or half loader).
 bool kq_nax_has_bk128(const std::string& t);
 
-// Whether the library function kname exists, and whether it declares the
-// decode constant and the output scale constant. Reads the unspecialized
-// function once.
+// The library function that serves kname (kq_find_function), and whether
+// it declares the decode constant and the output scale constant. Reads the
+// unspecialized function once.
 struct KqFunctionInfo {
   bool exists = false;
   bool word = false;
   bool out_scale = false;
+  std::string fn;
+  int x_bf16 = -1;
+  int glu_act = -1;
 };
 inline KqFunctionInfo kq_function_info(
     MTL::Library* lib,
     const std::string& kname) {
   auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
-  auto fn = NS::TransferPtr(lib->newFunction(
-      NS::String::string(kname.c_str(), NS::UTF8StringEncoding)));
+  const KqFoundFunction f = kq_find_function(lib, kname);
   KqFunctionInfo info;
-  if (fn.get() == nullptr) {
+  if (f.fn.get() == nullptr) {
     return info;
   }
   info.exists = true;
-  NS::Dictionary* fcs = fn->functionConstantsDictionary();
+  info.fn = f.name;
+  info.x_bf16 = f.x_bf16;
+  info.glu_act = f.glu_act;
+  NS::Dictionary* fcs = f.fn->functionConstantsDictionary();
   auto declares = [&](const char* fc) {
     return fcs != nullptr &&
         fcs->object(NS::String::string(fc, NS::UTF8StringEncoding)) != nullptr;
@@ -539,13 +606,15 @@ inline KqFunctionInfo kq_function_info(
   return info;
 }
 
-// The pipelines of one kq_get_kernel key: whether the function declares
-// the decode constant and the output scale constant, and its pipeline for
-// each value of the decode constant (a function without it has one
-// pipeline, in slot 1).
+// The pipelines of one kq_get_kernel key: the function and constants of
+// kq_function_info, and its pipeline for each value of the decode constant
+// (a function without it has one pipeline, in slot 1).
 struct KqPipelines {
   bool word = false;
   bool out_scale = false;
+  std::string fn;
+  int x_bf16 = -1;
+  int glu_act = -1;
   MTL::ComputePipelineState* ps[2] = {nullptr, nullptr};
 };
 
@@ -605,6 +674,9 @@ inline MTL::ComputePipelineState* kq_get_kernel(
   if (ps == nullptr) {
     bool word = false;
     bool out_scale = false;
+    std::string fn;
+    int x_bf16 = -1;
+    int glu_act = -1;
     {
       std::unique_lock<std::shared_mutex> lock(mu);
       auto it = cache.find(key);
@@ -620,11 +692,20 @@ inline MTL::ComputePipelineState* kq_get_kernel(
         it = cache
                  .emplace(
                      key,
-                     KqPipelines{info.word, info.out_scale, {nullptr, nullptr}})
+                     KqPipelines{
+                         info.word,
+                         info.out_scale,
+                         info.fn,
+                         info.x_bf16,
+                         info.glu_act,
+                         {nullptr, nullptr}})
                  .first;
       }
       word = it->second.word;
       out_scale = it->second.out_scale;
+      fn = it->second.fn;
+      x_bf16 = it->second.x_bf16;
+      glu_act = it->second.glu_act;
       ps = it->second.ps[word ? on : 1];
     }
     const int i = word ? on : 1;
@@ -640,14 +721,24 @@ inline MTL::ComputePipelineState* kq_get_kernel(
         static const int off = 0;
         fc.emplace_back(&off, MTL::DataType::DataTypeInt, kq_fc_out_scale);
       }
+      static const bool bf16[2] = {false, true};
+      static const int acts[3] = {0, 1, 2};
+      if (x_bf16 >= 0) {
+        fc.emplace_back(
+            &bf16[x_bf16], MTL::DataType::DataTypeBool, kq_fc_x_bf16);
+      }
+      if (glu_act >= 0) {
+        fc.emplace_back(
+            &acts[glu_act], MTL::DataType::DataTypeInt, kq_fc_glu_act);
+      }
       MTL::ComputePipelineState* built = nullptr;
       if (word) {
         static const bool values[2] = {false, true};
         fc.emplace_back(
             &values[i], MTL::DataType::DataTypeBool, kq_fc_kquant_word);
-        built = d.get_kernel(kname, lib, i ? key : key + "_kw0", fc);
+        built = d.get_kernel(fn, lib, i ? key : key + "_kw0", fc);
       } else {
-        built = d.get_kernel(kname, lib, key, fc);
+        built = d.get_kernel(fn, lib, key, fc);
       }
       std::unique_lock<std::shared_mutex> lock(mu);
       KqPipelines& p = cache.find(key)->second;

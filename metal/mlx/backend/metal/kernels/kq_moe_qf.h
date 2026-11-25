@@ -940,12 +940,8 @@ template <typename T, typename C, typename SCd>
 // "kq_<codec>_qf_sx_<shared codec>_<op>".
 // clang-format off
 #define instantiate_kq_qf_type(codec, core, type)                             \
-  instantiate_kernel("kq_" #codec "_qf_moe_glu_gather_silu_" #type,           \
-      KQ_MOE_KERNEL(kq_qf_moe_glu_gather), type, core, KQ_GLU_ACT_SILU)        \
-  instantiate_kernel("kq_" #codec "_qf_moe_glu_gather_gelu_" #type,           \
-      KQ_MOE_KERNEL(kq_qf_moe_glu_gather), type, core, KQ_GLU_ACT_GELU)        \
-  instantiate_kernel("kq_" #codec "_qf_moe_glu_gather_silu_limit_" #type,     \
-      KQ_MOE_KERNEL(kq_qf_moe_glu_gather), type, core, KQ_GLU_ACT_SILU_LIMIT)  \
+  instantiate_kernel("kq_" #codec "_qf_moe_glu_gather_act_" #type,           \
+      KQ_MOE_KERNEL(kq_qf_moe_glu_gather), type, core, KQ_GLU_ACT_FC)        \
   instantiate_kernel("kq_" #codec "_qf_gather_qmv_" #type,                    \
       KQ_MOE_KERNEL(kq_qf_gather_qmv), type, core)                             \
   instantiate_kernel("kq_" #codec "_qf_gather_qmv_mix_ns_" #type,             \
@@ -955,13 +951,9 @@ template <typename T, typename C, typename SCd>
 
 #define instantiate_kq_qf_sx_type(codec, core, scodec, score, type)           \
   instantiate_kernel(                                                         \
-      "kq_" #codec "_qf_sx_" #scodec "_moe_glu_gather_shexp_silu_" #type,     \
+      "kq_" #codec "_qf_sx_" #scodec "_moe_glu_gather_shexp_act_" #type,     \
       KQ_MOE_KERNEL(kq_qf_moe_glu_gather_shexp), type, core, score,           \
-      KQ_GLU_ACT_SILU)                                                         \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_qf_sx_" #scodec "_moe_glu_gather_shexp_gelu_" #type,     \
-      KQ_MOE_KERNEL(kq_qf_moe_glu_gather_shexp), type, core, score,           \
-      KQ_GLU_ACT_GELU)                                                         \
+      KQ_GLU_ACT_FC)                                                         \
   instantiate_kernel("kq_" #codec "_qf_sx_" #scodec "_gather_qmv_mix_" #type, \
       KQ_MOE_KERNEL(kq_qf_gather_qmv_mix), type, core, score)                  \
   instantiate_kernel(                                                         \
@@ -984,22 +976,14 @@ template <typename T, typename C, typename SCd>
   instantiate_kq_qf_sx_type(codec, core, q8_0, KqQfQ8_0, type)
 
 #define instantiate_kq_qf_dd_type(codec, core, type)                          \
-  instantiate_kernel("kq_" #codec "_qf_moe_glu_gather_dd_silu_" #type,        \
-      KQ_MOE_KERNEL(kq_qf_moe_glu_gather_dd), type, core, KQ_GLU_ACT_SILU)     \
-  instantiate_kernel("kq_" #codec "_qf_moe_glu_gather_dd_gelu_" #type,        \
-      KQ_MOE_KERNEL(kq_qf_moe_glu_gather_dd), type, core, KQ_GLU_ACT_GELU)     \
-  instantiate_kernel("kq_" #codec "_qf_moe_glu_gather_dd_silu_limit_" #type,  \
-      KQ_MOE_KERNEL(kq_qf_moe_glu_gather_dd), type, core, KQ_GLU_ACT_SILU_LIMIT)
+  instantiate_kernel("kq_" #codec "_qf_moe_glu_gather_dd_act_" #type,        \
+      KQ_MOE_KERNEL(kq_qf_moe_glu_gather_dd), type, core, KQ_GLU_ACT_FC)
 
 #define instantiate_kq_qf_grp_type(codec, core, scodec, score, type)          \
   instantiate_kernel(                                                         \
-      "kq_" #codec "_qf_sx_" #scodec "_moe_glu_gather_shexp_grp_silu_" #type, \
+      "kq_" #codec "_qf_sx_" #scodec "_moe_glu_gather_shexp_grp_act_" #type, \
       KQ_MOE_KERNEL(kq_qf_moe_glu_gather_shexp_grp), type, core, score,       \
-      KQ_GLU_ACT_SILU)                                                         \
-  instantiate_kernel(                                                         \
-      "kq_" #codec "_qf_sx_" #scodec "_moe_glu_gather_shexp_grp_gelu_" #type, \
-      KQ_MOE_KERNEL(kq_qf_moe_glu_gather_shexp_grp), type, core, score,       \
-      KQ_GLU_ACT_GELU)                                                         \
+      KQ_GLU_ACT_FC)                                                         \
   instantiate_kernel(                                                         \
       "kq_" #codec "_qf_sx_" #scodec "_gather_qmv_mix_grp_" #type,            \
       KQ_MOE_KERNEL(kq_qf_gather_qmv_mix_grp), type, core, score)
@@ -1012,19 +996,15 @@ template <typename T, typename C, typename SCd>
 
 // The pair GLU, for the cores it pays on (kq_qf_pairs).
 #define instantiate_kq_qf_dd(codec, core)             \
-  instantiate_kq_qf_dd_type(codec, core, bfloat16_t) \
-  instantiate_kq_qf_dd_type(codec, core, float16_t)
+  instantiate_kq_qf_dd_type(codec, core, kq_x16)
 
 // The grouped kernels, for every routed core.
 #define instantiate_kq_qf_grp_all(codec, core)   \
-  instantiate_kq_qf_grp(codec, core, bfloat16_t) \
-  instantiate_kq_qf_grp(codec, core, float16_t)
+  instantiate_kq_qf_grp(codec, core, kq_x16)
 
 #define instantiate_kq_qf(codec, core)                                        \
-  instantiate_kq_qf_type_all(codec, core, bfloat16_t)                         \
-  instantiate_kq_qf_type_all(codec, core, float16_t)
+  instantiate_kq_qf_type_all(codec, core, kq_x16)
 
 #define instantiate_kq_qf_bias(codec, core)                                   \
-  instantiate_kq_qf_bias_type(codec, core, bfloat16_t)                        \
-  instantiate_kq_qf_bias_type(codec, core, float16_t)
+  instantiate_kq_qf_bias_type(codec, core, kq_x16)
 // clang-format on
