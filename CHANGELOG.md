@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.14]
+
 ### Added
 - `fuse_graph` records a lazy graph once and `fused_call` runs it as one primitive on new inputs of
   the same shapes, with the same bits and less host time per call. `direct=True` replays the recorded
