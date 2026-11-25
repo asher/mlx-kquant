@@ -1364,6 +1364,23 @@ a cheaper lookup. Two other grid sources gave no gain. A 64-bit grid in a device
 constant table. A 2-bit code table, in threadgroup memory or in a device buffer, was about 20%
 slower.
 
+### Skip rows a verify does not keep
+
+A speculative verify runs the whole draft block, but a round may only use its first rows. Mark the
+expert ids of the other rows with bit 31 and pass `absent=True`, and those rows read no expert
+weights:
+
+```python
+ABSENT = 0x80000000
+cut = mx.where(mx.arange(T)[:, None] > keep, mx.array(ABSENT, mx.uint32), idx)
+h = kq.moe_glu_gather_kq(x, gw, uw, codec, cut, act="silu", absent=True)
+y = kq.gather_qmv_mix_ns_kq(h, dw, codec, cut, scores, absent=True)
+```
+
+A marked `[t, r]` pair gives zeros from the GLU and adds nothing to the mix. The other rows keep
+their bits. `absent=True` works on every codec with fused kernels and takes no biases or LoRA. A
+marked call skips the grouped forms that M5 runs at 5 to 16 rows.
+
 ### Gate and up in different codecs
 
 Quant recipes that pick a codec per tensor can put a layer's gate and up expert stacks in different

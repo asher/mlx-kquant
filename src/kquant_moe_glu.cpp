@@ -358,7 +358,9 @@ inline bool kq_moe_shexp_multi() {
 // read live once set).
 enum { KQ_MIX_LOOP = 0, KQ_MIX_SP = 1, KQ_MIX_DD = 2 };
 
-inline int kq_moe_mix_form(bool sp_ok, bool dd_ok) {
+// sp_pref: the slot-parallel kernel is the default pick, where it applies.
+// The forced forms read sp_ok alone.
+inline int kq_moe_mix_form(bool sp_ok, bool dd_ok, bool sp_pref) {
   static const bool has_env = kq_getenv("KQ_MOE_MIX_FORM") != nullptr;
   if (has_env) {
     const char* e = kq_getenv("KQ_MOE_MIX_FORM");
@@ -373,7 +375,11 @@ inline int kq_moe_mix_form(bool sp_ok, bool dd_ok) {
       return dd_ok ? KQ_MIX_DD : KQ_MIX_LOOP;
     }
   }
-  return sp_ok ? KQ_MIX_SP : dd_ok ? KQ_MIX_DD : KQ_MIX_LOOP;
+  return sp_ok && sp_pref ? KQ_MIX_SP : dd_ok ? KQ_MIX_DD : KQ_MIX_LOOP;
+}
+
+inline int kq_moe_mix_form(bool sp_ok, bool dd_ok) {
+  return kq_moe_mix_form(sp_ok, dd_ok, true);
 }
 
 // The dedupe down is off for a stq1_0 stem by default (kq_moe_c64_dd_off);
@@ -1038,10 +1044,24 @@ inline void kq_gather_qmv_mix_grp_gpu(
 #endif // _METAL_
 
 // Slot-parallel or loop form of a qf score-mixed down, by the same rule as
-// the Ext forms (kq_moe_sp, KQ_MOE_MIX_FORM=loop|sp).
-inline bool kq_qf_mix_sp(int T, int N, int rps, int S) {
-  return kq_moe_mix_form(kq_moe_sp((int64_t)T * (N / (2 * rps)), S), false) ==
+// the Ext forms (kq_moe_sp, KQ_MOE_MIX_FORM=loop|sp). loop_first keeps the
+// loop kernel unless a lever forces the slot-parallel one.
+inline bool
+kq_qf_mix_sp(int T, int N, int rps, int S, bool loop_first = false) {
+  return kq_moe_mix_form(
+             kq_moe_sp((int64_t)T * (N / (2 * rps)), S), false, !loop_first) ==
       KQ_MIX_SP;
+}
+
+// The no-shared-expert qf down of q4_0, q4_1 and nvfp4 runs faster in the
+// loop kernel than in the slot-parallel one on rows shorter than 2048:
+// 10 to 19% less time at 1 to 4 tokens for q4_0 and q4_1 at K 640 and
+// 1152, 4 to 7% for nvfp4 at K 1152 in a model (M5 Max,
+// bench_moe_mix_forms.py). At K 2048 the two tie; q2_0 and iq4_nl keep
+// the slot-parallel kernel. KQ_MOE_SP set keeps its own pick.
+inline bool kq_qf_mix_loop_first(const std::string& t, int K) {
+  static const bool sp_env = kq_getenv("KQ_MOE_SP") != nullptr;
+  return !sp_env && K < 2048 && (t == "q4_0" || t == "q4_1" || t == "nvfp4");
 }
 
 // Layout of the operands the MoE kernels read without strides. An
@@ -1248,7 +1268,9 @@ void KQuantMoEGLUKQ::eval_gpu(
   // Grouped form: the shared-expert grouped kernel with no shared slots,
   // the expert stacks standing in for its shared operands.
   const bool c64 = kq_moe_c64(kt);
-  const int gform = !biased && !kq_moe_c64_grp_off(kt) && kq_moe_group_glu(T)
+  // Ids that name no expert (absent_) skip the grouped kernels.
+  const int gform =
+      !absent_ && !biased && !kq_moe_c64_grp_off(kt) && kq_moe_group_glu(T)
       ? kq_moe_group_form(kt, "", N, K)
       : KQ_GRP_NONE;
   if (gform != KQ_GRP_NONE) {
@@ -1295,7 +1317,8 @@ void KQuantMoEGLUKQ::eval_gpu(
   // The half kernels run at nx 8: 32 rows per threadgroup amortize the
   // staged activation row and half grid (nx 16 measured 10% slower).
   const bool qf = kq_moe_qf(kt, N, K);
-  const bool use_half = !qf && !biased && kq_moe_half(kt, K);
+  // Ids that name no expert (absent_) skip the half kernels.
+  const bool use_half = !qf && !biased && !absent_ && kq_moe_half(kt, K);
   const bool dd = (!qf || kq_qf_pairs(kt)) && !biased && !use_half &&
       !kq_moe_c64_dd_off(kt) && kq_moe_dedup(T, KQ_DD_MAX_T);
   const bool c32 = !qf && !biased && !use_half && !dd &&
@@ -1917,10 +1940,13 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
       ? kq_moe_c32_down_nx()
       : kq_moe_pick_nx(
             (int64_t)N * T, K, kq_moe_mix_ns_wide(kquant_type_, dd ? 2 : T, K));
-  const int gform = !kq_moe_c64_grp_off(kquant_type_) && kq_moe_group_mix(T)
+  // Ids that name no expert (absent_) skip the tile and grouped kernels.
+  const int gform =
+      !absent_ && !kq_moe_c64_grp_off(kquant_type_) && kq_moe_group_mix(T)
       ? kq_moe_group_form(kquant_type_, "", N, K)
       : KQ_GRP_NONE;
-  if (kq_moe_tile_mix(T, kquant_type_, kquant_type_, N, K, out_scale_bits_)) {
+  if (!absent_ &&
+      kq_moe_tile_mix(T, kquant_type_, kquant_type_, N, K, out_scale_bits_)) {
     kq_gather_qmv_mix_tile_gpu(
         d, s, kquant_type_, "", w, w, x, indices, scores, out, T, S, N, K, 0);
   } else if (gform != KQ_GRP_NONE) {
@@ -1945,7 +1971,7 @@ void KQuantGatherQMVMixNSKQ::eval_gpu(
         out_scale_bits_);
   } else if (qf) {
     const int rps = kq_qf_rps(kquant_type_);
-    bool sp = kq_qf_mix_sp(T, N, rps, S);
+    bool sp = kq_qf_mix_sp(T, N, rps, S, kq_qf_mix_loop_first(kquant_type_, K));
     auto qf_name = [&](bool slot_parallel) {
       return "kq_" + kquant_type_ + "_qf_gather_qmv_mix_ns" +
           (slot_parallel ? "_sp_" : "_") + kq_type_string(x.dtype());
@@ -2199,7 +2225,7 @@ bool KQuantMoEGLUKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantMoEGLUKQ&>(other);
   return kquant_type_ == o.kquant_type_ && up_type_ == o.up_type_ &&
       act_ == o.act_ && limit_ == o.limit_ && alpha_ == o.alpha_ &&
-      out_scale_bits_ == o.out_scale_bits_;
+      out_scale_bits_ == o.out_scale_bits_ && absent_ == o.absent_;
 }
 
 bool KQuantGatherQMVKQ::is_equivalent(const mx::Primitive& other) const {
@@ -2267,7 +2293,7 @@ void KQuantGatherQMVMixNSKQ::eval_cpu(
 bool KQuantGatherQMVMixNSKQ::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantGatherQMVMixNSKQ&>(other);
   return kquant_type_ == o.kquant_type_ && lora_flags_ == o.lora_flags_ &&
-      out_scale_bits_ == o.out_scale_bits_;
+      out_scale_bits_ == o.out_scale_bits_ && absent_ == o.absent_;
 }
 
 std::vector<mx::Shape> KQuantGatherQMVMixNSKQ::output_shapes(
@@ -2919,6 +2945,7 @@ mx::array moe_glu_gather_kq(
     const std::optional<mx::array>& gate_scale,
     const std::optional<mx::array>& up_scale,
     const std::string& up_kquant_type,
+    bool absent,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const std::string up_type =
@@ -2997,6 +3024,10 @@ mx::array moe_glu_gather_kq(
     throw std::invalid_argument(
         "[mlx_kquant.moe_glu_gather_kq] gate/up expert shapes must match.");
   }
+  if (absent && biased) {
+    throw std::invalid_argument(
+        "[mlx_kquant.moe_glu_gather_kq] absent=True takes no biases.");
+  }
   if (biased) {
     for (const auto* b : {&*gate_bias, &*up_bias}) {
       if (b->ndim() != 2 || b->shape(0) != gate_w.shape(0) ||
@@ -3044,7 +3075,8 @@ mx::array moe_glu_gather_kq(
               ? alpha
               : 0.0f,
           os_bits,
-          up_type),
+          up_type,
+          absent),
       std::move(op_inputs));
 }
 
@@ -3429,6 +3461,7 @@ mx::array gather_qmv_mix_ns_kq(
     const std::optional<mx::array>& lora_table,
     const std::optional<mx::array>& lora_rows,
     const std::optional<mx::array>& out_scale,
+    bool absent,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
   const char* op = "[mlx_kquant.gather_qmv_mix_ns_kq]";
@@ -3452,6 +3485,10 @@ mx::array gather_qmv_mix_ns_kq(
   int K = x.shape(2);
   check_kq_expert_stack(op, w, kquant_type, K);
   kq_check_weight_base_at_build(w, kquant_type, s, "gather_qmv_mix_ns_kq");
+  if (absent && lora_a.has_value()) {
+    throw std::invalid_argument(
+        std::string(op) + " absent=True takes no LoRA.");
+  }
   const int os_bits = moe_scale_bits(
       "gather_qmv_mix_ns_kq",
       kquant_type,
@@ -3493,7 +3530,7 @@ mx::array gather_qmv_mix_ns_kq(
       std::move(out_shape),
       dt,
       std::make_shared<KQuantGatherQMVMixNSKQ>(
-          s, kquant_type, lora_flags, os_bits),
+          s, kquant_type, lora_flags, os_bits, absent),
       std::move(op_inputs));
 }
 

@@ -211,6 +211,44 @@ def test_gather_qmv_mix(codec, T, dtype, lever_cache):
         assert any("_gather_qmv_mix_grp" in k for k in keys)
 
 
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=str)
+@pytest.mark.parametrize("T", [1, 3, 6, 8, 16])
+@pytest.mark.parametrize("codec", ["q4_0", "q4_k"])
+def test_gather_qmv_mix_ns(codec, T, dtype, lever_cache):
+    w = _wire((E, MIX_OUT, MIX_IN), codec, 13)
+
+    def build(x, inds, sc):
+        return [kq.gather_qmv_mix_ns_kq(x, w, codec, inds, sc)]
+
+    def inputs_of(seed):
+        rng = np.random.default_rng(seed)
+        x = _normal(rng, (T, R, MIX_IN), dtype)
+        sc = mx.array(rng.uniform(0.05, 0.3, size=(T, R)).astype(np.float32))
+        return _evaled([x, _routes(rng, T), sc])
+
+    _check(build, inputs_of, "KQuantGatherQMVMixNSKQ")
+
+
+@pytest.mark.parametrize(
+    "act", [("silu", {}), ("situ", {"limit": 4.0, "alpha": 25.0})], ids=str
+)
+@pytest.mark.parametrize("T", [1, 3, 6, 16])
+@pytest.mark.parametrize("codec", ["q4_0", "q4_k"])
+def test_moe_glu_gather(codec, T, act, lever_cache):
+    K, N = 512, 256
+    gw, uw = _wire((E, N, K), codec, 31), _wire((E, N, K), codec, 32)
+    name, kw = act
+
+    def build(x, inds):
+        return [kq.moe_glu_gather_kq(x, gw, uw, codec, inds, act=name, **kw)]
+
+    def inputs_of(seed):
+        rng = np.random.default_rng(seed)
+        return _evaled([_normal(rng, (T, K), mx.bfloat16), _routes(rng, T)])
+
+    _check(build, inputs_of, "KQuantMoEGLUKQ")
+
+
 @pytest.mark.parametrize(
     "act", [("silu", {}), ("swiglu_oai", {"limit": 7.0, "alpha": 1.702})], ids=str
 )
@@ -421,6 +459,18 @@ def test_custom_kernel(dtype, init, lever_cache):
         return _evaled([_normal(rng, (n,), dtype), _normal(rng, (nb,), dtype)])
 
     _check(build, inputs_of, "CustomKernel")
+
+
+def test_stop_gradient(lever_cache):
+    # A buffer share with no dispatch of its own, between two that have one.
+    def build(x):
+        return [mx.stop_gradient(x * 2.0) + 1.0]
+
+    def inputs_of(seed):
+        rng = np.random.default_rng(seed)
+        return _evaled([_normal(rng, (4, 256), mx.bfloat16)])
+
+    _check(build, inputs_of, "StopGradient")
 
 
 def test_less_equal(lever_cache):

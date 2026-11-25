@@ -213,6 +213,16 @@ template <typename T, typename C, int ACT>
   constexpr int RPS = C::rps;
   const int R = tpg.y;
   const uint expert = indices[tid.z * R + tid.y];
+  if (expert & KQ_MOE_ABSENT_ID) {
+    if (simd_lid == 0) {
+      out +=
+          ((int64_t)tid.z * R + tid.y) * N + tid.x * 2 * RPS + simd_gid * RPS;
+      for (int i = 0; i < RPS; i++) {
+        out[i] = static_cast<T>(0.0f);
+      }
+    }
+    return;
+  }
   const int64_t off = (int64_t)expert * N * C::row_bytes(K);
   x += (int64_t)tid.z * K;
   float g[RPS] = {0};
@@ -256,6 +266,15 @@ template <typename T, typename C, int ACT>
   const int R = tpg.y;
   const int p = tid.z * R + tid.y;
   const uint expert = indices[p];
+  if (expert & KQ_MOE_ABSENT_ID) {
+    if (simd_lid == 0) {
+      device T* o = out + (int64_t)p * N + tid.x * 2 * RPS + simd_gid * RPS;
+      for (int i = 0; i < RPS; i++) {
+        o[i] = static_cast<T>(0.0f);
+      }
+    }
+    return;
+  }
   const int q = kq_dd_partner(indices, p, R * int(tpg.z), expert);
   if (q == -2) {
     return;
@@ -433,6 +452,9 @@ template <typename T, typename C>
   float acc[RPS] = {0};
   for (int slot = 0; slot < S; slot++) {
     const uint expert = indices[tid.z * S + slot];
+    if (expert & KQ_MOE_ABSENT_ID) {
+      continue;
+    }
     float r[RPS] = {0};
     C::template rows<T, RPS>(
         w + (int64_t)expert * N * rb,
@@ -482,15 +504,17 @@ template <typename T, typename C>
   {
     const uint expert = indices[tid.z * S + slot];
     float r[RPS] = {0};
-    C::template rows<T, RPS>(
-        w + (int64_t)expert * N * C::row_bytes(K),
-        h + ((int64_t)tid.z * S + slot) * K,
-        K,
-        N,
-        tid.x,
-        half_,
-        simd_lid,
-        r);
+    if (!(expert & KQ_MOE_ABSENT_ID)) {
+      C::template rows<T, RPS>(
+          w + (int64_t)expert * N * C::row_bytes(K),
+          h + ((int64_t)tid.z * S + slot) * K,
+          K,
+          N,
+          tid.x,
+          half_,
+          simd_lid,
+          r);
+    }
     if (simd_lid == 0) {
       for (int i = 0; i < RPS; i++) {
         parts[slot][half_ * RPS + i] = r[i];
@@ -503,9 +527,13 @@ template <typename T, typename C>
     const int row = tid.x * 2 * RPS + lr;
     float acc = 0.0f;
     for (int s = 0; s < S; s++) {
-      acc += KQ_MOE_MUL(
-                 scores[tid.z * S + s],
-                 kq_moe_row_scale(out_scale, indices[tid.z * S + s], N, row)) *
+      const uint e = indices[tid.z * S + s];
+      if (e & KQ_MOE_ABSENT_ID) {
+        continue;
+      }
+      acc +=
+          KQ_MOE_MUL(
+              scores[tid.z * S + s], kq_moe_row_scale(out_scale, e, N, row)) *
           parts[s][lr];
     }
     out[(int64_t)tid.z * N + row] = static_cast<T>(acc);
