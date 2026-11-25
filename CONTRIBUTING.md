@@ -51,6 +51,66 @@ Codec facts live in **one** place: `mlx_kquant/codec_geometry.py`. Update it, th
 README "Codec reference" table, and the kernel, then run
 `python scripts/check-codecs.py --check` - it fails on drift between the three.
 
+## Kernels and the wheel size
+
+PyPI refuses any file of this project over 100 MB, and the metallib is most
+of the wheel. Every kernel instantiation adds to it, so check the cost of a
+change before you open a pull request:
+
+```sh
+python scripts/check-wheel-size.py --check   # wheel estimate, largest kernel families
+```
+
+`tests/test_wheel_size.py` fails when the estimate passes 95 MB. If your
+change takes it past 90 MB, fold another family in the same change, largest
+first.
+
+### One instantiation per code shape
+
+Instantiate a kernel once for each thing that changes the shape of its code:
+the codec traits, tile sizes, `NX` lanes, anything that sizes an array or
+picks a matrix type. Everything else is a function constant, which Metal
+resolves when it builds the pipeline, so the specialized kernel runs at the
+same speed.
+
+- Activation dtype. A kernel whose math runs in float32 takes `kq_x16`
+  activations (`kq_x16.h`) and is instantiated once, named `..._kq_x16`.
+  Load with `kq_ld4` or `kq_ld8` and store with `static_cast<T>`.
+- GLU activation. Instantiate with `KQ_GLU_ACT_FC` and put `act` in the name
+  where the activation was.
+- Host code keeps asking for the typed name, such as
+  `kq_q4_k_moe_glu_gather_silu_nx16_bfloat16_t`. `kq_get_kernel` finds the
+  folded function and sets function constants 390 (dtype) and 391
+  (activation).
+- Kernels that load activations into matrix-unit tiles (`tensor<...>`,
+  `simdgroup_matrix`: the NAX matmuls and the expert stores) need the real
+  type and keep one instantiation per type.
+
+When you fold an existing family, compare `kq.metallib_kernels()` before
+and after: every old name must still resolve under the rule above, and every
+new function must be reached by one.
+
+### Iterate on a kernel
+
+Compile the one source you changed, in seconds, before a full build:
+
+```sh
+MLX_INC=$(python -c 'import mlx, os; print(os.path.join(os.path.dirname(mlx.__file__), "include"))')
+xcrun -sdk macosx metal -Imetal -I"$MLX_INC" -Wall -Wextra -fno-fast-math \
+  -Wno-c++17-extensions -Wmetal-addr-spaces \
+  -c metal/kq_moe_glu_kq.metal -o /tmp/kq_moe_glu_kq.air
+```
+
+Then rebuild in place, run the test files of the family you touched, and run
+the whole suite once before the pull request:
+
+```sh
+python setup.py build_ext --inplace
+pytest -q tests/test_moe_glu.py tests/test_moe_glu_variants.py
+python scripts/check-wheel-size.py --check
+pytest -q
+```
+
 ## Style
 
 - **Python:** `ruff` is the linter/formatter (config in `pyproject.toml`).

@@ -20,6 +20,8 @@
 // whose coefficients depend only on the activations, so each byte costs a
 // few floors and fmas and no integer work.
 
+#include "mlx/backend/metal/kernels/kq_x16.h"
+
 MLX_MTL_CONST int KQ_PQ2_0_SUPERBLOCK = 128;
 MLX_MTL_CONST int KQ_PQ2_0_BLOCK_BYTES = 34;
 MLX_MTL_CONST int KQ_PQ2_0_QS_OFFSET = 2;
@@ -200,11 +202,12 @@ METAL_FUNC void kq_pq2_0_qmv_sb_impl(
                                 : v == 2 ? kq_x2
                                          : kq_x3) +
           ib * SB + it * 16;
-      const vec<T, 8> lo = *(const device vec<T, 8>*)(xb);
-      const vec<T, 8> hi = *(const device vec<T, 8>*)(xb + 8);
+      float lo[8], hi[8];
+      kq_ld8(xb, lo);
+      kq_ld8(xb + 8, hi);
 #pragma unroll
       for (short j = 0; j < 8; ++j) {
-        y2[v][j] = A2(float(lo[j]), float(hi[j]));
+        y2[v][j] = A2(lo[j], hi[j]);
       }
     }
     // A static row loop lets the compiler interleave the rows' loads; the
@@ -295,12 +298,13 @@ METAL_FUNC void kq_pq2_0_verify_qmv_sb_impl(
     for (int m = 0; m < KQ_PRISM_MAX_VM; m++) {
       if (m < vm) {
         const device T* xb = x + m * in_vec_size + ib * SB + it * 16;
-        const vec<T, 8> lo = *(const device vec<T, 8>*)(xb);
-        const vec<T, 8> hi = *(const device vec<T, 8>*)(xb + 8);
+        float lo[8], hi[8];
+        kq_ld8(xb, lo);
+        kq_ld8(xb + 8, hi);
         A2 y2[8];
 #pragma unroll
         for (short j = 0; j < 8; ++j) {
-          y2[j] = A2(float(lo[j]), float(hi[j]));
+          y2[j] = A2(lo[j], hi[j]);
         }
 #pragma unroll
         for (int row = 0; row < results_per_simdgroup; row++) {

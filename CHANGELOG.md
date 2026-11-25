@@ -6,6 +6,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- The macOS wheels fit under PyPI's file size limit again. The fused MoE gather kernels are built once
+  for float16 and bfloat16 activations and once for every GLU activation, with the same outputs.
+
 ## [0.5.14]
 
 ### Added
